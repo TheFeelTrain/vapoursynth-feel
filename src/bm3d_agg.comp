@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_shader_atomic_float : require
 
 /*
  * BM3D temporal aggregation kernel. For each output pixel, sums the
@@ -17,7 +18,7 @@ layout(constant_id = 1) const int HEIGHT = 1080;
 layout(constant_id = 2) const int STRIDE = 1920;
 layout(constant_id = 3) const int TW = 5;
 
-layout(std430, binding = 0) buffer ResBuf { uint res[]; };
+layout(std430, binding = 0) buffer ResBuf { float res[]; };
 layout(std430, binding = 2) buffer DstBuf { float dst[]; };
 
 layout(push_constant) uniform PushConstants {
@@ -26,10 +27,10 @@ layout(push_constant) uniform PushConstants {
 
 const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
 
-// atomic load: the res buffer is accumulated with device-scope atomics by the
-// estimation kernel, so coherent (atomic) reads see those writes
+// atomic load: the res buffer is accumulated with device-scope float atomics
+// by the estimation kernel, so an atomic (coherent) read sees those writes
 float res_load(int o) {
-    return uintBitsToFloat(atomicOr(res[o], 0u));
+    return atomicAdd(res[o], 0.0f);
 }
 
 void main() {
