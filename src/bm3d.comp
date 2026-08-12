@@ -48,6 +48,7 @@ layout(push_constant) uniform PushConstants {
     int res_off;   // float offset of this plane's result region
     int nmod;      // center frame index of the window
     int nframes;   // total frame count (for boundary clamping)
+    int src_slot;  // radius 0: the stream's private source slot
 } pc;
 
 // absolute frame index of the window position z (clamped at the boundaries)
@@ -57,6 +58,12 @@ int src_frame(int z) {
 
 // float offset of the ring slot holding the frame at window position z
 int src_off(int z) {
+    // at radius 0 there is a single source frame per dispatch, stored in the
+    // stream's own slot (the host keyed the shared src ring by stream, not by
+    // frame index, so concurrent out-of-order frames cannot collide)
+    if (RADIUS == 0) {
+        return pc.src_slot * TEMPORAL_STRIDE;
+    }
     return src_frame(z) % SRC_RING * TEMPORAL_STRIDE;
 }
 
