@@ -27,7 +27,7 @@ using namespace std::string_literals;
 
 namespace {
 
-constexpr int MAX_RADIUS = 16;
+constexpr int MAX_RADIUS = 4;
 
 struct Bm3dPlane {
     int width {};
@@ -55,6 +55,7 @@ struct Bm3dStream {
     std::mutex * queue_lock {};
     uint32_t staging_type_index {};
     VkQueryPool ts_query {};
+    int stream_id {};        // index into BM3DData::timelines
 };
 
 
@@ -80,10 +81,10 @@ struct BM3DData {
     std::array<Bm3dPlane, 3> planes {};
     int n_planes {};
 
-    // shared device buffers (VRAM); the src is a ring of SRC_RING slots
-    static constexpr int SRC_RING = 9;   // window union + in-flight frames (matches the kernel)
+    // shared device buffers (VRAM); the src is a ring of src_ring slots
+    int src_ring {};             // 4 * radius + 1 (the window union, matches the kernel)
     static constexpr int RES_RING = 5;
-    VkDeviceSize src_size {};        // SRC_RING * pe * 4 bytes (per plane, packed)
+    VkDeviceSize src_size {};    // src_ring * pe elements (per plane, packed)
     VkBuffer src_buf {};
     VkDeviceMemory src_mem {};
     VkBuffer res_buf {};
@@ -97,8 +98,8 @@ struct BM3DData {
     int nframes {};
 
     ticket_semaphore semaphore;
-    std::array<VkSemaphore, 32> timelines {};
-    std::array<int, SRC_RING> src_content {};  // frame index currently in each src slot
+    std::vector<VkSemaphore> timelines;
+    std::array<int, 4 * MAX_RADIUS + 1> src_content {};  // frame index currently in each src slot
     std::array<int, RES_RING> res_content {};  // frame index whose estimates occupy each res slot
     std::array<int, 64> frame_stream {};   // stream index that processed frame n (mod 64)
     std::vector<Bm3dStream> streams;
@@ -232,14 +233,15 @@ static std::variant<VkPipeline, std::string> create_bm3d_pipeline(
         float sigma_y;
         int32_t block_step, bm_range, radius, ps_num, ps_range;
         float extractor;
-        int32_t nosearch, noestimate;
+        int32_t nosearch, noestimate, src_ring;
     } spec {
         plane.width, plane.height, plane.stride, sigma_y,
         d.block_step, d.bm_range, d.radius, d.ps_num, d.ps_range, d.extractor,
         std::getenv("BM3D_NOSEARCH") ? 1 : 0,
-        std::getenv("BM3D_NOESTIMATE") ? 1 : 0
+        std::getenv("BM3D_NOESTIMATE") ? 1 : 0,
+        d.src_ring
     };
-    const std::array<VkSpecializationMapEntry, 12> entries {{
+    const std::array<VkSpecializationMapEntry, 13> entries {{
         { 0,  0, sizeof(int32_t) },
         { 1,  4, sizeof(int32_t) },
         { 2,  8, sizeof(int32_t) },
@@ -252,6 +254,7 @@ static std::variant<VkPipeline, std::string> create_bm3d_pipeline(
         { 9, 36, sizeof(float) },
         { 10, 40, sizeof(int32_t) },
         { 11, 44, sizeof(int32_t) },
+        { 12, 48, sizeof(int32_t) },
     }};
     VkSpecializationInfo spec_info {
         .mapEntryCount = static_cast<uint32_t>(entries.size()),
@@ -288,15 +291,16 @@ static std::variant<VkPipeline, std::string> create_bm3d_pipeline(
 
 static std::variant<VkPipeline, std::string> create_agg_pipeline(
     const VK_Device & dev, const Bm3dPlane & plane,
-    VkShaderModule module, VkPipelineLayout layout) {
+    const BM3DData & d, VkShaderModule module, VkPipelineLayout layout) {
 
     struct Spec {
-        int32_t width, height, stride;
-    } spec { plane.width, plane.height, plane.stride };
-    const std::array<VkSpecializationMapEntry, 3> entries {{
+        int32_t width, height, stride, tw;
+    } spec { plane.width, plane.height, plane.stride, d.tw };
+    const std::array<VkSpecializationMapEntry, 4> entries {{
         { 0,  0, sizeof(int32_t) },
         { 1,  4, sizeof(int32_t) },
         { 2,  8, sizeof(int32_t) },
+        { 3, 12, sizeof(int32_t) },
     }};
     VkSpecializationInfo spec_info {
         .mapEntryCount = static_cast<uint32_t>(entries.size()),
@@ -340,7 +344,7 @@ static int agg_z(int i, int n, int nframes, int radius) {
 }
 
 static void record_bm3d_cmd(BM3DData * d, Bm3dStream & stream, int n,
-                     const std::array<bool, 16> & uploaded) {
+                     const std::array<bool, 4 * MAX_RADIUS + 1> & uploaded) {
     VkDevice dev = d->device->device;
     VkCommandBuffer cmd = stream.cmd;
 
@@ -370,7 +374,7 @@ static void record_bm3d_cmd(BM3DData * d, Bm3dStream & stream, int n,
             VkBufferCopy region {
                 .srcOffset = (static_cast<VkDeviceSize>(f - lo) * pe +
                     static_cast<VkDeviceSize>(plane) * d->src_size) * 4,
-                .dstOffset = (static_cast<VkDeviceSize>(f % d->SRC_RING) * pe +
+                .dstOffset = (static_cast<VkDeviceSize>(f % d->src_ring) * pe +
                     static_cast<VkDeviceSize>(plane) * d->src_size) * 4,
                 .size = pe * 4
             };
@@ -380,7 +384,7 @@ static void record_bm3d_cmd(BM3DData * d, Bm3dStream & stream, int n,
 
     // compute the missing result slots for the aggregation window
     // (the frame n+r at the steady state; the boundary frames too)
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < d->tw; ++i) {
         const int m_i = std::clamp(n - r + i, 0, nf - 1);
         const int slot = m_i % d->RES_RING;
         if (d->res_content[slot] == m_i) {
@@ -415,19 +419,19 @@ static void record_bm3d_cmd(BM3DData * d, Bm3dStream & stream, int n,
         const auto & p = d->planes[plane];
         const VkDeviceSize pe = p.pe;
 
-        // aggregation: 5 stacked slices (clamped frame indices, aggZ blocks)
+        // aggregation: tw stacked slices (clamped frame indices, aggZ blocks)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.agg_pipeline);
         {
-            int32_t bases[5] {};
+            int32_t bases[9] {};
             if (r == 0) {
                 // non-temporal: aggregate the single center slice
                 const int m_i = std::clamp(n, 0, nf - 1);
                 const int32_t base = static_cast<int32_t>(
                     static_cast<VkDeviceSize>(m_i % d->RES_RING) * 2 * pe +
                     static_cast<VkDeviceSize>(plane) * d->res_size_per_plane);
-                for (int i = 0; i < 5; ++i) bases[i] = base;
+                for (int i = 0; i < d->tw; ++i) bases[i] = base;
             } else {
-                for (int i = 0; i < 5; ++i) {
+                for (int i = 0; i < d->tw; ++i) {
                     const int m_i = std::clamp(n - r + i, 0, nf - 1);
                     const int z = agg_z(i, n, nf, r);
                     bases[i] = static_cast<int32_t>(
@@ -442,18 +446,18 @@ static void record_bm3d_cmd(BM3DData * d, Bm3dStream & stream, int n,
         (void)0;
         if (gputrace) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stream.ts_query, 2);
         {
-            // the estimation kernel's atomic accumulation must be visible to
-            // the aggregation reads; the aggregation kernel reads with atomic
-            // loads, but the RADV driver still needs an explicit barrier for
-            // the cross-dispatch visibility
+            // the estimation kernel's atomic accumulation (and the fill that
+            // zeroes the slots) must be visible to the aggregation reads; the
+            // aggregation kernel reads with atomic loads, but the RADV driver
+            // still needs an explicit barrier for the cross-dispatch visibility
             VkMemoryBarrier mem_barrier {
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT
             };
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
         }
         vkCmdDispatch(cmd, p.agg_grid_x, p.agg_grid_y, 1);
         if (gputrace) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, 3);
@@ -478,14 +482,24 @@ static const VSFrame *VS_CC BM3DGetFrame(
         VSFrame * dst = vsapi->newVideoFrame(&d->vi->format, d->vi->width, d->vi->height, nullptr, core);
 
         d->semaphore.acquire();
+        if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d acquired\n", n);
         d->streams_lock.lock();
         auto stream = std::move(d->streams.back());
         d->streams.pop_back();
-        const int my_stream = static_cast<int>(d->streams.size());
+        const int my_stream = stream.stream_id;
         d->frame_stream[n % 64] = my_stream;
+        if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d stream=%d\n", n, my_stream);
         d->streams_lock.unlock();
 
         const auto set_error = [&](const std::string & error_message) {
+            // unblock any frames already waiting on this frame's timeline
+            VkSemaphoreSignalInfo signal_info {
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+                .pNext = nullptr,
+                .semaphore = stream.timeline,
+                .value = static_cast<uint64_t>(n + 1)
+            };
+            vkSignalSemaphore(d->device->device, &signal_info);
             d->streams_lock.lock();
             d->streams.push_back(std::move(stream));
             d->streams_lock.unlock();
@@ -510,10 +524,20 @@ static const VSFrame *VS_CC BM3DGetFrame(
                 if (sf == my_stream) {
                     continue;   // same stream: already fence-ordered
                 }
+                if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d waits on f=%d sf=%d val=%d\n", n, f, sf, f + 1);
                 waits.push_back(d->timelines[sf]);
                 values.push_back(static_cast<uint64_t>(f + 1));
             }
             if (!waits.empty() && !std::getenv("BM3D_NOWAIT")) {
+                if (std::getenv("BM3D_TRACE")) {
+                    for (size_t w = 0; w < waits.size(); ++w) {
+                        uint64_t cur = 0;
+                        vkGetSemaphoreCounterValue(dev, waits[w], &cur);
+                        fprintf(stderr, "[t]   sem[%zu] cur=%llu want=%llu\n", w,
+                            static_cast<unsigned long long>(cur),
+                            static_cast<unsigned long long>(values[w]));
+                    }
+                }
                 VkSemaphoreWaitInfo wait_info {
                     .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
                     .pNext = nullptr,
@@ -523,6 +547,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
                     .pValues = values.data()
                 };
                 checkVK(vkWaitSemaphores(dev, &wait_info, UINT64_MAX));
+                if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d waits done (%zu)\n", n, waits.size());
             }
         }
 
@@ -535,10 +560,10 @@ static const VSFrame *VS_CC BM3DGetFrame(
         const int r = d->radius;
         const int lo = std::clamp(n - 2 * r, 0, d->nframes - 1);
         const int hi = std::clamp(n + 2 * r, 0, d->nframes - 1);
-        std::array<bool, 16> uploaded {};
+        std::array<bool, 4 * MAX_RADIUS + 1> uploaded {};
         bool any_uploaded = false;
         for (int f = lo; f <= hi; ++f) {
-            const int slot = f % d->SRC_RING;
+            const int slot = f % d->src_ring;
             if (d->src_content[slot] == f) {
                 continue;
             }
@@ -572,6 +597,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
         }
 
         record_bm3d_cmd(d, stream, n, uploaded);
+        if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d recorded\n", n);
 
         {
             std::lock_guard lock(*stream.queue_lock);
@@ -593,6 +619,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
         }
 
         checkVK(vkWaitForFences(dev, 1, &stream.fence, VK_TRUE, UINT64_MAX));
+        if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d fenced\n", n);
 
         if (stream.ts_query && std::getenv("BM3D_GPUTRACE")) {
             static std::atomic<uint64_t> ts_k {}, ts_a {};
@@ -644,6 +671,13 @@ static const VSFrame *VS_CC BM3DGetFrame(
                 .value = static_cast<uint64_t>(n + 1)
             };
             vkSignalSemaphore(dev, &signal_info);
+            if (std::getenv("BM3D_TRACE")) {
+                uint64_t cur = 0;
+                vkGetSemaphoreCounterValue(dev, stream.timeline, &cur);
+                fprintf(stderr, "[t] n=%d signaled val=%llu cur=%llu\n", n,
+                    static_cast<unsigned long long>(n + 1),
+                    static_cast<unsigned long long>(cur));
+            }
         }
 
         d->streams_lock.lock();
@@ -737,10 +771,11 @@ static void VS_CC BM3DCreate(
     if (error) {
         d->radius = 0;
     }
-    if (d->radius < 0 || d->radius > MAX_RADIUS) {
-        return set_error("\"radius\" must be in range [0, 16]");
+    if (d->radius < 0 || d->radius > 4) {
+        return set_error("\"radius\" must be in range [0, 4]");
     }
     d->tw = 2 * d->radius + 1;
+    d->src_ring = 4 * d->radius + 1;
 
     std::array<int, 3> ps_num;
     for (int i = 0; i < std::ssize(ps_num); ++i) {
@@ -812,7 +847,7 @@ static void VS_CC BM3DCreate(
         VkPushConstantRange push_constant_range {
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
             .offset = 0,
-            .size = 5 * sizeof(int32_t)
+            .size = 9 * sizeof(int32_t)
         };
         VkPipelineLayoutCreateInfo pipeline_layout_info {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -861,7 +896,7 @@ static void VS_CC BM3DCreate(
         (void)res_size;
         for (int plane = 0; plane < d->n_planes; ++plane) {
             const auto & p = d->planes[plane];
-            src_size += static_cast<VkDeviceSize>(d->SRC_RING) * p.pe;
+            src_size += static_cast<VkDeviceSize>(d->src_ring) * p.pe;
             res_size += static_cast<VkDeviceSize>(d->RES_RING) * d->tw * 2 * p.pe;
             dst_size += p.pe;
         }
@@ -959,7 +994,7 @@ static void VS_CC BM3DCreate(
             p.bm3d_pipeline = std::get<VkPipeline>(result);
         }
         {
-            const auto result = create_agg_pipeline(*d->device, p, d->agg_module, d->pipeline_layout);
+            const auto result = create_agg_pipeline(*d->device, p, *d, d->agg_module, d->pipeline_layout);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -974,6 +1009,7 @@ static void VS_CC BM3DCreate(
     // streams
     d->semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
     d->streams.reserve(d->num_streams);
+    d->timelines.resize(d->num_streams);
 
     uint32_t num_queues = std::min(d->num_streams, static_cast<int>(d->device->queue_count));
 
@@ -1006,6 +1042,7 @@ static void VS_CC BM3DCreate(
         }
         checkVK(vkMapMemory(dev, stream.staging_mem, 0, staging_size, 0,
             reinterpret_cast<void **>(&stream.map)));
+
 
         {
             VkCommandPoolCreateInfo pool_info {
@@ -1085,6 +1122,7 @@ static void VS_CC BM3DCreate(
 
         stream.queue = d->device->queues[i % num_queues].queue;
         stream.queue_lock = d->device->queues[i % num_queues].lock.get();
+        stream.stream_id = i;
 
         d->streams.push_back(std::move(stream));
     }

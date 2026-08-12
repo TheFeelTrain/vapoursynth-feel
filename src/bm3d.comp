@@ -26,6 +26,7 @@ layout(constant_id = 8) const int PS_RANGE = 7;
 layout(constant_id = 9) const float EXTRACTOR = 0.0;
 layout(constant_id = 10) const int NOSEARCH = 0;
 layout(constant_id = 11) const int NOESTIMATE = 0;
+layout(constant_id = 12) const int SRC_RING = 9;  // 4 * RADIUS + 1 (window union)
 
 const int KRADIUS = RADIUS;
 const int TEMPORAL_WIDTH = 2 * RADIUS + 1;
@@ -48,8 +49,6 @@ layout(push_constant) uniform PushConstants {
     int nmod;      // center frame index of the window
     int nframes;   // total frame count (for boundary clamping)
 } pc;
-
-const int SRC_RING = 9;
 
 // absolute frame index of the window position z (clamped at the boundaries)
 int src_frame(int z) {
