@@ -13,6 +13,7 @@ import ctypes
 import subprocess
 import sys
 import textwrap
+import threading
 
 import numpy as np
 import pytest
@@ -47,6 +48,59 @@ def _check_all_frames_finite(clip, **kwargs):
     for n in range(out.num_frames):
         a = frame_to_ndarray(out.get_frame(n))
         assert np.isfinite(a).all(), f"non-finite output at frame {n}"
+
+
+def _eval_parallel(clip, **kwargs):
+    """Evaluate every frame concurrently, the way vspipe does.
+
+    Sequential get_frame() calls keep at most one frame in flight in the
+    filter, so the pipelined multi-stream path (parallel arAllFramesReady
+    invocations, reused command buffers and fences across streams) is never
+    exercised. Requesting all frames from worker threads at once forces the
+    deep pipeline and with it the cross-stream synchronization.
+    """
+    out = _run(clip, **kwargs)
+    frames = [None] * out.num_frames
+
+    def worker(n):
+        frames[n] = frame_to_ndarray(out.get_frame(n))
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(out.num_frames)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert all(f is not None for f in frames)
+    return frames
+
+
+def test_bm3dv2_parallel_load_matches_serial(noise_gray):
+    """Parallel request load with num_streams=4 must produce the same pixel
+    values as the serial path.
+
+    This is the request pattern that exposed stale descriptor bindings, fence
+    misuse and command pool reuse violations under load on strict drivers
+    (black or garbage output only when frames are processed concurrently).
+    """
+    par = _eval_parallel(noise_gray, radius=2, num_streams=4)
+    ref = _run(noise_gray, radius=2, num_streams=1)
+    for n in range(noise_gray.num_frames):
+        d = par[n] - frame_to_ndarray(ref.get_frame(n))
+        assert np.abs(d).max() < 1e-5, f"parallel/serial mismatch at frame {n}"
+
+
+def test_bm3dv2_parallel_load_deterministic(noise_gray):
+    """Two parallel num_streams=4 runs must produce identical output.
+
+    A fence attached to two in-flight submissions makes frame results depend
+    on the completion order of the streams, which only shows up when many
+    frames are in flight at once.
+    """
+    a = _eval_parallel(noise_gray, radius=2, num_streams=4)
+    b = _eval_parallel(noise_gray, radius=2, num_streams=4)
+    for n in range(noise_gray.num_frames):
+        d = a[n] - b[n]
+        assert np.abs(d).max() < 1e-5, f"nondeterministic output at frame {n}"
 
 
 @pytest.mark.parametrize("radius", [0, 1, 2, 3, 4])
