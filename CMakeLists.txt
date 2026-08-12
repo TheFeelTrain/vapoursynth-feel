@@ -63,6 +63,17 @@ if(VK_GLSLC)
                 VERBATIM)
         endforeach()
     endforeach()
+    foreach(kernel IN ITEMS bm3d bm3d_agg)
+        list(APPEND VK_SPV_OUTPUTS "${VK_SPV_DIR}/${kernel}.spv")
+        add_custom_command(
+            OUTPUT "${VK_SPV_DIR}/${kernel}.spv"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
+            COMMAND ${VK_GLSLC} -O -fshader-stage=compute
+                    -o "${VK_SPV_DIR}/${kernel}.spv"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/src/${kernel}.comp"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/${kernel}.comp"
+            VERBATIM)
+    endforeach()
 else()
     message(FATAL_ERROR "glslc not found")
 endif()
@@ -76,6 +87,8 @@ add_custom_command(
             "${VK_SPV_DIR}/kernel_plain_8.spv"
             "${VK_SPV_DIR}/kernel_plain_16.spv"
             "${VK_SPV_DIR}/kernel_plain_32.spv"
+            "${VK_SPV_DIR}/bm3d.spv"
+            "${VK_SPV_DIR}/bm3d_agg.spv"
             "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
     DEPENDS ${VK_SPV_OUTPUTS}
     VERBATIM)
@@ -85,6 +98,7 @@ set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h" PROPE
 add_library(vsfeel SHARED
     src/vsfeel.cpp
     src/bilateral.cpp
+    src/bm3d.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h")
 configure_common(vsfeel)
 target_compile_options(vsfeel PRIVATE -mavx2)

@@ -2,7 +2,8 @@
 """Generate a C++ header embedding SPIR-V binaries as uint32_t arrays.
 
 Usage: gen_spirv_header.py <shared_8> <shared_16> <shared_32>
-                           <plain_8> <plain_16> <plain_32> <out header>
+                           <plain_8> <plain_16> <plain_32>
+                           <bm3d> <bm3d_agg> <out header>
 """
 
 import sys
@@ -23,11 +24,11 @@ def emit_spv(f, name: str, path: Path) -> None:
     f.write(f"static const size_t {name}_spv_size = sizeof({name}_spv);\n\n")
 
 def main() -> None:
-    if len(sys.argv) != 8:
-        print("usage: gen_spirv_header.py <shared_8> <shared_16> <shared_32> <plain_8> <plain_16> <plain_32> <out header>")
+    if len(sys.argv) != 10:
+        print("usage: gen_spirv_header.py <shared_8> <shared_16> <shared_32> <plain_8> <plain_16> <plain_32> <bm3d> <bm3d_agg> <out header>")
         sys.exit(1)
 
-    shared_8, shared_16, shared_32, plain_8, plain_16, plain_32, out_path = (Path(a) for a in sys.argv[1:])
+    shared_8, shared_16, shared_32, plain_8, plain_16, plain_32, bm3d, bm3d_agg, out_path = (Path(a) for a in sys.argv[1:])
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with out_path.open("w") as f:
@@ -39,6 +40,8 @@ def main() -> None:
         emit_spv(f, "kernel_plain_8", plain_8)
         emit_spv(f, "kernel_plain_16", plain_16)
         emit_spv(f, "kernel_plain_32", plain_32)
+        emit_spv(f, "bm3d", bm3d)
+        emit_spv(f, "bm3d_agg", bm3d_agg)
 
 if __name__ == "__main__":
     main()

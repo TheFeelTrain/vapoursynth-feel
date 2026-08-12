@@ -262,6 +262,5 @@ dist/
 uv.lock
 
 .vsjet/
-vapoursynth-zipcl/
-vk_test.py
-zip_test.py
+benchmark/
+reference/

@@ -146,6 +146,9 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
         .pQueuePriorities = &queue_priority
     };
 
+    VkPhysicalDeviceFeatures features {};
+    features.shaderFloat64 = VK_TRUE;
+
     VkDeviceCreateInfo device_info {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = nullptr,
@@ -156,7 +159,7 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
         .ppEnabledLayerNames = nullptr,
         .enabledExtensionCount = 0,
         .ppEnabledExtensionNames = nullptr,
-        .pEnabledFeatures = nullptr
+        .pEnabledFeatures = &features
     };
 
     result = vkCreateDevice(dev->physical_device, &device_info, nullptr, &dev->device);
@@ -317,4 +320,5 @@ VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
     );
 
     vsfeel_register_bilateral(vspapi, plugin);
+    vsfeel_register_bm3dv2(vspapi, plugin);
 }

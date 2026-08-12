@@ -1,0 +1,599 @@
+#version 450
+
+/*
+ * BM3D collaborative hard-thresholding kernel (Vulkan port of the vszipcl
+ * OpenCL kernel). One workgroup = one warp of 32 lanes; 4 groups of 8 lanes
+ * each process one 8x8 block. The per-lane layout is [match(8) x row(8)] with
+ * the block column provided by the lane id, so the 2D transform uses shared
+ * memory transposes between the 8 lanes of a group.
+ *
+ * Compile-time variants: -DBITS not used; the kernel is specialized through
+ * specialization constants (WIDTH..EXTRACTOR) so the pipeline can be built
+ * once per plane configuration.
+ */
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const int WIDTH = 1920;
+layout(constant_id = 1) const int HEIGHT = 1080;
+layout(constant_id = 2) const int STRIDE = 1920;
+layout(constant_id = 3) const float SIGMA_Y = 0.0;
+layout(constant_id = 4) const int BLOCK_STEP = 4;
+layout(constant_id = 5) const int BM_RANGE = 16;
+layout(constant_id = 6) const int RADIUS = 2;
+layout(constant_id = 7) const int PS_NUM = 2;
+layout(constant_id = 8) const int PS_RANGE = 7;
+layout(constant_id = 9) const float EXTRACTOR = 0.0;
+layout(constant_id = 10) const int NOSEARCH = 0;
+layout(constant_id = 11) const int NOESTIMATE = 0;
+
+const int KRADIUS = RADIUS;
+const int TEMPORAL_WIDTH = 2 * RADIUS + 1;
+const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
+const int PLANE_STRIDE = TEMPORAL_WIDTH * TEMPORAL_STRIDE;
+const int NUM_PLANES = 1;
+const int CLIP_STRIDE = NUM_PLANES * TEMPORAL_WIDTH * TEMPORAL_STRIDE;
+
+const float FLT_MAX_ = 3.402823466e+38f;
+const float FLT_EPS_ = 1.192092896e-07f;
+const int INT_MAX_ = 0x7fffffff;
+
+const int smem_stride = 33;
+
+layout(std430, binding = 0) buffer ResBuf { uint res[]; };
+layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
+
+layout(push_constant) uniform PushConstants {
+    int res_off;   // float offset of this plane's result region
+    int nmod;      // center frame index of the window
+    int nframes;   // total frame count (for boundary clamping)
+} pc;
+
+const int SRC_RING = 9;
+
+// absolute frame index of the window position z (clamped at the boundaries)
+int src_frame(int z) {
+    return min(max(pc.nmod - KRADIUS + z, 0), pc.nframes - 1);
+}
+
+// float offset of the ring slot holding the frame at window position z
+int src_off(int z) {
+    return src_frame(z) % SRC_RING * TEMPORAL_STRIDE;
+}
+
+shared float buffer_all[8 * smem_stride];
+shared float red_all[32];
+shared float l_e[4][64];
+shared int l_x[4][64];
+shared int l_y[4][64];
+shared int l_s[4][64];
+
+
+void dct_fwd(inout float v[8]) {
+    const float KP414213562 = +0.414213562373095048801688724209698078569671875;
+    const float KP1_847759065 = +1.847759065022573512256366378793576573644833252;
+    const float KP198912367 = +0.198912367379658006911597622644676228597850501;
+    const float KP1_961570560 = +1.961570560806460898252364472268478073947867462;
+    const float KP1_414213562 = +1.414213562373095048801688724209698078569671875;
+    const float KP668178637 = +0.668178637919298919997757686523080761552472251;
+    const float KP1_662939224 = +1.662939224605090474157576755235811513477121624;
+    const float KP707106781 = +0.707106781186547524400844362104849039284835938;
+
+    float T1 = v[0];
+    float T2 = v[7];
+    float T3 = T1 - T2;
+    float Tj = T1 + T2;
+    float Tc = v[4];
+    float Td = v[3];
+    float Te = Tc - Td;
+    float Tk = Tc + Td;
+    float T4 = v[2];
+    float T5 = v[5];
+    float T6 = T4 - T5;
+    float T7 = v[1];
+    float T8 = v[6];
+    float T9 = T7 - T8;
+    float Ta = T6 + T9;
+    float Tn = T7 + T8;
+    float Tf = T6 - T9;
+    float Tm = T4 + T5;
+    float Tb = fma(-KP707106781, Ta, T3);
+    float Tg = fma(-KP707106781, Tf, Te);
+    v[3] = KP1_662939224 * (fma(KP668178637, Tg, Tb));
+    v[5] = -(KP1_662939224 * (fma(-KP668178637, Tb, Tg)));
+    float Tp = Tj + Tk;
+    float Tq = Tm + Tn;
+    v[4] = KP1_414213562 * (Tp - Tq);
+    v[0] = KP1_414213562 * (Tp + Tq);
+    float Th = fma(KP707106781, Ta, T3);
+    float Ti = fma(KP707106781, Tf, Te);
+    v[1] = KP1_961570560 * (fma(-KP198912367, Ti, Th));
+    v[7] = KP1_961570560 * (fma(KP198912367, Th, Ti));
+    float Tl = Tj - Tk;
+    float To = Tm - Tn;
+    v[2] = KP1_847759065 * (fma(-KP414213562, To, Tl));
+    v[6] = KP1_847759065 * (fma(KP414213562, Tl, To));
+}
+
+void dct_inv(inout float v[8]) {
+    const float KP1_662939224 = +1.662939224605090474157576755235811513477121624;
+    const float KP668178637 = +0.668178637919298919997757686523080761552472251;
+    const float KP1_961570560 = +1.961570560806460898252364472268478073947867462;
+    const float KP198912367 = +0.198912367379658006911597622644676228597850501;
+    const float KP1_847759065 = +1.847759065022573512256366378793576573644833252;
+    const float KP707106781 = +0.707106781186547524400844362104849039284835938;
+    const float KP414213562 = +0.414213562373095048801688724209698078569671875;
+    const float KP1_414213562 = +1.414213562373095048801688724209698078569671875;
+
+    float T1 = v[0] * KP1_414213562;
+    float T2 = v[4];
+    float T3 = fma(KP1_414213562, T2, T1);
+    float Tj = fma(-KP1_414213562, T2, T1);
+    float T4 = v[2];
+    float T5 = v[6];
+    float T6 = fma(KP414213562, T5, T4);
+    float Tk = fma(KP414213562, T4, -T5);
+    float T8 = v[1];
+    float Td = v[7];
+    float T9 = v[5];
+    float Ta = v[3];
+    float Tb = T9 + Ta;
+    float Te = Ta - T9;
+    float Tc = fma(KP707106781, Tb, T8);
+    float Tn = fma(-KP707106781, Te, Td);
+    float Tf = fma(KP707106781, Te, Td);
+    float Tm = fma(-KP707106781, Tb, T8);
+    float T7 = fma(KP1_847759065, T6, T3);
+    float Tg = fma(KP198912367, Tf, Tc);
+    v[7] = fma(-KP1_961570560, Tg, T7);
+    v[0] = fma(KP1_961570560, Tg, T7);
+    float Tp = fma(-KP1_847759065, Tk, Tj);
+    float Tq = fma(KP668178637, Tm, Tn);
+    v[5] = fma(-KP1_662939224, Tq, Tp);
+    v[2] = fma(KP1_662939224, Tq, Tp);
+    float Th = fma(-KP1_847759065, T6, T3);
+    float Ti = fma(-KP198912367, Tc, Tf);
+    v[3] = fma(-KP1_961570560, Ti, Th);
+    v[4] = fma(KP1_961570560, Ti, Th);
+    float Tl = fma(KP1_847759065, Tk, Tj);
+    float To = fma(-KP668178637, Tn, Tm);
+    v[6] = fma(-KP1_662939224, To, Tl);
+    v[1] = fma(KP1_662939224, To, Tl);
+}
+
+void transform_pack8(inout float data[64]) {
+    // transform 8 groups of 8 consecutive elements, groups stepped by 8
+    for (int it = 0; it < 8; ++it) {
+        float v[8];
+        for (int i = 0; i < 8; ++i) v[i] = data[it * 8 + i];
+        dct_fwd(v);
+        for (int i = 0; i < 8; ++i) data[it * 8 + i] = v[i];
+    }
+}
+
+void transform_pack8_inv(inout float data[64]) {
+    for (int it = 0; it < 8; ++it) {
+        float v[8];
+        for (int i = 0; i < 8; ++i) v[i] = data[it * 8 + i];
+        dct_inv(v);
+        for (int i = 0; i < 8; ++i) data[it * 8 + i] = v[i];
+    }
+}
+
+void transform_pack8_1d(inout float data[64]) {
+    // stride 8 groups: the 8 matches at a fixed position
+    for (int it = 0; it < 8; ++it) {
+        float v[8];
+        for (int i = 0; i < 8; ++i) v[i] = data[it + i * 8];
+        dct_fwd(v);
+        for (int i = 0; i < 8; ++i) data[it + i * 8] = v[i];
+    }
+}
+
+void transform_pack8_1d_inv(inout float data[64]) {
+    for (int it = 0; it < 8; ++it) {
+        float v[8];
+        for (int i = 0; i < 8; ++i) v[i] = data[it + i * 8];
+        dct_inv(v);
+        for (int i = 0; i < 8; ++i) data[it + i * 8] = v[i];
+    }
+}
+
+// cooperative 8x8 transpose across the 8 lanes of a group via shared memory;
+// each lane holds [match x row] for its column, after the transpose it holds
+// [match x col] for its row. Only the lanes of one group (8 consecutive
+// logical lanes) participate per tile; the group's column range is
+// (lane & ~7) .. (lane & ~7) + 7.
+void transpose_pack8(inout float data[64]) {
+    const int lane = int(gl_LocalInvocationID.x);
+    for (int it = 0; it < 8; ++it) {
+        barrier();
+        for (int i = 0; i < 8; ++i) buffer_all[i * smem_stride + lane] = data[it * 8 + i];
+        barrier();
+        for (int i = 0; i < 8; ++i) {
+            data[it * 8 + i] = buffer_all[(lane % 8) * smem_stride + (lane & ~7) + i];
+        }
+    }
+}
+
+float reduce_group8(float x) {
+    const int lane = int(gl_LocalInvocationID.x);
+    barrier();
+    red_all[lane] = x;
+    barrier();
+    const int g = lane & ~7;
+    return ((red_all[g + 0] + red_all[g + 1]) + (red_all[g + 2] + red_all[g + 3])) +
+           ((red_all[g + 4] + red_all[g + 5]) + (red_all[g + 6] + red_all[g + 7]));
+}
+
+float ssd_pre(const float cur[64]) {
+    return 0.0f;
+}
+
+
+float ssd_err(const float cur[64], float pre, const int base_idx, int cx, int cy) {
+    float col[8];
+    for (int c = 0; c < 8; ++c) {
+        float errors[2] = float[2](0.0f, 0.0f);
+        for (int i = 0; i < 8; ++i) {
+            float val = cur[c * 8 + i] - src[base_idx + (cy + i) * STRIDE + (cx + c)];
+            errors[i % 2] += val * val;
+        }
+        col[c] = errors[0] + errors[1];
+    }
+    return ((col[0] + col[1]) + (col[2] + col[3])) + ((col[4] + col[5]) + (col[6] + col[7]));
+}
+
+void insert8(inout float e[8], inout int xs[8], inout int ys[8], inout int sq[8],
+             float err_, int cx_, int cy_, int cs_) {
+    if (err_ < e[7]) {
+        int pos = 8;
+        for (int k = 7; k >= 0; --k) {
+            pos = (err_ < e[k]) ? k : pos;
+        }
+        for (int k = 7; k >= 1; --k) {
+            e[k]  = (k == pos) ? err_ : ((k > pos) ? e[k - 1] : e[k]);
+            xs[k] = (k == pos) ? cx_ : ((k > pos) ? xs[k - 1] : xs[k]);
+            ys[k] = (k == pos) ? cy_ : ((k > pos) ? ys[k - 1] : ys[k]);
+            sq[k] = (k == pos) ? cs_ : ((k > pos) ? sq[k - 1] : sq[k]);
+        }
+        e[0]  = (pos == 0) ? err_ : e[0];
+        xs[0] = (pos == 0) ? cx_ : xs[0];
+        ys[0] = (pos == 0) ? cy_ : ys[0];
+        sq[0] = (pos == 0) ? cs_ : sq[0];
+    }
+}
+
+void ginsert8(inout float e[8], inout int xs[8], inout int ys[8], inout int zs[8],
+              float err_, int cx_, int cy_, int cz_) {
+    if (err_ < e[7]) {
+        int pos = 8;
+        for (int k = 7; k >= 0; --k) {
+            pos = (err_ < e[k]) ? k : pos;
+        }
+        for (int k = 7; k >= 1; --k) {
+            e[k]  = (k == pos) ? err_ : ((k > pos) ? e[k - 1] : e[k]);
+            xs[k] = (k == pos) ? cx_ : ((k > pos) ? xs[k - 1] : xs[k]);
+            ys[k] = (k == pos) ? cy_ : ((k > pos) ? ys[k - 1] : ys[k]);
+            zs[k] = (k == pos) ? cz_ : ((k > pos) ? zs[k - 1] : zs[k]);
+        }
+        e[0]  = (pos == 0) ? err_ : e[0];
+        xs[0] = (pos == 0) ? cx_ : xs[0];
+        ys[0] = (pos == 0) ? cy_ : ys[0];
+        zs[0] = (pos == 0) ? cz_ : zs[0];
+    }
+}
+
+void merge_group64(int base, out float me[8], out int mx[8], out int my[8], out int ms[8]) {
+    const int lane = int(gl_LocalInvocationID.x);
+    const int group = lane >> 3;
+    int head[8];
+    for (int l = 0; l < 8; ++l) head[l] = 0;
+    for (int k = 0; k < 8; ++k) {
+        int bl = 0;
+        int bh = 0;
+        float be = FLT_MAX_;
+        int bs = INT_MAX_;
+        bool found = false;
+        for (int l = 0; l < 8; ++l) {
+            int hv = head[l];
+            bool valid = hv < 8;
+            int idx = base + l * 8 + (valid ? hv : 7);
+            float e = valid ? l_e[group][idx] : FLT_MAX_;
+            int sq = valid ? l_s[group][idx] : INT_MAX_;
+            bool better = valid && (!found || e < be || (e == be && sq < bs));
+            bl = better ? l : bl;
+            bh = better ? hv : bh;
+            be = better ? e : be;
+            bs = better ? sq : bs;
+            found = found || valid;
+        }
+        me[k] = be;
+        mx[k] = l_x[group][base + bl * 8 + bh];
+        my[k] = l_y[group][base + bl * 8 + bh];
+        ms[k] = bs;
+        for (int l = 0; l < 8; ++l) {
+            head[l] += (l == bl) ? 1 : 0;
+        }
+    }
+}
+
+float hard_thresholding_s(inout float data[64]) {
+    const int lane = int(gl_LocalInvocationID.x);
+    float ks[4] = float[4](0.0f, 0.0f, 0.0f, 0.0f);
+
+    for (int i = 0; i < 64; ++i) {
+        float val = data[i];
+
+        float thr;
+        if (i == 0) {
+            thr = (lane % 8) != 0 ? SIGMA_Y : 0.0f;
+        } else {
+            thr = SIGMA_Y;
+        }
+
+        bool flag = abs(val) >= thr;
+
+        ks[i % 4] += flag ? 1.0f : 0.0f;
+        data[i] = flag ? (val * (1.0f / 4096.0f)) : 0.0f;
+    }
+
+    float k = (ks[0] + ks[1]) + (ks[2] + ks[3]);
+    k = reduce_group8(k);
+
+    return 1.0f / k;
+}
+
+void collaborative_hard(inout float denoising_patch[64], out float adaptive_weight) {
+    const int lane = int(gl_LocalInvocationID.x);
+    for (int ndim = 0; ndim < 2; ++ndim) {
+        transform_pack8(denoising_patch);
+        transpose_pack8(denoising_patch);
+    }
+    transform_pack8_1d(denoising_patch);
+
+    adaptive_weight = hard_thresholding_s(denoising_patch);
+
+    for (int ndim = 0; ndim < 2; ++ndim) {
+        transform_pack8_inv(denoising_patch);
+        transpose_pack8(denoising_patch);
+    }
+    transform_pack8_1d_inv(denoising_patch);
+}
+
+uint atom_add_f(uint old, float val) {
+    return floatBitsToUint(uintBitsToFloat(old) + val);
+}
+
+void main() {
+    const int lid = int(gl_LocalInvocationID.x);
+    const int group = lid >> 3;
+    const int sub_lane_id = lid & 7;
+    const int gid = int(gl_WorkGroupID.x);
+
+    const int x0 = (4 * gid + group) * BLOCK_STEP;
+    int y = BLOCK_STEP * int(gl_WorkGroupID.y);
+    if (y >= HEIGHT - 8 + BLOCK_STEP) {
+        return;
+    }
+    const bool is_active = x0 < WIDTH - 8 + BLOCK_STEP;
+    int x = min(is_active ? x0 : 0, WIDTH - 8);
+    y = min(y, HEIGHT - 8);
+
+    const int srcpc_base = src_off(KRADIUS);
+    float cur[64];
+    for (int c = 0; c < 8; ++c) {
+        for (int i = 0; i < 8; ++i) {
+            cur[c * 8 + i] = src[srcpc_base + (y + i) * STRIDE + (x + c)];
+        }
+    }
+    const float center_pre = ssd_pre(cur);
+
+    float ge[8];
+    int gx[8], gy[8], gz[8];
+    if (NOSEARCH != 0) {
+        for (int k = 0; k < 8; ++k) {
+            ge[k] = 0.0f;
+            gx[k] = x;
+            gy[k] = y;
+            gz[k] = KRADIUS;
+        }
+    } else {
+    {
+        float pe[8];
+        int px[8], py[8], ps[8];
+        for (int k = 0; k < 8; ++k) {
+            pe[k] = FLT_MAX_;
+            px[k] = 0;
+            py[k] = 0;
+            ps[k] = INT_MAX_;
+        }
+        const int left = max(x - BM_RANGE, 0);
+        const int right = min(x + BM_RANGE, WIDTH - 8);
+        const int top = max(y - BM_RANGE, 0);
+        const int bottom = min(y + BM_RANGE, HEIGHT - 8);
+        const int rw = right - left + 1;
+        const int total = (bottom - top + 1) * rw;
+        #pragma unroll 2
+        for (int s = sub_lane_id; s < total; s += 8) {
+            const int row_i = top + s / rw;
+            const int col_i = left + s % rw;
+            const float error = ssd_err(cur, center_pre, srcpc_base, col_i, row_i);
+            insert8(pe, px, py, ps, error, col_i, row_i, s);
+        }
+        barrier();
+        for (int k = 0; k < 8; ++k) {
+            l_e[group][sub_lane_id * 8 + k] = pe[k];
+            l_x[group][sub_lane_id * 8 + k] = px[k];
+            l_y[group][sub_lane_id * 8 + k] = py[k];
+            l_s[group][sub_lane_id * 8 + k] = ps[k];
+        }
+        barrier();
+        int gseq[8];
+        merge_group64(0, ge, gx, gy, gseq);
+        for (int k = 0; k < 8; ++k) gz[k] = KRADIUS;
+    }
+
+    {
+        int sx[8], sy[8];
+        for (int k = 0; k < 8; ++k) {
+            sx[k] = gx[k];
+            sy[k] = gy[k];
+        }
+
+        for (int direction = -1; direction <= 1; direction += 2) {
+            barrier();
+            if (sub_lane_id == 0) {
+                for (int k = 0; k < 8; ++k) {
+                    l_x[group][k] = sx[k];
+                    l_y[group][k] = sy[k];
+                }
+            }
+            barrier();
+
+            for (int t = 1; t <= KRADIUS; ++t) {
+                const int temporal_index = KRADIUS + direction * t;
+                const int temporal_srcpc = src_off(temporal_index);
+
+                int cxs[PS_NUM], cys[PS_NUM];
+                for (int i = 0; i < PS_NUM; ++i) {
+                    cxs[i] = l_x[group][i];
+                    cys[i] = l_y[group][i];
+                }
+
+                float pe[8];
+                int px[8], py[8], ps[8];
+                for (int k = 0; k < 8; ++k) {
+                    pe[k] = FLT_MAX_;
+                    px[k] = 0;
+                    py[k] = 0;
+                    ps[k] = INT_MAX_;
+                }
+                for (int i = 0; i < PS_NUM; ++i) {
+                    const int left = max(cxs[i] - PS_RANGE, 0);
+                    const int right = min(cxs[i] + PS_RANGE, WIDTH - 8);
+                    const int top = max(cys[i] - PS_RANGE, 0);
+                    const int bottom = min(cys[i] + PS_RANGE, HEIGHT - 8);
+                    const int rw = right - left + 1;
+                    const int total = (bottom - top + 1) * rw;
+                    const int seq_base = i * ((2 * PS_RANGE + 1) * (2 * PS_RANGE + 1));
+                    #pragma unroll 2
+                    for (int s = sub_lane_id; s < total; s += 8) {
+                        const int row_i = top + s / rw;
+                        const int col_i = left + s % rw;
+                        const float error = ssd_err(cur, center_pre, temporal_srcpc, col_i, row_i);
+                        insert8(pe, px, py, ps, error, col_i, row_i, seq_base + s);
+                    }
+                }
+
+                barrier();
+                for (int k = 0; k < 8; ++k) {
+                    l_e[group][sub_lane_id * 8 + k] = pe[k];
+                    l_x[group][sub_lane_id * 8 + k] = px[k];
+                    l_y[group][sub_lane_id * 8 + k] = py[k];
+                    l_s[group][sub_lane_id * 8 + k] = ps[k];
+                }
+                barrier();
+                if (sub_lane_id == 0) {
+                    float fe[8];
+                    int fx[8], fy[8], fs[8];
+                    merge_group64(0, fe, fx, fy, fs);
+                    for (int i = 0; i < PS_NUM; ++i) {
+                        ginsert8(ge, gx, gy, gz, fe[i], fx[i], fy[i], temporal_index);
+                    }
+                    for (int k = 0; k < 8; ++k) {
+                        l_x[group][k] = fx[k];
+                        l_y[group][k] = fy[k];
+                    }
+                }
+                barrier();
+            }
+        }
+    }
+
+    barrier();
+    if (sub_lane_id == 0) {
+        int match = 0;
+        for (int k = 0; k < 8; ++k) {
+            int m = ((gx[k] == x) && (gy[k] == y)) ? 1 : 0;
+            m = (m != 0 && (gz[k] == KRADIUS)) ? 1 : 0;
+            match += m;
+        }
+        if (match == 0) {
+            for (int k = 7; k >= 1; --k) {
+                gx[k] = gx[k - 1];
+                gy[k] = gy[k - 1];
+                gz[k] = gz[k - 1];
+            }
+            gx[0] = x;
+            gy[0] = y;
+            gz[0] = KRADIUS;
+        }
+        for (int k = 0; k < 8; ++k) {
+            l_x[group][k] = gx[k];
+            l_y[group][k] = gy[k];
+            l_s[group][k] = gz[k];
+        }
+    }
+    barrier();
+    }
+
+    if (NOESTIMATE == 0) {
+    float denoising_patch[64];
+
+    {
+        float sigma = SIGMA_Y;
+
+        const int rplane = pc.res_off;
+
+        float adaptive_weight;
+        {
+            for (int i = 0; i < 8; ++i) {
+                const int tmp_x = l_x[group][i];
+                const int tmp_y = l_y[group][i];
+                const int tmp_z = l_s[group][i];
+                const int srcp = src_off(tmp_z) + tmp_y * STRIDE + tmp_x + sub_lane_id;
+                for (int j = 0; j < 8; ++j) {
+                    denoising_patch[i * 8 + j] = src[srcp + j * STRIDE];
+                }
+            }
+            collaborative_hard(denoising_patch, adaptive_weight);
+        }
+
+        if (is_active) {
+            const int wdstpc = rplane + sub_lane_id;
+            const int weightpc = rplane + TEMPORAL_STRIDE + sub_lane_id;
+
+            for (int i = 0; i < 8; ++i) {
+                const int tmp_x = l_x[group][i];
+                const int tmp_y = l_y[group][i];
+                const int tmp_z = l_s[group][i];
+                const int offset = tmp_z * 2 * TEMPORAL_STRIDE + tmp_y * STRIDE + tmp_x;
+
+                for (int j = 0; j < 8; ++j) {
+                    float wdst_val = (adaptive_weight * denoising_patch[i * 8 + j] + EXTRACTOR) - EXTRACTOR;
+                    float weight_val = (adaptive_weight + EXTRACTOR) - EXTRACTOR;
+
+                    {
+                        uint old = res[wdstpc + offset + j * STRIDE];
+                        uint assumed;
+                        do {
+                            assumed = old;
+                            old = atomicCompSwap(res[wdstpc + offset + j * STRIDE], assumed, atom_add_f(assumed, wdst_val));
+                        } while (old != assumed);
+                    }
+                    {
+                        uint old = res[weightpc + offset + j * STRIDE];
+                        uint assumed;
+                        do {
+                            assumed = old;
+                            old = atomicCompSwap(res[weightpc + offset + j * STRIDE], assumed, atom_add_f(assumed, weight_val));
+                        } while (old != assumed);
+                    }
+                }
+            }
+        }
+    }
+    }
+}
+

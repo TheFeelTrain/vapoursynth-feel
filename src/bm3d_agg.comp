@@ -1,0 +1,50 @@
+#version 450
+
+/*
+ * BM3D temporal aggregation kernel. For each output pixel, sums the
+ * pre-aggregated estimates (wdst) and weights (weight) of the 5 stacked
+ * result buffers and divides. The five slice offsets are precomputed on the
+ * host (res slot of each temporal frame + the aggregated z-block). The
+ * division is computed in fp64 so it rounds identically to the CPU-side
+ * aggregation of the reference implementation.
+ */
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+layout(constant_id = 0) const int WIDTH = 1920;
+layout(constant_id = 1) const int HEIGHT = 1080;
+layout(constant_id = 2) const int STRIDE = 1920;
+
+layout(std430, binding = 0) buffer ResBuf { uint res[]; };
+layout(std430, binding = 2) buffer DstBuf { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    int bases[5];  // float offsets of the 5 wdst slices within the res buffer
+} pc;
+
+const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
+
+// atomic load: the res buffer is accumulated with device-scope atomics by the
+// estimation kernel, so only coherent (atomic) reads are guaranteed to see the
+// writes without an explicit memory barrier
+float res_load(int o) {
+    return uintBitsToFloat(atomicOr(res[o], 0u));
+}
+
+void main() {
+    const int x = int(gl_GlobalInvocationID.x);
+    const int y = int(gl_GlobalInvocationID.y);
+    if (x >= WIDTH || y >= HEIGHT) {
+        return;
+    }
+
+    double acc = 0.0;
+    double acw = 0.0;
+    for (int i = 0; i < 5; ++i) {
+        const int o = pc.bases[i] + y * STRIDE + x;
+        acc += double(res_load(o));
+        acw += double(res_load(o + TEMPORAL_STRIDE));
+    }
+
+    dst[y * STRIDE + x] = float(acc / acw);
+}
