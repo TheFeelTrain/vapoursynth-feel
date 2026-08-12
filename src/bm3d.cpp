@@ -48,6 +48,7 @@ struct Bm3dStream {
     float * map {};
     VkCommandPool pool {};
     VkCommandBuffer cmd {};
+    VkCommandBuffer cmd_agg {};   // aggregation phase: recorded after the waits
     VkFence fence {};
     VkSemaphore timeline {};
     VkDescriptorSet desc_set {};
@@ -99,7 +100,7 @@ struct BM3DData {
 
     ticket_semaphore semaphore;
     std::vector<VkSemaphore> timelines;
-    std::array<int, 4 * MAX_RADIUS + 1> src_content {};  // frame index currently in each src slot
+    std::vector<int> src_content {};  // frame index currently in each src slot
     std::vector<int> res_content {};  // frame index whose estimates occupy each res slot
     std::array<int, 64> frame_stream {};   // stream index that processed frame n (mod 64)
     std::vector<Bm3dStream> streams;
@@ -116,6 +117,7 @@ struct BM3DData {
             if (s.staging_mem) vkFreeMemory(dev, s.staging_mem, nullptr);
             if (s.staging) vkDestroyBuffer(dev, s.staging, nullptr);
             if (s.cmd) vkFreeCommandBuffers(dev, s.pool, 1, &s.cmd);
+            if (s.cmd_agg) vkFreeCommandBuffers(dev, s.pool, 1, &s.cmd_agg);
             if (s.pool) vkDestroyCommandPool(dev, s.pool, nullptr);
             if (s.fence) vkDestroyFence(dev, s.fence, nullptr);
             if (s.timeline) vkDestroySemaphore(dev, s.timeline, nullptr);
@@ -343,7 +345,13 @@ static int agg_z(int i, int n, int nframes, int radius) {
     return std::min(std::max(2 * radius - i, n - nframes + 1 + radius), n + radius);
 }
 
-static int record_bm3d_cmd(BM3DData * d, Bm3dStream & stream, int n,
+// Record the estimation phase of the command buffer (staging copies, the
+// zero-fills and the search/estimate dispatches). It has no dependency on the
+// other in-flight frames: the src ring is sized for the union of all their
+// windows, and each frame only writes its own res slot. It is submitted before
+// the cross-frame wait so the GPU is busy with this heavy work while the host
+// blocks on the previous frames' timelines.
+static int record_bm3d_kernels(BM3DData * d, Bm3dStream & stream, int n,
                      const std::array<bool, 4 * MAX_RADIUS + 1> & uploaded) {
     VkDevice dev = d->device->device;
     VkCommandBuffer cmd = stream.cmd;
@@ -420,6 +428,28 @@ static int record_bm3d_cmd(BM3DData * d, Bm3dStream & stream, int n,
 
     if (gputrace) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, 1);
 
+    vkEndCommandBuffer(cmd);
+    return n_dispatches;
+}
+
+// Record the aggregation phase of the command buffer. It reads the res slots
+// accumulated by the in-flight frames, so the host must have waited for their
+// timelines before submitting it.
+static void record_bm3d_agg(BM3DData * d, Bm3dStream & stream, int n) {
+    VkCommandBuffer cmd = stream.cmd_agg;
+
+    VkCommandBufferBeginInfo begin_info {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .pInheritanceInfo = nullptr
+    };
+    vkBeginCommandBuffer(cmd, &begin_info);
+
+    const int nf = d->nframes;
+    const int r = d->radius;
+    const bool gputrace = std::getenv("BM3D_GPUTRACE") != nullptr;
+
     for (int plane = 0; plane < d->n_planes; ++plane) {
         const auto & p = d->planes[plane];
         const VkDeviceSize pe = p.pe;
@@ -469,7 +499,6 @@ static int record_bm3d_cmd(BM3DData * d, Bm3dStream & stream, int n,
     }
 
     vkEndCommandBuffer(cmd);
-    return n_dispatches;
 }
 
 static const VSFrame *VS_CC BM3DGetFrame(
@@ -532,54 +561,15 @@ static const VSFrame *VS_CC BM3DGetFrame(
 
         VkDevice dev = d->device->device;
 
-        // wait for the results of the previous frames that this frame's
-        // aggregation depends on (the res slots of m = n-2..n+1). At radius 0
-        // each frame accumulates into its own dedicated slot, so no cross-frame
-        // ordering is needed and the wait is skipped to keep the pipeline full.
-        if (d->radius > 0) {
-            std::vector<VkSemaphore> waits;
-            std::vector<uint64_t> values;
-            for (int f = std::max(n - 4, 0); f <= n - 1; ++f) {
-                const int sf = d->frame_stream[f % 64];
-                if (sf < 0) {
-                    continue;   // frame never processed: its slots are computed here
-                }
-                if (sf == my_stream) {
-                    continue;   // same stream: already fence-ordered
-                }
-                if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d waits on f=%d sf=%d val=%d\n", n, f, sf, f + 1);
-                waits.push_back(d->timelines[sf]);
-                values.push_back(static_cast<uint64_t>(f + 1));
-            }
-            if (!waits.empty() && !std::getenv("BM3D_NOWAIT")) {
-                if (std::getenv("BM3D_TRACE")) {
-                    for (size_t w = 0; w < waits.size(); ++w) {
-                        uint64_t cur = 0;
-                        vkGetSemaphoreCounterValue(dev, waits[w], &cur);
-                        fprintf(stderr, "[t]   sem[%zu] cur=%llu want=%llu\n", w,
-                            static_cast<unsigned long long>(cur),
-                            static_cast<unsigned long long>(values[w]));
-                    }
-                }
-                VkSemaphoreWaitInfo wait_info {
-                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
-                    .pNext = nullptr,
-                    .flags = 0,
-                    .semaphoreCount = static_cast<uint32_t>(waits.size()),
-                    .pSemaphores = waits.data(),
-                    .pValues = values.data()
-                };
-                checkVK(vkWaitSemaphores(dev, &wait_info, UINT64_MAX));
-                if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d waits done (%zu)\n", n, waits.size());
-            }
-        }
+        // The estimation phase is submitted first and has no dependency on the
+        // other streams: the src ring is sized for the union of all in-flight
+        // windows, so this frame's uploads cannot clobber data the in-flight
+        // kernels still read. Only the aggregation is ordered after their
+        // timelines (the host-side wait below).
 
         // upload only the frames whose ring slots do not yet hold them. The
         // needed range is the union of every window that this record's
         // dispatches may read: [clamp(n-2r), clamp(n+2r)].
-        // The data ordering is already guaranteed by the stream-timeline waits
-        // above: the uploader of frame f (frame f-4 at the latest) is always
-        // included in the waited frames n-4..n-1.
         const int r = d->radius;
         const int lo = std::clamp(n - 2 * r, 0, d->nframes - 1);
         const int hi = std::clamp(n + 2 * r, 0, d->nframes - 1);
@@ -619,8 +609,8 @@ static const VSFrame *VS_CC BM3DGetFrame(
             vkFlushMappedMemoryRanges(dev, 1, &flush_range);
         }
 
-        const int ndisp = record_bm3d_cmd(d, stream, n, uploaded);
-        if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d recorded\n", n);
+        const int ndisp = record_bm3d_kernels(d, stream, n, uploaded);
+        if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d kernels recorded\n", n);
 
         {
             std::lock_guard lock(*stream.queue_lock);
@@ -635,6 +625,60 @@ static const VSFrame *VS_CC BM3DGetFrame(
                 .pWaitDstStageMask = nullptr,
                 .commandBufferCount = 1,
                 .pCommandBuffers = &stream.cmd,
+                .signalSemaphoreCount = 0,
+                .pSignalSemaphores = nullptr
+            };
+            checkVK(vkQueueSubmit(stream.queue, 1, &submit_info, stream.fence));
+        }
+
+        // wait for the estimation kernels of the previous frames whose res
+        // slots this frame's aggregation reads. The estimation phase was
+        // already submitted, so the GPU stays busy here instead of stalling
+        // behind this host-side wait. At radius 0 every frame accumulates into
+        // its own dedicated slot, so no cross-frame ordering is needed.
+        if (d->radius > 0) {
+            std::vector<VkSemaphore> waits;
+            std::vector<uint64_t> values;
+            for (int f = std::max(n - d->num_streams, 0); f <= n - 1; ++f) {
+                const int sf = d->frame_stream[f % 64];
+                if (sf < 0) {
+                    continue;   // frame never processed: its slots are computed here
+                }
+                if (sf == my_stream) {
+                    continue;   // same stream: already fence-ordered
+                }
+                if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d waits on f=%d sf=%d val=%d\n", n, f, sf, f + 1);
+                waits.push_back(d->timelines[sf]);
+                values.push_back(static_cast<uint64_t>(f + 1));
+            }
+            if (!waits.empty() && !std::getenv("BM3D_NOWAIT")) {
+                VkSemaphoreWaitInfo wait_info {
+                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .semaphoreCount = static_cast<uint32_t>(waits.size()),
+                    .pSemaphores = waits.data(),
+                    .pValues = values.data()
+                };
+                checkVK(vkWaitSemaphores(dev, &wait_info, UINT64_MAX));
+                if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d waits done (%zu)\n", n, waits.size());
+            }
+        }
+
+        record_bm3d_agg(d, stream, n);
+        if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d agg recorded\n", n);
+
+        {
+            std::lock_guard lock(*stream.queue_lock);
+
+            VkSubmitInfo submit_info {
+                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .pNext = nullptr,
+                .waitSemaphoreCount = 0,
+                .pWaitSemaphores = nullptr,
+                .pWaitDstStageMask = nullptr,
+                .commandBufferCount = 1,
+                .pCommandBuffers = &stream.cmd_agg,
                 .signalSemaphoreCount = 0,
                 .pSignalSemaphores = nullptr
             };
@@ -832,8 +876,10 @@ static void VS_CC BM3DCreate(
     // at radius 0 every frame only touches its own slot and never depends on
     // the previous frames' estimates, so give each in-flight frame its own
     // src/res slot to keep the pipeline full; otherwise the ring of 1 would
-    // serialize the frames behind the timeline waits
-    d->src_ring = (d->radius == 0) ? d->num_streams : 4 * d->radius + 1;
+    // serialize the frames behind the timeline waits. At radius > 0 the src
+    // ring must hold the union of the windows of every in-flight frame, since
+    // the estimation kernels are submitted before the cross-frame waits.
+    d->src_ring = (d->radius == 0) ? d->num_streams : 4 * d->radius + d->num_streams;
     d->res_ring = (d->radius == 0) ? d->num_streams : d->tw;
 
     const int extractor_exp = vsh::int64ToIntS(vsapi->mapGetInt(in, "extractor_exp", 0, &error));
@@ -1096,9 +1142,12 @@ static void VS_CC BM3DCreate(
                 .pNext = nullptr,
                 .commandPool = stream.pool,
                 .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                .commandBufferCount = 1
+                .commandBufferCount = 2
             };
-            checkVK(vkAllocateCommandBuffers(dev, &alloc_info, &stream.cmd));
+            VkCommandBuffer cmds[2] {};
+            checkVK(vkAllocateCommandBuffers(dev, &alloc_info, cmds));
+            stream.cmd = cmds[0];
+            stream.cmd_agg = cmds[1];
         }
         {
             VkFenceCreateInfo fence_info {
@@ -1164,8 +1213,8 @@ static void VS_CC BM3DCreate(
         d->streams.push_back(std::move(stream));
     }
 
+    d->src_content.assign(d->src_ring, -1);
     d->res_content.assign(d->res_ring, -1);
-    std::fill(d->src_content.begin(), d->src_content.end(), -1);
     std::fill(d->frame_stream.begin(), d->frame_stream.end(), -1);
 
     BM3DData * data = d.release();

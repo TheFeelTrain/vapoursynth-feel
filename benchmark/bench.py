@@ -120,7 +120,7 @@ def main() -> None:
     parser.add_argument("--clip", default=DEFAULT_CLIP, help="input clip path")
     # BM3Dv2 args as a single comma-separated "key=value" string
     parser.add_argument("--bm3d-args", dest="bm3d_args",
-                        default="sigma=0.7, radius=2, bm_range=16, ps_range=7, block_step=4, num_streams=2",
+                        default="sigma=0.7, radius=2, bm_range=16, ps_range=7, block_step=4",
                         help='BM3Dv2 args, e.g. "sigma=1.5, radius=4, num_streams=1"')
     # Bilateral args
     parser.add_argument("--sigma-spatial", type=float, default=3.0, dest="sigma_spatial")

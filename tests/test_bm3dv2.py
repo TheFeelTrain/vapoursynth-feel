@@ -58,8 +58,9 @@ def test_bm3dv2_no_nan_all_frames(noise_gray, radius):
     _check_all_frames_finite(noise_gray, radius=radius, num_streams=1)
 
 
-def test_bm3dv2_no_nan_all_frames_multi_stream(noise_gray):
-    _check_all_frames_finite(noise_gray, radius=2, num_streams=2)
+@pytest.mark.parametrize("num_streams", [2, 4])
+def test_bm3dv2_no_nan_all_frames_multi_stream(noise_gray, num_streams):
+    _check_all_frames_finite(noise_gray, radius=2, num_streams=num_streams)
 
 
 def test_bm3dv2_deterministic(noise_gray):
@@ -68,6 +69,25 @@ def test_bm3dv2_deterministic(noise_gray):
     for n in (0, 11, 23):
         d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
         assert np.abs(d).max() < 1e-5, f"nondeterministic output at frame {n}"
+
+
+def test_bm3dv2_deterministic_multi_stream(noise_gray):
+    """Two separate num_streams=4 instances must produce the same output."""
+    a = _run(noise_gray, radius=2, num_streams=4)
+    b = _run(noise_gray, radius=2, num_streams=4)
+    for n in (0, 11, 23):
+        d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
+        assert np.abs(d).max() < 1e-5, f"nondeterministic output at frame {n}"
+
+
+def test_bm3dv2_multi_stream_matches_single(noise_gray):
+    """The pipelined num_streams=4 path must produce the same result as the
+    serial num_streams=1 path."""
+    a = _run(noise_gray, radius=2, num_streams=4)
+    b = _run(noise_gray, radius=2, num_streams=1)
+    for n in (0, 11, 23):
+        d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
+        assert np.abs(d).max() < 1e-5, f"num_streams mismatch at frame {n}"
 
 
 def test_bm3dv2_rejects_gray8(noise_8bit):
