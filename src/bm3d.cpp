@@ -485,7 +485,22 @@ static const VSFrame *VS_CC BM3DGetFrame(
             vsapi->requestFrameFilter(idx, d->node, frameCtx);
         }
     } else if (activationReason == arAllFramesReady) {
-        VSFrame * dst = vsapi->newVideoFrame(&d->vi->format, d->vi->width, d->vi->height, nullptr, core);
+        const VSFrame * src = nullptr;
+        if (d->chroma) {
+            src = vsapi->getFrameFilter(n, d->node, frameCtx);
+        }
+        VSFrame * dst;
+        if (d->chroma) {
+            // process the luma plane in place, copy the chroma planes and the
+            // frame props from the source frame
+            const int pl[] = { 0, 1, 2 };
+            const VSFrame * fr[] = { nullptr, src, src };
+            dst = vsapi->newVideoFrame2(
+                &d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
+            vsapi->freeFrame(src);
+        } else {
+            dst = vsapi->newVideoFrame(&d->vi->format, d->vi->width, d->vi->height, nullptr, core);
+        }
 
         d->semaphore.acquire();
         if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d acquired\n", n);
@@ -889,7 +904,7 @@ static void VS_CC BM3DCreate(
         checkVK(vkCreateDescriptorPool(dev, &pool_info, nullptr, &d->desc_pool));
     }
 
-    // plane configs (luma plane 0; chroma uses YUV444 only, one entry per plane)
+    // plane configs (luma plane 0; YUV chroma is passed through unprocessed)
     d->n_planes = 0;
     if (d->vi->format.colorFamily == cfGray) {
         auto & p = d->planes[0];
@@ -898,8 +913,16 @@ static void VS_CC BM3DCreate(
         p.stride = (d->vi->width + 3) & ~3;
         p.pe = static_cast<VkDeviceSize>(p.stride) * p.height;
         d->n_planes = 1;
+    } else if (d->vi->format.colorFamily == cfYUV) {
+        auto & p = d->planes[0];
+        p.width = d->vi->width;
+        p.height = d->vi->height;
+        p.stride = (d->vi->width + 3) & ~3;
+        p.pe = static_cast<VkDeviceSize>(p.stride) * p.height;
+        d->n_planes = 1;
+        d->chroma = true;
     } else {
-        return set_error("BM3D: only Gray input is currently supported");
+        return set_error("BM3D: only Gray and YUV input are currently supported");
     }
 
     // shared buffers

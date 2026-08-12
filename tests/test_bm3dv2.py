@@ -9,6 +9,7 @@ were made visible to the aggregation kernel).
 Run from the repository root:  python -m pytest tests/test_bm3dv2.py
 """
 
+import ctypes
 import subprocess
 import sys
 import textwrap
@@ -78,6 +79,35 @@ def test_bm3dv2_rejects_radius5(noise_gray):
     """Radius > 4 is unsupported and must be rejected up front."""
     with pytest.raises(vs.Error):
         _run(noise_gray, radius=5)
+
+
+def test_bm3dv2_yuv_passthrough(noise_gray):
+    """A full YUV clip is accepted: the luma must match the Gray output and
+    the chroma planes must be copied through bit-identically."""
+    src = vs.core.bs.VideoSource(NOISE_MKV)
+    yuv = vs.core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
+    assert yuv.format.color_family == vs.YUV
+
+    out = _run(yuv, radius=2, num_streams=1)
+    ref = _run(noise_gray, radius=2, num_streams=1)
+
+    for n in (0, 11, 23):
+        f = out.get_frame(n)
+        # luma is denoised identically to the Gray path
+        d = frame_to_ndarray(f) - frame_to_ndarray(ref.get_frame(n))
+        assert np.abs(d).max() < 1e-5, f"luma mismatch at frame {n}"
+        # chroma is passed through unchanged
+        s = yuv.get_frame(n)
+        for plane in (1, 2):
+            sh = s.height >> 1
+            sw = s.width >> 1
+            a = np.ctypeslib.as_array(
+                ctypes.cast(f.get_read_ptr(plane), ctypes.POINTER(ctypes.c_float)),
+                shape=(sh, sw))
+            b = np.ctypeslib.as_array(
+                ctypes.cast(s.get_read_ptr(plane), ctypes.POINTER(ctypes.c_float)),
+                shape=(sh, sw))
+            assert np.array_equal(a, b), f"chroma{plane} changed at frame {n}"
 
 
 _COMPARE_SCRIPT = textwrap.dedent(f"""\

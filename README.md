@@ -48,7 +48,7 @@ core.vsfeel.BM3Dv2(clip, sigma=0.7, block_step=4, bm_range=16, radius=2, ps_num=
 ```
 
 - clip:
-    The input clip. Only 32 bit float Gray input is currently supported.
+    The input clip. Only 32 bit float Gray or YUV input is currently supported; for YUV input only the luma plane is denoised and the chroma planes are passed through unmodified.
 
 - sigma: (Default: 3.0)
     Noise standard deviation of the input. Use an array to assign it for each plane, otherwise the same value is used for all planes. Must be non-negative.
