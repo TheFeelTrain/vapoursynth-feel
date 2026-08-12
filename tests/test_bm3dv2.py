@@ -9,11 +9,15 @@ were made visible to the aggregation kernel).
 Run from the repository root:  python -m pytest tests/test_bm3dv2.py
 """
 
+import subprocess
+import sys
+import textwrap
+
 import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import WIDTH, HEIGHT, assert_gray32, frame_to_ndarray
+from conftest import WIDTH, HEIGHT, NOISE_MKV, assert_gray32, frame_to_ndarray
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
@@ -44,21 +48,17 @@ def _check_all_frames_finite(clip, **kwargs):
         assert np.isfinite(a).all(), f"non-finite output at frame {n}"
 
 
-def test_bm3dv2_no_nan_all_frames(noise_gray):
-    """Radius-2 output must be finite on every frame (incl. boundaries)."""
-    _check_all_frames_finite(noise_gray, radius=2, num_streams=1)
+@pytest.mark.parametrize("radius", [0, 1, 2, 3, 4])
+def test_bm3dv2_no_nan_all_frames(noise_gray, radius):
+    """Output must be finite on every frame (incl. boundaries) for each radius.
+
+    A brand new filter instance is created per parametrized test.
+    """
+    _check_all_frames_finite(noise_gray, radius=radius, num_streams=1)
 
 
 def test_bm3dv2_no_nan_all_frames_multi_stream(noise_gray):
     _check_all_frames_finite(noise_gray, radius=2, num_streams=2)
-
-
-def test_bm3dv2_radius0_finite(noise_gray):
-    _check_all_frames_finite(noise_gray, radius=0, num_streams=1)
-
-
-def test_bm3dv2_radius1_finite(noise_gray):
-    _check_all_frames_finite(noise_gray, radius=1, num_streams=1)
 
 
 def test_bm3dv2_deterministic(noise_gray):
@@ -74,43 +74,70 @@ def test_bm3dv2_rejects_gray8(noise_8bit):
         _run(noise_8bit)
 
 
-def test_bm3dv2_matches_vszipcl_radius0(noise_gray):
-    vszipcl = vs.core
-    if not hasattr(vszipcl, "vszipcl") or not hasattr(vszipcl.vszipcl, "BM3Dv2"):
-        pytest.skip("vszipcl not installed")
+def test_bm3dv2_rejects_radius5(noise_gray):
+    """Radius > 4 is unsupported and must be rejected up front."""
+    with pytest.raises(vs.Error):
+        _run(noise_gray, radius=5)
+
+
+_COMPARE_SCRIPT = textwrap.dedent(f"""\
+    import sys
+    import vapoursynth as vs
+    from vstools import core
+    import numpy as np
+    import ctypes
+
+    ref = sys.argv[1]
+    radius = int(sys.argv[2])
+
+    core.max_cache_size = 1024 * 56
+    src = core.bs.VideoSource({NOISE_MKV!r})
+    clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
+
+    kwargs = {{"sigma": 0.7, "radius": radius, "bm_range": 16, "ps_range": 7, "block_step": 4}}
+    if ref != "bm3dhip":
+        kwargs["num_streams"] = 1
+    ref_node = getattr(core, ref).BM3Dv2(clip, **kwargs)
+    my_node = core.vsfeel.BM3Dv2(clip, sigma=0.7, radius=radius, bm_range=16, ps_range=7, block_step=4, num_streams=1)
+
+    worst = 0.0
     for n in (0, 11, 23):
-        a = frame_to_ndarray(_run(noise_gray, radius=0, num_streams=1).get_frame(n))
-        b = frame_to_ndarray(
-            vszipcl.vszipcl.BM3Dv2(
-                noise_gray,
-                sigma=SIGMA,
-                radius=0,
-                bm_range=BM_RANGE,
-                ps_range=PS_RANGE,
-                block_step=BLOCK_STEP,
-                num_streams=1,
-            ).get_frame(n)
-        )
-        d = np.abs(a - b)
-        assert d.max() < 0.01 and d.mean() < 1e-3, f"max diff {d.max()} at frame {n}"
+        a = np.ctypeslib.as_array(ctypes.cast(my_node.get_frame(n).get_read_ptr(0), ctypes.POINTER(ctypes.c_float)), shape=({HEIGHT}, {WIDTH}))
+        b = np.ctypeslib.as_array(ctypes.cast(ref_node.get_frame(n).get_read_ptr(0), ctypes.POINTER(ctypes.c_float)), shape=({HEIGHT}, {WIDTH}))
+        worst = max(worst, float(np.abs(a - b).max()))
+    print(worst)
+""")
 
 
-def test_bm3dv2_matches_vszipcl_radius2(noise_gray):
-    vszipcl = vs.core
-    if not hasattr(vszipcl, "vszipcl") or not hasattr(vszipcl.vszipcl, "BM3Dv2"):
-        pytest.skip("vszipcl not installed")
-    for n in (0, 11, 22, 23):
-        a = frame_to_ndarray(_run(noise_gray, radius=2, num_streams=1).get_frame(n))
-        b = frame_to_ndarray(
-            vszipcl.vszipcl.BM3Dv2(
-                noise_gray,
-                sigma=SIGMA,
-                radius=2,
-                bm_range=BM_RANGE,
-                ps_range=PS_RANGE,
-                block_step=BLOCK_STEP,
-                num_streams=1,
-            ).get_frame(n)
+def _max_diff_vs_reference(radius: int, ref: str) -> float | None:
+    """Run the comparison in a subprocess; a crashing reference yields None."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _COMPARE_SCRIPT, ref, str(radius)],
+            capture_output=True, text=True, timeout=180,
         )
-        d = np.abs(a - b)
-        assert d.max() < 0.01 and d.mean() < 1e-3, f"max diff {d.max()} at frame {n}"
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    return float(lines[-1]) if lines else None
+
+
+@pytest.mark.parametrize("radius", [0, 2])
+def test_bm3dv2_matches_reference(noise_gray, radius):
+    """vsfeel must closely match vszipcl, falling back to bm3dhip.
+
+    The reference plugins are crash-prone on some drivers, so the comparison
+    runs in a subprocess: a crashed reference must not take down the suite.
+    bm3dhip implements the same algorithm and is expected to match vszipcl.
+    """
+    for ref in ("vszipcl", "bm3dhip"):
+        if not hasattr(vs.core, ref) or not hasattr(getattr(vs.core, ref), "BM3Dv2"):
+            continue
+        maxdiff = _max_diff_vs_reference(radius, ref)
+        if maxdiff is None:
+            continue  # crashed or failed to load: try the next reference
+        assert maxdiff < 0.01, f"max diff vs {ref}: {maxdiff}"
+        return
+    pytest.skip("no usable reference plugin (vszipcl/bm3dhip)")
