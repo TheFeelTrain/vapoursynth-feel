@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.29.0", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vapoursynth-feel"
+dynamic = ["version"]
+description = "GPU-accelerated VapourSynth filters (Vulkan)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [{ name = "TheFeelTrain" }]
+maintainers = [
+    { name = "TheFeelTrain", email = "the@feeltra.in" }
+]
+dependencies = ["vapoursynth>=74"]
+
+[dependency-groups]
+dev = ["hatchling>=1.27.0", "packaging"]
+
+[project.urls]
+"Source Code" = "https://github.com/TheFeelTrain/vapoursynth-feel"
+"Bug Tracker" = "https://github.com/TheFeelTrain/vapoursynth-feel"
+
+[tool.hatch.version]
+source = "vcs"
+tag-pattern = '^r(?P<version>.*)$'
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "CMakeLists.txt"]
+
+[tool.hatch.build.targets.wheel]
+include = ["vapoursynth/plugins"]
+artifacts = [
+    "vapoursynth/plugins/**/*.so",
+    "vapoursynth/plugins/**/*.dll",
+]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"

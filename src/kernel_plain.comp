@@ -1,0 +1,116 @@
+#version 450
+
+/*
+ * Bilateral filter compute shader, plain (non-shared-memory) variant.
+ *
+ * Compile-time variants: -DBITS=8|16|32 selects the staging element type.
+ * The staging buffer holds the raw VapourSynth plane bytes (uint16/uint8
+ * integer or float32), and this kernel performs the format conversion
+ * itself, so the host side only memcpys raw bytes.
+ */
+
+#if !defined(BITS)
+#define BITS 16
+#endif
+
+#if BITS == 8
+#define ELEM_BYTES 1
+#define ELEM_MASK  0xFFu
+#define PEAK       255.0f
+#define SCALE      (1.0f / 255.0f)
+#elif BITS == 16
+#define ELEM_BYTES 2
+#define ELEM_MASK  0xFFFFu
+#define PEAK       65535.0f
+#define SCALE      (1.0f / 65535.0f)
+#else
+#define ELEM_BYTES 4
+#define ELEM_MASK  0xFFFFFFFFu
+#define PEAK       1.0f
+#define SCALE      1.0f
+#endif
+
+#define ELEM_SHIFT(byte) (8 * ((byte) & 3))
+
+layout(constant_id = 0) const int WIDTH = 1920;
+layout(constant_id = 1) const int HEIGHT = 1080;
+layout(constant_id = 2) const int STRIDE = 1920;
+layout(constant_id = 3) const float SIGMA_SPATIAL_SCALED = 0.0;
+layout(constant_id = 4) const float SIGMA_COLOR_SCALED = 0.0;
+layout(constant_id = 5) const int RADIUS = 9;
+layout(constant_id = 6) const int HAS_REF = 0;
+
+layout(local_size_x_id = 10, local_size_y_id = 11, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer SrcBuf { uint src_raw[]; };
+layout(std430, binding = 1) buffer DstBuf { uint dst_raw[]; };
+
+layout(push_constant) uniform PushConstants {
+    int src_base;  // element offset of this plane's region
+    int dst_base;  // element offset of this plane's download region
+} pc;
+
+uint load_raw(int idx) {
+    int byte = idx * ELEM_BYTES;
+    uint word = src_raw[(pc.src_base + byte) >> 2];
+    return (word >> ELEM_SHIFT(byte)) & ELEM_MASK;
+}
+
+float load_value(int idx) {
+#if BITS == 32
+    return uintBitsToFloat(load_raw(idx));
+#else
+    return float(load_raw(idx)) * SCALE;
+#endif
+}
+
+void store_raw(int idx, uint val) {
+    int byte = idx * ELEM_BYTES;
+    int wi = (pc.dst_base + byte) >> 2;
+#if BITS == 32
+    dst_raw[wi] = val;
+#else
+    // masked OR into a shared dword; the host clears the download region
+    // before submission, so no lost-update race between paired lanes
+    atomicOr(dst_raw[wi], (val & ELEM_MASK) << ELEM_SHIFT(byte));
+#endif
+}
+
+void store_value(int idx, float v) {
+#if BITS == 32
+    store_raw(idx, floatBitsToUint(v));
+#else
+    store_raw(idx, uint(v * PEAK + 0.5f));
+#endif
+}
+
+void main() {
+    const int x = int(gl_GlobalInvocationID.x);
+    const int y = int(gl_GlobalInvocationID.y);
+
+    if (x >= WIDTH || y >= HEIGHT) {
+        return;
+    }
+
+    const float center = load_value((HAS_REF * HEIGHT + y) * STRIDE + x);
+
+    float num = 0.0f;
+    float den = 0.0f;
+
+    for (int cy = max(y - RADIUS, 0); cy <= min(y + RADIUS, HEIGHT - 1); ++cy) {
+        for (int cx = max(x - RADIUS, 0); cx <= min(x + RADIUS, WIDTH - 1); ++cx) {
+            float value = load_value((HAS_REF * HEIGHT + cy) * STRIDE + cx);
+            const int space = (y - cy) * (y - cy) + (x - cx) * (x - cx);
+            const float range = (value - center) * (value - center);
+            const float weight = exp2(
+                float(space) * SIGMA_SPATIAL_SCALED + range * SIGMA_COLOR_SCALED);
+            if (HAS_REF == 1) {
+                value = load_value(cy * STRIDE + cx);
+            }
+            num += weight * value;
+            den += weight;
+        }
+    }
+
+    store_value(y * STRIDE + x, num / den);
+}
