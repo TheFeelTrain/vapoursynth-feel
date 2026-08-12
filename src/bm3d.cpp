@@ -456,6 +456,12 @@ static void record_bm3d_agg(BM3DData * d, Bm3dStream & stream, int n) {
 
         // aggregation: tw stacked slices (clamped frame indices, aggZ blocks)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.agg_pipeline);
+        // descriptor bindings do not carry across command buffers: cmd_agg is
+        // recorded separately from the estimation phase, so without this bind
+        // the dispatch runs on undefined descriptor state (black output, and
+        // device loss under concurrent submissions)
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            d->pipeline_layout, 0, 1, &stream.desc_set, 0, nullptr);
         {
             int32_t bases[9] {};
             if (r == 0) {
@@ -628,7 +634,10 @@ static const VSFrame *VS_CC BM3DGetFrame(
                 .signalSemaphoreCount = 0,
                 .pSignalSemaphores = nullptr
             };
-            checkVK(vkQueueSubmit(stream.queue, 1, &submit_info, stream.fence));
+            /* no fence here: the fence is signalled by the aggregation submit on
+               the same queue, and a fence must not be attached to a second
+               submission while a first one still holds it */
+            checkVK(vkQueueSubmit(stream.queue, 1, &submit_info, VK_NULL_HANDLE));
         }
 
         // wait for the estimation kernels of the previous frames whose res
@@ -1131,7 +1140,11 @@ static void VS_CC BM3DCreate(
             VkCommandPoolCreateInfo pool_info {
                 .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                 .pNext = nullptr,
-                .flags = 0,
+                /* the per-frame recording re-begins the same command buffers;
+                   without this flag the implicit reset in vkBeginCommandBuffer
+                   is invalid usage (intermittent stale submissions: black
+                   output, device loss under load) */
+                .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
                 .queueFamilyIndex = d->device->queue_family
             };
             checkVK(vkCreateCommandPool(dev, &pool_info, nullptr, &stream.pool));
