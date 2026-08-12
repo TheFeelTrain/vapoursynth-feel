@@ -518,8 +518,10 @@ static const VSFrame *VS_CC BM3DGetFrame(
         VkDevice dev = d->device->device;
 
         // wait for the results of the previous frames that this frame's
-        // aggregation depends on (the res slots of m = n-2..n+1)
-        {
+        // aggregation depends on (the res slots of m = n-2..n+1). At radius 0
+        // each frame accumulates into its own dedicated slot, so no cross-frame
+        // ordering is needed and the wait is skipped to keep the pipeline full.
+        if (d->radius > 0) {
             std::vector<VkSemaphore> waits;
             std::vector<uint64_t> values;
             for (int f = std::max(n - 4, 0); f <= n - 1; ++f) {
@@ -781,8 +783,6 @@ static void VS_CC BM3DCreate(
         return set_error("\"radius\" must be in range [0, 4]");
     }
     d->tw = 2 * d->radius + 1;
-    d->src_ring = 4 * d->radius + 1;
-    d->res_ring = d->tw;
 
     std::array<int, 3> ps_num;
     for (int i = 0; i < std::ssize(ps_num); ++i) {
@@ -813,6 +813,13 @@ static void VS_CC BM3DCreate(
     if (d->num_streams <= 0) {
         return set_error("\"num_streams\" must be positive");
     }
+
+    // at radius 0 every frame only touches its own slot and never depends on
+    // the previous frames' estimates, so give each in-flight frame its own
+    // src/res slot to keep the pipeline full; otherwise the ring of 1 would
+    // serialize the frames behind the timeline waits
+    d->src_ring = (d->radius == 0) ? d->num_streams : 4 * d->radius + 1;
+    d->res_ring = (d->radius == 0) ? d->num_streams : d->tw;
 
     const int extractor_exp = vsh::int64ToIntS(vsapi->mapGetInt(in, "extractor_exp", 0, &error));
     d->extractor = (extractor_exp != 0)
