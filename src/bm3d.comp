@@ -28,6 +28,7 @@ layout(constant_id = 9) const float EXTRACTOR = 0.0;
 layout(constant_id = 10) const int NOSEARCH = 0;
 layout(constant_id = 11) const int NOESTIMATE = 0;
 layout(constant_id = 12) const int SRC_RING = 9;  // 4 * RADIUS + 1 (window union)
+layout(constant_id = 13) const int FINAL = 0;    // Wiener (ref) pass vs hard thresholding
 
 const int KRADIUS = RADIUS;
 const int TEMPORAL_WIDTH = 2 * RADIUS + 1;
@@ -57,15 +58,26 @@ int src_frame(int z) {
     return min(max(pc.nmod - KRADIUS + z, 0), pc.nframes - 1);
 }
 
-// float offset of the ring slot holding the frame at window position z
-int src_off(int z) {
-    // at radius 0 there is a single source frame per dispatch, stored in the
-    // stream's own slot (the host keyed the shared src ring by stream, not by
-    // frame index, so concurrent out-of-order frames cannot collide)
+// ring slot holding the frame at window position z (at radius 0 the stream's
+// own slot, keyed by stream not frame index so out-of-order frames never clash)
+int slot_base(int z) {
     if (RADIUS == 0) {
-        return pc.src_slot * TEMPORAL_STRIDE;
+        return pc.src_slot;
     }
-    return src_frame(z) % SRC_RING * TEMPORAL_STRIDE;
+    return src_frame(z) % SRC_RING;
+}
+
+// float offset of the frame at window position z in the clip used for block
+// matching and, in final mode, as the Wiener reference (clip 0). In final mode
+// each ring slot holds [ref][source], so the slot stride doubles.
+int src_search(int z) {
+    return slot_base(z) * TEMPORAL_STRIDE * (FINAL != 0 ? 2 : 1);
+}
+
+// float offset of the same frame in the clip that is actually denoised (the
+// source clip: clip 1 in final mode, the same as the search clip otherwise)
+int src_input(int z) {
+    return src_search(z) + (FINAL != 0 ? TEMPORAL_STRIDE : 0);
 }
 
 shared float buffer_all[8 * smem_stride];
@@ -386,6 +398,50 @@ void collaborative_hard(inout float denoising_patch[64], out float adaptive_weig
     transform_pack8_1d_inv(denoising_patch);
 }
 
+// Wiener filtering: the coefficient is derived from the (basic-estimate)
+// reference patch and applied to the transformed noisy patch
+float wiener_filtering_s(inout float data[64], inout float ref[64]) {
+    const int lane = int(gl_LocalInvocationID.x);
+    float ks[4] = float[4](0.0f, 0.0f, 0.0f, 0.0f);
+    for (int i = 0; i < 64; ++i) {
+        float val = data[i];
+        float ref_val = ref[i];
+        float coeff = (ref_val * ref_val) / (ref_val * ref_val + SIGMA_Y * SIGMA_Y);
+        if (i == 0) {
+            coeff = (lane % 8) != 0 ? coeff : 1.0f;
+        }
+        val *= coeff;
+        ks[i % 4] += coeff * coeff;
+        data[i] = val * (1.0f / 4096.0f);
+    }
+    float k = (ks[0] + ks[1]) + (ks[2] + ks[3]);
+    k = reduce_group8(k);
+    return 1.0f / k;
+}
+
+void collaborative_wiener(inout float denoising_patch[64], inout float ref_patch[64],
+                          out float adaptive_weight) {
+    for (int ndim = 0; ndim < 2; ++ndim) {
+        transform_pack8(denoising_patch);
+        transpose_pack8(denoising_patch);
+    }
+    transform_pack8_1d(denoising_patch);
+
+    for (int ndim = 0; ndim < 2; ++ndim) {
+        transform_pack8(ref_patch);
+        transpose_pack8(ref_patch);
+    }
+    transform_pack8_1d(ref_patch);
+
+    adaptive_weight = wiener_filtering_s(denoising_patch, ref_patch);
+
+    for (int ndim = 0; ndim < 2; ++ndim) {
+        transform_pack8_inv(denoising_patch);
+        transpose_pack8(denoising_patch);
+    }
+    transform_pack8_1d_inv(denoising_patch);
+}
+
 void main() {
     const int lid = int(gl_LocalInvocationID.x);
     const int group = lid >> 3;
@@ -401,7 +457,7 @@ void main() {
     int x = min(is_active ? x0 : 0, WIDTH - 8);
     y = min(y, HEIGHT - 8);
 
-    const int srcpc_base = src_off(KRADIUS);
+    const int srcpc_base = src_search(KRADIUS);
     float cur[64];
     for (int c = 0; c < 8; ++c) {
         for (int i = 0; i < 8; ++i) {
@@ -500,7 +556,7 @@ void main() {
 
             for (int t = 1; t <= KRADIUS; ++t) {
                 const int temporal_index = KRADIUS + direction * t;
-                const int temporal_srcpc = src_off(temporal_index);
+                const int temporal_srcpc = src_search(temporal_index);
 
                 int cxs[PS_NUM], cys[PS_NUM];
                 for (int i = 0; i < PS_NUM; ++i) {
@@ -609,6 +665,7 @@ void main() {
 
     if (NOESTIMATE == 0) {
     float denoising_patch[64];
+    float ref_patch[64];
 
     {
         float sigma = SIGMA_Y;
@@ -621,12 +678,20 @@ void main() {
                 const int tmp_x = l_x[group][i];
                 const int tmp_y = l_y[group][i];
                 const int tmp_z = l_s[group][i];
-                const int srcp = src_off(tmp_z) + tmp_y * STRIDE + tmp_x + sub_lane_id;
+                const int refp = src_search(tmp_z) + tmp_y * STRIDE + tmp_x + sub_lane_id;
+                const int srcp = src_input(tmp_z) + tmp_y * STRIDE + tmp_x + sub_lane_id;
                 for (int j = 0; j < 8; ++j) {
                     denoising_patch[i * 8 + j] = src[srcp + j * STRIDE];
+                    if (FINAL != 0) {
+                        ref_patch[i * 8 + j] = src[refp + j * STRIDE];
+                    }
                 }
             }
-            collaborative_hard(denoising_patch, adaptive_weight);
+            if (FINAL != 0) {
+                collaborative_wiener(denoising_patch, ref_patch, adaptive_weight);
+            } else {
+                collaborative_hard(denoising_patch, adaptive_weight);
+            }
         }
 
         if (is_active) {

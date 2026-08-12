@@ -73,6 +73,7 @@ struct Bm3dStream {
 
 struct BM3DData {
     VSNode * node;
+    VSNode * ref_node {};   // optional basic-estimate clip (final/Wiener pass)
     const VSVideoInfo * vi;
 
     int radius, num_streams;
@@ -82,6 +83,7 @@ struct BM3DData {
     int block_step, bm_range, ps_num, ps_range;
     bool process;
     bool chroma;
+    bool final {};                   // true when a "ref" clip is given
     float extractor;
 
     std::shared_ptr<VK_Device> device;
@@ -256,15 +258,16 @@ static std::variant<VkPipeline, std::string> create_bm3d_pipeline(
         float sigma_y;
         int32_t block_step, bm_range, radius, ps_num, ps_range;
         float extractor;
-        int32_t nosearch, noestimate, src_ring;
+        int32_t nosearch, noestimate, src_ring, final;
     } spec {
         plane.width, plane.height, plane.stride, sigma_y,
         d.block_step, d.bm_range, d.radius, d.ps_num, d.ps_range, d.extractor,
         std::getenv("BM3D_NOSEARCH") ? 1 : 0,
         std::getenv("BM3D_NOESTIMATE") ? 1 : 0,
-        d.src_ring
+        d.src_ring,
+        d.final ? 1 : 0
     };
-    const std::array<VkSpecializationMapEntry, 13> entries {{
+    const std::array<VkSpecializationMapEntry, 14> entries {{
         { 0,  0, sizeof(int32_t) },
         { 1,  4, sizeof(int32_t) },
         { 2,  8, sizeof(int32_t) },
@@ -278,6 +281,7 @@ static std::variant<VkPipeline, std::string> create_bm3d_pipeline(
         { 10, 40, sizeof(int32_t) },
         { 11, 44, sizeof(int32_t) },
         { 12, 48, sizeof(int32_t) },
+        { 13, 52, sizeof(int32_t) },
     }};
     VkSpecializationInfo spec_info {
         .mapEntryCount = static_cast<uint32_t>(entries.size()),
@@ -500,23 +504,51 @@ static int record_bm3d_kernels(BM3DData * d, Bm3dStream & stream, int n,
     // record's dispatches may need, clamped to [n-2r, n+2r]) into the src ring
     const int lo = std::clamp(n - 2 * r, 0, nf - 1);
     const int hi = std::clamp(n + 2 * r, 0, nf - 1);
+    const int clips = d->final ? 2 : 1;
     for (int f = lo; f <= hi; ++f) {
         if (!uploaded[f - lo]) {
             continue;
         }
         const int src_slot = (r == 0) ? stream.stream_id : (f % d->src_ring);
+        const VkDeviceSize slot_staging = static_cast<VkDeviceSize>(f - lo) * clips * d->planes[0].pe;
+        const VkDeviceSize slot_device = static_cast<VkDeviceSize>(src_slot) * clips * d->planes[0].pe;
         for (int plane = 0; plane < d->n_planes; ++plane) {
             const auto & p = d->planes[plane];
             const VkDeviceSize pe = p.pe;
-            VkBufferCopy region {
-                .srcOffset = (static_cast<VkDeviceSize>(f - lo) * pe +
-                    static_cast<VkDeviceSize>(plane) * d->src_size) * 4,
-                .dstOffset = (static_cast<VkDeviceSize>(src_slot) * pe +
-                    static_cast<VkDeviceSize>(plane) * d->src_size) * 4,
-                .size = pe * 4
-            };
-            vkCmdCopyBuffer(cmd, stream.staging, d->src_buf, 1, &region);
+            const VkDeviceSize plane_off = static_cast<VkDeviceSize>(plane) * d->src_size;
+            // source clip: second half of the slot in final mode
+            {
+                VkBufferCopy region {
+                    .srcOffset = (slot_staging + static_cast<VkDeviceSize>(clips - 1) * pe + plane_off) * 4,
+                    .dstOffset = (slot_device + static_cast<VkDeviceSize>(clips - 1) * pe + plane_off) * 4,
+                    .size = pe * 4
+                };
+                vkCmdCopyBuffer(cmd, stream.staging, d->src_buf, 1, &region);
+            }
+            // ref clip (final mode only): first half of the slot
+            if (d->final) {
+                VkBufferCopy region {
+                    .srcOffset = (slot_staging + plane_off) * 4,
+                    .dstOffset = (slot_device + plane_off) * 4,
+                    .size = pe * 4
+                };
+                vkCmdCopyBuffer(cmd, stream.staging, d->src_buf, 1, &region);
+            }
         }
+    }
+
+    // the estimation dispatches read the freshly copied source/ref frames, so
+    // make the transfer writes visible to the compute stage before launching
+    // them (and order the res zero-fill ahead of the atomic accumulation)
+    {
+        VkMemoryBarrier mem_barrier {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
     }
 
     // compute the missing result slots for the aggregation window
@@ -538,6 +570,19 @@ static int record_bm3d_kernels(BM3DData * d, Bm3dStream & stream, int n,
             const VkDeviceSize res_off = (static_cast<VkDeviceSize>(slot) * d->tw * 2 * pe +
                 static_cast<VkDeviceSize>(plane) * d->res_size_per_plane);
             vkCmdFillBuffer(cmd, d->res_buf, res_off * 4, d->tw * 2 * pe * 4, 0);
+
+            // the zero-fill must be visible to the atomic accumulation that
+            // follows it in the next dispatch
+            {
+                VkMemoryBarrier mem_barrier {
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+                };
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+            }
 
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.bm3d_pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -661,6 +706,9 @@ static const VSFrame *VS_CC BM3DGetFrame(
         for (int i = -2 * r; i <= 2 * r; ++i) {
             const int idx = std::clamp(n + i, 0, d->nframes - 1);
             vsapi->requestFrameFilter(idx, d->node, frameCtx);
+            if (d->ref_node) {
+                vsapi->requestFrameFilter(idx, d->ref_node, frameCtx);
+            }
         }
     } else if (activationReason == arAllFramesReady) {
         const VSFrame * src = nullptr;
@@ -729,21 +777,38 @@ static const VSFrame *VS_CC BM3DGetFrame(
         const int hi = std::clamp(n + 2 * r, 0, d->nframes - 1);
         std::array<bool, 4 * MAX_RADIUS + 1> uploaded {};
         bool any_uploaded = false;
+        const int clips = d->final ? 2 : 1;
         for (int f = lo; f <= hi; ++f) {
             if (!stream.upload_new[f - lo]) {
                 continue;
             }
+            const VkDeviceSize slot_base = static_cast<VkDeviceSize>(f - lo) * clips * d->planes[0].pe;
+            // source clip (the one actually denoised): the second half of the
+            // slot in final mode, so the block matching / Wiener reference (the
+            // first half) can be uploaded alongside it
             const VSFrame * src = vsapi->getFrameFilter(f, d->node, frameCtx);
             for (int plane = 0; plane < d->n_planes; ++plane) {
                 const auto & p = d->planes[plane];
                 auto srcp = vsapi->getReadPtr(src, plane);
-                float * dstp = stream.map +
-                    static_cast<VkDeviceSize>(f - lo) * p.pe +
+                float * dstp = stream.map + slot_base +
+                    static_cast<VkDeviceSize>(clips - 1) * p.pe +
                     static_cast<VkDeviceSize>(plane) * d->src_size;
                 const auto bytes = static_cast<size_t>(p.width) * sizeof(float) * p.height;
                 copy_stream_out(dstp, srcp, bytes);
             }
             vsapi->freeFrame(src);
+            if (d->final) {
+                const VSFrame * rsrc = vsapi->getFrameFilter(f, d->ref_node, frameCtx);
+                for (int plane = 0; plane < d->n_planes; ++plane) {
+                    const auto & p = d->planes[plane];
+                    auto srcp = vsapi->getReadPtr(rsrc, plane);
+                    float * dstp = stream.map + slot_base +
+                        static_cast<VkDeviceSize>(plane) * d->src_size;
+                    const auto bytes = static_cast<size_t>(p.width) * sizeof(float) * p.height;
+                    copy_stream_out(dstp, srcp, bytes);
+                }
+                vsapi->freeFrame(rsrc);
+            }
             uploaded[f - lo] = true;
             any_uploaded = true;
         }
@@ -810,8 +875,26 @@ static const VSFrame *VS_CC BM3DGetFrame(
             }
         }
 
-        std::vector<VkPipelineStageFlags> src_stages(src_waits.size(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         std::vector<VkPipelineStageFlags> res_stages(res_waits.size(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+        // The source window is read by this frame's estimation kernels. The
+        // uploaders' copies are ordered ahead of their own kernels on the same
+        // queue, so waiting for the uploaders' timelines here (host-side) is
+        // deadlock-free: a GPU-side wait on a timeline signalled by a later
+        // submission would block the whole queue. The kernel command buffer
+        // carries a transfer->compute barrier so the freshly copied frames are
+        // memory-visible.
+        if (d->radius > 0 && !src_waits.empty()) {
+            VkSemaphoreWaitInfo wait_info {
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .semaphoreCount = static_cast<uint32_t>(src_waits.size()),
+                .pSemaphores = src_waits.data(),
+                .pValues = src_values.data()
+            };
+            checkVK(vkWaitSemaphores(dev, &wait_info, UINT64_MAX));
+        }
 
         {
             std::lock_guard lock(*stream.queue_lock);
@@ -821,17 +904,17 @@ static const VSFrame *VS_CC BM3DGetFrame(
             VkTimelineSemaphoreSubmitInfo src_timeline {
                 .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
                 .pNext = nullptr,
-                .waitSemaphoreValueCount = static_cast<uint32_t>(src_values.size()),
-                .pWaitSemaphoreValues = src_values.data(),
+                .waitSemaphoreValueCount = 0,
+                .pWaitSemaphoreValues = nullptr,
                 .signalSemaphoreValueCount = 1,
                 .pSignalSemaphoreValues = &my_seq
             };
             VkSubmitInfo submit_info {
                 .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                 .pNext = &src_timeline,
-                .waitSemaphoreCount = static_cast<uint32_t>(src_waits.size()),
-                .pWaitSemaphores = src_waits.data(),
-                .pWaitDstStageMask = src_stages.data(),
+                .waitSemaphoreCount = 0,
+                .pWaitSemaphores = nullptr,
+                .pWaitDstStageMask = nullptr,
                 .commandBufferCount = 1,
                 .pCommandBuffers = &stream.cmd,
                 .signalSemaphoreCount = 1,
@@ -850,7 +933,10 @@ static const VSFrame *VS_CC BM3DGetFrame(
             std::lock_guard lock(*stream.queue_lock);
 
             // wait on our own kernels (the timeline is signalled by the kernel
-            // submit) and on the frames that computed the aggregation slots
+            // submit) and on the frames that computed the aggregation slots.
+            // The res waits stay device-side: a host-side wait here would let
+            // two frames deadlock waiting on each other's aggregation before
+            // either submits.
             std::vector<VkSemaphore> agg_waits { stream.timeline };
             std::vector<uint64_t> agg_values { my_seq };
             std::vector<VkPipelineStageFlags> agg_stages { VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT };
@@ -944,6 +1030,9 @@ static const VSFrame *VS_CC BM3DGetFrame(
 static void VS_CC BM3DFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
     BM3DData * d = static_cast<BM3DData *>(instanceData);
     vsapi->freeNode(d->node);
+    if (d->ref_node) {
+        vsapi->freeNode(d->ref_node);
+    }
     delete d;
 }
 
@@ -965,7 +1054,33 @@ static void VS_CC BM3DCreate(
     auto set_error = [&](const std::string & error_message) {
         vsapi->mapSetError(out, ("BM3D: " + error_message).c_str());
         vsapi->freeNode(d->node);
+        if (d->ref_node) {
+            vsapi->freeNode(d->ref_node);
+        }
     };
+
+    // optional "ref": a basic-estimate clip used for the final (Wiener) pass;
+    // the block matching runs on it and its patches provide the Wiener
+    // reference, while the noisy clip is the clip actually denoised
+    d->ref_node = vsapi->mapGetNode(in, "ref", 0, &error);
+    if (d->ref_node) {
+        const VSVideoInfo * rvi = vsapi->getVideoInfo(d->ref_node);
+        if (rvi->format.colorFamily != d->vi->format.colorFamily ||
+            rvi->format.sampleType != d->vi->format.sampleType ||
+            rvi->format.bitsPerSample != d->vi->format.bitsPerSample ||
+            rvi->format.subSamplingW != d->vi->format.subSamplingW ||
+            rvi->format.subSamplingH != d->vi->format.subSamplingH)
+        {
+            return set_error("\"ref\" must be of the same format as \"clip\"");
+        }
+        if (rvi->width != d->vi->width || rvi->height != d->vi->height) {
+            return set_error("\"ref\" must be of the same dimensions as \"clip\"");
+        }
+        if (rvi->numFrames != d->vi->numFrames) {
+            return set_error("\"ref\" must be of the same number of frames as \"clip\"");
+        }
+        d->final = true;
+    }
 
     if (d->vi->width <= 0 || d->vi->height <= 0 ||
         d->vi->format.sampleType != stFloat || d->vi->format.bitsPerSample != 32) {
@@ -985,8 +1100,11 @@ static void VS_CC BM3DCreate(
         d->process = sigma[i] >= FLT_EPSILON;
     }
 
-    // match the reference sigma scaling exactly
-    const float sigma_factor = std::bit_cast<float>(0x3f021bb6u);
+    // match the reference sigma scaling exactly (different factor for the
+    // final Wiener pass)
+    const float sigma_factor = d->final
+        ? std::bit_cast<float>(0x3e40c0c1u)
+        : std::bit_cast<float>(0x3f021bb6u);
     for (auto & sv : sigma) {
         sv *= sigma_factor;
     }
@@ -1164,7 +1282,10 @@ static void VS_CC BM3DCreate(
         (void)res_size;
         for (int plane = 0; plane < d->n_planes; ++plane) {
             const auto & p = d->planes[plane];
-            src_size += static_cast<VkDeviceSize>(d->src_ring) * p.pe;
+            // in final mode each ring slot holds [ref][source], so the ring
+            // doubles in size
+            const int clips = d->final ? 2 : 1;
+            src_size += static_cast<VkDeviceSize>(d->src_ring) * clips * p.pe;
             res_size += static_cast<VkDeviceSize>(d->res_cap) * d->tw * 2 * p.pe;
             dst_size += p.pe;
         }
@@ -1419,12 +1540,15 @@ static void VS_CC BM3DCreate(
 
     BM3DData * data = d.release();
 
-    VSFilterDependency deps[1] = {{data->node, rpStrictSpatial}};
+    VSFilterDependency deps[2] = {
+        { data->node, rpStrictSpatial },
+        { data->ref_node, rpStrictSpatial }
+    };
 
     vsapi->createVideoFilter(
         out, "BM3D", data->vi,
         BM3DGetFrame, BM3DFree,
-        fmParallel, deps, 1, data, core);
+        fmParallel, deps, data->ref_node ? 2 : 1, data, core);
 }
 
 // ---------------------------------------------------------------------------
@@ -1435,6 +1559,7 @@ void vsfeel_register_bm3dv2(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
     vspapi->registerFunction(
         "BM3Dv2",
         "clip:vnode;"
+        "ref:vnode:opt;"
         "sigma:float[]:opt;"
         "block_step:int[]:opt;"
         "bm_range:int[]:opt;"

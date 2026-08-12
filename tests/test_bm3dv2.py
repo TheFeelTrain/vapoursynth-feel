@@ -155,6 +155,46 @@ def test_bm3dv2_rejects_radius5(noise_gray):
         _run(noise_gray, radius=5)
 
 
+def test_bm3dv2_rejects_bad_ref_format(noise_gray):
+    """A \"ref\" with a different format/size must be rejected up front."""
+    bad = noise_gray.std.AddBorders(right=1)
+    with pytest.raises(vs.Error):
+        _run(noise_gray, ref=bad)
+
+
+def test_bm3dv2_ref_final_pass(noise_gray):
+    """A basic estimate passed as \"ref\" drives the final (Wiener) pass.
+
+    The final output must be finite on every frame, deterministic between two
+    sequential num_streams=1 instances, and differ from the basic estimate
+    (the Wiener refinement changes the pixels rather than copying them).
+    """
+    basic = _run(noise_gray, radius=2, num_streams=1)
+    a = _run(noise_gray, radius=2, num_streams=1, ref=basic)
+    b = _run(noise_gray, radius=2, num_streams=1, ref=basic)
+    for n in (0, 11, 23):
+        fa = frame_to_ndarray(a.get_frame(n))
+        fb = frame_to_ndarray(b.get_frame(n))
+        fb_ = frame_to_ndarray(basic.get_frame(n))
+        assert np.isfinite(fa).all(), f"non-finite final output at frame {n}"
+        assert np.abs(fa - fb).max() < 1e-5, f"nondeterministic final pass at frame {n}"
+        assert np.abs(fa - fb_).max() > 1e-4, f"final pass did not refine frame {n}"
+
+
+def test_bm3dv2_ref_matches_reference(noise_gray):
+    """The final (Wiener) pass must closely match the reference implementations
+    when given the same basic-estimate ref clip."""
+    for ref in ("vszipcl", "bm3dhip"):
+        if not hasattr(vs.core, ref) or not hasattr(getattr(vs.core, ref), "BM3Dv2"):
+            continue
+        maxdiff = _max_diff_vs_reference(2, ref, ref_pass=True)
+        if maxdiff is None:
+            continue  # crashed or failed to load: try the next reference
+        assert maxdiff < 0.01, f"max diff vs {ref} (ref pass): {maxdiff}"
+        return
+    pytest.skip("no usable reference plugin (vszipcl/bm3dhip)")
+
+
 def test_bm3dv2_yuv_passthrough(noise_gray):
     """A full YUV clip is accepted: the luma must match the Gray output and
     the chroma planes must be copied through bit-identically."""
@@ -193,6 +233,7 @@ _COMPARE_SCRIPT = textwrap.dedent(f"""\
 
     ref = sys.argv[1]
     radius = int(sys.argv[2])
+    ref_pass = int(sys.argv[3])
 
     core.max_cache_size = 1024 * 56
     src = core.bs.VideoSource({NOISE_MKV!r})
@@ -201,8 +242,14 @@ _COMPARE_SCRIPT = textwrap.dedent(f"""\
     kwargs = {{"sigma": 0.7, "radius": radius, "bm_range": 16, "ps_range": 7, "block_step": 4}}
     if ref != "bm3dhip":
         kwargs["num_streams"] = 1
-    ref_node = getattr(core, ref).BM3Dv2(clip, **kwargs)
-    my_node = core.vsfeel.BM3Dv2(clip, sigma=0.7, radius=radius, bm_range=16, ps_range=7, block_step=4, num_streams=1)
+    if ref_pass:
+        # both implementations get the same vsfeel basic estimate as the ref
+        basic = core.vsfeel.BM3Dv2(clip, **kwargs)
+        ref_node = getattr(core, ref).BM3Dv2(clip, ref=basic, **kwargs)
+        my_node = core.vsfeel.BM3Dv2(clip, ref=basic, sigma=0.7, radius=radius, bm_range=16, ps_range=7, block_step=4, num_streams=1)
+    else:
+        ref_node = getattr(core, ref).BM3Dv2(clip, **kwargs)
+        my_node = core.vsfeel.BM3Dv2(clip, sigma=0.7, radius=radius, bm_range=16, ps_range=7, block_step=4, num_streams=1)
 
     worst = 0.0
     for n in (0, 11, 23):
@@ -213,11 +260,11 @@ _COMPARE_SCRIPT = textwrap.dedent(f"""\
 """)
 
 
-def _max_diff_vs_reference(radius: int, ref: str) -> float | None:
+def _max_diff_vs_reference(radius: int, ref: str, ref_pass: bool = False) -> float | None:
     """Run the comparison in a subprocess; a crashing reference yields None."""
     try:
         result = subprocess.run(
-            [sys.executable, "-c", _COMPARE_SCRIPT, ref, str(radius)],
+            [sys.executable, "-c", _COMPARE_SCRIPT, ref, str(radius), str(int(ref_pass))],
             capture_output=True, text=True, timeout=180,
         )
     except subprocess.TimeoutExpired:
