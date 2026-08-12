@@ -124,7 +124,7 @@ def _max_diff_vs_reference(radius: int, ref: str) -> float | None:
     return float(lines[-1]) if lines else None
 
 
-@pytest.mark.parametrize("radius", [0, 2])
+@pytest.mark.parametrize("radius", [0, 2, 3, 4])
 def test_bm3dv2_matches_reference(noise_gray, radius):
     """vsfeel must closely match vszipcl, falling back to bm3dhip.
 
