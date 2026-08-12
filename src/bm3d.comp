@@ -251,6 +251,24 @@ float ssd_err(const float cur[64], float pre, const int base_idx, int cx, int cy
     return ((col[0] + col[1]) + (col[2] + col[3])) + ((col[4] + col[5]) + (col[6] + col[7]));
 }
 
+// squared error of a single patch column: cur column `c` (0..7) vs the source
+// column at x = X, summed over the 8 rows (used by the sliding-window scan)
+float col_ssd(const float cur[64], const int base_idx, int cy, int X, int c) {
+    float errors[2] = float[2](0.0f, 0.0f);
+    for (int i = 0; i < 8; ++i) {
+        float val = cur[c * 8 + i] - src[base_idx + (cy + i) * STRIDE + X];
+        errors[i % 2] += val * val;
+    }
+    return errors[0] + errors[1];
+}
+
+// combine 8 column sums in the exact order of the reference's ssd_err so the
+// sliding-window scan keeps each candidate's SSD bit-identical to a full 8x8
+// recompute (only the per-lane candidate partition differs)
+float reduce_cols(const float col[8]) {
+    return ((col[0] + col[1]) + (col[2] + col[3])) + ((col[4] + col[5]) + (col[6] + col[7]));
+}
+
 void insert8(inout float e[8], inout int xs[8], inout int ys[8], inout int sq[8],
              float err_, int cx_, int cy_, int cs_) {
     if (err_ < e[7]) {
@@ -416,17 +434,38 @@ void main() {
         const int top = max(y - BM_RANGE, 0);
         const int bottom = min(y + BM_RANGE, HEIGHT - 8);
         const int rw = right - left + 1;
-        const int total = (bottom - top + 1) * rw;
-        int row_i = top + sub_lane_id / rw;
-        int col_i = left + sub_lane_id % rw;
-        #pragma unroll 2
-        for (int s = sub_lane_id; s < total; s += 8) {
-            const float error = ssd_err(cur, center_pre, srcpc_base, col_i, row_i);
-            insert8(pe, px, py, ps, error, col_i, row_i, s);
-            col_i += 8;
-            while (col_i > right) {
-                col_i -= rw;
-                row_i += 1;
+        // At low radius the sliding-window scan is used (much fewer source
+        // reads); at radius >= 3 the per-lane row partition differs enough
+        // from the stride-8 reference partition to shift the top-8 selection,
+        // so there the exact stride-8 scan is kept instead.
+        if (RADIUS < 3) {
+            for (int cy = top + sub_lane_id; cy <= bottom; cy += 8) {
+                float col[8];
+                for (int c = 0; c < 8; ++c) {
+                    col[c] = col_ssd(cur, srcpc_base, cy, left + c, c);
+                }
+                insert8(pe, px, py, ps, reduce_cols(col), left, cy, (cy - top) * rw);
+                for (int cx = left + 1; cx <= right; ++cx) {
+                    for (int c = 0; c < 7; ++c) {
+                        col[c] = col[c + 1];
+                    }
+                    col[7] = col_ssd(cur, srcpc_base, cy, cx + 7, 7);
+                    insert8(pe, px, py, ps, reduce_cols(col), cx, cy, (cy - top) * rw + (cx - left));
+                }
+            }
+        } else {
+            const int total = (bottom - top + 1) * rw;
+            int row_i = top + sub_lane_id / rw;
+            int col_i = left + sub_lane_id % rw;
+            #pragma unroll 2
+            for (int s = sub_lane_id; s < total; s += 8) {
+                const float error = ssd_err(cur, center_pre, srcpc_base, col_i, row_i);
+                insert8(pe, px, py, ps, error, col_i, row_i, s);
+                col_i += 8;
+                while (col_i > right) {
+                    col_i -= rw;
+                    row_i += 1;
+                }
             }
         }
         barrier();
@@ -483,18 +522,35 @@ void main() {
                     const int top = max(cys[i] - PS_RANGE, 0);
                     const int bottom = min(cys[i] + PS_RANGE, HEIGHT - 8);
                     const int rw = right - left + 1;
-                    const int total = (bottom - top + 1) * rw;
                     const int seq_base = i * ((2 * PS_RANGE + 1) * (2 * PS_RANGE + 1));
-                    int row_i = top + sub_lane_id / rw;
-                    int col_i = left + sub_lane_id % rw;
-                    #pragma unroll 2
-                    for (int s = sub_lane_id; s < total; s += 8) {
-                        const float error = ssd_err(cur, center_pre, temporal_srcpc, col_i, row_i);
-                        insert8(pe, px, py, ps, error, col_i, row_i, seq_base + s);
-                        col_i += 8;
-                        while (col_i > right) {
-                            col_i -= rw;
-                            row_i += 1;
+                    if (RADIUS < 3) {
+                        for (int cy = top + sub_lane_id; cy <= bottom; cy += 8) {
+                            float col[8];
+                            for (int c = 0; c < 8; ++c) {
+                                col[c] = col_ssd(cur, temporal_srcpc, cy, left + c, c);
+                            }
+                            insert8(pe, px, py, ps, reduce_cols(col), left, cy, seq_base + (cy - top) * rw);
+                            for (int cx = left + 1; cx <= right; ++cx) {
+                                for (int c = 0; c < 7; ++c) {
+                                    col[c] = col[c + 1];
+                                }
+                                col[7] = col_ssd(cur, temporal_srcpc, cy, cx + 7, 7);
+                                insert8(pe, px, py, ps, reduce_cols(col), cx, cy, seq_base + (cy - top) * rw + (cx - left));
+                            }
+                        }
+                    } else {
+                        const int total = (bottom - top + 1) * rw;
+                        int row_i = top + sub_lane_id / rw;
+                        int col_i = left + sub_lane_id % rw;
+                        #pragma unroll 2
+                        for (int s = sub_lane_id; s < total; s += 8) {
+                            const float error = ssd_err(cur, center_pre, temporal_srcpc, col_i, row_i);
+                            insert8(pe, px, py, ps, error, col_i, row_i, seq_base + s);
+                            col_i += 8;
+                            while (col_i > right) {
+                                col_i -= rw;
+                                row_i += 1;
+                            }
                         }
                     }
                 }
