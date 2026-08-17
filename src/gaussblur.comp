@@ -122,6 +122,46 @@ int mirror(int i, int dim) {
     return i;
 }
 
+// convert a computed value to its packed integer form (the low halfword/byte
+// of the returned uint for the sub-32-bit formats)
+uint pack_value(float v) {
+#if BITS == 32
+    return floatBitsToUint(v);
+#elif BITS == 16 && HALF
+    return packHalf2x16(vec2(v, 0.0)) & ELEM_MASK;
+#else
+    return uint(clamp(roundEven(v), 0.0, PEAK)) & ELEM_MASK;
+#endif
+}
+
+// Horizontal-pass output: write R consecutive values as whole dwords. Every
+// thread owns R adjacent columns, so it owns each dword it touches and can
+// write plain (non-atomic) stores even for the 8/16-bit formats. The OOB
+// lanes are zeroed (the download region is pre-cleared), so packing is safe.
+void store_row(int row, int x0, float vals[R]) {
+#if BITS == 32
+    for (int j = 0; j < R; ++j) {
+        if (x0 + j < WIDTH) {
+            dst_raw[(pc.dst_base >> 2) + row + x0 + j] = floatBitsToUint(vals[j]);
+        }
+    }
+#else
+    const int per = 4 / ELEM_BYTES;            // elements per dword
+    const int n_dwords = R / per;
+    const int base = (pc.dst_base + (row + x0) * ELEM_BYTES) >> 2;
+    for (int d = 0; d < n_dwords; ++d) {
+        uint w = 0u;
+        for (int e = 0; e < per; ++e) {
+            const int c = x0 + d * per + e;
+            if (c < WIDTH) {
+                w |= pack_value(vals[d * per + e]) << (8 * ELEM_BYTES * e);
+            }
+        }
+        dst_raw[base + d] = w;
+    }
+#endif
+}
+
 #if defined(ENTRY_GAUSS)
 
 // the tile of vertically blurred columns: VRT*BLK_Y output rows wide, with a
@@ -174,7 +214,9 @@ void main() {
 #elif defined(ENTRY_VERT)
 
 // R consecutive output rows per thread; the rolling weight window reproduces
-// the per-pixel ascending-k FMAs exactly.
+// the per-pixel ascending-k FMAs exactly. The taps beyond the kernel length
+// carry wreg[j] == 0.0f, so `fma(v, 0, sum)` is an exact no-op and the sum
+// loop needs no per-tap branch (matching the reference CUDA kernel).
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 void main() {
     const int x = int(gl_GlobalInvocationID.x);
@@ -182,19 +224,21 @@ void main() {
     if (x >= WIDTH || y0 >= HEIGHT) return;
     const int radius = KLEN / 2;
     float sum[R], wreg[R];
+    #pragma unroll
     for (int j = 0; j < R; ++j) { sum[j] = 0.0f; wreg[j] = 0.0f; }
     for (int k = 0; k < KLEN + (R - 1); ++k) {
+        #pragma unroll
         for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];   // slide the window
         wreg[0] = (k < KLEN) ? wt[pc.wt_base + k] : 0.0f;
         int sy = y0 + k - radius;
         sy = mirror(sy, HEIGHT);
         sy = min(max(sy, 0), HEIGHT - 1);                // no-op for valid radius
         const float v = load_value(sy * STRIDE + x);
-        for (int j = 0; j < R; ++j) {
-            if (k - j >= 0 && k - j < KLEN)              // uniform: taps 0..KLEN-1
-                sum[j] = fma(v, wreg[j], sum[j]);
-        }
+        #pragma unroll
+        for (int j = 0; j < R; ++j)
+            sum[j] = fma(v, wreg[j], sum[j]);
     }
+    #pragma unroll
     for (int j = 0; j < R; ++j) {
         if (y0 + j < HEIGHT) tmp[(pc.tmp_base >> 2) + (y0 + j) * STRIDE + x] = sum[j];
     }
@@ -212,22 +256,21 @@ void main() {
     const int radius = KLEN / 2;
     const int row = y * STRIDE;
     float sum[R], wreg[R];
+    #pragma unroll
     for (int j = 0; j < R; ++j) { sum[j] = 0.0f; wreg[j] = 0.0f; }
     for (int k = 0; k < KLEN + (R - 1); ++k) {
+        #pragma unroll
         for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];   // slide the window
         wreg[0] = (k < KLEN) ? wt[pc.wt_base + k] : 0.0f;
         int sx = x0 + k - radius;
         sx = mirror(sx, WIDTH);
         sx = min(max(sx, 0), WIDTH - 1);                 // no-op for valid radius
         const float v = tmp[(pc.tmp_base >> 2) + row + sx];
-        for (int j = 0; j < R; ++j) {
-            if (k - j >= 0 && k - j < KLEN)              // uniform: taps 0..KLEN-1
-                sum[j] = fma(v, wreg[j], sum[j]);
-        }
+        #pragma unroll
+        for (int j = 0; j < R; ++j)
+            sum[j] = fma(v, wreg[j], sum[j]);
     }
-    for (int j = 0; j < R; ++j) {
-        if (x0 + j < WIDTH) store_value(row + x0 + j, sum[j]);
-    }
+    store_row(row, x0, sum);
 }
 
 #endif

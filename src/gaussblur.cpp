@@ -65,6 +65,8 @@ struct PlaneConfig {
 struct VK_Resource {
     VkBuffer staging {};
     VkDeviceMemory staging_mem {};
+    VkBuffer tmp_buf {};         // device-local float intermediate (large path)
+    VkDeviceMemory tmp_mem {};
     VkCommandPool pool {};
     VkCommandBuffer cmd {};
     VkFence fence {};
@@ -124,6 +126,12 @@ struct GaussData {
             }
             if (resource.staging) {
                 vkDestroyBuffer(dev, resource.staging, nullptr);
+            }
+            if (resource.tmp_mem) {
+                vkFreeMemory(dev, resource.tmp_mem, nullptr);
+            }
+            if (resource.tmp_buf) {
+                vkDestroyBuffer(dev, resource.tmp_buf, nullptr);
             }
             if (resource.cmd) {
                 vkFreeCommandBuffers(dev, resource.pool, 1, &resource.cmd);
@@ -364,11 +372,13 @@ static std::optional<std::string> record_command_buffer(
             const auto & cfg = d.planes[plane];
 
             // push constants are RAW BYTE offsets (the kernel converts to dword
-            // indices itself); wt_base is a float element offset
+            // indices itself); wt_base is a float element offset. src/dst
+            // point into the host-visible staging buffer, tmp into the
+            // device-local intermediate buffer.
             const int32_t push_constants[4] {
                 static_cast<int32_t>(cfg.upload_offset),
                 static_cast<int32_t>(d.upload_total + cfg.download_offset),
-                static_cast<int32_t>(d.upload_total + d.download_total + cfg.tmp_offset),
+                static_cast<int32_t>(cfg.tmp_offset),
                 static_cast<int32_t>(cfg.wt_base)
             };
 
@@ -1073,7 +1083,11 @@ static void VS_CC GaussCreate(
     d->need_fill = d->bits != 32;
 
     const VkDeviceSize min_size = 4;
-    const VkDeviceSize staging_size = std::max(upload_total + download_total + tmp_total, 2 * min_size);
+    // the large path's float intermediate lives in a separate device-local
+    // buffer (see below), so the host-visible staging only carries the raw
+    // source/destination planes
+    const VkDeviceSize staging_size = std::max(upload_total + download_total, 2 * min_size);
+    const VkDeviceSize tmp_size = std::max(tmp_total, min_size);
 
     // Resources
     d->semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
@@ -1109,6 +1123,31 @@ static void VS_CC GaussCreate(
             }
             resource.staging_mem = std::get<AllocatedMemory>(result).memory;
             resource.staging_type_index = std::get<AllocatedMemory>(result).type_index;
+        }
+
+        // the large path's float intermediate buffer: device-local so the two
+        // passes never round-trip it through host (PCIe) memory. Only created
+        // when some plane needs the large path; the small path never touches
+        // binding 3.
+        if (d->tmp_total > 0) {
+            VkBufferCreateInfo tmp_buffer_info {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .size = tmp_size,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr
+            };
+            checkVK(vkCreateBuffer(dev, &tmp_buffer_info, nullptr, &resource.tmp_buf));
+
+            const auto tmp_result = allocate_memory(
+                *d->device, resource.tmp_buf, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (std::holds_alternative<std::string>(tmp_result)) {
+                return set_error(std::get<std::string>(tmp_result));
+            }
+            resource.tmp_mem = std::get<AllocatedMemory>(tmp_result).memory;
         }
 
         {
@@ -1169,9 +1208,9 @@ static void VS_CC GaussCreate(
                 .range = staging_size
             };
             VkDescriptorBufferInfo tmp_info {
-                .buffer = resource.staging,
+                .buffer = resource.tmp_buf ? resource.tmp_buf : resource.staging,
                 .offset = 0,
-                .range = staging_size
+                .range = resource.tmp_buf ? VK_WHOLE_SIZE : staging_size
             };
 
             VkWriteDescriptorSet writes[4] {
