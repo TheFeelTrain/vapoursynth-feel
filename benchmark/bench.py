@@ -94,12 +94,13 @@ class FilterSpec:
 
 
 def _bm3d_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
+    ns_num = ns.num_streams if ns.num_streams is not None else 4
     common = (
         f"sigma={ns.bm3d_sigma}, radius={ns.bm3d_radius}, "
         f"bm_range={ns.bm3d_bm_range}, ps_range={ns.bm3d_ps_range}, "
         f"block_step={ns.bm3d_block_step}"
     )
-    with_streams = f"{common}, num_streams={ns.num_streams}"
+    with_streams = f"{common}, num_streams={ns_num}"
     return {
         "vsfeel": f"core.vsfeel.BM3Dv2({clip}, {with_streams})",
         "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {with_streams})",
@@ -109,9 +110,10 @@ def _bm3d_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
 
 
 def _bilateral_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
+    ns_num = ns.num_streams if ns.num_streams is not None else 4
     args = (
         f"sigma_spatial={ns.bilateral_sigma_spatial}, "
-        f"sigma_color={ns.bilateral_sigma_color}, num_streams={ns.num_streams}"
+        f"sigma_color={ns.bilateral_sigma_color}, num_streams={ns_num}"
     )
     return {
         "vsfeel": f"core.vsfeel.Bilateral({clip}, {args})",
@@ -121,7 +123,8 @@ def _bilateral_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
 
 
 def _gauss_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
-    args = f"sigma={ns.gauss_sigma}, num_streams={ns.num_streams}"
+    ns_num = ns.num_streams if ns.num_streams is not None else 4
+    args = f"sigma={ns.gauss_sigma}, num_streams={ns_num}"
     return {
         "vsfeel": f"core.vsfeel.GaussBlur({clip}, {args})",
         "vszipcl": f"core.vszipcl.GaussBlur({clip}, {args})",
@@ -130,13 +133,16 @@ def _gauss_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
 
 
 def _dfttest_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
-    # all three plugins share the vszipcu parameter surface
+    # all three plugins share the vszipcu parameter surface; the references
+    # default num_streams to 1, so this filter honours the global --num-streams
+    # only when explicitly given (defaulting to 1 otherwise)
+    num_streams = ns.num_streams if ns.num_streams is not None else 1
     args = (
         f"ftype={ns.dfttest_ftype}, sigma={ns.dfttest_sigma}, sigma2={ns.dfttest_sigma2}, "
         f"pmin={ns.dfttest_pmin}, pmax={ns.dfttest_pmax}, sbsize=16, sosize={ns.dfttest_sosize}, "
         f"tbsize={ns.dfttest_tbsize}, swin={ns.dfttest_swin}, twin={ns.dfttest_twin}, "
         f"sbeta={ns.dfttest_sbeta}, tbeta={ns.dfttest_tbeta}, zmean={ns.dfttest_zmean}, "
-        f"f0beta={ns.dfttest_f0beta}, num_streams={ns.num_streams}"
+        f"f0beta={ns.dfttest_f0beta}, num_streams={num_streams}"
     )
     return {
         "vsfeel": f"core.vsfeel.DFTTest({clip}, {args})",
@@ -195,7 +201,7 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("f0beta", "--dfttest-f0beta", "dfttest_f0beta", float, 1.0),
         ],
         build=_dfttest_build,
-        input="depth(get_y(clip), 32)",
+        input="depth(get_y(clip), 16)",
     ),
 }
 
@@ -230,7 +236,12 @@ def bench(plugin: str, chain: str, clip: str, frames: int) -> float | None:
 
 def args_desc(spec: FilterSpec, ns: argparse.Namespace) -> str:
     pairs = [f"{a.key}={getattr(ns, a.dest)}" for a in spec.args]
-    pairs.append(f"num_streams={ns.num_streams}")
+    num = ns.num_streams
+    if spec.title == "DFTTest":
+        num = ns.num_streams if ns.num_streams is not None else 1
+    elif num is None:
+        num = 4
+    pairs.append(f"num_streams={num}")
     return ", ".join(pairs)
 
 
@@ -276,8 +287,8 @@ def parse_args() -> argparse.Namespace:
                         help="filter to benchmark (default: all)")
     parser.add_argument("--frames", type=int, default=None,
                         help="frames to time (default: per-filter, see FILTERS)")
-    parser.add_argument("--num-streams", type=int, default=4,
-                        help="num_streams passed to the filters (default: 4)")
+    parser.add_argument("--num-streams", type=int, default=None,
+                        help="num_streams passed to the filters (default: 1, or the reference default)")
     parser.add_argument("--clip", default=DEFAULT_CLIP, help="input clip path")
 
     for spec in FILTERS.values():

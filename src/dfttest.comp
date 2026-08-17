@@ -1409,6 +1409,105 @@ void temporal_idft(inout float data[TD_SZ], int base) {
 #endif
 }
 
+// Manual unrolls (register pressure fix)
+#define TD_DFT_1(d) dft1(d,0,16);dft1(d,2,16);dft1(d,4,16);dft1(d,6,16);dft1(d,8,16);dft1(d,10,16);dft1(d,12,16);dft1(d,14,16);dft1(d,16,16);dft1(d,18,16);dft1(d,20,16);dft1(d,22,16);dft1(d,24,16);dft1(d,26,16);dft1(d,28,16);dft1(d,30,16);
+#define TD_DFT_3(d) dft3(d,0,16);dft3(d,2,16);dft3(d,4,16);dft3(d,6,16);dft3(d,8,16);dft3(d,10,16);dft3(d,12,16);dft3(d,14,16);dft3(d,16,16);dft3(d,18,16);dft3(d,20,16);dft3(d,22,16);dft3(d,24,16);dft3(d,26,16);dft3(d,28,16);dft3(d,30,16);
+#define TD_DFT_5(d) dft5(d,0,16);dft5(d,2,16);dft5(d,4,16);dft5(d,6,16);dft5(d,8,16);dft5(d,10,16);dft5(d,12,16);dft5(d,14,16);dft5(d,16,16);dft5(d,18,16);dft5(d,20,16);dft5(d,22,16);dft5(d,24,16);dft5(d,26,16);dft5(d,28,16);dft5(d,30,16);
+#define TD_DFT_7(d) dft7(d,0,16);dft7(d,2,16);dft7(d,4,16);dft7(d,6,16);dft7(d,8,16);dft7(d,10,16);dft7(d,12,16);dft7(d,14,16);dft7(d,16,16);dft7(d,18,16);dft7(d,20,16);dft7(d,22,16);dft7(d,24,16);dft7(d,26,16);dft7(d,28,16);dft7(d,30,16);
+#define TD_IDFT_1(d) idft1(d,0,16);idft1(d,2,16);idft1(d,4,16);idft1(d,6,16);idft1(d,8,16);idft1(d,10,16);idft1(d,12,16);idft1(d,14,16);idft1(d,16,16);idft1(d,18,16);idft1(d,20,16);idft1(d,22,16);idft1(d,24,16);idft1(d,26,16);idft1(d,28,16);idft1(d,30,16);
+#define TD_IDFT_3(d) idft3(d,0,16);idft3(d,2,16);idft3(d,4,16);idft3(d,6,16);idft3(d,8,16);idft3(d,10,16);idft3(d,12,16);idft3(d,14,16);idft3(d,16,16);idft3(d,18,16);idft3(d,20,16);idft3(d,22,16);idft3(d,24,16);idft3(d,26,16);idft3(d,28,16);idft3(d,30,16);
+#define TD_IDFT_5(d) idft5(d,0,16);idft5(d,2,16);idft5(d,4,16);idft5(d,6,16);idft5(d,8,16);idft5(d,10,16);idft5(d,12,16);idft5(d,14,16);idft5(d,16,16);idft5(d,18,16);idft5(d,20,16);idft5(d,22,16);idft5(d,24,16);idft5(d,26,16);idft5(d,28,16);idft5(d,30,16);
+#define TD_IDFT_7(d) idft7(d,0,16);idft7(d,2,16);idft7(d,4,16);idft7(d,6,16);idft7(d,8,16);idft7(d,10,16);idft7(d,12,16);idft7(d,14,16);idft7(d,16,16);idft7(d,18,16);idft7(d,20,16);idft7(d,22,16);idft7(d,24,16);idft7(d,26,16);idft7(d,28,16);idft7(d,30,16);
+#if RADIUS == 0
+#define TD_DFT_ALL(d) TD_DFT_1(d)
+#define TD_IDFT_ALL(d) TD_IDFT_1(d)
+#elif RADIUS == 1
+#define TD_DFT_ALL(d) TD_DFT_3(d)
+#define TD_IDFT_ALL(d) TD_IDFT_3(d)
+#elif RADIUS == 2
+#define TD_DFT_ALL(d) TD_DFT_5(d)
+#define TD_IDFT_ALL(d) TD_IDFT_5(d)
+#else
+#define TD_DFT_ALL(d) TD_DFT_7(d)
+#define TD_IDFT_ALL(d) TD_IDFT_7(d)
+#endif
+
+#define IM2COL_SLICE(d, i) { \
+    for (int j = 0; j < 16; ++j) { \
+        const int src_off = ((i) * ph + iy * pc.block_step + j) * pw + ix * pc.block_step + lane; \
+        d[(i) * 32 + j] = to_float(load_raw(src_off)) * wt[pc.wt_base + ((i) * 16 + j) * 16 + lane]; \
+    } \
+}
+#define SPATIAL_SLICE(d, i) { \
+    const int B = (i) * 32; \
+    barrier(); \
+    for (int j = 0; j < 16; ++j) { trans[tsub + 2 * (j * TSTRIDE + lane) + 0] = d[B + j]; } \
+    barrier(); \
+    for (int j = 0; j < 16; ++j) { d[B + j] = trans[tsub + 2 * (lane * TSTRIDE + j) + 0]; } \
+    barrier(); \
+    rdft16(d, B); \
+    for (int j = 0; j < 9; ++j) { \
+        trans[tsub + 2 * (lane * TSTRIDE + j) + 0] = d[B + 2 * j]; \
+        trans[tsub + 2 * (lane * TSTRIDE + j) + 1] = d[B + 2 * j + 1]; \
+    } \
+    barrier(); \
+    if (lane < 9) { \
+        for (int j = 0; j < 16; ++j) { \
+            d[B + 2 * j] = trans[tsub + 2 * (j * TSTRIDE + lane) + 0]; \
+            d[B + 2 * j + 1] = trans[tsub + 2 * (j * TSTRIDE + lane) + 1]; \
+        } \
+        dft16(d, B, 1); \
+    } \
+}
+#define IM2COL_ALL_1(d) IM2COL_SLICE(d,0)
+#define SPATIAL_ALL_1(d) SPATIAL_SLICE(d,0)
+#define IM2COL_ALL_3(d) IM2COL_SLICE(d,0) IM2COL_SLICE(d,1) IM2COL_SLICE(d,2)
+#define SPATIAL_ALL_3(d) SPATIAL_SLICE(d,0) SPATIAL_SLICE(d,1) SPATIAL_SLICE(d,2)
+#define IM2COL_ALL_5(d) IM2COL_SLICE(d,0) IM2COL_SLICE(d,1) IM2COL_SLICE(d,2) IM2COL_SLICE(d,3) IM2COL_SLICE(d,4)
+#define SPATIAL_ALL_5(d) SPATIAL_SLICE(d,0) SPATIAL_SLICE(d,1) SPATIAL_SLICE(d,2) SPATIAL_SLICE(d,3) SPATIAL_SLICE(d,4)
+#define IM2COL_ALL_7(d) IM2COL_SLICE(d,0) IM2COL_SLICE(d,1) IM2COL_SLICE(d,2) IM2COL_SLICE(d,3) IM2COL_SLICE(d,4) IM2COL_SLICE(d,5) IM2COL_SLICE(d,6)
+#define SPATIAL_ALL_7(d) SPATIAL_SLICE(d,0) SPATIAL_SLICE(d,1) SPATIAL_SLICE(d,2) SPATIAL_SLICE(d,3) SPATIAL_SLICE(d,4) SPATIAL_SLICE(d,5) SPATIAL_SLICE(d,6)
+#if RADIUS == 0
+#define IM2COL_ALL(d) IM2COL_ALL_1(d)
+#define SPATIAL_ALL(d) SPATIAL_ALL_1(d)
+#elif RADIUS == 1
+#define IM2COL_ALL(d) IM2COL_ALL_3(d)
+#define SPATIAL_ALL(d) SPATIAL_ALL_3(d)
+#elif RADIUS == 2
+#define IM2COL_ALL(d) IM2COL_ALL_5(d)
+#define SPATIAL_ALL(d) SPATIAL_ALL_5(d)
+#else
+#define IM2COL_ALL(d) IM2COL_ALL_7(d)
+#define SPATIAL_ALL(d) SPATIAL_ALL_7(d)
+#endif
+
+#define FILTER_BIN(d, i, j) { \
+    const int IDX = (i * 16 + j) * 2; \
+    float RE = d[IDX]; float IM = d[IDX + 1]; \
+    float V1 = 0.0; float V2 = 0.0; \
+    if (pc.wf_base >= 0) { \
+        V1 = s_gf[sub] * wt[pc.wf_base + ((i * 16 + j) * 9 + lane) * 2 + 0]; \
+        V2 = s_gf[sub] * wt[pc.wf_base + ((i * 16 + j) * 9 + lane) * 2 + 1]; \
+        RE -= V1; IM -= V2; \
+    } \
+    filter_value(RE, IM, lane, j, i); \
+    if (pc.wf_base >= 0) { RE += V1; IM += V2; } \
+    d[IDX] = RE; d[IDX + 1] = IM; \
+}
+#define FILTER_ALL_1(d) FILTER_BIN(d,0,0) FILTER_BIN(d,0,1) FILTER_BIN(d,0,2) FILTER_BIN(d,0,3) FILTER_BIN(d,0,4) FILTER_BIN(d,0,5) FILTER_BIN(d,0,6) FILTER_BIN(d,0,7) FILTER_BIN(d,0,8) FILTER_BIN(d,0,9) FILTER_BIN(d,0,10) FILTER_BIN(d,0,11) FILTER_BIN(d,0,12) FILTER_BIN(d,0,13) FILTER_BIN(d,0,14) FILTER_BIN(d,0,15)
+#define FILTER_ALL_3(d) FILTER_BIN(d,0,0) FILTER_BIN(d,0,1) FILTER_BIN(d,0,2) FILTER_BIN(d,0,3) FILTER_BIN(d,0,4) FILTER_BIN(d,0,5) FILTER_BIN(d,0,6) FILTER_BIN(d,0,7) FILTER_BIN(d,0,8) FILTER_BIN(d,0,9) FILTER_BIN(d,0,10) FILTER_BIN(d,0,11) FILTER_BIN(d,0,12) FILTER_BIN(d,0,13) FILTER_BIN(d,0,14) FILTER_BIN(d,0,15) FILTER_BIN(d,1,0) FILTER_BIN(d,1,1) FILTER_BIN(d,1,2) FILTER_BIN(d,1,3) FILTER_BIN(d,1,4) FILTER_BIN(d,1,5) FILTER_BIN(d,1,6) FILTER_BIN(d,1,7) FILTER_BIN(d,1,8) FILTER_BIN(d,1,9) FILTER_BIN(d,1,10) FILTER_BIN(d,1,11) FILTER_BIN(d,1,12) FILTER_BIN(d,1,13) FILTER_BIN(d,1,14) FILTER_BIN(d,1,15) FILTER_BIN(d,2,0) FILTER_BIN(d,2,1) FILTER_BIN(d,2,2) FILTER_BIN(d,2,3) FILTER_BIN(d,2,4) FILTER_BIN(d,2,5) FILTER_BIN(d,2,6) FILTER_BIN(d,2,7) FILTER_BIN(d,2,8) FILTER_BIN(d,2,9) FILTER_BIN(d,2,10) FILTER_BIN(d,2,11) FILTER_BIN(d,2,12) FILTER_BIN(d,2,13) FILTER_BIN(d,2,14) FILTER_BIN(d,2,15)
+#define FILTER_ALL_5(d) FILTER_BIN(d,0,0) FILTER_BIN(d,0,1) FILTER_BIN(d,0,2) FILTER_BIN(d,0,3) FILTER_BIN(d,0,4) FILTER_BIN(d,0,5) FILTER_BIN(d,0,6) FILTER_BIN(d,0,7) FILTER_BIN(d,0,8) FILTER_BIN(d,0,9) FILTER_BIN(d,0,10) FILTER_BIN(d,0,11) FILTER_BIN(d,0,12) FILTER_BIN(d,0,13) FILTER_BIN(d,0,14) FILTER_BIN(d,0,15) FILTER_BIN(d,1,0) FILTER_BIN(d,1,1) FILTER_BIN(d,1,2) FILTER_BIN(d,1,3) FILTER_BIN(d,1,4) FILTER_BIN(d,1,5) FILTER_BIN(d,1,6) FILTER_BIN(d,1,7) FILTER_BIN(d,1,8) FILTER_BIN(d,1,9) FILTER_BIN(d,1,10) FILTER_BIN(d,1,11) FILTER_BIN(d,1,12) FILTER_BIN(d,1,13) FILTER_BIN(d,1,14) FILTER_BIN(d,1,15) FILTER_BIN(d,2,0) FILTER_BIN(d,2,1) FILTER_BIN(d,2,2) FILTER_BIN(d,2,3) FILTER_BIN(d,2,4) FILTER_BIN(d,2,5) FILTER_BIN(d,2,6) FILTER_BIN(d,2,7) FILTER_BIN(d,2,8) FILTER_BIN(d,2,9) FILTER_BIN(d,2,10) FILTER_BIN(d,2,11) FILTER_BIN(d,2,12) FILTER_BIN(d,2,13) FILTER_BIN(d,2,14) FILTER_BIN(d,2,15) FILTER_BIN(d,3,0) FILTER_BIN(d,3,1) FILTER_BIN(d,3,2) FILTER_BIN(d,3,3) FILTER_BIN(d,3,4) FILTER_BIN(d,3,5) FILTER_BIN(d,3,6) FILTER_BIN(d,3,7) FILTER_BIN(d,3,8) FILTER_BIN(d,3,9) FILTER_BIN(d,3,10) FILTER_BIN(d,3,11) FILTER_BIN(d,3,12) FILTER_BIN(d,3,13) FILTER_BIN(d,3,14) FILTER_BIN(d,3,15) FILTER_BIN(d,4,0) FILTER_BIN(d,4,1) FILTER_BIN(d,4,2) FILTER_BIN(d,4,3) FILTER_BIN(d,4,4) FILTER_BIN(d,4,5) FILTER_BIN(d,4,6) FILTER_BIN(d,4,7) FILTER_BIN(d,4,8) FILTER_BIN(d,4,9) FILTER_BIN(d,4,10) FILTER_BIN(d,4,11) FILTER_BIN(d,4,12) FILTER_BIN(d,4,13) FILTER_BIN(d,4,14) FILTER_BIN(d,4,15)
+#define FILTER_ALL_7(d) FILTER_BIN(d,0,0) FILTER_BIN(d,0,1) FILTER_BIN(d,0,2) FILTER_BIN(d,0,3) FILTER_BIN(d,0,4) FILTER_BIN(d,0,5) FILTER_BIN(d,0,6) FILTER_BIN(d,0,7) FILTER_BIN(d,0,8) FILTER_BIN(d,0,9) FILTER_BIN(d,0,10) FILTER_BIN(d,0,11) FILTER_BIN(d,0,12) FILTER_BIN(d,0,13) FILTER_BIN(d,0,14) FILTER_BIN(d,0,15) FILTER_BIN(d,1,0) FILTER_BIN(d,1,1) FILTER_BIN(d,1,2) FILTER_BIN(d,1,3) FILTER_BIN(d,1,4) FILTER_BIN(d,1,5) FILTER_BIN(d,1,6) FILTER_BIN(d,1,7) FILTER_BIN(d,1,8) FILTER_BIN(d,1,9) FILTER_BIN(d,1,10) FILTER_BIN(d,1,11) FILTER_BIN(d,1,12) FILTER_BIN(d,1,13) FILTER_BIN(d,1,14) FILTER_BIN(d,1,15) FILTER_BIN(d,2,0) FILTER_BIN(d,2,1) FILTER_BIN(d,2,2) FILTER_BIN(d,2,3) FILTER_BIN(d,2,4) FILTER_BIN(d,2,5) FILTER_BIN(d,2,6) FILTER_BIN(d,2,7) FILTER_BIN(d,2,8) FILTER_BIN(d,2,9) FILTER_BIN(d,2,10) FILTER_BIN(d,2,11) FILTER_BIN(d,2,12) FILTER_BIN(d,2,13) FILTER_BIN(d,2,14) FILTER_BIN(d,2,15) FILTER_BIN(d,3,0) FILTER_BIN(d,3,1) FILTER_BIN(d,3,2) FILTER_BIN(d,3,3) FILTER_BIN(d,3,4) FILTER_BIN(d,3,5) FILTER_BIN(d,3,6) FILTER_BIN(d,3,7) FILTER_BIN(d,3,8) FILTER_BIN(d,3,9) FILTER_BIN(d,3,10) FILTER_BIN(d,3,11) FILTER_BIN(d,3,12) FILTER_BIN(d,3,13) FILTER_BIN(d,3,14) FILTER_BIN(d,3,15) FILTER_BIN(d,4,0) FILTER_BIN(d,4,1) FILTER_BIN(d,4,2) FILTER_BIN(d,4,3) FILTER_BIN(d,4,4) FILTER_BIN(d,4,5) FILTER_BIN(d,4,6) FILTER_BIN(d,4,7) FILTER_BIN(d,4,8) FILTER_BIN(d,4,9) FILTER_BIN(d,4,10) FILTER_BIN(d,4,11) FILTER_BIN(d,4,12) FILTER_BIN(d,4,13) FILTER_BIN(d,4,14) FILTER_BIN(d,4,15) FILTER_BIN(d,5,0) FILTER_BIN(d,5,1) FILTER_BIN(d,5,2) FILTER_BIN(d,5,3) FILTER_BIN(d,5,4) FILTER_BIN(d,5,5) FILTER_BIN(d,5,6) FILTER_BIN(d,5,7) FILTER_BIN(d,5,8) FILTER_BIN(d,5,9) FILTER_BIN(d,5,10) FILTER_BIN(d,5,11) FILTER_BIN(d,5,12) FILTER_BIN(d,5,13) FILTER_BIN(d,5,14) FILTER_BIN(d,5,15) FILTER_BIN(d,6,0) FILTER_BIN(d,6,1) FILTER_BIN(d,6,2) FILTER_BIN(d,6,3) FILTER_BIN(d,6,4) FILTER_BIN(d,6,5) FILTER_BIN(d,6,6) FILTER_BIN(d,6,7) FILTER_BIN(d,6,8) FILTER_BIN(d,6,9) FILTER_BIN(d,6,10) FILTER_BIN(d,6,11) FILTER_BIN(d,6,12) FILTER_BIN(d,6,13) FILTER_BIN(d,6,14) FILTER_BIN(d,6,15)
+#if RADIUS == 0
+#define FILTER_ALL(d) FILTER_ALL_1(d)
+#elif RADIUS == 1
+#define FILTER_ALL(d) FILTER_ALL_3(d)
+#elif RADIUS == 2
+#define FILTER_ALL(d) FILTER_ALL_5(d)
+#else
+#define FILTER_ALL(d) FILTER_ALL_7(d)
+#endif
+
 // ---------------------------------------------------------------------------
 // pad: reflection-pad the tight upload rows into the device-local padded buffer
 // (single-fold mirror, identical to the reference's reflect_pad kernel and the
@@ -1482,51 +1581,15 @@ void main() {
             td[i] = 0.0;
         }
 
-        // im2col: each lane loads column `lane` of the 16x16 window, windowed
-        for (int i = 0; i < tw; ++i) {
-            const int base = i * 32;
-            for (int j = 0; j < 16; ++j) {
-                const int src_off = (i * ph + iy * pc.block_step + j) * pw + ix * pc.block_step + lane;
-                td[base + j] = to_float(load_raw(src_off)) * wt[pc.wt_base + (i * 16 + j) * 16 + lane];
-            }
-        }
+        // im2col
+        IM2COL_ALL(td);
 
-        // per-slice: rdft along x (rows) then dft along y (columns)
-        for (int i = 0; i < tw; ++i) {
-            const int base = i * 32;
-            barrier();
-            // transpose store of the real data (scalar floats)
-            for (int j = 0; j < 16; ++j) {
-                trans[tsub + 2 * (j * TSTRIDE + lane) + 0] = td[base + j];
-            }
-            barrier();
-            // transpose load: lane now holds row `lane`
-            for (int j = 0; j < 16; ++j) {
-                td[base + j] = trans[tsub + 2 * (lane * TSTRIDE + j) + 0];
-            }
-            barrier();
-            rdft16(td, base);
-            // transpose store of the complex data
-            for (int j = 0; j < 9; ++j) {
-                trans[tsub + 2 * (lane * TSTRIDE + j) + 0] = td[base + 2 * j];
-                trans[tsub + 2 * (lane * TSTRIDE + j) + 1] = td[base + 2 * j + 1];
-            }
-            barrier();
-            if (lane < 9) {
-                // transpose load: lane holds bin `lane` across the 16 rows
-                for (int j = 0; j < 16; ++j) {
-                    td[base + 2 * j] = trans[tsub + 2 * (j * TSTRIDE + lane) + 0];
-                    td[base + 2 * j + 1] = trans[tsub + 2 * (j * TSTRIDE + lane) + 1];
-                }
-                dft16(td, base, 1);
-            }
-        }
+        // per-slice
+        SPATIAL_ALL(td);
 
         // temporal dft across the slices
         if (lane < 9) {
-            for (int i = 0; i < 16; ++i) {
-                temporal_dft(td, 2 * i);
-            }
+            TD_DFT_ALL(td);
         }
 
         // zero-mean: DC gain broadcast from lane 0
@@ -1539,32 +1602,9 @@ void main() {
 
         if (lane < 9) {
             // frequency filtering
-            for (int i = 0; i < tw; ++i) {
-                for (int j = 0; j < 16; ++j) {
-                    const int idx = (i * 16 + j) * 2;
-                    float re = td[idx];
-                    float im = td[idx + 1];
-                    float v1 = 0.0;
-                    float v2 = 0.0;
-                    if (pc.wf_base >= 0) {
-                        v1 = s_gf[sub] * wt[pc.wf_base + ((i * 16 + j) * 9 + lane) * 2 + 0];
-                        v2 = s_gf[sub] * wt[pc.wf_base + ((i * 16 + j) * 9 + lane) * 2 + 1];
-                        re -= v1;
-                        im -= v2;
-                    }
-                    filter_value(re, im, lane, j, i);
-                    if (pc.wf_base >= 0) {
-                        re += v1;
-                        im += v2;
-                    }
-                    td[idx] = re;
-                    td[idx + 1] = im;
-                }
-            }
+            FILTER_ALL(td);
             // temporal idft
-            for (int i = 0; i < 16; ++i) {
-                temporal_idft(td, 2 * i);
-            }
+            TD_IDFT_ALL(td);
         }
 
         // inverse y-transform of the center slice + transpose back to rows
