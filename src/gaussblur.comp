@@ -1,0 +1,233 @@
+#version 450
+
+/*
+ * GaussBlur — separable per-plane Gaussian blur (Vulkan port of the vszipcl /
+ * vszipcu reference kernels). Exactly one of ENTRY_GAUSS / ENTRY_VERT /
+ * ENTRY_HORIZ is defined at compile time, selecting the entry point:
+ *
+ *   ENTRY_GAUSS  — fused small path (radius <= 32): vertical blur of the tile
+ *                  columns plus a +/-RAD X-halo into shared memory, then the
+ *                  horizontal blur from shared memory straight to the output.
+ *   ENTRY_VERT   — large path (radius > 32), first pass: R consecutive output
+ *                  rows per thread using a rolling weight window.
+ *   ENTRY_HORIZ  — large path, second pass: R consecutive output columns per
+ *                  thread from the vertical pass' float buffer.
+ *
+ * Parity notes (do not alter): mirror reflects at the edges (single fold,
+ * `-i` / `2*(dim-1)-i`), the taps are accumulated in ascending-k order, and
+ * the accumulation uses explicit fma() so the FMAD contraction matches the
+ * CUDA/OpenCL references. The IO conversion follows the references: integer
+ * input is the raw code (no scaling), integer output rounds to nearest even
+ * and saturates (convert_*_sat_rte), 16-bit float widens/narrows exactly.
+ *
+ * Compile-time variants: -DBITS=8|16|32 with -DHALF=1 selecting the 16-bit
+ * float staging for BITS=16. The staging buffer holds the raw VapourSynth
+ * plane bytes and the kernel performs the format conversion itself, so the
+ * host side only memcpys raw bytes.
+ */
+
+#if !defined(BITS)
+#define BITS 16
+#endif
+#if !defined(HALF)
+#define HALF 0
+#endif
+
+#if BITS == 8
+#define ELEM_BYTES 1
+#define ELEM_MASK  0xFFu
+#define PEAK       255.0f
+#elif BITS == 16
+#define ELEM_BYTES 2
+#define ELEM_MASK  0xFFFFu
+#define PEAK       65535.0f
+#else
+#define ELEM_BYTES 4
+#define ELEM_MASK  0xFFFFFFFFu
+#define PEAK       1.0f
+#endif
+
+#define ELEM_SHIFT(byte) (8 * ((byte) & 3))
+
+const int BLK_X = 16;
+const int BLK_Y = 8;
+const int VRT = 3;
+const int R = 8;
+
+layout(constant_id = 0) const int WIDTH = 1920;
+layout(constant_id = 1) const int HEIGHT = 1080;
+layout(constant_id = 2) const int STRIDE = 1920;
+layout(constant_id = 3) const int KLEN = 1;
+layout(constant_id = 4) const int RAD = 0;
+
+layout(std430, binding = 0) readonly buffer WtBuf { float wt[]; };
+layout(std430, binding = 1) readonly buffer SrcBuf { uint src_raw[]; };
+layout(std430, binding = 2) buffer DstBuf { uint dst_raw[]; };
+layout(std430, binding = 3) buffer TmpBuf { float tmp[]; };
+
+// the bases are RAW BYTE offsets (the kernel converts to dword indices
+// itself); wt_base is a float element offset into the weights buffer
+layout(push_constant) uniform PushConstants {
+    int src_base;
+    int dst_base;
+    int tmp_base;
+    int wt_base;
+} pc;
+
+uint load_raw(int idx) {
+    int byte = idx * ELEM_BYTES;
+    uint word = src_raw[(pc.src_base + byte) >> 2];
+    return (word >> ELEM_SHIFT(byte)) & ELEM_MASK;
+}
+
+float load_value(int idx) {
+#if BITS == 32
+    return uintBitsToFloat(load_raw(idx));
+#elif BITS == 16 && HALF
+    return unpackHalf2x16(load_raw(idx)).x;
+#else
+    return float(load_raw(idx));
+#endif
+}
+
+void store_raw(int idx, uint val) {
+    int byte = idx * ELEM_BYTES;
+    int wi = (pc.dst_base + byte) >> 2;
+#if BITS == 32
+    dst_raw[wi] = val;
+#else
+    // masked OR into a shared dword; the host clears the download region
+    // before submission, so no lost-update race between paired lanes
+    atomicOr(dst_raw[wi], (val & ELEM_MASK) << ELEM_SHIFT(byte));
+#endif
+}
+
+void store_value(int idx, float v) {
+#if BITS == 32
+    store_raw(idx, floatBitsToUint(v));
+#elif BITS == 16 && HALF
+    store_raw(idx, packHalf2x16(vec2(v, 0.0)) & ELEM_MASK);
+#else
+    store_raw(idx, uint(clamp(roundEven(v), 0.0, PEAK)) & ELEM_MASK);
+#endif
+}
+
+// mirror reflects a raw (possibly out-of-range) tap coordinate
+int mirror(int i, int dim) {
+    if (i < 0) {
+        return -i;
+    } else if (i >= dim) {
+        return 2 * (dim - 1) - i;
+    }
+    return i;
+}
+
+#if defined(ENTRY_GAUSS)
+
+// the tile of vertically blurred columns: VRT*BLK_Y output rows wide, with a
+// +-RAD halo of columns so the horizontal pass never leaves shared memory
+shared float vblur[VRT * BLK_Y][BLK_X + 2 * RAD];
+
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    const int lx = int(gl_LocalInvocationID.x);
+    const int ly = int(gl_LocalInvocationID.y);
+    const int gx0 = int(gl_WorkGroupID.x) * BLK_X;       // first output column
+    const int gy0 = int(gl_WorkGroupID.y) * (VRT * BLK_Y); // first output row
+
+    // Phase 1 — vertical blur of the tile columns + a +-RAD X-halo into local
+    // memory. Every thread reaches the barrier below (the `continue` only
+    // skips the row's work), so no deadlock on the ragged tail.
+    for (int ry = ly; ry < VRT * BLK_Y; ry += BLK_Y) {
+        const int y = gy0 + ry;
+        if (y >= HEIGHT) continue;   // row past frame: Phase 2 never reads it
+        for (int cj = lx; cj < BLK_X + 2 * RAD; cj += BLK_X) {
+            int cx = gx0 - RAD + cj;                     // raw (maybe OOB) column
+            cx = mirror(cx, WIDTH);
+            cx = min(max(cx, 0), WIDTH - 1);             // no-op for read cells
+            float vsum = 0.0f;
+            for (int k = 0; k < KLEN; ++k) {             // ascending k
+                int sy = y + k - RAD;
+                sy = mirror(sy, HEIGHT);
+                vsum = fma(load_value(sy * STRIDE + cx), wt[pc.wt_base + k], vsum);
+            }
+            vblur[ry][cj] = vsum;
+        }
+    }
+    barrier();
+
+    // Phase 2 — horizontal blur from vblur -> dst. Output col x, VRT output
+    // rows per thread.
+    const int x = gx0 + lx;
+    if (x >= WIDTH) return;
+    for (int r = 0; r < VRT; ++r) {
+        const int y = gy0 + ly + r * BLK_Y;
+        if (y >= HEIGHT) return;                         // strided y -> safe to bail
+        const int lc = ly + r * BLK_Y;                   // local tile row
+        float sum = 0.0f;
+        for (int k = 0; k < KLEN; ++k)                   // ascending k
+            sum = fma(vblur[lc][lx + k], wt[pc.wt_base + k], sum);
+        store_value(y * STRIDE + x, sum);
+    }
+}
+
+#elif defined(ENTRY_VERT)
+
+// R consecutive output rows per thread; the rolling weight window reproduces
+// the per-pixel ascending-k FMAs exactly.
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    const int x = int(gl_GlobalInvocationID.x);
+    const int y0 = int(gl_GlobalInvocationID.y) * R;     // first output row
+    if (x >= WIDTH || y0 >= HEIGHT) return;
+    const int radius = KLEN / 2;
+    float sum[R], wreg[R];
+    for (int j = 0; j < R; ++j) { sum[j] = 0.0f; wreg[j] = 0.0f; }
+    for (int k = 0; k < KLEN + (R - 1); ++k) {
+        for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];   // slide the window
+        wreg[0] = (k < KLEN) ? wt[pc.wt_base + k] : 0.0f;
+        int sy = y0 + k - radius;
+        sy = mirror(sy, HEIGHT);
+        sy = min(max(sy, 0), HEIGHT - 1);                // no-op for valid radius
+        const float v = load_value(sy * STRIDE + x);
+        for (int j = 0; j < R; ++j) {
+            if (k - j >= 0 && k - j < KLEN)              // uniform: taps 0..KLEN-1
+                sum[j] = fma(v, wreg[j], sum[j]);
+        }
+    }
+    for (int j = 0; j < R; ++j) {
+        if (y0 + j < HEIGHT) tmp[(pc.tmp_base >> 2) + (y0 + j) * STRIDE + x] = sum[j];
+    }
+}
+
+#elif defined(ENTRY_HORIZ)
+
+// R consecutive output columns per thread, reading the vertical pass' float
+// buffer.
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    const int x0 = int(gl_GlobalInvocationID.x) * R;     // first output column
+    const int y = int(gl_GlobalInvocationID.y);
+    if (x0 >= WIDTH || y >= HEIGHT) return;
+    const int radius = KLEN / 2;
+    const int row = y * STRIDE;
+    float sum[R], wreg[R];
+    for (int j = 0; j < R; ++j) { sum[j] = 0.0f; wreg[j] = 0.0f; }
+    for (int k = 0; k < KLEN + (R - 1); ++k) {
+        for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];   // slide the window
+        wreg[0] = (k < KLEN) ? wt[pc.wt_base + k] : 0.0f;
+        int sx = x0 + k - radius;
+        sx = mirror(sx, WIDTH);
+        sx = min(max(sx, 0), WIDTH - 1);                 // no-op for valid radius
+        const float v = tmp[(pc.tmp_base >> 2) + row + sx];
+        for (int j = 0; j < R; ++j) {
+            if (k - j >= 0 && k - j < KLEN)              // uniform: taps 0..KLEN-1
+                sum[j] = fma(v, wreg[j], sum[j]);
+        }
+    }
+    for (int j = 0; j < R; ++j) {
+        if (x0 + j < WIDTH) store_value(row + x0 + j, sum[j]);
+    }
+}
+
+#endif

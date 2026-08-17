@@ -92,3 +92,4 @@ std::variant<AllocatedMemory, std::string> allocate_memory(
 
 void vsfeel_register_bilateral(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
 void vsfeel_register_bm3dv2(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
+void vsfeel_register_gaussblur(const VSPLUGINAPI * vspapi, VSPlugin * plugin);

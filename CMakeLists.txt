@@ -74,6 +74,37 @@ if(VK_GLSLC)
             DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/${kernel}.comp"
             VERBATIM)
     endforeach()
+    # GaussBlur: one kernel with three entry points (fused small path + the two
+    # large-path passes), per io variant (8/16 int, 16 half, 32 float)
+    set(VK_GAUSS_ENTRIES gauss vert horiz)
+    set(VK_GAUSS_BITDEFS "8" "16" "16h" "32")
+    foreach(bits IN LISTS VK_GAUSS_BITDEFS)
+        set(bits_defs)
+        if(bits STREQUAL "16h")
+            list(APPEND bits_defs -DBITS=16 -DHALF=1)
+        else()
+            list(APPEND bits_defs -DBITS=${bits})
+        endif()
+        foreach(entry IN LISTS VK_GAUSS_ENTRIES)
+            set(defs ${bits_defs})
+            if(entry STREQUAL gauss)
+                list(APPEND defs -DENTRY_GAUSS)
+            elseif(entry STREQUAL vert)
+                list(APPEND defs -DENTRY_VERT)
+            else()
+                list(APPEND defs -DENTRY_HORIZ)
+            endif()
+            list(APPEND VK_SPV_OUTPUTS "${VK_SPV_DIR}/gaussblur_${bits}_${entry}.spv")
+            add_custom_command(
+                OUTPUT "${VK_SPV_DIR}/gaussblur_${bits}_${entry}.spv"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
+                COMMAND ${VK_GLSLC} -O -fshader-stage=compute ${defs}
+                        -o "${VK_SPV_DIR}/gaussblur_${bits}_${entry}.spv"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/src/gaussblur.comp"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/gaussblur.comp"
+                VERBATIM)
+        endforeach()
+    endforeach()
 else()
     message(FATAL_ERROR "glslc not found")
 endif()
@@ -89,6 +120,18 @@ add_custom_command(
             "${VK_SPV_DIR}/kernel_plain_32.spv"
             "${VK_SPV_DIR}/bm3d.spv"
             "${VK_SPV_DIR}/bm3d_agg.spv"
+            "${VK_SPV_DIR}/gaussblur_8_gauss.spv"
+            "${VK_SPV_DIR}/gaussblur_8_vert.spv"
+            "${VK_SPV_DIR}/gaussblur_8_horiz.spv"
+            "${VK_SPV_DIR}/gaussblur_16_gauss.spv"
+            "${VK_SPV_DIR}/gaussblur_16_vert.spv"
+            "${VK_SPV_DIR}/gaussblur_16_horiz.spv"
+            "${VK_SPV_DIR}/gaussblur_16h_gauss.spv"
+            "${VK_SPV_DIR}/gaussblur_16h_vert.spv"
+            "${VK_SPV_DIR}/gaussblur_16h_horiz.spv"
+            "${VK_SPV_DIR}/gaussblur_32_gauss.spv"
+            "${VK_SPV_DIR}/gaussblur_32_vert.spv"
+            "${VK_SPV_DIR}/gaussblur_32_horiz.spv"
             "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
     DEPENDS ${VK_SPV_OUTPUTS}
     VERBATIM)
@@ -99,6 +142,7 @@ add_library(vsfeel SHARED
     src/vsfeel.cpp
     src/bilateral.cpp
     src/bm3d.cpp
+    src/gaussblur.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h")
 configure_common(vsfeel)
 target_compile_options(vsfeel PRIVATE -mavx2)
