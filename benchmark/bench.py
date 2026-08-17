@@ -116,6 +116,7 @@ def _bilateral_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     return {
         "vsfeel": f"core.vsfeel.Bilateral({clip}, {args})",
         "vszipcl": f"core.vszipcl.Bilateral({clip}, {args})",
+        "vszipcu": f"core.vszipcu.Bilateral({clip}, {args})",
     }
 
 
@@ -125,6 +126,22 @@ def _gauss_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
         "vsfeel": f"core.vsfeel.GaussBlur({clip}, {args})",
         "vszipcl": f"core.vszipcl.GaussBlur({clip}, {args})",
         "vszipcu": f"core.vszipcu.GaussBlur({clip}, {args})",
+    }
+
+
+def _dfttest_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
+    # all three plugins share the vszipcu parameter surface
+    args = (
+        f"ftype={ns.dfttest_ftype}, sigma={ns.dfttest_sigma}, sigma2={ns.dfttest_sigma2}, "
+        f"pmin={ns.dfttest_pmin}, pmax={ns.dfttest_pmax}, sbsize=16, sosize={ns.dfttest_sosize}, "
+        f"tbsize={ns.dfttest_tbsize}, swin={ns.dfttest_swin}, twin={ns.dfttest_twin}, "
+        f"sbeta={ns.dfttest_sbeta}, tbeta={ns.dfttest_tbeta}, zmean={ns.dfttest_zmean}, "
+        f"f0beta={ns.dfttest_f0beta}, num_streams={ns.num_streams}"
+    )
+    return {
+        "vsfeel": f"core.vsfeel.DFTTest({clip}, {args})",
+        "vszipcl": f"core.vszipcl.DFTTest({clip}, {args})",
+        "vszipcu": f"core.vszipcu.DFTTest({clip}, {args})",
     }
 
 
@@ -158,6 +175,27 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("sigma", "--gauss-sigma", "gauss_sigma", float, 16.0),
         ],
         build=_gauss_build,
+    ),
+    "dfttest": FilterSpec(
+        title="DFTTest",
+        default_frames=1000,
+        args=[
+            Arg("ftype", "--dfttest-ftype", "dfttest_ftype", int, 0),
+            Arg("sigma", "--dfttest-sigma", "dfttest_sigma", float, 8.0),
+            Arg("sigma2", "--dfttest-sigma2", "dfttest_sigma2", float, 8.0),
+            Arg("pmin", "--dfttest-pmin", "dfttest_pmin", float, 0.0),
+            Arg("pmax", "--dfttest-pmax", "dfttest_pmax", float, 500.0),
+            Arg("sosize", "--dfttest-sosize", "dfttest_sosize", int, 12),
+            Arg("tbsize", "--dfttest-tbsize", "dfttest_tbsize", int, 3),
+            Arg("swin", "--dfttest-swin", "dfttest_swin", int, 0),
+            Arg("twin", "--dfttest-twin", "dfttest_twin", int, 7),
+            Arg("sbeta", "--dfttest-sbeta", "dfttest_sbeta", float, 2.5),
+            Arg("tbeta", "--dfttest-tbeta", "dfttest_tbeta", float, 2.5),
+            Arg("zmean", "--dfttest-zmean", "dfttest_zmean", int, 1),
+            Arg("f0beta", "--dfttest-f0beta", "dfttest_f0beta", float, 1.0),
+        ],
+        build=_dfttest_build,
+        input="depth(get_y(clip), 32)",
     ),
 }
 
@@ -237,7 +275,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-f", "--filter", choices=[*FILTERS, "all"], default="all",
                         help="filter to benchmark (default: all)")
     parser.add_argument("--frames", type=int, default=None,
-                        help="frames to time (default: per-filter, 10000 for Bilateral/GaussBlur)")
+                        help="frames to time (default: per-filter, see FILTERS)")
     parser.add_argument("--num-streams", type=int, default=4,
                         help="num_streams passed to the filters (default: 4)")
     parser.add_argument("--clip", default=DEFAULT_CLIP, help="input clip path")

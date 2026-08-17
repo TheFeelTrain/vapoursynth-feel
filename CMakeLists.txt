@@ -105,6 +105,42 @@ if(VK_GLSLC)
                 VERBATIM)
         endforeach()
     endforeach()
+    # DFTTest: pad + fused + col2im kernels per io variant (8/16 int, 32
+    # float); the fused kernel is additionally compiled per temporal radius
+    # (0..3, i.e. tbsize 1/3/5/7) so its loops unroll and the working array
+    # stays in registers (the reference does the same via `#define RADIUS`).
+    set(VK_DFT_ENTRIES pad col2im)
+    foreach(bits IN LISTS VK_BITS)
+        foreach(entry IN LISTS VK_DFT_ENTRIES)
+            set(defs -DBITS=${bits})
+            if(entry STREQUAL pad)
+                list(APPEND defs -DENTRY_PAD)
+            else()
+                list(APPEND defs -DENTRY_COL2IM)
+            endif()
+            list(APPEND VK_SPV_OUTPUTS "${VK_SPV_DIR}/dfttest_${bits}_${entry}.spv")
+            add_custom_command(
+                OUTPUT "${VK_SPV_DIR}/dfttest_${bits}_${entry}.spv"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
+                COMMAND ${VK_GLSLC} -O -fshader-stage=compute ${defs}
+                        -o "${VK_SPV_DIR}/dfttest_${bits}_${entry}.spv"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
+                VERBATIM)
+        endforeach()
+        foreach(radius RANGE 0 3)
+            list(APPEND VK_SPV_OUTPUTS "${VK_SPV_DIR}/dfttest_${bits}_fused_r${radius}.spv")
+            add_custom_command(
+                OUTPUT "${VK_SPV_DIR}/dfttest_${bits}_fused_r${radius}.spv"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
+                COMMAND ${VK_GLSLC} -O -fshader-stage=compute -DBITS=${bits}
+                        -DENTRY_FUSED -DRADIUS=${radius}
+                        -o "${VK_SPV_DIR}/dfttest_${bits}_fused_r${radius}.spv"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
+                VERBATIM)
+        endforeach()
+    endforeach()
 else()
     message(FATAL_ERROR "glslc not found")
 endif()
@@ -132,6 +168,24 @@ add_custom_command(
             "${VK_SPV_DIR}/gaussblur_32_gauss.spv"
             "${VK_SPV_DIR}/gaussblur_32_vert.spv"
             "${VK_SPV_DIR}/gaussblur_32_horiz.spv"
+            "${VK_SPV_DIR}/dfttest_8_pad.spv"
+            "${VK_SPV_DIR}/dfttest_8_col2im.spv"
+            "${VK_SPV_DIR}/dfttest_8_fused_r0.spv"
+            "${VK_SPV_DIR}/dfttest_8_fused_r1.spv"
+            "${VK_SPV_DIR}/dfttest_8_fused_r2.spv"
+            "${VK_SPV_DIR}/dfttest_8_fused_r3.spv"
+            "${VK_SPV_DIR}/dfttest_16_pad.spv"
+            "${VK_SPV_DIR}/dfttest_16_col2im.spv"
+            "${VK_SPV_DIR}/dfttest_16_fused_r0.spv"
+            "${VK_SPV_DIR}/dfttest_16_fused_r1.spv"
+            "${VK_SPV_DIR}/dfttest_16_fused_r2.spv"
+            "${VK_SPV_DIR}/dfttest_16_fused_r3.spv"
+            "${VK_SPV_DIR}/dfttest_32_pad.spv"
+            "${VK_SPV_DIR}/dfttest_32_col2im.spv"
+            "${VK_SPV_DIR}/dfttest_32_fused_r0.spv"
+            "${VK_SPV_DIR}/dfttest_32_fused_r1.spv"
+            "${VK_SPV_DIR}/dfttest_32_fused_r2.spv"
+            "${VK_SPV_DIR}/dfttest_32_fused_r3.spv"
             "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
     DEPENDS ${VK_SPV_OUTPUTS}
     VERBATIM)
@@ -143,6 +197,7 @@ add_library(vsfeel SHARED
     src/bilateral.cpp
     src/bm3d.cpp
     src/gaussblur.cpp
+    src/dfttest.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h")
 configure_common(vsfeel)
 target_compile_options(vsfeel PRIVATE -mavx2)

@@ -322,4 +322,5 @@ VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
     vsfeel_register_bilateral(vspapi, plugin);
     vsfeel_register_bm3dv2(vspapi, plugin);
     vsfeel_register_gaussblur(vspapi, plugin);
+    vsfeel_register_dfttest(vspapi, plugin);
 }

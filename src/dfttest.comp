@@ -1,0 +1,1645 @@
+#version 450
+
+/*
+ * DFTTest — 3D block-wise frequency denoiser (Vulkan port of the vszipcu
+ * dfttest.cu / vs-dfttest2 hiprtc dft_kernels.hpp + kernel.hpp reference
+ * implementations).
+ *
+ * The reference kernels are FFTW 3.3.10 codelets (rdft/dft/idft/irdft for
+ * block sizes 16 and temporal sizes 1/3/5/7) driven by a per-warp block
+ * pipeline: im2col + window, 2D real DFT over the 16x16 spatial block, a
+ * complex DFT over the temporal window, frequency-domain filtering, the
+ * inverse transforms, and a col2im overlap-add of the windowed blocks.
+ *
+ * Parity notes (do not alter): the FFT codelet bodies are transcribed
+ * verbatim (FMA/FMS/FNMA/FNMS as plain float arithmetic, constants rounded
+ * to the exact float32 values the C casts produce), the shared-memory
+ * transpose uses a 17-float2 stride to avoid bank conflicts exactly like the
+ * reference, the filter math (wiener / hard / multiply / bandpass / power /
+ * sqrt variants) matches the generated filter() device code, and the zero-
+ * mean path subtracts the window frequency response scaled by the DC gain.
+ * The IO conversion follows the references: integer input is scaled by
+ * SCALE (1.0 for 8-bit, 1/256 for 16-bit), float input by 255.0; integer
+ * output rounds with +0.5 truncation (__float2int_rz) and clamps.
+ *
+ * Compile-time variants: -DBITS=8|16|32, exactly one of -DENTRY_PAD /
+ * -DENTRY_FUSED / -DENTRY_COL2IM defining the entry point. Everything else
+ * (radius, block_step, plane geometry, filter parameters, buffer offsets) is
+ * passed per-dispatch through push constants so a single triple of pipelines
+ * serves every plane.
+ *
+ * Bindings:
+ *   0: wt[]       — window weights, then window_freq, then the sigma array
+ *   1: staging    — tight upload planes (pad reads) + final output (write)
+ *   2: spatial    — device-local float block buffer between fused/col2im
+ *   3: padded     — device-local padded source planes (pad writes, fused reads)
+ */
+
+#if !defined(BITS)
+#define BITS 16
+#endif
+
+#if !defined(RADIUS)
+#define RADIUS 1
+#endif
+
+#define TW (2 * RADIUS + 1)
+
+#if BITS == 8
+#define ELEM_BYTES 1
+#define ELEM_MASK  0xFFu
+#define PEAK       255.0
+#define SCALE      1.0
+#elif BITS == 16
+#define ELEM_BYTES 2
+#define ELEM_MASK  0xFFFFu
+#define PEAK       65535.0
+#define SCALE      (1.0 / 256.0)
+#else
+#define ELEM_BYTES 4
+#define ELEM_MASK  0xFFFFFFFFu
+#define PEAK       1.0
+#define SCALE      255.0
+#endif
+
+#define TSTRIDE 17   // (16 + 1) transpose stride, matches the reference
+
+// The fused kernel's working array holds tw * 32 floats (tw temporal slices of
+// one complex 16-bin row). RADIUS is a compile-time define (like the
+// reference's `#define RADIUS`), so the temporal loops unroll and the array
+// stays in registers instead of spilling to scratch.
+#define TD_SZ (TW * 32)
+
+layout(constant_id = 0) const int UNUSED_CID = 0;
+
+layout(std430, binding = 0) readonly buffer WtBuf { float wt[]; };
+layout(std430, binding = 1) buffer StagingBuf { uint staging_raw[]; };
+layout(std430, binding = 2) buffer SpatialBuf { float spatial[]; };
+layout(std430, binding = 3) buffer PaddedBuf { uint padded_raw[]; };
+
+layout(push_constant) uniform PushConstants {
+    int padded_base;    // byte offset of the padded source region in padded buffer
+    int spatial_base;   // float element offset into the spatial buffer
+    int dst_base;       // byte offset of the download region in staging
+    int src_base;       // byte offset of the upload region in staging
+    int wt_base;        // float element offset of window[] in wt
+    int wf_base;        // float element offset of window_freq[] in wt (-1 if !zmean)
+    int sigma_base;     // float element offset of sigma[] in wt (-1 if scalar)
+    int radius;
+    int block_step;
+    int width;          // frame plane width
+    int height;         // frame plane height
+    int src_stride;     // upload plane row stride in elements
+    int dst_stride;     // frame plane row stride in elements
+    int filter_type;
+    float sigma;        // scaled scalar sigma (used when sigma_base < 0)
+    float sigma2;
+    float pmin;
+    float pmax;
+    float beta;
+} pc;
+
+int calc_pad_size(int size, int block_step) {
+    int rem = size % 16;
+    return size + (rem != 0 ? 16 - rem : 0) + max(16 - block_step, block_step) * 2;
+}
+
+int calc_pad_num(int size, int block_step) {
+    return (calc_pad_size(size, block_step) - 16) / block_step + 1;
+}
+
+// ---------------------------------------------------------------------------
+// FFTW 3.3.10 codelets, transcribed verbatim from the reference kernels.
+// The dft/idft family operates on interleaved (re, im) data where complex
+// element k of the sequence lives at float offsets base + 2*k*stride (stride
+// in complex-element units); the rdft/irdft family operates on 16 plain
+// floats at base .. base+15 (half-complex output/input in place).
+// ---------------------------------------------------------------------------
+
+#define FMA(a, b, c) (((a) * (b)) + (c))
+#define FMS(a, b, c) (((a) * (b)) - (c))
+#define FNMA(a, b, c) (- (((a) * (b)) + (c)))
+#define FNMS(a, b, c) ((c) - ((a) * (b)))
+
+// ./gen_r2cf.native -standalone -with-rs 2 -with-csr 2 -with-csi 2 -fma -n 16
+void rdft16(inout float data[TD_SZ], int base) {
+#define R0(k) data[base + (k)]
+#define R1(k) data[base + (k) + 1]
+    const float KP923879532 = uintBitsToFloat(0x3f6c835eu);
+    const float KP707106781 = uintBitsToFloat(0x3f3504f3u);
+    const float KP414213562 = uintBitsToFloat(0x3ed413cdu);
+
+    float T3, T6, T7, T49, T37, T10, T13, T14, T50, T40;
+    float T22, T55, T34, T44, T29, T54, T35, T47, T38, T39, T53, T56;
+    {
+        float T1, T2, T4, T5;
+        T1 = R0(0);
+        T2 = R0(8);
+        T3 = T1 + T2;
+        T4 = R0(4);
+        T5 = R0(12);
+        T6 = T4 + T5;
+        T7 = T3 + T6;
+        T49 = T4 - T5;
+        T37 = T1 - T2;
+    }
+    {
+        float T8, T9, T11, T12;
+        T8 = R0(2);
+        T9 = R0(10);
+        T10 = T8 + T9;
+        T38 = T8 - T9;
+        T11 = R0(14);
+        T12 = R0(6);
+        T13 = T11 + T12;
+        T39 = T11 - T12;
+    }
+    T14 = T10 + T13;
+    T50 = T39 - T38;
+    T40 = T38 + T39;
+    {
+        float T18, T42, T21, T43;
+        {
+            float T16, T17, T19, T20;
+            T16 = R1(0);
+            T17 = R1(8);
+            T18 = T16 + T17;
+            T42 = T16 - T17;
+            T19 = R1(4);
+            T20 = R1(12);
+            T21 = T19 + T20;
+            T43 = T19 - T20;
+        }
+        T22 = T18 - T21;
+        T55 = FMA(KP414213562, T42, T43);
+        T34 = T18 + T21;
+        T44 = FNMS(KP414213562, T43, T42);
+    }
+    {
+        float T25, T45, T28, T46;
+        {
+            float T23, T24, T26, T27;
+            T23 = R1(14);
+            T24 = R1(6);
+            T25 = T23 + T24;
+            T45 = T23 - T24;
+            T26 = R1(2);
+            T27 = R1(10);
+            T28 = T26 + T27;
+            T46 = T27 - T26;
+        }
+        T29 = T25 - T28;
+        T54 = FMA(KP414213562, T45, T46);
+        T35 = T25 + T28;
+        T47 = FNMS(KP414213562, T46, T45);
+    }
+    R0(8) = T7 - T14;
+    R1(8) = T35 - T34;
+    {
+        float T15, T30, T31, T32;
+        T15 = T3 - T6;
+        T30 = T22 + T29;
+        R0(12) = FNMS(KP707106781, T30, T15);
+        R0(4) = FMA(KP707106781, T30, T15);
+        T31 = T13 - T10;
+        T32 = T29 - T22;
+        R1(4) = FMA(KP707106781, T32, T31);
+        R1(12) = FMS(KP707106781, T32, T31);
+    }
+    {
+        float T33, T36, T41, T48;
+        T33 = T7 + T14;
+        T36 = T34 + T35;
+        R0(16) = T33 - T36;
+        R0(0) = T33 + T36;
+        T41 = FMA(KP707106781, T40, T37);
+        T48 = T44 + T47;
+        R0(14) = FNMS(KP923879532, T48, T41);
+        R0(2) = FMA(KP923879532, T48, T41);
+    }
+    T53 = FNMS(KP707106781, T50, T49);
+    T56 = T54 - T55;
+    R1(2) = FMS(KP923879532, T56, T53);
+    R1(14) = FMA(KP923879532, T56, T53);
+    {
+        float T57, T58, T51, T52;
+        T57 = FNMS(KP707106781, T40, T37);
+        T58 = T55 + T54;
+        R0(10) = FNMS(KP923879532, T58, T57);
+        R0(6) = FMA(KP923879532, T58, T57);
+        T51 = FMA(KP707106781, T50, T49);
+        T52 = T47 - T44;
+        R1(6) = FMA(KP923879532, T52, T51);
+        R1(10) = FMS(KP923879532, T52, T51);
+    }
+    R1(0) = 0.0;
+    R1(16) = 0.0;
+#undef R0
+#undef R1
+}
+
+// ./gen_t1.native -standalone -fma -n 1
+void dft1(inout float data[TD_SZ], int base, int stride) {
+}
+
+// ./gen_t1.native -standalone -fma -n 3
+void dft3(inout float data[TD_SZ], int base, int stride) {
+#define RI(k) data[base + (k) * stride]
+#define II(k) data[base + (k) * stride + 1]
+    const float KP866025403 = uintBitsToFloat(0x3f5db3d7u);
+    const float KP500000000 = uintBitsToFloat(0x3f000000u);
+
+    float T1, T9, T4, T12, T8, T10, T5, T11;
+    T1 = RI(0);
+    T9 = II(0);
+    {
+        float T2, T3, T6, T7;
+        T2 = RI(2);
+        T3 = RI(4);
+        T4 = T2 + T3;
+        T12 = T3 - T2;
+        T6 = II(2);
+        T7 = II(4);
+        T8 = T6 - T7;
+        T10 = T6 + T7;
+    }
+    RI(0) = T1 + T4;
+    II(0) = T9 + T10;
+    T5 = FNMS(KP500000000, T4, T1);
+    RI(4) = FNMS(KP866025403, T8, T5);
+    RI(2) = FMA(KP866025403, T8, T5);
+    T11 = FNMS(KP500000000, T10, T9);
+    II(2) = FMA(KP866025403, T12, T11);
+    II(4) = FNMS(KP866025403, T12, T11);
+#undef RI
+#undef II
+}
+
+// ./gen_t1.native -standalone -fma -n 5
+void dft5(inout float data[TD_SZ], int base, int stride) {
+#define RI(k) data[base + (k) * stride]
+#define II(k) data[base + (k) * stride + 1]
+    const float KP951056516 = uintBitsToFloat(0x3f737871u);
+    const float KP559016994 = uintBitsToFloat(0x3f0f1bbdu);
+    const float KP250000000 = uintBitsToFloat(0x3e800000u);
+    const float KP618033988 = uintBitsToFloat(0x3f1e377au);
+
+    float T1, T21, T8, T29, T10, T28, T14, T26, T17, T24;
+    T1 = RI(0);
+    T21 = II(0);
+    {
+        float T2, T3, T4, T5, T6, T7;
+        T2 = RI(2);
+        T3 = RI(8);
+        T4 = T2 + T3;
+        T5 = RI(4);
+        T6 = RI(6);
+        T7 = T5 + T6;
+        T8 = T4 + T7;
+        T29 = T5 - T6;
+        T10 = T4 - T7;
+        T28 = T2 - T3;
+    }
+    {
+        float T12, T13, T22, T15, T16, T23;
+        T12 = II(2);
+        T13 = II(8);
+        T22 = T12 + T13;
+        T15 = II(4);
+        T16 = II(6);
+        T23 = T15 + T16;
+        T14 = T12 - T13;
+        T26 = T22 - T23;
+        T17 = T15 - T16;
+        T24 = T22 + T23;
+    }
+    RI(0) = T1 + T8;
+    II(0) = T21 + T24;
+    {
+        float T18, T20, T11, T19, T9;
+        T18 = FMA(KP618033988, T17, T14);
+        T20 = FNMS(KP618033988, T14, T17);
+        T9 = FNMS(KP250000000, T8, T1);
+        T11 = FMA(KP559016994, T10, T9);
+        T19 = FNMS(KP559016994, T10, T9);
+        RI(8) = FNMS(KP951056516, T18, T11);
+        RI(6) = FMA(KP951056516, T20, T19);
+        RI(2) = FMA(KP951056516, T18, T11);
+        RI(4) = FNMS(KP951056516, T20, T19);
+    }
+    {
+        float T30, T32, T27, T31, T25;
+        T30 = FMA(KP618033988, T29, T28);
+        T32 = FNMS(KP618033988, T28, T29);
+        T25 = FNMS(KP250000000, T24, T21);
+        T27 = FMA(KP559016994, T26, T25);
+        T31 = FNMS(KP559016994, T26, T25);
+        II(2) = FNMS(KP951056516, T30, T27);
+        II(6) = FNMS(KP951056516, T32, T31);
+        II(8) = FMA(KP951056516, T30, T27);
+        II(4) = FMA(KP951056516, T32, T31);
+    }
+#undef RI
+#undef II
+}
+
+// ./gen_t1.native -standalone -fma -n 7
+void dft7(inout float data[TD_SZ], int base, int stride) {
+#define RI(k) data[base + (k) * stride]
+#define II(k) data[base + (k) * stride + 1]
+    const float KP974927912 = uintBitsToFloat(0x3f7994e0u);
+    const float KP900968867 = uintBitsToFloat(0x3f66a5e5u);
+    const float KP692021471 = uintBitsToFloat(0x3f312852u);
+    const float KP801937735 = uintBitsToFloat(0x3f4d4bcbu);
+    const float KP554958132 = uintBitsToFloat(0x3f0e11bcu);
+    const float KP356895867 = uintBitsToFloat(0x3eb6bb0eu);
+
+    float T1, T35, T4, T44, T10, T42, T7, T43, T11, T25;
+    float T55, T50, T45, T30, T16, T37, T22, T38, T19, T36;
+    float T23, T28, T52, T47, T39, T33;
+    T1 = RI(0);
+    T35 = II(0);
+    {
+        float T2, T3, T14, T15;
+        T2 = RI(2);
+        T3 = RI(12);
+        T4 = T2 + T3;
+        T44 = T3 - T2;
+        {
+            float T8, T9, T5, T6;
+            T8 = RI(6);
+            T9 = RI(8);
+            T10 = T8 + T9;
+            T42 = T9 - T8;
+            T5 = RI(4);
+            T6 = RI(10);
+            T7 = T5 + T6;
+            T43 = T6 - T5;
+        }
+        T11 = FNMS(KP356895867, T7, T4);
+        T25 = FNMS(KP356895867, T4, T10);
+        T55 = FMA(KP554958132, T42, T44);
+        T50 = FMA(KP554958132, T43, T42);
+        T45 = FNMS(KP554958132, T44, T43);
+        T30 = FNMS(KP356895867, T10, T7);
+        T14 = II(4);
+        T15 = II(10);
+        T16 = T14 - T15;
+        T37 = T14 + T15;
+        {
+            float T20, T21, T17, T18;
+            T20 = II(6);
+            T21 = II(8);
+            T22 = T20 - T21;
+            T38 = T20 + T21;
+            T17 = II(2);
+            T18 = II(12);
+            T19 = T17 - T18;
+            T36 = T17 + T18;
+        }
+        T23 = FMA(KP554958132, T22, T19);
+        T28 = FMA(KP554958132, T16, T22);
+        T52 = FNMS(KP356895867, T37, T36);
+        T47 = FNMS(KP356895867, T36, T38);
+        T39 = FNMS(KP356895867, T38, T37);
+        T33 = FNMS(KP554958132, T19, T16);
+    }
+    RI(0) = T1 + T4 + T7 + T10;
+    II(0) = T35 + T36 + T37 + T38;
+    {
+        float T24, T13, T12, T56, T54, T53;
+        T24 = FMA(KP801937735, T23, T16);
+        T12 = FNMS(KP692021471, T11, T10);
+        T13 = FNMS(KP900968867, T12, T1);
+        RI(12) = FNMS(KP974927912, T24, T13);
+        RI(2) = FMA(KP974927912, T24, T13);
+        T56 = FMA(KP801937735, T55, T43);
+        T53 = FNMS(KP692021471, T52, T38);
+        T54 = FNMS(KP900968867, T53, T35);
+        II(2) = FMA(KP974927912, T56, T54);
+        II(12) = FNMS(KP974927912, T56, T54);
+    }
+    {
+        float T29, T27, T26, T51, T49, T48;
+        T29 = FNMS(KP801937735, T28, T19);
+        T26 = FNMS(KP692021471, T25, T7);
+        T27 = FNMS(KP900968867, T26, T1);
+        RI(10) = FNMS(KP974927912, T29, T27);
+        RI(4) = FMA(KP974927912, T29, T27);
+        T51 = FNMS(KP801937735, T50, T44);
+        T48 = FNMS(KP692021471, T47, T37);
+        T49 = FNMS(KP900968867, T48, T35);
+        II(4) = FMA(KP974927912, T51, T49);
+        II(10) = FNMS(KP974927912, T51, T49);
+    }
+    {
+        float T34, T32, T31, T46, T41, T40;
+        T34 = FNMS(KP801937735, T33, T22);
+        T31 = FNMS(KP692021471, T30, T4);
+        T32 = FNMS(KP900968867, T31, T1);
+        RI(8) = FNMS(KP974927912, T34, T32);
+        RI(6) = FMA(KP974927912, T34, T32);
+        T46 = FNMS(KP801937735, T45, T42);
+        T40 = FNMS(KP692021471, T39, T36);
+        T41 = FNMS(KP900968867, T40, T35);
+        II(6) = FMA(KP974927912, T46, T41);
+        II(8) = FNMS(KP974927912, T46, T41);
+    }
+#undef RI
+#undef II
+}
+
+// ./gen_t1.native -standalone -fma -n 16
+void dft16(inout float data[TD_SZ], int base, int stride) {
+#define RI(k) data[base + (k) * stride]
+#define II(k) data[base + (k) * stride + 1]
+    const float KP923879532 = uintBitsToFloat(0x3f6c835eu);
+    const float KP414213562 = uintBitsToFloat(0x3ed413cdu);
+    const float KP707106781 = uintBitsToFloat(0x3f3504f3u);
+
+    float T7, T115, T129, T38, T49, T95, T105, T83, T29, T126;
+    float T141, T73, T78, T102, T123, T101, T14, T116, T130, T45;
+    float T52, T84, T85, T55, T22, T121, T140, T62, T67, T99;
+    float T118, T98;
+    {
+        float T3, T47, T34, T82, T6, T81, T37, T48;
+        {
+            float T1, T2, T32, T33;
+            T1 = RI(0);
+            T2 = RI(16);
+            T3 = T1 + T2;
+            T47 = T1 - T2;
+            T32 = II(0);
+            T33 = II(16);
+            T34 = T32 + T33;
+            T82 = T32 - T33;
+        }
+        {
+            float T4, T5, T35, T36;
+            T4 = RI(8);
+            T5 = RI(24);
+            T6 = T4 + T5;
+            T81 = T4 - T5;
+            T35 = II(8);
+            T36 = II(24);
+            T37 = T35 + T36;
+            T48 = T35 - T36;
+        }
+        T7 = T3 + T6;
+        T115 = T3 - T6;
+        T129 = T34 - T37;
+        T38 = T34 + T37;
+        T49 = T47 - T48;
+        T95 = T47 + T48;
+        T105 = T82 - T81;
+        T83 = T81 + T82;
+    }
+    {
+        float T25, T74, T72, T124, T28, T69, T77, T125;
+        {
+            float T23, T24, T70, T71;
+            T23 = RI(30);
+            T24 = RI(14);
+            T25 = T23 + T24;
+            T74 = T23 - T24;
+            T70 = II(30);
+            T71 = II(14);
+            T72 = T70 - T71;
+            T124 = T70 + T71;
+        }
+        {
+            float T26, T27, T75, T76;
+            T26 = RI(6);
+            T27 = RI(22);
+            T28 = T26 + T27;
+            T69 = T26 - T27;
+            T75 = II(6);
+            T76 = II(22);
+            T77 = T75 - T76;
+            T125 = T75 + T76;
+        }
+        T29 = T25 + T28;
+        T126 = T124 - T125;
+        T141 = T124 + T125;
+        T73 = T69 + T72;
+        T78 = T74 - T77;
+        T102 = T72 - T69;
+        T123 = T25 - T28;
+        T101 = T74 + T77;
+    }
+    {
+        float T10, T51, T41, T50, T13, T53, T44, T54;
+        {
+            float T8, T9, T39, T40;
+            T8 = RI(4);
+            T9 = RI(20);
+            T10 = T8 + T9;
+            T51 = T8 - T9;
+            T39 = II(4);
+            T40 = II(20);
+            T41 = T39 + T40;
+            T50 = T39 - T40;
+        }
+        {
+            float T11, T12, T42, T43;
+            T11 = RI(28);
+            T12 = RI(12);
+            T13 = T11 + T12;
+            T53 = T11 - T12;
+            T42 = II(28);
+            T43 = II(12);
+            T44 = T42 + T43;
+            T54 = T42 - T43;
+        }
+        T14 = T10 + T13;
+        T116 = T41 - T44;
+        T130 = T13 - T10;
+        T45 = T41 + T44;
+        T52 = T50 - T51;
+        T84 = T53 - T54;
+        T85 = T51 + T50;
+        T55 = T53 + T54;
+    }
+    {
+        float T18, T63, T61, T119, T21, T58, T66, T120;
+        {
+            float T16, T17, T59, T60;
+            T16 = RI(2);
+            T17 = RI(18);
+            T18 = T16 + T17;
+            T63 = T16 - T17;
+            T59 = II(2);
+            T60 = II(18);
+            T61 = T59 - T60;
+            T119 = T59 + T60;
+        }
+        {
+            float T19, T20, T64, T65;
+            T19 = RI(10);
+            T20 = RI(26);
+            T21 = T19 + T20;
+            T58 = T19 - T20;
+            T64 = II(10);
+            T65 = II(26);
+            T66 = T64 - T65;
+            T120 = T64 + T65;
+        }
+        T22 = T18 + T21;
+        T121 = T119 - T120;
+        T140 = T119 + T120;
+        T62 = T58 + T61;
+        T67 = T63 - T66;
+        T99 = T61 - T58;
+        T118 = T18 - T21;
+        T98 = T63 + T66;
+    }
+    {
+        float T15, T30, T143, T144;
+        T15 = T7 + T14;
+        T30 = T22 + T29;
+        RI(16) = T15 - T30;
+        RI(0) = T15 + T30;
+        T143 = T38 + T45;
+        T144 = T140 + T141;
+        II(16) = T143 - T144;
+        II(0) = T143 + T144;
+    }
+    {
+        float T31, T46, T139, T142;
+        T31 = T29 - T22;
+        T46 = T38 - T45;
+        II(8) = T31 + T46;
+        II(24) = T46 - T31;
+        T139 = T7 - T14;
+        T142 = T140 - T141;
+        RI(24) = T139 - T142;
+        RI(8) = T139 + T142;
+    }
+    {
+        float T117, T131, T128, T132, T122, T127;
+        T117 = T115 + T116;
+        T131 = T129 - T130;
+        T122 = T118 + T121;
+        T127 = T123 - T126;
+        T128 = T122 + T127;
+        T132 = T127 - T122;
+        RI(20) = FNMS(KP707106781, T128, T117);
+        II(12) = FMA(KP707106781, T132, T131);
+        RI(4) = FMA(KP707106781, T128, T117);
+        II(28) = FNMS(KP707106781, T132, T131);
+    }
+    {
+        float T133, T137, T136, T138, T134, T135;
+        T133 = T115 - T116;
+        T137 = T130 + T129;
+        T134 = T121 - T118;
+        T135 = T123 + T126;
+        T136 = T134 - T135;
+        T138 = T134 + T135;
+        RI(28) = FNMS(KP707106781, T136, T133);
+        II(4) = FMA(KP707106781, T138, T137);
+        RI(12) = FMA(KP707106781, T136, T133);
+        II(20) = FNMS(KP707106781, T138, T137);
+    }
+    {
+        float T57, T93, T87, T89, T80, T88, T92, T94, T56, T86;
+        T56 = T52 - T55;
+        T57 = FMA(KP707106781, T56, T49);
+        T93 = FNMS(KP707106781, T56, T49);
+        T86 = T84 - T85;
+        T87 = FNMS(KP707106781, T86, T83);
+        T89 = FMA(KP707106781, T86, T83);
+        {
+            float T68, T79, T90, T91;
+            T68 = FMA(KP414213562, T67, T62);
+            T79 = FNMS(KP414213562, T78, T73);
+            T80 = T68 - T79;
+            T88 = T68 + T79;
+            T90 = FMA(KP414213562, T73, T78);
+            T91 = FNMS(KP414213562, T62, T67);
+            T92 = T90 - T91;
+            T94 = T91 + T90;
+        }
+        RI(22) = FNMS(KP923879532, T80, T57);
+        II(22) = FNMS(KP923879532, T92, T89);
+        RI(6) = FMA(KP923879532, T80, T57);
+        II(6) = FMA(KP923879532, T92, T89);
+        II(14) = FNMS(KP923879532, T88, T87);
+        RI(14) = FNMS(KP923879532, T94, T93);
+        II(30) = FMA(KP923879532, T88, T87);
+        RI(30) = FMA(KP923879532, T94, T93);
+    }
+    {
+        float T97, T109, T107, T113, T104, T108, T112, T114, T96, T106;
+        T96 = T85 + T84;
+        T97 = FMA(KP707106781, T96, T95);
+        T109 = FNMS(KP707106781, T96, T95);
+        T106 = T52 + T55;
+        T107 = FNMS(KP707106781, T106, T105);
+        T113 = FMA(KP707106781, T106, T105);
+        {
+            float T100, T103, T110, T111;
+            T100 = FMA(KP414213562, T99, T98);
+            T103 = FNMS(KP414213562, T102, T101);
+            T104 = T100 + T103;
+            T108 = T103 - T100;
+            T110 = FNMS(KP414213562, T98, T99);
+            T111 = FMA(KP414213562, T101, T102);
+            T112 = T110 - T111;
+            T114 = T110 + T111;
+        }
+        RI(18) = FNMS(KP923879532, T104, T97);
+        II(18) = FNMS(KP923879532, T114, T113);
+        RI(2) = FMA(KP923879532, T104, T97);
+        II(2) = FMA(KP923879532, T114, T113);
+        II(26) = FNMS(KP923879532, T108, T107);
+        RI(26) = FNMS(KP923879532, T112, T109);
+        II(10) = FMA(KP923879532, T108, T107);
+        RI(10) = FMA(KP923879532, T112, T109);
+    }
+#undef RI
+#undef II
+}
+
+// ./gen_t1.native -standalone -fma -n 1
+void idft1(inout float data[TD_SZ], int base, int stride) {
+}
+
+// ./gen_t1.native -standalone -fma -n 3
+void idft3(inout float data[TD_SZ], int base, int stride) {
+#define RI(k) data[base + (k) * stride]
+#define II(k) data[base + (k) * stride + 1]
+    const float KP866025403 = uintBitsToFloat(0x3f5db3d7u);
+    const float KP500000000 = uintBitsToFloat(0x3f000000u);
+
+    float T1, T5, T4, T10, T8, T12, T9, T11;
+    T1 = RI(0);
+    T5 = II(0);
+    {
+        float T2, T3, T6, T7;
+        T2 = RI(2);
+        T3 = RI(4);
+        T4 = T2 + T3;
+        T10 = T2 - T3;
+        T6 = II(2);
+        T7 = II(4);
+        T8 = T6 + T7;
+        T12 = T7 - T6;
+    }
+    RI(0) = T1 + T4;
+    II(0) = T5 + T8;
+    T9 = FNMS(KP500000000, T8, T5);
+    II(2) = FMA(KP866025403, T10, T9);
+    II(4) = FNMS(KP866025403, T10, T9);
+    T11 = FNMS(KP500000000, T4, T1);
+    RI(4) = FNMS(KP866025403, T12, T11);
+    RI(2) = FMA(KP866025403, T12, T11);
+#undef RI
+#undef II
+}
+
+// ./gen_t1.native -standalone -fma -n 5
+void idft5(inout float data[TD_SZ], int base, int stride) {
+#define RI(k) data[base + (k) * stride]
+#define II(k) data[base + (k) * stride + 1]
+    const float KP951056516 = uintBitsToFloat(0x3f737871u);
+    const float KP559016994 = uintBitsToFloat(0x3f0f1bbdu);
+    const float KP250000000 = uintBitsToFloat(0x3e800000u);
+    const float KP618033988 = uintBitsToFloat(0x3f1e377au);
+
+    float T1, T21, T8, T29, T10, T28, T14, T26, T17, T24;
+    T1 = RI(0);
+    T21 = II(0);
+    {
+        float T2, T3, T4, T5, T6, T7;
+        T2 = RI(2);
+        T3 = RI(8);
+        T4 = T2 + T3;
+        T5 = RI(4);
+        T6 = RI(6);
+        T7 = T5 + T6;
+        T8 = T4 + T7;
+        T29 = T5 - T6;
+        T10 = T4 - T7;
+        T28 = T2 - T3;
+    }
+    {
+        float T12, T13, T22, T15, T16, T23;
+        T12 = II(2);
+        T13 = II(8);
+        T22 = T12 + T13;
+        T15 = II(4);
+        T16 = II(6);
+        T23 = T15 + T16;
+        T14 = T12 - T13;
+        T26 = T22 - T23;
+        T17 = T15 - T16;
+        T24 = T22 + T23;
+    }
+    RI(0) = T1 + T8;
+    II(0) = T21 + T24;
+    {
+        float T18, T20, T11, T19, T9;
+        T18 = FMA(KP618033988, T17, T14);
+        T20 = FNMS(KP618033988, T14, T17);
+        T9 = FNMS(KP250000000, T8, T1);
+        T11 = FMA(KP559016994, T10, T9);
+        T19 = FNMS(KP559016994, T10, T9);
+        RI(2) = FNMS(KP951056516, T18, T11);
+        RI(4) = FMA(KP951056516, T20, T19);
+        RI(8) = FMA(KP951056516, T18, T11);
+        RI(6) = FNMS(KP951056516, T20, T19);
+    }
+    {
+        float T30, T32, T27, T31, T25;
+        T30 = FMA(KP618033988, T29, T28);
+        T32 = FNMS(KP618033988, T28, T29);
+        T25 = FNMS(KP250000000, T24, T21);
+        T27 = FMA(KP559016994, T26, T25);
+        T31 = FNMS(KP559016994, T26, T25);
+        II(2) = FMA(KP951056516, T30, T27);
+        II(6) = FMA(KP951056516, T32, T31);
+        II(8) = FNMS(KP951056516, T30, T27);
+        II(4) = FNMS(KP951056516, T32, T31);
+    }
+#undef RI
+#undef II
+}
+
+// ./gen_t1.native -standalone -fma -n 7
+void idft7(inout float data[TD_SZ], int base, int stride) {
+#define RI(k) data[base + (k) * stride]
+#define II(k) data[base + (k) * stride + 1]
+    const float KP974927912 = uintBitsToFloat(0x3f7994e0u);
+    const float KP900968867 = uintBitsToFloat(0x3f66a5e5u);
+    const float KP692021471 = uintBitsToFloat(0x3f312852u);
+    const float KP801937735 = uintBitsToFloat(0x3f4d4bcbu);
+    const float KP356895867 = uintBitsToFloat(0x3eb6bb0eu);
+    const float KP554958132 = uintBitsToFloat(0x3f0e11bcu);
+
+    float T1, T11, T4, T26, T10, T24, T7, T25, T27, T32;
+    float T52, T47, T39, T37, T14, T43, T20, T44, T17, T42;
+    float T21, T29, T55, T50, T45, T34;
+    T1 = RI(0);
+    T11 = II(0);
+    {
+        float T2, T3, T12, T13;
+        T2 = RI(2);
+        T3 = RI(12);
+        T4 = T2 + T3;
+        T26 = T2 - T3;
+        {
+            float T8, T9, T5, T6;
+            T8 = RI(6);
+            T9 = RI(8);
+            T10 = T8 + T9;
+            T24 = T8 - T9;
+            T5 = RI(4);
+            T6 = RI(10);
+            T7 = T5 + T6;
+            T25 = T5 - T6;
+        }
+        T27 = FNMS(KP554958132, T26, T25);
+        T32 = FMA(KP554958132, T25, T24);
+        T52 = FNMS(KP356895867, T10, T7);
+        T47 = FNMS(KP356895867, T4, T10);
+        T39 = FNMS(KP356895867, T7, T4);
+        T37 = FMA(KP554958132, T24, T26);
+        T12 = II(2);
+        T13 = II(12);
+        T14 = T12 + T13;
+        T43 = T13 - T12;
+        {
+            float T18, T19, T15, T16;
+            T18 = II(6);
+            T19 = II(8);
+            T20 = T18 + T19;
+            T44 = T19 - T18;
+            T15 = II(4);
+            T16 = II(10);
+            T17 = T15 + T16;
+            T42 = T16 - T15;
+        }
+        T21 = FNMS(KP356895867, T20, T17);
+        T29 = FNMS(KP356895867, T14, T20);
+        T55 = FNMS(KP554958132, T43, T42);
+        T50 = FMA(KP554958132, T42, T44);
+        T45 = FMA(KP554958132, T44, T43);
+        T34 = FNMS(KP356895867, T17, T14);
+    }
+    RI(0) = T1 + T4 + T7 + T10;
+    II(0) = T11 + T14 + T17 + T20;
+    {
+        float T28, T23, T22, T56, T54, T53;
+        T28 = FNMS(KP801937735, T27, T24);
+        T22 = FNMS(KP692021471, T21, T14);
+        T23 = FNMS(KP900968867, T22, T11);
+        II(6) = FMA(KP974927912, T28, T23);
+        II(8) = FNMS(KP974927912, T28, T23);
+        T56 = FNMS(KP801937735, T55, T44);
+        T53 = FNMS(KP692021471, T52, T4);
+        T54 = FNMS(KP900968867, T53, T1);
+        RI(8) = FNMS(KP974927912, T56, T54);
+        RI(6) = FMA(KP974927912, T56, T54);
+    }
+    {
+        float T33, T31, T30, T51, T49, T48;
+        T33 = FNMS(KP801937735, T32, T26);
+        T30 = FNMS(KP692021471, T29, T17);
+        T31 = FNMS(KP900968867, T30, T11);
+        II(4) = FMA(KP974927912, T33, T31);
+        II(10) = FNMS(KP974927912, T33, T31);
+        T51 = FNMS(KP801937735, T50, T43);
+        T48 = FNMS(KP692021471, T47, T7);
+        T49 = FNMS(KP900968867, T48, T1);
+        RI(10) = FNMS(KP974927912, T51, T49);
+        RI(4) = FMA(KP974927912, T51, T49);
+    }
+    {
+        float T38, T36, T35, T46, T41, T40;
+        T38 = FMA(KP801937735, T37, T25);
+        T35 = FNMS(KP692021471, T34, T20);
+        T36 = FNMS(KP900968867, T35, T11);
+        II(2) = FMA(KP974927912, T38, T36);
+        II(12) = FNMS(KP974927912, T38, T36);
+        T46 = FMA(KP801937735, T45, T42);
+        T40 = FNMS(KP692021471, T39, T10);
+        T41 = FNMS(KP900968867, T40, T1);
+        RI(12) = FNMS(KP974927912, T46, T41);
+        RI(2) = FMA(KP974927912, T46, T41);
+    }
+#undef RI
+#undef II
+}
+
+// ./gen_t1.native -standalone -fma -n 16
+void idft16(inout float data[TD_SZ], int base, int stride) {
+#define RI(k) data[base + (k) * stride]
+#define II(k) data[base + (k) * stride + 1]
+    const float KP923879532 = uintBitsToFloat(0x3f6c835eu);
+    const float KP414213562 = uintBitsToFloat(0x3ed413cdu);
+    const float KP707106781 = uintBitsToFloat(0x3f3504f3u);
+
+    float T7, T115, T129, T38, T49, T95, T105, T83, T29, T126;
+    float T141, T73, T78, T99, T123, T98, T14, T116, T130, T45;
+    float T52, T84, T85, T55, T22, T121, T140, T62, T67, T102;
+    float T118, T101;
+    {
+        float T3, T81, T34, T48, T6, T47, T37, T82;
+        {
+            float T1, T2, T32, T33;
+            T1 = RI(0);
+            T2 = RI(16);
+            T3 = T1 + T2;
+            T81 = T1 - T2;
+            T32 = II(0);
+            T33 = II(16);
+            T34 = T32 + T33;
+            T48 = T32 - T33;
+        }
+        {
+            float T4, T5, T35, T36;
+            T4 = RI(8);
+            T5 = RI(24);
+            T6 = T4 + T5;
+            T47 = T4 - T5;
+            T35 = II(8);
+            T36 = II(24);
+            T37 = T35 + T36;
+            T82 = T35 - T36;
+        }
+        T7 = T3 + T6;
+        T115 = T34 - T37;
+        T129 = T3 - T6;
+        T38 = T34 + T37;
+        T49 = T47 + T48;
+        T95 = T81 + T82;
+        T105 = T48 - T47;
+        T83 = T81 - T82;
+    }
+    {
+        float T25, T74, T72, T124, T28, T69, T77, T125;
+        {
+            float T23, T24, T70, T71;
+            T23 = RI(30);
+            T24 = RI(14);
+            T25 = T23 + T24;
+            T74 = T23 - T24;
+            T70 = II(30);
+            T71 = II(14);
+            T72 = T70 - T71;
+            T124 = T70 + T71;
+        }
+        {
+            float T26, T27, T75, T76;
+            T26 = RI(6);
+            T27 = RI(22);
+            T28 = T26 + T27;
+            T69 = T26 - T27;
+            T75 = II(6);
+            T76 = II(22);
+            T77 = T75 - T76;
+            T125 = T75 + T76;
+        }
+        T29 = T25 + T28;
+        T126 = T124 - T125;
+        T141 = T124 + T125;
+        T73 = T69 + T72;
+        T78 = T74 - T77;
+        T99 = T74 + T77;
+        T123 = T25 - T28;
+        T98 = T72 - T69;
+    }
+    {
+        float T10, T50, T41, T51, T13, T54, T44, T53;
+        {
+            float T8, T9, T39, T40;
+            T8 = RI(4);
+            T9 = RI(20);
+            T10 = T8 + T9;
+            T50 = T8 - T9;
+            T39 = II(4);
+            T40 = II(20);
+            T41 = T39 + T40;
+            T51 = T39 - T40;
+        }
+        {
+            float T11, T12, T42, T43;
+            T11 = RI(28);
+            T12 = RI(12);
+            T13 = T11 + T12;
+            T54 = T11 - T12;
+            T42 = II(28);
+            T43 = II(12);
+            T44 = T42 + T43;
+            T53 = T42 - T43;
+        }
+        T14 = T10 + T13;
+        T116 = T10 - T13;
+        T130 = T44 - T41;
+        T45 = T41 + T44;
+        T52 = T50 + T51;
+        T84 = T50 - T51;
+        T85 = T54 + T53;
+        T55 = T53 - T54;
+    }
+    {
+        float T18, T63, T61, T119, T21, T58, T66, T120;
+        {
+            float T16, T17, T59, T60;
+            T16 = RI(2);
+            T17 = RI(18);
+            T18 = T16 + T17;
+            T63 = T16 - T17;
+            T59 = II(2);
+            T60 = II(18);
+            T61 = T59 - T60;
+            T119 = T59 + T60;
+        }
+        {
+            float T19, T20, T64, T65;
+            T19 = RI(10);
+            T20 = RI(26);
+            T21 = T19 + T20;
+            T58 = T19 - T20;
+            T64 = II(10);
+            T65 = II(26);
+            T66 = T64 - T65;
+            T120 = T64 + T65;
+        }
+        T22 = T18 + T21;
+        T121 = T119 - T120;
+        T140 = T119 + T120;
+        T62 = T58 + T61;
+        T67 = T63 - T66;
+        T102 = T63 + T66;
+        T118 = T18 - T21;
+        T101 = T61 - T58;
+    }
+    for (int i = 0; i < 32; ++i) {
+        data[base + i * stride] = 0.0;
+    }
+    {
+        float T15, T30, T139, T142;
+        T15 = T7 + T14;
+        T30 = T22 + T29;
+        RI(16) = T15 - T30;
+        RI(0) = T15 + T30;
+        T139 = T38 + T45;
+        T142 = T140 + T141;
+        II(16) = T139 - T142;
+        II(0) = T139 + T142;
+    }
+    {
+        float T31, T46, T143, T144;
+        T31 = T22 - T29;
+        T46 = T38 - T45;
+        II(8) = T31 + T46;
+        II(24) = T46 - T31;
+        T143 = T7 - T14;
+        T144 = T141 - T140;
+        RI(24) = T143 - T144;
+        RI(8) = T143 + T144;
+    }
+    {
+        float T117, T131, T128, T132, T122, T127;
+        T117 = T115 - T116;
+        T131 = T129 + T130;
+        T122 = T118 - T121;
+        T127 = T123 + T126;
+        T128 = T122 - T127;
+        T132 = T122 + T127;
+        II(28) = FNMS(KP707106781, T128, T117);
+        RI(4) = FMA(KP707106781, T132, T131);
+        II(12) = FMA(KP707106781, T128, T117);
+        RI(20) = FNMS(KP707106781, T132, T131);
+    }
+    {
+        float T133, T137, T136, T138, T134, T135;
+        T133 = T116 + T115;
+        T137 = T129 - T130;
+        T134 = T118 + T121;
+        T135 = T126 - T123;
+        T136 = T134 + T135;
+        T138 = T135 - T134;
+        II(20) = FNMS(KP707106781, T136, T133);
+        RI(12) = FMA(KP707106781, T138, T137);
+        II(4) = FMA(KP707106781, T136, T133);
+        RI(28) = FNMS(KP707106781, T138, T137);
+    }
+    {
+        float T57, T89, T87, T93, T80, T88, T92, T94, T56, T86;
+        T56 = T52 + T55;
+        T57 = FMA(KP707106781, T56, T49);
+        T89 = FNMS(KP707106781, T56, T49);
+        T86 = T84 + T85;
+        T87 = FNMS(KP707106781, T86, T83);
+        T93 = FMA(KP707106781, T86, T83);
+        {
+            float T68, T79, T90, T91;
+            T68 = FMA(KP414213562, T67, T62);
+            T79 = FNMS(KP414213562, T78, T73);
+            T80 = T68 + T79;
+            T88 = T79 - T68;
+            T90 = FNMS(KP414213562, T62, T67);
+            T91 = FMA(KP414213562, T73, T78);
+            T92 = T90 - T91;
+            T94 = T90 + T91;
+        }
+        II(18) = FNMS(KP923879532, T80, T57);
+        RI(18) = FNMS(KP923879532, T94, T93);
+        II(2) = FMA(KP923879532, T80, T57);
+        RI(2) = FMA(KP923879532, T94, T93);
+        RI(26) = FNMS(KP923879532, T88, T87);
+        II(26) = FNMS(KP923879532, T92, T89);
+        RI(10) = FMA(KP923879532, T88, T87);
+        II(10) = FMA(KP923879532, T92, T89);
+    }
+    {
+        float T97, T113, T107, T109, T104, T108, T112, T114, T96, T106;
+        T96 = T55 - T52;
+        T97 = FMA(KP707106781, T96, T95);
+        T113 = FNMS(KP707106781, T96, T95);
+        T106 = T84 - T85;
+        T107 = FNMS(KP707106781, T106, T105);
+        T109 = FMA(KP707106781, T106, T105);
+        {
+            float T100, T103, T110, T111;
+            T100 = FMA(KP414213562, T99, T98);
+            T103 = FNMS(KP414213562, T102, T101);
+            T104 = T100 - T103;
+            T108 = T103 + T100;
+            T110 = FMA(KP414213562, T101, T102);
+            T111 = FNMS(KP414213562, T98, T99);
+            T112 = T110 - T111;
+            T114 = T110 + T111;
+        }
+        RI(22) = FNMS(KP923879532, T104, T97);
+        II(22) = FNMS(KP923879532, T112, T109);
+        RI(6) = FMA(KP923879532, T104, T97);
+        II(6) = FMA(KP923879532, T112, T109);
+        II(14) = FNMS(KP923879532, T108, T107);
+        RI(14) = FNMS(KP923879532, T114, T113);
+        II(30) = FMA(KP923879532, T108, T107);
+        RI(30) = FMA(KP923879532, T114, T113);
+    }
+#undef RI
+#undef II
+}
+
+// ./gen_r2cb.native -standalone -with-rs 2 -with-csr 2 -with-csi 2 -fma -n 16
+void irdft16(inout float data[TD_SZ], int base) {
+#define R0(k) data[base + (k)]
+#define R1(k) data[base + (k) + 1]
+    const float KP1_847759065 = uintBitsToFloat(0x3fec835eu);
+    const float KP414213562 = uintBitsToFloat(0x3ed413cdu);
+    const float KP1_414213562 = uintBitsToFloat(0x3fb504f3u);
+    const float KP2_000000000 = uintBitsToFloat(0x40000000u);
+
+    float T5, T47, T19, T39, T8, T48, T24, T40, T12, T51;
+    float T15, T52, T30, T35, T53, T50, T43, T42;
+    {
+        float T4, T18, T3, T17, T1, T2;
+        T4 = R0(8);
+        T18 = R1(8);
+        T1 = R0(0);
+        T2 = R0(16);
+        T3 = T1 + T2;
+        T17 = T1 - T2;
+        T5 = FMA(KP2_000000000, T4, T3);
+        T47 = FNMS(KP2_000000000, T4, T3);
+        T19 = FMA(KP2_000000000, T18, T17);
+        T39 = FNMS(KP2_000000000, T18, T17);
+    }
+    {
+        float T6, T7, T20, T21, T22, T23;
+        T6 = R0(4);
+        T7 = R0(12);
+        T20 = T6 - T7;
+        T21 = R1(4);
+        T22 = R1(12);
+        T23 = T21 + T22;
+        T8 = T6 + T7;
+        T48 = T21 - T22;
+        T24 = T20 + T23;
+        T40 = T23 - T20;
+    }
+    {
+        float T26, T33, T34, T29;
+        {
+            float T10, T11, T31, T32;
+            T10 = R0(2);
+            T11 = R0(14);
+            T12 = T10 + T11;
+            T26 = T10 - T11;
+            T31 = R1(2);
+            T32 = R1(14);
+            T33 = T31 + T32;
+            T51 = T31 - T32;
+        }
+        {
+            float T13, T14, T27, T28;
+            T13 = R0(10);
+            T14 = R0(6);
+            T15 = T13 + T14;
+            T34 = T13 - T14;
+            T27 = R1(10);
+            T28 = R1(6);
+            T29 = T27 + T28;
+            T52 = T27 - T28;
+        }
+        T30 = T26 + T29;
+        T35 = T33 - T34;
+        T53 = T51 - T52;
+        T50 = T12 - T15;
+        T43 = T34 + T33;
+        T42 = T26 - T29;
+    }
+    {
+        float T9, T16, T55, T56;
+        T9 = FMA(KP2_000000000, T8, T5);
+        T16 = T12 + T15;
+        R0(8) = FNMS(KP2_000000000, T16, T9);
+        R0(0) = FMA(KP2_000000000, T16, T9);
+        T55 = FNMS(KP2_000000000, T48, T47);
+        T56 = T53 - T50;
+        R0(14) = FNMS(KP1_414213562, T56, T55);
+        R0(6) = FMA(KP1_414213562, T56, T55);
+    }
+    {
+        float T57, T58, T25, T36;
+        T57 = FNMS(KP2_000000000, T8, T5);
+        T58 = T52 + T51;
+        R0(12) = FNMS(KP2_000000000, T58, T57);
+        R0(4) = FMA(KP2_000000000, T58, T57);
+        T25 = FMA(KP1_414213562, T24, T19);
+        T36 = FMA(KP414213562, T35, T30);
+        R1(8) = FNMS(KP1_847759065, T36, T25);
+        R1(0) = FMA(KP1_847759065, T36, T25);
+    }
+    {
+        float T37, T38, T45, T46;
+        T37 = FNMS(KP1_414213562, T24, T19);
+        T38 = FNMS(KP414213562, T30, T35);
+        R1(12) = FNMS(KP1_847759065, T38, T37);
+        R1(4) = FMA(KP1_847759065, T38, T37);
+        T45 = FMA(KP1_414213562, T40, T39);
+        T46 = FMA(KP414213562, T42, T43);
+        R1(10) = FNMS(KP1_847759065, T46, T45);
+        R1(2) = FMA(KP1_847759065, T46, T45);
+    }
+    {
+        float T49, T54, T41, T44;
+        T49 = FMA(KP2_000000000, T48, T47);
+        T54 = T50 + T53;
+        R0(10) = FNMS(KP1_414213562, T54, T49);
+        R0(2) = FMA(KP1_414213562, T54, T49);
+        T41 = FNMS(KP1_414213562, T40, T39);
+        T44 = FNMS(KP414213562, T43, T42);
+        R1(6) = FNMS(KP1_847759065, T44, T41);
+        R1(14) = FMA(KP1_847759065, T44, T41);
+    }
+#undef R0
+#undef R1
+}
+
+// ---------------------------------------------------------------------------
+// IO helpers (raw staging / padded-buffer access)
+// ---------------------------------------------------------------------------
+
+float to_float(uint raw) {
+#if BITS == 32
+    return uintBitsToFloat(raw) * SCALE;
+#else
+    return float(raw) * SCALE;
+#endif
+}
+
+// the fused kernel reads the padded source from the device-local padded buffer
+uint load_raw(int sample_idx) {
+    int byte = pc.padded_base + sample_idx * ELEM_BYTES;
+    uint word = padded_raw[byte >> 2];
+    return (word >> (8 * (byte & 3))) & ELEM_MASK;
+}
+
+// the pad kernel reads the tight upload rows from the staging buffer
+uint load_upload(int sample_idx) {
+    int byte = pc.src_base + sample_idx * ELEM_BYTES;
+    uint word = staging_raw[byte >> 2];
+    return (word >> (8 * (byte & 3))) & ELEM_MASK;
+}
+
+void store_sample(int sample_idx, float v) {
+    int byte = pc.dst_base + sample_idx * ELEM_BYTES;
+#if BITS == 32
+    staging_raw[byte >> 2] = floatBitsToUint(v / SCALE);
+#else
+    float x = v / SCALE;
+    x = clamp(x + 0.5, 0.0, PEAK);
+    uint val = uint(x) & ELEM_MASK;
+    atomicOr(staging_raw[byte >> 2], val << (8 * (byte & 3)));
+#endif
+}
+
+// the pad kernel writes the padded source into the device-local buffer
+void store_padded(int sample_idx, float v) {
+    int byte = pc.padded_base + sample_idx * ELEM_BYTES;
+#if BITS == 32
+    padded_raw[byte >> 2] = floatBitsToUint(v / SCALE);
+#else
+    float x = v / SCALE;
+    x = clamp(x + 0.5, 0.0, PEAK);
+    uint val = uint(x) & ELEM_MASK;
+    atomicOr(padded_raw[byte >> 2], val << (8 * (byte & 3)));
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Frequency-domain filter (matches the reference generated filter())
+// ---------------------------------------------------------------------------
+
+void filter_value(inout float re, inout float im, int x, int y, int t) {
+    float sigma;
+    if (pc.sigma_base < 0) {
+        sigma = pc.sigma;
+    } else {
+        sigma = wt[pc.sigma_base + (t * 16 + y) * 9 + x];
+    }
+    float sigma2 = pc.sigma2;
+    float pmin = pc.pmin;
+    float pmax = pc.pmax;
+    float beta = pc.beta;
+    float multiplier = 0.0;
+
+    if (pc.filter_type == 2) {
+        re *= sigma;
+        im *= sigma;
+        return;
+    }
+
+    float psd = re * re + im * im;
+
+    if (pc.filter_type == 1) {
+        if (psd < sigma) {
+            re = 0.0;
+            im = 0.0;
+        }
+        return;
+    } else if (pc.filter_type == 0) {
+        multiplier = max((psd - sigma) / (psd + 1e-15), 0.0);
+    } else if (pc.filter_type == 3) {
+        if (psd >= pmin && psd <= pmax) {
+            multiplier = sigma;
+        } else {
+            multiplier = sigma2;
+        }
+    } else if (pc.filter_type == 4) {
+        multiplier = sigma * sqrt(psd * (pmax / ((psd + pmin) * (psd + pmax) + 1e-15)));
+    } else if (pc.filter_type == 5) {
+        multiplier = pow(max((psd - sigma) / (psd + 1e-15), 0.0), beta);
+    } else {
+        multiplier = sqrt(max((psd - sigma) / (psd + 1e-15), 0.0));
+    }
+
+    re *= multiplier;
+    im *= multiplier;
+}
+
+void temporal_dft(inout float data[TD_SZ], int base) {
+#if RADIUS == 0
+    dft1(data, base, 16);
+#elif RADIUS == 1
+    dft3(data, base, 16);
+#elif RADIUS == 2
+    dft5(data, base, 16);
+#else
+    dft7(data, base, 16);
+#endif
+}
+
+void temporal_idft(inout float data[TD_SZ], int base) {
+#if RADIUS == 0
+    idft1(data, base, 16);
+#elif RADIUS == 1
+    idft3(data, base, 16);
+#elif RADIUS == 2
+    idft5(data, base, 16);
+#else
+    idft7(data, base, 16);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// pad: reflection-pad the tight upload rows into the device-local padded buffer
+// (single-fold mirror, identical to the reference's reflect_pad kernel and the
+// previous host-side reflection_padding_impl)
+// ---------------------------------------------------------------------------
+
+#if defined(ENTRY_PAD)
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    const int pw = calc_pad_size(pc.width, pc.block_step);
+    const int ph = calc_pad_size(pc.height, pc.block_step);
+    const int pad_x = (pw - pc.width) / 2;
+    const int pad_y = (ph - pc.height) / 2;
+    const int tw = 2 * pc.radius + 1;
+    const int up_slice = pc.height * pc.src_stride;
+    const int pad_slice = pw * ph;
+
+    for (int y = int(gl_GlobalInvocationID.y); y < ph; y += int(gl_NumWorkGroups.y) * 8) {
+        for (int x = int(gl_GlobalInvocationID.x); x < pw; x += int(gl_NumWorkGroups.x) * 32) {
+            int sx = x - pad_x;
+            int sy = y - pad_y;
+            sx = sx < 0 ? -sx : (sx >= pc.width ? 2 * (pc.width - 1) - sx : sx);
+            sy = sy < 0 ? -sy : (sy >= pc.height ? 2 * (pc.height - 1) - sy : sy);
+            for (int t = 0; t < tw; ++t) {
+                const uint raw = load_upload(t * up_slice + sy * pc.src_stride + sx);
+                store_padded(t * pad_slice + y * pw + x, to_float(raw));
+            }
+        }
+    }
+}
+
+#endif // ENTRY_PAD
+
+// ---------------------------------------------------------------------------
+// fused: im2col + 3D DFT + filter + inverse + center-slice col
+// One 16x16 block per workgroup; the 16 invocations act as the 16 lanes of
+// the reference warp (the HIPRTC backend's 32-lane block with 16 active
+// lanes, workgroup barriers in place of warp shuffles).
+// ---------------------------------------------------------------------------
+
+#if defined(ENTRY_FUSED)
+
+#ifndef SUB_BLOCKS
+#define SUB_BLOCKS 4   // blocks processed per workgroup (4 * 16 = 64 threads, one wavefront on RDNA)
+#endif
+
+shared float trans[SUB_BLOCKS * 2 * 16 * TSTRIDE];
+shared float s_gf[SUB_BLOCKS];
+
+layout(local_size_x = SUB_BLOCKS * 16, local_size_y = 1, local_size_z = 1) in;
+void main() {
+    const int lane = int(gl_LocalInvocationIndex) & 15;
+    const int sub = int(gl_LocalInvocationIndex) >> 4;
+    const int pw = calc_pad_size(pc.width, pc.block_step);
+    const int ph = calc_pad_size(pc.height, pc.block_step);
+    const int hn = calc_pad_num(pc.width, pc.block_step);
+    const int vn = calc_pad_num(pc.height, pc.block_step);
+    const int num_blocks = hn * vn;
+    const int tw = TW;
+    const int tsub = sub * 2 * 16 * TSTRIDE;
+
+    for (int block_id = int(gl_WorkGroupID.x) * SUB_BLOCKS + sub;
+         block_id < num_blocks;
+         block_id += int(gl_NumWorkGroups.x) * SUB_BLOCKS) {
+        const int ix = block_id % hn;
+        const int iy = block_id / hn;
+
+        float td[TD_SZ];
+        for (int i = 0; i < TD_SZ; ++i) {
+            td[i] = 0.0;
+        }
+
+        // im2col: each lane loads column `lane` of the 16x16 window, windowed
+        for (int i = 0; i < tw; ++i) {
+            const int base = i * 32;
+            for (int j = 0; j < 16; ++j) {
+                const int src_off = (i * ph + iy * pc.block_step + j) * pw + ix * pc.block_step + lane;
+                td[base + j] = to_float(load_raw(src_off)) * wt[pc.wt_base + (i * 16 + j) * 16 + lane];
+            }
+        }
+
+        // per-slice: rdft along x (rows) then dft along y (columns)
+        for (int i = 0; i < tw; ++i) {
+            const int base = i * 32;
+            barrier();
+            // transpose store of the real data (scalar floats)
+            for (int j = 0; j < 16; ++j) {
+                trans[tsub + 2 * (j * TSTRIDE + lane) + 0] = td[base + j];
+            }
+            barrier();
+            // transpose load: lane now holds row `lane`
+            for (int j = 0; j < 16; ++j) {
+                td[base + j] = trans[tsub + 2 * (lane * TSTRIDE + j) + 0];
+            }
+            barrier();
+            rdft16(td, base);
+            // transpose store of the complex data
+            for (int j = 0; j < 9; ++j) {
+                trans[tsub + 2 * (lane * TSTRIDE + j) + 0] = td[base + 2 * j];
+                trans[tsub + 2 * (lane * TSTRIDE + j) + 1] = td[base + 2 * j + 1];
+            }
+            barrier();
+            if (lane < 9) {
+                // transpose load: lane holds bin `lane` across the 16 rows
+                for (int j = 0; j < 16; ++j) {
+                    td[base + 2 * j] = trans[tsub + 2 * (j * TSTRIDE + lane) + 0];
+                    td[base + 2 * j + 1] = trans[tsub + 2 * (j * TSTRIDE + lane) + 1];
+                }
+                dft16(td, base, 1);
+            }
+        }
+
+        // temporal dft across the slices
+        if (lane < 9) {
+            for (int i = 0; i < 16; ++i) {
+                temporal_dft(td, 2 * i);
+            }
+        }
+
+        // zero-mean: DC gain broadcast from lane 0
+        if (pc.wf_base >= 0) {
+            if (lane == 0) {
+                s_gf[sub] = td[0] / wt[pc.wf_base];
+            }
+        }
+        barrier();
+
+        if (lane < 9) {
+            // frequency filtering
+            for (int i = 0; i < tw; ++i) {
+                for (int j = 0; j < 16; ++j) {
+                    const int idx = (i * 16 + j) * 2;
+                    float re = td[idx];
+                    float im = td[idx + 1];
+                    float v1 = 0.0;
+                    float v2 = 0.0;
+                    if (pc.wf_base >= 0) {
+                        v1 = s_gf[sub] * wt[pc.wf_base + ((i * 16 + j) * 9 + lane) * 2 + 0];
+                        v2 = s_gf[sub] * wt[pc.wf_base + ((i * 16 + j) * 9 + lane) * 2 + 1];
+                        re -= v1;
+                        im -= v2;
+                    }
+                    filter_value(re, im, lane, j, i);
+                    if (pc.wf_base >= 0) {
+                        re += v1;
+                        im += v2;
+                    }
+                    td[idx] = re;
+                    td[idx + 1] = im;
+                }
+            }
+            // temporal idft
+            for (int i = 0; i < 16; ++i) {
+                temporal_idft(td, 2 * i);
+            }
+        }
+
+        // inverse y-transform of the center slice + transpose back to rows
+        const int cbase = RADIUS * 32;
+        barrier();
+        if (lane < 9) {
+            idft16(td, cbase, 1);
+            for (int j = 0; j < 16; ++j) {
+                trans[tsub + 2 * (j * TSTRIDE + lane) + 0] = td[cbase + 2 * j];
+                trans[tsub + 2 * (j * TSTRIDE + lane) + 1] = td[cbase + 2 * j + 1];
+            }
+        }
+        barrier();
+        for (int j = 0; j < 9; ++j) {
+            td[cbase + 2 * j] = trans[tsub + 2 * (lane * TSTRIDE + j) + 0];
+            td[cbase + 2 * j + 1] = trans[tsub + 2 * (lane * TSTRIDE + j) + 1];
+        }
+        irdft16(td, cbase);
+        barrier();
+        // transpose store of the row data (irdft emits the sequence reversed)
+        for (int j = 0; j < 16; ++j) {
+            trans[tsub + 2 * (j * TSTRIDE + lane) + 0] = td[cbase + (j == 0 ? 0 : 16 - j)];
+        }
+        barrier();
+        // write the block's center slice into the spatial buffer
+        const int dst_base = pc.spatial_base + (block_id * TW + RADIUS) * 256;
+        for (int j = 0; j < 16; ++j) {
+            spatial[dst_base + j * 16 + lane] = trans[tsub + 2 * (lane * TSTRIDE + j) + 0];
+        }
+    }
+}
+
+#endif // ENTRY_FUSED
+
+// ---------------------------------------------------------------------------
+// col2im: overlap-add the windowed blocks back into the final plane
+// ---------------------------------------------------------------------------
+
+#if defined(ENTRY_COL2IM)
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    const int pw = calc_pad_size(pc.width, pc.block_step);
+    const int ph = calc_pad_size(pc.height, pc.block_step);
+    const int hn = calc_pad_num(pc.width, pc.block_step);
+    const int vn = calc_pad_num(pc.height, pc.block_step);
+    const int tw = 2 * pc.radius + 1;
+    const int pad_x = (pw - pc.width) / 2;
+    const int pad_y = (ph - pc.height) / 2;
+
+    for (int y = int(gl_GlobalInvocationID.y); y < ph; y += int(gl_NumWorkGroups.y) * 8) {
+        for (int x = int(gl_GlobalInvocationID.x); x < pw; x += int(gl_NumWorkGroups.x) * 32) {
+            if (y < pad_y || y >= pad_y + pc.height || x < pad_x || x >= pad_x + pc.width) {
+                continue;
+            }
+
+            float sum = 0.0;
+            const int i1 = (y - 16 + pc.block_step) / pc.block_step;
+            const int i2 = min(y / pc.block_step, vn - 1);
+            const int j1 = (x - 16 + pc.block_step) / pc.block_step;
+            const int j2 = min(x / pc.block_step, hn - 1);
+
+            for (int i = i1; i <= i2; ++i) {
+                const int offset_y = y - i * pc.block_step;
+                for (int j = j1; j <= j2; ++j) {
+                    const int offset_x = x - j * pc.block_step;
+                    const int src_offset = (((i * hn + j) * tw + pc.radius) * 16 + offset_y) * 16 + offset_x;
+                    const int window_offset = (pc.radius * 16 + offset_y) * 16 + offset_x;
+                    sum += spatial[pc.spatial_base + src_offset] * wt[pc.wt_base + window_offset];
+                }
+            }
+
+            store_sample((y - pad_y) * pc.dst_stride + (x - pad_x), sum);
+        }
+    }
+}
+
+#endif // ENTRY_COL2IM
