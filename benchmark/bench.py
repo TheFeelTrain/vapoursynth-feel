@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Single-file benchmark for the vsfeel plugin.
+"""Benchmark vsfeel filters against the reference implementations.
 
-Runs the same clip through every installed BM3Dv2 (or Bilateral)
-implementation side by side and reports the throughput. The timing is done
-with vspipe so the numbers stay comparable with the previous per-plugin
-scripts (benchmark/feel_test.py, cl_test.py, cu_test.py).
+The benchmark is data-driven: every filter is described by one entry in the
+FILTERS registry below (its CLI args, the input clip expression, and a builder
+that maps each supported plugin to the vpy call that runs it). Plugins are
+described separately in PLUGINS. Adding a new filter = one new entry; adding a
+new reference plugin = one new entry.
+
+Timing is done with vspipe so results stay comparable across plugins and with
+the earlier per-plugin scripts (benchmark/feel_test.py, cl_test.py, cu_test.py).
 
 Usage:
-    python3 benchmark/bench.py                           # all BM3Dv2 plugins
-    python3 benchmark/bench.py vsfeel vszipcu            # a subset
-    python3 benchmark/bench.py --bilateral               # benchmark Bilateral instead
-    python3 benchmark/bench.py --bm3d-args "sigma=1.5, radius=4, num_streams=1"
+    python3 benchmark/bench.py                                   # all filters
+    python3 benchmark/bench.py --filter gaussblur                # one filter
+    python3 benchmark/bench.py --filter gaussblur vsfeel vszipcl # subset of plugins
+    python3 benchmark/bench.py --filter gaussblur --gauss-sigma 5.0
     python3 benchmark/bench.py --frames 500 --clip /path/to/input.mkv
 """
 
@@ -18,18 +22,15 @@ import argparse
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 DEFAULT_CLIP = "/home/encode/test/jpbd.mkv"
 
-# extra vpy lines needed to make a plugin available
-LOADERS = {
-    "vszipcu": 'core.std.LoadPlugin("/home/encode/test/vapoursynth-ziphip/zig-out/lib/libvszipcu.so")',
-}
-
 VSPIPE_TEMPLATE = """\
 from vssource import BestSource
-from vstools import core, get_y
+from vstools import core, depth, get_y
 
 core.max_cache_size = 1024 * 56
 
@@ -40,6 +41,130 @@ clip = BestSource(cachepath=None).source({clip!r}, 32)
 {chain}.set_output()
 """
 
+
+# ---------------------------------------------------------------------------
+# Plugin registry
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Plugin:
+    name: str
+    loader: str | None = None  # extra vpy line required to make it available
+
+
+PLUGINS = {
+    "vsfeel": Plugin("vsfeel"),
+    "vszipcl": Plugin("vszipcl"),
+    "vszipcu": Plugin(
+        "vszipcu",
+        loader='core.std.LoadPlugin("/home/encode/test/vapoursynth-ziphip/zig-out/lib/libvszipcu.so")',
+    ),
+    "bm3dhip": Plugin("bm3dhip"),
+}
+
+
+# ---------------------------------------------------------------------------
+# Filter registry
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Arg:
+    """One filter parameter exposed as a CLI flag.
+
+    ``key`` is the parameter name used inside the vpy call (and in the printed
+    description); ``flag``/``dest`` are the CLI spelling and its namespace
+    attribute (prefixed so different filters never collide when run together).
+    """
+
+    key: str
+    flag: str
+    dest: str
+    type: type
+    default: Any
+    help: str = ""
+
+
+@dataclass
+class FilterSpec:
+    title: str
+    default_frames: int
+    args: list[Arg]
+    build: Callable[[argparse.Namespace, str], dict[str, str]]
+    input: str = "depth(get_y(clip), 16)"  # clip expression the filter is applied to
+
+
+def _bm3d_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
+    common = (
+        f"sigma={ns.bm3d_sigma}, radius={ns.bm3d_radius}, "
+        f"bm_range={ns.bm3d_bm_range}, ps_range={ns.bm3d_ps_range}, "
+        f"block_step={ns.bm3d_block_step}"
+    )
+    with_streams = f"{common}, num_streams={ns.num_streams}"
+    return {
+        "vsfeel": f"core.vsfeel.BM3Dv2({clip}, {with_streams})",
+        "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {with_streams})",
+        "vszipcu": f"core.vszipcu.BM3Dv2({clip}, {with_streams})",
+        "bm3dhip": f"core.bm3dhip.BM3Dv2({clip}, {common})",  # no num_streams
+    }
+
+
+def _bilateral_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
+    args = (
+        f"sigma_spatial={ns.bilateral_sigma_spatial}, "
+        f"sigma_color={ns.bilateral_sigma_color}, num_streams={ns.num_streams}"
+    )
+    return {
+        "vsfeel": f"core.vsfeel.Bilateral({clip}, {args})",
+        "vszipcl": f"core.vszipcl.Bilateral({clip}, {args})",
+    }
+
+
+def _gauss_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
+    args = f"sigma={ns.gauss_sigma}, num_streams={ns.num_streams}"
+    return {
+        "vsfeel": f"core.vsfeel.GaussBlur({clip}, {args})",
+        "vszipcl": f"core.vszipcl.GaussBlur({clip}, {args})",
+        "vszipcu": f"core.vszipcu.GaussBlur({clip}, {args})",
+    }
+
+
+FILTERS: dict[str, FilterSpec] = {
+    "bm3dv2": FilterSpec(
+        title="BM3Dv2",
+        default_frames=1000,
+        args=[
+            Arg("sigma", "--bm3d-sigma", "bm3d_sigma", float, 0.7),
+            Arg("radius", "--bm3d-radius", "bm3d_radius", int, 2),
+            Arg("bm_range", "--bm3d-bm-range", "bm3d_bm_range", int, 16),
+            Arg("ps_range", "--bm3d-ps-range", "bm3d_ps_range", int, 7),
+            Arg("block_step", "--bm3d-block-step", "bm3d_block_step", int, 4),
+        ],
+        build=_bm3d_build,
+        input="depth(get_y(clip), 32)",
+    ),
+    "bilateral": FilterSpec(
+        title="Bilateral",
+        default_frames=10000,
+        args=[
+            Arg("sigma_spatial", "--bilateral-sigma-spatial", "bilateral_sigma_spatial", float, 3.0),
+            Arg("sigma_color", "--bilateral-sigma-color", "bilateral_sigma_color", float, 0.02),
+        ],
+        build=_bilateral_build,
+    ),
+    "gaussblur": FilterSpec(
+        title="GaussBlur",
+        default_frames=5000,
+        args=[
+            Arg("sigma", "--gauss-sigma", "gauss_sigma", float, 16.0),
+        ],
+        build=_gauss_build,
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# vspipe timing
+# ---------------------------------------------------------------------------
 
 def run_vspipe(vpy_path: Path, frames: int) -> float | None:
     cmd = ["vspipe", "--start", "0", "--end", str(frames - 1), str(vpy_path), "/dev/null"]
@@ -56,7 +181,7 @@ def run_vspipe(vpy_path: Path, frames: int) -> float | None:
 def bench(plugin: str, chain: str, clip: str, frames: int) -> float | None:
     vpy = VSPIPE_TEMPLATE.format(
         clip=clip,
-        extra=LOADERS.get(plugin, ""),
+        extra=PLUGINS[plugin].loader or "",
         chain=chain,
     )
     with tempfile.TemporaryDirectory() as tmp:
@@ -65,83 +190,26 @@ def bench(plugin: str, chain: str, clip: str, frames: int) -> float | None:
         return run_vspipe(path, frames)
 
 
-def _parse_bm3d_args(raw: str) -> tuple[list[str], str]:
-    """Split a "key=value, key=value" string into call args and a canonical
-    description. num_streams is handled per-plugin (bm3dhip has none)."""
-    pairs = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        key, _, value = part.partition("=")
-        key, value = key.strip(), value.strip()
-        if not key or not value:
-            sys.exit(f"invalid BM3D arg {part!r} (expected key=value)")
-        pairs.append((key, value))
-    if not pairs:
-        sys.exit("no BM3D args given")
-    args_all = ", ".join(f"{k}={v}" for k, v in pairs)
-    args_hip = ", ".join(f"{k}={v}" for k, v in pairs if k != "num_streams")
-    desc = args_all
-    return [args_all, args_hip], desc
+def args_desc(spec: FilterSpec, ns: argparse.Namespace) -> str:
+    pairs = [f"{a.key}={getattr(ns, a.dest)}" for a in spec.args]
+    pairs.append(f"num_streams={ns.num_streams}")
+    return ", ".join(pairs)
 
 
-def build_calls(args) -> tuple[dict[str, str], str]:
-    """Return (plugin -> filter call, human-readable args line)."""
-    if args.filter == "bm3dv2":
-        pair, desc = _parse_bm3d_args(args.bm3d_args)
-        args_all, args_hip = pair
-        calls = {
-            "vsfeel": f"core.vsfeel.BM3Dv2(get_y(clip), {args_all})",
-            "vszipcl": f"core.vszipcl.BM3Dv2(get_y(clip), {args_all})",
-            "vszipcu": f"core.vszipcu.BM3Dv2(get_y(clip), {args_all})",
-            "bm3dhip": f"core.bm3dhip.BM3Dv2(get_y(clip), {args_hip})",  # no num_streams
-        }
-        desc = args_all
-    else:
-        common = f"sigma_spatial={args.sigma_spatial}, sigma_color={args.sigma_color}"
-        calls = {
-            "vsfeel": f"core.vsfeel.Bilateral(get_y(clip), {common})",
-            "vszipcl": f"core.vszipcl.Bilateral(get_y(clip), {common})",
-        }
-        desc = f"sigma_spatial={args.sigma_spatial}, sigma_color={args.sigma_color}, num_streams=4"
-    return calls, desc
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark vsfeel against other BM3D implementations")
-    parser.add_argument("plugins", nargs="*", help="plugins to run (default: all)")
-    parser.add_argument("--filter", choices=("bm3dv2", "bilateral"), default="bm3dv2",
-                        help="filter to benchmark (default: bm3dv2)")
-    parser.add_argument("--bilateral", action="store_const", const="bilateral", dest="filter",
-                        help="shorthand for --filter bilateral")
-    parser.add_argument("--frames", type=int, default=None,
-                        help="frames to time (default: 1000 for bm3dv2, 10000 for bilateral)")
-    parser.add_argument("--clip", default=DEFAULT_CLIP, help="input clip path")
-    # BM3Dv2 args as a single comma-separated "key=value" string
-    parser.add_argument("--bm3d-args", dest="bm3d_args",
-                        default="sigma=0.7, radius=2, bm_range=16, ps_range=7, block_step=4",
-                        help='BM3Dv2 args, e.g. "sigma=1.5, radius=4, num_streams=1"')
-    # Bilateral args
-    parser.add_argument("--sigma-spatial", type=float, default=3.0, dest="sigma_spatial")
-    parser.add_argument("--sigma-color", type=float, default=0.02, dest="sigma_color")
-    args = parser.parse_args()
-
-    if args.frames is None:
-        args.frames = 10000 if args.filter == "bilateral" else 1000
-
-    calls, args_desc = build_calls(args)
-    plugins = args.plugins or list(calls)
+def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
+    calls = spec.build(ns, spec.input)
+    plugins = ns.plugins or list(calls)
     plugins = [p for p in plugins if p in calls]
     if not plugins:
-        sys.exit("no valid plugins requested")
+        sys.exit(f"no valid plugins requested for --filter {ns.filter}")
 
-    print(f"{args.filter.upper()} benchmark | {args.frames} frames | clip: {args.clip}")
-    print(f"args: {args_desc}\n")
+    frames = ns.frames or spec.default_frames
+    print(f"{spec.title} benchmark | {frames} frames | clip: {ns.clip}")
+    print(f"args: {args_desc(spec, ns)}\n")
 
     results = []
     for plugin in plugins:
-        fps = bench(plugin, calls[plugin], args.clip, args.frames)
+        fps = bench(plugin, calls[plugin], ns.clip, frames)
         results.append((plugin, fps))
         if fps is None:
             print(f"  {plugin:10s}  unavailable / failed")
@@ -154,6 +222,40 @@ def main() -> None:
         valid.sort(key=lambda x: x[1], reverse=True)
         for rank, (plugin, fps) in enumerate(valid, 1):
             print(f"  {rank}. {plugin:10s} {fps:9.2f} fps")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Benchmark vsfeel filters against the reference implementations."
+    )
+    parser.add_argument("plugins", nargs="*",
+                        help="plugins to run (default: every plugin providing the filter)")
+    parser.add_argument("-f", "--filter", choices=[*FILTERS, "all"], default="all",
+                        help="filter to benchmark (default: all)")
+    parser.add_argument("--frames", type=int, default=None,
+                        help="frames to time (default: per-filter, 10000 for Bilateral/GaussBlur)")
+    parser.add_argument("--num-streams", type=int, default=4,
+                        help="num_streams passed to the filters (default: 4)")
+    parser.add_argument("--clip", default=DEFAULT_CLIP, help="input clip path")
+
+    for spec in FILTERS.values():
+        for arg in spec.args:
+            parser.add_argument(arg.flag, dest=arg.dest, type=arg.type,
+                                default=arg.default, help=arg.help)
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    ns = parse_args()
+    ns.clip = str(Path(ns.clip).expanduser().resolve())
+    filters = list(FILTERS) if ns.filter == "all" else [ns.filter]
+    for fname in filters:
+        bench_filter(FILTERS[fname], ns)
 
 
 if __name__ == "__main__":
