@@ -1404,14 +1404,14 @@ static void VS_CC DftCreate(
     }
     {
         VkDescriptorPoolSize pool_size {
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * static_cast<uint32_t>(std::max(d->num_streams, 3))
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * static_cast<uint32_t>(std::max(d->num_streams, 8))
         };
 
         VkDescriptorPoolCreateInfo pool_info {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .maxSets = static_cast<uint32_t>(std::max(d->num_streams, 3)),
+            .maxSets = static_cast<uint32_t>(std::max(d->num_streams, 8)),
             .poolSizeCount = 1,
             .pPoolSizes = &pool_size
         };
@@ -1570,7 +1570,7 @@ static void VS_CC DftCreate(
         d->spatial_total * sizeof(float), min_size);
 
     d->need_fill = d->bits != 32;
-    const int effective_streams = std::max(d->num_streams, 3);
+    const int effective_streams = std::max(d->num_streams, 8);
     d->semaphore.current.store(effective_streams - 1, std::memory_order::relaxed);
     d->resources.reserve(effective_streams);
 
