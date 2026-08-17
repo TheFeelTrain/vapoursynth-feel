@@ -45,6 +45,14 @@ def noise_8bit():
     return vs.core.std.ShufflePlanes(src, 0, vs.GRAY)
 
 
+@pytest.fixture(scope="session")
+def noise_16bit():
+    """GRAY16 clip of the same video (integer reference comparison)."""
+    src = _source(NOISE_MKV)
+    y = vs.core.std.ShufflePlanes(src, 0, vs.GRAY)
+    return vs.core.fmtc.bitdepth(y, bits=16, fulls=True, fulld=True)
+
+
 def assert_gray32(clip):
     fmt = clip.format
     assert fmt.color_family == vs.GRAY

@@ -991,10 +991,10 @@ static void VS_CC DftCreate(
     const auto & fmt = d->vi->format;
     const int bits = fmt.bitsPerSample;
     const bool depth_ok = (fmt.sampleType == stFloat && bits == 32) ||
-                          (fmt.sampleType == stInteger && (bits == 8 || bits == 16));
+                          (fmt.sampleType == stInteger && bits == 16);
     if (!depth_ok || d->vi->width <= 0 || d->vi->height <= 0 ||
         (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV && fmt.colorFamily != cfRGB)) {
-        return set_error("input must be 8/16 bit integer or 32 bit float, Gray/YUV/RGB, constant format.");
+        return set_error("input must be 16 bit integer or 32 bit float, Gray/YUV/RGB, constant format.");
     }
     d->bits = bits;
     d->bytes = bits / 8;
@@ -1496,14 +1496,6 @@ static void VS_CC DftCreate(
         const uint32_t * fused_code[4] {};
         size_t fused_size[4] {};
         switch (d->bits) {
-            case 8:
-                pad_code = dfttest_8_pad_spv;        pad_size = dfttest_8_pad_spv_size;
-                col2im_code = dfttest_8_col2im_spv;  col2im_size = dfttest_8_col2im_spv_size;
-                fused_code[0] = dfttest_8_fused_r0_spv; fused_size[0] = dfttest_8_fused_r0_spv_size;
-                fused_code[1] = dfttest_8_fused_r1_spv; fused_size[1] = dfttest_8_fused_r1_spv_size;
-                fused_code[2] = dfttest_8_fused_r2_spv; fused_size[2] = dfttest_8_fused_r2_spv_size;
-                fused_code[3] = dfttest_8_fused_r3_spv; fused_size[3] = dfttest_8_fused_r3_spv_size;
-                break;
             case 16:
                 pad_code = dfttest_16_pad_spv;       pad_size = dfttest_16_pad_spv_size;
                 col2im_code = dfttest_16_col2im_spv; col2im_size = dfttest_16_col2im_spv_size;

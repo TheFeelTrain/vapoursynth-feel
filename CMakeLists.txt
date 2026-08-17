@@ -110,7 +110,8 @@ if(VK_GLSLC)
     # (0..3, i.e. tbsize 1/3/5/7) so its loops unroll and the working array
     # stays in registers (the reference does the same via `#define RADIUS`).
     set(VK_DFT_ENTRIES pad col2im)
-    foreach(bits IN LISTS VK_BITS)
+    set(VK_DFT_BITS "16" "32")
+    foreach(bits IN LISTS VK_DFT_BITS)
         foreach(entry IN LISTS VK_DFT_ENTRIES)
             set(defs -DBITS=${bits})
             if(entry STREQUAL pad)
@@ -168,12 +169,6 @@ add_custom_command(
             "${VK_SPV_DIR}/gaussblur_32_gauss.spv"
             "${VK_SPV_DIR}/gaussblur_32_vert.spv"
             "${VK_SPV_DIR}/gaussblur_32_horiz.spv"
-            "${VK_SPV_DIR}/dfttest_8_pad.spv"
-            "${VK_SPV_DIR}/dfttest_8_col2im.spv"
-            "${VK_SPV_DIR}/dfttest_8_fused_r0.spv"
-            "${VK_SPV_DIR}/dfttest_8_fused_r1.spv"
-            "${VK_SPV_DIR}/dfttest_8_fused_r2.spv"
-            "${VK_SPV_DIR}/dfttest_8_fused_r3.spv"
             "${VK_SPV_DIR}/dfttest_16_pad.spv"
             "${VK_SPV_DIR}/dfttest_16_col2im.spv"
             "${VK_SPV_DIR}/dfttest_16_fused_r0.spv"

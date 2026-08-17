@@ -205,18 +205,24 @@ def test_dfttest_matches_reference(noise_gray):
         assert maxdiff < tol, f"max diff {maxdiff} vs vszipcl for {kwargs}"
 
 
-def test_dfttest_gray8_matches_reference(noise_8bit):
-    """8-bit integer path: at most one code level of rounding difference."""
+def test_dfttest_gray16_matches_reference(noise_16bit):
+    """16-bit integer path: at most one code level of rounding difference."""
     if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "DFTTest"):
         pytest.skip("no vszipcl.DFTTest reference")
     core = vs.core
-    ref = core.vszipcl.DFTTest(noise_8bit)
-    my = core.vsfeel.DFTTest(noise_8bit)
+    ref = core.vszipcl.DFTTest(noise_16bit)
+    my = core.vsfeel.DFTTest(noise_16bit)
     for n in (0, 11, 23):
-        a = _plane(my.get_frame(n), 0, WIDTH, HEIGHT, np.uint8)
-        b = _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint8)
+        a = _plane(my.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+        b = _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         d = np.abs(a.astype(np.int64) - b.astype(np.int64))
-        assert d.max() <= 1, f"gray8 max diff {d.max()} at frame {n}"
+        assert d.max() <= 1, f"gray16 max diff {d.max()} at frame {n}"
+
+
+def test_dfttest_rejects_8bit(noise_8bit):
+    """8-bit integer input is not supported (only 16-bit int and fp32)."""
+    with pytest.raises(vs.Error):
+        vs.core.vsfeel.DFTTest(noise_8bit)
 
 
 # ---------------------------------------------------------------------------
