@@ -850,15 +850,19 @@ static const VSFrame *VS_CC DftGetFrame(
                 continue;
             }
             const auto & cfg = d->planes[plane];
+            const size_t row_bytes = static_cast<size_t>(cfg.width) * d->bytes;
             for (int t = 0; t < tw; ++t) {
                 const uint8_t * srcp = vsapi->getReadPtr(src[t], plane);
                 const int src_stride = vsapi->getStride(src[t], plane);
                 uint8_t * dstp = reinterpret_cast<uint8_t *>(map) + cfg.upload_offset +
                     static_cast<size_t>(t) * cfg.upload_bytes / tw;
-                for (int y = 0; y < cfg.height; ++y) {
-                    copy_stream_out(dstp + static_cast<size_t>(y) * cfg.width * d->bytes,
-                        srcp + static_cast<size_t>(y) * src_stride,
-                        static_cast<size_t>(cfg.width) * d->bytes);
+                if (src_stride == static_cast<int>(row_bytes)) {
+                    copy_stream_out(dstp, srcp, static_cast<size_t>(cfg.height) * row_bytes);
+                } else {
+                    for (int y = 0; y < cfg.height; ++y) {
+                        copy_stream_out(dstp + static_cast<size_t>(y) * row_bytes,
+                            srcp + static_cast<size_t>(y) * src_stride, row_bytes);
+                    }
                 }
             }
         }
@@ -1400,14 +1404,14 @@ static void VS_CC DftCreate(
     }
     {
         VkDescriptorPoolSize pool_size {
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * static_cast<uint32_t>(d->num_streams)
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * static_cast<uint32_t>(std::max(d->num_streams, 3))
         };
 
         VkDescriptorPoolCreateInfo pool_info {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .maxSets = static_cast<uint32_t>(d->num_streams),
+            .maxSets = static_cast<uint32_t>(std::max(d->num_streams, 3)),
             .poolSizeCount = 1,
             .pPoolSizes = &pool_size
         };
@@ -1574,13 +1578,14 @@ static void VS_CC DftCreate(
         d->spatial_total * sizeof(float), min_size);
 
     d->need_fill = d->bits != 32;
-    d->semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
-    d->resources.reserve(d->num_streams);
+    const int effective_streams = std::max(d->num_streams, 3);
+    d->semaphore.current.store(effective_streams - 1, std::memory_order::relaxed);
+    d->resources.reserve(effective_streams);
 
     const uint32_t num_queues = std::min(
         d->num_streams, static_cast<int>(d->device->queue_count));
 
-    for (int i = 0; i < d->num_streams; ++i) {
+    for (int i = 0; i < effective_streams; ++i) {
         VK_Resource resource;
 
         {
