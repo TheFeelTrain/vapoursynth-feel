@@ -74,6 +74,26 @@ core.vsfeel.BM3Dv2(clip, sigma=0.7, block_step=4, bm_range=16, radius=2, ps_num=
 - extractor_exp: (Default: 0)
     Exponent of the extractor used to bias the aggregation weight. 0 disables the extractor.
 
+### GaussBlur
+
+[Gaussian blur](https://en.wikipedia.org/wiki/Gaussian_blur) is a smoothing filter that blends each pixel with its neighbors, weighting nearby pixels more heavily than distant ones according to a bell-shaped (Gaussian) curve. It is commonly used to soften an image or reduce noise.
+
+```python
+core.vsfeel.GaussBlur(clip, sigma=0.5, device_id=0, num_streams=1)
+```
+
+- clip:
+    The input clip. Supports 8/16 bit integer, 16 bit half float and 32 bit float input in Gray, YUV or RGB color families.
+
+- sigma: (Default: 0.5)
+    Blur sigma for each plane. Use an array to assign it for each plane, otherwise the second plane defaults to `sigma[0] / sqrt((1 << subSamplingH) * (1 << subSamplingW))` and the third to the second plane's value. Must be non-negative. A value below the machine epsilon copies the plane through unmodified.
+
+- device_id: (Default: 0)
+    Index of the Vulkan device to use.
+
+- num_streams: (Default: 1)
+    Number of command buffers submitted per frame, enables concurrent kernel execution and data transfer. Must be in range [1, 32].
+
 ## Manual Compilation
 
 ```bash
