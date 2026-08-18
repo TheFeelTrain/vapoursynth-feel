@@ -604,7 +604,8 @@ static std::variant<VkShaderModule, std::string> create_shader_module(
 
 static std::variant<VkPipeline, std::string> create_pipeline(
     const VK_Device & dev, VkShaderModule module, VkPipelineLayout layout,
-    uint32_t required_subgroup_size = 0, int32_t filter_type = -1) {
+    uint32_t required_subgroup_size = 0, int32_t filter_type = -1,
+    int32_t zmean = -1) {
 
     if (const char * dbg = getenv("VSFEEL_DFTTEST_DBG")) {
         fprintf(stderr, "[dfttest] create_pipeline required_subgroup_size=%u filter_type=%d\n",
@@ -624,15 +625,24 @@ static std::variant<VkPipeline, std::string> create_pipeline(
         .requiredSubgroupSize = subgroup_size
     };
 
-    VkSpecializationMapEntry spec_entries[1] {
-        { .constantID = 1, .offset = 0, .size = sizeof(int32_t) }
+    VkSpecializationMapEntry spec_entries[2] {
+        { .constantID = 1, .offset = 0, .size = sizeof(int32_t) },
+        { .constantID = 2, .offset = sizeof(int32_t), .size = sizeof(int32_t) }
     };
-    int32_t spec_filter_type = filter_type;
+    int32_t spec_values[2] = { filter_type, zmean };
+    uint32_t n_spec = 0;
+    if (filter_type >= 0) {
+        n_spec++;
+    }
+    if (zmean >= 0) {
+        spec_entries[n_spec] = { .constantID = 2, .offset = n_spec * sizeof(int32_t), .size = sizeof(int32_t) };
+        n_spec++;
+    }
     VkSpecializationInfo spec_info {
-        .mapEntryCount = (filter_type >= 0) ? 1u : 0u,
+        .mapEntryCount = n_spec,
         .pMapEntries = spec_entries,
-        .dataSize = (filter_type >= 0) ? sizeof(int32_t) : 0u,
-        .pData = (filter_type >= 0) ? &spec_filter_type : nullptr
+        .dataSize = n_spec * sizeof(int32_t),
+        .pData = (n_spec > 0) ? spec_values : nullptr
     };
 
     VkPipelineShaderStageCreateInfo stage_info {
@@ -1334,7 +1344,7 @@ static void VS_CC DftCreate(
         download_sum += cfg.download_bytes;
 
         cfg.spatial_offset = spatial_sum;
-        spatial_sum += nblk * d->tw * 256;   // floats
+        spatial_sum += nblk * 256;           // floats (center slice only)
 
         if (d->tw * pad_elems >= (1ll << 31) || nblk * 256 >= (1ll << 31)) {
             return set_error("frame too large (padded plane exceeds 2^31 elements).");
@@ -1667,7 +1677,8 @@ static void VS_CC DftCreate(
         }
         for (int r = 0; r < 4; ++r) {
             const auto result = create_pipeline(*d->device, d->fused_module[r], d->pipeline_layout,
-                d->device->subgroup_size_control ? 32 : 0, d->filter_type);
+                d->device->subgroup_size_control ? 32 : 0, d->filter_type,
+                d->zmean ? 1 : 0);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }

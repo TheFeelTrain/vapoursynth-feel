@@ -79,6 +79,7 @@
 // into each pipeline so the dead filter branches (and their divisions) vanish,
 // matching the reference's compile-time `#if FILTER_TYPE` selection.
 layout(constant_id = 1) const int FILTER_TYPE = 0;
+layout(constant_id = 2) const int ZMEAN = 1;
 
 layout(std430, binding = 0) readonly buffer WtBuf { float wt[]; };
 #if BITS == 16
@@ -138,9 +139,9 @@ int calc_pad_num(int size, int block_step) {
 void rdft16(inout float data[TD_SZ], int base) {
 #define R0(k) data[base + (k)]
 #define R1(k) data[base + (k) + 1]
-    const float KP923879532 = uintBitsToFloat(0x3f6c835eu);
-    const float KP707106781 = uintBitsToFloat(0x3f3504f3u);
-    const float KP414213562 = uintBitsToFloat(0x3ed413cdu);
+    const float KP923879532 = 0.9238795f;
+    const float KP707106781 = 0.70710677f;
+    const float KP414213562 = 0.41421357f;
 
     float T3, T6, T7, T49, T37, T10, T13, T14, T50, T40;
     float T22, T55, T34, T44, T29, T54, T35, T47, T38, T39, T53, T56;
@@ -259,8 +260,8 @@ void dft1(inout float data[TD_SZ], int base, int stride) {
 void dft3(inout float data[TD_SZ], int base, int stride) {
 #define RI(k) data[base + (k) * stride]
 #define II(k) data[base + (k) * stride + 1]
-    const float KP866025403 = uintBitsToFloat(0x3f5db3d7u);
-    const float KP500000000 = uintBitsToFloat(0x3f000000u);
+    const float KP866025403 = 0.8660254f;
+    const float KP500000000 = 0.5f;
 
     float T1, T9, T4, T12, T8, T10, T5, T11;
     T1 = RI(0);
@@ -292,10 +293,10 @@ void dft3(inout float data[TD_SZ], int base, int stride) {
 void dft5(inout float data[TD_SZ], int base, int stride) {
 #define RI(k) data[base + (k) * stride]
 #define II(k) data[base + (k) * stride + 1]
-    const float KP951056516 = uintBitsToFloat(0x3f737871u);
-    const float KP559016994 = uintBitsToFloat(0x3f0f1bbdu);
-    const float KP250000000 = uintBitsToFloat(0x3e800000u);
-    const float KP618033988 = uintBitsToFloat(0x3f1e377au);
+    const float KP951056516 = 0.95105654f;
+    const float KP559016994 = 0.559017f;
+    const float KP250000000 = 0.25f;
+    const float KP618033988 = 0.618034f;
 
     float T1, T21, T8, T29, T10, T28, T14, T26, T17, T24;
     T1 = RI(0);
@@ -360,12 +361,12 @@ void dft5(inout float data[TD_SZ], int base, int stride) {
 void dft7(inout float data[TD_SZ], int base, int stride) {
 #define RI(k) data[base + (k) * stride]
 #define II(k) data[base + (k) * stride + 1]
-    const float KP974927912 = uintBitsToFloat(0x3f7994e0u);
-    const float KP900968867 = uintBitsToFloat(0x3f66a5e5u);
-    const float KP692021471 = uintBitsToFloat(0x3f312852u);
-    const float KP801937735 = uintBitsToFloat(0x3f4d4bcbu);
-    const float KP554958132 = uintBitsToFloat(0x3f0e11bcu);
-    const float KP356895867 = uintBitsToFloat(0x3eb6bb0eu);
+    const float KP974927912 = 0.9749279f;
+    const float KP900968867 = 0.90096885f;
+    const float KP692021471 = 0.6920215f;
+    const float KP801937735 = 0.80193776f;
+    const float KP554958132 = 0.5549581f;
+    const float KP356895867 = 0.35689586f;
 
     float T1, T35, T4, T44, T10, T42, T7, T43, T11, T25;
     float T55, T50, T45, T30, T16, T37, T22, T38, T19, T36;
@@ -466,9 +467,9 @@ void dft7(inout float data[TD_SZ], int base, int stride) {
 void dft16(inout float data[TD_SZ], int base, int stride) {
 #define RI(k) data[base + (k) * stride]
 #define II(k) data[base + (k) * stride + 1]
-    const float KP923879532 = uintBitsToFloat(0x3f6c835eu);
-    const float KP414213562 = uintBitsToFloat(0x3ed413cdu);
-    const float KP707106781 = uintBitsToFloat(0x3f3504f3u);
+    const float KP923879532 = 0.9238795f;
+    const float KP414213562 = 0.41421357f;
+    const float KP707106781 = 0.70710677f;
 
     float T7, T115, T129, T38, T49, T95, T105, T83, T29, T126;
     float T141, T73, T78, T102, T123, T101, T14, T116, T130, T45;
@@ -722,8 +723,8 @@ void idft1(inout float data[TD_SZ], int base, int stride) {
 void idft3(inout float data[TD_SZ], int base, int stride) {
 #define RI(k) data[base + (k) * stride]
 #define II(k) data[base + (k) * stride + 1]
-    const float KP866025403 = uintBitsToFloat(0x3f5db3d7u);
-    const float KP500000000 = uintBitsToFloat(0x3f000000u);
+    const float KP866025403 = 0.8660254f;
+    const float KP500000000 = 0.5f;
 
     float T1, T5, T4, T10, T8, T12, T9, T11;
     T1 = RI(0);
@@ -755,10 +756,10 @@ void idft3(inout float data[TD_SZ], int base, int stride) {
 void idft5(inout float data[TD_SZ], int base, int stride) {
 #define RI(k) data[base + (k) * stride]
 #define II(k) data[base + (k) * stride + 1]
-    const float KP951056516 = uintBitsToFloat(0x3f737871u);
-    const float KP559016994 = uintBitsToFloat(0x3f0f1bbdu);
-    const float KP250000000 = uintBitsToFloat(0x3e800000u);
-    const float KP618033988 = uintBitsToFloat(0x3f1e377au);
+    const float KP951056516 = 0.95105654f;
+    const float KP559016994 = 0.559017f;
+    const float KP250000000 = 0.25f;
+    const float KP618033988 = 0.618034f;
 
     float T1, T21, T8, T29, T10, T28, T14, T26, T17, T24;
     T1 = RI(0);
@@ -823,12 +824,12 @@ void idft5(inout float data[TD_SZ], int base, int stride) {
 void idft7(inout float data[TD_SZ], int base, int stride) {
 #define RI(k) data[base + (k) * stride]
 #define II(k) data[base + (k) * stride + 1]
-    const float KP974927912 = uintBitsToFloat(0x3f7994e0u);
-    const float KP900968867 = uintBitsToFloat(0x3f66a5e5u);
-    const float KP692021471 = uintBitsToFloat(0x3f312852u);
-    const float KP801937735 = uintBitsToFloat(0x3f4d4bcbu);
-    const float KP356895867 = uintBitsToFloat(0x3eb6bb0eu);
-    const float KP554958132 = uintBitsToFloat(0x3f0e11bcu);
+    const float KP974927912 = 0.9749279f;
+    const float KP900968867 = 0.90096885f;
+    const float KP692021471 = 0.6920215f;
+    const float KP801937735 = 0.80193776f;
+    const float KP356895867 = 0.35689586f;
+    const float KP554958132 = 0.5549581f;
 
     float T1, T11, T4, T26, T10, T24, T7, T25, T27, T32;
     float T52, T47, T39, T37, T14, T43, T20, T44, T17, T42;
@@ -929,9 +930,9 @@ void idft7(inout float data[TD_SZ], int base, int stride) {
 void idft16(inout float data[TD_SZ], int base, int stride) {
 #define RI(k) data[base + (k) * stride]
 #define II(k) data[base + (k) * stride + 1]
-    const float KP923879532 = uintBitsToFloat(0x3f6c835eu);
-    const float KP414213562 = uintBitsToFloat(0x3ed413cdu);
-    const float KP707106781 = uintBitsToFloat(0x3f3504f3u);
+    const float KP923879532 = 0.9238795f;
+    const float KP414213562 = 0.41421357f;
+    const float KP707106781 = 0.70710677f;
 
     float T7, T115, T129, T38, T49, T95, T105, T83, T29, T126;
     float T141, T73, T78, T99, T123, T98, T14, T116, T130, T45;
@@ -1184,10 +1185,10 @@ void idft16(inout float data[TD_SZ], int base, int stride) {
 void irdft16(inout float data[TD_SZ], int base) {
 #define R0(k) data[base + (k)]
 #define R1(k) data[base + (k) + 1]
-    const float KP1_847759065 = uintBitsToFloat(0x3fec835eu);
-    const float KP414213562 = uintBitsToFloat(0x3ed413cdu);
-    const float KP1_414213562 = uintBitsToFloat(0x3fb504f3u);
-    const float KP2_000000000 = uintBitsToFloat(0x40000000u);
+    const float KP1_847759065 = 1.847759f;
+    const float KP414213562 = 0.41421357f;
+    const float KP1_414213562 = 1.4142135f;
+    const float KP2_000000000 = 2.0f;
 
     float T5, T47, T19, T39, T8, T48, T24, T40, T12, T51;
     float T15, T52, T30, T35, T53, T50, T43, T42;
@@ -1507,13 +1508,13 @@ void temporal_idft(inout float data[TD_SZ], int base) {
     const int IDX = (i * 16 + j) * 2; \
     float RE = d[IDX]; float IM = d[IDX + 1]; \
     float V1 = 0.0; float V2 = 0.0; \
-    if (pc.wf_base >= 0) { \
-        V1 = s_gf[sub] * wt[pc.wf_base + ((i * 16 + j) * 9 + lane) * 2 + 0]; \
-        V2 = s_gf[sub] * wt[pc.wf_base + ((i * 16 + j) * 9 + lane) * 2 + 1]; \
+    if (ZMEAN != 0) { \
+        V1 = gf * wt[pc.wf_base + ((i * 16 + j) * 9 + lane) * 2 + 0]; \
+        V2 = gf * wt[pc.wf_base + ((i * 16 + j) * 9 + lane) * 2 + 1]; \
         RE -= V1; IM -= V2; \
     } \
     filter_value(RE, IM, lane, j, i); \
-    if (pc.wf_base >= 0) { RE += V1; IM += V2; } \
+    if (ZMEAN != 0) { RE += V1; IM += V2; } \
     d[IDX] = RE; d[IDX + 1] = IM; \
 }
 #define FILTER_ALL_1(d) FILTER_BIN(d,0,0) FILTER_BIN(d,0,1) FILTER_BIN(d,0,2) FILTER_BIN(d,0,3) FILTER_BIN(d,0,4) FILTER_BIN(d,0,5) FILTER_BIN(d,0,6) FILTER_BIN(d,0,7) FILTER_BIN(d,0,8) FILTER_BIN(d,0,9) FILTER_BIN(d,0,10) FILTER_BIN(d,0,11) FILTER_BIN(d,0,12) FILTER_BIN(d,0,13) FILTER_BIN(d,0,14) FILTER_BIN(d,0,15)
@@ -1615,12 +1616,16 @@ void main() {
         }
 
         // zero-mean: DC gain broadcast from lane 0
-        if (pc.wf_base >= 0) {
+        if (ZMEAN != 0) {
             if (lane == 0) {
                 s_gf[sub] = td[0] / wt[pc.wf_base];
             }
         }
         subgroupBarrier();
+        float gf = 0.0;
+        if (ZMEAN != 0) {
+            gf = s_gf[sub];
+        }
 
         if (lane < 9) {
             // frequency filtering
@@ -1652,7 +1657,7 @@ void main() {
         }
         subgroupBarrier();
         // write the block's center slice into the spatial buffer
-        const int dst_base = pc.spatial_base + (block_id * TW + RADIUS) * 256;
+        const int dst_base = pc.spatial_base + block_id * 256;
         for (int j = 0; j < 16; ++j) {
             spatial[dst_base + j * 16 + lane] = trans[tsub + 2 * (lane * TSTRIDE + j) + 0];
         }
@@ -1671,10 +1676,9 @@ layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
 void main() {
     const int pw = calc_pad_size(pc.width, pc.block_step);
     const int ph = calc_pad_size(pc.height, pc.block_step);
-    const int hn = calc_pad_num(pc.width, pc.block_step);
-    const int vn = calc_pad_num(pc.height, pc.block_step);
-    const int tw = 2 * pc.radius + 1;
-    const int pad_x = (pw - pc.width) / 2;
+            const int hn = calc_pad_num(pc.width, pc.block_step);
+            const int vn = calc_pad_num(pc.height, pc.block_step);
+            const int pad_x = (pw - pc.width) / 2;
     const int pad_y = (ph - pc.height) / 2;
 
     for (int y = int(gl_GlobalInvocationID.y); y < ph; y += int(gl_NumWorkGroups.y) * 8) {
@@ -1693,7 +1697,7 @@ void main() {
                 const int offset_y = y - i * pc.block_step;
                 for (int j = j1; j <= j2; ++j) {
                     const int offset_x = x - j * pc.block_step;
-                    const int src_offset = (((i * hn + j) * tw + pc.radius) * 16 + offset_y) * 16 + offset_x;
+                    const int src_offset = ((i * hn + j) * 16 + offset_y) * 16 + offset_x;
                     const int window_offset = (pc.radius * 16 + offset_y) * 16 + offset_x;
                     sum += spatial[pc.spatial_base + src_offset] * wt[pc.wt_base + window_offset];
                 }
