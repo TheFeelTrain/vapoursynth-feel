@@ -109,6 +109,9 @@ if(VK_GLSLC)
     # float); the fused kernel is additionally compiled per temporal radius
     # (0..3, i.e. tbsize 1/3/5/7) so its loops unroll and the working array
     # stays in registers (the reference does the same via `#define RADIUS`).
+    # The fused kernel uses subgroup barriers instead of workgroup barriers
+    # (each 16-lane block lives entirely in one wavefront), so SPIR-V 1.3+ is
+    # required.
     set(VK_DFT_ENTRIES pad col2im)
     set(VK_DFT_BITS "16" "32")
     foreach(bits IN LISTS VK_DFT_BITS)
@@ -119,24 +122,26 @@ if(VK_GLSLC)
             else()
                 list(APPEND defs -DENTRY_COL2IM)
             endif()
-            list(APPEND VK_SPV_OUTPUTS "${VK_SPV_DIR}/dfttest_${bits}_${entry}.spv")
+            set(raw_spv "${VK_SPV_DIR}/dfttest_${bits}_${entry}.spv")
+            list(APPEND VK_SPV_OUTPUTS "${raw_spv}")
             add_custom_command(
-                OUTPUT "${VK_SPV_DIR}/dfttest_${bits}_${entry}.spv"
+                OUTPUT "${raw_spv}"
                 COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
-                COMMAND ${VK_GLSLC} -O -fshader-stage=compute ${defs}
-                        -o "${VK_SPV_DIR}/dfttest_${bits}_${entry}.spv"
+                COMMAND ${VK_GLSLC} --target-env=vulkan1.3 -O -fshader-stage=compute ${defs}
+                        -o "${raw_spv}"
                         "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
                 DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
                 VERBATIM)
         endforeach()
         foreach(radius RANGE 0 3)
-            list(APPEND VK_SPV_OUTPUTS "${VK_SPV_DIR}/dfttest_${bits}_fused_r${radius}.spv")
+            set(raw_spv "${VK_SPV_DIR}/dfttest_${bits}_fused_r${radius}.spv")
+            list(APPEND VK_SPV_OUTPUTS "${raw_spv}")
             add_custom_command(
-                OUTPUT "${VK_SPV_DIR}/dfttest_${bits}_fused_r${radius}.spv"
+                OUTPUT "${raw_spv}"
                 COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
-                COMMAND ${VK_GLSLC} -O -fshader-stage=compute -DBITS=${bits}
+                COMMAND ${VK_GLSLC} --target-env=vulkan1.3 -O -fshader-stage=compute -DBITS=${bits}
                         -DENTRY_FUSED -DRADIUS=${radius}
-                        -o "${VK_SPV_DIR}/dfttest_${bits}_fused_r${radius}.spv"
+                        -o "${raw_spv}"
                         "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
                 DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
                 VERBATIM)

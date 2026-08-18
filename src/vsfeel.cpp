@@ -63,7 +63,7 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
             .applicationVersion = VK_MAKE_API_VERSION(0, 1, 0, 0),
             .pEngineName = "vsfeel",
             .engineVersion = VK_MAKE_API_VERSION(0, 1, 0, 0),
-            .apiVersion = VK_API_VERSION_1_2
+            .apiVersion = VK_API_VERSION_1_4
         };
 
         VkInstanceCreateInfo instance_info {
@@ -109,6 +109,24 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     vkGetPhysicalDeviceProperties(dev->physical_device, &props);
     dev->limits = props.limits;
 
+    VkPhysicalDeviceSubgroupSizeControlProperties subgroup_props {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES,
+        .pNext = nullptr
+    };
+    VkPhysicalDeviceProperties2 props2 {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &subgroup_props
+    };
+    vkGetPhysicalDeviceProperties2(dev->physical_device, &props2);
+    if (subgroup_props.minSubgroupSize && subgroup_props.maxSubgroupSize) {
+        dev->min_subgroup_size = subgroup_props.minSubgroupSize;
+        dev->max_subgroup_size = subgroup_props.maxSubgroupSize;
+    }
+    dev->subgroup_size_control =
+        dev->min_subgroup_size <= 32 && 32 <= dev->max_subgroup_size;
+    fprintf(stderr, "[vsfeel] subgroup_size_control=%d min=%u max=%u\n",
+        dev->subgroup_size_control, dev->min_subgroup_size, dev->max_subgroup_size);
+
     vkGetPhysicalDeviceMemoryProperties(dev->physical_device, &dev->mem_props);
 
     // Pick a compute-capable queue family, prefer the one with the most queues
@@ -149,16 +167,36 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     VkPhysicalDeviceFeatures features {};
     features.shaderFloat64 = VK_TRUE;
 
+    VkPhysicalDeviceVulkan11Features vulkan11_features {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+        .pNext = nullptr,
+        .storageBuffer16BitAccess = VK_TRUE,
+        .uniformAndStorageBuffer16BitAccess = VK_TRUE,
+        .storagePushConstant16 = VK_FALSE,
+        .storageInputOutput16 = VK_FALSE
+    };
+
+    VkPhysicalDeviceSubgroupSizeControlFeatures subgroup_features {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES,
+        .pNext = &vulkan11_features,
+        .subgroupSizeControl = VK_TRUE,
+        .computeFullSubgroups = VK_FALSE
+    };
+
+    const char * device_exts[] = {
+        VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME
+    };
+
     VkDeviceCreateInfo device_info {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = nullptr,
+        .pNext = &subgroup_features,
         .flags = 0,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &queue_info,
         .enabledLayerCount = 0,
         .ppEnabledLayerNames = nullptr,
-        .enabledExtensionCount = 0,
-        .ppEnabledExtensionNames = nullptr,
+        .enabledExtensionCount = 1,
+        .ppEnabledExtensionNames = device_exts,
         .pEnabledFeatures = &features
     };
 

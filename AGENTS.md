@@ -73,16 +73,23 @@ runs it. Plugins are described separately in `PLUGINS`.
   - `python3 benchmark/bench.py --filter <name> vsfeel vszipcl` — a subset of
     plugins, to compare against references
   - `--frames N`, `--num-streams N`, `--clip PATH` to control the run
-- The default clip is `/home/encode/test/jpbd.mkv` (1920x1080, YUV420PS).
+- The default clip is `/home/encode/test/jpbd.mkv` (1920x1080, YUV420P8).
+- Always benchmark on **both** the real input clip and the synthetic
+  `--synthetic` clip. The real clip is decoded via BestSource (~631 fps ceiling)
+  so filter speedups are invisible there; the synthetic BlankClip is the primary
+  metric for measuring filter throughput. The real clip stays as a smoke test
+  for the full input chain.
 
 To benchmark a single filter against the references:
 
 ```bash
 MANGOHUD=0 python3 benchmark/bench.py --filter dfttest vsfeel vszipcl vszipcu
+MANGOHUD=0 python3 benchmark/bench.py --synthetic --filter dfttest vsfeel vszipcl vszipcu
 ```
 
 This prints fps for each plugin and ranks them. Compare vsfeel's fps against
-the fastest reference.
+the fastest reference. Prefer `--synthetic` for judging optimizations (the real
+clip is decode-bound); confirm the real clip still behaves afterwards.
 
 ## Building
 
@@ -117,6 +124,12 @@ afraid to search for hints. Search even when you think you don't need to — it
 is always better to have more information. Look up relevant topics such as
 GPU/Vulkan/GLSL/RDNA3 performance, shader optimization techniques, and the
 reference projects' own documentation and discussions.
+
+## Commits
+
+Do not make any commits yourself. If you want a commit or a checkpoint, stop
+and ask the user to make it for you. Leave your changes staged/unstaged in the
+working tree and describe what should be committed.
 
 ## Typical workflow
 

@@ -1,5 +1,10 @@
 #version 450
 
+#if BITS == 16
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+#extension GL_KHR_shader_subgroup_basic : require
+
 /*
  * DFTTest — 3D block-wise frequency denoiser (Vulkan port of the vszipcu
  * dfttest.cu / vs-dfttest2 hiprtc dft_kernels.hpp + kernel.hpp reference
@@ -73,9 +78,14 @@
 layout(constant_id = 0) const int UNUSED_CID = 0;
 
 layout(std430, binding = 0) readonly buffer WtBuf { float wt[]; };
+#if BITS == 16
+layout(std430, binding = 1) buffer StagingBuf { uint16_t staging16[]; };
+layout(std430, binding = 3) buffer PaddedBuf { uint16_t padded16[]; };
+#else
 layout(std430, binding = 1) buffer StagingBuf { uint staging_raw[]; };
-layout(std430, binding = 2) buffer SpatialBuf { float spatial[]; };
 layout(std430, binding = 3) buffer PaddedBuf { uint padded_raw[]; };
+#endif
+layout(std430, binding = 2) buffer SpatialBuf { float spatial[]; };
 
 layout(push_constant) uniform PushConstants {
     int padded_base;    // byte offset of the padded source region in padded buffer
@@ -1297,40 +1307,46 @@ float to_float(uint raw) {
 
 // the fused kernel reads the padded source from the device-local padded buffer
 uint load_raw(int sample_idx) {
+#if BITS == 16
+    return uint(padded16[(pc.padded_base >> 1) + sample_idx]);
+#else
     int byte = pc.padded_base + sample_idx * ELEM_BYTES;
     uint word = padded_raw[byte >> 2];
     return (word >> (8 * (byte & 3))) & ELEM_MASK;
+#endif
 }
 
 // the pad kernel reads the tight upload rows from the staging buffer
 uint load_upload(int sample_idx) {
+#if BITS == 16
+    return uint(staging16[(pc.src_base >> 1) + sample_idx]);
+#else
     int byte = pc.src_base + sample_idx * ELEM_BYTES;
     uint word = staging_raw[byte >> 2];
     return (word >> (8 * (byte & 3))) & ELEM_MASK;
+#endif
 }
 
 void store_sample(int sample_idx, float v) {
-    int byte = pc.dst_base + sample_idx * ELEM_BYTES;
 #if BITS == 32
+    int byte = pc.dst_base + sample_idx * ELEM_BYTES;
     staging_raw[byte >> 2] = floatBitsToUint(v / SCALE);
 #else
     float x = v / SCALE;
     x = clamp(x + 0.5, 0.0, PEAK);
-    uint val = uint(x) & ELEM_MASK;
-    atomicOr(staging_raw[byte >> 2], val << (8 * (byte & 3)));
+    staging16[(pc.dst_base >> 1) + sample_idx] = uint16_t(uint(x) & ELEM_MASK);
 #endif
 }
 
 // the pad kernel writes the padded source into the device-local buffer
 void store_padded(int sample_idx, float v) {
-    int byte = pc.padded_base + sample_idx * ELEM_BYTES;
 #if BITS == 32
+    int byte = pc.padded_base + sample_idx * ELEM_BYTES;
     padded_raw[byte >> 2] = floatBitsToUint(v / SCALE);
 #else
     float x = v / SCALE;
     x = clamp(x + 0.5, 0.0, PEAK);
-    uint val = uint(x) & ELEM_MASK;
-    atomicOr(padded_raw[byte >> 2], val << (8 * (byte & 3)));
+    padded16[(pc.padded_base >> 1) + sample_idx] = uint16_t(uint(x) & ELEM_MASK);
 #endif
 }
 
@@ -1440,17 +1456,17 @@ void temporal_idft(inout float data[TD_SZ], int base) {
 }
 #define SPATIAL_SLICE(d, i) { \
     const int B = (i) * 32; \
-    barrier(); \
+    subgroupBarrier(); \
     for (int j = 0; j < 16; ++j) { trans[tsub + 2 * (j * TSTRIDE + lane) + 0] = d[B + j]; } \
-    barrier(); \
+    subgroupBarrier(); \
     for (int j = 0; j < 16; ++j) { d[B + j] = trans[tsub + 2 * (lane * TSTRIDE + j) + 0]; } \
-    barrier(); \
+    subgroupBarrier(); \
     rdft16(d, B); \
     for (int j = 0; j < 9; ++j) { \
         trans[tsub + 2 * (lane * TSTRIDE + j) + 0] = d[B + 2 * j]; \
         trans[tsub + 2 * (lane * TSTRIDE + j) + 1] = d[B + 2 * j + 1]; \
     } \
-    barrier(); \
+    subgroupBarrier(); \
     if (lane < 9) { \
         for (int j = 0; j < 16; ++j) { \
             d[B + 2 * j] = trans[tsub + 2 * (j * TSTRIDE + lane) + 0]; \
@@ -1552,7 +1568,7 @@ void main() {
 #if defined(ENTRY_FUSED)
 
 #ifndef SUB_BLOCKS
-#define SUB_BLOCKS 4   // blocks processed per workgroup (4 * 16 = 64 threads, one wavefront on RDNA)
+#define SUB_BLOCKS 8   // blocks processed per workgroup (8 * 16 = 128 threads, 2 wave64 on RDNA)
 #endif
 
 shared float trans[SUB_BLOCKS * 2 * 16 * TSTRIDE];
@@ -1598,7 +1614,7 @@ void main() {
                 s_gf[sub] = td[0] / wt[pc.wf_base];
             }
         }
-        barrier();
+        subgroupBarrier();
 
         if (lane < 9) {
             // frequency filtering
@@ -1609,7 +1625,7 @@ void main() {
 
         // inverse y-transform of the center slice + transpose back to rows
         const int cbase = RADIUS * 32;
-        barrier();
+        subgroupBarrier();
         if (lane < 9) {
             idft16(td, cbase, 1);
             for (int j = 0; j < 16; ++j) {
@@ -1617,18 +1633,18 @@ void main() {
                 trans[tsub + 2 * (j * TSTRIDE + lane) + 1] = td[cbase + 2 * j + 1];
             }
         }
-        barrier();
+        subgroupBarrier();
         for (int j = 0; j < 9; ++j) {
             td[cbase + 2 * j] = trans[tsub + 2 * (lane * TSTRIDE + j) + 0];
             td[cbase + 2 * j + 1] = trans[tsub + 2 * (lane * TSTRIDE + j) + 1];
         }
         irdft16(td, cbase);
-        barrier();
+        subgroupBarrier();
         // transpose store of the row data (irdft emits the sequence reversed)
         for (int j = 0; j < 16; ++j) {
             trans[tsub + 2 * (j * TSTRIDE + lane) + 0] = td[cbase + (j == 0 ? 0 : 16 - j)];
         }
-        barrier();
+        subgroupBarrier();
         // write the block's center slice into the spatial buffer
         const int dst_base = pc.spatial_base + (block_id * TW + RADIUS) * 256;
         for (int j = 0; j < 16; ++j) {

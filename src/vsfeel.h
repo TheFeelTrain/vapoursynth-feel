@@ -61,6 +61,9 @@ struct VK_Device {
     VkPhysicalDeviceLimits limits {};
     uint32_t queue_family {};
     uint32_t queue_count {};
+    uint32_t min_subgroup_size { 64 };
+    uint32_t max_subgroup_size { 64 };
+    bool subgroup_size_control { false };
     std::vector<VK_Queue> queues {};
     std::atomic<intptr_t> refcount { 0 };
 };

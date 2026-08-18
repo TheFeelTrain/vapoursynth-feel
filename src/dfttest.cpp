@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
@@ -478,7 +479,21 @@ struct DftData {
     std::vector<VK_Resource> resources;
     std::mutex resources_lock;
 
+    // ---- debug timing accumulators ----
+    std::atomic<uint64_t> t_acquire_ns {0}, t_upload_ns {0}, t_submit_ns {0},
+        t_wait_ns {0}, t_download_ns {0}, t_total_ns {0};
+    std::atomic<uint64_t> nframes {0};
+
     ~DftData() {
+        uint64_t n = nframes.load();
+        if (n) {
+            fprintf(stderr,
+                "[dfttest-timing] frames=%llu avg_total=%.3fms acquire=%.3fms upload=%.3fms submit=%.3fms wait=%.3fms download=%.3fms\n",
+                (unsigned long long)n,
+                t_total_ns.load() / 1e6 / n, t_acquire_ns.load() / 1e6 / n,
+                t_upload_ns.load() / 1e6 / n, t_submit_ns.load() / 1e6 / n,
+                t_wait_ns.load() / 1e6 / n, t_download_ns.load() / 1e6 / n);
+        }
         if (!device) {
             return;
         }
@@ -588,11 +603,29 @@ static std::variant<VkShaderModule, std::string> create_shader_module(
 }
 
 static std::variant<VkPipeline, std::string> create_pipeline(
-    const VK_Device & dev, VkShaderModule module, VkPipelineLayout layout) {
+    const VK_Device & dev, VkShaderModule module, VkPipelineLayout layout,
+    uint32_t required_subgroup_size = 0) {
+
+    if (const char * dbg = getenv("VSFEEL_DFTTEST_DBG")) {
+        fprintf(stderr, "[dfttest] create_pipeline required_subgroup_size=%u\n", required_subgroup_size);
+    }
+
+    uint32_t subgroup_size = required_subgroup_size;
+    if (const char * sw = getenv("VSFEEL_DFTTEST_SGSIZE")) {
+        subgroup_size = atoi(sw);
+    }
+    if (const char * sw = getenv("VSFEEL_DFTTEST_SGSIZE_INVALID")) {
+        subgroup_size = 17;   // invalid on purpose, to test driver validation
+    }
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+        .pNext = nullptr,
+        .requiredSubgroupSize = subgroup_size
+    };
 
     VkPipelineShaderStageCreateInfo stage_info {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .pNext = nullptr,
+        .pNext = subgroup_size ? &subgroup_size_info : nullptr,
         .flags = 0,
         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
         .module = module,
@@ -620,8 +653,14 @@ static std::variant<VkPipeline, std::string> create_pipeline(
 }
 
 // Records the per-plane fused + col2im dispatch sequence.
-static std::optional<std::string> record_command_buffer(
-    const DftData & d, VK_Resource & resource) {
+static bool trivial_kernels() {
+    static const bool v = getenv("VSFEEL_DFTTEST_TRIVIAL") != nullptr;
+    return v;
+}
+
+// bench_stage: 0 = pad only, 1 = pad+fused, 2 = pad+fused+col2im (full)
+static std::optional<std::string> record_command_buffer_stage(
+    const DftData & d, VK_Resource & resource, int bench_stage) {
 
     VkDevice dev = d.device->device;
 
@@ -636,9 +675,6 @@ static std::optional<std::string> record_command_buffer(
         return "vkBeginCommandBuffer failed";
     }
 
-    // the 8/16-bit io kernels use masked atomicOr for sub-dword stores, so
-    // their download regions (staging) and padded regions (device-local) must
-    // be cleared before every submission
     if (d.need_fill) {
         vkCmdFillBuffer(resource.cmd, resource.staging,
             d.upload_total, d.download_total, 0);
@@ -694,6 +730,9 @@ static std::optional<std::string> record_command_buffer(
         if (!d.process[plane]) {
             continue;
         }
+        if (trivial_kernels()) {
+            continue;
+        }
         const auto & cfg = d.planes[plane];
 
         PushConstants pc = base;
@@ -720,6 +759,9 @@ static std::optional<std::string> record_command_buffer(
                 (static_cast<uint32_t>(cfg.ph) + 7) / 8, max_grid_y);
             vkCmdDispatch(resource.cmd, std::max(grid_x, 1u), std::max(grid_y, 1u), 1);
         }
+        if (bench_stage == 0) {
+            continue;
+        }
 
         // the fused kernel reads the pad kernel's writes
         {
@@ -744,6 +786,9 @@ static std::optional<std::string> record_command_buffer(
             const uint32_t sub_blocks = blocks / 4 + (blocks % 4 != 0 ? 1 : 0);
             const uint32_t grid_x = std::min<uint32_t>(sub_blocks, max_grid_x);
             vkCmdDispatch(resource.cmd, std::max(grid_x, 1u), 1, 1);
+        }
+        if (bench_stage == 1) {
+            continue;
         }
 
         // the col2im kernel reads the fused kernel's writes
@@ -778,6 +823,11 @@ static std::optional<std::string> record_command_buffer(
     }
 
     return std::nullopt;
+}
+
+static std::optional<std::string> record_command_buffer(
+    const DftData & d, VK_Resource & resource) {
+    return record_command_buffer_stage(d, resource, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -816,7 +866,9 @@ static const VSFrame *VS_CC DftGetFrame(
         VSFrame * dst = vsapi->newVideoFrame2(
             &d->vi->format, d->vi->width, d->vi->height, fr, pl, center, core);
 
+        auto t0 = std::chrono::steady_clock::now();
         d->semaphore.acquire();
+        auto t1 = std::chrono::steady_clock::now();
         d->resources_lock.lock();
         auto resource = std::move(d->resources.back());
         d->resources.pop_back();
@@ -835,8 +887,45 @@ static const VSFrame *VS_CC DftGetFrame(
             return nullptr;
         };
 
+        if (const char * gb = getenv("VSFEEL_DFTTEST_GPU_BENCH"); gb && n == 0) {
+            VkDevice dev0 = d->device->device;
+            const int iters = atoi(gb);
+            auto bench_stage = [&](int stage, const char * name) {
+                if (record_command_buffer_stage(*d, resource, stage)) {
+                    return;
+                }
+                auto gb_start = std::chrono::steady_clock::now();
+                for (int i = 0; i < iters; ++i) {
+                    std::lock_guard lock(*resource.queue_lock);
+                    vkResetFences(dev0, 1, &resource.fence);
+                    VkSubmitInfo submit_info {
+                        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .pNext = nullptr,
+                        .waitSemaphoreCount = 0,
+                        .pWaitSemaphores = nullptr,
+                        .pWaitDstStageMask = nullptr,
+                        .commandBufferCount = 1,
+                        .pCommandBuffers = &resource.cmd,
+                        .signalSemaphoreCount = 0,
+                        .pSignalSemaphores = nullptr
+                    };
+                    vkQueueSubmit(resource.queue, 1, &submit_info, resource.fence);
+                    vkWaitForFences(dev0, 1, &resource.fence, VK_TRUE, UINT64_MAX);
+                }
+                auto gb_end = std::chrono::steady_clock::now();
+                double ms = std::chrono::duration_cast<std::chrono::nanoseconds>(gb_end - gb_start).count() / 1e6 / iters;
+                fprintf(stderr, "[dfttest-gpubench] %-20s %.4f ms\n", name, ms);
+            };
+            bench_stage(0, "pad");
+            bench_stage(1, "pad+fused");
+            bench_stage(2, "pad+fused+col2im");
+            record_command_buffer(*d, resource);
+        }
+
         VkDevice dev = d->device->device;
         float * map = resource.map;
+
+        auto t2 = std::chrono::steady_clock::now();
 
         const bool coherent =
             !!(d->device->mem_props.memoryTypes[resource.staging_type_index].propertyFlags &
@@ -886,6 +975,8 @@ static const VSFrame *VS_CC DftGetFrame(
             checkVK(vkFlushMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
         }
 
+        auto t3 = std::chrono::steady_clock::now();
+
         {
             std::lock_guard lock(*resource.queue_lock);
 
@@ -906,7 +997,9 @@ static const VSFrame *VS_CC DftGetFrame(
             checkVK(vkQueueSubmit(resource.queue, 1, &submit_info, resource.fence));
         }
 
+        auto t4 = std::chrono::steady_clock::now();
         checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
+        auto t5 = std::chrono::steady_clock::now();
 
         if (!coherent) {
             std::vector<VkMappedMemoryRange> ranges;
@@ -947,6 +1040,15 @@ static const VSFrame *VS_CC DftGetFrame(
         d->resources.push_back(std::move(resource));
         d->resources_lock.unlock();
         d->semaphore.release();
+
+        auto t6 = std::chrono::steady_clock::now();
+        d->t_acquire_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        d->t_upload_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+        d->t_submit_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t4 - t3).count();
+        d->t_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t5 - t4).count();
+        d->t_download_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t6 - t5).count();
+        d->t_total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t6 - t0).count();
+        d->nframes.fetch_add(1, std::memory_order::relaxed);
 
         for (int t = 0; t < tw; ++t) {
             vsapi->freeFrame(src[t]);
@@ -1360,6 +1462,12 @@ static void VS_CC DftCreate(
 
     VkDevice dev = d->device->device;
 
+    int effective_streams = std::max(d->num_streams, 8);
+    if (const char * es = getenv("VSFEEL_DFTTEST_STREAMS")) {
+        effective_streams = atoi(es);
+        if (effective_streams < 1) effective_streams = 1;
+    }
+
     // ------------------------------------------------------------------
     // Pipeline layout, descriptor set layout and descriptor pool
     // ------------------------------------------------------------------
@@ -1404,14 +1512,14 @@ static void VS_CC DftCreate(
     }
     {
         VkDescriptorPoolSize pool_size {
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * static_cast<uint32_t>(std::max(d->num_streams, 8))
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * static_cast<uint32_t>(effective_streams)
         };
 
         VkDescriptorPoolCreateInfo pool_info {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .maxSets = static_cast<uint32_t>(std::max(d->num_streams, 8)),
+            .maxSets = static_cast<uint32_t>(effective_streams),
             .poolSizeCount = 1,
             .pPoolSizes = &pool_size
         };
@@ -1538,21 +1646,24 @@ static void VS_CC DftCreate(
             d->col2im_module = std::get<VkShaderModule>(result);
         }
         {
-            const auto result = create_pipeline(*d->device, d->pad_module, d->pipeline_layout);
+            const auto result = create_pipeline(*d->device, d->pad_module, d->pipeline_layout,
+                d->device->subgroup_size_control ? 32 : 0);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
             d->pad_pipeline = std::get<VkPipeline>(result);
         }
         for (int r = 0; r < 4; ++r) {
-            const auto result = create_pipeline(*d->device, d->fused_module[r], d->pipeline_layout);
+            const auto result = create_pipeline(*d->device, d->fused_module[r], d->pipeline_layout,
+                d->device->subgroup_size_control ? 32 : 0);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
             d->fused_pipeline[r] = std::get<VkPipeline>(result);
         }
         {
-            const auto result = create_pipeline(*d->device, d->col2im_module, d->pipeline_layout);
+            const auto result = create_pipeline(*d->device, d->col2im_module, d->pipeline_layout,
+                d->device->subgroup_size_control ? 32 : 0);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -1569,8 +1680,7 @@ static void VS_CC DftCreate(
     const VkDeviceSize spatial_size = std::max<VkDeviceSize>(
         d->spatial_total * sizeof(float), min_size);
 
-    d->need_fill = d->bits != 32;
-    const int effective_streams = std::max(d->num_streams, 8);
+    d->need_fill = false;   // plain typed stores write every element; no zeroing needed
     d->semaphore.current.store(effective_streams - 1, std::memory_order::relaxed);
     d->resources.reserve(effective_streams);
 

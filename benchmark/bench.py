@@ -16,6 +16,7 @@ Usage:
     python3 benchmark/bench.py --filter gaussblur vsfeel vszipcl # subset of plugins
     python3 benchmark/bench.py --filter gaussblur --gauss-sigma 5.0
     python3 benchmark/bench.py --frames 500 --clip /path/to/input.mkv
+    python3 benchmark/bench.py --synthetic          # BlankClip: no decode bottleneck
 """
 
 import argparse
@@ -28,13 +29,23 @@ from typing import Any, Callable
 
 DEFAULT_CLIP = "/home/encode/test/jpbd.mkv"
 
-VSPIPE_TEMPLATE = """\
+def make_vpy(clip: str, extra: str, chain: str, frames: int, synth_format: str | None) -> str:
+    if synth_format:
+        # synthetic clip: measure pure filter throughput, no decode bottleneck
+        clip_expr = (
+            "core.std.BlankClip(width=1920, height=1080, "
+            f"format={synth_format}, length={frames})"
+        )
+    else:
+        clip_expr = f"BestSource(cachepath=None).source({clip!r}, 32)"
+    return f"""\
 from vssource import BestSource
 from vstools import core, depth, get_y
+import vapoursynth as vs
 
 core.max_cache_size = 1024 * 56
 
-clip = BestSource(cachepath=None).source({clip!r}, 32)
+clip = {clip_expr}
 
 {extra}
 
@@ -91,6 +102,7 @@ class FilterSpec:
     args: list[Arg]
     build: Callable[[argparse.Namespace, str], dict[str, str]]
     input: str = "depth(get_y(clip), 16)"  # clip expression the filter is applied to
+    synth_format: str | None = "vs.GRAY16"  # BlankClip format for --synthetic (None disables)
 
 
 def _bm3d_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
@@ -164,6 +176,7 @@ FILTERS: dict[str, FilterSpec] = {
         ],
         build=_bm3d_build,
         input="depth(get_y(clip), 32)",
+        synth_format="vs.GRAYS",
     ),
     "bilateral": FilterSpec(
         title="Bilateral",
@@ -222,11 +235,13 @@ def run_vspipe(vpy_path: Path, frames: int) -> float | None:
     return None
 
 
-def bench(plugin: str, chain: str, clip: str, frames: int) -> float | None:
-    vpy = VSPIPE_TEMPLATE.format(
+def bench(plugin: str, chain: str, clip: str, frames: int, synth_format: str | None) -> float | None:
+    vpy = make_vpy(
         clip=clip,
         extra=PLUGINS[plugin].loader or "",
         chain=chain,
+        frames=frames,
+        synth_format=synth_format,
     )
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"bench_{plugin}.vpy"
@@ -253,12 +268,14 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
         sys.exit(f"no valid plugins requested for --filter {ns.filter}")
 
     frames = ns.frames or spec.default_frames
-    print(f"{spec.title} benchmark | {frames} frames | clip: {ns.clip}")
+    synth = spec.synth_format if ns.synthetic else None
+    clip_desc = f"BlankClip 1920x1080 {synth.removeprefix('vs.')}" if synth else str(ns.clip)
+    print(f"{spec.title} benchmark | {frames} frames | clip: {clip_desc}")
     print(f"args: {args_desc(spec, ns)}\n")
 
     results = []
     for plugin in plugins:
-        fps = bench(plugin, calls[plugin], ns.clip, frames)
+        fps = bench(plugin, calls[plugin], ns.clip, frames, synth)
         results.append((plugin, fps))
         if fps is None:
             print(f"  {plugin:10s}  unavailable / failed")
@@ -290,6 +307,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-streams", type=int, default=None,
                         help="num_streams passed to the filters (default: 1, or the reference default)")
     parser.add_argument("--clip", default=DEFAULT_CLIP, help="input clip path")
+    parser.add_argument("--synthetic", action="store_true",
+                        help="use a synthetic 1920x1080 YUV420PS BlankClip instead of --clip "
+                             "(decoder-independent, measures pure filter throughput)")
 
     for spec in FILTERS.values():
         for arg in spec.args:
