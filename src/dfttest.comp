@@ -75,7 +75,10 @@
 // stays in registers instead of spilling to scratch.
 #define TD_SZ (TW * 32)
 
-layout(constant_id = 0) const int UNUSED_CID = 0;
+// Filter type as a specialization constant: the host bakes the filter variant
+// into each pipeline so the dead filter branches (and their divisions) vanish,
+// matching the reference's compile-time `#if FILTER_TYPE` selection.
+layout(constant_id = 1) const int FILTER_TYPE = 0;
 
 layout(std430, binding = 0) readonly buffer WtBuf { float wt[]; };
 #if BITS == 16
@@ -101,7 +104,7 @@ layout(push_constant) uniform PushConstants {
     int height;         // frame plane height
     int src_stride;     // upload plane row stride in elements
     int dst_stride;     // frame plane row stride in elements
-    int filter_type;
+    int filter_type;    // runtime fallback (unused when FILTER_TYPE is defined at build time)
     float sigma;        // scaled scalar sigma (used when sigma_base < 0)
     float sigma2;
     float pmin;
@@ -1367,7 +1370,7 @@ void filter_value(inout float re, inout float im, int x, int y, int t) {
     float beta = pc.beta;
     float multiplier = 0.0;
 
-    if (pc.filter_type == 2) {
+    if (FILTER_TYPE == 2) {
         re *= sigma;
         im *= sigma;
         return;
@@ -1375,26 +1378,29 @@ void filter_value(inout float re, inout float im, int x, int y, int t) {
 
     float psd = re * re + im * im;
 
-    if (pc.filter_type == 1) {
+    if (FILTER_TYPE == 1) {
         if (psd < sigma) {
             re = 0.0;
             im = 0.0;
         }
         return;
-    } else if (pc.filter_type == 0) {
-        multiplier = max((psd - sigma) / (psd + 1e-15), 0.0);
-    } else if (pc.filter_type == 3) {
+    } else if (FILTER_TYPE == 3) {
         if (psd >= pmin && psd <= pmax) {
             multiplier = sigma;
         } else {
             multiplier = sigma2;
         }
-    } else if (pc.filter_type == 4) {
-        multiplier = sigma * sqrt(psd * (pmax / ((psd + pmin) * (psd + pmax) + 1e-15)));
-    } else if (pc.filter_type == 5) {
-        multiplier = pow(max((psd - sigma) / (psd + 1e-15), 0.0), beta);
     } else {
-        multiplier = sqrt(max((psd - sigma) / (psd + 1e-15), 0.0));
+        float x0 = max((psd - sigma) / (psd + 1e-15), 0.0);
+        if (FILTER_TYPE == 4) {
+            multiplier = sigma * sqrt(psd * (pmax / ((psd + pmin) * (psd + pmax) + 1e-15)));
+        } else if (FILTER_TYPE == 5) {
+            multiplier = pow(x0, beta);
+        } else if (FILTER_TYPE == 6) {
+            multiplier = sqrt(x0);
+        } else {
+            multiplier = x0;
+        }
     }
 
     re *= multiplier;

@@ -91,6 +91,44 @@ This prints fps for each plugin and ranks them. Compare vsfeel's fps against
 the fastest reference. Prefer `--synthetic` for judging optimizations (the real
 clip is decode-bound); confirm the real clip still behaves afterwards.
 
+## Comparing a vsfeel kernel against the reference kernels
+
+When a vsfeel filter is slower than a reference on the same GPU, the win is
+almost always in kernel *codegen* or *launch structure*, not the algorithm.
+Both references (vszipcl = OpenCL/ROCm, vszipcu = HIP/ROCm) run on the same
+RX 7900XTX, so a fair comparison is possible. Method that worked for DFTTest:
+
+1. **Profile each GPU kernel of the references directly** before theorizing.
+   For ROCm references use `rocprofv3 -S --kernel-trace --memory-copy-trace --
+   vspipe test.py /dev/null` with a synthetic BlankClip input (decode never
+   hides the kernels). This gives per-kernel times in µs; time your own kernels
+   the same way (`VSFEEL_DFTTEST_GPU_BENCH=N`, or `RADV_DEBUG=shaderstats`).
+   Correlate structural differences (frame caches, launch config, stream/queue
+   counts) against the numbers before trusting any theory — e.g. the DFTTest
+   frame cache was worth only ~+24%, NOT the whole lead.
+2. **Compare compiled instruction streams, not just time.** OpenCL reference
+   kernels can be disassembled offline:
+   `/opt/rocm/llvm/bin/clang -x cl -target amdgcn-amd-amdhsa -mcpu=gfx1100 -O3
+   -cl-std=CL1.2 -cl-denorms-are-zero <prefix+kernel>.cl` then `llvm-objdump -d`.
+   For our SPIR-V, `RADV_DEBUG=asm` dumps the ACO ISA; `RADV_DEBUG=shaderstats`
+   prints VGPR/LDS/occupancy. Count total instructions and the FP-op
+   distribution (v_fma, v_rcp, v_mov, s_mov, v_dual_*). A 3x instruction-count
+   gap means ~2.5x time.
+3. **Find the bloat source in the higher-level IR first.** DFTTest's culprit
+   was `filter_type` as a **runtime push constant**: all 7 filter branches
+   stayed alive with full-precision divisions (193 OpFDiv) while OpenCL's
+   `#if FILTER_TYPE` compile-time template kept 49 v_rcp. Fix: make it a Vulkan
+   **specialization constant** (`layout(constant_id = N)`, `VkSpecializationInfo`
+   at pipeline creation, `if (FILTER_TYPE == ...)` chains — `#if` can't see spec
+   constants but an if on a spec constant folds). Result: 7644 → 4371
+   instructions, 486 → 552 fps.
+4. **Check the host dispatch matches the shader's workgroup config.** A stale
+   `blocks/4` grid with a `SUB_BLOCKS=8` shader launches 2x idle workgroups.
+
+General lesson: make every branch that is fixed per invocation (filter type,
+bit depth, window shape) a specialization constant or `#if` so the shader
+compiles to its cheapest form.
+
 ## Building
 
 The build uses CMake + `glslc` (Vulkan shader compiler).

@@ -604,10 +604,11 @@ static std::variant<VkShaderModule, std::string> create_shader_module(
 
 static std::variant<VkPipeline, std::string> create_pipeline(
     const VK_Device & dev, VkShaderModule module, VkPipelineLayout layout,
-    uint32_t required_subgroup_size = 0) {
+    uint32_t required_subgroup_size = 0, int32_t filter_type = -1) {
 
     if (const char * dbg = getenv("VSFEEL_DFTTEST_DBG")) {
-        fprintf(stderr, "[dfttest] create_pipeline required_subgroup_size=%u\n", required_subgroup_size);
+        fprintf(stderr, "[dfttest] create_pipeline required_subgroup_size=%u filter_type=%d\n",
+            required_subgroup_size, filter_type);
     }
 
     uint32_t subgroup_size = required_subgroup_size;
@@ -623,6 +624,17 @@ static std::variant<VkPipeline, std::string> create_pipeline(
         .requiredSubgroupSize = subgroup_size
     };
 
+    VkSpecializationMapEntry spec_entries[1] {
+        { .constantID = 1, .offset = 0, .size = sizeof(int32_t) }
+    };
+    int32_t spec_filter_type = filter_type;
+    VkSpecializationInfo spec_info {
+        .mapEntryCount = (filter_type >= 0) ? 1u : 0u,
+        .pMapEntries = spec_entries,
+        .dataSize = (filter_type >= 0) ? sizeof(int32_t) : 0u,
+        .pData = (filter_type >= 0) ? &spec_filter_type : nullptr
+    };
+
     VkPipelineShaderStageCreateInfo stage_info {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
         .pNext = subgroup_size ? &subgroup_size_info : nullptr,
@@ -630,7 +642,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
         .module = module,
         .pName = "main",
-        .pSpecializationInfo = nullptr
+        .pSpecializationInfo = &spec_info
     };
 
     VkComputePipelineCreateInfo pipeline_info {
@@ -775,7 +787,7 @@ static std::optional<std::string> record_command_buffer_stage(
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
         }
 
-        // fused kernel (SUB_BLOCKS=4 blocks per 64-thread workgroup)
+        // fused kernel (SUB_BLOCKS=8 blocks per 128-thread workgroup)
         vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.fused_pipeline[d.radius]);
         vkCmdBindDescriptorSets(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
@@ -783,7 +795,7 @@ static std::optional<std::string> record_command_buffer_stage(
             0, sizeof(PushConstants), &pc);
         {
             const uint32_t blocks = static_cast<uint32_t>(cfg.num_blocks);
-            const uint32_t sub_blocks = blocks / 4 + (blocks % 4 != 0 ? 1 : 0);
+            const uint32_t sub_blocks = blocks / 8 + (blocks % 8 != 0 ? 1 : 0);
             const uint32_t grid_x = std::min<uint32_t>(sub_blocks, max_grid_x);
             vkCmdDispatch(resource.cmd, std::max(grid_x, 1u), 1, 1);
         }
@@ -1655,7 +1667,7 @@ static void VS_CC DftCreate(
         }
         for (int r = 0; r < 4; ++r) {
             const auto result = create_pipeline(*d->device, d->fused_module[r], d->pipeline_layout,
-                d->device->subgroup_size_control ? 32 : 0);
+                d->device->subgroup_size_control ? 32 : 0, d->filter_type);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
