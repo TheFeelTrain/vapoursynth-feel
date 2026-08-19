@@ -8,7 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <numbers>
 #include <optional>
 #include <string>
@@ -387,6 +389,8 @@ struct PlaneConfig {
     VkDeviceSize download_offset {};// staging byte offset of the output region
     VkDeviceSize download_bytes {}; // h * width * bytes (tight rows)
     VkDeviceSize spatial_offset {}; // float element offset into the spatial buffer
+    VkDeviceSize slot_offset {};    // slot buffer byte offset of this plane's slot region
+    VkDeviceSize slot_plane_bytes {}; // pw * ph * bytes (one padded plane)
 };
 
 struct VK_Resource {
@@ -397,7 +401,8 @@ struct VK_Resource {
     VkBuffer spatial_buf {};        // device-local float block buffer
     VkDeviceMemory spatial_mem {};
     VkCommandPool pool {};
-    VkCommandBuffer cmd {};
+    VkCommandBuffer cmd {};      // pre-recorded fused + col2im
+    VkCommandBuffer cmd2 {};     // per-frame prepare (slot pads + D2D copies)
     VkFence fence {};
     VkDescriptorSet desc_set {};
     VkQueue queue {};
@@ -411,6 +416,7 @@ struct PushConstants {
     int32_t spatial_base;   // float element offset into the spatial buffer
     int32_t dst_base;       // byte offset of the download region in staging
     int32_t src_base;       // byte offset of the upload region in staging
+    int32_t pad_t0;         // temporal plane the pad kernel processes (frame cache)
     int32_t wt_base;        // float element offset of window[] in wt
     int32_t wf_base;        // float element offset of window_freq[] in wt (-1 if !zmean)
     int32_t sigma_base;     // float element offset of sigma[] in wt (-1 if scalar)
@@ -454,9 +460,11 @@ struct DftData {
     VkPipelineLayout pipeline_layout {};
     VkDescriptorPool desc_pool {};
     VkShaderModule pad_module {};
+    VkShaderModule pad_slot_module {};
     VkShaderModule col2im_module {};
     VkShaderModule fused_module[4] {};
     VkPipeline pad_pipeline {};
+    VkPipeline pad_slot_pipeline {};
     VkPipeline col2im_pipeline {};
     VkPipeline fused_pipeline[4] {};
 
@@ -473,6 +481,18 @@ struct DftData {
     VkDeviceSize download_total {}; // output region (staging)
     VkDeviceSize padded_total {};   // padded planes region (device-local)
     VkDeviceSize spatial_total {};  // float elements across planes
+    VkDeviceSize slot_total {};     // frame-cache slot region (device-local)
+
+    // padded-source frame cache: each source frame is reflect-pad'd once into a
+    // slot and reused across the tw-frame window via D2D copies (vszipcl-style).
+    // Only used for num_streams == 1 (single queue): with multiple queues a
+    // cross-queue semaphore wait could be scheduled before its signal, so the
+    // multi-stream path falls back to padding every frame (no cross-frame deps).
+    bool use_cache {};
+    VkBuffer slot_buf {};
+    VkDeviceMemory slot_mem {};
+    int slot_count {};                            // K slots per plane
+    std::unique_ptr<std::atomic<long long>[]> slot_owner {}; // source frame in each slot
     bool need_fill {};
     std::array<PlaneConfig, 3> planes {};
     ticket_semaphore semaphore;
@@ -523,7 +543,7 @@ struct DftData {
                 vkDestroyBuffer(dev, resource.spatial_buf, nullptr);
             }
             if (resource.cmd) {
-                vkFreeCommandBuffers(dev, resource.pool, 1, &resource.cmd);
+                vkFreeCommandBuffers(dev, resource.pool, 2, &resource.cmd);
             }
             if (resource.pool) {
                 vkDestroyCommandPool(dev, resource.pool, nullptr);
@@ -531,6 +551,13 @@ struct DftData {
             if (resource.fence) {
                 vkDestroyFence(dev, resource.fence, nullptr);
             }
+        }
+
+        if (slot_mem) {
+            vkFreeMemory(dev, slot_mem, nullptr);
+        }
+        if (slot_buf) {
+            vkDestroyBuffer(dev, slot_buf, nullptr);
         }
 
         if (wt_map) {
@@ -545,6 +572,9 @@ struct DftData {
 
         if (pad_pipeline) {
             vkDestroyPipeline(dev, pad_pipeline, nullptr);
+        }
+        if (pad_slot_pipeline) {
+            vkDestroyPipeline(dev, pad_slot_pipeline, nullptr);
         }
         for (auto & p : fused_pipeline) {
             if (p) {
@@ -565,6 +595,9 @@ struct DftData {
         }
         if (pad_module) {
             vkDestroyShaderModule(dev, pad_module, nullptr);
+        }
+        if (pad_slot_module) {
+            vkDestroyShaderModule(dev, pad_slot_module, nullptr);
         }
         for (auto & m : fused_module) {
             if (m) {
@@ -680,54 +713,26 @@ static bool trivial_kernels() {
     return v;
 }
 
-// bench_stage: 0 = pad only, 1 = pad+fused, 2 = pad+fused+col2im (full)
-static std::optional<std::string> record_command_buffer_stage(
-    const DftData & d, VK_Resource & resource, int bench_stage) {
+// Frame-cache slot operation for one (plane, temporal slice) of an output
+// frame: the source frame f is either new (padded into its slot now) or
+// already cached (D2D-copied from its slot).
+struct SlotOp {
+    int plane {};
+    int t {};
+    long long f {};
+    int slot {};
+    VkDeviceSize slot_base {};
+    bool is_pad {};
+    int which {};  // for reads: n - pad_frame (0 = same frame, no wait)
+};
 
-    VkDevice dev = d.device->device;
-
-    VkCommandBufferBeginInfo begin_info {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .pInheritanceInfo = nullptr
-    };
-
-    if (vkBeginCommandBuffer(resource.cmd, &begin_info) != VK_SUCCESS) {
-        return "vkBeginCommandBuffer failed";
-    }
-
-    if (d.need_fill) {
-        vkCmdFillBuffer(resource.cmd, resource.staging,
-            d.upload_total, d.download_total, 0);
-        {
-            VkMemoryBarrier mem_barrier {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
-            };
-            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
-        }
-        vkCmdFillBuffer(resource.cmd, resource.padded_buf, 0, d.padded_total, 0);
-        {
-            VkMemoryBarrier mem_barrier {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
-            };
-            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
-        }
-    }
-
-    const PushConstants base {
+static PushConstants base_pc(const DftData & d) {
+    return PushConstants {
         .padded_base = 0,
         .spatial_base = 0,
         .dst_base = 0,
         .src_base = 0,
+        .pad_t0 = 0,
         .wt_base = 0,
         .wf_base = d.wf_base,
         .sigma_base = d.sigma_base,
@@ -744,7 +749,193 @@ static std::optional<std::string> record_command_buffer_stage(
         .pmax = d.pmax,
         .beta = d.beta
     };
+}
 
+// Records the per-frame prepare command buffer (resource.cmd2): reflect-pad
+// the new source frames into the shared slots, then D2D-copy all tw padded
+// planes into the resource's padded buffer (which the pre-recorded
+// fused+col2im command buffer reads). With the multi-stream fallback it
+// instead pads every temporal slice directly (no slots).
+static std::optional<std::string> record_prepare_cb(
+    const DftData & d, VK_Resource & resource, const std::vector<SlotOp> & ops) {
+
+    const VkDevice dev = d.device->device;
+    VkCommandBuffer cmd = resource.cmd2;
+
+    VkCommandBufferBeginInfo begin_info {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .pInheritanceInfo = nullptr
+    };
+    if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
+        return "vkBeginCommandBuffer (prepare) failed";
+    }
+
+    if (!trivial_kernels()) {
+        const PushConstants base = base_pc(d);
+        const uint32_t max_grid_x = d.device->limits.maxComputeWorkGroupCount[0];
+        const uint32_t max_grid_y = d.device->limits.maxComputeWorkGroupCount[1];
+
+        if (d.use_cache) {
+            // frame cache: pad the new source frames into their slots
+            for (const SlotOp & op : ops) {
+                if (!op.is_pad) {
+                    continue;
+                }
+                const auto & cfg = d.planes[op.plane];
+                PushConstants pc = base;
+                pc.padded_base = static_cast<int32_t>(op.slot_base);
+                // the slot kernel applies the temporal offset itself
+                // (pc.pad_t0 * up_slice); do not add it here as well
+                pc.src_base = static_cast<int32_t>(cfg.upload_offset);
+                pc.pad_t0 = op.t;
+                pc.width = cfg.width;
+                pc.height = cfg.height;
+                pc.src_stride = cfg.width;
+                pc.dst_stride = cfg.width;
+
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.pad_slot_pipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
+                vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                    0, sizeof(PushConstants), &pc);
+                const uint32_t gx = std::min<uint32_t>(
+                    (static_cast<uint32_t>(cfg.pw) + 31) / 32, max_grid_x);
+                const uint32_t gy = std::min<uint32_t>(
+                    (static_cast<uint32_t>(cfg.ph) + 7) / 8, max_grid_y);
+                vkCmdDispatch(cmd, std::max(gx, 1u), std::max(gy, 1u), 1);
+            }
+
+            // the pad writes must be visible to the D2D copies below
+            bool any_pad = false;
+            for (const SlotOp & op : ops) {
+                any_pad = any_pad || op.is_pad;
+            }
+            if (any_pad) {
+                VkMemoryBarrier mem_barrier {
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT
+                };
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+            }
+
+            // D2D: every slot -> this resource's padded planes
+            for (const SlotOp & op : ops) {
+                const auto & cfg = d.planes[op.plane];
+                VkBufferCopy copy {
+                    .srcOffset = op.slot_base,
+                    .dstOffset = cfg.padded_offset +
+                        static_cast<VkDeviceSize>(op.t) * cfg.slot_plane_bytes,
+                    .size = cfg.slot_plane_bytes
+                };
+                vkCmdCopyBuffer(cmd, d.slot_buf, resource.padded_buf, 1, &copy);
+            }
+
+            // the copies must be visible to the fused kernel (next command buffer)
+            VkMemoryBarrier mem_barrier {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+            };
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+        } else {
+            // multi-stream path: pad every temporal slice of every plane
+            // directly into the resource's padded buffer (no frame cache)
+            for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
+                if (!d.process[plane]) {
+                    continue;
+                }
+                const auto & cfg = d.planes[plane];
+                PushConstants pc = base;
+                pc.padded_base = static_cast<int32_t>(cfg.padded_offset);
+                pc.src_base = static_cast<int32_t>(cfg.upload_offset);
+                pc.pad_t0 = 0;
+                pc.width = cfg.width;
+                pc.height = cfg.height;
+                pc.src_stride = cfg.width;
+                pc.dst_stride = cfg.width;
+
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.pad_pipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
+                vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                    0, sizeof(PushConstants), &pc);
+                const uint32_t gx = std::min<uint32_t>(
+                    (static_cast<uint32_t>(cfg.pw) + 31) / 32, max_grid_x);
+                const uint32_t gy = std::min<uint32_t>(
+                    (static_cast<uint32_t>(cfg.ph) + 7) / 8, max_grid_y);
+                vkCmdDispatch(cmd, std::max(gx, 1u), std::max(gy, 1u), 1);
+            }
+
+            // the pad writes must be visible to the fused kernel (next command buffer)
+            VkMemoryBarrier mem_barrier {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+            };
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+        }
+    }
+
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        return "vkEndCommandBuffer (prepare) failed";
+    }
+    return std::nullopt;
+}
+
+// Records the pre-recorded fused + col2im command buffer (resource.cmd).
+static std::optional<std::string> record_fused_col2im_cb(
+    const DftData & d, VK_Resource & resource,
+    bool with_fused, bool with_col2im) {
+
+    const VkDevice dev = d.device->device;
+    VkCommandBuffer cmd = resource.cmd;
+
+    VkCommandBufferBeginInfo begin_info {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .pInheritanceInfo = nullptr
+    };
+    if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
+        return "vkBeginCommandBuffer (fused) failed";
+    }
+
+    if (d.need_fill) {
+        vkCmdFillBuffer(cmd, resource.staging,
+            d.upload_total, d.download_total, 0);
+        {
+            VkMemoryBarrier mem_barrier {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+            };
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+        }
+        vkCmdFillBuffer(cmd, resource.padded_buf, 0, d.padded_total, 0);
+        {
+            VkMemoryBarrier mem_barrier {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+            };
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+        }
+    }
+
+    const PushConstants base = base_pc(d);
     const uint32_t max_grid_x = d.device->limits.maxComputeWorkGroupCount[0];
     const uint32_t max_grid_y = d.device->limits.maxComputeWorkGroupCount[1];
 
@@ -767,95 +958,55 @@ static std::optional<std::string> record_command_buffer_stage(
         pc.src_stride = cfg.width;
         pc.dst_stride = cfg.width;
 
-        // pad kernel: reflection-pad the tight upload rows into the device-local
-        // padded buffer
-        vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.pad_pipeline);
-        vkCmdBindDescriptorSets(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
-        vkCmdPushConstants(resource.cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-            0, sizeof(PushConstants), &pc);
-        {
-            const uint32_t grid_x = std::min<uint32_t>(
-                (static_cast<uint32_t>(cfg.pw) + 31) / 32, max_grid_x);
-            const uint32_t grid_y = std::min<uint32_t>(
-                (static_cast<uint32_t>(cfg.ph) + 7) / 8, max_grid_y);
-            vkCmdDispatch(resource.cmd, std::max(grid_x, 1u), std::max(grid_y, 1u), 1);
-        }
-        if (bench_stage == 0) {
-            continue;
-        }
-
-        // the fused kernel reads the pad kernel's writes
-        {
-            VkMemoryBarrier mem_barrier {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
-            };
-            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
-        }
-
-        // fused kernel (SUB_BLOCKS=8 blocks per 128-thread workgroup)
-        vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.fused_pipeline[d.radius]);
-        vkCmdBindDescriptorSets(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
-        vkCmdPushConstants(resource.cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-            0, sizeof(PushConstants), &pc);
-        {
+        if (with_fused) {
+            // fused kernel (SUB_BLOCKS=8 blocks per 128-thread workgroup)
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                d.fused_pipeline[d.radius]);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
+            vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                0, sizeof(PushConstants), &pc);
             const uint32_t blocks = static_cast<uint32_t>(cfg.num_blocks);
             const uint32_t sub_blocks = blocks / 8 + (blocks % 8 != 0 ? 1 : 0);
             const uint32_t grid_x = std::min<uint32_t>(sub_blocks, max_grid_x);
-            vkCmdDispatch(resource.cmd, std::max(grid_x, 1u), 1, 1);
-        }
-        if (bench_stage == 1) {
-            continue;
+            vkCmdDispatch(cmd, std::max(grid_x, 1u), 1, 1);
         }
 
-        // the col2im kernel reads the fused kernel's writes
-        {
+        if (with_col2im) {
+            // the col2im kernel reads the fused kernel's writes
             VkMemoryBarrier mem_barrier {
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .pNext = nullptr,
                 .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
             };
-            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
-        }
 
-        // col2im kernel
-        vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.col2im_pipeline);
-        vkCmdBindDescriptorSets(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
-        vkCmdPushConstants(resource.cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-            0, sizeof(PushConstants), &pc);
-        {
+            // col2im kernel
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.col2im_pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
+            vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                0, sizeof(PushConstants), &pc);
             const uint32_t grid_x = std::min<uint32_t>(
                 (static_cast<uint32_t>(cfg.pw) + 31) / 32, max_grid_x);
             const uint32_t grid_y = std::min<uint32_t>(
                 (static_cast<uint32_t>(cfg.ph) + 7) / 8, max_grid_y);
-            vkCmdDispatch(resource.cmd, std::max(grid_x, 1u), std::max(grid_y, 1u), 1);
+            vkCmdDispatch(cmd, std::max(grid_x, 1u), std::max(grid_y, 1u), 1);
         }
     }
 
-    if (vkEndCommandBuffer(resource.cmd) != VK_SUCCESS) {
-        return "vkEndCommandBuffer failed";
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        return "vkEndCommandBuffer (fused) failed";
     }
-
     return std::nullopt;
 }
 
 static std::optional<std::string> record_command_buffer(
     const DftData & d, VK_Resource & resource) {
-    return record_command_buffer_stage(d, resource, 2);
+    return record_fused_col2im_cb(d, resource, true, true);
 }
-
-// ---------------------------------------------------------------------------
-// Frame processing
-// ---------------------------------------------------------------------------
-
 static const VSFrame *VS_CC DftGetFrame(
     int n, int activationReason, void *instanceData, void **frameData,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
@@ -889,6 +1040,14 @@ static const VSFrame *VS_CC DftGetFrame(
             &d->vi->format, d->vi->width, d->vi->height, fr, pl, center, core);
 
         auto t0 = std::chrono::steady_clock::now();
+
+        // Note on the frame cache and out-of-order processing: no
+        // cross-frame synchronization is needed. The slot_owner atomics
+        // decide who pads a slot (the first frame that touches it, in
+        // wall-clock order; the store happens before that frame's submit)
+        // and who reads it (every later frame, whose submit is therefore
+        // strictly after the pad's submit). With a single queue the GPU
+        // executes the pad before the copy by queue ordering alone.
         d->semaphore.acquire();
         auto t1 = std::chrono::steady_clock::now();
         d->resources_lock.lock();
@@ -909,41 +1068,6 @@ static const VSFrame *VS_CC DftGetFrame(
             return nullptr;
         };
 
-        if (const char * gb = getenv("VSFEEL_DFTTEST_GPU_BENCH"); gb && n == 0) {
-            VkDevice dev0 = d->device->device;
-            const int iters = atoi(gb);
-            auto bench_stage = [&](int stage, const char * name) {
-                if (record_command_buffer_stage(*d, resource, stage)) {
-                    return;
-                }
-                auto gb_start = std::chrono::steady_clock::now();
-                for (int i = 0; i < iters; ++i) {
-                    std::lock_guard lock(*resource.queue_lock);
-                    vkResetFences(dev0, 1, &resource.fence);
-                    VkSubmitInfo submit_info {
-                        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                        .pNext = nullptr,
-                        .waitSemaphoreCount = 0,
-                        .pWaitSemaphores = nullptr,
-                        .pWaitDstStageMask = nullptr,
-                        .commandBufferCount = 1,
-                        .pCommandBuffers = &resource.cmd,
-                        .signalSemaphoreCount = 0,
-                        .pSignalSemaphores = nullptr
-                    };
-                    vkQueueSubmit(resource.queue, 1, &submit_info, resource.fence);
-                    vkWaitForFences(dev0, 1, &resource.fence, VK_TRUE, UINT64_MAX);
-                }
-                auto gb_end = std::chrono::steady_clock::now();
-                double ms = std::chrono::duration_cast<std::chrono::nanoseconds>(gb_end - gb_start).count() / 1e6 / iters;
-                fprintf(stderr, "[dfttest-gpubench] %-20s %.4f ms\n", name, ms);
-            };
-            bench_stage(0, "pad");
-            bench_stage(1, "pad+fused");
-            bench_stage(2, "pad+fused+col2im");
-            record_command_buffer(*d, resource);
-        }
-
         VkDevice dev = d->device->device;
         float * map = resource.map;
 
@@ -953,9 +1077,13 @@ static const VSFrame *VS_CC DftGetFrame(
             !!(d->device->mem_props.memoryTypes[resource.staging_type_index].propertyFlags &
                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-        // copy the tight (unpadded) rows of every source plane of the temporal
-        // window into the staging upload region; the pad kernel mirrors them
-        // into the device-local padded buffer
+        // Padded-source frame cache: each source frame of the temporal window is
+        // either already reflect-pad'd into its slot (D2D copy) or new (upload +
+        // pad into the slot now). A slot's semaphore is signaled when its pad
+        // completes; readers wait on it.
+        std::vector<SlotOp> ops;
+        ops.reserve(d->vi->format.numPlanes * tw);
+        std::vector<VkMappedMemoryRange> flush_ranges;
         for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
             if (!d->process[plane]) {
                 continue;
@@ -963,65 +1091,161 @@ static const VSFrame *VS_CC DftGetFrame(
             const auto & cfg = d->planes[plane];
             const size_t row_bytes = static_cast<size_t>(cfg.width) * d->bytes;
             for (int t = 0; t < tw; ++t) {
-                const uint8_t * srcp = vsapi->getReadPtr(src[t], plane);
-                const int src_stride = vsapi->getStride(src[t], plane);
-                uint8_t * dstp = reinterpret_cast<uint8_t *>(map) + cfg.upload_offset +
-                    static_cast<size_t>(t) * cfg.upload_bytes / tw;
-                if (src_stride == static_cast<int>(row_bytes)) {
-                    copy_stream_out(dstp, srcp, static_cast<size_t>(cfg.height) * row_bytes);
-                } else {
-                    for (int y = 0; y < cfg.height; ++y) {
-                        copy_stream_out(dstp + static_cast<size_t>(y) * row_bytes,
-                            srcp + static_cast<size_t>(y) * src_stride, row_bytes);
-                    }
+                const int idx = std::clamp(n - d->radius + t, 0, d->vi->numFrames - 1);
+                const int slot = static_cast<int>(idx % d->slot_count);
+                SlotOp op;
+                op.plane = plane;
+                op.t = t;
+                op.f = idx;
+                op.slot = slot;
+                op.slot_base = cfg.slot_offset +
+                    static_cast<VkDeviceSize>(slot) * cfg.slot_plane_bytes;
+                bool do_pad = !d->use_cache;
+                if (d->use_cache) {
+                    const bool force_pad = getenv("VSFEEL_DFTTEST_FORCEPAD") != nullptr;
+                    do_pad = force_pad ||
+                        d->slot_owner[plane * d->slot_count + slot].load(std::memory_order_relaxed) != idx;
                 }
+                if (do_pad) {
+                    op.which = 0;
+                    op.is_pad = true;
+                    const uint8_t * srcp = vsapi->getReadPtr(src[t], plane);
+                    const int src_stride = vsapi->getStride(src[t], plane);
+                    uint8_t * dstp = reinterpret_cast<uint8_t *>(map) + cfg.upload_offset +
+                        static_cast<size_t>(t) * cfg.upload_bytes / tw;
+                    if (src_stride == static_cast<int>(row_bytes)) {
+                        copy_stream_out(dstp, srcp, static_cast<size_t>(cfg.height) * row_bytes);
+                    } else {
+                        for (int y = 0; y < cfg.height; ++y) {
+                            copy_stream_out(dstp + static_cast<size_t>(y) * row_bytes,
+                                srcp + static_cast<size_t>(y) * src_stride, row_bytes);
+                        }
+                    }
+                    if (!coherent) {
+                        flush_ranges.push_back(VkMappedMemoryRange {
+                            .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                            .pNext = nullptr,
+                            .memory = resource.staging_mem,
+                            .offset = cfg.upload_offset +
+                                static_cast<size_t>(t) * cfg.upload_bytes / tw,
+                            .size = cfg.upload_bytes / tw,
+                        });
+                    }
+                    if (d->use_cache) {
+                        d->slot_owner[plane * d->slot_count + slot]
+                            .store(idx, std::memory_order_relaxed);
+                    }
+                } else {
+                    // the slot was pad'd by the first frame that used source idx
+                    const int pad_frame = std::max(0, idx - d->radius);
+                    op.which = n - pad_frame;
+                }
+                ops.push_back(op);
             }
         }
 
-        if (!coherent) {
-            std::vector<VkMappedMemoryRange> ranges;
-            ranges.reserve(d->vi->format.numPlanes);
-            for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-                if (!d->process[plane]) {
-                    continue;
-                }
-                const auto & cfg = d->planes[plane];
-                ranges.push_back(VkMappedMemoryRange {
-                    .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                    .pNext = nullptr,
-                    .memory = resource.staging_mem,
-                    .offset = cfg.upload_offset,
-                    .size = cfg.upload_bytes,
-                });
-            }
-            checkVK(vkFlushMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
+        if (!flush_ranges.empty()) {
+            checkVK(vkFlushMappedMemoryRanges(dev,
+                static_cast<uint32_t>(flush_ranges.size()), flush_ranges.data()));
         }
 
         auto t3 = std::chrono::steady_clock::now();
+
+        if (const char * gb = getenv("VSFEEL_DFTTEST_GPU_BENCH"); gb && n == 0) {
+            VkDevice dev0 = d->device->device;
+            const int iters = atoi(gb);
+            auto bench_stage = [&](int stage, const char * name) {
+                if (record_prepare_cb(*d, resource, ops)) {
+                    return;
+                }
+                if (record_fused_col2im_cb(*d, resource, stage >= 1, stage >= 2)) {
+                    return;
+                }
+                auto gb_start = std::chrono::steady_clock::now();
+                for (int i = 0; i < iters; ++i) {
+                    std::lock_guard lock(*resource.queue_lock);
+                    vkResetFences(dev0, 1, &resource.fence);
+                    VkCommandBuffer cbs[2] { resource.cmd2, resource.cmd };
+                    VkSubmitInfo si {
+                        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .pNext = nullptr,
+                        .commandBufferCount = stage >= 1 ? 2u : 1u,
+                        .pCommandBuffers = cbs
+                    };
+                    vkQueueSubmit(resource.queue, 1, &si, resource.fence);
+                    vkWaitForFences(dev0, 1, &resource.fence, VK_TRUE, UINT64_MAX);
+                }
+                auto gb_end = std::chrono::steady_clock::now();
+                double ms = std::chrono::duration_cast<std::chrono::nanoseconds>(gb_end - gb_start).count() / 1e6 / iters;
+                fprintf(stderr, "[dfttest-gpubench] %-20s %.4f ms\n", name, ms);
+            };
+            bench_stage(0, "pad");
+            bench_stage(1, "pad+fused");
+            bench_stage(2, "pad+fused+col2im");
+        }
+
+        if (const auto err = record_prepare_cb(*d, resource, ops)) {
+            set_error(*err);
+            return nullptr;
+        }
+        if (const auto err = record_fused_col2im_cb(*d, resource, true, true)) {
+            set_error(*err);
+            return nullptr;
+        }
 
         {
             std::lock_guard lock(*resource.queue_lock);
 
             checkVK(vkResetFences(dev, 1, &resource.fence));
 
-            VkSubmitInfo submit_info {
+            VkCommandBuffer cbs[2] { resource.cmd2, resource.cmd };
+            VkSubmitInfo si {
                 .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                 .pNext = nullptr,
-                .waitSemaphoreCount = 0,
-                .pWaitSemaphores = nullptr,
-                .pWaitDstStageMask = nullptr,
-                .commandBufferCount = 1,
-                .pCommandBuffers = &resource.cmd,
-                .signalSemaphoreCount = 0,
-                .pSignalSemaphores = nullptr
+                .commandBufferCount = 2,
+                .pCommandBuffers = cbs
             };
 
-            checkVK(vkQueueSubmit(resource.queue, 1, &submit_info, resource.fence));
+            checkVK(vkQueueSubmit(resource.queue, 1, &si, resource.fence));
         }
 
         auto t4 = std::chrono::steady_clock::now();
         checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
         auto t5 = std::chrono::steady_clock::now();
+
+        if (const char * dp = getenv("VSFEEL_DFTTEST_DUMP_PAD"); dp && n == atoi(dp)) {
+            VkDeviceSize dump_size = 0;
+            for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
+                if (d->process[plane]) {
+                    dump_size = d->planes[plane].padded_bytes;
+                }
+            }
+            {
+                VkCommandBufferAllocateInfo ai {
+                    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                    .commandPool = resource.pool,
+                    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                    .commandBufferCount = 1
+                };
+                VkCommandBuffer dcmd;
+                checkVK(vkAllocateCommandBuffers(dev, &ai, &dcmd));
+                VkCommandBufferBeginInfo bi { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                vkBeginCommandBuffer(dcmd, &bi);
+                VkBufferCopy bc { .srcOffset = 0, .dstOffset = 0, .size = dump_size };
+                vkCmdCopyBuffer(dcmd, resource.padded_buf, resource.staging, 1, &bc);
+                vkEndCommandBuffer(dcmd);
+                vkResetFences(dev, 1, &resource.fence);
+                VkSubmitInfo si { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                    .commandBufferCount = 1, .pCommandBuffers = &dcmd };
+                vkQueueSubmit(resource.queue, 1, &si, resource.fence);
+                vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX);
+                const char * path = getenv("VSFEEL_DFTTEST_DUMP_PATH");
+                FILE * f = fopen(path ? path : "/tmp/opencode/pad_dump.bin", "wb");
+                fwrite(map, 1, dump_size, f);
+                fclose(f);
+                vkFreeCommandBuffers(dev, resource.pool, 1, &dcmd);
+            }
+        }
 
         if (!coherent) {
             std::vector<VkMappedMemoryRange> ranges;
@@ -1346,6 +1570,8 @@ static void VS_CC DftCreate(
         cfg.spatial_offset = spatial_sum;
         spatial_sum += nblk * 256;           // floats (center slice only)
 
+        cfg.slot_plane_bytes = pad_elems * d->bytes;
+
         if (d->tw * pad_elems >= (1ll << 31) || nblk * 256 >= (1ll << 31)) {
             return set_error("frame too large (padded plane exceeds 2^31 elements).");
         }
@@ -1490,22 +1716,39 @@ static void VS_CC DftCreate(
         if (effective_streams < 1) effective_streams = 1;
     }
 
+    // frame-cache slots: a slot holds one padded source plane; K must exceed the
+    // number of distinct source frames in flight (S-1 behind + 1 ahead + reuse)
+    d->slot_count = effective_streams + 3;
+    {
+        VkDeviceSize slot_sum = 0;
+        for (int plane = 0; plane < num_planes; ++plane) {
+            if (!d->process[plane]) {
+                continue;
+            }
+            auto & cfg = d->planes[plane];
+            cfg.slot_offset = slot_sum;
+            slot_sum += static_cast<VkDeviceSize>(d->slot_count) * cfg.slot_plane_bytes;
+        }
+        d->slot_total = (slot_sum + 31) & ~VkDeviceSize(31);
+    }
+
     // ------------------------------------------------------------------
     // Pipeline layout, descriptor set layout and descriptor pool
     // ------------------------------------------------------------------
     {
-        VkDescriptorSetLayoutBinding bindings[4] {
+        VkDescriptorSetLayoutBinding bindings[5] {
             { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
             { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
             { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
             { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+            { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         };
 
         VkDescriptorSetLayoutCreateInfo layout_info {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .bindingCount = 4,
+            .bindingCount = 5,
             .pBindings = bindings
         };
 
@@ -1534,7 +1777,7 @@ static void VS_CC DftCreate(
     }
     {
         VkDescriptorPoolSize pool_size {
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * static_cast<uint32_t>(effective_streams)
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 * static_cast<uint32_t>(effective_streams)
         };
 
         VkDescriptorPoolCreateInfo pool_info {
@@ -1621,6 +1864,8 @@ static void VS_CC DftCreate(
     {
         const uint32_t * pad_code = nullptr;
         size_t pad_size = 0;
+        const uint32_t * pad_slot_code = nullptr;
+        size_t pad_slot_size = 0;
         const uint32_t * col2im_code = nullptr;
         size_t col2im_size = 0;
         const uint32_t * fused_code[4] {};
@@ -1628,6 +1873,7 @@ static void VS_CC DftCreate(
         switch (d->bits) {
             case 16:
                 pad_code = dfttest_16_pad_spv;       pad_size = dfttest_16_pad_spv_size;
+                pad_slot_code = dfttest_16_pad_slot_spv; pad_slot_size = dfttest_16_pad_slot_spv_size;
                 col2im_code = dfttest_16_col2im_spv; col2im_size = dfttest_16_col2im_spv_size;
                 fused_code[0] = dfttest_16_fused_r0_spv; fused_size[0] = dfttest_16_fused_r0_spv_size;
                 fused_code[1] = dfttest_16_fused_r1_spv; fused_size[1] = dfttest_16_fused_r1_spv_size;
@@ -1636,6 +1882,7 @@ static void VS_CC DftCreate(
                 break;
             case 32:
                 pad_code = dfttest_32_pad_spv;       pad_size = dfttest_32_pad_spv_size;
+                pad_slot_code = dfttest_32_pad_slot_spv; pad_slot_size = dfttest_32_pad_slot_spv_size;
                 col2im_code = dfttest_32_col2im_spv; col2im_size = dfttest_32_col2im_spv_size;
                 fused_code[0] = dfttest_32_fused_r0_spv; fused_size[0] = dfttest_32_fused_r0_spv_size;
                 fused_code[1] = dfttest_32_fused_r1_spv; fused_size[1] = dfttest_32_fused_r1_spv_size;
@@ -1652,6 +1899,13 @@ static void VS_CC DftCreate(
                 return set_error(std::get<std::string>(result));
             }
             d->pad_module = std::get<VkShaderModule>(result);
+        }
+        {
+            const auto result = create_shader_module(*d->device, pad_slot_code, pad_slot_size);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            d->pad_slot_module = std::get<VkShaderModule>(result);
         }
         for (int r = 0; r < 4; ++r) {
             const auto result = create_shader_module(*d->device, fused_code[r], fused_size[r]);
@@ -1674,6 +1928,14 @@ static void VS_CC DftCreate(
                 return set_error(std::get<std::string>(result));
             }
             d->pad_pipeline = std::get<VkPipeline>(result);
+        }
+        {
+            const auto result = create_pipeline(*d->device, d->pad_slot_module, d->pipeline_layout,
+                d->device->subgroup_size_control ? 32 : 0);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            d->pad_slot_pipeline = std::get<VkPipeline>(result);
         }
         for (int r = 0; r < 4; ++r) {
             const auto result = create_pipeline(*d->device, d->fused_module[r], d->pipeline_layout,
@@ -1706,6 +1968,43 @@ static void VS_CC DftCreate(
     d->need_fill = false;   // plain typed stores write every element; no zeroing needed
     d->semaphore.current.store(effective_streams - 1, std::memory_order::relaxed);
     d->resources.reserve(effective_streams);
+
+    // ---- frame-cache slot buffer + slot semaphores ----
+    // The cache is only safe with a single queue (num_streams == 1): with
+    // multiple queues a cross-queue semaphore wait can be scheduled before its
+    // signal, so the multi-stream path pads every frame directly (no slots).
+    d->use_cache = (d->num_streams <= 1);
+    {
+        const VkDeviceSize slot_size = d->use_cache
+            ? std::max(d->slot_total, VkDeviceSize(4))
+            : VkDeviceSize(64);  // dummy: keeps descriptor binding 4 valid
+        VkBufferCreateInfo buffer_info {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .size = slot_size,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr
+        };
+        checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &d->slot_buf));
+        const auto result = allocate_memory(
+            *d->device, d->slot_buf, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (std::holds_alternative<std::string>(result)) {
+            return set_error(std::get<std::string>(result));
+        }
+        d->slot_mem = std::get<AllocatedMemory>(result).memory;
+
+        if (d->use_cache) {
+            d->slot_owner = std::make_unique<std::atomic<long long>[]>(num_planes * d->slot_count);
+            for (int i = 0; i < num_planes * d->slot_count; ++i) {
+                d->slot_owner[i].store(-1, std::memory_order_relaxed);
+            }
+        }
+    }
 
     const uint32_t num_queues = std::min(
         d->num_streams, static_cast<int>(d->device->queue_count));
@@ -1797,9 +2096,12 @@ static void VS_CC DftCreate(
                 .pNext = nullptr,
                 .commandPool = resource.pool,
                 .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                .commandBufferCount = 1
+                .commandBufferCount = 2
             };
-            checkVK(vkAllocateCommandBuffers(dev, &alloc_info, &resource.cmd));
+            VkCommandBuffer cbs[2];
+            checkVK(vkAllocateCommandBuffers(dev, &alloc_info, cbs));
+            resource.cmd = cbs[0];
+            resource.cmd2 = cbs[1];
         }
         {
             VkFenceCreateInfo fence_info {
@@ -1841,8 +2143,13 @@ static void VS_CC DftCreate(
                 .offset = 0,
                 .range = VK_WHOLE_SIZE
             };
+            VkDescriptorBufferInfo slot_info {
+                .buffer = d->slot_buf,
+                .offset = 0,
+                .range = VK_WHOLE_SIZE
+            };
 
-            VkWriteDescriptorSet writes[4] {
+            VkWriteDescriptorSet writes[5] {
                 {
                     .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                     .pNext = nullptr,
@@ -1891,9 +2198,21 @@ static void VS_CC DftCreate(
                     .pBufferInfo = &padded_info,
                     .pTexelBufferView = nullptr
                 },
+                {
+                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .pNext = nullptr,
+                    .dstSet = resource.desc_set,
+                    .dstBinding = 4,
+                    .dstArrayElement = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    .pImageInfo = nullptr,
+                    .pBufferInfo = &slot_info,
+                    .pTexelBufferView = nullptr
+                },
             };
 
-            vkUpdateDescriptorSets(dev, 4, writes, 0, nullptr);
+            vkUpdateDescriptorSets(dev, 5, writes, 0, nullptr);
         }
 
         checkVK(vkMapMemory(dev, resource.staging_mem, 0, staging_size, 0, reinterpret_cast<void **>(&resource.map)));

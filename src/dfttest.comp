@@ -90,12 +90,18 @@ layout(std430, binding = 1) buffer StagingBuf { uint staging_raw[]; };
 layout(std430, binding = 3) buffer PaddedBuf { uint padded_raw[]; };
 #endif
 layout(std430, binding = 2) buffer SpatialBuf { float spatial[]; };
+#if BITS == 16
+layout(std430, binding = 4) buffer SlotBuf { uint16_t slot16[]; };
+#else
+layout(std430, binding = 4) buffer SlotBuf { uint slot_raw[]; };
+#endif
 
 layout(push_constant) uniform PushConstants {
     int padded_base;    // byte offset of the padded source region in padded buffer
     int spatial_base;   // float element offset into the spatial buffer
     int dst_base;       // byte offset of the download region in staging
     int src_base;       // byte offset of the upload region in staging
+    int pad_t0;         // temporal plane the pad kernel processes (frame cache)
     int wt_base;        // float element offset of window[] in wt
     int wf_base;        // float element offset of window_freq[] in wt (-1 if !zmean)
     int sigma_base;     // float element offset of sigma[] in wt (-1 if scalar)
@@ -1342,7 +1348,7 @@ void store_sample(int sample_idx, float v) {
 #endif
 }
 
-// the pad kernel writes the padded source into the device-local buffer
+// the pad kernel writes the padded source into the device-local padded buffer
 void store_padded(int sample_idx, float v) {
 #if BITS == 32
     int byte = pc.padded_base + sample_idx * ELEM_BYTES;
@@ -1351,6 +1357,19 @@ void store_padded(int sample_idx, float v) {
     float x = v / SCALE;
     x = clamp(x + 0.5, 0.0, PEAK);
     padded16[(pc.padded_base >> 1) + sample_idx] = uint16_t(uint(x) & ELEM_MASK);
+#endif
+}
+
+// the pad-slot kernel writes one padded plane into the shared slot buffer
+// (frame cache: each source frame is pad'd once and reused via D2D copies)
+void store_slot(int sample_idx, float v) {
+#if BITS == 32
+    int byte = pc.padded_base + sample_idx * ELEM_BYTES;
+    slot_raw[byte >> 2] = floatBitsToUint(v / SCALE);
+#else
+    float x = v / SCALE;
+    x = clamp(x + 0.5, 0.0, PEAK);
+    slot16[(pc.padded_base >> 1) + sample_idx] = uint16_t(uint(x) & ELEM_MASK);
 #endif
 }
 
@@ -1564,6 +1583,30 @@ void main() {
 }
 
 #endif // ENTRY_PAD
+
+#if defined(ENTRY_PAD_SLOT)
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    const int pw = calc_pad_size(pc.width, pc.block_step);
+    const int ph = calc_pad_size(pc.height, pc.block_step);
+    const int pad_x = (pw - pc.width) / 2;
+    const int pad_y = (ph - pc.height) / 2;
+    const int up_slice = pc.height * pc.src_stride;
+
+    for (int y = int(gl_GlobalInvocationID.y); y < ph; y += int(gl_NumWorkGroups.y) * 8) {
+        for (int x = int(gl_GlobalInvocationID.x); x < pw; x += int(gl_NumWorkGroups.x) * 32) {
+            int sx = x - pad_x;
+            int sy = y - pad_y;
+            sx = sx < 0 ? -sx : (sx >= pc.width ? 2 * (pc.width - 1) - sx : sx);
+            sy = sy < 0 ? -sy : (sy >= pc.height ? 2 * (pc.height - 1) - sy : sy);
+            const uint raw = load_upload(pc.pad_t0 * up_slice + sy * pc.src_stride + sx);
+            store_slot(y * pw + x, to_float(raw));
+        }
+    }
+}
+
+#endif // ENTRY_PAD_SLOT
 
 // ---------------------------------------------------------------------------
 // fused: im2col + 3D DFT + filter + inverse + center-slice col
