@@ -2,6 +2,8 @@
 
 GPU-accelerated filters in Vulkan for VapourSynth.
 
+Primarily optimized for running on RDNA 3 with the RADV driver on Linux.
+
 ## Requirements
 
 - GPU with Vulkan 1.3 (or 1.1 with `VK_KHR_maintenance4` / `VK_KHR_8bit_storage`) and `glslc` at build time
@@ -74,12 +76,53 @@ core.vsfeel.BM3Dv2(clip, sigma=0.7, block_step=4, bm_range=16, radius=2, ps_num=
 - extractor_exp: (Default: 0)
     Exponent of the extractor used to bias the aggregation weight. 0 disables the extractor.
 
+### DFTTest
+
+DFTTest is a 3D block-wise frequency-domain denoiser. Each 16x16 spatial block is stacked with temporally neighboring frames, transformed to the frequency domain, filtered, and transformed back with overlap-add. It reduces noise while preserving detail, with configurable spatial and temporal windowing and a choice of frequency-domain filter variants.
+
+```python
+core.vsfeel.DFTTest(clip, sigma=8.0, sosize=12, tbsize=3, swin=0, twin=7, zmean=1, num_streams=1)
+```
+
+- clip:
+    The input clip. Supports 16 bit integer and 32 bit float input in Gray, YUV or RGB color families.
+
+- ftype: (Default: 0)
+    Frequency-domain filter variant: 0 = wiener, 1 = hard threshold, 2 = multiply, 3 = bandpass, 4 = power.
+
+- sigma: (Default: 8.0)
+    Noise standard deviation of the input. Use an array to assign it for each plane, otherwise the same value is used for all planes.
+
+- sosize: (Default: 12)
+    Spatial overlap in pixels. Must be in range [0, 15].
+
+- tbsize: (Default: 3)
+    Temporal block size in frames, i.e. how many frames before and after the current frame are processed together. Must be odd, in range [1, 7].
+
+- swin: (Default: 0)
+    Spatial window type, 0 to 11.
+
+- twin: (Default: 7)
+    Temporal window type, 0 to 11.
+
+- zmean: (Default: 1)
+    Apply the zero-mean correction (subtract the window frequency response scaled by the DC gain before filtering).
+
+- f0beta: (Default: 1.0)
+    Exponent used with `ftype=0`.
+
+- planes:
+    The planes to process. By default all planes are processed.
+
+- num_streams: (Default: 1)
+    Number of command buffers submitted per frame, enables concurrent kernel execution and data transfer. Must be in range [1, 32].
+
 ### GaussBlur
 
 [Gaussian blur](https://en.wikipedia.org/wiki/Gaussian_blur) is a smoothing filter that blends each pixel with its neighbors, weighting nearby pixels more heavily than distant ones according to a bell-shaped (Gaussian) curve. It is commonly used to soften an image or reduce noise.
 
 ```python
-core.vsfeel.GaussBlur(clip, sigma=0.5, device_id=0, num_streams=1)
+core.vsfeel.GaussBlur(clip, sigma=0.5, num_streams=1)
 ```
 
 - clip:
@@ -87,9 +130,6 @@ core.vsfeel.GaussBlur(clip, sigma=0.5, device_id=0, num_streams=1)
 
 - sigma: (Default: 0.5)
     Blur sigma for each plane. Use an array to assign it for each plane, otherwise the second plane defaults to `sigma[0] / sqrt((1 << subSamplingH) * (1 << subSamplingW))` and the third to the second plane's value. Must be non-negative. A value below the machine epsilon copies the plane through unmodified.
-
-- device_id: (Default: 0)
-    Index of the Vulkan device to use.
 
 - num_streams: (Default: 1)
     Number of command buffers submitted per frame, enables concurrent kernel execution and data transfer. Must be in range [1, 32].

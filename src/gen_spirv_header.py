@@ -7,12 +7,12 @@ Usage: gen_spirv_header.py <shared_8> <shared_16> <shared_32>
                            <gaussblur_8_gauss> <gaussblur_8_vert> <gaussblur_8_horiz>
                            <gaussblur_16_gauss> <gaussblur_16_vert> <gaussblur_16_horiz>
                            <gaussblur_16h_gauss> <gaussblur_16h_vert> <gaussblur_16h_horiz>
-                           <gaussblur_32_gauss> <gaussblur_32_vert> <gaussblur_32_horiz>
-                           <dfttest_16_pad> <dfttest_16_col2im>
-                           <dfttest_16_fused_r0> <dfttest_16_fused_r1> <dfttest_16_fused_r2> <dfttest_16_fused_r3>
-                           <dfttest_32_pad> <dfttest_32_col2im>
-                           <dfttest_32_fused_r0> <dfttest_32_fused_r1> <dfttest_32_fused_r2> <dfttest_32_fused_r3>
-                           <out header>
+                            <gaussblur_32_gauss> <gaussblur_32_vert> <gaussblur_32_horiz>
+                            <dfttest_16_pad_slot> <dfttest_16_pad_direct> <dfttest_16_col2im>
+                            <dfttest_16_fused_r0> <dfttest_16_fused_r1> <dfttest_16_fused_r2> <dfttest_16_fused_r3>
+                            <dfttest_32_pad_slot> <dfttest_32_pad_direct> <dfttest_32_col2im>
+                            <dfttest_32_fused_r0> <dfttest_32_fused_r1> <dfttest_32_fused_r2> <dfttest_32_fused_r3>
+                            <out header>
 """
 
 import sys
@@ -33,15 +33,15 @@ def emit_spv(f, name: str, path: Path) -> None:
     f.write(f"static const size_t {name}_spv_size = sizeof({name}_spv);\n\n")
 
 def main() -> None:
-    if len(sys.argv) != 38:
-        print("usage: gen_spirv_header.py <shared_8> <shared_16> <shared_32> <plain_8> <plain_16> <plain_32> <bm3d> <bm3d_agg> <gaussblur_8_*x3> <gaussblur_16_*x3> <gaussblur_16h_*x3> <gaussblur_32_*x3> <dfttest_16_pad> <dfttest_16_pad_slot> <dfttest_16_pad_direct> <dfttest_16_col2im> <dfttest_16_fused_r0..r3> <dfttest_32_pad> <dfttest_32_pad_slot> <dfttest_32_pad_direct> <dfttest_32_col2im> <dfttest_32_fused_r0..r3> <out header>")
+    if len(sys.argv) != 36:
+        print("usage: gen_spirv_header.py <shared_8> <shared_16> <shared_32> <plain_8> <plain_16> <plain_32> <bm3d> <bm3d_agg> <gaussblur_8_*x3> <gaussblur_16_*x3> <gaussblur_16h_*x3> <gaussblur_32_*x3> <dfttest_16_pad_slot> <dfttest_16_pad_direct> <dfttest_16_col2im> <dfttest_16_fused_r0..r3> <dfttest_32_pad_slot> <dfttest_32_pad_direct> <dfttest_32_col2im> <dfttest_32_fused_r0..r3> <out header>")
         sys.exit(1)
 
     shared_8, shared_16, shared_32, plain_8, plain_16, plain_32, bm3d, bm3d_agg, \
         gb_8_g, gb_8_v, gb_8_h, gb_16_g, gb_16_v, gb_16_h, \
         gb_16h_g, gb_16h_v, gb_16h_h, gb_32_g, gb_32_v, gb_32_h, \
-        df_16_p, df_16_ps, df_16_pd, df_16_c, df_16_f0, df_16_f1, df_16_f2, df_16_f3, \
-        df_32_p, df_32_ps, df_32_pd, df_32_c, df_32_f0, df_32_f1, df_32_f2, df_32_f3, \
+        df_16_ps, df_16_pd, df_16_c, df_16_f0, df_16_f1, df_16_f2, df_16_f3, \
+        df_32_ps, df_32_pd, df_32_c, df_32_f0, df_32_f1, df_32_f2, df_32_f3, \
         out_path = (Path(a) for a in sys.argv[1:])
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -68,7 +68,6 @@ def main() -> None:
         emit_spv(f, "gaussblur_32_gauss", gb_32_g)
         emit_spv(f, "gaussblur_32_vert", gb_32_v)
         emit_spv(f, "gaussblur_32_horiz", gb_32_h)
-        emit_spv(f, "dfttest_16_pad", df_16_p)
         emit_spv(f, "dfttest_16_pad_slot", df_16_ps)
         emit_spv(f, "dfttest_16_pad_direct", df_16_pd)
         emit_spv(f, "dfttest_16_col2im", df_16_c)
@@ -76,7 +75,6 @@ def main() -> None:
         emit_spv(f, "dfttest_16_fused_r1", df_16_f1)
         emit_spv(f, "dfttest_16_fused_r2", df_16_f2)
         emit_spv(f, "dfttest_16_fused_r3", df_16_f3)
-        emit_spv(f, "dfttest_32_pad", df_32_p)
         emit_spv(f, "dfttest_32_pad_slot", df_32_ps)
         emit_spv(f, "dfttest_32_pad_direct", df_32_pd)
         emit_spv(f, "dfttest_32_col2im", df_32_c)

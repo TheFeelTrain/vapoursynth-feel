@@ -2,13 +2,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <numbers>
@@ -40,7 +38,6 @@ using namespace std::string_literals;
 // ---------------------------------------------------------------------------
 
 constexpr int BS = 16;              // spatial block size (sbsize, fixed)
-constexpr int MAX_RADIUS = 3;       // tbsize up to 7
 
 // ---------------------------------------------------------------------------
 // Host-side window / sigma table math (ported from vszipcu dfttest.zig)
@@ -379,9 +376,7 @@ struct PlaneConfig {
     int height {};
     int pw {};                      // padded dims
     int ph {};
-    int hn {};                      // block counts
-    int vn {};
-    int num_blocks {};
+    int num_blocks {};              // block grid
     VkDeviceSize upload_offset {};  // staging byte offset of the tight upload region
     VkDeviceSize upload_bytes {};   // tw * height * width * bytes (tight rows)
     VkDeviceSize padded_offset {};  // padded buffer byte offset
@@ -394,9 +389,8 @@ struct PlaneConfig {
 };
 
 // per-resource stable metadata (the pool moves VK_Resource objects, so the
-// frame generation counter and fence handle live in a stable allocation)
+// frame generation counter lives in a stable allocation)
 struct ResMeta {
-    VkFence fence {};        // whole-frame fence (fused + col2im submit)
     std::atomic<long long> frame_gen { 0 };
 };
 
@@ -417,9 +411,8 @@ struct SlotState {
 };
 
 struct VK_Resource {
-    int id {};
-    ResMeta * meta {};
-    VkBuffer staging {};
+        int id {};
+        VkBuffer staging {};
     VkDeviceMemory staging_mem {};
     VkBuffer padded_buf {};         // device-local padded source planes
     VkDeviceMemory padded_mem {};
@@ -467,11 +460,10 @@ struct DftData {
     VSNode * node;
     const VSVideoInfo * vi;
 
-    int device_id, num_streams;
+    int num_streams;
     int bits, bytes;
-    bool sample_type_float {};
 
-    int radius, block_step, tbsize;
+    int radius, block_step;
     int filter_type;
     bool zmean {};
     bool sigma_is_scalar { true };
@@ -488,12 +480,10 @@ struct DftData {
     VkDescriptorSetLayout set_layout {};
     VkPipelineLayout pipeline_layout {};
     VkDescriptorPool desc_pool {};
-    VkShaderModule pad_module {};
     VkShaderModule pad_slot_module {};
     VkShaderModule pad_direct_module {};
     VkShaderModule col2im_module {};
     VkShaderModule fused_module[4] {};
-    VkPipeline pad_pipeline {};
     VkPipeline pad_slot_pipeline {};
     VkPipeline pad_direct_pipeline {};
     VkPipeline col2im_pipeline {};
@@ -529,7 +519,6 @@ struct DftData {
     std::mutex slot_lock {};
     std::vector<SlotState> slots {};
     std::vector<std::unique_ptr<ResMeta>> res_meta {};
-    bool need_fill {};
     std::array<PlaneConfig, 3> planes {};
     ticket_semaphore semaphore;
     std::vector<VK_Resource> resources;
@@ -617,9 +606,6 @@ struct DftData {
             vkDestroyBuffer(dev, wt_buf, nullptr);
         }
 
-        if (pad_pipeline) {
-            vkDestroyPipeline(dev, pad_pipeline, nullptr);
-        }
         if (pad_slot_pipeline) {
             vkDestroyPipeline(dev, pad_slot_pipeline, nullptr);
         }
@@ -642,9 +628,6 @@ struct DftData {
         }
         if (set_layout) {
             vkDestroyDescriptorSetLayout(dev, set_layout, nullptr);
-        }
-        if (pad_module) {
-            vkDestroyShaderModule(dev, pad_module, nullptr);
         }
         if (pad_slot_module) {
             vkDestroyShaderModule(dev, pad_slot_module, nullptr);
@@ -778,7 +761,6 @@ static bool dfttest_trace() {
 struct SlotOp {
     int plane {};
     int t {};
-    long long f {};
     int slot { -1 };           // owning slot, or -1 (direct pad, no copy)
     VkDeviceSize slot_base {};
     bool is_pad {};
@@ -991,32 +973,6 @@ static std::optional<std::string> record_fused_col2im_cb(
         return "vkBeginCommandBuffer (fused) failed";
     }
 
-    if (d.need_fill) {
-        vkCmdFillBuffer(cmd, resource.staging,
-            d.upload_total, d.download_total, 0);
-        {
-            VkMemoryBarrier mem_barrier {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
-            };
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
-        }
-        vkCmdFillBuffer(cmd, resource.padded_buf, 0, d.padded_total, 0);
-        {
-            VkMemoryBarrier mem_barrier {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
-            };
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
-        }
-    }
-
     const PushConstants base = base_pc(d);
     const uint32_t max_grid_x = d.device->limits.maxComputeWorkGroupCount[0];
     const uint32_t max_grid_y = d.device->limits.maxComputeWorkGroupCount[1];
@@ -1085,10 +1041,6 @@ static std::optional<std::string> record_fused_col2im_cb(
     return std::nullopt;
 }
 
-static std::optional<std::string> record_command_buffer(
-    const DftData & d, VK_Resource & resource) {
-    return record_fused_col2im_cb(d, resource, true, true);
-}
 static const VSFrame *VS_CC DftGetFrame(
     int n, int activationReason, void *instanceData, void **frameData,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
@@ -1202,7 +1154,6 @@ static const VSFrame *VS_CC DftGetFrame(
                 SlotOp op;
                 op.plane = plane;
                 op.t = t;
-                op.f = idx;
                 op.which = which;
 
                 // find the slot that owns this source (any slot may hold it:
@@ -1611,7 +1562,6 @@ static void VS_CC DftCreate(
     }
     d->bits = bits;
     d->bytes = bits / 8;
-    d->sample_type_float = fmt.sampleType == stFloat;
 
     int ftype = vsh::int64ToIntS(vsapi->mapGetInt(in, "ftype", 0, &error));
     if (error) {
@@ -1752,7 +1702,6 @@ static void VS_CC DftCreate(
 
     d->radius = (tbsize - 1) / 2;
     d->block_step = sbsize - sosize;
-    d->tbsize = tbsize;
     d->tw = 2 * d->radius + 1;
     d->zmean = zmean != 0;
     d->beta = static_cast<float>(f0beta);
@@ -1805,9 +1754,8 @@ static void VS_CC DftCreate(
         cfg.height = (plane == 0) ? d->vi->height : d->vi->height >> subH;
         cfg.pw = calcPadSize(cfg.width, d->block_step);
         cfg.ph = calcPadSize(cfg.height, d->block_step);
-        cfg.hn = calcPadNum(cfg.width, d->block_step);
-        cfg.vn = calcPadNum(cfg.height, d->block_step);
-        cfg.num_blocks = cfg.hn * cfg.vn;
+        cfg.num_blocks = calcPadNum(cfg.width, d->block_step) *
+            calcPadNum(cfg.height, d->block_step);
 
         // single-fold reflect_pad requires pad <= dim-1
         const int ox = (cfg.pw - cfg.width) / 2;
@@ -1818,7 +1766,7 @@ static void VS_CC DftCreate(
         }
 
         const VkDeviceSize pad_elems = static_cast<VkDeviceSize>(cfg.pw) * cfg.ph;
-        const VkDeviceSize nblk = static_cast<VkDeviceSize>(cfg.hn) * cfg.vn;
+        const VkDeviceSize nblk = cfg.num_blocks;
 
         cfg.upload_offset = upload_sum;
         cfg.upload_bytes = static_cast<VkDeviceSize>(d->tw) * cfg.height * cfg.width * d->bytes;
@@ -1970,7 +1918,6 @@ static void VS_CC DftCreate(
             return set_error(std::get<std::string>(result));
         }
         d->device = std::get<std::shared_ptr<VK_Device>>(result);
-        d->device_id = device_id;
     }
 
     VkDevice dev = d->device->device;
@@ -2127,8 +2074,6 @@ static void VS_CC DftCreate(
     // Shader modules and pipelines
     // ------------------------------------------------------------------
     {
-        const uint32_t * pad_code = nullptr;
-        size_t pad_size = 0;
         const uint32_t * pad_slot_code = nullptr;
         size_t pad_slot_size = 0;
         const uint32_t * pad_direct_code = nullptr;
@@ -2139,7 +2084,6 @@ static void VS_CC DftCreate(
         size_t fused_size[4] {};
         switch (d->bits) {
             case 16:
-                pad_code = dfttest_16_pad_spv;       pad_size = dfttest_16_pad_spv_size;
                 pad_slot_code = dfttest_16_pad_slot_spv; pad_slot_size = dfttest_16_pad_slot_spv_size;
                 pad_direct_code = dfttest_16_pad_direct_spv; pad_direct_size = dfttest_16_pad_direct_spv_size;
                 col2im_code = dfttest_16_col2im_spv; col2im_size = dfttest_16_col2im_spv_size;
@@ -2149,7 +2093,6 @@ static void VS_CC DftCreate(
                 fused_code[3] = dfttest_16_fused_r3_spv; fused_size[3] = dfttest_16_fused_r3_spv_size;
                 break;
             case 32:
-                pad_code = dfttest_32_pad_spv;       pad_size = dfttest_32_pad_spv_size;
                 pad_slot_code = dfttest_32_pad_slot_spv; pad_slot_size = dfttest_32_pad_slot_spv_size;
                 pad_direct_code = dfttest_32_pad_direct_spv; pad_direct_size = dfttest_32_pad_direct_spv_size;
                 col2im_code = dfttest_32_col2im_spv; col2im_size = dfttest_32_col2im_spv_size;
@@ -2162,13 +2105,6 @@ static void VS_CC DftCreate(
                 return set_error("unsupported bit depth");
         }
 
-        {
-            const auto result = create_shader_module(*d->device, pad_code, pad_size);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->pad_module = std::get<VkShaderModule>(result);
-        }
         {
             const auto result = create_shader_module(*d->device, pad_slot_code, pad_slot_size);
             if (std::holds_alternative<std::string>(result)) {
@@ -2196,14 +2132,6 @@ static void VS_CC DftCreate(
                 return set_error(std::get<std::string>(result));
             }
             d->col2im_module = std::get<VkShaderModule>(result);
-        }
-        {
-            const auto result = create_pipeline(*d->device, d->pad_module, d->pipeline_layout,
-                d->device->subgroup_size_control ? 32 : 0);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->pad_pipeline = std::get<VkPipeline>(result);
         }
         {
             const auto result = create_pipeline(*d->device, d->pad_slot_module, d->pipeline_layout,
@@ -2249,7 +2177,6 @@ static void VS_CC DftCreate(
     const VkDeviceSize spatial_size = std::max<VkDeviceSize>(
         d->spatial_total * sizeof(float), min_size);
 
-    d->need_fill = false;   // plain typed stores write every element; no zeroing needed
     d->semaphore.current.store(effective_streams - 1, std::memory_order::relaxed);
     d->resources.reserve(effective_streams);
 
@@ -2388,8 +2315,6 @@ static void VS_CC DftCreate(
         }
         resource.id = i;
         d->res_meta.push_back(std::make_unique<ResMeta>());
-        d->res_meta.back()->fence = resource.fence;
-        resource.meta = d->res_meta.back().get();
         {
             VkDescriptorSetAllocateInfo alloc_info {
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -2499,7 +2424,7 @@ static void VS_CC DftCreate(
         resource.queue = d->device->queues[i % num_queues].queue;
         resource.queue_lock = d->device->queues[i % num_queues].lock.get();
 
-        if (const auto err = record_command_buffer(*d, resource)) {
+        if (const auto err = record_fused_col2im_cb(*d, resource, true, true)) {
             return set_error(*err);
         }
 

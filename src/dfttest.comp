@@ -24,20 +24,21 @@
  * sqrt variants) matches the generated filter() device code, and the zero-
  * mean path subtracts the window frequency response scaled by the DC gain.
  * The IO conversion follows the references: integer input is scaled by
- * SCALE (1.0 for 8-bit, 1/256 for 16-bit), float input by 255.0; integer
- * output rounds with +0.5 truncation (__float2int_rz) and clamps.
+ * SCALE (1/256 for 16-bit), float input by 255.0; integer output rounds with
+ * +0.5 truncation (__float2int_rz) and clamps.
  *
- * Compile-time variants: -DBITS=8|16|32, exactly one of -DENTRY_PAD /
- * -DENTRY_FUSED / -DENTRY_COL2IM defining the entry point. Everything else
- * (radius, block_step, plane geometry, filter parameters, buffer offsets) is
- * passed per-dispatch through push constants so a single triple of pipelines
- * serves every plane.
+ * Compile-time variants: -DBITS=16|32, exactly one of -DENTRY_PAD_SLOT /
+ * -DENTRY_PAD_DIRECT / -DENTRY_FUSED / -DENTRY_COL2IM defining the entry
+ * point. Everything else (radius, block_step, plane geometry, filter
+ * parameters, buffer offsets) is passed per-dispatch through push constants
+ * so a single set of pipelines serves every plane.
  *
  * Bindings:
  *   0: wt[]       — window weights, then window_freq, then the sigma array
  *   1: staging    — tight upload planes (pad reads) + final output (write)
  *   2: spatial    — device-local float block buffer between fused/col2im
  *   3: padded     — device-local padded source planes (pad writes, fused reads)
+ *   4: slot[]     — frame-cache slots (pad_slot writes, D2D-copied to padded)
  */
 
 #if !defined(BITS)
@@ -50,12 +51,7 @@
 
 #define TW (2 * RADIUS + 1)
 
-#if BITS == 8
-#define ELEM_BYTES 1
-#define ELEM_MASK  0xFFu
-#define PEAK       255.0
-#define SCALE      1.0
-#elif BITS == 16
+#if BITS == 16
 #define ELEM_BYTES 2
 #define ELEM_MASK  0xFFFFu
 #define PEAK       65535.0
@@ -111,7 +107,7 @@ layout(push_constant) uniform PushConstants {
     int height;         // frame plane height
     int src_stride;     // upload plane row stride in elements
     int dst_stride;     // frame plane row stride in elements
-    int filter_type;    // runtime fallback (unused when FILTER_TYPE is defined at build time)
+    int filter_type;    // host ABI layout only; the variant is the FILTER_TYPE spec constant
     float sigma;        // scaled scalar sigma (used when sigma_base < 0)
     float sigma2;
     float pmin;
@@ -1427,30 +1423,6 @@ void filter_value(inout float re, inout float im, int x, int y, int t) {
     im *= multiplier;
 }
 
-void temporal_dft(inout float data[TD_SZ], int base) {
-#if RADIUS == 0
-    dft1(data, base, 16);
-#elif RADIUS == 1
-    dft3(data, base, 16);
-#elif RADIUS == 2
-    dft5(data, base, 16);
-#else
-    dft7(data, base, 16);
-#endif
-}
-
-void temporal_idft(inout float data[TD_SZ], int base) {
-#if RADIUS == 0
-    idft1(data, base, 16);
-#elif RADIUS == 1
-    idft3(data, base, 16);
-#elif RADIUS == 2
-    idft5(data, base, 16);
-#else
-    idft7(data, base, 16);
-#endif
-}
-
 // Manual unrolls (register pressure fix)
 #define TD_DFT_1(d) dft1(d,0,16);dft1(d,2,16);dft1(d,4,16);dft1(d,6,16);dft1(d,8,16);dft1(d,10,16);dft1(d,12,16);dft1(d,14,16);dft1(d,16,16);dft1(d,18,16);dft1(d,20,16);dft1(d,22,16);dft1(d,24,16);dft1(d,26,16);dft1(d,28,16);dft1(d,30,16);
 #define TD_DFT_3(d) dft3(d,0,16);dft3(d,2,16);dft3(d,4,16);dft3(d,6,16);dft3(d,8,16);dft3(d,10,16);dft3(d,12,16);dft3(d,14,16);dft3(d,16,16);dft3(d,18,16);dft3(d,20,16);dft3(d,22,16);dft3(d,24,16);dft3(d,26,16);dft3(d,28,16);dft3(d,30,16);
@@ -1551,38 +1523,11 @@ void temporal_idft(inout float data[TD_SZ], int base) {
 #endif
 
 // ---------------------------------------------------------------------------
-// pad: reflection-pad the tight upload rows into the device-local padded buffer
-// (single-fold mirror, identical to the reference's reflect_pad kernel and the
-// previous host-side reflection_padding_impl)
+// pad_slot / pad_direct: reflection-pad one tight upload slice (single-fold
+// mirror, identical to the reference's reflect_pad kernel and the previous
+// host-side reflection_padding_impl) into the frame-cache slot buffer or, when
+// every slot is busy, straight into the device-local padded buffer
 // ---------------------------------------------------------------------------
-
-#if defined(ENTRY_PAD)
-
-layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
-void main() {
-    const int pw = calc_pad_size(pc.width, pc.block_step);
-    const int ph = calc_pad_size(pc.height, pc.block_step);
-    const int pad_x = (pw - pc.width) / 2;
-    const int pad_y = (ph - pc.height) / 2;
-    const int tw = 2 * pc.radius + 1;
-    const int up_slice = pc.height * pc.src_stride;
-    const int pad_slice = pw * ph;
-
-    for (int y = int(gl_GlobalInvocationID.y); y < ph; y += int(gl_NumWorkGroups.y) * 8) {
-        for (int x = int(gl_GlobalInvocationID.x); x < pw; x += int(gl_NumWorkGroups.x) * 32) {
-            int sx = x - pad_x;
-            int sy = y - pad_y;
-            sx = sx < 0 ? -sx : (sx >= pc.width ? 2 * (pc.width - 1) - sx : sx);
-            sy = sy < 0 ? -sy : (sy >= pc.height ? 2 * (pc.height - 1) - sy : sy);
-            for (int t = 0; t < tw; ++t) {
-                const uint raw = load_upload(t * up_slice + sy * pc.src_stride + sx);
-                store_padded(t * pad_slice + y * pw + x, to_float(raw));
-            }
-        }
-    }
-}
-
-#endif // ENTRY_PAD
 
 #if defined(ENTRY_PAD_SLOT)
 
@@ -1661,7 +1606,6 @@ void main() {
     const int hn = calc_pad_num(pc.width, pc.block_step);
     const int vn = calc_pad_num(pc.height, pc.block_step);
     const int num_blocks = hn * vn;
-    const int tw = TW;
     const int tsub = sub * 2 * 16 * TSTRIDE;
 
     for (int block_id = int(gl_WorkGroupID.x) * SUB_BLOCKS + sub;
