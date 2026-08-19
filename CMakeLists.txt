@@ -112,7 +112,7 @@ if(VK_GLSLC)
     # The fused kernel uses subgroup barriers instead of workgroup barriers
     # (each 16-lane block lives entirely in one wavefront), so SPIR-V 1.3+ is
     # required.
-    set(VK_DFT_ENTRIES pad pad_slot col2im)
+    set(VK_DFT_ENTRIES pad pad_slot pad_direct col2im)
     set(VK_DFT_BITS "16" "32")
     foreach(bits IN LISTS VK_DFT_BITS)
         foreach(entry IN LISTS VK_DFT_ENTRIES)
@@ -121,6 +121,8 @@ if(VK_GLSLC)
                 list(APPEND defs -DENTRY_PAD)
             elseif(entry STREQUAL pad_slot)
                 list(APPEND defs -DENTRY_PAD_SLOT)
+            elseif(entry STREQUAL pad_direct)
+                list(APPEND defs -DENTRY_PAD_DIRECT)
             else()
                 list(APPEND defs -DENTRY_COL2IM)
             endif()
@@ -178,6 +180,7 @@ add_custom_command(
             "${VK_SPV_DIR}/gaussblur_32_horiz.spv"
             "${VK_SPV_DIR}/dfttest_16_pad.spv"
             "${VK_SPV_DIR}/dfttest_16_pad_slot.spv"
+            "${VK_SPV_DIR}/dfttest_16_pad_direct.spv"
             "${VK_SPV_DIR}/dfttest_16_col2im.spv"
             "${VK_SPV_DIR}/dfttest_16_fused_r0.spv"
             "${VK_SPV_DIR}/dfttest_16_fused_r1.spv"
@@ -185,6 +188,7 @@ add_custom_command(
             "${VK_SPV_DIR}/dfttest_16_fused_r3.spv"
             "${VK_SPV_DIR}/dfttest_32_pad.spv"
             "${VK_SPV_DIR}/dfttest_32_pad_slot.spv"
+            "${VK_SPV_DIR}/dfttest_32_pad_direct.spv"
             "${VK_SPV_DIR}/dfttest_32_col2im.spv"
             "${VK_SPV_DIR}/dfttest_32_fused_r0.spv"
             "${VK_SPV_DIR}/dfttest_32_fused_r1.spv"

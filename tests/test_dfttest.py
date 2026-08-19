@@ -13,10 +13,12 @@ Run from the repository root:  python -m pytest tests/test_dfttest.py
 
 import ctypes
 import json
+import os
 import subprocess
 import sys
 import textwrap
 import threading
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -102,6 +104,44 @@ def test_dfttest_parallel_load_consistent(noise_gray):
         assert np.abs(a[n] - r).max() < 1e-6, f"parallel 1/serial mismatch at frame {n}"
         assert np.abs(b[n] - r).max() < 1e-6, f"parallel 2/serial mismatch at frame {n}"
         assert np.abs(a[n] - b[n]).max() < 1e-6, f"nondeterministic output at frame {n}"
+
+
+# ---------------------------------------------------------------------------
+# Pipelined-reader stress (regression)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("num_streams", [1, 4])
+def test_dfttest_vspipe_pipelined_no_hang(num_streams):
+    """vspipe's pipelined reader plus VapourSynth's prefetch activate frames
+    11+ ahead of the in-flight frames. With the old batched pad submit, a
+    reader's copy submit could land on the queue before the padder's pad
+    submit; RADV stalls the queue behind the unsignaled semaphore wait and
+    the whole run hangs with the GPU idle. Pads are now submitted at claim
+    time (before any dependent reader can commit), so the backward
+    dependency is structurally impossible — this test times out if it
+    regresses.
+
+    Runs the real benchmark as a subprocess (synthetic BlankClip, the
+    reproducer's workload) so that vspipe's reader, not a Python get_frame
+    loop, drives the frame requests.
+    """
+    bench = Path(__file__).resolve().parent.parent / "benchmark" / "bench.py"
+    cmd = [sys.executable, str(bench), "--synthetic", "--frames", "200",
+           "--filter", "dfttest", "vsfeel"]
+    if num_streams != 1:
+        cmd += ["--num-streams", str(num_streams)]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120,
+            env={**os.environ, "MANGOHUD": "0"},
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("benchmark run hung (queue stall / semaphore deadlock)")
+    assert result.returncode == 0, (
+        f"bench exited {result.returncode}:\n{result.stdout}\n{result.stderr}")
+    fps_line = next((line for line in result.stdout.splitlines()
+                     if "vsfeel" in line and "fps" in line), None)
+    assert fps_line, f"no vsfeel fps line:\n{result.stdout}\n{result.stderr}"
 
 
 # ---------------------------------------------------------------------------

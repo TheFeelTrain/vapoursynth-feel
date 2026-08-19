@@ -393,7 +393,32 @@ struct PlaneConfig {
     VkDeviceSize slot_plane_bytes {}; // pw * ph * bytes (one padded plane)
 };
 
+// per-resource stable metadata (the pool moves VK_Resource objects, so the
+// frame generation counter and fence handle live in a stable allocation)
+struct ResMeta {
+    VkFence fence {};        // whole-frame fence (fused + col2im submit)
+    std::atomic<long long> frame_gen { 0 };
+};
+
+// per-slot frame-cache state (index: plane * slot_count + slot). A slot
+// owns exactly one source frame (gen) at a time: the first frame that needs
+// it pads it (claim) and every later frame whose window contains it just
+// D2D-copies it (commit). A slot may only be reclaimed for a different
+// source once all committed readers' resources have been reused (their
+// frames are then fully done, copies included), which is checked against
+// frame_gen — no host fence waits, no deadlocks. `sem` holds the current
+// generation's binary semaphores: fresh per generation (created at claim,
+// destroyed at reclaim), so a stale signal can never leak across
+// generations.
+struct SlotState {
+    long long gen { -1 };        // source frame the slot owns (-1 = empty)
+    std::vector<std::pair<int, long long>> committed; // readers: {res_id, frame_gen}
+    std::vector<VkSemaphore> sem; // tw semaphores, one per reader offset
+};
+
 struct VK_Resource {
+    int id {};
+    ResMeta * meta {};
     VkBuffer staging {};
     VkDeviceMemory staging_mem {};
     VkBuffer padded_buf {};         // device-local padded source planes
@@ -402,7 +427,11 @@ struct VK_Resource {
     VkDeviceMemory spatial_mem {};
     VkCommandPool pool {};
     VkCommandBuffer cmd {};      // pre-recorded fused + col2im
-    VkCommandBuffer cmd2 {};     // per-frame prepare (slot pads + D2D copies)
+    VkCommandBuffer cmd2 {};     // per-frame D2D copies (slot -> padded planes)
+    // one pad command buffer per (plane, temporal slice): a pad op records
+    // and submits its own at claim time; a per-op buffer guarantees a buffer
+    // is never re-recorded while its previous submission is still executing
+    std::vector<VkCommandBuffer> cmd_pad {};
     VkFence fence {};
     VkDescriptorSet desc_set {};
     VkQueue queue {};
@@ -461,10 +490,12 @@ struct DftData {
     VkDescriptorPool desc_pool {};
     VkShaderModule pad_module {};
     VkShaderModule pad_slot_module {};
+    VkShaderModule pad_direct_module {};
     VkShaderModule col2im_module {};
     VkShaderModule fused_module[4] {};
     VkPipeline pad_pipeline {};
     VkPipeline pad_slot_pipeline {};
+    VkPipeline pad_direct_pipeline {};
     VkPipeline col2im_pipeline {};
     VkPipeline fused_pipeline[4] {};
 
@@ -485,14 +516,19 @@ struct DftData {
 
     // padded-source frame cache: each source frame is reflect-pad'd once into a
     // slot and reused across the tw-frame window via D2D copies (vszipcl-style).
-    // Only used for num_streams == 1 (single queue): with multiple queues a
-    // cross-queue semaphore wait could be scheduled before its signal, so the
-    // multi-stream path falls back to padding every frame (no cross-frame deps).
-    bool use_cache {};
+    // Works for any num_streams: the slot state machine (gen / committed readers
+    // under slot_lock) decides who pads and who reads; cross-queue visibility is
+    // provided by per-slot semaphores (the pad submit signals, the copy submit
+    // waits). The pad is submitted at claim time (under slot_lock) so a backward
+    // semaphore dependency on the queue is impossible, and a slot is only
+    // reclaimed once every committed reader's resource has been reused (frame
+    // done), so no host fence waits are needed.
     VkBuffer slot_buf {};
     VkDeviceMemory slot_mem {};
-    int slot_count {};                            // K slots per plane
-    std::unique_ptr<std::atomic<long long>[]> slot_owner {}; // source frame in each slot
+    int slot_count {};              // K slots per plane
+    std::mutex slot_lock {};
+    std::vector<SlotState> slots {};
+    std::vector<std::unique_ptr<ResMeta>> res_meta {};
     bool need_fill {};
     std::array<PlaneConfig, 3> planes {};
     ticket_semaphore semaphore;
@@ -543,7 +579,13 @@ struct DftData {
                 vkDestroyBuffer(dev, resource.spatial_buf, nullptr);
             }
             if (resource.cmd) {
-                vkFreeCommandBuffers(dev, resource.pool, 2, &resource.cmd);
+                VkCommandBuffer cbs[2] { resource.cmd, resource.cmd2 };
+                vkFreeCommandBuffers(dev, resource.pool, 2, cbs);
+            }
+            if (!resource.cmd_pad.empty()) {
+                vkFreeCommandBuffers(dev, resource.pool,
+                    static_cast<uint32_t>(resource.cmd_pad.size()),
+                    resource.cmd_pad.data());
             }
             if (resource.pool) {
                 vkDestroyCommandPool(dev, resource.pool, nullptr);
@@ -553,6 +595,11 @@ struct DftData {
             }
         }
 
+        for (auto & st : slots) {
+            for (auto & sem : st.sem) {
+                vkDestroySemaphore(dev, sem, nullptr);
+            }
+        }
         if (slot_mem) {
             vkFreeMemory(dev, slot_mem, nullptr);
         }
@@ -576,6 +623,9 @@ struct DftData {
         if (pad_slot_pipeline) {
             vkDestroyPipeline(dev, pad_slot_pipeline, nullptr);
         }
+        if (pad_direct_pipeline) {
+            vkDestroyPipeline(dev, pad_direct_pipeline, nullptr);
+        }
         for (auto & p : fused_pipeline) {
             if (p) {
                 vkDestroyPipeline(dev, p, nullptr);
@@ -598,6 +648,9 @@ struct DftData {
         }
         if (pad_slot_module) {
             vkDestroyShaderModule(dev, pad_slot_module, nullptr);
+        }
+        if (pad_direct_module) {
+            vkDestroyShaderModule(dev, pad_direct_module, nullptr);
         }
         for (auto & m : fused_module) {
             if (m) {
@@ -713,17 +766,23 @@ static bool trivial_kernels() {
     return v;
 }
 
+static bool dfttest_trace() {
+    static const bool v = getenv("VSFEEL_DFTTEST_TRACE") != nullptr;
+    return v;
+}
+
 // Frame-cache slot operation for one (plane, temporal slice) of an output
-// frame: the source frame f is either new (padded into its slot now) or
-// already cached (D2D-copied from its slot).
+// frame: the source frame f is either new (padded now, into its slot or
+// directly into the padded buffer if every slot is busy) or already cached
+// (D2D-copied from its slot).
 struct SlotOp {
     int plane {};
     int t {};
     long long f {};
-    int slot {};
+    int slot { -1 };           // owning slot, or -1 (direct pad, no copy)
     VkDeviceSize slot_base {};
     bool is_pad {};
-    int which {};  // for reads: n - pad_frame (0 = same frame, no wait)
+    int which {};  // reader offset: n - pad_frame (selects the slot semaphore)
 };
 
 static PushConstants base_pc(const DftData & d) {
@@ -751,15 +810,125 @@ static PushConstants base_pc(const DftData & d) {
     };
 }
 
-// Records the per-frame prepare command buffer (resource.cmd2): reflect-pad
-// the new source frames into the shared slots, then D2D-copy all tw padded
-// planes into the resource's padded buffer (which the pre-recorded
-// fused+col2im command buffer reads). With the multi-stream fallback it
-// instead pads every temporal slice directly (no slots).
-static std::optional<std::string> record_prepare_cb(
+// Appends one pad dispatch (an open command buffer) for a pad op: into the
+// shared slot (pad_slot_pipeline) or, when the op has no slot, straight into
+// the resource's padded buffer (pad_direct_pipeline).
+static void record_one_pad_dispatch(
+    VkCommandBuffer cmd, const DftData & d, const VK_Resource & resource,
+    const SlotOp & op) {
+
+    const auto & cfg = d.planes[op.plane];
+    PushConstants pc = base_pc(d);
+    // the pad kernels apply the temporal offset themselves (pc.pad_t0 *
+    // up_slice); do not add it to src_base as well
+    pc.src_base = static_cast<int32_t>(cfg.upload_offset);
+    pc.pad_t0 = op.t;
+    pc.width = cfg.width;
+    pc.height = cfg.height;
+    pc.src_stride = cfg.width;
+    pc.dst_stride = cfg.width;
+
+    if (op.slot >= 0) {
+        pc.padded_base = static_cast<int32_t>(op.slot_base);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.pad_slot_pipeline);
+    } else {
+        pc.padded_base = static_cast<int32_t>(cfg.padded_offset);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.pad_direct_pipeline);
+    }
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
+    vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+        0, sizeof(PushConstants), &pc);
+    const uint32_t max_grid_x = d.device->limits.maxComputeWorkGroupCount[0];
+    const uint32_t max_grid_y = d.device->limits.maxComputeWorkGroupCount[1];
+    const uint32_t gx = std::min<uint32_t>(
+        (static_cast<uint32_t>(cfg.pw) + 31) / 32, max_grid_x);
+    const uint32_t gy = std::min<uint32_t>(
+        (static_cast<uint32_t>(cfg.ph) + 7) / 8, max_grid_y);
+    vkCmdDispatch(cmd, std::max(gx, 1u), std::max(gy, 1u), 1);
+}
+
+// Records the slot-pad command buffer (resource.cmd_pad[0]): one pad
+// dispatch per pad op. Used by the GPU bench (debug); in the normal flow
+// each pad op records and submits its own command buffer at claim time.
+static std::optional<std::string> record_pad_cb(
     const DftData & d, VK_Resource & resource, const std::vector<SlotOp> & ops) {
 
+    VkCommandBuffer cmd = resource.cmd_pad[0];
+
+    VkCommandBufferBeginInfo begin_info {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .pInheritanceInfo = nullptr
+    };
+    if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
+        return "vkBeginCommandBuffer (pad) failed";
+    }
+
+    if (!trivial_kernels()) {
+        for (const SlotOp & op : ops) {
+            if (!op.is_pad) {
+                continue;
+            }
+            record_one_pad_dispatch(cmd, d, resource, op);
+        }
+    }
+
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        return "vkEndCommandBuffer (pad) failed";
+    }
+    return std::nullopt;
+}
+
+// Records and submits one pad op's command buffer immediately (called at
+// claim time, still holding slot_lock; takes queue_lock). Signalling the
+// slot's semaphores here — before any reader of this generation can commit —
+// makes a backward semaphore dependency on the queue impossible: every
+// reader's copy submit is queued after this pad submit.
+static bool submit_pad_op(
+    const DftData & d, VK_Resource & resource, const SlotOp & op) {
+
     const VkDevice dev = d.device->device;
+    VkCommandBuffer cmd = resource.cmd_pad[op.plane * d.tw + op.t];
+    VkCommandBufferBeginInfo begin_info {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .pInheritanceInfo = nullptr
+    };
+    if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
+        return false;
+    }
+    if (!trivial_kernels()) {
+        record_one_pad_dispatch(cmd, d, resource, op);
+    }
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        return false;
+    }
+
+    std::lock_guard qlock(*resource.queue_lock);
+    VkSubmitInfo si {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .pNext = nullptr,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd
+    };
+    if (op.slot >= 0) {
+        const auto & st = d.slots[op.plane * d.slot_count + op.slot];
+        si.signalSemaphoreCount = static_cast<uint32_t>(st.sem.size());
+        si.pSignalSemaphores = st.sem.data();
+    }
+    return vkQueueSubmit(resource.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS;
+}
+
+// Records the per-frame D2D copy command buffer (resource.cmd2): every slot
+// of the temporal window -> this resource's padded planes. The copies read
+// the slots (written by pads that may have run on another queue), so the
+// submit carrying this buffer waits on the slot semaphores.
+static std::optional<std::string> record_copy_cb(
+    const DftData & d, VK_Resource & resource, const std::vector<SlotOp> & ops) {
+
     VkCommandBuffer cmd = resource.cmd2;
 
     VkCommandBufferBeginInfo begin_info {
@@ -769,124 +938,37 @@ static std::optional<std::string> record_prepare_cb(
         .pInheritanceInfo = nullptr
     };
     if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
-        return "vkBeginCommandBuffer (prepare) failed";
+        return "vkBeginCommandBuffer (copy) failed";
     }
 
     if (!trivial_kernels()) {
-        const PushConstants base = base_pc(d);
-        const uint32_t max_grid_x = d.device->limits.maxComputeWorkGroupCount[0];
-        const uint32_t max_grid_y = d.device->limits.maxComputeWorkGroupCount[1];
-
-        if (d.use_cache) {
-            // frame cache: pad the new source frames into their slots
-            for (const SlotOp & op : ops) {
-                if (!op.is_pad) {
-                    continue;
-                }
-                const auto & cfg = d.planes[op.plane];
-                PushConstants pc = base;
-                pc.padded_base = static_cast<int32_t>(op.slot_base);
-                // the slot kernel applies the temporal offset itself
-                // (pc.pad_t0 * up_slice); do not add it here as well
-                pc.src_base = static_cast<int32_t>(cfg.upload_offset);
-                pc.pad_t0 = op.t;
-                pc.width = cfg.width;
-                pc.height = cfg.height;
-                pc.src_stride = cfg.width;
-                pc.dst_stride = cfg.width;
-
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.pad_slot_pipeline);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                    d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
-                vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                    0, sizeof(PushConstants), &pc);
-                const uint32_t gx = std::min<uint32_t>(
-                    (static_cast<uint32_t>(cfg.pw) + 31) / 32, max_grid_x);
-                const uint32_t gy = std::min<uint32_t>(
-                    (static_cast<uint32_t>(cfg.ph) + 7) / 8, max_grid_y);
-                vkCmdDispatch(cmd, std::max(gx, 1u), std::max(gy, 1u), 1);
+        for (const SlotOp & op : ops) {
+            if (op.slot < 0) {
+                continue;  // direct pad: the plane is already in padded_buf
             }
-
-            // the pad writes must be visible to the D2D copies below
-            bool any_pad = false;
-            for (const SlotOp & op : ops) {
-                any_pad = any_pad || op.is_pad;
-            }
-            if (any_pad) {
-                VkMemoryBarrier mem_barrier {
-                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                    .pNext = nullptr,
-                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT
-                };
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
-            }
-
-            // D2D: every slot -> this resource's padded planes
-            for (const SlotOp & op : ops) {
-                const auto & cfg = d.planes[op.plane];
-                VkBufferCopy copy {
-                    .srcOffset = op.slot_base,
-                    .dstOffset = cfg.padded_offset +
-                        static_cast<VkDeviceSize>(op.t) * cfg.slot_plane_bytes,
-                    .size = cfg.slot_plane_bytes
-                };
-                vkCmdCopyBuffer(cmd, d.slot_buf, resource.padded_buf, 1, &copy);
-            }
-
-            // the copies must be visible to the fused kernel (next command buffer)
-            VkMemoryBarrier mem_barrier {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+            const auto & cfg = d.planes[op.plane];
+            VkBufferCopy copy {
+                .srcOffset = op.slot_base,
+                .dstOffset = cfg.padded_offset +
+                    static_cast<VkDeviceSize>(op.t) * cfg.slot_plane_bytes,
+                .size = cfg.slot_plane_bytes
             };
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
-        } else {
-            // multi-stream path: pad every temporal slice of every plane
-            // directly into the resource's padded buffer (no frame cache)
-            for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
-                if (!d.process[plane]) {
-                    continue;
-                }
-                const auto & cfg = d.planes[plane];
-                PushConstants pc = base;
-                pc.padded_base = static_cast<int32_t>(cfg.padded_offset);
-                pc.src_base = static_cast<int32_t>(cfg.upload_offset);
-                pc.pad_t0 = 0;
-                pc.width = cfg.width;
-                pc.height = cfg.height;
-                pc.src_stride = cfg.width;
-                pc.dst_stride = cfg.width;
-
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.pad_pipeline);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                    d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
-                vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                    0, sizeof(PushConstants), &pc);
-                const uint32_t gx = std::min<uint32_t>(
-                    (static_cast<uint32_t>(cfg.pw) + 31) / 32, max_grid_x);
-                const uint32_t gy = std::min<uint32_t>(
-                    (static_cast<uint32_t>(cfg.ph) + 7) / 8, max_grid_y);
-                vkCmdDispatch(cmd, std::max(gx, 1u), std::max(gy, 1u), 1);
-            }
-
-            // the pad writes must be visible to the fused kernel (next command buffer)
-            VkMemoryBarrier mem_barrier {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
-            };
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+            vkCmdCopyBuffer(cmd, d.slot_buf, resource.padded_buf, 1, &copy);
         }
+
+        // the copies must be visible to the fused kernel (next command buffer)
+        VkMemoryBarrier mem_barrier {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
     }
 
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-        return "vkEndCommandBuffer (prepare) failed";
+        return "vkEndCommandBuffer (copy) failed";
     }
     return std::nullopt;
 }
@@ -1041,13 +1123,18 @@ static const VSFrame *VS_CC DftGetFrame(
 
         auto t0 = std::chrono::steady_clock::now();
 
-        // Note on the frame cache and out-of-order processing: no
-        // cross-frame synchronization is needed. The slot_owner atomics
-        // decide who pads a slot (the first frame that touches it, in
-        // wall-clock order; the store happens before that frame's submit)
-        // and who reads it (every later frame, whose submit is therefore
-        // strictly after the pad's submit). With a single queue the GPU
-        // executes the pad before the copy by queue ordering alone.
+        // Note on the frame cache and out-of-order processing: the slot
+        // state (gen/committed) under slot_lock decides who pads a slot (the
+        // first frame that touches it, in wall-clock order) and who reads it.
+        // The pad is submitted at claim time, still under slot_lock, so every
+        // reader's copy submit (which needs slot_lock to commit first) is
+        // queued after the pad submit that signals the slot's semaphores — a
+        // backward semaphore dependency on the queue, which stalls it, is
+        // structurally impossible. A slot is only reclaimed for a new source
+        // once every committed reader's resource has been reused (frame_gen
+        // advanced past their commit generation), which implies their frames
+        // — copies included — are fully done, so the overwrite never races a
+        // reader's copy. No host fence waits anywhere: no deadlocks.
         d->semaphore.acquire();
         auto t1 = std::chrono::steady_clock::now();
         d->resources_lock.lock();
@@ -1071,19 +1158,38 @@ static const VSFrame *VS_CC DftGetFrame(
         VkDevice dev = d->device->device;
         float * map = resource.map;
 
+        // Frame generation for this resource: a slot may only be reclaimed
+        // for a new source once every committed reader's resource has been
+        // reused (frame_gen advanced past their commit generation), which
+        // implies those frames — copies included — are fully done.
+        const long long my_gen =
+            d->res_meta[resource.id]->frame_gen.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        checkVK(vkResetFences(dev, 1, &resource.fence));
+
+        if (dfttest_trace()) {
+            fprintf(stderr, "[dfttest-trace] n=%d res=%d gen=%lld start\n",
+                n, resource.id, (long long)my_gen);
+        }
+
         auto t2 = std::chrono::steady_clock::now();
 
         const bool coherent =
             !!(d->device->mem_props.memoryTypes[resource.staging_type_index].propertyFlags &
                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-        // Padded-source frame cache: each source frame of the temporal window is
-        // either already reflect-pad'd into its slot (D2D copy) or new (upload +
-        // pad into the slot now). A slot's semaphore is signaled when its pad
-        // completes; readers wait on it.
+        // Padded-source frame cache: each source frame of the temporal window
+        // is either already reflect-pad'd into a slot (D2D copy) or new
+        // (upload + pad into a slot now; if every slot is busy, pad the slice
+        // straight into this resource's padded buffer instead). The slot state
+        // machine (under slot_lock) decides who pads (first frame in
+        // wall-clock order) and who reads. See the note above for why the pad
+        // is submitted at claim time and how slot reclamation stays safe.
         std::vector<SlotOp> ops;
         ops.reserve(d->vi->format.numPlanes * tw);
-        std::vector<VkMappedMemoryRange> flush_ranges;
+        std::vector<VkSemaphore> waits;
+        waits.reserve(ops.capacity());
+        const bool force_pad = getenv("VSFEEL_DFTTEST_FORCEPAD") != nullptr;
         for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
             if (!d->process[plane]) {
                 continue;
@@ -1092,23 +1198,63 @@ static const VSFrame *VS_CC DftGetFrame(
             const size_t row_bytes = static_cast<size_t>(cfg.width) * d->bytes;
             for (int t = 0; t < tw; ++t) {
                 const int idx = std::clamp(n - d->radius + t, 0, d->vi->numFrames - 1);
-                const int slot = static_cast<int>(idx % d->slot_count);
+                const int which = n - std::max(0, idx - d->radius);
                 SlotOp op;
                 op.plane = plane;
                 op.t = t;
                 op.f = idx;
-                op.slot = slot;
-                op.slot_base = cfg.slot_offset +
-                    static_cast<VkDeviceSize>(slot) * cfg.slot_plane_bytes;
-                bool do_pad = !d->use_cache;
-                if (d->use_cache) {
-                    const bool force_pad = getenv("VSFEEL_DFTTEST_FORCEPAD") != nullptr;
-                    do_pad = force_pad ||
-                        d->slot_owner[plane * d->slot_count + slot].load(std::memory_order_relaxed) != idx;
+                op.which = which;
+
+                // find the slot that owns this source (any slot may hold it:
+                // reclamation can move a source off its natural slot)
+                auto find_owner = [&]() {
+                    for (int s = 0; s < d->slot_count; ++s) {
+                        if (d->slots[plane * d->slot_count + s].gen == idx) {
+                            return s;
+                        }
+                    }
+                    return -1;
+                };
+
+                // register this frame as a reader of the slot's current
+                // generation and wait on its semaphore for this reader offset
+                // (deduped: at temporal boundaries two slices of one frame map
+                // to the same source, hence the same slot and which)
+                auto commit_reader = [&](int s) {
+                    SlotState & st = d->slots[plane * d->slot_count + s];
+                    st.committed.push_back({ resource.id, my_gen });
+                    op.slot = s;
+                    op.slot_base = cfg.slot_offset +
+                        static_cast<VkDeviceSize>(s) * cfg.slot_plane_bytes;
+                    const VkSemaphore wsem = st.sem[which];
+                    bool dup = false;
+                    for (auto w : waits) {
+                        if (w == wsem) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        waits.push_back(wsem);
+                    }
+                };
+
+                bool done = false;
+                {
+                    std::lock_guard lk(d->slot_lock);
+                    if (!force_pad) {
+                        const int owner = find_owner();
+                        if (owner >= 0) {
+                            commit_reader(owner);
+                            done = true;
+                        }
+                    }
                 }
-                if (do_pad) {
-                    op.which = 0;
-                    op.is_pad = true;
+                if (!done) {
+                    // padder candidate: upload this source plane to this
+                    // resource's staging, flush it, then re-claim (another
+                    // frame may have padded this source in the meantime, in
+                    // which case this upload was wasted)
                     const uint8_t * srcp = vsapi->getReadPtr(src[t], plane);
                     const int src_stride = vsapi->getStride(src[t], plane);
                     uint8_t * dstp = reinterpret_cast<uint8_t *>(map) + cfg.upload_offset +
@@ -1122,31 +1268,98 @@ static const VSFrame *VS_CC DftGetFrame(
                         }
                     }
                     if (!coherent) {
-                        flush_ranges.push_back(VkMappedMemoryRange {
+                        VkMappedMemoryRange flush_range {
                             .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                             .pNext = nullptr,
                             .memory = resource.staging_mem,
                             .offset = cfg.upload_offset +
                                 static_cast<size_t>(t) * cfg.upload_bytes / tw,
                             .size = cfg.upload_bytes / tw,
-                        });
+                        };
+                        checkVK(vkFlushMappedMemoryRanges(dev, 1, &flush_range));
                     }
-                    if (d->use_cache) {
-                        d->slot_owner[plane * d->slot_count + slot]
-                            .store(idx, std::memory_order_relaxed);
+
+                    std::lock_guard lk(d->slot_lock);
+                    int owner = -1;
+                    if (!force_pad) {
+                        owner = find_owner();
                     }
-                } else {
-                    // the slot was pad'd by the first frame that used source idx
-                    const int pad_frame = std::max(0, idx - d->radius);
-                    op.which = n - pad_frame;
+                    if (owner >= 0) {
+                        commit_reader(owner);
+                        done = true;
+                    } else {
+                        // padder: the slot may be taken iff it is empty or its
+                        // old generation's readers are all done (their
+                        // resources reused); natural slot first, then any free
+                        auto slot_free = [&](const SlotState & st) {
+                            if (st.gen == -1) {
+                                return true;
+                            }
+                            for (const auto & cr : st.committed) {
+                                if (d->res_meta[cr.first]->frame_gen.load(
+                                        std::memory_order_relaxed) <= cr.second) {
+                                    return false;
+                                }
+                            }
+                            return true;
+                        };
+                        const int natural = static_cast<int>(idx % d->slot_count);
+                        int slot = -1;
+                        for (int i = 0; i < d->slot_count; ++i) {
+                            const int s = (natural + i) % d->slot_count;
+                            if (slot_free(d->slots[plane * d->slot_count + s])) {
+                                slot = s;
+                                break;
+                            }
+                        }
+                        if (slot >= 0) {
+                            SlotState & st = d->slots[plane * d->slot_count + slot];
+                            if (st.gen != -1) {
+                                if (dfttest_trace()) {
+                                    fprintf(stderr,
+                                        "[dfttest-trace]   n=%d reclaim p%d slot=%d oldgen=%lld newgen=%d\n",
+                                        n, plane, slot, (long long)st.gen, idx);
+                                }
+                                for (auto & sem : st.sem) {
+                                    vkDestroySemaphore(dev, sem, nullptr);
+                                }
+                                st.sem.clear();
+                            }
+                            st.gen = idx;
+                            st.committed = { { resource.id, my_gen } };
+                            st.sem.resize(d->tw);
+                            for (auto & sem : st.sem) {
+                                VkSemaphoreCreateInfo sem_info {
+                                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+                                    .pNext = nullptr,
+                                    .flags = 0
+                                };
+                                checkVK(vkCreateSemaphore(dev, &sem_info, nullptr, &sem));
+                            }
+                            op.slot = slot;
+                            op.slot_base = cfg.slot_offset +
+                                static_cast<VkDeviceSize>(slot) * cfg.slot_plane_bytes;
+                            op.is_pad = true;
+                            if (!submit_pad_op(*d, resource, op)) {
+                                return set_error("vkQueueSubmit (pad) failed");
+                            }
+                        } else {
+                            // every slot is busy: pad this slice straight into
+                            // the padded buffer (no slot, no copy, no sems)
+                            op.is_pad = true;
+                            if (!submit_pad_op(*d, resource, op)) {
+                                return set_error("vkQueueSubmit (pad direct) failed");
+                            }
+                        }
+                    }
+                }
+
+                if (dfttest_trace()) {
+                    fprintf(stderr, "[dfttest-trace]   n=%d op p%d t%d idx=%d slot=%d which=%d %s\n",
+                        n, plane, t, idx, op.slot, which, op.is_pad ? "PAD" : "read");
                 }
                 ops.push_back(op);
             }
-        }
-
-        if (!flush_ranges.empty()) {
-            checkVK(vkFlushMappedMemoryRanges(dev,
-                static_cast<uint32_t>(flush_ranges.size()), flush_ranges.data()));
         }
 
         auto t3 = std::chrono::steady_clock::now();
@@ -1154,8 +1367,14 @@ static const VSFrame *VS_CC DftGetFrame(
         if (const char * gb = getenv("VSFEEL_DFTTEST_GPU_BENCH"); gb && n == 0) {
             VkDevice dev0 = d->device->device;
             const int iters = atoi(gb);
+            // the ops loop already submitted this frame's pads; wait for the
+            // queue to drain before re-recording their command buffers
+            vkDeviceWaitIdle(dev0);
             auto bench_stage = [&](int stage, const char * name) {
-                if (record_prepare_cb(*d, resource, ops)) {
+                if (record_pad_cb(*d, resource, ops)) {
+                    return;
+                }
+                if (record_copy_cb(*d, resource, ops)) {
                     return;
                 }
                 if (record_fused_col2im_cb(*d, resource, stage >= 1, stage >= 2)) {
@@ -1165,26 +1384,45 @@ static const VSFrame *VS_CC DftGetFrame(
                 for (int i = 0; i < iters; ++i) {
                     std::lock_guard lock(*resource.queue_lock);
                     vkResetFences(dev0, 1, &resource.fence);
-                    VkCommandBuffer cbs[2] { resource.cmd2, resource.cmd };
+                    VkCommandBuffer pad_cb = resource.cmd_pad[0];
+                    VkSubmitInfo pad_si {
+                        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .pNext = nullptr,
+                        .commandBufferCount = 1,
+                        .pCommandBuffers = &pad_cb
+                    };
+                    vkQueueSubmit(resource.queue, 1, &pad_si, VK_NULL_HANDLE);
+                    VkCommandBuffer copy_cb = resource.cmd2;
                     VkSubmitInfo si {
                         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                         .pNext = nullptr,
-                        .commandBufferCount = stage >= 1 ? 2u : 1u,
-                        .pCommandBuffers = cbs
+                        .commandBufferCount = 1,
+                        .pCommandBuffers = &copy_cb
                     };
                     vkQueueSubmit(resource.queue, 1, &si, resource.fence);
                     vkWaitForFences(dev0, 1, &resource.fence, VK_TRUE, UINT64_MAX);
+                    if (stage >= 1) {
+                        VkCommandBuffer cb = resource.cmd;
+                        VkSubmitInfo si2 {
+                            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                            .pNext = nullptr,
+                            .commandBufferCount = 1,
+                            .pCommandBuffers = &cb
+                        };
+                        vkQueueSubmit(resource.queue, 1, &si2, resource.fence);
+                        vkWaitForFences(dev0, 1, &resource.fence, VK_TRUE, UINT64_MAX);
+                    }
                 }
                 auto gb_end = std::chrono::steady_clock::now();
                 double ms = std::chrono::duration_cast<std::chrono::nanoseconds>(gb_end - gb_start).count() / 1e6 / iters;
                 fprintf(stderr, "[dfttest-gpubench] %-20s %.4f ms\n", name, ms);
             };
-            bench_stage(0, "pad");
-            bench_stage(1, "pad+fused");
-            bench_stage(2, "pad+fused+col2im");
+            bench_stage(0, "pad+copy");
+            bench_stage(1, "pad+copy+fused");
+            bench_stage(2, "pad+copy+fused+col2im");
         }
 
-        if (const auto err = record_prepare_cb(*d, resource, ops)) {
+        if (const auto err = record_copy_cb(*d, resource, ops)) {
             set_error(*err);
             return nullptr;
         }
@@ -1193,23 +1431,50 @@ static const VSFrame *VS_CC DftGetFrame(
             return nullptr;
         }
 
+        if (dfttest_trace()) {
+            fprintf(stderr, "[dfttest-trace]   n=%d res=%d submit: waits=%zu\n",
+                n, resource.id, waits.size());
+        }
+
         {
             std::lock_guard lock(*resource.queue_lock);
-
-            checkVK(vkResetFences(dev, 1, &resource.fence));
-
-            VkCommandBuffer cbs[2] { resource.cmd2, resource.cmd };
+            const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            VkCommandBuffer copy_cb = resource.cmd2;
             VkSubmitInfo si {
                 .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                 .pNext = nullptr,
-                .commandBufferCount = 2,
-                .pCommandBuffers = cbs
+                .waitSemaphoreCount = static_cast<uint32_t>(waits.size()),
+                .pWaitSemaphores = waits.empty() ? nullptr : waits.data(),
+                .pWaitDstStageMask = waits.empty() ? nullptr : &wait_stage,
+                .commandBufferCount = 1,
+                .pCommandBuffers = &copy_cb
             };
 
+            checkVK(vkQueueSubmit(resource.queue, 1, &si, VK_NULL_HANDLE));
+            if (dfttest_trace()) {
+                fprintf(stderr, "[dfttest-trace]   n=%d res=%d copy submitted\n", n, resource.id);
+            }
+        }
+
+        {
+            std::lock_guard lock(*resource.queue_lock);
+            VkCommandBuffer cb = resource.cmd;
+            VkSubmitInfo si {
+                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .pNext = nullptr,
+                .commandBufferCount = 1,
+                .pCommandBuffers = &cb
+            };
             checkVK(vkQueueSubmit(resource.queue, 1, &si, resource.fence));
+            if (dfttest_trace()) {
+                fprintf(stderr, "[dfttest-trace]   n=%d res=%d fused submitted\n", n, resource.id);
+            }
         }
 
         auto t4 = std::chrono::steady_clock::now();
+        if (dfttest_trace()) {
+            fprintf(stderr, "[dfttest-trace]   n=%d res=%d wait fence\n", n, resource.id);
+        }
         checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
         auto t5 = std::chrono::steady_clock::now();
 
@@ -1866,6 +2131,8 @@ static void VS_CC DftCreate(
         size_t pad_size = 0;
         const uint32_t * pad_slot_code = nullptr;
         size_t pad_slot_size = 0;
+        const uint32_t * pad_direct_code = nullptr;
+        size_t pad_direct_size = 0;
         const uint32_t * col2im_code = nullptr;
         size_t col2im_size = 0;
         const uint32_t * fused_code[4] {};
@@ -1874,6 +2141,7 @@ static void VS_CC DftCreate(
             case 16:
                 pad_code = dfttest_16_pad_spv;       pad_size = dfttest_16_pad_spv_size;
                 pad_slot_code = dfttest_16_pad_slot_spv; pad_slot_size = dfttest_16_pad_slot_spv_size;
+                pad_direct_code = dfttest_16_pad_direct_spv; pad_direct_size = dfttest_16_pad_direct_spv_size;
                 col2im_code = dfttest_16_col2im_spv; col2im_size = dfttest_16_col2im_spv_size;
                 fused_code[0] = dfttest_16_fused_r0_spv; fused_size[0] = dfttest_16_fused_r0_spv_size;
                 fused_code[1] = dfttest_16_fused_r1_spv; fused_size[1] = dfttest_16_fused_r1_spv_size;
@@ -1883,6 +2151,7 @@ static void VS_CC DftCreate(
             case 32:
                 pad_code = dfttest_32_pad_spv;       pad_size = dfttest_32_pad_spv_size;
                 pad_slot_code = dfttest_32_pad_slot_spv; pad_slot_size = dfttest_32_pad_slot_spv_size;
+                pad_direct_code = dfttest_32_pad_direct_spv; pad_direct_size = dfttest_32_pad_direct_spv_size;
                 col2im_code = dfttest_32_col2im_spv; col2im_size = dfttest_32_col2im_spv_size;
                 fused_code[0] = dfttest_32_fused_r0_spv; fused_size[0] = dfttest_32_fused_r0_spv_size;
                 fused_code[1] = dfttest_32_fused_r1_spv; fused_size[1] = dfttest_32_fused_r1_spv_size;
@@ -1906,6 +2175,13 @@ static void VS_CC DftCreate(
                 return set_error(std::get<std::string>(result));
             }
             d->pad_slot_module = std::get<VkShaderModule>(result);
+        }
+        {
+            const auto result = create_shader_module(*d->device, pad_direct_code, pad_direct_size);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            d->pad_direct_module = std::get<VkShaderModule>(result);
         }
         for (int r = 0; r < 4; ++r) {
             const auto result = create_shader_module(*d->device, fused_code[r], fused_size[r]);
@@ -1936,6 +2212,14 @@ static void VS_CC DftCreate(
                 return set_error(std::get<std::string>(result));
             }
             d->pad_slot_pipeline = std::get<VkPipeline>(result);
+        }
+        {
+            const auto result = create_pipeline(*d->device, d->pad_direct_module, d->pipeline_layout,
+                d->device->subgroup_size_control ? 32 : 0);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            d->pad_direct_pipeline = std::get<VkPipeline>(result);
         }
         for (int r = 0; r < 4; ++r) {
             const auto result = create_pipeline(*d->device, d->fused_module[r], d->pipeline_layout,
@@ -1969,15 +2253,9 @@ static void VS_CC DftCreate(
     d->semaphore.current.store(effective_streams - 1, std::memory_order::relaxed);
     d->resources.reserve(effective_streams);
 
-    // ---- frame-cache slot buffer + slot semaphores ----
-    // The cache is only safe with a single queue (num_streams == 1): with
-    // multiple queues a cross-queue semaphore wait can be scheduled before its
-    // signal, so the multi-stream path pads every frame directly (no slots).
-    d->use_cache = (d->num_streams <= 1);
+    // ---- frame-cache slot buffer (semaphores are created per generation) ----
     {
-        const VkDeviceSize slot_size = d->use_cache
-            ? std::max(d->slot_total, VkDeviceSize(4))
-            : VkDeviceSize(64);  // dummy: keeps descriptor binding 4 valid
+        const VkDeviceSize slot_size = std::max(d->slot_total, VkDeviceSize(4));
         VkBufferCreateInfo buffer_info {
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .pNext = nullptr,
@@ -1998,12 +2276,7 @@ static void VS_CC DftCreate(
         }
         d->slot_mem = std::get<AllocatedMemory>(result).memory;
 
-        if (d->use_cache) {
-            d->slot_owner = std::make_unique<std::atomic<long long>[]>(num_planes * d->slot_count);
-            for (int i = 0; i < num_planes * d->slot_count; ++i) {
-                d->slot_owner[i].store(-1, std::memory_order_relaxed);
-            }
-        }
+        d->slots.resize(num_planes * d->slot_count);
     }
 
     const uint32_t num_queues = std::min(
@@ -2091,17 +2364,19 @@ static void VS_CC DftCreate(
             checkVK(vkCreateCommandPool(dev, &pool_info, nullptr, &resource.pool));
         }
         {
+            const uint32_t n_pad = static_cast<uint32_t>(d->tw) * num_planes;
             VkCommandBufferAllocateInfo alloc_info {
                 .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                 .pNext = nullptr,
                 .commandPool = resource.pool,
                 .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                .commandBufferCount = 2
+                .commandBufferCount = 2 + n_pad
             };
-            VkCommandBuffer cbs[2];
-            checkVK(vkAllocateCommandBuffers(dev, &alloc_info, cbs));
+            std::vector<VkCommandBuffer> cbs(2 + n_pad);
+            checkVK(vkAllocateCommandBuffers(dev, &alloc_info, cbs.data()));
             resource.cmd = cbs[0];
             resource.cmd2 = cbs[1];
+            resource.cmd_pad.assign(cbs.begin() + 2, cbs.end());
         }
         {
             VkFenceCreateInfo fence_info {
@@ -2111,6 +2386,10 @@ static void VS_CC DftCreate(
             };
             checkVK(vkCreateFence(dev, &fence_info, nullptr, &resource.fence));
         }
+        resource.id = i;
+        d->res_meta.push_back(std::make_unique<ResMeta>());
+        d->res_meta.back()->fence = resource.fence;
+        resource.meta = d->res_meta.back().get();
         {
             VkDescriptorSetAllocateInfo alloc_info {
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,

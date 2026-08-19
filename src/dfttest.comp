@@ -1608,6 +1608,34 @@ void main() {
 
 #endif // ENTRY_PAD_SLOT
 
+// pad_direct: like pad_slot, but writes one padded temporal slice straight
+// into the per-resource padded buffer (fallback when every cache slot is
+// busy: no slot, no D2D copy, no semaphore).
+#if defined(ENTRY_PAD_DIRECT)
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    const int pw = calc_pad_size(pc.width, pc.block_step);
+    const int ph = calc_pad_size(pc.height, pc.block_step);
+    const int pad_x = (pw - pc.width) / 2;
+    const int pad_y = (ph - pc.height) / 2;
+    const int up_slice = pc.height * pc.src_stride;
+    const int pad_slice = pw * ph;
+
+    for (int y = int(gl_GlobalInvocationID.y); y < ph; y += int(gl_NumWorkGroups.y) * 8) {
+        for (int x = int(gl_GlobalInvocationID.x); x < pw; x += int(gl_NumWorkGroups.x) * 32) {
+            int sx = x - pad_x;
+            int sy = y - pad_y;
+            sx = sx < 0 ? -sx : (sx >= pc.width ? 2 * (pc.width - 1) - sx : sx);
+            sy = sy < 0 ? -sy : (sy >= pc.height ? 2 * (pc.height - 1) - sy : sy);
+            const uint raw = load_upload(pc.pad_t0 * up_slice + sy * pc.src_stride + sx);
+            store_padded(pc.pad_t0 * pad_slice + y * pw + x, to_float(raw));
+        }
+    }
+}
+
+#endif // ENTRY_PAD_DIRECT
+
 // ---------------------------------------------------------------------------
 // fused: im2col + 3D DFT + filter + inverse + center-slice col
 // One 16x16 block per workgroup; the 16 invocations act as the 16 lanes of
