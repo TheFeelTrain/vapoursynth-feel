@@ -53,7 +53,7 @@ layout(constant_id = 13) const float H2_INV_NORM = 1.0;
 #define NPIX      (STRIDE * VI_DIM_Y)        /* io elements per output channel */
 
 #ifndef ENTRY_PAD
-layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
 #endif
 
 #if BITS == 16
@@ -187,7 +187,7 @@ float nlm_pix_dist(int a0, int a1, int a2, int b0, int b1, int b2,
 #ifdef ENTRY_WEIGHT
 
 // Workgroup tile geometry (matches the reference launch config).
-#define BX        16
+#define BX        32
 #define BY        8
 #define VRT_RESULT 3
 // Exact per-instance LDS sizing: NLM_S is a specialization constant, so the

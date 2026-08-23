@@ -31,7 +31,7 @@ using namespace std::string_literals;
 namespace {
 
 // Workgroup tile geometry of the weight kernel (must match nlmeans.comp).
-constexpr int BLK_X = 16;
+constexpr int BLK_X = 32;
 constexpr int BLK_Y = 8;
 constexpr int VRT_RESULT = 3;
 
@@ -587,12 +587,21 @@ static const VSFrame *VS_CC NLMeansGetFrame(
                     const size_t inner_off =
                         static_cast<size_t>(d->pad) *
                             (row_bytes + d->elem_bytes);
-                    for (int y = 0; y < d->height; ++y) {
-                        memcpy(
-                            dstp + inner_off +
-                                static_cast<size_t>(y) * row_bytes,
-                            srcp + static_cast<size_t>(y) * s_pitch,
-                            static_cast<size_t>(d->width) * d->elem_bytes);
+                    const size_t src_row_bytes =
+                        static_cast<size_t>(d->width) * d->elem_bytes;
+                    if (s_pitch == row_bytes && row_bytes == src_row_bytes) {
+                        // padded-row stride equals the source stride: one bulk
+                        // memcpy covers the whole interior block
+                        memcpy(dstp + inner_off, srcp,
+                            src_row_bytes * d->height);
+                    } else {
+                        for (int y = 0; y < d->height; ++y) {
+                            memcpy(
+                                dstp + inner_off +
+                                    static_cast<size_t>(y) * row_bytes,
+                                srcp + static_cast<size_t>(y) * s_pitch,
+                                src_row_bytes);
+                        }
                     }
                     ++pi;
                 }
@@ -734,10 +743,15 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         const uint32_t p0 = v.w_boff[bi];
         const uint32_t p1 = v.w_boff[bi + 1];
 
-        const int32_t w_push[4] {
-            static_cast<int32_t>(v.w_base + p0), 0, 0, 0
-        };
-        record_dispatch(d, stream, d->weight_pipeline, w_push, gx, gy_w, p1 - p0);
+        if (gputrace && ts_used + 1 < NLMEANS_TS_MAX) {
+            vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stream.ts_query, ts_used++);
+        }
+        {
+            const int32_t w_push[4] {
+                static_cast<int32_t>(v.w_base + p0), 0, 0, 0
+            };
+            record_dispatch(d, stream, d->weight_pipeline, w_push, gx, gy_w, p1 - p0);
+        }
         record_barrier(stream.cmd,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -894,15 +908,12 @@ release_cache(d, stream, n);
                 prev_end = static_cast<double>(ts[s + 1]);
             }
             if (nq % 64 == 1 || nq < 5) {
-                fprintf(stderr,
-                    "[gputrace] n=%u copy=%.3f w1=%.3f a1=%.3f wall=%.3f "
-                    "finish=%.3f wSteady=%.3fx%u aSteady=%.3fx%u (ms)\n",
-                    nq + 1,
-                    (ts[1] - ts[0]) * period / 1e6,
-                    w1, a1,
-                    (ts[2] - ts[1]) * period / 1e6,
-                    (ts[3] - ts[2]) * period / 1e6,
-                    nw ? sum_w / nw : 0.0, nw, na ? sum_a / na : 0.0, na);
+                fprintf(stderr, "[gputrace] n=%u abs(us):", nq + 1);
+                for (uint32_t i = 0; i < stream.ts_count; ++i) {
+                    fprintf(stderr, " %u:%.0f", i,
+                        (ts[i] - ts[0]) * period / 1e3);
+                }
+                fprintf(stderr, "\n");
             }
         }
     }
@@ -1117,8 +1128,9 @@ static void VS_CC NLMeansCreate(
         // target GPU - larger rings stream weights through DRAM between the
         // weight and accumulation launches, smaller ones pay more dispatches.
         const int64_t ring_base_slots = (dd == 0) ? d->qb : 2 * static_cast<int64_t>(d->qb);
+        // weights are fp16 now
         const int64_t bytes_per_pack =
-            ring_base_slots * d->npix * static_cast<int64_t>(sizeof(float));
+            ring_base_slots * d->npix * static_cast<int64_t>(sizeof(uint16_t));
         constexpr int64_t U4A_RING_BUDGET = 64LL << 20;
         int64_t pack = U4A_RING_BUDGET / std::max<int64_t>(bytes_per_pack, 1);
         pack = std::clamp<int64_t>(pack, 1, 16384);
