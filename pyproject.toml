@@ -28,13 +28,15 @@ source = "vcs"
 tag-pattern = '^r(?P<version>.*)$'
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "CMakeLists.txt"]
+include = ["src", "CMakeLists.txt", "config.h.in"]
 
 [tool.hatch.build.targets.wheel]
-include = ["vapoursynth/plugins"]
+include = ["vapoursynth/plugins/vsfeel"]
 artifacts = [
-    "vapoursynth/plugins/**/*.so",
-    "vapoursynth/plugins/**/*.dll",
+    "vapoursynth/plugins/vsfeel/*.so",
+    "vapoursynth/plugins/vsfeel/*.dll",
+    "vapoursynth/plugins/vsfeel/*.dylib",
+    "vapoursynth/plugins/vsfeel/manifest.vs",
 ]
 
 [tool.hatch.build.targets.wheel.hooks.custom]

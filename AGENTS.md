@@ -58,6 +58,17 @@ standard test input.
   changes: `python -m pytest tests/test_<filter>.py -q`
 - A rewrite is only acceptable if all tests still pass.
 
+### Reference-comparison coverage and tolerance policy
+
+- **Sweep parameters against the reference** — every scalar parameter, every
+  supported input depth, plus special paths (joint processing, guide clips,
+  cropped frames). Crash-prone references run in a subprocess.
+- **Measure before setting a tolerance**, then document mechanism and
+  measured values. Tiers: `1e-6` for ulp-level float32 math; measurement-
+  bounded bounds (a few e-3) where discrete decisions flip on rounding order;
+  integer output in whole codes (`<= 1 LSB`); self-consistency stays exact.
+- Read planes back stride-aware and `.copy()` ctypes arrays.
+
 ## How benchmarking works
 
 The benchmark is `benchmark/bench.py`. It is data-driven: every filter is one

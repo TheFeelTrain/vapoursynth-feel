@@ -264,3 +264,6 @@ uv.lock
 .vsjet/
 reference/
 notes/
+# Packaging staging
+/install/
+/build/pack/

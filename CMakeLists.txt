@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(VapourSynth-BilateralHIP LANGUAGES CXX)
+project(vapoursynth-feel LANGUAGES CXX)
 
 find_package(Vulkan REQUIRED)
 find_program(VK_GLSLC glslc)
@@ -19,7 +19,7 @@ if(GIT_FOUND)
 endif()
 
 if(VCS_TAG)
-    message(STATUS "VapourSynth-BilateralHIP ${VCS_TAG}")
+    message(STATUS "vapoursynth-feel ${VCS_TAG}")
 else()
     message(WARNING "unknown plugin version")
     set(VCS_TAG "unknown")
@@ -240,19 +240,42 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 # VapourSynth discovery & installation
 find_package(PkgConfig QUIET MODULE)
 
+# Packaging override: when set (e.g. by hatch_build.py), artifacts are
+# installed to this relative directory instead of the live VapourSynth
+# plugin directory, regardless of whether vapoursynth is importable.
+# STRING, not PATH: PATH cache entries are canonicalized to absolute,
+# which would bypass CMAKE_INSTALL_PREFIX at install time.
+set(VSFEEL_INSTALL_DIR "" CACHE STRING "Relative plugin staging directory")
+
 if(PKG_CONFIG_FOUND)
     pkg_search_module(VS vapoursynth)
     if(VS_FOUND)
         message(STATUS "Found VapourSynth R${VS_VERSION}")
-        execute_process(
-            COMMAND "${Python3_EXECUTABLE}" -c "import vapoursynth; print(vapoursynth.get_plugin_dir())"
-            OUTPUT_VARIABLE VS_PLUGIN_DIR
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-        )
+        if(NOT VSFEEL_INSTALL_DIR)
+            execute_process(
+                COMMAND "${Python3_EXECUTABLE}" -c "import vapoursynth; print(vapoursynth.get_plugin_dir())"
+                OUTPUT_VARIABLE VS_PLUGIN_DIR
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+            )
+            string(STRIP "${VS_PLUGIN_DIR}" VS_PLUGIN_DIR)
+        endif()
 
         target_include_directories(vsfeel PRIVATE ${VS_INCLUDE_DIRS})
-        install(TARGETS vsfeel LIBRARY DESTINATION "${VS_PLUGIN_DIR}/vsfeel")
-        install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vk/manifest.vs" DESTINATION "${VS_PLUGIN_DIR}/vsfeel")
+
+        if(VSFEEL_INSTALL_DIR OR VS_PLUGIN_DIR)
+            set(_vsfeel_install_dir "${VSFEEL_INSTALL_DIR}")
+            if(NOT _vsfeel_install_dir)
+                set(_vsfeel_install_dir "${VS_PLUGIN_DIR}/vsfeel")
+            endif()
+            install(TARGETS vsfeel LIBRARY DESTINATION "${_vsfeel_install_dir}")
+            install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vk/manifest.vs" DESTINATION "${_vsfeel_install_dir}")
+        else()
+            # Isolated build environments (pip/pdm-build) can import no
+            # vapoursynth module; stage into <prefix>/lib|bin + <prefix>/
+            # so packaging hooks can collect the artifacts.
+            install(TARGETS vsfeel LIBRARY)
+            install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vk/manifest.vs" DESTINATION .)
+        endif()
     endif()
 endif()
 
