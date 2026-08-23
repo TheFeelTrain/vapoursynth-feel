@@ -31,6 +31,7 @@
 #define SCALE      1.0f
 #endif
 
+#extension GL_EXT_shader_16bit_storage : require
 layout(constant_id = 0)  const int VI_DIM_X = 640;
 layout(constant_id = 1)  const int VI_DIM_Y = 360;
 layout(constant_id = 2)  const int STRIDE = 640;
@@ -65,7 +66,9 @@ layout(std430, binding = 1) readonly buffer GuideBuf { float guide_raw[]; };
 layout(std430, binding = 2) writeonly buffer DstBuf  { float dst_raw[]; };
 #endif
 layout(std430, binding = 3) buffer AccBuf { float u2[]; };
-layout(std430, binding = 4) buffer WeightBuf { float u4a[]; };
+// weights live as fp16: halves the sweep-ring traffic; close-enough numerics
+// by the same policy as BM3Dv2
+layout(std430, binding = 4) buffer WeightBuf { float16_t u4a[]; };
 layout(std430, binding = 5) buffer MaxBuf { float u5[]; };
 layout(std430, binding = 6) readonly buffer WQBuf { int wq[]; };
 layout(std430, binding = 7) readonly buffer AQBuf { int aq[]; };
@@ -84,6 +87,7 @@ layout(push_constant) uniform PushConstants {
     int pc0;
     int pc1;
     int pc2;
+    int pc3;   /* acc: last sweep round -> apply the finish transform */
 } pc;
 
 #define LAYERS (2*NLM_D+1)
@@ -338,7 +342,9 @@ void main() {
         } else {
             float c = max(1.0f - arg, 0.0f); c = c*c; c = c*c; w = c*c;
         }
-        u4a[slot*U4_LAYER + y*STRIDE + x] = w;
+        // x4096 keeps small weights inside fp16's normal range (no
+        // subnormal cliff); acc rescales on load
+        u4a[slot*U4_LAYER + y*STRIDE + x] = float16_t(w * 4096.0f);
     }
 }
 
@@ -366,10 +372,10 @@ void main() {
             const int r = (q_base + b) * 8;
             const int qx = aq[r+0], qy = aq[r+1], qz = aq[r+2];
             const int sc = aq[r+3], sm = aq[r+4];
-            const float u4 = u4a[sc*U4_LAYER + g];
+            const float u4 = float(u4a[sc*U4_LAYER + g]) * (1.0f/4096.0f);
             const int xm = x-qx, ym = y-qy;
             const float u4_mq = (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
-                                ? 0.0f : u4a[sm*U4_LAYER + g - (qy*STRIDE + qx)];
+                                ? 0.0f : float(u4a[sm*U4_LAYER + g - (qy*STRIDE + qx)]) * (1.0f/4096.0f);
             u5v = max(u4, max(u4_mq, u5v));
             const int qps = qy*PSTRIDE + qx;
             const float pq0 = load_src(slot_table[NLM_D+qz] + gpad + qps);
@@ -377,7 +383,13 @@ void main() {
             acc0 += (u4*pq0) + (u4_mq*mq0);
             accw += (u4 + u4_mq);
         }
-        u2[2*g] = acc0; u2[2*g+1] = accw;
+        if (pc.pc3 != 0) {
+            const float m = WREF * u5v;
+            store_value(g,
+                (load_src(slot_table[NLM_D] + gpad)*m + acc0) / (m + accw));
+        } else {
+            u2[2*g] = acc0; u2[2*g+1] = accw;
+        }
     } else if (NLM_CHANNELS == 2) {
         float acc0 = pc.pc2 != 0 ? 0.0f : u2[3*g];
         float acc1 = pc.pc2 != 0 ? 0.0f : u2[3*g+1];
@@ -386,10 +398,10 @@ void main() {
             const int r = (q_base + b) * 8;
             const int qx = aq[r+0], qy = aq[r+1], qz = aq[r+2];
             const int sc = aq[r+3], sm = aq[r+4];
-            const float u4 = u4a[sc*U4_LAYER + g];
+            const float u4 = float(u4a[sc*U4_LAYER + g]) * (1.0f/4096.0f);
             const int xm = x-qx, ym = y-qy;
             const float u4_mq = (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
-                                ? 0.0f : u4a[sm*U4_LAYER + g - (qy*STRIDE + qx)];
+                                ? 0.0f : float(u4a[sm*U4_LAYER + g - (qy*STRIDE + qx)]) * (1.0f/4096.0f);
             u5v = max(u4, max(u4_mq, u5v));
             #ifdef NLMEANS_PROBE_ACC_NOSRC
                 const float pq0 = 1.0f, mq0 = 2.0f, pq1 = 3.0f, mq1 = 4.0f;
@@ -404,7 +416,16 @@ void main() {
             acc1 += (u4*pq1) + (u4_mq*mq1);
             accw += (u4 + u4_mq);
         }
-        u2[3*g] = acc0; u2[3*g+1] = acc1; u2[3*g+2] = accw;
+        if (pc.pc3 != 0) {
+            const float m = WREF * u5v;
+            const float den = m + accw;
+            store_value(g,
+                (load_src(slot_table[NLM_D] + gpad)*m + acc0) / den);
+            store_value(NPIX + g,
+                (load_src(slot_table[LAYERS+NLM_D] + gpad)*m + acc1) / den);
+        } else {
+            u2[3*g] = acc0; u2[3*g+1] = acc1; u2[3*g+2] = accw;
+        }
     } else {
         float acc0 = pc.pc2 != 0 ? 0.0f : u2[4*g];
         float acc1 = pc.pc2 != 0 ? 0.0f : u2[4*g+1];
@@ -414,10 +435,10 @@ void main() {
             const int r = (q_base + b) * 8;
             const int qx = aq[r+0], qy = aq[r+1], qz = aq[r+2];
             const int sc = aq[r+3], sm = aq[r+4];
-            const float u4 = u4a[sc*U4_LAYER + g];
+            const float u4 = float(u4a[sc*U4_LAYER + g]) * (1.0f/4096.0f);
             const int xm = x-qx, ym = y-qy;
             const float u4_mq = (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
-                                ? 0.0f : u4a[sm*U4_LAYER + g - (qy*STRIDE + qx)];
+                                ? 0.0f : float(u4a[sm*U4_LAYER + g - (qy*STRIDE + qx)]) * (1.0f/4096.0f);
             u5v = max(u4, max(u4_mq, u5v));
             const int qps = qy*PSTRIDE + qx;
             const float pq0 = load_src(slot_table[NLM_D+qz] + gpad + qps);
@@ -431,7 +452,18 @@ void main() {
             acc2 += (u4*pq2) + (u4_mq*mq2);
             accw += (u4 + u4_mq);
         }
-        u2[4*g] = acc0; u2[4*g+1] = acc1; u2[4*g+2] = acc2; u2[4*g+3] = accw;
+        if (pc.pc3 != 0) {
+            const float m = WREF * u5v;
+            const float den = m + accw;
+            store_value(g,
+                (load_src(slot_table[NLM_D] + gpad)*m + acc0) / den);
+            store_value(NPIX + g,
+                (load_src(slot_table[LAYERS+NLM_D] + gpad)*m + acc1) / den);
+            store_value(2*NPIX + g,
+                (load_src(slot_table[2*LAYERS+NLM_D] + gpad)*m + acc2) / den);
+        } else {
+            u2[4*g] = acc0; u2[4*g+1] = acc1; u2[4*g+2] = acc2; u2[4*g+3] = accw;
+        }
     }
     u5[g] = u5v;
 }

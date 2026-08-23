@@ -118,7 +118,8 @@ struct NLStream {
     // cache reservations held by this frame (valid between acquire/release)
     std::vector<int> win_slots;      // pool slot of each needed tile
     std::vector<bool> upload_new;    // true where this frame must fill a slot
-    int new_tiles {};                // tiles the pad kernel fills this frame
+    int new_tiles {};                // tiles shipped to the pool this frame
+    std::vector<VkBufferCopy> copy_regions;
 };
 
 // shared padded-tile cache: one channel-layer tile per slot
@@ -335,7 +336,7 @@ void record_barrier(VkCommandBuffer cmd, VkPipelineStageFlags src_stage,
 }
 
 void record_dispatch(NLMeansData * d, NLStream & st, VkPipeline pipeline,
-                     const int32_t (&push)[3],
+                     const int32_t (&push)[4],
                      uint32_t gx, uint32_t gy, uint32_t gz) {
     vkCmdBindPipeline(st.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(st.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -561,9 +562,12 @@ static const VSFrame *VS_CC NLMeansGetFrame(
     if (trace2) mark(t_acq);
 
     {
-        const size_t compact_bytes =
-            static_cast<size_t>(d->compact_tile_elems) * d->elem_bytes;
-        const size_t row_bytes = static_cast<size_t>(d->width) * d->elem_bytes;
+        // staging tiles use the SAME padded layout as pool slots, so each
+        // new tile ships to VRAM with one contiguous DMA region (margins are
+        // one-time-init zero and compose never touches them).
+        const size_t tile_bytes = static_cast<size_t>(d->slot_bytes);
+        const size_t row_bytes =
+            static_cast<size_t>(d->pstride) * d->elem_bytes;
 
         size_t pi = 0;
         size_t ti = 0;
@@ -579,15 +583,16 @@ static const VSFrame *VS_CC NLMeansGetFrame(
                         static_cast<const uint8_t *>(vsapi->getReadPtr(f, plane));
                     const size_t s_pitch = vsapi->getStride(f, plane);
                     uint8_t * dstp = stream.staging_map +
-                        pi * compact_bytes;
-                    if (s_pitch == row_bytes) {
-                        memcpy(dstp, srcp, row_bytes * d->height);
-                    } else {
-                        for (int y = 0; y < d->height; ++y) {
-                            memcpy(dstp + static_cast<size_t>(y) * row_bytes,
-                                srcp + static_cast<size_t>(y) * s_pitch,
-                                row_bytes);
-                        }
+                        pi * tile_bytes;
+                    const size_t inner_off =
+                        static_cast<size_t>(d->pad) *
+                            (row_bytes + d->elem_bytes);
+                    for (int y = 0; y < d->height; ++y) {
+                        memcpy(
+                            dstp + inner_off +
+                                static_cast<size_t>(y) * row_bytes,
+                            srcp + static_cast<size_t>(y) * s_pitch,
+                            static_cast<size_t>(d->width) * d->elem_bytes);
                     }
                     ++pi;
                 }
@@ -681,16 +686,29 @@ static const VSFrame *VS_CC NLMeansGetFrame(
     }
 
     if (stream.new_tiles > 0) {
-        const uint32_t gx_pad = static_cast<uint32_t>(
-            (d->pstride + 31) / 32);
-        const uint32_t gy_pad = static_cast<uint32_t>((d->ph + 7) / 8);
-        const int32_t p_push[3] { 0, 0, 0 };
-        record_dispatch(d, stream, d->pad_pipeline, p_push,
-            gx_pad, gy_pad, stream.new_tiles);
+        // ship each composed padded tile into its pool slot with plain DMA
+        // (the pad kernel is gone); margins ride along as zeros.
+        std::vector<VkBufferCopy> & regions = stream.copy_regions;
+        regions.clear();
+        size_t pi = 0;
+        for (size_t ti = 0; ti < stream.win_slots.size() &&
+                pi < static_cast<size_t>(stream.new_tiles); ++ti) {
+            if (!stream.upload_new[ti]) {
+                continue;
+            }
+            VkBufferCopy r {};
+            r.srcOffset = static_cast<VkDeviceSize>(pi) * d->slot_bytes;
+            r.dstOffset = static_cast<VkDeviceSize>(stream.win_slots[ti]) *
+                d->slot_elems * d->elem_bytes;
+            r.size = d->slot_bytes;
+            regions.push_back(r);
+            ++pi;
+        }
+        vkCmdCopyBuffer(stream.cmd, stream.staging, d->slots_buf,
+            static_cast<uint32_t>(regions.size()), regions.data());
         record_barrier(stream.cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_ACCESS_SHADER_WRITE_BIT,
-            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
 
     if (gputrace) {
@@ -716,8 +734,8 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         const uint32_t p0 = v.w_boff[bi];
         const uint32_t p1 = v.w_boff[bi + 1];
 
-        const int32_t w_push[3] {
-            static_cast<int32_t>(v.w_base + p0), 0, 0
+        const int32_t w_push[4] {
+            static_cast<int32_t>(v.w_base + p0), 0, 0, 0
         };
         record_dispatch(d, stream, d->weight_pipeline, w_push, gx, gy_w, p1 - p0);
         record_barrier(stream.cmd,
@@ -727,9 +745,10 @@ static const VSFrame *VS_CC NLMeansGetFrame(
             vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, ts_used++);
         }
 
-        const int32_t a_push[3] {
+        const int32_t a_push[4] {
             static_cast<int32_t>(v.q_base + q0), static_cast<int32_t>(nb),
-            bi == 0 ? 1 : 0
+            bi == 0 ? 1 : 0,
+            q0 + nb >= v.q_cnt ? 1 : 0
         };
         record_dispatch(d, stream, d->acc_pipeline, a_push, gx, gy, 1);
         record_barrier(stream.cmd,
@@ -748,10 +767,6 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         stream.ts_count = ts_used;
     }
 
-    {
-        const int32_t f_push[3] { 0, 0, 0 };
-        record_dispatch(d, stream, d->fin_pipeline, f_push, gx, gy, 1);
-    }
     if (gputrace) vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, 3);
 
     if (vkEndCommandBuffer(stream.cmd) != VK_SUCCESS) {
@@ -1243,7 +1258,7 @@ static void VS_CC NLMeansCreate(
         VkPushConstantRange push_constant_range {
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
             .offset = 0,
-            .size = 3 * sizeof(int32_t)
+            .size = 4 * sizeof(int32_t)
         };
         VkPipelineLayoutCreateInfo pipeline_layout_info {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -1441,7 +1456,7 @@ static void VS_CC NLMeansCreate(
     const VkDeviceSize u1z_bytes =
         (npix_v * d->channels * d->elem_bytes + 3) / 4 * 4;
     const VkDeviceSize u2_bytes = npix_v * (d->channels + 1) * sizeof(float);
-    const VkDeviceSize u4a_bytes = npix_v * slots * sizeof(float);
+    const VkDeviceSize u4a_bytes = npix_v * slots * sizeof(uint16_t);  // fp16 weights
     const VkDeviceSize u5_bytes = npix_v * sizeof(float);
 
     for (int i = 0; i < d->num_streams; ++i) {
