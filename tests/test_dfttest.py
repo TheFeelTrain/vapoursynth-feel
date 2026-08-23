@@ -8,6 +8,12 @@ identical to the references (the FFTW codelets, window tables, zero-mean
 gain and the frequency-domain filter are ported exactly; only float32
 rounding order may differ by an ulp between the backends).
 
+Tolerance policy (measured): float32 reference comparisons sit at a few ulp
+(~1e-8) and use REF_TOL = 1e-6, except hard-threshold ftype=1 configs where
+a pixel within an ulp of sigma can flip to/from zero — those keep a looser
+bound. 16-bit integer output is compared as whole output codes (<= 1 LSB).
+Self-consistency checks remain exact.
+
 Run from the repository root:  python -m pytest tests/test_dfttest.py
 """
 
@@ -38,12 +44,26 @@ def _run(clip, tbsize=3, num_streams=1, **kwargs):
     )
 
 
-def _plane(frame, plane, width, height, dtype=np.float32):
+from numpy.typing import DTypeLike
+
+
+def _plane(frame, plane, width, height, dtype: DTypeLike = np.float32):
     itemsize = np.dtype(dtype).itemsize
     return np.ctypeslib.as_array(
         ctypes.cast(frame.get_read_ptr(plane), ctypes.POINTER(ctypes.c_uint8)),
         shape=(height, width * itemsize),
     ).view(dtype).copy()
+
+
+def _stride_plane(frame, plane):
+    """Copy any plane into an ndarray, honouring the row pitch."""
+    fmt = frame.format
+    ss_w = fmt.subsampling_w if plane in (1, 2) and fmt.num_planes >= 3 else 0
+    ss_h = fmt.subsampling_h if plane in (1, 2) and fmt.num_planes >= 3 else 0
+    w = frame.width >> ss_w
+    h = frame.height >> ss_h
+    dtype = np.float32 if fmt.sample_type == vs.FLOAT else np.uint16
+    return _plane(frame, plane, w, h, dtype)
 
 
 def _eval_parallel(clip, **kwargs):
@@ -162,25 +182,32 @@ def test_dfttest_no_nan_all_frames_multi_stream(noise_gray, num_streams):
 # Reference comparison
 # ---------------------------------------------------------------------------
 
-# One subprocess runs every config (each entry is (kwargs, tolerance)); the
-# tolerance covers ulp-level accumulation from the float32 rounding-order
-# differences between backends.
+# One subprocess runs every config (each entry is (kwargs, tolerance)).
+# Tolerances are set from measurement: straight-line float32 math agrees
+# with vszipcl to a few ulp (~1e-8), so those configs use REF_TOL. The
+# hard-threshold ftype=1 configs keep a looser bound: a pixel whose power
+# sits within an ulp of sigma flips between zero and non-zero, which shows
+# up as isolated speckle worth up to ~sigma/255 on the normalized scale.
+REF_TOL = 1e-6
 REFERENCE_CASES = [
-    ({}, 2e-3),                                                     # defaults
-    ({"tbsize": 1}, 2e-3),                                          # spatial only
-    ({"tbsize": 7, "sosize": 4}, 2e-3),                             # radius 3, 75% overlap
-    ({"zmean": 0}, 2e-3),                                           # no zero-mean
-    ({"swin": 4, "sbeta": 3.0, "twin": 2, "tbeta": 4.0}, 2e-3),     # custom windows
-    ({"ftype": 2}, 2e-3),                                           # multiply
-    ({"ftype": 3, "pmin": 10.0, "pmax": 200.0}, 2e-3),              # bandpass
-    ({"ftype": 4, "pmin": 10.0, "pmax": 200.0}, 2e-3),              # rnlm-like
-    ({"ftype": 0, "f0beta": 0.5}, 2e-3),                            # sqrt wiener
-    ({"slocation": [0.0, 2.0, 0.5, 8.0, 1.0, 12.0], "ssystem": 0}, 2e-3),
-    ({"slocation": [0.0, 2.0, 0.5, 8.0, 1.0, 12.0], "ssystem": 1}, 2e-3),
+    ({}, REF_TOL),                                                  # defaults
+    ({"tbsize": 1}, REF_TOL),                                       # spatial only
+    ({"tbsize": 5}, REF_TOL),
+    ({"tbsize": 7, "sosize": 4}, REF_TOL),                          # radius 3, 75% overlap
+    ({"sosize": 12}, REF_TOL),                                      # >50% overlap
+    ({"zmean": 0}, REF_TOL),                                        # no zero-mean
+    ({"swin": 4, "sbeta": 3.0, "twin": 2, "tbeta": 4.0}, REF_TOL),  # custom windows
+    ({"ftype": 2}, REF_TOL),                                        # multiply
+    ({"ftype": 3, "pmin": 10.0, "pmax": 200.0}, REF_TOL),           # bandpass
+    ({"ftype": 4, "pmin": 10.0, "pmax": 200.0}, REF_TOL),           # rnlm-like
+    ({"ftype": 0, "f0beta": 0.5}, REF_TOL),                         # sqrt wiener
+    ({"slocation": [0.0, 2.0, 0.5, 8.0, 1.0, 12.0], "ssystem": 0}, REF_TOL),
+    ({"slocation": [0.0, 2.0, 0.5, 8.0, 1.0, 12.0], "ssystem": 1}, REF_TOL),
     ({"ssx": [0.0, 4.0, 1.0, 9.0], "ssy": [0.0, 3.0, 1.0, 7.0],
-      "sst": [0.0, 2.0, 1.0, 5.0], "ssystem": 1}, 2e-3),
-    # ftype=1 (hard threshold) is boundary-sensitive: a pixel whose power
-    # sits within an ulp of sigma flips between zero and non-zero.
+      "sst": [0.0, 2.0, 1.0, 5.0], "ssystem": 1}, REF_TOL),
+    ({"swin": 4, "sbeta": 3.0, "twin": 2, "tbeta": 4.0,
+      "ftype": 1, "sigma": 4.0}, 5e-3),
+    # ftype=1 (hard threshold) is boundary-sensitive (see above).
     ({"ftype": 1, "sigma": 4.0}, 5e-3),
 ]
 
@@ -245,18 +272,27 @@ def test_dfttest_matches_reference(noise_gray):
         assert maxdiff < tol, f"max diff {maxdiff} vs vszipcl for {kwargs}"
 
 
-def test_dfttest_gray16_matches_reference(noise_16bit):
+GRAY16_CASES = [
+    {},
+    {"tbsize": 5},
+    {"sosize": 12},
+    {"ftype": 1, "sigma": 4.0},
+]
+
+
+@pytest.mark.parametrize("kwargs", GRAY16_CASES, ids=lambda kw: str(kw) or "defaults")
+def test_dfttest_gray16_matches_reference(noise_16bit, kwargs):
     """16-bit integer path: at most one code level of rounding difference."""
     if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "DFTTest"):
         pytest.skip("no vszipcl.DFTTest reference")
     core = vs.core
-    ref = core.vszipcl.DFTTest(noise_16bit)
-    my = core.vsfeel.DFTTest(noise_16bit)
+    ref = core.vszipcl.DFTTest(noise_16bit, **kwargs)
+    my = core.vsfeel.DFTTest(noise_16bit, **kwargs)
     for n in (0, 11, 23):
         a = _plane(my.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         b = _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         d = np.abs(a.astype(np.int64) - b.astype(np.int64))
-        assert d.max() <= 1, f"gray16 max diff {d.max()} at frame {n}"
+        assert d.max() <= 1, f"gray16 max diff {d.max()} at frame {n} ({kwargs})"
 
 
 def test_dfttest_rejects_8bit(noise_8bit):
@@ -291,6 +327,27 @@ def test_dfttest_yuv_passthrough(noise_gray):
             a = _plane(f, plane, sw, sh)
             b = _plane(s, plane, sw, sh)
             assert np.array_equal(a, b), f"chroma{plane} changed at frame {n}"
+
+
+def test_dfttest_yuv_all_planes_matches_reference():
+    """YUV420 float32 with all planes processed must track vszipcl on every
+    plane (incl. subsampled chroma)."""
+    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "DFTTest"):
+        pytest.skip("no vszipcl.DFTTest reference")
+    core = vs.core
+    src = core.bs.VideoSource(NOISE_MKV)
+    yuv = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
+
+    my = _run(yuv, tbsize=1, num_streams=1)
+    ref = core.vszipcl.DFTTest(yuv, tbsize=1)
+    for n in (0, 11, 23):
+        fa, fb = my.get_frame(n), ref.get_frame(n)
+        for p in range(3):
+            d = np.abs(
+                _stride_plane(fa, p).astype(np.float64)
+                - _stride_plane(fb, p).astype(np.float64)
+            )
+            assert d.max() < REF_TOL, f"plane {p} max diff {d.max()} at frame {n}"
 
 
 # ---------------------------------------------------------------------------
