@@ -52,14 +52,14 @@ if(VK_GLSLC)
     set(VK_SPV_OUTPUTS)
     foreach(component IN LISTS VK_KERNEL_COMPONENTS)
         foreach(bits IN LISTS VK_BITS)
-            list(APPEND VK_SPV_OUTPUTS "${VK_SPV_DIR}/kernel_${component}_${bits}.spv")
+            list(APPEND VK_SPV_OUTPUTS "${VK_SPV_DIR}/bilateral_${component}_${bits}.spv")
             add_custom_command(
-                OUTPUT "${VK_SPV_DIR}/kernel_${component}_${bits}.spv"
+                OUTPUT "${VK_SPV_DIR}/bilateral_${component}_${bits}.spv"
                 COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
                 COMMAND ${VK_GLSLC} -O -fshader-stage=compute -DBITS=${bits}
-                        -o "${VK_SPV_DIR}/kernel_${component}_${bits}.spv"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel_${component}.comp"
-                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel_${component}.comp"
+                        -o "${VK_SPV_DIR}/bilateral_${component}_${bits}.spv"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/src/bilateral_${component}.comp"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/bilateral_${component}.comp"
                 VERBATIM)
         endforeach()
     endforeach()
@@ -180,10 +180,10 @@ endif()
 add_custom_command(
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
     COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/src/gen_spirv_header.py"
-            "${VK_SPV_DIR}/kernel_shared_16.spv"
-            "${VK_SPV_DIR}/kernel_shared_32.spv"
-            "${VK_SPV_DIR}/kernel_plain_16.spv"
-            "${VK_SPV_DIR}/kernel_plain_32.spv"
+            "${VK_SPV_DIR}/bilateral_shared_16.spv"
+            "${VK_SPV_DIR}/bilateral_shared_32.spv"
+            "${VK_SPV_DIR}/bilateral_plain_16.spv"
+            "${VK_SPV_DIR}/bilateral_plain_32.spv"
             "${VK_SPV_DIR}/bm3d.spv"
             "${VK_SPV_DIR}/bm3d_agg.spv"
             "${VK_SPV_DIR}/gaussblur_16_gauss.spv"

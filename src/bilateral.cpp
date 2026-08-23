@@ -871,12 +871,12 @@ static void VS_CC BilateralCreate(
         size_t plain_size = 0;
         switch (d->bits) {
             case 16:
-                shared_code = kernel_shared_16_spv; shared_size = kernel_shared_16_spv_size;
-                plain_code = kernel_plain_16_spv; plain_size = kernel_plain_16_spv_size;
+                shared_code = bilateral_shared_16_spv; shared_size = bilateral_shared_16_spv_size;
+                plain_code = bilateral_plain_16_spv; plain_size = bilateral_plain_16_spv_size;
                 break;
             case 32:
-                shared_code = kernel_shared_32_spv; shared_size = kernel_shared_32_spv_size;
-                plain_code = kernel_plain_32_spv; plain_size = kernel_plain_32_spv_size;
+                shared_code = bilateral_shared_32_spv; shared_size = bilateral_shared_32_spv_size;
+                plain_code = bilateral_plain_32_spv; plain_size = bilateral_plain_32_spv_size;
                 break;
             default:
                 return set_error("unsupported bit depth");
