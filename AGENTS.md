@@ -129,6 +129,53 @@ General lesson: make every branch that is fixed per invocation (filter type,
 bit depth, window shape) a specialization constant or `#if` so the shader
 compiles to its cheapest form.
 
+## Porting discipline
+
+Lessons from porting DFTTest and NLMeans that go beyond the method above:
+
+- **MVP first, verbatim.** Port tables, index math, and formulas from the
+  reference line-for-line and get the tests passing before optimizing
+  anything. Afterwards, every bug you find will be in your own new code, not
+  in the ported algorithm.
+- **Only noise-clip comparisons against the reference prove correctness.**
+  Constant/BlankClip input hides bugs (the references themselves deviate at
+  borders on such input). In test code, never assume tight pitch when reading
+  planes back, and `.copy()` any array extracted through ctypes — both alias
+  recycled frame memory and produce phantom nondeterminism.
+- **Trust only end-to-end benchmark fps medians over hundreds of frames.**
+  Microsecond GPU traces swing ±10–20% run-to-run (clock variance); a change
+  that does not move the fps median did not happen. Streams share the compute
+  queue, so per-kernel timings taken from multi-stream runs include the other
+  stream's interleaved work — attribute kernels only in single-stream traces.
+- **Never chain build → install → test into one command** (a failed compile
+  then silently leaves the stale `.so` installed). Verify binary freshness
+  before trusting any measurement.
+- **Host orchestration is usually half the performance.** Expect to spend as
+  much effort on memory pooling, upload/download paths, cross-stream cache
+  sharing, and dispatch/fence structure as on kernels. The big wins come from
+  removing work — fusing passes to cut dispatches/barriers/fences, uploading
+  once via DMA straight into its final layout, sharing immutable data
+  lock-free across streams (only writers exclude readers) — not from making
+  the surviving instructions cleverer.
+- **Spec constants cannot size arrays in GLSL.** If an array dimension must
+  vary, gate it with a compile-time `-D` define instead.
+- **Respect the compiler's register tradeoffs.** ACO raises VGPRs deliberately
+  for load ILP at an occupancy cost; forcing registers down often regresses.
+  Read `RADV_DEBUG=shaderstats` before assuming more waves would help.
+- **Reduced-precision storage needs explicit range management** (fp16 hit a
+  subnormal cliff; scaling values up on store and down on load fixed it).
+  Measure the actual drift against the reference and agree on the accuracy
+  policy with the user before relaxing any tolerance.
+- **Run Vulkan validation layers when output is inexplicable**
+  (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`); they found a zeroed
+  buffer-binding table in minutes.
+- **Decompose kernel cost with short-lived probes**, not theory: temporary
+  `-D` variants or env flags that drop one cost center at a time, measured,
+  reverted immediately. Expect plausible theories to be wrong — one seemingly
+  expensive memory-access pattern measured neutral because it was L2-resident.
+- **Keep `notes/<filter>.md` updated immediately** after every finding,
+  including dead ends, so nothing is re-derived or retried later.
+
 ## Building
 
 The build uses CMake + `glslc` (Vulkan shader compiler).
