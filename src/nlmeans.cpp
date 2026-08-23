@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
 #include <iterator>
 #include <memory>
@@ -80,14 +82,14 @@ struct Variant {
 };
 
 struct NLStream {
+    // upload staging: room for the worst case of new tiles in one frame,
+    // plus the per-frame slot-base table at the tail
     VkBuffer staging {};
     VkDeviceMemory staging_mem {};
     uint32_t staging_type_index {};
     uint8_t * staging_map {};
-    VkBuffer u1 {};
-    VkDeviceMemory u1_mem {};
-    VkBuffer u1r {};
-    VkDeviceMemory u1r_mem {};
+    VkBuffer tables_dev {};
+    VkDeviceMemory tables_dev_mem {};
     VkBuffer u1z {};
     VkDeviceMemory u1z_mem {};
     uint32_t u1z_type_index {};
@@ -104,6 +106,19 @@ struct NLStream {
     VkDescriptorSet desc_set {};
     VkQueue queue {};
     std::mutex * queue_lock {};
+    VkQueryPool ts_query {};
+
+    // cache reservations held by this frame (valid between acquire/release)
+    std::vector<int> win_slots;      // pool slot of each needed tile
+    std::vector<bool> upload_new;    // true where this frame must fill a slot
+    std::vector<VkBufferCopy> copy_regions;  // staging tile -> pool slot
+};
+
+// shared padded-tile cache: one channel-layer tile per slot
+struct CacheSlot {
+    int64_t key {-1};        // (clip << 40) | (c << 32) | idx, -1 = empty
+    int writer {-1};
+    std::vector<int> holders;
 };
 
 struct NLMeansData {
@@ -127,7 +142,18 @@ struct NLMeansData {
     int64_t npix {};
     int qb {};
     int num_streams {};
-    VkDeviceSize u1_bytes {};  // bytes of one padded window (all channels/layers)
+
+    // shared slot pool (device-local padded tiles) + its state
+    int n_slots {};
+    int staging_tiles {};            // worst-case new tiles per frame
+    VkDeviceSize slot_bytes {};      // one padded channel-layer tile
+    int64_t slot_elems {};
+    VkBuffer slots_buf {};
+    VkDeviceMemory slots_mem {};
+    std::vector<CacheSlot> cache;
+    int cache_cursor {};
+    std::mutex cache_lock;
+    std::condition_variable cache_cv;
 
     // create()-time q-sweep tables (stride-8 rows), shared by all streams
     std::vector<int> wq_host;
@@ -152,6 +178,8 @@ struct NLMeansData {
     std::vector<NLStream> streams;
     std::mutex streams_lock;
 
+    bool gputrace {};
+
     ~NLMeansData() {
         if (!device) {
             return;
@@ -163,10 +191,8 @@ struct NLMeansData {
             if (st.staging_map) vkUnmapMemory(dev, st.staging_mem);
             if (st.staging_mem) vkFreeMemory(dev, st.staging_mem, nullptr);
             if (st.staging) vkDestroyBuffer(dev, st.staging, nullptr);
-            if (st.u1_mem) vkFreeMemory(dev, st.u1_mem, nullptr);
-            if (st.u1) vkDestroyBuffer(dev, st.u1, nullptr);
-            if (st.u1r_mem) vkFreeMemory(dev, st.u1r_mem, nullptr);
-            if (st.u1r) vkDestroyBuffer(dev, st.u1r, nullptr);
+            if (st.tables_dev_mem) vkFreeMemory(dev, st.tables_dev_mem, nullptr);
+            if (st.tables_dev) vkDestroyBuffer(dev, st.tables_dev, nullptr);
             if (st.u1z_map) vkUnmapMemory(dev, st.u1z_mem);
             if (st.u1z_mem) vkFreeMemory(dev, st.u1z_mem, nullptr);
             if (st.u1z) vkDestroyBuffer(dev, st.u1z, nullptr);
@@ -179,9 +205,12 @@ struct NLMeansData {
             if (st.cmd) vkFreeCommandBuffers(dev, st.pool, 1, &st.cmd);
             if (st.pool) vkDestroyCommandPool(dev, st.pool, nullptr);
             if (st.fence) vkDestroyFence(dev, st.fence, nullptr);
+            if (st.ts_query) vkDestroyQueryPool(dev, st.ts_query, nullptr);
         }
         if (tables_mem) vkFreeMemory(dev, tables_mem, nullptr);
         if (tables_buf) vkDestroyBuffer(dev, tables_buf, nullptr);
+        if (slots_mem) vkFreeMemory(dev, slots_mem, nullptr);
+        if (slots_buf) vkDestroyBuffer(dev, slots_buf, nullptr);
         if (fin_pipeline) vkDestroyPipeline(dev, fin_pipeline, nullptr);
         if (acc_pipeline) vkDestroyPipeline(dev, acc_pipeline, nullptr);
         if (weight_pipeline) vkDestroyPipeline(dev, weight_pipeline, nullptr);
@@ -236,9 +265,16 @@ std::variant<VkPipeline, std::string> create_pipeline(
         .pData = &spec
     };
 
+    // explicit wave32 (same win as DFTTest); requires subgroup size control
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+        .pNext = nullptr,
+        .requiredSubgroupSize = 32
+    };
+
     VkPipelineShaderStageCreateInfo stage_info {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .pNext = nullptr,
+        .pNext = d.device->subgroup_size_control ? &subgroup_size_info : nullptr,
         .flags = 0,
         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
         .module = module,
@@ -278,7 +314,7 @@ void record_barrier(VkCommandBuffer cmd, VkPipelineStageFlags src_stage,
 }
 
 void record_dispatch(NLMeansData * d, NLStream & st, VkPipeline pipeline,
-                     const int32_t (&push)[2],
+                     const int32_t (&push)[3],
                      uint32_t gx, uint32_t gy, uint32_t gz) {
     vkCmdBindPipeline(st.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(st.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -286,6 +322,117 @@ void record_dispatch(NLMeansData * d, NLStream & st, VkPipeline pipeline,
     vkCmdPushConstants(st.cmd, d->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
         0, sizeof(push), push);
     vkCmdDispatch(st.cmd, gx, gy, gz);
+}
+
+static int64_t tile_key(int clip_id, int c, int idx) {
+    return (static_cast<int64_t>(clip_id) << 40) |
+           (static_cast<int64_t>(c) << 32) | idx;
+}
+
+// Reserve the pool slots this frame needs, all-or-nothing. Slots still held
+// by in-flight frames block until they complete (only possible when the
+// working set exceeds the pool, e.g. on seeks). No cross-frame GPU waits are
+// necessary: a slot is reusable only once its previous user has released it
+// post-fence, so its content is complete.
+static void acquire_cache(NLMeansData * d, NLStream & st, int n,
+                          std::vector<int64_t> & keys) {
+    const int C = d->channels;
+    const int m = std::min(d->d, n);
+    const int nf = d->vi->numFrames;
+    const int clips = d->has_ref ? 2 : 1;
+
+    keys.clear();
+    for (int clip = 0; clip < clips; ++clip) {
+        for (int k = -m; k <= m; ++k) {
+            const int idx = std::clamp(n + k, 0, nf - 1);
+            for (int c = 0; c < C; ++c) {
+                keys.push_back(tile_key(clip, c, idx));
+            }
+        }
+    }
+
+    st.win_slots.assign(keys.size(), -1);
+    st.upload_new.assign(keys.size(), false);
+
+    std::unique_lock lock(d->cache_lock);
+    for (;;) {
+        bool ok = true;
+        std::vector<int> chosen(keys.size(), -1);
+        std::vector<int> taken;
+        for (size_t ti = 0; ti < keys.size(); ++ti) {
+            bool is_new = false;
+            int found = -1;
+            // duplicate key within this frame (clamped boundary)? share slot
+            bool dup = false;
+            for (size_t tj = 0; tj < ti; ++tj) {
+                if (keys[tj] == keys[ti]) { found = chosen[tj]; dup = true; break; }
+            }
+            if (!dup) {
+                for (int i = 0; i < d->n_slots; ++i) {
+                    if (d->cache[i].key == keys[ti]) { found = i; break; }
+                }
+                // a slot picked earlier this frame (reused or evicted) still
+                // carries its OLD key until phase 2 and must never be handed
+                // out twice
+                if (found >= 0 &&
+                    std::find(taken.begin(), taken.end(), found) != taken.end()) {
+                    found = -1;
+                }
+                if (found >= 0 && !d->cache[found].holders.empty()) {
+                    ok = false;
+                    break;
+                }
+                if (found < 0) {
+                    // evict an unheld slot (round-robin from the cursor)
+                    for (int off = 0; off < d->n_slots; ++off) {
+                        const int cand = (d->cache_cursor + off) % d->n_slots;
+                        if (d->cache[cand].holders.empty() &&
+                            std::find(taken.begin(), taken.end(), cand) == taken.end()) {
+                            found = cand;
+                            break;
+                        }
+                    }
+                    if (found < 0) { ok = false; break; }
+                    is_new = true;
+                    d->cache_cursor = (found + 1) % d->n_slots;
+                }
+                // reserve this slot against later tiles of this frame
+                taken.push_back(found);
+            }
+            chosen[ti] = found;
+            st.upload_new[ti] = is_new;
+        }
+        if (!ok) {
+            d->cache_cv.wait(lock);
+            continue;
+        }
+        // phase 2: apply the reservations (lock held, checks still valid)
+        for (size_t ti = 0; ti < keys.size(); ++ti) {
+            const int slot = chosen[ti];
+            if (st.upload_new[ti]) {
+                d->cache[slot].key = keys[ti];
+                d->cache[slot].writer = n;
+                d->cache[slot].holders.clear();
+            }
+            d->cache[slot].holders.push_back(n);
+            st.win_slots[ti] = slot;
+            if (std::getenv("NLMEANS_DBG")) {
+                fprintf(stderr, "[dbg] n=%d tile %zu: key=%lld slot=%d new=%d\n",
+                    n, ti, static_cast<long long>(keys[ti]), slot,
+                    (int)st.upload_new[ti]);
+            }
+        }
+        return;
+    }
+}
+
+static void release_cache(NLMeansData * d, NLStream & st, int n) {
+    std::lock_guard lock(d->cache_lock);
+    for (int slot : st.win_slots) {
+        auto & h = d->cache[slot].holders;
+        h.erase(std::remove(h.begin(), h.end(), n), h.end());
+    }
+    d->cache_cv.notify_all();
 }
 
 static const VSFrame *VS_CC NLMeansGetFrame(
@@ -366,44 +513,90 @@ static const VSFrame *VS_CC NLMeansGetFrame(
 
     VkDevice dev = d->device->device;
 
+    const bool trace = std::getenv("NLMEANS_TRACE") != nullptr;
+    auto now_us = [] {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    static std::atomic<uint64_t> t_up {}, t_sub {}, t_wait {}, t_dl {};
+    static std::atomic<uint32_t> t_nf {};
+    uint64_t t0 = now_us();
+    auto mark = [&](std::atomic<uint64_t> & acc) { acc += now_us() - t0; t0 = now_us(); };
+
     // ------------------------------------------------------------------
-    // upload: compose the zero-padded temporal window in the staging
-    // mirror of u1 (+ u1r); margins were zeroed once at init and stay zero.
+    // cache acquire + upload: fill only the window tiles that are not yet
+    // resident; each tile is a padded channel-layer composed into the
+    // staging mirror (margins were zeroed once at init and stay zero).
     // ------------------------------------------------------------------
+    std::vector<int64_t> keys;
+    acquire_cache(d, stream, n, keys);
+
     {
-        const size_t lay_el = static_cast<size_t>(d->pstride) * d->ph;
-        const size_t pad_off = static_cast<size_t>(d->pad) * d->pstride + d->pad;
-        for (int i = 0; i < count; ++i) {
-            const size_t t_layer = static_cast<size_t>(d->d) - m + i;
-            for (int c = 0; c < C; ++c) {
-                const int plane = d->plane0 + c;
-                const uint8_t * srcp =
-                    static_cast<const uint8_t *>(vsapi->getReadPtr(frames[i], plane));
-                const size_t s_pitch = vsapi->getStride(frames[i], plane);
-                const size_t row_bytes =
-                    static_cast<size_t>(d->width) * d->elem_bytes;
-                uint8_t * dstp = stream.staging_map +
-                    ((static_cast<size_t>(c) * d->layers + t_layer) * lay_el +
-                     pad_off) * d->elem_bytes;
-                for (int y = 0; y < d->height; ++y) {
-                    copy_stream_out(dstp + static_cast<size_t>(y) * d->pstride * d->elem_bytes,
-                        srcp + static_cast<size_t>(y) * s_pitch, row_bytes);
-                }
-                if (d->has_ref) {
-                    const uint8_t * rsrcp =
-                        static_cast<const uint8_t *>(vsapi->getReadPtr(rframes[i], plane));
-                    const size_t r_pitch = vsapi->getStride(rframes[i], plane);
-                    uint8_t * rgp = stream.staging_map + d->u1_bytes +
-                        ((static_cast<size_t>(c) * d->layers + t_layer) * lay_el +
-                         pad_off) * d->elem_bytes;
-                    for (int y = 0; y < d->height; ++y) {
-                        copy_stream_out(rgp + static_cast<size_t>(y) * d->pstride * d->elem_bytes,
-                            rsrcp + static_cast<size_t>(y) * r_pitch, row_bytes);
+        const size_t slot_bytes = static_cast<size_t>(d->slot_bytes);
+        const size_t pad_off =
+            (static_cast<size_t>(d->pad) * d->pstride + d->pad) * d->elem_bytes;
+        const size_t row_pitch = static_cast<size_t>(d->pstride) * d->elem_bytes;
+        const size_t row_bytes = static_cast<size_t>(d->width) * d->elem_bytes;
+
+        size_t new_idx = 0;
+        size_t ti = 0;
+        for (int clip = 0; clip < (d->has_ref ? 2 : 1); ++clip) {
+            for (int i = 0; i < count; ++i) {
+                for (int c = 0; c < C; ++c, ++ti) {
+                    if (!stream.upload_new[ti]) {
+                        continue;
                     }
+                    const VSFrame * f = clip ? rframes[i] : frames[i];
+                    const int plane = d->plane0 + c;
+                    const uint8_t * srcp =
+                        static_cast<const uint8_t *>(vsapi->getReadPtr(f, plane));
+                    const size_t s_pitch = vsapi->getStride(f, plane);
+                    uint8_t * dstp = stream.staging_map +
+                        new_idx * slot_bytes + pad_off;
+                    for (int y = 0; y < d->height; ++y) {
+                        copy_stream_out(dstp + static_cast<size_t>(y) * row_pitch,
+                            srcp + static_cast<size_t>(y) * s_pitch, row_bytes);
+                    }
+                    stream.copy_regions.push_back(VkBufferCopy {
+                        .srcOffset = new_idx * slot_bytes,
+                        .dstOffset = static_cast<VkDeviceSize>(stream.win_slots[ti]) *
+                            d->slot_bytes,
+                        .size = slot_bytes
+                    });
+                    ++new_idx;
+                }
+            }
+        }
+
+        // per-frame layer->slot table: source at [c*layers+t], guide after it.
+        // Without rclip the guide aliases the source slots, but the guide
+        // section must still be fully written (the weight kernel always
+        // resolves distances through it).
+        int * tab = reinterpret_cast<int *>(stream.staging_map +
+            static_cast<size_t>(d->staging_tiles) * slot_bytes);
+        for (int clip = 0; clip < 2; ++clip) {
+            const size_t base =
+                static_cast<size_t>(clip) * (C * d->layers);
+            // source tiles are keys[0 .. C*layers); guide tiles follow when
+            // there is an rclip, otherwise they alias the source slots
+            const size_t key_off =
+                (clip == 1 && d->has_ref) ? static_cast<size_t>(C * d->layers) : 0;
+            for (int i = 0; i < count; ++i) {
+                const int t_layer = d->d - m + i;
+                for (int c = 0; c < C; ++c) {
+                    const size_t pos = base +
+                        static_cast<size_t>(c) * d->layers + t_layer;
+                    tab[pos] = static_cast<int>(
+                        static_cast<int64_t>(
+                            stream.win_slots[key_off +
+                                static_cast<size_t>(i) * C + c]) *
+                        d->slot_elems);
                 }
             }
         }
     }
+
+    mark(t_up);
 
     const bool staging_coherent =
         !!(d->device->mem_props.memoryTypes[
@@ -419,10 +612,11 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         };
         vkFlushMappedMemoryRanges(dev, 1, &range);
     }
+    mark(t_up);
 
     // ------------------------------------------------------------------
-    // command buffer: staging -> padded windows, scratch init, batched
-    // weight/accumulation sweep, finish
+    // command buffer: new-tile copies + table update, batched
+    // weight/accumulation sweep (first batch self-initializes), finish
     // ------------------------------------------------------------------
     VkCommandBufferBeginInfo begin_info {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -434,38 +628,35 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         return set_error("vkBeginCommandBuffer failed");
     }
 
-    const size_t lay_bytes = static_cast<size_t>(d->pstride) * d->ph * d->elem_bytes;
-    const size_t win_bytes = static_cast<size_t>(count) * lay_bytes;
-    for (int c = 0; c < C; ++c) {
-        const size_t off = static_cast<size_t>(c) * d->layers * lay_bytes +
-            static_cast<size_t>(d->d - m) * lay_bytes;
-        VkBufferCopy region {
-            .srcOffset = off,
-            .dstOffset = off,
-            .size = win_bytes
-        };
-        vkCmdCopyBuffer(stream.cmd, stream.staging, stream.u1, 1, &region);
-        if (d->has_ref) {
-            VkBufferCopy region_ref {
-                .srcOffset = d->u1_bytes + off,
-                .dstOffset = off,
-                .size = win_bytes
-            };
-            vkCmdCopyBuffer(stream.cmd, stream.staging, stream.u1r, 1, &region_ref);
-        }
+    const bool gputrace = d->gputrace;
+    if (gputrace) {
+        vkCmdResetQueryPool(stream.cmd, stream.ts_query, 0, 8);
+        vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stream.ts_query, 0);
     }
 
-    // sub-dword stores of the finish kernel OR into u1z dwords
-    if (d->elem_bytes == 2) {
-        vkCmdFillBuffer(stream.cmd, stream.u1z, 0, VK_WHOLE_SIZE, 0);
+    if (!stream.copy_regions.empty()) {
+        vkCmdCopyBuffer(stream.cmd, stream.staging, d->slots_buf,
+            static_cast<uint32_t>(stream.copy_regions.size()),
+            stream.copy_regions.data());
     }
-    vkCmdFillBuffer(stream.cmd, stream.u2, 0, VK_WHOLE_SIZE, 0);
-    vkCmdFillBuffer(stream.cmd, stream.u5, 0, VK_WHOLE_SIZE, FLT_EPS_BITS);
+    {
+        const size_t slot_bytes = static_cast<size_t>(d->slot_bytes);
+        VkBufferCopy tab_region {
+            .srcOffset = static_cast<VkDeviceSize>(d->staging_tiles) * slot_bytes,
+            .dstOffset = 0,
+            .size = static_cast<VkDeviceSize>(2 * C * d->layers) * sizeof(int32_t)
+        };
+        vkCmdCopyBuffer(stream.cmd, stream.staging, stream.tables_dev,
+            1, &tab_region);
+    }
+    stream.copy_regions.clear();
 
     record_barrier(stream.cmd,
         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+
+    if (gputrace) vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stream.ts_query, 1);
 
     const uint32_t gx = static_cast<uint32_t>((d->width + BLK_X - 1) / BLK_X);
     const uint32_t gy = static_cast<uint32_t>((d->height + BLK_Y - 1) / BLK_Y);
@@ -473,6 +664,10 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         (d->height + VRT_RESULT * BLK_Y - 1) / (VRT_RESULT * BLK_Y));
 
     const Variant & v = d->variants[m];
+
+    // Interleaved weight/accumulation batches: batch k's weights overwrite
+    // the shared u4a slot ring, so its accumulation MUST complete (barrier)
+    // before batch k+1's weights launch.
     uint32_t q0 = 0;
     size_t bi = 0;
     while (q0 < v.q_cnt) {
@@ -480,31 +675,40 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         const uint32_t p0 = v.w_boff[bi];
         const uint32_t p1 = v.w_boff[bi + 1];
 
-        const int32_t w_push[2] {
-            static_cast<int32_t>(v.w_base + p0), 0
+        const int32_t w_push[3] {
+            static_cast<int32_t>(v.w_base + p0), 0, 0
         };
         record_dispatch(d, stream, d->weight_pipeline, w_push, gx, gy_w, p1 - p0);
         record_barrier(stream.cmd,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        if (gputrace && bi == 0) {
+            vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, 4);
+        }
 
-        const int32_t a_push[2] {
-            static_cast<int32_t>(v.q_base + q0), static_cast<int32_t>(nb)
+        const int32_t a_push[3] {
+            static_cast<int32_t>(v.q_base + q0), static_cast<int32_t>(nb),
+            bi == 0 ? 1 : 0
         };
         record_dispatch(d, stream, d->acc_pipeline, a_push, gx, gy, 1);
         record_barrier(stream.cmd,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        if (gputrace && bi == 0) {
+            vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, 5);
+        }
 
         q0 += nb;
         ++bi;
     }
+    if (gputrace) vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, 2);
 
     {
-        const int32_t f_push[2] { 0, 0 };
+        const int32_t f_push[3] { 0, 0, 0 };
         record_dispatch(d, stream, d->fin_pipeline, f_push, gx, gy, 1);
     }
+    if (gputrace) vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, 3);
 
     if (vkEndCommandBuffer(stream.cmd) != VK_SUCCESS) {
         return set_error("vkEndCommandBuffer failed");
@@ -530,10 +734,15 @@ static const VSFrame *VS_CC NLMeansGetFrame(
             return set_error("vkQueueSubmit failed");
         }
     }
+    mark(t_sub);
 
     if (vkWaitForFences(dev, 1, &stream.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
         return set_error("vkWaitForFences failed");
     }
+    mark(t_wait);
+
+    // all kernels that read this frame's tiles have completed
+    release_cache(d, stream, n);
 
     const bool dst_coherent =
         !!(d->device->mem_props.memoryTypes[
@@ -562,6 +771,38 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         for (int y = 0; y < d->height; ++y) {
             memcpy(dstp + static_cast<size_t>(y) * d_pitch,
                 srcp + static_cast<size_t>(y) * row_bytes, row_bytes);
+        }
+    }
+    mark(t_dl);
+
+    if (trace) {
+        uint32_t nf = t_nf.fetch_add(1) + 1;
+        if (nf % 100 == 0) {
+            fprintf(stderr,
+                "[perf] frames=%u up=%.2f sub=%.2f wait=%.2f dl=%.2f (ms avg)\n",
+                nf,
+                t_up.load() / double(nf) / 1e3,
+                t_sub.load() / double(nf) / 1e3,
+                t_wait.load() / double(nf) / 1e3,
+                t_dl.load() / double(nf) / 1e3);
+        }
+    }
+    if (d->gputrace && stream.ts_query) {
+        uint64_t ts[6] {};
+        if (vkGetQueryPoolResults(dev, stream.ts_query, 0, 6,
+                sizeof(ts), ts, sizeof(uint64_t),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+            static std::atomic<uint32_t> ts_n {};
+            const float period = d->device->limits.timestampPeriod;
+            uint32_t nq = ts_n.fetch_add(1) + 1;
+            fprintf(stderr,
+                "[gputrace] n=%u copy=%.3f w1=%.3f a1=%.3f wall=%.3f finish=%.3f (ms)\n",
+                nq + 1,
+                (ts[1] - ts[0]) * period / 1e6,
+                (ts[4] - ts[1]) * period / 1e6,
+                (ts[5] - ts[4]) * period / 1e6,
+                (ts[2] - ts[1]) * period / 1e6,
+                (ts[3] - ts[2]) * period / 1e6);
         }
     }
 
@@ -835,6 +1076,7 @@ static void VS_CC NLMeansCreate(
             return set_error(std::get<std::string>(result));
         }
         d->device = std::get<std::shared_ptr<VK_Device>>(result);
+    d->gputrace = std::getenv("NLMEANS_GPUTRACE") != nullptr;
     }
 
     VkDevice dev = d->device->device;
@@ -867,8 +1109,8 @@ static void VS_CC NLMeansCreate(
 
     // descriptor set layout: 8 storage buffer bindings
     {
-        VkDescriptorSetLayoutBinding bindings[8];
-        for (uint32_t b = 0; b < 8; ++b) {
+        VkDescriptorSetLayoutBinding bindings[9];
+        for (uint32_t b = 0; b < 9; ++b) {
             bindings[b] = VkDescriptorSetLayoutBinding {
                 .binding = b,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -881,7 +1123,7 @@ static void VS_CC NLMeansCreate(
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .bindingCount = 8,
+            .bindingCount = 9,
             .pBindings = bindings
         };
         if (vkCreateDescriptorSetLayout(dev, &layout_info, nullptr, &d->set_layout) != VK_SUCCESS) {
@@ -892,7 +1134,7 @@ static void VS_CC NLMeansCreate(
         VkPushConstantRange push_constant_range {
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
             .offset = 0,
-            .size = 2 * sizeof(int32_t)
+            .size = 3 * sizeof(int32_t)
         };
         VkPipelineLayoutCreateInfo pipeline_layout_info {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -909,7 +1151,7 @@ static void VS_CC NLMeansCreate(
     }
     {
         VkDescriptorPoolSize pool_size {
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 * static_cast<uint32_t>(d->num_streams)
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9 * static_cast<uint32_t>(d->num_streams)
         };
         VkDescriptorPoolCreateInfo pool_info {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1018,18 +1260,41 @@ static void VS_CC NLMeansCreate(
         vkUnmapMemory(dev, d->tables_mem);
     }
 
-    // per-stream resources
+    // shared slot pool of padded channel-layer tiles + per-stream resources
     d->semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
     d->streams.reserve(d->num_streams);
 
     uint32_t num_queues = std::min(
         d->num_streams, static_cast<int>(d->device->queue_count));
 
-    const VkDeviceSize lay_bytes =
-        static_cast<VkDeviceSize>(d->pstride) * d->ph * d->elem_bytes;
-    const VkDeviceSize u1_bytes = lay_bytes * d->layers * d->channels;
     const int clips = d->has_ref ? 2 : 1;
-    d->u1_bytes = u1_bytes;
+    const VkDeviceSize slot_bytes_v =
+        static_cast<VkDeviceSize>(d->pstride) * d->ph * d->elem_bytes;
+    d->slot_bytes = slot_bytes_v;
+    d->slot_elems = static_cast<int64_t>(d->pstride) * d->ph;
+    // working set: the union of the in-flight frames' windows
+    d->staging_tiles = clips * d->channels * d->layers;
+    d->n_slots = (d->num_streams + 2 * d->d) * d->channels * clips +
+        2 * d->channels * clips;
+
+    {
+        const auto result = create_buffer(dev,
+            slot_bytes_v * d->n_slots,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (std::holds_alternative<std::string>(result)) {
+            return set_error(std::get<std::string>(result));
+        }
+        d->slots_buf = std::get<VkBuffer>(result);
+    }
+    if (auto err = bind_memory(*d, d->slots_buf, d->slots_mem,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+        return set_error(*err);
+    }
+    d->cache.assign(d->n_slots, CacheSlot {});
+
+    const VkDeviceSize staging_bytes =
+        slot_bytes_v * (d->staging_tiles + 1) +
+        2 * d->channels * d->layers * sizeof(int32_t);
 
     const VkDeviceSize npix_v = static_cast<VkDeviceSize>(d->npix);
     const VkDeviceSize u1z_bytes =
@@ -1041,9 +1306,9 @@ static void VS_CC NLMeansCreate(
     for (int i = 0; i < d->num_streams; ++i) {
         NLStream st;
 
-        // staging mirror of the padded source (+guide) window
+        // upload staging: new tiles plus the per-frame slot-base table
         {
-            const auto result = create_buffer(dev, u1_bytes * clips,
+            const auto result = create_buffer(dev, staging_bytes,
                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
@@ -1061,37 +1326,25 @@ static void VS_CC NLMeansCreate(
             st.staging_mem = std::get<AllocatedMemory>(result).memory;
             st.staging_type_index = std::get<AllocatedMemory>(result).type_index;
         }
-        if (vkMapMemory(dev, st.staging_mem, 0, u1_bytes * clips, 0,
+        if (vkMapMemory(dev, st.staging_mem, 0, staging_bytes, 0,
                 reinterpret_cast<void **>(&st.staging_map)) != VK_SUCCESS) {
             return set_error("vkMapMemory failed");
         }
-        // the pad margin of every layer keeps its one-time-init zero
-        memset(st.staging_map, 0, static_cast<size_t>(u1_bytes * clips));
+        // the pad margin of every tile keeps its one-time-init zero
+        memset(st.staging_map, 0, static_cast<size_t>(staging_bytes));
 
         {
-            const auto result = create_buffer(dev, u1_bytes,
+            const auto result = create_buffer(dev,
+                static_cast<VkDeviceSize>(2 * d->channels * d->layers) * sizeof(int32_t),
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
-            st.u1 = std::get<VkBuffer>(result);
+            st.tables_dev = std::get<VkBuffer>(result);
         }
-        if (auto err = bind_memory(*d, st.u1, st.u1_mem,
+        if (auto err = bind_memory(*d, st.tables_dev, st.tables_dev_mem,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
             return set_error(*err);
-        }
-
-        if (d->has_ref) {
-            const auto result = create_buffer(dev, u1_bytes,
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            st.u1r = std::get<VkBuffer>(result);
-            if (auto err = bind_memory(*d, st.u1r, st.u1r_mem,
-                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-                return set_error(*err);
-            }
         }
 
         // result buffer, written by the finish kernel, downloaded by the host
@@ -1192,6 +1445,18 @@ static void VS_CC NLMeansCreate(
                 return set_error("vkCreateFence failed");
             }
         }
+        if (d->gputrace) {
+            VkQueryPoolCreateInfo qp_info {
+                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                .queryCount = 8
+            };
+            if (vkCreateQueryPool(dev, &qp_info, nullptr, &st.ts_query) != VK_SUCCESS) {
+                return set_error("vkCreateQueryPool failed");
+            }
+        }
         {
             VkDescriptorSetAllocateInfo alloc_info {
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1204,20 +1469,21 @@ static void VS_CC NLMeansCreate(
                 return set_error("vkAllocateDescriptorSets failed");
             }
 
-            VkDescriptorBufferInfo infos[8] {
-                { st.u1, 0, VK_WHOLE_SIZE },
-                { d->has_ref ? st.u1r : st.u1, 0, VK_WHOLE_SIZE },
+            VkDescriptorBufferInfo infos[9] {
+                { d->slots_buf, 0, VK_WHOLE_SIZE },          // src values
+                { d->slots_buf, 0, VK_WHOLE_SIZE },          // guide values
                 { st.u1z, 0, VK_WHOLE_SIZE },
                 { st.u2, 0, VK_WHOLE_SIZE },
                 { st.u4a, 0, VK_WHOLE_SIZE },
                 { st.u5, 0, VK_WHOLE_SIZE },
                 { d->tables_buf, 0,
                   static_cast<VkDeviceSize>(d->wq_host.size()) * sizeof(int32_t) },
-                { d->tables_buf, d->aq_offset, VK_WHOLE_SIZE }
+                { d->tables_buf, d->aq_offset, VK_WHOLE_SIZE },
+                { st.tables_dev, 0, VK_WHOLE_SIZE }
             };
 
-            VkWriteDescriptorSet writes[8];
-            for (uint32_t b = 0; b < 8; ++b) {
+            VkWriteDescriptorSet writes[9];
+            for (uint32_t b = 0; b < 9; ++b) {
                 writes[b] = VkWriteDescriptorSet {
                     .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                     .pNext = nullptr,
@@ -1231,11 +1497,11 @@ static void VS_CC NLMeansCreate(
                     .pTexelBufferView = nullptr
                 };
             }
-            vkUpdateDescriptorSets(dev, 8, writes, 0, nullptr);
+            vkUpdateDescriptorSets(dev, 9, writes, 0, nullptr);
         }
 
-        st.queue = d->device->queues[i % num_queues].queue;
-        st.queue_lock = d->device->queues[i % num_queues].lock.get();
+        st.queue = d->device->queues[0].queue;  // TEMP: single-queue test
+        st.queue_lock = d->device->queues[0].lock.get();  // TEMP
 
         d->streams.push_back(std::move(st));
     }

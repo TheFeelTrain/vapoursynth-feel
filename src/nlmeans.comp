@@ -23,18 +23,13 @@
 #endif
 
 #if BITS == 16
-#define ELEM_BYTES 2
-#define ELEM_MASK  0xFFFFu
+#extension GL_EXT_shader_16bit_storage : require
 #define PEAK       65535.0f
 #define SCALE      (1.0f / 65535.0f)
 #else
-#define ELEM_BYTES 4
-#define ELEM_MASK  0xFFFFFFFFu
 #define PEAK       1.0f
 #define SCALE      1.0f
 #endif
-
-#define ELEM_SHIFT(byte) (8 * ((byte) & 3))
 
 layout(constant_id = 0)  const int VI_DIM_X = 640;
 layout(constant_id = 1)  const int VI_DIM_Y = 360;
@@ -58,84 +53,85 @@ layout(constant_id = 13) const float H2_INV_NORM = 1.0;
 
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
-layout(std430, binding = 0) readonly buffer SrcBuf   { uint src_raw[]; };    /* u1 */
-layout(std430, binding = 1) readonly buffer GuideBuf { uint guide_raw[]; };  /* u1r or u1 */
-layout(std430, binding = 2) buffer DstBuf { uint dst_raw[]; };               /* u1z */
+#if BITS == 16
+layout(std430, binding = 0) readonly buffer SrcBuf   { uint16_t src_raw[]; };
+layout(std430, binding = 1) readonly buffer GuideBuf { uint16_t guide_raw[]; };
+layout(std430, binding = 2) writeonly buffer DstBuf  { uint16_t dst_raw[]; };
+#else
+layout(std430, binding = 0) readonly buffer SrcBuf   { float src_raw[]; };
+layout(std430, binding = 1) readonly buffer GuideBuf { float guide_raw[]; };
+layout(std430, binding = 2) writeonly buffer DstBuf  { float dst_raw[]; };
+#endif
 layout(std430, binding = 3) buffer AccBuf { float u2[]; };
 layout(std430, binding = 4) buffer WeightBuf { float u4a[]; };
 layout(std430, binding = 5) buffer MaxBuf { float u5[]; };
 layout(std430, binding = 6) readonly buffer WQBuf { int wq[]; };
 layout(std430, binding = 7) readonly buffer AQBuf { int aq[]; };
+// per-frame layer->slot-base table: [c*layers + t] source, [C*layers + c*layers + t] guide
+// (element offsets of the padded tile holding that channel-layer this frame)
+layout(std430, binding = 8) readonly buffer SlotTable { int slot_table[]; };
 
 layout(push_constant) uniform PushConstants {
     int pc0;
     int pc1;
+    int pc2;
 } pc;
 
-uint load_src_raw(int idx) {
-    uint byte_off = uint(idx) * ELEM_BYTES;
-    uint word = src_raw[byte_off >> 2];
-    return (word >> ELEM_SHIFT(byte_off)) & ELEM_MASK;
-}
+#define LAYERS (2*NLM_D+1)
+#define GT_OFF (NLM_CHANNELS * LAYERS)
 
 float load_src(int idx) {
 #if BITS == 32
-    return uintBitsToFloat(load_src_raw(idx));
+    return src_raw[idx];
 #else
-    return float(load_src_raw(idx)) * SCALE;
+    return float(int(src_raw[idx])) * SCALE;
 #endif
-}
-
-uint load_guide_raw(int idx) {
-    uint byte_off = uint(idx) * ELEM_BYTES;
-    uint word = guide_raw[byte_off >> 2];
-    return (word >> ELEM_SHIFT(byte_off)) & ELEM_MASK;
 }
 
 float load_guide(int idx) {
 #if BITS == 32
-    return uintBitsToFloat(load_guide_raw(idx));
+    return guide_raw[idx];
 #else
-    return float(load_guide_raw(idx)) * SCALE;
+    return float(int(guide_raw[idx])) * SCALE;
 #endif
 }
 
 void store_value(int idx, float v) {
-    uint byte_off = uint(idx) * ELEM_BYTES;
-    uint wi = byte_off >> 2;
 #if BITS == 32
-    dst_raw[wi] = floatBitsToUint(v);
+    dst_raw[idx] = v;
 #else
-    // sub-dword store: OR into a shared dword; the host clears u1z before
-    // every submission so paired lanes never lose updates
-    atomicOr(dst_raw[wi], (uint(v * PEAK + 0.5f) & ELEM_MASK) << ELEM_SHIFT(byte_off));
+    // glslc -O chokes on a direct float->uint16_t convert (OpUConvert);
+    // go through uint with an explicit mask (same workaround as DFTTest)
+    dst_raw[idx] = uint16_t(uint(v * PEAK + 0.5f) & 0xFFFFu);
 #endif
 }
 
 /* Joint multi-channel patch distance for the center pixel (xx,y) vs the
- * candidate (xx+qx, y+qy) on layers t / t+qz. The +-a margin of the padded
- * buffers realizes the zero border; constants and operand order match the
+ * candidate (xx+qx, y+qy). aK/bK are the element bases of channel K's slot
+ * tiles for the reference / candidate layer; the +-a margin of each padded
+ * tile realizes the zero border. Constants and operand order match the
  * reference nlm_pix_dist exactly. The REF branches fold per pipeline. */
-float nlm_pix_dist(int t, int qz, int xx, int y, int qx, int qy) {
-    const int ac = t*U1_LAYER + (y+PAD)*PSTRIDE + (xx+PAD);
-    const int bc = (t+qz)*U1_LAYER + (y+qy+PAD)*PSTRIDE + (xx+qx+PAD);
+float nlm_pix_dist(int a0, int a1, int a2, int b0, int b1, int b2,
+                   int xx, int y, int qx, int qy) {
+    const int rc = (y+PAD)*PSTRIDE + (xx+PAD);
+    const int cc = (y+qy+PAD)*PSTRIDE + (xx+qx+PAD);
     if (NLM_REF == 0) {          /* LUMA */
-        const float d0 = load_guide(ac) - load_guide(bc);
+        const float d0 = load_guide(a0 + rc) - load_guide(b0 + cc);
         return 3.0f * (d0 * d0);
     } else if (NLM_REF == 1) {   /* CHROMA (U,V) */
-        const float du = load_guide(ac) - load_guide(bc);
-        const float dv = load_guide(U1_PLANE + ac) - load_guide(U1_PLANE + bc);
+        const float du = load_guide(a0 + rc) - load_guide(b0 + cc);
+        const float dv = load_guide(a1 + rc) - load_guide(b1 + cc);
         return 1.5f * (du*du + dv*dv);
     } else if (NLM_REF == 2) {   /* YUV (4:4:4 only) */
-        const float dy = load_guide(ac) - load_guide(bc);
-        const float du = load_guide(U1_PLANE + ac) - load_guide(U1_PLANE + bc);
-        const float dv = load_guide(2*U1_PLANE + ac) - load_guide(2*U1_PLANE + bc);
+        const float dy = load_guide(a0 + rc) - load_guide(b0 + cc);
+        const float du = load_guide(a1 + rc) - load_guide(b1 + cc);
+        const float dv = load_guide(a2 + rc) - load_guide(b2 + cc);
         return dy*dy + du*du + dv*dv;
     } else {                     /* RGB */
-        const float ar = load_guide(ac), br = load_guide(bc);
+        const float ar = load_guide(a0 + rc), br = load_guide(b0 + cc);
         const float dr = ar - br;
-        const float dg = load_guide(U1_PLANE + ac) - load_guide(U1_PLANE + bc);
-        const float db = load_guide(2*U1_PLANE + ac) - load_guide(2*U1_PLANE + bc);
+        const float dg = load_guide(a1 + rc) - load_guide(b1 + cc);
+        const float db = load_guide(a2 + rc) - load_guide(b2 + cc);
         const float m_red = (ar + br) / 6.0f;
         return (2.0f/3.0f + m_red) * (dr*dr) + (4.0f/3.0f) * (dg*dg) + (1.0f - m_red) * (db*db);
     }
@@ -147,13 +143,14 @@ float nlm_pix_dist(int t, int qz, int xx, int y, int qx, int qy) {
 #define BX        16
 #define BY        8
 #define VRT_RESULT 3
-#define S_MAX     8
-// odd strides avoid shared-memory bank conflicts (layout only)
-#define DIST_W ((BX + 2*S_MAX) | 1)
-#define HSUM_W (BX | 1)
+// Exact per-instance LDS sizing: NLM_S is a specialization constant, so the
+// pipeline allocates precisely what this instance needs (occupancy). Even
+// strides like the OpenCL reference (gfx11 has no bank-conflict penalty here).
+#define DIST_W (BX + 2*NLM_S)
+#define HSUM_W (BX)
 
-shared float dist[VRT_RESULT*BY + 2*S_MAX][DIST_W];
-shared float hsum[VRT_RESULT*BY + 2*S_MAX][HSUM_W];
+shared float dist[VRT_RESULT*BY + 2*NLM_S][DIST_W];
+shared float hsum[VRT_RESULT*BY + 2*NLM_S][HSUM_W];
 
 void main() {
     // Q-batched: workgroup z picks the pass whose (t,qx,qy,qz,slot) row comes
@@ -162,20 +159,47 @@ void main() {
     const int t = wq[prow+0], qx = wq[prow+1], qy = wq[prow+2], qz = wq[prow+3];
     const int slot = wq[prow+4];
 
+    // guide slot bases for layers t (reference) and t+qz (candidate)
+    const int gt = GT_OFF + t;
+    const int gt_c = GT_OFF + t + qz;
+    const int a0 = slot_table[gt],      b0 = slot_table[gt_c];
+    const int a1 = slot_table[gt + LAYERS],   b1 = slot_table[gt_c + LAYERS];
+    const int a2 = slot_table[gt + 2*LAYERS], b2 = slot_table[gt_c + 2*LAYERS];
+
     const int lx = int(gl_LocalInvocationID.x);
     const int ly = int(gl_LocalInvocationID.y);
     const int gx0 = int(gl_WorkGroupID.x) * BX;
     const int gy0 = int(gl_WorkGroupID.y) * (VRT_RESULT*BY);
 
+#undef DIST_CELL
+#define DIST_CELL(RY, CX) { \
+    const int xx_c = gx0 - NLM_S + (CX); \
+    const int yy_c = gy0 - NLM_S + (RY); \
+    dist[RY][CX] = (xx_c >= 0 && xx_c < VI_DIM_X && yy_c >= 0 && yy_c < VI_DIM_Y) \
+                   ? nlm_pix_dist(a0, a1, a2, b0, b1, b2, xx_c, yy_c, qx, qy) : 0.0f; }
+#undef DIST_CHUNK
+#define DIST_CHUNK(RYBASE) { \
+    const int ry_g = (RYBASE); \
+    if (ry_g < VRT_RESULT*BY + 2*NLM_S) { \
+        if (lx < 2*NLM_S) { \
+            DIST_CELL(ry_g, lx) \
+            DIST_CELL(ry_g, lx + BX) \
+        } else { \
+            DIST_CELL(ry_g, lx) \
+        } \
+    } }
+
     // 1) per-pixel distance over the tile + halo; OOB -> 0.0f (zero border).
-    for (int ry = ly; ry < VRT_RESULT*BY + 2*NLM_S; ry += BY) {
-        const int yy = gy0 - NLM_S + ry;
-        for (int cx = lx; cx < BX + 2*NLM_S; cx += BX) {
-            const int xx = gx0 - NLM_S + cx;
-            dist[ry][cx] = (xx >= 0 && xx < VI_DIM_X && yy >= 0 && yy < VI_DIM_Y)
-                           ? nlm_pix_dist(t, qz, xx, yy, qx, qy) : 0.0f;
-        }
-    }
+    // Written out as straight-line code (at most 5 strided rows per thread,
+    // at most 2 columns): keeps all pixel loads in flight simultaneously the
+    // way the reference compiler's full unroll does.
+    DIST_CHUNK(ly)
+    DIST_CHUNK(ly + BY)
+    DIST_CHUNK(ly + 2*BY)
+    DIST_CHUNK(ly + 3*BY)
+    DIST_CHUNK(ly + 4*BY)
+#undef DIST_CHUNK
+#undef DIST_CELL
     barrier();
     // 2) horizontal box-sum: hsum[ry][lx] = sum dist[ry][lx..lx+2S] (ascending x).
     for (int ry = ly; ry < VRT_RESULT*BY + 2*NLM_S; ry += BY) {
@@ -218,13 +242,14 @@ void main() {
     const int g = y*STRIDE + x;
     const int cx = x+PAD, cy = y+PAD;
     const int q_base = pc.pc0, nb = pc.pc1;
+    // first batch starts from constants (replaces u2/u5 zero-fills)
 
-    float u5v = u5[g];
+    float u5v = pc.pc2 != 0 ? 1.1920929e-7f : u5[g];
     // Accumulate both +q and -q per entry: weight(p,p+q)==weight(p,p-q).
     // Per pixel the loop walks the batch's q's in sweep order (rows of the
     // aq table: qx, qy, qz, center slot, mirror slot).
     if (NLM_CHANNELS == 1) {
-        float acc0 = u2[2*g], accw = u2[2*g+1];
+        float acc0 = pc.pc2 != 0 ? 0.0f : u2[2*g], accw = pc.pc2 != 0 ? 0.0f : u2[2*g+1];
         for (int b = 0; b < nb; ++b) {
             const int r = (q_base + b) * 8;
             const int qx = aq[r+0], qy = aq[r+1], qz = aq[r+2];
@@ -234,15 +259,17 @@ void main() {
             const float u4_mq = (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
                                 ? 0.0f : u4a[sm*U4_LAYER + ym*STRIDE + xm];
             u5v = max(u4, max(u4_mq, u5v));
-            const int pq = (NLM_D+qz)*U1_LAYER + (cy+qy)*PSTRIDE + (cx+qx);
-            const int mq = (NLM_D-qz)*U1_LAYER + (cy-qy)*PSTRIDE + (cx-qx);
-            const float pq0 = load_src(pq), mq0 = load_src(mq);
+            const int pqc = slot_table[NLM_D+qz] + (cy+qy)*PSTRIDE + (cx+qx);
+            const int mqc = slot_table[NLM_D-qz] + (cy-qy)*PSTRIDE + (cx-qx);
+            const float pq0 = load_src(pqc), mq0 = load_src(mqc);
             acc0 += (u4*pq0) + (u4_mq*mq0);
             accw += (u4 + u4_mq);
         }
         u2[2*g] = acc0; u2[2*g+1] = accw;
     } else if (NLM_CHANNELS == 2) {
-        float acc0 = u2[3*g], acc1 = u2[3*g+1], accw = u2[3*g+2];
+        float acc0 = pc.pc2 != 0 ? 0.0f : u2[3*g];
+        float acc1 = pc.pc2 != 0 ? 0.0f : u2[3*g+1];
+        float accw = pc.pc2 != 0 ? 0.0f : u2[3*g+2];
         for (int b = 0; b < nb; ++b) {
             const int r = (q_base + b) * 8;
             const int qx = aq[r+0], qy = aq[r+1], qz = aq[r+2];
@@ -252,17 +279,22 @@ void main() {
             const float u4_mq = (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
                                 ? 0.0f : u4a[sm*U4_LAYER + ym*STRIDE + xm];
             u5v = max(u4, max(u4_mq, u5v));
-            const int pq = (NLM_D+qz)*U1_LAYER + (cy+qy)*PSTRIDE + (cx+qx);
-            const int mq = (NLM_D-qz)*U1_LAYER + (cy-qy)*PSTRIDE + (cx-qx);
-            const float pq0 = load_src(pq),              mq0 = load_src(mq);
-            const float pq1 = load_src(U1_PLANE + pq),   mq1 = load_src(U1_PLANE + mq);
+            const int pq0b = slot_table[NLM_D+qz]     + (cy+qy)*PSTRIDE + (cx+qx);
+            const int mq0b = slot_table[NLM_D-qz]     + (cy-qy)*PSTRIDE + (cx-qx);
+            const int pq1b = slot_table[LAYERS+NLM_D+qz] + (cy+qy)*PSTRIDE + (cx+qx);
+            const int mq1b = slot_table[LAYERS+NLM_D-qz] + (cy-qy)*PSTRIDE + (cx-qx);
+            const float pq0 = load_src(pq0b), mq0 = load_src(mq0b);
+            const float pq1 = load_src(pq1b), mq1 = load_src(mq1b);
             acc0 += (u4*pq0) + (u4_mq*mq0);
             acc1 += (u4*pq1) + (u4_mq*mq1);
             accw += (u4 + u4_mq);
         }
         u2[3*g] = acc0; u2[3*g+1] = acc1; u2[3*g+2] = accw;
     } else {
-        float acc0 = u2[4*g], acc1 = u2[4*g+1], acc2 = u2[4*g+2], accw = u2[4*g+3];
+        float acc0 = pc.pc2 != 0 ? 0.0f : u2[4*g];
+        float acc1 = pc.pc2 != 0 ? 0.0f : u2[4*g+1];
+        float acc2 = pc.pc2 != 0 ? 0.0f : u2[4*g+2];
+        float accw = pc.pc2 != 0 ? 0.0f : u2[4*g+3];
         for (int b = 0; b < nb; ++b) {
             const int r = (q_base + b) * 8;
             const int qx = aq[r+0], qy = aq[r+1], qz = aq[r+2];
@@ -272,11 +304,15 @@ void main() {
             const float u4_mq = (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
                                 ? 0.0f : u4a[sm*U4_LAYER + ym*STRIDE + xm];
             u5v = max(u4, max(u4_mq, u5v));
-            const int pq = (NLM_D+qz)*U1_LAYER + (cy+qy)*PSTRIDE + (cx+qx);
-            const int mq = (NLM_D-qz)*U1_LAYER + (cy-qy)*PSTRIDE + (cx-qx);
-            const float pq0 = load_src(pq),                mq0 = load_src(mq);
-            const float pq1 = load_src(U1_PLANE + pq),     mq1 = load_src(U1_PLANE + mq);
-            const float pq2 = load_src(2*U1_PLANE + pq),   mq2 = load_src(2*U1_PLANE + mq);
+            const int pq0b = slot_table[NLM_D+qz]        + (cy+qy)*PSTRIDE + (cx+qx);
+            const int mq0b = slot_table[NLM_D-qz]        + (cy-qy)*PSTRIDE + (cx-qx);
+            const int pq1b = slot_table[LAYERS+NLM_D+qz]    + (cy+qy)*PSTRIDE + (cx+qx);
+            const int mq1b = slot_table[LAYERS+NLM_D-qz]    + (cy-qy)*PSTRIDE + (cx-qx);
+            const int pq2b = slot_table[2*LAYERS+NLM_D+qz]  + (cy+qy)*PSTRIDE + (cx+qx);
+            const int mq2b = slot_table[2*LAYERS+NLM_D-qz]  + (cy-qy)*PSTRIDE + (cx-qx);
+            const float pq0 = load_src(pq0b), mq0 = load_src(mq0b);
+            const float pq1 = load_src(pq1b), mq1 = load_src(mq1b);
+            const float pq2 = load_src(pq2b), mq2 = load_src(mq2b);
             acc0 += (u4*pq0) + (u4_mq*mq0);
             acc1 += (u4*pq1) + (u4_mq*mq1);
             acc2 += (u4*pq2) + (u4_mq*mq2);
@@ -299,7 +335,7 @@ void main() {
     if (x >= VI_DIM_X || y >= VI_DIM_Y) return;
     const int g = y*STRIDE + x;
     const float m = WREF * u5[g];
-    const int uc = NLM_D*U1_LAYER + (y+PAD)*PSTRIDE + (x+PAD);
+    const int uc = slot_table[NLM_D] + (y+PAD)*PSTRIDE + (x+PAD);
 
     if (NLM_CHANNELS == 1) {
         const float acc0 = u2[2*g], accw = u2[2*g+1];
@@ -308,14 +344,14 @@ void main() {
     } else if (NLM_CHANNELS == 2) {
         const float acc0 = u2[3*g], acc1 = u2[3*g+1], accw = u2[3*g+2];
         const float den = m + accw;
-        store_value(g,         (load_src(uc)*m             + acc0) / den);
-        store_value(NPIX + g,  (load_src(U1_PLANE + uc)*m  + acc1) / den);
+        store_value(g,               (load_src(uc)*m                          + acc0) / den);
+        store_value(NPIX + g,        (load_src(slot_table[LAYERS+NLM_D]       + (y+PAD)*PSTRIDE + (x+PAD))*m + acc1) / den);
     } else {
         const float acc0 = u2[4*g], acc1 = u2[4*g+1], acc2 = u2[4*g+2], accw = u2[4*g+3];
         const float den = m + accw;
-        store_value(g,           (load_src(uc)*m               + acc0) / den);
-        store_value(NPIX + g,    (load_src(U1_PLANE + uc)*m    + acc1) / den);
-        store_value(2*NPIX + g,  (load_src(2*U1_PLANE + uc)*m  + acc2) / den);
+        store_value(g,               (load_src(uc)*m                          + acc0) / den);
+        store_value(NPIX + g,        (load_src(slot_table[LAYERS+NLM_D]       + (y+PAD)*PSTRIDE + (x+PAD))*m + acc1) / den);
+        store_value(2*NPIX + g,      (load_src(slot_table[2*LAYERS+NLM_D]     + (y+PAD)*PSTRIDE + (x+PAD))*m + acc2) / den);
     }
 }
 
