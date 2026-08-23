@@ -6,6 +6,11 @@ GaussBlur; the expected behaviour is bit-identical output (the kernel taps,
 mirror reflection and fma accumulation were ported exactly, and the float32
 pipeline matches the reference's fp32 maths).
 
+Reference comparisons assert exact equality (measured max diff == 0.0 on
+every config tried, both code paths, both bit depths, YUV included), so no
+numeric tolerance is needed; only reference crashes are tolerated (the
+comparison runs in a subprocess).
+
 Run from the repository root:  python -m pytest tests/test_gaussblur.py
 """
 
@@ -168,7 +173,19 @@ def test_gaussblur_matches_reference_small(noise_gray, sigma):
     assert maxdiff == 0.0, f"small path max diff: {maxdiff}"
 
 
-@pytest.mark.parametrize("sigma", [20.0, 80.0])
+@pytest.mark.parametrize("sigma", [10.5, 11.0, 12.0])
+def test_gaussblur_matches_reference_path_boundary(noise_gray, sigma):
+    """Sigmas around the fused-small / two-pass transition (radius ~32) must
+    be bit-identical on both sides of the switch."""
+    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
+        pytest.skip("no vszipcl.GaussBlur reference")
+    maxdiff = _max_diff_vs_reference("gray32", sigma)
+    if maxdiff is None:
+        pytest.skip("reference comparison crashed")
+    assert maxdiff == 0.0, f"path boundary max diff: {maxdiff}"
+
+
+@pytest.mark.parametrize("sigma", [20.0, 30.0, 40.0, 80.0])
 def test_gaussblur_matches_reference_large(noise_gray, sigma):
     """Two-pass large path (radius > 32) must be bit-identical to vszipcl."""
     if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
@@ -179,24 +196,27 @@ def test_gaussblur_matches_reference_large(noise_gray, sigma):
     assert maxdiff == 0.0, f"large path max diff: {maxdiff}"
 
 
-def test_gaussblur_matches_reference_gray16(noise_gray):
+@pytest.mark.parametrize("sigma", [0.5, 2.0, 5.0, 20.0])
+def test_gaussblur_matches_reference_gray16(noise_gray, sigma):
+    """16-bit integer input must be bit-identical on both code paths."""
     if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
         pytest.skip("no vszipcl.GaussBlur reference")
-    maxdiff = _max_diff_vs_reference("gray16", 5.0)
+    maxdiff = _max_diff_vs_reference("gray16", sigma)
     if maxdiff is None:
         pytest.skip("reference comparison crashed")
-    assert maxdiff == 0.0, f"gray16 max diff: {maxdiff}"
+    assert maxdiff == 0.0, f"gray16 max diff ({sigma}): {maxdiff}"
 
 
-def test_gaussblur_matches_reference_yuv(noise_gray):
+@pytest.mark.parametrize("sigma", [0.5, 3.0, 20.0])
+def test_gaussblur_matches_reference_yuv(noise_gray, sigma):
     """YUV420: all three planes (incl. the subsampled chroma defaults) must
-    match vszipcl bit-for-bit."""
+    match vszipcl bit-for-bit, on both code paths."""
     if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
         pytest.skip("no vszipcl.GaussBlur reference")
-    maxdiff = _max_diff_vs_reference("yuv32", 3.0)
+    maxdiff = _max_diff_vs_reference("yuv32", sigma)
     if maxdiff is None:
         pytest.skip("reference comparison crashed")
-    assert maxdiff == 0.0, f"yuv32 max diff: {maxdiff}"
+    assert maxdiff == 0.0, f"yuv32 max diff ({sigma}): {maxdiff}"
 
 
 # ---------------------------------------------------------------------------
