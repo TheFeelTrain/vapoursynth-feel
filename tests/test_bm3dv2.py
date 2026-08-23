@@ -10,6 +10,7 @@ Run from the repository root:  python -m pytest tests/test_bm3dv2.py
 """
 
 import ctypes
+import json
 import subprocess
 import sys
 import textwrap
@@ -187,7 +188,7 @@ def test_bm3dv2_ref_matches_reference(noise_gray):
     for ref in ("vszipcl", "bm3dhip"):
         if not hasattr(vs.core, ref) or not hasattr(getattr(vs.core, ref), "BM3Dv2"):
             continue
-        maxdiff = _max_diff_vs_reference(2, ref, ref_pass=True)
+        maxdiff = _max_diff_vs_reference(dict(BASE_KWARGS), ref, ref_pass=True)
         if maxdiff is None:
             continue  # crashed or failed to load: try the next reference
         assert maxdiff < 0.01, f"max diff vs {ref} (ref pass): {maxdiff}"
@@ -226,30 +227,30 @@ def test_bm3dv2_yuv_passthrough(noise_gray):
 
 _COMPARE_SCRIPT = textwrap.dedent(f"""\
     import sys
+    import json
     import vapoursynth as vs
     from vstools import core
     import numpy as np
     import ctypes
 
     ref = sys.argv[1]
-    radius = int(sys.argv[2])
+    kwargs = json.loads(sys.argv[2])
     ref_pass = int(sys.argv[3])
 
     core.max_cache_size = 1024 * 56
     src = core.bs.VideoSource({NOISE_MKV!r})
     clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
 
-    kwargs = {{"sigma": 0.7, "radius": radius, "bm_range": 16, "ps_range": 7, "block_step": 4}}
     if ref != "bm3dhip":
         kwargs["num_streams"] = 1
     if ref_pass:
         # both implementations get the same vsfeel basic estimate as the ref
         basic = core.vsfeel.BM3Dv2(clip, **kwargs)
         ref_node = getattr(core, ref).BM3Dv2(clip, ref=basic, **kwargs)
-        my_node = core.vsfeel.BM3Dv2(clip, ref=basic, sigma=0.7, radius=radius, bm_range=16, ps_range=7, block_step=4, num_streams=1)
+        my_node = core.vsfeel.BM3Dv2(clip, ref=basic, **kwargs)
     else:
         ref_node = getattr(core, ref).BM3Dv2(clip, **kwargs)
-        my_node = core.vsfeel.BM3Dv2(clip, sigma=0.7, radius=radius, bm_range=16, ps_range=7, block_step=4, num_streams=1)
+        my_node = core.vsfeel.BM3Dv2(clip, **kwargs)
 
     worst = 0.0
     for n in (0, 11, 23):
@@ -260,12 +261,12 @@ _COMPARE_SCRIPT = textwrap.dedent(f"""\
 """)
 
 
-def _max_diff_vs_reference(radius: int, ref: str, ref_pass: bool = False) -> float | None:
+def _max_diff_vs_reference(kwargs: dict, ref: str, ref_pass: bool = False) -> float | None:
     """Run the comparison in a subprocess; a crashing reference yields None."""
     try:
         result = subprocess.run(
-            [sys.executable, "-c", _COMPARE_SCRIPT, ref, str(radius), str(int(ref_pass))],
-            capture_output=True, text=True, timeout=180,
+            [sys.executable, "-c", _COMPARE_SCRIPT, ref, json.dumps(kwargs), str(int(ref_pass))],
+            capture_output=True, text=True, timeout=300,
         )
     except subprocess.TimeoutExpired:
         return None
@@ -273,6 +274,51 @@ def _max_diff_vs_reference(radius: int, ref: str, ref_pass: bool = False) -> flo
         return None
     lines = [line for line in result.stdout.splitlines() if line.strip()]
     return float(lines[-1]) if lines else None
+
+
+BASE_KWARGS = dict(sigma=0.7, radius=2, bm_range=16, ps_range=7, block_step=4)
+
+# Parameter sweep around the defaults: every entry is merged over
+# BASE_KWARGS and compared against the reference (basic estimate).
+#
+# Tolerances are set from measurement. The basic estimate is sensitive to
+# block-match decisions made near the bm_range threshold: a microscopic fp
+# difference in distance accumulation can flip a block in or out of its
+# group, which shows up as isolated speckle (<0.1% of pixels, spread over
+# the whole frame). Larger sigma / more grouped blocks make this more
+# likely, hence the looser bounds there. Measured maxima at the time of
+# writing: defaults 0.0079, sigma=1.5 0.0203, ps_num=5 0.0123.
+SWEEP_CONFIGS = [
+    ({}, 0.01),
+    ({"sigma": 0.3}, 0.01),
+    ({"sigma": 1.5}, 0.03),
+    ({"block_step": 2}, 0.01),
+    ({"bm_range": 9}, 0.01),
+    ({"bm_range": 22}, 0.01),
+    ({"ps_range": 5}, 0.01),
+    ({"ps_range": 9}, 0.01),
+    ({"ps_num": 5}, 0.02),
+    ({"extractor_exp": 6}, 0.01),
+]
+
+
+def _sweep_id(cfg: dict) -> str:
+    return ",".join(f"{k}={v}" for k, v in cfg.items()) or "defaults"
+
+
+@pytest.mark.parametrize("cfg,tol", SWEEP_CONFIGS, ids=[_sweep_id(c) for c, _ in SWEEP_CONFIGS])
+def test_bm3dv2_parameter_sweep_matches_reference(noise_gray, cfg, tol):
+    """Parameter grid around the defaults must track the reference (basic
+    estimate pass)."""
+    for ref in ("vszipcl", "bm3dhip"):
+        if not hasattr(vs.core, ref) or not hasattr(getattr(vs.core, ref), "BM3Dv2"):
+            continue
+        maxdiff = _max_diff_vs_reference(dict(BASE_KWARGS, **cfg), ref)
+        if maxdiff is None:
+            continue  # crashed or failed to load: try the next reference
+        assert maxdiff < tol, f"max diff vs {ref} ({_sweep_id(cfg)}): {maxdiff}"
+        return
+    pytest.skip("no usable reference plugin (vszipcl/bm3dhip)")
 
 
 @pytest.mark.parametrize("radius", [0, 2, 3, 4])
@@ -286,7 +332,7 @@ def test_bm3dv2_matches_reference(noise_gray, radius):
     for ref in ("vszipcl", "bm3dhip"):
         if not hasattr(vs.core, ref) or not hasattr(getattr(vs.core, ref), "BM3Dv2"):
             continue
-        maxdiff = _max_diff_vs_reference(radius, ref)
+        maxdiff = _max_diff_vs_reference(dict(BASE_KWARGS, radius=radius), ref)
         if maxdiff is None:
             continue  # crashed or failed to load: try the next reference
         assert maxdiff < 0.01, f"max diff vs {ref}: {maxdiff}"
