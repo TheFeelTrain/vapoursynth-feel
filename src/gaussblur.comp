@@ -18,26 +18,18 @@
  * the accumulation uses explicit fma() so the FMAD contraction matches the
  * CUDA/OpenCL references. The IO conversion follows the references: integer
  * input is the raw code (no scaling), integer output rounds to nearest even
- * and saturates (convert_*_sat_rte), 16-bit float widens/narrows exactly.
+ * and saturates (convert_*_sat_rte).
  *
- * Compile-time variants: -DBITS=8|16|32 with -DHALF=1 selecting the 16-bit
- * float staging for BITS=16. The staging buffer holds the raw VapourSynth
- * plane bytes and the kernel performs the format conversion itself, so the
- * host side only memcpys raw bytes.
+ * Compile-time variants: -DBITS=16|32. The staging buffer holds the raw
+ * VapourSynth plane bytes and the kernel performs the format conversion
+ * itself, so the host side only memcpys raw bytes.
  */
 
 #if !defined(BITS)
 #define BITS 16
 #endif
-#if !defined(HALF)
-#define HALF 0
-#endif
 
-#if BITS == 8
-#define ELEM_BYTES 1
-#define ELEM_MASK  0xFFu
-#define PEAK       255.0f
-#elif BITS == 16
+#if BITS == 16
 #define ELEM_BYTES 2
 #define ELEM_MASK  0xFFFFu
 #define PEAK       65535.0f
@@ -83,8 +75,6 @@ uint load_raw(int idx) {
 float load_value(int idx) {
 #if BITS == 32
     return uintBitsToFloat(load_raw(idx));
-#elif BITS == 16 && HALF
-    return unpackHalf2x16(load_raw(idx)).x;
 #else
     return float(load_raw(idx));
 #endif
@@ -105,8 +95,6 @@ void store_raw(int idx, uint val) {
 void store_value(int idx, float v) {
 #if BITS == 32
     store_raw(idx, floatBitsToUint(v));
-#elif BITS == 16 && HALF
-    store_raw(idx, packHalf2x16(vec2(v, 0.0)) & ELEM_MASK);
 #else
     store_raw(idx, uint(clamp(roundEven(v), 0.0, PEAK)) & ELEM_MASK);
 #endif
@@ -122,13 +110,11 @@ int mirror(int i, int dim) {
     return i;
 }
 
-// convert a computed value to its packed integer form (the low halfword/byte
+// convert a computed value to its packed integer form (the low halfword
 // of the returned uint for the sub-32-bit formats)
 uint pack_value(float v) {
 #if BITS == 32
     return floatBitsToUint(v);
-#elif BITS == 16 && HALF
-    return packHalf2x16(vec2(v, 0.0)) & ELEM_MASK;
 #else
     return uint(clamp(roundEven(v), 0.0, PEAK)) & ELEM_MASK;
 #endif
@@ -136,7 +122,7 @@ uint pack_value(float v) {
 
 // Horizontal-pass output: write R consecutive values as whole dwords. Every
 // thread owns R adjacent columns, so it owns each dword it touches and can
-// write plain (non-atomic) stores even for the 8/16-bit formats. The OOB
+// write plain (non-atomic) stores even for the 16-bit format. The OOB
 // lanes are zeroed (the download region is pre-cleared), so packing is safe.
 void store_row(int row, int x0, float vals[R]) {
 #if BITS == 32

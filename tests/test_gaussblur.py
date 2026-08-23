@@ -112,15 +112,9 @@ _COMPARE_SCRIPT = textwrap.dedent(f"""\
     if fmt == "gray32":
         clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
         dtype, w, h = np.float32, {WIDTH}, {HEIGHT}
-    elif fmt == "gray8":
-        clip = core.std.ShufflePlanes(src, 0, vs.GRAY)
-        dtype, w, h = np.uint8, {WIDTH}, {HEIGHT}
     elif fmt == "gray16":
         clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=16, fulls=True, fulld=True)
         dtype, w, h = np.uint16, {WIDTH}, {HEIGHT}
-    elif fmt == "gray16h":
-        clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=16, fulls=True, fulld=True)
-        dtype, w, h = np.float16, {WIDTH}, {HEIGHT}
     elif fmt == "yuv32":
         clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
         dtype = np.float32
@@ -185,15 +179,6 @@ def test_gaussblur_matches_reference_large(noise_gray, sigma):
     assert maxdiff == 0.0, f"large path max diff: {maxdiff}"
 
 
-def test_gaussblur_matches_reference_gray8(noise_gray):
-    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
-        pytest.skip("no vszipcl.GaussBlur reference")
-    maxdiff = _max_diff_vs_reference("gray8", 5.0)
-    if maxdiff is None:
-        pytest.skip("reference comparison crashed")
-    assert maxdiff == 0.0, f"gray8 max diff: {maxdiff}"
-
-
 def test_gaussblur_matches_reference_gray16(noise_gray):
     if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
         pytest.skip("no vszipcl.GaussBlur reference")
@@ -201,15 +186,6 @@ def test_gaussblur_matches_reference_gray16(noise_gray):
     if maxdiff is None:
         pytest.skip("reference comparison crashed")
     assert maxdiff == 0.0, f"gray16 max diff: {maxdiff}"
-
-
-def test_gaussblur_matches_reference_gray16h(noise_gray):
-    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
-        pytest.skip("no vszipcl.GaussBlur reference")
-    maxdiff = _max_diff_vs_reference("gray16h", 5.0)
-    if maxdiff is None:
-        pytest.skip("reference comparison crashed")
-    assert maxdiff == 0.0, f"gray16h max diff: {maxdiff}"
 
 
 def test_gaussblur_matches_reference_yuv(noise_gray):
@@ -279,7 +255,9 @@ def test_gaussblur_rejects_negative_sigma(noise_gray):
 
 
 def test_gaussblur_rejects_bad_bitdepth(noise_8bit):
-    # 10-bit integer input is not supported
+    # only 16-bit integer and 32-bit float input is supported
+    with pytest.raises(vs.Error):
+        _run(noise_8bit)
     clip = vs.core.fmtc.bitdepth(noise_8bit, bits=10)
     with pytest.raises(vs.Error):
         _run(clip)

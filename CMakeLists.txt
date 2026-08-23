@@ -42,11 +42,11 @@ else()
 endif()
 
 # SPIR-V: compile the GLSL kernels with glslc when available.
-# Each kernel is compiled for 8/16/32-bit staging formats.
+# Each kernel is compiled for 16/32-bit staging formats.
 set(VK_SPV_DIR "${CMAKE_CURRENT_BINARY_DIR}/vk_spv")
 
 set(VK_KERNEL_COMPONENTS shared plain)
-set(VK_BITS 8 16 32)
+set(VK_BITS 16 32)
 
 if(VK_GLSLC)
     set(VK_SPV_OUTPUTS)
@@ -75,16 +75,11 @@ if(VK_GLSLC)
             VERBATIM)
     endforeach()
     # GaussBlur: one kernel with three entry points (fused small path + the two
-    # large-path passes), per io variant (8/16 int, 16 half, 32 float)
+    # large-path passes), per io variant (16 int, 32 float)
     set(VK_GAUSS_ENTRIES gauss vert horiz)
-    set(VK_GAUSS_BITDEFS "8" "16" "16h" "32")
+    set(VK_GAUSS_BITDEFS "16" "32")
     foreach(bits IN LISTS VK_GAUSS_BITDEFS)
-        set(bits_defs)
-        if(bits STREQUAL "16h")
-            list(APPEND bits_defs -DBITS=16 -DHALF=1)
-        else()
-            list(APPEND bits_defs -DBITS=${bits})
-        endif()
+        set(bits_defs -DBITS=${bits})
         foreach(entry IN LISTS VK_GAUSS_ENTRIES)
             set(defs ${bits_defs})
             if(entry STREQUAL gauss)
@@ -185,23 +180,15 @@ endif()
 add_custom_command(
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
     COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/src/gen_spirv_header.py"
-            "${VK_SPV_DIR}/kernel_shared_8.spv"
             "${VK_SPV_DIR}/kernel_shared_16.spv"
             "${VK_SPV_DIR}/kernel_shared_32.spv"
-            "${VK_SPV_DIR}/kernel_plain_8.spv"
             "${VK_SPV_DIR}/kernel_plain_16.spv"
             "${VK_SPV_DIR}/kernel_plain_32.spv"
             "${VK_SPV_DIR}/bm3d.spv"
             "${VK_SPV_DIR}/bm3d_agg.spv"
-            "${VK_SPV_DIR}/gaussblur_8_gauss.spv"
-            "${VK_SPV_DIR}/gaussblur_8_vert.spv"
-            "${VK_SPV_DIR}/gaussblur_8_horiz.spv"
             "${VK_SPV_DIR}/gaussblur_16_gauss.spv"
             "${VK_SPV_DIR}/gaussblur_16_vert.spv"
             "${VK_SPV_DIR}/gaussblur_16_horiz.spv"
-            "${VK_SPV_DIR}/gaussblur_16h_gauss.spv"
-            "${VK_SPV_DIR}/gaussblur_16h_vert.spv"
-            "${VK_SPV_DIR}/gaussblur_16h_horiz.spv"
             "${VK_SPV_DIR}/gaussblur_32_gauss.spv"
             "${VK_SPV_DIR}/gaussblur_32_vert.spv"
             "${VK_SPV_DIR}/gaussblur_32_horiz.spv"

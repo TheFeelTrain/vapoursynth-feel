@@ -3,8 +3,8 @@
 /*
  * Bilateral filter compute shader, shared-memory (tiled) variant.
  *
- * Compile-time variants: -DBITS=8|16|32 selects the staging element type.
- * The staging buffer holds the raw VapourSynth plane bytes (uint16/uint8
+ * Compile-time variants: -DBITS=16|32 selects the staging element type.
+ * The staging buffer holds the raw VapourSynth plane bytes (uint16
  * integer or float32), and this kernel performs the format conversion
  * itself, so the host side only memcpys raw bytes.
  *
@@ -22,12 +22,7 @@
 #define BITS 16
 #endif
 
-#if BITS == 8
-#define ELEM_BYTES 1
-#define ELEM_MASK  0xFFu
-#define PEAK       255.0f
-#define SCALE      (1.0f / 255.0f)
-#elif BITS == 16
+#if BITS == 16
 #define ELEM_BYTES 2
 #define ELEM_MASK  0xFFFFu
 #define PEAK       65535.0f
@@ -142,15 +137,15 @@ void main() {
     }
 
     // deposit the result into the output tile, then let the packing lane
-    // write complete dwords (pairs for 16-bit, quads for 8-bit) so no
-    // pre-clearing of the download region is required
+    // write complete dwords (pairs for 16-bit) so no pre-clearing of the
+    // download region is required
     out_tile[ty * TILE_X + tx] = num / den;
     barrier();
 
 #if BITS == 32
     store_value(y * STRIDE + x, num / den);
 #else
-    const int PACK = 4 / ELEM_BYTES;   // 2 for 16-bit, 4 for 8-bit
+    const int PACK = 4 / ELEM_BYTES;   // 2 for 16-bit
     if ((x & (PACK - 1)) == 0) {
         uint packed = 0;
         for (int k = 0; k < PACK; ++k) {

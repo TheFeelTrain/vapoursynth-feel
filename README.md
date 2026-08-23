@@ -6,7 +6,7 @@ Primarily optimized for running on RDNA 3 with the RADV driver on Linux.
 
 ## Requirements
 
-- GPU with Vulkan 1.3 (or 1.1 with `VK_KHR_maintenance4` / `VK_KHR_8bit_storage`) and `glslc` at build time
+- GPU with Vulkan 1.3 (or 1.1 with `VK_KHR_maintenance4`) and `glslc` at build time
 
 ## Usage
 
@@ -21,7 +21,7 @@ core.vsfeel.Bilateral(clip, sigma_spatial=3.0, sigma_color=0.02, radius=0, num_s
 ```
 
 - clip:
-    The input clip.
+    The input clip. Supports 16 bit integer and 32 bit float input in Gray, YUV or RGB color families.
 
 - sigma_spatial: (Default: 3.0)
     Filter sigma in the coordinate space.
@@ -126,7 +126,7 @@ core.vsfeel.GaussBlur(clip, sigma=0.5, num_streams=1)
 ```
 
 - clip:
-    The input clip. Supports 8/16 bit integer, 16 bit half float and 32 bit float input in Gray, YUV or RGB color families.
+    The input clip. Supports 16 bit integer and 32 bit float input in Gray, YUV or RGB color families.
 
 - sigma: (Default: 0.5)
     Blur sigma for each plane. Use an array to assign it for each plane, otherwise the second plane defaults to `sigma[0] / sqrt((1 << subSamplingH) * (1 << subSamplingW))` and the third to the second plane's value. Must be non-negative. A value below the machine epsilon copies the plane through unmodified.

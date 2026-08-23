@@ -53,15 +53,14 @@ def test_bilateral_deterministic(noise_gray):
         assert np.abs(da).max() == 0.0
 
 
-def test_bilateral_accepts_8bit(noise_8bit):
-    """Bilateral accepts 8/16-bit integer input as well."""
-    out = _run(noise_8bit, sigma_spatial=SIGMA_SPATIAL, sigma_color=0.02)
-    assert out.format.sample_type == vs.INTEGER
-    assert np.isfinite(frame_to_ndarray(out.get_frame(0), dtype=np.uint8)).all()
+def test_bilateral_rejects_8bit(noise_8bit):
+    """Only 16-bit integer and 32-bit float input is supported."""
+    with pytest.raises(vs.Error):
+        _run(noise_8bit)
 
 
 def test_bilateral_rejects_10bit(noise_8bit):
-    """Formats other than 8/16-bit int and 32-bit float must be rejected."""
+    """Formats other than 16-bit int and 32-bit float must be rejected."""
     clip10 = vs.core.fmtc.bitdepth(noise_8bit, bits=10)
     with pytest.raises(vs.Error):
         _run(clip10)

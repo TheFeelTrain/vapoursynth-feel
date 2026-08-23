@@ -593,11 +593,11 @@ static void VS_CC BilateralCreate(
             d->vi->format.sampleType
         };
         !vsh::isConstantVideoFormat(d->vi) ||
-        (sample == stInteger && (bps != 8 && bps != 16)) ||
+        (sample == stInteger && bps != 16) ||
         (sample == stFloat && bps != 32)
     ) {
 
-        return set_error("only constant format 8/16bit int or 32bit float input supported");
+        return set_error("input bitdepth must be 16 (integer) or 32 (float).");
     }
 
     d->bits = d->vi->format.bitsPerSample;
@@ -870,10 +870,6 @@ static void VS_CC BilateralCreate(
         const uint32_t * plain_code = nullptr;
         size_t plain_size = 0;
         switch (d->bits) {
-            case 8:
-                shared_code = kernel_shared_8_spv; shared_size = kernel_shared_8_spv_size;
-                plain_code = kernel_plain_8_spv; plain_size = kernel_plain_8_spv_size;
-                break;
             case 16:
                 shared_code = kernel_shared_16_spv; shared_size = kernel_shared_16_spv_size;
                 plain_code = kernel_plain_16_spv; plain_size = kernel_plain_16_spv_size;

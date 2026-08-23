@@ -3,8 +3,8 @@
 /*
  * Bilateral filter compute shader, plain (non-shared-memory) variant.
  *
- * Compile-time variants: -DBITS=8|16|32 selects the staging element type.
- * The staging buffer holds the raw VapourSynth plane bytes (uint16/uint8
+ * Compile-time variants: -DBITS=16|32 selects the staging element type.
+ * The staging buffer holds the raw VapourSynth plane bytes (uint16
  * integer or float32), and this kernel performs the format conversion
  * itself, so the host side only memcpys raw bytes.
  */
@@ -13,12 +13,7 @@
 #define BITS 16
 #endif
 
-#if BITS == 8
-#define ELEM_BYTES 1
-#define ELEM_MASK  0xFFu
-#define PEAK       255.0f
-#define SCALE      (1.0f / 255.0f)
-#elif BITS == 16
+#if BITS == 16
 #define ELEM_BYTES 2
 #define ELEM_MASK  0xFFFFu
 #define PEAK       65535.0f
