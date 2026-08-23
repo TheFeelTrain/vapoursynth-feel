@@ -134,6 +134,44 @@ core.vsfeel.GaussBlur(clip, sigma=0.5, num_streams=1)
 - num_streams: (Default: 1)
     Number of command buffers submitted per frame, enables concurrent kernel execution and data transfer. Must be in range [1, 32].
 
+### NLMeans
+
+[Non-local means](https://en.wikipedia.org/wiki/Non-local_means) is a denoising filter that replaces every pixel with a weighted average of pixels across a search window, weighting them by the similarity of their surrounding patches. Searching across space and time suppresses noise while preserving detail.
+
+```python
+core.vsfeel.NLMeans(clip, d=2, a=2, s=4, h=0.2, wmode=0, wref=1.0, channels="auto", rclip=None, num_streams=2)
+```
+
+- clip:
+    The input clip. Supports 16 bit integer and 32 bit float input in Gray, YUV or RGB color families.
+
+- d: (Default: 1)
+    Temporal radius, i.e. how many frames before and after the current frame are included in the search. Must be in range [0, 16].
+
+- a: (Default: 2)
+    Radius of the search window in pixels. The search covers (2a+1)^2 positions per frame pair. Must be in range [1, 64], and the window must fit within the frame.
+
+- s: (Default: 4)
+    Radius of the patch compared around every pixel when computing similarity. The patch contains (2s+1)^2 pixels. Must be in range [0, 8].
+
+- h: (Default: 1.2)
+    Filter strength. Higher values give more weight to less similar patches, producing stronger smoothing. Must be positive.
+
+- wmode: (Default: 0)
+    Weight transform applied to the normalized patch distance: 0 = exponential decay, 1 = linear, 2 = quadratic, 3 = eighth-power cutoff. Must be in range [0, 3].
+
+- wref: (Default: 1.0)
+    Weight multiplier for the center pixel itself relative to the found candidates. Must be non-negative.
+
+- channels: (Default: "auto")
+    Planes to process: "Y" denoises luma only, "UV" only chroma, "YUV" all planes jointly (requires 4:4:4), "RGB" all planes jointly with RGB distance weighting. "auto" picks based on the color family. Case-insensitive.
+
+- rclip:
+    Optional guide clip whose planes provide the patch content used to compute the distances, while the planes of the source clip are averaged. Must match the source clip's format and dimensions.
+
+- num_streams: (Default: 1)
+    Number of command buffers submitted per frame, enables concurrent kernel execution and data transfer. Must be in range [1, 32].
+
 ## Manual Compilation
 
 ```bash
