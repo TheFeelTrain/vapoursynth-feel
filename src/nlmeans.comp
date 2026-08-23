@@ -232,15 +232,83 @@ void main() {
         } \
     } }
 
+    // uniform per-invocation test: is this workgroup's whole tile+halo region
+    // (reference AND candidate) inside the frame? Then the zero-border
+    // predicate per cell can be dropped entirely.
+    const bool interior =
+        gx0 - NLM_S >= 0 && gx0 + BX + NLM_S <= VI_DIM_X &&
+        gx0 - NLM_S + qx >= 0 && gx0 + BX + NLM_S + qx <= VI_DIM_X &&
+        gy0 - NLM_S >= 0 && gy0 + VRT_RESULT*BY + NLM_S <= VI_DIM_Y &&
+        gy0 - NLM_S + qy >= 0 && gy0 + VRT_RESULT*BY + NLM_S + qy <= VI_DIM_Y;
+
     // 1) per-pixel distance over the tile + halo; OOB -> 0.0f (zero border).
-    // Written out as straight-line code (at most 5 strided rows per thread,
-    // at most 2 columns): keeps all pixel loads in flight simultaneously the
-    // way the reference compiler's full unroll does.
-    DIST_CHUNK(ly)
-    DIST_CHUNK(ly + BY)
-    DIST_CHUNK(ly + 2*BY)
-    DIST_CHUNK(ly + 3*BY)
-    DIST_CHUNK(ly + 4*BY)
+    if (interior) {
+        for (int ry_g2 = ly; ry_g2 < VRT_RESULT*BY + 2*NLM_S; ry_g2 += BY) {
+            const int yy_c = gy0 - NLM_S + ry_g2;
+            const int br = (yy_c+PAD)*PSTRIDE + gx0 - NLM_S + PAD;
+            const int bc = (yy_c+qy+PAD)*PSTRIDE + gx0 - NLM_S + qx + PAD;
+            // each thread covers up to two columns; batch the loads of both
+            const int cx_a = lx;
+            const bool two = lx < 2*NLM_S;
+            const int cx_b = two ? lx + BX : cx_a;
+                const int xx_a = gx0 - NLM_S + cx_a;
+                const int yy_c2 = yy_c;
+                bool ina = xx_a >= 0 && xx_a < VI_DIM_X && yy_c2 >= 0 && yy_c2 < VI_DIM_Y
+                           && xx_a + qx >= 0 && xx_a + qx < VI_DIM_X
+                           && yy_c2 + qy >= 0 && yy_c2 + qy < VI_DIM_Y;
+                const int xx_b = gx0 - NLM_S + cx_b;
+                bool inb2 = xx_b >= 0 && xx_b < VI_DIM_X
+                           && xx_b + qx >= 0 && xx_b + qx < VI_DIM_X
+                           && yy_c2 >= 0 && yy_c2 < VI_DIM_Y
+                           && yy_c2 + qy >= 0 && yy_c2 + qy < VI_DIM_Y;
+                float va = 0.0f, vb = 0.0f;
+                if (ina || inb2) {
+                    const int rc_a2 = br + cx_a, cc_a2 = bc + cx_a;
+                    const int rc_b2 = br + cx_b, cc_b2 = bc + cx_b;
+                    const float ar0 = load_guide(a0 + rc_a2), br0 = load_guide(b0 + cc_a2);
+                    const float ar1 = load_guide(a0 + rc_b2), br1 = load_guide(b0 + cc_b2);
+                    if (NLM_REF == 0) {
+                        const float d0 = ar0 - br0, d1 = ar1 - br1;
+                        va = 3.0f * (d0 * d0);
+                        vb = 3.0f * (d1 * d1);
+                    } else if (NLM_REF == 1) {
+                        const float au0 = load_guide(a1 + rc_a2), bu0 = load_guide(b1 + cc_a2);
+                        const float au1 = load_guide(a1 + rc_b2), bu1 = load_guide(b1 + cc_b2);
+                        const float du0 = ar0 - br0, dvv0 = au0 - bu0;
+                        const float du1 = ar1 - br1, dvv1 = au1 - bu1;
+                        va = 1.5f * (du0*du0 + dvv0*dvv0);
+                        vb = 1.5f * (du1*du1 + dvv1*dvv1);
+                    } else if (NLM_REF == 2) {
+                        const float au0 = load_guide(a1 + rc_a2), bu0 = load_guide(b1 + cc_a2);
+                        const float av0 = load_guide(a2 + rc_a2), bv0 = load_guide(b2 + cc_a2);
+                        const float au1 = load_guide(a1 + rc_b2), bu1 = load_guide(b1 + cc_b2);
+                        const float av1 = load_guide(a2 + rc_b2), bv1 = load_guide(b2 + cc_b2);
+                        const float ddy0 = ar0 - br0, ddu0 = au0 - bu0, ddv0 = av0 - bv0;
+                        const float ddy1 = ar1 - br1, ddu1 = au1 - bu1, ddv1 = av1 - bv1;
+                        va = ddy0*ddy0 + ddu0*ddu0 + ddv0*ddv0;
+                        vb = ddy1*ddy1 + ddu1*ddu1 + ddv1*ddv1;
+                    } else {
+                        const float au0 = load_guide(a1 + rc_a2), bu0 = load_guide(b1 + cc_a2);
+                        const float av0 = load_guide(a2 + rc_a2), bv0 = load_guide(b2 + cc_a2);
+                        const float au1 = load_guide(a1 + rc_b2), bu1 = load_guide(b1 + cc_b2);
+                        const float av1 = load_guide(a2 + rc_b2), bv1 = load_guide(b2 + cc_b2);
+                        const float dr0 = ar0 - br0, dg0 = au0 - bu0, db0 = av0 - bv0;
+                        const float dr1 = ar1 - br1, dg1 = au1 - bu1, db1 = av1 - bv1;
+                        const float mr0 = (ar0 + br0) / 6.0f, mr1 = (ar1 + br1) / 6.0f;
+                        va = (2.0f/3.0f + mr0)*(dr0*dr0) + (4.0f/3.0f)*(dg0*dg0) + (1.0f - mr0)*(db0*db0);
+                        vb = (2.0f/3.0f + mr1)*(dr1*dr1) + (4.0f/3.0f)*(dg1*dg1) + (1.0f - mr1)*(db1*db1);
+                    }
+                }
+                dist[ry_g2][cx_a] = ina ? va : 0.0f;
+                if (two) dist[ry_g2][cx_b] = (inb2 ? vb : 0.0f);
+        }
+    } else {
+        DIST_CHUNK(ly)
+        DIST_CHUNK(ly + BY)
+        DIST_CHUNK(ly + 2*BY)
+        DIST_CHUNK(ly + 3*BY)
+        DIST_CHUNK(ly + 4*BY)
+    }
 #undef DIST_CHUNK
 #undef DIST_CELL
     barrier();
@@ -284,6 +352,7 @@ void main() {
     if (x >= VI_DIM_X || y >= VI_DIM_Y) return;
     const int g = y*STRIDE + x;
     const int cx = x+PAD, cy = y+PAD;
+    const int gpad = cy*PSTRIDE + cx;
     const int q_base = pc.pc0, nb = pc.pc1;
     // first batch starts from constants (replaces u2/u5 zero-fills)
 
@@ -300,11 +369,11 @@ void main() {
             const float u4 = u4a[sc*U4_LAYER + g];
             const int xm = x-qx, ym = y-qy;
             const float u4_mq = (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
-                                ? 0.0f : u4a[sm*U4_LAYER + ym*STRIDE + xm];
+                                ? 0.0f : u4a[sm*U4_LAYER + g - (qy*STRIDE + qx)];
             u5v = max(u4, max(u4_mq, u5v));
-            const int pqc = slot_table[NLM_D+qz] + (cy+qy)*PSTRIDE + (cx+qx);
-            const int mqc = slot_table[NLM_D-qz] + (cy-qy)*PSTRIDE + (cx-qx);
-            const float pq0 = load_src(pqc), mq0 = load_src(mqc);
+            const int qps = qy*PSTRIDE + qx;
+            const float pq0 = load_src(slot_table[NLM_D+qz] + gpad + qps);
+            const float mq0 = load_src(slot_table[NLM_D-qz] + gpad - qps);
             acc0 += (u4*pq0) + (u4_mq*mq0);
             accw += (u4 + u4_mq);
         }
@@ -320,14 +389,17 @@ void main() {
             const float u4 = u4a[sc*U4_LAYER + g];
             const int xm = x-qx, ym = y-qy;
             const float u4_mq = (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
-                                ? 0.0f : u4a[sm*U4_LAYER + ym*STRIDE + xm];
+                                ? 0.0f : u4a[sm*U4_LAYER + g - (qy*STRIDE + qx)];
             u5v = max(u4, max(u4_mq, u5v));
-            const int pq0b = slot_table[NLM_D+qz]     + (cy+qy)*PSTRIDE + (cx+qx);
-            const int mq0b = slot_table[NLM_D-qz]     + (cy-qy)*PSTRIDE + (cx-qx);
-            const int pq1b = slot_table[LAYERS+NLM_D+qz] + (cy+qy)*PSTRIDE + (cx+qx);
-            const int mq1b = slot_table[LAYERS+NLM_D-qz] + (cy-qy)*PSTRIDE + (cx-qx);
-            const float pq0 = load_src(pq0b), mq0 = load_src(mq0b);
-            const float pq1 = load_src(pq1b), mq1 = load_src(mq1b);
+            #ifdef NLMEANS_PROBE_ACC_NOSRC
+                const float pq0 = 1.0f, mq0 = 2.0f, pq1 = 3.0f, mq1 = 4.0f;
+            #else
+            const int qps = qy*PSTRIDE + qx;
+            const float pq0 = load_src(slot_table[NLM_D+qz] + gpad + qps);
+            const float mq0 = load_src(slot_table[NLM_D-qz] + gpad - qps);
+            const float pq1 = load_src(slot_table[LAYERS+NLM_D+qz] + gpad + qps);
+            const float mq1 = load_src(slot_table[LAYERS+NLM_D-qz] + gpad - qps);
+            #endif
             acc0 += (u4*pq0) + (u4_mq*mq0);
             acc1 += (u4*pq1) + (u4_mq*mq1);
             accw += (u4 + u4_mq);
@@ -345,17 +417,15 @@ void main() {
             const float u4 = u4a[sc*U4_LAYER + g];
             const int xm = x-qx, ym = y-qy;
             const float u4_mq = (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
-                                ? 0.0f : u4a[sm*U4_LAYER + ym*STRIDE + xm];
+                                ? 0.0f : u4a[sm*U4_LAYER + g - (qy*STRIDE + qx)];
             u5v = max(u4, max(u4_mq, u5v));
-            const int pq0b = slot_table[NLM_D+qz]        + (cy+qy)*PSTRIDE + (cx+qx);
-            const int mq0b = slot_table[NLM_D-qz]        + (cy-qy)*PSTRIDE + (cx-qx);
-            const int pq1b = slot_table[LAYERS+NLM_D+qz]    + (cy+qy)*PSTRIDE + (cx+qx);
-            const int mq1b = slot_table[LAYERS+NLM_D-qz]    + (cy-qy)*PSTRIDE + (cx-qx);
-            const int pq2b = slot_table[2*LAYERS+NLM_D+qz]  + (cy+qy)*PSTRIDE + (cx+qx);
-            const int mq2b = slot_table[2*LAYERS+NLM_D-qz]  + (cy-qy)*PSTRIDE + (cx-qx);
-            const float pq0 = load_src(pq0b), mq0 = load_src(mq0b);
-            const float pq1 = load_src(pq1b), mq1 = load_src(mq1b);
-            const float pq2 = load_src(pq2b), mq2 = load_src(mq2b);
+            const int qps = qy*PSTRIDE + qx;
+            const float pq0 = load_src(slot_table[NLM_D+qz] + gpad + qps);
+            const float mq0 = load_src(slot_table[NLM_D-qz] + gpad - qps);
+            const float pq1 = load_src(slot_table[LAYERS+NLM_D+qz] + gpad + qps);
+            const float mq1 = load_src(slot_table[LAYERS+NLM_D-qz] + gpad - qps);
+            const float pq2 = load_src(slot_table[2*LAYERS+NLM_D+qz] + gpad + qps);
+            const float mq2 = load_src(slot_table[2*LAYERS+NLM_D-qz] + gpad - qps);
             acc0 += (u4*pq0) + (u4_mq*mq0);
             acc1 += (u4*pq1) + (u4_mq*mq1);
             acc2 += (u4*pq2) + (u4_mq*mq2);

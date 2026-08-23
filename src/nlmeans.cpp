@@ -35,6 +35,11 @@ constexpr int BLK_X = 16;
 constexpr int BLK_Y = 8;
 constexpr int VRT_RESULT = 3;
 
+// GPU-trace timestamp pool size: slots 0..3 fixed (top / post-pad / post-sweep
+// / post-finish), then one pair per weight+acc batch.
+constexpr uint32_t NLMEANS_TS_MAX = 130;
+constexpr uint32_t NLMEANS_TS_RESERVED = 4;
+
 // FLT_EPS bit pattern: u5 is seeded with it via vkCmdFillBuffer so the final
 // denominator stays > 0 without an explicit guard (matches the reference).
 constexpr uint32_t FLT_EPS_BITS = 0x34000000u;
@@ -108,6 +113,7 @@ struct NLStream {
     VkQueue queue {};
     std::mutex * queue_lock {};
     VkQueryPool ts_query {};
+    uint32_t ts_count {};
 
     // cache reservations held by this frame (valid between acquire/release)
     std::vector<int> win_slots;      // pool slot of each needed tile
@@ -119,6 +125,10 @@ struct NLStream {
 struct CacheSlot {
     int64_t key {-1};        // (clip << 40) | (c << 32) | idx, -1 = empty
     int writer {-1};
+    // true from upload reservation until the writer's fence completes;
+    // other frames must not touch the slot while it is being padded, but
+    // may share-read it freely once stable (tiles are immutable)
+    bool writing {false};
     std::vector<int> holders;
 };
 
@@ -142,6 +152,7 @@ struct NLMeansData {
     int pad {}, pstride {}, ph {}, layers {};
     int64_t npix {};
     int qb {};
+    uint32_t pack {1};     // sweep rounds: entries per weight+acc round (ring budget)
     int num_streams {};
 
     // shared slot pool (device-local padded tiles) + its state
@@ -158,6 +169,7 @@ struct NLMeansData {
     int cache_cursor {};
     std::mutex cache_lock;
     std::condition_variable cache_cv;
+    std::atomic<uint32_t> t_blocks {};
 
     // create()-time q-sweep tables (stride-8 rows), shared by all streams
     std::vector<int> wq_host;
@@ -389,9 +401,10 @@ static void acquire_cache(NLMeansData * d, NLStream & st, int n,
                     std::find(taken.begin(), taken.end(), found) != taken.end()) {
                     found = -1;
                 }
-                if (found >= 0 && !d->cache[found].holders.empty()) {
-                    ok = false;
-                    break;
+                if (found >= 0 && d->cache[found].writing) {
+                    // being padded by an in-flight frame right now: upload
+                    // a private duplicate instead of blocking on it
+                    found = -1;
                 }
                 if (found < 0) {
                     // evict an unheld slot (round-robin from the cursor)
@@ -414,6 +427,7 @@ static void acquire_cache(NLMeansData * d, NLStream & st, int n,
             st.upload_new[ti] = is_new;
         }
         if (!ok) {
+            d->t_blocks.fetch_add(1, std::memory_order::relaxed);
             d->cache_cv.wait(lock);
             continue;
         }
@@ -423,15 +437,11 @@ static void acquire_cache(NLMeansData * d, NLStream & st, int n,
             if (st.upload_new[ti]) {
                 d->cache[slot].key = keys[ti];
                 d->cache[slot].writer = n;
+                d->cache[slot].writing = true;
                 d->cache[slot].holders.clear();
             }
             d->cache[slot].holders.push_back(n);
             st.win_slots[ti] = slot;
-            if (std::getenv("NLMEANS_DBG")) {
-                fprintf(stderr, "[dbg] n=%d tile %zu: key=%lld slot=%d new=%d\n",
-                    n, ti, static_cast<long long>(keys[ti]), slot,
-                    (int)st.upload_new[ti]);
-            }
         }
         return;
     }
@@ -442,6 +452,9 @@ static void release_cache(NLMeansData * d, NLStream & st, int n) {
     for (int slot : st.win_slots) {
         auto & h = d->cache[slot].holders;
         h.erase(std::remove(h.begin(), h.end(), n), h.end());
+        if (d->cache[slot].writer == n) {
+            d->cache[slot].writing = false;
+        }
     }
     d->cache_cv.notify_all();
 }
@@ -532,6 +545,9 @@ static const VSFrame *VS_CC NLMeansGetFrame(
     };
     static std::atomic<uint64_t> t_up {}, t_sub {}, t_wait {}, t_dl {};
     static std::atomic<uint32_t> t_nf {};
+    static std::atomic<uint64_t> t_acq {}, t_comp {}, t_tab {};
+    const bool trace2 = std::getenv("NLMEANS_TRACE") &&
+        std::string(std::getenv("NLMEANS_TRACE")) == "2";
     uint64_t t0 = now_us();
     auto mark = [&](std::atomic<uint64_t> & acc) { acc += now_us() - t0; t0 = now_us(); };
 
@@ -542,6 +558,7 @@ static const VSFrame *VS_CC NLMeansGetFrame(
     // ------------------------------------------------------------------
     std::vector<int64_t> keys;
     acquire_cache(d, stream, n, keys);
+    if (trace2) mark(t_acq);
 
     {
         const size_t compact_bytes =
@@ -577,6 +594,7 @@ static const VSFrame *VS_CC NLMeansGetFrame(
             }
         }
         stream.new_tiles = static_cast<int>(pi);
+        if (trace2) mark(t_comp);
 
         // layer->slot table straight into the persistently mapped tables buf
         int * ints = stream.tables_map;
@@ -617,6 +635,7 @@ static const VSFrame *VS_CC NLMeansGetFrame(
                 }
             }
         }
+        if (trace2) mark(t_tab);
     }
 
     mark(t_up);
@@ -652,9 +671,13 @@ static const VSFrame *VS_CC NLMeansGetFrame(
     }
 
     const bool gputrace = d->gputrace;
+    uint32_t ts_used = 0;
     if (gputrace) {
-        vkCmdResetQueryPool(stream.cmd, stream.ts_query, 0, 8);
+        vkCmdResetQueryPool(stream.cmd, stream.ts_query, 0, NLMEANS_TS_MAX);
         vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stream.ts_query, 0);
+        // slots 1..3 are written below / after the sweep loop; batch pairs
+        // start at slot 4 so nothing overlaps.
+        ts_used = NLMEANS_TS_RESERVED;
     }
 
     if (stream.new_tiles > 0) {
@@ -670,7 +693,9 @@ static const VSFrame *VS_CC NLMeansGetFrame(
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     }
 
-    if (gputrace) vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stream.ts_query, 1);
+    if (gputrace) {
+        vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stream.ts_query, 1);
+    }
 
     const uint32_t gx = static_cast<uint32_t>((d->width + BLK_X - 1) / BLK_X);
     const uint32_t gy = static_cast<uint32_t>((d->height + BLK_Y - 1) / BLK_Y);
@@ -679,13 +704,15 @@ static const VSFrame *VS_CC NLMeansGetFrame(
 
     const Variant & v = d->variants[m];
 
-    // Interleaved weight/accumulation batches: batch k's weights overwrite
+    // Interleaved weight/accumulation rounds: a round's weights overwrite
     // the shared u4a slot ring, so its accumulation MUST complete (barrier)
-    // before batch k+1's weights launch.
+    // before the next round's weights launch. Rounds pack many sweep entries
+    // each (see the ring budget at create time).
     uint32_t q0 = 0;
     size_t bi = 0;
     while (q0 < v.q_cnt) {
-        const uint32_t nb = std::min<uint32_t>(d->qb, v.q_cnt - q0);
+        const uint32_t nb = std::min<uint32_t>(static_cast<uint32_t>(d->qb) * d->pack,
+                                               v.q_cnt - q0);
         const uint32_t p0 = v.w_boff[bi];
         const uint32_t p1 = v.w_boff[bi + 1];
 
@@ -696,8 +723,8 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         record_barrier(stream.cmd,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-        if (gputrace && bi == 0) {
-            vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, 4);
+        if (gputrace && ts_used < NLMEANS_TS_MAX) {
+            vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, ts_used++);
         }
 
         const int32_t a_push[3] {
@@ -709,14 +736,17 @@ static const VSFrame *VS_CC NLMeansGetFrame(
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        if (gputrace && bi == 0) {
-            vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, 5);
+        if (gputrace && ts_used < NLMEANS_TS_MAX) {
+            vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, ts_used++);
         }
 
         q0 += nb;
         ++bi;
     }
-    if (gputrace) vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, 2);
+    if (gputrace) {
+        vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, 2);
+        stream.ts_count = ts_used;
+    }
 
     {
         const int32_t f_push[3] { 0, 0, 0 };
@@ -796,9 +826,13 @@ release_cache(d, stream, n);
         const uint8_t * srcp = stream.u1z_map +
             static_cast<size_t>(c) * d->npix * d->elem_bytes;
         const size_t row_bytes = static_cast<size_t>(d->width) * d->elem_bytes;
-        for (int y = 0; y < d->height; ++y) {
-            memcpy(dstp + static_cast<size_t>(y) * d_pitch,
-                srcp + static_cast<size_t>(y) * row_bytes, row_bytes);
+        if (d_pitch == row_bytes) {
+            memcpy(dstp, srcp, row_bytes * d->height);
+        } else {
+            for (int y = 0; y < d->height; ++y) {
+                memcpy(dstp + static_cast<size_t>(y) * d_pitch,
+                    srcp + static_cast<size_t>(y) * row_bytes, row_bytes);
+            }
         }
     }
     mark(t_dl);
@@ -807,30 +841,54 @@ release_cache(d, stream, n);
         uint32_t nf = t_nf.fetch_add(1) + 1;
         if (nf % 100 == 0) {
             fprintf(stderr,
-                "[perf] frames=%u up=%.2f sub=%.2f wait=%.2f dl=%.2f (ms avg)\n",
+                "[perf] frames=%u up=%.2f sub=%.2f wait=%.2f dl=%.2f blocks=%u (ms avg)\n",
                 nf,
                 t_up.load() / double(nf) / 1e3,
                 t_sub.load() / double(nf) / 1e3,
                 t_wait.load() / double(nf) / 1e3,
-                t_dl.load() / double(nf) / 1e3);
+                t_dl.load() / double(nf) / 1e3,
+                d->t_blocks.load());
         }
     }
-    if (d->gputrace && stream.ts_query) {
-        uint64_t ts[6] {};
-        if (vkGetQueryPoolResults(dev, stream.ts_query, 0, 6,
+    if (trace2 && t_nf.load() % 100 == 99) {
+        fprintf(stderr,
+            "[perf2] n=%d acq=%.3f comp=%.3f tab=%.3f tiles=%d\n",
+            n,
+            t_acq.exchange(0) / 1e3,
+            t_comp.exchange(0) / 1e3,
+            t_tab.exchange(0) / 1e3,
+            stream.new_tiles);
+    }
+    if (d->gputrace && stream.ts_query && stream.ts_count >= 6) {
+        uint64_t ts[NLMEANS_TS_MAX] {};
+        if (vkGetQueryPoolResults(dev, stream.ts_query, 0, stream.ts_count,
                 sizeof(ts), ts, sizeof(uint64_t),
                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
             static std::atomic<uint32_t> ts_n {};
             const float period = d->device->limits.timestampPeriod;
             uint32_t nq = ts_n.fetch_add(1) + 1;
-            fprintf(stderr,
-                "[gputrace] n=%u copy=%.3f w1=%.3f a1=%.3f wall=%.3f finish=%.3f (ms)\n",
-                nq + 1,
-                (ts[1] - ts[0]) * period / 1e6,
-                (ts[4] - ts[1]) * period / 1e6,
-                (ts[5] - ts[4]) * period / 1e6,
-                (ts[2] - ts[1]) * period / 1e6,
-                (ts[3] - ts[2]) * period / 1e6);
+            // batch pairs live at slots 4..ts_count-1 (W_end, A_end each batch)
+            double w1 = 0.0, a1 = 0.0, sum_w = 0.0, sum_a = 0.0;
+            uint32_t nw = 0, na = 0;
+            double prev_end = static_cast<double>(ts[1]);
+            for (uint32_t s = 4; s + 1 < stream.ts_count; s += 2) {
+                const double w_ms = (ts[s] - prev_end) * period / 1e6;
+                const double a_ms = (ts[s + 1] - ts[s]) * period / 1e6;
+                if (s == 4) { w1 = w_ms; a1 = a_ms; }
+                else { sum_w += w_ms; sum_a += a_ms; ++nw; ++na; }
+                prev_end = static_cast<double>(ts[s + 1]);
+            }
+            if (nq % 64 == 1 || nq < 5) {
+                fprintf(stderr,
+                    "[gputrace] n=%u copy=%.3f w1=%.3f a1=%.3f wall=%.3f "
+                    "finish=%.3f wSteady=%.3fx%u aSteady=%.3fx%u (ms)\n",
+                    nq + 1,
+                    (ts[1] - ts[0]) * period / 1e6,
+                    w1, a1,
+                    (ts[2] - ts[1]) * period / 1e6,
+                    (ts[3] - ts[2]) * period / 1e6,
+                    nw ? sum_w / nw : 0.0, nw, na ? sum_a / na : 0.0, na);
+            }
         }
     }
 
@@ -1034,7 +1092,27 @@ static void VS_CC NLMeansCreate(
     d->stride = d->width;
     d->npix = static_cast<int64_t>(d->stride) * d->height;
     d->qb = d->npix <= static_cast<int64_t>(1920) * 1152 ? 8 : 4;
-    const int slots = (dd == 0) ? d->qb : 2 * d->qb;
+    // Pack as many sweep entries into one weight+accumulation round as the
+    // u4a plane-ring budget allows: the kernels' arithmetic is cheap next to
+    // the fixed per-dispatch/barrier drain, and probes showed an accumulation
+    // launch over 64 table rows costs the same as one over 8 rows. Bigger
+    // batches cut the number of W->A barrier rounds dramatically.
+    {
+        // Keep the u4a ring cache-friendly (~64 MiB): measured optimum on the
+        // target GPU - larger rings stream weights through DRAM between the
+        // weight and accumulation launches, smaller ones pay more dispatches.
+        const int64_t ring_base_slots = (dd == 0) ? d->qb : 2 * static_cast<int64_t>(d->qb);
+        const int64_t bytes_per_pack =
+            ring_base_slots * d->npix * static_cast<int64_t>(sizeof(float));
+        constexpr int64_t U4A_RING_BUDGET = 64LL << 20;
+        int64_t pack = U4A_RING_BUDGET / std::max<int64_t>(bytes_per_pack, 1);
+        pack = std::clamp<int64_t>(pack, 1, 16384);
+        if (const char * env = std::getenv("NLMEANS_PACK")) {
+            pack = std::clamp<int64_t>(atoll(env), 1, 16384);
+        }
+        d->pack = static_cast<uint32_t>(pack);
+    }
+    const int slots = ((dd == 0) ? d->qb : 2 * d->qb) * static_cast<int>(d->pack);
 
     // int32 addressing bound of the device-side layouts (the reference falls
     // back to 64-bit indices here; we reject instead)
@@ -1050,13 +1128,16 @@ static void VS_CC NLMeansCreate(
         }
     }
 
-    // q-batched sweep tables, built exactly like the reference: for each
-    // reachable boundary count m the half-space of displacements (exploiting
-    // weight(p,p+q)==weight(p,p-q)) in k/j/i order, grouped into batches of qb
+    // Run-merged sweep tables, equivalent to the reference q-batched sweep:
+    // for each reachable boundary count m the half-space of displacements
+    // (exploiting weight(p,p+q)==weight(p,p-q)) in k/j/i order, with
+    // consecutive-i displacements sharing (qy,qz) merged into RUN GROUPS of at
+    // most qb entries (so the u4a slot ring still covers one whole group).
     {
         const int64_t spt_side = 2LL * aa + 1;
         const int64_t spt_area = spt_side * spt_side;
         d->variants.resize(dd + 1);
+        const uint32_t batch = static_cast<uint32_t>(d->qb) * d->pack;
         for (int mm = 0; mm <= dd; ++mm) {
             Variant & v = d->variants[mm];
             v.w_base = static_cast<uint32_t>(d->wq_host.size() / 8);
@@ -1067,7 +1148,7 @@ static void VS_CC NLMeansCreate(
                     for (int i = -aa; i <= aa; ++i) {
                         if (static_cast<int64_t>(kk) * spt_area +
                                 static_cast<int64_t>(j) * spt_side + i < 0) {
-                            const uint32_t b_local = q_idx % static_cast<uint32_t>(d->qb);
+                            const uint32_t b_local = q_idx % batch;
                             if (b_local == 0) {
                                 v.w_boff.push_back(static_cast<uint32_t>(
                                     d->wq_host.size() / 8 - v.w_base));
@@ -1310,10 +1391,18 @@ static void VS_CC NLMeansCreate(
         static_cast<VkDeviceSize>(d->pstride) * d->ph * d->elem_bytes;
     d->slot_bytes = slot_bytes_v;
     d->slot_elems = static_cast<int64_t>(d->pstride) * d->ph;
-    // working set: the union of the in-flight frames' windows
+    // working set: every stream may hold a FULL window (layers tiles per
+    // channel/clip) from acquire until its fence completes; undersizing this
+    // makes acquire_cache block on the cv and serializes the streams.
+    // Cap the pool at 512 MiB so huge d/ns configs fall back to blocking.
     d->staging_tiles = clips * d->channels * d->layers;
-    d->n_slots = (d->num_streams + 2 * d->d) * d->channels * clips +
-        2 * d->channels * clips;
+    {
+        const int full = d->num_streams * d->channels * clips * d->layers;
+        const VkDeviceSize budget_slots = (512ull << 20) / slot_bytes_v;
+        const int capped = std::min(full,
+            static_cast<int>(std::max<VkDeviceSize>(budget_slots, 1)));
+        d->n_slots = capped + 2 * d->channels * clips;
+    }
 
     {
         const auto result = create_buffer(dev,
@@ -1510,7 +1599,7 @@ static void VS_CC NLMeansCreate(
                 .pNext = nullptr,
                 .flags = 0,
                 .queryType = VK_QUERY_TYPE_TIMESTAMP,
-                .queryCount = 8
+                .queryCount = NLMEANS_TS_MAX
             };
             if (vkCreateQueryPool(dev, &qp_info, nullptr, &st.ts_query) != VK_SUCCESS) {
                 return set_error("vkCreateQueryPool failed");
