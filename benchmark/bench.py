@@ -71,6 +71,7 @@ PLUGINS = {
         loader='core.std.LoadPlugin("/home/encode/test/vapoursynth-ziphip/zig-out/lib/libvszipcu.so")',
     ),
     "bm3dhip": Plugin("bm3dhip"),
+    "nlm_hip": Plugin("nlm_hip"),
 }
 
 
@@ -103,6 +104,7 @@ class FilterSpec:
     build: Callable[[argparse.Namespace, str], dict[str, str]]
     input: str = "depth(get_y(clip), 16)"  # clip expression the filter is applied to
     synth_format: str | None = "vs.GRAY16"  # BlankClip format for --synthetic (None disables)
+    default_streams: int = 4  # num_streams when --num-streams is not given
 
 
 def _bm3d_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
@@ -163,6 +165,21 @@ def _dfttest_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     }
 
 
+def _nlmeans_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
+    ns_num = ns.num_streams if ns.num_streams is not None else 2
+    args = (
+        f"d={ns.nlmeans_d}, a={ns.nlmeans_a}, s={ns.nlmeans_s}, h={ns.nlmeans_h}, "
+        f"wmode={ns.nlmeans_wmode}, wref={ns.nlmeans_wref}, channels='UV', "
+        f"num_streams={ns_num}"
+    )
+    return {
+        "vsfeel": f"core.vsfeel.NLMeans({clip}, {args})",
+        "vszipcl": f"core.vszipcl.NLMeans({clip}, {args})",
+        "vszipcu": f"core.vszipcu.NLMeans({clip}, {args})",
+        "nlm_hip": f"core.nlm_hip.NLMeans({clip}, {args})",
+    }
+
+
 FILTERS: dict[str, FilterSpec] = {
     "bm3dv2": FilterSpec(
         title="BM3Dv2",
@@ -215,6 +232,24 @@ FILTERS: dict[str, FilterSpec] = {
         ],
         build=_dfttest_build,
         input="depth(get_y(clip), 16)",
+        default_streams=1,
+    ),
+    "nlmeans": FilterSpec(
+        title="NLMeans",
+        default_frames=1000,
+        args=[
+            Arg("d", "--nlmeans-d", "nlmeans_d", int, 2),
+            Arg("a", "--nlmeans-a", "nlmeans_a", int, 2),
+            Arg("s", "--nlmeans-s", "nlmeans_s", int, 4),
+            Arg("h", "--nlmeans-h", "nlmeans_h", float, 0.2),
+            Arg("wmode", "--nlmeans-wmode", "nlmeans_wmode", int, 0),
+            Arg("wref", "--nlmeans-wref", "nlmeans_wref", float, 1.0),
+        ],
+        build=_nlmeans_build,
+        # chroma denoising on the subsampled planes is NLMeans' main use case
+        input="depth(clip, 16)",
+        synth_format="vs.YUV420P16",
+        default_streams=2,
     ),
 }
 
@@ -251,11 +286,7 @@ def bench(plugin: str, chain: str, clip: str, frames: int, synth_format: str | N
 
 def args_desc(spec: FilterSpec, ns: argparse.Namespace) -> str:
     pairs = [f"{a.key}={getattr(ns, a.dest)}" for a in spec.args]
-    num = ns.num_streams
-    if spec.title == "DFTTest":
-        num = ns.num_streams if ns.num_streams is not None else 1
-    elif num is None:
-        num = 4
+    num = ns.num_streams if ns.num_streams is not None else spec.default_streams
     pairs.append(f"num_streams={num}")
     return ", ".join(pairs)
 

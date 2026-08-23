@@ -1,0 +1,322 @@
+#version 450
+
+/*
+ * NLMeans (KNLMeansCL-style spatio-temporal non-local means), ported from the
+ * vszipcl/vszipcu reference kernels. One .comp file, three entry points
+ * selected at build time:
+ *
+ *   -DENTRY_WEIGHT  nlmWeight      patch-distance + separable box-sum + weight
+ *   -DENTRY_ACC     nlmAccumulation per-pixel +q/-q accumulation
+ *   -DENTRY_FINISH  nlmFinish      final weighted average
+ *
+ * -DBITS=16|32 selects the io element type of u1/u1z (raw VapourSynth plane
+ * bytes; 16-bit int or 32-bit float). Everything that is fixed per filter
+ * instance (dims, strides, d/a/s, ref mode, channels, wmode, h/wref) arrives
+ * as specialization constants so each pipeline compiles to its cheapest form.
+ *
+ * Do not reorder/re-associate: math, tap order, zero-border and the
+ * q-batched sweep order are part of the result (see reference nlmeans.zig).
+ */
+
+#if !defined(BITS)
+#define BITS 16
+#endif
+
+#if BITS == 16
+#define ELEM_BYTES 2
+#define ELEM_MASK  0xFFFFu
+#define PEAK       65535.0f
+#define SCALE      (1.0f / 65535.0f)
+#else
+#define ELEM_BYTES 4
+#define ELEM_MASK  0xFFFFFFFFu
+#define PEAK       1.0f
+#define SCALE      1.0f
+#endif
+
+#define ELEM_SHIFT(byte) (8 * ((byte) & 3))
+
+layout(constant_id = 0)  const int VI_DIM_X = 640;
+layout(constant_id = 1)  const int VI_DIM_Y = 360;
+layout(constant_id = 2)  const int STRIDE = 640;
+layout(constant_id = 3)  const int PSTRIDE = 656;
+layout(constant_id = 4)  const int PAD = 2;
+layout(constant_id = 5)  const int PH = 368;
+layout(constant_id = 6)  const int NLM_S = 4;
+layout(constant_id = 7)  const int NLM_D = 1;
+layout(constant_id = 8)  const int NLM_REF = 0;
+layout(constant_id = 9)  const int NLM_CHANNELS = 1;
+layout(constant_id = 10) const int WMODE = 0;
+layout(constant_id = 11) const float NLM_H = 1.2;
+layout(constant_id = 12) const float WREF = 1.0;
+layout(constant_id = 13) const float H2_INV_NORM = 1.0;
+
+#define U1_LAYER  (PSTRIDE * PH)             /* io elements per zero-padded layer */
+#define U1_PLANE  ((2*NLM_D+1) * U1_LAYER)   /* io elements per channel */
+#define U4_LAYER  (STRIDE * VI_DIM_Y)        /* floats per weight slot */
+#define NPIX      (STRIDE * VI_DIM_Y)        /* io elements per output channel */
+
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer SrcBuf   { uint src_raw[]; };    /* u1 */
+layout(std430, binding = 1) readonly buffer GuideBuf { uint guide_raw[]; };  /* u1r or u1 */
+layout(std430, binding = 2) buffer DstBuf { uint dst_raw[]; };               /* u1z */
+layout(std430, binding = 3) buffer AccBuf { float u2[]; };
+layout(std430, binding = 4) buffer WeightBuf { float u4a[]; };
+layout(std430, binding = 5) buffer MaxBuf { float u5[]; };
+layout(std430, binding = 6) readonly buffer WQBuf { int wq[]; };
+layout(std430, binding = 7) readonly buffer AQBuf { int aq[]; };
+
+layout(push_constant) uniform PushConstants {
+    int pc0;
+    int pc1;
+} pc;
+
+uint load_src_raw(int idx) {
+    uint byte_off = uint(idx) * ELEM_BYTES;
+    uint word = src_raw[byte_off >> 2];
+    return (word >> ELEM_SHIFT(byte_off)) & ELEM_MASK;
+}
+
+float load_src(int idx) {
+#if BITS == 32
+    return uintBitsToFloat(load_src_raw(idx));
+#else
+    return float(load_src_raw(idx)) * SCALE;
+#endif
+}
+
+uint load_guide_raw(int idx) {
+    uint byte_off = uint(idx) * ELEM_BYTES;
+    uint word = guide_raw[byte_off >> 2];
+    return (word >> ELEM_SHIFT(byte_off)) & ELEM_MASK;
+}
+
+float load_guide(int idx) {
+#if BITS == 32
+    return uintBitsToFloat(load_guide_raw(idx));
+#else
+    return float(load_guide_raw(idx)) * SCALE;
+#endif
+}
+
+void store_value(int idx, float v) {
+    uint byte_off = uint(idx) * ELEM_BYTES;
+    uint wi = byte_off >> 2;
+#if BITS == 32
+    dst_raw[wi] = floatBitsToUint(v);
+#else
+    // sub-dword store: OR into a shared dword; the host clears u1z before
+    // every submission so paired lanes never lose updates
+    atomicOr(dst_raw[wi], (uint(v * PEAK + 0.5f) & ELEM_MASK) << ELEM_SHIFT(byte_off));
+#endif
+}
+
+/* Joint multi-channel patch distance for the center pixel (xx,y) vs the
+ * candidate (xx+qx, y+qy) on layers t / t+qz. The +-a margin of the padded
+ * buffers realizes the zero border; constants and operand order match the
+ * reference nlm_pix_dist exactly. The REF branches fold per pipeline. */
+float nlm_pix_dist(int t, int qz, int xx, int y, int qx, int qy) {
+    const int ac = t*U1_LAYER + (y+PAD)*PSTRIDE + (xx+PAD);
+    const int bc = (t+qz)*U1_LAYER + (y+qy+PAD)*PSTRIDE + (xx+qx+PAD);
+    if (NLM_REF == 0) {          /* LUMA */
+        const float d0 = load_guide(ac) - load_guide(bc);
+        return 3.0f * (d0 * d0);
+    } else if (NLM_REF == 1) {   /* CHROMA (U,V) */
+        const float du = load_guide(ac) - load_guide(bc);
+        const float dv = load_guide(U1_PLANE + ac) - load_guide(U1_PLANE + bc);
+        return 1.5f * (du*du + dv*dv);
+    } else if (NLM_REF == 2) {   /* YUV (4:4:4 only) */
+        const float dy = load_guide(ac) - load_guide(bc);
+        const float du = load_guide(U1_PLANE + ac) - load_guide(U1_PLANE + bc);
+        const float dv = load_guide(2*U1_PLANE + ac) - load_guide(2*U1_PLANE + bc);
+        return dy*dy + du*du + dv*dv;
+    } else {                     /* RGB */
+        const float ar = load_guide(ac), br = load_guide(bc);
+        const float dr = ar - br;
+        const float dg = load_guide(U1_PLANE + ac) - load_guide(U1_PLANE + bc);
+        const float db = load_guide(2*U1_PLANE + ac) - load_guide(2*U1_PLANE + bc);
+        const float m_red = (ar + br) / 6.0f;
+        return (2.0f/3.0f + m_red) * (dr*dr) + (4.0f/3.0f) * (dg*dg) + (1.0f - m_red) * (db*db);
+    }
+}
+
+#ifdef ENTRY_WEIGHT
+
+// Workgroup tile geometry (matches the reference launch config).
+#define BX        16
+#define BY        8
+#define VRT_RESULT 3
+#define S_MAX     8
+// odd strides avoid shared-memory bank conflicts (layout only)
+#define DIST_W ((BX + 2*S_MAX) | 1)
+#define HSUM_W (BX | 1)
+
+shared float dist[VRT_RESULT*BY + 2*S_MAX][DIST_W];
+shared float hsum[VRT_RESULT*BY + 2*S_MAX][HSUM_W];
+
+void main() {
+    // Q-batched: workgroup z picks the pass whose (t,qx,qy,qz,slot) row comes
+    // from the create()-time sweep table wq (stride-8 rows).
+    const int prow = (pc.pc0 + int(gl_WorkGroupID.z)) * 8;
+    const int t = wq[prow+0], qx = wq[prow+1], qy = wq[prow+2], qz = wq[prow+3];
+    const int slot = wq[prow+4];
+
+    const int lx = int(gl_LocalInvocationID.x);
+    const int ly = int(gl_LocalInvocationID.y);
+    const int gx0 = int(gl_WorkGroupID.x) * BX;
+    const int gy0 = int(gl_WorkGroupID.y) * (VRT_RESULT*BY);
+
+    // 1) per-pixel distance over the tile + halo; OOB -> 0.0f (zero border).
+    for (int ry = ly; ry < VRT_RESULT*BY + 2*NLM_S; ry += BY) {
+        const int yy = gy0 - NLM_S + ry;
+        for (int cx = lx; cx < BX + 2*NLM_S; cx += BX) {
+            const int xx = gx0 - NLM_S + cx;
+            dist[ry][cx] = (xx >= 0 && xx < VI_DIM_X && yy >= 0 && yy < VI_DIM_Y)
+                           ? nlm_pix_dist(t, qz, xx, yy, qx, qy) : 0.0f;
+        }
+    }
+    barrier();
+    // 2) horizontal box-sum: hsum[ry][lx] = sum dist[ry][lx..lx+2S] (ascending x).
+    for (int ry = ly; ry < VRT_RESULT*BY + 2*NLM_S; ry += BY) {
+        float sh = 0.0f;
+        for (int i = 0; i <= 2*NLM_S; ++i) sh += dist[ry][lx + i];
+        hsum[ry][lx] = sh;
+    }
+    barrier();
+    // 3) vertical box-sum + weight transform, VRT_RESULT output rows per thread.
+    const int x = gx0 + lx;
+    if (x >= VI_DIM_X) return;
+    int y = gy0 + ly, lc = ly;
+    for (int r = 0; r < VRT_RESULT; ++r, y += BY, lc += BY) {
+        if (y >= VI_DIM_Y) return;
+        float sum = 0.0f;
+        for (int i = 0; i <= 2*NLM_S; ++i) sum += hsum[lc + i][lx];
+        const float arg = sum * H2_INV_NORM;
+        float w;
+        if (WMODE == 0) {
+            w = exp(-arg);
+        } else if (WMODE == 1) {
+            w = max(1.0f - arg, 0.0f);            // fdimf(1, arg)
+        } else if (WMODE == 2) {
+            float c = max(1.0f - arg, 0.0f); w = c*c;
+        } else {
+            float c = max(1.0f - arg, 0.0f); c = c*c; c = c*c; w = c*c;
+        }
+        u4a[slot*U4_LAYER + y*STRIDE + x] = w;
+    }
+}
+
+#endif /* ENTRY_WEIGHT */
+
+#ifdef ENTRY_ACC
+
+void main() {
+    const int x = int(gl_GlobalInvocationID.x);
+    const int y = int(gl_GlobalInvocationID.y);
+    if (x >= VI_DIM_X || y >= VI_DIM_Y) return;
+    const int g = y*STRIDE + x;
+    const int cx = x+PAD, cy = y+PAD;
+    const int q_base = pc.pc0, nb = pc.pc1;
+
+    float u5v = u5[g];
+    // Accumulate both +q and -q per entry: weight(p,p+q)==weight(p,p-q).
+    // Per pixel the loop walks the batch's q's in sweep order (rows of the
+    // aq table: qx, qy, qz, center slot, mirror slot).
+    if (NLM_CHANNELS == 1) {
+        float acc0 = u2[2*g], accw = u2[2*g+1];
+        for (int b = 0; b < nb; ++b) {
+            const int r = (q_base + b) * 8;
+            const int qx = aq[r+0], qy = aq[r+1], qz = aq[r+2];
+            const int sc = aq[r+3], sm = aq[r+4];
+            const float u4 = u4a[sc*U4_LAYER + g];
+            const int xm = x-qx, ym = y-qy;
+            const float u4_mq = (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
+                                ? 0.0f : u4a[sm*U4_LAYER + ym*STRIDE + xm];
+            u5v = max(u4, max(u4_mq, u5v));
+            const int pq = (NLM_D+qz)*U1_LAYER + (cy+qy)*PSTRIDE + (cx+qx);
+            const int mq = (NLM_D-qz)*U1_LAYER + (cy-qy)*PSTRIDE + (cx-qx);
+            const float pq0 = load_src(pq), mq0 = load_src(mq);
+            acc0 += (u4*pq0) + (u4_mq*mq0);
+            accw += (u4 + u4_mq);
+        }
+        u2[2*g] = acc0; u2[2*g+1] = accw;
+    } else if (NLM_CHANNELS == 2) {
+        float acc0 = u2[3*g], acc1 = u2[3*g+1], accw = u2[3*g+2];
+        for (int b = 0; b < nb; ++b) {
+            const int r = (q_base + b) * 8;
+            const int qx = aq[r+0], qy = aq[r+1], qz = aq[r+2];
+            const int sc = aq[r+3], sm = aq[r+4];
+            const float u4 = u4a[sc*U4_LAYER + g];
+            const int xm = x-qx, ym = y-qy;
+            const float u4_mq = (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
+                                ? 0.0f : u4a[sm*U4_LAYER + ym*STRIDE + xm];
+            u5v = max(u4, max(u4_mq, u5v));
+            const int pq = (NLM_D+qz)*U1_LAYER + (cy+qy)*PSTRIDE + (cx+qx);
+            const int mq = (NLM_D-qz)*U1_LAYER + (cy-qy)*PSTRIDE + (cx-qx);
+            const float pq0 = load_src(pq),              mq0 = load_src(mq);
+            const float pq1 = load_src(U1_PLANE + pq),   mq1 = load_src(U1_PLANE + mq);
+            acc0 += (u4*pq0) + (u4_mq*mq0);
+            acc1 += (u4*pq1) + (u4_mq*mq1);
+            accw += (u4 + u4_mq);
+        }
+        u2[3*g] = acc0; u2[3*g+1] = acc1; u2[3*g+2] = accw;
+    } else {
+        float acc0 = u2[4*g], acc1 = u2[4*g+1], acc2 = u2[4*g+2], accw = u2[4*g+3];
+        for (int b = 0; b < nb; ++b) {
+            const int r = (q_base + b) * 8;
+            const int qx = aq[r+0], qy = aq[r+1], qz = aq[r+2];
+            const int sc = aq[r+3], sm = aq[r+4];
+            const float u4 = u4a[sc*U4_LAYER + g];
+            const int xm = x-qx, ym = y-qy;
+            const float u4_mq = (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
+                                ? 0.0f : u4a[sm*U4_LAYER + ym*STRIDE + xm];
+            u5v = max(u4, max(u4_mq, u5v));
+            const int pq = (NLM_D+qz)*U1_LAYER + (cy+qy)*PSTRIDE + (cx+qx);
+            const int mq = (NLM_D-qz)*U1_LAYER + (cy-qy)*PSTRIDE + (cx-qx);
+            const float pq0 = load_src(pq),                mq0 = load_src(mq);
+            const float pq1 = load_src(U1_PLANE + pq),     mq1 = load_src(U1_PLANE + mq);
+            const float pq2 = load_src(2*U1_PLANE + pq),   mq2 = load_src(2*U1_PLANE + mq);
+            acc0 += (u4*pq0) + (u4_mq*mq0);
+            acc1 += (u4*pq1) + (u4_mq*mq1);
+            acc2 += (u4*pq2) + (u4_mq*mq2);
+            accw += (u4 + u4_mq);
+        }
+        u2[4*g] = acc0; u2[4*g+1] = acc1; u2[4*g+2] = acc2; u2[4*g+3] = accw;
+    }
+    u5[g] = u5v;
+}
+
+#endif /* ENTRY_ACC */
+
+#ifdef ENTRY_FINISH
+
+// out = (center*m + weighted_sum) / (m + weight_sum), m = wref*maxweight.
+// den==0 unguarded: u5 seeded with FLT_EPS keeps den > 0 (matches KNL).
+void main() {
+    const int x = int(gl_GlobalInvocationID.x);
+    const int y = int(gl_GlobalInvocationID.y);
+    if (x >= VI_DIM_X || y >= VI_DIM_Y) return;
+    const int g = y*STRIDE + x;
+    const float m = WREF * u5[g];
+    const int uc = NLM_D*U1_LAYER + (y+PAD)*PSTRIDE + (x+PAD);
+
+    if (NLM_CHANNELS == 1) {
+        const float acc0 = u2[2*g], accw = u2[2*g+1];
+        const float den = m + accw;
+        store_value(g, (load_src(uc)*m + acc0) / den);
+    } else if (NLM_CHANNELS == 2) {
+        const float acc0 = u2[3*g], acc1 = u2[3*g+1], accw = u2[3*g+2];
+        const float den = m + accw;
+        store_value(g,         (load_src(uc)*m             + acc0) / den);
+        store_value(NPIX + g,  (load_src(U1_PLANE + uc)*m  + acc1) / den);
+    } else {
+        const float acc0 = u2[4*g], acc1 = u2[4*g+1], acc2 = u2[4*g+2], accw = u2[4*g+3];
+        const float den = m + accw;
+        store_value(g,           (load_src(uc)*m               + acc0) / den);
+        store_value(NPIX + g,    (load_src(U1_PLANE + uc)*m    + acc1) / den);
+        store_value(2*NPIX + g,  (load_src(2*U1_PLANE + uc)*m  + acc2) / den);
+    }
+}
+
+#endif /* ENTRY_FINISH */

@@ -149,6 +149,32 @@ if(VK_GLSLC)
                 VERBATIM)
         endforeach()
     endforeach()
+    # NLMeans: weight / accumulation / finish entry points per io variant
+    # (16-bit int, 32-bit float); everything else is a specialization constant.
+    set(VK_NLM_ENTRIES weight acc finish)
+    set(VK_NLM_BITS "16" "32")
+    foreach(bits IN LISTS VK_NLM_BITS)
+        foreach(entry IN LISTS VK_NLM_ENTRIES)
+            set(defs -DBITS=${bits})
+            if(entry STREQUAL weight)
+                list(APPEND defs -DENTRY_WEIGHT)
+            elseif(entry STREQUAL acc)
+                list(APPEND defs -DENTRY_ACC)
+            else()
+                list(APPEND defs -DENTRY_FINISH)
+            endif()
+            set(raw_spv "${VK_SPV_DIR}/nlmeans_${bits}_${entry}.spv")
+            list(APPEND VK_SPV_OUTPUTS "${raw_spv}")
+            add_custom_command(
+                OUTPUT "${raw_spv}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
+                COMMAND ${VK_GLSLC} -O -fshader-stage=compute ${defs}
+                        -o "${raw_spv}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/src/nlmeans.comp"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/nlmeans.comp"
+                VERBATIM)
+        endforeach()
+    endforeach()
 else()
     message(FATAL_ERROR "glslc not found")
 endif()
@@ -190,6 +216,12 @@ add_custom_command(
             "${VK_SPV_DIR}/dfttest_32_fused_r1.spv"
             "${VK_SPV_DIR}/dfttest_32_fused_r2.spv"
             "${VK_SPV_DIR}/dfttest_32_fused_r3.spv"
+            "${VK_SPV_DIR}/nlmeans_16_weight.spv"
+            "${VK_SPV_DIR}/nlmeans_16_acc.spv"
+            "${VK_SPV_DIR}/nlmeans_16_finish.spv"
+            "${VK_SPV_DIR}/nlmeans_32_weight.spv"
+            "${VK_SPV_DIR}/nlmeans_32_acc.spv"
+            "${VK_SPV_DIR}/nlmeans_32_finish.spv"
             "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
     DEPENDS ${VK_SPV_OUTPUTS}
     VERBATIM)
@@ -202,6 +234,7 @@ add_library(vsfeel SHARED
     src/bm3d.cpp
     src/gaussblur.cpp
     src/dfttest.cpp
+    src/nlmeans.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h")
 configure_common(vsfeel)
 target_compile_options(vsfeel PRIVATE -mavx2)

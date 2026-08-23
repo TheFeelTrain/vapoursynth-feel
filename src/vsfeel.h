@@ -97,3 +97,4 @@ void vsfeel_register_bilateral(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
 void vsfeel_register_bm3dv2(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
 void vsfeel_register_gaussblur(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
 void vsfeel_register_dfttest(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
+void vsfeel_register_nlmeans(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
