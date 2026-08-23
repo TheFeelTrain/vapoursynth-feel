@@ -90,6 +90,7 @@ struct NLStream {
     uint8_t * staging_map {};
     VkBuffer tables_dev {};
     VkDeviceMemory tables_dev_mem {};
+    int * tables_map {};
     VkBuffer u1z {};
     VkDeviceMemory u1z_mem {};
     uint32_t u1z_type_index {};
@@ -111,7 +112,7 @@ struct NLStream {
     // cache reservations held by this frame (valid between acquire/release)
     std::vector<int> win_slots;      // pool slot of each needed tile
     std::vector<bool> upload_new;    // true where this frame must fill a slot
-    std::vector<VkBufferCopy> copy_regions;  // staging tile -> pool slot
+    int new_tiles {};                // tiles the pad kernel fills this frame
 };
 
 // shared padded-tile cache: one channel-layer tile per slot
@@ -146,6 +147,9 @@ struct NLMeansData {
     // shared slot pool (device-local padded tiles) + its state
     int n_slots {};
     int staging_tiles {};            // worst-case new tiles per frame
+    int tail_ints {};                // layer table + tile pairs in the tail
+    int64_t compact_tile_elems {};   // w*h elements of one compact tile
+    float * dbg_slots_map {};        // debug
     VkDeviceSize slot_bytes {};      // one padded channel-layer tile
     int64_t slot_elems {};
     VkBuffer slots_buf {};
@@ -167,9 +171,11 @@ struct NLMeansData {
     VkShaderModule weight_module {};
     VkShaderModule acc_module {};
     VkShaderModule fin_module {};
+    VkShaderModule pad_module {};
     VkPipeline weight_pipeline {};
     VkPipeline acc_pipeline {};
     VkPipeline fin_pipeline {};
+    VkPipeline pad_pipeline {};
     VkBuffer tables_buf {};
     VkDeviceMemory tables_mem {};
     VkDeviceSize aq_offset {};
@@ -191,6 +197,7 @@ struct NLMeansData {
             if (st.staging_map) vkUnmapMemory(dev, st.staging_mem);
             if (st.staging_mem) vkFreeMemory(dev, st.staging_mem, nullptr);
             if (st.staging) vkDestroyBuffer(dev, st.staging, nullptr);
+            if (st.tables_map) vkUnmapMemory(dev, st.tables_dev_mem);
             if (st.tables_dev_mem) vkFreeMemory(dev, st.tables_dev_mem, nullptr);
             if (st.tables_dev) vkDestroyBuffer(dev, st.tables_dev, nullptr);
             if (st.u1z_map) vkUnmapMemory(dev, st.u1z_mem);
@@ -211,9 +218,11 @@ struct NLMeansData {
         if (tables_buf) vkDestroyBuffer(dev, tables_buf, nullptr);
         if (slots_mem) vkFreeMemory(dev, slots_mem, nullptr);
         if (slots_buf) vkDestroyBuffer(dev, slots_buf, nullptr);
+        if (pad_pipeline) vkDestroyPipeline(dev, pad_pipeline, nullptr);
         if (fin_pipeline) vkDestroyPipeline(dev, fin_pipeline, nullptr);
         if (acc_pipeline) vkDestroyPipeline(dev, acc_pipeline, nullptr);
         if (weight_pipeline) vkDestroyPipeline(dev, weight_pipeline, nullptr);
+        if (pad_module) vkDestroyShaderModule(dev, pad_module, nullptr);
         if (fin_module) vkDestroyShaderModule(dev, fin_module, nullptr);
         if (acc_module) vkDestroyShaderModule(dev, acc_module, nullptr);
         if (weight_module) vkDestroyShaderModule(dev, weight_module, nullptr);
@@ -353,6 +362,8 @@ static void acquire_cache(NLMeansData * d, NLStream & st, int n,
 
     st.win_slots.assign(keys.size(), -1);
     st.upload_new.assign(keys.size(), false);
+    // DEBUG: NLMEANS_FORCE_PAD=1 disables slot reuse entirely
+    const bool force_pad = std::getenv("NLMEANS_FORCE_PAD") != nullptr;
 
     std::unique_lock lock(d->cache_lock);
     for (;;) {
@@ -367,7 +378,7 @@ static void acquire_cache(NLMeansData * d, NLStream & st, int n,
             for (size_t tj = 0; tj < ti; ++tj) {
                 if (keys[tj] == keys[ti]) { found = chosen[tj]; dup = true; break; }
             }
-            if (!dup) {
+            if (!dup && !force_pad) {
                 for (int i = 0; i < d->n_slots; ++i) {
                     if (d->cache[i].key == keys[ti]) { found = i; break; }
                 }
@@ -501,6 +512,7 @@ static const VSFrame *VS_CC NLMeansGetFrame(
     };
 
     auto set_error = [&](const std::string & error_message) {
+        fprintf(stderr, "[nlmeans-ERROR] n=%d: %s\n", n, error_message.c_str());
         d->streams_lock.lock();
         d->streams.push_back(std::move(stream));
         d->streams_lock.unlock();
@@ -532,13 +544,11 @@ static const VSFrame *VS_CC NLMeansGetFrame(
     acquire_cache(d, stream, n, keys);
 
     {
-        const size_t slot_bytes = static_cast<size_t>(d->slot_bytes);
-        const size_t pad_off =
-            (static_cast<size_t>(d->pad) * d->pstride + d->pad) * d->elem_bytes;
-        const size_t row_pitch = static_cast<size_t>(d->pstride) * d->elem_bytes;
+        const size_t compact_bytes =
+            static_cast<size_t>(d->compact_tile_elems) * d->elem_bytes;
         const size_t row_bytes = static_cast<size_t>(d->width) * d->elem_bytes;
 
-        size_t new_idx = 0;
+        size_t pi = 0;
         size_t ti = 0;
         for (int clip = 0; clip < (d->has_ref ? 2 : 1); ++clip) {
             for (int i = 0; i < count; ++i) {
@@ -552,33 +562,28 @@ static const VSFrame *VS_CC NLMeansGetFrame(
                         static_cast<const uint8_t *>(vsapi->getReadPtr(f, plane));
                     const size_t s_pitch = vsapi->getStride(f, plane);
                     uint8_t * dstp = stream.staging_map +
-                        new_idx * slot_bytes + pad_off;
-                    for (int y = 0; y < d->height; ++y) {
-                        copy_stream_out(dstp + static_cast<size_t>(y) * row_pitch,
-                            srcp + static_cast<size_t>(y) * s_pitch, row_bytes);
+                        pi * compact_bytes;
+                    if (s_pitch == row_bytes) {
+                        memcpy(dstp, srcp, row_bytes * d->height);
+                    } else {
+                        for (int y = 0; y < d->height; ++y) {
+                            memcpy(dstp + static_cast<size_t>(y) * row_bytes,
+                                srcp + static_cast<size_t>(y) * s_pitch,
+                                row_bytes);
+                        }
                     }
-                    stream.copy_regions.push_back(VkBufferCopy {
-                        .srcOffset = new_idx * slot_bytes,
-                        .dstOffset = static_cast<VkDeviceSize>(stream.win_slots[ti]) *
-                            d->slot_bytes,
-                        .size = slot_bytes
-                    });
-                    ++new_idx;
+                    ++pi;
                 }
             }
         }
+        stream.new_tiles = static_cast<int>(pi);
 
-        // per-frame layer->slot table: source at [c*layers+t], guide after it.
-        // Without rclip the guide aliases the source slots, but the guide
-        // section must still be fully written (the weight kernel always
-        // resolves distances through it).
-        int * tab = reinterpret_cast<int *>(stream.staging_map +
-            static_cast<size_t>(d->staging_tiles) * slot_bytes);
+        // layer->slot table straight into the persistently mapped tables buf
+        int * ints = stream.tables_map;
+        ti = 0;
         for (int clip = 0; clip < 2; ++clip) {
             const size_t base =
                 static_cast<size_t>(clip) * (C * d->layers);
-            // source tiles are keys[0 .. C*layers); guide tiles follow when
-            // there is an rclip, otherwise they alias the source slots
             const size_t key_off =
                 (clip == 1 && d->has_ref) ? static_cast<size_t>(C * d->layers) : 0;
             for (int i = 0; i < count; ++i) {
@@ -586,11 +591,29 @@ static const VSFrame *VS_CC NLMeansGetFrame(
                 for (int c = 0; c < C; ++c) {
                     const size_t pos = base +
                         static_cast<size_t>(c) * d->layers + t_layer;
-                    tab[pos] = static_cast<int>(
+                    ints[pos] = static_cast<int>(
                         static_cast<int64_t>(
                             stream.win_slots[key_off +
                                 static_cast<size_t>(i) * C + c]) *
                         d->slot_elems);
+                }
+            }
+        }
+        // pad pairs: {pool dst base, compact src base} per new tile
+        int * pairs = ints + 2 * C * d->layers;
+        size_t qi = 0;
+        ti = 0;
+        for (int clip = 0; clip < (d->has_ref ? 2 : 1); ++clip) {
+            for (int i = 0; i < count; ++i) {
+                for (int c = 0; c < C; ++c, ++ti) {
+                    if (!stream.upload_new[ti]) {
+                        continue;
+                    }
+                    pairs[2*qi] = static_cast<int>(
+                        static_cast<int64_t>(stream.win_slots[ti]) * d->slot_elems);
+                    pairs[2*qi+1] = static_cast<int>(
+                        static_cast<int64_t>(qi) * d->compact_tile_elems);
+                    ++qi;
                 }
             }
         }
@@ -634,27 +657,18 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stream.ts_query, 0);
     }
 
-    if (!stream.copy_regions.empty()) {
-        vkCmdCopyBuffer(stream.cmd, stream.staging, d->slots_buf,
-            static_cast<uint32_t>(stream.copy_regions.size()),
-            stream.copy_regions.data());
+    if (stream.new_tiles > 0) {
+        const uint32_t gx_pad = static_cast<uint32_t>(
+            (d->pstride + 31) / 32);
+        const uint32_t gy_pad = static_cast<uint32_t>((d->ph + 7) / 8);
+        const int32_t p_push[3] { 0, 0, 0 };
+        record_dispatch(d, stream, d->pad_pipeline, p_push,
+            gx_pad, gy_pad, stream.new_tiles);
+        record_barrier(stream.cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     }
-    {
-        const size_t slot_bytes = static_cast<size_t>(d->slot_bytes);
-        VkBufferCopy tab_region {
-            .srcOffset = static_cast<VkDeviceSize>(d->staging_tiles) * slot_bytes,
-            .dstOffset = 0,
-            .size = static_cast<VkDeviceSize>(2 * C * d->layers) * sizeof(int32_t)
-        };
-        vkCmdCopyBuffer(stream.cmd, stream.staging, stream.tables_dev,
-            1, &tab_region);
-    }
-    stream.copy_regions.clear();
-
-    record_barrier(stream.cmd,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
     if (gputrace) vkCmdWriteTimestamp(stream.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stream.ts_query, 1);
 
@@ -741,8 +755,22 @@ static const VSFrame *VS_CC NLMeansGetFrame(
     }
     mark(t_wait);
 
+    if (d->dbg_slots_map && std::getenv("NLMEANS_DBG")) {
+        fprintf(stderr, "[chk] n=%d:", n);
+        for (size_t ti = 0; ti < stream.win_slots.size(); ++ti) {
+            const int64_t base = static_cast<int64_t>(stream.win_slots[ti]) *
+                d->slot_elems;
+            float acc = 0.0f;
+            for (int64_t i = 0; i < d->slot_elems; i += 997)
+                acc += d->dbg_slots_map[base + i];
+            fprintf(stderr, " [%lld]=%.4f", static_cast<long long>(
+                stream.win_slots[ti]), acc);
+        }
+        fprintf(stderr, "\n");
+    }
+
     // all kernels that read this frame's tiles have completed
-    release_cache(d, stream, n);
+release_cache(d, stream, n);
 
     const bool dst_coherent =
         !!(d->device->mem_props.memoryTypes[
@@ -1109,8 +1137,8 @@ static void VS_CC NLMeansCreate(
 
     // descriptor set layout: 8 storage buffer bindings
     {
-        VkDescriptorSetLayoutBinding bindings[9];
-        for (uint32_t b = 0; b < 9; ++b) {
+        VkDescriptorSetLayoutBinding bindings[10];
+        for (uint32_t b = 0; b < 10; ++b) {
             bindings[b] = VkDescriptorSetLayoutBinding {
                 .binding = b,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -1123,7 +1151,7 @@ static void VS_CC NLMeansCreate(
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .bindingCount = 9,
+            .bindingCount = 10,
             .pBindings = bindings
         };
         if (vkCreateDescriptorSetLayout(dev, &layout_info, nullptr, &d->set_layout) != VK_SUCCESS) {
@@ -1151,7 +1179,7 @@ static void VS_CC NLMeansCreate(
     }
     {
         VkDescriptorPoolSize pool_size {
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9 * static_cast<uint32_t>(d->num_streams)
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10 * static_cast<uint32_t>(d->num_streams)
         };
         VkDescriptorPoolCreateInfo pool_info {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1172,6 +1200,8 @@ static void VS_CC NLMeansCreate(
         const uint32_t * acc_code;
         const uint32_t * fin_code;
         size_t weight_size, acc_size, fin_size;
+        const uint32_t * pad_code;
+        size_t pad_size;
         if (d->bits == 16) {
             weight_code = nlmeans_16_weight_spv;
             weight_size = nlmeans_16_weight_spv_size;
@@ -1179,6 +1209,8 @@ static void VS_CC NLMeansCreate(
             acc_size = nlmeans_16_acc_spv_size;
             fin_code = nlmeans_16_finish_spv;
             fin_size = nlmeans_16_finish_spv_size;
+            pad_code = nlmeans_16_pad_spv;
+            pad_size = nlmeans_16_pad_spv_size;
         } else {
             weight_code = nlmeans_32_weight_spv;
             weight_size = nlmeans_32_weight_spv_size;
@@ -1186,6 +1218,8 @@ static void VS_CC NLMeansCreate(
             acc_size = nlmeans_32_acc_spv_size;
             fin_code = nlmeans_32_finish_spv;
             fin_size = nlmeans_32_finish_spv_size;
+            pad_code = nlmeans_32_pad_spv;
+            pad_size = nlmeans_32_pad_spv_size;
         }
 
         auto make_module = [&](const uint32_t * code, size_t size,
@@ -1212,11 +1246,15 @@ static void VS_CC NLMeansCreate(
         if (auto err = make_module(fin_code, fin_size, d->fin_module)) {
             return set_error(*err);
         }
+        if (auto err = make_module(pad_code, pad_size, d->pad_module)) {
+            return set_error(*err);
+        }
 
         const std::pair<VkShaderModule, VkPipeline *> pipes[] {
             { d->weight_module, &d->weight_pipeline },
             { d->acc_module, &d->acc_pipeline },
-            { d->fin_module, &d->fin_pipeline }
+            { d->fin_module, &d->fin_pipeline },
+            { d->pad_module, &d->pad_pipeline }
         };
         for (auto [module, pipeline] : pipes) {
             const auto result = create_pipeline(*d, spec, module, d->pipeline_layout);
@@ -1286,15 +1324,29 @@ static void VS_CC NLMeansCreate(
         }
         d->slots_buf = std::get<VkBuffer>(result);
     }
+    const bool dbg_pool = std::getenv("NLMEANS_DBG") != nullptr;
     if (auto err = bind_memory(*d, d->slots_buf, d->slots_mem,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            dbg_pool ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                     : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
         return set_error(*err);
     }
     d->cache.assign(d->n_slots, CacheSlot {});
+    if (dbg_pool) {
+        void * dbg_mp;
+        if (vkMapMemory(dev, d->slots_mem, 0,
+                static_cast<VkDeviceSize>(d->n_slots) * slot_bytes_v, 0,
+                &dbg_mp) == VK_SUCCESS) {
+            d->dbg_slots_map = static_cast<float *>(dbg_mp);
+        }
+    }
 
+    // padded tiles mirrored 1:1 in staging; tables buffer holds the
+    // layer->slot table (+ pair headroom)
+    d->compact_tile_elems = static_cast<int64_t>(d->width) * d->height;
+    d->tail_ints = 2 * d->channels * d->layers + 2 * d->staging_tiles;
     const VkDeviceSize staging_bytes =
-        slot_bytes_v * (d->staging_tiles + 1) +
-        2 * d->channels * d->layers * sizeof(int32_t);
+        static_cast<VkDeviceSize>(d->staging_tiles) * slot_bytes_v;
 
     const VkDeviceSize npix_v = static_cast<VkDeviceSize>(d->npix);
     const VkDeviceSize u1z_bytes =
@@ -1309,7 +1361,8 @@ static void VS_CC NLMeansCreate(
         // upload staging: new tiles plus the per-frame slot-base table
         {
             const auto result = create_buffer(dev, staging_bytes,
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -1335,16 +1388,22 @@ static void VS_CC NLMeansCreate(
 
         {
             const auto result = create_buffer(dev,
-                static_cast<VkDeviceSize>(2 * d->channels * d->layers) * sizeof(int32_t),
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                static_cast<VkDeviceSize>(d->tail_ints) * sizeof(int32_t),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
             st.tables_dev = std::get<VkBuffer>(result);
         }
         if (auto err = bind_memory(*d, st.tables_dev, st.tables_dev_mem,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
             return set_error(*err);
+        }
+        if (vkMapMemory(dev, st.tables_dev_mem, 0,
+                static_cast<VkDeviceSize>(d->tail_ints) * sizeof(int32_t),
+                0, reinterpret_cast<void **>(&st.tables_map)) != VK_SUCCESS) {
+            return set_error("vkMapMemory failed");
         }
 
         // result buffer, written by the finish kernel, downloaded by the host
@@ -1469,7 +1528,7 @@ static void VS_CC NLMeansCreate(
                 return set_error("vkAllocateDescriptorSets failed");
             }
 
-            VkDescriptorBufferInfo infos[9] {
+            VkDescriptorBufferInfo infos[10] {
                 { d->slots_buf, 0, VK_WHOLE_SIZE },          // src values
                 { d->slots_buf, 0, VK_WHOLE_SIZE },          // guide values
                 { st.u1z, 0, VK_WHOLE_SIZE },
@@ -1479,11 +1538,12 @@ static void VS_CC NLMeansCreate(
                 { d->tables_buf, 0,
                   static_cast<VkDeviceSize>(d->wq_host.size()) * sizeof(int32_t) },
                 { d->tables_buf, d->aq_offset, VK_WHOLE_SIZE },
-                { st.tables_dev, 0, VK_WHOLE_SIZE }
+                { st.tables_dev, 0, VK_WHOLE_SIZE },
+                { st.staging, 0, VK_WHOLE_SIZE }
             };
 
-            VkWriteDescriptorSet writes[9];
-            for (uint32_t b = 0; b < 9; ++b) {
+            VkWriteDescriptorSet writes[10];
+            for (uint32_t b = 0; b < 10; ++b) {
                 writes[b] = VkWriteDescriptorSet {
                     .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                     .pNext = nullptr,
@@ -1497,7 +1557,7 @@ static void VS_CC NLMeansCreate(
                     .pTexelBufferView = nullptr
                 };
             }
-            vkUpdateDescriptorSets(dev, 9, writes, 0, nullptr);
+            vkUpdateDescriptorSets(dev, 10, writes, 0, nullptr);
         }
 
         st.queue = d->device->queues[0].queue;  // TEMP: single-queue test

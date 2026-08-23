@@ -149,9 +149,10 @@ if(VK_GLSLC)
                 VERBATIM)
         endforeach()
     endforeach()
-    # NLMeans: weight / accumulation / finish entry points per io variant
-    # (16-bit int, 32-bit float); everything else is a specialization constant.
-    set(VK_NLM_ENTRIES weight acc finish)
+    # NLMeans: weight / accumulation / finish / pad entry points per io
+    # variant (16-bit int, 32-bit float); everything else is a specialization
+    # constant.
+    set(VK_NLM_ENTRIES weight acc finish pad)
     set(VK_NLM_BITS "16" "32")
     foreach(bits IN LISTS VK_NLM_BITS)
         foreach(entry IN LISTS VK_NLM_ENTRIES)
@@ -160,6 +161,8 @@ if(VK_GLSLC)
                 list(APPEND defs -DENTRY_WEIGHT)
             elseif(entry STREQUAL acc)
                 list(APPEND defs -DENTRY_ACC)
+            elseif(entry STREQUAL pad)
+                list(APPEND defs -DENTRY_PAD)
             else()
                 list(APPEND defs -DENTRY_FINISH)
             endif()
@@ -219,9 +222,11 @@ add_custom_command(
             "${VK_SPV_DIR}/nlmeans_16_weight.spv"
             "${VK_SPV_DIR}/nlmeans_16_acc.spv"
             "${VK_SPV_DIR}/nlmeans_16_finish.spv"
+            "${VK_SPV_DIR}/nlmeans_16_pad.spv"
             "${VK_SPV_DIR}/nlmeans_32_weight.spv"
             "${VK_SPV_DIR}/nlmeans_32_acc.spv"
             "${VK_SPV_DIR}/nlmeans_32_finish.spv"
+            "${VK_SPV_DIR}/nlmeans_32_pad.spv"
             "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
     DEPENDS ${VK_SPV_OUTPUTS}
     VERBATIM)
