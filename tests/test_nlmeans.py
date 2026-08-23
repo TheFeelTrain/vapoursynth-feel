@@ -154,32 +154,63 @@ def test_temporal_differs_from_spatial(noise_gray):
 
 # --- correctness vs the reference --------------------------------------------
 
+# Parameter sweep vs vszipcl. Tolerance set from measurement: diffs come
+# from fp32 accumulation order in the weighted average (more taps at larger
+# a/s accumulate more), landing in the 0 .. 6e-5 band across all configs and
+# all special paths (UV/RGB joint, rclip guide, cropped stride). The bound
+# keeps ~40% headroom over the worst measurement while still catching real
+# misindexing (which produces O(0.1..1) errors).
+NLMEANS_REF_TOL = 1e-4
 
-def test_matches_reference_float(noise_gray):
-    ref = getattr(vs.core, "vszipcl", None) if hasattr(vs.core, "vszipcl") else None
-    if ref is None or not hasattr(ref, "NLMeans"):
-        pytest.skip("no vszipcl reference plugin")
-    for kwargs in (
-        dict(d=0),
-        dict(d=2),
-        dict(d=1, a=3, s=3, h=3.0, wref=0.4),
-        dict(d=0, wmode=2, h=2.0),
-    ):
-        mine = _run(noise_gray, **kwargs)
-        theirs = ref.NLMeans(noise_gray, num_streams=1, **kwargs)
-        worst = _max_diff(mine, theirs)
-        assert worst < 1e-4, f"max diff vs vszipcl {kwargs}: {worst}"
+REFERENCE_CASES = [
+    {"d": 0},
+    {"d": 2},
+    {"d": 1, "a": 3, "s": 3, "h": 3.0, "wref": 0.4},
+    {"d": 0, "wmode": 1},
+    {"d": 0, "wmode": 2, "h": 2.0},
+    {"d": 0, "wmode": 3},
+    {"d": 0, "a": 1},
+    {"d": 0, "a": 4},
+    {"d": 0, "s": 1},
+    {"d": 0, "s": 8},
+    {"d": 0, "h": 0.3},
+    {"d": 0, "h": 6.0},
+    {"d": 0, "wref": 0.0},
+]
 
 
-def test_matches_reference_16bit(noise_16bit):
+def _reference_plugin():
     ref = getattr(vs.core, "vszipcl", None)
     if ref is None or not hasattr(ref, "NLMeans"):
         pytest.skip("no vszipcl reference plugin")
-    mine = _run(noise_16bit, d=1)
-    theirs = ref.NLMeans(noise_16bit, num_streams=1, d=1)
-    # integer rounding path: allow a couple of LSBs of rounding difference
+    return ref
+
+
+@pytest.mark.parametrize("kwargs", REFERENCE_CASES, ids=lambda kw: str(kw))
+def test_matches_reference_float(noise_gray, kwargs):
+    theirs = _reference_plugin().NLMeans(noise_gray, num_streams=1, **kwargs)
+    mine = _run(noise_gray, **kwargs)
     worst = _max_diff(mine, theirs)
-    assert worst <= 2.0, f"max LSB diff vs vszipcl: {worst}"
+    assert worst < NLMEANS_REF_TOL, f"max diff vs vszipcl {kwargs}: {worst}"
+
+
+GRAY16_CASES = [
+    {"d": 1},
+    {"d": 2},
+    {"d": 0, "wmode": 2, "h": 2.0},
+    {"d": 0, "wmode": 3},
+    {"d": 1, "a": 4},
+]
+
+
+@pytest.mark.parametrize("kwargs", GRAY16_CASES, ids=lambda kw: str(kw))
+def test_matches_reference_16bit(noise_16bit, kwargs):
+    """Integer rounding path: both sides round nearly identical fp32 results
+    once, so codes differ by at most one step."""
+    theirs = _reference_plugin().NLMeans(noise_16bit, num_streams=1, **kwargs)
+    mine = _run(noise_16bit, **kwargs)
+    worst = _max_diff(mine, theirs)
+    assert worst <= 1.0, f"max LSB diff vs vszipcl {kwargs}: {worst}"
 
 
 def test_yuv_default_denises_luma_copies_chroma(noise_yuv32):
@@ -195,7 +226,7 @@ def test_yuv_default_denises_luma_copies_chroma(noise_yuv32):
 def test_yuv_channels_uv_matches_reference(noise_yuv32):
     """channels='UV' on a subsampled YUV clip: chroma denoised (subsampled
     lattice), luma passed through bit-exactly."""
-    ref = getattr(vs.core, "vszipcl", None)
+    ref = _reference_plugin()
     src = noise_yuv32
     assert src.format.subsampling_w == 1 and src.format.subsampling_h == 1
 
@@ -203,41 +234,35 @@ def test_yuv_channels_uv_matches_reference(noise_yuv32):
     assert _max_diff(out, src, planes=(0,), frames=(5,)) == 0.0
     assert _max_diff(out, src, planes=(1, 2), frames=(5,)) > 0.0
 
-    if ref is None or not hasattr(ref, "NLMeans"):
-        pytest.skip("no vszipcl reference plugin")
     theirs = ref.NLMeans(src, num_streams=1, d=0, channels="UV", h=1.5)
-    assert _max_diff(out, theirs, planes=(1, 2)) < 1e-4
+    assert _max_diff(out, theirs, planes=(1, 2)) < NLMEANS_REF_TOL
 
 
 def test_yuv_channels_uv_temporal_matches_reference(noise_yuv32):
-    ref = getattr(vs.core, "vszipcl", None)
-    if ref is None or not hasattr(ref, "NLMeans"):
-        pytest.skip("no vszipcl reference plugin")
+    ref = _reference_plugin()
     src = noise_yuv32
     mine = _run(src, d=1, channels="UV", h=1.5, num_streams=2)
     theirs = ref.NLMeans(src, num_streams=2, d=1, channels="UV", h=1.5)
-    assert _max_diff(mine, theirs, planes=(1, 2)) < 1e-4
+    assert _max_diff(mine, theirs, planes=(1, 2)) < NLMEANS_REF_TOL
 
 
 def test_yuv444_joint_matches_reference(noise_yuv444_16):
-    ref = getattr(vs.core, "vszipcl", None)
-    if ref is None or not hasattr(ref, "NLMeans"):
-        pytest.skip("no vszipcl reference plugin")
+    ref = _reference_plugin()
     src = noise_yuv444_16
     mine = _run(src, d=0, channels="YUV", h=1.0)
     theirs = ref.NLMeans(src, num_streams=1, d=0, channels="YUV", h=1.0)
-    # 16-bit joint processing: allow a couple of LSBs of rounding difference
+    # joint processing sums distances across three planes before rounding,
+    # so the fp divergence reaches two output codes (measured); single-plane
+    # paths stay within one
     assert _max_diff(mine, theirs, planes=(0, 1, 2)) <= 2.0
 
 
 def test_rgb_joint_matches_reference(noise_rgb32):
-    ref = getattr(vs.core, "vszipcl", None)
-    if ref is None or not hasattr(ref, "NLMeans"):
-        pytest.skip("no vszipcl reference plugin")
+    ref = _reference_plugin()
     src = noise_rgb32
     mine = _run(src, d=1, h=1.0)
     theirs = ref.NLMeans(src, num_streams=1, d=1, h=1.0)
-    assert _max_diff(mine, theirs, planes=(0, 1, 2)) < 1e-4
+    assert _max_diff(mine, theirs, planes=(0, 1, 2)) < NLMEANS_REF_TOL
 
 
 def test_rclip_self_is_identity(noise_gray):
@@ -248,29 +273,25 @@ def test_rclip_self_is_identity(noise_gray):
 
 
 def test_rclip_guide_matches_reference(noise_gray):
-    ref = getattr(vs.core, "vszipcl", None)
-    if ref is None or not hasattr(ref, "NLMeans"):
-        pytest.skip("no vszipcl reference plugin")
+    ref = _reference_plugin()
     src = noise_gray
     guide = src.std.BoxBlur(hradius=5, vradius=5)
     mine = _run(src, d=0, h=1.5, rclip=guide)
     plain = _run(src, d=0, h=1.5)
     assert _max_diff(mine, plain, frames=(5,)) > 0.0
     theirs = ref.NLMeans(src, num_streams=1, d=0, h=1.5, rclip=guide)
-    assert _max_diff(mine, theirs) < 1e-4
+    assert _max_diff(mine, theirs) < NLMEANS_REF_TOL
 
 
 def test_stride_handling_matches_reference(noise_gray):
     # a cropped frame keeps its parent's (wider) stride; the filter must
     # handle non-tight pitches identically to the reference
-    ref = getattr(vs.core, "vszipcl", None)
+    ref = _reference_plugin()
     cropped = noise_gray.std.Crop(left=27)
     assert cropped.width < noise_gray.width
-    if ref is None or not hasattr(ref, "NLMeans"):
-        pytest.skip("no vszipcl reference plugin")
     mine = _run(cropped, d=1)
     theirs = ref.NLMeans(cropped, num_streams=1, d=1)
-    assert _max_diff(mine, theirs) < 1e-4
+    assert _max_diff(mine, theirs) < NLMEANS_REF_TOL
 
 
 # --- determinism / streams ---------------------------------------------------
