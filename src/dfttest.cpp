@@ -531,7 +531,7 @@ struct DftData {
 
     ~DftData() {
         uint64_t n = nframes.load();
-        if (n) {
+        if (n && getenv("VSFEEL_DFTTEST_TIMING")) {
             fprintf(stderr,
                 "[dfttest-timing] frames=%llu avg_total=%.3fms acquire=%.3fms upload=%.3fms submit=%.3fms wait=%.3fms download=%.3fms\n",
                 (unsigned long long)n,
