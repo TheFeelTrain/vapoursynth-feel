@@ -70,6 +70,7 @@ PLUGINS = {
         "vszipcu",
         loader='core.std.LoadPlugin("/home/encode/test/vapoursynth-ziphip/zig-out/lib/libvszipcu.so")',
     ),
+    "bilateralhip": Plugin("bilateralhip"),
     "bm3dhip": Plugin("bm3dhip"),
     "nlm_hip": Plugin("nlm_hip"),
 }
@@ -133,6 +134,7 @@ def _bilateral_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
         "vsfeel": f"core.vsfeel.Bilateral({clip}, {args})",
         "vszipcl": f"core.vszipcl.Bilateral({clip}, {args})",
         "vszipcu": f"core.vszipcu.Bilateral({clip}, {args})",
+        "bilateralhip": f"core.bilateralhip.Bilateral({clip}, {args})",
     }
 
 

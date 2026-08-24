@@ -15,31 +15,6 @@ if TYPE_CHECKING:
 __all__ = ["Backend", "FeelBackend"]
 
 
-class FeelBackend:
-    """Duck-typed backend accepted by vs-jetpack's ``backend=`` arguments."""
-
-    value = "vsfeel"
-    """Plugin namespace. Read by wrappers that pick the plugin themselves,
-    e.g. ``vsrgtools.gauss_blur`` dispatches through ``getattr(core, backend.value)``."""
-
-    num_streams = 2
-    """Matches the stream count the vszipcl/vszipcu backends are given by
-    vs-jetpack; override per call with the plugin's own ``num_streams``
-    keyword."""
-
-    def resolve(self) -> Self:
-        """Resolve this backend to itself.
-
-        vs-jetpack enums implement ``resolve()`` to map their AUTO member onto
-        the function's default; an explicitly chosen backend always resolves to
-        itself.
-        """
-        return self
-
-    def _dispatch(self, func: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> vs.VideoNode:
-        return getattr(args[0].vsfeel, func)(*args[1:], **{"num_streams": self.num_streams} | kwargs)
-
-
 class _FeelBM3DPlugin:
     """Stand-in for the ``core.vsfeel`` plugin surface.
 
@@ -63,71 +38,54 @@ class _FeelBM3DPlugin:
         self.BM3Dv2 = bm3d_v2
 
 
-class FeelBilateral(FeelBackend):
-    """Selects ``core.vsfeel.Bilateral``, e.g. for ``vsrgtools.bilateral``."""
+class FeelBackend:
+    """Duck-typed backend accepted by vs-jetpack's ``backend=`` arguments.
 
-    def Bilateral(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:
+    One instance serves every vs-jetpack wrapper: each wrapper only ever
+    invokes the entry point matching its own filter, so the same object can be
+    passed to ``vsrgtools.bilateral``, ``vsdenoise.bm3d``, ... alike.
+    """
+
+    value = "vsfeel"
+    """Plugin namespace. Read by wrappers that pick the plugin themselves,
+    e.g. ``vsrgtools.gauss_blur`` dispatches through ``getattr(core, backend.value)``."""
+
+    num_streams = 2
+    """Matches the stream count the vszipcl/vszipcu backends are given by
+    vs-jetpack; override per call with the plugin's own ``num_streams``
+    keyword."""
+
+    def resolve(self) -> Self:
+        """Resolve this backend to itself.
+
+        vs-jetpack enums implement ``resolve()`` to map their AUTO member onto
+        the function's default; an explicitly chosen backend always resolves to
+        itself.
+        """
+        return self
+
+    def _dispatch(self, func: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> vs.VideoNode:
+        return getattr(args[0].vsfeel, func)(*args[1:], **{"num_streams": self.num_streams} | kwargs)
+
+    def Bilateral(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:  # noqa: N802
         return self._dispatch("Bilateral", (clip, *args), kwargs)
 
-
-class FeelGaussBlur(FeelBackend):
-    """Selects ``core.vsfeel.GaussBlur``, e.g. for ``vsrgtools.gauss_blur``.
-
-    No dispatch method needed: ``gauss_blur`` looks the plugin up itself via
-    ``getattr(core, backend.value).GaussBlur(...)``.
-    """
-
-    num_streams = 4
-    """The stream count ``gauss_blur`` gives its GPU backends."""
-
-
-class FeelNLMeans(FeelBackend):
-    """Selects ``core.vsfeel.NLMeans``, e.g. for ``vsdenoise.nl_means``."""
-
-    def NLMeans(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:
+    def NLMeans(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:  # noqa: N802
         return self._dispatch("NLMeans", (clip, *args), kwargs)
 
-
-class FeelDFTTest(FeelBackend):
-    """Selects ``core.vsfeel.DFTTest`` for ``vsdenoise.DFTTest``.
-
-    Although the other DFTTest backends target the dfttest2 python package,
-    ``denoise()`` emits classic dfttest-style keyword arguments
-    (tbsize/ftype/swin/twin/slocation/ssx/ssy/sst/planes), which
-    ``core.vsfeel.DFTTest`` accepts directly; dfttest2-only options are not
-    available through this backend.
-    """
-
-    def DFTTest(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:
+    def DFTTest(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:  # noqa: N802
         return self._dispatch("DFTTest", (clip, *args), kwargs)
-
-
-class FeelBM3D(FeelBackend):
-    """Selects ``core.vsfeel.BM3Dv2``, e.g. for ``vsdenoise.bm3d``.
-
-    ``bm3d`` obtains the plugin through ``backend.plugin`` and introspects its
-    signature to filter profile arguments, so a shim is interposed that hides
-    the parameters vsfeel does not implement (``chroma`` and friends).
-    """
-
-    def __init__(self) -> None:
-        self._plugin: _FeelBM3DPlugin | None = None
 
     @property
     def plugin(self) -> _FeelBM3DPlugin:
+        """Plugin surface for wrappers that look the function up themselves,
+        i.e. ``vsdenoise.bm3d`` through ``backend.plugin.BM3Dv2``."""
         if self._plugin is None:
             self._plugin = _FeelBM3DPlugin()
         return self._plugin
 
+    def __init__(self) -> None:
+        self._plugin: _FeelBM3DPlugin | None = None
 
-class Backend:
-    """Namespace of vsfeel backends for vs-jetpack functions.
 
-    Pass these as the ``backend=`` argument of the matching vs-jetpack wrapper.
-    """
-
-    Bilateral = FeelBilateral()
-    GaussBlur = FeelGaussBlur()
-    NLMeans = FeelNLMeans()
-    BM3D = FeelBM3D()
-    DFTTest = FeelDFTTest()
+Backend = FeelBackend()

@@ -185,19 +185,19 @@ from vsdenoise import bm3d, DFTTest, nl_means
 import vsfeel
 
 # Bilateral
-blurred = bilateral(clip, ref, 3.0, 0.02, backend=vsfeel.Backend.Bilateral)
+blurred = bilateral(clip, ref, 3.0, 0.02, backend=vsfeel.Backend)
 
 # BM3D
-denoised = bm3d(clip, 0.7, tr=2, profile=bm3d.Profile.NORMAL, ref=ref, planes=0, backend=vsfeel.Backend.BM3D)
+denoised = bm3d(clip, 0.7, tr=2, profile=bm3d.Profile.NORMAL, ref=ref, planes=0, backend=vsfeel.Backend)
 
 # DFTTest
-dft = DFTTest(clip, backend=vsfeel.Backend.DFTTest).denoise({0.0: 16.0, 0.5: 8.0, 1.0: 0.0}, tr=1)
+dft = DFTTest(clip, backend=vsfeel.Backend).denoise({0.0: 16.0, 0.5: 8.0, 1.0: 0.0}, tr=1)
 
 # GaussBlur
-smooth = gauss_blur(clip, 1.5, backend=vsfeel.Backend.GaussBlur)
+smooth = gauss_blur(clip, 1.5, backend=vsfeel.Backend)
 
 # NLMeans
-denoised = nl_means(clip, h=0.2, tr=2, a=2, s=4, ref=ref, planes=[1, 2], backend=vsfeel.Backend.NLMeans)
+denoised = nl_means(clip, h=0.2, tr=2, a=2, s=4, ref=ref, planes=[1, 2], backend=vsfeel.Backend)
 ```
 
 ## Manual Compilation
