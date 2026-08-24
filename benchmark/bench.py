@@ -7,8 +7,7 @@ that maps each supported plugin to the vpy call that runs it). Plugins are
 described separately in PLUGINS. Adding a new filter = one new entry; adding a
 new reference plugin = one new entry.
 
-Timing is done with vspipe so results stay comparable across plugins and with
-the earlier per-plugin scripts (benchmark/feel_test.py, cl_test.py, cu_test.py).
+Timing is done with vspipe so results stay comparable across plugins.
 
 Usage:
     python3 benchmark/bench.py                                   # all filters
@@ -16,7 +15,13 @@ Usage:
     python3 benchmark/bench.py --filter gaussblur vsfeel vszipcl # subset of plugins
     python3 benchmark/bench.py --filter gaussblur --gauss-sigma 5.0
     python3 benchmark/bench.py --frames 500 --clip /path/to/input.mkv
-    python3 benchmark/bench.py --synthetic          # BlankClip: no decode bottleneck
+    python3 benchmark/bench.py --no-cache          # live decode: full chain incl. BestSource
+
+By default the first --cache-frames frames of the real clip are decoded and
+held in RAM while vspipe is still evaluating the script (its fps figure only
+covers the output loop), so timing reflects real-content filter throughput
+without the BestSource decode bottleneck. --synthetic swaps real content for a
+BlankClip; --no-cache restores live decoding.
 """
 
 import argparse
@@ -29,24 +34,49 @@ from typing import Any, Callable
 
 DEFAULT_CLIP = "/home/encode/test/jpbd.mkv"
 
-def make_vpy(clip: str, extra: str, chain: str, frames: int, synth_format: str | None) -> str:
+def make_vpy(
+    clip: str,
+    extra: str,
+    chain: str,
+    frames: int,
+    synth_format: str | None,
+    cache_frames: int | None = None,
+) -> str:
     if synth_format:
         # synthetic clip: measure pure filter throughput, no decode bottleneck
         clip_expr = (
             "core.std.BlankClip(width=1920, height=1080, "
             f"format={synth_format}, length={frames})"
         )
+        cache_setup = ""
+    elif cache_frames:
+        # real clip, but decode + hold the first N frames in Python while the
+        # script is being evaluated (before vspipe starts timing), then serve
+        # them through a ModifyFrame shim and loop to reach the requested
+        # frame count. std.Cache() is an explicit no-op on current VapourSynth.
+        clip_expr = f"BestSource(cachepath=None).source({clip!r}, 32)"
+        cache_setup = (
+            f"m = min({cache_frames}, clip.num_frames)\n"
+            "_src_frames = [clip.get_frame(n) for n in range(m)]\n"
+            "def _serve_cached(n, f):\n"
+            "    return _src_frames[n % m]\n"
+            "_blank = clip.std.BlankClip()\n"
+            "_served = _blank.std.ModifyFrame(_blank, _serve_cached)\n"
+            f"clip = (_served * -(-{frames} // m)).std.Trim(0, {frames - 1})\n"
+        )
     else:
         clip_expr = f"BestSource(cachepath=None).source({clip!r}, 32)"
+        cache_setup = ""
     return f"""\
 from vssource import BestSource
 from vstools import core, depth, get_y
 import vapoursynth as vs
 
-core.max_cache_size = 1024 * 56
+core.max_cache_size = 1024 * 48
 
 clip = {clip_expr}
 
+{cache_setup}
 {extra}
 
 {chain}.set_output()
@@ -199,7 +229,7 @@ FILTERS: dict[str, FilterSpec] = {
     ),
     "bilateral": FilterSpec(
         title="Bilateral",
-        default_frames=10000,
+        default_frames=5000,
         args=[
             Arg("sigma_spatial", "--bilateral-sigma-spatial", "bilateral_sigma_spatial", float, 3.0),
             Arg("sigma_color", "--bilateral-sigma-color", "bilateral_sigma_color", float, 0.02),
@@ -272,13 +302,15 @@ def run_vspipe(vpy_path: Path, frames: int) -> float | None:
     return None
 
 
-def bench(plugin: str, chain: str, clip: str, frames: int, synth_format: str | None) -> float | None:
+def bench(plugin: str, chain: str, clip: str, frames: int, synth_format: str | None,
+          cache_frames: int | None = None) -> float | None:
     vpy = make_vpy(
         clip=clip,
         extra=PLUGINS[plugin].loader or "",
         chain=chain,
         frames=frames,
         synth_format=synth_format,
+        cache_frames=cache_frames,
     )
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"bench_{plugin}.vpy"
@@ -302,13 +334,17 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
 
     frames = ns.frames or spec.default_frames
     synth = spec.synth_format if ns.synthetic else None
-    clip_desc = f"BlankClip 1920x1080 {synth.removeprefix('vs.')}" if synth else str(ns.clip)
+    cache_frames = ns.cache_frames if (ns.cached and synth is None) else None
+    if synth:
+        clip_desc = f"BlankClip 1920x1080 {synth.removeprefix('vs.')}"
+    else:
+        clip_desc = str(ns.clip)
     print(f"{spec.title} benchmark | {frames} frames | clip: {clip_desc}")
     print(f"args: {args_desc(spec, ns)}\n")
 
     results = []
     for plugin in plugins:
-        fps = bench(plugin, calls[plugin], ns.clip, frames, synth)
+        fps = bench(plugin, calls[plugin], ns.clip, frames, synth, cache_frames)
         results.append((plugin, fps))
         if fps is None:
             print(f"  {plugin:10s}  unavailable / failed")
@@ -343,6 +379,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--synthetic", action="store_true",
                         help="use a synthetic 1920x1080 YUV420PS BlankClip instead of --clip "
                              "(decoder-independent, measures pure filter throughput)")
+    parser.add_argument("--cache", dest="cached", action="store_true", default=True,
+                        help="default mode: decode the first --cache-frames frames of the real clip "
+                             "into RAM before vspipe starts timing (removes the BestSource bottleneck "
+                             "while keeping real content; frames loop to reach --frames)")
+    parser.add_argument("--no-cache", dest="cached", action="store_false",
+                        help="decode live during timing instead (measures the full chain, "
+                             "bottlenecked by BestSource at ~630 fps)")
+    parser.add_argument("--cache-frames", type=int, default=1000,
+                        help="number of leading frames to preload with --cache (default: 1000)")
 
     for spec in FILTERS.values():
         for arg in spec.args:

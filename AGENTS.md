@@ -85,22 +85,22 @@ runs it. Plugins are described separately in `PLUGINS`.
     plugins, to compare against references
   - `--frames N`, `--num-streams N`, `--clip PATH` to control the run
 - The default clip is `/home/encode/test/jpbd.mkv` (1920x1080, YUV420P8).
-- Always benchmark on **both** the real input clip and the synthetic
-  `--synthetic` clip. The real clip is decoded via BestSource (~631 fps ceiling)
-  so filter speedups are invisible there; the synthetic BlankClip is the primary
-  metric for measuring filter throughput. The real clip stays as a smoke test
-  for the full input chain.
+- By default the run **caches real frames in RAM**: the first `--cache-frames`
+  (default 1000) frames are decoded while vspipe evaluates the script, and its
+  fps figure only covers the output loop, so timing measures filter throughput
+  on real content without the BestSource decode bottleneck (~630 fps). Frames
+  loop when `--frames` exceeds the cached span, so temporal filters see a seam
+  every N frames — fine for throughput, not for output inspection.
 
 To benchmark a single filter against the references:
 
 ```bash
 MANGOHUD=0 python3 benchmark/bench.py --filter dfttest vsfeel vszipcl vszipcu
-MANGOHUD=0 python3 benchmark/bench.py --synthetic --filter dfttest vsfeel vszipcl vszipcu
 ```
 
 This prints fps for each plugin and ranks them. Compare vsfeel's fps against
-the fastest reference. Prefer `--synthetic` for judging optimizations (the real
-clip is decode-bound); confirm the real clip still behaves afterwards.
+the fastest reference. Judge optimizations on multiple runs over hundreds of 
+frames.
 
 ## Comparing a vsfeel kernel against the reference kernels
 
