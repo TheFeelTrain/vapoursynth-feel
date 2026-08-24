@@ -17,7 +17,7 @@ maintainers = [
 dependencies = ["vapoursynth>=74"]
 
 [dependency-groups]
-dev = ["hatchling>=1.27.0", "packaging"]
+dev = ["hatchling>=1.27.0", "packaging", "vsjetpack>=2.2"]
 
 [project.urls]
 "Source Code" = "https://github.com/TheFeelTrain/vapoursynth-feel"
@@ -28,10 +28,10 @@ source = "vcs"
 tag-pattern = '^r(?P<version>.*)$'
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "CMakeLists.txt", "config.h.in"]
+include = ["src", "vsfeel", "CMakeLists.txt", "config.h.in"]
 
 [tool.hatch.build.targets.wheel]
-include = ["vapoursynth/plugins/vsfeel"]
+include = ["vapoursynth/plugins/vsfeel", "vsfeel"]
 artifacts = [
     "vapoursynth/plugins/vsfeel/*.so",
     "vapoursynth/plugins/vsfeel/*.dll",
