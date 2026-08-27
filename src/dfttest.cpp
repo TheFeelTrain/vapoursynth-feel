@@ -407,7 +407,11 @@ struct ResMeta {
 struct SlotState {
     long long gen { -1 };        // source frame the slot owns (-1 = empty)
     std::vector<std::pair<int, long long>> committed; // readers: {res_id, frame_gen}
-    std::vector<VkSemaphore> sem; // tw semaphores, one per reader offset
+    VkSemaphore sem {};          // one TIMELINE semaphore, reused across generations
+    uint64_t signal {};          // timeline value the current generation's pad signals;
+                                 // every reader of this generation waits on this value
+                                 // (timeline waits are non-destructive, so any number
+                                 // of repeated frame processings can wait on one value)
 };
 
 struct VK_Resource {
@@ -459,7 +463,6 @@ struct PushConstants {
 struct DftData {
     VSNode * node;
     const VSVideoInfo * vi;
-
     int num_streams;
     int bits, bytes;
 
@@ -585,8 +588,8 @@ struct DftData {
         }
 
         for (auto & st : slots) {
-            for (auto & sem : st.sem) {
-                vkDestroySemaphore(dev, sem, nullptr);
+            if (st.sem) {
+                vkDestroySemaphore(dev, st.sem, nullptr);
             }
         }
         if (slot_mem) {
@@ -865,9 +868,9 @@ static std::optional<std::string> record_pad_cb(
 
 // Records and submits one pad op's command buffer immediately (called at
 // claim time, still holding slot_lock; takes queue_lock). Signalling the
-// slot's semaphores here — before any reader of this generation can commit —
-// makes a backward semaphore dependency on the queue impossible: every
-// reader's copy submit is queued after this pad submit.
+// slot's timeline semaphore here — before any reader of this generation can
+// commit — makes a backward semaphore dependency on the queue impossible:
+// every reader's copy submit is queued after this pad submit.
 static bool submit_pad_op(
     const DftData & d, VK_Resource & resource, const SlotOp & op) {
 
@@ -896,10 +899,21 @@ static bool submit_pad_op(
         .commandBufferCount = 1,
         .pCommandBuffers = &cmd
     };
+    VkTimelineSemaphoreSubmitInfo tsi {
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        .pNext = nullptr,
+        .waitSemaphoreValueCount = 0,
+        .pWaitSemaphoreValues = nullptr,
+        .signalSemaphoreValueCount = 0,
+        .pSignalSemaphoreValues = nullptr
+    };
     if (op.slot >= 0) {
         const auto & st = d.slots[op.plane * d.slot_count + op.slot];
-        si.signalSemaphoreCount = static_cast<uint32_t>(st.sem.size());
-        si.pSignalSemaphores = st.sem.data();
+        tsi.signalSemaphoreValueCount = 1;
+        tsi.pSignalSemaphoreValues = &st.signal;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &st.sem;
+        si.pNext = &tsi;
     }
     return vkQueueSubmit(resource.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS;
 }
@@ -1078,15 +1092,19 @@ static const VSFrame *VS_CC DftGetFrame(
         // Note on the frame cache and out-of-order processing: the slot
         // state (gen/committed) under slot_lock decides who pads a slot (the
         // first frame that touches it, in wall-clock order) and who reads it.
-        // The pad is submitted at claim time, still under slot_lock, so every
-        // reader's copy submit (which needs slot_lock to commit first) is
-        // queued after the pad submit that signals the slot's semaphores — a
-        // backward semaphore dependency on the queue, which stalls it, is
-        // structurally impossible. A slot is only reclaimed for a new source
-        // once every committed reader's resource has been reused (frame_gen
-        // advanced past their commit generation), which implies their frames
-        // — copies included — are fully done, so the overwrite never races a
-        // reader's copy. No host fence waits anywhere: no deadlocks.
+        // The pad is submitted at claim time, still under slot_lock, and
+        // signals the slot's TIMELINE semaphore to a fresh per-generation
+        // value. Every reader — including readers of the same generation
+        // caused by the same frame being processed more than once (the
+        // scheduler / chained filters can request one frame repeatedly) —
+        // waits on that value, and timeline waits are non-destructive, so any
+        // number of copies may wait on the same signal: no second consumer can
+        // starve. A slot is only reclaimed for a new source once every
+        // committed reader's resource has been reused (frame_gen advanced past
+        // their commit generation), which implies their frames — copies
+        // included — are fully done, so the overwrite never races a reader's
+        // copy, and destroying the timeline semaphore is safe (all its waits
+        // have resolved). No host fence waits anywhere: no deadlocks.
         d->semaphore.acquire();
         auto t1 = std::chrono::steady_clock::now();
         d->resources_lock.lock();
@@ -1139,7 +1157,7 @@ static const VSFrame *VS_CC DftGetFrame(
         // is submitted at claim time and how slot reclamation stays safe.
         std::vector<SlotOp> ops;
         ops.reserve(d->vi->format.numPlanes * tw);
-        std::vector<VkSemaphore> waits;
+        std::vector<std::pair<VkSemaphore, uint64_t>> waits;
         waits.reserve(ops.capacity());
         const bool force_pad = getenv("VSFEEL_DFTTEST_FORCEPAD") != nullptr;
         for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
@@ -1167,26 +1185,28 @@ static const VSFrame *VS_CC DftGetFrame(
                     return -1;
                 };
 
-                // register this frame as a reader of the slot's current
-                // generation and wait on its semaphore for this reader offset
-                // (deduped: at temporal boundaries two slices of one frame map
-                // to the same source, hence the same slot and which)
+                // register this frame as a reader of the slot's current generation and
+                // wait on the generation's timeline value. Timeline waits are
+                // NON-DESTRUCTIVE: any number of frame processings of the same
+                // generation (e.g. the same frame n requested twice by the
+                // scheduler / chained filters) may wait on the same value.
+                // (Pair-deduped: at temporal boundaries two slices of one
+                // frame map to the same source, hence the same slot and value.)
                 auto commit_reader = [&](int s) {
                     SlotState & st = d->slots[plane * d->slot_count + s];
                     st.committed.push_back({ resource.id, my_gen });
                     op.slot = s;
                     op.slot_base = cfg.slot_offset +
                         static_cast<VkDeviceSize>(s) * cfg.slot_plane_bytes;
-                    const VkSemaphore wsem = st.sem[which];
                     bool dup = false;
-                    for (auto w : waits) {
-                        if (w == wsem) {
+                    for (const auto & w : waits) {
+                        if (w.first == st.sem && w.second == st.signal) {
                             dup = true;
                             break;
                         }
                     }
                     if (!dup) {
-                        waits.push_back(wsem);
+                        waits.emplace_back(st.sem, st.signal);
                     }
                 };
 
@@ -1271,22 +1291,27 @@ static const VSFrame *VS_CC DftGetFrame(
                                         "[dfttest-trace]   n=%d reclaim p%d slot=%d oldgen=%lld newgen=%d\n",
                                         n, plane, slot, (long long)st.gen, idx);
                                 }
-                                for (auto & sem : st.sem) {
-                                    vkDestroySemaphore(dev, sem, nullptr);
-                                }
-                                st.sem.clear();
                             }
-                            st.gen = idx;
-                            st.committed = { { resource.id, my_gen } };
-                            st.sem.resize(d->tw);
-                            for (auto & sem : st.sem) {
+                            if (!st.sem) {
                                 VkSemaphoreCreateInfo sem_info {
                                     .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
                                     .pNext = nullptr,
                                     .flags = 0
                                 };
-                                checkVK(vkCreateSemaphore(dev, &sem_info, nullptr, &sem));
+                                VkSemaphoreTypeCreateInfo type_info {
+                                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                                    .pNext = nullptr,
+                                    .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+                                    .initialValue = 0
+                                };
+                                sem_info.pNext = &type_info;
+                                checkVK(vkCreateSemaphore(dev, &sem_info, nullptr, &st.sem));
                             }
+                            st.gen = idx;
+                            st.committed = { { resource.id, my_gen } };
+                            // fresh timeline value for this generation: the pad
+                            // below signals it; every reader waits on it
+                            st.signal = ++st.signal;
                             op.slot = slot;
                             op.slot_base = cfg.slot_offset +
                                 static_cast<VkDeviceSize>(slot) * cfg.slot_plane_bytes;
@@ -1389,14 +1414,29 @@ static const VSFrame *VS_CC DftGetFrame(
 
         {
             std::lock_guard lock(*resource.queue_lock);
-            const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            std::vector<VkPipelineStageFlags> wait_stages(waits.size(),
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+            std::vector<VkSemaphore> wait_sems(waits.size());
+            std::vector<uint64_t> wait_vals(waits.size());
+            for (size_t i = 0; i < waits.size(); ++i) {
+                wait_sems[i] = waits[i].first;
+                wait_vals[i] = waits[i].second;
+            }
+            VkTimelineSemaphoreSubmitInfo tsi {
+                .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+                .pNext = nullptr,
+                .waitSemaphoreValueCount = static_cast<uint32_t>(waits.size()),
+                .pWaitSemaphoreValues = wait_vals.empty() ? nullptr : wait_vals.data(),
+                .signalSemaphoreValueCount = 0,
+                .pSignalSemaphoreValues = nullptr
+            };
             VkCommandBuffer copy_cb = resource.cmd2;
             VkSubmitInfo si {
                 .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                .pNext = nullptr,
+                .pNext = &tsi,
                 .waitSemaphoreCount = static_cast<uint32_t>(waits.size()),
-                .pWaitSemaphores = waits.empty() ? nullptr : waits.data(),
-                .pWaitDstStageMask = waits.empty() ? nullptr : &wait_stage,
+                .pWaitSemaphores = wait_sems.empty() ? nullptr : wait_sems.data(),
+                .pWaitDstStageMask = wait_stages.empty() ? nullptr : wait_stages.data(),
                 .commandBufferCount = 1,
                 .pCommandBuffers = &copy_cb
             };

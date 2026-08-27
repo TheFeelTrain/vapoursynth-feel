@@ -221,6 +221,14 @@ is always better to have more information. Look up relevant topics such as
 GPU/Vulkan/GLSL/RDNA3 performance, shader optimization techniques, and the
 reference projects' own documentation and discussions.
 
+## Scratch files
+
+Do all scratch work (temporary scripts, probe outputs, intermediate artifacts)
+in the repo's `tmp/` folder instead of the system `/tmp`. Under the sandboxed
+shell, `/tmp` is a fresh tmpfs per shell call, so files written there are
+cleared between commands — anything a later command needs must live under the
+workspace (`tmp/`).
+
 ## Commits
 
 Do not make any commits yourself. If you want a commit or a checkpoint, stop

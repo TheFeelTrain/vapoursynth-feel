@@ -183,13 +183,22 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
         .computeFullSubgroups = VK_FALSE
     };
 
+    // Timeline semaphores (core since Vulkan 1.2): the DFTTest frame cache
+    // signals a per-generation value and lets any number of copies wait on it
+    // non-destructively (binary semaphores would let a second waiter linger).
+    VkPhysicalDeviceTimelineSemaphoreFeatures timeline_features {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
+        .pNext = &subgroup_features,
+        .timelineSemaphore = VK_TRUE
+    };
+
     const char * device_exts[] = {
         VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME
     };
 
     VkDeviceCreateInfo device_info {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = &subgroup_features,
+        .pNext = &timeline_features,
         .flags = 0,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &queue_info,

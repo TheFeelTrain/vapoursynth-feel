@@ -20,6 +20,7 @@ Run from the repository root:  python -m pytest tests/test_dfttest.py
 import ctypes
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -162,6 +163,51 @@ def test_dfttest_vspipe_pipelined_no_hang(num_streams):
     fps_line = next((line for line in result.stdout.splitlines()
                      if "vsfeel" in line and "fps" in line), None)
     assert fps_line, f"no vsfeel fps line:\n{result.stdout}\n{result.stderr}"
+
+
+@pytest.mark.parametrize("chained", [3])
+def test_dfttest_vspipe_pipelined_chained_no_hang(chained, tmp_path):
+    """Chained DFTTest instances streamed through vspipe must not deadlock
+    (regression for the timeline-semaphore frame-cache fix).
+
+    User-reported bug: chaining DFTTest instances deadlocks at 3+ ("1 or 2
+    works but 3 or higher does not"). With binary slot semaphores one pad
+    signal serves exactly one reader; when an upstream frame is processed
+    again while a previous processing of it is still in flight, the second
+    consumer's copy submit waits on an already-consumed semaphore. RADV
+    stalls the queue and the run hangs with the GPU idle.
+
+    The slots now signal a timeline semaphore to a fresh per-generation
+    value, and timeline waits are non-destructive: any number of copies may
+    wait on one value, so a second consumer can never starve. This test
+    drives the exact user scenario — N chained instances on a synthetic
+    long GRAY16 clip via vspipe's pipelined reader — and fails on a hang
+    (timeout) or a non-zero exit.
+    """
+    script = tmp_path / "chained.py"
+    script.write_text(textwrap.dedent(f"""\
+        import vapoursynth as vs
+        core = vs.core
+        core.max_cache_size = 1024 * 8
+        clip = core.std.BlankClip(format=vs.GRAY16, width=1920, height=1080, length=12000)
+        for _ in range({chained}):
+            clip = core.vsfeel.DFTTest(clip, sigma=7.0, tbsize=1)
+        clip.set_output()
+    """))
+    vspipe = shutil.which("vspipe")
+    assert vspipe, "vspipe not on PATH"
+    try:
+        result = subprocess.run(
+            [vspipe, "-p", str(script), "/dev/null"],
+            capture_output=True, text=True, timeout=45,
+            env={**os.environ, "MANGOHUD": "0"},
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("chained DFTTest vspipe run hung (timeline slot-semaphore "
+                    "regression: a consumer waited on a value the pad never "
+                    "signalled)")
+    assert result.returncode == 0, (
+        f"vspipe exited {result.returncode}:\n{result.stdout}\n{result.stderr}")
 
 
 # ---------------------------------------------------------------------------
