@@ -50,10 +50,13 @@ class FeelBackend:
     """Plugin namespace. Read by wrappers that pick the plugin themselves,
     e.g. ``vsrgtools.gauss_blur`` dispatches through ``getattr(core, backend.value)``."""
 
-    num_streams = 2
-    """Matches the stream count the vszipcl/vszipcu backends are given by
-    vs-jetpack; override per call with the plugin's own ``num_streams``
-    keyword."""
+    num_streams: int | None = None
+    """Override for the plugin's ``num_streams`` argument.
+
+    ``None`` (the default) leaves the argument unset, so every filter uses its
+    own plugin default (DFTTest/NLMeans 1, Bilateral/BM3Dv2 4). Set this to an
+    int to force one value for all filters, or pass ``num_streams=`` to a
+    wrapper for a single call — an explicit wrapper keyword always wins."""
 
     def resolve(self) -> Self:
         """Resolve this backend to itself.
@@ -65,7 +68,9 @@ class FeelBackend:
         return self
 
     def _dispatch(self, func: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> vs.VideoNode:
-        return getattr(args[0].vsfeel, func)(*args[1:], **{"num_streams": self.num_streams} | kwargs)
+        if "num_streams" not in kwargs and self.num_streams is not None:
+            kwargs = {**kwargs, "num_streams": self.num_streams}
+        return getattr(args[0].vsfeel, func)(*args[1:], **kwargs)
 
     def Bilateral(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:  # noqa: N802
         return self._dispatch("Bilateral", (clip, *args), kwargs)
