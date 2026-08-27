@@ -388,7 +388,7 @@ struct PlaneConfig {
     VkDeviceSize slot_plane_bytes {}; // pw * ph * bytes (one padded plane)
 };
 
-// per-resource stable metadata (the pool moves VK_Resource objects, so the
+// per-resource stable metadata (the pool moves DFTTestResource objects, so the
 // frame generation counter lives in a stable allocation)
 struct ResMeta {
     std::atomic<long long> frame_gen { 0 };
@@ -414,7 +414,7 @@ struct SlotState {
                                  // of repeated frame processings can wait on one value)
 };
 
-struct VK_Resource {
+struct DFTTestResource {
         int id {};
         VkBuffer staging {};
     VkDeviceMemory staging_mem {};
@@ -523,9 +523,7 @@ struct DftData {
     std::vector<SlotState> slots {};
     std::vector<std::unique_ptr<ResMeta>> res_meta {};
     std::array<PlaneConfig, 3> planes {};
-    ticket_semaphore semaphore;
-    std::vector<VK_Resource> resources;
-    std::mutex resources_lock;
+    FramePool<DFTTestResource> pool;
 
     // ---- debug timing accumulators ----
     std::atomic<uint64_t> t_acquire_ns {0}, t_upload_ns {0}, t_submit_ns {0},
@@ -548,15 +546,9 @@ struct DftData {
         VkDevice dev = device->device;
         vkDeviceWaitIdle(dev);
 
-        for (auto & resource : resources) {
+        for (auto & resource : pool.items) {
             if (resource.map) {
                 vkUnmapMemory(dev, resource.staging_mem);
-            }
-            if (resource.staging_mem) {
-                vkFreeMemory(dev, resource.staging_mem, nullptr);
-            }
-            if (resource.staging) {
-                vkDestroyBuffer(dev, resource.staging, nullptr);
             }
             if (resource.padded_mem) {
                 vkFreeMemory(dev, resource.padded_mem, nullptr);
@@ -570,21 +562,15 @@ struct DftData {
             if (resource.spatial_buf) {
                 vkDestroyBuffer(dev, resource.spatial_buf, nullptr);
             }
-            if (resource.cmd) {
-                VkCommandBuffer cbs[2] { resource.cmd, resource.cmd2 };
-                vkFreeCommandBuffers(dev, resource.pool, 2, cbs);
+            if (resource.cmd2) {
+                vkFreeCommandBuffers(dev, resource.pool, 1, &resource.cmd2);
             }
             if (!resource.cmd_pad.empty()) {
                 vkFreeCommandBuffers(dev, resource.pool,
                     static_cast<uint32_t>(resource.cmd_pad.size()),
                     resource.cmd_pad.data());
             }
-            if (resource.pool) {
-                vkDestroyCommandPool(dev, resource.pool, nullptr);
-            }
-            if (resource.fence) {
-                vkDestroyFence(dev, resource.fence, nullptr);
-            }
+            destroy_common(dev, resource);
         }
 
         for (auto & st : slots) {
@@ -799,7 +785,7 @@ static PushConstants base_pc(const DftData & d) {
 // shared slot (pad_slot_pipeline) or, when the op has no slot, straight into
 // the resource's padded buffer (pad_direct_pipeline).
 static void record_one_pad_dispatch(
-    VkCommandBuffer cmd, const DftData & d, const VK_Resource & resource,
+    VkCommandBuffer cmd, const DftData & d, const DFTTestResource & resource,
     const SlotOp & op) {
 
     const auto & cfg = d.planes[op.plane];
@@ -837,7 +823,7 @@ static void record_one_pad_dispatch(
 // dispatch per pad op. Used by the GPU bench (debug); in the normal flow
 // each pad op records and submits its own command buffer at claim time.
 static std::optional<std::string> record_pad_cb(
-    const DftData & d, VK_Resource & resource, const std::vector<SlotOp> & ops) {
+    const DftData & d, DFTTestResource & resource, const std::vector<SlotOp> & ops) {
 
     VkCommandBuffer cmd = resource.cmd_pad[0];
 
@@ -872,7 +858,7 @@ static std::optional<std::string> record_pad_cb(
 // commit — makes a backward semaphore dependency on the queue impossible:
 // every reader's copy submit is queued after this pad submit.
 static bool submit_pad_op(
-    const DftData & d, VK_Resource & resource, const SlotOp & op) {
+    const DftData & d, DFTTestResource & resource, const SlotOp & op) {
 
     const VkDevice dev = d.device->device;
     VkCommandBuffer cmd = resource.cmd_pad[op.plane * d.tw + op.t];
@@ -892,30 +878,15 @@ static bool submit_pad_op(
         return false;
     }
 
-    std::lock_guard qlock(*resource.queue_lock);
-    VkSubmitInfo si {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .pNext = nullptr,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &cmd
-    };
-    VkTimelineSemaphoreSubmitInfo tsi {
-        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
-        .pNext = nullptr,
-        .waitSemaphoreValueCount = 0,
-        .pWaitSemaphoreValues = nullptr,
-        .signalSemaphoreValueCount = 0,
-        .pSignalSemaphoreValues = nullptr
-    };
     if (op.slot >= 0) {
         const auto & st = d.slots[op.plane * d.slot_count + op.slot];
-        tsi.signalSemaphoreValueCount = 1;
-        tsi.pSignalSemaphoreValues = &st.signal;
-        si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &st.sem;
-        si.pNext = &tsi;
+        // Signals the slot's timeline semaphore to st.signal (non-destructive:
+        // any number of reader copies may wait on the same value).
+        return submit_timeline(dev, resource.queue, resource.queue_lock, cmd,
+            {}, {}, {}, st.sem, st.signal, VK_NULL_HANDLE) == VK_SUCCESS;
     }
-    return vkQueueSubmit(resource.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS;
+    return submit_timeline(dev, resource.queue, resource.queue_lock, cmd,
+        {}, {}, {}, VK_NULL_HANDLE, 0, VK_NULL_HANDLE) == VK_SUCCESS;
 }
 
 // Records the per-frame D2D copy command buffer (resource.cmd2): every slot
@@ -923,7 +894,7 @@ static bool submit_pad_op(
 // the slots (written by pads that may have run on another queue), so the
 // submit carrying this buffer waits on the slot semaphores.
 static std::optional<std::string> record_copy_cb(
-    const DftData & d, VK_Resource & resource, const std::vector<SlotOp> & ops) {
+    const DftData & d, DFTTestResource & resource, const std::vector<SlotOp> & ops) {
 
     VkCommandBuffer cmd = resource.cmd2;
 
@@ -971,7 +942,7 @@ static std::optional<std::string> record_copy_cb(
 
 // Records the pre-recorded fused + col2im command buffer (resource.cmd).
 static std::optional<std::string> record_fused_col2im_cb(
-    const DftData & d, VK_Resource & resource,
+    const DftData & d, DFTTestResource & resource,
     bool with_fused, bool with_col2im) {
 
     const VkDevice dev = d.device->device;
@@ -1105,18 +1076,15 @@ static const VSFrame *VS_CC DftGetFrame(
         // included — are fully done, so the overwrite never races a reader's
         // copy, and destroying the timeline semaphore is safe (all its waits
         // have resolved). No host fence waits anywhere: no deadlocks.
-        d->semaphore.acquire();
+        d->pool.semaphore.acquire();
         auto t1 = std::chrono::steady_clock::now();
-        d->resources_lock.lock();
-        auto resource = std::move(d->resources.back());
-        d->resources.pop_back();
-        d->resources_lock.unlock();
+        d->pool.lock.lock();
+        auto resource = std::move(d->pool.items.back());
+        d->pool.items.pop_back();
+        d->pool.lock.unlock();
 
         auto set_error = [&](const std::string & error_message) {
-            d->resources_lock.lock();
-            d->resources.push_back(std::move(resource));
-            d->resources_lock.unlock();
-            d->semaphore.release();
+            d->pool.give_back(std::move(resource));
             vsapi->setFilterError(("DFTTest: " + error_message).c_str(), frameCtx);
             for (int t = 0; t < tw; ++t) {
                 vsapi->freeFrame(src[t]);
@@ -1134,8 +1102,6 @@ static const VSFrame *VS_CC DftGetFrame(
         // implies those frames — copies included — are fully done.
         const long long my_gen =
             d->res_meta[resource.id]->frame_gen.fetch_add(1, std::memory_order_relaxed) + 1;
-
-        checkVK(vkResetFences(dev, 1, &resource.fence));
 
         if (dfttest_trace()) {
             fprintf(stderr, "[dfttest-trace] n=%d res=%d gen=%lld start\n",
@@ -1413,7 +1379,6 @@ static const VSFrame *VS_CC DftGetFrame(
         }
 
         {
-            std::lock_guard lock(*resource.queue_lock);
             std::vector<VkPipelineStageFlags> wait_stages(waits.size(),
                 VK_PIPELINE_STAGE_TRANSFER_BIT);
             std::vector<VkSemaphore> wait_sems(waits.size());
@@ -1422,41 +1387,17 @@ static const VSFrame *VS_CC DftGetFrame(
                 wait_sems[i] = waits[i].first;
                 wait_vals[i] = waits[i].second;
             }
-            VkTimelineSemaphoreSubmitInfo tsi {
-                .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
-                .pNext = nullptr,
-                .waitSemaphoreValueCount = static_cast<uint32_t>(waits.size()),
-                .pWaitSemaphoreValues = wait_vals.empty() ? nullptr : wait_vals.data(),
-                .signalSemaphoreValueCount = 0,
-                .pSignalSemaphoreValues = nullptr
-            };
-            VkCommandBuffer copy_cb = resource.cmd2;
-            VkSubmitInfo si {
-                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                .pNext = &tsi,
-                .waitSemaphoreCount = static_cast<uint32_t>(waits.size()),
-                .pWaitSemaphores = wait_sems.empty() ? nullptr : wait_sems.data(),
-                .pWaitDstStageMask = wait_stages.empty() ? nullptr : wait_stages.data(),
-                .commandBufferCount = 1,
-                .pCommandBuffers = &copy_cb
-            };
-
-            checkVK(vkQueueSubmit(resource.queue, 1, &si, VK_NULL_HANDLE));
+            checkVK(submit_timeline(dev, resource.queue, resource.queue_lock,
+                resource.cmd2, wait_sems, wait_vals, wait_stages,
+                VK_NULL_HANDLE, 0, VK_NULL_HANDLE));
             if (dfttest_trace()) {
                 fprintf(stderr, "[dfttest-trace]   n=%d res=%d copy submitted\n", n, resource.id);
             }
         }
 
         {
-            std::lock_guard lock(*resource.queue_lock);
-            VkCommandBuffer cb = resource.cmd;
-            VkSubmitInfo si {
-                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                .pNext = nullptr,
-                .commandBufferCount = 1,
-                .pCommandBuffers = &cb
-            };
-            checkVK(vkQueueSubmit(resource.queue, 1, &si, resource.fence));
+            checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
+                resource.cmd, resource.fence));
             if (dfttest_trace()) {
                 fprintf(stderr, "[dfttest-trace]   n=%d res=%d fused submitted\n", n, resource.id);
             }
@@ -1538,10 +1479,7 @@ static const VSFrame *VS_CC DftGetFrame(
             }
         }
 
-        d->resources_lock.lock();
-        d->resources.push_back(std::move(resource));
-        d->resources_lock.unlock();
-        d->semaphore.release();
+        d->pool.give_back(std::move(resource));
 
         auto t6 = std::chrono::steady_clock::now();
         d->t_acquire_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
@@ -2217,8 +2155,8 @@ static void VS_CC DftCreate(
     const VkDeviceSize spatial_size = std::max<VkDeviceSize>(
         d->spatial_total * sizeof(float), min_size);
 
-    d->semaphore.current.store(effective_streams - 1, std::memory_order::relaxed);
-    d->resources.reserve(effective_streams);
+    d->pool.semaphore.current.store(effective_streams - 1, std::memory_order::relaxed);
+    d->pool.reserve(effective_streams);
 
     // ---- frame-cache slot buffer (semaphores are created per generation) ----
     {
@@ -2250,7 +2188,7 @@ static void VS_CC DftCreate(
         d->num_streams, static_cast<int>(d->device->queue_count));
 
     for (int i = 0; i < effective_streams; ++i) {
-        VK_Resource resource;
+        DFTTestResource resource;
 
         {
             VkBufferCreateInfo buffer_info {
@@ -2468,7 +2406,7 @@ static void VS_CC DftCreate(
             return set_error(*err);
         }
 
-        d->resources.push_back(std::move(resource));
+        d->pool.push(std::move(resource));
     }
 
     VSFilterDependency deps[1] = {

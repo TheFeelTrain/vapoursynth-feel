@@ -193,9 +193,7 @@ struct NLMeansData {
     VkDeviceMemory tables_mem {};
     VkDeviceSize aq_offset {};
 
-    ticket_semaphore semaphore;
-    std::vector<NLStream> streams;
-    std::mutex streams_lock;
+    FramePool<NLStream> pool;
 
     bool gputrace {};
 
@@ -206,10 +204,8 @@ struct NLMeansData {
         VkDevice dev = device->device;
         vkDeviceWaitIdle(dev);
 
-        for (auto & st : streams) {
+        for (auto & st : pool.items) {
             if (st.staging_map) vkUnmapMemory(dev, st.staging_mem);
-            if (st.staging_mem) vkFreeMemory(dev, st.staging_mem, nullptr);
-            if (st.staging) vkDestroyBuffer(dev, st.staging, nullptr);
             if (st.tables_map) vkUnmapMemory(dev, st.tables_dev_mem);
             if (st.tables_dev_mem) vkFreeMemory(dev, st.tables_dev_mem, nullptr);
             if (st.tables_dev) vkDestroyBuffer(dev, st.tables_dev, nullptr);
@@ -222,10 +218,8 @@ struct NLMeansData {
             if (st.u4a) vkDestroyBuffer(dev, st.u4a, nullptr);
             if (st.u5_mem) vkFreeMemory(dev, st.u5_mem, nullptr);
             if (st.u5) vkDestroyBuffer(dev, st.u5, nullptr);
-            if (st.cmd) vkFreeCommandBuffers(dev, st.pool, 1, &st.cmd);
-            if (st.pool) vkDestroyCommandPool(dev, st.pool, nullptr);
-            if (st.fence) vkDestroyFence(dev, st.fence, nullptr);
             if (st.ts_query) vkDestroyQueryPool(dev, st.ts_query, nullptr);
+            destroy_common(dev, st);
         }
         if (tables_mem) vkFreeMemory(dev, tables_mem, nullptr);
         if (tables_buf) vkDestroyBuffer(dev, tables_buf, nullptr);
@@ -510,11 +504,7 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         &d->vi->format, d->vi->width, d->vi->height, fr.data(), pl.data(),
         frames[m], core);
 
-    d->semaphore.acquire();
-    d->streams_lock.lock();
-    auto stream = std::move(d->streams.back());
-    d->streams.pop_back();
-    d->streams_lock.unlock();
+    auto stream = d->pool.take();
 
     auto cleanup_frames = [&] {
         for (int i = 0; i < count; ++i) {
@@ -527,10 +517,7 @@ static const VSFrame *VS_CC NLMeansGetFrame(
 
     auto set_error = [&](const std::string & error_message) {
         fprintf(stderr, "[nlmeans-ERROR] n=%d: %s\n", n, error_message.c_str());
-        d->streams_lock.lock();
-        d->streams.push_back(std::move(stream));
-        d->streams_lock.unlock();
-        d->semaphore.release();
+        d->pool.give_back(std::move(stream));
         vsapi->setFilterError(("NLMeans: " + error_message).c_str(), frameCtx);
         vsapi->freeFrame(dst);
         cleanup_frames();
@@ -787,25 +774,9 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         return set_error("vkEndCommandBuffer failed");
     }
 
-    {
-        std::lock_guard lock(*stream.queue_lock);
-        if (vkResetFences(dev, 1, &stream.fence) != VK_SUCCESS) {
-            return set_error("vkResetFences failed");
-        }
-        VkSubmitInfo submit_info {
-            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .pNext = nullptr,
-            .waitSemaphoreCount = 0,
-            .pWaitSemaphores = nullptr,
-            .pWaitDstStageMask = nullptr,
-            .commandBufferCount = 1,
-            .pCommandBuffers = &stream.cmd,
-            .signalSemaphoreCount = 0,
-            .pSignalSemaphores = nullptr
-        };
-        if (vkQueueSubmit(stream.queue, 1, &submit_info, stream.fence) != VK_SUCCESS) {
-            return set_error("vkQueueSubmit failed");
-        }
+    if (VkResult r = submit_with_fence(dev, stream.queue, stream.queue_lock,
+            stream.cmd, stream.fence); r != VK_SUCCESS) {
+        return set_error("vkQueueSubmit failed");
     }
     mark(t_sub);
 
@@ -920,10 +891,7 @@ release_cache(d, stream, n);
 
     cleanup_frames();
 
-    d->streams_lock.lock();
-    d->streams.push_back(std::move(stream));
-    d->streams_lock.unlock();
-    d->semaphore.release();
+    d->pool.give_back(std::move(stream));
 
     return dst;
 }
@@ -1407,8 +1375,8 @@ static void VS_CC NLMeansCreate(
     }
 
     // shared slot pool of padded channel-layer tiles + per-stream resources
-    d->semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
-    d->streams.reserve(d->num_streams);
+    d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
+    d->pool.reserve(d->num_streams);
 
     uint32_t num_queues = std::min(
         d->num_streams, static_cast<int>(d->device->queue_count));
@@ -1679,7 +1647,7 @@ static void VS_CC NLMeansCreate(
         st.queue = d->device->queues[0].queue;  // TEMP: single-queue test
         st.queue_lock = d->device->queues[0].lock.get();  // TEMP
 
-        d->streams.push_back(std::move(st));
+        d->pool.push(std::move(st));
     }
 
     NLMeansData * data = d.release();

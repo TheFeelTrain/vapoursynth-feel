@@ -108,7 +108,6 @@ struct BM3DData {
     VkDeviceSize res_size_per_plane {};  // floats per plane in the res buffer
     int nframes {};
 
-    ticket_semaphore semaphore;
     std::vector<VkSemaphore> timelines;
     // Per-frame-keyed caches of the res estimate stacks and the source
     // frames. Slots are reserved all-or-nothing for the duration of a frame
@@ -126,8 +125,7 @@ struct BM3DData {
     std::condition_variable cache_cv;
     std::array<int, 64> frame_stream {};   // stream index that processed frame n (mod 64)
     std::array<uint64_t, 64> frame_seq {}; // monotonic timeline value frame n signals
-    std::vector<Bm3dStream> streams;
-    std::mutex streams_lock;
+    FramePool<Bm3dStream> pool;
 
     ~BM3DData() {
         if (!device) {
@@ -135,18 +133,14 @@ struct BM3DData {
         }
         VkDevice dev = device->device;
         vkDeviceWaitIdle(dev);
-        for (auto & s : streams) {
+        for (auto & s : pool.items) {
             if (s.map) vkUnmapMemory(dev, s.staging_mem);
-            if (s.staging_mem) vkFreeMemory(dev, s.staging_mem, nullptr);
-            if (s.staging) vkDestroyBuffer(dev, s.staging, nullptr);
             if (s.dst_map) vkUnmapMemory(dev, s.dst_mem);
             if (s.dst_mem) vkFreeMemory(dev, s.dst_mem, nullptr);
             if (s.dst_buf) vkDestroyBuffer(dev, s.dst_buf, nullptr);
-            if (s.cmd) vkFreeCommandBuffers(dev, s.pool, 1, &s.cmd);
             if (s.cmd_agg) vkFreeCommandBuffers(dev, s.pool, 1, &s.cmd_agg);
-            if (s.pool) vkDestroyCommandPool(dev, s.pool, nullptr);
-            if (s.fence) vkDestroyFence(dev, s.fence, nullptr);
             if (s.timeline) vkDestroySemaphore(dev, s.timeline, nullptr);
+            destroy_common(dev, s);
         }
         if (res_mem) vkFreeMemory(dev, res_mem, nullptr);
         if (res_buf) vkDestroyBuffer(dev, res_buf, nullptr);
@@ -728,17 +722,13 @@ static const VSFrame *VS_CC BM3DGetFrame(
             dst = vsapi->newVideoFrame(&d->vi->format, d->vi->width, d->vi->height, nullptr, core);
         }
 
-        d->semaphore.acquire();
+        auto stream = d->pool.take();
         if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d acquired\n", n);
-        d->streams_lock.lock();
-        auto stream = std::move(d->streams.back());
-        d->streams.pop_back();
         const int my_stream = stream.stream_id;
         d->frame_stream[n % 64] = my_stream;
         const uint64_t my_seq = stream.seq++;
         d->frame_seq[n % 64] = my_seq;
         if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d stream=%d\n", n, my_stream);
-        d->streams_lock.unlock();
 
         // reserve this frame's cache slots (blocks only when the working set
         // exceeds the cache, e.g. on seeks; never holds a stream while waiting)
@@ -754,10 +744,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
             };
             vkSignalSemaphore(d->device->device, &signal_info);
             release_cache(d, stream, n);
-            d->streams_lock.lock();
-            d->streams.push_back(std::move(stream));
-            d->streams_lock.unlock();
-            d->semaphore.release();
+            d->pool.give_back(std::move(stream));
             vsapi->setFilterError(("BM3D: " + error_message).c_str(), frameCtx);
             vsapi->freeFrame(dst);
             return nullptr;
@@ -896,42 +883,16 @@ static const VSFrame *VS_CC BM3DGetFrame(
             checkVK(vkWaitSemaphores(dev, &wait_info, UINT64_MAX));
         }
 
-        {
-            std::lock_guard lock(*stream.queue_lock);
-
-            checkVK(vkResetFences(dev, 1, &stream.fence));
-
-            VkTimelineSemaphoreSubmitInfo src_timeline {
-                .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
-                .pNext = nullptr,
-                .waitSemaphoreValueCount = 0,
-                .pWaitSemaphoreValues = nullptr,
-                .signalSemaphoreValueCount = 1,
-                .pSignalSemaphoreValues = &my_seq
-            };
-            VkSubmitInfo submit_info {
-                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                .pNext = &src_timeline,
-                .waitSemaphoreCount = 0,
-                .pWaitSemaphores = nullptr,
-                .pWaitDstStageMask = nullptr,
-                .commandBufferCount = 1,
-                .pCommandBuffers = &stream.cmd,
-                .signalSemaphoreCount = 1,
-                .pSignalSemaphores = &stream.timeline
-            };
-            /* no fence here: the fence is signalled by the aggregation submit on
+        /* no fence here: the fence is signalled by the aggregation submit on
                the same queue, and a fence must not be attached to a second
                submission while a first one still holds it */
-            checkVK(vkQueueSubmit(stream.queue, 1, &submit_info, VK_NULL_HANDLE));
-        }
+            checkVK(submit_timeline(dev, stream.queue, stream.queue_lock, stream.cmd,
+                {}, {}, {}, stream.timeline, my_seq, VK_NULL_HANDLE));
 
         record_bm3d_agg(d, stream, n);
         if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d agg recorded\n", n);
 
         {
-            std::lock_guard lock(*stream.queue_lock);
-
             // wait on our own kernels (the timeline is signalled by the kernel
             // submit) and on the frames that computed the aggregation slots.
             // The res waits stay device-side: a host-side wait here would let
@@ -944,26 +905,9 @@ static const VSFrame *VS_CC BM3DGetFrame(
             agg_values.insert(agg_values.end(), res_values.begin(), res_values.end());
             agg_stages.insert(agg_stages.end(), res_stages.begin(), res_stages.end());
 
-            VkTimelineSemaphoreSubmitInfo agg_timeline {
-                .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
-                .pNext = nullptr,
-                .waitSemaphoreValueCount = static_cast<uint32_t>(agg_values.size()),
-                .pWaitSemaphoreValues = agg_values.data(),
-                .signalSemaphoreValueCount = 0,
-                .pSignalSemaphoreValues = nullptr
-            };
-            VkSubmitInfo submit_info {
-                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                .pNext = &agg_timeline,
-                .waitSemaphoreCount = static_cast<uint32_t>(agg_waits.size()),
-                .pWaitSemaphores = agg_waits.data(),
-                .pWaitDstStageMask = agg_stages.data(),
-                .commandBufferCount = 1,
-                .pCommandBuffers = &stream.cmd_agg,
-                .signalSemaphoreCount = 0,
-                .pSignalSemaphores = nullptr
-            };
-            checkVK(vkQueueSubmit(stream.queue, 1, &submit_info, stream.fence));
+            checkVK(submit_timeline(dev, stream.queue, stream.queue_lock,
+                stream.cmd_agg, agg_waits, agg_values, agg_stages,
+                VK_NULL_HANDLE, 0, stream.fence));
         }
 
         checkVK(vkWaitForFences(dev, 1, &stream.fence, VK_TRUE, UINT64_MAX));
@@ -1016,10 +960,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
             copy_stream_read(dstp, h_bufferp, bytes);
         }
 
-        d->streams_lock.lock();
-        d->streams.push_back(std::move(stream));
-        d->streams_lock.unlock();
-        d->semaphore.release();
+        d->pool.give_back(std::move(stream));
 
         return dst;
     }
@@ -1373,8 +1314,8 @@ static void VS_CC BM3DCreate(
     }
 
     // streams
-    d->semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
-    d->streams.reserve(d->num_streams);
+    d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
+    d->pool.reserve(d->num_streams);
     d->timelines.resize(d->num_streams);
 
     uint32_t num_queues = std::min(d->num_streams, static_cast<int>(d->device->queue_count));
@@ -1527,7 +1468,7 @@ static void VS_CC BM3DCreate(
         stream.queue_lock = d->device->queues[i % num_queues].lock.get();
         stream.stream_id = i;
 
-        d->streams.push_back(std::move(stream));
+        d->pool.push(std::move(stream));
     }
 
     d->src_frame.assign(d->src_ring, -1);

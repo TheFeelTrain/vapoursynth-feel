@@ -44,7 +44,7 @@ struct PlaneConfig {
     uint32_t grid_y {};
 };
 
-struct VK_Resource {
+struct BilateralResource {
     VkBuffer staging {};
     VkDeviceMemory staging_mem {};
     VkCommandPool pool {};
@@ -76,9 +76,7 @@ struct BilateralData {
     VkDeviceSize download_total {};
     bool need_fill {};
     std::array<PlaneConfig, 3> planes {};
-    ticket_semaphore semaphore;
-    std::vector<VK_Resource> resources;
-    std::mutex resources_lock;
+    FramePool<BilateralResource> pool;
 
     ~BilateralData() {
         if (!device) {
@@ -87,25 +85,11 @@ struct BilateralData {
         VkDevice dev = device->device;
         vkDeviceWaitIdle(dev);
 
-        for (auto & resource : resources) {
+        for (auto & resource : pool.items) {
             if (resource.map) {
                 vkUnmapMemory(dev, resource.staging_mem);
             }
-            if (resource.staging_mem) {
-                vkFreeMemory(dev, resource.staging_mem, nullptr);
-            }
-            if (resource.staging) {
-                vkDestroyBuffer(dev, resource.staging, nullptr);
-            }
-            if (resource.cmd) {
-                vkFreeCommandBuffers(dev, resource.pool, 1, &resource.cmd);
-            }
-            if (resource.pool) {
-                vkDestroyCommandPool(dev, resource.pool, nullptr);
-            }
-            if (resource.fence) {
-                vkDestroyFence(dev, resource.fence, nullptr);
-            }
+            destroy_common(dev, resource);
         }
 
         VkPipeline destroyed_pipelines[3] {};
@@ -268,7 +252,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
 // different planes can overlap on the GPU). The kernel reads its input and
 // writes its output straight from/to the staging buffer.
 static std::optional<std::string> record_command_buffer(
-    const BilateralData & d, VK_Resource & resource) {
+    const BilateralData & d, BilateralResource & resource) {
 
     VkDevice dev = d.device->device;
 
@@ -378,21 +362,14 @@ static const VSFrame *VS_CC BilateralGetFrame(
             };
 
             auto t_acq0 = now_us();
-            d->semaphore.acquire();
+            auto resource = d->pool.take();
             t_acq += now_us() - t_acq0;
-            d->resources_lock.lock();
-            auto resource = std::move(d->resources.back());
-            d->resources.pop_back();
-            d->resources_lock.unlock();
             int inf = t_inf.fetch_add(1) + 1;
             int peak = t_peak.load();
             while (inf > peak && !t_peak.compare_exchange_weak(peak, inf)) {}
 
         auto set_error = [&](const std::string & error_message) {
-            d->resources_lock.lock();
-            d->resources.push_back(std::move(resource));
-            d->resources_lock.unlock();
-            d->semaphore.release();
+            d->pool.give_back(std::move(resource));
             vsapi->setFilterError(("BilateralVK: " + error_message).c_str(), frameCtx);
             if (d->ref_node) {
                 vsapi->freeFrame(ref);
@@ -459,26 +436,8 @@ static const VSFrame *VS_CC BilateralGetFrame(
             checkVK(vkFlushMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
         }
 
-        {
-            std::lock_guard lock(*resource.queue_lock);
-
-            checkVK(vkResetFences(dev, 1, &resource.fence));
-
-            VkSubmitInfo submit_info {
-                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                .pNext = nullptr,
-                .waitSemaphoreCount = 0,
-                .pWaitSemaphores = nullptr,
-                .pWaitDstStageMask = nullptr,
-                .commandBufferCount = 1,
-                .pCommandBuffers = &resource.cmd,
-                .signalSemaphoreCount = 0,
-                .pSignalSemaphores = nullptr
-            };
-
-            checkVK(vkQueueSubmit(resource.queue, 1, &submit_info, resource.fence));
-        }
-
+        checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
+            resource.cmd, resource.fence));
         mark(t_sub);
 
         checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
@@ -532,10 +491,7 @@ static const VSFrame *VS_CC BilateralGetFrame(
         t_nf.fetch_add(1);
         dump();
 
-        d->resources_lock.lock();
-        d->resources.push_back(std::move(resource));
-        d->resources_lock.unlock();
-        d->semaphore.release();
+        d->pool.give_back(std::move(resource));
         }
 
         if (d->ref_node) {
@@ -987,14 +943,14 @@ static void VS_CC BilateralCreate(
     const VkDeviceSize staging_size = std::max(upload_total + download_total, 2 * min_size);
 
     // Resources
-    d->semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
-    d->resources.reserve(d->num_streams);
+    d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
+    d->pool.reserve(d->num_streams);
 
     uint32_t num_queues = std::min(
         d->num_streams, static_cast<int>(d->device->queue_count));
 
     for (int i = 0; i < d->num_streams; ++i) {
-        VK_Resource resource;
+        BilateralResource resource;
 
         {
             VkBufferCreateInfo buffer_info {
@@ -1121,7 +1077,7 @@ static void VS_CC BilateralCreate(
             return set_error(*err);
         }
 
-        d->resources.push_back(std::move(resource));
+        d->pool.push(std::move(resource));
     }
 
     VSFilterDependency deps[2] = {{d->node, rpStrictSpatial}};

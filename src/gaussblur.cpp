@@ -62,7 +62,7 @@ struct PlaneConfig {
     uint32_t wt_base {};             // float element offset into the weights buffer
 };
 
-struct VK_Resource {
+struct GaussBlurResource {
     VkBuffer staging {};
     VkDeviceMemory staging_mem {};
     VkBuffer tmp_buf {};         // device-local float intermediate (large path)
@@ -105,9 +105,7 @@ struct GaussData {
     VkDeviceSize tmp_total {};
     bool need_fill {};
     std::array<PlaneConfig, 3> planes {};
-    ticket_semaphore semaphore;
-    std::vector<VK_Resource> resources;
-    std::mutex resources_lock;
+    FramePool<GaussBlurResource> pool;
 
     ~GaussData() {
         if (!device) {
@@ -116,15 +114,9 @@ struct GaussData {
         VkDevice dev = device->device;
         vkDeviceWaitIdle(dev);
 
-        for (auto & resource : resources) {
+        for (auto & resource : pool.items) {
             if (resource.map) {
                 vkUnmapMemory(dev, resource.staging_mem);
-            }
-            if (resource.staging_mem) {
-                vkFreeMemory(dev, resource.staging_mem, nullptr);
-            }
-            if (resource.staging) {
-                vkDestroyBuffer(dev, resource.staging, nullptr);
             }
             if (resource.tmp_mem) {
                 vkFreeMemory(dev, resource.tmp_mem, nullptr);
@@ -132,15 +124,7 @@ struct GaussData {
             if (resource.tmp_buf) {
                 vkDestroyBuffer(dev, resource.tmp_buf, nullptr);
             }
-            if (resource.cmd) {
-                vkFreeCommandBuffers(dev, resource.pool, 1, &resource.cmd);
-            }
-            if (resource.pool) {
-                vkDestroyCommandPool(dev, resource.pool, nullptr);
-            }
-            if (resource.fence) {
-                vkDestroyFence(dev, resource.fence, nullptr);
-            }
+            destroy_common(dev, resource);
         }
 
         if (wt_map) {
@@ -331,7 +315,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
 // writes its output straight from/to the staging buffer; the large path also
 // uses a float tmp region within the same buffer.
 static std::optional<std::string> record_command_buffer(
-    const GaussData & d, VK_Resource & resource) {
+    const GaussData & d, GaussBlurResource & resource) {
 
     VkDevice dev = d.device->device;
 
@@ -457,17 +441,10 @@ static const VSFrame *VS_CC GaussGetFrame(
         VSFrame * dst = vsapi->newVideoFrame2(
             &d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
 
-        d->semaphore.acquire();
-        d->resources_lock.lock();
-        auto resource = std::move(d->resources.back());
-        d->resources.pop_back();
-        d->resources_lock.unlock();
+        auto resource = d->pool.take();
 
         auto set_error = [&](const std::string & error_message) {
-            d->resources_lock.lock();
-            d->resources.push_back(std::move(resource));
-            d->resources_lock.unlock();
-            d->semaphore.release();
+            d->pool.give_back(std::move(resource));
             vsapi->setFilterError(("GaussBlur: " + error_message).c_str(), frameCtx);
             vsapi->freeFrame(src);
             return nullptr;
@@ -517,25 +494,8 @@ static const VSFrame *VS_CC GaussGetFrame(
             checkVK(vkFlushMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
         }
 
-        {
-            std::lock_guard lock(*resource.queue_lock);
-
-            checkVK(vkResetFences(dev, 1, &resource.fence));
-
-            VkSubmitInfo submit_info {
-                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                .pNext = nullptr,
-                .waitSemaphoreCount = 0,
-                .pWaitSemaphores = nullptr,
-                .pWaitDstStageMask = nullptr,
-                .commandBufferCount = 1,
-                .pCommandBuffers = &resource.cmd,
-                .signalSemaphoreCount = 0,
-                .pSignalSemaphores = nullptr
-            };
-
-            checkVK(vkQueueSubmit(resource.queue, 1, &submit_info, resource.fence));
-        }
+        checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
+            resource.cmd, resource.fence));
 
         checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
 
@@ -576,10 +536,7 @@ static const VSFrame *VS_CC GaussGetFrame(
                 static_cast<size_t>(cfg.width * d->elem_bytes) * height);
         }
 
-        d->resources_lock.lock();
-        d->resources.push_back(std::move(resource));
-        d->resources_lock.unlock();
-        d->semaphore.release();
+        d->pool.give_back(std::move(resource));
 
         vsapi->freeFrame(src);
 
@@ -1077,14 +1034,14 @@ static void VS_CC GaussCreate(
     const VkDeviceSize tmp_size = std::max(tmp_total, min_size);
 
     // Resources
-    d->semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
-    d->resources.reserve(d->num_streams);
+    d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
+    d->pool.reserve(d->num_streams);
 
     uint32_t num_queues = std::min(
         d->num_streams, static_cast<int>(d->device->queue_count));
 
     for (int i = 0; i < d->num_streams; ++i) {
-        VK_Resource resource;
+        GaussBlurResource resource;
 
         {
             VkBufferCreateInfo buffer_info {
@@ -1263,7 +1220,7 @@ static void VS_CC GaussCreate(
             return set_error(*err);
         }
 
-        d->resources.push_back(std::move(resource));
+        d->pool.push(std::move(resource));
     }
 
     VSFilterDependency deps[1] = {{d->node, rpStrictSpatial}};
