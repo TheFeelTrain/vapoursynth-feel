@@ -140,6 +140,54 @@ General lesson: make every branch that is fixed per invocation (filter type,
 bit depth, window shape) a specialization constant or `#if` so the shader
 compiles to its cheapest form.
 
+## Shared plumbing (src/vsfeel.h)
+
+All filters share an inline (zero-overhead, C++20) plumbing layer in
+`src/vsfeel.h`. New filters must build on it — do not re-invent this wheel:
+
+- **`FramePool<T>`** — per-instance pool of per-frame resources: a
+  `ticket_semaphore` (caps in-flight frames), `std::vector<T> items`, and a
+  `std::mutex lock`. `take()` blocks on the semaphore then pops the LIFO
+  under the lock; `give_back(t)` pushes under the lock and releases the
+  ticket. Init before first use: set `pool.semaphore.current` to
+  `num_streams - 1`, `pool.reserve(num_streams)`, `pool.push(...)` one per
+  created resource. Every filter's per-frame `struct` lives in such a pool;
+  take at frame start, give back at frame end **and on every error path**
+  (the `set_error` lambda pattern). dfttest inlines the take sequence so it
+  can timestamp between acquire and lock; `pool.take()` suffices otherwise.
+- **`destroy_common(dev, r)`** — frees the shared fields: cmd buffer, command
+  pool, fence, staging buffer + memory. The filter unmaps mapped pointers
+  *before* and destroys its filter-specific objects (extra command buffers,
+  timeline semaphores, query pools, temporaries) on either side of the call.
+- **`submit_with_fence(dev, queue, *qlock, cb, fence)`** and
+  **`submit_timeline(dev, queue, *qlock, cb, waits, values, stages,
+  signal_sem, signal_value, fence)`** — every `vkQueueSubmit` must go through
+  these: they take the queue's lock (shared `std::mutex` on every `VK_Queue`
+  — all submits to a shared device/queue must serialize on it) and reset the
+  fence inside the lock. `submit_timeline` takes equal-sized wait
+  vectors (semaphore, value, stage) and optionally signals a timeline value;
+  waits are non-destructive so any number of consumers can wait on one signal.
+- **`trace_on(env)`** — env-gated debug flags; keep one env name per filter
+  (`VSFEEL_DFTTEST_TRACE`, `BM3D_TRACE`, ...).
+
+**ODR rule (learned the hard way):** a filter-local struct used to
+instantiate a shared template must have a **unique name per filter**
+(`DFTTestResource`, `GaussBlurResource`, `BilateralResource`, `NLStream`,
+`Bm3dStream` — never `VK_Resource`). Same mangled name + different
+`sizeof` across TUs lets the linker COMDAT-fold one TU's instantiation over
+the others, mis-striding the pool's vector and corrupting in-flight
+resources.
+
+**What stays per-filter:** frame caches (temporal three: DFTTest slot cache,
+NLMeans tile cache, BM3D ring/result stacks), shaders + launch config, sync
+choreography (pad→copy→fused ordering, host vs device waits), queue/stream
+assignment, cache sizing. `num_queues = min(num_streams, queue_count)`,
+`resource.queue = device->queues[i % num_queues]`; in-flight depth is
+`num_streams` (DFTTest uses `max(num_streams, 8)`).
+
+When porting a new filter, model the stateless path on gaussblur/bilateral
+(fence-only, no cache) and the cached/timeline path on bm3d.
+
 ## Porting discipline
 
 Lessons from porting DFTTest and NLMeans that go beyond the method above:

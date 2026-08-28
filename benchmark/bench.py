@@ -246,7 +246,7 @@ FILTERS: dict[str, FilterSpec] = {
     ),
     "dfttest": FilterSpec(
         title="DFTTest",
-        default_frames=1000,
+        default_frames=3000,
         args=[
             Arg("ftype", "--dfttest-ftype", "dfttest_ftype", int, 0),
             Arg("sigma", "--dfttest-sigma", "dfttest_sigma", float, 8.0),
@@ -268,7 +268,7 @@ FILTERS: dict[str, FilterSpec] = {
     ),
     "nlmeans": FilterSpec(
         title="NLMeans",
-        default_frames=1000,
+        default_frames=3000,
         args=[
             Arg("d", "--nlmeans-d", "nlmeans_d", int, 2),
             Arg("a", "--nlmeans-a", "nlmeans_a", int, 2),

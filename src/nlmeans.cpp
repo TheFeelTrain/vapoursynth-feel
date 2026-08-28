@@ -87,6 +87,7 @@ struct Variant {
 };
 
 struct NLStream {
+    int stream_id {-1};
     // upload staging: room for the worst case of new tiles in one frame,
     // plus the per-frame slot-base table at the tail
     VkBuffer staging {};
@@ -120,12 +121,22 @@ struct NLStream {
     std::vector<bool> upload_new;    // true where this frame must fill a slot
     int new_tiles {};                // tiles shipped to the pool this frame
     std::vector<VkBufferCopy> copy_regions;
+    // writers of reused (writing) tiles: {stream_id, submission count} their
+    // upload must be SUBMITTED before ours (single shared FIFO queue => the
+    // queue itself orders the write before our read; enforced host-side)
+    std::vector<int> wait_subs_streams;
+    std::vector<uint64_t> wait_subs_gen;
 };
 
 // shared padded-tile cache: one channel-layer tile per slot
 struct CacheSlot {
     int64_t key {-1};        // (clip << 40) | (c << 32) | idx, -1 = empty
     int writer {-1};
+    // who is uploading this slot, and the submission generation their upload
+    // will carry once queued (readers of a writing slot wait for that
+    // generation so the single shared queue orders the write before their read)
+    int writer_stream {-1};
+    uint64_t writer_count {0};
     // true from upload reservation until the writer's fence completes;
     // other frames must not touch the slot while it is being padded, but
     // may share-read it freely once stable (tiles are immutable)
@@ -171,6 +182,13 @@ struct NLMeansData {
     std::mutex cache_lock;
     std::condition_variable cache_cv;
     std::atomic<uint32_t> t_blocks {};
+    // per-stream submission counters + condvar: a writer bumps its counter
+    // after its (single-queue) submit; readers of its writing slots wait for
+    // that before their own submit so the FIFO queue orders the tile write
+    // before their reads (host-side ordering only — no device-side waits)
+    std::array<std::atomic<uint64_t>, 32> submit_count {};
+    std::mutex submit_lock;
+    std::condition_variable submit_cv;
 
     // create()-time q-sweep tables (stride-8 rows), shared by all streams
     std::vector<int> wq_host;
@@ -369,6 +387,8 @@ static void acquire_cache(NLMeansData * d, NLStream & st, int n,
 
     st.win_slots.assign(keys.size(), -1);
     st.upload_new.assign(keys.size(), false);
+    st.wait_subs_streams.clear();
+    st.wait_subs_gen.clear();
     // DEBUG: NLMEANS_FORCE_PAD=1 disables slot reuse entirely
     const bool force_pad = std::getenv("NLMEANS_FORCE_PAD") != nullptr;
 
@@ -397,9 +417,14 @@ static void acquire_cache(NLMeansData * d, NLStream & st, int n,
                     found = -1;
                 }
                 if (found >= 0 && d->cache[found].writing) {
-                    // being padded by an in-flight frame right now: upload
-                    // a private duplicate instead of blocking on it
-                    found = -1;
+                    // Another in-flight stream is about to upload this tile.
+                    // Instead of uploading a private duplicate, REUSE the slot:
+                    // on the single shared queue, its content lands before our
+                    // command buffer as long as we submit after the writer
+                    // (enforced in GetFrame before submit; the writer bumps
+                    // its submission count after queuing its uploads).
+                    st.wait_subs_streams.push_back(d->cache[found].writer_stream);
+                    st.wait_subs_gen.push_back(d->cache[found].writer_count);
                 }
                 if (found < 0) {
                     // evict an unheld slot (round-robin from the cursor)
@@ -433,6 +458,11 @@ static void acquire_cache(NLMeansData * d, NLStream & st, int n,
                 d->cache[slot].key = keys[ti];
                 d->cache[slot].writer = n;
                 d->cache[slot].writing = true;
+                // this stream's submission count AFTER it submits its current
+                // frame (bumped once per submit, one frame per stream)
+                d->cache[slot].writer_stream = st.stream_id;
+                d->cache[slot].writer_count =
+                    d->submit_count[st.stream_id].load(std::memory_order_acquire) + 1;
                 d->cache[slot].holders.clear();
             }
             d->cache[slot].holders.push_back(n);
@@ -515,16 +545,20 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         }
     };
 
+    VkDevice dev = d->device->device;
+
     auto set_error = [&](const std::string & error_message) {
         fprintf(stderr, "[nlmeans-ERROR] n=%d: %s\n", n, error_message.c_str());
+        // unblock any stream waiting on our pending uploads (we never submit)
+        d->submit_count[stream.stream_id].fetch_add(1, std::memory_order_release);
+        d->submit_cv.notify_all();
+        release_cache(d, stream, n);
         d->pool.give_back(std::move(stream));
         vsapi->setFilterError(("NLMeans: " + error_message).c_str(), frameCtx);
         vsapi->freeFrame(dst);
         cleanup_frames();
         return static_cast<const VSFrame *>(nullptr);
     };
-
-    VkDevice dev = d->device->device;
 
     const bool trace = std::getenv("NLMEANS_TRACE") != nullptr;
     auto now_us = [] {
@@ -556,6 +590,10 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         const size_t row_bytes =
             static_cast<size_t>(d->pstride) * d->elem_bytes;
 
+        // probe: time the pure compose memcpy (NLMEANS_PROBE)
+        const bool probe = std::getenv("NLMEANS_PROBE") != nullptr;
+        uint64_t pr0 = probe ? now_us() : 0;
+        uint64_t pr_bytes = 0;
         size_t pi = 0;
         size_t ti = 0;
         for (int clip = 0; clip < (d->has_ref ? 2 : 1); ++clip) {
@@ -590,8 +628,28 @@ static const VSFrame *VS_CC NLMeansGetFrame(
                                 src_row_bytes);
                         }
                     }
+                    if (probe) pr_bytes += src_row_bytes * d->height;
                     ++pi;
                 }
+            }
+        }
+        if (probe) {
+            static std::atomic<uint64_t> pr_acc {};
+            static std::atomic<uint64_t> pr_bacc {};
+            static std::atomic<uint32_t> pr_n {};
+            pr_acc += now_us() - pr0;
+            pr_bacc += pr_bytes;
+            uint32_t pn = pr_n.fetch_add(1) + 1;
+            if (pn % 100 == 0) {
+                fprintf(stderr,
+                    "[probe] n=%u compose-memcpy=%.3f ms  bytes/frame=%.2f KB\n",
+                    pn, pr_acc.load() / double(pn) / 1e3,
+                    pr_bacc.load() / double(pn) / 1024.0);
+            }
+            if (n < 60) {
+                fprintf(stderr, "[probe2] n=%d tiles=%d bytes=%llu\n", n,
+                    static_cast<int>(pi),
+                    static_cast<unsigned long long>(pr_bytes));
             }
         }
         stream.new_tiles = static_cast<int>(pi);
@@ -774,10 +832,30 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         return set_error("vkEndCommandBuffer failed");
     }
 
+    // Reused writing slots: the writer queues its uploads one submission
+    // ahead; WAIT (host-side) until it has submitted, then submit ours — the
+    // single shared queue executes in submission order, so the tile write
+    // lands before our reads. No device-side waits (a FIFO queue cannot make
+    // an early CB wait on a later CB's signal — that would deadlock the queue).
+    if (!stream.wait_subs_streams.empty()) {
+        std::unique_lock slk(d->submit_lock);
+        for (size_t wi = 0; wi < stream.wait_subs_streams.size(); ++wi) {
+            const int ws = stream.wait_subs_streams[wi];
+            const uint64_t wg = stream.wait_subs_gen[wi];
+            d->submit_cv.wait(slk, [&] {
+                return d->submit_count[ws].load(std::memory_order_acquire) >= wg;
+            });
+        }
+        stream.wait_subs_streams.clear();
+        stream.wait_subs_gen.clear();
+    }
+
     if (VkResult r = submit_with_fence(dev, stream.queue, stream.queue_lock,
             stream.cmd, stream.fence); r != VK_SUCCESS) {
         return set_error("vkQueueSubmit failed");
     }
+    d->submit_count[stream.stream_id].fetch_add(1, std::memory_order_release);
+    d->submit_cv.notify_all();
     mark(t_sub);
 
     if (vkWaitForFences(dev, 1, &stream.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
@@ -1470,6 +1548,50 @@ static void VS_CC NLMeansCreate(
         // the pad margin of every tile keeps its one-time-init zero
         memset(st.staging_map, 0, static_cast<size_t>(staging_bytes));
 
+        if (std::getenv("NLMEANS_PROBE") && i == 0) {
+            const auto & mp = d->device->mem_props;
+            fprintf(stderr, "[mem] staging type=%u flags=0x%x heap=%u (flags=0x%x size=%zuMB)\n",
+                st.staging_type_index,
+                mp.memoryTypes[st.staging_type_index].propertyFlags,
+                mp.memoryTypes[st.staging_type_index].heapIndex,
+                mp.memoryHeaps[mp.memoryTypes[st.staging_type_index].heapIndex].flags,
+                static_cast<size_t>(mp.memoryHeaps[mp.memoryTypes[st.staging_type_index].heapIndex].size / (1024 * 1024)));
+            // one-time bandwidth self-test into the real staging memory:
+            // row-loop (the compose pattern: 540 rows x 1920B into pstride 1936)
+            // vs bulk (one contiguous memcpy), and the same into a malloc'd buffer.
+            const size_t row_bytes = static_cast<size_t>(d->pstride) * d->elem_bytes;
+            const size_t inner = static_cast<size_t>(d->pad) * (row_bytes + d->elem_bytes);
+            const size_t src_row = static_cast<size_t>(d->width) * d->elem_bytes;
+            std::vector<uint8_t> srcbuf(src_row * d->height, 0xAB);
+            auto now_ms = [&] {
+                return std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            };
+            const int iters = 200;
+            double t0 = now_ms();
+            for (int it = 0; it < iters; ++it) {
+                for (int y = 0; y < d->height; ++y) {
+                    memcpy(st.staging_map + inner + static_cast<size_t>(y) * row_bytes,
+                        srcbuf.data() + static_cast<size_t>(y) * src_row, src_row);
+                }
+            }
+            double trow = (now_ms() - t0) / iters;
+            t0 = now_ms();
+            for (int it = 0; it < iters; ++it) {
+                memcpy(st.staging_map + inner, srcbuf.data(), src_row * d->height);
+            }
+            double tbulk = (now_ms() - t0) / iters;
+            std::vector<uint8_t> mallock(src_row * d->height);
+            t0 = now_ms();
+            for (int it = 0; it < iters; ++it) {
+                memcpy(mallock.data(), srcbuf.data(), src_row * d->height);
+            }
+            double tmalloc = (now_ms() - t0) / iters;
+            const double mb = src_row * d->height / 1e6;
+            fprintf(stderr, "[bw] row-loop into staging: %.3f ms (%5.1f GB/s)  bulk into staging: %.3f ms (%5.1f GB/s)  bulk malloc: %.3f ms (%5.1f GB/s)\n",
+                trow, mb / trow, tbulk, mb / tbulk, tmalloc, mb / tmalloc);
+        }
+
         {
             const auto result = create_buffer(dev,
                 static_cast<VkDeviceSize>(d->tail_ints) * sizeof(int32_t),
@@ -1646,6 +1768,7 @@ static void VS_CC NLMeansCreate(
 
         st.queue = d->device->queues[0].queue;  // TEMP: single-queue test
         st.queue_lock = d->device->queues[0].lock.get();  // TEMP
+        st.stream_id = i;
 
         d->pool.push(std::move(st));
     }
