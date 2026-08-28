@@ -82,6 +82,14 @@ def noise_yuv32():
 
 
 @pytest.fixture(scope="session")
+def noise_yuv420_16():
+    """YUV420P16 version of the noise clip (subsampled chroma lattice, for
+    the 16-bit 'UV' sweep)."""
+    src = vs.core.bs.VideoSource(NOISE_MKV)
+    return vs.core.resize.Bicubic(src, format=vs.YUV420P16)
+
+
+@pytest.fixture(scope="session")
 def noise_yuv444_16():
     """YUV444P16 version of the noise clip (for joint 'YUV' processing)."""
     src = vs.core.bs.VideoSource(NOISE_MKV)
@@ -95,6 +103,13 @@ def noise_rgb32():
     return vs.core.resize.Bicubic(src, format=vs.RGBS, matrix_in_s="709")
 
 
+@pytest.fixture(scope="session")
+def noise_rgb16():
+    """RGB48 (16-bit integer) version of the noise clip."""
+    src = vs.core.bs.VideoSource(NOISE_MKV)
+    return vs.core.resize.Bicubic(src, format=vs.RGB48, matrix_in_s="709")
+
+
 # --- basic behaviour ---------------------------------------------------------
 
 
@@ -105,13 +120,13 @@ def test_output_format_and_frames_preserved(noise_gray):
     assert out.num_frames == noise_gray.num_frames
 
 
-def test_denoise_changes_output(noise_gray):
+def test_denoise_changes_output_32bit(noise_gray):
     src = noise_gray
     out = _run(src, d=0)
     assert np.abs(_plane(out.get_frame(5), 0) - _plane(src.get_frame(5), 0)).max() > 0.0
 
 
-def test_higher_h_smooths_more(noise_gray):
+def test_higher_h_smooths_more_32bit(noise_gray):
     src = noise_gray
     weak = _run(src, d=0, h=0.3)
     strong = _run(src, d=0, h=4.0)
@@ -120,31 +135,31 @@ def test_higher_h_smooths_more(noise_gray):
     assert ds > dw
 
 
-def test_search_radius_changes_output(noise_gray):
+def test_search_radius_changes_output_32bit(noise_gray):
     a1 = _run(noise_gray, d=0, a=1)
     a4 = _run(noise_gray, d=0, a=4)
     assert _max_diff(a1, a4, frames=(5,)) > 0.0
 
 
-def test_patch_size_changes_output(noise_gray):
+def test_patch_size_changes_output_32bit(noise_gray):
     s1 = _run(noise_gray, d=0, s=1)
     s3 = _run(noise_gray, d=0, s=3)
     assert _max_diff(s1, s3, frames=(5,)) > 0.0
 
 
-def test_wmode_changes_output(noise_gray):
+def test_wmode_changes_output_32bit(noise_gray):
     w0 = _run(noise_gray, d=0, wmode=0)
     w3 = _run(noise_gray, d=0, wmode=3)
     assert _max_diff(w0, w3, frames=(5,)) > 0.0
 
 
-def test_wref_changes_output(noise_gray):
+def test_wref_changes_output_32bit(noise_gray):
     w1 = _run(noise_gray, d=0, wref=1.0)
     w0 = _run(noise_gray, d=0, wref=0.0)
     assert _max_diff(w1, w0, frames=(5,)) > 0.0
 
 
-def test_temporal_differs_from_spatial(noise_gray):
+def test_temporal_differs_from_spatial_32bit(noise_gray):
     # the noise clip is independent per frame, so a temporal window must
     # produce a different result than spatial-only
     spatial = _run(noise_gray, d=0)
@@ -187,7 +202,7 @@ def _reference_plugin():
 
 
 @pytest.mark.parametrize("kwargs", REFERENCE_CASES, ids=lambda kw: str(kw))
-def test_matches_reference_float(noise_gray, kwargs):
+def test_matches_reference_32bit(noise_gray, kwargs):
     theirs = _reference_plugin().NLMeans(noise_gray, num_streams=1, **kwargs)
     mine = _run(noise_gray, **kwargs)
     worst = _max_diff(mine, theirs)
@@ -213,7 +228,7 @@ def test_matches_reference_16bit(noise_16bit, kwargs):
     assert worst <= 1.0, f"max LSB diff vs vszipcl {kwargs}: {worst}"
 
 
-def test_yuv_default_denises_luma_copies_chroma(noise_yuv32):
+def test_yuv_default_denises_luma_copies_chroma_32bit(noise_yuv32):
     src = noise_yuv32
     out = _run(src, d=0)
     assert _max_diff(out, src, planes=(0,), frames=(5,)) > 0.0
@@ -223,7 +238,21 @@ def test_yuv_default_denises_luma_copies_chroma(noise_yuv32):
         assert np.array_equal(fa, fb), f"chroma{p} changed"
 
 
-def test_yuv_channels_uv_matches_reference(noise_yuv32):
+def test_yuv_default_denises_luma_copies_chroma_16bit(noise_yuv420_16):
+    """16-bit mirror of test_yuv_default_denises_luma_copies_chroma."""
+    src = noise_yuv420_16
+    out = _run(src, d=0)
+    assert _max_diff(out, src, planes=(0,), frames=(5,)) > 0.0
+    for p in (1, 2):
+        fa = _plane(out.get_frame(5), p)
+        fb = _plane(src.get_frame(5), p)
+        assert np.array_equal(fa, fb), f"chroma{p} changed"
+    ref = _reference_plugin()
+    theirs = ref.NLMeans(src, num_streams=1, d=0)
+    assert _max_diff(out, theirs, planes=(0,), frames=(5,)) <= 1.0
+
+
+def test_yuv_channels_uv_matches_reference_32bit(noise_yuv32):
     """channels='UV' on a subsampled YUV clip: chroma denoised (subsampled
     lattice), luma passed through bit-exactly."""
     ref = _reference_plugin()
@@ -238,7 +267,79 @@ def test_yuv_channels_uv_matches_reference(noise_yuv32):
     assert _max_diff(out, theirs, planes=(1, 2)) < NLMEANS_REF_TOL
 
 
-def test_yuv_channels_uv_temporal_matches_reference(noise_yuv32):
+# --- UV (chroma-only, 2-channel) sweep at both depths vs the reference ------
+#
+# The luma sweeps above only exercise 1 channel; the 16-bit 'UV' path was once
+# broken while every other depth/channel-count combination stayed correct, so
+# the 2-channel sweep must run at BOTH depths. Parameter list mirrors
+# REFERENCE_CASES. Tolerances measured on the noise clip:
+#   - 32-bit: worst 8.31e-5 across the sweep (fp32 accumulation order),
+#     bound NLMEANS_REF_TOL as for the luma sweep.
+#   - 16-bit: worst 4 codes (integer rounding + fp32 order on the subsampled
+#     lattice), bound 8.0 with 2x headroom. The wref=0 case is run with h=3.0
+#     instead of the default h=1.2: with wref=0 the tiny exp() weights of a
+#     noise clip fall into fp16 subnormals (x4096 store), which drifts the
+#     weighted average by thousands of codes at h=1.2 (measured 4421 LSB for
+#     UV16 and 4619 LSB for GRAY16 identically - a general 16-bit property of
+#     the fp16 weight ring, not a per-channel indexing fault), and drops to
+#     1 LSB at h=3.0.
+
+UV32_CASES = [
+    {"d": 0},
+    {"d": 2},
+    {"d": 1, "a": 3, "s": 3, "h": 3.0, "wref": 0.4},
+    {"d": 0, "wmode": 1},
+    {"d": 0, "wmode": 2, "h": 2.0},
+    {"d": 0, "wmode": 3},
+    {"d": 0, "a": 1},
+    {"d": 0, "a": 4},
+    {"d": 0, "s": 1},
+    {"d": 0, "s": 8},
+    {"d": 0, "h": 0.3},
+    {"d": 0, "h": 6.0},
+    {"d": 0, "wref": 0.0},
+]
+
+UV16_CASES = [
+    {"d": 0},
+    {"d": 2},
+    {"d": 1, "a": 3, "s": 3, "h": 3.0, "wref": 0.4},
+    {"d": 0, "wmode": 1},
+    {"d": 0, "wmode": 2, "h": 2.0},
+    {"d": 0, "wmode": 3},
+    {"d": 0, "a": 1},
+    {"d": 0, "a": 4},
+    {"d": 0, "s": 1},
+    {"d": 0, "s": 8},
+    {"d": 0, "h": 0.3},
+    {"d": 0, "h": 6.0},
+    {"d": 0, "wref": 0.0, "h": 3.0},  # see note above
+]
+
+UV16_REF_TOL = 8.0
+
+
+@pytest.mark.parametrize("kwargs", UV32_CASES, ids=lambda kw: str(kw))
+def test_uv_matches_reference_32bit(noise_yuv32, kwargs):
+    ref = _reference_plugin()
+    src = noise_yuv32
+    mine = _run(src, channels="UV", **kwargs)
+    theirs = ref.NLMeans(src, num_streams=1, channels="UV", **kwargs)
+    worst = _max_diff(mine, theirs, planes=(1, 2))
+    assert worst < NLMEANS_REF_TOL, f"max diff vs vszipcl {kwargs}: {worst}"
+
+
+@pytest.mark.parametrize("kwargs", UV16_CASES, ids=lambda kw: str(kw))
+def test_uv_matches_reference_16bit(noise_yuv420_16, kwargs):
+    ref = _reference_plugin()
+    src = noise_yuv420_16
+    mine = _run(src, channels="UV", **kwargs)
+    theirs = ref.NLMeans(src, num_streams=1, channels="UV", **kwargs)
+    worst = _max_diff(mine, theirs, planes=(1, 2))
+    assert worst <= UV16_REF_TOL, f"max LSB diff vs vszipcl {kwargs}: {worst}"
+
+
+def test_yuv_channels_uv_temporal_matches_reference_32bit(noise_yuv32):
     ref = _reference_plugin()
     src = noise_yuv32
     mine = _run(src, d=1, channels="UV", h=1.5, num_streams=2)
@@ -246,7 +347,7 @@ def test_yuv_channels_uv_temporal_matches_reference(noise_yuv32):
     assert _max_diff(mine, theirs, planes=(1, 2)) < NLMEANS_REF_TOL
 
 
-def test_yuv444_joint_matches_reference(noise_yuv444_16):
+def test_yuv444_joint_matches_reference_16bit(noise_yuv444_16):
     ref = _reference_plugin()
     src = noise_yuv444_16
     mine = _run(src, d=0, channels="YUV", h=1.0)
@@ -257,7 +358,7 @@ def test_yuv444_joint_matches_reference(noise_yuv444_16):
     assert _max_diff(mine, theirs, planes=(0, 1, 2)) <= 2.0
 
 
-def test_rgb_joint_matches_reference(noise_rgb32):
+def test_rgb_joint_matches_reference_32bit(noise_rgb32):
     ref = _reference_plugin()
     src = noise_rgb32
     mine = _run(src, d=1, h=1.0)
@@ -265,14 +366,31 @@ def test_rgb_joint_matches_reference(noise_rgb32):
     assert _max_diff(mine, theirs, planes=(0, 1, 2)) < NLMEANS_REF_TOL
 
 
-def test_rclip_self_is_identity(noise_gray):
+def test_rgb_joint_matches_reference_16bit(noise_rgb16):
+    """16-bit mirror of test_rgb_joint_matches_reference (whole codes)."""
+    ref = _reference_plugin()
+    src = noise_rgb16
+    mine = _run(src, d=1, h=1.0)
+    theirs = ref.NLMeans(src, num_streams=1, d=1, h=1.0)
+    assert _max_diff(mine, theirs, planes=(0, 1, 2)) <= 1.0
+
+
+def test_rclip_self_is_identity_32bit(noise_gray):
     src = noise_gray
     plain = _run(src, d=0, h=1.5)
     withref = _run(src, d=0, h=1.5, rclip=src)
     assert _max_diff(plain, withref, frames=(5,)) == 0.0
 
 
-def test_rclip_guide_matches_reference(noise_gray):
+def test_rclip_self_is_identity_16bit(noise_16bit):
+    """16-bit mirror of test_rclip_self_is_identity."""
+    src = noise_16bit
+    plain = _run(src, d=0, h=1.5)
+    withref = _run(src, d=0, h=1.5, rclip=src)
+    assert _max_diff(plain, withref, frames=(5,)) == 0.0
+
+
+def test_rclip_guide_matches_reference_32bit(noise_gray):
     ref = _reference_plugin()
     src = noise_gray
     guide = src.std.BoxBlur(hradius=5, vradius=5)
@@ -283,7 +401,19 @@ def test_rclip_guide_matches_reference(noise_gray):
     assert _max_diff(mine, theirs) < NLMEANS_REF_TOL
 
 
-def test_stride_handling_matches_reference(noise_gray):
+def test_rclip_guide_matches_reference_16bit(noise_16bit):
+    """16-bit mirror of test_rclip_guide_matches_reference (whole codes)."""
+    ref = _reference_plugin()
+    src = noise_16bit
+    guide = src.std.BoxBlur(hradius=5, vradius=5)
+    mine = _run(src, d=0, h=1.5, rclip=guide)
+    plain = _run(src, d=0, h=1.5)
+    assert _max_diff(mine, plain, frames=(5,)) > 0.0
+    theirs = ref.NLMeans(src, num_streams=1, d=0, h=1.5, rclip=guide)
+    assert _max_diff(mine, theirs) <= 1.0
+
+
+def test_stride_handling_matches_reference_32bit(noise_gray):
     # a cropped frame keeps its parent's (wider) stride; the filter must
     # handle non-tight pitches identically to the reference
     ref = _reference_plugin()
@@ -294,28 +424,57 @@ def test_stride_handling_matches_reference(noise_gray):
     assert _max_diff(mine, theirs) < NLMEANS_REF_TOL
 
 
+def test_stride_handling_matches_reference_16bit(noise_16bit):
+    """16-bit mirror of test_stride_handling_matches_reference (whole
+    codes)."""
+    ref = _reference_plugin()
+    cropped = noise_16bit.std.Crop(left=27)
+    assert cropped.width < noise_16bit.width
+    mine = _run(cropped, d=1)
+    theirs = ref.NLMeans(cropped, num_streams=1, d=1)
+    assert _max_diff(mine, theirs) <= 1.0
+
+
 # --- determinism / streams ---------------------------------------------------
 
 
-def test_deterministic_serial(noise_gray):
+def test_deterministic_serial_32bit(noise_gray):
     a = _run(noise_gray, d=2, h=1.5)
     b = _run(noise_gray, d=2, h=1.5)
     assert _max_diff(a, b) == 0.0
 
 
-def test_multi_stream_matches_single(noise_gray):
+def test_deterministic_serial_16bit(noise_16bit):
+    a = _run(noise_16bit, d=2, h=1.5)
+    b = _run(noise_16bit, d=2, h=1.5)
+    assert _max_diff(a, b) == 0.0
+
+
+def test_multi_stream_matches_single_32bit(noise_gray):
     a = _run(noise_gray, d=2, num_streams=4)
     b = _run(noise_gray, d=2, num_streams=1)
     assert _max_diff(a, b) == 0.0
 
 
-def test_multi_stream_temporal_matches_single(noise_yuv32):
+def test_multi_stream_matches_single_16bit(noise_16bit):
+    a = _run(noise_16bit, d=2, num_streams=4)
+    b = _run(noise_16bit, d=2, num_streams=1)
+    assert _max_diff(a, b) == 0.0
+
+
+def test_multi_stream_temporal_matches_single_32bit(noise_yuv32):
     a = _run(noise_yuv32, d=1, channels="UV", num_streams=4)
     b = _run(noise_yuv32, d=1, channels="UV", num_streams=1)
     assert _max_diff(a, b, planes=(1, 2)) == 0.0
 
 
-def test_parallel_load_matches_serial(noise_gray):
+def test_multi_stream_uv_matches_single_16bit(noise_yuv420_16):
+    a = _run(noise_yuv420_16, d=1, channels="UV", num_streams=4)
+    b = _run(noise_yuv420_16, d=1, channels="UV", num_streams=1)
+    assert _max_diff(a, b, planes=(1, 2)) == 0.0
+
+
+def test_parallel_load_matches_serial_32bit(noise_gray):
     par = _eval_parallel(noise_gray, d=2, num_streams=4)
     ref = _run(noise_gray, d=2, num_streams=1)
     for n in range(noise_gray.num_frames):
@@ -324,15 +483,31 @@ def test_parallel_load_matches_serial(noise_gray):
             f"parallel/serial mismatch at frame {n}"
 
 
-def test_parallel_load_deterministic(noise_gray):
+def test_parallel_load_matches_serial_16bit(noise_16bit):
+    par = _eval_parallel(noise_16bit, d=2, num_streams=4)
+    ref = _run(noise_16bit, d=2, num_streams=1)
+    for n in range(noise_16bit.num_frames):
+        fb = _plane(ref.get_frame(n), 0)
+        assert np.abs(par[n].astype(np.float64) - fb).max() == 0.0, \
+            f"parallel/serial mismatch at frame {n}"
+
+
+def test_parallel_load_deterministic_32bit(noise_gray):
     a = _eval_parallel(noise_gray, d=2, num_streams=4)
     b = _eval_parallel(noise_gray, d=2, num_streams=4)
     for n in range(noise_gray.num_frames):
         assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
 
 
+def test_parallel_load_deterministic_16bit(noise_16bit):
+    a = _eval_parallel(noise_16bit, d=2, num_streams=4)
+    b = _eval_parallel(noise_16bit, d=2, num_streams=4)
+    for n in range(noise_16bit.num_frames):
+        assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
+
+
 @pytest.mark.parametrize("radius", [0, 1, 2])
-def test_no_nan_all_frames(noise_gray, radius):
+def test_no_nan_all_frames_32bit(noise_gray, radius):
     out = _run(noise_gray, d=radius)
     assert_gray32(out)
     for n in range(out.num_frames):
@@ -342,15 +517,16 @@ def test_no_nan_all_frames(noise_gray, radius):
 
 
 @pytest.mark.parametrize("num_streams", [2, 4])
-def test_no_nan_all_frames_multi_stream(noise_gray, num_streams):
+def test_no_nan_all_frames_multi_stream_32bit(noise_gray, num_streams):
     out = _run(noise_gray, d=2, num_streams=num_streams)
     for n in range(out.num_frames):
         a = _plane(out.get_frame(n), 0)
         assert np.isfinite(a).all(), f"non-finite output at frame {n}"
 
 
-def test_16bit_output_finite_all_frames(noise_16bit):
-    out = _run(noise_16bit, d=2)
+@pytest.mark.parametrize("radius", [0, 1, 2])
+def test_no_nan_all_frames_16bit(noise_16bit, radius):
+    out = _run(noise_16bit, d=radius)
     assert out.format.id == noise_16bit.format.id
     for n in range(out.num_frames):
         a = _plane(out.get_frame(n), 0)

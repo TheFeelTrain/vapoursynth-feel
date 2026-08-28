@@ -67,13 +67,13 @@ def _stride_plane(frame, plane):
     return _plane(frame, plane, w, h, dtype)
 
 
-def _eval_parallel(clip, **kwargs):
+def _eval_parallel(clip, dtype=np.float32, **kwargs):
     """Evaluate every frame concurrently to exercise the multi-stream path."""
     out = _run(clip, **kwargs)
     frames = [None] * out.num_frames
 
     def worker(n):
-        frames[n] = frame_to_ndarray(out.get_frame(n))
+        frames[n] = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, dtype)
 
     threads = [threading.Thread(target=worker, args=(n,)) for n in range(out.num_frames)]
     for t in threads:
@@ -97,7 +97,7 @@ def _check_all_frames_finite(clip, **kwargs):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("num_streams", [1, 4])
-def test_dfttest_deterministic(noise_gray, num_streams):
+def test_dfttest_deterministic_32bit(noise_gray, num_streams):
     a = _run(noise_gray, num_streams=num_streams)
     b = _run(noise_gray, num_streams=num_streams)
     for n in (0, 11, 23):
@@ -105,7 +105,7 @@ def test_dfttest_deterministic(noise_gray, num_streams):
         assert np.abs(d).max() < 1e-6, f"nondeterministic output at frame {n}"
 
 
-def test_dfttest_multi_stream_matches_single(noise_gray):
+def test_dfttest_multi_stream_matches_single_32bit(noise_gray):
     a = _run(noise_gray, num_streams=4)
     b = _run(noise_gray, num_streams=1)
     for n in (0, 11, 23):
@@ -113,7 +113,7 @@ def test_dfttest_multi_stream_matches_single(noise_gray):
         assert np.abs(d).max() < 1e-6, f"num_streams mismatch at frame {n}"
 
 
-def test_dfttest_parallel_load_consistent(noise_gray):
+def test_dfttest_parallel_load_consistent_32bit(noise_gray):
     """Two parallel num_streams=4 runs must match the serial path, and each
     other — the request pattern that exposes stale descriptor bindings,
     fence misuse and command-pool reuse violations under load."""
@@ -127,12 +127,44 @@ def test_dfttest_parallel_load_consistent(noise_gray):
         assert np.abs(a[n] - b[n]).max() < 1e-6, f"nondeterministic output at frame {n}"
 
 
+@pytest.mark.parametrize("num_streams", [1, 4])
+def test_dfttest_deterministic_16bit(noise_16bit, num_streams):
+    a = _run(noise_16bit, num_streams=num_streams)
+    b = _run(noise_16bit, num_streams=num_streams)
+    for n in (0, 11, 23):
+        fa = _plane(a.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+        fb = _plane(b.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+        assert np.array_equal(fa, fb), f"nondeterministic output at frame {n}"
+
+
+def test_dfttest_multi_stream_matches_single_16bit(noise_16bit):
+    a = _run(noise_16bit, num_streams=4)
+    b = _run(noise_16bit, num_streams=1)
+    for n in (0, 11, 23):
+        fa = _plane(a.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+        fb = _plane(b.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+        assert np.array_equal(fa, fb), f"num_streams mismatch at frame {n}"
+
+
+def test_dfttest_parallel_load_consistent_16bit(noise_16bit):
+    """16-bit mirror of test_dfttest_parallel_load_consistent."""
+    a = _eval_parallel(noise_16bit, dtype=np.uint16, num_streams=4)
+    b = _eval_parallel(noise_16bit, dtype=np.uint16, num_streams=4)
+    ref = _run(noise_16bit, num_streams=1)
+    for n in range(noise_16bit.num_frames):
+        r = _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+        assert np.array_equal(a[n], r), f"parallel 1/serial mismatch at frame {n}"
+        assert np.array_equal(b[n], r), f"parallel 2/serial mismatch at frame {n}"
+        assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
+
+
 # ---------------------------------------------------------------------------
 # Pipelined-reader stress (regression)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("num_streams", [1, 4])
-def test_dfttest_vspipe_pipelined_no_hang(num_streams):
+@pytest.mark.parametrize("bits", [None, 16], ids=["32bit", "16bit"])
+def test_dfttest_vspipe_pipelined_no_hang(num_streams, bits):
     """vspipe's pipelined reader plus VapourSynth's prefetch activate frames
     11+ ahead of the in-flight frames. With the old batched pad submit, a
     reader's copy submit could land on the queue before the padder's pad
@@ -144,11 +176,14 @@ def test_dfttest_vspipe_pipelined_no_hang(num_streams):
 
     Runs the real benchmark as a subprocess (synthetic BlankClip, the
     reproducer's workload) so that vspipe's reader, not a Python get_frame
-    loop, drives the frame requests.
+    loop, drives the frame requests. Parametrized over both input depths
+    (float32 default and --bits 16 integer path).
     """
     bench = Path(__file__).resolve().parent.parent / "benchmark" / "bench.py"
     cmd = [sys.executable, str(bench), "--synthetic", "--frames", "200",
            "--filter", "dfttest", "vsfeel"]
+    if bits:
+        cmd += ["--bits", str(bits)]
     if num_streams != 1:
         cmd += ["--num-streams", str(num_streams)]
     try:
@@ -166,7 +201,7 @@ def test_dfttest_vspipe_pipelined_no_hang(num_streams):
 
 
 @pytest.mark.parametrize("chained", [3])
-def test_dfttest_vspipe_pipelined_chained_no_hang(chained, tmp_path):
+def test_dfttest_vspipe_pipelined_chained_no_hang_16bit(chained, tmp_path):
     """Chained DFTTest instances streamed through vspipe must not deadlock
     (regression for the timeline-semaphore frame-cache fix).
 
@@ -215,13 +250,32 @@ def test_dfttest_vspipe_pipelined_chained_no_hang(chained, tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("tbsize", [1, 3, 5, 7])
-def test_dfttest_no_nan_all_frames(noise_gray, tbsize):
+def test_dfttest_no_nan_all_frames_32bit(noise_gray, tbsize):
     _check_all_frames_finite(noise_gray, tbsize=tbsize, num_streams=1)
 
 
 @pytest.mark.parametrize("num_streams", [2, 4])
-def test_dfttest_no_nan_all_frames_multi_stream(noise_gray, num_streams):
+def test_dfttest_no_nan_all_frames_multi_stream_32bit(noise_gray, num_streams):
     _check_all_frames_finite(noise_gray, tbsize=3, num_streams=num_streams)
+
+
+@pytest.mark.parametrize("tbsize", [1, 3, 5, 7])
+def test_dfttest_no_nan_all_frames_16bit(noise_16bit, tbsize):
+    """16-bit mirror of test_dfttest_no_nan_all_frames_32bit (temporal
+    boundary handling on the integer path)."""
+    out = _run(noise_16bit, tbsize=tbsize, num_streams=1)
+    for n in range(out.num_frames):
+        a = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+        assert np.isfinite(a.astype(np.float32)).all()
+        assert a.max() <= 65535
+
+
+@pytest.mark.parametrize("num_streams", [2, 4])
+def test_dfttest_no_nan_all_frames_multi_stream_16bit(noise_16bit, num_streams):
+    out = _run(noise_16bit, tbsize=3, num_streams=num_streams)
+    for n in range(out.num_frames):
+        a = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+        assert np.isfinite(a.astype(np.float32)).all()
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +356,7 @@ def _reference_max_diffs() -> list[float] | None:
     return [float(line) for line in lines]
 
 
-def test_dfttest_matches_reference(noise_gray):
+def test_dfttest_matches_reference_32bit(noise_gray):
     """vsfeel must closely match vszipcl across the parameter surface.
 
     The implementations are ported exactly, so only float32 rounding order
@@ -318,16 +372,15 @@ def test_dfttest_matches_reference(noise_gray):
         assert maxdiff < tol, f"max diff {maxdiff} vs vszipcl for {kwargs}"
 
 
-GRAY16_CASES = [
-    {},
-    {"tbsize": 5},
-    {"sosize": 12},
-    {"ftype": 1, "sigma": 4.0},
-]
+# The 16-bit sweep mirrors the 32-bit REFERENCE_CASES list one-for-one.
+# Measured on the noise clip: every config (incl. the hard-threshold
+# ftype=1 cases) lands within one output code, so a flat <= 1 LSB bound
+# covers the whole 16-bit surface.
+GRAY16_CASES = [kwargs for kwargs, _ in REFERENCE_CASES]
 
 
 @pytest.mark.parametrize("kwargs", GRAY16_CASES, ids=lambda kw: str(kw) or "defaults")
-def test_dfttest_gray16_matches_reference(noise_16bit, kwargs):
+def test_dfttest_matches_reference_16bit(noise_16bit, kwargs):
     """16-bit integer path: at most one code level of rounding difference."""
     if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "DFTTest"):
         pytest.skip("no vszipcl.DFTTest reference")
@@ -351,7 +404,7 @@ def test_dfttest_rejects_8bit(noise_8bit):
 # Formats and plane handling
 # ---------------------------------------------------------------------------
 
-def test_dfttest_yuv_passthrough(noise_gray):
+def test_dfttest_yuv_passthrough_32bit(noise_gray):
     """A full YUV clip is accepted; with planes=[0] the chroma planes must be
     copied through bit-identically and the luma must match the Gray output."""
     core = vs.core
@@ -375,7 +428,7 @@ def test_dfttest_yuv_passthrough(noise_gray):
             assert np.array_equal(a, b), f"chroma{plane} changed at frame {n}"
 
 
-def test_dfttest_yuv_all_planes_matches_reference():
+def test_dfttest_yuv_all_planes_matches_reference_32bit():
     """YUV420 float32 with all planes processed must track vszipcl on every
     plane (incl. subsampled chroma)."""
     if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "DFTTest"):
@@ -394,6 +447,51 @@ def test_dfttest_yuv_all_planes_matches_reference():
                 - _stride_plane(fb, p).astype(np.float64)
             )
             assert d.max() < REF_TOL, f"plane {p} max diff {d.max()} at frame {n}"
+
+
+def test_dfttest_yuv_passthrough_16bit(noise_16bit):
+    """16-bit mirror of test_dfttest_yuv_passthrough: chroma copied through
+    bit-identically, luma matches the gray16 output."""
+    core = vs.core
+    src = core.bs.VideoSource(NOISE_MKV)
+    yuv = core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
+    assert yuv.format.color_family == vs.YUV
+
+    out = _run(yuv, planes=[0], num_streams=1)
+    ref = _run(noise_16bit, num_streams=1)
+
+    for n in (0, 11, 23):
+        d = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64) \
+            - _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
+        assert np.abs(d).max() == 0, f"luma mismatch at frame {n}"
+        s = yuv.get_frame(n)
+        for plane in (1, 2):
+            sh = s.height >> 1
+            sw = s.width >> 1
+            a = _plane(out.get_frame(n), plane, sw, sh, np.uint16)
+            b = _plane(s, plane, sw, sh, np.uint16)
+            assert np.array_equal(a, b), f"chroma{plane} changed at frame {n}"
+
+
+def test_dfttest_yuv_all_planes_matches_reference_16bit():
+    """16-bit mirror of test_dfttest_yuv_all_planes_matches_reference
+    (YUV420P16, whole-code comparison; measured <= 1 LSB)."""
+    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "DFTTest"):
+        pytest.skip("no vszipcl.DFTTest reference")
+    core = vs.core
+    src = core.bs.VideoSource(NOISE_MKV)
+    yuv = core.resize.Bicubic(src, format=vs.YUV420P16)
+
+    my = _run(yuv, tbsize=1, num_streams=1)
+    ref = core.vszipcl.DFTTest(yuv, tbsize=1)
+    for n in (0, 11, 23):
+        fa, fb = my.get_frame(n), ref.get_frame(n)
+        for p in range(3):
+            d = np.abs(
+                _stride_plane(fa, p).astype(np.float64)
+                - _stride_plane(fb, p).astype(np.float64)
+            )
+            assert d.max() <= 1.0, f"plane {p} max diff {d.max()} at frame {n}"
 
 
 # ---------------------------------------------------------------------------
