@@ -41,6 +41,7 @@ def make_vpy(
     frames: int,
     synth_format: str | None,
     cache_frames: int | None = None,
+    cache_conv: str | None = None,
 ) -> str:
     if synth_format:
         # synthetic clip: measure pure filter throughput, no decode bottleneck
@@ -50,13 +51,19 @@ def make_vpy(
         )
         cache_setup = ""
     elif cache_frames:
-        # real clip, but decode + hold the first N frames in Python while the
-        # script is being evaluated (before vspipe starts timing), then serve
-        # them through a ModifyFrame shim and loop to reach the requested
-        # frame count. std.Cache() is an explicit no-op on current VapourSynth.
+        # real clip, but decode + convert + hold the first N frames in Python
+        # while the script is being evaluated (before vspipe starts timing),
+        # then serve them through a ModifyFrame shim and loop to reach the
+        # requested frame count. std.Cache() is an explicit no-op on current
+        # VapourSynth. `cache_conv` is the filter's input expression (e.g.
+        # "depth(clip, 16)") applied BEFORE caching, so the timed region
+        # measures only filter throughput on the correct input format — the
+        # chain's own input expression then reduces to an identity.
         clip_expr = f"BestSource(cachepath=None).source({clip!r}, 32)"
+        conv = f"clip = {cache_conv}\n" if cache_conv else ""
         cache_setup = (
             f"m = min({cache_frames}, clip.num_frames)\n"
+            f"{conv}"
             "_src_frames = [clip.get_frame(n) for n in range(m)]\n"
             "def _serve_cached(n, f):\n"
             "    return _src_frames[n % m]\n"
@@ -303,7 +310,7 @@ def run_vspipe(vpy_path: Path, frames: int) -> float | None:
 
 
 def bench(plugin: str, chain: str, clip: str, frames: int, synth_format: str | None,
-          cache_frames: int | None = None) -> float | None:
+          cache_frames: int | None = None, cache_conv: str | None = None) -> float | None:
     vpy = make_vpy(
         clip=clip,
         extra=PLUGINS[plugin].loader or "",
@@ -311,6 +318,7 @@ def bench(plugin: str, chain: str, clip: str, frames: int, synth_format: str | N
         frames=frames,
         synth_format=synth_format,
         cache_frames=cache_frames,
+        cache_conv=cache_conv,
     )
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"bench_{plugin}.vpy"
@@ -335,6 +343,9 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
     frames = ns.frames or spec.default_frames
     synth = spec.synth_format if ns.synthetic else None
     cache_frames = ns.cache_frames if (ns.cached and synth is None) else None
+    # the cache holds frames in the filter's input format (e.g. depth(clip,16))
+    # so the timed region measures only filter throughput, like --synthetic
+    cache_conv = spec.input if cache_frames else None
     if synth:
         clip_desc = f"BlankClip 1920x1080 {synth.removeprefix('vs.')}"
     else:
@@ -344,7 +355,7 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
 
     results = []
     for plugin in plugins:
-        fps = bench(plugin, calls[plugin], ns.clip, frames, synth, cache_frames)
+        fps = bench(plugin, calls[plugin], ns.clip, frames, synth, cache_frames, cache_conv)
         results.append((plugin, fps))
         if fps is None:
             print(f"  {plugin:10s}  unavailable / failed")

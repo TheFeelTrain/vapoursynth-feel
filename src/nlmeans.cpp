@@ -1588,8 +1588,21 @@ static void VS_CC NLMeansCreate(
             }
             double tmalloc = (now_ms() - t0) / iters;
             const double mb = src_row * d->height / 1e6;
-            fprintf(stderr, "[bw] row-loop into staging: %.3f ms (%5.1f GB/s)  bulk into staging: %.3f ms (%5.1f GB/s)  bulk malloc: %.3f ms (%5.1f GB/s)\n",
-                trow, mb / trow, tbulk, mb / tbulk, tmalloc, mb / tmalloc);
+            // cold-source row loop: 64MB source read sequentially once per
+            // iteration (too big for any cache), same row pattern as compose
+            std::vector<uint8_t> cold(64u << 20, 0xCD);
+            double t0c = now_ms();
+            for (int it = 0; it < iters; ++it) {
+                const uint8_t * s = cold.data() + static_cast<size_t>(it % 32) * (2u << 20);
+                for (int y = 0; y < d->height; ++y) {
+                    memcpy(st.staging_map + inner + static_cast<size_t>(y) * row_bytes,
+                        s + static_cast<size_t>(y) * src_row, src_row);
+                }
+            }
+            double tcold = (now_ms() - t0c) / iters;
+            fprintf(stderr, "[bw] row-loop into staging: %.3f ms (%5.1f GB/s)  bulk into staging: %.3f ms (%5.1f GB/s)  bulk malloc: %.3f ms (%5.1f GB/s)  cold-row: %.3f ms (%5.1f GB/s)\n",
+                trow, mb / trow, tbulk, mb / tbulk, tmalloc, mb / tmalloc,
+                tcold, mb / tcold);
         }
 
         {
