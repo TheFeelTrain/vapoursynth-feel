@@ -25,6 +25,7 @@ BlankClip; --no-cache restores live decoding.
 """
 
 import argparse
+import re
 import subprocess
 import sys
 import tempfile
@@ -333,6 +334,27 @@ def args_desc(spec: FilterSpec, ns: argparse.Namespace) -> str:
     return ", ".join(pairs)
 
 
+def _format_for_bits(fmt: str, bits: int) -> str:
+    """Return the sibling of a ``vs.`` synthetic format name at the requested
+    bit depth (GRAYS <-> GRAY16, YUV420PS <-> YUV420P16, ...)."""
+    m = re.match(r"^(vs\.[A-Za-z0-9]+?)(S|16|PS|P16)$", fmt)
+    if not m:
+        raise SystemExit(
+            f"--bits {bits}: cannot map synthetic format {fmt!r} to {bits}-bit")
+    base = m.group(1)
+    suffix = "16" if bits == 16 else "S"
+    if not base.endswith("GRAY"):
+        suffix = "P16" if bits == 16 else "PS"
+    return f"{base}{suffix}"
+
+
+def _input_for_bits(expr: str, bits: int) -> str:
+    """Override the depth argument of the cache-conversion expression
+    (``depth(X, N)`` -> ``depth(X, bits)``)."""
+    return re.sub(r"depth\(([^,]+), \d+\)",
+                  lambda m: f"depth({m.group(1)}, {bits})", expr)
+
+
 def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
     calls = spec.build(ns, spec.input)
     plugins = ns.plugins or list(calls)
@@ -342,15 +364,20 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
 
     frames = ns.frames or spec.default_frames
     synth = spec.synth_format if ns.synthetic else None
+    if synth and ns.bits:
+        synth = _format_for_bits(synth, ns.bits)
     cache_frames = ns.cache_frames if (ns.cached and synth is None) else None
     # the cache holds frames in the filter's input format (e.g. depth(clip,16))
     # so the timed region measures only filter throughput, like --synthetic
     cache_conv = spec.input if cache_frames else None
+    if cache_conv and ns.bits:
+        cache_conv = _input_for_bits(cache_conv, ns.bits)
     if synth:
         clip_desc = f"BlankClip 1920x1080 {synth.removeprefix('vs.')}"
     else:
         clip_desc = str(ns.clip)
-    print(f"{spec.title} benchmark | {frames} frames | clip: {clip_desc}")
+    bits_desc = f" | bits: {ns.bits}" if ns.bits else ""
+    print(f"{spec.title} benchmark | {frames} frames | clip: {clip_desc}{bits_desc}")
     print(f"args: {args_desc(spec, ns)}\n")
 
     results = []
@@ -388,8 +415,13 @@ def parse_args() -> argparse.Namespace:
                         help="num_streams passed to the filters (default: 1, or the reference default)")
     parser.add_argument("--clip", default=DEFAULT_CLIP, help="input clip path")
     parser.add_argument("--synthetic", action="store_true",
-                        help="use a synthetic 1920x1080 YUV420PS BlankClip instead of --clip "
+                        help="use a synthetic 1920x1080 BlankClip instead of --clip "
                              "(decoder-independent, measures pure filter throughput)")
+    parser.add_argument("--bits", type=int, choices=(16, 32), default=None,
+                        help="benchmark the 16-bit or 32-bit input path: with "
+                             "--synthetic this swaps the BlankClip format, otherwise "
+                             "it overrides the cached-frame conversion depth "
+                             "(default: each filter's configured depth)")
     parser.add_argument("--cache", dest="cached", action="store_true", default=True,
                         help="default mode: decode the first --cache-frames frames of the real clip "
                              "into RAM before vspipe starts timing (removes the BestSource bottleneck "
