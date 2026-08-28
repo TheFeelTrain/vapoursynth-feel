@@ -247,6 +247,10 @@ void main() {
 
     // 1) per-pixel distance over the tile + halo; OOB -> 0.0f (zero border).
     if (interior) {
+        // The interior predicate guarantees the whole tile+halo (ref AND cand
+        // extents incl. the qx/qy shift) is inside the frame, so every cell
+        // here is in-bounds: the per-cell bounds checks are dead and dropped.
+        // Keep both cells' loads batched for ILP (splitting them regresses).
         for (int ry_g2 = ly; ry_g2 < VRT_RESULT*BY + 2*NLM_S; ry_g2 += BY) {
             const int yy_c = gy0 - NLM_S + ry_g2;
             const int br = (yy_c+PAD)*PSTRIDE + gx0 - NLM_S + PAD;
@@ -255,56 +259,44 @@ void main() {
             const int cx_a = lx;
             const bool two = lx < 2*NLM_S;
             const int cx_b = two ? lx + BX : cx_a;
-                const int xx_a = gx0 - NLM_S + cx_a;
-                const int yy_c2 = yy_c;
-                bool ina = xx_a >= 0 && xx_a < VI_DIM_X && yy_c2 >= 0 && yy_c2 < VI_DIM_Y
-                           && xx_a + qx >= 0 && xx_a + qx < VI_DIM_X
-                           && yy_c2 + qy >= 0 && yy_c2 + qy < VI_DIM_Y;
-                const int xx_b = gx0 - NLM_S + cx_b;
-                bool inb2 = xx_b >= 0 && xx_b < VI_DIM_X
-                           && xx_b + qx >= 0 && xx_b + qx < VI_DIM_X
-                           && yy_c2 >= 0 && yy_c2 < VI_DIM_Y
-                           && yy_c2 + qy >= 0 && yy_c2 + qy < VI_DIM_Y;
-                float va = 0.0f, vb = 0.0f;
-                if (ina || inb2) {
-                    const int rc_a2 = br + cx_a, cc_a2 = bc + cx_a;
-                    const int rc_b2 = br + cx_b, cc_b2 = bc + cx_b;
-                    const float ar0 = load_guide(a0 + rc_a2), br0 = load_guide(b0 + cc_a2);
-                    const float ar1 = load_guide(a0 + rc_b2), br1 = load_guide(b0 + cc_b2);
-                    if (NLM_REF == 0) {
-                        const float d0 = ar0 - br0, d1 = ar1 - br1;
-                        va = 3.0f * (d0 * d0);
-                        vb = 3.0f * (d1 * d1);
-                    } else if (NLM_REF == 1) {
-                        const float au0 = load_guide(a1 + rc_a2), bu0 = load_guide(b1 + cc_a2);
-                        const float au1 = load_guide(a1 + rc_b2), bu1 = load_guide(b1 + cc_b2);
-                        const float du0 = ar0 - br0, dvv0 = au0 - bu0;
-                        const float du1 = ar1 - br1, dvv1 = au1 - bu1;
-                        va = 1.5f * (du0*du0 + dvv0*dvv0);
-                        vb = 1.5f * (du1*du1 + dvv1*dvv1);
-                    } else if (NLM_REF == 2) {
-                        const float au0 = load_guide(a1 + rc_a2), bu0 = load_guide(b1 + cc_a2);
-                        const float av0 = load_guide(a2 + rc_a2), bv0 = load_guide(b2 + cc_a2);
-                        const float au1 = load_guide(a1 + rc_b2), bu1 = load_guide(b1 + cc_b2);
-                        const float av1 = load_guide(a2 + rc_b2), bv1 = load_guide(b2 + cc_b2);
-                        const float ddy0 = ar0 - br0, ddu0 = au0 - bu0, ddv0 = av0 - bv0;
-                        const float ddy1 = ar1 - br1, ddu1 = au1 - bu1, ddv1 = av1 - bv1;
-                        va = ddy0*ddy0 + ddu0*ddu0 + ddv0*ddv0;
-                        vb = ddy1*ddy1 + ddu1*ddu1 + ddv1*ddv1;
-                    } else {
-                        const float au0 = load_guide(a1 + rc_a2), bu0 = load_guide(b1 + cc_a2);
-                        const float av0 = load_guide(a2 + rc_a2), bv0 = load_guide(b2 + cc_a2);
-                        const float au1 = load_guide(a1 + rc_b2), bu1 = load_guide(b1 + cc_b2);
-                        const float av1 = load_guide(a2 + rc_b2), bv1 = load_guide(b2 + cc_b2);
-                        const float dr0 = ar0 - br0, dg0 = au0 - bu0, db0 = av0 - bv0;
-                        const float dr1 = ar1 - br1, dg1 = au1 - bu1, db1 = av1 - bv1;
-                        const float mr0 = (ar0 + br0) / 6.0f, mr1 = (ar1 + br1) / 6.0f;
-                        va = (2.0f/3.0f + mr0)*(dr0*dr0) + (4.0f/3.0f)*(dg0*dg0) + (1.0f - mr0)*(db0*db0);
-                        vb = (2.0f/3.0f + mr1)*(dr1*dr1) + (4.0f/3.0f)*(dg1*dg1) + (1.0f - mr1)*(db1*db1);
-                    }
-                }
-                dist[ry_g2][cx_a] = ina ? va : 0.0f;
-                if (two) dist[ry_g2][cx_b] = (inb2 ? vb : 0.0f);
+            const int rc_a2 = br + cx_a, cc_a2 = bc + cx_a;
+            const int rc_b2 = br + cx_b, cc_b2 = bc + cx_b;
+            const float ar0 = load_guide(a0 + rc_a2), br0 = load_guide(b0 + cc_a2);
+            const float ar1 = load_guide(a0 + rc_b2), br1 = load_guide(b0 + cc_b2);
+            float va, vb;
+            if (NLM_REF == 0) {
+                const float d0 = ar0 - br0, d1 = ar1 - br1;
+                va = 3.0f * (d0 * d0);
+                vb = 3.0f * (d1 * d1);
+            } else if (NLM_REF == 1) {
+                const float au0 = load_guide(a1 + rc_a2), bu0 = load_guide(b1 + cc_a2);
+                const float au1 = load_guide(a1 + rc_b2), bu1 = load_guide(b1 + cc_b2);
+                const float du0 = ar0 - br0, dvv0 = au0 - bu0;
+                const float du1 = ar1 - br1, dvv1 = au1 - bu1;
+                va = 1.5f * (du0*du0 + dvv0*dvv0);
+                vb = 1.5f * (du1*du1 + dvv1*dvv1);
+            } else if (NLM_REF == 2) {
+                const float au0 = load_guide(a1 + rc_a2), bu0 = load_guide(b1 + cc_a2);
+                const float av0 = load_guide(a2 + rc_a2), bv0 = load_guide(b2 + cc_a2);
+                const float au1 = load_guide(a1 + rc_b2), bu1 = load_guide(b1 + cc_b2);
+                const float av1 = load_guide(a2 + rc_b2), bv1 = load_guide(b2 + cc_b2);
+                const float ddy0 = ar0 - br0, ddu0 = au0 - bu0, ddv0 = av0 - bv0;
+                const float ddy1 = ar1 - br1, ddu1 = au1 - bu1, ddv1 = av1 - bv1;
+                va = ddy0*ddy0 + ddu0*ddu0 + ddv0*ddv0;
+                vb = ddy1*ddy1 + ddu1*ddu1 + ddv1*ddv1;
+            } else {
+                const float au0 = load_guide(a1 + rc_a2), bu0 = load_guide(b1 + cc_a2);
+                const float av0 = load_guide(a2 + rc_a2), bv0 = load_guide(b2 + cc_a2);
+                const float au1 = load_guide(a1 + rc_b2), bu1 = load_guide(b1 + cc_b2);
+                const float av1 = load_guide(a2 + rc_b2), bv1 = load_guide(b2 + cc_b2);
+                const float dr0 = ar0 - br0, dg0 = au0 - bu0, db0 = av0 - bv0;
+                const float dr1 = ar1 - br1, dg1 = au1 - bu1, db1 = av1 - bv1;
+                const float mr0 = (ar0 + br0) / 6.0f, mr1 = (ar1 + br1) / 6.0f;
+                va = (2.0f/3.0f + mr0)*(dr0*dr0) + (4.0f/3.0f)*(dg0*dg0) + (1.0f - mr0)*(db0*db0);
+                vb = (2.0f/3.0f + mr1)*(dr1*dr1) + (4.0f/3.0f)*(dg1*dg1) + (1.0f - mr1)*(db1*db1);
+            }
+            dist[ry_g2][cx_a] = va;
+            if (two) dist[ry_g2][cx_b] = vb;
         }
     } else {
         DIST_CHUNK(ly)
