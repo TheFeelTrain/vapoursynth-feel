@@ -216,17 +216,29 @@ def test_dfttest_vspipe_pipelined_chained_no_hang_16bit(chained, tmp_path):
     value, and timeline waits are non-destructive: any number of copies may
     wait on one value, so a second consumer can never starve. This test
     drives the exact user scenario — N chained instances on a synthetic
-    long GRAY16 clip via vspipe's pipelined reader — and fails on a hang
+    GRAY16 clip via vspipe's pipelined reader — and fails on a hang
     (timeout) or a non-zero exit.
+
+    The probe line inside the chain loop is the reload trigger: wrapper
+    libraries (e.g. vsdenoise's check_progressive) sample a frame of each
+    intermediate node while the script evaluates, and the streaming pass
+    then re-requests those frames while the probe's processing is still
+    in flight — the "processed again while in flight" condition fires at
+    frame 0. Without the probe the old plugin only stalled after tens of
+    thousands of frames (timing-dependent, 9k-37k observed), which made a
+    short test flaky. With the probe the pre-fix plugin hangs at frame zero
+    every time (verified: 3/3 hangs at LEN=200, 3/3 completes on the fixed
+    build), so the clip only needs to be a few hundred frames long.
     """
     script = tmp_path / "chained.py"
     script.write_text(textwrap.dedent(f"""\
         import vapoursynth as vs
         core = vs.core
         core.max_cache_size = 1024 * 8
-        clip = core.std.BlankClip(format=vs.GRAY16, width=1920, height=1080, length=12000)
+        clip = core.std.BlankClip(format=vs.GRAY16, width=1920, height=1080, length=200)
         for _ in range({chained}):
             clip = core.vsfeel.DFTTest(clip, sigma=7.0, tbsize=1)
+            clip.get_frame(0)   # eval-time probe (see docstring)
         clip.set_output()
     """))
     vspipe = shutil.which("vspipe")
