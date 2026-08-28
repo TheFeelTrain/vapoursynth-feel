@@ -356,7 +356,11 @@ def _input_for_bits(expr: str, bits: int) -> str:
 
 
 def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
-    calls = spec.build(ns, spec.input)
+    # --bits overrides the filter's input expression (depth(X,16) -> depth(X,32))
+    # for BOTH the chain and the cached frames: the chain must consume the same
+    # format the cache holds, or the timed region re-converts behind the filter
+    input_expr = _input_for_bits(spec.input, ns.bits) if ns.bits else spec.input
+    calls = spec.build(ns, input_expr)
     plugins = ns.plugins or list(calls)
     plugins = [p for p in plugins if p in calls]
     if not plugins:
@@ -369,9 +373,7 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
     cache_frames = ns.cache_frames if (ns.cached and synth is None) else None
     # the cache holds frames in the filter's input format (e.g. depth(clip,16))
     # so the timed region measures only filter throughput, like --synthetic
-    cache_conv = spec.input if cache_frames else None
-    if cache_conv and ns.bits:
-        cache_conv = _input_for_bits(cache_conv, ns.bits)
+    cache_conv = input_expr if cache_frames else None
     if synth:
         clip_desc = f"BlankClip 1920x1080 {synth.removeprefix('vs.')}"
     else:
