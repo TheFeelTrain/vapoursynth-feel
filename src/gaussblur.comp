@@ -75,6 +75,15 @@ float load_value(int idx) {
 #endif
 }
 
+// load from an absolute element index (the caller precomputes src_base itself)
+float load_value_raw(int idx) {
+#if BITS == 32
+    return src[idx];
+#else
+    return float(int(src[idx]));
+#endif
+}
+
 void store_value(int idx, float v) {
 #if BITS == 32
     dst[pc.dst_base + idx] = v;
@@ -84,6 +93,33 @@ void store_value(int idx, float v) {
     dst[pc.dst_base + idx] = uint16_t(uint(clamp(roundEven(v), 0.0f, PEAK)) & 0xFFFFu);
 #endif
 }
+
+#if defined(ENTRY_HORIZ) && (BITS == 16)
+// raw dword view of the 16-bit output buffer (even element = low halfword),
+// used by the packed pair stores of the horizontal pass
+layout(std430, binding = 4) writeonly buffer DstU32 { uint dst32[]; };
+
+// Horizontal-pass output, interior rows only: write R consecutive values as
+// packed dword pairs (R/2 32-bit stores). The caller guarantees x0 is even
+// and x0+R-1 < WIDTH, so each thread owns its dwords outright.
+void store_row_packed(int row, int x0, float vals[R]) {
+    const int base32 = (pc.dst_base + row + x0) >> 1;   // dword index
+    #pragma unroll
+    for (int p = 0; p < R / 2; ++p) {
+        const uint lo = uint(clamp(roundEven(vals[2 * p]), 0.0f, PEAK)) & 0xFFFFu;
+        const uint hi = uint(clamp(roundEven(vals[2 * p + 1]), 0.0f, PEAK)) & 0xFFFFu;
+        dst32[base32 + p] = lo | (hi << 16);
+    }
+}
+#elif defined(ENTRY_HORIZ)
+// float path: no packing needed, plain stores
+void store_row_packed(int row, int x0, float vals[R]) {
+    #pragma unroll
+    for (int j = 0; j < R; ++j) {
+        dst[pc.dst_base + row + x0 + j] = vals[j];
+    }
+}
+#endif
 
 // mirror reflects a raw (possibly out-of-range) tap coordinate
 int mirror(int i, int dim) {
@@ -146,10 +182,16 @@ void main() {
 
 #elif defined(ENTRY_VERT)
 
-// R consecutive output rows per thread; the rolling weight window reproduces
-// the per-pixel ascending-k FMAs exactly. The taps beyond the kernel length
-// carry wreg[j] == 0.0f, so `fma(v, 0, sum)` is an exact no-op and the sum
-// loop needs no per-tap branch (matching the reference CUDA kernel).
+// Large path, vertical pass. R consecutive output rows per thread; the rolling
+// weight window reproduces the per-pixel ascending-k FMAs exactly (taps past
+// the kernel length carry wreg[j] == 0.0f, an exact no-op).
+//
+// Optimizations over the naive rolling window (bit-exactness preserved — the
+// FMA sequence per output pixel is unchanged):
+// - interior threads (no mirror needed for any tap) run a branch-free loop
+//   with incrementing row addresses; only edge threads take the mirror path
+// - two tap rows are in flight at once (even/odd k), so the VMEM engine
+//   overlaps loads instead of stalling on every tap
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 void main() {
     const int x = int(gl_GlobalInvocationID.x);
@@ -159,17 +201,53 @@ void main() {
     float sum[R], wreg[R];
     #pragma unroll
     for (int j = 0; j < R; ++j) { sum[j] = 0.0f; wreg[j] = 0.0f; }
-    for (int k = 0; k < KLEN + (R - 1); ++k) {
-        #pragma unroll
-        for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];   // slide the window
-        wreg[0] = (k < KLEN) ? wt[pc.wt_base + k] : 0.0f;
-        int sy = y0 + k - radius;
-        sy = mirror(sy, HEIGHT);
-        sy = min(max(sy, 0), HEIGHT - 1);                // no-op for valid radius
-        const float v = load_value(sy * STRIDE + x);
-        #pragma unroll
-        for (int j = 0; j < R; ++j)
-            sum[j] = fma(v, wreg[j], sum[j]);
+
+    // the thread is interior when every row it reads — the full rolling
+    // window, i.e. [y0-radius, y0+taps-1-radius] — is in range: no mirror
+    // anywhere, no out-of-bounds loads
+    const int taps_v = KLEN + (R - 1);
+    const bool interior = y0 - radius >= 0 && y0 + taps_v - 1 - radius < HEIGHT;
+
+    if (interior) {
+        const int idx0 = pc.src_base + (y0 - radius) * STRIDE + x;
+        const int taps = KLEN + (R - 1);
+        for (int k = 0; k < taps; k += 2) {
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+            wreg[0] = (k < KLEN) ? wt[pc.wt_base + k] : 0.0f;
+            // both tap rows are issued before either FMA batch, so the VMEM
+            // engine has two loads in flight instead of stalling per tap
+            const float v0 = load_value_raw(idx0 + k * STRIDE);
+            if (k + 1 < taps) {
+                const float v1 = load_value_raw(idx0 + (k + 1) * STRIDE);
+                #pragma unroll
+                for (int j = 0; j < R; ++j)
+                    sum[j] = fma(v0, wreg[j], sum[j]);
+                #pragma unroll
+                for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+                wreg[0] = (k + 1 < KLEN) ? wt[pc.wt_base + k + 1] : 0.0f;
+                #pragma unroll
+                for (int j = 0; j < R; ++j)
+                    sum[j] = fma(v1, wreg[j], sum[j]);
+            } else {
+                #pragma unroll
+                for (int j = 0; j < R; ++j)
+                    sum[j] = fma(v0, wreg[j], sum[j]);
+            }
+        }
+    } else {
+        for (int k = 0; k < KLEN + (R - 1); ++k) {
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+            wreg[0] = (k < KLEN) ? wt[pc.wt_base + k] : 0.0f;
+            int sy = y0 + k - radius;
+            sy = mirror(sy, HEIGHT);
+            sy = min(max(sy, 0), HEIGHT - 1);
+            const float v = load_value(sy * STRIDE + x);
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                sum[j] = fma(v, wreg[j], sum[j]);
+        }
     }
     #pragma unroll
     for (int j = 0; j < R; ++j) {
@@ -179,8 +257,11 @@ void main() {
 
 #elif defined(ENTRY_HORIZ)
 
-// R consecutive output columns per thread, reading the vertical pass' float
-// buffer.
+// Large path, horizontal pass: R consecutive output columns per thread,
+// reading the vertical pass' float tmp buffer. Same optimizations as the
+// vertical pass (interior fast path + two taps in flight), plus the output
+// is written as packed dword pairs — R/2 32-bit stores instead of R 16-bit
+// stores (thread ownership of whole dwords is guaranteed: x0 is even).
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 void main() {
     const int x0 = int(gl_GlobalInvocationID.x) * R;     // first output column
@@ -191,21 +272,56 @@ void main() {
     float sum[R], wreg[R];
     #pragma unroll
     for (int j = 0; j < R; ++j) { sum[j] = 0.0f; wreg[j] = 0.0f; }
-    for (int k = 0; k < KLEN + (R - 1); ++k) {
+
+    // interior: no column tap ever needs the mirror (the full rolling window
+    // [x0-radius, x0+taps-1-radius] is in range), which also implies x0 and
+    // x0+R-1 are both in range, so every output and packed store is valid
+    const int taps_h = KLEN + (R - 1);
+    const bool interior = x0 - radius >= 0 && x0 + taps_h - 1 - radius < WIDTH;
+
+    if (interior) {
+        const int base = pc.tmp_base + row + x0 - radius;
+        const int taps = KLEN + (R - 1);
+        for (int k = 0; k < taps; k += 2) {
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+            wreg[0] = (k < KLEN) ? wt[pc.wt_base + k] : 0.0f;
+            const float v0 = tmp[base + k];
+            if (k + 1 < taps) {
+                const float v1 = tmp[base + k + 1];
+                #pragma unroll
+                for (int j = 0; j < R; ++j)
+                    sum[j] = fma(v0, wreg[j], sum[j]);
+                #pragma unroll
+                for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+                wreg[0] = (k + 1 < KLEN) ? wt[pc.wt_base + k + 1] : 0.0f;
+                #pragma unroll
+                for (int j = 0; j < R; ++j)
+                    sum[j] = fma(v1, wreg[j], sum[j]);
+            } else {
+                #pragma unroll
+                for (int j = 0; j < R; ++j)
+                    sum[j] = fma(v0, wreg[j], sum[j]);
+            }
+        }
+        store_row_packed(row, x0, sum);
+    } else {
+        for (int k = 0; k < KLEN + (R - 1); ++k) {
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];   // slide the window
+            wreg[0] = (k < KLEN) ? wt[pc.wt_base + k] : 0.0f;
+            int sx = x0 + k - radius;
+            sx = mirror(sx, WIDTH);
+            sx = min(max(sx, 0), WIDTH - 1);                 // no-op for valid radius
+            const float v = tmp[pc.tmp_base + row + sx];
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                sum[j] = fma(v, wreg[j], sum[j]);
+        }
         #pragma unroll
-        for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];   // slide the window
-        wreg[0] = (k < KLEN) ? wt[pc.wt_base + k] : 0.0f;
-        int sx = x0 + k - radius;
-        sx = mirror(sx, WIDTH);
-        sx = min(max(sx, 0), WIDTH - 1);                 // no-op for valid radius
-        const float v = tmp[pc.tmp_base + row + sx];
-        #pragma unroll
-        for (int j = 0; j < R; ++j)
-            sum[j] = fma(v, wreg[j], sum[j]);
-    }
-    #pragma unroll
-    for (int j = 0; j < R; ++j) {
-        if (x0 + j < WIDTH) store_value(row + x0 + j, sum[j]);
+        for (int j = 0; j < R; ++j) {
+            if (x0 + j < WIDTH) store_value(row + x0 + j, sum[j]);
+        }
     }
 }
 
