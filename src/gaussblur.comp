@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_shader_16bit_storage : require
 
 /*
  * GaussBlur — separable per-plane Gaussian blur (Vulkan port of the vszipcl /
@@ -20,9 +21,12 @@
  * input is the raw code (no scaling), integer output rounds to nearest even
  * and saturates (convert_*_sat_rte).
  *
- * Compile-time variants: -DBITS=16|32. The staging buffer holds the raw
- * VapourSynth plane bytes and the kernel performs the format conversion
- * itself, so the host side only memcpys raw bytes.
+ * All buffers live in device-local VRAM (the host moves frames in/out with
+ * DMA copies in the same command buffer). Compile-time variants:
+ * -DBITS=16|32. The 16-bit path uses native uint16_t SSBO elements (the
+ * device enables storageBuffer16BitAccess), so loads and stores are plain
+ * coalesced element accesses — no shift/mask unpacking, no dword packing,
+ * no atomics.
  */
 
 #if !defined(BITS)
@@ -30,16 +34,12 @@
 #endif
 
 #if BITS == 16
-#define ELEM_BYTES 2
-#define ELEM_MASK  0xFFFFu
-#define PEAK       65535.0f
+#define IO_TYPE uint16_t
+#define PEAK    65535.0f
 #else
-#define ELEM_BYTES 4
-#define ELEM_MASK  0xFFFFFFFFu
-#define PEAK       1.0f
+#define IO_TYPE float
+#define PEAK    1.0f
 #endif
-
-#define ELEM_SHIFT(byte) (8 * ((byte) & 3))
 
 const int BLK_X = 16;
 const int BLK_Y = 8;
@@ -53,12 +53,12 @@ layout(constant_id = 3) const int KLEN = 1;
 layout(constant_id = 4) const int RAD = 0;
 
 layout(std430, binding = 0) readonly buffer WtBuf { float wt[]; };
-layout(std430, binding = 1) readonly buffer SrcBuf { uint src_raw[]; };
-layout(std430, binding = 2) buffer DstBuf { uint dst_raw[]; };
+layout(std430, binding = 1) readonly buffer SrcBuf { IO_TYPE src[]; };
+layout(std430, binding = 2) writeonly buffer DstBuf { IO_TYPE dst[]; };
 layout(std430, binding = 3) buffer TmpBuf { float tmp[]; };
 
-// the bases are RAW BYTE offsets (the kernel converts to dword indices
-// itself); wt_base is a float element offset into the weights buffer
+// element offsets into the VRAM buffers; wt_base is a float element offset
+// into the weights buffer
 layout(push_constant) uniform PushConstants {
     int src_base;
     int dst_base;
@@ -66,37 +66,22 @@ layout(push_constant) uniform PushConstants {
     int wt_base;
 } pc;
 
-uint load_raw(int idx) {
-    int byte = idx * ELEM_BYTES;
-    uint word = src_raw[(pc.src_base + byte) >> 2];
-    return (word >> ELEM_SHIFT(byte)) & ELEM_MASK;
-}
-
 float load_value(int idx) {
 #if BITS == 32
-    return uintBitsToFloat(load_raw(idx));
+    return src[pc.src_base + idx];
 #else
-    return float(load_raw(idx));
-#endif
-}
-
-void store_raw(int idx, uint val) {
-    int byte = idx * ELEM_BYTES;
-    int wi = (pc.dst_base + byte) >> 2;
-#if BITS == 32
-    dst_raw[wi] = val;
-#else
-    // masked OR into a shared dword; the host clears the download region
-    // before submission, so no lost-update race between paired lanes
-    atomicOr(dst_raw[wi], (val & ELEM_MASK) << ELEM_SHIFT(byte));
+    // direct uint16_t->float conversion chokes glslc; int() widens cleanly
+    return float(int(src[pc.src_base + idx]));
 #endif
 }
 
 void store_value(int idx, float v) {
 #if BITS == 32
-    store_raw(idx, floatBitsToUint(v));
+    dst[pc.dst_base + idx] = v;
 #else
-    store_raw(idx, uint(clamp(roundEven(v), 0.0, PEAK)) & ELEM_MASK);
+    // glslc -O chokes on a direct float->uint16_t convert (OpUConvert); go
+    // through uint with an explicit mask (same workaround as nlmeans/dfttest)
+    dst[pc.dst_base + idx] = uint16_t(uint(clamp(roundEven(v), 0.0f, PEAK)) & 0xFFFFu);
 #endif
 }
 
@@ -108,44 +93,6 @@ int mirror(int i, int dim) {
         return 2 * (dim - 1) - i;
     }
     return i;
-}
-
-// convert a computed value to its packed integer form (the low halfword
-// of the returned uint for the sub-32-bit formats)
-uint pack_value(float v) {
-#if BITS == 32
-    return floatBitsToUint(v);
-#else
-    return uint(clamp(roundEven(v), 0.0, PEAK)) & ELEM_MASK;
-#endif
-}
-
-// Horizontal-pass output: write R consecutive values as whole dwords. Every
-// thread owns R adjacent columns, so it owns each dword it touches and can
-// write plain (non-atomic) stores even for the 16-bit format. The OOB
-// lanes are zeroed (the download region is pre-cleared), so packing is safe.
-void store_row(int row, int x0, float vals[R]) {
-#if BITS == 32
-    for (int j = 0; j < R; ++j) {
-        if (x0 + j < WIDTH) {
-            dst_raw[(pc.dst_base >> 2) + row + x0 + j] = floatBitsToUint(vals[j]);
-        }
-    }
-#else
-    const int per = 4 / ELEM_BYTES;            // elements per dword
-    const int n_dwords = R / per;
-    const int base = (pc.dst_base + (row + x0) * ELEM_BYTES) >> 2;
-    for (int d = 0; d < n_dwords; ++d) {
-        uint w = 0u;
-        for (int e = 0; e < per; ++e) {
-            const int c = x0 + d * per + e;
-            if (c < WIDTH) {
-                w |= pack_value(vals[d * per + e]) << (8 * ELEM_BYTES * e);
-            }
-        }
-        dst_raw[base + d] = w;
-    }
-#endif
 }
 
 #if defined(ENTRY_GAUSS)
@@ -226,7 +173,7 @@ void main() {
     }
     #pragma unroll
     for (int j = 0; j < R; ++j) {
-        if (y0 + j < HEIGHT) tmp[(pc.tmp_base >> 2) + (y0 + j) * STRIDE + x] = sum[j];
+        if (y0 + j < HEIGHT) tmp[pc.tmp_base + (y0 + j) * STRIDE + x] = sum[j];
     }
 }
 
@@ -251,12 +198,15 @@ void main() {
         int sx = x0 + k - radius;
         sx = mirror(sx, WIDTH);
         sx = min(max(sx, 0), WIDTH - 1);                 // no-op for valid radius
-        const float v = tmp[(pc.tmp_base >> 2) + row + sx];
+        const float v = tmp[pc.tmp_base + row + sx];
         #pragma unroll
         for (int j = 0; j < R; ++j)
             sum[j] = fma(v, wreg[j], sum[j]);
     }
-    store_row(row, x0, sum);
+    #pragma unroll
+    for (int j = 0; j < R; ++j) {
+        if (x0 + j < WIDTH) store_value(row + x0 + j, sum[j]);
+    }
 }
 
 #endif

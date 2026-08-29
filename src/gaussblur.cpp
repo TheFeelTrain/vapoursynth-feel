@@ -53,10 +53,13 @@ struct PlaneConfig {
     uint32_t v_grid_y {};            // large vertical dispatch
     uint32_t h_grid_x {};
     uint32_t h_grid_y {};            // large horizontal dispatch
-    VkDeviceSize upload_offset {};   // bytes, offset within staging
+    VkDeviceSize upload_offset {};   // bytes, offset within staging upload area
     VkDeviceSize upload_size {};     // bytes
-    VkDeviceSize download_offset {}; // bytes, offset within download area
+    VkDeviceSize download_offset {}; // bytes, offset within staging download area
     VkDeviceSize download_size {};   // bytes
+    VkDeviceSize src_elem {};        // element offset into the VRAM source buffer
+    VkDeviceSize dst_elem {};        // element offset into the VRAM destination buffer
+    VkDeviceSize tmp_elem {};        // float element offset into the VRAM tmp buffer
     VkDeviceSize tmp_offset {};      // bytes, offset within tmp area (large path)
     VkDeviceSize tmp_size {};        // bytes
     uint32_t wt_base {};             // float element offset into the weights buffer
@@ -65,6 +68,10 @@ struct PlaneConfig {
 struct GaussBlurResource {
     VkBuffer staging {};
     VkDeviceMemory staging_mem {};
+    VkBuffer src_buf {};        // device-local input planes (VRAM)
+    VkDeviceMemory src_mem {};
+    VkBuffer dst_buf {};        // device-local output planes (VRAM)
+    VkDeviceMemory dst_mem {};
     VkBuffer tmp_buf {};         // device-local float intermediate (large path)
     VkDeviceMemory tmp_mem {};
     VkCommandPool pool {};
@@ -103,7 +110,6 @@ struct GaussData {
     VkDeviceSize upload_total {};
     VkDeviceSize download_total {};
     VkDeviceSize tmp_total {};
-    bool need_fill {};
     std::array<PlaneConfig, 3> planes {};
     FramePool<GaussBlurResource> pool;
 
@@ -123,6 +129,18 @@ struct GaussData {
             }
             if (resource.tmp_buf) {
                 vkDestroyBuffer(dev, resource.tmp_buf, nullptr);
+            }
+            if (resource.dst_mem) {
+                vkFreeMemory(dev, resource.dst_mem, nullptr);
+            }
+            if (resource.dst_buf) {
+                vkDestroyBuffer(dev, resource.dst_buf, nullptr);
+            }
+            if (resource.src_mem) {
+                vkFreeMemory(dev, resource.src_mem, nullptr);
+            }
+            if (resource.src_buf) {
+                vkDestroyBuffer(dev, resource.src_buf, nullptr);
             }
             destroy_common(dev, resource);
         }
@@ -310,10 +328,11 @@ static std::variant<VkPipeline, std::string> create_pipeline(
 }
 
 // Records the dispatch sequence for all planes into a single pre-recorded
-// command buffer (all plane regions are disjoint, so the dispatches of
-// different planes can overlap on the GPU). The kernel reads its input and
-// writes its output straight from/to the staging buffer; the large path also
-// uses a float tmp region within the same buffer.
+// command buffer. The frame bytes are moved by two big DMA copies at the
+// head and tail (staging upload area -> VRAM src, VRAM dst -> staging
+// download area); the kernels then read and write device-local VRAM only.
+// All plane regions are disjoint, so the dispatches of different planes can
+// overlap on the GPU.
 static std::optional<std::string> record_command_buffer(
     const GaussData & d, GaussBlurResource & resource) {
 
@@ -330,22 +349,19 @@ static std::optional<std::string> record_command_buffer(
         return "vkBeginCommandBuffer failed";
     }
 
-        // the 8/16-bit io kernels use masked atomicOr for sub-dword stores, so
-        // their download regions must be cleared before every submission; the
-        // 32-bit kernel packs complete dwords and needs no clearing
-        if (d.need_fill) {
-            vkCmdFillBuffer(resource.cmd, resource.staging,
-                d.upload_total, d.download_total, 0);
-            {
-                VkMemoryBarrier mem_barrier {
-                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                    .pNext = nullptr,
-                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
-                };
-                vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
-            }
+        // upload: staging -> VRAM src (one copy, all planes are contiguous)
+        if (d.upload_total > 0) {
+            const VkBufferCopy upload_region { 0, 0, d.upload_total };
+            vkCmdCopyBuffer(resource.cmd, resource.staging, resource.src_buf,
+                1, &upload_region);
+            VkMemoryBarrier copy_barrier {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+            };
+            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &copy_barrier, 0, nullptr, 0, nullptr);
         }
 
         for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
@@ -354,14 +370,12 @@ static std::optional<std::string> record_command_buffer(
             }
             const auto & cfg = d.planes[plane];
 
-            // push constants are RAW BYTE offsets (the kernel converts to dword
-            // indices itself); wt_base is a float element offset. src/dst
-            // point into the host-visible staging buffer, tmp into the
-            // device-local intermediate buffer.
+            // push constants are element offsets into the VRAM buffers;
+            // wt_base is a float element offset into the weights buffer
             const int32_t push_constants[4] {
-                static_cast<int32_t>(cfg.upload_offset),
-                static_cast<int32_t>(d.upload_total + cfg.download_offset),
-                static_cast<int32_t>(cfg.tmp_offset),
+                static_cast<int32_t>(cfg.src_elem),
+                static_cast<int32_t>(cfg.dst_elem),
+                static_cast<int32_t>(cfg.tmp_elem),
                 static_cast<int32_t>(cfg.wt_base)
             };
 
@@ -409,6 +423,21 @@ static std::optional<std::string> record_command_buffer(
             }
         }
 
+        // download: VRAM dst -> staging (one copy, all planes contiguous)
+        if (d.download_total > 0) {
+            VkMemoryBarrier kernel_barrier {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT
+            };
+            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &kernel_barrier, 0, nullptr, 0, nullptr);
+            const VkBufferCopy download_region { 0, d.upload_total, d.download_total };
+            vkCmdCopyBuffer(resource.cmd, resource.dst_buf, resource.staging,
+                1, &download_region);
+        }
+
     if (vkEndCommandBuffer(resource.cmd) != VK_SUCCESS) {
         return "vkEndCommandBuffer failed";
     }
@@ -416,9 +445,58 @@ static std::optional<std::string> record_command_buffer(
     return std::nullopt;
 }
 
-// ---------------------------------------------------------------------------
-// Frame processing
-// ---------------------------------------------------------------------------
+// Env-gated per-frame GPU probe (n==0 only, like dfttest's GPU_BENCH): re-runs
+// the pre-recorded command buffer N times, and separately times a copies-only
+// and a kernels-only recording, printing per-iteration µs to stderr.
+static void gpu_bench_probe(GaussData * d, GaussBlurResource & resource, int n) {
+    static const char * gb = getenv("VSFEEL_GAUSS_GPU_BENCH");
+    if (!gb || n != 0) {
+        return;
+    }
+    const int iters = std::max(atoi(gb), 1);
+    VkDevice dev = d->device->device;
+
+    vkDeviceWaitIdle(dev);
+
+    // warm everything up (caches, pipelines)
+    for (int i = 0; i < 3; ++i) {
+        checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
+            resource.cmd, resource.fence));
+        checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
+    }
+
+    auto time_cbs = [&](const char * name, int repeats) {
+        auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
+                resource.cmd, resource.fence));
+            checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
+        }
+        auto stop = std::chrono::steady_clock::now();
+        const double us =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start).count()
+            / 1000.0 / (iters * repeats);
+        fprintf(stderr, "[gaussblur-gpu-bench] %-*s %9.1f us/frame (x%d)\n",
+            28, name, us, repeats);
+    };
+
+    // 1) full pre-recorded CB: copies + kernels
+    time_cbs("full (copies+kernels)", 1);
+
+    // 2) kernels only: record a CB without the two DMA copies (the src VRAM
+    //    already holds frame 0's bytes from the warmup, so output is valid)
+    {
+        GaussData probe = *d;
+        probe.upload_total = 0;
+        probe.download_total = 0;
+        if (record_command_buffer(probe, resource)) {
+            fprintf(stderr, "[gaussblur-gpu-bench] kernels-only re-record failed\n");
+            return;
+        }
+        time_cbs("kernels only", 1);
+    }
+    fprintf(stderr, "[gaussblur-gpu-bench] done\n");
+}
 
 static const VSFrame *VS_CC GaussGetFrame(
     int n, int activationReason, void *instanceData, void **frameData,
@@ -991,7 +1069,9 @@ static void VS_CC GaussCreate(
     }
 
     // Buffer region offsets (raw bytes), each region 32-byte aligned so the
-    // streaming copies can use aligned loads/stores
+    // streaming copies can use aligned loads/stores. The staging layout and
+    // the VRAM src/dst layouts are identical, so one DMA copy per direction
+    // moves every plane at once.
     auto align32 = [](VkDeviceSize v) { return (v + 31) & ~VkDeviceSize(31); };
 
     VkDeviceSize upload_total = 0;
@@ -1016,21 +1096,26 @@ static void VS_CC GaussCreate(
         cfg.download_size = plane_bytes;
         download_total = align32(cfg.download_offset + cfg.download_size);
 
+        // the VRAM buffers mirror the staging layout byte-for-byte
+        cfg.src_elem = cfg.upload_offset / d->elem_bytes;
+        cfg.dst_elem = cfg.download_offset / d->elem_bytes;
+
         cfg.tmp_offset = align32(tmp_total);
         cfg.tmp_size = tmp_bytes;
+        cfg.tmp_elem = cfg.tmp_offset / 4;
         tmp_total = align32(cfg.tmp_offset + cfg.tmp_size);
     }
 
     d->upload_total = upload_total;
     d->download_total = download_total;
     d->tmp_total = tmp_total;
-    d->need_fill = d->bits != 32;
 
     const VkDeviceSize min_size = 4;
-    // the large path's float intermediate lives in a separate device-local
-    // buffer (see below), so the host-visible staging only carries the raw
-    // source/destination planes
+    // the host-visible staging only carries raw plane bytes; the kernels'
+    // src/dst/tmp live in device-local VRAM (see below)
     const VkDeviceSize staging_size = std::max(upload_total + download_total, 2 * min_size);
+    const VkDeviceSize src_size = std::max(upload_total, min_size);
+    const VkDeviceSize dst_size = std::max(download_total, min_size);
     const VkDeviceSize tmp_size = std::max(tmp_total, min_size);
 
     // Resources
@@ -1049,7 +1134,7 @@ static void VS_CC GaussCreate(
                 .pNext = nullptr,
                 .flags = 0,
                 .size = staging_size,
-                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
                 .queueFamilyIndexCount = 0,
                 .pQueueFamilyIndices = nullptr
@@ -1067,6 +1152,52 @@ static void VS_CC GaussCreate(
             }
             resource.staging_mem = std::get<AllocatedMemory>(result).memory;
             resource.staging_type_index = std::get<AllocatedMemory>(result).type_index;
+        }
+
+        // device-local input planes: the H2D DMA copy writes them, the
+        // kernels read them
+        {
+            VkBufferCreateInfo buffer_info {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .size = src_size,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr
+            };
+            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.src_buf));
+
+            const auto result = allocate_memory(
+                *d->device, resource.src_buf, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            resource.src_mem = std::get<AllocatedMemory>(result).memory;
+        }
+
+        // device-local output planes: the kernels write them, the D2H DMA
+        // copy reads them
+        {
+            VkBufferCreateInfo buffer_info {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .size = dst_size,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr
+            };
+            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.dst_buf));
+
+            const auto result = allocate_memory(
+                *d->device, resource.dst_buf, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            resource.dst_mem = std::get<AllocatedMemory>(result).memory;
         }
 
         // the large path's float intermediate buffer: device-local so the two
@@ -1142,19 +1273,19 @@ static void VS_CC GaussCreate(
                 .range = VK_WHOLE_SIZE
             };
             VkDescriptorBufferInfo src_info {
-                .buffer = resource.staging,
+                .buffer = resource.src_buf,
                 .offset = 0,
-                .range = staging_size
+                .range = VK_WHOLE_SIZE
             };
             VkDescriptorBufferInfo dst_info {
-                .buffer = resource.staging,
+                .buffer = resource.dst_buf,
                 .offset = 0,
-                .range = staging_size
+                .range = VK_WHOLE_SIZE
             };
             VkDescriptorBufferInfo tmp_info {
-                .buffer = resource.tmp_buf ? resource.tmp_buf : resource.staging,
+                .buffer = resource.tmp_buf ? resource.tmp_buf : resource.src_buf,
                 .offset = 0,
-                .range = resource.tmp_buf ? VK_WHOLE_SIZE : staging_size
+                .range = VK_WHOLE_SIZE
             };
 
             VkWriteDescriptorSet writes[4] {
