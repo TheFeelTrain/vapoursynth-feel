@@ -2,9 +2,10 @@
 
 The committed tests/noise_24f.mkv clip (24 frames of random noise) is used as
 the input. The vsfeel implementation is a brand-new Vulkan port of the EEDI3
-family-A algorithm; the reference oracles are eedi3vk2 (Vulkan, bit-exact on
-the shared parameter surface) and eedi3m (original CPU implementation, used as
-a loose sanity oracle where eedi3vk2 lacks a parameter such as cost3/ucubic).
+family-A algorithm; the reference oracle is eedi3vk2 (Vulkan, bit-exact on the
+shared parameter surface). eedi3m (original CPU implementation) is used only
+as a coarse cross-check where useful; it is not an oracle (its default AVX2
+float DP flips a handful of argmins vs the GPU family).
 
 Agreement measured on the noise clip (640x360, interp rows only):
 
@@ -372,41 +373,6 @@ def test_eedi3_matches_vk2_reference(bits, cases):
     for (kwargs, tol), maxdiff in zip(cases, maxdiffs):
         assert maxdiff < tol or maxdiff == 0, (
             f"max diff {maxdiff} vs eedi3vk2 for {kwargs} (tol {tol})")
-
-
-# ---------------------------------------------------------------------------
-# eedi3m loose sanity (cost3 / ucubic, which eedi3vk2 lacks)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("kwargs", [
-    {"field": 1, "mdis": 5, "nrad": 1, "vcheck": 0, "cost3": 0},
-    {"field": 1, "mdis": 5, "nrad": 1, "vcheck": 0, "ucubic": 0},
-    {"field": 1, "mdis": 20, "nrad": 3, "vcheck": 0, "cost3": 0},
-    {"field": 1, "mdis": 20, "nrad": 3, "vcheck": 0, "ucubic": 0},
-    {"field": 1, "mdis": 5, "nrad": 1, "vcheck": 0,
-     "cost3": 0, "ucubic": 0},
-], ids=lambda kw: str(kw) or "defaults")
-def test_eedi3_cost3_ucubic_close_to_eedi3m(noise_16bit, kwargs):
-    """cost3/ucubic only exist in vsfeel and eedi3m. The noise-clip agreement
-    is >= 99.9% of interp pixels within 1 LSB (measured 99.86% worst on the
-    mdis20/nrad3 cost3=0 config); the tiny residue is the documented float-DP
-    argmin flip set, identical to the eedi3m-vs-eedi3vk2 divergence."""
-    if not hasattr(vs.core, "eedi3m") or not hasattr(vs.core.eedi3m, "EEDI3"):
-        pytest.skip("no eedi3m.EEDI3 reference")
-    core = vs.core
-    # eedi3m takes the same integer-domain parameters (native u16 scale).
-    ref = core.eedi3m.EEDI3(noise_16bit, **kwargs)
-    my = core.vsfeel.EEDI3(noise_16bit, **kwargs)
-    worst_frac = 0.0
-    for n in (0, 11, 23):
-        a = _plane(my.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
-        b = _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
-        rows = _interp_rows(HEIGHT, n, kwargs["field"])
-        d = np.abs(a - b)[rows]
-        assert d.max() <= 65535  # sane
-        worst_frac = max(worst_frac, float((d > 1).sum()) / float(d.size))
-    # measured worst case ~0.14%; leave generous headroom for other content
-    assert worst_frac < 0.02, f"worst interp mismatch fraction {worst_frac}"
 
 
 # ---------------------------------------------------------------------------

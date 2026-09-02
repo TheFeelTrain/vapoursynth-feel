@@ -126,7 +126,7 @@ struct Eedi3Data {
     bool process[MAX_PLANES] { true, true, true };
 
     int field {}, nrad { 2 }, mdis { 20 }, vcheck { 2 };
-    bool dh {}, cost3 { true }, ucubic { true };
+    bool dh {};
     float alpha { 0.2f }, beta { 0.25f }, gamma { 20.0f };
     float vthresh2 { 4.0f };
     float rw {}, rcp_vth0 {}, rcp_vth1 {}, rcp_vth2 {};
@@ -136,12 +136,12 @@ struct Eedi3Data {
     // for the same width are shared by all planes of that width
     struct WidthKey {
         int width, rows, tpitch, pad_stride, pad_height;
-        int has_mclip, has_sclip, vcheck, cost3, ucubic;
+        int has_mclip, has_sclip, vcheck;
         bool operator==(const WidthKey & o) const {
             return width == o.width && rows == o.rows && tpitch == o.tpitch &&
                    pad_stride == o.pad_stride && pad_height == o.pad_height &&
                    has_mclip == o.has_mclip && has_sclip == o.has_sclip &&
-                   vcheck == o.vcheck && cost3 == o.cost3 && ucubic == o.ucubic;
+                   vcheck == o.vcheck;
         }
     };
 
@@ -351,13 +351,11 @@ struct RowSpecData {
     int32_t has_mclip;
     int32_t has_sclip;
     int32_t vcheck;
-    int32_t cost3;
-    int32_t ucubic;
     int32_t lsz_row;
     int32_t lsz_vcheck;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 10> row_entries {{
+static constexpr std::array<VkSpecializationMapEntry, 8> row_entries {{
     { 0,  0, sizeof(int32_t) },
     { 1,  4, sizeof(int32_t) },
     { 2,  8, sizeof(int32_t) },
@@ -366,8 +364,6 @@ static constexpr std::array<VkSpecializationMapEntry, 10> row_entries {{
     { 5, 20, sizeof(int32_t) },
     { 6, 24, sizeof(int32_t) },
     { 7, 28, sizeof(int32_t) },
-    { 8, 32, sizeof(int32_t) },
-    { 9, 36, sizeof(int32_t) },
 }};
 
 static std::variant<VkPipeline, std::string> create_pipeline(
@@ -912,8 +908,6 @@ static void VS_CC Eedi3Create(
     d->gamma = get_float("gamma", 20.0f);
     d->nrad = get_int("nrad", 2);
     d->mdis = get_int("mdis", 20);
-    d->ucubic = get_int("ucubic", 1) != 0;
-    d->cost3 = get_int("cost3", 1) != 0;
     d->vcheck = get_int("vcheck", 2);
     float vthresh0 = get_float("vthresh0", 32.0f);
     float vthresh1 = get_float("vthresh1", 64.0f);
@@ -1056,17 +1050,17 @@ static void VS_CC Eedi3Create(
         d->device = std::get<std::shared_ptr<VK_Device>>(result);
     }
 
-    // eedi3m scaling (see EEDI3.cpp create):
+    // eedi3m scaling (see EEDI3.cpp create), with cost3 always on (GPU family
+    // semantics — eedi3vk2/vszip* have no cost3 switch and always do alpha/3
+    // and sum s0+s1+s2):
     //   remainingWeight = 1 - alpha - beta   (raw, before alpha/3)
-    //   if cost3: alpha /= 3
+    //   alpha /= 3   (cost3)
     //   int:  beta *= 2^(bits-8), gamma *= 2^(bits-8),
     //         vthresh0 *= 2^(bits-8), vthresh1 *= 2^(bits-8)
     //   float: beta /= 255, gamma /= 255, vthresh0 /= 255, vthresh1 /= 255
     //   vthresh2 is never scaled; alpha is never /255.
     d->rw = 1.0f - d->alpha - d->beta;
-    if (d->cost3) {
-        d->alpha /= 3.0f;
-    }
+    d->alpha /= 3.0f;
     if (d->vi->format.sampleType == stInteger) {
         d->peak = (1 << d->vi->format.bitsPerSample) - 1;
         const int scale = 1 << (d->vi->format.bitsPerSample - 8);
@@ -1085,7 +1079,7 @@ static void VS_CC Eedi3Create(
     d->rcp_vth1 = 1.0f / vthresh1;
     d->rcp_vth2 = 1.0f / d->vthresh2;
 
-    // Workgroup sizes (spec constants 8/9 in the shaders): the row kernel's DP
+    // Workgroup sizes (spec constants 6/7 in the shaders): the row kernel's DP
     // needs exactly one lane per direction u in [-mdis..mdis], so its local
     // size is TPITCH (a non-power-of-two like 81 is fine — no subgroup ops).
     // The vcheck kernel is a single WG striding over columns (up to WIDTH).
@@ -1292,8 +1286,6 @@ static void VS_CC Eedi3Create(
         .has_mclip = d->mclip_node ? 1 : 0,
         .has_sclip = (d->vcheck > 0 && d->sclip_node) ? 1 : 0,
         .vcheck = d->vcheck,
-        .cost3 = d->cost3 ? 1 : 0,
-        .ucubic = d->ucubic ? 1 : 0,
         .lsz_row = lsz_row,
         .lsz_vcheck = lsz_vcheck,
     };
@@ -1532,8 +1524,6 @@ void vsfeel_register_eedi3(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
         "gamma:float:opt;"
         "nrad:int:opt;"
         "mdis:int:opt;"
-        "ucubic:int:opt;"
-        "cost3:int:opt;"
         "vcheck:int:opt;"
         "vthresh0:float:opt;"
         "vthresh1:float:opt;"

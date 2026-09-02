@@ -48,7 +48,7 @@
  * ENTRY_VCHECK grid (1, 1): one workgroup per plane; serial row walk.
  *
  * Spec constants: 0 WIDTH, 1 NRAD, 2 MDIS, 3 HAS_MCLIP, 4 HAS_SCLIP,
- * 5 VCHECK_MODE, 6 COST3, 7 UCUBIC, 8 local_size_row, 9 local_size_vcheck.
+ * 5 VCHECK_MODE, 6 local_size_row, 7 local_size_vcheck.
  */
 
 #if !defined(BITS)
@@ -76,8 +76,6 @@ layout(constant_id = 2) const int MDIS = 20;
 layout(constant_id = 3) const int HAS_MCLIP = 0;
 layout(constant_id = 4) const int HAS_SCLIP = 0;
 layout(constant_id = 5) const int VCHECK_MODE = 2;
-layout(constant_id = 6) const int COST3 = 1;
-layout(constant_id = 7) const int UCUBIC = 1;
 
 const int TPITCH = 2 * MDIS + 1;
 const int CENTER = MDIS;
@@ -108,7 +106,7 @@ layout(push_constant) uniform PC {
     int pad_height;   // padded plane height in rows
     int field;        // parity of the interpolated dst rows (0/1)
     int rows;         // number of interpolated rows
-    float alpha;      // cost3 = raw alpha / 3 ; cost3 off = raw alpha
+    float alpha;      // raw alpha / 3 (cost3 always on)
     float beta;
     float gamma;
     float rw;         // 1 - raw alpha - raw beta
@@ -197,6 +195,8 @@ float conn_cost(int dy, int x, int u) {
     const float S1 = s1_ok ? s1 : (s2_ok ? s2 : s0);
     const float S2 = s2_ok ? s2 : S1;
 
+    // cost3 is always on (GPU family semantics: eedi3vk2/vszip* have no
+    // cost3 switch and always divide alpha by 3 and sum s0+s1+s2).
     // ip is the inner 2-tap average. eedi3m computes it in INTEGER domain
     // ((a + b + 1) >> 1 == round-half-up on the exact mean) for integer
     // formats, which feeds an integer |x - ip| difference — for odd sums the
@@ -215,8 +215,6 @@ float conn_cost(int dy, int x, int u) {
     const float v = abs(pad_get(dy - 1, x) - ip) + abs(pad_get(dy + 1, x) - ip);
 #endif
 
-    if (COST3 == 0)
-        return pc.alpha * s0 + pc.beta * float(abs(u)) + pc.rw * v;
     return pc.alpha * (s0 + S1 + S2) + pc.beta * float(abs(u)) + pc.rw * v;
 }
 
@@ -231,7 +229,7 @@ shared float pco[2][TPITCH];
 shared int8_t tileSh[BT_TILE * TPITCH];
 shared int8_t tileF[BT_TILE];
 
-layout(local_size_x_id = 8) in;
+layout(local_size_x_id = 6) in;
 
 void main() {
     const int r = int(gl_WorkGroupID.y);
@@ -318,11 +316,10 @@ void main() {
     barrier();       // all pbt writes visible before backtrack reads them
 
     // The rightmost column always takes direction 0 (fpath[WIDTH-1] == 0);
-    // direction 0 interpolates to the vertical cubic / average.
+    // direction 0 interpolates to the vertical cubic (ucubic always on).
     if (lane == 0) {
         const int x = WIDTH - 1;
-        float oval = (UCUBIC != 0) ? cubic_float(dy, x)
-                                   : (pad_get(dy - 1, x) + pad_get(dy + 1, x)) * 0.5f;
+        float oval = cubic_float(dy, x);
         if (VCHECK_MODE > 0) {
             dmap[pc.dmap_base + r * WIDTH + x] = int8_t(0);
             if (HAS_SCLIP == 0) {
@@ -365,12 +362,14 @@ void main() {
             float oval;
             int dval = dir;
             if (masked_x) {
+                // masked pixels interpolate the vertical cubic, direction 0
                 dval = 0;
-                oval = (UCUBIC != 0) ? cubic_float(dy, x)
-                                     : (pad_get(dy - 1, x) + pad_get(dy + 1, x)) * 0.5f;
+                oval = cubic_float(dy, x);
             } else {
+                // ucubic always on: 4-tap cubic along the direction when the
+                // 3*|dir| taps stay in the frame, else the 2-tap average.
                 const int ad3 = abs(3 * dir);
-                if (UCUBIC != 0 && x >= ad3 && x <= WIDTH - 1 - ad3) {
+                if (x >= ad3 && x <= WIDTH - 1 - ad3) {
                     oval = 0.5625f * (pad_get(dy - 1, x + dir) + pad_get(dy + 1, x - dir))
                          - 0.0625f * (pad_get(dy - 3, x + 3 * dir) + pad_get(dy + 3, x - 3 * dir));
                 } else {
@@ -404,7 +403,7 @@ void main() {
 // from the frame), exactly like eedi3vk2's vcheck kernel.
 shared float tlineSh[2][WIDTH];
 
-layout(local_size_x_id = 9) in;
+layout(local_size_x_id = 7) in;
 
 void main() {
     const int tid = int(gl_LocalInvocationID.x);
