@@ -1,0 +1,561 @@
+#version 450
+/*
+ * EEDI3 — full-pel edge-directed line interpolation (Vulkan port).
+ *
+ * Semantic target: family A (eedi3m, the original HolyWu implementation;
+ * eedi3vk2 is the same family and the closest GPU cross-check). This is a
+ * from-scratch implementation that reproduces eedi3m's per-column math:
+ *
+ *   - connection costs s0/s1/s2 over a (2*nrad+1)-tap window with the
+ *     corrected validity gates (all loads stay inside the 12-column mirrored
+ *     pad margin; eedi3m's scalar s2 gate is looser and reads out of bounds)
+ *   - per-column direction clamp umax = min(x, W-1-x, mdis)
+ *   - DP predecessor window umax2 = min(x-1, W-x, mdis), relax over
+ *     v in [max(-umax2,u-1), min(umax2,u+1)], ascending-v strict-< tie break
+ *   - pbt stores ABSOLUTE predecessor directions (int8)
+ *   - masked columns (mclip) carry the previous column's path costs and
+ *     backtrack rows with the two extreme fixups (eedi3m semantics)
+ *   - interpolate: 4-tap cubic along the direction when the guard holds, else
+ *     2-tap average; masked columns -> vertical cubic, direction 0
+ *   - vcheck (single workgroup per plane, serialized row walk): the modified
+ *     previous interp row is carried in a shared ping-pong buffer quantized to
+ *     the io type, exactly like eedi3vk2's vcheck kernel.
+ *
+ * The host uploads eedi3m's exact padded plane (copyPad) as FLOAT for both
+ * bit depths: u16 values are exact integers < 2^24, so float arithmetic on
+ * them reproduces the integer cost/interp math bit-exactly (u16 io is only
+ * (re)quantized at stores and for vcheck's pixel reads, where eedi3m does
+ * the same). f32 io passes through the pad unchanged.
+ *
+ * ENTRY_ROW is a per-column-workgroup-barrier DP (MVP architecture, easy to
+ * verify). The per-interp-row register/subgroup-shuffle DP that replaces it
+ * for speed shares this exact host interface (buffers + push constants) and
+ * only swaps the kernel internals.
+ *
+ * Buffers (one subrange per plane per binding; the base element offsets of
+ * each plane region are push constants because each binding's descriptor
+ * range spans the whole buffer):
+ *   b0 pad    float, padded plane (padStride x padHeight), MARGIN offsets
+ *   b1 dst    io type, rows x WIDTH (tight) interpolated rows
+ *   b2 pbt    int8, rows x WIDTH x TPITCH absolute predecessor per (col,u)
+ *   b3 dmap   int8, rows x WIDTH direction per pixel (only VCHECK > 0)
+ *   b4 bmask  uint8, rows x WIDTH dilated mclip mask (optional)
+ *   b5 sclip  io type, rows x WIDTH (only VCHECK > 0 && HAS_SCLIP)
+ *   b6 cint   io type, rows x WIDTH vertical cubic per pixel (only when
+ *             VCHECK > 0 && !HAS_SCLIP)
+ *
+ * ENTRY_ROW grid (1, rows): one workgroup per interpolated row.
+ * ENTRY_VCHECK grid (1, 1): one workgroup per plane; serial row walk.
+ *
+ * Spec constants: 0 WIDTH, 1 NRAD, 2 MDIS, 3 HAS_MCLIP, 4 HAS_SCLIP,
+ * 5 VCHECK_MODE, 6 COST3, 7 UCUBIC, 8 local_size_row, 9 local_size_vcheck.
+ */
+
+#if !defined(BITS)
+#define BITS 16
+#endif
+
+#if BITS == 16
+#define IO_TYPE uint16_t
+#define PEAK 65535.0f
+#else
+#define IO_TYPE float
+#define PEAK 1.0f
+#endif
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+
+const float FLT_MAX_09 = 3.0616170017461927e+38f;  // FLT_MAX * 0.9
+const float FLT_MAX_V = 3.402823466e+38f;          // FLT_MAX
+
+layout(constant_id = 0) const int WIDTH = 640;
+layout(constant_id = 1) const int NRAD = 2;
+layout(constant_id = 2) const int MDIS = 20;
+layout(constant_id = 3) const int HAS_MCLIP = 0;
+layout(constant_id = 4) const int HAS_SCLIP = 0;
+layout(constant_id = 5) const int VCHECK_MODE = 2;
+layout(constant_id = 6) const int COST3 = 1;
+layout(constant_id = 7) const int UCUBIC = 1;
+
+const int TPITCH = 2 * MDIS + 1;
+const int CENTER = MDIS;
+const int MARGIN_H = 12;
+const int MARGIN_V = 4;
+
+// backtrack + interpolate tile width (columns)
+const int BT_TILE = 32;
+
+layout(std430, binding = 0) readonly buffer PadBuf { float pad[]; };
+layout(std430, binding = 1) buffer DstBuf { IO_TYPE dst[]; };
+layout(std430, binding = 2) buffer PbtBuf { int8_t pbt[]; };
+layout(std430, binding = 3) buffer DmapBuf { int8_t dmap[]; };
+layout(std430, binding = 4) readonly buffer BmaskBuf { uint8_t bmask[]; };
+layout(std430, binding = 5) readonly buffer SclipBuf { IO_TYPE sclip[]; };
+layout(std430, binding = 6) buffer CintBuf { IO_TYPE cint[]; };
+
+layout(push_constant) uniform PC {
+    // per-plane element bases into each binding's descriptor range
+    int pad_base;     // float elements into b0 (padded plane)
+    int dst_base;     // io elements into b1 (interp rows)
+    int pbt_base;     // int8 elements into b2
+    int dmap_base;    // int8 elements into b3
+    int bmask_base;   // uint8 elements into b4
+    int sclip_base;   // io elements into b5
+    int cint_base;    // io elements into b6
+    int pad_stride;   // padded plane row pitch in float elements
+    int pad_height;   // padded plane height in rows
+    int field;        // parity of the interpolated dst rows (0/1)
+    int rows;         // number of interpolated rows
+    float alpha;      // cost3 = raw alpha / 3 ; cost3 off = raw alpha
+    float beta;
+    float gamma;
+    float rw;         // 1 - raw alpha - raw beta
+    float vth0r;
+    float vth1r;
+    float vth2r;
+    float vth2;
+} pc;
+
+// Padded-plane access at OUTPUT dst-row coordinates. copyPad places every
+// kept source row at pad row MARGIN_V + <output dst row> (dh=0: 1:1; dh=1:
+// kept output dst rows of parity 1-field come from source rows in order), so
+// interp rows (parity `field`) read their +/-1, +/-3 taps (kept rows) at
+// pad row MARGIN_V + dy +/- {1,3} — always in bounds thanks to the mirrored
+// vertical margins the host builds (same for the horizontal margins).
+float pad_get(int dst_row, int col) {
+    return pad[pc.pad_base + (MARGIN_V + dst_row) * pc.pad_stride + MARGIN_H + col];
+}
+
+float load_dst_val(int r, int x) {
+#if BITS == 16
+    return float(int(dst[pc.dst_base + r * WIDTH + x]));
+#else
+    return dst[pc.dst_base + r * WIDTH + x];
+#endif
+}
+
+float load_sclip_val(int r, int x) {
+#if BITS == 16
+    return float(int(sclip[pc.sclip_base + r * WIDTH + x]));
+#else
+    return sclip[pc.sclip_base + r * WIDTH + x];
+#endif
+}
+
+// io store: u16 rounds half-up + clamps to [0, peak], which reproduces
+// eedi3m's integer (X + 8) >> 4 / (a + b + 1) >> 1 arithmetic evaluated on
+// exact float taps (see design notes); f32 stores pass through unchanged.
+void store_dst_val(int r, int x, float v) {
+#if BITS == 16
+    dst[pc.dst_base + r * WIDTH + x] = IO_TYPE(uint(clamp(floor(v + 0.5f), 0.0f, PEAK)));
+#else
+    dst[pc.dst_base + r * WIDTH + x] = v;
+#endif
+}
+
+bool bmask_at(int r, int x) {
+    if (HAS_MCLIP == 0) return true;
+    return bmask[pc.bmask_base + r * WIDTH + x] != uint8_t(0);
+}
+
+// Vertical 4-tap cubic at column x of interp dst row dy (kept rows dy +/- 1
+// and dy +/- 3). Integer formats reproduce the clamp/round of the int cubic
+// through store_dst_val / the cint quantizer; float uses exact weights.
+float cubic_float(int dy, int x) {
+    return 0.5625f * (pad_get(dy - 1, x) + pad_get(dy + 1, x))
+         - 0.0625f * (pad_get(dy - 3, x) + pad_get(dy + 3, x));
+}
+
+// Connection cost for interp dst row dy, column x, direction u.
+// u16: s0/s1/s2/v are integer SAD sums accumulated in float (exact, terms
+// stay below 2^24). Cost combine matches eedi3m's float order.
+float conn_cost(int dy, int x, int u) {
+    const int u2 = 2 * u;
+    float s0 = 0.0f;
+    float s1 = 0.0f;
+    float s2 = 0.0f;
+    const bool s1_ok = (u >= 0 && x >= u2) || (u <= 0 && x < WIDTH + u2);
+    const bool s2_ok = (u <= 0 && x >= -u2) || (u >= 0 && x < WIDTH - u2);
+
+    for (int k = -NRAD; k <= NRAD; ++k) {
+        s0 += abs(pad_get(dy - 3, x + u + k) - pad_get(dy - 1, x - u + k))
+            + abs(pad_get(dy - 1, x + u + k) - pad_get(dy + 1, x - u + k))
+            + abs(pad_get(dy + 1, x + u + k) - pad_get(dy + 3, x - u + k));
+        if (s1_ok) {
+            s1 += abs(pad_get(dy - 3, x + k) - pad_get(dy - 1, x - u2 + k))
+                + abs(pad_get(dy - 1, x + k) - pad_get(dy + 1, x - u2 + k))
+                + abs(pad_get(dy + 1, x + k) - pad_get(dy + 3, x - u2 + k));
+        }
+        if (s2_ok) {
+            s2 += abs(pad_get(dy - 3, x + u2 + k) - pad_get(dy - 1, x + k))
+                + abs(pad_get(dy - 1, x + u2 + k) - pad_get(dy + 1, x + k))
+                + abs(pad_get(dy + 1, x + u2 + k) - pad_get(dy + 3, x + k));
+        }
+    }
+    const float S1 = s1_ok ? s1 : (s2_ok ? s2 : s0);
+    const float S2 = s2_ok ? s2 : S1;
+
+    // ip is the inner 2-tap average. eedi3m computes it in INTEGER domain
+    // ((a + b + 1) >> 1 == round-half-up on the exact mean) for integer
+    // formats, which feeds an integer |x - ip| difference — for odd sums the
+    // plain float midpoint (a+b)/2 differs by 0.5, shifting the v penalty by
+    // up to 1 and flipping near-tie argmins (seen at nrad=3). Reproduce the
+    // integer v exactly. Float formats use the exact midpoint.
+#if BITS == 16
+    const float t1 = pad_get(dy - 1, x + u);
+    const float t2 = pad_get(dy + 1, x - u);
+    const float ip = floor((t1 + t2 + 1.0f) * 0.5f);
+    const float c1 = pad_get(dy - 1, x);
+    const float c2 = pad_get(dy + 1, x);
+    const float v = abs(c1 - ip) + abs(c2 - ip);
+#else
+    const float ip = (pad_get(dy - 1, x + u) + pad_get(dy + 1, x - u)) * 0.5f;
+    const float v = abs(pad_get(dy - 1, x) - ip) + abs(pad_get(dy + 1, x) - ip);
+#endif
+
+    if (COST3 == 0)
+        return pc.alpha * s0 + pc.beta * float(abs(u)) + pc.rw * v;
+    return pc.alpha * (s0 + S1 + S2) + pc.beta * float(abs(u)) + pc.rw * v;
+}
+
+#if defined(ENTRY_ROW)
+
+// Per-interp-row DP. One workgroup per interpolated row; each lane owns the
+// direction u = lane - CENTER. Path costs live in a shared parity ping-pong
+// (pco[col & 1]); a workgroup barrier between columns makes the previous
+// column's costs visible. pbt rows are written straight to global and read
+// back in backtrack tiles.
+shared float pco[2][TPITCH];
+shared int8_t tileSh[BT_TILE * TPITCH];
+shared int8_t tileF[BT_TILE];
+
+layout(local_size_x_id = 8) in;
+
+void main() {
+    const int r = int(gl_WorkGroupID.y);
+    const int lane = int(gl_LocalInvocationID.x);
+    const int lsz = int(gl_WorkGroupSize.x);
+    const int dy = pc.field + 2 * r;
+    const int u = lane - CENTER;
+    const int pbt_row = pc.pbt_base + r * (WIDTH * TPITCH);
+
+    // Column 0: only u == 0 carries a connection cost. A masked column 0 is
+    // pinned to 0 (eedi3m would read uninitialized memory there; eedi3vk2
+    // pins 0 too), keeping the pipeline deterministic.
+    for (int i = lane; i < TPITCH; i += lsz) {
+        pco[0][i] = 0.0f;
+        pco[1][i] = 0.0f;
+    }
+    barrier();
+    if (lane == CENTER && (HAS_MCLIP == 0 || bmask_at(r, 0))) {
+        pco[0][CENTER] = conn_cost(dy, 0, 0);
+    }
+    barrier();
+
+    // DP over columns. Column costs live in pco[col & 1] (parity ping-pong).
+    // The absolute-predecessor rows are written straight to global pbt.
+    for (int x = 1; x < WIDTH; ++x) {
+        const int pong = x & 1;
+        const int ping = pong ^ 1;
+        const int umax = min(min(x, WIDTH - 1 - x), MDIS);
+        const bool masked = (HAS_MCLIP != 0 && !bmask_at(r, x));
+        const bool u_in = (u >= -umax && u <= umax);
+
+        if (masked) {
+            // eedi3m masked column: the cost row and backtrack row carry from
+            // the previous column; the two extreme entries get fixups so the
+            // path stays inside the narrower reachable set.
+            if (x == 1) {
+                for (int i = lane; i < TPITCH; i += lsz) {
+                    pco[pong][i] = 0.0f;
+                    pbt[pbt_row + (x - 1) * TPITCH + i] = int8_t(0);
+                }
+            } else {
+                for (int i = lane; i < TPITCH; i += lsz) {
+                    pco[pong][i] = pco[ping][i];
+                    pbt[pbt_row + (x - 1) * TPITCH + i] =
+                        pbt[pbt_row + (x - 2) * TPITCH + i];
+                }
+                const int pumax = min(x - 1, WIDTH - x);
+                if (pumax < MDIS) {
+                    if (lane == CENTER - pumax)
+                        pbt[pbt_row + (x - 1) * TPITCH + CENTER - pumax] = int8_t(1 - pumax);
+                    if (lane == CENTER + pumax)
+                        pbt[pbt_row + (x - 1) * TPITCH + CENTER + pumax] = int8_t(pumax - 1);
+                }
+            }
+            barrier();
+            continue;
+        }
+
+        float ccost = 0.0f;
+        if (u_in) {
+            ccost = conn_cost(dy, x, u);
+        }
+        barrier();   // previous column's pco writes visible
+
+        if (u_in) {
+            const int umax2 = min(min(x - 1, WIDTH - x), MDIS);
+            float bval = FLT_MAX_V;
+            int idx = 0;
+            const int lo = max(-umax2, u - 1);
+            const int hi = min(umax2, u + 1);
+            for (int v = lo; v <= hi; ++v) {
+                const float z = pco[ping][CENTER + v] + pc.gamma * float(abs(u - v));
+                const float cc = min(z, FLT_MAX_09);
+                if (cc < bval) {        // strict < : lowest v wins ties
+                    bval = cc;
+                    idx = v;
+                }
+            }
+            pco[pong][CENTER + u] = min(bval + ccost, FLT_MAX_09);
+            pbt[pbt_row + (x - 1) * TPITCH + CENTER + u] = int8_t(idx);
+        }
+        barrier();   // this column's pco writes visible to x + 1
+    }
+    barrier();       // all pbt writes visible before backtrack reads them
+
+    // The rightmost column always takes direction 0 (fpath[WIDTH-1] == 0);
+    // direction 0 interpolates to the vertical cubic / average.
+    if (lane == 0) {
+        const int x = WIDTH - 1;
+        float oval = (UCUBIC != 0) ? cubic_float(dy, x)
+                                   : (pad_get(dy - 1, x) + pad_get(dy + 1, x)) * 0.5f;
+        if (VCHECK_MODE > 0) {
+            dmap[pc.dmap_base + r * WIDTH + x] = int8_t(0);
+            if (HAS_SCLIP == 0) {
+#if BITS == 16
+                cint[pc.cint_base + r * WIDTH + x] =
+                    IO_TYPE(uint(clamp(floor(cubic_float(dy, x) + 0.5f), 0.0f, PEAK)));
+#else
+                cint[pc.cint_base + r * WIDTH + x] = cubic_float(dy, x);
+#endif
+            }
+        }
+        store_dst_val(r, x, oval);
+    }
+    barrier();
+
+    // Backtrack from the right in tiles; lane 0 walks each tile backwards.
+    int fcarry = 0;  // fpath[x0 + n]; starts at fpath[WIDTH - 1] == 0
+    for (int x0 = ((WIDTH - 2) / BT_TILE) * BT_TILE; x0 >= 0; x0 -= BT_TILE) {
+        const int n = min(BT_TILE, WIDTH - 1 - x0);
+
+        for (int c = 0; c < n; ++c)
+            for (int i = lane; i < TPITCH; i += lsz)
+                tileSh[c * TPITCH + i] = pbt[pbt_row + (x0 + c) * TPITCH + i];
+        barrier();
+
+        if (lane == 0) {
+            int f = fcarry;
+            for (int x = x0 + n - 1; x >= x0; --x) {
+                f = int(tileSh[(x - x0) * TPITCH + CENTER + f]);
+                tileF[x - x0] = int8_t(f);
+            }
+            fcarry = f;
+        }
+        barrier();
+
+        if (lane < n) {
+            const int x = x0 + lane;
+            const int dir = int(tileF[lane]);
+            const bool masked_x = (HAS_MCLIP != 0 && !bmask_at(r, x));
+            float oval;
+            int dval = dir;
+            if (masked_x) {
+                dval = 0;
+                oval = (UCUBIC != 0) ? cubic_float(dy, x)
+                                     : (pad_get(dy - 1, x) + pad_get(dy + 1, x)) * 0.5f;
+            } else {
+                const int ad3 = abs(3 * dir);
+                if (UCUBIC != 0 && x >= ad3 && x <= WIDTH - 1 - ad3) {
+                    oval = 0.5625f * (pad_get(dy - 1, x + dir) + pad_get(dy + 1, x - dir))
+                         - 0.0625f * (pad_get(dy - 3, x + 3 * dir) + pad_get(dy + 3, x - 3 * dir));
+                } else {
+                    oval = (pad_get(dy - 1, x + dir) + pad_get(dy + 1, x - dir)) * 0.5f;
+                }
+            }
+            if (VCHECK_MODE > 0) {
+                dmap[pc.dmap_base + r * WIDTH + x] = int8_t(dval);
+                if (HAS_SCLIP == 0) {
+#if BITS == 16
+                    cint[pc.cint_base + r * WIDTH + x] =
+                        IO_TYPE(uint(clamp(floor(cubic_float(dy, x) + 0.5f), 0.0f, PEAK)));
+#else
+                    cint[pc.cint_base + r * WIDTH + x] = cubic_float(dy, x);
+#endif
+                }
+            }
+            store_dst_val(r, x, oval);
+        }
+        barrier();   // tile reads done before the next (leftward) tile reuses tileSh
+    }
+}
+
+#endif  // ENTRY_ROW
+
+#if defined(ENTRY_VCHECK)
+
+// vcheck is a serial row walk (row i reads the modified row i - 1), so a
+// single workgroup iterates all rows carrying the previous modified row in a
+// shared ping-pong buffer quantized to the io type (what eedi3m reads back
+// from the frame), exactly like eedi3vk2's vcheck kernel.
+shared float tlineSh[2][WIDTH];
+
+layout(local_size_x_id = 9) in;
+
+void main() {
+    const int tid = int(gl_LocalInvocationID.x);
+    const int lsz = int(gl_WorkGroupSize.x);
+
+    for (int r = 0; r < pc.rows; ++r) {
+        const int y = MARGIN_V + pc.field + 2 * r;   // pad row of this interp row
+        const bool do_row = (y >= 6 && y < pc.pad_height - 6);
+        const int cur = r & 1;
+        const int prev = 1 - cur;
+        const int yf = pc.field + 2 * r;
+        const int dr = (r >= 1) ? (r - 1) : 0;        // interp row for dmap dirt
+        const int dn = (r + 1 < pc.rows) ? (r + 1) : r;   // next interp row
+
+        if (!do_row) {
+            for (int x = tid; x < WIDTH; x += lsz)
+                tlineSh[cur][x] = load_dst_val(r, x);
+        } else {
+            for (int x = tid; x < WIDTH; x += lsz) {
+                const int dirc = int(dmap[pc.dmap_base + r * WIDTH + x]);
+#if BITS == 16
+                // eedi3m cint is the raw sclip sample (native scale) or the
+                // pre-quantized vertical cubic from the main kernel.
+                const float cint_s = HAS_SCLIP != 0
+                    ? load_sclip_val(r, x)
+                    : float(int(cint[pc.cint_base + r * WIDTH + x]));
+#else
+                const float cint_s = HAS_SCLIP != 0
+                    ? load_sclip_val(r, x)
+                    : cint[pc.cint_base + r * WIDTH + x];
+#endif
+
+                if (dirc == 0) {
+                    tlineSh[cur][x] = cint_s;
+                    continue;
+                }
+                const int dirt = int(dmap[pc.dmap_base + dr * WIDTH + x]);
+                const int dirb = int(dmap[pc.dmap_base + dn * WIDTH + x]);
+                if (max(dirc * dirt, dirc * dirb) < 0 || (dirt == dirb && dirt == 0)) {
+                    tlineSh[cur][x] = cint_s;
+                    continue;
+                }
+
+#if BITS == 16
+                // int-domain score (eedi3m exact); float blend; truncating
+                // store. dstp is the plain interpolated row r in io storage.
+                const int dCi = int(load_dst_val(r, x));
+                const int dCp = int(load_dst_val(r, x + dirc));
+                const int dm  = int(load_dst_val(r, x - dirc));
+                const int dNm = int(load_dst_val(dn, x - dirc));
+                const int v1px = int(pad_get(yf - 1, x + dirc));
+                const int v1nx = int(pad_get(yf + 1, x - dirc));
+                const int v1p0 = int(pad_get(yf - 1, x));
+                const int v1n0 = int(pad_get(yf + 1, x));
+                const int pr = (r >= 1) ? int(tlineSh[prev][x + dirc]) : 0;
+                const int it = (pr + dm + 1) >> 1;
+                const int ib = (dCp + dNm + 1) >> 1;
+                const int vt = abs(pr - v1px) + abs(dCp - v1px);
+                const int vb = abs(dNm - v1nx) + abs(dm - v1nx);
+                const int vc = abs(dCi - v1p0) + abs(dCi - v1n0);
+                const int d0 = abs(it - v1p0);
+                const int d1 = abs(ib - v1n0);
+                const int d2 = abs(vt - vc);
+                const int d3 = abs(vb - vc);
+                int mdiff0, mdiff1;
+                if (VCHECK_MODE == 1) {
+                    mdiff0 = min(d0, d1);
+                    mdiff1 = min(d2, d3);
+                } else if (VCHECK_MODE == 2) {
+                    mdiff0 = (d0 + d1 + 1) >> 1;
+                    mdiff1 = (d2 + d3 + 1) >> 1;
+                } else {
+                    mdiff0 = max(d0, d1);
+                    mdiff1 = max(d2, d3);
+                }
+                const float a0 = float(mdiff0) * pc.vth0r;
+                const float a1 = float(mdiff1) * pc.vth1r;
+                const float a2 = max((pc.vth2 - float(abs(dirc))) * pc.vth2r, 0.0f);
+                const float a = min(max(a0, max(a1, a2)), 1.0f);
+                const float blend = (1.0f - a) * float(dCi) + a * cint_s;
+                tlineSh[cur][x] = float(min(max(int(blend), 0), 65535));
+#else
+                const float pr = (r >= 1) ? tlineSh[prev][x + dirc] : 0.0f;
+                const float dCi = load_dst_val(r, x);
+                const float dCp = load_dst_val(r, x + dirc);
+                const float dm  = load_dst_val(r, x - dirc);
+                const float dNm = load_dst_val(dn, x - dirc);
+                const float v1px = pad_get(yf - 1, x + dirc);
+                const float v1nx = pad_get(yf + 1, x - dirc);
+                const float v1p0 = pad_get(yf - 1, x);
+                const float v1n0 = pad_get(yf + 1, x);
+                const float it = (pr + dm) * 0.5f;
+                const float ib = (dCp + dNm) * 0.5f;
+                const float vt = abs(pr - v1px) + abs(dCp - v1px);
+                const float vb = abs(dNm - v1nx) + abs(dm - v1nx);
+                const float vc = abs(dCi - v1p0) + abs(dCi - v1n0);
+                const float d0 = abs(it - v1p0);
+                const float d1 = abs(ib - v1n0);
+                const float d2 = abs(vt - vc);
+                const float d3 = abs(vb - vc);
+                float mdiff0, mdiff1;
+                if (VCHECK_MODE == 1) {
+                    mdiff0 = min(d0, d1);
+                    mdiff1 = min(d2, d3);
+                } else if (VCHECK_MODE == 2) {
+                    mdiff0 = (d0 + d1) * 0.5f;
+                    mdiff1 = (d2 + d3) * 0.5f;
+                } else {
+                    mdiff0 = max(d0, d1);
+                    mdiff1 = max(d2, d3);
+                }
+                const float a0 = mdiff0 * pc.vth0r;
+                const float a1 = mdiff1 * pc.vth1r;
+                const float a2 = max((pc.vth2 - float(abs(dirc))) * pc.vth2r, 0.0f);
+                const float a = min(max(a0, max(a1, a2)), 1.0f);
+                tlineSh[cur][x] = (1.0f - a) * dCi + a * cint_s;
+#endif
+            }
+        }
+        barrier();
+
+        // Flush the previous row once row r no longer needs it.
+        if (r >= 1) {
+            const int py = MARGIN_V + pc.field + 2 * (r - 1);
+            if (py >= 6 && py < pc.pad_height - 6) {
+                for (int x = tid; x < WIDTH; x += lsz) {
+#if BITS == 16
+                    dst[pc.dst_base + (r - 1) * WIDTH + x] = IO_TYPE(uint(tlineSh[prev][x]));
+#else
+                    dst[pc.dst_base + (r - 1) * WIDTH + x] = tlineSh[prev][x];
+#endif
+                }
+            }
+        }
+        barrier();
+    }
+
+    // Flush the final row.
+    const int rl = pc.rows - 1;
+    if (pc.rows >= 1) {
+        const int py = MARGIN_V + pc.field + 2 * rl;
+        if (py >= 6 && py < pc.pad_height - 6) {
+            for (int x = tid; x < WIDTH; x += lsz) {
+#if BITS == 16
+                dst[pc.dst_base + rl * WIDTH + x] = IO_TYPE(uint(tlineSh[rl & 1][x]));
+#else
+                dst[pc.dst_base + rl * WIDTH + x] = tlineSh[rl & 1][x];
+#endif
+            }
+        }
+    }
+}
+
+#endif  // ENTRY_VCHECK

@@ -167,9 +167,23 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     VkPhysicalDeviceFeatures features {};
     features.shaderFloat64 = VK_TRUE;
 
+    // EEDI3 stores its int8 predecessor/direction/mask buffers in SSBOs and
+    // does int8 ALU on them. These are core Vulkan 1.2 features (the RDNA3
+    // target supports all of them); chained via the Vulkan 1.1/1.2 structs.
+    VkPhysicalDeviceVulkan12Features vulkan12_features {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .pNext = nullptr,
+        .storageBuffer8BitAccess = VK_TRUE,
+        .uniformAndStorageBuffer8BitAccess = VK_TRUE,
+        .storagePushConstant8 = VK_FALSE,
+        .shaderFloat16 = VK_FALSE,
+        .shaderInt8 = VK_TRUE,
+        .descriptorIndexing = VK_FALSE
+    };
+
     VkPhysicalDeviceVulkan11Features vulkan11_features {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
-        .pNext = nullptr,
+        .pNext = &vulkan12_features,
         .storageBuffer16BitAccess = VK_TRUE,
         .uniformAndStorageBuffer16BitAccess = VK_TRUE,
         .storagePushConstant16 = VK_FALSE,
@@ -371,4 +385,5 @@ VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
     vsfeel_register_gaussblur(vspapi, plugin);
     vsfeel_register_dfttest(vspapi, plugin);
     vsfeel_register_nlmeans(vspapi, plugin);
+    vsfeel_register_eedi3(vspapi, plugin);
 }

@@ -173,6 +173,30 @@ if(VK_GLSLC)
                 VERBATIM)
         endforeach()
     endforeach()
+    # EEDI3: row kernel (one WG per interp row) + vcheck kernel (single WG
+    # serial row walk), per io variant (16 int, 32 float).
+    set(VK_EEDI3_ENTRIES row vcheck)
+    set(VK_EEDI3_BITS "16" "32")
+    foreach(bits IN LISTS VK_EEDI3_BITS)
+        foreach(entry IN LISTS VK_EEDI3_ENTRIES)
+            set(defs -DBITS=${bits})
+            if(entry STREQUAL row)
+                list(APPEND defs -DENTRY_ROW)
+            else()
+                list(APPEND defs -DENTRY_VCHECK)
+            endif()
+            set(raw_spv "${VK_SPV_DIR}/eedi3_${bits}_${entry}.spv")
+            list(APPEND VK_SPV_OUTPUTS "${raw_spv}")
+            add_custom_command(
+                OUTPUT "${raw_spv}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
+                COMMAND ${VK_GLSLC} -O -fshader-stage=compute ${defs}
+                        -o "${raw_spv}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/src/eedi3.comp"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/eedi3.comp"
+                VERBATIM)
+        endforeach()
+    endforeach()
 else()
     message(FATAL_ERROR "glslc not found")
 endif()
@@ -214,6 +238,10 @@ add_custom_command(
             "${VK_SPV_DIR}/nlmeans_32_acc.spv"
             "${VK_SPV_DIR}/nlmeans_32_finish.spv"
             "${VK_SPV_DIR}/nlmeans_32_pad.spv"
+            "${VK_SPV_DIR}/eedi3_16_row.spv"
+            "${VK_SPV_DIR}/eedi3_16_vcheck.spv"
+            "${VK_SPV_DIR}/eedi3_32_row.spv"
+            "${VK_SPV_DIR}/eedi3_32_vcheck.spv"
             "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
     DEPENDS ${VK_SPV_OUTPUTS}
     VERBATIM)
@@ -227,6 +255,7 @@ add_library(vsfeel SHARED
     src/gaussblur.cpp
     src/dfttest.cpp
     src/nlmeans.cpp
+    src/eedi3.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h")
 configure_common(vsfeel)
 target_compile_options(vsfeel PRIVATE -mavx2)

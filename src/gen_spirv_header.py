@@ -12,6 +12,7 @@ Usage: gen_spirv_header.py <bl_shared_16> <bl_shared_32>
                              <dfttest_32_fused_r0> <dfttest_32_fused_r1> <dfttest_32_fused_r2> <dfttest_32_fused_r3>
                              <nlmeans_16_weight> <nlmeans_16_acc> <nlmeans_16_finish> <nlmeans_16_pad>
                              <nlmeans_32_weight> <nlmeans_32_acc> <nlmeans_32_finish> <nlmeans_32_pad>
+                             <eedi3_16_row> <eedi3_16_vcheck> <eedi3_32_row> <eedi3_32_vcheck>
                              <out header>
 """
 
@@ -33,7 +34,7 @@ def emit_spv(f, name: str, path: Path) -> None:
     f.write(f"static const size_t {name}_spv_size = sizeof({name}_spv);\n\n")
 
 def main() -> None:
-    if len(sys.argv) != 36:
+    if len(sys.argv) != 40:
         print("usage: gen_spirv_header.py <...dfttest binaries...> "
               "<nlmeans_16_weight> <nlmeans_16_acc> <nlmeans_16_finish> "
               "<nlmeans_32_weight> <nlmeans_32_acc> <nlmeans_32_finish> <out header>")
@@ -44,6 +45,7 @@ def main() -> None:
         df_16_ps, df_16_pd, df_16_c, df_16_f0, df_16_f1, df_16_f2, df_16_f3, \
         df_32_ps, df_32_pd, df_32_c, df_32_f0, df_32_f1, df_32_f2, df_32_f3, \
         nl_16_w, nl_16_a, nl_16_f, nl_16_p, nl_32_w, nl_32_a, nl_32_f, nl_32_p, \
+        e16_r, e16_v, e32_r, e32_v, \
         out_path = (Path(a) for a in sys.argv[1:])
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -84,6 +86,10 @@ def main() -> None:
         emit_spv(f, "nlmeans_32_acc", nl_32_a)
         emit_spv(f, "nlmeans_32_finish", nl_32_f)
         emit_spv(f, "nlmeans_32_pad", nl_32_p)
+        emit_spv(f, "eedi3_16_row", e16_r)
+        emit_spv(f, "eedi3_16_vcheck", e16_v)
+        emit_spv(f, "eedi3_32_row", e32_r)
+        emit_spv(f, "eedi3_32_vcheck", e32_v)
 
 if __name__ == "__main__":
     main()
