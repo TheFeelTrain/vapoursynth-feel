@@ -10,10 +10,12 @@ float DP flips a handful of argmins vs the GPU family).
 Agreement measured on the noise clip (640x360, interp rows only):
 
 * u16 (GRAY16): vsfeel == eedi3vk2 BIT-EXACT (max diff 0) across every shared
-  config tested: field 0/1, dh, mdis 3..40, nrad 0..3, vcheck 0..3, custom
-  alpha/beta/gamma/vthresh, sclip, and mclip (Gray8/Gray16/Gray32 masks;
-  vsfeel converts the mask to Gray8 internally, eedi3vk2 needs the clip's
-  format - both then agree bit-exactly).
+  config tested: field 0/1/2/3, dh, mdis 3..40, nrad 0..3, vcheck 0..3, custom
+  alpha/beta/gamma/vthresh, and the full sclip / mclip surface. sclip
+  describes the OUTPUT clip: 2N frames under field>1 (based_aa's
+  Interleave([s, s])), 2x height under dh. mclip stays at the source N frames
+  (Gray8/Gray16/Gray32 masks; vsfeel converts the mask to Gray8 internally,
+  eedi3vk2 needs the clip's format - both then agree bit-exactly).
 * f32 (GRAYS): vsfeel vs eedi3vk2 within ~1 ulp (7.45e-9 on the noise clip);
   a few parameter corners (e.g. gamma=5 with vcheck) show isolated DP
   argmin flips worth up to a few e-3 on a handful of pixels (measured
@@ -272,6 +274,7 @@ REFERENCE_CASES_16 = [
     ({"field": 0, "mdis": 5, "nrad": 1, "vcheck": 0}, 0),
     ({"field": 1, "dh": 1, "mdis": 5, "nrad": 1, "vcheck": 0}, 0),
     ({"field": 1, "dh": 1, "mdis": 20, "nrad": 3, "vcheck": 2}, 0),
+    ({"field": 2, "mdis": 5, "nrad": 1, "vcheck": 0}, 0),
     ({"field": 3, "mdis": 5, "nrad": 1, "vcheck": 0}, 0),
     ({"field": 1, "alpha": 0.0, "beta": 0.0, "gamma": 5.0}, 0),
     ({"field": 1, "alpha": 0.5, "beta": 0.5}, 0),
@@ -287,6 +290,7 @@ REFERENCE_CASES_32 = [
     ({"field": 0, "mdis": 5, "nrad": 1, "vcheck": 0}, 1e-6),
     ({"field": 1, "dh": 1, "mdis": 5, "nrad": 1, "vcheck": 0}, 1e-6),
     ({"field": 1, "dh": 1, "mdis": 20, "nrad": 3, "vcheck": 2}, 1e-6),
+    ({"field": 2, "mdis": 5, "nrad": 1, "vcheck": 0}, 1e-6),
     ({"field": 3, "mdis": 5, "nrad": 1, "vcheck": 0}, 1e-6),
     ({"field": 1, "alpha": 0.0, "beta": 0.0, "gamma": 5.0}, 5e-3),
     ({"field": 1, "alpha": 0.5, "beta": 0.5}, 1e-6),
@@ -445,6 +449,44 @@ def test_eedi3_mclip_masked_region_is_vertical_cubic(noise_16bit):
             f"masked px {row},{x}: {d[row,x]} vs cubic {taps}")
 
 
+@pytest.mark.parametrize("field", [2, 3], ids=["field2", "field3"])
+def test_eedi3_mclip_field_gt1_matches_vk2(noise_16bit, field):
+    """mclip combined with frame doubling: the mask (N frames, one per source
+    frame) must drive both output parities exactly like eedi3vk2."""
+    if not hasattr(vs.core, "eedi3vk2") or not hasattr(vs.core.eedi3vk2, "EEDI3"):
+        pytest.skip("no eedi3vk2.EEDI3 reference")
+    clip = noise_16bit
+    kw = dict(field=field, mdis=5, nrad=1, vcheck=2)
+    m16 = _right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
+    ref_mask = vs.core.fmtc.bitdepth(m16, bits=16, fulls=True, fulld=True)
+    vk2 = vs.core.eedi3vk2.EEDI3(clip, mclip=ref_mask, **kw)
+    my = _run(clip, mclip=m16, **kw)  # g16 auto->g8
+    assert my.num_frames == 2 * clip.num_frames
+    for n in (0, 5, clip.num_frames, 2 * clip.num_frames - 1):
+        rows = _interp_rows(HEIGHT, n, field)
+        a = _plane(my.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
+        b = _plane(vk2.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
+        assert np.abs(a - b)[rows].max() == 0, f"mclip field={field} mismatch at n={n}"
+
+
+def test_eedi3_mclip_dh_matches_vk2(noise_16bit):
+    """mclip combined with dh (doubled height)."""
+    if not hasattr(vs.core, "eedi3vk2") or not hasattr(vs.core.eedi3vk2, "EEDI3"):
+        pytest.skip("no eedi3vk2.EEDI3 reference")
+    clip = noise_16bit
+    kw = dict(field=1, dh=1, mdis=5, nrad=1, vcheck=2)
+    m16 = _right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
+    ref_mask = vs.core.fmtc.bitdepth(m16, bits=16, fulls=True, fulld=True)
+    vk2 = vs.core.eedi3vk2.EEDI3(clip, mclip=ref_mask, **kw)
+    my = _run(clip, mclip=m16, **kw)
+    assert my.height == 2 * HEIGHT
+    for n in (0, 11, 23):
+        rows = _interp_rows(2 * HEIGHT, n, 1)
+        a = _plane(my.get_frame(n), 0, WIDTH, 2 * HEIGHT, np.uint16).astype(np.int64)
+        b = _plane(vk2.get_frame(n), 0, WIDTH, 2 * HEIGHT, np.uint16).astype(np.int64)
+        assert np.abs(a - b)[rows].max() == 0, f"mclip dh mismatch at n={n}"
+
+
 # ---------------------------------------------------------------------------
 # Formats and plane handling
 # ---------------------------------------------------------------------------
@@ -521,6 +563,28 @@ def test_eedi3_field_gt1_doubles_frames():
     f1 = out.get_frame(1)
     d1 = _plane(f1, 0, WIDTH, HEIGHT, np.uint16)
     assert np.array_equal(d1[1::2], a0[1::2]), "kept rows changed at n=1"
+
+
+def test_eedi3_output_props_progressive_and_duration():
+    """Output frames are progressive (_FieldBased=0) and under field>1 the
+    duration is halved (fps doubles) — the standard EEDI3 deinterlace props."""
+    clip = noise_16bit_or_skip()
+    core = vs.core
+    s0 = clip.get_frame(0).props
+    sn, sd = s0.get("_DurationNum"), s0.get("_DurationDen")
+    for field, factor in ((1, 1), (3, 2)):
+        out = _run(clip, field=field, mdis=5, nrad=1, vcheck=0)
+        assert out.num_frames == factor * clip.num_frames
+        assert out.fps_num == factor * clip.fps_num
+        assert out.fps_den == clip.fps_den
+        for n in (0, min(out.num_frames - 1, 5)):
+            pr = out.get_frame(n).props
+            assert pr.get("_FieldBased") == 0, f"_FieldBased not progressive (n={n})"
+            on, od = pr.get("_DurationNum"), pr.get("_DurationDen")
+            # duration on/od == (1/factor) * sn/sd, compared without floats
+            assert on is not None and od is not None, f"no duration props (n={n})"
+            assert on * factor * sd == sn * od, (
+                f"duration not scaled by 1/{factor} at n={n}: {on}/{od}")
 
 
 def noise_16bit_or_skip():
@@ -641,3 +705,77 @@ def test_eedi3_rejects_sclip_wrong_dims_when_vcheck(noise_16bit):
         _run(noise_16bit, vcheck=2, sclip=small)
     # ignored (not validated) when vcheck == 0
     _run(noise_16bit, vcheck=0, sclip=small)
+
+
+def test_eedi3_sclip_requires_2n_frames_under_field_gt1(noise_16bit):
+    """sclip describes the OUTPUT: under field>1 the sclip must have 2N frames
+    (one per output frame, like based_aa's Interleave([s, s])). N-frame sclips
+    are rejected; the 2N one is accepted and bit-exact vs eedi3vk2."""
+    clip = noise_16bit
+    N = clip.num_frames
+    base = dict(field=3, mdis=5, nrad=1, vcheck=2)
+    with pytest.raises(vs.Error):
+        _run(clip, sclip=clip, **base)          # N-frame: wrong
+    if not hasattr(vs.core, "eedi3vk2") or not hasattr(vs.core.eedi3vk2, "EEDI3"):
+        pytest.skip("no eedi3vk2.EEDI3 reference")
+    # shifted content so sclip != the vertical cubic
+    shifted = vs.core.std.Expr(clip, "x 1000 +")
+    sc2n = vs.core.std.Interleave([shifted, shifted])   # 2N frames
+    vk2 = vs.core.eedi3vk2.EEDI3(clip, sclip=sc2n, **base)
+    my = _run(clip, sclip=sc2n, **base)
+    assert my.num_frames == 2 * N
+    for n in (0, 1, N - 1, N, 2 * N - 1):
+        rows = _interp_rows(HEIGHT, n, 3)
+        a = _plane(my.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
+        b = _plane(vk2.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
+        assert np.abs(a - b)[rows].max() == 0, f"field=3 sclip mismatch at n={n}"
+
+
+def test_eedi3_sclip_dh_requires_doubled_height(noise_16bit):
+    """Under dh the output doubles in height, so sclip must be 2x tall too."""
+    clip = noise_16bit
+    base = dict(field=1, dh=1, mdis=5, nrad=1, vcheck=2)
+    with pytest.raises(vs.Error):
+        _run(clip, sclip=clip, **base)          # 1x height: wrong
+    if not hasattr(vs.core, "eedi3vk2") or not hasattr(vs.core.eedi3vk2, "EEDI3"):
+        pytest.skip("no eedi3vk2.EEDI3 reference")
+    shifted = vs.core.std.Expr(clip, "x 1000 +")
+    sc_dh = vs.core.resize.Point(shifted, WIDTH, 2 * HEIGHT)
+    vk2 = vs.core.eedi3vk2.EEDI3(clip, sclip=sc_dh, **base)
+    my = _run(clip, sclip=sc_dh, **base)
+    assert my.height == 2 * HEIGHT
+    for n in (0, 11, 23):
+        rows = _interp_rows(2 * HEIGHT, n, 1)
+        a = _plane(my.get_frame(n), 0, WIDTH, 2 * HEIGHT, np.uint16).astype(np.int64)
+        b = _plane(vk2.get_frame(n), 0, WIDTH, 2 * HEIGHT, np.uint16).astype(np.int64)
+        assert np.abs(a - b)[rows].max() == 0, f"dh sclip mismatch at n={n}"
+
+
+def test_eedi3_sclip_content_matches_vk2(noise_16bit):
+    """sclip is the vcheck reference: with vcheck > 0 the output must use the
+    sclip content (shifted noise, never equal to the vertical cubic) exactly
+    like eedi3vk2 does. Guards the sclip row staging / Interleave parity."""
+    if not hasattr(vs.core, "eedi3vk2") or not hasattr(vs.core.eedi3vk2, "EEDI3"):
+        pytest.skip("no eedi3vk2.EEDI3 reference")
+    clip = noise_16bit
+    shifted = vs.core.std.Expr(clip, "x 1000 +")
+    base = dict(field=1, mdis=5, nrad=1, vcheck=2)
+    vk2 = vs.core.eedi3vk2.EEDI3(clip, sclip=shifted, **base)
+    my = _run(clip, sclip=shifted, **base)
+    for n in (0, 11, 23):
+        rows = _interp_rows(HEIGHT, n, 1)
+        a = _plane(my.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
+        b = _plane(vk2.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
+        assert np.abs(a - b)[rows].max() == 0, f"sclip mismatch at n={n}"
+    # sclip must actually change the output vs the no-sclip run (sanity that
+    # the test content is meaningful)
+    no_sc = _run(clip, **base)
+    changed = False
+    for n in (0, 11):
+        a = _plane(my.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
+        b = _plane(no_sc.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
+        rows = _interp_rows(HEIGHT, n, 1)
+        if (np.abs(a - b)[rows] > 0).any():
+            changed = True
+    assert changed, "sclip content did not affect the output (test is vacuous)"
+

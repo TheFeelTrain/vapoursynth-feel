@@ -1013,13 +1013,29 @@ static void VS_CC Eedi3Create(
         }
     }
 
-    // sclip only validated when vcheck > 0 (eedi3m semantics)
+    // sclip only validated when vcheck > 0 (eedi3m semantics). Like eedi3m /
+    // eedi3vk2 / vszip, the sclip describes the OUTPUT: under field > 1 the
+    // output doubles the frame count (sclip supplies one frame per output
+    // frame, i.e. 2N frames — based_aa builds it via Interleave([s, s])), and
+    // under dh it doubles the height. Validating against the pre-doubling vi
+    // would wrongly accept an N-frame sclip (whose frames n >= N would be
+    // requested out of range) and reject the correct 2N one.
     if (d->vcheck > 0 && d->sclip_node) {
         const auto svi = vsapi->getVideoInfo(d->sclip_node);
-        if (!vsh::isSameVideoInfo(svi, d->vi)) {
+        VSVideoInfo out_vi = *d->vi;
+        if (d->field > 1) {
+            if (d->vi->numFrames > INT32_MAX / 2) {
+                return set_error("resulting clip is too long");
+            }
+            out_vi.numFrames = d->vi->numFrames * 2;
+        }
+        if (d->dh) {
+            out_vi.height *= 2;
+        }
+        if (!vsh::isSameVideoInfo(svi, &out_vi)) {
             return set_error("sclip's format and dimensions don't match");
         }
-        if (svi->numFrames != d->vi->numFrames) {
+        if (svi->numFrames != out_vi.numFrames) {
             return set_error("sclip's number of frames doesn't match");
         }
     }

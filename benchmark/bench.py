@@ -102,6 +102,7 @@ def make_aa_vpy(
     chain: str,
     frames: int,
     cache_frames: int | None = 400,
+    eedi3_field: int = 3,
 ) -> str:
     """Real-clip vpy that mirrors vsaa.based_aa's EEDI3 usage:
 
@@ -113,7 +114,12 @@ def make_aa_vpy(
       while vspipe evaluates the script, so the timed region covers only the
       EEDI3 call (with its mclip/sclip), not the CPU mask/upscale work.
       cache_frames=None keeps a live decode (full chain incl. mask work).
-    The chain string receives `clip` (the 2x luma) and `mclip`/`sclip` clips.
+    The chain string receives `clip` (the 2x luma), `mclip` (the 2x mask) and
+    `sclip`. based_aa runs its default EEDI3 in double-rate mode (field = 3:
+    tff + double_rate*2), so the filter outputs 2 frames per input frame and
+    sclip must describe the output: one frame per OUTPUT frame, built exactly
+    like based_aa does with Interleave([s, s]). When eedi3_field <= 1 the
+    sclip is the plain clip.
     """
     if cache_frames is not None:
         cache_lines = f"""\
@@ -128,10 +134,11 @@ _blank = ss.std.BlankClip()
 clip = (_blank.std.ModifyFrame(_blank, _serve_ss) * -(-{frames} // m)).std.Trim(0, {frames} - 1)
 _blankm = mclip.std.BlankClip()
 mclip = (_blankm.std.ModifyFrame(_blankm, _serve_msk) * -(-{frames} // m)).std.Trim(0, {frames} - 1)
-sclip = clip
+sclip = {f"core.std.Interleave([clip, clip])" if eedi3_field > 1 else "clip"}
 """
     else:
-        cache_lines = "clip = ss\nsclip = clip\n"
+        sclip_expr = "core.std.Interleave([ss, ss])" if eedi3_field > 1 else "clip"
+        cache_lines = f"clip = ss\nsclip = {sclip_expr}\n"
     return f"""\
 from vssource import BestSource
 from vstools import core, depth, get_y
@@ -423,7 +430,13 @@ FILTERS: dict[str, FilterSpec] = {
         title="EEDI3",
         default_frames=2000,
         args=[
-            Arg("field", "--eedi3-field", "eedi3_field", int, 1),
+            # based_aa runs its default EEDI3 antialiaser in double-rate mode:
+            # field = tff + double_rate*2 = 3 (progressive input, tff=True), i.e.
+            # 2 output frames per input frame interpolating each field parity,
+            # which based_aa folds back with std.Merge(clip[::2], clip[1::2]).
+            # The merge is not EEDI3 work, so the benchmark times field=3 alone
+            # (the exact double-rate call based_aa makes) and skips the merge.
+            Arg("field", "--eedi3-field", "eedi3_field", int, 3),
             Arg("mdis", "--eedi3-mdis", "eedi3_mdis", int, 20),
             Arg("nrad", "--eedi3-nrad", "eedi3_nrad", int, 2),
             Arg("alpha", "--eedi3-alpha", "eedi3_alpha", float, 0.125),
@@ -481,7 +494,8 @@ def bench(plugin: str, chain: str, clip: str, frames: int, synth_format: str | N
 
 
 def bench_aa(plugin: str, chain: str, clip: str, frames: int,
-             cache_frames: int | None = None) -> float | None:
+             cache_frames: int | None = None,
+             eedi3_field: int = 3) -> float | None:
     """Run an EEDI3 anti-aliasing style benchmark (see make_aa_vpy)."""
     vpy = make_aa_vpy(
         clip=clip,
@@ -489,6 +503,7 @@ def bench_aa(plugin: str, chain: str, clip: str, frames: int,
         chain=chain,
         frames=frames,
         cache_frames=cache_frames,
+        eedi3_field=eedi3_field,
     )
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"bench_{plugin}.vpy"
@@ -560,7 +575,8 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
             # luma + the 2x edge mask (both ~16.6 MB/frame at 1080p->2160p
             # GRAY16), so the timed region measures only the EEDI3 call.
             fps = bench_aa(plugin, calls[plugin], ns.clip, frames,
-                           min(cache_frames or 400, 500))
+                           min(cache_frames or 400, 500),
+                           getattr(ns, "eedi3_field", 3))
         else:
             fps = bench(plugin, calls[plugin], ns.clip, frames, synth, cache_frames, cache_conv)
         results.append((plugin, fps))
