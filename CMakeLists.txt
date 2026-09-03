@@ -199,6 +199,29 @@ if(VK_GLSLC)
                 VERBATIM)
         endforeach()
     endforeach()
+    # EEDI3 upload kernels: mirror-pad builder + empty-row vcheck copy per io
+    # variant (plain 1D kernels, fixed local size, no subgroup ops);
+    # vulkan1.3 target keeps one rule for the file.
+    set(VK_EEDI3_UP_ENTRIES pad vcopy)
+    foreach(bits IN LISTS VK_EEDI3_BITS)
+        foreach(entry IN LISTS VK_EEDI3_UP_ENTRIES)
+            if(entry STREQUAL pad)
+                set(entry_def -DENTRY_PAD)
+            else()
+                set(entry_def -DENTRY_VCOPY)
+            endif()
+            set(raw_spv "${VK_SPV_DIR}/eedi3_${bits}_${entry}.spv")
+            list(APPEND VK_SPV_OUTPUTS "${raw_spv}")
+            add_custom_command(
+                OUTPUT "${raw_spv}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
+                COMMAND ${VK_GLSLC} --target-env=vulkan1.3 -O -fshader-stage=compute -DBITS=${bits} ${entry_def}
+                        -o "${raw_spv}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/src/eedi3.comp"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/eedi3.comp"
+                VERBATIM)
+        endforeach()
+    endforeach()
 else()
     message(FATAL_ERROR "glslc not found")
 endif()
@@ -244,6 +267,10 @@ add_custom_command(
             "${VK_SPV_DIR}/eedi3_16_vcheck.spv"
             "${VK_SPV_DIR}/eedi3_32_row.spv"
             "${VK_SPV_DIR}/eedi3_32_vcheck.spv"
+            "${VK_SPV_DIR}/eedi3_16_pad.spv"
+            "${VK_SPV_DIR}/eedi3_32_pad.spv"
+            "${VK_SPV_DIR}/eedi3_16_vcopy.spv"
+            "${VK_SPV_DIR}/eedi3_32_vcopy.spv"
             "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
     DEPENDS ${VK_SPV_OUTPUTS}
     VERBATIM)

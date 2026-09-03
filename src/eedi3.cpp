@@ -73,7 +73,8 @@ enum Binding : uint32_t {
     B_CINT = 6,
     B_VOUT = 7,       // vcheck output rows (io type); vcheck reads taps from
                       // B_DST (untouched) and writes the vchecked row here
-    BIND_COUNT = 8
+    B_RAW = 8,        // ENTRY_PAD's extra view of pad_dev (built pad out)
+    BIND_COUNT = 9
 };
 
 struct PlaneConfig {
@@ -86,20 +87,31 @@ struct PlaneConfig {
 
     VkPipeline row_pipeline {};
     VkPipeline vcheck_pipeline {};    // only when vcheck > 0
+    VkPipeline pad_pipeline {};       // mirror-pad builder (always)
+    VkPipeline vcopy_pipeline {};     // empty-row vcheck copy (vcheck+mclip)
 
-    // staging (host-visible) regions, byte offsets
-    VkDeviceSize pad_offset {};       // float pad plane (upload)
-    VkDeviceSize pad_bytes {};
-    VkDeviceSize bmask_offset {};     // dilated mask rows (upload; mclip only)
-    VkDeviceSize bmask_bytes {};
+    // staging (host-visible) regions, byte offsets: tight kept source rows,
+    // gathered sclip rows (sclip only). The shared tight mask rows live in
+    // Eedi3Data (maskraw_offset/bytes).
+    VkDeviceSize raw_offset {};       // kept src rows (upload)
+    VkDeviceSize raw_bytes {};
     VkDeviceSize sclip_offset {};     // sclip interp rows (upload; sclip only)
     VkDeviceSize sclip_bytes {};
     VkDeviceSize dl_offset {};        // interp row download (device -> host)
     VkDeviceSize dl_bytes {};
 
+    // device-mirror (pad_dev) regions: 1:1 copy of the upload [0,upload_total)
+    // plus kernel-built regions (never staged)
+    VkDeviceSize built_offset {};     // built padded plane (pad kernel out)
+    VkDeviceSize built_bytes {};
+    VkDeviceSize bits_offset {};      // packed dilation bits (bmask kernel out)
+    VkDeviceSize bits_bytes {};
+
     // device-local buffer regions, byte offsets (offsets into d->dev_buf)
     VkDeviceSize dst_offset {};       // interp rows (io type)
     VkDeviceSize dst_bytes {};
+    VkDeviceSize rempty_offset {};    // per-row empty flags, int8 (always)
+    VkDeviceSize rempty_bytes {};
     VkDeviceSize pbt_offset {};       // int8 rows*width*tpitch
     VkDeviceSize pbt_bytes {};
     VkDeviceSize dmap_offset {};      // int8 rows*width (vcheck only)
@@ -164,12 +176,15 @@ struct Eedi3Data {
     VkDescriptorPool desc_pool {};
     VkShaderModule row_module {};
     VkShaderModule vcheck_module {};
+    VkShaderModule pad_module {};
+    VkShaderModule vcopy_module {};
     VkDeviceSize upload_total {}, download_total {}, dev_total {};
     std::array<PlaneConfig, MAX_PLANES> planes {};
     FramePool<Eedi3Resource> pool;
 
-    // module/pipeline cache keyed by width (values owned by the pipelines map)
-    std::vector<std::pair<WidthKey, std::array<VkPipeline, 2>>> width_pipes {};
+    // module/pipeline cache keyed by width (values owned by the pipelines
+    // map): [row, vcheck, pad]
+    std::vector<std::pair<WidthKey, std::array<VkPipeline, 4>>> width_pipes {};
 
     ~Eedi3Data() {
         if (!device) {
@@ -197,23 +212,23 @@ struct Eedi3Data {
             destroy_common(dev, resource);
         }
 
-        VkPipeline destroyed[2 * 3] {};
+        VkPipeline destroyed[4 * 3] {};
         int nd = 0;
-        for (auto & [key, pair] : width_pipes) {
-            for (int i = 0; i < 2; ++i) {
-                if (!pair[i]) {
+        for (auto & [key, quad] : width_pipes) {
+            for (int i = 0; i < 4; ++i) {
+                if (!quad[i]) {
                     continue;
                 }
                 bool seen = false;
                 for (int j = 0; j < nd; ++j) {
-                    if (destroyed[j] == pair[i]) {
+                    if (destroyed[j] == quad[i]) {
                         seen = true;
                         break;
                     }
                 }
                 if (!seen) {
-                    destroyed[nd++] = pair[i];
-                    vkDestroyPipeline(dev, pair[i], nullptr);
+                    destroyed[nd++] = quad[i];
+                    vkDestroyPipeline(dev, quad[i], nullptr);
                 }
             }
         }
@@ -232,95 +247,21 @@ struct Eedi3Data {
         if (vcheck_module) {
             vkDestroyShaderModule(dev, vcheck_module, nullptr);
         }
+        if (pad_module) {
+            vkDestroyShaderModule(dev, pad_module, nullptr);
+        }
+        if (vcopy_module) {
+            vkDestroyShaderModule(dev, vcopy_module, nullptr);
+        }
 
         release_device(device);
     }
 };
 
 // ---------------------------------------------------------------------------
-// CPU-side pad / mask staging (mirrors eedi3m's copyPad exactly)
+// CPU-side staging (tight kept-row / sclip gathers live inline in GetFrame;
+// the GPU pad kernel expands mirrors, replicating eedi3m's copyPad exactly)
 // ---------------------------------------------------------------------------
-
-// Writes one full padded row (including the mirrored margins) of the given
-// source row into tmp, then copies it to pad at `y` (in pad-row units).
-// srcRow may be negative / past the end (vertical mirror handles it above).
-// Tdst is the pad element type (uint16_t for 16-bit input, float for 32-bit:
-// native values, so the u16 path is a pure copy with no float conversion).
-template <typename Tsrc, typename Tdst>
-static void copy_pad_row(const Tsrc * src_line, const int src_stride,
-                         Tdst * tmp, const int pad_w, const int src_row,
-                         const int y, Tdst * pad, const int pad_stride,
-                         const int src_width, const int src_height) {
-    // resolve mirrored source row
-    int real = src_row;
-    if (real < 0) {
-        real = -1 - real;
-    }
-    if (real >= src_height) {
-        real = 2 * src_height - 1 - real;
-    }
-    real = std::max(real, 0);
-    if (real >= src_height) {
-        real = src_height - 1;
-    }
-
-    const Tsrc * line = src_line + static_cast<int64_t>(src_stride) * real;
-
-    for (int x = 0; x < src_width; ++x) {
-        tmp[MARGIN_H + x] = static_cast<Tdst>(line[x]);
-    }
-    for (int x = 0; x < MARGIN_H; ++x) {
-        tmp[x] = tmp[MARGIN_H * 2 - x];
-    }
-    for (int x = pad_w - MARGIN_H, c = 2; x < pad_w; ++x, c += 2) {
-        tmp[x] = tmp[x - c];
-    }
-
-    // Streaming store: pad rows are 32-byte aligned and never re-read by the
-    // CPU (the GPU consumes them via the H2D copy), so bypass the cache.
-    copy_stream_out(pad + static_cast<int64_t>(pad_stride) * y, tmp,
-                    static_cast<size_t>(pad_w) * sizeof(Tdst));
-}
-
-// Builds the host-side padded plane exactly like eedi3m's copyPad: kept rows
-// (parity `off` in the source, which is 1-field for dh=0 and every row with
-// 2-row output pitch for dh=1) plus mirrored vertical margins. `pad` is the
-// native-type upload destination (u16 values for 16-bit / raw f32).
-template <typename Tsrc, typename Tdst>
-static void copy_pad_plane(const Tsrc * src, const ptrdiff_t src_stride_elems,
-                           const int src_width, const int src_height,
-                           Tdst * pad, const int pad_stride, const int pad_w,
-                           const int pad_h, const bool dh, const int off,
-                           Tdst * tmp) {
-    // Interior kept rows.
-    if (!dh) {
-        // pad row MARGIN_V + off + 2k  <- src row off + 2k, k = 0..H/2-1
-        for (int k = 0; k < src_height / 2; ++k) {
-            const int y = MARGIN_V + off + 2 * k;
-            copy_pad_row(src, src_stride_elems, tmp, pad_w,
-                         off + 2 * k, y, pad, pad_stride, src_width, src_height);
-        }
-    } else {
-        // dh: pad row MARGIN_V + off + 2k <- src row k for k in 0..srcH-1
-        for (int k = 0; k < src_height; ++k) {
-            const int y = MARGIN_V + off + 2 * k;
-            copy_pad_row(src, src_stride_elems, tmp, pad_w,
-                         k, y, pad, pad_stride, src_width, src_height);
-        }
-    }
-
-    // Vertical margins (copy whole mirrored rows).
-    for (int y = off; y < MARGIN_V; y += 2) {
-        copy_stream_out(pad + static_cast<int64_t>(pad_stride) * y,
-                        pad + static_cast<int64_t>(pad_stride) * (MARGIN_V * 2 - y),
-                        static_cast<size_t>(pad_w) * sizeof(Tdst));
-    }
-    for (int y = pad_h - MARGIN_V + off, c = 2 + 2 * off; y < pad_h; y += 2, c += 4) {
-        copy_stream_out(pad + static_cast<int64_t>(pad_stride) * y,
-                        pad + static_cast<int64_t>(pad_stride) * (y - c),
-                        static_cast<size_t>(pad_w) * sizeof(Tdst));
-    }
-}
 
 // Mirrors eedi3m's bmask dilation scan for one row: marks columns within
 // mdis of a set mask pixel ("last" propagation). Writes directly PACKED BITS
@@ -445,11 +386,11 @@ static std::variant<VkPipeline, std::string> create_pipeline(
 // Push constant layout must match the shader's PC struct (int block then
 // float block; see eedi3.comp).
 struct PushConstants {
-    int32_t pad_base;
+    int32_t pad_base;       // pad-elem base of the BUILT pad (b0 reads it)
     int32_t dst_base;
     int32_t pbt_base;
     int32_t dmap_base;
-    int32_t bmask_base;
+    int32_t bmask_base;     // word base of the packed bits (b4)
     int32_t sclip_base;
     int32_t cint_base;
     int32_t vout_base;    // vcheck output rows (element base into dev_buf)
@@ -465,8 +406,13 @@ struct PushConstants {
     float vth1r;
     float vth2r;
     float vth2;
+    // upload-kernel field (ENTRY_PAD; ignored by row/vcheck).
+    // NOTE: ENTRY_PAD writes the built pad through b8 at pc.pad_base (same
+    // numeric base as the row kernel's b0 reads — same region, same buffer).
+    int32_t raw_base;       // pad-elem base of tight kept rows (H2D mirror)
+    int32_t rempty_base;    // int8 base of per-row empty flags (dev_buf via b3)
 };
-static_assert(sizeof(PushConstants) == 12 * 4 + 8 * 4, "push constants size");
+static_assert(sizeof(PushConstants) == 14 * 4 + 8 * 4, "push constants size");
 
 // base offsets in ELEMENTS for each binding of a plane's regions (element
 // type per binding; the descriptors range the whole buffer so the shader
@@ -499,9 +445,9 @@ static std::optional<std::string> record_command_buffer(
 
     const int32_t elem = d.elem_bytes;
 
-    // H2D: copy the CPU-written upload region (pad + bmask + sclip, [0,
-    // upload_total)) from system-RAM staging into the device-local pad_dev the
-    // kernels read. Host writes were flushed by the caller before submit.
+    // H2D: copy the CPU-written upload region (tight kept rows, packed bits,
+    // sclip, [0, upload_total)) from system-RAM staging into the device-local
+    // pad_dev mirror the kernels read. Host writes were flushed by the caller.
     if (d.upload_total > 0) {
         const VkBufferCopy region {
             .srcOffset = 0,
@@ -520,12 +466,52 @@ static std::optional<std::string> record_command_buffer(
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
     }
 
-    // The row kernel reads the pad / bmask / sclip straight from the staging
-    // (host) buffer and writes dst / pbt / dmap / cint to dev_buf; a D2H copy
-    // then brings the interp rows back into the staging download area. The
-    // command buffer is recorded per frame because the interp-row parity
+    // Upload kernel: build the padded planes from the raw upload (per plane).
+    // The command buffer is recorded per frame because the interp-row parity
     // `field` varies (field > 1 doubles frames and _FieldBased sources).
     (void)field;
+    const int32_t pad_elem = pad_elem_bytes(d.bits);
+    for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
+        if (!d.process[plane]) {
+            continue;
+        }
+        const auto & cfg = d.planes[plane];
+
+        PushConstants ppc {};
+        ppc.pad_base = static_cast<int32_t>(cfg.built_offset / pad_elem);
+        ppc.pad_stride = cfg.pad_stride;
+        ppc.pad_height = cfg.pad_height;
+        ppc.field = field;
+        ppc.rows = cfg.rows;
+        ppc.raw_base = static_cast<int32_t>(cfg.raw_offset / pad_elem);
+
+        // pad builder: one thread per padded element
+        vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.pad_pipeline);
+        vkCmdBindDescriptorSets(
+            resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
+        vkCmdPushConstants(
+            resource.cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+            0, sizeof(ppc), &ppc);
+        const uint32_t pad_total = static_cast<uint32_t>(cfg.pad_stride) *
+            static_cast<uint32_t>(cfg.pad_height);
+        vkCmdDispatch(resource.cmd, (pad_total + 255) / 256, 1, 1);
+    }
+    {
+        // the pad builder's writes must be visible to the row kernel's reads
+        VkMemoryBarrier mem_barrier {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+        };
+        vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+    }
+
+    // The row kernel reads the built pad / packed bmask / sclip and writes
+    // dst / pbt / dmap / cint to dev_buf; a D2H copy then brings the interp
+    // rows back into the staging download area.
     for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
         if (!d.process[plane]) {
             continue;
@@ -535,14 +521,17 @@ static std::optional<std::string> record_command_buffer(
         const int has_sclip = (d.vcheck > 0 && d.sclip_node) ? 1 : 0;
 
         PushConstants pc {
-            .pad_base = static_cast<int32_t>(cfg.pad_offset / pad_elem_bytes(d.bits)),
+            .pad_base = static_cast<int32_t>(cfg.built_offset / pad_elem_bytes(d.bits)),
             .dst_base = static_cast<int32_t>(cfg.dst_offset / elem),
             .pbt_base = static_cast<int32_t>(cfg.pbt_offset),
             .dmap_base = static_cast<int32_t>(cfg.dmap_offset),
-            .bmask_base = static_cast<int32_t>(cfg.bmask_offset / sizeof(uint32_t)),
+            .bmask_base = static_cast<int32_t>(cfg.bits_offset / sizeof(uint32_t)),
             .sclip_base = static_cast<int32_t>(cfg.sclip_offset / elem),
             .cint_base = static_cast<int32_t>(cfg.cint_offset / elem),
-            .vout_base = static_cast<int32_t>(cfg.vout_offset / elem),
+            // vout lands DIRECTLY in the staging download region (b7 views
+            // staging): no D2H copy when vcheck > 0, so the base indexes
+            // staging, past the upload.
+            .vout_base = static_cast<int32_t>((d.upload_total + cfg.dl_offset) / elem),
             .pad_stride = cfg.pad_stride,
             .pad_height = cfg.pad_height,
             .field = field,
@@ -555,6 +544,8 @@ static std::optional<std::string> record_command_buffer(
             .vth1r = d.rcp_vth1,
             .vth2r = d.rcp_vth2,
             .vth2 = d.vthresh2,
+            .raw_base = 0,
+            .rempty_base = static_cast<int32_t>(cfg.rempty_offset),
         };
 
         vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.row_pipeline);
@@ -567,7 +558,8 @@ static std::optional<std::string> record_command_buffer(
         vkCmdDispatch(resource.cmd, 1, static_cast<uint32_t>(cfg.rows), 1);
 
         if (d.vcheck > 0) {
-            // the vcheck kernel reads the row kernel's writes
+            // the vcheck passes read the row kernel's writes (dst/dmap/cint
+            // rempty flags)
             VkMemoryBarrier mem_barrier {
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .pNext = nullptr,
@@ -576,6 +568,32 @@ static std::optional<std::string> record_command_buffer(
             };
             vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+
+            // empty-row fast pass (mclip only; without a mask no row is
+            // empty and the walk below handles everything): fully-masked
+            // rows copied in parallel, so the serial walk only iterates
+            // non-empty rows and pays ~1/3 of the barriers.
+            if (d.mclip_node) {
+                vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.vcopy_pipeline);
+                vkCmdBindDescriptorSets(
+                    resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
+                vkCmdPushConstants(
+                    resource.cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                    0, sizeof(pc), &pc);
+                const uint32_t vcopy_total = static_cast<uint32_t>(cfg.rows) *
+                    static_cast<uint32_t>(cfg.width);
+                vkCmdDispatch(resource.cmd, (vcopy_total + 255) / 256, 1, 1);
+
+                VkMemoryBarrier vcopy_barrier {
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+                };
+                vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &vcopy_barrier, 0, nullptr, 0, nullptr);
+            }
 
             vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.vcheck_pipeline);
             vkCmdBindDescriptorSets(
@@ -588,8 +606,10 @@ static std::optional<std::string> record_command_buffer(
         }
     }
 
-    // download: dev_buf interp rows -> staging download region
-    if (d.download_total > 0) {
+    // download: with vcheck the interp rows were written DIRECTLY to the
+    // staging download region (vout views staging — no copy, no barrier).
+    // Without vcheck the row kernel's dst (dev_buf) still needs the D2H copy.
+    if (d.vcheck == 0 && d.download_total > 0) {
         VkMemoryBarrier mem_barrier {
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
@@ -604,11 +624,8 @@ static std::optional<std::string> record_command_buffer(
                 continue;
             }
             const auto & cfg = d.planes[plane];
-            // With vcheck the interp rows live in vout (dst stays the plain
-            // row-kernel output the vcheck reads taps from).
-            const VkDeviceSize src = (d.vcheck > 0) ? cfg.vout_offset : cfg.dst_offset;
             const VkBufferCopy region {
-                .srcOffset = src,
+                .srcOffset = cfg.dst_offset,
                 .dstOffset = d.upload_total + cfg.dl_offset,
                 .size = cfg.dl_bytes
             };
@@ -704,7 +721,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
 
     const bool hbench = getenv("VSFEEL_EEDI3_HBENCH") && sn == 0;
     const auto h_t0 = std::chrono::steady_clock::now();
-    auto h_tPadEnd = h_t0, h_tBmaskEnd = h_t0;
+    auto h_tMaskEnd = h_t0, h_tGatherEnd = h_t0;
 
     // Re-record the command buffer with this frame's interp-row parity (the
     // previous submit on this resource was waited on before give_back, so the
@@ -718,20 +735,10 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         !!(d->device->mem_props.memoryTypes[resource.staging_type_index].propertyFlags &
            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    // CPU: stage pad (native type: u16 for 16-bit input, float for 32-bit),
-    // dilated bmask rows, and sclip interp rows.
+    // CPU: gather tight kept source rows, CPU-packed dilation bits, and
+    // sclip interp rows into staging (plain streaming copies for the rows;
+    // the GPU pad kernel expands mirrors, the row kernel reads the bits).
     uint8_t * const staging = static_cast<uint8_t *>(static_cast<void *>(map));
-    const int pad_elem = (d->bits == 16) ? 2 : 4;
-    const int max_pad_row = [&] {
-        int m = 0;
-        for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-            if (d->process[plane]) {
-                m = std::max(m, d->planes[plane].pad_stride * pad_elem);
-            }
-        }
-        return m;
-    }();
-    std::vector<uint8_t> tmp_bytes(static_cast<size_t>(max_pad_row));
 
     for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
         if (!d->process[plane]) {
@@ -741,28 +748,19 @@ static const VSFrame *VS_CC Eedi3GetFrame(
 
         const auto srcp = vsapi->getReadPtr(src, plane);
         const ptrdiff_t src_stride = vsapi->getStride(src, plane);
-        const int src_width = vsapi->getFrameWidth(src, plane);
-        const int src_height = vsapi->getFrameHeight(src, plane);
-
-        if (d->bits == 16) {
-            copy_pad_plane<uint16_t, uint16_t>(
-                reinterpret_cast<const uint16_t *>(srcp), src_stride / 2,
-                src_width, src_height,
-                reinterpret_cast<uint16_t *>(staging + cfg.pad_offset),
-                cfg.pad_stride,
-                cfg.width + MARGIN_H * 2, cfg.pad_height, d->dh, off,
-                reinterpret_cast<uint16_t *>(tmp_bytes.data()));
+        const size_t raw_row_bytes = static_cast<size_t>(cfg.width) * pad_elem_bytes(d->bits);
+        uint8_t * rawp = staging + cfg.raw_offset;
+        if (!d->dh) {
+            for (int k = 0; k < cfg.rows; ++k) {
+                copy_stream_out(rawp + static_cast<size_t>(k) * raw_row_bytes,
+                                srcp + src_stride * (off + 2 * k), raw_row_bytes);
+            }
         } else {
-            copy_pad_plane<float, float>(
-                reinterpret_cast<const float *>(srcp), src_stride / 4,
-                src_width, src_height,
-                reinterpret_cast<float *>(staging + cfg.pad_offset),
-                cfg.pad_stride,
-                cfg.width + MARGIN_H * 2, cfg.pad_height, d->dh, off,
-                reinterpret_cast<float *>(tmp_bytes.data()));
+            for (int k = 0; k < cfg.rows; ++k) {
+                copy_stream_out(rawp + static_cast<size_t>(k) * raw_row_bytes,
+                                srcp + src_stride * k, raw_row_bytes);
+            }
         }
-        if (hbench) { h_tPadEnd = std::chrono::steady_clock::now(); }
-
         if (d->mclip_node && mcp) {
             // single Gray mask drives every processed plane: mask row for
             // interp row r is (dh ? r : field + 2r) of the mclip frame.
@@ -770,7 +768,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
             // builder ORs bits in.
             const uint8_t * maskp = vsapi->getReadPtr(mcp, 0);
             const ptrdiff_t mask_stride = vsapi->getStride(mcp, 0);
-            uint8_t * bm = staging + cfg.bmask_offset;
+            uint8_t * bm = staging + cfg.bits_offset;
             const size_t bm_row_bytes =
                 static_cast<size_t>((cfg.width + 31) / 32) * sizeof(uint32_t);
             for (int r = 0; r < cfg.rows; ++r) {
@@ -782,7 +780,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
                                 cfg.width, d->mdis);
             }
         }
-        if (hbench) { h_tBmaskEnd = std::chrono::steady_clock::now(); }
+        if (hbench) { h_tMaskEnd = std::chrono::steady_clock::now(); }
 
         if (d->vcheck > 0 && d->sclip_node && scp) {
             const auto scpp = vsapi->getReadPtr(scp, plane);
@@ -795,6 +793,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
             }
         }
     }
+    if (hbench) { h_tGatherEnd = std::chrono::steady_clock::now(); }
 
     if (!coherent) {
         std::vector<VkMappedMemoryRange> ranges;
@@ -902,8 +901,8 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         };
         fprintf(stderr, "[eedi3-hbench] cpu_stage=%.3fms gpu_submit_wait=%.3fms blit=%.3fms\n",
                 us(h_t0, h_t1), us(h_t1, h_t2), us(h_t2, h_t3));
-        fprintf(stderr, "[eedi3-hbench]   of cpu_stage: pad=%.3fms bmask=%.3fms\n",
-                us(h_t0, h_tPadEnd), us(h_tPadEnd, h_tBmaskEnd));
+        fprintf(stderr, "[eedi3-hbench]   of cpu_stage: raw+bits=%.3fms sclip=%.3fms\n",
+                us(h_t0, h_tMaskEnd), us(h_tMaskEnd, h_tGatherEnd));
     }
 
     vsapi->freeFrame(src);
@@ -1276,20 +1275,25 @@ static void VS_CC Eedi3Create(
     const int elem_bytes = d->elem_bytes;
     const int pad_elem = pad_elem_bytes(d->bits);
 
-    // Shader modules for this bit depth.
+    // Shader modules for this bit depth (row/vcheck/pad per depth; the
+    // bmask dilate+pack kernel is depth-independent).
     {
         const uint32_t * row_code = nullptr;
         size_t row_size = 0;
         const uint32_t * vc_code = nullptr;
         size_t vc_size = 0;
+        const uint32_t * pad_code = nullptr;
+        size_t pad_size = 0;
         switch (d->bits) {
             case 16:
                 row_code = eedi3_16_row_spv; row_size = eedi3_16_row_spv_size;
                 vc_code = eedi3_16_vcheck_spv; vc_size = eedi3_16_vcheck_spv_size;
+                pad_code = eedi3_16_pad_spv; pad_size = eedi3_16_pad_spv_size;
                 break;
             case 32:
                 row_code = eedi3_32_row_spv; row_size = eedi3_32_row_spv_size;
                 vc_code = eedi3_32_vcheck_spv; vc_size = eedi3_32_vcheck_spv_size;
+                pad_code = eedi3_32_pad_spv; pad_size = eedi3_32_pad_spv_size;
                 break;
             default:
                 return set_error("unsupported bit depth");
@@ -1305,6 +1309,30 @@ static void VS_CC Eedi3Create(
                 return set_error(std::get<std::string>(r2));
             }
             d->vcheck_module = std::get<VkShaderModule>(r2);
+        }
+        auto r3 = create_shader_module(*d->device, pad_code, pad_size);
+        if (std::holds_alternative<std::string>(r3)) {
+            return set_error(std::get<std::string>(r3));
+        }
+        d->pad_module = std::get<VkShaderModule>(r3);
+        if (d->vcheck > 0 && d->mclip_node) {
+            const uint32_t * vcopy_code = nullptr;
+            size_t vcopy_size = 0;
+            switch (d->bits) {
+                case 16:
+                    vcopy_code = eedi3_16_vcopy_spv; vcopy_size = eedi3_16_vcopy_spv_size;
+                    break;
+                case 32:
+                    vcopy_code = eedi3_32_vcopy_spv; vcopy_size = eedi3_32_vcopy_spv_size;
+                    break;
+                default:
+                    return set_error("unsupported bit depth");
+            }
+            auto r4 = create_shader_module(*d->device, vcopy_code, vcopy_size);
+            if (std::holds_alternative<std::string>(r4)) {
+                return set_error(std::get<std::string>(r4));
+            }
+            d->vcopy_module = std::get<VkShaderModule>(r4);
         }
     }
 
@@ -1354,20 +1382,22 @@ static void VS_CC Eedi3Create(
         cfg.pad_stride = (pw + MARGIN_H * 2 + 15) & ~15;   // pad elements
         cfg.pad_height = ph + MARGIN_V * 2;
 
-        // staging regions
-        cfg.pad_bytes = static_cast<VkDeviceSize>(cfg.pad_stride) * cfg.pad_height * pad_elem;
-        cfg.pad_offset = align32(upload_total);
-        upload_total = align32(cfg.pad_offset + cfg.pad_bytes);
+        // staging/upload regions: tight kept source rows (the pad kernel
+        // expands mirrors), gathered sclip rows, and CPU-packed dilation bits
+        cfg.raw_bytes = static_cast<VkDeviceSize>(pw) * cfg.rows * pad_elem;
+        cfg.raw_offset = align32(upload_total);
+        upload_total = align32(cfg.raw_offset + cfg.raw_bytes);
 
-        if (d->mclip_node) {
-            cfg.bmask_bytes = static_cast<VkDeviceSize>((pw + 31) / 32) * cfg.rows * 4;  // packed bits
-            cfg.bmask_offset = align32(upload_total);
-            upload_total = align32(cfg.bmask_offset + cfg.bmask_bytes);
-        }
         if (d->vcheck > 0 && d->sclip_node) {
             cfg.sclip_bytes = static_cast<VkDeviceSize>(pw) * cfg.rows * elem_bytes;
             cfg.sclip_offset = align32(upload_total);
             upload_total = align32(cfg.sclip_offset + cfg.sclip_bytes);
+        }
+
+        if (d->mclip_node) {
+            cfg.bits_bytes = static_cast<VkDeviceSize>((pw + 31) / 32) * cfg.rows * 4;
+            cfg.bits_offset = align32(upload_total);
+            upload_total = align32(cfg.bits_offset + cfg.bits_bytes);
         }
 
         // download region (host staging): interp rows only (tight)
@@ -1379,6 +1409,12 @@ static void VS_CC Eedi3Create(
         cfg.dst_bytes = cfg.dl_bytes;
         cfg.dst_offset = align32(dev_total);
         dev_total = align32(cfg.dst_offset + cfg.dst_bytes);
+
+        // per-interp-row empty flags for the vcheck split (1 byte/row;
+        // written by the row kernel, read by vcopy + the walk)
+        cfg.rempty_bytes = static_cast<VkDeviceSize>(cfg.rows);
+        cfg.rempty_offset = align32(dev_total);
+        dev_total = align32(cfg.rempty_offset + cfg.rempty_bytes);
 
         cfg.pbt_bytes = static_cast<VkDeviceSize>(pw) * cfg.rows * tpitch;  // int8
         cfg.pbt_offset = align32(dev_total);
@@ -1395,20 +1431,36 @@ static void VS_CC Eedi3Create(
                 dev_total = align32(cfg.cint_offset + cfg.cint_bytes);
             }
 
-            // vcheck output rows (io type): vcheck writes the vchecked row
-            // here while reading its taps from the untouched dst; the host
-            // downloads vout instead of dst when vcheck > 0.
+            // vout region (dev_buf): RETIRED — vcheck/vcopy write vout
+            // directly into the staging download region (b7 views staging),
+            // so no D2H copy is needed. Kept allocated to avoid layout churn.
             cfg.vout_bytes = cfg.dl_bytes;
             cfg.vout_offset = align32(dev_total);
             dev_total = align32(cfg.vout_offset + cfg.vout_bytes);
         }
     }
+
     d->upload_total = upload_total;
     d->download_total = download_total;
     d->dev_total = dev_total;
 
+    // pad_dev (device-only, never staged): per-plane built padded planes
+    // produced by the pad kernel from the mirrored upload. The mirror
+    // occupies [0, upload_total), so the tail starts after it.
+    VkDeviceSize tail_total = upload_total;
+    for (int plane = 0; plane < numPlanes; ++plane) {
+        if (!d->process[plane]) {
+            continue;
+        }
+        auto & cfg = planes[plane];
+        cfg.built_bytes = static_cast<VkDeviceSize>(cfg.pad_stride) * cfg.pad_height * pad_elem;
+        cfg.built_offset = align32(tail_total);
+        tail_total = align32(cfg.built_offset + cfg.built_bytes);
+    }
+
     const VkDeviceSize staging_size = std::max(upload_total + download_total, VkDeviceSize(4));
     const VkDeviceSize dev_size = std::max(dev_total, VkDeviceSize(4));
+    const VkDeviceSize mirror_size = std::max(tail_total, VkDeviceSize(4));
 
     // Per-width pipelines (deduplicated).
     RowSpecData base_spec {
@@ -1422,16 +1474,21 @@ static void VS_CC Eedi3Create(
         .lsz_vcheck = lsz_vcheck,
     };
 
-    // helper to fetch-or-create the (row, vcheck) pipelines for a width key;
-    // uses Eedi3Data::WidthKey (all filter-level params like vcheck/mclip are
-    // identical across planes, so the geometry fields dominate)
+    // helper to fetch-or-create the (row, vcheck, pad, vcopy) pipelines for
+    // a width key; uses Eedi3Data::WidthKey (all filter-level params like
+    // vcheck/mclip are identical across planes, so the geometry fields
+    // dominate). The pad/vcopy upload kernels use fixed local sizes, so the
+    // row/vcheck workgroup-size spec entries are ignored by their pipelines.
     using WidthKey = Eedi3Data::WidthKey;
     auto get_pipelines = [&](const WidthKey & key, VkPipeline & row_pipe,
-                             VkPipeline & vc_pipe) -> std::optional<std::string> {
-        for (auto & [k, pair] : d->width_pipes) {
+                             VkPipeline & vc_pipe, VkPipeline & pad_pipe,
+                             VkPipeline & vcopy_pipe) -> std::optional<std::string> {
+        for (auto & [k, quad] : d->width_pipes) {
             if (k == key) {
-                row_pipe = pair[0];
-                vc_pipe = pair[1];
+                row_pipe = quad[0];
+                vc_pipe = quad[1];
+                pad_pipe = quad[2];
+                vcopy_pipe = quad[3];
                 return std::nullopt;
             }
         }
@@ -1453,9 +1510,33 @@ static void VS_CC Eedi3Create(
             }
             vcp = std::get<VkPipeline>(r2);
         }
-        d->width_pipes.emplace_back(key, std::array<VkPipeline, 2>{ rowp, vcp });
+        auto r3 = create_pipeline(*d->device, spec, d->pad_module, d->pipeline_layout, 0);
+        if (std::holds_alternative<std::string>(r3)) {
+            vkDestroyPipeline(dev, rowp, nullptr);
+            if (vcp) {
+                vkDestroyPipeline(dev, vcp, nullptr);
+            }
+            return std::get<std::string>(r3);
+        }
+        VkPipeline padp = std::get<VkPipeline>(r3);
+        VkPipeline vcopyp = VK_NULL_HANDLE;
+        if (d->vcheck > 0 && d->mclip_node) {
+            auto r4 = create_pipeline(*d->device, spec, d->vcopy_module, d->pipeline_layout, 0);
+            if (std::holds_alternative<std::string>(r4)) {
+                vkDestroyPipeline(dev, rowp, nullptr);
+                if (vcp) {
+                    vkDestroyPipeline(dev, vcp, nullptr);
+                }
+                vkDestroyPipeline(dev, padp, nullptr);
+                return std::get<std::string>(r4);
+            }
+            vcopyp = std::get<VkPipeline>(r4);
+        }
+        d->width_pipes.emplace_back(key, std::array<VkPipeline, 4>{ rowp, vcp, padp, vcopyp });
         row_pipe = rowp;
         vc_pipe = vcp;
+        pad_pipe = padp;
+        vcopy_pipe = vcopyp;
         return std::nullopt;
     };
 
@@ -1465,7 +1546,8 @@ static void VS_CC Eedi3Create(
         }
         auto & cfg = planes[plane];
         WidthKey key { cfg.width, cfg.rows, cfg.tpitch, cfg.pad_stride, cfg.pad_height };
-        if (auto err = get_pipelines(key, cfg.row_pipeline, cfg.vcheck_pipeline)) {
+        if (auto err = get_pipelines(key, cfg.row_pipeline, cfg.vcheck_pipeline,
+                                     cfg.pad_pipeline, cfg.vcopy_pipeline)) {
             return set_error(*err);
         }
     }
@@ -1495,6 +1577,12 @@ static void VS_CC Eedi3Create(
             checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.staging));
         }
         {
+            // Cached host-visible staging: CPU writes use streaming stores
+            // and the download uses streaming loads (both bypass the cache
+            // anyway), but cached memory is REQUIRED for sane NT-load and
+            // DMA behavior — uncached staging collapsed throughput (43fps).
+            // GPU GTT reads of this memory snoop-stall, so everything the
+            // kernels reuse goes through the H2D mirror instead.
             const auto result = allocate_memory(
                 *d->device, resource.staging,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
@@ -1526,17 +1614,13 @@ static void VS_CC Eedi3Create(
             resource.dev_type_index = std::get<AllocatedMemory>(result).type_index;
         }
         {
-            // Device-local mirror of the CPU-written upload region (pad,
-            // bmask, sclip). The kernels bind THIS for reads: reading the pad
-            // from system-RAM staging (heap 0) over PCIe on every cost
-            // evaluation is far slower than a device-local read. The CPU still
-            // writes staging (fast cached host memory); one H2D copy per frame
-            // moves the upload region to VRAM before the row dispatches.
+            // Device-local kernel-built regions (built pads, packed bits).
+            // The upload itself is read straight from staging (no H2D).
             VkBufferCreateInfo buffer_info {
                 .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                 .pNext = nullptr,
                 .flags = 0,
-                .size = upload_total,
+                .size = mirror_size,
                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
                 .queueFamilyIndexCount = 0,
@@ -1588,9 +1672,10 @@ static void VS_CC Eedi3Create(
             checkVK(vkAllocateDescriptorSets(dev, &alloc_info, &resource.desc_set));
         }
         {
-            // pad / bmask / sclip are read by the kernels -> bind the
-            // device-local mirror (pad_dev) so kernel reads hit VRAM, not the
-            // system-RAM staging the CPU writes.
+            // Heavily-reused kernel data (built pads, packed bits, sclip) is
+            // read from the device-local H2D mirror; dst/pbt/dmap/cint/vout
+            // live in dev_buf. Binding 8 is ENTRY_PAD's built-pad output view
+            // of pad_dev.
             VkDescriptorBufferInfo pad_info {
                 .buffer = resource.pad_dev, .offset = 0, .range = VK_WHOLE_SIZE
             };
@@ -1613,11 +1698,15 @@ static void VS_CC Eedi3Create(
                 .buffer = resource.dev_buf, .offset = 0, .range = VK_WHOLE_SIZE
             };
             VkDescriptorBufferInfo vout_info {
-                .buffer = resource.dev_buf, .offset = 0, .range = VK_WHOLE_SIZE
+                .buffer = resource.staging, .offset = 0, .range = VK_WHOLE_SIZE
+            };
+            VkDescriptorBufferInfo raw_info {
+                .buffer = resource.pad_dev, .offset = 0, .range = VK_WHOLE_SIZE
             };
             const VkDescriptorBufferInfo * infos[BIND_COUNT] {
                 &pad_info, &dst_info, &pbt_info, &dmap_info,
-                &bmask_info, &sclip_info, &cint_info, &vout_info
+                &bmask_info, &sclip_info, &cint_info, &vout_info,
+                &raw_info
             };
             VkWriteDescriptorSet writes[BIND_COUNT];
             for (uint32_t b = 0; b < BIND_COUNT; ++b) {

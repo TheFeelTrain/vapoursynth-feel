@@ -95,19 +95,43 @@ const int MARGIN_V = 4;
 // backtrack + interpolate tile width (columns)
 const int BT_TILE = 32;
 
+#if defined(ENTRY_PAD)
+// Raw tight kept rows (u16/f32 native) uploaded through the H2D mirror;
+// ENTRY_PAD expands the mirror margins into the built pad (binding 8,
+// device mirror tail).
+layout(std430, binding = 0) readonly buffer RawBuf {
+#if BITS == 16
+    uint16_t raw[];
+#else
+    float raw[];
+#endif
+};
+layout(std430, binding = 8) writeonly buffer PadOutBuf {
+#if BITS == 16
+    uint16_t padOut[];
+#else
+    float padOut[];
+#endif
+};
+#else
 layout(std430, binding = 0) readonly buffer PadBuf {
 #if BITS == 16
-    // Native u16 pad (host uploads half the bytes vs float; the kernels read
-    // VRAM through the H2D mirror). Every value is < 2^16 so float() is exact
-    // and all downstream cost/interp math is bit-identical to the float pad.
+    // Native u16 pad (built by ENTRY_PAD from the raw upload; the row/vcheck
+    // kernels read it from VRAM through the device mirror). Every value is
+    // < 2^16 so float() is exact and all downstream cost/interp math is
+    // bit-identical to the old host-built float pad.
     uint16_t pad[];
 #else
     float pad[];
 #endif
 };
+#endif
 layout(std430, binding = 1) buffer DstBuf { IO_TYPE dst[]; };
 layout(std430, binding = 2) buffer PbtBuf { int8_t pbt[]; };
 layout(std430, binding = 3) buffer DmapBuf { int8_t dmap[]; };
+// Per-interp-row empty flags (1 byte/row; written by ENTRY_ROW lane 0, read
+// by the vcheck passes). Lives in dev_buf; accessed through b3's whole-range
+// descriptor (same int8 element type, manual base below).
 layout(std430, binding = 4) readonly buffer BmaskBuf { uint bmask[]; };
 layout(std430, binding = 5) readonly buffer SclipBuf { IO_TYPE sclip[]; };
 layout(std430, binding = 6) buffer CintBuf { IO_TYPE cint[]; };
@@ -126,7 +150,7 @@ layout(push_constant) uniform PC {
     int pad_stride;   // padded plane row pitch in float elements
     int pad_height;   // padded plane height in rows
     int field;        // parity of the interpolated dst rows (0/1)
-    int rows;         // number of interpolated rows
+    int rows;         // number of interpolated rows (== kept source rows)
     float alpha;      // raw alpha / 3 (cost3 always on)
     float beta;
     float gamma;
@@ -135,6 +159,10 @@ layout(push_constant) uniform PC {
     float vth1r;
     float vth2r;
     float vth2;
+    // ENTRY_PAD upload kernel (ignored by row/vcheck): the raw kept rows
+    // live in the H2D mirror (b0), like everything else the kernels reuse.
+    int raw_base;     // pad-elem base of the tight kept rows
+    int rempty_base;  // int8 base of the per-row empty flags (dev_buf via b3)
 } pc;
 
 // Padded-plane access at OUTPUT dst-row coordinates. copyPad places every
@@ -143,6 +171,8 @@ layout(push_constant) uniform PC {
 // interp rows (parity `field`) read their +/-1, +/-3 taps (kept rows) at
 // pad row MARGIN_V + dy +/- {1,3} — always in bounds thanks to the mirrored
 // vertical margins the host builds (same for the horizontal margins).
+// (Not compiled into ENTRY_PAD: that entry only has the raw/padOut buffers.)
+#if !defined(ENTRY_PAD)
 float pad_get(int dst_row, int col) {
 #if BITS == 16
     // Widen via int (int(uint16) already compiles under the 16-bit storage
@@ -317,6 +347,7 @@ float combine_interior(int dy, int x, int u, float s0, float s1, float s2) {
 #endif
     return pc.alpha * (s0 + S1 + S2) + pc.beta * float(abs(u)) + pc.rw * v;
 }
+#endif  // !ENTRY_PAD
 #if defined(ENTRY_ROW)
 
 // Per-interp-row DP in REGISTERS with subgroup shuffles (eedi3vk2 structure):
@@ -401,6 +432,11 @@ void main() {
         subgroupBarrier();
     }
     const int xmin = (HAS_MCLIP != 0) ? rowXmin : 0;
+
+    // Per-row empty flag for the vcheck split (lane 0; uniform, no
+    // divergence): fully-masked rows skip the serial vcheck walk.
+    if (lane == 0)
+        dmap[pc.rempty_base + r] = int8_t(xmin >= WIDTH ? 1 : 0);
 
     if (xmin >= WIDTH) {
         // Fully-masked row (measured ~53% of rows in the AA workload): every
@@ -738,6 +774,12 @@ void main() {
     const int lsz = int(gl_WorkGroupSize.x);
 
     for (int r = 0; r < pc.rows; ++r) {
+        // Empty (fully-masked, dmap-0) rows were already copied by ENTRY_VCOPY
+        // and need no ordering: skip them AND their barrier (this is the whole
+        // win — ~2/3 of the 1080 serial barriers disappear). Uniform branch:
+        // every lane reads the same flag byte.
+        if (dmap[pc.rempty_base + r] != int8_t(0))
+            continue;
         const int y = MARGIN_V + pc.field + 2 * r;   // pad row of this interp row
         const bool do_row = (y >= 6 && y < pc.pad_height - 6);
         const int yf = pc.field + 2 * r;
@@ -855,3 +897,93 @@ void main() {
 }
 
 #endif  // ENTRY_VCHECK
+
+#if defined(ENTRY_VCOPY)
+
+// Parallel copy for fully-masked (dmap-0) rows: vout = cint (or sclip) on
+// vcheckable rows, dst passthrough otherwise — exactly what the serial walk
+// computes for dirc == 0 rows (empty rows always have dmap 0). The walk then
+// iterates only non-empty rows, dropping ~2/3 of its serial barriers.
+layout(local_size_x = 256) in;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const int total = pc.rows * WIDTH;
+    if (int(i) >= total) return;
+    const int r = int(i) / WIDTH;
+    const int x = int(i) % WIDTH;
+    if (dmap[pc.rempty_base + r] == int8_t(0)) return;
+    const int y = MARGIN_V + pc.field + 2 * r;
+    const bool do_row = (y >= 6 && y < pc.pad_height - 6);
+    float oval;
+    if (!do_row) {
+        oval = load_dst_val(r, x);
+    } else {
+#if BITS == 16
+        oval = HAS_SCLIP != 0
+            ? load_sclip_val(r, x)
+            : float(int(cint[pc.cint_base + r * WIDTH + x]));
+#else
+        oval = HAS_SCLIP != 0
+            ? load_sclip_val(r, x)
+            : cint[pc.cint_base + r * WIDTH + x];
+#endif
+    }
+#if BITS == 16
+    vout[pc.vout_base + r * WIDTH + x] = IO_TYPE(uint(clamp(floor(oval + 0.5f), 0.0f, PEAK)));
+#else
+    vout[pc.vout_base + r * WIDTH + x] = oval;
+#endif
+}
+
+#endif  // ENTRY_VCOPY
+
+#if defined(ENTRY_PAD)
+
+// Mirror-pad builder (replaces the host copyPad): expands the host-gathered
+// tight kept rows (b0, stride WIDTH, rows entries) into the full padded plane
+// (b8, stride pad_stride, pad_height rows) with eedi3m's exact mirror rules.
+//
+// Vertical mapping replicates copyPad in pad space: interior kept rows sit at
+// MARGIN_V + off + 2k (off = 1-field; k = kept index, rows entries covering
+// both dh and non-dh); top margins reflect around pad row MARGIN_V
+// (qy = 2*MARGIN_V - qy) and bottom margins replay the loop's
+// qy -= 2 + 2*off + 4k step. Rows at the other parity (and stride-padding
+// lanes past pad_w) are never read downstream; their indices are clamped so
+// every access stays in bounds and deterministic.
+// Horizontal mapping replicates the row mirrors: sx = -ix on the left,
+// sx = ix - 2*(px - (pad_w - MARGIN_H) + 1) on the right, clamped.
+layout(local_size_x = 256) in;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    const int total = pc.pad_stride * pc.pad_height;
+    if (int(idx) >= total) return;
+    const int py = int(idx) / pc.pad_stride;
+    const int px = int(idx) % pc.pad_stride;
+    const int off = 1 - pc.field;
+    const int pad_w = WIDTH + 2 * MARGIN_H;
+
+    int qy = py;
+    if (qy < MARGIN_V) {
+        qy = 2 * MARGIN_V - qy;
+    } else if (qy >= MARGIN_V + 2 * pc.rows) {
+        const int y0 = pc.pad_height - MARGIN_V + off;
+        const int k = (qy - y0) / 2;
+        qy = qy - (2 + 2 * off + 4 * k);
+    }
+    int kk = (qy - MARGIN_V - off) / 2;
+    kk = clamp(kk, 0, pc.rows - 1);
+
+    const int ix = px - MARGIN_H;
+    int sx;
+    if (ix < 0) sx = -ix;
+    else if (ix >= WIDTH) sx = ix - 2 * (px - (pad_w - MARGIN_H) + 1);
+    else sx = ix;
+    sx = clamp(sx, 0, WIDTH - 1);
+
+    padOut[pc.pad_base + py * pc.pad_stride + px] =
+        raw[pc.raw_base + kk * WIDTH + sx];
+}
+
+#endif  // ENTRY_PAD
