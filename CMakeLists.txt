@@ -173,8 +173,10 @@ if(VK_GLSLC)
                 VERBATIM)
         endforeach()
     endforeach()
-    # EEDI3: row kernel (one WG per interp row) + vcheck kernel (single WG
-    # serial row walk), per io variant (16 int, 32 float).
+    # EEDI3: row kernel (one 32-lane WG per interp row, subgroup-register DP
+    # with shuffles) + vcheck kernel (single WG serial row walk), per io
+    # variant (16 int, 32 float). The row kernel needs subgroup ops + the
+    # Vulkan memory model, so SPIR-V 1.3+ (vulkan1.3 target) is required.
     set(VK_EEDI3_ENTRIES row vcheck)
     set(VK_EEDI3_BITS "16" "32")
     foreach(bits IN LISTS VK_EEDI3_BITS)
@@ -190,7 +192,7 @@ if(VK_GLSLC)
             add_custom_command(
                 OUTPUT "${raw_spv}"
                 COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
-                COMMAND ${VK_GLSLC} -O -fshader-stage=compute ${defs}
+                COMMAND ${VK_GLSLC} --target-env=vulkan1.3 -O -fshader-stage=compute ${defs}
                         -o "${raw_spv}"
                         "${CMAKE_CURRENT_SOURCE_DIR}/src/eedi3.comp"
                 DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/eedi3.comp"
