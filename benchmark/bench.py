@@ -338,8 +338,7 @@ def _eedi3_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
         return {
             "vsfeel": f"core.vsfeel.EEDI3({clip}, {common}, num_streams={ns_num})",
             "eedi3vk2": f"core.eedi3vk2.EEDI3({clip}, {common}, num_streams={ns_num})",
-            "vszipcl": f"core.vszipcl.EEDI3({clip}, {common}, num_streams={ns_num})",
-            "vszipcu": f"core.vszipcu.EEDI3({clip}, {common}, num_streams={ns_num})",
+            "vszipcl": f"core.vszipcl.EEDI3({clip}, {common}, num_streams={ns_num})"
         }
     if use_mclip:
         mcap = "sclip=sclip, mclip=mclip"
@@ -350,8 +349,7 @@ def _eedi3_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     return {
         "vsfeel": f"core.vsfeel.EEDI3({clip}, {with_mclip}, num_streams={ns_num})",
         "eedi3vk2": f"core.eedi3vk2.EEDI3({clip}, {with_mclip}, num_streams={ns_num})",
-        "vszipcl": f"core.vszipcl.EEDI3({clip}, {with_sclip}, num_streams={ns_num})",
-        "vszipcu": f"core.vszipcu.EEDI3({clip}, {with_sclip}, num_streams={ns_num})",
+        "vszipcl": f"core.vszipcl.EEDI3({clip}, {with_sclip}, num_streams={ns_num})"
     }
 
 

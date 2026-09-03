@@ -22,11 +22,11 @@
  *     previous interp row is carried in a shared ping-pong buffer quantized to
  *     the io type, exactly like eedi3vk2's vcheck kernel.
  *
- * The host uploads eedi3m's exact padded plane (copyPad) as FLOAT for both
- * bit depths: u16 values are exact integers < 2^24, so float arithmetic on
- * them reproduces the integer cost/interp math bit-exactly (u16 io is only
- * (re)quantized at stores and for vcheck's pixel reads, where eedi3m does
- * the same). f32 io passes through the pad unchanged.
+ * The host uploads eedi3m's exact padded plane (copyPad) in the NATIVE io
+ * type (u16 stays u16, f32 stays f32): u16 values are exact integers < 2^24,
+ * so float arithmetic on them reproduces the integer cost/interp math
+ * bit-exactly (u16 io is only (re)quantized at stores and for vcheck's pixel
+ * reads, where eedi3m does the same). f32 io passes through the pad unchanged.
  *
  * ENTRY_ROW runs the DP in per-lane REGISTERS with subgroup shuffles (see the
  * comment at the kernel): one 32-lane workgroup per interpolated row, each
@@ -95,11 +95,20 @@ const int MARGIN_V = 4;
 // backtrack + interpolate tile width (columns)
 const int BT_TILE = 32;
 
-layout(std430, binding = 0) readonly buffer PadBuf { float pad[]; };
+layout(std430, binding = 0) readonly buffer PadBuf {
+#if BITS == 16
+    // Native u16 pad (host uploads half the bytes vs float; the kernels read
+    // VRAM through the H2D mirror). Every value is < 2^16 so float() is exact
+    // and all downstream cost/interp math is bit-identical to the float pad.
+    uint16_t pad[];
+#else
+    float pad[];
+#endif
+};
 layout(std430, binding = 1) buffer DstBuf { IO_TYPE dst[]; };
 layout(std430, binding = 2) buffer PbtBuf { int8_t pbt[]; };
 layout(std430, binding = 3) buffer DmapBuf { int8_t dmap[]; };
-layout(std430, binding = 4) readonly buffer BmaskBuf { uint8_t bmask[]; };
+layout(std430, binding = 4) readonly buffer BmaskBuf { uint bmask[]; };
 layout(std430, binding = 5) readonly buffer SclipBuf { IO_TYPE sclip[]; };
 layout(std430, binding = 6) buffer CintBuf { IO_TYPE cint[]; };
 layout(std430, binding = 7) buffer VoutBuf { IO_TYPE vout[]; };
@@ -110,7 +119,7 @@ layout(push_constant) uniform PC {
     int dst_base;     // io elements into b1 (interp rows)
     int pbt_base;     // int8 elements into b2
     int dmap_base;    // int8 elements into b3
-    int bmask_base;   // uint8 elements into b4
+    int bmask_base;   // uint words into b4 (host-packed bits)
     int sclip_base;   // io elements into b5
     int cint_base;    // io elements into b6
     int vout_base;    // io elements into b7 (vcheck output rows)
@@ -135,7 +144,13 @@ layout(push_constant) uniform PC {
 // pad row MARGIN_V + dy +/- {1,3} — always in bounds thanks to the mirrored
 // vertical margins the host builds (same for the horizontal margins).
 float pad_get(int dst_row, int col) {
+#if BITS == 16
+    // Widen via int (int(uint16) already compiles under the 16-bit storage
+    // extension; a direct float(uint16) would need int16 arithmetic); exact.
+    return float(int(pad[pc.pad_base + (MARGIN_V + dst_row) * pc.pad_stride + MARGIN_H + col]));
+#else
     return pad[pc.pad_base + (MARGIN_V + dst_row) * pc.pad_stride + MARGIN_H + col];
+#endif
 }
 
 float load_dst_val(int r, int x) {
@@ -163,11 +178,6 @@ void store_dst_val(int r, int x, float v) {
 #else
     dst[pc.dst_base + r * WIDTH + x] = v;
 #endif
-}
-
-bool bmask_at(int r, int x) {
-    if (HAS_MCLIP == 0) return true;
-    return bmask[pc.bmask_base + r * WIDTH + x] != uint8_t(0);
 }
 
 // Vertical 4-tap cubic at column x of interp dst row dy (kept rows dy +/- 1
@@ -341,6 +351,9 @@ const int K = (TPITCH + SGSIZE - 1) / SGSIZE;  // directions per lane
 shared int8_t tileSh[BT_TILE * TPITCH];
 shared int8_t tileF[BT_TILE];
 shared uint bmaskSh[(WIDTH + 31) / 32];
+// First unmasked column of this row (WIDTH = fully masked). Written by lane
+// 0 after the pack loop, read by all lanes after a barrier.
+shared int rowXmin;
 
 layout(local_size_x_id = 6) in;
 
@@ -359,20 +372,57 @@ void main() {
     const int laneBase = lane * K;
 
     if (HAS_MCLIP != 0) {
-        // Pack this row's dilated mask into shared bits (one uint per 32
-        // columns), so the per-column masked test is a shared read instead of
-        // a serial dependent global load (eedi3vk2 does the same).
-        for (int i = lane; i < (WIDTH + 31) / 32; i += SGSIZE) {
-            uint bits = 0u;
-            for (int j = 0; j < 32; j++) {
-                const int x = i * 32 + j;
-                if (x < WIDTH && bmask[pc.bmask_base + r * WIDTH + x] != uint8_t(0))
-                    bits |= 1u << j;
+        // The host uploads this row's dilated mask PRE-PACKED (one uint per
+        // 32 columns); burst-copy the words to shared instead of packing
+        // bytes here (8x less upload + no per-bit work).
+        for (int i = lane; i < (WIDTH + 31) / 32; i += SGSIZE)
+            bmaskSh[i] = bmask[pc.bmask_base + r * ((WIDTH + 31) / 32) + i];
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        // Span scan: first unmasked column of this row (lane 0 walks the
+        // packed words; ~WIDTH/32 iterations of trivial ops, negligible next
+        // to the 3840-iteration serial column loop it lets us shorten).
+        // Lets the DP jump over the fully-masked left tail [1, xmin):
+        // masked columns only CARRY the cost row (cur = pp, values never
+        // change) so the seed at xmin-1 is analytically exact (all zeros
+        // after the xd==1 zeroing; pRel adjusted below for the fixups).
+        if (lane == 0) {
+            int first = WIDTH;
+            for (int i = 0; i < (WIDTH + 31) / 32; ++i) {
+                const uint w = bmaskSh[i];
+                if (w != 0u) {
+                    first = i * 32 + findLSB(w);
+                    break;
+                }
             }
-            bmaskSh[i] = bits;
+            rowXmin = first;
         }
         subgroupMemoryBarrierShared();
         subgroupBarrier();
+    }
+    const int xmin = (HAS_MCLIP != 0) ? rowXmin : 0;
+
+    if (xmin >= WIDTH) {
+        // Fully-masked row (measured ~53% of rows in the AA workload): every
+        // pixel interpolates the vertical cubic with direction 0, so the
+        // whole serial DP/carry/backtrack is pure waste. Parallel cubic over
+        // all lanes instead — bit-exact vs the masked_x branch below.
+        for (int x = lane; x < WIDTH; x += SGSIZE) {
+            const float oval = cubic_float(dy, x);
+            if (VCHECK_MODE > 0) {
+                dmap[pc.dmap_base + r * WIDTH + x] = int8_t(0);
+                if (HAS_SCLIP == 0) {
+#if BITS == 16
+                    cint[pc.cint_base + r * WIDTH + x] =
+                        IO_TYPE(uint(clamp(floor(cubic_float(dy, x) + 0.5f), 0.0f, PEAK)));
+#else
+                    cint[pc.cint_base + r * WIDTH + x] = cubic_float(dy, x);
+#endif
+                }
+            }
+            store_dst_val(r, x, oval);
+        }
+        return;
     }
 
     // Per-direction DP state (registers). u = laneBase + j - CENTER.
@@ -397,7 +447,35 @@ void main() {
         }
     }
 
-    for (int xd = 1; xd < WIDTH; xd++) {
+    if (HAS_MCLIP != 0 && xmin > 1) {
+        // Analytic predecessor seed for the jump over the masked left tail
+        // [1, xmin): columns 0-1 are masked (else xmin <= 1), so xd==1 would
+        // have zeroed pRel to -u; each later masked column xd applies fixups
+        // cRel = +/-1 at lanes u = -/+(pumax) with pumax = min(xd-1, WIDTH-xd)
+        // (values pp stay all zeros — masked columns only copy them). The
+        // last fixup hit wins; both ramps give the same value (-sign(u)), so
+        // pRel[u] = -sign(u) iff some xd in [2, xmin) has min(xd-1, WIDTH-xd)
+        // == |u| (rising ramp: xd = |u|+1 < xmin; falling ramp: xd = WIDTH-|u|,
+        // only reachable when the span starts in the last |u| columns).
+        // Bit-exact vs running the skipped iterations (verified in tests).
+        for (int j = 0; j < K; j++) {
+            const int i = laneBase + j;
+            if (i < TPITCH) {
+                const int u = i - CENTER;
+                const int au = abs(u);
+                if (au >= 1 && au <= MDIS) {
+                    const bool hit = (au <= xmin - 2) ||
+                        (xmin > WIDTH - au && au <= WIDTH - 2);
+                    pRel[j] = hit ? ((u > 0) ? -1 : 1) : -u;
+                } else {
+                    pRel[j] = -u;
+                }
+            }
+        }
+    }
+
+    const int xstart = max(1, xmin);
+    for (int xd = xstart; xd < WIDTH; xd++) {
         const int umax = min(min(xd, WIDTH - 1 - xd), MDIS);
         const bool masked = (HAS_MCLIP != 0 && !bmask_local(xd));
 
@@ -550,10 +628,15 @@ void main() {
     subgroupBarrier();
 
     // Backtrack from the right in tiles (relative deltas accumulate); lane 0
-    // walks each tile backwards from fcarry.
+    // walks each tile backwards from fcarry. Tiles entirely left of the
+    // first unmasked column need no walk: nothing left of xmin reads
+    // directions (all masked -> cubic), so stop there (bit-exact: the walk
+    // right of xmin is untouched, fcarry propagates identically).
     int fcarry = 0;  // fpath[x0 + n]; starts at fpath[WIDTH - 1] == 0
     for (int x0 = ((WIDTH - 2) / BT_TILE) * BT_TILE; x0 >= 0; x0 -= BT_TILE) {
         const int n = min(BT_TILE, WIDTH - 1 - x0);
+        if (x0 + n <= xmin)
+            break;
 
         for (int c = 0; c < n; ++c)
             for (int i = lane; i < TPITCH; i += SGSIZE)
@@ -562,8 +645,12 @@ void main() {
         subgroupBarrier();
 
         if (lane == 0) {
+            // Walk only down to xmin: columns left of it are all masked
+            // (their directions are discarded for cubic), and their pbt was
+            // never written (the DP loop starts at xmin).
             int f = fcarry;
-            for (int x = x0 + n - 1; x >= x0; --x) {
+            const int xlo = max(x0, xmin);
+            for (int x = x0 + n - 1; x >= xlo; --x) {
                 f += int(tileSh[(x - x0) * TPITCH + CENTER + f]);
                 tileF[x - x0] = int8_t(f);
             }
@@ -574,6 +661,23 @@ void main() {
 
         if (lane < n) {
             const int x = x0 + lane;
+            // Columns left of xmin (only in the leftmost processed tile) are
+            // masked: vertical cubic, direction 0, no tileF read.
+            if (x < xmin) {
+                const float oval = cubic_float(dy, x);
+                if (VCHECK_MODE > 0) {
+                    dmap[pc.dmap_base + r * WIDTH + x] = int8_t(0);
+                    if (HAS_SCLIP == 0) {
+#if BITS == 16
+                        cint[pc.cint_base + r * WIDTH + x] =
+                            IO_TYPE(uint(clamp(floor(cubic_float(dy, x) + 0.5f), 0.0f, PEAK)));
+#else
+                        cint[pc.cint_base + r * WIDTH + x] = cubic_float(dy, x);
+#endif
+                    }
+                }
+                store_dst_val(r, x, oval);
+            } else {
             const int dir = int(tileF[lane]);
             const bool masked_x = (HAS_MCLIP != 0 && !bmask_local(x));
             float oval;
@@ -605,6 +709,7 @@ void main() {
                 }
             }
             store_dst_val(r, x, oval);
+            } // (x >= xmin) dir/backtrack path
         }
         subgroupMemoryBarrierShared();
         subgroupBarrier();   // tile reads done before the next (leftward) tile reuses tileSh

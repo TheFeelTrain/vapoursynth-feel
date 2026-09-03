@@ -54,6 +54,13 @@ constexpr int MARGIN_H = 12;
 constexpr int MARGIN_V = 4;
 constexpr int MAX_PLANES = 3;
 
+// Pad element size: native u16 for 16-bit input (halves the pad upload, the
+// H2D copy and the kernel's pad read traffic vs float), float for 32-bit.
+// u16 values are exact in float so all downstream math is bit-identical.
+static int pad_elem_bytes(int bits) {
+    return (bits == 16) ? 2 : 4;
+}
+
 // Host-side pad upload is always float (see eedi3.comp header): u16 native
 // values are exact integers < 2^24 so float cost/interp math is bit-exact.
 enum Binding : uint32_t {
@@ -73,7 +80,7 @@ struct PlaneConfig {
     int width {};                     // output plane width (pixels)
     int height {};                    // output plane height (pixels)
     int rows {};                      // number of interp rows == height / 2
-    int pad_stride {};                // float elements per padded row
+    int pad_stride {};                // pad elements per padded row
     int pad_height {};                // padded rows == height + 2*MARGIN_V
     int tpitch {};                    // 2*mdis + 1
 
@@ -237,10 +244,12 @@ struct Eedi3Data {
 // Writes one full padded row (including the mirrored margins) of the given
 // source row into tmp, then copies it to pad at `y` (in pad-row units).
 // srcRow may be negative / past the end (vertical mirror handles it above).
-template <typename Tsrc>
+// Tdst is the pad element type (uint16_t for 16-bit input, float for 32-bit:
+// native values, so the u16 path is a pure copy with no float conversion).
+template <typename Tsrc, typename Tdst>
 static void copy_pad_row(const Tsrc * src_line, const int src_stride,
-                         float * tmp, const int pad_w, const int src_row,
-                         const int y, float * pad, const int pad_stride,
+                         Tdst * tmp, const int pad_w, const int src_row,
+                         const int y, Tdst * pad, const int pad_stride,
                          const int src_width, const int src_height) {
     // resolve mirrored source row
     int real = src_row;
@@ -258,7 +267,7 @@ static void copy_pad_row(const Tsrc * src_line, const int src_stride,
     const Tsrc * line = src_line + static_cast<int64_t>(src_stride) * real;
 
     for (int x = 0; x < src_width; ++x) {
-        tmp[MARGIN_H + x] = static_cast<float>(line[x]);
+        tmp[MARGIN_H + x] = static_cast<Tdst>(line[x]);
     }
     for (int x = 0; x < MARGIN_H; ++x) {
         tmp[x] = tmp[MARGIN_H * 2 - x];
@@ -267,19 +276,22 @@ static void copy_pad_row(const Tsrc * src_line, const int src_stride,
         tmp[x] = tmp[x - c];
     }
 
-    std::memcpy(pad + static_cast<int64_t>(pad_stride) * y, tmp, pad_w * sizeof(float));
+    // Streaming store: pad rows are 32-byte aligned and never re-read by the
+    // CPU (the GPU consumes them via the H2D copy), so bypass the cache.
+    copy_stream_out(pad + static_cast<int64_t>(pad_stride) * y, tmp,
+                    static_cast<size_t>(pad_w) * sizeof(Tdst));
 }
 
 // Builds the host-side padded plane exactly like eedi3m's copyPad: kept rows
 // (parity `off` in the source, which is 1-field for dh=0 and every row with
 // 2-row output pitch for dh=1) plus mirrored vertical margins. `pad` is the
-// float upload destination (native values for u16 / raw f32 for float).
-template <typename Tsrc>
+// native-type upload destination (u16 values for 16-bit / raw f32).
+template <typename Tsrc, typename Tdst>
 static void copy_pad_plane(const Tsrc * src, const ptrdiff_t src_stride_elems,
                            const int src_width, const int src_height,
-                           float * pad, const int pad_stride, const int pad_w,
+                           Tdst * pad, const int pad_stride, const int pad_w,
                            const int pad_h, const bool dh, const int off,
-                           float * tmp) {
+                           Tdst * tmp) {
     // Interior kept rows.
     if (!dh) {
         // pad row MARGIN_V + off + 2k  <- src row off + 2k, k = 0..H/2-1
@@ -299,20 +311,22 @@ static void copy_pad_plane(const Tsrc * src, const ptrdiff_t src_stride_elems,
 
     // Vertical margins (copy whole mirrored rows).
     for (int y = off; y < MARGIN_V; y += 2) {
-        std::memcpy(pad + static_cast<int64_t>(pad_stride) * y,
-                    pad + static_cast<int64_t>(pad_stride) * (MARGIN_V * 2 - y),
-                    pad_w * sizeof(float));
+        copy_stream_out(pad + static_cast<int64_t>(pad_stride) * y,
+                        pad + static_cast<int64_t>(pad_stride) * (MARGIN_V * 2 - y),
+                        static_cast<size_t>(pad_w) * sizeof(Tdst));
     }
     for (int y = pad_h - MARGIN_V + off, c = 2 + 2 * off; y < pad_h; y += 2, c += 4) {
-        std::memcpy(pad + static_cast<int64_t>(pad_stride) * y,
-                    pad + static_cast<int64_t>(pad_stride) * (y - c),
-                    pad_w * sizeof(float));
+        copy_stream_out(pad + static_cast<int64_t>(pad_stride) * y,
+                        pad + static_cast<int64_t>(pad_stride) * (y - c),
+                        static_cast<size_t>(pad_w) * sizeof(Tdst));
     }
 }
 
 // Mirrors eedi3m's bmask dilation scan for one row: marks columns within
-// mdis of a set mask pixel ("last" propagation).
-static void build_bmask_row(const uint8_t * maskp, uint8_t * out,
+// mdis of a set mask pixel ("last" propagation). Writes directly PACKED BITS
+// (one uint32 per 32 columns) into the upload region: 8x fewer bytes than the
+// byte mask (smaller H2D + the shader loads words instead of packing).
+static void build_bmask_row(const uint8_t * maskp, uint32_t * out,
                             const int width, const int mdis) {
     const int minmdis = std::min(width, mdis);
     int last = -666999;
@@ -326,10 +340,14 @@ static void build_bmask_row(const uint8_t * maskp, uint8_t * out,
         if (maskp[x + mdis] != 0) {
             last = x + mdis * 2;
         }
-        out[x] = (x <= last) ? 1 : 0;
+        if (x <= last) {
+            out[x >> 5] |= 1u << (x & 31);
+        }
     }
     for (int x = std::max(width - minmdis, 0); x < width; ++x) {
-        out[x] = (x <= last) ? 1 : 0;
+        if (x <= last) {
+            out[x >> 5] |= 1u << (x & 31);
+        }
     }
 }
 
@@ -517,11 +535,11 @@ static std::optional<std::string> record_command_buffer(
         const int has_sclip = (d.vcheck > 0 && d.sclip_node) ? 1 : 0;
 
         PushConstants pc {
-            .pad_base = static_cast<int32_t>(cfg.pad_offset / sizeof(float)),
+            .pad_base = static_cast<int32_t>(cfg.pad_offset / pad_elem_bytes(d.bits)),
             .dst_base = static_cast<int32_t>(cfg.dst_offset / elem),
             .pbt_base = static_cast<int32_t>(cfg.pbt_offset),
             .dmap_base = static_cast<int32_t>(cfg.dmap_offset),
-            .bmask_base = static_cast<int32_t>(cfg.bmask_offset),
+            .bmask_base = static_cast<int32_t>(cfg.bmask_offset / sizeof(uint32_t)),
             .sclip_base = static_cast<int32_t>(cfg.sclip_offset / elem),
             .cint_base = static_cast<int32_t>(cfg.cint_offset / elem),
             .vout_base = static_cast<int32_t>(cfg.vout_offset / elem),
@@ -684,6 +702,10 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     }
     const int off = 1 - field;
 
+    const bool hbench = getenv("VSFEEL_EEDI3_HBENCH") && sn == 0;
+    const auto h_t0 = std::chrono::steady_clock::now();
+    auto h_tPadEnd = h_t0, h_tBmaskEnd = h_t0;
+
     // Re-record the command buffer with this frame's interp-row parity (the
     // previous submit on this resource was waited on before give_back, so the
     // pool reset is safe).
@@ -696,18 +718,20 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         !!(d->device->mem_props.memoryTypes[resource.staging_type_index].propertyFlags &
            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    // CPU: stage pad (float), dilated bmask rows, and sclip interp rows.
+    // CPU: stage pad (native type: u16 for 16-bit input, float for 32-bit),
+    // dilated bmask rows, and sclip interp rows.
     uint8_t * const staging = static_cast<uint8_t *>(static_cast<void *>(map));
+    const int pad_elem = (d->bits == 16) ? 2 : 4;
     const int max_pad_row = [&] {
         int m = 0;
         for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
             if (d->process[plane]) {
-                m = std::max(m, d->planes[plane].pad_stride * static_cast<int>(sizeof(float)));
+                m = std::max(m, d->planes[plane].pad_stride * pad_elem);
             }
         }
         return m;
     }();
-    std::vector<float> tmp_row(max_pad_row / sizeof(float));
+    std::vector<uint8_t> tmp_bytes(static_cast<size_t>(max_pad_row));
 
     for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
         if (!d->process[plane]) {
@@ -720,34 +744,45 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         const int src_width = vsapi->getFrameWidth(src, plane);
         const int src_height = vsapi->getFrameHeight(src, plane);
 
-        float * pad = reinterpret_cast<float *>(staging + cfg.pad_offset);
         if (d->bits == 16) {
-            copy_pad_plane<uint16_t>(
+            copy_pad_plane<uint16_t, uint16_t>(
                 reinterpret_cast<const uint16_t *>(srcp), src_stride / 2,
-                src_width, src_height, pad, cfg.pad_stride,
+                src_width, src_height,
+                reinterpret_cast<uint16_t *>(staging + cfg.pad_offset),
+                cfg.pad_stride,
                 cfg.width + MARGIN_H * 2, cfg.pad_height, d->dh, off,
-                tmp_row.data());
+                reinterpret_cast<uint16_t *>(tmp_bytes.data()));
         } else {
-            copy_pad_plane<float>(
+            copy_pad_plane<float, float>(
                 reinterpret_cast<const float *>(srcp), src_stride / 4,
-                src_width, src_height, pad, cfg.pad_stride,
+                src_width, src_height,
+                reinterpret_cast<float *>(staging + cfg.pad_offset),
+                cfg.pad_stride,
                 cfg.width + MARGIN_H * 2, cfg.pad_height, d->dh, off,
-                tmp_row.data());
+                reinterpret_cast<float *>(tmp_bytes.data()));
         }
+        if (hbench) { h_tPadEnd = std::chrono::steady_clock::now(); }
 
         if (d->mclip_node && mcp) {
             // single Gray mask drives every processed plane: mask row for
-            // interp row r is (dh ? r : field + 2r) of the mclip frame
+            // interp row r is (dh ? r : field + 2r) of the mclip frame.
+            // Stored as packed bits (words per row); zeroed first since the
+            // builder ORs bits in.
             const uint8_t * maskp = vsapi->getReadPtr(mcp, 0);
             const ptrdiff_t mask_stride = vsapi->getStride(mcp, 0);
             uint8_t * bm = staging + cfg.bmask_offset;
+            const size_t bm_row_bytes =
+                static_cast<size_t>((cfg.width + 31) / 32) * sizeof(uint32_t);
             for (int r = 0; r < cfg.rows; ++r) {
                 const int mrow = d->dh ? r : field + 2 * r;
+                uint8_t * bmr = bm + static_cast<int64_t>(r) * bm_row_bytes;
+                std::memset(bmr, 0, bm_row_bytes);
                 build_bmask_row(maskp + mask_stride * mrow,
-                                bm + static_cast<int64_t>(r) * cfg.width,
+                                reinterpret_cast<uint32_t *>(bmr),
                                 cfg.width, d->mdis);
             }
         }
+        if (hbench) { h_tBmaskEnd = std::chrono::steady_clock::now(); }
 
         if (d->vcheck > 0 && d->sclip_node && scp) {
             const auto scpp = vsapi->getReadPtr(scp, plane);
@@ -755,8 +790,8 @@ static const VSFrame *VS_CC Eedi3GetFrame(
             const size_t row_bytes = static_cast<size_t>(cfg.width) * d->elem_bytes;
             uint8_t * sc = staging + cfg.sclip_offset;
             for (int r = 0; r < cfg.rows; ++r) {
-                std::memcpy(sc + static_cast<size_t>(r) * row_bytes,
-                            scpp + scp_stride * (field + 2 * r), row_bytes);
+                copy_stream_out(sc + static_cast<size_t>(r) * row_bytes,
+                                scpp + scp_stride * (field + 2 * r), row_bytes);
             }
         }
     }
@@ -783,7 +818,9 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
         resource.cmd, resource.fence));
 
+    const auto h_t1 = std::chrono::steady_clock::now();
     checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
+    const auto h_t2 = std::chrono::steady_clock::now();
 
     if (!coherent) {
         std::vector<VkMappedMemoryRange> ranges;
@@ -820,27 +857,54 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         const auto srcp = vsapi->getReadPtr(src, plane);
         const ptrdiff_t src_stride = vsapi->getStride(src, plane);
 
-        // interp rows (the row kernel wrote rows r at dst rows field+2r)
-        for (int r = 0; r < cfg.rows; ++r) {
-            std::memcpy(dstp + dst_stride * (field + 2 * r),
-                        dl + static_cast<size_t>(r) * row_bytes, row_bytes);
+        // interp rows (the row kernel wrote rows r at dst rows field+2r).
+        // Streaming: the staging download is never re-read by the CPU and
+        // the frame is written once — bypass the cache both ways. Staging
+        // download rows are 32-byte aligned when row_bytes is (the common
+        // case); otherwise fall back to memcpy (movntdqa faults unaligned).
+        if ((row_bytes & 31) == 0) {
+            for (int r = 0; r < cfg.rows; ++r) {
+                copy_stream_read(dstp + dst_stride * (field + 2 * r),
+                                 dl + static_cast<size_t>(r) * row_bytes, row_bytes);
+            }
+        } else {
+            for (int r = 0; r < cfg.rows; ++r) {
+                std::memcpy(dstp + dst_stride * (field + 2 * r),
+                            dl + static_cast<size_t>(r) * row_bytes, row_bytes);
+            }
         }
 
         // kept rows: parity off in dst. dh=0: same coords as src; dh=1: src
         // row k -> dst row 2k + off (dst height == 2*src height).
+        // Streaming stores (no read-for-ownership on the fresh frame; the
+        // source frame stays cached for downstream readers).
         const int dst_height = vsapi->getFrameHeight(dst, plane);
         const int kept_rows = dst_height / 2;
         if (!d->dh) {
-            vsh::bitblt(dstp + dst_stride * off, dst_stride * 2,
-                        srcp + src_stride * off, src_stride * 2,
-                        row_bytes, kept_rows);
+            for (int k = 0; k < kept_rows; ++k) {
+                copy_stream_out(dstp + dst_stride * (off + 2 * k),
+                                srcp + src_stride * (off + 2 * k), row_bytes);
+            }
         } else {
-            vsh::bitblt(dstp + dst_stride * off, dst_stride * 2,
-                        srcp, src_stride, row_bytes, kept_rows);
+            for (int k = 0; k < kept_rows; ++k) {
+                copy_stream_out(dstp + dst_stride * (off + 2 * k),
+                                srcp + src_stride * k, row_bytes);
+            }
         }
     }
 
     d->pool.give_back(std::move(resource));
+
+    if (hbench) {
+        const auto h_t3 = std::chrono::steady_clock::now();
+        const auto us = [](auto a, auto b) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count() / 1000.0;
+        };
+        fprintf(stderr, "[eedi3-hbench] cpu_stage=%.3fms gpu_submit_wait=%.3fms blit=%.3fms\n",
+                us(h_t0, h_t1), us(h_t1, h_t2), us(h_t2, h_t3));
+        fprintf(stderr, "[eedi3-hbench]   of cpu_stage: pad=%.3fms bmask=%.3fms\n",
+                us(h_t0, h_tPadEnd), us(h_tPadEnd, h_tBmaskEnd));
+    }
 
     vsapi->freeFrame(src);
     vsapi->freeFrame(scp);
@@ -1210,7 +1274,7 @@ static void VS_CC Eedi3Create(
     }
 
     const int elem_bytes = d->elem_bytes;
-    const int padBps = 4;   // pad is float for both formats
+    const int pad_elem = pad_elem_bytes(d->bits);
 
     // Shader modules for this bit depth.
     {
@@ -1287,16 +1351,16 @@ static void VS_CC Eedi3Create(
         cfg.height = ph;
         cfg.rows = ph / 2;
         cfg.tpitch = tpitch;
-        cfg.pad_stride = (pw + MARGIN_H * 2 + 15) & ~15;   // float elements
+        cfg.pad_stride = (pw + MARGIN_H * 2 + 15) & ~15;   // pad elements
         cfg.pad_height = ph + MARGIN_V * 2;
 
         // staging regions
-        cfg.pad_bytes = static_cast<VkDeviceSize>(cfg.pad_stride) * cfg.pad_height * sizeof(float);
+        cfg.pad_bytes = static_cast<VkDeviceSize>(cfg.pad_stride) * cfg.pad_height * pad_elem;
         cfg.pad_offset = align32(upload_total);
         upload_total = align32(cfg.pad_offset + cfg.pad_bytes);
 
         if (d->mclip_node) {
-            cfg.bmask_bytes = static_cast<VkDeviceSize>(pw) * cfg.rows;  // uint8
+            cfg.bmask_bytes = static_cast<VkDeviceSize>((pw + 31) / 32) * cfg.rows * 4;  // packed bits
             cfg.bmask_offset = align32(upload_total);
             upload_total = align32(cfg.bmask_offset + cfg.bmask_bytes);
         }
