@@ -1,0 +1,304 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+/*
+ * NNEDI3 — intra-field interpolator (vsfeel's own implementation of the
+ * algorithm both references compute: nnedi3vk and vszipcu agree bit-exactly,
+ * so matching their math lands within ~1 LSB of both).
+ *
+ * Structure (deliberately different from nnedi3vk's prescreen-list/predict
+ * split): one thread per interpolated pixel runs cubic -> prescreener ->
+ * predictor inline, with serial (natural-order) accumulation. No compaction,
+ * no atomics, no subgroup ops — simple and accurate, to be split for speed
+ * later.
+ *
+ * Exactly one of ENTRY_PAD / ENTRY_MAIN is defined at compile time:
+ *
+ *   ENTRY_PAD   — clamp-mirror the packed field rows into the padded plane:
+ *                 pad[i][x] = field[clamp(i-(MARGIN_V-fp))][clamp(x-MARGIN_H)]
+ *   ENTRY_MAIN  — per output pixel (x, r): cubic taps, prescreener decision,
+ *                 predictor network when needed.
+ *
+ * Formula order mirrors the references so results agree to ~1 LSB:
+ * - cubic and all prescreener dots accumulate `precise` (no FMA contraction,
+ *   no reassociation), ascending-k order;
+ * - predictor MACs are explicit fma() (the references' __fmaf_rn);
+ * - exp/sqrt/divide are the plain builtins (all *_APPROX are 0 off the
+ *   tensor-core path);
+ * - integer store rounds to nearest even and saturates (rintf semantics).
+ *
+ * The model weights arrive mean-subtracted from the host (same projection
+ * the references bake in), so the in-shader normalization is v*mstd2 with
+ * the window mean re-added only in the final wae5 blend.
+ *
+ * Compile-time variants: -DBITS=16|32 (uint16_t / float IO).
+ */
+
+#if !defined(BITS)
+#define BITS 16
+#endif
+
+#if BITS == 16
+#define IO_TYPE uint16_t
+#else
+#define IO_TYPE float
+#endif
+
+const int MARGIN_H = 24;
+const int MARGIN_V = 3;
+
+layout(constant_id = 0) const int WIDTH = 1920;
+layout(constant_id = 1) const int ROWS = 540;
+layout(constant_id = 2) const int PADSTRIDE = 1968;
+layout(constant_id = 3) const int PEAK = 65535;
+layout(constant_id = 4) const int PSCRN = 2;
+layout(constant_id = 5) const int XDIM = 32;
+layout(constant_id = 6) const int YDIM = 4;
+layout(constant_id = 7) const int NNS = 32;
+layout(constant_id = 8) const int QUAL = 1;
+
+const int FS = XDIM * YDIM;
+
+layout(std430, binding = 0) readonly buffer FieldBuf { IO_TYPE fieldBuf[]; };
+layout(std430, binding = 1) buffer PadBuf { IO_TYPE padBuf[]; };
+layout(std430, binding = 2) buffer DstBuf { IO_TYPE dstBuf[]; };
+// Prescreener weights as vec4s: layer-0 transposed (vec k holds all four
+// neurons' weights for window element k), deeper layers at fixed indices.
+layout(std430, binding = 3) readonly buffer PsWeights { vec4 psW[]; };
+// Predictor weights per qual pass: (softmax, elliott) pairs in [q][k][p]
+// order, biases (smB, elB) per [q][p].
+layout(std430, binding = 4) readonly buffer PdWeights { vec2 pdW[]; };
+layout(std430, binding = 5) readonly buffer PdBias { vec2 pdB[]; };
+
+layout(push_constant) uniform PushConstants {
+    int field_base;
+    int pad_base;
+    int dst_base;
+    int fp;
+} pc;
+
+float loadField(int idx) {
+#if BITS == 32
+    return fieldBuf[pc.field_base + idx];
+#else
+    return float(int(fieldBuf[pc.field_base + idx]));
+#endif
+}
+
+float loadPad(int row, int col) {
+    const int idx = pc.pad_base + row * PADSTRIDE + col;
+#if BITS == 32
+    return padBuf[idx];
+#else
+    return float(int(padBuf[idx]));
+#endif
+}
+
+void storeDst(int idx, float v) {
+#if BITS == 32
+    dstBuf[pc.dst_base + idx] = v;
+#else
+    // glslc -O chokes on direct float->uint16_t (OpUConvert); go through
+    // uint with an explicit mask (same workaround as the other filters)
+    dstBuf[pc.dst_base + idx] = uint16_t(uint(clamp(roundEven(v), 0.0, float(PEAK))) & 0xFFFFu);
+#endif
+}
+
+float elliott(float x) {
+    return x / (1.0 + abs(x));
+}
+
+#if defined(ENTRY_PAD)
+
+layout(local_size_x = 32, local_size_y = 8) in;
+
+void main() {
+    const int x = int(gl_GlobalInvocationID.x);
+    const int i = int(gl_GlobalInvocationID.y);
+    const int padW = WIDTH + 2 * MARGIN_H;
+    const int padH = ROWS + 2 * MARGIN_V;
+    if (x >= padW || i >= padH)
+        return;
+    const int f = clamp(i - (MARGIN_V - pc.fp), 0, ROWS - 1);
+    const int c = clamp(x - MARGIN_H, 0, WIDTH - 1);
+#if BITS == 32
+    padBuf[pc.pad_base + i * PADSTRIDE + x] = fieldBuf[pc.field_base + f * WIDTH + c];
+#else
+    padBuf[pc.pad_base + i * PADSTRIDE + x] = fieldBuf[pc.field_base + f * WIDTH + c];
+#endif
+}
+
+#else // ENTRY_MAIN
+
+layout(local_size_x = 64) in;
+
+// 4-tap cubic on the padded column, reference tap order.
+float cubicRow(int r, int col) {
+    precise float acc = 0.0;
+    acc += (-3.0 / 32.0) * loadPad(r + 1, col);
+    acc += (19.0 / 32.0) * loadPad(r + 2, col);
+    acc += (19.0 / 32.0) * loadPad(r + 3, col);
+    acc += (-3.0 / 32.0) * loadPad(r + 4, col);
+    return acc;
+}
+
+// Old prescreener (pscrn=1): 12x4 window, three layers. Returns true when
+// the pixel needs the predictor network.
+bool needPredictOld(int x, int r) {
+    precise float st0 = 0.0, st1 = 0.0, st2 = 0.0, st3 = 0.0;
+    for (int k = 0; k < 48; k++) {
+        const float v = loadPad(r + 1 + k / 12, x - 5 + k % 12 + MARGIN_H);
+        const vec4 w = psW[k];
+        st0 += w.x * v;
+        st1 += w.y * v;
+        st2 += w.z * v;
+        st3 += w.w * v;
+    }
+    const vec4 b0 = psW[48];
+    precise float st[8];
+    st[0] = st0 + b0.x;
+    st[1] = elliott(st1 + b0.y);
+    st[2] = elliott(st2 + b0.z);
+    st[3] = elliott(st3 + b0.w);
+    const vec4 b1 = psW[53];
+    for (int n = 0; n < 4; n++) {
+        const vec4 w = psW[49 + n];
+        precise float acc = 0.0;
+        acc += w.x * st[0];
+        acc += w.y * st[1];
+        acc += w.z * st[2];
+        acc += w.w * st[3];
+        const float bn = b1[n];
+        st[4 + n] = elliott(acc + bn);
+    }
+    const vec4 b2 = psW[62];
+    float l2max_a = -3.4028235e+38;
+    float l2max_b = -3.4028235e+38;
+    for (int n = 0; n < 4; n++) {
+        const vec4 wa = psW[54 + n * 2];
+        const vec4 wb = psW[55 + n * 2];
+        precise float acc = 0.0;
+        acc += wa.x * st[0];
+        acc += wa.y * st[1];
+        acc += wa.z * st[2];
+        acc += wa.w * st[3];
+        acc += wb.x * st[4];
+        acc += wb.y * st[5];
+        acc += wb.z * st[6];
+        acc += wb.w * st[7];
+        const float v = acc + b2[n];
+        if (n < 2)
+            l2max_a = max(l2max_a, v);
+        else
+            l2max_b = max(l2max_b, v);
+    }
+    return l2max_b > l2max_a;
+}
+
+// New prescreener (pscrn>=2): 16x4 layer-0 window shared by four consecutive
+// pixels (anchored at the group base), layer-1 row n verdicts pixel xbase+n.
+bool needPredictNew(int x, int r) {
+    const int n = x & 3;
+    const int xbase = x - n;
+    precise float st0 = 0.0, st1 = 0.0, st2 = 0.0, st3 = 0.0;
+    for (int k = 0; k < 64; k++) {
+        const float v = loadPad(r + 1 + k / 16, xbase - 6 + k % 16 + MARGIN_H);
+        const vec4 w = psW[k];
+        st0 += w.x * v;
+        st1 += w.y * v;
+        st2 += w.z * v;
+        st3 += w.w * v;
+    }
+    const vec4 b0 = psW[64];
+    const float st_0 = elliott(st0 + b0.x);
+    const float st_1 = elliott(st1 + b0.y);
+    const float st_2 = elliott(st2 + b0.z);
+    const float st_3 = elliott(st3 + b0.w);
+    const vec4 w = psW[65 + n];
+    const vec4 b1 = psW[69];
+    precise float acc = 0.0;
+    acc += w.x * st_0;
+    acc += w.y * st_1;
+    acc += w.z * st_2;
+    acc += w.w * st_3;
+    return !(acc + b1[n] > 0.0);
+}
+
+// Predictor network for pixel (x, r): window mean/variance normalization,
+// then QUAL wae5 passes over NNS softmax+elliott neuron pairs.
+float predictPixel(int x, int r) {
+    const int col0 = x - (XDIM / 2 - 1) + MARGIN_H;
+    const int row0 = r + (YDIM == 6 ? 0 : 1);
+
+    float mean = 0.0;
+    for (int e = 0; e < FS; e++)
+        mean += loadPad(row0 + e / XDIM, col0 + e % XDIM);
+    mean /= float(FS);
+
+    float s2 = 0.0;
+    for (int e = 0; e < FS; e++) {
+        const float d = loadPad(row0 + e / XDIM, col0 + e % XDIM) - mean;
+        s2 += d * d;
+    }
+    const float variance = s2 / float(FS);
+
+    float mstd0 = mean;
+    float mstd1;
+    float mstd2;
+    if (variance < 1.1920929e-7) { // FLT_EPSILON, as in the references
+        mstd1 = 0.0;
+        mstd2 = 0.0;
+    } else {
+        mstd1 = sqrt(variance);
+        mstd2 = 1.0 / mstd1;
+    }
+
+    float result = 0.0;
+    for (int q = 0; q < QUAL; q++) {
+        const int bBase = q * NNS;
+        const int wBase = q * FS * NNS;
+        float vsum = 0.0;
+        float wsum = 0.0;
+        for (int p = 0; p < NNS; p++) {
+            const vec2 bias = pdB[bBase + p];
+            float accS = 0.0;
+            float accE = 0.0;
+            for (int k = 0; k < FS; k++) {
+                const float nk = loadPad(row0 + k / XDIM, col0 + k % XDIM) * mstd2;
+                const vec2 w = pdW[wBase + k * NNS + p];
+                accS = fma(w.x, nk, accS);
+                accE = fma(w.y, nk, accE);
+            }
+            accS += bias.x;
+            accE += bias.y;
+            const float e = exp(clamp(accS, -80.0, 80.0));
+            vsum = fma(e, elliott(accE), vsum);
+            wsum += e;
+        }
+        const float blended = wsum > 1e-10 ? fma((5.0 * vsum) / wsum, mstd1, mstd0) : mstd0;
+        result += blended;
+    }
+    return result / float(QUAL);
+}
+
+void main() {
+    const int gid = int(gl_GlobalInvocationID.x);
+    const int x = gid % WIDTH;
+    const int r = gid / WIDTH;
+    if (r >= ROWS)
+        return;
+
+    float cubic = 0.0;
+    bool need = true;
+    if (PSCRN != 0) {
+        cubic = cubicRow(r, x + MARGIN_H);
+        if (PSCRN == 1)
+            need = needPredictOld(x, r);
+        else
+            need = needPredictNew(x, r);
+    }
+    const float v = need ? predictPixel(x, r) : cubic;
+    storeDst(r * WIDTH + x, v);
+}
+
+#endif

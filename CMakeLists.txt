@@ -222,6 +222,29 @@ if(VK_GLSLC)
                 VERBATIM)
         endforeach()
     endforeach()
+    # NNEDI3: clamp pad builder + fused main kernel per io variant (plain
+    # kernels, no subgroup ops); vulkan1.3 target keeps one rule for the file.
+    set(VK_NNEDI3_ENTRIES pad main)
+    set(VK_NNEDI3_BITS "16" "32")
+    foreach(bits IN LISTS VK_NNEDI3_BITS)
+        foreach(entry IN LISTS VK_NNEDI3_ENTRIES)
+            if(entry STREQUAL pad)
+                set(entry_def -DENTRY_PAD)
+            else()
+                set(entry_def -DENTRY_MAIN)
+            endif()
+            set(raw_spv "${VK_SPV_DIR}/nnedi3_${bits}_${entry}.spv")
+            list(APPEND VK_SPV_OUTPUTS "${raw_spv}")
+            add_custom_command(
+                OUTPUT "${raw_spv}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
+                COMMAND ${VK_GLSLC} --target-env=vulkan1.3 -O -fshader-stage=compute -DBITS=${bits} ${entry_def}
+                        -o "${raw_spv}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3.comp"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3.comp"
+                VERBATIM)
+        endforeach()
+    endforeach()
 else()
     message(FATAL_ERROR "glslc not found")
 endif()
@@ -271,10 +294,35 @@ add_custom_command(
             "${VK_SPV_DIR}/eedi3_32_pad.spv"
             "${VK_SPV_DIR}/eedi3_16_vcopy.spv"
             "${VK_SPV_DIR}/eedi3_32_vcopy.spv"
+            "${VK_SPV_DIR}/nnedi3_16_pad.spv"
+            "${VK_SPV_DIR}/nnedi3_16_main.spv"
+            "${VK_SPV_DIR}/nnedi3_32_pad.spv"
+            "${VK_SPV_DIR}/nnedi3_32_main.spv"
             "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
     DEPENDS ${VK_SPV_OUTPUTS}
     VERBATIM)
 set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h" PROPERTIES GENERATED TRUE)
+
+# NNEDI3 weights: link the raw blob straight into the binary (objcopy turns
+# it into an object exposing _binary_nnedi3_weights_bin_{start,end}). The
+# blob stays out of C++ sources so the 13.5 MB never passes through the
+# compiler; the wheel remains self-contained (reference/ is not shipped).
+find_program(VK_OBJCOPY objcopy REQUIRED)
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.o"
+    COMMAND ${CMAKE_COMMAND} -E copy
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3_weights.bin"
+            "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.bin"
+    # run under the output dir so the embedded symbols derive from the bare
+    # filename (_binary_nnedi3_weights_bin_{start,end}), not the build path
+    COMMAND ${VK_OBJCOPY} --input binary --output elf64-x86-64
+            --binary-architecture i386:x86-64
+            nnedi3_weights.bin nnedi3_weights.o
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3_weights.bin"
+    VERBATIM)
+set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.o"
+    PROPERTIES GENERATED TRUE)
 
 # Plugin
 add_library(vsfeel SHARED
@@ -285,7 +333,9 @@ add_library(vsfeel SHARED
     src/dfttest.cpp
     src/nlmeans.cpp
     src/eedi3.cpp
-    "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h")
+    src/nnedi3.cpp
+    "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
+    "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.o")
 configure_common(vsfeel)
 target_compile_options(vsfeel PRIVATE -mavx2)
 target_link_libraries(vsfeel PRIVATE Vulkan::Vulkan)

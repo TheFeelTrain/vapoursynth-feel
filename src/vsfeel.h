@@ -242,3 +242,4 @@ void vsfeel_register_gaussblur(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
 void vsfeel_register_dfttest(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
 void vsfeel_register_nlmeans(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
 void vsfeel_register_eedi3(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
+void vsfeel_register_nnedi3(const VSPLUGINAPI * vspapi, VSPlugin * plugin);

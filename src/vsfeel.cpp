@@ -386,4 +386,5 @@ VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
     vsfeel_register_dfttest(vspapi, plugin);
     vsfeel_register_nlmeans(vspapi, plugin);
     vsfeel_register_eedi3(vspapi, plugin);
+    vsfeel_register_nnedi3(vspapi, plugin);
 }

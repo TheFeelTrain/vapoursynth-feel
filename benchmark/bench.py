@@ -187,6 +187,7 @@ PLUGINS = {
         loader='core.std.LoadPlugin("/home/encode/test/vapoursynth-ziphip/zig-out/lib/libvszipcu.so")',
     ),
     "eedi3vk2": Plugin("eedi3vk2"),
+    "nnedi3vk": Plugin("nnedi3vk"),
     "bilateralhip": Plugin("bilateralhip"),
     "bm3dhip": Plugin("bm3dhip"),
     "nlm_hip": Plugin("nlm_hip"),
@@ -353,6 +354,16 @@ def _eedi3_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     }
 
 
+def _nnedi3_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
+    ns_num = ns.num_streams if ns.num_streams is not None else 2
+    common = f"field={ns.nnedi3_field}"
+    return {
+        "vsfeel": f"core.vsfeel.NNEDI3({clip}, {common}, num_streams={ns_num})",
+        "nnedi3vk": f"core.nnedi3vk.NNEDI3({clip}, {common})",
+        "vszipcu": f"core.vszipcu.NNEDI3({clip}, {common}, device_id=0)",
+    }
+
+
 FILTERS: dict[str, FilterSpec] = {
     "bm3dv2": FilterSpec(
         title="BM3Dv2",
@@ -454,6 +465,15 @@ FILTERS: dict[str, FilterSpec] = {
         input="depth(get_y(clip), 16)",
         aa=True,
         default_streams=8,
+    ),
+    "nnedi3": FilterSpec(
+        title="NNEDI3",
+        default_frames=200,
+        args=[
+            Arg("field", "--nnedi3-field", "nnedi3_field", int, 1),
+        ],
+        build=_nnedi3_build,
+        default_streams=2,
     ),
 }
 
