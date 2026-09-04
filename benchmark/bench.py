@@ -453,7 +453,7 @@ FILTERS: dict[str, FilterSpec] = {
         # (used by the hang tests) falls back to a plain 1x GRAY16 call.
         input="depth(get_y(clip), 16)",
         aa=True,
-        default_streams=4,
+        default_streams=8,
     ),
 }
 

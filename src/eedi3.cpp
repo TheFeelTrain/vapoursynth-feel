@@ -54,6 +54,34 @@ constexpr int MARGIN_H = 12;
 constexpr int MARGIN_V = 4;
 constexpr int MAX_PLANES = 3;
 
+// Out-of-place transpose with 64x64 blocking (both sides stay cache-friendly:
+// every tile-row segment is contiguous on read and write):
+// dst[x * dstride + y] = src[y * sstride + x], x in [0,W), y in [0,H).
+// Strides and dims are in ELEMENTS; elem is the byte size.
+static void transpose_plane(const uint8_t * src, ptrdiff_t sstride_elems,
+                            const int W, const int H,
+                            uint8_t * dst, ptrdiff_t dstride_elems,
+                            const int elem) {
+    constexpr int TILE = 64;
+    const size_t seg_bytes = static_cast<size_t>(TILE) * elem;
+    for (int x0 = 0; x0 < W; x0 += TILE) {
+        const int xn = std::min(TILE, W - x0);
+        for (int y0 = 0; y0 < H; y0 += TILE) {
+            const int yn = std::min(TILE, H - y0);
+            for (int y = 0; y < yn; ++y) {
+                const uint8_t * s = src + (static_cast<int64_t>(y0 + y) * sstride_elems + x0) * elem;
+                uint8_t * d = dst + (static_cast<int64_t>(x0) * dstride_elems + y0 + y) * elem;
+                if (xn == TILE) {
+                    copy_stream_out(d, s, seg_bytes);
+                } else {
+                    std::memcpy(d, s, static_cast<size_t>(xn) * elem);
+                }
+            }
+            (void)yn;
+        }
+    }
+}
+
 // Pad element size: native u16 for 16-bit input (halves the pad upload, the
 // H2D copy and the kernel's pad read traffic vs float), float for 32-bit.
 // u16 values are exact in float so all downstream math is bit-identical.
@@ -446,8 +474,9 @@ static std::optional<std::string> record_command_buffer(
     const int32_t elem = d.elem_bytes;
 
     // H2D: copy the CPU-written upload region (tight kept rows, packed bits,
-    // sclip, [0, upload_total)) from system-RAM staging into the device-local
-    // pad_dev mirror the kernels read. Host writes were flushed by the caller.
+    // sclip, [0, upload_total)) into the device-local mirror. GPU reads of
+    // host staging are slow here even when purely streaming (measured twice),
+    // so everything reused goes through VRAM. Host writes were flushed.
     if (d.upload_total > 0) {
         const VkBufferCopy region {
             .srcOffset = 0,
@@ -1157,7 +1186,9 @@ static void VS_CC Eedi3Create(
 
     int num_streams = vsh::int64ToIntS(vsapi->mapGetInt(in, "num_streams", 0, &err));
     if (err) {
-        num_streams = 4;
+        // 8 is the overlap knee on the target GPU (4 streams starves the
+        // queue; 16+ plateaus). ~250MB VRAM per stream.
+        num_streams = 8;
     }
     if (num_streams < 1 || num_streams > 32) {
         return set_error("num_streams must be 1..32.");
@@ -1762,12 +1793,163 @@ static void VS_CC Eedi3Create(
 }
 
 // ---------------------------------------------------------------------------
+// EEDI3H — horizontal EEDI3 (vszipcl parity).
+//
+// Pure composition: Transpose clip/sclip/mclip in, run EEDI3, Transpose back.
+// No instance state, no new kernels, no new host paths — every behavior
+// (validation, numerics, mclip/sclip/dh/field semantics) is EEDI3's, applied
+// to the transposed geometry exactly like vszipcl's EEDI3H does on the GPU:
+// field selects transposed-row (= original column) parity, dh doubles the
+// transposed height (= the original width). By construction,
+//   EEDI3H(x) == Transpose(EEDI3(Transpose(x)))
+// bit-exactly (same kernels, same params, transposed data flow), which is
+// also the primary test oracle (tests/test_eedi3h.py).
+// ---------------------------------------------------------------------------
+
+static void VS_CC Eedi3HCreate(
+    const VSMap *in, VSMap *out, void *userData,
+    VSCore *core, const VSAPI *vsapi) {
+
+    VSPlugin * self = static_cast<VSPlugin *>(userData);
+    std::vector<VSNode *> owned;   // transposed intermediates we must release
+    auto fail = [&](const std::string & error_message) {
+        vsapi->mapSetError(out, ("EEDI3H: " + error_message).c_str());
+        for (VSNode * n : owned) {
+            vsapi->freeNode(n);
+        }
+    };
+
+    // Transpose one optional input clip (absent -> leave *slot null).
+    auto transpose_opt = [&](const char * key, VSNode ** slot) -> bool {
+        int e = 0;
+        VSNode * src = vsapi->mapGetNode(in, key, 0, &e);
+        if (e || !src) {
+            return true;
+        }
+        VSMap * args = vsapi->createMap();
+        vsapi->mapConsumeNode(args, "clip", src, maReplace);
+        VSMap * ret = vsapi->invoke(
+            vsapi->getPluginByID(VSH_STD_PLUGIN_ID, core), "Transpose", args);
+        vsapi->freeMap(args);
+        if (vsapi->mapGetError(ret)) {
+            fail(vsapi->mapGetError(ret));
+            vsapi->freeMap(ret);
+            return false;
+        }
+        *slot = vsapi->mapGetNode(ret, "clip", 0, nullptr);
+        owned.push_back(*slot);
+        vsapi->freeMap(ret);
+        return true;
+    };
+
+    int e = 0;
+    VSNode * clip = vsapi->mapGetNode(in, "clip", 0, &e);
+    if (e || !clip) {
+        return fail("clip is required");
+    }
+    VSNode *tclip = nullptr, *tsclip = nullptr, *tmclip = nullptr;
+    {
+        VSMap * args = vsapi->createMap();
+        vsapi->mapConsumeNode(args, "clip", clip, maReplace);
+        VSMap * ret = vsapi->invoke(
+            vsapi->getPluginByID(VSH_STD_PLUGIN_ID, core), "Transpose", args);
+        vsapi->freeMap(args);
+        if (vsapi->mapGetError(ret)) {
+            fail(vsapi->mapGetError(ret));
+            vsapi->freeMap(ret);
+            return;
+        }
+        tclip = vsapi->mapGetNode(ret, "clip", 0, nullptr);
+        owned.push_back(tclip);
+        vsapi->freeMap(ret);
+    }
+    if (!transpose_opt("sclip", &tsclip) || !transpose_opt("mclip", &tmclip)) {
+        return;  // fail() already recorded the error and freed `owned`
+    }
+
+    // Forward every scalar arg verbatim; clips go in transposed.
+    VSMap * args = vsapi->createMap();
+    vsapi->mapConsumeNode(args, "clip", tclip, maReplace);
+    if (tsclip) {
+        vsapi->mapConsumeNode(args, "sclip", tsclip, maReplace);
+    }
+    if (tmclip) {
+        vsapi->mapConsumeNode(args, "mclip", tmclip, maReplace);
+    }
+    // owned refs moved into args; the inner filter takes its own references.
+    owned.clear();
+    auto fwd_int = [&](const char * key) {
+        int ee = 0;
+        const int64_t v = vsapi->mapGetInt(in, key, 0, &ee);
+        if (!ee) {
+            vsapi->mapSetInt(args, key, v, maReplace);
+        }
+    };
+    auto fwd_int_arr = [&](const char * key) {
+        const int n = vsapi->mapNumElements(in, key);
+        for (int i = 0; i < n; ++i) {
+            int ee = 0;
+            const int64_t v = vsapi->mapGetInt(in, key, i, &ee);
+            if (!ee) {
+                vsapi->mapSetInt(args, key, v, maAppend);
+            }
+        }
+    };
+    auto fwd_float = [&](const char * key) {
+        int ee = 0;
+        const double v = vsapi->mapGetFloat(in, key, 0, &ee);
+        if (!ee) {
+            vsapi->mapSetFloat(args, key, v, maReplace);
+        }
+    };
+    fwd_int("field");
+    fwd_int("dh");
+    fwd_int_arr("planes");
+    fwd_float("alpha");
+    fwd_float("beta");
+    fwd_float("gamma");
+    fwd_int("nrad");
+    fwd_int("mdis");
+    fwd_int("vcheck");
+    fwd_float("vthresh0");
+    fwd_float("vthresh1");
+    fwd_float("vthresh2");
+    fwd_int("device_id");
+    fwd_int("num_streams");
+
+    VSMap * ret = vsapi->invoke(self, "EEDI3", args);
+    vsapi->freeMap(args);
+    if (vsapi->mapGetError(ret)) {
+        // Our transposed refs died with `args`; the inner filter cleans up
+        // its own references on create-failure. Just propagate the error.
+        fail(vsapi->mapGetError(ret));
+        vsapi->freeMap(ret);
+        return;
+    }
+    VSNode * eedi3 = vsapi->mapGetNode(ret, "clip", 0, nullptr);
+    vsapi->freeMap(ret);
+
+    VSMap * args2 = vsapi->createMap();
+    vsapi->mapConsumeNode(args2, "clip", eedi3, maReplace);
+    VSMap * ret2 = vsapi->invoke(
+        vsapi->getPluginByID(VSH_STD_PLUGIN_ID, core), "Transpose", args2);
+    vsapi->freeMap(args2);
+    if (vsapi->mapGetError(ret2)) {
+        fail(vsapi->mapGetError(ret2));
+        vsapi->freeMap(ret2);
+        return;
+    }
+    VSNode * final = vsapi->mapGetNode(ret2, "clip", 0, nullptr);
+    vsapi->freeMap(ret2);
+    vsapi->mapConsumeNode(out, "clip", final, maReplace);
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
 void vsfeel_register_eedi3(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
-    vspapi->registerFunction(
-        "EEDI3",
+    const char * eedi3_args =
         "clip:vnode;"
         "field:int;"
         "dh:int:opt;"
@@ -1784,8 +1966,17 @@ void vsfeel_register_eedi3(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
         "sclip:vnode:opt;"
         "mclip:vnode:opt;"
         "device_id:int:opt;"
-        "num_streams:int:opt;",
+        "num_streams:int:opt;";
+    vspapi->registerFunction(
+        "EEDI3",
+        eedi3_args,
         "clip:vnode;",
         Eedi3Create, nullptr, plugin
+    );
+    vspapi->registerFunction(
+        "EEDI3H",
+        eedi3_args,
+        "clip:vnode;",
+        Eedi3HCreate, plugin, plugin
     );
 }

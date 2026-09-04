@@ -50,6 +50,12 @@ class FeelBackend:
     """Plugin namespace. Read by wrappers that pick the plugin themselves,
     e.g. ``vsrgtools.gauss_blur`` dispatches through ``getattr(core, backend.value)``."""
 
+    supports_mclip = True
+    """Whether the backend's EEDI3 supports mclip (read by vsaa.based_aa)."""
+
+    supports_h = True
+    """Whether the backend can interpolate columns (EEDI3H)."""
+
     num_streams: int | None = None
     """Override for the plugin's ``num_streams`` argument.
 
@@ -80,6 +86,12 @@ class FeelBackend:
 
     def DFTTest(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:  # noqa: N802
         return self._dispatch("DFTTest", (clip, *args), kwargs)
+
+    def EEDI3(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:  # noqa: N802
+        return self._dispatch("EEDI3", (clip, *args), kwargs)
+
+    def EEDI3H(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:  # noqa: N802
+        return self._dispatch("EEDI3H", (clip, *args), kwargs)
 
     @property
     def plugin(self) -> _FeelBM3DPlugin:
