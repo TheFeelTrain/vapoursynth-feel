@@ -196,6 +196,16 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   reference line-for-line and get the tests passing before optimizing
   anything. Afterwards, every bug you find will be in your own new code, not
   in the ported algorithm.
+- **Hold a bit-exact oracle against the closest reference where one exists.**
+  Exactness (not just tolerance) is what makes aggressive structural changes
+  verifiable in minutes — loose bounds cannot catch a one-column indexing
+  slip. Pair small targeted tests with real-content checks; they catch
+  disjoint bug classes.
+- **Compose variants from shipped filters before writing new code.** A filter
+  that is a geometric or parametric transform of an existing one can often be
+  a few invokes with zero new state — correct by construction, with a free
+  self-consistency oracle, and near-zero maintenance. New kernels are for
+  what composition cannot express.
 - **Only noise-clip comparisons against the reference prove correctness.**
   Constant/BlankClip input hides bugs (the references themselves deviate at
   borders on such input). In test code, never assume tight pitch when reading
@@ -206,9 +216,17 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   that does not move the fps median did not happen. Streams share the compute
   queue, so per-kernel timings taken from multi-stream runs include the other
   stream's interleaved work — attribute kernels only in single-stream traces.
+  Identical binaries swing between invocations too, so compare same-session
+  pairs or medians over 1000+ frames, never single short bursts.
 - **Never chain build → install → test into one command** (a failed compile
   then silently leaves the stale `.so` installed). Verify binary freshness
-  before trusting any measurement.
+  (timestamp-compare, `strings`-grep the installed `.so`) before trusting any
+  measurement.
+- **Prove the host/GPU split before optimizing anything.** Add a small
+  env-gated chrono probe around the frame path (CPU staging / GPU
+  submit-wait / download-and-blit) and read it on real content first — kernel
+  work that looks dominant from reading code is routinely not the bottleneck.
+  Keep durable probes like this in-tree; delete one-shot diagnostics.
 - **Host orchestration is usually half the performance.** Expect to spend as
   much effort on memory pooling, upload/download paths, cross-stream cache
   sharing, and dispatch/fence structure as on kernels. The big wins come from
@@ -216,6 +234,18 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   once via DMA straight into its final layout, sharing immutable data
   lock-free across streams (only writers exclude readers) — not from making
   the surviving instructions cleverer.
+- **Minimize bytes moved, then minimize copies.** Transfer buffers in the
+  narrowest exactly-representable type and widen on load; prefer
+  non-temporal copies for write-once/read-once staging (which requires
+  host-cached memory — uncached kills NT loads); re-measure copy-vs-direct
+  after every structural change, because the answer flips as the code
+  changes. Dump the target GPU's memory-type table once and rule transfer
+  tricks in or out permanently.
+- **Sweep in-flight depth; set the default at the knee.** Throughput vs
+  `num_streams` is never flat and never monotonic — measure it, set the
+  filter default at the knee, and state the per-stream VRAM cost next to it.
+  Implementations tied at one depth can differ 2x at another (queue
+  starvation vs GPU saturation).
 - **Spec constants cannot size arrays in GLSL.** If an array dimension must
   vary, gate it with a compile-time `-D` define instead.
 - **Respect the compiler's register tradeoffs.** ACO raises VGPRs deliberately
@@ -232,6 +262,12 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   `-D` variants or env flags that drop one cost center at a time, measured,
   reverted immediately. Expect plausible theories to be wrong — one seemingly
   expensive memory-access pattern measured neutral because it was L2-resident.
+  When the model names a cost, delete it in a scratch build and measure: a
+  probe that disagrees with a confident model (barriers modeled 10x over real
+  cost here) is always right. Where device profilers are unavailable, bound
+  cost centers with workload-shape variants instead — inputs that isolate
+  each stage (all-skip, full-work, no auxiliary data) read ceilings directly
+  off end-to-end fps.
 - **Keep `notes/<filter>.md` updated immediately** after every finding,
   including dead ends, so nothing is re-derived or retried later.
 
