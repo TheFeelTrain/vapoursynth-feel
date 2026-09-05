@@ -356,11 +356,17 @@ def _eedi3_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
 
 def _nnedi3_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     ns_num = ns.num_streams if ns.num_streams is not None else 2
-    common = f"field={ns.nnedi3_field}"
+    common = (
+        f"field={ns.nnedi3_field}, dh={ns.nnedi3_dh}, "
+        f"nsize={ns.nnedi3_nsize}, nns={ns.nnedi3_nns}, qual={ns.nnedi3_qual}, "
+        f"etype={ns.nnedi3_etype}, pscrn={ns.nnedi3_pscrn}"
+    )
+    if ns.nnedi3_planes:
+        common += f", planes=[{ns.nnedi3_planes}]"
     return {
         "vsfeel": f"core.vsfeel.NNEDI3({clip}, {common}, num_streams={ns_num})",
-        "nnedi3vk": f"core.nnedi3vk.NNEDI3({clip}, {common})",
-        "vszipcu": f"core.vszipcu.NNEDI3({clip}, {common}, device_id=0)",
+        "nnedi3vk": f"core.nnedi3vk.NNEDI3({clip}, {common}, num_streams={ns_num})",
+        "vszipcu": f"core.vszipcu.NNEDI3({clip}, {common}, num_streams={ns_num})",
     }
 
 
@@ -471,6 +477,13 @@ FILTERS: dict[str, FilterSpec] = {
         default_frames=5000,
         args=[
             Arg("field", "--nnedi3-field", "nnedi3_field", int, 1),
+            Arg("dh", "--nnedi3-dh", "nnedi3_dh", int, 0),
+            Arg("planes", "--nnedi3-planes", "nnedi3_planes", str, None),
+            Arg("nsize", "--nnedi3-nsize", "nnedi3_nsize", int, 6),
+            Arg("nns", "--nnedi3-nns", "nnedi3_nns", int, 1),
+            Arg("qual", "--nnedi3-qual", "nnedi3_qual", int, 1),
+            Arg("etype", "--nnedi3-etype", "nnedi3_etype", int, 0),
+            Arg("pscrn", "--nnedi3-pscrn", "nnedi3_pscrn", int, 2),
         ],
         build=_nnedi3_build,
         default_streams=2,
