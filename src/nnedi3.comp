@@ -6,18 +6,26 @@
  * algorithm both references compute: nnedi3vk and vszipcu agree bit-exactly,
  * so matching their math lands within ~1 LSB of both).
  *
- * Structure (deliberately different from nnedi3vk's prescreen-list/predict
- * split): one thread per interpolated pixel runs cubic -> prescreener ->
- * predictor inline, with serial (natural-order) accumulation. No compaction,
- * no atomics, no subgroup ops — simple and accurate, to be split for speed
- * later.
+ * Structure: the prescreen kernel writes cheap cubic results and compacts
+ * the predictor-rejected pixel indices into a list (one atomic per
+ * subgroup); the cooperative predict kernel runs the network over the
+ * listed pixels only (one 32-lane subgroup per 4 pixels, window stats and
+ * wae5 reductions via subgroup adds, GEMV from shared memory), launching
+ * indirectly off the prescreen-maintained count. No prescreening
+ * (pscrn=0) runs predict directly over every pixel.
  *
- * Exactly one of ENTRY_PAD / ENTRY_MAIN is defined at compile time:
+ * Exactly one of ENTRY_PAD / ENTRY_ASSEMBLE / ENTRY_PRESCREEN /
+ * ENTRY_PREDICT / ENTRY_COUNT is defined at compile time:
  *
- *   ENTRY_PAD   — clamp-mirror the packed field rows into the padded plane:
- *                 pad[i][x] = field[clamp(i-(MARGIN_V-fp))][clamp(x-MARGIN_H)]
- *   ENTRY_MAIN  — per output pixel (x, r): cubic taps, prescreener decision,
- *                 predictor network when needed.
+ *   ENTRY_PAD       — clamp-mirror the packed field rows into the padded
+ *                     plane: pad[i][x] = field[clamp(i-(MARGIN_V-fp))]
+ *                     [clamp(x-MARGIN_H)]
+ *   ENTRY_ASSEMBLE  — interleave kept field rows + packed interp rows into
+ *                     the full-frame output (kernel-direct download write)
+ *   ENTRY_PRESCREEN — per output pixel group: cubic taps, prescreener
+ *                     decision, cubic store or list compaction
+ *   ENTRY_PREDICT   — predictor network over listed (or all) pixels
+ *   ENTRY_COUNT     — 1-thread indirect-size derivation from the count
  *
  * Formula order mirrors the references so results agree to ~1 LSB:
  * - cubic and all prescreener dots accumulate `precise` (no FMA contraction,
@@ -56,37 +64,50 @@ layout(constant_id = 5) const int XDIM = 32;
 layout(constant_id = 6) const int YDIM = 4;
 layout(constant_id = 7) const int NNS = 32;
 layout(constant_id = 8) const int QUAL = 1;
+layout(constant_id = 9) const int USE_LIST = 1;
 
 const int FS = XDIM * YDIM;
 
 layout(std430, binding = 0) readonly buffer FieldBuf { IO_TYPE fieldBuf[]; };
 layout(std430, binding = 1) buffer PadBuf { IO_TYPE padBuf[]; };
 layout(std430, binding = 2) buffer DstBuf { IO_TYPE dstBuf[]; };
+// Full-frame assembly target: the staging download area (kernel-direct
+// download, no D2H copy). Same element type as the other IO buffers.
+layout(std430, binding = 6) writeonly buffer OutBuf { IO_TYPE outBuf[]; };
+// Rejected-pixel list (prescreen writes, predict reads) and the indirect
+// dispatch struct {groupsX, groupsY, groupsZ, count} (host fills {0,1,1,0},
+// prescreen bumps via subgroup-aggregated atomics, predict reads count and
+// launches indirectly off groupsX).
+layout(std430, binding = 7) buffer ListBuf { uint listBuf[]; };
+layout(std430, binding = 8) buffer IndBuf {
+    uint indGroupsX;
+    uint indGroupsY;
+    uint indGroupsZ;
+    uint indCount;
+};
 // Prescreener weights as vec4s: layer-0 transposed (vec k holds all four
 // neurons' weights for window element k), deeper layers at fixed indices.
-layout(std430, binding = 3) readonly buffer PsWeights { vec4 psW[]; };
+layout(std430, binding = 3) readonly restrict buffer PsWeights { vec4 psW[]; };
 // Predictor weights per qual pass: (softmax, elliott) pairs in [q][k][p]
 // order, biases (smB, elB) per [q][p].
-layout(std430, binding = 4) readonly buffer PdWeights { vec2 pdW[]; };
-layout(std430, binding = 5) readonly buffer PdBias { vec2 pdB[]; };
+layout(std430, binding = 4) readonly restrict buffer PdWeights { vec2 pdW[]; };
+layout(std430, binding = 5) readonly restrict buffer PdBias { vec2 pdB[]; };
 
+// Per-dispatch buffer bases (IO_TYPE elements, except the list which is
+// uints):
+//   pad:       A=field, B=pad (+parity)
+//   prescreen: A=list, B=pad, C=packed interp rows
+//   predict:   A=list, B=pad, C=packed interp rows
+//   assemble:  A=field, B=packed interp rows, C=full-frame output (+parity)
 layout(push_constant) uniform PushConstants {
-    int field_base;
-    int pad_base;
-    int dst_base;
-    int fp;
+    int a_base;
+    int b_base;
+    int c_base;
+    int parity;
 } pc;
 
-float loadField(int idx) {
-#if BITS == 32
-    return fieldBuf[pc.field_base + idx];
-#else
-    return float(int(fieldBuf[pc.field_base + idx]));
-#endif
-}
-
 float loadPad(int row, int col) {
-    const int idx = pc.pad_base + row * PADSTRIDE + col;
+    const int idx = pc.b_base + row * PADSTRIDE + col;
 #if BITS == 32
     return padBuf[idx];
 #else
@@ -96,41 +117,13 @@ float loadPad(int row, int col) {
 
 void storeDst(int idx, float v) {
 #if BITS == 32
-    dstBuf[pc.dst_base + idx] = v;
+    dstBuf[pc.c_base + idx] = v;
 #else
     // glslc -O chokes on direct float->uint16_t (OpUConvert); go through
     // uint with an explicit mask (same workaround as the other filters)
-    dstBuf[pc.dst_base + idx] = uint16_t(uint(clamp(roundEven(v), 0.0, float(PEAK))) & 0xFFFFu);
+    dstBuf[pc.c_base + idx] = uint16_t(uint(clamp(roundEven(v), 0.0, float(PEAK))) & 0xFFFFu);
 #endif
 }
-
-float elliott(float x) {
-    return x / (1.0 + abs(x));
-}
-
-#if defined(ENTRY_PAD)
-
-layout(local_size_x = 32, local_size_y = 8) in;
-
-void main() {
-    const int x = int(gl_GlobalInvocationID.x);
-    const int i = int(gl_GlobalInvocationID.y);
-    const int padW = WIDTH + 2 * MARGIN_H;
-    const int padH = ROWS + 2 * MARGIN_V;
-    if (x >= padW || i >= padH)
-        return;
-    const int f = clamp(i - (MARGIN_V - pc.fp), 0, ROWS - 1);
-    const int c = clamp(x - MARGIN_H, 0, WIDTH - 1);
-#if BITS == 32
-    padBuf[pc.pad_base + i * PADSTRIDE + x] = fieldBuf[pc.field_base + f * WIDTH + c];
-#else
-    padBuf[pc.pad_base + i * PADSTRIDE + x] = fieldBuf[pc.field_base + f * WIDTH + c];
-#endif
-}
-
-#else // ENTRY_MAIN
-
-layout(local_size_x = 64) in;
 
 // 4-tap cubic on the padded column, reference tap order.
 float cubicRow(int r, int col) {
@@ -142,9 +135,12 @@ float cubicRow(int r, int col) {
     return acc;
 }
 
-// Old prescreener (pscrn=1): 12x4 window, three layers. Returns true when
-// the pixel needs the predictor network.
-bool needPredictOld(int x, int r) {
+float elliott(float x) {
+    return x / (1.0 + abs(x));
+}
+
+// needs the predictor network.
+bool verdictOld(int x, int r) {
     precise float st0 = 0.0, st1 = 0.0, st2 = 0.0, st3 = 0.0;
     for (int k = 0; k < 48; k++) {
         const float v = loadPad(r + 1 + k / 12, x - 5 + k % 12 + MARGIN_H);
@@ -168,12 +164,11 @@ bool needPredictOld(int x, int r) {
         acc += w.y * st[1];
         acc += w.z * st[2];
         acc += w.w * st[3];
-        const float bn = b1[n];
-        st[4 + n] = elliott(acc + bn);
+        st[4 + n] = elliott(acc + b1[n]);
     }
     const vec4 b2 = psW[62];
-    float l2max_a = -3.4028235e+38;
-    float l2max_b = -3.4028235e+38;
+    float lo_max = -3.4028235e+38;
+    float hi_max = -3.4028235e+38;
     for (int n = 0; n < 4; n++) {
         const vec4 wa = psW[54 + n * 2];
         const vec4 wb = psW[55 + n * 2];
@@ -188,18 +183,17 @@ bool needPredictOld(int x, int r) {
         acc += wb.w * st[7];
         const float v = acc + b2[n];
         if (n < 2)
-            l2max_a = max(l2max_a, v);
+            lo_max = max(lo_max, v);
         else
-            l2max_b = max(l2max_b, v);
+            hi_max = max(hi_max, v);
     }
-    return l2max_b > l2max_a;
+    return hi_max > lo_max;
 }
 
-// New prescreener (pscrn>=2): 16x4 layer-0 window shared by four consecutive
-// pixels (anchored at the group base), layer-1 row n verdicts pixel xbase+n.
-bool needPredictNew(int x, int r) {
-    const int n = x & 3;
-    const int xbase = x - n;
+// New prescreener (pscrn>=2): the 16x4 layer-0 window is shared by four
+// consecutive pixels (anchored at the group base); layer-1 row n verdicts
+// pixel xbase+n.
+vec4 prescreenL0New(int xbase, int r) {
     precise float st0 = 0.0, st1 = 0.0, st2 = 0.0, st3 = 0.0;
     for (int k = 0; k < 64; k++) {
         const float v = loadPad(r + 1 + k / 16, xbase - 6 + k % 16 + MARGIN_H);
@@ -210,95 +204,314 @@ bool needPredictNew(int x, int r) {
         st3 += w.w * v;
     }
     const vec4 b0 = psW[64];
-    const float st_0 = elliott(st0 + b0.x);
-    const float st_1 = elliott(st1 + b0.y);
-    const float st_2 = elliott(st2 + b0.z);
-    const float st_3 = elliott(st3 + b0.w);
+    return vec4(elliott(st0 + b0.x), elliott(st1 + b0.y),
+                elliott(st2 + b0.z), elliott(st3 + b0.w));
+}
+
+bool verdictNew(vec4 st, int n) {
     const vec4 w = psW[65 + n];
     const vec4 b1 = psW[69];
     precise float acc = 0.0;
-    acc += w.x * st_0;
-    acc += w.y * st_1;
-    acc += w.z * st_2;
-    acc += w.w * st_3;
+    acc += w.x * st.x;
+    acc += w.y * st.y;
+    acc += w.z * st.z;
+    acc += w.w * st.w;
     return !(acc + b1[n] > 0.0);
 }
 
-// Predictor network for pixel (x, r): window mean/variance normalization,
-// then QUAL wae5 passes over NNS softmax+elliott neuron pairs.
-float predictPixel(int x, int r) {
-    const int col0 = x - (XDIM / 2 - 1) + MARGIN_H;
-    const int row0 = r + (YDIM == 6 ? 0 : 1);
+#if defined(ENTRY_PAD)
 
-    float mean = 0.0;
-    for (int e = 0; e < FS; e++)
-        mean += loadPad(row0 + e / XDIM, col0 + e % XDIM);
-    mean /= float(FS);
-
-    float s2 = 0.0;
-    for (int e = 0; e < FS; e++) {
-        const float d = loadPad(row0 + e / XDIM, col0 + e % XDIM) - mean;
-        s2 += d * d;
-    }
-    const float variance = s2 / float(FS);
-
-    float mstd0 = mean;
-    float mstd1;
-    float mstd2;
-    if (variance < 1.1920929e-7) { // FLT_EPSILON, as in the references
-        mstd1 = 0.0;
-        mstd2 = 0.0;
-    } else {
-        mstd1 = sqrt(variance);
-        mstd2 = 1.0 / mstd1;
-    }
-
-    float result = 0.0;
-    for (int q = 0; q < QUAL; q++) {
-        const int bBase = q * NNS;
-        const int wBase = q * FS * NNS;
-        float vsum = 0.0;
-        float wsum = 0.0;
-        for (int p = 0; p < NNS; p++) {
-            const vec2 bias = pdB[bBase + p];
-            float accS = 0.0;
-            float accE = 0.0;
-            for (int k = 0; k < FS; k++) {
-                const float nk = loadPad(row0 + k / XDIM, col0 + k % XDIM) * mstd2;
-                const vec2 w = pdW[wBase + k * NNS + p];
-                accS = fma(w.x, nk, accS);
-                accE = fma(w.y, nk, accE);
-            }
-            accS += bias.x;
-            accE += bias.y;
-            const float e = exp(clamp(accS, -80.0, 80.0));
-            vsum = fma(e, elliott(accE), vsum);
-            wsum += e;
-        }
-        const float blended = wsum > 1e-10 ? fma((5.0 * vsum) / wsum, mstd1, mstd0) : mstd0;
-        result += blended;
-    }
-    return result / float(QUAL);
-}
+layout(local_size_x = 32, local_size_y = 8) in;
 
 void main() {
+    const int x = int(gl_GlobalInvocationID.x);
+    const int i = int(gl_GlobalInvocationID.y);
+    const int padW = WIDTH + 2 * MARGIN_H;
+    const int padH = ROWS + 2 * MARGIN_V;
+    if (x >= padW || i >= padH)
+        return;
+    const int fp = 1 - pc.parity;
+    const int f = clamp(i - (MARGIN_V - fp), 0, ROWS - 1);
+    const int c = clamp(x - MARGIN_H, 0, WIDTH - 1);
+    padBuf[pc.b_base + i * PADSTRIDE + x] = fieldBuf[pc.a_base + f * WIDTH + c];
+}
+
+#elif defined(ENTRY_ASSEMBLE)
+
+// Full-frame assembly: kept lines come straight from the packed field rows,
+// interpolated lines from the predict kernel's packed output. One thread per
+// output pixel, fully coalesced on all three buffers.
+layout(local_size_x = 64) in;
+
+void main() {
+    const int height = 2 * ROWS;
     const int gid = int(gl_GlobalInvocationID.x);
     const int x = gid % WIDTH;
-    const int r = gid / WIDTH;
-    if (r >= ROWS)
+    const int y = gid / WIDTH;
+    if (y >= height)
         return;
+#if BITS == 32
+    float v;
+    if ((y & 1) == pc.parity)
+        v = fieldBuf[pc.a_base + ((y - pc.parity) / 2) * WIDTH + x];
+    else
+        v = dstBuf[pc.b_base + ((y - (1 - pc.parity)) / 2) * WIDTH + x];
+    outBuf[pc.c_base + y * WIDTH + x] = v;
+#else
+    // no named uint16_t locals (needs explicit-arithmetic ext): shuffle
+    // through uint like the other filters' pack/unpack idioms
+    uint v;
+    if ((y & 1) == pc.parity)
+        v = uint(fieldBuf[pc.a_base + ((y - pc.parity) / 2) * WIDTH + x]);
+    else
+        v = uint(dstBuf[pc.b_base + ((y - (1 - pc.parity)) / 2) * WIDTH + x]);
+    outBuf[pc.c_base + y * WIDTH + x] = uint16_t(v & 0xFFFFu);
+#endif
+}
 
-    float cubic = 0.0;
-    bool need = true;
-    if (PSCRN != 0) {
-        cubic = cubicRow(r, x + MARGIN_H);
-        if (PSCRN == 1)
-            need = needPredictOld(x, r);
-        else
-            need = needPredictNew(x, r);
+#elif defined(ENTRY_PRESCREEN)
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+layout(local_size_x = 128) in;
+
+// Workgroup compaction scratch: one in-subgroup total per subgroup slot
+// (slots sized for the smallest possible subgroup).
+shared uint sgCounts[4];
+
+
+void main() {
+    const int P = (PSCRN == 1) ? 1 : 4; // pixels per thread
+    const int xg = (WIDTH + P - 1) / P;
+    const int gid = int(gl_GlobalInvocationID.x);
+    const int r = gid / xg;
+    const int xbase = (gid % xg) * P;
+    const bool valid = r < ROWS;
+
+    uint needMask = 0u;
+    vec4 stNew = vec4(0.0);
+    if (valid) {
+        if (PSCRN == 1) {
+            if (verdictOld(xbase, r))
+                needMask = 1u;
+        } else {
+            stNew = prescreenL0New(xbase, r);
+            for (int n = 0; n < 4; n++) {
+                if (verdictNew(stNew, n))
+                    needMask |= 1u << n;
+            }
+        }
     }
-    const float v = need ? predictPixel(x, r) : cubic;
-    storeDst(r * WIDTH + x, v);
+
+    int cnt = 0;
+    uint pixIdx[4];
+    if (valid) {
+        for (int n = 0; n < P; n++) {
+            const int x = xbase + n;
+            if (x >= WIDTH)
+                break;
+            const uint idx = uint(r) * uint(WIDTH) + uint(x);
+            if ((needMask & (1u << n)) != 0u)
+                pixIdx[cnt++] = idx;
+            else
+                storeDst(int(idx), cubicRow(r, x + MARGIN_H));
+        }
+    }
+
+    // Hierarchical compaction: per-subgroup scans aggregate in shared
+    // memory, then ONE thread per workgroup bumps the count (a single
+    // atomicAdd per 128 threads instead of per subgroup) and prefixes the
+    // subgroup bases. The indirect groupsX is derived afterwards by a
+    // 1-thread kernel — no contended atomicMax anywhere.
+    const uint total = subgroupAdd(uint(cnt));
+    const uint myOff = subgroupExclusiveAdd(uint(cnt));
+    if (subgroupElect())
+        sgCounts[gl_SubgroupID] = total;
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) {
+        const uint c0 = sgCounts[0], c1 = sgCounts[1];
+        const uint c2 = sgCounts[2], c3 = sgCounts[3];
+        const uint t = c0 + c1 + c2 + c3;
+        uint base = 0u;
+        if (t > 0u)
+            base = atomicAdd(indCount, t);
+        sgCounts[0] = base;
+        sgCounts[1] = base + c0;
+        sgCounts[2] = base + c0 + c1;
+        sgCounts[3] = base + c0 + c1 + c2;
+    }
+    barrier();
+    const uint off = sgCounts[gl_SubgroupID] + myOff;
+    for (int c = 0; c < cnt; c++)
+        listBuf[pc.a_base + int(off) + c] = pixIdx[c];
+}
+
+#elif defined(ENTRY_PREDICT)
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+// Cooperative predictor (PXP pixels per subgroup; see notes).
+layout(local_size_x = 128) in;
+#ifndef PXP
+const int PXP = ((((NNS + 31) / 32) <= 2) && (FS <= 128)) ? 8 : 4;
+#endif
+const int EPLX = (FS + 31) / 32;
+const int PPL = (NNS + 31) / 32;
+
+const uint SHSTRIDE = (PXP == 8) ? 256u : 288u;
+
+shared vec4 shTile[4 * 288];
+
+// ---- one work unit (PXP pixels at FIRST, NPX valid): window stats into
+// shared, vec4 GEMV, wae5 blend, store. Used by both the fast path and
+// the cold loop tail below.
+#define PREDICT_UNIT(FIRST, NPX) \
+    { \
+        [[unroll]] for (int px = 0; px < 8; px++) { \
+            if (px >= PXP) \
+                break; \
+            const uint li = min((FIRST) + uint(px), npix - 1u); \
+            const uint idx = (USE_LIST != 0) ? listBuf[pc.a_base + int(li)] : li; \
+            idxs[px] = idx; \
+            const int col0 = int(idx % uint(WIDTH)) - (XDIM / 2 - 1) + MARGIN_H; \
+            const int row0 = int(idx / uint(WIDTH)) + ((YDIM == 6) ? 0 : 1); \
+            float sum = 0.0; \
+            const uint shBase = warp * SHSTRIDE + uint(px / 4) * 128u; \
+            float vt[9]; \
+            [[unroll]] for (int t = 0; t < EPLX; t++) { \
+                const int e = int(lane) + t * 32; \
+                float v = 0.0; \
+                if (e < FS) { \
+                    v = loadPad(row0 + e / XDIM, col0 + e % XDIM); \
+                    sum += v; \
+                } \
+                vt[t] = v; \
+            } \
+            const float mean = subgroupAdd(sum) / float(FS); \
+            float s2 = 0.0; \
+            [[unroll]] for (int t = 0; t < EPLX; t++) { \
+                const int e = int(lane) + t * 32; \
+                if (e >= FS) \
+                    continue; \
+                const float d = vt[t] - mean; \
+                s2 += d * d; \
+            } \
+            const float variance = subgroupAdd(s2) / float(FS); \
+            float m0 = mean, m1, m2; \
+            if (variance < 1.1920929e-7) { \
+                m1 = 0.0; \
+                m2 = 0.0; \
+            } else { \
+                m1 = sqrt(variance); \
+                m2 = 1.0 / m1; \
+            } \
+            mstd0[px] = m0; \
+            mstd1[px] = m1; \
+            mstd2[px] = m2; \
+            result[px] = 0.0; \
+            [[unroll]] for (int t = 0; t < EPLX; t++) { \
+                const int e = int(lane) + t * 32; \
+                if (e >= FS) \
+                    continue; \
+                shTile[shBase + uint(e)][px % 4] = vt[t] * m2; \
+            } \
+        } \
+        subgroupMemoryBarrierShared(); \
+        subgroupBarrier(); \
+        [[unroll]] for (int q = 0; q < QUAL; q++) { \
+            const int bBase = q * NNS; \
+            const int wBase = q * FS * NNS; \
+            const uint shSub = warp * SHSTRIDE; \
+            vec4 accSa[8], accSb[8], accEa[8], accEb[8]; \
+            [[unroll]] for (int t = 0; t < PPL; t++) { \
+                accSa[t] = vec4(0.0); \
+                accSb[t] = vec4(0.0); \
+                accEa[t] = vec4(0.0); \
+                accEb[t] = vec4(0.0); \
+            } \
+            for (int k = 0; k < FS; k++) { \
+                const vec4 xa = shTile[shSub + uint(k)]; \
+                vec4 xb = vec4(0.0); \
+                if (PXP == 8) \
+                    xb = shTile[shSub + 128u + uint(k)]; \
+                [[unroll]] for (int t = 0; t < PPL; t++) { \
+                    const int pp = int(lane) + t * 32; \
+                    if (pp >= NNS) \
+                        continue; \
+                    const vec2 w = pdW[wBase + k * NNS + pp]; \
+                    accSa[t] = fma(vec4(w.x), xa, accSa[t]); \
+                    accEa[t] = fma(vec4(w.y), xa, accEa[t]); \
+                    if (PXP == 8) { \
+                        accSb[t] = fma(vec4(w.x), xb, accSb[t]); \
+                        accEb[t] = fma(vec4(w.y), xb, accEb[t]); \
+                    } \
+                } \
+            } \
+            [[unroll]] for (int px = 0; px < 8; px++) { \
+                if (px >= PXP || uint(px) >= (NPX)) \
+                    break; \
+                float vsum = 0.0, wsum = 0.0; \
+                [[unroll]] for (int t = 0; t < PPL; t++) { \
+                    const int pp = int(lane) + t * 32; \
+                    if (pp >= NNS) \
+                        continue; \
+                    const vec2 b = pdB[bBase + pp]; \
+                    const float aS = (px < 4 ? accSa[t][px] : accSb[t][px - 4]) + b.x; \
+                    const float aE = (px < 4 ? accEa[t][px] : accEb[t][px - 4]) + b.y; \
+                    const float e = exp(clamp(aS, -80.0, 80.0)); \
+                    vsum = fma(e, elliott(aE), vsum); \
+                    wsum += e; \
+                } \
+                vsum = subgroupAdd(vsum); \
+                wsum = subgroupAdd(wsum); \
+                result[px] += (wsum > 1e-10) \
+                    ? fma((5.0 * vsum) / wsum, mstd1[px], mstd0[px]) \
+                    : mstd0[px]; \
+            } \
+        } \
+        if (lane == 0u) { \
+            [[unroll]] for (int px = 0; px < 8; px++) { \
+                if (px >= PXP || uint(px) >= (NPX)) \
+                    break; \
+                storeDst(int(idxs[px]), result[px] / float(QUAL)); \
+            } \
+        } \
+    }
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint warp = gl_SubgroupID;
+    const uint npix = (USE_LIST != 0) ? indCount : uint(WIDTH) * uint(ROWS);
+    uint idxs[8];
+    float mstd0[8], mstd1[8], mstd2[8], result[8];
+
+    // Exact-sized grids in both modes (indirect off the compacted count,
+    // direct off the host-computed pixel grid): one work unit per subgroup;
+    // out-of-range subgroups exit immediately, no loop tail. Four subgroups
+    // per 128-thread workgroup.
+    const uint firstPix = (uint(gl_WorkGroupID.x) * 4u + warp) * uint(PXP);
+    if (firstPix >= npix)
+        return;
+    PREDICT_UNIT(firstPix, min(uint(PXP), npix - firstPix))
+}
+
+#elif defined(ENTRY_COUNT)
+
+// Derives the predictor's indirect groupsX from the compacted count:
+// groupsX = ceil(count / PPG) where PPG = 4 subgroups × PXP pixels (mirrors
+// the predict entry's PXP rule). Single thread, no contended atomics.
+layout(local_size_x = 32) in;
+
+void main() {
+    if (gl_GlobalInvocationID.x == 0u) {
+        const int pxp = ((((NNS + 31) / 32) <= 2) && (FS <= 128)) ? 8 : 4;
+        indGroupsX = (indCount + uint(4 * pxp) - 1u) / uint(4 * pxp);
+    }
 }
 
 #endif
+

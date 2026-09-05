@@ -222,16 +222,23 @@ if(VK_GLSLC)
                 VERBATIM)
         endforeach()
     endforeach()
-    # NNEDI3: clamp pad builder + fused main kernel per io variant (plain
-    # kernels, no subgroup ops); vulkan1.3 target keeps one rule for the file.
-    set(VK_NNEDI3_ENTRIES pad main)
+    # NNEDI3: prescreener + cooperative predictor + count + full-frame
+    # assembler per io variant. The predictor needs subgroup ops + the Vulkan
+    # memory model, so SPIR-V 1.3+ (vulkan1.3 target).
+    set(VK_NNEDI3_ENTRIES pad prescreen predict count assemble)
     set(VK_NNEDI3_BITS "16" "32")
     foreach(bits IN LISTS VK_NNEDI3_BITS)
         foreach(entry IN LISTS VK_NNEDI3_ENTRIES)
             if(entry STREQUAL pad)
                 set(entry_def -DENTRY_PAD)
+            elseif(entry STREQUAL prescreen)
+                set(entry_def -DENTRY_PRESCREEN)
+            elseif(entry STREQUAL predict)
+                set(entry_def -DENTRY_PREDICT)
+            elseif(entry STREQUAL count)
+                set(entry_def -DENTRY_COUNT)
             else()
-                set(entry_def -DENTRY_MAIN)
+                set(entry_def -DENTRY_ASSEMBLE)
             endif()
             set(raw_spv "${VK_SPV_DIR}/nnedi3_${bits}_${entry}.spv")
             list(APPEND VK_SPV_OUTPUTS "${raw_spv}")
@@ -295,9 +302,15 @@ add_custom_command(
             "${VK_SPV_DIR}/eedi3_16_vcopy.spv"
             "${VK_SPV_DIR}/eedi3_32_vcopy.spv"
             "${VK_SPV_DIR}/nnedi3_16_pad.spv"
-            "${VK_SPV_DIR}/nnedi3_16_main.spv"
+            "${VK_SPV_DIR}/nnedi3_16_prescreen.spv"
+            "${VK_SPV_DIR}/nnedi3_16_predict.spv"
+            "${VK_SPV_DIR}/nnedi3_16_count.spv"
+            "${VK_SPV_DIR}/nnedi3_16_assemble.spv"
             "${VK_SPV_DIR}/nnedi3_32_pad.spv"
-            "${VK_SPV_DIR}/nnedi3_32_main.spv"
+            "${VK_SPV_DIR}/nnedi3_32_prescreen.spv"
+            "${VK_SPV_DIR}/nnedi3_32_predict.spv"
+            "${VK_SPV_DIR}/nnedi3_32_count.spv"
+            "${VK_SPV_DIR}/nnedi3_32_assemble.spv"
             "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
     DEPENDS ${VK_SPV_OUTPUTS}
     VERBATIM)

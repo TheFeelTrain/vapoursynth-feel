@@ -468,7 +468,7 @@ FILTERS: dict[str, FilterSpec] = {
     ),
     "nnedi3": FilterSpec(
         title="NNEDI3",
-        default_frames=200,
+        default_frames=5000,
         args=[
             Arg("field", "--nnedi3-field", "nnedi3_field", int, 1),
         ],

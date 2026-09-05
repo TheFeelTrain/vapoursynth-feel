@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -9,9 +11,9 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <utility>
-#include <variant>
-#include <vector>
+
+// _mm_sfence for ordering the non-temporal pad stores before submit.
+#include <immintrin.h>
 
 #include <vulkan/vulkan.h>
 
@@ -30,10 +32,10 @@ using namespace std::string_literals;
 // vsfeel's own implementation of the predictor/prescreener math both GPU
 // references compute (nnedi3vk and vszipcu agree bit-exactly, see
 // notes/NNEDI3.md). The host follows the usual vsfeel shape (FramePool,
-// staging upload/download, device-local working buffers, one pre-recorded
-// command buffer per resource); the shader is a fused one-thread-per-pixel
-// kernel (cubic -> prescreener -> predictor inline), not the references'
-// prescreen-list/predict split.
+// upload/download staging, device-local working buffers); the GPU runs a
+// prescreen kernel (cubic + compacted rejected-pixel list), an indirect
+// cooperative predict kernel over the list, and a DMA readback of the packed
+// interp rows (host interleaves kept lines from the source).
 // ---------------------------------------------------------------------------
 
 // Window / network tables indexed by the filter arguments.
@@ -262,33 +264,45 @@ struct Nnedi3Plane {
     int pad_h {};
     uint32_t pad_grid_x {};
     uint32_t pad_grid_y {};
-    uint32_t main_grid_x {};
+    uint32_t pre_grid_x {};          // direct prescreen dispatch (threads)
+    uint32_t pred_grid_x {};         // legacy serial direct grid (unused)
+    uint32_t pred_grid_direct_x {};  // cooperative direct grid (pscrn==0)
+    uint32_t asm_grid_x {};
     VkPipeline pad_pipeline {};
-    VkPipeline main_pipeline {};
-    VkDeviceSize upload_offset {};
-    VkDeviceSize download_offset {};
-    int32_t field_elem {};
-    int32_t pad_elem {};
+    VkPipeline pre_pipeline {};      // null when pscrn==0
+    VkPipeline pred_pipeline {};
+    VkPipeline cnt_pipeline {};      // null when pscrn==0
+    VkPipeline asm_pipeline {};
+    VkDeviceSize up_offset {};       // bytes in the upload staging (padded plane)
+    VkDeviceSize download_offset {}; // bytes in the download staging (packed interp)
+    VkDeviceSize list_offset {};     // bytes in the device list buffer (uints)
+    int32_t pad_elem {};             // element offset of the pad in upload staging
     int32_t dst_elem {};
+    int32_t list_elem {};            // uint element offset in the list buffer
 };
 
 struct Nnedi3Resource {
-    VkBuffer staging {};
+    VkBuffer staging {};       // download staging (GTT, DMA target + host reads)
     VkDeviceMemory staging_mem {};
-    VkBuffer field_buf {};
-    VkDeviceMemory field_mem {};
-    VkBuffer pad_buf {};
-    VkDeviceMemory pad_mem {};
+    VkBuffer up_staging {};    // upload staging (VRAM-mapped: CPU pre-pads, GPU reads direct)
+    VkDeviceMemory up_mem {};
     VkBuffer dst_buf {};
     VkDeviceMemory dst_mem {};
+    VkBuffer list_buf {};        // rejected-pixel indices (device-local)
+    VkDeviceMemory list_mem {};
+    VkBuffer ind_buf {};         // {groupsX,1,1,count} indirect struct (device-local)
+    VkDeviceMemory ind_mem {};
     VkCommandPool pool {};
     VkCommandBuffer cmd {};
     VkFence fence {};
+    VkQueryPool query_pool {};   // TEMPORARY per-stage timestamps (remove after tuning)
     VkDescriptorSet desc_set {};
     VkQueue queue {};
     std::mutex * queue_lock {};
     uint8_t * map {};
+    uint8_t * up_map {};
     uint32_t staging_type_index {};
+    uint32_t up_type_index {};
 };
 
 struct Nnedi3Data {
@@ -300,6 +314,7 @@ struct Nnedi3Data {
     int field;
     bool dh;
     int qual, pscrn;
+    bool use_list;               // prescreen compacts a list (pscrn > 0)
     int peak, elem_bytes;
     int xdim, ydim, nns;
     bool process[3] { true, true, true };
@@ -309,8 +324,10 @@ struct Nnedi3Data {
     VkPipelineLayout pipeline_layout {};
     VkDescriptorPool desc_pool {};
     VkShaderModule pad_module {};
-    VkShaderModule main_module {};
-
+    VkShaderModule pre_module {};
+    VkShaderModule pred_module {};
+    VkShaderModule cnt_module {};
+    VkShaderModule asm_module {};
     VkBuffer ps_buf {};
     VkDeviceMemory ps_mem {};
     VkBuffer pdw_buf {};
@@ -318,15 +335,42 @@ struct Nnedi3Data {
     VkBuffer pdb_buf {};
     VkDeviceMemory pdb_mem {};
 
-    VkDeviceSize upload_total {};
+    VkDeviceSize up_total {};
     VkDeviceSize download_total {};
-    VkDeviceSize field_total {};
-    VkDeviceSize pad_total {};
     VkDeviceSize dst_total {};
+    VkDeviceSize list_total {};
     std::array<Nnedi3Plane, 3> planes {};
     FramePool<Nnedi3Resource> pool;
 
+    // Env-gated per-stage timing (VSFEEL_NNEDI3_BENCH): accumulated
+    // nanoseconds + frame count, reported as per-frame averages.
+    std::atomic<uint64_t> t_record {};
+    std::atomic<uint64_t> t_pack {};
+    std::atomic<uint64_t> t_gpu {};
+    std::atomic<uint64_t> t_interleave {};
+    std::atomic<uint64_t> t_frames {};
+    // TEMPORARY GPU timestamps (VSFEEL_NNEDI3_TSTAMP): nanoseconds per stage.
+    std::atomic<uint64_t> t_ts_pre {};
+    std::atomic<uint64_t> t_ts_pred {};
+    std::atomic<uint64_t> t_ts_copy {};
+    std::atomic<uint64_t> t_ts_n {};
     ~Nnedi3Data() {
+        if (trace_on("VSFEEL_NNEDI3_BENCH") && t_frames.load() > 0) {
+            const double n = static_cast<double>(t_frames.load());
+            fprintf(stderr,
+                "[nnedi3-bench] per-frame us: record=%7.1f pack=%7.1f "
+                "gpu=%7.1f downcopy=%7.1f (frames=%.0f)\n",
+                t_record.load() / 1000.0 / n,
+                t_pack.load() / 1000.0 / n, t_gpu.load() / 1000.0 / n,
+                t_interleave.load() / 1000.0 / n, n);
+        }
+        if (trace_on("VSFEEL_NNEDI3_TSTAMP") && t_ts_n.load() > 0) {
+            const double n = static_cast<double>(t_ts_n.load());
+            fprintf(stderr,
+                "[nnedi3-ts] GPU us: pre=%7.1f pred=%7.1f copy=%7.1f (frames=%.0f)\n",
+                t_ts_pre.load() / 1000.0 / n, t_ts_pred.load() / 1000.0 / n,
+                t_ts_copy.load() / 1000.0 / n, n);
+        }
         if (!device) {
             return;
         }
@@ -337,11 +381,18 @@ struct Nnedi3Data {
             if (resource.map) {
                 vkUnmapMemory(dev, resource.staging_mem);
             }
+            if (resource.up_map) {
+                vkUnmapMemory(dev, resource.up_mem);
+            }
             destroy_common(dev, resource);
+            if (resource.query_pool) {
+                vkDestroyQueryPool(dev, resource.query_pool, nullptr);
+            }
             const std::pair<VkBuffer *, VkDeviceMemory *> bufs[] {
-                { &resource.field_buf, &resource.field_mem },
-                { &resource.pad_buf, &resource.pad_mem },
+                { &resource.up_staging, &resource.up_mem },
                 { &resource.dst_buf, &resource.dst_mem },
+                { &resource.list_buf, &resource.list_mem },
+                { &resource.ind_buf, &resource.ind_mem },
             };
             for (auto [buf, mem] : bufs) {
                 if (*mem) {
@@ -368,10 +419,14 @@ struct Nnedi3Data {
             }
         }
 
-        VkPipeline seen[6] {};
+        VkPipeline seen[15] {};
         int n_seen = 0;
         for (auto & plane : planes) {
-            const VkPipeline ps[2] { plane.pad_pipeline, plane.main_pipeline };
+            const VkPipeline ps[5] {
+                plane.pad_pipeline, plane.pre_pipeline,
+                plane.pred_pipeline, plane.cnt_pipeline,
+                plane.asm_pipeline
+            };
             for (VkPipeline p : ps) {
                 if (!p) {
                     continue;
@@ -380,7 +435,7 @@ struct Nnedi3Data {
                 for (int i = 0; i < n_seen; ++i) {
                     dup |= seen[i] == p;
                 }
-                if (!dup && n_seen < 6) {
+                if (!dup && n_seen < 15) {
                     seen[n_seen++] = p;
                     vkDestroyPipeline(dev, p, nullptr);
                 }
@@ -398,8 +453,17 @@ struct Nnedi3Data {
         if (pad_module) {
             vkDestroyShaderModule(dev, pad_module, nullptr);
         }
-        if (main_module) {
-            vkDestroyShaderModule(dev, main_module, nullptr);
+        if (pre_module) {
+            vkDestroyShaderModule(dev, pre_module, nullptr);
+        }
+        if (pred_module) {
+            vkDestroyShaderModule(dev, pred_module, nullptr);
+        }
+        if (cnt_module) {
+            vkDestroyShaderModule(dev, cnt_module, nullptr);
+        }
+        if (asm_module) {
+            vkDestroyShaderModule(dev, asm_module, nullptr);
         }
 
         release_device(device);
@@ -430,15 +494,16 @@ static std::variant<VkShaderModule, std::string> create_shader_module(
 }
 
 struct Nnedi3Spec {
-    int32_t width, rows, pad_stride, peak, pscrn, xdim, ydim, nns, qual;
+    int32_t width, rows, pad_stride, peak, pscrn, xdim, ydim, nns, qual, use_list;
 };
 
 static std::variant<VkPipeline, std::string> create_pipeline(
     const VK_Device & dev, const Nnedi3Spec & spec,
-    VkShaderModule module, VkPipelineLayout layout) {
+    VkShaderModule module, VkPipelineLayout layout,
+    uint32_t required_subgroup_size = 0) {
 
-    std::array<VkSpecializationMapEntry, 9> entries {};
-    for (uint32_t i = 0; i < 9; ++i) {
+    std::array<VkSpecializationMapEntry, 10> entries {};
+    for (uint32_t i = 0; i < 10; ++i) {
         entries[i] = { i, i * static_cast<uint32_t>(sizeof(int32_t)), sizeof(int32_t) };
     }
 
@@ -449,9 +514,15 @@ static std::variant<VkPipeline, std::string> create_pipeline(
         .pData = &spec
     };
 
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+        .pNext = nullptr,
+        .requiredSubgroupSize = required_subgroup_size
+    };
+
     VkPipelineShaderStageCreateInfo stage_info {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .pNext = nullptr,
+        .pNext = required_subgroup_size ? &subgroup_size_info : nullptr,
         .flags = 0,
         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
         .module = module,
@@ -478,12 +549,14 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     return pipeline;
 }
 
-// Records the per-frame dispatch sequence into a pre-recorded command buffer:
-// one H2D copy of the packed field rows, then per plane (pad kernel,
-// barrier, main kernel), then one D2H copy of the packed interp rows. All
-// plane regions are disjoint, so dispatches of different planes may overlap.
+// Records the per-frame dispatch sequence: per plane (indirect-struct reset,
+// prescreen + list compaction unless pscrn==0, predictor, D2H of the packed
+// interp rows). The CPU pre-pads the field into VRAM-mapped upload staging
+// that prescreen/predict read directly (zero-copy upload: no H2D, no pad
+// kernel). All plane regions are disjoint, so dispatches of different planes
+// may overlap.
 static std::optional<std::string> record_command_buffer(
-    const Nnedi3Data & d, Nnedi3Resource & resource, int fp) {
+    const Nnedi3Data & d, Nnedi3Resource & resource) {
 
     VkDevice dev = d.device->device;
 
@@ -497,20 +570,32 @@ static std::optional<std::string> record_command_buffer(
     if (vkBeginCommandBuffer(resource.cmd, &begin_info) != VK_SUCCESS) {
         return "vkBeginCommandBuffer failed";
     }
-
-    if (d.upload_total > 0) {
-        const VkBufferCopy upload_region { 0, 0, d.upload_total };
-        vkCmdCopyBuffer(resource.cmd, resource.staging, resource.field_buf,
-            1, &upload_region);
-        VkMemoryBarrier copy_barrier {
+    // TEMPORARY per-stage timestamps, plane 0 only (remove after tuning)
+    vkCmdResetQueryPool(resource.cmd, resource.query_pool, 0, 4);
+    vkCmdWriteTimestamp(resource.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        resource.query_pool, 0);
+    // Host-write -> shader-read visibility for the CPU-pre-padded upload
+    // staging: the submit orders after the CPU pad, but cached/host-visible
+    // writes need an explicit availability+visibility edge before the first
+    // shader read of the padded planes.
+    {
+        VkMemoryBarrier host_barrier {
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
         };
-        vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &copy_barrier, 0, nullptr, 0, nullptr);
+        vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_HOST_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &host_barrier,
+            0, nullptr, 0, nullptr);
     }
+
+    // Temporary per-kernel timing (VSFEEL_NNEDI3_UPTO=n ends the CB after
+    // stage n: 1=prescreen, 2=count, 3=predict, 4=readback copy).
+    const char * upto_env = getenv("VSFEEL_NNEDI3_UPTO");
+    const int upto = upto_env ? atoi(upto_env) : 9;
+    bool truncated = false;
+
 
     for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
         if (!d.process[plane]) {
@@ -518,56 +603,138 @@ static std::optional<std::string> record_command_buffer(
         }
         const auto & cfg = d.planes[plane];
 
-        {
-            const int32_t push[4] { cfg.field_elem, cfg.pad_elem, 0, fp };
-            vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.pad_pipeline);
+        if (d.use_list) {
+            // reset this plane's indirect struct to {0,1,1,0}: groupsX=0,
+            // groupsY/Z=1, and the prescreen-accumulated pixel count=0 (the
+            // count word must be cleared — prescreen bumps it with atomics)
+            vkCmdFillBuffer(resource.cmd, resource.ind_buf, 0, 4, 0);
+            vkCmdFillBuffer(resource.cmd, resource.ind_buf, 4, 8, 1);
+            vkCmdFillBuffer(resource.cmd, resource.ind_buf, 12, 4, 0);
+            VkMemoryBarrier fill_barrier {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+            };
+            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fill_barrier,
+                0, nullptr, 0, nullptr);
+        }
+
+        if (d.use_list) {
+            // prescreen: cubic stores + rejected-pixel compaction
+            const int32_t push[4] { cfg.list_elem, cfg.pad_elem, cfg.dst_elem, 0 };
+            vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.pre_pipeline);
             vkCmdBindDescriptorSets(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                 d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
             vkCmdPushConstants(resource.cmd, d.pipeline_layout,
                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
-            vkCmdDispatch(resource.cmd, cfg.pad_grid_x, cfg.pad_grid_y, 1);
-        }
+            vkCmdDispatch(resource.cmd, cfg.pre_grid_x, 1, 1);
+            if (upto <= 1) {
+                truncated = true;
+                break;
+            }
 
-        {
-            VkMemoryBarrier mem_barrier {
+            // Prescreen's atomicAdd writes to indCount must be visible to
+            // the count kernel's read (Vulkan needs an explicit
+            // availability+visibility edge between the two dispatches —
+            // back-to-back dispatches do NOT order memory automatically).
+            {
+                VkMemoryBarrier pre_count_barrier {
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+                };
+                vkCmdPipelineBarrier(resource.cmd,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0, 1, &pre_count_barrier, 0, nullptr, 0, nullptr);
+            }
+            // Derive this plane's indirect groupsX from the compacted count
+            // (single thread), then launch the predictor indirectly — exact
+            // sizing, no over-launch on sparse frames.
+            vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.cnt_pipeline);
+            vkCmdBindDescriptorSets(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
+            vkCmdDispatch(resource.cmd, 1, 1, 1);
+            if (upto <= 2) {
+                truncated = true;
+                break;
+            }
+            VkMemoryBarrier ind_barrier {
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .pNext = nullptr,
                 .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                 VK_ACCESS_INDIRECT_COMMAND_READ_BIT
             };
             vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1, &ind_barrier,
+                0, nullptr, 0, nullptr);
         }
 
+        // TEMPORARY timestamps, plane 0 only
+        if (plane == 0) {
+            vkCmdWriteTimestamp(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                resource.query_pool, 1);
+        }
+        // predictor: indirect launch off the prescreen-maintained count
+        // (list mode) or fixed direct grid (pscrn=0, full coverage); the
+        // shader strides its loop off the dispatched width, always correct
         {
-            const int32_t push[4] { 0, cfg.pad_elem, cfg.dst_elem, 0 };
-            vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.main_pipeline);
+            const int32_t push[4] { cfg.list_elem, cfg.pad_elem, cfg.dst_elem, 0 };
+            vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.pred_pipeline);
             vkCmdBindDescriptorSets(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                 d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
             vkCmdPushConstants(resource.cmd, d.pipeline_layout,
                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
-            vkCmdDispatch(resource.cmd, cfg.main_grid_x, 1, 1);
+            if (d.use_list) {
+                vkCmdDispatchIndirect(resource.cmd, resource.ind_buf, 0);
+            } else {
+                vkCmdDispatch(resource.cmd, cfg.pred_grid_direct_x, 1, 1);
+            }
         }
-    }
-
-    if (d.download_total > 0) {
-        VkMemoryBarrier kernel_barrier {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT
-        };
-        vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &kernel_barrier, 0, nullptr, 0, nullptr);
-        const VkBufferCopy download_region { 0, d.upload_total, d.download_total };
-        vkCmdCopyBuffer(resource.cmd, resource.dst_buf, resource.staging,
-            1, &download_region);
+        // TEMPORARY timestamps, plane 0 only
+        if (plane == 0) {
+            vkCmdWriteTimestamp(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                resource.query_pool, 2);
+        }
+        // Download: DMA the packed interp rows (device-local dst) to the
+        // staging download area. Kept lines never cross the bus — the host
+        // interleaves them straight from the source frame. One region per
+        // plane; regions are disjoint so a single copy call suffices.
+        {
+            VkMemoryBarrier copy_barrier {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT
+            };
+            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &copy_barrier, 0, nullptr, 0, nullptr);
+            const VkDeviceSize field_bytes = static_cast<VkDeviceSize>(cfg.width) *
+                static_cast<VkDeviceSize>(cfg.rows) * static_cast<VkDeviceSize>(d.elem_bytes);
+            const VkBufferCopy region {
+                static_cast<VkDeviceSize>(cfg.dst_elem) * static_cast<VkDeviceSize>(d.elem_bytes),
+                cfg.download_offset,
+                field_bytes
+            };
+            vkCmdCopyBuffer(resource.cmd, resource.dst_buf, resource.staging, 1, &region);
+        }
+        // TEMPORARY timestamps, plane 0 only
+        if (plane == 0) {
+            vkCmdWriteTimestamp(resource.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                resource.query_pool, 3);
+        }
     }
 
     if (vkEndCommandBuffer(resource.cmd) != VK_SUCCESS) {
         return "vkEndCommandBuffer failed";
     }
 
+    (void)truncated;
     return std::nullopt;
 }
 
@@ -641,115 +808,225 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
             }
             parity = !!parity;
         }
-        const int fp = !parity;
         const size_t bps = static_cast<size_t>(d->elem_bytes);
-
-        // Kept lines straight from the source field.
-        for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-            if (!d->process[plane]) {
-                continue;
+        const bool bench = trace_on("VSFEEL_NNEDI3_BENCH");
+        const auto now = std::chrono::steady_clock::now;
+        auto t_prev = now();
+        auto bump = [&](std::atomic<uint64_t> & acc) {
+            if (bench) {
+                const auto t = now();
+                acc.fetch_add(
+                    static_cast<uint64_t>((t - t_prev).count()),
+                    std::memory_order_relaxed);
+                t_prev = t;
             }
-            const auto & cfg = d->planes[plane];
-            const uint8_t * srcp = vsapi->getReadPtr(src, plane);
-            const ptrdiff_t src_stride = vsapi->getStride(src, plane);
-            const uint8_t * fieldp = srcp + (d->dh ? 0 : parity * src_stride);
-            const ptrdiff_t field_stride = src_stride * (d->dh ? 1 : 2);
-            uint8_t * dstp = vsapi->getWritePtr(dst, plane);
-            const ptrdiff_t dst_stride = vsapi->getStride(dst, plane);
-            const size_t row_bytes = static_cast<size_t>(cfg.width) * bps;
-            for (int r = 0; r < cfg.rows; ++r) {
-                std::memcpy(dstp + (parity + 2 * r) * dst_stride,
-                    fieldp + r * field_stride, row_bytes);
-            }
-        }
+        };
 
         VkDevice dev = d->device->device;
         uint8_t * map = resource.map;
 
-        // The pad kernel's fp anchor follows this frame's field parity, so
-        // re-record the command buffer per frame (EEDI3 precedent: the
-        // previous submit on this resource was waited on before give_back,
-        // so the pool reset is safe).
-        checkVK(vkResetCommandPool(dev, resource.pool, 0));
-        if (const auto err = record_command_buffer(*d, resource, fp)) {
-            return set_error(*err);
-        }
 
-        // Pack the field rows into the staging upload area.
-        for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-            if (!d->process[plane]) {
-                continue;
-            }
-            const auto & cfg = d->planes[plane];
-            const uint8_t * srcp = vsapi->getReadPtr(src, plane);
-            const ptrdiff_t src_stride = vsapi->getStride(src, plane);
-            const uint8_t * fieldp = srcp + (d->dh ? 0 : parity * src_stride);
-            const ptrdiff_t field_stride = src_stride * (d->dh ? 1 : 2);
-            uint8_t * dstp = map + cfg.upload_offset;
-            const size_t row_bytes = static_cast<size_t>(cfg.width) * bps;
-            for (int r = 0; r < cfg.rows; ++r) {
-                std::memcpy(dstp + r * row_bytes, fieldp + r * field_stride, row_bytes);
+        // Pre-pad the field rows into the VRAM-mapped upload staging
+        // (zero-copy upload: prescreen/predict read it directly, no H2D).
+        // Row-clone pattern: full-row streaming stores + replicated edges.
+        // Write-combined memory: streaming stores, never re-read by the CPU.
+        {
+            const int fp = 1 - parity;
+            for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
+                if (!d->process[plane]) {
+                    continue;
+                }
+                const auto & cfg = d->planes[plane];
+                const uint8_t * srcp = vsapi->getReadPtr(src, plane);
+                const ptrdiff_t src_stride = vsapi->getStride(src, plane);
+                const uint8_t * fieldp = srcp + (d->dh ? 0 : parity * src_stride);
+                const ptrdiff_t field_stride = src_stride * (d->dh ? 1 : 2);
+                uint8_t * pad = resource.up_map + cfg.up_offset;
+                const size_t row_bytes = static_cast<size_t>(cfg.width) * bps;
+                const size_t pad_row_bytes = static_cast<size_t>(cfg.pad_stride) * bps;
+                for (int i = 0; i < cfg.pad_h; ++i) {
+                    int f = i - (MARGIN_V - fp);
+                    f = f < 0 ? 0 : (f >= cfg.rows ? cfg.rows - 1 : f);
+                    const uint8_t * line = fieldp + static_cast<ptrdiff_t>(f) * field_stride;
+                    uint8_t * dst = pad + static_cast<size_t>(i) * pad_row_bytes +
+                        static_cast<size_t>(MARGIN_H) * bps;
+                    copy_stream_out(dst, line, row_bytes);
+                    // replicate edge elements into the margins (element-typed)
+                    if (bps == 2) {
+                        const uint16_t l = reinterpret_cast<const uint16_t *>(line)[0];
+                        const uint16_t r = reinterpret_cast<const uint16_t *>(line)[cfg.width - 1];
+                        uint16_t * d16 = reinterpret_cast<uint16_t *>(pad) +
+                            static_cast<size_t>(i) * cfg.pad_stride;
+                        for (int x = 0; x < MARGIN_H; ++x) {
+                            d16[x] = l;
+                            d16[MARGIN_H + cfg.width + x] = r;
+                        }
+                    } else {
+                        const float l = reinterpret_cast<const float *>(line)[0];
+                        const float r = reinterpret_cast<const float *>(line)[cfg.width - 1];
+                        float * d32 = reinterpret_cast<float *>(pad) +
+                            static_cast<size_t>(i) * cfg.pad_stride;
+                        for (int x = 0; x < MARGIN_H; ++x) {
+                            d32[x] = l;
+                            d32[MARGIN_H + cfg.width + x] = r;
+                        }
+                    }
+                }
             }
         }
-
-        const bool coherent =
-            !!(d->device->mem_props.memoryTypes[resource.staging_type_index].propertyFlags &
+        bump(d->t_pack);
+        // Order the non-temporal pad stores before the submit: an SFENCE
+        // drains the CPU store buffer so no NT write is still in flight when
+        // the GPU starts reading the padded planes.
+        _mm_sfence();
+        const bool up_coherent =
+            !!(d->device->mem_props.memoryTypes[resource.up_type_index].propertyFlags &
                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (!coherent && d->upload_total > 0) {
+        if (!up_coherent && d->up_total > 0) {
             VkMappedMemoryRange flush_range {
                 .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                 .pNext = nullptr,
-                .memory = resource.staging_mem,
+                .memory = resource.up_mem,
                 .offset = 0,
-                .size = d->upload_total,
+                .size = d->up_total,
             };
             checkVK(vkFlushMappedMemoryRanges(dev, 1, &flush_range));
         }
+        // Record after the pad lands, then make the CPU writes visible to
+        // the GPU: vkQueueSubmit's host-happens-before covers the ordering,
+        // but DEVICE_LOCAL staging needs an explicit flush+barrier, not just
+        // the queue-latch. Host writes must complete before the shader reads
+        // them — this barrier (host write -> shader read) is the visibility
+        // edge the zero-copy upload was missing.
+        checkVK(vkResetCommandPool(dev, resource.pool, 0));
+        if (const auto err = record_command_buffer(*d, resource)) {
+            return set_error(*err);
+        }
+        bump(d->t_record);
 
         checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
             resource.cmd, resource.fence));
 
         checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
+        bump(d->t_gpu);
+        // TEMPORARY GPU timestamps (remove after tuning)
+        if (trace_on("VSFEEL_NNEDI3_TSTAMP")) {
+            uint64_t ts[4] = {};
+            if (vkGetQueryPoolResults(dev, resource.query_pool, 0, 4,
+                    sizeof(ts), ts, sizeof(uint64_t),
+                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS &&
+                ts[3] >= ts[0]) {
+                const double period =
+                    static_cast<double>(d->device->limits.timestampPeriod);
+                d->t_ts_pre.fetch_add(
+                    static_cast<uint64_t>((ts[1] - ts[0]) * period),
+                    std::memory_order_relaxed);
+                d->t_ts_pred.fetch_add(
+                    static_cast<uint64_t>((ts[2] - ts[1]) * period),
+                    std::memory_order_relaxed);
+                d->t_ts_copy.fetch_add(
+                    static_cast<uint64_t>((ts[3] - ts[2]) * period),
+                    std::memory_order_relaxed);
+                d->t_ts_n.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
 
-        if (!coherent && d->download_total > 0) {
+        if (trace_on("VSFEEL_NNEDI3_COUNT")) {
+            // one-off count readback: extra submit, perturbs timing
+            VkCommandBuffer cb;
+            VkCommandBufferAllocateInfo ainfo {
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                .pNext = nullptr,
+                .commandPool = resource.pool,
+                .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                .commandBufferCount = 1
+            };
+            if (vkAllocateCommandBuffers(dev, &ainfo, &cb) == VK_SUCCESS) {
+                VkCommandBufferBeginInfo binfo {
+                    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                    .pNext = nullptr,
+                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+                    .pInheritanceInfo = nullptr
+                };
+                if (vkBeginCommandBuffer(cb, &binfo) == VK_SUCCESS) {
+                    VkBufferCopy r { 0, d->download_total, 16 };
+                    vkCmdCopyBuffer(cb, resource.ind_buf, resource.staging, 1, &r);
+                    vkEndCommandBuffer(cb);
+                    submit_with_fence(dev, resource.queue, resource.queue_lock, cb, resource.fence);
+                    if (vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS) {
+                        uint32_t words[4] = {};
+                        std::memcpy(words, map + d->download_total, 16);
+                        fprintf(stderr, "[nnedi3-count] frame %d groupsX=%u count=%u\n",
+                            n, words[0], words[3]);
+                    }
+                }
+                vkFreeCommandBuffers(dev, resource.pool, 1, &cb);
+            }
+        }
+
+        const bool dl_coherent =
+            !!(d->device->mem_props.memoryTypes[resource.staging_type_index].propertyFlags &
+               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (!dl_coherent && d->download_total > 0) {
             VkMappedMemoryRange inv_range {
                 .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                 .pNext = nullptr,
                 .memory = resource.staging_mem,
-                .offset = d->upload_total,
+                .offset = 0,
                 .size = d->download_total,
             };
             checkVK(vkInvalidateMappedMemoryRanges(dev, 1, &inv_range));
         }
 
-        // Interleave the interpolated rows at the complementary parity. In
-        // dh mode with unprocessed planes the reference leaves those planes
-        // uninitialized; zero the gaps deterministically instead.
+        // Interleave: kept lines come straight from the source frame, interp
+        // lines from the DMA'd packed rows in the staging download area.
+        // Unprocessed dh planes (which the reference leaves uninitialized)
+        // get kept lines + zeroed gaps deterministically.
         for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
+            const auto & cfg = d->planes[plane];
             uint8_t * dstp = vsapi->getWritePtr(dst, plane);
             const ptrdiff_t dst_stride = vsapi->getStride(dst, plane);
             if (!d->process[plane]) {
                 if (d->dh) {
-                    const int w = vsapi->getFrameWidth(dst, plane);
-                    const int h = vsapi->getFrameHeight(dst, plane);
-                    const size_t rb = static_cast<size_t>(w) * bps;
-                    for (int y = 0; y < h; ++y) {
-                        if (((y & 1) != parity)) {
-                            std::memset(dstp + y * dst_stride, 0, rb);
-                        }
+                    const uint8_t * srcp = vsapi->getReadPtr(src, plane);
+                    const ptrdiff_t src_stride = vsapi->getStride(src, plane);
+                    const int w = vsapi->getFrameWidth(src, plane);
+                    const int rows = vsapi->getFrameHeight(src, plane);
+                    const size_t row_bytes = static_cast<size_t>(w) * bps;
+                    for (int r = 0; r < rows; ++r) {
+                        std::memcpy(dstp + (parity + 2 * r) * dst_stride,
+                            srcp + r * src_stride, row_bytes);
+                        std::memset(dstp + (1 - parity + 2 * r) * dst_stride,
+                            0, row_bytes);
                     }
                 }
                 continue;
             }
-            const auto & cfg = d->planes[plane];
-            const uint8_t * interp = map + d->upload_total + cfg.download_offset;
+            const uint8_t * srcp = vsapi->getReadPtr(src, plane);
+            const ptrdiff_t src_stride = vsapi->getStride(src, plane);
+            const uint8_t * interp = map + cfg.download_offset;
             const size_t row_bytes = static_cast<size_t>(cfg.width) * bps;
-            const int off = 1 - parity;
+            const int height = vsapi->getFrameHeight(dst, plane);
+            const int fp = 1 - parity;
+            // Kept pass (cached source): one memcpy per kept row.
+            if (!d->dh) {
+                for (int y = parity; y < height; y += 2) {
+                    std::memcpy(dstp + y * dst_stride, srcp + y * src_stride, row_bytes);
+                }
+            } else {
+                for (int y = parity; y < height; y += 2) {
+                    std::memcpy(dstp + y * dst_stride,
+                        srcp + ((y - parity) / 2) * src_stride, row_bytes);
+                }
+            }
+            // Interp pass (WC staging): non-temporal loads, never cached.
             for (int r = 0; r < cfg.rows; ++r) {
-                std::memcpy(dstp + (off + 2 * r) * dst_stride,
+                copy_stream_read(dstp + (fp + 2 * r) * dst_stride,
                     interp + r * row_bytes, row_bytes);
             }
         }
+        bump(d->t_interleave);
+        d->t_frames.fetch_add(1, std::memory_order_relaxed);
 
         vsapi->freeFrame(src);
         d->pool.give_back(std::move(resource));
@@ -913,6 +1190,7 @@ static void VS_CC Nnedi3Create(
     if (d->pscrn < 0 || d->pscrn > 4) {
         return set_error("pscrn must be between 0 and 4 (inclusive).");
     }
+    d->use_list = d->pscrn > 0;
 
     if (!d->dh) {
         for (int plane = 0; plane < fmt.numPlanes; ++plane) {
@@ -933,6 +1211,8 @@ static void VS_CC Nnedi3Create(
 
     int num_streams = vsh::int64ToIntS(vsapi->mapGetInt(in, "num_streams", 0, &error));
     if (error) {
+        // Per-stream efficiency is the target (not scaling): default stays
+        // low; pipelining across streams still helps throughput.
         num_streams = 2;
     }
     if (num_streams < 1 || num_streams > 32) {
@@ -1055,10 +1335,11 @@ static void VS_CC Nnedi3Create(
 
     VkDevice dev = d->device->device;
 
-    // Descriptor set layout: field / pad / dst / prescreener / weights / biases.
+    // Descriptor set layout: field / pad / interp / prescreener / weights /
+    // biases / staging-out / pixel list / indirect struct.
     {
-        VkDescriptorSetLayoutBinding bindings[6] {};
-        for (uint32_t i = 0; i < 6; ++i) {
+        VkDescriptorSetLayoutBinding bindings[9] {};
+        for (uint32_t i = 0; i < 9; ++i) {
             bindings[i] = {
                 i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                 VK_SHADER_STAGE_COMPUTE_BIT, nullptr
@@ -1068,7 +1349,7 @@ static void VS_CC Nnedi3Create(
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .bindingCount = 6,
+            .bindingCount = 9,
             .pBindings = bindings
         };
         checkVK(vkCreateDescriptorSetLayout(dev, &layout_info, nullptr, &d->set_layout));
@@ -1092,7 +1373,7 @@ static void VS_CC Nnedi3Create(
     }
     {
         VkDescriptorPoolSize pool_size {
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 * static_cast<uint32_t>(d->num_streams)
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9 * static_cast<uint32_t>(d->num_streams)
         };
         VkDescriptorPoolCreateInfo pool_info {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1123,14 +1404,26 @@ static void VS_CC Nnedi3Create(
     {
         const uint32_t * pad_code = nullptr;
         size_t pad_size = 0;
-        const uint32_t * main_code = nullptr;
-        size_t main_size = 0;
+        const uint32_t * pre_code = nullptr;
+        size_t pre_size = 0;
+        const uint32_t * pred_code = nullptr;
+        size_t pred_size = 0;
+        const uint32_t * cnt_code = nullptr;
+        size_t cnt_size = 0;
+        const uint32_t * asm_code = nullptr;
+        size_t asm_size = 0;
         if (d->elem_bytes == 2) {
             pad_code = nnedi3_16_pad_spv;   pad_size = nnedi3_16_pad_spv_size;
-            main_code = nnedi3_16_main_spv; main_size = nnedi3_16_main_spv_size;
+            pre_code = nnedi3_16_prescreen_spv; pre_size = nnedi3_16_prescreen_spv_size;
+            pred_code = nnedi3_16_predict_spv; pred_size = nnedi3_16_predict_spv_size;
+            cnt_code = nnedi3_16_count_spv; cnt_size = nnedi3_16_count_spv_size;
+            asm_code = nnedi3_16_assemble_spv; asm_size = nnedi3_16_assemble_spv_size;
         } else {
             pad_code = nnedi3_32_pad_spv;   pad_size = nnedi3_32_pad_spv_size;
-            main_code = nnedi3_32_main_spv; main_size = nnedi3_32_main_spv_size;
+            pre_code = nnedi3_32_prescreen_spv; pre_size = nnedi3_32_prescreen_spv_size;
+            pred_code = nnedi3_32_predict_spv; pred_size = nnedi3_32_predict_spv_size;
+            cnt_code = nnedi3_32_count_spv; cnt_size = nnedi3_32_count_spv_size;
+            asm_code = nnedi3_32_assemble_spv; asm_size = nnedi3_32_assemble_spv_size;
         }
         {
             const auto result = create_shader_module(*d->device, pad_code, pad_size);
@@ -1139,23 +1432,57 @@ static void VS_CC Nnedi3Create(
             }
             d->pad_module = std::get<VkShaderModule>(result);
         }
-        {
-            const auto result = create_shader_module(*d->device, main_code, main_size);
+        if (d->use_list) {
+            const auto result = create_shader_module(*d->device, pre_code, pre_size);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
-            d->main_module = std::get<VkShaderModule>(result);
+            d->pre_module = std::get<VkShaderModule>(result);
         }
+        if (d->use_list) {
+            const auto result = create_shader_module(*d->device, cnt_code, cnt_size);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            d->cnt_module = std::get<VkShaderModule>(result);
+        }
+        {
+            const auto result = create_shader_module(*d->device, pred_code, pred_size);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            d->pred_module = std::get<VkShaderModule>(result);
+        }
+        {
+            const auto result = create_shader_module(*d->device, asm_code, asm_size);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            d->asm_module = std::get<VkShaderModule>(result);
+        }
+    }
+
+    // The cooperative predictor needs one 32-lane subgroup per 4 pixels.
+    uint32_t pred_subgroup = 0;
+    if (d->device->subgroup_size_control &&
+        d->device->min_subgroup_size <= 32 && 32 <= d->device->max_subgroup_size) {
+        pred_subgroup = 32;
+    } else {
+        return set_error("device cannot run 32-lane subgroups "
+                         "(required by the predictor kernel).");
     }
 
     // Per-plane geometry and pipelines (deduplicated across identical planes).
     const uint32_t max_grid_x = d->device->limits.maxComputeWorkGroupCount[0];
     const uint32_t max_grid_y = d->device->limits.maxComputeWorkGroupCount[1];
     {
-        struct Key { int w, rows, stride; };
+        struct Key { int w, rows, stride, pscrn, xdim, ydim, nns, qual; };
         std::array<Key, 3> keys {};
         std::array<VkPipeline, 3> pad_pipes {};
-        std::array<VkPipeline, 3> main_pipes {};
+        std::array<VkPipeline, 3> pre_pipes {};
+        std::array<VkPipeline, 3> pred_pipes {};
+        std::array<VkPipeline, 3> cnt_pipes {};
+        std::array<VkPipeline, 3> asm_pipes {};
         int n_keys = 0;
         for (int plane = 0; plane < fmt.numPlanes; ++plane) {
             if (!d->process[plane]) {
@@ -1175,21 +1502,47 @@ static void VS_CC Nnedi3Create(
                 (static_cast<uint32_t>(cfg.width + MARGIN_H * 2) + 31) / 32, max_grid_x);
             cfg.pad_grid_y = std::min<uint32_t>(
                 (static_cast<uint32_t>(cfg.pad_h) + 7) / 8, max_grid_y);
-            cfg.main_grid_x = std::min<uint32_t>(
-                (static_cast<uint32_t>(cfg.width) * static_cast<uint32_t>(cfg.rows) + 63) / 64,
+            // prescreen: one thread per pixel group (P=1 old, P=4 new)
+            const uint32_t pps = d->pscrn == 1 ? 1 : 4;
+            cfg.pre_grid_x = std::min<uint32_t>(
+                (static_cast<uint32_t>(cfg.width) * static_cast<uint32_t>(cfg.rows) +
+                 pps * 128 - 1) / (pps * 128), max_grid_x);
+            // direct predict grid (both modes): full pixel coverage with
+            // 1024-thread workgroups (see PREDICT entry); count-bounded by
+            // the kernel's early return, always correct
+            cfg.pred_grid_x = std::min<uint32_t>(
+                (static_cast<uint32_t>(cfg.width) * static_cast<uint32_t>(cfg.rows) + 1023) / 1024,
+                max_grid_x);
+            // cooperative direct grid (pscrn==0): 4 subgroups x PXP pixels
+            // per 128-thread workgroup (PXP mirrors the shader)
+            {
+                const int host_ppl = (d->nns + 31) / 32;
+                const int host_fs = d->xdim * d->ydim;
+                const int host_pxp = (host_ppl <= 2 && host_fs <= 128) ? 8 : 4;
+                const uint32_t ppg = static_cast<uint32_t>(4 * host_pxp);
+                cfg.pred_grid_direct_x = std::min<uint32_t>(
+                    (static_cast<uint32_t>(cfg.width) * static_cast<uint32_t>(cfg.rows) + ppg - 1) / ppg,
+                    max_grid_x);
+            }
+            cfg.asm_grid_x = std::min<uint32_t>(
+                (static_cast<uint32_t>(cfg.width) * static_cast<uint32_t>(cfg.height) + 63) / 64,
                 max_grid_x);
 
             int ki = 0;
             for (; ki < n_keys; ++ki) {
                 if (keys[ki].w == cfg.width && keys[ki].rows == cfg.rows &&
-                    keys[ki].stride == cfg.pad_stride) {
+                    keys[ki].stride == cfg.pad_stride &&
+                    keys[ki].pscrn == d->pscrn && keys[ki].xdim == d->xdim &&
+                    keys[ki].ydim == d->ydim && keys[ki].nns == d->nns &&
+                    keys[ki].qual == d->qual) {
                     break;
                 }
             }
             if (ki == n_keys) {
                 const Nnedi3Spec spec {
                     cfg.width, cfg.rows, cfg.pad_stride, d->peak,
-                    d->pscrn, d->xdim, d->ydim, d->nns, d->qual
+                    d->pscrn, d->xdim, d->ydim, d->nns, d->qual,
+                    d->use_list ? 1 : 0
                 };
                 {
                     const auto result = create_pipeline(
@@ -1199,19 +1552,48 @@ static void VS_CC Nnedi3Create(
                     }
                     pad_pipes[n_keys] = std::get<VkPipeline>(result);
                 }
-                {
+                if (d->use_list) {
                     const auto result = create_pipeline(
-                        *d->device, spec, d->main_module, d->pipeline_layout);
+                        *d->device, spec, d->pre_module, d->pipeline_layout,
+                        pred_subgroup);
                     if (std::holds_alternative<std::string>(result)) {
                         return set_error(std::get<std::string>(result));
                     }
-                    main_pipes[n_keys] = std::get<VkPipeline>(result);
+                    pre_pipes[n_keys] = std::get<VkPipeline>(result);
                 }
-                keys[n_keys] = { cfg.width, cfg.rows, cfg.pad_stride };
+                if (d->use_list) {
+                    const auto result = create_pipeline(
+                        *d->device, spec, d->cnt_module, d->pipeline_layout);
+                    if (std::holds_alternative<std::string>(result)) {
+                        return set_error(std::get<std::string>(result));
+                    }
+                    cnt_pipes[n_keys] = std::get<VkPipeline>(result);
+                }
+                {
+                    const auto result = create_pipeline(
+                        *d->device, spec, d->pred_module, d->pipeline_layout,
+                        pred_subgroup);
+                    if (std::holds_alternative<std::string>(result)) {
+                        return set_error(std::get<std::string>(result));
+                    }
+                    pred_pipes[n_keys] = std::get<VkPipeline>(result);
+                }
+                {
+                    const auto result = create_pipeline(
+                        *d->device, spec, d->asm_module, d->pipeline_layout);
+                    if (std::holds_alternative<std::string>(result)) {
+                        return set_error(std::get<std::string>(result));
+                    }
+                    asm_pipes[n_keys] = std::get<VkPipeline>(result);
+                }
+                keys[n_keys] = { cfg.width, cfg.rows, cfg.pad_stride, d->pscrn, d->xdim, d->ydim, d->nns, d->qual };
                 ++n_keys;
             }
             cfg.pad_pipeline = pad_pipes[ki];
-            cfg.main_pipeline = main_pipes[ki];
+            cfg.pre_pipeline = pre_pipes[ki];
+            cfg.pred_pipeline = pred_pipes[ki];
+            cfg.cnt_pipeline = cnt_pipes[ki];
+            cfg.asm_pipeline = asm_pipes[ki];
         }
         bool any = false;
         for (int plane = 0; plane < fmt.numPlanes; ++plane) {
@@ -1223,43 +1605,48 @@ static void VS_CC Nnedi3Create(
     }
 
     // Buffer region offsets (raw bytes), each region 32-byte aligned. The
-    // staging upload/download areas and the device field/dst buffers share
-    // the same layout, so one DMA copy per direction moves every plane.
+    // upload staging holds CPU-pre-padded planes (zero-copy GPU reads); the
+    // download staging holds packed interp rows DMA'd from device-local dst.
     auto align32 = [](VkDeviceSize v) { return (v + 31) & ~VkDeviceSize(31); };
     {
-        VkDeviceSize up = 0, down = 0, field = 0, pad = 0, dst = 0;
+        VkDeviceSize up = 0, down = 0, dst = 0, list = 0;
         for (int plane = 0; plane < fmt.numPlanes; ++plane) {
             if (!d->process[plane]) {
                 continue;
             }
             auto & cfg = d->planes[plane];
-            const VkDeviceSize plane_bytes =
+            const VkDeviceSize field_bytes =
                 static_cast<VkDeviceSize>(cfg.width) * cfg.rows * d->elem_bytes;
             const VkDeviceSize pad_bytes =
                 static_cast<VkDeviceSize>(cfg.pad_stride) * cfg.pad_h * d->elem_bytes;
-            cfg.upload_offset = align32(up);
+            const VkDeviceSize list_bytes =
+                static_cast<VkDeviceSize>(cfg.width) * cfg.rows * sizeof(uint32_t);
+            cfg.up_offset = align32(up);
             cfg.download_offset = align32(down);
-            up = align32(cfg.upload_offset + plane_bytes);
-            down = align32(cfg.download_offset + plane_bytes);
-            cfg.field_elem = static_cast<int32_t>(align32(field) / d->elem_bytes);
-            cfg.pad_elem = static_cast<int32_t>(align32(pad) / d->elem_bytes);
+            cfg.list_offset = align32(list);
+            up = align32(cfg.up_offset + pad_bytes);
+            down = align32(cfg.download_offset + field_bytes);
+            list = align32(cfg.list_offset + list_bytes);
+            cfg.pad_elem = static_cast<int32_t>(cfg.up_offset / d->elem_bytes);
             cfg.dst_elem = static_cast<int32_t>(align32(dst) / d->elem_bytes);
-            field = align32(field) + plane_bytes;
-            pad = align32(pad) + pad_bytes;
-            dst = align32(dst) + plane_bytes;
+            cfg.list_elem = static_cast<int32_t>(cfg.list_offset / 4);
+            dst = align32(dst) + field_bytes;
         }
-        d->upload_total = up;
+        d->up_total = up;
         d->download_total = down;
-        d->field_total = field;
-        d->pad_total = pad;
         d->dst_total = dst;
+        d->list_total = list;
     }
 
+
+    // Download staging (GTT): packed interp rows + 16 B count-debug scratch.
     const VkDeviceSize staging_size =
-        std::max<VkDeviceSize>(d->upload_total + d->download_total, 8);
-    const VkDeviceSize field_size = std::max<VkDeviceSize>(d->field_total, 4);
-    const VkDeviceSize pad_size = std::max<VkDeviceSize>(d->pad_total, 4);
+        std::max<VkDeviceSize>(d->download_total + 16, 8);
+    // Upload staging (VRAM-mapped): CPU-pre-padded planes, GPU reads direct.
+    const VkDeviceSize up_size = std::max<VkDeviceSize>(d->up_total, 4);
     const VkDeviceSize dst_size = std::max<VkDeviceSize>(d->dst_total, 4);
+    const VkDeviceSize list_size = std::max<VkDeviceSize>(d->list_total, 4);
+    constexpr VkDeviceSize ind_size = 16;
 
     d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
     d->pool.reserve(d->num_streams);
@@ -1276,7 +1663,9 @@ static void VS_CC Nnedi3Create(
                 .pNext = nullptr,
                 .flags = 0,
                 .size = staging_size,
-                .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                // TRANSFER_DST: D2H readback target, host-mapped for the
+                // interleave copies (no GPU storage access anymore)
+                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
                 .queueFamilyIndexCount = 0,
                 .pQueueFamilyIndices = nullptr
@@ -1295,17 +1684,47 @@ static void VS_CC Nnedi3Create(
             resource.staging_mem = std::get<AllocatedMemory>(result).memory;
             resource.staging_type_index = std::get<AllocatedMemory>(result).type_index;
         }
-
+        // Upload staging (VRAM-mapped): the host pre-pads into it, the GPU
+        // reads the padded planes directly (zero-copy upload, STORAGE read).
+        {
+            VkBufferCreateInfo buffer_info {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .size = up_size,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr
+            };
+            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.up_staging));
+        }
+        {
+            // VRAM-mapped upload: HOST_VISIBLE|COHERENT without CACHED lands
+            // on the ReBAR type (write-combined, full-speed GPU reads); the
+            // CACHED variant lands on GTT (slow GPU reads of every window
+            // tap). NT stores make the CPU side fast on WC.
+            const auto result = allocate_memory(
+                *d->device, resource.up_staging,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            resource.up_mem = std::get<AllocatedMemory>(result).memory;
+            resource.up_type_index = std::get<AllocatedMemory>(result).type_index;
+        }
         auto make_device_buffer = [&](VkBuffer & buf, VkDeviceMemory & mem,
-                                      VkDeviceSize size, const char * what)
+                                      VkDeviceSize size, const char * what,
+                                      VkBufferUsageFlags extra_usage = 0)
             -> std::optional<std::string> {
             VkBufferCreateInfo buffer_info {
                 .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                 .pNext = nullptr,
                 .flags = 0,
                 .size = size,
-                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .usage = (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT) | extra_usage,
                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
                 .queueFamilyIndexCount = 0,
                 .pQueueFamilyIndices = nullptr
@@ -1323,15 +1742,16 @@ static void VS_CC Nnedi3Create(
         };
 
         if (const auto err = make_device_buffer(
-                resource.field_buf, resource.field_mem, field_size, "field")) {
-            return set_error(*err);
-        }
-        if (const auto err = make_device_buffer(
-                resource.pad_buf, resource.pad_mem, pad_size, "pad")) {
-            return set_error(*err);
-        }
-        if (const auto err = make_device_buffer(
                 resource.dst_buf, resource.dst_mem, dst_size, "dst")) {
+            return set_error(*err);
+        }
+        if (const auto err = make_device_buffer(
+                resource.list_buf, resource.list_mem, list_size, "list")) {
+            return set_error(*err);
+        }
+        if (const auto err = make_device_buffer(
+                resource.ind_buf, resource.ind_mem, ind_size, "ind",
+                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT)) {
             return set_error(*err);
         }
 
@@ -1366,6 +1786,19 @@ static void VS_CC Nnedi3Create(
         }
 
         {
+            // TEMPORARY per-stage timestamps (remove after tuning)
+            VkQueryPoolCreateInfo query_info {
+                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                .queryCount = 5,
+                .pipelineStatistics = 0
+            };
+            checkVK(vkCreateQueryPool(dev, &query_info, nullptr, &resource.query_pool));
+        }
+
+        {
             VkDescriptorSetAllocateInfo alloc_info {
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                 .pNext = nullptr,
@@ -1377,16 +1810,19 @@ static void VS_CC Nnedi3Create(
         }
 
         {
-            VkDescriptorBufferInfo infos[6] {
-                { resource.field_buf, 0, VK_WHOLE_SIZE },
-                { resource.pad_buf, 0, VK_WHOLE_SIZE },
+            VkDescriptorBufferInfo infos[9] {
+                { resource.up_staging, 0, VK_WHOLE_SIZE },
+                { resource.up_staging, 0, VK_WHOLE_SIZE },
                 { resource.dst_buf, 0, VK_WHOLE_SIZE },
                 { d->ps_buf, 0, VK_WHOLE_SIZE },
                 { d->pdw_buf, 0, VK_WHOLE_SIZE },
                 { d->pdb_buf, 0, VK_WHOLE_SIZE },
+                { resource.staging, 0, VK_WHOLE_SIZE },
+                { resource.list_buf, 0, VK_WHOLE_SIZE },
+                { resource.ind_buf, 0, VK_WHOLE_SIZE },
             };
-            VkWriteDescriptorSet writes[6] {};
-            for (uint32_t b = 0; b < 6; ++b) {
+            VkWriteDescriptorSet writes[9] {};
+            for (uint32_t b = 0; b < 9; ++b) {
                 writes[b] = {
                     .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                     .pNext = nullptr,
@@ -1400,11 +1836,13 @@ static void VS_CC Nnedi3Create(
                     .pTexelBufferView = nullptr
                 };
             }
-            vkUpdateDescriptorSets(dev, 6, writes, 0, nullptr);
+            vkUpdateDescriptorSets(dev, 9, writes, 0, nullptr);
         }
 
         checkVK(vkMapMemory(dev, resource.staging_mem, 0, staging_size, 0,
             reinterpret_cast<void **>(&resource.map)));
+        checkVK(vkMapMemory(dev, resource.up_mem, 0, up_size, 0,
+            reinterpret_cast<void **>(&resource.up_map)));
 
         resource.queue = d->device->queues[i % num_queues].queue;
         resource.queue_lock = d->device->queues[i % num_queues].lock.get();
