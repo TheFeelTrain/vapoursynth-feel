@@ -269,3 +269,8 @@ tmp/
 /install/
 /build/pack/
 .dsh-managed-access.json
+
+*.ffindex
+*.bsindex
+
+VP_VULKANINFO_*.json

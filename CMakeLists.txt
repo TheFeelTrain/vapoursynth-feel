@@ -222,10 +222,11 @@ if(VK_GLSLC)
                 VERBATIM)
         endforeach()
     endforeach()
-    # NNEDI3: prescreener + cooperative predictor + count + full-frame
-    # assembler per io variant. The predictor needs subgroup ops + the Vulkan
+    # NNEDI3: prescreener + cooperative predictor (+PXP=4 narrow variant for
+    # wide networks: NNS=64..256, FS>128) + count + full-frame assembler per
+    # io variant. The predictor needs subgroup ops + the Vulkan
     # memory model, so SPIR-V 1.3+ (vulkan1.3 target).
-    set(VK_NNEDI3_ENTRIES pad prescreen predict count assemble)
+    set(VK_NNEDI3_ENTRIES pad prescreen predict predict_n4 count assemble)
     set(VK_NNEDI3_BITS "16" "32")
     foreach(bits IN LISTS VK_NNEDI3_BITS)
         foreach(entry IN LISTS VK_NNEDI3_ENTRIES)
@@ -235,6 +236,8 @@ if(VK_GLSLC)
                 set(entry_def -DENTRY_PRESCREEN)
             elseif(entry STREQUAL predict)
                 set(entry_def -DENTRY_PREDICT)
+            elseif(entry STREQUAL predict_n4)
+                set(entry_def -DENTRY_PREDICT -DPXP=4)
             elseif(entry STREQUAL count)
                 set(entry_def -DENTRY_COUNT)
             else()
@@ -304,11 +307,13 @@ add_custom_command(
             "${VK_SPV_DIR}/nnedi3_16_pad.spv"
             "${VK_SPV_DIR}/nnedi3_16_prescreen.spv"
             "${VK_SPV_DIR}/nnedi3_16_predict.spv"
+            "${VK_SPV_DIR}/nnedi3_16_predict_n4.spv"
             "${VK_SPV_DIR}/nnedi3_16_count.spv"
             "${VK_SPV_DIR}/nnedi3_16_assemble.spv"
             "${VK_SPV_DIR}/nnedi3_32_pad.spv"
             "${VK_SPV_DIR}/nnedi3_32_prescreen.spv"
             "${VK_SPV_DIR}/nnedi3_32_predict.spv"
+            "${VK_SPV_DIR}/nnedi3_32_predict_n4.spv"
             "${VK_SPV_DIR}/nnedi3_32_count.spv"
             "${VK_SPV_DIR}/nnedi3_32_assemble.spv"
             "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"

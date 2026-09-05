@@ -77,14 +77,10 @@ layout(std430, binding = 6) writeonly buffer OutBuf { IO_TYPE outBuf[]; };
 // Rejected-pixel list (prescreen writes, predict reads) and the indirect
 // dispatch struct {groupsX, groupsY, groupsZ, count} (host fills {0,1,1,0},
 // prescreen bumps via subgroup-aggregated atomics, predict reads count and
-// launches indirectly off groupsX).
+// launches indirectly off groupsX). Multi-plane clips pack one struct per
+// plane; pc.d_base selects this dispatch's struct (uint index into indBuf).
 layout(std430, binding = 7) buffer ListBuf { uint listBuf[]; };
-layout(std430, binding = 8) buffer IndBuf {
-    uint indGroupsX;
-    uint indGroupsY;
-    uint indGroupsZ;
-    uint indCount;
-};
+layout(std430, binding = 8) buffer IndBuf { uint indBuf[]; };
 // Prescreener weights as vec4s: layer-0 transposed (vec k holds all four
 // neurons' weights for window element k), deeper layers at fixed indices.
 layout(std430, binding = 3) readonly restrict buffer PsWeights { vec4 psW[]; };
@@ -104,6 +100,7 @@ layout(push_constant) uniform PushConstants {
     int b_base;
     int c_base;
     int parity;
+    int d_base;
 } pc;
 
 float loadPad(int row, int col) {
@@ -277,11 +274,6 @@ void main() {
 
 layout(local_size_x = 128) in;
 
-// Workgroup compaction scratch: one in-subgroup total per subgroup slot
-// (slots sized for the smallest possible subgroup).
-shared uint sgCounts[4];
-
-
 void main() {
     const int P = (PSCRN == 1) ? 1 : 4; // pixels per thread
     const int xg = (WIDTH + P - 1) / P;
@@ -320,30 +312,22 @@ void main() {
         }
     }
 
-    // Hierarchical compaction: per-subgroup scans aggregate in shared
-    // memory, then ONE thread per workgroup bumps the count (a single
-    // atomicAdd per 128 threads instead of per subgroup) and prefixes the
-    // subgroup bases. The indirect groupsX is derived afterwards by a
-    // 1-thread kernel — no contended atomicMax anywhere.
+    // Compaction: one atomic per subgroup, in-subgroup offsets via an
+    // exclusive scan (the reference pattern — no shared memory, no
+    // subgroup-size assumption). The indirect groupsX is maintained here
+    // with atomicMax off the atomicAdd return value (reference pattern),
+    // so no count kernel is needed. indBuf words at pc.d_base:
+    // {groupsX, groupsY, groupsZ, count}; PPG = 4 subgroups x PXP pixels
+    // per predict workgroup (PXP rule mirrors ENTRY_PREDICT).
     const uint total = subgroupAdd(uint(cnt));
-    const uint myOff = subgroupExclusiveAdd(uint(cnt));
-    if (subgroupElect())
-        sgCounts[gl_SubgroupID] = total;
-    barrier();
-    if (gl_LocalInvocationID.x == 0u) {
-        const uint c0 = sgCounts[0], c1 = sgCounts[1];
-        const uint c2 = sgCounts[2], c3 = sgCounts[3];
-        const uint t = c0 + c1 + c2 + c3;
-        uint base = 0u;
-        if (t > 0u)
-            base = atomicAdd(indCount, t);
-        sgCounts[0] = base;
-        sgCounts[1] = base + c0;
-        sgCounts[2] = base + c0 + c1;
-        sgCounts[3] = base + c0 + c1 + c2;
+    uint base = 0u;
+    if (subgroupElect() && total > 0u) {
+        base = atomicAdd(indBuf[pc.d_base + 3], total);
+        const uint ppg = uint(4 * ((((NNS + 31) / 32) <= 2) && (FS <= 128) ? 8 : 4));
+        atomicMax(indBuf[pc.d_base], (base + total + ppg - 1u) / ppg);
     }
-    barrier();
-    const uint off = sgCounts[gl_SubgroupID] + myOff;
+    base = subgroupBroadcastFirst(base);
+    const uint off = base + subgroupExclusiveAdd(uint(cnt));
     for (int c = 0; c < cnt; c++)
         listBuf[pc.a_base + int(off) + c] = pixIdx[c];
 }
@@ -485,7 +469,7 @@ shared vec4 shTile[4 * 288];
 void main() {
     const uint lane = gl_SubgroupInvocationID;
     const uint warp = gl_SubgroupID;
-    const uint npix = (USE_LIST != 0) ? indCount : uint(WIDTH) * uint(ROWS);
+    const uint npix = (USE_LIST != 0) ? indBuf[pc.d_base + 3] : uint(WIDTH) * uint(ROWS);
     uint idxs[8];
     float mstd0[8], mstd1[8], mstd2[8], result[8];
 
@@ -509,7 +493,8 @@ layout(local_size_x = 32) in;
 void main() {
     if (gl_GlobalInvocationID.x == 0u) {
         const int pxp = ((((NNS + 31) / 32) <= 2) && (FS <= 128)) ? 8 : 4;
-        indGroupsX = (indCount + uint(4 * pxp) - 1u) / uint(4 * pxp);
+        const uint n = indBuf[pc.d_base + 3];
+        indBuf[pc.d_base] = (n + uint(4 * pxp) - 1u) / uint(4 * pxp);
     }
 }
 
