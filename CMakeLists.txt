@@ -223,10 +223,10 @@ if(VK_GLSLC)
         endforeach()
     endforeach()
     # NNEDI3: prescreener + cooperative predictor (+PXP=4 narrow variant for
-    # wide networks: NNS=64..256, FS>128) + count + full-frame assembler per
-    # io variant. The predictor needs subgroup ops + the Vulkan
-    # memory model, so SPIR-V 1.3+ (vulkan1.3 target).
-    set(VK_NNEDI3_ENTRIES pad prescreen predict predict_n4 count assemble)
+    # wide networks, +PXP=4 small-tile variant for FS<=64: 4KB LDS instead
+    # of 18KB) + count + full-frame assembler per io variant. The predictor
+    # needs subgroup ops + the Vulkan memory model, so SPIR-V 1.3+.
+    set(VK_NNEDI3_ENTRIES pad prescreen predict predict_n4 predict_n4s count assemble)
     set(VK_NNEDI3_BITS "16" "32")
     foreach(bits IN LISTS VK_NNEDI3_BITS)
         foreach(entry IN LISTS VK_NNEDI3_ENTRIES)
@@ -238,6 +238,8 @@ if(VK_GLSLC)
                 set(entry_def -DENTRY_PREDICT)
             elseif(entry STREQUAL predict_n4)
                 set(entry_def -DENTRY_PREDICT -DPXP=4)
+            elseif(entry STREQUAL predict_n4s)
+                set(entry_def -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=64u)
             elseif(entry STREQUAL count)
                 set(entry_def -DENTRY_COUNT)
             else()
@@ -308,12 +310,14 @@ add_custom_command(
             "${VK_SPV_DIR}/nnedi3_16_prescreen.spv"
             "${VK_SPV_DIR}/nnedi3_16_predict.spv"
             "${VK_SPV_DIR}/nnedi3_16_predict_n4.spv"
+            "${VK_SPV_DIR}/nnedi3_16_predict_n4s.spv"
             "${VK_SPV_DIR}/nnedi3_16_count.spv"
             "${VK_SPV_DIR}/nnedi3_16_assemble.spv"
             "${VK_SPV_DIR}/nnedi3_32_pad.spv"
             "${VK_SPV_DIR}/nnedi3_32_prescreen.spv"
             "${VK_SPV_DIR}/nnedi3_32_predict.spv"
             "${VK_SPV_DIR}/nnedi3_32_predict_n4.spv"
+            "${VK_SPV_DIR}/nnedi3_32_predict_n4s.spv"
             "${VK_SPV_DIR}/nnedi3_32_count.spv"
             "${VK_SPV_DIR}/nnedi3_32_assemble.spv"
             "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"

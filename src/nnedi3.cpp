@@ -303,18 +303,14 @@ struct Nnedi3Resource {
     VkBuffer ind_buf {};         // {groupsX,1,1,count} indirect struct (device-local)
     VkDeviceMemory ind_mem {};
     VkCommandPool pool {};
-    VkCommandBuffer cmd {};
-    VkCommandPool copy_pool {};  // transfer queue pool (null without xfer queue)
-    VkCommandBuffer copy_cmd {}; // D2H copies (null without xfer queue)
-    VkSemaphore timeline {};     // compute->copy chain (null without xfer queue)
-    uint64_t timeline_value {};
+    VkCommandBuffer cmd {};      // parity-0 pre-recorded CB
+    VkCommandBuffer cmd1 {};     // parity-1 pre-recorded CB (freed manually;
+                                 // destroy_common frees cmd+pool)
     VkFence fence {};
     VkQueryPool query_pool {};   // TEMPORARY per-stage timestamps (remove after tuning)
     VkDescriptorSet desc_set {};
     VkQueue queue {};
     std::mutex * queue_lock {};
-    VkQueue xfer_queue {};       // null without xfer queue (copy runs inline)
-    std::mutex * xfer_lock {};
     uint8_t * map {};
     uint8_t * up_map {};
     uint32_t staging_type_index {};
@@ -343,6 +339,7 @@ struct Nnedi3Data {
     VkShaderModule pre_module {};
     VkShaderModule pred_module {};
     VkShaderModule pred_n4_module {};
+    VkShaderModule pred_n4s_module {};
     VkShaderModule cnt_module {};
     VkShaderModule asm_module {};
     VkBuffer ps_buf {};
@@ -373,10 +370,9 @@ struct Nnedi3Data {
     std::atomic<uint64_t> t_interp {};
     std::atomic<uint64_t> t_frames {};
     // TEMPORARY GPU timestamps (VSFEEL_NNEDI3_TSTAMP): nanoseconds per stage.
-    std::atomic<uint64_t> t_ts_h2dpad {};
     std::atomic<uint64_t> t_ts_pre {};
     std::atomic<uint64_t> t_ts_pred {};
-    std::atomic<uint64_t> t_ts_asm {};
+    std::atomic<uint64_t> t_ts_copy {};
     std::atomic<uint64_t> t_ts_n {};
     ~Nnedi3Data() {
         if (trace_on("VSFEEL_NNEDI3_BENCH") && t_frames.load() > 0) {
@@ -392,9 +388,9 @@ struct Nnedi3Data {
         if (trace_on("VSFEEL_NNEDI3_TSTAMP") && t_ts_n.load() > 0) {
             const double n = static_cast<double>(t_ts_n.load());
             fprintf(stderr,
-                "[nnedi3-ts] GPU us: h2dpad=%7.1f pre=%7.1f pred=%7.1f asm=%7.1f (frames=%.0f)\n",
-                t_ts_h2dpad.load() / 1000.0 / n, t_ts_pre.load() / 1000.0 / n,
-                t_ts_pred.load() / 1000.0 / n, t_ts_asm.load() / 1000.0 / n, n);
+                "[nnedi3-ts] GPU us: pre=%7.1f pred=%7.1f copy=%7.1f (frames=%.0f)\n",
+                t_ts_pre.load() / 1000.0 / n, t_ts_pred.load() / 1000.0 / n,
+                t_ts_copy.load() / 1000.0 / n, n);
         }
         if (!device) {
             return;
@@ -409,16 +405,10 @@ struct Nnedi3Data {
             if (resource.up_map) {
                 vkUnmapMemory(dev, resource.up_mem);
             }
+            if (resource.cmd1) {
+                vkFreeCommandBuffers(dev, resource.pool, 1, &resource.cmd1);
+            }
             destroy_common(dev, resource);
-            if (resource.copy_cmd) {
-                vkFreeCommandBuffers(dev, resource.copy_pool, 1, &resource.copy_cmd);
-            }
-            if (resource.copy_pool) {
-                vkDestroyCommandPool(dev, resource.copy_pool, nullptr);
-            }
-            if (resource.timeline) {
-                vkDestroySemaphore(dev, resource.timeline, nullptr);
-            }
             if (resource.query_pool) {
                 vkDestroyQueryPool(dev, resource.query_pool, nullptr);
             }
@@ -497,6 +487,9 @@ struct Nnedi3Data {
         if (pred_n4_module) {
             vkDestroyShaderModule(dev, pred_n4_module, nullptr);
         }
+        if (pred_n4s_module) {
+            vkDestroyShaderModule(dev, pred_n4s_module, nullptr);
+        }
         if (cnt_module) {
             vkDestroyShaderModule(dev, cnt_module, nullptr);
         }
@@ -561,7 +554,12 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     VkPipelineShaderStageCreateInfo stage_info {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
         .pNext = required_subgroup_size ? &subgroup_size_info : nullptr,
-        .flags = 0,
+        // Full subgroups like the reference (REQUIRE_FULL_SUBGROUPS_BIT):
+        // both kernels keep subgroup-uniform control flow (early exits are
+        // per-subgroup uniform), so the scheduler can pack waves tightly.
+        .flags = required_subgroup_size
+            ? VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT
+            : VkPipelineShaderStageCreateFlags(0),
         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
         .module = module,
         .pName = "main",
@@ -587,14 +585,13 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     return pipeline;
 }
 
-// Records the per-frame dispatch sequence: per plane (H2D of the packed
-// field rows, pad kernel, indirect-struct reset, prescreen + list
-// compaction unless pscrn==0, predictor). The D2H readback of the packed
-// interp rows goes on the transfer queue (record_copy_buffer) so it
-// overlaps the next frame's compute; timeline semaphores chain
-// compute -> copy per resource. The CPU packs field rows into GTT staging
-// (cheap memcpy), the GPU DMAs them to device-local and pads there — all
-// window reads run at full VRAM speed. All plane regions are disjoint,
+// Records the per-frame dispatch sequence, pre-recorded once per parity at
+// create time (no per-frame reset/record): per plane (indirect-struct reset,
+// prescreen + list compaction unless pscrn==0, predictor with fused
+// clamp-mirror window reads straight from the ReBAR upload, D2H of the
+// packed interp rows inline on the compute queue). The CPU packs field rows
+// into ReBAR staging (tight, no margins); the host barrier is unnecessary
+// (submit orders pack before device work). All plane regions are disjoint,
 // so dispatches of different planes may overlap.
 static std::optional<std::string> record_command_buffer(
     const Nnedi3Data & d, Nnedi3Resource & resource, int parity) {
@@ -612,17 +609,12 @@ static std::optional<std::string> record_command_buffer(
         return "vkBeginCommandBuffer failed";
     }
     // TEMPORARY per-stage timestamps, plane 0 only (remove after tuning):
-    // 0=top, 1=H2D+pad done, 2=prescreen done, 3=predict done,
-    // 4=assemble done. Query pool has 5 slots (count+1).
-    vkCmdResetQueryPool(resource.cmd, resource.query_pool, 0, 5);
+    // 0=top, 1=prescreen done, 2=predict done, 3=D2H done. Query pool has
+    // 4 slots (count+1). One timestamp per stage boundary only — each
+    // timestamp write costs a pipeline bubble, so no marker timestamps.
+    vkCmdResetQueryPool(resource.cmd, resource.query_pool, 0, 4);
     vkCmdWriteTimestamp(resource.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         resource.query_pool, 0);
-
-    // Temporary per-kernel timing (VSFEEL_NNEDI3_UPTO=n ends the CB after
-    // stage n: 1=prescreen, 2=count, 3=predict, 4=readback copy).
-    const char * upto_env = getenv("VSFEEL_NNEDI3_UPTO");
-    const int upto = upto_env ? atoi(upto_env) : 9;
-    bool truncated = false;
 
 
     for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
@@ -631,52 +623,13 @@ static std::optional<std::string> record_command_buffer(
         }
         const auto & cfg = d.planes[plane];
 
-        // The pad kernel reads the packed field rows straight out of the
-        // ReBAR-mapped upload staging (no H2D copy). The CPU's pack writes
-        // need a host-write -> shader-read visibility edge before the first
-        // pad dispatch; one barrier covers all planes.
-        {
-            VkMemoryBarrier host_barrier {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
-            };
-            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_HOST_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &host_barrier,
-                0, nullptr, 0, nullptr);
-        }
-        // Pad: expand packed field rows to padded planes
-        // (ReBAR read + device-local write; A=upload field, B=pad target;
-        // parity selects the kept field).
-        // TEMPORARY split probe (VSFEEL_NNEDI3_NOHPAD): skip the pad
-        // dispatch to attribute pad cost. Output is garbage (timing only).
-        const bool no_hpad = getenv("VSFEEL_NNEDI3_NOHPAD") != nullptr;
-        // Pad: expand packed field rows to padded planes on the GPU
-        // (device-local read + write; ~30us, like the reference).
-        if (!no_hpad) {
-            const int32_t push[5] { cfg.up_elem, cfg.pad_elem, 0, parity, 0 };
-            vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.pad_pipeline);
-            vkCmdBindDescriptorSets(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
-            vkCmdPushConstants(resource.cmd, d.pipeline_layout,
-                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
-            vkCmdDispatch(resource.cmd, cfg.pad_grid_x, cfg.pad_grid_y, 1);
-            // TEMPORARY timestamps, plane 0 only
-            if (plane == 0) {
-                vkCmdWriteTimestamp(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    resource.query_pool, 1);
-            }
-            VkMemoryBarrier pad_barrier {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
-            };
-            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &pad_barrier,
-                0, nullptr, 0, nullptr);
-        }
+        // No host barrier: vkQueueSubmit already orders the CPU pack writes
+        // (before submit, +_mm_sfence for the NT stores) before all device
+        // work in the batch — same as the reference, which records no host
+        // barrier for its ReBAR upload. (A host barrier here was added
+        // during zero-copy debugging and kept defensively; A/B showed it
+        // costs a pipeline bubble for zero correctness value — 46/46 +
+        // fresh-instance determinism green without it. Do NOT re-add.)
 
         if (d.use_list) {
             // reset this plane's indirect struct to {0,1,1,0}: groupsX=0,
@@ -700,8 +653,9 @@ static std::optional<std::string> record_command_buffer(
         }
 
         if (d.use_list) {
-            // prescreen: cubic stores + rejected-pixel compaction
-            const int32_t push[5] { cfg.list_elem, cfg.pad_elem, cfg.dst_elem, 0,
+            // prescreen: cubic stores + rejected-pixel compaction. B=upload
+            // field base (fused window reads), word3=parity for the clamp.
+            const int32_t push[5] { cfg.list_elem, cfg.up_elem, cfg.dst_elem, parity,
                 static_cast<int32_t>(cfg.ind_offset / 4) };
             vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.pre_pipeline);
             vkCmdBindDescriptorSets(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -709,10 +663,6 @@ static std::optional<std::string> record_command_buffer(
             vkCmdPushConstants(resource.cmd, d.pipeline_layout,
                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
             vkCmdDispatch(resource.cmd, cfg.pre_grid_x, 1, 1);
-            if (upto <= 1) {
-                truncated = true;
-                break;
-            }
 
             // Prescreen's atomicAdd/atomicMax writes to this plane's indBuf
             // struct (pixel count + indirect groupsX) must be visible to the
@@ -734,108 +684,84 @@ static std::optional<std::string> record_command_buffer(
                     VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
                     0, 1, &pre_pred_barrier, 0, nullptr, 0, nullptr);
             }
-            if (upto <= 2) {
-                truncated = true;
-                break;
-            }
         }
 
-        // TEMPORARY timestamps, plane 0 only: 1=H2D+pad done,
-        // 2=prescreen done, 3=predict done, 4=assemble done (query pool
-        // sized count+1 = 5).
+        // TEMPORARY timestamp slot 1: prescreen done (plane 0 only).
         if (plane == 0) {
             vkCmdWriteTimestamp(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                resource.query_pool, 2);
+                resource.query_pool, 1);
         }
         // predictor: indirect launch off the prescreen-maintained count
         // (list mode) or fixed direct grid (pscrn=0, full coverage); the
-        // shader strides its loop off the dispatched width, always correct
+        // shader strides its loop off the dispatched width, always correct.
+        // (Over-launch probe VSFEEL_NNEDI3_PREDIRECT=1 measured 2026-09-05:
+        // full-grid direct was SLOWER — pred 268 vs 223µs GPU, 1892 vs 2055
+        // fps best-of-3 at 2 streams. The exiting subgroups still cost
+        // window-gather + occupancy; keep the exact indirect grid.)
         {
-            const int32_t push[5] { cfg.list_elem, cfg.pad_elem, cfg.dst_elem, 0,
+            const int32_t push[5] { cfg.list_elem, cfg.up_elem, cfg.dst_elem, parity,
                 static_cast<int32_t>(cfg.ind_offset / 4) };
             vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.pred_pipeline);
             vkCmdBindDescriptorSets(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                 d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
             vkCmdPushConstants(resource.cmd, d.pipeline_layout,
                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
-            // TEMPORARY over-launch probe (VSFEEL_NNEDI3_PREDIRECT=1):
-            // full-grid direct dispatch even in list mode (out-of-range
-            // subgroups exit via firstPix>=npix). Tests whether the exact
-            // indirect grid starves the GPU on sparse frames.
-            if (d.use_list && !getenv("VSFEEL_NNEDI3_PREDIRECT")) {
+            if (d.use_list) {
                 vkCmdDispatchIndirect(resource.cmd, resource.ind_buf, cfg.ind_offset);
             } else {
                 vkCmdDispatch(resource.cmd, cfg.pred_grid_direct_x, 1, 1);
             }
         }
-        // TEMPORARY timestamps, plane 0 only
+        // TEMPORARY timestamp slot 2: predict done (plane 0 only).
         if (plane == 0) {
             vkCmdWriteTimestamp(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                resource.query_pool, 3);
+                resource.query_pool, 2);
         }
-        // Predictor writes to dst must be visible to the assemble read:
-        // back-to-back dispatches do NOT order memory automatically.
+        // Predictor writes to dst must be visible to the D2H copy:
+        // back-to-back dispatch->copy does NOT order memory automatically.
+        // (Assemble deleted 2026-09-06: it re-read kept lines from ReBAR,
+        // rewrote them to asm, and D2H'd 4MB of which the host only used
+        // the 2MB interp half. D2H the packed interp dst directly — halves
+        // PCIe download, deletes the asm kernel + barrier + asm traffic.)
         {
-            VkMemoryBarrier pred_asm_barrier {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
-            };
-            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &pred_asm_barrier,
-                0, nullptr, 0, nullptr);
-        }
-        // Assemble: interleave kept field rows + packed interp rows into
-        // the device-local full frame (one coalesced full-frame write;
-        // A=upload field, B=dst interp source, C=asm target). In dh mode
-        // the output is 2x the input height with the field as every kept
-        // line, same as non-dh (rows == input height, height == 2*rows).
-        {
-            const int32_t push[5] { cfg.up_elem, cfg.dst_elem, cfg.asm_elem, parity, 0 };
-            vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.asm_pipeline);
-            vkCmdBindDescriptorSets(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
-            vkCmdPushConstants(resource.cmd, d.pipeline_layout,
-                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
-            vkCmdDispatch(resource.cmd, cfg.asm_grid_x, 1, 1);
-            VkMemoryBarrier asm_barrier {
+            VkMemoryBarrier pred_copy_barrier {
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .pNext = nullptr,
                 .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT
             };
             vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &asm_barrier,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &pred_copy_barrier,
                 0, nullptr, 0, nullptr);
         }
-        // Download: DMA the assembled full frame (device-local asm) to the
+        // Download: DMA the packed interp rows (device-local dst) to the
         // staging download area. One region per plane; regions are disjoint.
-        // When a transfer queue is available the copies live in the copy CB
-        // (record_copy_buffer, overlapping the next frame's compute) and
-        // this block only keeps the timestamp; otherwise the copy runs here.
-        if (!resource.xfer_queue) {
+        // Always inline on the compute queue (the same-family "transfer
+        // queue" measured SLOWER at every stream count — extra submit +
+        // timeline + cross-queue sync costs more than the 2MB overlap buys;
+        // NOXFER A/B 2026-09-06: +2-3% at 2 and 4 streams).
+        {
+            const VkDeviceSize field_bytes = static_cast<VkDeviceSize>(cfg.width) *
+                static_cast<VkDeviceSize>(cfg.rows) * static_cast<VkDeviceSize>(d.elem_bytes);
+            const VkBufferCopy region {
+                static_cast<VkDeviceSize>(cfg.dst_elem) * static_cast<VkDeviceSize>(d.elem_bytes),
+                cfg.download_offset,
+                field_bytes
+            };
+            vkCmdCopyBuffer(resource.cmd, resource.dst_buf, resource.staging, 1, &region);
             VkMemoryBarrier copy_barrier {
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_HOST_READ_BIT
             };
-            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &copy_barrier, 0, nullptr, 0, nullptr);
-            const VkDeviceSize frame_bytes = static_cast<VkDeviceSize>(cfg.width) *
-                static_cast<VkDeviceSize>(cfg.height) * static_cast<VkDeviceSize>(d.elem_bytes);
-            const VkBufferCopy region {
-                static_cast<VkDeviceSize>(cfg.asm_elem) * static_cast<VkDeviceSize>(d.elem_bytes),
-                cfg.download_offset,
-                frame_bytes
-            };
-            vkCmdCopyBuffer(resource.cmd, resource.asm_buf, resource.staging, 1, &region);
+            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &copy_barrier, 0, nullptr, 0, nullptr);
         }
-        // TEMPORARY timestamps, plane 0 only
+        // TEMPORARY timestamp slot 3: D2H done (plane 0 only).
         if (plane == 0) {
-            vkCmdWriteTimestamp(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                resource.query_pool, 4);
+            vkCmdWriteTimestamp(resource.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                resource.query_pool, 3);
         }
     }
 
@@ -843,54 +769,6 @@ static std::optional<std::string> record_command_buffer(
         return "vkEndCommandBuffer failed";
     }
 
-    (void)truncated;
-    return std::nullopt;
-}
-
-// Records the transfer-queue copy CB: per-plane D2H of the assembled full
-// frames (device-local asm -> staging download area). Runs on the transfer
-// queue behind the compute CB's timeline signal, so the copies overlap the
-// next frame's compute. The timeline wait carries the compute writes'
-// visibility (no barrier needed before the copies); the trailing barrier
-// makes the copies visible to the host read.
-static std::optional<std::string> record_copy_buffer(
-    const Nnedi3Data & d, Nnedi3Resource & resource) {
-
-    VkCommandBufferBeginInfo begin_info {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .pInheritanceInfo = nullptr
-    };
-
-    if (vkBeginCommandBuffer(resource.copy_cmd, &begin_info) != VK_SUCCESS) {
-        return "vkBeginCommandBuffer (copy) failed";
-    }
-    for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
-        if (!d.process[plane]) {
-            continue;
-        }
-        const auto & cfg = d.planes[plane];
-        const VkDeviceSize frame_bytes = static_cast<VkDeviceSize>(cfg.width) *
-            static_cast<VkDeviceSize>(cfg.height) * static_cast<VkDeviceSize>(d.elem_bytes);
-        const VkBufferCopy region {
-            static_cast<VkDeviceSize>(cfg.asm_elem) * static_cast<VkDeviceSize>(d.elem_bytes),
-            cfg.download_offset,
-            frame_bytes
-        };
-        vkCmdCopyBuffer(resource.copy_cmd, resource.asm_buf, resource.staging, 1, &region);
-    }
-    VkMemoryBarrier copy_barrier {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_HOST_READ_BIT
-    };
-    vkCmdPipelineBarrier(resource.copy_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &copy_barrier, 0, nullptr, 0, nullptr);
-    if (vkEndCommandBuffer(resource.copy_cmd) != VK_SUCCESS) {
-        return "vkEndCommandBuffer (copy) failed";
-    }
     return std::nullopt;
 }
 
@@ -1033,35 +911,47 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
 
 
         // Pack the field rows into the ReBAR upload staging (tightly
-        // packed, no margins — the GPU pad kernel expands them in place
-        // and assemble reads the kept lines back out of it, so NO host
-        // copy runs after the fence: the full frame arrives assembled and
-        // the host does one straight copy to dst). One row-copy per field
-        // row; NT stores (copy_stream_out + sfence below).
+        // packed, no margins — the GPU pad kernel expands them in place).
+        // Non-dh reads the kept rows back out of dst (just memcpy'd
+        // pre-acquire above, cache-hot) instead of re-reading src: same
+        // stride-2 pattern, but the 2MB source pass is served from L3
+        // instead of DRAM. Dh keeps the src path (pack is contiguous there,
+        // dst would be strided). NT stores + sfence.
         {
             for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
                 if (!d->process[plane]) {
                     continue;
                 }
                 const auto & cfg = d->planes[plane];
-                const uint8_t * srcp = vsapi->getReadPtr(src, plane);
-                const ptrdiff_t src_stride = vsapi->getStride(src, plane);
-                const uint8_t * fieldp = srcp + (d->dh ? 0 : parity * src_stride);
-                const ptrdiff_t field_stride = src_stride * (d->dh ? 1 : 2);
                 uint8_t * up = resource.up_map + cfg.up_offset;
                 const size_t row_bytes = static_cast<size_t>(cfg.width) * bps;
-                for (int r = 0; r < cfg.rows; ++r) {
-                    copy_stream_out(up + static_cast<size_t>(r) * row_bytes,
-                        fieldp + static_cast<ptrdiff_t>(r) * field_stride,
-                        row_bytes);
+                if (!d->dh) {
+                    const uint8_t * dstp = vsapi->getReadPtr(dst, plane);
+                    const ptrdiff_t dst_stride = vsapi->getStride(dst, plane);
+                    const uint8_t * fieldp = dstp + parity * dst_stride;
+                    const ptrdiff_t field_stride = dst_stride * 2;
+                    for (int r = 0; r < cfg.rows; ++r) {
+                        copy_stream_out(up + static_cast<size_t>(r) * row_bytes,
+                            fieldp + static_cast<ptrdiff_t>(r) * field_stride,
+                            row_bytes);
+                    }
+                } else {
+                    const uint8_t * srcp = vsapi->getReadPtr(src, plane);
+                    const ptrdiff_t src_stride = vsapi->getStride(src, plane);
+                    uint8_t * up_dh = up;
+                    for (int r = 0; r < cfg.rows; ++r) {
+                        copy_stream_out(up_dh + static_cast<size_t>(r) * row_bytes,
+                            srcp + static_cast<ptrdiff_t>(r) * src_stride,
+                            row_bytes);
+                    }
                 }
             }
+            bump(d->t_pack);
+            // Order the non-temporal pack stores before the submit: an SFENCE
+            // drains the CPU store buffer so no NT write is still in flight
+            // when the GPU reads the upload staging.
+            _mm_sfence();
         }
-        bump(d->t_pack);
-        // Order the non-temporal pack stores before the submit: an SFENCE
-        // drains the CPU store buffer so no NT write is still in flight
-        // when the GPU reads the upload staging.
-        _mm_sfence();
         const bool up_coherent =
             !!(d->device->mem_props.memoryTypes[resource.up_type_index].propertyFlags &
                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -1075,67 +965,35 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
             };
             checkVK(vkFlushMappedMemoryRanges(dev, 1, &flush_range));
         }
-        // Record after the pack lands (the CB's host barrier + pad
-        // dispatch consume it; the barrier makes it visible device-side).
-        checkVK(vkResetCommandPool(dev, resource.pool, 0));
-        if (resource.copy_pool) {
-            checkVK(vkResetCommandPool(dev, resource.copy_pool, 0));
-        }
-        if (const auto err = record_command_buffer(*d, resource, parity)) {
-            return set_error(*err);
-        }
-        if (resource.copy_cmd) {
-            if (const auto err = record_copy_buffer(*d, resource)) {
-                return set_error(*err);
-            }
-        }
-        bump(d->t_record);
-
-        if (resource.xfer_queue) {
-            // Split submit: compute signals the timeline, the copy waits on
-            // it device-side (overlapping the next frame's compute) and the
-            // fence rides the copy (the host needs the download, not the
-            // compute, to be done).
-            const uint64_t compute_done = ++resource.timeline_value;
-            checkVK(submit_timeline(dev, resource.queue, resource.queue_lock,
-                resource.cmd, {}, {}, {}, resource.timeline, compute_done,
-                VK_NULL_HANDLE));
-            const std::vector<VkSemaphore> waits { resource.timeline };
-            const std::vector<uint64_t> values { compute_done };
-            const std::vector<VkPipelineStageFlags> stages {
-                VK_PIPELINE_STAGE_TRANSFER_BIT
-            };
-            checkVK(submit_timeline(dev, resource.xfer_queue, resource.xfer_lock,
-                resource.copy_cmd, waits, values, stages,
-                VK_NULL_HANDLE, 0, resource.fence));
-        } else {
-            checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
-                resource.cmd, resource.fence));
-        }
+        // Submit the pre-recorded CB for this parity (recorded once at
+        // create time — no per-frame reset/record). The CB's host barrier
+        // orders the pack writes above before the prescreen/predict reads.
+        // Single inline submit on the compute queue (fence waits compute +
+        // D2H). No transfer queue, no timeline, no per-frame allocs.
+        VkCommandBuffer cb = parity ? resource.cmd1 : resource.cmd;
+        checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
+            cb, resource.fence));
         bump(d->t_gpu);
 
         checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
         bump(d->t_wait);
         // TEMPORARY GPU timestamps (remove after tuning)
         if (trace_on("VSFEEL_NNEDI3_TSTAMP")) {
-            uint64_t ts[5] = {};
-            if (vkGetQueryPoolResults(dev, resource.query_pool, 0, 5,
+            uint64_t ts[4] = {};
+            if (vkGetQueryPoolResults(dev, resource.query_pool, 0, 4,
                     sizeof(ts), ts, sizeof(uint64_t),
                     VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS &&
-                ts[4] >= ts[0]) {
+                ts[3] >= ts[0]) {
                 const double period =
                     static_cast<double>(d->device->limits.timestampPeriod);
-                d->t_ts_h2dpad.fetch_add(
+                d->t_ts_pre.fetch_add(
                     static_cast<uint64_t>((ts[1] - ts[0]) * period),
                     std::memory_order_relaxed);
-                d->t_ts_pre.fetch_add(
+                d->t_ts_pred.fetch_add(
                     static_cast<uint64_t>((ts[2] - ts[1]) * period),
                     std::memory_order_relaxed);
-                d->t_ts_pred.fetch_add(
+                d->t_ts_copy.fetch_add(
                     static_cast<uint64_t>((ts[3] - ts[2]) * period),
-                    std::memory_order_relaxed);
-                d->t_ts_asm.fetch_add(
-                    static_cast<uint64_t>((ts[4] - ts[3]) * period),
                     std::memory_order_relaxed);
                 d->t_ts_n.fetch_add(1, std::memory_order_relaxed);
             }
@@ -1217,11 +1075,9 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
                 continue;
             }
             const size_t row_bytes = static_cast<size_t>(cfg.width) * bps;
-            // Staging now holds the assembled FULL frame (kept + interp);
-            // copy the INTERP half out of it into the dst gaps the
-            // pre-acquire kept pass left. NT stores (write-once dst,
-            // WC-friendly); the per-row call overhead is noise next to
-            // the 2MB moved.
+            // Staging holds the packed INTERP rows (tight, rows per plane);
+            // scatter them into the dst gaps the pre-acquire kept pass left.
+            // NT stores (write-once dst, WC-friendly).
             const uint8_t * frame = frame_base + cfg.download_offset;
             if (skip_il) {
                 bump(d->t_interp);
@@ -1229,7 +1085,7 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
                 const int fp = 1 - parity;
                 for (int r = 0; r < cfg.rows; ++r) {
                     copy_stream_out(dstp + (fp + 2 * r) * dst_stride,
-                        frame + static_cast<size_t>((fp + 2 * r)) * row_bytes,
+                        frame + static_cast<size_t>(r) * row_bytes,
                         row_bytes);
                 }
                 bump(d->t_interp);
@@ -1541,9 +1397,10 @@ static void VS_CC Nnedi3Create(
 
     int num_streams = vsh::int64ToIntS(vsapi->mapGetInt(in, "num_streams", 0, &error));
     if (error) {
-        // Per-stream efficiency is the target (not scaling): default stays
-        // low; pipelining across streams still helps throughput.
-        num_streams = 2;
+        // Throughput knee is at 4-6 streams (measured 2026-09-06: 2s 2320,
+        // 4s 2640, 6s 2765, 8s 2814 vs ref plateau ~2540 from 4s; per-stream
+        // ~18MB VRAM, so 4 streams ≈ 72MB). Default 4 wins out-of-box.
+        num_streams = 4;
     }
     if (num_streams < 1 || num_streams > 32) {
         return set_error("num_streams must be 1..32.");
@@ -1740,6 +1597,8 @@ static void VS_CC Nnedi3Create(
         size_t pred_size = 0;
         const uint32_t * pred_n4_code = nullptr;
         size_t pred_n4_size = 0;
+        const uint32_t * pred_n4s_code = nullptr;
+        size_t pred_n4s_size = 0;
         const uint32_t * cnt_code = nullptr;
         size_t cnt_size = 0;
         const uint32_t * asm_code = nullptr;
@@ -1749,6 +1608,7 @@ static void VS_CC Nnedi3Create(
             pre_code = nnedi3_16_prescreen_spv; pre_size = nnedi3_16_prescreen_spv_size;
             pred_code = nnedi3_16_predict_spv; pred_size = nnedi3_16_predict_spv_size;
             pred_n4_code = nnedi3_16_predict_n4_spv; pred_n4_size = nnedi3_16_predict_n4_spv_size;
+            pred_n4s_code = nnedi3_16_predict_n4s_spv; pred_n4s_size = nnedi3_16_predict_n4s_spv_size;
             cnt_code = nnedi3_16_count_spv; cnt_size = nnedi3_16_count_spv_size;
             asm_code = nnedi3_16_assemble_spv; asm_size = nnedi3_16_assemble_spv_size;
         } else {
@@ -1756,6 +1616,7 @@ static void VS_CC Nnedi3Create(
             pre_code = nnedi3_32_prescreen_spv; pre_size = nnedi3_32_prescreen_spv_size;
             pred_code = nnedi3_32_predict_spv; pred_size = nnedi3_32_predict_spv_size;
             pred_n4_code = nnedi3_32_predict_n4_spv; pred_n4_size = nnedi3_32_predict_n4_spv_size;
+            pred_n4s_code = nnedi3_32_predict_n4s_spv; pred_n4s_size = nnedi3_32_predict_n4s_spv_size;
             cnt_code = nnedi3_32_count_spv; cnt_size = nnedi3_32_count_spv_size;
             asm_code = nnedi3_32_assemble_spv; asm_size = nnedi3_32_assemble_spv_size;
         }
@@ -1793,6 +1654,13 @@ static void VS_CC Nnedi3Create(
                 return set_error(std::get<std::string>(result));
             }
             d->pred_n4_module = std::get<VkShaderModule>(result);
+        }
+        {
+            const auto result = create_shader_module(*d->device, pred_n4s_code, pred_n4s_size);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            d->pred_n4s_module = std::get<VkShaderModule>(result);
         }
         {
             const auto result = create_shader_module(*d->device, asm_code, asm_size);
@@ -1921,9 +1789,16 @@ static void VS_CC Nnedi3Create(
                     cnt_pipes[n_keys] = std::get<VkPipeline>(result);
                 }
                 {
-                    // PXP=8 module for narrow networks, PXP=4 for wide ones.
-                    VkShaderModule mod = use_pxp8(d->nns, d->xdim * d->ydim)
-                        ? d->pred_module : d->pred_n4_module;
+                    // PXP=8 for narrow networks; PXP=4 wide networks use the
+                    // small-tile module when FS<=64 (4KB LDS vs 18KB),
+                    // full-tile otherwise.
+                    const int fs = d->xdim * d->ydim;
+                    VkShaderModule mod = d->pred_n4_module;
+                    if (use_pxp8(d->nns, fs)) {
+                        mod = d->pred_module;
+                    } else if (fs <= 64) {
+                        mod = d->pred_n4s_module;
+                    }
                     const auto result = create_pipeline(
                         *d->device, spec, mod, d->pipeline_layout,
                         pred_subgroup);
@@ -1959,12 +1834,11 @@ static void VS_CC Nnedi3Create(
     }
 
     // Buffer region offsets (raw bytes), each region 32-byte aligned. The
-    // upload staging holds the CPU-packed field rows (H2D source); the
-    // device-local field buffer is the DMA target and pad-kernel source;
-    // the device-local pad buffer holds the padded planes that prescreen
-    // and predict read (full VRAM speed); the device-local asm buffer
-    // holds the assembled full frames (assemble target, D2H source); the
-    // download staging holds those full frames DMA'd for the host copy.
+    // upload staging holds the CPU-packed field rows (ReBAR, pad-kernel
+    // source); the device-local pad buffer holds the padded planes that
+    // prescreen and predict read (full VRAM speed); the download staging
+    // holds the packed interp rows DMA'd for the host scatter (interp half
+    // only — kept lines never cross the bus).
     auto align32 = [](VkDeviceSize v) { return (v + 31) & ~VkDeviceSize(31); };
     {
         VkDeviceSize up = 0, down = 0, pad = 0, asm_b = 0, dst = 0, list = 0, ind = 0;
@@ -1988,7 +1862,7 @@ static void VS_CC Nnedi3Create(
             cfg.list_offset = align32(list);
             cfg.ind_offset = align32(ind);
             up = align32(cfg.up_offset + field_bytes);
-            down = align32(cfg.download_offset + frame_bytes);
+            down = align32(cfg.download_offset + field_bytes);
             pad = align32(cfg.pad_offset + pad_bytes);
             asm_b = align32(cfg.asm_offset + frame_bytes);
             list = align32(cfg.list_offset + list_bytes);
@@ -2162,6 +2036,7 @@ static void VS_CC Nnedi3Create(
                 .commandBufferCount = 1
             };
             checkVK(vkAllocateCommandBuffers(dev, &alloc_info, &resource.cmd));
+            checkVK(vkAllocateCommandBuffers(dev, &alloc_info, &resource.cmd1));
         }
 
         {
@@ -2180,7 +2055,7 @@ static void VS_CC Nnedi3Create(
                 .pNext = nullptr,
                 .flags = 0,
                 .queryType = VK_QUERY_TYPE_TIMESTAMP,
-                .queryCount = 5,
+                .queryCount = 4,
                 .pipelineStatistics = 0
             };
             checkVK(vkCreateQueryPool(dev, &query_info, nullptr, &resource.query_pool));
@@ -2240,43 +2115,24 @@ static void VS_CC Nnedi3Create(
 
         resource.queue = d->device->queues[i % num_queues].queue;
         resource.queue_lock = d->device->queues[i % num_queues].lock.get();
-        // Transfer queue: a different same-family queue so the D2H copies
-        // run concurrently with compute (the family shares the DMA engine,
-        // like the reference's dedicated transfer family). Env-gated off
-        // with VSFEEL_NNEDI3_NOXFER (copies then run inline in the compute
-        // CB). Needs ≥2 queues; with one queue the copy shares the compute
-        // queue (still correct, no overlap).
-        if (!getenv("VSFEEL_NNEDI3_NOXFER") && d->device->queue_count >= 2) {
-            const uint32_t xfer_idx = (i + 1) % d->device->queue_count;
-            resource.xfer_queue = d->device->queues[xfer_idx].queue;
-            resource.xfer_lock = d->device->queues[xfer_idx].lock.get();
-            VkCommandPoolCreateInfo copy_pool_info {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .queueFamilyIndex = d->device->queue_family
-            };
-            checkVK(vkCreateCommandPool(dev, &copy_pool_info, nullptr, &resource.copy_pool));
-            VkCommandBufferAllocateInfo copy_alloc_info {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                .pNext = nullptr,
-                .commandPool = resource.copy_pool,
-                .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                .commandBufferCount = 1
-            };
-            checkVK(vkAllocateCommandBuffers(dev, &copy_alloc_info, &resource.copy_cmd));
-            VkSemaphoreTypeCreateInfo type_info {
-                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
-                .pNext = nullptr,
-                .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
-                .initialValue = 0
-            };
-            VkSemaphoreCreateInfo sem_info {
-                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-                .pNext = &type_info,
-                .flags = 0
-            };
-            checkVK(vkCreateSemaphore(dev, &sem_info, nullptr, &resource.timeline));
+
+        // Pre-record both parity variants once (no per-frame reset/record:
+        // pushes differ only by parity; all per-frame GPU state resets —
+        // query pool, ind fills — live inside the CB and re-execute per
+        // submit; the host barrier orders the pack writes before the reads).
+        // Swap idiom: record writes resource.cmd, so point it at each
+        // buffer in turn, then restore cmd=parity0 / cmd1=parity1.
+        {
+            VkCommandBuffer cmd0 = resource.cmd;
+            if (const auto err = record_command_buffer(*d, resource, 0)) {
+                return set_error(*err);
+            }
+            resource.cmd = resource.cmd1;
+            if (const auto err = record_command_buffer(*d, resource, 1)) {
+                return set_error(*err);
+            }
+            resource.cmd1 = resource.cmd;
+            resource.cmd = cmd0;
         }
 
         d->pool.push(std::move(resource));

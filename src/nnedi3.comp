@@ -91,9 +91,9 @@ layout(std430, binding = 5) readonly restrict buffer PdBias { vec2 pdB[]; };
 
 // Per-dispatch buffer bases (IO_TYPE elements, except the list which is
 // uints):
-//   pad:       A=field, B=pad (+parity)
-//   prescreen: A=list, B=pad, C=packed interp rows
-//   predict:   A=list, B=pad, C=packed interp rows
+//   pad:       A=field, B=pad (+parity) [dead: pad fused into window reads]
+//   prescreen: A=list, B=field (tight upload), C=packed interp rows (+parity)
+//   predict:   A=list, B=field (tight upload), C=packed interp rows (+parity)
 //   assemble:  A=field, B=packed interp rows, C=full-frame output (+parity)
 layout(push_constant) uniform PushConstants {
     int a_base;
@@ -103,12 +103,20 @@ layout(push_constant) uniform PushConstants {
     int d_base;
 } pc;
 
+// Window read fused from the pad kernel: pad[i][x] =
+// field[clamp(i-(MARGIN_V-fp))][clamp(x-MARGIN_H)] with fp=1-parity.
+// Reading the tight field directly with the same clamp deletes the pad
+// kernel + pad buffer + barrier (pad writes 4MB + window re-reads; the
+// clamp ALU is noise next to the 130MB of L2-hit window traffic).
 float loadPad(int row, int col) {
-    const int idx = pc.b_base + row * PADSTRIDE + col;
+    const int fp = 1 - pc.parity;
+    const int f = clamp(row - (MARGIN_V - fp), 0, ROWS - 1);
+    const int c = clamp(col - MARGIN_H, 0, WIDTH - 1);
+    const int idx = pc.b_base + f * WIDTH + c;
 #if BITS == 32
-    return padBuf[idx];
+    return fieldBuf[idx];
 #else
-    return float(int(padBuf[idx]));
+    return float(int(fieldBuf[idx]));
 #endif
 }
 
@@ -346,9 +354,15 @@ const int PXP = ((((NNS + 31) / 32) <= 2) && (FS <= 128)) ? 8 : 4;
 const int EPLX = (FS + 31) / 32;
 const int PPL = (NNS + 31) / 32;
 
+#ifndef SHSTRIDE
 const uint SHSTRIDE = (PXP == 8) ? 256u : 288u;
+#endif
 
+#if defined(SHSTRIDE)
+shared vec4 shTile[4 * SHSTRIDE];
+#else
 shared vec4 shTile[4 * 288];
+#endif
 
 // ---- one work unit (PXP pixels at FIRST, NPX valid): window stats into
 // shared, vec4 GEMV, wae5 blend, store. Used by both the fast path and

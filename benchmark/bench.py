@@ -355,7 +355,7 @@ def _eedi3_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
 
 
 def _nnedi3_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
-    ns_num = ns.num_streams if ns.num_streams is not None else 2
+    ns_num = ns.num_streams if ns.num_streams is not None else 4
     common = (
         f"field={ns.nnedi3_field}, dh={ns.nnedi3_dh}, "
         f"nsize={ns.nnedi3_nsize}, nns={ns.nnedi3_nns}, qual={ns.nnedi3_qual}, "
@@ -486,7 +486,7 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("pscrn", "--nnedi3-pscrn", "nnedi3_pscrn", int, 4),
         ],
         build=_nnedi3_build,
-        default_streams=2,
+        default_streams=4,
     ),
 }
 

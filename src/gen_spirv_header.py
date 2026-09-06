@@ -35,13 +35,13 @@ def emit_spv(f, name: str, path: Path) -> None:
     f.write(f"static const size_t {name}_spv_size = sizeof({name}_spv);\n\n")
 
 def main() -> None:
-    if len(sys.argv) != 56:
+    if len(sys.argv) != 58:
         print("usage: gen_spirv_header.py <...dfttest binaries...> "
               "<nlmeans_16_weight> <nlmeans_16_acc> <nlmeans_16_finish> "
               "<nlmeans_32_weight> <nlmeans_32_acc> <nlmeans_32_finish> "
               "<eedi3 ...> <nnedi3_16_pad> <nnedi3_16_prescreen> <nnedi3_16_predict> "
-              "<nnedi3_16_predict_n4> <nnedi3_16_count> <nnedi3_16_assemble> <nnedi3_32_pad> <nnedi3_32_prescreen> "
-              "<nnedi3_32_predict> <nnedi3_32_predict_n4> <nnedi3_32_count> <nnedi3_32_assemble> <out header>")
+              "<nnedi3_16_predict_n4> <nnedi3_16_predict_n4s> <nnedi3_16_count> <nnedi3_16_assemble> <nnedi3_32_pad> <nnedi3_32_prescreen> "
+              "<nnedi3_32_predict> <nnedi3_32_predict_n4> <nnedi3_32_predict_n4s> <nnedi3_32_count> <nnedi3_32_assemble> <out header>")
         sys.exit(1)
 
     bl_shared_16, bl_shared_32, bl_plain_16, bl_plain_32, bm3d, bm3d_agg, \
@@ -50,7 +50,7 @@ def main() -> None:
         df_32_ps, df_32_pd, df_32_c, df_32_f0, df_32_f1, df_32_f2, df_32_f3, \
         nl_16_w, nl_16_a, nl_16_f, nl_16_p, nl_32_w, nl_32_a, nl_32_f, nl_32_p, \
         e16_r, e16_v, e32_r, e32_v, e16_p, e32_p, e16_c, e32_c, \
-        nn16_p, nn16_s, nn16_r, nn16_r4, nn16_c, nn16_a, nn32_p, nn32_s, nn32_r, nn32_r4, nn32_c, nn32_a, \
+        nn16_p, nn16_s, nn16_r, nn16_r4, nn16_r4s, nn16_c, nn16_a, nn32_p, nn32_s, nn32_r, nn32_r4, nn32_r4s, nn32_c, nn32_a, \
         out_path = (Path(a) for a in sys.argv[1:])
 
     with out_path.open("w") as f:
@@ -102,12 +102,14 @@ def main() -> None:
         emit_spv(f, "nnedi3_16_prescreen", nn16_s)
         emit_spv(f, "nnedi3_16_predict", nn16_r)
         emit_spv(f, "nnedi3_16_predict_n4", nn16_r4)
+        emit_spv(f, "nnedi3_16_predict_n4s", nn16_r4s)
         emit_spv(f, "nnedi3_16_count", nn16_c)
         emit_spv(f, "nnedi3_16_assemble", nn16_a)
         emit_spv(f, "nnedi3_32_pad", nn32_p)
         emit_spv(f, "nnedi3_32_prescreen", nn32_s)
         emit_spv(f, "nnedi3_32_predict", nn32_r)
         emit_spv(f, "nnedi3_32_predict_n4", nn32_r4)
+        emit_spv(f, "nnedi3_32_predict_n4s", nn32_r4s)
         emit_spv(f, "nnedi3_32_count", nn32_c)
         emit_spv(f, "nnedi3_32_assemble", nn32_a)
 
