@@ -39,6 +39,9 @@ struct PlaneConfig {
     VkDeviceSize upload_size {};     // bytes, incl. ref plane
     VkDeviceSize download_offset {}; // bytes, offset within download area
     VkDeviceSize download_size {};   // bytes
+    VkDeviceSize src_elem {};        // element offset into the VRAM source buffer
+    VkDeviceSize dst_elem {};        // element offset into the VRAM destination buffer
+    VkDeviceSize dst_stage_elem {};  // element offset of the download region in staging
     VkPipeline pipeline {};
     uint32_t grid_x {};
     uint32_t grid_y {};
@@ -47,6 +50,12 @@ struct PlaneConfig {
 struct BilateralResource {
     VkBuffer staging {};
     VkDeviceMemory staging_mem {};
+    VkBuffer src_buf {};        // device-local input planes (VRAM)
+    VkDeviceMemory src_mem {};
+    void * src_map {};          // mapped VRAM window when the upload is host-direct
+    uint32_t src_type_index {};
+    VkBuffer dst_buf {};        // device-local output planes (VRAM)
+    VkDeviceMemory dst_mem {};
     VkCommandPool pool {};
     VkCommandBuffer cmd {};
     VkFence fence {};
@@ -74,7 +83,8 @@ struct BilateralData {
     VkShaderModule plain_module {};
     VkDeviceSize upload_total {};
     VkDeviceSize download_total {};
-    bool need_fill {};
+    bool host_direct_upload {};  // src VRAM is host-mapped (ReBAR): no H2D copy
+    bool kd_download {};         // kernels write the GTT download staging directly
     std::array<PlaneConfig, 3> planes {};
     FramePool<BilateralResource> pool;
 
@@ -88,6 +98,21 @@ struct BilateralData {
         for (auto & resource : pool.items) {
             if (resource.map) {
                 vkUnmapMemory(dev, resource.staging_mem);
+            }
+            if (resource.src_map) {
+                vkUnmapMemory(dev, resource.src_mem);
+            }
+            if (resource.dst_mem) {
+                vkFreeMemory(dev, resource.dst_mem, nullptr);
+            }
+            if (resource.dst_buf) {
+                vkDestroyBuffer(dev, resource.dst_buf, nullptr);
+            }
+            if (resource.src_mem) {
+                vkFreeMemory(dev, resource.src_mem, nullptr);
+            }
+            if (resource.src_buf) {
+                vkDestroyBuffer(dev, resource.src_buf, nullptr);
             }
             destroy_common(dev, resource);
         }
@@ -248,9 +273,12 @@ static std::variant<VkPipeline, std::string> create_pipeline(
 }
 
 // Records the dispatch sequence for all planes into a single pre-recorded
-// command buffer (all plane regions are disjoint, so the dispatches of
-// different planes can overlap on the GPU). The kernel reads its input and
-// writes its output straight from/to the staging buffer.
+// command buffer. The frame bytes are moved by two big DMA copies at the
+// head and tail (staging upload area -> VRAM src, VRAM dst -> staging
+// download area); the kernels then read and write device-local VRAM only
+// (or host-mapped VRAM / GTT staging directly on the fast paths, with the
+// corresponding copy skipped). All plane regions are disjoint, so the
+// dispatches of different planes can overlap on the GPU.
 static std::optional<std::string> record_command_buffer(
     const BilateralData & d, BilateralResource & resource) {
 
@@ -267,12 +295,21 @@ static std::optional<std::string> record_command_buffer(
         return "vkBeginCommandBuffer failed";
     }
 
-        // the plain kernel uses masked atomicOr for sub-dword stores, so its
-        // download regions must be cleared before every submission; the shared
-        // kernel packs complete dwords and needs no clearing
-        if (d.need_fill) {
-            vkCmdFillBuffer(resource.cmd, resource.staging,
-                d.upload_total, d.download_total, 0);
+        // upload: staging -> VRAM src (one copy, all planes are contiguous).
+        // Skipped when the src VRAM is host-mapped: the CPU memcpy of the
+        // frame already landed the bytes in VRAM before submission.
+        if (!d.host_direct_upload && d.upload_total > 0) {
+            const VkBufferCopy upload_region { 0, 0, d.upload_total };
+            vkCmdCopyBuffer(resource.cmd, resource.staging, resource.src_buf,
+                1, &upload_region);
+            VkMemoryBarrier copy_barrier {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+            };
+            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &copy_barrier, 0, nullptr, 0, nullptr);
         }
 
         for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
@@ -286,11 +323,13 @@ static std::optional<std::string> record_command_buffer(
             resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
         {
-            // push constants are RAW BYTE offsets; the kernel converts to
-            // dword indices itself (idx * ELEM_BYTES, then >> 2)
+            // push constants are element offsets into the bound buffers;
+            // kd_download: the output SSBO is the GTT staging (the kernels'
+            // plain coalesced stores land straight in host memory); the dst
+            // push constant then addresses the staging download region.
             int32_t push_constants[2] {
-                static_cast<int32_t>(cfg.upload_offset),
-                static_cast<int32_t>(d.upload_total + cfg.download_offset)
+                static_cast<int32_t>(cfg.src_elem),
+                static_cast<int32_t>(d.kd_download ? cfg.dst_stage_elem : cfg.dst_elem)
             };
             vkCmdPushConstants(
                 resource.cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -301,6 +340,23 @@ static std::optional<std::string> record_command_buffer(
             vkCmdDispatch(resource.cmd, 1, 1, 1);
         }
     }
+
+        // download: VRAM dst -> staging (one copy, all planes contiguous).
+        // Skipped for kd_download — the kernels already wrote the staging
+        // download region directly (plain stores, no atomics).
+        if (!d.kd_download && d.download_total > 0) {
+            VkMemoryBarrier kernel_barrier {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT
+            };
+            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &kernel_barrier, 0, nullptr, 0, nullptr);
+            const VkBufferCopy download_region { 0, d.upload_total, d.download_total };
+            vkCmdCopyBuffer(resource.cmd, resource.dst_buf, resource.staging,
+                1, &download_region);
+        }
 
     if (vkEndCommandBuffer(resource.cmd) != VK_SUCCESS) {
         return "vkEndCommandBuffer failed";
@@ -364,6 +420,9 @@ static const VSFrame *VS_CC BilateralGetFrame(
             auto t_acq0 = now_us();
             auto resource = d->pool.take();
             t_acq += now_us() - t_acq0;
+            // reset the stage clock after the acquire: the take() wait is
+            // accounted in t_acq and must not leak into t_up
+            t0 = now_us();
             int inf = t_inf.fetch_add(1) + 1;
             int peak = t_peak.load();
             while (inf > peak && !t_peak.compare_exchange_weak(peak, inf)) {}
@@ -388,6 +447,13 @@ static const VSFrame *VS_CC BilateralGetFrame(
         const bool nocpu = std::getenv("BILATERAL_NOCPU") != nullptr;
         const bool nodl = std::getenv("BILATERAL_NODL") != nullptr;
 
+        // the upload target is either the host-mapped VRAM src window
+        // (host-direct path: the bytes land in VRAM with no GPU copy) or the
+        // staging upload area (the command buffer's H2D copy moves them)
+        uint8_t * const upload_base = d->host_direct_upload
+            ? static_cast<uint8_t *>(resource.src_map)
+            : static_cast<uint8_t *>(static_cast<void *>(map));
+
         for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
             if (!d->process[plane]) {
                 continue;
@@ -398,14 +464,20 @@ static const VSFrame *VS_CC BilateralGetFrame(
             const auto & cfg = d->planes[plane];
 
             auto srcp = vsapi->getReadPtr(src, plane);
-            auto dstp = static_cast<uint8_t *>(static_cast<void *>(map)) + cfg.upload_offset;
+            auto dstp = upload_base + cfg.upload_offset;
 
-            // raw byte copy of the plane (staging layout matches the frame pitch);
-            // non-temporal stores keep the lines clean in DRAM so the GPU does
-            // not pay snoop/writeback stalls when it reads them
+            // raw byte copy of the plane (staging/VRAM layout matches the
+            // frame pitch); plain memcpy into the mapped VRAM window (the
+            // window is write-combined: streaming stores measured slower),
+            // streaming stores into GTT staging (keeps the lines clean in
+            // DRAM so the GPU does not pay snoop/writeback stalls)
             if (!nocpu) {
                 const auto bytes = static_cast<size_t>(cfg.width * d->elem_bytes) * height;
-                copy_stream_out(dstp, srcp, bytes);
+                if (d->host_direct_upload) {
+                    memcpy(dstp, srcp, bytes);
+                } else {
+                    copy_stream_out(dstp, srcp, bytes);
+                }
 
                 // reference plane goes directly below the source plane
                 if (d->ref_node) {
@@ -649,13 +721,22 @@ static void VS_CC BilateralCreate(
     }
 
     int block_x = vsh::int64ToIntS(vsapi->mapGetInt(in, "block_x", 0, &error));
-    if (error) {
-        block_x = 32;
-    }
-
+    const bool block_x_default = !!error;
     int block_y = vsh::int64ToIntS(vsapi->mapGetInt(in, "block_y", 0, &error));
-    if (error) {
-        block_y = 32;
+    const bool block_y_default = !!error;
+    if (block_x_default || block_y_default) {
+        // Auto-tuned workgroup shape from the benchmark matrix (RX 7900 XTX,
+        // ns=4 real-clip GRAY16 medians): tall blocks hide the exp-pipeline
+        // latency of large windows (R=24: 16x16 = 343 fps vs 16x8 = 228),
+        // while wide blocks are marginally better for small windows
+        // (R=9: 32x8 = 1742 vs 16x16 = 1705; R=3: 2449 vs 2412).
+        const int max_radius = std::max({ radius[0], radius[1], radius[2] });
+        if (block_x_default) {
+            block_x = 32;
+        }
+        if (block_y_default) {
+            block_y = (max_radius > 12) ? 16 : 8;
+        }
     }
 
     {
@@ -913,7 +994,12 @@ static void VS_CC BilateralCreate(
         cfg.pipeline = std::get<VkPipeline>(result);
     }
 
-    // Buffer region offsets (raw bytes)
+    // Buffer region offsets (raw bytes), each region 32-byte aligned so the
+    // streaming copies can use aligned loads/stores. The staging layout and
+    // the VRAM src/dst layouts are identical, so one DMA copy per direction
+    // moves every plane at once.
+    auto align32 = [](VkDeviceSize v) { return (v + 31) & ~VkDeviceSize(31); };
+
     VkDeviceSize upload_total = 0;
     VkDeviceSize download_total = 0;
 
@@ -926,28 +1012,69 @@ static void VS_CC BilateralCreate(
         VkDeviceSize plane_bytes =
             static_cast<VkDeviceSize>(cfg.height) * cfg.pitch_bytes;
 
-        cfg.upload_offset = upload_total;
+        cfg.upload_offset = align32(upload_total);
         cfg.upload_size = (1 + has_ref) * plane_bytes;
-        upload_total += cfg.upload_size;
+        upload_total = align32(cfg.upload_offset + cfg.upload_size);
 
-        cfg.download_offset = download_total;
+        cfg.download_offset = align32(download_total);
         cfg.download_size = plane_bytes;
-        download_total += cfg.download_size;
+        download_total = align32(cfg.download_offset + cfg.download_size);
+
+        // the VRAM buffers mirror the staging layout byte-for-byte
+        cfg.src_elem = cfg.upload_offset / d->elem_bytes;
+        cfg.dst_elem = cfg.download_offset / d->elem_bytes;
     }
 
     d->upload_total = upload_total;
     d->download_total = download_total;
-    d->need_fill = need_plain;
+
+    // kd download addresses the staging download area, which begins at the
+    // FINAL upload_total — only known now, after every plane was laid out
+    for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
+        if (!pipeline_valid[plane]) {
+            continue;
+        }
+        auto & cfg = planes[plane];
+        cfg.dst_stage_elem = (upload_total + cfg.download_offset) / d->elem_bytes;
+    }
 
     const VkDeviceSize min_size = 4;
+    // the host-visible staging only carries raw plane bytes; the kernels'
+    // src/dst live in device-local VRAM (see below)
     const VkDeviceSize staging_size = std::max(upload_total + download_total, 2 * min_size);
+    const VkDeviceSize src_size = std::max(upload_total, min_size);
+    const VkDeviceSize dst_size = std::max(download_total, min_size);
 
     // Resources
+    // host-direct upload: the CPU memcpy writes the host-mapped VRAM src
+    // window directly (no GPU-side H2D copy); opt out with VSFEEL_BILAT_HD=0
+    // (plain VRAM src + staging upload + in-CB copy)
+    d->host_direct_upload = !getenv("VSFEEL_BILAT_HD") || atoi(getenv("VSFEEL_BILAT_HD")) != 0;
+    // kernel-direct download: the bilateral kernels' plain coalesced stores
+    // write the GTT staging download region over PCIe directly, removing the
+    // GPU-side D2H copy; opt out with VSFEEL_BILAT_KD=0 for the VRAM+copy path
+    d->kd_download = !getenv("VSFEEL_BILAT_KD") || atoi(getenv("VSFEEL_BILAT_KD")) != 0;
     d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
     d->pool.reserve(d->num_streams);
 
-    uint32_t num_queues = std::min(
-        d->num_streams, static_cast<int>(d->device->queue_count));
+    // Two queues feed the GPU with no idle bubbles: with one stream per
+    // queue (num_queues == num_streams) each queue drains while its worker
+    // does the post-fence CPU work (download memcpy + VS bookkeeping +
+    // next-frame upload) before the next submit; sharing a queue across
+    // streams keeps a next CB queued (ns=4: 2 queues = 1986 fps vs 4 queues
+    // = 1709 fps). Beyond 2 the gains stop (lock/CP overhead). Override
+    // with VSFEEL_BILAT_QUEUES=N for tuning.
+    uint32_t num_queues = std::min({
+        d->num_streams, static_cast<int>(d->device->queue_count), 2 });
+    if (const char * qn = std::getenv("VSFEEL_BILAT_QUEUES")) {
+        const int q = atoi(qn);
+        if (q > 0) {
+            num_queues = std::min<uint32_t>(
+                static_cast<uint32_t>(d->num_streams),
+                std::min<uint32_t>(static_cast<uint32_t>(q),
+                    d->device->queue_count));
+        }
+    }
 
     for (int i = 0; i < d->num_streams; ++i) {
         BilateralResource resource;
@@ -958,7 +1085,11 @@ static void VS_CC BilateralCreate(
                 .pNext = nullptr,
                 .flags = 0,
                 .size = staging_size,
-                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                // STORAGE_BUFFER: with kd_download the bilateral kernels write
+                // the download region as an SSBO; TRANSFER_*: the H2D/D2H
+                // copies of the non-host-direct paths
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
                 .queueFamilyIndexCount = 0,
                 .pQueueFamilyIndices = nullptr
@@ -979,6 +1110,75 @@ static void VS_CC BilateralCreate(
             }
             resource.staging_mem = std::get<AllocatedMemory>(result).memory;
             resource.staging_type_index = std::get<AllocatedMemory>(result).type_index;
+        }
+
+        // device-local input planes: the kernels read them. With ReBAR the
+        // buffer is host-mapped so the CPU memcpy writes VRAM directly and
+        // the command buffer needs no H2D copy; if no host-visible device-
+        // local memory exists, fall back to a plain VRAM buffer filled by
+        // the H2D copy.
+        {
+            VkBufferCreateInfo buffer_info {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .size = src_size,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr
+            };
+            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.src_buf));
+
+            auto result = allocate_memory(
+                *d->device, resource.src_buf,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (std::holds_alternative<std::string>(result)) {
+                result = allocate_memory(
+                    *d->device, resource.src_buf, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                if (std::holds_alternative<std::string>(result)) {
+                    return set_error(std::get<std::string>(result));
+                }
+            } else if (d->host_direct_upload) {
+                // only take the host-mapped path when the allocation really
+                // is device-local (allocate_memory may relax the requirement)
+                const uint32_t ti = std::get<AllocatedMemory>(result).type_index;
+                const auto flags = d->device->mem_props.memoryTypes[ti].propertyFlags;
+                d->host_direct_upload =
+                    (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+                    (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                    (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            }
+            resource.src_mem = std::get<AllocatedMemory>(result).memory;
+            resource.src_type_index = std::get<AllocatedMemory>(result).type_index;
+            if (d->host_direct_upload) {
+                checkVK(vkMapMemory(dev, resource.src_mem, 0, src_size, 0, &resource.src_map));
+            }
+        }
+
+        // device-local output planes: the kernels write them, the D2H DMA
+        // copy reads them. Not needed when the kernels write the staging
+        // download region directly (kd_download).
+        if (!d->kd_download) {
+            VkBufferCreateInfo buffer_info {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .size = dst_size,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr
+            };
+            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.dst_buf));
+
+            const auto result = allocate_memory(
+                *d->device, resource.dst_buf, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            resource.dst_mem = std::get<AllocatedMemory>(result).memory;
         }
 
         {
@@ -1024,14 +1224,14 @@ static void VS_CC BilateralCreate(
 
         {
             VkDescriptorBufferInfo src_info {
-                .buffer = resource.staging,
+                .buffer = resource.src_buf,
                 .offset = 0,
-                .range = staging_size
+                .range = VK_WHOLE_SIZE
             };
             VkDescriptorBufferInfo dst_info {
-                .buffer = resource.staging,
+                .buffer = d->kd_download ? resource.staging : resource.dst_buf,
                 .offset = 0,
-                .range = staging_size
+                .range = VK_WHOLE_SIZE
             };
 
             VkWriteDescriptorSet writes[2] {

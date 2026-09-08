@@ -1,18 +1,19 @@
 #version 450
+#extension GL_EXT_shader_16bit_storage : require
 
 /*
  * Bilateral filter compute shader, shared-memory (tiled) variant.
  *
  * Compile-time variants: -DBITS=16|32 selects the staging element type.
- * The staging buffer holds the raw VapourSynth plane bytes (uint16
- * integer or float32), and this kernel performs the format conversion
- * itself, so the host side only memcpys raw bytes.
+ * All buffers hold native elements (uint16_t integer or float32) in
+ * device-local VRAM (or host-visible staging for kernel-direct download),
+ * so loads and stores are plain coalesced element accesses — no shift/mask
+ * unpacking, no dword packing, no atomics.
  *
  * All parameters are specialization constants so that the compiler can
- * fully unroll the (2*RADIUS+1)^2 inner loop and constant-fold all
- * clamping/indexing.
+ * fully unroll the tile-load loops and constant-fold all clamping/indexing.
  *
- * Memory layout (per plane region, raw bytes):
+ * Memory layout (per plane region, elements of IO_TYPE):
  *   rows [0, HEIGHT)            : source plane
  *   rows [HEIGHT, 2*HEIGHT)     : reference plane (only if HAS_REF)
  *   rows are STRIDE elements wide (only WIDTH are meaningful)
@@ -23,18 +24,14 @@
 #endif
 
 #if BITS == 16
-#define ELEM_BYTES 2
-#define ELEM_MASK  0xFFFFu
+#define IO_TYPE uint16_t
 #define PEAK       65535.0f
 #define SCALE      (1.0f / 65535.0f)
 #else
-#define ELEM_BYTES 4
-#define ELEM_MASK  0xFFFFFFFFu
+#define IO_TYPE float
 #define PEAK       1.0f
 #define SCALE      1.0f
 #endif
-
-#define ELEM_SHIFT(byte) (8 * ((byte) & 3))
 
 layout(constant_id = 0) const int WIDTH = 1920;
 layout(constant_id = 1) const int HEIGHT = 1080;
@@ -49,38 +46,32 @@ layout(constant_id = 9) const int SHARED_FLOATS = 884;
 
 layout(local_size_x_id = 10, local_size_y_id = 11, local_size_z = 1) in;
 
-layout(std430, binding = 0) readonly buffer SrcBuf { uint src_raw[]; };
-layout(std430, binding = 1) buffer DstBuf { uint dst_raw[]; };
+layout(std430, binding = 0) readonly buffer SrcBuf { IO_TYPE src[]; };
+layout(std430, binding = 1) writeonly buffer DstBuf { IO_TYPE dst[]; };
 
 layout(push_constant) uniform PushConstants {
-    int src_base;  // byte offset of this plane's source region
-    int dst_base;  // byte offset of this plane's download region
+    int src_base;  // element offset of this plane's source region
+    int dst_base;  // element offset of this plane's download region
 } pc;
 
 shared float buf[SHARED_FLOATS];
-shared float out_tile[TILE_X * TILE_Y];
-
-uint load_raw(int idx) {
-    int byte = idx * ELEM_BYTES;
-    uint word = src_raw[(pc.src_base + byte) >> 2];
-    return (word >> ELEM_SHIFT(byte)) & ELEM_MASK;
-}
 
 float load_value(int idx) {
 #if BITS == 32
-    return uintBitsToFloat(load_raw(idx));
+    return src[pc.src_base + idx];
 #else
-    return float(load_raw(idx)) * SCALE;
+    // direct uint16_t->float conversion chokes glslc; int() widens cleanly
+    return float(int(src[pc.src_base + idx])) * SCALE;
 #endif
 }
 
 void store_value(int idx, float v) {
-    int byte = idx * ELEM_BYTES;
-    int wi = (pc.dst_base + byte) >> 2;
 #if BITS == 32
-    dst_raw[wi] = floatBitsToUint(v);
+    dst[pc.dst_base + idx] = v;
 #else
-    dst_raw[wi] = v < 0.0f ? 0u : uint(v * PEAK + 0.5f);
+    // glslc -O chokes on a direct float->uint16_t convert (OpUConvert); go
+    // through uint with an explicit mask (same workaround as nlmeans/dfttest)
+    dst[pc.dst_base + idx] = uint16_t(uint(v * PEAK + 0.5f) & 0xFFFFu);
 #endif
 }
 
@@ -136,26 +127,5 @@ void main() {
         }
     }
 
-    // deposit the result into the output tile, then let the packing lane
-    // write complete dwords (pairs for 16-bit) so no pre-clearing of the
-    // download region is required
-    out_tile[ty * TILE_X + tx] = num / den;
-    barrier();
-
-#if BITS == 32
     store_value(y * STRIDE + x, num / den);
-#else
-    const int PACK = 4 / ELEM_BYTES;   // 2 for 16-bit
-    if ((x & (PACK - 1)) == 0) {
-        uint packed = 0;
-        for (int k = 0; k < PACK; ++k) {
-            const float out_val = (x + k < WIDTH && tx + k < TILE_X)
-                ? out_tile[ty * TILE_X + tx + k] : 0.0f;
-            const uint val = out_val < 0.0f ? 0u : uint(out_val * PEAK + 0.5f);
-            packed |= (val & ELEM_MASK) << (8 * ELEM_BYTES * k);
-        }
-        int byte = (y * STRIDE + x) * ELEM_BYTES;
-        dst_raw[(pc.dst_base + byte) >> 2] = packed;
-    }
-#endif
 }

@@ -99,8 +99,15 @@ MANGOHUD=0 python3 benchmark/bench.py --filter dfttest vsfeel vszipcl vszipcu
 ```
 
 This prints fps for each plugin and ranks them. Compare vsfeel's fps against
-the fastest reference. Judge optimizations on multiple runs over hundreds of 
+the fastest reference. Judge optimizations on multiple runs over hundreds of
 frames.
+
+Two-tier measurement keeps the iteration loop tight: screen candidates with a
+fast custom `.vpy` + `vspipe` (a few hundred frames, BlankClip or a small
+cached real clip), and grade only on full `bench.py` same-session pairs over
+1000+ frames (a `rep_<filter>.sh` loop of 5000-frame ×3 repeats settles
+medians). A one-off fast-vpy number that later pairs contradict was noise,
+not a finding.
 
 ## Comparing a vsfeel kernel against the reference kernels
 
@@ -129,7 +136,12 @@ RX 7900XTX, so a fair comparison is possible. Method that worked for DFTTest:
    `/opt/rocm/llvm/bin/clang -x cl -target amdgcn-amd-amdhsa -mcpu=gfx1100 -O3
    -cl-std=CL1.2 -cl-denorms-are-zero <prefix+kernel>.cl` then `llvm-objdump -d`.
    For our SPIR-V, `RADV_DEBUG=asm` dumps the ACO ISA; `RADV_DEBUG=shaderstats`
-   prints VGPR/LDS/occupancy. Count total instructions and the FP-op
+   prints VGPR/LDS/occupancy. Instruction counts are only comparable at
+   equal unroll structure — check loop-branch counts first (a fully-unrolled
+   kernel vs a rolled loop with a dual-issued body can differ 10x on paper
+   and tie on hardware). Always report Subgroups-per-SIMD, LDS, and
+   spill/scratch bytes next to the count: a lower count with halved occupancy
+   or new spills is a regression. Count the FP-op
    distribution (v_fma, v_rcp, v_mov, s_mov, v_dual_*). A 3x instruction-count
    gap means ~2.5x time. When diffing your own change before/after, watch for
    schedule-damage signatures, not just the total: doubled `buffer_load_*` =
@@ -197,8 +209,9 @@ resources.
 **What stays per-filter:** frame caches (temporal three: DFTTest slot cache,
 NLMeans tile cache, BM3D ring/result stacks), shaders + launch config, sync
 choreography (pad→copy→fused ordering, host vs device waits), queue/stream
-assignment, cache sizing. `num_queues = min(num_streams, queue_count)`,
-`resource.queue = device->queues[i % num_queues]`; in-flight depth is
+assignment, cache sizing. `num_queues = min(num_streams, queue_count)` is only
+the starting point — the cap is swept per filter (see the queue-sharing rule
+below), `resource.queue = device->queues[i % num_queues]`; in-flight depth is
 `num_streams` (DFTTest uses `max(num_streams, 2)` — queue count and buffer
 count are independent; see the knee rule below).
 
@@ -237,6 +250,13 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   pairs or medians over 1000+ frames, never single short bursts. A
   comments-only rebuild that moves a one-shot trace is clock variance, not a
   regression — check `pp_dpm_sclk` and repeat 3x before debugging.
+  When one plugin swings ±15–40% between invocations while the other stays
+  flat, triage in order: 5x same-command repeats, then alone-vs-pair
+  interleaving, then `pp_dpm_sclk` / `gpu_busy_percent` polled in a loop
+  *during* the run (a single read after a 2–3 s run only ever sees idle),
+  then thermals and host load. Same-session pairs stay fair through all of
+  it — grade on those, and lengthen the run before trusting any absolute
+  number (short runs are clock-ramp-sensitive).
 - **Never chain build → install → test into one command** (a failed compile
   then silently leaves the stale `.so` installed). Verify binary freshness
   (timestamp-compare, `strings`-grep the installed `.so`) before trusting any
@@ -250,6 +270,10 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   the kernels — is the bottleneck); a ~20-line C program streaming exactly
   frame-sized bytes settles memcpy-vs-NT upload questions the same
   afternoon. Do both before theorizing.
+  Reset the stage clock after every blocking acquire (pool take, fence wait)
+  so waits never leak into the next stage, and cross-check summed stages
+  against wall-clock before trusting any split — a stage reporting
+  milliseconds for a microsecond memcpy is a timer bug, not a finding.
   Keep durable probes like this in-tree; delete one-shot diagnostics.
 - **Host orchestration is usually half the performance.** Expect to spend as
   much effort on memory pooling, upload/download paths, cross-stream cache
@@ -273,21 +297,66 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   change, because the answer flips as the code changes. Dump the target
   GPU's memory-type table once and rule transfer tricks in or out
   permanently.
+- **Port a proven memory path to the next filter before tuning kernels.**
+  Once a transfer structure wins on one filter (device-local buffers,
+  host-direct upload, kernel-direct download, native element types), port
+  the whole structure wholesale to the next filter with the same IO shape
+  before spending anything on kernel cleverness — it routinely contributes
+  most of the absolute gain. Ablate each leg with its opt-out env flag so
+  the contribution is measured, and keep those flags as durable tuning
+  knobs rather than deleting them as one-shot diagnostics.
 - **Sweep in-flight depth; set the default at the knee.** Throughput vs
   `num_streams` is never flat and never monotonic — measure it, set the
   filter default at the knee, and state the per-stream VRAM cost next to it.
-  Queue count (`min(num_streams, queue_count)`) and buffer count (ticket
-  depth) are independent: the knee is typically 2 (frame N runs on the GPU
-  while N+1 uploads/records/submits), and deeper pools only add VRAM.
+  Queue count and buffer count (ticket depth) are independent: the knee is
+  typically 2 (frame N runs on the GPU while N+1 uploads/records/submits),
+  and deeper pools only add VRAM.
   Re-sweep after structural changes — the frame cache moved DFTTest's knee
   8→2 — and never inherit depth constants across redesigns.
   Implementations tied at one depth can differ 2x at another (queue
   starvation vs GPU saturation).
+- **Sweep queue sharing independently of stream count.**
+  `min(num_streams, queue_count)` is only the starting point. With one
+  stream per queue, each queue drains while its worker does post-fence CPU
+  work (download memcpy + bookkeeping + next upload) before the next submit,
+  leaving idle bubbles; sharing a queue across streams keeps a next CB
+  queued. Sweep the cap (`min(num_streams, queue_count, CAP)` for
+  CAP = 1..queue_count, via a `VSFEEL_<FILTER>_QUEUES` env override kept as
+  a durable tuning knob) at the graded depth. Oversubscribing queues can win
+  double digits and collapse run-to-run variance — a variance drop alongside
+  the speedup confirms the bubble mechanism. Re-sweep after memory-path
+  changes, since removing copies changes bubble sizes.
+- **Sweep workgroup shape across workload configs, not just the default.**
+  The best tile is a function of the algorithm's workload params (window
+  radius, taps, halo overfetch), not a universal constant — a shape that
+  ties at one config can win 50% at another and collapse at a third, so
+  sweep the matrix (block candidates × representative configs) and re-verify
+  under the final queue cap, since overlap changes amplify or shrink shape
+  effects. Where the matrix shows a clear workload-dependent winner, auto-
+  select the default from the workload params (only when the user leaves the
+  args unset — the `mapGetInt` error flag distinguishes explicit from
+  default, and explicit args are always respected). Never inherit shapes
+  across redesigns: a spill-free shape at one radius can spill at another,
+  so check `shaderstats` (VGPR spill/scratch) per matrix cell.
+- **Decide allocation-dependent fast paths before the resource loop.**
+  If a fast path depends on a memory type existing (host-visible
+  device-local for direct upload, and so on), probe once up front and store
+  an immutable global bool — never mutate a shared flag per resource inside
+  the creation loop. `allocate_memory` relaxes requirements per buffer, so a
+  mid-loop flip desyncs already-recorded command buffers (copy vs no-copy)
+  from the frame-time upload/download base used by all resources. When the
+  fast path is unavailable, every resource must take the fallback
+  consistently.
 - **Spec constants cannot size arrays in GLSL.** If an array dimension must
   vary, gate it with a compile-time `-D` define instead.
 - **Respect the compiler's register tradeoffs.** ACO raises VGPRs deliberately
   for load ILP at an occupancy cost; forcing registers down often regresses.
   Read `RADV_DEBUG=shaderstats` before assuming more waves would help.
+  The same applies to `requiredSubgroupSize`: forcing wave32 halves
+  Subgroups-per-SIMD and only pays off for kernels with subgroup ops or
+  extreme register pressure — otherwise it regresses. Sweep it per filter
+  like any other launch param; a win on one filter never implies a win on
+  the next.
 - **Reduced-precision storage needs explicit range management** (fp16 hit a
   subnormal cliff; scaling values up on store and down on load fixed it).
   Measure the actual drift against the reference and agree on the accuracy
@@ -301,9 +370,14 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
 - **Run Vulkan validation layers when output is inexplicable**
   (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`); they found a zeroed
   buffer-binding table in minutes.
-- **Decompose kernel cost with short-lived probes**, not theory: temporary
-  `-D` variants or env flags that drop one cost center at a time, measured,
-  reverted immediately. Expect plausible theories to be wrong — one seemingly
+- **Decompose kernel cost with short-lived probes**, not theory: kill the
+  theory with arithmetic before coding anything — bandwidth math (taps ×
+  bytes × pixels vs bus), value-range math (min/max exponent vs subnormal),
+  tile-size math (halo overfetch, LDS bytes vs budget). Then structure
+  probes as a ladder: remove-all first (empty/box kernel) to read the
+  ceiling, then remove-half (keep exactly one cost center) to attribute.
+  Implement probes as temporary `-D` variants or env flags, back up the
+  `.comp` first for a trivial revert, measure, revert immediately. Expect plausible theories to be wrong — one seemingly
   expensive memory-access pattern measured neutral because it was L2-resident.
   When the model names a cost, delete it in a scratch build and measure: a
   probe that disagrees with a confident model (barriers modeled 10x over real
