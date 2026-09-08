@@ -113,7 +113,14 @@ RX 7900XTX, so a fair comparison is possible. Method that worked for DFTTest:
    For ROCm references use `rocprofv3 -S --kernel-trace --memory-copy-trace --
    vspipe test.py /dev/null` with a synthetic BlankClip input (decode never
    hides the kernels). This gives per-kernel times in µs; time your own kernels
-   the same way (`VSFEEL_DFTTEST_GPU_BENCH=N`, or `RADV_DEBUG=shaderstats`).
+   with warm in-command-buffer timestamp queries, not a cold one-shot bench:
+   reset the query pool and stamp (CB head / post-barrier / per-stage ends)
+   inside the single submitted CB, arm one shot on a warm frame (~100 —
+   frame 0 runs at idle clocks, ~500 MHz vs ~2 GHz steady; check
+   `pp_dpm_sclk`), read back with `vkCmdCopyQueryPoolResults` + `WAIT_BIT`.
+   Reset and stamps must share one CB or pool reuse across frames/resources
+   races; stamps from a CB that was recorded but never submitted read back as
+   absolute epoch values, so sanity-check deltas.
    Correlate structural differences (frame caches, launch config, stream/queue
    counts) against the numbers before trusting any theory — e.g. the DFTTest
    frame cache was worth only ~+24%, NOT the whole lead.
@@ -124,7 +131,12 @@ RX 7900XTX, so a fair comparison is possible. Method that worked for DFTTest:
    For our SPIR-V, `RADV_DEBUG=asm` dumps the ACO ISA; `RADV_DEBUG=shaderstats`
    prints VGPR/LDS/occupancy. Count total instructions and the FP-op
    distribution (v_fma, v_rcp, v_mov, s_mov, v_dual_*). A 3x instruction-count
-   gap means ~2.5x time.
+   gap means ~2.5x time. When diffing your own change before/after, watch for
+   schedule-damage signatures, not just the total: doubled `buffer_load_*` =
+   a branch if-converted into loads issued on both sides; an `s_load_b128`
+   spike = push-constant pressure (budget the guaranteed 128 B — growing the
+   block pushes reads through SMEM); a `v_dual_*` drop plus `s_waitcnt`
+   explosion = broken dual-issue packing across the whole kernel.
 3. **Find the bloat source in the higher-level IR first.** DFTTest's culprit
    was `filter_type` as a **runtime push constant**: all 7 filter branches
    stayed alive with full-precision divisions (193 OpFDiv) while OpenCL's
@@ -138,7 +150,11 @@ RX 7900XTX, so a fair comparison is possible. Method that worked for DFTTest:
 
 General lesson: make every branch that is fixed per invocation (filter type,
 bit depth, window shape) a specialization constant or `#if` so the shader
-compiles to its cheapest form.
+compiles to its cheapest form. For branches that vary per frame (cache hit
+vs fallback path), ship two pipelines — a branchless fast variant plus a
+mixed fallback — and let the host pick per dispatch: a uniform `if` in a hot
+loop if-converts into loads issued on both sides plus de-dualized ALU and
+`s_waitcnt` chains (measured 2x slower), and ACO will not save you.
 
 ## Shared plumbing (src/vsfeel.h)
 
@@ -183,7 +199,8 @@ NLMeans tile cache, BM3D ring/result stacks), shaders + launch config, sync
 choreography (pad→copy→fused ordering, host vs device waits), queue/stream
 assignment, cache sizing. `num_queues = min(num_streams, queue_count)`,
 `resource.queue = device->queues[i % num_queues]`; in-flight depth is
-`num_streams` (DFTTest uses `max(num_streams, 8)`).
+`num_streams` (DFTTest uses `max(num_streams, 2)` — queue count and buffer
+count are independent; see the knee rule below).
 
 When porting a new filter, model the stateless path on gaussblur/bilateral
 (fence-only, no cache) and the cached/timeline path on bm3d.
@@ -217,7 +234,9 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   queue, so per-kernel timings taken from multi-stream runs include the other
   stream's interleaved work — attribute kernels only in single-stream traces.
   Identical binaries swing between invocations too, so compare same-session
-  pairs or medians over 1000+ frames, never single short bursts.
+  pairs or medians over 1000+ frames, never single short bursts. A
+  comments-only rebuild that moves a one-shot trace is clock variance, not a
+  regression — check `pp_dpm_sclk` and repeat 3x before debugging.
 - **Never chain build → install → test into one command** (a failed compile
   then silently leaves the stale `.so` installed). Verify binary freshness
   (timestamp-compare, `strings`-grep the installed `.so`) before trusting any
@@ -226,24 +245,42 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   env-gated chrono probe around the frame path (CPU staging / GPU
   submit-wait / download-and-blit) and read it on real content first — kernel
   work that looks dominant from reading code is routinely not the bottleneck.
+  An empty-kernel submit mode reads the host-path ceiling off end-to-end fps
+  in one run (if trivial kernels still miss the target, the host path — not
+  the kernels — is the bottleneck); a ~20-line C program streaming exactly
+  frame-sized bytes settles memcpy-vs-NT upload questions the same
+  afternoon. Do both before theorizing.
   Keep durable probes like this in-tree; delete one-shot diagnostics.
 - **Host orchestration is usually half the performance.** Expect to spend as
   much effort on memory pooling, upload/download paths, cross-stream cache
   sharing, and dispatch/fence structure as on kernels. The big wins come from
   removing work — fusing passes to cut dispatches/barriers/fences, uploading
-  once via DMA straight into its final layout, sharing immutable data
+  once via DMA straight into its final layout, pointing the consumer at the
+  cache in place (per-slice/per-tile source addresses via push constants,
+  e.g. a `slot_base[]` table with a `-1` = fallback sentinel) instead of
+  copying cache→working set and then reading it, sharing immutable data
   lock-free across streams (only writers exclude readers) — not from making
-  the surviving instructions cleverer.
+  the surviving instructions cleverer. The existing fence/resource-reuse gate
+  usually already covers the new (longer) cache lifetime, so no new sync is
+  needed.
 - **Minimize bytes moved, then minimize copies.** Transfer buffers in the
-  narrowest exactly-representable type and widen on load; prefer
-  non-temporal copies for write-once/read-once staging (which requires
-  host-cached memory — uncached kills NT loads); re-measure copy-vs-direct
-  after every structural change, because the answer flips as the code
-  changes. Dump the target GPU's memory-type table once and rule transfer
-  tricks in or out permanently.
+  narrowest exactly-representable type and widen on load. On the 7900XTX,
+  CPU **writes** go to ReBAR host-mapped VRAM with plain `memcpy` (measured
+  64 GB/s vs 31 GB/s for NT stores into write-combining VRAM — the old
+  "streaming stores are always faster" advice is backwards here);
+  **downloads** stay SDMA copies into GTT because CPU reads from the VRAM
+  BAR run at ~1 GB/s. Re-measure copy-vs-direct after every structural
+  change, because the answer flips as the code changes. Dump the target
+  GPU's memory-type table once and rule transfer tricks in or out
+  permanently.
 - **Sweep in-flight depth; set the default at the knee.** Throughput vs
   `num_streams` is never flat and never monotonic — measure it, set the
   filter default at the knee, and state the per-stream VRAM cost next to it.
+  Queue count (`min(num_streams, queue_count)`) and buffer count (ticket
+  depth) are independent: the knee is typically 2 (frame N runs on the GPU
+  while N+1 uploads/records/submits), and deeper pools only add VRAM.
+  Re-sweep after structural changes — the frame cache moved DFTTest's knee
+  8→2 — and never inherit depth constants across redesigns.
   Implementations tied at one depth can differ 2x at another (queue
   starvation vs GPU saturation).
 - **Spec constants cannot size arrays in GLSL.** If an array dimension must
@@ -255,6 +292,12 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   subnormal cliff; scaling values up on store and down on load fixed it).
   Measure the actual drift against the reference and agree on the accuracy
   policy with the user before relaxing any tolerance.
+- **One descriptor set per buffer role; aliased sets fail silent and look
+  fast.** If two paths need different buffers on the same binding (e.g. pad
+  reads upload while fused writes download on binding 1), they need separate
+  sets — sharing one silently redirects writes out of bounds (all-zero output
+  at *higher* fps). BlankClip never catches this. After any memory-path
+  change, noise-diff against the reference *before* trusting fps.
 - **Run Vulkan validation layers when output is inexplicable**
   (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`); they found a zeroed
   buffer-binding table in minutes.
@@ -281,9 +324,23 @@ cmake --build build --config Release
 ```
 
 The SPIR-V shaders are compiled at build time and embedded into a generated C++
-header (`spirv_binaries.h`) via `src/gen_spirv_header.py`. When you add a new
-shader variant, update `CMakeLists.txt` (the `VK_*` lists) and
-`src/gen_spirv_header.py` accordingly.
+header (`spirv_binaries.h`) via `src/gen_spirv_header.py`. Adding a shader
+variant is one step: append its glslc rule to `VK_SPV_OUTPUTS` in
+`CMakeLists.txt` — the header script (`--out <header> <spv...>`) derives
+symbol names from the filenames (`<stem>.spv` → `<stem>_spv` /
+`<stem>_spv_size`), so it never needs editing for new variants.
+
+### How the shader pipeline fits together
+
+Each `src/*.comp` file holds several entry points selected by `-D` defines
+(e.g. `-DENTRY_FUSED -DRADIUS=1 -DBITS=16`); a CMake `foreach` loop compiles
+one `.spv` per variant into `build/vk_spv/`, and `gen_spirv_header.py` packs
+them all into `spirv_binaries.h` as `uint32_t` arrays. The C++ side picks the
+arrays it needs (usually per bit depth / radius at filter creation) and
+creates one `VkShaderModule` + `VkPipeline` per variant. So a new fast-path
+variant means: an `#if` block in the `.comp`, one CMake loop entry (copy a
+neighboring `add_custom_command` and change the `-D` flags + output name),
+and a module/pipeline pair in the filter's creation function — nothing else.
 
 ### Installing the built plugin
 
