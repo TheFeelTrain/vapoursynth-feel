@@ -327,7 +327,7 @@ def _eedi3_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     --eedi3-mclip 0 drops the mclip from the vsfeel/eedi3vk2 calls.
 
     """
-    ns_num = ns.num_streams if ns.num_streams is not None else 4
+    ns_num = ns.num_streams if ns.num_streams is not None else 8
     use_mclip = getattr(ns, "eedi3_mclip", True)
     common = (
         f"field={ns.eedi3_field}, mdis={ns.eedi3_mdis}, nrad={ns.eedi3_nrad}, "

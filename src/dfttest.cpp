@@ -1900,7 +1900,17 @@ static void VS_CC DftCreate(
 
     VkDevice dev = d->device->device;
 
-    int effective_streams = std::max(d->num_streams, 8);
+    // In-flight depth: two resources are enough to keep the GPU fed (one
+    // frame's fused+col2im runs while the next frame uploads/records/submits
+    // on the host); deeper pools only add VRAM (~142 MiB per resource at
+    // 1080p GRAY16: tw padded slices + the num_blocks*256 float spatial
+    // buffer). Measured 2026-09-08 (RX 7900XTX, real-clip cached bench):
+    // S=2 keeps 99.5% of S=8 throughput (994 vs 1000 fps ns=1, 1096 vs 1101
+    // ns=4, chained x3/x5 equal-or-faster) at ~1/4 the VRAM (306 vs 1182
+    // MiB). A single in-flight frame cannot overlap host work with GPU work
+    // (~640 vs ~1000 fps), hence the floor of 2. An explicit num_streams
+    // above the floor is still honoured (deeper ticket + more queues).
+    int effective_streams = std::max(d->num_streams, 2);
     if (const char * es = getenv("VSFEEL_DFTTEST_STREAMS")) {
         effective_streams = atoi(es);
         if (effective_streams < 1) effective_streams = 1;
