@@ -14,6 +14,15 @@ vs-jetpack filters (vsrgtools, vsdenoise, ...). Just pass it in:
     clean = bm3d(clip, 0.7, tr=2, profile=bm3d.Profile.FAST, backend=vsfeel.Backend)
     dft = DFTTest(clip, backend=vsfeel.Backend).denoise({0: 16, 0.5: 8, 1.0: 0}, tr=1)
 
+To also route the *internal* filters vs-jetpack calls on its own (e.g. the
+bilateral postfilter inside ``vsaa.based_aa``), use the backend as a context
+manager — no vs-jetpack changes needed:
+
+    from vsaa import based_aa
+
+    with vsfeel.Backend():
+        based = based_aa(clip, backend=vsfeel.Backend)
+
 """
 
 from .backend import Backend, FeelBackend

@@ -12,7 +12,9 @@ import vapoursynth as vs
 from conftest import frame_to_ndarray
 
 pytest.importorskip("vstools")
+pytest.importorskip("vsaa")
 
+from vsaa import EEDI3  # noqa: E402
 from vsdenoise import bm3d, nl_means  # noqa: E402
 from vsdenoise.fft import DFTTest  # noqa: E402
 from vsrgtools import bilateral, gauss_blur  # noqa: E402
@@ -53,3 +55,30 @@ def test_dfttest_runs_via_jetpack(noise_gray):
     dft = DFTTest(noise_gray, backend=_backend())
     out = dft.denoise({0.0: 16.0, 0.5: 8.0, 1.0: 0.0}, tr=1)
     assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
+
+
+def test_eedi3_runs_via_vsaa(noise_gray):
+    out = EEDI3(backend=_backend()).antialias(noise_gray)
+    assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
+
+
+def test_eedi3h_fallback_matches_native(noise_gray):
+    native = EEDI3(backend=_backend()).antialias(noise_gray, direction=EEDI3.AADirection.HORIZONTAL)
+
+    class _NoH(vsfeel.FeelBackend):
+        supports_h = False
+
+    fallback = EEDI3(backend=_NoH()).antialias(noise_gray, direction=EEDI3.AADirection.HORIZONTAL)
+    assert np.array_equal(frame_to_ndarray(native.get_frame(0)), frame_to_ndarray(fallback.get_frame(0)))
+
+
+def test_backend_context_routes_singletons(noise_gray):
+    old_bilateral, old_gauss = bilateral.backend, gauss_blur.backend
+    with _backend()():
+        assert bilateral.backend is _backend()
+        assert gauss_blur.backend is _backend()
+        # implicit backend= (AUTO -> singleton) now routes through vsfeel
+        assert np.isfinite(frame_to_ndarray(bilateral(noise_gray, sigmaS=3.0, sigmaR=0.02).get_frame(0))).all()
+        assert np.isfinite(frame_to_ndarray(gauss_blur(noise_gray, 1.5).get_frame(0))).all()
+    assert bilateral.backend == old_bilateral
+    assert gauss_blur.backend == old_gauss

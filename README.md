@@ -200,6 +200,15 @@ smooth = gauss_blur(clip, 1.5, backend=vsfeel.Backend)
 denoised = nl_means(clip, h=0.2, tr=2, a=2, s=4, ref=ref, planes=[1, 2], backend=vsfeel.Backend)
 ```
 
+To also route the *internal* filters vs-jetpack calls on its own (e.g. the bilateral postfilter inside `vsaa.based_aa`), use the backend as a context manager:
+
+```python
+from vsaa import based_aa
+
+with vsfeel.Backend():
+    based = based_aa(clip, backend=vsfeel.Backend)
+```
+
 ## Manual Compilation
 
 ```bash
