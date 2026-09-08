@@ -418,19 +418,37 @@ struct DFTTestResource {
         int id {};
         VkBuffer staging {};
     VkDeviceMemory staging_mem {};
+    // ReBAR upload buffer (host-mapped VRAM): the CPU memcpy of the tight
+    // upload planes lands directly in VRAM, so the pad kernel reads VRAM
+    // instead of GTT over PCIe. Falls back to staging (up_direct=false)
+    // when no host-visible device-local memory exists. Download stays in
+    // staging (CPU reads from the VRAM BAR are ~1 GB/s; SDMA->GTT wins).
+    VkBuffer up_buf {};
+    VkDeviceMemory up_mem {};
+    void * up_map {};
+    bool up_direct {};
     VkBuffer padded_buf {};         // device-local padded source planes
     VkDeviceMemory padded_mem {};
     VkBuffer spatial_buf {};        // device-local float block buffer
     VkDeviceMemory spatial_mem {};
     VkCommandPool pool {};
-    VkCommandBuffer cmd {};      // pre-recorded fused + col2im
-    VkCommandBuffer cmd2 {};     // per-frame D2D copies (slot -> padded planes)
+    VkCommandBuffer cmd {};      // per-frame fused + col2im (slot-direct addresses)
+    VkCommandBuffer cmd2 {};     // unused (was the D2D copy CB pre-slot-direct); kept for layout stability
     // one pad command buffer per (plane, temporal slice): a pad op records
     // and submits its own at claim time; a per-op buffer guarantees a buffer
     // is never re-recorded while its previous submission is still executing
     std::vector<VkCommandBuffer> cmd_pad {};
     VkFence fence {};
+    // GPU timestamp query pool: 8 slots (reset/copy-avail barrier, pad end,
+    // copy end, fused end, col2im end + spares). Written+read back only when
+    // VSFEEL_DFTTEST_QBENCH=1 on frame 0; zero cost otherwise (no queries
+    // recorded in the normal path).
+    VkQueryPool qpool {};
+    VkBuffer qbuf {};             // device->host readable timestamp results
+    VkDeviceMemory qmem {};
+    uint64_t * qmap {};
     VkDescriptorSet desc_set {};
+    VkDescriptorSet pad_set {};   // same layout; binding 1 = upload buffer (up_buf when up_direct)
     VkQueue queue {};
     std::mutex * queue_lock {};
     float * map {};
@@ -458,6 +476,10 @@ struct PushConstants {
     float pmin;
     float pmax;
     float beta;
+    // slot-direct fused: per-temporal-slice byte offset into the slot buffer
+    // (slot_buf), or -1 when the slice was direct-padded into padded_buf
+    // (all slots busy) and must be read from there instead.
+    int32_t slot_base[7];
 };
 
 struct DftData {
@@ -487,10 +509,12 @@ struct DftData {
     VkShaderModule pad_direct_module {};
     VkShaderModule col2im_module {};
     VkShaderModule fused_module[4] {};
+    VkShaderModule fused_direct_module[4] {};
     VkPipeline pad_slot_pipeline {};
     VkPipeline pad_direct_pipeline {};
     VkPipeline col2im_pipeline {};
     VkPipeline fused_pipeline[4] {};
+    VkPipeline fused_direct_pipeline[4] {};
 
     // shared constant buffer: window, then window_freq, then the sigma array
     VkBuffer wt_buf {};
@@ -500,6 +524,10 @@ struct DftData {
     VkDeviceSize wt_bytes {};
     int32_t wf_base {};             // float offset of window_freq (-1 if !zmean)
     int32_t sigma_base {};          // float offset of sigma array (-1 if scalar)
+    // ReBAR available (any host-visible device-local memory type)? Decided
+    // per-resource at allocation (buffer memory requirements may exclude
+    // the host-visible type); the flag records the outcome of resource 0.
+    bool up_direct_ok { true };
 
     VkDeviceSize upload_total {};   // tight upload planes region (staging)
     VkDeviceSize download_total {}; // output region (staging)
@@ -550,6 +578,15 @@ struct DftData {
             if (resource.map) {
                 vkUnmapMemory(dev, resource.staging_mem);
             }
+            if (resource.up_map) {
+                vkUnmapMemory(dev, resource.up_mem);
+            }
+            if (resource.up_mem) {
+                vkFreeMemory(dev, resource.up_mem, nullptr);
+            }
+            if (resource.up_buf) {
+                vkDestroyBuffer(dev, resource.up_buf, nullptr);
+            }
             if (resource.padded_mem) {
                 vkFreeMemory(dev, resource.padded_mem, nullptr);
             }
@@ -561,6 +598,18 @@ struct DftData {
             }
             if (resource.spatial_buf) {
                 vkDestroyBuffer(dev, resource.spatial_buf, nullptr);
+            }
+            if (resource.qmap) {
+                vkUnmapMemory(dev, resource.qmem);
+            }
+            if (resource.qmem) {
+                vkFreeMemory(dev, resource.qmem, nullptr);
+            }
+            if (resource.qbuf) {
+                vkDestroyBuffer(dev, resource.qbuf, nullptr);
+            }
+            if (resource.qpool) {
+                vkDestroyQueryPool(dev, resource.qpool, nullptr);
             }
             if (resource.cmd2) {
                 vkFreeCommandBuffers(dev, resource.pool, 1, &resource.cmd2);
@@ -606,6 +655,11 @@ struct DftData {
                 vkDestroyPipeline(dev, p, nullptr);
             }
         }
+        for (auto & p : fused_direct_pipeline) {
+            if (p) {
+                vkDestroyPipeline(dev, p, nullptr);
+            }
+        }
         if (col2im_pipeline) {
             vkDestroyPipeline(dev, col2im_pipeline, nullptr);
         }
@@ -625,6 +679,11 @@ struct DftData {
             vkDestroyShaderModule(dev, pad_direct_module, nullptr);
         }
         for (auto & m : fused_module) {
+            if (m) {
+                vkDestroyShaderModule(dev, m, nullptr);
+            }
+        }
+        for (auto & m : fused_direct_module) {
             if (m) {
                 vkDestroyShaderModule(dev, m, nullptr);
             }
@@ -757,7 +816,7 @@ struct SlotOp {
 };
 
 static PushConstants base_pc(const DftData & d) {
-    return PushConstants {
+    PushConstants pc {
         .padded_base = 0,
         .spatial_base = 0,
         .dst_base = 0,
@@ -779,6 +838,10 @@ static PushConstants base_pc(const DftData & d) {
         .pmax = d.pmax,
         .beta = d.beta
     };
+    for (int i = 0; i < 7; ++i) {
+        pc.slot_base[i] = -1;
+    }
+    return pc;
 }
 
 // Appends one pad dispatch (an open command buffer) for a pad op: into the
@@ -807,7 +870,7 @@ static void record_one_pad_dispatch(
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.pad_direct_pipeline);
     }
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
+        d.pipeline_layout, 0, 1, &resource.pad_set, 0, nullptr);
     vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
         0, sizeof(PushConstants), &pc);
     const uint32_t max_grid_x = d.device->limits.maxComputeWorkGroupCount[0];
@@ -889,61 +952,54 @@ static bool submit_pad_op(
         {}, {}, {}, VK_NULL_HANDLE, 0, VK_NULL_HANDLE) == VK_SUCCESS;
 }
 
-// Records the per-frame D2D copy command buffer (resource.cmd2): every slot
-// of the temporal window -> this resource's padded planes. The copies read
-// the slots (written by pads that may have run on another queue), so the
-// submit carrying this buffer waits on the slot semaphores.
-static std::optional<std::string> record_copy_cb(
-    const DftData & d, DFTTestResource & resource, const std::vector<SlotOp> & ops) {
+static bool qbench_on() {
+    static const bool v = getenv("VSFEEL_DFTTEST_QBENCH") != nullptr;
+    return v;
+}
 
-    VkCommandBuffer cmd = resource.cmd2;
-
-    VkCommandBufferBeginInfo begin_info {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .pInheritanceInfo = nullptr
-    };
-    if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
-        return "vkBeginCommandBuffer (copy) failed";
-    }
-
-    if (!trivial_kernels()) {
-        for (const SlotOp & op : ops) {
-            if (op.slot < 0) {
-                continue;  // direct pad: the plane is already in padded_buf
-            }
-            const auto & cfg = d.planes[op.plane];
-            VkBufferCopy copy {
-                .srcOffset = op.slot_base,
-                .dstOffset = cfg.padded_offset +
-                    static_cast<VkDeviceSize>(op.t) * cfg.slot_plane_bytes,
-                .size = cfg.slot_plane_bytes
-            };
-            vkCmdCopyBuffer(cmd, d.slot_buf, resource.padded_buf, 1, &copy);
+// One-shot gate: timestamps are recorded for a single frame only (frame 0),
+// otherwise later frames reusing the same resource reset/rewrite the pool
+// before the readback CB runs.
+// The armed frame id (set by qbench_arm); readback runs only for it.
+static std::atomic<int> qbench_frame { -1 };
+static int qbench_frame_idx() {
+    static const int v = [] {
+        const char * e = getenv("VSFEEL_DFTTEST_QBENCH");
+        if (!e || !*e) {
+            return 100;
         }
-
-        // the copies must be visible to the fused kernel (next command buffer)
-        VkMemoryBarrier mem_barrier {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
-        };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+        return atoi(e);
+    }();
+    return v;
+}
+static bool qbench_arm(int n) {
+    static std::atomic<int> done { 0 };
+    if (!qbench_on() || n != qbench_frame_idx()) {
+        return false;
     }
-
-    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-        return "vkEndCommandBuffer (copy) failed";
+    int expect = 0;
+    if (done.compare_exchange_strong(expect, 1)) {
+        qbench_frame.store(n);
+        return true;
     }
-    return std::nullopt;
+    return false;
+}
+
+
+// Timestamp helpers (qbench only): q0 = fused-CB head, q1 = after the
+// slot-visibility barrier, q2 = fused end, q3 = col2im end. Reset + written
+// by the fused CB itself (single submitted CB — no cross-CB races).
+static void qwrite(VkCommandBuffer cmd, VkQueryPool pool, uint32_t q) {
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, pool, q);
 }
 
 // Records the pre-recorded fused + col2im command buffer (resource.cmd).
+// slot_base[t] carries the frame's per-slice slot addresses (or -1 for a
+// direct-padded slice); empty (creation-time record) means all -1.
 static std::optional<std::string> record_fused_col2im_cb(
     const DftData & d, DFTTestResource & resource,
-    bool with_fused, bool with_col2im) {
+    bool with_fused, bool with_col2im, bool qb = false,
+    const int32_t * slot_base3x7 = nullptr, int tw_direct = 0) {
 
     const VkDevice dev = d.device->device;
     VkCommandBuffer cmd = resource.cmd;
@@ -956,6 +1012,28 @@ static std::optional<std::string> record_fused_col2im_cb(
     };
     if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
         return "vkBeginCommandBuffer (fused) failed";
+    }
+
+    // slot-direct: the pad kernels (submitted earlier, possibly on another
+    // queue) wrote the slots this fused reads. Same-queue ordering is free;
+    // visibility needs this barrier (cross-queue pods additionally wait on
+    // the slot timeline semaphores at submit time).
+    if (qb && resource.qpool) {
+        vkCmdResetQueryPool(cmd, resource.qpool, 0, 8);
+        qwrite(cmd, resource.qpool, 0);
+    }
+    if (!trivial_kernels() && with_fused) {
+        VkMemoryBarrier slot_barrier {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &slot_barrier, 0, nullptr, 0, nullptr);
+    }
+    if (qb && resource.qpool && with_fused) {
+        qwrite(cmd, resource.qpool, 1);
     }
 
     const PushConstants base = base_pc(d);
@@ -972,6 +1050,11 @@ static std::optional<std::string> record_fused_col2im_cb(
         const auto & cfg = d.planes[plane];
 
         PushConstants pc = base;
+        if (slot_base3x7) {
+            for (int t = 0; t < 7; ++t) {
+                pc.slot_base[t] = slot_base3x7[plane * 7 + t];
+            }
+        }
         pc.padded_base = static_cast<int32_t>(cfg.padded_offset);
         pc.spatial_base = static_cast<int32_t>(cfg.spatial_offset);
         pc.dst_base = static_cast<int32_t>(d.upload_total + cfg.download_offset);
@@ -982,9 +1065,25 @@ static std::optional<std::string> record_fused_col2im_cb(
         pc.dst_stride = cfg.width;
 
         if (with_fused) {
-            // fused kernel (SUB_BLOCKS=8 blocks per 128-thread workgroup)
+            // fused kernel (SUB_BLOCKS=8 blocks per 128-thread workgroup).
+            // Slot-direct variant when every slice of the window is
+            // slot-backed (no padded-fallback branch in im2col); else the
+            // mixed variant. Opt out with VSFEEL_DFTTEST_FUSEDDIRECT=0.
+            bool all_direct = slot_base3x7 != nullptr;
+            if (all_direct) {
+                for (int t = 0; t < tw_direct; ++t) {
+                    if (slot_base3x7[plane * 7 + t] < 0) {
+                        all_direct = false;
+                        break;
+                    }
+                }
+            }
+            static const bool allow_direct =
+                !getenv("VSFEEL_DFTTEST_FUSEDDIRECT") ||
+                atoi(getenv("VSFEEL_DFTTEST_FUSEDDIRECT")) != 0;
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                d.fused_pipeline[d.radius]);
+                (allow_direct && all_direct) ? d.fused_direct_pipeline[d.radius] :
+                                               d.fused_pipeline[d.radius]);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                 d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
             vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -993,6 +1092,9 @@ static std::optional<std::string> record_fused_col2im_cb(
             const uint32_t sub_blocks = blocks / 8 + (blocks % 8 != 0 ? 1 : 0);
             const uint32_t grid_x = std::min<uint32_t>(sub_blocks, max_grid_x);
             vkCmdDispatch(cmd, std::max(grid_x, 1u), 1, 1);
+            if (qb && resource.qpool) {
+                qwrite(cmd, resource.qpool, 2);
+            }
         }
 
         if (with_col2im) {
@@ -1017,6 +1119,9 @@ static std::optional<std::string> record_fused_col2im_cb(
             const uint32_t grid_y = std::min<uint32_t>(
                 (static_cast<uint32_t>(cfg.ph) + 7) / 8, max_grid_y);
             vkCmdDispatch(cmd, std::max(grid_x, 1u), std::max(grid_y, 1u), 1);
+            if (qb && resource.qpool && with_col2im) {
+                qwrite(cmd, resource.qpool, 3);
+            }
         }
     }
 
@@ -1189,22 +1294,35 @@ static const VSFrame *VS_CC DftGetFrame(
                 }
                 if (!done) {
                     // padder candidate: upload this source plane to this
-                    // resource's staging, flush it, then re-claim (another
-                    // frame may have padded this source in the meantime, in
-                    // which case this upload was wasted)
+                    // resource's upload region (ReBAR VRAM when up_direct,
+                    // else staging), then re-claim (another frame may have
+                    // padded this source in the meantime, in which case this
+                    // upload was wasted)
                     const uint8_t * srcp = vsapi->getReadPtr(src[t], plane);
                     const int src_stride = vsapi->getStride(src[t], plane);
-                    uint8_t * dstp = reinterpret_cast<uint8_t *>(map) + cfg.upload_offset +
+                    uint8_t * up_base = resource.up_direct ?
+                        reinterpret_cast<uint8_t *>(resource.up_map) :
+                        reinterpret_cast<uint8_t *>(map);
+                    uint8_t * dstp = up_base + cfg.upload_offset +
                         static_cast<size_t>(t) * cfg.upload_bytes / tw;
                     if (src_stride == static_cast<int>(row_bytes)) {
-                        copy_stream_out(dstp, srcp, static_cast<size_t>(cfg.height) * row_bytes);
+                        if (resource.up_direct) {
+                            memcpy(dstp, srcp, static_cast<size_t>(cfg.height) * row_bytes);
+                        } else {
+                            copy_stream_out(dstp, srcp, static_cast<size_t>(cfg.height) * row_bytes);
+                        }
                     } else {
                         for (int y = 0; y < cfg.height; ++y) {
-                            copy_stream_out(dstp + static_cast<size_t>(y) * row_bytes,
-                                srcp + static_cast<size_t>(y) * src_stride, row_bytes);
+                            if (resource.up_direct) {
+                                memcpy(dstp + static_cast<size_t>(y) * row_bytes,
+                                    srcp + static_cast<size_t>(y) * src_stride, row_bytes);
+                            } else {
+                                copy_stream_out(dstp + static_cast<size_t>(y) * row_bytes,
+                                    srcp + static_cast<size_t>(y) * src_stride, row_bytes);
+                            }
                         }
                     }
-                    if (!coherent) {
+                    if (!coherent && !resource.up_direct) {
                         VkMappedMemoryRange flush_range {
                             .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                             .pNext = nullptr,
@@ -1312,14 +1430,24 @@ static const VSFrame *VS_CC DftGetFrame(
             // the ops loop already submitted this frame's pads; wait for the
             // queue to drain before re-recording their command buffers
             vkDeviceWaitIdle(dev0);
+            // slot-direct fused needs this frame's slot addresses
+            int32_t gb_slot_base[3][7];
+            for (int p = 0; p < 3; ++p) {
+                for (int t = 0; t < 7; ++t) {
+                    gb_slot_base[p][t] = -1;
+                }
+            }
+            for (const SlotOp & op : ops) {
+                if (op.slot >= 0) {
+                    gb_slot_base[op.plane][op.t] = static_cast<int32_t>(op.slot_base);
+                }
+            }
             auto bench_stage = [&](int stage, const char * name) {
                 if (record_pad_cb(*d, resource, ops)) {
                     return;
                 }
-                if (record_copy_cb(*d, resource, ops)) {
-                    return;
-                }
-                if (record_fused_col2im_cb(*d, resource, stage >= 1, stage >= 2)) {
+                if (record_fused_col2im_cb(*d, resource, stage >= 1, stage >= 2, false,
+                        &gb_slot_base[0][0], d->tw)) {
                     return;
                 }
                 auto gb_start = std::chrono::steady_clock::now();
@@ -1334,15 +1462,6 @@ static const VSFrame *VS_CC DftGetFrame(
                         .pCommandBuffers = &pad_cb
                     };
                     vkQueueSubmit(resource.queue, 1, &pad_si, VK_NULL_HANDLE);
-                    VkCommandBuffer copy_cb = resource.cmd2;
-                    VkSubmitInfo si {
-                        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                        .pNext = nullptr,
-                        .commandBufferCount = 1,
-                        .pCommandBuffers = &copy_cb
-                    };
-                    vkQueueSubmit(resource.queue, 1, &si, resource.fence);
-                    vkWaitForFences(dev0, 1, &resource.fence, VK_TRUE, UINT64_MAX);
                     if (stage >= 1) {
                         VkCommandBuffer cb = resource.cmd;
                         VkSubmitInfo si2 {
@@ -1353,24 +1472,33 @@ static const VSFrame *VS_CC DftGetFrame(
                         };
                         vkQueueSubmit(resource.queue, 1, &si2, resource.fence);
                         vkWaitForFences(dev0, 1, &resource.fence, VK_TRUE, UINT64_MAX);
+                    } else {
+                        vkQueueSubmit(resource.queue, 1, &pad_si, resource.fence);
+                        vkWaitForFences(dev0, 1, &resource.fence, VK_TRUE, UINT64_MAX);
                     }
                 }
                 auto gb_end = std::chrono::steady_clock::now();
                 double ms = std::chrono::duration_cast<std::chrono::nanoseconds>(gb_end - gb_start).count() / 1e6 / iters;
                 fprintf(stderr, "[dfttest-gpubench] %-20s %.4f ms\n", name, ms);
             };
-            bench_stage(0, "pad+copy");
-            bench_stage(1, "pad+copy+fused");
-            bench_stage(2, "pad+copy+fused+col2im");
+            bench_stage(0, "pad");
+            bench_stage(1, "pad+fused");
+            bench_stage(2, "pad+fused+col2im");
         }
 
-        if (const auto err = record_copy_cb(*d, resource, ops)) {
-            set_error(*err);
-            return nullptr;
+        const bool qb = qbench_arm(n);
+        // slot-direct: per-slice slot addresses for the fused kernel (-1 =
+        // direct-padded slice, already in padded_buf). One row per plane.
+        int32_t slot_base[3][7];
+        for (int p = 0; p < 3; ++p) {
+            for (int t = 0; t < 7; ++t) {
+                slot_base[p][t] = -1;
+            }
         }
-        if (const auto err = record_fused_col2im_cb(*d, resource, true, true)) {
-            set_error(*err);
-            return nullptr;
+        for (const SlotOp & op : ops) {
+            if (op.slot >= 0) {
+                slot_base[op.plane][op.t] = static_cast<int32_t>(op.slot_base);
+            }
         }
 
         if (dfttest_trace()) {
@@ -1378,9 +1506,18 @@ static const VSFrame *VS_CC DftGetFrame(
                 n, resource.id, waits.size());
         }
 
+        // slot-direct fused submit: waits on the slot generations (pads may
+        // run on another queue) at COMPUTE stage; the head barrier in cmd
+        // covers same-queue visibility. The copy CB is now empty (kept for
+        // qbench stamps only) — no separate submit.
         {
+            if (const auto err = record_fused_col2im_cb(*d, resource, true, true, qb,
+                    &slot_base[0][0], d->tw)) {
+                set_error(*err);
+                return nullptr;
+            }
             std::vector<VkPipelineStageFlags> wait_stages(waits.size(),
-                VK_PIPELINE_STAGE_TRANSFER_BIT);
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
             std::vector<VkSemaphore> wait_sems(waits.size());
             std::vector<uint64_t> wait_vals(waits.size());
             for (size_t i = 0; i < waits.size(); ++i) {
@@ -1388,16 +1525,8 @@ static const VSFrame *VS_CC DftGetFrame(
                 wait_vals[i] = waits[i].second;
             }
             checkVK(submit_timeline(dev, resource.queue, resource.queue_lock,
-                resource.cmd2, wait_sems, wait_vals, wait_stages,
-                VK_NULL_HANDLE, 0, VK_NULL_HANDLE));
-            if (dfttest_trace()) {
-                fprintf(stderr, "[dfttest-trace]   n=%d res=%d copy submitted\n", n, resource.id);
-            }
-        }
-
-        {
-            checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
-                resource.cmd, resource.fence));
+                resource.cmd, wait_sems, wait_vals, wait_stages,
+                VK_NULL_HANDLE, 0, resource.fence));
             if (dfttest_trace()) {
                 fprintf(stderr, "[dfttest-trace]   n=%d res=%d fused submitted\n", n, resource.id);
             }
@@ -1409,6 +1538,51 @@ static const VSFrame *VS_CC DftGetFrame(
         }
         checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
         auto t5 = std::chrono::steady_clock::now();
+
+        // Steady-state per-stage GPU times (qbench only, frame 0): copy the
+        // 4 availability-stamped timestamps back with a throwaway CB and
+        // print pad/copy/fused/col2im deltas. timestampPeriod is 10 ns/tick.
+        if (qbench_on() && resource.qpool && n == qbench_frame.load()) {
+            VkCommandBuffer qcmd;
+            VkCommandBufferAllocateInfo qai {
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                .pNext = nullptr,
+                .commandPool = resource.pool,
+                .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                .commandBufferCount = 1
+            };
+            if (vkAllocateCommandBuffers(dev, &qai, &qcmd) == VK_SUCCESS) {
+                VkCommandBufferBeginInfo qbi {
+                    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                vkBeginCommandBuffer(qcmd, &qbi);
+                VkBufferCopy qbc { .srcOffset = 0, .dstOffset = 0,
+                    .size = 8 * sizeof(uint64_t) };
+                vkCmdCopyQueryPoolResults(qcmd, resource.qpool, 0, 4, resource.qbuf,
+                    0, sizeof(uint64_t),
+                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                (void)qbc;
+                vkEndCommandBuffer(qcmd);
+                {
+                    std::lock_guard lk(*resource.queue_lock);
+                    vkResetFences(dev, 1, &resource.fence);
+                    VkSubmitInfo qsi { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .commandBufferCount = 1, .pCommandBuffers = &qcmd };
+                    vkQueueSubmit(resource.queue, 1, &qsi, resource.fence);
+                }
+                vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX);
+                vkFreeCommandBuffers(dev, resource.pool, 1, &qcmd);
+                const uint64_t * ts = resource.qmap;
+                fprintf(stderr,
+                    "[dfttest-qbench] pad_end=%.1f copy_end=%.1f fused_end=%.1f col2im_end=%.1f (us, from copy-CB start; period=10ns)\n",
+                    ts[0] * 10.0 / 1000.0, ts[1] * 10.0 / 1000.0,
+                    ts[2] * 10.0 / 1000.0, ts[3] * 10.0 / 1000.0);
+                fprintf(stderr,
+                    "[dfttest-qbench] headbar=%.1fus fused=%.1fus col2im=%.1fus\n",
+                    (ts[1] - ts[0]) * 10.0 / 1000.0,
+                    (ts[2] - ts[1]) * 10.0 / 1000.0,
+                    (ts[3] - ts[2]) * 10.0 / 1000.0);
+            }
+        }
 
         if (const char * dp = getenv("VSFEEL_DFTTEST_DUMP_PAD"); dp && n == atoi(dp)) {
             VkDeviceSize dump_size = 0;
@@ -1917,8 +2091,11 @@ static void VS_CC DftCreate(
     }
 
     // frame-cache slots: a slot holds one padded source plane; K must exceed the
-    // number of distinct source frames in flight (S-1 behind + 1 ahead + reuse)
-    d->slot_count = effective_streams + 3;
+    // number of distinct source frames in flight (S-1 behind + 1 ahead + reuse).
+    // Slot-direct fused reads the slots in place, so a whole temporal window
+    // must fit when processing serially: keep at least tw slots so the
+    // direct-pad fallback stays a rare out-of-order path, not the norm.
+    d->slot_count = std::max(effective_streams + 3, d->tw);
     {
         VkDeviceSize slot_sum = 0;
         for (int plane = 0; plane < num_planes; ++plane) {
@@ -1977,14 +2154,14 @@ static void VS_CC DftCreate(
     }
     {
         VkDescriptorPoolSize pool_size {
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 * static_cast<uint32_t>(effective_streams)
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10 * static_cast<uint32_t>(effective_streams)
         };
 
         VkDescriptorPoolCreateInfo pool_info {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .maxSets = static_cast<uint32_t>(effective_streams),
+            .maxSets = 2 * static_cast<uint32_t>(effective_streams),
             .poolSizeCount = 1,
             .pPoolSizes = &pool_size
         };
@@ -2070,6 +2247,8 @@ static void VS_CC DftCreate(
         size_t col2im_size = 0;
         const uint32_t * fused_code[4] {};
         size_t fused_size[4] {};
+        const uint32_t * fused_direct_code[4] {};
+        size_t fused_direct_size[4] {};
         switch (d->bits) {
             case 16:
                 pad_slot_code = dfttest_16_pad_slot_spv; pad_slot_size = dfttest_16_pad_slot_spv_size;
@@ -2079,6 +2258,10 @@ static void VS_CC DftCreate(
                 fused_code[1] = dfttest_16_fused_r1_spv; fused_size[1] = dfttest_16_fused_r1_spv_size;
                 fused_code[2] = dfttest_16_fused_r2_spv; fused_size[2] = dfttest_16_fused_r2_spv_size;
                 fused_code[3] = dfttest_16_fused_r3_spv; fused_size[3] = dfttest_16_fused_r3_spv_size;
+                fused_direct_code[0] = dfttest_16_fused_direct_r0_spv; fused_direct_size[0] = dfttest_16_fused_direct_r0_spv_size;
+                fused_direct_code[1] = dfttest_16_fused_direct_r1_spv; fused_direct_size[1] = dfttest_16_fused_direct_r1_spv_size;
+                fused_direct_code[2] = dfttest_16_fused_direct_r2_spv; fused_direct_size[2] = dfttest_16_fused_direct_r2_spv_size;
+                fused_direct_code[3] = dfttest_16_fused_direct_r3_spv; fused_direct_size[3] = dfttest_16_fused_direct_r3_spv_size;
                 break;
             case 32:
                 pad_slot_code = dfttest_32_pad_slot_spv; pad_slot_size = dfttest_32_pad_slot_spv_size;
@@ -2088,6 +2271,10 @@ static void VS_CC DftCreate(
                 fused_code[1] = dfttest_32_fused_r1_spv; fused_size[1] = dfttest_32_fused_r1_spv_size;
                 fused_code[2] = dfttest_32_fused_r2_spv; fused_size[2] = dfttest_32_fused_r2_spv_size;
                 fused_code[3] = dfttest_32_fused_r3_spv; fused_size[3] = dfttest_32_fused_r3_spv_size;
+                fused_direct_code[0] = dfttest_32_fused_direct_r0_spv; fused_direct_size[0] = dfttest_32_fused_direct_r0_spv_size;
+                fused_direct_code[1] = dfttest_32_fused_direct_r1_spv; fused_direct_size[1] = dfttest_32_fused_direct_r1_spv_size;
+                fused_direct_code[2] = dfttest_32_fused_direct_r2_spv; fused_direct_size[2] = dfttest_32_fused_direct_r2_spv_size;
+                fused_direct_code[3] = dfttest_32_fused_direct_r3_spv; fused_direct_size[3] = dfttest_32_fused_direct_r3_spv_size;
                 break;
             default:
                 return set_error("unsupported bit depth");
@@ -2113,6 +2300,13 @@ static void VS_CC DftCreate(
                 return set_error(std::get<std::string>(result));
             }
             d->fused_module[r] = std::get<VkShaderModule>(result);
+        }
+        for (int r = 0; r < 4; ++r) {
+            const auto result = create_shader_module(*d->device, fused_direct_code[r], fused_direct_size[r]);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            d->fused_direct_module[r] = std::get<VkShaderModule>(result);
         }
         {
             const auto result = create_shader_module(*d->device, col2im_code, col2im_size);
@@ -2145,6 +2339,15 @@ static void VS_CC DftCreate(
                 return set_error(std::get<std::string>(result));
             }
             d->fused_pipeline[r] = std::get<VkPipeline>(result);
+        }
+        for (int r = 0; r < 4; ++r) {
+            const auto result = create_pipeline(*d->device, d->fused_direct_module[r], d->pipeline_layout,
+                d->device->subgroup_size_control ? 32 : 0, d->filter_type,
+                d->zmean ? 1 : 0);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            d->fused_direct_pipeline[r] = std::get<VkPipeline>(result);
         }
         {
             const auto result = create_pipeline(*d->device, d->col2im_module, d->pipeline_layout,
@@ -2225,6 +2428,58 @@ static void VS_CC DftCreate(
             resource.staging_type_index = std::get<AllocatedMemory>(result).type_index;
         }
 
+        // ReBAR upload buffer: host-mapped VRAM the CPU writes directly.
+        // Falls back (up_direct=false, staging upload region is used) when
+        // the buffer cannot be backed by host-visible device-local memory.
+        // Opt out with VSFEEL_DFTTEST_UPDIRECT=0.
+        {
+            const char * ud = getenv("VSFEEL_DFTTEST_UPDIRECT");
+            const bool want_direct = !ud || atoi(ud) != 0;
+            resource.up_direct = false;
+            if (want_direct && d->upload_total > 0) {
+                VkBufferCreateInfo up_info {
+                    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .size = std::max(d->upload_total, VkDeviceSize(4)),
+                    .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                    .queueFamilyIndexCount = 0,
+                    .pQueueFamilyIndices = nullptr
+                };
+                checkVK(vkCreateBuffer(dev, &up_info, nullptr, &resource.up_buf));
+                const auto up_result = allocate_memory(
+                    *d->device, resource.up_buf,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                if (!std::holds_alternative<std::string>(up_result)) {
+                    const uint32_t ti = std::get<AllocatedMemory>(up_result).type_index;
+                    const auto flags =
+                        d->device->mem_props.memoryTypes[ti].propertyFlags;
+                    if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+                        (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                        resource.up_mem = std::get<AllocatedMemory>(up_result).memory;
+                        checkVK(vkMapMemory(dev, resource.up_mem, 0,
+                            std::max(d->upload_total, VkDeviceSize(4)), 0,
+                            &resource.up_map));
+                        resource.up_direct = true;
+                    } else {
+                        vkFreeMemory(dev, std::get<AllocatedMemory>(up_result).memory,
+                            nullptr);
+                        vkDestroyBuffer(dev, resource.up_buf, nullptr);
+                        resource.up_buf = VK_NULL_HANDLE;
+                    }
+                } else {
+                    vkDestroyBuffer(dev, resource.up_buf, nullptr);
+                    resource.up_buf = VK_NULL_HANDLE;
+                }
+            }
+            if (i == 0) {
+                d->up_direct_ok = resource.up_direct;
+                fprintf(stderr, "[dfttest] up_direct=%d\n", resource.up_direct ? 1 : 0);
+            }
+        }
+
         {
             VkBufferCreateInfo buffer_info {
                 .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -2301,6 +2556,44 @@ static void VS_CC DftCreate(
             };
             checkVK(vkCreateFence(dev, &fence_info, nullptr, &resource.fence));
         }
+        // Timestamp query pool + host-readable result buffer (qbench only;
+        // allocated always — 8×8 B + query pool object is negligible).
+        {
+            VkQueryPoolCreateInfo qpool_info {
+                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                .queryCount = 8,
+                .pipelineStatistics = 0
+            };
+            checkVK(vkCreateQueryPool(dev, &qpool_info, nullptr, &resource.qpool));
+        }
+        {
+            VkBufferCreateInfo buffer_info {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .size = 8 * sizeof(uint64_t),
+                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr
+            };
+            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.qbuf));
+        }
+        {
+            const auto result = allocate_memory(
+                *d->device, resource.qbuf,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            resource.qmem = std::get<AllocatedMemory>(result).memory;
+        }
+        checkVK(vkMapMemory(dev, resource.qmem, 0, 8 * sizeof(uint64_t), 0,
+            reinterpret_cast<void **>(&resource.qmap)));
         resource.id = i;
         d->res_meta.push_back(std::make_unique<ResMeta>());
         {
@@ -2312,6 +2605,7 @@ static void VS_CC DftCreate(
                 .pSetLayouts = &d->set_layout
             };
             checkVK(vkAllocateDescriptorSets(dev, &alloc_info, &resource.desc_set));
+            checkVK(vkAllocateDescriptorSets(dev, &alloc_info, &resource.pad_set));
         }
 
         {
@@ -2324,6 +2618,11 @@ static void VS_CC DftCreate(
                 .buffer = resource.staging,
                 .offset = 0,
                 .range = staging_size
+            };
+            VkDescriptorBufferInfo upload_info {
+                .buffer = resource.up_direct ? resource.up_buf : resource.staging,
+                .offset = 0,
+                .range = VK_WHOLE_SIZE
             };
             VkDescriptorBufferInfo spatial_info {
                 .buffer = resource.spatial_buf,
@@ -2405,6 +2704,36 @@ static void VS_CC DftCreate(
             };
 
             vkUpdateDescriptorSets(dev, 5, writes, 0, nullptr);
+
+            VkWriteDescriptorSet pad_write {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = resource.pad_set,
+                .dstBinding = 1,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pImageInfo = nullptr,
+                .pBufferInfo = &upload_info,
+                .pTexelBufferView = nullptr
+            };
+            // pad_set shares bindings 0/2/3/4 with desc_set; only binding 1
+            // (upload reads) differs. Copy the rest, then override binding 1.
+            VkCopyDescriptorSet copies[1] {
+                {
+                    .sType = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET,
+                    .pNext = nullptr,
+                    .srcSet = resource.desc_set,
+                    .srcBinding = 0,
+                    .srcArrayElement = 0,
+                    .dstSet = resource.pad_set,
+                    .dstBinding = 0,
+                    .dstArrayElement = 0,
+                    .descriptorCount = 5
+                }
+            };
+            vkUpdateDescriptorSets(dev, 0, nullptr, 1, copies);
+            vkUpdateDescriptorSets(dev, 1, &pad_write, 0, nullptr);
         }
 
         checkVK(vkMapMemory(dev, resource.staging_mem, 0, staging_size, 0, reinterpret_cast<void **>(&resource.map)));

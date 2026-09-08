@@ -113,6 +113,7 @@ layout(push_constant) uniform PushConstants {
     float pmin;
     float pmax;
     float beta;
+    int slot_base[7];   // per-slice byte offset into slot[] (-1 = direct-padded slice in padded)
 } pc;
 
 int calc_pad_size(int size, int block_step) {
@@ -1311,6 +1312,41 @@ float to_float(uint raw) {
 #endif
 }
 
+// the fused kernel reads the padded source: slot-direct for cached slices
+// (slot_base[t] = byte offset into slot[]), padded_buf slice t for
+// direct-padded slices (slot_base[t] < 0, all slots were busy). The slice
+// index is uniform across the subgroup, so the branch is a single exec-mask
+// switch, not per-lane divergence.
+uint load_fused_direct(int slice, int sample_idx) {
+    int sb = pc.slot_base[slice];
+#if BITS == 16
+    return uint(slot16[(sb >> 1) + sample_idx]);
+#else
+    int byte = sb + sample_idx * ELEM_BYTES;
+    uint word = slot_raw[byte >> 2];
+    return (word >> (8 * (byte & 3))) & ELEM_MASK;
+#endif
+}
+uint load_fused(int slice, int sample_idx, int pad_slice) {
+    int sb = pc.slot_base[slice];
+    if (sb >= 0) {
+#if BITS == 16
+        return uint(slot16[(sb >> 1) + sample_idx]);
+#else
+        int byte = sb + sample_idx * ELEM_BYTES;
+        uint word = slot_raw[byte >> 2];
+        return (word >> (8 * (byte & 3))) & ELEM_MASK;
+#endif
+    }
+#if BITS == 16
+    return uint(padded16[(pc.padded_base >> 1) + slice * pad_slice + sample_idx]);
+#else
+    int byte = pc.padded_base + (slice * pad_slice + sample_idx) * ELEM_BYTES;
+    uint word = padded_raw[byte >> 2];
+    return (word >> (8 * (byte & 3))) & ELEM_MASK;
+#endif
+}
+
 // the fused kernel reads the padded source from the device-local padded buffer
 uint load_raw(int sample_idx) {
 #if BITS == 16
@@ -1446,12 +1482,23 @@ void filter_value(inout float re, inout float im, int x, int y, int t) {
 #define TD_IDFT_ALL(d) TD_IDFT_7(d)
 #endif
 
+#if defined(FUSED_DIRECT)
 #define IM2COL_SLICE(d, i) { \
+    const int row0 = (iy * pc.block_step) * pw + ix * pc.block_step + lane; \
+    const int wrow0 = pc.wt_base + ((i) * 16) * 16 + lane; \
     for (int j = 0; j < 16; ++j) { \
-        const int src_off = ((i) * ph + iy * pc.block_step + j) * pw + ix * pc.block_step + lane; \
-        d[(i) * 32 + j] = to_float(load_raw(src_off)) * wt[pc.wt_base + ((i) * 16 + j) * 16 + lane]; \
+        d[(i) * 32 + j] = to_float(load_fused_direct(i, row0 + j * pw)) * wt[wrow0 + j * 16]; \
     } \
 }
+#else
+#define IM2COL_SLICE(d, i) { \
+    const int row0 = (iy * pc.block_step) * pw + ix * pc.block_step + lane; \
+    const int wrow0 = pc.wt_base + ((i) * 16) * 16 + lane; \
+    for (int j = 0; j < 16; ++j) { \
+        d[(i) * 32 + j] = to_float(load_fused(i, row0 + j * pw, pw * ph)) * wt[wrow0 + j * 16]; \
+    } \
+}
+#endif
 #define SPATIAL_SLICE(d, i) { \
     const int B = (i) * 32; \
     subgroupBarrier(); \

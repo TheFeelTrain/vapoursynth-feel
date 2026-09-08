@@ -142,6 +142,19 @@ if(VK_GLSLC)
                         "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
                 DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
                 VERBATIM)
+            # slot-direct fused variant (no padded-fallback branch in im2col);
+            # used when every temporal slice of the frame lives in a slot
+            set(raw_spv "${VK_SPV_DIR}/dfttest_${bits}_fused_direct_r${radius}.spv")
+            list(APPEND VK_SPV_OUTPUTS "${raw_spv}")
+            add_custom_command(
+                OUTPUT "${raw_spv}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
+                COMMAND ${VK_GLSLC} --target-env=vulkan1.3 -O -fshader-stage=compute -DBITS=${bits}
+                        -DENTRY_FUSED -DFUSED_DIRECT -DRADIUS=${radius}
+                        -o "${raw_spv}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
+                VERBATIM)
         endforeach()
     endforeach()
     # NLMeans: weight / accumulation / finish / pad entry points per io
@@ -283,6 +296,10 @@ add_custom_command(
             "${VK_SPV_DIR}/dfttest_16_fused_r1.spv"
             "${VK_SPV_DIR}/dfttest_16_fused_r2.spv"
             "${VK_SPV_DIR}/dfttest_16_fused_r3.spv"
+            "${VK_SPV_DIR}/dfttest_16_fused_direct_r0.spv"
+            "${VK_SPV_DIR}/dfttest_16_fused_direct_r1.spv"
+            "${VK_SPV_DIR}/dfttest_16_fused_direct_r2.spv"
+            "${VK_SPV_DIR}/dfttest_16_fused_direct_r3.spv"
             "${VK_SPV_DIR}/dfttest_32_pad_slot.spv"
             "${VK_SPV_DIR}/dfttest_32_pad_direct.spv"
             "${VK_SPV_DIR}/dfttest_32_col2im.spv"
@@ -290,6 +307,10 @@ add_custom_command(
             "${VK_SPV_DIR}/dfttest_32_fused_r1.spv"
             "${VK_SPV_DIR}/dfttest_32_fused_r2.spv"
             "${VK_SPV_DIR}/dfttest_32_fused_r3.spv"
+            "${VK_SPV_DIR}/dfttest_32_fused_direct_r0.spv"
+            "${VK_SPV_DIR}/dfttest_32_fused_direct_r1.spv"
+            "${VK_SPV_DIR}/dfttest_32_fused_direct_r2.spv"
+            "${VK_SPV_DIR}/dfttest_32_fused_direct_r3.spv"
             "${VK_SPV_DIR}/nlmeans_16_weight.spv"
             "${VK_SPV_DIR}/nlmeans_16_acc.spv"
             "${VK_SPV_DIR}/nlmeans_16_finish.spv"
