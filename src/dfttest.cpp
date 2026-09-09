@@ -2476,7 +2476,9 @@ static void VS_CC DftCreate(
             }
             if (i == 0) {
                 d->up_direct_ok = resource.up_direct;
-                fprintf(stderr, "[dfttest] up_direct=%d\n", resource.up_direct ? 1 : 0);
+                if (dfttest_trace() || getenv("VSFEEL_DFTTEST_DBG")) {
+                    fprintf(stderr, "[dfttest] up_direct=%d\n", resource.up_direct ? 1 : 0);
+                }
             }
         }
 

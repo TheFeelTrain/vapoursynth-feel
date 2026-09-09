@@ -398,14 +398,25 @@ static const VSFrame *VS_CC BilateralGetFrame(
             &d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
 
         {
+            // Host phase probe (VSFEEL_BILAT_TRACE): accumulated microsecond
+            // stage timings, reported as averages every 200 frames. Zero
+            // overhead when unset (no clock reads, no atomic traffic).
+            static const bool trace = trace_on("VSFEEL_BILAT_TRACE");
             static std::atomic<uint64_t> t_up {}, t_wait {}, t_dl {}, t_bit {}, t_sub {}, t_acq {};
             static std::atomic<uint32_t> t_nf {};
             static std::atomic<int> t_inf {}, t_peak {};
             auto now_us = [] { return std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count(); };
-            auto t0 = now_us();
-            auto mark = [&](std::atomic<uint64_t> & acc) { acc += now_us() - t0; t0 = now_us(); };
+            auto t0 = trace ? now_us() : 0;
+            auto mark = [&](std::atomic<uint64_t> & acc) {
+                if (trace) {
+                    acc += now_us() - t0; t0 = now_us();
+                }
+            };
             auto dump = [&] {
+                if (!trace) {
+                    return;
+                }
                 uint32_t nf = t_nf.load();
                 if (nf > 0 && nf % 200 == 0) {
                     fprintf(stderr, "[perf] frames=%u inf=%d acq=%.2f up=%.2f sub=%.2f wait=%.2f bit=%.2f (ms avg)\n",
@@ -417,15 +428,22 @@ static const VSFrame *VS_CC BilateralGetFrame(
                 }
             };
 
-            auto t_acq0 = now_us();
+            auto t_acq0 = trace ? now_us() : 0;
             auto resource = d->pool.take();
-            t_acq += now_us() - t_acq0;
+            if (trace) {
+                t_acq += now_us() - t_acq0;
+            }
             // reset the stage clock after the acquire: the take() wait is
             // accounted in t_acq and must not leak into t_up
-            t0 = now_us();
-            int inf = t_inf.fetch_add(1) + 1;
-            int peak = t_peak.load();
-            while (inf > peak && !t_peak.compare_exchange_weak(peak, inf)) {}
+            if (trace) {
+                t0 = now_us();
+            }
+            int peak = 0;
+            if (trace) {
+                int inf = t_inf.fetch_add(1) + 1;
+                peak = t_peak.load();
+                while (inf > peak && !t_peak.compare_exchange_weak(peak, inf)) {}
+            }
 
         auto set_error = [&](const std::string & error_message) {
             d->pool.give_back(std::move(resource));
@@ -559,9 +577,11 @@ static const VSFrame *VS_CC BilateralGetFrame(
 
         mark(t_bit);
         mark(t_dl);
-        t_inf.fetch_sub(1);
-        t_nf.fetch_add(1);
-        dump();
+        if (trace) {
+            t_inf.fetch_sub(1);
+            t_nf.fetch_add(1);
+            dump();
+        }
 
         d->pool.give_back(std::move(resource));
         }

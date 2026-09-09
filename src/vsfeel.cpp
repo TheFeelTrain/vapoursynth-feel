@@ -124,8 +124,10 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     }
     dev->subgroup_size_control =
         dev->min_subgroup_size <= 32 && 32 <= dev->max_subgroup_size;
-    fprintf(stderr, "[vsfeel] subgroup_size_control=%d min=%u max=%u\n",
-        dev->subgroup_size_control, dev->min_subgroup_size, dev->max_subgroup_size);
+    if (trace_on("VSFEEL_DBG")) {
+        fprintf(stderr, "[vsfeel] subgroup_size_control=%d min=%u max=%u\n",
+            dev->subgroup_size_control, dev->min_subgroup_size, dev->max_subgroup_size);
+    }
 
     vkGetPhysicalDeviceMemoryProperties(dev->physical_device, &dev->mem_props);
 
