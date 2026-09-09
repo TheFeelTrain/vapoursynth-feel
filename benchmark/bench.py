@@ -103,10 +103,11 @@ def make_aa_vpy(
     frames: int,
     cache_frames: int | None = 400,
     eedi3_field: int = 3,
+    bits: int = AA_MASK_BITS,
 ) -> str:
     """Real-clip vpy that mirrors vsaa.based_aa's EEDI3 usage:
 
-    - luma of the source at AA_MASK_BITS (16)
+    - luma of the source at `bits` (16 or 32, like the ss clip)
     - edge mask: Prewitt -> binarize(mask_thr=60 scaled to depth) -> box_blur(Maximum)
     - both luma and mask are Point-upscaled 2x (the "supersampling"; the user
       chose a plain Point upscale over ArtCNN)
@@ -150,11 +151,11 @@ import vapoursynth as vs
 core.max_cache_size = 1024 * 48
 
 src = BestSource(cachepath=None).source({clip!r}, 32)
-luma = depth(get_y(src), {AA_MASK_BITS})
+luma = depth(get_y(src), {bits})
 
 # vsaa.based_aa mask chain (defaults: Prewitt, mask_thr=60)
 mask = EdgeDetect.ensure_obj(Prewitt).edgemask(luma)
-mask = Morpho.binarize_mask(mask, scale_mask(60, 8, {AA_MASK_BITS}))
+mask = Morpho.binarize_mask(mask, scale_mask(60, 8, {bits}))
 mask = box_blur(mask.std.Maximum())
 
 # Point 2x upscale of input + mask (user: "double the size of the input frames
@@ -526,7 +527,8 @@ def bench(plugin: str, chain: str, clip: str, frames: int, synth_format: str | N
 
 def bench_aa(plugin: str, chain: str, clip: str, frames: int,
              cache_frames: int | None = None,
-             eedi3_field: int = 3) -> float | None:
+             eedi3_field: int = 3,
+             bits: int = AA_MASK_BITS) -> float | None:
     """Run an EEDI3 anti-aliasing style benchmark (see make_aa_vpy)."""
     vpy = make_aa_vpy(
         clip=clip,
@@ -535,6 +537,7 @@ def bench_aa(plugin: str, chain: str, clip: str, frames: int,
         frames=frames,
         cache_frames=cache_frames,
         eedi3_field=eedi3_field,
+        bits=bits,
     )
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"bench_{plugin}.vpy"
@@ -605,9 +608,13 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
             # AA benchmark on real content: cache holds the 2x Point-upscaled
             # luma + the 2x edge mask (both ~16.6 MB/frame at 1080p->2160p
             # GRAY16), so the timed region measures only the EEDI3 call.
+            # fp32 frames are twice the bytes, so halve the cap to pin ~the
+            # same bytes in RAM (a 500-frame fp32 cache thrashes swap).
+            aa_cap = 500 if (ns.bits or AA_MASK_BITS) == 16 else 250
             fps = bench_aa(plugin, calls[plugin], ns.clip, frames,
-                           min(cache_frames or 400, 500),
-                           getattr(ns, "eedi3_field", 3))
+                           min(cache_frames or 400, aa_cap),
+                           getattr(ns, "eedi3_field", 3),
+                           ns.bits or AA_MASK_BITS)
         else:
             fps = bench(plugin, calls[plugin], ns.clip, frames, synth, cache_frames, cache_conv)
         results.append((plugin, fps))
