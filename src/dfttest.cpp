@@ -572,7 +572,9 @@ struct DftData {
             return;
         }
         VkDevice dev = device->device;
-        vkDeviceWaitIdle(dev);
+        // retire this instance's own submissions (per queue) instead of
+        // idling the whole device, which other filters may be sharing
+        retire_instance(pool);
 
         for (auto & resource : pool.items) {
             if (resource.map) {
@@ -2530,7 +2532,11 @@ static void VS_CC DftCreate(
             VkCommandPoolCreateInfo pool_info {
                 .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                 .pNext = nullptr,
-                .flags = 0,
+                // this filter re-records its command buffers every frame
+                // (pad/fused/col2im); implicit reset at vkBeginCommandBuffer
+                // requires the pool flag, otherwise the buffer must be in the
+                // initial state (VUID-vkBeginCommandBuffer-commandBuffer-00050)
+                .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
                 .queueFamilyIndex = d->device->queue_family
             };
             checkVK(vkCreateCommandPool(dev, &pool_info, nullptr, &resource.pool));

@@ -21,13 +21,13 @@ one rounding step. Self-consistency checks (determinism) remain exact.
 Run from the repository root:  python -m pytest tests/test_bilateral.py
 """
 
-import ctypes
-
 import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import HEIGHT, WIDTH, assert_gray32, frame_to_ndarray
+from conftest import (
+    assert_gray32, format_dtype, frame_to_ndarray, plane_to_ndarray,
+)
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
@@ -49,19 +49,12 @@ def _ref(clip, **kwargs):
 
 
 def _plane(frame, plane):
-    """Copy a frame plane into an ndarray, honouring the row pitch."""
-    fmt = frame.format
-    itemsize = fmt.bytes_per_sample
-    ss_w = fmt.subsampling_w if plane in (1, 2) and fmt.num_planes >= 3 else 0
-    ss_h = fmt.subsampling_h if plane in (1, 2) and fmt.num_planes >= 3 else 0
-    w = frame.width >> ss_w
-    h = frame.height >> ss_h
-    raw = np.ctypeslib.as_array(
-        ctypes.cast(frame.get_read_ptr(plane), ctypes.POINTER(ctypes.c_uint8)),
-        shape=(h, frame.get_stride(plane)),
-    )
-    dtype = np.float32 if fmt.sample_type == vs.FLOAT else np.uint16
-    return raw[:, :w * itemsize].copy().view(dtype).reshape(h, w)
+    """Copy a frame plane into an ndarray, honouring the row pitch.
+
+    Delegates to the shared stride-aware reader (geometry derived from the
+    frame, result always a fresh copy).
+    """
+    return plane_to_ndarray(frame, plane, format_dtype(frame.format))
 
 
 def _max_diff(a_node, b_node, frames=(0, 11, 23)):

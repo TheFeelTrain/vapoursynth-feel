@@ -193,76 +193,151 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     dev->queue_family = best_family;
     dev->queue_count = best_queues;
 
-    const float queue_priority { 1.0f };
+    // One priority per requested queue: the specification (and every driver)
+    // reads pQueuePriorities[0 .. queueCount), so the array must be that long.
+    // A single float here made the driver read past the object.
+    std::vector<float> queue_priorities(best_queues, 1.0f);
     VkDeviceQueueCreateInfo queue_info {
         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
         .queueFamilyIndex = best_family,
         .queueCount = best_queues,
-        .pQueuePriorities = &queue_priority
+        .pQueuePriorities = queue_priorities.data()
     };
 
+    // Query the physical device for every feature the shipped shaders need
+    // before asking for it. The answers are recorded in VK_Device so a filter
+    // whose shaders require a missing feature can report a precise creation
+    // error instead of relying on the driver accepting the pipeline anyway.
+    // The extension list comes first: an extension feature struct must only be
+    // chained when the extension itself is supported.
+    bool atomic_float_ext = false;
+    {
+        uint32_t ext_count = 0;
+        vkEnumerateDeviceExtensionProperties(dev->physical_device, nullptr, &ext_count, nullptr);
+        std::vector<VkExtensionProperties> exts(ext_count);
+        if (ext_count) {
+            vkEnumerateDeviceExtensionProperties(dev->physical_device, nullptr, &ext_count, exts.data());
+            for (const auto & e : exts) {
+                if (std::strcmp(e.extensionName, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME) == 0) {
+                    atomic_float_ext = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    VkPhysicalDeviceVulkan11Features supported_11 {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+        .pNext = nullptr
+    };
+    VkPhysicalDeviceVulkan12Features supported_12 {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .pNext = &supported_11
+    };
+    VkPhysicalDeviceVulkan13Features supported_13 {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+        .pNext = &supported_12
+    };
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT supported_atomic_float {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+        .pNext = &supported_13
+    };
+    VkPhysicalDeviceSubgroupSizeControlFeatures supported_subgroup {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES,
+        .pNext = atomic_float_ext ? static_cast<void *>(&supported_atomic_float)
+                                  : static_cast<void *>(&supported_13)
+    };
+    VkPhysicalDeviceFeatures2 supported_features {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &supported_subgroup,
+        .features = {}
+    };
+    vkGetPhysicalDeviceFeatures2(dev->physical_device, &supported_features);
+
+    dev->feat_float64 = supported_features.features.shaderFloat64 == VK_TRUE;
+    dev->feat_16bit_storage = supported_11.storageBuffer16BitAccess == VK_TRUE;
+    dev->feat_8bit_storage = supported_12.storageBuffer8BitAccess == VK_TRUE &&
+                             supported_12.shaderInt8 == VK_TRUE;
+    dev->feat_vulkan_memory_model = supported_12.vulkanMemoryModel == VK_TRUE;
+    dev->feat_maintenance4 = supported_13.maintenance4 == VK_TRUE;
+    dev->feat_atomic_float32_add = atomic_float_ext &&
+        supported_atomic_float.shaderBufferFloat32AtomicAdd == VK_TRUE;
+    dev->feat_compute_full_subgroups =
+        supported_subgroup.computeFullSubgroups == VK_TRUE;
+
     VkPhysicalDeviceFeatures features {};
-    features.shaderFloat64 = VK_TRUE;
+    features.shaderFloat64 = dev->feat_float64 ? VK_TRUE : VK_FALSE;
 
     // EEDI3 stores its int8 predecessor/direction/mask buffers in SSBOs and
-    // does int8 ALU on them. These are core Vulkan 1.2 features (the RDNA3
-    // target supports all of them); chained via the Vulkan 1.1/1.2 structs.
+    // does int8 ALU on them; its row/vcheck shaders use
+    // GL_KHR_memory_scope_semantics (VulkanMemoryModel, SPIR-V `OpMemoryModel
+    // Logical Vulkan`) and `local_size_x_id` (LocalSizeId, which needs
+    // maintenance4). BM3D accumulates into float SSBOs with atomicAdd, which
+    // needs VK_EXT_shader_atomic_float. Timeline semaphores (core 1.2) back
+    // the DFTTest/BM3D frame caches. All of these live in the 1.1/1.2/1.3
+    // feature structs; chaining the individual promoted structs alongside
+    // them is what VUID-VkDeviceCreateInfo-pNext-02830 forbids.
     VkPhysicalDeviceVulkan12Features vulkan12_features {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
         .pNext = nullptr,
-        .storageBuffer8BitAccess = VK_TRUE,
-        .uniformAndStorageBuffer8BitAccess = VK_TRUE,
+        .storageBuffer8BitAccess = supported_12.storageBuffer8BitAccess,
+        .uniformAndStorageBuffer8BitAccess = supported_12.uniformAndStorageBuffer8BitAccess,
         .storagePushConstant8 = VK_FALSE,
         .shaderFloat16 = VK_FALSE,
-        .shaderInt8 = VK_TRUE,
-        .descriptorIndexing = VK_FALSE
+        .shaderInt8 = supported_12.shaderInt8,
+        .descriptorIndexing = VK_FALSE,
+        .timelineSemaphore = supported_12.timelineSemaphore,
+        .vulkanMemoryModel = supported_12.vulkanMemoryModel,
+        .vulkanMemoryModelDeviceScope = supported_12.vulkanMemoryModelDeviceScope
     };
 
     VkPhysicalDeviceVulkan11Features vulkan11_features {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
         .pNext = &vulkan12_features,
-        .storageBuffer16BitAccess = VK_TRUE,
-        .uniformAndStorageBuffer16BitAccess = VK_TRUE,
+        .storageBuffer16BitAccess = supported_11.storageBuffer16BitAccess,
+        .uniformAndStorageBuffer16BitAccess = supported_11.uniformAndStorageBuffer16BitAccess,
         .storagePushConstant16 = VK_FALSE,
         .storageInputOutput16 = VK_FALSE
     };
 
-    VkPhysicalDeviceSubgroupSizeControlFeatures subgroup_features {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES,
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float_features {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
         .pNext = &vulkan11_features,
-        .subgroupSizeControl = VK_TRUE,
-        .computeFullSubgroups = VK_FALSE
+        .shaderBufferFloat32AtomicAdd =
+            dev->feat_atomic_float32_add ? VK_TRUE : VK_FALSE
     };
 
-    // Timeline semaphores (core since Vulkan 1.2): the DFTTest frame cache
-    // signals a per-generation value and lets any number of copies wait on it
-    // non-destructively (binary semaphores would let a second waiter linger).
-    VkPhysicalDeviceTimelineSemaphoreFeatures timeline_features {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
-        .pNext = &subgroup_features,
-        .timelineSemaphore = VK_TRUE
+    VkPhysicalDeviceVulkan13Features vulkan13_features {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+        .pNext = &atomic_float_features,
+        .subgroupSizeControl = supported_13.subgroupSizeControl,
+        .computeFullSubgroups = supported_13.computeFullSubgroups,
+        .maintenance4 = supported_13.maintenance4
     };
 
-    const char * device_exts[2] = {
-        VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME, nullptr
-    };
-    uint32_t device_ext_count = 1;
+    // VK_EXT_shader_atomic_float carries the atomicAdd(float) feature; it is
+    // not promoted to core, so the extension has to be enabled for the
+    // feature struct to be meaningful.
+    std::vector<const char *> device_exts { VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME };
     if (dev->host_import) {
-        device_exts[device_ext_count++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+        device_exts.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    }
+    if (atomic_float_ext) {
+        device_exts.push_back(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
     }
 
     VkDeviceCreateInfo device_info {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = &timeline_features,
+        .pNext = &vulkan13_features,
         .flags = 0,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &queue_info,
         .enabledLayerCount = 0,
         .ppEnabledLayerNames = nullptr,
-        .enabledExtensionCount = device_ext_count,
-        .ppEnabledExtensionNames = device_exts,
+        .enabledExtensionCount = static_cast<uint32_t>(device_exts.size()),
+        .ppEnabledExtensionNames = device_exts.data(),
         .pEnabledFeatures = &features
     };
 
@@ -335,15 +410,71 @@ void copy_stream_read(void * dst, const void * src, size_t bytes) {
     s += align;
     d += align;
     bytes -= align;
+    // movntdqa faults on a misaligned source, and rows inside a pitched plane
+    // are routinely misaligned (any visible row width not a multiple of 32
+    // bytes, e.g. a 630-pixel float32 plane). Keep the non-temporal load only
+    // when the source actually is 32-byte aligned; the streaming *stores*
+    // (which only need the destination, aligned above) are kept either way.
+    const bool aligned_src = (reinterpret_cast<uintptr_t>(s) & 31) == 0;
     size_t i = 0;
-    for (; i + 64 <= bytes; i += 64) {
-        _mm256_stream_si256(reinterpret_cast<__m256i *>(d + i),
-            _mm256_stream_load_si256(reinterpret_cast<const __m256i *>(s + i)));
-        _mm256_stream_si256(reinterpret_cast<__m256i *>(d + i + 32),
-            _mm256_stream_load_si256(reinterpret_cast<const __m256i *>(s + i + 32)));
+    if (aligned_src) {
+        for (; i + 64 <= bytes; i += 64) {
+            _mm256_stream_si256(reinterpret_cast<__m256i *>(d + i),
+                _mm256_stream_load_si256(reinterpret_cast<const __m256i *>(s + i)));
+            _mm256_stream_si256(reinterpret_cast<__m256i *>(d + i + 32),
+                _mm256_stream_load_si256(reinterpret_cast<const __m256i *>(s + i + 32)));
+        }
+    } else {
+        for (; i + 64 <= bytes; i += 64) {
+            _mm256_stream_si256(reinterpret_cast<__m256i *>(d + i),
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + i)));
+            _mm256_stream_si256(reinterpret_cast<__m256i *>(d + i + 32),
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + i + 32)));
+        }
     }
     if (i < bytes) {
         memcpy(d + i, s + i, bytes - i);
+    }
+}
+
+void copy_plane_out(void * dst, ptrdiff_t dst_pitch, const void * src,
+                    ptrdiff_t src_pitch, size_t row_bytes, int height, bool nt) {
+    if (height <= 0 || row_bytes == 0) {
+        return;
+    }
+    const auto copy_row = [nt](void * d, const void * s, size_t n) {
+        if (nt) {
+            copy_stream_out(d, s, n);
+        } else {
+            memcpy(d, s, n);
+        }
+    };
+    if (dst_pitch == static_cast<ptrdiff_t>(row_bytes) &&
+        src_pitch == static_cast<ptrdiff_t>(row_bytes)) {
+        copy_row(dst, src, row_bytes * static_cast<size_t>(height));
+        return;
+    }
+    for (int y = 0; y < height; ++y) {
+        copy_row(static_cast<uint8_t *>(dst) + static_cast<ptrdiff_t>(y) * dst_pitch,
+                 static_cast<const uint8_t *>(src) + static_cast<ptrdiff_t>(y) * src_pitch,
+                 row_bytes);
+    }
+}
+
+void copy_plane_read(void * dst, ptrdiff_t dst_pitch, const void * src,
+                     ptrdiff_t src_pitch, size_t row_bytes, int height) {
+    if (height <= 0 || row_bytes == 0) {
+        return;
+    }
+    if (dst_pitch == static_cast<ptrdiff_t>(row_bytes) &&
+        src_pitch == static_cast<ptrdiff_t>(row_bytes)) {
+        copy_stream_read(dst, src, row_bytes * static_cast<size_t>(height));
+        return;
+    }
+    for (int y = 0; y < height; ++y) {
+        copy_stream_read(static_cast<uint8_t *>(dst) + static_cast<ptrdiff_t>(y) * dst_pitch,
+                         static_cast<const uint8_t *>(src) + static_cast<ptrdiff_t>(y) * src_pitch,
+                         row_bytes);
     }
 }
 

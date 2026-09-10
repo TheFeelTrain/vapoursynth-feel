@@ -70,6 +70,17 @@ struct VK_Device {
     uint32_t min_subgroup_size { 64 };
     uint32_t max_subgroup_size { 64 };
     bool subgroup_size_control { false };
+    // Feature availability as queried from the physical device and enabled at
+    // device creation. A filter whose shaders need one of these reports a
+    // precise creation error instead of relying on the driver accepting the
+    // pipeline anyway.
+    bool feat_float64 { false };
+    bool feat_atomic_float32_add { false };
+    bool feat_vulkan_memory_model { false };
+    bool feat_maintenance4 { false };
+    bool feat_compute_full_subgroups { false };
+    bool feat_8bit_storage { false };
+    bool feat_16bit_storage { false };
     std::vector<VK_Queue> queues {};
     std::atomic<intptr_t> refcount { 0 };
 };
@@ -84,8 +95,25 @@ void copy_stream_out(void * dst, const void * src, size_t bytes);
 
 // Streaming copy variant that reads the GPU-written staging without caching
 // it (non-temporal loads) before writing the destination with streaming stores.
-// The source must be 32-byte aligned (staging download offsets always are).
+// The 32-byte-aligned source fast path is used only when the source actually
+// is aligned; anything else falls back to unaligned loads (rows inside a
+// pitched plane are frequently misaligned).
 void copy_stream_read(void * dst, const void * src, size_t bytes);
+
+// Copy `height` visible rows of `row_bytes` bytes from `src` (row pitch
+// `src_pitch`) to `dst` (row pitch `dst_pitch`). When every pitch equals
+// `row_bytes` the whole plane is one contiguous copy; otherwise the rows are
+// copied one at a time, so padded VapourSynth frame strides and GPU-aligned
+// plane pitches are both handled. `nt` selects streaming stores (right for the
+// GTT staging buffers) instead of ordinary cached stores (right for the
+// write-combined VRAM BAR window).
+void copy_plane_out(void * dst, ptrdiff_t dst_pitch, const void * src,
+                    ptrdiff_t src_pitch, size_t row_bytes, int height, bool nt);
+
+// Row-wise counterpart of copy_stream_read with independent source and
+// destination pitches (GPU plane pitch in, frame stride out).
+void copy_plane_read(void * dst, ptrdiff_t dst_pitch, const void * src,
+                     ptrdiff_t src_pitch, size_t row_bytes, int height);
 
 struct AllocatedMemory {
     VkDeviceMemory memory;
@@ -160,6 +188,39 @@ void destroy_common(VkDevice dev, T & r) {
     }
     if (r.staging) {
         vkDestroyBuffer(dev, r.staging, nullptr);
+    }
+}
+
+// Retire this instance's own GPU work without idling a shared device.
+// VapourSynth destroys a filter instance only after every frame callback has
+// returned, and each frame path waits for its own fence before returning, so
+// this instance's submissions have already completed by teardown. What
+// remains is Vulkan's external synchronization: drain every queue the
+// instance submitted on, holding that queue's lock. A device-wide
+// vkDeviceWaitIdle here would stall (and, without the queue locks, race)
+// unrelated filters sharing the same device; the device-wide idle stays in
+// release_device(), where the refcount proves no other filter exists.
+template <typename T>
+inline void retire_instance(const FramePool<T> & pool) {
+    std::vector<std::pair<VkQueue, std::mutex *>> queues;
+    for (const auto & r : pool.items) {
+        if (!r.queue) {
+            continue;
+        }
+        bool seen = false;
+        for (const auto & q : queues) {
+            if (q.first == r.queue) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            queues.emplace_back(r.queue, r.queue_lock);
+        }
+    }
+    for (auto & q : queues) {
+        std::lock_guard lock(*q.second);
+        vkQueueWaitIdle(q.first);
     }
 }
 

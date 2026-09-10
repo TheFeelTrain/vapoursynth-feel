@@ -38,6 +38,16 @@ Speed matters more than code size or elegance. Do not be afraid to rewrite a
 filter wholesale if it makes it meaningfully faster, as long as it stays
 correct and keeps passing the tests.
 
+**Per-stream efficiency is the metric, not raw per-frame throughput.** A filter
+that only looks fast because it burns 24 streams on a 24 GB card is a worse
+result than one that matches it at 8. `num_streams = 8` is the **maximum**
+default any filter should ship: it is the established sweet spot across the
+existing filters, keeps per-instance VRAM bounded, and leaves headroom in a
+user's surrounding graph. If a filter only wins above 8 streams, treat that as
+evidence the per-stream path is inefficient — find the inefficiency rather than
+raising the count. Sweep below 8 as well (4 and 6 are common knees) and ship
+the lowest count that reaches the plateau.
+
 When tuning, use the benchmark (below) to measure before/after, and treat the
 GPUs documented here as the target. `MANGOHUD=0` should be set for every
 benchmark run — it does not change results, it just suppresses extra messages
@@ -231,6 +241,26 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   verifiable in minutes — loose bounds cannot catch a one-column indexing
   slip. Pair small targeted tests with real-content checks; they catch
   disjoint bug classes.
+- **A recorded dead end decays: re-test it against the CURRENT code, and
+  record the mechanism, not the verdict.** "Host-visible VRAM is poison (27.6
+  fps)" and "reading staging directly collapses to 178 fps" were both true for
+  the technique that was tried (ordinary cached stores into uncached memory)
+  and both false for a different technique on the same memory (NT stores: +29%
+  on EEDI3). Before inheriting a dead end, ask whether your variant actually
+  shares the failed mechanism. The strongest signal that one is stale is that
+  **another filter in this repo already ships the thing the notes call
+  impossible** — nnedi3 had the exact ReBAR NT-store upload. When notes and
+  shipped code disagree, read the code.
+- **For a semantics-preserving rewrite, build inputs that straddle the new
+  code's decision boundaries.** The oracle alone was not enough: EEDI3's
+  replacement mask predicate was off by one (`>= 130` instead of `>= 129`) and
+  BOTH binary masks and uniformly-random masks passed — neither can see a
+  threshold error. Only masks concentrated at the boundary (values 120–139)
+  exposed it. So when you swap a computation for a cheaper equivalent, run the
+  old and new implementations side by side on identical inputs across
+  distributions that target every threshold, rounding, and tie-break in the
+  new code. Comparing both against a reference is weaker: the reference may
+  itself be permissive.
 - **Compose variants from shipped filters before writing new code.** A filter
   that is a geometric or parametric transform of an existing one can often be
   a few invokes with zero new state — correct by construction, with a free
@@ -254,9 +284,11 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   flat, triage in order: 5x same-command repeats, then alone-vs-pair
   interleaving, then `pp_dpm_sclk` / `gpu_busy_percent` polled in a loop
   *during* the run (a single read after a 2–3 s run only ever sees idle),
-  then thermals and host load. Same-session pairs stay fair through all of
-  it — grade on those, and lengthen the run before trusting any absolute
-  number (short runs are clock-ramp-sensitive).
+  then thermals and host load, then **harness memory** (see the bimodal rule
+  below — additive frame caches overflowing RAM produce exactly this
+  signature). Same-session pairs stay fair through all of it — grade on those,
+  and lengthen the run before trusting any absolute number (short runs are
+  clock-ramp-sensitive).
 - **Never chain build → install → test into one command** (a failed compile
   then silently leaves the stale `.so` installed). Verify binary freshness
   (timestamp-compare, `strings`-grep the installed `.so`) before trusting any
@@ -265,16 +297,37 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   env-gated chrono probe around the frame path (CPU staging / GPU
   submit-wait / download-and-blit) and read it on real content first — kernel
   work that looks dominant from reading code is routinely not the bottleneck.
-  An empty-kernel submit mode reads the host-path ceiling off end-to-end fps
-  in one run (if trivial kernels still miss the target, the host path — not
-  the kernels — is the bottleneck); a ~20-line C program streaming exactly
-  frame-sized bytes settles memcpy-vs-NT upload questions the same
-  afternoon. Do both before theorizing.
   Reset the stage clock after every blocking acquire (pool take, fence wait)
   so waits never leak into the next stage, and cross-check summed stages
   against wall-clock before trusting any split — a stage reporting
   milliseconds for a microsecond memcpy is a timer bug, not a finding.
   Keep durable probes like this in-tree; delete one-shot diagnostics.
+- **"I removed the work and nothing changed" is a RESULT, not a failed probe.**
+  On EEDI3, deleting the entire DP + backtrack + interpolate changed fps by
+  −1%: the GPU kernel was fully hidden behind the host path at that stream
+  count. The correct conclusion is *the frame is host-bound and the GPU has
+  spare capacity* — stop tuning kernels and go count CPU bytes. Frame cost is
+  roughly `max(GPU, host)` per stream, so which side you are on can only be
+  read off an ablation, never inferred from kernel timings. Build the ablation
+  ladder as remove-all → remove-half → remove-one so the answer is unambiguous.
+- **An isolated microbenchmark proposes; only an in-situ same-session A/B
+  decides.** A standalone C program said plain `memcpy` beat the NT-store path
+  3.7× (0.14 vs 0.51 ms/frame); in the real filter that same change *lost*
+  (blit 6.1 → 10.4 ms/frame, 481 → 401 fps), because the isolated test has no
+  competing streams, no other cache pressure, and no write-combining
+  contention. Prefer a **runtime knob plus a same-session sweep of the real
+  binary** — ten lines, and both arms are measured under identical conditions.
+  Reach for the scratch C program only to rule a mechanism *out*, never to
+  pick a winner.
+- **When every host stage costs about the same, you are bound by a shared
+  resource — not by a hot loop.** EEDI3's ladder read blit ~20%, upload gather
+  ~16%, vcheck ~10%, sclip ~10%, and no stage dominated. Additive costs of
+  similar size mean the host memory path; a single dominant item means a loop
+  to optimize. Tell them apart with the ladder (one stage, then pairs, then
+  all), and expect the fix to be "move fewer bytes", not "make a loop
+  tighter". Related: **aggregate CPU copy bandwidth falls as thread count
+  rises** (measured ~101 GB/s at 2 threads vs ~54 at 8), so more streams can
+  *reduce* total host throughput.
 - **Host orchestration is usually half the performance.** Expect to spend as
   much effort on memory pooling, upload/download paths, cross-stream cache
   sharing, and dispatch/fence structure as on kernels. The big wins come from
@@ -287,16 +340,47 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   the surviving instructions cleverer. The existing fence/resource-reuse gate
   usually already covers the new (longer) cache lifetime, so no new sync is
   needed.
-- **Minimize bytes moved, then minimize copies.** Transfer buffers in the
-  narrowest exactly-representable type and widen on load. On the 7900XTX,
-  CPU **writes** go to ReBAR host-mapped VRAM with plain `memcpy` (measured
-  64 GB/s vs 31 GB/s for NT stores into write-combining VRAM — the old
-  "streaming stores are always faster" advice is backwards here);
-  **downloads** stay SDMA copies into GTT because CPU reads from the VRAM
-  BAR run at ~1 GB/s. Re-measure copy-vs-direct after every structural
-  change, because the answer flips as the code changes. Dump the target
-  GPU's memory-type table once and rule transfer tricks in or out
-  permanently.
+- **Minimize bytes moved, then minimize copies — and count reads per source
+  byte, not just copies.** Transfer buffers in the narrowest
+  exactly-representable type and widen on load (native u16 pad instead of f32
+  halved EEDI3's upload, H2D and pad-read traffic at once). Then audit the
+  frame for any buffer whose *same source bytes* are read by two different
+  loops: merging a second pass into the first while the row is still cache-hot
+  is nearly free and was worth +3.5% on EEDI3 while deleting 8.3 MB/frame of
+  pure DRAM re-reads.
+- **Upload path (measured on the 7900XTX, and it has flipped repeatedly —
+  re-measure per filter).** The winner is **NT stores directly into a
+  host-visible VRAM buffer** (`DEVICE_LOCAL|HOST_VISIBLE|COHERENT`, mapped
+  once, `_mm_sfence()` before submit, no H2D copy and no transfer→compute
+  barrier): +29% on EEDI3 over cached-system-RAM staging + `vkCmdCopyBuffer`.
+  The catch is that the host-visible device-local types here are **uncached**,
+  so ordinary cached stores into them are catastrophic (measured 27.6 fps) —
+  only the NT store form is fast. Within the older staging approach, NT stores
+  also beat plain `memcpy` in situ (400–417 vs 331 fps over 8 combos). The
+  isolated microbenchmark said the OPPOSITE (memcpy 0.14 vs NT 0.51 ms/frame) —
+  see the probe rule below: **an isolated copy benchmark proposes, only an
+  in-situ same-session A/B decides.**
+  **UNRESOLVED CONTRADICTION — measure before trusting either side:** a
+  previous session recorded the reverse for a plain 64 GB/s vs 31 GB/s
+  throughput comparison (memcpy into ReBAR VRAM *beating* NT stores). Both
+  numbers are real measurements on this box, so the winner evidently depends
+  on the buffer, size, or access pattern. Treat the upload path as
+  unfixed: implement it behind an env opt-out, sweep both arms in situ, and
+  record which one won and for what shape.
+  Downloads stay kernel-direct (the GPU writing results straight into host
+  staging beat a device-local buffer + SDMA D2H, 568 vs 553 fps); CPU reads
+  from the VRAM BAR remain ~1 GB/s, so never let the CPU read results back
+  from a VRAM buffer.
+- **Do not invoke a graph node to normalize an input your kernel only reads as
+  a predicate.** EEDI3 forced every mask through `SetFrameProps(_Range=1) ->
+  resize.Point -> Gray8` so the kernel could test `byte != 0` — a whole extra
+  full-frame pass in the graph, every frame. Because the reduction is
+  monotonic, that predicate is exactly `v >= 129` on the native u16 input, so
+  the node was deleted for an instant +8%. Whenever a filter adds a
+  std/resize/format node at create time, ask what the consumer actually needs
+  from it; a monotone transform or a threshold can usually be folded into the
+  native data. Verify equivalence exhaustively when the domain is small
+  (65536 values is a proof, not a hope).
 - **Port a proven memory path to the next filter before tuning kernels.**
   Once a transfer structure wins on one filter (device-local buffers,
   host-direct upload, kernel-direct download, native element types), port
@@ -305,14 +389,19 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   most of the absolute gain. Ablate each leg with its opt-out env flag so
   the contribution is measured, and keep those flags as durable tuning
   knobs rather than deleting them as one-shot diagnostics.
-- **Sweep in-flight depth; set the default at the knee.** Throughput vs
-  `num_streams` is never flat and never monotonic — measure it, set the
-  filter default at the knee, and state the per-stream VRAM cost next to it.
-  Queue count and buffer count (ticket depth) are independent: the knee is
-  typically 2 (frame N runs on the GPU while N+1 uploads/records/submits),
-  and deeper pools only add VRAM.
-  Re-sweep after structural changes — the frame cache moved DFTTest's knee
-  8→2 — and never inherit depth constants across redesigns.
+- **Sweep in-flight depth; set the default at the knee, and never above 8.**
+  Throughput vs `num_streams` is never flat and never monotonic — measure it,
+  set the filter default at the knee, and state the per-stream VRAM cost next
+  to it. **`num_streams = 8` is the hard maximum for a shipped default** (see
+  "The goal"); a knee above 8 means the per-stream path needs work, not a
+  higher count. Queue count and buffer count (ticket depth) are independent:
+  the knee is typically 2 (frame N runs on the GPU while N+1
+  uploads/records/submits), and deeper pools only add VRAM.
+  **Re-sweep the knee after every structural change** — it is a property of
+  where the bottleneck sits, so shifting work between host and GPU moves it.
+  EEDI3's knee went 8 → 12 when the upload path was made cheaper, and DFTTest's
+  went 8 → 2 when the frame cache landed. Never inherit depth constants, or
+  knee conclusions, across redesigns.
   Implementations tied at one depth can differ 2x at another (queue
   starvation vs GPU saturation).
 - **Sweep queue sharing independently of stream count.**
@@ -370,6 +459,36 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
 - **Run Vulkan validation layers when output is inexplicable**
   (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`); they found a zeroed
   buffer-binding table in minutes.
+- **The CPU-side staging code deserves as much scrutiny as the shaders.**
+  Once the host path is the limiter, the wins are in the C++: EEDI3's
+  single largest absolute cost was a scalar per-row loop in the *host* code
+  (6.1 ms/frame, ~22× slower than the SIMD rewrite), not anything on the GPU.
+  Two patterns to hunt:
+  - **Serial scans carrying a scalar across iterations** (`last = ...` style
+    state that each step depends on). If the loop computes a *window* property
+    (is-any-set, coverage, box-sum reachability), it is usually a **dilation**,
+    and dilations compose (`dil_a ∘ dil_b == dil_(a+b)`) — so a packed-bit
+    formulation collapses O(N) serial steps into O(log N) shift-OR passes
+    over machine words. 6.1 → 0.28 ms/frame here. Pack predicate bits with
+    `_mm256_cmpeq_epi8` + `movemask`, or for u16 with an xor-bias + signed
+    `cmpgt` + `movemask` (remember `cmpgt` is strict: for `v >= T` the
+    constant is `T-1`).
+  - **Repeated reads of one source buffer by separate loops** (see the
+    read-counting rule above).
+  Prove a new SIMD kernel against a brute-force oracle over randomized inputs
+  *before* wiring it in, including a fallback path for shapes the vector form
+  cannot express (narrow rows, oversized parameters).
+- **A bimodal measurement is a bug to chase, and the harness's memory budget
+  is part of the measurement.** One binary swung 143–260 fps on consecutive
+  fp32 runs while the GPU-bound reference stayed flat at ~190. The cause was
+  the *harness*: the framework's `max_cache_size` and the harness's own
+  decoded-frame cache are additive, and together they exceeded RAM. When you
+  see the "one side swings, other stays flat" signature, add **harness memory**
+  to the triage list (clocks, thermals, queue count, host load). And when
+  fixing it, shrink the *test-specific* cache, not the shared framework one:
+  lowering `max_cache_size` instead made the timed region re-run the upstream
+  chain and collapsed *every* plugin by 3–4× — a much more confusing failure
+  than the original noise.
 - **Decompose kernel cost with short-lived probes**, not theory: kill the
   theory with arithmetic before coding anything — bandwidth math (taps ×
   bytes × pixels vs bus), value-range math (min/max exponent vs subnormal),
@@ -386,7 +505,14 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   each stage (all-skip, full-work, no auxiliary data) read ceilings directly
   off end-to-end fps.
 - **Keep `notes/<filter>.md` updated immediately** after every finding,
-  including dead ends, so nothing is re-derived or retried later.
+  including dead ends, so nothing is re-derived or retried later. Since notes
+  are gitignored, they are local working memory: another checkout will not
+  have them, so anything that must survive belongs in this file or in a code
+  comment. **Worked examples of most rules above live in `notes/EEDI3.md`
+  rounds 10–12** (host-bounded frames, the SIMD dilation rewrite, the ReBAR
+  upload, the boundary-input oracle bug, the harness-memory bimodality, and a
+  list of measured non-wins) — worth reading before starting a new filter,
+  even though none of it is EEDI3-specific.
 
 ## Building
 
@@ -455,6 +581,11 @@ working tree and describe what should be committed.
 1. Read the reference implementation for the filter in `reference/`.
 2. Check the current vsfeel implementation and its tests.
 3. Build and run the benchmark + tests to get a baseline.
-4. Optimize / port, rebuilding and copying the `.so` as described above.
-5. Re-benchmark and re-test; keep going until vsfeel is faster than the
+4. **Measure the host/GPU split before optimizing** (the chrono probe), then
+   run an ablation ladder (remove-all / remove-half) to find which side is
+   actually the limiter. Do not assume it is the kernels.
+5. Optimize / port, keeping each candidate behind an env opt-out so it can be
+   A/B'd in situ, and re-sweep the stream knee afterwards. Rebuild and copy
+   the `.so` as described above.
+6. Re-benchmark and re-test; keep going until vsfeel is faster than the
    references while still passing all tests.

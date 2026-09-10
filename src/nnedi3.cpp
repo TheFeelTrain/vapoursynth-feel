@@ -396,7 +396,9 @@ struct Nnedi3Data {
             return;
         }
         VkDevice dev = device->device;
-        vkDeviceWaitIdle(dev);
+        // retire this instance's own submissions (per queue) instead of
+        // idling the whole device, which other filters may be sharing
+        retire_instance(pool);
 
         for (auto & resource : pool.items) {
             if (resource.map) {
@@ -557,7 +559,10 @@ static std::variant<VkPipeline, std::string> create_pipeline(
         // Full subgroups like the reference (REQUIRE_FULL_SUBGROUPS_BIT):
         // both kernels keep subgroup-uniform control flow (early exits are
         // per-subgroup uniform), so the scheduler can pack waves tightly.
-        .flags = required_subgroup_size
+        // The flag requires the computeFullSubgroups feature to be enabled
+        // (VUID-VkPipelineShaderStageCreateInfo-flags-02785), so it is only
+        // set when the device actually exposes it.
+        .flags = (required_subgroup_size && dev.feat_compute_full_subgroups)
             ? VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT
             : VkPipelineShaderStageCreateFlags(0),
         .stage = VK_SHADER_STAGE_COMPUTE_BIT,

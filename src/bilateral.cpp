@@ -93,7 +93,9 @@ struct BilateralData {
             return;
         }
         VkDevice dev = device->device;
-        vkDeviceWaitIdle(dev);
+        // retire this instance's own submissions (per queue) instead of
+        // idling the whole device, which other filters may be sharing
+        retire_instance(pool);
 
         for (auto & resource : pool.items) {
             if (resource.map) {
@@ -484,23 +486,25 @@ static const VSFrame *VS_CC BilateralGetFrame(
             auto srcp = vsapi->getReadPtr(src, plane);
             auto dstp = upload_base + cfg.upload_offset;
 
-            // raw byte copy of the plane (staging/VRAM layout matches the
-            // frame pitch); plain memcpy into the mapped VRAM window (the
-            // window is write-combined: streaming stores measured slower),
-            // streaming stores into GTT staging (keeps the lines clean in
-            // DRAM so the GPU does not pay snoop/writeback stalls)
+            // raw byte copy of the plane. The GPU plane pitch rounds the
+            // visible width up to 16 bytes and need not match either the
+            // VapourSynth frame stride or the visible row length, so copy the
+            // visible rows one at a time unless all three coincide. Plain
+            // memcpy into the mapped VRAM window (the window is write-
+            // combined: streaming stores measured slower), streaming stores
+            // into GTT staging (keeps the lines clean in DRAM so the GPU does
+            // not pay snoop/writeback stalls)
             if (!nocpu) {
-                const auto bytes = static_cast<size_t>(cfg.width * d->elem_bytes) * height;
-                if (d->host_direct_upload) {
-                    memcpy(dstp, srcp, bytes);
-                } else {
-                    copy_stream_out(dstp, srcp, bytes);
-                }
+                const size_t row_bytes = static_cast<size_t>(cfg.width) * d->elem_bytes;
+                copy_plane_out(dstp, cfg.pitch_bytes, srcp, s_pitch, row_bytes,
+                    height, !d->host_direct_upload);
 
                 // reference plane goes directly below the source plane
                 if (d->ref_node) {
                     auto refp = vsapi->getReadPtr(ref, plane);
-                    copy_stream_out(dstp + static_cast<int64_t>(height) * cfg.pitch_bytes, refp, bytes);
+                    copy_plane_out(dstp + static_cast<int64_t>(height) * cfg.pitch_bytes,
+                        cfg.pitch_bytes, refp, vsapi->getStride(ref, plane),
+                        row_bytes, height, true);
                 }
             }
         }
@@ -559,18 +563,18 @@ static const VSFrame *VS_CC BilateralGetFrame(
                     continue;
                 }
 
-                int width = vsapi->getFrameWidth(src, plane);
                 int height = vsapi->getFrameHeight(src, plane);
-                int s_pitch = vsapi->getStride(src, plane);
                 const auto & cfg = d->planes[plane];
 
                 auto dstp = vsapi->getWritePtr(dst, plane);
                 const uint8_t * h_bufferp =
                     static_cast<const uint8_t *>(static_cast<const void *>(map)) + d->upload_total + cfg.download_offset;
 
-                // raw byte copy of the plane (staging layout matches the frame pitch)
-                copy_stream_read(dstp, h_bufferp,
-                    static_cast<size_t>(cfg.width * d->elem_bytes) * height);
+                // raw byte copy of the plane, honouring the GPU plane pitch
+                // and the destination frame's stride
+                copy_plane_read(dstp, vsapi->getStride(dst, plane), h_bufferp,
+                    cfg.pitch_bytes, static_cast<size_t>(cfg.width) * d->elem_bytes,
+                    height);
             }
         }
         }

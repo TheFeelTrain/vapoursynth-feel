@@ -270,7 +270,9 @@ struct Eedi3Data {
             return;
         }
         VkDevice dev = device->device;
-        vkDeviceWaitIdle(dev);
+        // retire this instance's own submissions (per queue) instead of
+        // idling the whole device, which other filters may be sharing
+        retire_instance(pool);
 
         for (auto & resource : pool.items) {
             if (resource.map) {
@@ -1511,6 +1513,24 @@ static void VS_CC Eedi3Create(
             return set_error(std::get<std::string>(result));
         }
         d->device = std::get<std::shared_ptr<VK_Device>>(result);
+    }
+
+    // The row/vcheck shaders compile to `OpMemoryModel Logical Vulkan`
+    // (GL_KHR_memory_scope_semantics) and use `local_size_x_id` (LocalSizeId,
+    // which needs maintenance4); all EEDI3 shaders also use int8/int16 SSBO
+    // storage. Report a precise creation error instead of relying on the
+    // driver accepting a pipeline whose features were never enabled.
+    if (!d->device->feat_vulkan_memory_model) {
+        return set_error("vulkanMemoryModel is not enabled on this device");
+    }
+    if (!d->device->feat_maintenance4) {
+        return set_error("maintenance4 (LocalSizeId) is not enabled on this device");
+    }
+    if (!d->device->feat_8bit_storage) {
+        return set_error("shaderInt8/storageBuffer8BitAccess is not enabled on this device");
+    }
+    if (!d->device->feat_16bit_storage) {
+        return set_error("storageBuffer16BitAccess is not enabled on this device");
     }
 
     // eedi3m scaling (see EEDI3.cpp create), with cost3 always on (GPU family

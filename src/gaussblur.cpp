@@ -124,7 +124,9 @@ struct GaussData {
             return;
         }
         VkDevice dev = device->device;
-        vkDeviceWaitIdle(dev);
+        // retire this instance's own submissions (per queue) instead of
+        // idling the whole device, which other filters may be sharing
+        retire_instance(pool);
 
         for (auto & resource : pool.items) {
             if (resource.map) {
@@ -570,8 +572,16 @@ static const VSFrame *VS_CC GaussGetFrame(
         uint8_t * const upload_base = d->host_direct_upload
             ? static_cast<uint8_t *>(resource.src_map)
             : static_cast<uint8_t *>(static_cast<void *>(map));
-        const bool src_coherent = !d->host_direct_upload || coherent ||
-            !!(d->device->mem_props.memoryTypes[resource.src_type_index].propertyFlags &
+        // Coherence of the allocation the upload actually writes. The
+        // host-direct path only engages on a coherent device-local type, but
+        // the staging fallback can land on the non-coherent host-visible
+        // memory allocate_memory deliberately permits — there the flush below
+        // is required, and keying it off the destination allocation (instead
+        // of off `host_direct_upload`) is what keeps it reachable.
+        const uint32_t upload_type = d->host_direct_upload
+            ? resource.src_type_index : resource.staging_type_index;
+        const bool upload_coherent =
+            !!(d->device->mem_props.memoryTypes[upload_type].propertyFlags &
                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
         for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
@@ -585,18 +595,16 @@ static const VSFrame *VS_CC GaussGetFrame(
             auto srcp = vsapi->getReadPtr(src, plane);
             auto dstp = upload_base + cfg.upload_offset;
 
-            // raw byte copy of the plane (staging layout matches the frame
-            // pitch); plain memcpy: the mapped VRAM window is write-combined,
-            // and streaming stores measured slower (11 vs 22.5 GB/s)
-            const auto bytes = static_cast<size_t>(cfg.width * d->elem_bytes) * height;
-            if (d->host_direct_upload) {
-                memcpy(dstp, srcp, bytes);
-            } else {
-                copy_stream_out(dstp, srcp, bytes);
-            }
+            // raw byte copy of the plane, honouring the GPU plane pitch (the
+            // visible width rounded up to 16 bytes) and the frame's stride;
+            // plain memcpy: the mapped VRAM window is write-combined, and
+            // streaming stores measured slower (11 vs 22.5 GB/s)
+            copy_plane_out(dstp, cfg.pitch_bytes, srcp, vsapi->getStride(src, plane),
+                static_cast<size_t>(cfg.width) * d->elem_bytes, height,
+                !d->host_direct_upload);
         }
 
-        if (!d->host_direct_upload && !src_coherent) {
+        if (!upload_coherent) {
             std::vector<VkMappedMemoryRange> ranges;
             ranges.reserve(d->vi->format.numPlanes);
             for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
@@ -607,7 +615,7 @@ static const VSFrame *VS_CC GaussGetFrame(
                 ranges.push_back(VkMappedMemoryRange {
                     .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                     .pNext = nullptr,
-                    .memory = resource.staging_mem,
+                    .memory = d->host_direct_upload ? resource.src_mem : resource.staging_mem,
                     .offset = cfg.upload_offset,
                     .size = cfg.upload_size,
                 });
@@ -644,7 +652,6 @@ static const VSFrame *VS_CC GaussGetFrame(
                 continue;
             }
 
-            int width = vsapi->getFrameWidth(src, plane);
             int height = vsapi->getFrameHeight(src, plane);
             const auto & cfg = d->planes[plane];
 
@@ -652,9 +659,11 @@ static const VSFrame *VS_CC GaussGetFrame(
             const uint8_t * h_bufferp =
                 static_cast<const uint8_t *>(static_cast<const void *>(map)) + d->upload_total + cfg.download_offset;
 
-            // raw byte copy of the plane (staging layout matches the frame pitch)
-            copy_stream_read(dstp, h_bufferp,
-                static_cast<size_t>(cfg.width * d->elem_bytes) * height);
+            // raw byte copy of the plane, honouring the GPU plane pitch and
+            // the destination frame's stride
+            copy_plane_read(dstp, vsapi->getStride(dst, plane), h_bufferp,
+                cfg.pitch_bytes, static_cast<size_t>(cfg.width) * d->elem_bytes,
+                height);
         }
 
         d->pool.give_back(std::move(resource));

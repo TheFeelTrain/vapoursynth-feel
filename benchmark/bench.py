@@ -29,6 +29,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -506,11 +507,23 @@ def run_vspipe(vpy_path: Path, frames: int) -> float | None:
     cmd = ["vspipe", "--start", "0", "--end", str(frames - 1), str(vpy_path), "/dev/null"]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
+        # A failed run must not read as an unavailable plugin: surface the tail
+        # of vspipe's stderr so the cause (bad argument, crash, missing plugin)
+        # is visible instead of being silently swallowed.
+        tail = "\n".join((result.stderr or "").splitlines()[-15:])
+        print(f"  [vspipe failed: exit {result.returncode}] {vpy_path.name}", file=sys.stderr)
+        if tail:
+            print(textwrap.indent(tail, "    "), file=sys.stderr)
         return None
     for line in (result.stderr or "").splitlines():
         if "Output" in line and "fps" in line:
             # vspipe: "Output 1000 frames in 12.83 seconds (77.94 fps)"
             return float(line.rsplit("(", 1)[1].split("fps")[0].strip())
+    # exited 0 but printed no timing line: report that too
+    tail = "\n".join((result.stderr or "").splitlines()[-10:])
+    print(f"  [vspipe produced no fps line: {vpy_path.name}]", file=sys.stderr)
+    if tail:
+        print(textwrap.indent(tail, "    "), file=sys.stderr)
     return None
 
 

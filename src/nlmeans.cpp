@@ -220,7 +220,9 @@ struct NLMeansData {
             return;
         }
         VkDevice dev = device->device;
-        vkDeviceWaitIdle(dev);
+        // retire this instance's own submissions (per queue) instead of
+        // idling the whole device, which other filters may be sharing
+        retire_instance(pool);
 
         for (auto & st : pool.items) {
             if (st.staging_map) vkUnmapMemory(dev, st.staging_mem);

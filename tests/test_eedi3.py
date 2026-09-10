@@ -31,7 +31,6 @@ parallel load) is exact.
 Run from the repository root:  python -m pytest tests/test_eedi3.py
 """
 
-import ctypes
 import json
 import os
 import shutil
@@ -45,7 +44,10 @@ import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import WIDTH, HEIGHT, NOISE_MKV, frame_to_ndarray
+from conftest import (
+    WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, compare_or_skip,
+    format_dtype, frame_to_ndarray, plane_to_ndarray,
+)
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
@@ -64,22 +66,13 @@ def _run(clip, field=1, num_streams=1, **kwargs):
 
 
 def _plane(frame, plane, width, height, dtype=np.float32):
-    itemsize = np.dtype(dtype).itemsize
-    return np.ctypeslib.as_array(
-        ctypes.cast(frame.get_read_ptr(plane), ctypes.POINTER(ctypes.c_uint8)),
-        shape=(height, width * itemsize),
-    ).view(dtype).copy()
+    """Stride-aware, copying plane read (geometry derived from the frame)."""
+    return plane_to_ndarray(frame, plane, dtype)
 
 
 def _stride_plane(frame, plane):
     """Copy any plane into an ndarray, honouring the row pitch."""
-    fmt = frame.format
-    ss_w = fmt.subsampling_w if plane in (1, 2) and fmt.num_planes >= 3 else 0
-    ss_h = fmt.subsampling_h if plane in (1, 2) and fmt.num_planes >= 3 else 0
-    w = frame.width >> ss_w
-    h = frame.height >> ss_h
-    dtype = np.float32 if fmt.sample_type == vs.FLOAT else np.uint16
-    return _plane(frame, plane, w, h, dtype)
+    return plane_to_ndarray(frame, plane, format_dtype(frame.format))
 
 
 def _interp_rows(h, n, field):
@@ -301,12 +294,10 @@ REFERENCE_CASES_32 = [
       "vthresh0": 128.0, "vthresh1": 8.0, "vthresh2": 16.0}, 1e-6),
 ]
 
-_COMPARE_SCRIPT = textwrap.dedent(f"""\
+_COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     import json
     import sys
     import vapoursynth as vs
-    import numpy as np
-    import ctypes
 
     bits = int(sys.argv[2])
     cases = json.loads(sys.argv[1])
@@ -314,52 +305,67 @@ _COMPARE_SCRIPT = textwrap.dedent(f"""\
     src = core.bs.VideoSource({NOISE_MKV!r})
     clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                               bits=bits, fulls=True, fulld=True)
-    it = 2 if bits == 16 else 4
     dt = np.uint16 if bits == 16 else np.float32
-    h, w = clip.height, clip.width
 
-    results = []
-    for kwargs in cases:
-        ref_node = core.eedi3vk2.EEDI3(clip, **kwargs)
-        my_node = core.vsfeel.EEDI3(clip, **kwargs)
+    frames = (0, 11, 23)
+
+    def row_mask(h, n, field):
         # interp rows only: kept rows are bit-copies and always equal
-        dmax = 0.0
-        for n in (0, 11, 23):
-            fr = ref_node.get_frame(n)
-            fm = my_node.get_frame(n)
-            a = np.ctypeslib.as_array(ctypes.cast(fm.get_read_ptr(0), ctypes.POINTER(ctypes.c_uint8)), shape=(h, w * it)).view(dt).copy()
-            b = np.ctypeslib.as_array(ctypes.cast(fr.get_read_ptr(0), ctypes.POINTER(ctypes.c_uint8)), shape=(h, w * it)).view(dt).copy()
-            fbase = kwargs.get('field', 1) & 1
-            eff = fbase if kwargs.get('field', 1) <= 1 else ((n & 1) ^ fbase)
-            rows = np.zeros(h, dtype=bool); rows[eff::2] = True
-            d = np.abs(a.astype(np.float64) - b.astype(np.float64))[rows]
-            if d.size:
-                dmax = max(dmax, float(d.max()))
-        results.append(dmax)
-    print(json.dumps(results))
+        fbase = field & 1
+        eff = fbase if field <= 1 else ((n & 1) ^ fbase)
+        rows = np.zeros(h, dtype=bool)
+        rows[eff::2] = True
+        return rows
+
+    # --- reference phase: materialise and copy before touching vsfeel ---
+    ref_frames = []
+    try:
+        for kwargs in cases:
+            ref_node = core.eedi3vk2.EEDI3(clip, **kwargs)
+            ref_frames.append([read_plane(ref_node.get_frame(n), 0, dt)
+                               for n in frames])
+    except Exception as exc:
+        print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
+        raise SystemExit(2)
+    print("REF ok", flush=True)
+
+    # --- vsfeel phase ---
+    results = []
+    try:
+        for kwargs, rframes in zip(cases, ref_frames):
+            my_node = core.vsfeel.EEDI3(clip, **kwargs)
+            dmax = 0.0
+            for n, b in zip(frames, rframes):
+                a = read_plane(my_node.get_frame(n), 0, dt)
+                if not (np.isfinite(a.astype(np.float64)).all()
+                        and np.isfinite(b.astype(np.float64)).all()):
+                    print("VSFEEL fail: non-finite at frame %d for %s" % (n, kwargs), flush=True)
+                    raise SystemExit(3)
+                rows = row_mask(a.shape[0], n, kwargs.get('field', 1))
+                d = np.abs(a.astype(np.float64) - b.astype(np.float64))[rows]
+                if d.size:
+                    dmax = max(dmax, float(d.max()))
+            results.append(dmax)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print("VSFEEL fail: %s: %s" % (type(exc).__name__, exc), flush=True)
+        raise SystemExit(3)
+    print("RESULT " + json.dumps(results), flush=True)
 """)
 
 
 def _reference_max_diffs(bits, cases):
-    """Run every config against eedi3vk2 in one subprocess; a crashing
-    reference yields None (the comparison must not take down the suite)."""
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", _COMPARE_SCRIPT,
-             json.dumps([kw for kw, _ in cases]), str(bits)],
-            capture_output=True, text=True, timeout=600,
-        )
-    except subprocess.TimeoutExpired:
-        return None
-    if result.returncode != 0:
-        return None
-    try:
-        parsed = json.loads(result.stdout.strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        return None
-    if len(parsed) != len(cases):
-        return None
-    return parsed
+    """Run every config against eedi3vk2 in one subprocess.
+
+    A missing/crashing reference skips (via compare_or_skip); a vsfeel crash,
+    exception, timeout or non-finite result fails with the captured tail.
+    """
+    return compare_or_skip(
+        _COMPARE_SCRIPT,
+        [json.dumps([kw for kw, _ in cases]), str(bits)],
+        timeout=600,
+    )
 
 
 @pytest.mark.parametrize("bits,cases", [
@@ -375,8 +381,6 @@ def test_eedi3_matches_vk2_reference(bits, cases):
     if not hasattr(vs.core, "eedi3vk2") or not hasattr(vs.core.eedi3vk2, "EEDI3"):
         pytest.skip("no eedi3vk2.EEDI3 reference")
     maxdiffs = _reference_max_diffs(bits, cases)
-    if maxdiffs is None:
-        pytest.skip("reference comparison crashed")
     for (kwargs, tol), maxdiff in zip(cases, maxdiffs):
         assert maxdiff < tol or maxdiff == 0, (
             f"max diff {maxdiff} vs eedi3vk2 for {kwargs} (tol {tol})")

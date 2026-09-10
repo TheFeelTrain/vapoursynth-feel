@@ -17,7 +17,6 @@ Self-consistency checks remain exact.
 Run from the repository root:  python -m pytest tests/test_dfttest.py
 """
 
-import ctypes
 import json
 import os
 import shutil
@@ -31,7 +30,10 @@ import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import WIDTH, HEIGHT, NOISE_MKV, assert_gray32, frame_to_ndarray
+from conftest import (
+    WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_gray32, compare_or_skip,
+    format_dtype, frame_to_ndarray, plane_to_ndarray,
+)
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
@@ -49,22 +51,13 @@ from numpy.typing import DTypeLike
 
 
 def _plane(frame, plane, width, height, dtype: DTypeLike = np.float32):
-    itemsize = np.dtype(dtype).itemsize
-    return np.ctypeslib.as_array(
-        ctypes.cast(frame.get_read_ptr(plane), ctypes.POINTER(ctypes.c_uint8)),
-        shape=(height, width * itemsize),
-    ).view(dtype).copy()
+    """Stride-aware, copying plane read (geometry derived from the frame)."""
+    return plane_to_ndarray(frame, plane, dtype)
 
 
 def _stride_plane(frame, plane):
     """Copy any plane into an ndarray, honouring the row pitch."""
-    fmt = frame.format
-    ss_w = fmt.subsampling_w if plane in (1, 2) and fmt.num_planes >= 3 else 0
-    ss_h = fmt.subsampling_h if plane in (1, 2) and fmt.num_planes >= 3 else 0
-    w = frame.width >> ss_w
-    h = frame.height >> ss_h
-    dtype = np.float32 if fmt.sample_type == vs.FLOAT else np.uint16
-    return _plane(frame, plane, w, h, dtype)
+    return plane_to_ndarray(frame, plane, format_dtype(frame.format))
 
 
 def _eval_parallel(clip, dtype=np.float32, **kwargs):
@@ -323,49 +316,64 @@ REFERENCE_CASES = [
     ({"ftype": 1, "sigma": 4.0}, 5e-3),
 ]
 
-_COMPARE_SCRIPT = textwrap.dedent(f"""\
+_COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     import json
     import sys
     import vapoursynth as vs
     from vstools import core
-    import numpy as np
-    import ctypes
 
     cases = json.loads(sys.argv[1])
     src = core.bs.VideoSource({NOISE_MKV!r})
     clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
 
-    for kwargs in cases:
-        ref_node = core.vszipcl.DFTTest(clip, **kwargs)
-        my_node = core.vsfeel.DFTTest(clip, **kwargs)
-        worst = 0.0
-        for n in (0, 11, 23):
-            fr, fm = ref_node.get_frame(n), my_node.get_frame(n)
-            a = np.ctypeslib.as_array(ctypes.cast(fm.get_read_ptr(0), ctypes.POINTER(ctypes.c_float)), shape=({HEIGHT}, {WIDTH}))
-            b = np.ctypeslib.as_array(ctypes.cast(fr.get_read_ptr(0), ctypes.POINTER(ctypes.c_float)), shape=({HEIGHT}, {WIDTH}))
-            worst = max(worst, float(np.abs(a.astype(np.float64) - b.astype(np.float64)).max()))
-        print(worst)
+    frames = (0, 11, 23)
+
+    # --- reference phase: materialise and copy before touching vsfeel ---
+    ref_frames = []
+    try:
+        for kwargs in cases:
+            ref_node = core.vszipcl.DFTTest(clip, **kwargs)
+            ref_frames.append([read_plane(ref_node.get_frame(n), 0, np.float32)
+                               for n in frames])
+    except Exception as exc:
+        print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
+        raise SystemExit(2)
+    print("REF ok", flush=True)
+
+    # --- vsfeel phase ---
+    results = []
+    try:
+        for kwargs, rframes in zip(cases, ref_frames):
+            my_node = core.vsfeel.DFTTest(clip, num_streams=1, **kwargs)
+            worst = 0.0
+            for n, b in zip(frames, rframes):
+                a = read_plane(my_node.get_frame(n), 0, np.float32)
+                if not (np.isfinite(a).all() and np.isfinite(b).all()):
+                    print("VSFEEL fail: non-finite at frame %d for %s" % (n, kwargs), flush=True)
+                    raise SystemExit(3)
+                worst = max(worst, float(np.abs(a.astype(np.float64)
+                                                - b.astype(np.float64)).max()))
+            results.append(worst)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print("VSFEEL fail: %s: %s" % (type(exc).__name__, exc), flush=True)
+        raise SystemExit(3)
+    print("RESULT " + json.dumps(results), flush=True)
 """)
 
 
-def _reference_max_diffs() -> list[float] | None:
-    """Run every config in a single subprocess; a crashing reference yields
-    None (the reference plugins are crash-prone on some drivers, so the
-    comparison must not take down the suite)."""
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", _COMPARE_SCRIPT,
-             json.dumps([kw for kw, _ in REFERENCE_CASES])],
-            capture_output=True, text=True, timeout=600,
-        )
-    except subprocess.TimeoutExpired:
-        return None
-    if result.returncode != 0:
-        return None
-    lines = [line for line in result.stdout.splitlines() if line.strip()]
-    if len(lines) != len(REFERENCE_CASES):
-        return None
-    return [float(line) for line in lines]
+def _reference_max_diffs() -> list[float]:
+    """Run every config in a single subprocess.
+
+    A missing/crashing reference skips (via compare_or_skip); a vsfeel crash,
+    exception, timeout or non-finite result fails with the captured tail.
+    """
+    return compare_or_skip(
+        _COMPARE_SCRIPT,
+        [json.dumps([kw for kw, _ in REFERENCE_CASES])],
+        timeout=600,
+    )
 
 
 def test_dfttest_matches_reference_32bit(noise_gray):
@@ -378,8 +386,6 @@ def test_dfttest_matches_reference_32bit(noise_gray):
     if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "DFTTest"):
         pytest.skip("no vszipcl.DFTTest reference")
     maxdiffs = _reference_max_diffs()
-    if maxdiffs is None:
-        pytest.skip("reference comparison crashed")
     for (kwargs, tol), maxdiff in zip(REFERENCE_CASES, maxdiffs):
         assert maxdiff < tol, f"max diff {maxdiff} vs vszipcl for {kwargs}"
 

@@ -20,14 +20,13 @@ Self-consistency (determinism across runs, multi-stream == single) is exact.
 Run from the repository root:  python -m pytest tests/test_nnedi3.py
 """
 
-import ctypes
 import threading
 
 import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import WIDTH, HEIGHT, NOISE_MKV
+from conftest import WIDTH, HEIGHT, NOISE_MKV, plane_to_ndarray
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
@@ -46,10 +45,8 @@ def _ref(clip, field=1, **kwargs):
 
 
 def _plane_u16(frame, plane, width, height):
-    return np.ctypeslib.as_array(
-        ctypes.cast(frame.get_read_ptr(plane), ctypes.POINTER(ctypes.c_uint8)),
-        shape=(height, width * 2),
-    ).view(np.uint16).copy()
+    """Stride-aware, copying uint16 plane read (geometry from the frame)."""
+    return plane_to_ndarray(frame, plane, np.uint16)
 
 
 def _max_diff_u16(a, b, plane, width, height, frames):

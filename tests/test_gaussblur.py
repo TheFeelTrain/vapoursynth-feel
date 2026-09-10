@@ -14,9 +14,6 @@ comparison runs in a subprocess).
 Run from the repository root:  python -m pytest tests/test_gaussblur.py
 """
 
-import ctypes
-import subprocess
-import sys
 import textwrap
 import threading
 
@@ -24,7 +21,10 @@ import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import WIDTH, HEIGHT, NOISE_MKV, assert_gray32, frame_to_ndarray
+from conftest import (
+    WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_gray32, compare_or_skip,
+    frame_to_ndarray, plane_to_ndarray,
+)
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
@@ -39,11 +39,12 @@ def _run(clip, sigma=2.0, num_streams=1, **kwargs):
 
 
 def _plane(frame, plane, width, height, dtype=np.float32):
-    itemsize = np.dtype(dtype).itemsize
-    return np.ctypeslib.as_array(
-        ctypes.cast(frame.get_read_ptr(plane), ctypes.POINTER(ctypes.c_uint8)),
-        shape=(height, width * itemsize),
-    ).view(dtype).copy()
+    """Stride-aware plane read (width/height kept for call-site compatibility).
+
+    The actual geometry is derived from the frame, so cropped/pitched planes
+    read correctly; the returned array is always a fresh copy.
+    """
+    return plane_to_ndarray(frame, plane, dtype)
 
 
 def _eval_parallel(clip, dtype=np.float32, **kwargs):
@@ -136,12 +137,11 @@ def test_gaussblur_parallel_load_deterministic_16bit(noise_16bit):
 # Reference comparison (bit-exact)
 # ---------------------------------------------------------------------------
 
-_COMPARE_SCRIPT = textwrap.dedent(f"""\
+_COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     import sys
+    import json
     import vapoursynth as vs
     from vstools import core
-    import numpy as np
-    import ctypes
 
     fmt = sys.argv[1]
     sigma = float(sys.argv[2])
@@ -149,53 +149,54 @@ _COMPARE_SCRIPT = textwrap.dedent(f"""\
 
     if fmt == "gray32":
         clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
-        dtype, w, h = np.float32, {WIDTH}, {HEIGHT}
+        dtype, planes = np.float32, 1
     elif fmt == "gray16":
         clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=16, fulls=True, fulld=True)
-        dtype, w, h = np.uint16, {WIDTH}, {HEIGHT}
+        dtype, planes = np.uint16, 1
     elif fmt == "yuv32":
         clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
-        dtype = np.float32
+        dtype, planes = np.float32, 3
     elif fmt == "yuv16":
         clip = core.resize.Bicubic(src, format=vs.YUV420P16)
-        dtype = np.uint16
+        dtype, planes = np.uint16, 3
     else:
         raise SystemExit("bad fmt")
 
-    kwargs = {{"sigma": sigma}}
-    ref_node = core.vszipcl.GaussBlur(clip, **kwargs)
-    my_node = core.vsfeel.GaussBlur(clip, **kwargs)
+    # --- reference phase: materialise and copy before touching vsfeel ---
+    try:
+        ref_node = core.vszipcl.GaussBlur(clip, sigma=sigma, num_streams=1)
+        ref_frames = {{n: [read_plane(ref_node.get_frame(n), p, dtype)
+                           for p in range(planes)]
+                       for n in (3, 11, 23)}}
+    except Exception as exc:
+        print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
+        raise SystemExit(2)
+    print("REF ok", flush=True)
 
+    # --- vsfeel phase ---
+    my_node = core.vsfeel.GaussBlur(clip, sigma=sigma, num_streams=1)
     worst = 0.0
     for n in (3, 11, 23):
-        fr, fm = ref_node.get_frame(n), my_node.get_frame(n)
-        planes = 3 if fmt in ("yuv32", "yuv16") else 1
-        for p in range(planes):
-            if fmt in ("yuv32", "yuv16"):
-                w = {WIDTH} // (1 if p == 0 else 2)
-                h = {HEIGHT} // (1 if p == 0 else 2)
-            else:
-                w, h = {WIDTH}, {HEIGHT}
-            a = np.ctypeslib.as_array(ctypes.cast(fm.get_read_ptr(p), ctypes.POINTER(ctypes.c_uint8)), shape=(h, w * np.dtype(dtype).itemsize)).view(dtype)
-            b = np.ctypeslib.as_array(ctypes.cast(fr.get_read_ptr(p), ctypes.POINTER(ctypes.c_uint8)), shape=(h, w * np.dtype(dtype).itemsize)).view(dtype)
-            worst = max(worst, float(np.abs(a.astype(np.float64) - b.astype(np.float64)).max()))
-    print(worst)
+        fm = my_node.get_frame(n)
+        for p, b in enumerate(ref_frames[n]):
+            a = read_plane(fm, p, dtype)
+            if not (np.isfinite(a.astype(np.float64)).all()
+                    and np.isfinite(b.astype(np.float64)).all()):
+                print("VSFEEL fail: non-finite at frame %d plane %d" % (n, p), flush=True)
+                raise SystemExit(3)
+            worst = max(worst, float(np.abs(a.astype(np.float64)
+                                            - b.astype(np.float64)).max()))
+    print("RESULT " + json.dumps(worst), flush=True)
 """)
 
 
-def _max_diff_vs_reference(fmt: str, sigma: float) -> float | None:
-    """Run the comparison in a subprocess; a crashing reference yields None."""
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", _COMPARE_SCRIPT, fmt, str(sigma)],
-            capture_output=True, text=True, timeout=180,
-        )
-    except subprocess.TimeoutExpired:
-        return None
-    if result.returncode != 0:
-        return None
-    lines = [line for line in result.stdout.splitlines() if line.strip()]
-    return float(lines[-1]) if lines else None
+def _max_diff_vs_reference(fmt: str, sigma: float) -> float:
+    """Run the comparison in a subprocess.
+
+    A missing/failed reference skips (via compare_or_skip); a vsfeel crash,
+    exception, timeout or non-finite result fails with the captured tail.
+    """
+    return compare_or_skip(_COMPARE_SCRIPT, [fmt, str(sigma)], timeout=300)
 
 
 @pytest.mark.parametrize("sigma", [0.5, 2.0, 5.0, 10.0])
@@ -204,8 +205,6 @@ def test_gaussblur_matches_reference_small_32bit(noise_gray, sigma):
     if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
         pytest.skip("no vszipcl.GaussBlur reference")
     maxdiff = _max_diff_vs_reference("gray32", sigma)
-    if maxdiff is None:
-        pytest.skip("reference comparison crashed")
     assert maxdiff == 0.0, f"small path max diff: {maxdiff}"
 
 
@@ -216,8 +215,6 @@ def test_gaussblur_matches_reference_path_boundary_32bit(noise_gray, sigma):
     if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
         pytest.skip("no vszipcl.GaussBlur reference")
     maxdiff = _max_diff_vs_reference("gray32", sigma)
-    if maxdiff is None:
-        pytest.skip("reference comparison crashed")
     assert maxdiff == 0.0, f"path boundary max diff: {maxdiff}"
 
 
@@ -227,8 +224,6 @@ def test_gaussblur_matches_reference_large_32bit(noise_gray, sigma):
     if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
         pytest.skip("no vszipcl.GaussBlur reference")
     maxdiff = _max_diff_vs_reference("gray32", sigma)
-    if maxdiff is None:
-        pytest.skip("reference comparison crashed")
     assert maxdiff == 0.0, f"large path max diff: {maxdiff}"
 
 
@@ -241,8 +236,6 @@ def test_gaussblur_matches_reference_16bit(noise_gray, sigma):
     if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
         pytest.skip("no vszipcl.GaussBlur reference")
     maxdiff = _max_diff_vs_reference("gray16", sigma)
-    if maxdiff is None:
-        pytest.skip("reference comparison crashed")
     assert maxdiff == 0.0, f"gray16 max diff ({sigma}): {maxdiff}"
 
 
@@ -253,8 +246,6 @@ def test_gaussblur_matches_reference_yuv_32bit(noise_gray, sigma):
     if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
         pytest.skip("no vszipcl.GaussBlur reference")
     maxdiff = _max_diff_vs_reference("yuv32", sigma)
-    if maxdiff is None:
-        pytest.skip("reference comparison crashed")
     assert maxdiff == 0.0, f"yuv32 max diff ({sigma}): {maxdiff}"
 
 
@@ -265,8 +256,6 @@ def test_gaussblur_matches_reference_yuv_16bit(noise_gray, sigma):
     if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
         pytest.skip("no vszipcl.GaussBlur reference")
     maxdiff = _max_diff_vs_reference("yuv16", sigma)
-    if maxdiff is None:
-        pytest.skip("reference comparison crashed")
     assert maxdiff == 0.0, f"yuv16 max diff ({sigma}): {maxdiff}"
 
 

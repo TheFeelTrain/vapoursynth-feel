@@ -60,14 +60,27 @@ struct Bm3dStream {
     std::mutex * queue_lock {};
     uint32_t staging_type_index {};
     VkQueryPool ts_query {};
-    int stream_id {};        // index into BM3DData::timelines
+    int stream_id {};        // index of this stream in the pool
     uint64_t seq {1};        // next monotonic timeline value this stream signals
     // cache reservations for the current frame (radius > 0)
     std::array<int, 9> win_slots {};      // res cache slot of each window frame
     std::array<int, 9> win_writers {};    // frame that wrote each window slot
+    // identity of the slot's writer, captured under the cache lock when this
+    // frame reserved the slot: waiting on (semaphore, value) is exact, while
+    // recovering it from the frame number (a modulo-64 table) goes stale as
+    // soon as the table entry is reused
+    std::array<VkSemaphore, 9> win_writer_sem {};
+    std::array<uint64_t, 9> win_writer_value {};
     std::array<bool, 9> win_recompute {}; // true where this frame must recompute the slot
     std::array<bool, 4 * MAX_RADIUS + 1> upload_new {};  // src frames this frame uploads
     std::array<int, 4 * MAX_RADIUS + 1> src_writers {};  // uploader of each window src slot
+    std::array<VkSemaphore, 4 * MAX_RADIUS + 1> src_writer_sem {};
+    std::array<uint64_t, 4 * MAX_RADIUS + 1> src_writer_value {};
+    // unique token identifying this frame's cache reservation. A frame index
+    // is not a unique holder identity: the scheduler can process the same
+    // frame twice at once, and erasing holders by value would then drop both
+    // entries at the first release, freeing a slot another reader still uses.
+    uint64_t res_token {};
 };
 
 
@@ -77,6 +90,7 @@ struct BM3DData {
     const VSVideoInfo * vi;
 
     int radius, num_streams;
+    int device_id {};
     int tw;                          // 2 * radius + 1
     float sigma;                     // scaled luma sigma
     float sigma_u, sigma_v;
@@ -108,7 +122,6 @@ struct BM3DData {
     VkDeviceSize res_size_per_plane {};  // floats per plane in the res buffer
     int nframes {};
 
-    std::vector<VkSemaphore> timelines;
     // Per-frame-keyed caches of the res estimate stacks and the source
     // frames. Slots are reserved all-or-nothing for the duration of a frame
     // (shared holds for reads, exclusive for recompute/upload), so no two
@@ -117,14 +130,22 @@ struct BM3DData {
     // fused-mode accumulator cache.
     std::vector<int> src_frame {};   // frame index whose data each src slot holds
     std::vector<int> src_writer {};  // frame that reserved each src slot for upload
-    std::vector<std::vector<int>> src_holders {};
+    // Who last wrote each slot, stored with the reservation itself. The writer
+    // is a frame number *and* the (timeline semaphore, value) it signals: the
+    // frame number alone is not a stable key (a later frame can reuse it), and
+    // a stale lookup makes a reader wait on an unrelated frame's unsubmitted
+    // value — a cycle when that frame is itself waiting for the reader.
+    std::vector<VkSemaphore> src_writer_sem {};
+    std::vector<uint64_t> src_writer_value {};
+    std::vector<std::vector<uint64_t>> src_holders {};  // reservation tokens
     std::vector<int> res_frame {};   // frame index whose stack each res slot holds
     std::vector<int> res_writer {};  // frame that computed each res slot's content
-    std::vector<std::vector<int>> res_holders {};
+    std::vector<VkSemaphore> res_writer_sem {};
+    std::vector<uint64_t> res_writer_value {};
+    std::vector<std::vector<uint64_t>> res_holders {};  // reservation tokens
+    uint64_t next_res_token {1};
     std::mutex cache_lock;
     std::condition_variable cache_cv;
-    std::array<int, 64> frame_stream {};   // stream index that processed frame n (mod 64)
-    std::array<uint64_t, 64> frame_seq {}; // monotonic timeline value frame n signals
     FramePool<Bm3dStream> pool;
 
     ~BM3DData() {
@@ -132,10 +153,13 @@ struct BM3DData {
             return;
         }
         VkDevice dev = device->device;
-        vkDeviceWaitIdle(dev);
+        // retire this instance's own submissions (per queue) instead of
+        // idling the whole device, which other filters may be sharing
+        retire_instance(pool);
         for (auto & s : pool.items) {
             if (s.map) vkUnmapMemory(dev, s.staging_mem);
             if (s.dst_map) vkUnmapMemory(dev, s.dst_mem);
+            if (s.ts_query) vkDestroyQueryPool(dev, s.ts_query, nullptr);
             if (s.dst_mem) vkFreeMemory(dev, s.dst_mem, nullptr);
             if (s.dst_buf) vkDestroyBuffer(dev, s.dst_buf, nullptr);
             if (s.cmd_agg) vkFreeCommandBuffers(dev, s.pool, 1, &s.cmd_agg);
@@ -224,13 +248,7 @@ struct VkPhysicalDeviceFeaturesCompat {
 // The device shared with the bilateral plugin may not enable fp64; we enable
 // it here via the device features if the driver supports it.
 std::optional<std::string> enable_float64(const std::shared_ptr<VK_Device> & dev) {
-    VkPhysicalDeviceFeatures2 features2 {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-        .pNext = nullptr,
-        .features = {}
-    };
-    vkGetPhysicalDeviceFeatures2(dev->physical_device, &features2);
-    if (!features2.features.shaderFloat64) {
+    if (!dev->feat_float64) {
         return "shaderFloat64 is not supported by this device";
     }
     return std::nullopt;
@@ -371,12 +389,14 @@ static int agg_z(int i, int n, int nframes, int radius) {
 // same slot concurrently; the blocking only happens when the working set
 // exceeds the cache (seeks, very out-of-order arrivals) and never holds the
 // lock or any stream while waiting.
-static void acquire_cache(BM3DData * d, Bm3dStream & stream, int n) {
+static void acquire_cache(BM3DData * d, Bm3dStream & stream, int n, uint64_t seq) {
     if (d->radius == 0) {
         // per-frame slots: keyed by the stream so concurrent out-of-order
         // frames never share a slot (a stream processes one frame at a time)
         stream.win_slots.fill(-1);
         stream.win_writers.fill(-1);
+        stream.win_writer_sem.fill(VK_NULL_HANDLE);
+        stream.win_writer_value.fill(0);
         stream.win_recompute.fill(false);
         stream.upload_new.fill(false);
         stream.win_slots[0] = stream.stream_id;
@@ -394,9 +414,13 @@ static void acquire_cache(BM3DData * d, Bm3dStream & stream, int n) {
         bool ok = true;
         stream.win_slots.fill(-1);
         stream.win_writers.fill(-1);
+        stream.win_writer_sem.fill(VK_NULL_HANDLE);
+        stream.win_writer_value.fill(0);
         stream.win_recompute.fill(false);
         stream.upload_new.fill(false);
         stream.src_writers.fill(-1);
+        stream.src_writer_sem.fill(VK_NULL_HANDLE);
+        stream.src_writer_value.fill(0);
         // Phase 1: check-only, with no side effects. The failed passes must
         // not leave half-applied reservations behind, or a retry would treat
         // the abandoned slots as cached and never recompute them.
@@ -405,6 +429,8 @@ static void acquire_cache(BM3DData * d, Bm3dStream & stream, int n) {
             const int slot = m % d->res_cap;
             stream.win_slots[i] = slot;
             stream.win_writers[i] = d->res_writer[slot];
+            stream.win_writer_sem[i] = d->res_writer_sem[slot];
+            stream.win_writer_value[i] = d->res_writer_value[slot];
             if (d->res_frame[slot] != m && !d->res_holders[slot].empty()) {
                 ok = false;   // slot in use by an in-flight frame
                 break;
@@ -414,6 +440,8 @@ static void acquire_cache(BM3DData * d, Bm3dStream & stream, int n) {
             for (int f = lo; f <= hi; ++f) {
                 const int slot = f % d->src_ring;
                 stream.src_writers[f - lo] = d->src_writer[slot];
+                stream.src_writer_sem[f - lo] = d->src_writer_sem[slot];
+                stream.src_writer_value[f - lo] = d->src_writer_value[slot];
                 if (d->src_frame[slot] != f && !d->src_holders[slot].empty()) {
                     ok = false;
                     break;
@@ -426,24 +454,34 @@ static void acquire_cache(BM3DData * d, Bm3dStream & stream, int n) {
         }
         // Phase 2: apply the reservations (the lock is held, so the phase-1
         // checks are still valid).
+        stream.res_token = d->next_res_token++;
         for (int i = 0; i < d->tw; ++i) {
             const int m = std::clamp(n - r + i, 0, nf - 1);
             const int slot = stream.win_slots[i];
             if (d->res_frame[slot] != m) {
                 d->res_frame[slot] = m;
                 d->res_writer[slot] = n;
+                d->res_writer_sem[slot] = stream.timeline;
+                d->res_writer_value[slot] = seq;
                 stream.win_recompute[i] = true;
+                // this frame overwrites the slot itself, so the previous
+                // writer's contents (and its dependency) no longer matter
+                stream.win_writers[i] = -1;
+                stream.win_writer_sem[i] = VK_NULL_HANDLE;
+                stream.win_writer_value[i] = 0;
             }
-            d->res_holders[slot].push_back(n);
+            d->res_holders[slot].push_back(stream.res_token);
         }
         for (int f = lo; f <= hi; ++f) {
             const int slot = f % d->src_ring;
             if (d->src_frame[slot] != f) {
                 d->src_frame[slot] = f;
                 d->src_writer[slot] = n;
+                d->src_writer_sem[slot] = stream.timeline;
+                d->src_writer_value[slot] = seq;
                 stream.upload_new[f - lo] = true;
             }
-            d->src_holders[slot].push_back(n);
+            d->src_holders[slot].push_back(stream.res_token);
         }
         return;
     }
@@ -458,7 +496,7 @@ static void release_cache(BM3DData * d, Bm3dStream & stream, int n) {
     std::lock_guard lock(d->cache_lock);
     for (int i = 0; i < d->tw; ++i) {
         auto & h = d->res_holders[stream.win_slots[i]];
-        h.erase(std::remove(h.begin(), h.end(), n), h.end());
+        h.erase(std::remove(h.begin(), h.end(), stream.res_token), h.end());
     }
     const int r = d->radius;
     const int nf = d->nframes;
@@ -466,7 +504,7 @@ static void release_cache(BM3DData * d, Bm3dStream & stream, int n) {
     const int hi = std::clamp(n + 2 * r, 0, nf - 1);
     for (int f = lo; f <= hi; ++f) {
         auto & h = d->src_holders[f % d->src_ring];
-        h.erase(std::remove(h.begin(), h.end(), n), h.end());
+        h.erase(std::remove(h.begin(), h.end(), stream.res_token), h.end());
     }
     d->cache_cv.notify_all();
 }
@@ -547,7 +585,13 @@ static int record_bm3d_kernels(BM3DData * d, Bm3dStream & stream, int n,
 
     // compute the missing result slots for the aggregation window
     // (the frame n+r at the steady state; the boundary frames too)
-    if (gputrace) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stream.ts_query, 0);
+    if (gputrace) {
+        // a query must be reset before first use and before each reuse; doing
+        // it inside the command buffer keeps the reset ordered with the stamps
+        // (and with the aggregation command buffer submitted after this one)
+        vkCmdResetQueryPool(cmd, stream.ts_query, 0, 4);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stream.ts_query, 0);
+    }
     int n_dispatches = 0;
     for (int i = 0; i < d->tw; ++i) {
         if (!stream.win_recompute[i]) {
@@ -705,34 +749,36 @@ static const VSFrame *VS_CC BM3DGetFrame(
             }
         }
     } else if (activationReason == arAllFramesReady) {
-        const VSFrame * src = nullptr;
-        if (d->chroma) {
-            src = vsapi->getFrameFilter(n, d->node, frameCtx);
-        }
         VSFrame * dst;
         if (d->chroma) {
             // process the luma plane in place, copy the chroma planes and the
             // frame props from the source frame
+            const VSFrame * src = vsapi->getFrameFilter(n, d->node, frameCtx);
             const int pl[] = { 0, 1, 2 };
             const VSFrame * fr[] = { nullptr, src, src };
             dst = vsapi->newVideoFrame2(
                 &d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
             vsapi->freeFrame(src);
         } else {
-            dst = vsapi->newVideoFrame(&d->vi->format, d->vi->width, d->vi->height, nullptr, core);
+            // the grayscale path has no planes to copy, but the center source
+            // frame is still the property donor: without it the output loses
+            // _DurationNum/_DurationDen/_ColorRange and application metadata
+            // that the YUV path preserves
+            const VSFrame * src = vsapi->getFrameFilter(n, d->node, frameCtx);
+            dst = vsapi->newVideoFrame(
+                &d->vi->format, d->vi->width, d->vi->height, src, core);
+            vsapi->freeFrame(src);
         }
 
         auto stream = d->pool.take();
         if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d acquired\n", n);
         const int my_stream = stream.stream_id;
-        d->frame_stream[n % 64] = my_stream;
         const uint64_t my_seq = stream.seq++;
-        d->frame_seq[n % 64] = my_seq;
         if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d stream=%d\n", n, my_stream);
 
         // reserve this frame's cache slots (blocks only when the working set
         // exceeds the cache, e.g. on seeks; never holds a stream while waiting)
-        acquire_cache(d, stream, n);
+        acquire_cache(d, stream, n, my_seq);
 
         const auto set_error = [&](const std::string & error_message) {
             // unblock any frames already waiting on this frame's timeline
@@ -780,8 +826,12 @@ static const VSFrame *VS_CC BM3DGetFrame(
                 float * dstp = stream.map + slot_base +
                     static_cast<VkDeviceSize>(clips - 1) * p.pe +
                     static_cast<VkDeviceSize>(plane) * d->src_size;
-                const auto bytes = static_cast<size_t>(p.width) * sizeof(float) * p.height;
-                copy_stream_out(dstp, srcp, bytes);
+                // the frame's stride is not necessarily the GPU plane pitch
+                // (width rounded up to 4 floats), so copy the visible rows one
+                // at a time unless both are tight
+                copy_plane_out(dstp, static_cast<ptrdiff_t>(p.stride) * sizeof(float),
+                    srcp, vsapi->getStride(src, plane),
+                    static_cast<size_t>(p.width) * sizeof(float), p.height, true);
             }
             vsapi->freeFrame(src);
             if (d->final) {
@@ -791,8 +841,9 @@ static const VSFrame *VS_CC BM3DGetFrame(
                     auto srcp = vsapi->getReadPtr(rsrc, plane);
                     float * dstp = stream.map + slot_base +
                         static_cast<VkDeviceSize>(plane) * d->src_size;
-                    const auto bytes = static_cast<size_t>(p.width) * sizeof(float) * p.height;
-                    copy_stream_out(dstp, srcp, bytes);
+                    copy_plane_out(dstp, static_cast<ptrdiff_t>(p.stride) * sizeof(float),
+                        srcp, vsapi->getStride(rsrc, plane),
+                        static_cast<size_t>(p.width) * sizeof(float), p.height, true);
                 }
                 vsapi->freeFrame(rsrc);
             }
@@ -830,47 +881,63 @@ static const VSFrame *VS_CC BM3DGetFrame(
 
         std::vector<VkSemaphore> src_waits, res_waits;
         std::vector<uint64_t> src_values, res_values;
+        // one entry per semaphore, at the maximum value requested: the same
+        // stream can be the writer of several slots of this window, and a
+        // submission must not carry the same timeline semaphore twice
+        const auto add_wait = [](std::vector<VkSemaphore> & sems,
+                                 std::vector<uint64_t> & values,
+                                 VkSemaphore sem, uint64_t value) {
+            for (size_t i = 0; i < sems.size(); ++i) {
+                if (sems[i] == sem) {
+                    values[i] = std::max(values[i], value);
+                    return;
+                }
+            }
+            sems.push_back(sem);
+            values.push_back(value);
+        };
         if (d->radius > 0) {
             for (int f = src_lo; f <= src_hi; ++f) {
                 if (stream.upload_new[f - src_lo]) {
                     continue;   // own upload: copied ahead of our dispatches
                 }
                 const int w = stream.src_writers[f - src_lo];
-                if (w < 0 || w == n) {
+                const VkSemaphore sem = stream.src_writer_sem[f - src_lo];
+                if (w < 0 || sem == VK_NULL_HANDLE) {
                     continue;
                 }
-                const int sf = d->frame_stream[w % 64];
-                if (sf < 0 || sf == my_stream) {
+                if (sem == stream.timeline) {
                     continue;   // same stream: already queue-ordered
                 }
-                if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d waits on src uploader w=%d sf=%d val=%llu\n", n, w, sf, static_cast<unsigned long long>(d->frame_seq[w % 64]));
-                src_waits.push_back(d->timelines[sf]);
-                src_values.push_back(d->frame_seq[w % 64]);
+                if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d waits on src uploader w=%d val=%llu\n", n, w, static_cast<unsigned long long>(stream.src_writer_value[f - src_lo]));
+                add_wait(src_waits, src_values, sem, stream.src_writer_value[f - src_lo]);
             }
             for (int i = 0; i < d->tw; ++i) {
                 const int w = stream.win_writers[i];
-                if (w < 0 || w == n) {
-                    continue;   // own work: ordered by the shared queue
+                const VkSemaphore sem = stream.win_writer_sem[i];
+                if (w < 0 || sem == VK_NULL_HANDLE) {
+                    continue;   // own work or a slot this frame recomputes
                 }
-                const int sf = d->frame_stream[w % 64];
-                if (sf < 0 || sf == my_stream) {
-                    continue;
+                if (sem == stream.timeline) {
+                    continue;   // same stream: already queue-ordered
                 }
-                if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d waits on writer w=%d sf=%d val=%llu\n", n, w, sf, static_cast<unsigned long long>(d->frame_seq[w % 64]));
-                res_waits.push_back(d->timelines[sf]);
-                res_values.push_back(d->frame_seq[w % 64]);
+                if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d waits on writer w=%d val=%llu\n", n, w, static_cast<unsigned long long>(stream.win_writer_value[i]));
+                add_wait(res_waits, res_values, sem, stream.win_writer_value[i]);
             }
         }
 
         std::vector<VkPipelineStageFlags> res_stages(res_waits.size(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        std::vector<VkPipelineStageFlags> src_stages(src_waits.size(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
         // The source window is read by this frame's estimation kernels. The
         // uploaders' copies are ordered ahead of their own kernels on the same
         // queue, so waiting for the uploaders' timelines here (host-side) is
         // deadlock-free: a GPU-side wait on a timeline signalled by a later
-        // submission would block the whole queue. The kernel command buffer
-        // carries a transfer->compute barrier so the freshly copied frames are
-        // memory-visible.
+        // submission would block the whole queue. The host wait alone does not
+        // establish the device-side producer->consumer memory dependency for
+        // transfers that ran on another queue, so the same timelines are also
+        // fed to the estimation submit as device waits (they are signalled by
+        // now, so those waits are immediate).
         if (d->radius > 0 && !src_waits.empty()) {
             VkSemaphoreWaitInfo wait_info {
                 .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
@@ -887,7 +954,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
                the same queue, and a fence must not be attached to a second
                submission while a first one still holds it */
             checkVK(submit_timeline(dev, stream.queue, stream.queue_lock, stream.cmd,
-                {}, {}, {}, stream.timeline, my_seq, VK_NULL_HANDLE));
+                src_waits, src_values, src_stages, stream.timeline, my_seq, VK_NULL_HANDLE));
 
         record_bm3d_agg(d, stream, n);
         if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d agg recorded\n", n);
@@ -927,7 +994,9 @@ static const VSFrame *VS_CC BM3DGetFrame(
                     sizeof(ts), ts, sizeof(uint64_t),
                     VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
                 const float period = d->device->limits.timestampPeriod;
-                uint32_t nq = ts_nf.fetch_add(1);
+                // fetch_add returns the previous count: the first completed
+                // frame is sample 1, not 0 (dividing by 0 printed garbage)
+                uint32_t nq = ts_nf.fetch_add(1) + 1;
                 if (ts[0] && ts[1]) ts_k += (ts[1] - ts[0]) * period;
                 if (ts[2] && ts[3]) ts_a += (ts[3] - ts[2]) * period;
                 if (nq % 50 == 0) {
@@ -956,8 +1025,9 @@ static const VSFrame *VS_CC BM3DGetFrame(
             auto dstp = vsapi->getWritePtr(dst, plane);
             const float * h_bufferp = stream.dst_map +
                 static_cast<VkDeviceSize>(plane) * p.pe;
-            const auto bytes = static_cast<size_t>(p.width) * sizeof(float) * p.height;
-            copy_stream_read(dstp, h_bufferp, bytes);
+            copy_plane_read(dstp, vsapi->getStride(dst, plane), h_bufferp,
+                static_cast<ptrdiff_t>(p.stride) * sizeof(float),
+                static_cast<size_t>(p.width) * sizeof(float), p.height);
         }
 
         d->pool.give_back(std::move(stream));
@@ -1026,6 +1096,15 @@ static void VS_CC BM3DCreate(
     if (d->vi->width <= 0 || d->vi->height <= 0 ||
         d->vi->format.sampleType != stFloat || d->vi->format.bitsPerSample != 32) {
         return set_error("only constant format 32 bit float input supported");
+    }
+
+    // The block-matching kernel always loads unconditional 8x8 patches and
+    // clamps its block origin to (dimension - 8), so anything smaller would
+    // index negative buffer offsets. Reject it before allocating GPU
+    // resources rather than relying on robust buffer access (which is not
+    // enabled).
+    if (d->vi->width < 8 || d->vi->height < 8) {
+        return set_error("clip dimensions must be at least 8x8");
     }
 
     std::array<float, 3> sigma;
@@ -1115,6 +1194,15 @@ static void VS_CC BM3DCreate(
         return set_error("\"num_streams\" must be positive");
     }
 
+    int device_id = vsh::int64ToIntS(vsapi->mapGetInt(in, "device_id", 0, &error));
+    if (error) {
+        device_id = 0;
+    }
+    if (device_id < 0) {
+        return set_error("\"device_id\" must be non-negative");
+    }
+    d->device_id = device_id;
+
     // at radius 0 every frame only touches its own slot and never depends on
     // the previous frames' estimates, so give each in-flight frame its own
     // src/res slot to keep the pipeline full; otherwise the ring of 1 would
@@ -1133,16 +1221,21 @@ static void VS_CC BM3DCreate(
     d->nframes = d->vi->numFrames;
 
     {
-        const auto result = get_device(0);
+        const auto result = get_device(d->device_id);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
         d->device = std::get<std::shared_ptr<VK_Device>>(result);
     }
 
-    // enable fp64 for the exactly-rounded aggregation division
+    // enable fp64 for the exactly-rounded aggregation division; the BM3D
+    // kernels also accumulate into float SSBOs with atomicAdd
+    // (GL_EXT_shader_atomic_float), so both features are required
     if (auto err = enable_float64(d->device)) {
         return set_error(*err);
+    }
+    if (!d->device->feat_atomic_float32_add) {
+        return set_error("shaderBufferFloat32AtomicAdd is not supported by this device");
     }
 
     VkDevice dev = d->device->device;
@@ -1316,7 +1409,6 @@ static void VS_CC BM3DCreate(
     // streams
     d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
     d->pool.reserve(d->num_streams);
-    d->timelines.resize(d->num_streams);
 
     uint32_t num_queues = std::min(d->num_streams, static_cast<int>(d->device->queue_count));
 
@@ -1428,7 +1520,6 @@ static void VS_CC BM3DCreate(
                 .flags = 0
             };
             checkVK(vkCreateSemaphore(dev, &sem_info, nullptr, &stream.timeline));
-            d->timelines[i] = stream.timeline;
         }
         if (std::getenv("BM3D_GPUTRACE")) {
             VkQueryPoolCreateInfo qp_info {
@@ -1473,11 +1564,14 @@ static void VS_CC BM3DCreate(
 
     d->src_frame.assign(d->src_ring, -1);
     d->src_writer.assign(d->src_ring, -1);
+    d->src_writer_sem.assign(d->src_ring, VK_NULL_HANDLE);
+    d->src_writer_value.assign(d->src_ring, 0);
     d->src_holders.resize(d->src_ring);
     d->res_frame.assign(d->res_cap, -1);
     d->res_writer.assign(d->res_cap, -1);
+    d->res_writer_sem.assign(d->res_cap, VK_NULL_HANDLE);
+    d->res_writer_value.assign(d->res_cap, 0);
     d->res_holders.resize(d->res_cap);
-    std::fill(d->frame_stream.begin(), d->frame_stream.end(), -1);
 
     BM3DData * data = d.release();
 
@@ -1508,7 +1602,8 @@ void vsfeel_register_bm3dv2(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
         "ps_num:int[]:opt;"
         "ps_range:int[]:opt;"
         "num_streams:int:opt;"
-        "extractor_exp:int:opt;",
+        "extractor_exp:int:opt;"
+        "device_id:int:opt;",
         "clip:vnode;",
         BM3DCreate, nullptr, plugin
     );
