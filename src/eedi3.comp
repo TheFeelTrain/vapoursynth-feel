@@ -94,6 +94,11 @@ const int MARGIN_V = 4;
 
 // backtrack + interpolate tile width (columns)
 const int BT_TILE = 32;
+// Diagnostics-only ablation level (0 = full kernel; 2 = return after the mask
+// pack/span scan, 3 = return at entry). Kept as a tuning instrument.
+#ifndef PROBE
+#define PROBE 0
+#endif
 
 #if defined(ENTRY_PAD)
 // Raw tight kept rows (u16/f32 native) uploaded through the H2D mirror;
@@ -402,6 +407,10 @@ void main() {
     const int pbt_row = pc.pbt_base + r * (WIDTH * TPITCH);
     const int laneBase = lane * K;
 
+#if PROBE >= 3
+    if (lane == 0) dmap[pc.rempty_base + r] = int8_t(0);
+    return;
+#endif
     if (HAS_MCLIP != 0) {
         // The host uploads this row's dilated mask PRE-PACKED (one uint per
         // 32 columns); burst-copy the words to shared instead of packing
@@ -437,6 +446,9 @@ void main() {
     // divergence): fully-masked rows skip the serial vcheck walk.
     if (lane == 0)
         dmap[pc.rempty_base + r] = int8_t(xmin >= WIDTH ? 1 : 0);
+#if PROBE == 2
+    return;
+#endif
 
     if (xmin >= WIDTH) {
         // Fully-masked row (measured ~53% of rows in the AA workload): every
@@ -548,7 +560,11 @@ void main() {
             }
             for (int j = 0; j < K; j++) {
                 if (laneBase + j < TPITCH)
+#if PROBE == 1
+                    pbt[pbt_row + (xd - 1) * TPITCH + laneBase + j] = int8_t(0);
+#else
                     pbt[pbt_row + (xd - 1) * TPITCH + laneBase + j] = int8_t(cRel[j]);
+#endif
             }
         } else {
             // Unmasked column: gather the previous column's path costs
@@ -628,7 +644,11 @@ void main() {
                     const float pcost = min(bval + ccost, FLT_MAX_09);
                     cur[j] = pcost;
                     cRel[j] = idx - u;
+#if PROBE == 1
+                    pbt[pbt_row + (xd - 1) * TPITCH + i] = int8_t(0);
+#else
                     pbt[pbt_row + (xd - 1) * TPITCH + i] = int8_t(cRel[j]);
+#endif
                 }
             }
         }

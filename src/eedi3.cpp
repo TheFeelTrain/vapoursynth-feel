@@ -15,6 +15,8 @@
 #include <variant>
 #include <vector>
 
+#include <immintrin.h>
+
 #include <vulkan/vulkan.h>
 
 #include <VapourSynth4.h>
@@ -89,6 +91,30 @@ static int pad_elem_bytes(int bits) {
     return (bits == 16) ? 2 : 4;
 }
 
+// Copy dispatch for the per-frame host staging work. The NT load/store pair
+// (copy_stream_*) bypasses the CPU cache, which is right for buffers the CPU
+// touches exactly once — but under 8 concurrent streams the aggregate NT
+// store bandwidth on this platform is what limits the frame, so the choice is
+// a measured per-call-site trade (VSFEEL_EEDI3_COPY: bit0 = upload gathers,
+// bit1 = the dst blit).
+static inline void frame_copy_out(void * dst, const void * src, size_t bytes,
+                                  const bool nt) {
+    if (nt) {
+        copy_stream_out(dst, src, bytes);
+    } else {
+        std::memcpy(dst, src, bytes);
+    }
+}
+
+static inline void frame_copy_stream_read(void * dst, const void * src,
+                                          size_t bytes, const bool nt) {
+    if (nt) {
+        copy_stream_read(dst, src, bytes);
+    } else {
+        std::memcpy(dst, src, bytes);
+    }
+}
+
 // Host-side pad upload is always float (see eedi3.comp header): u16 native
 // values are exact integers < 2^24 so float cost/interp math is bit-exact.
 enum Binding : uint32_t {
@@ -153,8 +179,13 @@ struct PlaneConfig {
 struct Eedi3Resource {
     VkBuffer staging {};
     VkDeviceMemory staging_mem {};
-    VkBuffer pad_dev {};          // device-local mirror of the upload region
+    VkBuffer pad_dev {};          // device-local built pads (pad kernel out)
     VkDeviceMemory pad_dev_mem {};
+    VkBuffer up_dev {};           // ReBAR upload: CPU NT-stores land in VRAM
+    VkDeviceMemory up_dev_mem {};
+    uint8_t * up_map {};          // mapped view of up_dev
+    uint32_t up_type_index {};
+    VkDescriptorSet desc_set_pad {};   // pad kernel (b0 = up_dev, b8 = pad_dev)
     VkBuffer dev_buf {};          // device-local kernels' buffers
     VkDeviceMemory dev_mem {};
     VkCommandPool pool {};
@@ -180,6 +211,15 @@ struct Eedi3Data {
 
     int field {}, nrad { 2 }, mdis { 20 }, vcheck { 2 };
     bool dh {};
+    // Which copies use non-temporal load/store (bit0 = upload gathers, bit1 =
+    // the final blit). Swept with VSFEEL_EEDI3_COPY; the default is measured.
+    int copy_mode { 3 };
+    // Diagnostics-only host-path ablations (env-gated; all default off).
+    bool skip_blit {}, skip_sclip {}, skip_raw {}, skip_h2d {}, skip_vcheck {};
+    // ReBAR direct upload: the CPU NT-stores the upload straight into
+    // host-visible VRAM (nnedi3's proven path) instead of writing system-RAM
+    // staging and DMA'ing it. VSFEEL_EEDI3_NOREBAR=1 forces the old path.
+    bool rebar_up { true };  // VSFEEL_EEDI3_NOREBAR=1 forces the H2D path
     float alpha { 0.2f }, beta { 0.25f }, gamma { 20.0f };
     float vthresh2 { 4.0f };
     float rw {}, rcp_vth0 {}, rcp_vth1 {}, rcp_vth2 {};
@@ -230,6 +270,15 @@ struct Eedi3Data {
             }
             if (resource.pad_dev) {
                 vkDestroyBuffer(dev, resource.pad_dev, nullptr);
+            }
+            if (resource.up_map) {
+                vkUnmapMemory(dev, resource.up_dev_mem);
+            }
+            if (resource.up_dev_mem) {
+                vkFreeMemory(dev, resource.up_dev_mem, nullptr);
+            }
+            if (resource.up_dev) {
+                vkDestroyBuffer(dev, resource.up_dev, nullptr);
             }
             if (resource.dev_mem) {
                 vkFreeMemory(dev, resource.dev_mem, nullptr);
@@ -291,12 +340,22 @@ struct Eedi3Data {
 // the GPU pad kernel expands mirrors, replicating eedi3m's copyPad exactly)
 // ---------------------------------------------------------------------------
 
-// Mirrors eedi3m's bmask dilation scan for one row: marks columns within
-// mdis of a set mask pixel ("last" propagation). Writes directly PACKED BITS
-// (one uint32 per 32 columns) into the upload region: 8x fewer bytes than the
-// byte mask (smaller H2D + the shader loads words instead of packing).
-static void build_bmask_row(const uint8_t * maskp, uint32_t * out,
-                            const int width, const int mdis) {
+// Row dilation + bit packing: out[x>>5] bit (x&31) is set iff any mask byte in
+// [x-mdis, x+mdis] is non-zero (bytes outside [0,width) count as zero) — the
+// same window-OR the scalar last-propagation scan below computes, proved
+// equivalent incl. edges when the GPU bmask kernel was prototyped (notes 8.2).
+// Writes PACKED BITS (one uint32 per 32 columns): 8x fewer bytes than the byte
+// mask (smaller H2D + the shader loads words instead of packing).
+//
+// Why bits and not the scan: bits are a *dilation by a box*, which composes
+// (dil_a ∘ dil_b == dil_(a+b)) and therefore collapses to a handful of
+// whole-array shift-ORs. The scan's serial `last` dependency is exactly what
+// made the scalar version ~6 ms/frame at 3840x1080 (microbenchmark) — i.e. the
+// single largest CPU cost in the whole filter.
+//
+// scratch must hold 2 * ((width + mdis + 63) / 64) uint64 words.
+static void build_bmask_row_scalar(const uint8_t * maskp, uint32_t * out,
+                                   const int width, const int mdis) {
     const int minmdis = std::min(width, mdis);
     int last = -666999;
 
@@ -317,6 +376,103 @@ static void build_bmask_row(const uint8_t * maskp, uint32_t * out,
         if (x <= last) {
             out[x >> 5] |= 1u << (x & 31);
         }
+    }
+}
+
+static void build_bmask_row(const uint8_t * maskp, uint32_t * out,
+                            const int width, const int mdis,
+                            uint64_t * scratch) {
+    // The shift/dilate form below equals the scalar scan only when the scan's
+    // two coverage loops are contiguous, i.e. width >= 2*mdis (validation caps
+    // mdis at 40). Narrower rows keep the exact legacy scalar path; so does
+    // mdis >= 64, which the shift form cannot express.
+    if (mdis >= 64 || width < 2 * mdis) {
+        const int nwords = (width + 31) / 32;
+        std::memset(out, 0, static_cast<size_t>(nwords) * sizeof(uint32_t));
+        build_bmask_row_scalar(maskp, out, width, mdis);
+        return;
+    }
+
+    // The accumulator must span [0, width-1+mdis]: B = b << mdis puts set bits
+    // up to width-1+mdis, and the dilation reads B at x+t for x < width and
+    // t <= 2*mdis only through those (bits at p > width-1+mdis map to mask
+    // bytes past the row, which are zero) -- but the SHIFT itself needs the
+    // extra words to exist, and the dilation needs them to hold B's high bits.
+    const int nw_b = (width + 63) / 64;                  // packed mask words
+    const int nw = (width + mdis + 63) / 64;             // accumulator words
+
+    // 1. pack: bit x = (maskp[x] != 0); words past nw_b stay zero
+    std::memset(scratch, 0, static_cast<size_t>(nw) * sizeof(uint64_t));
+    const __m256i zero = _mm256_setzero_si256();
+    for (int i = 0; i < nw_b; ++i) {
+        const int x = i * 64;
+        uint64_t w = 0;
+        for (int h = 0; h < 2; ++h) {
+            const int xb = x + h * 32;
+            uint32_t m = 0;
+            if (xb + 32 <= width) {
+                const __m256i v = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(maskp + xb));
+                m = ~static_cast<uint32_t>(_mm256_movemask_epi8(
+                    _mm256_cmpeq_epi8(v, zero)));
+            } else if (xb < width) {
+                uint8_t tmp[32] = {};
+                std::memcpy(tmp, maskp + xb, static_cast<size_t>(width - xb));
+                const __m256i v = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(tmp));
+                m = ~static_cast<uint32_t>(_mm256_movemask_epi8(
+                    _mm256_cmpeq_epi8(v, zero)));
+            }
+            w |= static_cast<uint64_t>(m) << (h * 32);
+        }
+        scratch[i] = w;
+    }
+
+    // 2. B[x] = b[x - mdis]: shift the bit array toward higher x by mdis
+    //    (descending in place: src[i-1] is still untouched when i is written).
+    {
+        const int k = mdis;
+        for (int i = nw - 1; i >= 0; --i) {
+            const uint64_t hi = scratch[i] << k;
+            const uint64_t lo = (i > 0) ? (scratch[i - 1] >> (64 - k)) : 0;
+            scratch[i] = hi | lo;
+        }
+    }
+
+    // 3. out[x] = OR_{t=0}^{2*mdis} B[x+t]. In bit-index terms this is
+    //    `acc >> t` ((a>>t)[p] == a[p+t]), so each B bit at p covers out bits
+    //    [p-2mdis, p]. Compose by doubling: if acc == dil_r then
+    //    acc | (acc >> s) == dil_{r+s} for any s <= r+1, so 2*mdis is reached
+    //    in O(log mdis) whole-array passes instead of 2*mdis passes.
+    if (mdis > 0) {
+        const int r = 2 * mdis;
+        uint64_t * const shifted = scratch + nw;   // caller-provided second half
+        int radius = 0;
+        for (int step = 1; radius < r; step <<= 1) {
+            const int s = std::min(step, r - radius);
+            for (int i = 0; i < nw; ++i) {
+                const uint64_t hi = scratch[i] >> s;
+                const uint64_t lo = (i + 1 < nw)
+                    ? (scratch[i + 1] << (64 - s)) : 0;
+                shifted[i] = hi | lo;
+            }
+            for (int i = 0; i < nw; ++i) {
+                scratch[i] |= shifted[i];
+            }
+            radius += s;
+        }
+    }
+
+    // 4. store as packed uint32 words (row stride is (width+31)/32 words);
+    //    the bits past `width` in the last word are cleared (the shader never
+    //    reads them, but the upload stays byte-reproducible).
+    const int nwords = (width + 31) / 32;
+    for (int i = 0; i < nwords; ++i) {
+        out[i] = static_cast<uint32_t>(scratch[i >> 1] >> ((i & 1) * 32));
+    }
+    const int tail = width & 31;
+    if (tail != 0) {
+        out[nwords - 1] &= (1u << tail) - 1u;
     }
 }
 
@@ -473,11 +629,13 @@ static std::optional<std::string> record_command_buffer(
 
     const int32_t elem = d.elem_bytes;
 
-    // H2D: copy the CPU-written upload region (tight kept rows, packed bits,
-    // sclip, [0, upload_total)) into the device-local mirror. GPU reads of
-    // host staging are slow here even when purely streaming (measured twice),
-    // so everything reused goes through VRAM. Host writes were flushed.
-    if (d.upload_total > 0) {
+    // Upload: with the ReBAR path the CPU has ALREADY NT-stored the upload
+    // region straight into host-visible VRAM (resource.up_dev), so there is
+    // nothing to copy here and no transfer->compute barrier to pay -- the
+    // kernels read up_dev directly. The host-side stores are drained by an
+    // _mm_sfence() before submit. VSFEEL_EEDI3_NOREBAR=1 restores the old
+    // staging -> pad_dev DMA.
+    if (d.upload_total > 0 && !d.skip_h2d && !d.rebar_up) {
         const VkBufferCopy region {
             .srcOffset = 0,
             .dstOffset = 0,
@@ -516,9 +674,14 @@ static std::optional<std::string> record_command_buffer(
 
         // pad builder: one thread per padded element
         vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.pad_pipeline);
+        // The pad kernel reads the raw upload at binding 0; with the ReBAR
+        // path that is up_dev and needs its own set (the row kernel reads the
+        // built pad from pad_dev at the same binding index).
+        VkDescriptorSet const pad_set = resource.desc_set_pad
+            ? resource.desc_set_pad : resource.desc_set;
         vkCmdBindDescriptorSets(
             resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
+            d.pipeline_layout, 0, 1, &pad_set, 0, nullptr);
         vkCmdPushConstants(
             resource.cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
             0, sizeof(ppc), &ppc);
@@ -586,7 +749,7 @@ static std::optional<std::string> record_command_buffer(
             0, sizeof(pc), &pc);
         vkCmdDispatch(resource.cmd, 1, static_cast<uint32_t>(cfg.rows), 1);
 
-        if (d.vcheck > 0) {
+        if (d.vcheck > 0 && !d.skip_vcheck) {
             // the vcheck passes read the row kernel's writes (dst/dmap/cint
             // rempty flags)
             VkMemoryBarrier mem_barrier {
@@ -748,9 +911,11 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     }
     const int off = 1 - field;
 
-    const bool hbench = getenv("VSFEEL_EEDI3_HBENCH") && sn == 0;
+    static const int hframe = getenv("VSFEEL_EEDI3_HFRAME") ? atoi(getenv("VSFEEL_EEDI3_HFRAME")) : 0;
+    const bool hbench = getenv("VSFEEL_EEDI3_HBENCH") && sn == hframe;
     const auto h_t0 = std::chrono::steady_clock::now();
-    auto h_tMaskEnd = h_t0, h_tGatherEnd = h_t0;
+    auto h_tMaskEnd = h_t0, h_tGatherEnd = h_t0, h_tRawEnd = h_t0;
+    auto h_tRecEnd = h_t0;
 
     // Re-record the command buffer with this frame's interp-row parity (the
     // previous submit on this resource was waited on before give_back, so the
@@ -759,15 +924,21 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     if (const auto err = record_command_buffer(*d, resource, field)) {
         return set_error(*err);
     }
+    if (hbench) { h_tRecEnd = std::chrono::steady_clock::now(); }
 
     const bool coherent =
         !!(d->device->mem_props.memoryTypes[resource.staging_type_index].propertyFlags &
            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
     // CPU: gather tight kept source rows, CPU-packed dilation bits, and
-    // sclip interp rows into staging (plain streaming copies for the rows;
-    // the GPU pad kernel expands mirrors, the row kernel reads the bits).
+    // sclip interp rows into the upload region (plain streaming copies for
+    // the rows; the GPU pad kernel expands mirrors, the row kernel reads the
+    // bits). With the ReBAR path the upload region lives in host-visible
+    // VRAM (resource.up_map) and is NT-stored directly; the old path writes
+    // system-RAM staging and lets the DMA mirror it.
     uint8_t * const staging = static_cast<uint8_t *>(static_cast<void *>(map));
+    uint8_t * const upload = resource.up_map
+        ? resource.up_map : staging;
 
     for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
         if (!d->process[plane]) {
@@ -778,18 +949,41 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         const auto srcp = vsapi->getReadPtr(src, plane);
         const ptrdiff_t src_stride = vsapi->getStride(src, plane);
         const size_t raw_row_bytes = static_cast<size_t>(cfg.width) * pad_elem_bytes(d->bits);
-        uint8_t * rawp = staging + cfg.raw_offset;
-        if (!d->dh) {
+        uint8_t * rawp = upload + cfg.raw_offset;
+        // The tight kept-row gather and the destination's kept-row copy read
+        // exactly the same source rows in the same order (raw row k -> kept
+        // row k -> dst row `off + 2k`), so both are written here while the
+        // source row is hot. Doing the dst half later in the blit re-read the
+        // whole source a second time (8.3 MB/frame at the bench geometry) —
+        // measured worth ~5-7% when the host copies are the limiter.
+        auto dstp = vsapi->getWritePtr(dst, plane);
+        const ptrdiff_t dst_stride = vsapi->getStride(dst, plane);
+        const bool nt_raw = (d->copy_mode & 1) != 0;
+        const bool nt_kept = (d->copy_mode & 2) != 0;
+        if (d->skip_raw) {
+            // diagnostics-only
+        } else if (!d->dh) {
             for (int k = 0; k < cfg.rows; ++k) {
-                copy_stream_out(rawp + static_cast<size_t>(k) * raw_row_bytes,
-                                srcp + src_stride * (off + 2 * k), raw_row_bytes);
+                const uint8_t * const srow = srcp + src_stride * (off + 2 * k);
+                frame_copy_out(rawp + static_cast<size_t>(k) * raw_row_bytes,
+                               srow, raw_row_bytes, nt_raw);
+                if (!d->skip_blit) {
+                    frame_copy_out(dstp + dst_stride * (off + 2 * k),
+                                   srow, raw_row_bytes, nt_kept);
+                }
             }
         } else {
             for (int k = 0; k < cfg.rows; ++k) {
-                copy_stream_out(rawp + static_cast<size_t>(k) * raw_row_bytes,
-                                srcp + src_stride * k, raw_row_bytes);
+                const uint8_t * const srow = srcp + src_stride * k;
+                frame_copy_out(rawp + static_cast<size_t>(k) * raw_row_bytes,
+                               srow, raw_row_bytes, nt_raw);
+                if (!d->skip_blit) {
+                    frame_copy_out(dstp + dst_stride * (2 * k + off),
+                                   srow, raw_row_bytes, nt_kept);
+                }
             }
         }
+        if (hbench) { h_tRawEnd = std::chrono::steady_clock::now(); }
         if (d->mclip_node && mcp) {
             // single Gray mask drives every processed plane: mask row for
             // interp row r is (dh ? r : field + 2r) of the mclip frame.
@@ -797,28 +991,30 @@ static const VSFrame *VS_CC Eedi3GetFrame(
             // builder ORs bits in.
             const uint8_t * maskp = vsapi->getReadPtr(mcp, 0);
             const ptrdiff_t mask_stride = vsapi->getStride(mcp, 0);
-            uint8_t * bm = staging + cfg.bits_offset;
+            uint8_t * bm = upload + cfg.bits_offset;
             const size_t bm_row_bytes =
                 static_cast<size_t>((cfg.width + 31) / 32) * sizeof(uint32_t);
+            std::vector<uint64_t> bmask_scratch(
+                2 * static_cast<size_t>((cfg.width + d->mdis + 63) / 64));
             for (int r = 0; r < cfg.rows; ++r) {
                 const int mrow = d->dh ? r : field + 2 * r;
                 uint8_t * bmr = bm + static_cast<int64_t>(r) * bm_row_bytes;
-                std::memset(bmr, 0, bm_row_bytes);
                 build_bmask_row(maskp + mask_stride * mrow,
                                 reinterpret_cast<uint32_t *>(bmr),
-                                cfg.width, d->mdis);
+                                cfg.width, d->mdis, bmask_scratch.data());
             }
         }
         if (hbench) { h_tMaskEnd = std::chrono::steady_clock::now(); }
 
-        if (d->vcheck > 0 && d->sclip_node && scp) {
+        if (d->vcheck > 0 && d->sclip_node && scp && !d->skip_sclip) {
             const auto scpp = vsapi->getReadPtr(scp, plane);
             const ptrdiff_t scp_stride = vsapi->getStride(scp, plane);
             const size_t row_bytes = static_cast<size_t>(cfg.width) * d->elem_bytes;
-            uint8_t * sc = staging + cfg.sclip_offset;
+            uint8_t * sc = upload + cfg.sclip_offset;
             for (int r = 0; r < cfg.rows; ++r) {
-                copy_stream_out(sc + static_cast<size_t>(r) * row_bytes,
-                                scpp + scp_stride * (field + 2 * r), row_bytes);
+                frame_copy_out(sc + static_cast<size_t>(r) * row_bytes,
+                               scpp + scp_stride * (field + 2 * r), row_bytes,
+                               (d->copy_mode & 1) != 0);
             }
         }
     }
@@ -842,6 +1038,10 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         }
         checkVK(vkFlushMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
     }
+
+    // Drain the CPU store buffer so no NT upload write is still in flight when
+    // the GPU reads up_dev (required for the ReBAR path; harmless otherwise).
+    _mm_sfence();
 
     checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
         resource.cmd, resource.fence));
@@ -890,10 +1090,25 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         // the frame is written once — bypass the cache both ways. Staging
         // download rows are 32-byte aligned when row_bytes is (the common
         // case); otherwise fall back to memcpy (movntdqa faults unaligned).
-        if ((row_bytes & 31) == 0) {
-            for (int r = 0; r < cfg.rows; ++r) {
-                copy_stream_read(dstp + dst_stride * (field + 2 * r),
-                                 dl + static_cast<size_t>(r) * row_bytes, row_bytes);
+        // NOTE: a plain-memcpy variant was tried and is SLOWER in situ
+        // (blit 6.1 -> 10.4 ms/frame, vc0 481 -> 401 fps) even though the
+        // isolated microbenchmark prefers it — do not "fix" this back.
+        if (d->skip_blit) {
+            // diagnostics-only
+        } else if ((row_bytes & 31) == 0 && (d->copy_mode & 2)) {
+            // bit2 picks the load flavor: NT load (copy_stream_read, right for
+            // WC memory) or an ordinary cached load (copy_stream_out, right
+            // for the WB staging the GPU just wrote). Both use an NT store.
+            if (d->copy_mode & 4) {
+                for (int r = 0; r < cfg.rows; ++r) {
+                    copy_stream_out(dstp + dst_stride * (field + 2 * r),
+                                    dl + static_cast<size_t>(r) * row_bytes, row_bytes);
+                }
+            } else {
+                for (int r = 0; r < cfg.rows; ++r) {
+                    copy_stream_read(dstp + dst_stride * (field + 2 * r),
+                                     dl + static_cast<size_t>(r) * row_bytes, row_bytes);
+                }
             }
         } else {
             for (int r = 0; r < cfg.rows; ++r) {
@@ -902,23 +1117,8 @@ static const VSFrame *VS_CC Eedi3GetFrame(
             }
         }
 
-        // kept rows: parity off in dst. dh=0: same coords as src; dh=1: src
-        // row k -> dst row 2k + off (dst height == 2*src height).
-        // Streaming stores (no read-for-ownership on the fresh frame; the
-        // source frame stays cached for downstream readers).
-        const int dst_height = vsapi->getFrameHeight(dst, plane);
-        const int kept_rows = dst_height / 2;
-        if (!d->dh) {
-            for (int k = 0; k < kept_rows; ++k) {
-                copy_stream_out(dstp + dst_stride * (off + 2 * k),
-                                srcp + src_stride * (off + 2 * k), row_bytes);
-            }
-        } else {
-            for (int k = 0; k < kept_rows; ++k) {
-                copy_stream_out(dstp + dst_stride * (off + 2 * k),
-                                srcp + src_stride * k, row_bytes);
-            }
-        }
+        // kept rows were already written during the upload gather above
+        // (same source rows, same order) — nothing left to do here.
     }
 
     d->pool.give_back(std::move(resource));
@@ -930,8 +1130,9 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         };
         fprintf(stderr, "[eedi3-hbench] cpu_stage=%.3fms gpu_submit_wait=%.3fms blit=%.3fms\n",
                 us(h_t0, h_t1), us(h_t1, h_t2), us(h_t2, h_t3));
-        fprintf(stderr, "[eedi3-hbench]   of cpu_stage: raw+bits=%.3fms sclip=%.3fms\n",
-                us(h_t0, h_tMaskEnd), us(h_tMaskEnd, h_tGatherEnd));
+        fprintf(stderr, "[eedi3-hbench]   of cpu_stage: record=%.3fms raw=%.3fms bits=%.3fms sclip=%.3fms\n",
+                us(h_t0, h_tRecEnd), us(h_tRecEnd, h_tRawEnd),
+                us(h_tRawEnd, h_tMaskEnd), us(h_tMaskEnd, h_tGatherEnd));
     }
 
     vsapi->freeFrame(src);
@@ -1194,6 +1395,22 @@ static void VS_CC Eedi3Create(
         return set_error("num_streams must be 1..32.");
     }
     d->num_streams = num_streams;
+
+    if (const char * rb = std::getenv("VSFEEL_EEDI3_NOREBAR")) {
+        d->rebar_up = (atoi(rb) == 0);
+    }
+    d->skip_blit = std::getenv("VSFEEL_EEDI3_NOBLIT") != nullptr;
+    d->skip_sclip = std::getenv("VSFEEL_EEDI3_NOSCLIP") != nullptr;
+    d->skip_raw = std::getenv("VSFEEL_EEDI3_NORAW") != nullptr;
+    d->skip_h2d = std::getenv("VSFEEL_EEDI3_NOH2D") != nullptr;
+    d->skip_vcheck = std::getenv("VSFEEL_EEDI3_NOVC") != nullptr;
+
+    if (const char * cm = std::getenv("VSFEEL_EEDI3_COPY")) {
+        const int v = atoi(cm);
+        if (v >= 0 && v <= 7) {
+            d->copy_mode = v;
+        }
+    }
     d->device_id = device_id;
 
     {
@@ -1289,14 +1506,19 @@ static void VS_CC Eedi3Create(
         checkVK(vkCreatePipelineLayout(dev, &plci, nullptr, &d->pipeline_layout));
     }
     {
+        // Two sets per stream when the ReBAR upload is active (the pad kernel
+        // needs its own set because its binding 0 is the raw upload while the
+        // row kernel's binding 0 is the built pad).
+        const uint32_t sets_per_stream = (d->rebar_up) ? 2u : 1u;
         VkDescriptorPoolSize pool_size {
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, BIND_COUNT * static_cast<uint32_t>(d->num_streams)
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            BIND_COUNT * static_cast<uint32_t>(d->num_streams) * sets_per_stream
         };
         VkDescriptorPoolCreateInfo pool_info {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .maxSets = static_cast<uint32_t>(d->num_streams),
+            .maxSets = static_cast<uint32_t>(d->num_streams) * sets_per_stream,
             .poolSizeCount = 1,
             .pPoolSizes = &pool_size
         };
@@ -1587,8 +1809,23 @@ static void VS_CC Eedi3Create(
     d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
     d->pool.reserve(d->num_streams);
 
+    // Queue sharing: min(num_streams, queue_count) is the starting point. With
+    // one stream per queue each queue drains while its worker does the
+    // post-fence CPU work (blit + bookkeeping + next upload) before the next
+    // submit, leaving idle bubbles; sharing a queue across streams keeps a
+    // next CB queued. Sweep with VSFEEL_EEDI3_QUEUES=N (durable tuning knob,
+    // sibling of VSFEEL_BILAT_QUEUES).
     uint32_t num_queues = std::min(
         d->num_streams, static_cast<int>(d->device->queue_count));
+    if (const char * qn = std::getenv("VSFEEL_EEDI3_QUEUES")) {
+        const int q = atoi(qn);
+        if (q > 0) {
+            num_queues = std::min<uint32_t>(
+                static_cast<uint32_t>(d->num_streams),
+                std::min<uint32_t>(static_cast<uint32_t>(q),
+                    d->device->queue_count));
+        }
+    }
 
     for (int i = 0; i < d->num_streams; ++i) {
         Eedi3Resource resource;
@@ -1665,6 +1902,37 @@ static void VS_CC Eedi3Create(
             }
             resource.pad_dev_mem = std::get<AllocatedMemory>(result).memory;
         }
+        if (d->rebar_up && upload_total > 0) {
+            // ReBAR direct-upload buffer: DEVICE_LOCAL|HOST_VISIBLE|COHERENT
+            // (types 3/4 on this 7900XTX). The CPU NT-stores the upload into
+            // VRAM through the BAR (the type is uncached, so an ordinary
+            // cached store would be pathologically slow -- this is exactly why
+            // an earlier attempt at host-visible staging collapsed; NT stores
+            // bypass the cache and are fine, the nnedi3 precedent). The pad /
+            // row / vcheck kernels then read it at full VRAM speed with no
+            // DMA and no transfer barrier.
+            VkBufferCreateInfo buffer_info {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .size = std::max(upload_total, VkDeviceSize(4)),
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr
+            };
+            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.up_dev));
+            const auto result = allocate_memory(
+                *d->device, resource.up_dev,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            resource.up_dev_mem = std::get<AllocatedMemory>(result).memory;
+            resource.up_type_index = std::get<AllocatedMemory>(result).type_index;
+        }
         {
             VkCommandPoolCreateInfo pool_info {
                 .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -1701,6 +1969,9 @@ static void VS_CC Eedi3Create(
                 .pSetLayouts = &d->set_layout
             };
             checkVK(vkAllocateDescriptorSets(dev, &alloc_info, &resource.desc_set));
+            if (d->rebar_up && upload_total > 0) {
+                checkVK(vkAllocateDescriptorSets(dev, &alloc_info, &resource.desc_set_pad));
+            }
         }
         {
             // Heavily-reused kernel data (built pads, packed bits, sclip) is
@@ -1719,11 +1990,16 @@ static void VS_CC Eedi3Create(
             VkDescriptorBufferInfo dmap_info {
                 .buffer = resource.dev_buf, .offset = 0, .range = VK_WHOLE_SIZE
             };
+            // With the ReBAR upload the packed bits and sclip live in up_dev
+            // (the CPU wrote them there); otherwise they sit in the pad_dev
+            // mirror like the raw rows.
+            VkBuffer const bmask_buf = (d->rebar_up && upload_total > 0)
+                ? resource.up_dev : resource.pad_dev;
             VkDescriptorBufferInfo bmask_info {
-                .buffer = resource.pad_dev, .offset = 0, .range = VK_WHOLE_SIZE
+                .buffer = bmask_buf, .offset = 0, .range = VK_WHOLE_SIZE
             };
             VkDescriptorBufferInfo sclip_info {
-                .buffer = resource.pad_dev, .offset = 0, .range = VK_WHOLE_SIZE
+                .buffer = bmask_buf, .offset = 0, .range = VK_WHOLE_SIZE
             };
             VkDescriptorBufferInfo cint_info {
                 .buffer = resource.dev_buf, .offset = 0, .range = VK_WHOLE_SIZE
@@ -1731,8 +2007,15 @@ static void VS_CC Eedi3Create(
             VkDescriptorBufferInfo vout_info {
                 .buffer = resource.staging, .offset = 0, .range = VK_WHOLE_SIZE
             };
+            // The PAD kernel reads the raw upload at binding 0 while the row
+            // kernel reads the BUILT pad at binding 0 -- different buffers on
+            // the same binding, which is exactly the aliasing hazard the notes
+            // warn about. With ReBAR they need separate sets: desc_set_pad has
+            // b0 = up_dev (raw), desc_set has b0 = pad_dev (built pad).
             VkDescriptorBufferInfo raw_info {
-                .buffer = resource.pad_dev, .offset = 0, .range = VK_WHOLE_SIZE
+                .buffer = (d->rebar_up && upload_total > 0)
+                    ? resource.up_dev : resource.pad_dev,
+                .offset = 0, .range = VK_WHOLE_SIZE
             };
             const VkDescriptorBufferInfo * infos[BIND_COUNT] {
                 &pad_info, &dst_info, &pbt_info, &dmap_info,
@@ -1755,10 +2038,29 @@ static void VS_CC Eedi3Create(
                 };
             }
             vkUpdateDescriptorSets(dev, BIND_COUNT, writes, 0, nullptr);
+
+            if (d->rebar_up && upload_total > 0) {
+                // Same set as above except binding 0 = the raw upload (the
+                // pad kernel's input) and binding 8 = the built-pad output
+                // (desc_set leaves b8 == raw_info because raw and built both
+                // used to live in pad_dev).
+                VkWriteDescriptorSet pad_writes[BIND_COUNT];
+                for (uint32_t b = 0; b < BIND_COUNT; ++b) {
+                    pad_writes[b] = writes[b];
+                    pad_writes[b].dstSet = resource.desc_set_pad;
+                    pad_writes[b].pBufferInfo = (b == 0) ? &raw_info
+                        : (b == 8) ? &pad_info : infos[b];
+                }
+                vkUpdateDescriptorSets(dev, BIND_COUNT, pad_writes, 0, nullptr);
+            }
         }
 
         checkVK(vkMapMemory(dev, resource.staging_mem, 0, staging_size, 0,
                             reinterpret_cast<void **>(&resource.map)));
+        if (d->rebar_up && upload_total > 0) {
+            checkVK(vkMapMemory(dev, resource.up_dev_mem, 0, upload_total, 0,
+                                reinterpret_cast<void **>(&resource.up_map)));
+        }
 
         resource.queue = d->device->queues[i % num_queues].queue;
         resource.queue_lock = d->device->queues[i % num_queues].lock.get();

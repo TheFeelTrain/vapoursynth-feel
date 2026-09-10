@@ -190,11 +190,12 @@ if(VK_GLSLC)
     # with shuffles) + vcheck kernel (single WG serial row walk), per io
     # variant (16 int, 32 float). The row kernel needs subgroup ops + the
     # Vulkan memory model, so SPIR-V 1.3+ (vulkan1.3 target) is required.
+    set(EEDI3_PROBE "0" CACHE STRING "EEDI3 diagnostics-only shader ablation level")
     set(VK_EEDI3_ENTRIES row vcheck)
     set(VK_EEDI3_BITS "16" "32")
     foreach(bits IN LISTS VK_EEDI3_BITS)
         foreach(entry IN LISTS VK_EEDI3_ENTRIES)
-            set(defs -DBITS=${bits})
+            set(defs -DBITS=${bits} -DPROBE=${EEDI3_PROBE})
             if(entry STREQUAL row)
                 list(APPEND defs -DENTRY_ROW)
             else()
