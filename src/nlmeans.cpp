@@ -330,7 +330,7 @@ std::variant<VkPipeline, std::string> create_pipeline(
 
     VkPipeline pipeline;
     VkResult result = vkCreateComputePipelines(
-        d.device->device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline);
+        d.device->device, d.device->pipeline_cache, 1, &pipeline_info, nullptr, &pipeline);
     if (result != VK_SUCCESS) {
         return "vkCreateComputePipelines failed"s;
     }

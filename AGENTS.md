@@ -68,6 +68,26 @@ standard test input.
   changes: `python -m pytest tests/test_<filter>.py -q`
 - A rewrite is only acceptable if all tests still pass.
 
+### Running the suite fast
+
+The suite creates hundreds of filter nodes across many subprocesses, and on
+RADV shader *compilation* used to dominate it. The plugin's persistent
+pipeline cache (see "Persistent pipeline cache" under Building) removes that
+cost, with no change to results and no change to how you invoke pytest.
+
+Measured on the 443-test suite with the default `~/.cache/vsfeel` cache:
+
+| run | wall time |
+|---|---:|
+| first run (builds the cache) | ~3.5 min |
+| warm cache | ~2.5 min |
+| before the cache existed | ~7.5 min |
+
+The cache only skips compilation of *unchanged* shaders — editing a `.comp` or
+rebuilding the plugin invalidates the affected entries and they are recompiled
+on the next run. If a run is unexpectedly slow again, that is the first thing
+to check.
+
 ### Reference-comparison coverage and tolerance policy
 
 - **Sweep parameters against the reference** — every scalar parameter, every
@@ -553,6 +573,28 @@ cp build/libvsfeel.so /usr/lib/python3.14/site-packages/vapoursynth/plugins/vsfe
 
 Then re-run the tests / benchmark. The copy step is needed every time you
 rebuild, or you will benchmark a stale plugin.
+
+### Persistent pipeline cache (makes creation and the test suite fast)
+
+Compiling the compute shaders from SPIR-V dominates filter creation on RADV —
+about 4.4 s for the first DFTTest variant in a process, versus ~0.11 s once the
+driver has it. The plugin therefore keeps a `VkPipelineCache` seeded from and
+flushed to a file:
+
+- default location: `$XDG_CACHE_HOME/vsfeel/pipeline_cache_<pipelineCacheUUID>.bin`
+  (`~/.cache/vsfeel/...`), with an automatic fallback to `$TMPDIR/vsfeel/` when
+  the home cache is not writable (read-only home, sandbox, CI);
+- `VSFEEL_PIPELINE_CACHE=<path>` overrides the file, `VSFEEL_PIPELINE_CACHE=0`
+  disables the cache entirely (useful when checking that a shader change
+  actually recompiles);
+- the driver's `pipelineCacheUUID` is both the filename and part of the cache
+  contents, so a driver/device change misses instead of feeding the driver
+  incompatible data. The file is written via a unique temp file + rename, so
+  concurrent test subprocesses cannot corrupt it.
+
+Measured on the full suite: **~7.5 min cold → ~3.5 min for the run that builds
+the cache → ~2.5 min warm** (443 tests). The first run after a driver or
+`glslc` update pays the compile again by design.
 
 ## Use web searches
 

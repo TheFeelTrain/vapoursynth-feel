@@ -81,12 +81,26 @@ struct VK_Device {
     bool feat_compute_full_subgroups { false };
     bool feat_8bit_storage { false };
     bool feat_16bit_storage { false };
+    // Persistent pipeline cache: compiling the compute shaders from SPIR-V is
+    // by far the most expensive part of filter creation (seconds per variant
+    // on RADV), and every new filter instance would otherwise pay it again in
+    // every process. A VkPipelineCache seeded from and flushed to a file makes
+    // it a one-time cost per (device, driver) pair.
+    VkPipelineCache pipeline_cache {};
+    std::mutex pipeline_cache_lock;      // serializes cache data extraction
+    std::string pipeline_cache_path;     // empty = cache disabled
     std::vector<VK_Queue> queues {};
     std::atomic<intptr_t> refcount { 0 };
 };
 
 std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id);
 void release_device(const std::shared_ptr<VK_Device> & dev);
+
+// Flush the device's compiled-pipeline cache to its file (best effort, no-op
+// when the cache is disabled or nothing was compiled). Called when the last
+// instance releases the device and once at process exit, so subprocess-based
+// runs (vspipe, test comparisons) still contribute to the cache.
+void save_pipeline_cache(VK_Device & dev);
 
 // Streaming copy: non-temporal stores bypass the CPU cache so the freshly
 // written lines sit clean in DRAM; the GPU can then read them over PCIe

@@ -6,7 +6,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <iterator>
+#include <unistd.h>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -44,6 +46,184 @@ const char * vk_result_string(VkResult result) {
 
 static std::mutex g_device_lock;
 static std::map<int, std::shared_ptr<VK_Device>> g_devices;
+
+// ---------------------------------------------------------------------------
+// Persistent pipeline cache
+// ---------------------------------------------------------------------------
+//
+// Compiling the compute shaders from SPIR-V dominates filter creation on RADV
+// (seconds for a spec-constant variant, versus ~0.1 s once the driver has it
+// cached). Without an application-level cache every new filter instance pays
+// that again, in every process -- which is what makes the test suite take
+// minutes rather than seconds, since it creates hundreds of filter nodes
+// across many subprocesses.
+//
+// The cache lives at $VSFEEL_PIPELINE_CACHE, or
+// $XDG_CACHE_HOME/vsfeel/pipeline_cache_<pipelineCacheUUID>.bin (default
+// ~/.cache/vsfeel/...). The UUID is part of both the name and the file
+// contents, so a driver or device change simply misses instead of feeding the
+// driver incompatible data. Every operation here is best effort: a read-only
+// or missing cache directory costs a recompile, never a filter error.
+
+static std::string pipeline_cache_path_for(const VkPhysicalDeviceProperties & props) {
+    const char * override_env = std::getenv("VSFEEL_PIPELINE_CACHE");
+    if (override_env != nullptr) {
+        const std::string value { override_env };
+        if (value.empty() || value == "0") {
+            return {};   // explicitly disabled
+        }
+        return value;
+    }
+
+    std::string dir;
+    if (const char * xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg) {
+        dir = xdg;
+    } else if (const char * home = std::getenv("HOME"); home && *home) {
+        dir = std::string(home) + "/.cache";
+    }
+    if (!dir.empty()) {
+        dir += "/vsfeel";
+    }
+
+    // The home cache may be unwritable (read-only home, sandbox, CI). Fall
+    // back to the per-user temp directory so the cache still works there
+    // instead of silently recompiling everything.
+    const auto usable = [](const std::string & d) {
+        if (d.empty()) {
+            return false;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(d, ec);
+        if (ec && !std::filesystem::is_directory(d)) {
+            return false;
+        }
+        return ::access(d.c_str(), W_OK) == 0;
+    };
+    if (!usable(dir)) {
+        std::error_code ec;
+        const std::string tmp = (std::filesystem::temp_directory_path(ec) / "vsfeel").string();
+        if (ec || !usable(tmp)) {
+            return {};
+        }
+        dir = tmp;
+    }
+
+    char uuid[2 * VK_UUID_SIZE + 1] {};
+    for (uint32_t i = 0; i < VK_UUID_SIZE; ++i) {
+        std::snprintf(uuid + 2 * i, 3, "%02x", props.pipelineCacheUUID[i]);
+    }
+    return dir + "/pipeline_cache_" + uuid + ".bin";
+}
+
+static void load_pipeline_cache(VK_Device & dev) {
+    VkPhysicalDeviceProperties props {};
+    vkGetPhysicalDeviceProperties(dev.physical_device, &props);
+
+    dev.pipeline_cache_path = pipeline_cache_path_for(props);
+    if (dev.pipeline_cache_path.empty()) {
+        return;
+    }
+
+    std::vector<uint8_t> initial;
+    if (FILE * f = std::fopen(dev.pipeline_cache_path.c_str(), "rb")) {
+        if (std::fseek(f, 0, SEEK_END) == 0) {
+            const long size = std::ftell(f);
+            if (size > 0 && std::fseek(f, 0, SEEK_SET) == 0) {
+                initial.resize(static_cast<size_t>(size));
+                if (std::fread(initial.data(), 1, initial.size(), f) != initial.size()) {
+                    initial.clear();
+                }
+            }
+        }
+        std::fclose(f);
+    }
+
+    VkPipelineCacheCreateInfo cache_info {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .initialDataSize = initial.size(),
+        .pInitialData = initial.empty() ? nullptr : initial.data()
+    };
+
+    VkResult result = vkCreatePipelineCache(dev.device, &cache_info, nullptr, &dev.pipeline_cache);
+    if (result != VK_SUCCESS && !initial.empty()) {
+        // corrupt/stale/foreign cache data: start clean rather than failing
+        if (trace_on("VSFEEL_DBG")) {
+            fprintf(stderr, "[vsfeel] pipeline cache rejected (%s), starting empty\n",
+                vk_result_string(result));
+        }
+        cache_info.initialDataSize = 0;
+        cache_info.pInitialData = nullptr;
+        result = vkCreatePipelineCache(dev.device, &cache_info, nullptr, &dev.pipeline_cache);
+    }
+    if (result != VK_SUCCESS) {
+        dev.pipeline_cache = VK_NULL_HANDLE;
+        dev.pipeline_cache_path.clear();
+        return;
+    }
+    if (trace_on("VSFEEL_DBG")) {
+        fprintf(stderr, "[vsfeel] pipeline cache %s (%zu B loaded)\n",
+            dev.pipeline_cache_path.c_str(), initial.size());
+    }
+}
+
+void save_pipeline_cache(VK_Device & dev) {
+    if (dev.pipeline_cache == VK_NULL_HANDLE || dev.pipeline_cache_path.empty()) {
+        return;
+    }
+    std::lock_guard lock(dev.pipeline_cache_lock);
+
+    size_t size = 0;
+    if (vkGetPipelineCacheData(dev.device, dev.pipeline_cache, &size, nullptr) != VK_SUCCESS ||
+        size == 0) {
+        return;
+    }
+    std::vector<uint8_t> data(size);
+    if (vkGetPipelineCacheData(dev.device, dev.pipeline_cache, &size, data.data()) != VK_SUCCESS) {
+        return;
+    }
+    data.resize(size);
+
+    // create the directory chain (ignore "already exists"); a failure here
+    // just means the cache cannot be persisted
+    if (const size_t slash = dev.pipeline_cache_path.find_last_of('/');
+        slash != std::string::npos) {
+        std::error_code ec;
+        std::filesystem::create_directories(dev.pipeline_cache_path.substr(0, slash), ec);
+    }
+
+    // write to a uniquely named sibling and rename, so two processes flushing
+    // at once cannot interleave into one file and an interrupted flush cannot
+    // leave a truncated cache behind
+    const std::string tmp_path = dev.pipeline_cache_path + "." +
+        std::to_string(static_cast<unsigned long>(::getpid())) + ".tmp";
+    FILE * f = std::fopen(tmp_path.c_str(), "wb");
+    if (f == nullptr) {
+        return;
+    }
+    const bool written = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+    std::fclose(f);
+    if (!written) {
+        std::remove(tmp_path.c_str());
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, dev.pipeline_cache_path, ec);
+    if (ec) {
+        std::remove(tmp_path.c_str());
+    }
+}
+
+// Flush every live device's cache at process exit, so subprocess-based runs
+// (vspipe, test comparisons) that never tear their core down cleanly still
+// contribute to the cache.
+static void save_all_pipeline_caches() {
+    std::lock_guard lock(g_device_lock);
+    for (auto & [id, dev] : g_devices) {
+        save_pipeline_cache(*dev);
+    }
+}
 
 std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) {
     std::lock_guard lock(g_device_lock);
@@ -353,6 +533,16 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
         vkGetDeviceQueue(dev->device, best_family, i, &queue);
         dev->queues.push_back(VK_Queue { queue, std::make_unique<std::mutex>() });
     }
+
+    // seed the persistent pipeline cache so filter creation does not recompile
+    // the shaders in every process
+    load_pipeline_cache(*dev);
+    static const bool atexit_registered = [] {
+        std::atexit(save_all_pipeline_caches);
+        return true;
+    }();
+    (void)atexit_registered;
+
     ++dev->refcount;
     g_devices.emplace(device_id, dev);
 
@@ -362,7 +552,14 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
 void release_device(const std::shared_ptr<VK_Device> & dev) {
     std::lock_guard lock(g_device_lock);
     if (--dev->refcount == 0) {
+        // persist everything compiled since the last flush before the device
+        // and its cache go away
+        save_pipeline_cache(*dev);
         vkDeviceWaitIdle(dev->device);
+        if (dev->pipeline_cache != VK_NULL_HANDLE) {
+            vkDestroyPipelineCache(dev->device, dev->pipeline_cache, nullptr);
+            dev->pipeline_cache = VK_NULL_HANDLE;
+        }
         vkDestroyDevice(dev->device, nullptr);
         vkDestroyInstance(dev->instance, nullptr);
         for (auto it = g_devices.begin(); it != g_devices.end(); ++it) {
