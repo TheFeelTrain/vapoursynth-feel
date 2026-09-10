@@ -13,7 +13,7 @@ Measured on an RX 7900 XTX at benchmark defaults (`benchmark/bench.py`).
 | Bilateral | 1997       | 1505        | 1.33x       | 1271        | 754          | 1.69x        |
 | BM3Dv2    | —         | —          | —          | 169         | 41           | 4.07x        |
 | DFTTest   | 1289       | 887         | 1.45x       | 1073        | 633          | 1.70x        |
-| EEDI3     | 382        | 191         | 2.01x       | 175         | 186          | 0.94x        |
+| EEDI3     | 613        | 211         | 2.90x       | 255         | 202          | 1.26x        |
 | GaussBlur | 2474       | 1473        | 1.68x       | 1271        | 696          | 1.82x        |
 | NLMeans   | 992        | 753         | 1.32x       | 867         | 666          | 1.30x        |
 

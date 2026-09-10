@@ -80,6 +80,9 @@ from vssource import BestSource
 from vstools import core, depth, get_y
 import vapoursynth as vs
 
+# Big enough that the timed region never re-runs the decode/mask chain (a
+# small value here collapses every plugin: measured 61 fps vs 220 for vsfeel
+# and 39 vs 200 for vszipcl at 8 GB).
 core.max_cache_size = 1024 * 48
 
 clip = {clip_expr}
@@ -148,6 +151,9 @@ from vsrgtools import box_blur
 from vstools import scale_mask
 import vapoursynth as vs
 
+# Big enough that the timed region never re-runs the decode/mask chain (a
+# small value here collapses every plugin: measured 61 fps vs 220 for vsfeel
+# and 39 vs 200 for vszipcl at 8 GB).
 core.max_cache_size = 1024 * 48
 
 src = BestSource(cachepath=None).source({clip!r}, 32)
@@ -608,9 +614,13 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
             # AA benchmark on real content: cache holds the 2x Point-upscaled
             # luma + the 2x edge mask (both ~16.6 MB/frame at 1080p->2160p
             # GRAY16), so the timed region measures only the EEDI3 call.
-            # fp32 frames are twice the bytes, so halve the cap to pin ~the
-            # same bytes in RAM (a 500-frame fp32 cache thrashes swap).
-            aa_cap = 500 if (ns.bits or AA_MASK_BITS) == 16 else 250
+            # fp32 frames are twice the bytes, so cut the cap further to pin
+            # ~the same bytes in RAM. The Python cache and VapourSynth's own
+            # (48 GB) frame cache are ADDITIVE: at 2x 2160p fp32 a 250-frame
+            # Python cache plus VS's cache ran past the 62 GB box and thrashed,
+            # which showed up as one binary swinging 143..221 fps while the
+            # GPU-bound reference stayed flat. 120 frames (~6 GB) is stable.
+            aa_cap = 500 if (ns.bits or AA_MASK_BITS) == 16 else 120
             fps = bench_aa(plugin, calls[plugin], ns.clip, frames,
                            min(cache_frames or 400, aa_cap),
                            getattr(ns, "eedi3_field", 3),

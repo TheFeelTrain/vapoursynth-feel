@@ -131,6 +131,43 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
 
     vkGetPhysicalDeviceMemoryProperties(dev->physical_device, &dev->mem_props);
 
+    // Host-pointer import (VK_EXT_external_memory_host): lets a kernel write
+    // straight into a VapourSynth frame's plane memory, removing a host
+    // staging round trip. Optional; query the alignment requirement and the
+    // extension's presence before anyone relies on it.
+    dev->host_import = false;
+    {
+        uint32_t ext_count = 0;
+        vkEnumerateDeviceExtensionProperties(dev->physical_device, nullptr, &ext_count, nullptr);
+        std::vector<VkExtensionProperties> exts(ext_count);
+        vkEnumerateDeviceExtensionProperties(dev->physical_device, nullptr, &ext_count, exts.data());
+        bool present = false;
+        for (const auto & e : exts) {
+            if (std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) == 0) {
+                present = true;
+                break;
+            }
+        }
+        if (present) {
+            VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_props {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
+                .pNext = nullptr
+            };
+            VkPhysicalDeviceProperties2 p2 {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                .pNext = &host_props
+            };
+            vkGetPhysicalDeviceProperties2(dev->physical_device, &p2);
+            dev->host_pointer_alignment = host_props.minImportedHostPointerAlignment;
+            dev->host_import = true;
+        }
+        if (trace_on("VSFEEL_DBG")) {
+            fprintf(stderr, "[vsfeel] host_import=%d min_align=%llu\n",
+                dev->host_import,
+                (unsigned long long)dev->host_pointer_alignment);
+        }
+    }
+
     // Pick a compute-capable queue family, prefer the one with the most queues
     uint32_t family_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(
@@ -208,9 +245,13 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
         .timelineSemaphore = VK_TRUE
     };
 
-    const char * device_exts[] = {
-        VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME
+    const char * device_exts[2] = {
+        VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME, nullptr
     };
+    uint32_t device_ext_count = 1;
+    if (dev->host_import) {
+        device_exts[device_ext_count++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+    }
 
     VkDeviceCreateInfo device_info {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -220,7 +261,7 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
         .pQueueCreateInfos = &queue_info,
         .enabledLayerCount = 0,
         .ppEnabledLayerNames = nullptr,
-        .enabledExtensionCount = 1,
+        .enabledExtensionCount = device_ext_count,
         .ppEnabledExtensionNames = device_exts,
         .pEnabledFeatures = &features
     };

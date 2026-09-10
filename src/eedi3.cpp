@@ -216,10 +216,21 @@ struct Eedi3Data {
     int copy_mode { 3 };
     // Diagnostics-only host-path ablations (env-gated; all default off).
     bool skip_blit {}, skip_sclip {}, skip_raw {}, skip_h2d {}, skip_vcheck {};
+    bool raw_stage {};   // diagnostics: raw gather -> cached staging (plain stores)
+    bool blit_contig {}; // diagnostics: one contiguous copy instead of per-row
+    // Gray16 mclip handled natively (no SetFrameProps+resize.Point->Gray8 node).
+    bool mclip_native16 {};
+    bool skip_pad {};    // diagnostics: skip the pad-builder dispatch
     // ReBAR direct upload: the CPU NT-stores the upload straight into
     // host-visible VRAM (nnedi3's proven path) instead of writing system-RAM
     // staging and DMA'ing it. VSFEEL_EEDI3_NOREBAR=1 forces the old path.
     bool rebar_up { true };  // VSFEEL_EEDI3_NOREBAR=1 forces the H2D path
+    // Download structure. false (default): the vcheck/vcopy kernels write the
+    // vout rows straight into the host staging (no D2H copy, but every GPU
+    // store targets system RAM and must snoop the CPU caches). true: vout goes
+    // to a device-local region and one vkCmdCopyBuffer (SDMA) brings it back.
+    // VSFEEL_EEDI3_VOUTDEV=1 selects the DMA form.
+    bool vout_dev {};
     float alpha { 0.2f }, beta { 0.25f }, gamma { 20.0f };
     float vthresh2 { 4.0f };
     float rw {}, rcp_vth0 {}, rcp_vth1 {}, rcp_vth2 {};
@@ -353,19 +364,34 @@ struct Eedi3Data {
 // made the scalar version ~6 ms/frame at 3840x1080 (microbenchmark) — i.e. the
 // single largest CPU cost in the whole filter.
 //
+// Native 16-bit mask variant: the host used to force the mask through a
+// SetFrameProps(_Range=1) + resize.Point -> Gray8 node and then pack "byte != 0".
+// That conversion is a whole extra full-frame pass in the graph (16.6 MB read +
+// 8.3 MB write at the bench geometry) and it is NOT needed to recover the same
+// boolean: zimg's full-range 16->8 bit reduction is monotonic and
+// round(v * 255 / 65535), so "converted != 0" is exactly "v >= 129" — verified
+// exhaustively over all 65536 u16 values (tmp/thresh_full.py, 0 mismatches).
+// Reading the u16 mask directly skips the conversion node entirely and halves
+// the mask read; only the needed (kept-parity) rows are touched.
+//
 // scratch must hold 2 * ((width + mdis + 63) / 64) uint64 words.
-static void build_bmask_row_scalar(const uint8_t * maskp, uint32_t * out,
-                                   const int width, const int mdis) {
+static void build_bmask_row_scalar(const uint8_t * maskp, const uint16_t * mask16,
+                                   uint32_t * out, const int width, const int mdis) {
+    // Native u16 masks use the exact bit-depth-reduction threshold (see
+    // build_bmask_row): nonzero-after-conversion == (v >= 129).
+    auto nz = [&](int x) {
+        return mask16 ? (mask16[x] >= 129u) : (maskp[x] != 0);
+    };
     const int minmdis = std::min(width, mdis);
     int last = -666999;
 
     for (int x = 0; x < minmdis; ++x) {
-        if (maskp[x] != 0) {
+        if (nz(x)) {
             last = x + mdis;
         }
     }
     for (int x = 0; x < width - minmdis; ++x) {
-        if (maskp[x + mdis] != 0) {
+        if (nz(x + mdis)) {
             last = x + mdis * 2;
         }
         if (x <= last) {
@@ -379,7 +405,27 @@ static void build_bmask_row_scalar(const uint8_t * maskp, uint32_t * out,
     }
 }
 
-static void build_bmask_row(const uint8_t * maskp, uint32_t * out,
+// 16 u16 lanes -> 16 packed bits (bit k = mask[x+k] >= 129). Biasing by 0x8000
+// turns the unsigned compare into a signed one. cmpgt is STRICT, so the
+// constant must be 128-32768: biased > -32640 <=> v-32768 > 128-32768 <=> v > 128
+// <=> v >= 129. (Writing 129-32768 would silently test v >= 130 — a bug that
+// only shows up on masks whose values straddle the threshold.) The movemask
+// then has two identical bits per lane; the compress folds the even ones to 16.
+static inline uint32_t bmask_bits16(const __m256i v) {
+    const __m256i biased = _mm256_xor_si256(
+        v, _mm256_set1_epi16(static_cast<short>(0x8000)));
+    const __m256i cmp = _mm256_cmpgt_epi16(
+        biased, _mm256_set1_epi16(static_cast<short>(128 - 32768)));
+    uint32_t m = static_cast<uint32_t>(_mm256_movemask_epi8(cmp)) & 0x55555555u;
+    m = (m | (m >> 1)) & 0x33333333u;
+    m = (m | (m >> 2)) & 0x0F0F0F0Fu;
+    m = (m | (m >> 4)) & 0x00FF00FFu;
+    m = (m | (m >> 8)) & 0x0000FFFFu;
+    return m;
+}
+
+static void build_bmask_row(const uint8_t * maskp, const uint16_t * mask16,
+                            uint32_t * out,
                             const int width, const int mdis,
                             uint64_t * scratch) {
     // The shift/dilate form below equals the scalar scan only when the scan's
@@ -389,7 +435,7 @@ static void build_bmask_row(const uint8_t * maskp, uint32_t * out,
     if (mdis >= 64 || width < 2 * mdis) {
         const int nwords = (width + 31) / 32;
         std::memset(out, 0, static_cast<size_t>(nwords) * sizeof(uint32_t));
-        build_bmask_row_scalar(maskp, out, width, mdis);
+        build_bmask_row_scalar(maskp, mask16, out, width, mdis);
         return;
     }
 
@@ -401,31 +447,54 @@ static void build_bmask_row(const uint8_t * maskp, uint32_t * out,
     const int nw_b = (width + 63) / 64;                  // packed mask words
     const int nw = (width + mdis + 63) / 64;             // accumulator words
 
-    // 1. pack: bit x = (maskp[x] != 0); words past nw_b stay zero
+    // 1. pack: bit x = mask non-zero; words past nw_b stay zero
     std::memset(scratch, 0, static_cast<size_t>(nw) * sizeof(uint64_t));
     const __m256i zero = _mm256_setzero_si256();
-    for (int i = 0; i < nw_b; ++i) {
-        const int x = i * 64;
-        uint64_t w = 0;
-        for (int h = 0; h < 2; ++h) {
-            const int xb = x + h * 32;
-            uint32_t m = 0;
-            if (xb + 32 <= width) {
-                const __m256i v = _mm256_loadu_si256(
-                    reinterpret_cast<const __m256i *>(maskp + xb));
-                m = ~static_cast<uint32_t>(_mm256_movemask_epi8(
-                    _mm256_cmpeq_epi8(v, zero)));
-            } else if (xb < width) {
-                uint8_t tmp[32] = {};
-                std::memcpy(tmp, maskp + xb, static_cast<size_t>(width - xb));
-                const __m256i v = _mm256_loadu_si256(
-                    reinterpret_cast<const __m256i *>(tmp));
-                m = ~static_cast<uint32_t>(_mm256_movemask_epi8(
-                    _mm256_cmpeq_epi8(v, zero)));
+    if (mask16) {
+        for (int i = 0; i < nw_b; ++i) {
+            const int x = i * 64;
+            uint64_t w = 0;
+            for (int q = 0; q < 4; ++q) {
+                const int xb = x + q * 16;
+                uint32_t m = 0;
+                if (xb + 16 <= width) {
+                    m = bmask_bits16(_mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(mask16 + xb)));
+                } else if (xb < width) {
+                    uint16_t tmp[16] = {};
+                    std::memcpy(tmp, mask16 + xb,
+                                static_cast<size_t>(width - xb) * sizeof(uint16_t));
+                    m = bmask_bits16(_mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(tmp)));
+                }
+                w |= static_cast<uint64_t>(m) << (q * 16);
             }
-            w |= static_cast<uint64_t>(m) << (h * 32);
+            scratch[i] = w;
         }
-        scratch[i] = w;
+    } else {
+        for (int i = 0; i < nw_b; ++i) {
+            const int x = i * 64;
+            uint64_t w = 0;
+            for (int h = 0; h < 2; ++h) {
+                const int xb = x + h * 32;
+                uint32_t m = 0;
+                if (xb + 32 <= width) {
+                    const __m256i v = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(maskp + xb));
+                    m = ~static_cast<uint32_t>(_mm256_movemask_epi8(
+                        _mm256_cmpeq_epi8(v, zero)));
+                } else if (xb < width) {
+                    uint8_t tmp[32] = {};
+                    std::memcpy(tmp, maskp + xb, static_cast<size_t>(width - xb));
+                    const __m256i v = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(tmp));
+                    m = ~static_cast<uint32_t>(_mm256_movemask_epi8(
+                        _mm256_cmpeq_epi8(v, zero)));
+                }
+                w |= static_cast<uint64_t>(m) << (h * 32);
+            }
+            scratch[i] = w;
+        }
     }
 
     // 2. B[x] = b[x - mdis]: shift the bit array toward higher x by mdis
@@ -659,7 +728,7 @@ static std::optional<std::string> record_command_buffer(
     (void)field;
     const int32_t pad_elem = pad_elem_bytes(d.bits);
     for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
-        if (!d.process[plane]) {
+        if (!d.process[plane] || d.skip_pad) {
             continue;
         }
         const auto & cfg = d.planes[plane];
@@ -720,10 +789,12 @@ static std::optional<std::string> record_command_buffer(
             .bmask_base = static_cast<int32_t>(cfg.bits_offset / sizeof(uint32_t)),
             .sclip_base = static_cast<int32_t>(cfg.sclip_offset / elem),
             .cint_base = static_cast<int32_t>(cfg.cint_offset / elem),
-            // vout lands DIRECTLY in the staging download region (b7 views
-            // staging): no D2H copy when vcheck > 0, so the base indexes
-            // staging, past the upload.
-            .vout_base = static_cast<int32_t>((d.upload_total + cfg.dl_offset) / elem),
+            // vout either lands DIRECTLY in the staging download region (b7
+            // views staging: no D2H copy, but GPU stores go to system RAM) or
+            // in a device-local region that one SDMA copy brings back.
+            .vout_base = static_cast<int32_t>(d.vout_dev
+                ? (cfg.vout_offset / elem)
+                : ((d.upload_total + cfg.dl_offset) / elem)),
             .pad_stride = cfg.pad_stride,
             .pad_height = cfg.pad_height,
             .field = field,
@@ -798,10 +869,11 @@ static std::optional<std::string> record_command_buffer(
         }
     }
 
-    // download: with vcheck the interp rows were written DIRECTLY to the
-    // staging download region (vout views staging — no copy, no barrier).
-    // Without vcheck the row kernel's dst (dev_buf) still needs the D2H copy.
-    if (d.vcheck == 0 && d.download_total > 0) {
+    // download: vcheck writes vout either into staging directly (no copy) or
+    // into dev_buf (one SDMA copy back); without vcheck the row kernel's dst
+    // (dev_buf) always needs the copy.
+    const bool need_d2h = (d.vcheck > 0) ? d.vout_dev : (d.download_total > 0);
+    if (need_d2h) {
         VkMemoryBarrier mem_barrier {
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
@@ -817,7 +889,7 @@ static std::optional<std::string> record_command_buffer(
             }
             const auto & cfg = d.planes[plane];
             const VkBufferCopy region {
-                .srcOffset = cfg.dst_offset,
+                .srcOffset = (d.vcheck > 0) ? cfg.vout_offset : cfg.dst_offset,
                 .dstOffset = d.upload_total + cfg.dl_offset,
                 .size = cfg.dl_bytes
             };
@@ -949,7 +1021,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         const auto srcp = vsapi->getReadPtr(src, plane);
         const ptrdiff_t src_stride = vsapi->getStride(src, plane);
         const size_t raw_row_bytes = static_cast<size_t>(cfg.width) * pad_elem_bytes(d->bits);
-        uint8_t * rawp = upload + cfg.raw_offset;
+        uint8_t * rawp = (d->raw_stage ? staging : upload) + cfg.raw_offset;
         // The tight kept-row gather and the destination's kept-row copy read
         // exactly the same source rows in the same order (raw row k -> kept
         // row k -> dst row `off + 2k`), so both are written here while the
@@ -958,7 +1030,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         // measured worth ~5-7% when the host copies are the limiter.
         auto dstp = vsapi->getWritePtr(dst, plane);
         const ptrdiff_t dst_stride = vsapi->getStride(dst, plane);
-        const bool nt_raw = (d->copy_mode & 1) != 0;
+        const bool nt_raw = (d->copy_mode & 1) != 0 && !d->raw_stage;
         const bool nt_kept = (d->copy_mode & 2) != 0;
         if (d->skip_raw) {
             // diagnostics-only
@@ -991,6 +1063,8 @@ static const VSFrame *VS_CC Eedi3GetFrame(
             // builder ORs bits in.
             const uint8_t * maskp = vsapi->getReadPtr(mcp, 0);
             const ptrdiff_t mask_stride = vsapi->getStride(mcp, 0);
+            const uint16_t * mask16 = d->mclip_native16
+                ? reinterpret_cast<const uint16_t *>(maskp) : nullptr;
             uint8_t * bm = upload + cfg.bits_offset;
             const size_t bm_row_bytes =
                 static_cast<size_t>((cfg.width + 31) / 32) * sizeof(uint32_t);
@@ -999,7 +1073,10 @@ static const VSFrame *VS_CC Eedi3GetFrame(
             for (int r = 0; r < cfg.rows; ++r) {
                 const int mrow = d->dh ? r : field + 2 * r;
                 uint8_t * bmr = bm + static_cast<int64_t>(r) * bm_row_bytes;
-                build_bmask_row(maskp + mask_stride * mrow,
+                const uint8_t * const mrow_p = maskp + mask_stride * mrow;
+                build_bmask_row(mrow_p,
+                                mask16 ? reinterpret_cast<const uint16_t *>(mrow_p)
+                                       : nullptr,
                                 reinterpret_cast<uint32_t *>(bmr),
                                 cfg.width, d->mdis, bmask_scratch.data());
             }
@@ -1095,6 +1172,9 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         // isolated microbenchmark prefers it — do not "fix" this back.
         if (d->skip_blit) {
             // diagnostics-only
+        } else if (d->blit_contig) {
+            // diagnostics-only: measures the ceiling of a fully contiguous copy
+            std::memcpy(dstp, dl, static_cast<size_t>(cfg.rows) * row_bytes);
         } else if ((row_bytes & 31) == 0 && (d->copy_mode & 2)) {
             // bit2 picks the load flavor: NT load (copy_stream_read, right for
             // WC memory) or an ordinary cached load (copy_stream_out, right
@@ -1307,7 +1387,13 @@ static void VS_CC Eedi3Create(
             return set_error("mclip's number of frames doesn't match");
         }
 
-        if (mvi->format.bitsPerSample != 8 || mvi->format.sampleType != stInteger) {
+        // Gray16 integer masks are handled natively: the exact boolean the
+        // Gray8 conversion would produce is (v >= 129), verified exhaustively,
+        // so the extra full-frame graph node is pure overhead. Everything else
+        // (float, 10/12/14-bit, ...) keeps the reference conversion.
+        if (mvi->format.bitsPerSample == 16 && mvi->format.sampleType == stInteger) {
+            d->mclip_native16 = true;
+        } else if (mvi->format.bitsPerSample != 8 || mvi->format.sampleType != stInteger) {
             VSMap * args = vsapi->createMap();
             vsapi->mapConsumeNode(args, "clip", d->mclip_node, maReplace);
             d->mclip_node = nullptr;  // ownership moved into args
@@ -1399,6 +1485,12 @@ static void VS_CC Eedi3Create(
     if (const char * rb = std::getenv("VSFEEL_EEDI3_NOREBAR")) {
         d->rebar_up = (atoi(rb) == 0);
     }
+    if (const char * vd = std::getenv("VSFEEL_EEDI3_VOUTDEV")) {
+        d->vout_dev = (atoi(vd) != 0);
+    }
+    d->raw_stage = std::getenv("VSFEEL_EEDI3_RAWSTAGE") != nullptr;
+    d->blit_contig = std::getenv("VSFEEL_EEDI3_BLITCONTIG") != nullptr;
+    d->skip_pad = std::getenv("VSFEEL_EEDI3_NOPAD") != nullptr;
     d->skip_blit = std::getenv("VSFEEL_EEDI3_NOBLIT") != nullptr;
     d->skip_sclip = std::getenv("VSFEEL_EEDI3_NOSCLIP") != nullptr;
     d->skip_raw = std::getenv("VSFEEL_EEDI3_NORAW") != nullptr;
@@ -2005,7 +2097,8 @@ static void VS_CC Eedi3Create(
                 .buffer = resource.dev_buf, .offset = 0, .range = VK_WHOLE_SIZE
             };
             VkDescriptorBufferInfo vout_info {
-                .buffer = resource.staging, .offset = 0, .range = VK_WHOLE_SIZE
+                .buffer = d->vout_dev ? resource.dev_buf : resource.staging,
+                .offset = 0, .range = VK_WHOLE_SIZE
             };
             // The PAD kernel reads the raw upload at binding 0 while the row
             // kernel reads the BUILT pad at binding 0 -- different buffers on

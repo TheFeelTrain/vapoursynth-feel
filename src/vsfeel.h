@@ -63,6 +63,10 @@ struct VK_Device {
     VkPhysicalDeviceLimits limits {};
     uint32_t queue_family {};
     uint32_t queue_count {};
+    // VK_EXT_external_memory_host: whether a host pointer can be imported as a
+    // Vulkan buffer, and the alignment it must satisfy.
+    bool host_import {};
+    VkDeviceSize host_pointer_alignment {};
     uint32_t min_subgroup_size { 64 };
     uint32_t max_subgroup_size { 64 };
     bool subgroup_size_control { false };
