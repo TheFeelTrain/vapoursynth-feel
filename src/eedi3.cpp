@@ -194,23 +194,44 @@ static inline __m256i deint_even_f32(const __m256i a, const __m256i b) {
     return _mm256_permute4x64_epi64(s, 0xD8);
 }
 
-// One deinterleaved row: d[k] = s[2*k], k in [0,rows). `nt` streams the stores
-// (required for the uncached host-visible VRAM the ReBAR upload targets; the
-// 32-byte-aligned body is what makes that worth doing).
+// The odd u16/f32 lanes of two 256-bit vectors (the complementary parity: the
+// fused pair gather below needs both halves of one 64-byte row chunk).
+static inline __m256i deint_odd_u16(const __m256i a, const __m256i b) {
+    const __m256i m = _mm256_setr_epi8(
+        2, 3, 6, 7, 10, 11, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1,
+        2, 3, 6, 7, 10, 11, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m256i sa = _mm256_permute4x64_epi64(_mm256_shuffle_epi8(a, m), 0x08);
+    const __m256i sb = _mm256_permute4x64_epi64(_mm256_shuffle_epi8(b, m), 0x08);
+    return _mm256_set_m128i(_mm256_castsi256_si128(sb), _mm256_castsi256_si128(sa));
+}
+
+static inline __m256i deint_odd_f32(const __m256i a, const __m256i b) {
+    const __m256i s = _mm256_castps_si256(_mm256_shuffle_ps(
+        _mm256_castsi256_ps(a), _mm256_castsi256_ps(b), 0xDD));
+    return _mm256_permute4x64_epi64(s, 0xD8);
+}
+
+// One deinterleaved row: d[k] = s[2*k + parity], k in [0,rows), with `s`
+// pointing at the ROW START. Selecting the parity with the deinterleave (rather
+// than offsetting the pointer) keeps every 32-byte load 32-byte aligned — a
+// 2-byte offset makes each load straddle two cache lines. `nt` streams the
+// stores (required for the uncached host-visible VRAM the ReBAR upload targets;
+// the 32-byte-aligned body is what makes that worth doing).
 static inline void deint_row_u16(const uint16_t * s, uint16_t * d, int rows,
-                                 int simd_lim, bool nt) {
+                                 int simd_lim, bool nt, const bool odd) {
     int k = 0;
     if (nt) {
         const int head = std::min<int>(
             rows, static_cast<int>(((32 - (reinterpret_cast<uintptr_t>(d) & 31)) & 31) / 2));
         for (; k < head; ++k) {
-            d[k] = s[2 * k];
+            d[k] = s[2 * k + (odd ? 1 : 0)];
         }
     }
     for (; k + 16 <= simd_lim; k += 16) {
-        const __m256i v = deint_even_u16(
-            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + 2 * k)),
-            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + 2 * k + 16)));
+        const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + 2 * k));
+        const __m256i vb = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i *>(s + 2 * k + 16));
+        const __m256i v = odd ? deint_odd_u16(va, vb) : deint_even_u16(va, vb);
         if (nt && (k & 15) == 0) {
             _mm256_stream_si256(reinterpret_cast<__m256i *>(d + k), v);
         } else {
@@ -218,24 +239,24 @@ static inline void deint_row_u16(const uint16_t * s, uint16_t * d, int rows,
         }
     }
     for (; k < rows; ++k) {
-        d[k] = s[2 * k];
+        d[k] = s[2 * k + (odd ? 1 : 0)];
     }
 }
 
 static inline void deint_row_f32(const float * s, float * d, int rows,
-                                 int simd_lim, bool nt) {
+                                 int simd_lim, bool nt, const bool odd) {
     int k = 0;
     if (nt) {
         const int head = std::min<int>(
             rows, static_cast<int>(((32 - (reinterpret_cast<uintptr_t>(d) & 31)) & 31) / 4));
         for (; k < head; ++k) {
-            d[k] = s[2 * k];
+            d[k] = s[2 * k + (odd ? 1 : 0)];
         }
     }
     for (; k + 8 <= simd_lim; k += 8) {
-        const __m256i v = deint_even_f32(
-            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + 2 * k)),
-            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + 2 * k + 8)));
+        const __m256i va = _mm256_castps_si256(_mm256_loadu_ps(s + 2 * k));
+        const __m256i vb = _mm256_castps_si256(_mm256_loadu_ps(s + 2 * k + 8));
+        const __m256i v = odd ? deint_odd_f32(va, vb) : deint_even_f32(va, vb);
         if (nt && (k & 7) == 0) {
             _mm256_stream_ps(d + k, _mm256_castsi256_ps(v));
         } else {
@@ -243,7 +264,7 @@ static inline void deint_row_f32(const float * s, float * d, int rows,
         }
     }
     for (; k < rows; ++k) {
-        d[k] = s[2 * k];
+        d[k] = s[2 * k + (odd ? 1 : 0)];
     }
 }
 
@@ -255,9 +276,6 @@ static void gather_columns(const uint8_t * src, ptrdiff_t src_stride,
                            const int step, const int first, const int elem,
                            const bool nt) {
     const size_t dst_row = static_cast<size_t>(rows) * elem;
-    // Selecting every other column makes the vector loads read one element past
-    // the last selected pair, so an odd `first` has to stop one block earlier.
-    const int simd_lim = rows - (first ? 1 : 0);
     if (step == 1) {
         for (int y = 0; y < H; ++y) {
             frame_copy_out(dst + static_cast<size_t>(y) * dst_row,
@@ -267,18 +285,111 @@ static void gather_columns(const uint8_t * src, ptrdiff_t src_stride,
     } else if (elem == 2) {
         for (int y = 0; y < H; ++y) {
             const uint16_t * s = reinterpret_cast<const uint16_t *>(
-                src + static_cast<size_t>(y) * src_stride) + first;
+                src + static_cast<size_t>(y) * src_stride);
             deint_row_u16(s, reinterpret_cast<uint16_t *>(dst + static_cast<size_t>(y) * dst_row),
-                          rows, simd_lim, nt);
+                          rows, rows, nt, first != 0);
         }
     } else {
         for (int y = 0; y < H; ++y) {
             const float * s = reinterpret_cast<const float *>(
-                src + static_cast<size_t>(y) * src_stride) + first;
+                src + static_cast<size_t>(y) * src_stride);
             deint_row_f32(s, reinterpret_cast<float *>(dst + static_cast<size_t>(y) * dst_row),
-                          rows, simd_lim, nt);
+                          rows, rows, nt, first != 0);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fused kept/interp column gather (EEDI3H, when the sclip frame IS the clip
+// frame -- based_aa and the benchmark both pass Interleave([clip, clip]), so
+// vsapi hands out the identical plane pointer).
+//
+// The separate gathers read every source row twice: once for the kept columns
+// (parity `off`) and once for the interp columns (parity `field`). Both
+// parities live in the same 64-byte row chunk, so one pass can produce both,
+// halving the source read (measured +8% end-to-end at ns=8).
+//
+// Deinterleave from element 0 (even lanes = parity 0, odd = parity 1) so the
+// loads are aligned, and require the destination rows to be 32-byte aligned
+// and a multiple of the vector width, which makes every NT store aligned (the
+// call site checks this and falls back to the two-pass path otherwise).
+// ---------------------------------------------------------------------------
+
+static void gather_pair_row_u16(const uint16_t * s, uint16_t * da, uint16_t * db,
+                                const int rows, const bool a_even, const bool nt) {
+    for (int k = 0; k < rows; k += 16) {
+        const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + 2 * k));
+        const __m256i b = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i *>(s + 2 * k + 16));
+        const __m256i ve = deint_even_u16(a, b);
+        const __m256i vo = deint_odd_u16(a, b);
+        if (nt) {
+            _mm256_stream_si256(reinterpret_cast<__m256i *>(da + k), a_even ? ve : vo);
+            _mm256_stream_si256(reinterpret_cast<__m256i *>(db + k), a_even ? vo : ve);
+        } else {
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(da + k), a_even ? ve : vo);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(db + k), a_even ? vo : ve);
+        }
+    }
+}
+
+static void gather_pair_row_f32(const float * s, float * da, float * db,
+                                const int rows, const bool a_even, const bool nt) {
+    for (int k = 0; k < rows; k += 8) {
+        const __m256i a = _mm256_castps_si256(
+            _mm256_loadu_ps(s + 2 * k));
+        const __m256i b = _mm256_castps_si256(
+            _mm256_loadu_ps(s + 2 * k + 8));
+        const __m256i ve = deint_even_f32(a, b);
+        const __m256i vo = deint_odd_f32(a, b);
+        if (nt) {
+            _mm256_stream_ps(da + k, _mm256_castsi256_ps(a_even ? ve : vo));
+            _mm256_stream_ps(db + k, _mm256_castsi256_ps(a_even ? vo : ve));
+        } else {
+            _mm256_storeu_ps(da + k, _mm256_castsi256_ps(a_even ? ve : vo));
+            _mm256_storeu_ps(db + k, _mm256_castsi256_ps(a_even ? vo : ve));
+        }
+    }
+}
+
+// dst_kept[y*rows + k] = src[y][first + 2k], dst_interp[y*rows + k] =
+// src[y][1-first + 2k] (both compacted). Returns false when the geometry does
+// not allow the aligned fast path (caller falls back to two gather_columns).
+static bool gather_columns_pair(const uint8_t * src, ptrdiff_t src_stride,
+                                const int H, uint8_t * dst_kept, uint8_t * dst_interp,
+                                const int rows, const int first, const int elem,
+                                const bool nt) {
+    const size_t dst_row = static_cast<size_t>(rows) * elem;
+    const int vec = (elem == 2) ? 16 : 8;
+    if (rows % vec != 0 || (dst_row & 31) != 0 ||
+        (reinterpret_cast<uintptr_t>(dst_kept) & 31) != 0 ||
+        (reinterpret_cast<uintptr_t>(dst_interp) & 31) != 0) {
+        return false;
+    }
+    const bool a_even = (first == 0);
+    for (int y = 0; y < H; ++y) {
+        const uint8_t * const row = src + static_cast<size_t>(y) * src_stride;
+        uint8_t * const da = dst_kept + static_cast<size_t>(y) * dst_row;
+        uint8_t * const db = dst_interp + static_cast<size_t>(y) * dst_row;
+        if (elem == 2) {
+            gather_pair_row_u16(reinterpret_cast<const uint16_t *>(row),
+                                reinterpret_cast<uint16_t *>(da),
+                                reinterpret_cast<uint16_t *>(db), rows, a_even, nt);
+        } else {
+            gather_pair_row_f32(reinterpret_cast<const float *>(row),
+                                reinterpret_cast<float *>(da),
+                                reinterpret_cast<float *>(db), rows, a_even, nt);
+        }
+    }
+    return true;
+}
+
+
+// The even bytes of two 16-byte vectors, packed into one.
+static inline __m128i deint_even_u8(const __m128i a, const __m128i b) {
+    const __m128i m = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14,
+                                    -1, -1, -1, -1, -1, -1, -1, -1);
+    return _mm_unpacklo_epi64(_mm_shuffle_epi8(a, m), _mm_shuffle_epi8(b, m));
 }
 
 // Nonzero-byte predicate (0xFF/0x00), used for the reference's native Gray8
@@ -286,13 +397,6 @@ static void gather_columns(const uint8_t * src, ptrdiff_t src_stride,
 static inline __m128i nz_u8_mask(const __m128i v) {
     const __m128i zero = _mm_setzero_si128();
     return _mm_andnot_si128(_mm_cmpeq_epi8(v, zero), _mm_set1_epi8(static_cast<char>(0xFF)));
-}
-
-// The even bytes of two 16-byte vectors, packed into one.
-static inline __m128i deint_even_u8(const __m128i a, const __m128i b) {
-    const __m128i m = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14,
-                                    -1, -1, -1, -1, -1, -1, -1, -1);
-    return _mm_unpacklo_epi64(_mm_shuffle_epi8(a, m), _mm_shuffle_epi8(b, m));
 }
 
 // Mask gather: dst[y*rows + k] = predicate(src[y*src_stride + first + step*k])
@@ -373,6 +477,246 @@ static void gather_mask_u8(const uint8_t * src, ptrdiff_t src_stride,
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// EEDI3H fused mask path.
+//
+// The transposed plane's mask row k is the source mask COLUMN
+// `first + step*k`, so the byte matrix the vertical path feeds
+// build_bmask_row has to be transposed first. Building that matrix and then
+// transposing it moves ~4x more bytes than the bits the row kernel actually
+// reads (a 4.15 MB byte matrix + a second 4.15 MB transpose copy in the 2x
+// upscaled benchmark), and it was the single largest EEDI3H host stage
+// (measured: skipping it entirely, +33% end-to-end). The pair below builds
+// the PACKED bit matrix in one pass instead: threshold 16 mask elements into
+// 16 predicate bytes, transpose the 16x16 byte tile in registers, and
+// movemask it into a 64-bit word of the transposed bit row. Both global
+// streams stay linear (mask rows in, bit rows out).
+// ---------------------------------------------------------------------------
+
+// 8 float predicates as 8 bytes (0xFF/0x00), the exact strict "> 0.5/255" test.
+static inline __m128i nz_bytes_f32(const __m256 v) {
+    const __m256 thr = _mm256_set1_ps(0.5f / 255.0f);
+    const __m256i c = _mm256_castps_si256(_mm256_cmp_ps(v, thr, _CMP_GT_OQ));
+    const __m256i p16 = _mm256_packs_epi32(c, c);
+    const __m256i p8 = _mm256_packs_epi16(p16, p16);
+    return _mm256_castsi256_si128(p8);   // low 8 bytes = the 8 predicates
+}
+
+// 16 mask u16 -> 16 predicate bytes (bit-identical to bmask_bits16's test).
+// `s` is the row start and `odd` selects the source parity via the
+// deinterleave, so the loads stay aligned.
+static inline __m128i nz_bytes_u16(const uint16_t * s, const int step, const bool odd) {
+    const __m256i bias = _mm256_set1_epi16(static_cast<short>(0x8000));
+    const __m256i thr = _mm256_set1_epi16(static_cast<short>(128 - 32768));
+    const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s));
+    __m256i v = a;
+    if (step == 2) {
+        const __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + 16));
+        v = odd ? deint_odd_u16(a, b) : deint_even_u16(a, b);
+    }
+    const __m256i cmp = _mm256_cmpgt_epi16(_mm256_xor_si256(v, bias), thr);
+    const __m256i packed = _mm256_packs_epi16(cmp, cmp);
+    return _mm256_castsi256_si128(_mm256_permute4x64_epi64(packed, 0x08));
+}
+
+// 16 mask f32 -> 16 predicate bytes.
+static inline __m128i nz_bytes_f32x16(const float * s, const int step, const bool odd) {
+    if (step == 2) {
+        const __m256 a = _mm256_loadu_ps(s);
+        const __m256 b = _mm256_loadu_ps(s + 8);
+        const __m256 c = _mm256_loadu_ps(s + 16);
+        const __m256 d = _mm256_loadu_ps(s + 24);
+        const __m256i va = _mm256_castps_si256(a);
+        const __m256i vb = _mm256_castps_si256(b);
+        const __m256i vc = _mm256_castps_si256(c);
+        const __m256i vd = _mm256_castps_si256(d);
+        const __m256 e0 = _mm256_castsi256_ps(odd ? deint_odd_f32(va, vb)
+                                                  : deint_even_f32(va, vb));
+        const __m256 e1 = _mm256_castsi256_ps(odd ? deint_odd_f32(vc, vd)
+                                                  : deint_even_f32(vc, vd));
+        return _mm_unpacklo_epi64(nz_bytes_f32(e0), nz_bytes_f32(e1));
+    }
+    return _mm_unpacklo_epi64(nz_bytes_f32(_mm256_loadu_ps(s)),
+                              nz_bytes_f32(_mm256_loadu_ps(s + 8)));
+}
+
+// 16 mask bytes -> 16 predicate bytes.
+static inline __m128i nz_bytes_u8(const uint8_t * s, const int step, const bool odd) {
+    if (step == 2) {
+        const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(s));
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(s + 16));
+        if (odd) {
+            const __m128i m = _mm_setr_epi8(1, 3, 5, 7, 9, 11, 13, 15,
+                                            -1, -1, -1, -1, -1, -1, -1, -1);
+            return nz_u8_mask(_mm_unpacklo_epi64(_mm_shuffle_epi8(a, m),
+                                                 _mm_shuffle_epi8(b, m)));
+        }
+        return nz_u8_mask(deint_even_u8(a, b));
+    }
+    return nz_u8_mask(_mm_loadu_si128(reinterpret_cast<const __m128i *>(s)));
+}
+
+// One element, for the k-block that does not fit the 16-wide vector path.
+static inline bool mask_nz_elem(const uint8_t * row, const int idx, const int bits) {
+    if (bits == 16) {
+        return reinterpret_cast<const uint16_t *>(row)[idx] >= 129u;
+    }
+    if (bits == 32) {
+        return reinterpret_cast<const float *>(row)[idx] > 0.5f / 255.0f;
+    }
+    return row[idx] != 0;
+}
+
+// bitmat[k * bw + (y >> 6)] bit (y & 63) = predicate(mask[y][first + step*k])
+// for k in [0, rows), y in [0, H). The bitmat row length is H bits; bw must be
+// (H + 63) / 64 (the caller allocates rows * bw words). `bits` is the MASK's
+// representation (16/32/8), not the clip's.
+//
+// wacc must hold `rows` words. The 64 rows of one y block are accumulated in
+// four 16-row groups, and within a group the k sweep walks each row LINEARLY
+// (only 16 row streams are live, which the hardware prefetcher tracks); the
+// obvious k-outermost order keeps 64 streams open and measured 2x slower.
+static void gather_mask_bitmat(const uint8_t * src, ptrdiff_t src_stride,
+                               const int H, const int rows, const int first,
+                               const int step, const int bits, uint64_t * bitmat,
+                               const int bw, uint64_t * wacc) {
+    // For step == 2 the source row is the kept/interp parity pair, i.e. 2*rows
+    // elements wide; for step == 1 (dh: every column survives) it is `rows`.
+    const int in_w = (step == 2) ? 2 * rows : rows;
+    const int load_span = (step == 2) ? 32 : 16;
+    for (int y0 = 0; y0 < H; y0 += 64) {
+        std::memset(wacc, 0, static_cast<size_t>(rows) * sizeof(uint64_t));
+        for (int g = 0; g < 4; ++g) {
+            if (y0 + g * 16 >= H) {
+                break;
+            }
+            for (int k0 = 0; k0 < rows; k0 += 16) {
+                const int kn = std::min(16, rows - k0);
+                // The 16-wide vector load spans step * k0 + load_span elements
+                // from the ROW START (the parity is selected by the
+                // deinterleave, so the loads stay aligned and the last block of
+                // an aligned row is exactly in bounds); anything else falls
+                // back to the scalar loop.
+                const bool vec = step * k0 + load_span <= in_w;
+                uint32_t m[16] = {};
+                if (vec) {
+                    __m128i r[16];
+                    for (int i = 0; i < 16; ++i) {
+                        const int y = y0 + g * 16 + i;
+                        if (y >= H) {
+                            r[i] = _mm_setzero_si128();
+                            continue;
+                        }
+                        const uint8_t * const row =
+                            src + static_cast<size_t>(y) * src_stride;
+                        const int c = step * k0;
+                        const bool odd = first != 0;
+                        r[i] = (bits == 16)
+                            ? nz_bytes_u16(reinterpret_cast<const uint16_t *>(row) + c, step, odd)
+                            : (bits == 32)
+                                ? nz_bytes_f32x16(reinterpret_cast<const float *>(row) + c, step, odd)
+                                : nz_bytes_u8(row + c, step, odd);
+                    }
+                    transpose16x16_u8(r);
+                    for (int j = 0; j < 16; ++j) {
+                        m[j] = static_cast<uint32_t>(_mm_movemask_epi8(r[j]));
+                    }
+                } else {
+                    for (int i = 0; i < 16; ++i) {
+                        const int y = y0 + g * 16 + i;
+                        if (y >= H) {
+                            break;
+                        }
+                        const uint8_t * const row =
+                            src + static_cast<size_t>(y) * src_stride;
+                        for (int j = 0; j < kn; ++j) {
+                            if (mask_nz_elem(row, first + step * (k0 + j), bits)) {
+                                m[j] |= 1u << i;
+                            }
+                        }
+                    }
+                }
+                for (int j = 0; j < kn; ++j) {
+                    wacc[k0 + j] |= static_cast<uint64_t>(m[j]) << (g * 16);
+                }
+            }
+        }
+        const int yvalid = std::min(64, H - y0);
+        const uint64_t ymask = (yvalid >= 64) ? ~0ull : ((1ull << yvalid) - 1);
+        for (int k = 0; k < rows; ++k) {
+            bitmat[static_cast<size_t>(k) * bw + (y0 >> 6)] = wacc[k] & ymask;
+        }
+    }
+}
+
+// The shift+dilate+pack step of build_bmask_row, shared with the EEDI3H fused
+// path (which fills `scratch` from the transposed bit matrix instead of from
+// mask bytes). scratch holds 2 * ((width + mdis + 63) / 64) words: the first
+// nw are the input bits (zero past `width`), the second nw the dilation
+// temporaries.
+static void bmask_dilate_store(uint64_t * scratch, uint32_t * out,
+                               const int width, const int mdis) {
+    const int nw = (width + mdis + 63) / 64;             // accumulator words
+    // 2. B[x] = b[x - mdis]: shift the bit array toward higher x by mdis
+    //    (descending in place: src[i-1] is still untouched when i is written).
+    if (mdis > 0) {
+        const int k = mdis;
+        for (int i = nw - 1; i >= 0; --i) {
+            const uint64_t hi = scratch[i] << k;
+            const uint64_t lo = (i > 0) ? (scratch[i - 1] >> (64 - k)) : 0;
+            scratch[i] = hi | lo;
+        }
+    }
+
+    // 3. out[x] = OR_{t=0}^{2*mdis} B[x+t]. In bit-index terms this is
+    //    `acc >> t` ((a>>t)[p] == a[p+t]), so each B bit at p covers out bits
+    //    [p-2mdis, p]. Compose by doubling: if acc == dil_r then
+    //    acc | (acc >> s) == dil_{r+s} for any s <= r+1, so 2*mdis is reached
+    //    in O(log mdis) whole-array passes instead of 2*mdis passes.
+    if (mdis > 0) {
+        const int r = 2 * mdis;
+        uint64_t * const shifted = scratch + nw;
+        int radius = 0;
+        for (int step = 1; radius < r; step <<= 1) {
+            const int s = std::min(step, r - radius);
+            for (int i = 0; i < nw; ++i) {
+                const uint64_t hi = scratch[i] >> s;
+                const uint64_t lo = (i + 1 < nw)
+                    ? (scratch[i + 1] << (64 - s)) : 0;
+                shifted[i] = hi | lo;
+            }
+            for (int i = 0; i < nw; ++i) {
+                scratch[i] |= shifted[i];
+            }
+            radius += s;
+        }
+    }
+
+    // 4. store as packed uint32 words (row stride is (width+31)/32 words);
+    //    the bits past `width` in the last word are cleared (the shader never
+    //    reads them, but the upload stays byte-reproducible).
+    const int nwords = (width + 31) / 32;
+    for (int i = 0; i < nwords; ++i) {
+        out[i] = static_cast<uint32_t>(scratch[i >> 1] >> ((i & 1) * 32));
+    }
+    const int tail = width & 31;
+    if (tail != 0) {
+        out[nwords - 1] &= (1u << tail) - 1u;
+    }
+}
+
+// Transposed bit row -> the row kernel's packed dilated mask row.
+static void build_bmask_row_from_bits(const uint64_t * bits, uint32_t * out,
+                                      const int width, const int mdis,
+                                      uint64_t * scratch) {
+    const int nw = (width + mdis + 63) / 64;
+    const int bw = (width + 63) / 64;
+    std::memcpy(scratch, bits, static_cast<size_t>(bw) * sizeof(uint64_t));
+    std::memset(scratch + bw, 0, static_cast<size_t>(nw - bw) * sizeof(uint64_t));
+    bmask_dilate_store(scratch, out, width, mdis);
+}
+
 
 // Host-side pad upload is always float (see eedi3.comp header): u16 native
 // values are exact integers < 2^24 so float cost/interp math is bit-exact.
@@ -522,6 +866,18 @@ struct Eedi3Data {
     // Diagnostics-only host-path ablations (env-gated; all default off).
     bool skip_blit {}, skip_sclip {}, skip_raw {}, skip_h2d {}, skip_vcheck {};
     bool skip_xfer {};   // diagnostics: import path without the blit dispatch
+    bool skip_xpose {}, skip_compose {}, skip_maskx {};  // diagnostics (EEDI3H)
+    // EEDI3H only: build the transposed mask's PACKED bit matrix in one pass
+    // (threshold + 16x16 byte transpose + movemask) instead of the byte matrix
+    // plus its whole-plane transpose. VSFEEL_EEDI3_MASKFUSE=0 restores the old
+    // two-pass path for A/B.
+    bool mask_fuse { true };
+    // EEDI3H only: when the sclip frame aliases the clip frame (based_aa's
+    // Interleave([clip, clip])), gather the kept AND interp column parities in
+    // one pass over the source rows instead of reading the whole frame twice.
+    // VSFEEL_EEDI3_PAIR=0 forces the two-pass form.
+    bool skip_pair { false };
+
     bool raw_stage {};   // diagnostics: raw gather -> cached staging (plain stores)
     bool blit_contig {}; // diagnostics: one contiguous copy instead of per-row
     // Gray16 mclip handled natively (no SetFrameProps+resize.Point->Gray8 node).
@@ -1046,52 +1402,7 @@ static void build_bmask_row(const uint8_t * maskp, const uint16_t * mask16,
         }
     }
 
-    // 2. B[x] = b[x - mdis]: shift the bit array toward higher x by mdis
-    //    (descending in place: src[i-1] is still untouched when i is written).
-    {
-        const int k = mdis;
-        for (int i = nw - 1; i >= 0; --i) {
-            const uint64_t hi = scratch[i] << k;
-            const uint64_t lo = (i > 0) ? (scratch[i - 1] >> (64 - k)) : 0;
-            scratch[i] = hi | lo;
-        }
-    }
-
-    // 3. out[x] = OR_{t=0}^{2*mdis} B[x+t]. In bit-index terms this is
-    //    `acc >> t` ((a>>t)[p] == a[p+t]), so each B bit at p covers out bits
-    //    [p-2mdis, p]. Compose by doubling: if acc == dil_r then
-    //    acc | (acc >> s) == dil_{r+s} for any s <= r+1, so 2*mdis is reached
-    //    in O(log mdis) whole-array passes instead of 2*mdis passes.
-    if (mdis > 0) {
-        const int r = 2 * mdis;
-        uint64_t * const shifted = scratch + nw;   // caller-provided second half
-        int radius = 0;
-        for (int step = 1; radius < r; step <<= 1) {
-            const int s = std::min(step, r - radius);
-            for (int i = 0; i < nw; ++i) {
-                const uint64_t hi = scratch[i] >> s;
-                const uint64_t lo = (i + 1 < nw)
-                    ? (scratch[i + 1] << (64 - s)) : 0;
-                shifted[i] = hi | lo;
-            }
-            for (int i = 0; i < nw; ++i) {
-                scratch[i] |= shifted[i];
-            }
-            radius += s;
-        }
-    }
-
-    // 4. store as packed uint32 words (row stride is (width+31)/32 words);
-    //    the bits past `width` in the last word are cleared (the shader never
-    //    reads them, but the upload stays byte-reproducible).
-    const int nwords = (width + 31) / 32;
-    for (int i = 0; i < nwords; ++i) {
-        out[i] = static_cast<uint32_t>(scratch[i >> 1] >> ((i & 1) * 32));
-    }
-    const int tail = width & 31;
-    if (tail != 0) {
-        out[nwords - 1] &= (1u << tail) - 1u;
-    }
+    bmask_dilate_store(scratch, out, width, mdis);
 }
 
 // ---------------------------------------------------------------------------
@@ -1323,9 +1634,11 @@ static std::optional<std::string> record_command_buffer(
                 const uint32_t gy = (static_cast<uint32_t>(cfg.width) + 15) / 16;
                 vkCmdDispatch(resource.cmd, gx, gy, 1);
             };
-            xpose(cfg.raw_offset, cfg.rt_offset);
-            if (cfg.rtS_bytes > 0) {
-                xpose(cfg.sclip_offset, cfg.rtS_offset);
+            if (!d.skip_xpose) {
+                xpose(cfg.raw_offset, cfg.rt_offset);
+                if (cfg.rtS_bytes > 0) {
+                    xpose(cfg.sclip_offset, cfg.rtS_offset);
+                }
             }
             VkMemoryBarrier xbarrier {
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -1503,7 +1816,7 @@ static std::optional<std::string> record_command_buffer(
         vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
         for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
-            if (!d.process[plane]) {
+            if (!d.process[plane] || d.skip_compose) {
                 continue;
             }
             const auto & cfg = d.planes[plane];
@@ -1682,6 +1995,11 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     if (d->mclip_node) {
         mcp = vsapi->getFrameFilter(sn, d->mclip_node, frameCtx);
     }
+    if (d->horiz && scp && getenv("VSFEEL_EEDI3_PTRTRACE") && (sn < 3)) {
+        fprintf(stderr, "[eedi3-ptr] sn=%d src=%p scp=%p mcp=%p\n", sn,
+                vsapi->getReadPtr(src, 0), vsapi->getReadPtr(scp, 0),
+                mcp ? vsapi->getReadPtr(mcp, 0) : nullptr);
+    }
 
     int field = d->field & 1;
     int err;
@@ -1705,6 +2023,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         (hframe >= 0 ? sn == hframe : (sn >= 100 && sn % 200 == 0));
     const auto h_t0 = std::chrono::steady_clock::now();
     auto h_tMaskEnd = h_t0, h_tGatherEnd = h_t0, h_tRawEnd = h_t0;
+    auto h_tMaskMid = h_t0;
     auto h_tRecEnd = h_t0, h_tImportEnd = h_t0;
 
     // Re-record the command buffer with this frame's interp-row parity (the
@@ -1802,7 +2121,24 @@ static const VSFrame *VS_CC Eedi3GetFrame(
             // source COLUMNS of the kept parity read out of the source ROWS.
             // dh keeps every source column (the transposed height doubles, so
             // every input column survives as a kept row).
-            if (!d->skip_raw) {
+            //
+            // When the sclip frame IS this frame (based_aa's Interleave([clip,
+            // clip]), which vsapi hands out as the same plane pointer) the
+            // interp-parity columns are the other half of the very same row
+            // chunks, so both compactions come out of one pass: the second
+            // full-frame read is pure waste. VSFEEL_EEDI3_PAIR=0 restores the
+            // two-pass form for A/B.
+            const bool need_sclip = d->vcheck > 0 && d->sclip_node && scp &&
+                !d->skip_sclip;
+            bool pair_done = false;
+            if (need_sclip && !d->skip_raw && !d->skip_pair && !d->dh &&
+                vsapi->getReadPtr(scp, plane) == srcp &&
+                nt_raw == ((d->copy_mode & 1) != 0)) {
+                pair_done = gather_columns_pair(
+                    srcp, src_stride, cfg.src_h, rawp, upload + cfg.sclip_offset,
+                    cfg.rows, off, d->elem_bytes, nt_raw);
+            }
+            if (!pair_done && !d->skip_raw) {
                 gather_columns(srcp, src_stride, cfg.src_h, rawp, cfg.rows,
                                d->dh ? 1 : 2, d->dh ? 0 : off,
                                d->elem_bytes, nt_raw);
@@ -1823,29 +2159,61 @@ static const VSFrame *VS_CC Eedi3GetFrame(
                 // and the Gray8 fallback), not the clip's depth.
                 const int mbits = d->mclip_native16 ? 16
                     : (d->mclip_native32 ? 32 : 8);
-                gather_mask_u8(maskp, mask_stride, cfg.src_h, ms, cfg.rows,
-                               d->dh ? 0 : field, d->dh ? 1 : 2, mbits);
-                transpose_plane(ms, cfg.rows, cfg.rows, cfg.width, m2,
-                                cfg.width, 1);
+                if (!d->skip_maskx) {
+                    gather_mask_u8(maskp, mask_stride, cfg.src_h, ms, cfg.rows,
+                                   d->dh ? 0 : field, d->dh ? 1 : 2, mbits);
+                    transpose_plane(ms, cfg.rows, cfg.rows, cfg.width, m2,
+                                    cfg.width, 1);
+                }
                 // The packed bits are built by ordinary (cached) stores, which
                 // are catastrophic into the uncached host-visible VRAM the
                 // ReBAR upload uses: keep them in the cached staging mirror and
                 // let the row kernel read them from there (binding 4).
                 uint8_t * bm = staging + cfg.bits_offset;
                 const int nwords = (cfg.width + 31) / 32;
+                const int nw64 = (cfg.width + d->mdis + 63) / 64;
+                // [0, 2*nw64) = the dilation scratch, then the fused gather's
+                // per-y-block accumulator (one u64 per transposed row).
                 std::vector<uint64_t> bmask_scratch(
-                    2 * static_cast<size_t>((cfg.width + d->mdis + 63) / 64));
-                for (int r = 0; r < cfg.rows; ++r) {
-                    build_bmask_row(m2 + static_cast<size_t>(r) * cfg.width,
-                                    nullptr, nullptr,
-                                    reinterpret_cast<uint32_t *>(
-                                        bm + static_cast<size_t>(r) * nwords * 4),
-                                    cfg.width, d->mdis, bmask_scratch.data());
+                    2 * static_cast<size_t>(nw64) + cfg.rows);
+                if (d->mask_fuse && !d->skip_maskx && d->mdis < 64 &&
+                    cfg.width >= 2 * d->mdis) {
+                    // Fused: threshold+transpose+pack straight into the
+                    // transposed bit matrix, then dilate each transposed row.
+                    const int bw = (cfg.width + 63) / 64;   // words per bit row
+                    uint64_t * const bitmat = reinterpret_cast<uint64_t *>(ms);
+                    gather_mask_bitmat(maskp, mask_stride, cfg.src_h, cfg.rows,
+                                       d->dh ? 0 : field, d->dh ? 1 : 2, mbits,
+                                       bitmat, bw, bmask_scratch.data() + 2 * nw64);
+                    if (hbench) { h_tMaskMid = std::chrono::steady_clock::now(); }
+                    for (int r = 0; r < cfg.rows; ++r) {
+                        build_bmask_row_from_bits(
+                            bitmat + static_cast<size_t>(r) * bw,
+                            reinterpret_cast<uint32_t *>(
+                                bm + static_cast<size_t>(r) * nwords * 4),
+                            cfg.width, d->mdis, bmask_scratch.data());
+                    }
+                } else {
+                    if (!d->skip_maskx) {
+                        gather_mask_u8(maskp, mask_stride, cfg.src_h, ms, cfg.rows,
+                                       d->dh ? 0 : field, d->dh ? 1 : 2, mbits);
+                        transpose_plane(ms, cfg.rows, cfg.rows, cfg.width, m2,
+                                        cfg.width, 1);
+                    }
+                    if (hbench) { h_tMaskMid = std::chrono::steady_clock::now(); }
+                    for (int r = 0; r < cfg.rows; ++r) {
+                        build_bmask_row(m2 + static_cast<size_t>(r) * cfg.width,
+                                        nullptr, nullptr,
+                                        reinterpret_cast<uint32_t *>(
+                                            bm + static_cast<size_t>(r) * nwords * 4),
+                                        cfg.width, d->mdis, bmask_scratch.data());
+                    }
                 }
             }
             if (hbench) { h_tMaskEnd = std::chrono::steady_clock::now(); }
 
-            if (d->vcheck > 0 && d->sclip_node && scp && !d->skip_sclip) {
+            if (d->vcheck > 0 && d->sclip_node && scp && !d->skip_sclip &&
+                !pair_done) {
                 // The vcheck reads the transposed sclip's interp rows, i.e. the
                 // sclip's interp columns (field + 2r) transposed.
                 const auto scpp = vsapi->getReadPtr(scp, plane);
@@ -2073,9 +2441,10 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         };
         fprintf(stderr, "[eedi3-hbench] cpu_stage=%.3fms submit=%.3fms fence_wait=%.3fms blit=%.3fms\n",
                 us(h_t0, h_t1), us(h_tSub0, h_tSub1), us(h_t1, h_t2), us(h_t2, h_t3));
-        fprintf(stderr, "[eedi3-hbench]   of cpu_stage: import=%.3fms record=%.3fms raw=%.3fms bits=%.3fms sclip=%.3fms\n",
+        fprintf(stderr, "[eedi3-hbench]   of cpu_stage: import=%.3fms record=%.3fms raw=%.3fms bits=%.3fms(maskx=%.3f bmask=%.3f) sclip=%.3fms\n",
                 us(h_t0, h_tImportEnd), us(h_tImportEnd, h_tRecEnd), us(h_tRecEnd, h_tRawEnd),
-                us(h_tRawEnd, h_tMaskEnd), us(h_tMaskEnd, h_tGatherEnd));
+                us(h_tRawEnd, h_tMaskEnd), us(h_tRawEnd, h_tMaskMid),
+                us(h_tMaskMid, h_tMaskEnd), us(h_tMaskEnd, h_tGatherEnd));
     }
 
     vsapi->freeFrame(src);
@@ -2395,6 +2764,15 @@ static void vsfeel_eedi3_create(
     d->skip_h2d = std::getenv("VSFEEL_EEDI3_NOH2D") != nullptr;
     d->skip_vcheck = std::getenv("VSFEEL_EEDI3_NOVC") != nullptr;
     d->skip_xfer = std::getenv("VSFEEL_EEDI3_NOXFER") != nullptr;
+    d->skip_xpose = std::getenv("VSFEEL_EEDI3_NOXPOSE") != nullptr;
+    d->skip_compose = std::getenv("VSFEEL_EEDI3_NOCOMPOSE") != nullptr;
+    d->skip_maskx = std::getenv("VSFEEL_EEDI3_NOMASKX") != nullptr;
+    if (const char * mf = std::getenv("VSFEEL_EEDI3_MASKFUSE")) {
+        d->mask_fuse = atoi(mf) != 0;
+    }
+    if (const char * pr = std::getenv("VSFEEL_EEDI3_PAIR")) {
+        d->skip_pair = atoi(pr) == 0;
+    }
 
     if (const char * cm = std::getenv("VSFEEL_EEDI3_COPY")) {
         const int v = atoi(cm);
@@ -2795,6 +3173,11 @@ static void vsfeel_eedi3_create(
             scratch_total = align32(cfg.out_offset + cfg.out_bytes);
 
             cfg.ms_bytes = 2 * static_cast<VkDeviceSize>(cfg.rows) * cfg.width;
+            // The fused path uses this scratch for the PACKED transposed bit
+            // matrix (rows * (width+63)/64 u64 words), which is ~8x smaller
+            // than the byte matrix -- max() keeps both paths in bounds.
+            cfg.ms_bytes = std::max(cfg.ms_bytes,
+                static_cast<VkDeviceSize>(cfg.rows) * ((cfg.width + 63) / 64) * 8);
             cfg.ms_offset = align32(scratch_total);
             scratch_total = align32(cfg.ms_offset + cfg.ms_bytes);
         }
