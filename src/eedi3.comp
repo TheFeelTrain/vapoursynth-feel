@@ -115,7 +115,8 @@ const int BT_TILE = 32;
 
 // Entry points that touch only the raw/pad buffers, not the row-kernel
 // helpers (pad_get/conn_cost/...), so those helpers must not be compiled in.
-#if defined(ENTRY_PAD) || defined(ENTRY_XPOSE) || defined(ENTRY_COMPOSE)
+#if defined(ENTRY_PAD) || defined(ENTRY_XPOSE) || defined(ENTRY_COMPOSE) || \
+    defined(ENTRY_ASSEMBLEV)
 #define ENTRY_NO_HELPERS 1
 #endif
 
@@ -185,6 +186,21 @@ layout(std430, binding = 1) readonly buffer CompDst {
     float cdst[];
 #endif
 };
+#elif defined(ENTRY_ASSEMBLEV)
+// EEDI3AA vertical merge. Each output row y of the merged frame v averages
+// the SOURCE row with the interpolated row the vertical sub-pass of matching
+// parity produced: v[y] = (src[y] + vout_{y&1}[y>>1] + 1) >> 1 (u16; f32
+// averages 0.5*a + 0.5*b, which is what std.Merge does bitwise).
+//
+// The source rows are the two compacted per-parity raw uploads (the vertical
+// gather writes only the kept rows of the sub-pass's parity, so the two blocks
+// together ARE the frame), read through binding 9 -- the same buffer ENTRY_PAD
+// reads its raw from (up_dev under ReBAR, the pad_dev mirror otherwise). vout
+// is binding 7 (device-local) and the merged frame goes out through binding 10
+// (the staging scratch region) so the host can gather its columns next.
+layout(std430, binding = 9) readonly buffer AsmRaw { IO_TYPE asm_raw[]; };
+layout(std430, binding = 7) readonly buffer AsmVout { IO_TYPE asm_vout[]; };
+layout(std430, binding = 10) writeonly buffer AsmOut { IO_TYPE asm_out[]; };
 #elif defined(ENTRY_PAD)
 // Raw kept rows (u16/f32 native) in the pad builder's source layout;
 // ENTRY_PAD expands the mirror margins into the built pad (binding 8,
@@ -265,6 +281,12 @@ layout(push_constant) uniform PC {
     // ENTRY_COMPOSE only: io-element base of the assembled output plane (b10,
     // the staging download region).
     int out_base;
+    // ENTRY_ASSEMBLEV only: io-element base of the second field's vout rows
+    // (b7) and pad-elem base of the second compacted raw upload (b9). Both
+    // sub-passes write the same buffers, so their bases are separate push
+    // constants rather than extra bindings.
+    int vout2_base;
+    int raw2_base;
 } pc;
 
 // Padded-plane access at OUTPUT dst-row coordinates. copyPad places every
@@ -1347,3 +1369,37 @@ void main() {
 }
 
 #endif  // ENTRY_COMPOSE
+
+#if defined(ENTRY_ASSEMBLEV)
+
+// EEDI3AA vertical merge: one dispatch per plane, one thread per output
+// element. `pc.field` is the FIRST sub-pass's interp parity; every row whose
+// parity matches it takes that sub-pass's vout rows and the OTHER sub-pass's
+// compacted source rows (that sub-pass kept the complementary parity), and
+// vice versa. `pc.rows` is the vertical pass's interp-row count, so the output
+// plane has 2*pc.rows rows (dh is not supported on this path).
+layout(local_size_x = 256) in;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    const int total = 2 * pc.rows * WIDTH;
+    if (int(idx) >= total) return;
+    const int y = int(idx) / WIDTH;
+    const int x = int(idx) % WIDTH;
+    const int p = y & 1;
+    const int r = y >> 1;
+    // src[y] lives in the upload gathered for field (1 - p); vout comes from
+    // the sub-pass whose interp parity IS p.
+    const int raw_base = (p == pc.field) ? pc.raw2_base : pc.raw_base;
+    const int vout_base = (p == pc.field) ? pc.vout_base : pc.vout2_base;
+    const int i = raw_base + r * WIDTH + x;
+    const int j = vout_base + r * WIDTH + x;
+#if BITS == 16
+    asm_out[pc.out_base + int(idx)] =
+        IO_TYPE((int(asm_raw[i]) + int(asm_vout[j]) + 1) >> 1);
+#else
+    asm_out[pc.out_base + int(idx)] = 0.5f * asm_raw[i] + 0.5f * asm_vout[j];
+#endif
+}
+
+#endif  // ENTRY_ASSEMBLEV

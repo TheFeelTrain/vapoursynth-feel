@@ -364,6 +364,74 @@ def _eedi3_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     }
 
 
+def _eedi3aa_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
+    """The fused based_aa EEDI3 chain: vsfeel.EEDI3AA vs the two-call chain.
+
+    ``vsfeel`` runs the fused single call. Every reference plugin runs the
+    *same* chain based_aa would run on it: eedi3vk2 natively (EEDI3 then
+    EEDI3H), vszipcl/vszipcu through std.Transpose (they have no EEDI3H).
+    The chain strings are multi-statement: the ``_v``/``_vm``/``_h``
+    temporaries make sure each direction's EEDI3 is invoked once, not once
+    per merge arm.
+    """
+    ns_num = ns.num_streams if ns.num_streams is not None else 8
+    use_mclip = getattr(ns, "eedi3_mclip", True)
+    common = (
+        f"field={ns.eedi3_field}, mdis={ns.eedi3_mdis}, nrad={ns.eedi3_nrad}, "
+        f"alpha={ns.eedi3_alpha}, beta={ns.eedi3_beta}, gamma={ns.eedi3_gamma}, "
+        f"vcheck={ns.eedi3_vcheck}, vthresh0={ns.eedi3_vthresh0}, "
+        f"vthresh1={ns.eedi3_vthresh1}, vthresh2={ns.eedi3_vthresh2}"
+    )
+    aux = "sclip=sclip, mclip=mclip" if use_mclip else "sclip=sclip"
+    aux_sclip = "sclip=sclip"
+
+    def native(p: str, pod: str) -> str:
+        return (
+            f"_v = core.{p}.EEDI3({clip}, {common}, {pod}, num_streams={ns_num})\n"
+            f"_vm = core.std.Merge(_v[::2], _v[1::2])\n"
+            f"_h = core.{p}.EEDI3H(_vm, {common}, {pod}, num_streams={ns_num})\n"
+            f"core.std.Merge(_h[::2], _h[1::2])"
+        )
+
+    def transposed(p: str) -> str:
+        # based_aa's should_h=False path: transpose -> EEDI3 -> transpose for
+        # the horizontal direction, with the sclip transposed to match.
+        # vszipcl/vszipcu have no mclip, so the mask is simply not passed
+        # (based_aa only forwards it to backends that support it).
+        return (
+            f"_s = sclip.std.Transpose()\n"
+            f"_v = core.{p}.EEDI3({clip}, {common}, {aux_sclip}, "
+            f"num_streams={ns_num})\n"
+            f"_vm = core.std.Merge(_v[::2], _v[1::2])\n"
+            f"_h = core.{p}.EEDI3(_vm.std.Transpose(), {common}, sclip=_s, "
+            f"num_streams={ns_num}).std.Transpose()\n"
+            f"core.std.Merge(_h[::2], _h[1::2])"
+        )
+
+    def plugin_caps(p: str) -> tuple[bool, bool]:
+        """(has EEDI3H, supports mclip) — based_aa's should_h / supports_mclip."""
+        try:
+            import vapoursynth as vs
+            fn = getattr(vs.core, p)
+            return (hasattr(fn, "EEDI3H"),
+                    "mclip" in fn.EEDI3.__signature__.parameters)
+        except Exception:
+            return (False, False)
+
+    out: dict[str, str] = {
+        "vsfeel": (
+            f"core.vsfeel.EEDI3AA({clip}, {common}, {aux}, num_streams={ns_num})"
+        ),
+    }
+    for p in ("eedi3vk2", "vszipcl", "vszipcu"):
+        has_h, has_mclip = plugin_caps(p)
+        if has_h:
+            out[p] = native(p, aux if (use_mclip and has_mclip) else aux_sclip)
+        else:
+            out[p] = transposed(p)
+    return out
+
+
 def _nnedi3_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     ns_num = ns.num_streams if ns.num_streams is not None else 4
     common = (
@@ -478,6 +546,32 @@ FILTERS: dict[str, FilterSpec] = {
         # Real runs mirror vsaa.based_aa: source at 16-bit, vsaa edge mask,
         # both Point-upscaled 2x, then EEDI3 with sclip/mclip. --synthetic
         # (used by the hang tests) falls back to a plain 1x GRAY16 call.
+        input="depth(get_y(clip), 16)",
+        aa=True,
+        default_streams=8,
+    ),
+    "eedi3aa": FilterSpec(
+        title="EEDI3AA (fused based_aa chain)",
+        default_frames=2000,
+        args=[
+            # Same surface as the eedi3 entry: based_aa's default antialiaser
+            # in double-rate mode (field = tff + double_rate*2 = 3).
+            Arg("field", "--eedi3-field", "eedi3_field", int, 3),
+            Arg("mdis", "--eedi3-mdis", "eedi3_mdis", int, 20),
+            Arg("nrad", "--eedi3-nrad", "eedi3_nrad", int, 2),
+            Arg("alpha", "--eedi3-alpha", "eedi3_alpha", float, 0.125),
+            Arg("beta", "--eedi3-beta", "eedi3_beta", float, 0.25),
+            Arg("gamma", "--eedi3-gamma", "eedi3_gamma", float, 40.0),
+            Arg("vcheck", "--eedi3-vcheck", "eedi3_vcheck", int, 2),
+            Arg("vthresh0", "--eedi3-vthresh0", "eedi3_vthresh0", float, 12.0),
+            Arg("vthresh1", "--eedi3-vthresh1", "eedi3_vthresh1", float, 24.0),
+            Arg("vthresh2", "--eedi3-vthresh2", "eedi3_vthresh2", float, 4.0),
+            Arg("mclip", "--eedi3-mclip", "eedi3_mclip", _str_to_bool, True,
+                "pass the vsaa edge mask as mclip (default: true)"),
+        ],
+        build=_eedi3aa_build,
+        # Grades the whole based_aa chain: vsfeel's fused call against the
+        # two-call chain each reference plugin would run.
         input="depth(get_y(clip), 16)",
         aa=True,
         default_streams=8,
@@ -691,8 +785,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-frames", type=int, default=1000,
                         help="number of leading frames to preload with --cache (default: 1000)")
 
+    # Filters may share CLI flags (eedi3 and eedi3aa expose the same EEDI3
+    # surface); register each flag once.
+    seen_flags: set[str] = set()
     for spec in FILTERS.values():
         for arg in spec.args:
+            if arg.flag in seen_flags:
+                continue
+            seen_flags.add(arg.flag)
             parser.add_argument(arg.flag, dest=arg.dest, type=arg.type,
                                 default=arg.default, help=arg.help)
 

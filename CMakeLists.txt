@@ -218,7 +218,7 @@ if(VK_GLSLC)
     # EEDI3 upload kernels: mirror-pad builder + empty-row vcheck copy per io
     # variant (plain 1D kernels, fixed local size, no subgroup ops);
     # vulkan1.3 target keeps one rule for the file.
-    set(VK_EEDI3_UP_ENTRIES pad vcopy blit xpose compose)
+    set(VK_EEDI3_UP_ENTRIES pad vcopy blit xpose compose assemblev)
     foreach(bits IN LISTS VK_EEDI3_BITS)
         foreach(entry IN LISTS VK_EEDI3_UP_ENTRIES)
             if(entry STREQUAL pad)
@@ -229,6 +229,8 @@ if(VK_GLSLC)
                 set(entry_def -DENTRY_XPOSE)
             elseif(entry STREQUAL compose)
                 set(entry_def -DENTRY_COMPOSE)
+            elseif(entry STREQUAL assemblev)
+                set(entry_def -DENTRY_ASSEMBLEV)
             else()
                 set(entry_def -DENTRY_VCOPY)
             endif()

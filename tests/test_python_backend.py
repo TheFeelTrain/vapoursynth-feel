@@ -72,6 +72,35 @@ def test_eedi3h_fallback_matches_native(noise_gray):
     assert np.array_equal(frame_to_ndarray(native.get_frame(0)), frame_to_ndarray(fallback.get_frame(0)))
 
 
+def test_eedi3aa_subclass_is_a_vsaa_eedi3():
+    """vsfeel.EEDI3 is a lazy subclass, so based_aa's isinstance checks pass."""
+    assert issubclass(vsfeel.EEDI3, EEDI3)
+    # `import vsfeel` must not require vsaa: the subclass is built on access.
+    assert vsfeel.__all__ == ["Backend", "FeelBackend", "EEDI3"]
+
+
+def test_eedi3aa_matches_the_two_call_chain(noise_16bit):
+    """The fused antialiaser reproduces the base class's chain bit-exactly."""
+    fused = vsfeel.EEDI3(backend=_backend(), mdis=5, nrad=1).antialias(noise_16bit)
+    chain = EEDI3(backend=EEDI3.Backend.FEEL, mdis=5, nrad=1).antialias(noise_16bit)
+    assert fused.num_frames == chain.num_frames == noise_16bit.num_frames
+    for n in (0, 5, 23):
+        a = frame_to_ndarray(fused.get_frame(n), dtype=np.uint16)
+        b = frame_to_ndarray(chain.get_frame(n), dtype=np.uint16)
+        assert np.array_equal(a, b), f"fused chain mismatch at frame {n}"
+
+
+def test_eedi3aa_falls_back_for_non_both(noise_16bit):
+    """direction != BOTH keeps the base class's single-direction path."""
+    fused = vsfeel.EEDI3(backend=_backend()).antialias(
+        noise_16bit, direction=EEDI3.AADirection.HORIZONTAL)
+    chain = EEDI3(backend=EEDI3.Backend.FEEL).antialias(
+        noise_16bit, direction=EEDI3.AADirection.HORIZONTAL)
+    for n in (0, 11):
+        assert np.array_equal(frame_to_ndarray(fused.get_frame(n), dtype=np.uint16),
+                              frame_to_ndarray(chain.get_frame(n), dtype=np.uint16))
+
+
 def test_backend_context_routes_singletons(noise_gray):
     old_bilateral, old_gauss = bilateral.backend, gauss_blur.backend
     with _backend()():
