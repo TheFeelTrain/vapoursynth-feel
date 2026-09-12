@@ -327,6 +327,7 @@ struct Nnedi3Data {
     bool dh;
     int qual, pscrn;
     bool use_list;               // prescreen compacts a list (pscrn > 0)
+    bool gpu_trace = false;      // VSFEEL_NNEDI3_TSTAMP: record GPU timestamps
     int peak, elem_bytes;
     int xdim, ydim, nns;
     bool process[3] { true, true, true };
@@ -617,9 +618,14 @@ static std::optional<std::string> record_command_buffer(
     // 0=top, 1=prescreen done, 2=predict done, 3=D2H done. Query pool has
     // 4 slots (count+1). One timestamp per stage boundary only — each
     // timestamp write costs a pipeline bubble, so no marker timestamps.
-    vkCmdResetQueryPool(resource.cmd, resource.query_pool, 0, 4);
-    vkCmdWriteTimestamp(resource.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        resource.query_pool, 0);
+    // Gated on the env flag: an unconditional reset + 4 writes per frame is
+    // pure overhead (a timestamp write flushes the pipeline) on the default
+    // path, where the results are never even read back.
+    if (d.gpu_trace) {
+        vkCmdResetQueryPool(resource.cmd, resource.query_pool, 0, 4);
+        vkCmdWriteTimestamp(resource.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            resource.query_pool, 0);
+    }
 
 
     for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
@@ -692,7 +698,7 @@ static std::optional<std::string> record_command_buffer(
         }
 
         // TEMPORARY timestamp slot 1: prescreen done (plane 0 only).
-        if (plane == 0) {
+        if (plane == 0 && d.gpu_trace) {
             vkCmdWriteTimestamp(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 resource.query_pool, 1);
         }
@@ -718,7 +724,7 @@ static std::optional<std::string> record_command_buffer(
             }
         }
         // TEMPORARY timestamp slot 2: predict done (plane 0 only).
-        if (plane == 0) {
+        if (plane == 0 && d.gpu_trace) {
             vkCmdWriteTimestamp(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 resource.query_pool, 2);
         }
@@ -764,7 +770,7 @@ static std::optional<std::string> record_command_buffer(
                 VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &copy_barrier, 0, nullptr, 0, nullptr);
         }
         // TEMPORARY timestamp slot 3: D2H done (plane 0 only).
-        if (plane == 0) {
+        if (plane == 0 && d.gpu_trace) {
             vkCmdWriteTimestamp(resource.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 resource.query_pool, 3);
         }
@@ -983,7 +989,7 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
         checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
         bump(d->t_wait);
         // TEMPORARY GPU timestamps (remove after tuning)
-        if (trace_on("VSFEEL_NNEDI3_TSTAMP")) {
+        if (d->gpu_trace) {
             uint64_t ts[4] = {};
             if (vkGetQueryPoolResults(dev, resource.query_pool, 0, 4,
                     sizeof(ts), ts, sizeof(uint64_t),
@@ -1299,6 +1305,8 @@ static void VS_CC Nnedi3Create(
     VSCore *core, const VSAPI *vsapi) {
 
     auto d { std::make_unique<Nnedi3Data>() };
+
+    d->gpu_trace = trace_on("VSFEEL_NNEDI3_TSTAMP");
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
@@ -1904,8 +1912,10 @@ static void VS_CC Nnedi3Create(
     d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
     d->pool.reserve(d->num_streams);
 
-    uint32_t num_queues = std::min(
-        d->num_streams, static_cast<int>(d->device->queue_count));
+    // Queue sharing is swept independently of the stream count (see
+    // resolve_queue_cap): override with VSFEEL_NNEDI3_QUEUES=N.
+    uint32_t num_queues = resolve_queue_cap(d->num_streams,
+        d->device->queue_count, "VSFEEL_NNEDI3_QUEUES", 2);
 
     for (int i = 0; i < d->num_streams; ++i) {
         Nnedi3Resource resource;
@@ -2054,16 +2064,20 @@ static void VS_CC Nnedi3Create(
         }
 
         {
-            // TEMPORARY per-stage timestamps (remove after tuning)
-            VkQueryPoolCreateInfo query_info {
-                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .queryType = VK_QUERY_TYPE_TIMESTAMP,
-                .queryCount = 4,
-                .pipelineStatistics = 0
-            };
-            checkVK(vkCreateQueryPool(dev, &query_info, nullptr, &resource.query_pool));
+            // TEMPORARY per-stage timestamps (remove after tuning). Only
+            // created when VSFEEL_NNEDI3_TSTAMP is set: the default path never
+            // touches it, so per-resource query-pool VRAM is not paid either.
+            if (d->gpu_trace) {
+                VkQueryPoolCreateInfo query_info {
+                    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                    .queryCount = 4,
+                    .pipelineStatistics = 0
+                };
+                checkVK(vkCreateQueryPool(dev, &query_info, nullptr, &resource.query_pool));
+            }
         }
 
         {

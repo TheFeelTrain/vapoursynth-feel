@@ -554,6 +554,10 @@ struct DftData {
     FramePool<DFTTestResource> pool;
 
     // ---- debug timing accumulators ----
+    // Gated on VSFEEL_DFTTEST_TIMING at create time: the per-frame clocks and
+    // atomic accumulations are pure overhead on the default path (they were
+    // recorded unconditionally even though nothing ever printed them).
+    bool host_timing { false };
     std::atomic<uint64_t> t_acquire_ns {0}, t_upload_ns {0}, t_submit_ns {0},
         t_wait_ns {0}, t_download_ns {0}, t_total_ns {0};
     std::atomic<uint64_t> nframes {0};
@@ -1165,7 +1169,8 @@ static const VSFrame *VS_CC DftGetFrame(
         VSFrame * dst = vsapi->newVideoFrame2(
             &d->vi->format, d->vi->width, d->vi->height, fr, pl, center, core);
 
-        auto t0 = std::chrono::steady_clock::now();
+        auto t0 = d->host_timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
 
         // Note on the frame cache and out-of-order processing: the slot
         // state (gen/committed) under slot_lock decides who pads a slot (the
@@ -1184,7 +1189,8 @@ static const VSFrame *VS_CC DftGetFrame(
         // copy, and destroying the timeline semaphore is safe (all its waits
         // have resolved). No host fence waits anywhere: no deadlocks.
         d->pool.semaphore.acquire();
-        auto t1 = std::chrono::steady_clock::now();
+        auto t1 = d->host_timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
         d->pool.lock.lock();
         auto resource = std::move(d->pool.items.back());
         d->pool.items.pop_back();
@@ -1215,7 +1221,8 @@ static const VSFrame *VS_CC DftGetFrame(
                 n, resource.id, (long long)my_gen);
         }
 
-        auto t2 = std::chrono::steady_clock::now();
+        auto t2 = d->host_timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
 
         const bool coherent =
             !!(d->device->mem_props.memoryTypes[resource.staging_type_index].propertyFlags &
@@ -1424,7 +1431,8 @@ static const VSFrame *VS_CC DftGetFrame(
             }
         }
 
-        auto t3 = std::chrono::steady_clock::now();
+        auto t3 = d->host_timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
 
         if (const char * gb = getenv("VSFEEL_DFTTEST_GPU_BENCH"); gb && n == 0) {
             VkDevice dev0 = d->device->device;
@@ -1534,12 +1542,14 @@ static const VSFrame *VS_CC DftGetFrame(
             }
         }
 
-        auto t4 = std::chrono::steady_clock::now();
+        auto t4 = d->host_timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
         if (dfttest_trace()) {
             fprintf(stderr, "[dfttest-trace]   n=%d res=%d wait fence\n", n, resource.id);
         }
         checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
-        auto t5 = std::chrono::steady_clock::now();
+        auto t5 = d->host_timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
 
         // Steady-state per-stage GPU times (qbench only, frame 0): copy the
         // 4 availability-stamped timestamps back with a throwaway CB and
@@ -1657,14 +1667,17 @@ static const VSFrame *VS_CC DftGetFrame(
 
         d->pool.give_back(std::move(resource));
 
-        auto t6 = std::chrono::steady_clock::now();
-        d->t_acquire_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-        d->t_upload_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
-        d->t_submit_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t4 - t3).count();
-        d->t_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t5 - t4).count();
-        d->t_download_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t6 - t5).count();
-        d->t_total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t6 - t0).count();
-        d->nframes.fetch_add(1, std::memory_order::relaxed);
+        auto t6 = d->host_timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
+        if (d->host_timing) {
+            d->t_acquire_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+            d->t_upload_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+            d->t_submit_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t4 - t3).count();
+            d->t_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t5 - t4).count();
+            d->t_download_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t6 - t5).count();
+            d->t_total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t6 - t0).count();
+            d->nframes.fetch_add(1, std::memory_order::relaxed);
+        }
 
         for (int t = 0; t < tw; ++t) {
             vsapi->freeFrame(src[t]);
@@ -1695,6 +1708,9 @@ static void VS_CC DftCreate(
     VSCore *core, const VSAPI *vsapi) {
 
     auto d { std::make_unique<DftData>() };
+
+    // Opt-in host-path timing; the default path records no clocks.
+    d->host_timing = getenv("VSFEEL_DFTTEST_TIMING") != nullptr;
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
@@ -2399,8 +2415,10 @@ static void VS_CC DftCreate(
         d->slots.resize(num_planes * d->slot_count);
     }
 
-    const uint32_t num_queues = std::min(
-        d->num_streams, static_cast<int>(d->device->queue_count));
+    // Queue sharing is swept independently of the stream count (see
+    // resolve_queue_cap): override with VSFEEL_DFTTEST_QUEUES=N.
+    const uint32_t num_queues = resolve_queue_cap(d->num_streams,
+        d->device->queue_count, "VSFEEL_DFTTEST_QUEUES", 2);
 
     for (int i = 0; i < effective_streams; ++i) {
         DFTTestResource resource;

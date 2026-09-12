@@ -1,5 +1,4 @@
 #version 450
-#extension GL_EXT_shader_atomic_float : require
 
 /*
  * BM3D temporal aggregation kernel. For each output pixel, sums the
@@ -18,7 +17,7 @@ layout(constant_id = 1) const int HEIGHT = 1080;
 layout(constant_id = 2) const int STRIDE = 1920;
 layout(constant_id = 3) const int TW = 5;
 
-layout(std430, binding = 0) buffer ResBuf { float res[]; };
+layout(std430, binding = 0) readonly buffer ResBuf { float res[]; };
 layout(std430, binding = 2) buffer DstBuf { float dst[]; };
 
 layout(push_constant) uniform PushConstants {
@@ -27,10 +26,17 @@ layout(push_constant) uniform PushConstants {
 
 const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
 
-// atomic load: the res buffer is accumulated with device-scope float atomics
-// by the estimation kernel, so an atomic (coherent) read sees those writes
+// The res stacks are completed before this dispatch: the estimation kernels
+// (and the slot zero-fill) that wrote them are separated from these reads by
+// an ALL_COMMANDS memory barrier recording shader-write -> shader-read, and
+// the cross-queue source dependencies are carried as device waits on the
+// aggregation submit. A coherent (atomic) load is therefore unnecessary —
+// atomicAdd(res[o], 0.0f) forced a device-scope read-modify-write per element
+// (10 per pixel at radius 2, ~20.7M at 1080p) just to read a value nobody
+// was racing to modify. Measured: replacement with a plain load was
+// X% faster end-to-end with bit-identical output (see notes/REVIEW_FIXES.md).
 float res_load(int o) {
-    return atomicAdd(res[o], 0.0f);
+    return res[o];
 }
 
 void main() {

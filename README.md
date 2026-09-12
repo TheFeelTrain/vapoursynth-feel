@@ -6,16 +6,19 @@ Primarily optimized for running on RDNA 3 with the RADV driver on Linux.
 
 ## Performance
 
-Measured on an RX 7900 XTX at benchmark defaults (`benchmark/bench.py`).
+| Filter    | u16 vsfeel | u16 ref | u16 speedup | fp32 vsfeel | fp32 ref | fp32 speedup |
+|-----------|-----------:|--------:|------------:|------------:|---------:|-------------:|
+| Bilateral | 1903       | 1484    | 1.28x       | 1250        | 763      | 1.64x        |
+| BM3Dv2    | -          | -       | -           | 166         | 41       | 4.02x        |
+| DFTTest   | 1268       | 871     | 1.46x       | 1053        | 625      | 1.69x        |
+| EEDI3     | 583        | 199     | 2.93x       | 238         | 197      | 1.20x        |
+| GaussBlur | 2516       | 1599    | 1.57x       | 1267        | 756      | 1.68x        |
+| NLMeans   | 970        | 737     | 1.32x       | 846         | 651      | 1.30x        |
+| NNEDI3    | 2907       | 2659    | 1.09x       | 1563        | 1396     | 1.12x        |
 
-| Filter    | u16 vsfeel | u16 vszipcl | u16 speedup | fp32 vsfeel | fp32 vszipcl | fp32 speedup |
-|-----------|------------|-------------|-------------|-------------|--------------|--------------|
-| Bilateral | 1997       | 1505        | 1.33x       | 1271        | 754          | 1.69x        |
-| BM3Dv2    | —         | —          | —          | 169         | 41           | 4.07x        |
-| DFTTest   | 1289       | 887         | 1.45x       | 1073        | 633          | 1.70x        |
-| EEDI3     | 613        | 211         | 2.90x       | 255         | 202          | 1.26x        |
-| GaussBlur | 2474       | 1473        | 1.68x       | 1271        | 696          | 1.82x        |
-| NLMeans   | 992        | 753         | 1.32x       | 867         | 666          | 1.30x        |
+Reference columns are `vszipcl` for all filters except `nnedi3vk` for NNEDI3.
+
+Each figure is the median of 3 `benchmark/bench.py --bits <16|32>` runs on an RX 7900 XTX.
 
 ## Common Arguments
 
@@ -23,7 +26,7 @@ Measured on an RX 7900 XTX at benchmark defaults (`benchmark/bench.py`).
 
 More streams means more VRAM. Default values should be the most efficient.
 
-All filters support 16-bit integer and 32-bit float input except for BM3Dv2.
+All filters support 16-bit integer and 32-bit float input except for BM3Dv2, which is 32-bit only.
 
 ## Filters
 

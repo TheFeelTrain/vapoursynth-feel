@@ -190,10 +190,7 @@ class Plugin:
 PLUGINS = {
     "vsfeel": Plugin("vsfeel"),
     "vszipcl": Plugin("vszipcl"),
-    "vszipcu": Plugin(
-        "vszipcu",
-        loader='core.std.LoadPlugin("/home/encode/test/vapoursynth-ziphip/zig-out/lib/libvszipcu.so")',
-    ),
+    "vszipcu": Plugin("vszipcu"),
     "eedi3vk2": Plugin("eedi3vk2"),
     "nnedi3vk": Plugin("nnedi3vk"),
     "bilateralhip": Plugin("bilateralhip"),

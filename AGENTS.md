@@ -68,26 +68,6 @@ standard test input.
   changes: `python -m pytest tests/test_<filter>.py -q`
 - A rewrite is only acceptable if all tests still pass.
 
-### Running the suite fast
-
-The suite creates hundreds of filter nodes across many subprocesses, and on
-RADV shader *compilation* used to dominate it. The plugin's persistent
-pipeline cache (see "Persistent pipeline cache" under Building) removes that
-cost, with no change to results and no change to how you invoke pytest.
-
-Measured on the 443-test suite with the default `~/.cache/vsfeel` cache:
-
-| run | wall time |
-|---|---:|
-| first run (builds the cache) | ~3.5 min |
-| warm cache | ~2.5 min |
-| before the cache existed | ~7.5 min |
-
-The cache only skips compilation of *unchanged* shaders — editing a `.comp` or
-rebuilding the plugin invalidates the affected entries and they are recompiled
-on the next run. If a run is unexpectedly slow again, that is the first thing
-to check.
-
 ### Reference-comparison coverage and tolerance policy
 
 - **Sweep parameters against the reference** — every scalar parameter, every

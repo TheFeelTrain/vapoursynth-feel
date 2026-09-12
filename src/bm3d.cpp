@@ -148,7 +148,28 @@ struct BM3DData {
     std::condition_variable cache_cv;
     FramePool<Bm3dStream> pool;
 
+    // Env-gated host-path probe (VSFEEL_BM3D_TIMING=1). The stage split is the
+    // prerequisite for any transfer-path change: kernel time alone says nothing
+    // about whether the frame is GPU- or host-bound. Reset the clock after every
+    // blocking acquire so a wait never leaks into the next stage.
+    bool host_timing { false };
+    std::atomic<uint64_t> ht_take_ns {}, ht_acquire_ns {}, ht_upload_ns {},
+        ht_record_ns {}, ht_srcwait_ns {}, ht_agg_ns {}, ht_fence_ns {},
+        ht_down_ns {}, ht_total_ns {}, ht_n {};
+
     ~BM3DData() {
+        if (host_timing && ht_n.load()) {
+            const double n = static_cast<double>(ht_n.load());
+            fprintf(stderr,
+                "[bm3d-timing] frames=%.0f per-frame us: take=%7.1f acquire=%7.1f "
+                "upload=%7.1f record=%7.1f srcwait=%7.1f agg=%7.1f fence=%7.1f "
+                "download=%7.1f total=%7.1f\n",
+                n, ht_take_ns.load() / 1000.0 / n, ht_acquire_ns.load() / 1000.0 / n,
+                ht_upload_ns.load() / 1000.0 / n, ht_record_ns.load() / 1000.0 / n,
+                ht_srcwait_ns.load() / 1000.0 / n, ht_agg_ns.load() / 1000.0 / n,
+                ht_fence_ns.load() / 1000.0 / n, ht_down_ns.load() / 1000.0 / n,
+                ht_total_ns.load() / 1000.0 / n);
+        }
         if (!device) {
             return;
         }
@@ -770,7 +791,11 @@ static const VSFrame *VS_CC BM3DGetFrame(
             vsapi->freeFrame(src);
         }
 
+        auto t0 = d->host_timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
         auto stream = d->pool.take();
+        auto t1 = d->host_timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
         if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d acquired\n", n);
         const int my_stream = stream.stream_id;
         const uint64_t my_seq = stream.seq++;
@@ -779,6 +804,8 @@ static const VSFrame *VS_CC BM3DGetFrame(
         // reserve this frame's cache slots (blocks only when the working set
         // exceeds the cache, e.g. on seeks; never holds a stream while waiting)
         acquire_cache(d, stream, n, my_seq);
+        auto t2 = d->host_timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
 
         const auto set_error = [&](const std::string & error_message) {
             // unblock any frames already waiting on this frame's timeline
@@ -863,8 +890,12 @@ static const VSFrame *VS_CC BM3DGetFrame(
             };
             vkFlushMappedMemoryRanges(dev, 1, &flush_range);
         }
+        auto t3 = d->host_timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
 
         const int ndisp = record_bm3d_kernels(d, stream, n, uploaded);
+        auto t4 = d->host_timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
         if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d kernels recorded\n", n);
 
         // Cross-frame dependencies are expressed on the writers' per-stream
@@ -955,6 +986,8 @@ static const VSFrame *VS_CC BM3DGetFrame(
                submission while a first one still holds it */
             checkVK(submit_timeline(dev, stream.queue, stream.queue_lock, stream.cmd,
                 src_waits, src_values, src_stages, stream.timeline, my_seq, VK_NULL_HANDLE));
+        auto t5 = d->host_timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
 
         record_bm3d_agg(d, stream, n);
         if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d agg recorded\n", n);
@@ -976,8 +1009,12 @@ static const VSFrame *VS_CC BM3DGetFrame(
                 stream.cmd_agg, agg_waits, agg_values, agg_stages,
                 VK_NULL_HANDLE, 0, stream.fence));
         }
+        auto t6 = d->host_timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
 
         checkVK(vkWaitForFences(dev, 1, &stream.fence, VK_TRUE, UINT64_MAX));
+        auto t7 = d->host_timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
         if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d fenced\n", n);
 
         // hand the cache slots back only after the aggregation has completed:
@@ -1032,6 +1069,26 @@ static const VSFrame *VS_CC BM3DGetFrame(
 
         d->pool.give_back(std::move(stream));
 
+        if (d->host_timing) {
+            auto t8 = std::chrono::steady_clock::now();
+            const auto us = [](auto a, auto b) {
+                return static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+            };
+            d->ht_take_ns += us(t0, t1);
+            d->ht_acquire_ns += us(t1, t2);
+            d->ht_upload_ns += us(t2, t3);
+            d->ht_record_ns += us(t3, t4);
+            d->ht_srcwait_ns += us(t4, t5);
+            d->ht_agg_ns += us(t5, t6);
+            d->ht_fence_ns += us(t6, t7);
+            // download runs after the fence: t7 -> t8 covers it (and the
+            // give_back above)
+            d->ht_down_ns += us(t7, t8);
+            d->ht_total_ns += us(t0, t8);
+            d->ht_n.fetch_add(1, std::memory_order_relaxed);
+        }
+
         return dst;
     }
 
@@ -1056,6 +1113,9 @@ static void VS_CC BM3DCreate(
     VSCore *core, const VSAPI *vsapi) {
 
     auto d { std::make_unique<BM3DData>() };
+
+    // Opt-in host-path probe: the default path records no clocks.
+    d->host_timing = getenv("VSFEEL_BM3D_TIMING") != nullptr;
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
@@ -1410,7 +1470,10 @@ static void VS_CC BM3DCreate(
     d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
     d->pool.reserve(d->num_streams);
 
-    uint32_t num_queues = std::min(d->num_streams, static_cast<int>(d->device->queue_count));
+    // Queue sharing is swept independently of the stream count (see
+    // resolve_queue_cap): override with VSFEEL_BM3D_QUEUES=N.
+    uint32_t num_queues = resolve_queue_cap(d->num_streams,
+        d->device->queue_count, "VSFEEL_BM3D_QUEUES", UINT32_MAX);
 
     for (int i = 0; i < d->num_streams; ++i) {
         Bm3dStream stream;

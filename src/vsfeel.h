@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -45,6 +46,26 @@ struct ticket_semaphore {
 };
 
 const char * vk_result_string(VkResult result);
+
+// Queue sharing: cap how many of the device's compute queues the filter's
+// streams are spread over. With one stream per queue each queue drains while
+// its worker does post-fence CPU work before the next submit, leaving idle
+// bubbles; sharing a queue across streams keeps a next command buffer queued.
+// The default cap is a filter-specific starting point; `env_name` (e.g.
+// "VSFEEL_GAUSS_QUEUES") overrides it as a durable tuning knob. The result is
+// always clamped to [1, min(num_streams, queue_count)].
+inline uint32_t resolve_queue_cap(int num_streams, uint32_t queue_count,
+                                  const char * env_name, uint32_t default_cap) {
+    const uint32_t streams = static_cast<uint32_t>(std::max(num_streams, 1));
+    uint32_t cap = std::min({ streams, queue_count, default_cap });
+    if (const char * qn = std::getenv(env_name)) {
+        const int q = atoi(qn);
+        if (q > 0) {
+            cap = std::min({ streams, queue_count, static_cast<uint32_t>(q) });
+        }
+    }
+    return std::max(cap, 1u);
+}
 
 // ---------------------------------------------------------------------------
 // Shared, reference-counted VkDevice (one per physical device)

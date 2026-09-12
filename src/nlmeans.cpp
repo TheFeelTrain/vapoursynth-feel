@@ -1458,8 +1458,10 @@ static void VS_CC NLMeansCreate(
     d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
     d->pool.reserve(d->num_streams);
 
-    uint32_t num_queues = std::min(
-        d->num_streams, static_cast<int>(d->device->queue_count));
+    // Queue sharing is swept independently of the stream count (see
+    // resolve_queue_cap): override with VSFEEL_NLMEANS_QUEUES=N.
+    uint32_t num_queues = resolve_queue_cap(d->num_streams,
+        d->device->queue_count, "VSFEEL_NLMEANS_QUEUES", UINT32_MAX);
 
     const int clips = d->has_ref ? 2 : 1;
     const VkDeviceSize slot_bytes_v =
