@@ -56,30 +56,80 @@ constexpr int MARGIN_H = 12;
 constexpr int MARGIN_V = 4;
 constexpr int MAX_PLANES = 3;
 
-// Out-of-place transpose with 64x64 blocking (both sides stay cache-friendly:
-// every tile-row segment is contiguous on read and write):
-// dst[x * dstride + y] = src[y * sstride + x], x in [0,W), y in [0,H).
-// Strides and dims are in ELEMENTS; elem is the byte size.
+// 16x16 byte transpose in place (SSE2, four unpack stages: 8/16/32/64-bit).
+static inline void transpose16x16_u8(__m128i * r) {
+    __m128i t[16];
+    for (int i = 0; i < 16; i += 2) {
+        t[i]     = _mm_unpacklo_epi8(r[i], r[i + 1]);
+        t[i + 1] = _mm_unpackhi_epi8(r[i], r[i + 1]);
+    }
+    for (int i = 0; i < 16; i += 4) {
+        const __m128i u0 = _mm_unpacklo_epi16(t[i], t[i + 2]);
+        const __m128i u1 = _mm_unpackhi_epi16(t[i], t[i + 2]);
+        const __m128i u2 = _mm_unpacklo_epi16(t[i + 1], t[i + 3]);
+        const __m128i u3 = _mm_unpackhi_epi16(t[i + 1], t[i + 3]);
+        t[i] = u0; t[i + 1] = u1; t[i + 2] = u2; t[i + 3] = u3;
+    }
+    for (int i = 0; i < 16; i += 8) {
+        const __m128i u0 = _mm_unpacklo_epi32(t[i], t[i + 4]);
+        const __m128i u1 = _mm_unpackhi_epi32(t[i], t[i + 4]);
+        const __m128i u2 = _mm_unpacklo_epi32(t[i + 1], t[i + 5]);
+        const __m128i u3 = _mm_unpackhi_epi32(t[i + 1], t[i + 5]);
+        const __m128i u4 = _mm_unpacklo_epi32(t[i + 2], t[i + 6]);
+        const __m128i u5 = _mm_unpackhi_epi32(t[i + 2], t[i + 6]);
+        const __m128i u6 = _mm_unpacklo_epi32(t[i + 3], t[i + 7]);
+        const __m128i u7 = _mm_unpackhi_epi32(t[i + 3], t[i + 7]);
+        t[i] = u0; t[i + 1] = u1; t[i + 2] = u2; t[i + 3] = u3;
+        t[i + 4] = u4; t[i + 5] = u5; t[i + 6] = u6; t[i + 7] = u7;
+    }
+    for (int i = 0; i < 8; ++i) {
+        r[2 * i]     = _mm_unpacklo_epi64(t[i], t[i + 8]);
+        r[2 * i + 1] = _mm_unpackhi_epi64(t[i], t[i + 8]);
+    }
+}
+
+// Out-of-place transpose: dst[x * dstride + y] = src[y * sstride + x], x in
+// [0,W), y in [0,H). Strides and dims are in ELEMENTS; elem is the byte size.
+// Only the 1-byte case (EEDI3H's transposed mask) is on a hot path: it runs
+// 16x16 byte-transpose tiles, so both the load and the store are contiguous.
+// Wider elements take a scalar fallback (correct, and unused in practice).
 static void transpose_plane(const uint8_t * src, ptrdiff_t sstride_elems,
                             const int W, const int H,
                             uint8_t * dst, ptrdiff_t dstride_elems,
                             const int elem) {
-    constexpr int TILE = 64;
-    const size_t seg_bytes = static_cast<size_t>(TILE) * elem;
-    for (int x0 = 0; x0 < W; x0 += TILE) {
-        const int xn = std::min(TILE, W - x0);
-        for (int y0 = 0; y0 < H; y0 += TILE) {
-            const int yn = std::min(TILE, H - y0);
-            for (int y = 0; y < yn; ++y) {
-                const uint8_t * s = src + (static_cast<int64_t>(y0 + y) * sstride_elems + x0) * elem;
-                uint8_t * d = dst + (static_cast<int64_t>(x0) * dstride_elems + y0 + y) * elem;
-                if (xn == TILE) {
-                    copy_stream_out(d, s, seg_bytes);
-                } else {
-                    std::memcpy(d, s, static_cast<size_t>(xn) * elem);
+    if (elem != 1) {
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                std::memcpy(dst + (static_cast<ptrdiff_t>(x) * dstride_elems + y) * elem,
+                            src + (static_cast<ptrdiff_t>(y) * sstride_elems + x) * elem,
+                            static_cast<size_t>(elem));
+            }
+        }
+        return;
+    }
+    for (int x0 = 0; x0 < W; x0 += 16) {
+        const int xn = std::min(16, W - x0);
+        for (int y0 = 0; y0 < H; y0 += 16) {
+            const int yn = std::min(16, H - y0);
+            if (xn == 16 && yn == 16) {
+                __m128i r[16];
+                for (int y = 0; y < 16; ++y) {
+                    r[y] = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+                        src + static_cast<size_t>(y0 + y) * sstride_elems + x0));
+                }
+                transpose16x16_u8(r);
+                for (int x = 0; x < 16; ++x) {
+                    _mm_storeu_si128(reinterpret_cast<__m128i *>(
+                        dst + static_cast<size_t>(x0 + x) * dstride_elems + y0), r[x]);
+                }
+            } else {
+                for (int y = 0; y < yn; ++y) {
+                    for (int x = 0; x < xn; ++x) {
+                        dst[static_cast<size_t>(x0 + x) * dstride_elems + y0 + y] =
+                            src[static_cast<size_t>(y0 + y) * sstride_elems + x0 + x];
+                    }
                 }
             }
-            (void)yn;
         }
     }
 }
@@ -115,6 +165,215 @@ static inline void frame_copy_stream_read(void * dst, const void * src,
     }
 }
 
+// ---------------------------------------------------------------------------
+// EEDI3H host gathers.
+//
+// The GPU kernels are orientation-agnostic, so EEDI3H simply feeds them the
+// transposed plane: the host reads the source ROWS and writes the selected
+// column parity compactly (K), and one GPU pass (ENTRY_XPOSE) transposes K into
+// the pad builder's own layout. Every access stays a contiguous stream: the
+// selected source columns are read at line granularity and the K rows are
+// written whole.
+// ---------------------------------------------------------------------------
+
+// The even u16/f32 lanes of two 256-bit vectors, packed into one (16 or 8
+// elements). Selecting every other source column is exactly what the parity
+// gathers need, and it keeps the read side a full-width linear stream.
+static inline __m256i deint_even_u16(const __m256i a, const __m256i b) {
+    const __m256i m = _mm256_setr_epi8(
+        0, 1, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1,
+        0, 1, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m256i sa = _mm256_permute4x64_epi64(_mm256_shuffle_epi8(a, m), 0x08);
+    const __m256i sb = _mm256_permute4x64_epi64(_mm256_shuffle_epi8(b, m), 0x08);
+    return _mm256_set_m128i(_mm256_castsi256_si128(sb), _mm256_castsi256_si128(sa));
+}
+
+static inline __m256i deint_even_f32(const __m256i a, const __m256i b) {
+    const __m256i s = _mm256_castps_si256(_mm256_shuffle_ps(
+        _mm256_castsi256_ps(a), _mm256_castsi256_ps(b), 0x88));
+    return _mm256_permute4x64_epi64(s, 0xD8);
+}
+
+// One deinterleaved row: d[k] = s[2*k], k in [0,rows). `nt` streams the stores
+// (required for the uncached host-visible VRAM the ReBAR upload targets; the
+// 32-byte-aligned body is what makes that worth doing).
+static inline void deint_row_u16(const uint16_t * s, uint16_t * d, int rows,
+                                 int simd_lim, bool nt) {
+    int k = 0;
+    if (nt) {
+        const int head = std::min<int>(
+            rows, static_cast<int>(((32 - (reinterpret_cast<uintptr_t>(d) & 31)) & 31) / 2));
+        for (; k < head; ++k) {
+            d[k] = s[2 * k];
+        }
+    }
+    for (; k + 16 <= simd_lim; k += 16) {
+        const __m256i v = deint_even_u16(
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + 2 * k)),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + 2 * k + 16)));
+        if (nt && (k & 15) == 0) {
+            _mm256_stream_si256(reinterpret_cast<__m256i *>(d + k), v);
+        } else {
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(d + k), v);
+        }
+    }
+    for (; k < rows; ++k) {
+        d[k] = s[2 * k];
+    }
+}
+
+static inline void deint_row_f32(const float * s, float * d, int rows,
+                                 int simd_lim, bool nt) {
+    int k = 0;
+    if (nt) {
+        const int head = std::min<int>(
+            rows, static_cast<int>(((32 - (reinterpret_cast<uintptr_t>(d) & 31)) & 31) / 4));
+        for (; k < head; ++k) {
+            d[k] = s[2 * k];
+        }
+    }
+    for (; k + 8 <= simd_lim; k += 8) {
+        const __m256i v = deint_even_f32(
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + 2 * k)),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + 2 * k + 8)));
+        if (nt && (k & 7) == 0) {
+            _mm256_stream_ps(d + k, _mm256_castsi256_ps(v));
+        } else {
+            _mm256_storeu_ps(d + k, _mm256_castsi256_ps(v));
+        }
+    }
+    for (; k < rows; ++k) {
+        d[k] = s[2 * k];
+    }
+}
+
+// dst[y*rows + k] = src[y*src_stride + first + step*k] for y in [0,H).
+// step == 2 is the column-parity deinterleave; step == 1 (dh: every source
+// column is kept) degenerates to a plain row copy.
+static void gather_columns(const uint8_t * src, ptrdiff_t src_stride,
+                           const int H, uint8_t * dst, const int rows,
+                           const int step, const int first, const int elem,
+                           const bool nt) {
+    const size_t dst_row = static_cast<size_t>(rows) * elem;
+    // Selecting every other column makes the vector loads read one element past
+    // the last selected pair, so an odd `first` has to stop one block earlier.
+    const int simd_lim = rows - (first ? 1 : 0);
+    if (step == 1) {
+        for (int y = 0; y < H; ++y) {
+            frame_copy_out(dst + static_cast<size_t>(y) * dst_row,
+                           src + static_cast<size_t>(y) * src_stride,
+                           dst_row, nt);
+        }
+    } else if (elem == 2) {
+        for (int y = 0; y < H; ++y) {
+            const uint16_t * s = reinterpret_cast<const uint16_t *>(
+                src + static_cast<size_t>(y) * src_stride) + first;
+            deint_row_u16(s, reinterpret_cast<uint16_t *>(dst + static_cast<size_t>(y) * dst_row),
+                          rows, simd_lim, nt);
+        }
+    } else {
+        for (int y = 0; y < H; ++y) {
+            const float * s = reinterpret_cast<const float *>(
+                src + static_cast<size_t>(y) * src_stride) + first;
+            deint_row_f32(s, reinterpret_cast<float *>(dst + static_cast<size_t>(y) * dst_row),
+                          rows, simd_lim, nt);
+        }
+    }
+}
+
+// Nonzero-byte predicate (0xFF/0x00), used for the reference's native Gray8
+// mask form.
+static inline __m128i nz_u8_mask(const __m128i v) {
+    const __m128i zero = _mm_setzero_si128();
+    return _mm_andnot_si128(_mm_cmpeq_epi8(v, zero), _mm_set1_epi8(static_cast<char>(0xFF)));
+}
+
+// The even bytes of two 16-byte vectors, packed into one.
+static inline __m128i deint_even_u8(const __m128i a, const __m128i b) {
+    const __m128i m = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14,
+                                    -1, -1, -1, -1, -1, -1, -1, -1);
+    return _mm_unpacklo_epi64(_mm_shuffle_epi8(a, m), _mm_shuffle_epi8(b, m));
+}
+
+// Mask gather: dst[y*rows + k] = predicate(src[y*src_stride + first + step*k])
+// as one byte per element (0xFF/0x00 for the vector path, 0/1 for the tail).
+// The predicate matches build_bmask_row_scalar's nz() exactly (u16 >= 129,
+// f32 > 0.5/255, byte != 0) so it is the same boolean the vertical path builds
+// from the mask's native representation; the GPU never sees this matrix.
+// step == 2 is the column-parity deinterleave, step == 1 (dh) keeps every
+// column.
+static void gather_mask_u8(const uint8_t * src, ptrdiff_t src_stride,
+                           const int H, uint8_t * dst, const int rows,
+                           const int first, const int step, const int bits) {
+    const __m256i bias = _mm256_set1_epi16(static_cast<short>(0x8000));
+    const __m256i thr16 = _mm256_set1_epi16(static_cast<short>(128 - 32768));
+    for (int y = 0; y < H; ++y) {
+        const uint8_t * const row = src + static_cast<size_t>(y) * src_stride;
+        uint8_t * const d = dst + static_cast<size_t>(y) * rows;
+        int k = 0;
+        if (bits == 16) {
+            const uint16_t * s = reinterpret_cast<const uint16_t *>(row) + first;
+            const int lim = rows - (first ? 1 : 0);
+            for (; k + 16 <= lim; k += 16) {
+                // xor bias turns the unsigned >= 129 test into a signed compare
+                // (cmpgt is strict: 128-32768 as the biased constant <=> v >= 129).
+                __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + step * k));
+                __m256i b = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(s + step * k + 16));
+                const __m256i v = (step == 2) ? deint_even_u16(a, b) : a;
+                const __m256i cmp = _mm256_cmpgt_epi16(_mm256_xor_si256(v, bias), thr16);
+                // signed pack: cmp is all-ones (true) or zero, so the bytes
+                // come out 0xFF/0x00 -- what build_bmask_row's byte path tests.
+                const __m256i packed = _mm256_packs_epi16(cmp, cmp);
+                const __m128i bytes = _mm256_castsi256_si128(
+                    _mm256_permute4x64_epi64(packed, 0x08));
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(d + k), bytes);
+            }
+            for (; k < rows; ++k) {
+                d[k] = s[step * k] >= 129u ? 0xFF : 0x00;
+            }
+        } else if (bits == 32) {
+            const float * s = reinterpret_cast<const float *>(row) + first;
+            const __m256i thr = _mm256_castps_si256(_mm256_set1_ps(0.5f / 255.0f));
+            const int lim = rows - (first ? 1 : 0);
+            for (; k + 8 <= lim; k += 8) {
+                __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + step * k));
+                __m256i b = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(s + step * k + 8));
+                const __m256i v = (step == 2) ? deint_even_f32(a, b) : a;
+                const __m256i cmp = _mm256_castps_si256(_mm256_cmp_ps(
+                    _mm256_castsi256_ps(v), _mm256_castsi256_ps(thr), _CMP_GT_OQ));
+                const uint32_t mask = static_cast<uint32_t>(_mm256_movemask_ps(
+                    _mm256_castsi256_ps(cmp)));
+                uint64_t bytes = 0;
+                for (int i = 0; i < 8; ++i) {
+                    bytes |= static_cast<uint64_t>((mask >> i) & 1u) << (i * 8);
+                }
+                std::memcpy(d + k, &bytes, 8);
+            }
+            for (; k < rows; ++k) {
+                d[k] = s[step * k] > 0.5f / 255.0f ? 0xFF : 0x00;
+            }
+        } else {
+            // Gray8 (or a mask the reference converted to Gray8): the exact
+            // predicate is "byte != 0".
+            const uint8_t * s = row + first;
+            const int lim = rows - (first ? 1 : 0);
+            for (; k + 16 <= lim; k += 16) {
+                const __m128i a = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i *>(s + step * k));
+                const __m128i b = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i *>(s + step * k + 16));
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(d + k),
+                                 nz_u8_mask(step == 2 ? deint_even_u8(a, b) : a));
+            }
+            for (; k < rows; ++k) {
+                d[k] = s[step * k] != 0 ? 0xFF : 0x00;
+            }
+        }
+    }
+}
+
 // Host-side pad upload is always float (see eedi3.comp header): u16 native
 // values are exact integers < 2^24 so float cost/interp math is bit-exact.
 enum Binding : uint32_t {
@@ -128,7 +387,14 @@ enum Binding : uint32_t {
     B_VOUT = 7,       // vcheck output rows (io type); vcheck reads taps from
                       // B_DST (untouched) and writes the vchecked row here
     B_RAW = 8,        // ENTRY_PAD's extra view of pad_dev (built pad out)
-    BIND_COUNT = 9
+    B_PADSRC = 9,     // ENTRY_PAD's source plane: the raw upload (vertical) or
+                      // the GPU-transposed R'/B' in pad_dev (EEDI3H). The pad
+                      // builder always reads binding 9, so switching the layout
+                      // never needs a second pad-kernel variant.
+    B_OUT = 10,       // ENTRY_COMPOSE's assembled output plane (staging); a
+                      // separate binding from vout (b7) so vout can sit in
+                      // device-local memory without dragging the output there.
+    BIND_COUNT = 11
 };
 
 // Compile-time max plane width for the shared-memory (LDS) vcheck variant.
@@ -137,8 +403,15 @@ enum Binding : uint32_t {
 static constexpr int MAXW_LDS = 4096;
 
 struct PlaneConfig {
-    int width {};                     // output plane width (pixels)
-    int height {};                    // output plane height (pixels)
+    int width {};                     // KERNEL plane width: the row kernel's
+                                      // WIDTH spec constant and the EEDI3H
+                                      // transposed row length
+    int height {};                    // output plane height (vertical) / kernel
+                                      // plane height (EEDI3H)
+    int src_w {};                     // source plane dims (gather geometry)
+    int src_h {};
+    int out_w {};                     // output (frame order) plane dims
+    int out_h {};
     int rows {};                      // number of interp rows == height / 2
     int pad_stride {};                // pad elements per padded row
     int pad_height {};                // padded rows == height + 2*MARGIN_V
@@ -149,6 +422,8 @@ struct PlaneConfig {
     VkPipeline pad_pipeline {};       // mirror-pad builder (always)
     VkPipeline vcopy_pipeline {};     // empty-row vcheck copy (vcheck+mclip)
     VkPipeline blit_pipeline {};      // direct-to-frame row spread (import path)
+    VkPipeline xpose_pipeline {};     // compact upload -> R'/B' (EEDI3H only)
+    VkPipeline compose_pipeline {};   // R' + vout -> output plane (EEDI3H only)
     // true when vcheck_pipeline is the shared-memory d2p variant: it carries
     // every row (no empty-row skip) and therefore needs no vcopy dispatch.
     bool vcheck_lds {};
@@ -162,6 +437,12 @@ struct PlaneConfig {
     VkDeviceSize sclip_bytes {};
     VkDeviceSize dl_offset {};        // interp row download (device -> host)
     VkDeviceSize dl_bytes {};
+    // EEDI3H staging tail: the composed output plane and the CPU mask scratch
+    // (deinterleaved rows + their transpose; never touched by the GPU).
+    VkDeviceSize out_offset {};       // composed output plane (io elements)
+    VkDeviceSize out_bytes {};
+    VkDeviceSize ms_offset {};        // mask scratch, bytes (2 * rows * width)
+    VkDeviceSize ms_bytes {};
 
     // device-mirror (pad_dev) regions: 1:1 copy of the upload [0,upload_total)
     // plus kernel-built regions (never staged)
@@ -169,6 +450,12 @@ struct PlaneConfig {
     VkDeviceSize built_bytes {};
     VkDeviceSize bits_offset {};      // packed dilation bits (bmask kernel out)
     VkDeviceSize bits_bytes {};
+    // EEDI3H: transposed kept rows R' (pad kernel source) and transposed sclip
+    // B' (vcheck source), both written by the xpose kernel in pad_dev.
+    VkDeviceSize rt_offset {};        // R' (pad elements)
+    VkDeviceSize rt_bytes {};
+    VkDeviceSize rtS_offset {};       // B' (io elements)
+    VkDeviceSize rtS_bytes {};
 
     // device-local buffer regions, byte offsets (offsets into d->dev_buf)
     VkDeviceSize dst_offset {};       // interp rows (io type)
@@ -221,6 +508,14 @@ struct Eedi3Data {
 
     int field {}, nrad { 2 }, mdis { 20 }, vcheck { 2 };
     bool dh {};
+    // EEDI3H: run the whole pipeline on the TRANSPOSED plane. The EEDI3
+    // kernels are orientation-agnostic (the pad builder, row kernel, vcheck and
+    // vcopy all just see a padded plane), so nothing in the kernels changes:
+    // the host deinterleaves the kept source columns into K, one GPU transpose
+    // (ENTRY_XPOSE) puts them in the pad builder's own layout, and one GPU pass
+    // (ENTRY_COMPOSE) reassembles the output plane. This removes the four
+    // std.Transpose passes that used to be the entire EEDI3H penalty.
+    bool horiz { false };
     // Which copies use non-temporal load/store (bit0 = upload gathers, bit1 =
     // the final blit). Swept with VSFEEL_EEDI3_COPY; the default is measured.
     int copy_mode { 3 };
@@ -299,19 +594,27 @@ struct Eedi3Data {
     VkShaderModule pad_module {};
     VkShaderModule vcopy_module {};
     VkShaderModule blit_module {};    // direct-to-frame row spread (import path)
+    VkShaderModule xpose_module {};   // EEDI3H upload transpose (K -> R'/B')
+    VkShaderModule compose_module {}; // EEDI3H output assembly (R' + vout)
     VkDeviceSize upload_total {}, download_total {}, dev_total {};
+    // EEDI3H staging tail (composed plane + CPU mask scratch), after the
+    // upload and download regions.
+    VkDeviceSize scratch_total {};
     std::array<PlaneConfig, MAX_PLANES> planes {};
     FramePool<Eedi3Resource> pool;
 
     // module/pipeline cache keyed by width (values owned by the pipelines
-    // map): [row, vcheck, pad, vcopy, blit]
-    std::vector<std::pair<WidthKey, std::array<VkPipeline, 6>>> width_pipes {};
+    // map): [row, vcheck, pad, vcopy, blit, _, xpose, compose]
+    std::vector<std::pair<WidthKey, std::array<VkPipeline, 8>>> width_pipes {};
     // vout lives in dev_buf whenever the direct-to-frame path is compiled in
     // (the transfer needs a device-local source), which also makes the
     // pre-existing VOUTDEV layout the fallback for frames that cannot be
     // imported. Kept consistent between descriptor creation and recording.
+    // EEDI3H sets vout_dev by default: its only consumer is ENTRY_COMPOSE, and
+    // reading vout back over PCIe from the staging download costs ~10% of the
+    // frame. The assembled plane has its own binding, so it is unaffected.
     bool vout_in_dev() const {
-        return vout_dev || (dst_host && device && device->host_import);
+        return vout_dev || (!horiz && dst_host && device && device->host_import);
     }
 
     ~Eedi3Data() {
@@ -351,10 +654,10 @@ struct Eedi3Data {
             destroy_common(dev, resource);
         }
 
-        VkPipeline destroyed[6 * 3] {};
+        VkPipeline destroyed[8 * 3] {};
         int nd = 0;
         for (auto & [key, quad] : width_pipes) {
-            for (int i = 0; i < 6; ++i) {
+            for (int i = 0; i < 8; ++i) {
                 if (!quad[i]) {
                     continue;
                 }
@@ -397,6 +700,12 @@ struct Eedi3Data {
         }
         if (blit_module) {
             vkDestroyShaderModule(dev, blit_module, nullptr);
+        }
+        if (xpose_module) {
+            vkDestroyShaderModule(dev, xpose_module, nullptr);
+        }
+        if (compose_module) {
+            vkDestroyShaderModule(dev, compose_module, nullptr);
         }
 
         release_device(device);
@@ -910,8 +1219,11 @@ struct PushConstants {
     // ENTRY_PAD only: skip pad rows of parity `field` (never read; see the pad
     // kernel). 1 = skip (default), 0 = build the whole plane.
     int32_t pad_skip_parity;
+    // ENTRY_COMPOSE only: io-element base of the assembled output plane in the
+    // staging download region (binding 10; vout is binding 7).
+    int32_t out_base;
 };
-static_assert(sizeof(PushConstants) == 16 * 4 + 8 * 4, "push constants size");
+static_assert(sizeof(PushConstants) == 17 * 4 + 8 * 4, "push constants size");
 
 // base offsets in ELEMENTS for each binding of a plane's regions (element
 // type per binding; the descriptors range the whole buffer so the shader
@@ -980,22 +1292,64 @@ static std::optional<std::string> record_command_buffer(
         }
         const auto & cfg = d.planes[plane];
 
+        // The pad kernel reads its source at binding 9: the host-uploaded raw
+        // kept rows in the ReBAR/non-ReBAR upload buffer vertically, or the
+        // device-local R'/B' regions EEDI3H produces. Under ReBAR that needs
+        // the pad kernel's own set (the row kernel reads the BUILT pad from
+        // pad_dev at the same binding index as the row kernel's pad).
+        VkDescriptorSet const pad_set = resource.desc_set_pad
+            ? resource.desc_set_pad : resource.desc_set;
+
+        if (d.horiz) {
+            // ENTRY_XPOSE: the host deinterleaved the source columns into K
+            // (binding 0, `rows` elements per row, `width` rows); transpose it
+            // into R' (binding 9, pad_dev) so the pad builder sees exactly the
+            // layout it has always read. Same transpose for the sclip K -> B'
+            // when the vcheck needs one.
+            auto xpose = [&](VkDeviceSize src_off, VkDeviceSize dst_off) {
+                PushConstants xpc {};
+                xpc.raw_base = static_cast<int32_t>(src_off / pad_elem);
+                xpc.pad_base = static_cast<int32_t>(dst_off / pad_elem);
+                xpc.rows = cfg.rows;
+                vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                  cfg.xpose_pipeline);
+                vkCmdBindDescriptorSets(
+                    resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    d.pipeline_layout, 0, 1, &pad_set, 0, nullptr);
+                vkCmdPushConstants(
+                    resource.cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                    0, sizeof(xpc), &xpc);
+                const uint32_t gx = (static_cast<uint32_t>(cfg.rows) + 15) / 16;
+                const uint32_t gy = (static_cast<uint32_t>(cfg.width) + 15) / 16;
+                vkCmdDispatch(resource.cmd, gx, gy, 1);
+            };
+            xpose(cfg.raw_offset, cfg.rt_offset);
+            if (cfg.rtS_bytes > 0) {
+                xpose(cfg.sclip_offset, cfg.rtS_offset);
+            }
+            VkMemoryBarrier xbarrier {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+            };
+            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &xbarrier,
+                0, nullptr, 0, nullptr);
+        }
+
         PushConstants ppc {};
         ppc.pad_base = static_cast<int32_t>(cfg.built_offset / pad_elem);
         ppc.pad_stride = cfg.pad_stride;
         ppc.pad_height = cfg.pad_height;
         ppc.field = field;
         ppc.rows = cfg.rows;
-        ppc.raw_base = static_cast<int32_t>(cfg.raw_offset / pad_elem);
+        ppc.raw_base = static_cast<int32_t>(
+            (d.horiz ? cfg.rt_offset : cfg.raw_offset) / pad_elem);
         ppc.pad_skip_parity = d.pad_skip_parity ? 1 : 0;
 
         // pad builder: one thread per padded element
         vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.pad_pipeline);
-        // The pad kernel reads the raw upload at binding 0; with the ReBAR
-        // path that is up_dev and needs its own set (the row kernel reads the
-        // built pad from pad_dev at the same binding index).
-        VkDescriptorSet const pad_set = resource.desc_set_pad
-            ? resource.desc_set_pad : resource.desc_set;
         vkCmdBindDescriptorSets(
             resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             d.pipeline_layout, 0, 1, &pad_set, 0, nullptr);
@@ -1035,7 +1389,11 @@ static std::optional<std::string> record_command_buffer(
             .pbt_base = static_cast<int32_t>(cfg.pbt_offset),
             .dmap_base = static_cast<int32_t>(cfg.dmap_offset),
             .bmask_base = static_cast<int32_t>(cfg.bits_offset / sizeof(uint32_t)),
-            .sclip_base = static_cast<int32_t>(cfg.sclip_offset / elem),
+            // EEDI3H keeps the vcheck's sclip in the GPU-transposed B' region
+            // (binding 5 points at pad_dev for that mode); vertically it is the
+            // host-gathered compact sclip in the upload mirror.
+            .sclip_base = static_cast<int32_t>(
+                (d.horiz ? cfg.rtS_offset : cfg.sclip_offset) / elem),
             .cint_base = static_cast<int32_t>(cfg.cint_offset / elem),
             // vout either lands DIRECTLY in the staging download region (b7
             // views staging: no D2H copy, but GPU stores go to system RAM) or
@@ -1130,6 +1488,59 @@ static std::optional<std::string> record_command_buffer(
     //   vout_dev     -> vout (dev_buf) is copied back to staging as one region;
     //   staging vout -> the vcheck kernels already wrote staging: nothing here.
     // Without vcheck the row kernel's dst (dev_buf) is the transfer source.
+    // EEDI3H: the interp values are rows of the TRANSPOSED plane, so they are
+    // reassembled into the frame-order output plane by ENTRY_COMPOSE (one
+    // dispatch per plane, into the staging output region) and the CPU blit is
+    // then a plain row copy. Nothing is downloaded tight and nothing is
+    // imported, so none of the tail shapes below apply.
+    if (d.horiz) {
+        VkMemoryBarrier mem_barrier {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+        };
+        vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+        for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
+            if (!d.process[plane]) {
+                continue;
+            }
+            const auto & cfg = d.planes[plane];
+            PushConstants cpc {};
+            // b9 = R' (device-local), b7 = vout, b10 = the assembled plane
+            // (the staging download). Without a vcheck the interp values are
+            // the row kernel's dst (b1) instead -- a spec constant selects it.
+            cpc.pad_base = static_cast<int32_t>(cfg.rt_offset / elem);
+            // Same rule as the row/vcheck push constants: vout is either the
+            // device-local region or the staging download, and binding 7 was
+            // created for exactly one of them.
+            cpc.vout_base = static_cast<int32_t>(d.vout_in_dev()
+                ? (cfg.vout_offset / elem)
+                : ((d.upload_total + cfg.dl_offset) / elem));
+            cpc.dst_base = static_cast<int32_t>(cfg.dst_offset / elem);
+            cpc.out_base = static_cast<int32_t>(
+                (d.upload_total + d.download_total + cfg.out_offset) / elem);
+            cpc.field = field;
+            cpc.rows = cfg.rows;
+            vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              cfg.compose_pipeline);
+            vkCmdBindDescriptorSets(
+                resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
+            vkCmdPushConstants(
+                resource.cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                0, sizeof(cpc), &cpc);
+            const uint32_t gx = (static_cast<uint32_t>(cfg.rows) + 15) / 16;
+            const uint32_t gy = (static_cast<uint32_t>(cfg.width) + 15) / 16;
+            vkCmdDispatch(resource.cmd, gx, gy, 1);
+        }
+        if (vkEndCommandBuffer(resource.cmd) != VK_SUCCESS) {
+            return "vkEndCommandBuffer failed";
+        }
+        return std::nullopt;
+    }
+
     bool any_direct = false, any_d2h = false;
     for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
         if (!d.process[plane]) {
@@ -1241,10 +1652,11 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         (!d->dh && !d->process[1]) ? src : nullptr,
         (!d->dh && !d->process[2]) ? src : nullptr
     };
-    // dh doubles the output height (width is never changed by EEDI3)
-    const int out_height = d->dh ? d->vi->height * 2 : d->vi->height;
+    // dh doubles the interpolated axis: height vertically, width in EEDI3H.
+    const int out_height = (d->dh && !d->horiz) ? d->vi->height * 2 : d->vi->height;
+    const int out_width = (d->dh && d->horiz) ? d->vi->width * 2 : d->vi->width;
     VSFrame * dst = vsapi->newVideoFrame2(
-        &d->vi->format, d->vi->width, out_height, fr, pl, src, core);
+        &d->vi->format, out_width, out_height, fr, pl, src, core);
 
     auto resource = d->pool.take();
 
@@ -1380,16 +1792,77 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         const ptrdiff_t src_stride = vsapi->getStride(src, plane);
         const size_t raw_row_bytes = static_cast<size_t>(cfg.width) * pad_elem_bytes(d->bits);
         uint8_t * rawp = (d->raw_stage ? staging : upload) + cfg.raw_offset;
+        auto dstp = vsapi->getWritePtr(dst, plane);
+        const ptrdiff_t dst_stride = vsapi->getStride(dst, plane);
+        const bool nt_raw = (d->copy_mode & 1) != 0 && !d->raw_stage;
+        const bool nt_kept = (d->copy_mode & 2) != 0;
+
+        if (d->horiz) {
+            // EEDI3H: the upload is the transposed plane's kept rows, i.e. the
+            // source COLUMNS of the kept parity read out of the source ROWS.
+            // dh keeps every source column (the transposed height doubles, so
+            // every input column survives as a kept row).
+            if (!d->skip_raw) {
+                gather_columns(srcp, src_stride, cfg.src_h, rawp, cfg.rows,
+                               d->dh ? 1 : 2, d->dh ? 0 : off,
+                               d->elem_bytes, nt_raw);
+            }
+            if (hbench) { h_tRawEnd = std::chrono::steady_clock::now(); }
+
+            if (d->mclip_node && mcp) {
+                // The row kernel needs, for transposed interp row r, the mask
+                // dilated along the transposed row (the source COLUMN r): build
+                // the mask's transposed byte image and run the existing
+                // build_bmask_row on its rows -- identical math to the vertical
+                // path, just applied to the transposed plane.
+                const uint8_t * maskp = vsapi->getReadPtr(mcp, 0);
+                const ptrdiff_t mask_stride = vsapi->getStride(mcp, 0);
+                uint8_t * const ms = staging + d->upload_total + d->download_total + cfg.ms_offset;
+                uint8_t * const m2 = ms + static_cast<size_t>(cfg.rows) * cfg.width;
+                // The mask's own representation (the reference's native forms
+                // and the Gray8 fallback), not the clip's depth.
+                const int mbits = d->mclip_native16 ? 16
+                    : (d->mclip_native32 ? 32 : 8);
+                gather_mask_u8(maskp, mask_stride, cfg.src_h, ms, cfg.rows,
+                               d->dh ? 0 : field, d->dh ? 1 : 2, mbits);
+                transpose_plane(ms, cfg.rows, cfg.rows, cfg.width, m2,
+                                cfg.width, 1);
+                // The packed bits are built by ordinary (cached) stores, which
+                // are catastrophic into the uncached host-visible VRAM the
+                // ReBAR upload uses: keep them in the cached staging mirror and
+                // let the row kernel read them from there (binding 4).
+                uint8_t * bm = staging + cfg.bits_offset;
+                const int nwords = (cfg.width + 31) / 32;
+                std::vector<uint64_t> bmask_scratch(
+                    2 * static_cast<size_t>((cfg.width + d->mdis + 63) / 64));
+                for (int r = 0; r < cfg.rows; ++r) {
+                    build_bmask_row(m2 + static_cast<size_t>(r) * cfg.width,
+                                    nullptr, nullptr,
+                                    reinterpret_cast<uint32_t *>(
+                                        bm + static_cast<size_t>(r) * nwords * 4),
+                                    cfg.width, d->mdis, bmask_scratch.data());
+                }
+            }
+            if (hbench) { h_tMaskEnd = std::chrono::steady_clock::now(); }
+
+            if (d->vcheck > 0 && d->sclip_node && scp && !d->skip_sclip) {
+                // The vcheck reads the transposed sclip's interp rows, i.e. the
+                // sclip's interp columns (field + 2r) transposed.
+                const auto scpp = vsapi->getReadPtr(scp, plane);
+                const ptrdiff_t scp_stride = vsapi->getStride(scp, plane);
+                gather_columns(scpp, scp_stride, cfg.src_h,
+                               upload + cfg.sclip_offset, cfg.rows,
+                               2, field, d->elem_bytes, (d->copy_mode & 1) != 0);
+            }
+            continue;
+        }
+
         // The tight kept-row gather and the destination's kept-row copy read
         // exactly the same source rows in the same order (raw row k -> kept
         // row k -> dst row `off + 2k`), so both are written here while the
         // source row is hot. Doing the dst half later in the blit re-read the
         // whole source a second time (8.3 MB/frame at the bench geometry) —
         // measured worth ~5-7% when the host copies are the limiter.
-        auto dstp = vsapi->getWritePtr(dst, plane);
-        const ptrdiff_t dst_stride = vsapi->getStride(dst, plane);
-        const bool nt_raw = (d->copy_mode & 1) != 0 && !d->raw_stage;
-        const bool nt_kept = (d->copy_mode & 2) != 0;
         if (d->skip_raw) {
             // diagnostics-only
         } else if (!d->dh) {
@@ -1425,7 +1898,9 @@ static const VSFrame *VS_CC Eedi3GetFrame(
                 ? reinterpret_cast<const uint16_t *>(maskp) : nullptr;
             const float * maskf = d->mclip_native32
                 ? reinterpret_cast<const float *>(maskp) : nullptr;
-            uint8_t * bm = upload + cfg.bits_offset;
+            // Same as the EEDI3H gather: the packed bits go to the cached
+            // staging mirror, never straight into the uncached ReBAR VRAM.
+            uint8_t * bm = staging + cfg.bits_offset;
             const size_t bm_row_bytes =
                 static_cast<size_t>((cfg.width + 31) / 32) * sizeof(uint32_t);
             std::vector<uint64_t> bmask_scratch(
@@ -1503,8 +1978,9 @@ static const VSFrame *VS_CC Eedi3GetFrame(
                 .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                 .pNext = nullptr,
                 .memory = resource.staging_mem,
-                .offset = d->upload_total + cfg.dl_offset,
-                .size = cfg.dl_bytes,
+                .offset = d->upload_total + (d->horiz
+                    ? d->download_total + cfg.out_offset : cfg.dl_offset),
+                .size = d->horiz ? cfg.out_bytes : cfg.dl_bytes,
             });
         }
         checkVK(vkInvalidateMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
@@ -1526,6 +2002,24 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         const ptrdiff_t dst_stride = vsapi->getStride(dst, plane);
         const auto srcp = vsapi->getReadPtr(src, plane);
         const ptrdiff_t src_stride = vsapi->getStride(src, plane);
+
+        if (d->horiz) {
+            // ENTRY_COMPOSE wrote the whole frame-order plane, so the CPU blit
+            // is a plain strided row copy (the kept columns came back through
+            // the GPU with the interpolated ones).
+            if (!d->skip_blit) {
+                const size_t out_row = static_cast<size_t>(cfg.out_w) * d->elem_bytes;
+                const uint8_t * const src_out =
+                    static_cast<const uint8_t *>(static_cast<const void *>(map)) +
+                    d->upload_total + d->download_total + cfg.out_offset;
+                for (int y = 0; y < cfg.out_h; ++y) {
+                    frame_copy_out(dstp + dst_stride * y,
+                                   src_out + static_cast<size_t>(y) * out_row,
+                                   out_row, (d->copy_mode & 2) != 0);
+                }
+            }
+            continue;
+        }
 
         // interp rows (the row kernel wrote rows r at dst rows field+2r).
         // Streaming: the staging download is never re-read by the CPU and
@@ -1619,12 +2113,13 @@ static void VS_CC Eedi3Free(
     delete d;
 }
 
-static void VS_CC Eedi3Create(
+static void vsfeel_eedi3_create(
     const VSMap *in, VSMap *out, void *userData,
-    VSCore *core, const VSAPI *vsapi) {
+    VSCore *core, const VSAPI *vsapi, bool horiz) {
 
     auto d { std::make_unique<Eedi3Data>() };
     int err = 0;
+    d->horiz = horiz;
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
@@ -1706,10 +2201,16 @@ static void VS_CC Eedi3Create(
         return set_error("field must be 0, 1, 2, or 3");
     }
     if (!d->dh) {
+        // The interpolated axis must divide into interp/kept lines: the height
+        // vertically, the width in EEDI3H (which interpolates columns).
         for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-            if (d->process[plane] &&
-                ((d->vi->height >> (plane > 0 ? d->vi->format.subSamplingH : 0)) & 1)) {
-                return set_error("plane's height must be mod 2 when dh=False");
+            const int axis = d->horiz
+                ? (d->vi->width >> (plane > 0 ? d->vi->format.subSamplingW : 0))
+                : (d->vi->height >> (plane > 0 ? d->vi->format.subSamplingH : 0));
+            if (d->process[plane] && (axis & 1)) {
+                return set_error(d->horiz
+                    ? "plane's width must be mod 2 when dh=False"
+                    : "plane's height must be mod 2 when dh=False");
             }
         }
     }
@@ -1827,7 +2328,11 @@ static void VS_CC Eedi3Create(
             out_vi.numFrames = d->vi->numFrames * 2;
         }
         if (d->dh) {
-            out_vi.height *= 2;
+            if (d->horiz) {
+                out_vi.width *= 2;
+            } else {
+                out_vi.height *= 2;
+            }
         }
         if (!vsh::isSameVideoInfo(svi, &out_vi)) {
             return set_error("sclip's format and dimensions don't match");
@@ -1861,9 +2366,22 @@ static void VS_CC Eedi3Create(
     }
     if (const char * vd = std::getenv("VSFEEL_EEDI3_VOUTDEV")) {
         d->vout_dev = (atoi(vd) != 0);
+    } else if (d->horiz) {
+        // EEDI3H default: the vcheck output is read back by the compose pass,
+        // and reading it over PCIe from the staging download costs ~10% of the
+        // frame (measured 328 -> 360 fps at ns=8). Device-local vout is free
+        // here because the assembled plane has its own staging binding.
+        d->vout_dev = true;
     }
     if (const char * dh = std::getenv("VSFEEL_EEDI3_DSTHOST")) {
         d->dst_host = (atoi(dh) != 0);
+    }
+    if (d->horiz) {
+        // The direct-to-frame import path is vertical-only: EEDI3H's output is
+        // assembled by ENTRY_COMPOSE into the staging download and blitted by
+        // the CPU, and importing the frame anyway would only add the (measured
+        // very expensive) per-frame host-pointer import for nothing.
+        d->dst_host = false;
     }
     d->raw_stage = std::getenv("VSFEEL_EEDI3_RAWSTAGE") != nullptr;
     d->blit_contig = std::getenv("VSFEEL_EEDI3_BLITCONTIG") != nullptr;
@@ -2113,6 +2631,34 @@ static void VS_CC Eedi3Create(
             }
             d->blit_module = std::get<VkShaderModule>(r5);
         }
+        if (d->horiz) {
+            const uint32_t * xp_code = nullptr;
+            size_t xp_size = 0;
+            const uint32_t * cp_code = nullptr;
+            size_t cp_size = 0;
+            switch (d->bits) {
+                case 16:
+                    xp_code = eedi3_16_xpose_spv; xp_size = eedi3_16_xpose_spv_size;
+                    cp_code = eedi3_16_compose_spv; cp_size = eedi3_16_compose_spv_size;
+                    break;
+                case 32:
+                    xp_code = eedi3_32_xpose_spv; xp_size = eedi3_32_xpose_spv_size;
+                    cp_code = eedi3_32_compose_spv; cp_size = eedi3_32_compose_spv_size;
+                    break;
+                default:
+                    return set_error("unsupported bit depth");
+            }
+            auto rx = create_shader_module(*d->device, xp_code, xp_size);
+            if (std::holds_alternative<std::string>(rx)) {
+                return set_error(std::get<std::string>(rx));
+            }
+            d->xpose_module = std::get<VkShaderModule>(rx);
+            auto rc = create_shader_module(*d->device, cp_code, cp_size);
+            if (std::holds_alternative<std::string>(rc)) {
+                return set_error(std::get<std::string>(rc));
+            }
+            d->compose_module = std::get<VkShaderModule>(rc);
+        }
     }
 
     const int numPlanes = d->vi->format.numPlanes;
@@ -2133,8 +2679,15 @@ static void VS_CC Eedi3Create(
         out_video.numFrames *= 2;
         vsh::muldivRational(&out_video.fpsNum, &out_video.fpsDen, 2, 1);
     }
+    // dh doubles the interpolated axis: the height vertically, the width in
+    // EEDI3H (EEDI3H = T(EEDI3(T(x))), so EEDI3's height doubling becomes a
+    // width doubling here).
     if (d->dh) {
-        out_video.height *= 2;
+        if (d->horiz) {
+            out_video.width *= 2;
+        } else {
+            out_video.height *= 2;
+        }
     }
 
     auto align32 = [](VkDeviceSize v) { return (v + 31) & ~VkDeviceSize(31); };
@@ -2144,6 +2697,7 @@ static void VS_CC Eedi3Create(
     VkDeviceSize upload_total = 0;
     VkDeviceSize download_total = 0;
     VkDeviceSize dev_total = 0;
+    VkDeviceSize scratch_total = 0;
 
     auto & planes = d->planes;
     for (int plane = 0; plane < numPlanes; ++plane) {
@@ -2151,15 +2705,27 @@ static void VS_CC Eedi3Create(
             continue;
         }
         auto & cfg = planes[plane];
-        const int pw = (plane == 0) ? out_video.width : out_video.width >> subW;
-        const int ph = (plane == 0) ? out_video.height : out_video.height >> subH;
+        // Input plane dims, then the kernel's view of them: vertically the
+        // kernel plane is the input plane with dh doubling the height;
+        // horizontally it is the transpose (width <-> height, dh doubling the
+        // transposed height = the output width).
+        const int in_w = (plane == 0) ? d->vi->width : d->vi->width >> subW;
+        const int in_h = (plane == 0) ? d->vi->height : d->vi->height >> subH;
+        const int kw = d->horiz ? in_h : in_w;
+        const int kh = d->horiz ? (d->dh ? 2 * in_w : in_w)
+                                : (d->dh ? 2 * in_h : in_h);
 
-        cfg.width = pw;
-        cfg.height = ph;
-        cfg.rows = ph / 2;
+        cfg.src_w = in_w;
+        cfg.src_h = in_h;
+        cfg.width = kw;
+        cfg.height = kh;
+        cfg.rows = kh / 2;
+        cfg.out_w = d->horiz ? kh : kw;
+        cfg.out_h = d->horiz ? kw : kh;
         cfg.tpitch = tpitch;
-        cfg.pad_stride = (pw + MARGIN_H * 2 + 15) & ~15;   // pad elements
-        cfg.pad_height = ph + MARGIN_V * 2;
+        cfg.pad_stride = (kw + MARGIN_H * 2 + 15) & ~15;   // pad elements
+        cfg.pad_height = kh + MARGIN_V * 2;
+        const int pw = kw;
 
         // staging/upload regions: tight kept source rows (the pad kernel
         // expands mirrors), gathered sclip rows, and CPU-packed dilation bits
@@ -2217,15 +2783,35 @@ static void VS_CC Eedi3Create(
             cfg.vout_offset = align32(dev_total);
             dev_total = align32(cfg.vout_offset + cfg.vout_bytes);
         }
+
+        if (d->horiz) {
+            // Staging tail: the assembled output plane (written by ENTRY_
+            // COMPOSE, read back by the CPU) and the CPU-only mask scratch
+            // (the deinterleaved mask rows plus their transpose; the GPU never
+            // sees either). Both sit after the download region so the
+            // non-coherent invalidate ranges stay well defined.
+            cfg.out_bytes = static_cast<VkDeviceSize>(cfg.out_w) * cfg.out_h * elem_bytes;
+            cfg.out_offset = align32(scratch_total);
+            scratch_total = align32(cfg.out_offset + cfg.out_bytes);
+
+            cfg.ms_bytes = 2 * static_cast<VkDeviceSize>(cfg.rows) * cfg.width;
+            cfg.ms_offset = align32(scratch_total);
+            scratch_total = align32(cfg.ms_offset + cfg.ms_bytes);
+        }
     }
 
     d->upload_total = upload_total;
     d->download_total = download_total;
     d->dev_total = dev_total;
+    d->scratch_total = scratch_total;
 
     // pad_dev (device-only, never staged): per-plane built padded planes
     // produced by the pad kernel from the mirrored upload. The mirror
-    // occupies [0, upload_total), so the tail starts after it.
+    // occupies [0, upload_total), so the tail starts after it. EEDI3H adds the
+    // transposed upload R' and transposed sclip B' there as well: both are
+    // GPU-produced and only ever read by kernels, so they must be
+    // device-local, and both are read by ENTRY_PAD / the vcheck through
+    // binding 9 (and 5), which point at pad_dev.
     VkDeviceSize tail_total = upload_total;
     for (int plane = 0; plane < numPlanes; ++plane) {
         if (!d->process[plane]) {
@@ -2235,9 +2821,20 @@ static void VS_CC Eedi3Create(
         cfg.built_bytes = static_cast<VkDeviceSize>(cfg.pad_stride) * cfg.pad_height * pad_elem;
         cfg.built_offset = align32(tail_total);
         tail_total = align32(cfg.built_offset + cfg.built_bytes);
+        if (d->horiz) {
+            cfg.rt_bytes = static_cast<VkDeviceSize>(cfg.rows) * cfg.width * pad_elem;
+            cfg.rt_offset = align32(tail_total);
+            tail_total = align32(cfg.rt_offset + cfg.rt_bytes);
+            if (d->vcheck > 0 && d->sclip_node) {
+                cfg.rtS_bytes = static_cast<VkDeviceSize>(cfg.rows) * cfg.width * elem_bytes;
+                cfg.rtS_offset = align32(tail_total);
+                tail_total = align32(cfg.rtS_offset + cfg.rtS_bytes);
+            }
+        }
     }
 
-    const VkDeviceSize staging_size = std::max(upload_total + download_total, VkDeviceSize(4));
+    const VkDeviceSize staging_size = std::max(
+        upload_total + download_total + scratch_total, VkDeviceSize(4));
     const VkDeviceSize dev_size = std::max(dev_total, VkDeviceSize(4));
     const VkDeviceSize mirror_size = std::max(tail_total, VkDeviceSize(4));
 
@@ -2275,6 +2872,8 @@ static void VS_CC Eedi3Create(
                              VkPipeline & vc_pipe, VkPipeline & pad_pipe,
                              VkPipeline & vcopy_pipe,
                              VkPipeline & blit_pipe,
+                             VkPipeline & xpose_pipe,
+                             VkPipeline & compose_pipe,
                              bool & use_lds) -> std::optional<std::string> {
         use_lds = lds_ok && key.width <= MAXW_LDS;
         for (auto & [k, quad] : d->width_pipes) {
@@ -2284,6 +2883,8 @@ static void VS_CC Eedi3Create(
                 pad_pipe = quad[2];
                 vcopy_pipe = quad[3];
                 blit_pipe = quad[4];
+                xpose_pipe = quad[6];
+                compose_pipe = quad[7];
                 // A cached entry wins only if it was built for the same d2p
                 // path; entries are keyed by width so they are consistent.
                 return std::nullopt;
@@ -2347,13 +2948,44 @@ static void VS_CC Eedi3Create(
             }
             blitp = std::get<VkPipeline>(r5);
         }
-        d->width_pipes.emplace_back(key, std::array<VkPipeline, 6>{
-            rowp, vcp, padp, vcopyp, blitp, VK_NULL_HANDLE });
+        // EEDI3H passes: the upload transpose and the output reassembly. Both
+        // are per-width like everything else (WIDTH is the spec constant that
+        // sizes their tiles), so they ride the same cache key.
+        VkPipeline xposep = VK_NULL_HANDLE, composep = VK_NULL_HANDLE;
+        if (d->horiz) {
+            auto r6 = create_pipeline(*d->device, spec, d->xpose_module,
+                                      d->pipeline_layout, 0);
+            if (std::holds_alternative<std::string>(r6)) {
+                vkDestroyPipeline(dev, rowp, nullptr);
+                if (vcp) { vkDestroyPipeline(dev, vcp, nullptr); }
+                vkDestroyPipeline(dev, padp, nullptr);
+                if (vcopyp) { vkDestroyPipeline(dev, vcopyp, nullptr); }
+                if (blitp) { vkDestroyPipeline(dev, blitp, nullptr); }
+                return std::get<std::string>(r6);
+            }
+            xposep = std::get<VkPipeline>(r6);
+            auto r7 = create_pipeline(*d->device, spec, d->compose_module,
+                                      d->pipeline_layout, 0);
+            if (std::holds_alternative<std::string>(r7)) {
+                vkDestroyPipeline(dev, rowp, nullptr);
+                if (vcp) { vkDestroyPipeline(dev, vcp, nullptr); }
+                vkDestroyPipeline(dev, padp, nullptr);
+                if (vcopyp) { vkDestroyPipeline(dev, vcopyp, nullptr); }
+                if (blitp) { vkDestroyPipeline(dev, blitp, nullptr); }
+                vkDestroyPipeline(dev, xposep, nullptr);
+                return std::get<std::string>(r7);
+            }
+            composep = std::get<VkPipeline>(r7);
+        }
+        d->width_pipes.emplace_back(key, std::array<VkPipeline, 8>{
+            rowp, vcp, padp, vcopyp, blitp, VK_NULL_HANDLE, xposep, composep });
         row_pipe = rowp;
         vc_pipe = vcp;
         pad_pipe = padp;
         vcopy_pipe = vcopyp;
         blit_pipe = blitp;
+        xpose_pipe = xposep;
+        compose_pipe = composep;
         return std::nullopt;
     };
 
@@ -2365,7 +2997,8 @@ static void VS_CC Eedi3Create(
         WidthKey key { cfg.width, cfg.rows, cfg.tpitch, cfg.pad_stride, cfg.pad_height };
         if (auto err = get_pipelines(key, cfg.row_pipeline, cfg.vcheck_pipeline,
                                      cfg.pad_pipeline, cfg.vcopy_pipeline,
-                                     cfg.blit_pipeline, cfg.vcheck_lds)) {
+                                     cfg.blit_pipeline, cfg.xpose_pipeline,
+                                     cfg.compose_pipeline, cfg.vcheck_lds)) {
             return set_error(*err);
         }
     }
@@ -2564,13 +3197,26 @@ static void VS_CC Eedi3Create(
             // With the ReBAR upload the packed bits and sclip live in up_dev
             // (the CPU wrote them there); otherwise they sit in the pad_dev
             // mirror like the raw rows.
+            // The upload mirror (raw rows + sclip) lives in up_dev under
+            // ReBAR and in pad_dev otherwise.
             VkBuffer const bmask_buf = (d->rebar_up && upload_total > 0)
                 ? resource.up_dev : resource.pad_dev;
+            // Packed bits are always written to the cached staging mirror (see
+            // get_frame) -- ordinary stores into the uncached host-visible VRAM
+            // are one transaction per word, and that showed up as the single
+            // largest host stage. Under ReBAR the kernel reads them from
+            // staging; otherwise the mirror copy in pad_dev already has them.
             VkDescriptorBufferInfo bmask_info {
-                .buffer = bmask_buf, .offset = 0, .range = VK_WHOLE_SIZE
+                .buffer = (d->rebar_up && upload_total > 0)
+                    ? resource.staging : resource.pad_dev,
+                .offset = 0, .range = VK_WHOLE_SIZE
             };
+            // EEDI3H keeps the transposed sclip (binding 9's sibling, written
+            // by the xpose pass) in pad_dev; the host-uploaded compact sclip K
+            // is only the xpose pass's source (binding 0).
             VkDescriptorBufferInfo sclip_info {
-                .buffer = bmask_buf, .offset = 0, .range = VK_WHOLE_SIZE
+                .buffer = d->horiz ? resource.pad_dev : bmask_buf,
+                .offset = 0, .range = VK_WHOLE_SIZE
             };
             VkDescriptorBufferInfo cint_info {
                 .buffer = resource.dev_buf, .offset = 0, .range = VK_WHOLE_SIZE
@@ -2589,10 +3235,21 @@ static void VS_CC Eedi3Create(
                     ? resource.up_dev : resource.pad_dev,
                 .offset = 0, .range = VK_WHOLE_SIZE
             };
+            // Binding 9 is the pad builder's source plane. Vertically that is
+            // the host-uploaded raw (up_dev under ReBAR, the pad_dev mirror
+            // otherwise, i.e. exactly binding 0's buffer); EEDI3H always uses
+            // the device-local R'/B' regions instead.
+            VkDescriptorBufferInfo padsrc_info {
+                .buffer = d->horiz ? resource.pad_dev : raw_info.buffer,
+                .offset = 0, .range = VK_WHOLE_SIZE
+            };
+            VkDescriptorBufferInfo out_info {
+                .buffer = resource.staging, .offset = 0, .range = VK_WHOLE_SIZE
+            };
             const VkDescriptorBufferInfo * infos[BIND_COUNT] {
                 &pad_info, &dst_info, &pbt_info, &dmap_info,
                 &bmask_info, &sclip_info, &cint_info, &vout_info,
-                &raw_info
+                &raw_info, &padsrc_info, &out_info
             };
             VkWriteDescriptorSet writes[BIND_COUNT];
             for (uint32_t b = 0; b < BIND_COUNT; ++b) {
@@ -2686,153 +3343,26 @@ static void VS_CC Eedi3Create(
 // ---------------------------------------------------------------------------
 // EEDI3H — horizontal EEDI3 (vszipcl parity).
 //
-// Pure composition: Transpose clip/sclip/mclip in, run EEDI3, Transpose back.
-// No instance state, no new kernels, no new host paths — every behavior
-// (validation, numerics, mclip/sclip/dh/field semantics) is EEDI3's, applied
-// to the transposed geometry exactly like vszipcl's EEDI3H does on the GPU:
-// field selects transposed-row (= original column) parity, dh doubles the
-// transposed height (= the original width). By construction,
+// Thin wrapper over the same implementation with the transposed geometry: the
+// kernels are orientation-agnostic, so EEDI3H only changes what the host
+// gathers (source columns instead of source rows) and how the result is
+// reassembled (one GPU pass instead of four std.Transpose nodes). Everything
+// else -- validation, numerics, mclip/sclip/dh/field semantics -- is EEDI3's,
+// and by construction
 //   EEDI3H(x) == Transpose(EEDI3(Transpose(x)))
-// bit-exactly (same kernels, same params, transposed data flow), which is
-// also the primary test oracle (tests/test_eedi3h.py).
+// bit-exactly, which is also the primary test oracle (tests/test_eedi3h.py).
 // ---------------------------------------------------------------------------
+
+static void VS_CC Eedi3Create(
+    const VSMap *in, VSMap *out, void *userData,
+    VSCore *core, const VSAPI *vsapi) {
+    vsfeel_eedi3_create(in, out, userData, core, vsapi, false);
+}
 
 static void VS_CC Eedi3HCreate(
     const VSMap *in, VSMap *out, void *userData,
     VSCore *core, const VSAPI *vsapi) {
-
-    VSPlugin * self = static_cast<VSPlugin *>(userData);
-    std::vector<VSNode *> owned;   // transposed intermediates we must release
-    auto fail = [&](const std::string & error_message) {
-        vsapi->mapSetError(out, ("EEDI3H: " + error_message).c_str());
-        for (VSNode * n : owned) {
-            vsapi->freeNode(n);
-        }
-    };
-
-    // Transpose one optional input clip (absent -> leave *slot null).
-    auto transpose_opt = [&](const char * key, VSNode ** slot) -> bool {
-        int e = 0;
-        VSNode * src = vsapi->mapGetNode(in, key, 0, &e);
-        if (e || !src) {
-            return true;
-        }
-        VSMap * args = vsapi->createMap();
-        vsapi->mapConsumeNode(args, "clip", src, maReplace);
-        VSMap * ret = vsapi->invoke(
-            vsapi->getPluginByID(VSH_STD_PLUGIN_ID, core), "Transpose", args);
-        vsapi->freeMap(args);
-        if (vsapi->mapGetError(ret)) {
-            fail(vsapi->mapGetError(ret));
-            vsapi->freeMap(ret);
-            return false;
-        }
-        *slot = vsapi->mapGetNode(ret, "clip", 0, nullptr);
-        owned.push_back(*slot);
-        vsapi->freeMap(ret);
-        return true;
-    };
-
-    int e = 0;
-    VSNode * clip = vsapi->mapGetNode(in, "clip", 0, &e);
-    if (e || !clip) {
-        return fail("clip is required");
-    }
-    VSNode *tclip = nullptr, *tsclip = nullptr, *tmclip = nullptr;
-    {
-        VSMap * args = vsapi->createMap();
-        vsapi->mapConsumeNode(args, "clip", clip, maReplace);
-        VSMap * ret = vsapi->invoke(
-            vsapi->getPluginByID(VSH_STD_PLUGIN_ID, core), "Transpose", args);
-        vsapi->freeMap(args);
-        if (vsapi->mapGetError(ret)) {
-            fail(vsapi->mapGetError(ret));
-            vsapi->freeMap(ret);
-            return;
-        }
-        tclip = vsapi->mapGetNode(ret, "clip", 0, nullptr);
-        owned.push_back(tclip);
-        vsapi->freeMap(ret);
-    }
-    if (!transpose_opt("sclip", &tsclip) || !transpose_opt("mclip", &tmclip)) {
-        return;  // fail() already recorded the error and freed `owned`
-    }
-
-    // Forward every scalar arg verbatim; clips go in transposed.
-    VSMap * args = vsapi->createMap();
-    vsapi->mapConsumeNode(args, "clip", tclip, maReplace);
-    if (tsclip) {
-        vsapi->mapConsumeNode(args, "sclip", tsclip, maReplace);
-    }
-    if (tmclip) {
-        vsapi->mapConsumeNode(args, "mclip", tmclip, maReplace);
-    }
-    // owned refs moved into args; the inner filter takes its own references.
-    owned.clear();
-    auto fwd_int = [&](const char * key) {
-        int ee = 0;
-        const int64_t v = vsapi->mapGetInt(in, key, 0, &ee);
-        if (!ee) {
-            vsapi->mapSetInt(args, key, v, maReplace);
-        }
-    };
-    auto fwd_int_arr = [&](const char * key) {
-        const int n = vsapi->mapNumElements(in, key);
-        for (int i = 0; i < n; ++i) {
-            int ee = 0;
-            const int64_t v = vsapi->mapGetInt(in, key, i, &ee);
-            if (!ee) {
-                vsapi->mapSetInt(args, key, v, maAppend);
-            }
-        }
-    };
-    auto fwd_float = [&](const char * key) {
-        int ee = 0;
-        const double v = vsapi->mapGetFloat(in, key, 0, &ee);
-        if (!ee) {
-            vsapi->mapSetFloat(args, key, v, maReplace);
-        }
-    };
-    fwd_int("field");
-    fwd_int("dh");
-    fwd_int_arr("planes");
-    fwd_float("alpha");
-    fwd_float("beta");
-    fwd_float("gamma");
-    fwd_int("nrad");
-    fwd_int("mdis");
-    fwd_int("vcheck");
-    fwd_float("vthresh0");
-    fwd_float("vthresh1");
-    fwd_float("vthresh2");
-    fwd_int("device_id");
-    fwd_int("num_streams");
-
-    VSMap * ret = vsapi->invoke(self, "EEDI3", args);
-    vsapi->freeMap(args);
-    if (vsapi->mapGetError(ret)) {
-        // Our transposed refs died with `args`; the inner filter cleans up
-        // its own references on create-failure. Just propagate the error.
-        fail(vsapi->mapGetError(ret));
-        vsapi->freeMap(ret);
-        return;
-    }
-    VSNode * eedi3 = vsapi->mapGetNode(ret, "clip", 0, nullptr);
-    vsapi->freeMap(ret);
-
-    VSMap * args2 = vsapi->createMap();
-    vsapi->mapConsumeNode(args2, "clip", eedi3, maReplace);
-    VSMap * ret2 = vsapi->invoke(
-        vsapi->getPluginByID(VSH_STD_PLUGIN_ID, core), "Transpose", args2);
-    vsapi->freeMap(args2);
-    if (vsapi->mapGetError(ret2)) {
-        fail(vsapi->mapGetError(ret2));
-        vsapi->freeMap(ret2);
-        return;
-    }
-    VSNode * final = vsapi->mapGetNode(ret2, "clip", 0, nullptr);
-    vsapi->freeMap(ret2);
-    vsapi->mapConsumeNode(out, "clip", final, maReplace);
+    vsfeel_eedi3_create(in, out, userData, core, vsapi, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -2868,6 +3398,6 @@ void vsfeel_register_eedi3(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
         "EEDI3H",
         eedi3_args,
         "clip:vnode;",
-        Eedi3HCreate, plugin, plugin
+        Eedi3HCreate, nullptr, plugin
     );
 }
