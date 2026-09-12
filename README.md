@@ -11,7 +11,7 @@ Primarily optimized for running on RDNA 3 with the RADV driver on Linux.
 | Bilateral | 1903       | 1484    | 1.28x       | 1250        | 763      | 1.64x        |
 | BM3Dv2    | -          | -       | -           | 166         | 41       | 4.02x        |
 | DFTTest   | 1268       | 871     | 1.46x       | 1053        | 625      | 1.69x        |
-| EEDI3     | 301        | 206     | 1.46x       | 253         | 199      | 1.27x        |
+| EEDI3     | 508        | 195     | 2.61x       | 301         | 198      | 1.52x        |
 | GaussBlur | 2516       | 1599    | 1.57x       | 1267        | 756      | 1.68x        |
 | NLMeans   | 970        | 737     | 1.32x       | 846         | 651      | 1.30x        |
 | NNEDI3    | 2907       | 2659    | 1.09x       | 1563        | 1396     | 1.12x        |

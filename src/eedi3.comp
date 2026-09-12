@@ -94,8 +94,11 @@ const int MARGIN_V = 4;
 
 // backtrack + interpolate tile width (columns)
 const int BT_TILE = 32;
-// Diagnostics-only ablation level (0 = full kernel; 2 = return after the mask
-// pack/span scan, 3 = return at entry). Kept as a tuning instrument.
+// Diagnostics-only ablation level (0 = full kernel; 1 = store a zero pbt; 2 =
+// return after the mask pack/span scan; 3 = return at entry; 4 = skip the pbt
+// stores entirely; 5 = return after the DP, no backtrack; 6 = backtrack reads
+// the previous row's pbt, i.e. no same-workgroup store->load dependency).
+// Kept as a tuning instrument; only 2/4/6 produced the round-15 cost model.
 #ifndef PROBE
 #define PROBE 0
 #endif
@@ -400,7 +403,9 @@ float combine_interior(int dy, int x, int u, float s0, float s1, float s2) {
 const int SGSIZE = 32;                       // == workgroup size (host sets it)
 const int K = (TPITCH + SGSIZE - 1) / SGSIZE;  // directions per lane
 
-shared int8_t tileSh[BT_TILE * TPITCH];
+// tileF carries the per-column direction from the lane-0 backtrack walk to the
+// parallel interpolate lanes. (The old tileSh staging buffer is gone: the walk
+// now reads pbt directly from global — see the backtrack comment.)
 shared int8_t tileF[BT_TILE];
 shared uint bmaskSh[(WIDTH + 31) / 32];
 // First unmasked column of this row (WIDTH = fully masked). Written by lane
@@ -578,6 +583,8 @@ void main() {
                 if (laneBase + j < TPITCH)
 #if PROBE == 1
                     pbt[pbt_row + (xd - 1) * TPITCH + laneBase + j] = int8_t(0);
+#elif PROBE == 4
+                    ;  // diagnostics: no pbt store at all (traffic ablation)
 #else
                     pbt[pbt_row + (xd - 1) * TPITCH + laneBase + j] = int8_t(cRel[j]);
 #endif
@@ -613,15 +620,16 @@ void main() {
 
                 if (laneActive) {
                     float ccost;
-                    if (HAS_MCLIP == 0) {
-                        // No mclip: every column is unmasked, so the rolling
-                        // windows stay warm across the whole interior band and
-                        // each column advances them by one term. (With mclip
-                        // the rolling state would die at every masked column
-                        // and be reseeded at every unmasked run — eedi3vk2
-                        // recomputes the full cost there instead, which lets
-                        // the ring registers go and keeps masked columns at
-                        // tiny footprint.)
+                    {
+                        // Rolling windows are used on BOTH the mclip and the
+                        // no-mclip path (round 15: the old "rolling with mclip
+                        // buys nothing" verdict came from the all-zero-mask
+                        // benchmark, where no column was ever unmasked, so the
+                        // rolling path never ran). With mclip the state simply
+                        // dies at each masked column and reseeds at the next
+                        // unmasked interior one, which still costs one 9-load
+                        // seed instead of a ~51-load full conn_cost recompute
+                        // per unmasked direction.
                         const bool interior = (xd >= 2 * au && xd <= WIDTH - 1 - 2 * au);
                         if (interior) {
                             if (!rolled[j]) {
@@ -637,8 +645,6 @@ void main() {
                             rolled[j] = false;
                             ccost = conn_cost(dy, xd, u);
                         }
-                    } else {
-                        ccost = conn_cost(dy, xd, u);
                     }
 
                     // DP relax over v in [u-1, u+1] (subset of |v| <= umax2 by
@@ -662,6 +668,8 @@ void main() {
                     cRel[j] = idx - u;
 #if PROBE == 1
                     pbt[pbt_row + (xd - 1) * TPITCH + i] = int8_t(0);
+#elif PROBE == 4
+                    ;  // diagnostics: no pbt store at all (traffic ablation)
 #else
                     pbt[pbt_row + (xd - 1) * TPITCH + i] = int8_t(cRel[j]);
 #endif
@@ -704,26 +712,42 @@ void main() {
     // first unmasked column need no walk: nothing left of xmin reads
     // directions (all masked -> cubic), so stop there (bit-exact: the walk
     // right of xmin is untouched, fcarry propagates identically).
+#if PROBE == 5
+    // Diagnostics: DP + pbt stores only, no backtrack/interpolate.
+    return;
+#endif
     int fcarry = 0;  // fpath[x0 + n]; starts at fpath[WIDTH - 1] == 0
+#if PROBE == 6
+    // Diagnostics: read the PREVIOUS row's pbt so the backtrack has no
+    // same-workgroup store->load dependency on the DP stores above. This is
+    // the probe that isolated the round-15 finding: uncoupled 718/606 fps
+    // (vc0/vc2) versus 308/264 coupled, while the DP+stores alone and the
+    // backtrack alone are each ~free.
+    const int pbt_src = (r >= 1) ? (pbt_row - WIDTH * TPITCH) : pbt_row;
+#else
+    const int pbt_src = pbt_row;
+#endif
     for (int x0 = ((WIDTH - 2) / BT_TILE) * BT_TILE; x0 >= 0; x0 -= BT_TILE) {
         const int n = min(BT_TILE, WIDTH - 1 - x0);
         if (x0 + n <= xmin)
             break;
 
-        for (int c = 0; c < n; ++c)
-            for (int i = lane; i < TPITCH; i += SGSIZE)
-                tileSh[c * TPITCH + i] = pbt[pbt_row + (x0 + c) * TPITCH + i];
-        subgroupMemoryBarrierShared();
-        subgroupBarrier();
-
         if (lane == 0) {
             // Walk only down to xmin: columns left of it are all masked
             // (their directions are discarded for cubic), and their pbt was
             // never written (the DP loop starts at xmin).
+            //
+            // The walk reads pbt DIRECTLY from global memory: it consumes one
+            // byte per column (index CENTER + f), so staging the full TPITCH
+            // bytes of every column into LDS first would pull ~41x more data
+            // through the DP's store->load dependency for nothing. The tile
+            // loop still bounds the serial chain and lets the whole workgroup
+            // interpolate each tile in parallel. Measured at vc0/mdis=20
+            // (2000f, ns=8): 326 -> 368 fps versus the LDS staging form.
             int f = fcarry;
             const int xlo = max(x0, xmin);
             for (int x = x0 + n - 1; x >= xlo; --x) {
-                f += int(tileSh[(x - x0) * TPITCH + CENTER + f]);
+                f += int(pbt[pbt_src + x * TPITCH + CENTER + f]);
                 tileF[x - x0] = int8_t(f);
             }
             fcarry = f;
@@ -784,7 +808,7 @@ void main() {
             } // (x >= xmin) dir/backtrack path
         }
         subgroupMemoryBarrierShared();
-        subgroupBarrier();   // tile reads done before the next (leftward) tile reuses tileSh
+        subgroupBarrier();   // tileF reads done before the next (leftward) tile overwrites it
     }
 }
 
