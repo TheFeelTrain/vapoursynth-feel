@@ -124,7 +124,10 @@ def make_aa_vpy(
     tff + double_rate*2), so the filter outputs 2 frames per input frame and
     sclip must describe the output: one frame per OUTPUT frame, built exactly
     like based_aa does with Interleave([s, s]). When eedi3_field <= 1 the
-    sclip is the plain clip.
+    sclip is the plain clip. Only the fused `core.vsfeel.EEDI3AA` arm consumes
+    `sclip` directly; the reference arms are the vsaa antialiaser, which takes
+    the single-rate `clip` as its sclip and interleaves it itself, just as
+    based_aa does.
     """
     if cache_frames is not None:
         cache_lines = f"""\
@@ -364,71 +367,108 @@ def _eedi3_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     }
 
 
+def _vsaa_eedi3_backend(plugin: str) -> str | None:
+    """Name of the ``vsaa`` ``EEDI3.Backend`` member that drives ``plugin``.
+
+    ``based_aa`` reaches a reference plugin through this enum, over
+    ``EEDI3.Backend.EEDI3`` / ``EEDI3H``. Deriving the member from the plugin
+    name keeps the benchmark honest about which plugin actually ships EEDI3H:
+    ``EEDI3.Backend.should_h`` is True only for vszipcl/vszipcu, while
+    eedi3vk2 does *not* register EEDI3H and takes the transpose -> EEDI3 ->
+    transpose fallback.
+    """
+    try:
+        from vsaa import EEDI3 as _VsaaEEDI3
+    except ImportError:
+        return None
+    return next((m.name for m in _VsaaEEDI3.Backend if m.value == plugin), None)
+
+
 def _eedi3aa_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
-    """The fused based_aa EEDI3 chain: vsfeel.EEDI3AA vs the two-call chain.
+    """The fused based_aa EEDI3 chain: vsfeel.EEDI3AA vs based_aa's own chain.
 
     ``vsfeel`` runs the fused single call. Every reference plugin runs the
-    *same* chain based_aa would run on it: eedi3vk2 natively (EEDI3 then
-    EEDI3H), vszipcl/vszipcu through std.Transpose (they have no EEDI3H).
-    The chain strings are multi-statement: the ``_v``/``_vm``/``_h``
-    temporaries make sure each direction's EEDI3 is invoked once, not once
-    per merge arm.
+    *actual* ``vsaa`` antialiaser ``based_aa`` drives, so the chain cannot
+    drift from the wrapper: vsaa owns ``should_h`` (native EEDI3H only where
+    the plugin ships it — vszipcl and vszipcu; eedi3vk2 falls back to
+    transpose -> EEDI3 -> transpose), ``supports_mclip`` (forwarded to both
+    the native and the fallback path) and the double-rate
+    ``Interleave([s, s])`` sclip, and derives the plugin's ``field`` from
+    ``(tff, double_rate)``. ``--eedi3-field`` is mapped back onto that pair
+    (based_aa's field is ``tff + double_rate*2``).
+
+    ``clip`` is the 2x supersampled luma (based_aa's ``ss``), ``mclip`` the
+    2x mask and ``sclip`` the already-interleaved 2N clip: the fused arm takes
+    it directly (``core.vsfeel.EEDI3AA`` consumes the 2N clip, exactly as
+    ``vsfeel.vsaa.EEDI3`` hands it over) while the reference arms pass the
+    single-rate ``clip`` as sclip, which is what based_aa does (its
+    antialiaser interleaves it itself).
     """
     ns_num = ns.num_streams if ns.num_streams is not None else 8
     use_mclip = getattr(ns, "eedi3_mclip", True)
-    common = (
-        f"field={ns.eedi3_field}, mdis={ns.eedi3_mdis}, nrad={ns.eedi3_nrad}, "
+    field = ns.eedi3_field
+    if field <= 1:
+        # EEDI3AA is the fused *double-rate* chain (four sub-passes + two
+        # merges); a single-rate field has no fused form to grade.
+        raise SystemExit(
+            "the eedi3aa benchmark grades the double-rate chain only "
+            f"(field 2 or 3), got --eedi3-field {field}")
+    # vsfeel's plugin takes the three thresholds separately; the vsaa
+    # antialiaser carries based_aa's `vthresh=(v0, v1, v2)` object field and
+    # expands it itself.
+    common_plugin = (
         f"alpha={ns.eedi3_alpha}, beta={ns.eedi3_beta}, gamma={ns.eedi3_gamma}, "
-        f"vcheck={ns.eedi3_vcheck}, vthresh0={ns.eedi3_vthresh0}, "
-        f"vthresh1={ns.eedi3_vthresh1}, vthresh2={ns.eedi3_vthresh2}"
+        f"nrad={ns.eedi3_nrad}, mdis={ns.eedi3_mdis}, vcheck={ns.eedi3_vcheck}, "
+        f"vthresh0={ns.eedi3_vthresh0}, vthresh1={ns.eedi3_vthresh1}, "
+        f"vthresh2={ns.eedi3_vthresh2}"
     )
+    common_vsaa = (
+        f"alpha={ns.eedi3_alpha}, beta={ns.eedi3_beta}, gamma={ns.eedi3_gamma}, "
+        f"nrad={ns.eedi3_nrad}, mdis={ns.eedi3_mdis}, vcheck={ns.eedi3_vcheck}, "
+        f"vthresh=({ns.eedi3_vthresh0}, {ns.eedi3_vthresh1}, {ns.eedi3_vthresh2})"
+    )
+    # based_aa's default antialiaser runs double-rate, so field = tff + 2.
+    tff = field - 2
+
+    if getattr(ns, "synthetic", False):
+        # The synthetic vpy defines only `clip` (no ss/mask): mirror
+        # based_aa's sclip=ss with the clip itself and run maskless.
+        out = {
+            "vsfeel": (
+                f"core.vsfeel.EEDI3AA({clip}, field={field}, {common_plugin}, "
+                f"sclip=core.std.Interleave([{clip}, {clip}]), "
+                f"num_streams={ns_num})"
+            ),
+        }
+        for p in ("eedi3vk2", "vszipcl", "vszipcu"):
+            member = _vsaa_eedi3_backend(p)
+            if member is None:
+                continue
+            out[p] = (
+                "from vsaa import EEDI3 as _VsaaEEDI3\n"
+                f"_VsaaEEDI3(backend=_VsaaEEDI3.Backend.{member}, {common_vsaa})"
+                f".antialias({clip}, tff={tff}, sclip={clip}, "
+                f"num_streams={ns_num})"
+            )
+        return out
+
     aux = "sclip=sclip, mclip=mclip" if use_mclip else "sclip=sclip"
-    aux_sclip = "sclip=sclip"
-
-    def native(p: str, pod: str) -> str:
-        return (
-            f"_v = core.{p}.EEDI3({clip}, {common}, {pod}, num_streams={ns_num})\n"
-            f"_vm = core.std.Merge(_v[::2], _v[1::2])\n"
-            f"_h = core.{p}.EEDI3H(_vm, {common}, {pod}, num_streams={ns_num})\n"
-            f"core.std.Merge(_h[::2], _h[1::2])"
-        )
-
-    def transposed(p: str) -> str:
-        # based_aa's should_h=False path: transpose -> EEDI3 -> transpose for
-        # the horizontal direction, with the sclip transposed to match.
-        # vszipcl/vszipcu have no mclip, so the mask is simply not passed
-        # (based_aa only forwards it to backends that support it).
-        return (
-            f"_s = sclip.std.Transpose()\n"
-            f"_v = core.{p}.EEDI3({clip}, {common}, {aux_sclip}, "
-            f"num_streams={ns_num})\n"
-            f"_vm = core.std.Merge(_v[::2], _v[1::2])\n"
-            f"_h = core.{p}.EEDI3(_vm.std.Transpose(), {common}, sclip=_s, "
-            f"num_streams={ns_num}).std.Transpose()\n"
-            f"core.std.Merge(_h[::2], _h[1::2])"
-        )
-
-    def plugin_caps(p: str) -> tuple[bool, bool]:
-        """(has EEDI3H, supports mclip) — based_aa's should_h / supports_mclip."""
-        try:
-            import vapoursynth as vs
-            fn = getattr(vs.core, p)
-            return (hasattr(fn, "EEDI3H"),
-                    "mclip" in fn.EEDI3.__signature__.parameters)
-        except Exception:
-            return (False, False)
-
+    aa_aux = "sclip=clip" + (", mclip=mclip" if use_mclip else "")
     out: dict[str, str] = {
         "vsfeel": (
-            f"core.vsfeel.EEDI3AA({clip}, {common}, {aux}, num_streams={ns_num})"
+            f"core.vsfeel.EEDI3AA({clip}, field={field}, {common_plugin}, {aux}, "
+            f"num_streams={ns_num})"
         ),
     }
     for p in ("eedi3vk2", "vszipcl", "vszipcu"):
-        has_h, has_mclip = plugin_caps(p)
-        if has_h:
-            out[p] = native(p, aux if (use_mclip and has_mclip) else aux_sclip)
-        else:
-            out[p] = transposed(p)
+        member = _vsaa_eedi3_backend(p)
+        if member is None:
+            continue
+        out[p] = (
+            "from vsaa import EEDI3 as _VsaaEEDI3\n"
+            f"_VsaaEEDI3(backend=_VsaaEEDI3.Backend.{member}, {common_vsaa})"
+            f".antialias({clip}, tff={tff}, {aa_aux}, num_streams={ns_num})"
+        )
     return out
 
 
@@ -551,8 +591,8 @@ FILTERS: dict[str, FilterSpec] = {
         default_streams=8,
     ),
     "eedi3aa": FilterSpec(
-        title="EEDI3AA (fused based_aa chain)",
-        default_frames=2000,
+        title="EEDI3AA (based_aa)",
+        default_frames=1000,
         args=[
             # Same surface as the eedi3 entry: based_aa's default antialiaser
             # in double-rate mode (field = tff + double_rate*2 = 3).
@@ -570,8 +610,9 @@ FILTERS: dict[str, FilterSpec] = {
                 "pass the vsaa edge mask as mclip (default: true)"),
         ],
         build=_eedi3aa_build,
-        # Grades the whole based_aa chain: vsfeel's fused call against the
-        # two-call chain each reference plugin would run.
+        # Grades the whole based_aa EEDI3 chain: vsfeel's fused call against
+        # the chain vsaa.based_aa itself runs on each reference plugin
+        # (see _eedi3aa_build — the reference arms ARE the vsaa antialiaser).
         input="depth(get_y(clip), 16)",
         aa=True,
         default_streams=8,
