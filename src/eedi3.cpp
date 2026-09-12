@@ -131,6 +131,11 @@ enum Binding : uint32_t {
     BIND_COUNT = 9
 };
 
+// Compile-time max plane width for the shared-memory (LDS) vcheck variant.
+// Must match MAXW in src/eedi3.comp and the -DMAXW passed by the CMake
+// vcheck_lds rule; wider planes fall back to the global-read vcheck.
+static constexpr int MAXW_LDS = 4096;
+
 struct PlaneConfig {
     int width {};                     // output plane width (pixels)
     int height {};                    // output plane height (pixels)
@@ -143,6 +148,10 @@ struct PlaneConfig {
     VkPipeline vcheck_pipeline {};    // only when vcheck > 0
     VkPipeline pad_pipeline {};       // mirror-pad builder (always)
     VkPipeline vcopy_pipeline {};     // empty-row vcheck copy (vcheck+mclip)
+    VkPipeline blit_pipeline {};      // direct-to-frame row spread (import path)
+    // true when vcheck_pipeline is the shared-memory d2p variant: it carries
+    // every row (no empty-row skip) and therefore needs no vcopy dispatch.
+    bool vcheck_lds {};
 
     // staging (host-visible) regions, byte offsets: tight kept source rows,
     // gathered sclip rows (sclip only). The shared tight mask rows live in
@@ -186,6 +195,7 @@ struct Eedi3Resource {
     uint8_t * up_map {};          // mapped view of up_dev
     uint32_t up_type_index {};
     VkDescriptorSet desc_set_pad {};   // pad kernel (b0 = up_dev, b8 = pad_dev)
+    VkDescriptorSet desc_set_blit[MAX_PLANES] {};  // b1 = imported output frame
     VkBuffer dev_buf {};          // device-local kernels' buffers
     VkDeviceMemory dev_mem {};
     VkCommandPool pool {};
@@ -216,11 +226,18 @@ struct Eedi3Data {
     int copy_mode { 3 };
     // Diagnostics-only host-path ablations (env-gated; all default off).
     bool skip_blit {}, skip_sclip {}, skip_raw {}, skip_h2d {}, skip_vcheck {};
+    bool skip_xfer {};   // diagnostics: import path without the blit dispatch
     bool raw_stage {};   // diagnostics: raw gather -> cached staging (plain stores)
     bool blit_contig {}; // diagnostics: one contiguous copy instead of per-row
     // Gray16 mclip handled natively (no SetFrameProps+resize.Point->Gray8 node).
     bool mclip_native16 {};
     bool skip_pad {};    // diagnostics: skip the pad-builder dispatch
+    // ENTRY_PAD stores only the pad rows pad_get can read (parity 1-field:
+    // every interp row's +/-{1,3} taps). The other parity is written and never
+    // read, so skipping it halves the pad kernel's stores and mirror math.
+    // Bit-exact by construction; VSFEEL_EEDI3_PADPAR=0 builds the whole plane
+    // for A/B.
+    bool pad_skip_parity { true };
     // ReBAR direct upload: the CPU NT-stores the upload straight into
     // host-visible VRAM (nnedi3's proven path) instead of writing system-RAM
     // staging and DMA'ing it. VSFEEL_EEDI3_NOREBAR=1 forces the old path.
@@ -231,6 +248,23 @@ struct Eedi3Data {
     // to a device-local region and one vkCmdCopyBuffer (SDMA) brings it back.
     // VSFEEL_EEDI3_VOUTDEV=1 selects the DMA form.
     bool vout_dev {};
+    // Direct-to-frame output: write the interp rows into the output frame's
+    // own memory, imported with VK_EXT_external_memory_host, instead of
+    // downloading them and blitting on the CPU. It removes the whole ~20% dst
+    // blit (a staging read plus a frame write) at the cost of one host pointer
+    // import per frame, and is BIT-EXACT (tests pass either way) -- but it is
+    // DEFAULT OFF because the import is not cheap on this platform: RADV/
+    // amdgpu does GPU-visible VM work for every import and destroy, and at
+    // num_streams=8 that saturates the GPU. Measured on the 2x-upscaled jpbd AA
+    // benchmark (field=3, 2000f, ns=8, harness cache 500 frames):
+    //   staged 608 | staged + vout in dev_buf (no import) 588 |
+    //   per-frame import, GPU never touches the import 487 | import + blit 390
+    // i.e. the import alone costs ~20%, more than the 20% blit it removes. It
+    // only wins at low frame-buffer churn (harness cache 50: 697 vs 641) and
+    // at low stream counts (ns=2: 324 vs 287). Re-test if RADV's import path
+    // gets cheaper. VSFEEL_EEDI3_DSTHOST=1 enables it, VSFEEL_EEDI3_DSTHOST=0
+    // forces the CPU blit.
+    bool dst_host { false };
     float alpha { 0.2f }, beta { 0.25f }, gamma { 20.0f };
     float vthresh2 { 4.0f };
     float rw {}, rcp_vth0 {}, rcp_vth1 {}, rcp_vth2 {};
@@ -255,15 +289,24 @@ struct Eedi3Data {
     VkDescriptorPool desc_pool {};
     VkShaderModule row_module {};
     VkShaderModule vcheck_module {};
+    VkShaderModule vcheck_lds_module {};  // shared-memory d2p variant (optional)
     VkShaderModule pad_module {};
     VkShaderModule vcopy_module {};
+    VkShaderModule blit_module {};    // direct-to-frame row spread (import path)
     VkDeviceSize upload_total {}, download_total {}, dev_total {};
     std::array<PlaneConfig, MAX_PLANES> planes {};
     FramePool<Eedi3Resource> pool;
 
     // module/pipeline cache keyed by width (values owned by the pipelines
-    // map): [row, vcheck, pad]
-    std::vector<std::pair<WidthKey, std::array<VkPipeline, 4>>> width_pipes {};
+    // map): [row, vcheck, pad, vcopy, blit]
+    std::vector<std::pair<WidthKey, std::array<VkPipeline, 6>>> width_pipes {};
+    // vout lives in dev_buf whenever the direct-to-frame path is compiled in
+    // (the transfer needs a device-local source), which also makes the
+    // pre-existing VOUTDEV layout the fallback for frames that cannot be
+    // imported. Kept consistent between descriptor creation and recording.
+    bool vout_in_dev() const {
+        return vout_dev || (dst_host && device && device->host_import);
+    }
 
     ~Eedi3Data() {
         if (!device) {
@@ -302,10 +345,10 @@ struct Eedi3Data {
             destroy_common(dev, resource);
         }
 
-        VkPipeline destroyed[4 * 3] {};
+        VkPipeline destroyed[6 * 3] {};
         int nd = 0;
         for (auto & [key, quad] : width_pipes) {
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 6; ++i) {
                 if (!quad[i]) {
                     continue;
                 }
@@ -337,14 +380,157 @@ struct Eedi3Data {
         if (vcheck_module) {
             vkDestroyShaderModule(dev, vcheck_module, nullptr);
         }
+        if (vcheck_lds_module) {
+            vkDestroyShaderModule(dev, vcheck_lds_module, nullptr);
+        }
         if (pad_module) {
             vkDestroyShaderModule(dev, pad_module, nullptr);
         }
         if (vcopy_module) {
             vkDestroyShaderModule(dev, vcopy_module, nullptr);
         }
+        if (blit_module) {
+            vkDestroyShaderModule(dev, blit_module, nullptr);
+        }
 
         release_device(device);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Direct-to-frame output (VK_EXT_external_memory_host)
+//
+// The final interp rows are written by ENTRY_BLIT straight into the output
+// frame, instead of being downloaded to staging and blitted row by row by the
+// CPU. Both legs of the old CPU blit (a staging read plus a dst write, ~20% of
+// the frame) disappear; the new cost is one host-pointer import of the plane
+// per frame plus the blit dispatch itself.
+//
+// VapourSynth plane pointers are 64-byte aligned but not page aligned (they
+// sit 128 bytes into their page on this build) while
+// minImportedHostPointerAlignment is the page size (4096). The import
+// therefore starts at the enclosing page and the buffer is bound at the
+// plane's byte offset inside that region: the offset stays a multiple of the
+// buffer's alignment requirement, and every byte the GPU touches lies inside
+// the plane itself, so no page outside the frame allocation is ever used.
+// ---------------------------------------------------------------------------
+
+struct Eedi3HostImport {
+    VkBuffer buffer {};
+    VkDeviceMemory memory {};
+};
+
+static std::optional<std::string> import_plane_host_memory(
+    const Eedi3Data & d, void * plane, const VkDeviceSize plane_bytes,
+    Eedi3HostImport & out) {
+
+    const VK_Device & dev = *d.device;
+    if (!dev.host_import || dev.host_pointer_alignment == 0 ||
+        !dev.get_memory_host_pointer_properties) {
+        return "host pointer import unavailable";
+    }
+    const VkDeviceSize align = dev.host_pointer_alignment;
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(plane);
+    const uintptr_t base = addr & ~(static_cast<uintptr_t>(align) - 1);
+    const VkDeviceSize offset = addr - base;
+    // both the address and the size must be a multiple of the alignment
+    const VkDeviceSize region = ((offset + plane_bytes) + align - 1) / align * align;
+
+    VkMemoryHostPointerPropertiesEXT props {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
+        .pNext = nullptr,
+        .memoryTypeBits = 0
+    };
+    if (dev.get_memory_host_pointer_properties(dev.device,
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+            reinterpret_cast<void *>(base), &props) != VK_SUCCESS) {
+        return "vkGetMemoryHostPointerPropertiesEXT failed";
+    }
+
+    uint32_t type_index = ~0u;
+    for (uint32_t i = 0; i < dev.mem_props.memoryTypeCount; ++i) {
+        if (!(props.memoryTypeBits & (1u << i))) {
+            continue;
+        }
+        const auto flags = dev.mem_props.memoryTypes[i].propertyFlags;
+        if ((flags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            type_index = i;
+            break;
+        }
+    }
+    if (type_index == ~0u) {
+        return "no coherent host-visible memory type accepts the plane pointer";
+    }
+
+    VkBufferCreateInfo buffer_info {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .size = plane_bytes,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr
+    };
+    if (vkCreateBuffer(dev.device, &buffer_info, nullptr, &out.buffer) != VK_SUCCESS) {
+        return "vkCreateBuffer for the imported plane failed";
+    }
+
+    VkImportMemoryHostPointerInfoEXT import_info {
+        .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+        .pNext = nullptr,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+        .pHostPointer = reinterpret_cast<void *>(base)
+    };
+    VkMemoryAllocateInfo alloc_info {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &import_info,
+        .allocationSize = region,
+        .memoryTypeIndex = type_index
+    };
+    VkResult result = vkAllocateMemory(dev.device, &alloc_info, nullptr, &out.memory);
+    if (result != VK_SUCCESS) {
+        vkDestroyBuffer(dev.device, out.buffer, nullptr);
+        out.buffer = VK_NULL_HANDLE;
+        return "vkAllocateMemory (host import) failed: "s + vk_result_string(result);
+    }
+    result = vkBindBufferMemory(dev.device, out.buffer, out.memory, offset);
+    if (result != VK_SUCCESS) {
+        vkFreeMemory(dev.device, out.memory, nullptr);
+        vkDestroyBuffer(dev.device, out.buffer, nullptr);
+        out = {};
+        return "vkBindBufferMemory (host import) failed: "s + vk_result_string(result);
+    }
+    return std::nullopt;
+}
+
+static void destroy_host_import(const Eedi3Data & d, Eedi3HostImport & imp) {
+    VkDevice dev = d.device->device;
+    if (imp.memory) {
+        vkFreeMemory(dev, imp.memory, nullptr);
+    }
+    if (imp.buffer) {
+        vkDestroyBuffer(dev, imp.buffer, nullptr);
+    }
+    imp = {};
+}
+
+// Per-frame direct-output targets: the imported output frame of each processed
+// plane plus the frame's own row pitch in elements.
+struct Eedi3Direct {
+    Eedi3HostImport plane[MAX_PLANES] {};
+    int stride[MAX_PLANES] {};                 // frame row pitch in elements
+    VkDeviceSize vout_offset[MAX_PLANES] {};   // tight source rows in dev_buf
+    bool active[MAX_PLANES] {};
+
+    void destroy(const Eedi3Data & d) {
+        for (int p = 0; p < MAX_PLANES; ++p) {
+            destroy_host_import(d, plane[p]);
+            active[p] = false;
+        }
     }
 };
 
@@ -666,8 +852,14 @@ struct PushConstants {
     // numeric base as the row kernel's b0 reads — same region, same buffer).
     int32_t raw_base;       // pad-elem base of tight kept rows (H2D mirror)
     int32_t rempty_base;    // int8 base of per-row empty flags (dev_buf via b3)
+    // ENTRY_BLIT only: output frame row pitch in io elements (b1 is the
+    // imported output frame, b7 holds the tight interp rows).
+    int32_t dst_stride;
+    // ENTRY_PAD only: skip pad rows of parity `field` (never read; see the pad
+    // kernel). 1 = skip (default), 0 = build the whole plane.
+    int32_t pad_skip_parity;
 };
-static_assert(sizeof(PushConstants) == 14 * 4 + 8 * 4, "push constants size");
+static_assert(sizeof(PushConstants) == 16 * 4 + 8 * 4, "push constants size");
 
 // base offsets in ELEMENTS for each binding of a plane's regions (element
 // type per binding; the descriptors range the whole buffer so the shader
@@ -683,7 +875,8 @@ struct PlaneBases {
 };
 
 static std::optional<std::string> record_command_buffer(
-    const Eedi3Data & d, Eedi3Resource & resource, const int field) {
+    const Eedi3Data & d, Eedi3Resource & resource, const int field,
+    Eedi3Direct & direct) {
 
     VkDevice dev = d.device->device;
 
@@ -742,6 +935,7 @@ static std::optional<std::string> record_command_buffer(
         ppc.field = field;
         ppc.rows = cfg.rows;
         ppc.raw_base = static_cast<int32_t>(cfg.raw_offset / pad_elem);
+        ppc.pad_skip_parity = d.pad_skip_parity ? 1 : 0;
 
         // pad builder: one thread per padded element
         vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.pad_pipeline);
@@ -793,8 +987,9 @@ static std::optional<std::string> record_command_buffer(
             .cint_base = static_cast<int32_t>(cfg.cint_offset / elem),
             // vout either lands DIRECTLY in the staging download region (b7
             // views staging: no D2H copy, but GPU stores go to system RAM) or
-            // in a device-local region that one SDMA copy brings back.
-            .vout_base = static_cast<int32_t>(d.vout_dev
+            // in a device-local region that a transfer brings back (SDMA to
+            // staging, or the direct-to-frame copy below).
+            .vout_base = static_cast<int32_t>(d.vout_in_dev()
                 ? (cfg.vout_offset / elem)
                 : ((d.upload_total + cfg.dl_offset) / elem)),
             .pad_stride = cfg.pad_stride,
@@ -837,8 +1032,10 @@ static std::optional<std::string> record_command_buffer(
             // empty-row fast pass (mclip only; without a mask no row is
             // empty and the walk below handles everything): fully-masked
             // rows copied in parallel, so the serial walk only iterates
-            // non-empty rows and pays ~1/3 of the barriers.
-            if (d.mclip_node) {
+            // non-empty rows and pays ~1/3 of the barriers. The LDS walk
+            // carries every row (it needs the whole chain), so it needs no
+            // vcopy pass at all.
+            if (d.mclip_node && !cfg.vcheck_lds) {
                 vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.vcopy_pipeline);
                 vkCmdBindDescriptorSets(
                     resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -871,25 +1068,72 @@ static std::optional<std::string> record_command_buffer(
         }
     }
 
-    // download: vcheck writes vout either into staging directly (no copy) or
-    // into dev_buf (one SDMA copy back); without vcheck the row kernel's dst
-    // (dev_buf) always needs the copy.
-    const bool need_d2h = (d.vcheck > 0) ? d.vout_dev : (d.download_total > 0);
-    if (need_d2h) {
+    // Tail. Three shapes per plane:
+    //   direct       -> an ENTRY_BLIT dispatch spreads vout (dev_buf, tight,
+    //                   b7) into the imported output frame (b1) at the frame's
+    //                   own row pitch and interp parity. A multi-region
+    //                   vkCmdCopyBuffer was tried for exactly this and is
+    //                   unusable in situ (one region per interp row measured
+    //                   milliseconds of GPU time per frame, ~2x the frame);
+    //   vout_dev     -> vout (dev_buf) is copied back to staging as one region;
+    //   staging vout -> the vcheck kernels already wrote staging: nothing here.
+    // Without vcheck the row kernel's dst (dev_buf) is the transfer source.
+    bool any_direct = false, any_d2h = false;
+    for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
+        if (!d.process[plane]) {
+            continue;
+        }
+        if (direct.active[plane] && !d.skip_xfer && d.planes[plane].blit_pipeline) {
+            any_direct = true;
+        } else if (!direct.active[plane] &&
+                   ((d.vcheck > 0) ? d.vout_in_dev() : (d.download_total > 0))) {
+            any_d2h = true;
+        }
+    }
+    if (any_direct || any_d2h) {
         VkMemoryBarrier mem_barrier {
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT
+            .dstAccessMask = static_cast<VkAccessFlags>(
+                (any_direct ? (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT) : 0) |
+                (any_d2h ? VK_ACCESS_TRANSFER_READ_BIT : 0))
         };
         vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+            static_cast<VkPipelineStageFlags>(
+                (any_direct ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0) |
+                (any_d2h ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0)),
+            0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
 
         for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
             if (!d.process[plane]) {
                 continue;
             }
             const auto & cfg = d.planes[plane];
+            if (direct.active[plane] && !d.skip_xfer && cfg.blit_pipeline) {
+                PushConstants bpc {};
+                bpc.dst_base = 0;   // the imported buffer starts at the plane
+                bpc.dst_stride = direct.stride[plane];
+                bpc.vout_base = static_cast<int32_t>(direct.vout_offset[plane] / elem);
+                bpc.field = field;
+                bpc.rows = cfg.rows;
+                vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                  cfg.blit_pipeline);
+                vkCmdBindDescriptorSets(
+                    resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    d.pipeline_layout, 0, 1, &resource.desc_set_blit[plane], 0, nullptr);
+                vkCmdPushConstants(
+                    resource.cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                    0, sizeof(bpc), &bpc);
+                const uint32_t total = static_cast<uint32_t>(cfg.rows) *
+                    static_cast<uint32_t>(cfg.width);
+                vkCmdDispatch(resource.cmd, (total + 255) / 256, 1, 1);
+                continue;
+            }
+            if (direct.active[plane] ||
+                !((d.vcheck > 0) ? d.vout_in_dev() : (d.download_total > 0))) {
+                continue;
+            }
             const VkBufferCopy region {
                 .srcOffset = (d.vcheck > 0) ? cfg.vout_offset : cfg.dst_offset,
                 .dstOffset = d.upload_total + cfg.dl_offset,
@@ -952,7 +1196,11 @@ static const VSFrame *VS_CC Eedi3GetFrame(
 
     auto resource = d->pool.take();
 
+    // per-frame direct-to-frame output imports; released on every exit path
+    Eedi3Direct direct;
+
     auto set_error = [&](const std::string & error_message) {
+        direct.destroy(*d);
         d->pool.give_back(std::move(resource));
         vsapi->setFilterError(("EEDI3VK: " + error_message).c_str(), frameCtx);
         vsapi->freeFrame(src);
@@ -985,17 +1233,73 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     }
     const int off = 1 - field;
 
-    static const int hframe = getenv("VSFEEL_EEDI3_HFRAME") ? atoi(getenv("VSFEEL_EEDI3_HFRAME")) : 0;
-    const bool hbench = getenv("VSFEEL_EEDI3_HBENCH") && sn == hframe;
+    // Host-path probe: sample one frame with VSFEEL_EEDI3_HFRAME=<n>, or every
+    // 200th frame from sn=100 when the variable is unset (a single sample is
+    // clock-noise-prone; <0 selects the periodic form).
+    static const int hframe = getenv("VSFEEL_EEDI3_HFRAME") ? atoi(getenv("VSFEEL_EEDI3_HFRAME")) : -1;
+    const bool hbench = getenv("VSFEEL_EEDI3_HBENCH") &&
+        (hframe >= 0 ? sn == hframe : (sn >= 100 && sn % 200 == 0));
     const auto h_t0 = std::chrono::steady_clock::now();
     auto h_tMaskEnd = h_t0, h_tGatherEnd = h_t0, h_tRawEnd = h_t0;
-    auto h_tRecEnd = h_t0;
+    auto h_tRecEnd = h_t0, h_tImportEnd = h_t0;
 
     // Re-record the command buffer with this frame's interp-row parity (the
     // previous submit on this resource was waited on before give_back, so the
     // pool reset is safe).
     checkVK(vkResetCommandPool(dev, resource.pool, 0));
-    if (const auto err = record_command_buffer(*d, resource, field)) {
+
+    // Direct-to-frame output: import each processed plane's memory before
+    // recording, because the blit dispatch needs the buffer handle. All planes
+    // must be importable: vout_base is a single push constant per dispatch, but
+    // the fallback (staging + CPU blit) needs vout in staging, so a mixed frame
+    // is not expressible. Any failure falls back to the CPU blit for the whole
+    // frame.
+    if (d->dst_host && d->device->host_import && !d->skip_blit) {
+        for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
+            if (!d->process[plane]) {
+                continue;
+            }
+            const auto & cfg = d->planes[plane];
+            void * const dstp = vsapi->getWritePtr(dst, plane);
+            const ptrdiff_t dst_stride = vsapi->getStride(dst, plane);
+            const VkDeviceSize plane_bytes =
+                static_cast<VkDeviceSize>(dst_stride) * cfg.height;
+            if (auto err = import_plane_host_memory(*d, dstp, plane_bytes,
+                                                    direct.plane[plane])) {
+                direct.destroy(*d);
+                if (trace_on("VSFEEL_EEDI3_TRACE")) {
+                    fprintf(stderr, "[eedi3] direct-to-frame import failed: %s\n",
+                            err->c_str());
+                }
+                break;
+            }
+            direct.stride[plane] = static_cast<int>(dst_stride / d->elem_bytes);
+            direct.vout_offset[plane] = (d->vcheck > 0) ? cfg.vout_offset
+                                                        : cfg.dst_offset;
+            direct.active[plane] = true;
+            // point the blit set's b1 (the output frame) at this plane's import
+            VkDescriptorBufferInfo blit_info {
+                .buffer = direct.plane[plane].buffer,
+                .offset = 0, .range = VK_WHOLE_SIZE
+            };
+            VkWriteDescriptorSet blit_write {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = resource.desc_set_blit[plane],
+                .dstBinding = 1,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pImageInfo = nullptr,
+                .pBufferInfo = &blit_info,
+                .pTexelBufferView = nullptr
+            };
+            vkUpdateDescriptorSets(dev, 1, &blit_write, 0, nullptr);
+        }
+    }
+    if (hbench) { h_tImportEnd = std::chrono::steady_clock::now(); }
+
+    if (const auto err = record_command_buffer(*d, resource, field, direct)) {
         return set_error(*err);
     }
     if (hbench) { h_tRecEnd = std::chrono::steady_clock::now(); }
@@ -1122,8 +1426,10 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     // the GPU reads up_dev (required for the ReBAR path; harmless otherwise).
     _mm_sfence();
 
+    const auto h_tSub0 = std::chrono::steady_clock::now();
     checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
         resource.cmd, resource.fence));
+    const auto h_tSub1 = std::chrono::steady_clock::now();
 
     const auto h_t1 = std::chrono::steady_clock::now();
     checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
@@ -1149,9 +1455,10 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     }
 
     // Copy results into dst: interp rows from the download region, kept rows
-    // straight from src (like eedi3vk2).
+    // straight from src (like eedi3vk2). Planes whose memory was imported
+    // (direct-to-frame) were already written by the blit kernel.
     for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-        if (!d->process[plane]) {
+        if (!d->process[plane] || direct.active[plane]) {
             continue;
         }
         const auto & cfg = d->planes[plane];
@@ -1203,6 +1510,10 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         // (same source rows, same order) — nothing left to do here.
     }
 
+    // The GPU is done with the imported planes (the fence above), so the
+    // pinned pages can be released before the frame is handed to the consumer.
+    direct.destroy(*d);
+
     d->pool.give_back(std::move(resource));
 
     if (hbench) {
@@ -1210,10 +1521,10 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         const auto us = [](auto a, auto b) {
             return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count() / 1000.0;
         };
-        fprintf(stderr, "[eedi3-hbench] cpu_stage=%.3fms gpu_submit_wait=%.3fms blit=%.3fms\n",
-                us(h_t0, h_t1), us(h_t1, h_t2), us(h_t2, h_t3));
-        fprintf(stderr, "[eedi3-hbench]   of cpu_stage: record=%.3fms raw=%.3fms bits=%.3fms sclip=%.3fms\n",
-                us(h_t0, h_tRecEnd), us(h_tRecEnd, h_tRawEnd),
+        fprintf(stderr, "[eedi3-hbench] cpu_stage=%.3fms submit=%.3fms fence_wait=%.3fms blit=%.3fms\n",
+                us(h_t0, h_t1), us(h_tSub0, h_tSub1), us(h_t1, h_t2), us(h_t2, h_t3));
+        fprintf(stderr, "[eedi3-hbench]   of cpu_stage: import=%.3fms record=%.3fms raw=%.3fms bits=%.3fms sclip=%.3fms\n",
+                us(h_t0, h_tImportEnd), us(h_tImportEnd, h_tRecEnd), us(h_tRecEnd, h_tRawEnd),
                 us(h_tRawEnd, h_tMaskEnd), us(h_tMaskEnd, h_tGatherEnd));
     }
 
@@ -1490,14 +1801,21 @@ static void VS_CC Eedi3Create(
     if (const char * vd = std::getenv("VSFEEL_EEDI3_VOUTDEV")) {
         d->vout_dev = (atoi(vd) != 0);
     }
+    if (const char * dh = std::getenv("VSFEEL_EEDI3_DSTHOST")) {
+        d->dst_host = (atoi(dh) != 0);
+    }
     d->raw_stage = std::getenv("VSFEEL_EEDI3_RAWSTAGE") != nullptr;
     d->blit_contig = std::getenv("VSFEEL_EEDI3_BLITCONTIG") != nullptr;
     d->skip_pad = std::getenv("VSFEEL_EEDI3_NOPAD") != nullptr;
+    if (const char * pp = std::getenv("VSFEEL_EEDI3_PADPAR")) {
+        d->pad_skip_parity = atoi(pp) != 0;
+    }
     d->skip_blit = std::getenv("VSFEEL_EEDI3_NOBLIT") != nullptr;
     d->skip_sclip = std::getenv("VSFEEL_EEDI3_NOSCLIP") != nullptr;
     d->skip_raw = std::getenv("VSFEEL_EEDI3_NORAW") != nullptr;
     d->skip_h2d = std::getenv("VSFEEL_EEDI3_NOH2D") != nullptr;
     d->skip_vcheck = std::getenv("VSFEEL_EEDI3_NOVC") != nullptr;
+    d->skip_xfer = std::getenv("VSFEEL_EEDI3_NOXFER") != nullptr;
 
     if (const char * cm = std::getenv("VSFEEL_EEDI3_COPY")) {
         const int v = atoi(cm);
@@ -1618,10 +1936,14 @@ static void VS_CC Eedi3Create(
         checkVK(vkCreatePipelineLayout(dev, &plci, nullptr, &d->pipeline_layout));
     }
     {
-        // Two sets per stream when the ReBAR upload is active (the pad kernel
-        // needs its own set because its binding 0 is the raw upload while the
-        // row kernel's binding 0 is the built pad).
-        const uint32_t sets_per_stream = (d->rebar_up) ? 2u : 1u;
+        // Per stream: the shared row/vcheck/vcopy set, a second set when the
+        // ReBAR upload is active (the pad kernel needs its own set because its
+        // binding 0 is the raw upload while the row kernel's binding 0 is the
+        // built pad), and one blit set per plane (its b1 is that plane's
+        // imported output frame, which differs per dispatch in a frame).
+        const uint32_t sets_per_stream =
+            ((d->rebar_up) ? 2u : 1u) +
+            ((d->dst_host && d->device->host_import) ? MAX_PLANES : 0u);
         VkDescriptorPoolSize pool_size {
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             BIND_COUNT * static_cast<uint32_t>(d->num_streams) * sets_per_stream
@@ -1647,17 +1969,21 @@ static void VS_CC Eedi3Create(
         size_t row_size = 0;
         const uint32_t * vc_code = nullptr;
         size_t vc_size = 0;
+        const uint32_t * vclds_code = nullptr;
+        size_t vclds_size = 0;
         const uint32_t * pad_code = nullptr;
         size_t pad_size = 0;
         switch (d->bits) {
             case 16:
                 row_code = eedi3_16_row_spv; row_size = eedi3_16_row_spv_size;
                 vc_code = eedi3_16_vcheck_spv; vc_size = eedi3_16_vcheck_spv_size;
+                vclds_code = eedi3_16_vcheck_lds_spv; vclds_size = eedi3_16_vcheck_lds_spv_size;
                 pad_code = eedi3_16_pad_spv; pad_size = eedi3_16_pad_spv_size;
                 break;
             case 32:
                 row_code = eedi3_32_row_spv; row_size = eedi3_32_row_spv_size;
                 vc_code = eedi3_32_vcheck_spv; vc_size = eedi3_32_vcheck_spv_size;
+                vclds_code = eedi3_32_vcheck_lds_spv; vclds_size = eedi3_32_vcheck_lds_spv_size;
                 pad_code = eedi3_32_pad_spv; pad_size = eedi3_32_pad_spv_size;
                 break;
             default:
@@ -1674,6 +2000,14 @@ static void VS_CC Eedi3Create(
                 return set_error(std::get<std::string>(r2));
             }
             d->vcheck_module = std::get<VkShaderModule>(r2);
+            if (d->device->limits.maxComputeSharedMemorySize >=
+                    2 * MAXW_LDS * sizeof(float)) {
+                auto r2b = create_shader_module(*d->device, vclds_code, vclds_size);
+                if (std::holds_alternative<std::string>(r2b)) {
+                    return set_error(std::get<std::string>(r2b));
+                }
+                d->vcheck_lds_module = std::get<VkShaderModule>(r2b);
+            }
         }
         auto r3 = create_shader_module(*d->device, pad_code, pad_size);
         if (std::holds_alternative<std::string>(r3)) {
@@ -1698,6 +2032,25 @@ static void VS_CC Eedi3Create(
                 return set_error(std::get<std::string>(r4));
             }
             d->vcopy_module = std::get<VkShaderModule>(r4);
+        }
+        if (d->dst_host && d->device->host_import) {
+            const uint32_t * blit_code = nullptr;
+            size_t blit_size = 0;
+            switch (d->bits) {
+                case 16:
+                    blit_code = eedi3_16_blit_spv; blit_size = eedi3_16_blit_spv_size;
+                    break;
+                case 32:
+                    blit_code = eedi3_32_blit_spv; blit_size = eedi3_32_blit_spv_size;
+                    break;
+                default:
+                    return set_error("unsupported bit depth");
+            }
+            auto r5 = create_shader_module(*d->device, blit_code, blit_size);
+            if (std::holds_alternative<std::string>(r5)) {
+                return set_error(std::get<std::string>(r5));
+            }
+            d->blit_module = std::get<VkShaderModule>(r5);
         }
     }
 
@@ -1839,21 +2192,39 @@ static void VS_CC Eedi3Create(
         .lsz_vcheck = lsz_vcheck,
     };
 
-    // helper to fetch-or-create the (row, vcheck, pad, vcopy) pipelines for
-    // a width key; uses Eedi3Data::WidthKey (all filter-level params like
-    // vcheck/mclip are identical across planes, so the geometry fields
-    // dominate). The pad/vcopy upload kernels use fixed local sizes, so the
-    // row/vcheck workgroup-size spec entries are ignored by their pipelines.
+    // Shared-memory vcheck opt-out (durable tuning knob and A/B switch): the
+    // LDS path is strictly less memory traffic, but VSFEEL_EEDI3_VCLDS=0
+    // forces the global-read form so the two can be measured in one binary.
+    bool lds_ok = d->vcheck > 0 && d->vcheck_lds_module;
+    if (const char * lv = std::getenv("VSFEEL_EEDI3_VCLDS")) {
+        if (atoi(lv) == 0) {
+            lds_ok = false;
+        }
+    }
+
+    // helper to fetch-or-create the (row, vcheck, pad, vcopy, blit, vcheck_lds)
+    // pipelines for a width key; uses Eedi3Data::WidthKey (all filter-level
+    // params like vcheck/mclip are identical across planes, so the geometry
+    // fields dominate). The pad/vcopy/blit upload kernels use fixed local
+    // sizes, so the row/vcheck workgroup-size spec entries are ignored by
+    // their pipelines. Widths that fit the shared-memory vcheck take the LDS
+    // pipeline as their `vcheck` and leave vcopy unused.
     using WidthKey = Eedi3Data::WidthKey;
     auto get_pipelines = [&](const WidthKey & key, VkPipeline & row_pipe,
                              VkPipeline & vc_pipe, VkPipeline & pad_pipe,
-                             VkPipeline & vcopy_pipe) -> std::optional<std::string> {
+                             VkPipeline & vcopy_pipe,
+                             VkPipeline & blit_pipe,
+                             bool & use_lds) -> std::optional<std::string> {
+        use_lds = lds_ok && key.width <= MAXW_LDS;
         for (auto & [k, quad] : d->width_pipes) {
             if (k == key) {
                 row_pipe = quad[0];
                 vc_pipe = quad[1];
                 pad_pipe = quad[2];
                 vcopy_pipe = quad[3];
+                blit_pipe = quad[4];
+                // A cached entry wins only if it was built for the same d2p
+                // path; entries are keyed by width so they are consistent.
                 return std::nullopt;
             }
         }
@@ -1868,7 +2239,9 @@ static void VS_CC Eedi3Create(
         VkPipeline rowp = std::get<VkPipeline>(r1);
         VkPipeline vcp = VK_NULL_HANDLE;
         if (d->vcheck > 0) {
-            auto r2 = create_pipeline(*d->device, spec, d->vcheck_module, d->pipeline_layout, 0);
+            auto r2 = create_pipeline(*d->device, spec,
+                                      use_lds ? d->vcheck_lds_module : d->vcheck_module,
+                                      d->pipeline_layout, 0);
             if (std::holds_alternative<std::string>(r2)) {
                 vkDestroyPipeline(dev, rowp, nullptr);
                 return std::get<std::string>(r2);
@@ -1885,7 +2258,7 @@ static void VS_CC Eedi3Create(
         }
         VkPipeline padp = std::get<VkPipeline>(r3);
         VkPipeline vcopyp = VK_NULL_HANDLE;
-        if (d->vcheck > 0 && d->mclip_node) {
+        if (d->vcheck > 0 && d->mclip_node && !use_lds) {
             auto r4 = create_pipeline(*d->device, spec, d->vcopy_module, d->pipeline_layout, 0);
             if (std::holds_alternative<std::string>(r4)) {
                 vkDestroyPipeline(dev, rowp, nullptr);
@@ -1897,11 +2270,29 @@ static void VS_CC Eedi3Create(
             }
             vcopyp = std::get<VkPipeline>(r4);
         }
-        d->width_pipes.emplace_back(key, std::array<VkPipeline, 4>{ rowp, vcp, padp, vcopyp });
+        VkPipeline blitp = VK_NULL_HANDLE;
+        if (d->dst_host && d->device->host_import) {
+            auto r5 = create_pipeline(*d->device, spec, d->blit_module, d->pipeline_layout, 0);
+            if (std::holds_alternative<std::string>(r5)) {
+                vkDestroyPipeline(dev, rowp, nullptr);
+                if (vcp) {
+                    vkDestroyPipeline(dev, vcp, nullptr);
+                }
+                vkDestroyPipeline(dev, padp, nullptr);
+                if (vcopyp) {
+                    vkDestroyPipeline(dev, vcopyp, nullptr);
+                }
+                return std::get<std::string>(r5);
+            }
+            blitp = std::get<VkPipeline>(r5);
+        }
+        d->width_pipes.emplace_back(key, std::array<VkPipeline, 6>{
+            rowp, vcp, padp, vcopyp, blitp, VK_NULL_HANDLE });
         row_pipe = rowp;
         vc_pipe = vcp;
         pad_pipe = padp;
         vcopy_pipe = vcopyp;
+        blit_pipe = blitp;
         return std::nullopt;
     };
 
@@ -1912,7 +2303,8 @@ static void VS_CC Eedi3Create(
         auto & cfg = planes[plane];
         WidthKey key { cfg.width, cfg.rows, cfg.tpitch, cfg.pad_stride, cfg.pad_height };
         if (auto err = get_pipelines(key, cfg.row_pipeline, cfg.vcheck_pipeline,
-                                     cfg.pad_pipeline, cfg.vcopy_pipeline)) {
+                                     cfg.pad_pipeline, cfg.vcopy_pipeline,
+                                     cfg.blit_pipeline, cfg.vcheck_lds)) {
             return set_error(*err);
         }
     }
@@ -2084,6 +2476,12 @@ static void VS_CC Eedi3Create(
             if (d->rebar_up && upload_total > 0) {
                 checkVK(vkAllocateDescriptorSets(dev, &alloc_info, &resource.desc_set_pad));
             }
+            if (d->dst_host && d->device->host_import) {
+                for (int p = 0; p < MAX_PLANES; ++p) {
+                    checkVK(vkAllocateDescriptorSets(dev, &alloc_info,
+                                                     &resource.desc_set_blit[p]));
+                }
+            }
         }
         {
             // Heavily-reused kernel data (built pads, packed bits, sclip) is
@@ -2117,7 +2515,7 @@ static void VS_CC Eedi3Create(
                 .buffer = resource.dev_buf, .offset = 0, .range = VK_WHOLE_SIZE
             };
             VkDescriptorBufferInfo vout_info {
-                .buffer = d->vout_dev ? resource.dev_buf : resource.staging,
+                .buffer = d->vout_in_dev() ? resource.dev_buf : resource.staging,
                 .offset = 0, .range = VK_WHOLE_SIZE
             };
             // The PAD kernel reads the raw upload at binding 0 while the row
@@ -2165,6 +2563,23 @@ static void VS_CC Eedi3Create(
                         : (b == 8) ? &pad_info : infos[b];
                 }
                 vkUpdateDescriptorSets(dev, BIND_COUNT, pad_writes, 0, nullptr);
+            }
+
+            if (d->dst_host && d->device->host_import) {
+                // One set per plane for the direct-to-frame blit: the shader
+                // only reads b7 (tight vout rows) and writes b1, whose buffer
+                // is re-pointed at that plane's imported frame every frame
+                // before the command buffer is recorded. All other bindings
+                // are written with valid defaults so no binding is left
+                // undefined.
+                for (int p = 0; p < MAX_PLANES; ++p) {
+                    VkWriteDescriptorSet blit_writes[BIND_COUNT];
+                    for (uint32_t b = 0; b < BIND_COUNT; ++b) {
+                        blit_writes[b] = writes[b];
+                        blit_writes[b].dstSet = resource.desc_set_blit[p];
+                    }
+                    vkUpdateDescriptorSets(dev, BIND_COUNT, blit_writes, 0, nullptr);
+                }
             }
         }
 

@@ -100,6 +100,16 @@ const int BT_TILE = 32;
 #define PROBE 0
 #endif
 
+// vcheck d2p source (see the ENTRY_VCHECK section): 1 = carry the modified
+// previous interp row in shared memory, 0 = read it back from vout.
+#ifndef VCHECK_LDS
+#define VCHECK_LDS 0
+#endif
+// Compile-time max plane width the LDS ping-pong can hold (per row buffer).
+#ifndef MAXW
+#define MAXW 4096
+#endif
+
 #if defined(ENTRY_PAD)
 // Raw tight kept rows (u16/f32 native) uploaded through the H2D mirror;
 // ENTRY_PAD expands the mirror margins into the built pad (binding 8,
@@ -168,6 +178,12 @@ layout(push_constant) uniform PC {
     // live in the H2D mirror (b0), like everything else the kernels reuse.
     int raw_base;     // pad-elem base of the tight kept rows
     int rempty_base;  // int8 base of the per-row empty flags (dev_buf via b3)
+    // ENTRY_BLIT only: row pitch of the OUTPUT FRAME in io elements (b1 is the
+    // imported frame, b7 the tight interp rows in dev_buf).
+    int dst_stride;
+    // ENTRY_PAD only: skip pad rows of parity `field` (never read; see the pad
+    // kernel). Diagnostics/tuning knob, default on.
+    int pad_skip_parity;
 } pc;
 
 // Padded-plane access at OUTPUT dst-row coordinates. copyPad places every
@@ -787,25 +803,81 @@ void main() {
 // No shared-memory staging (matches vszipcl's vcheck; the LDS ping-pong was
 // measurably slower). Non-vcheckable rows (kept rows / edges) pass the plain
 // dst value through to vout unchanged.
+//
+// VCHECK_LDS selects where the d2p term reads the MODIFIED previous interp row
+// from: 1 = a shared-memory ping-pong holding the last two rows (the
+// reference eedi3vk2's structure, quantized through the pixel format exactly
+// like the frame read-back did), 0 = back from vout in global memory. The LDS
+// form removes one global (staging, when vout is not device-local) read per
+// dirc != 0 pixel; it needs a compile-time max width and the host only picks
+// it when width <= MAXW and the device's shared-memory limit fits 2*MAXW
+// floats, otherwise the global form runs unchanged.
 layout(local_size_x_id = 7) in;
+
+// Quantized vcheck output as an integer-valued float (u16 rounds half-up and
+// clamps; f32 passes through). 16-bit types cannot be a function return type
+// here, so every store converts at the assignment instead.
+float vc_quant(float v) {
+#if BITS == 16
+    return clamp(floor(v + 0.5f), 0.0f, PEAK);
+#else
+    return v;
+#endif
+}
+
+// Store one quantized value into the global vout row.
+void vout_store(int r, int x, float q) {
+#if BITS == 16
+    vout[pc.vout_base + r * WIDTH + x] = IO_TYPE(uint(q));
+#else
+    vout[pc.vout_base + r * WIDTH + x] = q;
+#endif
+}
+
+#if VCHECK_LDS
+shared float tlineSh[2][MAXW];
+int g_cur, g_prev;
+float vc_prev(int i) { return tlineSh[g_prev][i]; }
+void vc_store(int x, float q) { tlineSh[g_cur][x] = q; }
+#else
+int g_row, g_prev_row;
+float vc_prev(int i) {
+#if BITS == 16
+    return float(int(vout[pc.vout_base + g_prev_row * WIDTH + i]));
+#else
+    return vout[pc.vout_base + g_prev_row * WIDTH + i];
+#endif
+}
+void vc_store(int x, float q) { vout_store(g_row, x, q); }
+#endif
 
 void main() {
     const int tid = int(gl_LocalInvocationID.x);
     const int lsz = int(gl_WorkGroupSize.x);
 
     for (int r = 0; r < pc.rows; ++r) {
+#if VCHECK_LDS
+        // Every row must advance the LDS chain, so there is no empty-row skip
+        // on this path (and the host does not dispatch ENTRY_VCOPY): an empty
+        // row's pixels all have dirc == 0 and take the cint_s branch below,
+        // which is exactly what vcopy wrote for them.
+        g_cur = r & 1;
+        g_prev = 1 - g_cur;
+#else
         // Empty (fully-masked, dmap-0) rows were already copied by ENTRY_VCOPY
         // and need no ordering: skip them AND their barrier (this is the whole
         // win — ~2/3 of the 1080 serial barriers disappear). Uniform branch:
         // every lane reads the same flag byte.
         if (dmap[pc.rempty_base + r] != int8_t(0))
             continue;
+        g_row = r;
+        g_prev_row = (r >= 1) ? (r - 1) : 0;
+#endif
         const int y = MARGIN_V + pc.field + 2 * r;   // pad row of this interp row
         const bool do_row = (y >= 6 && y < pc.pad_height - 6);
         const int yf = pc.field + 2 * r;
         const int dr = (r >= 1) ? (r - 1) : 0;        // interp row for dmap dirt
         const int dn = (r + 1 < pc.rows) ? (r + 1) : r;   // next interp row
-        const int pr_row = (r >= 1) ? (r - 1) : 0;    // vout row for d2p
 
         for (int x = tid; x < WIDTH; x += lsz) {
             float oval;
@@ -838,7 +910,7 @@ void main() {
                         const int v1p0 = int(pad_get(yf - 1, x));
                         const int v1n0 = int(pad_get(yf + 1, x));
                         const int pr = (r >= 1)
-                            ? int(vout[pc.vout_base + pr_row * WIDTH + x + dirc]) : 0;
+                            ? int(vc_prev(x + dirc)) : 0;
                         const int it = (pr + dm + 1) >> 1;
                         const int ib = (dCp + dNm + 1) >> 1;
                         const int vt = abs(pr - v1px) + abs(dCp - v1px);
@@ -867,7 +939,7 @@ void main() {
                         oval = float(min(max(int(blend), 0), 65535));
 #else
                         const float pr = (r >= 1)
-                            ? vout[pc.vout_base + pr_row * WIDTH + x + dirc] : 0.0f;
+                            ? vc_prev(x + dirc) : 0.0f;
                         const float dCi = load_dst_val(r, x);
                         const float dCp = load_dst_val(r, x + dirc);
                         const float dm  = load_dst_val(r, x - dirc);
@@ -905,15 +977,29 @@ void main() {
                     }
                 }
             }
-#if BITS == 16
-            vout[pc.vout_base + r * WIDTH + x] = IO_TYPE(uint(clamp(floor(oval + 0.5f), 0.0f, PEAK)));
-#else
-            vout[pc.vout_base + r * WIDTH + x] = oval;
-#endif
+            vc_store(x, vc_quant(oval));
         }
+#if VCHECK_LDS
+        // The previous row is final now: flush it to vout. The barrier below
+        // orders this flush (and the row it came from) before the next
+        // iteration reuses that ping-pong buffer.
+        if (r >= 1) {
+            for (int x = tid; x < WIDTH; x += lsz) {
+                vout_store(r - 1, x, tlineSh[g_prev][x]);
+            }
+        }
+#endif
         groupMemoryBarrier();
         barrier();
     }
+#if VCHECK_LDS
+    if (pc.rows >= 1) {
+        const int r = pc.rows - 1;
+        for (int x = tid; x < WIDTH; x += lsz) {
+            vout_store(r, x, tlineSh[r & 1][x]);
+        }
+    }
+#endif
 }
 
 #endif  // ENTRY_VCHECK
@@ -984,6 +1070,13 @@ void main() {
     const int off = 1 - pc.field;
     const int pad_w = WIDTH + 2 * MARGIN_H;
 
+    // pad_get is only ever called at pad rows MARGIN_V + dst_row with
+    // dst_row = field + 2r +/- {1,3}, so every row that is READ has parity
+    // (MARGIN_V + field + 1) & 1 == (field + 1) & 1. Rows of the other parity
+    // are written and never read: skip them (halves the pad kernel's stores and
+    // mirror math). The buffer keeps stale values there, which nothing reads.
+    if (pc.pad_skip_parity != 0 && (py & 1) == (pc.field & 1)) return;
+
     int qy = py;
     if (qy < MARGIN_V) {
         qy = 2 * MARGIN_V - qy;
@@ -1007,3 +1100,27 @@ void main() {
 }
 
 #endif  // ENTRY_PAD
+
+#if defined(ENTRY_BLIT)
+
+// Direct-to-frame output rows (VK_EXT_external_memory_host path, default off).
+// The interp rows produced by ENTRY_ROW (or vcheck) sit tight in dev_buf at b7;
+// the output frame's own memory is bound as b1, so this pass spreads those rows
+// into the frame at its real row pitch and interp parity, replacing the CPU
+// blit (a staging read plus a frame write, ~20% of the frame) with a GPU pass
+// (~1 ms of frame latency at 2160p). The transfer engine was tried for this and
+// is not usable: a multi-region vkCmdCopyBuffer with one region per interp row
+// costs ~13 us per region in situ, i.e. ~14 ms of frame latency.
+layout(local_size_x = 256) in;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const int total = pc.rows * WIDTH;
+    if (int(i) >= total) return;
+    const int r = int(i) / WIDTH;
+    const int x = int(i) % WIDTH;
+    dst[pc.dst_base + (pc.field + 2 * r) * pc.dst_stride + x] =
+        vout[pc.vout_base + r * WIDTH + x];
+}
+
+#endif  // ENTRY_BLIT

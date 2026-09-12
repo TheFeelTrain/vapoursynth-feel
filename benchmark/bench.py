@@ -160,9 +160,14 @@ core.max_cache_size = 1024 * 48
 src = BestSource(cachepath=None).source({clip!r}, 32)
 luma = depth(get_y(src), {bits})
 
-# vsaa.based_aa mask chain (defaults: Prewitt, mask_thr=60)
+# vsaa.based_aa mask chain (defaults: Prewitt, mask_thr=60). The threshold
+# must be scaled to 32 (not to `bits`): Morpho.binarize_mask re-scales its
+# midthr from the 32-bit float range to the clip's format, so passing an
+# already-16-bit-scaled 15420 becomes 65535 and the mask comes out all zero
+# (which silently disables mclip and turns EEDI3 into a row copier).
+# vsaa/funcs.py:171 does exactly this with scale_mask(mask_thr, 8, 32).
 mask = EdgeDetect.ensure_obj(Prewitt).edgemask(luma)
-mask = Morpho.binarize_mask(mask, scale_mask(60, 8, {bits}))
+mask = Morpho.binarize_mask(mask, scale_mask(60, 8, 32))
 mask = box_blur(mask.std.Maximum())
 
 # Point 2x upscale of input + mask (user: "double the size of the input frames

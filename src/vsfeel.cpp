@@ -527,6 +527,18 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
         return "vkCreateDevice failed: "s + vk_result_string(result);
     }
 
+    if (dev->host_import) {
+        // Device-level command of VK_EXT_external_memory_host (the extension is
+        // enabled above whenever the physical device advertised it). It reports
+        // which memory types accept a given host pointer.
+        dev->get_memory_host_pointer_properties =
+            reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+                vkGetDeviceProcAddr(dev->device, "vkGetMemoryHostPointerPropertiesEXT"));
+        if (!dev->get_memory_host_pointer_properties) {
+            dev->host_import = false;
+        }
+    }
+
     dev->queues.reserve(dev->queue_count);
     for (uint32_t i = 0; i < dev->queue_count; ++i) {
         VkQueue queue;
