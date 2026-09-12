@@ -231,6 +231,12 @@ struct Eedi3Data {
     bool blit_contig {}; // diagnostics: one contiguous copy instead of per-row
     // Gray16 mclip handled natively (no SetFrameProps+resize.Point->Gray8 node).
     bool mclip_native16 {};
+    // Gray32 float mclip handled natively too. based_aa passes mclip in the
+    // CLIP's format, so a float clip gets a float mask; eedi3vk2 consumes that
+    // directly, and forcing it through the reference conversion node made
+    // vsfeel pay a whole extra full-frame pass that based_aa does not require.
+    // The exact predicate is in build_bmask_row.
+    bool mclip_native32 {};
     bool skip_pad {};    // diagnostics: skip the pad-builder dispatch
     // ENTRY_PAD stores only the pad rows pad_get can read (parity 1-field:
     // every interp row's +/-{1,3} taps). The other parity is written and never
@@ -564,10 +570,27 @@ struct Eedi3Direct {
 //
 // scratch must hold 2 * ((width + mdis + 63) / 64) uint64 words.
 static void build_bmask_row_scalar(const uint8_t * maskp, const uint16_t * mask16,
+                                   const float * maskf,
                                    uint32_t * out, const int width, const int mdis) {
-    // Native u16 masks use the exact bit-depth-reduction threshold (see
-    // build_bmask_row): nonzero-after-conversion == (v >= 129).
+    // Native masks use the exact bit-depth-reduction threshold (see
+    // build_bmask_row): nonzero-after-conversion == (v >= 129) for Gray16 and
+    // == (v > 0.5/255) for a full-range Gray32 float mask.
+    //
+    // Float masks are only required to live in [0,1] (based_aa's are exactly
+    // 0.0/1.0), and the predicate is exact there. One deliberate divergence:
+    // zimg's float->8-bit reduction is a saturating SIMD convert, so a value
+    // above ~8.42e6 (where v*255+0.5 overflows int32) converts to byte 0.
+    // Reproducing that would make vsfeel depend on an unrelated library's
+    // integer-overflow behavior, and eedi3vk2 -- which consumes the float mask
+    // directly -- treats such a value as nonzero. The native path follows
+    // eedi3vk2.
     auto nz = [&](int x) {
+        if (maskf) {
+            // STRICT >: measured on the real conversion, the first float whose
+            // converted byte is nonzero is 0x1.01104p-9 = nextafter(0.5f/255),
+            // so ">= 0.5f/255" is off by one ULP (round 11's cmpgt lesson).
+            return maskf[x] > 0.5f / 255.0f;
+        }
         return mask16 ? (mask16[x] >= 129u) : (maskp[x] != 0);
     };
     const int minmdis = std::min(width, mdis);
@@ -613,6 +636,7 @@ static inline uint32_t bmask_bits16(const __m256i v) {
 }
 
 static void build_bmask_row(const uint8_t * maskp, const uint16_t * mask16,
+                            const float * maskf,
                             uint32_t * out,
                             const int width, const int mdis,
                             uint64_t * scratch) {
@@ -623,7 +647,7 @@ static void build_bmask_row(const uint8_t * maskp, const uint16_t * mask16,
     if (mdis >= 64 || width < 2 * mdis) {
         const int nwords = (width + 31) / 32;
         std::memset(out, 0, static_cast<size_t>(nwords) * sizeof(uint32_t));
-        build_bmask_row_scalar(maskp, mask16, out, width, mdis);
+        build_bmask_row_scalar(maskp, mask16, maskf, out, width, mdis);
         return;
     }
 
@@ -638,7 +662,35 @@ static void build_bmask_row(const uint8_t * maskp, const uint16_t * mask16,
     // 1. pack: bit x = mask non-zero; words past nw_b stay zero
     std::memset(scratch, 0, static_cast<size_t>(nw) * sizeof(uint64_t));
     const __m256i zero = _mm256_setzero_si256();
-    if (mask16) {
+    if (maskf) {
+        // Float mask: the conversion node computed round(clamp(v,0,1)*255) and
+        // tested != 0, which holds exactly for v > 0.5f/255 (the boundary float
+        // is nextafter(0.5f/255) — see build_bmask_row_scalar). Strict compare,
+        // so no multiply: the threshold IS the comparison constant.
+        const __m256 thresh = _mm256_set1_ps(0.5f / 255.0f);
+        for (int i = 0; i < nw_b; ++i) {
+            const int x = i * 64;
+            uint64_t w = 0;
+            for (int g = 0; g < 8; ++g) {
+                const int xb = x + g * 8;
+                uint32_t m = 0;
+                if (xb + 8 <= width) {
+                    m = static_cast<uint32_t>(_mm256_movemask_ps(
+                        _mm256_cmp_ps(_mm256_loadu_ps(maskf + xb), thresh,
+                                      _CMP_GT_OQ)));
+                } else if (xb < width) {
+                    float tmp[8] = {};
+                    std::memcpy(tmp, maskf + xb,
+                                static_cast<size_t>(width - xb) * sizeof(float));
+                    m = static_cast<uint32_t>(_mm256_movemask_ps(
+                        _mm256_cmp_ps(_mm256_loadu_ps(tmp), thresh,
+                                      _CMP_GT_OQ)));
+                }
+                w |= static_cast<uint64_t>(m) << (g * 8);
+            }
+            scratch[i] = w;
+        }
+    } else if (mask16) {
         for (int i = 0; i < nw_b; ++i) {
             const int x = i * 64;
             uint64_t w = 0;
@@ -1371,6 +1423,8 @@ static const VSFrame *VS_CC Eedi3GetFrame(
             const ptrdiff_t mask_stride = vsapi->getStride(mcp, 0);
             const uint16_t * mask16 = d->mclip_native16
                 ? reinterpret_cast<const uint16_t *>(maskp) : nullptr;
+            const float * maskf = d->mclip_native32
+                ? reinterpret_cast<const float *>(maskp) : nullptr;
             uint8_t * bm = upload + cfg.bits_offset;
             const size_t bm_row_bytes =
                 static_cast<size_t>((cfg.width + 31) / 32) * sizeof(uint32_t);
@@ -1383,6 +1437,8 @@ static const VSFrame *VS_CC Eedi3GetFrame(
                 build_bmask_row(mrow_p,
                                 mask16 ? reinterpret_cast<const uint16_t *>(mrow_p)
                                        : nullptr,
+                                maskf ? reinterpret_cast<const float *>(mrow_p)
+                                      : nullptr,
                                 reinterpret_cast<uint32_t *>(bmr),
                                 cfg.width, d->mdis, bmask_scratch.data());
             }
@@ -1700,12 +1756,17 @@ static void VS_CC Eedi3Create(
             return set_error("mclip's number of frames doesn't match");
         }
 
-        // Gray16 integer masks are handled natively: the exact boolean the
-        // Gray8 conversion would produce is (v >= 129), verified exhaustively,
-        // so the extra full-frame graph node is pure overhead. Everything else
-        // (float, 10/12/14-bit, ...) keeps the reference conversion.
+        // Gray16 integer and Gray32 float masks are handled natively: the exact
+        // boolean the Gray8 conversion would produce is (v >= 129) for Gray16
+        // (verified exhaustively) and (v * 255 >= 0.5) for a full-range float
+        // mask, so the extra full-frame graph node is pure overhead. This
+        // matters for based_aa, which passes mclip in the CLIP's format: a
+        // float clip gets a float mask, and eedi3vk2 consumes it directly.
+        // Other depths (10/12/14-bit) keep the reference conversion.
         if (mvi->format.bitsPerSample == 16 && mvi->format.sampleType == stInteger) {
             d->mclip_native16 = true;
+        } else if (mvi->format.bitsPerSample == 32 && mvi->format.sampleType == stFloat) {
+            d->mclip_native32 = true;
         } else if (mvi->format.bitsPerSample != 8 || mvi->format.sampleType != stInteger) {
             VSMap * args = vsapi->createMap();
             vsapi->mapConsumeNode(args, "clip", d->mclip_node, maReplace);

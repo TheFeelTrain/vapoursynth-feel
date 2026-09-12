@@ -729,8 +729,37 @@ void main() {
 #endif
     for (int x0 = ((WIDTH - 2) / BT_TILE) * BT_TILE; x0 >= 0; x0 -= BT_TILE) {
         const int n = min(BT_TILE, WIDTH - 1 - x0);
-        if (x0 + n <= xmin)
-            break;
+        if (x0 + n <= xmin) {
+            // Tile entirely left of the first DP column: no walk is needed
+            // (nothing here reads a direction), but the vertical cubic MUST
+            // still be written. Skipping it left `dst` stale for every column
+            // below the first DP column — uninitialized memory on the first
+            // frame and a recycled resource's previous contents afterwards.
+            // That was the structured-mclip nondeterminism (round 15/16): a
+            // mask whose first processed column is far enough right that a
+            // whole tile gets skipped, which is why an all-zero mask (xmin =
+            // WIDTH, handled by the parallel-cubic branch), an all-white mask
+            // (xmin = 0) and the noise-clip half/half mask never showed it.
+            for (int x = lane; x < n; x += SGSIZE) {
+                const int xt = x0 + x;
+                const float oval = cubic_float(dy, xt);
+                if (VCHECK_MODE > 0) {
+                    dmap[pc.dmap_base + r * WIDTH + xt] = int8_t(0);
+                    if (HAS_SCLIP == 0) {
+#if BITS == 16
+                        cint[pc.cint_base + r * WIDTH + xt] =
+                            IO_TYPE(uint(clamp(floor(cubic_float(dy, xt) + 0.5f), 0.0f, PEAK)));
+#else
+                        cint[pc.cint_base + r * WIDTH + xt] = cubic_float(dy, xt);
+#endif
+                    }
+                }
+                store_dst_val(r, xt, oval);
+            }
+            // No shared state is touched here, so the tile barrier can be
+            // skipped: every lane passed the previous iteration's end barrier.
+            continue;
+        }
 
         if (lane == 0) {
             // Walk only down to xmin: columns left of it are all masked

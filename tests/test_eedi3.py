@@ -432,6 +432,123 @@ def test_eedi3_mclip_auto_converts_gray16_gray32(noise_gray, noise_16bit):
             assert np.array_equal(a, b), f"mask conversion mismatch at frame {n}"
 
 
+def _mask_boundary_values(width):
+    """A row of consecutive float32 values straddling the mask-conversion
+    boundary (0.5/255). Only values here can distinguish "v > 0.5/255" from the
+    reference conversion's nonzero test -- binary or uniformly random masks
+    cannot see an off-by-one-ULP predicate (the round-11 lesson)."""
+    mid = np.float32(0.5) / np.float32(255.0)
+    vals = []
+    v = mid
+    for _ in range(width // 2):
+        v = np.nextafter(v, np.float32(-1.0), dtype=np.float32)
+        vals.append(v)
+    vals.reverse()
+    vals.append(mid)
+    v = mid
+    while len(vals) < width:
+        v = np.nextafter(v, np.float32(2.0), dtype=np.float32)
+        vals.append(v)
+    return np.array(vals, dtype=np.float32)
+
+
+def _float_mask_clip(arr, length):
+    """A GrayS (32-bit float) mask clip carrying ``arr`` (h, w)."""
+    h, w = arr.shape
+    base = vs.core.std.BlankClip(format=vs.GRAYS, width=w, height=h,
+                                 length=length, color=[0.0])
+
+    def mk(n, f):
+        out = f.copy()
+        p = np.asarray(out[0])
+        p[:h, :w] = arr
+        return out
+
+    return base.std.ModifyFrame(base, mk)
+
+
+@pytest.mark.parametrize("kind", ["ramp", "checker"])
+@pytest.mark.parametrize("mdis,nrad", [(5, 1), (20, 3)])
+def test_eedi3_mclip_float_native_matches_reference_conversion(
+        noise_16bit, kind, mdis, nrad):
+    """A GrayS float mask is now handled natively (no SetFrameProps ->
+    resize.Point -> Gray8 node). It must produce exactly what the deleted
+    reference conversion produced, including at the predicate boundary.
+
+    The oracle is built in-graph: the same float mask pushed through the
+    reference conversion and passed as an explicit Gray8 mask must give a
+    bit-identical result to passing the float mask directly. Both distributions
+    are concentrated on the two critical floats (the boundary value and the one
+    above it), which is the ONLY input class that can see the strict-vs-
+    non-strict comparison (verified by mutating ">" to ">=": the ramp and
+    checker cases both fail)."""
+    clip = noise_16bit
+    kw = dict(field=1, mdis=mdis, nrad=nrad, vcheck=0)
+    mid = np.float32(0.5) / np.float32(255.0)
+    above = np.nextafter(mid, np.float32(2.0), dtype=np.float32)
+    if kind == "ramp":
+        arr = np.tile(_mask_boundary_values(WIDTH), (HEIGHT, 1))
+    else:
+        # alternate the boundary value with the first value above it, so a
+        # predicate that wrongly includes `mid` flips half the columns
+        xs = np.arange(WIDTH)
+        arr = np.where((xs % 2 == 0)[None, :], mid, above)
+        arr = np.repeat(arr, HEIGHT, axis=0).astype(np.float32)
+
+    mf = _float_mask_clip(arr, clip.num_frames)
+    # Exactly the node the filter used to insert.
+    mconv = vs.core.resize.Point(
+        vs.core.std.SetFrameProps(mf, _Range=1), format=vs.GRAY8)
+
+    native = _run(clip, mclip=mf, **kw)
+    converted = _run(clip, mclip=mconv, **kw)
+    for n in (0, 11):
+        a = _plane(native.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+        b = _plane(converted.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+        assert np.array_equal(a, b), (
+            f"native float mask != reference conversion ({kind}, mdis={mdis}, "
+            f"nrad={nrad}) at frame {n}")
+
+
+@pytest.mark.parametrize("mdis,nrad", [(5, 1), (20, 3)])
+def test_eedi3_mclip_long_mask_off_prefix(noise_16bit, mdis, nrad):
+    """A mask that is OFF for a long left prefix puts the first DP column far
+    to the right. Every column left of it must still be written (the vertical
+    cubic). The backtrack used to `break` out of its tile loop once a whole
+    tile sat left of that column, leaving dst stale -- uninitialized on the
+    first frame -- which made output nondeterministic and wrong in the prefix.
+    (This is the structured-mclip nondeterminism tracked from round 14; the
+    existing tests missed it because their half/half mask puts the mask ON on
+    the left, i.e. first DP column 0.)"""
+    clip = noise_16bit
+    kw = dict(field=1, mdis=mdis, nrad=nrad, vcheck=0)
+    half = WIDTH // 2
+    black = vs.core.std.BlankClip(format=vs.GRAY8, width=half, height=HEIGHT,
+                                  length=clip.num_frames, color=[0])
+    white = vs.core.std.BlankClip(format=vs.GRAY8, width=WIDTH - half,
+                                  height=HEIGHT, length=clip.num_frames,
+                                  color=[255])
+    m16 = vs.core.fmtc.bitdepth(vs.core.std.StackHorizontal([black, white]),
+                                bits=16, fulls=True, fulld=True)
+
+    outs = [_run(clip, mclip=m16, **kw) for _ in range(3)]
+    zero = vs.core.std.BlankClip(format=vs.GRAY16, width=WIDTH, height=HEIGHT,
+                                 length=clip.num_frames, color=[0])
+    z = _run(clip, mclip=zero, **kw)
+    for n in (0, 11):
+        ref = _plane(outs[0].get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+        for o in outs[1:]:
+            cur = _plane(o.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+            assert np.array_equal(ref, cur), (
+                f"nondeterministic with a long mask-off prefix at frame {n}")
+        zc = _plane(z.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+        # The host dilates the mask by +/-mdis, so the first DP column is
+        # half-mdis; everything strictly left of that must be the cubic.
+        safe = half - mdis - 2
+        assert np.array_equal(ref[:, :safe], zc[:, :safe]), (
+            f"mask-off prefix is not the vertical cubic at frame {n}")
+
+
 def test_eedi3_mclip_masked_region_is_vertical_cubic(noise_16bit):
     """Inside a masked (black) region the interpolated pixel is the vertical
     cubic of the two kept rows; verify on a mid-frame interp row where all
