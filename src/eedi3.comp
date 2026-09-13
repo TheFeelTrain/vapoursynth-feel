@@ -98,7 +98,23 @@ const int BT_TILE = 32;
 // return after the mask pack/span scan; 3 = return at entry; 4 = skip the pbt
 // stores entirely; 5 = return after the DP, no backtrack; 6 = backtrack reads
 // the previous row's pbt, i.e. no same-workgroup store->load dependency).
-// Kept as a tuning instrument; only 2/4/6 produced the round-15 cost model.
+// 7 = the real walk PLUS a second, discarded walk over the PREVIOUS row's pbt
+// (same dependent-load chain, but its lines were written by another workgroup,
+// so it never hits a freshly-issued store). Output is unchanged, so it costs
+// exactly one extra non-hazardous serial walk: if that is cheap, the cost of
+// the real walk is the same-workgroup store visibility, not the chain latency.
+// 8 = the same extra walk but with an f-INDEPENDENT address, so its loads can
+// issue ahead of the chain. 7 vs 8 costs the dependent-address chain alone.
+// 9 = keep the DP but store every column to the same 41 bytes (no store
+// traffic, same instruction count) -> separates DP compute from store cost.
+// 10 = 8's walk with an explicit 4x unroll so independent loads can overlap.
+// 12 = like 2 but dmap is filled with a realistic direction pattern first, so
+// the downstream vcheck's branch mix matches the real kernel.
+// Kept as a tuning instrument. NOTE (round 20): the entry guard used to be
+// `PROBE >= 3`, so levels 4-7 silently compiled to an EMPTY kernel (1656 B of
+// SPIR-V, against 43720 B for PROBE=0) and the old "only 2/4/6 produced the
+// cost model" claim is void for 4 and 6. Always `stat` the built .spv size
+// after building a probe variant. The round-20 model used 2/5/6/7/8/9/10/12.
 #ifndef PROBE
 #define PROBE 0
 #endif
@@ -178,8 +194,10 @@ layout(std430, binding = 10) writeonly buffer CompOut {
 };
 // Without a vcheck the interpolated values are the row kernel's dst rows
 // (binding 1) rather than the vcheck output; VCHECK_MODE is a spec constant so
-// the selection folds away.
-layout(std430, binding = 1) readonly buffer CompDst {
+// the selection folds away. In the EEDI3AA fused path (comp_fuse != 0) this
+// same binding is the device-local home of the FIRST sub-pass's assembled
+// plane, which is why it is declared writable for every mode.
+layout(std430, binding = 1) buffer CompDst {
 #if BITS == 16
     uint16_t cdst[];
 #else
@@ -287,6 +305,14 @@ layout(push_constant) uniform PC {
     // constants rather than extra bindings.
     int vout2_base;
     int raw2_base;
+    // ENTRY_COMPOSE only, EEDI3AA fused horizontal output:
+    //   0 = the historical two-plane compose (write O to b10 for the CPU merge)
+    //   1 = first sub-pass: write the assembled plane O_0 into b1 (device-local)
+    //   2 = second sub-pass: read O_0 from b1, assemble O_1 and write the 50/50
+    //       merge of the two straight to b10 (the staging download).
+    // This removes one full-plane PCIe write and the CPU merge read; b1's
+    // element base is reuse of `dst_base` (unused by compose when vcheck > 0).
+    int comp_fuse;
 } pc;
 
 // Padded-plane access at OUTPUT dst-row coordinates. copyPad places every
@@ -529,7 +555,7 @@ void main() {
     const int pbt_row = pc.pbt_base + r * (WIDTH * TPITCH);
     const int laneBase = lane * K;
 
-#if PROBE >= 3
+#if PROBE == 3
     if (lane == 0) dmap[pc.rempty_base + r] = int8_t(0);
     return;
 #endif
@@ -568,6 +594,17 @@ void main() {
     // divergence): fully-masked rows skip the serial vcheck walk.
     if (lane == 0)
         dmap[pc.rempty_base + r] = int8_t(xmin >= WIDTH ? 1 : 0);
+#if PROBE == 12
+    // Faithful "no row kernel" ablation: the DP/backtrack/interpolate are all
+    // skipped, but dmap is filled with a REALISTIC direction pattern (0 on
+    // masked columns, nonzero on the DP columns) so the downstream vcheck takes
+    // the same branch mix it takes on the real kernel. PROBE 2 returns with
+    // dmap stale, which leaves the vcheck on its dirc==0 fast branch and
+    // therefore overstates the row kernel's share.
+    for (int x = lane; x < WIDTH; x += SGSIZE)
+        dmap[pc.dmap_base + r * WIDTH + x] = int8_t((x >= xmin) ? 1 : 0);
+    return;
+#endif
 #if PROBE == 2
     return;
 #endif
@@ -686,6 +723,10 @@ void main() {
                     pbt[pbt_row + (xd - 1) * TPITCH + laneBase + j] = int8_t(0);
 #elif PROBE == 4
                     ;  // diagnostics: no pbt store at all (traffic ablation)
+#elif PROBE == 9
+                    // diagnostics: keep the DP, write every column to the SAME
+                    // 41 bytes (no xd in the address) -> ~zero store traffic.
+                    pbt[pbt_row + laneBase + j] = int8_t(cRel[j]);
 #else
                     pbt[pbt_row + (xd - 1) * TPITCH + laneBase + j] = int8_t(cRel[j]);
 #endif
@@ -771,6 +812,8 @@ void main() {
                     pbt[pbt_row + (xd - 1) * TPITCH + i] = int8_t(0);
 #elif PROBE == 4
                     ;  // diagnostics: no pbt store at all (traffic ablation)
+#elif PROBE == 9
+                    pbt[pbt_row + i] = int8_t(cRel[j]);
 #else
                     pbt[pbt_row + (xd - 1) * TPITCH + i] = int8_t(cRel[j]);
 #endif
@@ -881,6 +924,41 @@ void main() {
                 tileF[x - x0] = int8_t(f);
             }
             fcarry = f;
+#if PROBE == 7 || PROBE == 8 || PROBE == 10
+            // Diagnostics: one extra identical walk over the PREVIOUS row's
+            // pbt row (written by another workgroup, so no same-workgroup
+            // store->load hazard), result discarded. Same chain latency and
+            // same load count as the real walk; pure extra cost. PROBE 7 keeps
+            // the f-dependent address (serial chain intact); PROBE 8 makes the
+            // address f-independent (loads can issue ahead / MLP), so 7 vs 8
+            // isolates the cost of the dependent-address chain itself.
+            {
+                const int pbt_old = (r >= 1) ? (pbt_row - WIDTH * TPITCH) : pbt_row;
+                int f2 = 0;
+#if PROBE == 7
+                for (int x = x0 + n - 1; x >= xlo; --x)
+                    f2 += int(pbt[pbt_old + x * TPITCH + CENTER + f2]);
+#elif PROBE == 8
+                for (int x = x0 + n - 1; x >= xlo; --x)
+                    f2 += int(pbt[pbt_old + x * TPITCH + CENTER]);
+#else
+                // PROBE 10: f-independent address AND explicitly unrolled by 4, so
+                // four independent loads issue back-to-back (memory-level
+                // parallelism). 8 vs 10 answers "is the walk latency-bound?".
+                int x = x0 + n - 1;
+                for (; x >= xlo + 3; x -= 4) {
+                    const int a = int(pbt[pbt_old + x * TPITCH + CENTER]);
+                    const int b = int(pbt[pbt_old + (x - 1) * TPITCH + CENTER]);
+                    const int c = int(pbt[pbt_old + (x - 2) * TPITCH + CENTER]);
+                    const int d = int(pbt[pbt_old + (x - 3) * TPITCH + CENTER]);
+                    f2 += a + b + c + d;
+                }
+                for (; x >= xlo; --x)
+                    f2 += int(pbt[pbt_old + x * TPITCH + CENTER]);
+#endif
+                if (f2 == pc.pbt_base) dmap[pc.rempty_base + r] = int8_t(0);
+            }
+#endif
         }
         subgroupMemoryBarrierShared();
         subgroupBarrier();
@@ -1335,6 +1413,16 @@ layout(local_size_x = 16, local_size_y = 16) in;
 shared SHARED_T compV[16][17];
 shared SHARED_T compR[16][17];
 
+// std.Merge's default 50/50: u16 is (a+b+1)>>1 (== _mm256_avg_epu16), f32 is
+// 0.5f*a + 0.5f*b in the same association order the CPU merge used.
+SHARED_T merge_avg(const SHARED_T a, const SHARED_T b) {
+#if BITS == 16
+    return (a + b + 1u) >> 1;
+#else
+    return 0.5f * a + 0.5f * b;
+#endif
+}
+
 void main() {
     const int tx = int(gl_LocalInvocationID.x);
     const int ty = int(gl_LocalInvocationID.y);
@@ -1361,9 +1449,28 @@ void main() {
         const int k = bx + tx;
         const int y = by + ty;
         if (k < pc.rows && y < WIDTH) {
-            const int o = pc.out_base + y * (2 * pc.rows) + 2 * k;
-            cout2[o + pc.field] = IO_TYPE(compV[tx][ty]);
-            cout2[o + (1 - pc.field)] = IO_TYPE(compR[tx][ty]);
+            // Plane-relative element offset (both the b1 o0 region and the b10
+            // staging output are addressed from their own base).
+            const int off = y * (2 * pc.rows) + 2 * k;
+            if (pc.comp_fuse == 1) {
+                // First AA horizontal sub-pass: park the assembled plane in the
+                // device-local binding so the second sub-pass can merge against
+                // it without a PCIe round trip.
+                cdst[pc.dst_base + off + pc.field] = IO_TYPE(compV[tx][ty]);
+                cdst[pc.dst_base + off + (1 - pc.field)] = IO_TYPE(compR[tx][ty]);
+            } else if (pc.comp_fuse == 2) {
+                // Second AA horizontal sub-pass: O_1 is assembled here and
+                // averaged 50/50 with O_0 (in cdst) exactly like std.Merge's
+                // u16 (a+b+1)>>1 / f32 0.5a+0.5b, then written straight to the
+                // staging download.
+                cout2[pc.out_base + off + pc.field] = IO_TYPE(merge_avg(
+                    SHARED_T(cdst[pc.dst_base + off + pc.field]), compV[tx][ty]));
+                cout2[pc.out_base + off + (1 - pc.field)] = IO_TYPE(merge_avg(
+                    SHARED_T(cdst[pc.dst_base + off + (1 - pc.field)]), compR[tx][ty]));
+            } else {
+                cout2[pc.out_base + off + pc.field] = IO_TYPE(compV[tx][ty]);
+                cout2[pc.out_base + off + (1 - pc.field)] = IO_TYPE(compR[tx][ty]);
+            }
         }
     }
 }

@@ -27,7 +27,7 @@ manager — no vs-jetpack changes needed:
 nodes; ``vsfeel.EEDI3`` is a subclass of ``vsaa``'s antialiaser that replaces
 that whole chain with the fused ``core.vsfeel.EEDI3AA`` call:
 
-    aa = based_aa(clip, antialiaser=vsfeel.EEDI3(backend=vsfeel.Backend))
+    aa = based_aa(clip, antialiaser=vsfeel.EEDI3())
 
 It is resolved lazily (PEP 562), so ``import vsfeel`` never requires vsaa.
 """

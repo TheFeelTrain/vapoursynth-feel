@@ -16,14 +16,16 @@ Usage (no vs-jetpack changes needed)::
     from vsaa import based_aa
     import vsfeel
 
-    aa = based_aa(clip, antialiaser=vsfeel.EEDI3(backend=vsfeel.Backend))
+    aa = based_aa(clip, antialiaser=vsfeel.EEDI3())
 
 ``vsfeel.EEDI3`` is a *subclass* of ``vsaa.deinterlacers.EEDI3``, so
 ``based_aa``'s ``isinstance`` checks, ``.sclip``/``.mclip``/``.backend``
-attributes and every dataclass field come from the base class. ``import
-vsfeel`` itself never imports vsaa; the subclass is built on first access to
-``vsfeel.EEDI3`` (and this module can be imported directly as
-``from vsfeel.vsaa import EEDI3``).
+attributes and every dataclass field come from the base class. It defaults
+``backend`` to ``vsfeel.Backend`` — using the vsfeel antialiaser obviously
+means the vsfeel plugin — so the argument only needs passing to force a
+different backend. ``import vsfeel`` itself never imports vsaa; the subclass
+is built on first access to ``vsfeel.EEDI3`` (and this module can be imported
+directly as ``from vsfeel.vsaa import EEDI3``).
 
 Anything the fused filter does not express — ``direction != BOTH``,
 ``double_rate=False``, ``transpose_first``, a ``Deinterlacer`` sclip, or an
@@ -33,6 +35,7 @@ so the subclass is a drop-in replacement.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -44,6 +47,8 @@ from jetpytools import fallback
 from vsaa.deinterlacers import Deinterlacer
 from vsaa.deinterlacers import EEDI3 as _VsaaEEDI3
 from vstools import VSFunctionNoArgs, core
+
+from .backend import Backend as _FeelBackend
 
 _AADirection = _VsaaEEDI3.AADirection
 
@@ -62,12 +67,20 @@ def _fusable_format(clip: vs.VideoNode) -> bool:
     return False
 
 
+@dataclass
 class EEDI3(_VsaaEEDI3):
     """``vsaa`` EEDI3 antialiaser that fuses based_aa's chain into one call.
 
     Only ``antialias(direction=BOTH)`` in double-rate mode takes the fused
     path; every other call is delegated to the base implementation unchanged.
+
+    ``backend`` defaults to ``vsfeel.Backend``: constructing the vsfeel
+    antialiaser and then asking for another plugin's backend is contradictory,
+    so that is what an omitted argument means. Pass ``backend=`` explicitly to
+    override it.
     """
+
+    backend: Any = _FeelBackend
 
     def antialias(  # type: ignore[override]
         self,
