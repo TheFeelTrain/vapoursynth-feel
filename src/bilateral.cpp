@@ -915,9 +915,10 @@ static void VS_CC BilateralCreate(
 
         const int tile_x = 2 * key.radius + block_x;
         const int tile_y = 2 * key.radius + block_y;
-        // the shared kernel keeps the source tile(s) plus the output tile
+        // the shared kernel keeps the source tile plus the guide tile (if
+        // any); the output goes straight to dst[] — there is no output tile
         const size_t shared_bytes =
-            static_cast<size_t>(2 + has_ref) * tile_x * tile_y * sizeof(float);
+            static_cast<size_t>(1 + has_ref) * tile_x * tile_y * sizeof(float);
 
         bool use_shared = use_shared_memory &&
             shared_bytes <= std::min<size_t>(48 * 1024, d->device->limits.maxComputeSharedMemorySize);
@@ -989,9 +990,10 @@ static void VS_CC BilateralCreate(
 
         const int tile_x = 2 * key.radius + block_x;
         const int tile_y = 2 * key.radius + block_y;
-        // the shared kernel keeps the source tile(s) plus the output tile
+        // the shared kernel keeps the source tile plus the guide tile (if
+        // any); the output goes straight to dst[] — there is no output tile
         const size_t shared_bytes =
-            static_cast<size_t>(2 + has_ref) * tile_x * tile_y * sizeof(float);
+            static_cast<size_t>(1 + has_ref) * tile_x * tile_y * sizeof(float);
 
         SpecData spec {
             .width = key.width,

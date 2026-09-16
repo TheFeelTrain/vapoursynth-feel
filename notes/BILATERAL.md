@@ -31,6 +31,11 @@ Benchmark call: `MANGOHUD=0 python3 benchmark/bench.py --filter bilateral
 ns=6: 1985 vs 1645 (+21%). Knee is ~6; default num_streams stays 4
 (benchmark-graded depth; per-stream VRAM ~8 MB: 4 MB src + 4 MB staging).
 
+> **R≥18 rows above predate the WO-03 LDS fix (see below)** — the reserved
+> LDS changed at every radius and the kernel selection changed for
+> R∈[28,43] (no-ref) / R∈[21,27] (guide), so those rows must be re-measured
+> by WO-24 before being quoted.
+
 ## Implementation (current)
 
 Mirrors the GaussBlur VRAM structure (see `notes/GAUSSBLUR.md`):
@@ -126,6 +131,91 @@ instead of overlapping them.
   (1350) > 16x16 (1308); R=24: 16x16 (345) > 32x16 (318) ≫ 16x8 (228).
   Threshold R>12 → 16x16 is optimal as implemented; re-verified under the
   queue cap (the block_y effect shrank once bubbles were gone).
+
+## WO-03 — LDS tile over-reserved by one whole tile (FIXED)
+
+`bilateral.cpp` sized the shared kernel's spec-constant array as
+`(2 + has_ref) * tile_x * tile_y * 4` ("source tile(s) plus the output tile"),
+but `bilateral_shared.comp` keeps only `(1 + has_ref)` tiles — the output
+goes straight to `dst[]` (`ref_offset = HAS_REF*TILE_Y*TILE_X`, no output
+tile). The reference sizes identically (`bilateral.zig:180`). Since
+`SHARED_FLOATS` sizes `shared float buf[SHARED_FLOATS]`, the host's number
+*was* the reserved LDS. Fixed to `(1 + has_ref)` in both places.
+
+Creation-time probe (`VSFEEL_BILAT_LDS_TRACE`, temporary; removed after use),
+640x360 GRAY16, auto block shape (`32x8` R≤12, `32x16` above):
+
+| R | has_ref | tile | new shared | old shared | new use_shared | old use_shared |
+|---|---|---|---|---|---|---|
+| 9 | 0 | 50x26 | 5 200 | 10 400 | 1 | 1 |
+| 9 | 1 | 50x26 | 10 400 | 15 600 | 1 | 1 |
+| 12 | 1 | 56x32 | 14 336 | 21 504 | 1 | 1 |
+| 18 | 1 | 68x52 | 28 288 | 42 432 | 1 | 1 |
+| 21 | 1 | 74x58 | 34 336 | **51 504** | 1 | **0** |
+| 24 | 0 | 80x64 | 20 480 | 40 960 | 1 | 1 |
+| 24 | 1 | 80x64 | 40 960 | **61 440** | 1 | **0** |
+| 27 | 1 | 86x70 | 48 160 | **72 240** | 1 | **0** |
+| 28 | 0 | 88x72 | 25 344 | **50 688** | 1 | **0** |
+| 28 | 1 | 88x72 | **50 688** | 76 032 | **0** | 0 |
+| 32 | 0 | 96x80 | 30 720 | **61 440** | 1 | **0** |
+| 32 | 1 | 96x80 | **61 440** | 92 160 | **0** | 0 |
+| 43 | 0 | 118x102 | 48 144 | **96 288** | 1 | **0** |
+| 45 | 0 | 122x106 | **51 728** | 103 456 | **0** | 0 |
+| 45 | 1 | 122x106 | 103 456 | 155 184 | 0 | 0 |
+
+Matches REPORT P0-3 exactly: the old gate dropped the tiled kernel for
+no-ref **R ∈ [28,43]** and guide **R ∈ [21,27]**; the fix keeps it there and
+halves/third-s the reserved LDS everywhere else (default R=9 32x8: 10 400 →
+5 200 B, i.e. 6 → 12 workgroups/CU of 64 KiB).
+
+**Measured effect (screen, not graded).** 1920x1080 GRAY16 BlankClip, R=32
+no-ref, ns=4, `vspipe -e 499`, 2 alternating reps: plain kernel (what the
+old gate chose at R=32) **54.1 / 54.0 fps** vs shared kernel (fixed) **205.9
+/ 205.1 fps** — ~3.8x. This is the R∈[28,43] fallback cliff, now reopened.
+
+**Default config is unchanged.** Same-session pre/post A/B (both binaries built
+from this tree and hash-verified at each arm; 1920x1080 GRAY16/GRAYS BlankClip,
+R=9, ns=4, 1500 frames, 3 order-alternating reps, medians): u16 **1992.0 →
+1998.4 fps** (+0.3%), fp32 **1268.6 → 1259.8 fps** (−0.7%) — both inside the
+run-to-run swing, so the README default-config row needs no numeric change.
+The R=9 shared kernel is evidently not LDS-occupancy-limited (VGPR-bound at
+~192 VGPR); only the radius bands near the 48 KiB gate were.
+The graded pre/post at R=24/R=32 was attempted and blocked: swapping the two
+binaries in the system plugin directory was denied by the sandbox, and the
+"Final scoreboard" R≥18 rows are from other sessions, so no same-session
+graded number exists for them yet (WO-24 should take it).
+
+**Correctness in the newly-shared band** (noise_24f, 640x360 GRAY16/f32,
+frames 3+17, vszipcl reference):
+
+| config | shared-vs-ref | plain-vs-ref |
+|---|---|---|
+| R=32 no-ref 16-bit | 1 code | 451 codes |
+| R=32 no-ref 32-bit | 5.6e-9 | 6.9e-3 |
+| R=43 no-ref 16-bit | 1 code | 451 codes |
+| R=24 +ref 16-bit | 1 code | 477 codes |
+| R=24 +ref 32-bit | 5.6e-9 | 7.3e-3 |
+
+So the fix *improves* reference agreement in the changed band (the plain
+kernel's border semantics are the divergent side, ~7e-3), it does not trade
+correctness for speed.
+
+**R=24 (the documented R=24 loss) is unchanged in kind:** old reserved
+40 960 B ≤ 48 KiB → shared both before and after; only the reserved LDS
+drops (40 960 → 20 480 B → 1 → 3 workgroups/CU). The notes' "ACO VOPD=0"
+explanation for the 345-vs-367 loss may now be the only remaining cause, but
+the occupancy change means **R≥18 must be re-measured (WO-24)**; do not
+inherit the table in "Final scoreboard" for R≥18.
+
+**Flagged, not changed:** `tests/test_bilateral.py:142-144` (16-bit) and
+`tests/test_bilateral.py:204-205` (32-bit) justify `BORDER_TOL_CODES`/
+`BORDER_TOL` by "staging tile exceeds the 48 KiB budget". Measured now, the
+shared kernel agrees with the reference to 1 code / ≤5.6e-9 at *every* sigma
+including the wide-sigma R=24 case, so the stated mechanism is not active
+and the tolerance is ~655x (16-bit) / ~10^5x (32-bit) looser than measured.
+The R=24 kernel choice is not affected by WO-03, so the comment was already
+stale before this fix. Flagged for the test-integrity work orders (WO-48/
+WO-55); left untouched per this work order.
 
 ## Debug env vars
 
