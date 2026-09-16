@@ -263,7 +263,6 @@ uv.lock
 
 .vsjet/
 reference/
-notes/
 tmp/
 # Packaging staging
 /install/

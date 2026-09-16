@@ -1,36 +1,11 @@
 """vsaa integration: a fused EEDI3 antialiaser backed by ``vsfeel.EEDI3AA``.
 
-``vsaa.based_aa`` drives its anti-aliasing through an ``EEDI3`` antialiaser,
-whose ``antialias`` method runs the *whole* chain
-
-    Merge( EEDI3H( Merge( EEDI3(clip) ) ) )
-
-as two plugin calls plus two ``std.Merge`` nodes. ``vsfeel.EEDI3AA`` is that
-exact chain fused into one plugin call (same kernels, same numerics — the
-fused filter is bit-exact against the two-call chain for 16-bit integer input
-and within a few ulp for float input), so this module subclasses the vsaa
-antialiaser and overrides ``antialias`` to emit the single call.
-
-Usage (no vs-jetpack changes needed)::
+Usage:
 
     from vsaa import based_aa
     import vsfeel
 
     aa = based_aa(clip, antialiaser=vsfeel.EEDI3())
-
-``vsfeel.EEDI3`` is a *subclass* of ``vsaa.deinterlacers.EEDI3``, so
-``based_aa``'s ``isinstance`` checks, ``.sclip``/``.mclip``/``.backend``
-attributes and every dataclass field come from the base class. It defaults
-``backend`` to ``vsfeel.Backend`` — using the vsfeel antialiaser obviously
-means the vsfeel plugin — so the argument only needs passing to force a
-different backend. ``import vsfeel`` itself never imports vsaa; the subclass
-is built on first access to ``vsfeel.EEDI3`` (and this module can be imported
-directly as ``from vsfeel.vsaa import EEDI3``).
-
-Anything the fused filter does not express — ``direction != BOTH``,
-``double_rate=False``, ``transpose_first``, a ``Deinterlacer`` sclip, or an
-input format EEDI3AA rejects — falls back to the base class's two-call chain,
-so the subclass is a drop-in replacement.
 """
 
 from __future__ import annotations
