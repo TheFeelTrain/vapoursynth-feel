@@ -1,4 +1,4 @@
-"""Regression tests for cropped / non-tightly-pitched plane geometry (R1, R2).
+"""Regression tests for cropped / non-tightly-pitched plane geometry (R1, R2, R3).
 
 Both findings are width-dependent host-copy bugs that a 640-pixel fixture
 cannot see:
@@ -10,12 +10,18 @@ cannot see:
   in one operation while the VapourSynth pitch is rounded up (e.g. 2560 bytes
   for a 630-pixel float32 plane), so the upload read past/before the visible
   rows and dropped the tail of the last row.
+* R3: NNEDI3's prescreen dispatch grid used ``ceil(width*rows/(P*128))`` while
+  the shader groups pixels per row as ``ceil(width/P)``.  Whenever ``P`` does
+  not divide the plane width the tail of the frame was never dispatched and
+  uninitialized VRAM reached the output.  The 630/638-pixel cases below (and
+  the 315-sample chroma of the yuv420 variants) are exactly the geometry that
+  exposed it.
 
 The tests crop a 640-wide Gray clip to 630 and 638 pixels, run the affected
-vsfeel filters, and compare against the matching vszipcl reference.  Because
-the R1 crash is a SIGSEGV in the CPU copy helper, every comparison runs in a
-subprocess with a timeout so a crash is reported as a test failure instead of
-killing the pytest process.
+vsfeel filters, and compare against the matching reference (vszipcl, or
+nnedi3vk for NNEDI3).  Because the R1 crash is a SIGSEGV in the CPU copy
+helper, every comparison runs in a subprocess with a timeout so a crash is
+reported as a test failure instead of killing the pytest process.
 
 Tolerances are measurement-bounded (measured values are recorded next to each
 case); the reference comparisons use ``num_streams=1``.
@@ -62,6 +68,12 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     color = spec.get("color", "gray")
     params = spec.get("params", {{}})
     frames = spec.get("frames", [0, 1, 2])
+    filter_ = spec["filter"]
+
+    if filter_ == "nnedi3":
+        # nnedi3vk only accepts 16-bit integer input; vsfeel is the same
+        # GRAY16 clip, so the case is registered as 16-bit.
+        assert bits == 16 and color == "gray", (bits, color)
 
     core.max_cache_size = 512
     src = core.bs.VideoSource({NOISE_MKV!r})
@@ -82,8 +94,6 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
         guide = core.resize.Bicubic(main, width=main.width, height=main.height,
                                     format=main.format)
 
-    filter_ = spec["filter"]
-
     # --- reference phase: materialise and copy before touching vsfeel ---
     try:
         if filter_ == "dfttest":
@@ -94,6 +104,8 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
             ref_node = core.vszipcl.Bilateral(main, ref=guide, num_streams=1, **params)
         elif filter_ == "bm3d":
             ref_node = core.vszipcl.BM3Dv2(main, num_streams=1, **params)
+        elif filter_ == "nnedi3":
+            ref_node = core.nnedi3vk.NNEDI3(main, field=1, num_streams=1, **params)
         else:
             raise SystemExit("bad filter %r" % filter_)
         ref_frames = [[read_plane(ref_node.get_frame(n), p, dtype)
@@ -111,6 +123,8 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
             my_node = core.vsfeel.GaussBlur(main, num_streams=1, **params)
         elif filter_ == "bilateral":
             my_node = core.vsfeel.Bilateral(main, ref=guide, num_streams=1, **params)
+        elif filter_ == "nnedi3":
+            my_node = core.vsfeel.NNEDI3(main, field=1, num_streams=1, **params)
         else:
             my_node = core.vsfeel.BM3Dv2(main, num_streams=1, **params)
         worst = 0.0
@@ -141,6 +155,8 @@ _DFTTEST_PARAMS = {"tbsize": 3}
 _GAUSS_PARAMS = {"sigma": 2.0}
 _BM3D_PARAMS = {"sigma": 0.7, "radius": 1, "bm_range": 16, "ps_range": 7,
                 "block_step": 4}
+# Default pscrn (2) means P=4 pixels/thread, the grouping that under-covered.
+_NNEDI3_PARAMS = {"pscrn": 2}
 
 CASES = []
 
@@ -164,6 +180,10 @@ for _w in WIDTHS:
     _add("bilateral", 16, _w, 0, _BILATERAL_PARAMS, TOL_U16_LSB)
     _add("bilateral", 16, _w, 1, _BILATERAL_PARAMS, TOL_U16_LSB)
     _add("bm3d", 32, _w, 0, _BM3D_PARAMS, TOL_BM3D)
+    # R3: NNEDI3's prescreen dispatch grid must cover every row's tail
+    # (P=4 does not divide 630/638).  GRAY16 only: nnedi3vk wants an integer
+    # clip, and vsfeel==nnedi3vk is bit-exact here (measured 0 codes).
+    _add("nnedi3", 16, _w, 0, _NNEDI3_PARAMS, TOL_U16_LSB)
 
 # Subsampled chroma (R1/R2): the chroma planes are half the luma width, so
 # their visible rows are 315 * itemsize bytes at 630 px — a different pitch and

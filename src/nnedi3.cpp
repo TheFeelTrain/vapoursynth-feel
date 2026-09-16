@@ -1736,11 +1736,19 @@ static void VS_CC Nnedi3Create(
                 (static_cast<uint32_t>(cfg.width + MARGIN_H * 2) + 31) / 32, max_grid_x);
             cfg.pad_grid_y = std::min<uint32_t>(
                 (static_cast<uint32_t>(cfg.pad_h) + 7) / 8, max_grid_y);
-            // prescreen: one thread per pixel group (P=1 old, P=4 new)
+            // prescreen: one thread per pixel group (P=1 old, P=4 new).
+            // The shader groups pixels per ROW as ceil(width/P) and indexes
+            // r = gid / ceil(width/P), so the dispatch must cover
+            // rows*ceil(width/P) threads -- NOT ceil(width*rows/P), which is
+            // smaller whenever P does not divide width and leaves the tail of
+            // the frame unwritten (uninitialized VRAM reaches the output).
+            // Matches the reference (nnedi3vk.cpp:1121-1123).
             const uint32_t pps = d->pscrn == 1 ? 1 : 4;
+            const uint32_t groups_per_row =
+                (static_cast<uint32_t>(cfg.width) + pps - 1) / pps;
             cfg.pre_grid_x = std::min<uint32_t>(
-                (static_cast<uint32_t>(cfg.width) * static_cast<uint32_t>(cfg.rows) +
-                 pps * 128 - 1) / (pps * 128), max_grid_x);
+                (static_cast<uint32_t>(cfg.rows) * groups_per_row + 127) / 128,
+                max_grid_x);
             // direct predict grid (both modes): full pixel coverage with
             // 1024-thread workgroups (see PREDICT entry); count-bounded by
             // the kernel's early return, always correct
@@ -2175,7 +2183,7 @@ void vsfeel_register_nnedi3(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
     vspapi->registerFunction(
         "NNEDI3",
         "clip:vnode;"
-        "field:int:opt;"
+        "field:int;"
         "dh:int:opt;"
         "planes:int[]:opt;"
         "nsize:int:opt;"

@@ -105,6 +105,32 @@ Predictor upload layout per qual pass: weight pairs `(sm,el)` as
   After fix: 46/46 pass. Missing-`field`_arg create-path abort observed in a
   probe (omitted optional arg → terminate in Nnedi3Create); tests always pass
   field explicitly so out of scope for now, flagged for later.
+  **(2026-09-16, WO-01) FIXED.** Registering `"field:int:opt;"` while reading
+  it with a null error pointer meant VapourSynth took VS_FATAL_ERROR ->
+  `fprintf` + `std::terminate`; the process died with SIGABRT (exit 134) and
+  `try/except` never ran. `field` is now registered required (`"field:int;"`,
+  matching EEDI3), so omitting it is a normal catchable `vs.Error`
+  ("NNEDI3: argument field is required"). Regression test:
+  `tests/test_nnedi3.py::test_nnedi3_requires_field`.
+
+- **(2026-09-16, WO-02) FIXED: prescreen dispatch grid under-covered the
+  frame.** Host computed `pre_grid_x = ceil(width*rows / (P*128))`, but
+  `nnedi3.comp` groups pixels per ROW as `ceil(width/P)` (r = gid/xg), so the
+  exact requirement is `ceil(rows*ceil(width/P)/128)`. Whenever `P` does not
+  divide `width` (P=4 for the default pscrn>=2) the last row's tail groups
+  were never dispatched, and since the D2H copy ships the whole packed interp
+  region, **uninitialized VRAM reached the output**. Measured before the fix:
+  YUV420P16 1924x1080 (chroma 962) -> **182 garbage pixels per chroma plane**,
+  every frame, values 0..65527 (the correct output is constant 30000); luma
+  1924 (divisible by 4) and pscrn=0/1 were unaffected. Fix follows the
+  reference (`nnedi3vk.cpp:1121-1123`, threads = rows*ceil(width/P)):
+  `groups_per_row = ceil(width/P); pre_grid_x = ceil(rows*groups_per_row/128)`.
+  The suite was green because every fixture is 640 wide (chroma 320).
+  Added the 630/638 case to `tests/test_geometry.py` (vsfeel vs nnedi3vk,
+  GRAY16 pscrn=2, frames 0..2): **bit-exact, 0 codes** at 630/638; a probe also
+  covered 640/626/610 (all 0). Repro kept in `tmp/wo02_repro.py`
+  (constant-clip tail scan, made deterministic by reverse frame order / pool
+  poisoning) and `tmp/wo02_oracle.py`.
 
 - Accuracy (still current, same 46 tests): 16-bit within 1 LSB of nnedi3vk
   everywhere tested (0 on most content; isolated 1-code rounding flips from

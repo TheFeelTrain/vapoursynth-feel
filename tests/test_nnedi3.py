@@ -240,6 +240,18 @@ def test_nnedi3_kept_lines_copied(noise_16bit):
 # Input validation
 # ---------------------------------------------------------------------------
 
+def test_nnedi3_requires_field(noise_16bit):
+    """`field` is a required argument (EEDI3 does the same).
+
+    It used to be registered as optional but read with a null error pointer,
+    so omitting it took VapourSynth's VS_FATAL_ERROR path (`fprintf` +
+    `std::terminate`): the process died (SIGABRT) and Python could not catch
+    it. It must now raise a normal, catchable vs.Error.
+    """
+    with pytest.raises(vs.Error):
+        vs.core.vsfeel.NNEDI3(noise_16bit)
+
+
 def test_nnedi3_rejects_8bit(noise_8bit):
     with pytest.raises(vs.Error):
         _run(noise_8bit).get_frame(0)
