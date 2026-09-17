@@ -164,6 +164,22 @@ out-of-bounds read; now a per-wait vector.
   output frame digest is byte-identical with and without the dump. Repro:
   `tmp/wo21_dump_check.py`.
 - Suite 61/61 at each rebuild.
+- **Cross-cutting hardening pass.** Every offset pushed to the shader is an
+  `int32`, so creation now bounds each region in the unit the shader uses:
+  `tw*pad_elems`, `upload_bytes`, `padded_bytes`, `slot_plane_bytes` and
+  `nblk*256` per plane, the `upload_sum`/`download_sum`/`padded_sum`/
+  `spatial_sum` aggregates *and* `upload_total + download_sum` (that pair is
+  what `dst_base` is built from), plus `slot_total` for the slot cache — 8K
+  16-bit + `num_streams=32` used to wrap `slot_base[]` negative and the
+  fused-direct variant has no fallback guard. `f0beta` now rejects NaN, the
+  `slocation/ssx/ssy/sst` `mapGetFloatArray` error is checked before the result
+  is dereferenced, and all flush/invalidate ranges go through the shared
+  `flush_range`/`mapped_range` helpers (offset rounded down and size rounded up
+  to `minNonCoherentAtomSize`, clamped with `VK_WHOLE_SIZE`). `DFTTest` also
+  reports `"requires Vulkan 1.3 (device reports X.Y)"` instead of an opaque
+  pipeline error. Verified in `tmp/verify_validation.py`; the atom-alignment change
+  is a no-op on this coherent device.
+
 
 ## Commands
 

@@ -44,7 +44,7 @@ constexpr uint32_t NLMEANS_TS_RESERVED = 4;
 // denominator stays > 0 without an explicit guard (matches the reference).
 constexpr uint32_t FLT_EPS_BITS = 0x34000000u;
 
-struct SpecData {
+struct NLMeansSpecData {
     int32_t width;
     int32_t height;
     int32_t stride;
@@ -301,7 +301,7 @@ std::optional<std::string> bind_memory(
 }
 
 std::variant<VkPipeline, std::string> create_pipeline(
-    const NLMeansData & d, const SpecData & spec,
+    const NLMeansData & d, const NLMeansSpecData & spec,
     VkShaderModule module, VkPipelineLayout layout) {
 
     VkSpecializationInfo spec_info {
@@ -339,8 +339,7 @@ std::variant<VkPipeline, std::string> create_pipeline(
     };
 
     VkPipeline pipeline;
-    VkResult result = vkCreateComputePipelines(
-        d.device->device, d.device->pipeline_cache, 1, &pipeline_info, nullptr, &pipeline);
+    VkResult result = create_compute_pipeline(*d.device, pipeline_info, &pipeline);
     if (result != VK_SUCCESS) {
         return "vkCreateComputePipelines failed"s;
     }
@@ -1092,7 +1091,7 @@ static void VS_CC NLMeansCreate(
     if (error) {
         d->wref_param = 1.0f;
     }
-    if (d->wref_param < 0.0f) {
+    if (!std::isfinite(d->wref_param) || d->wref_param < 0.0f) {
         return set_error("wref must be >= 0.");
     }
 
@@ -1288,7 +1287,7 @@ static void VS_CC NLMeansCreate(
     denom *= s_size;
     const float h2_inv_norm = nlm_norm / denom;
 
-    SpecData spec {
+    NLMeansSpecData spec {
         .width = d->width,
         .height = d->height,
         .stride = d->stride,
@@ -1824,9 +1823,13 @@ static void VS_CC NLMeansCreate(
 
     NLMeansData * data = d.release();
 
+    // A temporal filter requests frames outside n, which the strict-spatial
+    // policy does not permit; only d = 0 is purely spatial.
+    const VSRequestPattern policy =
+        data->d > 0 ? rpGeneral : rpStrictSpatial;
     VSFilterDependency deps[2] = {
-        { data->node, rpStrictSpatial },
-        { data->ref_node, rpStrictSpatial }
+        { data->node, policy },
+        { data->ref_node, policy }
     };
 
     vsapi->createVideoFilter(

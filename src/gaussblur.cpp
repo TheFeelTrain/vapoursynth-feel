@@ -37,7 +37,7 @@ constexpr int VRT = 3;         // output rows per thread, small path
 constexpr int LARGE_R = 8;     // outputs per thread, large path
 constexpr int LARGE_THRESHOLD = 32;  // radius <= 32 => fused small path
 
-struct PlaneConfig {
+struct GaussPlaneConfig {
     int width {};                    // pixels
     int height {};                   // pixels
     int stride {};                   // pitch in elements (round_up(width, 16b/elem))
@@ -116,7 +116,7 @@ struct GaussData {
     VkDeviceSize tmp_total {};
     bool host_direct_upload {};  // src VRAM is host-mapped (ReBAR): no H2D copy
     bool kd_download {};         // kernels write the GTT download staging directly
-    std::array<PlaneConfig, 3> planes {};
+    std::array<GaussPlaneConfig, 3> planes {};
     FramePool<GaussBlurResource> pool;
 
     ~GaussData() {
@@ -287,7 +287,7 @@ static std::variant<VkShaderModule, std::string> create_shader_module(
 }
 
 static std::variant<VkPipeline, std::string> create_pipeline(
-    const VK_Device & dev, const PlaneConfig & cfg,
+    const VK_Device & dev, const GaussPlaneConfig & cfg,
     VkShaderModule module, VkPipelineLayout layout) {
 
     struct Spec {
@@ -330,8 +330,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     };
 
     VkPipeline pipeline;
-    VkResult result = vkCreateComputePipelines(
-        dev.device, dev.pipeline_cache, 1, &pipeline_info, nullptr, &pipeline);
+    VkResult result = create_compute_pipeline(dev, pipeline_info, &pipeline);
     if (result != VK_SUCCESS) {
         return "vkCreateComputePipelines failed: "s + vk_result_string(result);
     }
@@ -612,13 +611,9 @@ static const VSFrame *VS_CC GaussGetFrame(
                     continue;
                 }
                 const auto & cfg = d->planes[plane];
-                ranges.push_back(VkMappedMemoryRange {
-                    .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                    .pNext = nullptr,
-                    .memory = d->host_direct_upload ? resource.src_mem : resource.staging_mem,
-                    .offset = cfg.upload_offset,
-                    .size = cfg.upload_size,
-                });
+                ranges.push_back(mapped_range(*d->device,
+                    d->host_direct_upload ? resource.src_mem : resource.staging_mem,
+                    cfg.upload_offset, cfg.upload_size));
             }
             checkVK(vkFlushMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
         }
@@ -636,13 +631,8 @@ static const VSFrame *VS_CC GaussGetFrame(
                     continue;
                 }
                 const auto & cfg = d->planes[plane];
-                ranges.push_back(VkMappedMemoryRange {
-                    .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                    .pNext = nullptr,
-                    .memory = resource.staging_mem,
-                    .offset = d->upload_total + cfg.download_offset,
-                    .size = cfg.download_size,
-                });
+                ranges.push_back(mapped_range(*d->device, resource.staging_mem,
+                    d->upload_total + cfg.download_offset, cfg.download_size));
             }
             checkVK(vkInvalidateMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
         }
@@ -1038,7 +1028,7 @@ static void VS_CC GaussCreate(
         const int ksize = static_cast<int>(weights[ci].size());
         const int radius = ksize / 2;
 
-        PlaneConfig cfg;
+        GaussPlaneConfig cfg;
         cfg.width = key.w;
         cfg.height = key.h;
         cfg.stride = key.stride;

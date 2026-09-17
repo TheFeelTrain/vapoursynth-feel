@@ -2561,3 +2561,24 @@ so attribute kernels only in the ns=1 trace.
   the row kernel's input and therefore its branch mix (the horizontal "pad
   +7.3%" reading was mostly that, not the pad kernel -- gbench puts pad+xpose at
   under 0.1 ms).
+
+## Round 22 — cross-cutting hardening
+
+- Every flush/invalidate range goes through the shared `mapped_range` helper in
+  `vsfeel.h` (offset rounded down, size rounded up to `minNonCoherentAtomSize`,
+  `VK_WHOLE_SIZE` when the allocation size is unknown or the rounded end would
+  overrun it). EEDI3's identical per-plane flush entries (`[0, upload_total)`
+  pushed once per processed plane, twice in the file) collapsed to one range.
+  The `!coherent` invalidate ranges over `v_offset` / `out_offset` / `dl_offset`
+  keep their per-plane shape and are now atom-aligned.
+- `VK_EXT_subgroup_size_control` is enabled only when the physical device
+  advertises it (or the device is Vulkan 1.3+, where it is core); the device
+  extension list is enumerated once for all three optional extensions;
+  `apiVersion` is recorded and `create()` reports
+  `"EEDI3 requires Vulkan 1.3 (device reports X.Y)"`; all
+  `vkCreateComputePipelines` calls take `pipeline_cache_lock`; and
+  `allocate_memory` refuses a `DEVICE_LOCAL|HOST_VISIBLE` request instead of
+  silently relaxing it to host memory.
+- No behaviour change here (`api_version=1.4`, extension present, ReBAR present,
+  staging coherent), so no measurement; verified with the full test suite plus
+  `VSFEEL_DBG=1` showing the recorded values.

@@ -371,7 +371,7 @@ static int calcPadNum(int size, int block_step) {
 // Filter state
 // ---------------------------------------------------------------------------
 
-struct PlaneConfig {
+struct DftPlaneConfig {
     int width {};                   // frame plane pixels
     int height {};
     int pw {};                      // padded dims
@@ -455,7 +455,7 @@ struct DFTTestResource {
     uint32_t staging_type_index {};
 };
 
-struct PushConstants {
+struct DftPushConstants {
     int32_t padded_base;    // byte offset into the padded buffer
     int32_t spatial_base;   // float element offset into the spatial buffer
     int32_t dst_base;       // byte offset of the download region in staging
@@ -551,7 +551,7 @@ struct DftData {
     std::mutex slot_lock {};
     std::vector<SlotState> slots {};
     std::vector<std::unique_ptr<ResMeta>> res_meta {};
-    std::array<PlaneConfig, 3> planes {};
+    std::array<DftPlaneConfig, 3> planes {};
     FramePool<DFTTestResource> pool;
 
     // ---- debug timing accumulators ----
@@ -798,8 +798,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     };
 
     VkPipeline pipeline;
-    VkResult result = vkCreateComputePipelines(
-        dev.device, dev.pipeline_cache, 1, &pipeline_info, nullptr, &pipeline);
+    VkResult result = create_compute_pipeline(dev, pipeline_info, &pipeline);
     if (result != VK_SUCCESS) {
         return "vkCreateComputePipelines failed: "s + vk_result_string(result);
     }
@@ -830,8 +829,8 @@ struct SlotOp {
     int which {};  // reader offset: n - pad_frame (selects the slot semaphore)
 };
 
-static PushConstants base_pc(const DftData & d) {
-    PushConstants pc {
+static DftPushConstants base_pc(const DftData & d) {
+    DftPushConstants pc {
         .padded_base = 0,
         .spatial_base = 0,
         .dst_base = 0,
@@ -867,7 +866,7 @@ static void record_one_pad_dispatch(
     const SlotOp & op) {
 
     const auto & cfg = d.planes[op.plane];
-    PushConstants pc = base_pc(d);
+    DftPushConstants pc = base_pc(d);
     // the pad kernels apply the temporal offset themselves (pc.pad_t0 *
     // up_slice); do not add it to src_base as well
     pc.src_base = static_cast<int32_t>(cfg.upload_offset);
@@ -887,7 +886,7 @@ static void record_one_pad_dispatch(
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
         d.pipeline_layout, 0, 1, &resource.pad_set, 0, nullptr);
     vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-        0, sizeof(PushConstants), &pc);
+        0, sizeof(DftPushConstants), &pc);
     const uint32_t max_grid_x = d.device->limits.maxComputeWorkGroupCount[0];
     const uint32_t max_grid_y = d.device->limits.maxComputeWorkGroupCount[1];
     const uint32_t gx = std::min<uint32_t>(
@@ -1069,7 +1068,7 @@ static std::optional<std::string> record_fused_col2im_cb(
         qwrite(cmd, resource.qpool, 1);
     }
 
-    const PushConstants base = base_pc(d);
+    const DftPushConstants base = base_pc(d);
     const uint32_t max_grid_x = d.device->limits.maxComputeWorkGroupCount[0];
     const uint32_t max_grid_y = d.device->limits.maxComputeWorkGroupCount[1];
 
@@ -1082,7 +1081,7 @@ static std::optional<std::string> record_fused_col2im_cb(
         }
         const auto & cfg = d.planes[plane];
 
-        PushConstants pc = base;
+        DftPushConstants pc = base;
         if (slot_base3x7) {
             for (int t = 0; t < 7; ++t) {
                 pc.slot_base[t] = slot_base3x7[plane * 7 + t];
@@ -1120,7 +1119,7 @@ static std::optional<std::string> record_fused_col2im_cb(
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                 d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
             vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                0, sizeof(PushConstants), &pc);
+                0, sizeof(DftPushConstants), &pc);
             const uint32_t blocks = static_cast<uint32_t>(cfg.num_blocks);
             const uint32_t sub_blocks = blocks / 8 + (blocks % 8 != 0 ? 1 : 0);
             const uint32_t grid_x = std::min<uint32_t>(sub_blocks, max_grid_x);
@@ -1146,7 +1145,7 @@ static std::optional<std::string> record_fused_col2im_cb(
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                 d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
             vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                0, sizeof(PushConstants), &pc);
+                0, sizeof(DftPushConstants), &pc);
             const uint32_t grid_x = std::min<uint32_t>(
                 (static_cast<uint32_t>(cfg.pw) + 31) / 32, max_grid_x);
             const uint32_t grid_y = std::min<uint32_t>(
@@ -1357,15 +1356,10 @@ static const VSFrame *VS_CC DftGetFrame(
                         }
                     }
                     if (!coherent && !resource.up_direct) {
-                        VkMappedMemoryRange flush_range {
-                            .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                            .pNext = nullptr,
-                            .memory = resource.staging_mem,
-                            .offset = cfg.upload_offset +
+                        checkVK(flush_range(*d->device, resource.staging_mem,
+                            cfg.upload_offset +
                                 static_cast<size_t>(t) * cfg.upload_bytes / tw,
-                            .size = cfg.upload_bytes / tw,
-                        };
-                        checkVK(vkFlushMappedMemoryRanges(dev, 1, &flush_range));
+                            cfg.upload_bytes / tw, d->staging_total));
                     }
 
                     std::lock_guard lk(d->slot_lock);
@@ -1690,13 +1684,9 @@ static const VSFrame *VS_CC DftGetFrame(
                     continue;
                 }
                 const auto & cfg = d->planes[plane];
-                ranges.push_back(VkMappedMemoryRange {
-                    .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                    .pNext = nullptr,
-                    .memory = resource.staging_mem,
-                    .offset = d->upload_total + cfg.download_offset,
-                    .size = cfg.download_bytes,
-                });
+                ranges.push_back(mapped_range(*d->device, resource.staging_mem,
+                    d->upload_total + cfg.download_offset, cfg.download_bytes,
+                    d->staging_total));
             }
             checkVK(vkInvalidateMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
         }
@@ -1873,6 +1863,9 @@ static void VS_CC DftCreate(
     if (error) {
         f0beta = 1.0;
     }
+    if (!std::isfinite(f0beta)) {
+        return set_error("f0beta must be finite.");
+    }
     int ssystem = vsh::int64ToIntS(vsapi->mapGetInt(in, "ssystem", 0, &error));
     if (error) {
         ssystem = 0;
@@ -1888,18 +1881,30 @@ static void VS_CC DftCreate(
     int n_slocation = 0, n_ssx = 0, n_ssy = 0, n_sst = 0;
     if (vsapi->mapNumElements(in, "slocation") > 0) {
         slocation = vsapi->mapGetFloatArray(in, "slocation", &error);
+        if (error) {
+            return set_error("slocation must be an array of floats.");
+        }
         n_slocation = vsapi->mapNumElements(in, "slocation");
     }
     if (vsapi->mapNumElements(in, "ssx") > 0) {
         ssx = vsapi->mapGetFloatArray(in, "ssx", &error);
+        if (error) {
+            return set_error("ssx must be an array of floats.");
+        }
         n_ssx = vsapi->mapNumElements(in, "ssx");
     }
     if (vsapi->mapNumElements(in, "ssy") > 0) {
         ssy = vsapi->mapGetFloatArray(in, "ssy", &error);
+        if (error) {
+            return set_error("ssy must be an array of floats.");
+        }
         n_ssy = vsapi->mapNumElements(in, "ssy");
     }
     if (vsapi->mapNumElements(in, "sst") > 0) {
         sst = vsapi->mapGetFloatArray(in, "sst", &error);
+        if (error) {
+            return set_error("sst must be an array of floats.");
+        }
         n_sst = vsapi->mapNumElements(in, "sst");
     }
     const int array_counts[4] { n_slocation, n_ssx, n_ssy, n_sst };
@@ -2010,8 +2015,15 @@ static void VS_CC DftCreate(
 
         cfg.slot_plane_bytes = pad_elems * d->bytes;
 
-        if (d->tw * pad_elems >= (1ll << 31) || nblk * 256 >= (1ll << 31)) {
-            return set_error("frame too large (padded plane exceeds 2^31 elements).");
+        // Every region below is addressed by an int32 push constant, so bound
+        // each per-plane region in the units the shader actually uses: bytes
+        // for the padded/download/upload bases, float elements for spatial.
+        if (d->tw * pad_elems >= (1ll << 31) ||
+            cfg.upload_bytes >= (1ll << 31) ||
+            cfg.padded_bytes >= (1ll << 31) ||
+            cfg.slot_plane_bytes >= (1ll << 31) ||
+            nblk * 256 >= (1ll << 31)) {
+            return set_error("frame too large (a plane region exceeds the 2^31 addressing limit).");
         }
     }
     if (upload_sum == 0) {
@@ -2021,8 +2033,12 @@ static void VS_CC DftCreate(
     d->download_total = (download_sum + 31) & ~VkDeviceSize(31);
     d->padded_total = (padded_sum + 31) & ~VkDeviceSize(31);
     d->spatial_total = (spatial_sum + 7) & ~VkDeviceSize(7);
-    if (padded_sum >= (1ull << 32) || spatial_sum >= (1ull << 32)) {
-        return set_error("frame too large (device buffers exceed 4 GiB).");
+    // dst_base is upload_total + the plane's download offset, so the two sums
+    // together (not just each one) have to stay inside int32.
+    if (upload_sum >= (1ull << 31) || download_sum >= (1ull << 31) ||
+        padded_sum >= (1ull << 31) || spatial_sum >= (1ull << 31) ||
+        d->upload_total + download_sum >= (1ull << 31)) {
+        return set_error("frame too large (a buffer region exceeds the 2^31 addressing limit).");
     }
 
     const auto window = getWindow(d->radius, d->block_step, swin, sbeta, twin, tbeta);
@@ -2145,6 +2161,10 @@ static void VS_CC DftCreate(
         d->device = std::get<std::shared_ptr<VK_Device>>(result);
     }
 
+    if (auto e = require_vulkan_1_3(*d->device, "DFTTest")) {
+        return set_error(*e);
+    }
+
     VkDevice dev = d->device->device;
 
     // In-flight depth: two resources are enough to keep the GPU fed (one
@@ -2180,6 +2200,13 @@ static void VS_CC DftCreate(
             slot_sum += static_cast<VkDeviceSize>(d->slot_count) * cfg.slot_plane_bytes;
         }
         d->slot_total = (slot_sum + 31) & ~VkDeviceSize(31);
+        // slot_base[] is an int32 byte offset into the slot buffer and the
+        // fused-direct variant has no fallback guard, so the whole cache has
+        // to fit inside int32.
+        if (d->slot_total >= (1ull << 31)) {
+            return set_error("frame too large (the slot cache exceeds the 2^31 "
+                             "addressing limit; lower num_streams or the temporal radius).");
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2209,7 +2236,7 @@ static void VS_CC DftCreate(
         VkPushConstantRange push_constant_range {
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
             .offset = 0,
-            .size = sizeof(PushConstants)
+            .size = sizeof(DftPushConstants)
         };
 
         VkPipelineLayoutCreateInfo pipeline_layout_info {

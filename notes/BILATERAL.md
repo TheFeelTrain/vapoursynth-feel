@@ -225,3 +225,13 @@ WO-55); left untouched per this work order.
 - `VSFEEL_BILAT_TRACE=1` — host phase `[perf]` averages every 200 frames.
 - `BILATERAL_NOCPU` / `BILATERAL_NODL` / `BILATERAL_NODISPATCH` — pre-existing
   diagnostics (empty upload / skip download / extra null dispatch).
+
+## Validation hardening (cross-cutting pass)
+
+`num_streams` is now `1..32` (was `> 0` only, so `1000` reached a 1000-deep pool
+and a 2000-set descriptor pool before failing mid-loop), `sigma_spatial` /
+`sigma_color` reject NaN and infinity, and the default-radius derivation clamps
+`round(sigma*3)` to `1e6` *before* the float-to-int cast (huge finite sigma was
+UB; the reference clamps identically). Flush/invalidate ranges go through the
+shared `mapped_range` helper (see `notes/EEDI3AA.md` round 8). No performance
+change; all `test_bilateral.py` tests pass.

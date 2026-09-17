@@ -288,24 +288,51 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     VkPhysicalDeviceProperties props {};
     vkGetPhysicalDeviceProperties(dev->physical_device, &props);
     dev->limits = props.limits;
+    dev->api_version = props.apiVersion;
 
-    VkPhysicalDeviceSubgroupSizeControlProperties subgroup_props {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES,
-        .pNext = nullptr
+    // Query the device extension list once and share it: an extension feature
+    // or property struct may only be chained when the extension was found
+    // (or, for the ones promoted to core, when the device is new enough).
+    uint32_t ext_count = 0;
+    vkEnumerateDeviceExtensionProperties(dev->physical_device, nullptr, &ext_count, nullptr);
+    std::vector<VkExtensionProperties> exts(ext_count);
+    if (ext_count) {
+        vkEnumerateDeviceExtensionProperties(dev->physical_device, nullptr, &ext_count, exts.data());
+    }
+    const auto has_ext = [&exts](const char * name) {
+        for (const auto & e : exts) {
+            if (std::strcmp(e.extensionName, name) == 0) {
+                return true;
+            }
+        }
+        return false;
     };
-    VkPhysicalDeviceProperties2 props2 {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-        .pNext = &subgroup_props
-    };
-    vkGetPhysicalDeviceProperties2(dev->physical_device, &props2);
-    if (subgroup_props.minSubgroupSize && subgroup_props.maxSubgroupSize) {
-        dev->min_subgroup_size = subgroup_props.minSubgroupSize;
-        dev->max_subgroup_size = subgroup_props.maxSubgroupSize;
+    const bool atomic_float_ext = has_ext(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+    // VK_EXT_subgroup_size_control was promoted in Vulkan 1.3, so on a 1.3
+    // device its structs are valid without the extension being advertised.
+    const bool subgroup_ext = has_ext(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+    const bool subgroup_ok = subgroup_ext || props.apiVersion >= VK_API_VERSION_1_3;
+
+    if (subgroup_ok) {
+        VkPhysicalDeviceSubgroupSizeControlProperties subgroup_props {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES,
+            .pNext = nullptr
+        };
+        VkPhysicalDeviceProperties2 props2 {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &subgroup_props
+        };
+        vkGetPhysicalDeviceProperties2(dev->physical_device, &props2);
+        if (subgroup_props.minSubgroupSize && subgroup_props.maxSubgroupSize) {
+            dev->min_subgroup_size = subgroup_props.minSubgroupSize;
+            dev->max_subgroup_size = subgroup_props.maxSubgroupSize;
+        }
     }
     dev->subgroup_size_control =
-        dev->min_subgroup_size <= 32 && 32 <= dev->max_subgroup_size;
+        subgroup_ok && dev->min_subgroup_size <= 32 && 32 <= dev->max_subgroup_size;
     if (trace_on("VSFEEL_DBG")) {
-        fprintf(stderr, "[vsfeel] subgroup_size_control=%d min=%u max=%u\n",
+        fprintf(stderr, "[vsfeel] api_version=%u.%u subgroup_size_control=%d min=%u max=%u\n",
+            VK_API_VERSION_MAJOR(dev->api_version), VK_API_VERSION_MINOR(dev->api_version),
             dev->subgroup_size_control, dev->min_subgroup_size, dev->max_subgroup_size);
     }
 
@@ -315,37 +342,23 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     // straight into a VapourSynth frame's plane memory, removing a host
     // staging round trip. Optional; query the alignment requirement and the
     // extension's presence before anyone relies on it.
-    dev->host_import = false;
-    {
-        uint32_t ext_count = 0;
-        vkEnumerateDeviceExtensionProperties(dev->physical_device, nullptr, &ext_count, nullptr);
-        std::vector<VkExtensionProperties> exts(ext_count);
-        vkEnumerateDeviceExtensionProperties(dev->physical_device, nullptr, &ext_count, exts.data());
-        bool present = false;
-        for (const auto & e : exts) {
-            if (std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) == 0) {
-                present = true;
-                break;
-            }
-        }
-        if (present) {
-            VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_props {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
-                .pNext = nullptr
-            };
-            VkPhysicalDeviceProperties2 p2 {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-                .pNext = &host_props
-            };
-            vkGetPhysicalDeviceProperties2(dev->physical_device, &p2);
-            dev->host_pointer_alignment = host_props.minImportedHostPointerAlignment;
-            dev->host_import = true;
-        }
-        if (trace_on("VSFEEL_DBG")) {
-            fprintf(stderr, "[vsfeel] host_import=%d min_align=%llu\n",
-                dev->host_import,
-                (unsigned long long)dev->host_pointer_alignment);
-        }
+    dev->host_import = has_ext(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    if (dev->host_import) {
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_props {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
+            .pNext = nullptr
+        };
+        VkPhysicalDeviceProperties2 p2 {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &host_props
+        };
+        vkGetPhysicalDeviceProperties2(dev->physical_device, &p2);
+        dev->host_pointer_alignment = host_props.minImportedHostPointerAlignment;
+    }
+    if (trace_on("VSFEEL_DBG")) {
+        fprintf(stderr, "[vsfeel] host_import=%d min_align=%llu\n",
+            dev->host_import,
+            (unsigned long long)dev->host_pointer_alignment);
     }
 
     // Pick a compute-capable queue family, prefer the one with the most queues
@@ -390,24 +403,6 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     // before asking for it. The answers are recorded in VK_Device so a filter
     // whose shaders require a missing feature can report a precise creation
     // error instead of relying on the driver accepting the pipeline anyway.
-    // The extension list comes first: an extension feature struct must only be
-    // chained when the extension itself is supported.
-    bool atomic_float_ext = false;
-    {
-        uint32_t ext_count = 0;
-        vkEnumerateDeviceExtensionProperties(dev->physical_device, nullptr, &ext_count, nullptr);
-        std::vector<VkExtensionProperties> exts(ext_count);
-        if (ext_count) {
-            vkEnumerateDeviceExtensionProperties(dev->physical_device, nullptr, &ext_count, exts.data());
-            for (const auto & e : exts) {
-                if (std::strcmp(e.extensionName, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME) == 0) {
-                    atomic_float_ext = true;
-                    break;
-                }
-            }
-        }
-    }
-
     VkPhysicalDeviceVulkan11Features supported_11 {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
         .pNext = nullptr
@@ -431,7 +426,9 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     };
     VkPhysicalDeviceFeatures2 supported_features {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-        .pNext = &supported_subgroup,
+        .pNext = subgroup_ok ? static_cast<void *>(&supported_subgroup)
+                             : (atomic_float_ext ? static_cast<void *>(&supported_atomic_float)
+                                                 : static_cast<void *>(&supported_13)),
         .features = {}
     };
     vkGetPhysicalDeviceFeatures2(dev->physical_device, &supported_features);
@@ -499,8 +496,12 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
 
     // VK_EXT_shader_atomic_float carries the atomicAdd(float) feature; it is
     // not promoted to core, so the extension has to be enabled for the
-    // feature struct to be meaningful.
-    std::vector<const char *> device_exts { VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME };
+    // feature struct to be meaningful. VK_EXT_subgroup_size_control is
+    // promoted in Vulkan 1.3, so it is only requested when advertised.
+    std::vector<const char *> device_exts;
+    if (subgroup_ext) {
+        device_exts.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+    }
     if (dev->host_import) {
         device_exts.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     }
@@ -707,24 +708,32 @@ std::variant<AllocatedMemory, std::string> allocate_memory(
 
     // Try the requested flags, then relaxed variants, so that e.g. a staging
     // buffer prefers host-cached memory (fast CPU access) but still works on
-    // drivers that only expose write-combined host memory.
-    const VkMemoryPropertyFlags candidates[] {
+    // drivers that only expose write-combined host memory. A caller that asked
+    // for host-visible *device-local* memory (the direct-upload fast paths)
+    // depends on the allocation really being device local, so those two bits
+    // are never relaxed away: the call fails instead and the caller falls back.
+    constexpr VkMemoryPropertyFlags rebar_flags =
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    const bool wants_rebar = (required & rebar_flags) == rebar_flags;
+    const std::array<VkMemoryPropertyFlags, 5> candidates {
         required,
         required & ~VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
         required & ~VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
     };
+    const size_t candidate_count = wants_rebar ? 3 : candidates.size();
 
     auto type_index = std::optional<uint32_t> {};
-    for (auto candidate : candidates) {
-        type_index = find_memory_type(dev, requirements.memoryTypeBits, candidate);
+    for (size_t i = 0; i < candidate_count; ++i) {
+        type_index = find_memory_type(dev, requirements.memoryTypeBits, candidates[i]);
         if (type_index) {
             break;
         }
     }
     if (!type_index) {
-        return "no suitable memory type found";
+        return wants_rebar ? "no DEVICE_LOCAL|HOST_VISIBLE memory type found"
+                           : "no suitable memory type found";
     }
 
     VkMemoryAllocateInfo allocate_info {

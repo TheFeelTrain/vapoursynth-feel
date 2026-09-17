@@ -621,3 +621,13 @@ lost; expected, timing-only path). dh scaling: 2 MB field → 95µs,
 (~25 GB/s, plausible PCIe) and pad ≈ 12–15µs. Reference H2D ~129µs for
 the same 2 MB — we are FASTER there. The kernels sum the same (~350 vs
 ~380); wall differs (900 vs 430) → host-side + submit, not GPU.
+
+## Validation hardening (cross-cutting pass)
+
+The upload flush (`up_total`) and download invalidate (`download_total`) now go
+through the shared `flush_range`/`invalidate_range` helpers, which round the
+range to `minNonCoherentAtomSize`/`VK_WHOLE_SIZE` as Vulkan requires (previously
+offset 0 + an arbitrary size, invalid on a non-coherent memory type). Creation
+also preflights the recorded `apiVersion` and reports
+`"NNEDI3 requires Vulkan 1.3 (device reports X.Y)"` instead of an opaque
+pipeline-creation failure. No behaviour change on this device; full suite green.

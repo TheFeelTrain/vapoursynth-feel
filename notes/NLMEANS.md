@@ -583,3 +583,12 @@ under an already-held lock, and `holders` grows from 4 to 8 bytes per entry
 - f32: vsfeel 848.6 vs vszipcl 639.5 (1.327x; README row 846/651/1.30x)
 Ratios match the shipped rows, so README.md's Performance table was left
 unchanged.
+
+## Validation hardening (cross-cutting pass)
+
+`wref` rejects NaN (and infinity) — `if (wref < 0)` let a NaN through into the
+weight denominator. The frame-request dependencies now use `rpGeneral` when
+`d > 0`: the filter requests `n ± d`, which `rpStrictSpatial` does not permit
+(only `d = 0` stays strict-spatial). The shared flush-range helper covers the
+staging/u1z flushes. No performance change; all `test_nlmeans.py` tests pass
+(the `wref=-0.5` message is unchanged, so its regex still matches).

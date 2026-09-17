@@ -29,6 +29,9 @@ using namespace std::string_literals;
 namespace {
 
 constexpr int MAX_RADIUS = 4;
+// The shader does the search-window arithmetic ((2*range+1)^2, x±range) in
+// int32; beyond this, absurd-but-accepted values overflow it.
+constexpr int kMaxSearchRange = 8192;
 
 struct Bm3dPlane {
     int width {};
@@ -341,8 +344,7 @@ static std::variant<VkPipeline, std::string> create_bm3d_pipeline(
         .basePipelineIndex = -1
     };
     VkPipeline pipeline;
-    VkResult result = vkCreateComputePipelines(
-        dev.device, dev.pipeline_cache, 1, &pipeline_info, nullptr, &pipeline);
+    VkResult result = create_compute_pipeline(dev, pipeline_info, &pipeline);
     if (result != VK_SUCCESS) {
         return "vkCreateComputePipelines failed: "s + vk_result_string(result);
     }
@@ -387,8 +389,7 @@ static std::variant<VkPipeline, std::string> create_agg_pipeline(
         .basePipelineIndex = -1
     };
     VkPipeline pipeline;
-    VkResult result = vkCreateComputePipelines(
-        dev.device, dev.pipeline_cache, 1, &pipeline_info, nullptr, &pipeline);
+    VkResult result = create_compute_pipeline(dev, pipeline_info, &pipeline);
     if (result != VK_SUCCESS) {
         return "vkCreateComputePipelines failed: "s + vk_result_string(result);
     }
@@ -1178,8 +1179,8 @@ static void VS_CC BM3DCreate(
         sigma[i] = static_cast<float>(vsapi->mapGetFloat(in, "sigma", i, &error));
         if (error) {
             sigma[i] = (i == 0) ? 3.0f : sigma[i - 1];
-        } else if (sigma[i] < 0.0f) {
-            return set_error("\"sigma\" must be non-negative");
+        } else if (!std::isfinite(sigma[i]) || sigma[i] < 0.0f) {
+            return set_error("\"sigma\" must be finite and non-negative");
         }
     }
     for (int i = 0; i < std::ssize(sigma); ++i) {
@@ -1214,8 +1215,8 @@ static void VS_CC BM3DCreate(
         bm_range[i] = vsh::int64ToIntS(vsapi->mapGetInt(in, "bm_range", i, &error));
         if (error) {
             bm_range[i] = (i == 0) ? 9 : bm_range[i - 1];
-        } else if (bm_range[i] <= 0) {
-            return set_error("\"bm_range\" must be positive");
+        } else if (bm_range[i] <= 0 || bm_range[i] > kMaxSearchRange) {
+            return set_error("\"bm_range\" must be in range [1, 8192]");
         }
     }
     d->bm_range = bm_range[0];
@@ -1246,8 +1247,8 @@ static void VS_CC BM3DCreate(
         ps_range[i] = vsh::int64ToIntS(vsapi->mapGetInt(in, "ps_range", i, &error));
         if (error) {
             ps_range[i] = (i == 0) ? 4 : ps_range[i - 1];
-        } else if (ps_range[i] <= 0) {
-            return set_error("\"ps_range\" must be positive");
+        } else if (ps_range[i] <= 0 || ps_range[i] > kMaxSearchRange) {
+            return set_error("\"ps_range\" must be in range [1, 8192]");
         }
     }
     d->ps_range = ps_range[0];
@@ -1256,8 +1257,8 @@ static void VS_CC BM3DCreate(
     if (error) {
         d->num_streams = 4;
     }
-    if (d->num_streams <= 0) {
-        return set_error("\"num_streams\" must be positive");
+    if (d->num_streams < 1 || d->num_streams > 32) {
+        return set_error("\"num_streams\" must be 1..32");
     }
 
     int device_id = vsh::int64ToIntS(vsapi->mapGetInt(in, "device_id", 0, &error));
@@ -1281,6 +1282,11 @@ static void VS_CC BM3DCreate(
     d->res_cap = (d->radius == 0) ? d->num_streams : d->tw + d->num_streams + 2 * d->radius;
 
     const int extractor_exp = vsh::int64ToIntS(vsapi->mapGetInt(in, "extractor_exp", 0, &error));
+    // outside the normal float exponent range the extractor add/subtract pair
+    // turns the aggregation into NaN
+    if (extractor_exp < -126 || extractor_exp > 127) {
+        return set_error("\"extractor_exp\" must be in range [-126, 127]");
+    }
     d->extractor = (extractor_exp != 0)
         ? std::ldexp(1.0f, extractor_exp) : 0.0f;
 
@@ -1661,9 +1667,13 @@ static void VS_CC BM3DCreate(
 
     BM3DData * data = d.release();
 
+    // A temporal filter requests frames outside n, which the strict-spatial
+    // policy does not permit; only radius 0 is purely spatial.
+    const VSRequestPattern policy =
+        data->radius > 0 ? rpGeneral : rpStrictSpatial;
     VSFilterDependency deps[2] = {
-        { data->node, rpStrictSpatial },
-        { data->ref_node, rpStrictSpatial }
+        { data->node, policy },
+        { data->ref_node, policy }
     };
 
     vsapi->createVideoFilter(

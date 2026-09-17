@@ -30,7 +30,7 @@ using namespace std::string_literals;
 // Filter state
 // ---------------------------------------------------------------------------
 
-struct PlaneConfig {
+struct BilateralPlaneConfig {
     int width {};                    // pixels
     int height {};                   // pixels
     int stride {};                   // pitch in elements (round_up(width, alignment))
@@ -85,7 +85,7 @@ struct BilateralData {
     VkDeviceSize download_total {};
     bool host_direct_upload {};  // src VRAM is host-mapped (ReBAR): no H2D copy
     bool kd_download {};         // kernels write the GTT download staging directly
-    std::array<PlaneConfig, 3> planes {};
+    std::array<BilateralPlaneConfig, 3> planes {};
     FramePool<BilateralResource> pool;
 
     ~BilateralData() {
@@ -162,7 +162,7 @@ struct BilateralData {
 // Shader specialization constants
 // ---------------------------------------------------------------------------
 
-struct SpecData {
+struct BilateralSpecData {
     int32_t width;
     int32_t height;
     int32_t stride;
@@ -225,7 +225,7 @@ static std::variant<VkShaderModule, std::string> create_shader_module(
 
 // use_shared selects between the two kernels
 static std::variant<VkPipeline, std::string> create_pipeline(
-    const VK_Device & dev, bool use_shared, const SpecData & spec,
+    const VK_Device & dev, bool use_shared, const BilateralSpecData & spec,
     VkShaderModule module, VkPipelineLayout layout) {
 
     const VkSpecializationMapEntry * entries;
@@ -266,8 +266,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     };
 
     VkPipeline pipeline;
-    VkResult result = vkCreateComputePipelines(
-        dev.device, dev.pipeline_cache, 1, &pipeline_info, nullptr, &pipeline);
+    VkResult result = create_compute_pipeline(dev, pipeline_info, &pipeline);
     if (result != VK_SUCCESS) {
         return "vkCreateComputePipelines failed: "s + vk_result_string(result);
     }
@@ -519,13 +518,8 @@ static const VSFrame *VS_CC BilateralGetFrame(
                     continue;
                 }
                 const auto & cfg = d->planes[plane];
-                ranges.push_back(VkMappedMemoryRange {
-                    .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                    .pNext = nullptr,
-                    .memory = resource.staging_mem,
-                    .offset = cfg.upload_offset,
-                    .size = cfg.upload_size,
-                });
+                ranges.push_back(mapped_range(*d->device, resource.staging_mem,
+                    cfg.upload_offset, cfg.upload_size));
             }
             checkVK(vkFlushMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
         }
@@ -545,13 +539,8 @@ static const VSFrame *VS_CC BilateralGetFrame(
                     continue;
                 }
                 const auto & cfg = d->planes[plane];
-                ranges.push_back(VkMappedMemoryRange {
-                    .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                    .pNext = nullptr,
-                    .memory = resource.staging_mem,
-                    .offset = d->upload_total + cfg.download_offset,
-                    .size = cfg.download_size,
-                });
+                ranges.push_back(mapped_range(*d->device, resource.staging_mem,
+                    d->upload_total + cfg.download_offset, cfg.download_size));
             }
             checkVK(vkInvalidateMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
         }
@@ -676,8 +665,8 @@ static void VS_CC BilateralCreate(
             } else {
                 sigma_spatial[i] = sigma_spatial[i - 1];
             }
-        } else if (sigma_spatial[i] < 0.f) {
-            return set_error("\"sigma_spatial\" must be non-negative");
+        } else if (!std::isfinite(sigma_spatial[i]) || sigma_spatial[i] < 0.f) {
+            return set_error("\"sigma_spatial\" must be finite and non-negative");
         }
 
         if (sigma_spatial[i] < FLT_EPSILON) {
@@ -701,8 +690,8 @@ static void VS_CC BilateralCreate(
             } else {
                 sigma_color[i] = sigma_color[i - 1];
             }
-        } else if (sigma_color[i] < 0.f) {
-            return set_error("\"sigma_color\" must be non-negative");
+        } else if (!std::isfinite(sigma_color[i]) || sigma_color[i] < 0.f) {
+            return set_error("\"sigma_color\" must be finite and non-negative");
         }
     }
 
@@ -720,7 +709,10 @@ static void VS_CC BilateralCreate(
         radius[i] = vsh::int64ToIntS(vsapi->mapGetInt(in, "radius", i, &error));
 
         if (error) {
-            radius[i] = std::max(1, static_cast<int>(std::roundf(sigma_spatial[i] * 3.f)));
+            // clamp before the cast: a huge finite sigma would otherwise make
+            // the float-to-int conversion undefined (the reference clamps too)
+            radius[i] = std::max(1, static_cast<int>(
+                std::min(std::roundf(sigma_spatial[i] * 3.f), 1000000.f)));
         } else if (radius[i] <= 0) {
             return set_error("\"radius\" must be positive");
         }
@@ -735,8 +727,8 @@ static void VS_CC BilateralCreate(
     if (error) {
         d->num_streams = 4;
     }
-    if (d->num_streams <= 0) {
-        return set_error("\"num_streams\" must be positive");
+    if (d->num_streams < 1 || d->num_streams > 32) {
+        return set_error("\"num_streams\" must be 1..32");
     }
 
     bool use_shared_memory = !!vsapi->mapGetInt(in, "use_shared_memory", 0, &error);
@@ -870,7 +862,7 @@ static void VS_CC BilateralCreate(
     std::array<bool, 3> pipeline_valid {};
     std::array<bool, 3> plane_shared {};
 
-    std::array<PlaneConfig, 3> & planes = d->planes;
+    std::array<BilateralPlaneConfig, 3> & planes = d->planes;
     bool need_plain = false;
 
     for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
@@ -995,7 +987,7 @@ static void VS_CC BilateralCreate(
         const size_t shared_bytes =
             static_cast<size_t>(1 + has_ref) * tile_x * tile_y * sizeof(float);
 
-        SpecData spec {
+        BilateralSpecData spec {
             .width = key.width,
             .height = key.height,
             .stride = key.stride,

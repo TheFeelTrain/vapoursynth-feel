@@ -751,7 +751,7 @@ enum Binding : uint32_t {
 // vcheck_lds rule; wider planes fall back to the global-read vcheck.
 static constexpr int MAXW_LDS = 4096;
 
-struct PlaneConfig {
+struct Eedi3PlaneConfig {
     int width {};                     // KERNEL plane width: the row kernel's
                                       // WIDTH spec constant and the EEDI3H
                                       // transposed row length
@@ -915,7 +915,7 @@ struct Eedi3Data {
     // CPU merge read). VSFEEL_EEDI3_AATIGHT=0 restores the two-plane + CPU
     // merge form for A/B. Requires vcheck > 0 (see the compose push constants).
     bool aa_fuse { true };
-    std::array<PlaneConfig, MAX_PLANES> aplanes {};
+    std::array<Eedi3PlaneConfig, MAX_PLANES> aplanes {};
 
     // Which copies use non-temporal load/store (bit0 = upload gathers, bit1 =
     // the final blit). Swept with VSFEEL_EEDI3_COPY; the default is measured.
@@ -1014,7 +1014,7 @@ struct Eedi3Data {
     // EEDI3H staging tail (composed plane + CPU mask scratch), after the
     // upload and download regions.
     VkDeviceSize scratch_total {};
-    std::array<PlaneConfig, MAX_PLANES> planes {};
+    std::array<Eedi3PlaneConfig, MAX_PLANES> planes {};
     FramePool<Eedi3Resource> pool;
 
     // module/pipeline cache keyed by width (values owned by the pipelines
@@ -1562,8 +1562,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     };
 
     VkPipeline pipeline;
-    VkResult result = vkCreateComputePipelines(
-        dev.device, dev.pipeline_cache, 1, &pipeline_info, nullptr, &pipeline);
+    VkResult result = create_compute_pipeline(dev, pipeline_info, &pipeline);
     if (result != VK_SUCCESS) {
         return "vkCreateComputePipelines failed: "s + vk_result_string(result);
     }
@@ -1572,7 +1571,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
 
 // Push constant layout must match the shader's PC struct (int block then
 // float block; see eedi3.comp).
-struct PushConstants {
+struct Eedi3PushConstants {
     int32_t pad_base;       // pad-elem base of the BUILT pad (b0 reads it)
     int32_t dst_base;
     int32_t pbt_base;
@@ -1619,7 +1618,7 @@ struct PushConstants {
     // plane and writes the result straight to the staging download.
     int32_t comp_fuse;
 };
-static_assert(sizeof(PushConstants) == 19 * 4 + 8 * 4 + 4, "push constants size");
+static_assert(sizeof(Eedi3PushConstants) == 19 * 4 + 8 * 4 + 4, "push constants size");
 
 // base offsets in ELEMENTS for each binding of a plane's regions (element
 // type per binding; the descriptors range the whole buffer so the shader
@@ -1653,7 +1652,7 @@ enum class PassTail { kTransfer, kDirect, kCompose, kAssembleV, kNone };
 // buffers (EEDI3AA only).
 static std::optional<std::string> record_pass(
     const Eedi3Data & d, Eedi3Resource & resource, const int field,
-    const std::array<PlaneConfig, MAX_PLANES> & planes, const bool horiz,
+    const std::array<Eedi3PlaneConfig, MAX_PLANES> & planes, const bool horiz,
     const bool second, const PassTail tail, const Eedi3Direct & direct) {
 
     const int32_t elem = d.elem_bytes;
@@ -1712,7 +1711,7 @@ static std::optional<std::string> record_pass(
             // layout it has always read. Same transpose for the sclip K -> B'
             // when the vcheck needs one.
             auto xpose = [&](VkDeviceSize src_off, VkDeviceSize dst_off) {
-                PushConstants xpc {};
+                Eedi3PushConstants xpc {};
                 xpc.raw_base = static_cast<int32_t>(src_off / pad_elem);
                 xpc.pad_base = static_cast<int32_t>(dst_off / pad_elem);
                 xpc.rows = cfg.rows;
@@ -1749,7 +1748,7 @@ static std::optional<std::string> record_pass(
         }
         gpu_mark();   // mark 1: after xpose (horiz) / no-op (vert)
 
-        PushConstants ppc {};
+        Eedi3PushConstants ppc {};
         ppc.pad_base = static_cast<int32_t>(cfg.built_offset / pad_elem);
         ppc.pad_stride = cfg.pad_stride;
         ppc.pad_height = cfg.pad_height;
@@ -1793,7 +1792,7 @@ static std::optional<std::string> record_pass(
         }
         const auto & cfg = planes[plane];
 
-        PushConstants pc {
+        Eedi3PushConstants pc {
             .pad_base = static_cast<int32_t>(cfg.built_offset / pad_elem_bytes(d.bits)),
             .dst_base = static_cast<int32_t>(
                 (second ? cfg.dst2_offset : cfg.dst_offset) / elem),
@@ -1926,7 +1925,7 @@ static std::optional<std::string> record_pass(
                 continue;
             }
             const auto & cfg = planes[plane];
-            PushConstants apc {};
+            Eedi3PushConstants apc {};
             apc.raw_base = static_cast<int32_t>(cfg.raw_offset / pad_elem);
             apc.raw2_base = static_cast<int32_t>(cfg.raw2_offset / pad_elem);
             apc.vout_base = static_cast<int32_t>(cfg.vout_offset / elem);
@@ -1965,7 +1964,7 @@ static std::optional<std::string> record_pass(
                 continue;
             }
             const auto & cfg = planes[plane];
-            PushConstants cpc {};
+            Eedi3PushConstants cpc {};
             // b9 = R' (device-local), b7 = vout, b10 = the assembled plane
             // (the staging download). Without a vcheck the interp values are
             // the row kernel's dst (b1) instead -- a spec constant selects it.
@@ -2046,7 +2045,7 @@ static std::optional<std::string> record_pass(
             const auto & cfg = planes[plane];
             if (direct_tail && direct.active[plane] && !d.skip_xfer &&
                 cfg.blit_pipeline) {
-                PushConstants bpc {};
+                Eedi3PushConstants bpc {};
                 bpc.dst_base = 0;   // the imported buffer starts at the plane
                 bpc.dst_stride = direct.stride[plane];
                 bpc.vout_base = static_cast<int32_t>(direct.vout_offset[plane] / elem);
@@ -2220,7 +2219,7 @@ static std::optional<std::string> record_command_buffer(
 // gather minus the dst kept-row copy -- the fused filter builds the merged
 // frame on the GPU instead.
 static void aa_gather_vertical(
-    const Eedi3Data & d, const PlaneConfig & cfg, uint8_t * upload,
+    const Eedi3Data & d, const Eedi3PlaneConfig & cfg, uint8_t * upload,
     uint8_t * staging, const uint8_t * srcp, ptrdiff_t src_stride,
     const uint8_t * scpp, ptrdiff_t scp_stride,
     const uint8_t * maskp, ptrdiff_t mask_stride,
@@ -2275,7 +2274,7 @@ static void aa_gather_vertical(
 // mask bit matrix. Exactly EEDI3H's gather, with the source pointer supplied by
 // the caller.
 static void aa_gather_horizontal(
-    const Eedi3Data & d, const PlaneConfig & acfg, uint8_t * upload,
+    const Eedi3Data & d, const Eedi3PlaneConfig & acfg, uint8_t * upload,
     uint8_t * staging, const uint8_t * srcp, ptrdiff_t src_stride,
     const uint8_t * scpp, ptrdiff_t scp_stride,
     const uint8_t * maskp, ptrdiff_t mask_stride,
@@ -2580,21 +2579,9 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
     }
 
     if (!coherent) {
-        std::vector<VkMappedMemoryRange> ranges;
-        for (int plane = 0; plane < numPlanes; ++plane) {
-            if (!d->process[plane]) {
-                continue;
-            }
-            ranges.push_back(VkMappedMemoryRange {
-                .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                .pNext = nullptr,
-                .memory = resource.staging_mem,
-                .offset = 0,
-                .size = d->upload_total,
-            });
-        }
-        checkVK(vkFlushMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()),
-                                          ranges.data()));
+        const VkMappedMemoryRange range =
+            mapped_range(*d->device, resource.staging_mem, 0, d->upload_total);
+        checkVK(vkFlushMappedMemoryRanges(dev, 1, &range));
     }
     _mm_sfence();
     checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
@@ -2613,13 +2600,8 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
                 continue;
             }
             const auto & cfg = d->planes[plane];
-            ranges.push_back(VkMappedMemoryRange {
-                .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                .pNext = nullptr,
-                .memory = resource.staging_mem,
-                .offset = d->upload_total + d->download_total + cfg.v_offset,
-                .size = cfg.v_bytes,
-            });
+            ranges.push_back(mapped_range(*d->device, resource.staging_mem,
+                d->upload_total + d->download_total + cfg.v_offset, cfg.v_bytes));
         }
         checkVK(vkInvalidateMappedMemoryRanges(dev,
             static_cast<uint32_t>(ranges.size()), ranges.data()));
@@ -2668,21 +2650,9 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
     if (hbench) { h_thRec = std::chrono::steady_clock::now(); }
 
     if (!coherent) {
-        std::vector<VkMappedMemoryRange> ranges;
-        for (int plane = 0; plane < numPlanes; ++plane) {
-            if (!d->process[plane]) {
-                continue;
-            }
-            ranges.push_back(VkMappedMemoryRange {
-                .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                .pNext = nullptr,
-                .memory = resource.staging_mem,
-                .offset = 0,
-                .size = d->upload_total,
-            });
-        }
-        checkVK(vkFlushMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()),
-                                          ranges.data()));
+        const VkMappedMemoryRange range =
+            mapped_range(*d->device, resource.staging_mem, 0, d->upload_total);
+        checkVK(vkFlushMappedMemoryRanges(dev, 1, &range));
     }
     _mm_sfence();
     checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
@@ -2704,13 +2674,8 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
             const VkDeviceSize off[2] = { cfg.out_offset, cfg.out2_offset };
             const VkDeviceSize bytes[2] = { cfg.out_bytes, cfg.out2_bytes };
             for (int k = 0; k < 2; ++k) {
-                ranges.push_back(VkMappedMemoryRange {
-                    .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                    .pNext = nullptr,
-                    .memory = resource.staging_mem,
-                    .offset = d->upload_total + d->download_total + off[k],
-                    .size = bytes[k],
-                });
+                ranges.push_back(mapped_range(*d->device, resource.staging_mem,
+                    d->upload_total + d->download_total + off[k], bytes[k]));
             }
         }
         checkVK(vkInvalidateMappedMemoryRanges(dev,
@@ -3151,22 +3116,9 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     if (hbench) { h_tGatherEnd = std::chrono::steady_clock::now(); }
 
     if (!coherent) {
-        std::vector<VkMappedMemoryRange> ranges;
-        ranges.reserve(d->vi->format.numPlanes);
-        for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-            if (!d->process[plane]) {
-                continue;
-            }
-            const auto & cfg = d->planes[plane];
-            ranges.push_back(VkMappedMemoryRange {
-                .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                .pNext = nullptr,
-                .memory = resource.staging_mem,
-                .offset = 0,
-                .size = d->upload_total,
-            });
-        }
-        checkVK(vkFlushMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
+        const VkMappedMemoryRange range =
+            mapped_range(*d->device, resource.staging_mem, 0, d->upload_total);
+        checkVK(vkFlushMappedMemoryRanges(dev, 1, &range));
     }
 
     // Drain the CPU store buffer so no NT upload write is still in flight when
@@ -3192,14 +3144,10 @@ static const VSFrame *VS_CC Eedi3GetFrame(
                 continue;
             }
             const auto & cfg = d->planes[plane];
-            ranges.push_back(VkMappedMemoryRange {
-                .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                .pNext = nullptr,
-                .memory = resource.staging_mem,
-                .offset = d->upload_total + (d->horiz
+            ranges.push_back(mapped_range(*d->device, resource.staging_mem,
+                d->upload_total + (d->horiz
                     ? d->download_total + cfg.out_offset : cfg.dl_offset),
-                .size = d->horiz ? cfg.out_bytes : cfg.dl_bytes,
-            });
+                d->horiz ? cfg.out_bytes : cfg.dl_bytes));
         }
         checkVK(vkInvalidateMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
     }
@@ -3667,6 +3615,9 @@ static void vsfeel_eedi3_create(
     // which needs maintenance4); all EEDI3 shaders also use int8/int16 SSBO
     // storage. Report a precise creation error instead of relying on the
     // driver accepting a pipeline whose features were never enabled.
+    if (auto e = require_vulkan_1_3(*d->device, "EEDI3")) {
+        return set_error(*e);
+    }
     if (!d->device->feat_vulkan_memory_model) {
         return set_error("vulkanMemoryModel is not enabled on this device");
     }
@@ -3751,7 +3702,7 @@ static void vsfeel_eedi3_create(
         VkPushConstantRange pcr {
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
             .offset = 0,
-            .size = sizeof(PushConstants)
+            .size = sizeof(Eedi3PushConstants)
         };
         VkPipelineLayoutCreateInfo plci {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,

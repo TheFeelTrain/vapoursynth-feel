@@ -896,3 +896,25 @@ coherent, so it is a no-op here. Verified behaviourally with a temporary forced-
 `coherent=false` build: 133/133 `test_eedi3aa.py` pass and the Khronos
 validation layer emits zero VUIDs (ranges stay inside the staging allocation).
 
+---
+# ROUND 8 — atom-aligned ranges + Vulkan 1.3 preflight
+
+`VkMappedMemoryRange` offsets/sizes must be multiples of
+`minNonCoherentAtomSize` (256 here), or run to the end of the allocation. All
+five filters' hand-built 32-byte-aligned ranges were replaced by the shared
+`mapped_range`/`flush_range`/`invalidate_range` helpers in `vsfeel.h`, which
+round the offset down, the size up, and fall back to `VK_WHOLE_SIZE` when the
+allocation size is unknown or the rounded end would overrun it. EEDI3/AA's
+identical per-plane flush entries (three copies of `[0, upload_total)`) collapsed
+to one.
+
+Same pass: `VK_EXT_subgroup_size_control` is only enabled when advertised (or
+the device is 1.3+, where it is core), the device extension list is enumerated
+once, `VkPhysicalDeviceProperties::apiVersion` is recorded and checked before
+the SPIR-V 1.6 filters create a pipeline ("requires Vulkan 1.3 (device reports
+X.Y)"), every `vkCreateComputePipelines` takes `pipeline_cache_lock`, and
+`allocate_memory` refuses rather than silently relaxing a
+`DEVICE_LOCAL|HOST_VISIBLE` request. On this box nothing changes behaviourally
+(`api_version=1.4`, extension present, staging coherent); full suite green.
+
+

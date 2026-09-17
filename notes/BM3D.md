@@ -143,7 +143,13 @@ This is now covered by
   every radius / stream count (for `r = 0`, `res = 2*ns*pe` vs
   `src = 2*(ns-1)*pe`; for `r > 0` the `tw * 2` factor dominates), so a
   configuration whose source offsets would wrap is rejected by the same check.
-- **Not fixed here** (creation-time parameter validation, a separate change):
-  `bm_range` and `ps_range` are only checked for positivity, so
-  `bm_range = INT32_MAX` divides by zero in the shader, and `extractor_exp` has
-  no upper bound (`std::ldexp(1.0f, 200)` is NaN).
+- **Parameter validation (added in the cross-cutting hardening pass).**
+  `bm_range`/`ps_range` are now bounded to `[1, 8192]`: the shader computes
+  `x ± BM_RANGE`, `(2*PS_RANGE+1)^2` and `i * that` in `int`, so `INT32_MAX`
+  overflowed `rw = right - left + 1` to `<= 0` and the radius>=3 scan divided by
+  it (`sub_lane_id % rw`). `extractor_exp` is bounded to `[-126, 127]` because
+  `(x + 2^e) - 2^e` is NaN once `2^e` is not a finite normal float.
+  `num_streams` is now `1..32`, `sigma` rejects NaN/inf, and the frame-request
+  policy is `rpGeneral` whenever `radius > 0` (a temporal filter may not declare
+  `rpStrictSpatial`). Verified in `tmp/verify_validation.py`.
+

@@ -583,8 +583,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     };
 
     VkPipeline pipeline;
-    VkResult result = vkCreateComputePipelines(
-        dev.device, dev.pipeline_cache, 1, &pipeline_info, nullptr, &pipeline);
+    VkResult result = create_compute_pipeline(dev, pipeline_info, &pipeline);
     if (result != VK_SUCCESS) {
         return "vkCreateComputePipelines failed: "s + vk_result_string(result);
     }
@@ -967,14 +966,7 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
             !!(d->device->mem_props.memoryTypes[resource.up_type_index].propertyFlags &
                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         if (!up_coherent && d->up_total > 0) {
-            VkMappedMemoryRange flush_range {
-                .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                .pNext = nullptr,
-                .memory = resource.up_mem,
-                .offset = 0,
-                .size = d->up_total,
-            };
-            checkVK(vkFlushMappedMemoryRanges(dev, 1, &flush_range));
+            checkVK(flush_range(*d->device, resource.up_mem, 0, d->up_total));
         }
         // Submit the pre-recorded CB for this parity (recorded once at
         // create time — no per-frame reset/record). The CB's host barrier
@@ -1047,14 +1039,8 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
             !!(d->device->mem_props.memoryTypes[resource.staging_type_index].propertyFlags &
                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         if (!dl_coherent && d->download_total > 0) {
-            VkMappedMemoryRange inv_range {
-                .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                .pNext = nullptr,
-                .memory = resource.staging_mem,
-                .offset = 0,
-                .size = d->download_total,
-            };
-            checkVK(vkInvalidateMappedMemoryRanges(dev, 1, &inv_range));
+            checkVK(invalidate_range(*d->device, resource.staging_mem, 0,
+                d->download_total));
         }
         bump(d->t_setup);
 
@@ -1531,6 +1517,10 @@ static void VS_CC Nnedi3Create(
         }
         d->device = std::get<std::shared_ptr<VK_Device>>(result);
         d->device_id = device_id;
+    }
+
+    if (auto e = require_vulkan_1_3(*d->device, "NNEDI3")) {
+        return set_error(*e);
     }
 
     VkDevice dev = d->device->device;

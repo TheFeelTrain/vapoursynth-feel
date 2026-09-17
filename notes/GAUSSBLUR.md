@@ -116,3 +116,10 @@ Benchmark call: `MANGOHUD=0 python benchmark/bench.py --filter gaussblur`
   kernels + D2H copy only; CPU upload/download memcpys run on the VS
   worker threads in parallel with GPU work. D2H must stay a GPU copy
   (CPU reads from VRAM BAR are 1.3 GB/s — dead end, measured).
+
+## Validation hardening (cross-cutting pass)
+
+The upload flush and download invalidate ranges (per plane, at arbitrary
+32-byte-aligned offsets) now go through the shared `mapped_range` helper, which
+rounds them to `minNonCoherentAtomSize`/`VK_WHOLE_SIZE` as Vulkan requires. No
+behaviour change on this coherent device; all `test_gaussblur.py` tests pass.

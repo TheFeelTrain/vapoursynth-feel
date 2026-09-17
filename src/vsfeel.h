@@ -82,6 +82,7 @@ struct VK_Device {
     VkDevice device {};
     VkPhysicalDeviceMemoryProperties mem_props {};
     VkPhysicalDeviceLimits limits {};
+    uint32_t api_version {};
     uint32_t queue_family {};
     uint32_t queue_count {};
     // VK_EXT_external_memory_host: whether a host pointer can be imported as a
@@ -110,7 +111,7 @@ struct VK_Device {
     // every process. A VkPipelineCache seeded from and flushed to a file makes
     // it a one-time cost per (device, driver) pair.
     VkPipelineCache pipeline_cache {};
-    std::mutex pipeline_cache_lock;      // serializes cache data extraction
+    mutable std::mutex pipeline_cache_lock;  // serializes cache access
     std::string pipeline_cache_path;     // empty = cache disabled
     std::vector<VK_Queue> queues {};
     std::atomic<intptr_t> refcount { 0 };
@@ -124,6 +125,30 @@ void release_device(const std::shared_ptr<VK_Device> & dev);
 // instance releases the device and once at process exit, so subprocess-based
 // runs (vspipe, test comparisons) still contribute to the cache.
 void save_pipeline_cache(VK_Device & dev);
+
+// Vulkan requires external synchronization of host access to a VkPipelineCache,
+// and VapourSynth creates filter nodes from several threads, so every
+// vkCreateComputePipelines call goes through this lock-taking wrapper.
+inline VkResult create_compute_pipeline(
+    const VK_Device & dev, const VkComputePipelineCreateInfo & info,
+    VkPipeline * pipeline) {
+    std::lock_guard lock(dev.pipeline_cache_lock);
+    return vkCreateComputePipelines(
+        dev.device, dev.pipeline_cache, 1, &info, nullptr, pipeline);
+}
+
+// The DFTTest/EEDI3/NNEDI3 shaders are compiled for SPIR-V 1.6, which a Vulkan
+// 1.3 device is required to accept; below that, pipeline creation fails with an
+// opaque driver error, so report the version instead.
+inline std::optional<std::string> require_vulkan_1_3(
+    const VK_Device & dev, const char * filter) {
+    if (dev.api_version >= VK_API_VERSION_1_3) {
+        return std::nullopt;
+    }
+    return std::string(filter) + " requires Vulkan 1.3 (device reports " +
+        std::to_string(VK_API_VERSION_MAJOR(dev.api_version)) + "." +
+        std::to_string(VK_API_VERSION_MINOR(dev.api_version)) + ")";
+}
 
 // Streaming copy: non-temporal stores bypass the CPU cache so the freshly
 // written lines sit clean in DRAM; the GPU can then read them over PCIe
@@ -151,6 +176,54 @@ void copy_plane_out(void * dst, ptrdiff_t dst_pitch, const void * src,
 // destination pitches (GPU plane pitch in, frame stride out).
 void copy_plane_read(void * dst, ptrdiff_t dst_pitch, const void * src,
                      ptrdiff_t src_pitch, size_t row_bytes, int height);
+
+// Vulkan requires mapped-memory flush/invalidate ranges to be multiples of
+// minNonCoherentAtomSize, or to run to the end of the allocation. Callers work
+// in exact plane/slice ranges, so round the offset down and the size up here;
+// a range that would overrun `mem_size` (or one whose allocation size is
+// unknown, `mem_size == 0`) becomes VK_WHOLE_SIZE instead.
+inline VkMappedMemoryRange mapped_range(
+    const VK_Device & dev, VkDeviceMemory memory, VkDeviceSize offset,
+    VkDeviceSize size, VkDeviceSize mem_size = 0) {
+    const VkDeviceSize atom =
+        dev.limits.nonCoherentAtomSize ? dev.limits.nonCoherentAtomSize : 1;
+    const VkDeviceSize start = offset - (offset % atom);
+    VkDeviceSize range = VK_WHOLE_SIZE;
+    if (mem_size > 0) {
+        const VkDeviceSize end = offset + size;
+        const VkDeviceSize aligned_end = end + ((atom - (end % atom)) % atom);
+        if (aligned_end <= mem_size) {
+            range = aligned_end - start;
+        }
+    }
+    return VkMappedMemoryRange {
+        .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+        .pNext = nullptr,
+        .memory = memory,
+        .offset = start,
+        .size = range
+    };
+}
+
+inline VkResult flush_range(const VK_Device & dev, VkDeviceMemory memory,
+                            VkDeviceSize offset, VkDeviceSize size,
+                            VkDeviceSize mem_size = 0) {
+    if (size == 0) {
+        return VK_SUCCESS;
+    }
+    VkMappedMemoryRange range = mapped_range(dev, memory, offset, size, mem_size);
+    return vkFlushMappedMemoryRanges(dev.device, 1, &range);
+}
+
+inline VkResult invalidate_range(const VK_Device & dev, VkDeviceMemory memory,
+                                 VkDeviceSize offset, VkDeviceSize size,
+                                 VkDeviceSize mem_size = 0) {
+    if (size == 0) {
+        return VK_SUCCESS;
+    }
+    VkMappedMemoryRange range = mapped_range(dev, memory, offset, size, mem_size);
+    return vkInvalidateMappedMemoryRanges(dev.device, 1, &range);
+}
 
 struct AllocatedMemory {
     VkDeviceMemory memory;
