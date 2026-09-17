@@ -873,3 +873,26 @@ Combined same-session A/B against the pre-round defaults:
 **EEDI3AA 89.7 -> 108.8 fps (+21.3%)**, and `benchmark/bench.py --filter
 eedi3aa` measures ~121 fps at ns=8 (vszipcl 48.6, eedi3vk2 36.2). All 214
 EEDI3-family tests pass.
+
+---
+# ROUND 7 — invalidate GPU-written staging before the CPU reads it
+
+`Eedi3AaGetFrame` reads two GPU-written staging regions but never invalidated
+them: the merged vertical frame (`v_offset`, written by `ENTRY_ASSEMBLEV` via
+binding 10) read by `gather_horizontal`, and the two composed planes
+(`out_offset`/`out2_offset`, written by `ENTRY_COMPOSE`) read by the final
+merge. Both reads were guarded only by the `coherent` flag, which
+`allocate_memory` can drop — on a non-coherent device the horizontal pass would
+gather a stale `v`. `Eedi3GetFrame` already had the matching invalidate; the AA
+path had only the flush half.
+
+Fix: mirror EEDI3's block after each fence wait — one `vkInvalidateMappedMemoryRanges`
+over `{upload_total + download_total + v_offset, v_bytes}` per processed plane
+after the vertical fence, and one over `out_offset`/`out2_offset` after the
+horizontal fence.
+
+No measurement: the block is behind `!coherent` and this box's staging is
+coherent, so it is a no-op here. Verified behaviourally with a temporary forced-
+`coherent=false` build: 133/133 `test_eedi3aa.py` pass and the Khronos
+validation layer emits zero VUIDs (ranges stay inside the staging allocation).
+

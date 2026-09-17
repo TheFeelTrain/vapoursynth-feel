@@ -2603,6 +2603,27 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
     eedi3_gpu_report(*d, resource, "aa-v", 0);
     if (hbench) { h_tvWait = std::chrono::steady_clock::now(); }
 
+    // The column-gather below reads the assemble kernel's merged vertical
+    // frame out of staging, so invalidate it first (mirrors EEDI3's block).
+    if (!coherent) {
+        std::vector<VkMappedMemoryRange> ranges;
+        ranges.reserve(numPlanes);
+        for (int plane = 0; plane < numPlanes; ++plane) {
+            if (!d->process[plane]) {
+                continue;
+            }
+            const auto & cfg = d->planes[plane];
+            ranges.push_back(VkMappedMemoryRange {
+                .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                .pNext = nullptr,
+                .memory = resource.staging_mem,
+                .offset = d->upload_total + d->download_total + cfg.v_offset,
+                .size = cfg.v_bytes,
+            });
+        }
+        checkVK(vkInvalidateMappedMemoryRanges(dev,
+            static_cast<uint32_t>(ranges.size()), ranges.data()));
+    }
 
     // ------------------------------------------------------------------
     // Host: column-gather the merged v for both horizontal sub-passes.
@@ -2669,6 +2690,32 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
     checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
     eedi3_gpu_report(*d, resource, "aa-h", 1);
     if (hbench) { h_thWait = std::chrono::steady_clock::now(); }
+
+    // The final merge below reads the two compose kernels' planes from
+    // staging, so invalidate them first (mirrors EEDI3's block).
+    if (!coherent) {
+        std::vector<VkMappedMemoryRange> ranges;
+        ranges.reserve(2 * numPlanes);
+        for (int plane = 0; plane < numPlanes; ++plane) {
+            if (!d->process[plane]) {
+                continue;
+            }
+            const auto & cfg = d->planes[plane];
+            const VkDeviceSize off[2] = { cfg.out_offset, cfg.out2_offset };
+            const VkDeviceSize bytes[2] = { cfg.out_bytes, cfg.out2_bytes };
+            for (int k = 0; k < 2; ++k) {
+                ranges.push_back(VkMappedMemoryRange {
+                    .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                    .pNext = nullptr,
+                    .memory = resource.staging_mem,
+                    .offset = d->upload_total + d->download_total + off[k],
+                    .size = bytes[k],
+                });
+            }
+        }
+        checkVK(vkInvalidateMappedMemoryRanges(dev,
+            static_cast<uint32_t>(ranges.size()), ranges.data()));
+    }
 
     // ------------------------------------------------------------------
     // Final 50/50 merge of the two composed planes into the output frame.
