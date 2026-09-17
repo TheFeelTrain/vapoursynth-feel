@@ -1,4 +1,23 @@
-# NNEDI3 — vsfeel port (Vulkan)
+# NNEDI3 — notes
+
+*vsfeel's Vulkan port of nnedi3vk.*
+
+Status: **shipped**, `num_streams = 4`, ~18 MB VRAM/stream. Perf (jpbd 1080p
+GRAY16, nnedi3vk in parens): 1s 1330 (1550) / 2s 2320 (2360) / 4s 2650 (2520) /
+8s 2814 (2584).
+
+- **Zero-copy ReBAR upload** — CPU packs tight field rows into the host-mapped
+  `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` buffer; no GPU pad, no H2D copy.
+- **Fused clamp-mirror reads** — prescreen/predict clamp the packed field
+  directly (`fp = 1-parity`, push word 3) instead of a padded buffer.
+- **Pre-recorded parity CBs** — two CBs per resource, recorded once at create.
+- **Packed-interp-only D2H** — predict writes interp rows to a device-local
+  `dst`, one inline `vkCmdCopyBuffer` ships that half-frame, host scatters it;
+  kept rows are copied from `src` pre-acquire.
+- **Transfer queue deleted** — D2H is always inline on the compute queue.
+- `PAD`/`ASSEMBLE`/`COUNT` entries are compiled but **not dispatched**: dead
+  pipelines plus ~6 MB/stream dead VRAM (`pad_buf` 2 MB + `asm_buf` 4 MB per
+  1080p plane). Cleanup candidate, not design.
 
 ## References
 
@@ -62,25 +81,32 @@ Predictor upload layout per qual pass: weight pairs `(sm,el)` as
 ## vsfeel design (own structure, not a nnedi3vk mirror)
 
 - `src/nnedi3.comp`, five entry points, BITS=16/32:
-  - `ENTRY_PAD`: clamp pad kernel (own trivial kernel, cf. vszipcu's).
+  - `ENTRY_PAD`: clamp pad kernel. **Not dispatched** — the window reads clamp
+    the tight ReBAR field directly (the pad kernel was deleted).
   - `ENTRY_PRESCREEN`: one thread per pixel group (P=1 old pscrn, P=4 new)
     doing cubic taps + prescreener verdict inline; accepted pixels get cubic
     stored, rejected indices compacted into a list with one atomicAdd per
-    128-thread workgroup (subgroup-aggregated totals in shared memory).
+    128-thread workgroup (subgroup-aggregated totals in shared memory). Also
+    clamps the field for its own window reads.
   - `ENTRY_PREDICT`: cooperative predictor over the list (pscrn>0) or all
     pixels (pscrn=0): one 32-lane subgroup per PXP pixels (8 when
     NNS<=64 and FS<=128, else 4), window stats via subgroup adds, GEMV from
-    shared-memory tile, wae5 blend; fixed 2048-group direct dispatch with a
-    GRIDPX-strided loop tail (count-bounded, always correct).
-  - `ENTRY_COUNT`: 1-thread `groupsX = ceil(count/16)` derivation (created
-    but not dispatched yet — indirect launch is still env-gated experimental).
-  - `ENTRY_ASSEMBLE`: interleave kept field rows + packed interp rows into
-    the full frame, written straight into the staging download area
-    (kernel-direct download, no D2H copy).
-- `src/nnedi3.cpp`: vsfeel-style host (FramePool, staging upload, device-local
-  field/pad/dst/list/indirect buffers, persistent-mapped weight buffers, one
-  CB per frame: H2D → pad → prescreen → predict → assemble). Field extract +
-  interleave... (interleave now on GPU via assemble). Spec-constant dims.
+    shared-memory tile, wae5 blend; indirect launch off the prescreen count
+    (direct grid for pscrn=0), always count-bounded so the loop tail is
+    correct.
+  - `ENTRY_COUNT`: 1-thread `groupsX = ceil(count/16)` derivation. **Not
+    dispatched** — the prescreen's atomicMax maintains the indirect width.
+  - `ENTRY_ASSEMBLE`: interleave kept field rows + packed interp rows into a
+    full frame. **Not dispatched** — the assemble kernel was deleted; the
+    predict dst (packed interp rows only) is what D2H ships.
+- `src/nnedi3.cpp`: vsfeel-style host — `FramePool`, host-mapped ReBAR upload
+  staging (CPU packs tight field rows), device-local field/dst/list/indirect
+  buffers, persistent-mapped weight buffers, **two pre-recorded CBs per
+  resource** (one per parity, recorded once at create). Per-frame path:
+  CPU pack → submit (prescreen → barrier → indirect predict → barrier → inline
+  `vkCmdCopyBuffer` of the packed interp dst to GTT staging) → host scatter of
+  interp rows + kept rows copied from `src`. No H2D copy, no GPU pad, no
+  assemble, no transfer queue. Spec-constant dims.
 - Weights: `src/nnedi3_weights.bin` committed (13.5 MB), objcopy-embedded.
 - Args: field/dh/planes/nsize/nns/qual/etype/pscrn/device_id/num_streams.
   Depths: 16-bit int + 32-bit float (8-bit/f16 rejected with a clear error).
@@ -206,6 +232,12 @@ launch, fills, sparse-grid inefficiency. Expected GPU: verdict-full-grid
 ~50 + inline-predict ~22 + D2H 86 ≈ 160 vs split ~315.
 Accuracy: serial (non-butterfly) reduction order, same formulas — the fused
 MVP already proved ≤1 LSB / 1e-6 on this exact tradeoff.
+
+## Historical
+
+The dated record of how this design was reached. GPU pad, GPU assemble, the
+transfer-queue split submit and the host snapshot/early-`give_back` were all
+later deleted; blocks marked historical below carry their mechanism only.
 
 ## Session status 2026-09-05 (STOPPED, tree RED — read before touching)
 
@@ -394,9 +426,11 @@ Radical round, each step measured best-of-3/median-of-5 same-session pairs
 - **Defaults set at the knee (user cap: ≤4): filter `num_streams` 2→4,
   bench nnedi3 `default_streams` + build fallback 2→4.** Out-of-box:
   ~2640 vs ref default-2s ~2360 (+12%); same-4s h2h +5%. Per-stream
-  ~18MB VRAM (incl. dead asm+pad ~8MB — cleanup would drop to ~10MB).
+  ~18MB VRAM (incl. dead asm+pad ≈ 6MB/plane — cleanup would drop it).
 
 ### Perf state (best-of-3, 2026-09-05 post-ReBAR)
+
+> Numbers and stage names (`h2dpad`, `asm`) are the deleted-kernel era.
 
 - 1 stream: vsfeel ~986 vs nnedi3vk ~1625 (0.61x). Host: pack ~150–160 +
   kept ~320–365 + submit/record ~35 ≈ 520 serial; GPU ~260
@@ -448,6 +482,8 @@ Radical round, each step measured best-of-3/median-of-5 same-session pairs
   hold.)
 
 ### What landed (all verified 46/46)
+
+> All four items were later deleted; kept for the mechanism.
 
 1. **Transfer-queue split submit** (`src/nnedi3.cpp`: per-resource
    `copy_pool`/`copy_cmd`/timeline/`xfer_queue`; `record_copy_buffer` does
@@ -535,6 +571,9 @@ Radical round, each step measured best-of-3/median-of-5 same-session pairs
 
 ### Next (hypothesis order)
 
+> All three were tested: #1 REFUTED (indirect stayed), #2 folded into the
+> fused clamp reads, #3 became the deleted pad/assemble path.
+
 1. **Predict over-launch**: ref launches `ceilDiv(w*rows,16)` blocks
    REGARDLESS of count (over-launch + `firstPix >= npix` early-exit); we
    launch exact `ceil(count/PPG)` indirectly (e.g. groupsX=16 for
@@ -550,13 +589,25 @@ Radical round, each step measured best-of-3/median-of-5 same-session pairs
    copy ≈ 1000µs at 2 streams) — e.g. assemble directly into mapped
    staging (no D2H, no snapshot), or kept-line host path with fewer passes.
 
-### Probes kept in tree (TEMPORARY, env-gated — remove after tuning)
+### Probes kept in tree (TEMPORARY, env-gated)
 
-`VSFEEL_NNEDI3_BENCH/TSTAMP/UPTO/COUNT/SKIPIL/SPLITIL(dead after assemble —
-fused copy has no split path)/NOXFER/UPGTT(dead after GPU pad — upload is
-always GTT now)`, per-resource query pool. `tmp/` scratch: `probe2.vpy`,
-`q2_vs.vpy`, `p0vs.vpy`, `a1.vpy`, `synth_a.vpy`, `nondet*.py`, `asm_*.txt`
-(stale: pre-pad ISA), `ns_tmp.vpy`, `ss.vpy`.
+Live NNEDI3 knobs in `src/nnedi3.cpp`, verified against the source:
+
+| env | what it does |
+|---|---|
+| `VSFEEL_NNEDI3_TSTAMP` | per-frame GPU timestamp slots 0=top 1=pre 2=pred 3=copy |
+| `VSFEEL_NNEDI3_BENCH` | host `[perf]` phase averages every 200 frames |
+| `VSFEEL_NNEDI3_COUNT` | read back the prescreen pixel count |
+| `VSFEEL_NNEDI3_SKIPIL` | skip the downloads (timing only, garbage out) |
+| `VSFEEL_NNEDI3_QUEUES=N` | override the queue cap (default 2) |
+
+`VSFEEL_NNEDI3_PREDIRECT` is not a live knob — the over-launch probe was
+removed after it was refuted; only the comment with the measured numbers
+remains. `UPTO`, `SPLITIL`, `NOXFER` and `UPGTT` no longer exist anywhere in
+the tree.
+
+`tmp/` scratch: `probe2.vpy`, `q2_vs.vpy`, `p0vs.vpy`, `a1.vpy`, `synth_a.vpy`,
+`nondet*.py`, `asm_*.txt` (stale: pre-pad ISA), `ns_tmp.vpy`, `ss.vpy`.
 
 ### Scalar-GEMV experiment (STASHED, not in tree — correctness bug open)
 

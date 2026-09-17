@@ -1,140 +1,101 @@
-# GaussBlur — performance notes
+# GaussBlur — notes
 
-Status: **iterating** — vsfeel 1808 fps vs vszipcl 1412 (beaten) vs vszipcu
-3489. Baseline was 1342/1643/3083. Next target: eliminate the GPU-side H2D
-copy via host-mapped VRAM upload.
+Status: **iterating** — beats vszipcl, still trails vszipcu. Config: jpbd
+1920x1080 GRAY16, σ=16 (radius 48 → two-pass `ENTRY_VERT`/`ENTRY_HORIZ` path),
+1000 frames.
 
-## Context
+| ns | vsfeel | vszipcl | vszipcu |
+|---|---|---|---|
+| 4 (shipped) | **2577** | 1414 | 3431 |
+| 8 | **2522** | 1425 | 3711 |
 
-Benchmark call: `MANGOHUD=0 python benchmark/bench.py --filter gaussblur`
+Knee is 4 (8 is flat), so the filter is GPU-side limited, not
+overlap-limited. The remaining gap is to vszipcu's HIP path, not to OpenCL.
+`num_streams` defaults to 1 in the plugin (the benchmark passes 4); per-stream
+VRAM is ~4 MB src + ~4 MB dst + staging.
 
-- Input: `/home/thefeeltrain/Encode/test/jpbd.mkv` 1920x1080 YUV420P8, converted to GRAY16
-  (`depth(get_y(clip), 16)`), 5000 frames cached in RAM, num_streams=4.
-- sigma=16 → taps = ceil(16*6+1) = 97 → radius 48 > 32 → **two-pass large path**
-  (ENTRY_VERT then ENTRY_HORIZ) on every frame.
-- Target GPU: RX 7900 XTX (gfx1100), RADV. PCIe 4.0 x16. **ReBAR is enabled**
-  (BAR0 = 32 GiB; Vulkan heap 1 = 24 GiB DEVICE_LOCAL, and memoryType[3] =
-  DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT — i.e. VRAM mapped into the CPU
-  address space).
+Bench: `MANGOHUD=0 python3 benchmark/bench.py --filter gaussblur
+[--gauss-sigma X] [--num-streams N] vsfeel vszipcl vszipcu`.
+Target GPU: RX 7900 XTX (gfx1100), RADV, ReBAR (`memoryType 3`).
 
-## Current vsfeel implementation (baseline)
+## Implementation
 
-- Host-visible cached staging buffer (type 5: HOST_VISIBLE|HOST_COHERENT|
-  HOST_CACHED, heap 0 = 31 GiB GTT/carve-out), one per stream, holding
-  upload + download regions back to back. Kernels read/write **sysmem
-  directly** (SSBO bound to staging), no device-local bounce.
-- The 16-bit kernel unpacks u16 elements from u32 dwords (shift/mask per
-  element) and stores results with **masked atomicOr** into shared dwords
-  (because two adjacent lanes share a dword) — the download region is
-  pre-cleared with vkCmdFillBuffer every frame.
-- Large path: ENTRY_VERT writes float tmp (device-local buffer) then
-  ENTRY_HORIZ reads tmp and writes 16-bit dst via atomicOr packs.
-- Per-frame flow: memcpy VS frame → staging (streaming stores), submit,
-  vkWaitForFences, memcpy staging → VS frame (streaming loads). Fully
-  synchronous per frame; pool depth = num_streams.
-- num_queues = min(num_streams, queue_count). RADV compute family exposes
-  **4 queues** (family 1, compute+transfer) — with num_streams=4 all four
-  queues are used, one stream each.
+Mirrors the Bilateral VRAM structure (see `notes/BILATERAL.md`):
 
-## Reference structures
+- Per-stream device-local `src_buf` + `dst_buf` in VRAM holding **native
+  `uint16_t`/`float` elements**, plus a host-visible cached GTT `staging`
+  (upload + download regions).
+- **Host-direct upload** (default; `VSFEEL_GAUSS_HD=0` opts out): `src_buf` is
+  ReBAR host-mapped and the CPU memcpys each plane straight into VRAM — no H2D
+  copy. Falls back to staging + in-CB `vkCmdCopyBuffer` when no host-visible
+  device-local type exists; the flag is decided once before the resource loop.
+- **Kernel-direct download** (default; `VSFEEL_GAUSS_KD=0` opts out): the blur
+  kernels' coalesced stores write the GTT staging download region directly, so
+  there is no D2H copy. With both on, per-frame GPU work is **kernel only**.
+- Native `uint16_t`/`float` SSBOs: no shift/mask unpacking, no dword `atomicOr`
+  packing, no per-frame `vkCmdFillBuffer`. Push constants are element offsets.
+- **Packed pair stores** (`store_row_packed`, binding 4 `DstU32`): the
+  horizontal pass writes R outputs as `R/2` 32-bit stores; `x0` is guaranteed
+  even so each thread owns its dwords. The vertical pass writes float `tmp`.
+- Workgroup `16x8`; queue cap 1 (`VSFEEL_GAUSS_QUEUES`).
 
-- vszipcu (fastest): separate d_src/d_dst (device-local, HIP), d_tmp device
-  float buffer. Per plane: async memcpyHtoD (cstream — a dedicated copy
-  stream), kernel(s) on the compute stream, async memcpyDtoH, then
-  **s.cstream.sync() + s.stream.sync()** (i.e. also fully synchronous
-  per frame, but the H2D copy of each plane runs concurrently with kernels
-  of previously-copied planes *within* the frame because of event
-  chaining; D2H too).
-- vszipcl: same shape with OpenCL pinned staging buffers + clFinish per
-  frame.
+## Reference structure (same GPU, READ-ONLY)
 
-## Facts gathered
+- **vszipcu (fastest):** device-local `d_src`/`d_dst` + float `d_tmp`. Per
+  plane: async `memcpyHtoD` (dedicated copy stream) → kernels on the compute
+  stream → async `memcpyDtoH`, then sync both. Still serial per frame, but the
+  copies overlap the previous plane's kernels and run on SDMA engines
+  full-duplex with compute.
+- **vszipcl:** same shape with OpenCL pinned staging + `clFinish` per frame;
+  already beaten.
+- `rocprofv3` profile of vszipcu (BlankClip gray16 1080p, σ=16, ns=1, 200
+  frames): vertical 118 µs, horizontal 177 µs, H2D 153 µs, D2H 152 µs —
+  kernels 295 + copies 305, ≈ PCIe-bound.
 
-- Queue families on RADV gfx1100: [0] gfx+compute (1 queue), [1] compute+
-  transfer (**4 queues**), [2] video decode, [3] video encode.
-- Vulkan memory types: [3] and [4] = DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT
-  (heap 1, 24 GiB) — usable for host-mapped VRAM staging.
-- Current staging (HOST_CACHED, heap 0) is GTT RAM, not VRAM.
-- **rocprofv3 per-frame profile of vszipcu** (BlankClip gray16 1080p,
-  sigma=16, ns=1, 200 frames): vertical_blur avg **118 µs**, horizontal_blur
-  avg **177 µs**, H2D copy **153 µs**, D2H copy **152 µs**. Kernels 295 µs +
-  copies 305 µs, overlapped via copy-stream/compute-stream pipelining and
-  4 streams → 3400 fps ≈ 294 µs/frame ≈ **PCIe-bound** (8.3 MB/frame ≈ 28 GB/s).
-- BlankClip gray16 throughput (pure filter, no decode):
-  - ns=1: vsfeel 669 (σ16) / 738 (σ4) vs vszipcu 1621 / 1827, vszipcl 1594/1871
-  - ns=4: vsfeel ~1270, vszipcu ~3150, vszipcl ~1440
-- **ReBAR host-mapped VRAM bandwidth probe** (64 MiB, Vulkan memoryType 3):
-  CPU→VRAM NT stores 11 GB/s, plain memcpy 22.5 GB/s (write-combining works);
-  **VRAM→CPU read 1.3 GB/s NT / 0.1 GB/s memcpy — unusable for downloads**.
-  → mapped-VRAM direct staging is dead for the read path; downloads must use
-  SDMA copies into GTT.
-- rocprofv3 does NOT see RADV/Vulkan work (only the HIP/ROCm runtime), so
-  vsfeel kernel times must be measured via fps or RADV_DEBUG/asm dumps.
-- RADV shaderstats of current large-path kernels (σ16: KLEN=97):
-  vert: 178 instr, 24 VGPR, 9 VMEM clauses; horiz: 146 instr, 24 VGPR.
-  Tiny kernels — the loop stayed rolled; not obviously bloated.
+## Open work
 
-## Plan (validated by the numbers)
+- **No HD/KD ablation is recorded for GaussBlur.** The +34%/+3% figures once
+  quoted here were Bilateral's. Sweep `VSFEEL_GAUSS_HD` × `VSFEEL_GAUSS_KD` in
+  one session before quoting a split.
+- Replace `VSFEEL_GAUSS_GPU_BENCH` with the warm in-command-buffer timestamp
+  form (eedi3/nnedi3/dfttest) before attributing any kernel-vs-copy split.
+- Then sweep the workgroup shape across σ ∈ {4, 16, 40, 80}.
 
-1. **Device-local VRAM src/dst buffers per stream**; kernels read/write VRAM
-   only (they currently read/write GTT over PCIe, and 16-bit writes go
-   through dword atomicOr RMW over PCIe — catastrophic). One big
-   `vkCmdCopyBuffer` H2D (staging upload region → dev_src) at the head of the
-   pre-recorded command buffer and one big D2H (dev_dst → staging download
-   region) at the tail. This is exactly vszipcu's structure (their H2D runs
-   on a separate copy stream; ours runs inside the same command buffer but
-   on 4 different queues so frames overlap).
-2. **16-bit SSBO elements** (`uint16_t[]` via GL_EXT_shader_16bit_storage /
-   storageBuffer16BitAccess, already enabled device-wide in vsfeel.cpp):
-   removes the per-element shift/mask unpacking, the dword packing, the
-   atomicOr, and the per-frame vkCmdFillBuffer clear + barrier entirely.
-3. Push constants become element offsets into the VRAM buffers (u16/f32).
-4. Keep per-plane config/dedup, same math (FMA ascending-k, mirror) — output
-   must stay bit-exact.
+## Historical
 
-## Log
+- First structure (deleted in the VRAM rework): GTT staging only, kernels
+  reading/writing sysmem over PCIe, 16-bit writes via dword `atomicOr` RMW with
+  a per-frame `vkCmdFillBuffer` pre-clear, fully synchronous per frame, all 4
+  compute queues at ns=4.
+- VRAM rework (device-local `src`/`dst`/`tmp` + one H2D and one D2H
+  `vkCmdCopyBuffer`): vsfeel **1808** (was 1191–1342) vs vszipcl 1412, vszipcu
+  3489.
+- **CPU reads from the VRAM BAR are ~1.3 GB/s NT / 0.1 GB/s memcpy** (64 MiB
+  probe, memoryType 3) → mapped-VRAM staging is dead for the read path.
+- **Plain memcpy into the mapped VRAM window beats NT stores** on upload: 22.5
+  vs 11 GB/s in the probe, and in situ the WC window is why the shipped
+  `copy_plane_out` passes no NT flag. This is the *opposite* of the
+  EEDI3/NNEDI3 upload verdict — the path is buffer- and shape-dependent, so
+  re-measure rather than inheriting it.
+- rocprofv3 does **not** see RADV/Vulkan work, so kernel times must come from
+  in-command-buffer timestamps or fps.
 
-- (start) Baselines above. Reading code, profiling next.
-- **VRAM rework done** (committed as "GaussBlur: Move frame io to
-  device-local VRAM with DMA copies"): device-local src/dst/tmp + one big
-  H2D and one big D2H vkCmdCopyBuffer per frame, native u16 SSBO elements
-  (no atomicOr, no fill-clear, no shift/mask). Benchmark: vsfeel
-  **1808 fps** (was 1191-1342), vszipcl 1412 (**beaten**), vszipcu 3489.
-  BlankClip ns=1: 731 fps (was 669), ns=4: 1794 (was 1273). Probe added:
-  `VSFEEL_GAUSS_GPU_BENCH=N` env (wired into GaussGetFrame, frame 0 only).
-- **Probe numbers** (σ16 gray16 1080p, ns=1, N=100): full CB (copies+kernels)
-  **715.5 µs/frame**, kernels only **306.7 µs** (= vert 118 + horiz 177 ≈
-  vszipcu kernel parity). → the two DMA copies cost **~409 µs**
-  (~20.3 GB/s, ~200 µs per direction) and barely overlap.
-- Analysis: vszipcu's 287 µs/frame = kernels 295 µs (CUs) fully overlapped
-  with copies 305 µs (HIP SDMA engines) — PCIe full-duplex. Our copies run
-  on the CP inside the same command buffer/queue; overlap across frames on
-  4 queues is only partial (aggregate 553 µs/frame at ns=4).
-- Next: **remove the GPU-side H2D copy** — CPU memcpys the frame directly
-  into host-mapped VRAM (ReBAR memoryType 3; measured 22.5 GB/s with plain
-  memcpy, better than NT stores at 11 GB/s). GPU per frame becomes
-  kernels + D2H copy only; CPU upload/download memcpys run on the VS
-  worker threads in parallel with GPU work. D2H must stay a GPU copy
-  (CPU reads from VRAM BAR are 1.3 GB/s — dead end, measured).
+## Debug env vars
 
-## Validation hardening (cross-cutting pass)
+- `VSFEEL_GAUSS_HD=0` — staging + H2D copy instead of host-direct upload.
+- `VSFEEL_GAUSS_KD=0` — VRAM dst + D2H copy instead of kernel-direct download.
+- `VSFEEL_GAUSS_QUEUES=N` — override the queue cap (default 1).
+- `VSFEEL_GAUSS_GPU_BENCH=N` — retained scratch probe: re-records the
+  production CB and idles the device from a frame callback **without holding
+  the other streams' queue locks**, so its per-stage numbers are not
+  comparable to the in-CB timestamp form. Do not trust it.
 
-The upload flush and download invalidate ranges (per plane, at arbitrary
-32-byte-aligned offsets) now go through the shared `mapped_range` helper, which
-rounds them to `minNonCoherentAtomSize`/`VK_WHOLE_SIZE` as Vulkan requires. No
-behaviour change on this coherent device; all `test_gaussblur.py` tests pass.
+## Validation hardening
 
-## NT-store ordering
-
-Same gap as Bilateral: on the staging path (`host_direct_upload == false`) the
-upload uses NT stores, and the submit that tells the GPU to read that window had
-no `_mm_sfence()` before it. Added unconditionally just before
-`submit_with_fence`. Correctness-only change, no fps effect expected;
-`test_gaussblur.py` passes.
-
-## Creation and frame error paths
-
-Same as Bilateral: the per-stream resource is created into the pool via
-`FramePool::emplace()`, so a creation error is torn down by `~GaussData` rather
-than leaking its buffers, memory, command pool, fence and mapped windows; the
-frame-path `set_error` now frees `dst` as well. Correctness-only.
+Upload flush / download invalidate ranges go through the shared `mapped_range`
+helper (`minNonCoherentAtomSize`/`VK_WHOLE_SIZE` rounding); no behaviour change
+on this coherent device. On the staging path the upload is NT-stored, so an
+unconditional `_mm_sfence()` now sits before `submit_with_fence`. Creation
+errors are torn down by `~GaussData` via `FramePool::emplace()`, and the
+frame-path `set_error` frees `dst`. All correctness-only; `test_gaussblur.py`
+passes.

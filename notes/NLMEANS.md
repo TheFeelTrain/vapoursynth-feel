@@ -1,4 +1,27 @@
-# NLMeans optimization notes
+# NLMeans — notes
+
+Status: **shipped.** Verified against `src/nlmeans.{cpp,comp}` and
+`CMakeLists.txt`:
+
+- **Slot-direct cache** — shared pool of padded per-(clip,frame,channel) tiles;
+  kernels resolve `layer -> slot` through an int table, so no staging→u1 copies
+  and no D2D refreshes. Holders use BM3D-style **reservation tokens**.
+- **`NLM_REF` is a specialization constant** (`nlmeans.comp:43`), not a
+  compile-time `-D`: CMake emits one `nlmeans_{16,32}_{weight,acc,pad,finish}`
+  per io-variant, not an 8-binary weight matrix.
+- **`first`-flag init ships** (`pc.pc2`) and the **finish is fused into the
+  last acc round** (`pc.pc3`).
+- **fp16 weight ring ×4096** (`float16_t u4a[]`) — the subnormal-cliff fix;
+  drift ≤5 LSB / ~1e-4 float.
+- Shipped: u16 **970** vs vszipcl 737, fp32 **846** vs 651 (`README.md`,
+  medians of 3). Fps figures in the rounds below are that session's.
+
+## Historical
+
+Round-by-round record of how this design was reached, ending just before
+`## 2026-09-16`. **Sections marked below describe work not in the tree** —
+notably "Run-merging", which has no counterpart in `src/` or `CMakeLists.txt`
+(no `RUNMAX`, `run_len`, `weight_r`).
 
 Goal: `vsfeel.NLMeans` **at least 20% faster than vszipcl** on the synthetic
 benchmark (757 fps ⇒ ≥ ~908 fps), all tests passing; numerically faithful to
@@ -24,6 +47,10 @@ up ~0.25 ms, dl ~0.38 ms. To move further the KERNELS must shrink — host is
 no longer the bottleneck.
 
 ## Cache-sharing fix (2026-08-22, 606 → 714 fps)
+
+> Item 2 was superseded: the "Duplicate-upload fix (writing-slot reuse)" round
+> later identifies that duplicate-upload policy as the root cause of a 548 fps
+> regression.
 
 Three related changes to acquire/release:
 
@@ -151,6 +178,8 @@ plus `RADV_DEBUG=asm`.
 
 ## Remaining paths (priority order)
 
+> #1 and #2 are the shipped design now; #3 is still open.
+
 1. **Slot-direct reads + frame cache** (the big one): replace the per-stream
    contiguous u1 window with a shared pool of padded per-(clip,frame,channel)
    slot tiles; kernels resolve layer→slot through a small int table (binding 8)
@@ -199,12 +228,27 @@ plus `RADV_DEBUG=asm`.
 
 ## Debug env vars
 
+Verified against `src/nlmeans.cpp`:
+
 - `NLMEANS_TRACE=1` — [perf] host phase averages every 100 frames
-  (up/sub/wait/dl ms).
+  (up/sub/wait/dl ms); `NLMEANS_TRACE=2` adds per-phase acq/comp/tab splits.
 - `NLMEANS_GPUTRACE=1` — per-frame GPU timestamp splits: copy, first weight
   batch (w1), first acc batch (a1), all-batch wall, finish.
+- `NLMEANS_TS_MAX=N` — timestamp slots per frame (default 4; 130 in the
+  per-batch trace below); `NLMEANS_TS_RESERVED` overrides the reserved count.
+- `NLMEANS_PACK=N` — entries per W/A round (default from the 64 MiB ring
+  budget, which lands on 1).
+- `NLMEANS_FORCE_PAD` — force the pad kernel path.
+- `NLMEANS_PROBE` / `NLMEANS_PROBE_ACC_NOSRC` — stage ablations (page the
+  slots map, drop the acc source loads).
+- `NLMEANS_DBG` — dump the slot map (`dbg_slots_map`) and use the debug pool.
 - `RADV_DEBUG=asm` — ACO ISA dumps to stderr (works);
   `RADV_DEBUG=shaderstats` — VGPR/LDS stats (works on this build).
+
+NLMeans has **no queue knob** — it hardcodes `device->queues[0]`; the dead
+`VSFEEL_NLMEANS_QUEUES` call was removed (see "Creation error path and the dead
+queue knob" below). Note `NLMEANS_FORCE_PAD=1` currently **crashes** (heap
+corruption, pre-existing, no test uses it).
 
 ## Per-batch GPU trace (NLMEANS_TS_MAX=130, timestamps after every W/A dispatch)
 Steady-state (frame 66+) at TRUE bench config (1920x1080 YUV420P16, chroma 960x540,
@@ -227,6 +271,13 @@ artifact. Run-merging (LDS tiles shared across consecutive-i displacements)
 attacks exactly the 32us.
 
 ## Run-merging implemented (commit-in-progress) -> NEUTRAL (685 fps unchanged)
+
+> **REVERTED / not in tree at HEAD.** No `RUNMAX`, `run_len` or `weight_r`
+> exists in `src/nlmeans.{cpp,comp}` or `CMakeLists.txt`, and the claim below
+> that `NLM_REF` became a compile-time `-D` with 8 weight binaries is false:
+> `nlmeans.comp:43` still has
+> `layout(constant_id = 8) const int NLM_REF = 0`. Kept for the mechanism.
+
 One WG now sweeps a run of consecutive-i displacements sharing (qy,qz); ref and
 candidate-union tiles staged once in LDS (NLM_RUNMAX spec const id 14 caps run
 length at qb so the u4a ring is unchanged). wq rows became GROUP descriptors
@@ -238,7 +289,7 @@ so channel-count-sized LDS tiles require a real macro; weight now ships as 8
 binaries nlmeans_{16,32}_weight_r{0..3}). Result: wSteady STILL 52us/batch.
 **Conclusion: warm weight kernel is ALU/LDS/barrier-bound, NOT load-bound** -
 the 65% "dist phase" saving measured cold was mostly loads that were already
-L2-hits warm. Kept anyway (fewer DRAM refs, correctness intact, 52/52 tests).
+L2-hits warm. Reverted (see the marker above); the measurement is kept.
 GPU budget per frame (full 1080p config, measured x2 of half-height trace):
 pad ~0.17 | weight ~0.86 | acc ~0.32 | finish ~0.09 ms ~= wall 1.46 (queue sat).
 Next targets ranked: (1) acc mirror-weight gather u4a[sm][ym*STRIDE+xm] is

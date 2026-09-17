@@ -1,14 +1,18 @@
-# EEDI3 — implementation, accuracy landscape & port plan
+# EEDI3 — notes
 
-Status: **shipped and tuned through round 18; EEDI3H is now native (transposed
-staging + two GPU passes), 1.55x faster than the old composition.** This is the
-single note for this filter. It is ordered in rounds — earlier rounds are the
-port and the history, the last rounds are the current truth — and it ends with
-the short-form "remaining work / do-not-retry / method rules" section that is
-the first thing to read before touching EEDI3 again. Jump to `## Round 16` for
-the cost model and the fixed correctness bug, `## Round 17` for the original
-EEDI3H transpose analysis, and `## Round 18` for what was implemented and what
-is left.
+*Implementation, accuracy landscape & port plan.*
+
+Status: **shipped; the rounds below run to round 26.** EEDI3 and EEDI3H are
+native (EEDI3H = transposed staging + two GPU passes, 1.55x faster than the old
+composition), and EEDI3AA is the fused four-sub-pass anti-alias filter built on
+the same machinery (see `notes/EEDI3AA.md`). This is the single note for this
+filter. It is ordered in rounds — earlier rounds are the port and the history,
+the last rounds are the current truth. Note the reference blocks sit **before**
+the last rounds: `## A. What is left`, `## B. Do-not-retry` and
+`## C. Method rules` follow round 20, and rounds 21–26 follow them. Read
+`## A. What is left` first, then the highest-numbered round. `## Round 16` holds
+the cost model and the fixed correctness bug, and `## Round 17` the original
+EEDI3H transpose analysis.
 
 ## References available
 

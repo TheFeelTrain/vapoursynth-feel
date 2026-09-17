@@ -1,4 +1,4 @@
-# BM3Dv2 notes
+# BM3Dv2 — notes
 
 Goal: `vsfeel.BM3Dv2` faster than the reference plugins on the target GPU
 (RX 7900 XTX, RDNA3, gfx1100, Mesa RADV), numerically faithful to vszipcl.

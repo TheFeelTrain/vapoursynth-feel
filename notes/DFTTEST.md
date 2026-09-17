@@ -1,4 +1,4 @@
-# DFTTest optimization notes
+# DFTTest — notes
 
 Goal: `vsfeel.DFTTest` ≥20% faster than vszipcl (the faster reference), all
 tests passing, VRAM ≤ references. Target GPU: RX 7900 XTX (RDNA3, gfx1100),

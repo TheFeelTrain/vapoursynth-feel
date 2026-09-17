@@ -505,10 +505,13 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   each stage (all-skip, full-work, no auxiliary data) read ceilings directly
   off end-to-end fps.
 - **Keep `notes/<filter>.md` updated immediately** after every finding,
-  including dead ends, so nothing is re-derived or retried later. Since notes
-  are gitignored, they are local working memory: another checkout will not
-  have them, so anything that must survive belongs in this file or in a code
-  comment. **Worked examples of most rules above live in `notes/EEDI3.md`
+  including dead ends, so nothing is re-derived or retried later. The notes
+  are **tracked** (`notes/README.md` explains the convention): they are the
+  durable design record, visible to every checkout and the first thing a new
+  contributor reads, so durable findings belong there rather than only in a
+  code comment. **Keep entries short** — conclusion first, a number only with
+  its config, one line for a correctness-only change, mechanism not story.
+  **Worked examples of most rules above live in `notes/EEDI3.md`
   rounds 10–12** (host-bounded frames, the SIMD dilation rewrite, the ReBAR
   upload, the boundary-input oracle bug, the harness-memory bimodality, and a
   list of measured non-wins) — worth reading before starting a new filter,

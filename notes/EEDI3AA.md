@@ -1,8 +1,18 @@
-# EEDI3AA — fused vertical + horizontal EEDI3 anti-aliasing (design + plan)
+# EEDI3AA — notes
 
-Status: **designed, not implemented.** This file is the handoff for a fresh
-session. Read `notes/EEDI3.md` round 19 (the last section of that file's
-"Remaining work") for the state of the EEDI3H filter this builds on.
+Status: **implemented and shipped.** `core.vsfeel.EEDI3AA` exists
+(`src/eedi3.cpp` registers it on the `EEDI3`/`EEDI3H`/`EEDI3AA` create path,
+`src/eedi3.comp` carries `ENTRY_ASSEMBLEV` + `ENTRY_COMPOSE`), the `vsaa`
+wrapper ships, and `tests/test_eedi3aa.py` covers it. It replaces the
+`vsaa.based_aa` chain of four EEDI3 sub-passes plus two `std.Merge` nodes with
+**one plugin call and one fused VRAM compose**; it is bit-exact against the
+two-call chain for u16 and within a few ulp for f32.
+
+Current measured state: `benchmark/bench.py --filter eedi3aa` ~**121 fps at
+ns=8** (vszipcl 48.6, eedi3vk2 36.2). The round-by-round design record follows
+in the order it happened, ending at round 8; the original handoff text
+("Status: designed, not implemented") is preserved under `## Historical` at the
+end of this file.
 
 The one-line summary: `vsaa.based_aa` runs **four** EEDI3 sub-passes per output
 frame as two chained filter calls plus two `std.Merge` nodes. Fusing that whole
@@ -922,5 +932,15 @@ streaming-store predicate tested the element index instead of the pointer (so
 row cells not a multiple of 32 bytes silently took cached stores into the
 uncached ReBAR window). See `notes/EEDI3.md` round 23 — `aa_gather_horizontal`
 gets the same fix for free.
+
+---
+
+## Historical
+
+The original file handoff, kept verbatim as the design brief it was:
+
+> Status: **designed, not implemented.** This file is the handoff for a fresh
+> session. Read `notes/EEDI3.md` round 19 (the last section of that file's
+> "Remaining work") for the state of the EEDI3H filter this builds on.
 
 

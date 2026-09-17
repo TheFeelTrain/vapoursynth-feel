@@ -1,4 +1,4 @@
-# Bilateral — performance notes
+# Bilateral — notes
 
 Status: **done for now** — vsfeel beats vszipcl everywhere except the
 extreme wide-sigma edge (R=24). Default config (GRAY16, sigma 3.0/0.02):
