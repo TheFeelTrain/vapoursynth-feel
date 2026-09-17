@@ -23,6 +23,9 @@ class CustomHook(BuildHookInterface[Any]):
         subprocess.run(
             ["cmake", "-S", str(root), "-B", str(root / self.build_dir),
              "-D", "CMAKE_BUILD_TYPE=Release",
+             # hatch-vcs is the single version source; embed the version it
+             # resolved for this build instead of letting CMake guess one
+             "-D", f"VSFEEL_VERSION={version}",
              # stage into install/<target_dir> instead of the live VapourSynth
              # plugin directory (which is an absolute path when vapoursynth is
              # importable, and cmake --install ignores --prefix for those)

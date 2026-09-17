@@ -7,23 +7,63 @@ find_program(VK_GLSLC glslc)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 find_package(Git QUIET)
-if(GIT_FOUND)
+
+# ---------------------------------------------------------------------------
+# Version: hatch-vcs (pyproject.toml) is the single source of truth. A
+# packaging build passes the version in; a bare CMake build resolves it via
+# the same setuptools_scm entry point and only then falls back to git describe.
+# The result lands in config.h and reaches the runtime as VSFEEL_VERSION.
+# ---------------------------------------------------------------------------
+if(NOT VSFEEL_VERSION)
     execute_process(
-        COMMAND ${GIT_EXECUTABLE} describe --tags --long --always
+        COMMAND "${Python3_EXECUTABLE}" -c
+            "from setuptools_scm import get_version; print(get_version(tag_regex=r'^r(?P<version>.*)$'))"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-        OUTPUT_VARIABLE VCS_TAG
+        OUTPUT_VARIABLE _scm_version
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _scm_status
+        ERROR_VARIABLE _scm_error
     )
-    if(VCS_TAG)
-        string(STRIP "${VCS_TAG}" VCS_TAG)
+    if(_scm_status EQUAL 0 AND _scm_version)
+        set(VSFEEL_VERSION "${_scm_version}")
     endif()
 endif()
 
-if(VCS_TAG)
-    message(STATUS "vapoursynth-feel ${VCS_TAG}")
-else()
-    message(WARNING "unknown plugin version")
-    set(VCS_TAG "unknown")
+if(NOT VSFEEL_VERSION AND GIT_FOUND)
+    # `--always` is deliberately absent: it makes describe succeed with a bare
+    # hash even when no r* tag is reachable, which is what previously hid the
+    # failure. Check the status and fall back explicitly instead.
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} describe --tags --long --match "r[0-9]*" --dirty
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        OUTPUT_VARIABLE _git_describe
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _git_status
+        ERROR_QUIET
+    )
+    if(_git_status EQUAL 0)
+        string(REGEX REPLACE "^r" "" VSFEEL_VERSION "${_git_describe}")
+    else()
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            OUTPUT_VARIABLE _git_hash
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _hash_status
+        )
+        if(_hash_status EQUAL 0 AND _git_hash)
+            set(VSFEEL_VERSION "0.0.dev0+g${_git_hash}")
+        endif()
+    endif()
 endif()
+
+if(NOT VSFEEL_VERSION)
+    set(VSFEEL_VERSION "unknown")
+    message(WARNING
+        "vapoursynth-feel: no version could be determined "
+        "(setuptools_scm: ${_scm_error}; git describe status: ${_git_status})")
+endif()
+message(STATUS "vapoursynth-feel ${VSFEEL_VERSION}")
 
 # Helpers
 function(configure_common target)
