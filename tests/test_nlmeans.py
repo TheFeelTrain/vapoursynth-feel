@@ -178,7 +178,9 @@ REFERENCE_CASES = [
     {"d": 0, "s": 8},
     {"d": 0, "h": 0.3},
     {"d": 0, "h": 6.0},
-    {"d": 0, "wref": 0.0},
+    # wref=0 at the default h is outside the fp16 weight ring's envelope (see
+    # the envelope tests below); at h=3.0 both sides agree to ~1 code.
+    {"d": 0, "wref": 0.0, "h": 3.0},
 ]
 
 
@@ -285,7 +287,9 @@ UV32_CASES = [
     {"d": 0, "s": 8},
     {"d": 0, "h": 0.3},
     {"d": 0, "h": 6.0},
-    {"d": 0, "wref": 0.0},
+    # No wref=0 entry: at fp32 vszipcl's chroma path emits non-finite pixels
+    # (~16/plane/frame) and a few wild ones on the last frame, so an equality
+    # comparison is not meaningful. vsfeel's finiteness is pinned below.
 ]
 
 UV16_CASES = [
@@ -325,6 +329,45 @@ def test_uv_matches_reference_16bit(noise_yuv420_16, kwargs):
     theirs = ref.NLMeans(src, num_streams=1, channels="UV", **kwargs)
     worst = _max_diff(mine, theirs, planes=(1, 2))
     assert worst <= UV16_REF_TOL, f"max LSB diff vs vszipcl {kwargs}: {worst}"
+
+ENVELOPE_FRAMES = (0, 11, 23)
+
+def test_wref0_low_h_is_finite_32bit(noise_gray):
+    """A fully flushed weight ring must fall back to the centre sample, not 0/0.
+
+    Covers both the exp() ring (wmode 0, fp16 flush) and the truncated modes
+    (wmode 1-3, max(1-arg,0) == 0 for every tap).
+    """
+    for h in (0.6, 1.0, 1.2):
+        for wmode in (0, 1, 2, 3):
+            out = _run(noise_gray, d=0, h=h, wmode=wmode, wref=0.0)
+            for n in ENVELOPE_FRAMES:
+                got = _plane(out.get_frame(n), 0)
+                assert np.isfinite(got).all(), f"h={h} wmode={wmode} n={n}"
+
+
+def test_wref0_low_h_is_finite_uv_32bit(noise_yuv32):
+    """Same guard on the 2-channel path."""
+    out = _run(noise_yuv32, channels="UV", d=0, wref=0.0)
+    for n in ENVELOPE_FRAMES:
+        for p in (1, 2):
+            assert np.isfinite(_plane(out.get_frame(n), p)).all(), f"n={n} p={p}"
+
+
+def test_wref0_low_h_envelope_16bit(noise_16bit):
+    """Pin the measured deviation at the envelope edge (h=1.2, wref=0)."""
+    theirs = _reference_plugin().NLMeans(noise_16bit, num_streams=1, d=0, wref=0.0)
+    mine = _run(noise_16bit, d=0, wref=0.0)
+    worst = _max_diff(mine, theirs, frames=ENVELOPE_FRAMES)
+    assert 1000.0 < worst < 6000.0, f"fp16 weight-ring envelope moved: {worst}"
+
+
+def test_wref0_low_h_envelope_32bit(noise_gray):
+    """Pin the same edge at fp32 (float units, ~4573 codes measured)."""
+    theirs = _reference_plugin().NLMeans(noise_gray, num_streams=1, d=0, wref=0.0)
+    mine = _run(noise_gray, d=0, wref=0.0)
+    worst = _max_diff(mine, theirs, frames=ENVELOPE_FRAMES)
+    assert 0.03 < worst < 0.12, f"fp16 weight-ring envelope moved: {worst}"
 
 
 def test_yuv_channels_uv_temporal_matches_reference_32bit(noise_yuv32):

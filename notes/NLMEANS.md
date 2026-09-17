@@ -604,3 +604,48 @@ requirement is documented at the assignment. The tile-reuse ordering and the
 cross-submission transfer -> shader visibility both depend on submission order
 on one queue, so wiring the knob would need semaphores in place of that
 guarantee. `test_nlmeans.py` passes.
+
+## Upload staging sized for the steady state + fp16 ring envelope
+
+Staging was `clips*C*(2d+1)` tiles, memset in full at creation: 263 MiB at
+1080p f32 d=16, 2.1 GiB at ns=8, 4.1 GiB at 8K d=1 — GTT/BAR, not host RAM, so
+it eats the VRAM budget. It now starts at `2*clips*C` tiles; `create_staging()`
+grows the buffer (fresh margins zeroed once, descriptor 9 rebound) only when a
+frame really needs more, which happens on a seek or eviction storm, not in a
+linear decode (measured 1-2 new tiles/frame at d=16). The D2 check and the dead
+pad-pair tail keep the full-window bound (`window_tiles`).
+
+GTT delta at creation, fresh process per config (`mem_info_gtt_used`):
+
+| config | before | after | create ms |
+|---|---|---|---|
+| 1080p f32 d=16 ns=1 | 271 MiB | 24 MiB | 41 -> 17 |
+| 1080p f32 d=16 ns=8 | 2168 MiB | 191 MiB | 213 -> 29 |
+| 1080p f32 d=16 rclip | 534 MiB | 40 MiB | 66 -> 18 |
+| 1080p f32 UV d=16 | 137 MiB | 12 MiB | 27 -> 18 |
+| 4K f32 d=6 | 445 MiB | 95 MiB | 55 -> 24 |
+| 8K f32 d=1 | 505 MiB | 380 MiB | 55 -> 47 |
+
+Device-local VRAM unchanged. `NLMEANS_TRACE=1` prints `[grow]`; a random-order
+120-frame 1080p f32 d=16 ns=8 run (grew cap 2 -> 33 on stream 7) is bit-exact
+against the linear run. Bench unchanged (same session: u16 954.8 -> 944.2, f32
+829.4 -> 829.2, both within noise).
+
+**fp16 ring envelope.** The D3 cliff stays (documented in README) because it
+cannot be scaled away: weights <= 1 and fp16 max is 65504, so 2^16 already
+overflows and the largest safe scale (2^15) moves the flush only from arg 25.65
+to 27.73. Instead the acc finish is now `finish_sample()`: a zero total weight
+(wref=0 + fully flushed ring, or wmode 1-3 truncating every tap to zero)
+returns the centre sample instead of 0/0 = NaN.
+Noise clip, d=0 a=2 s=4, max over frames 0/11/23:
+- wref=1, h=1.2: 2 codes (u16) / 1.9 codes (fp32) — unchanged;
+- wref=0, h=1.2: 4573 codes both depths, no NaN (was NaN at fp32);
+- wref=0, h=3.0: <=1 code; h=0.6: 8192 codes, and there vszipcl itself emits
+  non-finite pixels (gray32 and UV32).
+Tests: gray32/UV16 `wref=0` sweeps moved to h=3.0, the UV32 one dropped (the
+reference's fp32 chroma path is non-finite at wref=0), four envelope tests pin
+the guard and the measured bands. 113/113 pass.
+
+Separately: `NLMEANS_FORCE_PAD=1` crashes (heap corruption) — with the flag the
+acquire loop leaves `chosen[ti] = -1` and phase 2 indexes `cache[-1]`, a
+pre-existing bug unrelated to the staging change. No test uses the flag.

@@ -88,12 +88,14 @@ struct Variant {
 
 struct NLStream {
     int stream_id {-1};
-    // upload staging: room for the worst case of new tiles in one frame,
-    // plus the per-frame slot-base table at the tail
+    // upload staging: room for the tiles a frame must ship, plus the
+    // per-frame slot-base table at the tail. Grown on demand (see
+    // create_staging) when a frame needs more tiles than the steady state.
     VkBuffer staging {};
     VkDeviceMemory staging_mem {};
     uint32_t staging_type_index {};
     uint8_t * staging_map {};
+    int staging_cap {};              // tiles the staging buffer holds
     VkBuffer tables_dev {};
     VkDeviceMemory tables_dev_mem {};
     int * tables_map {};
@@ -178,7 +180,8 @@ struct NLMeansData {
 
     // shared slot pool (device-local padded tiles) + its state
     int n_slots {};
-    int staging_tiles {};            // worst-case new tiles per frame
+    int window_tiles {};             // clips*C*(2d+1): slots one full window needs
+    int staging_tiles {};            // per-stream upload staging capacity, tiles
     int tail_ints {};                // layer table + tile pairs in the tail
     int64_t compact_tile_elems {};   // w*h elements of one compact tile
     float * dbg_slots_map {};        // debug
@@ -496,6 +499,76 @@ static void release_cache(NLMeansData * d, NLStream & st) {
     d->cache_cv.notify_all();
 }
 
+// Create (or grow) a stream's host-visible upload staging. The pad margin of
+// every tile must stay zero and the compose never rewrites it, so the whole
+// buffer is zeroed once per (re)allocation. Only called for a stream whose
+// previous command buffer has completed, so the descriptor rewrite is safe.
+static std::string create_staging(NLMeansData * d, NLStream & st, int tiles) {
+    VkDevice dev = d->device->device;
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(tiles) * d->slot_bytes;
+
+    VkBuffer buf;
+    {
+        const auto result = create_buffer(dev, bytes,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        if (std::holds_alternative<std::string>(result)) {
+            return std::get<std::string>(result);
+        }
+        buf = std::get<VkBuffer>(result);
+    }
+    VkDeviceMemory mem {};
+    uint32_t type_index {};
+    {
+        const auto result = allocate_memory(*d->device, buf,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        if (std::holds_alternative<std::string>(result)) {
+            vkDestroyBuffer(dev, buf, nullptr);
+            return std::get<std::string>(result);
+        }
+        mem = std::get<AllocatedMemory>(result).memory;
+        type_index = std::get<AllocatedMemory>(result).type_index;
+    }
+    uint8_t * map = nullptr;
+    if (vkMapMemory(dev, mem, 0, bytes, 0,
+            reinterpret_cast<void **>(&map)) != VK_SUCCESS) {
+        vkFreeMemory(dev, mem, nullptr);
+        vkDestroyBuffer(dev, buf, nullptr);
+        return "vkMapMemory failed";
+    }
+    memset(map, 0, static_cast<size_t>(bytes));
+
+    if (st.staging_map) vkUnmapMemory(dev, st.staging_mem);
+    if (st.staging_mem) vkFreeMemory(dev, st.staging_mem, nullptr);
+    if (st.staging) vkDestroyBuffer(dev, st.staging, nullptr);
+    st.staging = buf;
+    st.staging_mem = mem;
+    st.staging_type_index = type_index;
+    st.staging_map = map;
+    st.staging_cap = tiles;
+
+    // binding 9 (read only by the retired pad kernel) must not dangle
+    if (st.desc_set != VK_NULL_HANDLE) {
+        VkDescriptorBufferInfo info { st.staging, 0, VK_WHOLE_SIZE };
+        VkWriteDescriptorSet write {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = nullptr,
+            .dstSet = st.desc_set,
+            .dstBinding = 9,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pImageInfo = nullptr,
+            .pBufferInfo = &info,
+            .pTexelBufferView = nullptr
+        };
+        vkUpdateDescriptorSets(dev, 1, &write, 0, nullptr);
+    }
+    return {};
+}
+
 static const VSFrame *VS_CC NLMeansGetFrame(
     int n, int activationReason, void *instanceData, void **frameData,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
@@ -593,6 +666,25 @@ static const VSFrame *VS_CC NLMeansGetFrame(
     std::vector<int64_t> keys;
     acquire_cache(d, stream, n, keys);
     if (trace2) mark(t_acq);
+
+    // Steady state uploads only the tiles that just entered the window; a
+    // seek (or an eviction storm) can need a whole window at once, so grow
+    // the staging instead of sizing it for the worst case up front.
+    int new_tiles = 0;
+    for (bool b : stream.upload_new) {
+        new_tiles += b ? 1 : 0;
+    }
+    if (new_tiles > stream.staging_cap) {
+        const int cap = stream.staging_cap;
+        const int want = std::max(new_tiles, 2 * cap);
+        if (auto err = create_staging(d, stream, want); !err.empty()) {
+            return set_error(err);
+        }
+        if (trace) {
+            fprintf(stderr, "[grow] stream=%d n=%d tiles=%d cap=%d -> %d\n",
+                stream.stream_id, n, new_tiles, cap, want);
+        }
+    }
 
     {
         // staging tiles use the SAME padded layout as pool slots, so each
@@ -1483,7 +1575,12 @@ static void VS_CC NLMeansCreate(
     // channel/clip) from acquire until its fence completes; undersizing this
     // makes acquire_cache block on the cv and serializes the streams.
     // Cap the pool at 512 MiB so huge d/ns configs fall back to blocking.
-    d->staging_tiles = clips * d->channels * d->layers;
+    d->window_tiles = clips * d->channels * d->layers;
+    // Upload staging only ever holds the tiles a frame must ship: normally the
+    // one or two frames that just entered the window, with room for the
+    // warm-up's second end. create_staging grows it if a frame ever needs
+    // more (see NLMeansGetFrame).
+    d->staging_tiles = 2 * clips * d->channels;
     {
         const int full = d->num_streams * d->channels * clips * d->layers;
         const VkDeviceSize budget_slots = (512ull << 20) / slot_bytes_v;
@@ -1497,14 +1594,14 @@ static void VS_CC NLMeansCreate(
     // notify: it holds nothing and never submits). When the 512 MiB budget
     // cannot cover one full window, reject the configuration here instead of
     // hanging the graph.
-    if (d->n_slots < d->staging_tiles) {
+    if (d->n_slots < d->window_tiles) {
         char msg[256];
         snprintf(msg, sizeof(msg),
             "temporal radius d=%d with %d channel(s) and %d clip(s) needs %d "
             "cache slots (%.0f MiB), but the 512 MiB slot-pool budget allows "
             "%d; reduce d, channels or num_streams",
-            d->d, d->channels, clips, d->staging_tiles,
-            static_cast<double>(d->staging_tiles) *
+            d->d, d->channels, clips, d->window_tiles,
+            static_cast<double>(d->window_tiles) *
                 static_cast<double>(slot_bytes_v) / (1024.0 * 1024.0),
             d->n_slots);
         return set_error(msg);
@@ -1539,9 +1636,7 @@ static void VS_CC NLMeansCreate(
     // padded tiles mirrored 1:1 in staging; tables buffer holds the
     // layer->slot table (+ pair headroom)
     d->compact_tile_elems = static_cast<int64_t>(d->width) * d->height;
-    d->tail_ints = 2 * d->channels * d->layers + 2 * d->staging_tiles;
-    const VkDeviceSize staging_bytes =
-        static_cast<VkDeviceSize>(d->staging_tiles) * slot_bytes_v;
+    d->tail_ints = 2 * d->channels * d->layers + 2 * d->window_tiles;
 
     const VkDeviceSize npix_v = static_cast<VkDeviceSize>(d->npix);
     const VkDeviceSize u1z_bytes =
@@ -1556,33 +1651,11 @@ static void VS_CC NLMeansCreate(
         // FramePool::emplace).
         NLStream & st = d->pool.emplace();
 
-        // upload staging: new tiles plus the per-frame slot-base table
-        {
-            const auto result = create_buffer(dev, staging_bytes,
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            st.staging = std::get<VkBuffer>(result);
+        // upload staging: the tiles this frame ships (desc_set is not
+        // allocated yet, so create_staging only builds the buffer here)
+        if (auto err = create_staging(d.get(), st, d->staging_tiles); !err.empty()) {
+            return set_error(err);
         }
-        {
-            const auto result = allocate_memory(*d->device, st.staging,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            st.staging_mem = std::get<AllocatedMemory>(result).memory;
-            st.staging_type_index = std::get<AllocatedMemory>(result).type_index;
-        }
-        if (vkMapMemory(dev, st.staging_mem, 0, staging_bytes, 0,
-                reinterpret_cast<void **>(&st.staging_map)) != VK_SUCCESS) {
-            return set_error("vkMapMemory failed");
-        }
-        // the pad margin of every tile keeps its one-time-init zero
-        memset(st.staging_map, 0, static_cast<size_t>(staging_bytes));
 
         if (std::getenv("NLMEANS_PROBE") && i == 0) {
             const auto & mp = d->device->mem_props;

@@ -119,6 +119,14 @@ void store_value(int idx, float v) {
 #endif
 }
 
+// The fp16 weight ring can flush every tap to zero at low h with wref=0
+// (see README's NLMeans accuracy note); fall back to the centre sample
+// instead of evaluating 0/0.
+float finish_sample(float ctr, float m, float acc, float accw) {
+    const float den = m + accw;
+    return den > 0.0f ? (ctr*m + acc) / den : ctr;
+}
+
 #ifdef ENTRY_PAD
 // Zero-pad one compact upload tile into its cache slot. Workgroup z picks
 // the tile; its {slot_base, compact_base} element pair lives in the slot
@@ -377,8 +385,8 @@ void main() {
         }
         if (pc.pc3 != 0) {
             const float m = WREF * u5v;
-            store_value(g,
-                (load_src(slot_table[NLM_D] + gpad)*m + acc0) / (m + accw));
+            store_value(g, finish_sample(
+                load_src(slot_table[NLM_D] + gpad), m, acc0, accw));
         } else {
             u2[2*g] = acc0; u2[2*g+1] = accw;
         }
@@ -410,11 +418,10 @@ void main() {
         }
         if (pc.pc3 != 0) {
             const float m = WREF * u5v;
-            const float den = m + accw;
-            store_value(g,
-                (load_src(slot_table[NLM_D] + gpad)*m + acc0) / den);
-            store_value(NPIX + g,
-                (load_src(slot_table[LAYERS+NLM_D] + gpad)*m + acc1) / den);
+            store_value(g, finish_sample(
+                load_src(slot_table[NLM_D] + gpad), m, acc0, accw));
+            store_value(NPIX + g, finish_sample(
+                load_src(slot_table[LAYERS+NLM_D] + gpad), m, acc1, accw));
         } else {
             u2[3*g] = acc0; u2[3*g+1] = acc1; u2[3*g+2] = accw;
         }
@@ -446,13 +453,12 @@ void main() {
         }
         if (pc.pc3 != 0) {
             const float m = WREF * u5v;
-            const float den = m + accw;
-            store_value(g,
-                (load_src(slot_table[NLM_D] + gpad)*m + acc0) / den);
-            store_value(NPIX + g,
-                (load_src(slot_table[LAYERS+NLM_D] + gpad)*m + acc1) / den);
-            store_value(2*NPIX + g,
-                (load_src(slot_table[2*LAYERS+NLM_D] + gpad)*m + acc2) / den);
+            store_value(g, finish_sample(
+                load_src(slot_table[NLM_D] + gpad), m, acc0, accw));
+            store_value(NPIX + g, finish_sample(
+                load_src(slot_table[LAYERS+NLM_D] + gpad), m, acc1, accw));
+            store_value(2*NPIX + g, finish_sample(
+                load_src(slot_table[2*LAYERS+NLM_D] + gpad), m, acc2, accw));
         } else {
             u2[4*g] = acc0; u2[4*g+1] = acc1; u2[4*g+2] = acc2; u2[4*g+3] = accw;
         }
