@@ -110,6 +110,7 @@ const int BT_TILE = 32;
 // 10 = 8's walk with an explicit 4x unroll so independent loads can overlap.
 // 12 = like 2 but dmap is filled with a realistic direction pattern first, so
 // the downstream vcheck's branch mix matches the real kernel.
+// There is no PROBE 11 (the numbering skips it); 13 and above are unused.
 // Kept as a tuning instrument. NOTE (round 20): the entry guard used to be
 // `PROBE >= 3`, so levels 4-7 silently compiled to an EMPTY kernel (1656 B of
 // SPIR-V, against 43720 B for PROBE=0) and the old "only 2/4/6 produced the
@@ -957,7 +958,16 @@ void main() {
                 for (; x >= xlo; --x)
                     f2 += int(pbt[pbt_old + x * TPITCH + CENTER]);
 #endif
-                if (f2 == pc.pbt_base) dmap[pc.rempty_base + r] = int8_t(0);
+                // Consume f2 without touching the output. The old form wrote 0
+                // to the empty-row flag when `f2 == pc.pbt_base` -- a value no
+                // walk can produce, so it only fired by accident, and when it
+                // did it cleared the flag the vcheck reads and silently changed
+                // the ablation. The probe's cost is its load chain, not the
+                // flag store, so a read-only sink keeps the chain live and is
+                // byte-identical to the real kernel.
+                if (f2 == dmap[pc.rempty_base + r]) {
+                    rowXmin = f2;
+                }
             }
 #endif
         }

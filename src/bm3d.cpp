@@ -488,7 +488,6 @@ static void release_cache(BM3DData * d, Bm3dStream & stream, int n) {
 // blocks on the previous frames' timelines.
 static int record_bm3d_kernels(BM3DData * d, Bm3dStream & stream, int n,
                      const std::array<bool, 4 * MAX_RADIUS + 1> & uploaded) {
-    VkDevice dev = d->device->device;
     VkCommandBuffer cmd = stream.cmd;
 
     VkCommandBufferBeginInfo begin_info {
@@ -705,7 +704,7 @@ static void record_bm3d_agg(BM3DData * d, Bm3dStream & stream, int n) {
 }
 
 static const VSFrame *VS_CC BM3DGetFrame(
-    int n, int activationReason, void *instanceData, void **frameData,
+    int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
 
     BM3DData * d = static_cast<BM3DData *>(instanceData);
@@ -1118,7 +1117,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
     return nullptr;
 }
 
-static void VS_CC BM3DFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
+static void VS_CC BM3DFree(void *instanceData, [[maybe_unused]] VSCore *core, const VSAPI *vsapi) {
     BM3DData * d = static_cast<BM3DData *>(instanceData);
     vsapi->freeNode(d->node);
     if (d->ref_node) {
@@ -1132,7 +1131,7 @@ static void VS_CC BM3DFree(void *instanceData, VSCore *core, const VSAPI *vsapi)
 // ---------------------------------------------------------------------------
 
 static void VS_CC BM3DCreate(
-    const VSMap *in, VSMap *out, void *userData,
+    const VSMap *in, VSMap *out, [[maybe_unused]] void *userData,
     VSCore *core, const VSAPI *vsapi) {
 
     auto d { std::make_unique<BM3DData>() };

@@ -348,8 +348,6 @@ static std::variant<VkPipeline, std::string> create_pipeline(
 static std::optional<std::string> record_command_buffer(
     const GaussData & d, GaussBlurResource & resource, bool with_copies = true) {
 
-    VkDevice dev = d.device->device;
-
     VkCommandBufferBeginInfo begin_info {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .pNext = nullptr,
@@ -526,7 +524,7 @@ static void gpu_bench_probe(GaussData * d, GaussBlurResource & resource, int n) 
 }
 
 static const VSFrame *VS_CC GaussGetFrame(
-    int n, int activationReason, void *instanceData, void **frameData,
+    int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
 
     GaussData * d = static_cast<GaussData *>(instanceData);
@@ -678,7 +676,7 @@ static const VSFrame *VS_CC GaussGetFrame(
 // ---------------------------------------------------------------------------
 
 static void VS_CC GaussFree(
-    void *instanceData, VSCore *core, const VSAPI *vsapi) {
+    void *instanceData, [[maybe_unused]] VSCore *core, const VSAPI *vsapi) {
 
     GaussData * d = static_cast<GaussData *>(instanceData);
 
@@ -688,7 +686,7 @@ static void VS_CC GaussFree(
 }
 
 static void VS_CC GaussCreate(
-    const VSMap *in, VSMap *out, void *userData,
+    const VSMap *in, VSMap *out, [[maybe_unused]] void *userData,
     VSCore *core, const VSAPI *vsapi) {
 
     auto d { std::make_unique<GaussData>() };
@@ -832,7 +830,6 @@ static void VS_CC GaussCreate(
     // shared-memory tile fits the device.
     std::array<bool, 3> cfg_small {};
     for (int ci = 0; ci < n_cfg; ++ci) {
-        const auto & key = keys[ci];
         const int ksize = static_cast<int>(weights[ci].size());
         const int radius = ksize / 2;
         const size_t tile_bytes =

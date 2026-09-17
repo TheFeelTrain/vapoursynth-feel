@@ -18,6 +18,14 @@
 
 #include <VapourSynth4.h>
 
+// The Vulkan and VapourSynth structs are built with designated initializers
+// that set only the members that matter; C++ zero-initializes the rest, so a
+// short initializer list is a deliberate convention here rather than a bug.
+// Without this the Vulkan headers alone produce ~190 false positives.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#endif
+
 #define checkVK(expr) do {                                                          \
     if (VkResult __result = (expr); __result != VK_SUCCESS) [[unlikely]] {          \
         return set_error("'"s + #expr + "' failed: " + vk_result_string(__result));\

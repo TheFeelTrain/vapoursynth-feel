@@ -731,7 +731,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     uint32_t required_subgroup_size = 0, int32_t filter_type = -1,
     int32_t zmean = -1) {
 
-    if (const char * dbg = getenv("VSFEEL_DFTTEST_DBG")) {
+    if (getenv("VSFEEL_DFTTEST_DBG")) {
         fprintf(stderr, "[dfttest] create_pipeline required_subgroup_size=%u filter_type=%d\n",
             required_subgroup_size, filter_type);
     }
@@ -740,7 +740,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     if (const char * sw = getenv("VSFEEL_DFTTEST_SGSIZE")) {
         subgroup_size = atoi(sw);
     }
-    if (const char * sw = getenv("VSFEEL_DFTTEST_SGSIZE_INVALID")) {
+    if (getenv("VSFEEL_DFTTEST_SGSIZE_INVALID")) {
         subgroup_size = 17;   // invalid on purpose, to test driver validation
     }
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info {
@@ -1033,7 +1033,6 @@ static std::optional<std::string> record_fused_col2im_cb(
     bool with_fused, bool with_col2im, bool qb = false,
     const int32_t * slot_base3x7 = nullptr, int tw_direct = 0) {
 
-    const VkDevice dev = d.device->device;
     VkCommandBuffer cmd = resource.cmd;
 
     VkCommandBufferBeginInfo begin_info {
@@ -1164,7 +1163,7 @@ static std::optional<std::string> record_fused_col2im_cb(
 }
 
 static const VSFrame *VS_CC DftGetFrame(
-    int n, int activationReason, void *instanceData, void **frameData,
+    int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
 
     DftData * d = static_cast<DftData *>(instanceData);
@@ -1739,7 +1738,7 @@ static const VSFrame *VS_CC DftGetFrame(
 // ---------------------------------------------------------------------------
 
 static void VS_CC DftFree(
-    void *instanceData, VSCore *core, const VSAPI *vsapi) {
+    void *instanceData, [[maybe_unused]] VSCore *core, const VSAPI *vsapi) {
 
     DftData * d = static_cast<DftData *>(instanceData);
 
@@ -1749,7 +1748,7 @@ static void VS_CC DftFree(
 }
 
 static void VS_CC DftCreate(
-    const VSMap *in, VSMap *out, void *userData,
+    const VSMap *in, VSMap *out, [[maybe_unused]] void *userData,
     VSCore *core, const VSAPI *vsapi) {
 
     auto d { std::make_unique<DftData>() };
@@ -2057,13 +2056,13 @@ static void VS_CC DftCreate(
         const Norm norm = (slocation != nullptr && ssystem == 1) ? Norm::identity
             : (tbsize == 1) ? Norm::sqrt : Norm::cbrt;
 
+        // slocation is the one shared 3-D table: all three axes use the same
+        // function, so the per-axis sources are just aliases of it.
         SigmaFunc fx, fy, ft;
-        bool shared = false;
         if (slocation != nullptr) {
             fx = SigmaFunc::initPacks(slocation, n_slocation, norm);
             fy = fx;
             ft = fx;
-            shared = true;
         } else {
             fx = (ssx != nullptr) ? SigmaFunc::initPacks(ssx, n_ssx, norm)
                                   : SigmaFunc::initConst(norm, sigma);

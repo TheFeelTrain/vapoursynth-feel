@@ -334,6 +334,13 @@ add_library(vsfeel SHARED
     "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.o")
 configure_common(vsfeel)
 target_compile_options(vsfeel PRIVATE -mavx2)
+# Build the plugin with a real warning baseline so defects do not accumulate.
+# -Wmissing-field-initializers is deliberately excluded: vsfeel.h silences it
+# for the Vulkan/VapourSynth designated-initializer convention.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(vsfeel PRIVATE
+        -Wall -Wextra -Wshadow -Wno-missing-field-initializers)
+endif()
 # Keep the host's EEDI3 vcheck LDS fit check in step with the -DMAXW the shader
 # was compiled with (defined above, in the EEDI3 shader block).
 target_compile_definitions(vsfeel PRIVATE EEDI3_MAXW_LDS=${EEDI3_MAXW})

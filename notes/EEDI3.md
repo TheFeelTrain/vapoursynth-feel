@@ -2709,3 +2709,65 @@ Verified: `tests/` 603 passed. Bit-exactness against the previous binary
 (`8e65f1f`, real install-and-swap, `cmp` of raw planes, 14 configs — EEDI3
 field/dh/nrad/vcheck 0,3/mclip/streams=4, EEDI3H field/dh, EEDI3AA field 2 and
 3, NNEDI3 field 2): every config byte-identical.
+
+## Round 26 — probe-harness corruption fixed, repo warning baseline
+
+**The PROBE 7/8/10 fake store really did corrupt the ablation.** The extra
+walk's result `f2` was kept alive with `if (f2 == pc.pbt_base)
+dmap[pc.rempty_base + r] = 0`. `pc.pbt_base` is a byte offset into `dev_buf`,
+while `f2` is the sum of byte-valued steps over ~2*mdis columns; the two are
+unrelated, so the store was an accidental trigger -- and when it fired it
+cleared the per-row empty flag that ENTRY_VCHECK reads at
+`dmap[pc.rempty_base + r]`, changing the vcheck's branch mix and the output.
+
+It is replaced by a read-only sink into `rowXmin` (a shared local that is dead
+after the `xmin` snapshot), so the probe's load chain stays live and the flag
+byte is never written. Verified with a PROBE=7 build on the noise clip with
+mclip (which actually exercises rowXmin/rempty): row kernel SPIR-V 43744 ->
+**44432 B** for BITS=16 (37964 -> 38652 for BITS=32), so the extra walk is
+still compiled in, and the output is byte-identical to PROBE=0 and stable
+across repeats (sha256 283717477cead12f both ways).
+
+The probe list in the shader header also now records that PROBE 11 and 13+ are
+unused gaps (11 was previously simply missing from the list).
+
+**Compiler warning baseline.** The tree had never been compiled with warnings
+on; `-Wall -Wextra -Wshadow` reported **191** hits across the eight sources --
+of which 191-2 were `-Wmissing-field-initializers` on the Vulkan/VapourSynth
+designated-initializer convention (C++ zero-fills the unmentioned members, so
+they are false positives). `src/vsfeel.h` now silences exactly that one warning
+for the whole plugin with a comment, and `CMakeLists.txt` builds with
+`-Wall -Wextra -Wshadow -Wno-missing-field-initializers`, so the baseline is
+enforced from now on. The build is warning-free.
+
+Real defects the sweep surfaced and fixed:
+
+* `dfttest.cpp` `create_pipeline`: `if (const char * dbg =
+  getenv("VSFEEL_DFTTEST_DBG"))` -- the whole point of the flag was to gate the
+  `create_pipeline` print, but the print was unconditional and every DFTTest
+  creation was writing to stderr (`dbg` was the unused variable). Now gated:
+  0 lines by default, 11 with the flag set.
+* `nlmeans.cpp` gputrace: six batch-timing accumulators (`w1`, `a1`, `sum_w`,
+  `sum_a`, `nw`, `na`) were computed every traced frame and thrown away. The
+  gputrace line now reports them (first batch + per-batch averages) instead of
+  dropping the data.
+* `dfttest.cpp` sigma array: the `shared` flag was set and never read; removed.
+* `nnedi3.cpp` `VSFEEL_NNEDI3_COUNT`: the count readback's `VkCommandBuffer cb`
+  shadowed the frame's real `cb`, so the block read misleadingly; renamed
+  `count_cb`. `Nnedi3Create`'s `fs` shadowed the weight-blob `fs`; renamed
+  `net_fs` (the `use_pxp8` lambda parameters had the same problem, now
+  `net_nns`/`net_fs`).
+* `bilateral.cpp` block-size clamp compared `int32_t block_x/block_y` against
+  unsigned `maxComputeWorkGroupSize`, which the negative check three lines
+  below already guards against; explicit casts added, matching the sibling
+  condition.
+* `nlmeans.cpp` `NLMeansGetFrame`'s trace counter shadowed `nf`
+  (`d->vi->numFrames`) -- renamed `tframe`.
+
+Dead leftovers removed: `record_command_buffer`'s unused `VkDevice dev` in
+bilateral, gaussblur and nnedi3; `record_fused_col2im_cb`'s in dfttest;
+`record_bm3d_kernels`'s in bm3d; gaussblur's unused `keys[ci]` binding; and the
+VS-API `frameData`/`core`/`userData` parameters that no filter uses are now
+`[[maybe_unused]]`.
+
+Verified: `tests/` 603 passed; PROBE=7 bit-identical to PROBE=0 as above.

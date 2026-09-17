@@ -564,7 +564,8 @@ static std::variant<VkPipeline, std::string> create_pipeline(
         // (VUID-VkPipelineShaderStageCreateInfo-flags-02785), so it is only
         // set when the device actually exposes it.
         .flags = (required_subgroup_size && dev.feat_compute_full_subgroups)
-            ? VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT
+            ? VkPipelineShaderStageCreateFlags(
+                  VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT)
             : VkPipelineShaderStageCreateFlags(0),
         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
         .module = module,
@@ -600,8 +601,6 @@ static std::variant<VkPipeline, std::string> create_pipeline(
 // so dispatches of different planes may overlap.
 static std::optional<std::string> record_command_buffer(
     const Nnedi3Data & d, Nnedi3Resource & resource, int parity) {
-
-    VkDevice dev = d.device->device;
 
     VkCommandBufferBeginInfo begin_info {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -783,7 +782,7 @@ static std::optional<std::string> record_command_buffer(
 }
 
 static const VSFrame *VS_CC Nnedi3GetFrame(
-    int n, int activationReason, void *instanceData, void **frameData,
+    int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
 
     Nnedi3Data * d = static_cast<Nnedi3Data *>(instanceData);
@@ -1004,7 +1003,7 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
 
         if (trace_on("VSFEEL_NNEDI3_COUNT")) {
             // one-off count readback: extra submit, perturbs timing
-            VkCommandBuffer cb;
+            VkCommandBuffer count_cb;
             VkCommandBufferAllocateInfo ainfo {
                 .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                 .pNext = nullptr,
@@ -1012,18 +1011,18 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
                 .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
                 .commandBufferCount = 1
             };
-            if (vkAllocateCommandBuffers(dev, &ainfo, &cb) == VK_SUCCESS) {
+            if (vkAllocateCommandBuffers(dev, &ainfo, &count_cb) == VK_SUCCESS) {
                 VkCommandBufferBeginInfo binfo {
                     .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                     .pNext = nullptr,
                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
                     .pInheritanceInfo = nullptr
                 };
-                if (vkBeginCommandBuffer(cb, &binfo) == VK_SUCCESS) {
+                if (vkBeginCommandBuffer(count_cb, &binfo) == VK_SUCCESS) {
                     VkBufferCopy r { 0, d->download_total, 16 };
-                    vkCmdCopyBuffer(cb, resource.ind_buf, resource.staging, 1, &r);
-                    vkEndCommandBuffer(cb);
-                    submit_with_fence(dev, resource.queue, resource.queue_lock, cb, resource.fence);
+                    vkCmdCopyBuffer(count_cb, resource.ind_buf, resource.staging, 1, &r);
+                    vkEndCommandBuffer(count_cb);
+                    submit_with_fence(dev, resource.queue, resource.queue_lock, count_cb, resource.fence);
                     if (vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS) {
                         uint32_t words[4] = {};
                         std::memcpy(words, map + d->download_total, 16);
@@ -1031,7 +1030,7 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
                             n, words[0], words[3]);
                     }
                 }
-                vkFreeCommandBuffers(dev, resource.pool, 1, &cb);
+                vkFreeCommandBuffers(dev, resource.pool, 1, &count_cb);
             }
         }
 
@@ -1118,7 +1117,7 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
 // ---------------------------------------------------------------------------
 
 static void VS_CC Nnedi3Free(
-    void *instanceData, VSCore *core, const VSAPI *vsapi) {
+    void *instanceData, [[maybe_unused]] VSCore *core, const VSAPI *vsapi) {
 
     Nnedi3Data * d = static_cast<Nnedi3Data *>(instanceData);
 
@@ -1287,7 +1286,7 @@ static std::optional<std::string> upload_weights(
 }
 
 static void VS_CC Nnedi3Create(
-    const VSMap *in, VSMap *out, void *userData,
+    const VSMap *in, VSMap *out, [[maybe_unused]] void *userData,
     VSCore *core, const VSAPI *vsapi) {
 
     auto d { std::make_unique<Nnedi3Data>() };
@@ -1693,8 +1692,8 @@ static void VS_CC Nnedi3Create(
     // the shader's PXP rule and the count kernel's groupsX divisor).
     const uint32_t max_grid_x = d->device->limits.maxComputeWorkGroupCount[0];
     const uint32_t max_grid_y = d->device->limits.maxComputeWorkGroupCount[1];
-    const auto use_pxp8 = [](int nns, int fs) {
-        return ((nns + 31) / 32 <= 2) && (fs <= 128);
+    const auto use_pxp8 = [](int net_nns, int net_fs) {
+        return ((net_nns + 31) / 32 <= 2) && (net_fs <= 128);
     };
     {
         struct Key { int w, rows, stride, pscrn, xdim, ydim, nns, qual; };
@@ -1806,11 +1805,11 @@ static void VS_CC Nnedi3Create(
                     // PXP=8 for narrow networks; PXP=4 wide networks use the
                     // small-tile module when FS<=64 (4KB LDS vs 18KB),
                     // full-tile otherwise.
-                    const int fs = d->xdim * d->ydim;
+                    const int net_fs = d->xdim * d->ydim;
                     VkShaderModule mod = d->pred_n4_module;
-                    if (use_pxp8(d->nns, fs)) {
+                    if (use_pxp8(d->nns, net_fs)) {
                         mod = d->pred_module;
-                    } else if (fs <= 64) {
+                    } else if (net_fs <= 64) {
                         mod = d->pred_n4s_module;
                     }
                     const auto result = create_pipeline(

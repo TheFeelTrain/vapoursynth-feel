@@ -285,8 +285,6 @@ static std::variant<VkPipeline, std::string> create_pipeline(
 static std::optional<std::string> record_command_buffer(
     const BilateralData & d, BilateralResource & resource) {
 
-    VkDevice dev = d.device->device;
-
     VkCommandBufferBeginInfo begin_info {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .pNext = nullptr,
@@ -373,7 +371,7 @@ static std::optional<std::string> record_command_buffer(
 // ---------------------------------------------------------------------------
 
 static const VSFrame *VS_CC BilateralGetFrame(
-    int n, int activationReason, void *instanceData, void **frameData,
+    int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
 
     BilateralData * d = static_cast<BilateralData *>(instanceData);
@@ -603,7 +601,7 @@ static const VSFrame *VS_CC BilateralGetFrame(
 // ---------------------------------------------------------------------------
 
 static void VS_CC BilateralFree(
-    void *instanceData, VSCore *core, const VSAPI *vsapi) {
+    void *instanceData, [[maybe_unused]] VSCore *core, const VSAPI *vsapi) {
 
     BilateralData * d = static_cast<BilateralData *>(instanceData);
 
@@ -616,7 +614,7 @@ static void VS_CC BilateralFree(
 }
 
 static void VS_CC BilateralCreate(
-    const VSMap *in, VSMap *out, void *userData,
+    const VSMap *in, VSMap *out, [[maybe_unused]] void *userData,
     VSCore *core, const VSAPI *vsapi) {
 
     auto d { std::make_unique<BilateralData>() };
@@ -776,8 +774,8 @@ static void VS_CC BilateralCreate(
         const VkPhysicalDeviceLimits & limits = d->device->limits;
 
         // shrink the default block size if the device cannot host it
-        if (block_x > limits.maxComputeWorkGroupSize[0] ||
-            block_y > limits.maxComputeWorkGroupSize[1] ||
+        if (static_cast<uint32_t>(block_x) > limits.maxComputeWorkGroupSize[0] ||
+            static_cast<uint32_t>(block_y) > limits.maxComputeWorkGroupSize[1] ||
             static_cast<uint32_t>(block_x) * block_y > limits.maxComputeWorkGroupInvocations) {
             block_x = std::min<int>(16, limits.maxComputeWorkGroupSize[0]);
             block_y = std::min<int>(16, limits.maxComputeWorkGroupSize[1]);

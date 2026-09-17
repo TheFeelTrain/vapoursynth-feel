@@ -570,7 +570,7 @@ static std::string create_staging(NLMeansData * d, NLStream & st, int tiles) {
 }
 
 static const VSFrame *VS_CC NLMeansGetFrame(
-    int n, int activationReason, void *instanceData, void **frameData,
+    int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
 
     NLMeansData * d = static_cast<NLMeansData *>(instanceData);
@@ -1023,15 +1023,15 @@ release_cache(d, stream);
     mark(t_dl);
 
     if (trace) {
-        uint32_t nf = t_nf.fetch_add(1) + 1;
-        if (nf % 100 == 0) {
+        const uint32_t tframe = t_nf.fetch_add(1) + 1;
+        if (tframe % 100 == 0) {
             fprintf(stderr,
                 "[perf] frames=%u up=%.2f sub=%.2f wait=%.2f dl=%.2f blocks=%u (ms avg)\n",
-                nf,
-                t_up.load() / double(nf) / 1e3,
-                t_sub.load() / double(nf) / 1e3,
-                t_wait.load() / double(nf) / 1e3,
-                t_dl.load() / double(nf) / 1e3,
+                tframe,
+                t_up.load() / double(tframe) / 1e3,
+                t_sub.load() / double(tframe) / 1e3,
+                t_wait.load() / double(tframe) / 1e3,
+                t_dl.load() / double(tframe) / 1e3,
                 d->t_blocks.load());
         }
     }
@@ -1069,7 +1069,10 @@ release_cache(d, stream);
                     fprintf(stderr, " %u:%.0f", i,
                         (ts[i] - ts[0]) * period / 1e3);
                 }
-                fprintf(stderr, "\n");
+                fprintf(stderr, " | first w=%.1f a=%.1f batch_avg w=%.1f a=%.1f (n=%u)\n",
+                    w1 / 1e3, a1 / 1e3,
+                    nw ? sum_w / double(nw) / 1e3 : 0.0,
+                    na ? sum_a / double(na) / 1e3 : 0.0, nw);
             }
         }
     }
@@ -1081,7 +1084,7 @@ release_cache(d, stream);
     return dst;
 }
 
-static void VS_CC NLMeansFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
+static void VS_CC NLMeansFree(void *instanceData, [[maybe_unused]] VSCore *core, const VSAPI *vsapi) {
     NLMeansData * d = static_cast<NLMeansData *>(instanceData);
     vsapi->freeNode(d->node);
     if (d->ref_node) {
@@ -1091,7 +1094,7 @@ static void VS_CC NLMeansFree(void *instanceData, VSCore *core, const VSAPI *vsa
 }
 
 static void VS_CC NLMeansCreate(
-    const VSMap *in, VSMap *out, void *userData,
+    const VSMap *in, VSMap *out, [[maybe_unused]] void *userData,
     VSCore *core, const VSAPI *vsapi) {
 
     auto d { std::make_unique<NLMeansData>() };
