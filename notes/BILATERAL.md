@@ -235,3 +235,14 @@ and a 2000-set descriptor pool before failing mid-loop), `sigma_spatial` /
 UB; the reference clamps identically). Flush/invalidate ranges go through the
 shared `mapped_range` helper (see `notes/EEDI3AA.md` round 8). No performance
 change; all `test_bilateral.py` tests pass.
+
+## NT-store ordering
+
+The guide plane is always NT-stored (`copy_plane_out(..., nt=true)`, hardcoded)
+and the source planes are too on the staging path, but nothing ordered those
+weak stores before the submit that tells the kernels to read the upload window,
+so a kernel could see stale or partially written input. An unconditional
+`_mm_sfence()` now sits immediately before `submit_with_fence`, matching
+EEDI3/NNEDI3. The requirement is documented on `copy_stream_out` /
+`copy_plane_out` in `vsfeel.h`. Correctness-only change, no fps effect
+expected; `test_bilateral.py` passes.

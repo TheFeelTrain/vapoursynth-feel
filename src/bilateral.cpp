@@ -16,6 +16,8 @@
 #include <variant>
 #include <vector>
 
+#include <immintrin.h>
+
 #include <vulkan/vulkan.h>
 
 #include <VapourSynth4.h>
@@ -523,6 +525,11 @@ static const VSFrame *VS_CC BilateralGetFrame(
             }
             checkVK(vkFlushMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
         }
+
+        // The guide plane is always NT-stored (and the source planes are on the
+        // staging path); NT stores are weakly ordered, so drain them before the
+        // GPU is told to read the upload window.
+        _mm_sfence();
 
         checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
             resource.cmd, resource.fence));

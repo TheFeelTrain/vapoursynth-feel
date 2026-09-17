@@ -15,6 +15,8 @@
 #include <variant>
 #include <vector>
 
+#include <immintrin.h>
+
 #include <vulkan/vulkan.h>
 
 #include <VapourSynth4.h>
@@ -617,6 +619,10 @@ static const VSFrame *VS_CC GaussGetFrame(
             }
             checkVK(vkFlushMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
         }
+
+        // On the staging path the upload is NT-stored; drain the weak stores
+        // before the GPU is told to read the upload window.
+        _mm_sfence();
 
         checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
             resource.cmd, resource.fence));

@@ -123,3 +123,11 @@ The upload flush and download invalidate ranges (per plane, at arbitrary
 32-byte-aligned offsets) now go through the shared `mapped_range` helper, which
 rounds them to `minNonCoherentAtomSize`/`VK_WHOLE_SIZE` as Vulkan requires. No
 behaviour change on this coherent device; all `test_gaussblur.py` tests pass.
+
+## NT-store ordering
+
+Same gap as Bilateral: on the staging path (`host_direct_upload == false`) the
+upload uses NT stores, and the submit that tells the GPU to read that window had
+no `_mm_sfence()` before it. Added unconditionally just before
+`submit_with_fence`. Correctness-only change, no fps effect expected;
+`test_gaussblur.py` passes.

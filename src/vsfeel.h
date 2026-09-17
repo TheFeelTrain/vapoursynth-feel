@@ -152,7 +152,9 @@ inline std::optional<std::string> require_vulkan_1_3(
 
 // Streaming copy: non-temporal stores bypass the CPU cache so the freshly
 // written lines sit clean in DRAM; the GPU can then read them over PCIe
-// without snoop/writeback stalls.
+// without snoop/writeback stalls. Non-temporal stores are weakly ordered, so
+// the caller must issue _mm_sfence() after the copy and before submitting any
+// GPU work that reads `dst` (same for copy_plane_out with nt=true).
 void copy_stream_out(void * dst, const void * src, size_t bytes);
 
 // Streaming copy variant that reads the GPU-written staging without caching
@@ -168,7 +170,8 @@ void copy_stream_read(void * dst, const void * src, size_t bytes);
 // copied one at a time, so padded VapourSynth frame strides and GPU-aligned
 // plane pitches are both handled. `nt` selects streaming stores (right for the
 // GTT staging buffers) instead of ordinary cached stores (right for the
-// write-combined VRAM BAR window).
+// write-combined VRAM BAR window); with `nt` the caller must _mm_sfence()
+// before submitting the GPU work that reads the destination.
 void copy_plane_out(void * dst, ptrdiff_t dst_pitch, const void * src,
                     ptrdiff_t src_pitch, size_t row_bytes, int height, bool nt);
 
