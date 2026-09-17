@@ -401,6 +401,21 @@ def test_rclip_guide_matches_reference_16bit(noise_16bit):
     assert _max_diff(mine, theirs) <= 1.0
 
 
+@pytest.mark.parametrize("d", [1, 2])
+def test_rclip_temporal_matches_reference_early_frames(noise_gray, d):
+    """Frames n < d use a shorter window (2*min(d,n)+1 layers), where the
+    guide clip's slot table used to be indexed with the full-window stride
+    and read past win_slots. Pre-fix diff vs vszipcl was 2.4e-2 (d=1) and
+    6.7e-3 (d=2); frames n >= d matched to ~1e-6."""
+    ref = _reference_plugin()
+    src = noise_gray
+    guide = src.std.BoxBlur(hradius=5, vradius=5)
+    mine = _run(src, num_streams=1, d=d, h=1.5, rclip=guide)
+    theirs = ref.NLMeans(src, num_streams=1, d=d, h=1.5, rclip=guide)
+    worst = _max_diff(mine, theirs, frames=(0, 1, 2, 3))
+    assert worst < NLMEANS_REF_TOL, f"max diff vs vszipcl (d={d}): {worst}"
+
+
 def test_stride_handling_matches_reference_32bit(noise_gray):
     # a cropped frame keeps its parent's (wider) stride; the filter must
     # handle non-tight pitches identically to the reference
@@ -586,3 +601,28 @@ def test_reject_rclip_dimension_mismatch(noise_gray):
 def test_reject_rclip_format_mismatch(noise_gray, noise_16bit):
     with pytest.raises(vs.Error, match=r"'rclip' must match the source clip"):
         _run(noise_gray, d=0, rclip=noise_16bit)
+
+
+def test_reject_window_larger_than_slot_pool():
+    """A frame at n >= d must hold one full window (clips*C*(2d+1) slots) at
+    once. When the 512 MiB pool cap cannot cover that, creation must reject
+    the configuration: the all-or-nothing acquire would otherwise wait on
+    cache_cv forever (it holds no slots and never submits, so nothing can
+    notify it). 1080p f32 YUV444 at d=16 is the minimal case: pool 70,
+    needs 99."""
+    core = vs.core
+    src = core.std.BlankClip(None, 1920, 1080, vs.YUV444PS, length=40,
+                             color=[0.5, 0.5, 0.5])
+    with pytest.raises(vs.Error,
+                       match=r"needs 99 cache slots .* budget allows 70"):
+        _run(src, channels="YUV", d=16)
+
+
+def test_accept_window_that_fits_the_slot_pool():
+    """Control for the case above: the same geometry in luma at d=16 needs
+    only 33 slots and must still create and evaluate frame n = d."""
+    core = vs.core
+    src = core.std.BlankClip(None, 1920, 1080, vs.GRAYS, length=40,
+                             color=[0.5])
+    out = _run(src, d=16)
+    assert out.get_frame(16) is not None

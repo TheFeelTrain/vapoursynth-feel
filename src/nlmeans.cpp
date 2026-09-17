@@ -120,6 +120,12 @@ struct NLStream {
     std::vector<int> win_slots;      // pool slot of each needed tile
     std::vector<bool> upload_new;    // true where this frame must fill a slot
     int new_tiles {};                // tiles shipped to the pool this frame
+    // Unique token identifying this frame's cache reservation. A frame index
+    // is not a unique holder identity: the scheduler can process the same
+    // frame twice at once (two consumers of this node), and erasing holders
+    // by value would then drop both entries at the first release, freeing a
+    // slot another reader still uses. Same pattern as BM3D's res_token.
+    uint64_t res_token {};
     std::vector<VkBufferCopy> copy_regions;
     // writers of reused (writing) tiles: {stream_id, submission count} their
     // upload must be SUBMITTED before ours (single shared FIFO queue => the
@@ -131,7 +137,10 @@ struct NLStream {
 // shared padded-tile cache: one channel-layer tile per slot
 struct CacheSlot {
     int64_t key {-1};        // (clip << 40) | (c << 32) | idx, -1 = empty
-    int writer {-1};
+    // reservation token of the frame that uploaded this slot, and of every
+    // frame currently reading it (see NLStream::res_token for why a token,
+    // not a frame index)
+    uint64_t writer_token {0};
     // who is uploading this slot, and the submission generation their upload
     // will carry once queued (readers of a writing slot wait for that
     // generation so the single shared queue orders the write before their read)
@@ -141,7 +150,7 @@ struct CacheSlot {
     // other frames must not touch the slot while it is being padded, but
     // may share-read it freely once stable (tiles are immutable)
     bool writing {false};
-    std::vector<int> holders;
+    std::vector<uint64_t> holders;
 };
 
 struct NLMeansData {
@@ -179,6 +188,7 @@ struct NLMeansData {
     VkDeviceMemory slots_mem {};
     std::vector<CacheSlot> cache;
     int cache_cursor {};
+    uint64_t next_res_token {1};   // guarded by cache_lock
     std::mutex cache_lock;
     std::condition_variable cache_cv;
     std::atomic<uint32_t> t_blocks {};
@@ -454,11 +464,12 @@ static void acquire_cache(NLMeansData * d, NLStream & st, int n,
             continue;
         }
         // phase 2: apply the reservations (lock held, checks still valid)
+        st.res_token = d->next_res_token++;
         for (size_t ti = 0; ti < keys.size(); ++ti) {
             const int slot = chosen[ti];
             if (st.upload_new[ti]) {
                 d->cache[slot].key = keys[ti];
-                d->cache[slot].writer = n;
+                d->cache[slot].writer_token = st.res_token;
                 d->cache[slot].writing = true;
                 // this stream's submission count AFTER it submits its current
                 // frame (bumped once per submit, one frame per stream)
@@ -467,19 +478,19 @@ static void acquire_cache(NLMeansData * d, NLStream & st, int n,
                     d->submit_count[st.stream_id].load(std::memory_order_acquire) + 1;
                 d->cache[slot].holders.clear();
             }
-            d->cache[slot].holders.push_back(n);
+            d->cache[slot].holders.push_back(st.res_token);
             st.win_slots[ti] = slot;
         }
         return;
     }
 }
 
-static void release_cache(NLMeansData * d, NLStream & st, int n) {
+static void release_cache(NLMeansData * d, NLStream & st) {
     std::lock_guard lock(d->cache_lock);
     for (int slot : st.win_slots) {
         auto & h = d->cache[slot].holders;
-        h.erase(std::remove(h.begin(), h.end(), n), h.end());
-        if (d->cache[slot].writer == n) {
+        h.erase(std::remove(h.begin(), h.end(), st.res_token), h.end());
+        if (d->cache[slot].writer_token == st.res_token) {
             d->cache[slot].writing = false;
         }
     }
@@ -554,7 +565,7 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         // unblock any stream waiting on our pending uploads (we never submit)
         d->submit_count[stream.stream_id].fetch_add(1, std::memory_order_release);
         d->submit_cv.notify_all();
-        release_cache(d, stream, n);
+        release_cache(d, stream);
         d->pool.give_back(std::move(stream));
         vsapi->setFilterError(("NLMeans: " + error_message).c_str(), frameCtx);
         vsapi->freeFrame(dst);
@@ -663,8 +674,11 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         for (int clip = 0; clip < 2; ++clip) {
             const size_t base =
                 static_cast<size_t>(clip) * (C * d->layers);
+            // win_slots is laid out [clip][i in 0..count-1][c], so clip 1
+            // starts at C*count -- NOT the full-window C*layers. When n < d
+            // we have count < layers and the latter reads past the vector.
             const size_t key_off =
-                (clip == 1 && d->has_ref) ? static_cast<size_t>(C * d->layers) : 0;
+                (clip == 1 && d->has_ref) ? static_cast<size_t>(C * count) : 0;
             for (int i = 0; i < count; ++i) {
                 const int t_layer = d->d - m + i;
                 for (int c = 0; c < C; ++c) {
@@ -880,7 +894,7 @@ static const VSFrame *VS_CC NLMeansGetFrame(
     }
 
     // all kernels that read this frame's tiles have completed
-release_cache(d, stream, n);
+release_cache(d, stream);
 
     const bool dst_coherent =
         !!(d->device->mem_props.memoryTypes[
@@ -1479,6 +1493,24 @@ static void VS_CC NLMeansCreate(
         const int capped = std::min(full,
             static_cast<int>(std::max<VkDeviceSize>(budget_slots, 1)));
         d->n_slots = capped + 2 * d->channels * clips;
+    }
+    // acquire_cache is all-or-nothing: a frame at n >= d must hold
+    // clips*C*(2d+1) distinct slots simultaneously, and a frame that cannot
+    // reserve its whole window waits on cache_cv forever (nobody else can
+    // notify: it holds nothing and never submits). When the 512 MiB budget
+    // cannot cover one full window, reject the configuration here instead of
+    // hanging the graph.
+    if (d->n_slots < d->staging_tiles) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "temporal radius d=%d with %d channel(s) and %d clip(s) needs %d "
+            "cache slots (%.0f MiB), but the 512 MiB slot-pool budget allows "
+            "%d; reduce d, channels or num_streams",
+            d->d, d->channels, clips, d->staging_tiles,
+            static_cast<double>(d->staging_tiles) *
+                static_cast<double>(slot_bytes_v) / (1024.0 * 1024.0),
+            d->n_slots);
+        return set_error(msg);
     }
 
     {

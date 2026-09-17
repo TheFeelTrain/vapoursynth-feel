@@ -485,3 +485,101 @@ Fix: build the chain calls from the bit-adjusted expression:
   calls = spec.build(ns, input_expr); cache_conv = input_expr
 NOW MEASURES TRUE 32-BIT: vsfeel 860-862 vs vszipcl 661-662 (+30%), same
 margin as 16-bit (vsfeel ~1000-1012 vs 768-770, +30%).
+
+## 2026-09-16: WO-04/05/06 — pool sizing, rclip indexing, reservation tokens
+
+Three correctness fixes from REPORT.md §II.6 (D1, D2, and the holders
+identity). All host-side; no shader, launch or memory-path change, so the
+shipped benchmark figures are unaffected (re-measured below). Full suite
+592/592; tests/test_nlmeans.py 110/110 (was 106).
+
+### D1 (WO-05) — guide-clip layer-table read ran past `win_slots` when n < d
+`win_slots` is `[clip][i in 0..count-1][c]` with `count = 2*min(d,n)+1`, but
+the clip-1 layer-table write used `key_off = C*layers` (the full-window
+stride). Whenever `n < d`, `count < layers`, so the read ran
+`C*(layers-count)` elements past the vector and the `*slot_elems` multiplier
+turned heap garbage into a slot base the shader read far outside the slot
+buffer. Fix: `key_off = C*count`. Every previous rclip fixture used d=0
+(count == layers), which is why 106 tests missed it.
+
+Measured (tmp/wo05_repro.py: 4-frame GrayS, BoxBlur guide, vs vszipcl):
+- before: d=1 frame 0 (n<d) 2.38e-2; d=2 frame 1 (n<d) 6.68e-3;
+  frames n>=d ~1.0e-6
+- after: all frames <= 1.6e-6 (incl. the previously exposed ones)
+
+Test added: `test_rclip_temporal_matches_reference_early_frames` (d=1,2;
+frames 0..3; tol 1e-4 = NLMEANS_REF_TOL).
+
+### D2 (WO-04) — a slot pool smaller than one window hangs on cache_cv
+A frame at n >= d must hold `clips*C*(2d+1)` distinct slots simultaneously,
+but `n_slots = min(ns*C*clips*layers, 512MiB/slot_bytes) + 2*C*clips`. When
+the budget binds below one window the all-or-nothing acquire can never set
+`ok`, and `cache_cv.wait` never returns: the waiting frame holds no slots and
+never submits, so nothing can notify it. Fix: reject at creation when
+`n_slots < staging_tiles`, with the slot count, MiB and pool size in the
+message. The rejection set is exactly the previous hang set -- no config that
+worked is rejected, and those that would hang now fail fast before any large
+allocation (the check sits before the slots buffer and the per-stream
+staging).
+
+Measured (tmp/wo04_repro.py, subprocess + 25 s timeout, ns=1):
+| config | before | after |
+|---|---|---|
+| 1080p f32 YUV444 d=16 (pool 70, need 99) | HANG | precise create error |
+| 1080p f32 YUV444 d=12 (70, 75) | HANG | precise create error |
+| 4K f32 Gray d=9 (18, 19) | HANG | precise create error |
+| 1080p f32 YUV444 + rclip d=8 (76, 102) | HANG | precise create error |
+| 1080p f32 Gray d=16 (37, 33) control | runs | runs |
+
+The slot arithmetic is copied line-for-line into tmp/wo04_matrix.py and
+enumerated over 720p/1080p/1440p/4K/8K x {16,32}-bit x C{1,2,3} x d{1..16} x
+ns{1,2,8} x rclip{0,1} (2880 configs): **403 hang at the shipped ns=1** and
+1209 across ns in {1,2,8}; the fix rejects exactly that set. REPORT.md quotes
+"70 hanging configurations" and its 1080p f32 YUV d=16 example (pool 70, need
+99) reproduces exactly, but two other worked examples in that bullet do not:
+"1080p f32 C=2 + rclip ... 76 vs 102" is C=3 + rclip under this arithmetic,
+and "8K f32 + rclip d=1 (5 vs 6)" computes pool 8 / need 6 (no hang). Treat
+the "70" as a lower bound, not a count to re-derive.
+
+Tests added: `test_reject_window_larger_than_slot_pool` (1080p f32 YUV444
+d=16 -> vs.Error "needs 99 cache slots ... budget allows 70") and its control
+`test_accept_window_that_fits_the_slot_pool` (same geometry, luma, d=16:
+pool 37 >= need 33, evaluates frame 16).
+
+### holders (WO-06) — reservation tokens instead of frame indices
+`holders` and the slot's writer were frame indices. Two concurrent
+evaluations of the same frame n (two consumers of one node, or a re-request
+while in flight) each pushed n, so `std::remove(..., n)` at the first release
+dropped BOTH entries and marked the slot evictable while the other reader
+still used it. Ported BM3D's `res_token` pattern: a per-reservation
+`uint64_t res_token` assigned under cache_lock, `holders` is now
+`vector<uint64_t>`, and the slot stores `writer_token` so only the uploading
+reservation can clear `writing`.
+
+Measured (tmp/wo06_overlap.py): 4 concurrent requests for the SAME frame cost
+7.6 ms vs 8.5 ms for 4 DIFFERENT frames at ns=4 (ratio 0.89) -- the core
+really does recompute and overlap the same frame, so two reservations for one
+n do coexist. **No divergence could be produced on this box, however.**
+tmp/wo06_repro.py (duplicate + competing frames, pool pressure),
+tmp/wo06_repro2.py (seek schedule mixing duplicates and far seeks) and
+tmp/wo06_repro3.py (StackVertical = two consumers of one node; NLMEANS_DBG
+shows every frame computed exactly twice) are all bit-identical to the ns=1
+oracle, including 20 reps under `taskset -c 0,1`. Mechanism that masks it: a
+reader of a *writing* slot waits for the writer's SUBMIT (not the writer's
+fence), while release happens only after the writer's FENCE wait -- so both
+consumers have submitted long before the slot becomes evictable, and the one
+FIFO queue orders their reads ahead of any re-keying copy. The token fix
+closes the remaining window (a consumer descheduled between acquire and
+submit for longer than the other's GPU round trip) and makes the identity
+independent of that timing. Verified by the three harnesses + the full suite,
+not by a firing repro.
+
+### Performance
+No change expected or seen: the token is one `uint64_t` increment per frame
+under an already-held lock, and `holders` grows from 4 to 8 bytes per entry
+(a handful per slot at most). Same-session benchmark on the standard clip
+(3000 frames, ns=2, d=2, channels='UV'):
+- u16: vsfeel 1002.5 vs vszipcl 758.4 (1.322x; README row 970/737/1.32x)
+- f32: vsfeel 848.6 vs vszipcl 639.5 (1.327x; README row 846/651/1.30x)
+Ratios match the shipped rows, so README.md's Performance table was left
+unchanged.
