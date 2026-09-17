@@ -4456,7 +4456,10 @@ static void vsfeel_eedi3_create(
     }
 
     for (int i = 0; i < d->num_streams; ++i) {
-        Eedi3Resource resource;
+        // Owned by the pool while it is being built: a mid-loop error return
+        // tears it down in ~Eedi3Data instead of leaking it (see
+        // FramePool::emplace).
+        Eedi3Resource & resource = d->pool.emplace();
 
         {
             VkBufferCreateInfo buffer_info {
@@ -4785,11 +4788,6 @@ static void vsfeel_eedi3_create(
 
         resource.queue = d->device->queues[i % num_queues].queue;
         resource.queue_lock = d->device->queues[i % num_queues].lock.get();
-
-        // The command buffer is recorded per frame (interp-row parity varies),
-        // so the resource is pushed empty; record_command_buffer runs in
-        // GetFrame before each submit.
-        d->pool.push(std::move(resource));
     }
 
     // Dependencies. EEDI3/EEDI3H are temporal when field > 1 (each output frame

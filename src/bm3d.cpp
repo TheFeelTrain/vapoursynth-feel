@@ -765,6 +765,9 @@ static const VSFrame *VS_CC BM3DGetFrame(
         const int my_stream = stream.stream_id;
         const uint64_t my_seq = stream.seq++;
         if (std::getenv("BM3D_TRACE")) fprintf(stderr, "[t] n=%d stream=%d\n", n, my_stream);
+        // set once the estimation command buffer has been queued; from then on
+        // the stream has work in flight that the error path must drain.
+        bool estimation_submitted = false;
 
         // reserve this frame's cache slots (blocks only when the working set
         // exceeds the cache, e.g. on seeks; never holds a stream while waiting)
@@ -773,21 +776,38 @@ static const VSFrame *VS_CC BM3DGetFrame(
                                  : std::chrono::steady_clock::time_point {};
 
         const auto set_error = [&](const std::string & error_message) {
-            // unblock any frames already waiting on this frame's timeline
-            VkSemaphoreSignalInfo signal_info {
-                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
-                .pNext = nullptr,
-                .semaphore = stream.timeline,
-                .value = my_seq
-            };
-            vkSignalSemaphore(d->device->device, &signal_info);
-            // no estimation will be submitted for this sequence: satisfy any
-            // reader blocked on the submission event before dropping the slots
+            VkDevice e_dev = d->device->device;
+            // If no estimation was submitted, nothing will signal this frame's
+            // timeline, so unblock readers waiting on it from the host. Once it
+            // has been submitted the device signals my_seq on completion, and a
+            // host signal here would release the slots before the kernels have
+            // finished reading them.
+            if (!estimation_submitted) {
+                VkSemaphoreSignalInfo signal_info {
+                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+                    .pNext = nullptr,
+                    .semaphore = stream.timeline,
+                    .value = my_seq
+                };
+                vkSignalSemaphore(e_dev, &signal_info);
+            }
+            // satisfy any reader blocked on the submission event before
+            // dropping the slots
             {
                 std::lock_guard lock(d->cache_lock);
                 d->stream_submitted[stream.stream_id] = my_seq;
             }
             d->cache_cv.notify_all();
+            // Do not return the stream to the pool with work still in flight: a
+            // successor would re-record its command buffers and the cache slots
+            // would be reused while this frame's kernels still read them. Drain
+            // the queue under its lock (serializing against a concurrent
+            // vkQueueSubmit) and reset the fence for the next take().
+            if (estimation_submitted) {
+                std::lock_guard lock(*stream.queue_lock);
+                vkQueueWaitIdle(stream.queue);
+                vkResetFences(e_dev, 1, &stream.fence);
+            }
             release_cache(d, stream, n);
             d->pool.give_back(std::move(stream));
             vsapi->setFilterError(("BM3D: " + error_message).c_str(), frameCtx);
@@ -956,8 +976,9 @@ static const VSFrame *VS_CC BM3DGetFrame(
         /* no fence here: the fence is signalled by the aggregation submit on
                the same queue, and a fence must not be attached to a second
                submission while a first one still holds it */
-            checkVK(submit_timeline(dev, stream.queue, stream.queue_lock, stream.cmd,
-                src_waits, src_values, src_stages, stream.timeline, my_seq, VK_NULL_HANDLE));
+        checkVK(submit_timeline(dev, stream.queue, stream.queue_lock, stream.cmd,
+            src_waits, src_values, src_stages, stream.timeline, my_seq, VK_NULL_HANDLE));
+        estimation_submitted = true;
         // Publish the submission event before recording the aggregation: a
         // reader whose aggregation device-waits on this estimation must be able
         // to see that the signal is already on its way (see the host wait below).

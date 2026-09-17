@@ -1916,7 +1916,10 @@ static void VS_CC Nnedi3Create(
         d->device->queue_count, "VSFEEL_NNEDI3_QUEUES", 2);
 
     for (int i = 0; i < d->num_streams; ++i) {
-        Nnedi3Resource resource;
+        // Owned by the pool while it is being built: a mid-loop error return
+        // tears it down in ~Nnedi3Data instead of leaking it (see
+        // FramePool::emplace).
+        Nnedi3Resource & resource = d->pool.emplace();
 
         {
             VkBufferCreateInfo buffer_info {
@@ -2151,8 +2154,6 @@ static void VS_CC Nnedi3Create(
             resource.cmd1 = resource.cmd;
             resource.cmd = cmd0;
         }
-
-        d->pool.push(std::move(resource));
     }
 
     VSFilterDependency deps[1] = {{ d->node, d->field > 1 ? rpGeneral : rpStrictSpatial }};

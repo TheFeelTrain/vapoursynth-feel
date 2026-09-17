@@ -552,6 +552,7 @@ static const VSFrame *VS_CC GaussGetFrame(
             d->pool.give_back(std::move(resource));
             vsapi->setFilterError(("GaussBlur: " + error_message).c_str(), frameCtx);
             vsapi->freeFrame(src);
+            vsapi->freeFrame(dst);
             return nullptr;
         };
 
@@ -1197,7 +1198,10 @@ static void VS_CC GaussCreate(
         d->device->queue_count, "VSFEEL_GAUSS_QUEUES", 1);
 
     for (int i = 0; i < d->num_streams; ++i) {
-        GaussBlurResource resource;
+        // Owned by the pool while it is being built: a mid-loop error return
+        // tears it down in ~GaussData instead of leaking it (see
+        // FramePool::emplace).
+        GaussBlurResource & resource = d->pool.emplace();
 
         {
             VkBufferCreateInfo buffer_info {
@@ -1460,8 +1464,6 @@ static void VS_CC GaussCreate(
         if (const auto err = record_command_buffer(*d, resource)) {
             return set_error(*err);
         }
-
-        d->pool.push(std::move(resource));
     }
 
     VSFilterDependency deps[1] = {{d->node, rpStrictSpatial}};

@@ -131,3 +131,10 @@ upload uses NT stores, and the submit that tells the GPU to read that window had
 no `_mm_sfence()` before it. Added unconditionally just before
 `submit_with_fence`. Correctness-only change, no fps effect expected;
 `test_gaussblur.py` passes.
+
+## Creation and frame error paths
+
+Same as Bilateral: the per-stream resource is created into the pool via
+`FramePool::emplace()`, so a creation error is torn down by `~GaussData` rather
+than leaking its buffers, memory, command pool, fence and mapped windows; the
+frame-path `set_error` now frees `dst` as well. Correctness-only.

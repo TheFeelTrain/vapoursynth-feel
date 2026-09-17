@@ -592,3 +592,15 @@ weight denominator. The frame-request dependencies now use `rpGeneral` when
 (only `d = 0` stays strict-spatial). The shared flush-range helper covers the
 staging/u1z flushes. No performance change; all `test_nlmeans.py` tests pass
 (the `wref=-0.5` message is unchanged, so its regex still matches).
+
+## Creation error path and the dead queue knob
+
+The per-stream `NLStream` is created straight into the pool
+(`FramePool::emplace()`), so a creation error no longer abandons its buffers,
+memory, mapped windows, command pool and fence. `VSFEEL_NLMEANS_QUEUES` was
+computed by `resolve_queue_cap` and then discarded while every stream was pinned
+to `queues[0]`; the dead call and env var are gone and the single-queue
+requirement is documented at the assignment. The tile-reuse ordering and the
+cross-submission transfer -> shader visibility both depend on submission order
+on one queue, so wiring the knob would need semaphores in place of that
+guarantee. `test_nlmeans.py` passes.

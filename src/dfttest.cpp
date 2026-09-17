@@ -2504,12 +2504,16 @@ static void VS_CC DftCreate(
     }
 
     // Queue sharing is swept independently of the stream count (see
-    // resolve_queue_cap): override with VSFEEL_DFTTEST_QUEUES=N.
-    const uint32_t num_queues = resolve_queue_cap(d->num_streams,
-        d->device->queue_count, "VSFEEL_DFTTEST_QUEUES", 2);
+    // resolve_queue_cap): override with VSFEEL_DFTTEST_QUEUES=N. The cap is
+    // resolved from the in-flight stream count (effective_streams), not the
+    // user's num_streams, so the knob is reachable at the shipped default.
+    const uint32_t num_queues = resolve_queue_cap(effective_streams, d->device->queue_count, "VSFEEL_DFFTEST_QUEUES", 2);
 
     for (int i = 0; i < effective_streams; ++i) {
-        DFTTestResource resource;
+        // Owned by the pool while it is being built: a mid-loop error return
+        // tears it down in ~DftData instead of leaking it (see
+        // FramePool::emplace).
+        DFTTestResource & resource = d->pool.emplace();
 
         {
             VkBufferCreateInfo buffer_info {
@@ -2861,8 +2865,6 @@ static void VS_CC DftCreate(
         if (const auto err = record_fused_col2im_cb(*d, resource, true, true)) {
             return set_error(*err);
         }
-
-        d->pool.push(std::move(resource));
     }
 
     VSFilterDependency deps[1] = {

@@ -2608,3 +2608,10 @@ gather) is worth only +2.6% at this width, and `VSFEEL_EEDI3_COPY=0` (force
 cached stores on every gather) costs ~1% — full-width 32-byte AVX stores
 coalesce in the write-combining buffer, unlike the narrow scalar stores behind
 the old "27.6 fps" observation. Output bit-identical at 630/638/640 px.
+
+## Creation error path
+
+The per-stream `Eedi3Resource` is created into the pool via
+`FramePool::emplace()`, so an error return inside the creation loop is torn down
+by `~Eedi3Data` (buffers, device memory, mapped windows, command pool, query
+pool, fence) instead of leaking it. Correctness-only; the EEDI3 suites pass.

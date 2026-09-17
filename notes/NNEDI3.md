@@ -631,3 +631,10 @@ offset 0 + an arbitrary size, invalid on a non-coherent memory type). Creation
 also preflights the recorded `apiVersion` and reports
 `"NNEDI3 requires Vulkan 1.3 (device reports X.Y)"` instead of an opaque
 pipeline-creation failure. No behaviour change on this device; full suite green.
+
+## Creation error path
+
+The per-stream `Nnedi3Resource` is created into the pool via
+`FramePool::emplace()`, so an error return inside the creation loop is torn down
+by `~Nnedi3Data` (buffers, device memory, mapped windows, command buffers, query
+pool, fence) instead of leaking it. Correctness-only; `test_nnedi3.py` passes.

@@ -497,3 +497,18 @@ nlmeans ~425, bm3dv2 ~154 fps.
 dfttest submit migration detail: frame-start `vkResetFences` removed — the
 fence resets now happen inside submit_with_fence/submit_timeline under the
 queue lock at the fused submit; copies are fence-less timeline-waits.
+
+## Queue cap and creation error path
+
+`resolve_queue_cap` was called with `d->num_streams` (1 at the shipped default)
+while the loop creates `effective_streams` (= max(num_streams, 2)) resources, so
+the cap collapsed to 1 and `VSFEEL_DFFTEST_QUEUES` could never exceed it. It now
+resolves from `effective_streams`: with the knob unset the two in-flight streams
+go to two queues, `VSFEEL_DFFTEST_QUEUES=1` puts both on queue 0, and `=2/4`
+selects two (verified with a temporary `num_queues` print, since removed).
+Same-session interleaved A/B at the shipped default, 3 x 1000 frames
+(`bench.py --filter dfttest vsfeel`): two queues 1362.7/1377.1/1367.4 fps vs
+one queue 1298.5/1267.3/1278.3 — **+7.0%**, so the README row was updated. The
+per-stream resource is also created into the pool via `FramePool::emplace()`, so
+a creation error is torn down by `~DftData` instead of leaking. Full suite 600
+passed.

@@ -1471,10 +1471,8 @@ static void VS_CC NLMeansCreate(
     d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
     d->pool.reserve(d->num_streams);
 
-    // Queue sharing is swept independently of the stream count (see
-    // resolve_queue_cap): override with VSFEEL_NLMEANS_QUEUES=N.
-    uint32_t num_queues = resolve_queue_cap(d->num_streams,
-        d->device->queue_count, "VSFEEL_NLMEANS_QUEUES", UINT32_MAX);
+    // Streams are pinned to one shared queue (see the per-stream assignment
+    // below); the tile-reuse ordering depends on it.
 
     const int clips = d->has_ref ? 2 : 1;
     const VkDeviceSize slot_bytes_v =
@@ -1553,7 +1551,10 @@ static void VS_CC NLMeansCreate(
     const VkDeviceSize u5_bytes = npix_v * sizeof(float);
 
     for (int i = 0; i < d->num_streams; ++i) {
-        NLStream st;
+        // Owned by the pool while it is being built: a mid-loop error return
+        // tears it down in ~NLMeansData instead of leaking it (see
+        // FramePool::emplace).
+        NLStream & st = d->pool.emplace();
 
         // upload staging: new tiles plus the per-frame slot-base table
         {
@@ -1814,11 +1815,14 @@ static void VS_CC NLMeansCreate(
             vkUpdateDescriptorSets(dev, 10, writes, 0, nullptr);
         }
 
-        st.queue = d->device->queues[0].queue;  // TEMP: single-queue test
-        st.queue_lock = d->device->queues[0].lock.get();  // TEMP
+        // Every stream shares queue 0 by design. The shared-tile reuse protocol
+        // and the cross-submission transfer -> shader visibility are ordered by
+        // submission order on one VkQueue (the submit_count/submit_cv handshake
+        // at the writer/reader paths depends on it), so spreading streams over
+        // several queues would require semaphores in place of that guarantee.
+        st.queue = d->device->queues[0].queue;
+        st.queue_lock = d->device->queues[0].lock.get();
         st.stream_id = i;
-
-        d->pool.push(std::move(st));
     }
 
     NLMeansData * data = d.release();

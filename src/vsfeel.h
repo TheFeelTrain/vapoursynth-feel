@@ -262,6 +262,17 @@ struct FramePool {
         items.push_back(std::move(r));
     }
 
+    // Push-then-fill variant of push() for creation loops: the resource is
+    // owned by the pool from the moment it exists, so an early error return
+    // leaves it to be torn down by the filter destructor instead of
+    // abandoning its buffers, device memory, mapped windows, command pool and
+    // fence. The caller must have reserved capacity up front and must not
+    // touch the pool concurrently while filling the returned reference.
+    T & emplace() {
+        std::lock_guard guard(lock);
+        return items.emplace_back();
+    }
+
     T take() {
         semaphore.acquire();
         std::lock_guard guard(lock);

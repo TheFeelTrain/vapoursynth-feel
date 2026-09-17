@@ -210,4 +210,15 @@ SPIR-V change (first run of a new binary only); the steady medians differ by
 <0.5%, below the noise floor, and BM3D's recorded frame split is ~90% fence.
 README's BM3D row is therefore unchanged.
 
+## Frame error path
+
+A failed frame used to hand its stream back to the pool with GPU work still in
+flight, letting a successor re-record the command buffers and reuse the cache
+slots while the estimation/aggregation still read them. The error path now
+drains the stream's queue under its lock and resets the fence once the
+estimation has been submitted, and it host-signals the frame's timeline only
+when no estimation was submitted (otherwise the device signals it on completion
+and an early host signal would release the slots too soon). `test_bm3dv2.py`
+passes.
+
 

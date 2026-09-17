@@ -455,6 +455,7 @@ static const VSFrame *VS_CC BilateralGetFrame(
                 vsapi->freeFrame(ref);
             }
             vsapi->freeFrame(src);
+            vsapi->freeFrame(dst);
             return nullptr;
         };
 
@@ -1102,7 +1103,10 @@ static void VS_CC BilateralCreate(
     }
 
     for (int i = 0; i < d->num_streams; ++i) {
-        BilateralResource resource;
+        // Owned by the pool while it is being built: a mid-loop error return
+        // tears it down in ~BilateralData instead of leaking it (see
+        // FramePool::emplace).
+        BilateralResource & resource = d->pool.emplace();
 
         {
             VkBufferCreateInfo buffer_info {
@@ -1301,8 +1305,6 @@ static void VS_CC BilateralCreate(
         if (const auto err = record_command_buffer(*d, resource)) {
             return set_error(*err);
         }
-
-        d->pool.push(std::move(resource));
     }
 
     VSFilterDependency deps[2] = {{d->node, rpStrictSpatial}};

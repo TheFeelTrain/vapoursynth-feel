@@ -246,3 +246,12 @@ so a kernel could see stale or partially written input. An unconditional
 EEDI3/NNEDI3. The requirement is documented on `copy_stream_out` /
 `copy_plane_out` in `vsfeel.h`. Correctness-only change, no fps effect
 expected; `test_bilateral.py` passes.
+
+## Creation and frame error paths
+
+The per-stream resource is created straight into the pool
+(`FramePool::emplace()`), so any error return inside the creation loop leaves it
+to `~BilateralData` instead of abandoning its buffers, device memory, command
+pool, fence and mapped windows. The frame-path `set_error` also frees `dst`,
+which used to leak one full output frame per failed frame. Correctness-only; the
+full suite passes.
