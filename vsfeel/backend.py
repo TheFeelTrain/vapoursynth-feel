@@ -95,9 +95,10 @@ class FeelBackend:
     """Override for the plugin's ``num_streams`` argument.
 
     ``None`` (the default) leaves the argument unset, so every filter uses its
-    own plugin default (DFTTest/NLMeans 1, Bilateral/BM3Dv2 4). Set this to an
-    int to force one value for all filters, or pass ``num_streams=`` to a
-    wrapper for a single call — an explicit wrapper keyword always wins."""
+    own plugin default (DFTTest 1; NLMeans 2; Bilateral/BM3Dv2/GaussBlur/NNEDI3
+    4; EEDI3 8). Set this to an int to force one value for all filters, or pass
+    ``num_streams=`` to a wrapper for a single call — an explicit wrapper
+    keyword always wins."""
 
     def resolve(self) -> Self:
         """Resolve this backend to itself.

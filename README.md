@@ -138,7 +138,7 @@ core.vsfeel.EEDI3(clip clip, int field[,   # and EEDI3H, same args, horizontal
 core.vsfeel.GaussBlur(clip clip[,
     float[] sigma=0.5,              # blur strength; per-plane, chroma default = sigma[0]/sqrt((1<<ssw)*(1<<ssh))
     int     device_id=0, 
-    int     num_streams=1])
+    int     num_streams=4])
 ```
 
 ### NLMeans
@@ -158,7 +158,7 @@ core.vsfeel.NLMeans(clip clip[,
     float   wref=1.0,               # >= 0: weight of the pixel itself
     string  channels="auto",        # planes to process, jointly for YUV/RGB; auto picks by format
     int     device_id=0, 
-    int     num_streams=1])
+    int     num_streams=2])
 ```
 `channels="YUV"` requires 4:4:4 so on subsampled clips run a `"Y"` pass and a `"UV"` pass instead.
 

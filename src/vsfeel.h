@@ -53,6 +53,29 @@ struct ticket_semaphore {
     }
 };
 
+// Env flags. Every filter flag goes through one of these so the naming and the
+// `getenv` parsing live in a single place; each filter keeps its own names
+// (VSFEEL_DFTTEST_TRACE, VSFEEL_BM3D_TRACE, ...) so flipping one filter's
+// debugging never affects another.
+inline bool env_flag(const char * env) {
+    return std::getenv(env) != nullptr;
+}
+
+inline int env_int(const char * env, int default_value) {
+    const char * v = std::getenv(env);
+    if (!v || !*v) {
+        return default_value;
+    }
+    char * end = nullptr;
+    const long parsed = std::strtol(v, &end, 10);
+    return end != v ? static_cast<int>(parsed) : default_value;
+}
+
+inline const char * env_str(const char * env) {
+    const char * v = std::getenv(env);
+    return (v && *v) ? v : nullptr;
+}
+
 const char * vk_result_string(VkResult result);
 
 // Queue sharing: cap how many of the device's compute queues the filter's
@@ -66,11 +89,8 @@ inline uint32_t resolve_queue_cap(int num_streams, uint32_t queue_count,
                                   const char * env_name, uint32_t default_cap) {
     const uint32_t streams = static_cast<uint32_t>(std::max(num_streams, 1));
     uint32_t cap = std::min({ streams, queue_count, default_cap });
-    if (const char * qn = std::getenv(env_name)) {
-        const int q = atoi(qn);
-        if (q > 0) {
-            cap = std::min({ streams, queue_count, static_cast<uint32_t>(q) });
-        }
+    if (const int q = env_int(env_name, 0); q > 0) {
+        cap = std::min({ streams, queue_count, static_cast<uint32_t>(q) });
     }
     return std::max(cap, 1u);
 }
@@ -420,13 +440,6 @@ inline VkResult submit_timeline(
         .pSignalSemaphores = signal_sem != VK_NULL_HANDLE ? &signal_sem : nullptr
     };
     return vkQueueSubmit(queue, 1, &submit_info, fence);
-}
-
-// Env-gated trace/behavior flag. Each filter keeps its own env names
-// (VSFEEL_DFTTEST_TRACE, BM3D_TRACE, NLMEANS_TRACE, BILATERAL_NOCPU, ...)
-// so flipping one filter's debugging never affects another.
-inline bool trace_on(const char * env) {
-    return std::getenv(env) != nullptr;
 }
 
 // ---------------------------------------------------------------------------

@@ -404,7 +404,7 @@ static void acquire_cache(NLMeansData * d, NLStream & st, int n,
     st.wait_subs_streams.clear();
     st.wait_subs_gen.clear();
     // DEBUG: NLMEANS_FORCE_PAD=1 disables slot reuse entirely
-    const bool force_pad = std::getenv("NLMEANS_FORCE_PAD") != nullptr;
+    const bool force_pad = env_flag("VSFEEL_NLMEANS_FORCE_PAD") || env_flag("NLMEANS_FORCE_PAD");
 
     std::unique_lock lock(d->cache_lock);
     for (;;) {
@@ -645,7 +645,7 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         return static_cast<const VSFrame *>(nullptr);
     };
 
-    const bool trace = std::getenv("NLMEANS_TRACE") != nullptr;
+    const bool trace = env_flag("VSFEEL_NLMEANS_TRACE") || env_flag("NLMEANS_TRACE");
     auto now_us = [] {
         return std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -653,8 +653,8 @@ static const VSFrame *VS_CC NLMeansGetFrame(
     static std::atomic<uint64_t> t_up {}, t_sub {}, t_wait {}, t_dl {};
     static std::atomic<uint32_t> t_nf {};
     static std::atomic<uint64_t> t_acq {}, t_comp {}, t_tab {};
-    const bool trace2 = std::getenv("NLMEANS_TRACE") &&
-        std::string(std::getenv("NLMEANS_TRACE")) == "2";
+    const bool trace2 = env_int("VSFEEL_NLMEANS_TRACE",
+        env_int("NLMEANS_TRACE", 0)) == 2;
     uint64_t t0 = now_us();
     auto mark = [&](std::atomic<uint64_t> & acc) { acc += now_us() - t0; t0 = now_us(); };
 
@@ -695,7 +695,7 @@ static const VSFrame *VS_CC NLMeansGetFrame(
             static_cast<size_t>(d->pstride) * d->elem_bytes;
 
         // probe: time the pure compose memcpy (NLMEANS_PROBE)
-        const bool probe = std::getenv("NLMEANS_PROBE") != nullptr;
+        const bool probe = env_flag("VSFEEL_NLMEANS_PROBE") || env_flag("NLMEANS_PROBE");
         uint64_t pr0 = probe ? now_us() : 0;
         uint64_t pr_bytes = 0;
         size_t pi = 0;
@@ -970,7 +970,7 @@ static const VSFrame *VS_CC NLMeansGetFrame(
     }
     mark(t_wait);
 
-    if (d->dbg_slots_map && std::getenv("NLMEANS_DBG")) {
+    if (d->dbg_slots_map && (env_flag("VSFEEL_NLMEANS_DBG") || env_flag("NLMEANS_DBG"))) {
         fprintf(stderr, "[chk] n=%d:", n);
         for (size_t ti = 0; ti < stream.win_slots.size(); ++ti) {
             const int64_t base = static_cast<int64_t>(stream.win_slots[ti]) *
@@ -1192,7 +1192,7 @@ static void VS_CC NLMeansCreate(
 
     d->num_streams = vsh::int64ToIntS(vsapi->mapGetInt(in, "num_streams", 0, &error));
     if (error) {
-        d->num_streams = 1;
+        d->num_streams = 2;
     }
     if (d->num_streams < 1 || d->num_streams > 32) {
         return set_error("num_streams must be 1..32.");
@@ -1290,8 +1290,9 @@ static void VS_CC NLMeansCreate(
         constexpr int64_t U4A_RING_BUDGET = 64LL << 20;
         int64_t pack = U4A_RING_BUDGET / std::max<int64_t>(bytes_per_pack, 1);
         pack = std::clamp<int64_t>(pack, 1, 16384);
-        if (const char * env = std::getenv("NLMEANS_PACK")) {
-            pack = std::clamp<int64_t>(atoll(env), 1, 16384);
+        const int pack_env = env_int("VSFEEL_NLMEANS_PACK", env_int("NLMEANS_PACK", 0));
+        if (pack_env > 0) {
+            pack = std::clamp<int64_t>(pack_env, 1, 16384);
         }
         d->pack = static_cast<uint32_t>(pack);
     }
@@ -1368,7 +1369,7 @@ static void VS_CC NLMeansCreate(
             return set_error(std::get<std::string>(result));
         }
         d->device = std::get<std::shared_ptr<VK_Device>>(result);
-    d->gputrace = std::getenv("NLMEANS_GPUTRACE") != nullptr;
+    d->gputrace = env_flag("VSFEEL_NLMEANS_GPUTRACE") || env_flag("NLMEANS_GPUTRACE");
     }
 
     VkDevice dev = d->device->device;
@@ -1619,7 +1620,7 @@ static void VS_CC NLMeansCreate(
         }
         d->slots_buf = std::get<VkBuffer>(result);
     }
-    const bool dbg_pool = std::getenv("NLMEANS_DBG") != nullptr;
+    const bool dbg_pool = env_flag("VSFEEL_NLMEANS_DBG") || env_flag("NLMEANS_DBG");
     if (auto err = bind_memory(*d, d->slots_buf, d->slots_mem,
             dbg_pool ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
@@ -1660,7 +1661,7 @@ static void VS_CC NLMeansCreate(
             return set_error(err);
         }
 
-        if (std::getenv("NLMEANS_PROBE") && i == 0) {
+        if ((env_flag("VSFEEL_NLMEANS_PROBE") || env_flag("NLMEANS_PROBE")) && i == 0) {
             const auto & mp = d->device->mem_props;
             fprintf(stderr, "[mem] staging type=%u flags=0x%x heap=%u (flags=0x%x size=%zuMB)\n",
                 st.staging_type_index,

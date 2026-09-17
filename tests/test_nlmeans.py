@@ -15,7 +15,7 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    NOISE_MKV, assert_gray32, format_dtype, frame_to_ndarray, plane_to_ndarray,
+    NOISE_MKV, assert_gray32, format_dtype, plane_to_ndarray,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")

@@ -376,7 +376,7 @@ struct Nnedi3Data {
     std::atomic<uint64_t> t_ts_copy {};
     std::atomic<uint64_t> t_ts_n {};
     ~Nnedi3Data() {
-        if (trace_on("VSFEEL_NNEDI3_BENCH") && t_frames.load() > 0) {
+        if (env_flag("VSFEEL_NNEDI3_BENCH") && t_frames.load() > 0) {
             const double n = static_cast<double>(t_frames.load());
             fprintf(stderr,
                 "[nnedi3-bench] per-frame us: record=%7.1f pack=%7.1f "
@@ -386,7 +386,7 @@ struct Nnedi3Data {
                 t_wait.load() / 1000.0 / n, t_setup.load() / 1000.0 / n,
                 t_kept.load() / 1000.0 / n, t_interp.load() / 1000.0 / n, n);
         }
-        if (trace_on("VSFEEL_NNEDI3_TSTAMP") && t_ts_n.load() > 0) {
+        if (env_flag("VSFEEL_NNEDI3_TSTAMP") && t_ts_n.load() > 0) {
             const double n = static_cast<double>(t_ts_n.load());
             fprintf(stderr,
                 "[nnedi3-ts] GPU us: pre=%7.1f pred=%7.1f copy=%7.1f (frames=%.0f)\n",
@@ -853,7 +853,7 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
         // memcpy (cached src, write-once dst).
         {
             const size_t bps_kept = static_cast<size_t>(d->elem_bytes);
-            const bool bench_kept = trace_on("VSFEEL_NNEDI3_BENCH");
+            const bool bench_kept = env_flag("VSFEEL_NNEDI3_BENCH");
             const auto t_kept0 = bench_kept ? std::chrono::steady_clock::now()
                                             : std::chrono::steady_clock::time_point {};
             for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
@@ -902,7 +902,7 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
         // early give_back in the interleave section (the resource is moved
         // from at that point).
         const size_t bps = static_cast<size_t>(d->elem_bytes);
-        const bool bench = trace_on("VSFEEL_NNEDI3_BENCH");
+        const bool bench = env_flag("VSFEEL_NNEDI3_BENCH");
         const auto now = std::chrono::steady_clock::now;
         auto t_prev = now();
         auto bump = [&](std::atomic<uint64_t> & acc) {
@@ -1001,7 +1001,7 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
             }
         }
 
-        if (trace_on("VSFEEL_NNEDI3_COUNT")) {
+        if (env_flag("VSFEEL_NNEDI3_COUNT")) {
             // one-off count readback: extra submit, perturbs timing
             VkCommandBuffer count_cb;
             VkCommandBufferAllocateInfo ainfo {
@@ -1048,7 +1048,7 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
         // wait no longer serializes them; stride-2 scatter from the tight
         // staging rows.
         // VSFEEL_NNEDI3_SKIPIL=1 skips the copies (timing only, garbage out).
-        const bool skip_il = getenv("VSFEEL_NNEDI3_SKIPIL") != nullptr;
+        const bool skip_il = env_flag("VSFEEL_NNEDI3_SKIPIL");
         const uint8_t * frame_base = map;
         for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
             const auto & cfg = d->planes[plane];
@@ -1291,7 +1291,7 @@ static void VS_CC Nnedi3Create(
 
     auto d { std::make_unique<Nnedi3Data>() };
 
-    d->gpu_trace = trace_on("VSFEEL_NNEDI3_TSTAMP");
+    d->gpu_trace = env_flag("VSFEEL_NNEDI3_TSTAMP");
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);

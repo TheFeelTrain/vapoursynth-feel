@@ -214,18 +214,34 @@ Status: **shipped.** Verified against `src/nlmeans.{cpp,comp}` and
 
 ## Debug env vars
 
-- `NLMEANS_TRACE=1` — `[perf]` host phase averages every 100 frames
+Flags are `VSFEEL_NLMEANS_<FLAG>`; the pre-standardisation `NLMEANS_<FLAG>`
+spelling still works for one release (read as a fallback, so the new name wins).
+
+- `VSFEEL_NLMEANS_TRACE=1` — `[perf]` host phase averages every 100 frames
   (up/sub/wait/dl); `=2` adds per-phase acq/comp/tab splits and `[grow]`.
-- `NLMEANS_GPUTRACE=1` — per-frame GPU timestamp splits per W/A dispatch.
-- `NLMEANS_PACK=N` — entries per W/A round (clamped 1..16384; default from the
-  64 MiB ring budget).
-- `NLMEANS_FORCE_PAD=1` — disables slot reuse entirely. **Currently crashes**
+- `VSFEEL_NLMEANS_GPUTRACE=1` — per-frame GPU timestamp splits per W/A dispatch.
+- `VSFEEL_NLMEANS_PACK=N` — entries per W/A round (clamped 1..16384; default from
+  the 64 MiB ring budget).
+- `VSFEEL_NLMEANS_FORCE_PAD=1` — disables slot reuse entirely. **Currently crashes**
   (heap corruption: the acquire loop leaves `chosen[ti] = -1` and phase 2
   indexes `cache[-1]`, pre-existing). No test uses it.
-- `NLMEANS_PROBE=1` — page the slots map. `NLMEANS_DBG=1` — dump the slot map
-  and use the debug pool.
+- `VSFEEL_NLMEANS_PROBE=1` — page the slots map. `VSFEEL_NLMEANS_DBG=1` — dump the
+  slot map and use the debug pool.
 - `NLMEANS_TS_MAX` (130) and `NLMEANS_TS_RESERVED` (4) are C++ constants in
   `nlmeans.cpp`, and `NLMEANS_PROBE_ACC_NOSRC` is a compile-time `-D` in
   `nlmeans.comp` — none of the three is an env var.
-- `NLMEANS_PACK` is the only runtime tuning knob; there is no queue knob.
+- `VSFEEL_NLMEANS_PACK` is the only runtime tuning knob; there is no queue knob.
 - `RADV_DEBUG=asm` / `RADV_DEBUG=shaderstats` work on this Mesa build.
+
+## Default num_streams 1 -> 2
+
+ns=1 is the "cannot overlap" case (the same one DFTTest refuses to ship, having
+an in-flight floor of 2). Same-session sweep on the current binary, 500 cached
+real-clip frames x3 (medians, bench channels='UV'): ns=1 548.59, ns=2 842.58,
+ns=4 838.14 — a 1.54x win at ns=2, and ns=4 is *not* better. The benchmark
+already used 2; the plugin default now matches it (and the README table).
+
+Per-stream cost is ~100 MiB at 1080p YUV420P16 d=2/a=2/s=4 (sysfs deltas):
+default 200.6 MiB == explicit ns=2 206.7, ns=1 107.6, ns=4 404.8. The 512 MiB
+slot-pool budget is unchanged and the created configs still satisfy the
+one-full-window requirement; streams stay pinned to the single shared queue.

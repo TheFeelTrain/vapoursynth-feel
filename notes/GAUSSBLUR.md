@@ -99,3 +99,13 @@ unconditional `_mm_sfence()` now sits before `submit_with_fence`. Creation
 errors are torn down by `~GaussData` via `FramePool::emplace()`, and the
 frame-path `set_error` frees `dst`. All correctness-only; `test_gaussblur.py`
 passes.
+
+## Default num_streams 1 -> 4
+
+The plugin shipped `num_streams=1`, the "cannot overlap" case: per-stream cost
+at 1080p is ~12 MiB (measured from sysfs VRAM deltas), and the frame is
+host-bound at one stream. Same-session sweep on the current binary, 500 cached
+real-clip frames x3 (medians): ns=1 1236.21, ns=4 2495.18, ns=8 2254.66
+(synthetic 400f: 1071 / 2111 / 2255). ns=4 is the knee — 2.0x at 1/4 of ns=8's
+VRAM. The benchmark already used 4; the plugin default now matches it (and the
+README table), which is why the committed performance row is unchanged.

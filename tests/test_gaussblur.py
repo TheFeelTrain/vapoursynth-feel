@@ -22,7 +22,7 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_gray32, compare_or_skip,
+    WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, compare_or_skip,
     frame_to_ndarray, plane_to_ndarray,
 )
 

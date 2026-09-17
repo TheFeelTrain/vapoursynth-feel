@@ -337,7 +337,7 @@ static std::optional<std::string> record_command_buffer(
                 0, sizeof(push_constants), push_constants);
         }
         vkCmdDispatch(resource.cmd, cfg.grid_x, cfg.grid_y, 1);
-        if (std::getenv("BILATERAL_NODISPATCH")) {
+        if (env_flag("VSFEEL_BILAT_NODISPATCH") || env_flag("BILATERAL_NODISPATCH")) {
             vkCmdDispatch(resource.cmd, 1, 1, 1);
         }
     }
@@ -402,7 +402,7 @@ static const VSFrame *VS_CC BilateralGetFrame(
             // Host phase probe (VSFEEL_BILAT_TRACE): accumulated microsecond
             // stage timings, reported as averages every 200 frames. Zero
             // overhead when unset (no clock reads, no atomic traffic).
-            static const bool trace = trace_on("VSFEEL_BILAT_TRACE");
+            static const bool trace = env_flag("VSFEEL_BILAT_TRACE");
             static std::atomic<uint64_t> t_up {}, t_wait {}, t_dl {}, t_bit {}, t_sub {}, t_acq {};
             static std::atomic<uint32_t> t_nf {};
             static std::atomic<int> t_inf {}, t_peak {};
@@ -464,8 +464,8 @@ static const VSFrame *VS_CC BilateralGetFrame(
             !!(d->device->mem_props.memoryTypes[resource.staging_type_index].propertyFlags &
                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-        const bool nocpu = std::getenv("BILATERAL_NOCPU") != nullptr;
-        const bool nodl = std::getenv("BILATERAL_NODL") != nullptr;
+        const bool nocpu = env_flag("VSFEEL_BILAT_NOCPU") || env_flag("BILATERAL_NOCPU");
+        const bool nodl = env_flag("VSFEEL_BILAT_NODL") || env_flag("BILATERAL_NODL");
 
         // the upload target is either the host-mapped VRAM src window
         // (host-direct path: the bytes land in VRAM with no GPU copy) or the
@@ -1073,11 +1073,11 @@ static void VS_CC BilateralCreate(
     // host-direct upload: the CPU memcpy writes the host-mapped VRAM src
     // window directly (no GPU-side H2D copy); opt out with VSFEEL_BILAT_HD=0
     // (plain VRAM src + staging upload + in-CB copy)
-    d->host_direct_upload = !getenv("VSFEEL_BILAT_HD") || atoi(getenv("VSFEEL_BILAT_HD")) != 0;
+    d->host_direct_upload = env_int("VSFEEL_BILAT_HD", 1) != 0;
     // kernel-direct download: the bilateral kernels' plain coalesced stores
     // write the GTT staging download region over PCIe directly, removing the
     // GPU-side D2H copy; opt out with VSFEEL_BILAT_KD=0 for the VRAM+copy path
-    d->kd_download = !getenv("VSFEEL_BILAT_KD") || atoi(getenv("VSFEEL_BILAT_KD")) != 0;
+    d->kd_download = env_int("VSFEEL_BILAT_KD", 1) != 0;
     d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
     d->pool.reserve(d->num_streams);
 
@@ -1088,17 +1088,8 @@ static void VS_CC BilateralCreate(
     // streams keeps a next CB queued (ns=4: 2 queues = 1986 fps vs 4 queues
     // = 1709 fps). Beyond 2 the gains stop (lock/CP overhead). Override
     // with VSFEEL_BILAT_QUEUES=N for tuning.
-    uint32_t num_queues = std::min({
-        d->num_streams, static_cast<int>(d->device->queue_count), 2 });
-    if (const char * qn = std::getenv("VSFEEL_BILAT_QUEUES")) {
-        const int q = atoi(qn);
-        if (q > 0) {
-            num_queues = std::min<uint32_t>(
-                static_cast<uint32_t>(d->num_streams),
-                std::min<uint32_t>(static_cast<uint32_t>(q),
-                    d->device->queue_count));
-        }
-    }
+    uint32_t num_queues = resolve_queue_cap(
+        d->num_streams, d->device->queue_count, "VSFEEL_BILAT_QUEUES", 2);
 
     for (int i = 0; i < d->num_streams; ++i) {
         // Owned by the pool while it is being built: a mid-loop error return
@@ -1127,7 +1118,7 @@ static void VS_CC BilateralCreate(
         {
             const auto result = allocate_memory(
                 *d->device, resource.staging,
-                std::getenv("BILATERAL_NOCPU")
+                (env_flag("VSFEEL_BILAT_NOCPU") || env_flag("BILATERAL_NOCPU"))
                     ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
                     : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
@@ -1291,7 +1282,7 @@ static void VS_CC BilateralCreate(
             vkUpdateDescriptorSets(dev, 2, writes, 0, nullptr);
         }
 
-        if (!std::getenv("BILATERAL_NOCPU")) {
+        if (!(env_flag("VSFEEL_BILAT_NOCPU") || env_flag("BILATERAL_NOCPU"))) {
             checkVK(vkMapMemory(dev, resource.staging_mem, 0, staging_size, 0, reinterpret_cast<void **>(&resource.map)));
         } else {
             resource.map = nullptr;

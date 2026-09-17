@@ -18,14 +18,12 @@ Agreement measured on the noise clip:
 Run from the repository root:  python -m pytest tests/test_eedi3h.py
 """
 
-import ctypes
-
 import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import WIDTH, HEIGHT, NOISE_MKV, frame_to_ndarray
-from test_eedi3 import _plane, _dtype, _itemsize
+from conftest import WIDTH, HEIGHT
+from test_eedi3 import _plane
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
 

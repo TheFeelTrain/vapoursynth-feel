@@ -318,18 +318,29 @@ class FilterSpec:
     title: str
     default_frames: int
     args: list[Arg]
-    build: Callable[[argparse.Namespace, str], dict[str, str]]
+    build: Callable[[argparse.Namespace, str, "FilterSpec"], dict[str, str]]
     input: str = "depth(get_y(clip), 16)"  # clip expression the filter is applied to
     synth_format: str | None = "vs.GRAY16"  # BlankClip format for --synthetic (None disables)
-    default_streams: int = 4  # num_streams when --num-streams is not given
+    default_streams: int = 4  # bench --num-streams default; see resolve_streams()
     # When set, the real-clip benchmark uses a custom vpy (see make_aa_vpy) that
     # doubles the input with a Point upscale and feeds the filter auxiliary clips
     # derived from it. Only sensible for EEDI3-style AA benchmarks.
     aa: bool = False
 
 
-def _bm3d_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
-    ns_num = ns.num_streams if ns.num_streams is not None else 4
+def resolve_streams(spec: FilterSpec, ns: argparse.Namespace) -> int:
+    """The one place the benchmark decides which ``num_streams`` it passes.
+
+    Builders, ``args_desc`` and the ``--streams`` sweep all call this, so the
+    printed header and the value actually handed to each plugin cannot drift
+    apart. ``--num-streams`` wins when given; otherwise the filter spec's
+    ``default_streams`` is the single source of truth.
+    """
+    return ns.num_streams if ns.num_streams is not None else spec.default_streams
+
+
+def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
+    ns_num = resolve_streams(spec, ns)
     common = (
         f"sigma={ns.bm3d_sigma}, radius={ns.bm3d_radius}, "
         f"bm_range={ns.bm3d_bm_range}, ps_range={ns.bm3d_ps_range}, "
@@ -344,8 +355,8 @@ def _bm3d_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     }
 
 
-def _bilateral_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
-    ns_num = ns.num_streams if ns.num_streams is not None else 4
+def _bilateral_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
+    ns_num = resolve_streams(spec, ns)
     args = (
         f"sigma_spatial={ns.bilateral_sigma_spatial}, "
         f"sigma_color={ns.bilateral_sigma_color}, num_streams={ns_num}"
@@ -358,8 +369,8 @@ def _bilateral_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     }
 
 
-def _gauss_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
-    ns_num = ns.num_streams if ns.num_streams is not None else 4
+def _gauss_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
+    ns_num = resolve_streams(spec, ns)
     args = f"sigma={ns.gauss_sigma}, num_streams={ns_num}"
     return {
         "vsfeel": f"core.vsfeel.GaussBlur({clip}, {args})",
@@ -368,11 +379,10 @@ def _gauss_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     }
 
 
-def _dfttest_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
-    # all three plugins share the vszipcu parameter surface; the references
-    # default num_streams to 1, so this filter honours the global --num-streams
-    # only when explicitly given (defaulting to 1 otherwise)
-    num_streams = ns.num_streams if ns.num_streams is not None else 1
+def _dfttest_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
+    # all three plugins share the vszipcu parameter surface; FilterSpec's
+    # default_streams=1 keeps the benchmark on the references' own default
+    num_streams = resolve_streams(spec, ns)
     args = (
         f"ftype={ns.dfttest_ftype}, sigma={ns.dfttest_sigma}, sigma2={ns.dfttest_sigma2}, "
         f"pmin={ns.dfttest_pmin}, pmax={ns.dfttest_pmax}, sbsize=16, sosize={ns.dfttest_sosize}, "
@@ -387,8 +397,8 @@ def _dfttest_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     }
 
 
-def _nlmeans_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
-    ns_num = ns.num_streams if ns.num_streams is not None else 2
+def _nlmeans_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
+    ns_num = resolve_streams(spec, ns)
     args = (
         f"d={ns.nlmeans_d}, a={ns.nlmeans_a}, s={ns.nlmeans_s}, h={ns.nlmeans_h}, "
         f"wmode={ns.nlmeans_wmode}, wref={ns.nlmeans_wref}, channels='UV', "
@@ -402,7 +412,7 @@ def _nlmeans_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     }
 
 
-def _eedi3_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
+def _eedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
     """EEDI3 anti-aliasing chain (mirrors vsaa.based_aa defaults).
 
     Real-clip runs (aa FilterSpec) use make_aa_vpy, which defines `clip`
@@ -412,7 +422,7 @@ def _eedi3_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     --eedi3-mclip 0 drops the mclip from the vsfeel/eedi3vk2 calls.
 
     """
-    ns_num = ns.num_streams if ns.num_streams is not None else 8
+    ns_num = resolve_streams(spec, ns)
     use_mclip = getattr(ns, "eedi3_mclip", True)
     common = (
         f"field={ns.eedi3_field}, mdis={ns.eedi3_mdis}, nrad={ns.eedi3_nrad}, "
@@ -456,7 +466,7 @@ def _vsaa_eedi3_backend(plugin: str) -> str | None:
     return next((m.name for m in _VsaaEEDI3.Backend if m.value == plugin), None)
 
 
-def _eedi3aa_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
+def _eedi3aa_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
     """The fused based_aa EEDI3 chain: vsfeel.EEDI3AA vs based_aa's own chain.
 
     ``vsfeel`` runs the fused single call. Every reference plugin runs the
@@ -476,7 +486,7 @@ def _eedi3aa_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     single-rate ``clip`` as sclip, which is what based_aa does (its
     antialiaser interleaves it itself).
     """
-    ns_num = ns.num_streams if ns.num_streams is not None else 8
+    ns_num = resolve_streams(spec, ns)
     use_mclip = getattr(ns, "eedi3_mclip", True)
     field = ns.eedi3_field
     if field <= 1:
@@ -544,8 +554,8 @@ def _eedi3aa_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
     return out
 
 
-def _nnedi3_build(ns: argparse.Namespace, clip: str) -> dict[str, str]:
-    ns_num = ns.num_streams if ns.num_streams is not None else 4
+def _nnedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
+    ns_num = resolve_streams(spec, ns)
     common = (
         f"field={ns.nnedi3_field}, dh={ns.nnedi3_dh}, "
         f"nsize={ns.nnedi3_nsize}, nns={ns.nnedi3_nns}, qual={ns.nnedi3_qual}, "
@@ -826,8 +836,7 @@ def _fmt_stats(values: list[float]) -> str:
 
 def args_desc(spec: FilterSpec, ns: argparse.Namespace) -> str:
     pairs = [f"{a.key}={getattr(ns, a.dest)}" for a in spec.args]
-    num = ns.num_streams if ns.num_streams is not None else spec.default_streams
-    pairs.append(f"num_streams={num}")
+    pairs.append(f"num_streams={resolve_streams(spec, ns)}")
     return ", ".join(pairs)
 
 
@@ -855,11 +864,11 @@ def _input_for_bits(expr: str, bits: int) -> str:
 def _cache_desc(spec: FilterSpec, ns: argparse.Namespace, synth: str | None,
                 cache_frames: int | None) -> str:
     if synth is not None:
-        return "cache: n/a (synthetic BlankClip)"
+        return "cache: N/A (BlankClip)"
     if cache_frames is None:
-        return "cache: live decode (no preload)"
+        return "cache: N/A"
     if spec.aa:
-        return (f"cache: AA 2x luma+mask, up to {cache_frames} frames, "
+        return (f"cache: 2x luma+mclip"
                 f"{ns.aa_cache_mb} MiB byte budget")
     return f"cache: first {cache_frames} frames"
 
@@ -923,18 +932,17 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
     sweep: dict[int | None, dict[str, float]] = {}
     for streams in streams_values:
         ns.num_streams = streams
-        calls = spec.build(ns, input_expr)
+        calls = spec.build(ns, input_expr, spec)
         plugins = resolve_plugins(ns.plugins or list(calls), calls, spec.title)
         plugins = _resolve_pair(ns, calls, plugins, spec.title)
         if not plugins:
             sys.exit(f"no valid plugins requested for --filter {ns.filter}")
         if not order:
             order = plugins
-        order_note = "order alternates" if ns.interleave else "fixed order"
         print(f"{spec.title} benchmark | {frames} frames | clip: {clip_desc}{bits_desc}")
         print(f"args: {args_desc(spec, ns)}")
         print(f"{_cache_desc(spec, ns, synth, cache_frames)} | "
-              f"repeat: {ns.repeat} ({order_note}) | timeout: {ns.timeout:g}s\n")
+              f"repeat: {ns.repeat} | timeout: {ns.timeout:g}s\n")
 
         runs: dict[str, list[float]] = {p: [] for p in plugins}
         for r in range(ns.repeat):
@@ -1037,7 +1045,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frames", type=int, default=None,
                         help="frames to time (default: per-filter, see FILTERS)")
     parser.add_argument("--num-streams", type=int, default=None,
-                        help="num_streams passed to the filters (default: 1, or the reference default)")
+                        help="num_streams passed to the filters (default: each "
+                             "filter's bench default, see FilterSpec.default_streams)")
     parser.add_argument("--clip", default=DEFAULT_CLIP, help="input clip path")
     parser.add_argument("--synthetic", action="store_true",
                         help="use a synthetic 1920x1080 BlankClip instead of --clip "

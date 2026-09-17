@@ -7,7 +7,6 @@ unmodified vs-jetpack wrappers.
 
 import numpy as np
 import pytest
-import vapoursynth as vs
 
 from conftest import frame_to_ndarray
 

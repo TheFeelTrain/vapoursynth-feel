@@ -153,7 +153,7 @@ static void load_pipeline_cache(VK_Device & dev) {
     VkResult result = vkCreatePipelineCache(dev.device, &cache_info, nullptr, &dev.pipeline_cache);
     if (result != VK_SUCCESS && !initial.empty()) {
         // corrupt/stale/foreign cache data: start clean rather than failing
-        if (trace_on("VSFEEL_DBG")) {
+        if (env_flag("VSFEEL_DBG")) {
             fprintf(stderr, "[vsfeel] pipeline cache rejected (%s), starting empty\n",
                 vk_result_string(result));
         }
@@ -166,7 +166,7 @@ static void load_pipeline_cache(VK_Device & dev) {
         dev.pipeline_cache_path.clear();
         return;
     }
-    if (trace_on("VSFEEL_DBG")) {
+    if (env_flag("VSFEEL_DBG")) {
         fprintf(stderr, "[vsfeel] pipeline cache %s (%zu B loaded)\n",
             dev.pipeline_cache_path.c_str(), initial.size());
     }
@@ -344,7 +344,7 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     }
     dev->subgroup_size_control =
         subgroup_ok && dev->min_subgroup_size <= 32 && 32 <= dev->max_subgroup_size;
-    if (trace_on("VSFEEL_DBG")) {
+    if (env_flag("VSFEEL_DBG")) {
         fprintf(stderr, "[vsfeel] api_version=%u.%u subgroup_size_control=%d min=%u max=%u\n",
             VK_API_VERSION_MAJOR(dev->api_version), VK_API_VERSION_MINOR(dev->api_version),
             dev->subgroup_size_control, dev->min_subgroup_size, dev->max_subgroup_size);
@@ -369,7 +369,7 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
         vkGetPhysicalDeviceProperties2(dev->physical_device, &p2);
         dev->host_pointer_alignment = host_props.minImportedHostPointerAlignment;
     }
-    if (trace_on("VSFEEL_DBG")) {
+    if (env_flag("VSFEEL_DBG")) {
         fprintf(stderr, "[vsfeel] host_import=%d min_align=%llu\n",
             dev->host_import,
             (unsigned long long)dev->host_pointer_alignment);
@@ -564,7 +564,7 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     // seed the persistent pipeline cache so filter creation does not recompile
     // the shaders in every process
     load_pipeline_cache(*dev);
-    if (trace_on("VSFEEL_DBG")) {
+    if (env_flag("VSFEEL_DBG")) {
         // One banner per device: enough to tell which build, GPU, driver and
         // cache file a run is actually using.
         fprintf(stderr,

@@ -33,7 +33,6 @@ Run from the repository root:  python -m pytest tests/test_eedi3.py
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import textwrap
@@ -101,7 +100,6 @@ def _eval_parallel(clip, field=1, num_streams=4, **kwargs):
     out = _run(clip, field=field, num_streams=num_streams, **kwargs)
     frames = [None] * out.num_frames
     bits = 16 if clip.format.sample_type == vs.INTEGER else 32
-    it = _itemsize(bits)
     dtype = _dtype(bits)
 
     def worker(n):
@@ -661,7 +659,6 @@ def test_eedi3_yuv_passthrough_32bit(noise_gray):
 def test_eedi3_dh_doubles_height():
     """dh=True doubles the height and interp parity is the field."""
     clip = noise_16bit_or_skip()
-    core = vs.core
     kw = dict(field=1, dh=1, mdis=5, nrad=1, vcheck=0)
     out = _run(clip, **kw)
     assert out.width == WIDTH
@@ -673,7 +670,6 @@ def test_eedi3_field_gt1_doubles_frames():
     """field=3 (top field base + doubling) doubles the frame count and the
     output fps, with kept rows matching the source (progressive)."""
     clip = noise_16bit_or_skip()
-    core = vs.core
     out = _run(clip, field=3, mdis=5, nrad=1, vcheck=0)
     assert out.num_frames == 2 * clip.num_frames
     assert out.fps_num == 2 * clip.fps_num
@@ -693,7 +689,6 @@ def test_eedi3_output_props_progressive_and_duration():
     """Output frames are progressive (_FieldBased=0) and under field>1 the
     duration is halved (fps doubles) — the standard EEDI3 deinterlace props."""
     clip = noise_16bit_or_skip()
-    core = vs.core
     s0 = clip.get_frame(0).props
     sn, sd = s0.get("_DurationNum"), s0.get("_DurationDen")
     for field, factor in ((1, 1), (3, 2)):

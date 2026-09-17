@@ -222,3 +222,15 @@ and an early host signal would release the slots too soon). `test_bm3dv2.py`
 passes.
 
 
+
+## Debug env vars
+
+Standardised on `VSFEEL_BM3D_<FLAG>`; the pre-standardisation `BM3D_<FLAG>`
+spelling still works for one release (new name wins). Every flag routes through
+the `env_flag`/`env_int`/`env_str` helpers in `vsfeel.h`.
+
+- `VSFEEL_BM3D_TRACE=1` — acquire/submit/wait trace.
+- `VSFEEL_BM3D_TIMING=1` — host-stage split per frame (cached at creation).
+- `VSFEEL_BM3D_QUEUES=N` — queue cap override.
+- `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs.
+- `VSFEEL_BM3D_DUMP=1` / `VSFEEL_BM3D_GPUTRACE=1` — slot dump / GPU timestamps.

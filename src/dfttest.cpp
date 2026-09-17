@@ -433,7 +433,6 @@ struct DFTTestResource {
     VkDeviceMemory spatial_mem {};
     VkCommandPool pool {};
     VkCommandBuffer cmd {};      // per-frame fused + col2im (slot-direct addresses)
-    VkCommandBuffer cmd2 {};     // unused (was the D2D copy CB pre-slot-direct); kept for layout stability
     // one pad command buffer per (plane, temporal slice): a pad op records
     // and submits its own at claim time; a per-op buffer guarantees a buffer
     // is never re-recorded while its previous submission is still executing
@@ -565,7 +564,7 @@ struct DftData {
 
     ~DftData() {
         uint64_t n = nframes.load();
-        if (n && getenv("VSFEEL_DFTTEST_TIMING")) {
+        if (n && env_flag("VSFEEL_DFTTEST_TIMING")) {
             fprintf(stderr,
                 "[dfttest-timing] frames=%llu avg_total=%.3fms acquire=%.3fms upload=%.3fms submit=%.3fms wait=%.3fms download=%.3fms\n",
                 (unsigned long long)n,
@@ -617,9 +616,6 @@ struct DftData {
             }
             if (resource.qpool) {
                 vkDestroyQueryPool(dev, resource.qpool, nullptr);
-            }
-            if (resource.cmd2) {
-                vkFreeCommandBuffers(dev, resource.pool, 1, &resource.cmd2);
             }
             if (!resource.cmd_pad.empty()) {
                 vkFreeCommandBuffers(dev, resource.pool,
@@ -731,16 +727,16 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     uint32_t required_subgroup_size = 0, int32_t filter_type = -1,
     int32_t zmean = -1) {
 
-    if (getenv("VSFEEL_DFTTEST_DBG")) {
+    if (env_flag("VSFEEL_DFTTEST_DBG")) {
         fprintf(stderr, "[dfttest] create_pipeline required_subgroup_size=%u filter_type=%d\n",
             required_subgroup_size, filter_type);
     }
 
     uint32_t subgroup_size = required_subgroup_size;
-    if (const char * sw = getenv("VSFEEL_DFTTEST_SGSIZE")) {
-        subgroup_size = atoi(sw);
+    if (const int sw = env_int("VSFEEL_DFTTEST_SGSIZE", 0); sw > 0) {
+        subgroup_size = static_cast<uint32_t>(sw);
     }
-    if (getenv("VSFEEL_DFTTEST_SGSIZE_INVALID")) {
+    if (env_flag("VSFEEL_DFTTEST_SGSIZE_INVALID")) {
         subgroup_size = 17;   // invalid on purpose, to test driver validation
     }
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info {
@@ -807,12 +803,12 @@ static std::variant<VkPipeline, std::string> create_pipeline(
 
 // Records the per-plane fused + col2im dispatch sequence.
 static bool trivial_kernels() {
-    static const bool v = getenv("VSFEEL_DFTTEST_TRIVIAL") != nullptr;
+    static const bool v = env_flag("VSFEEL_DFTTEST_TRIVIAL");
     return v;
 }
 
 static bool dfttest_trace() {
-    static const bool v = getenv("VSFEEL_DFTTEST_TRACE") != nullptr;
+    static const bool v = env_flag("VSFEEL_DFTTEST_TRACE");
     return v;
 }
 
@@ -934,8 +930,7 @@ static std::optional<std::string> record_pad_cb(
 // counted. Unset in normal use (one branch on a cached value).
 static bool fail_slot_pad_submit() {
     static const int nth = [] {
-        const char * e = getenv("VSFEEL_DFTTEST_FAILPAD");
-        return e ? atoi(e) : 0;
+        return env_int("VSFEEL_DFTTEST_FAILPAD", 0);
     }();
     if (nth <= 0) {
         return false;
@@ -985,7 +980,7 @@ static bool submit_pad_op(
 }
 
 static bool qbench_on() {
-    static const bool v = getenv("VSFEEL_DFTTEST_QBENCH") != nullptr;
+    static const bool v = env_flag("VSFEEL_DFTTEST_QBENCH");
     return v;
 }
 
@@ -996,11 +991,7 @@ static bool qbench_on() {
 static std::atomic<int> qbench_frame { -1 };
 static int qbench_frame_idx() {
     static const int v = [] {
-        const char * e = getenv("VSFEEL_DFTTEST_QBENCH");
-        if (!e || !*e) {
-            return 100;
-        }
-        return atoi(e);
+        return env_int("VSFEEL_DFTTEST_QBENCH", 100);
     }();
     return v;
 }
@@ -1110,8 +1101,7 @@ static std::optional<std::string> record_fused_col2im_cb(
                 }
             }
             static const bool allow_direct =
-                !getenv("VSFEEL_DFTTEST_FUSEDDIRECT") ||
-                atoi(getenv("VSFEEL_DFTTEST_FUSEDDIRECT")) != 0;
+                env_int("VSFEEL_DFTTEST_FUSEDDIRECT", 1) != 0;
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                 (allow_direct && all_direct) ? d.fused_direct_pipeline[d.radius] :
                                                d.fused_pipeline[d.radius]);
@@ -1262,7 +1252,7 @@ static const VSFrame *VS_CC DftGetFrame(
         ops.reserve(d->vi->format.numPlanes * tw);
         std::vector<std::pair<VkSemaphore, uint64_t>> waits;
         waits.reserve(ops.capacity());
-        const bool force_pad = getenv("VSFEEL_DFTTEST_FORCEPAD") != nullptr;
+        const bool force_pad = env_flag("VSFEEL_DFTTEST_FORCEPAD");
         for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
             if (!d->process[plane]) {
                 continue;
@@ -1461,9 +1451,9 @@ static const VSFrame *VS_CC DftGetFrame(
         auto t3 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
 
-        if (const char * gb = getenv("VSFEEL_DFTTEST_GPU_BENCH"); gb && n == 0) {
+        if (const int iters = env_int("VSFEEL_DFTTEST_GPU_BENCH", 0);
+            iters > 0 && n == 0) {
             VkDevice dev0 = d->device->device;
-            const int iters = atoi(gb);
             // the ops loop already submitted this frame's pads; wait for the
             // queue to drain before re-recording their command buffers
             vkDeviceWaitIdle(dev0);
@@ -1618,7 +1608,7 @@ static const VSFrame *VS_CC DftGetFrame(
             }
         }
 
-        if (const char * dp = getenv("VSFEEL_DFTTEST_DUMP_PAD"); dp && n == atoi(dp)) {
+        if (const int dump_n = env_int("VSFEEL_DFTTEST_DUMP_PAD", -1); dump_n >= 0 && n == dump_n) {
             VkDeviceSize dump_size = 0;
             for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
                 if (d->process[plane]) {
@@ -1636,7 +1626,7 @@ static const VSFrame *VS_CC DftGetFrame(
                 checkVK(vkAllocateCommandBuffers(dev, &ai, &dcmd));
                 VkCommandBufferBeginInfo bi { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
                 checkVK(vkBeginCommandBuffer(dcmd, &bi));
-                const char * dump_path = getenv("VSFEEL_DFTTEST_DUMP_PATH");
+                const char * const dump_path = env_str("VSFEEL_DFTTEST_DUMP_PATH");
                 const VkDeviceSize dump_offset = d->upload_total + d->download_total;
                 if (!dump_path || !*dump_path) {
                     vkFreeCommandBuffers(dev, resource.pool, 1, &dcmd);
@@ -1754,7 +1744,7 @@ static void VS_CC DftCreate(
     auto d { std::make_unique<DftData>() };
 
     // Opt-in host-path timing; the default path records no clocks.
-    d->host_timing = getenv("VSFEEL_DFTTEST_TIMING") != nullptr;
+    d->host_timing = env_flag("VSFEEL_DFTTEST_TIMING");
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
@@ -2177,9 +2167,8 @@ static void VS_CC DftCreate(
     // (~640 vs ~1000 fps), hence the floor of 2. An explicit num_streams
     // above the floor is still honoured (deeper ticket + more queues).
     int effective_streams = std::max(d->num_streams, 2);
-    if (const char * es = getenv("VSFEEL_DFTTEST_STREAMS")) {
-        effective_streams = atoi(es);
-        if (effective_streams < 1) effective_streams = 1;
+    if (const int es = env_int("VSFEEL_DFTTEST_STREAMS", 0); es > 0) {
+        effective_streams = es;
     }
 
     // frame-cache slots: a slot holds one padded source plane; K must exceed the
@@ -2467,7 +2456,7 @@ static void VS_CC DftCreate(
     // download and overflow the allocation (VUID-vkCmdCopyBuffer-size-00116,
     // which faults the GPU). Only when the debug flag is set.
     VkDeviceSize staging_size = std::max(d->upload_total + d->download_total, 2 * min_size);
-    if (getenv("VSFEEL_DFTTEST_DUMP_PAD")) {
+    if (env_flag("VSFEEL_DFTTEST_DUMP_PAD")) {
         staging_size += std::max(d->padded_total, min_size);
     }
     d->staging_total = staging_size;
@@ -2546,8 +2535,7 @@ static void VS_CC DftCreate(
         // a non-coherent type would feed the pad stale bytes.
         // Opt out with VSFEEL_DFTTEST_UPDIRECT=0.
         {
-            const char * ud = getenv("VSFEEL_DFTTEST_UPDIRECT");
-            const bool want_direct = !ud || atoi(ud) != 0;
+            const bool want_direct = env_int("VSFEEL_DFTTEST_UPDIRECT", 1) != 0;
             resource.up_direct = false;
             if (want_direct && d->upload_total > 0) {
                 VkBufferCreateInfo up_info {
@@ -2590,7 +2578,7 @@ static void VS_CC DftCreate(
             }
             if (i == 0) {
                 d->up_direct_ok = resource.up_direct;
-                if (dfttest_trace() || getenv("VSFEEL_DFTTEST_DBG")) {
+                if (dfttest_trace() || env_flag("VSFEEL_DFTTEST_DBG")) {
                     fprintf(stderr, "[dfttest] up_direct=%d\n", resource.up_direct ? 1 : 0);
                 }
             }
@@ -2660,13 +2648,12 @@ static void VS_CC DftCreate(
                 .pNext = nullptr,
                 .commandPool = resource.pool,
                 .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                .commandBufferCount = 2 + n_pad
+                .commandBufferCount = 1 + n_pad
             };
-            std::vector<VkCommandBuffer> cbs(2 + n_pad);
+            std::vector<VkCommandBuffer> cbs(1 + n_pad);
             checkVK(vkAllocateCommandBuffers(dev, &alloc_info, cbs.data()));
             resource.cmd = cbs[0];
-            resource.cmd2 = cbs[1];
-            resource.cmd_pad.assign(cbs.begin() + 2, cbs.end());
+            resource.cmd_pad.assign(cbs.begin() + 1, cbs.end());
         }
         {
             VkFenceCreateInfo fence_info {

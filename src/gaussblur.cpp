@@ -466,11 +466,10 @@ static std::optional<std::string> record_command_buffer(
 // the full pre-recorded command buffer (DMA copies + kernels) and a
 // kernels-only recording, printing per-iteration µs to stderr.
 static void gpu_bench_probe(GaussData * d, GaussBlurResource & resource, int n) {
-    static const char * gb = getenv("VSFEEL_GAUSS_GPU_BENCH");
-    if (!gb || n != 0) {
+    static const int iters = std::max(env_int("VSFEEL_GAUSS_GPU_BENCH", 0), 1);
+    if (!env_flag("VSFEEL_GAUSS_GPU_BENCH") || n != 0) {
         return;
     }
-    const int iters = std::max(atoi(gb), 1);
     VkDevice dev = d->device->device;
 
     vkDeviceWaitIdle(dev);
@@ -723,7 +722,7 @@ static void VS_CC GaussCreate(
 
     int num_streams = vsh::int64ToIntS(vsapi->mapGetInt(in, "num_streams", 0, &error));
     if (error) {
-        num_streams = 1;
+        num_streams = 4;
     }
     if (num_streams < 1 || num_streams > 32) {
         return set_error("num_streams must be 1..32.");
@@ -1181,11 +1180,11 @@ static void VS_CC GaussCreate(
     // host-direct upload: the CPU memcpy writes the host-mapped VRAM src
     // window directly (no GPU-side H2D copy); opt out with VSFEEL_GAUSS_HD=0
     // (plain VRAM src + staging upload + in-CB copy)
-    d->host_direct_upload = !getenv("VSFEEL_GAUSS_HD") || atoi(getenv("VSFEEL_GAUSS_HD")) != 0;
+    d->host_direct_upload = env_int("VSFEEL_GAUSS_HD", 1) != 0;
     // kernel-direct download: the blur kernels' plain coalesced stores write
     // the GTT staging download region over PCIe directly, removing the
     // GPU-side D2H copy; opt out with VSFEEL_GAUSS_KD=0 for the VRAM+copy path
-    d->kd_download = !getenv("VSFEEL_GAUSS_KD") || atoi(getenv("VSFEEL_GAUSS_KD")) != 0;
+    d->kd_download = env_int("VSFEEL_GAUSS_KD", 1) != 0;
     d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
     d->pool.reserve(d->num_streams);
 

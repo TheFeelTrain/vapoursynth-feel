@@ -223,8 +223,10 @@ WO-55); left untouched per this work order.
 - `VSFEEL_BILAT_KD=0` — VRAM dst + D2H copy instead of kernel-direct download.
 - `VSFEEL_BILAT_QUEUES=N` — override the queue cap (default 2).
 - `VSFEEL_BILAT_TRACE=1` — host phase `[perf]` averages every 200 frames.
-- `BILATERAL_NOCPU` / `BILATERAL_NODL` / `BILATERAL_NODISPATCH` — pre-existing
-  diagnostics (empty upload / skip download / extra null dispatch).
+- `VSFEEL_BILAT_NOCPU` / `VSFEEL_BILAT_NODL` / `VSFEEL_BILAT_NODISPATCH` —
+  diagnostics (empty upload / skip download / extra null dispatch); the
+  un-prefixed `BILATERAL_*` spelling still works for one release.
+- All filter flags now go through `env_flag`/`env_int`/`env_str` in `vsfeel.h`.
 
 ## Validation hardening (cross-cutting pass)
 

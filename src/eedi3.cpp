@@ -2531,9 +2531,8 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
     // every 200th frame from sn=100 when unset (a single sample is
     // clock-noise-prone; <0 selects the periodic form). Durable tuning probe,
     // same shape as EEDI3's VSFEEL_EEDI3_HBENCH.
-    static const int hframe = getenv("VSFEEL_EEDI3AA_HFRAME")
-        ? atoi(getenv("VSFEEL_EEDI3AA_HFRAME")) : -1;
-    const bool hbench = getenv("VSFEEL_EEDI3AA_HBENCH") &&
+    static const int hframe = env_int("VSFEEL_EEDI3AA_HFRAME", -1);
+    const bool hbench = env_flag("VSFEEL_EEDI3AA_HBENCH") &&
         (hframe >= 0 ? sn == hframe : (sn >= 100 && sn % 200 == 0));
     const auto h_t0 = std::chrono::steady_clock::now();
     auto h_tvGather = h_t0, h_tvRec = h_t0, h_tvWait = h_t0;
@@ -2847,7 +2846,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     if (d->mclip_node) {
         mcp = vsapi->getFrameFilter(sn, d->mclip_node, frameCtx);
     }
-    if (d->horiz && scp && getenv("VSFEEL_EEDI3_PTRTRACE") && (sn < 3)) {
+    if (d->horiz && scp && env_flag("VSFEEL_EEDI3_PTRTRACE") && (sn < 3)) {
         fprintf(stderr, "[eedi3-ptr] sn=%d src=%p scp=%p mcp=%p\n", sn,
                 vsapi->getReadPtr(src, 0), vsapi->getReadPtr(scp, 0),
                 mcp ? vsapi->getReadPtr(mcp, 0) : nullptr);
@@ -2870,8 +2869,8 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     // Host-path probe: sample one frame with VSFEEL_EEDI3_HFRAME=<n>, or every
     // 200th frame from sn=100 when the variable is unset (a single sample is
     // clock-noise-prone; <0 selects the periodic form).
-    static const int hframe = getenv("VSFEEL_EEDI3_HFRAME") ? atoi(getenv("VSFEEL_EEDI3_HFRAME")) : -1;
-    const bool hbench = getenv("VSFEEL_EEDI3_HBENCH") &&
+    static const int hframe = env_int("VSFEEL_EEDI3_HFRAME", -1);
+    const bool hbench = env_flag("VSFEEL_EEDI3_HBENCH") &&
         (hframe >= 0 ? sn == hframe : (sn >= 100 && sn % 200 == 0));
     const auto h_t0 = std::chrono::steady_clock::now();
     auto h_tMaskEnd = h_t0, h_tGatherEnd = h_t0, h_tRawEnd = h_t0;
@@ -2902,7 +2901,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
             if (auto import_err = import_plane_host_memory(*d, dstp, plane_bytes,
                                                            direct.plane[plane])) {
                 direct.destroy(*d);
-                if (trace_on("VSFEEL_EEDI3_TRACE")) {
+                if (env_flag("VSFEEL_EEDI3_TRACE")) {
                     fprintf(stderr, "[eedi3] direct-to-frame import failed: %s\n",
                             import_err->c_str());
                 }
@@ -3583,10 +3582,10 @@ static void vsfeel_eedi3_create(
     }
     d->num_streams = num_streams;
 
-    if (const char * rb = std::getenv("VSFEEL_EEDI3_NOREBAR")) {
+    if (const char * rb = env_str("VSFEEL_EEDI3_NOREBAR")) {
         d->rebar_up = (atoi(rb) == 0);
     }
-    if (const char * vd = std::getenv("VSFEEL_EEDI3_VOUTDEV")) {
+    if (const char * vd = env_str("VSFEEL_EEDI3_VOUTDEV")) {
         d->vout_dev = (atoi(vd) != 0);
     } else if (d->horiz) {
         // EEDI3H default: the vcheck output is read back by the compose pass,
@@ -3595,7 +3594,7 @@ static void vsfeel_eedi3_create(
         // here because the assembled plane has its own staging binding.
         d->vout_dev = true;
     }
-    if (const char * dh = std::getenv("VSFEEL_EEDI3_DSTHOST")) {
+    if (const char * dh = env_str("VSFEEL_EEDI3_DSTHOST")) {
         d->dst_host = (atoi(dh) != 0);
     }
     if (d->horiz) {
@@ -3611,42 +3610,42 @@ static void vsfeel_eedi3_create(
         // merges the two composed planes into the frame, so no host import.
         d->vout_dev = true;
         d->dst_host = false;
-        if (const char * af = std::getenv("VSFEEL_EEDI3_AATIGHT")) {
+        if (const char * af = env_str("VSFEEL_EEDI3_AATIGHT")) {
             d->aa_fuse = atoi(af) != 0;
         }
     }
-    d->raw_stage = std::getenv("VSFEEL_EEDI3_RAWSTAGE") != nullptr;
+    d->raw_stage = env_flag("VSFEEL_EEDI3_RAWSTAGE");
     if (d->raw_stage) {
         // The host writes the raw gather to staging instead of up_dev, but the
         // kernels always read the raw upload from whichever buffer the H2D path
         // mirrors into. That is only consistent with the DMA path.
         d->rebar_up = false;
     }
-    d->blit_contig = std::getenv("VSFEEL_EEDI3_BLITCONTIG") != nullptr;
-    d->skip_pad = std::getenv("VSFEEL_EEDI3_NOPAD") != nullptr;
-    if (const char * pp = std::getenv("VSFEEL_EEDI3_PADPAR")) {
+    d->blit_contig = env_flag("VSFEEL_EEDI3_BLITCONTIG");
+    d->skip_pad = env_flag("VSFEEL_EEDI3_NOPAD");
+    if (const char * pp = env_str("VSFEEL_EEDI3_PADPAR")) {
         d->pad_skip_parity = atoi(pp) != 0;
     }
-    d->skip_blit = std::getenv("VSFEEL_EEDI3_NOBLIT") != nullptr;
+    d->skip_blit = env_flag("VSFEEL_EEDI3_NOBLIT");
     if (d->aa && d->skip_blit) {
         return set_error("VSFEEL_EEDI3_NOBLIT is not supported by EEDI3AA");
     }
-    d->skip_sclip = std::getenv("VSFEEL_EEDI3_NOSCLIP") != nullptr;
-    d->skip_raw = std::getenv("VSFEEL_EEDI3_NORAW") != nullptr;
-    d->skip_h2d = std::getenv("VSFEEL_EEDI3_NOH2D") != nullptr;
-    d->skip_vcheck = std::getenv("VSFEEL_EEDI3_NOVC") != nullptr;
-    d->skip_xfer = std::getenv("VSFEEL_EEDI3_NOXFER") != nullptr;
-    d->skip_xpose = std::getenv("VSFEEL_EEDI3_NOXPOSE") != nullptr;
-    d->skip_compose = std::getenv("VSFEEL_EEDI3_NOCOMPOSE") != nullptr;
-    d->skip_maskx = std::getenv("VSFEEL_EEDI3_NOMASKX") != nullptr;
-    if (const char * mf = std::getenv("VSFEEL_EEDI3_MASKFUSE")) {
+    d->skip_sclip = env_flag("VSFEEL_EEDI3_NOSCLIP");
+    d->skip_raw = env_flag("VSFEEL_EEDI3_NORAW");
+    d->skip_h2d = env_flag("VSFEEL_EEDI3_NOH2D");
+    d->skip_vcheck = env_flag("VSFEEL_EEDI3_NOVC");
+    d->skip_xfer = env_flag("VSFEEL_EEDI3_NOXFER");
+    d->skip_xpose = env_flag("VSFEEL_EEDI3_NOXPOSE");
+    d->skip_compose = env_flag("VSFEEL_EEDI3_NOCOMPOSE");
+    d->skip_maskx = env_flag("VSFEEL_EEDI3_NOMASKX");
+    if (const char * mf = env_str("VSFEEL_EEDI3_MASKFUSE")) {
         d->mask_fuse = atoi(mf) != 0;
     }
-    if (const char * pr = std::getenv("VSFEEL_EEDI3_PAIR")) {
+    if (const char * pr = env_str("VSFEEL_EEDI3_PAIR")) {
         d->skip_pair = atoi(pr) == 0;
     }
 
-    if (const char * cm = std::getenv("VSFEEL_EEDI3_COPY")) {
+    if (const char * cm = env_str("VSFEEL_EEDI3_COPY")) {
         const int v = atoi(cm);
         if (v >= 0 && v <= 7) {
             d->copy_mode = v;
@@ -4299,7 +4298,7 @@ static void vsfeel_eedi3_create(
     // EEDI3AA 96.8 -> 109.4 (+13%). The global form is now the default;
     // VSFEEL_EEDI3_VCLDS=1 forces the LDS ping-pong back for A/B.
     bool lds_ok = false;
-    if (const char * lv = std::getenv("VSFEEL_EEDI3_VCLDS")) {
+    if (const char * lv = env_str("VSFEEL_EEDI3_VCLDS")) {
         lds_ok = atoi(lv) != 0;
     }
     lds_ok = lds_ok && d->vcheck > 0 && d->vcheck_lds_module;
@@ -4488,17 +4487,9 @@ static void vsfeel_eedi3_create(
     // submit, leaving idle bubbles; sharing a queue across streams keeps a
     // next CB queued. Sweep with VSFEEL_EEDI3_QUEUES=N (durable tuning knob,
     // sibling of VSFEEL_BILAT_QUEUES).
-    uint32_t num_queues = std::min(
-        d->num_streams, static_cast<int>(d->device->queue_count));
-    if (const char * qn = std::getenv("VSFEEL_EEDI3_QUEUES")) {
-        const int q = atoi(qn);
-        if (q > 0) {
-            num_queues = std::min<uint32_t>(
-                static_cast<uint32_t>(d->num_streams),
-                std::min<uint32_t>(static_cast<uint32_t>(q),
-                    d->device->queue_count));
-        }
-    }
+    uint32_t num_queues = resolve_queue_cap(
+        d->num_streams, d->device->queue_count, "VSFEEL_EEDI3_QUEUES",
+        UINT32_MAX);
 
     for (int i = 0; i < d->num_streams; ++i) {
         // Owned by the pool while it is being built: a mid-loop error return
@@ -4634,7 +4625,7 @@ static void vsfeel_eedi3_create(
             };
             checkVK(vkCreateFence(dev, &fence_info, nullptr, &resource.fence));
         }
-        if (std::getenv("VSFEEL_EEDI3_GBENCH")) {
+        if (env_flag("VSFEEL_EEDI3_GBENCH")) {
             VkQueryPoolCreateInfo qp_info {
                 .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
                 .pNext = nullptr,
