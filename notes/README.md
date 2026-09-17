@@ -49,13 +49,14 @@ bullet each, under **Historical**.
 
 ## Keeping it short
 
-- Keep the whole file under ~500 lines, with the **live part** (banner through
-  open work) under ~250. That matches the healthy files (`BILATERAL` 257,
-  `BM3D` 224, `GAUSSBLUR` 101) and puts `DFTTEST` (514) right at the ceiling;
-  it is a limit on new writing, not a target to grow into. Files over it
-  (`EEDI3AA` 946, `NLMEANS` 702, `NNEDI3` 700) get their history compressed
-  when touched, never appended to. `EEDI3.md` is the one accepted exception —
-  it is the port's full accuracy record.
+- Keep the whole file under ~700 lines, with the **live part** (banner through
+  open work) under ~300. It is a limit on new writing, not a target to grow
+  into: when a file crosses it, compress its history rather than appending.
+- **Delete perf conclusions that were measured on a broken benchmark.** If the
+  harness, input, or mask was wrong, the round's numbers are void: keep the
+  accuracy proofs, correctness fixes and mechanisms, and replace the perf record
+  with one explicit "void, do not quote" note. Do not leave a void number looking
+  authoritative because it was once believed.
 - Do not restate the algorithm, paste probe logs, or copy code; link to the
   source file and line instead.
 - Do not re-derive what another filter's note already established. A one-line
