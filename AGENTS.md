@@ -528,22 +528,35 @@ cmake --build build --config Release
 
 The SPIR-V shaders are compiled at build time and embedded into a generated C++
 header (`spirv_binaries.h`) via `src/gen_spirv_header.py`. Adding a shader
-variant is one step: append its glslc rule to `VK_SPV_OUTPUTS` in
-`CMakeLists.txt` — the header script (`--out <header> <spv...>`) derives
-symbol names from the filenames (`<stem>.spv` → `<stem>_spv` /
-`<stem>_spv_size`), so it never needs editing for new variants.
+variant is one line in the owning component's `VK_*_VARIANTS` table in
+`CMakeLists.txt` — an `"<out>|<source>|<defs>"` entry naming the output, the
+`.comp` file and every `-D` (including `--target-env`). `add_spv_variant()`
+turns each entry into the `glslc` rule and collects the outputs into
+`VK_SPV_OUTPUTS`, which is generated, not edited by hand. The header script
+(`--out <header> <spv...>`) derives symbol names from the filenames
+(`<stem>.spv` → `<stem>_spv` / `<stem>_spv_size`), so it never needs editing for
+new variants.
 
 ### How the shader pipeline fits together
 
 Each `src/*.comp` file holds several entry points selected by `-D` defines
 (e.g. `-DENTRY_FUSED -DRADIUS=1 -DBITS=16`); a CMake `foreach` loop compiles
-one `.spv` per variant into `build/vk_spv/`, and `gen_spirv_header.py` packs
-them all into `spirv_binaries.h` as `uint32_t` arrays. The C++ side picks the
-arrays it needs (usually per bit depth / radius at filter creation) and
-creates one `VkShaderModule` + `VkPipeline` per variant. So a new fast-path
-variant means: an `#if` block in the `.comp`, one CMake loop entry (copy a
-neighboring `add_custom_command` and change the `-D` flags + output name),
-and a module/pipeline pair in the filter's creation function — nothing else.
+one `.spv` per variant-table entry into `build/vk_spv/`, and
+`gen_spirv_header.py` packs them all into `spirv_binaries.h` as `uint32_t`
+arrays. The C++ side picks the arrays it needs (usually per bit depth / radius
+at filter creation) and creates one `VkShaderModule` + `VkPipeline` per
+variant. So a new fast-path variant means: an `#if` block in the `.comp`, one
+entry in that component's `VK_*_VARIANTS` table, and a module/pipeline pair in
+the filter's creation function — nothing else.
+
+Every variant rule also depends on a generated `<out>.spv.flags` stamp holding
+that variant's `glslc` arguments. Ninja would rebuild on a flag-only change by
+itself, but the default Makefiles generator does not: without the stamp a
+changed `-D`, `--target-env` or `PROBE`/`MAXW` cache value leaves a stale
+`.spv` in place and silently ships the old kernel (a stale probe kernel already
+invalidated a round of measurements once). The stamp is written with
+`file(GENERATE)` and content-hashed, so an unrelated `CMakeLists.txt` edit does
+not recompile the shaders. Do not remove it.
 
 ### Installing the built plugin
 
