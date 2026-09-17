@@ -153,3 +153,61 @@ This is now covered by
   policy is `rpGeneral` whenever `radius > 0` (a temporal filter may not declare
   `rpStrictSpatial`). Verified in `tmp/verify_validation.py`.
 
+## Same-queue timeline submission ordering (2026-09-16)
+
+**Mechanism.** A frame's aggregation device-waits on the estimation timelines of
+the streams that filled its result slots. A reader can acquire after a writer and
+reach its aggregation submit first; if both share a `VkQueue` (`i % num_queues`),
+the aggregation waits on a value signalled by a submit that is *behind* it in the
+FIFO, and RADV does not run past an unsatisfied timeline wait — the queue, and
+the writer's own fence wait, stall permanently. DFTTest's chained-instance hang
+is the recorded precedent for that driver behavior.
+
+**Fix.** Per-stream `stream_submitted` (highest estimation seq submitted
+host-side) plus the existing `cache_cv`: after its own estimation submit a frame
+publishes its seq, and before submitting the aggregation it waits host-side until
+every result-slot writer has *submitted* (not completed) its estimation. Waiting
+for submission rather than completion keeps the GPU/host overlap and cannot
+deadlock: the waits always point at frames that acquired their cache reservation
+earlier, and a writer never waits on a reader's aggregation. The frame error path
+publishes the same event so a reader cannot block on a submit that never comes.
+
+**Measurement (no reproduced hang).** `VSFEEL_BM3D_QUEUES=1`, 8 streams, 1080p,
+radius 4, random concurrent seek orders (52 attempts total, 25 s cap each) on the
+pre-fix binary: every attempt completed and matched the `num_streams=1` run
+(maxdiff ~4.5e-8). The predicted FIFO stall did not reproduce on this box, so the
+fix is an ordering invariant rather than a fix for an observed hang; it is
+covered permanently by `test_bm3dv2_seek_collision_single_queue` (the same seek
+collision with one queue). Throughput is unchanged (below).
+
+## fp32 aggregation, sigma skip, GPUTRACE gating (2026-09-16)
+
+- **fp32 aggregation.** `bm3d_agg.comp` divided in `double`; no reference does
+  (vszipcl's `aggPlane` is f32, BM3DCUDA uses an f32 reciprocal multiply), and
+  fp64 runs at 1/16 rate on RDNA3. Dropped to fp32, which also removes the hard
+  `shaderFloat64` create-time requirement and the dead
+  `VkPhysicalDeviceFeaturesCompat` copy of the features struct.
+- **Sigma skip.** `sigma[0] < FLT_EPSILON` now passes luma through (a source
+  copy) instead of dispatching, matching the installed references' `PROC_MASK`
+  behavior. Measured, GRAY32 noise frame 0:
+  sigma=0 no-ref / sigma=0 + ref / sigma=1e-9 + ref / YUV444 `sigma=[0,3,3]` +
+  ref were `4.1e-8` / **96 NaN pixels** / `4.5e-8` / **96 NaN** before, and
+  bit-identical to the source after; installed vszipcl and vszipcu are
+  bit-identical to the source in all four. The `0/0` Wiener coefficient at
+  `sigma=0` is unreachable once the plane is skipped. Control `sigma=0.7` is
+  unchanged (min `-0.00233876`, max `0.0360892` both before and after).
+  The vendored vszipcl source rejects "all planes have sigma < FLT_EPSILON", but
+  the installed build pass-throughs instead; vsfeel follows the installed
+  reference (the comparison oracle).
+- **GPUTRACE.** `d->gpu_trace` is cached at creation and gates the query-pool
+  creation, the timestamp recording and the readback, so setting
+  `BM3D_GPUTRACE` after creation no longer records into a null pool.
+
+**Performance.** Same-session interleaved A/B, 3 pairs of 1500 frames
+(`benchmark/bench.py -f bm3dv2 vsfeel`): old 173.21/172.64/172.88, new
+75.53/172.64/172.57 fps. The 75.5 is the pipeline-cache cold compile after the
+SPIR-V change (first run of a new binary only); the steady medians differ by
+<0.5%, below the noise floor, and BM3D's recorded frame split is ~90% fence.
+README's BM3D row is therefore unchanged.
+
+

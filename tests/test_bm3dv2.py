@@ -322,6 +322,28 @@ def test_bm3dv2_yuv_passthrough(noise_gray):
             assert np.array_equal(a, b), f"chroma{plane} changed at frame {n}"
 
 
+@pytest.mark.parametrize("sigma", [0.0, 1e-9])
+@pytest.mark.parametrize("use_ref", [False, True])
+def test_bm3dv2_sigma_below_epsilon_passes_through(noise_gray, sigma, use_ref):
+    """A plane whose sigma is below FLT_EPSILON is a bit-exact source copy,
+    as in the reference's PROC_MASK. Covers the old sigma=0 + ref 0/0 NaN."""
+    basic = None
+    if use_ref:
+        basic = vs.core.vsfeel.BM3Dv2(
+            noise_gray, sigma=SIGMA, radius=2, bm_range=BM_RANGE,
+            ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=1)
+        _ = frame_to_ndarray(basic.get_frame(0))
+    out = vs.core.vsfeel.BM3Dv2(
+        noise_gray, sigma=sigma, radius=2, bm_range=BM_RANGE,
+        ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=1,
+        **({"ref": basic} if use_ref else {}))
+    for n in (0, 11, 23):
+        a = frame_to_ndarray(out.get_frame(n))
+        b = frame_to_ndarray(noise_gray.get_frame(n))
+        assert np.isfinite(a).all(), f"non-finite output at frame {n}"
+        assert np.array_equal(a, b), f"sigma={sigma} plane not passed through at {n}"
+
+
 # ---------------------------------------------------------------------------
 # Seek schedule (R5)
 # ---------------------------------------------------------------------------
@@ -399,6 +421,23 @@ def test_bm3dv2_seek_collision_self_consistent():
         # serial run completes is a vsfeel failure, not a missing reference.
         raise AssertionError(f"seek-schedule subprocess failed early: {exc}") from exc
     assert worst < 1e-5, f"num_streams=4 seek schedule mismatch: {worst}"
+
+
+def test_bm3dv2_seek_collision_single_queue():
+    """The same schedule with every stream on ONE VkQueue must also complete.
+
+    A reader's aggregation device-waits on the estimation timelines of the
+    frames that filled its cache slots; if that signal comes from a later
+    submit on the same FIFO queue, the queue stalls permanently. The fix waits
+    host-side for the writers' estimation *submissions*, so the schedule must
+    finish and match the serial run exactly as it does with 4 queues.
+    """
+    try:
+        worst = run_compare_subprocess(
+            _SEEK_SCRIPT, [], timeout=300, env={"VSFEEL_BM3D_QUEUES": "1"})
+    except ReferenceUnavailable as exc:
+        raise AssertionError(f"single-queue seek subprocess failed early: {exc}") from exc
+    assert worst < 1e-5, f"single-queue seek schedule mismatch: {worst}"
 
 
 # ---------------------------------------------------------------------------

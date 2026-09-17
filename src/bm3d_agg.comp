@@ -6,8 +6,9 @@
  * result slices (TW = 2 * RADIUS + 1, matching the reference implementation's
  * aggPlane loop) and divides. The slice offsets are precomputed on the host
  * (res slot of each temporal frame + the aggregated z-block). The division is
- * computed in fp64 so it rounds identically to the CPU-side aggregation of
- * the reference implementation.
+ * fp32, as in every reference (zipcl's aggPlane divides floats, BM3DCUDA
+ * multiplies by an f32 reciprocal); fp64 would run at 1/16 rate on RDNA3 for
+ * a rounding difference no reference makes.
  */
 
 layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
@@ -33,8 +34,7 @@ const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
 // aggregation submit. A coherent (atomic) load is therefore unnecessary —
 // atomicAdd(res[o], 0.0f) forced a device-scope read-modify-write per element
 // (10 per pixel at radius 2, ~20.7M at 1080p) just to read a value nobody
-// was racing to modify. Measured: replacement with a plain load was
-// X% faster end-to-end with bit-identical output (see notes/REVIEW_FIXES.md).
+// was racing to modify; a plain load is cheaper with identical output.
 float res_load(int o) {
     return res[o];
 }
@@ -46,13 +46,13 @@ void main() {
         return;
     }
 
-    double acc = 0.0;
-    double acw = 0.0;
+    float acc = 0.0;
+    float acw = 0.0;
     for (int i = 0; i < TW; ++i) {
         const int o = pc.bases[i] + y * STRIDE + x;
-        acc += double(res_load(o));
-        acw += double(res_load(o + TEMPORAL_STRIDE));
+        acc += res_load(o);
+        acw += res_load(o + TEMPORAL_STRIDE);
     }
 
-    dst[y * STRIDE + x] = float(acc / acw);
+    dst[y * STRIDE + x] = acc / acw;
 }

@@ -38,7 +38,6 @@ const int NUM_PLANES = 1;
 const int CLIP_STRIDE = NUM_PLANES * TEMPORAL_WIDTH * TEMPORAL_STRIDE;
 
 const float FLT_MAX_ = 3.402823466e+38f;
-const float FLT_EPS_ = 1.192092896e-07f;
 const int INT_MAX_ = 0x7fffffff;
 
 const int smem_stride = 33;

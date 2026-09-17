@@ -105,10 +105,11 @@ def _tail(text, n=25):
     return "\n".join(lines[-n:]) if lines else "(empty)"
 
 
-def run_compare_subprocess(code, argv=(), timeout=600.0):
+def run_compare_subprocess(code, argv=(), timeout=600.0, env=None):
     """Run a comparison script in a subprocess and parse its report.
 
-    Returns the JSON payload printed on the ``RESULT`` line.
+    Returns the JSON payload printed on the ``RESULT`` line.  ``env`` adds
+    overrides to the inherited environment (e.g. a queue-cap knob).
 
     Raises :class:`ReferenceUnavailable` when the reference could not be
     materialised (missing plugin, its own evaluation failed, or the subprocess
@@ -117,10 +118,11 @@ def run_compare_subprocess(code, argv=(), timeout=600.0):
     vsfeel side failed (exception, crash, timeout, malformed/missing result).
     """
     argv = [str(a) for a in argv]
+    run_env = {**os.environ, **env} if env else None
     try:
         proc = subprocess.run(
             [sys.executable, "-c", code, *argv],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, timeout=timeout, env=run_env,
         )
         stdout = _as_text(proc.stdout)
         stderr = _as_text(proc.stderr)
