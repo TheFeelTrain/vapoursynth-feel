@@ -531,6 +531,7 @@ struct DftData {
 
     VkDeviceSize upload_total {};   // tight upload planes region (staging)
     VkDeviceSize download_total {}; // output region (staging)
+    VkDeviceSize staging_total {};  // staging allocation size (upload+download+dump)
     VkDeviceSize padded_total {};   // padded planes region (device-local)
     VkDeviceSize spatial_total {};  // float elements across planes
     VkDeviceSize slot_total {};     // frame-cache slot region (device-local)
@@ -748,18 +749,26 @@ static std::variant<VkPipeline, std::string> create_pipeline(
         .requiredSubgroupSize = subgroup_size
     };
 
-    VkSpecializationMapEntry spec_entries[2] {
-        { .constantID = 1, .offset = 0, .size = sizeof(int32_t) },
-        { .constantID = 2, .offset = sizeof(int32_t), .size = sizeof(int32_t) }
-    };
-    int32_t spec_values[2] = { filter_type, zmean };
+    // Build the spec-constant map from an explicit (id, value) list so the
+    // offset always matches the slot the value is stored in; the old
+    // positional form delivered spec_values[0] as constant 2 when
+    // filter_type < 0 and zmean >= 0.
+    VkSpecializationMapEntry spec_entries[2] {};
+    int32_t spec_values[2] {};
     uint32_t n_spec = 0;
     if (filter_type >= 0) {
-        n_spec++;
+        spec_entries[n_spec] = { .constantID = 1,
+            .offset = static_cast<uint32_t>(n_spec * sizeof(int32_t)),
+            .size = sizeof(int32_t) };
+        spec_values[n_spec] = filter_type;
+        ++n_spec;
     }
     if (zmean >= 0) {
-        spec_entries[n_spec] = { .constantID = 2, .offset = n_spec * sizeof(int32_t), .size = sizeof(int32_t) };
-        n_spec++;
+        spec_entries[n_spec] = { .constantID = 2,
+            .offset = static_cast<uint32_t>(n_spec * sizeof(int32_t)),
+            .size = sizeof(int32_t) };
+        spec_values[n_spec] = zmean;
+        ++n_spec;
     }
     VkSpecializationInfo spec_info {
         .mapEntryCount = n_spec,
@@ -921,6 +930,21 @@ static std::optional<std::string> record_pad_cb(
     return std::nullopt;
 }
 
+// Test-only fault injection: VSFEEL_DFTTEST_FAILPAD=N fails the Nth *slot* pad
+// submit, so the claim-rollback path below stays reachable. Direct pads are not
+// counted. Unset in normal use (one branch on a cached value).
+static bool fail_slot_pad_submit() {
+    static const int nth = [] {
+        const char * e = getenv("VSFEEL_DFTTEST_FAILPAD");
+        return e ? atoi(e) : 0;
+    }();
+    if (nth <= 0) {
+        return false;
+    }
+    static std::atomic<int> seen { 0 };
+    return seen.fetch_add(1, std::memory_order_relaxed) + 1 == nth;
+}
+
 // Records and submits one pad op's command buffer immediately (called at
 // claim time, still holding slot_lock; takes queue_lock). Signalling the
 // slot's timeline semaphore here — before any reader of this generation can
@@ -929,6 +953,9 @@ static std::optional<std::string> record_pad_cb(
 static bool submit_pad_op(
     const DftData & d, DFTTestResource & resource, const SlotOp & op) {
 
+    if (op.slot >= 0 && fail_slot_pad_submit()) {
+        return false;
+    }
     const VkDevice dev = d.device->device;
     VkCommandBuffer cmd = resource.cmd_pad[op.plane * d.tw + op.t];
     VkCommandBufferBeginInfo begin_info {
@@ -1189,8 +1216,6 @@ static const VSFrame *VS_CC DftGetFrame(
         // copy, and destroying the timeline semaphore is safe (all its waits
         // have resolved). No host fence waits anywhere: no deadlocks.
         d->pool.semaphore.acquire();
-        auto t1 = d->host_timing ? std::chrono::steady_clock::now()
-                                 : std::chrono::steady_clock::time_point {};
         d->pool.lock.lock();
         auto resource = std::move(d->pool.items.back());
         d->pool.items.pop_back();
@@ -1404,12 +1429,21 @@ static const VSFrame *VS_CC DftGetFrame(
                             st.committed = { { resource.id, my_gen } };
                             // fresh timeline value for this generation: the pad
                             // below signals it; every reader waits on it
-                            st.signal = ++st.signal;
+                            st.signal += 1;
                             op.slot = slot;
                             op.slot_base = cfg.slot_offset +
                                 static_cast<VkDeviceSize>(slot) * cfg.slot_plane_bytes;
                             op.is_pad = true;
                             if (!submit_pad_op(*d, resource, op)) {
+                                // The claim already set gen/committed and bumped the
+                                // signal, but the pad that would signal it failed.
+                                // A later reader committing to this generation would
+                                // submit a wait on a value that never arrives, and
+                                // RADV will not run a submit behind such a wait on the
+                                // same queue: permanent queue/host wedge. Roll the slot
+                                // back to empty so the next frame re-pads it.
+                                st.gen = -1;
+                                st.committed.clear();
                                 return set_error("vkQueueSubmit (pad) failed");
                             }
                         } else {
@@ -1566,22 +1600,17 @@ static const VSFrame *VS_CC DftGetFrame(
             if (vkAllocateCommandBuffers(dev, &qai, &qcmd) == VK_SUCCESS) {
                 VkCommandBufferBeginInfo qbi {
                     .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-                vkBeginCommandBuffer(qcmd, &qbi);
+                checkVK(vkBeginCommandBuffer(qcmd, &qbi));
                 VkBufferCopy qbc { .srcOffset = 0, .dstOffset = 0,
                     .size = 8 * sizeof(uint64_t) };
                 vkCmdCopyQueryPoolResults(qcmd, resource.qpool, 0, 4, resource.qbuf,
                     0, sizeof(uint64_t),
                     VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
                 (void)qbc;
-                vkEndCommandBuffer(qcmd);
-                {
-                    std::lock_guard lk(*resource.queue_lock);
-                    vkResetFences(dev, 1, &resource.fence);
-                    VkSubmitInfo qsi { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                        .commandBufferCount = 1, .pCommandBuffers = &qcmd };
-                    vkQueueSubmit(resource.queue, 1, &qsi, resource.fence);
-                }
-                vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX);
+                checkVK(vkEndCommandBuffer(qcmd));
+                checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
+                    qcmd, resource.fence));
+                checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
                 vkFreeCommandBuffers(dev, resource.pool, 1, &qcmd);
                 const uint64_t * ts = resource.qmap;
                 fprintf(stderr,
@@ -1613,18 +1642,41 @@ static const VSFrame *VS_CC DftGetFrame(
                 VkCommandBuffer dcmd;
                 checkVK(vkAllocateCommandBuffers(dev, &ai, &dcmd));
                 VkCommandBufferBeginInfo bi { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-                vkBeginCommandBuffer(dcmd, &bi);
-                VkBufferCopy bc { .srcOffset = 0, .dstOffset = 0, .size = dump_size };
+                checkVK(vkBeginCommandBuffer(dcmd, &bi));
+                const char * dump_path = getenv("VSFEEL_DFTTEST_DUMP_PATH");
+                const VkDeviceSize dump_offset = d->upload_total + d->download_total;
+                if (!dump_path || !*dump_path) {
+                    vkFreeCommandBuffers(dev, resource.pool, 1, &dcmd);
+                    return set_error("VSFEEL_DFTTEST_DUMP_PATH must name the dump file");
+                }
+                // hard bound: an out-of-range copy faults the GPU; the dump
+                // region is reserved at creation for exactly this size
+                if (dump_offset + dump_size > d->staging_total) {
+                    vkFreeCommandBuffers(dev, resource.pool, 1, &dcmd);
+                    return set_error("dump region does not fit in staging");
+                }
+                VkBufferCopy bc { .srcOffset = 0, .dstOffset = dump_offset, .size = dump_size };
                 vkCmdCopyBuffer(dcmd, resource.padded_buf, resource.staging, 1, &bc);
-                vkEndCommandBuffer(dcmd);
-                vkResetFences(dev, 1, &resource.fence);
-                VkSubmitInfo si { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                    .commandBufferCount = 1, .pCommandBuffers = &dcmd };
-                vkQueueSubmit(resource.queue, 1, &si, resource.fence);
-                vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX);
-                const char * path = getenv("VSFEEL_DFTTEST_DUMP_PATH");
-                FILE * f = fopen(path ? path : "/tmp/opencode/pad_dump.bin", "wb");
-                fwrite(map, 1, dump_size, f);
+                checkVK(vkEndCommandBuffer(dcmd));
+                checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
+                    dcmd, resource.fence));
+                checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
+                if (!coherent) {
+                    VkMappedMemoryRange dump_range {
+                        .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                        .pNext = nullptr,
+                        .memory = resource.staging_mem,
+                        .offset = 0,
+                        .size = VK_WHOLE_SIZE,
+                    };
+                    checkVK(vkInvalidateMappedMemoryRanges(dev, 1, &dump_range));
+                }
+                FILE * f = fopen(dump_path, "wb");
+                if (!f) {
+                    vkFreeCommandBuffers(dev, resource.pool, 1, &dcmd);
+                    return set_error(std::string("cannot open dump path: ") + dump_path);
+                }
+                fwrite(reinterpret_cast<const uint8_t *>(map) + dump_offset, 1, dump_size, f);
                 fclose(f);
                 vkFreeCommandBuffers(dev, resource.pool, 1, &dcmd);
             }
@@ -1670,8 +1722,11 @@ static const VSFrame *VS_CC DftGetFrame(
         auto t6 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
         if (d->host_timing) {
-            d->t_acquire_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-            d->t_upload_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+            // acquire = ticket wait + pool pop (t0 -> t2); upload = the frame
+            // memcpy/flush and the pad submits (t2 -> t3); these plus the
+            // remaining stages sum to avg_total.
+            d->t_acquire_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t0).count();
+            d->t_upload_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count();
             d->t_submit_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t4 - t3).count();
             d->t_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t5 - t4).count();
             d->t_download_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t6 - t5).count();
@@ -2381,7 +2436,15 @@ static void VS_CC DftCreate(
     // Buffers and resources
     // ------------------------------------------------------------------
     const VkDeviceSize min_size = 4;
-    const VkDeviceSize staging_size = std::max(d->upload_total + d->download_total, 2 * min_size);
+    // The dump path copies one whole padded plane into staging. Reserve a third
+    // region for it, past upload and download, or the copy would clobber the
+    // download and overflow the allocation (VUID-vkCmdCopyBuffer-size-00116,
+    // which faults the GPU). Only when the debug flag is set.
+    VkDeviceSize staging_size = std::max(d->upload_total + d->download_total, 2 * min_size);
+    if (getenv("VSFEEL_DFTTEST_DUMP_PAD")) {
+        staging_size += std::max(d->padded_total, min_size);
+    }
+    d->staging_total = staging_size;
     const VkDeviceSize padded_size = std::max(d->padded_total, min_size);
     const VkDeviceSize spatial_size = std::max<VkDeviceSize>(
         d->spatial_total * sizeof(float), min_size);
@@ -2397,9 +2460,7 @@ static void VS_CC DftCreate(
             .pNext = nullptr,
             .flags = 0,
             .size = slot_size,
-            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                     VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr
@@ -2450,7 +2511,9 @@ static void VS_CC DftCreate(
 
         // ReBAR upload buffer: host-mapped VRAM the CPU writes directly.
         // Falls back (up_direct=false, staging upload region is used) when
-        // the buffer cannot be backed by host-visible device-local memory.
+        // the buffer cannot be backed by host-visible *and coherent*
+        // device-local memory: this path is a plain CPU memcpy with no flush, so
+        // a non-coherent type would feed the pad stale bytes.
         // Opt out with VSFEEL_DFTTEST_UPDIRECT=0.
         {
             const char * ud = getenv("VSFEEL_DFTTEST_UPDIRECT");
@@ -2477,7 +2540,8 @@ static void VS_CC DftCreate(
                     const auto flags =
                         d->device->mem_props.memoryTypes[ti].propertyFlags;
                     if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
-                        (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                        (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                        (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
                         resource.up_mem = std::get<AllocatedMemory>(up_result).memory;
                         checkVK(vkMapMemory(dev, resource.up_mem, 0,
                             std::max(d->upload_total, VkDeviceSize(4)), 0,
@@ -2508,7 +2572,7 @@ static void VS_CC DftCreate(
                 .pNext = nullptr,
                 .flags = 0,
                 .size = padded_size,
-                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
                 .queueFamilyIndexCount = 0,
                 .pQueueFamilyIndices = nullptr

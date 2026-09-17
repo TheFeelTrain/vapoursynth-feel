@@ -104,7 +104,7 @@ semaphore with a per-generation signal *value*; the pad signals value V and
 any number of copies wait on V. Timeline waits are non-destructive, so
 repeated processings can never starve a second consumer. The per-generation
 binary sem create/destroy loop is gone; signalling moves into `st.signal`
-(`st.signal = ++st.signal` at claim). `VkPhysicalDeviceTimelineSemaphore-
+(`st.signal += 1` at claim). `VkPhysicalDeviceTimelineSemaphore-
 Features` is chained into `VkDeviceCreateInfo` in `get_device()` (the app
 already requests 1.4). Also fixed along the way: the D2D copy submit shared
 one `VkPipelineStageFlags` across `waitSemaphoreCount > 1` — an
@@ -123,6 +123,47 @@ out-of-bounds read; now a per-wait vector.
   bit-exact for N=1/2 × tbsize 1/3 (3651e55a…, 527375cc…, 4383e3ff…
   and 80f35632…).
 - Suite: 35/35 (34 + the new chained test).
+
+## Correctness pass 2026-09 (slot rollback, UB, secondary defects)
+
+- **Failed pad submit wedged the queue forever.** The claim set `gen`,
+  `committed` and bumped `signal` *before* `submit_pad_op`; if that submit
+  failed, the slot claimed a generation it never signalled, a later reader
+  committed to it, and its fused submit waited on a value that never arrives —
+  RADV will not run a submit behind such a wait, so the queue (and host) hung.
+  Fix: on failure, roll the slot back (`gen = -1`, clear `committed`) under
+  `slot_lock` so the next frame re-pads it. Reproduced with the new fault
+  injection `VSFEEL_DFTTEST_FAILPAD=N` (fails the Nth *slot* pad submit; unset =
+  zero effect): pre-fix frame 0 errored then frame 1 hung (>45 s); post-fix
+  frames 1/2 complete. Repro: `tmp/wo09_repro_failpad.py`.
+- **`st.signal = ++st.signal` is UB** (unsequenced read/write of one scalar;
+  `-Wsequence-point` at `dfttest.cpp:1407`). Now `st.signal += 1`. A compiler
+  could have stored the old value, making readers wait on the previous
+  generation's value (stale slot read).
+- **Debug submits bypassed `submit_with_fence`/`queue_lock`** on `DUMP_PAD` and
+  re-implemented it on `QBENCH`; both now go through the shared helper with
+  checked `vkBegin/EndCommandBuffer`. `slot_buf` dropped its unused transfer
+  flags; `padded_buf` swapped `TRANSFER_DST` for the `TRANSFER_SRC` the dump
+  copy actually uses. A non-coherent ReBAR upload type is now rejected (falls
+  back to staging) instead of being accepted and never flushed. The host timing
+  probe accumulated `t2-t1` (pool pop) as "upload" and silently dropped the
+  real `t2 -> t3` upload/pad-stage; now `acquire = t0..t2`, `upload = t2..t3`,
+  so the stages sum to `avg_total`. Spec-constant entries are built from an
+  explicit `(id, value)` list (the positional form delivered `filter_type` as
+  constant 2 when `filter_type < 0, zmean >= 0`).
+- **`DUMP_PAD` copied 46464 B into a 32768 B staging buffer** (one padded plane
+  into upload+download) — `VUID-vkCmdCopyBuffer-size-00116`, and it clobbered
+  the download region, so the dumped frame's output was corrupt. On this box it
+  **reset the GPU**. Fix: staging reserves a third region for the dump
+  (creation-time, only when `DUMP_PAD` is set), the copy targets
+  `upload_total + download_total`, the host reads from there, a hard bound
+  refuses any copy that would not fit, and whole-range invalidate covers a
+  non-coherent staging type. `VSFEEL_DFTTEST_DUMP_PATH` is now mandatory (the
+  old hardcoded `/tmp/opencode/pad_dump.bin` fallback is gone). Verified under
+  `VK_LAYER_KHRONOS_validation`: 0 validation errors, dump 46464 B, and the
+  output frame digest is byte-identical with and without the dump. Repro:
+  `tmp/wo21_dump_check.py`.
+- Suite 61/61 at each rebuild.
 
 ## Commands
 
@@ -227,7 +268,7 @@ deadlocks).
   pool. Reclaim via `frame_gen` needs no host waits at all.
 - **No stale signals / no second-consumer starvation:** one timeline
   semaphore per slot; each generation signals a fresh value
-  (`st.signal = ++st.signal` at claim) and ANY number of readers wait on
+  (`st.signal += 1` at claim) and ANY number of readers wait on
   that value non-destructively — the chained-instance deadlock (2+
   consumers of one binary signal) is structurally impossible. Destroying
   the slot semaphore at reclaim is safe: reclaim only happens after every
@@ -394,7 +435,9 @@ instr, 690 → 468 µs (vszipcl 441).
   (also shown with `VSFEEL_DFTTEST_DBG=1`).
 - `VSFEEL_DFTTEST_FORCEPAD` — pad every op (bypass slot reuse).
 - `VSFEEL_DFTTEST_DUMP_PAD=n` + `VSFEEL_DFTTEST_DUMP_PATH=file` — dump the
-  padded buffer after frame n.
+  padded buffer after frame n. The path is now required (no hardcoded default).
+- `VSFEEL_DFTTEST_FAILPAD=N` — fault injection: fail the Nth slot pad submit,
+  to exercise the claim-rollback path.
 - `VSFEEL_DFTTEST_STREAMS=N` — override effective_streams.
 - `VSFEEL_DFTTEST_TRIVIAL=1` — skip kernels. `VSFEEL_DFTTEST_DBG=1`,
   `VSFEEL_DFTTEST_SGSIZE=N` — plumbing.
