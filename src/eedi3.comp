@@ -125,6 +125,7 @@ const int BT_TILE = 32;
 #define VCHECK_LDS 0
 #endif
 // Compile-time max plane width the LDS ping-pong can hold (per row buffer).
+// CMake passes -DMAXW (EEDI3_MAXW); the host's fit check reads the same value.
 #ifndef MAXW
 #define MAXW 4096
 #endif

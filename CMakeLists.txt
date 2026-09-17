@@ -191,11 +191,15 @@ if(VK_GLSLC)
     # variant (16 int, 32 float). The row kernel needs subgroup ops + the
     # Vulkan memory model, so SPIR-V 1.3+ (vulkan1.3 target) is required.
     set(EEDI3_PROBE "0" CACHE STRING "EEDI3 diagnostics-only shader ablation level")
+    # Max plane width the vcheck LDS ping-pong can hold. Single source for the
+    # shader (-DMAXW) and the host's fit check (EEDI3_MAXW_LDS), so the two
+    # cannot drift and create a pipeline whose static LDS exceeds the device.
+    set(EEDI3_MAXW "4096" CACHE STRING "EEDI3 vcheck LDS max plane width")
     set(VK_EEDI3_ENTRIES row vcheck vcheck_lds)
     set(VK_EEDI3_BITS "16" "32")
     foreach(bits IN LISTS VK_EEDI3_BITS)
         foreach(entry IN LISTS VK_EEDI3_ENTRIES)
-            set(defs -DBITS=${bits} -DPROBE=${EEDI3_PROBE})
+            set(defs -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW})
             if(entry STREQUAL row)
                 list(APPEND defs -DENTRY_ROW)
             elseif(entry STREQUAL vcheck_lds)
@@ -330,6 +334,9 @@ add_library(vsfeel SHARED
     "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.o")
 configure_common(vsfeel)
 target_compile_options(vsfeel PRIVATE -mavx2)
+# Keep the host's EEDI3 vcheck LDS fit check in step with the -DMAXW the shader
+# was compiled with (defined above, in the EEDI3 shader block).
+target_compile_definitions(vsfeel PRIVATE EEDI3_MAXW_LDS=${EEDI3_MAXW})
 target_link_libraries(vsfeel PRIVATE Vulkan::Vulkan)
 target_include_directories(vsfeel PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 

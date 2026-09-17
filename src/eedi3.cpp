@@ -33,6 +33,17 @@ using namespace std::string_literals;
 // marks); EEDI3AA records two passes per submission, so the cap covers both.
 constexpr int EEDI3_TS_CAP = 24;
 
+// One accumulator per submission kind: EEDI3 and EEDI3H share the "single"
+// tag but have different stage structures, so folding them (and AA's vertical
+// pass) into one index mixes unrelated stage numbers together.
+enum GpuBenchSlot {
+    GB_EEDI3 = 0,
+    GB_EEDI3H,
+    GB_AA_VERT,
+    GB_AA_HORIZ,
+    GB_SLOT_COUNT
+};
+
 // ---------------------------------------------------------------------------
 // EEDI3 — full-pel edge-directed line interpolation.
 //
@@ -156,15 +167,6 @@ static inline void frame_copy_out(void * dst, const void * src, size_t bytes,
                                   const bool nt) {
     if (nt) {
         copy_stream_out(dst, src, bytes);
-    } else {
-        std::memcpy(dst, src, bytes);
-    }
-}
-
-static inline void frame_copy_stream_read(void * dst, const void * src,
-                                          size_t bytes, const bool nt) {
-    if (nt) {
-        copy_stream_read(dst, src, bytes);
     } else {
         std::memcpy(dst, src, bytes);
     }
@@ -749,9 +751,13 @@ enum Binding : uint32_t {
 };
 
 // Compile-time max plane width for the shared-memory (LDS) vcheck variant.
-// Must match MAXW in src/eedi3.comp and the -DMAXW passed by the CMake
-// vcheck_lds rule; wider planes fall back to the global-read vcheck.
-static constexpr int MAXW_LDS = 4096;
+// The single source is EEDI3_MAXW in CMakeLists.txt, which passes -DMAXW to the
+// vcheck_lds shader rule and -DEEDI3_MAXW_LDS here; wider planes fall back to
+// the global-read vcheck. The fallback matches the shader's own default.
+#ifndef EEDI3_MAXW_LDS
+#define EEDI3_MAXW_LDS 4096
+#endif
+static constexpr int MAXW_LDS = EEDI3_MAXW_LDS;
 
 struct Eedi3PlaneConfig {
     int width {};                     // KERNEL plane width: the row kernel's
@@ -759,8 +765,7 @@ struct Eedi3PlaneConfig {
                                       // transposed row length
     int height {};                    // output plane height (vertical) / kernel
                                       // plane height (EEDI3H)
-    int src_w {};                     // source plane dims (gather geometry)
-    int src_h {};
+    int src_h {};                     // source plane height (gather geometry)
     int out_w {};                     // output (frame order) plane dims
     int out_h {};
     int rows {};                      // number of interp rows == height / 2
@@ -856,7 +861,6 @@ struct Eedi3Resource {
     VkBuffer up_dev {};           // ReBAR upload: CPU NT-stores land in VRAM
     VkDeviceMemory up_dev_mem {};
     uint8_t * up_map {};          // mapped view of up_dev
-    uint32_t up_type_index {};
     VkDescriptorSet desc_set_pad {};   // pad kernel (b0 = up_dev, b8 = pad_dev)
     // EEDI3AA needs BOTH geometries' views of the shared buffers in one filter:
     //   desc_set_h  — horizontal row/vcheck/compose: b0/b5/b9 all view pad_dev
@@ -878,12 +882,51 @@ struct Eedi3Resource {
     std::mutex * queue_lock {};
     float * map {};
     uint32_t staging_type_index {};
-    uint32_t dev_type_index {};
     // VSFEEL_EEDI3_GBENCH: per-submission GPU stage timestamps (one query per
     // recorded stage boundary; read back after the fence).
     VkQueryPool ts_query {};
     int ts_used {};
     int ts_cap {};
+    // Scratch for vkFlush/InvalidateMappedMemoryRanges, reused across frames so
+    // the non-coherent fallback does not allocate per plane per frame.
+    std::vector<VkMappedMemoryRange> mapped_ranges {};
+
+    // Rebuilds `mapped_ranges`: `off(plane)` returns {offset,bytes} relative to
+    // `base`; a zero-byte entry (unprocessed plane) is skipped. Used only when
+    // the memory type is not host-coherent.
+    template <typename OffFn>
+    const std::vector<VkMappedMemoryRange> & plane_ranges(
+        const VK_Device & dev, const VkDeviceMemory mem,
+        const VkDeviceSize base, int numPlanes, const OffFn & off) {
+        mapped_ranges.clear();
+        for (int plane = 0; plane < numPlanes; ++plane) {
+            const auto [offset, bytes] = off(plane);
+            if (bytes == 0) {
+                continue;
+            }
+            mapped_ranges.push_back(
+                mapped_range(dev, mem, base + offset, bytes));
+        }
+        return mapped_ranges;
+    }
+
+    // Same, for callers whose ranges do not map one-to-one onto planes: `off(i)`
+    // returns {offset,bytes} for a flat range index in [0, count).
+    template <typename OffFn>
+    const std::vector<VkMappedMemoryRange> & flat_ranges(
+        const VK_Device & dev, const VkDeviceMemory mem,
+        const VkDeviceSize base, int count, const OffFn & off) {
+        mapped_ranges.clear();
+        for (int i = 0; i < count; ++i) {
+            const auto [offset, bytes] = off(i);
+            if (bytes == 0) {
+                continue;
+            }
+            mapped_ranges.push_back(
+                mapped_range(dev, mem, base + offset, bytes));
+        }
+        return mapped_ranges;
+    }
 };
 
 struct Eedi3Data {
@@ -984,18 +1027,15 @@ struct Eedi3Data {
     float alpha { 0.2f }, beta { 0.25f }, gamma { 20.0f };
     float vthresh2 { 4.0f };
     float rw {}, rcp_vth0 {}, rcp_vth1 {}, rcp_vth2 {};
-    int peak {};
 
     // one pipeline set per distinct plane width (like eedi3vk2); pipelines
-    // for the same width are shared by all planes of that width
+    // for the same width are shared by all planes of that width. Only geometry
+    // is keyed: vcheck/mclip/sclip are filter-level, identical across planes.
     struct WidthKey {
         int width, rows, tpitch, pad_stride, pad_height;
-        int has_mclip, has_sclip, vcheck;
         bool operator==(const WidthKey & o) const {
             return width == o.width && rows == o.rows && tpitch == o.tpitch &&
-                   pad_stride == o.pad_stride && pad_height == o.pad_height &&
-                   has_mclip == o.has_mclip && has_sclip == o.has_sclip &&
-                   vcheck == o.vcheck;
+                   pad_stride == o.pad_stride && pad_height == o.pad_height;
         }
     };
 
@@ -1633,19 +1673,6 @@ struct Eedi3PushConstants {
 };
 static_assert(sizeof(Eedi3PushConstants) == 19 * 4 + 8 * 4 + 4, "push constants size");
 
-// base offsets in ELEMENTS for each binding of a plane's regions (element
-// type per binding; the descriptors range the whole buffer so the shader
-// indexes base + offset).
-struct PlaneBases {
-    int32_t pad;       // float elements into staging (pad region)
-    int32_t dst;       // io elements into dev_buf (interp rows)
-    int32_t pbt;       // int8 elements into dev_buf
-    int32_t dmap;      // int8 elements into dev_buf
-    int32_t bmask;     // uint8 elements into staging
-    int32_t sclip;     // io elements into staging
-    int32_t cint;      // io elements into dev_buf
-};
-
 // What a recorded pass does after the row kernel + vcheck:
 //   kTransfer — copy the interp rows back to staging (the historical default,
 //               direct-to-frame disabled);
@@ -2141,10 +2168,13 @@ static void eedi3_gpu_report(const Eedi3Data & d, Eedi3Resource & resource,
             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS) {
         return;
     }
-    static std::atomic<uint64_t> acc[2][EEDI3_TS_CAP];
-    static std::atomic<int> cnt[2][EEDI3_TS_CAP];
-    static std::atomic<uint32_t> frames[2];
-    const int ti = tag_id & 1;
+    static std::atomic<uint64_t> acc[GB_SLOT_COUNT][EEDI3_TS_CAP];
+    static std::atomic<int> cnt[GB_SLOT_COUNT][EEDI3_TS_CAP];
+    static std::atomic<uint32_t> frames[GB_SLOT_COUNT];
+    const int ti = tag_id;
+    if (ti < 0 || ti >= GB_SLOT_COUNT) {
+        return;
+    }
     for (int i = 0; i + 1 < n; ++i) {
         if (ts[i] && ts[i + 1]) {
             acc[ti][i] += ts[i + 1] - ts[i];
@@ -2405,7 +2435,7 @@ static void merge_pair_rows(uint8_t * dst, ptrdiff_t dst_stride,
 // ---------------------------------------------------------------------------
 
 static const VSFrame *VS_CC Eedi3AaGetFrame(
-    int n, int activationReason, void *instanceData, void **frameData,
+    int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
 
     Eedi3Data * d = static_cast<Eedi3Data *>(instanceData);
@@ -2600,22 +2630,21 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
     checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
         resource.cmd, resource.fence));
     checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
-    eedi3_gpu_report(*d, resource, "aa-v", 0);
+    eedi3_gpu_report(*d, resource, "aa-v", GB_AA_VERT);
     if (hbench) { h_tvWait = std::chrono::steady_clock::now(); }
 
     // The column-gather below reads the assemble kernel's merged vertical
     // frame out of staging, so invalidate it first (mirrors EEDI3's block).
     if (!coherent) {
-        std::vector<VkMappedMemoryRange> ranges;
-        ranges.reserve(numPlanes);
-        for (int plane = 0; plane < numPlanes; ++plane) {
-            if (!d->process[plane]) {
-                continue;
-            }
-            const auto & cfg = d->planes[plane];
-            ranges.push_back(mapped_range(*d->device, resource.staging_mem,
-                d->upload_total + d->download_total + cfg.v_offset, cfg.v_bytes));
-        }
+        const auto & ranges = resource.plane_ranges(
+            *d->device, resource.staging_mem, d->upload_total + d->download_total,
+            numPlanes, [&](int plane) -> std::pair<VkDeviceSize, VkDeviceSize> {
+                if (!d->process[plane]) {
+                    return { 0, 0 };
+                }
+                const auto & cfg = d->planes[plane];
+                return { cfg.v_offset, cfg.v_bytes };
+            });
         checkVK(vkInvalidateMappedMemoryRanges(dev,
             static_cast<uint32_t>(ranges.size()), ranges.data()));
     }
@@ -2671,26 +2700,23 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
     checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
         resource.cmd, resource.fence));
     checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
-    eedi3_gpu_report(*d, resource, "aa-h", 1);
+    eedi3_gpu_report(*d, resource, "aa-h", GB_AA_HORIZ);
     if (hbench) { h_thWait = std::chrono::steady_clock::now(); }
 
     // The final merge below reads the two compose kernels' planes from
     // staging, so invalidate them first (mirrors EEDI3's block).
     if (!coherent) {
-        std::vector<VkMappedMemoryRange> ranges;
-        ranges.reserve(2 * numPlanes);
-        for (int plane = 0; plane < numPlanes; ++plane) {
-            if (!d->process[plane]) {
-                continue;
-            }
-            const auto & cfg = d->planes[plane];
-            const VkDeviceSize off[2] = { cfg.out_offset, cfg.out2_offset };
-            const VkDeviceSize bytes[2] = { cfg.out_bytes, cfg.out2_bytes };
-            for (int k = 0; k < 2; ++k) {
-                ranges.push_back(mapped_range(*d->device, resource.staging_mem,
-                    d->upload_total + d->download_total + off[k], bytes[k]));
-            }
-        }
+        const auto & ranges = resource.flat_ranges(
+            *d->device, resource.staging_mem, d->upload_total + d->download_total,
+            2 * numPlanes, [&](int i) -> std::pair<VkDeviceSize, VkDeviceSize> {
+                const int plane = i / 2;
+                if (!d->process[plane]) {
+                    return { 0, 0 };
+                }
+                const auto & cfg = d->planes[plane];
+                return (i & 1) ? std::pair{ cfg.out2_offset, cfg.out2_bytes }
+                               : std::pair{ cfg.out_offset, cfg.out_bytes };
+            });
         checkVK(vkInvalidateMappedMemoryRanges(dev,
             static_cast<uint32_t>(ranges.size()), ranges.data()));
     }
@@ -2757,7 +2783,7 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
 // ---------------------------------------------------------------------------
 
 static const VSFrame *VS_CC Eedi3GetFrame(
-    int n, int activationReason, void *instanceData, void **frameData,
+    int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
 
     Eedi3Data * d = static_cast<Eedi3Data *>(instanceData);
@@ -2873,12 +2899,12 @@ static const VSFrame *VS_CC Eedi3GetFrame(
             const ptrdiff_t dst_stride = vsapi->getStride(dst, plane);
             const VkDeviceSize plane_bytes =
                 static_cast<VkDeviceSize>(dst_stride) * cfg.height;
-            if (auto err = import_plane_host_memory(*d, dstp, plane_bytes,
-                                                    direct.plane[plane])) {
+            if (auto import_err = import_plane_host_memory(*d, dstp, plane_bytes,
+                                                           direct.plane[plane])) {
                 direct.destroy(*d);
                 if (trace_on("VSFEEL_EEDI3_TRACE")) {
                     fprintf(stderr, "[eedi3] direct-to-frame import failed: %s\n",
-                            err->c_str());
+                            import_err->c_str());
                 }
                 break;
             }
@@ -2908,8 +2934,8 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     }
     if (hbench) { h_tImportEnd = std::chrono::steady_clock::now(); }
 
-    if (const auto err = record_command_buffer(*d, resource, field, direct)) {
-        return set_error(*err);
+    if (const auto record_err = record_command_buffer(*d, resource, field, direct)) {
+        return set_error(*record_err);
     }
     if (hbench) { h_tRecEnd = std::chrono::steady_clock::now(); }
 
@@ -3147,21 +3173,24 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
     const auto h_t2 = std::chrono::steady_clock::now();
 
-    eedi3_gpu_report(*d, resource, "single", 0);
+    // EEDI3H shares this frame path with EEDI3 (only `horiz` differs), so the
+    // report tag and its accumulator slot have to follow the orientation.
+    eedi3_gpu_report(*d, resource, d->horiz ? "single-h" : "single",
+                     d->horiz ? GB_EEDI3H : GB_EEDI3);
 
     if (!coherent) {
-        std::vector<VkMappedMemoryRange> ranges;
-        ranges.reserve(d->vi->format.numPlanes);
-        for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-            if (!d->process[plane]) {
-                continue;
-            }
-            const auto & cfg = d->planes[plane];
-            ranges.push_back(mapped_range(*d->device, resource.staging_mem,
-                d->upload_total + (d->horiz
-                    ? d->download_total + cfg.out_offset : cfg.dl_offset),
-                d->horiz ? cfg.out_bytes : cfg.dl_bytes));
-        }
+        const int numPlanes = d->vi->format.numPlanes;
+        const auto & ranges = resource.plane_ranges(
+            *d->device, resource.staging_mem, d->upload_total, numPlanes,
+            [&](int plane) -> std::pair<VkDeviceSize, VkDeviceSize> {
+                if (!d->process[plane]) {
+                    return { 0, 0 };
+                }
+                const auto & cfg = d->planes[plane];
+                return d->horiz
+                    ? std::pair{ d->download_total + cfg.out_offset, cfg.out_bytes }
+                    : std::pair{ cfg.dl_offset, cfg.dl_bytes };
+            });
         checkVK(vkInvalidateMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
     }
 
@@ -3179,8 +3208,6 @@ static const VSFrame *VS_CC Eedi3GetFrame(
 
         auto dstp = vsapi->getWritePtr(dst, plane);
         const ptrdiff_t dst_stride = vsapi->getStride(dst, plane);
-        const auto srcp = vsapi->getReadPtr(src, plane);
-        const ptrdiff_t src_stride = vsapi->getStride(src, plane);
 
         if (d->horiz) {
             // ENTRY_COMPOSE wrote the whole frame-order plane, so the CPU blit
@@ -3285,7 +3312,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
 // ---------------------------------------------------------------------------
 
 static void VS_CC Eedi3Free(
-    void *instanceData, VSCore *core, const VSAPI *vsapi) {
+    void *instanceData, [[maybe_unused]] VSCore *core, const VSAPI *vsapi) {
 
     Eedi3Data * d = static_cast<Eedi3Data *>(instanceData);
     vsapi->freeNode(d->node);
@@ -3295,7 +3322,7 @@ static void VS_CC Eedi3Free(
 }
 
 static void vsfeel_eedi3_create(
-    const VSMap *in, VSMap *out, void *userData,
+    const VSMap *in, VSMap *out, [[maybe_unused]] void *userData,
     VSCore *core, const VSAPI *vsapi, bool horiz, bool aa) {
 
     auto d { std::make_unique<Eedi3Data>() };
@@ -3668,14 +3695,12 @@ static void vsfeel_eedi3_create(
     d->rw = 1.0f - d->alpha - d->beta;
     d->alpha /= 3.0f;
     if (d->vi->format.sampleType == stInteger) {
-        d->peak = (1 << d->vi->format.bitsPerSample) - 1;
         const int scale = 1 << (d->vi->format.bitsPerSample - 8);
         d->beta *= static_cast<float>(scale);
         d->gamma *= static_cast<float>(scale);
         vthresh0 *= static_cast<float>(scale);
         vthresh1 *= static_cast<float>(scale);
     } else {
-        d->peak = 1;
         d->beta /= 255.0f;
         d->gamma /= 255.0f;
         vthresh0 /= 255.0f;
@@ -3911,12 +3936,8 @@ static void vsfeel_eedi3_create(
     const int subW = d->vi->format.subSamplingW;
     const int subH = d->vi->format.subSamplingH;
 
-    // Plane geometry (output dims; dh doubles the height BEFORE this: d->vi
-    // already doubled? No - the filter doubles vi at create AFTER validation.
-    // Do it now:
-    VSVideoInfo * out_vi = const_cast<VSVideoInfo *>(d->vi);
-    // We must NOT modify the const node videoInfo in place (it is shared with
-    // the upstream node). Instead build an output vi copy.
+    // Plane geometry (output dims). The filter doubles vi at create AFTER
+    // validation, so build the output vi copy now.
     VSVideoInfo out_video = *d->vi;
     // EEDI3AA is single-rate: it consumes the two doubled sub-frames of every
     // input frame internally and emits one frame per input frame, so the
@@ -3966,7 +3987,6 @@ static void vsfeel_eedi3_create(
             const int in_w = (plane == 0) ? d->vi->width : d->vi->width >> subW;
             const int in_h = (plane == 0) ? d->vi->height : d->vi->height >> subH;
             auto & a = d->aplanes[plane];
-            a.src_w = in_w;
             a.src_h = in_h;
             a.width = in_h;                 // kernel plane width = frame height
             a.height = in_w;
@@ -3993,7 +4013,6 @@ static void vsfeel_eedi3_create(
         const int kh = d->horiz ? (d->dh ? 2 * in_w : in_w)
                                 : (d->dh ? 2 * in_h : in_h);
 
-        cfg.src_w = in_w;
         cfg.src_h = in_h;
         cfg.width = kw;
         cfg.height = kh;
@@ -4420,22 +4439,22 @@ static void vsfeel_eedi3_create(
         }
         auto & cfg = planes[plane];
         WidthKey key { cfg.width, cfg.rows, cfg.tpitch, cfg.pad_stride, cfg.pad_height };
-        if (auto err = get_pipelines(key, cfg.row_pipeline, cfg.vcheck_pipeline,
-                                     cfg.pad_pipeline, cfg.vcopy_pipeline,
-                                     cfg.blit_pipeline, cfg.xpose_pipeline,
-                                     cfg.compose_pipeline, cfg.vcheck_lds)) {
-            return set_error(*err);
+        if (auto pipe_err = get_pipelines(key, cfg.row_pipeline, cfg.vcheck_pipeline,
+                                          cfg.pad_pipeline, cfg.vcopy_pipeline,
+                                          cfg.blit_pipeline, cfg.xpose_pipeline,
+                                          cfg.compose_pipeline, cfg.vcheck_lds)) {
+            return set_error(*pipe_err);
         }
         if (d->aa) {
             // EEDI3AA: the horizontal pass is a second geometry over the same
             // buffers, and the vertical merge is its own kernel.
             auto & a = d->aplanes[plane];
             WidthKey akey { a.width, a.rows, a.tpitch, a.pad_stride, a.pad_height };
-            if (auto err = get_pipelines(akey, a.row_pipeline, a.vcheck_pipeline,
-                                         a.pad_pipeline, a.vcopy_pipeline,
-                                         a.blit_pipeline, a.xpose_pipeline,
-                                         a.compose_pipeline, a.vcheck_lds)) {
-                return set_error(*err);
+            if (auto apipe_err = get_pipelines(akey, a.row_pipeline, a.vcheck_pipeline,
+                                               a.pad_pipeline, a.vcopy_pipeline,
+                                               a.blit_pipeline, a.xpose_pipeline,
+                                               a.compose_pipeline, a.vcheck_lds)) {
+                return set_error(*apipe_err);
             }
             VkPipeline asm_pipe = VK_NULL_HANDLE;
             for (auto & [w, p] : d->assemble_pipes) {
@@ -4536,7 +4555,6 @@ static void vsfeel_eedi3_create(
                 return set_error(std::get<std::string>(result));
             }
             resource.dev_mem = std::get<AllocatedMemory>(result).memory;
-            resource.dev_type_index = std::get<AllocatedMemory>(result).type_index;
         }
         {
             // Device-local kernel-built regions (built pads, packed bits).
@@ -4588,7 +4606,6 @@ static void vsfeel_eedi3_create(
                 return set_error(std::get<std::string>(result));
             }
             resource.up_dev_mem = std::get<AllocatedMemory>(result).memory;
-            resource.up_type_index = std::get<AllocatedMemory>(result).type_index;
         }
         {
             VkCommandPoolCreateInfo pool_info {

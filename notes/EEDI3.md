@@ -2622,7 +2622,8 @@ pool, fence) instead of leaking it. Correctness-only; the EEDI3 suites pass.
    `destroyed[nd++]` had zero headroom: EEDI3AA's worst case (four `WidthKey`s x
    six non-null pipelines, 24) exactly fills it. Now a `std::vector` with
    `std::find` dedup, so a fifth key or a new pipeline kind cannot smash the
-   stack.
+   stack. (Round 25's 11/12 measurements are the *timestamp* cap, a different
+   budget; this 24 is real.)
 2. **Host-pointer import.** `import_plane_host_memory` bound at
    `addr & (align-1)` without ever reading the imported buffer's own
    `VkMemoryRequirements`. It now queries them and rejects (falls back to the
@@ -2650,3 +2651,61 @@ Verified: `test_eedi3.py + test_eedi3h.py + test_eedi3aa.py` 214 passed,
 `test_nnedi3.py` 47 passed; known-length `field>1` still doubles 24 -> 48 for
 EEDI3/EEDI3H/NNEDI3; `DSTHOST=1` still imports bit-identically to the default
 path. No performance measured; every change is on a cold or latent path.
+
+## Round 25 — diagnostic-probe cleanup, MAXW single-sourcing, dead-code sweep
+
+Correctness-only; no shipped path changes behaviour.
+
+**GPU stage profiler (`VSFEEL_EEDI3_GBENCH`).** Two defects in the readback:
+the accumulator slots were indexed by `tag_id & 1`, so EEDI3 (tag 0), EEDI3H
+(tag 0) and EEDI3AA's vertical pass (tag 0) all accumulated into slot 0 and the
+printed "stage N" means different work depending on which filters shared the
+graph; and the report claimed `EEDI3_TS_CAP = 24` was "exactly consumed" by the
+AA horizontal submission. Measured mark counts per submission (via a temporary
+print, 96-frame loop so the every-50 report fires):
+
+```
+EEDI3 single   used=6/24   EEDI3H single  used=6/24
+EEDI3AA aa-v   used=11/24  EEDI3AA aa-h   used=12/24
+```
+
+so no mark was ever dropped — that claim was wrong. Fixed the real bug: four
+slots (`GB_EEDI3`, `GB_EEDI3H`, `GB_AA_VERT`, `GB_AA_HORIZ`), an explicit slot
+argument, and EEDI3H now reports as `single-h` instead of reusing `single`.
+Stage s5 exists only in the horizontal passes (compose vs assemble).
+
+**`MAXW` had two independent copies and no build link.** The comment at the
+host's `MAXW_LDS` claimed CMake passed `-DMAXW`, but the `vcheck_lds` rule did
+not, so the host's LDS-fit check and the shader's `shared float
+tlineSh[2][MAXW]` could drift and produce a pipeline whose static LDS exceeds
+the device limit. `EEDI3_MAXW` in `CMakeLists.txt` is now the single source: it
+is passed as `-DMAXW` to the shader rule and as `-DEEDI3_MAXW_LDS` to the host
+(default 4096 in both, so nothing changed for the shipped build). Verified a
+non-default configure (`-D EEDI3_MAXW=2048`) reaches both: the glslc command
+carries `-DMAXW=2048` and the host constant preprocesses to 2048.
+
+**Dead code / warnings removed.** Four `-Wshadow` `err` locals in
+`Eedi3GetFrame` and the two `get_pipelines` calls; the unused `srcp` /
+`src_stride` locals in the EEDI3 download tail (superseded when the kept rows
+moved into the upload gather); the second `out_vi` (a `const_cast` whose own
+comment contradicted the next line); `struct PlaneBases`;
+`frame_copy_stream_read`; the write-only `Eedi3Data::peak`,
+`Eedi3PlaneConfig::src_w`, `Eedi3Resource::dev_type_index` and `up_type_index`;
+and `WidthKey`'s `has_mclip`/`has_sclip`/`vcheck` fields, which were never set
+by any construction (always 0) and never read — they also produced
+`-Wmissing-field-initializers` noise. Unused VS-API callback parameters are now
+`[[maybe_unused]]`. `eedi3.cpp` is clean under `-Wall -Wextra -Wshadow` apart
+from pre-existing designated-initializer notes on `Eedi3PushConstants` and
+`VkQueryPoolCreateInfo`.
+
+**Per-frame heap traffic.** The three `vkFlush/InvalidateMappedMemoryRanges`
+sites built a fresh `std::vector<VkMappedMemoryRange>` per plane per frame. They
+now fill a reusable `Eedi3Resource::mapped_ranges` through
+`plane_ranges()`/`flat_ranges()`. Only the non-coherent fallback runs at all on
+this box, so this is preparation rather than a measured win; the gather-local
+`std::vector<uint64_t> scratch` buffers (~100 B) were left alone.
+
+Verified: `tests/` 603 passed. Bit-exactness against the previous binary
+(`8e65f1f`, real install-and-swap, `cmp` of raw planes, 14 configs — EEDI3
+field/dh/nrad/vcheck 0,3/mclip/streams=4, EEDI3H field/dh, EEDI3AA field 2 and
+3, NNEDI3 field 2): every config byte-identical.
