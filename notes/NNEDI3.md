@@ -638,3 +638,12 @@ The per-stream `Nnedi3Resource` is created into the pool via
 `FramePool::emplace()`, so an error return inside the creation loop is torn down
 by `~Nnedi3Data` (buffers, device memory, mapped windows, command buffers, query
 pool, fence) instead of leaking it. Correctness-only; `test_nnedi3.py` passes.
+
+## Unknown-length sentinel (field > 1)
+
+`if (field > 1) vi_out.numFrames *= 2` also hit the `-1` unknown-length
+sentinel, handing `createVideoFilter` a `-2` length. Now guarded with
+`if (numFrames > 0)` (same fix as EEDI3). No installed source plugin here
+reports `-1`, so the guard is verified by the standalone arithmetic check in
+`tmp/wo20_unknown_len.cpp`; known-length `field=2/3` still doubles 24 -> 48.
+Correctness-only; `test_nnedi3.py` passes.

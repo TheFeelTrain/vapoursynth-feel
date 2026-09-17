@@ -2615,3 +2615,38 @@ The per-stream `Eedi3Resource` is created into the pool via
 `FramePool::emplace()`, so an error return inside the creation loop is torn down
 by `~Eedi3Data` (buffers, device memory, mapped windows, command pool, query
 pool, fence) instead of leaking it. Correctness-only; the EEDI3 suites pass.
+
+## Round 24 — four latent-defect hardenings (correctness-only)
+
+1. **Pipeline dedup array.** `VkPipeline destroyed[8 * 3]` feeding
+   `destroyed[nd++]` had zero headroom: EEDI3AA's worst case (four `WidthKey`s x
+   six non-null pipelines, 24) exactly fills it. Now a `std::vector` with
+   `std::find` dedup, so a fifth key or a new pipeline kind cannot smash the
+   stack.
+2. **Host-pointer import.** `import_plane_host_memory` bound at
+   `addr & (align-1)` without ever reading the imported buffer's own
+   `VkMemoryRequirements`. It now queries them and rejects (falls back to the
+   CPU blit) when the offset is not a multiple of `mem_req.alignment`, when the
+   allocation region is below `mem_req.size`, or when `mem_req.memoryTypeBits`
+   rejects the chosen host-visible type. Latent only on this driver
+   (`minImportedHostPointerAlignment` already satisfies the buffer alignment).
+3. **Unknown-length sentinel.** `field > 1` multiplied `numFrames` by 2
+   unconditionally, so a `-1` unknown-length source became `-2` at
+   `createVideoFilter`. Guarded with `if (numFrames > 0)` in EEDI3's sclip
+   validation, EEDI3's output vi, and NNEDI3's output vi. No installed source
+   plugin here reports `-1` (BestSource/FFMS2 always resolve a count, including
+   on a truncated FFV1 mkv), so the sentinel arithmetic is verified by a
+   standalone compile of the exact guard (`tmp/wo20_unknown_len.cpp`): `-1`
+   stays `-1`, `0` stays `0`, known lengths still double, the
+   `> INT32_MAX/2` overflow guard is unchanged.
+4. **Diagnostic-flag consistency.** `VSFEEL_EEDI3_RAWSTAGE=1` wrote the raw
+   gather into staging while the kernels still read the raw upload from
+   `up_dev`, so alone it was garbage (it needed `NOREBAR=1`); it now selects the
+   DMA path itself. `VSFEEL_EEDI3_NOBLIT` was a silent no-op on EEDI3AA (the
+   final merge is not skippable), so the combination now fails loudly at
+   creation instead of pretending.
+
+Verified: `test_eedi3.py + test_eedi3h.py + test_eedi3aa.py` 214 passed,
+`test_nnedi3.py` 47 passed; known-length `field>1` still doubles 24 -> 48 for
+EEDI3/EEDI3H/NNEDI3; `DSTHOST=1` still imports bit-identically to the default
+path. No performance measured; every change is on a cold or latent path.

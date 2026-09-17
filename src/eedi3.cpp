@@ -1076,22 +1076,18 @@ struct Eedi3Data {
             destroy_common(dev, resource);
         }
 
-        VkPipeline destroyed[8 * 3] {};
-        int nd = 0;
+        // Same pipeline handle can be cached under several width keys; destroy
+        // each at most once. Vector, not a fixed array: the AA worst case
+        // (four width keys x six pipelines) leaves no headroom.
+        std::vector<VkPipeline> destroyed;
         for (auto & [key, quad] : width_pipes) {
             for (int i = 0; i < 8; ++i) {
                 if (!quad[i]) {
                     continue;
                 }
-                bool seen = false;
-                for (int j = 0; j < nd; ++j) {
-                    if (destroyed[j] == quad[i]) {
-                        seen = true;
-                        break;
-                    }
-                }
-                if (!seen) {
-                    destroyed[nd++] = quad[i];
+                if (std::find(destroyed.begin(), destroyed.end(), quad[i]) ==
+                    destroyed.end()) {
+                    destroyed.push_back(quad[i]);
                     vkDestroyPipeline(dev, quad[i], nullptr);
                 }
             }
@@ -1224,6 +1220,21 @@ static std::optional<std::string> import_plane_host_memory(
     };
     if (vkCreateBuffer(dev.device, &buffer_info, nullptr, &out.buffer) != VK_SUCCESS) {
         return "vkCreateBuffer for the imported plane failed";
+    }
+
+    // The alignment the buffer itself requires, not just the host pointer's:
+    // binding at `offset` is invalid usage unless it is a multiple of this.
+    VkMemoryRequirements mem_req {};
+    vkGetBufferMemoryRequirements(dev.device, out.buffer, &mem_req);
+    if (offset % mem_req.alignment != 0 || region < mem_req.size) {
+        vkDestroyBuffer(dev.device, out.buffer, nullptr);
+        out.buffer = VK_NULL_HANDLE;
+        return "host pointer does not meet the imported buffer's alignment";
+    }
+    if (!(mem_req.memoryTypeBits & (1u << type_index))) {
+        vkDestroyBuffer(dev.device, out.buffer, nullptr);
+        out.buffer = VK_NULL_HANDLE;
+        return "imported buffer rejects the host-visible memory type";
     }
 
     VkImportMemoryHostPointerInfoEXT import_info {
@@ -3506,7 +3517,10 @@ static void vsfeel_eedi3_create(
             if (d->vi->numFrames > INT32_MAX / 2) {
                 return set_error("resulting clip is too long");
             }
-            out_vi.numFrames = d->vi->numFrames * 2;
+            // numFrames == -1 is the unknown-length sentinel, not a length.
+            if (d->vi->numFrames > 0) {
+                out_vi.numFrames *= 2;
+            }
         }
         if (d->dh) {
             if (d->horiz) {
@@ -3575,12 +3589,21 @@ static void vsfeel_eedi3_create(
         }
     }
     d->raw_stage = std::getenv("VSFEEL_EEDI3_RAWSTAGE") != nullptr;
+    if (d->raw_stage) {
+        // The host writes the raw gather to staging instead of up_dev, but the
+        // kernels always read the raw upload from whichever buffer the H2D path
+        // mirrors into. That is only consistent with the DMA path.
+        d->rebar_up = false;
+    }
     d->blit_contig = std::getenv("VSFEEL_EEDI3_BLITCONTIG") != nullptr;
     d->skip_pad = std::getenv("VSFEEL_EEDI3_NOPAD") != nullptr;
     if (const char * pp = std::getenv("VSFEEL_EEDI3_PADPAR")) {
         d->pad_skip_parity = atoi(pp) != 0;
     }
     d->skip_blit = std::getenv("VSFEEL_EEDI3_NOBLIT") != nullptr;
+    if (d->aa && d->skip_blit) {
+        return set_error("VSFEEL_EEDI3_NOBLIT is not supported by EEDI3AA");
+    }
     d->skip_sclip = std::getenv("VSFEEL_EEDI3_NOSCLIP") != nullptr;
     d->skip_raw = std::getenv("VSFEEL_EEDI3_NORAW") != nullptr;
     d->skip_h2d = std::getenv("VSFEEL_EEDI3_NOH2D") != nullptr;
@@ -3902,7 +3925,10 @@ static void vsfeel_eedi3_create(
         if (d->vi->numFrames > INT32_MAX / 2) {
             return set_error("resulting clip is too long");
         }
-        out_video.numFrames *= 2;
+        // numFrames == -1 is the unknown-length sentinel, not a length.
+        if (d->vi->numFrames > 0) {
+            out_video.numFrames *= 2;
+        }
         vsh::muldivRational(&out_video.fpsNum, &out_video.fpsDen, 2, 1);
     }
     // dh doubles the interpolated axis: the height vertically, the width in

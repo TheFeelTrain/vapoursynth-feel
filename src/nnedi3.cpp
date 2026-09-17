@@ -1410,7 +1410,10 @@ static void VS_CC Nnedi3Create(
         if (d->vi_out.numFrames > INT32_MAX / 2) {
             return set_error("resulting clip is too long.");
         }
-        d->vi_out.numFrames *= 2;
+        // numFrames == -1 is the unknown-length sentinel, not a length.
+        if (d->vi_out.numFrames > 0) {
+            d->vi_out.numFrames *= 2;
+        }
         vsh::muldivRational(&d->vi_out.fpsNum, &d->vi_out.fpsDen, 2, 1);
     }
     if (d->dh) {
