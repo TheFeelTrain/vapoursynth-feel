@@ -917,4 +917,10 @@ X.Y)"), every `vkCreateComputePipelines` takes `pipeline_cache_lock`, and
 `DEVICE_LOCAL|HOST_VISIBLE` request. On this box nothing changes behaviourally
 (`api_version=1.4`, extension present, staging coherent); full suite green.
 
+The fused horizontal gather shares EEDI3's `deint_row_u16/f32`, whose
+streaming-store predicate tested the element index instead of the pointer (so
+row cells not a multiple of 32 bytes silently took cached stores into the
+uncached ReBAR window). See `notes/EEDI3.md` round 23 — `aa_gather_horizontal`
+gets the same fix for free.
+
 

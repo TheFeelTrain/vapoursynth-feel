@@ -221,7 +221,9 @@ static inline __m256i deint_odd_f32(const __m256i a, const __m256i b) {
 // than offsetting the pointer) keeps every 32-byte load 32-byte aligned — a
 // 2-byte offset makes each load straddle two cache lines. `nt` streams the
 // stores (required for the uncached host-visible VRAM the ReBAR upload targets;
-// the 32-byte-aligned body is what makes that worth doing).
+// the 32-byte-aligned body is what makes that worth doing): the scalar head
+// loop aligns `d` and each body iteration advances exactly 32 bytes, so every
+// body store is aligned and can be a streaming store.
 static inline void deint_row_u16(const uint16_t * s, uint16_t * d, int rows,
                                  int simd_lim, bool nt, const bool odd) {
     int k = 0;
@@ -237,7 +239,7 @@ static inline void deint_row_u16(const uint16_t * s, uint16_t * d, int rows,
         const __m256i vb = _mm256_loadu_si256(
             reinterpret_cast<const __m256i *>(s + 2 * k + 16));
         const __m256i v = odd ? deint_odd_u16(va, vb) : deint_even_u16(va, vb);
-        if (nt && (k & 15) == 0) {
+        if (nt) {
             _mm256_stream_si256(reinterpret_cast<__m256i *>(d + k), v);
         } else {
             _mm256_storeu_si256(reinterpret_cast<__m256i *>(d + k), v);
@@ -262,7 +264,7 @@ static inline void deint_row_f32(const float * s, float * d, int rows,
         const __m256i va = _mm256_castps_si256(_mm256_loadu_ps(s + 2 * k));
         const __m256i vb = _mm256_castps_si256(_mm256_loadu_ps(s + 2 * k + 8));
         const __m256i v = odd ? deint_odd_f32(va, vb) : deint_even_f32(va, vb);
-        if (nt && (k & 7) == 0) {
+        if (nt) {
             _mm256_stream_ps(d + k, _mm256_castsi256_ps(v));
         } else {
             _mm256_storeu_ps(d + k, _mm256_castsi256_ps(v));

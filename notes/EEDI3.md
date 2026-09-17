@@ -2582,3 +2582,29 @@ so attribute kernels only in the ns=1 trace.
 - No behaviour change here (`api_version=1.4`, extension present, ReBAR present,
   staging coherent), so no measurement; verified with the full test suite plus
   `VSFEEL_DBG=1` showing the recorded values.
+
+## Round 23 — NT-store alignment predicate in the host gather
+
+`deint_row_u16` / `deint_row_f32` gated their streaming store on
+`(k & 15) == 0` / `(k & 7) == 0` — the *element index*, not the pointer. The
+scalar head loop already aligns `d`, so after it `d + k` is 32-byte aligned by
+construction and every body iteration advances exactly 32 bytes; the predicate
+was therefore true only when the head length happened to be a multiple of the
+vector width. On any destination row whose cell length is not a multiple of 32
+bytes (EEDI3H's transposed kept-row cells are `rows * elem`: at a 630-px source
+that is 1260 B for u16 and 2520 B for f32) the head is 10 / 6 elements and
+*every* body store silently fell back to `_mm256_storeu_*` — a cached store into
+the uncached host-visible VRAM window that the whole ReBAR upload design targets.
+Predicate dropped: `nt` alone now selects `_mm256_stream_*`. The 1920-px
+flagship was unaffected (rows are a multiple of 32 bytes, head always 0).
+
+Measured on the AA geometry (jpbd -> 630px luma -> 2x Point, EEDI3H field=3,
+mclip, 800 frames, ns=8, interleaved old/new binaries, 3 rounds of 2 reps;
+harness: `tmp/bench_eedi3h_crop.py`):
+old 799.9/784.1/798.9, new 803.1/824.9/803.4 fps. Same-order pairs are +0.4%
+and +0.6%; the middle pair is +5% but order-confounded. Perf-neutral in
+practice, and the ablation says why: `VSFEEL_EEDI3_NORAW=1` (skip the raw
+gather) is worth only +2.6% at this width, and `VSFEEL_EEDI3_COPY=0` (force
+cached stores on every gather) costs ~1% — full-width 32-byte AVX stores
+coalesce in the write-combining buffer, unlike the narrow scalar stores behind
+the old "27.6 fps" observation. Output bit-identical at 630/638/640 px.
