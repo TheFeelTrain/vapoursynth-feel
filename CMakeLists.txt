@@ -43,247 +43,189 @@ endif()
 
 # SPIR-V: compile the GLSL kernels with glslc when available.
 # Each kernel is compiled for 16/32-bit staging formats.
-set(VK_SPV_DIR "${CMAKE_CURRENT_BINARY_DIR}/vk_spv")
 
-set(VK_KERNEL_COMPONENTS shared plain)
-set(VK_BITS 16 32)
+# --- shader variant table -----------------------------------------------------
+# One "|"-separated "<out>|<source>|<defs>" entry per .spv (pipes, not
+# semicolons: a ";" would split a quoted entry into three separate list
+# elements). The table is the only place a variant is declared: entry point, bit
+# depth, radius and every other -D live in the <defs> field, so adding a variant
+# is one line and there is no entry-name -> -D ladder to extend in several
+# places. add_spv_variant() below turns an entry into the glslc rule.
+#
+# The <defs> fields are quoted so that entries stay one CMake list element even
+# when they carry spaces; separate_arguments() splits them back into arguments.
+#
+# --target-env is deliberately left as it is here (bilateral/bm3d/gaussblur/
+# nlmeans compile as SPIR-V 1.0, dfttest/eedi3/nnedi3 as 1.6). Unifying it is a
+# codegen change and belongs in its own measured commit, not in this refactor.
 
-if(VK_GLSLC)
-    set(VK_SPV_OUTPUTS)
-    foreach(component IN LISTS VK_KERNEL_COMPONENTS)
-        foreach(bits IN LISTS VK_BITS)
-            list(APPEND VK_SPV_OUTPUTS "${VK_SPV_DIR}/bilateral_${component}_${bits}.spv")
-            add_custom_command(
-                OUTPUT "${VK_SPV_DIR}/bilateral_${component}_${bits}.spv"
-                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
-                COMMAND ${VK_GLSLC} -O -fshader-stage=compute -DBITS=${bits}
-                        -o "${VK_SPV_DIR}/bilateral_${component}_${bits}.spv"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/src/bilateral_${component}.comp"
-                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/bilateral_${component}.comp"
-                VERBATIM)
-        endforeach()
+set(VK_BITS "16" "32")
+
+# Bilateral: one entry point per file, per io variant.
+set(VK_BILATERAL_VARIANTS)
+foreach(component IN ITEMS shared plain)
+    foreach(bits IN LISTS VK_BITS)
+        list(APPEND VK_BILATERAL_VARIANTS
+            "bilateral_${component}_${bits}|bilateral_${component}.comp|-DBITS=${bits}")
     endforeach()
-    foreach(kernel IN ITEMS bm3d bm3d_agg)
-        list(APPEND VK_SPV_OUTPUTS "${VK_SPV_DIR}/${kernel}.spv")
-        add_custom_command(
-            OUTPUT "${VK_SPV_DIR}/${kernel}.spv"
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
-            COMMAND ${VK_GLSLC} -O -fshader-stage=compute
-                    -o "${VK_SPV_DIR}/${kernel}.spv"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/src/${kernel}.comp"
-            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/${kernel}.comp"
-            VERBATIM)
+endforeach()
+
+# BM3D: two single-entry files, no io variants (float only).
+set(VK_BM3D_VARIANTS
+    "bm3d|bm3d.comp|"
+    "bm3d_agg|bm3d_agg.comp|")
+
+# GaussBlur: one kernel with three entry points (fused small path + the two
+# large-path passes), per io variant (16 int, 32 float).
+set(VK_GAUSS_ENTRIES gauss vert horiz)
+set(VK_GAUSS_ENTRY_DEFS -DENTRY_GAUSS -DENTRY_VERT -DENTRY_HORIZ)
+set(VK_GAUSS_VARIANTS)
+foreach(bits IN LISTS VK_BITS)
+    foreach(entry_i RANGE 0 2)
+        list(GET VK_GAUSS_ENTRIES ${entry_i} entry)
+        list(GET VK_GAUSS_ENTRY_DEFS ${entry_i} entry_def)
+        list(APPEND VK_GAUSS_VARIANTS
+            "gaussblur_${bits}_${entry}|gaussblur.comp|-DBITS=${bits} ${entry_def}")
     endforeach()
-    # GaussBlur: one kernel with three entry points (fused small path + the two
-    # large-path passes), per io variant (16 int, 32 float)
-    set(VK_GAUSS_ENTRIES gauss vert horiz)
-    set(VK_GAUSS_BITDEFS "16" "32")
-    foreach(bits IN LISTS VK_GAUSS_BITDEFS)
-        set(bits_defs -DBITS=${bits})
-        foreach(entry IN LISTS VK_GAUSS_ENTRIES)
-            set(defs ${bits_defs})
-            if(entry STREQUAL gauss)
-                list(APPEND defs -DENTRY_GAUSS)
-            elseif(entry STREQUAL vert)
-                list(APPEND defs -DENTRY_VERT)
-            else()
-                list(APPEND defs -DENTRY_HORIZ)
-            endif()
-            list(APPEND VK_SPV_OUTPUTS "${VK_SPV_DIR}/gaussblur_${bits}_${entry}.spv")
-            add_custom_command(
-                OUTPUT "${VK_SPV_DIR}/gaussblur_${bits}_${entry}.spv"
-                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
-                COMMAND ${VK_GLSLC} -O -fshader-stage=compute ${defs}
-                        -o "${VK_SPV_DIR}/gaussblur_${bits}_${entry}.spv"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/src/gaussblur.comp"
-                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/gaussblur.comp"
-                VERBATIM)
-        endforeach()
+endforeach()
+
+# DFTTest: pad + fused + col2im kernels per io variant (16 int, 32
+# float); the fused kernel is additionally compiled per temporal radius
+# (0..3, i.e. tbsize 1/3/5/7) so its loops unroll and the working array
+# stays in registers (the reference does the same via `#define RADIUS`).
+# The fused kernel uses subgroup barriers instead of workgroup barriers
+# (each 16-lane block lives entirely in one wavefront), so SPIR-V 1.3+ is
+# required.
+set(VK_DFT_ENTRIES pad_slot pad_direct col2im)
+set(VK_DFT_ENTRY_DEFS -DENTRY_PAD_SLOT -DENTRY_PAD_DIRECT -DENTRY_COL2IM)
+set(VK_DFT_VARIANTS)
+foreach(bits IN LISTS VK_BITS)
+    foreach(entry_i RANGE 0 2)
+        list(GET VK_DFT_ENTRIES ${entry_i} entry)
+        list(GET VK_DFT_ENTRY_DEFS ${entry_i} entry_def)
+        list(APPEND VK_DFT_VARIANTS
+            "dfttest_${bits}_${entry}|dfttest.comp|--target-env=vulkan1.3 -DBITS=${bits} ${entry_def}")
     endforeach()
-    # DFTTest: pad + fused + col2im kernels per io variant (16 int, 32
-    # float); the fused kernel is additionally compiled per temporal radius
-    # (0..3, i.e. tbsize 1/3/5/7) so its loops unroll and the working array
-    # stays in registers (the reference does the same via `#define RADIUS`).
-    # The fused kernel uses subgroup barriers instead of workgroup barriers
-    # (each 16-lane block lives entirely in one wavefront), so SPIR-V 1.3+ is
-    # required.
-    set(VK_DFT_ENTRIES pad_slot pad_direct col2im)
-    set(VK_DFT_BITS "16" "32")
-    foreach(bits IN LISTS VK_DFT_BITS)
-        foreach(entry IN LISTS VK_DFT_ENTRIES)
-            set(defs -DBITS=${bits})
-            if(entry STREQUAL pad_slot)
-                list(APPEND defs -DENTRY_PAD_SLOT)
-            elseif(entry STREQUAL pad_direct)
-                list(APPEND defs -DENTRY_PAD_DIRECT)
-            else()
-                list(APPEND defs -DENTRY_COL2IM)
-            endif()
-            set(raw_spv "${VK_SPV_DIR}/dfttest_${bits}_${entry}.spv")
-            list(APPEND VK_SPV_OUTPUTS "${raw_spv}")
-            add_custom_command(
-                OUTPUT "${raw_spv}"
-                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
-                COMMAND ${VK_GLSLC} --target-env=vulkan1.3 -O -fshader-stage=compute ${defs}
-                        -o "${raw_spv}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
-                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
-                VERBATIM)
-        endforeach()
-        foreach(radius RANGE 0 3)
-            set(raw_spv "${VK_SPV_DIR}/dfttest_${bits}_fused_r${radius}.spv")
-            list(APPEND VK_SPV_OUTPUTS "${raw_spv}")
-            add_custom_command(
-                OUTPUT "${raw_spv}"
-                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
-                COMMAND ${VK_GLSLC} --target-env=vulkan1.3 -O -fshader-stage=compute -DBITS=${bits}
-                        -DENTRY_FUSED -DRADIUS=${radius}
-                        -o "${raw_spv}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
-                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
-                VERBATIM)
+    foreach(radius RANGE 0 3)
+        list(APPEND VK_DFT_VARIANTS
+            "dfttest_${bits}_fused_r${radius}|dfttest.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_FUSED -DRADIUS=${radius}"
             # slot-direct fused variant (no padded-fallback branch in im2col);
             # used when every temporal slice of the frame lives in a slot
-            set(raw_spv "${VK_SPV_DIR}/dfttest_${bits}_fused_direct_r${radius}.spv")
-            list(APPEND VK_SPV_OUTPUTS "${raw_spv}")
-            add_custom_command(
-                OUTPUT "${raw_spv}"
-                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
-                COMMAND ${VK_GLSLC} --target-env=vulkan1.3 -O -fshader-stage=compute -DBITS=${bits}
-                        -DENTRY_FUSED -DFUSED_DIRECT -DRADIUS=${radius}
-                        -o "${raw_spv}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
-                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/dfttest.comp"
-                VERBATIM)
-        endforeach()
+            "dfttest_${bits}_fused_direct_r${radius}|dfttest.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_FUSED -DFUSED_DIRECT -DRADIUS=${radius}")
     endforeach()
-    # NLMeans: weight / accumulation / finish / pad entry points per io
-    # variant (16-bit int, 32-bit float); everything else is a specialization
-    # constant.
-    set(VK_NLM_ENTRIES weight acc finish pad)
-    set(VK_NLM_BITS "16" "32")
-    foreach(bits IN LISTS VK_NLM_BITS)
-        foreach(entry IN LISTS VK_NLM_ENTRIES)
-            set(defs -DBITS=${bits})
-            if(entry STREQUAL weight)
-                list(APPEND defs -DENTRY_WEIGHT)
-            elseif(entry STREQUAL acc)
-                list(APPEND defs -DENTRY_ACC)
-            elseif(entry STREQUAL pad)
-                list(APPEND defs -DENTRY_PAD)
-            else()
-                list(APPEND defs -DENTRY_FINISH)
-            endif()
-            set(raw_spv "${VK_SPV_DIR}/nlmeans_${bits}_${entry}.spv")
-            list(APPEND VK_SPV_OUTPUTS "${raw_spv}")
-            add_custom_command(
-                OUTPUT "${raw_spv}"
-                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
-                COMMAND ${VK_GLSLC} -O -fshader-stage=compute ${defs}
-                        -o "${raw_spv}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/src/nlmeans.comp"
-                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/nlmeans.comp"
-                VERBATIM)
-        endforeach()
+endforeach()
+
+# NLMeans: weight / accumulation / finish / pad entry points per io
+# variant (16-bit int, 32-bit float); everything else is a specialization
+# constant.
+set(VK_NLM_ENTRIES weight acc finish pad)
+set(VK_NLM_ENTRY_DEFS -DENTRY_WEIGHT -DENTRY_ACC -DENTRY_FINISH -DENTRY_PAD)
+set(VK_NLM_VARIANTS)
+foreach(bits IN LISTS VK_BITS)
+    foreach(entry_i RANGE 0 3)
+        list(GET VK_NLM_ENTRIES ${entry_i} entry)
+        list(GET VK_NLM_ENTRY_DEFS ${entry_i} entry_def)
+        list(APPEND VK_NLM_VARIANTS
+            "nlmeans_${bits}_${entry}|nlmeans.comp|-DBITS=${bits} ${entry_def}")
     endforeach()
-    # EEDI3: row kernel (one 32-lane WG per interp row, subgroup-register DP
-    # with shuffles) + vcheck kernel (single WG serial row walk), per io
-    # variant (16 int, 32 float). The row kernel needs subgroup ops + the
-    # Vulkan memory model, so SPIR-V 1.3+ (vulkan1.3 target) is required.
-    set(EEDI3_PROBE "0" CACHE STRING "EEDI3 diagnostics-only shader ablation level")
-    # Max plane width the vcheck LDS ping-pong can hold. Single source for the
-    # shader (-DMAXW) and the host's fit check (EEDI3_MAXW_LDS), so the two
-    # cannot drift and create a pipeline whose static LDS exceeds the device.
-    set(EEDI3_MAXW "4096" CACHE STRING "EEDI3 vcheck LDS max plane width")
-    set(VK_EEDI3_ENTRIES row vcheck vcheck_lds)
-    set(VK_EEDI3_BITS "16" "32")
-    foreach(bits IN LISTS VK_EEDI3_BITS)
-        foreach(entry IN LISTS VK_EEDI3_ENTRIES)
-            set(defs -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW})
-            if(entry STREQUAL row)
-                list(APPEND defs -DENTRY_ROW)
-            elseif(entry STREQUAL vcheck_lds)
-                list(APPEND defs -DENTRY_VCHECK -DVCHECK_LDS=1)
-            else()
-                list(APPEND defs -DENTRY_VCHECK)
-            endif()
-            set(raw_spv "${VK_SPV_DIR}/eedi3_${bits}_${entry}.spv")
-            list(APPEND VK_SPV_OUTPUTS "${raw_spv}")
-            add_custom_command(
-                OUTPUT "${raw_spv}"
-                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
-                COMMAND ${VK_GLSLC} --target-env=vulkan1.3 -O -fshader-stage=compute ${defs}
-                        -o "${raw_spv}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/src/eedi3.comp"
-                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/eedi3.comp"
-                VERBATIM)
-        endforeach()
-    endforeach()
-    # EEDI3 upload kernels: mirror-pad builder + empty-row vcheck copy per io
-    # variant (plain 1D kernels, fixed local size, no subgroup ops);
-    # vulkan1.3 target keeps one rule for the file.
-    set(VK_EEDI3_UP_ENTRIES pad vcopy blit xpose compose assemblev)
-    foreach(bits IN LISTS VK_EEDI3_BITS)
-        foreach(entry IN LISTS VK_EEDI3_UP_ENTRIES)
-            if(entry STREQUAL pad)
-                set(entry_def -DENTRY_PAD)
-            elseif(entry STREQUAL blit)
-                set(entry_def -DENTRY_BLIT)
-            elseif(entry STREQUAL xpose)
-                set(entry_def -DENTRY_XPOSE)
-            elseif(entry STREQUAL compose)
-                set(entry_def -DENTRY_COMPOSE)
-            elseif(entry STREQUAL assemblev)
-                set(entry_def -DENTRY_ASSEMBLEV)
-            else()
-                set(entry_def -DENTRY_VCOPY)
-            endif()
-            set(raw_spv "${VK_SPV_DIR}/eedi3_${bits}_${entry}.spv")
-            list(APPEND VK_SPV_OUTPUTS "${raw_spv}")
-            add_custom_command(
-                OUTPUT "${raw_spv}"
-                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
-                COMMAND ${VK_GLSLC} --target-env=vulkan1.3 -O -fshader-stage=compute -DBITS=${bits} ${entry_def}
-                        -o "${raw_spv}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/src/eedi3.comp"
-                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/eedi3.comp"
-                VERBATIM)
-        endforeach()
-    endforeach()
-    # NNEDI3: prescreener + cooperative predictor (+PXP=4 narrow variant for
-    # wide networks, +PXP=4 small-tile variant for FS<=64: 4KB LDS instead
-    # of 18KB) + count + full-frame assembler per io variant. The predictor
-    # needs subgroup ops + the Vulkan memory model, so SPIR-V 1.3+.
-    set(VK_NNEDI3_ENTRIES pad prescreen predict predict_n4 predict_n4s count assemble)
-    set(VK_NNEDI3_BITS "16" "32")
-    foreach(bits IN LISTS VK_NNEDI3_BITS)
-        foreach(entry IN LISTS VK_NNEDI3_ENTRIES)
-            if(entry STREQUAL pad)
-                set(entry_def -DENTRY_PAD)
-            elseif(entry STREQUAL prescreen)
-                set(entry_def -DENTRY_PRESCREEN)
-            elseif(entry STREQUAL predict)
-                set(entry_def -DENTRY_PREDICT)
-            elseif(entry STREQUAL predict_n4)
-                set(entry_def -DENTRY_PREDICT -DPXP=4)
-            elseif(entry STREQUAL predict_n4s)
-                set(entry_def -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=64u)
-            elseif(entry STREQUAL count)
-                set(entry_def -DENTRY_COUNT)
-            else()
-                set(entry_def -DENTRY_ASSEMBLE)
-            endif()
-            set(raw_spv "${VK_SPV_DIR}/nnedi3_${bits}_${entry}.spv")
-            list(APPEND VK_SPV_OUTPUTS "${raw_spv}")
-            add_custom_command(
-                OUTPUT "${raw_spv}"
-                COMMAND ${CMAKE_COMMAND} -E make_directory "${VK_SPV_DIR}"
-                COMMAND ${VK_GLSLC} --target-env=vulkan1.3 -O -fshader-stage=compute -DBITS=${bits} ${entry_def}
-                        -o "${raw_spv}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3.comp"
-                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3.comp"
-                VERBATIM)
-        endforeach()
+endforeach()
+
+# EEDI3: row kernel (one 32-lane WG per interp row, subgroup-register DP
+# with shuffles) + vcheck kernel (single WG serial row walk), per io
+# variant (16 int, 32 float). The row kernel needs subgroup ops + the
+# Vulkan memory model, so SPIR-V 1.3+ (vulkan1.3 target) is required.
+# PROBE and MAXW are cache variables: PROBE is a diagnostics-only ablation
+# level, MAXW is the max plane width the vcheck LDS ping-pong can hold, kept in
+# step with the host's fit check (EEDI3_MAXW_LDS) so the two cannot drift into a
+# pipeline whose static LDS exceeds the device.
+set(EEDI3_PROBE "0" CACHE STRING "EEDI3 diagnostics-only shader ablation level")
+set(EEDI3_MAXW "4096" CACHE STRING "EEDI3 vcheck LDS max plane width")
+set(VK_EEDI3_VARIANTS)
+foreach(bits IN LISTS VK_BITS)
+    list(APPEND VK_EEDI3_VARIANTS
+        "eedi3_${bits}_row|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_ROW"
+        "eedi3_${bits}_vcheck|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK"
+        "eedi3_${bits}_vcheck_lds|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_LDS=1"
+        # upload kernels: mirror-pad builder + empty-row vcheck copy and the
+        # assemble/transpose passes (plain 1D kernels, fixed local size, no
+        # subgroup ops); vulkan1.3 target keeps one rule for the file.
+        "eedi3_${bits}_pad|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PAD"
+        "eedi3_${bits}_vcopy|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_VCOPY"
+        "eedi3_${bits}_blit|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_BLIT"
+        "eedi3_${bits}_xpose|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_XPOSE"
+        "eedi3_${bits}_compose|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_COMPOSE"
+        "eedi3_${bits}_assemblev|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_ASSEMBLEV")
+endforeach()
+
+# NNEDI3: prescreener + cooperative predictor (+PXP=4 narrow variant for
+# wide networks, +PXP=4 small-tile variant for FS<=64: 4KB LDS instead
+# of 18KB) + count + full-frame assembler per io variant. The predictor
+# needs subgroup ops + the Vulkan memory model, so SPIR-V 1.3+.
+set(VK_NNEDI3_VARIANTS)
+foreach(bits IN LISTS VK_BITS)
+    list(APPEND VK_NNEDI3_VARIANTS
+        "nnedi3_${bits}_pad|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PAD"
+        "nnedi3_${bits}_prescreen|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PRESCREEN"
+        "nnedi3_${bits}_predict|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PREDICT"
+        "nnedi3_${bits}_predict_n4|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PREDICT -DPXP=4"
+        "nnedi3_${bits}_predict_n4s|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=64u"
+        "nnedi3_${bits}_count|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_COUNT"
+        "nnedi3_${bits}_assemble|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_ASSEMBLE")
+endforeach()
+
+set(VK_VARIANTS
+    ${VK_BILATERAL_VARIANTS}
+    ${VK_BM3D_VARIANTS}
+    ${VK_GAUSS_VARIANTS}
+    ${VK_DFT_VARIANTS}
+    ${VK_NLM_VARIANTS}
+    ${VK_EEDI3_VARIANTS}
+    ${VK_NNEDI3_VARIANTS})
+
+# --- the glslc rule -----------------------------------------------------------
+
+# One .spv per table entry. <defs> is a single string so the rule stays one
+# command; it is split back into arguments here.
+#
+# Each rule also DEPENDS on a per-variant flags file holding that variant's
+# glslc arguments. Ninja tracks the command line itself, but the default Unix
+# Makefiles generator does not: without the stamp a -D, a --target-env or a
+# PROBE/MAXW cache change leaves a stale .spv behind and silently ships the old
+# kernel. The file is written with file(GENERATE) (content-hash: only a real
+# flag change touches it, so an unrelated CMakeLists edit does not recompile
+# the shaders).
+function(add_spv_variant out source defs)
+    separate_arguments(flags UNIX_COMMAND "${defs}")
+
+    set(spv "${VK_SPV_DIR}/${out}.spv")
+    set(stamp "${VK_SPV_DIR}/${out}.spv.flags")
+    file(GENERATE OUTPUT "${stamp}" CONTENT "${flags}\n")
+
+    add_custom_command(
+        OUTPUT "${spv}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${VK_SPV_DIR}"
+        COMMAND "${VK_GLSLC}" -O -fshader-stage=compute ${flags} -o "${spv}" "${source}"
+        DEPENDS "${source}" "${stamp}"
+        VERBATIM)
+    set(VK_SPV_OUTPUTS ${VK_SPV_OUTPUTS} "${spv}" PARENT_SCOPE)
+endfunction()
+
+if(VK_GLSLC)
+    set(VK_SPV_DIR "${CMAKE_CURRENT_BINARY_DIR}/vk_spv")
+    set(VK_SPV_OUTPUTS)
+    foreach(variant IN LISTS VK_VARIANTS)
+        string(REPLACE "|" ";" variant_fields "${variant}")
+        list(LENGTH variant_fields field_count)
+        if(field_count LESS 2)
+            message(FATAL_ERROR "malformed shader variant entry: ${variant}")
+        endif()
+        list(GET variant_fields 0 out)
+        list(GET variant_fields 1 source)
+        list(SUBLIST variant_fields 2 -1 defs)
+        if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/${source}")
+            message(FATAL_ERROR "shader variant ${out}: missing src/${source}")
+        endif()
+        add_spv_variant("${out}" "${CMAKE_CURRENT_SOURCE_DIR}/src/${source}" "${defs}")
     endforeach()
 else()
     message(FATAL_ERROR "glslc not found")
@@ -403,3 +345,5 @@ if(NOT VS_FOUND)
     install(TARGETS vsfeel LIBRARY RUNTIME)
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vk/manifest.vs" DESTINATION .)
 endif()
+
+# wo39 rebuild probe comment
