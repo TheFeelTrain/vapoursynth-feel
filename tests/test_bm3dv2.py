@@ -148,6 +148,28 @@ def test_bm3dv2_multi_stream_matches_single(noise_gray):
         assert np.abs(d).max() < 1e-5, f"num_streams mismatch at frame {n}"
 
 
+def test_bm3dv2_nosearch_matches_search_on_constant_clip(monkeypatch):
+    """The no-search arm must initialise the shared match tables, or the
+    aggregation indexes stale LDS.
+
+    Before the fix a constant clip came out 99.5% NaN; it now matches the
+    searched run to one ulp.
+    """
+    clip = vs.core.std.BlankClip(
+        width=64, height=64, format=vs.GRAYS, length=3, color=0.5)
+    monkeypatch.delenv("BM3D_NOSEARCH", raising=False)
+    search = _run(clip, radius=2, num_streams=1)
+    monkeypatch.setenv("BM3D_NOSEARCH", "1")
+    nosearch = _run(clip, radius=2, num_streams=1)
+    for n in range(3):
+        a = frame_to_ndarray(search.get_frame(n))
+        b = frame_to_ndarray(nosearch.get_frame(n))
+        assert np.isfinite(b).all(), f"non-finite no-search output at frame {n}"
+        # measured 2.98e-8 (one ulp) between the two arms on this input
+        assert np.abs(a - b).max() < 1e-6, f"no-search vs search at frame {n}"
+        assert np.abs(b - 0.5).max() < 1e-6, f"no-search left the constant at frame {n}"
+
+
 def test_bm3dv2_rejects_gray8(noise_8bit):
     with pytest.raises(vs.Error):
         _run(noise_8bit)
@@ -216,6 +238,29 @@ def test_bm3dv2_accepts_exactly_8x8():
     a = frame_to_ndarray(out.get_frame(0))
     assert a.shape == (8, 8)
     assert np.isfinite(a).all()
+
+
+def test_bm3dv2_rejects_int32_res_overflow():
+    """A stack above 2^31 floats must be rejected at creation.
+
+    The kernel addresses `res` through signed 32-bit offsets, so 3840x2160 /
+    radius 4 / num_streams 4 (3.13e9 floats, an 11.7 GiB buffer that does
+    allocate on a 24 GiB card) wrapped negatively.
+    """
+    with pytest.raises(vs.Error, match="32-bit"):
+        vs.core.vsfeel.BM3Dv2(
+            _blank(3840, 2160), sigma=SIGMA, radius=4, bm_range=BM_RANGE,
+            ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=4,
+        )
+
+
+def test_bm3dv2_accepts_radius4_within_addressing_limit():
+    """The guard must not reject radius 4 when the stack stays addressable."""
+    out = vs.core.vsfeel.BM3Dv2(
+        _blank(8, 8), sigma=SIGMA, radius=4, bm_range=BM_RANGE,
+        ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=4,
+    )
+    assert out.num_frames == 3
 
 
 def test_bm3dv2_device_id(noise_gray):

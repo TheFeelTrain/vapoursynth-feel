@@ -1167,6 +1167,12 @@ static void VS_CC BM3DCreate(
         return set_error("clip dimensions must be at least 8x8");
     }
 
+    // The window clamps and the cache keys assume [0, numFrames-1]; an empty
+    // or unknown length would index the slot tables before their base.
+    if (d->vi->numFrames <= 0) {
+        return set_error("clip frame count must be known and positive");
+    }
+
     std::array<float, 3> sigma;
     for (int i = 0; i < std::ssize(sigma); ++i) {
         sigma[i] = static_cast<float>(vsapi->mapGetFloat(in, "sigma", i, &error));
@@ -1366,6 +1372,23 @@ static void VS_CC BM3DCreate(
         d->chroma = true;
     } else {
         return set_error("BM3D: only Gray and YUV input are currently supported");
+    }
+
+    // The kernel addresses the estimate stacks through signed 32-bit offsets,
+    // so a stack at or above 2^31 floats wraps and writes outside the slot.
+    {
+        const VkDeviceSize res_floats = static_cast<VkDeviceSize>(d->res_cap) *
+            d->tw * 2 * d->planes[0].pe;
+        if (res_floats > static_cast<VkDeviceSize>(INT32_MAX)) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                "frame is too large: the estimate cache needs %llu floats per "
+                "plane (radius %d, num_streams %d), which overflows the 32-bit "
+                "kernel addressing; reduce num_streams or radius",
+                static_cast<unsigned long long>(res_floats), d->radius,
+                d->num_streams);
+            return set_error(msg);
+        }
     }
 
     // shared buffers

@@ -635,7 +635,10 @@ void main() {
             }
         }
     }
+    }
 
+    // The aggregation phase indexes these tables unconditionally, so the
+    // NOSEARCH arm must flush its synthetic group instead of leaving stale LDS.
     barrier();
     if (sub_lane_id == 0) {
         int match = 0;
@@ -661,7 +664,6 @@ void main() {
         }
     }
     barrier();
-    }
 
     if (NOESTIMATE == 0) {
     float denoising_patch[64];
