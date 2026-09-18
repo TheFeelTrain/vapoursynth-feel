@@ -1,3 +1,4 @@
+import importlib.util
 import platform
 import shutil
 import subprocess
@@ -35,6 +36,19 @@ def find_tool(name: str) -> str:
     raise RuntimeError(f"{name} not found on PATH or in {candidate.parent}")
 
 
+def vapoursynth_include_dir() -> str | None:
+    """VapourSynth headers as seen by the interpreter running this hook.
+
+    vapoursynth is a build requirement, so this environment has the headers even
+    though whichever interpreter CMake's FindPython3 picks may not.
+    """
+    spec = importlib.util.find_spec("vapoursynth")
+    if spec is None or spec.origin is None:
+        return None
+    include = Path(spec.origin).parent / "include"
+    return str(include) if (include / "VapourSynth4.h").is_file() else None
+
+
 # Deliberately not parameterized: hatchling's BuildHookInterface gained a second
 # generic parameter in 1.32, so any explicit subscript breaks one version or the
 # other.
@@ -62,20 +76,23 @@ class CustomHook(BuildHookInterface):
         build_data["tag"] = f"py3-none-{next(tags.platform_tags())}"
 
         cmake = find_tool("cmake")
-        subprocess.run(
-            [cmake, "-S", str(root), "-B", str(self.build_dir),
-             "-D", "CMAKE_BUILD_TYPE=Release",
-             # hatch-vcs is the single version source; embed the version it
-             # resolved for this build instead of letting CMake guess one
-             "-D", f"VSFEEL_VERSION={version}",
-             # stage into install/<target_dir> instead of the live VapourSynth
-             # plugin directory (which is an absolute path when vapoursynth is
-             # importable, and cmake --install ignores --prefix for those).
-             # Relative on purpose: an absolute DESTINATION would bypass the
-             # --prefix under which finalize cleans up.
-             "-D", f"VSFEEL_INSTALL_DIR={self.target_dir.relative_to(root)}"],
-            check=True, cwd=root,
-        )
+        cmake_args = [
+            cmake, "-S", str(root), "-B", str(self.build_dir),
+            "-D", "CMAKE_BUILD_TYPE=Release",
+            # hatch-vcs is the single version source; embed the version it
+            # resolved for this build instead of letting CMake guess one
+            "-D", f"VSFEEL_VERSION={version}",
+            # stage into install/<target_dir> instead of the live VapourSynth
+            # plugin directory (which is an absolute path when vapoursynth is
+            # importable, and cmake --install ignores --prefix for those).
+            # Relative on purpose: an absolute DESTINATION would bypass the
+            # --prefix under which finalize cleans up.
+            "-D", f"VSFEEL_INSTALL_DIR={self.target_dir.relative_to(root)}",
+        ]
+        include_dir = vapoursynth_include_dir()
+        if include_dir is not None:
+            cmake_args += ["-D", f"VS_INCLUDE_DIR={include_dir}"]
+        subprocess.run(cmake_args, check=True, cwd=root)
         subprocess.run(
             [cmake, "--build", str(self.build_dir), "--config", "Release",
              "--parallel"],

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.29.0", "hatch-vcs", "packaging", "cmake>=3.21"]
+requires = ["hatchling>=1.29.0", "hatch-vcs", "packaging", "cmake>=3.21", "vapoursynth>=74"]
 build-backend = "hatchling.build"
 
 [project]

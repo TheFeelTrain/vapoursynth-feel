@@ -10,23 +10,23 @@ endif()
 
 # Vulkan is reached through volk, which dlopens the loader at runtime: nothing
 # links libvulkan, and that is what lets the Linux wheel be manylinux (no
-# manylinux policy whitelists libvulkan.so.1). The headers are pinned rather
-# than taken from a Vulkan SDK so a bare container can build the plugin.
+# manylinux policy whitelists libvulkan.so.1). The headers are pinned by hash
+# rather than taken from a Vulkan SDK so a bare container can build the plugin;
+# release tarballs are used instead of git clones because they are an order of
+# magnitude smaller and need no git.
 include(FetchContent)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)   # volk is a static lib linked into a .so
 FetchContent_Declare(vulkan_headers
-    GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
-    GIT_TAG vulkan-sdk-1.4.357.0
-    GIT_SHALLOW TRUE)
+    URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.357.0.tar.gz
+    URL_HASH SHA256=e87dce08116151f6b6d7de6b6faf41498e87e6cf848ff16fa3bd5402190ad4a3)
 FetchContent_MakeAvailable(vulkan_headers)
 # Pin volk to the fetched headers: left to itself it prefers a system Vulkan
 # SDK, so the same commit would compile against different headers per machine.
 set(VULKAN_HEADERS_INSTALL_DIR "${vulkan_headers_SOURCE_DIR}" CACHE PATH
     "Vulkan headers used to build volk" FORCE)
 FetchContent_Declare(volk
-    GIT_REPOSITORY https://github.com/zeux/volk.git
-    GIT_TAG vulkan-sdk-1.4.357.0
-    GIT_SHALLOW TRUE)
+    URL https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.4.357.0.tar.gz
+    URL_HASH SHA256=6400c7b23e24d17e4f04bac49b55b06c4e87677d33398e90344743ec73560ca6)
 FetchContent_MakeAvailable(volk)
 
 find_program(VK_GLSLC glslc)
@@ -413,8 +413,24 @@ if(VS_FOUND)
 else()
     set(VS_INCLUDE_DIR "" CACHE PATH "Path to VapourSynth headers (containing VapourSynth4.h)")
     if(NOT VS_INCLUDE_DIR)
-        # No pkg-config, which is the norm on Windows: derive the path from the
-        # installed Python package, whose wheel and SDK both ship include/.
+        # No pkg-config, which is the norm on Windows and in manylinux build
+        # containers. The vapoursynth package ships its own CLI that knows where
+        # its headers are, and it is on PATH in an isolated build environment.
+        execute_process(
+            COMMAND vapoursynth get-include
+            OUTPUT_VARIABLE _vs_cli_include
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(_vs_cli_include AND EXISTS "${_vs_cli_include}/VapourSynth4.h")
+            set(VS_INCLUDE_DIR "${_vs_cli_include}" CACHE PATH
+                "Path to VapourSynth headers (containing VapourSynth4.h)" FORCE)
+        endif()
+    endif()
+    if(NOT VS_INCLUDE_DIR)
+        # Fallback for when that CLI is not on PATH: ask the interpreter CMake
+        # found, though it may not be the one the build environment installed
+        # the headers into.
         execute_process(
             COMMAND "${Python3_EXECUTABLE}" -c
                 "import os, vapoursynth; print(os.path.join(os.path.dirname(vapoursynth.__file__), 'include'))"
