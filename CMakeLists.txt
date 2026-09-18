@@ -1,8 +1,34 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(vapoursynth-feel LANGUAGES CXX)
+project(vapoursynth-feel LANGUAGES C CXX)
 
-find_package(Vulkan REQUIRED)
+# The NNEDI3 weight blob is linked in as an RCDATA resource on Windows, where
+# the default toolchains ship no objcopy.
+if(WIN32)
+    enable_language(RC)
+endif()
+
+# Vulkan is reached through volk, which dlopens the loader at runtime: nothing
+# links libvulkan, and that is what lets the Linux wheel be manylinux (no
+# manylinux policy whitelists libvulkan.so.1). The headers are pinned rather
+# than taken from a Vulkan SDK so a bare container can build the plugin.
+include(FetchContent)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)   # volk is a static lib linked into a .so
+FetchContent_Declare(vulkan_headers
+    GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+    GIT_TAG vulkan-sdk-1.4.357.0
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(vulkan_headers)
+# Pin volk to the fetched headers: left to itself it prefers a system Vulkan
+# SDK, so the same commit would compile against different headers per machine.
+set(VULKAN_HEADERS_INSTALL_DIR "${vulkan_headers_SOURCE_DIR}" CACHE PATH
+    "Vulkan headers used to build volk" FORCE)
+FetchContent_Declare(volk
+    GIT_REPOSITORY https://github.com/zeux/volk.git
+    GIT_TAG vulkan-sdk-1.4.357.0
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(volk)
+
 find_program(VK_GLSLC glslc)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -281,26 +307,38 @@ add_custom_command(
     VERBATIM)
 set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h" PROPERTIES GENERATED TRUE)
 
-# NNEDI3 weights: link the raw blob straight into the binary (objcopy turns
-# it into an object exposing _binary_nnedi3_weights_bin_{start,end}). The
-# blob stays out of C++ sources so the 13.5 MB never passes through the
-# compiler; the wheel remains self-contained (reference/ is not shipped).
-find_program(VK_OBJCOPY objcopy REQUIRED)
-add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.o"
-    COMMAND ${CMAKE_COMMAND} -E copy
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3_weights.bin"
-            "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.bin"
-    # run under the output dir so the embedded symbols derive from the bare
-    # filename (_binary_nnedi3_weights_bin_{start,end}), not the build path
-    COMMAND ${VK_OBJCOPY} --input binary --output elf64-x86-64
-            --binary-architecture i386:x86-64
-            nnedi3_weights.bin nnedi3_weights.o
-    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3_weights.bin"
-    VERBATIM)
-set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.o"
-    PROPERTIES GENERATED TRUE)
+# NNEDI3 weights: link the raw blob straight into the binary so the 13.5 MB
+# never passes through the compiler, and the wheel stays self-contained
+# (reference/ is not shipped). objcopy turns it into an object exposing
+# _binary_nnedi3_weights_bin_{start,end}; MSVC has no objcopy, so Windows
+# embeds the same bytes as an RCDATA resource that nnedi3.cpp reads with
+# FindResource (see weights_blob()).
+if(WIN32)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3_weights.bin"
+                   "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.bin" COPYONLY)
+    # Bare filename: the resource compiler runs with the build dir as its CWD.
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.rc"
+         "NNEDI3_WEIGHTS RCDATA \"nnedi3_weights.bin\"\n")
+    set(VSFEEL_WEIGHTS_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.rc")
+else()
+    find_program(VK_OBJCOPY objcopy REQUIRED)
+    add_custom_command(
+        OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.o"
+        COMMAND ${CMAKE_COMMAND} -E copy
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3_weights.bin"
+                "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.bin"
+        # run under the output dir so the embedded symbols derive from the bare
+        # filename (_binary_nnedi3_weights_bin_{start,end}), not the build path
+        COMMAND ${VK_OBJCOPY} --input binary --output elf64-x86-64
+                --binary-architecture i386:x86-64
+                nnedi3_weights.bin nnedi3_weights.o
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3_weights.bin"
+        VERBATIM)
+    set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.o"
+        PROPERTIES GENERATED TRUE)
+    set(VSFEEL_WEIGHTS_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.o")
+endif()
 
 # Plugin
 add_library(vsfeel SHARED
@@ -313,9 +351,23 @@ add_library(vsfeel SHARED
     src/eedi3.cpp
     src/nnedi3.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
-    "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.o")
+    ${VSFEEL_WEIGHTS_SOURCE})
 configure_common(vsfeel)
-target_compile_options(vsfeel PRIVATE -mavx2)
+if(WIN32)
+    # The manifest above names the plugin "vsfeel", so the file must be
+    # vsfeel.dll: MinGW would otherwise emit libvsfeel.dll and the host would
+    # never find it.
+    set_target_properties(vsfeel PROPERTIES PREFIX "")
+endif()
+if(MSVC)
+    # The sources are UTF-8 with non-ASCII punctuation in comments and messages.
+    target_compile_options(vsfeel PRIVATE /arch:AVX2 /utf-8 /EHsc)
+else()
+    target_compile_options(vsfeel PRIVATE -mavx2)
+    # Keep volk's vk* function pointers and everything else internal; the plugin
+    # only needs to export VapourSynthPluginInit2 (VS_EXTERNAL_API marks it).
+    target_compile_options(vsfeel PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
+endif()
 # Build the plugin with a real warning baseline so defects do not accumulate.
 # -Wmissing-field-initializers is deliberately excluded: vsfeel.h silences it
 # for the Vulkan/VapourSynth designated-initializer convention.
@@ -326,7 +378,13 @@ endif()
 # Keep the host's EEDI3 vcheck LDS fit check in step with the -DMAXW the shader
 # was compiled with (defined above, in the EEDI3 shader block).
 target_compile_definitions(vsfeel PRIVATE EEDI3_MAXW_LDS=${EEDI3_MAXW})
-target_link_libraries(vsfeel PRIVATE Vulkan::Vulkan)
+if(WIN32 AND NOT MSVC)
+    # Link the MinGW runtime statically: a plugin that needs libstdc++-6.dll,
+    # libgcc_s_seh-1.dll and libwinpthread-1.dll is not loadable by a stock
+    # VapourSynth install. -s drops the symbol table from the release DLL.
+    target_link_options(vsfeel PRIVATE -static-libgcc -static-libstdc++ -static -s)
+endif()
+target_link_libraries(vsfeel PRIVATE volk::volk)
 target_include_directories(vsfeel PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 # Config header
@@ -343,45 +401,73 @@ find_package(PkgConfig QUIET MODULE)
 # which would bypass CMAKE_INSTALL_PREFIX at install time.
 set(VSFEEL_INSTALL_DIR "" CACHE STRING "Relative plugin staging directory")
 
+set(VS_PLUGIN_DIR "")
+
 if(PKG_CONFIG_FOUND)
     pkg_search_module(VS vapoursynth)
-    if(VS_FOUND)
-        message(STATUS "Found VapourSynth R${VS_VERSION}")
-        if(NOT VSFEEL_INSTALL_DIR)
-            execute_process(
-                COMMAND "${Python3_EXECUTABLE}" -c "import vapoursynth; print(vapoursynth.get_plugin_dir())"
-                OUTPUT_VARIABLE VS_PLUGIN_DIR
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-            )
-            string(STRIP "${VS_PLUGIN_DIR}" VS_PLUGIN_DIR)
-        endif()
-
-        target_include_directories(vsfeel PRIVATE ${VS_INCLUDE_DIRS})
-
-        if(VSFEEL_INSTALL_DIR OR VS_PLUGIN_DIR)
-            set(_vsfeel_install_dir "${VSFEEL_INSTALL_DIR}")
-            if(NOT _vsfeel_install_dir)
-                set(_vsfeel_install_dir "${VS_PLUGIN_DIR}/vsfeel")
-            endif()
-            install(TARGETS vsfeel LIBRARY DESTINATION "${_vsfeel_install_dir}")
-            install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vk/manifest.vs" DESTINATION "${_vsfeel_install_dir}")
-        else()
-            # Isolated build environments (pip/pdm-build) can import no
-            # vapoursynth module; stage into <prefix>/lib|bin + <prefix>/
-            # so packaging hooks can collect the artifacts.
-            install(TARGETS vsfeel LIBRARY)
-            install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vk/manifest.vs" DESTINATION .)
-        endif()
-    endif()
 endif()
 
-if(NOT VS_FOUND)
-    set(VS_INCLUDE_DIR "" CACHE PATH "Path to VapourSynth headers")
-    if(VS_INCLUDE_DIR STREQUAL "")
-        message(WARNING "VapourSynth not found")
+if(VS_FOUND)
+    message(STATUS "Found VapourSynth R${VS_VERSION}")
+    target_include_directories(vsfeel PRIVATE ${VS_INCLUDE_DIRS})
+else()
+    set(VS_INCLUDE_DIR "" CACHE PATH "Path to VapourSynth headers (containing VapourSynth4.h)")
+    if(NOT VS_INCLUDE_DIR)
+        # No pkg-config, which is the norm on Windows: derive the path from the
+        # installed Python package, whose wheel and SDK both ship include/.
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" -c
+                "import os, vapoursynth; print(os.path.join(os.path.dirname(vapoursynth.__file__), 'include'))"
+            OUTPUT_VARIABLE _vs_py_include
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(_vs_py_include AND EXISTS "${_vs_py_include}/VapourSynth4.h")
+            set(VS_INCLUDE_DIR "${_vs_py_include}" CACHE PATH
+                "Path to VapourSynth headers (containing VapourSynth4.h)" FORCE)
+        endif()
     endif()
+    if(NOT VS_INCLUDE_DIR)
+        message(FATAL_ERROR
+            "VapourSynth headers not found. Install the vapoursynth Python "
+            "package or configure with -DVS_INCLUDE_DIR=<dir containing VapourSynth4.h>")
+    endif()
+    message(STATUS "Using VapourSynth headers from ${VS_INCLUDE_DIR}")
+    target_include_directories(vsfeel PRIVATE "${VS_INCLUDE_DIR}")
+endif()
 
-    target_include_directories(vsfeel PRIVATE ${VS_INCLUDE_DIR})
+# Where the running VapourSynth loads plugins from. Skipped when the packaging
+# override is set: that staging directory is relative on purpose, so it has to
+# go through CMAKE_INSTALL_PREFIX.
+if(NOT VSFEEL_INSTALL_DIR)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c "import vapoursynth; print(vapoursynth.get_plugin_dir())"
+        OUTPUT_VARIABLE VS_PLUGIN_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    string(STRIP "${VS_PLUGIN_DIR}" VS_PLUGIN_DIR)
+endif()
+
+# The packaging override wins over the live plugin directory, and RUNTIME is
+# what installs the DLL on Windows (LIBRARY alone installs nothing there).
+if(VSFEEL_INSTALL_DIR)
+    set(_vsfeel_install_dir "${VSFEEL_INSTALL_DIR}")
+elseif(VS_PLUGIN_DIR)
+    set(_vsfeel_install_dir "${VS_PLUGIN_DIR}/vsfeel")
+else()
+    set(_vsfeel_install_dir "")
+endif()
+
+if(_vsfeel_install_dir)
+    install(TARGETS vsfeel
+            LIBRARY DESTINATION "${_vsfeel_install_dir}"
+            RUNTIME DESTINATION "${_vsfeel_install_dir}")
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vk/manifest.vs" DESTINATION "${_vsfeel_install_dir}")
+else()
+    # Isolated build environments (pip/pdm-build) can import no vapoursynth
+    # module; stage into <prefix>/lib|bin + <prefix>/ so packaging hooks can
+    # collect the artifacts.
     install(TARGETS vsfeel LIBRARY RUNTIME)
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vk/manifest.vs" DESTINATION .)
 endif()

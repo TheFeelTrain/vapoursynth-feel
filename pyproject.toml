@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.29.0", "hatch-vcs"]
+requires = ["hatchling>=1.29.0", "hatch-vcs", "packaging", "cmake>=3.21"]
 build-backend = "hatchling.build"
 
 [project]
@@ -27,16 +27,28 @@ dev = ["hatchling>=1.27.0", "packaging", "vsjetpack>=2.2"]
 source = "vcs"
 tag-pattern = '^r(?P<version>.*)$'
 
+# Patterns are anchored to the project root: a bare `vsfeel` also matches the
+# staged `install/vapoursynth/plugins/vsfeel/` copy, which then ships whenever
+# hatchling's gitignore filtering is unavailable (e.g. sdist builds under /tmp).
 [tool.hatch.build.targets.sdist]
-include = ["src", "vsfeel", "CMakeLists.txt", "config.h.in"]
+include = [
+    "/src",
+    "/vsfeel",
+    "/CMakeLists.txt",
+    "/config.h.in",
+    "/hatch_build.py",
+    "/README.md",
+    "/LICENSE",
+]
 
+# The plugin is x86-64 Linux and Windows (see the platform guard in
+# hatch_build.py), so a wheel carries exactly one platform's library.
 [tool.hatch.build.targets.wheel]
-include = ["vapoursynth/plugins/vsfeel", "vsfeel"]
+include = ["/vapoursynth/plugins/vsfeel", "/vsfeel"]
 artifacts = [
-    "vapoursynth/plugins/vsfeel/*.so",
-    "vapoursynth/plugins/vsfeel/*.dll",
-    "vapoursynth/plugins/vsfeel/*.dylib",
-    "vapoursynth/plugins/vsfeel/manifest.vs",
+    "/vapoursynth/plugins/vsfeel/*.so",
+    "/vapoursynth/plugins/vsfeel/*.dll",
+    "/vapoursynth/plugins/vsfeel/manifest.vs",
 ]
 
 [tool.hatch.build.targets.wheel.hooks.custom]

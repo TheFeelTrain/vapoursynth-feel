@@ -267,6 +267,7 @@ tmp/
 # Packaging staging
 /install/
 /build/pack/
+/vapoursynth/
 .dsh-managed-access.json
 
 *.ffindex

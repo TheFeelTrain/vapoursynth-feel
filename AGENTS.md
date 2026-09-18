@@ -526,6 +526,15 @@ cmake -S . -B build -D CMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
 
+Vulkan headers (`Vulkan-Headers`) and the loader shim (`volk`) are pinned and
+fetched by `FetchContent` at configure time, so no Vulkan SDK is needed to link
+— only `glslc` from one. **Nothing links a Vulkan library**: `volkInitialize()`
+dlopens the loader, which is what lets the Linux wheel be repaired to manylinux
+(`libvulkan.so.1` is on no manylinux whitelist) and the Windows DLL need no
+import library. Every TU includes `<volk.h>`, never `<vulkan/vulkan.h>`, so `vk*`
+calls resolve to volk's function pointers; the plugin builds with
+`-fvisibility=hidden` and exports only `VapourSynthPluginInit2`.
+
 The SPIR-V shaders are compiled at build time and embedded into a generated C++
 header (`spirv_binaries.h`) via `src/gen_spirv_header.py`. Adding a shader
 variant is one line in the owning component's `VK_*_VARIANTS` table in

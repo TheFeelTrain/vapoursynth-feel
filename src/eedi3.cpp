@@ -17,7 +17,7 @@
 
 #include <immintrin.h>
 
-#include <vulkan/vulkan.h>
+#include <volk.h>
 
 #include <VapourSynth4.h>
 #include <VSConstants4.h>

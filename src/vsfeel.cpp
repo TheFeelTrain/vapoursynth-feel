@@ -8,7 +8,12 @@
 #include <cstring>
 #include <filesystem>
 #include <iterator>
-#include <unistd.h>
+#if defined(_WIN32)
+#  include <io.h>       // _access
+#  include <process.h>  // _getpid
+#else
+#  include <unistd.h>   // access, getpid
+#endif
 #include <map>
 #include <memory>
 #include <mutex>
@@ -19,7 +24,7 @@
 #include <variant>
 #include <vector>
 
-#include <vulkan/vulkan.h>
+#include <volk.h>
 
 #include <VapourSynth4.h>
 
@@ -36,6 +41,7 @@ const char * vk_result_string(VkResult result) {
         case VK_SUCCESS:                      return "VK_SUCCESS";
         case VK_ERROR_OUT_OF_HOST_MEMORY:     return "VK_ERROR_OUT_OF_HOST_MEMORY";
         case VK_ERROR_OUT_OF_DEVICE_MEMORY:   return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_INITIALIZATION_FAILED:  return "VK_ERROR_INITIALIZATION_FAILED";
         case VK_ERROR_DEVICE_LOST:            return "VK_ERROR_DEVICE_LOST";
         case VK_ERROR_INCOMPATIBLE_DRIVER:    return "VK_ERROR_INCOMPATIBLE_DRIVER";
         case VK_ERROR_EXTENSION_NOT_PRESENT:  return "VK_ERROR_EXTENSION_NOT_PRESENT";
@@ -63,11 +69,27 @@ static std::map<int, std::shared_ptr<VK_Device>> g_devices;
 // across many subprocesses.
 //
 // The cache lives at $VSFEEL_PIPELINE_CACHE, or
-// $XDG_CACHE_HOME/vsfeel/pipeline_cache_<pipelineCacheUUID>.bin (default
-// ~/.cache/vsfeel/...). The UUID is part of both the name and the file
-// contents, so a driver or device change simply misses instead of feeding the
-// driver incompatible data. Every operation here is best effort: a read-only
+// $XDG_CACHE_HOME/vsfeel/pipeline_cache_<pipelineCacheUUID>.bin ($LOCALAPPDATA
+// on Windows, ~/.cache elsewhere). The UUID is part of both the name and the
+// file contents, so a driver or device change simply misses instead of feeding
+// the driver incompatible data. Every operation here is best effort: a read-only
 // or missing cache directory costs a recompile, never a filter error.
+
+static bool directory_writable(const std::string & path) {
+#if defined(_WIN32)
+    return ::_access(path.c_str(), 2 /* write */) == 0;
+#else
+    return ::access(path.c_str(), W_OK) == 0;
+#endif
+}
+
+static int process_id() {
+#if defined(_WIN32)
+    return ::_getpid();
+#else
+    return ::getpid();
+#endif
+}
 
 static std::string pipeline_cache_path_for(const VkPhysicalDeviceProperties & props) {
     const char * override_env = std::getenv("VSFEEL_PIPELINE_CACHE");
@@ -82,6 +104,8 @@ static std::string pipeline_cache_path_for(const VkPhysicalDeviceProperties & pr
     std::string dir;
     if (const char * xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg) {
         dir = xdg;
+    } else if (const char * local = std::getenv("LOCALAPPDATA"); local && *local) {
+        dir = local;
     } else if (const char * home = std::getenv("HOME"); home && *home) {
         dir = std::string(home) + "/.cache";
     }
@@ -101,7 +125,7 @@ static std::string pipeline_cache_path_for(const VkPhysicalDeviceProperties & pr
         if (ec && !std::filesystem::is_directory(d)) {
             return false;
         }
-        return ::access(d.c_str(), W_OK) == 0;
+        return directory_writable(d);
     };
     if (!usable(dir)) {
         std::error_code ec;
@@ -201,7 +225,7 @@ void save_pipeline_cache(VK_Device & dev) {
     // at once cannot interleave into one file and an interrupted flush cannot
     // leave a truncated cache behind
     const std::string tmp_path = dev.pipeline_cache_path + "." +
-        std::to_string(static_cast<unsigned long>(::getpid())) + ".tmp";
+        std::to_string(static_cast<unsigned long>(process_id())) + ".tmp";
     FILE * f = std::fopen(tmp_path.c_str(), "wb");
     if (f == nullptr) {
         return;
@@ -241,6 +265,22 @@ static std::array<uint32_t, 3> version_components() {
 std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) {
     std::lock_guard lock(g_device_lock);
 
+    // volk dlopens the loader, so nothing links libvulkan: that is what keeps
+    // the Linux wheel manylinux-clean and the Windows build free of an import
+    // library. Once per process, and it has to happen before any vk* call.
+    static std::once_flag volk_once;
+    static VkResult volk_result = VK_ERROR_INITIALIZATION_FAILED;
+    std::call_once(volk_once, [] { volk_result = volkInitialize(); });
+    if (volk_result != VK_SUCCESS) {
+        return "no Vulkan loader found ("s + vk_result_string(volk_result) + ")";
+    }
+    const uint32_t loader_version = volkGetInstanceVersion();
+    if (loader_version < VK_API_VERSION_1_4) {
+        return "Vulkan 1.4 is required, but the loader reports "
+            + std::to_string(VK_API_VERSION_MAJOR(loader_version)) + "."
+            + std::to_string(VK_API_VERSION_MINOR(loader_version));
+    }
+
     if (auto it = g_devices.find(device_id); it != g_devices.end()) {
         ++it->second->refcount;
         return it->second;
@@ -275,6 +315,9 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
         if (result != VK_SUCCESS) {
             return "vkCreateInstance failed: "s + vk_result_string(result);
         }
+        // Loads the whole instance's entry points, device-level ones included;
+        // volkLoadInstanceOnly would need a volkLoadDevice per device instead.
+        volkLoadInstance(dev->instance);
     }
 
     uint32_t device_count = 0;

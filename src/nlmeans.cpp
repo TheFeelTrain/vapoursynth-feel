@@ -18,7 +18,7 @@
 
 #include <strings.h>
 
-#include <vulkan/vulkan.h>
+#include <volk.h>
 
 #include <VapourSynth4.h>
 #include <VSHelper4.h>

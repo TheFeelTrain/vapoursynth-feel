@@ -10,12 +10,23 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 
 // _mm_sfence for ordering the non-temporal pad stores before submit.
 #include <immintrin.h>
 
-#include <vulkan/vulkan.h>
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
+
+#include <volk.h>
 
 #include <VapourSynth4.h>
 #include <VSConstants4.h>
@@ -46,10 +57,44 @@ constexpr int NNEDI3_NNS[5] { 16, 32, 64, 128, 256 };
 constexpr int MARGIN_H = 24;
 constexpr int MARGIN_V = 3;
 
-// Weight blob linked into the binary (see CMakeLists.txt objcopy rule).
+// Weight blob linked into the binary (see CMakeLists.txt): objcopy on every
+// toolchain that has it, an RCDATA resource on Windows, where none does.
+#if !defined(_WIN32)
 extern "C" {
 extern const uint8_t _binary_nnedi3_weights_bin_start[];
 extern const uint8_t _binary_nnedi3_weights_bin_end[];
+}
+#endif
+
+static std::span<const uint8_t> weights_blob() {
+#if defined(_WIN32)
+    static const std::span<const uint8_t> blob = []() -> std::span<const uint8_t> {
+        HMODULE module = nullptr;
+        // Our own module, not the host executable's: FindResourceW(nullptr, …)
+        // searches the process image, which is VapourSynth, not this plugin.
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&weights_blob), &module) == 0) {
+            return {};
+        }
+        // MAKEINTRESOURCEW(10) is RT_RCDATA in its wide form: RT_RCDATA itself
+        // follows the UNICODE macro, which must not decide whether this builds.
+        const HRSRC res = FindResourceW(module, L"NNEDI3_WEIGHTS",
+                                        MAKEINTRESOURCEW(10));
+        if (res == nullptr) {
+            return {};
+        }
+        const HGLOBAL handle = LoadResource(module, res);
+        if (handle == nullptr) {
+            return {};
+        }
+        const auto * bytes = static_cast<const uint8_t *>(LockResource(handle));
+        return { bytes, static_cast<size_t>(SizeofResource(module, res)) };
+    }();
+    return blob;
+#else
+    return { _binary_nnedi3_weights_bin_start, _binary_nnedi3_weights_bin_end };
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -156,12 +201,12 @@ static std::optional<std::string> parse_weights(int nsize, int nns_sel, int etyp
                                                 PsOldWeights & ps_old,
                                                 PsNewWeights & ps_new,
                                                 ModelWeights & model) {
-    const float * data = reinterpret_cast<const float *>(
-        _binary_nnedi3_weights_bin_start);
-    const size_t count = (reinterpret_cast<const uint8_t *>(
-        _binary_nnedi3_weights_bin_end) -
-        reinterpret_cast<const uint8_t *>(
-        _binary_nnedi3_weights_bin_start)) / sizeof(float);
+    const std::span<const uint8_t> blob = weights_blob();
+    if (blob.empty()) {
+        return "weight blob missing from the plugin binary";
+    }
+    const auto * data = reinterpret_cast<const float *>(blob.data());
+    const size_t count = blob.size() / sizeof(float);
     WeightReader r { data, count, 0 };
 
     for (int n = 0; n < 4; ++n) {
