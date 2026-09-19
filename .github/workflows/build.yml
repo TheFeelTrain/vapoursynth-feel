@@ -67,7 +67,20 @@ jobs:
       env:
         # The packaged toolchain has no make/ninja default; CMake reads this.
         CMAKE_GENERATOR: Ninja
-      run: uv build --wheel --out-dir dist
+      run: |
+        # MSYS2's git emulates POSIX file modes, so it invents an executable bit
+        # for shebang files (src/gen_spirv_header.py, benchmark/bench.py) and
+        # reports them as modified. setuptools_scm reads that as a dirty tree and
+        # stamps a local version (+g<hash>.d<date>), which PyPI rejects. Line
+        # endings can disagree between this git and the one that checked the tree
+        # out, for the same reason. Normalise both and re-materialise the tree
+        # from the commit before anything reads the version.
+        git config --global core.filemode false
+        git config --global core.autocrlf false
+        git checkout -f -q HEAD -- .
+        echo "--- tracked changes (must be empty) ---"
+        git status --porcelain --untracked-files=no
+        uv build --wheel --out-dir dist
     - uses: actions/upload-artifact@v4
       with:
         name: windows-wheel
@@ -85,3 +98,33 @@ jobs:
         path: dist
         merge-multiple: true
     - uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        # A partially published release can be finished by re-running the
+        # workflow: files PyPI already has are skipped instead of failing the
+        # job, since PyPI never allows re-uploading a filename anyway.
+        skip-existing: true
+
+  release-assets:
+    # Separate from the PyPI upload on purpose: the two channels are
+    # independent, so whichever one fails, the other still completes.
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    needs: [sdist, linux-wheel, windows-wheel]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # attach assets to the release
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        path: dist
+        merge-multiple: true
+    - name: Attach the distributions to the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # Create the release if the tag was pushed without one.
+        gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 ||
+          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
+        # Wheels and sdist only: dist/ also holds the .publish.attestation files
+        # the PyPI action writes, which do not belong on the release page.
+        # --clobber makes a re-run replace assets instead of failing.
+        gh release upload "${GITHUB_REF_NAME}" dist/*.whl dist/*.tar.gz --clobber
