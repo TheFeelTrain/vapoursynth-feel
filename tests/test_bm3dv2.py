@@ -551,17 +551,40 @@ def test_bm3dv2_ref_matches_reference(noise_gray):
 # defaults 0.00786, sigma=0.3 0.00256, sigma=1.5 0.02025, block_step=2
 # 0.00648, bm_range=9 0.00866, bm_range=22 0.00873, ps_range=5 0.00793,
 # ps_range=9 0.00732, ps_num=5 0.01226, extractor_exp=6 0.00806.
+#
+# Filled-in ranges (same oracle/session): block_step 1..8 worst 0.0132,
+# ps_num 1..8 0.0124, bm_range 1/4/32 0.0087, extractor_exp 3/8 0.0111,
+# radius=1 0.0074. The 0.02 bound covers the loosest with ~50% headroom.
 SWEEP_CONFIGS = [
     ({}, 0.01),
     ({"sigma": 0.3}, 0.01),
     ({"sigma": 1.5}, 0.03),
     ({"block_step": 2}, 0.01),
+    ({"block_step": 1}, 0.01),
+    ({"block_step": 3}, 0.01),
+    ({"block_step": 5}, 0.02),
+    ({"block_step": 6}, 0.02),
+    ({"block_step": 7}, 0.02),
+    ({"block_step": 8}, 0.02),
     ({"bm_range": 9}, 0.01),
     ({"bm_range": 22}, 0.01),
+    ({"bm_range": 1}, 0.01),
+    ({"bm_range": 4}, 0.01),
+    ({"bm_range": 32}, 0.01),
     ({"ps_range": 5}, 0.01),
     ({"ps_range": 9}, 0.01),
     ({"ps_num": 5}, 0.02),
+    ({"ps_num": 1}, 0.02),
+    ({"ps_num": 2}, 0.02),
+    ({"ps_num": 3}, 0.02),
+    ({"ps_num": 4}, 0.02),
+    ({"ps_num": 6}, 0.02),
+    ({"ps_num": 7}, 0.02),
+    ({"ps_num": 8}, 0.02),
     ({"extractor_exp": 6}, 0.01),
+    ({"extractor_exp": 3}, 0.02),
+    ({"extractor_exp": 8}, 0.02),
+    ({"radius": 1}, 0.01),
 ]
 
 
@@ -578,9 +601,9 @@ def test_bm3dv2_parameter_sweep_matches_reference(noise_gray, cfg, tol):
 
 
 # Remeasured with the repaired oracle (vszipcl, basic estimate, radius sweep):
-# radius 0/2/3/4 = 0.00708/0.00786/0.00285/0.00300; the Wiener ref pass =
-# 0.00273. The 0.01 bound covers all of them with margin.
-@pytest.mark.parametrize("radius", [0, 2, 3, 4])
+# radius 0/1/2/3/4 = 0.00708/0.00742/0.00786/0.00285/0.00300; the Wiener ref
+# pass = 0.00273. The 0.01 bound covers all of them with margin.
+@pytest.mark.parametrize("radius", [0, 1, 2, 3, 4])
 def test_bm3dv2_matches_reference(noise_gray, radius):
     """vsfeel must closely match vszipcl, falling back to bm3dhip.
 
@@ -590,3 +613,40 @@ def test_bm3dv2_matches_reference(noise_gray, radius):
     """
     ref, maxdiff = _compare_against_any_reference(dict(BASE_KWARGS, radius=radius))
     assert maxdiff < 0.01, f"max diff vs {ref}: {maxdiff}"
+
+
+# ---------------------------------------------------------------------------
+# extractor_exp: the documented ">= 3 = bitwise reproducible" claim
+# ---------------------------------------------------------------------------
+#
+# The reference pre-rounds the atomic addends with `(x + E) - E`
+# (kernel.cu:741-742), which makes the sums order-independent. EXTRACTOR is a
+# spec constant, so RADV used to constant-fold the pair back to x and the
+# parameter was a silent no-op (identical ISA for 0 and 20). bm3d.comp now
+# computes it under `precise` inside `if (EXTRACTOR != 0.0)`; the default
+# path's ISA is unchanged. After the fix, two fresh ns=1 runs are
+# bit-identical at 3/6/8 (3.7e-8 at 0) and the output tracks the reference.
+
+@pytest.mark.parametrize("extractor_exp", [3, 6, 8])
+def test_bm3dv2_extractor_exp_is_bit_reproducible(noise_gray, extractor_exp):
+    """Two runs at extractor_exp >= 3 must be identical (reference: exact)."""
+    a = _run(noise_gray, radius=2, num_streams=1, extractor_exp=extractor_exp)
+    b = _run(noise_gray, radius=2, num_streams=1, extractor_exp=extractor_exp)
+    for n in (0, 11, 23):
+        fa = frame_to_ndarray(a.get_frame(n))
+        fb = frame_to_ndarray(b.get_frame(n))
+        assert np.array_equal(fa, fb), \
+            f"extractor_exp={extractor_exp} not reproducible at frame {n}"
+
+
+def test_bm3dv2_extractor_exp_changes_aggregation(noise_gray):
+    """A 2^20 extractor quantises the atomic addends to a 0.125 grid, which
+    must move the output (the reference goes non-finite at 2^20). An output
+    identical to extractor_exp=0 means the constant is folded away again."""
+    base = _run(noise_gray, radius=2, num_streams=1, extractor_exp=0)
+    coarse = _run(noise_gray, radius=2, num_streams=1, extractor_exp=20)
+    for n in (0, 11, 23):
+        d = np.abs(frame_to_ndarray(base.get_frame(n))
+                   - frame_to_ndarray(coarse.get_frame(n)))
+        assert (not np.isfinite(d).all()) or float(d.max()) > 1e-4, \
+            f"extractor_exp=20 left frame {n} unchanged (max diff {d.max()})"

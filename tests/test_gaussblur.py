@@ -14,6 +14,7 @@ comparison runs in a subprocess).
 Run from the repository root:  python -m pytest tests/test_gaussblur.py
 """
 
+import json
 import textwrap
 import threading
 
@@ -144,7 +145,7 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     from vstools import core
 
     fmt = sys.argv[1]
-    sigma = float(sys.argv[2])
+    sigma = json.loads(sys.argv[2])
     src = core.bs.VideoSource({NOISE_MKV!r})
 
     if fmt == "gray32":
@@ -190,13 +191,14 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 """)
 
 
-def _max_diff_vs_reference(fmt: str, sigma: float) -> float:
+def _max_diff_vs_reference(fmt: str, sigma) -> float:
     """Run the comparison in a subprocess.
 
+    ``sigma`` is a scalar or a per-plane list (the reference accepts arrays).
     A missing/failed reference skips (via compare_or_skip); a vsfeel crash,
     exception, timeout or non-finite result fails with the captured tail.
     """
-    return compare_or_skip(_COMPARE_SCRIPT, [fmt, str(sigma)], timeout=300)
+    return compare_or_skip(_COMPARE_SCRIPT, [fmt, json.dumps(sigma)], timeout=300)
 
 
 @pytest.mark.parametrize("sigma", [0.5, 2.0, 5.0, 10.0])
@@ -354,3 +356,80 @@ def test_gaussblur_rejects_bad_num_streams(noise_gray):
         _run(noise_gray, num_streams=0)
     with pytest.raises(vs.Error):
         _run(noise_gray, num_streams=33)
+
+
+# ---------------------------------------------------------------------------
+# Per-plane sigma arrays
+# ---------------------------------------------------------------------------
+#
+# Explicit per-plane arrays (incl. the documented chroma default and an
+# explicit zero pass-through plane); the scalar YUV tests only covered the
+# default implicitly. Must stay bit-exact.
+
+
+@pytest.mark.parametrize("sigma,tol", [
+    ([2.0, 1.0, 1.0], 0.0),          # explicit chroma-rule values
+    ([2.0, 3.0, 4.0], 0.0),          # increasing, all processed
+    ([0.0, 2.0, 2.0], 0.0),          # luma passes through
+    ([20.0, 2.0, 2.0], 0.0),         # large path on luma only
+    ([0.5, 10.5, 30.0], 0.0),        # one sigma per code path
+], ids=["chroma-rule", "increasing", "luma-passthrough", "luma-large",
+        "per-plane-paths"])
+def test_gaussblur_per_plane_sigma_matches_reference_yuv_32bit(
+        noise_gray, sigma, tol):
+    maxdiff = _max_diff_vs_reference("yuv32", sigma)
+    assert maxdiff <= tol, f"yuv32 per-plane sigma max diff ({sigma}): {maxdiff}"
+
+
+@pytest.mark.parametrize("sigma", [
+    [2.0, 1.0, 1.0],
+    [2.0, 3.0, 4.0],
+    [0.0, 2.0, 2.0],
+], ids=["chroma-rule", "increasing", "luma-passthrough"])
+def test_gaussblur_per_plane_sigma_matches_reference_yuv_16bit(noise_gray, sigma):
+    """16-bit mirror of the per-plane array sweep (bit-exact)."""
+    maxdiff = _max_diff_vs_reference("yuv16", sigma)
+    assert maxdiff == 0.0, f"yuv16 per-plane sigma max diff ({sigma}): {maxdiff}"
+
+
+def test_gaussblur_per_plane_sigma_gray_32bit(noise_gray):
+    """On a single-plane clip only element 0 is used; extra elements must not
+    change the result (must equal the scalar run bit-exactly)."""
+    scalar = _run(noise_gray, sigma=2.0, num_streams=1)
+    array = _run(noise_gray, sigma=[2.0, 99.0, 0.25], num_streams=1)
+    for n in (0, 11):
+        a = frame_to_ndarray(scalar.get_frame(n))
+        b = frame_to_ndarray(array.get_frame(n))
+        assert np.array_equal(a, b), f"extra sigma elements changed frame {n}"
+    assert _max_diff_vs_reference("gray32", [2.0, 99.0, 0.25]) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# radius >= dimension error
+# ---------------------------------------------------------------------------
+
+def test_gaussblur_rejects_radius_ge_dimension():
+    """A kernel radius reaching the plane dimension would read past the
+    mirror-clamped window and must be rejected at creation.
+
+    On a 32x32 clip, sigma=16 hits ``radius > w-1`` and sigma=100 also hits
+    ``sigma > min(w, h)``; sigma=4 (radius 12) must still run.
+    """
+    core = vs.core
+    small = core.std.BlankClip(format=vs.GRAYS, width=32, height=32, length=2)
+    for sigma in (16.0, 32.0, 100.0):
+        with pytest.raises(vs.Error, match=r"radius >= dimension"):
+            _run(small, sigma=sigma, num_streams=1)
+    ok = _run(small, sigma=4.0, num_streams=1)
+    assert np.isfinite(frame_to_ndarray(ok.get_frame(0))).all()
+
+
+def test_gaussblur_rejects_radius_ge_dimension_per_plane(noise_gray):
+    """The check is per processed plane: a large chroma sigma on a small
+    subsampled chroma plane must be rejected even when luma is fine."""
+    core = vs.core
+    small = core.std.BlankClip(format=vs.YUV420PS, width=64, height=64,
+                               length=2)
+    # chroma plane is 32x32; sigma 16 exceeds it while luma (64) is fine
+    with pytest.raises(vs.Error, match=r"radius >= dimension"):
+        _run(small, sigma=[2.0, 16.0, 16.0], num_streams=1)

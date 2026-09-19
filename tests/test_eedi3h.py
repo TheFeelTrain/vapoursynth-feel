@@ -23,7 +23,7 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    WIDTH, HEIGHT, reference_compare, reference_or_skip, reference_spec,
+    WIDTH, HEIGHT, NOISE_MKV, reference_compare, reference_or_skip, reference_spec,
 )
 from test_eedi3 import _plane
 
@@ -264,3 +264,150 @@ def test_eedi3h_yuv_planes(noise_16bit):
             a = _plane(my.get_frame(n), plane, w, h, np.uint16)
             b = _plane(ref.get_frame(n), plane, w, h, np.uint16)
             assert np.array_equal(a, b), f"plane {plane} frame {n} differs"
+
+
+# ---------------------------------------------------------------------------
+# Input validation
+# ---------------------------------------------------------------------------
+#
+# EEDI3H shares EEDI3's create function, so each validation branch needs its
+# own coverage here: the horizontal orientation swaps which axis the mod-2 /
+# dh checks apply to.
+
+def test_eedi3h_rejects_8bit(noise_8bit):
+    with pytest.raises(vs.Error):
+        _runh(noise_8bit, field=1)
+
+
+def test_eedi3h_rejects_10bit(noise_8bit):
+    clip = vs.core.fmtc.bitdepth(noise_8bit, bits=10)
+    with pytest.raises(vs.Error):
+        _runh(clip, field=1)
+
+
+def test_eedi3h_rejects_bad_field(noise_16bit):
+    for bad in (-1, 4):
+        with pytest.raises(vs.Error):
+            _runh(noise_16bit, field=bad)
+
+
+def test_eedi3h_rejects_dh_with_field_gt1(noise_16bit):
+    for field in (2, 3):
+        with pytest.raises(vs.Error):
+            _runh(noise_16bit, field=field, dh=1)
+
+
+def test_eedi3h_rejects_bad_alpha_beta(noise_16bit):
+    for kw in ({"alpha": -0.1}, {"alpha": 1.5}, {"beta": 1.1},
+               {"alpha": 0.7, "beta": 0.7}, {"beta": -0.1}):
+        with pytest.raises(vs.Error):
+            _runh(noise_16bit, field=1, **kw)
+
+
+def test_eedi3h_rejects_bad_gamma(noise_16bit):
+    with pytest.raises(vs.Error):
+        _runh(noise_16bit, field=1, gamma=-1.0)
+
+
+def test_eedi3h_rejects_bad_nrad(noise_16bit):
+    for bad in (-1, 4):
+        with pytest.raises(vs.Error):
+            _runh(noise_16bit, field=1, nrad=bad)
+
+
+def test_eedi3h_rejects_bad_mdis(noise_16bit):
+    for bad in (0, 41):
+        with pytest.raises(vs.Error):
+            _runh(noise_16bit, field=1, mdis=bad)
+
+
+def test_eedi3h_rejects_bad_vcheck(noise_16bit):
+    for bad in (-1, 4):
+        with pytest.raises(vs.Error):
+            _runh(noise_16bit, field=1, vcheck=bad)
+
+
+def test_eedi3h_rejects_bad_vthresh(noise_16bit):
+    for kw in ({"vthresh0": 0.0}, {"vthresh1": -5.0}, {"vthresh2": 0.0}):
+        with pytest.raises(vs.Error):
+            _runh(noise_16bit, field=1, vcheck=2, **kw)
+    # ignored when vcheck == 0
+    _runh(noise_16bit, field=1, vcheck=0, vthresh0=0.0)
+
+
+def test_eedi3h_rejects_bad_planes(noise_16bit):
+    with pytest.raises(vs.Error):
+        _runh(noise_16bit, field=1, planes=[0, 0])
+    with pytest.raises(vs.Error):
+        _runh(noise_16bit, field=1, planes=[5])
+
+
+def test_eedi3h_rejects_bad_num_streams(noise_16bit):
+    for bad in (0, 33):
+        with pytest.raises(vs.Error):
+            _runh(noise_16bit, field=1, num_streams=bad)
+
+
+def test_eedi3h_rejects_bad_device_id(noise_16bit):
+    with pytest.raises(vs.Error):
+        _runh(noise_16bit, field=1, device_id=-1)
+
+
+def test_eedi3h_rejects_mclip_not_gray(noise_16bit):
+    src = vs.core.bs.VideoSource(NOISE_MKV)
+    yuv = vs.core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
+    with pytest.raises(vs.Error):
+        _runh(noise_16bit, field=1, mclip=yuv)
+
+
+def test_eedi3h_rejects_mclip_wrong_dims(noise_16bit):
+    small = vs.core.std.BlankClip(format=vs.GRAY8, width=100, height=100,
+                                  length=noise_16bit.num_frames, color=[128])
+    with pytest.raises(vs.Error):
+        _runh(noise_16bit, field=1, mclip=small)
+
+
+def test_eedi3h_rejects_mclip_wrong_frames(noise_16bit):
+    short = vs.core.std.BlankClip(format=vs.GRAY8, width=WIDTH, height=HEIGHT,
+                                  length=1, color=[128])
+    with pytest.raises(vs.Error):
+        _runh(noise_16bit, field=1, mclip=short)
+
+
+def test_eedi3h_rejects_sclip_wrong_dims_when_vcheck(noise_16bit):
+    """sclip is validated only when vcheck > 0 (eedi3m semantics)."""
+    small = vs.core.std.BlankClip(format=vs.GRAY16, width=100, height=100,
+                                  length=noise_16bit.num_frames)
+    with pytest.raises(vs.Error):
+        _runh(noise_16bit, field=1, vcheck=2, sclip=small)
+    # ignored (not validated) when vcheck == 0
+    _runh(noise_16bit, field=1, vcheck=0, sclip=small)
+
+
+def test_eedi3h_sclip_requires_2n_frames_under_field_gt1(noise_16bit):
+    """sclip describes the OUTPUT: field > 1 doubles the frame count, so the
+    sclip must carry 2N frames (one per output frame, as based_aa builds it)."""
+    clip = noise_16bit
+    N = clip.num_frames
+    base = dict(field=3, mdis=5, nrad=1, vcheck=2)
+    with pytest.raises(vs.Error):
+        _runh(clip, sclip=clip, **base)          # N frames: wrong
+    two_n = vs.core.std.BlankClip(format=vs.GRAY16, width=WIDTH, height=HEIGHT,
+                                  length=2 * N, color=[1000])
+    out = _runh(clip, sclip=two_n, **base)       # 2N frames: accepted
+    assert out.num_frames == 2 * N
+    out.get_frame(2 * N - 1)
+
+
+def test_eedi3h_sclip_dh_requires_doubled_width(noise_16bit):
+    """Under dh EEDI3H doubles the output WIDTH (not the height), so the sclip
+    must be twice as wide as the source."""
+    clip = noise_16bit
+    base = dict(field=1, dh=1, mdis=5, nrad=1, vcheck=2)
+    with pytest.raises(vs.Error):
+        _runh(clip, sclip=clip, **base)          # 1x width: wrong
+    wide = vs.core.std.BlankClip(format=vs.GRAY16, width=2 * WIDTH, height=HEIGHT,
+                                 length=clip.num_frames, color=[1000])
+    out = _runh(clip, sclip=wide, **base)        # 2x width: accepted
+    assert (out.width, out.height) == (2 * WIDTH, HEIGHT)
+    out.get_frame(0)

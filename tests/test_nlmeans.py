@@ -211,6 +211,57 @@ def test_matches_reference_16bit(noise_16bit, kwargs):
     assert worst <= 1.0, f"max LSB diff vs vszipcl {kwargs}: {worst}"
 
 
+# Positive maxima of the three radii (a=64, s=8, d=16): the m=0..2
+# sweep-table variants and run-group boundaries the a<=4 / d<=2 sweep misses.
+# At the default h=1.2 the largest push the fp16 weight ring to its envelope
+# (a=64 2.02e-3, s=8+a=64 1.42e-2) while the same configs at h=3.0 land at
+# 1.6e-6 and wmode 1/2/3 at a=64 stays ~1e-6, so the drift is weight
+# quantisation, not indexing. d=16 with s=8 and a=64 together is omitted: it
+# hard-recovers the GPU.
+POSITIVE_MAX_CASES = [
+    # (kwargs, bound, measured)
+    ({"d": 0, "a": 64}, 3e-3, 2.02e-3),
+    ({"d": 0, "s": 8, "a": 64}, 2e-2, 1.42e-2),
+    ({"d": 0, "a": 64, "h": 3.0}, NLMEANS_REF_TOL, 1.61e-6),
+    ({"d": 0, "s": 8, "a": 64, "h": 3.0}, NLMEANS_REF_TOL, 1.46e-6),
+    ({"d": 16}, NLMEANS_REF_TOL, 4.22e-6),
+    ({"d": 16, "a": 64}, NLMEANS_REF_TOL, 6.97e-5),
+    ({"d": 16, "a": 64, "h": 3.0}, NLMEANS_REF_TOL, 1.54e-5),
+]
+
+
+@pytest.mark.parametrize("kwargs,bound,measured", POSITIVE_MAX_CASES,
+                         ids=[str(kw) for kw, _, _ in POSITIVE_MAX_CASES])
+def test_matches_reference_positive_maxima_32bit(noise_gray, kwargs, bound,
+                                                 measured):
+    worst = _ref_compare("gray32", (0, 11, 23), dict(num_streams=1, **kwargs))
+    assert worst < bound, \
+        f"max diff vs vszipcl {kwargs}: {worst} (bound {bound}, was {measured})"
+
+
+POSITIVE_MAX_16_CASES = [
+    # (kwargs, bound, measured codes)
+    ({"d": 16}, 1.0, 1),
+    ({"d": 16, "s": 8}, 1.0, 1),
+    ({"d": 16, "a": 64}, 8.0, 5),
+    ({"d": 16, "a": 64, "h": 3.0}, 1.0, 1),
+    ({"d": 0, "a": 64}, 200.0, 133),          # fp16 weight envelope at h=1.2
+    ({"d": 0, "a": 64, "h": 3.0}, 1.0, 1),    # same config, weights representable
+    ({"d": 0, "s": 8, "a": 64, "h": 3.0}, 1.0, 1),
+]
+
+
+@pytest.mark.parametrize("kwargs,bound,measured", POSITIVE_MAX_16_CASES,
+                         ids=[str(kw) for kw, _, _ in POSITIVE_MAX_16_CASES])
+def test_matches_reference_positive_maxima_16bit(noise_16bit, kwargs, bound,
+                                                 measured):
+    """16-bit mirror: whole output codes. The a=64/h=1.2 entry carries the
+    same fp16-weight envelope (133 codes) and is 1 code at h=3.0."""
+    worst = _ref_compare("gray16", (0, 11, 23), dict(num_streams=1, **kwargs))
+    assert worst <= bound, \
+        f"max LSB diff vs vszipcl {kwargs}: {worst} (bound {bound}, was {measured})"
+
+
 def test_yuv_default_denises_luma_copies_chroma_32bit(noise_yuv32):
     src = noise_yuv32
     out = _run(src, d=0)

@@ -234,3 +234,31 @@ the `env_flag`/`env_int`/`env_str` helpers in `vsfeel.h`.
 - `VSFEEL_BM3D_QUEUES=N` — queue cap override.
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs.
 - `VSFEEL_BM3D_DUMP=1` / `VSFEEL_BM3D_GPUTRACE=1` — slot dump / GPU timestamps.
+
+## `extractor_exp` was a silent no-op — FIXED
+
+**Mechanism.** Host wiring was fine (`extractor_exp -> Spec.extractor`,
+`constant_id 9`, confirmed by print) and the SPIR-V kept the `(x + E) - E`
+pre-rounding, but RADV folds that pair to `x` once E is a known spec constant:
+`RADV_DEBUG=asm` for `extractor_exp=0` and `=20` was instruction-for-instruction
+identical (181 `v_add_f32`/`v_sub_f32` both, no 2^20 constant), so the parameter
+was inert.
+
+**Fix.** `bm3d.comp` computes the pair under GLSL `precise` (SPIR-V
+`NoContraction`) inside `if (EXTRACTOR != 0.0)`. The `if` folds at pipeline
+creation: pre-fix vs post-fix `extractor_exp=0` ISA diff is **0 lines**. Only
+`E != 0` gains the rounding ops.
+
+**After**, same noise clip (sigma 0.7, radius 2, bm_range 16, ps_range 7,
+block_step 4, two fresh `ns=1` instances):
+
+| extractor_exp | vsfeel run-to-run | vsfeel vs e0 | vszipcl vs e0 |
+|---|---|---|---|
+| 0 | 3.7e-8 | — | — |
+| 3 | 0 | 1.8e-4 | 1.2e-4 |
+| 8 | 0 | 5.6e-3 | 3.8e-3 |
+| 20 | — | non-finite | non-finite |
+
+The documented ">= 3 = bitwise reproducible" guarantee now holds, matching
+vszipcl. Rule left behind: **a spec-constant-guarded `(x + E) - E` idiom needs
+`precise`, or RADV folds it.**

@@ -90,6 +90,12 @@ REFERENCE_CASES_16 = [
     {"nns": 2},
     {"nns": 4},
     {"field": 0},
+    # gaps in the nsize / nns sweeps; measured 0 LSB on the noise clip
+    {"nsize": 1},
+    {"nsize": 2},
+    {"nsize": 5},
+    {"nns": 1},
+    {"nns": 3},
 ]
 
 
@@ -142,7 +148,9 @@ def test_nnedi3_yuv_matches_reference():
 # ---------------------------------------------------------------------------
 
 REFERENCE_CASES_32 = [{}, {"pscrn": 0}, {"pscrn": 1}, {"qual": 2},
-                      {"etype": 1}, {"nsize": 0}, {"nns": 4}, {"field": 0}]
+                      {"etype": 1}, {"nsize": 0}, {"nns": 4}, {"field": 0},
+                      # float-path gaps: field 2/3 and dh (16-bit only before)
+                      {"field": 2}, {"field": 3}, {"dh": True}]
 
 
 @pytest.mark.parametrize("kwargs", REFERENCE_CASES_32,

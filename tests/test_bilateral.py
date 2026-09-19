@@ -264,3 +264,139 @@ def test_bilateral_ref_clip_matches_reference_16bit(noise_16bit):
                      dict(sigma_spatial=2.0, sigma_color=0.05),
                      guide={"kind": "flipvertical"})
     assert worst <= 1.0, f"max diff {worst} LSB"
+
+
+# ---------------------------------------------------------------------------
+# Workgroup shape (block_x / block_y)
+# ---------------------------------------------------------------------------
+#
+# vszipcl hardcodes 16x8 and takes no block args, so these are checked for
+# exact shape-invariance instead (the kernel is a per-pixel gather, so the
+# shape is a pure launch parameter); the default shape is anchored to vszipcl
+# by the sweeps above.
+
+BLOCK_SHAPES = [(16, 16), (8, 32), (32, 8), (64, 1), (1, 64), (16, 8), (4, 4)]
+
+
+@pytest.mark.parametrize("block_x,block_y", BLOCK_SHAPES,
+                         ids=[f"{x}x{y}" for x, y in BLOCK_SHAPES])
+def test_bilateral_block_shape_does_not_change_output_32bit(
+        noise_gray, block_x, block_y):
+    kwargs = dict(sigma_spatial=3.0, sigma_color=0.05, num_streams=1)
+    default = _run(noise_gray, **kwargs)
+    shaped = _run(noise_gray, block_x=block_x, block_y=block_y, **kwargs)
+    for n in (0, 11, 23):
+        a = frame_to_ndarray(default.get_frame(n))
+        b = frame_to_ndarray(shaped.get_frame(n))
+        assert np.array_equal(a, b), \
+            f"block {block_x}x{block_y} changed frame {n}"
+
+
+@pytest.mark.parametrize("block_x,block_y", BLOCK_SHAPES,
+                         ids=[f"{x}x{y}" for x, y in BLOCK_SHAPES])
+def test_bilateral_block_shape_does_not_change_output_16bit(
+        noise_16bit, block_x, block_y):
+    kwargs = dict(sigma_spatial=3.0, sigma_color=0.05, num_streams=1)
+    default = _run(noise_16bit, **kwargs)
+    shaped = _run(noise_16bit, block_x=block_x, block_y=block_y, **kwargs)
+    for n in (0, 11, 23):
+        a = _plane(default.get_frame(n), 0)
+        b = _plane(shaped.get_frame(n), 0)
+        assert np.array_equal(a, b), \
+            f"block {block_x}x{block_y} changed frame {n}"
+
+
+def test_bilateral_rejects_zero_block(noise_gray):
+    """A zero workgroup dimension cannot be launched and must be rejected."""
+    for bx, by in [(0, 8), (8, 0), (0, 0)]:
+        with pytest.raises(vs.Error):
+            _run(noise_gray, sigma_spatial=3.0, sigma_color=0.05,
+                 block_x=bx, block_y=by)
+
+
+def test_bilateral_negative_block_is_clamped_not_rejected(noise_gray):
+    """Pins current behaviour: a negative block dimension is silently clamped
+    to the device default, not rejected.
+
+    ``bilateral.cpp:726`` casts to ``uint32_t`` before the limit comparison,
+    so -1 wraps and takes the shrink branch before the ``block_x <= 0`` check
+    at :733. Output is still correct (the shape has no semantic effect); the
+    validation is just inconsistent with ``block_x=0``, which errors.
+    """
+    kwargs = dict(sigma_spatial=3.0, sigma_color=0.05, num_streams=1)
+    default = _run(noise_gray, **kwargs)
+    for bx, by in [(-1, 8), (8, -1), (-1, -1)]:
+        shaped = _run(noise_gray, block_x=bx, block_y=by, **kwargs)
+        for n in (0, 11):
+            a = frame_to_ndarray(default.get_frame(n))
+            b = frame_to_ndarray(shaped.get_frame(n))
+            assert np.array_equal(a, b), \
+                f"negative block {bx}x{by} changed frame {n}"
+
+
+# ---------------------------------------------------------------------------
+# Per-plane parameter arrays
+# ---------------------------------------------------------------------------
+#
+# Explicit three-element sigma_spatial / sigma_color / radius arrays (incl.
+# the documented chroma default) against vszipcl, which the scalar YUV tests
+# only covered implicitly.
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"sigma_spatial": [2.0, 1.0, 1.0]},                    # the chroma rule
+    {"sigma_spatial": [2.0, 1.5, 1.5], "sigma_color": [0.05, 0.02, 0.02]},
+    {"sigma_spatial": [2.0, 1.0, 3.0],
+     "sigma_color": [0.05, 0.02, 0.1], "radius": [2, 1, 3]},
+    {"sigma_spatial": [1.0, 0.5, 0.5], "radius": [1, 1, 1]},
+], ids=["chroma-rule", "spatial+color", "all-three", "radius-1"])
+def test_bilateral_per_plane_arrays_match_reference_32bit(noise_gray, kwargs):
+    """YUV420 float32 with explicit per-plane arrays must track vszipcl on
+    all three planes (incl. the subsampled chroma lattice)."""
+    worst = _compare("yuv32", (0, 11, 23), kwargs)
+    assert worst < REF_TOL, f"max diff {worst} ({kwargs})"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"sigma_spatial": [2.0, 1.0, 1.0]},
+    {"sigma_spatial": [2.0, 1.5, 1.5], "sigma_color": [0.05, 0.02, 0.02]},
+    {"sigma_spatial": [2.0, 1.0, 3.0], "radius": [2, 1, 3]},
+], ids=["chroma-rule", "spatial+color", "spatial+radius"])
+def test_bilateral_per_plane_arrays_match_reference_16bit(noise_16bit, kwargs):
+    """16-bit mirror of the per-plane array sweep (whole output codes)."""
+    worst = _compare("yuv420_16", (0, 11, 23), kwargs)
+    assert worst <= 1.0, f"max diff {worst} LSB ({kwargs})"
+
+
+def test_bilateral_per_plane_arrays_gray_32bit(noise_gray):
+    """A three-element array on a single-plane clip: only element 0 is used,
+    and the result must equal the scalar-parameter run exactly."""
+    scalar = _run(noise_gray, sigma_spatial=2.0, sigma_color=0.05,
+                  num_streams=1)
+    array = _run(noise_gray, sigma_spatial=[2.0, 1.5, 1.0],
+                 sigma_color=[0.05, 0.03, 0.02], num_streams=1)
+    for n in (0, 11):
+        a = frame_to_ndarray(scalar.get_frame(n))
+        b = frame_to_ndarray(array.get_frame(n))
+        assert np.array_equal(a, b), f"extra array elements changed frame {n}"
+    worst = _compare("gray32", (0, 11, 23),
+                     dict(sigma_spatial=[2.0, 1.5, 1.0],
+                          sigma_color=[0.05, 0.03, 0.02]))
+    assert worst < REF_TOL, f"max diff {worst}"
+
+
+# ---------------------------------------------------------------------------
+# Error paths
+# ---------------------------------------------------------------------------
+
+def test_bilateral_rejects_negative_sigma(noise_gray):
+    with pytest.raises(vs.Error):
+        _run(noise_gray, sigma_spatial=-1.0)
+    with pytest.raises(vs.Error):
+        _run(noise_gray, sigma_color=-1.0)
+
+
+def test_bilateral_rejects_nonpositive_radius(noise_gray):
+    for bad in (0, -1):
+        with pytest.raises(vs.Error):
+            _run(noise_gray, radius=bad)

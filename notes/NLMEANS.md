@@ -245,3 +245,23 @@ Per-stream cost is ~100 MiB at 1080p YUV420P16 d=2/a=2/s=4 (sysfs deltas):
 default 200.6 MiB == explicit ns=2 206.7, ns=1 107.6, ns=4 404.8. The 512 MiB
 slot-pool budget is unchanged and the created configs still satisfy the
 one-full-window requirement; streams stay pinned to the single shared queue.
+
+## Positive maxima (a=64, s=8, d=16) vs the reference
+
+These exercise the `m=0..2` sweep-table variants and the run-group boundaries
+the a<=4 / d<=2 sweep never reached. Measured vs vszipcl on the noise clip,
+frames 0/11/23, `num_streams=1`:
+
+| config | fp32 max diff | 16-bit codes |
+|---|---|---|
+| `a=64` (h=1.2) | 2.02e-3 | 133 |
+| `s=8,a=64` (h=1.2) | 1.42e-2 | — |
+| `a=64` (h=3.0) | 1.61e-6 | 1 |
+| `s=8,a=64` (h=3.0) | 1.46e-6 | 1 |
+| `d=16` | 4.22e-6 | 1 |
+| `d=16,a=64` | 6.97e-5 | 5 |
+
+Only wmode 0 at low h diverges, growing with tap count; h>=3 or wmode 1/2/3
+stays ulp-level and self-consistency is exactly 0.0 — the D3 fp16 weight-ring
+envelope, not indexing. `d=16,s=8,a=64` together hard-recovers the GPU; do not
+add it.

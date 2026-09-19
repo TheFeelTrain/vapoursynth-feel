@@ -53,6 +53,16 @@ GPUs documented here as the target. `MANGOHUD=0` should be set for every
 benchmark run — it does not change results, it just suppresses extra messages
 in the output.
 
+## Comments and docstrings
+
+Keep them short and only where the code is not self-explanatory: aim for 3
+lines or less, say *why* rather than *what*, and do not restate the code. Test
+docstrings are a few lines at most. Notes files (`notes/<filter>.md`) may be
+longer, but do not pad them. Never cite work-order or report IDs (`WO-55`,
+`§I.11`, `T9`) in code, comments, docstrings or notes: those files are untracked
+working documents, so a checkout reader cannot resolve the codes. When a
+number matters, put it next to the config that produced it.
+
 ## Testing
 
 Every filter needs **comprehensive unit tests** in `tests/`, run with pytest.

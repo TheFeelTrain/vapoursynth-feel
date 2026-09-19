@@ -323,9 +323,22 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     import vapoursynth as vs
     from vstools import core
 
-    cases = json.loads(sys.argv[1])
+    clip_kind = sys.argv[1]
+    cases = json.loads(sys.argv[2])
+    planes = json.loads(sys.argv[3])
+
     src = core.bs.VideoSource({NOISE_MKV!r})
-    clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
+    if clip_kind == "gray32":
+        clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
+    elif clip_kind == "gray16":
+        clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=16, fulls=True, fulld=True)
+    elif clip_kind == "yuv32":
+        clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
+    elif clip_kind == "yuv420_16":
+        clip = core.resize.Bicubic(src, format=vs.YUV420P16)
+    else:
+        raise SystemExit("bad clip kind %r" % clip_kind)
+    dt = np.float32 if clip.format.sample_type == vs.FLOAT else np.uint16
 
     frames = (0, 11, 23)
 
@@ -334,8 +347,8 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     try:
         for kwargs in cases:
             ref_node = core.vszipcl.DFTTest(clip, **kwargs)
-            ref_frames.append([read_plane(ref_node.get_frame(n), 0, np.float32)
-                               for n in frames])
+            ref_frames.append([[read_plane(ref_node.get_frame(n), p, dt)
+                                for p in planes] for n in frames])
     except Exception as exc:
         print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
         raise SystemExit(2)
@@ -347,13 +360,17 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
         for kwargs, rframes in zip(cases, ref_frames):
             my_node = core.vsfeel.DFTTest(clip, num_streams=1, **kwargs)
             worst = 0.0
-            for n, b in zip(frames, rframes):
-                a = read_plane(my_node.get_frame(n), 0, np.float32)
-                if not (np.isfinite(a).all() and np.isfinite(b).all()):
-                    print("VSFEEL fail: non-finite at frame %d for %s" % (n, kwargs), flush=True)
-                    raise SystemExit(3)
-                worst = max(worst, float(np.abs(a.astype(np.float64)
-                                                - b.astype(np.float64)).max()))
+            for n, rplanes in zip(frames, rframes):
+                my_frame = my_node.get_frame(n)
+                for p, b in zip(planes, rplanes):
+                    a = read_plane(my_frame, p, dt)
+                    if not (np.isfinite(a.astype(np.float64)).all()
+                            and np.isfinite(b.astype(np.float64)).all()):
+                        print("VSFEEL fail: non-finite at frame %d plane %d for %s"
+                              % (n, p, kwargs), flush=True)
+                        raise SystemExit(3)
+                    worst = max(worst, float(np.abs(a.astype(np.float64)
+                                                    - b.astype(np.float64)).max()))
             results.append(worst)
     except SystemExit:
         raise
@@ -364,15 +381,17 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 """)
 
 
-def _reference_max_diffs() -> list[float]:
+def _reference_max_diffs(clip_kind="gray32", cases=None, planes=(0,)) -> list[float]:
     """Run every config in a single subprocess.
 
     A missing/crashing reference skips (via compare_or_skip); a vsfeel crash,
     exception, timeout or non-finite result fails with the captured tail.
     """
+    if cases is None:
+        cases = [kw for kw, _ in REFERENCE_CASES]
     return compare_or_skip(
         _COMPARE_SCRIPT,
-        [json.dumps([kw for kw, _ in REFERENCE_CASES])],
+        [clip_kind, json.dumps(cases), json.dumps(list(planes))],
         timeout=600,
     )
 
@@ -402,6 +421,38 @@ def test_dfttest_matches_reference_16bit(noise_16bit, kwargs):
     """16-bit integer path: at most one code level of rounding difference."""
     worst = _ref_compare("gray16", kwargs)
     assert worst <= 1, f"gray16 max diff {worst} ({kwargs})"
+
+
+# Window indices 0..11 on both axes, sigma2, the legal sosize surface (incl.
+# the two >50% overlaps and their divisor rule), every f0beta variant, and
+# ftype 2/3/4 with a non-default sigma. Batched per depth: one process per
+# config would take minutes. Measured worst 3e-8 (fp32), 0 in 16-bit.
+DFTEST_PARAM_SWEEP = (
+    [{"swin": v} for v in range(12)]
+    + [{"twin": v} for v in range(12)]
+    + [{"sigma2": 2.0}, {"sigma2": 16.0}]
+    + [{"sosize": v} for v in (0, 8, 14, 15)]
+    + [{"f0beta": v} for v in (0.0, 0.25, 2.0, 4.0)]
+    + [{"ftype": t, "sigma": 4.0, "pmin": 10.0, "pmax": 200.0}
+       for t in (2, 3, 4)]
+)
+
+
+def test_dfttest_parameter_sweep_matches_reference_32bit(noise_gray):
+    """Window/sigma/sosize/f0beta/ftype holes must match vszipcl."""
+    reference_or_skip("vszipcl", "DFTTest")
+    maxdiffs = _reference_max_diffs("gray32", DFTEST_PARAM_SWEEP, (0,))
+    assert len(maxdiffs) == len(DFTEST_PARAM_SWEEP)
+    for kwargs, maxdiff in zip(DFTEST_PARAM_SWEEP, maxdiffs):
+        assert maxdiff < REF_TOL, f"max diff {maxdiff} vs vszipcl for {kwargs}"
+
+
+def test_dfttest_parameter_sweep_matches_reference_16bit(noise_16bit):
+    """16-bit mirror of the new parameter sweep (whole output codes)."""
+    reference_or_skip("vszipcl", "DFTTest")
+    maxdiffs = _reference_max_diffs("gray16", DFTEST_PARAM_SWEEP, (0,))
+    for kwargs, maxdiff in zip(DFTEST_PARAM_SWEEP, maxdiffs):
+        assert maxdiff <= 1, f"gray16 max diff {maxdiff} for {kwargs}"
 
 
 def test_dfttest_rejects_8bit(noise_8bit):
@@ -474,6 +525,38 @@ def test_dfttest_yuv_all_planes_matches_reference_16bit():
     (YUV420P16, whole-code comparison; measured <= 1 LSB)."""
     worst = _ref_compare("yuv420_16", {"tbsize": 1}, planes=(0, 1, 2))
     assert worst <= 1.0, f"max diff {worst}"
+
+
+def test_dfttest_planes_chroma_only_32bit():
+    """planes=[1,2] on YUV420 float32: the two subsampled chroma planes must
+    match vszipcl (the luma is passed through untouched, pinned below)."""
+    worst = _ref_compare("yuv32", {"tbsize": 1, "planes": [1, 2]}, planes=(1, 2))
+    assert worst < REF_TOL, f"max diff {worst}"
+
+
+def test_dfttest_planes_chroma_only_16bit():
+    """16-bit mirror of test_dfttest_planes_chroma_only (whole codes)."""
+    worst = _ref_compare("yuv420_16", {"tbsize": 1, "planes": [1, 2]},
+                         planes=(1, 2))
+    assert worst <= 1.0, f"max diff {worst}"
+
+
+def test_dfttest_planes_chroma_leaves_luma_untouched(noise_gray):
+    """With planes=[1,2] the unprocessed luma must be copied through
+    bit-identically while both chroma planes change."""
+    core = vs.core
+    src = core.fmtc.bitdepth(core.bs.VideoSource(NOISE_MKV), bits=32,
+                             fulls=True, fulld=True)
+    out = _run(src, planes=[1, 2], num_streams=1)
+    for n in (0, 11, 23):
+        f = out.get_frame(n)
+        s = src.get_frame(n)
+        assert np.array_equal(_plane(f, 0, WIDTH, HEIGHT), _plane(s, 0, WIDTH, HEIGHT)), \
+            f"luma changed at frame {n}"
+        for p in (1, 2):
+            w, h = src.width >> 1, src.height >> 1
+            assert not np.array_equal(_plane(f, p, w, h), _plane(s, p, w, h)), \
+                f"chroma{p} was not filtered at frame {n}"
 
 
 # ---------------------------------------------------------------------------

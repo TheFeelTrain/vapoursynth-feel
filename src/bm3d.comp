@@ -706,8 +706,21 @@ void main() {
                 const int offset = tmp_z * 2 * TEMPORAL_STRIDE + tmp_y * STRIDE + tmp_x;
 
                 for (int j = 0; j < 8; ++j) {
-                    float wdst_val = (adaptive_weight * denoising_patch[i * 8 + j] + EXTRACTOR) - EXTRACTOR;
-                    float weight_val = (adaptive_weight + EXTRACTOR) - EXTRACTOR;
+                    float wdst_val = adaptive_weight * denoising_patch[i * 8 + j];
+                    float weight_val = adaptive_weight;
+
+                    // extractor_exp pre-rounding: makes the float atomic sums
+                    // order-independent. `precise` is load-bearing — without
+                    // it the compiler folds `(x + E) - E` back to x once the
+                    // spec constant is known and the parameter becomes a
+                    // no-op. The `if` folds at pipeline creation, so E == 0
+                    // keeps the original code.
+                    if (EXTRACTOR != 0.0) {
+                        precise float wdst_rounded = (wdst_val + EXTRACTOR) - EXTRACTOR;
+                        precise float weight_rounded = (weight_val + EXTRACTOR) - EXTRACTOR;
+                        wdst_val = wdst_rounded;
+                        weight_val = weight_rounded;
+                    }
 
                     atomicAdd(res[wdstpc + offset + j * STRIDE], wdst_val);
                     atomicAdd(res[weightpc + offset + j * STRIDE], weight_val);
