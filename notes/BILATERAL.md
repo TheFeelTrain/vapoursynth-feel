@@ -1,7 +1,10 @@
 # Bilateral — notes
 
-Status: **done for now** — vsfeel beats vszipcl everywhere except the
-extreme wide-sigma edge (R=24). Default config (GRAY16, sigma 3.0/0.02):
+Status: **done for now** — with the LDS sizing and gate fixes in, vsfeel beats
+vszipcl in every measured cell where the tiled kernel runs, including the old
+R=24 loss and the wide radii the 48 KiB cap used to send to the plain kernel.
+The only remaining losses are tiles that genuinely exceed the device's 64 KiB
+LDS (guide R≥34, no-guide R≥53). Default config (GRAY16, sigma 3.0/0.02):
 **ns=4: ~1975 vs ~1520 (+30%)**, ns=1 +26%, ns=2 +121%, ns=8 +18%,
 32-bit +67%, YUV420P16 +76%. Target was +10% at ns=4.
 
@@ -23,7 +26,7 @@ Benchmark call: `MANGOHUD=0 python3 tools/benchmark.py --filter bilateral
 | R=3 (sigma 1.0) | 2528 | 1665 | +52% |
 | R=12 (sigma 4.0) | 1302 | 1279 | +2% |
 | R=18 (sigma 6.0) | 652 | 595 | +9% |
-| R=24 (sigma 8.0) | 345 | 367 | −6% (only loss) |
+| R=24 (sigma 8.0) | 345 | 367 | −6% (pre-fix; see matrix below) |
 | 32-bit default | 1288 | 771 | +67% |
 | YUV420P16 3-plane | 1610 | 915 | +76% |
 | ns=1 / ns=2 / ns=8 (default) | 908/1828/1970 | 718/826/1663 | +26/+121/+18% |
@@ -31,10 +34,10 @@ Benchmark call: `MANGOHUD=0 python3 tools/benchmark.py --filter bilateral
 ns=6: 1985 vs 1645 (+21%). Knee is ~6; default num_streams stays 4
 (benchmark-graded depth; per-stream VRAM ~8 MB: 4 MB src + 4 MB staging).
 
-> **R≥18 rows above predate the WO-03 LDS fix (see below)** — the reserved
+> **R≥18 rows above predate the LDS tile sizing fix (below).** The reserved
 > LDS changed at every radius and the kernel selection changed for
-> R∈[28,43] (no-ref) / R∈[21,27] (guide), so those rows must be re-measured
-> by WO-24 before being quoted.
+> R∈[28,43] (no-ref) / R∈[21,27] (guide), so those rows are superseded by the
+> radius × guide matrix below before being quoted.
 
 ## Implementation (current)
 
@@ -202,10 +205,10 @@ correctness for speed.
 
 **R=24 (the documented R=24 loss) is unchanged in kind:** old reserved
 40 960 B ≤ 48 KiB → shared both before and after; only the reserved LDS
-drops (40 960 → 20 480 B → 1 → 3 workgroups/CU). The notes' "ACO VOPD=0"
-explanation for the 345-vs-367 loss may now be the only remaining cause, but
-the occupancy change means **R≥18 must be re-measured (WO-24)**; do not
-inherit the table in "Final scoreboard" for R≥18.
+drops (40 960 → 20 480 B → 1 → 3 workgroups/CU). That occupancy change is
+what the radius × guide matrix below confirms as the cause of the 345-vs-367
+loss (R=24 now 407.8 vs 364.1, 1.12x); the "ACO VOPD=0" explanation is
+retired. Do not inherit the "Final scoreboard" rows for R≥18.
 
 **Flagged, not changed:** `tests/test_bilateral.py:142-144` (16-bit) and
 `tests/test_bilateral.py:204-205` (32-bit) justify `BORDER_TOL_CODES`/
@@ -216,6 +219,80 @@ and the tolerance is ~655x (16-bit) / ~10^5x (32-bit) looser than measured.
 The R=24 kernel choice is not affected by WO-03, so the comment was already
 stale before this fix. Flagged for the test-integrity work orders (WO-48/
 WO-55); left untouched per this work order.
+
+## Radius × guide matrix (post LDS fix; 1500 frames, ns=4, GRAY16 1920x1080)
+
+Medians of 3 order-alternated reps, one session, via the benchmark harness's
+own vspipe timing (real clip, first 1000 frames cached). "guide" passes
+`ref=clip`. Kernel is the creation-time `use_shared` choice, traced with a
+temporary `VSFEEL_BILAT_TRACE` print; at the time the gate was
+`shared_bytes <= min(48 KiB, 65 536 B device limit)`. The three † cells'
+plain fallback was removed by raising the gate (next section); their rows
+here are the pre-gate baseline.
+
+| R | no-guide kernel | vsfeel | vszipcl | ratio | guide kernel | vsfeel | vszipcl | ratio |
+|---|---|---|---|---|---|---|---|---|
+| 9  | shared | 1977.0 | 1567.6 | 1.26x | shared | 1974.9 | 1120.6 | 1.76x |
+| 12 | shared | 1330.8 | 1334.0 | 1.00x | shared | 1271.7 |  738.1 | 1.72x |
+| 18 | shared |  668.9 |  599.7 | 1.12x | shared |  625.5 |  330.8 | 1.89x |
+| 21 | shared |  515.0 |  418.8 | 1.23x | shared |  377.1 |  244.7 | 1.54x |
+| 22 | shared |  468.9 |  421.1 | 1.11x | shared |  348.7 |  206.6 | 1.69x |
+| 24 | shared |  407.8 |  364.1 | 1.12x | shared |  299.2 |  183.3 | 1.63x |
+| 27 | shared |  317.3 |  249.9 | 1.27x | shared |  236.1 |   97.5 | 2.42x |
+| 28 | shared |  295.1 |  196.3 | 1.50x | plain† |   70.8 |   90.1 | 0.79x |
+| 32 | shared |  231.5 |  144.3 | 1.60x | plain† |   54.8 |   58.4 | 0.94x |
+| 43 | shared |  106.0 |   40.0 | 2.65x | plain  |   31.2 |   43.7 | 0.71x |
+| 45 | plain† |   30.1 |   65.9 | 0.46x | plain  |   28.6 |   40.0 | 0.71x |
+
+Stock-harness cross-check, no guide (`tools/benchmark.py --filter bilateral`,
+1500 frames ×3): R=9 1978.7 vs 1581.5, R=24 407.1 vs 362.5 — agrees with the
+matrix within run-to-run.
+
+- **The R=24 loss was LDS occupancy, not ACO VOPD packing.** 345 fps pre-fix
+  (40 960 B reserved) → 407.8 post-fix (20 480 B, 1 → 3 workgroups/CU, the
+  count that fits); vszipcl 364.1 on the same run.
+- **Every shared-kernel cell wins (1.00–2.65x); every plain-kernel cell
+  loses.** The one directly comparable shared-vs-plain probe (R=32 no-ref,
+  in the fix section above) measures ~3.8x, which is why R=45 no-guide
+  (plain, 30.1) sits below R=43 (shared, 106.0) and guide R=32 (plain, 54.8)
+  below guide R=27 (shared, 236.1). R=12 no-guide is the only tie.
+- **The 48 KiB gate was a cliff — now raised to the device limit.** It forced
+  `plain` for no-guide R≥44 (R=45: 51 728 B) and guide R≥28 (50 688 /
+  61 440 B) although this device reports 65 536 B and all three fit. The gate
+  now uses the reported limit; the affected cells and the new boundary are
+  re-measured in "LDS gate raised to the device limit" below.
+
+## LDS gate raised to the device limit
+
+`use_shared` gated on `min(48 KiB, maxComputeSharedMemorySize)`; this device
+reports **65 536 B**, so wide tiles that fit were sent to the ~3.2x slower
+plain kernel. The gate now uses the device limit directly:
+
+- no-guide shared iff `4*(2R+32)*(2R+16) <= 65 536` → R ≤ 52 (was ≤ 43)
+- guide shared iff `8*(2R+32)*(2R+16) <= 65 536` → R ≤ 33 (was ≤ 27)
+- `gaussblur.cpp:787` carries the same 48 KiB cap; left for its own change.
+
+`buf[SHARED_FLOATS]` is the shared shader's only LDS consumer, so sizing up to
+the reported limit is exact; no cell lands on 65 536 itself (worst is no-guide
+R=52 at 65 280 B).
+
+Same-session A/B (pre/post binaries swapped in the plugin directory between
+reps, order alternated, 1500 frames ×3, ns=4, GRAY16 1920x1080):
+
+| cell | kernel | pre (plain) | post (shared) | gain | vszipcl | post/ref |
+|---|---|---|---|---|---|---|
+| no-guide R=45 | plain → shared |  30.12 |  99.05 | 3.29x | 65.90 | 1.50x |
+| guide R=28    | plain → shared |  70.86 | 220.90 | 3.12x | 90.46 | 2.44x |
+| guide R=32    | plain → shared |  54.88 | 181.83 | 3.31x | 58.57 | 3.10x |
+
+Boundary control (400 frames, pre vs post): the new edges flip as predicted and
+the fallback survives above them — no-guide R=52 22.76 → 74.15 (3.26x), R=53
+21.91 → 21.90 (1.000x); guide R=33 51.67 → 157.41 (3.05x), R=34 48.81 → 48.82
+(1.000x). The 1.000x cells confirm the gate still rejects tiles over 64 KiB
+rather than creating an over-budget pipeline.
+
+Full suite: 799 passed. No test config is affected (the widest is no-guide
+R=24, shared before and after).
 
 ## Debug env vars
 

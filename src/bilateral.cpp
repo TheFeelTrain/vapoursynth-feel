@@ -867,8 +867,10 @@ static void VS_CC BilateralCreate(
         const size_t shared_bytes =
             static_cast<size_t>(1 + has_ref) * tile_x * tile_y * sizeof(float);
 
+        // gate on the device's real LDS limit: the old hardcoded 48 KiB cap
+        // sent wide radii that still fit to the ~4x slower plain kernel
         bool use_shared = use_shared_memory &&
-            shared_bytes <= std::min<size_t>(48 * 1024, d->device->limits.maxComputeSharedMemorySize);
+            shared_bytes <= d->device->limits.maxComputeSharedMemorySize;
         plane_shared[plane] = use_shared;
     }
 
