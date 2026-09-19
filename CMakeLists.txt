@@ -43,7 +43,7 @@ find_package(Git QUIET)
 if(NOT VSFEEL_VERSION)
     execute_process(
         COMMAND "${Python3_EXECUTABLE}" -c
-            "from setuptools_scm import get_version; print(get_version(tag_regex=r'^r(?P<version>.*)$'))"
+            "from setuptools_scm import get_version; print(get_version())"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         OUTPUT_VARIABLE _scm_version
         OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -57,10 +57,11 @@ endif()
 
 if(NOT VSFEEL_VERSION AND GIT_FOUND)
     # `--always` is deliberately absent: it makes describe succeed with a bare
-    # hash even when no r* tag is reachable, which is what previously hid the
-    # failure. Check the status and fall back explicitly instead.
+    # hash even when no version tag is reachable, which is what previously hid
+    # the failure. Check the status and fall back explicitly instead.
     execute_process(
-        COMMAND ${GIT_EXECUTABLE} describe --tags --long --match "r[0-9]*" --dirty
+        COMMAND ${GIT_EXECUTABLE} describe --tags --long
+                --match "[0-9]*" --match "v[0-9]*" --dirty
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         OUTPUT_VARIABLE _git_describe
         OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -68,7 +69,7 @@ if(NOT VSFEEL_VERSION AND GIT_FOUND)
         ERROR_QUIET
     )
     if(_git_status EQUAL 0)
-        string(REGEX REPLACE "^r" "" VSFEEL_VERSION "${_git_describe}")
+        string(REGEX REPLACE "^v" "" VSFEEL_VERSION "${_git_describe}")
     else()
         execute_process(
             COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD

@@ -25,7 +25,6 @@ dev = ["hatchling>=1.27.0", "packaging", "vsjetpack>=2.2"]
 
 [tool.hatch.version]
 source = "vcs"
-tag-pattern = '^r(?P<version>.*)$'
 
 # Patterns are anchored to the project root: a bare `vsfeel` also matches the
 # staged `install/vapoursynth/plugins/vsfeel/` copy, which then ships whenever
