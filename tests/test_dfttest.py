@@ -172,7 +172,7 @@ def test_dfttest_vspipe_pipelined_no_hang(num_streams, bits):
     loop, drives the frame requests. Parametrized over both input depths
     (float32 default and --bits 16 integer path).
     """
-    bench = Path(__file__).resolve().parent.parent / "benchmark" / "bench.py"
+    bench = Path(__file__).resolve().parent.parent / "tools" / "benchmark.py"
     cmd = [sys.executable, str(bench), "--synthetic", "--frames", "200",
            "--filter", "dfttest", "vsfeel"]
     if bits:

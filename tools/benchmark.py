@@ -10,16 +10,16 @@ new reference plugin = one new entry.
 Timing is done with vspipe so results stay comparable across plugins.
 
 Usage:
-    python3 benchmark/bench.py                                   # all filters
-    python3 benchmark/bench.py --filter gaussblur                # one filter
-    python3 benchmark/bench.py --filter gaussblur vsfeel vszipcl # subset of plugins
-    python3 benchmark/bench.py --filter gaussblur --gauss-sigma 5.0
-    python3 benchmark/bench.py --filter gaussblur --repeat 5      # median of 5, alternating order
-    python3 benchmark/bench.py --filter dfttest --pair vszipcl    # same-session pair + ratio
-    python3 benchmark/bench.py --filter bilateral --streams 1,2,4,8
-    python3 benchmark/bench.py --frames 500 --clip /path/to/input.mkv
-    python3 benchmark/bench.py --no-cache          # live decode: full chain incl. BestSource
-    python3 benchmark/bench.py --check-fresh       # refuse to run against a stale .so
+    python3 tools/benchmark.py                                   # all filters
+    python3 tools/benchmark.py --filter gaussblur                # one filter
+    python3 tools/benchmark.py --filter gaussblur vsfeel vszipcl # subset of plugins
+    python3 tools/benchmark.py --filter gaussblur --gauss-sigma 5.0
+    python3 tools/benchmark.py --filter gaussblur --repeat 5      # median of 5, alternating order
+    python3 tools/benchmark.py --filter dfttest --pair vszipcl    # same-session pair + ratio
+    python3 tools/benchmark.py --filter bilateral --streams 1,2,4,8
+    python3 tools/benchmark.py --frames 500 --clip /path/to/input.mkv
+    python3 tools/benchmark.py --no-cache          # live decode: full chain incl. BestSource
+    python3 tools/benchmark.py --check-fresh       # refuse to run against a stale .so
 
 Every plugin is timed --repeat times (default 3) and the median is reported with
 min/max/spread; the plugin order alternates between repeats so clock/thermal

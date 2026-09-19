@@ -239,7 +239,7 @@ were re-swept honestly in rounds 14/21 — see those rounds, not these.
 
 ## Round 14 — the benchmark's mask was a no-op; first honest cost model
 
-- Bug: `bench.py::make_aa_vpy` passed an already-16-bit-scaled threshold to
+- Bug: `benchmark.py::make_aa_vpy` passed an already-16-bit-scaled threshold to
   `Morpho.binarize_mask`, which re-scales from the 32-bit range → 65535 → **mask
   100% zero** (real `vsaa`: `scale_mask(60, 8, 32)` = 15420). So `xmin >= WIDTH`
   every row and the pipeline was dead code — the origin of the pre-14 "deleting the

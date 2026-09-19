@@ -81,7 +81,7 @@ standard test input.
 
 ## How benchmarking works
 
-The benchmark is `benchmark/bench.py`. It is data-driven: every filter is one
+The benchmark is `tools/benchmark.py`. It is data-driven: every filter is one
 entry in a `FILTERS` registry describing its CLI args, the input clip
 expression, and a builder that maps each supported plugin to the vpy call that
 runs it. Plugins are described separately in `PLUGINS`.
@@ -89,9 +89,9 @@ runs it. Plugins are described separately in `PLUGINS`.
 - Timing is done with `vspipe`, so results are comparable across plugins and
   with the earlier per-plugin scripts.
 - Usage:
-  - `python3 benchmark/bench.py` — all filters
-  - `python3 benchmark/bench.py --filter <name>` — one filter
-  - `python3 benchmark/bench.py --filter <name> vsfeel vszipcl` — a subset of
+  - `python3 tools/benchmark.py` — all filters
+  - `python3 tools/benchmark.py --filter <name>` — one filter
+  - `python3 tools/benchmark.py --filter <name> vsfeel vszipcl` — a subset of
     plugins, to compare against references
   - `--frames N`, `--num-streams N`, `--clip PATH` to control the run
 - The default clip is `/home/encode/test/jpbd.mkv` (1920x1080, YUV420P8).
@@ -105,7 +105,7 @@ runs it. Plugins are described separately in `PLUGINS`.
 To benchmark a single filter against the references:
 
 ```bash
-MANGOHUD=0 python3 benchmark/bench.py --filter dfttest vsfeel vszipcl vszipcu
+MANGOHUD=0 python3 tools/benchmark.py --filter dfttest vsfeel vszipcl vszipcu
 ```
 
 This prints fps for each plugin and ranks them. Compare vsfeel's fps against
@@ -114,7 +114,7 @@ frames.
 
 Two-tier measurement keeps the iteration loop tight: screen candidates with a
 fast custom `.vpy` + `vspipe` (a few hundred frames, BlankClip or a small
-cached real clip), and grade only on full `bench.py` same-session pairs over
+cached real clip), and grade only on full `benchmark.py` same-session pairs over
 1000+ frames (a `rep_<filter>.sh` loop of 5000-frame ×3 repeats settles
 medians). A one-off fast-vpy number that later pairs contradict was noise,
 not a finding.
@@ -526,6 +526,10 @@ cmake -S . -B build -D CMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
 
+`tools/install.sh` wraps those two steps, copies the result into VapourSynth's
+plugin directory, and fails unless the installed copy hashes equal the build —
+prefer it to copying by hand (see below).
+
 Vulkan headers (`Vulkan-Headers`) and the loader shim (`volk`) are pinned and
 fetched by `FetchContent` at configure time, so no Vulkan SDK is needed to link
 — only `glslc` from one. **Nothing links a Vulkan library**: `volkInitialize()`
@@ -569,15 +573,26 @@ not recompile the shaders. Do not remove it.
 
 ### Installing the built plugin
 
-Copy the built shared object into VapourSynth's plugin directory so the
-running Python picks it up:
+Use `tools/install.sh`: it configures and builds, copies the shared object into
+VapourSynth's plugin directory, and fails unless the installed copy hashes equal
+the build.
 
 ```bash
-cp build/libvsfeel.so /usr/lib/python3.14/site-packages/vapoursynth/plugins/vsfeel/
+tools/install.sh                 # build/ + the plugin dir of the running Python
+tools/install.sh -h              # -b build dir, -p plugin dir, -c build type
 ```
 
+It asks `vapoursynth.get_plugin_dir()` where the running Python loads plugins
+from, so a venv installs into the venv; `VSFEEL_BUILD_DIR` and
+`VSFEEL_PLUGIN_DIR` override the autodetection. The copy is skipped when the
+installed plugin already matches the build, so re-running it after an unrelated
+change is a no-op.
+
 Then re-run the tests / benchmark. The copy step is needed every time you
-rebuild, or you will benchmark a stale plugin.
+rebuild, or you will benchmark a stale plugin — and never fold the build and the
+test run into one shell command (rule above): if the compile fails, the stale
+plugin stays installed and silently "passes". The hash check in this script is
+what makes that loud, since a stale `.spv` once masqueraded as a working build.
 
 ### Persistent pipeline cache (makes creation and the test suite fast)
 

@@ -204,7 +204,7 @@ collision with one queue). Throughput is unchanged (below).
   `BM3D_GPUTRACE` after creation no longer records into a null pool.
 
 **Performance.** Same-session interleaved A/B, 3 pairs of 1500 frames
-(`benchmark/bench.py -f bm3dv2 vsfeel`): old 173.21/172.64/172.88, new
+(`tools/benchmark.py -f bm3dv2 vsfeel`): old 173.21/172.64/172.88, new
 75.53/172.64/172.57 fps. The 75.5 is the pipeline-cache cold compile after the
 SPIR-V change (first run of a new binary only); the steady medians differ by
 <0.5%, below the noise floor, and BM3D's recorded frame split is ~90% fence.

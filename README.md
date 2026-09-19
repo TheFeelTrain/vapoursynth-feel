@@ -18,7 +18,7 @@ Primarily optimized for running on RDNA 3 with the RADV driver on Linux.
 
 Reference columns are `vszipcl` for all filters except `nnedi3vk` for NNEDI3.
 
-Each figure is the median of 3 `benchmark/bench.py --bits <16|32>` runs on an RX 7900 XTX.
+Each figure is the median of 3 `tools/benchmark.py --bits <16|32>` runs on an RX 7900 XTX.
 
 ## Common Arguments
 

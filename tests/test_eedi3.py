@@ -194,7 +194,7 @@ def test_eedi3_vspipe_pipelined_no_hang(num_streams, bits):
     resource-pool misuse deadlocks or crashes the whole run. Runs the real
     benchmark as a subprocess so that vspipe's reader drives the requests.
     Times out if the filter hangs."""
-    bench = Path(__file__).resolve().parent.parent / "benchmark" / "bench.py"
+    bench = Path(__file__).resolve().parent.parent / "tools" / "benchmark.py"
     cmd = [sys.executable, str(bench), "--synthetic", "--frames", "200",
            "--filter", "eedi3", "vsfeel"]
     if bits:

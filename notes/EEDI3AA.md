@@ -68,7 +68,7 @@ Measured, not assumed — do not re-derive from intuition.
 - `vsfeel/vsaa.py`: `EEDI3(vsaa.deinterlacers.EEDI3)` overrides `antialias` to
   emit one `EEDI3AA` call, else `super()`; `vsfeel.EEDI3` is a PEP-562 lazy
   re-export, so `import vsfeel` never needs vsaa.
-- `benchmark/bench.py`: reference arms are the `vsaa` EEDI3 antialiaser itself
+- `tools/benchmark.py`: reference arms are the `vsaa` EEDI3 antialiaser itself
   (`should_h`/`supports_mclip`/the `Interleave([s,s])` sclip/`field = tff + 2`
   all come from vsaa, so they cannot drift); the fused arm calls
   `core.vsfeel.EEDI3AA` directly.
@@ -120,7 +120,7 @@ under-reported every stage 10x).
   (`VSFEEL_EEDI3_AATIGHT=0` restores the two-plane + CPU form; vcheck 0 falls
   back). Together, round 6: fused 89.7 → 108.8 fps (1200 f × 4 order-reversed
   reps), bit-exact vs the old path (30 real 4K frames, 497 MB/arm
-  byte-identical); `bench.py --filter eedi3aa` then measured ~121 fps at ns=8
+  byte-identical); `benchmark.py --filter eedi3aa` then measured ~121 fps at ns=8
   (vszipcl 48.6, eedi3vk2 36.2).
 - **Dead end — GPU K compaction (`ENTRY_ASSEMBLEK`).** One kernel merging
   src+vout *and* emitting both compacted column matrices was **bit-exact for

@@ -5,7 +5,7 @@ extreme wide-sigma edge (R=24). Default config (GRAY16, sigma 3.0/0.02):
 **ns=4: ~1975 vs ~1520 (+30%)**, ns=1 +26%, ns=2 +121%, ns=8 +18%,
 32-bit +67%, YUV420P16 +76%. Target was +10% at ns=4.
 
-Benchmark call: `MANGOHUD=0 python3 benchmark/bench.py --filter bilateral
+Benchmark call: `MANGOHUD=0 python3 tools/benchmark.py --filter bilateral
 [--num-streams N] [--bits 32] [--bilateral-sigma-spatial X
 --bilateral-sigma-color Y] vsfeel vszipcl`
 

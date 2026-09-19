@@ -128,7 +128,7 @@ jobs:
         CMAKE_GENERATOR: Ninja
       run: |
         # MSYS2's git emulates POSIX file modes, so it invents an executable bit
-        # for shebang files (src/gen_spirv_header.py, benchmark/bench.py) and
+        # for shebang files (src/gen_spirv_header.py, tools/benchmark.py) and
         # reports them as modified. setuptools_scm reads that as a dirty tree and
         # stamps a local version (+g<hash>.d<date>), which PyPI rejects. Line
         # endings can disagree between this git and the one that checked the tree

@@ -14,7 +14,7 @@ overlap-limited. The remaining gap is to vszipcu's HIP path, not to OpenCL.
 `num_streams` defaults to 1 in the plugin (the benchmark passes 4); per-stream
 VRAM is ~4 MB src + ~4 MB dst + staging.
 
-Bench: `MANGOHUD=0 python3 benchmark/bench.py --filter gaussblur
+Bench: `MANGOHUD=0 python3 tools/benchmark.py --filter gaussblur
 [--gauss-sigma X] [--num-streams N] vsfeel vszipcl vszipcu`.
 Target GPU: RX 7900 XTX (gfx1100), RADV, ReBAR (`memoryType 3`).
 

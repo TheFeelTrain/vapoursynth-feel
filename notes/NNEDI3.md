@@ -148,7 +148,7 @@ slots 5 → 4 (0=top 1=pre 2=pred 3=copy).
   (`warp*288 + 15*32 + 31 > 1152`) overflows `shTile[4*288]` for warp≥1 → OOB
   shared writes → fresh-instance nondeterminism (maxdiff ~3000, 26 failed); rule:
   re-derive the shared footprint (≤1152 vec4) for any PXP/stride change.
-- **Pack writer: NT wins — judge on `bench.py`, not a microbench.** An isolated heap
+- **Pack writer: NT wins — judge on `benchmark.py`, not a microbench.** An isolated heap
   microbench said memcpy 41 vs NT 65 µs; both real mappings said the opposite (GTT:
   NT+sfence ~300 vs memcpy ~440 at 2s; ReBAR: 1s NT 1075 vs memcpy 1027).
 - **`copy_stream_read` faults on an unaligned SOURCE** (`_mm256_stream_load_si256`

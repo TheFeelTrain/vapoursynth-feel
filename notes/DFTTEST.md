@@ -247,7 +247,7 @@ constants, ZMEAN spec constant, gf hoist): 3378 → 2613 instr, 690 → 468 µs
 - `test_dfttest.py`: 30 tests locally (~2 s); a HANG is a bug, so always run it
   under `timeout 20`.
 - `test_dfttest_vspipe_pipelined_no_hang` (ns=1/4, 32/16-bit): runs the real
-  `bench.py --synthetic --frames 200` through vspipe with a 120 s timeout.
+  `benchmark.py --synthetic --frames 200` through vspipe with a 120 s timeout.
   vspipe's pipelined reader + prefetch activates frames 11+ ahead — the workload
   that stalls the queue under a batched pad submit. Pure-Python sequential
   `get_frame` does not reproduce it.
