@@ -17,7 +17,14 @@ maintainers = [
 dependencies = ["vapoursynth>=74"]
 
 [dependency-groups]
-dev = ["hatchling>=1.27.0", "packaging", "vsjetpack>=2.2"]
+dev = [
+    "hatchling>=1.27.0",
+    "packaging",
+    "vsjetpack>=2.2",
+    "numpy",
+    "pytest",
+    "pytest-xdist",
+]
 
 [project.urls]
 "Source Code" = "https://github.com/TheFeelTrain/vapoursynth-feel"

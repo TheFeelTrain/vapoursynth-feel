@@ -263,5 +263,20 @@ frames 0/11/23, `num_streams=1`:
 
 Only wmode 0 at low h diverges, growing with tap count; h>=3 or wmode 1/2/3
 stays ulp-level and self-consistency is exactly 0.0 — the D3 fp16 weight-ring
-envelope, not indexing. `d=16,s=8,a=64` together hard-recovers the GPU; do not
-add it.
+envelope, not indexing.
+
+**`a=64, d=16` hard-recovers the GPU when the device is shared.** Serially it
+is stable (5/5 bit-identical; `s=8` also passes once, so the old "do not add
+it" line no longer reproduces at `ns=1`). One instance's weight sweep is
+~1.16 s/frame at 640x360 (GPUTRACE slot 2; bandwidth-bound guide re-reads,
+unchanged by `VSFEEL_NLMEANS_PACK` 1/9/18 — verified 69/118/180 MB VRAM). Two
+concurrent *processes* at this config — or one vsfeel plus one heavy vszipcl
+process — lose the context on the 3rd frame; one process with `num_streams=2`
+and 6 frames (a 5.96 s frame), 256x256/320x180 clips, and the reference 4-way
+concurrent are all fine. `RADV_DEBUG=hang` blames `nlmeans_32_weight.spv`, wave
+parked on a memory op (`TCP_BUSY`/`GL1CC_BUSY` set, `vm_fault.log` empty); no
+compute TDR applies (the driver enforces none by default). Every loop is
+constant- or push-constant-bounded and both `barrier()`s are reached
+unconditionally, so the co-scheduled weight sweep itself is the trigger, not an
+OOB or a timeout. Do not share the GPU with this configuration; `-n 8 --dist
+loadfile` keeps it serial per file.

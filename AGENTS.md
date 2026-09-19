@@ -75,7 +75,17 @@ standard test input.
 - The `tests/` folder has `conftest.py` with shared fixtures/helpers
   (`WIDTH`, `HEIGHT`, `NOISE_MKV`, `frame_to_ndarray`, ...).
 - Always run the full test suite for the filter you touch before and after
-  changes: `python -m pytest tests/test_<filter>.py -q`
+  changes: `python -m pytest tests/test_<filter>.py -q`.
+- Run the whole suite with **`tools/test.sh`** (extra args are passed through,
+  default target `tests`). It uses pytest-xdist (`dev` dependency group) with
+  `--dist loadfile` and caps workers at 8. Measured on the RX 7900XTX, 789
+  tests: **522 s serial, ~2.5 min via `tools/test.sh`** (133–146 s observed).
+  Do not raise the cap and
+  do not drop `loadfile`: 16 workers fail with `vkQueueSubmit failed` (GPU
+  exhaustion), and a plain `-n 8` is flaky because NLMeans `a=64, d=16`
+  hard-recovers the GPU whenever another client shares it — file-level
+  distribution stops that config overlapping another heavy file. See
+  `notes/NLMEANS.md`. `VSFEEL_TEST_WORKERS=1 tools/test.sh` forces serial.
 - **The suite loads the installed plugin, not `build/libvsfeel.so`.** After any
   C++ or shader change, build *and install* with `tools/install.sh` — one
   command — before running pytest, or you are testing the previous binary.
@@ -624,9 +634,10 @@ flushed to a file:
   incompatible data. The file is written via a unique temp file + rename, so
   concurrent test subprocesses cannot corrupt it.
 
-Measured on the full suite: **~7.5 min cold → ~3.5 min for the run that builds
-the cache → ~2.5 min warm** (443 tests). The first run after a driver or
-`glslc` update pays the compile again by design.
+Measured on the full suite when it was 443 tests: **~7.5 min cold → ~3.5 min for
+the run that builds the cache → ~2.5 min warm**. The suite has since grown to
+789 tests (522 s serial, ~2.5 min via `tools/test.sh` — see Testing). The first
+run after a driver or `glslc` update pays the compile again by design.
 
 ## Use web searches
 

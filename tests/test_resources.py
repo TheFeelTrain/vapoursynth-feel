@@ -42,10 +42,11 @@ FILTERS = ["Bilateral", "GaussBlur", "DFTTest", "NLMeans", "BM3Dv2",
 CYCLES = 200
 WARMUP = 20  # device / pipeline-cache / allocator settling, discarded
 
-# see the module docstring for the measured values these sit above
+# see the module docstring for the measured values these sit above.  The
+# device-wide sysfs figure is reported but not graded: it is shared, so under a
+# parallel test run another worker's allocations move it.
 GPU_RISE_LIMIT = 4 * 1024 * 1024
 RSS_RISE_LIMIT = 32 * 1024 * 1024
-DEVICE_RISE_LIMIT = 256 * 1024 * 1024
 
 
 _COMMON = r'''
@@ -320,13 +321,14 @@ def _trend(samples):
     }
 
 
-def _format(key, trend, limit):
-    return ("  %-4s first %8.2f MB  last %8.2f MB  rise %+7.2f MB  "
-            "min-rise %+7.2f MB  min %8.2f  max %8.2f  (limit %.0f MB)"
+def _format(key, trend, limit=None):
+    text = ("  %-4s first %8.2f MB  last %8.2f MB  rise %+7.2f MB  "
+            "min-rise %+7.2f MB  min %8.2f  max %8.2f"
             % (key, trend["first"] / 1048576, trend["last"] / 1048576,
                trend["rise"] / 1048576, trend["min_rise"] / 1048576,
-               trend["min"] / 1048576, trend["max"] / 1048576,
-               limit / 1048576))
+               trend["min"] / 1048576, trend["max"] / 1048576))
+    return (text + "  (limit %.0f MB)" % (limit / 1048576) if limit is not None
+            else text + "  (reported only)")
 
 
 @pytest.mark.parametrize("filter_name", FILTERS)
@@ -346,17 +348,17 @@ def test_create_destroy_cycles_keep_memory_bounded(filter_name):
                                             len(samples)))
 
     keys = ("vram", "gtt", "cpu", "rss", "dev")
+    graded = ("vram", "gtt", "cpu", "rss")
     trends = {k: _trend([s[k] for s in samples]) for k in keys}
     limits = {"vram": GPU_RISE_LIMIT, "gtt": GPU_RISE_LIMIT,
-              "cpu": GPU_RISE_LIMIT, "rss": RSS_RISE_LIMIT,
-              "dev": DEVICE_RISE_LIMIT}
+              "cpu": GPU_RISE_LIMIT, "rss": RSS_RISE_LIMIT}
 
     report = ["%s: %d cycles, %.1f ms/cycle"
               % (filter_name, payload["cycles"],
                  1000.0 * payload["secs"] / payload["cycles"])]
     for key in keys:
         report.append("  %-4s unavailable" % key if trends[key] is None
-                      else _format(key, trends[key], limits[key]))
+                      else _format(key, trends[key], limits.get(key)))
     report.append("  device released after teardown: %s (teardown %r)"
                   % (payload["teardown"] in (None, [0, 0, 0]),
                      payload["teardown"]))
@@ -368,7 +370,7 @@ def test_create_destroy_cycles_keep_memory_bounded(filter_name):
         "sysfs mem_info_vram_used are missing)\n" + "\n".join(report))
 
     bad = []
-    for key in keys:
+    for key in graded:
         trend = trends[key]
         if trend is None:
             continue
