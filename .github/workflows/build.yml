@@ -1,20 +1,44 @@
 name: Build
 
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Rebuild distributions that are already on PyPI
+        type: boolean
+        default: false
 
 jobs:
   sdist:
     runs-on: ubuntu-latest
+    env:
+      FORCE_BUILD: ${{ github.event.inputs.force_build }}
     steps:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0   # hatch-vcs derives the version from git tags
+    - name: Is the sdist already published?
+      id: published
+      run: |
+        if bash .github/scripts/pypi_dist.sh published "vapoursynth_feel-${GITHUB_REF_NAME#v}.tar.gz"; then
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+        fi
     - run: python -m pip install --upgrade build
+      if: steps.published.outputs.skip != 'true'
     - run: python -m build --sdist --outdir dist
+      if: steps.published.outputs.skip != 'true'
+    - name: Reuse the published sdist
+      if: steps.published.outputs.skip == 'true'
+      run: bash .github/scripts/pypi_dist.sh fetch "vapoursynth_feel-${GITHUB_REF_NAME#v}.tar.gz" dist
     - uses: actions/upload-artifact@v4
       with:
         name: sdist
         path: dist
+        if-no-files-found: ignore
 
   # Vulkan is loaded through volk at runtime, so the wheel links no libvulkan
   # and auditwheel can retag it to manylinux. Built in the manylinux image so
@@ -22,25 +46,47 @@ jobs:
   linux-wheel:
     runs-on: ubuntu-latest
     container: quay.io/pypa/manylinux_2_34_x86_64
+    env:
+      FORCE_BUILD: ${{ github.event.inputs.force_build }}
     steps:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
+    - name: Is the wheel already published?
+      id: published
+      shell: bash
+      run: |
+        if bash .github/scripts/pypi_dist.sh published "vapoursynth_feel-${GITHUB_REF_NAME#v}-py3-none-manylinux_2_34_x86_64.whl"; then
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+        fi
     - name: Install glslc
+      if: steps.published.outputs.skip != 'true'
       run: dnf -y install glslc
     - name: Build and repair
+      if: steps.published.outputs.skip != 'true'
       run: |
         PY=/opt/python/cp312-cp312/bin/python
         "$PY" -m pip install --upgrade build auditwheel
         "$PY" -m build --wheel --outdir dist
         "$PY" -m auditwheel repair --plat manylinux_2_34_x86_64 -w wheelhouse dist/*.whl
+    - name: Reuse the published wheel
+      if: steps.published.outputs.skip == 'true'
+      shell: bash
+      run: |
+        mkdir -p wheelhouse
+        bash .github/scripts/pypi_dist.sh fetch "vapoursynth_feel-${GITHUB_REF_NAME#v}-py3-none-manylinux_2_34_x86_64.whl" wheelhouse
     - uses: actions/upload-artifact@v4
       with:
         name: linux-wheel
         path: wheelhouse
+        if-no-files-found: ignore
 
   windows-wheel:
     runs-on: windows-latest
+    env:
+      FORCE_BUILD: ${{ github.event.inputs.force_build }}
     defaults:
       run:
         shell: msys2 {0}
@@ -48,7 +94,16 @@ jobs:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
+    - name: Is the wheel already published?
+      id: published
+      run: |
+        if bash .github/scripts/pypi_dist.sh published "vapoursynth_feel-${GITHUB_REF_NAME#v}-py3-none-win_amd64.whl"; then
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+        fi
     - uses: msys2/setup-msys2@v2
+      if: steps.published.outputs.skip != 'true'
       with:
         msystem: MINGW64
         update: true
@@ -64,6 +119,7 @@ jobs:
           toolchain:p
           uv:p
     - name: Build
+      if: steps.published.outputs.skip != 'true'
       env:
         # The packaged toolchain has no make/ninja default; CMake reads this.
         CMAKE_GENERATOR: Ninja
@@ -81,10 +137,14 @@ jobs:
         echo "--- tracked changes (must be empty) ---"
         git status --porcelain --untracked-files=no
         uv build --wheel --out-dir dist
+    - name: Reuse the published wheel
+      if: steps.published.outputs.skip == 'true'
+      run: bash .github/scripts/pypi_dist.sh fetch "vapoursynth_feel-${GITHUB_REF_NAME#v}-py3-none-win_amd64.whl" dist
     - uses: actions/upload-artifact@v4
       with:
         name: windows-wheel
         path: dist
+        if-no-files-found: ignore
 
   publish:
     permissions:
@@ -97,11 +157,37 @@ jobs:
       with:
         path: dist
         merge-multiple: true
+    - name: Drop distributions PyPI already has
+      id: already_published
+      run: |
+        # PyPI never allows re-uploading a filename, and twine aborts the whole
+        # batch on the first rejection, so remove what is already published and
+        # upload the rest. Finishing a partially published release is then a
+        # plain re-run, and the log says exactly what was skipped.
+        version="${GITHUB_REF_NAME#v}"
+        existing=$(curl -fsS "https://pypi.org/pypi/vapoursynth-feel/${version}/json" 2>/dev/null |
+          python3 -c "import json,sys; print('\n'.join(f['filename'] for f in json.load(sys.stdin)['urls']))" 2>/dev/null || true)
+        for file in dist/*.whl dist/*.tar.gz; do
+          [ -e "$file" ] || continue
+          name=$(basename "$file")
+          if printf '%s\n' "$existing" | grep -qxF "$name"; then
+            echo "already on PyPI, dropping ${name}"
+            rm -f "$file"
+          fi
+        done
+        echo "--- uploading ---"
+        to_upload=$(ls -1 dist/*.whl dist/*.tar.gz 2>/dev/null || true)
+        if [ -n "$to_upload" ]; then
+          printf '%s\n' "$to_upload"
+          echo "remaining=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "(nothing new)"
+          echo "remaining=false" >> "$GITHUB_OUTPUT"
+        fi
     - uses: pypa/gh-action-pypi-publish@release/v1
+      if: steps.already_published.outputs.remaining == 'true'
       with:
-        # A partially published release can be finished by re-running the
-        # workflow: files PyPI already has are skipped instead of failing the
-        # job, since PyPI never allows re-uploading a filename anyway.
+        # Belt and braces: also let twine skip anything that raced in.
         skip-existing: true
 
   release-assets:
@@ -121,10 +207,15 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
+        # Wheels and sdist only: dist/ also holds the .publish.attestation files
+        # the PyPI action writes, which do not belong on the release page.
+        files=$(ls -1 dist/*.whl dist/*.tar.gz 2>/dev/null || true)
+        if [ -z "${files}" ]; then
+          echo "nothing to attach"
+          exit 0
+        fi
         # Create the release if the tag was pushed without one.
         gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 ||
           gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
-        # Wheels and sdist only: dist/ also holds the .publish.attestation files
-        # the PyPI action writes, which do not belong on the release page.
         # --clobber makes a re-run replace assets instead of failing.
-        gh release upload "${GITHUB_REF_NAME}" dist/*.whl dist/*.tar.gz --clobber
+        gh release upload "${GITHUB_REF_NAME}" ${files} --clobber
