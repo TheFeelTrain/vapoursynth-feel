@@ -475,6 +475,127 @@ def reference_compare(spec, timeout=600.0):
 
 
 # ---------------------------------------------------------------------------
+# Temporal frame-request order
+# ---------------------------------------------------------------------------
+#
+# A filter that caches temporal state must return the same pixels whatever order
+# the graph asks for its frames in: vspipe requests frames concurrently and the
+# scheduler re-requests in-flight frames (DFTTest's notes prove it), which is the
+# only pattern that exposes a cache holder/lifetime bug.  Each ordering runs on
+# a *fresh* node under the subprocess timeout, while the num_streams=1 serial
+# run is the oracle, so a hang fails the test instead of the suite.
+#
+# The orders are fixed (no RNG): forward proves the oracle path, reverse and
+# "far" request temporally distant neighbours, interleave and scramble thrash
+# the frame cache, and "revisit" re-requests frames the node already served.
+
+TEMPORAL_ORDER_SCRIPT = COMPARE_PRELUDE + r'''
+import json
+import sys
+from math import gcd
+
+import vapoursynth as vs
+
+spec = json.loads(sys.argv[1])
+core = vs.core
+core.max_cache_size = spec.get("max_cache_size", 256)
+
+src = core.bs.VideoSource(spec["source"])
+clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
+                          bits=32, fulls=True, fulld=True)
+if spec.get("nframes"):
+    clip = core.std.Loop(clip, times=spec["nframes"])
+
+nf = clip.num_frames
+plane = spec.get("plane", 0)
+kwargs = spec["params"]
+
+# A stride coprime with nf visits every frame exactly once while jumping around;
+# keep it deterministic so a failure is reproducible.
+key = next(k for k in range(3, 2 * nf + 3, 2) if gcd(k, nf) == 1)
+scramble = [(i * key) % nf for i in range(nf)]
+far = sorted(range(nf), key=lambda n: (abs(n - nf // 2), n))
+interleave = list(range(0, nf, 2)) + [n for n in range(nf) if n % 2][::-1]
+revisit = [n for n in [0, 3, 3, 1, 5, 1, nf - 1, 0, nf - 2, 2, nf - 1]]
+orders = {
+    "forward": list(range(nf)),
+    "reverse": list(range(nf))[::-1],
+    "far": far,
+    "interleave": interleave,
+    "scramble": scramble,
+    "revisit": revisit,
+}
+
+
+def run(order):
+    node = getattr(core.vsfeel, spec["filter"])(clip, **kwargs)
+    return {n: read_plane(node.get_frame(n), plane, np.float32).copy() for n in order}
+
+
+try:
+    ref = run(orders["forward"])
+except Exception as exc:
+    print("VSFEEL fail: serial run: %s: %s" % (type(exc).__name__, exc), flush=True)
+    raise SystemExit(3)
+print("REF ok", flush=True)
+
+worst = {}
+for name, order in orders.items():
+    try:
+        got = run(order)
+    except Exception as exc:
+        print("VSFEEL fail: %s: %s: %s" % (name, type(exc).__name__, exc), flush=True)
+        raise SystemExit(3)
+    w = 0.0
+    for n in order:
+        a, b = got[n].astype(np.float64), ref[n].astype(np.float64)
+        if not (np.isfinite(a).all() and np.isfinite(b).all()):
+            print("VSFEEL fail: non-finite, order %s frame %d" % (name, n), flush=True)
+            raise SystemExit(3)
+        w = max(w, float(np.abs(a - b).max()))
+    worst[name] = w
+
+print("RESULT " + json.dumps({"orders": worst, "num_frames": nf}), flush=True)
+'''
+
+
+def temporal_order_diff(filter_name, params, nframes=None, plane=0,
+                        timeout=600.0):
+    """Worst pixel diff per frame-request ordering, against the serial run.
+
+    ``filter_name`` is the ``core.vsfeel`` function; ``params`` its keyword
+    arguments (temporal radius/window set by the caller); ``nframes`` loops the
+    clip to that length, which is how the 1- and 2-frame cases are built.  Skips
+    from the reference protocol are turned into failures: there is no external
+    reference here, so anything that dies before the oracle completes is a
+    vsfeel failure, not a missing plugin.
+    """
+    spec = {"source": NOISE_MKV, "filter": filter_name, "params": params,
+            "plane": plane, "max_cache_size": 256}
+    if nframes is not None:
+        spec["nframes"] = int(nframes)
+    try:
+        payload = run_compare_subprocess(TEMPORAL_ORDER_SCRIPT,
+                                         [json.dumps(spec)], timeout=timeout)
+    except ReferenceUnavailable as exc:
+        raise AssertionError(
+            f"temporal-order subprocess failed before the oracle completed: {exc}"
+        ) from exc
+    return payload["orders"]
+
+
+def assert_temporal_order_consistent(filter_name, params, tol=1e-5,
+                                     nframes=None, plane=0, timeout=600.0):
+    """Every request order must reproduce the serial result within ``tol``."""
+    worst = temporal_order_diff(filter_name, params, nframes=nframes,
+                                plane=plane, timeout=timeout)
+    bad = {name: w for name, w in worst.items() if w > tol}
+    assert not bad, (
+        f"{filter_name} output depends on frame-request order "
+        f"(tol {tol:g}, params {params}): {bad}")
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 

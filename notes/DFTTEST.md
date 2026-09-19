@@ -257,6 +257,11 @@ constants, ZMEAN spec constant, gf hoist): 3378 → 2613 instr, 690 → 468 µs
   build only stalled after 9k–37k frames (timing-dependent, flaky).
 - Suite counts across the fixes: 30 → 35/35 (chained test) → 61/61 → 187
   (shared-plumbing migration) → 600 passed (queue-cap/emplace work).
+- `test_dfttest_frame_request_order_matches_serial` drives the node in six
+  request orders (repeat/reverse/far/random/thrash) on a fresh instance against
+  the serial run: exact (0.0 diff) at tbsize=3, ns=4, and on 1–2-frame clips.
+  Sequential `get_frame` never re-requests an in-flight frame, so this is the
+  pattern the shared `conftest.assert_temporal_order_consistent` exists to add.
 
 ## Do not retry
 

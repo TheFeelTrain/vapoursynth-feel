@@ -19,8 +19,8 @@ import vapoursynth as vs
 
 from conftest import (
     NOISE_MKV, COMPARE_PRELUDE, ReferenceUnavailable, assert_all_frames_finite,
-    assert_gray32, frame_to_ndarray, plane_to_ndarray, run_compare_subprocess,
-    skip_or_fail_reference,
+    assert_gray32, assert_temporal_order_consistent, frame_to_ndarray,
+    plane_to_ndarray, run_compare_subprocess, skip_or_fail_reference,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -437,6 +437,29 @@ def test_bm3dv2_seek_collision_single_queue():
     except ReferenceUnavailable as exc:
         raise AssertionError(f"single-queue seek subprocess failed early: {exc}") from exc
     assert worst < 1e-5, f"single-queue seek schedule mismatch: {worst}"
+
+
+def test_bm3dv2_frame_request_order_matches_serial():
+    """repeat/reverse/far/random request orders must match the serial run.
+
+    The aggregation accumulates with atomicAdd, so the self-consistency floor
+    is the ordering rounding of the sums (~3e-8 measured), not exact equality.
+    """
+    assert_temporal_order_consistent(
+        "BM3Dv2",
+        {"sigma": SIGMA, "radius": 2, "bm_range": BM_RANGE, "ps_range": PS_RANGE,
+         "block_step": BLOCK_STEP, "num_streams": 4},
+        tol=1e-5, timeout=300)
+
+
+@pytest.mark.parametrize("nframes", [1, 2])
+def test_bm3dv2_short_clip_temporal_window(nframes):
+    """A clip shorter than 2*radius+1 must still be order-independent."""
+    assert_temporal_order_consistent(
+        "BM3Dv2",
+        {"sigma": SIGMA, "radius": 2, "bm_range": BM_RANGE, "ps_range": PS_RANGE,
+         "block_step": BLOCK_STEP, "num_streams": 4},
+        tol=1e-5, nframes=nframes, timeout=300)
 
 
 # ---------------------------------------------------------------------------

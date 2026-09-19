@@ -78,6 +78,21 @@ bullet each, under **Historical**.
 - **Cross-check every number and symbol against `src/` before quoting it.** A
   drifted note is worse than no note.
 
+## Test helpers that cover several filters
+
+Test infrastructure shared by more than one filter belongs in `tests/conftest.py`
+and gets one line here, not a section per note.
+
+- `assert_temporal_order_consistent(filter, params, tol, nframes=...)` — runs the
+  node in six frame-request orders (forward/reverse/far/interleave/scramble/
+  revisit) on a fresh instance each and compares to the serial run, under the
+  subprocess timeout. Temporal caches (DFTTest slots, NLMeans tiles, BM3D
+  ring/res) are order-sensitive by construction and sequential `get_frame` never
+  re-requests an in-flight frame, so this is the request pattern vspipe actually
+  produces. `nframes=1/2` builds the short-clip cases. Tolerance is 0 for the
+  slot/tile caches; BM3D uses 1e-5 because its atomicAdd aggregation has a
+  ~3e-8 ordering floor.
+
 ## Short vs long — worked examples
 
 Correctness-only fix:

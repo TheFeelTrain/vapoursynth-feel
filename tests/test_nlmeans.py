@@ -15,8 +15,9 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    NOISE_MKV, assert_changes_on_noise, assert_gray32, format_dtype, max_diff,
-    plane_to_ndarray, reference_compare, reference_or_skip, reference_spec,
+    NOISE_MKV, assert_changes_on_noise, assert_gray32,
+    assert_temporal_order_consistent, format_dtype, max_diff, plane_to_ndarray,
+    reference_compare, reference_or_skip, reference_spec,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -577,6 +578,28 @@ def test_parallel_load_deterministic_16bit(noise_16bit):
     b = _eval_parallel(noise_16bit, d=2, num_streams=4)
     for n in range(noise_16bit.num_frames):
         assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
+
+
+# --- frame-request order / short clips ---------------------------------------
+
+@pytest.mark.parametrize("d", [2, 16])
+def test_frame_request_order_matches_serial(d):
+    """The tile cache must return the same pixels whatever order frames arrive.
+
+    A cached slot keyed and released by frame index instead of a per-request
+    token can be freed while another request still reads it; only an
+    out-of-sequence request pattern makes that observable.
+    """
+    assert_temporal_order_consistent(
+        "NLMeans", {"d": d, "num_streams": 4}, tol=0.0, timeout=300)
+
+
+@pytest.mark.parametrize("nframes", [1, 2])
+def test_short_clip_temporal_window(nframes):
+    """A clip shorter than the temporal window is order-independent too."""
+    assert_temporal_order_consistent(
+        "NLMeans", {"d": 2, "num_streams": 4}, tol=0.0, nframes=nframes,
+        timeout=300)
 
 
 @pytest.mark.parametrize("radius", [0, 1, 2])

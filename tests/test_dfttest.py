@@ -32,8 +32,9 @@ import vapoursynth as vs
 
 from conftest import (
     WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_all_frames_finite,
-    assert_changes_on_noise, assert_gray32, compare_or_skip, frame_to_ndarray,
-    plane_to_ndarray, reference_compare, reference_or_skip, reference_spec,
+    assert_changes_on_noise, assert_gray32, assert_temporal_order_consistent,
+    compare_or_skip, frame_to_ndarray, plane_to_ndarray, reference_compare,
+    reference_or_skip, reference_spec,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -250,6 +251,28 @@ def test_dfttest_vspipe_pipelined_chained_no_hang_16bit(chained, tmp_path):
                     "signalled)")
     assert result.returncode == 0, (
         f"vspipe exited {result.returncode}:\n{result.stdout}\n{result.stderr}")
+
+
+# ---------------------------------------------------------------------------
+# Frame-request order and short clips (temporal cache)
+# ---------------------------------------------------------------------------
+
+def test_dfttest_frame_request_order_matches_serial():
+    """The cached temporal window must not depend on the request order.
+
+    vspipe's scheduler re-requests in-flight frames, so a wrong or stale slot
+    read shows up only when the frames arrive out of sequence.
+    """
+    assert_temporal_order_consistent(
+        "DFTTest", {"tbsize": 3, "num_streams": 4}, tol=0.0, timeout=300)
+
+
+@pytest.mark.parametrize("nframes", [1, 2])
+def test_dfttest_short_clip_temporal_window(nframes):
+    """A clip shorter than tbsize must still be order-independent."""
+    assert_temporal_order_consistent(
+        "DFTTest", {"tbsize": 3, "num_streams": 4}, tol=0.0,
+        nframes=nframes, timeout=300)
 
 
 # ---------------------------------------------------------------------------
