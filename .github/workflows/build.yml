@@ -52,16 +52,22 @@ jobs:
       with:
         msystem: MINGW64
         update: true
+        # No python:p / python-pip:p on purpose. MSYS2's Python is a mingw build,
+        # so its platform tag is mingw_x86_64 and no PyPI wheel matches it: pip
+        # then tries to build vapoursynth and cmake from source and dies. uv
+        # brings its own managed win_amd64 CPython, which every wheel matches,
+        # while the packaged toolchain supplies the compiler and glslc.
         pacboy: >-
           git:p
-          python:p
-          python-pip:p
+          ninja:p
           shaderc:p
           toolchain:p
+          uv:p
     - name: Build
-      run: |
-        python -m pip install --upgrade build
-        python -m build --wheel --outdir dist
+      env:
+        # The packaged toolchain has no make/ninja default; CMake reads this.
+        CMAKE_GENERATOR: Ninja
+      run: uv build --wheel --out-dir dist
     - uses: actions/upload-artifact@v4
       with:
         name: windows-wheel

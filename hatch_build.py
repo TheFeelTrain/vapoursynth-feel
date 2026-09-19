@@ -88,6 +88,9 @@ class CustomHook(BuildHookInterface):
             # Relative on purpose: an absolute DESTINATION would bypass the
             # --prefix under which finalize cleans up.
             "-D", f"VSFEEL_INSTALL_DIR={self.target_dir.relative_to(root)}",
+            # The build environment's interpreter, so CMake does not have to
+            # find one on PATH (it generates the SPIR-V header at build time).
+            "-D", f"Python3_EXECUTABLE={sys.executable}",
         ]
         include_dir = vapoursynth_include_dir()
         if include_dir is not None:
