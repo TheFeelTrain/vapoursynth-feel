@@ -703,34 +703,13 @@ struct DftData {
 // Pipeline creation
 // ---------------------------------------------------------------------------
 
-static std::variant<VkShaderModule, std::string> create_shader_module(
-    const VK_Device & dev, const uint32_t * code, size_t code_size) {
-
-    VkShaderModuleCreateInfo module_info {
-        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .codeSize = code_size,
-        .pCode = code
-    };
-
-    VkShaderModule module;
-    VkResult result = vkCreateShaderModule(dev.device, &module_info, nullptr, &module);
-    if (result != VK_SUCCESS) {
-        return "vkCreateShaderModule failed: "s + vk_result_string(result);
-    }
-    return module;
-}
-
+// DFTTest's two per-invocation variants: the env overrides exist so a probe
+// run can force a subgroup size (or deliberately request an invalid one and
+// watch the driver reject it).
 static std::variant<VkPipeline, std::string> create_pipeline(
     const VK_Device & dev, VkShaderModule module, VkPipelineLayout layout,
     uint32_t required_subgroup_size = 0, int32_t filter_type = -1,
     int32_t zmean = -1) {
-
-    if (env_flag("VSFEEL_DFTTEST_DBG")) {
-        fprintf(stderr, "[dfttest] create_pipeline required_subgroup_size=%u filter_type=%d\n",
-            required_subgroup_size, filter_type);
-    }
 
     uint32_t subgroup_size = required_subgroup_size;
     if (const int sw = env_int("VSFEEL_DFTTEST_SGSIZE", 0); sw > 0) {
@@ -739,11 +718,6 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     if (env_flag("VSFEEL_DFTTEST_SGSIZE_INVALID")) {
         subgroup_size = 17;   // invalid on purpose, to test driver validation
     }
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
-        .pNext = nullptr,
-        .requiredSubgroupSize = subgroup_size
-    };
 
     // Build the spec-constant map from an explicit (id, value) list so the
     // offset always matches the slot the value is stored in; the old
@@ -766,39 +740,10 @@ static std::variant<VkPipeline, std::string> create_pipeline(
         spec_values[n_spec] = zmean;
         ++n_spec;
     }
-    VkSpecializationInfo spec_info {
-        .mapEntryCount = n_spec,
-        .pMapEntries = spec_entries,
-        .dataSize = n_spec * sizeof(int32_t),
-        .pData = (n_spec > 0) ? spec_values : nullptr
-    };
 
-    VkPipelineShaderStageCreateInfo stage_info {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .pNext = subgroup_size ? &subgroup_size_info : nullptr,
-        .flags = 0,
-        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-        .module = module,
-        .pName = "main",
-        .pSpecializationInfo = &spec_info
-    };
-
-    VkComputePipelineCreateInfo pipeline_info {
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stage = stage_info,
-        .layout = layout,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = -1
-    };
-
-    VkPipeline pipeline;
-    VkResult result = create_compute_pipeline(dev, pipeline_info, &pipeline);
-    if (result != VK_SUCCESS) {
-        return "vkCreateComputePipelines failed: "s + vk_result_string(result);
-    }
-    return pipeline;
+    return create_compute_pipeline(dev, module, layout,
+        n_spec ? spec_entries : nullptr, n_spec ? spec_values : nullptr,
+        n_spec, n_spec * sizeof(int32_t), "dfttest", subgroup_size);
 }
 
 // Records the per-plane fused + col2im dispatch sequence.

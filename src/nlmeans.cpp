@@ -273,80 +273,14 @@ struct NLMeansData {
     }
 };
 
-std::variant<VkBuffer, std::string> create_buffer(VkDevice dev, VkDeviceSize size, VkBufferUsageFlags usage) {
-    VkBufferCreateInfo info {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .size = std::max<VkDeviceSize>(size, 4),
-        .usage = usage,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .queueFamilyIndexCount = 0,
-        .pQueueFamilyIndices = nullptr
-    };
-    VkBuffer buffer;
-    if (vkCreateBuffer(dev, &info, nullptr, &buffer) != VK_SUCCESS) {
-        return "vkCreateBuffer failed"s;
-    }
-    return buffer;
-}
-
-std::optional<std::string> bind_memory(
-    const NLMeansData & d, VkBuffer buffer, VkDeviceMemory & mem,
-    VkMemoryPropertyFlags required) {
-
-    const auto result = allocate_memory(*d.device, buffer, required);
-    if (std::holds_alternative<std::string>(result)) {
-        return std::get<std::string>(result);
-    }
-    mem = std::get<AllocatedMemory>(result).memory;
-    return std::nullopt;
-}
-
 std::variant<VkPipeline, std::string> create_pipeline(
     const NLMeansData & d, const NLMeansSpecData & spec,
     VkShaderModule module, VkPipelineLayout layout) {
 
-    VkSpecializationInfo spec_info {
-        .mapEntryCount = static_cast<uint32_t>(spec_entries.size()),
-        .pMapEntries = spec_entries.data(),
-        .dataSize = sizeof(spec),
-        .pData = &spec
-    };
-
     // explicit wave32 (same win as DFTTest); requires subgroup size control
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
-        .pNext = nullptr,
-        .requiredSubgroupSize = 32
-    };
-
-    VkPipelineShaderStageCreateInfo stage_info {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .pNext = d.device->subgroup_size_control ? &subgroup_size_info : nullptr,
-        .flags = 0,
-        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-        .module = module,
-        .pName = "main",
-        .pSpecializationInfo = &spec_info
-    };
-
-    VkComputePipelineCreateInfo pipeline_info {
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stage = stage_info,
-        .layout = layout,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = -1
-    };
-
-    VkPipeline pipeline;
-    VkResult result = create_compute_pipeline(*d.device, pipeline_info, &pipeline);
-    if (result != VK_SUCCESS) {
-        return "vkCreateComputePipelines failed"s;
-    }
-    return pipeline;
+    return create_compute_pipeline(*d.device, module, layout, spec_entries.data(),
+        &spec, static_cast<uint32_t>(spec_entries.size()), sizeof(spec),
+        "nlmeans", d.device->subgroup_size_control ? 32 : 0);
 }
 
 void record_barrier(VkCommandBuffer cmd, VkPipelineStageFlags src_stage,
@@ -1487,32 +1421,33 @@ static void VS_CC NLMeansCreate(
             pad_size = nlmeans_32_pad_spv_size;
         }
 
-        auto make_module = [&](const uint32_t * code, size_t size,
-                               VkShaderModule & mod) -> std::optional<std::string> {
-            VkShaderModuleCreateInfo module_info {
-                .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .codeSize = size,
-                .pCode = code
-            };
-            if (vkCreateShaderModule(dev, &module_info, nullptr, &mod) != VK_SUCCESS) {
-                return "vkCreateShaderModule failed"s;
+        {
+            const auto result = create_shader_module(*d->device, weight_code, weight_size);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
             }
-            return std::nullopt;
-        };
-
-        if (auto err = make_module(weight_code, weight_size, d->weight_module)) {
-            return set_error(*err);
+            d->weight_module = std::get<VkShaderModule>(result);
         }
-        if (auto err = make_module(acc_code, acc_size, d->acc_module)) {
-            return set_error(*err);
+        {
+            const auto result = create_shader_module(*d->device, acc_code, acc_size);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            d->acc_module = std::get<VkShaderModule>(result);
         }
-        if (auto err = make_module(fin_code, fin_size, d->fin_module)) {
-            return set_error(*err);
+        {
+            const auto result = create_shader_module(*d->device, fin_code, fin_size);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            d->fin_module = std::get<VkShaderModule>(result);
         }
-        if (auto err = make_module(pad_code, pad_size, d->pad_module)) {
-            return set_error(*err);
+        {
+            const auto result = create_shader_module(*d->device, pad_code, pad_size);
+            if (std::holds_alternative<std::string>(result)) {
+                return set_error(std::get<std::string>(result));
+            }
+            d->pad_module = std::get<VkShaderModule>(result);
         }
 
         const std::pair<VkShaderModule, VkPipeline *> pipes[] {
@@ -1547,7 +1482,7 @@ static void VS_CC NLMeansCreate(
             }
             d->tables_buf = std::get<VkBuffer>(result);
         }
-        if (auto err = bind_memory(*d, d->tables_buf, d->tables_mem,
+        if (auto err = bind_memory(*d->device, d->tables_buf, d->tables_mem,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
                 VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
@@ -1621,7 +1556,7 @@ static void VS_CC NLMeansCreate(
         d->slots_buf = std::get<VkBuffer>(result);
     }
     const bool dbg_pool = env_flag("VSFEEL_NLMEANS_DBG") || env_flag("NLMEANS_DBG");
-    if (auto err = bind_memory(*d, d->slots_buf, d->slots_mem,
+    if (auto err = bind_memory(*d->device, d->slots_buf, d->slots_mem,
             dbg_pool ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
                      : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
@@ -1727,7 +1662,7 @@ static void VS_CC NLMeansCreate(
             }
             st.tables_dev = std::get<VkBuffer>(result);
         }
-        if (auto err = bind_memory(*d, st.tables_dev, st.tables_dev_mem,
+        if (auto err = bind_memory(*d->device, st.tables_dev, st.tables_dev_mem,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
             return set_error(*err);
@@ -1771,7 +1706,7 @@ static void VS_CC NLMeansCreate(
             }
             st.u2 = std::get<VkBuffer>(result);
         }
-        if (auto err = bind_memory(*d, st.u2, st.u2_mem,
+        if (auto err = bind_memory(*d->device, st.u2, st.u2_mem,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
             return set_error(*err);
         }
@@ -1784,7 +1719,7 @@ static void VS_CC NLMeansCreate(
             }
             st.u4a = std::get<VkBuffer>(result);
         }
-        if (auto err = bind_memory(*d, st.u4a, st.u4a_mem,
+        if (auto err = bind_memory(*d->device, st.u4a, st.u4a_mem,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
             return set_error(*err);
         }
@@ -1797,7 +1732,7 @@ static void VS_CC NLMeansCreate(
             }
             st.u5 = std::get<VkBuffer>(result);
         }
-        if (auto err = bind_memory(*d, st.u5, st.u5_mem,
+        if (auto err = bind_memory(*d->device, st.u5, st.u5_mem,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
             return set_error(*err);
         }

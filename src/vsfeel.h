@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -17,6 +19,8 @@
 #include <volk.h>
 
 #include <VapourSynth4.h>
+
+using namespace std::string_literals;
 
 // The Vulkan and VapourSynth structs are built with designated initializers
 // that set only the members that matter; C++ zero-initializes the rest, so a
@@ -156,13 +160,116 @@ void save_pipeline_cache(VK_Device & dev);
 
 // Vulkan requires external synchronization of host access to a VkPipelineCache,
 // and VapourSynth creates filter nodes from several threads, so every
-// vkCreateComputePipelines call goes through this lock-taking wrapper.
+// vkCreateComputePipelines call goes through this raw lock-taking wrapper.
 inline VkResult create_compute_pipeline(
     const VK_Device & dev, const VkComputePipelineCreateInfo & info,
     VkPipeline * pipeline) {
     std::lock_guard lock(dev.pipeline_cache_lock);
     return vkCreateComputePipelines(
         dev.device, dev.pipeline_cache, 1, &info, nullptr, pipeline);
+}
+
+// Shader module from an embedded SPIR-V blob. Shared by every filter so they
+// all report the same failure text.
+inline std::variant<VkShaderModule, std::string> create_shader_module(
+    const VK_Device & dev, const uint32_t * code, size_t code_size) {
+
+    VkShaderModuleCreateInfo module_info {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .codeSize = code_size,
+        .pCode = code
+    };
+
+    VkShaderModule module;
+    VkResult result = vkCreateShaderModule(dev.device, &module_info, nullptr, &module);
+    if (result != VK_SUCCESS) {
+        return "vkCreateShaderModule failed: "s + vk_result_string(result);
+    }
+    return module;
+}
+
+// Compute pipeline from a module plus its specialization constants.
+// `required_subgroup_size` 0 leaves the driver's default subgroup alone; a
+// non-zero value chains VkPipelineShaderStageRequiredSubgroupSizeCreateInfo,
+// which needs VK_EXT_subgroup_size_control. `full_subgroups` sets
+// REQUIRE_FULL_SUBGROUPS_BIT when the device exposes the feature.
+// `entries`/`values`/`values_size` describe the spec-constant block exactly as
+// VkSpecializationInfo would; entries == nullptr means no specialization.
+// `tag` only names the shader in the VSFEEL_DBG banner.
+inline std::variant<VkPipeline, std::string> create_compute_pipeline(
+    const VK_Device & dev, VkShaderModule module, VkPipelineLayout layout,
+    const VkSpecializationMapEntry * entries, const void * values,
+    uint32_t entry_count, size_t values_size, const char * tag,
+    uint32_t required_subgroup_size = 0, bool full_subgroups = false) {
+
+    if (entries == nullptr) {
+        entry_count = 0;
+        values = nullptr;
+        values_size = 0;
+    }
+    if (env_flag("VSFEEL_DBG")) {
+        fprintf(stderr, "[vsfeel] pipeline %s subgroup=%u spec=%u\n",
+            tag, required_subgroup_size, entry_count);
+    }
+
+    VkSpecializationInfo spec_info {
+        .mapEntryCount = entry_count,
+        .pMapEntries = entries,
+        .dataSize = values_size,
+        .pData = values
+    };
+
+    if (required_subgroup_size != 0 && !dev.subgroup_size_control) {
+        return std::string(tag) + " requests subgroup size " +
+            std::to_string(required_subgroup_size) +
+            " but the device has no VK_EXT_subgroup_size_control";
+    }
+    // The feature struct must not be chained when no size was requested: its
+    // absence is what lets the driver choose.
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+        .pNext = nullptr,
+        .requiredSubgroupSize = required_subgroup_size
+    };
+
+    VkPipelineShaderStageCreateInfo stage_info {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .pNext = required_subgroup_size ? &subgroup_size_info : nullptr,
+        .flags = (full_subgroups && dev.feat_compute_full_subgroups)
+            ? VkPipelineShaderStageCreateFlags(
+                  VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT)
+            : VkPipelineShaderStageCreateFlags(0),
+        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+        .module = module,
+        .pName = "main",
+        .pSpecializationInfo = &spec_info
+    };
+
+    VkComputePipelineCreateInfo pipeline_info {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .stage = stage_info,
+        .layout = layout,
+        .basePipelineHandle = VK_NULL_HANDLE,
+        .basePipelineIndex = -1
+    };
+
+    VkPipeline pipeline;
+    VkResult result = create_compute_pipeline(dev, pipeline_info, &pipeline);
+    if (result != VK_SUCCESS) {
+        return "vkCreateComputePipelines failed: "s + vk_result_string(result);
+    }
+    return pipeline;
+}
+
+// Round a size or offset up to a 32-byte boundary. The per-frame buffers pack
+// their plane regions this way so each region is 32-byte aligned (what
+// non-temporal access and descriptor offsets both want).
+inline constexpr VkDeviceSize align32(VkDeviceSize v) {
+    return (v + 31) & ~VkDeviceSize(31);
 }
 
 // The DFTTest/EEDI3/NNEDI3 shaders are compiled for SPIR-V 1.6, which a Vulkan
@@ -263,6 +370,72 @@ struct AllocatedMemory {
 
 std::variant<AllocatedMemory, std::string> allocate_memory(
     const VK_Device & dev, VkBuffer buffer, VkMemoryPropertyFlags required);
+
+// Buffer handle with no memory bound yet. `size` is forced non-zero because
+// Vulkan requires a positive size; a zero-byte request becomes 4 bytes so the
+// handle is still valid to bind and destroy.
+inline std::variant<VkBuffer, std::string> create_buffer(
+    VkDevice dev, VkDeviceSize size, VkBufferUsageFlags usage) {
+    VkBufferCreateInfo info {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .size = std::max<VkDeviceSize>(size, 4),
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr
+    };
+    VkBuffer buffer;
+    if (vkCreateBuffer(dev, &info, nullptr, &buffer) != VK_SUCCESS) {
+        return "vkCreateBuffer failed"s;
+    }
+    return buffer;
+}
+
+// Allocate memory for `buffer` with the requested property flags and bind it,
+// writing the VkDeviceMemory back through `mem`. allocate_memory() owns the
+// fallback ladder; this only surfaces its error.
+inline std::optional<std::string> bind_memory(
+    const VK_Device & dev, VkBuffer buffer, VkDeviceMemory & mem,
+    VkMemoryPropertyFlags required) {
+
+    const auto result = allocate_memory(dev, buffer, required);
+    if (std::holds_alternative<std::string>(result)) {
+        return std::get<std::string>(result);
+    }
+    mem = std::get<AllocatedMemory>(result).memory;
+    return std::nullopt;
+}
+
+// Device-local buffer with storage plus transfer-src/dst usage, the shape the
+// per-frame scratch buffers share. `extra_usage` adds the one or two bits a
+// specific buffer needs (indirect, ...). `what` only names the buffer in the
+// failure text.
+inline std::optional<std::string> make_device_buffer(
+    const VK_Device & dev, VkBuffer & buf, VkDeviceMemory & mem,
+    VkDeviceSize size, const char * what, VkBufferUsageFlags extra_usage = 0) {
+
+    const auto created = create_buffer(dev.device, size,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT | extra_usage);
+    if (std::holds_alternative<std::string>(created)) {
+        return "vkCreateBuffer ("s + what + ") failed.";
+    }
+    buf = std::get<VkBuffer>(created);
+
+    const auto bound = bind_memory(
+        dev, buf, mem, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (bound) {
+        // The buffer exists but has no memory: free it so a failed creation
+        // loop does not leak handles.
+        vkDestroyBuffer(dev.device, buf, nullptr);
+        buf = VK_NULL_HANDLE;
+        mem = VK_NULL_HANDLE;
+        return bound;
+    }
+    return std::nullopt;
+}
 
 // ---------------------------------------------------------------------------
 // Shared per-frame plumbing (zero-overhead inline helpers)

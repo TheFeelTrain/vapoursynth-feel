@@ -1533,27 +1533,8 @@ static void build_bmask_row(const uint8_t * maskp, const uint16_t * mask16,
 }
 
 // ---------------------------------------------------------------------------
-// Shader module + pipeline helpers (vsfeel idiom)
+// Pipeline creation
 // ---------------------------------------------------------------------------
-
-static std::variant<VkShaderModule, std::string> create_shader_module(
-    const VK_Device & dev, const uint32_t * code, size_t code_size) {
-
-    VkShaderModuleCreateInfo module_info {
-        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .codeSize = code_size,
-        .pCode = code
-    };
-
-    VkShaderModule module;
-    VkResult result = vkCreateShaderModule(dev.device, &module_info, nullptr, &module);
-    if (result != VK_SUCCESS) {
-        return "vkCreateShaderModule failed: "s + vk_result_string(result);
-    }
-    return module;
-}
 
 struct RowSpecData {
     int32_t width;
@@ -1581,45 +1562,9 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     const VK_Device & dev, const RowSpecData & spec, VkShaderModule module,
     VkPipelineLayout layout, uint32_t required_subgroup_size = 0) {
 
-    VkSpecializationInfo spec_info {
-        .mapEntryCount = static_cast<uint32_t>(row_entries.size()),
-        .pMapEntries = row_entries.data(),
-        .dataSize = sizeof(spec),
-        .pData = &spec
-    };
-
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
-        .pNext = nullptr,
-        .requiredSubgroupSize = required_subgroup_size
-    };
-
-    VkPipelineShaderStageCreateInfo stage_info {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .pNext = required_subgroup_size ? &subgroup_size_info : nullptr,
-        .flags = 0,
-        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-        .module = module,
-        .pName = "main",
-        .pSpecializationInfo = &spec_info
-    };
-
-    VkComputePipelineCreateInfo pipeline_info {
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stage = stage_info,
-        .layout = layout,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = -1
-    };
-
-    VkPipeline pipeline;
-    VkResult result = create_compute_pipeline(dev, pipeline_info, &pipeline);
-    if (result != VK_SUCCESS) {
-        return "vkCreateComputePipelines failed: "s + vk_result_string(result);
-    }
-    return pipeline;
+    return create_compute_pipeline(dev, module, layout, row_entries.data(),
+        &spec, static_cast<uint32_t>(row_entries.size()), sizeof(spec), "eedi3",
+        required_subgroup_size);
 }
 
 // Push constant layout must match the shader's PC struct (int block then
@@ -3961,8 +3906,6 @@ static void vsfeel_eedi3_create(
             out_video.height *= 2;
         }
     }
-
-    auto align32 = [](VkDeviceSize v) { return (v + 31) & ~VkDeviceSize(31); };
 
     const int tpitch = 2 * d->mdis + 1;
 

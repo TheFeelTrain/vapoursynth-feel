@@ -269,25 +269,6 @@ static std::vector<float> get_gauss_kernel(float sigma) {
 // Pipeline creation
 // ---------------------------------------------------------------------------
 
-static std::variant<VkShaderModule, std::string> create_shader_module(
-    const VK_Device & dev, const uint32_t * code, size_t code_size) {
-
-    VkShaderModuleCreateInfo module_info {
-        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .codeSize = code_size,
-        .pCode = code
-    };
-
-    VkShaderModule module;
-    VkResult result = vkCreateShaderModule(dev.device, &module_info, nullptr, &module);
-    if (result != VK_SUCCESS) {
-        return "vkCreateShaderModule failed: "s + vk_result_string(result);
-    }
-    return module;
-}
-
 static std::variant<VkPipeline, std::string> create_pipeline(
     const VK_Device & dev, const GaussPlaneConfig & cfg,
     VkShaderModule module, VkPipelineLayout layout) {
@@ -304,39 +285,8 @@ static std::variant<VkPipeline, std::string> create_pipeline(
         { 4, 16, sizeof(int32_t) },
     }};
 
-    VkSpecializationInfo spec_info {
-        .mapEntryCount = static_cast<uint32_t>(entries.size()),
-        .pMapEntries = entries.data(),
-        .dataSize = sizeof(spec),
-        .pData = &spec
-    };
-
-    VkPipelineShaderStageCreateInfo stage_info {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-        .module = module,
-        .pName = "main",
-        .pSpecializationInfo = &spec_info
-    };
-
-    VkComputePipelineCreateInfo pipeline_info {
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stage = stage_info,
-        .layout = layout,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = -1
-    };
-
-    VkPipeline pipeline;
-    VkResult result = create_compute_pipeline(dev, pipeline_info, &pipeline);
-    if (result != VK_SUCCESS) {
-        return "vkCreateComputePipelines failed: "s + vk_result_string(result);
-    }
-    return pipeline;
+    return create_compute_pipeline(dev, module, layout, entries.data(), &spec,
+        static_cast<uint32_t>(entries.size()), sizeof(spec), "gaussblur");
 }
 
 // Records the dispatch sequence for all planes into a single pre-recorded
@@ -1120,8 +1070,6 @@ static void VS_CC GaussCreate(
     // streaming copies can use aligned loads/stores. The staging layout and
     // the VRAM src/dst layouts are identical, so one DMA copy per direction
     // moves every plane at once.
-    auto align32 = [](VkDeviceSize v) { return (v + 31) & ~VkDeviceSize(31); };
-
     VkDeviceSize upload_total = 0;
     VkDeviceSize download_total = 0;
     VkDeviceSize tmp_total = 0;

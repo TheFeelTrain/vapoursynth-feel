@@ -263,36 +263,8 @@ static std::variant<VkPipeline, std::string> create_bm3d_pipeline(
         { 12, 48, sizeof(int32_t) },
         { 13, 52, sizeof(int32_t) },
     }};
-    VkSpecializationInfo spec_info {
-        .mapEntryCount = static_cast<uint32_t>(entries.size()),
-        .pMapEntries = entries.data(),
-        .dataSize = sizeof(spec),
-        .pData = &spec
-    };
-    VkPipelineShaderStageCreateInfo stage_info {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-        .module = module,
-        .pName = "main",
-        .pSpecializationInfo = &spec_info
-    };
-    VkComputePipelineCreateInfo pipeline_info {
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stage = stage_info,
-        .layout = layout,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = -1
-    };
-    VkPipeline pipeline;
-    VkResult result = create_compute_pipeline(dev, pipeline_info, &pipeline);
-    if (result != VK_SUCCESS) {
-        return "vkCreateComputePipelines failed: "s + vk_result_string(result);
-    }
-    return pipeline;
+    return create_compute_pipeline(dev, module, layout, entries.data(), &spec,
+        static_cast<uint32_t>(entries.size()), sizeof(spec), "bm3d");
 }
 
 static std::variant<VkPipeline, std::string> create_agg_pipeline(
@@ -308,36 +280,8 @@ static std::variant<VkPipeline, std::string> create_agg_pipeline(
         { 2,  8, sizeof(int32_t) },
         { 3, 12, sizeof(int32_t) },
     }};
-    VkSpecializationInfo spec_info {
-        .mapEntryCount = static_cast<uint32_t>(entries.size()),
-        .pMapEntries = entries.data(),
-        .dataSize = sizeof(spec),
-        .pData = &spec
-    };
-    VkPipelineShaderStageCreateInfo stage_info {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-        .module = module,
-        .pName = "main",
-        .pSpecializationInfo = &spec_info
-    };
-    VkComputePipelineCreateInfo pipeline_info {
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stage = stage_info,
-        .layout = layout,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = -1
-    };
-    VkPipeline pipeline;
-    VkResult result = create_compute_pipeline(dev, pipeline_info, &pipeline);
-    if (result != VK_SUCCESS) {
-        return "vkCreateComputePipelines failed: "s + vk_result_string(result);
-    }
-    return pipeline;
+    return create_compute_pipeline(dev, module, layout, entries.data(), &spec,
+        static_cast<uint32_t>(entries.size()), sizeof(spec), "bm3d_agg");
 }
 
 // ---------------------------------------------------------------------------
@@ -1476,22 +1420,16 @@ static void VS_CC BM3DCreate(
 
     // shader modules
     {
-        VkShaderModuleCreateInfo module_info {
-            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .codeSize = bm3d_spv_size,
-            .pCode = bm3d_spv
-        };
-        checkVK(vkCreateShaderModule(dev, &module_info, nullptr, &d->bm3d_module));
-        VkShaderModuleCreateInfo module_info2 {
-            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .codeSize = bm3d_agg_spv_size,
-            .pCode = bm3d_agg_spv
-        };
-        checkVK(vkCreateShaderModule(dev, &module_info2, nullptr, &d->agg_module));
+        const auto r1 = create_shader_module(*d->device, bm3d_spv, bm3d_spv_size);
+        if (std::holds_alternative<std::string>(r1)) {
+            return set_error(std::get<std::string>(r1));
+        }
+        d->bm3d_module = std::get<VkShaderModule>(r1);
+        const auto r2 = create_shader_module(*d->device, bm3d_agg_spv, bm3d_agg_spv_size);
+        if (std::holds_alternative<std::string>(r2)) {
+            return set_error(std::get<std::string>(r2));
+        }
+        d->agg_module = std::get<VkShaderModule>(r2);
     }
 
     // pipelines

@@ -553,29 +553,14 @@ struct Nnedi3Data {
 // Pipeline creation
 // ---------------------------------------------------------------------------
 
-static std::variant<VkShaderModule, std::string> create_shader_module(
-    const VK_Device & dev, const uint32_t * code, size_t code_size) {
-
-    VkShaderModuleCreateInfo module_info {
-        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .codeSize = code_size,
-        .pCode = code
-    };
-
-    VkShaderModule module;
-    VkResult result = vkCreateShaderModule(dev.device, &module_info, nullptr, &module);
-    if (result != VK_SUCCESS) {
-        return "vkCreateShaderModule failed: "s + vk_result_string(result);
-    }
-    return module;
-}
-
 struct Nnedi3Spec {
     int32_t width, rows, pad_stride, peak, pscrn, xdim, ydim, nns, qual, use_list;
 };
 
+// Both kernels keep subgroup-uniform control flow (early exits are
+// per-subgroup uniform), so it asks for full subgroups like the reference
+// (REQUIRE_FULL_SUBGROUPS_BIT); the shared helper only sets that flag when the
+// device actually exposes computeFullSubgroups.
 static std::variant<VkPipeline, std::string> create_pipeline(
     const VK_Device & dev, const Nnedi3Spec & spec,
     VkShaderModule module, VkPipelineLayout layout,
@@ -586,54 +571,9 @@ static std::variant<VkPipeline, std::string> create_pipeline(
         entries[i] = { i, i * static_cast<uint32_t>(sizeof(int32_t)), sizeof(int32_t) };
     }
 
-    VkSpecializationInfo spec_info {
-        .mapEntryCount = static_cast<uint32_t>(entries.size()),
-        .pMapEntries = entries.data(),
-        .dataSize = sizeof(spec),
-        .pData = &spec
-    };
-
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
-        .pNext = nullptr,
-        .requiredSubgroupSize = required_subgroup_size
-    };
-
-    VkPipelineShaderStageCreateInfo stage_info {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .pNext = required_subgroup_size ? &subgroup_size_info : nullptr,
-        // Full subgroups like the reference (REQUIRE_FULL_SUBGROUPS_BIT):
-        // both kernels keep subgroup-uniform control flow (early exits are
-        // per-subgroup uniform), so the scheduler can pack waves tightly.
-        // The flag requires the computeFullSubgroups feature to be enabled
-        // (VUID-VkPipelineShaderStageCreateInfo-flags-02785), so it is only
-        // set when the device actually exposes it.
-        .flags = (required_subgroup_size && dev.feat_compute_full_subgroups)
-            ? VkPipelineShaderStageCreateFlags(
-                  VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT)
-            : VkPipelineShaderStageCreateFlags(0),
-        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-        .module = module,
-        .pName = "main",
-        .pSpecializationInfo = &spec_info
-    };
-
-    VkComputePipelineCreateInfo pipeline_info {
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stage = stage_info,
-        .layout = layout,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = -1
-    };
-
-    VkPipeline pipeline;
-    VkResult result = create_compute_pipeline(dev, pipeline_info, &pipeline);
-    if (result != VK_SUCCESS) {
-        return "vkCreateComputePipelines failed: "s + vk_result_string(result);
-    }
-    return pipeline;
+    return create_compute_pipeline(dev, module, layout, entries.data(), &spec,
+        static_cast<uint32_t>(entries.size()), sizeof(spec), "nnedi3",
+        required_subgroup_size, /*full_subgroups=*/true);
 }
 
 // Records the per-frame dispatch sequence, pre-recorded once per parity at
@@ -1897,7 +1837,6 @@ static void VS_CC Nnedi3Create(
     // prescreen and predict read (full VRAM speed); the download staging
     // holds the packed interp rows DMA'd for the host scatter (interp half
     // only — kept lines never cross the bus).
-    auto align32 = [](VkDeviceSize v) { return (v + 31) & ~VkDeviceSize(31); };
     {
         VkDeviceSize up = 0, down = 0, pad = 0, asm_b = 0, dst = 0, list = 0, ind = 0;
         for (int plane = 0; plane < fmt.numPlanes; ++plane) {
@@ -2030,52 +1969,24 @@ static void VS_CC Nnedi3Create(
             resource.up_mem = std::get<AllocatedMemory>(result).memory;
             resource.up_type_index = std::get<AllocatedMemory>(result).type_index;
         }
-        auto make_device_buffer = [&](VkBuffer & buf, VkDeviceMemory & mem,
-                                      VkDeviceSize size, const char * what,
-                                      VkBufferUsageFlags extra_usage = 0)
-            -> std::optional<std::string> {
-            VkBufferCreateInfo buffer_info {
-                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .size = size,
-                .usage = (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                         VK_BUFFER_USAGE_TRANSFER_DST_BIT) | extra_usage,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = nullptr
-            };
-            if (vkCreateBuffer(dev, &buffer_info, nullptr, &buf) != VK_SUCCESS) {
-                return "vkCreateBuffer ("s + what + ") failed.";
-            }
-            const auto result = allocate_memory(
-                *d->device, buf, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            if (std::holds_alternative<std::string>(result)) {
-                return std::get<std::string>(result);
-            }
-            mem = std::get<AllocatedMemory>(result).memory;
-            return std::nullopt;
-        };
-
         if (const auto err = make_device_buffer(
-                resource.dst_buf, resource.dst_mem, dst_size, "dst")) {
+                *d->device, resource.dst_buf, resource.dst_mem, dst_size, "dst")) {
             return set_error(*err);
         }
         if (const auto err = make_device_buffer(
-                resource.pad_buf, resource.pad_mem, pad_size, "pad")) {
+                *d->device, resource.pad_buf, resource.pad_mem, pad_size, "pad")) {
             return set_error(*err);
         }
         if (const auto err = make_device_buffer(
-                resource.asm_buf, resource.asm_mem, asm_size, "asm",
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
+                *d->device, resource.asm_buf, resource.asm_mem, asm_size, "asm")) {
             return set_error(*err);
         }
         if (const auto err = make_device_buffer(
-                resource.list_buf, resource.list_mem, list_size, "list")) {
+                *d->device, resource.list_buf, resource.list_mem, list_size, "list")) {
             return set_error(*err);
         }
         if (const auto err = make_device_buffer(
-                resource.ind_buf, resource.ind_mem, ind_size, "ind",
+                *d->device, resource.ind_buf, resource.ind_mem, ind_size, "ind",
                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT)) {
             return set_error(*err);
         }
