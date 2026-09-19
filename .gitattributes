@@ -1,0 +1,7 @@
+# Normalise text files in the repository. Binary detection still applies, so the
+# test clip and the NNEDI3 weight blob are left alone.
+* text=auto
+
+# Shell scripts are executed with bash on Windows too (Git Bash for the steps
+# that run before MSYS2 is set up), where a CRLF checkout would break them.
+*.sh text eol=lf

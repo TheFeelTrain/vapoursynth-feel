@@ -96,6 +96,9 @@ jobs:
         fetch-depth: 0
     - name: Is the wheel already published?
       id: published
+      # Git Bash, not the job's msys2 shell: this runs before setup-msys2, so
+      # that shell does not exist yet. Skipping MSYS2 entirely is the point.
+      shell: bash
       run: |
         if bash .github/scripts/pypi_dist.sh published "vapoursynth_feel-${GITHUB_REF_NAME#v}-py3-none-win_amd64.whl"; then
           echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -139,6 +142,7 @@ jobs:
         uv build --wheel --out-dir dist
     - name: Reuse the published wheel
       if: steps.published.outputs.skip == 'true'
+      shell: bash
       run: bash .github/scripts/pypi_dist.sh fetch "vapoursynth_feel-${GITHUB_REF_NAME#v}-py3-none-win_amd64.whl" dist
     - uses: actions/upload-artifact@v4
       with:
