@@ -45,7 +45,7 @@ import vapoursynth as vs
 
 from conftest import (
     WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, compare_or_skip,
-    format_dtype, frame_to_ndarray, plane_to_ndarray,
+    format_dtype, frame_to_ndarray, plane_to_ndarray, reference_or_skip,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -123,6 +123,119 @@ def _right_half_mask(width, height, length, bits):
                                   length=length, color=[255])
     mask8 = vs.core.std.StackHorizontal([white, black])
     return vs.core.fmtc.bitdepth(mask8, bits=bits, fulls=True, fulld=True)
+
+
+# ---------------------------------------------------------------------------
+# mclip / sclip reference comparisons, in a subprocess
+# ---------------------------------------------------------------------------
+#
+# eedi3vk2 is as crash-prone as any Vulkan plugin, so the mask/sclip
+# comparisons run in a subprocess like the shared-surface sweep above.  The
+# script rebuilds the mask and sclip variants itself (it cannot import this
+# module); comparisons are restricted to the interpolated rows, where the two
+# implementations share the same maths.
+
+_MC_COMPARE_SCRIPT = COMPARE_PRELUDE + r'''
+import json
+import sys
+import vapoursynth as vs
+
+core = vs.core
+
+
+def right_half_mask(width, height, length, bits):
+    half = width // 2
+    black = core.std.BlankClip(format=vs.GRAY8, width=half, height=height,
+                               length=length, color=[0])
+    white = core.std.BlankClip(format=vs.GRAY8, width=half, height=height,
+                               length=length, color=[255])
+    mask8 = core.std.StackHorizontal([white, black])
+    return core.fmtc.bitdepth(mask8, bits=bits, fulls=True, fulld=True)
+
+
+def interp_rows(h, n, field):
+    fbase = field & 1
+    eff = fbase if field <= 1 else ((n & 1) ^ fbase)
+    rows = np.zeros(h, dtype=bool)
+    rows[eff::2] = True
+    return rows
+
+
+spec = json.loads(sys.argv[1])
+src = core.bs.VideoSource(spec["source"])
+bits = spec["bits"]
+clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
+                          bits=bits, fulls=True, fulld=True)
+dt = np.uint16 if bits == 16 else np.float32
+frames = spec["frames"]
+kwargs = dict(spec["kwargs"])
+field = kwargs.get("field", 1)
+
+ref_kw = dict(kwargs)
+my_kw = dict(kwargs)
+if spec.get("mclip"):
+    mask = right_half_mask(clip.width, clip.height, clip.num_frames, 16)
+    my_kw["mclip"] = mask
+    ref_kw["mclip"] = mask if bits == 16 else core.fmtc.bitdepth(
+        mask, bits=32, fulls=True, fulld=True)
+
+kind = spec.get("sclip")
+if kind == "shift":
+    sclip = core.std.Expr(clip, "x 1000 +")
+elif kind == "shift2n":
+    sclip = core.std.Interleave([core.std.Expr(clip, "x 1000 +")] * 2)
+elif kind == "shift_dh":
+    sclip = core.resize.Point(core.std.Expr(clip, "x 1000 +"),
+                              clip.width, 2 * clip.height)
+else:
+    sclip = None
+if sclip is not None:
+    ref_kw["sclip"] = sclip
+    my_kw["sclip"] = sclip
+
+# --- reference phase: materialise and copy before touching vsfeel ---
+try:
+    ref_node = core.eedi3vk2.EEDI3(clip, **ref_kw)
+    ref_frames = {n: read_plane(ref_node.get_frame(n), 0, dt) for n in frames}
+except Exception as exc:
+    print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
+    raise SystemExit(2)
+print("REF ok", flush=True)
+
+# --- vsfeel phase ---
+try:
+    my_node = core.vsfeel.EEDI3(clip, **my_kw)
+    maxdiff = 0.0
+    for n in frames:
+        a = read_plane(my_node.get_frame(n), 0, dt)
+        b = ref_frames[n]
+        if not (np.isfinite(a.astype(np.float64)).all()
+                and np.isfinite(b.astype(np.float64)).all()):
+            print("VSFEEL fail: non-finite at frame %d" % n, flush=True)
+            raise SystemExit(3)
+        d = np.abs(a.astype(np.float64) - b.astype(np.float64))
+        if spec.get("interp_rows", True):
+            d = d[interp_rows(a.shape[0], n, field)]
+        if d.size:
+            maxdiff = max(maxdiff, float(d.max()))
+except SystemExit:
+    raise
+except Exception as exc:
+    print("VSFEEL fail: %s: %s" % (type(exc).__name__, exc), flush=True)
+    raise SystemExit(3)
+print("RESULT " + json.dumps({"maxdiff": maxdiff,
+                              "width": my_node.width,
+                              "height": my_node.height,
+                              "num_frames": my_node.num_frames}), flush=True)
+'''
+
+
+def _mc_compare(bits, frames, kwargs, mclip=False, sclip=None):
+    """Compare vsfeel against eedi3vk2 for an mclip/sclip case (subprocess)."""
+    reference_or_skip("eedi3vk2", "EEDI3")
+    spec = {"source": NOISE_MKV, "bits": bits, "frames": list(frames),
+            "kwargs": dict(kwargs), "mclip": bool(mclip), "sclip": sclip}
+    return compare_or_skip(_MC_COMPARE_SCRIPT, [json.dumps(spec)], timeout=600)
 
 
 # ---------------------------------------------------------------------------
@@ -376,8 +489,7 @@ def test_eedi3_matches_vk2_reference(bits, cases):
     (documented in REFERENCE_CASES_32) where a rounding-order difference
     flips a DP argmin; those use a looser bound.
     """
-    if not hasattr(vs.core, "eedi3vk2") or not hasattr(vs.core.eedi3vk2, "EEDI3"):
-        pytest.skip("no eedi3vk2.EEDI3 reference")
+    reference_or_skip("eedi3vk2", "EEDI3")
     maxdiffs = _reference_max_diffs(bits, cases)
     for (kwargs, tol), maxdiff in zip(cases, maxdiffs):
         assert maxdiff < tol or maxdiff == 0, (
@@ -392,25 +504,12 @@ def test_eedi3_matches_vk2_reference(bits, cases):
 def test_eedi3_mclip_gray8_matches_vk2_same_format(noise_gray, noise_16bit, bits):
     """vsfeel's Gray8 mask must equal eedi3vk2's same-format mask exactly on
     the shared surface (vk2 requires the clip's own format)."""
-    if not hasattr(vs.core, "eedi3vk2") or not hasattr(vs.core.eedi3vk2, "EEDI3"):
-        pytest.skip("no eedi3vk2.EEDI3 reference")
-    clip = noise_16bit if bits == 16 else noise_gray
     kw = dict(field=1, mdis=5, nrad=1, vcheck=2)
-    m16 = _right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
-    # vk2 wants a mask in the clip format
-    ref_mask = m16 if bits == 16 else vs.core.fmtc.bitdepth(m16, bits=32, fulls=True, fulld=True)
-    vk2 = vs.core.eedi3vk2.EEDI3(clip, mclip=ref_mask, **kw)
-    my = vs.core.vsfeel.EEDI3(clip, mclip=m16, **kw)  # g16 auto->g8
-    dtype = _dtype(bits)
-    for n in (0, 11):
-        a = _plane(my.get_frame(n), 0, WIDTH, HEIGHT, dtype).astype(np.float64)
-        b = _plane(vk2.get_frame(n), 0, WIDTH, HEIGHT, dtype).astype(np.float64)
-        d = np.abs(a - b)
-        rows = _interp_rows(HEIGHT, n, kw["field"])
-        if bits == 16:
-            assert d[rows].max() == 0, f"mclip mismatch at frame {n}"
-        else:
-            assert d[rows].max() < 1e-6, f"mclip mismatch at frame {n}"
+    payload = _mc_compare(bits, (0, 11), kw, mclip=True)
+    if bits == 16:
+        assert payload["maxdiff"] == 0, "mclip mismatch"
+    else:
+        assert payload["maxdiff"] < 1e-6, "mclip mismatch"
 
 
 def test_eedi3_mclip_auto_converts_gray16_gray32(noise_gray, noise_16bit):
@@ -575,38 +674,19 @@ def test_eedi3_mclip_masked_region_is_vertical_cubic(noise_16bit):
 def test_eedi3_mclip_field_gt1_matches_vk2(noise_16bit, field):
     """mclip combined with frame doubling: the mask (N frames, one per source
     frame) must drive both output parities exactly like eedi3vk2."""
-    if not hasattr(vs.core, "eedi3vk2") or not hasattr(vs.core.eedi3vk2, "EEDI3"):
-        pytest.skip("no eedi3vk2.EEDI3 reference")
-    clip = noise_16bit
+    n_src = noise_16bit.num_frames
     kw = dict(field=field, mdis=5, nrad=1, vcheck=2)
-    m16 = _right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
-    ref_mask = vs.core.fmtc.bitdepth(m16, bits=16, fulls=True, fulld=True)
-    vk2 = vs.core.eedi3vk2.EEDI3(clip, mclip=ref_mask, **kw)
-    my = _run(clip, mclip=m16, **kw)  # g16 auto->g8
-    assert my.num_frames == 2 * clip.num_frames
-    for n in (0, 5, clip.num_frames, 2 * clip.num_frames - 1):
-        rows = _interp_rows(HEIGHT, n, field)
-        a = _plane(my.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
-        b = _plane(vk2.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
-        assert np.abs(a - b)[rows].max() == 0, f"mclip field={field} mismatch at n={n}"
+    payload = _mc_compare(16, (0, 5, n_src, 2 * n_src - 1), kw, mclip=True)
+    assert payload["num_frames"] == 2 * n_src
+    assert payload["maxdiff"] == 0, f"mclip field={field} mismatch"
 
 
 def test_eedi3_mclip_dh_matches_vk2(noise_16bit):
     """mclip combined with dh (doubled height)."""
-    if not hasattr(vs.core, "eedi3vk2") or not hasattr(vs.core.eedi3vk2, "EEDI3"):
-        pytest.skip("no eedi3vk2.EEDI3 reference")
-    clip = noise_16bit
     kw = dict(field=1, dh=1, mdis=5, nrad=1, vcheck=2)
-    m16 = _right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
-    ref_mask = vs.core.fmtc.bitdepth(m16, bits=16, fulls=True, fulld=True)
-    vk2 = vs.core.eedi3vk2.EEDI3(clip, mclip=ref_mask, **kw)
-    my = _run(clip, mclip=m16, **kw)
-    assert my.height == 2 * HEIGHT
-    for n in (0, 11, 23):
-        rows = _interp_rows(2 * HEIGHT, n, 1)
-        a = _plane(my.get_frame(n), 0, WIDTH, 2 * HEIGHT, np.uint16).astype(np.int64)
-        b = _plane(vk2.get_frame(n), 0, WIDTH, 2 * HEIGHT, np.uint16).astype(np.int64)
-        assert np.abs(a - b)[rows].max() == 0, f"mclip dh mismatch at n={n}"
+    payload = _mc_compare(16, (0, 11, 23), kw, mclip=True)
+    assert payload["height"] == 2 * HEIGHT
+    assert payload["maxdiff"] == 0, "mclip dh mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -835,19 +915,10 @@ def test_eedi3_sclip_requires_2n_frames_under_field_gt1(noise_16bit):
     base = dict(field=3, mdis=5, nrad=1, vcheck=2)
     with pytest.raises(vs.Error):
         _run(clip, sclip=clip, **base)          # N-frame: wrong
-    if not hasattr(vs.core, "eedi3vk2") or not hasattr(vs.core.eedi3vk2, "EEDI3"):
-        pytest.skip("no eedi3vk2.EEDI3 reference")
     # shifted content so sclip != the vertical cubic
-    shifted = vs.core.std.Expr(clip, "x 1000 +")
-    sc2n = vs.core.std.Interleave([shifted, shifted])   # 2N frames
-    vk2 = vs.core.eedi3vk2.EEDI3(clip, sclip=sc2n, **base)
-    my = _run(clip, sclip=sc2n, **base)
-    assert my.num_frames == 2 * N
-    for n in (0, 1, N - 1, N, 2 * N - 1):
-        rows = _interp_rows(HEIGHT, n, 3)
-        a = _plane(my.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
-        b = _plane(vk2.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
-        assert np.abs(a - b)[rows].max() == 0, f"field=3 sclip mismatch at n={n}"
+    payload = _mc_compare(16, (0, 1, N - 1, N, 2 * N - 1), base, sclip="shift2n")
+    assert payload["num_frames"] == 2 * N
+    assert payload["maxdiff"] == 0, "field=3 sclip mismatch"
 
 
 def test_eedi3_sclip_dh_requires_doubled_height(noise_16bit):
@@ -856,38 +927,23 @@ def test_eedi3_sclip_dh_requires_doubled_height(noise_16bit):
     base = dict(field=1, dh=1, mdis=5, nrad=1, vcheck=2)
     with pytest.raises(vs.Error):
         _run(clip, sclip=clip, **base)          # 1x height: wrong
-    if not hasattr(vs.core, "eedi3vk2") or not hasattr(vs.core.eedi3vk2, "EEDI3"):
-        pytest.skip("no eedi3vk2.EEDI3 reference")
-    shifted = vs.core.std.Expr(clip, "x 1000 +")
-    sc_dh = vs.core.resize.Point(shifted, WIDTH, 2 * HEIGHT)
-    vk2 = vs.core.eedi3vk2.EEDI3(clip, sclip=sc_dh, **base)
-    my = _run(clip, sclip=sc_dh, **base)
-    assert my.height == 2 * HEIGHT
-    for n in (0, 11, 23):
-        rows = _interp_rows(2 * HEIGHT, n, 1)
-        a = _plane(my.get_frame(n), 0, WIDTH, 2 * HEIGHT, np.uint16).astype(np.int64)
-        b = _plane(vk2.get_frame(n), 0, WIDTH, 2 * HEIGHT, np.uint16).astype(np.int64)
-        assert np.abs(a - b)[rows].max() == 0, f"dh sclip mismatch at n={n}"
+    payload = _mc_compare(16, (0, 11, 23), base, sclip="shift_dh")
+    assert payload["height"] == 2 * HEIGHT
+    assert payload["maxdiff"] == 0, "dh sclip mismatch"
 
 
 def test_eedi3_sclip_content_matches_vk2(noise_16bit):
     """sclip is the vcheck reference: with vcheck > 0 the output must use the
     sclip content (shifted noise, never equal to the vertical cubic) exactly
     like eedi3vk2 does. Guards the sclip row staging / Interleave parity."""
-    if not hasattr(vs.core, "eedi3vk2") or not hasattr(vs.core.eedi3vk2, "EEDI3"):
-        pytest.skip("no eedi3vk2.EEDI3 reference")
     clip = noise_16bit
-    shifted = vs.core.std.Expr(clip, "x 1000 +")
     base = dict(field=1, mdis=5, nrad=1, vcheck=2)
-    vk2 = vs.core.eedi3vk2.EEDI3(clip, sclip=shifted, **base)
-    my = _run(clip, sclip=shifted, **base)
-    for n in (0, 11, 23):
-        rows = _interp_rows(HEIGHT, n, 1)
-        a = _plane(my.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
-        b = _plane(vk2.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
-        assert np.abs(a - b)[rows].max() == 0, f"sclip mismatch at n={n}"
+    payload = _mc_compare(16, (0, 11, 23), base, sclip="shift")
+    assert payload["maxdiff"] == 0, "sclip mismatch"
     # sclip must actually change the output vs the no-sclip run (sanity that
     # the test content is meaningful)
+    shifted = vs.core.std.Expr(clip, "x 1000 +")
+    my = _run(clip, sclip=shifted, **base)
     no_sc = _run(clip, **base)
     changed = False
     for n in (0, 11):

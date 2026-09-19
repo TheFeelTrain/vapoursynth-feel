@@ -18,8 +18,9 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    NOISE_MKV, COMPARE_PRELUDE, ReferenceUnavailable, assert_gray32,
-    frame_to_ndarray, plane_to_ndarray, run_compare_subprocess,
+    NOISE_MKV, COMPARE_PRELUDE, ReferenceUnavailable, assert_all_frames_finite,
+    assert_gray32, frame_to_ndarray, plane_to_ndarray, run_compare_subprocess,
+    skip_or_fail_reference,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -46,9 +47,7 @@ def _run(clip, radius=2, num_streams=1, **kwargs):
 def _check_all_frames_finite(clip, **kwargs):
     out = _run(clip, **kwargs)
     assert_gray32(out)
-    for n in range(out.num_frames):
-        a = frame_to_ndarray(out.get_frame(n))
-        assert np.isfinite(a).all(), f"non-finite output at frame {n}"
+    assert_all_frames_finite(out)
 
 
 def _eval_parallel(clip, **kwargs):
@@ -528,7 +527,8 @@ def _compare_against_any_reference(kwargs: dict, ref_pass: bool = False) -> tupl
             return ref, _max_diff_vs_reference(kwargs, ref, ref_pass=ref_pass)
         except ReferenceUnavailable as exc:
             reasons.append(f"{ref}: {exc}")
-    pytest.skip("no usable reference plugin (vszipcl/bm3dhip): " + "; ".join(reasons))
+    skip_or_fail_reference(
+        "no usable reference plugin (vszipcl/bm3dhip): " + "; ".join(reasons))
 
 
 def test_bm3dv2_ref_matches_reference(noise_gray):

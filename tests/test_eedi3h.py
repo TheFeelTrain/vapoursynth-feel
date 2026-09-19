@@ -22,7 +22,9 @@ import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import WIDTH, HEIGHT
+from conftest import (
+    WIDTH, HEIGHT, reference_compare, reference_or_skip, reference_spec,
+)
 from test_eedi3 import _plane
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -160,21 +162,17 @@ def test_eedi3h_vszipcl_loose(noise_16bit):
 
     Measured on noise: ~1.7% pixels differ, max a few hundred LSB. Catches
     gross errors (wrong axis, broken composition) while allowing the family
-    difference.
+    difference.  Runs in a subprocess so a reference crash cannot take the
+    suite down.
     """
-    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "EEDI3H"):
-        pytest.skip("no vszipcl.EEDI3H reference")
-    clip = noise_16bit
-    kw = dict(field=1, mdis=5, nrad=1, vcheck=2)
-    my = _runh(clip, **kw)
-    ref = vs.core.vszipcl.EEDI3H(clip, num_streams=1, **kw)
-    assert (my.width, my.height) == (ref.width, ref.height) == (WIDTH, HEIGHT)
-    for n in (0, 11):
-        a = _plane(my.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int32)
-        b = _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int32)
-        d = np.abs(a - b)
-        assert (d > 0).mean() < 0.05, f"too many pixels differ at frame {n}"
-        assert d.max() < 4096, f"max diff too large at frame {n}: {d.max()}"
+    reference_or_skip("vszipcl", "EEDI3H")
+    spec = reference_spec(
+        "vszipcl", "EEDI3H", "gray16", frames=(0, 11),
+        kwargs=dict(field=1, mdis=5, nrad=1, vcheck=2, num_streams=1))
+    payload = reference_compare(spec)
+    assert (payload["width"], payload["height"]) == (WIDTH, HEIGHT)
+    assert payload["ndiff_frac"] < 0.05, "too many pixels differ"
+    assert payload["maxdiff"] < 4096, f"max diff too large: {payload['maxdiff']}"
 
 
 # ---------------------------------------------------------------------------

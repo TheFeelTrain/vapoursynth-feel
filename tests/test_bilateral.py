@@ -18,6 +18,9 @@ installed, with a two-tier "close enough" policy:
 sides round nearly identical fp32 results once, so codes differ by at most
 one rounding step. Self-consistency checks (determinism) remain exact.
 
+Every reference comparison runs in a subprocess (``reference_compare``) so a
+reference crash cannot take the pytest process down with it.
+
 Run from the repository root:  python -m pytest tests/test_bilateral.py
 """
 
@@ -26,7 +29,8 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    assert_gray32, format_dtype, frame_to_ndarray, plane_to_ndarray,
+    assert_changes_on_noise, assert_gray32, format_dtype, frame_to_ndarray,
+    plane_to_ndarray, reference_compare, reference_or_skip, reference_spec,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -41,13 +45,6 @@ def _run(clip, **kwargs):
     return vs.core.vsfeel.Bilateral(clip, **kwargs)
 
 
-def _ref(clip, **kwargs):
-    """Reference output, skipping the test if vszipcl is not installed."""
-    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "Bilateral"):
-        pytest.skip("vszipcl not installed")
-    return vs.core.vszipcl.Bilateral(clip, **kwargs)
-
-
 def _plane(frame, plane):
     """Copy a frame plane into an ndarray, honouring the row pitch.
 
@@ -57,16 +54,12 @@ def _plane(frame, plane):
     return plane_to_ndarray(frame, plane, format_dtype(frame.format))
 
 
-def _max_diff(a_node, b_node, frames=(0, 11, 23)):
-    worst = 0.0
-    for n in frames:
-        fa, fb = a_node.get_frame(n), b_node.get_frame(n)
-        for p in range(fa.format.num_planes):
-            d = np.abs(
-                _plane(fa, p).astype(np.float64) - _plane(fb, p).astype(np.float64)
-            )
-            worst = max(worst, float(d.max()))
-    return worst
+def _compare(fmt, frames, params, guide=None):
+    """Worst diff vs vszipcl over ``frames`` (subprocess; skips if absent)."""
+    reference_or_skip("vszipcl", "Bilateral")
+    spec = reference_spec("vszipcl", "Bilateral", fmt, frames=frames,
+                          kwargs=params, guide=guide)
+    return reference_compare(spec)["maxdiff"]
 
 
 def test_bilateral_output_finite_32bit(noise_gray):
@@ -114,15 +107,10 @@ def test_bilateral_rejects_10bit(noise_8bit):
 
 def test_bilateral_matches_reference_32bit(noise_gray):
     """Default parameters stay close to the reference implementation."""
-    for n in (0, 11, 23):
-        a = frame_to_ndarray(
-            _run(noise_gray, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR, num_streams=2).get_frame(n)
-        )
-        b = frame_to_ndarray(
-            _ref(noise_gray, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR, num_streams=2).get_frame(n)
-        )
-        d = np.abs(a - b)
-        assert d.max() < REF_TOL, f"max diff {d.max()} at frame {n}"
+    params = dict(sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR,
+                  num_streams=2)
+    worst = _compare("gray32", (0, 11, 23), params)
+    assert worst < REF_TOL, f"max diff {worst}"
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +119,8 @@ def test_bilateral_matches_reference_32bit(noise_gray):
 
 def test_bilateral_matches_reference_16bit(noise_16bit):
     """16-bit integer input: within one output-code rounding step."""
-    out = _run(noise_16bit, sigma_spatial=2.0, sigma_color=0.05)
-    ref = _ref(noise_16bit, sigma_spatial=2.0, sigma_color=0.05)
-    worst = _max_diff(out, ref, frames=(0, 7, 23))
+    params = dict(sigma_spatial=2.0, sigma_color=0.05)
+    worst = _compare("gray16", (0, 7, 23), params)
     assert worst <= 1.0, f"int16 max diff {worst} LSB"
 
 
@@ -153,20 +140,16 @@ BORDER_TOL_CODES = 655.0
 def test_bilateral_sigma_sweep_matches_reference_16bit(
         noise_16bit, sigma_spatial, sigma_color, tol):
     """16-bit mirror of test_bilateral_sigma_sweep_matches_reference."""
-    kwargs = dict(sigma_spatial=sigma_spatial, sigma_color=sigma_color)
-    out = _run(noise_16bit, **kwargs)
-    ref = _ref(noise_16bit, **kwargs)
-    worst = _max_diff(out, ref, frames=(3, 17))
+    worst = _compare("gray16", (3, 17),
+                     dict(sigma_spatial=sigma_spatial, sigma_color=sigma_color))
     assert worst <= tol, f"max diff {worst} LSB (tol {tol})"
 
 
 @pytest.mark.parametrize("radius", [1, 5])
 def test_bilateral_radius_sweep_matches_reference_16bit(noise_16bit, radius):
     """16-bit mirror of test_bilateral_radius_sweep_matches_reference."""
-    kwargs = dict(sigma_spatial=2.0, sigma_color=0.05, radius=radius)
-    out = _run(noise_16bit, **kwargs)
-    ref = _ref(noise_16bit, **kwargs)
-    worst = _max_diff(out, ref, frames=(3, 17))
+    worst = _compare("gray16", (3, 17),
+                     dict(sigma_spatial=2.0, sigma_color=0.05, radius=radius))
     assert worst <= 1.0, f"max diff {worst} LSB"
 
 
@@ -174,11 +157,9 @@ def test_bilateral_radius_sweep_matches_reference_16bit(noise_16bit, radius):
 def test_bilateral_shader_variants_match_vszipcl_16bit(
         noise_16bit, use_shared_memory):
     """16-bit mirror of test_bilateral_shader_variants_match_vszipcl."""
-    kwargs = dict(sigma_spatial=2.0, sigma_color=0.05,
-                  use_shared_memory=use_shared_memory)
-    out = _run(noise_16bit, **kwargs)
-    ref = _ref(noise_16bit, **kwargs)
-    worst = _max_diff(out, ref, frames=(0, 23))
+    worst = _compare("gray16", (0, 23),
+                     dict(sigma_spatial=2.0, sigma_color=0.05,
+                          use_shared_memory=use_shared_memory))
     assert worst <= 1.0, f"max diff {worst} LSB"
 
 
@@ -186,15 +167,11 @@ def test_bilateral_shader_variants_match_vszipcl_16bit(
 def test_bilateral_yuv_matches_reference_16bit(noise_gray, use_shared_memory):
     """16-bit YUV420: all planes must track the reference in both shader
     variants (mirror of the 32-bit YUV test)."""
-    if hasattr(vs.core, "bs"):
-        source = vs.core.bs.VideoSource("tests/noise_24f.mkv")
-    else:
-        source = vs.core.ffms2.Source("tests/noise_24f.mkv")
-    yuv = vs.core.resize.Bicubic(source, format=vs.YUV420P16)
-    kwargs = dict(use_shared_memory=use_shared_memory)
-    out = _run(yuv, **kwargs)
-    ref = _ref(yuv, **kwargs)
-    worst = _max_diff(out, ref, frames=(0, 11))
+    reference_or_skip("vszipcl", "Bilateral")
+    spec = reference_spec(
+        "vszipcl", "Bilateral", "yuv420_16", frames=(0, 11),
+        kwargs=dict(use_shared_memory=use_shared_memory))
+    worst = reference_compare(spec)["maxdiff"]
     assert worst <= 1.0, f"max diff {worst} LSB"
 
 
@@ -207,20 +184,16 @@ def test_bilateral_yuv_matches_reference_16bit(noise_gray, use_shared_memory):
 ], ids=["small-sigma", "default-like", "wide-sigma"])
 def test_bilateral_sigma_sweep_matches_reference_32bit(noise_gray, sigma_spatial, sigma_color, tol):
     """Sigma grid on float input; radius is auto-derived from sigma_spatial."""
-    kwargs = dict(sigma_spatial=sigma_spatial, sigma_color=sigma_color)
-    out = _run(noise_gray, **kwargs)
-    ref = _ref(noise_gray, **kwargs)
-    worst = _max_diff(out, ref, frames=(3, 17))
+    worst = _compare("gray32", (3, 17),
+                     dict(sigma_spatial=sigma_spatial, sigma_color=sigma_color))
     assert worst < tol, f"max diff {worst} (tol {tol})"
 
 
 @pytest.mark.parametrize("radius", [1, 5])
 def test_bilateral_radius_sweep_matches_reference_32bit(noise_gray, radius):
     """Explicit small and large radii override the auto-derived window."""
-    kwargs = dict(sigma_spatial=2.0, sigma_color=0.05, radius=radius)
-    out = _run(noise_gray, **kwargs)
-    ref = _ref(noise_gray, **kwargs)
-    worst = _max_diff(out, ref, frames=(3, 17))
+    worst = _compare("gray32", (3, 17),
+                     dict(sigma_spatial=2.0, sigma_color=0.05, radius=radius))
     assert worst < REF_TOL, f"max diff {worst}"
 
 
@@ -228,11 +201,9 @@ def test_bilateral_radius_sweep_matches_reference_32bit(noise_gray, radius):
 def test_bilateral_shader_variants_match_vszipcl_32bit(noise_gray, use_shared_memory):
     """Both shader variants track the reference (borders may differ between
     variants, exactly like the reference's own _sm/_gl pair)."""
-    kwargs = dict(sigma_spatial=2.0, sigma_color=0.05,
-                  use_shared_memory=use_shared_memory)
-    out = _run(noise_gray, **kwargs)
-    ref = _ref(noise_gray, **kwargs)
-    worst = _max_diff(out, ref, frames=(0, 23))
+    worst = _compare("gray32", (0, 23),
+                     dict(sigma_spatial=2.0, sigma_color=0.05,
+                          use_shared_memory=use_shared_memory))
     assert worst < REF_TOL, f"max diff {worst}"
 
 
@@ -240,30 +211,27 @@ def test_bilateral_shader_variants_match_vszipcl_32bit(noise_gray, use_shared_me
 def test_bilateral_yuv_matches_reference_32bit(noise_gray, use_shared_memory):
     """YUV float32: all planes (incl. subsampled chroma with scaled default
     sigmas) must match the reference, in both shader variants."""
-    if hasattr(vs.core, "bs"):
-        source = vs.core.bs.VideoSource("tests/noise_24f.mkv")
-    else:
-        source = vs.core.ffms2.Source("tests/noise_24f.mkv")
-    yuv = vs.core.fmtc.bitdepth(source, bits=32, fulls=True, fulld=True)
-    kwargs = dict(use_shared_memory=use_shared_memory)
-    out = _run(yuv, **kwargs)
-    ref = _ref(yuv, **kwargs)
-    worst = _max_diff(out, ref, frames=(0, 11))
+    reference_or_skip("vszipcl", "Bilateral")
+    spec = reference_spec(
+        "vszipcl", "Bilateral", "yuv32", frames=(0, 11),
+        kwargs=dict(use_shared_memory=use_shared_memory))
+    worst = reference_compare(spec)["maxdiff"]
     assert worst < REF_TOL, f"max diff {worst}"
 
 
 def test_bilateral_ref_clip_matches_reference_32bit(noise_gray):
     """Joint filtering through a guide clip matches the reference."""
-    guide = noise_gray.std.FlipVertical()
-    kwargs = dict(sigma_spatial=2.0, sigma_color=0.05, ref=guide)
-    out = _run(noise_gray, **kwargs)
-    ref = _ref(noise_gray, **kwargs)
-    worst = _max_diff(out, ref, frames=(0, 11, 23))
-    assert worst < REF_TOL, f"max diff {worst}"
+    kwargs = dict(sigma_spatial=2.0, sigma_color=0.05)
+    out = _run(noise_gray, ref=noise_gray.std.FlipVertical(), **kwargs)
     assert_gray32(out)
+    worst = _compare("gray32", (0, 11, 23), kwargs,
+                     guide={"kind": "flipvertical"})
+    assert worst < REF_TOL, f"max diff {worst}"
 
 
 def test_bilateral_output_finite_16bit(noise_16bit):
+    """The 16-bit output must be finite AND actually filtered: an identity
+    implementation used to pass the uint16 finiteness/range check."""
     for num_streams in (1, 2):
         out = _run(
             noise_16bit,
@@ -272,16 +240,14 @@ def test_bilateral_output_finite_16bit(noise_16bit):
             num_streams=num_streams,
         )
         assert out.format.id == noise_16bit.format.id
-        a = _plane(out.get_frame(10), 0)
-        assert np.isfinite(a.astype(np.float32)).all()
-        assert a.min() >= 0 and a.max() <= 65535
+        assert_changes_on_noise(out, noise_16bit, frames=(10,),
+                                what="bilateral")
 
 
 def test_bilateral_defaults_run_16bit(noise_16bit):
     out = _run(noise_16bit)
     assert out.format.id == noise_16bit.format.id
-    a = _plane(out.get_frame(0), 0)
-    assert np.isfinite(a.astype(np.float32)).all()
+    assert_changes_on_noise(out, noise_16bit, frames=(0,), what="bilateral")
 
 
 def test_bilateral_deterministic_16bit(noise_16bit):
@@ -294,9 +260,7 @@ def test_bilateral_deterministic_16bit(noise_16bit):
 
 def test_bilateral_ref_clip_matches_reference_16bit(noise_16bit):
     """16-bit mirror of test_bilateral_ref_clip_matches_reference."""
-    guide = noise_16bit.std.FlipVertical()
-    kwargs = dict(sigma_spatial=2.0, sigma_color=0.05, ref=guide)
-    out = _run(noise_16bit, **kwargs)
-    ref = _ref(noise_16bit, **kwargs)
-    worst = _max_diff(out, ref, frames=(0, 11, 23))
+    worst = _compare("gray16", (0, 11, 23),
+                     dict(sigma_spatial=2.0, sigma_color=0.05),
+                     guide={"kind": "flipvertical"})
     assert worst <= 1.0, f"max diff {worst} LSB"

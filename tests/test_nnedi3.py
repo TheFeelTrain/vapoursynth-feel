@@ -26,7 +26,10 @@ import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import WIDTH, HEIGHT, NOISE_MKV, plane_to_ndarray
+from conftest import (
+    WIDTH, HEIGHT, NOISE_MKV, plane_to_ndarray, reference_compare,
+    reference_or_skip, reference_spec,
+)
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
@@ -40,8 +43,18 @@ def _run(clip, field=1, num_streams=1, **kwargs):
     )
 
 
-def _ref(clip, field=1, **kwargs):
-    return vs.core.nnedi3vk.NNEDI3(clip, field=field, **kwargs)
+def _ref_compare(fmt, frames, params, planes=None):
+    """Compare against nnedi3vk in a subprocess; skip if it is not installed.
+
+    Returns the RESULT payload (``maxdiff`` plus the vsfeel output geometry).
+    ``field`` defaults to 1 (both plugins require it).
+    """
+    reference_or_skip("nnedi3vk", "NNEDI3")
+    params = dict(params)
+    params.setdefault("field", 1)
+    spec = reference_spec("nnedi3vk", "NNEDI3", fmt, frames=frames,
+                          planes=planes, kwargs=params)
+    return reference_compare(spec)
 
 
 def _plane_u16(frame, plane, width, height):
@@ -83,32 +96,28 @@ REFERENCE_CASES_16 = [
 @pytest.mark.parametrize("kwargs", REFERENCE_CASES_16,
                          ids=[str(sorted(k.items())) for k in REFERENCE_CASES_16])
 def test_nnedi3_matches_reference_16bit(noise_16bit, kwargs):
-    a = _run(noise_16bit, **kwargs)
-    b = _ref(noise_16bit, **kwargs)
-    assert _max_diff_u16(a, b, 0, WIDTH, HEIGHT, (0, 11, 23)) <= 1
+    payload = _ref_compare("gray16", (0, 11, 23), kwargs)
+    assert payload["maxdiff"] <= 1, kwargs
 
 
 def test_nnedi3_pscrn0_within_1lsb(noise_16bit):
     """pscrn=0 forces every pixel through the predictor (serial accumulation
     vs the reference's subgroup reductions): allow 1 LSB."""
-    a = _run(noise_16bit, pscrn=0)
-    b = _ref(noise_16bit, pscrn=0)
-    assert _max_diff_u16(a, b, 0, WIDTH, HEIGHT, (0, 11)) <= 1
+    payload = _ref_compare("gray16", (0, 11), {"pscrn": 0})
+    assert payload["maxdiff"] <= 1
 
 
 def test_nnedi3_field_gt1_matches_reference(noise_16bit):
     for field in (2, 3):
-        a = _run(noise_16bit, field=field)
-        b = _ref(noise_16bit, field=field)
-        assert a.num_frames == b.num_frames == 48
-        assert _max_diff_u16(a, b, 0, WIDTH, HEIGHT, (0, 1, 24, 47)) <= 1
+        payload = _ref_compare("gray16", (0, 1, 24, 47), {"field": field})
+        assert payload["num_frames"] == 48
+        assert payload["maxdiff"] <= 1
 
 
 def test_nnedi3_dh_matches_reference(noise_16bit):
-    a = _run(noise_16bit, dh=True)
-    b = _ref(noise_16bit, dh=True)
-    assert a.height == b.height == 2 * HEIGHT
-    assert _max_diff_u16(a, b, 0, WIDTH, 2 * HEIGHT, (0, 11, 23)) <= 1
+    payload = _ref_compare("gray16", (0, 11, 23), {"dh": True})
+    assert payload["height"] == 2 * HEIGHT
+    assert payload["maxdiff"] <= 1
 
 
 def _yuv420p16():
@@ -124,11 +133,8 @@ def test_nnedi3_yuv_matches_reference():
     yuv = _yuv420p16()
     assert yuv.format.color_family == vs.YUV
     for kwargs in ({}, {"planes": [0]}, {"planes": [1, 2]}, {"nsize": 0}):
-        a = _run(yuv, **kwargs)
-        b = _ref(yuv, **kwargs)
-        for p, (w, h) in enumerate(((WIDTH, HEIGHT), (WIDTH // 2, HEIGHT // 2),
-                                    (WIDTH // 2, HEIGHT // 2))):
-            assert _max_diff_u16(a, b, p, w, h, (0, 11)) <= 1, kwargs
+        payload = _ref_compare("yuv420_16", (0, 11), kwargs)
+        assert payload["maxdiff"] <= 1, kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -142,12 +148,8 @@ REFERENCE_CASES_32 = [{}, {"pscrn": 0}, {"pscrn": 1}, {"qual": 2},
 @pytest.mark.parametrize("kwargs", REFERENCE_CASES_32,
                          ids=[str(sorted(k.items())) for k in REFERENCE_CASES_32])
 def test_nnedi3_matches_reference_32bit(noise_gray, kwargs):
-    from conftest import frame_to_ndarray
-    a = _run(noise_gray, **kwargs)
-    b = _ref(noise_gray, **kwargs)
-    for n in (0, 11):
-        d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
-        assert np.abs(d).max() <= 1e-6, f"frame {n} {kwargs}"
+    payload = _ref_compare("gray32", (0, 11), kwargs)
+    assert payload["maxdiff"] <= 1e-6, kwargs
 
 
 # ---------------------------------------------------------------------------

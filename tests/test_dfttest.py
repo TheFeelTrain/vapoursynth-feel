@@ -31,8 +31,9 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_gray32, compare_or_skip,
-    format_dtype, frame_to_ndarray, plane_to_ndarray,
+    WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_all_frames_finite,
+    assert_changes_on_noise, assert_gray32, compare_or_skip, frame_to_ndarray,
+    plane_to_ndarray, reference_compare, reference_or_skip, reference_spec,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -55,11 +56,6 @@ def _plane(frame, plane, width, height, dtype: DTypeLike = np.float32):
     return plane_to_ndarray(frame, plane, dtype)
 
 
-def _stride_plane(frame, plane):
-    """Copy any plane into an ndarray, honouring the row pitch."""
-    return plane_to_ndarray(frame, plane, format_dtype(frame.format))
-
-
 def _eval_parallel(clip, dtype=np.float32, **kwargs):
     """Evaluate every frame concurrently to exercise the multi-stream path."""
     out = _run(clip, **kwargs)
@@ -80,9 +76,15 @@ def _eval_parallel(clip, dtype=np.float32, **kwargs):
 def _check_all_frames_finite(clip, **kwargs):
     out = _run(clip, **kwargs)
     assert_gray32(out)
-    for n in range(out.num_frames):
-        a = frame_to_ndarray(out.get_frame(n))
-        assert np.isfinite(a).all(), f"non-finite output at frame {n}"
+    assert_all_frames_finite(out)
+
+
+def _ref_compare(fmt, params, frames=(0, 11, 23), planes=None):
+    """Worst diff vs vszipcl over ``frames`` (subprocess; skips if absent)."""
+    reference_or_skip("vszipcl", "DFTTest")
+    spec = reference_spec("vszipcl", "DFTTest", fmt, frames=frames,
+                          planes=planes, kwargs=params)
+    return reference_compare(spec)["maxdiff"]
 
 
 # ---------------------------------------------------------------------------
@@ -267,20 +269,19 @@ def test_dfttest_no_nan_all_frames_multi_stream_32bit(noise_gray, num_streams):
 @pytest.mark.parametrize("tbsize", [1, 3, 5, 7])
 def test_dfttest_no_nan_all_frames_16bit(noise_16bit, tbsize):
     """16-bit mirror of test_dfttest_no_nan_all_frames_32bit (temporal
-    boundary handling on the integer path)."""
+    boundary handling on the integer path).
+
+    ``isfinite(uint16)`` cannot fail, so the meaningful assertion is that the
+    filter actually altered the noise input.
+    """
     out = _run(noise_16bit, tbsize=tbsize, num_streams=1)
-    for n in range(out.num_frames):
-        a = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
-        assert np.isfinite(a.astype(np.float32)).all()
-        assert a.max() <= 65535
+    assert_changes_on_noise(out, noise_16bit, what="DFTTest")
 
 
 @pytest.mark.parametrize("num_streams", [2, 4])
 def test_dfttest_no_nan_all_frames_multi_stream_16bit(noise_16bit, num_streams):
     out = _run(noise_16bit, tbsize=3, num_streams=num_streams)
-    for n in range(out.num_frames):
-        a = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
-        assert np.isfinite(a.astype(np.float32)).all()
+    assert_changes_on_noise(out, noise_16bit, what="DFTTest")
 
 
 # ---------------------------------------------------------------------------
@@ -383,8 +384,7 @@ def test_dfttest_matches_reference_32bit(noise_gray):
     may differ; the per-config tolerance covers ulp-level accumulation (and
     the few pixels that flip across a hard threshold).
     """
-    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "DFTTest"):
-        pytest.skip("no vszipcl.DFTTest reference")
+    reference_or_skip("vszipcl", "DFTTest")
     maxdiffs = _reference_max_diffs()
     for (kwargs, tol), maxdiff in zip(REFERENCE_CASES, maxdiffs):
         assert maxdiff < tol, f"max diff {maxdiff} vs vszipcl for {kwargs}"
@@ -400,16 +400,8 @@ GRAY16_CASES = [kwargs for kwargs, _ in REFERENCE_CASES]
 @pytest.mark.parametrize("kwargs", GRAY16_CASES, ids=lambda kw: str(kw) or "defaults")
 def test_dfttest_matches_reference_16bit(noise_16bit, kwargs):
     """16-bit integer path: at most one code level of rounding difference."""
-    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "DFTTest"):
-        pytest.skip("no vszipcl.DFTTest reference")
-    core = vs.core
-    ref = core.vszipcl.DFTTest(noise_16bit, **kwargs)
-    my = core.vsfeel.DFTTest(noise_16bit, **kwargs)
-    for n in (0, 11, 23):
-        a = _plane(my.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
-        b = _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
-        d = np.abs(a.astype(np.int64) - b.astype(np.int64))
-        assert d.max() <= 1, f"gray16 max diff {d.max()} at frame {n} ({kwargs})"
+    worst = _ref_compare("gray16", kwargs)
+    assert worst <= 1, f"gray16 max diff {worst} ({kwargs})"
 
 
 def test_dfttest_rejects_8bit(noise_8bit):
@@ -449,22 +441,8 @@ def test_dfttest_yuv_passthrough_32bit(noise_gray):
 def test_dfttest_yuv_all_planes_matches_reference_32bit():
     """YUV420 float32 with all planes processed must track vszipcl on every
     plane (incl. subsampled chroma)."""
-    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "DFTTest"):
-        pytest.skip("no vszipcl.DFTTest reference")
-    core = vs.core
-    src = core.bs.VideoSource(NOISE_MKV)
-    yuv = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
-
-    my = _run(yuv, tbsize=1, num_streams=1)
-    ref = core.vszipcl.DFTTest(yuv, tbsize=1)
-    for n in (0, 11, 23):
-        fa, fb = my.get_frame(n), ref.get_frame(n)
-        for p in range(3):
-            d = np.abs(
-                _stride_plane(fa, p).astype(np.float64)
-                - _stride_plane(fb, p).astype(np.float64)
-            )
-            assert d.max() < REF_TOL, f"plane {p} max diff {d.max()} at frame {n}"
+    worst = _ref_compare("yuv32", {"tbsize": 1}, planes=(0, 1, 2))
+    assert worst < REF_TOL, f"max diff {worst}"
 
 
 def test_dfttest_yuv_passthrough_16bit(noise_16bit):
@@ -494,22 +472,8 @@ def test_dfttest_yuv_passthrough_16bit(noise_16bit):
 def test_dfttest_yuv_all_planes_matches_reference_16bit():
     """16-bit mirror of test_dfttest_yuv_all_planes_matches_reference
     (YUV420P16, whole-code comparison; measured <= 1 LSB)."""
-    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "DFTTest"):
-        pytest.skip("no vszipcl.DFTTest reference")
-    core = vs.core
-    src = core.bs.VideoSource(NOISE_MKV)
-    yuv = core.resize.Bicubic(src, format=vs.YUV420P16)
-
-    my = _run(yuv, tbsize=1, num_streams=1)
-    ref = core.vszipcl.DFTTest(yuv, tbsize=1)
-    for n in (0, 11, 23):
-        fa, fb = my.get_frame(n), ref.get_frame(n)
-        for p in range(3):
-            d = np.abs(
-                _stride_plane(fa, p).astype(np.float64)
-                - _stride_plane(fb, p).astype(np.float64)
-            )
-            assert d.max() <= 1.0, f"plane {p} max diff {d.max()} at frame {n}"
+    worst = _ref_compare("yuv420_16", {"tbsize": 1}, planes=(0, 1, 2))
+    assert worst <= 1.0, f"max diff {worst}"
 
 
 # ---------------------------------------------------------------------------

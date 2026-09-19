@@ -557,14 +557,16 @@ struct Nnedi3Spec {
     int32_t width, rows, pad_stride, peak, pscrn, xdim, ydim, nns, qual, use_list;
 };
 
-// Both kernels keep subgroup-uniform control flow (early exits are
-// per-subgroup uniform), so it asks for full subgroups like the reference
-// (REQUIRE_FULL_SUBGROUPS_BIT); the shared helper only sets that flag when the
-// device actually exposes computeFullSubgroups.
+// The cooperative kernels (prescreen, predict) keep subgroup-uniform control
+// flow (early exits are per-subgroup uniform) and run subgroup intrinsics, so
+// they ask for full subgroups like the reference.  pad/assemble/count are
+// plain per-thread kernels; requesting full subgroups for the 32-wide ones
+// would violate VUID-VkPipelineShaderStageCreateInfo-flags-02759 against a
+// 64-lane default subgroup and buys nothing.
 static std::variant<VkPipeline, std::string> create_pipeline(
     const VK_Device & dev, const Nnedi3Spec & spec,
     VkShaderModule module, VkPipelineLayout layout,
-    uint32_t required_subgroup_size = 0) {
+    uint32_t required_subgroup_size = 0, bool full_subgroups = false) {
 
     std::array<VkSpecializationMapEntry, 10> entries {};
     for (uint32_t i = 0; i < 10; ++i) {
@@ -573,7 +575,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
 
     return create_compute_pipeline(dev, module, layout, entries.data(), &spec,
         static_cast<uint32_t>(entries.size()), sizeof(spec), "nnedi3",
-        required_subgroup_size, /*full_subgroups=*/true);
+        required_subgroup_size, full_subgroups);
 }
 
 // Records the per-frame dispatch sequence, pre-recorded once per parity at
@@ -1772,7 +1774,7 @@ static void VS_CC Nnedi3Create(
                 if (d->use_list) {
                     const auto result = create_pipeline(
                         *d->device, spec, d->pre_module, d->pipeline_layout,
-                        pred_subgroup);
+                        pred_subgroup, /*full_subgroups=*/true);
                     if (std::holds_alternative<std::string>(result)) {
                         return set_error(std::get<std::string>(result));
                     }
@@ -1799,7 +1801,7 @@ static void VS_CC Nnedi3Create(
                     }
                     const auto result = create_pipeline(
                         *d->device, spec, mod, d->pipeline_layout,
-                        pred_subgroup);
+                        pred_subgroup, /*full_subgroups=*/true);
                     if (std::holds_alternative<std::string>(result)) {
                         return set_error(std::get<std::string>(result));
                     }

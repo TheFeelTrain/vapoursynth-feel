@@ -23,7 +23,7 @@ import vapoursynth as vs
 
 from conftest import (
     WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, compare_or_skip,
-    frame_to_ndarray, plane_to_ndarray,
+    frame_to_ndarray, plane_to_ndarray, reference_or_skip,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -202,8 +202,7 @@ def _max_diff_vs_reference(fmt: str, sigma: float) -> float:
 @pytest.mark.parametrize("sigma", [0.5, 2.0, 5.0, 10.0])
 def test_gaussblur_matches_reference_small_32bit(noise_gray, sigma):
     """Fused small path (radius <= 32) must be bit-identical to vszipcl."""
-    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
-        pytest.skip("no vszipcl.GaussBlur reference")
+    reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("gray32", sigma)
     assert maxdiff == 0.0, f"small path max diff: {maxdiff}"
 
@@ -212,8 +211,7 @@ def test_gaussblur_matches_reference_small_32bit(noise_gray, sigma):
 def test_gaussblur_matches_reference_path_boundary_32bit(noise_gray, sigma):
     """Sigmas around the fused-small / two-pass transition (radius ~32) must
     be bit-identical on both sides of the switch."""
-    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
-        pytest.skip("no vszipcl.GaussBlur reference")
+    reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("gray32", sigma)
     assert maxdiff == 0.0, f"path boundary max diff: {maxdiff}"
 
@@ -221,8 +219,7 @@ def test_gaussblur_matches_reference_path_boundary_32bit(noise_gray, sigma):
 @pytest.mark.parametrize("sigma", [20.0, 30.0, 40.0, 80.0])
 def test_gaussblur_matches_reference_large_32bit(noise_gray, sigma):
     """Two-pass large path (radius > 32) must be bit-identical to vszipcl."""
-    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
-        pytest.skip("no vszipcl.GaussBlur reference")
+    reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("gray32", sigma)
     assert maxdiff == 0.0, f"large path max diff: {maxdiff}"
 
@@ -233,8 +230,7 @@ def test_gaussblur_matches_reference_16bit(noise_gray, sigma):
     """16-bit integer input must be bit-identical on both code paths — the
     same sigma sweep (small path, transition, large path) as the 32-bit
     tests above."""
-    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
-        pytest.skip("no vszipcl.GaussBlur reference")
+    reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("gray16", sigma)
     assert maxdiff == 0.0, f"gray16 max diff ({sigma}): {maxdiff}"
 
@@ -243,8 +239,7 @@ def test_gaussblur_matches_reference_16bit(noise_gray, sigma):
 def test_gaussblur_matches_reference_yuv_32bit(noise_gray, sigma):
     """YUV420: all three planes (incl. the subsampled chroma defaults) must
     match vszipcl bit-for-bit, on both code paths."""
-    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
-        pytest.skip("no vszipcl.GaussBlur reference")
+    reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("yuv32", sigma)
     assert maxdiff == 0.0, f"yuv32 max diff ({sigma}): {maxdiff}"
 
@@ -253,8 +248,7 @@ def test_gaussblur_matches_reference_yuv_32bit(noise_gray, sigma):
 def test_gaussblur_matches_reference_yuv_16bit(noise_gray, sigma):
     """16-bit YUV420: all three planes must match vszipcl bit-for-bit on both
     code paths (mirror of the 32-bit YUV test)."""
-    if not hasattr(vs.core, "vszipcl") or not hasattr(vs.core.vszipcl, "GaussBlur"):
-        pytest.skip("no vszipcl.GaussBlur reference")
+    reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("yuv16", sigma)
     assert maxdiff == 0.0, f"yuv16 max diff ({sigma}): {maxdiff}"
 

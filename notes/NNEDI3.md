@@ -228,3 +228,12 @@ over-launch refutation; `UPTO`, `SPLITIL`, `NOXFER`, `UPGTT` no longer exist.
   `tests/test_geometry.py` (640/626/610 also 0 codes). Unknown length: `field > 1`
   doubled the `-1` sentinel to `-2`, now guarded with `numFrames > 0` (same fix as
   EEDI3); `field=2/3` still doubles 24 → 48.
+- **Validation-layer defect, fixed:** `VK_LAYER_KHRONOS_validation` flagged two
+  pipeline creations with `VUID-VkPipelineShaderStageCreateInfo-flags-02759` — the
+  32-wide pad and count kernels were given `REQUIRE_FULL_SUBGROUPS_BIT` while the
+  device's default subgroup size is 64, with neither
+  `ALLOW_VARYING_SUBGROUP_SIZE` nor an explicit required size. Only the cooperative
+  kernels (prescreen, predict) run subgroup intrinsics, so `create_pipeline` now
+  takes `full_subgroups` and it is set only for those two; pad/assemble/count are
+  plain per-thread kernels. Covered by `tests/test_validation.py`
+  (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`, fail on `Validation Error`/`VUID`).

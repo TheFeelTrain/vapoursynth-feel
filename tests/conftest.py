@@ -65,6 +65,54 @@ def frame_to_ndarray(frame, dtype=np.float32, plane=0):
     return plane_to_ndarray(frame, plane, dtype)
 
 
+def plane_to_float64(frame, plane):
+    """Visible plane widened to float64 (NaN-safe comparisons)."""
+    return plane_to_ndarray(frame, plane, format_dtype(frame.format)).astype(np.float64)
+
+
+def max_diff(a_node, b_node, planes=None, frames=(0, 11, 23)):
+    """Worst absolute difference between two clips' visible planes.
+
+    Finiteness is asserted on both sides first: Python's ``max(0.0, nan) ==
+    0.0`` makes a bare ``max()`` over the difference report a perfect 0.0 match
+    for any non-finite image, so a NaN would silently pass every comparison.
+    ``planes=None`` means every plane of the frame.
+    """
+    worst = 0.0
+    for n in frames:
+        fa, fb = a_node.get_frame(n), b_node.get_frame(n)
+        sel = range(fa.format.num_planes) if planes is None else planes
+        for p in sel:
+            x, y = plane_to_float64(fa, p), plane_to_float64(fb, p)
+            assert np.isfinite(x).all(), f"non-finite first clip at frame {n} plane {p}"
+            assert np.isfinite(y).all(), f"non-finite second clip at frame {n} plane {p}"
+            worst = max(worst, float(np.abs(x - y).max()))
+    return worst
+
+
+def assert_all_frames_finite(node, frames=None, plane=0):
+    """Every frame's visible plane must be finite (float64 widening)."""
+    frames = range(node.num_frames) if frames is None else frames
+    for n in frames:
+        a = plane_to_float64(node.get_frame(n), plane)
+        assert np.isfinite(a).all(), f"non-finite output at frame {n}"
+
+
+def assert_changes_on_noise(out, src, frames=None, plane=0, what="filter"):
+    """Anti-vacuity: ``out`` must alter ``src`` somewhere.
+
+    A finiteness (or uint16 range) assertion alone passes for an identity
+    filter, so every such test also has to show the filter did something.
+    """
+    frames = range(out.num_frames) if frames is None else frames
+    worst = 0.0
+    for n in frames:
+        d = plane_to_float64(out.get_frame(n), plane) - plane_to_float64(src.get_frame(n), plane)
+        assert np.isfinite(d).all(), f"non-finite difference at frame {n}"
+        worst = max(worst, float(np.abs(d).max()))
+    assert worst > 0.0, f"{what} left the noise input unchanged (identity filter)"
+
+
 # ---------------------------------------------------------------------------
 # Reference-comparison subprocess protocol
 # ---------------------------------------------------------------------------
@@ -82,8 +130,49 @@ def frame_to_ndarray(frame, dtype=np.float32, plane=0):
 # the vsfeel node is constructed or read, and `REF ok` printed at that point.
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--require-references", action="store_true", default=False,
+        help="fail instead of skipping when a reference plugin is unavailable",
+    )
+
+
+# Set by the session fixture below.  A missing reference silently deletes the
+# correctness net, so the default is to skip but this switch makes it loud.
+_REQUIRE_REFERENCES = False
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _configure_references(request):
+    global _REQUIRE_REFERENCES
+    _REQUIRE_REFERENCES = bool(request.config.getoption("--require-references"))
+
+
 class ReferenceUnavailable(RuntimeError):
     """The reference plugin or the reference-side evaluation failed."""
+
+
+def skip_or_fail_reference(reason):
+    """Skip because a reference is unavailable, or fail under
+    ``--require-references`` (which exists to keep a missing reference from
+    silently deleting the correctness net)."""
+    if _REQUIRE_REFERENCES:
+        pytest.fail(f"reference required but unavailable "
+                    f"(--require-references): {reason}")
+    pytest.skip(reason)
+
+
+def reference_or_skip(plugin, func=None):
+    """Return ``core.<plugin>`` (or ``core.<plugin>.<func>``).
+
+    Skips when the reference plugin is not installed; with
+    ``--require-references`` the absence is a failure instead.
+    """
+    ref = getattr(vs.core, plugin, None)
+    name = plugin if func is None else f"{plugin}.{func}"
+    if ref is not None and (func is None or hasattr(ref, func)):
+        return ref
+    skip_or_fail_reference(f"no {name} reference plugin")
 
 
 _REF_OK = "REF ok"
@@ -195,7 +284,7 @@ def compare_or_skip(code, argv=(), timeout=600.0):
     try:
         return run_compare_subprocess(code, argv, timeout)
     except ReferenceUnavailable as exc:
-        pytest.skip("reference unavailable: %s" % exc)
+        skip_or_fail_reference(f"reference unavailable: {exc}")
 
 
 # Inline prelude for the compare scripts (they run under ``python -c`` and
@@ -223,6 +312,166 @@ def read_plane(frame, plane, dtype):
         shape=(h, frame.get_stride(plane)))
     return raw[:, :w * dt.itemsize].copy().view(dt).reshape(h, w)
 '''
+
+
+# ---------------------------------------------------------------------------
+# Generic one-case reference comparison
+# ---------------------------------------------------------------------------
+#
+# Reference plugins are crash-prone, so every reference comparison runs in a
+# subprocess (see the protocol above).  A test describes its case with
+# :func:`reference_spec` and calls :func:`reference_compare`; the script below
+# builds the clip, materialises the reference before touching vsfeel, then
+# compares the requested frames/planes.
+
+REFERENCE_SCRIPT = COMPARE_PRELUDE + r'''
+import json
+import sys
+import vapoursynth as vs
+
+core = vs.core
+
+
+def build_clip(spec):
+    src = core.bs.VideoSource(spec["source"])
+    gray = lambda: core.std.ShufflePlanes(src, 0, vs.GRAY)
+    kind = spec["clip"]
+    if kind == "gray8":
+        clip = gray()
+    elif kind == "gray16":
+        clip = core.fmtc.bitdepth(gray(), bits=16, fulls=True, fulld=True)
+    elif kind == "gray32":
+        clip = core.fmtc.bitdepth(gray(), bits=32, fulls=True, fulld=True)
+    elif kind == "yuv16":
+        clip = core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
+    elif kind == "yuv32":
+        clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
+    elif kind == "yuv420_16":
+        clip = core.resize.Bicubic(src, format=vs.YUV420P16)
+    elif kind == "yuv444_16":
+        clip = core.resize.Bicubic(src, format=vs.YUV444P16)
+    elif kind == "rgb32":
+        clip = core.resize.Bicubic(src, format=vs.RGBS, matrix_in_s="709")
+    elif kind == "rgb16":
+        clip = core.resize.Bicubic(src, format=vs.RGB48, matrix_in_s="709")
+    else:
+        raise SystemExit("bad clip kind %r" % kind)
+    if spec.get("crop"):
+        clip = core.std.Crop(clip, **spec["crop"])
+    return clip
+
+
+def build_guide(clip, spec):
+    kind = (spec or {}).get("kind", "none")
+    if kind == "none":
+        return None
+    if kind == "same":
+        return clip
+    if kind == "flipvertical":
+        return core.std.FlipVertical(clip)
+    if kind == "boxblur":
+        return core.std.BoxBlur(clip, hradius=spec.get("hradius", 5),
+                                vradius=spec.get("vradius", 5))
+    if kind == "resize":
+        return core.resize.Bicubic(clip, width=clip.width, height=clip.height,
+                                   format=clip.format)
+    raise SystemExit("bad guide kind %r" % kind)
+
+
+spec = json.loads(sys.argv[1])
+clip = build_clip(spec)
+guide = build_guide(clip, spec.get("guide"))
+frames = spec.get("frames", [0, 11, 23])
+dt = np.float32 if clip.format.sample_type == vs.FLOAT else np.uint16
+planes = spec.get("planes") or list(range(clip.format.num_planes))
+kwargs = dict(spec.get("kwargs") or {})
+if guide is not None:
+    kwargs[spec.get("guide_kwarg", "ref")] = guide
+
+ref_func = getattr(getattr(core, spec["plugin"], None), spec["filter"], None)
+
+# --- reference phase: materialise and copy before touching vsfeel ---
+try:
+    if ref_func is None:
+        raise RuntimeError("no %s.%s reference" % (spec["plugin"], spec["filter"]))
+    ref_node = ref_func(clip, **kwargs)
+    ref_frames = [[read_plane(ref_node.get_frame(n), p, dt) for p in planes]
+                  for n in frames]
+except Exception as exc:
+    print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
+    raise SystemExit(2)
+print("REF ok", flush=True)
+
+# --- vsfeel phase ---
+try:
+    my_node = getattr(core.vsfeel, spec.get("vsfeel_filter", spec["filter"]))(clip, **kwargs)
+    maxdiff = 0.0
+    ndiff = 0
+    total = 0
+    for n, ref_planes in zip(frames, ref_frames):
+        frame = my_node.get_frame(n)
+        for p, b in zip(planes, ref_planes):
+            a = read_plane(frame, p, dt)
+            if not (np.isfinite(a.astype(np.float64)).all()
+                    and np.isfinite(b.astype(np.float64)).all()):
+                print("VSFEEL fail: non-finite at frame %d plane %d" % (n, p), flush=True)
+                raise SystemExit(3)
+            d = np.abs(a.astype(np.float64) - b.astype(np.float64))
+            maxdiff = max(maxdiff, float(d.max()))
+            ndiff += int((d > 0).sum())
+            total += int(d.size)
+except SystemExit:
+    raise
+except Exception as exc:
+    print("VSFEEL fail: %s: %s" % (type(exc).__name__, exc), flush=True)
+    raise SystemExit(3)
+print("RESULT " + json.dumps({
+    "maxdiff": maxdiff,
+    "ndiff_frac": (ndiff / total) if total else 0.0,
+    "width": my_node.width,
+    "height": my_node.height,
+    "num_frames": my_node.num_frames,
+}), flush=True)
+'''
+
+
+def reference_spec(plugin, filter, clip, frames=(0, 11, 23), planes=None,
+                   kwargs=None, guide=None, guide_kwarg="ref", crop=None,
+                   vsfeel_filter=None):
+    """Build the JSON spec consumed by :data:`REFERENCE_SCRIPT`.
+
+    ``clip`` names the input format ("gray32", "gray16", "yuv420_16", ...);
+    ``guide`` is a JSONable description of the joint-filter clip, if any.
+    """
+    spec = {
+        "source": NOISE_MKV,
+        "clip": clip,
+        "plugin": plugin,
+        "filter": filter,
+        "frames": list(frames),
+        "kwargs": dict(kwargs or {}),
+    }
+    if planes is not None:
+        spec["planes"] = list(planes)
+    if crop is not None:
+        spec["crop"] = dict(crop)
+    if guide is not None:
+        spec["guide"] = dict(guide)
+        spec["guide_kwarg"] = guide_kwarg
+    if vsfeel_filter is not None:
+        spec["vsfeel_filter"] = vsfeel_filter
+    return spec
+
+
+def reference_compare(spec, timeout=600.0):
+    """Run one reference-vs-vsfeel comparison in a subprocess.
+
+    Returns the RESULT payload: ``maxdiff``, ``ndiff_frac`` and the vsfeel
+    output geometry.  A missing/crashing reference skips (or fails under
+    ``--require-references``); a vsfeel crash, timeout or non-finite result
+    fails with the captured subprocess tail.
+    """
+    return compare_or_skip(REFERENCE_SCRIPT, [json.dumps(spec)], timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
