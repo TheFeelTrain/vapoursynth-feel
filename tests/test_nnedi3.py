@@ -20,15 +20,14 @@ Self-consistency (determinism across runs, multi-stream == single) is exact.
 Run from the repository root:  python -m pytest tests/test_nnedi3.py
 """
 
-import threading
-
 import numpy as np
 import pytest
 import vapoursynth as vs
 
 from conftest import (
-    WIDTH, HEIGHT, NOISE_MKV, plane_to_ndarray, reference_compare,
-    reference_or_skip, reference_spec,
+    WIDTH, HEIGHT, NOISE_MKV, assert_changes_on_noise,
+    assert_preserves_frame_props, eval_parallel, frame_to_ndarray,
+    plane as _plane, reference_compare, reference_or_skip, reference_spec,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -55,20 +54,6 @@ def _ref_compare(fmt, frames, params, planes=None):
     spec = reference_spec("nnedi3vk", "NNEDI3", fmt, frames=frames,
                           planes=planes, kwargs=params)
     return reference_compare(spec)
-
-
-def _plane_u16(frame, plane, width, height):
-    """Stride-aware, copying uint16 plane read (geometry from the frame)."""
-    return plane_to_ndarray(frame, plane, np.uint16)
-
-
-def _max_diff_u16(a, b, plane, width, height, frames):
-    md = 0
-    for n in frames:
-        pa = _plane_u16(a.get_frame(n), plane, width, height)
-        pb = _plane_u16(b.get_frame(n), plane, width, height)
-        md = max(md, int(np.abs(pa.astype(np.int32) - pb.astype(np.int32)).max()))
-    return md
 
 
 # ---------------------------------------------------------------------------
@@ -172,10 +157,9 @@ def test_nnedi3_deterministic(noise_gray, noise_16bit, bits):
     for n in (0, 11, 23):
         fa, fb = a.get_frame(n), b.get_frame(n)
         if bits == 16:
-            d = _plane_u16(fa, 0, WIDTH, HEIGHT).astype(np.int32) - \
-                _plane_u16(fb, 0, WIDTH, HEIGHT).astype(np.int32)
+            d = _plane(fa, 0, WIDTH, HEIGHT).astype(np.int32) - \
+                _plane(fb, 0, WIDTH, HEIGHT).astype(np.int32)
         else:
-            from conftest import frame_to_ndarray
             d = frame_to_ndarray(fa) - frame_to_ndarray(fb)
         assert np.abs(d).max() == 0, f"nondeterministic output at frame {n}"
 
@@ -188,28 +172,16 @@ def test_nnedi3_multi_stream_matches_single(noise_gray, noise_16bit, bits):
     for n in (0, 11, 23):
         fa, fb = a.get_frame(n), b.get_frame(n)
         if bits == 16:
-            d = _plane_u16(fa, 0, WIDTH, HEIGHT).astype(np.int32) - \
-                _plane_u16(fb, 0, WIDTH, HEIGHT).astype(np.int32)
+            d = _plane(fa, 0, WIDTH, HEIGHT).astype(np.int32) - \
+                _plane(fb, 0, WIDTH, HEIGHT).astype(np.int32)
         else:
-            from conftest import frame_to_ndarray
             d = frame_to_ndarray(fa) - frame_to_ndarray(fb)
         assert np.abs(d).max() == 0, f"stream-count divergence at frame {n}"
 
 
 def test_nnedi3_parallel_load_consistent(noise_16bit):
-    out = _run(noise_16bit, num_streams=4)
-    expect = _plane_u16(_run(noise_16bit, num_streams=1).get_frame(5), 0, WIDTH, HEIGHT)
-    got = [None] * out.num_frames
-
-    def worker(n):
-        got[n] = _plane_u16(out.get_frame(n), 0, WIDTH, HEIGHT)
-
-    threads = [threading.Thread(target=worker, args=(n,)) for n in range(out.num_frames)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert all(f is not None for f in got)
+    expect = _plane(_run(noise_16bit, num_streams=1).get_frame(5), 0)
+    got = eval_parallel(_run, noise_16bit, num_streams=4)
     assert np.abs(got[5].astype(np.int32) - expect.astype(np.int32)).max() == 0
 
 
@@ -241,9 +213,25 @@ def test_nnedi3_kept_lines_copied(noise_16bit):
     Progressive content with field=1 keeps parity 0 (even output lines)."""
     out = _run(noise_16bit, field=1)
     for n in (0, 7):
-        s = _plane_u16(noise_16bit.get_frame(n), 0, WIDTH, HEIGHT)
-        o = _plane_u16(out.get_frame(n), 0, WIDTH, HEIGHT)
+        s = _plane(noise_16bit.get_frame(n), 0, WIDTH, HEIGHT)
+        o = _plane(out.get_frame(n), 0, WIDTH, HEIGHT)
         assert np.abs(o[0::2].astype(np.int32) - s[0::2].astype(np.int32)).max() == 0
+
+
+def test_nnedi3_changes_noise_16bit(noise_16bit):
+    """The interpolated rows must actually alter the noise input.
+
+    ``isfinite(uint16)`` cannot fail and the reference comparison skips when
+    nnedi3vk is absent, so this is the invariant that fails for an identity
+    implementation.
+    """
+    out = _run(noise_16bit, field=1)
+    assert_changes_on_noise(out, noise_16bit, what="NNEDI3")
+
+
+def test_nnedi3_preserves_frame_props(noise_16bit):
+    """field=1 keeps the duration while tagging the output progressive."""
+    assert_preserves_frame_props(_run, noise_16bit, field=1, num_streams=1)
 
 
 # ---------------------------------------------------------------------------

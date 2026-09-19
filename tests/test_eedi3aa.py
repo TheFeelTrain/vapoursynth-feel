@@ -30,14 +30,14 @@ parallel load) is exact. The chain's props (N frames, input fps,
 Run from the repository root:  python -m pytest tests/test_eedi3aa.py
 """
 
-import threading
-
 import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import WIDTH, HEIGHT, NOISE_MKV
-from test_eedi3 import _plane, _dtype
+from conftest import (
+    WIDTH, HEIGHT, NOISE_MKV, assert_preserves_frame_props,
+    dtype_for_bits as _dtype, eval_parallel, half_mask as _mask, plane as _plane,
+)
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
@@ -92,41 +92,6 @@ def _interleave2(clip):
 def _interleave_distinct(clip):
     """A 2N-frame sclip whose two sub-frames do not alias."""
     return vs.core.std.Interleave([clip, clip.std.Invert()])
-
-
-def _mask(clip, bits, left_white=True):
-    """Half-white / half-black Gray mask at `bits`, at the clip's geometry."""
-    half = clip.width // 2
-    white = vs.core.std.BlankClip(
-        format=vs.GRAY8, width=half, height=clip.height,
-        length=clip.num_frames, color=[255 if left_white else 0])
-    black = vs.core.std.BlankClip(
-        format=vs.GRAY8, width=clip.width - half, height=clip.height,
-        length=clip.num_frames, color=[0 if left_white else 255])
-    m8 = vs.core.std.StackHorizontal([white, black])
-    if bits == 8:
-        return m8
-    return vs.core.fmtc.bitdepth(m8, bits=bits, fulls=True, fulld=True)
-
-
-def _eval_parallel(clip, field=3, num_streams=4, **kwargs):
-    """Materialise every frame concurrently to exercise the multi-stream path."""
-    out = _aa(clip, field=field, num_streams=num_streams, **kwargs)
-    frames = [None] * out.num_frames
-    bits = 16 if clip.format.sample_type == vs.INTEGER else 32
-    dtype = _dtype(bits)
-
-    def worker(n):
-        frames[n] = _plane(out.get_frame(n), 0, out.width, out.height, dtype)
-
-    threads = [threading.Thread(target=worker, args=(n,))
-               for n in range(out.num_frames)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert all(f is not None for f in frames)
-    return frames
 
 
 # ---------------------------------------------------------------------------
@@ -320,8 +285,8 @@ def test_eedi3aa_parallel_load_consistent(noise_16bit):
     clip = noise_16bit
     kw = dict(sclip=_interleave2(clip), mclip=_mask(clip, 16),
               vcheck=2, mdis=5, nrad=1)
-    a = _eval_parallel(clip, num_streams=4, **kw)
-    b = _eval_parallel(clip, num_streams=4, **kw)
+    a = eval_parallel(_aa, clip, num_streams=4, **kw)
+    b = eval_parallel(_aa, clip, num_streams=4, **kw)
     ref = _aa(clip, num_streams=1, **kw)
     for n in range(clip.num_frames):
         r = _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
@@ -357,6 +322,13 @@ def test_eedi3aa_props_match_chain(noise_16bit):
         assert pm.get("_FieldBased") == pr.get("_FieldBased")
         assert pm.get("_DurationNum") == pr.get("_DurationNum")
         assert pm.get("_DurationDen") == pr.get("_DurationDen")
+
+
+def test_eedi3aa_preserves_frame_props(noise_gray):
+    """field=3 halves the duration (fps doubles) but must keep every other tag."""
+    assert_preserves_frame_props(
+        _aa, noise_gray, field=3, duration_factor=2, num_streams=1,
+        sclip=_interleave2(noise_gray))
 
 
 # ---------------------------------------------------------------------------

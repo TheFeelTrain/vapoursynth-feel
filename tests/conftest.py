@@ -1,8 +1,11 @@
 import ctypes
 import json
+import math
 import os
 import subprocess
 import sys
+import threading
+import time
 
 import numpy as np
 import pytest
@@ -41,6 +44,11 @@ def format_dtype(fmt):
     return np.float32 if fmt.sample_type == vs.FLOAT else np.uint16
 
 
+def dtype_for_bits(bits):
+    """Numpy dtype for ``bits``-bit integer output (any non-16 -> float32)."""
+    return np.uint16 if bits == 16 else np.float32
+
+
 def plane_to_ndarray(frame, plane, dtype=np.float32):
     """Copy one *visible* plane of a VapourSynth frame into a fresh ndarray.
 
@@ -58,6 +66,19 @@ def plane_to_ndarray(frame, plane, dtype=np.float32):
         shape=(h, stride),
     )
     return raw[:, : w * dt.itemsize].copy().view(dt).reshape(h, w)
+
+
+def plane(frame, plane, width=None, height=None, dtype=None):
+    """Stride-aware, copying plane read for test call sites.
+
+    The visible geometry is derived from the frame, so ``width``/``height`` are
+    accepted for call-site compatibility and ignored. ``dtype=None`` reads the
+    frame's native sample type (float32 or uint16); pass one explicitly to
+    reinterpret, e.g. ``np.uint16`` for whole-code integer comparisons.
+    """
+    if dtype is None:
+        dtype = format_dtype(frame.format)
+    return plane_to_ndarray(frame, plane, dtype)
 
 
 def frame_to_ndarray(frame, dtype=np.float32, plane=0):
@@ -111,6 +132,57 @@ def assert_changes_on_noise(out, src, frames=None, plane=0, what="filter"):
         assert np.isfinite(d).all(), f"non-finite difference at frame {n}"
         worst = max(worst, float(np.abs(d).max()))
     assert worst > 0.0, f"{what} left the noise input unchanged (identity filter)"
+
+
+def eval_parallel(filter_func, clip, plane=0, dtype=None, timeout=180.0, **kwargs):
+    """Evaluate every frame of a filter node concurrently, the way vspipe does.
+
+    Sequential ``get_frame`` calls keep at most one frame in flight, so the
+    pipelined multi-stream path (parallel ``arAllFramesReady`` invocations,
+    reused command buffers and fences across streams) is never exercised.
+    Requesting all frames from worker threads at once forces the deep pipeline
+    and with it the cross-stream synchronization.
+
+    ``filter_func`` is the module's ``_run`` builder and ``kwargs`` its
+    arguments. The join waits at most ``timeout`` in total; a filter that
+    deadlocks fails the test with the number of stuck workers instead of
+    hanging the suite, and a worker exception is re-reported rather than
+    swallowed.
+    """
+    node = filter_func(clip, **kwargs)
+    frames = [None] * node.num_frames
+    errors = []
+
+    def worker(n):
+        try:
+            frames[n] = plane_to_ndarray(
+                node.get_frame(n), plane,
+                format_dtype(node.format) if dtype is None else dtype)
+        except BaseException as exc:  # reported below; must not die silently
+            errors.append(f"frame {n}: {type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=worker, args=(n,), daemon=True)
+               for n in range(node.num_frames)]
+    deadline = time.monotonic() + timeout
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    hung = sum(1 for t in threads if t.is_alive())
+    assert not errors, f"parallel load failed: {'; '.join(errors[:4])}"
+    assert hung == 0, (
+        f"parallel load deadlocked: {hung}/{len(threads)} workers still alive "
+        f"after {timeout:g}s")
+    assert all(f is not None for f in frames)
+    return frames
+
+
+def check_all_frames_finite(filter_func, clip, **kwargs):
+    """Run a filter and assert every frame is finite Gray32 output."""
+    out = filter_func(clip, **kwargs)
+    assert_gray32(out)
+    assert_all_frames_finite(out)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +668,73 @@ def assert_temporal_order_consistent(filter_name, params, tol=1e-5,
 
 
 # ---------------------------------------------------------------------------
+# Mask clips and frame-property preservation
+# ---------------------------------------------------------------------------
+#
+# Mask builders were duplicated across the EEDI3 family; both take the mask
+# clip's geometry from an argument because mclip is built at the *destination*
+# geometry (EEDI3H transposes, so its mask is built at the source height).
+
+def right_half_mask(width, height, length, bits):
+    """Gray mask clip: white left half, black right half (drives mclip)."""
+    half = width // 2
+    black = vs.core.std.BlankClip(format=vs.GRAY8, width=half, height=height,
+                                  length=length, color=[0])
+    white = vs.core.std.BlankClip(format=vs.GRAY8, width=half, height=height,
+                                  length=length, color=[255])
+    mask8 = vs.core.std.StackHorizontal([white, black])
+    return vs.core.fmtc.bitdepth(mask8, bits=bits, fulls=True, fulld=True)
+
+
+def half_mask(clip, bits, left_white=True):
+    """Half-white / half-black Gray mask at ``bits``, at ``clip``'s geometry."""
+    half = clip.width // 2
+    white = vs.core.std.BlankClip(
+        format=vs.GRAY8, width=half, height=clip.height,
+        length=clip.num_frames, color=[255 if left_white else 0])
+    black = vs.core.std.BlankClip(
+        format=vs.GRAY8, width=clip.width - half, height=clip.height,
+        length=clip.num_frames, color=[0 if left_white else 255])
+    m8 = vs.core.std.StackHorizontal([white, black])
+    if bits == 8:
+        return m8
+    return vs.core.fmtc.bitdepth(m8, bits=bits, fulls=True, fulld=True)
+
+
+# Tags an output frame must carry through from the source frame. ``_Range`` is
+# the surviving equivalent of the deprecated ``_ColorRange`` (remapped by
+# SetFrameProps); ``MyTag`` covers arbitrary application metadata.
+PROP_TAGS = {"_DurationNum": 1001, "_DurationDen": 24000, "_Range": 0,
+             "MyTag": 7}
+
+
+def assert_preserves_frame_props(filter_func, clip, frames=(0, 11, 23),
+                                 duration_factor=1, **kwargs):
+    """The output must republish the source frame's properties, tag for tag.
+
+    ``duration_factor`` divides the source duration, matching the reference
+    convention for a filter that doubles its frame rate (``muldivRational(num,
+    den, 1, factor)``); it defaults to 1 for filters that keep the frame rate.
+    """
+    tags = dict(PROP_TAGS)
+    if duration_factor != 1:
+        num, den = tags["_DurationNum"], tags["_DurationDen"] * duration_factor
+        g = math.gcd(num, den)
+        tags["_DurationNum"], tags["_DurationDen"] = num // g, den // g
+    tagged = vs.core.std.SetFrameProps(clip, **tags)
+    out = filter_func(tagged, **kwargs)
+    for n in frames:
+        props = out.get_frame(n).props
+        for key, want in tags.items():
+            got = props.get(key)
+            assert got is not None, f"{key} lost at frame {n}"
+            if key == "_Range":
+                assert int(got) == want, f"_Range changed at frame {n}: {got}"
+            else:
+                assert got == want, f"{key} changed at frame {n}: {got}"
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
@@ -620,6 +759,42 @@ def noise_16bit():
     src = _source(NOISE_MKV)
     y = vs.core.std.ShufflePlanes(src, 0, vs.GRAY)
     return vs.core.fmtc.bitdepth(y, bits=16, fulls=True, fulld=True)
+
+
+def _resized(fmt, **kwargs):
+    return vs.core.resize.Bicubic(_source(NOISE_MKV), format=fmt, **kwargs)
+
+
+@pytest.fixture(scope="session")
+def noise_yuv32():
+    """YUV420PS (float32) version of the noise clip (chroma is subsampled)."""
+    return vs.core.fmtc.bitdepth(_source(NOISE_MKV), bits=32, fulls=True,
+                                 fulld=True)
+
+
+@pytest.fixture(scope="session")
+def noise_yuv420_16():
+    """YUV420P16 version (subsampled chroma lattice, for the 16-bit 'UV'
+    sweep)."""
+    return _resized(vs.YUV420P16)
+
+
+@pytest.fixture(scope="session")
+def noise_yuv444_16():
+    """YUV444P16 version (for joint 'YUV' processing)."""
+    return _resized(vs.YUV444P16)
+
+
+@pytest.fixture(scope="session")
+def noise_rgb32():
+    """RGBS version of the noise clip."""
+    return _resized(vs.RGBS, matrix_in_s="709")
+
+
+@pytest.fixture(scope="session")
+def noise_rgb16():
+    """RGB48 (16-bit integer) version of the noise clip."""
+    return _resized(vs.RGB48, matrix_in_s="709")
 
 
 def assert_gray32(clip):

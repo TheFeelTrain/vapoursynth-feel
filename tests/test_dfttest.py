@@ -23,7 +23,6 @@ import shutil
 import subprocess
 import sys
 import textwrap
-import threading
 from pathlib import Path
 
 import numpy as np
@@ -31,10 +30,10 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_all_frames_finite,
-    assert_changes_on_noise, assert_gray32, assert_temporal_order_consistent,
-    compare_or_skip, frame_to_ndarray, plane_to_ndarray, reference_compare,
-    reference_or_skip, reference_spec,
+    WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_changes_on_noise,
+    assert_preserves_frame_props, assert_temporal_order_consistent,
+    check_all_frames_finite, compare_or_skip, eval_parallel, frame_to_ndarray,
+    plane as _plane, reference_compare, reference_or_skip, reference_spec,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -47,37 +46,6 @@ def _run(clip, tbsize=3, num_streams=1, **kwargs):
         num_streams=num_streams,
         **kwargs,
     )
-
-
-from numpy.typing import DTypeLike
-
-
-def _plane(frame, plane, width, height, dtype: DTypeLike = np.float32):
-    """Stride-aware, copying plane read (geometry derived from the frame)."""
-    return plane_to_ndarray(frame, plane, dtype)
-
-
-def _eval_parallel(clip, dtype=np.float32, **kwargs):
-    """Evaluate every frame concurrently to exercise the multi-stream path."""
-    out = _run(clip, **kwargs)
-    frames = [None] * out.num_frames
-
-    def worker(n):
-        frames[n] = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, dtype)
-
-    threads = [threading.Thread(target=worker, args=(n,)) for n in range(out.num_frames)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert all(f is not None for f in frames)
-    return frames
-
-
-def _check_all_frames_finite(clip, **kwargs):
-    out = _run(clip, **kwargs)
-    assert_gray32(out)
-    assert_all_frames_finite(out)
 
 
 def _ref_compare(fmt, params, frames=(0, 11, 23), planes=None):
@@ -109,12 +77,17 @@ def test_dfttest_multi_stream_matches_single_32bit(noise_gray):
         assert np.abs(d).max() < 1e-6, f"num_streams mismatch at frame {n}"
 
 
+def test_dfttest_preserves_frame_props(noise_gray):
+    """The temporal cache must republish the source frame's properties."""
+    assert_preserves_frame_props(_run, noise_gray, tbsize=3, num_streams=1)
+
+
 def test_dfttest_parallel_load_consistent_32bit(noise_gray):
     """Two parallel num_streams=4 runs must match the serial path, and each
     other — the request pattern that exposes stale descriptor bindings,
     fence misuse and command-pool reuse violations under load."""
-    a = _eval_parallel(noise_gray, num_streams=4)
-    b = _eval_parallel(noise_gray, num_streams=4)
+    a = eval_parallel(_run, noise_gray, num_streams=4)
+    b = eval_parallel(_run, noise_gray, num_streams=4)
     ref = _run(noise_gray, num_streams=1)
     for n in range(noise_gray.num_frames):
         r = frame_to_ndarray(ref.get_frame(n))
@@ -144,8 +117,8 @@ def test_dfttest_multi_stream_matches_single_16bit(noise_16bit):
 
 def test_dfttest_parallel_load_consistent_16bit(noise_16bit):
     """16-bit mirror of test_dfttest_parallel_load_consistent."""
-    a = _eval_parallel(noise_16bit, dtype=np.uint16, num_streams=4)
-    b = _eval_parallel(noise_16bit, dtype=np.uint16, num_streams=4)
+    a = eval_parallel(_run, noise_16bit, dtype=np.uint16, num_streams=4)
+    b = eval_parallel(_run, noise_16bit, dtype=np.uint16, num_streams=4)
     ref = _run(noise_16bit, num_streams=1)
     for n in range(noise_16bit.num_frames):
         r = _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
@@ -281,12 +254,12 @@ def test_dfttest_short_clip_temporal_window(nframes):
 
 @pytest.mark.parametrize("tbsize", [1, 3, 5, 7])
 def test_dfttest_no_nan_all_frames_32bit(noise_gray, tbsize):
-    _check_all_frames_finite(noise_gray, tbsize=tbsize, num_streams=1)
+    check_all_frames_finite(_run, noise_gray, tbsize=tbsize, num_streams=1)
 
 
 @pytest.mark.parametrize("num_streams", [2, 4])
 def test_dfttest_no_nan_all_frames_multi_stream_32bit(noise_gray, num_streams):
-    _check_all_frames_finite(noise_gray, tbsize=3, num_streams=num_streams)
+    check_all_frames_finite(_run, noise_gray, tbsize=3, num_streams=num_streams)
 
 
 @pytest.mark.parametrize("tbsize", [1, 3, 5, 7])

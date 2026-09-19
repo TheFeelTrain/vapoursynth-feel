@@ -29,13 +29,11 @@ the multi-stream comparison in ``test_bm3dv2.py``.
 Run from the repository root:  python -m pytest tests/test_streams.py
 """
 
-import threading
-
 import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import format_dtype, plane_to_ndarray
+from conftest import eval_parallel, format_dtype, plane_to_ndarray
 
 STREAM_COUNTS = (1, 3, 4, 6, 8, 16, 32)
 TINY_SIZE = 64
@@ -111,34 +109,6 @@ def stream_clips(noise_gray):
     return {"noise24": noise_gray, "tiny": tiny}
 
 
-def _request_all(node, dtype):
-    """Request every frame concurrently, the way vspipe drives the filter.
-
-    Worker exceptions are collected and re-raised on the main thread: a
-    failure (or a filter-side crash) must fail the test rather than leave a
-    ``None`` slot behind.
-    """
-    frames = [None] * node.num_frames
-    errors = []
-
-    def work(n):
-        try:
-            frames[n] = plane_to_ndarray(node.get_frame(n), 0, dtype)
-        except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
-            errors.append((n, exc))
-
-    threads = [threading.Thread(target=work, args=(n,))
-               for n in range(node.num_frames)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    if errors:
-        raise AssertionError(
-            "frame request failed at frame %d: %r" % (errors[0][0], errors[0][1]))
-    return frames
-
-
 @pytest.mark.parametrize("clip_name", ("noise24", "tiny"))
 @pytest.mark.parametrize("name,build", CASES)
 def test_num_streams_matches_serial(stream_clips, name, build, clip_name):
@@ -156,7 +126,8 @@ def test_num_streams_matches_serial(stream_clips, name, build, clip_name):
 
     bad = []
     for num_streams in STREAM_COUNTS:
-        out = _request_all(build(clip, num_streams), dtype)
+        out = eval_parallel(build, clip, num_streams=num_streams,
+                            dtype=dtype)
         differing = [n for n in range(clip.num_frames)
                      if not np.array_equal(ref[n], out[n])]
         if differing:

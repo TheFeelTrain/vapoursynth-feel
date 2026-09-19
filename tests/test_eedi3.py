@@ -36,7 +36,6 @@ import os
 import subprocess
 import sys
 import textwrap
-import threading
 from pathlib import Path
 
 import numpy as np
@@ -44,8 +43,9 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, compare_or_skip,
-    format_dtype, frame_to_ndarray, plane_to_ndarray, reference_or_skip,
+    WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_preserves_frame_props,
+    compare_or_skip, dtype_for_bits as _dtype, eval_parallel, frame_to_ndarray,
+    plane as _plane, reference_or_skip, right_half_mask,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -64,16 +64,6 @@ def _run(clip, field=1, num_streams=1, **kwargs):
     )
 
 
-def _plane(frame, plane, width, height, dtype=np.float32):
-    """Stride-aware, copying plane read (geometry derived from the frame)."""
-    return plane_to_ndarray(frame, plane, dtype)
-
-
-def _stride_plane(frame, plane):
-    """Copy any plane into an ndarray, honouring the row pitch."""
-    return plane_to_ndarray(frame, plane, format_dtype(frame.format))
-
-
 def _interp_rows(h, n, field):
     """Boolean row mask of the interpolated rows of output frame n.
 
@@ -87,42 +77,8 @@ def _interp_rows(h, n, field):
     return rows
 
 
-def _dtype(bits):
-    return np.uint16 if bits == 16 else np.float32
-
-
 def _itemsize(bits):
     return np.dtype(_dtype(bits)).itemsize
-
-
-def _eval_parallel(clip, field=1, num_streams=4, **kwargs):
-    """Evaluate every frame concurrently to exercise the multi-stream path."""
-    out = _run(clip, field=field, num_streams=num_streams, **kwargs)
-    frames = [None] * out.num_frames
-    bits = 16 if clip.format.sample_type == vs.INTEGER else 32
-    dtype = _dtype(bits)
-
-    def worker(n):
-        frames[n] = _plane(out.get_frame(n), 0, out.width, out.height, dtype)
-
-    threads = [threading.Thread(target=worker, args=(n,)) for n in range(out.num_frames)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert all(f is not None for f in frames)
-    return frames
-
-
-def _right_half_mask(width, height, length, bits):
-    """Gray mask clip: white left half, black right half (drives mclip)."""
-    half = width // 2
-    black = vs.core.std.BlankClip(format=vs.GRAY8, width=half, height=height,
-                                  length=length, color=[0])
-    white = vs.core.std.BlankClip(format=vs.GRAY8, width=half, height=height,
-                                  length=length, color=[255])
-    mask8 = vs.core.std.StackHorizontal([white, black])
-    return vs.core.fmtc.bitdepth(mask8, bits=bits, fulls=True, fulld=True)
 
 
 # ---------------------------------------------------------------------------
@@ -279,8 +235,8 @@ def test_eedi3_parallel_load_consistent(noise_gray, noise_16bit, bits):
     other — the request pattern that exposes stale descriptor bindings, fence
     misuse and command-pool reuse violations under load."""
     clip = noise_16bit if bits == 16 else noise_gray
-    a = _eval_parallel(clip, num_streams=4)
-    b = _eval_parallel(clip, num_streams=4)
+    a = eval_parallel(_run, clip, num_streams=4)
+    b = eval_parallel(_run, clip, num_streams=4)
     ref = _run(clip, num_streams=1)
     dtype = _dtype(bits)
     for n in range(clip.num_frames):
@@ -293,6 +249,15 @@ def test_eedi3_parallel_load_consistent(noise_gray, noise_16bit, bits):
             assert np.abs(a[n] - r).max() < 1e-6, f"parallel 1/serial mismatch at frame {n}"
             assert np.abs(b[n] - r).max() < 1e-6, f"parallel 2/serial mismatch at frame {n}"
             assert np.abs(a[n] - b[n]).max() < 1e-6, f"nondeterministic output at frame {n}"
+
+
+def test_eedi3_preserves_frame_props(noise_gray):
+    """field=1 (no frame doubling) must keep every source property.
+
+    ``_FieldBased`` is set to progressive by the filter; the tagged duration
+    and custom metadata must survive unchanged.
+    """
+    assert_preserves_frame_props(_run, noise_gray, field=1, num_streams=1)
 
 
 # ---------------------------------------------------------------------------
@@ -517,9 +482,9 @@ def test_eedi3_mclip_auto_converts_gray16_gray32(noise_gray, noise_16bit):
     give the same result as an explicit Gray8 mask."""
     clip = noise_16bit
     kw = dict(field=1, mdis=20, nrad=3, vcheck=2)
-    m8 = _right_half_mask(WIDTH, HEIGHT, clip.num_frames, 8)
-    m16 = _right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
-    m32 = _right_half_mask(WIDTH, HEIGHT, clip.num_frames, 32)
+    m8 = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 8)
+    m16 = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
+    m32 = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 32)
     base = _run(clip, mclip=m8, **kw)
     for m in (m16, m32):
         o = _run(clip, mclip=m, **kw)
@@ -652,7 +617,7 @@ def test_eedi3_mclip_masked_region_is_vertical_cubic(noise_16bit):
     four taps are interior."""
     clip = noise_16bit
     kw = dict(field=1, mdis=5, nrad=1, vcheck=0)
-    m16 = _right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
+    m16 = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
     out = _run(clip, mclip=m16, **kw)
     src = noise_16bit
     for n in (0,):

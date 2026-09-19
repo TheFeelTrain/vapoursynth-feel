@@ -11,15 +11,15 @@ Run from the repository root:  python -m pytest tests/test_bm3dv2.py
 
 import json
 import textwrap
-import threading
 
 import numpy as np
 import pytest
 import vapoursynth as vs
 
 from conftest import (
-    NOISE_MKV, COMPARE_PRELUDE, ReferenceUnavailable, assert_all_frames_finite,
-    assert_gray32, assert_temporal_order_consistent, frame_to_ndarray,
+    NOISE_MKV, COMPARE_PRELUDE, ReferenceUnavailable,
+    assert_preserves_frame_props, assert_temporal_order_consistent,
+    check_all_frames_finite, eval_parallel, frame_to_ndarray,
     plane_to_ndarray, run_compare_subprocess, skip_or_fail_reference,
 )
 
@@ -44,36 +44,6 @@ def _run(clip, radius=2, num_streams=1, **kwargs):
     )
 
 
-def _check_all_frames_finite(clip, **kwargs):
-    out = _run(clip, **kwargs)
-    assert_gray32(out)
-    assert_all_frames_finite(out)
-
-
-def _eval_parallel(clip, **kwargs):
-    """Evaluate every frame concurrently, the way vspipe does.
-
-    Sequential get_frame() calls keep at most one frame in flight in the
-    filter, so the pipelined multi-stream path (parallel arAllFramesReady
-    invocations, reused command buffers and fences across streams) is never
-    exercised. Requesting all frames from worker threads at once forces the
-    deep pipeline and with it the cross-stream synchronization.
-    """
-    out = _run(clip, **kwargs)
-    frames = [None] * out.num_frames
-
-    def worker(n):
-        frames[n] = frame_to_ndarray(out.get_frame(n))
-
-    threads = [threading.Thread(target=worker, args=(n,)) for n in range(out.num_frames)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert all(f is not None for f in frames)
-    return frames
-
-
 def test_bm3dv2_parallel_load_matches_serial(noise_gray):
     """Parallel request load with num_streams=4 must produce the same pixel
     values as the serial path.
@@ -82,7 +52,7 @@ def test_bm3dv2_parallel_load_matches_serial(noise_gray):
     misuse and command pool reuse violations under load on strict drivers
     (black or garbage output only when frames are processed concurrently).
     """
-    par = _eval_parallel(noise_gray, radius=2, num_streams=4)
+    par = eval_parallel(_run, noise_gray, radius=2, num_streams=4)
     ref = _run(noise_gray, radius=2, num_streams=1)
     for n in range(noise_gray.num_frames):
         d = par[n] - frame_to_ndarray(ref.get_frame(n))
@@ -96,8 +66,8 @@ def test_bm3dv2_parallel_load_deterministic(noise_gray):
     on the completion order of the streams, which only shows up when many
     frames are in flight at once.
     """
-    a = _eval_parallel(noise_gray, radius=2, num_streams=4)
-    b = _eval_parallel(noise_gray, radius=2, num_streams=4)
+    a = eval_parallel(_run, noise_gray, radius=2, num_streams=4)
+    b = eval_parallel(_run, noise_gray, radius=2, num_streams=4)
     for n in range(noise_gray.num_frames):
         d = a[n] - b[n]
         assert np.abs(d).max() < 1e-5, f"nondeterministic output at frame {n}"
@@ -109,12 +79,12 @@ def test_bm3dv2_no_nan_all_frames(noise_gray, radius):
 
     A brand new filter instance is created per parametrized test.
     """
-    _check_all_frames_finite(noise_gray, radius=radius, num_streams=1)
+    check_all_frames_finite(_run, noise_gray, radius=radius, num_streams=1)
 
 
 @pytest.mark.parametrize("num_streams", [2, 4])
 def test_bm3dv2_no_nan_all_frames_multi_stream(noise_gray, num_streams):
-    _check_all_frames_finite(noise_gray, radius=2, num_streams=num_streams)
+    check_all_frames_finite(_run, noise_gray, radius=2, num_streams=num_streams)
 
 
 def test_bm3dv2_deterministic(noise_gray):
@@ -286,16 +256,7 @@ def test_bm3dv2_preserves_gray_frame_props(noise_gray):
     ``SetFrameProps``; the surviving equivalent key ``_Range`` is tagged
     instead. ``MyTag`` verifies arbitrary application metadata.
     """
-    tagged = vs.core.std.SetFrameProps(
-        noise_gray, _DurationNum=1001, _DurationDen=24000, _Range=0, MyTag=7,
-    )
-    out = _run(tagged, radius=2, num_streams=1)
-    for n in (0, 11, 23):
-        props = out.get_frame(n).props
-        assert props["_DurationNum"] == 1001, f"_DurationNum lost at frame {n}"
-        assert props["_DurationDen"] == 24000, f"_DurationDen lost at frame {n}"
-        assert int(props["_Range"]) == 0, f"_Range lost at frame {n}"
-        assert props["MyTag"] == 7, f"custom metadata lost at frame {n}"
+    assert_preserves_frame_props(_run, noise_gray, radius=2, num_streams=1)
 
 
 def test_bm3dv2_yuv_passthrough(noise_gray):

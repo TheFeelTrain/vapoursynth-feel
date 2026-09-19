@@ -29,8 +29,9 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    assert_changes_on_noise, assert_gray32, format_dtype, frame_to_ndarray,
-    plane_to_ndarray, reference_compare, reference_or_skip, reference_spec,
+    assert_changes_on_noise, assert_gray32, assert_preserves_frame_props,
+    frame_to_ndarray, plane as _plane, reference_compare, reference_or_skip,
+    reference_spec,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -43,15 +44,6 @@ BORDER_TOL = 0.01
 
 def _run(clip, **kwargs):
     return vs.core.vsfeel.Bilateral(clip, **kwargs)
-
-
-def _plane(frame, plane):
-    """Copy a frame plane into an ndarray, honouring the row pitch.
-
-    Delegates to the shared stride-aware reader (geometry derived from the
-    frame, result always a fresh copy).
-    """
-    return plane_to_ndarray(frame, plane, format_dtype(frame.format))
 
 
 def _compare(fmt, frames, params, guide=None):
@@ -248,6 +240,13 @@ def test_bilateral_defaults_run_16bit(noise_16bit):
     out = _run(noise_16bit)
     assert out.format.id == noise_16bit.format.id
     assert_changes_on_noise(out, noise_16bit, frames=(0,), what="bilateral")
+
+
+def test_bilateral_preserves_frame_props(noise_gray):
+    """Bilateral must republish the source frame's properties."""
+    assert_preserves_frame_props(
+        _run, noise_gray, sigma_spatial=SIGMA_SPATIAL,
+        sigma_color=SIGMA_COLOR, num_streams=1)
 
 
 def test_bilateral_deterministic_16bit(noise_16bit):

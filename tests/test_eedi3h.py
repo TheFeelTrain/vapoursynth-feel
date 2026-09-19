@@ -23,9 +23,9 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    WIDTH, HEIGHT, NOISE_MKV, reference_compare, reference_or_skip, reference_spec,
+    WIDTH, HEIGHT, NOISE_MKV, assert_preserves_frame_props, plane as _plane,
+    reference_compare, reference_or_skip, reference_spec, right_half_mask,
 )
-from test_eedi3 import _plane
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
@@ -125,10 +125,9 @@ def test_eedi3h_transpose_oracle_32bit(noise_gray, kw):
 
 def test_eedi3h_transpose_oracle_mclip(noise_16bit):
     """mclip flows through the composition transposed (exact)."""
-    from test_eedi3 import _right_half_mask
     clip = noise_16bit
     kw = dict(field=1, mdis=5, nrad=1, vcheck=2)
-    m = _right_half_mask(WIDTH, HEIGHT, clip.num_frames, 8)
+    m = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 8)
     _assert_oracle_exact(clip, np.uint16, WIDTH, HEIGHT, [0, 11],
                          mclip=m, **kw)
 
@@ -145,10 +144,9 @@ def test_eedi3h_transpose_oracle_sclip(noise_16bit):
 
 def test_eedi3h_transpose_oracle_mclip_sclip(noise_16bit):
     """mclip + sclip together (exact)."""
-    from test_eedi3 import _right_half_mask
     clip = noise_16bit
     kw = dict(field=1, mdis=20, nrad=2, vcheck=2)
-    m = _right_half_mask(WIDTH, HEIGHT, clip.num_frames, 8)
+    m = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 8)
     _assert_oracle_exact(clip, np.uint16, WIDTH, HEIGHT, [0, 11],
                          mclip=m, sclip=clip, **kw)
 
@@ -200,6 +198,12 @@ def test_eedi3h_output_dims_and_props(noise_16bit):
             src_props["_DurationNum"] * props["_DurationDen"]
 
 
+def test_eedi3h_preserves_frame_props(noise_gray):
+    """The transpose composition must keep the source frame's properties."""
+    assert_preserves_frame_props(_runh, noise_gray, field=1, mdis=5, nrad=1,
+                                 vcheck=0)
+
+
 def test_eedi3h_rejects_odd_width(noise_16bit):
     """The interpolated (horizontal) axis must be mod 2 when dh=False."""
     odd = noise_16bit.std.Crop(right=1)
@@ -215,10 +219,9 @@ def test_eedi3h_rejects_odd_width(noise_16bit):
 def test_eedi3h_masked_region_is_horizontal_cubic(noise_16bit):
     """Inside a masked (black) region the pixel is the HORIZONTAL cubic of
     the two kept columns (mirror of EEDI3's vertical-cubic guarantee)."""
-    from test_eedi3 import _right_half_mask
     clip = noise_16bit
     kw = dict(field=0, mdis=5, nrad=1, vcheck=0)
-    m = _right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
+    m = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
     out = _runh(clip, mclip=m, **kw)
     src = noise_16bit
     f = out.get_frame(0)

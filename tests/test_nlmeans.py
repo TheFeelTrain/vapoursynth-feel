@@ -8,15 +8,13 @@ shows up as a large diff against the reference implementation.
 Run from the repository root:  python -m pytest tests/test_nlmeans.py
 """
 
-import threading
-
 import numpy as np
 import pytest
 import vapoursynth as vs
 
 from conftest import (
-    NOISE_MKV, assert_changes_on_noise, assert_gray32,
-    assert_temporal_order_consistent, format_dtype, max_diff, plane_to_ndarray,
+    assert_changes_on_noise, assert_gray32, assert_preserves_frame_props,
+    assert_temporal_order_consistent, eval_parallel, max_diff, plane as _plane,
     reference_compare, reference_or_skip, reference_spec,
 )
 
@@ -27,29 +25,6 @@ H_PARAM = 1.2
 
 def _run(clip, num_streams=1, **kwargs):
     return vs.core.vsfeel.NLMeans(clip, num_streams=num_streams, **kwargs)
-
-
-def _plane(frame, plane):
-    """Copy a frame plane into an ndarray (float32 or uint16), honouring the
-    plane's actual row pitch (shared stride-aware reader)."""
-    return plane_to_ndarray(frame, plane, format_dtype(frame.format))
-
-
-def _eval_parallel(clip, **kwargs):
-    """Evaluate every frame concurrently, the way vspipe does."""
-    out = _run(clip, **kwargs)
-    frames = [None] * out.num_frames
-
-    def worker(n):
-        frames[n] = _plane(out.get_frame(n), 0)
-
-    threads = [threading.Thread(target=worker, args=(n,)) for n in range(out.num_frames)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert all(f is not None for f in frames)
-    return frames
 
 
 def _ref_compare(fmt, frames, params, planes=None, guide=None, crop=None):
@@ -65,44 +40,6 @@ def _ref_compare(fmt, frames, params, planes=None, guide=None, crop=None):
     return reference_compare(spec)["maxdiff"]
 
 
-# --- shared clips ------------------------------------------------------------
-
-@pytest.fixture(scope="session")
-def noise_yuv32():
-    """YUV420PS (float32) version of the noise clip (chroma is subsampled)."""
-    src = vs.core.bs.VideoSource(NOISE_MKV)
-    return vs.core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
-
-
-@pytest.fixture(scope="session")
-def noise_yuv420_16():
-    """YUV420P16 version of the noise clip (subsampled chroma lattice, for
-    the 16-bit 'UV' sweep)."""
-    src = vs.core.bs.VideoSource(NOISE_MKV)
-    return vs.core.resize.Bicubic(src, format=vs.YUV420P16)
-
-
-@pytest.fixture(scope="session")
-def noise_yuv444_16():
-    """YUV444P16 version of the noise clip (for joint 'YUV' processing)."""
-    src = vs.core.bs.VideoSource(NOISE_MKV)
-    return vs.core.resize.Bicubic(src, format=vs.YUV444P16)
-
-
-@pytest.fixture(scope="session")
-def noise_rgb32():
-    """RGBS version of the noise clip."""
-    src = vs.core.bs.VideoSource(NOISE_MKV)
-    return vs.core.resize.Bicubic(src, format=vs.RGBS, matrix_in_s="709")
-
-
-@pytest.fixture(scope="session")
-def noise_rgb16():
-    """RGB48 (16-bit integer) version of the noise clip."""
-    src = vs.core.bs.VideoSource(NOISE_MKV)
-    return vs.core.resize.Bicubic(src, format=vs.RGB48, matrix_in_s="709")
-
-
 # --- basic behaviour ---------------------------------------------------------
 
 
@@ -111,6 +48,11 @@ def test_output_format_and_frames_preserved(noise_gray):
     assert out.format.id == noise_gray.format.id
     assert (out.width, out.height) == (noise_gray.width, noise_gray.height)
     assert out.num_frames == noise_gray.num_frames
+
+
+def test_nlmeans_preserves_frame_props(noise_gray):
+    """NLMeans must republish the source frame's properties."""
+    assert_preserves_frame_props(_run, noise_gray, d=0, num_streams=1)
 
 
 def test_denoise_changes_output_32bit(noise_gray):
@@ -549,7 +491,7 @@ def test_multi_stream_uv_matches_single_16bit(noise_yuv420_16):
 
 
 def test_parallel_load_matches_serial_32bit(noise_gray):
-    par = _eval_parallel(noise_gray, d=2, num_streams=4)
+    par = eval_parallel(_run, noise_gray, d=2, num_streams=4)
     ref = _run(noise_gray, d=2, num_streams=1)
     for n in range(noise_gray.num_frames):
         fb = _plane(ref.get_frame(n), 0)
@@ -558,7 +500,7 @@ def test_parallel_load_matches_serial_32bit(noise_gray):
 
 
 def test_parallel_load_matches_serial_16bit(noise_16bit):
-    par = _eval_parallel(noise_16bit, d=2, num_streams=4)
+    par = eval_parallel(_run, noise_16bit, d=2, num_streams=4)
     ref = _run(noise_16bit, d=2, num_streams=1)
     for n in range(noise_16bit.num_frames):
         fb = _plane(ref.get_frame(n), 0)
@@ -567,15 +509,15 @@ def test_parallel_load_matches_serial_16bit(noise_16bit):
 
 
 def test_parallel_load_deterministic_32bit(noise_gray):
-    a = _eval_parallel(noise_gray, d=2, num_streams=4)
-    b = _eval_parallel(noise_gray, d=2, num_streams=4)
+    a = eval_parallel(_run, noise_gray, d=2, num_streams=4)
+    b = eval_parallel(_run, noise_gray, d=2, num_streams=4)
     for n in range(noise_gray.num_frames):
         assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
 
 
 def test_parallel_load_deterministic_16bit(noise_16bit):
-    a = _eval_parallel(noise_16bit, d=2, num_streams=4)
-    b = _eval_parallel(noise_16bit, d=2, num_streams=4)
+    a = eval_parallel(_run, noise_16bit, d=2, num_streams=4)
+    b = eval_parallel(_run, noise_16bit, d=2, num_streams=4)
     for n in range(noise_16bit.num_frames):
         assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
 
