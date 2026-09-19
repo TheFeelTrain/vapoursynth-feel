@@ -210,6 +210,9 @@ jobs:
     - name: Attach the distributions to the release
       env:
         GH_TOKEN: ${{ github.token }}
+        # This job never checks the repository out, so gh cannot work out which
+        # repo to use from a git remote; GH_REPO tells it directly.
+        GH_REPO: ${{ github.repository }}
       run: |
         # Wheels and sdist only: dist/ also holds the .publish.attestation files
         # the PyPI action writes, which do not belong on the release page.
