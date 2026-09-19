@@ -251,6 +251,19 @@ def test_eedi3_parallel_load_consistent(noise_gray, noise_16bit, bits):
             assert np.abs(a[n] - b[n]).max() < 1e-6, f"nondeterministic output at frame {n}"
 
 
+def test_eedi3_parallel_vcheck_matches_serial(noise_16bit, monkeypatch):
+    """The shipped parallel vcheck and the serial walk (VSFEEL_EEDI3_VPARA=0,
+    the A/B control) must agree exactly on the noise clip."""
+    monkeypatch.setenv("VSFEEL_EEDI3_VPARA", "0")
+    serial = _run(noise_16bit, field=1, num_streams=1)
+    monkeypatch.delenv("VSFEEL_EEDI3_VPARA")
+    parallel = _run(noise_16bit, field=1, num_streams=1)
+    for n in (0, 11, 23):
+        a = _plane(serial.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+        b = _plane(parallel.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+        assert np.array_equal(a, b), f"serial/parallel vcheck mismatch at frame {n}"
+
+
 def test_eedi3_preserves_frame_props(noise_gray):
     """field=1 (no frame doubling) must keep every source property.
 

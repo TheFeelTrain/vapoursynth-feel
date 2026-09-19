@@ -213,6 +213,12 @@ foreach(bits IN LISTS VK_BITS)
         "eedi3_${bits}_row|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_ROW"
         "eedi3_${bits}_vcheck|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK"
         "eedi3_${bits}_vcheck_lds|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_LDS=1"
+        "eedi3_${bits}_vcheck_para|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=1"
+        "eedi3_${bits}_vcheck_para_j1|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=2"
+        "eedi3_${bits}_vcheck_para_j2|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=3"
+        "eedi3_${bits}_vcheck_para_j3|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=4"
+        "eedi3_${bits}_vcheck_para_j4|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=5"
+        "eedi3_${bits}_vcheck_para_j5|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=6"
         # upload kernels: mirror-pad builder + empty-row vcheck copy and the
         # assemble/transpose passes (plain 1D kernels, fixed local size, no
         # subgroup ops); vulkan1.3 target keeps one rule for the file.

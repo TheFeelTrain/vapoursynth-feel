@@ -48,7 +48,8 @@
  *             VCHECK > 0 && !HAS_SCLIP)
  *
  * ENTRY_ROW grid (1, rows): one workgroup per interpolated row.
- * ENTRY_VCHECK grid (1, 1): one workgroup per plane; serial row walk.
+ * ENTRY_VCHECK grid (1, 1): one workgroup per plane; serial row walk. With
+ * VCHECK_PARA the grid is (1, rows): one workgroup per row.
  *
  * Spec constants: 0 WIDTH, 1 NRAD, 2 MDIS, 3 HAS_MCLIP, 4 HAS_SCLIP,
  * 5 VCHECK_MODE, 6 local_size_row, 7 local_size_vcheck.
@@ -124,6 +125,17 @@ const int BT_TILE = 32;
 // previous interp row in shared memory, 0 = read it back from vout.
 #ifndef VCHECK_LDS
 #define VCHECK_LDS 0
+#endif
+// Parallel vcheck: the d2p term never reads a vcheck write, so rows have no
+// ordering dependence and one workgroup owns each row. VCHECK_PARA picks how
+// the d2p term is formed (each extra step costs more work and drifts less):
+//   1 = the un-vchecked previous row (dst);
+//   2..6 = + that many Jacobi steps (the predecessor's own parallel value).
+#ifndef VCHECK_PARA
+#define VCHECK_PARA 0
+#endif
+#if VCHECK_LDS && VCHECK_PARA
+#error "VCHECK_LDS and VCHECK_PARA are mutually exclusive"
 #endif
 // Compile-time max plane width the LDS ping-pong can hold (per row buffer).
 // CMake passes -DMAXW (EEDI3_MAXW); the host's fit check reads the same value.
@@ -1035,10 +1047,10 @@ void main() {
 
 #if defined(ENTRY_VCHECK)
 
-// vcheck is a serial row walk (row r reads the MODIFIED row r-1 as its d2p
-// term). A single workgroup iterates rows top-down and writes each vchecked
-// row to the vout buffer (b7). All taps except d2p come from dst (b1), which
-// the row kernel wrote and vcheck never modifies, so:
+// vcheck walks the interp rows top-down in the serial form (row r reads the
+// MODIFIED row r-1 as its d2p term) and writes each vchecked row to vout (b7).
+// All taps except d2p come from dst (b1), which the row kernel wrote and vcheck
+// never modifies, so:
 //   - row r / r+1 taps (dCi/dCp/dm/dNm): dst, always the plain row-kernel
 //     output — no in-place race;
 //   - d2p (row r-1): vout row r-1, written last iteration, L2-hot.
@@ -1080,20 +1092,212 @@ void vout_store(int r, int x, float q) {
 #if VCHECK_LDS
 shared float tlineSh[2][MAXW];
 int g_cur, g_prev;
-float vc_prev(int i) { return tlineSh[g_prev][i]; }
 void vc_store(int x, float q) { tlineSh[g_cur][x] = q; }
 #else
-int g_row, g_prev_row;
-float vc_prev(int i) {
+int g_row;
+void vc_store(int x, float q) { vout_store(g_row, x, q); }
+// The stored (so already quantized) vout value of interp row r, column x: what
+// a serial walk reads back as its d2p term.
+float vc_read_vout(int r, int x) {
 #if BITS == 16
-    return float(int(vout[pc.vout_base + g_prev_row * WIDTH + i]));
+    return float(int(vout[pc.vout_base + r * WIDTH + x]));
 #else
-    return vout[pc.vout_base + g_prev_row * WIDTH + i];
+    return vout[pc.vout_base + r * WIDTH + x];
 #endif
 }
-void vc_store(int x, float q) { vout_store(g_row, x, q); }
 #endif
 
+// The dirc == 0 result: the vertical cubic, or the caller's sclip.
+float vc_cint_s(int r, int x) {
+#if BITS == 16
+    return HAS_SCLIP != 0
+        ? load_sclip_val(r, x)
+        : float(int(cint[pc.cint_base + r * WIDTH + x]));
+#else
+    return HAS_SCLIP != 0
+        ? load_sclip_val(r, x)
+        : cint[pc.cint_base + r * WIDTH + x];
+#endif
+}
+
+// One pixel's blend. The caller has already established do_row, dirc != 0 and
+// the direction test; `pr` is the d2p term.
+float vc_blend(int r, int x, float pr) {
+    const int yf = pc.field + 2 * r;
+    const int dirc = int(dmap[pc.dmap_base + r * WIDTH + x]);
+    const int dn = (r + 1 < pc.rows) ? (r + 1) : r;
+    const float cint_s = vc_cint_s(r, x);
+#if BITS == 16
+    const int dCi = int(load_dst_val(r, x));
+    const int dCp = int(load_dst_val(r, x + dirc));
+    const int dm  = int(load_dst_val(r, x - dirc));
+    const int dNm = int(load_dst_val(dn, x - dirc));
+    const int v1px = int(pad_get(yf - 1, x + dirc));
+    const int v1nx = int(pad_get(yf + 1, x - dirc));
+    const int v1p0 = int(pad_get(yf - 1, x));
+    const int v1n0 = int(pad_get(yf + 1, x));
+    const int p = int(pr);
+    const int it = (p + dm + 1) >> 1;
+    const int ib = (dCp + dNm + 1) >> 1;
+    const int vt = abs(p - v1px) + abs(dCp - v1px);
+    const int vb = abs(dNm - v1nx) + abs(dm - v1nx);
+    const int vc = abs(dCi - v1p0) + abs(dCi - v1n0);
+    const int d0 = abs(it - v1p0);
+    const int d1 = abs(ib - v1n0);
+    const int d2 = abs(vt - vc);
+    const int d3 = abs(vb - vc);
+    int mdiff0, mdiff1;
+    if (VCHECK_MODE == 1) {
+        mdiff0 = min(d0, d1);
+        mdiff1 = min(d2, d3);
+    } else if (VCHECK_MODE == 2) {
+        mdiff0 = (d0 + d1 + 1) >> 1;
+        mdiff1 = (d2 + d3 + 1) >> 1;
+    } else {
+        mdiff0 = max(d0, d1);
+        mdiff1 = max(d2, d3);
+    }
+    const float a0 = float(mdiff0) * pc.vth0r;
+    const float a1 = float(mdiff1) * pc.vth1r;
+    const float a2 = max((pc.vth2 - float(abs(dirc))) * pc.vth2r, 0.0f);
+    const float a = min(max(a0, max(a1, a2)), 1.0f);
+    const float blend = (1.0f - a) * float(dCi) + a * cint_s;
+    return float(min(max(int(blend), 0), 65535));
+#else
+    const float dCi = load_dst_val(r, x);
+    const float dCp = load_dst_val(r, x + dirc);
+    const float dm  = load_dst_val(r, x - dirc);
+    const float dNm = load_dst_val(dn, x - dirc);
+    const float v1px = pad_get(yf - 1, x + dirc);
+    const float v1nx = pad_get(yf + 1, x - dirc);
+    const float v1p0 = pad_get(yf - 1, x);
+    const float v1n0 = pad_get(yf + 1, x);
+    const float it = (pr + dm) * 0.5f;
+    const float ib = (dCp + dNm) * 0.5f;
+    const float vt = abs(pr - v1px) + abs(dCp - v1px);
+    const float vb = abs(dNm - v1nx) + abs(dm - v1nx);
+    const float vc = abs(dCi - v1p0) + abs(dCi - v1n0);
+    const float d0 = abs(it - v1p0);
+    const float d1 = abs(ib - v1n0);
+    const float d2 = abs(vt - vc);
+    const float d3 = abs(vb - vc);
+    float mdiff0, mdiff1;
+    if (VCHECK_MODE == 1) {
+        mdiff0 = min(d0, d1);
+        mdiff1 = min(d2, d3);
+    } else if (VCHECK_MODE == 2) {
+        mdiff0 = (d0 + d1) * 0.5f;
+        mdiff1 = (d2 + d3) * 0.5f;
+    } else {
+        mdiff0 = max(d0, d1);
+        mdiff1 = max(d2, d3);
+    }
+    const float a0 = mdiff0 * pc.vth0r;
+    const float a1 = mdiff1 * pc.vth1r;
+    const float a2 = max((pc.vth2 - float(abs(dirc))) * pc.vth2r, 0.0f);
+    const float a = min(max(a0, max(a1, a2)), 1.0f);
+    return (1.0f - a) * dCi + a * cint_s;
+#endif
+}
+
+// One pixel: the early-out decisions live here, the blend math in vc_blend.
+// PR_EXPR is the d2p term and is evaluated only where it is actually used.
+#define DEF_VC_EVAL(NAME, PR_EXPR)                                        \
+float NAME(int r, int x) {                                                \
+    const int y = MARGIN_V + pc.field + 2 * r;                            \
+    if (!(y >= 6 && y < pc.pad_height - 6)) {                             \
+        return load_dst_val(r, x);                                        \
+    }                                                                     \
+    const int dirc = int(dmap[pc.dmap_base + r * WIDTH + x]);             \
+    if (dirc == 0) {                                                      \
+        return vc_cint_s(r, x);                                           \
+    }                                                                     \
+    const int dr = (r >= 1) ? (r - 1) : 0;                                \
+    const int dn = (r + 1 < pc.rows) ? (r + 1) : r;                       \
+    const int dirt = int(dmap[pc.dmap_base + dr * WIDTH + x]);            \
+    const int dirb = int(dmap[pc.dmap_base + dn * WIDTH + x]);            \
+    if (max(dirc * dirt, dirc * dirb) < 0 || (dirt == dirb && dirt == 0)) { \
+        return vc_cint_s(r, x);                                           \
+    }                                                                     \
+    const float pr = (r >= 1) ? (PR_EXPR) : 0.0f;                         \
+    return vc_blend(r, x, pr);                                            \
+}
+
+#if VCHECK_PARA
+// The stored form of a parallel evaluation: exactly what a serial walk would
+// have read back from vout one pass earlier.
+float vc_para_quant(float v) {
+#if BITS == 16
+    return float(uint(vc_quant(v)));
+#else
+    return v;
+#endif
+}
+// Each extra step feeds the predecessor row's own (one-step-less) parallel
+// value as the d2p term. Pixels whose predecessor's blend was already fully
+// determined (a == 1 -> cint_s) then see exactly the serial value, which is
+// where most of the drift lives, so a few steps decay it geometrically.
+#define DEF_VC_EVAL_J(NAME, PREV) \
+    DEF_VC_EVAL(NAME, vc_para_quant(PREV(r - 1, x + dirc)))
+DEF_VC_EVAL(vc_eval_0, load_dst_val(r - 1, x + dirc))
+#if VCHECK_PARA >= 2
+DEF_VC_EVAL_J(vc_eval_1, vc_eval_0)
+#endif
+#if VCHECK_PARA >= 3
+DEF_VC_EVAL_J(vc_eval_2, vc_eval_1)
+#endif
+#if VCHECK_PARA >= 4
+DEF_VC_EVAL_J(vc_eval_3, vc_eval_2)
+#endif
+#if VCHECK_PARA >= 5
+DEF_VC_EVAL_J(vc_eval_4, vc_eval_3)
+#endif
+#if VCHECK_PARA >= 6
+DEF_VC_EVAL_J(vc_eval_5, vc_eval_4)
+#endif
+#if VCHECK_PARA >= 6
+#define VC_PARA_EVAL vc_eval_5
+#elif VCHECK_PARA >= 5
+#define VC_PARA_EVAL vc_eval_4
+#elif VCHECK_PARA >= 4
+#define VC_PARA_EVAL vc_eval_3
+#elif VCHECK_PARA >= 3
+#define VC_PARA_EVAL vc_eval_2
+#elif VCHECK_PARA >= 2
+#define VC_PARA_EVAL vc_eval_1
+#else
+#define VC_PARA_EVAL vc_eval_0
+#endif
+float vc_eval(int r, int x) { return VC_PARA_EVAL(r, x); }
+#else
+#if VCHECK_LDS
+#define VC_PR_EXPR tlineSh[g_prev][x + dirc]
+#else
+#define VC_PR_EXPR vc_read_vout(r - 1, x + dirc)
+#endif
+DEF_VC_EVAL(vc_eval, VC_PR_EXPR)
+#endif
+
+// One interp row. The serial form calls this once per row from a top-down walk;
+// VCHECK_PARA calls it once per workgroup, so nothing here may assume ordering.
+void vc_row(int r) {
+    const int tid = int(gl_LocalInvocationID.x);
+    const int lsz = int(gl_WorkGroupSize.x);
+    for (int x = tid; x < WIDTH; x += lsz) {
+        vc_store(x, vc_quant(vc_eval(r, x)));
+    }
+}
+
+#if VCHECK_PARA
+// One workgroup per interp row; the rows are independent (the d2p term never
+// reads a vcheck write).
+void main() {
+    const int r = int(gl_WorkGroupID.y);
+    if (r >= pc.rows) return;
+    g_row = r;
+    vc_row(r);
+}
+#else
 void main() {
     const int tid = int(gl_LocalInvocationID.x);
     const int lsz = int(gl_WorkGroupSize.x);
@@ -1114,114 +1318,8 @@ void main() {
         if (dmap[pc.rempty_base + r] != int8_t(0))
             continue;
         g_row = r;
-        g_prev_row = (r >= 1) ? (r - 1) : 0;
 #endif
-        const int y = MARGIN_V + pc.field + 2 * r;   // pad row of this interp row
-        const bool do_row = (y >= 6 && y < pc.pad_height - 6);
-        const int yf = pc.field + 2 * r;
-        const int dr = (r >= 1) ? (r - 1) : 0;        // interp row for dmap dirt
-        const int dn = (r + 1 < pc.rows) ? (r + 1) : r;   // next interp row
-
-        for (int x = tid; x < WIDTH; x += lsz) {
-            float oval;
-            if (!do_row) {
-                oval = load_dst_val(r, x);
-            } else {
-                const int dirc = int(dmap[pc.dmap_base + r * WIDTH + x]);
-#if BITS == 16
-                const float cint_s = HAS_SCLIP != 0
-                    ? load_sclip_val(r, x)
-                    : float(int(cint[pc.cint_base + r * WIDTH + x]));
-#else
-                const float cint_s = HAS_SCLIP != 0
-                    ? load_sclip_val(r, x)
-                    : cint[pc.cint_base + r * WIDTH + x];
-#endif
-
-                oval = cint_s;
-                if (dirc != 0) {
-                    const int dirt = int(dmap[pc.dmap_base + dr * WIDTH + x]);
-                    const int dirb = int(dmap[pc.dmap_base + dn * WIDTH + x]);
-                    if (!(max(dirc * dirt, dirc * dirb) < 0 || (dirt == dirb && dirt == 0))) {
-#if BITS == 16
-                        const int dCi = int(load_dst_val(r, x));
-                        const int dCp = int(load_dst_val(r, x + dirc));
-                        const int dm  = int(load_dst_val(r, x - dirc));
-                        const int dNm = int(load_dst_val(dn, x - dirc));
-                        const int v1px = int(pad_get(yf - 1, x + dirc));
-                        const int v1nx = int(pad_get(yf + 1, x - dirc));
-                        const int v1p0 = int(pad_get(yf - 1, x));
-                        const int v1n0 = int(pad_get(yf + 1, x));
-                        const int pr = (r >= 1)
-                            ? int(vc_prev(x + dirc)) : 0;
-                        const int it = (pr + dm + 1) >> 1;
-                        const int ib = (dCp + dNm + 1) >> 1;
-                        const int vt = abs(pr - v1px) + abs(dCp - v1px);
-                        const int vb = abs(dNm - v1nx) + abs(dm - v1nx);
-                        const int vc = abs(dCi - v1p0) + abs(dCi - v1n0);
-                        const int d0 = abs(it - v1p0);
-                        const int d1 = abs(ib - v1n0);
-                        const int d2 = abs(vt - vc);
-                        const int d3 = abs(vb - vc);
-                        int mdiff0, mdiff1;
-                        if (VCHECK_MODE == 1) {
-                            mdiff0 = min(d0, d1);
-                            mdiff1 = min(d2, d3);
-                        } else if (VCHECK_MODE == 2) {
-                            mdiff0 = (d0 + d1 + 1) >> 1;
-                            mdiff1 = (d2 + d3 + 1) >> 1;
-                        } else {
-                            mdiff0 = max(d0, d1);
-                            mdiff1 = max(d2, d3);
-                        }
-                        const float a0 = float(mdiff0) * pc.vth0r;
-                        const float a1 = float(mdiff1) * pc.vth1r;
-                        const float a2 = max((pc.vth2 - float(abs(dirc))) * pc.vth2r, 0.0f);
-                        const float a = min(max(a0, max(a1, a2)), 1.0f);
-                        const float blend = (1.0f - a) * float(dCi) + a * cint_s;
-                        oval = float(min(max(int(blend), 0), 65535));
-#else
-                        const float pr = (r >= 1)
-                            ? vc_prev(x + dirc) : 0.0f;
-                        const float dCi = load_dst_val(r, x);
-                        const float dCp = load_dst_val(r, x + dirc);
-                        const float dm  = load_dst_val(r, x - dirc);
-                        const float dNm = load_dst_val(dn, x - dirc);
-                        const float v1px = pad_get(yf - 1, x + dirc);
-                        const float v1nx = pad_get(yf + 1, x - dirc);
-                        const float v1p0 = pad_get(yf - 1, x);
-                        const float v1n0 = pad_get(yf + 1, x);
-                        const float it = (pr + dm) * 0.5f;
-                        const float ib = (dCp + dNm) * 0.5f;
-                        const float vt = abs(pr - v1px) + abs(dCp - v1px);
-                        const float vb = abs(dNm - v1nx) + abs(dm - v1nx);
-                        const float vc = abs(dCi - v1p0) + abs(dCi - v1n0);
-                        const float d0 = abs(it - v1p0);
-                        const float d1 = abs(ib - v1n0);
-                        const float d2 = abs(vt - vc);
-                        const float d3 = abs(vb - vc);
-                        float mdiff0, mdiff1;
-                        if (VCHECK_MODE == 1) {
-                            mdiff0 = min(d0, d1);
-                            mdiff1 = min(d2, d3);
-                        } else if (VCHECK_MODE == 2) {
-                            mdiff0 = (d0 + d1) * 0.5f;
-                            mdiff1 = (d2 + d3) * 0.5f;
-                        } else {
-                            mdiff0 = max(d0, d1);
-                            mdiff1 = max(d2, d3);
-                        }
-                        const float a0 = mdiff0 * pc.vth0r;
-                        const float a1 = mdiff1 * pc.vth1r;
-                        const float a2 = max((pc.vth2 - float(abs(dirc))) * pc.vth2r, 0.0f);
-                        const float a = min(max(a0, max(a1, a2)), 1.0f);
-                        oval = (1.0f - a) * dCi + a * cint_s;
-#endif
-                    }
-                }
-            }
-            vc_store(x, vc_quant(oval));
-        }
+        vc_row(r);
 #if VCHECK_LDS
         // The previous row is final now: flush it to vout. The barrier below
         // orders this flush (and the row it came from) before the next
@@ -1244,6 +1342,7 @@ void main() {
     }
 #endif
 }
+#endif  // VCHECK_PARA
 
 #endif  // ENTRY_VCHECK
 

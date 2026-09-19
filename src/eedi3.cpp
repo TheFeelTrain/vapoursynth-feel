@@ -783,6 +783,9 @@ struct Eedi3PlaneConfig {
     // true when vcheck_pipeline is the shared-memory d2p variant: it carries
     // every row (no empty-row skip) and therefore needs no vcopy dispatch.
     bool vcheck_lds {};
+    // true when vcheck_pipeline is the parallel (un-vchecked d2p) variant: one
+    // workgroup per row, so it needs no vcopy dispatch either.
+    bool vcheck_para {};
 
     // staging (host-visible) regions, byte offsets: tight kept source rows,
     // gathered sclip rows (sclip only). The shared tight mask rows live in
@@ -967,6 +970,14 @@ struct Eedi3Data {
     int copy_mode { 3 };
     // Diagnostics-only host-path ablations (env-gated; all default off).
     bool skip_blit {}, skip_sclip {}, skip_raw {}, skip_h2d {}, skip_vcheck {};
+    // vcheck d2p from an un-vchecked source (one workgroup per row), so the
+    // serial row walk and its per-row barrier disappear. Levels trade accuracy
+    // for work: 1 = dst row, 2..6 = +an increasing number of Jacobi steps.
+    // The shipped default reproduces the serial walk exactly on the whole
+    // tested surface; VSFEEL_EEDI3_VPARA=0 restores the serial walk (the A/B
+    // control) and 1..6 pin a level.
+    static constexpr int VCHECK_PARA_LEVELS = 6;
+    int vcheck_para { VCHECK_PARA_LEVELS };
     bool skip_xfer {};   // diagnostics: import path without the blit dispatch
     bool skip_xpose {}, skip_compose {}, skip_maskx {};  // diagnostics (EEDI3H)
     // EEDI3H only: build the transposed mask's PACKED bit matrix in one pass
@@ -1046,6 +1057,8 @@ struct Eedi3Data {
     VkShaderModule row_module {};
     VkShaderModule vcheck_module {};
     VkShaderModule vcheck_lds_module {};  // shared-memory d2p variant (optional)
+    // parallel (un-vchecked d2p) vcheck variants, indexed by level - 1
+    std::array<VkShaderModule, VCHECK_PARA_LEVELS> vcheck_para_modules {};
     VkShaderModule pad_module {};
     VkShaderModule vcopy_module {};
     VkShaderModule blit_module {};    // direct-to-frame row spread (import path)
@@ -1149,6 +1162,11 @@ struct Eedi3Data {
         }
         if (vcheck_lds_module) {
             vkDestroyShaderModule(dev, vcheck_lds_module, nullptr);
+        }
+        for (VkShaderModule m : vcheck_para_modules) {
+            if (m) {
+                vkDestroyShaderModule(dev, m, nullptr);
+            }
         }
         if (pad_module) {
             vkDestroyShaderModule(dev, pad_module, nullptr);
@@ -1841,9 +1859,9 @@ static std::optional<std::string> record_pass(
             // empty and the walk below handles everything): fully-masked
             // rows copied in parallel, so the serial walk only iterates
             // non-empty rows and pays ~1/3 of the barriers. The LDS walk
-            // carries every row (it needs the whole chain), so it needs no
-            // vcopy pass at all.
-            if (d.mclip_node && !cfg.vcheck_lds) {
+            // carries every row (it needs the whole chain), and the parallel
+            // walk computes every row itself, so neither needs a vcopy pass.
+            if (d.mclip_node && !cfg.vcheck_lds && !cfg.vcheck_para) {
                 vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.vcopy_pipeline);
                 vkCmdBindDescriptorSets(
                     resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1872,7 +1890,9 @@ static std::optional<std::string> record_pass(
             vkCmdPushConstants(
                 resource.cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                 0, sizeof(pc), &pc);
-            vkCmdDispatch(resource.cmd, 1, 1, 1);
+            // Parallel vcheck: one workgroup per interp row.
+            vkCmdDispatch(resource.cmd, 1,
+                          cfg.vcheck_para ? static_cast<uint32_t>(cfg.rows) : 1u, 1);
         }
         gpu_mark();   // mark 4: after the vcheck/vcopy block (per plane)
     }
@@ -3589,6 +3609,10 @@ static void vsfeel_eedi3_create(
     if (const char * pr = env_str("VSFEEL_EEDI3_PAIR")) {
         d->skip_pair = atoi(pr) == 0;
     }
+    if (const char * vp = env_str("VSFEEL_EEDI3_VPARA")) {
+        const int v = atoi(vp);
+        d->vcheck_para = (v >= 0 && v <= Eedi3Data::VCHECK_PARA_LEVELS) ? v : 0;
+    }
 
     if (const char * cm = env_str("VSFEEL_EEDI3_COPY")) {
         const int v = atoi(cm);
@@ -3746,6 +3770,8 @@ static void vsfeel_eedi3_create(
         size_t vc_size = 0;
         const uint32_t * vclds_code = nullptr;
         size_t vclds_size = 0;
+        const uint32_t * vcpara_code[Eedi3Data::VCHECK_PARA_LEVELS] = {};
+        size_t vcpara_size[Eedi3Data::VCHECK_PARA_LEVELS] = {};
         const uint32_t * pad_code = nullptr;
         size_t pad_size = 0;
         switch (d->bits) {
@@ -3753,12 +3779,36 @@ static void vsfeel_eedi3_create(
                 row_code = eedi3_16_row_spv; row_size = eedi3_16_row_spv_size;
                 vc_code = eedi3_16_vcheck_spv; vc_size = eedi3_16_vcheck_spv_size;
                 vclds_code = eedi3_16_vcheck_lds_spv; vclds_size = eedi3_16_vcheck_lds_spv_size;
+                vcpara_code[0] = eedi3_16_vcheck_para_spv;
+                vcpara_size[0] = eedi3_16_vcheck_para_spv_size;
+                vcpara_code[1] = eedi3_16_vcheck_para_j1_spv;
+                vcpara_size[1] = eedi3_16_vcheck_para_j1_spv_size;
+                vcpara_code[2] = eedi3_16_vcheck_para_j2_spv;
+                vcpara_size[2] = eedi3_16_vcheck_para_j2_spv_size;
+                vcpara_code[3] = eedi3_16_vcheck_para_j3_spv;
+                vcpara_size[3] = eedi3_16_vcheck_para_j3_spv_size;
+                vcpara_code[4] = eedi3_16_vcheck_para_j4_spv;
+                vcpara_size[4] = eedi3_16_vcheck_para_j4_spv_size;
+                vcpara_code[5] = eedi3_16_vcheck_para_j5_spv;
+                vcpara_size[5] = eedi3_16_vcheck_para_j5_spv_size;
                 pad_code = eedi3_16_pad_spv; pad_size = eedi3_16_pad_spv_size;
                 break;
             case 32:
                 row_code = eedi3_32_row_spv; row_size = eedi3_32_row_spv_size;
                 vc_code = eedi3_32_vcheck_spv; vc_size = eedi3_32_vcheck_spv_size;
                 vclds_code = eedi3_32_vcheck_lds_spv; vclds_size = eedi3_32_vcheck_lds_spv_size;
+                vcpara_code[0] = eedi3_32_vcheck_para_spv;
+                vcpara_size[0] = eedi3_32_vcheck_para_spv_size;
+                vcpara_code[1] = eedi3_32_vcheck_para_j1_spv;
+                vcpara_size[1] = eedi3_32_vcheck_para_j1_spv_size;
+                vcpara_code[2] = eedi3_32_vcheck_para_j2_spv;
+                vcpara_size[2] = eedi3_32_vcheck_para_j2_spv_size;
+                vcpara_code[3] = eedi3_32_vcheck_para_j3_spv;
+                vcpara_size[3] = eedi3_32_vcheck_para_j3_spv_size;
+                vcpara_code[4] = eedi3_32_vcheck_para_j4_spv;
+                vcpara_size[4] = eedi3_32_vcheck_para_j4_spv_size;
+                vcpara_code[5] = eedi3_32_vcheck_para_j5_spv;
+                vcpara_size[5] = eedi3_32_vcheck_para_j5_spv_size;
                 pad_code = eedi3_32_pad_spv; pad_size = eedi3_32_pad_spv_size;
                 break;
             default:
@@ -3782,6 +3832,15 @@ static void vsfeel_eedi3_create(
                     return set_error(std::get<std::string>(r2b));
                 }
                 d->vcheck_lds_module = std::get<VkShaderModule>(r2b);
+            }
+            if (d->vcheck_para >= 1 && d->vcheck_para <= Eedi3Data::VCHECK_PARA_LEVELS) {
+                const int lvl = d->vcheck_para - 1;
+                auto r2c = create_shader_module(*d->device, vcpara_code[lvl],
+                                                vcpara_size[lvl]);
+                if (std::holds_alternative<std::string>(r2c)) {
+                    return set_error(std::get<std::string>(r2c));
+                }
+                d->vcheck_para_modules[lvl] = std::get<VkShaderModule>(r2c);
             }
         }
         auto r3 = create_shader_module(*d->device, pad_code, pad_size);
@@ -4245,6 +4304,10 @@ static void vsfeel_eedi3_create(
         lds_ok = atoi(lv) != 0;
     }
     lds_ok = lds_ok && d->vcheck > 0 && d->vcheck_lds_module;
+    // Parallel vcheck wins over the LDS form when both are available.
+    const bool para_ok = d->vcheck > 0 && d->vcheck_para >= 1 &&
+        d->vcheck_para <= Eedi3Data::VCHECK_PARA_LEVELS &&
+        d->vcheck_para_modules[d->vcheck_para - 1];
 
     // helper to fetch-or-create the (row, vcheck, pad, vcopy, blit, vcheck_lds)
     // pipelines for a width key; uses Eedi3Data::WidthKey (all filter-level
@@ -4260,8 +4323,9 @@ static void vsfeel_eedi3_create(
                              VkPipeline & blit_pipe,
                              VkPipeline & xpose_pipe,
                              VkPipeline & compose_pipe,
-                             bool & use_lds) -> std::optional<std::string> {
-        use_lds = lds_ok && key.width <= MAXW_LDS;
+                             bool & use_lds, bool & use_para) -> std::optional<std::string> {
+        use_para = para_ok;
+        use_lds = !use_para && lds_ok && key.width <= MAXW_LDS;
         for (auto & [k, quad] : d->width_pipes) {
             if (k == key) {
                 row_pipe = quad[0];
@@ -4288,7 +4352,9 @@ static void vsfeel_eedi3_create(
         VkPipeline vcp = VK_NULL_HANDLE;
         if (d->vcheck > 0) {
             auto r2 = create_pipeline(*d->device, spec,
-                                      use_lds ? d->vcheck_lds_module : d->vcheck_module,
+                                      use_para ? d->vcheck_para_modules[d->vcheck_para - 1]
+                                               : (use_lds ? d->vcheck_lds_module
+                                                          : d->vcheck_module),
                                       d->pipeline_layout, 0);
             if (std::holds_alternative<std::string>(r2)) {
                 vkDestroyPipeline(dev, rowp, nullptr);
@@ -4306,7 +4372,7 @@ static void vsfeel_eedi3_create(
         }
         VkPipeline padp = std::get<VkPipeline>(r3);
         VkPipeline vcopyp = VK_NULL_HANDLE;
-        if (d->vcheck > 0 && d->mclip_node && !use_lds) {
+        if (d->vcheck > 0 && d->mclip_node && !use_lds && !use_para) {
             auto r4 = create_pipeline(*d->device, spec, d->vcopy_module, d->pipeline_layout, 0);
             if (std::holds_alternative<std::string>(r4)) {
                 vkDestroyPipeline(dev, rowp, nullptr);
@@ -4384,7 +4450,8 @@ static void vsfeel_eedi3_create(
         if (auto pipe_err = get_pipelines(key, cfg.row_pipeline, cfg.vcheck_pipeline,
                                           cfg.pad_pipeline, cfg.vcopy_pipeline,
                                           cfg.blit_pipeline, cfg.xpose_pipeline,
-                                          cfg.compose_pipeline, cfg.vcheck_lds)) {
+                                          cfg.compose_pipeline, cfg.vcheck_lds,
+                                          cfg.vcheck_para)) {
             return set_error(*pipe_err);
         }
         if (d->aa) {
@@ -4395,7 +4462,8 @@ static void vsfeel_eedi3_create(
             if (auto apipe_err = get_pipelines(akey, a.row_pipeline, a.vcheck_pipeline,
                                                a.pad_pipeline, a.vcopy_pipeline,
                                                a.blit_pipeline, a.xpose_pipeline,
-                                               a.compose_pipeline, a.vcheck_lds)) {
+                                               a.compose_pipeline, a.vcheck_lds,
+                                               a.vcheck_para)) {
                 return set_error(*apipe_err);
             }
             VkPipeline asm_pipe = VK_NULL_HANDLE;

@@ -5,21 +5,23 @@
 ## Status
 
 Benchmark defaults (2000 f, ns=8, real based_aa mask, 2x2160p GRAY16, field=3,
-mdis=20, vcheck=2): EEDI3 **~518**, EEDI3H **~378**, EEDI3AA **~109** fps —
-2.59x vszipcl u16 / 1.52x fp32.
+mdis=20, vcheck=2): EEDI3 **~628** (u16, parallel vcheck default), EEDI3H
+**~378**, EEDI3AA **~160** fps — 2.93x vszipcl u16 / 1.71x fp32.
 
 | depth | vsfeel | vszipcl | speedup |
 |---|---|---|---|
-| u16 | 613 (591/621/613) | 211 (213/194/211) | 2.90x |
-| fp32 | 255 (255/247/260) | 202 (203/202/201) | 1.26x |
+| u16 | 628 (622/628) | 214 (213/216) | 2.94x |
+| fp32 | 318 (316/319) | 186 (184/191) | 1.71x |
 
 - **The graded `mclip` was 100% zero until round 14**, making DP/backtrack,
   vcheck and vcopy dead code. Pre-round-14 verdicts describe that path and are
   marked *(stale)* below.
 - Round 14's cost model was superseded by round 20's: row kernel **~17%** of the
-  vertical frame (~25% of EEDI3AA), vcheck ~14%.
+  vertical frame (~25% of EEDI3AA), vcheck ~14%. Round 27 parallelised the
+  vcheck (level 6 default), so that share is now spread over 1080 workgroups.
 - `src/eedi3.comp`: MDIS 20 → TPITCH 41, CENTER 20, BT_TILE 32, SGSIZE 32, K 2,
-  RING_CAP 7. `VCHECK_LDS` defaults to 0 (global-read form, round 21).
+  RING_CAP 7. `VCHECK_LDS` defaults to 0 (global-read form, round 21); the
+  parallel vcheck (`VCHECK_PARA=6`) is the default since round 27.
 
 ## References (five backends, same GPU)
 
@@ -568,16 +570,46 @@ flat as control.
   `shared` flag; three shadowed locals in nnedi3; a signed/unsigned block-size
   comparison in bilateral. 603 tests pass.
 
+## Round 27 — the vcheck is parallel by default; a Jacobi ladder controls drift
+
+- **The serial row walk is gone from the shipped path.** Row r takes `d2p` from
+  the *un-vchecked* dst row r-1, so no vcheck write feeds another row: the pass
+  runs one workgroup per interp row (`grid (1, rows, 1)`) and needs no vcopy
+  (the parallel walk writes every row itself). Same-session A/B, 5 order-reversed
+  2000-frame pairs on the honest path (ns=8, real 2x2160p based_aa chain):
+  EEDI3 **497.96 -> 628.68 fps, +26%** (per-pair ratio 1.253-1.285x; the serial
+  arm alone swings ~10% between sessions, the parallel arm does not). EEDI3AA,
+  1000-frame reps: **108.3 -> 160.2 fps, +48%** at the shipped level.
+- **The drift is a blend decision flip, and extra Jacobi steps decay it
+  geometrically.** At `a == 1` the output is `cint_s` whatever `d2p` is, so
+  feeding the predecessor row's own (one-step-less) parallel value reproduces
+  the serial value at those pixels. Level N = N-1 extra steps. Drift vs the
+  serial walk, real jpbd frames 300-305, benchmark config:
+
+  | level | EEDI3 fps | u16 max (of 65535) | fp32 max |
+  |---|---|---|---|
+  | serial | 498.0 | — | — |
+  | 1 | 631.3 | 4157 on 0.072% px | 0.088 on 0.108% px |
+  | 3 | 635.7 | 580 on 0.018% | 0.021 on 0.037% |
+  | 5 | — | 36 on 0.003% | 0.0017 on 0.012% |
+  | 6 | 628.7 | 5 on 0.0007% | 2.8e-4 on 0.006% |
+
+  (The fps column mixes two adjacent sessions; the vertical path pays nothing
+  for the steps. EEDI3AA runs the vcheck twice, so the steps cost it ~5 points:
+  167.6 fps (+55%) at level 1 against 160.2 (+48%).)
+- **Default is level 6**, the lowest that is bit-exact on the whole tested
+  surface: all 236 EEDI3/EEDI3H/EEDI3AA tests pass unmodified, u16 vs eedi3vk2
+  stays 0 and fp32 stays at the serial ulp on the noise clip. Level 3 is the
+  first that is not (1 code on three reference cases). `VSFEEL_EEDI3_VPARA=0`
+  restores the serial walk as the A/B control; 1..6 pin a level. Test
+  `test_eedi3_parallel_vcheck_matches_serial` pins the two arms together.
+- The ladder costs no extra dispatches: one shared `vc_blend` and a
+  macro-generated driver per d2p source. The LDS form (`VCHECK_LDS`) is
+  untouched and still selected by `VSFEEL_EEDI3_VCLDS=1`; the parallel level
+  wins when both are set.
+
 ## Open work
 
-- **A1. Parallel vcheck — the one lever with real upside.** Feed the d2p term from
-  the unvchecked `dst[r-1]` so rows become independent and the serial 1080-barrier
-  walk becomes a per-row parallel pass; the whole vcheck cost is the ceiling, i.e.
-  the `NOVC` arm, **+18-27%** on the honest path. Costs real accuracy; the only
-  measurement ever taken (round 11: 1.2e-3 drift vs the f32 reference) came from
-  the degenerate config where it measured *neutral*, so it must be re-measured.
-  Prerequisite: an agreed drift policy on the noise clip plus
-  `tests/test_eedi3.py` tolerance updates.
 - **A2. Row-kernel work — round 20 closed the two proposed levers as dead; the
   kernel is ~17% of the vertical frame (~25% of EEDI3AA).** Done and kept:
   rolling-with-mclip (+76%, 15.D) and the walk reading pbt directly (+9-13%, 15.C).
@@ -593,8 +625,9 @@ flat as control.
   - BT_TILE as a spec constant swept {16,32,64}; hoisting duplicated `cubic_float`
     evaluations; fixed-per-invocation floats as spec constants; parallelising the
     serial span scan. All bounded by the ~17% share.
-  - The row kernel is now fast enough that **the vcheck (~14%) and the host stages
-    matter again** — re-run the ladder before assuming anything.
+  - The row kernel is now fast enough, and the vcheck is parallel since round
+    27, that **the host stages matter again** — re-run the ladder before
+    assuming anything.
 - **A3. Fuse the vcheck across planes** (one launch, `gl_WorkGroupID.y = plane`, as
   vszipcl does) — YUV-only, cannot move the Gray flagship, real for colour AA. Not
   attempted. Nothing else in the host path pays: `record_command_buffer` is
@@ -660,9 +693,12 @@ the reason a variant failed, not as a current number.
   walk must visit every row while the global form skips fully-masked rows. Both
   sides are real and the reversal is workload-dependent (row-mask density), so
   re-check it if the mask mix changes.
-- **Parallel vcheck via unvchecked `d2p`** (round 11: "neutral while costing
-  accuracy"): **(stale)** — neutral only because the vcheck did nothing in the
-  degenerate config. Promoted to **A1**.
+- **Parallel vcheck — SHIPPED (round 27).** Feeding `d2p` from the un-vchecked
+  `dst[r-1]` is a real accuracy change (u16 drift up to 4157 codes on 0.07% of
+  real-content pixels), but each extra Jacobi step multiplies the exact pixels,
+  so level 6 (five steps, free on the vertical path, ~5% on EEDI3AA) is
+  bit-exact on the whole tested surface. Do not re-open level 1: it is the
+  fastest arm but gives up the u16 bit-exactness invariant.
 - **(stale) batch**: a single contiguous blit instead of per-row strided copies
   (525 vs 555); plain `memcpy` instead of the NT load/store pair anywhere in the
   frame path (blit 6.1 → 10.4 ms/frame; vc0 481 → 401); skipping the pbt global
@@ -726,6 +762,8 @@ the reason a variant failed, not as a current number.
 - `VSFEEL_EEDI3_DSTHOST` — `=1` per-frame host-pointer output import (default off).
 - `VSFEEL_EEDI3_AATIGHT` — `=0` restores the pre-round-21 EEDI3AA compose.
 - `VSFEEL_EEDI3_VCLDS` — `=1` forces the LDS vcheck ping-pong back (global is default).
+- `VSFEEL_EEDI3_VPARA` — vcheck form: 0 = serial row walk (A/B control), 1..6 =
+  parallel with that many Jacobi steps. Default 6 (bit-exact on the test surface).
 - `VSFEEL_EEDI3_QUEUES` — queue cap override (default `min(num_streams, queue_count)`).
 - `VSFEEL_EEDI3_COPY` — 0..7 bit mask: bit0 NT raw gather, bit1 NT kept rows, bit2 NT blit.
 - `VSFEEL_EEDI3_MASKFUSE` — `=0` A/Bs the pre-round-19 two-pass mask path.
