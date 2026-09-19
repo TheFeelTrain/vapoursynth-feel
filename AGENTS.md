@@ -66,6 +66,9 @@ standard test input.
   (`WIDTH`, `HEIGHT`, `NOISE_MKV`, `frame_to_ndarray`, ...).
 - Always run the full test suite for the filter you touch before and after
   changes: `python -m pytest tests/test_<filter>.py -q`
+- **The suite loads the installed plugin, not `build/libvsfeel.so`.** After any
+  C++ or shader change, build *and install* with `tools/install.sh` — one
+  command — before running pytest, or you are testing the previous binary.
 - A rewrite is only acceptable if all tests still pass.
 
 ### Reference-comparison coverage and tolerance policy
@@ -290,9 +293,9 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   and lengthen the run before trusting any absolute number (short runs are
   clock-ramp-sensitive).
 - **Never chain build → install → test into one command** (a failed compile
-  then silently leaves the stale `.so` installed). Verify binary freshness
-  (timestamp-compare, `strings`-grep the installed `.so`) before trusting any
-  measurement.
+  then silently leaves the stale `.so` installed). Build and install with
+  `tools/install.sh` — one command that does both and does not exit until the
+  installed copy's sha256 matches the build — then test in a separate command.
 - **Prove the host/GPU split before optimizing anything.** Add a small
   env-gated chrono probe around the frame path (CPU staging / GPU
   submit-wait / download-and-blit) and read it on real content first — kernel
@@ -517,18 +520,40 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   list of measured non-wins) — worth reading before starting a new filter,
   even though none of it is EEDI3-specific.
 
-## Building
+## Building and installing
 
-The build uses CMake + `glslc` (Vulkan shader compiler).
+**Build with `tools/install.sh`. It builds *and* installs in a single command.**
+There is no separate copy step and no reason to run `cmake` by hand — a
+hand-built `libvsfeel.so` that was never copied into the plugin directory is
+invisible to VapourSynth, so the tests and the benchmark quietly keep exercising
+the previous binary.
+
+```bash
+tools/install.sh                 # configure + build + install, then hash-verify
+tools/install.sh -h              # -b build dir, -p plugin dir, -c build type
+```
+
+That one command configures `build/` (Release) with CMake + `glslc` (the Vulkan
+shader compiler), compiles the plugin, copies `libvsfeel.so` into
+VapourSynth's plugin directory, and **fails unless the installed copy's sha256
+equals the build's**. It asks `vapoursynth.get_plugin_dir()` where the running
+Python loads plugins from, so a venv installs into the venv;
+`VSFEEL_BUILD_DIR` and `VSFEEL_PLUGIN_DIR` override the autodetection. A run
+whose plugin directory already matches the build is a no-op.
+
+The bare CMake rules are only for a compile-only check that must not touch the
+installed plugin:
 
 ```bash
 cmake -S . -B build -D CMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
 
-`tools/install.sh` wraps those two steps, copies the result into VapourSynth's
-plugin directory, and fails unless the installed copy hashes equal the build —
-prefer it to copying by hand (see below).
+**Never chain build → install → test into one shell command.** If the compile
+fails, the previous `.so` stays installed and the test run silently "passes"
+against a binary that does not contain your change. Build *and install* with
+`tools/install.sh`, confirm the two hashes it prints match, then run the tests
+or the benchmark as a separate command.
 
 Vulkan headers (`Vulkan-Headers`) and the loader shim (`volk`) are pinned and
 fetched by `FetchContent` at configure time, so no Vulkan SDK is needed to link
@@ -570,29 +595,6 @@ changed `-D`, `--target-env` or `PROBE`/`MAXW` cache value leaves a stale
 invalidated a round of measurements once). The stamp is written with
 `file(GENERATE)` and content-hashed, so an unrelated `CMakeLists.txt` edit does
 not recompile the shaders. Do not remove it.
-
-### Installing the built plugin
-
-Use `tools/install.sh`: it configures and builds, copies the shared object into
-VapourSynth's plugin directory, and fails unless the installed copy hashes equal
-the build.
-
-```bash
-tools/install.sh                 # build/ + the plugin dir of the running Python
-tools/install.sh -h              # -b build dir, -p plugin dir, -c build type
-```
-
-It asks `vapoursynth.get_plugin_dir()` where the running Python loads plugins
-from, so a venv installs into the venv; `VSFEEL_BUILD_DIR` and
-`VSFEEL_PLUGIN_DIR` override the autodetection. The copy is skipped when the
-installed plugin already matches the build, so re-running it after an unrelated
-change is a no-op.
-
-Then re-run the tests / benchmark. The copy step is needed every time you
-rebuild, or you will benchmark a stale plugin — and never fold the build and the
-test run into one shell command (rule above): if the compile fails, the stale
-plugin stays installed and silently "passes". The hash check in this script is
-what makes that loud, since a stale `.spv` once masqueraded as a working build.
 
 ### Persistent pipeline cache (makes creation and the test suite fast)
 
@@ -642,12 +644,13 @@ working tree and describe what should be committed.
 
 1. Read the reference implementation for the filter in `reference/`.
 2. Check the current vsfeel implementation and its tests.
-3. Build and run the benchmark + tests to get a baseline.
+3. Build and install with `tools/install.sh` (one command, hash-verified), then
+   run the benchmark + tests to get a baseline.
 4. **Measure the host/GPU split before optimizing** (the chrono probe), then
    run an ablation ladder (remove-all / remove-half) to find which side is
    actually the limiter. Do not assume it is the kernels.
 5. Optimize / port, keeping each candidate behind an env opt-out so it can be
-   A/B'd in situ, and re-sweep the stream knee afterwards. Rebuild and copy
-   the `.so` as described above.
+   A/B'd in situ, and re-sweep the stream knee afterwards. Rebuild and install
+   with `tools/install.sh` (it does both), then re-measure.
 6. Re-benchmark and re-test; keep going until vsfeel is faster than the
    references while still passing all tests.
