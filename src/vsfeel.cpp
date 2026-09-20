@@ -768,6 +768,44 @@ void copy_stream_out(void * dst, const void * src, size_t bytes) {
     }
 }
 
+void copy_stream_rows(void * dst, ptrdiff_t dst_pitch, const void * src,
+                      ptrdiff_t src_pitch, size_t row_bytes, int height) {
+    if (height <= 0 || row_bytes == 0) {
+        return;
+    }
+    uint8_t * d = static_cast<uint8_t *>(dst);
+    const uint8_t * s = static_cast<const uint8_t *>(src);
+    const size_t head = (32 - (reinterpret_cast<uintptr_t>(d) & 31)) & 31;
+    if ((dst_pitch & 31) != 0 || head > row_bytes) {
+        for (int r = 0; r < height; ++r) {
+            copy_stream_out(d + static_cast<ptrdiff_t>(r) * dst_pitch,
+                s + static_cast<ptrdiff_t>(r) * src_pitch, row_bytes);
+        }
+        return;
+    }
+    if (head > 0) {
+        for (int r = 0; r < height; ++r) {
+            std::memcpy(d + static_cast<ptrdiff_t>(r) * dst_pitch,
+                s + static_cast<ptrdiff_t>(r) * src_pitch, head);
+        }
+    }
+    const size_t body = row_bytes - head;
+    for (int r = 0; r < height; ++r) {
+        uint8_t * dr = d + static_cast<ptrdiff_t>(r) * dst_pitch + head;
+        const uint8_t * sr = s + static_cast<ptrdiff_t>(r) * src_pitch + head;
+        size_t i = 0;
+        for (; i + 64 <= body; i += 64) {
+            _mm256_stream_si256(reinterpret_cast<__m256i *>(dr + i),
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(sr + i)));
+            _mm256_stream_si256(reinterpret_cast<__m256i *>(dr + i + 32),
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(sr + i + 32)));
+        }
+        if (i < body) {
+            std::memcpy(dr + i, sr + i, body - i);
+        }
+    }
+}
+
 void copy_stream_read(void * dst, const void * src, size_t bytes) {
     const uint8_t * s = static_cast<const uint8_t *>(src);
     uint8_t * d = static_cast<uint8_t *>(dst);

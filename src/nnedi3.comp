@@ -290,15 +290,16 @@ const int PXP = ((((NNS + 31) / 32) <= 2) && (FS <= 128)) ? 8 : 4;
 const int EPLX = (FS + 31) / 32;
 const int PPL = (NNS + 31) / 32;
 
+// Shared tile stride in vec4 rows. Must always be a -D: the array dimension
+// below cannot depend on PXP/FS (spec constants), and the old GLSL-const
+// fallback silently disagreed with the #if that sized the array, so PXP=8
+// addressed 256 while 288 was allocated. The default variant is selected by
+// the host only for PXP=8 (256), n4 for PXP=4 (288), n4s for FS<=64 (64).
 #ifndef SHSTRIDE
-const uint SHSTRIDE = (PXP == 8) ? 256u : 288u;
+#define SHSTRIDE 288u
 #endif
 
-#if defined(SHSTRIDE)
 shared vec4 shTile[4 * SHSTRIDE];
-#else
-shared vec4 shTile[4 * 288];
-#endif
 
 // ---- one work unit (PXP pixels at FIRST, NPX valid): window stats into
 // shared, vec4 GEMV, wae5 blend, store. Used by both the fast path and
@@ -329,7 +330,7 @@ shared vec4 shTile[4 * 288];
             float s2 = 0.0; \
             [[unroll]] for (int t = 0; t < EPLX; t++) { \
                 const int e = int(lane) + t * 32; \
-                if (e >= FS) \
+                if (FS % 32 != 0 && e >= FS) \
                     continue; \
                 const float d = vt[t] - mean; \
                 s2 += d * d; \
@@ -349,7 +350,7 @@ shared vec4 shTile[4 * 288];
             result[px] = 0.0; \
             [[unroll]] for (int t = 0; t < EPLX; t++) { \
                 const int e = int(lane) + t * 32; \
-                if (e >= FS) \
+                if (FS % 32 != 0 && e >= FS) \
                     continue; \
                 shTile[shBase + uint(e)][px % 4] = vt[t] * m2; \
             } \

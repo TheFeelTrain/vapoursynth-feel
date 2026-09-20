@@ -2,22 +2,27 @@
 
 *vsfeel's Vulkan port of nnedi3vk (refs `VapourSynth-nnedi3vk` / `vapoursynth-zipcu` / CPU `znedi3`).*
 
-Status: **shipped**, `num_streams = 4` (`1..32`), ~10 MB VRAM/stream (per-stream
-buffer sum; 16.7 MB before the dead pad/assemble buffers were deleted). Scoreboard
-is median-of-5 same-session pairs, jpbd 1080p GRAY16, bench defaults
-(`field=3 dh=0 nsize=0 nns=4 qual=2 etype=0 pscrn=4`); nnedi3vk in the ref column:
+Status: **shipped**, `num_streams = 4` (`1..32`), ~8 MB VRAM/stream plus
+`num_streams + 2` shared GTT download slots (per-instance VRAM 33.8 MiB measured
+at ns=4, 1080p GRAY16 — unchanged: the download staging is host memory, and the
+split adds 2 slots ≈ 4 MB system RAM). Scoreboard is one session, median-of-3,
+jpbd 1080p GRAY16 bench defaults (`field=3 dh=0 nsize=0 nns=4 qual=2 etype=0
+pscrn=4`, 2000 frames); nnedi3vk in the ref column:
 
 | ns | vsfeel | ref | ratio |
 |---|---|---|---|
-| 1 | 1330 | 1550 | 0.86 |
-| 2 | 2320 | 2360 | 0.985 |
-| 4 (shipped) | 2650 | 2520 | **1.05** |
-| 6 | 2765 | 2560 | 1.08 |
-| 8 | 2814 | 2584 | 1.09 |
+| 1 | 1574 | 1633 | 0.96 |
+| 2 | 2625 | 2501 | 1.05 |
+| 4 (shipped) | 2961 | 2628 | **1.13** |
+| 6 | 2966 | 2638 | 1.12 |
+| 8 | 3028 | 2674 | 1.13 |
 
-- Bench `default_streams = 4` too, so out-of-box is ~2640 vs ref default-2s ~2360.
-- Remaining gap is all 1-stream: kernels at parity (pre 55 / pred 195-200 / copy
-  89 µs vs ref 34 / 179 / 89), our host bill ~600 µs serial.
+- Bench `default_streams = 4` too. 4 is within ~2% of the 6/8 plateau and stays
+  the shipped default on per-stream efficiency (734 vs 375 fps/stream).
+- The remaining ns=1 gap (0.96) is host/copy side: the interp scatter alone is
+  worth +15% at ns=4 and +8% at ns=1 (SKIPIL ablation) and is DRAM-bound, not
+  instruction-bound. Kernels are at parity (pre 55 / pred 195-200 / copy 89 µs
+  vs ref 34 / 179 / 89).
 - Agreement: nnedi3vk vs vszipcu **BIT-EXACT** (maxdiff 0, frames 0/5/11, all
   planes, noise_24f → YUV420P8 field=1); vs CPU znedi3 maxdiff 5, ~1% px (CPU
   float ordering) — **nnedi3vk is ground truth**.
@@ -60,8 +65,8 @@ Per plane (output W×H, interp rows = H/2): **field extract** (kept rows per
 
 ## Implementation (what ships)
 
-`src/nnedi3.comp` — two entries, BITS=16/32, plus `predict_n4` (`-DPXP=4`) and
-`predict_n4s` (`-DPXP=4 -DSHSTRIDE=64u`):
+`src/nnedi3.comp` — two entries, BITS=16/32, plus `predict_n4` (`-DPXP=4
+-DSHSTRIDE=288u`) and `predict_n4s` (`-DPXP=4 -DSHSTRIDE=64u`):
 
 - `ENTRY_PRESCREEN` — 128 threads, one per pixel group (P=1 at pscrn=1, else 4);
   cubic taps + verdict inline, cubic store or list compaction (one `atomicAdd` per
@@ -69,27 +74,62 @@ Per plane (output W×H, interp rows = H/2): **field extract** (kept rows per
   width itself** (`atomicMax(groupsX)` off the `atomicAdd` return) — no count
   dispatch. Grid `ceil(rows*ceil(width/P)/128)`.
 - `ENTRY_PREDICT` — 128 threads = 4 subgroups, one per PXP pixels; PXP = 8 when
-  `ceil(nns/32) <= 2 && fs <= 128` else 4; shared tile `shTile[4*SHSTRIDE]` (288,
-  or 256 for `n4s`). Subgroup-add window stats, GEMV from the shared tile, wae5
-  blend. Indirect off the prescreen count for pscrn>0, direct grid for pscrn=0.
+  `ceil(nns/32) <= 2 && fs <= 128` else 4; shared tile `shTile[4*SHSTRIDE]` —
+  `SHSTRIDE` is always a `-D` (256 for the PXP=8 default, 288 for `n4`, 64 for
+  `n4s`). Subgroup-add window stats, GEMV from the shared tile, wae5 blend.
+  Indirect off the prescreen count for pscrn>0, direct grid for pscrn=0.
 
 `src/nnedi3.cpp`: `FramePool` of `Nnedi3Resource` (ODR-unique); host-mapped ReBAR
 upload staging (`DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`), device-local
 dst/list/indirect buffers, persistent-mapped weights; descriptors 0-6 per stream;
 5 push words `{list, up, dst, parity, d_base}`.
 
-- **Two pre-recorded CBs per resource** (one per parity, at create). Per frame:
-  CPU pack → submit → host scatter. CB per plane: indirect-struct reset (list mode
-  only) → prescreen → barrier → indirect predict → barrier → inline
-  `vkCmdCopyBuffer` of the packed interp dst → host barrier: no H2D, no GPU pad, no
-  assemble, no transfer queue.
-- Pack: tight field rows via `copy_stream_out` (NT) + `_mm_sfence()`, reading the
+- **Two pre-recorded compute CBs per resource** (one per parity, at create), each
+  per plane: indirect-struct reset (list mode only) → prescreen → barrier →
+  indirect predict → barrier (`no H2D`, no GPU pad, no assemble, no transfer
+  queue). A third CB per resource is **re-recorded every frame**
+  (`record_copy_command_buffer`, pool created with `RESET_COMMAND_BUFFER`) because
+  the D2H destination is chosen per frame: the interp `vkCmdCopyBuffer` plus the
+  `TRANSFER_WRITE → HOST_READ` barrier. Both CBs go out as one `vkQueueSubmit`.
+  Per frame: CPU pack → take a download slot → submit → host scatter.
+- **Download slots** (`Nnedi3Download`): `num_streams + 2` host-visible GTT
+  staging buffers pooled apart from the streams, so the stream is handed back as
+  soon as its fence signals — the next frame packs while this frame's scatter is
+  still reading the slot (the reference's rb-slot pattern).
+- Pack: tight field rows via `copy_stream_rows` (NT) + `_mm_sfence()`, reading the
   kept rows out of `dst` for non-dh (copied from `src` pre-acquire, cache-hot);
   kept lines are copied **before** `pool.take()` to overlap other frames' GPU work.
 - Args: field/dh/planes/nsize/nns/qual/etype/pscrn/device_id/num_streams; 16-bit
   int + 32-bit float only (8-bit/f16 rejected); `field:int;` is **required**.
 
 ## Historical
+
+### 2026-09-20 — download slot pool split (+7.7% at 1 stream, neutral at ns>=4)
+
+- Same-session alternating pairs, jpbd 1080p GRAY16 bench defaults, ns=1:
+  1473 → 1587 fps (4 rounds of median-of-3; per-config spread 1-3%). The stream
+  now goes back after its fence, so the next frame's pack overlaps this frame's
+  scatter. ns=2 2546 → 2560, ns=4 2922 → 2890: at >=4 streams the scatter already
+  overlaps, and the extra concurrency only adds memory contention (BENCH shows
+  pack 450 → 593 us/frame, kept 839 → 989).
+- The scatter is the biggest single host cost: `SKIPIL=1` (skip the stride-2 NT
+  scatter only) is +15% at ns=4 (3069 → 3541) and +8% at ns=1. It is DRAM-write
+  bound (~24 GB/s over 540 rows), so an instruction diet cannot remove it — only
+  overlap or fewer bytes.
+- `copy_stream_rows` hoists the per-row NT alignment prologue (one call per plane,
+  one alignment computation): ~1% of the interp stage at ns=1 (85.1 → 84.3 us),
+  nothing end-to-end. Kept anyway (strictly less work; also covers the pitched
+  fallback).
+- `SHSTRIDE` (the dead `#if defined(SHSTRIDE)`/GLSL-const trap): default predict
+  variant now gets `-DSHSTRIDE=256u`, `n4` 288, `n4s` 64. **No LDS change**:
+  RADV reports 15360 B for PXP=8 before and after because it sizes by the used
+  range, not the declared array. Latent-OOB fix only.
+- `if (e >= FS)` → `if (FS % 32 != 0 && e >= FS)` (reference form): the SPIR-V
+  gains the spec-constant `SMod`, but the ACO ISA is byte-identical — for FS a
+  multiple of 32 the old guard already folded (lane <= 31, `t` unrolled). Kept as
+  source truth; no perf change.
+- Sweeps on the final binary: queue cap 2 still best (Q1 2811 / Q2 3007 / Q3 2884
+  / Q4 2967 at ns=4); ns 4/6/8 = 2961/2966/3028, so 4 stays the shipped default.
 
 ### 2026-09-20 — dead pad/assemble/count path deleted (38% of per-stream VRAM)
 
@@ -201,9 +241,11 @@ H2D was ours to lose (~80 µs for 2 MB vs their 129).
 
 ## Open work
 
-- **1-stream host bill** (~600 µs: pack ~170 + kept ~335 + interp ~87 + submit ~18).
-  The kept 2 MB strided memcpy runs at ~6 GB/s effective and is hardware-bound;
-  further wins need fewer host bytes (`VK_EXT_external_memory_host`, not attempted).
+- **Host bill, both halves copy-bound**: the interp scatter (2 MB stride-2 NT
+  stores, ~24 GB/s) is worth +15% at ns=4 / +8% at ns=1 when skipped; the kept
+  stride-2 memcpy (~8 GB/s effective) is the other half. Both need *fewer host
+  bytes*, not a tighter loop — `VK_EXT_external_memory_host` zero-copy is the
+  only exit and EEDI3 measured it catastrophic on this driver (not retried).
 - **Prescreen is ~2.8x the reference** (140 vs 50 µs when measured): compare ISA
   against their pattern (scalar `float v[EPL]`, warp shuffles, no shared), check
   VGPR/occupancy and the `precise` chains.

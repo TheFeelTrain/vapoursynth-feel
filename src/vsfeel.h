@@ -613,6 +613,14 @@ inline std::optional<std::string> require_vulkan_1_3(
 // GPU work that reads `dst` (same for copy_plane_out with nt=true).
 void copy_stream_out(void * dst, const void * src, size_t bytes);
 
+// Row-wise copy_stream_out over `height` rows of `row_bytes` bytes. When the
+// destination pitch is a multiple of 32 every row shares one 32-byte
+// alignment, so the store-alignment prologue is resolved once for the plane
+// instead of once per row (the scalar head/tail bytes stay per row — NT
+// stores must be aligned). Falls back to per-row copy_stream_out otherwise.
+void copy_stream_rows(void * dst, ptrdiff_t dst_pitch, const void * src,
+                      ptrdiff_t src_pitch, size_t row_bytes, int height);
+
 // Streaming copy variant that reads the GPU-written staging without caching
 // it (non-temporal loads) before writing the destination with streaming stores.
 // The 32-byte-aligned source fast path is used only when the source actually
@@ -878,11 +886,13 @@ void destroy_common(VkDevice dev, T & r) {
     if (r.fence) {
         vkDestroyFence(dev, r.fence, nullptr);
     }
-    if (r.staging_mem) {
-        vkFreeMemory(dev, r.staging_mem, nullptr);
-    }
-    if (r.staging) {
-        vkDestroyBuffer(dev, r.staging, nullptr);
+    if constexpr (requires { r.staging; r.staging_mem; }) {
+        if (r.staging_mem) {
+            vkFreeMemory(dev, r.staging_mem, nullptr);
+        }
+        if (r.staging) {
+            vkDestroyBuffer(dev, r.staging, nullptr);
+        }
     }
 }
 
@@ -919,12 +929,15 @@ inline void retire_instance(const FramePool<T> & pool) {
     }
 }
 
-// Submit a single pre-recorded command buffer with an optional fence,
-// serialized on the queue's lock. The fence is reset inside the lock; the
-// caller waits on it separately, outside the lock, so other frames keep
-// submitting while this one is in flight.
+// Submit command buffers with an optional fence, serialized on the queue's
+// lock. The fence is reset inside the lock; the caller waits on it separately,
+// outside the lock, so other frames keep submitting while this one is in
+// flight. The multi-buffer form shares one lock/fence/signal, so a small
+// per-frame re-recorded buffer (e.g. a download copy whose destination changes
+// per frame) can ride along with a pre-recorded compute buffer.
 inline VkResult submit_with_fence([[maybe_unused]] VkDevice dev, VkQueue queue,
-                                  std::mutex * qlock, VkCommandBuffer cb,
+                                  std::mutex * qlock,
+                                  const VkCommandBuffer * cbs, uint32_t count,
                                   VkFence fence) {
     std::lock_guard lock(*qlock);
     if (fence != VK_NULL_HANDLE) {
@@ -938,12 +951,18 @@ inline VkResult submit_with_fence([[maybe_unused]] VkDevice dev, VkQueue queue,
         .waitSemaphoreCount = 0,
         .pWaitSemaphores = nullptr,
         .pWaitDstStageMask = nullptr,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &cb,
+        .commandBufferCount = count,
+        .pCommandBuffers = cbs,
         .signalSemaphoreCount = 0,
         .pSignalSemaphores = nullptr
     };
     return vkQueueSubmit(queue, 1, &submit_info, fence);
+}
+
+inline VkResult submit_with_fence(VkDevice dev, VkQueue queue,
+                                  std::mutex * qlock, VkCommandBuffer cb,
+                                  VkFence fence) {
+    return submit_with_fence(dev, queue, qlock, &cb, 1, fence);
 }
 
 // Timeline-semaphore submit: the command buffer waits (device-side) on
