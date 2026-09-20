@@ -54,8 +54,14 @@ struct Bm3dStream {
     VkDeviceMemory dst_mem {};
     float * dst_map {};
     VkCommandPool pool {};
-    VkCommandBuffer cmd {};
+    VkCommandBuffer cmd {};       // == est_cmds[0], kept for destroy_common
     VkCommandBuffer cmd_agg {};   // aggregation phase: recorded after the waits
+    // One command buffer per recomputed window position, and how many this
+    // frame recorded. A single submission holding all of them can run past
+    // Windows' TDR watchdog (about 2 s) on a slow card, where the driver's
+    // reset fails and the machine freezes instead of reporting a lost device.
+    std::array<VkCommandBuffer, 2 * MAX_RADIUS + 1> est_cmds {};
+    int est_cb_count {};
     VkFence fence {};
     VkSemaphore timeline {};
     VkDescriptorSet desc_set {};
@@ -177,6 +183,9 @@ struct BM3DData {
     // the legacy-name fallback) sixteen times per frame on the default path.
     bool trace { false };
     bool dump { false };
+    // Submit one command buffer per recomputed window position instead of one
+    // holding them all (VSFEEL_BM3D_SPLIT=0 restores the single submission).
+    bool split_est { true };
     std::atomic<uint64_t> ht_take_ns {}, ht_acquire_ns {}, ht_upload_ns {},
         ht_record_ns {}, ht_srcwait_ns {}, ht_agg_ns {}, ht_fence_ns {},
         ht_down_ns {}, ht_total_ns {}, ht_n {};
@@ -454,9 +463,90 @@ static void release_cache(BM3DData * d, Bm3dStream & stream, int n) {
 // windows, and each frame only writes its own res slot. It is submitted before
 // the cross-frame wait so the GPU is busy with this heavy work while the host
 // blocks on the previous frames' timelines.
+// Zero-fill one result slot and dispatch the estimation kernel for it. Separate
+// so each recomputed position can be recorded into its own command buffer: a
+// frame's estimation is the search run over every window position it is missing,
+// and on a slow card the total can run past the driver's watchdog window.
+static void record_est_position(BM3DData * d, Bm3dStream & stream, VkCommandBuffer cmd,
+                                int n, int i) {
+    const int r = d->radius;
+    const int nf = d->nframes;
+    const int slot = stream.win_slots[i];
+    const int m_i = std::clamp(n - r + i, 0, nf - 1);
+    if (d->dump) fprintf(stderr, "[d] n=%d computes slot %d for frame %d\n", n, slot, m_i);
+    for (int plane = 0; plane < d->n_planes; ++plane) {
+        const auto & p = d->planes[plane];
+        const VkDeviceSize pe = p.pe;
+
+        const VkDeviceSize res_off = (static_cast<VkDeviceSize>(slot) * d->tw * 2 * pe +
+            static_cast<VkDeviceSize>(plane) * d->res_size_per_plane);
+        vkCmdFillBuffer(cmd, d->res_buf, res_off * 4, d->tw * 2 * pe * 4, 0);
+
+        // the zero-fill must be visible to the atomic accumulation that
+        // follows it in the next dispatch
+        {
+            VkMemoryBarrier mem_barrier {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+            };
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+        }
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.bm3d_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            d->pipeline_layout, 0, 1, &stream.desc_set, 0, nullptr);
+        {
+            const int32_t pushes[4] {
+                static_cast<int32_t>(res_off),
+                m_i,
+                nf,
+                static_cast<int32_t>((r == 0) ? stream.stream_id : 0)
+            };
+            vkCmdPushConstants(cmd, d->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                0, sizeof(pushes), pushes);
+        }
+        vkCmdDispatch(cmd, p.bm3d_grid_x, p.bm3d_grid_y, 1);
+    }
+}
+
 static int record_bm3d_kernels(BM3DData * d, Bm3dStream & stream, int n,
                      const std::array<bool, 4 * MAX_RADIUS + 1> & uploaded) {
-    VkCommandBuffer cmd = stream.cmd;
+    const int nf = d->nframes;
+    const int r = d->radius;
+    const bool gputrace = d->gpu_trace && stream.ts_query != VK_NULL_HANDLE;
+
+    // Which window positions need computing. A clamped window collapses several
+    // positions onto one slot and one centre frame, i.e. identical dispatches
+    // whose fills wipe each other, so only one of them is kept.
+    int pos[2 * MAX_RADIUS + 1] {};
+    int n_pos = 0;
+    for (int i = 0; i < d->tw; ++i) {
+        if (!stream.win_recompute[i]) {
+            continue;
+        }
+        const int m_i = std::clamp(n - r + i, 0, nf - 1);
+        const int slot = stream.win_slots[i];
+        bool duplicate_later = false;
+        for (int j = i + 1; j < d->tw && !duplicate_later; ++j) {
+            duplicate_later = stream.win_recompute[j] && stream.win_slots[j] == slot &&
+                std::clamp(n - r + j, 0, nf - 1) == m_i;
+        }
+        if (!duplicate_later) {
+            pos[n_pos++] = i;
+        }
+    }
+    // A frame with nothing to recompute still needs a command buffer for its
+    // uploads and for the timeline signal every consumer waits on.
+    stream.est_cb_count = (d->split_est && n_pos > 0) ? n_pos : 1;
+
+    // copy the frames uploaded by the host (the union of all windows that this
+    // record's dispatches may need, clamped to [n-2r, n+2r]) into the src ring
+    const int lo = std::clamp(n - 2 * r, 0, nf - 1);
+    const int hi = std::clamp(n + 2 * r, 0, nf - 1);
+    const int clips = d->final ? 2 : 1;
 
     VkCommandBufferBeginInfo begin_info {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -464,103 +554,51 @@ static int record_bm3d_kernels(BM3DData * d, Bm3dStream & stream, int n,
         .flags = 0,
         .pInheritanceInfo = nullptr
     };
-    vkBeginCommandBuffer(cmd, &begin_info);
+    // Every position gets its own submission, so no single one can approach the
+    // watchdog. The first carries the uploads and the timeline signal still
+    // fires only after the last, which leaves the cross-frame sync unchanged:
+    // a consumer waits for the whole estimation exactly as it did before.
+    for (int c = 0; c < stream.est_cb_count; ++c) {
+        VkCommandBuffer cmd = stream.est_cmds[c];
+        vkBeginCommandBuffer(cmd, &begin_info);
 
-    const int nf = d->nframes;
-    const int r = d->radius;
-    const bool gputrace = d->gpu_trace && stream.ts_query != VK_NULL_HANDLE;
-
-    // copy the frames uploaded by the host (the union of all windows that this
-    // record's dispatches may need, clamped to [n-2r, n+2r]) into the src ring
-    const int lo = std::clamp(n - 2 * r, 0, nf - 1);
-    const int hi = std::clamp(n + 2 * r, 0, nf - 1);
-    const int clips = d->final ? 2 : 1;
-    for (int f = lo; f <= hi; ++f) {
-        if (!uploaded[f - lo]) {
-            continue;
-        }
-        const int src_slot = (r == 0) ? stream.stream_id : (f % d->src_ring);
-        const VkDeviceSize slot_staging = static_cast<VkDeviceSize>(f - lo) * clips * d->planes[0].pe;
-        const VkDeviceSize slot_device = static_cast<VkDeviceSize>(src_slot) * clips * d->planes[0].pe;
-        for (int plane = 0; plane < d->n_planes; ++plane) {
-            const auto & p = d->planes[plane];
-            const VkDeviceSize pe = p.pe;
-            const VkDeviceSize plane_off = static_cast<VkDeviceSize>(plane) * d->src_size;
-            // source clip: second half of the slot in final mode
-            {
-                VkBufferCopy region {
-                    .srcOffset = (slot_staging + static_cast<VkDeviceSize>(clips - 1) * pe + plane_off) * 4,
-                    .dstOffset = (slot_device + static_cast<VkDeviceSize>(clips - 1) * pe + plane_off) * 4,
-                    .size = pe * 4
-                };
-                vkCmdCopyBuffer(cmd, stream.staging, d->src_buf, 1, &region);
+        if (c == 0) {
+            for (int f = lo; f <= hi; ++f) {
+                if (!uploaded[f - lo]) {
+                    continue;
+                }
+                const int src_slot = (r == 0) ? stream.stream_id : (f % d->src_ring);
+                const VkDeviceSize slot_staging = static_cast<VkDeviceSize>(f - lo) * clips * d->planes[0].pe;
+                const VkDeviceSize slot_device = static_cast<VkDeviceSize>(src_slot) * clips * d->planes[0].pe;
+                for (int plane = 0; plane < d->n_planes; ++plane) {
+                    const auto & p = d->planes[plane];
+                    const VkDeviceSize pe = p.pe;
+                    const VkDeviceSize plane_off = static_cast<VkDeviceSize>(plane) * d->src_size;
+                    // source clip: second half of the slot in final mode
+                    {
+                        VkBufferCopy region {
+                            .srcOffset = (slot_staging + static_cast<VkDeviceSize>(clips - 1) * pe + plane_off) * 4,
+                            .dstOffset = (slot_device + static_cast<VkDeviceSize>(clips - 1) * pe + plane_off) * 4,
+                            .size = pe * 4
+                        };
+                        vkCmdCopyBuffer(cmd, stream.staging, d->src_buf, 1, &region);
+                    }
+                    // ref clip (final mode only): first half of the slot
+                    if (d->final) {
+                        VkBufferCopy region {
+                            .srcOffset = (slot_staging + plane_off) * 4,
+                            .dstOffset = (slot_device + plane_off) * 4,
+                            .size = pe * 4
+                        };
+                        vkCmdCopyBuffer(cmd, stream.staging, d->src_buf, 1, &region);
+                    }
+                }
             }
-            // ref clip (final mode only): first half of the slot
-            if (d->final) {
-                VkBufferCopy region {
-                    .srcOffset = (slot_staging + plane_off) * 4,
-                    .dstOffset = (slot_device + plane_off) * 4,
-                    .size = pe * 4
-                };
-                vkCmdCopyBuffer(cmd, stream.staging, d->src_buf, 1, &region);
-            }
-        }
-    }
 
-    // the estimation dispatches read the freshly copied source/ref frames, so
-    // make the transfer writes visible to the compute stage before launching
-    // them (and order the res zero-fill ahead of the atomic accumulation)
-    {
-        VkMemoryBarrier mem_barrier {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
-        };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
-    }
-
-    // compute the missing result slots for the aggregation window
-    // (the frame n+r at the steady state; the boundary frames too)
-    if (gputrace) {
-        // a query must be reset before first use and before each reuse; doing
-        // it inside the command buffer keeps the reset ordered with the stamps
-        // (and with the aggregation command buffer submitted after this one)
-        vkCmdResetQueryPool(cmd, stream.ts_query, 0, 4);
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stream.ts_query, 0);
-    }
-    int n_dispatches = 0;
-    for (int i = 0; i < d->tw; ++i) {
-        if (!stream.win_recompute[i]) {
-            continue;
-        }
-        const int m_i = std::clamp(n - r + i, 0, nf - 1);
-        const int slot = stream.win_slots[i];
-        // A clamped window (the first/last radius frames) collapses several
-        // positions onto one centre frame, i.e. the same slot and the same push
-        // constants. Those dispatches are identical, and each one's fill wipes
-        // the slices the previous one wrote, so only the last is kept.
-        bool duplicate_later = false;
-        for (int j = i + 1; j < d->tw && !duplicate_later; ++j) {
-            duplicate_later = stream.win_recompute[j] && stream.win_slots[j] == slot &&
-                std::clamp(n - r + j, 0, nf - 1) == m_i;
-        }
-        if (duplicate_later) {
-            continue;
-        }
-        n_dispatches++;
-        if (d->dump) fprintf(stderr, "[d] n=%d computes slot %d for frame %d\n", n, slot, m_i);
-        for (int plane = 0; plane < d->n_planes; ++plane) {
-            const auto & p = d->planes[plane];
-            const VkDeviceSize pe = p.pe;
-
-            const VkDeviceSize res_off = (static_cast<VkDeviceSize>(slot) * d->tw * 2 * pe +
-                static_cast<VkDeviceSize>(plane) * d->res_size_per_plane);
-            vkCmdFillBuffer(cmd, d->res_buf, res_off * 4, d->tw * 2 * pe * 4, 0);
-
-            // the zero-fill must be visible to the atomic accumulation that
-            // follows it in the next dispatch
+            // the estimation dispatches read the freshly copied source/ref
+            // frames, so make the transfer writes visible to the compute stage
+            // before launching them (and order the res zero-fill ahead of the
+            // atomic accumulation)
             {
                 VkMemoryBarrier mem_barrier {
                     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -572,42 +610,51 @@ static int record_bm3d_kernels(BM3DData * d, Bm3dStream & stream, int n,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
             }
 
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.bm3d_pipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                d->pipeline_layout, 0, 1, &stream.desc_set, 0, nullptr);
-            {
-                const int32_t pushes[4] {
-                    static_cast<int32_t>(res_off),
-                    m_i,
-                    nf,
-                    static_cast<int32_t>((r == 0) ? stream.stream_id : 0)
-                };
-                vkCmdPushConstants(cmd, d->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                    0, sizeof(pushes), pushes);
+            if (gputrace) {
+                // a query must be reset before first use and before each reuse;
+                // doing it inside the command buffer keeps the reset ordered
+                // with the stamps (and with the aggregation command buffer
+                // submitted after this one)
+                vkCmdResetQueryPool(cmd, stream.ts_query, 0, 4);
+                vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stream.ts_query, 0);
             }
-            vkCmdDispatch(cmd, p.bm3d_grid_x, p.bm3d_grid_y, 1);
         }
+
+        if (c < n_pos) {
+            if (d->split_est) {
+                record_est_position(d, stream, cmd, n, pos[c]);
+            } else {
+                for (int k = 0; k < n_pos; ++k) {
+                    record_est_position(d, stream, cmd, n, pos[k]);
+                }
+            }
+        }
+
+        if (c == stream.est_cb_count - 1) {
+            if (gputrace) {
+                vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, 1);
+            }
+            // The estimation kernels' atomic accumulation must be visible to
+            // the aggregation reads, which are dispatched from a separate
+            // command buffer (submitted later on the same queue): make the
+            // writes available to the queue-wide scope so the aggregation sees
+            // complete slot contents. The barrier covers the earlier
+            // submissions of this frame as well, being later in queue order.
+            {
+                VkMemoryBarrier mem_barrier {
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT
+                };
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+            }
+        }
+
+        vkEndCommandBuffer(cmd);
     }
-
-    if (gputrace) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stream.ts_query, 1);
-
-    // The estimation kernels' atomic accumulation must be visible to the
-    // aggregation reads, which are dispatched from a separate command buffer
-    // (submitted later on the same queue): make the writes available to the
-    // queue-wide scope so the aggregation sees complete slot contents.
-    {
-        VkMemoryBarrier mem_barrier {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT
-        };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
-    }
-
-    vkEndCommandBuffer(cmd);
-    return n_dispatches;
+    return n_pos;
 }
 
 // Record the aggregation phase of the command buffer. It reads the res slots
@@ -877,7 +924,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
         const int ndisp = record_bm3d_kernels(d, stream, n, uploaded);
         auto t4 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
-        if (d->trace) fprintf(stderr, "[t] n=%d kernels recorded\n", n);
+        if (d->trace) fprintf(stderr, "[t] n=%d kernels recorded (%d submits)\n", n, stream.est_cb_count);
 
         // Cross-frame dependencies are expressed on the writers' per-stream
         // timelines, signalled device-side by each writer's kernel submit. A
@@ -966,8 +1013,27 @@ static const VSFrame *VS_CC BM3DGetFrame(
                the same queue, and a fence must not be attached to a second
                submission while a first one still holds it */
         vsfeel_trace_mark("sub est");
-        checkVK(submit_timeline(dev, stream.queue, stream.queue_lock, stream.cmd,
-            src_waits, src_values, src_stages, stream.timeline, my_seq, VK_NULL_HANDLE));
+        // One submission per recomputed window position (see
+        // record_bm3d_kernels). The queue orders them, so only the first has to
+        // wait for the uploads and only the last signals the timeline -- which
+        // is what every consumer of this frame waits on, so the cross-frame
+        // sync is unchanged and a partial failure leaves the signal unsent for
+        // the error path to host-signal.
+        for (int c = 0; c < stream.est_cb_count; ++c) {
+            const bool first = c == 0;
+            const bool last = c == stream.est_cb_count - 1;
+            static const std::vector<VkSemaphore> no_waits;
+            static const std::vector<uint64_t> no_values;
+            static const std::vector<VkPipelineStageFlags> no_stages;
+            checkVK(submit_timeline(dev, stream.queue, stream.queue_lock,
+                stream.est_cmds[c],
+                first ? src_waits : no_waits,
+                first ? src_values : no_values,
+                first ? src_stages : no_stages,
+                last ? stream.timeline : VK_NULL_HANDLE,
+                last ? my_seq : 0,
+                VK_NULL_HANDLE));
+        }
         estimation_submitted = true;
         // Publish the submission event before recording the aggregation: a
         // reader whose aggregation device-waits on this estimation must be able
@@ -1144,6 +1210,7 @@ static void VS_CC BM3DCreate(
     // fallback) for flags that are fixed per instance.
     d->trace = vsfeel_debug_trace("VSFEEL_BM3D_TRACE") || env_flag("BM3D_TRACE");
     d->dump = env_flag("VSFEEL_BM3D_DUMP") || env_flag("BM3D_DUMP");
+    d->split_est = env_int("VSFEEL_BM3D_SPLIT", 1) != 0;
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
@@ -1707,12 +1774,15 @@ static void VS_CC BM3DCreate(
                 .pNext = nullptr,
                 .commandPool = stream.pool,
                 .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                .commandBufferCount = 2
+                .commandBufferCount = 2 * MAX_RADIUS + 2
             };
-            VkCommandBuffer cmds[2] {};
+            VkCommandBuffer cmds[2 * MAX_RADIUS + 2] {};
             checkVK(vkAllocateCommandBuffers(dev, &alloc_info, cmds));
-            stream.cmd = cmds[0];
-            stream.cmd_agg = cmds[1];
+            for (int c = 0; c < 2 * MAX_RADIUS + 1; ++c) {
+                stream.est_cmds[c] = cmds[c];
+            }
+            stream.cmd = stream.est_cmds[0];
+            stream.cmd_agg = cmds[2 * MAX_RADIUS + 1];
         }
         {
             VkFenceCreateInfo fence_info {

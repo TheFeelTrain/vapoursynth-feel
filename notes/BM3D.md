@@ -18,16 +18,17 @@ Current design:
   partition and a **sliding column-SSD window**; each sub-group lane keeps its
   own top-8, which `merge_group` 8-way-merges.
 - Each temporal direction/t step scans PS_NUM PS_RANGE windows around the
-  previous step's matches. **Its per-lane list is only PS_NUM deep** — the merge
-  only ever consumes that many (`merge_group(PS_NUM, …)`) and only the first
-  PS_NUM entries are read back as the next centres, which is a provable
-  equivalence and the single largest win in this file (below).
+  previous step's matches; **its per-lane list is only PS_NUM deep**, which the
+  Round below shows is equivalent and the largest single win in this file.
 - The scan body is unrolled four candidates wide; the four new column loads
   issue before any reduce/insert consumes them.
 - Degenerate paths: `sigma < FLT_EPSILON` passes the plane through (a source
   copy), like the installed references' `PROC_MASK`.
 - Per-frame resources live in `FramePool<Bm3dStream>`; cross-frame handoff is
   per-stream timeline semaphores plus `res_holders` reservation tokens.
+- The estimation submits **one command buffer per recomputed window position**
+  (a full-recompute frame has up to 2r+1 of them), so no single submission can
+  reach Windows' TDR watchdog on a slow card (`VSFEEL_BM3D_SPLIT=0` reverts).
 - Upload staging is host-visible VRAM (ReBAR) on the default path
   (`VSFEEL_BM3D_HD=0` opts out), sized for the 4r+1 slots a record actually
   uploads.
@@ -113,10 +114,9 @@ Shuffle masks are < 8, so this stays correct on a wave64 device.
 
 **2026-09-20 — queue cap stays uncapped.** `VSFEEL_BM3D_QUEUES` {1,2,4} ×
 `num_streams` {4,8} at 2 and 4 concurrent requests: uncapped is best or tied in
-every cell. Unlike Bilateral (+16% at cap 2) BM3D is not queue-starved — ~88%
-of the frame is fence, so a shared queue has no drain bubble to fill.
-Re-measured on the current binary: 309.9 / 313.0 / 313.1 / 312.4 fps for cap
-1 / 2 / 4 / uncapped. Unchanged.
+every cell (309.9 / 313.0 / 313.1 / 312.4 fps). Unlike Bilateral (+16% at cap 2)
+BM3D is not queue-starved — ~88% of the frame is fence, so a shared queue has no
+drain bubble to fill.
 
 **`extractor_exp` was a silent no-op — fixed.** Host wiring was fine and the
 SPIR-V kept `(x + E) - E`, but RADV folds that pair once E is a known spec
@@ -245,11 +245,12 @@ per-instance staging once before the stream loop; the DB machine is unchanged.
 
 ## Open work
 
-- **RX 580/Windows loses the device at a seek.** The fullest capture plays 18267+
-  cleanly, then a seek to frame 0 dies on frame 0's *first* estimation submit
-  ("No fault detected") — nothing from that frame had been submitted, so the loss
-  came from work in flight when the seek landed, not from a long run. Frame 0 also
-  waits on writers from before the seek (`w=18274 val=4`); untriaged.
+- **RX 580/Windows: the long-submission TDR is bounded, awaiting a field run.**
+  The freeze hits frames whose estimation recomputes every window position, with
+  no player involved — not the seek, and not the GPU-timing probe
+  (`timestamp_bits=64`, so those timestamps were valid usage). `bm_range=4 tr=1`
+  and `NOSEARCH=1` both make it disappear, so it tracks the search's total
+  duration in one submission; the estimation now submits per recomputed position.
 
 - **The spatial search is the remaining kernel cost.** Its per-lane list must
   stay 8 deep, so its insert is ~14 instructions per candidate more expensive
@@ -310,6 +311,7 @@ cached at creation, not read per frame.
 - `VSFEEL_BM3D_VRAM=1` — creation-time VRAM budget (shared + per-stream).
 - `VSFEEL_BM3D_QUEUES=N` — queue cap override.
 - `VSFEEL_BM3D_HD=0` — force the GTT staging + PCIe upload.
+- `VSFEEL_BM3D_SPLIT=0` — one estimation submission per frame (pre-TDR-split).
 - `VSFEEL_BM3D_CACHE=1` — add the seek margin back to the estimate cache
   (0, the default, sizes it for the working set; see the VRAM paragraph for the
   +36..41%).
