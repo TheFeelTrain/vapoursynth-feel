@@ -44,7 +44,10 @@ Status: **shipped.** Verified against `src/nlmeans.{cpp,comp}` and
 - int32 addressing bound: reject when
   `max(lay·layers·C, npix·slots, npix·C) >= 2^31`.
 - Workgroup tile `BLK_X=32`, `BLK_Y=8`, `VRT_RESULT=3`; weight shaderstats
-  VGPRs=24 SGPRs=108 LDS=6144 (6144 vs zipcl's 5120), no spills.
+  VGPR 24, no spills, 16 subgroups/SIMD throughout. `dist`/`hsum` row counts and
+  `DIST_W` are specialization-constant expressions (`BX + 2*NLM_S`,
+  `VRT_RESULT*BY + 2*NLM_S`), so each instance allocates exactly its own tile —
+  LDS 7 168 / 8 192 / 9 216 / 13 312 B at s = 1/2/4/8.
 - ACO raises VGPRs 11→24 for load ILP on purpose; forcing them down regressed
   (guarded-load variant → 713–733 fps, reverted). 3rd WG/SIMD needs VGPR≤21.
 
@@ -231,8 +234,13 @@ exactly 0. Ceiling is small by design (only new tiles are uploaded).
 - **wave32 required-subgroup-size pNext**: no effect (unlike DFTTest's 552→673).
 - **Manual straight-line unroll of the distance loops**: no effect — the dist
   loads were not serialization-bound.
-- **Even-stride LDS matching zipcl's 5120 B** (vs our odd-stride 6144 B): no
-  effect; occupancy is not the limiter either way.
+- **Per-workload `-D` LDS variants for `dist`/`hsum`**: already shipped — the
+  arrays are sized per instance, not from a worst case. A specialization
+  constant **may** size a GLSL array on this toolchain (glslc + RADV fold it
+  before codegen and allocate the exact tile), which is what the `DIST_W` row
+  count above is; a `-D` matrix would compile the same LDS. Stride form
+  (zipcl's even 5 120 B vs our odd stride) is irrelevant too — occupancy is at
+  the 16-subgroup/SIMD cap at every `s`.
 - **Grouped all-weights-first**: BROKE correctness — the u4a ring is reused by
   every batch, so batch k+1 overwrites slots batch k still reads. The
   interleaved W→A barrier sequence is load-bearing.

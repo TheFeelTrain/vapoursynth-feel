@@ -63,7 +63,16 @@
 #define SCALE      255.0
 #endif
 
-#define TSTRIDE 17   // (16 + 1) transpose stride, matches the reference
+// Fused-kernel transpose scratch, per sub-block. Two row layouts share one
+// 288-float window (the phases are barrier-separated and each reads only what
+// it wrote): TR_ROW_1 = 17-float rows for the 16x16 real transposes, TR_ROW_2
+// = 18-float rows for the 9x16 ones (2 floats per element). Both strides keep
+// each phase's lane pattern bank-conflict-free, and 288 is the tight bound
+// (max offset 287): 2*16*17 = 544 floats per sub-block cost 18 432 B of LDS
+// per 128-thread workgroup, 288 costs 10 240 B.
+#define TR_ROW_1 17
+#define TR_ROW_2 18
+#define TR_SUB   288
 
 // The fused kernel's working array holds tw * 32 floats (tw temporal slices of
 // one complex 16-bin row). RADIUS is a compile-time define (like the
@@ -1502,20 +1511,20 @@ void filter_value(inout float re, inout float im, int x, int y, int t) {
 #define SPATIAL_SLICE(d, i) { \
     const int B = (i) * 32; \
     subgroupBarrier(); \
-    for (int j = 0; j < 16; ++j) { trans[tsub + 2 * (j * TSTRIDE + lane) + 0] = d[B + j]; } \
+    for (int j = 0; j < 16; ++j) { trans[tsub + TR_ROW_1 * j + lane] = d[B + j]; } \
     subgroupBarrier(); \
-    for (int j = 0; j < 16; ++j) { d[B + j] = trans[tsub + 2 * (lane * TSTRIDE + j) + 0]; } \
+    for (int j = 0; j < 16; ++j) { d[B + j] = trans[tsub + TR_ROW_1 * lane + j]; } \
     subgroupBarrier(); \
     rdft16(d, B); \
     for (int j = 0; j < 9; ++j) { \
-        trans[tsub + 2 * (lane * TSTRIDE + j) + 0] = d[B + 2 * j]; \
-        trans[tsub + 2 * (lane * TSTRIDE + j) + 1] = d[B + 2 * j + 1]; \
+        trans[tsub + TR_ROW_2 * lane + 2 * j + 0] = d[B + 2 * j]; \
+        trans[tsub + TR_ROW_2 * lane + 2 * j + 1] = d[B + 2 * j + 1]; \
     } \
     subgroupBarrier(); \
     if (lane < 9) { \
         for (int j = 0; j < 16; ++j) { \
-            d[B + 2 * j] = trans[tsub + 2 * (j * TSTRIDE + lane) + 0]; \
-            d[B + 2 * j + 1] = trans[tsub + 2 * (j * TSTRIDE + lane) + 1]; \
+            d[B + 2 * j] = trans[tsub + TR_ROW_2 * j + 2 * lane + 0]; \
+            d[B + 2 * j + 1] = trans[tsub + TR_ROW_2 * j + 2 * lane + 1]; \
         } \
         dft16(d, B, 1); \
     } \
@@ -1641,7 +1650,7 @@ void main() {
 #define SUB_BLOCKS 8   // blocks processed per workgroup (8 * 16 = 128 threads, 2 wave64 on RDNA)
 #endif
 
-shared float trans[SUB_BLOCKS * 2 * 16 * TSTRIDE];
+shared float trans[SUB_BLOCKS * TR_SUB];
 shared float s_gf[SUB_BLOCKS];
 
 layout(local_size_x = SUB_BLOCKS * 16, local_size_y = 1, local_size_z = 1) in;
@@ -1653,7 +1662,7 @@ void main() {
     const int hn = calc_pad_num(pc.width, pc.block_step);
     const int vn = calc_pad_num(pc.height, pc.block_step);
     const int num_blocks = hn * vn;
-    const int tsub = sub * 2 * 16 * TSTRIDE;
+    const int tsub = sub * TR_SUB;
 
     for (int block_id = int(gl_WorkGroupID.x) * SUB_BLOCKS + sub;
          block_id < num_blocks;
@@ -1702,26 +1711,26 @@ void main() {
         if (lane < 9) {
             idft16(td, cbase, 1);
             for (int j = 0; j < 16; ++j) {
-                trans[tsub + 2 * (j * TSTRIDE + lane) + 0] = td[cbase + 2 * j];
-                trans[tsub + 2 * (j * TSTRIDE + lane) + 1] = td[cbase + 2 * j + 1];
+                trans[tsub + TR_ROW_2 * j + 2 * lane + 0] = td[cbase + 2 * j];
+                trans[tsub + TR_ROW_2 * j + 2 * lane + 1] = td[cbase + 2 * j + 1];
             }
         }
         subgroupBarrier();
         for (int j = 0; j < 9; ++j) {
-            td[cbase + 2 * j] = trans[tsub + 2 * (lane * TSTRIDE + j) + 0];
-            td[cbase + 2 * j + 1] = trans[tsub + 2 * (lane * TSTRIDE + j) + 1];
+            td[cbase + 2 * j] = trans[tsub + TR_ROW_2 * lane + 2 * j + 0];
+            td[cbase + 2 * j + 1] = trans[tsub + TR_ROW_2 * lane + 2 * j + 1];
         }
         irdft16(td, cbase);
         subgroupBarrier();
         // transpose store of the row data (irdft emits the sequence reversed)
         for (int j = 0; j < 16; ++j) {
-            trans[tsub + 2 * (j * TSTRIDE + lane) + 0] = td[cbase + (j == 0 ? 0 : 16 - j)];
+            trans[tsub + TR_ROW_1 * j + lane] = td[cbase + (j == 0 ? 0 : 16 - j)];
         }
         subgroupBarrier();
         // write the block's center slice into the spatial buffer
         const int dst_base = pc.spatial_base + block_id * 256;
         for (int j = 0; j < 16; ++j) {
-            spatial[dst_base + j * 16 + lane] = trans[tsub + 2 * (lane * TSTRIDE + j) + 0];
+            spatial[dst_base + j * 16 + lane] = trans[tsub + TR_ROW_1 * lane + j];
         }
     }
 }

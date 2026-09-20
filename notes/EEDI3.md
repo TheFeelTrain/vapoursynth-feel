@@ -514,13 +514,18 @@ kernel **s2 = 3.485 of 3.86 ms** at 1080p ns=1 — ~90% of the GPU frame.
 
 ## Open work
 
-- **Row kernel register pressure** is the one lever round 29 supports: raise wave
-  residency by trimming `K=2` direction state or `RING_CAP` 7 (16 float ring slots
-  per lane against RN = 5 live at nrad=2). Rings are indexed at runtime (`k - NRAD`),
-  so trimming is an ACO question, and there is no `-D` escape (`NRAD` is spec
-  constant 1, and spec constants cannot size arrays). Check `shaderstats`
-  VGPRs/spills at `nrad=1/2/3` first; ACO raises VGPRs deliberately for load ILP, so
-  a lower count with new spills or schedule damage is a regression.
+- **Row kernel register pressure**: `RING_CAP` is not it. Trimming the fixed
+  bound to `2*NRAD+1` leaves the compiled row kernel **byte-identical** at
+  nrad=1/2/3 (same code size and instruction count, VGPR 96/96/120, 16/16/12
+  subgroups/SIMD, no spills): the `if (k >= RN) break` guard is dead once the
+  driver specializes `NRAD`, so the unused ring slots were never allocated, and
+  the ring is register state, not LDS (LDS is 1 024 B). At nrad=1/2 occupancy is
+  already at the 16-subgroup cap; at nrad=3 `RING_CAP == RN` exactly. (Spec
+  constants *can* size arrays here — `notes/NLMEANS.md` ships it — so the
+  earlier "no `-D` escape" reasoning was wrong about the mechanism but right
+  about the answer.) The remaining lever is the `K=2` direction state. ACO
+  raises VGPRs deliberately for load ILP, so a lower count with new spills or
+  schedule damage is a regression.
 - **Split the walk into its own dispatch, one lane per ROW.** Today one lane of a
   32-lane workgroup runs the walk while the kernel is issue-bound, so this is a
   *lane-utilisation* change, not a chain fix (round 20/29). Ceiling 11.9% of the

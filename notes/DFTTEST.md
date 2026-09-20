@@ -19,6 +19,8 @@ Status: **shipped.** Verified against `src/dfttest.{cpp,comp}` and
 - Perf, 500f cached real-clip medians: **ns=1 1215 vs 864 (+41%)**, **ns=4
   1325 vs 1297 (+2%)**. README rows: u16 1445 vs 909 (1.59x), f32 1102 vs 628
   (1.75x).
+- Perf, 1000f jpbd GRAY16 same-session pairs (ns=1, 3 order-reversed reps):
+  **1506 vs 1345 fps** for the tight fused transpose, +12% (vszipcl 871).
 - VRAM: 310 MiB at ns=1, 600 MiB at ns=4 (was 1182 MiB/instance before the
   in-flight floor moved 8 → 2).
 
@@ -96,10 +98,11 @@ Status: **shipped.** Verified against `src/dfttest.{cpp,comp}` and
   queues measured **+7.0%** over one (3×1000 same-session pairs: 1362.7/1377.1/
   1367.4 vs 1298.5/1267.3/1278.3).
 - Fused: `SUB_BLOCKS=8` (128-thread WGs), `td[TD_SZ]` register-resident,
-  `subgroupBarrier()`, VGPR 240 (largest radius variant 256) with 18 432 B LDS
-  per workgroup → **6 subgroups/SIMD** (5 for the largest), measured on the
-  shipped GRAY16 config. An earlier revision of this line read "2 wave32/SIMD";
-  re-measure rather than quote it (see Open work).
+  `subgroupBarrier()`, one 288-float (1 152 B) transpose window per sub-block →
+  **10 240 B LDS** per workgroup. Measured on the shipped GRAY16 config: radius
+  0/1 VGPR 120 and **12 subgroups/SIMD**; radius 2 VGPR 192 with 20 KB scratch,
+  8; radius 3 VGPR 256 with 28 KB scratch, 5. Re-measure rather than quote any
+  of it.
 - Benchmark defaults: `ftype=0`, `sigma=8`, `sosize=12`, `tbsize=3`, `swin=0`,
   `twin=7`, `sbeta=2.5`, `tbeta=2.5`, `zmean=1`, `f0beta=1.0`.
 - Bounds: every offset pushed to the shader is `int32`, so creation bounds each
@@ -239,6 +242,25 @@ grid fix → 673 wave32 pNext → 801 center-slice spatial buffer (3.4 GB → 1.
 constants, ZMEAN spec constant, gf hoist): 3378 → 2613 instr, 690 → 468 µs
 (vszipcl 441).
 
+## 2026-09-20 — fused transpose window tightened, LDS 18 432 → 10 240 B (+12%)
+
+The fused kernel's per-sub-block transpose scratch was the reference's
+`2*16*17 = 544` floats. The four barrier-separated phases that share it need
+only two row layouts — 17-float rows for the 16x16 real transposes, 18-float
+rows for the 9x16 float ones — and both fit in one 288-float window (max
+offset 287). Every fused variant's LDS drops to 10 240 B. Radius 0 keeps VGPR
+120 and goes 6 → 12 subgroups/SIMD on the LDS alone; radius 1 drops VGPR
+240 → 120 (6 → 12); radius 2 drops 240 → 192 (6 → 8); radius 3 is unchanged at
+256/5, scratch-bound.
+
+jpbd 1080p GRAY16, 1000 frames, 3 order-reversed same-session pairs, ns=1:
+**1345 → 1506 fps**, every pair +6% … +13%; ns=4, two pairs: 1417/1410 →
+1465/1615. fp32 is not a regression either (`--bits 32`, two pairs: 1058.7/
+1058.8 → 1095.9/1099.4). Data movement only, so output stays bit-exact: 70/70
+`test_dfttest.py` (tbsize 1/3/5/7 vs vszipcl), 800/800 full suite. No `-D`
+variant was needed for the trim — see `notes/NLMEANS.md` for why a
+specialization constant can size an array on this toolchain.
+
 ## 2026-09-20 — second-queue transfer split measured neutral (reverted)
 
 Both `VSFEEL_DFFTEST_XFER` prototypes were bit-exact and then reverted, because
@@ -265,25 +287,15 @@ wait and buys nothing; the ns=4 gap to vszipcl is fused codegen, not SDMA.
 - **Fused codegen residue (448 vs 384 µs)**: remaining IM2COL/window ALU,
   pointer-walk strength reduction (base + increment per j), ACO dual-issue
   packing (`v_dual_mov` 128 vs 18).
-- **Fused-kernel occupancy is at the low tier and the constraint is
-  unattributed.** `RADV_DEBUG=shaderstats` on the shipped GRAY16 config
-  (ftype=0, sigma=8, sosize=12, tbsize=3, swin=0, twin=7, zmean=1, f0beta=1,
-  ns=1) reports the fused radius variants at **VGPR 240** (the largest radius at
-  256) with **18 432 B LDS** per 128-thread workgroup, i.e. **6 subgroups/SIMD**
-  (5 for the largest); the small kernels are VGPR 24/120. BM3D sat in exactly
-  this 6-wave tier and cutting its live per-lane state to 192 registers bought
-  7 → 8 waves for 23% off the kernel, so a wave here is plausibly worth double
-  digits — but nothing here is proven. What is *not* known is which of the two
-  binds: 18 432 B / 128 threads = 144 B of LDS per thread, and Vulkan only
-  exposes `maxComputeSharedMemorySize` 65 536 (a per-workgroup ceiling) and
-  `maxComputeWorkGroupInvocations` 1024, not the per-CU LDS pool the occupancy
-  calculator divides by. **First step, and it is cheap:** add a `PROBE`-gated
-  LDS pad to the fused variant (one `-D`, no algorithm change), walk the
-  declared size up in ~1 KB steps and record where `subgroups/SIMD` steps down.
-  That yields the pool and names the binding constraint. Only then is a
-  VGPR-reduction variant (the `td[TD_SZ]` register block is the obvious donor)
-  worth writing — and note the existing "forcing VGPRs down regressed" result on
-  NLMeans, so this needs a same-session A/B, not a theory.
+- **Fused occupancy: the LDS half is resolved, the scratch half is not.** The
+  radius-0/1 variants were **LDS-bound**, not VGPR-bound: at VGPR 120 the old
+  18 432 B window held 6 subgroups/SIMD, and halving the window to 10 240 B at
+  the same VGPR took them to 12. Radius 2/3 still **spill 20/28 KB of scratch**
+  at VGPR 192/256 and stay at 8/5, so *those* are the low tier that remains —
+  the donor there is the `td[TD_SZ]` register block, not LDS (the old
+  LDS-pad-probe plan is no longer the first step). Any VGPR-reduction variant
+  needs a same-session A/B, not a theory: forcing VGPRs down regressed on
+  NLMeans.
 - Col2im (260 µs) is already 2× faster than both references — leave it.
 
 ## Tests
