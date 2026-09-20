@@ -420,7 +420,7 @@ struct Nnedi3Data {
                 t_wait.load() / 1000.0 / n, t_setup.load() / 1000.0 / n,
                 t_kept.load() / 1000.0 / n, t_interp.load() / 1000.0 / n, n);
         }
-        if (env_flag("VSFEEL_NNEDI3_TSTAMP") && t_ts_n.load() > 0) {
+        if (vsfeel_debug_probe("VSFEEL_NNEDI3_TSTAMP") && t_ts_n.load() > 0) {
             const double n = static_cast<double>(t_ts_n.load());
             fprintf(stderr,
                 "[nnedi3-ts] GPU us: pre=%7.1f pred=%7.1f copy=%7.1f (frames=%.0f)\n",
@@ -1312,7 +1312,7 @@ static void VS_CC Nnedi3Create(
 
     auto d { std::make_unique<Nnedi3Data>() };
 
-    d->gpu_trace = env_flag("VSFEEL_NNEDI3_TSTAMP");
+    d->gpu_trace = vsfeel_debug_probe("VSFEEL_NNEDI3_TSTAMP");
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
@@ -1542,6 +1542,11 @@ static void VS_CC Nnedi3Create(
         d->device = std::get<std::shared_ptr<VK_Device>>(result);
         d->device_id = device_id;
     }
+
+    // The GPU-timing probe is invalid usage on a queue family whose
+    // timestampValidBits is 0, where vkCmdWriteTimestamp can hang the engine
+    // (a machine-wide freeze, not just a lost device): keep it off there.
+    d->gpu_trace = d->gpu_trace && vsfeel_probe_timestamps(*d->device, "NNEDI3");
 
     if (auto e = require_vulkan_1_3(*d->device, "NNEDI3")) {
         return set_error(*e);

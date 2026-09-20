@@ -4900,7 +4900,8 @@ static void vsfeel_eedi3_create(
             };
             checkVK(vkCreateFence(dev, &fence_info, nullptr, &resource.fence));
         }
-        if (env_flag("VSFEEL_EEDI3_GBENCH")) {
+        if (env_flag("VSFEEL_EEDI3_GBENCH") &&
+            vsfeel_probe_timestamps(*d->device, "EEDI3")) {
             VkQueryPoolCreateInfo qp_info {
                 .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
                 .pNext = nullptr,

@@ -1136,10 +1136,10 @@ static void VS_CC BM3DCreate(
     auto d { std::make_unique<BM3DData>() };
 
     // Opt-in host-path probe: the default path records no clocks.
-    d->host_timing = env_flag("VSFEEL_BM3D_TIMING");
+    d->host_timing = vsfeel_debug_probe("VSFEEL_BM3D_TIMING");
     // The timestamp pool is created only when this is set, so every later
     // recording/readback must use the cached flag, not a frame-time getenv.
-    d->gpu_trace = env_flag("VSFEEL_BM3D_GPUTRACE") || env_flag("BM3D_GPUTRACE");
+    d->gpu_trace = vsfeel_debug_probe("VSFEEL_BM3D_GPUTRACE") || env_flag("BM3D_GPUTRACE");
     // Cached too: the frame path must not pay a getenv (plus the legacy-name
     // fallback) for flags that are fixed per instance.
     d->trace = vsfeel_debug_trace("VSFEEL_BM3D_TRACE") || env_flag("BM3D_TRACE");
@@ -1349,6 +1349,11 @@ static void VS_CC BM3DCreate(
         }
         d->device = std::get<std::shared_ptr<VK_Device>>(result);
     }
+
+    // The GPU-timing probe is invalid usage on a queue family whose
+    // timestampValidBits is 0, where vkCmdWriteTimestamp can hang the engine
+    // (a machine-wide freeze, not just a lost device): keep it off there.
+    d->gpu_trace = d->gpu_trace && vsfeel_probe_timestamps(*d->device, "BM3D");
 
     // The BM3D kernels accumulate into float SSBOs. Hardware buffer float
     // atomics need VK_EXT_shader_atomic_float, which no pre-RDNA3 AMD driver

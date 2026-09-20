@@ -101,10 +101,13 @@ inline const char * env_str(const char * env) {
 // **VSFEEL_DEBUG is the one to give a bug reporter**, and it takes a level:
 // `=1` prints the one-shot diagnostics (device banner, capability and heap
 // dump, creation banners, fallback notices, the full error trace), `=2` adds
-// the per-filter frame-path traces, which print several lines per frame.
+// the instrumentation -- the per-filter frame-path traces (several lines per
+// frame) and the measurement probes (host stage timings, GPU kernel
+// timestamps), which a hang or a stutter needs as much as the trace does.
 // VSFEEL_TRACE is the trace alone (1 = first 50 lines, 2 = every line), and the
-// per-filter names turn on one filter alone. Performance probes (TIMING,
-// GPUTRACE) stay explicit: they measure, they do not diagnose.
+// per-filter names turn on one filter's own diagnostics alone. Probes only
+// observe (a timestamp query, a clock read) but they are not free, so never
+// benchmark a level-2 run.
 
 inline int vsfeel_debug_level() {
     static const int level = [] {
@@ -158,6 +161,14 @@ inline bool vsfeel_debug_flag(const char * specific) {
 // A per-filter frame-path trace: several lines per frame, so it needs
 // VSFEEL_DEBUG=2 or the filter-specific name.
 inline bool vsfeel_debug_trace(const char * specific) {
+    return vsfeel_debug_level() >= 2 || env_flag(specific);
+}
+
+// A per-filter measurement probe (host TIMING, GPU timestamps): it costs a
+// little to collect and prints its own periodic summary, so like the frame
+// traces it needs VSFEEL_DEBUG=2 or the filter-specific name. A bug report of
+// a hang needs these numbers as much as the trace does.
+inline bool vsfeel_debug_probe(const char * specific) {
     return vsfeel_debug_level() >= 2 || env_flag(specific);
 }
 
@@ -249,6 +260,10 @@ struct VK_Device {
     uint32_t api_version {};
     uint32_t queue_family {};
     uint32_t queue_count {};
+    // VkQueueFamilyProperties::timestampValidBits for queue_family: 0 means the
+    // family cannot take vkCmdWriteTimestamp at all, so the GPU-timing probes
+    // must stay off (see vsfeel_probe_timestamps below).
+    uint32_t timestamp_valid_bits {};
     // VK_EXT_external_memory_host: whether a host pointer can be imported as a
     // Vulkan buffer, and the alignment it must satisfy. The query command is
     // needed to learn which memory types accept a given pointer.
@@ -745,6 +760,22 @@ inline bool rebar_available(const VK_Device & dev, VkDeviceSize bytes) {
         }
         vkFreeMemory(dev.device, memory, nullptr);
         return true;
+    }
+    return false;
+}
+
+// GPU-timing probes (GPUTRACE / TSTAMP / qbench) need a queue family that
+// accepts vkCmdWriteTimestamp. On a family whose timestampValidBits is 0 that
+// command is invalid usage, and a driver that takes one anyway can hang the
+// engine outright -- a machine-wide freeze and bugcheck, not just a lost
+// device. So each probe is gated on this, and says so once when it is skipped.
+inline bool vsfeel_probe_timestamps(const VK_Device & dev, const char * tag) {
+    if (dev.timestamp_valid_bits != 0) {
+        return true;
+    }
+    if (vsfeel_debug_enabled()) {
+        fprintf(stderr, "[vsfeel] %s: queue family %u reports 0 timestamp bits; "
+                        "GPU timings disabled\n", tag, dev.queue_family);
     }
     return false;
 }

@@ -1263,7 +1263,12 @@ static void VS_CC NLMeansCreate(
             return set_error(std::get<std::string>(result));
         }
         d->device = std::get<std::shared_ptr<VK_Device>>(result);
-    d->gputrace = env_flag("VSFEEL_NLMEANS_GPUTRACE") || env_flag("NLMEANS_GPUTRACE");
+    d->gputrace = vsfeel_debug_probe("VSFEEL_NLMEANS_GPUTRACE") || env_flag("NLMEANS_GPUTRACE");
+
+    // The GPU-timing probe is invalid usage on a queue family whose
+    // timestampValidBits is 0, where vkCmdWriteTimestamp can hang the engine
+    // (a machine-wide freeze, not just a lost device): keep it off there.
+    d->gputrace = d->gputrace && vsfeel_probe_timestamps(*d->device, "NLMeans");
     }
 
     VkDevice dev = d->device->device;

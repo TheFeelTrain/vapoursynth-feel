@@ -254,11 +254,19 @@ All filters share an inline (zero-overhead, C++20) plumbing layer in
 - **`env_flag` / `env_int` / `env_str`** — env-gated debug flags; keep one env
   name per filter (`VSFEEL_DFTTEST_TRACE`, `BM3D_TRACE`, ...). Read per-filter
   *diagnostic* flags through **`vsfeel_debug_flag(name)`** (one-shot: creation
-  banners, fallback notices) or **`vsfeel_debug_trace(name)`** (per-frame
-  traces), never `env_flag`: `VSFEEL_DEBUG=1` — the one switch to hand a bug
-  reporter: device banner, heap dump, creation banners, full error trace —
-  turns the one-shot ones on, and `=2` adds the per-frame firehose.
-  Performance probes (`TIMING`, `GPUTRACE`) stay on `env_flag`.
+  banners, fallback notices), **`vsfeel_debug_trace(name)`** (per-frame traces)
+  or **`vsfeel_debug_probe(name)`** (measurement: host `TIMING`, GPU
+  `GPUTRACE`/`TSTAMP`), never `env_flag`: `VSFEEL_DEBUG=1` — the one switch to
+  hand a bug reporter: device banner, heap dump, creation banners, full error
+  trace — turns the one-shot ones on, and `=2` adds the per-frame firehose and
+  the probes, because a hang needs the kernel times as much as the trace.
+  A level-2 run is instrumented, so never benchmark it. **A GPU-timing probe
+  must also be gated on `VK_Device::timestamp_valid_bits`** (via
+  `vsfeel_probe_timestamps`): `vkCmdWriteTimestamp` is invalid usage on a queue
+  family that reports 0, and a driver taking one anyway can hang the engine —
+  a machine-wide freeze and bugcheck, not a lost device. Gate the *flag*, not
+  just the query pool: a filter that writes timestamps off the flag alone would
+  otherwise write with a null pool.
 - **`vsfeel_trace_error(filter, frame, message, device)`** — every `set_error`
   lambda calls this first, so **one** switch (`VSFEEL_DEBUG=1`, or `VSFEEL_TRACE`
   alone: `=1`, `=2` for no line cap) names the filter, the output frame

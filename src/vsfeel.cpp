@@ -488,11 +488,13 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
 
     uint32_t best_family = ~0u;
     uint32_t best_queues = 0;
+    uint32_t best_timestamp_bits = 0;
     for (uint32_t i = 0; i < family_count; ++i) {
         if (family_props[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
             if (best_family == ~0u || family_props[i].queueCount > best_queues) {
                 best_family = i;
                 best_queues = family_props[i].queueCount;
+                best_timestamp_bits = family_props[i].timestampValidBits;
             }
         }
     }
@@ -502,6 +504,11 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     }
     dev->queue_family = best_family;
     dev->queue_count = best_queues;
+    // vkCmdWriteTimestamp is invalid usage on a family whose timestampValidBits
+    // is 0, and a driver that takes one anyway can hang the engine outright (a
+    // machine-wide freeze, not just a lost device), so every GPU-timing probe is
+    // gated on this.
+    dev->timestamp_valid_bits = best_timestamp_bits;
 
     // One priority per requested queue: the specification (and every driver)
     // reads pQueuePriorities[0 .. queueCount), so the array must be that long.
@@ -694,7 +701,7 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
         // One banner per device: enough to tell which build, GPU, driver and
         // cache file a run is actually using.
         fprintf(stderr,
-            "[vsfeel] version=%s commit=%s device=%s driver=%u.%u.%u vulkan=%u.%u device_fault=%d cache=%s\n",
+            "[vsfeel] version=%s commit=%s device=%s driver=%u.%u.%u vulkan=%u.%u device_fault=%d timestamp_bits=%u cache=%s\n",
             VSFEEL_VERSION, VSFEEL_COMMIT, props.deviceName,
             VK_API_VERSION_MAJOR(props.driverVersion),
             VK_API_VERSION_MINOR(props.driverVersion),
@@ -702,6 +709,7 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
             VK_API_VERSION_MAJOR(dev->api_version),
             VK_API_VERSION_MINOR(dev->api_version),
             dev->feat_device_fault ? 1 : 0,
+            dev->timestamp_valid_bits,
             dev->pipeline_cache_path.empty() ? "<disabled>" : dev->pipeline_cache_path.c_str());
         if (vsfeel_trace_enabled()) {
             // Confirms the variable was seen, the way VK_LOADER_DEBUG=layer

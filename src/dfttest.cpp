@@ -564,7 +564,7 @@ struct DftData {
 
     ~DftData() {
         uint64_t n = nframes.load();
-        if (n && env_flag("VSFEEL_DFTTEST_TIMING")) {
+        if (n && vsfeel_debug_probe("VSFEEL_DFTTEST_TIMING")) {
             fprintf(stderr,
                 "[dfttest-timing] frames=%llu avg_total=%.3fms acquire=%.3fms upload=%.3fms submit=%.3fms wait=%.3fms download=%.3fms\n",
                 (unsigned long long)n,
@@ -1696,7 +1696,7 @@ static void VS_CC DftCreate(
     auto d { std::make_unique<DftData>() };
 
     // Opt-in host-path timing; the default path records no clocks.
-    d->host_timing = env_flag("VSFEEL_DFTTEST_TIMING");
+    d->host_timing = vsfeel_debug_probe("VSFEEL_DFTTEST_TIMING");
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
@@ -2618,7 +2618,7 @@ static void VS_CC DftCreate(
         }
         // Timestamp query pool + host-readable result buffer (qbench only;
         // allocated always — 8×8 B + query pool object is negligible).
-        {
+        if (vsfeel_probe_timestamps(*d->device, "DFTTest")) {
             VkQueryPoolCreateInfo qpool_info {
                 .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
                 .pNext = nullptr,
