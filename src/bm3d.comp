@@ -1,5 +1,13 @@
 #version 450
+// Buffer float atomics are an extension no pre-RDNA3 AMD driver reports: RADV
+// gates shaderBufferFloat32AtomicAdd at GFX11 and the Windows driver has no
+// hardware fadd to expose on Polaris/Vega/RDNA1-2 either. -DNO_FLOAT_ATOMICS
+// builds the accumulation on atomicCompSwap instead (the reference's own
+// atom_add_f), and drops the `require` so the module carries no
+// AtomicFloat32AddEXT capability.
+#ifndef NO_FLOAT_ATOMICS
 #extension GL_EXT_shader_atomic_float : require
+#endif
 #extension GL_KHR_shader_subgroup_shuffle : enable
 
 /*
@@ -37,8 +45,29 @@ const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
 const float FLT_MAX_ = 3.402823466e+38f;
 const int INT_MAX_ = 0x7fffffff;
 
+#ifndef NO_FLOAT_ATOMICS
 layout(std430, binding = 0) buffer ResBuf { float res[]; };
+#else
+layout(std430, binding = 0) buffer ResBuf { uint res_u[]; };
+#endif
 layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
+
+// Adds val to the float at res[idx]. The no-extension form is the reference's
+// atom_add_f: a CAS loop over the uint bits, one fadd per round like the
+// hardware atomic, so the accumulated bits are the same up to add order.
+void res_add(int idx, float val) {
+#ifndef NO_FLOAT_ATOMICS
+    atomicAdd(res[idx], val);
+#else
+    uint old = res_u[idx];
+    uint assumed;
+    do {
+        assumed = old;
+        old = atomicCompSwap(res_u[idx], assumed,
+                             floatBitsToUint(uintBitsToFloat(assumed) + val));
+    } while (old != assumed);
+#endif
+}
 
 layout(push_constant) uniform PushConstants {
     int res_off;   // float offset of this plane's result region
@@ -745,8 +774,8 @@ void main() {
                         weight_val = weight_rounded;
                     }
 
-                    atomicAdd(res[wdstpc + offset + j * STRIDE], wdst_val);
-                    atomicAdd(res[weightpc + offset + j * STRIDE], weight_val);
+                    res_add(wdstpc + offset + j * STRIDE, wdst_val);
+                    res_add(weightpc + offset + j * STRIDE, weight_val);
                 }
             }
         }

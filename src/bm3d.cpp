@@ -104,6 +104,7 @@ struct BM3DData {
     bool chroma;
     bool final {};                   // true when a "ref" clip is given
     float extractor;
+    bool cas_atomics {};             // aggregate with the CAS kernel (no float atomics)
 
     std::shared_ptr<VK_Device> device;
     VkDescriptorSetLayout set_layout {};
@@ -1312,11 +1313,13 @@ static void VS_CC BM3DCreate(
         d->device = std::get<std::shared_ptr<VK_Device>>(result);
     }
 
-    // the BM3D kernels accumulate into float SSBOs with atomicAdd
-    // (GL_EXT_shader_atomic_float), so that feature is required
-    if (!d->device->feat_atomic_float32_add) {
-        return set_error("shaderBufferFloat32AtomicAdd is not supported by this device");
-    }
+    // The BM3D kernels accumulate into float SSBOs. Hardware buffer float
+    // atomics need VK_EXT_shader_atomic_float, which no pre-RDNA3 AMD driver
+    // reports (RADV: GFX11+; the Windows driver does not expose it on Polaris
+    // either); on anything older the accumulation falls back to the CAS loop
+    // the OpenCL reference itself uses (atom_add_f), so the filter runs
+    // everywhere instead of failing at creation.
+    d->cas_atomics = env_flag("VSFEEL_BM3D_CAS") || !d->device->feat_atomic_float32_add;
     // The 8x8 group transposes and the group-8 reduction are subgroup shuffles.
     // The spec only makes SUBGROUP_FEATURE_BASIC_BIT mandatory, so a device
     // without SHUFFLE would either reject the module or mis-execute.
@@ -1474,7 +1477,9 @@ static void VS_CC BM3DCreate(
 
     // shader modules
     {
-        const auto r1 = create_shader_module(*d->device, bm3d_spv, bm3d_spv_size);
+        const uint32_t * code = d->cas_atomics ? bm3d_cas_spv : bm3d_spv;
+        const size_t code_size = d->cas_atomics ? bm3d_cas_spv_size : bm3d_spv_size;
+        const auto r1 = create_shader_module(*d->device, code, code_size);
         if (std::holds_alternative<std::string>(r1)) {
             return set_error(std::get<std::string>(r1));
         }

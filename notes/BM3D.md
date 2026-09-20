@@ -9,6 +9,11 @@ Current design:
 - Two kernels: `bm3d.comp` (block match + group + collaborative transform,
   one warp of 32 lanes = 4 sub-groups of 8 lanes, one 8x8 block each) and
   `bm3d_agg.comp` (temporal aggregation over the TW = 2r+1 stack slices).
+- Estimation accumulates with hardware buffer float atomics where the device
+  has them (`VK_EXT_shader_atomic_float`; RADV gates it at GFX11). Everywhere
+  else the same kernel's `-DNO_FLOAT_ATOMICS` build runs the reference's own
+  `atom_add_f` CAS loop; the host picks per device, `VSFEEL_BM3D_CAS=1` forces
+  it (see Historical for the cost).
 - The spatial search scans the (2*bm_range+1)² window with a per-lane row
   partition and a **sliding column-SSD window**; each sub-group lane keeps its
   own top-8, which `merge_group` 8-way-merges.
@@ -209,6 +214,24 @@ PS_NUM-depth list is exact (same (e, sq) merge order), and the packing and
 unrolling are order-preserving. `test_bm3dv2_matches_reference` spans
 radius 0..4 against vszipcl at the documented tolerances.
 
+**2026-09-20 — runs without buffer float atomics (BM3D was AMD-RDNA3-only).**
+RADV sets `shaderBufferFloat32AtomicAdd = gfx_level >= GFX11`
+(`src/amd/vulkan/radv_physical_device.c`) and AMD's Windows driver does not
+report it on Polaris either, so BM3D failed creation with
+"shaderBufferFloat32AtomicAdd is not supported by this device" on every older
+card — RX 580, Vega, RDNA1/2 alike, on both platforms. `bm3d.comp` now has a
+`-DNO_FLOAT_ATOMICS` build (`bm3d_cas.spv`, chosen when the feature is missing,
+forced with `VSFEEL_BM3D_CAS=1`) whose two aggregate stores call a `res_add`
+that runs the CAS loop zipcl's own `atom_add_f` has always used — core
+`atomicCompSwap` only, no extension, so nothing about it is RADV- or
+Linux-specific. Not a semantic change: one fp32 add per round, so at
+`extractor_exp=8` the two builds are bit-identical on the noise clip and 75/75
+BM3D tests (+110 tests in the
+streams/resources/geometry/lifecycle/validation/python_backend files) pass on
+each. Cost, 1000f 1080p GRAY32 r=2 ns=2 interleaved pairs on the 7900XTX:
+314.8/312.5/314.9 fps (hardware) vs 260.0/260.4/259.8 fps (CAS), i.e. +0.66 ms
+per frame or ~17% — the fallback is a device-support path, not a tuning knob.
+
 ## Open work
 
 - **The spatial search is the remaining kernel cost.** Its per-lane list must
@@ -223,7 +246,13 @@ radius 0..4 against vszipcl at the documented tolerances.
   sliding window. The spatial scan also wastes ~18% of its wave iterations on
   the final row, where only 1 of 8 lanes is active.
 - The estimate phase's 0.40 ms has not been decomposed into transform vs
-  atomics. A probe is easy (replace the two `atomicAdd`s with plain stores).
+  atomics. The CAS build bounds it (below): its +0.66 ms/frame for a
+  read-modify-write loop means the two `atomicAdd`s are most of that 0.40 ms.
+- **No cheaper atomics exist on the older devices that need the fallback.**
+  GFX8–10 have no `buffer_atomic_add_f32`, so CAS *is* the floor there;
+  `shaderSharedFloat32AtomicAdd` (which RADV does expose from GFX8) cannot help,
+  because a group's 8 matched patches land anywhere in the plane — there is no
+  per-workgroup LDS tile to accumulate into.
 - `sigma` is scaled per plane but only luma is processed; the YUV path copies
   chroma. No measurements needed unless a user asks.
 
@@ -264,6 +293,8 @@ cached at creation, not read per frame.
 - `VSFEEL_BM3D_VRAM=1` — creation-time VRAM budget (shared + per-stream).
 - `VSFEEL_BM3D_QUEUES=N` — queue cap override.
 - `VSFEEL_BM3D_HD=0` — force the GTT staging + PCIe upload.
+- `VSFEEL_BM3D_CAS=1` — force the atomicCompSwap aggregation build on a device
+  that has buffer float atomics (A/B measurement only).
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs; both
   are vsfeel inventions, not reference behaviour, and NOSEARCH distorts the
   temporal search as well (see the ablation note).

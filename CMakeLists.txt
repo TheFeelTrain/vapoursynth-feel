@@ -139,9 +139,12 @@ foreach(component IN ITEMS shared plain)
     endforeach()
 endforeach()
 
-# BM3D: two single-entry files, no io variants (float only).
+# BM3D: two single-entry files, no io variants (float only). bm3d_cas is the
+# same kernel with the aggregation on atomicCompSwap, for devices without
+# buffer float atomics; see src/bm3d.comp.
 set(VK_BM3D_VARIANTS
     "bm3d|bm3d.comp|--target-env=vulkan1.3"
+    "bm3d_cas|bm3d.comp|--target-env=vulkan1.3 -DNO_FLOAT_ATOMICS"
     "bm3d_agg|bm3d_agg.comp|")
 
 # GaussBlur: one kernel with three entry points (fused small path + the two
