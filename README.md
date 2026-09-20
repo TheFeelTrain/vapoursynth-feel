@@ -9,11 +9,11 @@ Primarily optimized for running on RDNA 3 with the RADV driver on Linux.
 | Filter    | u16 vsfeel | u16 ref | u16 speedup | fp32 vsfeel | fp32 ref | fp32 speedup |
 |-----------|-----------:|--------:|------------:|------------:|---------:|-------------:|
 | Bilateral | 1903       | 1484    | 1.28x       | 1250        | 763      | 1.64x        |
-| BM3Dv2    | -          | -       | -           | 166         | 41       | 4.02x        |
+| BM3Dv2    | -          | -       | -           | 179         | 42       | 4.27x        |
 | DFTTest   | 1445       | 909     | 1.59x       | 1102        | 628      | 1.75x        |
 | EEDI3     | 628        | 214     | 2.93x       | 318         | 186      | 1.71x        |
 | GaussBlur | 2516       | 1599    | 1.57x       | 1267        | 756      | 1.68x        |
-| NLMeans   | 970        | 737     | 1.32x       | 846         | 651      | 1.30x        |
+| NLMeans   | 1094       | 767     | 1.43x       | 1015        | 672      | 1.51x        |
 | NNEDI3    | 2907       | 2659    | 1.09x       | 1563        | 1396     | 1.12x        |
 
 Reference columns are `vszipcl` for all filters except `nnedi3vk` for NNEDI3.

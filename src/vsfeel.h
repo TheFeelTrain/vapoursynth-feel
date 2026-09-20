@@ -631,6 +631,24 @@ struct AllocatedMemory {
 std::variant<AllocatedMemory, std::string> allocate_memory(
     const VK_Device & dev, VkBuffer buffer, VkMemoryPropertyFlags required);
 
+// Host-visible device-local memory (the ReBAR window) exists: the CPU can write
+// a buffer the kernels read without an H2D copy. A device property, so a filter
+// can decide its upload path once at creation. allocate_memory never relaxes
+// DEVICE_LOCAL|HOST_VISIBLE away, so requesting these flags either succeeds on
+// this type or fails cleanly.
+inline bool rebar_available(const VK_Device & dev) {
+    constexpr VkMemoryPropertyFlags flags =
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < dev.mem_props.memoryTypeCount; ++i) {
+        if ((dev.mem_props.memoryTypes[i].propertyFlags & flags) == flags) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Buffer handle with no memory bound yet. `size` is forced non-zero because
 // Vulkan requires a positive size; a zero-byte request becomes 4 bytes so the
 // handle is still valid to bind and destroy.

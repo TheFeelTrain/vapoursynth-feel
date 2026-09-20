@@ -12,8 +12,8 @@ implemented in **Vulkan** (GLSL compute shaders compiled to SPIR-V with
 results equivalent to, a reference implementation in the `reference/` folder.
 
 The primary GPU this project is developed and tuned against is an **AMD Radeon
-RX 7900XTX (RDNA3, gfx1100)**. Optimizations are targeted at that GPU; other
-configurations are not the priority.
+RX 7900XTX (RDNA3, gfx1100)**. Optimizations are targeted at that GPU, but do
+consider other configurations if possible.
 
 ## The `reference/` folder is READ-ONLY
 
@@ -128,7 +128,7 @@ runs it. Plugins are described separately in `PLUGINS`.
 To benchmark a single filter against the references:
 
 ```bash
-MANGOHUD=0 python3 tools/benchmark.py --filter dfttest vsfeel vszipcl vszipcu
+MANGOHUD=0 python3 tools/benchmark.py --filter dfttest vsfeel vszipcl
 ```
 
 This prints fps for each plugin and ranks them. Compare vsfeel's fps against
@@ -545,11 +545,14 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   off end-to-end fps.
 - **Keep `notes/<filter>.md` updated immediately** after every finding,
   including dead ends, so nothing is re-derived or retried later. The notes
-  are **tracked** (`notes/README.md` explains the convention): they are the
-  durable design record, visible to every checkout and the first thing a new
-  contributor reads, so durable findings belong there rather than only in a
-  code comment. **Keep entries short** — conclusion first, a number only with
-  its config, one line for a correctness-only change, mechanism not story.
+  are **tracked**: they are the durable design record, visible to every checkout
+  and the first thing a new contributor reads, so durable findings belong there
+  rather than only in a code comment. **Read `notes/README.md` first and follow
+  it** — it is the authority on the notes (section shape, style, and the line
+  budget, which `notes/EEDI3.md` is already over), so nothing about how to write
+  them is repeated here. Keep entries short regardless: conclusion first, a
+  number only with its config, one line for a correctness-only change, mechanism
+  not story.
   **Worked examples of most rules above live in `notes/EEDI3.md`
   rounds 10–12** (host-bounded frames, the SIMD dilation rewrite, the ReBAR
   upload, the boundary-input oracle bug, the harness-memory bimodality, and a

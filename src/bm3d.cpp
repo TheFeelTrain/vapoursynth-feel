@@ -62,6 +62,7 @@ struct Bm3dStream {
     VkQueue queue {};
     std::mutex * queue_lock {};
     uint32_t staging_type_index {};
+    bool staging_coherent {};   // false -> flush the upload before the copy
     VkQueryPool ts_query {};
     int stream_id {};        // index of this stream in the pool
     uint64_t seq {1};        // next monotonic timeline value this stream signals
@@ -122,6 +123,10 @@ struct BM3DData {
     VkBuffer res_buf {};
     VkDeviceMemory res_mem {};
     VkDeviceSize dst_size {};        // pe elements (per stream)
+    // Upload staging in the host-visible ReBAR window (decided once at
+    // creation): the CPU writes VRAM directly and the ring copy is device-local
+    // instead of a PCIe read. Opt out with VSFEEL_BM3D_HD=0.
+    bool staging_direct {};
 
     VkDeviceSize res_size_per_plane {};  // floats per plane in the res buffer
     int nframes {};
@@ -793,10 +798,13 @@ static const VSFrame *VS_CC BM3DGetFrame(
                     static_cast<VkDeviceSize>(plane) * d->src_size;
                 // the frame's stride is not necessarily the GPU plane pitch
                 // (width rounded up to 4 floats), so copy the visible rows one
-                // at a time unless both are tight
+                // at a time unless both are tight. NT stores keep the GTT
+                // staging lines clean for the PCIe read; the ReBAR window is
+                // write-combined, where cached stores are the fast form.
                 copy_plane_out(dstp, static_cast<ptrdiff_t>(p.stride) * sizeof(float),
                     srcp, vsapi->getStride(src, plane),
-                    static_cast<size_t>(p.width) * sizeof(float), p.height, true);
+                    static_cast<size_t>(p.width) * sizeof(float), p.height,
+                    !d->staging_direct);
             }
             vsapi->freeFrame(src);
             if (d->final) {
@@ -808,7 +816,8 @@ static const VSFrame *VS_CC BM3DGetFrame(
                         static_cast<VkDeviceSize>(plane) * d->src_size;
                     copy_plane_out(dstp, static_cast<ptrdiff_t>(p.stride) * sizeof(float),
                         srcp, vsapi->getStride(rsrc, plane),
-                        static_cast<size_t>(p.width) * sizeof(float), p.height, true);
+                        static_cast<size_t>(p.width) * sizeof(float), p.height,
+                        !d->staging_direct);
                 }
                 vsapi->freeFrame(rsrc);
             }
@@ -817,8 +826,9 @@ static const VSFrame *VS_CC BM3DGetFrame(
         }
 
         // make the host-written staging visible to the device copies (the
-        // cached mapping may hold dirty lines that the GPU would miss)
-        if (any_uploaded) {
+        // cached mapping may hold dirty lines that the GPU would miss; the
+        // coherent ReBAR window needs no flush)
+        if (any_uploaded && (!d->staging_direct || !stream.staging_coherent)) {
             VkMappedMemoryRange flush_range {
                 .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                 .pNext = nullptr,
@@ -1471,6 +1481,9 @@ static void VS_CC BM3DCreate(
     uint32_t num_queues = resolve_queue_cap(d->num_streams,
         d->device->queue_count, "VSFEEL_BM3D_QUEUES", UINT32_MAX);
 
+    d->staging_direct =
+        env_int("VSFEEL_BM3D_HD", 1) != 0 && rebar_available(*d->device);
+
     for (int i = 0; i < d->num_streams; ++i) {
         Bm3dStream stream;
 
@@ -1490,13 +1503,21 @@ static void VS_CC BM3DCreate(
         }
         {
             const auto result = allocate_memory(*d->device, stream.staging,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+                d->staging_direct
+                    ? (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                    : (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                       VK_MEMORY_PROPERTY_HOST_CACHED_BIT));
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
             stream.staging_mem = std::get<AllocatedMemory>(result).memory;
             stream.staging_type_index = std::get<AllocatedMemory>(result).type_index;
+            stream.staging_coherent =
+                !!(d->device->mem_props.memoryTypes[stream.staging_type_index].propertyFlags &
+                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         }
         checkVK(vkMapMemory(dev, stream.staging_mem, 0, staging_size, 0,
             reinterpret_cast<void **>(&stream.map)));

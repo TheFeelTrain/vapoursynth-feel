@@ -208,7 +208,8 @@ collision with one queue). Throughput is unchanged (below).
 75.53/172.64/172.57 fps. The 75.5 is the pipeline-cache cold compile after the
 SPIR-V change (first run of a new binary only); the steady medians differ by
 <0.5%, below the noise floor, and BM3D's recorded frame split is ~90% fence.
-README's BM3D row is therefore unchanged.
+README's BM3D row was unchanged by this round (the later ReBAR upload port did
+move it).
 
 ## Frame error path
 
@@ -223,6 +224,21 @@ passes.
 
 
 
+## 2026-09-19 — ReBAR upload staging (+4.6%)
+
+The per-stream upload staging was GTT; allocating it
+`DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` (probed once at creation into
+`staging_direct`; `VSFEEL_BM3D_HD=0` opts out) makes the host write VRAM and the
+ring copy a device-local read. The store form flips with the allocation: NT
+stores for the GTT arm, cached stores for the write-combined window, and no
+flush for the coherent window. 1000f 1080p GRAY r=2 ns=4, 3 interleaved pairs:
+**178.2** vs 170.3 fps, every pair favouring ReBAR; `|HD-GTT|` ≤ 9e-8, which is
+the same floor two same-arm instances show (`bm3d.comp` accumulates the estimate
+stacks with atomic float adds, so the order is scheduling-dependent). The
+staging is the same buffer as before, only relocated GTT→VRAM; it reserves
+`src_ring*clips*Σpe*4` B/stream (~95 MiB at this config), and only the touched
+ring slots become resident.
+
 ## Debug env vars
 
 Standardised on `VSFEEL_BM3D_<FLAG>`; the pre-standardisation `BM3D_<FLAG>`
@@ -232,6 +248,8 @@ the `env_flag`/`env_int`/`env_str` helpers in `vsfeel.h`.
 - `VSFEEL_BM3D_TRACE=1` — acquire/submit/wait trace.
 - `VSFEEL_BM3D_TIMING=1` — host-stage split per frame (cached at creation).
 - `VSFEEL_BM3D_QUEUES=N` — queue cap override.
+- `VSFEEL_BM3D_HD=0` — force the GTT staging + PCIe upload (no ReBAR staging);
+  default is the host-visible VRAM staging when the device has it.
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs.
 - `VSFEEL_BM3D_DUMP=1` / `VSFEEL_BM3D_GPUTRACE=1` — slot dump / GPU timestamps.
 
@@ -262,3 +280,28 @@ block_step 4, two fresh `ns=1` instances):
 The documented ">= 3 = bitwise reproducible" guarantee now holds, matching
 vszipcl. Rule left behind: **a spec-constant-guarded `(x + E) - E` idiom needs
 `precise`, or RADV folds it.**
+
+## Slot-direct cache consumption is already in place
+
+Audited for a cache-to-working-set copy to delete: there is none. Both caches
+are already read in place, so the technique was adopted with the early cache
+rework rather than still missing.
+
+- `bm3d.comp` reads the source ring directly: `slot_base(z)` maps a window
+  position to `src_frame(z) % SRC_RING`, and `src_search`/`src_input` index
+  `src[]` at that slot. No per-stream window copy exists.
+- `bm3d_agg.comp` reads the estimate stacks directly through the per-slice
+  push-constant `bases[9]` (filled from `win_slots` + `agg_z` in
+  `record_bm3d_agg`). `win_slots`/`res_holders` are host-side bookkeeping
+  (slot indices, reservation tokens), not frame data.
+- The only D2D `vkCmdCopyBuffer` in the filter is `staging -> src_buf`, the
+  host-upload leg. The per-stream buffers are `staging` (upload source) and
+  `dst_buf` (download target) only.
+
+**Measurement.** Single-request host probe (`-r 1`, 1080p real clip, radius 2,
+`num_streams=4`, 200 f, µs/frame): take 0.4, acquire 1.6, upload 385.8,
+record 12.8, srcwait 24.6, agg 13.8, **fence 6327.2**, download 391.2, total
+7157.4 — the stages sum to the 1.79 s wall. The frame is ~88% fence and the
+host path has no copy stage; the one copy left is the upload leg, which is the
+host-direct-upload change, not a consumption one. Suite 75/75; benchmark
+162.5 fps vs vszipcu 67.1 / vszipcl 40.9.

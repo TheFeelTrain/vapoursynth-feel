@@ -15,10 +15,12 @@ Status: **shipped.** Verified against `src/nlmeans.{cpp,comp}` and
 - `NLM_REF` is a spec constant (`nlmeans.comp:43`), not a compile-time `-D`.
 - Single queue (`queues[0]`), tile reuse ordered host-side by submit count.
 - Accuracy: ≤1 LSB (16-bit) / ~3e-8 (float) vs vszipcl.
-- Perf, standard clip (3000f, ns=2, d=2, `channels=UV`, medians):
-  u16 **970** vs 737, f32 **846** vs 651 (README rows 1.32x / 1.30x).
-- Same-session re-check after the token fix: u16 1002.5 vs 758.4 (1.322x),
-  f32 848.6 vs 639.5 (1.327x) — ratios match the shipped rows.
+- Perf, standard clip (3000f, ns=2, d=2, `channels=UV`, medians, same-session
+  pairs): u16 **1094** vs 767 (1.43x), f32 **1015** vs 672 (1.51x).
+- **ReBAR upload staging** (default on, `VSFEEL_NLMEANS_HD=0` opts out): the
+  per-stream staging buffer is host-visible VRAM, so the compose writes VRAM and
+  the staging→slot copy is a device-local read; output bit-identical against
+  both arms and vszipcl, ~2 MiB/instance.
 
 ## Implementation
 
@@ -47,6 +49,18 @@ Status: **shipped.** Verified against `src/nlmeans.{cpp,comp}` and
   (guarded-load variant → 713–733 fps, reverted). 3rd WG/SIMD needs VGPR≤21.
 
 ## Historical
+
+### 2026-09-19 — ReBAR upload staging (+7.7%)
+
+The per-stream upload buffer was GTT, so every composed tile crossed PCIe twice
+(host→GTT, then the CB's GTT→VRAM copy). Allocating it
+`DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` (a device property probed once at
+creation into `staging_direct`; `VSFEEL_NLMEANS_HD=0` opts out) makes the compose
+land in VRAM and the existing copy a VRAM read. Command buffer and copy
+structure are unchanged, and the buffer holds only the tiles a frame ships, so
+the VRAM cost is one tile set. 1000f u16 ns=2, 3 interleaved pairs: 1076.7 vs
+999.6 fps, every pair favouring the ReBAR arm; `|HD-GTT|` and `|either-ref|` are
+exactly 0. Ceiling is small by design (only new tiles are uploaded).
 
 ### Cache + upload (2026-08-22 → 2026-09)
 
@@ -222,6 +236,8 @@ spelling still works for one release (read as a fallback, so the new name wins).
 - `VSFEEL_NLMEANS_GPUTRACE=1` — per-frame GPU timestamp splits per W/A dispatch.
 - `VSFEEL_NLMEANS_PACK=N` — entries per W/A round (clamped 1..16384; default from
   the 64 MiB ring budget).
+- `VSFEEL_NLMEANS_HD=0` — force the GTT staging + PCIe upload (no ReBAR
+  staging); default is the host-visible VRAM staging when the device has it.
 - `VSFEEL_NLMEANS_FORCE_PAD=1` — disables slot reuse entirely. **Currently crashes**
   (heap corruption: the acquire loop leaves `chosen[ti] = -1` and phase 2
   indexes `cache[-1]`, pre-existing). No test uses it.
@@ -230,7 +246,8 @@ spelling still works for one release (read as a fallback, so the new name wins).
 - `NLMEANS_TS_MAX` (130) and `NLMEANS_TS_RESERVED` (4) are C++ constants in
   `nlmeans.cpp`, and `NLMEANS_PROBE_ACC_NOSRC` is a compile-time `-D` in
   `nlmeans.comp` — none of the three is an env var.
-- `VSFEEL_NLMEANS_PACK` is the only runtime tuning knob; there is no queue knob.
+- `VSFEEL_NLMEANS_PACK`/`VSFEEL_NLMEANS_HD` are the runtime tuning knobs; there
+  is no queue knob.
 - `RADV_DEBUG=asm` / `RADV_DEBUG=shaderstats` work on this Mesa build.
 
 ## Default num_streams 1 -> 2

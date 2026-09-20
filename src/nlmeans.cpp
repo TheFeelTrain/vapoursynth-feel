@@ -182,6 +182,7 @@ struct NLMeansData {
     int n_slots {};
     int window_tiles {};             // clips*C*(2d+1): slots one full window needs
     int staging_tiles {};            // per-stream upload staging capacity, tiles
+    bool staging_direct {};          // ReBAR staging: host writes VRAM, no H2D DMA
     int tail_ints {};                // layer table + tile pairs in the tail
     int64_t compact_tile_elems {};   // w*h elements of one compact tile
     float * dbg_slots_map {};        // debug
@@ -437,6 +438,9 @@ static void release_cache(NLMeansData * d, NLStream & st) {
 // every tile must stay zero and the compose never rewrites it, so the whole
 // buffer is zeroed once per (re)allocation. Only called for a stream whose
 // previous command buffer has completed, so the descriptor rewrite is safe.
+// With ReBAR (staging_direct) the buffer lives in host-visible VRAM, so the
+// host compose writes land there and the tile copy reads VRAM instead of
+// crossing PCIe.
 static std::string create_staging(NLMeansData * d, NLStream & st, int tiles) {
     VkDevice dev = d->device->device;
     const VkDeviceSize bytes = static_cast<VkDeviceSize>(tiles) * d->slot_bytes;
@@ -454,10 +458,14 @@ static std::string create_staging(NLMeansData * d, NLStream & st, int tiles) {
     VkDeviceMemory mem {};
     uint32_t type_index {};
     {
-        const auto result = allocate_memory(*d->device, buf,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-            VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        const VkMemoryPropertyFlags flags = d->staging_direct
+            ? (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+            : (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+               VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        const auto result = allocate_memory(*d->device, buf, flags);
         if (std::holds_alternative<std::string>(result)) {
             vkDestroyBuffer(dev, buf, nullptr);
             return std::get<std::string>(result);
@@ -1525,6 +1533,13 @@ static void VS_CC NLMeansCreate(
     // warm-up's second end. create_staging grows it if a frame ever needs
     // more (see NLMeansGetFrame).
     d->staging_tiles = 2 * clips * d->channels;
+    // host-direct upload: with the ReBAR window the per-stream staging is
+    // mapped in VRAM, so the CPU compose writes it directly and the tile copy
+    // is a VRAM read instead of a PCIe one. Opt out with VSFEEL_NLMEANS_HD=0.
+    // Decided once here so every stream (including later create_staging growth)
+    // takes the same path.
+    d->staging_direct =
+        env_int("VSFEEL_NLMEANS_HD", 1) != 0 && rebar_available(*d->device);
     {
         const int full = d->num_streams * d->channels * clips * d->layers;
         const VkDeviceSize budget_slots = (512ull << 20) / slot_bytes_v;
