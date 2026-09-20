@@ -218,36 +218,38 @@ unrolling are order-preserving. `test_bm3dv2_matches_reference` spans
 radius 0..4 against vszipcl at the documented tolerances.
 
 **2026-09-20 — runs where buffer float atomics are missing (BM3D was
-AMD-RDNA3-only).** RADV gates `shaderBufferFloat32AtomicAdd` at GFX11
-(`radv_physical_device.c`) and the Windows driver has no such feature on
-Polaris, so BM3D refused creation — RX 580, Vega, RDNA1/2 alike. `bm3d.comp`
-gained a `-DNO_FLOAT_ATOMICS` build (`bm3d_cas.spv`, auto-selected, forced with
-`VSFEEL_BM3D_CAS=1`) whose aggregate stores run the CAS loop zipcl's own
-`atom_add_f` has always used: core `atomicCompSwap` only, so nothing about it is
+AMD-RDNA3-only).** RADV gates `shaderBufferFloat32AtomicAdd` at GFX11 and the
+Windows driver has no such feature on Polaris, so creation failed on RX 580,
+Vega and RDNA1/2 alike. `bm3d.comp` gained a `-DNO_FLOAT_ATOMICS` build
+(`bm3d_cas.spv`, auto-selected, `VSFEEL_BM3D_CAS=1` forces it) running zipcl's
+own `atom_add_f` CAS loop: core `atomicCompSwap` only, so nothing about it is
 driver-specific, and one fp32 add per round keeps it bit-identical to the
-hardware path at `extractor_exp=8` (75/75 BM3D tests either way). Cost, 1000f
-1080p GRAY32 r=2 ns=2 interleaved pairs: 314.8/312.5/314.9 (hardware) vs
-260.0/260.4/259.8 (CAS) fps, +0.66 ms/frame or ~17%.
+hardware path at `extractor_exp=8` (75/75 tests). Cost, 1000f 1080p GRAY32 r=2
+ns=2 interleaved pairs: 314.8/312.5/314.9 vs 260.0/260.4/259.8 fps, +17%.
 
-**2026-09-20 — the estimate cache now sizes to its working set (default), not
-the working set plus a window of seek slack.** `res_cap` was
-`tw + ns + 2r` while the in-flight working set is `ns + 2r`, so every instance
-allocated `tw` slots for a margin only out-of-order requests consume; radius 4
-on an 8 GiB card failed to allocate because of them. Dropping the margin is
--36..41% of total VRAM at no in-order cost, so it became the default;
-`VSFEEL_BM3D_CACHE=1` restores it for seek/scrub-heavy graphs, where a warm
-slot beats blocking in the acquire. Numbers in the VRAM paragraph.
+**2026-09-20 — the estimate cache sizes to its working set by default.** `res_cap`
+was `tw + ns + 2r` where the in-flight working set is only `ns + 2r`, so every
+instance allocated `tw` slots for a margin only out-of-order requests consume —
+which is what made radius 4 fail to allocate on an 8 GiB card. Dropping it is
+-36..41% of total VRAM at no in-order cost; `VSFEEL_BM3D_CACHE=1` restores the
+margin for seek-heavy graphs. Numbers in the VRAM paragraph.
 
-**2026-09-20 — the ReBAR probe now tests the heap, not the memory type.**
-`DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` also exists without Resizable BAR,
-backed by the PCIe aperture (typically 256 MiB) instead of VRAM, so staging
-taken from it failed with `VK_ERROR_OUT_OF_DEVICE_MEMORY` while VRAM was empty
-(RX 580/Windows, 1080p r=2, both passes). `rebar_available(dev, bytes)` gates on
-the backing heap size, then probes the whole per-instance staging once before
-the stream loop and falls back to GTT; no change on the DB machine (type 3 is in
-the 24 GiB device-local heap).
+**2026-09-20 — the direct-upload path needs a real ReBAR heap, not just the
+memory type.** An RX 580/Windows reports heap 0 = 7936 MiB device-local and heap
+2 = 256 MiB device-local, with the `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`
+type in that aperture: staging taken from it failed with
+`VK_ERROR_OUT_OF_DEVICE_MEMORY` while VRAM sat empty (1080p r=2; the Wiener pass
+stages 284.8 MiB). `rebar_available(dev, bytes)` now requires the backing heap
+to be a quarter of the largest device-local heap, then probes the whole
+per-instance staging once before the stream loop; the DB machine is unchanged.
 
 ## Open work
+
+- **RX 580/Windows loses the device at a seek.** The fullest capture plays 18267+
+  cleanly, then a seek to frame 0 dies on frame 0's *first* estimation submit
+  ("No fault detected") — nothing from that frame had been submitted, so the loss
+  came from work in flight when the seek landed, not from a long run. Frame 0 also
+  waits on writers from before the seek (`w=18274 val=4`); untriaged.
 
 - **The spatial search is the remaining kernel cost.** Its per-lane list must
   stay 8 deep, so its insert is ~14 instructions per candidate more expensive

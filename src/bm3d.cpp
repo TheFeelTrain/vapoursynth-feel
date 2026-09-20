@@ -1573,10 +1573,13 @@ static void VS_CC BM3DCreate(
     const bool hd_requested = env_int("VSFEEL_BM3D_HD", 1) != 0;
     d->staging_direct = hd_requested &&
         rebar_available(*d->device, staging_size * d->num_streams);
-    if (hd_requested && !d->staging_direct && vsfeel_device_info_enabled()) {
-        fprintf(stderr, "[bm3d] staging: %.0f MiB x %d streams does not fit "
-            "host-visible VRAM; using GTT\n",
-            static_cast<double>(staging_size) / (1024.0 * 1024.0), d->num_streams);
+    if (vsfeel_debug_enabled()) {
+        fprintf(stderr, "[bm3d] staging: %.0f MiB x %d streams -> %s\n",
+            static_cast<double>(staging_size) / (1024.0 * 1024.0), d->num_streams,
+            !hd_requested ? "GTT (VSFEEL_BM3D_HD=0)"
+                          : d->staging_direct
+                              ? "host-visible VRAM (direct)"
+                              : "GTT (no usable host-visible VRAM)");
     }
 
     for (int i = 0; i < d->num_streams; ++i) {

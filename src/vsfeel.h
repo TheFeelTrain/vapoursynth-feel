@@ -692,48 +692,53 @@ struct AllocatedMemory {
 std::variant<AllocatedMemory, std::string> allocate_memory(
     const VK_Device & dev, VkBuffer buffer, VkMemoryPropertyFlags required);
 
-// Can `bytes` actually be allocated from host-visible device-local memory (the
-// direct-upload path)? The memory *type* is not the answer: a card without
-// Resizable BAR still exposes DEVICE_LOCAL|HOST_VISIBLE, backed by the PCIe
-// aperture instead of VRAM, and a staging buffer bigger than that aperture
-// fails with VK_ERROR_OUT_OF_DEVICE_MEMORY while the VRAM heap sits empty.
-// So gate on the heap size and then on a real allocation of the whole request,
-// freed at once. allocate_memory never relaxes DEVICE_LOCAL|HOST_VISIBLE away,
-// so a caller that takes this path has to be sure it fits up front.
+// Can `bytes` actually be allocated from host-visible device-local memory, i.e.
+// is the direct-upload path worth taking? The memory *type* is not the answer:
+// a card without Resizable BAR still exposes DEVICE_LOCAL|HOST_VISIBLE, backed
+// by the PCIe aperture rather than VRAM (an RX 580 under the Windows driver
+// reports a 256 MiB aperture heap next to its 7936 MiB VRAM heap, and staging
+// taken from it fails with VK_ERROR_OUT_OF_DEVICE_MEMORY while VRAM sits
+// empty). Two gates: the backing heap must be a real slice of VRAM rather than
+// an aperture, and the whole request must actually allocate. The probe is
+// freed at once; allocate_memory never relaxes DEVICE_LOCAL|HOST_VISIBLE away,
+// so a caller taking this path has to be sure it fits up front.
 inline bool rebar_available(const VK_Device & dev, VkDeviceSize bytes) {
     constexpr VkMemoryPropertyFlags flags =
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    uint32_t type = 0;
-    bool found = false;
-    for (uint32_t i = 0; i < dev.mem_props.memoryTypeCount; ++i) {
-        if ((dev.mem_props.memoryTypes[i].propertyFlags & flags) == flags) {
-            type = i;
-            found = true;
-            break;
+    VkDeviceSize vram = 0;
+    for (uint32_t i = 0; i < dev.mem_props.memoryHeapCount; ++i) {
+        if (dev.mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            vram = std::max(vram, dev.mem_props.memoryHeaps[i].size);
         }
     }
-    if (!found) {
-        return false;
-    }
     bytes = std::max<VkDeviceSize>(bytes, 4);
-    const uint32_t heap = dev.mem_props.memoryTypes[type].heapIndex;
-    if (dev.mem_props.memoryHeaps[heap].size < bytes) {
-        return false;
+    for (uint32_t type = 0; type < dev.mem_props.memoryTypeCount; ++type) {
+        if ((dev.mem_props.memoryTypes[type].propertyFlags & flags) != flags) {
+            continue;
+        }
+        const VkDeviceSize heap =
+            dev.mem_props.memoryHeaps[dev.mem_props.memoryTypes[type].heapIndex].size;
+        // A quarter of VRAM is far above any PCIe aperture and far below a real
+        // Resizable-BAR window, which is the whole VRAM.
+        if (heap < bytes || heap < vram / 4) {
+            continue;
+        }
+        VkMemoryAllocateInfo info {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .allocationSize = bytes,
+            .memoryTypeIndex = type
+        };
+        VkDeviceMemory memory;
+        if (vkAllocateMemory(dev.device, &info, nullptr, &memory) != VK_SUCCESS) {
+            continue;
+        }
+        vkFreeMemory(dev.device, memory, nullptr);
+        return true;
     }
-    VkMemoryAllocateInfo info {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .pNext = nullptr,
-        .allocationSize = bytes,
-        .memoryTypeIndex = type
-    };
-    VkDeviceMemory memory;
-    if (vkAllocateMemory(dev.device, &info, nullptr, &memory) != VK_SUCCESS) {
-        return false;
-    }
-    vkFreeMemory(dev.device, memory, nullptr);
-    return true;
+    return false;
 }
 
 // Buffer handle with no memory bound yet. `size` is forced non-zero because
