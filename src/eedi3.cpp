@@ -372,13 +372,15 @@ static void gather_pair_row_f32(const float * s, float * da, float * db,
     }
 }
 
-// dst_kept[y*rows + k] = src[y][first + 2k], dst_interp[y*rows + k] =
-// src[y][1-first + 2k] (both compacted). Returns false when the geometry does
-// not allow the aligned fast path (caller falls back to two gather_columns).
+// Deinterleaves src's columns into dst_kept/dst_interp (both compacted, one
+// element per source column pair). `a_even` says which destination takes the
+// even columns: even and interp parity swap between the row-parity callers and
+// the AA horizontal gather, which reads columns. Returns false when the
+// geometry misses the aligned fast path.
 static bool gather_columns_pair(const uint8_t * src, ptrdiff_t src_stride,
                                 const int H, uint8_t * dst_kept, uint8_t * dst_interp,
-                                const int rows, const int first, const int elem,
-                                const bool nt) {
+                                const int rows, const bool a_even,
+                                const int elem, const bool nt) {
     const size_t dst_row = static_cast<size_t>(rows) * elem;
     const int vec = (elem == 2) ? 16 : 8;
     if (rows % vec != 0 || (dst_row & 31) != 0 ||
@@ -386,7 +388,6 @@ static bool gather_columns_pair(const uint8_t * src, ptrdiff_t src_stride,
         (reinterpret_cast<uintptr_t>(dst_interp) & 31) != 0) {
         return false;
     }
-    const bool a_even = (first == 0);
     for (int y = 0; y < H; ++y) {
         const uint8_t * const row = src + static_cast<size_t>(y) * src_stride;
         uint8_t * const da = dst_kept + static_cast<size_t>(y) * dst_row;
@@ -2350,6 +2351,82 @@ static void aa_gather_horizontal(
     }
 }
 
+// Both horizontal parities in one pass over the merged frame: the column pair
+// the kept/interp split needs is in the same 64-byte chunk, so a single read
+// produces both parities' raw planes, and the sclip columns pair the same way.
+// The mask bit matrix does not depend on the parity, so this also deletes the
+// second build the two-call form did. Its real purpose is to make both
+// parities available before one submission.
+// Returns false when the geometry misses the aligned pair fast path; the caller
+// then falls back to two aa_gather_horizontal calls.
+static bool aa_gather_horizontal_pair(
+    const Eedi3Data & d, const Eedi3PlaneConfig & acfg, uint8_t * upload,
+    uint8_t * staging, const uint8_t * srcp, ptrdiff_t src_stride,
+    const uint8_t * scpp, ptrdiff_t scp_stride,
+    const uint8_t * maskp, ptrdiff_t mask_stride) {
+
+    const bool nt = (d.copy_mode & 1) != 0;
+    const int rows = acfg.rows;
+    const int H = acfg.src_h;
+
+    if (maskp) {
+        const int mbits = d.mclip_native16 ? 16 : (d.mclip_native32 ? 32 : 8);
+        uint8_t * const ms = staging + d.upload_total + d.download_total + acfg.ms_offset;
+        uint8_t * const bm = staging + acfg.bits_offset;
+        const int nwords = (acfg.width + 31) / 32;
+        const int nw64 = (acfg.width + d.mdis + 63) / 64;
+        uint64_t * const scratch =
+            bmask_scratch(2 * static_cast<size_t>(nw64) + acfg.rows);
+        if (d.mask_fuse && d.mdis < 64 && acfg.width >= 2 * d.mdis) {
+            const int bw = (acfg.width + 63) / 64;
+            uint64_t * const bitmat = reinterpret_cast<uint64_t *>(ms);
+            gather_mask_bitmat(maskp, mask_stride, H, rows, 0, 2, mbits,
+                               bitmat, bw, scratch + 2 * nw64);
+            for (int r = 0; r < rows; ++r) {
+                build_bmask_row_from_bits(
+                    bitmat + static_cast<size_t>(r) * bw,
+                    reinterpret_cast<uint32_t *>(
+                        bm + static_cast<size_t>(r) * nwords * 4),
+                    acfg.width, d.mdis, scratch);
+            }
+        } else {
+            uint8_t * const m2 = ms + static_cast<size_t>(rows) * acfg.width;
+            gather_mask_u8(maskp, mask_stride, H, ms, rows, 0, 2, mbits);
+            transpose_plane(ms, rows, rows, acfg.width, m2, acfg.width, 1);
+            for (int r = 0; r < rows; ++r) {
+                build_bmask_row(m2 + static_cast<size_t>(r) * acfg.width,
+                                nullptr, nullptr,
+                                reinterpret_cast<uint32_t *>(
+                                    bm + static_cast<size_t>(r) * nwords * 4),
+                                acfg.width, d.mdis, scratch);
+            }
+        }
+    }
+
+    if (!d.skip_raw) {
+        // Kept columns take the pass's parity: even for field 1, odd for
+        // field 0 (aa_gather_horizontal's `1 - field`), so raw2 gets the
+        // complement.
+        if (!gather_columns_pair(srcp, src_stride, H,
+                                 upload + acfg.raw_offset,
+                                 upload + acfg.raw2_offset,
+                                 rows, false, d.elem_bytes, nt)) {
+            gather_columns(srcp, src_stride, H, upload + acfg.raw_offset,
+                           rows, 2, 1, d.elem_bytes, nt);
+            gather_columns(srcp, src_stride, H, upload + acfg.raw2_offset,
+                           rows, 2, 0, d.elem_bytes, nt);
+        }
+    }
+
+    if (scpp && d.vcheck > 0 && !d.skip_sclip) {
+        gather_columns(scpp, scp_stride, H, upload + acfg.sclip_offset,
+                       rows, 2, 0, d.elem_bytes, nt);
+        gather_columns(scpp, scp_stride, H, upload + acfg.sclip2_offset,
+                       rows, 2, 1, d.elem_bytes, nt);
+    }
+    return true;
+}
+
 // Final 50/50 merge of the two composed horizontal planes into the output
 // frame: std.Merge's default u16 arithmetic is exactly (a+b+1)>>1 (==
 // _mm256_avg_epu16), f32 is 0.5f*a + 0.5f*b bitwise.
@@ -2563,6 +2640,34 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
         }
     };
 
+    // Both parities of every plane in one pass. Only valid when a sclip frame
+    // is sourced: the pair path uploads both parities' sclip columns, and the
+    // fallback (two gather_horizontal calls) needs a scp per pass.
+    auto gather_horizontal_pair = [&]() {
+        if (!scp0) {
+            return false;
+        }
+        for (int plane = 0; plane < numPlanes; ++plane) {
+            if (!d->process[plane]) {
+                continue;
+            }
+            const auto & vcfg = d->planes[plane];
+            const auto & acfg = d->aplanes[plane];
+            const uint8_t * const vp = staging + d->upload_total +
+                d->download_total + vcfg.v_offset;
+            const ptrdiff_t v_stride =
+                static_cast<ptrdiff_t>(vcfg.out_w) * d->elem_bytes;
+            if (!aa_gather_horizontal_pair(*d, acfg, upload, staging, vp,
+                                           v_stride,
+                                           vsapi->getReadPtr(scp0, plane),
+                                           vsapi->getStride(scp0, plane),
+                                           maskp, mask_stride)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     // ------------------------------------------------------------------
     // Submission 1: the vertical stage (both sub-frames).
     // ------------------------------------------------------------------
@@ -2632,18 +2737,37 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
     }
 
     // ------------------------------------------------------------------
-    // Host: column-gather the merged v for both horizontal sub-passes.
+    // Host: column-gather the merged v, then compose both horizontal
+    // sub-frames in one submission.
+    //
+    // Both sub-passes read only the merged frame, which the vertical fence
+    // above has already finished, so nothing between them needs the host or a
+    // second fence: the pair gather uploads both parities here and the two
+    // compose passes go into a single command buffer separated by their own
+    // memory barrier. Setting VSFEEL_EEDI3AA_HFUSE selects this; leaving it
+    // unset restores the two-submission form as the A/B control.
     // ------------------------------------------------------------------
-    gather_horizontal(fh0, false);
-    gather_horizontal(fh1, true);
+    const bool one_cb = env_flag("VSFEEL_EEDI3AA_HFUSE");
+    bool fused = false;
+    if (one_cb) {
+        fused = gather_horizontal_pair();
+    }
+    if (!fused) {
+        gather_horizontal(fh0, false);
+        gather_horizontal(fh1, true);
+    }
     if (hbench) { h_thGather = std::chrono::steady_clock::now(); }
 
+    if (!coherent) {
+        const VkMappedMemoryRange range =
+            mapped_range(*d->device, resource.staging_mem, 0, d->upload_total);
+        checkVK(vkFlushMappedMemoryRanges(dev, 1, &range));
+    }
+    _mm_sfence();
 
-    // ------------------------------------------------------------------
-    // Submission 2: the horizontal stage (both sub-frames compose their plane).
-    // ------------------------------------------------------------------
-    checkVK(vkResetCommandPool(dev, resource.pool, 0));
-    {
+    if (fused) {
+        // One CB, one submit, one fence wait for both compose passes.
+        checkVK(vkResetCommandPool(dev, resource.pool, 0));
         VkCommandBufferBeginInfo begin_info {
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
             .pNext = nullptr,
@@ -2653,40 +2777,109 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
         if (vkBeginCommandBuffer(resource.cmd, &begin_info) != VK_SUCCESS) {
             return set_error("vkBeginCommandBuffer failed");
         }
-    }
-    resource.ts_used = 0;
-    if (resource.ts_query) {
-        vkCmdResetQueryPool(resource.cmd, resource.ts_query, 0,
-                            static_cast<uint32_t>(resource.ts_cap));
-    }
-    vsfeel_trace_mark("rec cb2");
-    record_h2d_copy(*d, resource);
-    if (const auto e = record_pass(*d, resource, fh0, d->aplanes, true, false,
-                                   PassTail::kCompose, direct)) {
-        return set_error(*e);
-    }
-    if (const auto e = record_pass(*d, resource, fh1, d->aplanes, true, true,
-                                   PassTail::kCompose, direct)) {
-        return set_error(*e);
-    }
-    if (vkEndCommandBuffer(resource.cmd) != VK_SUCCESS) {
-        return set_error("vkEndCommandBuffer failed");
-    }
-    if (hbench) { h_thRec = std::chrono::steady_clock::now(); }
+        resource.ts_used = 0;
+        if (resource.ts_query) {
+            vkCmdResetQueryPool(resource.cmd, resource.ts_query, 0,
+                                static_cast<uint32_t>(resource.ts_cap));
+        }
+        vsfeel_trace_mark("rec cb2");
+        record_h2d_copy(*d, resource);
+        if (const auto e = record_pass(*d, resource, fh0, d->aplanes, true, false,
+                                       PassTail::kCompose, direct)) {
+            return set_error(*e);
+        }
+        if (const auto e = record_pass(*d, resource, fh1, d->aplanes, true, true,
+                                       PassTail::kCompose, direct)) {
+            return set_error(*e);
+        }
+        if (vkEndCommandBuffer(resource.cmd) != VK_SUCCESS) {
+            return set_error("vkEndCommandBuffer failed");
+        }
+        if (hbench) { h_thRec = std::chrono::steady_clock::now(); }
+        vsfeel_trace_mark("sub cb2");
+        checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
+            resource.cmd, resource.fence));
+        vsfeel_trace_mark("wait cb2");
+        checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
+        eedi3_gpu_report(*d, resource, "aa-h", GB_AA_HORIZ);
+        if (hbench) { h_thWait = std::chrono::steady_clock::now(); }
+    } else {
+        // A/B control: two submissions, a fence wait between them.
+        checkVK(vkResetCommandPool(dev, resource.pool, 0));
+        {
+            VkCommandBufferBeginInfo begin_info {
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .pInheritanceInfo = nullptr
+            };
+            if (vkBeginCommandBuffer(resource.cmd, &begin_info) != VK_SUCCESS) {
+                return set_error("vkBeginCommandBuffer failed");
+            }
+        }
+        resource.ts_used = 0;
+        if (resource.ts_query) {
+            vkCmdResetQueryPool(resource.cmd, resource.ts_query, 0,
+                                static_cast<uint32_t>(resource.ts_cap));
+        }
+        vsfeel_trace_mark("rec cb2");
+        record_h2d_copy(*d, resource);
+        if (const auto e = record_pass(*d, resource, fh0, d->aplanes, true, false,
+                                       PassTail::kCompose, direct)) {
+            return set_error(*e);
+        }
+        if (vkEndCommandBuffer(resource.cmd) != VK_SUCCESS) {
+            return set_error("vkEndCommandBuffer failed");
+        }
+        if (!coherent) {
+            const VkMappedMemoryRange range =
+                mapped_range(*d->device, resource.staging_mem, 0, d->upload_total);
+            checkVK(vkFlushMappedMemoryRanges(dev, 1, &range));
+        }
+        _mm_sfence();
+        vsfeel_trace_mark("sub cb2");
+        checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
+            resource.cmd, resource.fence));
+        vsfeel_trace_mark("wait cb2");
+        checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
+        if (hbench) { h_thRec = std::chrono::steady_clock::now(); }
+        if (hbench) { h_thWait = std::chrono::steady_clock::now(); }
 
-    if (!coherent) {
-        const VkMappedMemoryRange range =
-            mapped_range(*d->device, resource.staging_mem, 0, d->upload_total);
-        checkVK(vkFlushMappedMemoryRanges(dev, 1, &range));
+        checkVK(vkResetCommandPool(dev, resource.pool, 0));
+        {
+            VkCommandBufferBeginInfo begin_info {
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .pInheritanceInfo = nullptr
+            };
+            if (vkBeginCommandBuffer(resource.cmd, &begin_info) != VK_SUCCESS) {
+                return set_error("vkBeginCommandBuffer failed");
+            }
+        }
+        vsfeel_trace_mark("rec cb3");
+        record_h2d_copy(*d, resource);
+        if (const auto e = record_pass(*d, resource, fh1, d->aplanes, true, true,
+                                       PassTail::kCompose, direct)) {
+            return set_error(*e);
+        }
+        if (vkEndCommandBuffer(resource.cmd) != VK_SUCCESS) {
+            return set_error("vkEndCommandBuffer failed");
+        }
+        if (!coherent) {
+            const VkMappedMemoryRange range =
+                mapped_range(*d->device, resource.staging_mem, 0, d->upload_total);
+            checkVK(vkFlushMappedMemoryRanges(dev, 1, &range));
+        }
+        _mm_sfence();
+        vsfeel_trace_mark("sub cb3");
+        checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
+            resource.cmd, resource.fence));
+        vsfeel_trace_mark("wait cb3");
+        checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
+        eedi3_gpu_report(*d, resource, "aa-h", GB_AA_HORIZ);
+        if (hbench) { h_thWait = std::chrono::steady_clock::now(); }
     }
-    _mm_sfence();
-    vsfeel_trace_mark("sub cb2");
-    checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
-        resource.cmd, resource.fence));
-    vsfeel_trace_mark("wait cb2");
-    checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
-    eedi3_gpu_report(*d, resource, "aa-h", GB_AA_HORIZ);
-    if (hbench) { h_thWait = std::chrono::steady_clock::now(); }
 
     // The final merge below reads the two compose kernels' planes from
     // staging, so invalidate them first (mirrors EEDI3's block).
@@ -2715,8 +2908,8 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
         }
         const auto & cfg = d->planes[plane];
         const size_t out_row = static_cast<size_t>(cfg.out_w) * d->elem_bytes;
-        const bool fused = d->aa_fuse && d->vcheck > 0 && cfg.o0_bytes > 0;
-        if (fused) {
+        const bool gpu_fused = d->aa_fuse && d->vcheck > 0 && cfg.o0_bytes > 0;
+        if (gpu_fused) {
             // The second compose already wrote merge(O_0, O_1) full-frame to the
             // staging download, so this is a plain strided row copy.
             const uint8_t * const mo = staging + d->upload_total +
@@ -2978,7 +3171,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
                 nt_raw == ((d->copy_mode & 1) != 0)) {
                 pair_done = gather_columns_pair(
                     srcp, src_stride, cfg.src_h, rawp, upload + cfg.sclip_offset,
-                    cfg.rows, off, d->elem_bytes, nt_raw);
+                    cfg.rows, off == 0, d->elem_bytes, nt_raw);
             }
             if (!pair_done && !d->skip_raw) {
                 gather_columns(srcp, src_stride, cfg.src_h, rawp, cfg.rows,

@@ -608,28 +608,60 @@ flat as control.
   untouched and still selected by `VSFEEL_EEDI3_VCLDS=1`; the parallel level
   wins when both are set.
 
-## Round 28 — EEDI3 host-pass: three levers measured, none pays
+## Round 28 — EEDI3AA's two horizontal submissions fused into one
 
 The host-stage probe (`VSFEEL_EEDI3_HBENCH` / `VSFEEL_EEDI3AA_HBENCH`, sampled
 at sn=80) was re-run before touching anything. Its stages sum to the reported
 total almost exactly, i.e. **EEDI3AA is fully serialized**: per stream at
 1080p/ns=1, vGather 3.4 + vWait 8.7 + hGather 2.6 + hWait 6.5 + merge 0.6 =
-21.9 ms. Command-buffer recording is 0.009-0.015 ms of that.
+21.9 ms. Command-buffer recording is 0.009-0.015 ms of that, so the rejected
+levers below were bounded out or refuted before any code was written.
+
+**Shipped: one submission instead of two for the AA horizontal stage.**
+Both sub-passes read only the merged vertical frame, which the first fence has
+already finished, so nothing between them needs the host or a second fence. The
+two compose passes now go into one command buffer (separated by the memory
+barrier `record_pass` already emits) behind one `submit_with_fence` and one
+`vkWaitForFences`. To have both parities uploaded before that single submit the
+frame is column-gathered once with the `gather_columns_pair` form into both
+`raw`/`raw2` (and `sclip`/`sclip2`) regions; the mask bit matrix does not depend
+on the parity, so this also deletes its duplicate build. `num_streams` is
+untouched, so per-stream VRAM does not change.
+
+Measured, ns=1 same frame (`VSFEEL_EEDI3AA_HBENCH`), two submissions -> fused:
+total 21.631 -> 19.470 ms (**-10%**), the second fence window 6.045 -> 5.172 ms.
+That hWait drop is only ~0.9 ms, not the 6 ms the serialization model predicted,
+so most of the window was compute the GPU still has to do.
+
+End-to-end at ns=8 is far smaller than the ns=1 win, because throughput there is
+bound by total GPU work / 8 streams, not by serialized latency. 6 interleaved
+order-reversed pairs of `--filter eedi3aa`, 2000 frames: median 141.3 (control)
+vs 144.8 (fused); a later 5-pair run 132.4 vs 144.5. So **a few percent**, not
+10%. In every direct pair the fused arm won or tied; it never lost. Run-to-run
+spread on this harness is +-7-14% (and one arm occasionally lands in a slow
+bimodal band), so grade the medians, not any single pair.
+
+The A/B knob is `VSFEEL_EEDI3AA_HFUSE`: set (to anything) selects the fused
+form, unset keeps the two-submission control. Because the fused path is the
+default, `tests/test_eedi3aa.py`'s bit-exact oracle sweeps both its arms through
+it. Bit-exactness against the control was verified separately over 15 GRAY
+geometries x u16/f32 (odd width 630/638, odd height, rows % 16 != 0, vcheck
+0/1/2/3, mdis 5/20/40, mclip on/off) and 7 multi-plane cases (YUV420P16 /
+YUV444P16 at 640x360 and 630x360 and 1280x720, GRAY16 to 1080x1920): 0
+mismatches everywhere, including the fused GPU merge (`comp_fuse`), which is
+`(a+b+1)>>1` bit-identical to `merge_pair_rows`' `_mm256_avg_epu16`.
+
+Rejected on the way:
 
 1. **Pre-recording the CBs — bounded out, not implemented.** `record` is
    0.01-0.02 ms/frame in every measured arm (EEDI3 vertical 0.014, AA 0.009 and
-   0.013), so the entire recording path is <=0.07% of the frame. The earlier
-   A3 note (round 19) already said this; the number reproduces.
-2. **Fusing the AA horizontal stage's two parities into one pass — bit-exact,
-   measured NEUTRAL, reverted.** `gather_columns_pair` (the EEDI3H pair form)
-   reads the merged frame once and writes both parities, deleting one of the
-   two full-frame column gathers *and* the duplicated mask-bit build.
-   A/B at ns=1, same frame: hGather 2.630 -> 2.650 ms, total 21.933 -> 21.881 ms
-   (0.2%, below the probe's own resolution). Mechanism: the pair halves 8.3 MB
-   (u16) of reads per frame into a staging buffer whose traffic is evidently
-   not the binding cost — a 6-pair order-reversed A/B at ns=8 could not resolve
-   it either (153.6 vs 156.1 fps median, 7% spread). Reverted: neutral
-   complexity is not worth an index-parity parameter.
+   0.013), so the whole recording path is <=0.07% of the frame. The round-19 A3
+   note already said this; the number reproduces.
+2. **The pair gather on its own — bit-exact, neutral, ships only as the enabler
+   above.** A/B at ns=1 without the fusion: hGather 2.630 -> 2.650 ms, total
+   21.933 -> 21.881 ms, under the probe's resolution. Halving 8.3 MB (u16) of
+   reads per frame into staging buys nothing, so that traffic is not the binding
+   cost. It earns its place by making the single submit possible, not alone.
 3. **Not building the vertical `xpose`/`compose` pipelines for AA — premise is
    false.** `EEDI3AA` *does* dispatch `xpose`: its horizontal sub-pass calls
    `record_pass(..., horiz=true, planes=d->aplanes)`, and `d->aa` is set while
@@ -641,23 +673,16 @@ total almost exactly, i.e. **EEDI3AA is fully serialized**: per stream at
    `std::vector<uint64_t>` scratch buffers the gather paths allocated per plane
    per frame (up to 12 allocations/AA frame) become one `bmask_scratch()` buffer
    per worker thread. Every builder fully overwrites the span it uses, so reuse
-   is safe; the win is bounded by the ~1 us/alloc it removes, i.e. well under
-   the probe's resolution — it is correctness-neutral cleanup, not a speedup.
+   is safe; the win is bounded by the ~1 us/alloc it removes, i.e. far under the
+   probe's resolution — correctness-neutral cleanup, not a speedup.
    `env_flag("...HBENCH")` is also cached in a `static` instead of re-read by
    `getenv` every frame.
 
-Same-session A/B against an unmodified HEAD build of the same shaders
-(`--filter eedi3aa`, 1000 frames, ns=8, 6 order-reversed pairs): HEAD median
-153.6 fps, this build 156.1 fps (ratio 1.017x) — inside the run-to-run spread,
-so treat the change as neutral and read neither number as a regression.
-
-The limiter the probe exposes is the **GPU fence wait** (15.2 ms of the 21.9 ms
-per-frame path at ns=1), not the host CPU stages. The one structural lever it
-implies that was *not* tried: both AA horizontal sub-passes read only the merged
-frame, so they could share a single command buffer and a single fence wait
-(saving the ~6.5 ms second wait, ~30% of the ns=1 path) — that needs the
-two-parity pre-gather from item 2 to be worth it, which is why item 2 was built
-and measured first.
+Walk the A/B in one process, or the harness will lie: an early comparison
+against a HEAD *worktree* build was silently meaningless because the worktree's
+`CMakeCache.txt` still pointed at the main checkout (`CMAKE_HOME_DIRECTORY`), so
+`install.sh` rebuilt the main tree. Check that cache field before trusting a
+second build directory.
 
 ## Open work
 
