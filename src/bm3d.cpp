@@ -701,7 +701,9 @@ static const VSFrame *VS_CC BM3DGetFrame(
 
         auto t0 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
+        vsfeel_trace_frame_begin();
         auto stream = d->pool.take();
+        vsfeel_trace_mark("pool");
         auto t1 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
         if (env_flag("VSFEEL_BM3D_TRACE") || env_flag("BM3D_TRACE")) fprintf(stderr, "[t] n=%d acquired\n", n);
@@ -719,6 +721,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
                                  : std::chrono::steady_clock::time_point {};
 
         const auto set_error = [&](const std::string & error_message) {
+            vsfeel_trace_error("BM3D", n, error_message, d->device.get());
             VkDevice e_dev = d->device->device;
             // If no estimation was submitted, nothing will signal this frame's
             // timeline, so unblock readers waiting on it from the host. Once it
@@ -919,6 +922,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
         /* no fence here: the fence is signalled by the aggregation submit on
                the same queue, and a fence must not be attached to a second
                submission while a first one still holds it */
+        vsfeel_trace_mark("sub est");
         checkVK(submit_timeline(dev, stream.queue, stream.queue_lock, stream.cmd,
             src_waits, src_values, src_stages, stream.timeline, my_seq, VK_NULL_HANDLE));
         estimation_submitted = true;
@@ -971,6 +975,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
             agg_values.insert(agg_values.end(), res_values.begin(), res_values.end());
             agg_stages.insert(agg_stages.end(), res_stages.begin(), res_stages.end());
 
+            vsfeel_trace_mark("sub agg");
             checkVK(submit_timeline(dev, stream.queue, stream.queue_lock,
                 stream.cmd_agg, agg_waits, agg_values, agg_stages,
                 VK_NULL_HANDLE, 0, stream.fence));
@@ -978,6 +983,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
         auto t6 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
 
+        vsfeel_trace_mark("wait");
         checkVK(vkWaitForFences(dev, 1, &stream.fence, VK_TRUE, UINT64_MAX));
         auto t7 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
@@ -1092,6 +1098,7 @@ static void VS_CC BM3DCreate(
     int error;
 
     auto set_error = [&](const std::string & error_message) {
+        vsfeel_trace_error("BM3D", -1, error_message, d->device.get());
         vsapi->mapSetError(out, ("BM3D: " + error_message).c_str());
         vsapi->freeNode(d->node);
         if (d->ref_node) {

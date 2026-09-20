@@ -876,9 +876,12 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
             }
         }
 
+        vsfeel_trace_frame_begin();
         auto resource = d->pool.take();
+        vsfeel_trace_mark("pool");
 
         auto set_error = [&](const std::string & error_message) {
+            vsfeel_trace_error("NNEDI3", n, error_message, d->device.get());
             d->pool.give_back(std::move(resource));
             vsapi->setFilterError(("NNEDI3: " + error_message).c_str(), frameCtx);
             vsapi->freeFrame(src);
@@ -960,10 +963,12 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
         // Single inline submit on the compute queue (fence waits compute +
         // D2H). No transfer queue, no timeline, no per-frame allocs.
         VkCommandBuffer cb = parity ? resource.cmd1 : resource.cmd;
+        vsfeel_trace_mark("submit");
         checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
             cb, resource.fence));
         bump(d->t_gpu);
 
+        vsfeel_trace_mark("wait");
         checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
         bump(d->t_wait);
         // TEMPORARY GPU timestamps (remove after tuning)
@@ -1287,6 +1292,7 @@ static void VS_CC Nnedi3Create(
     int error;
 
     auto set_error = [&](const std::string & error_message) {
+        vsfeel_trace_error("NNEDI3", -1, error_message, d->device.get());
         vsapi->mapSetError(out, ("NNEDI3: " + error_message).c_str());
         vsapi->freeNode(d->node);
     };

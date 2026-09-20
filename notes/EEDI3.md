@@ -608,6 +608,57 @@ flat as control.
   untouched and still selected by `VSFEEL_EEDI3_VCLDS=1`; the parallel level
   wins when both are set.
 
+## Round 28 — EEDI3 host-pass: three levers measured, none pays
+
+The host-stage probe (`VSFEEL_EEDI3_HBENCH` / `VSFEEL_EEDI3AA_HBENCH`, sampled
+at sn=80) was re-run before touching anything. Its stages sum to the reported
+total almost exactly, i.e. **EEDI3AA is fully serialized**: per stream at
+1080p/ns=1, vGather 3.4 + vWait 8.7 + hGather 2.6 + hWait 6.5 + merge 0.6 =
+21.9 ms. Command-buffer recording is 0.009-0.015 ms of that.
+
+1. **Pre-recording the CBs — bounded out, not implemented.** `record` is
+   0.01-0.02 ms/frame in every measured arm (EEDI3 vertical 0.014, AA 0.009 and
+   0.013), so the entire recording path is <=0.07% of the frame. The earlier
+   A3 note (round 19) already said this; the number reproduces.
+2. **Fusing the AA horizontal stage's two parities into one pass — bit-exact,
+   measured NEUTRAL, reverted.** `gather_columns_pair` (the EEDI3H pair form)
+   reads the merged frame once and writes both parities, deleting one of the
+   two full-frame column gathers *and* the duplicated mask-bit build.
+   A/B at ns=1, same frame: hGather 2.630 -> 2.650 ms, total 21.933 -> 21.881 ms
+   (0.2%, below the probe's own resolution). Mechanism: the pair halves 8.3 MB
+   (u16) of reads per frame into a staging buffer whose traffic is evidently
+   not the binding cost — a 6-pair order-reversed A/B at ns=8 could not resolve
+   it either (153.6 vs 156.1 fps median, 7% spread). Reverted: neutral
+   complexity is not worth an index-parity parameter.
+3. **Not building the vertical `xpose`/`compose` pipelines for AA — premise is
+   false.** `EEDI3AA` *does* dispatch `xpose`: its horizontal sub-pass calls
+   `record_pass(..., horiz=true, planes=d->aplanes)`, and `d->aa` is set while
+   `d->horiz` is not, so gating on `d->horiz` hands `record_pass` a null
+   `xpose_pipeline` and RADV faults in `vkCmdBindPipeline`. `create_pipeline`
+   with a null `VkShaderModule` still returns a `VkPipeline`, so the failure
+   surfaces at dispatch, not creation. AA needs both kernels; nothing to prune.
+4. **Kept: the per-frame mask scratch is now thread-local.** The four
+   `std::vector<uint64_t>` scratch buffers the gather paths allocated per plane
+   per frame (up to 12 allocations/AA frame) become one `bmask_scratch()` buffer
+   per worker thread. Every builder fully overwrites the span it uses, so reuse
+   is safe; the win is bounded by the ~1 us/alloc it removes, i.e. well under
+   the probe's resolution — it is correctness-neutral cleanup, not a speedup.
+   `env_flag("...HBENCH")` is also cached in a `static` instead of re-read by
+   `getenv` every frame.
+
+Same-session A/B against an unmodified HEAD build of the same shaders
+(`--filter eedi3aa`, 1000 frames, ns=8, 6 order-reversed pairs): HEAD median
+153.6 fps, this build 156.1 fps (ratio 1.017x) — inside the run-to-run spread,
+so treat the change as neutral and read neither number as a regression.
+
+The limiter the probe exposes is the **GPU fence wait** (15.2 ms of the 21.9 ms
+per-frame path at ns=1), not the host CPU stages. The one structural lever it
+implies that was *not* tried: both AA horizontal sub-passes read only the merged
+frame, so they could share a single command buffer and a single fence wait
+(saving the ~6.5 ms second wait, ~30% of the ns=1 path) — that needs the
+two-parity pre-gather from item 2 to be worth it, which is why item 2 was built
+and measured first.
+
 ## Open work
 
 - **A2. Row-kernel work — round 20 closed the two proposed levers as dead; the

@@ -228,8 +228,24 @@ All filters share an inline (zero-overhead, C++20) plumbing layer in
   fence inside the lock. `submit_timeline` takes equal-sized wait
   vectors (semaphore, value, stage) and optionally signals a timeline value;
   waits are non-destructive so any number of consumers can wait on one signal.
-- **`trace_on(env)`** — env-gated debug flags; keep one env name per filter
-  (`VSFEEL_DFTTEST_TRACE`, `BM3D_TRACE`, ...).
+- **`env_flag` / `env_int` / `env_str`** — env-gated debug flags; keep one env
+  name per filter (`VSFEEL_DFTTEST_TRACE`, `BM3D_TRACE`, ...).
+- **`vsfeel_trace_error(filter, frame, message, device)`** — every `set_error`
+  lambda calls this first, so **one** switch (`VSFEEL_TRACE=1`, `=2` for no line
+  cap) names the filter, the output frame (`create` at filter creation) and the
+  order of every error, prints the device/driver banner, and on
+  `VK_ERROR_DEVICE_LOST` asks the driver for its own fault report
+  (`VK_EXT_device_fault`: description, faulting address and kind, vendor code,
+  vendor crash dump). The order is the point: a lost device makes every later
+  call fail, so the `(first)` line is the only informative one. Add the call
+  whenever a new error path is added — a filter that reports through
+  `vsapi->mapSetError` directly bypasses it. Pass `d->device.get()`, which is
+  null before device creation.
+- **`vsfeel_trace_frame_begin()` / `vsfeel_trace_mark(stage)`** — the trail the
+  first error dumps: call `frame_begin` when the frame path starts and mark each
+  step *before* it runs (`pool`, `rec cb1`, `sub cb1`, `wait cb1`, ...), so the
+  last mark names the step that failed. Marks are inert unless tracing is on;
+  thread_local, because the frame path is synchronous per worker thread.
 
 **ODR rule (learned the hard way):** a filter-local struct used to
 instantiate a shared template must have a **unique name per filter**

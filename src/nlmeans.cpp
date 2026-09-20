@@ -553,7 +553,9 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         &d->vi->format, d->vi->width, d->vi->height, fr.data(), pl.data(),
         frames[m], core);
 
+    vsfeel_trace_frame_begin();
     auto stream = d->pool.take();
+    vsfeel_trace_mark("pool");
 
     auto cleanup_frames = [&] {
         for (int i = 0; i < count; ++i) {
@@ -567,7 +569,7 @@ static const VSFrame *VS_CC NLMeansGetFrame(
     VkDevice dev = d->device->device;
 
     auto set_error = [&](const std::string & error_message) {
-        fprintf(stderr, "[nlmeans-ERROR] n=%d: %s\n", n, error_message.c_str());
+        vsfeel_trace_error("NLMeans", n, error_message, d->device.get());
         // unblock any stream waiting on our pending uploads (we never submit)
         d->submit_count[stream.stream_id].fetch_add(1, std::memory_order_release);
         d->submit_cv.notify_all();
@@ -891,6 +893,7 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         stream.wait_subs_gen.clear();
     }
 
+    vsfeel_trace_mark("submit");
     if (VkResult r = submit_with_fence(dev, stream.queue, stream.queue_lock,
             stream.cmd, stream.fence); r != VK_SUCCESS) {
         return set_error("vkQueueSubmit failed");
@@ -899,6 +902,7 @@ static const VSFrame *VS_CC NLMeansGetFrame(
     d->submit_cv.notify_all();
     mark(t_sub);
 
+    vsfeel_trace_mark("wait");
     if (vkWaitForFences(dev, 1, &stream.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
         return set_error("vkWaitForFences failed");
     }
@@ -1039,6 +1043,7 @@ static void VS_CC NLMeansCreate(
     int error;
 
     auto set_error = [&](const std::string & error_message) {
+        vsfeel_trace_error("NLMeans", -1, error_message, d->device.get());
         vsapi->mapSetError(out, ("NLMeans: " + error_message).c_str());
         vsapi->freeNode(d->node);
         if (d->ref_node) {

@@ -379,7 +379,9 @@ static const VSFrame *VS_CC BilateralGetFrame(
             };
 
             auto t_acq0 = trace ? now_us() : 0;
+            vsfeel_trace_frame_begin();
             auto resource = d->pool.take();
+            vsfeel_trace_mark("pool");
             if (trace) {
                 t_acq += now_us() - t_acq0;
             }
@@ -396,6 +398,7 @@ static const VSFrame *VS_CC BilateralGetFrame(
             }
 
         auto set_error = [&](const std::string & error_message) {
+            vsfeel_trace_error("BilateralVK", n, error_message, d->device.get());
             d->pool.give_back(std::move(resource));
             vsapi->setFilterError(("BilateralVK: " + error_message).c_str(), frameCtx);
             if (d->ref_node) {
@@ -479,10 +482,12 @@ static const VSFrame *VS_CC BilateralGetFrame(
         // GPU is told to read the upload window.
         _mm_sfence();
 
+        vsfeel_trace_mark("submit");
         checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
             resource.cmd, resource.fence));
         mark(t_sub);
 
+        vsfeel_trace_mark("wait");
         checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
         mark(t_wait);
 
@@ -577,6 +582,7 @@ static void VS_CC BilateralCreate(
     bool has_ref = d->ref_node != nullptr;
 
     auto set_error = [&](const std::string & error_message) {
+        vsfeel_trace_error("BilateralVK", -1, error_message, d->device.get());
         vsapi->mapSetError(out, ("BilateralVK: " + error_message).c_str());
         if (has_ref) {
             vsapi->freeNode(d->ref_node);

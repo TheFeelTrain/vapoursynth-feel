@@ -892,6 +892,8 @@ static bool fail_slot_pad_submit() {
 static bool submit_pad_op(
     const DftData & d, DFTTestResource & resource, const SlotOp & op) {
 
+    // Before the failure check: the trail's last mark names the step that failed.
+    vsfeel_trace_mark("pad");
     if (op.slot >= 0 && fail_slot_pad_submit()) {
         return false;
     }
@@ -1148,13 +1150,16 @@ static const VSFrame *VS_CC DftGetFrame(
         // included — are fully done, so the overwrite never races a reader's
         // copy, and destroying the timeline semaphore is safe (all its waits
         // have resolved). No host fence waits anywhere: no deadlocks.
+        vsfeel_trace_frame_begin();
         d->pool.semaphore.acquire();
         d->pool.lock.lock();
         auto resource = std::move(d->pool.items.back());
         d->pool.items.pop_back();
         d->pool.lock.unlock();
+        vsfeel_trace_mark("pool");
 
         auto set_error = [&](const std::string & error_message) {
+            vsfeel_trace_error("DFTTest", n, error_message, d->device.get());
             d->pool.give_back(std::move(resource));
             vsapi->setFilterError(("DFTTest: " + error_message).c_str(), frameCtx);
             for (int t = 0; t < tw; ++t) {
@@ -1496,6 +1501,7 @@ static const VSFrame *VS_CC DftGetFrame(
                 wait_sems[i] = waits[i].first;
                 wait_vals[i] = waits[i].second;
             }
+            vsfeel_trace_mark("sub fused");
             checkVK(submit_timeline(dev, resource.queue, resource.queue_lock,
                 resource.cmd, wait_sems, wait_vals, wait_stages,
                 VK_NULL_HANDLE, 0, resource.fence));
@@ -1509,6 +1515,7 @@ static const VSFrame *VS_CC DftGetFrame(
         if (dfttest_trace()) {
             fprintf(stderr, "[dfttest-trace]   n=%d res=%d wait fence\n", n, resource.id);
         }
+        vsfeel_trace_mark("wait");
         checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
         auto t5 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
@@ -1697,6 +1704,7 @@ static void VS_CC DftCreate(
     int error;
 
     auto set_error = [&](const std::string & error_message) {
+        vsfeel_trace_error("DFTTest", -1, error_message, d->device.get());
         vsapi->mapSetError(out, ("DFTTest: " + error_message).c_str());
         vsapi->freeNode(d->node);
     };

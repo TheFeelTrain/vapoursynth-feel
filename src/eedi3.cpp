@@ -277,6 +277,17 @@ static inline void deint_row_f32(const float * s, float * d, int rows,
     }
 }
 
+// Reusable scratch for the packed-mask dilation builders. Every caller fully
+// overwrites the span it uses, so one buffer per worker thread replaces the
+// per-frame vector the gather paths used to allocate (up to 12 per AA frame).
+static uint64_t * bmask_scratch(size_t words) {
+    static thread_local std::vector<uint64_t> buf;
+    if (buf.size() < words) {
+        buf.resize(words);
+    }
+    return buf.data();
+}
+
 // dst[y*rows + k] = src[y*src_stride + first + step*k] for y in [0,H).
 // step == 2 is the column-parity deinterleave; step == 1 (dh: every source
 // column is kept) degenerates to a plain row copy.
@@ -2251,8 +2262,8 @@ static void aa_gather_vertical(
         uint8_t * const bm = staging + (second ? cfg.bits2_offset : cfg.bits_offset);
         const size_t bm_row_bytes =
             static_cast<size_t>((pw + 31) / 32) * sizeof(uint32_t);
-        std::vector<uint64_t> scratch(
-            2 * static_cast<size_t>((pw + d.mdis + 63) / 64));
+        uint64_t * const scratch =
+            bmask_scratch(2 * static_cast<size_t>((pw + d.mdis + 63) / 64));
         for (int r = 0; r < cfg.rows; ++r) {
             const uint8_t * const mrow_p = maskp + mask_stride * (field + 2 * r);
             build_bmask_row(mrow_p,
@@ -2262,7 +2273,7 @@ static void aa_gather_vertical(
                                 ? reinterpret_cast<const float *>(mrow_p) : nullptr,
                             reinterpret_cast<uint32_t *>(
                                 bm + static_cast<int64_t>(r) * bm_row_bytes),
-                            pw, d.mdis, scratch.data());
+                            pw, d.mdis, scratch);
         }
     }
 
@@ -2304,19 +2315,19 @@ static void aa_gather_horizontal(
         uint8_t * const bm = staging + (second ? acfg.bits2_offset : acfg.bits_offset);
         const int nwords = (acfg.width + 31) / 32;
         const int nw64 = (acfg.width + d.mdis + 63) / 64;
-        std::vector<uint64_t> scratch(
-            2 * static_cast<size_t>(nw64) + acfg.rows);
+        uint64_t * const scratch =
+            bmask_scratch(2 * static_cast<size_t>(nw64) + acfg.rows);
         if (d.mask_fuse && d.mdis < 64 && acfg.width >= 2 * d.mdis) {
             const int bw = (acfg.width + 63) / 64;   // words per bit row
             uint64_t * const bitmat = reinterpret_cast<uint64_t *>(ms);
             gather_mask_bitmat(maskp, mask_stride, H, rows, field, 2, mbits,
-                               bitmat, bw, scratch.data() + 2 * nw64);
+                               bitmat, bw, scratch + 2 * nw64);
             for (int r = 0; r < rows; ++r) {
                 build_bmask_row_from_bits(
                     bitmat + static_cast<size_t>(r) * bw,
                     reinterpret_cast<uint32_t *>(
                         bm + static_cast<size_t>(r) * nwords * 4),
-                    acfg.width, d.mdis, scratch.data());
+                    acfg.width, d.mdis, scratch);
             }
         } else {
             uint8_t * const m2 = ms + static_cast<size_t>(rows) * acfg.width;
@@ -2327,7 +2338,7 @@ static void aa_gather_horizontal(
                                 nullptr, nullptr,
                                 reinterpret_cast<uint32_t *>(
                                     bm + static_cast<size_t>(r) * nwords * 4),
-                                acfg.width, d.mdis, scratch.data());
+                                acfg.width, d.mdis, scratch);
             }
         }
     }
@@ -2433,7 +2444,9 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
     VSFrame * dst = vsapi->newVideoFrame2(
         &d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
 
+    vsfeel_trace_frame_begin();
     auto resource = d->pool.take();
+    vsfeel_trace_mark("pool");
     Eedi3Direct direct;   // the fused path never imports output planes
 
     VkDevice dev = d->device->device;
@@ -2450,6 +2463,7 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
     }
 
     auto set_error = [&](const std::string & error_message) {
+        vsfeel_trace_error("EEDI3AA", n, error_message, d->device.get());
         d->pool.give_back(std::move(resource));
         vsapi->setFilterError(("EEDI3AA: " + error_message).c_str(), frameCtx);
         vsapi->freeFrame(src);
@@ -2497,7 +2511,8 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
     // clock-noise-prone; <0 selects the periodic form). Durable tuning probe,
     // same shape as EEDI3's VSFEEL_EEDI3_HBENCH.
     static const int hframe = env_int("VSFEEL_EEDI3AA_HFRAME", -1);
-    const bool hbench = env_flag("VSFEEL_EEDI3AA_HBENCH") &&
+    static const bool hbench_on = env_flag("VSFEEL_EEDI3AA_HBENCH");
+    const bool hbench = hbench_on &&
         (hframe >= 0 ? sn == hframe : (sn >= 100 && sn % 200 == 0));
     const auto h_t0 = std::chrono::steady_clock::now();
     auto h_tvGather = h_t0, h_tvRec = h_t0, h_tvWait = h_t0;
@@ -2568,6 +2583,7 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
         vkCmdResetQueryPool(resource.cmd, resource.ts_query, 0,
                             static_cast<uint32_t>(resource.ts_cap));
     }
+    vsfeel_trace_mark("rec cb1");
     record_h2d_copy(*d, resource);
     gather_vertical(fv0, false);
     gather_vertical(fv1, true);
@@ -2591,8 +2607,10 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
         checkVK(vkFlushMappedMemoryRanges(dev, 1, &range));
     }
     _mm_sfence();
+    vsfeel_trace_mark("sub cb1");
     checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
         resource.cmd, resource.fence));
+    vsfeel_trace_mark("wait cb1");
     checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
     eedi3_gpu_report(*d, resource, "aa-v", GB_AA_VERT);
     if (hbench) { h_tvWait = std::chrono::steady_clock::now(); }
@@ -2641,6 +2659,7 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
         vkCmdResetQueryPool(resource.cmd, resource.ts_query, 0,
                             static_cast<uint32_t>(resource.ts_cap));
     }
+    vsfeel_trace_mark("rec cb2");
     record_h2d_copy(*d, resource);
     if (const auto e = record_pass(*d, resource, fh0, d->aplanes, true, false,
                                    PassTail::kCompose, direct)) {
@@ -2661,8 +2680,10 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
         checkVK(vkFlushMappedMemoryRanges(dev, 1, &range));
     }
     _mm_sfence();
+    vsfeel_trace_mark("sub cb2");
     checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
         resource.cmd, resource.fence));
+    vsfeel_trace_mark("wait cb2");
     checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
     eedi3_gpu_report(*d, resource, "aa-h", GB_AA_HORIZ);
     if (hbench) { h_thWait = std::chrono::steady_clock::now(); }
@@ -2787,12 +2808,15 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     VSFrame * dst = vsapi->newVideoFrame2(
         &d->vi->format, out_width, out_height, fr, pl, src, core);
 
+    vsfeel_trace_frame_begin();
     auto resource = d->pool.take();
+    vsfeel_trace_mark("pool");
 
     // per-frame direct-to-frame output imports; released on every exit path
     Eedi3Direct direct;
 
     auto set_error = [&](const std::string & error_message) {
+        vsfeel_trace_error("EEDI3VK", n, error_message, d->device.get());
         direct.destroy(*d);
         d->pool.give_back(std::move(resource));
         vsapi->setFilterError(("EEDI3VK: " + error_message).c_str(), frameCtx);
@@ -2835,7 +2859,8 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     // 200th frame from sn=100 when the variable is unset (a single sample is
     // clock-noise-prone; <0 selects the periodic form).
     static const int hframe = env_int("VSFEEL_EEDI3_HFRAME", -1);
-    const bool hbench = env_flag("VSFEEL_EEDI3_HBENCH") &&
+    static const bool hbench_on = env_flag("VSFEEL_EEDI3_HBENCH");
+    const bool hbench = hbench_on &&
         (hframe >= 0 ? sn == hframe : (sn >= 100 && sn % 200 == 0));
     const auto h_t0 = std::chrono::steady_clock::now();
     auto h_tMaskEnd = h_t0, h_tGatherEnd = h_t0, h_tRawEnd = h_t0;
@@ -2898,6 +2923,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     }
     if (hbench) { h_tImportEnd = std::chrono::steady_clock::now(); }
 
+    vsfeel_trace_mark("rec");
     if (const auto record_err = record_command_buffer(*d, resource, field, direct)) {
         return set_error(*record_err);
     }
@@ -2990,8 +3016,8 @@ static const VSFrame *VS_CC Eedi3GetFrame(
                 const int nw64 = (cfg.width + d->mdis + 63) / 64;
                 // [0, 2*nw64) = the dilation scratch, then the fused gather's
                 // per-y-block accumulator (one u64 per transposed row).
-                std::vector<uint64_t> bmask_scratch(
-                    2 * static_cast<size_t>(nw64) + cfg.rows);
+                uint64_t * const scratch =
+                    bmask_scratch(2 * static_cast<size_t>(nw64) + cfg.rows);
                 if (d->mask_fuse && !d->skip_maskx && d->mdis < 64 &&
                     cfg.width >= 2 * d->mdis) {
                     // Fused: threshold+transpose+pack straight into the
@@ -3000,14 +3026,14 @@ static const VSFrame *VS_CC Eedi3GetFrame(
                     uint64_t * const bitmat = reinterpret_cast<uint64_t *>(ms);
                     gather_mask_bitmat(maskp, mask_stride, cfg.src_h, cfg.rows,
                                        d->dh ? 0 : field, d->dh ? 1 : 2, mbits,
-                                       bitmat, bw, bmask_scratch.data() + 2 * nw64);
+                                       bitmat, bw, scratch + 2 * nw64);
                     if (hbench) { h_tMaskMid = std::chrono::steady_clock::now(); }
                     for (int r = 0; r < cfg.rows; ++r) {
                         build_bmask_row_from_bits(
                             bitmat + static_cast<size_t>(r) * bw,
                             reinterpret_cast<uint32_t *>(
                                 bm + static_cast<size_t>(r) * nwords * 4),
-                            cfg.width, d->mdis, bmask_scratch.data());
+                            cfg.width, d->mdis, scratch);
                     }
                 } else {
                     if (!d->skip_maskx) {
@@ -3022,7 +3048,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
                                         nullptr, nullptr,
                                         reinterpret_cast<uint32_t *>(
                                             bm + static_cast<size_t>(r) * nwords * 4),
-                                        cfg.width, d->mdis, bmask_scratch.data());
+                                        cfg.width, d->mdis, scratch);
                     }
                 }
             }
@@ -3087,7 +3113,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
             uint8_t * bm = staging + cfg.bits_offset;
             const size_t bm_row_bytes =
                 static_cast<size_t>((cfg.width + 31) / 32) * sizeof(uint32_t);
-            std::vector<uint64_t> bmask_scratch(
+            uint64_t * const scratch = bmask_scratch(
                 2 * static_cast<size_t>((cfg.width + d->mdis + 63) / 64));
             for (int r = 0; r < cfg.rows; ++r) {
                 const int mrow = d->dh ? r : field + 2 * r;
@@ -3099,7 +3125,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
                                 maskf ? reinterpret_cast<const float *>(mrow_p)
                                       : nullptr,
                                 reinterpret_cast<uint32_t *>(bmr),
-                                cfg.width, d->mdis, bmask_scratch.data());
+                                cfg.width, d->mdis, scratch);
             }
         }
         if (hbench) { h_tMaskEnd = std::chrono::steady_clock::now(); }
@@ -3129,11 +3155,13 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     _mm_sfence();
 
     const auto h_tSub0 = std::chrono::steady_clock::now();
+    vsfeel_trace_mark("sub");
     checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
         resource.cmd, resource.fence));
     const auto h_tSub1 = std::chrono::steady_clock::now();
 
     const auto h_t1 = std::chrono::steady_clock::now();
+    vsfeel_trace_mark("wait");
     checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
     const auto h_t2 = std::chrono::steady_clock::now();
 
@@ -3304,6 +3332,7 @@ static void vsfeel_eedi3_create(
     bool has_mclip = d->mclip_node != nullptr;
 
     auto set_error = [&](const std::string & error_message) {
+        vsfeel_trace_error("EEDI3VK", -1, error_message, d->device.get());
         vsapi->mapSetError(out, ("EEDI3VK: " + error_message).c_str());
         vsapi->freeNode(d->node);
         if (has_sclip) {
@@ -3461,6 +3490,7 @@ static void vsfeel_eedi3_create(
             VSMap * ret = vsapi->invoke(
                 vsapi->getPluginByID(VSH_STD_PLUGIN_ID, core), "SetFrameProps", args);
             if (vsapi->mapGetError(ret)) {
+                vsfeel_trace_error("EEDI3VK", -1, vsapi->mapGetError(ret), d->device.get());
                 vsapi->mapSetError(out, vsapi->mapGetError(ret));
                 vsapi->freeMap(args);
                 vsapi->freeMap(ret);
@@ -3481,6 +3511,7 @@ static void vsfeel_eedi3_create(
                 vsapi->getPluginByID(VSH_RESIZE_PLUGIN_ID, core), "Point", args);
             vsapi->freeMap(args);
             if (vsapi->mapGetError(ret)) {
+                vsfeel_trace_error("EEDI3VK", -1, vsapi->mapGetError(ret), d->device.get());
                 vsapi->mapSetError(out, vsapi->mapGetError(ret));
                 vsapi->freeMap(ret);
                 vsapi->freeNode(d->node);

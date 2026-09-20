@@ -493,9 +493,12 @@ static const VSFrame *VS_CC GaussGetFrame(
         VSFrame * dst = vsapi->newVideoFrame2(
             &d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
 
+        vsfeel_trace_frame_begin();
         auto resource = d->pool.take();
+        vsfeel_trace_mark("pool");
 
         auto set_error = [&](const std::string & error_message) {
+            vsfeel_trace_error("GaussBlur", n, error_message, d->device.get());
             d->pool.give_back(std::move(resource));
             vsapi->setFilterError(("GaussBlur: " + error_message).c_str(), frameCtx);
             vsapi->freeFrame(src);
@@ -572,9 +575,11 @@ static const VSFrame *VS_CC GaussGetFrame(
         // before the GPU is told to read the upload window.
         _mm_sfence();
 
+        vsfeel_trace_mark("submit");
         checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
             resource.cmd, resource.fence));
 
+        vsfeel_trace_mark("wait");
         checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
 
         if (!coherent) {
@@ -646,6 +651,7 @@ static void VS_CC GaussCreate(
     int error;
 
     auto set_error = [&](const std::string & error_message) {
+        vsfeel_trace_error("GaussBlur", -1, error_message, d->device.get());
         vsapi->mapSetError(out, ("GaussBlur: " + error_message).c_str());
         vsapi->freeNode(d->node);
     };

@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -80,6 +82,92 @@ inline const char * env_str(const char * env) {
     return (v && *v) ? v : nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// Error tracing (VSFEEL_TRACE)
+// ---------------------------------------------------------------------------
+//
+// One switch for the whole plugin: every error a filter reports is echoed to
+// stderr with the filter that raised it, the output frame, and its position in
+// the sequence. The order matters because a lost device makes every later call
+// fail too -- the first line is the informative one and the rest are a
+// cascade. Create-time errors print `create` in place of a frame number.
+//
+// VSFEEL_TRACE=1 stops after 50 lines, =2 prints every one. The device banner
+// is printed under this switch as well, because which GPU and driver a failure
+// came from is part of the report.
+
+inline int vsfeel_trace_level() {
+    static const int level = [] {
+        const char * v = std::getenv("VSFEEL_TRACE");
+        if (!v || !*v || std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0) {
+            return 0;
+        }
+        return std::strcmp(v, "2") == 0 ? 2 : 1;
+    }();
+    return level;
+}
+
+inline bool vsfeel_trace_enabled() {
+    return vsfeel_trace_level() > 0;
+}
+
+// The device banner and the capability lines: also on under VSFEEL_TRACE.
+inline bool vsfeel_device_info_enabled() {
+    static const bool on = env_flag("VSFEEL_DBG") || vsfeel_trace_enabled();
+    return on;
+}
+
+struct VK_Device;
+
+// Declared here, defined after VK_Device: a VK_ERROR_DEVICE_LOST also asks the
+// driver for its own fault report (VK_EXT_device_fault), the only source that
+// says *why* the GPU died rather than that a fence wait returned an error.
+inline void vsfeel_trace_error(const char * filter, int frame,
+                               const std::string & message,
+                               const VK_Device * device);
+
+// Host-side trail of what the failing frame had done when it failed. The frame
+// path is synchronous per worker thread, so the marks leading to an error are
+// always the ones on the failing thread; thread_local is the whole story. Only
+// the first error dumps them -- a lost device fails every later frame too.
+struct VK_TraceTrail {
+    static constexpr int CAP = 16;
+    const char * stage[CAP] {};
+    double ms[CAP] {};
+    int count {};
+    std::chrono::steady_clock::time_point t0 {};
+};
+
+inline VK_TraceTrail & vsfeel_trace_trail() {
+    thread_local VK_TraceTrail trail;
+    return trail;
+}
+
+// First call of a frame path. No-ops when tracing is off, like the marks below,
+// so they can sit in the frame path unconditionally.
+inline void vsfeel_trace_frame_begin() {
+    if (vsfeel_trace_level() == 0) {
+        return;
+    }
+    VK_TraceTrail & trail = vsfeel_trace_trail();
+    trail.count = 0;
+    trail.t0 = std::chrono::steady_clock::now();
+}
+
+inline void vsfeel_trace_mark(const char * stage) {
+    if (vsfeel_trace_level() == 0) {
+        return;
+    }
+    VK_TraceTrail & trail = vsfeel_trace_trail();
+    if (trail.count >= VK_TraceTrail::CAP) {
+        return;
+    }
+    trail.stage[trail.count] = stage;
+    trail.ms[trail.count] = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - trail.t0).count();
+    ++trail.count;
+}
+
 const char * vk_result_string(VkResult result);
 
 // Queue sharing: cap how many of the device's compute queues the filter's
@@ -137,6 +225,11 @@ struct VK_Device {
     bool feat_compute_full_subgroups { false };
     bool feat_8bit_storage { false };
     bool feat_16bit_storage { false };
+    // VK_EXT_device_fault: after VK_ERROR_DEVICE_LOST the driver can report what
+    // the GPU faulted on (address, kind) and, on NVIDIA, a vendor crash dump.
+    // Enabled at device creation when advertised; the query is only legal once
+    // the device is lost.
+    bool feat_device_fault { false };
     // Persistent pipeline cache: compiling the compute shaders from SPIR-V is
     // by far the most expensive part of filter creation (seconds per variant
     // on RADV), and every new filter instance would otherwise pay it again in
@@ -148,6 +241,173 @@ struct VK_Device {
     std::vector<VK_Queue> queues {};
     std::atomic<intptr_t> refcount { 0 };
 };
+
+inline const char * device_fault_address_type(VkDeviceFaultAddressTypeEXT type) {
+    switch (type) {
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT:                        return "none";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT:                return "read-invalid";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT:               return "write-invalid";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT:             return "execute-invalid";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: return "ip-unknown";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: return "ip-invalid";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT:   return "ip-fault";
+        default:                                                          return "unknown";
+    }
+}
+
+// The driver's own post-mortem of a lost device (VK_EXT_device_fault). This is
+// the only source that says *why* the GPU died -- a shader reading or writing an
+// address it does not own looks like a bare fence-wait failure without it. The
+// vendor binary goes to a file: on NVIDIA it decodes to the faulting
+// instruction, which no amount of host-side logging can recover.
+inline void vsfeel_trace_device_fault(const VK_Device & dev) {
+    // volk only fills the entry point when the driver advertises it; a fault
+    // report that cannot crash the process is worth the null check.
+    if (dev.device == VK_NULL_HANDLE || !dev.feat_device_fault ||
+        vkGetDeviceFaultInfoEXT == nullptr) {
+        return;
+    }
+    // One-shot: the device stays lost, so every later error is a cascade and
+    // would repeat the same block.
+    static std::atomic<bool> reported { false };
+    if (reported.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+
+    VkDeviceFaultCountsEXT counts {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT,
+        .pNext = nullptr
+    };
+    VkResult result = vkGetDeviceFaultInfoEXT(dev.device, &counts, nullptr);
+    if (result != VK_SUCCESS) {
+        std::fprintf(stderr, "[vsfeel-trace] device fault query failed: %s\n",
+                     vk_result_string(result));
+        return;
+    }
+
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+    std::vector<uint8_t> binary(static_cast<size_t>(counts.vendorBinarySize));
+    VkDeviceFaultInfoEXT info {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT,
+        .pNext = nullptr,
+        .pAddressInfos = addresses.empty() ? nullptr : addresses.data(),
+        .pVendorInfos = vendors.empty() ? nullptr : vendors.data(),
+        .pVendorBinaryData = binary.empty() ? nullptr : binary.data()
+    };
+    result = vkGetDeviceFaultInfoEXT(dev.device, &counts, &info);
+    if (result != VK_SUCCESS && !binary.empty()) {
+        // Not every driver returns the vendor binary even when it advertises
+        // the feature; retry without it rather than losing the description.
+        binary.clear();
+        VkDeviceFaultCountsEXT no_binary {
+            .sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT,
+            .pNext = nullptr,
+            .addressInfoCount = counts.addressInfoCount,
+            .vendorInfoCount = counts.vendorInfoCount,
+            .vendorBinarySize = 0
+        };
+        info.pVendorBinaryData = nullptr;
+        result = vkGetDeviceFaultInfoEXT(dev.device, &no_binary, &info);
+    }
+    if (result != VK_SUCCESS) {
+        std::fprintf(stderr, "[vsfeel-trace] device fault query failed: %s\n",
+                     vk_result_string(result));
+        return;
+    }
+
+    std::fprintf(stderr, "[vsfeel-trace] device fault: %s\n", info.description);
+    for (const auto & address : addresses) {
+        std::fprintf(stderr, "[vsfeel-trace]   %s at 0x%llx (%llu address bits valid)\n",
+            device_fault_address_type(address.addressType),
+            static_cast<unsigned long long>(address.reportedAddress),
+            static_cast<unsigned long long>(address.addressPrecision));
+    }
+    for (const auto & vendor : vendors) {
+        std::fprintf(stderr, "[vsfeel-trace]   vendor code=0x%llx data=0x%llx: %s\n",
+            static_cast<unsigned long long>(vendor.vendorFaultCode),
+            static_cast<unsigned long long>(vendor.vendorFaultData),
+            vendor.description);
+    }
+    if (!binary.empty()) {
+        std::error_code ec;
+        std::filesystem::path path = std::filesystem::temp_directory_path(ec);
+        if (ec) {
+            path = ".";
+        }
+        path /= "vsfeel-device-fault-" +
+            std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) +
+            ".bin";
+        if (FILE * f = std::fopen(path.string().c_str(), "wb")) {
+            std::fwrite(binary.data(), 1, binary.size(), f);
+            std::fclose(f);
+            std::fprintf(stderr, "[vsfeel-trace]   vendor binary: %zu bytes -> %s\n",
+                binary.size(), path.string().c_str());
+        } else {
+            std::fprintf(stderr, "[vsfeel-trace]   vendor binary: %zu bytes (not saved)\n",
+                binary.size());
+        }
+    }
+}
+
+inline void vsfeel_trace_error(const char * filter, int frame,
+                               const std::string & message,
+                               const VK_Device * device) {
+    const int level = vsfeel_trace_level();
+    if (level == 0) {
+        return;
+    }
+    static std::atomic<uint64_t> seen { 0 };
+    static const auto start = std::chrono::steady_clock::now();
+    const uint64_t seq = seen.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (level == 1 && seq == 51) {
+        std::fprintf(stderr, "[vsfeel-trace] further errors suppressed "
+                             "(VSFEEL_TRACE=2 prints all)\n");
+    }
+    if (level == 1 && seq > 50) {
+        return;
+    }
+
+    char where[32];
+    if (frame >= 0) {
+        std::snprintf(where, sizeof(where), "frame=%d", frame);
+    } else {
+        std::snprintf(where, sizeof(where), "create");
+    }
+    // A few error strings are built with embedded newlines; keep one line per
+    // error so the log can be pasted whole.
+    std::string one_line = message;
+    for (char & c : one_line) {
+        if (c == '\n' || c == '\r') {
+            c = ' ';
+        }
+    }
+
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    std::fprintf(stderr, "[vsfeel-trace] %-9s %-9s #%-3llu %-7s t=+%.1fms: %s\n",
+        filter, where, static_cast<unsigned long long>(seq),
+        seq == 1 ? "(first)" : "", ms, one_line.c_str());
+
+    // How far the failing frame got: the error names the call that failed, the
+    // trail says which stage of the frame that call belongs to. First error
+    // only -- a lost device repeats the same shape on every later frame.
+    if (seq == 1) {
+        const VK_TraceTrail & trail = vsfeel_trace_trail();
+        if (trail.count > 0) {
+            std::fprintf(stderr, "[vsfeel-trace]   trail:");
+            for (int i = 0; i < trail.count; ++i) {
+                std::fprintf(stderr, "%s %s +%.1fms", i ? " |" : "",
+                             trail.stage[i], trail.ms[i]);
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
+
+    if (device != nullptr && message.find("VK_ERROR_DEVICE_LOST") != std::string::npos) {
+        vsfeel_trace_device_fault(*device);
+    }
+}
 
 std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id);
 void release_device(const std::shared_ptr<VK_Device> & dev);

@@ -369,6 +369,9 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     // device its structs are valid without the extension being advertised.
     const bool subgroup_ext = has_ext(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
     const bool subgroup_ok = subgroup_ext || props.apiVersion >= VK_API_VERSION_1_3;
+    // Post-mortem of a lost device: what the GPU faulted on, and on NVIDIA a
+    // vendor crash dump. Only queried after VK_ERROR_DEVICE_LOST.
+    const bool device_fault_ext = has_ext(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 
     if (subgroup_ok) {
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_props {
@@ -387,7 +390,7 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     }
     dev->subgroup_size_control =
         subgroup_ok && dev->min_subgroup_size <= 32 && 32 <= dev->max_subgroup_size;
-    if (env_flag("VSFEEL_DBG")) {
+    if (vsfeel_device_info_enabled()) {
         fprintf(stderr, "[vsfeel] api_version=%u.%u subgroup_size_control=%d min=%u max=%u\n",
             VK_API_VERSION_MAJOR(dev->api_version), VK_API_VERSION_MINOR(dev->api_version),
             dev->subgroup_size_control, dev->min_subgroup_size, dev->max_subgroup_size);
@@ -412,7 +415,7 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
         vkGetPhysicalDeviceProperties2(dev->physical_device, &p2);
         dev->host_pointer_alignment = host_props.minImportedHostPointerAlignment;
     }
-    if (env_flag("VSFEEL_DBG")) {
+    if (vsfeel_device_info_enabled()) {
         fprintf(stderr, "[vsfeel] host_import=%d min_align=%llu\n",
             dev->host_import,
             (unsigned long long)dev->host_pointer_alignment);
@@ -481,11 +484,17 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
         .pNext = atomic_float_ext ? static_cast<void *>(&supported_atomic_float)
                                   : static_cast<void *>(&supported_13)
     };
+    void * const supported_tail = subgroup_ok
+        ? static_cast<void *>(&supported_subgroup)
+        : (atomic_float_ext ? static_cast<void *>(&supported_atomic_float)
+                            : static_cast<void *>(&supported_13));
+    VkPhysicalDeviceFaultFeaturesEXT supported_fault {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT,
+        .pNext = supported_tail
+    };
     VkPhysicalDeviceFeatures2 supported_features {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-        .pNext = subgroup_ok ? static_cast<void *>(&supported_subgroup)
-                             : (atomic_float_ext ? static_cast<void *>(&supported_atomic_float)
-                                                 : static_cast<void *>(&supported_13)),
+        .pNext = device_fault_ext ? static_cast<void *>(&supported_fault) : supported_tail,
         .features = {}
     };
     vkGetPhysicalDeviceFeatures2(dev->physical_device, &supported_features);
@@ -500,6 +509,7 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
         supported_atomic_float.shaderBufferFloat32AtomicAdd == VK_TRUE;
     dev->feat_compute_full_subgroups =
         supported_subgroup.computeFullSubgroups == VK_TRUE;
+    dev->feat_device_fault = device_fault_ext && supported_fault.deviceFault == VK_TRUE;
 
     VkPhysicalDeviceFeatures features {};
     features.shaderFloat64 = dev->feat_float64 ? VK_TRUE : VK_FALSE;
@@ -565,10 +575,26 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     if (atomic_float_ext) {
         device_exts.push_back(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
     }
+    if (device_fault_ext) {
+        device_exts.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    }
+
+    // Chained only when the extension is enabled: a feature struct for an
+    // extension the device was not created with is invalid usage. The vendor
+    // binary is a separate opt-in feature (NVIDIA returns a crash dump there).
+    VkPhysicalDeviceFaultFeaturesEXT fault_features {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT,
+        .pNext = &vulkan13_features,
+        .deviceFault = dev->feat_device_fault ? VK_TRUE : VK_FALSE,
+        .deviceFaultVendorBinary = (dev->feat_device_fault &&
+                                    supported_fault.deviceFaultVendorBinary == VK_TRUE)
+            ? VK_TRUE : VK_FALSE
+    };
 
     VkDeviceCreateInfo device_info {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = &vulkan13_features,
+        .pNext = device_fault_ext ? static_cast<void *>(&fault_features)
+                                  : static_cast<void *>(&vulkan13_features),
         .flags = 0,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &queue_info,
@@ -607,18 +633,25 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     // seed the persistent pipeline cache so filter creation does not recompile
     // the shaders in every process
     load_pipeline_cache(*dev);
-    if (env_flag("VSFEEL_DBG")) {
+    if (vsfeel_device_info_enabled()) {
         // One banner per device: enough to tell which build, GPU, driver and
         // cache file a run is actually using.
         fprintf(stderr,
-            "[vsfeel] version=%s device=%s driver=%u.%u.%u vulkan=%u.%u cache=%s\n",
+            "[vsfeel] version=%s device=%s driver=%u.%u.%u vulkan=%u.%u device_fault=%d cache=%s\n",
             VSFEEL_VERSION, props.deviceName,
             VK_API_VERSION_MAJOR(props.driverVersion),
             VK_API_VERSION_MINOR(props.driverVersion),
             VK_API_VERSION_PATCH(props.driverVersion),
             VK_API_VERSION_MAJOR(dev->api_version),
             VK_API_VERSION_MINOR(dev->api_version),
+            dev->feat_device_fault ? 1 : 0,
             dev->pipeline_cache_path.empty() ? "<disabled>" : dev->pipeline_cache_path.c_str());
+        if (vsfeel_trace_enabled()) {
+            // Confirms the variable was seen, the way VK_LOADER_DEBUG=layer
+            // confirms a layer loaded; the errors follow.
+            fprintf(stderr, "[vsfeel-trace] on: errors are logged with filter, "
+                            "frame and order\n");
+        }
     }
     static const bool atexit_registered = [] {
         std::atexit(save_all_pipeline_caches);
