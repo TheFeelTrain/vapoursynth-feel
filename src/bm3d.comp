@@ -48,24 +48,31 @@ const int INT_MAX_ = 0x7fffffff;
 #ifndef NO_FLOAT_ATOMICS
 layout(std430, binding = 0) buffer ResBuf { float res[]; };
 #else
-layout(std430, binding = 0) buffer ResBuf { uint res_u[]; };
+// `coherent`: this buffer is written by atomics from other invocations, so a
+// plain load of it is a data race the compiler may treat as invariant.
+layout(std430, binding = 0) coherent buffer ResBuf { uint res_u[]; };
 #endif
 layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
 
 // Adds val to the float at res[idx]. The no-extension form is the reference's
 // atom_add_f: a CAS loop over the uint bits, one fadd per round like the
 // hardware atomic, so the accumulated bits are the same up to add order.
+// Every read of the accumulator is an atomic: the reference reads its initial
+// value through a `volatile` pointer for this reason, and atomicCompSwap(x,0,0)
+// is an atomic load that returns the current value without changing it.
 void res_add(int idx, float val) {
 #ifndef NO_FLOAT_ATOMICS
     atomicAdd(res[idx], val);
 #else
-    uint old = res_u[idx];
-    uint assumed;
-    do {
+    uint assumed = atomicCompSwap(res_u[idx], 0u, 0u);
+    for (;;) {
+        const uint old = atomicCompSwap(res_u[idx], assumed,
+                                        floatBitsToUint(uintBitsToFloat(assumed) + val));
+        if (old == assumed) {
+            break;
+        }
         assumed = old;
-        old = atomicCompSwap(res_u[idx], assumed,
-                             floatBitsToUint(uintBitsToFloat(assumed) + val));
-    } while (old != assumed);
+    }
 #endif
 }
 

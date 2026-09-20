@@ -40,6 +40,17 @@ find_package(Git QUIET)
 # the same setuptools_scm entry point and only then falls back to git describe.
 # The result lands in config.h and reaches the runtime as VSFEEL_VERSION.
 # ---------------------------------------------------------------------------
+# A build that passes a *label* instead of a version (an umbrella packaging flow
+# has been seen passing "standard") would otherwise bake that into the binary,
+# where it identifies nothing and cannot be told from any other build. Only
+# accept something that looks like a version; resolve a real one otherwise.
+if(VSFEEL_VERSION AND NOT VSFEEL_VERSION MATCHES "^[0-9]")
+    message(WARNING
+        "vapoursynth-feel: ignoring VSFEEL_VERSION='${VSFEEL_VERSION}' "
+        "(not a version); resolving one from git instead")
+    unset(VSFEEL_VERSION)
+    unset(VSFEEL_VERSION CACHE)
+endif()
 if(NOT VSFEEL_VERSION)
     execute_process(
         COMMAND "${Python3_EXECUTABLE}" -c
@@ -91,6 +102,37 @@ if(NOT VSFEEL_VERSION)
         "(setuptools_scm: ${_scm_error}; git describe status: ${_git_status})")
 endif()
 message(STATUS "vapoursynth-feel ${VSFEEL_VERSION}")
+
+# The commit the binary was built from, reported next to the version. A
+# packaging or umbrella build may pass its own VSFEEL_VERSION (observed:
+# "standard"), which identifies nothing, so this is resolved from git
+# independently of it and survives any -D override.
+set(VSFEEL_COMMIT "unknown")
+if(GIT_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        OUTPUT_VARIABLE _commit_hash
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _commit_status
+        ERROR_QUIET
+    )
+    if(_commit_status EQUAL 0 AND _commit_hash)
+        set(VSFEEL_COMMIT "${_commit_hash}")
+        # dirty only matters for a checkout; a tarball build has no git state
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} status --porcelain --untracked-files=no
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            OUTPUT_VARIABLE _commit_dirty
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _dirty_status
+        )
+        if(_dirty_status EQUAL 0 AND _commit_dirty)
+            string(APPEND VSFEEL_COMMIT "-dirty")
+        endif()
+    endif()
+endif()
+message(STATUS "vapoursynth-feel commit ${VSFEEL_COMMIT}")
 
 # Helpers
 function(configure_common target)

@@ -694,8 +694,8 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
         // One banner per device: enough to tell which build, GPU, driver and
         // cache file a run is actually using.
         fprintf(stderr,
-            "[vsfeel] version=%s device=%s driver=%u.%u.%u vulkan=%u.%u device_fault=%d cache=%s\n",
-            VSFEEL_VERSION, props.deviceName,
+            "[vsfeel] version=%s commit=%s device=%s driver=%u.%u.%u vulkan=%u.%u device_fault=%d cache=%s\n",
+            VSFEEL_VERSION, VSFEEL_COMMIT, props.deviceName,
             VK_API_VERSION_MAJOR(props.driverVersion),
             VK_API_VERSION_MINOR(props.driverVersion),
             VK_API_VERSION_PATCH(props.driverVersion),
@@ -923,7 +923,9 @@ std::variant<AllocatedMemory, std::string> allocate_memory(
 // ---------------------------------------------------------------------------
 
 // Reports the compiled-in version, so a stale installed .so is identifiable
-// from Python as well as from the VSFEEL_DEBUG banner.
+// from Python as well as from the VSFEEL_DEBUG banner (which also prints the
+// commit -- the version can come from a packaging build untrusted by design,
+// the commit cannot).
 static void VS_CC versionReport(const VSMap *, VSMap * out, void *, VSCore *, const VSAPI * vsapi) {
     vsapi->mapSetData(out, "version", VSFEEL_VERSION,
         static_cast<int>(std::strlen(VSFEEL_VERSION)), dtUtf8, 0);

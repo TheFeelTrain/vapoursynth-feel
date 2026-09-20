@@ -273,9 +273,16 @@ static std::variant<VkPipeline, std::string> create_bm3d_pipeline(
         { 12, 48, sizeof(int32_t) },
         { 13, 52, sizeof(int32_t) },
     }};
+    // A device without subgroup size control (all of GCN) runs this kernel's
+    // 8-lane shuffles on a 64-wide subgroup; VSFEEL_BM3D_SUBGROUP=64 forces that
+    // here so the wave64 path can be tested on a wave32 box.
+    const int forced_subgroup = env_int("VSFEEL_BM3D_SUBGROUP", 0);
+    const uint32_t subgroup_size = forced_subgroup > 0
+        ? static_cast<uint32_t>(forced_subgroup)
+        : (dev.subgroup_size_control ? 32u : 0u);
     return create_compute_pipeline(dev, module, layout, entries.data(), &spec,
         static_cast<uint32_t>(entries.size()), sizeof(spec), "bm3d",
-        dev.subgroup_size_control ? 32 : 0);
+        subgroup_size);
 }
 
 static std::variant<VkPipeline, std::string> create_agg_pipeline(
@@ -524,6 +531,18 @@ static int record_bm3d_kernels(BM3DData * d, Bm3dStream & stream, int n,
         }
         const int m_i = std::clamp(n - r + i, 0, nf - 1);
         const int slot = stream.win_slots[i];
+        // A clamped window (the first/last radius frames) collapses several
+        // positions onto one centre frame, i.e. the same slot and the same push
+        // constants. Those dispatches are identical, and each one's fill wipes
+        // the slices the previous one wrote, so only the last is kept.
+        bool duplicate_later = false;
+        for (int j = i + 1; j < d->tw && !duplicate_later; ++j) {
+            duplicate_later = stream.win_recompute[j] && stream.win_slots[j] == slot &&
+                std::clamp(n - r + j, 0, nf - 1) == m_i;
+        }
+        if (duplicate_later) {
+            continue;
+        }
         n_dispatches++;
         if (d->dump) fprintf(stderr, "[d] n=%d computes slot %d for frame %d\n", n, slot, m_i);
         for (int plane = 0; plane < d->n_planes; ++plane) {
