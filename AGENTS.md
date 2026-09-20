@@ -192,6 +192,29 @@ RX 7900XTX, so a fair comparison is possible. Method that worked for DFTTest:
    instructions, 486 → 552 fps.
 4. **Check the host dispatch matches the shader's workgroup config.** A stale
    `blocks/4` grid with a `SUB_BLOCKS=8` shader launches 2x idle workgroups.
+5. **Cut a ranked intermediate to the depth its *consumer* reads.** BM3D's
+   temporal search kept a per-lane top-8 because the *spatial* search needs all
+   eight, but the temporal consumer only ever reads the top `PS_NUM`
+   (`merge_group(PS_NUM)` feeds `ginsert8` and the next step's centres).
+   Rebuilding it at depth `PS_NUM` cut the insert's shift from seven steps to
+   one and its live registers from 24 to 6: kernel 3.72 → 2.85 ms, VGPR 216 →
+   192, occupancy 7 → **8 waves/SIMD** — two wins from one cut, because the
+   register half crossed an occupancy cliff. The equivalence is a lemma, not a
+   hope: in a k-way merge the k-th output is the k-th smallest of the union, so
+   per-lane depth k is sufficient for a global top-k. Audit every top-k,
+   candidate list and best-match set by asking what the *downstream* stage
+   reads, not what the producer computes — the producer is almost always wider.
+   Moving such a structure to shared memory instead is a trap; see "Respect the
+   compiler's register tradeoffs" under Porting discipline.
+6. **Unroll a rolled scan loop by hand, N candidates wide, and hoist the
+   loads.** `#pragma unroll` is a no-op in glslc/GLSL (byte-identical SPIR-V),
+   and ACO only unrolls where registers allow. When a loop body ends in a long
+   serial chain — a sorted insert, a dependency-carrying reduction — the next
+   iteration's *independent* loads sit behind it, and every resident wave
+   reaches the same `s_waitcnt` at the same time, so occupancy cannot hide it.
+   Issuing four candidates' loads before consuming any of them took BM3D's
+   estimation kernel 4.94 → 3.96 ms. Sweep the width: 2/4/8 gave
+   4.168/3.963/4.093 ms, because register pressure eventually wins.
 
 General lesson: make every branch that is fixed per invocation (filter type,
 bit depth, window shape) a specialization constant or `#if` so the shader
@@ -409,7 +432,15 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   Downloads stay kernel-direct (the GPU writing results straight into host
   staging beat a device-local buffer + SDMA D2H, 568 vs 553 fps); CPU reads
   from the VRAM BAR remain ~1 GB/s, so never let the CPU read results back
-  from a VRAM buffer.
+  from a VRAM buffer. **A download pass costs what it stores, not what it
+  computes, and flat scaling is the tell.** BM3D's aggregation measured
+  ~0.32 ms at TW = 1, 5 and 9 alike, and vectorising it to `vec4` changed
+  nothing, because 8.3 MB of fp32 results at ~26 GB/s over PCIe *is* the whole
+  cost. So (a) read a final pass's scaling before optimizing its compute, and
+  (b) kernel-direct download and host-pointer import cannot help — the
+  GPU→host store is the floor, not the host copy that follows it. For scale,
+  ~0.32 ms/frame is a hard floor at 1080p fp32, i.e. `fps ≤ 1/(kernel + 0.32)`
+  for any filter that returns a frame to the host.
 - **Do not invoke a graph node to normalize an input your kernel only reads as
   a predicate.** EEDI3 forced every mask through `SetFrameProps(_Range=1) ->
   resize.Point -> Gray8` so the kernel could test `byte != 0` — a whole extra
@@ -431,7 +462,19 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
 - **Sweep in-flight depth; set the default at the knee, and never above 8.**
   Throughput vs `num_streams` is never flat and never monotonic — measure it,
   set the filter default at the knee, and state the per-stream VRAM cost next
-  to it. **`num_streams = 8` is the hard maximum for a shipped default** (see
+  to it. Count the **caches whose size is derived from `num_streams`**, not
+  just the per-stream buffers: BM3D's `res_cap = tw + ns + 2r` and
+  `src_ring = 4r + ns` meant ns 4 → 2 saved 23% of *total* VRAM (1107 vs
+  1440 MiB at 1080p r=2), not the ~11% the per-stream staging suggested. Print
+  the budget at creation behind a `VSFEEL_<FILTER>_VRAM=1` banner so the figure
+  is measured rather than estimated, and size each allocation for what a
+  dispatch actually writes, not for the cache it lands in (BM3D's staging was
+  ring-sized for `4r+ns` slots but only `4r+1` are ever written).
+  Measure the knee at the request depth you care about: `vspipe`'s own default
+  is ~32 concurrent requests, deeper than most real consumers, which is why
+  BM3D reverses (ns=2 wins at 1–3 requests, loses ~1% at 32) — a depth-dependent
+  win that only exists at 32 is not a shipping win.
+  **`num_streams = 8` is the hard maximum for a shipped default** (see
   "The goal"); a knee above 8 means the per-stream path needs work, not a
   higher count. Queue count and buffer count (ticket depth) are independent:
   the knee is typically 2 (frame N runs on the GPU while N+1
@@ -480,6 +523,15 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
 - **Respect the compiler's register tradeoffs.** ACO raises VGPRs deliberately
   for load ILP at an occupancy cost; forcing registers down often regresses.
   Read `RADV_DEBUG=shaderstats` before assuming more waves would help.
+  **LDS is not a way out.** Three attempts to move kernel-live data into shared
+  memory to free registers (a resolved match group, per-lane sorted lists in a
+  bank-conflict-free layout, and loop-invariant centres) each *raised* VGPRs
+  216 → 240 and dropped occupancy 7 → 6 waves/SIMD; two of them lost 5–90%.
+  The mechanism is data-dependent addressing — extra address registers and
+  longer live ranges — so spilling to shared only helps when the index is a
+  compile-time constant. Diff VGPR *and* subgroups/SIMD on every kernel edit;
+  measured occupancy on this box (wave32, RADV) is VGPR 192 → 8 subgroups/SIMD,
+  216 → 7, 240 → 6, so one "small" register change is a whole wave.
   The same applies to `requiredSubgroupSize`: forcing wave32 halves
   Subgroups-per-SIMD and only pays off for kernels with subgroup ops or
   extreme register pressure — otherwise it regresses. Sweep it per filter
@@ -543,6 +595,13 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   cost centers with workload-shape variants instead — inputs that isolate
   each stage (all-skip, full-work, no auxiliary data) read ceilings directly
   off end-to-end fps.
+  **An ablation that changes the data is not an ablation.** BM3D's
+  `NOSEARCH=1` kill-switch also made every candidate tie, which suppressed the
+  temporal search's insert branch, so its 0.741 ms could not be read as "the
+  spatial search costs 2.1 ms". Prefer a **workload sweep** — vary the search
+  radius and take the marginal ms per candidate — because that changes how much
+  work happens without changing how the branches behave; the sweep is what
+  actually localized BM3D's cost.
 - **Keep `notes/<filter>.md` updated immediately** after every finding,
   including dead ends, so nothing is re-derived or retried later. The notes
   are **tracked**: they are the durable design record, visible to every checkout

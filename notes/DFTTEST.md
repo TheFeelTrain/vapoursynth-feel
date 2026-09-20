@@ -91,7 +91,10 @@ Status: **shipped.** Verified against `src/dfttest.{cpp,comp}` and
   queues measured **+7.0%** over one (3×1000 same-session pairs: 1362.7/1377.1/
   1367.4 vs 1298.5/1267.3/1278.3).
 - Fused: `SUB_BLOCKS=8` (128-thread WGs), `td[TD_SZ]` register-resident,
-  `subgroupBarrier()`, ~240 VGPR → 2 wave32/SIMD.
+  `subgroupBarrier()`, VGPR 240 (largest radius variant 256) with 18 432 B LDS
+  per workgroup → **6 subgroups/SIMD** (5 for the largest), measured on the
+  shipped GRAY16 config. An earlier revision of this line read "2 wave32/SIMD";
+  re-measure rather than quote it (see Open work).
 - Benchmark defaults: `ftype=0`, `sigma=8`, `sosize=12`, `tbsize=3`, `swin=0`,
   `twin=7`, `sbeta=2.5`, `tbeta=2.5`, `zmean=1`, `f0beta=1.0`.
 - Bounds: every offset pushed to the shader is `int32`, so creation bounds each
@@ -238,8 +241,26 @@ constants, ZMEAN spec constant, gf hoist): 3378 → 2613 instr, 690 → 468 µs
   A dedicated transfer queue + 2× staging ping-pong is untried.
 - **Fused codegen residue (448 vs 384 µs)**: remaining IM2COL/window ALU,
   pointer-walk strength reduction (base + increment per j), ACO dual-issue
-  packing (`v_dual_mov` 128 vs 18). ACO 2613 instr vs vszipcl 2546, both 2
-  wave32/SIMD.
+  packing (`v_dual_mov` 128 vs 18).
+- **Fused-kernel occupancy is at the low tier and the constraint is
+  unattributed.** `RADV_DEBUG=shaderstats` on the shipped GRAY16 config
+  (ftype=0, sigma=8, sosize=12, tbsize=3, swin=0, twin=7, zmean=1, f0beta=1,
+  ns=1) reports the fused radius variants at **VGPR 240** (the largest radius at
+  256) with **18 432 B LDS** per 128-thread workgroup, i.e. **6 subgroups/SIMD**
+  (5 for the largest); the small kernels are VGPR 24/120. BM3D sat in exactly
+  this 6-wave tier and cutting its live per-lane state to 192 registers bought
+  7 → 8 waves for 23% off the kernel, so a wave here is plausibly worth double
+  digits — but nothing here is proven. What is *not* known is which of the two
+  binds: 18 432 B / 128 threads = 144 B of LDS per thread, and Vulkan only
+  exposes `maxComputeSharedMemorySize` 65 536 (a per-workgroup ceiling) and
+  `maxComputeWorkGroupInvocations` 1024, not the per-CU LDS pool the occupancy
+  calculator divides by. **First step, and it is cheap:** add a `PROBE`-gated
+  LDS pad to the fused variant (one `-D`, no algorithm change), walk the
+  declared size up in ~1 KB steps and record where `subgroups/SIMD` steps down.
+  That yields the pool and names the binding constraint. Only then is a
+  VGPR-reduction variant (the `td[TD_SZ]` register block is the obvious donor)
+  worth writing — and note the existing "forcing VGPRs down regressed" result on
+  NLMeans, so this needs a same-session A/B, not a theory.
 - Col2im (260 µs) is already 2× faster than both references — leave it.
 
 ## Tests
@@ -277,8 +298,16 @@ constants, ZMEAN spec constant, gf hoist): 3378 → 2613 instr, 690 → 468 µs
 - `SUB_BLOCKS=16`; DMA upload to a device raw_buf (453 fps); float-internal
   buffers + a pack kernel (buggy); `RADV_PERFTEST=cswave32` (driver-global, not
   shippable); `OpExecutionMode SubgroupSize` injection (ignored); glslc `-Os`/
-  spirv-opt (no-op); `RADV_DEBUG=llvm` (not in release Mesa);
-  `RADV_DEBUG=shaderstats` (prints nothing for DFTTest).
+  spirv-opt (no-op); `RADV_DEBUG=llvm` (not in release Mesa).
+  (`RADV_DEBUG=shaderstats` **does** print for DFTTest on current Mesa — the
+  older claim that it prints nothing is stale, and it is how the fused kernel's
+  VGPR/LDS/occupancy numbers in Open work were measured.)
+- **Ranked-intermediate depth cut** (BM3D's per-window-list win): no
+  application — the chain is im2col → spatial DFT → temporal DFT → filter →
+  IDFT, with no candidate list. The producer-vs-consumer check on the LDS
+  transposes is clean: the first transpose stores rows 0..15 at columns 0..8 and
+  the read consumes columns 0..8 of all 16 rows (lanes 0..8 store, all 16 read);
+  the second writes and reads 16x16. No dead stores to delete.
 - Diagnosing the cache corruption as an out-of-order race — it was the double
   temporal offset (`src_base`).
 

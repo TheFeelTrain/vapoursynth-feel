@@ -54,9 +54,6 @@ constexpr int NNEDI3_XDIM[7] { 8, 16, 32, 48, 8, 16, 32 };
 constexpr int NNEDI3_YDIM[7] { 6, 6, 6, 6, 4, 4, 4 };
 constexpr int NNEDI3_NNS[5] { 16, 32, 64, 128, 256 };
 
-constexpr int MARGIN_H = 24;
-constexpr int MARGIN_V = 3;
-
 // Weight blob linked into the binary (see CMakeLists.txt): objcopy on every
 // toolchain that has it, an RCDATA resource on Windows, where none does.
 #if !defined(_WIN32)
@@ -305,28 +302,15 @@ struct Nnedi3Plane {
     int width {};
     int height {};
     int rows {};
-    int pad_stride {};
-    int pad_h {};
-    uint32_t pad_grid_x {};
-    uint32_t pad_grid_y {};
     uint32_t pre_grid_x {};          // direct prescreen dispatch (threads)
-    uint32_t pred_grid_x {};         // legacy serial direct grid (unused)
     uint32_t pred_grid_direct_x {};  // cooperative direct grid (pscrn==0)
-    uint32_t asm_grid_x {};
-    VkPipeline pad_pipeline {};
     VkPipeline pre_pipeline {};      // null when pscrn==0
     VkPipeline pred_pipeline {};
-    VkPipeline cnt_pipeline {};      // null when pscrn==0
-    VkPipeline asm_pipeline {};
     VkDeviceSize up_offset {};       // bytes in the upload staging (packed field)
-    VkDeviceSize download_offset {}; // bytes in the download staging (full frame)
+    VkDeviceSize download_offset {}; // bytes in the download staging (packed interp rows)
     VkDeviceSize list_offset {};     // bytes in the device list buffer (uints)
     VkDeviceSize ind_offset {};      // bytes in the indirect struct buffer
-    VkDeviceSize pad_offset {};      // bytes in the device pad buffer (padded plane)
-    VkDeviceSize asm_offset {};      // bytes in the device full-frame buffer
     int32_t up_elem {};              // element offset of the packed field in upload staging
-    int32_t pad_elem {};             // element offset of the pad in pad buffer
-    int32_t asm_elem {};             // element offset of the frame in asm buffer
     int32_t dst_elem {};
     int32_t list_elem {};            // uint element offset in the list buffer
 };
@@ -335,12 +319,8 @@ struct Nnedi3Resource {
     VkBuffer staging {};       // download staging (GTT, DMA target + host reads)
     VkDeviceMemory staging_mem {};
     VkBuffer up_staging {};    // upload staging (ReBAR: CPU packs tight
-                               // field rows, pad kernel reads direct, no DMA)
+                               // field rows, predict reads direct, no DMA)
     VkDeviceMemory up_mem {};
-    VkBuffer pad_buf {};       // device-local padded planes (prescreen/predict source)
-    VkDeviceMemory pad_mem {};
-    VkBuffer asm_buf {};       // device-local full frames (assemble target, D2H source)
-    VkDeviceMemory asm_mem {};
     VkBuffer dst_buf {};
     VkDeviceMemory dst_mem {};
     VkBuffer list_buf {};        // rejected-pixel indices (device-local)
@@ -381,13 +361,10 @@ struct Nnedi3Data {
     VkDescriptorSetLayout set_layout {};
     VkPipelineLayout pipeline_layout {};
     VkDescriptorPool desc_pool {};
-    VkShaderModule pad_module {};
     VkShaderModule pre_module {};
     VkShaderModule pred_module {};
     VkShaderModule pred_n4_module {};
     VkShaderModule pred_n4s_module {};
-    VkShaderModule cnt_module {};
-    VkShaderModule asm_module {};
     VkBuffer ps_buf {};
     VkDeviceMemory ps_mem {};
     VkBuffer pdw_buf {};
@@ -397,8 +374,6 @@ struct Nnedi3Data {
 
     VkDeviceSize up_total {};
     VkDeviceSize download_total {};
-    VkDeviceSize pad_total {};
-    VkDeviceSize asm_total {};
     VkDeviceSize dst_total {};
     VkDeviceSize list_total {};
     VkDeviceSize ind_total {};
@@ -462,8 +437,6 @@ struct Nnedi3Data {
             }
             const std::pair<VkBuffer *, VkDeviceMemory *> bufs[] {
                 { &resource.up_staging, &resource.up_mem },
-                { &resource.pad_buf, &resource.pad_mem },
-                { &resource.asm_buf, &resource.asm_mem },
                 { &resource.dst_buf, &resource.dst_mem },
                 { &resource.list_buf, &resource.list_mem },
                 { &resource.ind_buf, &resource.ind_mem },
@@ -492,13 +465,11 @@ struct Nnedi3Data {
             }
         }
 
-        VkPipeline seen[15] {};
+        VkPipeline seen[6] {};
         int n_seen = 0;
         for (auto & plane : planes) {
-            const VkPipeline ps[5] {
-                plane.pad_pipeline, plane.pre_pipeline,
-                plane.pred_pipeline,
-                plane.cnt_pipeline, plane.asm_pipeline
+            const VkPipeline ps[2] {
+                plane.pre_pipeline, plane.pred_pipeline
             };
             for (VkPipeline p : ps) {
                 if (!p) {
@@ -508,7 +479,7 @@ struct Nnedi3Data {
                 for (int i = 0; i < n_seen; ++i) {
                     dup |= seen[i] == p;
                 }
-                if (!dup && n_seen < 15) {
+                if (!dup && n_seen < 6) {
                     seen[n_seen++] = p;
                     vkDestroyPipeline(dev, p, nullptr);
                 }
@@ -523,9 +494,6 @@ struct Nnedi3Data {
         if (set_layout) {
             vkDestroyDescriptorSetLayout(dev, set_layout, nullptr);
         }
-        if (pad_module) {
-            vkDestroyShaderModule(dev, pad_module, nullptr);
-        }
         if (pre_module) {
             vkDestroyShaderModule(dev, pre_module, nullptr);
         }
@@ -538,12 +506,6 @@ struct Nnedi3Data {
         if (pred_n4s_module) {
             vkDestroyShaderModule(dev, pred_n4s_module, nullptr);
         }
-        if (cnt_module) {
-            vkDestroyShaderModule(dev, cnt_module, nullptr);
-        }
-        if (asm_module) {
-            vkDestroyShaderModule(dev, asm_module, nullptr);
-        }
 
         release_device(device);
     }
@@ -554,22 +516,19 @@ struct Nnedi3Data {
 // ---------------------------------------------------------------------------
 
 struct Nnedi3Spec {
-    int32_t width, rows, pad_stride, peak, pscrn, xdim, ydim, nns, qual, use_list;
+    int32_t width, rows, peak, pscrn, xdim, ydim, nns, qual, use_list;
 };
 
 // The cooperative kernels (prescreen, predict) keep subgroup-uniform control
 // flow (early exits are per-subgroup uniform) and run subgroup intrinsics, so
-// they ask for full subgroups like the reference.  pad/assemble/count are
-// plain per-thread kernels; requesting full subgroups for the 32-wide ones
-// would violate VUID-VkPipelineShaderStageCreateInfo-flags-02759 against a
-// 64-lane default subgroup and buys nothing.
+// they ask for full subgroups like the reference.
 static std::variant<VkPipeline, std::string> create_pipeline(
     const VK_Device & dev, const Nnedi3Spec & spec,
     VkShaderModule module, VkPipelineLayout layout,
     uint32_t required_subgroup_size = 0, bool full_subgroups = false) {
 
-    std::array<VkSpecializationMapEntry, 10> entries {};
-    for (uint32_t i = 0; i < 10; ++i) {
+    std::array<VkSpecializationMapEntry, 9> entries {};
+    for (uint32_t i = 0; i < 9; ++i) {
         entries[i] = { i, i * static_cast<uint32_t>(sizeof(int32_t)), sizeof(int32_t) };
     }
 
@@ -910,7 +869,7 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
 
 
         // Pack the field rows into the ReBAR upload staging (tightly
-        // packed, no margins — the GPU pad kernel expands them in place).
+        // packed, no margins — the window reads clamp-fetch the margins).
         // Non-dh reads the kept rows back out of dst (just memcpy'd
         // pre-acquire above, cache-hot) instead of re-reading src: same
         // stride-2 pattern, but the 2MB source pass is served from L3
@@ -1520,11 +1479,11 @@ static void VS_CC Nnedi3Create(
 
     VkDevice dev = d->device->device;
 
-    // Descriptor set layout: field / pad / interp / prescreener / weights /
-    // biases / staging-out / pixel list / indirect struct.
+    // Descriptor set layout: field / interp / prescreener / weights /
+    // biases / pixel list / indirect struct.
     {
-        VkDescriptorSetLayoutBinding bindings[9] {};
-        for (uint32_t i = 0; i < 9; ++i) {
+        VkDescriptorSetLayoutBinding bindings[7] {};
+        for (uint32_t i = 0; i < 7; ++i) {
             bindings[i] = {
                 i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                 VK_SHADER_STAGE_COMPUTE_BIT, nullptr
@@ -1534,7 +1493,7 @@ static void VS_CC Nnedi3Create(
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .bindingCount = 9,
+            .bindingCount = 7,
             .pBindings = bindings
         };
         checkVK(vkCreateDescriptorSetLayout(dev, &layout_info, nullptr, &d->set_layout));
@@ -1558,7 +1517,7 @@ static void VS_CC Nnedi3Create(
     }
     {
         VkDescriptorPoolSize pool_size {
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9 * static_cast<uint32_t>(d->num_streams)
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7 * static_cast<uint32_t>(d->num_streams)
         };
         VkDescriptorPoolCreateInfo pool_info {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1587,8 +1546,6 @@ static void VS_CC Nnedi3Create(
 
     // Shader modules for this bit depth.
     {
-        const uint32_t * pad_code = nullptr;
-        size_t pad_size = 0;
         const uint32_t * pre_code = nullptr;
         size_t pre_size = 0;
         const uint32_t * pred_code = nullptr;
@@ -1597,33 +1554,16 @@ static void VS_CC Nnedi3Create(
         size_t pred_n4_size = 0;
         const uint32_t * pred_n4s_code = nullptr;
         size_t pred_n4s_size = 0;
-        const uint32_t * cnt_code = nullptr;
-        size_t cnt_size = 0;
-        const uint32_t * asm_code = nullptr;
-        size_t asm_size = 0;
         if (d->elem_bytes == 2) {
-            pad_code = nnedi3_16_pad_spv;   pad_size = nnedi3_16_pad_spv_size;
             pre_code = nnedi3_16_prescreen_spv; pre_size = nnedi3_16_prescreen_spv_size;
             pred_code = nnedi3_16_predict_spv; pred_size = nnedi3_16_predict_spv_size;
             pred_n4_code = nnedi3_16_predict_n4_spv; pred_n4_size = nnedi3_16_predict_n4_spv_size;
             pred_n4s_code = nnedi3_16_predict_n4s_spv; pred_n4s_size = nnedi3_16_predict_n4s_spv_size;
-            cnt_code = nnedi3_16_count_spv; cnt_size = nnedi3_16_count_spv_size;
-            asm_code = nnedi3_16_assemble_spv; asm_size = nnedi3_16_assemble_spv_size;
         } else {
-            pad_code = nnedi3_32_pad_spv;   pad_size = nnedi3_32_pad_spv_size;
             pre_code = nnedi3_32_prescreen_spv; pre_size = nnedi3_32_prescreen_spv_size;
             pred_code = nnedi3_32_predict_spv; pred_size = nnedi3_32_predict_spv_size;
             pred_n4_code = nnedi3_32_predict_n4_spv; pred_n4_size = nnedi3_32_predict_n4_spv_size;
             pred_n4s_code = nnedi3_32_predict_n4s_spv; pred_n4s_size = nnedi3_32_predict_n4s_spv_size;
-            cnt_code = nnedi3_32_count_spv; cnt_size = nnedi3_32_count_spv_size;
-            asm_code = nnedi3_32_assemble_spv; asm_size = nnedi3_32_assemble_spv_size;
-        }
-        {
-            const auto result = create_shader_module(*d->device, pad_code, pad_size);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->pad_module = std::get<VkShaderModule>(result);
         }
         if (d->use_list) {
             const auto result = create_shader_module(*d->device, pre_code, pre_size);
@@ -1631,13 +1571,6 @@ static void VS_CC Nnedi3Create(
                 return set_error(std::get<std::string>(result));
             }
             d->pre_module = std::get<VkShaderModule>(result);
-        }
-        if (d->use_list) {
-            const auto result = create_shader_module(*d->device, cnt_code, cnt_size);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->cnt_module = std::get<VkShaderModule>(result);
         }
         {
             const auto result = create_shader_module(*d->device, pred_code, pred_size);
@@ -1660,13 +1593,6 @@ static void VS_CC Nnedi3Create(
             }
             d->pred_n4s_module = std::get<VkShaderModule>(result);
         }
-        {
-            const auto result = create_shader_module(*d->device, asm_code, asm_size);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->asm_module = std::get<VkShaderModule>(result);
-        }
     }
 
     // The cooperative predictor needs one 32-lane subgroup per 4 pixels.
@@ -1682,20 +1608,16 @@ static void VS_CC Nnedi3Create(
     // Per-plane geometry and pipelines (deduplicated across identical planes).
     // The predict pipeline is chosen per key: narrow networks (PPL<=2 and
     // FS<=128) use the PXP=8 module, wide networks the PXP=4 module (matches
-    // the shader's PXP rule and the count kernel's groupsX divisor).
+    // the shader's PXP rule).
     const uint32_t max_grid_x = d->device->limits.maxComputeWorkGroupCount[0];
-    const uint32_t max_grid_y = d->device->limits.maxComputeWorkGroupCount[1];
     const auto use_pxp8 = [](int net_nns, int net_fs) {
         return ((net_nns + 31) / 32 <= 2) && (net_fs <= 128);
     };
     {
-        struct Key { int w, rows, stride, pscrn, xdim, ydim, nns, qual; };
+        struct Key { int w, rows, pscrn, xdim, ydim, nns, qual; };
         std::array<Key, 3> keys {};
-        std::array<VkPipeline, 3> pad_pipes {};
         std::array<VkPipeline, 3> pre_pipes {};
         std::array<VkPipeline, 3> pred_pipes {};
-        std::array<VkPipeline, 3> cnt_pipes {};
-        std::array<VkPipeline, 3> asm_pipes {};
         int n_keys = 0;
         for (int plane = 0; plane < fmt.numPlanes; ++plane) {
             if (!d->process[plane]) {
@@ -1711,16 +1633,10 @@ static void VS_CC Nnedi3Create(
             cfg.width = in_w;
             cfg.height = d->dh ? in_h * 2 : in_h;
             cfg.rows = d->dh ? in_h : in_h / 2;
-            cfg.pad_stride = (cfg.width + MARGIN_H * 2 + 15) & ~15;
-            cfg.pad_h = cfg.rows + MARGIN_V * 2;
             if (static_cast<int64_t>(cfg.width) * cfg.rows >= (int64_t(1) << 31) ||
                 cfg.rows < 1 || cfg.width < 1) {
                 return set_error("plane geometry out of range.");
             }
-            cfg.pad_grid_x = std::min<uint32_t>(
-                (static_cast<uint32_t>(cfg.width + MARGIN_H * 2) + 31) / 32, max_grid_x);
-            cfg.pad_grid_y = std::min<uint32_t>(
-                (static_cast<uint32_t>(cfg.pad_h) + 7) / 8, max_grid_y);
             // prescreen: one thread per pixel group (P=1 old, P=4 new).
             // The shader groups pixels per ROW as ceil(width/P) and indexes
             // r = gid / ceil(width/P), so the dispatch must cover
@@ -1734,12 +1650,6 @@ static void VS_CC Nnedi3Create(
             cfg.pre_grid_x = std::min<uint32_t>(
                 (static_cast<uint32_t>(cfg.rows) * groups_per_row + 127) / 128,
                 max_grid_x);
-            // direct predict grid (both modes): full pixel coverage with
-            // 1024-thread workgroups (see PREDICT entry); count-bounded by
-            // the kernel's early return, always correct
-            cfg.pred_grid_x = std::min<uint32_t>(
-                (static_cast<uint32_t>(cfg.width) * static_cast<uint32_t>(cfg.rows) + 1023) / 1024,
-                max_grid_x);
             // cooperative direct grid (pscrn==0): 4 subgroups x PXP pixels
             // per 128-thread workgroup (PXP mirrors the shader rule below)
             {
@@ -1749,14 +1659,10 @@ static void VS_CC Nnedi3Create(
                     (static_cast<uint32_t>(cfg.width) * static_cast<uint32_t>(cfg.rows) + ppg - 1) / ppg,
                     max_grid_x);
             }
-            cfg.asm_grid_x = std::min<uint32_t>(
-                (static_cast<uint32_t>(cfg.width) * static_cast<uint32_t>(cfg.height) + 63) / 64,
-                max_grid_x);
 
             int ki = 0;
             for (; ki < n_keys; ++ki) {
                 if (keys[ki].w == cfg.width && keys[ki].rows == cfg.rows &&
-                    keys[ki].stride == cfg.pad_stride &&
                     keys[ki].pscrn == d->pscrn && keys[ki].xdim == d->xdim &&
                     keys[ki].ydim == d->ydim && keys[ki].nns == d->nns &&
                     keys[ki].qual == d->qual) {
@@ -1765,18 +1671,10 @@ static void VS_CC Nnedi3Create(
             }
             if (ki == n_keys) {
                 const Nnedi3Spec spec {
-                    cfg.width, cfg.rows, cfg.pad_stride, d->peak,
+                    cfg.width, cfg.rows, d->peak,
                     d->pscrn, d->xdim, d->ydim, d->nns, d->qual,
                     d->use_list ? 1 : 0
                 };
-                {
-                    const auto result = create_pipeline(
-                        *d->device, spec, d->pad_module, d->pipeline_layout);
-                    if (std::holds_alternative<std::string>(result)) {
-                        return set_error(std::get<std::string>(result));
-                    }
-                    pad_pipes[n_keys] = std::get<VkPipeline>(result);
-                }
                 if (d->use_list) {
                     const auto result = create_pipeline(
                         *d->device, spec, d->pre_module, d->pipeline_layout,
@@ -1785,14 +1683,6 @@ static void VS_CC Nnedi3Create(
                         return set_error(std::get<std::string>(result));
                     }
                     pre_pipes[n_keys] = std::get<VkPipeline>(result);
-                }
-                if (d->use_list) {
-                    const auto result = create_pipeline(
-                        *d->device, spec, d->cnt_module, d->pipeline_layout);
-                    if (std::holds_alternative<std::string>(result)) {
-                        return set_error(std::get<std::string>(result));
-                    }
-                    cnt_pipes[n_keys] = std::get<VkPipeline>(result);
                 }
                 {
                     // PXP=8 for narrow networks; PXP=4 wide networks use the
@@ -1813,22 +1703,11 @@ static void VS_CC Nnedi3Create(
                     }
                     pred_pipes[n_keys] = std::get<VkPipeline>(result);
                 }
-                {
-                    const auto result = create_pipeline(
-                        *d->device, spec, d->asm_module, d->pipeline_layout);
-                    if (std::holds_alternative<std::string>(result)) {
-                        return set_error(std::get<std::string>(result));
-                    }
-                    asm_pipes[n_keys] = std::get<VkPipeline>(result);
-                }
-                keys[n_keys] = { cfg.width, cfg.rows, cfg.pad_stride, d->pscrn, d->xdim, d->ydim, d->nns, d->qual };
+                keys[n_keys] = { cfg.width, cfg.rows, d->pscrn, d->xdim, d->ydim, d->nns, d->qual };
                 ++n_keys;
             }
-            cfg.pad_pipeline = pad_pipes[ki];
             cfg.pre_pipeline = pre_pipes[ki];
             cfg.pred_pipeline = pred_pipes[ki];
-            cfg.cnt_pipeline = cnt_pipes[ki];
-            cfg.asm_pipeline = asm_pipes[ki];
         }
         bool any = false;
         for (int plane = 0; plane < fmt.numPlanes; ++plane) {
@@ -1840,13 +1719,12 @@ static void VS_CC Nnedi3Create(
     }
 
     // Buffer region offsets (raw bytes), each region 32-byte aligned. The
-    // upload staging holds the CPU-packed field rows (ReBAR, pad-kernel
-    // source); the device-local pad buffer holds the padded planes that
-    // prescreen and predict read (full VRAM speed); the download staging
-    // holds the packed interp rows DMA'd for the host scatter (interp half
-    // only — kept lines never cross the bus).
+    // upload staging holds the CPU-packed field rows the prescreen/predict
+    // kernels read (ReBAR, no H2D DMA); the download staging holds the packed
+    // interp rows DMA'd for the host scatter (interp half only — kept lines
+    // never cross the bus).
     {
-        VkDeviceSize up = 0, down = 0, pad = 0, asm_b = 0, dst = 0, list = 0, ind = 0;
+        VkDeviceSize up = 0, down = 0, dst = 0, list = 0, ind = 0;
         for (int plane = 0; plane < fmt.numPlanes; ++plane) {
             if (!d->process[plane]) {
                 continue;
@@ -1854,26 +1732,16 @@ static void VS_CC Nnedi3Create(
             auto & cfg = d->planes[plane];
             const VkDeviceSize field_bytes =
                 static_cast<VkDeviceSize>(cfg.width) * cfg.rows * d->elem_bytes;
-            const VkDeviceSize frame_bytes =
-                static_cast<VkDeviceSize>(cfg.width) * cfg.height * d->elem_bytes;
-            const VkDeviceSize pad_bytes =
-                static_cast<VkDeviceSize>(cfg.pad_stride) * cfg.pad_h * d->elem_bytes;
             const VkDeviceSize list_bytes =
                 static_cast<VkDeviceSize>(cfg.width) * cfg.rows * sizeof(uint32_t);
             cfg.up_offset = align32(up);
             cfg.download_offset = align32(down);
-            cfg.pad_offset = align32(pad);
-            cfg.asm_offset = align32(asm_b);
             cfg.list_offset = align32(list);
             cfg.ind_offset = align32(ind);
             up = align32(cfg.up_offset + field_bytes);
             down = align32(cfg.download_offset + field_bytes);
-            pad = align32(cfg.pad_offset + pad_bytes);
-            asm_b = align32(cfg.asm_offset + frame_bytes);
             list = align32(cfg.list_offset + list_bytes);
             cfg.up_elem = static_cast<int32_t>(cfg.up_offset / d->elem_bytes);
-            cfg.pad_elem = static_cast<int32_t>(cfg.pad_offset / d->elem_bytes);
-            cfg.asm_elem = static_cast<int32_t>(cfg.asm_offset / d->elem_bytes);
             cfg.dst_elem = static_cast<int32_t>(align32(dst) / d->elem_bytes);
             cfg.list_elem = static_cast<int32_t>(cfg.list_offset / 4);
             dst = align32(dst) + field_bytes;
@@ -1881,22 +1749,18 @@ static void VS_CC Nnedi3Create(
         }
         d->up_total = up;
         d->download_total = down;
-        d->pad_total = pad;
-        d->asm_total = asm_b;
         d->dst_total = dst;
         d->list_total = list;
         d->ind_total = ind;
     }
 
 
-    // Download staging (GTT): assembled full frames + 16 B count-debug scratch.
+    // Download staging (GTT): packed interp rows + 16 B count-debug scratch.
     const VkDeviceSize staging_size =
         std::max<VkDeviceSize>(d->download_total + 16, 8);
     // Upload staging (ReBAR VRAM-mapped): CPU-packed field rows, read
-    // directly by the pad/assemble kernels — no H2D DMA.
+    // directly by the prescreen/predict kernels — no H2D DMA.
     const VkDeviceSize up_size = std::max<VkDeviceSize>(d->up_total, 4);
-    const VkDeviceSize pad_size = std::max<VkDeviceSize>(d->pad_total, 4);
-    const VkDeviceSize asm_size = std::max<VkDeviceSize>(d->asm_total, 4);
     const VkDeviceSize dst_size = std::max<VkDeviceSize>(d->dst_total, 4);
     const VkDeviceSize list_size = std::max<VkDeviceSize>(d->list_total, 4);
     const VkDeviceSize ind_size = std::max<VkDeviceSize>(d->ind_total, 16);
@@ -1922,12 +1786,8 @@ static void VS_CC Nnedi3Create(
                 .flags = 0,
                 .size = staging_size,
                 // TRANSFER_DST: D2H readback target, host-mapped for the
-                // interleave copies. STORAGE: the shader's binding 6 is a
-                // STORAGE_BUFFER descriptor over the whole staging (the
-                // assemble entry is compiled but currently undispatched;
-                // the usage flag must still match the descriptor type).
-                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                // interleave copies.
+                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
                 .queueFamilyIndexCount = 0,
                 .pQueueFamilyIndices = nullptr
@@ -1947,7 +1807,7 @@ static void VS_CC Nnedi3Create(
             resource.staging_type_index = std::get<AllocatedMemory>(result).type_index;
         }
         // Upload staging (ReBAR VRAM-mapped): the host packs tight field
-        // rows into it; the pad/assemble kernels shader-read it directly
+        // rows into it; the prescreen/predict kernels shader-read it directly
         // (STORAGE source, no TRANSFER — no H2D DMA, like the reference).
         {
             VkBufferCreateInfo buffer_info {
@@ -1979,14 +1839,6 @@ static void VS_CC Nnedi3Create(
         }
         if (const auto err = make_device_buffer(
                 *d->device, resource.dst_buf, resource.dst_mem, dst_size, "dst")) {
-            return set_error(*err);
-        }
-        if (const auto err = make_device_buffer(
-                *d->device, resource.pad_buf, resource.pad_mem, pad_size, "pad")) {
-            return set_error(*err);
-        }
-        if (const auto err = make_device_buffer(
-                *d->device, resource.asm_buf, resource.asm_mem, asm_size, "asm")) {
             return set_error(*err);
         }
         if (const auto err = make_device_buffer(
@@ -2059,25 +1911,19 @@ static void VS_CC Nnedi3Create(
         }
 
         {
-            // Bindings: 0=upload field (pad/assemble source), 1=pad (pad
-            // target, prescreen/predict source), 2=dst, 3/4/5=weights,
-            // 6=asm (assemble target; OutBuf), 7=list, 8=indirect.
-            // NOTE: binding 6 is rebound per-dispatch below (assemble writes
-            // asm_buf, count-debug reads staging), so the create-time value
-            // is only a placeholder.
-            VkDescriptorBufferInfo infos[9] {
+            // Bindings: 0=upload field (prescreen/predict source), 1=dst
+            // (packed interp rows), 2/3/4=weights, 5=list, 6=indirect.
+            VkDescriptorBufferInfo infos[7] {
                 { resource.up_staging, 0, VK_WHOLE_SIZE },
-                { resource.pad_buf, 0, VK_WHOLE_SIZE },
                 { resource.dst_buf, 0, VK_WHOLE_SIZE },
                 { d->ps_buf, 0, VK_WHOLE_SIZE },
                 { d->pdw_buf, 0, VK_WHOLE_SIZE },
                 { d->pdb_buf, 0, VK_WHOLE_SIZE },
-                { resource.asm_buf, 0, VK_WHOLE_SIZE },
                 { resource.list_buf, 0, VK_WHOLE_SIZE },
                 { resource.ind_buf, 0, VK_WHOLE_SIZE },
             };
-            VkWriteDescriptorSet writes[9] {};
-            for (uint32_t b = 0; b < 9; ++b) {
+            VkWriteDescriptorSet writes[7] {};
+            for (uint32_t b = 0; b < 7; ++b) {
                 writes[b] = {
                     .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                     .pNext = nullptr,
@@ -2091,7 +1937,7 @@ static void VS_CC Nnedi3Create(
                     .pTexelBufferView = nullptr
                 };
             }
-            vkUpdateDescriptorSets(dev, 9, writes, 0, nullptr);
+            vkUpdateDescriptorSets(dev, 7, writes, 0, nullptr);
         }
 
         checkVK(vkMapMemory(dev, resource.staging_mem, 0, staging_size, 0,

@@ -184,14 +184,13 @@ foreach(bits IN LISTS VK_BITS)
     endforeach()
 endforeach()
 
-# NLMeans: weight / accumulation / finish / pad entry points per io
-# variant (16-bit int, 32-bit float); everything else is a specialization
-# constant.
-set(VK_NLM_ENTRIES weight acc finish pad)
-set(VK_NLM_ENTRY_DEFS -DENTRY_WEIGHT -DENTRY_ACC -DENTRY_FINISH -DENTRY_PAD)
+# NLMeans: weight / accumulation entry points per io variant (16-bit int,
+# 32-bit float); everything else is a specialization constant.
+set(VK_NLM_ENTRIES weight acc)
+set(VK_NLM_ENTRY_DEFS -DENTRY_WEIGHT -DENTRY_ACC)
 set(VK_NLM_VARIANTS)
 foreach(bits IN LISTS VK_BITS)
-    foreach(entry_i RANGE 0 3)
+    foreach(entry_i RANGE 0 1)
         list(GET VK_NLM_ENTRIES ${entry_i} entry)
         list(GET VK_NLM_ENTRY_DEFS ${entry_i} entry_def)
         list(APPEND VK_NLM_VARIANTS
@@ -239,13 +238,10 @@ endforeach()
 set(VK_NNEDI3_VARIANTS)
 foreach(bits IN LISTS VK_BITS)
     list(APPEND VK_NNEDI3_VARIANTS
-        "nnedi3_${bits}_pad|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PAD"
         "nnedi3_${bits}_prescreen|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PRESCREEN"
         "nnedi3_${bits}_predict|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PREDICT"
         "nnedi3_${bits}_predict_n4|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PREDICT -DPXP=4"
-        "nnedi3_${bits}_predict_n4s|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=64u"
-        "nnedi3_${bits}_count|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_COUNT"
-        "nnedi3_${bits}_assemble|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_ASSEMBLE")
+        "nnedi3_${bits}_predict_n4s|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=64u")
 endforeach()
 
 set(VK_VARIANTS

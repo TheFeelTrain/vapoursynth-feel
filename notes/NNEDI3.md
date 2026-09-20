@@ -2,7 +2,8 @@
 
 *vsfeel's Vulkan port of nnedi3vk (refs `VapourSynth-nnedi3vk` / `vapoursynth-zipcu` / CPU `znedi3`).*
 
-Status: **shipped**, `num_streams = 4` (`1..32`), ~18 MB VRAM/stream. Scoreboard
+Status: **shipped**, `num_streams = 4` (`1..32`), ~10 MB VRAM/stream (per-stream
+buffer sum; 16.7 MB before the dead pad/assemble buffers were deleted). Scoreboard
 is median-of-5 same-session pairs, jpbd 1080p GRAY16, bench defaults
 (`field=3 dh=0 nsize=0 nns=4 qual=2 etype=0 pscrn=4`); nnedi3vk in the ref column:
 
@@ -25,8 +26,9 @@ is median-of-5 same-session pairs, jpbd 1080p GRAY16, bench defaults
   field 0/1/2/3, dh, planes subsets, nsize 0..6, nns 0..4, qual 1/2, etype 0/1,
   pscrn 0..4 across GRAY16/YUV420P16/GRAYS, plus determinism, 1-vs-4 streams,
   parallel load and props.
-- `PAD`/`ASSEMBLE`/`COUNT` compile but are **never dispatched**; `pad_buf` +
-  `asm_buf` stay allocated (~5 MB/stream at 1080p) — cleanup candidate. Weights
+- The `PAD`/`ASSEMBLE`/`COUNT` kernels and the `pad_buf`/`asm_buf` they fed are
+  **deleted**; live per-stream VRAM 15.0 → 8.7 MB measured (`mem_info_vram_used`
+  delta, 1080p GRAY16, 4 streams). Weights
   `src/nnedi3_weights.bin`, 13,574,928 B, md5 `5c97e25c4a7277d06d3e3851373f1065`.
 
 ## Algorithm (both references)
@@ -58,7 +60,7 @@ Per plane (output W×H, interp rows = H/2): **field extract** (kept rows per
 
 ## Implementation (what ships)
 
-`src/nnedi3.comp` — five entries, BITS=16/32, plus `predict_n4` (`-DPXP=4`) and
+`src/nnedi3.comp` — two entries, BITS=16/32, plus `predict_n4` (`-DPXP=4`) and
 `predict_n4s` (`-DPXP=4 -DSHSTRIDE=64u`):
 
 - `ENTRY_PRESCREEN` — 128 threads, one per pixel group (P=1 at pscrn=1, else 4);
@@ -70,12 +72,10 @@ Per plane (output W×H, interp rows = H/2): **field extract** (kept rows per
   `ceil(nns/32) <= 2 && fs <= 128` else 4; shared tile `shTile[4*SHSTRIDE]` (288,
   or 256 for `n4s`). Subgroup-add window stats, GEMV from the shared tile, wae5
   blend. Indirect off the prescreen count for pscrn>0, direct grid for pscrn=0.
-- `ENTRY_PAD`/`ENTRY_COUNT`/`ENTRY_ASSEMBLE` — compiled and pipeline-created but
-  **never dispatched**.
 
 `src/nnedi3.cpp`: `FramePool` of `Nnedi3Resource` (ODR-unique); host-mapped ReBAR
 upload staging (`DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`), device-local
-dst/list/indirect buffers, persistent-mapped weights; descriptors 0-8 per stream;
+dst/list/indirect buffers, persistent-mapped weights; descriptors 0-6 per stream;
 5 push words `{list, up, dst, parity, d_base}`.
 
 - **Two pre-recorded CBs per resource** (one per parity, at create). Per frame:
@@ -90,6 +90,20 @@ dst/list/indirect buffers, persistent-mapped weights; descriptors 0-8 per stream
   int + 32-bit float only (8-bit/f16 rejected); `field:int;` is **required**.
 
 ## Historical
+
+### 2026-09-20 — dead pad/assemble/count path deleted (38% of per-stream VRAM)
+
+The pad/assemble/count entries had been undispatched since the pad was fused
+into window reads and the download went to the packed interp rows, but
+`pad_buf` + `asm_buf` were still allocated and the pad/count/assemble pipelines
+and modules still created per instance. Deleted: both buffers, the three
+pipelines and their modules, `MARGIN_H`/`MARGIN_V`, `pad_stride`/`pad_h`/
+`pad_grid_*`/`pred_grid_x`/`asm_grid_*`/`pad_elem`/`pad_offset`/`asm_elem`/
+`asm_offset`, the dead descriptor bindings (9 → 7), the staging
+`STORAGE_BUFFER` usage flag, and the six `{16,32}_{pad,count,assemble}` SPIR-V
+outputs. Measured `mem_info_vram_used` around a 4-stream 1080p GRAY16 instance:
+60.1 → 34.9 MB, i.e. **24.1 MB freed / 6.0 MB per stream** (matches the 6.29 MB
+the two buffers sized). No fps change; 800-test suite green.
 
 ### 2026-09-04 — MVP: fused build, bit-exact with vszipcu, ~1130 fps vs ~2095 (~0.54x), 2 streams
 
@@ -192,9 +206,7 @@ H2D was ours to lose (~80 µs for 2 MB vs their 129).
   further wins need fewer host bytes (`VK_EXT_external_memory_host`, not attempted).
 - **Prescreen is ~2.8x the reference** (140 vs 50 µs when measured): compare ISA
   against their pattern (scalar `float v[EPL]`, warp shuffles, no shared), check
-  VGPR/occupancy and the `precise` chains. **Delete the dead pad/assemble/count
-  pipelines and their VRAM** (~5 MB/stream at 1080p) — no test can regress, the
-  paths are unreachable.
+  VGPR/occupancy and the `precise` chains.
 - **MVP limit**: `dh` + a planes subset zeroes interp lines on skipped planes (the
   reference leaves them uninitialized).
 
@@ -234,6 +246,6 @@ over-launch refutation; `UPTO`, `SPLITIL`, `NOXFER`, `UPGTT` no longer exist.
   device's default subgroup size is 64, with neither
   `ALLOW_VARYING_SUBGROUP_SIZE` nor an explicit required size. Only the cooperative
   kernels (prescreen, predict) run subgroup intrinsics, so `create_pipeline` now
-  takes `full_subgroups` and it is set only for those two; pad/assemble/count are
-  plain per-thread kernels. Covered by `tests/test_validation.py`
-  (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`, fail on `Validation Error`/`VUID`).
+  takes `full_subgroups` and it is set only for those two. Covered by
+  `tests/test_validation.py` (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`,
+  fail on `Validation Error`/`VUID`).

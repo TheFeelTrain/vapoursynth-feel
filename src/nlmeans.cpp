@@ -40,28 +40,22 @@ constexpr int VRT_RESULT = 3;
 constexpr uint32_t NLMEANS_TS_MAX = 130;
 constexpr uint32_t NLMEANS_TS_RESERVED = 4;
 
-// FLT_EPS bit pattern: u5 is seeded with it via vkCmdFillBuffer so the final
-// denominator stays > 0 without an explicit guard (matches the reference).
-constexpr uint32_t FLT_EPS_BITS = 0x34000000u;
-
 struct NLMeansSpecData {
     int32_t width;
     int32_t height;
     int32_t stride;
     int32_t pstride;
     int32_t pad;
-    int32_t ph;
     int32_t s;
     int32_t d;
     int32_t ref;
     int32_t channels;
     int32_t wmode;
-    float h;
     float wref;
     float h2_inv_norm;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 14> spec_entries {{
+static constexpr std::array<VkSpecializationMapEntry, 12> spec_entries {{
     { 0,  0, sizeof(int32_t) },
     { 1,  4, sizeof(int32_t) },
     { 2,  8, sizeof(int32_t) },
@@ -72,10 +66,8 @@ static constexpr std::array<VkSpecializationMapEntry, 14> spec_entries {{
     { 7, 28, sizeof(int32_t) },
     { 8, 32, sizeof(int32_t) },
     { 9, 36, sizeof(int32_t) },
-    { 10, 40, sizeof(int32_t) },
+    { 10, 40, sizeof(float) },
     { 11, 44, sizeof(float) },
-    { 12, 48, sizeof(float) },
-    { 13, 52, sizeof(float) },
 }};
 
 // One sweep-table variant per reachable temporal boundary count m=min(d, n).
@@ -183,8 +175,7 @@ struct NLMeansData {
     int window_tiles {};             // clips*C*(2d+1): slots one full window needs
     int staging_tiles {};            // per-stream upload staging capacity, tiles
     bool staging_direct {};          // ReBAR staging: host writes VRAM, no H2D DMA
-    int tail_ints {};                // layer table + tile pairs in the tail
-    int64_t compact_tile_elems {};   // w*h elements of one compact tile
+    int tail_ints {};                // layer table ints in the tables tail
     float * dbg_slots_map {};        // debug
     VkDeviceSize slot_bytes {};      // one padded channel-layer tile
     int64_t slot_elems {};
@@ -215,12 +206,8 @@ struct NLMeansData {
     VkDescriptorPool desc_pool {};
     VkShaderModule weight_module {};
     VkShaderModule acc_module {};
-    VkShaderModule fin_module {};
-    VkShaderModule pad_module {};
     VkPipeline weight_pipeline {};
     VkPipeline acc_pipeline {};
-    VkPipeline fin_pipeline {};
-    VkPipeline pad_pipeline {};
     VkBuffer tables_buf {};
     VkDeviceMemory tables_mem {};
     VkDeviceSize aq_offset {};
@@ -259,12 +246,8 @@ struct NLMeansData {
         if (tables_buf) vkDestroyBuffer(dev, tables_buf, nullptr);
         if (slots_mem) vkFreeMemory(dev, slots_mem, nullptr);
         if (slots_buf) vkDestroyBuffer(dev, slots_buf, nullptr);
-        if (pad_pipeline) vkDestroyPipeline(dev, pad_pipeline, nullptr);
-        if (fin_pipeline) vkDestroyPipeline(dev, fin_pipeline, nullptr);
         if (acc_pipeline) vkDestroyPipeline(dev, acc_pipeline, nullptr);
         if (weight_pipeline) vkDestroyPipeline(dev, weight_pipeline, nullptr);
-        if (pad_module) vkDestroyShaderModule(dev, pad_module, nullptr);
-        if (fin_module) vkDestroyShaderModule(dev, fin_module, nullptr);
         if (acc_module) vkDestroyShaderModule(dev, acc_module, nullptr);
         if (weight_module) vkDestroyShaderModule(dev, weight_module, nullptr);
         if (desc_pool) vkDestroyDescriptorPool(dev, desc_pool, nullptr);
@@ -448,8 +431,7 @@ static std::string create_staging(NLMeansData * d, NLStream & st, int tiles) {
     VkBuffer buf;
     {
         const auto result = create_buffer(dev, bytes,
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         if (std::holds_alternative<std::string>(result)) {
             return std::get<std::string>(result);
         }
@@ -491,23 +473,6 @@ static std::string create_staging(NLMeansData * d, NLStream & st, int tiles) {
     st.staging_map = map;
     st.staging_cap = tiles;
 
-    // binding 9 (read only by the retired pad kernel) must not dangle
-    if (st.desc_set != VK_NULL_HANDLE) {
-        VkDescriptorBufferInfo info { st.staging, 0, VK_WHOLE_SIZE };
-        VkWriteDescriptorSet write {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .pNext = nullptr,
-            .dstSet = st.desc_set,
-            .dstBinding = 9,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .pImageInfo = nullptr,
-            .pBufferInfo = &info,
-            .pTexelBufferView = nullptr
-        };
-        vkUpdateDescriptorSets(dev, 1, &write, 0, nullptr);
-    }
     return {};
 }
 
@@ -724,24 +689,6 @@ static const VSFrame *VS_CC NLMeansGetFrame(
                             stream.win_slots[key_off +
                                 static_cast<size_t>(i) * C + c]) *
                         d->slot_elems);
-                }
-            }
-        }
-        // pad pairs: {pool dst base, compact src base} per new tile
-        int * pairs = ints + 2 * C * d->layers;
-        size_t qi = 0;
-        ti = 0;
-        for (int clip = 0; clip < (d->has_ref ? 2 : 1); ++clip) {
-            for (int i = 0; i < count; ++i) {
-                for (int c = 0; c < C; ++c, ++ti) {
-                    if (!stream.upload_new[ti]) {
-                        continue;
-                    }
-                    pairs[2*qi] = static_cast<int>(
-                        static_cast<int64_t>(stream.win_slots[ti]) * d->slot_elems);
-                    pairs[2*qi+1] = static_cast<int>(
-                        static_cast<int64_t>(qi) * d->compact_tile_elems);
-                    ++qi;
                 }
             }
         }
@@ -1336,21 +1283,19 @@ static void VS_CC NLMeansCreate(
         .stride = d->stride,
         .pstride = d->pstride,
         .pad = d->pad,
-        .ph = d->ph,
         .s = d->s,
         .d = d->d,
         .ref = d->ref_mode,
         .channels = d->channels,
         .wmode = d->wmode,
-        .h = d->h_param,
         .wref = d->wref_param,
         .h2_inv_norm = h2_inv_norm
     };
 
-    // descriptor set layout: 8 storage buffer bindings
+    // descriptor set layout: 9 storage buffer bindings
     {
-        VkDescriptorSetLayoutBinding bindings[10];
-        for (uint32_t b = 0; b < 10; ++b) {
+        VkDescriptorSetLayoutBinding bindings[9];
+        for (uint32_t b = 0; b < 9; ++b) {
             bindings[b] = VkDescriptorSetLayoutBinding {
                 .binding = b,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -1363,7 +1308,7 @@ static void VS_CC NLMeansCreate(
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .bindingCount = 10,
+            .bindingCount = 9,
             .pBindings = bindings
         };
         if (vkCreateDescriptorSetLayout(dev, &layout_info, nullptr, &d->set_layout) != VK_SUCCESS) {
@@ -1391,7 +1336,7 @@ static void VS_CC NLMeansCreate(
     }
     {
         VkDescriptorPoolSize pool_size {
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10 * static_cast<uint32_t>(d->num_streams)
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9 * static_cast<uint32_t>(d->num_streams)
         };
         VkDescriptorPoolCreateInfo pool_info {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1410,28 +1355,17 @@ static void VS_CC NLMeansCreate(
     {
         const uint32_t * weight_code;
         const uint32_t * acc_code;
-        const uint32_t * fin_code;
-        size_t weight_size, acc_size, fin_size;
-        const uint32_t * pad_code;
-        size_t pad_size;
+        size_t weight_size, acc_size;
         if (d->bits == 16) {
             weight_code = nlmeans_16_weight_spv;
             weight_size = nlmeans_16_weight_spv_size;
             acc_code = nlmeans_16_acc_spv;
             acc_size = nlmeans_16_acc_spv_size;
-            fin_code = nlmeans_16_finish_spv;
-            fin_size = nlmeans_16_finish_spv_size;
-            pad_code = nlmeans_16_pad_spv;
-            pad_size = nlmeans_16_pad_spv_size;
         } else {
             weight_code = nlmeans_32_weight_spv;
             weight_size = nlmeans_32_weight_spv_size;
             acc_code = nlmeans_32_acc_spv;
             acc_size = nlmeans_32_acc_spv_size;
-            fin_code = nlmeans_32_finish_spv;
-            fin_size = nlmeans_32_finish_spv_size;
-            pad_code = nlmeans_32_pad_spv;
-            pad_size = nlmeans_32_pad_spv_size;
         }
 
         {
@@ -1448,26 +1382,10 @@ static void VS_CC NLMeansCreate(
             }
             d->acc_module = std::get<VkShaderModule>(result);
         }
-        {
-            const auto result = create_shader_module(*d->device, fin_code, fin_size);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->fin_module = std::get<VkShaderModule>(result);
-        }
-        {
-            const auto result = create_shader_module(*d->device, pad_code, pad_size);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->pad_module = std::get<VkShaderModule>(result);
-        }
 
         const std::pair<VkShaderModule, VkPipeline *> pipes[] {
             { d->weight_module, &d->weight_pipeline },
-            { d->acc_module, &d->acc_pipeline },
-            { d->fin_module, &d->fin_pipeline },
-            { d->pad_module, &d->pad_pipeline }
+            { d->acc_module, &d->acc_pipeline }
         };
         for (auto [module, pipeline] : pipes) {
             const auto result = create_pipeline(*d, spec, module, d->pipeline_layout);
@@ -1592,10 +1510,9 @@ static void VS_CC NLMeansCreate(
         }
     }
 
-    // padded tiles mirrored 1:1 in staging; tables buffer holds the
-    // layer->slot table (+ pair headroom)
-    d->compact_tile_elems = static_cast<int64_t>(d->width) * d->height;
-    d->tail_ints = 2 * d->channels * d->layers + 2 * d->window_tiles;
+    // padded tiles mirrored 1:1 in staging; the per-stream tables buffer holds
+    // the layer->slot table
+    d->tail_ints = 2 * d->channels * d->layers;
 
     const VkDeviceSize npix_v = static_cast<VkDeviceSize>(d->npix);
     const VkDeviceSize u1z_bytes =
@@ -1815,7 +1732,7 @@ static void VS_CC NLMeansCreate(
                 return set_error("vkAllocateDescriptorSets failed");
             }
 
-            VkDescriptorBufferInfo infos[10] {
+            VkDescriptorBufferInfo infos[9] {
                 { d->slots_buf, 0, VK_WHOLE_SIZE },          // src values
                 { d->slots_buf, 0, VK_WHOLE_SIZE },          // guide values
                 { st.u1z, 0, VK_WHOLE_SIZE },
@@ -1825,12 +1742,11 @@ static void VS_CC NLMeansCreate(
                 { d->tables_buf, 0,
                   static_cast<VkDeviceSize>(d->wq_host.size()) * sizeof(int32_t) },
                 { d->tables_buf, d->aq_offset, VK_WHOLE_SIZE },
-                { st.tables_dev, 0, VK_WHOLE_SIZE },
-                { st.staging, 0, VK_WHOLE_SIZE }
+                { st.tables_dev, 0, VK_WHOLE_SIZE }
             };
 
-            VkWriteDescriptorSet writes[10];
-            for (uint32_t b = 0; b < 10; ++b) {
+            VkWriteDescriptorSet writes[9];
+            for (uint32_t b = 0; b < 9; ++b) {
                 writes[b] = VkWriteDescriptorSet {
                     .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                     .pNext = nullptr,
@@ -1844,7 +1760,7 @@ static void VS_CC NLMeansCreate(
                     .pTexelBufferView = nullptr
                 };
             }
-            vkUpdateDescriptorSets(dev, 10, writes, 0, nullptr);
+            vkUpdateDescriptorSets(dev, 9, writes, 0, nullptr);
         }
 
         // Every stream shares queue 0 by design. The shared-tile reuse protocol

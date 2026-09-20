@@ -14,18 +14,11 @@
  * indirectly off the prescreen-maintained count. No prescreening
  * (pscrn=0) runs predict directly over every pixel.
  *
- * Exactly one of ENTRY_PAD / ENTRY_ASSEMBLE / ENTRY_PRESCREEN /
- * ENTRY_PREDICT / ENTRY_COUNT is defined at compile time:
+ * Exactly one of ENTRY_PRESCREEN / ENTRY_PREDICT is defined at compile time:
  *
- *   ENTRY_PAD       — clamp-mirror the packed field rows into the padded
- *                     plane: pad[i][x] = field[clamp(i-(MARGIN_V-fp))]
- *                     [clamp(x-MARGIN_H)]
- *   ENTRY_ASSEMBLE  — interleave kept field rows + packed interp rows into
- *                     the full-frame output (kernel-direct download write)
  *   ENTRY_PRESCREEN — per output pixel group: cubic taps, prescreener
  *                     decision, cubic store or list compaction
  *   ENTRY_PREDICT   — predictor network over listed (or all) pixels
- *   ENTRY_COUNT     — 1-thread indirect-size derivation from the count
  *
  * Formula order mirrors the references so results agree to ~1 LSB:
  * - cubic and all prescreener dots accumulate `precise` (no FMA contraction,
@@ -57,44 +50,37 @@ const int MARGIN_V = 3;
 
 layout(constant_id = 0) const int WIDTH = 1920;
 layout(constant_id = 1) const int ROWS = 540;
-layout(constant_id = 2) const int PADSTRIDE = 1968;
-layout(constant_id = 3) const int PEAK = 65535;
-layout(constant_id = 4) const int PSCRN = 2;
-layout(constant_id = 5) const int XDIM = 32;
-layout(constant_id = 6) const int YDIM = 4;
-layout(constant_id = 7) const int NNS = 32;
-layout(constant_id = 8) const int QUAL = 1;
-layout(constant_id = 9) const int USE_LIST = 1;
+layout(constant_id = 2) const int PEAK = 65535;
+layout(constant_id = 3) const int PSCRN = 2;
+layout(constant_id = 4) const int XDIM = 32;
+layout(constant_id = 5) const int YDIM = 4;
+layout(constant_id = 6) const int NNS = 32;
+layout(constant_id = 7) const int QUAL = 1;
+layout(constant_id = 8) const int USE_LIST = 1;
 
 const int FS = XDIM * YDIM;
 
 layout(std430, binding = 0) readonly buffer FieldBuf { IO_TYPE fieldBuf[]; };
-layout(std430, binding = 1) buffer PadBuf { IO_TYPE padBuf[]; };
-layout(std430, binding = 2) buffer DstBuf { IO_TYPE dstBuf[]; };
-// Full-frame assembly target: the staging download area (kernel-direct
-// download, no D2H copy). Same element type as the other IO buffers.
-layout(std430, binding = 6) writeonly buffer OutBuf { IO_TYPE outBuf[]; };
+layout(std430, binding = 1) buffer DstBuf { IO_TYPE dstBuf[]; };
 // Rejected-pixel list (prescreen writes, predict reads) and the indirect
 // dispatch struct {groupsX, groupsY, groupsZ, count} (host fills {0,1,1,0},
 // prescreen bumps via subgroup-aggregated atomics, predict reads count and
 // launches indirectly off groupsX). Multi-plane clips pack one struct per
 // plane; pc.d_base selects this dispatch's struct (uint index into indBuf).
-layout(std430, binding = 7) buffer ListBuf { uint listBuf[]; };
-layout(std430, binding = 8) buffer IndBuf { uint indBuf[]; };
+layout(std430, binding = 5) buffer ListBuf { uint listBuf[]; };
+layout(std430, binding = 6) buffer IndBuf { uint indBuf[]; };
 // Prescreener weights as vec4s: layer-0 transposed (vec k holds all four
 // neurons' weights for window element k), deeper layers at fixed indices.
-layout(std430, binding = 3) readonly restrict buffer PsWeights { vec4 psW[]; };
+layout(std430, binding = 2) readonly restrict buffer PsWeights { vec4 psW[]; };
 // Predictor weights per qual pass: (softmax, elliott) pairs in [q][k][p]
 // order, biases (smB, elB) per [q][p].
-layout(std430, binding = 4) readonly restrict buffer PdWeights { vec2 pdW[]; };
-layout(std430, binding = 5) readonly restrict buffer PdBias { vec2 pdB[]; };
+layout(std430, binding = 3) readonly restrict buffer PdWeights { vec2 pdW[]; };
+layout(std430, binding = 4) readonly restrict buffer PdBias { vec2 pdB[]; };
 
 // Per-dispatch buffer bases (IO_TYPE elements, except the list which is
 // uints):
-//   pad:       A=field, B=pad (+parity) [dead: pad fused into window reads]
 //   prescreen: A=list, B=field (tight upload), C=packed interp rows (+parity)
 //   predict:   A=list, B=field (tight upload), C=packed interp rows (+parity)
-//   assemble:  A=field, B=packed interp rows, C=full-frame output (+parity)
 layout(push_constant) uniform PushConstants {
     int a_base;
     int b_base;
@@ -224,57 +210,7 @@ bool verdictNew(vec4 st, int n) {
     return !(acc + b1[n] > 0.0);
 }
 
-#if defined(ENTRY_PAD)
-
-layout(local_size_x = 32, local_size_y = 8) in;
-
-void main() {
-    const int x = int(gl_GlobalInvocationID.x);
-    const int i = int(gl_GlobalInvocationID.y);
-    const int padW = WIDTH + 2 * MARGIN_H;
-    const int padH = ROWS + 2 * MARGIN_V;
-    if (x >= padW || i >= padH)
-        return;
-    const int fp = 1 - pc.parity;
-    const int f = clamp(i - (MARGIN_V - fp), 0, ROWS - 1);
-    const int c = clamp(x - MARGIN_H, 0, WIDTH - 1);
-    padBuf[pc.b_base + i * PADSTRIDE + x] = fieldBuf[pc.a_base + f * WIDTH + c];
-}
-
-#elif defined(ENTRY_ASSEMBLE)
-
-// Full-frame assembly: kept lines come straight from the packed field rows,
-// interpolated lines from the predict kernel's packed output. One thread per
-// output pixel, fully coalesced on all three buffers.
-layout(local_size_x = 64) in;
-
-void main() {
-    const int height = 2 * ROWS;
-    const int gid = int(gl_GlobalInvocationID.x);
-    const int x = gid % WIDTH;
-    const int y = gid / WIDTH;
-    if (y >= height)
-        return;
-#if BITS == 32
-    float v;
-    if ((y & 1) == pc.parity)
-        v = fieldBuf[pc.a_base + ((y - pc.parity) / 2) * WIDTH + x];
-    else
-        v = dstBuf[pc.b_base + ((y - (1 - pc.parity)) / 2) * WIDTH + x];
-    outBuf[pc.c_base + y * WIDTH + x] = v;
-#else
-    // no named uint16_t locals (needs explicit-arithmetic ext): shuffle
-    // through uint like the other filters' pack/unpack idioms
-    uint v;
-    if ((y & 1) == pc.parity)
-        v = uint(fieldBuf[pc.a_base + ((y - pc.parity) / 2) * WIDTH + x]);
-    else
-        v = uint(dstBuf[pc.b_base + ((y - (1 - pc.parity)) / 2) * WIDTH + x]);
-    outBuf[pc.c_base + y * WIDTH + x] = uint16_t(v & 0xFFFFu);
-#endif
-}
-
-#elif defined(ENTRY_PRESCREEN)
+#if defined(ENTRY_PRESCREEN)
 
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -495,21 +431,6 @@ void main() {
     if (firstPix >= npix)
         return;
     PREDICT_UNIT(firstPix, min(uint(PXP), npix - firstPix))
-}
-
-#elif defined(ENTRY_COUNT)
-
-// Derives the predictor's indirect groupsX from the compacted count:
-// groupsX = ceil(count / PPG) where PPG = 4 subgroups × PXP pixels (mirrors
-// the predict entry's PXP rule). Single thread, no contended atomics.
-layout(local_size_x = 32) in;
-
-void main() {
-    if (gl_GlobalInvocationID.x == 0u) {
-        const int pxp = ((((NNS + 31) / 32) <= 2) && (FS <= 128)) ? 8 : 4;
-        const uint n = indBuf[pc.d_base + 3];
-        indBuf[pc.d_base] = (n + uint(4 * pxp) - 1u) / uint(4 * pxp);
-    }
 }
 
 #endif

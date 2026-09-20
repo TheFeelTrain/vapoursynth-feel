@@ -4,10 +4,6 @@ GPU-accelerated filters in Vulkan for VapourSynth.
 
 Primarily optimized for running on RDNA 3 with the RADV driver on Linux.
 
-Requires Vulkan 1.3 or newer: the BM3D/DFTTest/EEDI3/NNEDI3 shaders are SPIR-V 1.6,
-which only a 1.3 device must accept, and the loader and instance are created at
-that version. Older GPUs still work if their driver reports Vulkan 1.3.
-
 ## Performance
 
 | Filter    | u16 vsfeel | u16 ref | u16 speedup | fp32 vsfeel | fp32 ref | fp32 speedup |
@@ -18,7 +14,7 @@ that version. Older GPUs still work if their driver reports Vulkan 1.3.
 | EEDI3     | 628        | 214     | 2.93x       | 318         | 186      | 1.71x        |
 | GaussBlur | 2516       | 1599    | 1.57x       | 1267        | 756      | 1.68x        |
 | NLMeans   | 1094       | 767     | 1.43x       | 1015        | 672      | 1.51x        |
-| NNEDI3    | 2907       | 2659    | 1.09x       | 1563        | 1396     | 1.12x        |
+| NNEDI3    | 2996       | 2677    | 1.12x       | 1580        | 1415     | 1.12x        |
 
 Reference columns are `vszipcl` for all filters except `nnedi3vk` for NNEDI3.
 

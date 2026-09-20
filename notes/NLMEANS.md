@@ -50,6 +50,21 @@ Status: **shipped.** Verified against `src/nlmeans.{cpp,comp}` and
 
 ## Historical
 
+### 2026-09-20 — dead pad/finish kernels deleted; pipeline creation was not the wall
+
+`ENTRY_PAD` and `ENTRY_FINISH`, their modules/pipelines and the
+`nlmeans_{16,32}_{pad,finish}.spv` variants were built and destroyed at every
+creation but never dispatched: finish has lived in the last acc round (`pc3`)
+since the slot-direct rewrite, and tiles ship by `vkCmdCopyBuffer`. Deleting
+them also drops the dead `{dst,src}` pair table the pad kernel read, the
+`2*window_tiles` int tail of the tables buffer, the binding-9 descriptor and its
+`create_staging` rewrite, the staging `STORAGE_BUFFER` usage flag, and the
+unused `PH`/`NLM_H` spec constants (`NLM_H` was `h`, dead in every live kernel).
+Cold creation (`VSFEEL_PIPELINE_CACHE=0`, 640x360 GRAY16) 20.3 → 18.2 ms median
+of 2; warm per-instance creation unchanged (32.8 vs 34.1 ms, run spread), so
+the two pipeline compiles were **not** the dominant per-instance cost. No fps
+change; 189/189 filter tests, 800 full suite.
+
 ### 2026-09-19 — ReBAR upload staging (+7.7%)
 
 The per-stream upload buffer was GTT, so every composed tile crossed PCIe twice
@@ -197,13 +212,17 @@ exactly 0. Ceiling is small by design (only new tiles are uploaded).
 - **Subgroup-shuffle box sums** to cut LDS phases (complex).
 - **fp16 dist/hsum LDS arrays** with range scaling — numerics risk.
 - **acc src-tile LDS cache** gated on `LAYERS*CH` (~+30 fps est).
-- Dead code: stop building/dispatching the pad and finish binaries
-  (`fin_pipeline` still built, unused).
 - Residual kernel gap: candidates left are cooperative-matrix (WMMA) box-sum
   and launch structure.
 
 ## Do not retry
 
+- **Ranked-intermediate depth cut** (BM3D's per-window-list win): no
+  application. NLMeans has no top-k or candidate list — it is a dense box-sum
+  plus weighted accumulation where every candidate and every `dist`/`hsum` cell
+  is read. The register half has nothing to bite on either: the weight kernel
+  measures VGPR 24 at 2 workgroups/SIMD, and the guarded-load test above already
+  showed that forcing VGPRs to ≤21 for a 3rd workgroup regressed.
 - **Compile-time `-DNLM_S=4`**: within noise of the spec-constant version. Do
   not build the 9-value s-variant matrix.
 - **wave32 required-subgroup-size pNext**: no effect (unlike DFTTest's 552→673).

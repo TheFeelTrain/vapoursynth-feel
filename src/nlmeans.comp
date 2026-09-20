@@ -2,16 +2,16 @@
 
 /*
  * NLMeans (KNLMeansCL-style spatio-temporal non-local means), ported from the
- * vszipcl/vszipcu reference kernels. One .comp file, three entry points
+ * vszipcl/vszipcu reference kernels. One .comp file, two entry points
  * selected at build time:
  *
  *   -DENTRY_WEIGHT  nlmWeight      patch-distance + separable box-sum + weight
- *   -DENTRY_ACC     nlmAccumulation per-pixel +q/-q accumulation
- *   -DENTRY_FINISH  nlmFinish      final weighted average
+ *   -DENTRY_ACC     nlmAccumulation per-pixel +q/-q accumulation, applying the
+ *                   final weighted average on the last sweep round (pc3)
  *
  * -DBITS=16|32 selects the io element type of u1/u1z (raw VapourSynth plane
  * bytes; 16-bit int or 32-bit float). Everything that is fixed per filter
- * instance (dims, strides, d/a/s, ref mode, channels, wmode, h/wref) arrives
+ * instance (dims, strides, d/a/s, ref mode, channels, wmode, wref) arrives
  * as specialization constants so each pipeline compiles to its cheapest form.
  *
  * Do not reorder/re-associate: math, tap order, zero-border and the
@@ -37,24 +37,18 @@ layout(constant_id = 1)  const int VI_DIM_Y = 360;
 layout(constant_id = 2)  const int STRIDE = 640;
 layout(constant_id = 3)  const int PSTRIDE = 656;
 layout(constant_id = 4)  const int PAD = 2;
-layout(constant_id = 5)  const int PH = 368;
-layout(constant_id = 6)  const int NLM_S = 4;
-layout(constant_id = 7)  const int NLM_D = 1;
-layout(constant_id = 8)  const int NLM_REF = 0;
-layout(constant_id = 9)  const int NLM_CHANNELS = 1;
-layout(constant_id = 10) const int WMODE = 0;
-layout(constant_id = 11) const float NLM_H = 1.2;
-layout(constant_id = 12) const float WREF = 1.0;
-layout(constant_id = 13) const float H2_INV_NORM = 1.0;
+layout(constant_id = 5)  const int NLM_S = 4;
+layout(constant_id = 6)  const int NLM_D = 1;
+layout(constant_id = 7)  const int NLM_REF = 0;
+layout(constant_id = 8)  const int NLM_CHANNELS = 1;
+layout(constant_id = 9)  const int WMODE = 0;
+layout(constant_id = 10) const float WREF = 1.0;
+layout(constant_id = 11) const float H2_INV_NORM = 1.0;
 
-#define U1_LAYER  (PSTRIDE * PH)             /* io elements per zero-padded layer */
-#define U1_PLANE  ((2*NLM_D+1) * U1_LAYER)   /* io elements per channel */
 #define U4_LAYER  (STRIDE * VI_DIM_Y)        /* floats per weight slot */
 #define NPIX      (STRIDE * VI_DIM_Y)        /* io elements per output channel */
 
-#ifndef ENTRY_PAD
 layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
-#endif
 
 #if BITS == 16
 layout(std430, binding = 0) buffer SrcBuf   { uint16_t src_raw[]; };
@@ -74,14 +68,8 @@ layout(std430, binding = 6) readonly buffer WQBuf { int wq[]; };
 layout(std430, binding = 7) readonly buffer AQBuf { int aq[]; };
 // per-frame layer->slot-base table: [c*layers + t] source, [C*layers + c*layers + t]
 // guide (element offsets of the padded tile holding that channel-layer this
-// frame), followed by {dst_base, src_base} element pairs for the pad kernel
+// frame)
 layout(std430, binding = 8) readonly buffer SlotTable { int slot_table[]; };
-// compact upload staging (pad kernel source)
-#if BITS == 16
-layout(std430, binding = 9) readonly buffer UpBuf { uint16_t up_raw[]; };
-#else
-layout(std430, binding = 9) readonly buffer UpBuf { float up_raw[]; };
-#endif
 
 layout(push_constant) uniform PushConstants {
     int pc0;
@@ -126,40 +114,6 @@ float finish_sample(float ctr, float m, float acc, float accw) {
     const float den = m + accw;
     return den > 0.0f ? (ctr*m + acc) / den : ctr;
 }
-
-#ifdef ENTRY_PAD
-// Zero-pad one compact upload tile into its cache slot. Workgroup z picks
-// the tile; its {slot_base, compact_base} element pair lives in the slot
-// table after the layer table (region 2*NLM_CHANNELS*LAYERS ints).
-layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
-void main() {
-#if BITS == 16
-#define UP_VAL(i) (float(int(up_raw[i])) * SCALE)
-#else
-#define UP_VAL(i) up_raw[i]
-#endif
-    const int pi = 2*NLM_CHANNELS*LAYERS + int(gl_WorkGroupID.z)*2;
-    const int dstb = slot_table[pi];
-    const int srcb = slot_table[pi+1];
-    for (int y = int(gl_GlobalInvocationID.y); y < PH;
-         y += int(gl_NumWorkGroups.y) * 8) {
-        for (int x = int(gl_GlobalInvocationID.x); x < PSTRIDE;
-             x += int(gl_NumWorkGroups.x) * 32) {
-            float v = 0.0f;
-            if (x >= PAD && x < PAD+VI_DIM_X && y >= PAD && y < PAD+VI_DIM_Y) {
-                v = UP_VAL(srcb + (y-PAD)*VI_DIM_X + (x-PAD));
-            }
-#if BITS == 16
-            src_raw[dstb + y*PSTRIDE + x] =
-                uint16_t(uint(v * PEAK + 0.5f) & 0xFFFFu);
-#else
-            src_raw[dstb + y*PSTRIDE + x] = v;
-#endif
-        }
-    }
-#undef UP_VAL
-}
-#endif /* ENTRY_PAD */
 
 /* Joint multi-channel patch distance for the center pixel (xx,y) vs the
  * candidate (xx+qx, y+qy). aK/bK are the element bases of channel K's slot
@@ -468,34 +422,3 @@ void main() {
 
 #endif /* ENTRY_ACC */
 
-#ifdef ENTRY_FINISH
-
-// out = (center*m + weighted_sum) / (m + weight_sum), m = wref*maxweight.
-// den==0 unguarded: u5 seeded with FLT_EPS keeps den > 0 (matches KNL).
-void main() {
-    const int x = int(gl_GlobalInvocationID.x);
-    const int y = int(gl_GlobalInvocationID.y);
-    if (x >= VI_DIM_X || y >= VI_DIM_Y) return;
-    const int g = y*STRIDE + x;
-    const float m = WREF * u5[g];
-    const int uc = slot_table[NLM_D] + (y+PAD)*PSTRIDE + (x+PAD);
-
-    if (NLM_CHANNELS == 1) {
-        const float acc0 = u2[2*g], accw = u2[2*g+1];
-        const float den = m + accw;
-        store_value(g, (load_src(uc)*m + acc0) / den);
-    } else if (NLM_CHANNELS == 2) {
-        const float acc0 = u2[3*g], acc1 = u2[3*g+1], accw = u2[3*g+2];
-        const float den = m + accw;
-        store_value(g,               (load_src(uc)*m                          + acc0) / den);
-        store_value(NPIX + g,        (load_src(slot_table[LAYERS+NLM_D]       + (y+PAD)*PSTRIDE + (x+PAD))*m + acc1) / den);
-    } else {
-        const float acc0 = u2[4*g], acc1 = u2[4*g+1], acc2 = u2[4*g+2], accw = u2[4*g+3];
-        const float den = m + accw;
-        store_value(g,               (load_src(uc)*m                          + acc0) / den);
-        store_value(NPIX + g,        (load_src(slot_table[LAYERS+NLM_D]       + (y+PAD)*PSTRIDE + (x+PAD))*m + acc1) / den);
-        store_value(2*NPIX + g,      (load_src(slot_table[2*LAYERS+NLM_D]     + (y+PAD)*PSTRIDE + (x+PAD))*m + acc2) / den);
-    }
-}
-
-#endif /* ENTRY_FINISH */
