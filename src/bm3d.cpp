@@ -1292,7 +1292,17 @@ static void VS_CC BM3DCreate(
     // frames (like the reference's fused-mode accumulator cache); anything
     // beyond that (e.g. seeking) blocks in the acquire instead of corrupting.
     d->src_ring = (d->radius == 0) ? d->num_streams : 4 * d->radius + d->num_streams;
-    d->res_cap = (d->radius == 0) ? d->num_streams : d->tw + d->num_streams + 2 * d->radius;
+    // One in-flight frame needs the stacks of centre frames [n-r, n+r], so
+    // num_streams concurrent frames span num_streams + 2r slots. That working
+    // set is the default: the estimate cache is the largest allocation, and on
+    // an 8 GiB card the slack below is the difference between running radius 4
+    // and failing to allocate. VSFEEL_BM3D_CACHE=1 adds a whole extra window,
+    // so an out-of-order (seek) request finds a warm slot instead of waiting in
+    // the acquire, for tw/(ns+2r+tw) more VRAM.
+    const int res_working_set = d->num_streams + 2 * d->radius;
+    const bool cache_slack = env_int("VSFEEL_BM3D_CACHE", 0) != 0;
+    d->res_cap = (d->radius == 0) ? d->num_streams
+        : (cache_slack ? res_working_set + d->tw : res_working_set);
 
     const int extractor_exp = vsh::int64ToIntS(vsapi->mapGetInt(in, "extractor_exp", 0, &error));
     // outside the normal float exponent range the extractor add/subtract pair
@@ -1469,7 +1479,17 @@ static void VS_CC BM3DCreate(
             const auto result = allocate_memory(*d->device, d->res_buf,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
+                // The estimate cache is by far the largest allocation, so an
+                // out-of-memory here is the usual "radius too high for this
+                // card"; name the size and what shrinks it.
+                char msg[320];
+                snprintf(msg, sizeof(msg),
+                    "%s; the estimate cache needs %.0f MiB (radius %d, "
+                    "num_streams %d): lower radius or num_streams",
+                    std::get<std::string>(result).c_str(),
+                    static_cast<double>(res_size) * 4.0 / (1024.0 * 1024.0),
+                    d->radius, d->num_streams);
+                return set_error(msg);
             }
             d->res_mem = std::get<AllocatedMemory>(result).memory;
         }

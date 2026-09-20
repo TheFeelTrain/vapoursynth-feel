@@ -59,6 +59,11 @@ Status: **shipped.** Verified against `src/dfttest.{cpp,comp}` and
   where a window spans 7 sources against K=5): `ENTRY_PAD_DIRECT` pads into the
   per-resource padded buffer, read same-queue-ordered. ns=1 + radius 1 never
   hits it (4 distinct sources < 5 slots).
+- **Pad and fused must share a queue.** A padder adds no `st.sem` wait for its
+  own pad: a fresh slot is visible only through same-queue submission order plus
+  the fused CB's head barrier. Moving the pads off that queue needs the wait
+  added explicitly, and the direct-pad fallback has no semaphore at all, so it
+  cannot move off the compute queue without new sync.
 
 ### Why it is deadlock/stall-free (do not "simplify" away)
 
@@ -234,11 +239,29 @@ grid fix → 673 wave32 pNext → 801 center-slice spatial buffer (3.4 GB → 1.
 constants, ZMEAN spec constant, gf hoist): 3378 → 2613 instr, 690 → 468 µs
 (vszipcl 441).
 
+## 2026-09-20 — second-queue transfer split measured neutral (reverted)
+
+Both `VSFEEL_DFFTEST_XFER` prototypes were bit-exact and then reverted, because
+neither moved the graded median:
+
+- **D2H split**: col2im wrote a device-local result buffer and a pre-recorded
+  `vkCmdCopyBuffer` on queues 2/3 (compute on 0/1) moved it to staging, with the
+  frame fence on the copy. 5 order-reversed pairs, jpbd 1080p GRAY16, 2000
+  frames, median of 3: **1161.56 → 1161.55 fps** at ns=4.
+- **Pad split**: pads on the second queue instead of the compute queue. Requires
+  an explicit `st.sem` wait for the frame's *own* pad added to the fused — without
+  it the fused could read an unwritten slot (intermittent, 1 of 6 trials in a
+  repeat harness, output off by up to 1630 codes). With
+  the wait: ns=4 **1321.97 → 1317.04**, ns=8 **1352.39 → 1355.44** (3 reps × 3
+  × 1000-frame medians); ns=1 was too bimodal (1010/1235, ±19%) to call.
+
+Mechanism: the frame is fused-kernel-bound (448 µs against col2im 226-260 µs and
+a ~24 µs pad), and shader stores to GTT are posted, so both legs already overlap
+the neighbouring stream's compute. A second queue adds a submit plus a timeline
+wait and buys nothing; the ns=4 gap to vszipcl is fused codegen, not SDMA.
+
 ## Open work
 
-- **ns=4 SDMA overlap** (the remaining gap): vszipcl runs H2D/D2H on separate
-  copy engines full-duplex while kernels run; ours serializes on the compute CP.
-  A dedicated transfer queue + 2× staging ping-pong is untried.
 - **Fused codegen residue (448 vs 384 µs)**: remaining IM2COL/window ALU,
   pointer-walk strength reduction (base + increment per j), ACO dual-issue
   packing (`v_dual_mov` 128 vs 18).
@@ -286,6 +309,10 @@ constants, ZMEAN spec constant, gf hoist): 3378 → 2613 instr, 690 → 468 µs
 
 ## Do not retry
 
+- **Second-queue transfer split** (`VSFEEL_DFFTEST_XFER`, both the D2H copy and
+  the pad variant): neutral at every graded config, see the 2026-09-20 round.
+  The transfer legs already overlap neighbouring compute; the bottleneck is the
+  fused kernel.
 - **Host-side cache synchronization in any form**: mutex+cv ordered-submission
   waits starve the VS worker pool; drain-on-fence gives circular waits between
   concurrent padders. The cache must be sync-free: GPU ordering via submit order

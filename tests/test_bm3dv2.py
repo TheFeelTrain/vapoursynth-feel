@@ -212,13 +212,15 @@ def test_bm3dv2_accepts_exactly_8x8():
 def test_bm3dv2_rejects_int32_res_overflow():
     """A stack above 2^31 floats must be rejected at creation.
 
-    The kernel addresses `res` through signed 32-bit offsets, so 3840x2160 /
-    radius 4 / num_streams 4 (3.13e9 floats, an 11.7 GiB buffer that does
-    allocate on a 24 GiB card) wrapped negatively.
+    The kernel addresses `res` through signed 32-bit offsets, so a 4K radius-4
+    stack wrapped negatively. 8K keeps the overflow true under both estimate
+    cache sizings (7.2e9 floats at the minimum working set, 1.25e10 with the
+    default slack), unlike the 4K/ns=4 config whose overflow depended on the
+    slack being allocated.
     """
     with pytest.raises(vs.Error, match="32-bit"):
         vs.core.vsfeel.BM3Dv2(
-            _blank(3840, 2160), sigma=SIGMA, radius=4, bm_range=BM_RANGE,
+            _blank(7680, 4320), sigma=SIGMA, radius=4, bm_range=BM_RANGE,
             ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=4,
         )
 

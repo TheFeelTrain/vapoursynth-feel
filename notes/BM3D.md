@@ -199,7 +199,9 @@ only at vspipe's own ~32-request default (313.6 vs 310.6). The plateau is at 2;
 1080p r=2 — the estimate stack itself scales as `tw + ns + 2r`, so it is 23%
 off the total, not just off the per-stream part).
 
-**Per-instance VRAM**, printed by `VSFEEL_BM3D_VRAM=1` at creation. 1080p r=2:
+**Per-instance VRAM**, printed by `VSFEEL_BM3D_VRAM=1` at creation. Two
+formulas cover it: `src = src_ring * clips * pe` with `src_ring = 4r + ns`, and
+`res = res_cap * tw * 2 * pe` with `res_cap = tw + ns + 2r`. 1080p r=2:
 ns=2 1107.4 MiB, ns=4 1439.6 MiB, ns=8 2104.1 MiB; the shared estimate stack is
 79% of that at ns=2 and 64% at ns=8 (both it and the per-stream staging scale
 with the count), and the per-stream part is staging + dst only. The staging
@@ -207,6 +209,20 @@ right-sizing (4r+1 slots instead of `4r+num_streams`) removed 23.7 MiB per
 stream, 95 MiB at ns=4. At r=4/ns=8 the same figure is 5.3 GiB for the basic
 estimate and 7.0 GiB for the final (Wiener) pass, which is why the 32-bit `res`
 addressing guard exists.
+
+**The estimate cache is sized for the in-flight working set by default;
+`VSFEEL_BM3D_CACHE=1` restores a window of seek margin.** An in-flight
+frame needs the stacks of centre frames `[n-r, n+r]`, so `num_streams`
+concurrent frames span `num_streams + 2r` slots — that is `res_cap` now. The
+default used to add `tw` more so an out-of-order (seek) request finds a warm
+slot instead of waiting in the acquire; that margin costs `tw/(ns+2r+tw)` of the
+largest buffer, which is what made radius 4 fail to allocate on an 8 GiB card.
+1080p equivalents (banner run at 640x360, exactly x9 in `pe`) r=2 ns=2 1107 ->
+712 MiB, r=4 ns=2 3132 -> 1851 MiB, r=4 ns=2 final 3544 -> 2263 MiB, i.e.
+-36..41% of the whole instance. In-order throughput is unchanged: 1000f 1080p
+GRAY32 r=2 ns=2, three interleaved pairs, 299.9/296.9/299.2 fps slack vs
+299.3/298.8/297.6 fps working set. All 75 BM3D tests pass either way, including
+the six request orders and the seek-collision case.
 
 **Correctness of the round.** 75/75 BM3D tests and 800/800 repo tests pass.
 No numerical change was intended or observed: the equivalence argument for the
@@ -231,6 +247,15 @@ streams/resources/geometry/lifecycle/validation/python_backend files) pass on
 each. Cost, 1000f 1080p GRAY32 r=2 ns=2 interleaved pairs on the 7900XTX:
 314.8/312.5/314.9 fps (hardware) vs 260.0/260.4/259.8 fps (CAS), i.e. +0.66 ms
 per frame or ~17% — the fallback is a device-support path, not a tuning knob.
+
+**2026-09-20 — the estimate cache now sizes to its working set (default), not
+the working set plus a window of seek slack.** `res_cap` was
+`tw + ns + 2r` while the in-flight working set is `ns + 2r`, so every instance
+allocated `tw` slots for a margin only out-of-order requests consume; radius 4
+on an 8 GiB card failed to allocate because of them. Dropping the margin is
+-36..41% of total VRAM at no in-order cost, so it became the default;
+`VSFEEL_BM3D_CACHE=1` restores it for seek/scrub-heavy graphs, where a warm
+slot beats blocking in the acquire. Numbers in the VRAM paragraph.
 
 ## Open work
 
@@ -293,6 +318,9 @@ cached at creation, not read per frame.
 - `VSFEEL_BM3D_VRAM=1` — creation-time VRAM budget (shared + per-stream).
 - `VSFEEL_BM3D_QUEUES=N` — queue cap override.
 - `VSFEEL_BM3D_HD=0` — force the GTT staging + PCIe upload.
+- `VSFEEL_BM3D_CACHE=1` — add the seek margin back to the estimate cache
+  (0, the default, sizes it for the working set; see the VRAM paragraph for the
+  +36..41%).
 - `VSFEEL_BM3D_CAS=1` — force the atomicCompSwap aggregation build on a device
   that has buffer float atomics (A/B measurement only).
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs; both
