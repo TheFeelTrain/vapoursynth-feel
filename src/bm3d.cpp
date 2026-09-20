@@ -1300,6 +1300,11 @@ static void VS_CC BM3DCreate(
         return set_error("subgroup shuffle is not supported by this device "
                          "(VK_SUBGROUP_FEATURE_SHUFFLE_BIT is required)");
     }
+    // bm3d.comp is compiled for SPIR-V 1.6 (subgroup ops), which only a Vulkan
+    // 1.3 device is required to accept.
+    if (auto e = require_vulkan_1_3(*d->device, "BM3D")) {
+        return set_error(*e);
+    }
 
     VkDevice dev = d->device->device;
 

@@ -274,9 +274,14 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     if (volk_result != VK_SUCCESS) {
         return "no Vulkan loader found ("s + vk_result_string(volk_result) + ")";
     }
+    // The plugin's floor is Vulkan 1.3: every feature chain below tops out at
+    // VkPhysicalDeviceVulkan13Features, and the SPIR-V 1.6 shaders (dfttest,
+    // eedi3, nnedi3, bm3d) need a 1.3 device. Asking for more here would reject
+    // loaders that can run the plugin; the per-filter require_vulkan_1_3()
+    // guard reports the device version when it is the device that is too old.
     const uint32_t loader_version = volkGetInstanceVersion();
-    if (loader_version < VK_API_VERSION_1_4) {
-        return "Vulkan 1.4 is required, but the loader reports "
+    if (loader_version < VK_API_VERSION_1_3) {
+        return "Vulkan 1.3 is required, but the loader reports "
             + std::to_string(VK_API_VERSION_MAJOR(loader_version)) + "."
             + std::to_string(VK_API_VERSION_MINOR(loader_version));
     }
@@ -297,7 +302,7 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
             .applicationVersion = VK_MAKE_API_VERSION(0, version[0], version[1], version[2]),
             .pEngineName = "vsfeel",
             .engineVersion = VK_MAKE_API_VERSION(0, version[0], version[1], version[2]),
-            .apiVersion = VK_API_VERSION_1_4
+            .apiVersion = VK_API_VERSION_1_3
         };
 
         VkInstanceCreateInfo instance_info {

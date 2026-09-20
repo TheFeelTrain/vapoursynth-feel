@@ -537,9 +537,9 @@ inline constexpr VkDeviceSize align32(VkDeviceSize v) {
     return (v + 31) & ~VkDeviceSize(31);
 }
 
-// The DFTTest/EEDI3/NNEDI3 shaders are compiled for SPIR-V 1.6, which a Vulkan
-// 1.3 device is required to accept; below that, pipeline creation fails with an
-// opaque driver error, so report the version instead.
+// The DFTTest/EEDI3/NNEDI3/BM3D shaders are compiled for SPIR-V 1.6, which a
+// Vulkan 1.3 device is required to accept; below that, pipeline creation fails
+// with an opaque driver error, so report the version instead.
 inline std::optional<std::string> require_vulkan_1_3(
     const VK_Device & dev, const char * filter) {
     if (dev.api_version >= VK_API_VERSION_1_3) {

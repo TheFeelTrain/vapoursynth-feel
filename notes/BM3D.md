@@ -266,6 +266,13 @@ same-binary runs show (atomic-add order), and the full suite is green.
 `merge_group64` indexes them with a data-dependent row (`bh`), which a shuffle
 cannot select; the LDS there is load-bearing, not a leftover.
 
+**New device requirement.** `bm3d.comp` is now SPIR-V 1.6, so BM3D joins
+DFTTest/EEDI3/NNEDI3 behind `require_vulkan_1_3` (a 1.3 *device*), and it is the
+first filter to need `VK_SUBGROUP_FEATURE_SHUFFLE_BIT` (checked at creation;
+only BASIC is mandatory by spec). The subgroup-size request is still 32 when the
+device offers it, but the shuffles only ever XOR a mask < 8, so they stay inside
+the 8-lane group on a wave64 device too.
+
 **`#pragma unroll` is a non-item on this toolchain.** glslc/glslang ignores it in
 GLSL (byte-identical SPIR-V with and without), and ACO already fully unrolls every
 fixed-trip loop — the kernel has only four backward branches, all in the
