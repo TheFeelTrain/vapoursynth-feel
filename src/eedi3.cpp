@@ -876,6 +876,7 @@ struct Eedi3Resource {
     VkBuffer up_dev {};           // ReBAR upload: CPU NT-stores land in VRAM
     VkDeviceMemory up_dev_mem {};
     uint8_t * up_map {};          // mapped view of up_dev
+    bool up_coherent { true };    // up_dev's memory type is HOST_COHERENT
     VkDescriptorSet desc_set_pad {};   // pad kernel (b0 = up_dev, b8 = pad_dev)
     // EEDI3AA needs BOTH geometries' views of the shared buffers in one filter:
     //   desc_set_h  — horizontal row/vcheck/compose: b0/b5/b9 all view pad_dev
@@ -941,6 +942,18 @@ struct Eedi3Resource {
                 mapped_range(dev, mem, base + offset, bytes));
         }
         return mapped_ranges;
+    }
+
+    // Non-coherent host-visible uploads must be flushed to the device before
+    // the kernels read them. The rebar probe requires a coherent type, so this
+    // is a safety net for a driver that binds a relaxed one anyway. A no-op on
+    // the coherent path and when there is no up_dev at all.
+    VkResult flush_up_dev(const VK_Device & dev, VkDeviceSize bytes) const {
+        if (!up_dev_mem || up_coherent || bytes == 0) {
+            return VK_SUCCESS;
+        }
+        const VkMappedMemoryRange range = mapped_range(dev, up_dev_mem, 0, bytes);
+        return vkFlushMappedMemoryRanges(dev.device, 1, &range);
     }
 };
 
@@ -2711,6 +2724,7 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
             mapped_range(*d->device, resource.staging_mem, 0, d->upload_total);
         checkVK(vkFlushMappedMemoryRanges(dev, 1, &range));
     }
+    checkVK(resource.flush_up_dev(*d->device, d->upload_total));
     _mm_sfence();
     vsfeel_trace_mark("sub cb1");
     checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
@@ -2744,8 +2758,10 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
     // above has already finished, so nothing between them needs the host or a
     // second fence: the pair gather uploads both parities here and the two
     // compose passes go into a single command buffer separated by their own
-    // memory barrier. Setting VSFEEL_EEDI3AA_HFUSE selects this; leaving it
-    // unset restores the two-submission form as the A/B control.
+    // memory barrier. VSFEEL_EEDI3AA_HFUSE=1 selects this; unset (or =0) keeps
+    // the two-submission form, which is the shipped default -- the fused path
+    // does not match the two-call oracle on several geometries (mdis=20 and
+    // field=2 among them), so it stays opt-in until that is diagnosed.
     // ------------------------------------------------------------------
     const bool one_cb = env_flag("VSFEEL_EEDI3AA_HFUSE");
     bool fused = false;
@@ -2763,6 +2779,7 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
             mapped_range(*d->device, resource.staging_mem, 0, d->upload_total);
         checkVK(vkFlushMappedMemoryRanges(dev, 1, &range));
     }
+    checkVK(resource.flush_up_dev(*d->device, d->upload_total));
     _mm_sfence();
 
     if (fused) {
@@ -3345,6 +3362,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
 
     // Drain the CPU store buffer so no NT upload write is still in flight when
     // the GPU reads up_dev (required for the ReBAR path; harmless otherwise).
+    checkVK(resource.flush_up_dev(*d->device, d->upload_total));
     _mm_sfence();
 
     const auto h_tSub0 = std::chrono::steady_clock::now();
@@ -3904,19 +3922,18 @@ static void vsfeel_eedi3_create(
 
     // Workgroup sizes (spec constants 6/7 in the shaders). The row kernel is
     // a subgroup-register DP: one workgroup of SGSIZE=32 lanes per interp row,
-    // exactly one subgroup, with the host requesting requiredSubgroupSize=32
-    // on the row pipeline (RDNA3's native 64-lane wavefront is split via the
-    // subgroup size control feature). The vcheck kernel is a single WG
-    // striding over columns (up to WIDTH).
+    // exactly one subgroup. A device that already reports 32-lane subgroups
+    // needs nothing more; one that defaults wider (RADV reports 64 on RDNA3)
+    // has to be able to force 32 through subgroup size control. The vcheck
+    // kernel is a single WG striding over columns (up to WIDTH).
     constexpr int SGSIZE = 32;   // must match the shader
     const auto & lim = d->device->limits;
     const int max_invoc = static_cast<int>(lim.maxComputeWorkGroupInvocations);
     const int max_x = static_cast<int>(lim.maxComputeWorkGroupSize[0]);
     int lsz_vcheck = std::min({ 1024, max_invoc, max_x });
-    if (!d->device->subgroup_size_control ||
-        d->device->min_subgroup_size > SGSIZE || SGSIZE > d->device->max_subgroup_size) {
-        return set_error("device cannot run the EEDI3 row kernel (needs a 32-lane "
-                         "subgroup via subgroup size control)");
+    if (!d->device->has_subgroup_size(SGSIZE)) {
+        return set_error("device cannot run the EEDI3 row kernel (needs 32-lane "
+                         "subgroups, natively or via subgroup size control)");
     }
     const int lsz_row = SGSIZE;
 
@@ -4422,6 +4439,23 @@ static void vsfeel_eedi3_create(
     d->dev_total = dev_total;
     d->scratch_total = scratch_total;
 
+    // The direct upload is only taken where host-visible device-local memory
+    // exists and can hold the whole per-instance footprint. The memory *type*
+    // is not enough: a card without ReBAR exposes the same type through a PCIe
+    // aperture too small for the buffers, so the allocation fails with the VRAM
+    // heap empty. Probe once, before any resource is created, and fall back to
+    // cached staging + H2D. The descriptor pool above was sized for the direct
+    // path, so a fallback leaves a little unused capacity -- harmless, and the
+    // alternative is mis-sizing it from an unknown upload_total.
+    if (d->rebar_up && upload_total > 0 &&
+        !rebar_available(*d->device, upload_total * d->num_streams)) {
+        d->rebar_up = false;
+        if (vsfeel_device_info_enabled()) {
+            fprintf(stderr, "[eedi3] upload: %.0f MiB x %d streams does not fit "
+                            "host-visible VRAM; using cached staging + H2D\n",
+                static_cast<double>(upload_total) / (1024.0 * 1024.0), d->num_streams);
+        }
+    }
 
     // pad_dev (device-only, never staged): per-plane built padded planes
     // produced by the pad kernel from the mirrored upload. The mirror
@@ -4831,7 +4865,13 @@ static void vsfeel_eedi3_create(
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
-            resource.up_dev_mem = std::get<AllocatedMemory>(result).memory;
+            const auto & allocated = std::get<AllocatedMemory>(result);
+            resource.up_dev_mem = allocated.memory;
+            // allocate_memory may relax HOST_COHERENT; record what was bound so
+            // the frame path flushes instead of handing the kernels stale data.
+            resource.up_coherent =
+                (d->device->mem_props.memoryTypes[allocated.type_index].propertyFlags &
+                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
         }
         {
             VkCommandPoolCreateInfo pool_info {

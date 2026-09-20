@@ -391,9 +391,13 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
             .pNext = &subgroup_ops
         };
         vkGetPhysicalDeviceProperties2(dev->physical_device, &props2);
+        dev->subgroup_size = subgroup_ops.subgroupSize;
         dev->subgroup_shuffle =
             (subgroup_ops.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT) != 0;
     }
+    // Size control is only usable for the stages the driver lists it for, and
+    // the filters that ask for a specific width are compute shaders.
+    VkShaderStageFlags required_subgroup_stages = 0;
     if (subgroup_ok) {
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_props {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES,
@@ -404,19 +408,21 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
             .pNext = &subgroup_props
         };
         vkGetPhysicalDeviceProperties2(dev->physical_device, &props2);
+        required_subgroup_stages = subgroup_props.requiredSubgroupSizeStages;
         if (subgroup_props.minSubgroupSize && subgroup_props.maxSubgroupSize) {
             dev->min_subgroup_size = subgroup_props.minSubgroupSize;
             dev->max_subgroup_size = subgroup_props.maxSubgroupSize;
         }
     }
-    dev->subgroup_size_control =
-        subgroup_ok && dev->min_subgroup_size <= 32 && 32 <= dev->max_subgroup_size;
+    dev->subgroup_size_control = subgroup_ok &&
+        (required_subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        dev->min_subgroup_size <= 32 && 32 <= dev->max_subgroup_size;
     if (vsfeel_device_info_enabled()) {
-        fprintf(stderr, "[vsfeel] api_version=%u.%u subgroup_size_control=%d min=%u max=%u "
-                        "subgroup_shuffle=%d\n",
+        fprintf(stderr, "[vsfeel] api_version=%u.%u subgroup=%u subgroup_size_control=%d "
+                        "min=%u max=%u subgroup_shuffle=%d\n",
             VK_API_VERSION_MAJOR(dev->api_version), VK_API_VERSION_MINOR(dev->api_version),
-            dev->subgroup_size_control, dev->min_subgroup_size, dev->max_subgroup_size,
-            dev->subgroup_shuffle);
+            dev->subgroup_size, dev->subgroup_size_control, dev->min_subgroup_size,
+            dev->max_subgroup_size, dev->subgroup_shuffle);
     }
 
     vkGetPhysicalDeviceMemoryProperties(dev->physical_device, &dev->mem_props);

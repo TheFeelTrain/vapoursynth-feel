@@ -833,8 +833,10 @@ static const VSFrame *VS_CC BM3DGetFrame(
 
         // make the host-written staging visible to the device copies (the
         // cached mapping may hold dirty lines that the GPU would miss; the
-        // coherent ReBAR window needs no flush)
-        if (any_uploaded && (!d->staging_direct || !stream.staging_coherent)) {
+        // coherent ReBAR window needs no flush). Testing staging_direct here
+        // would short-circuit the coherence test and flush the whole 74 MB
+        // mapping every frame on the GTT path even when it is coherent.
+        if (any_uploaded && !stream.staging_coherent) {
             VkMappedMemoryRange flush_range {
                 .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                 .pNext = nullptr,
@@ -1330,6 +1332,11 @@ static void VS_CC BM3DCreate(
     // the OpenCL reference itself uses (atom_add_f), so the filter runs
     // everywhere instead of failing at creation.
     d->cas_atomics = env_flag("VSFEEL_BM3D_CAS") || !d->device->feat_atomic_float32_add;
+    if (vsfeel_device_info_enabled()) {
+        fprintf(stderr, "[bm3d] aggregation: %s\n",
+            d->cas_atomics ? "CAS loop (no buffer float atomics available)"
+                           : "hardware buffer float atomics");
+    }
     // The 8x8 group transposes and the group-8 reduction are subgroup shuffles.
     // The spec only makes SUBGROUP_FEATURE_BASIC_BIT mandatory, so a device
     // without SHUFFLE would either reject the module or mis-execute.

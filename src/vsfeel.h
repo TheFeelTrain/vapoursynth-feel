@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -63,8 +64,13 @@ struct ticket_semaphore {
 // `getenv` parsing live in a single place; each filter keeps its own names
 // (VSFEEL_DFTTEST_TRACE, VSFEEL_BM3D_TRACE, ...) so flipping one filter's
 // debugging never affects another.
+// A flag is on when it is set to anything other than an empty string or "0",
+// so `VAR=0` disables it the way every other switch reads. Presence alone used
+// to be the test, which made the documented "=0 to restore the old path"
+// controls impossible to use and silently enabled debug/ablation paths.
 inline bool env_flag(const char * env) {
-    return std::getenv(env) != nullptr;
+    const char * v = std::getenv(env);
+    return v && *v && std::strcmp(v, "0") != 0;
 }
 
 inline int env_int(const char * env, int default_value) {
@@ -249,9 +255,21 @@ struct VK_Device {
     bool host_import {};
     VkDeviceSize host_pointer_alignment {};
     PFN_vkGetMemoryHostPointerPropertiesEXT get_memory_host_pointer_properties {};
+    uint32_t subgroup_size { 0 };    // the driver's default subgroup width
     uint32_t min_subgroup_size { 64 };
     uint32_t max_subgroup_size { 64 };
     bool subgroup_size_control { false };
+    // Whether a shader can be guaranteed `size`-lane subgroups: natively, or
+    // through size control when the driver's default width differs. Both are
+    // sufficient; requiring the extension on a device that already reports the
+    // wanted width would refuse a device that can run the kernel.
+    bool has_subgroup_size(uint32_t size) const {
+        if (subgroup_size == size) {
+            return true;
+        }
+        return subgroup_size_control && min_subgroup_size <= size &&
+            size <= max_subgroup_size;
+    }
     // VK_SUBGROUP_FEATURE_SHUFFLE_BIT: a shader using subgroupShuffle needs the
     // GroupNonUniformShuffle capability. Only BASIC is required by the spec, so
     // this is queried rather than assumed. The subgroup size control query above
