@@ -753,7 +753,7 @@ static bool trivial_kernels() {
 }
 
 static bool dfttest_trace() {
-    static const bool v = env_flag("VSFEEL_DFTTEST_TRACE");
+    static const bool v = vsfeel_debug_trace("VSFEEL_DFTTEST_TRACE");
     return v;
 }
 
@@ -2531,7 +2531,7 @@ static void VS_CC DftCreate(
             }
             if (i == 0) {
                 d->up_direct_ok = resource.up_direct;
-                if (dfttest_trace() || env_flag("VSFEEL_DFTTEST_DBG")) {
+                if (vsfeel_debug_flag("VSFEEL_DFTTEST_DBG")) {
                     fprintf(stderr, "[dfttest] up_direct=%d\n", resource.up_direct ? 1 : 0);
                 }
             }

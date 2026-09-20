@@ -252,10 +252,17 @@ All filters share an inline (zero-overhead, C++20) plumbing layer in
   vectors (semaphore, value, stage) and optionally signals a timeline value;
   waits are non-destructive so any number of consumers can wait on one signal.
 - **`env_flag` / `env_int` / `env_str`** — env-gated debug flags; keep one env
-  name per filter (`VSFEEL_DFTTEST_TRACE`, `BM3D_TRACE`, ...).
+  name per filter (`VSFEEL_DFTTEST_TRACE`, `BM3D_TRACE`, ...). Read per-filter
+  *diagnostic* flags through **`vsfeel_debug_flag(name)`** (one-shot: creation
+  banners, fallback notices) or **`vsfeel_debug_trace(name)`** (per-frame
+  traces), never `env_flag`: `VSFEEL_DEBUG=1` — the one switch to hand a bug
+  reporter: device banner, heap dump, creation banners, full error trace —
+  turns the one-shot ones on, and `=2` adds the per-frame firehose.
+  Performance probes (`TIMING`, `GPUTRACE`) stay on `env_flag`.
 - **`vsfeel_trace_error(filter, frame, message, device)`** — every `set_error`
-  lambda calls this first, so **one** switch (`VSFEEL_TRACE=1`, `=2` for no line
-  cap) names the filter, the output frame (`create` at filter creation) and the
+  lambda calls this first, so **one** switch (`VSFEEL_DEBUG=1`, or `VSFEEL_TRACE`
+  alone: `=1`, `=2` for no line cap) names the filter, the output frame
+  (`create` at filter creation) and the
   order of every error, prints the device/driver banner, and on
   `VK_ERROR_DEVICE_LOST` asks the driver for its own fault report
   (`VK_EXT_device_fault`: description, faulting address and kind, vendor code,

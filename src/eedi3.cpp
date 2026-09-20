@@ -3084,7 +3084,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
             if (auto import_err = import_plane_host_memory(*d, dstp, plane_bytes,
                                                            direct.plane[plane])) {
                 direct.destroy(*d);
-                if (env_flag("VSFEEL_EEDI3_TRACE")) {
+                if (vsfeel_debug_flag("VSFEEL_EEDI3_TRACE")) {
                     fprintf(stderr, "[eedi3] direct-to-frame import failed: %s\n",
                             import_err->c_str());
                 }

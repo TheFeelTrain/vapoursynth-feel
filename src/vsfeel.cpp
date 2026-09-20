@@ -177,7 +177,7 @@ static void load_pipeline_cache(VK_Device & dev) {
     VkResult result = vkCreatePipelineCache(dev.device, &cache_info, nullptr, &dev.pipeline_cache);
     if (result != VK_SUCCESS && !initial.empty()) {
         // corrupt/stale/foreign cache data: start clean rather than failing
-        if (env_flag("VSFEEL_DBG")) {
+        if (vsfeel_debug_enabled()) {
             fprintf(stderr, "[vsfeel] pipeline cache rejected (%s), starting empty\n",
                 vk_result_string(result));
         }
@@ -190,7 +190,7 @@ static void load_pipeline_cache(VK_Device & dev) {
         dev.pipeline_cache_path.clear();
         return;
     }
-    if (env_flag("VSFEEL_DBG")) {
+    if (vsfeel_debug_enabled()) {
         fprintf(stderr, "[vsfeel] pipeline cache %s (%zu B loaded)\n",
             dev.pipeline_cache_path.c_str(), initial.size());
     }
@@ -420,6 +420,34 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     }
 
     vkGetPhysicalDeviceMemoryProperties(dev->physical_device, &dev->mem_props);
+
+    // The direct-upload fast path lives or dies on the size and ownership of
+    // the host-visible device-local heap, which differs wildly between drivers
+    // (real ReBAR window vs a PCIe aperture), so print the layout whenever the
+    // device banner is on.
+    if (vsfeel_device_info_enabled()) {
+        for (uint32_t i = 0; i < dev->mem_props.memoryHeapCount; ++i) {
+            fprintf(stderr, "[vsfeel] heap %u: %.0f MiB%s\n", i,
+                static_cast<double>(dev->mem_props.memoryHeaps[i].size) / (1024.0 * 1024.0),
+                (dev->mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                    ? " device-local" : "");
+        }
+        for (uint32_t i = 0; i < dev->mem_props.memoryTypeCount; ++i) {
+            const auto flags = dev->mem_props.memoryTypes[i].propertyFlags;
+            constexpr VkMemoryPropertyFlags direct =
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            if ((flags & direct) == direct) {
+                fprintf(stderr, "[vsfeel] direct-upload type %u: heap %u (%.0f MiB)\n", i,
+                    dev->mem_props.memoryTypes[i].heapIndex,
+                    static_cast<double>(dev->mem_props
+                        .memoryHeaps[dev->mem_props.memoryTypes[i].heapIndex].size) /
+                        (1024.0 * 1024.0));
+                break;
+            }
+        }
+    }
 
     // Host-pointer import (VK_EXT_external_memory_host): lets a kernel write
     // straight into a VapourSynth frame's plane memory, removing a host
@@ -889,7 +917,7 @@ std::variant<AllocatedMemory, std::string> allocate_memory(
 // ---------------------------------------------------------------------------
 
 // Reports the compiled-in version, so a stale installed .so is identifiable
-// from Python as well as from the VSFEEL_DBG banner.
+// from Python as well as from the VSFEEL_DEBUG banner.
 static void VS_CC versionReport(const VSMap *, VSMap * out, void *, VSCore *, const VSAPI * vsapi) {
     vsapi->mapSetData(out, "version", VSFEEL_VERSION,
         static_cast<int>(std::strlen(VSFEEL_VERSION)), dtUtf8, 0);

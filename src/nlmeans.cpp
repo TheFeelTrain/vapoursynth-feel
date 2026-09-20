@@ -554,7 +554,7 @@ static const VSFrame *VS_CC NLMeansGetFrame(
         return static_cast<const VSFrame *>(nullptr);
     };
 
-    const bool trace = env_flag("VSFEEL_NLMEANS_TRACE") || env_flag("NLMEANS_TRACE");
+    const bool trace = vsfeel_debug_trace("VSFEEL_NLMEANS_TRACE") || env_flag("NLMEANS_TRACE");
     auto now_us = [] {
         return std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1456,8 +1456,9 @@ static void VS_CC NLMeansCreate(
     // is a VRAM read instead of a PCIe one. Opt out with VSFEEL_NLMEANS_HD=0.
     // Decided once here so every stream (including later create_staging growth)
     // takes the same path.
-    d->staging_direct =
-        env_int("VSFEEL_NLMEANS_HD", 1) != 0 && rebar_available(*d->device);
+    d->staging_direct = env_int("VSFEEL_NLMEANS_HD", 1) != 0 &&
+        rebar_available(*d->device,
+            static_cast<VkDeviceSize>(d->staging_tiles) * d->slot_bytes * d->num_streams);
     {
         const int full = d->num_streams * d->channels * clips * d->layers;
         const VkDeviceSize budget_slots = (512ull << 20) / slot_bytes_v;

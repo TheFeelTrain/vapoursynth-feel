@@ -74,41 +74,28 @@ Before this round the same command gave 190.5 fps at ns=4 (kernel 4.94 + agg
 
 Chronological; each entry keeps the mechanism, not the story.
 
-**2026-09-16 — correctness pass (no steady-state perf change).** Three
-creation/kernel-safety fixes: reject a configuration whose estimate-stack size
-(`res_cap * tw * 2 * pe`) exceeds the kernel's signed 32-bit `res` addressing
-(4K r=4 ns=4 allocates 11.7 GiB and silently wrapped); require a known positive
-frame count; and make `BM3D_NOSEARCH` flush its synthetic group instead of
-letting the aggregation index uninitialized LDS. The last one is covered by
-`test_bm3dv2_nosearch_matches_search_on_constant_clip` (a constant clip's
-searched and no-search arms must agree to 1 ulp).
-
-**2026-09-16 — parameter validation.** `bm_range`/`ps_range` bounded to
-[1, 8192] (the shader computes `(2r+1)²` and `x±r` in int32),
-`extractor_exp` to [-126, 127], `num_streams` to 1..32, `sigma` rejects
-NaN/inf, and the request policy is `rpGeneral` whenever `radius > 0`.
-
-**2026-09-16 — same-queue timeline ordering.** A reader's aggregation
-device-waits on the timelines of the streams that filled its result slots; on a
-shared queue that wait can sit in the FIFO ahead of the submit that signals it,
-which RADV does not run past. Each frame now publishes its estimation *seq*
-under `cache_lock` and the reader host-waits for the writers' **submission**
-(not completion) before submitting its aggregation. No hang was reproduced on
-this box; it is an ordering invariant, covered by
-`test_bm3dv2_seek_collision_single_queue`.
-
-**2026-09-16 — fp32 aggregation, sigma skip, gputrace gating.** `bm3d_agg.comp`
-divided in `double` for no reason any reference shares (1/16 rate on RDNA3, and
-a hard `shaderFloat64` requirement); now fp32. `sigma[0] < FLT_EPSILON` passes
-the plane through instead of dispatching, which also removes the 0/0 Wiener
-coefficient (`sigma=0` used to emit NaN). `d->gpu_trace` is cached at creation
-so `VSFEEL_BM3D_GPUTRACE` set after creation cannot record into a null pool.
-
-**2026-09-16 — frame error path.** A failed frame used to hand its stream back
-with GPU work in flight, letting a successor re-record the command buffers and
-reuse cache slots the running kernels still read. The error path now drains the
-queue under its lock and resets the fence, and host-signals the timeline only
-when no estimation was submitted.
+- **2026-09-16 — creation safety.** Reject an estimate stack past the kernel's
+  signed 32-bit `res` addressing (`res_cap * tw * 2 * pe`; 4K r=4 ns=4 is
+  11.7 GiB), require a known positive frame count, and flush `NOSEARCH`'s
+  synthetic group instead of letting the aggregation read uninitialized LDS
+  (`test_bm3dv2_nosearch_matches_search_on_constant_clip`).
+- **2026-09-16 — parameter validation.** `bm_range`/`ps_range` [1, 8192]
+  (int32 `(2r+1)²`), `extractor_exp` [-126, 127], `num_streams` 1..32, `sigma`
+  rejects NaN/inf, `rpGeneral` whenever `radius > 0`.
+- **2026-09-16 — same-queue timeline ordering.** A reader device-waits on the
+  timelines of the streams that filled its result slots, and on a shared queue
+  that wait can sit in the FIFO ahead of the signal RADV will not run past; each
+  frame now publishes its estimation *seq* under `cache_lock` and the reader
+  host-waits for the writers' **submission** before submitting its aggregation
+  (`test_bm3dv2_seek_collision_single_queue`).
+- **2026-09-16 — fp32 aggregation, sigma skip, gputrace gating.** `bm3d_agg`
+  divided in `double` (1/16 rate, hard `shaderFloat64` need); `sigma[0] <
+  FLT_EPSILON` passes the plane through, which removes the 0/0 Wiener NaN;
+  `gpu_trace` cached at creation.
+- **2026-09-16 — frame error path.** A failed frame handed its stream back with
+  GPU work in flight, so a successor could re-record the buffers and reuse slots
+  the running kernels read; the error path now drains the queue and resets the
+  fence.
 
 **2026-09-19 — ReBAR upload staging (+4.6%).** Per-stream staging moved from
 GTT to `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`, so the CPU writes VRAM and
@@ -230,23 +217,17 @@ PS_NUM-depth list is exact (same (e, sq) merge order), and the packing and
 unrolling are order-preserving. `test_bm3dv2_matches_reference` spans
 radius 0..4 against vszipcl at the documented tolerances.
 
-**2026-09-20 — runs without buffer float atomics (BM3D was AMD-RDNA3-only).**
-RADV sets `shaderBufferFloat32AtomicAdd = gfx_level >= GFX11`
-(`src/amd/vulkan/radv_physical_device.c`) and AMD's Windows driver does not
-report it on Polaris either, so BM3D failed creation with
-"shaderBufferFloat32AtomicAdd is not supported by this device" on every older
-card — RX 580, Vega, RDNA1/2 alike, on both platforms. `bm3d.comp` now has a
-`-DNO_FLOAT_ATOMICS` build (`bm3d_cas.spv`, chosen when the feature is missing,
-forced with `VSFEEL_BM3D_CAS=1`) whose two aggregate stores call a `res_add`
-that runs the CAS loop zipcl's own `atom_add_f` has always used — core
-`atomicCompSwap` only, no extension, so nothing about it is RADV- or
-Linux-specific. Not a semantic change: one fp32 add per round, so at
-`extractor_exp=8` the two builds are bit-identical on the noise clip and 75/75
-BM3D tests (+110 tests in the
-streams/resources/geometry/lifecycle/validation/python_backend files) pass on
-each. Cost, 1000f 1080p GRAY32 r=2 ns=2 interleaved pairs on the 7900XTX:
-314.8/312.5/314.9 fps (hardware) vs 260.0/260.4/259.8 fps (CAS), i.e. +0.66 ms
-per frame or ~17% — the fallback is a device-support path, not a tuning knob.
+**2026-09-20 — runs where buffer float atomics are missing (BM3D was
+AMD-RDNA3-only).** RADV gates `shaderBufferFloat32AtomicAdd` at GFX11
+(`radv_physical_device.c`) and the Windows driver has no such feature on
+Polaris, so BM3D refused creation — RX 580, Vega, RDNA1/2 alike. `bm3d.comp`
+gained a `-DNO_FLOAT_ATOMICS` build (`bm3d_cas.spv`, auto-selected, forced with
+`VSFEEL_BM3D_CAS=1`) whose aggregate stores run the CAS loop zipcl's own
+`atom_add_f` has always used: core `atomicCompSwap` only, so nothing about it is
+driver-specific, and one fp32 add per round keeps it bit-identical to the
+hardware path at `extractor_exp=8` (75/75 BM3D tests either way). Cost, 1000f
+1080p GRAY32 r=2 ns=2 interleaved pairs: 314.8/312.5/314.9 (hardware) vs
+260.0/260.4/259.8 (CAS) fps, +0.66 ms/frame or ~17%.
 
 **2026-09-20 — the estimate cache now sizes to its working set (default), not
 the working set plus a window of seek slack.** `res_cap` was
@@ -256,6 +237,15 @@ on an 8 GiB card failed to allocate because of them. Dropping the margin is
 -36..41% of total VRAM at no in-order cost, so it became the default;
 `VSFEEL_BM3D_CACHE=1` restores it for seek/scrub-heavy graphs, where a warm
 slot beats blocking in the acquire. Numbers in the VRAM paragraph.
+
+**2026-09-20 — the ReBAR probe now tests the heap, not the memory type.**
+`DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` also exists without Resizable BAR,
+backed by the PCIe aperture (typically 256 MiB) instead of VRAM, so staging
+taken from it failed with `VK_ERROR_OUT_OF_DEVICE_MEMORY` while VRAM was empty
+(RX 580/Windows, 1080p r=2, both passes). `rebar_available(dev, bytes)` gates on
+the backing heap size, then probes the whole per-instance staging once before
+the stream loop and falls back to GTT; no change on the DB machine (type 3 is in
+the 24 GiB device-local heap).
 
 ## Open work
 

@@ -1115,7 +1115,7 @@ static void VS_CC BM3DCreate(
     d->gpu_trace = env_flag("VSFEEL_BM3D_GPUTRACE") || env_flag("BM3D_GPUTRACE");
     // Cached too: the frame path must not pay a getenv (plus the legacy-name
     // fallback) for flags that are fixed per instance.
-    d->trace = env_flag("VSFEEL_BM3D_TRACE") || env_flag("BM3D_TRACE");
+    d->trace = vsfeel_debug_trace("VSFEEL_BM3D_TRACE") || env_flag("BM3D_TRACE");
     d->dump = env_flag("VSFEEL_BM3D_DUMP") || env_flag("BM3D_DUMP");
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
@@ -1543,9 +1543,6 @@ static void VS_CC BM3DCreate(
     uint32_t num_queues = resolve_queue_cap(d->num_streams,
         d->device->queue_count, "VSFEEL_BM3D_QUEUES", UINT32_MAX);
 
-    d->staging_direct =
-        env_int("VSFEEL_BM3D_HD", 1) != 0 && rebar_available(*d->device);
-
     // A record uploads [n-2r, n+2r] = 4r+1 slots (1 at radius 0); the ring is
     // only that large because several in-flight frames' windows are resident at
     // once. Sizing the staging like the ring wasted (num_streams-1) slots of
@@ -1558,6 +1555,21 @@ static void VS_CC BM3DCreate(
             static_cast<VkDeviceSize>(staging_slots) * clips * d->planes[0].pe +
             static_cast<VkDeviceSize>(plane) * d->src_size;
         staging_size = std::max(staging_size, slot_extent * 4);
+    }
+
+    // Host-direct upload: with a real ReBAR window the per-stream staging is
+    // mapped in VRAM, so the CPU writes it directly. Decided once, before the
+    // stream loop, and against the whole per-instance staging size: a card
+    // without Resizable BAR exposes the same memory type through a PCIe
+    // aperture too small to hold it, and there the allocation fails with the
+    // VRAM heap empty.
+    const bool hd_requested = env_int("VSFEEL_BM3D_HD", 1) != 0;
+    d->staging_direct = hd_requested &&
+        rebar_available(*d->device, staging_size * d->num_streams);
+    if (hd_requested && !d->staging_direct && vsfeel_device_info_enabled()) {
+        fprintf(stderr, "[bm3d] staging: %.0f MiB x %d streams does not fit "
+            "host-visible VRAM; using GTT\n",
+            static_cast<double>(staging_size) / (1024.0 * 1024.0), d->num_streams);
     }
 
     for (int i = 0; i < d->num_streams; ++i) {
@@ -1586,7 +1598,15 @@ static void VS_CC BM3DCreate(
                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT));
             if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
+                char msg[288];
+                snprintf(msg, sizeof(msg),
+                    "%s; upload staging is %.0f MiB per stream x %d streams%s",
+                    std::get<std::string>(result).c_str(),
+                    static_cast<double>(staging_size) / (1024.0 * 1024.0),
+                    d->num_streams,
+                    d->staging_direct ? " (set VSFEEL_BM3D_HD=0 for the GTT path)"
+                                      : "");
+                return set_error(msg);
             }
             stream.staging_mem = std::get<AllocatedMemory>(result).memory;
             stream.staging_type_index = std::get<AllocatedMemory>(result).type_index;
@@ -1720,7 +1740,7 @@ static void VS_CC BM3DCreate(
     // Per-instance VRAM budget. The shared buffers are reserved up front; the
     // per-stream staging/dst are what the stream count multiplies. Gated by an
     // env flag so a normal creation prints nothing.
-    if (env_flag("VSFEEL_BM3D_VRAM")) {
+    if (vsfeel_debug_flag("VSFEEL_BM3D_VRAM")) {
         const double mib = 1024.0 * 1024.0;
         const double shared = static_cast<double>(d->src_size + d->res_size_per_plane) * 4.0;
         const double per_stream =

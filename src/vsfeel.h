@@ -83,7 +83,7 @@ inline const char * env_str(const char * env) {
 }
 
 // ---------------------------------------------------------------------------
-// Error tracing (VSFEEL_TRACE)
+// Debug switches (VSFEEL_DEBUG, VSFEEL_TRACE)
 // ---------------------------------------------------------------------------
 //
 // One switch for the whole plugin: every error a filter reports is echoed to
@@ -92,12 +92,38 @@ inline const char * env_str(const char * env) {
 // fail too -- the first line is the informative one and the rest are a
 // cascade. Create-time errors print `create` in place of a frame number.
 //
-// VSFEEL_TRACE=1 stops after 50 lines, =2 prints every one. The device banner
-// is printed under this switch as well, because which GPU and driver a failure
-// came from is part of the report.
+// **VSFEEL_DEBUG is the one to give a bug reporter**, and it takes a level:
+// `=1` prints the one-shot diagnostics (device banner, capability and heap
+// dump, creation banners, fallback notices, the full error trace), `=2` adds
+// the per-filter frame-path traces, which print several lines per frame.
+// VSFEEL_TRACE is the trace alone (1 = first 50 lines, 2 = every line), and the
+// per-filter names turn on one filter alone. Performance probes (TIMING,
+// GPUTRACE) stay explicit: they measure, they do not diagnose.
+
+inline int vsfeel_debug_level() {
+    static const int level = [] {
+        // VSFEEL_DBG is the pre-rename spelling, kept working for one release.
+        const char * v = std::getenv("VSFEEL_DEBUG");
+        if (!v || !*v) {
+            v = std::getenv("VSFEEL_DBG");
+        }
+        if (!v || !*v || std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0) {
+            return 0;
+        }
+        return std::strcmp(v, "2") == 0 ? 2 : 1;
+    }();
+    return level;
+}
+
+inline bool vsfeel_debug_enabled() {
+    return vsfeel_debug_level() > 0;
+}
 
 inline int vsfeel_trace_level() {
     static const int level = [] {
+        if (vsfeel_debug_enabled()) {
+            return 2;
+        }
         const char * v = std::getenv("VSFEEL_TRACE");
         if (!v || !*v || std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0) {
             return 0;
@@ -113,8 +139,20 @@ inline bool vsfeel_trace_enabled() {
 
 // The device banner and the capability lines: also on under VSFEEL_TRACE.
 inline bool vsfeel_device_info_enabled() {
-    static const bool on = env_flag("VSFEEL_DBG") || vsfeel_trace_enabled();
+    static const bool on = vsfeel_debug_enabled() || vsfeel_trace_enabled();
     return on;
+}
+
+// A per-filter one-shot diagnostic (creation banner, fallback notice): the
+// filter-specific name turns that one on, VSFEEL_DEBUG does at level 1.
+inline bool vsfeel_debug_flag(const char * specific) {
+    return vsfeel_debug_enabled() || env_flag(specific);
+}
+
+// A per-filter frame-path trace: several lines per frame, so it needs
+// VSFEEL_DEBUG=2 or the filter-specific name.
+inline bool vsfeel_debug_trace(const char * specific) {
+    return vsfeel_debug_level() >= 2 || env_flag(specific);
 }
 
 struct VK_Device;
@@ -462,7 +500,7 @@ inline std::variant<VkShaderModule, std::string> create_shader_module(
 // REQUIRE_FULL_SUBGROUPS_BIT when the device exposes the feature.
 // `entries`/`values`/`values_size` describe the spec-constant block exactly as
 // VkSpecializationInfo would; entries == nullptr means no specialization.
-// `tag` only names the shader in the VSFEEL_DBG banner.
+// `tag` only names the shader in the VSFEEL_DEBUG banner.
 inline std::variant<VkPipeline, std::string> create_compute_pipeline(
     const VK_Device & dev, VkShaderModule module, VkPipelineLayout layout,
     const VkSpecializationMapEntry * entries, const void * values,
@@ -474,7 +512,7 @@ inline std::variant<VkPipeline, std::string> create_compute_pipeline(
         values = nullptr;
         values_size = 0;
     }
-    if (env_flag("VSFEEL_DBG")) {
+    if (vsfeel_debug_enabled()) {
         fprintf(stderr, "[vsfeel] pipeline %s subgroup=%u spec=%u\n",
             tag, required_subgroup_size, entry_count);
     }
@@ -636,22 +674,48 @@ struct AllocatedMemory {
 std::variant<AllocatedMemory, std::string> allocate_memory(
     const VK_Device & dev, VkBuffer buffer, VkMemoryPropertyFlags required);
 
-// Host-visible device-local memory (the ReBAR window) exists: the CPU can write
-// a buffer the kernels read without an H2D copy. A device property, so a filter
-// can decide its upload path once at creation. allocate_memory never relaxes
-// DEVICE_LOCAL|HOST_VISIBLE away, so requesting these flags either succeeds on
-// this type or fails cleanly.
-inline bool rebar_available(const VK_Device & dev) {
+// Can `bytes` actually be allocated from host-visible device-local memory (the
+// direct-upload path)? The memory *type* is not the answer: a card without
+// Resizable BAR still exposes DEVICE_LOCAL|HOST_VISIBLE, backed by the PCIe
+// aperture instead of VRAM, and a staging buffer bigger than that aperture
+// fails with VK_ERROR_OUT_OF_DEVICE_MEMORY while the VRAM heap sits empty.
+// So gate on the heap size and then on a real allocation of the whole request,
+// freed at once. allocate_memory never relaxes DEVICE_LOCAL|HOST_VISIBLE away,
+// so a caller that takes this path has to be sure it fits up front.
+inline bool rebar_available(const VK_Device & dev, VkDeviceSize bytes) {
     constexpr VkMemoryPropertyFlags flags =
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t type = 0;
+    bool found = false;
     for (uint32_t i = 0; i < dev.mem_props.memoryTypeCount; ++i) {
         if ((dev.mem_props.memoryTypes[i].propertyFlags & flags) == flags) {
-            return true;
+            type = i;
+            found = true;
+            break;
         }
     }
-    return false;
+    if (!found) {
+        return false;
+    }
+    bytes = std::max<VkDeviceSize>(bytes, 4);
+    const uint32_t heap = dev.mem_props.memoryTypes[type].heapIndex;
+    if (dev.mem_props.memoryHeaps[heap].size < bytes) {
+        return false;
+    }
+    VkMemoryAllocateInfo info {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = nullptr,
+        .allocationSize = bytes,
+        .memoryTypeIndex = type
+    };
+    VkDeviceMemory memory;
+    if (vkAllocateMemory(dev.device, &info, nullptr, &memory) != VK_SUCCESS) {
+        return false;
+    }
+    vkFreeMemory(dev.device, memory, nullptr);
+    return true;
 }
 
 // Buffer handle with no memory bound yet. `size` is forced non-zero because

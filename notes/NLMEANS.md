@@ -50,6 +50,9 @@ Status: **shipped.** Verified against `src/nlmeans.{cpp,comp}` and
 
 ## Historical
 
+- **2026-09-20 — the staging ReBAR path is taken only if the heap can hold the
+  allocation** (no change on this box). Same mechanism as `notes/BM3D.md`.
+
 ### 2026-09-20 — dead pad/finish kernels deleted; pipeline creation was not the wall
 
 `ENTRY_PAD` and `ENTRY_FINISH`, their modules/pipelines and the

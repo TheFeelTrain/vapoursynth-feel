@@ -351,7 +351,7 @@ static const VSFrame *VS_CC BilateralGetFrame(
             // Host phase probe (VSFEEL_BILAT_TRACE): accumulated microsecond
             // stage timings, reported as averages every 200 frames. Zero
             // overhead when unset (no clock reads, no atomic traffic).
-            static const bool trace = env_flag("VSFEEL_BILAT_TRACE");
+            static const bool trace = vsfeel_debug_trace("VSFEEL_BILAT_TRACE");
             static std::atomic<uint64_t> t_up {}, t_wait {}, t_dl {}, t_bit {}, t_sub {}, t_acq {};
             static std::atomic<uint32_t> t_nf {};
             static std::atomic<int> t_inf {}, t_peak {};
