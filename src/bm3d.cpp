@@ -362,7 +362,12 @@ static void acquire_cache(BM3DData * d, Bm3dStream & stream, int n, uint64_t seq
             stream.win_writer_stream[i] = d->res_writer_stream[slot];
             stream.win_writer_sem[i] = d->res_writer_sem[slot];
             stream.win_writer_value[i] = d->res_writer_value[slot];
-            if (d->res_frame[slot] != m && !d->res_holders[slot].empty()) {
+            // A clamped window maps several positions onto one slot, so this
+            // must be decided from the state *before* phase 2 mutates it: the
+            // later positions would otherwise look cached and keep the stale
+            // writer of the slot's previous contents as a dependency.
+            stream.win_recompute[i] = (d->res_frame[slot] != m);
+            if (stream.win_recompute[i] && !d->res_holders[slot].empty()) {
                 ok = false;   // slot in use by an in-flight frame
                 break;
             }
@@ -389,15 +394,16 @@ static void acquire_cache(BM3DData * d, Bm3dStream & stream, int n, uint64_t seq
         for (int i = 0; i < d->tw; ++i) {
             const int m = std::clamp(n - r + i, 0, nf - 1);
             const int slot = stream.win_slots[i];
-            if (d->res_frame[slot] != m) {
-                d->res_frame[slot] = m;
-                d->res_writer[slot] = n;
-                d->res_writer_stream[slot] = stream.stream_id;
-                d->res_writer_sem[slot] = stream.timeline;
-                d->res_writer_value[slot] = seq;
-                stream.win_recompute[i] = true;
-                // this frame overwrites the slot itself, so the previous
-                // writer's contents (and its dependency) no longer matter
+            if (stream.win_recompute[i]) {
+                if (d->res_frame[slot] != m) {   // first position mapping here
+                    d->res_frame[slot] = m;
+                    d->res_writer[slot] = n;
+                    d->res_writer_stream[slot] = stream.stream_id;
+                    d->res_writer_sem[slot] = stream.timeline;
+                    d->res_writer_value[slot] = seq;
+                }
+                // every position that maps here drops the previous writer's
+                // dependency: this frame overwrites the slot's contents
                 stream.win_writers[i] = -1;
                 stream.win_writer_stream[i] = -1;
                 stream.win_writer_sem[i] = VK_NULL_HANDLE;
