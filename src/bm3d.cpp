@@ -172,6 +172,10 @@ struct BM3DData {
     // Cached at creation: the timestamp query pool only exists when the env
     // var was set then, so recording must not be driven by a frame-time getenv.
     bool gpu_trace { false };
+    // Trace/dump flags are read once: the frame path used to call getenv (and
+    // the legacy-name fallback) sixteen times per frame on the default path.
+    bool trace { false };
+    bool dump { false };
     std::atomic<uint64_t> ht_take_ns {}, ht_acquire_ns {}, ht_upload_ns {},
         ht_record_ns {}, ht_srcwait_ns {}, ht_agg_ns {}, ht_fence_ns {},
         ht_down_ns {}, ht_total_ns {}, ht_n {};
@@ -520,7 +524,7 @@ static int record_bm3d_kernels(BM3DData * d, Bm3dStream & stream, int n,
         const int m_i = std::clamp(n - r + i, 0, nf - 1);
         const int slot = stream.win_slots[i];
         n_dispatches++;
-        if (env_flag("VSFEEL_BM3D_DUMP") || env_flag("BM3D_DUMP")) fprintf(stderr, "[d] n=%d computes slot %d for frame %d\n", n, slot, m_i);
+        if (d->dump) fprintf(stderr, "[d] n=%d computes slot %d for frame %d\n", n, slot, m_i);
         for (int plane = 0; plane < d->n_planes; ++plane) {
             const auto & p = d->planes[plane];
             const VkDeviceSize pe = p.pe;
@@ -712,10 +716,10 @@ static const VSFrame *VS_CC BM3DGetFrame(
         vsfeel_trace_mark("pool");
         auto t1 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
-        if (env_flag("VSFEEL_BM3D_TRACE") || env_flag("BM3D_TRACE")) fprintf(stderr, "[t] n=%d acquired\n", n);
+        if (d->trace) fprintf(stderr, "[t] n=%d acquired\n", n);
         const int my_stream = stream.stream_id;
         const uint64_t my_seq = stream.seq++;
-        if (env_flag("VSFEEL_BM3D_TRACE") || env_flag("BM3D_TRACE")) fprintf(stderr, "[t] n=%d stream=%d\n", n, my_stream);
+        if (d->trace) fprintf(stderr, "[t] n=%d stream=%d\n", n, my_stream);
         // set once the estimation command buffer has been queued; from then on
         // the stream has work in flight that the error path must drain.
         bool estimation_submitted = false;
@@ -845,7 +849,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
         const int ndisp = record_bm3d_kernels(d, stream, n, uploaded);
         auto t4 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
-        if (env_flag("VSFEEL_BM3D_TRACE") || env_flag("BM3D_TRACE")) fprintf(stderr, "[t] n=%d kernels recorded\n", n);
+        if (d->trace) fprintf(stderr, "[t] n=%d kernels recorded\n", n);
 
         // Cross-frame dependencies are expressed on the writers' per-stream
         // timelines, signalled device-side by each writer's kernel submit. A
@@ -889,7 +893,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
                 if (sem == stream.timeline) {
                     continue;   // same stream: already queue-ordered
                 }
-                if (env_flag("VSFEEL_BM3D_TRACE") || env_flag("BM3D_TRACE")) fprintf(stderr, "[t] n=%d waits on src uploader w=%d val=%llu\n", n, w, static_cast<unsigned long long>(stream.src_writer_value[f - src_lo]));
+                if (d->trace) fprintf(stderr, "[t] n=%d waits on src uploader w=%d val=%llu\n", n, w, static_cast<unsigned long long>(stream.src_writer_value[f - src_lo]));
                 add_wait(src_waits, src_values, sem, stream.src_writer_value[f - src_lo]);
             }
             for (int i = 0; i < d->tw; ++i) {
@@ -901,7 +905,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
                 if (sem == stream.timeline) {
                     continue;   // same stream: already queue-ordered
                 }
-                if (env_flag("VSFEEL_BM3D_TRACE") || env_flag("BM3D_TRACE")) fprintf(stderr, "[t] n=%d waits on writer w=%d val=%llu\n", n, w, static_cast<unsigned long long>(stream.win_writer_value[i]));
+                if (d->trace) fprintf(stderr, "[t] n=%d waits on writer w=%d val=%llu\n", n, w, static_cast<unsigned long long>(stream.win_writer_value[i]));
                 add_wait(res_waits, res_values, sem, stream.win_writer_value[i]);
             }
         }
@@ -949,7 +953,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
                                  : std::chrono::steady_clock::time_point {};
 
         record_bm3d_agg(d, stream, n);
-        if (env_flag("VSFEEL_BM3D_TRACE") || env_flag("BM3D_TRACE")) fprintf(stderr, "[t] n=%d agg recorded\n", n);
+        if (d->trace) fprintf(stderr, "[t] n=%d agg recorded\n", n);
 
         // The aggregation device-waits on the estimate-stack writers'
         // timelines. On a queue shared by several streams, a submit that waits
@@ -998,7 +1002,7 @@ static const VSFrame *VS_CC BM3DGetFrame(
         checkVK(vkWaitForFences(dev, 1, &stream.fence, VK_TRUE, UINT64_MAX));
         auto t7 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
-        if (env_flag("VSFEEL_BM3D_TRACE") || env_flag("BM3D_TRACE")) fprintf(stderr, "[t] n=%d fenced\n", n);
+        if (d->trace) fprintf(stderr, "[t] n=%d fenced\n", n);
 
         // hand the cache slots back only after the aggregation has completed:
         // the slots are shared with the other streams, and on a device with
@@ -1013,15 +1017,21 @@ static const VSFrame *VS_CC BM3DGetFrame(
             if (vkGetQueryPoolResults(dev, stream.ts_query, 0, 4,
                     sizeof(ts), ts, sizeof(uint64_t),
                     VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
-                const float period = d->device->limits.timestampPeriod;
+                const double period = d->device->limits.timestampPeriod;  // ns/tick
                 // fetch_add returns the previous count: the first completed
                 // frame is sample 1, not 0 (dividing by 0 printed garbage)
                 uint32_t nq = ts_nf.fetch_add(1) + 1;
-                if (ts[0] && ts[1]) ts_k += (ts[1] - ts[0]) * period;
-                if (ts[2] && ts[3]) ts_a += (ts[3] - ts[2]) * period;
+                // accumulate whole nanoseconds: the 1e3 divisor below made the
+                // printed "ms" a microsecond figure
+                const auto ns = [period](uint64_t a, uint64_t b) {
+                    return static_cast<uint64_t>(
+                        std::llround(static_cast<double>(b - a) * period));
+                };
+                if (ts[0] && ts[1]) ts_k += ns(ts[0], ts[1]);
+                if (ts[2] && ts[3]) ts_a += ns(ts[2], ts[3]);
                 if (nq % 50 == 0) {
                     fprintf(stderr, "[bm3dgpu] n=%u kernel=%.3f agg=%.3f (ms) disp=%d\n",
-                        nq, ts_k.load() / double(nq) / 1e3, ts_a.load() / double(nq) / 1e3, ndisp);
+                        nq, ts_k.load() / double(nq) / 1e6, ts_a.load() / double(nq) / 1e6, ndisp);
                 }
             }
         }
@@ -1102,6 +1112,10 @@ static void VS_CC BM3DCreate(
     // The timestamp pool is created only when this is set, so every later
     // recording/readback must use the cached flag, not a frame-time getenv.
     d->gpu_trace = env_flag("VSFEEL_BM3D_GPUTRACE") || env_flag("BM3D_GPUTRACE");
+    // Cached too: the frame path must not pay a getenv (plus the legacy-name
+    // fallback) for flags that are fixed per instance.
+    d->trace = env_flag("VSFEEL_BM3D_TRACE") || env_flag("BM3D_TRACE");
+    d->dump = env_flag("VSFEEL_BM3D_DUMP") || env_flag("BM3D_DUMP");
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
@@ -1152,6 +1166,12 @@ static void VS_CC BM3DCreate(
     // enabled).
     if (d->vi->width < 8 || d->vi->height < 8) {
         return set_error("clip dimensions must be at least 8x8");
+    }
+
+    // The scan lists pack a candidate's (x, y) into one 32-bit word (16 + 15
+    // bits) so the top-8 insert shifts three arrays instead of four.
+    if (d->vi->width > 0xFFFF || d->vi->height > 0x7FFF) {
+        return set_error("clip dimensions must not exceed 65535x32767");
     }
 
     // The window clamps and the cache keys assume [0, numFrames-1]; an empty
@@ -1243,7 +1263,11 @@ static void VS_CC BM3DCreate(
 
     d->num_streams = vsh::int64ToIntS(vsapi->mapGetInt(in, "num_streams", 0, &error));
     if (error) {
-        d->num_streams = 4;
+        // Two in-flight frames already saturate the GPU (the frame is kernel
+        // bound; 4 costs ~1% only at vspipe's ~32-request default and is
+        // slower at a shallow 1-3 request consumer) and the estimate stack
+        // scales with the count, so 2 saves 332 MiB at 1080p r=2.
+        d->num_streams = 2;
     }
     if (d->num_streams < 1 || d->num_streams > 32) {
         return set_error("\"num_streams\" must be 1..32");
@@ -1481,7 +1505,7 @@ static void VS_CC BM3DCreate(
         }
         p.bm3d_grid_x = static_cast<uint32_t>((p.width + 4 * d->block_step - 1) / (4 * d->block_step));
         p.bm3d_grid_y = static_cast<uint32_t>((p.height + d->block_step - 1) / d->block_step);
-        p.agg_grid_x = static_cast<uint32_t>((p.width + 31) / 32);
+        p.agg_grid_x = static_cast<uint32_t>((p.stride + 127) / 128);
         p.agg_grid_y = static_cast<uint32_t>((p.height + 7) / 8);
     }
 
@@ -1497,10 +1521,23 @@ static void VS_CC BM3DCreate(
     d->staging_direct =
         env_int("VSFEEL_BM3D_HD", 1) != 0 && rebar_available(*d->device);
 
+    // A record uploads [n-2r, n+2r] = 4r+1 slots (1 at radius 0); the ring is
+    // only that large because several in-flight frames' windows are resident at
+    // once. Sizing the staging like the ring wasted (num_streams-1) slots of
+    // host-visible VRAM per stream without ever being written.
+    const int clips = d->final ? 2 : 1;
+    const int staging_slots = (d->radius == 0) ? 1 : 4 * d->radius + 1;
+    VkDeviceSize staging_size = 0;
+    for (int plane = 0; plane < d->n_planes; ++plane) {
+        const VkDeviceSize slot_extent =
+            static_cast<VkDeviceSize>(staging_slots) * clips * d->planes[0].pe +
+            static_cast<VkDeviceSize>(plane) * d->src_size;
+        staging_size = std::max(staging_size, slot_extent * 4);
+    }
+
     for (int i = 0; i < d->num_streams; ++i) {
         Bm3dStream stream;
 
-        VkDeviceSize staging_size = d->src_size * 4;
         {
             VkBufferCreateInfo buffer_info {
                 .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -1653,6 +1690,27 @@ static void VS_CC BM3DCreate(
         stream.stream_id = i;
 
         d->pool.push(std::move(stream));
+    }
+
+    // Per-instance VRAM budget. The shared buffers are reserved up front; the
+    // per-stream staging/dst are what the stream count multiplies. Gated by an
+    // env flag so a normal creation prints nothing.
+    if (env_flag("VSFEEL_BM3D_VRAM")) {
+        const double mib = 1024.0 * 1024.0;
+        const double shared = static_cast<double>(d->src_size + d->res_size_per_plane) * 4.0;
+        const double per_stream =
+            static_cast<double>(staging_size + d->dst_size * 4);
+        const double res_only = static_cast<double>(d->res_size_per_plane) * 4.0;
+        fprintf(stderr,
+            "[bm3d] vram: src=%.1f MiB res=%.1f MiB (%.0f%% of total), "
+            "per-stream staging=%.1f MiB dst=%.1f MiB -> total=%.1f MiB "
+            "(radius=%d num_streams=%d res_cap=%d src_ring=%d)\n",
+            static_cast<double>(d->src_size) * 4.0 / mib, res_only / mib,
+            100.0 * res_only / (shared + per_stream * d->num_streams),
+            static_cast<double>(staging_size) / mib,
+            static_cast<double>(d->dst_size) * 4.0 / mib,
+            (shared + per_stream * d->num_streams) / mib,
+            d->radius, d->num_streams, d->res_cap, d->src_ring);
     }
 
     d->src_frame.assign(d->src_ring, -1);

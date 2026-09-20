@@ -275,23 +275,73 @@ float reduce_cols(const float col[8]) {
     return ((col[0] + col[1]) + (col[2] + col[3])) + ((col[4] + col[5]) + (col[6] + col[7]));
 }
 
-void insert8(inout float e[8], inout int xs[8], inout int ys[8], inout int sq[8],
+// The candidate's (x, y) pair travels packed in one word: the insert shifts one
+// array per position, and folding x and y into a single word makes that three
+// arrays instead of four.
+const int XY_SHIFT = 16;
+int pack_xy(int cx, int cy) { return (cx & 0xFFFF) | (cy << XY_SHIFT); }
+
+// `depth` is a compile-time constant at every call site: the spatial search
+// needs all 8 group members, while a temporal per-window list is only ever
+// consumed down to its top PS_NUM entries (merge_group is asked for PS_NUM,
+// and the window centres read back only the first PS_NUM). A depth-PS_NUM list
+// makes the insert shift one element instead of seven and holds six registers
+// instead of twenty-four.
+void insertN(int depth, inout float e[8], inout int xy[8], inout int sq[8],
              float err_, int cx_, int cy_, int cs_) {
-    if (err_ < e[7]) {
-        int pos = 8;
-        for (int k = 7; k >= 0; --k) {
+    if (err_ < e[depth - 1]) {
+        const int xy_ = pack_xy(cx_, cy_);
+        int pos = depth;
+        for (int k = depth - 1; k >= 0; --k) {
             pos = (err_ < e[k]) ? k : pos;
         }
-        for (int k = 7; k >= 1; --k) {
+        for (int k = depth - 1; k >= 1; --k) {
             e[k]  = (k == pos) ? err_ : ((k > pos) ? e[k - 1] : e[k]);
-            xs[k] = (k == pos) ? cx_ : ((k > pos) ? xs[k - 1] : xs[k]);
-            ys[k] = (k == pos) ? cy_ : ((k > pos) ? ys[k - 1] : ys[k]);
+            xy[k] = (k == pos) ? xy_ : ((k > pos) ? xy[k - 1] : xy[k]);
             sq[k] = (k == pos) ? cs_ : ((k > pos) ? sq[k - 1] : sq[k]);
         }
         e[0]  = (pos == 0) ? err_ : e[0];
-        xs[0] = (pos == 0) ? cx_ : xs[0];
-        ys[0] = (pos == 0) ? cy_ : ys[0];
+        xy[0] = (pos == 0) ? xy_ : xy[0];
         sq[0] = (pos == 0) ? cs_ : sq[0];
+    }
+}
+
+// Sliding-window scan of the candidate columns [left..right] at row `cy`, in
+// the exact order the reference scans them (so the top-8 tie-break by sequence
+// index is unchanged). Four columns in flight: a single pending load would
+// stall the whole wave, and the previous candidate's insert is a long
+// dependency chain the next candidates' loads hide behind.
+void scan_row(int depth, const float cur[64], int base_idx, int cy, int left,
+              int right, int sq0, inout float pe[8], inout int pxy[8],
+              inout int ps[8]) {
+    float col[8];
+    for (int c = 0; c < 8; ++c) {
+        col[c] = col_ssd(cur, base_idx, cy, left + c, c);
+    }
+    insertN(depth, pe, pxy, ps, reduce_cols(col), left, cy, sq0);
+    int cx = left + 1;
+    for (; cx + 3 <= right; cx += 4) {
+        const float n0 = col_ssd(cur, base_idx, cy, cx + 7, 7);
+        const float n1 = col_ssd(cur, base_idx, cy, cx + 8, 7);
+        const float n2 = col_ssd(cur, base_idx, cy, cx + 9, 7);
+        const float n3 = col_ssd(cur, base_idx, cy, cx + 10, 7);
+        for (int c = 0; c < 7; ++c) col[c] = col[c + 1];
+        col[7] = n0;
+        insertN(depth, pe, pxy, ps, reduce_cols(col), cx, cy, sq0 + (cx - left));
+        for (int c = 0; c < 7; ++c) col[c] = col[c + 1];
+        col[7] = n1;
+        insertN(depth, pe, pxy, ps, reduce_cols(col), cx + 1, cy, sq0 + (cx - left) + 1);
+        for (int c = 0; c < 7; ++c) col[c] = col[c + 1];
+        col[7] = n2;
+        insertN(depth, pe, pxy, ps, reduce_cols(col), cx + 2, cy, sq0 + (cx - left) + 2);
+        for (int c = 0; c < 7; ++c) col[c] = col[c + 1];
+        col[7] = n3;
+        insertN(depth, pe, pxy, ps, reduce_cols(col), cx + 3, cy, sq0 + (cx - left) + 3);
+    }
+    for (; cx <= right; ++cx) {
+        for (int c = 0; c < 7; ++c) col[c] = col[c + 1];
+        col[7] = col_ssd(cur, base_idx, cy, cx + 7, 7);
+        insertN(depth, pe, pxy, ps, reduce_cols(col), cx, cy, sq0 + (cx - left));
     }
 }
 
@@ -315,12 +365,15 @@ void ginsert8(inout float e[8], inout int xs[8], inout int ys[8], inout int zs[8
     }
 }
 
-void merge_group64(int base, out float me[8], out int mx[8], out int my[8], out int ms[8]) {
+// `n` entries of the merged list are produced. The temporal searches only
+// consume the top PS_NUM, so they ask for that many and their lanes hold only
+// that many.
+void merge_group(int n, int base, out float me[8], out int mx[8], out int my[8], out int ms[8]) {
     const int lane = int(gl_LocalInvocationID.x);
     const int group = lane >> 3;
     int head[8];
     for (int l = 0; l < 8; ++l) head[l] = 0;
-    for (int k = 0; k < 8; ++k) {
+    for (int k = 0; k < n; ++k) {
         int bl = 0;
         int bh = 0;
         float be = FLT_MAX_;
@@ -328,8 +381,8 @@ void merge_group64(int base, out float me[8], out int mx[8], out int my[8], out 
         bool found = false;
         for (int l = 0; l < 8; ++l) {
             int hv = head[l];
-            bool valid = hv < 8;
-            int idx = base + l * 8 + (valid ? hv : 7);
+            bool valid = hv < n;
+            int idx = base + l * 8 + (valid ? hv : 0);
             float e = valid ? l_e[group][idx] : FLT_MAX_;
             int sq = valid ? l_s[group][idx] : INT_MAX_;
             bool better = valid && (!found || e < be || (e == be && sq < bs));
@@ -471,11 +524,10 @@ void main() {
     } else {
     {
         float pe[8];
-        int px[8], py[8], ps[8];
+        int pxy[8], ps[8];
         for (int k = 0; k < 8; ++k) {
             pe[k] = FLT_MAX_;
-            px[k] = 0;
-            py[k] = 0;
+            pxy[k] = 0;
             ps[k] = INT_MAX_;
         }
         const int left = max(x - BM_RANGE, 0);
@@ -489,18 +541,7 @@ void main() {
         // so there the exact stride-8 scan is kept instead.
         if (RADIUS < 3) {
             for (int cy = top + sub_lane_id; cy <= bottom; cy += 8) {
-                float col[8];
-                for (int c = 0; c < 8; ++c) {
-                    col[c] = col_ssd(cur, srcpc_base, cy, left + c, c);
-                }
-                insert8(pe, px, py, ps, reduce_cols(col), left, cy, (cy - top) * rw);
-                for (int cx = left + 1; cx <= right; ++cx) {
-                    for (int c = 0; c < 7; ++c) {
-                        col[c] = col[c + 1];
-                    }
-                    col[7] = col_ssd(cur, srcpc_base, cy, cx + 7, 7);
-                    insert8(pe, px, py, ps, reduce_cols(col), cx, cy, (cy - top) * rw + (cx - left));
-                }
+                scan_row(8, cur, srcpc_base, cy, left, right, (cy - top) * rw, pe, pxy, ps);
             }
         } else {
             const int total = (bottom - top + 1) * rw;
@@ -509,7 +550,7 @@ void main() {
             #pragma unroll 2
             for (int s = sub_lane_id; s < total; s += 8) {
                 const float error = ssd_err(cur, srcpc_base, col_i, row_i);
-                insert8(pe, px, py, ps, error, col_i, row_i, s);
+                insertN(8, pe, pxy, ps, error, col_i, row_i, s);
                 col_i += 8;
                 while (col_i > right) {
                     col_i -= rw;
@@ -520,13 +561,13 @@ void main() {
         barrier();
         for (int k = 0; k < 8; ++k) {
             l_e[group][sub_lane_id * 8 + k] = pe[k];
-            l_x[group][sub_lane_id * 8 + k] = px[k];
-            l_y[group][sub_lane_id * 8 + k] = py[k];
+            l_x[group][sub_lane_id * 8 + k] = pxy[k] & 0xFFFF;
+            l_y[group][sub_lane_id * 8 + k] = pxy[k] >> XY_SHIFT;
             l_s[group][sub_lane_id * 8 + k] = ps[k];
         }
         barrier();
         int gseq[8];
-        merge_group64(0, ge, gx, gy, gseq);
+        merge_group(8, 0, ge, gx, gy, gseq);
         for (int k = 0; k < 8; ++k) gz[k] = KRADIUS;
     }
 
@@ -558,11 +599,10 @@ void main() {
                 }
 
                 float pe[8];
-                int px[8], py[8], ps[8];
-                for (int k = 0; k < 8; ++k) {
+                int pxy[8], ps[8];
+                for (int k = 0; k < PS_NUM; ++k) {
                     pe[k] = FLT_MAX_;
-                    px[k] = 0;
-                    py[k] = 0;
+                    pxy[k] = 0;
                     ps[k] = INT_MAX_;
                 }
                 for (int i = 0; i < PS_NUM; ++i) {
@@ -574,18 +614,7 @@ void main() {
                     const int seq_base = i * ((2 * PS_RANGE + 1) * (2 * PS_RANGE + 1));
                     if (RADIUS < 3) {
                         for (int cy = top + sub_lane_id; cy <= bottom; cy += 8) {
-                            float col[8];
-                            for (int c = 0; c < 8; ++c) {
-                                col[c] = col_ssd(cur, temporal_srcpc, cy, left + c, c);
-                            }
-                            insert8(pe, px, py, ps, reduce_cols(col), left, cy, seq_base + (cy - top) * rw);
-                            for (int cx = left + 1; cx <= right; ++cx) {
-                                for (int c = 0; c < 7; ++c) {
-                                    col[c] = col[c + 1];
-                                }
-                                col[7] = col_ssd(cur, temporal_srcpc, cy, cx + 7, 7);
-                                insert8(pe, px, py, ps, reduce_cols(col), cx, cy, seq_base + (cy - top) * rw + (cx - left));
-                            }
+                            scan_row(PS_NUM, cur, temporal_srcpc, cy, left, right, seq_base + (cy - top) * rw, pe, pxy, ps);
                         }
                     } else {
                         const int total = (bottom - top + 1) * rw;
@@ -594,7 +623,7 @@ void main() {
                         #pragma unroll 2
                         for (int s = sub_lane_id; s < total; s += 8) {
                             const float error = ssd_err(cur, temporal_srcpc, col_i, row_i);
-                            insert8(pe, px, py, ps, error, col_i, row_i, seq_base + s);
+                            insertN(PS_NUM, pe, pxy, ps, error, col_i, row_i, seq_base + s);
                             col_i += 8;
                             while (col_i > right) {
                                 col_i -= rw;
@@ -605,21 +634,21 @@ void main() {
                 }
 
                 barrier();
-                for (int k = 0; k < 8; ++k) {
+                for (int k = 0; k < PS_NUM; ++k) {
                     l_e[group][sub_lane_id * 8 + k] = pe[k];
-                    l_x[group][sub_lane_id * 8 + k] = px[k];
-                    l_y[group][sub_lane_id * 8 + k] = py[k];
+                    l_x[group][sub_lane_id * 8 + k] = pxy[k] & 0xFFFF;
+                    l_y[group][sub_lane_id * 8 + k] = pxy[k] >> XY_SHIFT;
                     l_s[group][sub_lane_id * 8 + k] = ps[k];
                 }
                 barrier();
                 if (sub_lane_id == 0) {
                     float fe[8];
                     int fx[8], fy[8], fs[8];
-                    merge_group64(0, fe, fx, fy, fs);
+                    merge_group(PS_NUM, 0, fe, fx, fy, fs);
                     for (int i = 0; i < PS_NUM; ++i) {
                         ginsert8(ge, gx, gy, gz, fe[i], fx[i], fy[i], temporal_index);
                     }
-                    for (int k = 0; k < 8; ++k) {
+                    for (int k = 0; k < PS_NUM; ++k) {
                         l_x[group][k] = fx[k];
                         l_y[group][k] = fy[k];
                     }

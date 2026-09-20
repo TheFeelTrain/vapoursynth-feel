@@ -1,349 +1,270 @@
 # BM3Dv2 — notes
 
-Goal: `vsfeel.BM3Dv2` faster than the reference plugins on the target GPU
-(RX 7900 XTX, RDNA3, gfx1100, Mesa RADV), numerically faithful to vszipcl.
-This filter had no notes file until the 2026-09-16 correctness pass below, so
-nothing about it had been recorded; only the correctness work is written up
-here, no tuning has been done yet.
+**shipped.** Vulkan port of vszipcl's BM3D (fused mode: one estimation pass per
+output frame, temporal aggregation over the stack window). Numerically faithful
+to vszipcl; see the tolerance policy in `tests/test_bm3dv2.py`.
 
-## TL;DR (2026-09-16, correctness pass)
+Current design:
 
-Three creation/kernel-safety fixes. 43/43 tests pass. **No throughput claim**:
-nothing added is on the steady-state frame path, and the `NOSEARCH=0`
-specialization is unchanged (see the digest check at the bottom).
+- Two kernels: `bm3d.comp` (block match + group + collaborative transform,
+  one warp of 32 lanes = 4 sub-groups of 8 lanes, one 8x8 block each) and
+  `bm3d_agg.comp` (temporal aggregation over the TW = 2r+1 stack slices).
+- The spatial search scans the (2*bm_range+1)² window with a per-lane row
+  partition and a **sliding column-SSD window**; each sub-group lane keeps its
+  own top-8, which `merge_group` 8-way-merges.
+- Each temporal direction/t step scans PS_NUM PS_RANGE windows around the
+  previous step's matches. **Its per-lane list is only PS_NUM deep** — the merge
+  only ever consumes that many (`merge_group(PS_NUM, …)`) and only the first
+  PS_NUM entries are read back as the next centres, which is a provable
+  equivalence and the single largest win in this file (below).
+- The scan body is unrolled four candidates wide; the four new column loads
+  issue before any reduce/insert consumes them.
+- Degenerate paths: `sigma < FLT_EPSILON` passes the plane through (a source
+  copy), like the installed references' `PROC_MASK`.
+- Per-frame resources live in `FramePool<Bm3dStream>`; cross-frame handoff is
+  per-stream timeline semaphores plus `res_holders` reservation tokens.
+- Upload staging is host-visible VRAM (ReBAR) on the default path
+  (`VSFEEL_BM3D_HD=0` opts out), sized for the 4r+1 slots a record actually
+  uploads.
+- `num_streams` default **2**: the GPU saturates at two in-flight frames.
 
-1. Reject a configuration whose estimate-stack size exceeds the kernel's 32-bit
-   `res` addressing.
-2. Require a known, positive clip frame count.
-3. `BM3D_NOSEARCH` no longer consumes uninitialized shared memory.
+Performance — 1080p GRAY32, jpbd, `tools/benchmark.py -f bm3dv2 vsfeel vszipcl`,
+1000 frames × 3 interleaved, sigma 0.7, radius 2, bm_range 16, ps_range 7,
+block_step 4:
 
-## 1. `res` addressing overflows signed 32-bit at 4K / radius 4
+| | fps | GPU est. kernel | GPU agg | VRAM (r=2) |
+|---|---|---|---|---|
+| vsfeel | **313.7** (311-316 over runs; 313.6 at ns=4) | 2.86 ms | 0.33 ms | 1107 MiB |
+| vszipcl | 46.5 | — | — | — |
 
-**Mechanism.** The host pushes the per-slot base of the estimate stack as an
-`int32_t` (`record_bm3d_kernels`, `record_bm3d_agg`) and every `res[]` offset in
-`bm3d.comp` is computed in 32-bit `int`
-(`src_search`/`src_input` aside, the aggregation uses
-`rplane + offset + j * STRIDE`). The buffer itself is
-`res_cap * tw * 2 * pe` floats; once that reaches 2^31 the pushed base and the
-shader-side sums wrap, and a wrapped base is negative, so the fill and the
-atomic accumulation write outside the slot.
+Before this round the same command gave 190.5 fps at ns=4 (kernel 4.94 + agg
+0.33 ms). Speedup over vszipcl went 4.6x → 6.7x, absolute fps +65%.
 
-**Arithmetic.** `tw = 2r+1`, `res_cap = tw + num_streams + 2r` for `r > 0`.
+## Implementation notes that the code alone does not show
 
-| config | src_ring | res_cap | res floats | x 2^31 | buffer |
-|---|---|---|---|---|---|
-| 1080p r=4 ns=4 | 20 | 21 | 783 820 800 | 0.36 | 2.92 GiB |
-| 1080p r=4 ns=8 | 24 | 25 | 933 120 000 | 0.43 | 3.48 GiB |
-| 4K r=4 ns=4 | 20 | 21 | 3 135 283 200 | **1.46** | 11.68 GiB |
+- **The block-matching search is the whole filter.** At r=2/step 4 it is ~85%
+  of the estimation kernel; the collaborative transform + patch loads + all
+  133.8 M float atomics together are only ~0.4 ms/frame, and the zero-fill plus
+  the ring copies are ~0.1 ms. Nothing else is worth tuning (see the ablation
+  table under Historical).
+- **The aggregation is PCIe-bound, not work-bound.** Its time is ~0.32 ms at
+  TW = 1, 5 and 9 alike; the 8.3 MB result store goes to GTT over PCIe at
+  ~26 GB/s. Vectorising it to `vec4` (one thread per 4 columns) changes
+  nothing, so it is left vectorised purely for the lower instruction count.
+- **LDS is a trap for this kernel.** Three separate attempts to move
+  kernel-live data into shared memory (the resolved group, the per-lane scan
+  lists, the direction-invariant centres) all raised ACO's VGPR count from 216
+  to 240 and dropped occupancy from 7 to 6 waves/SIMD, losing 5-90%. The
+  mechanism is the dynamic LDS addressing, not the memory traffic. Do not
+  retry an LDS variant here; the win came from *reducing the data* (list depth,
+  packed coordinates) instead.
+- The 8-lane transposes and the group-8 reduction are `subgroupShuffleXor`
+  butterflies (register-only, no LDS, no barrier) and reproduce the
+  reference's exact reduction tree.
+- `extractor_exp`'s `(x + E) - E` pre-rounding must stay under GLSL `precise`:
+  RADV folds the pair to `x` when E is a known spec constant, which makes the
+  parameter inert (fixed, see Historical).
 
-The 4K cell allocates successfully on a 24 GiB card, which is why this is a
-silent-corruption bug rather than an allocation failure.
+## Historical
 
-**Fix.** Reject at creation after the plane geometry is known, before any GPU
-buffer is created:
-`res_cap * tw * 2 * pe > INT32_MAX` →
-`"frame is too large: the estimate cache needs N floats per plane (radius R,
-num_streams S), which overflows the 32-bit kernel addressing; reduce
-num_streams or radius"`.
+Chronological; each entry keeps the mechanism, not the story.
 
-**Measured (scratch scripts, `tmp/` is gitignored).** `tmp/bm3d_res_overflow.py`
-prints the table above and tries the three configs:
+**2026-09-16 — correctness pass (no steady-state perf change).** Three
+creation/kernel-safety fixes: reject a configuration whose estimate-stack size
+(`res_cap * tw * 2 * pe`) exceeds the kernel's signed 32-bit `res` addressing
+(4K r=4 ns=4 allocates 11.7 GiB and silently wrapped); require a known positive
+frame count; and make `BM3D_NOSEARCH` flush its synthetic group instead of
+letting the aggregation index uninitialized LDS. The last one is covered by
+`test_bm3dv2_nosearch_matches_search_on_constant_clip` (a constant clip's
+searched and no-search arms must agree to 1 ulp).
 
-- before: `4K radius=4 ns=4: created OK ... -> 2 frames`, `RESULT: overflow
-  config was accepted -> the guard is missing`
-- after: `4K radius=4 ns=4: Error: BM3D: frame is too large: ... overflows the
-  32-bit kernel addressing ...`, controls (1080p r=4 ns=4, 1080p r=2 ns=4,
-  1080p r=4 ns=8) still create, `RESULT: overflow config was rejected -> guard
-  active`
+**2026-09-16 — parameter validation.** `bm_range`/`ps_range` bounded to
+[1, 8192] (the shader computes `(2r+1)²` and `x±r` in int32),
+`extractor_exp` to [-126, 127], `num_streams` to 1..32, `sigma` rejects
+NaN/inf, and the request policy is `rpGeneral` whenever `radius > 0`.
 
-A permanent creation-time test covers the rejection
-(`test_bm3dv2_rejects_int32_res_overflow`); it is cheap because the guard runs
-before the buffers are allocated.
+**2026-09-16 — same-queue timeline ordering.** A reader's aggregation
+device-waits on the timelines of the streams that filled its result slots; on a
+shared queue that wait can sit in the FIFO ahead of the submit that signals it,
+which RADV does not run past. Each frame now publishes its estimation *seq*
+under `cache_lock` and the reader host-waits for the writers' **submission**
+(not completion) before submitting its aggregation. No hang was reproduced on
+this box; it is an ordering invariant, covered by
+`test_bm3dv2_seek_collision_single_queue`.
 
-## 2. Unknown / empty clip length
+**2026-09-16 — fp32 aggregation, sigma skip, gputrace gating.** `bm3d_agg.comp`
+divided in `double` for no reason any reference shares (1/16 rate on RDNA3, and
+a hard `shaderFloat64` requirement); now fp32. `sigma[0] < FLT_EPSILON` passes
+the plane through instead of dispatching, which also removes the 0/0 Wiener
+coefficient (`sigma=0` used to emit NaN). `d->gpu_trace` is cached at creation
+so `VSFEEL_BM3D_GPUTRACE` set after creation cannot record into a null pool.
 
-**Mechanism.** `nframes` is used as `std::clamp(v, 0, nframes - 1)` in
-`acquire_cache`, `release_cache` and the frame path, and the ring tables are
-indexed by `f % src_ring`. With `numFrames <= 0`, `clamp` returns `-2` (or
-`-1`), and `slot = f % src_ring` is negative, so `src_frame[slot]` /
-`src_holders[slot]` index before the base — host heap UB, and a negative
-`src_slot` can reach the shader.
+**2026-09-16 — frame error path.** A failed frame used to hand its stream back
+with GPU work in flight, letting a successor re-record the command buffers and
+reuse cache slots the running kernels still read. The error path now drains the
+queue under its lock and resets the fence, and host-signals the timeline only
+when no estimation was submitted.
 
-**Finding: this state is unreachable on current VapourSynth.** The core rejects
-any filter whose `VSVideoInfo` has `numFrames < 1` ("The VSVideoInfo structure
-passed by <filter> is invalid", `src/core/vscore.cpp:1704` on master). Measured
-with a scratch source plugin (`tmp/fakesrc.cpp`, `tmp/libfakesrc.so`, loaded
-with `core.std.LoadPlugin`, no core changes): `numFrames = 24` and
-`2^31-1` are accepted, `numFrames = 0`, `-1`, `-2` are all rejected before the
-node exists. Built-in filters agree (`std.BlankClip(length=0)` and
-`std.Trim(length=0)` are rejected; `std.Loop(times=0)` reports `2^31-1`, not
-`-1`). So `-1` cannot be produced by any installed source and cannot be
-propagated through any filter.
+**2026-09-19 — ReBAR upload staging (+4.6%).** Per-stream staging moved from
+GTT to `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`, so the CPU writes VRAM and
+the ring copy is a device-local read; the store form flips with the allocation
+(NT stores for GTT, cached stores for the write-combined window, no flush for
+the coherent one). 178.2 vs 170.3 fps at 1000f 1080p GRAY r=2 ns=4, 3
+interleaved pairs.
 
-**Fix.** Still added the `numFrames <= 0` rejection at creation: it is one
-branch, it documents the invariant the frame path depends on, and it makes the
-filter safe if a future VapourSynth reintroduces unknown-length clips. It is
-defence in depth, not a fix that can be exercised on this build — do not spend
-time trying to build a repro for it again.
+**2026-09-19 — subgroup shuffles for the 8-lane exchanges (+6%).**
+`transpose_pack8` and `reduce_group8` became register-only `subgroupShuffleXor`
+butterflies. The barriers were already free (a 32-lane workgroup is one wave, so
+all 64 `barrier()`s compiled away); the cost was the LDS round-trip. 179.0 →
+190.9 fps at r=2 ns=4. VGPR 256 → 216, LDS 6144 → 4096 B, subgroups/SIMD 5 → 7.
+Shuffle masks are < 8, so this stays correct on a wave64 device.
 
-## 3. `BM3D_NOSEARCH` read uninitialized shared memory
+**2026-09-20 — queue cap stays uncapped.** `VSFEEL_BM3D_QUEUES` {1,2,4} ×
+`num_streams` {4,8} at 2 and 4 concurrent requests: uncapped is best or tied in
+every cell. Unlike Bilateral (+16% at cap 2) BM3D is not queue-starved — ~88%
+of the frame is fence, so a shared queue has no drain bubble to fill.
+Re-measured on the current binary: 309.9 / 313.0 / 313.1 / 312.4 fps for cap
+1 / 2 / 4 / uncapped. Unchanged.
 
-**Mechanism.** With `NOSEARCH != 0` the kernel sets its synthetic group
-(`gx = x`, `gy = y`, `gz = KRADIUS`) and skips the entire search, but the
-aggregation phase unconditionally indexes the shared match tables
-(`l_x[group][i]`, `l_y[group][i]`, `l_s[group][i]`, `bm3d.comp`) to build the
-`src` patch offsets and the `res` accumulation offsets. The flush of those
-tables from the merged group was inside the `else` arm, so the no-search arm
-read whatever the previous workgroup left in LDS and used it as block
-coordinates (and as a temporal window index for `offset = tmp_z * 2 *
-TEMPORAL_STRIDE + ...`). `robustBufferAccess` is off by design, so that is a
-wild read and a wild write.
+**`extractor_exp` was a silent no-op — fixed.** Host wiring was fine and the
+SPIR-V kept `(x + E) - E`, but RADV folds that pair once E is a known spec
+constant (`RADV_DEBUG=asm` was instruction-identical for E=0 and E=20). The
+pair now computes under `precise` inside `if (EXTRACTOR != 0.0)`; the `if`
+folds at pipeline creation, so E=0's ISA is unchanged. Rule: a
+spec-constant-guarded `(x + E) - E` idiom needs `precise` or RADV folds it.
 
-**Fix.** Move the flush block out of the `else` (it still runs the same
-`match`/insert logic, which is a no-op for a synthetic group that already
-contains the centre 8 times) so both arms write the tables. One `barrier()`
-before and after, in uniform control flow.
+**Slot-direct cache consumption was already in place.** Both caches are read in
+place: `bm3d.comp` indexes the source ring through `slot_base(z)`, and
+`bm3d_agg.comp` reads the estimate stacks through the per-slice push-constant
+`bases[9]`. The only D2D copy in the filter is `staging -> src_buf`, the upload
+leg.
 
-**Oracle.** A *constant* clip makes every 8x8 patch identical, so a correct
-no-search run (eight copies of the centre block) must produce the same constant
-the searched run does. `tmp/bm3d_nosearch.py`, 64x64 GRAYS constant 0.5,
-3 frames, `radius=2`, `num_streams=1`:
+## Round: the block-match scan (2026-09-21, +64% end to end)
 
-| | search arm | no-search before | no-search after |
-|---|---|---|---|
-| min / max | 0.49999994 / 0.49999997 | NaN | 0.49999997 / 0.49999997 |
-| non-finite | 0 | **12224 / 12288 (99.5%)** | 0 |
-| digest (sha256, first 16) | c3921581a525861d | 080eb4202c408a6b | 4b7812ac2dcd102b |
+Everything above is a whole-kernel time from a warm single-request
+`VSFEEL_BM3D_GPUTRACE=1` run (`-r 1`, 300 frames, 1080p GRAY32 defaults), which
+settles to ±0.2% on repeat. Kernel ms is the metric for kernel work: the fence
+is depth-invariant (5.4 → 5.6 ms over radius 1..8) and fps is flat from ns=2 to
+ns=8, so the GPU is the wall. Graded fps is quoted separately.
 
-`max |search - nosearch| = 2.98e-8` (one ulp) after the fix, both arms within
-`6e-8` of the constant. The one-ulp gap is expected, not a defect: the two arms
-give a pixel a different *number* of identical contributions (the no-search
-group stacks all eight on the centre block, the searched group spreads them),
-and the weighted sums round differently before the division. The no-search
-output is reproducible across processes (same digest on repeated runs); the
-pre-fix garbage happened to be reproducible too, so the non-finite count and
-the constant oracle are the discriminators, not run-to-run determinism.
+1. **Four-wide sliding scan (`scan_row`) — 4.943 → 3.96 ms.** A rolled loop
+   leaves the next candidate's eight loads behind the previous candidate's
+   ~60-instruction insert, and every wave stalls on the same `s_waitcnt` at the
+   same time. Issuing four candidates' new-column loads before any of them is
+   consumed fixes that: 2-wide reached 4.168, 4-wide 3.963, 8-wide 4.093
+   (register pressure starts to bite). Same operations in the same order, so
+   bit-identical.
+2. **Pack the candidate's (x, y) into one word — 3.96 → 3.72 ms.** The insert
+   shifts three arrays per position instead of four; x gets 16 bits and y 15,
+   which is why creation now rejects dimensions above 65535x32767.
+3. **Temporal per-window lists are PS_NUM deep — 3.72 → 2.85 ms, VGPR 216 →
+   192, subgroups/SIMD 7 → 8.** `merge_group` only ever hands `fe[0..PS_NUM-1]`
+   to `ginsert8` and only the first PS_NUM merged entries are read back as the
+   next window's centres, so each lane only needs its own top-PS_NUM: a k-way
+   merge's k-th output is always the k-th smallest of the union, and a global
+   top-k element is inside its lane's top-k. With PS_NUM=2 the insert shifts one
+   element instead of seven and the list costs six registers instead of
+   twenty-four. The spatial list stays 8 deep (its group of 8 is the filter's
+   actual output group). `ps_num` 1..8 all pass the reference sweep.
+4. **Dead ends, with mechanism.**
+   - The resolved group in LDS (Stage A): 5.36 ms, VGPR 240, 6 waves.
+   - The per-lane scan lists in LDS with a bank-conflict-free `[k][lane]`
+     layout and a real branch on the insert: 7.27 ms, VGPR 240, 6 waves. The
+     branch fires as intended; the register cost of the dynamic addressing
+     swamps the 60 instructions it saves.
+   - The direction-invariant centres in LDS: 3.88 vs 3.72 ms, VGPR 240.
+   - `reduce8` (reduce the sliding window from explicit terms instead of
+     shifting a `col[8]`): byte-identical code, no change, reverted.
+   - `vec4` aggregation: 0.330 vs 0.327 ms, i.e. neutral — see the PCIe note.
+5. **Ablation ladder** (same kernel, default windows): full 2.884 ms;
+   `NOESTIMATE=1` 2.488 (so patch load + transform + all atomics = 0.40 ms);
+   `NOSEARCH=1` 0.741 — but NOSEARCH also makes every candidate tie, so it
+   suppresses the temporal inserts too and cannot be read as "the spatial
+   search costs 2.1 ms". The honest split comes from window sweeps:
+   0.0032 ms per candidate per lane for `bm_range`, 0.0030 for `ps_range`, and
+   a ~1.4-2.0 ms intercept at tiny windows (row-init column batches, merges,
+   the estimate phase, the 83 MB/slot fill and the ring copies).
 
-This is now covered by
-`test_bm3dv2_nosearch_matches_search_on_constant_clip`.
+**Stream knee, re-swept after the restructure.** ns = 1/2/3/4/6/8 =
+243.4/312.8/311.9/310.1/312.3/313.0 fps (800f × 2). A careful 2000f × 3 pass
+gives 314.5 / 316.0 / 316.8 for ns = 2/4/8, and direct `vspipe` runs give
+ns=2 the edge at 2-3 requests (318.4 vs 316.5) while ns=4 leads by 0.7-1.0%
+only at vspipe's own ~32-request default (313.6 vs 310.6). The plateau is at 2;
+2 was chosen as the default for the 332 MiB it saves (1107 vs 1440 MiB at
+1080p r=2 — the estimate stack itself scales as `tw + ns + 2r`, so it is 23%
+off the total, not just off the per-stream part).
 
-## Measured facts worth keeping
+**Per-instance VRAM**, printed by `VSFEEL_BM3D_VRAM=1` at creation. 1080p r=2:
+ns=2 1107.4 MiB, ns=4 1439.6 MiB, ns=8 2104.1 MiB; the shared estimate stack is
+79% of that at ns=2 and 64% at ns=8 (both it and the per-stream staging scale
+with the count), and the per-stream part is staging + dst only. The staging
+right-sizing (4r+1 slots instead of `4r+num_streams`) removed 23.7 MiB per
+stream, 95 MiB at ns=4. At r=4/ns=8 the same figure is 5.3 GiB for the basic
+estimate and 7.0 GiB for the final (Wiener) pass, which is why the 32-bit `res`
+addressing guard exists.
 
-- **`NOSEARCH=0` is bit-identical before and after this pass.** The constant
-  clip's searched-arm digest is `c3921581a525861d` both pre- and post-fix, so
-  the code motion only affected the `NOSEARCH=1` specialization.
-- `BM3D_NOSEARCH` is an ablation knob, not a production path: it makes the
-  "group" eight copies of the centre block, so the collaborative transform sees
-  eight identical patches and the hard threshold keeps only the DC term. It is
-  what remains of a vsfeel-invented flag, not something the references have.
-- `std.Loop(times=0)` reports `numFrames = INT32_MAX`, not `-1`; that is
-  accepted by the `numFrames <= 0` guard (and by BM3D's clamps).
-- The `res` guard also bounds the `src` addressing: `src_search(z)` reaches at
-  most `(src_ring - 1) * pe * (FINAL ? 2 : 1)`, and `res_floats >=` that for
-  every radius / stream count (for `r = 0`, `res = 2*ns*pe` vs
-  `src = 2*(ns-1)*pe`; for `r > 0` the `tw * 2` factor dominates), so a
-  configuration whose source offsets would wrap is rejected by the same check.
-- **Parameter validation (added in the cross-cutting hardening pass).**
-  `bm_range`/`ps_range` are now bounded to `[1, 8192]`: the shader computes
-  `x ± BM_RANGE`, `(2*PS_RANGE+1)^2` and `i * that` in `int`, so `INT32_MAX`
-  overflowed `rw = right - left + 1` to `<= 0` and the radius>=3 scan divided by
-  it (`sub_lane_id % rw`). `extractor_exp` is bounded to `[-126, 127]` because
-  `(x + 2^e) - 2^e` is NaN once `2^e` is not a finite normal float.
-  `num_streams` is now `1..32`, `sigma` rejects NaN/inf, and the frame-request
-  policy is `rpGeneral` whenever `radius > 0` (a temporal filter may not declare
-  `rpStrictSpatial`). Verified in `tmp/verify_validation.py`.
+**Correctness of the round.** 75/75 BM3D tests and 800/800 repo tests pass.
+No numerical change was intended or observed: the equivalence argument for the
+PS_NUM-depth list is exact (same (e, sq) merge order), and the packing and
+unrolling are order-preserving. `test_bm3dv2_matches_reference` spans
+radius 0..4 against vszipcl at the documented tolerances.
 
-## Same-queue timeline submission ordering (2026-09-16)
+## Open work
 
-**Mechanism.** A frame's aggregation device-waits on the estimation timelines of
-the streams that filled its result slots. A reader can acquire after a writer and
-reach its aggregation submit first; if both share a `VkQueue` (`i % num_queues`),
-the aggregation waits on a value signalled by a submit that is *behind* it in the
-FIFO, and RADV does not run past an unsatisfied timeline wait — the queue, and
-the writer's own fence wait, stall permanently. DFTTest's chained-instance hang
-is the recorded precedent for that driver behavior.
+- **The spatial search is the remaining kernel cost.** Its per-lane list must
+  stay 8 deep, so its insert is ~14 instructions per candidate more expensive
+  than the temporal one. Dropping the sequence index from the spatial list
+  (recovering `sq = (cy-top)*rw + (cx-left)` from the packed coordinates at
+  merge time, which is exact) is worth ~2% of the frame and was not taken.
+- **Dead plumbing.** `merge_group`'s `ms` output and the spatial `gseq` array
+  are unused tails of the port (`ms`/`fs` were already dead before this round).
+- **The row-init column batches** (8 `col_ssd` per row per lane, 21 rows per
+  lane per frame) are ~15% of kernel instructions and are inherent to the
+  sliding window. The spatial scan also wastes ~18% of its wave iterations on
+  the final row, where only 1 of 8 lanes is active.
+- The estimate phase's 0.40 ms has not been decomposed into transform vs
+  atomics. A probe is easy (replace the two `atomicAdd`s with plain stores).
+- `sigma` is scaled per plane but only luma is processed; the YUV path copies
+  chroma. No measurements needed unless a user asks.
 
-**Fix.** Per-stream `stream_submitted` (highest estimation seq submitted
-host-side) plus the existing `cache_cv`: after its own estimation submit a frame
-publishes its seq, and before submitting the aggregation it waits host-side until
-every result-slot writer has *submitted* (not completed) its estimation. Waiting
-for submission rather than completion keeps the GPU/host overlap and cannot
-deadlock: the waits always point at frames that acquired their cache reservation
-earlier, and a writer never waits on a reader's aggregation. The frame error path
-publishes the same event so a reader cannot block on a submit that never comes.
+**Do not re-derive** (measured, not theory):
 
-**Measurement (no reproduced hang).** `VSFEEL_BM3D_QUEUES=1`, 8 streams, 1080p,
-radius 4, random concurrent seek orders (52 attempts total, 25 s cap each) on the
-pre-fix binary: every attempt completed and matched the `num_streams=1` run
-(maxdiff ~4.5e-8). The predicted FIFO stall did not reproduce on this box, so the
-fix is an ordering invariant rather than a fix for an observed hang; it is
-covered permanently by `test_bm3dv2_seek_collision_single_queue` (the same seek
-collision with one queue). Throughput is unchanged (below).
+- Any LDS restructure — see the mechanism above.
+- Queue cap: uncapped is best or tied (table above).
+- `#pragma unroll`: glslc ignores it in GLSL and ACO already unrolls
+  fixed-trip loops; the four remaining backward branches are the variable-trip
+  scans, which is why the unrolling is manual.
+- A different SSD accumulation order (e.g. a running window sum instead of the
+  per-candidate 8-term tree): the reference-comparison tolerance is already
+  0.0079 against a 0.01 bound at the defaults, so nothing may perturb which
+  blocks match.
 
-## fp32 aggregation, sigma skip, GPUTRACE gating (2026-09-16)
+**Method rules**
 
-- **fp32 aggregation.** `bm3d_agg.comp` divided in `double`; no reference does
-  (vszipcl's `aggPlane` is f32, BM3DCUDA uses an f32 reciprocal multiply), and
-  fp64 runs at 1/16 rate on RDNA3. Dropped to fp32, which also removes the hard
-  `shaderFloat64` create-time requirement and the dead
-  `VkPhysicalDeviceFeaturesCompat` copy of the features struct.
-- **Sigma skip.** `sigma[0] < FLT_EPSILON` now passes luma through (a source
-  copy) instead of dispatching, matching the installed references' `PROC_MASK`
-  behavior. Measured, GRAY32 noise frame 0:
-  sigma=0 no-ref / sigma=0 + ref / sigma=1e-9 + ref / YUV444 `sigma=[0,3,3]` +
-  ref were `4.1e-8` / **96 NaN pixels** / `4.5e-8` / **96 NaN** before, and
-  bit-identical to the source after; installed vszipcl and vszipcu are
-  bit-identical to the source in all four. The `0/0` Wiener coefficient at
-  `sigma=0` is unreachable once the plane is skipped. Control `sigma=0.7` is
-  unchanged (min `-0.00233876`, max `0.0360892` both before and after).
-  The vendored vszipcl source rejects "all planes have sigma < FLT_EPSILON", but
-  the installed build pass-throughs instead; vsfeel follows the installed
-  reference (the comparison oracle).
-- **GPUTRACE.** `d->gpu_trace` is cached at creation and gates the query-pool
-  creation, the timestamp recording and the readback, so setting
-  `BM3D_GPUTRACE` after creation no longer records into a null pool.
-
-**Performance.** Same-session interleaved A/B, 3 pairs of 1500 frames
-(`tools/benchmark.py -f bm3dv2 vsfeel`): old 173.21/172.64/172.88, new
-75.53/172.64/172.57 fps. The 75.5 is the pipeline-cache cold compile after the
-SPIR-V change (first run of a new binary only); the steady medians differ by
-<0.5%, below the noise floor, and BM3D's recorded frame split is ~90% fence.
-README's BM3D row was unchanged by this round (the later ReBAR upload port did
-move it).
-
-## Frame error path
-
-A failed frame used to hand its stream back to the pool with GPU work still in
-flight, letting a successor re-record the command buffers and reuse the cache
-slots while the estimation/aggregation still read them. The error path now
-drains the stream's queue under its lock and resets the fence once the
-estimation has been submitted, and it host-signals the frame's timeline only
-when no estimation was submitted (otherwise the device signals it on completion
-and an early host signal would release the slots too soon). `test_bm3dv2.py`
-passes.
-
-
-
-## 2026-09-19 — ReBAR upload staging (+4.6%)
-
-The per-stream upload staging was GTT; allocating it
-`DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` (probed once at creation into
-`staging_direct`; `VSFEEL_BM3D_HD=0` opts out) makes the host write VRAM and the
-ring copy a device-local read. The store form flips with the allocation: NT
-stores for the GTT arm, cached stores for the write-combined window, and no
-flush for the coherent window. 1000f 1080p GRAY r=2 ns=4, 3 interleaved pairs:
-**178.2** vs 170.3 fps, every pair favouring ReBAR; `|HD-GTT|` ≤ 9e-8, which is
-the same floor two same-arm instances show (`bm3d.comp` accumulates the estimate
-stacks with atomic float adds, so the order is scheduling-dependent). The
-staging is the same buffer as before, only relocated GTT→VRAM; it reserves
-`src_ring*clips*Σpe*4` B/stream (~95 MiB at this config), and only the touched
-ring slots become resident.
-
-## 2026-09-19 — subgroup shuffles for the 8-lane exchanges (+6%)
-
-The four `transpose_pack8` calls (each 16 barriers + 128 LDS ops) and
-`reduce_group8`'s LDS reduction are now register-only subgroup shuffles: the
-transpose as three butterfly steps that swap one bit of the lane id with one bit
-of the element index, the reduction as the same butterfly over 8 lanes, which
-happens to reproduce the reference's exact
-`((0+1)+(2+3))+((4+5)+(6+7))` tree and so is bit-identical.
-1000f 1080p GRAY32 r=2 ns=4 (3 interleaved pairs each): transpose **179.0 →
-183.5**, reduction on top **183.5 → 190.9** fps, every pair favouring the
-shuffle; graded run with references: **189.6** vs vszipcl 41.7 / vszipcu 67.6
-(spread 0.5%).
-
-**Mechanism — the barriers were already free; the LDS was not.** The workgroup is
-32 lanes, i.e. one wave, so all 64 `barrier()`s compiled to **zero** `s_barrier`
-instructions (checked with `RADV_DEBUG=asm`); the cost was the LDS round-trip
-(461 → 205 `ds_*`) plus the `s_waitcnt` (278 → 233) that drains it. That is why a
-change that *raises* the instruction count (6213 → 7351, VALU 4196 → 5675, the
-extra 768 `v_mov_b32_dpp` + 768 selects) is still faster. shaderstats: VGPR
-256 → 216, LDS 6144 → 4096 B, Subgroups per SIMD 5 → 7, spills/scratch 0 both
-sides. Correctness: `max|Δ|` vs the LDS build 9.7e-8, the same floor two
-same-binary runs show (atomic-add order), and the full suite is green.
-
-**The remaining LDS tables (`l_e`/`l_x`/`l_y`/`l_s`) stay.** Their consumer
-`merge_group64` indexes them with a data-dependent row (`bh`), which a shuffle
-cannot select; the LDS there is load-bearing, not a leftover.
-
-**New device requirement.** `bm3d.comp` is now SPIR-V 1.6, so BM3D joins
-DFTTest/EEDI3/NNEDI3 behind `require_vulkan_1_3` (a 1.3 *device*), and it is the
-first filter to need `VK_SUBGROUP_FEATURE_SHUFFLE_BIT` (checked at creation;
-only BASIC is mandatory by spec). The subgroup-size request is still 32 when the
-device offers it, but the shuffles only ever XOR a mask < 8, so they stay inside
-the 8-lane group on a wave64 device too.
-
-**`#pragma unroll` is a non-item on this toolchain.** glslc/glslang ignores it in
-GLSL (byte-identical SPIR-V with and without), and ACO already fully unrolls every
-fixed-trip loop — the kernel has only four backward branches, all in the
-variable-trip search loops. The three live 64-float patch arrays therefore cost
-no spills and no scratch in both the hard and the Wiener variants (the point
-`bm3d.comp` was flagged for); the shuffle pass above is what actually lowered
-register pressure.
+- Grade kernel changes on `VSFEEL_BM3D_GPUTRACE=1` at `-r 1` over a few hundred
+  frames (repeat once: the printed value settles to ±0.2%), then confirm fps
+  with an interleaved `tools/benchmark.py` pair over 1000+ frames. A one-shot
+  `-r 1` fps figure mixes in the ~1.4 ms host path and moves for unrelated
+  reasons.
+- The GPU timestamp accumulator had two bugs until this round — it added
+  `uint64_t * float` into an `atomic<uint64_t>` (truncating) and divided ns by
+  `1e3` while printing "ms", so every figure it printed before 2026-09-21 is
+  1000x off. Use the accumulator, not the old numbers.
+- Never chain build → install → test; use `tools/install.sh` (hash-verified).
 
 ## Debug env vars
 
 Standardised on `VSFEEL_BM3D_<FLAG>`; the pre-standardisation `BM3D_<FLAG>`
-spelling still works for one release (new name wins). Every flag routes through
-the `env_flag`/`env_int`/`env_str` helpers in `vsfeel.h`.
+spelling still works for one release (new name wins). All route through the
+`env_flag`/`env_int`/`env_str` helpers in `vsfeel.h`; `TRACE` and `DUMP` are
+cached at creation, not read per frame.
 
 - `VSFEEL_BM3D_TRACE=1` — acquire/submit/wait trace.
 - `VSFEEL_BM3D_TIMING=1` — host-stage split per frame (cached at creation).
+- `VSFEEL_BM3D_VRAM=1` — creation-time VRAM budget (shared + per-stream).
 - `VSFEEL_BM3D_QUEUES=N` — queue cap override.
-- `VSFEEL_BM3D_HD=0` — force the GTT staging + PCIe upload (no ReBAR staging);
-  default is the host-visible VRAM staging when the device has it.
-- `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs.
+- `VSFEEL_BM3D_HD=0` — force the GTT staging + PCIe upload.
+- `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs; both
+  are vsfeel inventions, not reference behaviour, and NOSEARCH distorts the
+  temporal search as well (see the ablation note).
 - `VSFEEL_BM3D_DUMP=1` / `VSFEEL_BM3D_GPUTRACE=1` — slot dump / GPU timestamps.
-
-## `extractor_exp` was a silent no-op — FIXED
-
-**Mechanism.** Host wiring was fine (`extractor_exp -> Spec.extractor`,
-`constant_id 9`, confirmed by print) and the SPIR-V kept the `(x + E) - E`
-pre-rounding, but RADV folds that pair to `x` once E is a known spec constant:
-`RADV_DEBUG=asm` for `extractor_exp=0` and `=20` was instruction-for-instruction
-identical (181 `v_add_f32`/`v_sub_f32` both, no 2^20 constant), so the parameter
-was inert.
-
-**Fix.** `bm3d.comp` computes the pair under GLSL `precise` (SPIR-V
-`NoContraction`) inside `if (EXTRACTOR != 0.0)`. The `if` folds at pipeline
-creation: pre-fix vs post-fix `extractor_exp=0` ISA diff is **0 lines**. Only
-`E != 0` gains the rounding ops.
-
-**After**, same noise clip (sigma 0.7, radius 2, bm_range 16, ps_range 7,
-block_step 4, two fresh `ns=1` instances):
-
-| extractor_exp | vsfeel run-to-run | vsfeel vs e0 | vszipcl vs e0 |
-|---|---|---|---|
-| 0 | 3.7e-8 | — | — |
-| 3 | 0 | 1.8e-4 | 1.2e-4 |
-| 8 | 0 | 5.6e-3 | 3.8e-3 |
-| 20 | — | non-finite | non-finite |
-
-The documented ">= 3 = bitwise reproducible" guarantee now holds, matching
-vszipcl. Rule left behind: **a spec-constant-guarded `(x + E) - E` idiom needs
-`precise`, or RADV folds it.**
-
-## Slot-direct cache consumption is already in place
-
-Audited for a cache-to-working-set copy to delete: there is none. Both caches
-are already read in place, so the technique was adopted with the early cache
-rework rather than still missing.
-
-- `bm3d.comp` reads the source ring directly: `slot_base(z)` maps a window
-  position to `src_frame(z) % SRC_RING`, and `src_search`/`src_input` index
-  `src[]` at that slot. No per-stream window copy exists.
-- `bm3d_agg.comp` reads the estimate stacks directly through the per-slice
-  push-constant `bases[9]` (filled from `win_slots` + `agg_z` in
-  `record_bm3d_agg`). `win_slots`/`res_holders` are host-side bookkeeping
-  (slot indices, reservation tokens), not frame data.
-- The only D2D `vkCmdCopyBuffer` in the filter is `staging -> src_buf`, the
-  host-upload leg. The per-stream buffers are `staging` (upload source) and
-  `dst_buf` (download target) only.
-
-**Measurement.** Single-request host probe (`-r 1`, 1080p real clip, radius 2,
-`num_streams=4`, 200 f, µs/frame): take 0.4, acquire 1.6, upload 385.8,
-record 12.8, srcwait 24.6, agg 13.8, **fence 6327.2**, download 391.2, total
-7157.4 — the stages sum to the 1.79 s wall. The frame is ~88% fence and the
-host path has no copy stage; the one copy left is the upload leg, which is the
-host-direct-upload change, not a consumption one. Suite 75/75; benchmark
-162.5 fps vs vszipcu 67.1 / vszipcl 40.9.

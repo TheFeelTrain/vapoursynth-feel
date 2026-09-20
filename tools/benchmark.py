@@ -349,9 +349,7 @@ def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
     with_streams = f"{common}, num_streams={ns_num}"
     return {
         "vsfeel": f"core.vsfeel.BM3Dv2({clip}, {with_streams})",
-        "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {with_streams})",
-        "vszipcu": f"core.vszipcu.BM3Dv2({clip}, {with_streams})",
-        "bm3dhip": f"core.bm3dhip.BM3Dv2({clip}, {common})",  # no num_streams
+        "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {with_streams})"
     }
 
 
@@ -364,8 +362,7 @@ def _bilateral_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dic
     return {
         "vsfeel": f"core.vsfeel.Bilateral({clip}, {args})",
         "vszipcl": f"core.vszipcl.Bilateral({clip}, {args})",
-        "vszipcu": f"core.vszipcu.Bilateral({clip}, {args})",
-        "bilateralhip": f"core.bilateralhip.Bilateral({clip}, {args})",
+        "vszipcu": f"core.vszipcu.Bilateral({clip}, {args})"
     }
 
 
@@ -582,6 +579,7 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("block_step", "--bm3d-block-step", "bm3d_block_step", int, 4),
         ],
         build=_bm3d_build,
+        default_streams=2,  # matches the filter's shipped default
         input="depth(get_y(clip), 32)",
         synth_format="vs.GRAYS",
     ),

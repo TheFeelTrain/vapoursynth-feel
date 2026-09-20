@@ -9,6 +9,12 @@
  * fp32, as in every reference (zipcl's aggPlane divides floats, BM3DCUDA
  * multiplies by an f32 reciprocal); fp64 would run at 1/16 rate on RDNA3 for
  * a rounding difference no reference makes.
+ *
+ * One thread covers four adjacent columns through vec4 accesses (the plane
+ * pitch is already a multiple of four floats, so every slice base, row offset
+ * and column is 16-byte aligned). Scalar loads left the kernel bound by its
+ * ten interleaved load streams rather than by bytes: the same bytes move in a
+ * quarter of the instructions.
  */
 
 layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
@@ -18,8 +24,8 @@ layout(constant_id = 1) const int HEIGHT = 1080;
 layout(constant_id = 2) const int STRIDE = 1920;
 layout(constant_id = 3) const int TW = 5;
 
-layout(std430, binding = 0) readonly buffer ResBuf { float res[]; };
-layout(std430, binding = 2) buffer DstBuf { float dst[]; };
+layout(std430, binding = 0) readonly buffer ResBuf { vec4 res4[]; };
+layout(std430, binding = 2) buffer DstBuf { vec4 dst4[]; };
 
 layout(push_constant) uniform PushConstants {
     int bases[9];  // float offsets of the TW wdst slices within the res buffer
@@ -27,32 +33,33 @@ layout(push_constant) uniform PushConstants {
 
 const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
 
-// The res stacks are completed before this dispatch: the estimation kernels
-// (and the slot zero-fill) that wrote them are separated from these reads by
-// an ALL_COMMANDS memory barrier recording shader-write -> shader-read, and
-// the cross-queue source dependencies are carried as device waits on the
-// aggregation submit. A coherent (atomic) load is therefore unnecessary —
-// atomicAdd(res[o], 0.0f) forced a device-scope read-modify-write per element
-// (10 per pixel at radius 2, ~20.7M at 1080p) just to read a value nobody
-// was racing to modify; a plain load is cheaper with identical output.
-float res_load(int o) {
-    return res[o];
-}
-
 void main() {
-    const int x = int(gl_GlobalInvocationID.x);
+    const int x = 4 * int(gl_GlobalInvocationID.x);
     const int y = int(gl_GlobalInvocationID.y);
-    if (x >= WIDTH || y >= HEIGHT) {
+    // x may reach into the row padding (never read back), which keeps the
+    // store in bounds without a per-row tail path.
+    if (x >= STRIDE || y >= HEIGHT) {
         return;
     }
 
-    float acc = 0.0;
-    float acw = 0.0;
+    // The res stacks are completed before this dispatch: the estimation kernels
+    // (and the slot zero-fill) that wrote them are separated from these reads by
+    // an ALL_COMMANDS memory barrier recording shader-write -> shader-read, and
+    // the cross-queue source dependencies are carried as device waits on the
+    // aggregation submit. A coherent (atomic) load is therefore unnecessary —
+    // atomicAdd(res[o], 0.0f) forced a device-scope read-modify-write per element
+    // just to read a value nobody was racing to modify; a plain load is cheaper
+    // with identical output.
+    const int o = (y * STRIDE + x) >> 2;
+    const int tstride4 = TEMPORAL_STRIDE >> 2;
+
+    vec4 acc = vec4(0.0);
+    vec4 acw = vec4(0.0);
     for (int i = 0; i < TW; ++i) {
-        const int o = pc.bases[i] + y * STRIDE + x;
-        acc += res_load(o);
-        acw += res_load(o + TEMPORAL_STRIDE);
+        const int b = (pc.bases[i] >> 2) + o;
+        acc += res4[b];
+        acw += res4[b + tstride4];
     }
 
-    dst[y * STRIDE + x] = acc / acw;
+    dst4[o] = acc / acw;
 }

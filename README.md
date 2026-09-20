@@ -13,7 +13,7 @@ that version. Older GPUs still work if their driver reports Vulkan 1.3.
 | Filter    | u16 vsfeel | u16 ref | u16 speedup | fp32 vsfeel | fp32 ref | fp32 speedup |
 |-----------|-----------:|--------:|------------:|------------:|---------:|-------------:|
 | Bilateral | 1903       | 1484    | 1.28x       | 1250        | 763      | 1.64x        |
-| BM3Dv2    | -          | -       | -           | 190         | 42       | 4.55x        |
+| BM3Dv2    | -          | -       | -           | 315         | 47       | 6.72x        |
 | DFTTest   | 1445       | 909     | 1.59x       | 1102        | 628      | 1.75x        |
 | EEDI3     | 628        | 214     | 2.93x       | 318         | 186      | 1.71x        |
 | GaussBlur | 2516       | 1599    | 1.57x       | 1267        | 756      | 1.68x        |
@@ -65,7 +65,7 @@ core.vsfeel.BM3Dv2(clip clip[,
     int[]   ps_range=4,             # search radius around each predicted candidate, in pixels
     int     extractor_exp=0         # aggregation weight bias; 0 = off, >= 3 = reproducible output
     int     device_id=0, 
-    int     num_streams=4])       
+    int     num_streams=2])       
 ```
 32-bit float only. Chroma passes through unprocessed.
 
