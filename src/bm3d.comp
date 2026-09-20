@@ -1,5 +1,6 @@
 #version 450
 #extension GL_EXT_shader_atomic_float : require
+#extension GL_KHR_shader_subgroup_shuffle : enable
 
 /*
  * BM3D collaborative hard-thresholding kernel (Vulkan port of the vszipcl
@@ -31,16 +32,10 @@ layout(constant_id = 12) const int SRC_RING = 9;  // 4 * RADIUS + 1 (window unio
 layout(constant_id = 13) const int FINAL = 0;    // Wiener (ref) pass vs hard thresholding
 
 const int KRADIUS = RADIUS;
-const int TEMPORAL_WIDTH = 2 * RADIUS + 1;
 const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
-const int PLANE_STRIDE = TEMPORAL_WIDTH * TEMPORAL_STRIDE;
-const int NUM_PLANES = 1;
-const int CLIP_STRIDE = NUM_PLANES * TEMPORAL_WIDTH * TEMPORAL_STRIDE;
 
 const float FLT_MAX_ = 3.402823466e+38f;
 const int INT_MAX_ = 0x7fffffff;
-
-const int smem_stride = 33;
 
 layout(std430, binding = 0) buffer ResBuf { float res[]; };
 layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
@@ -79,8 +74,6 @@ int src_input(int z) {
     return src_search(z) + (FINAL != 0 ? TEMPORAL_STRIDE : 0);
 }
 
-shared float buffer_all[8 * smem_stride];
-shared float red_all[32];
 shared float l_e[4][64];
 shared int l_x[4][64];
 shared int l_y[4][64];
@@ -217,39 +210,41 @@ void transform_pack8_1d_inv(inout float data[64]) {
     }
 }
 
-// cooperative 8x8 transpose across the 8 lanes of a group via shared memory;
-// each lane holds [match x row] for its column, after the transpose it holds
-// [match x col] for its row. Only the lanes of one group (8 consecutive
-// logical lanes) participate per tile; the group's column range is
-// (lane & ~7) .. (lane & ~7) + 7.
+// Cooperative 8x8 transpose across the 8 lanes of a group, as three butterfly
+// steps that swap one bit of the lane id with one bit of the element index.
+// Register-only: no LDS round-trip and no barrier, and the exchange cannot
+// leave the group because every mask is < 8. Only the lanes of one group
+// (8 consecutive logical lanes) participate per tile; the group's column range
+// is (lane & ~7) .. (lane & ~7) + 7.
 void transpose_pack8(inout float data[64]) {
     const int lane = int(gl_LocalInvocationID.x);
     for (int it = 0; it < 8; ++it) {
-        barrier();
-        for (int i = 0; i < 8; ++i) buffer_all[i * smem_stride + lane] = data[it * 8 + i];
-        barrier();
-        for (int i = 0; i < 8; ++i) {
-            data[it * 8 + i] = buffer_all[(lane % 8) * smem_stride + (lane & ~7) + i];
+        for (int b = 0; b < 3; ++b) {
+            const int mask = 1 << b;
+            float t[8];
+            for (int j = 0; j < 8; ++j) {
+                t[j] = subgroupShuffleXor(data[it * 8 + (j ^ mask)], mask);
+            }
+            for (int j = 0; j < 8; ++j) {
+                if (((j >> b) & 1) != ((lane >> b) & 1)) {
+                    data[it * 8 + j] = t[j];
+                }
+            }
         }
     }
 }
 
+// Sum the 8 values of one group with the reference's exact tree order
+// ((0+1)+(2+3))+((4+5)+(6+7)). The xor butterfly reproduces that tree in
+// registers, so this needs no LDS and no barrier and is bit-identical.
 float reduce_group8(float x) {
-    const int lane = int(gl_LocalInvocationID.x);
-    barrier();
-    red_all[lane] = x;
-    barrier();
-    const int g = lane & ~7;
-    return ((red_all[g + 0] + red_all[g + 1]) + (red_all[g + 2] + red_all[g + 3])) +
-           ((red_all[g + 4] + red_all[g + 5]) + (red_all[g + 6] + red_all[g + 7]));
+    x += subgroupShuffleXor(x, 1);
+    x += subgroupShuffleXor(x, 2);
+    x += subgroupShuffleXor(x, 4);
+    return x;
 }
 
-float ssd_pre(const float cur[64]) {
-    return 0.0f;
-}
-
-
-float ssd_err(const float cur[64], float pre, const int base_idx, int cx, int cy) {
+float ssd_err(const float cur[64], const int base_idx, int cx, int cy) {
     float col[8];
     for (int c = 0; c < 8; ++c) {
         float errors[2] = float[2](0.0f, 0.0f);
@@ -463,7 +458,6 @@ void main() {
             cur[c * 8 + i] = src[srcpc_base + (y + i) * STRIDE + (x + c)];
         }
     }
-    const float center_pre = ssd_pre(cur);
 
     float ge[8];
     int gx[8], gy[8], gz[8];
@@ -514,7 +508,7 @@ void main() {
             int col_i = left + sub_lane_id % rw;
             #pragma unroll 2
             for (int s = sub_lane_id; s < total; s += 8) {
-                const float error = ssd_err(cur, center_pre, srcpc_base, col_i, row_i);
+                const float error = ssd_err(cur, srcpc_base, col_i, row_i);
                 insert8(pe, px, py, ps, error, col_i, row_i, s);
                 col_i += 8;
                 while (col_i > right) {
@@ -599,7 +593,7 @@ void main() {
                         int col_i = left + sub_lane_id % rw;
                         #pragma unroll 2
                         for (int s = sub_lane_id; s < total; s += 8) {
-                            const float error = ssd_err(cur, center_pre, temporal_srcpc, col_i, row_i);
+                            const float error = ssd_err(cur, temporal_srcpc, col_i, row_i);
                             insert8(pe, px, py, ps, error, col_i, row_i, seq_base + s);
                             col_i += 8;
                             while (col_i > right) {

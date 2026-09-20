@@ -214,6 +214,11 @@ struct VK_Device {
     uint32_t min_subgroup_size { 64 };
     uint32_t max_subgroup_size { 64 };
     bool subgroup_size_control { false };
+    // VK_SUBGROUP_FEATURE_SHUFFLE_BIT: a shader using subgroupShuffle needs the
+    // GroupNonUniformShuffle capability. Only BASIC is required by the spec, so
+    // this is queried rather than assumed. The subgroup size control query above
+    // is a different question (it can force a *specific* width).
+    bool subgroup_shuffle { false };
     // Feature availability as queried from the physical device and enabled at
     // device creation. A filter whose shaders need one of these reports a
     // precise creation error instead of relying on the driver accepting the

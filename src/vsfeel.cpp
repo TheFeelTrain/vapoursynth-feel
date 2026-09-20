@@ -373,6 +373,22 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     // vendor crash dump. Only queried after VK_ERROR_DEVICE_LOST.
     const bool device_fault_ext = has_ext(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 
+    // Subgroup operations are core Vulkan 1.1; only their *size control* needs
+    // the extension. Query the supported operations separately so a shader with
+    // subgroupShuffle can be gated on the capability it actually needs.
+    {
+        VkPhysicalDeviceSubgroupProperties subgroup_ops {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
+            .pNext = nullptr
+        };
+        VkPhysicalDeviceProperties2 props2 {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &subgroup_ops
+        };
+        vkGetPhysicalDeviceProperties2(dev->physical_device, &props2);
+        dev->subgroup_shuffle =
+            (subgroup_ops.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT) != 0;
+    }
     if (subgroup_ok) {
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_props {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES,
@@ -391,9 +407,11 @@ std::variant<std::shared_ptr<VK_Device>, std::string> get_device(int device_id) 
     dev->subgroup_size_control =
         subgroup_ok && dev->min_subgroup_size <= 32 && 32 <= dev->max_subgroup_size;
     if (vsfeel_device_info_enabled()) {
-        fprintf(stderr, "[vsfeel] api_version=%u.%u subgroup_size_control=%d min=%u max=%u\n",
+        fprintf(stderr, "[vsfeel] api_version=%u.%u subgroup_size_control=%d min=%u max=%u "
+                        "subgroup_shuffle=%d\n",
             VK_API_VERSION_MAJOR(dev->api_version), VK_API_VERSION_MINOR(dev->api_version),
-            dev->subgroup_size_control, dev->min_subgroup_size, dev->max_subgroup_size);
+            dev->subgroup_size_control, dev->min_subgroup_size, dev->max_subgroup_size,
+            dev->subgroup_shuffle);
     }
 
     vkGetPhysicalDeviceMemoryProperties(dev->physical_device, &dev->mem_props);

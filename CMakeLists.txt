@@ -122,9 +122,11 @@ endif()
 # The <defs> fields are quoted so that entries stay one CMake list element even
 # when they carry spaces; separate_arguments() splits them back into arguments.
 #
-# --target-env is deliberately left as it is here (bilateral/bm3d/gaussblur/
+# --target-env is deliberately left as it is here (bilateral/gaussblur/
 # nlmeans compile as SPIR-V 1.0, dfttest/eedi3/nnedi3 as 1.6). Unifying it is a
 # codegen change and belongs in its own measured commit, not in this refactor.
+# bm3d is 1.6 as well: its group transpose is a subgroup shuffle, which needs
+# SPIR-V 1.3+.
 
 set(VK_BITS "16" "32")
 
@@ -139,7 +141,7 @@ endforeach()
 
 # BM3D: two single-entry files, no io variants (float only).
 set(VK_BM3D_VARIANTS
-    "bm3d|bm3d.comp|"
+    "bm3d|bm3d.comp|--target-env=vulkan1.3"
     "bm3d_agg|bm3d_agg.comp|")
 
 # GaussBlur: one kernel with three entry points (fused small path + the two

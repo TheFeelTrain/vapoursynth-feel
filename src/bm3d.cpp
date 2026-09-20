@@ -269,7 +269,8 @@ static std::variant<VkPipeline, std::string> create_bm3d_pipeline(
         { 13, 52, sizeof(int32_t) },
     }};
     return create_compute_pipeline(dev, module, layout, entries.data(), &spec,
-        static_cast<uint32_t>(entries.size()), sizeof(spec), "bm3d");
+        static_cast<uint32_t>(entries.size()), sizeof(spec), "bm3d",
+        dev.subgroup_size_control ? 32 : 0);
 }
 
 static std::variant<VkPipeline, std::string> create_agg_pipeline(
@@ -1291,6 +1292,13 @@ static void VS_CC BM3DCreate(
     // (GL_EXT_shader_atomic_float), so that feature is required
     if (!d->device->feat_atomic_float32_add) {
         return set_error("shaderBufferFloat32AtomicAdd is not supported by this device");
+    }
+    // The 8x8 group transposes and the group-8 reduction are subgroup shuffles.
+    // The spec only makes SUBGROUP_FEATURE_BASIC_BIT mandatory, so a device
+    // without SHUFFLE would either reject the module or mis-execute.
+    if (!d->device->subgroup_shuffle) {
+        return set_error("subgroup shuffle is not supported by this device "
+                         "(VK_SUBGROUP_FEATURE_SHUFFLE_BIT is required)");
     }
 
     VkDevice dev = d->device->device;

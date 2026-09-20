@@ -239,6 +239,41 @@ staging is the same buffer as before, only relocated GTT→VRAM; it reserves
 `src_ring*clips*Σpe*4` B/stream (~95 MiB at this config), and only the touched
 ring slots become resident.
 
+## 2026-09-19 — subgroup shuffles for the 8-lane exchanges (+6%)
+
+The four `transpose_pack8` calls (each 16 barriers + 128 LDS ops) and
+`reduce_group8`'s LDS reduction are now register-only subgroup shuffles: the
+transpose as three butterfly steps that swap one bit of the lane id with one bit
+of the element index, the reduction as the same butterfly over 8 lanes, which
+happens to reproduce the reference's exact
+`((0+1)+(2+3))+((4+5)+(6+7))` tree and so is bit-identical.
+1000f 1080p GRAY32 r=2 ns=4 (3 interleaved pairs each): transpose **179.0 →
+183.5**, reduction on top **183.5 → 190.9** fps, every pair favouring the
+shuffle; graded run with references: **189.6** vs vszipcl 41.7 / vszipcu 67.6
+(spread 0.5%).
+
+**Mechanism — the barriers were already free; the LDS was not.** The workgroup is
+32 lanes, i.e. one wave, so all 64 `barrier()`s compiled to **zero** `s_barrier`
+instructions (checked with `RADV_DEBUG=asm`); the cost was the LDS round-trip
+(461 → 205 `ds_*`) plus the `s_waitcnt` (278 → 233) that drains it. That is why a
+change that *raises* the instruction count (6213 → 7351, VALU 4196 → 5675, the
+extra 768 `v_mov_b32_dpp` + 768 selects) is still faster. shaderstats: VGPR
+256 → 216, LDS 6144 → 4096 B, Subgroups per SIMD 5 → 7, spills/scratch 0 both
+sides. Correctness: `max|Δ|` vs the LDS build 9.7e-8, the same floor two
+same-binary runs show (atomic-add order), and the full suite is green.
+
+**The remaining LDS tables (`l_e`/`l_x`/`l_y`/`l_s`) stay.** Their consumer
+`merge_group64` indexes them with a data-dependent row (`bh`), which a shuffle
+cannot select; the LDS there is load-bearing, not a leftover.
+
+**`#pragma unroll` is a non-item on this toolchain.** glslc/glslang ignores it in
+GLSL (byte-identical SPIR-V with and without), and ACO already fully unrolls every
+fixed-trip loop — the kernel has only four backward branches, all in the
+variable-trip search loops. The three live 64-float patch arrays therefore cost
+no spills and no scratch in both the hard and the Wiener variants (the point
+`bm3d.comp` was flagged for); the shuffle pass above is what actually lowered
+register pressure.
+
 ## Debug env vars
 
 Standardised on `VSFEEL_BM3D_<FLAG>`; the pre-standardisation `BM3D_<FLAG>`
