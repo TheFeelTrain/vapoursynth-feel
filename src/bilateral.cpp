@@ -7,16 +7,11 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
-#include <iterator>
 #include <memory>
 #include <numbers>
-#include <optional>
 #include <string>
-#include <utility>
 #include <variant>
 #include <vector>
-
-#include <immintrin.h>
 
 #include <volk.h>
 
@@ -31,132 +26,85 @@ using namespace std::string_literals;
 // ---------------------------------------------------------------------------
 // Filter state
 // ---------------------------------------------------------------------------
+//
+// Bilateral is a pure per-pixel gather over the frame's own planes. It takes
+// `vnode:gpu` and returns `vnode:gpu` with ffGPUOutput: the kernels read the
+// core's GPU frame planes and write the output frame's planes in place, and the
+// core owns every transfer (std.GPUUpload/GPUDownload). The filter owns no copy
+// of the pixels — one pipeline per plane and one exec pool is all of it.
 
 struct BilateralPlaneConfig {
-    int width {};                    // pixels
-    int height {};                   // pixels
-    int stride {};                   // pitch in elements (round_up(width, alignment))
-    int pitch_bytes {};              // row pitch in bytes
-    VkDeviceSize upload_offset {};   // bytes, offset within staging
-    VkDeviceSize upload_size {};     // bytes, incl. ref plane
-    VkDeviceSize download_offset {}; // bytes, offset within download area
-    VkDeviceSize download_size {};   // bytes
-    VkDeviceSize src_elem {};        // element offset into the VRAM source buffer
-    VkDeviceSize dst_elem {};        // element offset into the VRAM destination buffer
-    VkDeviceSize dst_stage_elem {};  // element offset of the download region in staging
+    int width {};          // visible pixels
+    int height {};
+    int stride {};         // the core's plane pitch in elements
     VkPipeline pipeline {};
     uint32_t grid_x {};
     uint32_t grid_y {};
 };
 
-struct BilateralResource {
-    VkBuffer staging {};
-    VkDeviceMemory staging_mem {};
-    VkBuffer src_buf {};        // device-local input planes (VRAM)
-    VkDeviceMemory src_mem {};
-    void * src_map {};          // mapped VRAM window when the upload is host-direct
-    uint32_t src_type_index {};
-    VkBuffer dst_buf {};        // device-local output planes (VRAM)
-    VkDeviceMemory dst_mem {};
-    VkCommandPool pool {};
-    VkCommandBuffer cmd {};
-    VkFence fence {};
-    VkDescriptorSet desc_set {};
-    VkQueue queue {};
-    std::mutex * queue_lock {};
-    float * map {};
-    uint32_t staging_type_index {};
-};
-
 struct BilateralData {
-    VSNode * node;
-    VSNode * ref_node;
-    const VSVideoInfo * vi;
+    VSNode * node {};
+    VSNode * ref_node {};   // optional guide clip
+    const VSVideoInfo * vi {};
 
-    int device_id, num_streams;
-    int bits, elem_bytes;
+    int bits {}, elem_bytes {};
     bool process[3] { true, true, true };
 
-    std::shared_ptr<VK_Device> device;
+    std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
     VkPipelineLayout pipeline_layout {};
-    VkDescriptorPool desc_pool {};
-    VkShaderModule shared_module {};
-    VkShaderModule plain_module {};
-    VkDeviceSize upload_total {};
-    VkDeviceSize download_total {};
-    bool host_direct_upload {};  // src VRAM is host-mapped (ReBAR): no H2D copy
-    bool kd_download {};         // kernels write the GTT download staging directly
     std::array<BilateralPlaneConfig, 3> planes {};
-    FramePool<BilateralResource> pool;
+    VSGPUExecPool * pool {};
+
+    // VSFEEL_BILAT_TIMING=1: per-frame host stage split. Under the API the host
+    // side is only acquire/record/submit, but the split still says whether the
+    // frame is host- or GPU-bound, which no kernel timing can.
+    bool host_timing { false };
+    std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
+        ht_total_ns {}, ht_n {};
 
     ~BilateralData() {
-        if (!device) {
+        if (host_timing && ht_n.load()) {
+            const double n = static_cast<double>(ht_n.load());
+            fprintf(stderr,
+                "[bilat-timing] frames=%.0f per-frame us: acquire=%7.1f "
+                "record=%7.1f submit=%7.1f total=%7.1f\n",
+                n, ht_acquire_ns.load() / 1000.0 / n,
+                ht_record_ns.load() / 1000.0 / n,
+                ht_submit_ns.load() / 1000.0 / n, ht_total_ns.load() / 1000.0 / n);
+        }
+        if (!gpu) {
             return;
         }
-        VkDevice dev = device->device;
-        // retire this instance's own submissions (per queue) instead of
-        // idling the whole device, which other filters may be sharing
-        retire_instance(pool);
-
-        for (auto & resource : pool.items) {
-            if (resource.map) {
-                vkUnmapMemory(dev, resource.staging_mem);
-            }
-            if (resource.src_map) {
-                vkUnmapMemory(dev, resource.src_mem);
-            }
-            if (resource.dst_mem) {
-                vkFreeMemory(dev, resource.dst_mem, nullptr);
-            }
-            if (resource.dst_buf) {
-                vkDestroyBuffer(dev, resource.dst_buf, nullptr);
-            }
-            if (resource.src_mem) {
-                vkFreeMemory(dev, resource.src_mem, nullptr);
-            }
-            if (resource.src_buf) {
-                vkDestroyBuffer(dev, resource.src_buf, nullptr);
-            }
-            destroy_common(dev, resource);
+        // The pool drains every submission it made before it returns, so the
+        // pipelines and layouts below are safe to destroy afterwards.
+        if (pool) {
+            gpu->api->freeGPUExecPool(pool);
+            pool = nullptr;
         }
-
-        VkPipeline destroyed_pipelines[3] {};
+        VkDevice dev = gpu->device;
+        VkPipeline destroyed[3] {};
         int num_destroyed = 0;
         for (auto & plane : planes) {
             if (!plane.pipeline) {
                 continue;
             }
-            bool already_destroyed = false;
+            bool seen = false;
             for (int i = 0; i < num_destroyed; ++i) {
-                if (destroyed_pipelines[i] == plane.pipeline) {
-                    already_destroyed = true;
-                    break;
-                }
+                seen |= destroyed[i] == plane.pipeline;
             }
-            if (already_destroyed) {
+            if (seen) {
                 continue;
             }
-            destroyed_pipelines[num_destroyed++] = plane.pipeline;
-            vkDestroyPipeline(dev, plane.pipeline, nullptr);
-        }
-        if (desc_pool) {
-            vkDestroyDescriptorPool(dev, desc_pool, nullptr);
+            destroyed[num_destroyed++] = plane.pipeline;
+            gpu->vk->vkDestroyPipeline(dev, plane.pipeline, nullptr);
         }
         if (pipeline_layout) {
-            vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
+            gpu->vk->vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
         }
         if (set_layout) {
-            vkDestroyDescriptorSetLayout(dev, set_layout, nullptr);
+            gpu->vk->vkDestroyDescriptorSetLayout(dev, set_layout, nullptr);
         }
-        if (shared_module) {
-            vkDestroyShaderModule(dev, shared_module, nullptr);
-        }
-        if (plain_module) {
-            vkDestroyShaderModule(dev, plain_module, nullptr);
-        }
-
-        release_device(device);
     }
 };
 
@@ -206,10 +154,9 @@ static constexpr std::array<VkSpecializationMapEntry, 9> plain_entries {{
     { 11, 44, sizeof(int32_t) },
 }};
 
-// use_shared selects between the two kernels
 static std::variant<VkPipeline, std::string> create_pipeline(
-    const VK_Device & dev, bool use_shared, const BilateralSpecData & spec,
-    VkShaderModule module, VkPipelineLayout layout) {
+    const GPUDevice & dev, bool use_shared, const BilateralSpecData & spec,
+    const uint32_t * code, size_t code_size, VkPipelineLayout layout) {
 
     const VkSpecializationMapEntry * entries;
     uint32_t entry_count;
@@ -220,104 +167,175 @@ static std::variant<VkPipeline, std::string> create_pipeline(
         entries = plain_entries.data();
         entry_count = static_cast<uint32_t>(std::size(plain_entries));
     }
-    return create_compute_pipeline(
-        dev, module, layout, entries, &spec, entry_count, sizeof(spec), "bilateral");
-}
-
-// Records the dispatch sequence for all planes into a single pre-recorded
-// command buffer. The frame bytes are moved by two big DMA copies at the
-// head and tail (staging upload area -> VRAM src, VRAM dst -> staging
-// download area); the kernels then read and write device-local VRAM only
-// (or host-mapped VRAM / GTT staging directly on the fast paths, with the
-// corresponding copy skipped). All plane regions are disjoint, so the
-// dispatches of different planes can overlap on the GPU.
-static std::optional<std::string> record_command_buffer(
-    const BilateralData & d, BilateralResource & resource) {
-
-    VkCommandBufferBeginInfo begin_info {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .pInheritanceInfo = nullptr
-    };
-
-    if (vkBeginCommandBuffer(resource.cmd, &begin_info) != VK_SUCCESS) {
-        return "vkBeginCommandBuffer failed";
-    }
-
-        // upload: staging -> VRAM src (one copy, all planes are contiguous).
-        // Skipped when the src VRAM is host-mapped: the CPU memcpy of the
-        // frame already landed the bytes in VRAM before submission.
-        if (!d.host_direct_upload && d.upload_total > 0) {
-            const VkBufferCopy upload_region { 0, 0, d.upload_total };
-            vkCmdCopyBuffer(resource.cmd, resource.staging, resource.src_buf,
-                1, &upload_region);
-            VkMemoryBarrier copy_barrier {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
-            };
-            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &copy_barrier, 0, nullptr, 0, nullptr);
-        }
-
-        for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
-        if (!d.process[plane]) {
-            continue;
-        }
-        const auto & cfg = d.planes[plane];
-
-        vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.pipeline);
-        vkCmdBindDescriptorSets(
-            resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
-        {
-            // push constants are element offsets into the bound buffers;
-            // kd_download: the output SSBO is the GTT staging (the kernels'
-            // plain coalesced stores land straight in host memory); the dst
-            // push constant then addresses the staging download region.
-            int32_t push_constants[2] {
-                static_cast<int32_t>(cfg.src_elem),
-                static_cast<int32_t>(d.kd_download ? cfg.dst_stage_elem : cfg.dst_elem)
-            };
-            vkCmdPushConstants(
-                resource.cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                0, sizeof(push_constants), push_constants);
-        }
-        vkCmdDispatch(resource.cmd, cfg.grid_x, cfg.grid_y, 1);
-        if (env_flag("VSFEEL_BILAT_NODISPATCH") || env_flag("BILATERAL_NODISPATCH")) {
-            vkCmdDispatch(resource.cmd, 1, 1, 1);
-        }
-    }
-
-        // download: VRAM dst -> staging (one copy, all planes contiguous).
-        // Skipped for kd_download — the kernels already wrote the staging
-        // download region directly (plain stores, no atomics).
-        if (!d.kd_download && d.download_total > 0) {
-            VkMemoryBarrier kernel_barrier {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT
-            };
-            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &kernel_barrier, 0, nullptr, 0, nullptr);
-            const VkBufferCopy download_region { 0, d.upload_total, d.download_total };
-            vkCmdCopyBuffer(resource.cmd, resource.dst_buf, resource.staging,
-                1, &download_region);
-        }
-
-    if (vkEndCommandBuffer(resource.cmd) != VK_SUCCESS) {
-        return "vkEndCommandBuffer failed";
-    }
-
-    return std::nullopt;
+    return gpu_create_pipeline(dev, code, code_size, layout, entries, &spec,
+        entry_count, sizeof(spec), "bilateral");
 }
 
 // ---------------------------------------------------------------------------
 // Frame processing
 // ---------------------------------------------------------------------------
+
+static void bilateral_process_mask(const BilateralData & d, int numPlanes,
+                                   bool & any_process, bool & all_process) {
+    any_process = false;
+    all_process = true;
+    for (int p = 0; p < numPlanes; ++p) {
+        any_process |= d.process[p];
+        all_process &= d.process[p];
+    }
+}
+
+// GPU input: the kernels read the source (and guide) planes and write the output
+// frame's planes in place. The core owns every transfer.
+static const VSFrame * bilateral_gpu_frame(
+    BilateralData * d, int n, VSFrameContext * frameCtx, VSCore * core,
+    const VSAPI * vsapi) {
+
+    const int numPlanes = d->vi->format.numPlanes;
+    const VSFrame * src = vsapi->getFrameFilter(n, d->node, frameCtx);
+    const VSFrame * ref = d->ref_node
+        ? vsapi->getFrameFilter(n, d->ref_node, frameCtx) : nullptr;
+
+    bool any_process = false, all_process = true;
+    bilateral_process_mask(*d, numPlanes, any_process, all_process);
+
+    // Unprocessed planes ride along from the source frame, keeping their own
+    // producer pairs; everything processed is written by this submission.
+    // newVideoFrame2 infers residency from the plane sources, so a frame with no
+    // source plane at all has to come from newGPUVideoFrame.
+    const int pl[] = { 0, 1, 2 };
+    const VSFrame * fr[] = {
+        d->process[0] ? nullptr : src,
+        d->process[1] ? nullptr : src,
+        d->process[2] ? nullptr : src
+    };
+    VSFrame * dst = all_process
+        ? d->gpu->api->newGPUVideoFrame(&d->vi->format, d->vi->width,
+              d->vi->height, src, core)
+        : vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height,
+              fr, pl, src, core);
+    if (!dst) {
+        vsfeel_trace_error("BilateralVK", n, "failed to allocate the output frame",
+                           d->gpu.get());
+        vsapi->setFilterError("BilateralVK: failed to allocate the output frame", frameCtx);
+        if (ref) {
+            vsapi->freeFrame(ref);
+        }
+        vsapi->freeFrame(src);
+        return nullptr;
+    }
+
+    // Nothing to run: every plane shares from the source, so the frame is
+    // already complete and an empty submission would only cost a round trip.
+    if (!any_process) {
+        if (ref) {
+            vsapi->freeFrame(ref);
+        }
+        vsapi->freeFrame(src);
+        return dst;
+    }
+
+    auto t0 = d->host_timing ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point {};
+    vsfeel_trace_frame_begin();
+    vsfeel_trace_mark("acquire");
+
+    char errbuf[512] {};
+    VSGPUExecContext * ctx = d->gpu->api->gpuExecAcquire(d->pool, errbuf, sizeof(errbuf));
+    auto fail = [&](const std::string & message) -> const VSFrame * {
+        if (ctx) {
+            d->gpu->api->gpuExecAbandon(ctx);
+            ctx = nullptr;
+        }
+        vsfeel_trace_error("BilateralVK", n, message, d->gpu.get());
+        vsapi->setFilterError(("BilateralVK: " + message).c_str(), frameCtx);
+        vsapi->freeFrame(dst);
+        if (ref) {
+            vsapi->freeFrame(ref);
+        }
+        vsapi->freeFrame(src);
+        return nullptr;
+    };
+    if (!ctx) {
+        return fail("could not acquire a recording context: "s + errbuf);
+    }
+    auto t1 = d->host_timing ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point {};
+
+    // The kernels read the source (and the guide) and write the output planes
+    // in place; each plane is a disjoint dispatch, so no barrier is needed.
+    vsfeel_trace_mark("record");
+    VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
+    for (int p = 0; p < numPlanes; ++p) {
+        if (!d->process[p]) {
+            continue;
+        }
+        VSVulkanPlaneInfo src_plane {};
+        if (d->gpu->api->getGPUPlane(src, p, &src_plane)) {
+            return fail("source plane " + std::to_string(p) + " is not GPU resident");
+        }
+        VSVulkanPlaneInfo dst_plane {};
+        if (d->gpu->api->getGPUPlane(dst, p, &dst_plane)) {
+            return fail("output plane " + std::to_string(p) + " is not GPU resident");
+        }
+        VkBuffer ref_buffer = src_plane.buffer;
+        if (d->ref_node) {
+            VSVulkanPlaneInfo ref_plane {};
+            if (d->gpu->api->getGPUPlane(ref, p, &ref_plane)) {
+                return fail("guide plane " + std::to_string(p) + " is not GPU resident");
+            }
+            ref_buffer = ref_plane.buffer;
+        }
+
+        const auto & cfg = d->planes[p];
+        d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.pipeline);
+        // binding 2 is the guide; without one the source stands in for it and
+        // the shader's HAS_REF==0 path never reads it
+        const VkBuffer buffers[3] { src_plane.buffer, dst_plane.buffer, ref_buffer };
+        gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 3);
+        d->gpu->vk->vkCmdDispatch(cmd, cfg.grid_x, cfg.grid_y, 1);
+    }
+    auto t2 = d->host_timing ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point {};
+
+    d->gpu->api->gpuExecReadsFrame(ctx, src);
+    if (d->ref_node) {
+        d->gpu->api->gpuExecReadsFrame(ctx, ref);
+    }
+    for (int p = 0; p < numPlanes; ++p) {
+        if (d->process[p]) {
+            d->gpu->api->gpuExecWritesPlane(ctx, dst, p);
+        }
+    }
+
+    vsfeel_trace_mark("submit");
+    uint64_t signaled = 0;
+    const int submit_error = d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf, sizeof(errbuf));
+    ctx = nullptr;  // consumed either way
+    if (submit_error) {
+        return fail("submit failed: "s + errbuf);
+    }
+    auto t3 = d->host_timing ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point {};
+
+    if (d->host_timing) {
+        const auto ns = [](auto a, auto b) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+        };
+        d->ht_acquire_ns += ns(t0, t1);
+        d->ht_record_ns += ns(t1, t2);
+        d->ht_submit_ns += ns(t2, t3);
+        d->ht_total_ns += ns(t0, t3);
+        d->ht_n.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (ref) {
+        vsapi->freeFrame(ref);
+    }
+    vsapi->freeFrame(src);
+    return dst;
+}
 
 static const VSFrame *VS_CC BilateralGetFrame(
     int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData,
@@ -330,224 +348,13 @@ static const VSFrame *VS_CC BilateralGetFrame(
         if (d->ref_node) {
             vsapi->requestFrameFilter(n, d->ref_node, frameCtx);
         }
-    } else if (activationReason == arAllFramesReady) {
-        const VSFrame * src = vsapi->getFrameFilter(n, d->node, frameCtx);
-        const VSFrame * ref = nullptr;
-        if (d->ref_node) {
-            ref = vsapi->getFrameFilter(n, d->ref_node, frameCtx);
-        }
-
-        const int pl[] = { 0, 1, 2 };
-        const VSFrame * fr[] = {
-            d->process[0] ? nullptr : src,
-            d->process[1] ? nullptr : src,
-            d->process[2] ? nullptr : src
-        };
-
-        VSFrame * dst = vsapi->newVideoFrame2(
-            &d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
-
-        {
-            // Host phase probe (VSFEEL_BILAT_TRACE): accumulated microsecond
-            // stage timings, reported as averages every 200 frames. Zero
-            // overhead when unset (no clock reads, no atomic traffic).
-            static const bool trace = vsfeel_debug_trace("VSFEEL_BILAT_TRACE");
-            static std::atomic<uint64_t> t_up {}, t_wait {}, t_dl {}, t_bit {}, t_sub {}, t_acq {};
-            static std::atomic<uint32_t> t_nf {};
-            static std::atomic<int> t_inf {}, t_peak {};
-            auto now_us = [] { return std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count(); };
-            auto t0 = trace ? now_us() : 0;
-            auto mark = [&](std::atomic<uint64_t> & acc) {
-                if (trace) {
-                    acc += now_us() - t0; t0 = now_us();
-                }
-            };
-            auto dump = [&] {
-                if (!trace) {
-                    return;
-                }
-                uint32_t nf = t_nf.load();
-                if (nf > 0 && nf % 200 == 0) {
-                    fprintf(stderr, "[perf] frames=%u inf=%d acq=%.2f up=%.2f sub=%.2f wait=%.2f bit=%.2f (ms avg)\n",
-                        nf, t_peak.load(),
-                        t_acq.load()/double(nf)/1e3,
-                        t_up.load()/double(nf)/1e3, t_sub.load()/double(nf)/1e3,
-                        t_wait.load()/double(nf)/1e3,
-                        t_bit.load()/double(nf)/1e3);
-                }
-            };
-
-            auto t_acq0 = trace ? now_us() : 0;
-            vsfeel_trace_frame_begin();
-            auto resource = d->pool.take();
-            vsfeel_trace_mark("pool");
-            if (trace) {
-                t_acq += now_us() - t_acq0;
-            }
-            // reset the stage clock after the acquire: the take() wait is
-            // accounted in t_acq and must not leak into t_up
-            if (trace) {
-                t0 = now_us();
-            }
-            int peak = 0;
-            if (trace) {
-                int inf = t_inf.fetch_add(1) + 1;
-                peak = t_peak.load();
-                while (inf > peak && !t_peak.compare_exchange_weak(peak, inf)) {}
-            }
-
-        auto set_error = [&](const std::string & error_message) {
-            vsfeel_trace_error("BilateralVK", n, error_message, d->device.get());
-            d->pool.give_back(std::move(resource));
-            vsapi->setFilterError(("BilateralVK: " + error_message).c_str(), frameCtx);
-            if (d->ref_node) {
-                vsapi->freeFrame(ref);
-            }
-            vsapi->freeFrame(src);
-            vsapi->freeFrame(dst);
-            return nullptr;
-        };
-
-        VkDevice dev = d->device->device;
-        float * map = resource.map;
-
-        const bool coherent =
-            !!(d->device->mem_props.memoryTypes[resource.staging_type_index].propertyFlags &
-               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-        const bool nocpu = env_flag("VSFEEL_BILAT_NOCPU") || env_flag("BILATERAL_NOCPU");
-        const bool nodl = env_flag("VSFEEL_BILAT_NODL") || env_flag("BILATERAL_NODL");
-
-        // the upload target is either the host-mapped VRAM src window
-        // (host-direct path: the bytes land in VRAM with no GPU copy) or the
-        // staging upload area (the command buffer's H2D copy moves them)
-        uint8_t * const upload_base = d->host_direct_upload
-            ? static_cast<uint8_t *>(resource.src_map)
-            : static_cast<uint8_t *>(static_cast<void *>(map));
-
-        for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-            if (!d->process[plane]) {
-                continue;
-            }
-
-            int height = vsapi->getFrameHeight(src, plane);
-            int s_pitch = vsapi->getStride(src, plane);
-            const auto & cfg = d->planes[plane];
-
-            auto srcp = vsapi->getReadPtr(src, plane);
-            auto dstp = upload_base + cfg.upload_offset;
-
-            // raw byte copy of the plane. The GPU plane pitch rounds the
-            // visible width up to 16 bytes and need not match either the
-            // VapourSynth frame stride or the visible row length, so copy the
-            // visible rows one at a time unless all three coincide. Plain
-            // memcpy into the mapped VRAM window (the window is write-
-            // combined: streaming stores measured slower), streaming stores
-            // into GTT staging (keeps the lines clean in DRAM so the GPU does
-            // not pay snoop/writeback stalls)
-            if (!nocpu) {
-                const size_t row_bytes = static_cast<size_t>(cfg.width) * d->elem_bytes;
-                copy_plane_out(dstp, cfg.pitch_bytes, srcp, s_pitch, row_bytes,
-                    height, !d->host_direct_upload);
-
-                // reference plane goes directly below the source plane
-                if (d->ref_node) {
-                    auto refp = vsapi->getReadPtr(ref, plane);
-                    copy_plane_out(dstp + static_cast<int64_t>(height) * cfg.pitch_bytes,
-                        cfg.pitch_bytes, refp, vsapi->getStride(ref, plane),
-                        row_bytes, height, true);
-                }
-            }
-        }
-
-        mark(t_up);
-
-        if (!coherent && !nocpu) {
-            std::vector<VkMappedMemoryRange> ranges;
-            ranges.reserve(d->vi->format.numPlanes * 2);
-            for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-                if (!d->process[plane]) {
-                    continue;
-                }
-                const auto & cfg = d->planes[plane];
-                ranges.push_back(mapped_range(*d->device, resource.staging_mem,
-                    cfg.upload_offset, cfg.upload_size));
-            }
-            checkVK(vkFlushMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
-        }
-
-        // The guide plane is always NT-stored (and the source planes are on the
-        // staging path); NT stores are weakly ordered, so drain them before the
-        // GPU is told to read the upload window.
-        _mm_sfence();
-
-        vsfeel_trace_mark("submit");
-        checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
-            resource.cmd, resource.fence));
-        mark(t_sub);
-
-        vsfeel_trace_mark("wait");
-        checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
-        mark(t_wait);
-
-        if (!coherent && !nocpu) {
-            std::vector<VkMappedMemoryRange> ranges;
-            ranges.reserve(d->vi->format.numPlanes);
-            for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-                if (!d->process[plane]) {
-                    continue;
-                }
-                const auto & cfg = d->planes[plane];
-                ranges.push_back(mapped_range(*d->device, resource.staging_mem,
-                    d->upload_total + cfg.download_offset, cfg.download_size));
-            }
-            checkVK(vkInvalidateMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
-        }
-
-        if (!nocpu) {
-        if (!nodl) {
-            for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-                if (!d->process[plane]) {
-                    continue;
-                }
-
-                int height = vsapi->getFrameHeight(src, plane);
-                const auto & cfg = d->planes[plane];
-
-                auto dstp = vsapi->getWritePtr(dst, plane);
-                const uint8_t * h_bufferp =
-                    static_cast<const uint8_t *>(static_cast<const void *>(map)) + d->upload_total + cfg.download_offset;
-
-                // raw byte copy of the plane, honouring the GPU plane pitch
-                // and the destination frame's stride
-                copy_plane_read(dstp, vsapi->getStride(dst, plane), h_bufferp,
-                    cfg.pitch_bytes, static_cast<size_t>(cfg.width) * d->elem_bytes,
-                    height);
-            }
-        }
-        }
-
-        mark(t_bit);
-        mark(t_dl);
-        if (trace) {
-            t_inf.fetch_sub(1);
-            t_nf.fetch_add(1);
-            dump();
-        }
-
-        d->pool.give_back(std::move(resource));
-        }
-
-        if (d->ref_node) {
-            vsapi->freeFrame(ref);
-        }
-        vsapi->freeFrame(src);
-
-        return dst;
+        return nullptr;
+    }
+    if (activationReason != arAllFramesReady) {
+        return nullptr;
     }
 
-    return nullptr;
+    return bilateral_gpu_frame(d, n, frameCtx, core, vsapi);
 }
 
 // ---------------------------------------------------------------------------
@@ -573,16 +380,19 @@ static void VS_CC BilateralCreate(
 
     auto d { std::make_unique<BilateralData>() };
 
+    // Opt-in host-path probe: the default path records no clocks.
+    d->host_timing = vsfeel_debug_probe("VSFEEL_BILAT_TIMING");
+
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
 
     int error;
 
     d->ref_node = vsapi->mapGetNode(in, "ref", 0, &error);
-    bool has_ref = d->ref_node != nullptr;
+    const bool has_ref = d->ref_node != nullptr;
 
     auto set_error = [&](const std::string & error_message) {
-        vsfeel_trace_error("BilateralVK", -1, error_message, d->device.get());
+        vsfeel_trace_error("BilateralVK", -1, error_message, d->gpu.get());
         vsapi->mapSetError(out, ("BilateralVK: " + error_message).c_str());
         if (has_ref) {
             vsapi->freeNode(d->ref_node);
@@ -598,16 +408,18 @@ static void VS_CC BilateralCreate(
         (sample == stInteger && bps != 16) ||
         (sample == stFloat && bps != 32)
     ) {
-
         return set_error("input bitdepth must be 16 (integer) or 32 (float).");
     }
 
     d->bits = d->vi->format.bitsPerSample;
     d->elem_bytes = d->bits / 8;
 
-    const auto ref_vi = vsapi->getVideoInfo(d->ref_node);
-    if (d->ref_node && (!vsh::isSameVideoInfo(d->vi, ref_vi) || d->vi->numFrames != ref_vi->numFrames)) {
-        return set_error("\"ref\" must be of the same format as \"clip\"");
+    if (has_ref) {
+        const auto ref_vi = vsapi->getVideoInfo(d->ref_node);
+        if (!vsh::isSameVideoInfo(d->vi, ref_vi) ||
+            d->vi->numFrames != ref_vi->numFrames) {
+            return set_error("\"ref\" must be of the same format and dimensions as \"clip\"");
+        }
     }
 
     std::array<float, 3> sigma_spatial;
@@ -637,7 +449,8 @@ static void VS_CC BilateralCreate(
 
     std::array<float, 3> sigma_spatial_scaled;
     for (int i = 0; i < std::ssize(sigma_spatial); ++i) {
-        sigma_spatial_scaled[i] = (-0.5f / (sigma_spatial[i] * sigma_spatial[i])) * std::numbers::log2e_v<float>;
+        sigma_spatial_scaled[i] = (-0.5f / (sigma_spatial[i] * sigma_spatial[i])) *
+            std::numbers::log2e_v<float>;
     }
 
     std::array<float, 3> sigma_color;
@@ -661,7 +474,8 @@ static void VS_CC BilateralCreate(
         if (sigma_color[i] < FLT_EPSILON) {
             d->process[i] = false;
         } else {
-            sigma_color_scaled[i] = (-0.5f / (sigma_color[i] * sigma_color[i])) * std::numbers::log2e_v<float>;
+            sigma_color_scaled[i] = (-0.5f / (sigma_color[i] * sigma_color[i])) *
+                std::numbers::log2e_v<float>;
         }
     }
 
@@ -680,16 +494,20 @@ static void VS_CC BilateralCreate(
     }
 
     int device_id = vsh::int64ToIntS(vsapi->mapGetInt(in, "device_id", 0, &error));
-    if (error) {
-        device_id = 0;
+    // Device selection moved to the core (core.set_vulkan_device): one Vulkan
+    // device per process, picked before any GPU filter runs. The argument stays
+    // accepted so existing scripts keep loading; a negative one is still an
+    // error because it never selected anything.
+    if (!error && device_id < 0) {
+        return set_error("\"device_id\" must be non-negative; under the R80 GPU API "
+                         "device selection is core.set_vulkan_device");
     }
 
-    d->num_streams = vsh::int64ToIntS(vsapi->mapGetInt(in, "num_streams", 0, &error));
-    if (error) {
-        d->num_streams = 4;
-    }
-    if (d->num_streams < 1 || d->num_streams > 32) {
-        return set_error("\"num_streams\" must be 1..32");
+    // "num_streams" is accepted for compatibility and no longer selects
+    // anything: how many frames are in flight is the core's call now.
+    if (vsapi->mapGetInt(in, "num_streams", 0, &error), !error &&
+        vsfeel_debug_flag("VSFEEL_BILAT_DEPRECATED")) {
+        fprintf(stderr, "[bilateral] num_streams is ignored under the R80 GPU API\n");
     }
 
     bool use_shared_memory = !!vsapi->mapGetInt(in, "use_shared_memory", 0, &error);
@@ -717,16 +535,15 @@ static void VS_CC BilateralCreate(
     }
 
     {
-        const auto result = get_device(device_id);
+        const auto result = get_gpu_device(core, vsapi);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
-        d->device = std::get<std::shared_ptr<VK_Device>>(result);
-        d->device_id = device_id;
+        d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
     }
 
     {
-        const VkPhysicalDeviceLimits & limits = d->device->limits;
+        const VkPhysicalDeviceLimits & limits = d->gpu->limits;
 
         // shrink the default block size if the device cannot host it
         if (static_cast<uint32_t>(block_x) > limits.maxComputeWorkGroupSize[0] ||
@@ -744,60 +561,39 @@ static void VS_CC BilateralCreate(
         }
     }
 
-    // Pipeline layouts and descriptor pool
+    // Push descriptors: each dispatch rebinds its own view of the planes, so
+    // nothing is allocated from a pool and nothing survives the command buffer.
     {
-        VkDescriptorSetLayoutBinding bindings[2] {
-            { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        };
-
-        VkDescriptorSetLayoutCreateInfo layout_info {
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .bindingCount = 2,
-            .pBindings = bindings
-        };
-
-        checkVK(vkCreateDescriptorSetLayout(
-            d->device->device, &layout_info, nullptr, &d->set_layout));
+        const auto result = gpu_push_set_layout(*d->gpu, 3);
+        if (std::holds_alternative<std::string>(result)) {
+            return set_error(std::get<std::string>(result));
+        }
+        d->set_layout = std::get<VkDescriptorSetLayout>(result);
     }
     {
-        VkPushConstantRange push_constant_range {
-            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-            .offset = 0,
-            .size = 2 * sizeof(int32_t)
-        };
-
-        VkPipelineLayoutCreateInfo pipeline_layout_info {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .setLayoutCount = 1,
-            .pSetLayouts = &d->set_layout,
-            .pushConstantRangeCount = 1,
-            .pPushConstantRanges = &push_constant_range
-        };
-
-        checkVK(vkCreatePipelineLayout(
-            d->device->device, &pipeline_layout_info, nullptr, &d->pipeline_layout));
+        const auto result = gpu_pipeline_layout(*d->gpu, d->set_layout, 0);
+        if (std::holds_alternative<std::string>(result)) {
+            return set_error(std::get<std::string>(result));
+        }
+        d->pipeline_layout = std::get<VkPipelineLayout>(result);
     }
+
+    // The plane geometry has to be the one the core's GPU frames carry, because
+    // kernel addressing is STRIDE elements per row. A GPU frame's stride is the
+    // CPU frame's stride (the core stores planes exactly as the CPU allocator
+    // would), so it is read off a scratch frame here rather than guessed from an
+    // alignment rule.
+    int plane_stride[3] {};
     {
-        VkDescriptorPoolSize pool_size {
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * static_cast<uint32_t>(d->num_streams)
-        };
-
-        VkDescriptorPoolCreateInfo pool_info {
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .maxSets = static_cast<uint32_t>(d->num_streams),
-            .poolSizeCount = 1,
-            .pPoolSizes = &pool_size
-        };
-
-        checkVK(vkCreateDescriptorPool(
-            d->device->device, &pool_info, nullptr, &d->desc_pool));
+        VSFrame * probe = vsapi->newVideoFrame(&d->vi->format, d->vi->width,
+                                               d->vi->height, nullptr, core);
+        if (probe == nullptr) {
+            return set_error("could not allocate a probe frame to read the plane stride");
+        }
+        for (int p = 0; p < d->vi->format.numPlanes; ++p) {
+            plane_stride[p] = static_cast<int>(vsapi->getStride(probe, p) / d->elem_bytes);
+        }
+        vsapi->freeFrame(probe);
     }
 
     int width = d->vi->width;
@@ -805,7 +601,6 @@ static void VS_CC BilateralCreate(
     int ssw = d->vi->format.subSamplingW;
     int ssh = d->vi->format.subSamplingH;
 
-    // Per-plane pipeline configuration, with deduplication for identical planes
     struct PipelineKey {
         int width;
         int height;
@@ -824,17 +619,26 @@ static void VS_CC BilateralCreate(
     std::array<bool, 3> plane_shared {};
 
     std::array<BilateralPlaneConfig, 3> & planes = d->planes;
-    bool need_plain = false;
 
     for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
         if (!d->process[plane]) {
             continue;
         }
 
-        int plane_width { plane == 0 ? width : width >> ssw };
-        int plane_height { plane == 0 ? height : height >> ssh };
-        int pitch_bytes = (plane_width * d->elem_bytes + 15) & ~15;
-        int stride = pitch_bytes / d->elem_bytes;
+        const int plane_width { plane == 0 ? width : width >> ssw };
+        const int plane_height { plane == 0 ? height : height >> ssh };
+        const int stride = plane_stride[plane];
+
+        // The kernel addresses a plane through signed 32-bit element offsets;
+        // reject a plane whose last element would not fit rather than letting it
+        // wrap and write outside the buffer.
+        const int64_t last = static_cast<int64_t>(plane_height - 1) * stride + plane_width - 1;
+        if (last > INT32_MAX) {
+            return set_error("plane " + std::to_string(plane) + " is too large: " +
+                std::to_string(plane_width) + "x" + std::to_string(plane_height) +
+                " at stride " + std::to_string(stride) +
+                " overflows the kernel's 32-bit addressing");
+        }
 
         pipeline_keys[plane] = {
             plane_width, plane_height, stride,
@@ -843,7 +647,8 @@ static void VS_CC BilateralCreate(
         pipeline_valid[plane] = true;
     }
 
-    VkDevice dev = d->device->device;
+    const uint32_t max_grid_x = d->gpu->limits.maxComputeWorkGroupCount[0];
+    const uint32_t max_grid_y = d->gpu->limits.maxComputeWorkGroupCount[1];
 
     for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
         if (!pipeline_valid[plane]) {
@@ -856,10 +661,6 @@ static void VS_CC BilateralCreate(
         cfg.width = key.width;
         cfg.height = key.height;
         cfg.stride = key.stride;
-        cfg.pitch_bytes = cfg.stride * d->elem_bytes;
-
-        const uint32_t max_grid_x = d->device->limits.maxComputeWorkGroupCount[0];
-        const uint32_t max_grid_y = d->device->limits.maxComputeWorkGroupCount[1];
 
         cfg.grid_x = static_cast<uint32_t>(std::min<int64_t>(
             (cfg.width - 1) / block_x + 1, static_cast<int64_t>(max_grid_x)));
@@ -868,58 +669,32 @@ static void VS_CC BilateralCreate(
 
         const int tile_x = 2 * key.radius + block_x;
         const int tile_y = 2 * key.radius + block_y;
-        // the shared kernel keeps the source tile plus the guide tile (if
-        // any); the output goes straight to dst[] — there is no output tile
+        // the shared kernel keeps the source tile plus the guide tile (if any);
+        // the output goes straight to dst[] — there is no output tile
         const size_t shared_bytes =
             static_cast<size_t>(1 + has_ref) * tile_x * tile_y * sizeof(float);
 
-        // gate on the device's real LDS limit: the old hardcoded 48 KiB cap
-        // sent wide radii that still fit to the ~4x slower plain kernel
-        bool use_shared = use_shared_memory &&
-            shared_bytes <= d->device->limits.maxComputeSharedMemorySize;
-        plane_shared[plane] = use_shared;
+        // gate on the device's real LDS limit: the old hardcoded 48 KiB cap sent
+        // wide radii that still fit to the ~4x slower plain kernel
+        plane_shared[plane] = use_shared_memory &&
+            shared_bytes <= d->gpu->limits.maxComputeSharedMemorySize;
     }
 
-    // Shader modules (create lazily — only those actually used)
-    {
-        const uint32_t * shared_code = nullptr;
-        size_t shared_size = 0;
-        const uint32_t * plain_code = nullptr;
-        size_t plain_size = 0;
-        switch (d->bits) {
-            case 16:
-                shared_code = bilateral_shared_16_spv; shared_size = bilateral_shared_16_spv_size;
-                plain_code = bilateral_plain_16_spv; plain_size = bilateral_plain_16_spv_size;
-                break;
-            case 32:
-                shared_code = bilateral_shared_32_spv; shared_size = bilateral_shared_32_spv_size;
-                plain_code = bilateral_plain_32_spv; plain_size = bilateral_plain_32_spv_size;
-                break;
-            default:
-                return set_error("unsupported bit depth");
-        }
-
-        bool need_shared = false;
-        for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-            if (pipeline_valid[plane]) {
-                need_shared |= plane_shared[plane];
-                need_plain |= !plane_shared[plane];
-            }
-        }
-        if (need_shared) {
-            auto result = create_shader_module(*d->device, shared_code, shared_size);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->shared_module = std::get<VkShaderModule>(result);
-        }
-        if (need_plain) {
-            auto result = create_shader_module(*d->device, plain_code, plain_size);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->plain_module = std::get<VkShaderModule>(result);
-        }
+    const uint32_t * shared_code = nullptr;
+    size_t shared_size = 0;
+    const uint32_t * plain_code = nullptr;
+    size_t plain_size = 0;
+    switch (d->bits) {
+        case 16:
+            shared_code = bilateral_shared_16_spv; shared_size = bilateral_shared_16_spv_size;
+            plain_code = bilateral_plain_16_spv; plain_size = bilateral_plain_16_spv_size;
+            break;
+        case 32:
+            shared_code = bilateral_shared_32_spv; shared_size = bilateral_shared_32_spv_size;
+            plain_code = bilateral_plain_32_spv; plain_size = bilateral_plain_32_spv_size;
+            break;
+        default:
+            return set_error("unsupported bit depth");
     }
 
     for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
@@ -945,8 +720,6 @@ static void VS_CC BilateralCreate(
 
         const int tile_x = 2 * key.radius + block_x;
         const int tile_y = 2 * key.radius + block_y;
-        // the shared kernel keeps the source tile plus the guide tile (if
-        // any); the output goes straight to dst[] — there is no output tile
         const size_t shared_bytes =
             static_cast<size_t>(1 + has_ref) * tile_x * tile_y * sizeof(float);
 
@@ -966,8 +739,9 @@ static void VS_CC BilateralCreate(
         };
 
         const auto result = create_pipeline(
-            *d->device, plane_shared[plane], spec,
-            plane_shared[plane] ? d->shared_module : d->plain_module,
+            *d->gpu, plane_shared[plane], spec,
+            plane_shared[plane] ? shared_code : plain_code,
+            plane_shared[plane] ? shared_size : plain_size,
             d->pipeline_layout);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
@@ -975,298 +749,36 @@ static void VS_CC BilateralCreate(
         cfg.pipeline = std::get<VkPipeline>(result);
     }
 
-    // Buffer region offsets (raw bytes), each region 32-byte aligned so the
-    // streaming copies can use aligned loads/stores. The staging layout and
-    // the VRAM src/dst layouts are identical, so one DMA copy per direction
-    // moves every plane at once.
-    VkDeviceSize upload_total = 0;
-    VkDeviceSize download_total = 0;
-
-    for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-        if (!pipeline_valid[plane]) {
-            continue;
+    {
+        char err[512] {};
+        d->pool = d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
+        if (d->pool == nullptr) {
+            return set_error("createGPUExecPool failed: "s + err);
         }
-
-        auto & cfg = planes[plane];
-        VkDeviceSize plane_bytes =
-            static_cast<VkDeviceSize>(cfg.height) * cfg.pitch_bytes;
-
-        cfg.upload_offset = align32(upload_total);
-        cfg.upload_size = (1 + has_ref) * plane_bytes;
-        upload_total = align32(cfg.upload_offset + cfg.upload_size);
-
-        cfg.download_offset = align32(download_total);
-        cfg.download_size = plane_bytes;
-        download_total = align32(cfg.download_offset + cfg.download_size);
-
-        // the VRAM buffers mirror the staging layout byte-for-byte
-        cfg.src_elem = cfg.upload_offset / d->elem_bytes;
-        cfg.dst_elem = cfg.download_offset / d->elem_bytes;
-    }
-
-    d->upload_total = upload_total;
-    d->download_total = download_total;
-
-    // kd download addresses the staging download area, which begins at the
-    // FINAL upload_total — only known now, after every plane was laid out
-    for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-        if (!pipeline_valid[plane]) {
-            continue;
-        }
-        auto & cfg = planes[plane];
-        cfg.dst_stage_elem = (upload_total + cfg.download_offset) / d->elem_bytes;
-    }
-
-    const VkDeviceSize min_size = 4;
-    // the host-visible staging only carries raw plane bytes; the kernels'
-    // src/dst live in device-local VRAM (see below)
-    const VkDeviceSize staging_size = std::max(upload_total + download_total, 2 * min_size);
-    const VkDeviceSize src_size = std::max(upload_total, min_size);
-    const VkDeviceSize dst_size = std::max(download_total, min_size);
-
-    // Resources
-    // host-direct upload: the CPU memcpy writes the host-mapped VRAM src
-    // window directly (no GPU-side H2D copy); opt out with VSFEEL_BILAT_HD=0
-    // (plain VRAM src + staging upload + in-CB copy)
-    d->host_direct_upload = env_int("VSFEEL_BILAT_HD", 1) != 0;
-    // kernel-direct download: the bilateral kernels' plain coalesced stores
-    // write the GTT staging download region over PCIe directly, removing the
-    // GPU-side D2H copy; opt out with VSFEEL_BILAT_KD=0 for the VRAM+copy path
-    d->kd_download = env_int("VSFEEL_BILAT_KD", 1) != 0;
-    d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
-    d->pool.reserve(d->num_streams);
-
-    // Two queues feed the GPU with no idle bubbles: with one stream per
-    // queue (num_queues == num_streams) each queue drains while its worker
-    // does the post-fence CPU work (download memcpy + VS bookkeeping +
-    // next-frame upload) before the next submit; sharing a queue across
-    // streams keeps a next CB queued (ns=4: 2 queues = 1986 fps vs 4 queues
-    // = 1709 fps). Beyond 2 the gains stop (lock/CP overhead). Override
-    // with VSFEEL_BILAT_QUEUES=N for tuning.
-    uint32_t num_queues = resolve_queue_cap(
-        d->num_streams, d->device->queue_count, "VSFEEL_BILAT_QUEUES", 2);
-
-    for (int i = 0; i < d->num_streams; ++i) {
-        // Owned by the pool while it is being built: a mid-loop error return
-        // tears it down in ~BilateralData instead of leaking it (see
-        // FramePool::emplace).
-        BilateralResource & resource = d->pool.emplace();
-
-        {
-            VkBufferCreateInfo buffer_info {
-                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .size = staging_size,
-                // STORAGE_BUFFER: with kd_download the bilateral kernels write
-                // the download region as an SSBO; TRANSFER_*: the H2D/D2H
-                // copies of the non-host-direct paths
-                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = nullptr
-            };
-            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.staging));
-        }
-
-        {
-            const auto result = allocate_memory(
-                *d->device, resource.staging,
-                (env_flag("VSFEEL_BILAT_NOCPU") || env_flag("BILATERAL_NOCPU"))
-                    ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-                    : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                          VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            resource.staging_mem = std::get<AllocatedMemory>(result).memory;
-            resource.staging_type_index = std::get<AllocatedMemory>(result).type_index;
-        }
-
-        // device-local input planes: the kernels read them. With ReBAR the
-        // buffer is host-mapped so the CPU memcpy writes VRAM directly and
-        // the command buffer needs no H2D copy; if no host-visible device-
-        // local memory exists, fall back to a plain VRAM buffer filled by
-        // the H2D copy.
-        {
-            VkBufferCreateInfo buffer_info {
-                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .size = src_size,
-                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = nullptr
-            };
-            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.src_buf));
-
-            auto result = allocate_memory(
-                *d->device, resource.src_buf,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            if (std::holds_alternative<std::string>(result)) {
-                result = allocate_memory(
-                    *d->device, resource.src_buf, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                if (std::holds_alternative<std::string>(result)) {
-                    return set_error(std::get<std::string>(result));
-                }
-            } else if (d->host_direct_upload) {
-                // only take the host-mapped path when the allocation really
-                // is device-local (allocate_memory may relax the requirement)
-                const uint32_t ti = std::get<AllocatedMemory>(result).type_index;
-                const auto flags = d->device->mem_props.memoryTypes[ti].propertyFlags;
-                d->host_direct_upload =
-                    (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
-                    (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
-                    (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            }
-            resource.src_mem = std::get<AllocatedMemory>(result).memory;
-            resource.src_type_index = std::get<AllocatedMemory>(result).type_index;
-            if (d->host_direct_upload) {
-                checkVK(vkMapMemory(dev, resource.src_mem, 0, src_size, 0, &resource.src_map));
-            }
-        }
-
-        // device-local output planes: the kernels write them, the D2H DMA
-        // copy reads them. Not needed when the kernels write the staging
-        // download region directly (kd_download).
-        if (!d->kd_download) {
-            VkBufferCreateInfo buffer_info {
-                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .size = dst_size,
-                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = nullptr
-            };
-            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.dst_buf));
-
-            const auto result = allocate_memory(
-                *d->device, resource.dst_buf, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            resource.dst_mem = std::get<AllocatedMemory>(result).memory;
-        }
-
-        {
-            VkCommandPoolCreateInfo pool_info {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .queueFamilyIndex = d->device->queue_family
-            };
-            checkVK(vkCreateCommandPool(dev, &pool_info, nullptr, &resource.pool));
-        }
-
-        {
-            VkCommandBufferAllocateInfo alloc_info {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                .pNext = nullptr,
-                .commandPool = resource.pool,
-                .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                .commandBufferCount = 1
-            };
-            checkVK(vkAllocateCommandBuffers(dev, &alloc_info, &resource.cmd));
-        }
-
-        {
-            VkFenceCreateInfo fence_info {
-                .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0
-            };
-            checkVK(vkCreateFence(dev, &fence_info, nullptr, &resource.fence));
-        }
-
-        {
-            VkDescriptorSetAllocateInfo alloc_info {
-                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                .pNext = nullptr,
-                .descriptorPool = d->desc_pool,
-                .descriptorSetCount = 1,
-                .pSetLayouts = &d->set_layout
-            };
-            checkVK(vkAllocateDescriptorSets(dev, &alloc_info, &resource.desc_set));
-        }
-
-        {
-            VkDescriptorBufferInfo src_info {
-                .buffer = resource.src_buf,
-                .offset = 0,
-                .range = VK_WHOLE_SIZE
-            };
-            VkDescriptorBufferInfo dst_info {
-                .buffer = d->kd_download ? resource.staging : resource.dst_buf,
-                .offset = 0,
-                .range = VK_WHOLE_SIZE
-            };
-
-            VkWriteDescriptorSet writes[2] {
-                {
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext = nullptr,
-                    .dstSet = resource.desc_set,
-                    .dstBinding = 0,
-                    .dstArrayElement = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pImageInfo = nullptr,
-                    .pBufferInfo = &src_info,
-                    .pTexelBufferView = nullptr
-                },
-                {
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext = nullptr,
-                    .dstSet = resource.desc_set,
-                    .dstBinding = 1,
-                    .dstArrayElement = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pImageInfo = nullptr,
-                    .pBufferInfo = &dst_info,
-                    .pTexelBufferView = nullptr
-                },
-            };
-
-            vkUpdateDescriptorSets(dev, 2, writes, 0, nullptr);
-        }
-
-        if (!(env_flag("VSFEEL_BILAT_NOCPU") || env_flag("BILATERAL_NOCPU"))) {
-            checkVK(vkMapMemory(dev, resource.staging_mem, 0, staging_size, 0, reinterpret_cast<void **>(&resource.map)));
-        } else {
-            resource.map = nullptr;
-        }
-
-        resource.queue = d->device->queues[i % num_queues].queue;
-        resource.queue_lock = d->device->queues[i % num_queues].lock.get();
-
-        if (const auto err = record_command_buffer(*d, resource)) {
-            return set_error(*err);
-        }
-    }
-
-    VSFilterDependency deps[2] = {{d->node, rpStrictSpatial}};
-    int num_deps = 1;
-    if (has_ref) {
-        deps[1].source = d->ref_node;
-        deps[1].requestPattern = rpStrictSpatial;
-        num_deps = 2;
     }
 
     BilateralData *data = d.release();
 
-    vsapi->createVideoFilter(
-        out, "Bilateral", data->vi,
-        BilateralGetFrame, BilateralFree,
-        fmParallel, deps, num_deps, data, core);
-}
+    // A spatial filter, so the strict-spatial request pattern is the honest
+    // declaration for both inputs.
+    VSFilterDependency deps[2] = {
+        { data->node, rpStrictSpatial },
+        { data->ref_node, rpStrictSpatial }
+    };
 
+    // ffGPUOutput: the frames this filter returns live in VRAM and carry their
+    // own producer pairs, so the core never downloads them for a consumer that
+    // does not need host pixels.
+    VSNode * result = vsapi->createVideoFilterEx2(
+        "Bilateral", data->vi,
+        BilateralGetFrame, BilateralFree,
+        fmParallel, ffGPUOutput, deps, data->ref_node ? 2 : 1, data, core);
+    if (result == nullptr) {
+        vsapi->mapSetError(out, "BilateralVK: filter creation failed");
+        return;
+    }
+    vsapi->mapConsumeNode(out, "clip", result, maAppend);
+}
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -1275,7 +787,7 @@ static void VS_CC BilateralCreate(
 void vsfeel_register_bilateral(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
     vspapi->registerFunction(
         "Bilateral",
-        "clip:vnode;"
+        "clip:vnode:gpu;"
         "sigma_spatial:float[]:opt;"
         "sigma_color:float[]:opt;"
         "radius:int[]:opt;"
@@ -1284,8 +796,8 @@ void vsfeel_register_bilateral(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
         "use_shared_memory:int:opt;"
         "block_x:int:opt;"
         "block_y:int:opt;"
-        "ref:vnode:opt;",
-        "clip:vnode;",
+        "ref:vnode:gpu:opt;",
+        "clip:vnode:gpu;",
         BilateralCreate, nullptr, plugin
     );
 }

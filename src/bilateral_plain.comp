@@ -4,11 +4,14 @@
 /*
  * Bilateral filter compute shader, plain (non-shared-memory) variant.
  *
- * Compile-time variants: -DBITS=16|32 selects the staging element type.
- * All buffers hold native elements (uint16_t integer or float32) in
- * device-local VRAM (or host-visible staging for kernel-direct download),
- * so loads and stores are plain coalesced element accesses — no shift/mask
- * unpacking, no atomics, no pre-clearing of the download region.
+ * Compile-time variants: -DBITS=16|32 selects the element type. Each plane is
+ * bound whole into its own binding: src is the filtered source, ref the guide
+ * (bound to src when HAS_REF is 0) and dst the output frame plane. All three
+ * hold native elements, so loads and stores are plain coalesced accesses — no
+ * shift/mask unpacking, no dword packing, no atomics.
+ *
+ * STRIDE is the core's plane pitch in elements; only [0, WIDTH) columns and
+ * [0, HEIGHT) rows are meaningful.
  */
 
 #if !defined(BITS)
@@ -37,28 +40,32 @@ layout(local_size_x_id = 10, local_size_y_id = 11, local_size_z = 1) in;
 
 layout(std430, binding = 0) readonly buffer SrcBuf { IO_TYPE src[]; };
 layout(std430, binding = 1) writeonly buffer DstBuf { IO_TYPE dst[]; };
+layout(std430, binding = 2) readonly buffer RefBuf { IO_TYPE ref[]; };
 
-layout(push_constant) uniform PushConstants {
-    int src_base;  // element offset of this plane's source region
-    int dst_base;  // element offset of this plane's download region
-} pc;
-
-float load_value(int idx) {
+float load_src(int idx) {
 #if BITS == 32
-    return src[pc.src_base + idx];
+    return src[idx];
 #else
     // direct uint16_t->float conversion chokes glslc; int() widens cleanly
-    return float(int(src[pc.src_base + idx])) * SCALE;
+    return float(int(src[idx])) * SCALE;
+#endif
+}
+
+float load_ref(int idx) {
+#if BITS == 32
+    return ref[idx];
+#else
+    return float(int(ref[idx])) * SCALE;
 #endif
 }
 
 void store_value(int idx, float v) {
 #if BITS == 32
-    dst[pc.dst_base + idx] = v;
+    dst[idx] = v;
 #else
     // glslc -O chokes on a direct float->uint16_t convert (OpUConvert); go
     // through uint with an explicit mask (same workaround as nlmeans/dfttest)
-    dst[pc.dst_base + idx] = uint16_t(uint(v * PEAK + 0.5f) & 0xFFFFu);
+    dst[idx] = uint16_t(uint(v * PEAK + 0.5f) & 0xFFFFu);
 #endif
 }
 
@@ -70,20 +77,22 @@ void main() {
         return;
     }
 
-    const float center = load_value((HAS_REF * HEIGHT + y) * STRIDE + x);
+    const float center = (HAS_REF == 1) ? load_ref(y * STRIDE + x)
+                                        : load_src(y * STRIDE + x);
 
     float num = 0.0f;
     float den = 0.0f;
 
     for (int cy = max(y - RADIUS, 0); cy <= min(y + RADIUS, HEIGHT - 1); ++cy) {
         for (int cx = max(x - RADIUS, 0); cx <= min(x + RADIUS, WIDTH - 1); ++cx) {
-            float value = load_value((HAS_REF * HEIGHT + cy) * STRIDE + cx);
+            float value = (HAS_REF == 1) ? load_ref(cy * STRIDE + cx)
+                                         : load_src(cy * STRIDE + cx);
             const int space = (y - cy) * (y - cy) + (x - cx) * (x - cx);
             const float range = (value - center) * (value - center);
             const float weight = exp2(
                 float(space) * SIGMA_SPATIAL_SCALED + range * SIGMA_COLOR_SCALED);
             if (HAS_REF == 1) {
-                value = load_value(cy * STRIDE + cx);
+                value = load_src(cy * STRIDE + cx);
             }
             num += weight * value;
             den += weight;

@@ -4,19 +4,16 @@
 /*
  * Bilateral filter compute shader, shared-memory (tiled) variant.
  *
- * Compile-time variants: -DBITS=16|32 selects the staging element type.
- * All buffers hold native elements (uint16_t integer or float32) in
- * device-local VRAM (or host-visible staging for kernel-direct download),
- * so loads and stores are plain coalesced element accesses — no shift/mask
- * unpacking, no dword packing, no atomics.
+ * Compile-time variants: -DBITS=16|32 selects the element type. Each plane is
+ * bound whole into its own binding: src is the filtered source, ref the guide
+ * (bound to src when HAS_REF is 0) and dst the output frame plane. All three
+ * hold native elements, so loads and stores are plain coalesced accesses — no
+ * shift/mask unpacking, no dword packing, no atomics.
  *
- * All parameters are specialization constants so that the compiler can
- * fully unroll the tile-load loops and constant-fold all clamping/indexing.
- *
- * Memory layout (per plane region, elements of IO_TYPE):
- *   rows [0, HEIGHT)            : source plane
- *   rows [HEIGHT, 2*HEIGHT)     : reference plane (only if HAS_REF)
- *   rows are STRIDE elements wide (only WIDTH are meaningful)
+ * WIDTH/HEIGHT/STRIDE/RADIUS/... are specialization constants so that the
+ * compiler can fully unroll the tile-load loops and constant-fold all
+ * clamping/indexing. STRIDE is the core's plane pitch in elements; only
+ * [0, WIDTH) columns and [0, HEIGHT) rows are meaningful.
  */
 
 #if !defined(BITS)
@@ -48,30 +45,34 @@ layout(local_size_x_id = 10, local_size_y_id = 11, local_size_z = 1) in;
 
 layout(std430, binding = 0) readonly buffer SrcBuf { IO_TYPE src[]; };
 layout(std430, binding = 1) writeonly buffer DstBuf { IO_TYPE dst[]; };
-
-layout(push_constant) uniform PushConstants {
-    int src_base;  // element offset of this plane's source region
-    int dst_base;  // element offset of this plane's download region
-} pc;
+layout(std430, binding = 2) readonly buffer RefBuf { IO_TYPE ref[]; };
 
 shared float buf[SHARED_FLOATS];
 
-float load_value(int idx) {
+float load_src(int idx) {
 #if BITS == 32
-    return src[pc.src_base + idx];
+    return src[idx];
 #else
     // direct uint16_t->float conversion chokes glslc; int() widens cleanly
-    return float(int(src[pc.src_base + idx])) * SCALE;
+    return float(int(src[idx])) * SCALE;
+#endif
+}
+
+float load_ref(int idx) {
+#if BITS == 32
+    return ref[idx];
+#else
+    return float(int(ref[idx])) * SCALE;
 #endif
 }
 
 void store_value(int idx, float v) {
 #if BITS == 32
-    dst[pc.dst_base + idx] = v;
+    dst[idx] = v;
 #else
     // glslc -O chokes on a direct float->uint16_t convert (OpUConvert); go
     // through uint with an explicit mask (same workaround as nlmeans/dfttest)
-    dst[pc.dst_base + idx] = uint16_t(uint(v * PEAK + 0.5f) & 0xFFFFu);
+    dst[idx] = uint16_t(uint(v * PEAK + 0.5f) & 0xFFFFu);
 #endif
 }
 
@@ -81,13 +82,15 @@ void main() {
     const int tx = int(gl_LocalInvocationID.x);
     const int ty = int(gl_LocalInvocationID.y);
 
+    // the guide tile sits above the source tile; with no guide the source tile
+    // is what both the weight and the value read
     const int ref_offset = HAS_REF * TILE_Y * TILE_X;
 
     for (int cy = ty; cy < TILE_Y; cy += int(gl_WorkGroupSize.y)) {
         const int sy = clamp(cy - ty - RADIUS + y, 0, HEIGHT - 1);
         for (int cx = tx; cx < TILE_X; cx += int(gl_WorkGroupSize.x)) {
             const int sx = clamp(cx - tx - RADIUS + x, 0, WIDTH - 1);
-            buf[cy * TILE_X + cx] = load_value(sy * STRIDE + sx);
+            buf[cy * TILE_X + cx] = load_src(sy * STRIDE + sx);
         }
     }
     if (HAS_REF == 1) {
@@ -95,7 +98,7 @@ void main() {
             const int sy = clamp(cy - ty - RADIUS + y, 0, HEIGHT - 1);
             for (int cx = tx; cx < TILE_X; cx += int(gl_WorkGroupSize.x)) {
                 const int sx = clamp(cx - tx - RADIUS + x, 0, WIDTH - 1);
-                buf[ref_offset + cy * TILE_X + cx] = load_value((HEIGHT + sy) * STRIDE + sx);
+                buf[ref_offset + cy * TILE_X + cx] = load_ref(sy * STRIDE + sx);
             }
         }
     }

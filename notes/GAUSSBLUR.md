@@ -20,7 +20,8 @@ Target GPU: RX 7900 XTX (gfx1100), RADV, ReBAR (`memoryType 3`).
 
 ## Implementation
 
-Mirrors the Bilateral VRAM structure (see `notes/BILATERAL.md`):
+Mirrors the pre-R80 Bilateral VRAM structure (Bilateral itself now runs on the
+R80 GPU API and owns no staging — see `notes/BILATERAL.md`):
 
 - Per-stream device-local `src_buf` + `dst_buf` in VRAM holding **native
   `uint16_t`/`float` elements**, plus a host-visible cached GTT `staging`

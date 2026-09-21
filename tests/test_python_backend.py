@@ -31,7 +31,7 @@ def test_backend_resolves():
 
 
 def test_bilateral_runs_via_jetpack(noise_gray):
-    out = bilateral(noise_gray, sigmaS=3.0, sigmaR=0.02, backend=_backend())
+    out = cpu_node(bilateral(noise_gray, sigmaS=3.0, sigmaR=0.02, backend=_backend()))
     assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
 
 
@@ -112,7 +112,8 @@ def test_backend_context_routes_singletons(noise_gray):
         assert bilateral.backend is _backend()
         assert gauss_blur.backend is _backend()
         # implicit backend= (AUTO -> singleton) now routes through vsfeel
-        assert np.isfinite(frame_to_ndarray(bilateral(noise_gray, sigmaS=3.0, sigmaR=0.02).get_frame(0))).all()
+        assert np.isfinite(frame_to_ndarray(cpu_node(
+            bilateral(noise_gray, sigmaS=3.0, sigmaR=0.02)).get_frame(0))).all()
         assert np.isfinite(frame_to_ndarray(gauss_blur(noise_gray, 1.5).get_frame(0))).all()
     assert bilateral.backend == old_bilateral
     assert gauss_blur.backend == old_gauss

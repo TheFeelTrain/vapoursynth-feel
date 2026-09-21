@@ -725,6 +725,9 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("sigma_color", "--bilateral-sigma-color", "bilateral_sigma_color", float, 0.02),
         ],
         build=_bilateral_build,
+        # vsfeel's Bilateral runs on the R80 GPU API (vnode:gpu in/out); the
+        # references stay on the CPU cache.
+        gpu_plugins=frozenset({"vsfeel"}),
     ),
     "gaussblur": FilterSpec(
         title="GaussBlur",

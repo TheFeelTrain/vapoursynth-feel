@@ -9,10 +9,9 @@ installed, with a two-tier "close enough" policy:
 
 - REF_TOL (1e-6 on the normalized [0, 1] scale) for everything where both
   sides compute the same math — measured diffs are float32 noise (~1e-8).
-- BORDER_TOL (0.01) only for configs where the staging tile outgrows the
-  shared-memory budget: there the reference's own kernel variants disagree
-  at frame borders (edge-clamp vs window truncation), a semantic difference
-  worth up to ~7e-3 on noise input.
+- BORDER_TOL (0.01) only for wide-sigma configs, where the reference's own
+  kernel variants disagree at frame borders (edge-clamp vs window truncation),
+  a semantic difference worth up to ~7e-3 on noise input.
 
 16-bit integer output is compared in whole output codes (<= 1 LSB): both
 sides round nearly identical fp32 results once, so codes differ by at most
@@ -30,8 +29,8 @@ import vapoursynth as vs
 
 from conftest import (
     assert_changes_on_noise, assert_gray32, assert_preserves_frame_props,
-    frame_to_ndarray, plane as _plane, reference_compare, reference_or_skip,
-    reference_spec,
+    cpu_node, frame_to_ndarray, plane as _plane, reference_compare,
+    reference_or_skip, reference_spec,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -43,7 +42,8 @@ BORDER_TOL = 0.01
 
 
 def _run(clip, **kwargs):
-    return vs.core.vsfeel.Bilateral(clip, **kwargs)
+    """Bilateral as a clip the test can read pixels from (see conftest.cpu_node)."""
+    return cpu_node(vs.core.vsfeel.Bilateral(clip, **kwargs))
 
 
 def _compare(fmt, frames, params, guide=None):
