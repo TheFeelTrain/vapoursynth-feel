@@ -134,6 +134,19 @@ def assert_changes_on_noise(out, src, frames=None, plane=0, what="filter"):
     assert worst > 0.0, f"{what} left the noise input unchanged (identity filter)"
 
 
+def cpu_node(node):
+    """A clip whose frames the host can read.
+
+    A GPU-resident frame has no host pointer (``get_read_ptr`` raises), so a
+    test that reads pixels has to insert ``std.GPUDownload`` first. Doing it
+    here keeps every other test free of residency plumbing, and a CPU node --
+    still what every unported filter returns -- passes through untouched.
+    """
+    if getattr(node, "gpu_resident", False):
+        return vs.core.std.GPUDownload(clip=node)
+    return node
+
+
 def eval_parallel(filter_func, clip, plane=0, dtype=None, timeout=180.0, **kwargs):
     """Evaluate every frame of a filter node concurrently, the way vspipe does.
 
@@ -149,7 +162,7 @@ def eval_parallel(filter_func, clip, plane=0, dtype=None, timeout=180.0, **kwarg
     hanging the suite, and a worker exception is re-reported rather than
     swallowed.
     """
-    node = filter_func(clip, **kwargs)
+    node = cpu_node(filter_func(clip, **kwargs))
     frames = [None] * node.num_frames
     errors = []
 
@@ -476,7 +489,7 @@ print("REF ok", flush=True)
 
 # --- vsfeel phase ---
 try:
-    my_node = getattr(core.vsfeel, spec.get("vsfeel_filter", spec["filter"]))(clip, **kwargs)
+    my_node = cpu_node(getattr(core.vsfeel, spec.get("vsfeel_filter", spec["filter"]))(clip, **kwargs))
     maxdiff = 0.0
     ndiff = 0
     total = 0
@@ -600,7 +613,9 @@ orders = {
 
 
 def run(order):
-    node = getattr(core.vsfeel, spec["filter"])(clip, **kwargs)
+    raw = getattr(core.vsfeel, spec["filter"])(clip, **kwargs)
+    # Pixels are read directly, so a GPU-resident node gets downloaded first.
+    node = core.std.GPUDownload(clip=raw) if raw.gpu_resident else raw
     return {n: read_plane(node.get_frame(n), plane, np.float32).copy() for n in order}
 
 

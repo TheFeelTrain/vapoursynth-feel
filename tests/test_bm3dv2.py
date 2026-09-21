@@ -21,7 +21,13 @@ from conftest import (
     assert_preserves_frame_props, assert_temporal_order_consistent,
     check_all_frames_finite, eval_parallel, frame_to_ndarray,
     plane_to_ndarray, run_compare_subprocess, skip_or_fail_reference,
+    cpu_node,
 )
+
+def BM3D(*args, **kwargs):
+    """BM3Dv2 as a clip the test can read pixels from (see conftest.cpu_node)."""
+    return cpu_node(vs.core.vsfeel.BM3Dv2(*args, **kwargs))
+
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
@@ -32,7 +38,7 @@ BLOCK_STEP = 4
 
 
 def _run(clip, radius=2, num_streams=1, **kwargs):
-    return vs.core.vsfeel.BM3Dv2(
+    return BM3D(
         clip,
         sigma=SIGMA,
         radius=radius,
@@ -192,7 +198,7 @@ def test_bm3dv2_rejects_dimensions_below_block(w, h):
     coordinates into the patch loads.
     """
     with pytest.raises(vs.Error):
-        vs.core.vsfeel.BM3Dv2(
+        BM3D(
             _blank(w, h), sigma=SIGMA, radius=2, bm_range=BM_RANGE,
             ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=1,
         )
@@ -200,7 +206,7 @@ def test_bm3dv2_rejects_dimensions_below_block(w, h):
 
 def test_bm3dv2_accepts_exactly_8x8():
     """An 8x8 clip is the smallest supported geometry and must run."""
-    out = vs.core.vsfeel.BM3Dv2(
+    out = BM3D(
         _blank(8, 8), sigma=SIGMA, radius=2, bm_range=BM_RANGE,
         ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=1,
     )
@@ -219,7 +225,7 @@ def test_bm3dv2_rejects_int32_res_overflow():
     slack being allocated.
     """
     with pytest.raises(vs.Error, match="32-bit"):
-        vs.core.vsfeel.BM3Dv2(
+        BM3D(
             _blank(7680, 4320), sigma=SIGMA, radius=4, bm_range=BM_RANGE,
             ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=4,
         )
@@ -227,7 +233,7 @@ def test_bm3dv2_rejects_int32_res_overflow():
 
 def test_bm3dv2_accepts_radius4_within_addressing_limit():
     """The guard must not reject radius 4 when the stack stays addressable."""
-    out = vs.core.vsfeel.BM3Dv2(
+    out = BM3D(
         _blank(8, 8), sigma=SIGMA, radius=4, bm_range=BM_RANGE,
         ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=4,
     )
@@ -235,20 +241,24 @@ def test_bm3dv2_accepts_radius4_within_addressing_limit():
 
 
 def test_bm3dv2_device_id(noise_gray):
-    """R11: device_id is validated and selects the requested device.
+    """device_id is accepted for compatibility and no longer selects anything.
 
-    device_id=-1 and an out-of-range id must fail at creation; device_id=0
-    must behave like the default (measured max diff ~2e-8, the same
-    atomic-order run-to-run floor as two default instances).
+    Under the R80 GPU API the core owns the one Vulkan device per process, so
+    the choice moved to ``core.set_vulkan_device``. A negative id never
+    selected anything and still fails at creation; a positive or out-of-range
+    one is ignored, and the result must equal the default run (measured max
+    diff ~2e-8, the atomic-order run-to-run floor).
     """
-    for bad in (-1, 99):
-        with pytest.raises(vs.Error):
-            _run(noise_gray, num_streams=1, device_id=bad)
+    with pytest.raises(vs.Error):
+        _run(noise_gray, num_streams=1, device_id=-1)
     a = _run(noise_gray, num_streams=1, device_id=0)
     b = _run(noise_gray, num_streams=1)
+    c = _run(noise_gray, num_streams=1, device_id=99)
     for n in (0, 11, 23):
         d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
         assert np.abs(d).max() < 1e-5, f"device_id=0 differs from default at frame {n}"
+        d = frame_to_ndarray(c.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
+        assert np.abs(d).max() < 1e-5, f"device_id=99 differs from default at frame {n}"
 
 
 def test_bm3dv2_preserves_gray_frame_props(noise_gray):
@@ -291,11 +301,11 @@ def test_bm3dv2_sigma_below_epsilon_passes_through(noise_gray, sigma, use_ref):
     as in the reference's PROC_MASK. Covers the old sigma=0 + ref 0/0 NaN."""
     basic = None
     if use_ref:
-        basic = vs.core.vsfeel.BM3Dv2(
+        basic = BM3D(
             noise_gray, sigma=SIGMA, radius=2, bm_range=BM_RANGE,
             ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=1)
         _ = frame_to_ndarray(basic.get_frame(0))
-    out = vs.core.vsfeel.BM3Dv2(
+    out = BM3D(
         noise_gray, sigma=sigma, radius=2, bm_range=BM_RANGE,
         ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=1,
         **({"ref": basic} if use_ref else {}))
@@ -330,18 +340,23 @@ _SEEK_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     kwargs = dict(sigma={SIGMA}, radius=2, bm_range={BM_RANGE},
                   ps_range={PS_RANGE}, block_step={BLOCK_STEP})
 
+    def vsfeel(clip, **kw):
+        # Pixels are read directly here, so the GPU-resident node is downloaded.
+        node = core.vsfeel.BM3Dv2(clip, **kw)
+        return core.std.GPUDownload(clip=node) if node.gpu_resident else node
+
     order = [0, 64, 1, 65, 2, 13, 79, 40, 95, 3]
 
     # Serial num_streams=1 run is the self-consistency oracle.
     try:
-        base = core.vsfeel.BM3Dv2(clip, num_streams=1, **kwargs)
+        base = vsfeel(clip, num_streams=1, **kwargs)
         ref = {{n: read_plane(base.get_frame(n), 0, np.float32) for n in order}}
     except Exception as exc:
         print("VSFEEL fail: serial run: %s: %s" % (type(exc).__name__, exc), flush=True)
         raise SystemExit(3)
     print("REF ok", flush=True)
 
-    out = core.vsfeel.BM3Dv2(clip, num_streams=4, **kwargs)
+    out = vsfeel(clip, num_streams=4, **kwargs)
     got = {{}}
     errors = {{}}
 
@@ -439,6 +454,12 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     kwargs = json.loads(sys.argv[2])
     ref_pass = int(sys.argv[3])
 
+    def vsfeel(clip, **kw):
+        # The host cannot read a GPU-resident frame's pixels, and this script
+        # reads them directly, so the node is downloaded here.
+        node = core.vsfeel.BM3Dv2(clip, **kw)
+        return core.std.GPUDownload(clip=node) if node.gpu_resident else node
+
     core.max_cache_size = 1024 * 56
     src = core.bs.VideoSource({NOISE_MKV!r})
     clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
@@ -454,7 +475,7 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
         # that clip here so a vsfeel failure is not mislabelled as a missing
         # reference; the frames stay cached for the reference below.
         try:
-            basic = core.vsfeel.BM3Dv2(clip, **kwargs)
+            basic = vsfeel(clip, **kwargs)
             _ = [read_plane(basic.get_frame(n), 0, np.float32) for n in frames]
         except Exception as exc:
             print("VSFEEL fail: basic estimate: %s: %s" % (type(exc).__name__, exc), flush=True)
@@ -474,8 +495,8 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     print("REF ok", flush=True)
 
     # --- vsfeel phase ---
-    my_node = (core.vsfeel.BM3Dv2(clip, ref=basic, **kwargs) if ref_pass
-               else core.vsfeel.BM3Dv2(clip, **kwargs))
+    my_node = (vsfeel(clip, ref=basic, **kwargs) if ref_pass
+               else vsfeel(clip, **kwargs))
     worst = 0.0
     for n, b in zip(frames, ref_frames):
         a = read_plane(my_node.get_frame(n), 0, np.float32)

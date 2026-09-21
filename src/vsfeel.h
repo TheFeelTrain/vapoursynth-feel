@@ -21,7 +21,14 @@
 
 #include <volk.h>
 
+// The GPU API this plugin targets (VSAPI::getVulkanAPI) only exists from API
+// 4.3 on. The build defines it for every TU; the guard keeps a TU that includes
+// VapourSynth4.h through some other path from silently dropping to API 4.0.
+#ifndef VS_USE_API_43
+#define VS_USE_API_43
+#endif
 #include <VapourSynth4.h>
+#include <VSVulkan4.h>
 
 using namespace std::string_literals;
 
@@ -1033,6 +1040,394 @@ inline VkResult submit_timeline(
         .pSignalSemaphores = signal_sem != VK_NULL_HANDLE ? &signal_sem : nullptr
     };
     return vkQueueSubmit(queue, 1, &submit_info, fence);
+}
+
+// ---------------------------------------------------------------------------
+// R80 GPU API (VSVulkan4): the device the core owns
+// ---------------------------------------------------------------------------
+//
+// From R80 on there is exactly one Vulkan device in the process and the core
+// owns it. A filter no longer creates a device, a queue or a frame: it asks for
+// the core's handles and dispatch table, records into an exec pool's command
+// buffer, and moves GPU resident frames whose synchronization travels as
+// producer pairs. Everything below is the thin shared layer over that API --
+// device facts, pooled buffers, pipelines and the two push operations.
+//
+// The legacy volk path above stays until the last filter is ported; nothing new
+// should build on it.
+
+// How many storage buffers one dispatch may bind. Matches the push descriptor
+// arrays below; a device never reports fewer than this for the filters here.
+constexpr uint32_t GPU_MAX_BINDINGS = 32;
+
+struct GPUDevice {
+    const VSVULKANAPI * api {};
+    const VSVulkanFunctions * vk {};
+    VSVulkanCoreHandles handles {};
+
+    // Raw handles, named as the legacy VK_Device names them, so the kernel side
+    // of a ported filter reads the same way.
+    VkInstance instance {};
+    VkPhysicalDevice physical_device {};
+    VkDevice device {};
+    VkQueue compute_queue {};
+
+    VkPhysicalDeviceMemoryProperties mem_props {};
+    VkPhysicalDeviceLimits limits {};
+    VkDeviceSize max_storage_buffer_range {};
+    uint32_t api_version {};
+    uint32_t queue_family {};
+    // VkQueueFamilyProperties::timestampValidBits for the core's compute queue
+    // family. Zero means a vkCmdWriteTimestamp2 there is invalid usage, so the
+    // GPU-timing probes must stay off.
+    uint32_t timestamp_valid_bits {};
+
+    uint32_t subgroup_size { 32 };
+    uint32_t min_subgroup_size { 32 };
+    uint32_t max_subgroup_size { 32 };
+    // Both are required by the core's device baseline (Vulkan 1.3 features), so
+    // unlike the legacy path there is nothing to check before using them.
+    bool subgroup_size_control { true };
+    bool subgroup_shuffle { true };
+    bool feat_float16 { false };
+    bool feat_float64 { false };
+    bool feat_atomic_float32_add { false };
+
+    // Persistent pipeline cache, shared by every instance on this device: the
+    // core exposes no cache of its own, and compiling from SPIR-V is seconds
+    // per variant on RADV.
+    VkPipelineCache pipeline_cache {};
+    std::mutex * pipeline_cache_lock {};
+    std::string pipeline_cache_path;
+
+    // The core owns the device and destroys it with the core, so the cache has
+    // to be flushed while the last reference here is still dropped -- an
+    // atexit handler would run after the device is gone. The registry holds a
+    // weak reference for exactly that reason.
+    ~GPUDevice();
+
+    bool has_subgroup_size(uint32_t size) const {
+        if (subgroup_size == size) {
+            return true;
+        }
+        return subgroup_size_control && min_subgroup_size <= size &&
+            size <= max_subgroup_size;
+    }
+};
+
+// The core's device, brought up on first use and shared per VkDevice. Fails with
+// the core's message when no usable device exists.
+std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
+    VSCore * core, const VSAPI * vsapi);
+
+// Trace entry for a filter on the core's device. VK_EXT_device_fault's
+// post-mortem is not available here -- the core creates the device with no
+// extensions -- so a lost device reports its message without a driver dump.
+inline void vsfeel_trace_error(const char * filter, int frame,
+                               const std::string & message, const GPUDevice *) {
+    vsfeel_trace_error(filter, frame, message, static_cast<const VK_Device *>(nullptr));
+}
+
+// GPU-timing probes: see the legacy overload above. Same gate, same reason.
+inline bool vsfeel_probe_timestamps(const GPUDevice & dev, const char * tag) {
+    if (dev.timestamp_valid_bits != 0) {
+        return true;
+    }
+    if (vsfeel_debug_enabled()) {
+        fprintf(stderr, "[vsfeel] %s: queue family %u reports 0 timestamp bits; "
+                        "GPU timings disabled\n", tag, dev.queue_family);
+    }
+    return false;
+}
+
+// A buffer from the core's pool. `handle` owns it; the rest is what a kernel or
+// the host needs to use it.
+struct GpuBuffer {
+    VSGPUBuffer * handle {};
+    VkBuffer buffer {};
+    VkDeviceAddress address {};
+    void * mapped {};
+    VkDeviceSize size {};
+    VkMemoryPropertyFlags memory_flags {};
+
+    explicit operator bool() const { return handle != nullptr; }
+};
+
+// Storage buffer from the pool; empty return means success, otherwise the
+// failure text. `extra_usage` adds what a specific buffer needs beyond storage
+// (transfer, device address, indirect).
+inline std::string gpu_make_buffer(const GPUDevice & g, VSCore * core,
+                                   VkDeviceSize bytes, GpuBuffer & out,
+                                   VkMemoryPropertyFlags required,
+                                   VkMemoryPropertyFlags preferred = 0,
+                                   VkBufferUsageFlags extra_usage = 0,
+                                   VkBufferUsageFlags exclude = 0) {
+    char err[512] {};
+    VSVulkanBufferInfo info {};
+    const VkBufferUsageFlags usage =
+        ((VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | extra_usage) & ~exclude);
+    out.handle = g.api->createGPUBuffer(core, bytes, usage, required, preferred,
+        &info, err, sizeof(err));
+    if (!out.handle) {
+        return err;
+    }
+    out.buffer = info.buffer;
+    out.address = info.address;
+    out.mapped = info.mapped;
+    out.size = info.size;
+    out.memory_flags = info.memoryFlags;
+    return {};
+}
+
+// Device local buffer that lives exactly as long as the recording it was made
+// for: handed to the context, destroyed when that submission is known complete.
+inline std::string gpu_frame_buffer(const GPUDevice & g, VSCore * core,
+                                    VSGPUExecContext * ctx, VkDeviceSize bytes,
+                                    GpuBuffer & out, VkBufferUsageFlags extra_usage = 0) {
+    std::string err = gpu_make_buffer(g, core, bytes, out,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, extra_usage);
+    if (!err.empty()) {
+        return err;
+    }
+    g.api->gpuExecUsesBuffer(ctx, out.handle);
+    return {};
+}
+
+inline void gpu_destroy_buffer(const GPUDevice & g, GpuBuffer & b) {
+    if (b.handle) {
+        g.api->destroyGPUBuffer(b.handle);
+        b = {};
+    }
+}
+
+// Bind `count` storage buffers to set 0, bindings 0..count-1 through the push
+// descriptor set the layout declares. Each dispatch rebinds its own view of the
+// planes, which is why nothing here is allocated from a descriptor pool.
+inline void gpu_push_buffers(const GPUDevice & g, VkCommandBuffer cmd,
+                             VkPipelineLayout layout, const VkBuffer * buffers,
+                             uint32_t count) {
+    VkDescriptorBufferInfo infos[GPU_MAX_BINDINGS] {};
+    VkWriteDescriptorSet writes[GPU_MAX_BINDINGS] {};
+    for (uint32_t i = 0; i < count; ++i) {
+        infos[i].buffer = buffers[i];
+        infos[i].offset = 0;
+        infos[i].range = VK_WHOLE_SIZE;
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &infos[i];
+    }
+    g.vk->vkCmdPushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0,
+        count, writes);
+}
+
+inline void gpu_push_constants(const GPUDevice & g, VkCommandBuffer cmd,
+                               VkPipelineLayout layout, const void * data,
+                               uint32_t bytes) {
+    VkPushConstantsInfo info {};
+    info.sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO;
+    info.layout = layout;
+    info.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    info.size = bytes;
+    info.pValues = data;
+    g.vk->vkCmdPushConstants2(cmd, &info);
+}
+
+// How many timeline waits one submission may carry. A frame's window gives at
+// most one wait per writer plus one per source producer.
+constexpr uint32_t GPU_MAX_SUBMIT_WAITS = 32;
+
+// Submit one command buffer on the core's compute queue, optionally waiting on
+// timeline (semaphore, value) pairs and optionally signalling one. The queue
+// lock is taken around the submit alone -- it is a leaf, so nothing else may
+// run inside the bracket -- and a timeline value is always allocated by the
+// caller before the call, which is what keeps signals in numeric order on any
+// one timeline.
+//
+// The 1.4 spelling (vkQueueSubmit2) is the only one the core's table carries;
+// timeline values travel in VkSemaphoreSubmitInfo rather than a separate
+// chained struct.
+inline VkResult gpu_submit(const GPUDevice & g, VSCore * core, VkCommandBuffer cmd,
+                           const VkSemaphore * waits, const uint64_t * values,
+                           uint32_t wait_count, VkPipelineStageFlags2 wait_stage,
+                           VkSemaphore signal_sem, uint64_t signal_value,
+                           VkFence fence) {
+    VkSemaphoreSubmitInfo wait_infos[GPU_MAX_SUBMIT_WAITS] {};
+    for (uint32_t i = 0; i < wait_count; ++i) {
+        wait_infos[i].sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+        wait_infos[i].semaphore = waits[i];
+        wait_infos[i].value = values[i];
+        wait_infos[i].stageMask = wait_stage;
+    }
+
+    VkSemaphoreSubmitInfo signal_info {};
+    signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    signal_info.semaphore = signal_sem;
+    signal_info.value = signal_value;
+    // Everything the submission writes must be visible when the signal fires.
+    signal_info.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+    VkCommandBufferSubmitInfo cb_info {};
+    cb_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cb_info.commandBuffer = cmd;
+
+    VkSubmitInfo2 info {};
+    info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    info.waitSemaphoreInfoCount = wait_count;
+    info.pWaitSemaphoreInfos = wait_count ? wait_infos : nullptr;
+    info.commandBufferInfoCount = 1;
+    info.pCommandBufferInfos = &cb_info;
+    info.signalSemaphoreInfoCount = signal_sem != VK_NULL_HANDLE ? 1u : 0u;
+    info.pSignalSemaphoreInfos = signal_sem != VK_NULL_HANDLE ? &signal_info : nullptr;
+
+    g.api->lockVulkanQueue(core, vqCompute);
+    const VkResult result = g.vk->vkQueueSubmit2(g.compute_queue, 1, &info, fence);
+    g.api->unlockVulkanQueue(core, vqCompute);
+    return result;
+}
+
+// Compute-to-compute barrier with both scopes. Every pass that follows one that
+// wrote something it reads needs this; only genuinely disjoint passes may skip
+// it (record them as one dispatch instead).
+inline void gpu_barrier(const GPUDevice & g, VkCommandBuffer cmd) {
+    VkMemoryBarrier2 mb {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    VkDependencyInfo dep {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &mb;
+    g.vk->vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+// Descriptor set layout for `bindings` storage buffers, in push descriptor
+// form: no pool, no allocation, nothing to free but the layout itself.
+inline std::variant<VkDescriptorSetLayout, std::string> gpu_push_set_layout(
+    const GPUDevice & g, uint32_t bindings) {
+    VkDescriptorSetLayoutBinding b[GPU_MAX_BINDINGS] {};
+    for (uint32_t i = 0; i < bindings; ++i) {
+        b[i].binding = i;
+        b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        b[i].descriptorCount = 1;
+        b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo info {};
+    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT;
+    info.bindingCount = bindings;
+    info.pBindings = b;
+    VkDescriptorSetLayout layout {};
+    if (g.vk->vkCreateDescriptorSetLayout(g.device, &info, nullptr, &layout) != VK_SUCCESS) {
+        return "vkCreateDescriptorSetLayout failed"s;
+    }
+    return layout;
+}
+
+inline std::variant<VkPipelineLayout, std::string> gpu_pipeline_layout(
+    const GPUDevice & g, VkDescriptorSetLayout set, uint32_t push_bytes) {
+    VkPushConstantRange range {};
+    range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    range.size = push_bytes;
+    VkPipelineLayoutCreateInfo info {};
+    info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    info.setLayoutCount = 1;
+    info.pSetLayouts = &set;
+    if (push_bytes > 0) {
+        info.pushConstantRangeCount = 1;
+        info.pPushConstantRanges = &range;
+    }
+    VkPipelineLayout layout {};
+    if (g.vk->vkCreatePipelineLayout(g.device, &info, nullptr, &layout) != VK_SUCCESS) {
+        return "vkCreatePipelineLayout failed"s;
+    }
+    return layout;
+}
+
+// Compute pipeline from an embedded SPIR-V blob plus its specialization
+// constants. maintenance5 is part of the core's baseline, so the module is
+// chained straight into pipeline creation and never exists as an object.
+// `entries` == nullptr means no specialization; `required_subgroup_size` 0
+// leaves the driver's default width alone. `tag` only names the pipeline in the
+// VSFEEL_DEBUG banner.
+inline std::variant<VkPipeline, std::string> gpu_create_pipeline(
+    const GPUDevice & g, const uint32_t * code, size_t code_size,
+    VkPipelineLayout layout, const VkSpecializationMapEntry * entries,
+    const void * values, uint32_t entry_count, size_t values_size, const char * tag,
+    uint32_t required_subgroup_size = 0, bool full_subgroups = false) {
+
+    if (entries == nullptr) {
+        entry_count = 0;
+        values = nullptr;
+        values_size = 0;
+    }
+    if (vsfeel_debug_enabled()) {
+        fprintf(stderr, "[vsfeel] pipeline %s subgroup=%u spec=%u\n",
+            tag, required_subgroup_size, entry_count);
+    }
+    if (required_subgroup_size != 0 && !g.has_subgroup_size(required_subgroup_size)) {
+        return std::string(tag) + " requests subgroup size " +
+            std::to_string(required_subgroup_size) +
+            ", which this device cannot provide";
+    }
+
+    VkShaderModuleCreateInfo module_info {};
+    module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    module_info.codeSize = code_size;
+    module_info.pCode = code;
+
+    VkSpecializationInfo spec_info {};
+    spec_info.mapEntryCount = entry_count;
+    spec_info.pMapEntries = entries;
+    spec_info.dataSize = values_size;
+    spec_info.pData = values;
+
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_info {};
+    subgroup_info.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+    subgroup_info.requiredSubgroupSize = required_subgroup_size;
+
+    VkPipelineShaderStageCreateInfo stage {};
+    stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage.pNext = &module_info;
+    stage.flags = full_subgroups
+        ? VkPipelineShaderStageCreateFlags(
+              VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT)
+        : VkPipelineShaderStageCreateFlags(0);
+    stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stage.pName = "main";
+    if (entry_count > 0) {
+        /* The specialization block is immutable once the stage info is built, so
+           it is chained here rather than assigned after. */
+        stage.pSpecializationInfo = &spec_info;
+    }
+    if (required_subgroup_size != 0) {
+        subgroup_info.pNext = stage.pNext;
+        stage.pNext = &subgroup_info;
+    }
+
+    VkComputePipelineCreateInfo info {};
+    info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    info.stage = stage;
+    info.layout = layout;
+
+    VkPipeline pipeline {};
+    VkResult result;
+    {
+        // vkCreateComputePipelines requires the host to serialize access to the
+        // shared cache.
+        std::lock_guard lock(*g.pipeline_cache_lock);
+        result = g.vk->vkCreateComputePipelines(
+            g.device, g.pipeline_cache, 1, &info, nullptr, &pipeline);
+    }
+    if (result != VK_SUCCESS) {
+        return "vkCreateComputePipelines failed: "s + vk_result_string(result);
+    }
+    return pipeline;
 }
 
 // ---------------------------------------------------------------------------

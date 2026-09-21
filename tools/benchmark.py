@@ -63,7 +63,27 @@ def make_vpy(
     synth_format: str | None,
     cache_frames: int | None = None,
     cache_conv: str | None = None,
+    gpu_cache: bool = False,
+    gpu_cache_mb: int | None = None,
 ) -> str:
+    # With --gpu-cache the script also defines `clip_gpu`: the same frames,
+    # already resident on the device. The upload happens while the script is
+    # evaluated (before vspipe starts timing), exactly like the CPU preload, so a
+    # GPU-capable filter can be timed without the GPUUpload stage in the graph.
+    # Only plugins that declare vnode:gpu/vnode:all may be pointed at it.
+    #
+    # Two traps when measuring transfers against this:
+    #  - `std.GPUDownload(<CPU clip>)` is a silent no-op. gpuTransferCreate
+    #    returns its input unchanged whenever the residency already matches, so
+    #    a "download" arm built on a CPU clip does no GPU work at all (measured
+    #    3746 fps) and makes an upload arm look expensive next to nothing. Only
+    #    `GPUDownload(GPUUpload(clip))` exercises a real transfer.
+    #  - Serving the cached GPU frames through a Python ModifyFrame costs more
+    #    than the upload it removes: that node is fmParallelRequests, so its
+    #    callback serializes the whole front of the chain (509 vs 533 fps at
+    #    radius 0). clip_gpu is therefore a plain node and the GPU frames are
+    #    warmed into the core's own frame cache instead.
+    gpu_lines = ""
     if synth_format:
         # synthetic clip: measure pure filter throughput, no decode bottleneck
         clip_expr = (
@@ -71,6 +91,7 @@ def make_vpy(
             f"format={synth_format}, length={frames})"
         )
         cache_setup = ""
+        gpu_lines = "clip_gpu = core.std.GPUUpload(clip=clip)\n" if gpu_cache else ""
     elif cache_frames:
         # real clip, but decode + convert + hold the first N frames in Python
         # while the script is being evaluated (before vspipe starts timing),
@@ -82,9 +103,22 @@ def make_vpy(
         # chain's own input expression then reduces to an identity.
         clip_expr = f"BestSource(cachepath=None).source({clip!r}, 32)"
         conv = f"clip = {cache_conv}\n" if cache_conv else ""
+        # The GPU copy of the cache is whole frames in VRAM, so it gets a byte
+        # budget of its own; both caches then serve the same span.
+        size_lines = (
+            "_fbytes = (clip.width * clip.height * clip.format.bytes_per_sample\n"
+            "           * clip.format.num_planes)\n"
+            f"_cap = max(1, {gpu_cache_mb} * 1024 * 1024 // _fbytes)\n"
+            f"m = min({cache_frames}, _cap, clip.num_frames)\n"
+        ) if (gpu_cache and gpu_cache_mb) else f"m = min({cache_frames}, clip.num_frames)\n"
+        # The cap has to be measured on the cached format, so with --gpu-cache
+        # the conversion comes first; without it the order is unchanged.
+        if gpu_cache:
+            head = conv + size_lines
+        else:
+            head = f"m = min({cache_frames}, clip.num_frames)\n" + conv
         cache_setup = (
-            f"m = min({cache_frames}, clip.num_frames)\n"
-            f"{conv}"
+            f"{head}"
             "_src_frames = [clip.get_frame(n) for n in range(m)]\n"
             "def _serve_cached(n, f):\n"
             "    return _src_frames[n % m]\n"
@@ -92,9 +126,23 @@ def make_vpy(
             "_served = _blank.std.ModifyFrame(_blank, _serve_cached)\n"
             f"clip = (_served * -(-{frames} // m)).std.Trim(0, {frames - 1})\n"
         )
+        if gpu_cache:
+            # clip_gpu stays a plain native node: the uploads are warmed into the
+            # core's own frame cache here (outside the timed region) and the
+            # cached frames are then served straight from it. Serving them
+            # through a Python ModifyFrame instead costs more than the upload it
+            # removes -- that node is fmParallelRequests, so its callback
+            # serializes the whole front of the chain (measured 509 vs 533 fps at
+            # radius 0, i.e. the "no upload" arm was the slower one).
+            gpu_lines = (
+                "_gpu_src = core.std.GPUUpload(clip=_served)\n"
+                "_gpu_warm = [_gpu_src.get_frame(n) for n in range(m)]\n"
+                f"clip_gpu = (_gpu_src * -(-{frames} // m)).std.Trim(0, {frames - 1})\n"
+            )
     else:
         clip_expr = f"BestSource(cachepath=None).source({clip!r}, 32)"
         cache_setup = ""
+        gpu_lines = "clip_gpu = core.std.GPUUpload(clip=clip)\n" if gpu_cache else ""
     return f"""\
 from vssource import BestSource
 from vstools import core, depth, get_y
@@ -108,6 +156,7 @@ core.max_cache_size = 1024 * 48
 clip = {clip_expr}
 
 {cache_setup}
+{gpu_lines}
 {extra}
 
 {chain}.set_output()
@@ -236,6 +285,8 @@ PLUGINS = {
     "bilateralhip": Plugin("bilateralhip"),
     "bm3dhip": Plugin("bm3dhip"),
     "nlm_hip": Plugin("nlm_hip"),
+    "bm3dvk": Plugin("bm3dvk"),
+    "knlmvk": Plugin("knlmvk"),
 }
 
 
@@ -326,6 +377,11 @@ class FilterSpec:
     # doubles the input with a Point upscale and feeds the filter auxiliary clips
     # derived from it. Only sensible for EEDI3-style AA benchmarks.
     aa: bool = False
+    # Plugins whose call for this filter takes a GPU-resident input, i.e. the
+    # filter is declared vnode:gpu or vnode:all. Under --gpu-cache only these get
+    # `clip_gpu` (no core GPUUpload stage); every other arm keeps the CPU cache,
+    # so one run still compares like with like.
+    gpu_plugins: frozenset[str] = frozenset()
 
 
 def resolve_streams(spec: FilterSpec, ns: argparse.Namespace) -> int:
@@ -349,7 +405,9 @@ def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
     with_streams = f"{common}, num_streams={ns_num}"
     return {
         "vsfeel": f"core.vsfeel.BM3Dv2({clip}, {with_streams})",
-        "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {with_streams})"
+        "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {with_streams})",
+        # The Vulkan reference streams itself through the core (no num_streams).
+        "bm3dvk": f"core.bm3dvk.BM3Dv2({clip}, {common})"
     }
 
 
@@ -406,6 +464,12 @@ def _nlmeans_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
         "vszipcl": f"core.vszipcl.NLMeans({clip}, {args})",
         "vszipcu": f"core.vszipcu.NLMeans({clip}, {args})",
         "nlm_hip": f"core.nlm_hip.NLMeans({clip}, {args})",
+        # The Vulkan reference streams itself through the core (no num_streams).
+        "knlmvk": (
+            f"core.knlmvk.KNLMeans({clip}, d={ns.nlmeans_d}, a={ns.nlmeans_a}, "
+            f"s={ns.nlmeans_s}, h={ns.nlmeans_h}, wmode={ns.nlmeans_wmode}, "
+            f"wref={ns.nlmeans_wref}, channels='UV')"
+        ),
     }
 
 
@@ -582,6 +646,9 @@ FILTERS: dict[str, FilterSpec] = {
         default_streams=2,  # matches the filter's shipped default
         input="depth(get_y(clip), 32)",
         synth_format="vs.GRAYS",
+        # vsfeel's BM3Dv2 runs on the R80 GPU API (vnode:gpu in/out); so does
+        # bm3dvk's. vszipcl stays on the CPU cache.
+        gpu_plugins=frozenset({"vsfeel", "bm3dvk"}),
     ),
     "bilateral": FilterSpec(
         title="Bilateral",
@@ -638,6 +705,8 @@ FILTERS: dict[str, FilterSpec] = {
         input="depth(clip, 16)",
         synth_format="vs.YUV420P16",
         default_streams=2,
+        # knlmvk is vnode:gpu; vsfeel's NLMeans is not ported to the GPU API yet.
+        gpu_plugins=frozenset({"knlmvk"}),
     ),
     "eedi3": FilterSpec(
         title="EEDI3",
@@ -779,7 +848,8 @@ def run_vspipe(vpy_path: Path, frames: int, timeout: float = DEFAULT_TIMEOUT) ->
 
 def bench(plugin: str, chain: str, clip: str, frames: int, synth_format: str | None,
           cache_frames: int | None = None, cache_conv: str | None = None,
-          timeout: float = DEFAULT_TIMEOUT) -> float | None:
+          timeout: float = DEFAULT_TIMEOUT, gpu_cache: bool = False,
+          gpu_cache_mb: int | None = None) -> float | None:
     vpy = make_vpy(
         clip=clip,
         extra=_plugin_loader(plugin),
@@ -788,6 +858,8 @@ def bench(plugin: str, chain: str, clip: str, frames: int, synth_format: str | N
         synth_format=synth_format,
         cache_frames=cache_frames,
         cache_conv=cache_conv,
+        gpu_cache=gpu_cache,
+        gpu_cache_mb=gpu_cache_mb,
     )
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"bench_{plugin}.vpy"
@@ -873,15 +945,19 @@ def _cache_desc(spec: FilterSpec, ns: argparse.Namespace, synth: str | None,
 
 def _run_once(spec: FilterSpec, ns: argparse.Namespace, plugin: str, chain: str,
               frames: int, synth: str | None, cache_frames: int | None,
-              cache_conv: str | None) -> float | None:
-    """One timed vspipe run of one plugin: the repeat/interleave unit."""
+              cache_conv: str | None, gpu_cache: bool = False) -> float | None:
+    """One timed vspipe run of one plugin: the repeat/interleave unit.
+
+    `gpu_cache` says this arm's chain consumes `clip_gpu`, so the script has to
+    build the device-resident cache; the arms that do not are given the CPU one.
+    """
     if spec.aa and synth is None:
         budget = ns.aa_cache_mb * 1024 * 1024 if ns.aa_cache_mb else None
         return bench_aa(plugin, chain, ns.clip, frames, cache_frames,
                         getattr(ns, "eedi3_field", 3), ns.bits or AA_MASK_BITS,
                         budget, ns.timeout)
     return bench(plugin, chain, ns.clip, frames, synth, cache_frames, cache_conv,
-                 ns.timeout)
+                 ns.timeout, gpu_cache=gpu_cache, gpu_cache_mb=ns.gpu_cache_mb)
 
 
 def _resolve_pair(ns: argparse.Namespace, calls: dict[str, str],
@@ -931,6 +1007,15 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
     for streams in streams_values:
         ns.num_streams = streams
         calls = spec.build(ns, input_expr, spec)
+        # --gpu-cache: rebuild the calls that accept a GPU-resident input against
+        # the pre-uploaded clip. Everything else keeps the CPU cache, so the two
+        # kinds of arm can sit in one run without either being handicapped.
+        gpu_arms: list[str] = []
+        if getattr(ns, "gpu_cache", False) and spec.gpu_plugins:
+            gpu_calls = spec.build(ns, "clip_gpu", spec)
+            gpu_arms = [p for p in calls if p in spec.gpu_plugins]
+            for p in gpu_arms:
+                calls[p] = gpu_calls[p]
         plugins = resolve_plugins(ns.plugins or list(calls), calls, spec.title)
         plugins = _resolve_pair(ns, calls, plugins, spec.title)
         if not plugins:
@@ -939,7 +1024,17 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
             order = plugins
         print(f"{spec.title} benchmark | {frames} frames | clip: {clip_desc}{bits_desc}")
         print(f"args: {args_desc(spec, ns)}")
-        print(f"{_cache_desc(spec, ns, synth, cache_frames)} | "
+        gpu_desc = ""
+        if getattr(ns, "gpu_cache", False):
+            if not gpu_arms:
+                gpu_desc = " | gpu cache: no GPU-input arm in this filter"
+            elif cache_frames:
+                gpu_desc = f" | gpu cache: {ns.gpu_cache_mb} MiB ({', '.join(gpu_arms)})"
+            else:
+                # No preload to mirror (BlankClip or --no-cache): the arms get a
+                # GPUUpload-fed clip, which is what the graph would insert anyway.
+                gpu_desc = f" | gpu cache: live upload ({', '.join(gpu_arms)})"
+        print(f"{_cache_desc(spec, ns, synth, cache_frames)}{gpu_desc} | "
               f"repeat: {ns.repeat} | timeout: {ns.timeout:g}s\n")
 
         runs: dict[str, list[float]] = {p: [] for p in plugins}
@@ -949,7 +1044,8 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
             reverse = ns.interleave and r % 2 == 1
             for plugin in (list(reversed(plugins)) if reverse else plugins):
                 fps = _run_once(spec, ns, plugin, calls[plugin], frames, synth,
-                                cache_frames, cache_conv)
+                                cache_frames, cache_conv,
+                                gpu_cache=plugin in gpu_arms)
                 if fps is not None:
                     runs[plugin].append(fps)
         for plugin in plugins:
@@ -1063,6 +1159,14 @@ def parse_args() -> argparse.Namespace:
                              "bottlenecked by BestSource at ~630 fps)")
     parser.add_argument("--cache-frames", type=int, default=1000,
                         help="number of leading frames to preload with --cache (default: 1000)")
+    parser.add_argument("--gpu-cache", action="store_true",
+                        help="also preload the cached frames on the device and hand them to "
+                             "the filters that take vnode:gpu/vnode:all input, so their runs "
+                             "have no GPUUpload stage in the graph; every other plugin keeps "
+                             "the CPU cache")
+    parser.add_argument("--gpu-cache-mb", type=int, default=6144,
+                        help="VRAM budget for --gpu-cache frames; the cached span is capped "
+                             "to what fits, for both caches (default: 6144)")
     parser.add_argument("--repeat", "--repeats", dest="repeat", type=int, default=3,
                         help="timed runs per plugin; the median is reported with "
                              "min/max/spread and the plugin order alternates "

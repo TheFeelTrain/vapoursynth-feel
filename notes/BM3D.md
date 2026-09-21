@@ -29,10 +29,15 @@ Current design:
 - The estimation submits **one command buffer per recomputed window position**
   (a full-recompute frame has up to 2r+1 of them), so no single submission can
   reach Windows' TDR watchdog on a slow card (`VSFEEL_BM3D_SPLIT=0` reverts).
-- Upload staging is host-visible VRAM (ReBAR) on the default path
-  (`VSFEEL_BM3D_HD=0` opts out), sized for the 4r+1 slots a record actually
-  uploads.
-- `num_streams` default **2**: the GPU saturates at two in-flight frames.
+- Runs on the R80 GPU API: `clip:vnode:gpu` in and out with `ffGPUOutput`, so
+  the core's `GPUUpload`/`GPUDownload` cross the bus and a consumer waits on the
+  plane's producer pair. Device, queue lock and buffer pool come from the core;
+  the filter keeps per-stream `VSGPUTimeline`s and submits through `gpu_submit`,
+  because the estimate cache needs values allocated before recording.
+- A frame returns with its submission running: the stream gate is `drain_value`,
+  the timeline value the next user of that stream waits on, not a fence.
+- `num_streams` and `device_id` are accepted and **ignored** -- depth is the
+  core's, device choice is `core.set_vulkan_device`; the pool is fixed at 2.
 
 Performance — 1080p GRAY32, jpbd, `tools/benchmark.py -f bm3dv2 vsfeel vszipcl`,
 1000 frames × 3 interleaved, sigma 0.7, radius 2, bm_range 16, ps_range 7,
@@ -40,11 +45,13 @@ block_step 4:
 
 | | fps | GPU est. kernel | GPU agg | VRAM (r=2) |
 |---|---|---|---|---|
-| vsfeel | **313.7** (311-316 over runs; 313.6 at ns=4) | 2.86 ms | 0.33 ms | 1107 MiB |
+| vsfeel | **295.9-302.9** | — | — | 554 MiB |
 | vszipcl | 46.5 | — | — | — |
 
-Before this round the same command gave 190.5 fps at ns=4 (kernel 4.94 + agg
-0.33 ms). Speedup over vszipcl went 4.6x → 6.7x, absolute fps +65%.
+The R80 GPU API port costs 4-6% on this CPU-sink benchmark (314.4 → 297.0 fps
+same-session); the upload stage is free and the download is the whole cost --
+see the port round under Historical. Before that port the same command gave
+190.5 fps at ns=4 (kernel 4.94 + agg 0.33 ms), i.e. 4.6x → 6.7x over vszipcl.
 
 ## Implementation notes that the code alone does not show
 
@@ -53,10 +60,11 @@ Before this round the same command gave 190.5 fps at ns=4 (kernel 4.94 + agg
   133.8 M float atomics together are only ~0.4 ms/frame, and the zero-fill plus
   the ring copies are ~0.1 ms. Nothing else is worth tuning (see the ablation
   table under Historical).
-- **The aggregation is PCIe-bound, not work-bound.** Its time is ~0.32 ms at
-  TW = 1, 5 and 9 alike; the 8.3 MB result store goes to GTT over PCIe at
-  ~26 GB/s. Vectorising it to `vec4` (one thread per 4 columns) changes
-  nothing, so it is left vectorised purely for the lower instruction count.
+- **The aggregation was a PCIe store, not work** (pre-port): ~0.32 ms at
+  TW = 1, 5 and 9 alike, the 8.3 MB result going to GTT at ~26 GB/s, which is
+  why vectorising it to `vec4` changed nothing. The R80 port writes the output
+  plane in place, so that PCIe cost now lives in `GPUDownload` -- see the port
+  round.
 - **LDS is a trap for this kernel.** Three separate attempts to move
   kernel-live data into shared memory (the resolved group, the per-lane scan
   lists, the direction-invariant centres) all raised ACO's VGPR count from 216
@@ -75,61 +83,32 @@ Before this round the same command gave 190.5 fps at ns=4 (kernel 4.94 + agg
 
 Chronological; each entry keeps the mechanism, not the story.
 
-- **2026-09-16 — creation safety.** Reject an estimate stack past the kernel's
-  signed 32-bit `res` addressing (`res_cap * tw * 2 * pe`; 4K r=4 ns=4 is
-  11.7 GiB), require a known positive frame count, and flush `NOSEARCH`'s
-  synthetic group instead of letting the aggregation read uninitialized LDS
-  (`test_bm3dv2_nosearch_matches_search_on_constant_clip`).
-- **2026-09-16 — parameter validation.** `bm_range`/`ps_range` [1, 8192]
-  (int32 `(2r+1)²`), `extractor_exp` [-126, 127], `num_streams` 1..32, `sigma`
-  rejects NaN/inf, `rpGeneral` whenever `radius > 0`.
-- **2026-09-16 — same-queue timeline ordering.** A reader device-waits on the
-  timelines of the streams that filled its result slots, and on a shared queue
-  that wait can sit in the FIFO ahead of the signal RADV will not run past; each
-  frame now publishes its estimation *seq* under `cache_lock` and the reader
-  host-waits for the writers' **submission** before submitting its aggregation
-  (`test_bm3dv2_seek_collision_single_queue`).
-- **2026-09-16 — fp32 aggregation, sigma skip, gputrace gating.** `bm3d_agg`
-  divided in `double` (1/16 rate, hard `shaderFloat64` need); `sigma[0] <
-  FLT_EPSILON` passes the plane through, which removes the 0/0 Wiener NaN;
-  `gpu_trace` cached at creation.
-- **2026-09-16 — frame error path.** A failed frame handed its stream back with
-  GPU work in flight, so a successor could re-record the buffers and reuse slots
-  the running kernels read; the error path now drains the queue and resets the
-  fence.
-
-**2026-09-19 — ReBAR upload staging (+4.6%).** Per-stream staging moved from
-GTT to `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`, so the CPU writes VRAM and
-the ring copy is a device-local read; the store form flips with the allocation
-(NT stores for GTT, cached stores for the write-combined window, no flush for
-the coherent one). 178.2 vs 170.3 fps at 1000f 1080p GRAY r=2 ns=4, 3
-interleaved pairs.
-
-**2026-09-19 — subgroup shuffles for the 8-lane exchanges (+6%).**
-`transpose_pack8` and `reduce_group8` became register-only `subgroupShuffleXor`
-butterflies. The barriers were already free (a 32-lane workgroup is one wave, so
-all 64 `barrier()`s compiled away); the cost was the LDS round-trip. 179.0 →
-190.9 fps at r=2 ns=4. VGPR 256 → 216, LDS 6144 → 4096 B, subgroups/SIMD 5 → 7.
-Shuffle masks are < 8, so this stays correct on a wave64 device.
-
-**2026-09-20 — queue cap stays uncapped.** `VSFEEL_BM3D_QUEUES` {1,2,4} ×
-`num_streams` {4,8} at 2 and 4 concurrent requests: uncapped is best or tied in
-every cell (309.9 / 313.0 / 313.1 / 312.4 fps). Unlike Bilateral (+16% at cap 2)
-BM3D is not queue-starved — ~88% of the frame is fence, so a shared queue has no
-drain bubble to fill.
-
-**`extractor_exp` was a silent no-op — fixed.** Host wiring was fine and the
-SPIR-V kept `(x + E) - E`, but RADV folds that pair once E is a known spec
-constant (`RADV_DEBUG=asm` was instruction-identical for E=0 and E=20). The
-pair now computes under `precise` inside `if (EXTRACTOR != 0.0)`; the `if`
-folds at pipeline creation, so E=0's ISA is unchanged. Rule: a
-spec-constant-guarded `(x + E) - E` idiom needs `precise` or RADV folds it.
-
-**Slot-direct cache consumption was already in place.** Both caches are read in
-place: `bm3d.comp` indexes the source ring through `slot_base(z)`, and
-`bm3d_agg.comp` reads the estimate stacks through the per-slice push-constant
-`bases[9]`. The only D2D copy in the filter is `staging -> src_buf`, the upload
-leg.
+- **2026-09-20 — R80 GPU API port: -4..6% on a CPU sink, upload free, download
+  the whole cost.** Same-session pairs, 1080p GRAY32 r=2 1000 frames x3:
+  314.43 -> 297.04 and 302.87 -> 290.94 fps. Mechanism: the core's
+  `downloadPlanes` reads a plane in place only when it is
+  `HOST_VISIBLE|HOST_COHERENT|HOST_CACHED`, and a discrete card's frame planes
+  are write-combined, so a CPU consumer pays a full-frame DMA into cached
+  staging plus the host copy -- where the pre-port build wrote its result
+  straight into host-visible memory from the aggregation kernel. The upload is
+  free because `uploadPlanes` does have that path (one memcpy into the frame's
+  VRAM plane, no submission); per 1080p GRAY32 frame, single vspipe runs of an
+  otherwise empty graph: 0.276 ms cache floor, 0.921 download only, 0.899
+  upload + download. BM3D with `--gpu-cache` (no upload stage, 3x medians):
+  295.85 vs 295.92 fps, i.e. unchanged.
+  Dead ends, all slower than the shipped version:
+  - Own host staging for a CPU input, -12.8% (273.2 vs 314.4): a pooled host
+    buffer plus a DMA into the ring loses to writing the frame's plane directly.
+  - Writing the source ring directly when `createGPUBuffer` returns it
+    host-visible recovered most of that (299.8) but needed a second IO path for
+    the same result.
+  - Cached vs uncached staging and NT stores changed nothing.
+  Two correctness bugs, both fixed: releasing a cache slot at the next use of
+  that stream deadlocked `acquire_cache` (release at submit instead -- the one
+  compute queue already orders a later recompute after the aggregation), and a
+  pass-through path that ran after `acquire_cache` without releasing its
+  reservations hung the next frame. Benchmark-harness traps found here are
+  commented in `tools/benchmark.py` (`--gpu-cache`), not repeated.
 
 ## Round: the block-match scan (2026-09-21, +64% end to end)
 
@@ -308,9 +287,7 @@ cached at creation, not read per frame.
 
 - `VSFEEL_BM3D_TRACE=1` — acquire/submit/wait trace.
 - `VSFEEL_BM3D_TIMING=1` — host-stage split per frame (cached at creation).
-- `VSFEEL_BM3D_VRAM=1` — creation-time VRAM budget (shared + per-stream).
-- `VSFEEL_BM3D_QUEUES=N` — queue cap override.
-- `VSFEEL_BM3D_HD=0` — force the GTT staging + PCIe upload.
+- `VSFEEL_BM3D_VRAM=1` — creation-time VRAM budget (pooled buffers only now).
 - `VSFEEL_BM3D_SPLIT=0` — one estimation submission per frame (pre-TDR-split).
 - `VSFEEL_BM3D_CACHE=1` — add the seek margin back to the estimate cache
   (0, the default, sizes it for the working set; see the VRAM paragraph for the
@@ -321,3 +298,7 @@ cached at creation, not read per frame.
   are vsfeel inventions, not reference behaviour, and NOSEARCH distorts the
   temporal search as well (see the ablation note).
 - `VSFEEL_BM3D_DUMP=1` / `VSFEEL_BM3D_GPUTRACE=1` — slot dump / GPU timestamps.
+  The GPU probe now reads the query pool when the next frame drains the stream,
+  because a frame no longer waits for its own work.
+- `VSFEEL_BM3D_HD`, `VSFEEL_BM3D_QUEUES` — **gone** with the pre-R80 transfer and
+  queue-selection code.

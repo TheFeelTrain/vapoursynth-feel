@@ -430,6 +430,10 @@ endif()
 # Keep the host's EEDI3 vcheck LDS fit check in step with the -DMAXW the shader
 # was compiled with (defined above, in the EEDI3 shader block).
 target_compile_definitions(vsfeel PRIVATE EEDI3_MAXW_LDS=${EEDI3_MAXW})
+# The core's Vulkan device is reached through VSAPI::getVulkanAPI, which exists
+# only from API 4.3 on (R80). Defined for every TU so no include order can
+# silently drop the plugin back to API 4.0.
+target_compile_definitions(vsfeel PRIVATE VS_USE_API_43)
 if(WIN32 AND NOT MSVC)
     # Link the MinGW runtime statically: a plugin that needs libstdc++-6.dll,
     # libgcc_s_seh-1.dll and libwinpthread-1.dll is not loadable by a stock
