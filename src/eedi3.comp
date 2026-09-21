@@ -146,8 +146,22 @@ const int BT_TILE = 32;
 // Entry points that touch only the raw/pad buffers, not the row-kernel
 // helpers (pad_get/conn_cost/...), so those helpers must not be compiled in.
 #if defined(ENTRY_PAD) || defined(ENTRY_XPOSE) || defined(ENTRY_COMPOSE) || \
-    defined(ENTRY_ASSEMBLEV)
+    defined(ENTRY_ASSEMBLEV) || defined(ENTRY_BLIT) || \
+    defined(ENTRY_MASKPACK) || defined(ENTRY_MASKDILATE)
 #define ENTRY_NO_HELPERS 1
+#endif
+
+// Mask preparation compile-time configuration (the two mclip kernels only).
+// The mask plane is read straight from the core's GPU frame, so its element
+// type and the source layout are compile-time properties; CMake compiles one
+// variant per mask format (and, for the dilate kernel, per source layout). The
+// column step (1 under dh, else 2) is runtime -- it varies per frame with the
+// interleaving field -- and arrives as pc.src_step.
+#ifndef MASK_BITS
+#define MASK_BITS 8
+#endif
+#ifndef MASK_TRANS
+#define MASK_TRANS 0
 #endif
 
 // LDS staging type: 16-bit shared storage needs GL_EXT_shader_explicit_
@@ -160,9 +174,11 @@ const int BT_TILE = 32;
 #endif
 
 #if defined(ENTRY_XPOSE)
-// EEDI3H compact-upload transpose: the host deinterleaves the source rows
-// into K (WIDTH rows of `rows` elements, binding 0) and the pad builder needs
-// them in its own layout R' (`rows` rows of WIDTH elements, binding 9).
+// EEDI3H/Horizontal transpose: the source plane is read in frame order with its
+// own row pitch (binding 0) and written as the pad builder's packed layout R'
+// (`rows` rows of WIDTH elements, binding 1): R'[k][y] = src[y][first+step*k].
+// Each 16x16 tile goes through LDS so both the global load and the global store
+// stay coalesced; the interior of the pad kernel's own layout is unchanged.
 layout(std430, binding = 0) readonly buffer XposeSrc {
 #if BITS == 16
     uint16_t xsrc[];
@@ -170,7 +186,7 @@ layout(std430, binding = 0) readonly buffer XposeSrc {
     float xsrc[];
 #endif
 };
-layout(std430, binding = 9) writeonly buffer XposeDst {
+layout(std430, binding = 1) writeonly buffer XposeDst {
 #if BITS == 16
     uint16_t xdst[];
 #else
@@ -178,40 +194,34 @@ layout(std430, binding = 9) writeonly buffer XposeDst {
 #endif
 };
 #elif defined(ENTRY_COMPOSE)
-// EEDI3H output: reassemble the full output plane from the transposed kept
-// rows (R', binding 9) and the interpolated values (vout, binding 7; or the
-// row kernel's dst, binding 1, when there is no vcheck). The assembled plane
-// is written through its own binding (10, the staging download).
-layout(std430, binding = 9) readonly buffer CompRt {
+// Horizontal output assembly: reassemble the frame-order output plane (written
+// through binding 2, an output frame plane with `dst_stride`) from the
+// transposed kept rows (R', binding 0) and the interpolated values (binding 1:
+// vout, or the row kernel's dst when there is no vcheck; VCHECK_MODE selects).
+// In the EEDI3AA fused path (comp_fuse) binding 3 is the device-local home of
+// the first sub-pass's O_0 plane that the second sub-pass merges against.
+layout(std430, binding = 0) readonly buffer CompRt {
 #if BITS == 16
     uint16_t crt[];
 #else
     float crt[];
 #endif
 };
-layout(std430, binding = 7) readonly buffer CompIn {
+layout(std430, binding = 1) readonly buffer CompIn {
 #if BITS == 16
     uint16_t cout[];
 #else
     float cout[];
 #endif
 };
-// The assembled plane goes to its own binding so the vout source above can be
-// either the staging download or a device-local buffer without moving the
-// output with it.
-layout(std430, binding = 10) writeonly buffer CompOut {
+layout(std430, binding = 2) writeonly buffer CompOut {
 #if BITS == 16
     uint16_t cout2[];
 #else
     float cout2[];
 #endif
 };
-// Without a vcheck the interpolated values are the row kernel's dst rows
-// (binding 1) rather than the vcheck output; VCHECK_MODE is a spec constant so
-// the selection folds away. In the EEDI3AA fused path (comp_fuse != 0) this
-// same binding is the device-local home of the FIRST sub-pass's assembled
-// plane, which is why it is declared writable for every mode.
-layout(std430, binding = 1) buffer CompDst {
+layout(std430, binding = 3) buffer CompO0 {
 #if BITS == 16
     uint16_t cdst[];
 #else
@@ -219,48 +229,83 @@ layout(std430, binding = 1) buffer CompDst {
 #endif
 };
 #elif defined(ENTRY_ASSEMBLEV)
-// EEDI3AA vertical merge. Each output row y of the merged frame v averages
-// the SOURCE row with the interpolated row the vertical sub-pass of matching
-// parity produced: v[y] = (src[y] + vout_{y&1}[y>>1] + 1) >> 1 (u16; f32
-// averages 0.5*a + 0.5*b, which is what std.Merge does bitwise).
-//
-// The source rows are the two compacted per-parity raw uploads (the vertical
-// gather writes only the kept rows of the sub-pass's parity, so the two blocks
-// together ARE the frame), read through binding 9 -- the same buffer ENTRY_PAD
-// reads its raw from (up_dev under ReBAR, the pad_dev mirror otherwise). vout
-// is binding 7 (device-local) and the merged frame goes out through binding 10
-// (the staging scratch region) so the host can gather its columns next.
-layout(std430, binding = 9) readonly buffer AsmRaw { IO_TYPE asm_raw[]; };
-layout(std430, binding = 7) readonly buffer AsmVout { IO_TYPE asm_vout[]; };
-layout(std430, binding = 10) writeonly buffer AsmOut { IO_TYPE asm_out[]; };
+// EEDI3AA vertical merge: v[y] = (src[y] + vout_{y&1}[y>>1] + 1) >> 1 for u16
+// (f32 averages 0.5*a + 0.5*b, which is std.Merge bitwise). The source row is
+// read from the input frame plane directly (binding 0, pitch `src_stride`);
+// binding 1/2 are the two sub-passes' vout rows and binding 3 the merged frame.
+layout(std430, binding = 0) readonly buffer AsmSrc { IO_TYPE asm_src[]; };
+layout(std430, binding = 1) readonly buffer AsmVout { IO_TYPE asm_vout[]; };
+layout(std430, binding = 2) readonly buffer AsmVout2 { IO_TYPE asm_vout2[]; };
+layout(std430, binding = 3) writeonly buffer AsmOut { IO_TYPE asm_out[]; };
 #elif defined(ENTRY_PAD)
-// Raw kept rows (u16/f32 native) in the pad builder's source layout;
-// ENTRY_PAD expands the mirror margins into the built pad (binding 8,
-// device mirror tail). Vertically this is the host-uploaded tight kept rows
-// (the same bytes as binding 0); horizontally it is the GPU-transposed R'
-// written by ENTRY_XPOSE, which is why the pad builder reads binding 9 for
-// both and never needs a second variant.
-layout(std430, binding = 9) readonly buffer RawBuf {
+// ENTRY_PAD expands the mirror margins into the built pad (binding 1). Its
+// source (binding 0) is either the input frame plane read in frame order with
+// `src_stride` (vertical) or the packed R' ENTRY_XPOSE produced (horizontal);
+// PAD_SRC_PITCHED selects, so the mirror logic itself never changes.
+layout(std430, binding = 0) readonly buffer PadSrc {
 #if BITS == 16
-    uint16_t raw[];
+    uint16_t pdsrc[];
 #else
-    float raw[];
+    float pdsrc[];
 #endif
 };
-layout(std430, binding = 8) writeonly buffer PadOutBuf {
+layout(std430, binding = 1) writeonly buffer PadOutBuf {
 #if BITS == 16
     uint16_t padOut[];
 #else
     float padOut[];
 #endif
 };
+#elif defined(ENTRY_MASKPACK)
+// Horizontal mask preparation: transpose the mask plane's predicate bits.
+// binding 0 is the mask plane in frame order (element type per MASK_BITS, row
+// pitch `src_stride`); binding 1 is the packed transposed bit matrix (one u32
+// per 32 source rows per output row). ENTRY_MASKDILATE then dilates each row.
+layout(std430, binding = 0) readonly buffer MaskSrc {
+#if MASK_BITS == 8
+    uint8_t msk8[];
+#elif MASK_BITS == 16
+    uint16_t msk16[];
+#else
+    float msk32[];
+#endif
+};
+layout(std430, binding = 1) writeonly buffer PredOut { uint predout[]; };
+#elif defined(ENTRY_MASKDILATE)
+// Mask dilation: `out[x] = OR over |t| <= MDIS of predicate(src[x+t])`, the
+// per-interp-row copyMask dilation. binding 0 is either the raw mask plane (one
+// element per column, MASK_TRANS == 0) or the packed transposed predicate
+// matrix ENTRY_MASKPACK produced (MASK_TRANS == 1); binding 1 is the row
+// kernel's packed u32 mask row.
+layout(std430, binding = 0) readonly buffer DilSrc {
+#if MASK_TRANS == 1
+    uint dilsrc_bits[];
+#else
+#if MASK_BITS == 8
+    uint8_t dilsrc8[];
+#elif MASK_BITS == 16
+    uint16_t dilsrc16[];
+#else
+    float dilsrc32[];
+#endif
+#endif
+};
+layout(std430, binding = 1) writeonly buffer DilOut { uint dilout[]; };
+#elif defined(ENTRY_BLIT)
+// Output-plane writer: every row of the output frame plane (binding 2, pitch
+// `dst_stride`) is either an interpolated row (binding 0: vout, or the row
+// kernel's dst when there is no vcheck) or a kept source row (binding 1, the
+// input frame plane with `src_stride`). Writing kept rows here instead of
+// copying the source plane keeps the whole output in one dispatch.
+layout(std430, binding = 0) readonly buffer BlitIn { IO_TYPE blit_in[]; };
+layout(std430, binding = 1) readonly buffer BlitSrc { IO_TYPE blit_src[]; };
+layout(std430, binding = 2) writeonly buffer BlitOut { IO_TYPE blit_out[]; };
 #else
 layout(std430, binding = 0) readonly buffer PadBuf {
 #if BITS == 16
-    // Native u16 pad (built by ENTRY_PAD from the raw upload; the row/vcheck
-    // kernels read it from VRAM through the device mirror). Every value is
+    // Native u16 pad (built by ENTRY_PAD from the source plane). Every value is
     // < 2^16 so float() is exact and all downstream cost/interp math is
-    // bit-identical to the old host-built float pad.
+    // bit-identical to the host-built float pad.
     uint16_t pad[];
 #else
     float pad[];
@@ -269,10 +314,11 @@ layout(std430, binding = 0) readonly buffer PadBuf {
 layout(std430, binding = 1) buffer DstBuf { IO_TYPE dst[]; };
 layout(std430, binding = 2) buffer PbtBuf { int8_t pbt[]; };
 layout(std430, binding = 3) buffer DmapBuf { int8_t dmap[]; };
-// Per-interp-row empty flags (1 byte/row; written by ENTRY_ROW lane 0, read
-// by the vcheck passes). Lives in dev_buf; accessed through b3's whole-range
-// descriptor (same int8 element type, manual base below).
+// Packed dilated mask row (one u32 per 32 columns), built by ENTRY_MASKDILATE.
 layout(std430, binding = 4) readonly buffer BmaskBuf { uint bmask[]; };
+// vcheck sclip source: the sclip plane read in frame order at pitch
+// `sclip_stride` (vertical) or the packed transposed B' (horizontal; HORIZ
+// selects, and the base is then r*WIDTH+x).
 layout(std430, binding = 5) readonly buffer SclipBuf { IO_TYPE sclip[]; };
 layout(std430, binding = 6) buffer CintBuf { IO_TYPE cint[]; };
 layout(std430, binding = 7) buffer VoutBuf { IO_TYPE vout[]; };
@@ -280,15 +326,15 @@ layout(std430, binding = 7) buffer VoutBuf { IO_TYPE vout[]; };
 
 layout(push_constant) uniform PC {
     // per-plane element bases into each binding's descriptor range
-    int pad_base;     // float elements into b0 (padded plane)
+    int pad_base;     // pad elements into b0 (padded plane)
     int dst_base;     // io elements into b1 (interp rows)
     int pbt_base;     // int8 elements into b2
     int dmap_base;    // int8 elements into b3
-    int bmask_base;   // uint words into b4 (host-packed bits)
+    int bmask_base;   // uint words into b4
     int sclip_base;   // io elements into b5
     int cint_base;    // io elements into b6
     int vout_base;    // io elements into b7 (vcheck output rows)
-    int pad_stride;   // padded plane row pitch in float elements
+    int pad_stride;   // padded plane row pitch in pad elements
     int pad_height;   // padded plane height in rows
     int field;        // parity of the interpolated dst rows (0/1)
     int rows;         // number of interpolated rows (== kept source rows)
@@ -300,33 +346,29 @@ layout(push_constant) uniform PC {
     float vth1r;
     float vth2r;
     float vth2;
-    // ENTRY_PAD upload kernel (ignored by row/vcheck): the raw kept rows
-    // live in the H2D mirror (b0), like everything else the kernels reuse.
-    int raw_base;     // pad-elem base of the tight kept rows
-    int rempty_base;  // int8 base of the per-row empty flags (dev_buf via b3)
-    // ENTRY_BLIT only: row pitch of the OUTPUT FRAME in io elements (b1 is the
-    // imported frame, b7 the tight interp rows in dev_buf).
+    // ENTRY_PAD / ENTRY_XPOSE / ENTRY_BLIT / ENTRY_ASSEMBLEV: element base and
+    // row pitch (in elements) of the SOURCE frame plane. ENTRY_BLIT also uses
+    // src_stride for its kept rows.
+    int raw_base;
+    int rempty_base;  // int8 base of the per-row empty flags
+    // ENTRY_BLIT / ENTRY_COMPOSE: row pitch of the OUTPUT frame plane.
     int dst_stride;
-    // ENTRY_PAD only: skip pad rows of parity `field` (never read; see the pad
-    // kernel). Diagnostics/tuning knob, default on.
-    int pad_skip_parity;
-    // ENTRY_COMPOSE only: io-element base of the assembled output plane (b10,
-    // the staging download region).
+    int src_stride;   // source plane pitch, in elements
+    int sclip_stride; // ENTRY_VCHECK only: sclip plane pitch (vertical)
+    int src_first;    // ENTRY_XPOSE/ENTRY_PAD: first kept source column/row
+    int src_step;     // ENTRY_XPOSE/ENTRY_PAD: kept parity step (1 under dh)
+    // ENTRY_COMPOSE / ENTRY_ASSEMBLEV only: element base of the assembled plane.
     int out_base;
-    // ENTRY_ASSEMBLEV only: io-element base of the second field's vout rows
-    // (b7) and pad-elem base of the second compacted raw upload (b9). Both
-    // sub-passes write the same buffers, so their bases are separate push
-    // constants rather than extra bindings.
+    // ENTRY_ASSEMBLEV only: io-element base of the second sub-pass's vout rows.
     int vout2_base;
-    int raw2_base;
     // ENTRY_COMPOSE only, EEDI3AA fused horizontal output:
-    //   0 = the historical two-plane compose (write O to b10 for the CPU merge)
-    //   1 = first sub-pass: write the assembled plane O_0 into b1 (device-local)
-    //   2 = second sub-pass: read O_0 from b1, assemble O_1 and write the 50/50
-    //       merge of the two straight to b10 (the staging download).
-    // This removes one full-plane PCIe write and the CPU merge read; b1's
-    // element base is reuse of `dst_base` (unused by compose when vcheck > 0).
+    //   0 = one plane per sub-pass (write O to the output frame directly);
+    //   1 = first sub-pass: park the assembled O_0 plane in binding 3;
+    //   2 = second sub-pass: read O_0 from binding 3, assemble O_1 and write
+    //       the 50/50 merge of the two straight to the output frame.
     int comp_fuse;
+    // ENTRY_PAD only: 1 when the source is the packed R' (horizontal).
+    int pad_src_pitched;
 } pc;
 
 // Padded-plane access at OUTPUT dst-row coordinates. copyPad places every
@@ -357,10 +399,16 @@ float load_dst_val(int r, int x) {
 }
 
 float load_sclip_val(int r, int x) {
+    // Vertical: the sclip plane read in frame order at interp row field+2r.
+    // Horizontal: the packed transposed B' the xpose pass produced, one row of
+    // WIDTH per interp row. HORIZ folds the choice away at pipeline creation.
+    const int i = (pc.pad_src_pitched != 0)
+        ? (pc.sclip_base + r * WIDTH + x)
+        : (pc.sclip_base + (pc.field + 2 * r) * pc.sclip_stride + x);
 #if BITS == 16
-    return float(int(sclip[pc.sclip_base + r * WIDTH + x]));
+    return float(int(sclip[i]));
 #else
-    return sclip[pc.sclip_base + r * WIDTH + x];
+    return sclip[i];
 #endif
 }
 
@@ -1388,14 +1436,18 @@ void main() {
 
 #if defined(ENTRY_PAD)
 
-// Mirror-pad builder (replaces the host copyPad): expands the host-gathered
-// tight kept rows (b0, stride WIDTH, rows entries) into the full padded plane
-// (b8, stride pad_stride, pad_height rows) with eedi3m's exact mirror rules.
+// Mirror-pad builder: expands the kept rows into the full padded plane
+// (stride pad_stride, pad_height rows) with eedi3m's exact mirror rules.
+//
+// The source (binding 0) is either the input frame plane read in frame order
+// with `src_stride` -- kept rows are `src_first + src_step*kk`, i.e. field+2k
+// vertically or k under dh -- or, horizontally, the packed R' the xpose pass
+// produced (one row of WIDTH per kept index). pad_src_pitched picks, and the
+// mirror logic below never changes.
 //
 // Vertical mapping replicates copyPad in pad space: interior kept rows sit at
-// MARGIN_V + off + 2k (off = 1-field; k = kept index, rows entries covering
-// both dh and non-dh); top margins reflect around pad row MARGIN_V
-// (qy = 2*MARGIN_V - qy) and bottom margins replay the loop's
+// MARGIN_V + off + 2k (off = 1-field); top margins reflect around pad row
+// MARGIN_V (qy = 2*MARGIN_V - qy) and bottom margins replay the loop's
 // qy -= 2 + 2*off + 4k step. Rows at the other parity (and stride-padding
 // lanes past pad_w) are never read downstream; their indices are clamped so
 // every access stays in bounds and deterministic.
@@ -1417,7 +1469,7 @@ void main() {
     // (MARGIN_V + field + 1) & 1 == (field + 1) & 1. Rows of the other parity
     // are written and never read: skip them (halves the pad kernel's stores and
     // mirror math). The buffer keeps stale values there, which nothing reads.
-    if (pc.pad_skip_parity != 0 && (py & 1) == (pc.field & 1)) return;
+    if ((py & 1) == (pc.field & 1)) return;
 
     int qy = py;
     if (qy < MARGIN_V) {
@@ -1437,42 +1489,202 @@ void main() {
     else sx = ix;
     sx = clamp(sx, 0, WIDTH - 1);
 
-    padOut[pc.pad_base + py * pc.pad_stride + px] =
-        raw[pc.raw_base + kk * WIDTH + sx];
+    if (pc.pad_src_pitched != 0) {
+        const int sy = pc.src_first + pc.src_step * kk;
+        padOut[pc.pad_base + py * pc.pad_stride + px] =
+            pdsrc[pc.raw_base + sy * pc.src_stride + sx];
+    } else {
+        padOut[pc.pad_base + py * pc.pad_stride + px] =
+            pdsrc[pc.raw_base + kk * WIDTH + sx];
+    }
 }
 
 #endif  // ENTRY_PAD
 
+#if defined(ENTRY_MASKPACK)
+
+// Horizontal mask preparation: the row kernel needs the mask dilated along the
+// TRANSPOSED row (i.e. along the source column), so build the transposed
+// predicate bit matrix here in one tiled pass. Each 32x32 workgroup reads the
+// mask rows coalesced (lane = column) into shared, and each thread emits one
+// transposed word (bit ty = source row y0+ty). Only the columns of the interp
+// parity `src_first + src_step*k` map to output rows; the other columns'
+// threads do not store.
+//
+// The predicate must match the reference Gray8 conversion exactly: a u16 mask
+// is nonzero-after-conversion iff v >= 129, a full-range float iff v > 0.5/255
+// (strict; >= is off by one ULP), a byte iff != 0.
+layout(local_size_x = 32) in;
+
+shared uint tile[32];
+
+void main() {
+    const int tx = int(gl_LocalInvocationID.x);
+    const int x0 = int(gl_WorkGroupID.x) * 32;
+    const int y0 = int(gl_WorkGroupID.y) * 32;
+    const int mask_w = pc.rows * pc.src_step;   // == the mask plane's width
+    const int x = x0 + tx;
+
+    if (tx == 0) {
+        for (int i = 0; i < 32; ++i) tile[i] = 0u;
+    }
+    barrier();
+
+    // Coalesced load: the 32 lanes cover 32 consecutive columns of one row.
+    for (int ty = 0; ty < 32; ++ty) {
+        const int y = y0 + ty;
+        uint bit = 0u;
+        if (x < mask_w && y < WIDTH) {
+            const int i = y * pc.src_stride + x;
+#if MASK_BITS == 8
+            bit = (msk8[i] != 0) ? 1u : 0u;
+#elif MASK_BITS == 16
+            bit = (int(msk16[i]) >= 129) ? 1u : 0u;
+#else
+            bit = (msk32[i] > (0.5f / 255.0f)) ? 1u : 0u;
+#endif
+        }
+        if (bit != 0u) atomicOr(tile[ty], 1u << tx);
+    }
+    barrier();
+
+    // Transpose: thread tx extracts bit tx from every row and packs the 32
+    // bits into the output word for the row that column x maps to.
+    if (x < mask_w && x >= pc.src_first &&
+        ((x - pc.src_first) % pc.src_step) == 0) {
+        const int k = (x - pc.src_first) / pc.src_step;
+        if (k < pc.rows) {
+            uint v = 0u;
+            for (int ty = 0; ty < 32; ++ty) {
+                v |= ((tile[ty] >> tx) & 1u) << ty;
+            }
+            predout[pc.raw_base + k * ((WIDTH + 31) / 32) + (y0 >> 5)] = v;
+        }
+    }
+}
+
+#endif  // ENTRY_MASKPACK
+
+#if defined(ENTRY_MASKDILATE)
+
+// Per-interp-row copyMask dilation: out[x] = OR over |t| <= MDIS of
+// predicate(src[x+t]). With MASK_TRANS == 0 the source is the raw mask plane
+// (row src_first + src_step*r, pitch src_stride, element type per MASK_BITS);
+// with MASK_TRANS == 1 it is the packed transposed predicate matrix that
+// ENTRY_MASKPACK produced (row r of (WIDTH+31)/32 u32 words).
+//
+// One workgroup per row, one output u32 word per thread. The five source words
+// around the output word hold the whole MDIS window (+-40 columns = +-2 words),
+// and the doubling composition (radius 1,2,4,8,16,rest; every shift is <= 16
+// so 32-bit words are enough) runs entirely in registers, so the row costs one
+// barrier.
+layout(local_size_x = 64) in;
+
+// Source predicate bits for word i of row r (32 columns starting at 32*i).
+uint row_word(int r, int i) {
+    if (i < 0 || i >= (WIDTH + 31) / 32) return 0u;
+#if MASK_TRANS == 1
+    return dilsrc_bits[pc.raw_base + r * ((WIDTH + 31) / 32) + i];
+#else
+    uint w = 0u;
+    const int base = (pc.src_first + pc.src_step * r) * pc.src_stride + i * 32;
+    for (int b = 0; b < 32; ++b) {
+        const int x = i * 32 + b;
+        if (x >= WIDTH) break;
+#if MASK_BITS == 8
+        if (dilsrc8[base + b] != 0) w |= (1u << b);
+#elif MASK_BITS == 16
+        if (int(dilsrc16[base + b]) >= 129) w |= (1u << b);
+#else
+        if (dilsrc32[base + b] > (0.5f / 255.0f)) w |= (1u << b);
+#endif
+    }
+    return w;
+#endif
+}
+
+void main() {
+    const int r = int(gl_WorkGroupID.x);
+    const int tid = int(gl_LocalInvocationID.x);
+    const int lsz = int(gl_WorkGroupSize.x);
+    const int nwords = (WIDTH + 31) / 32;
+    const int base = pc.bmask_base + r * nwords;
+
+    for (int i = tid; i < nwords; i += lsz) {
+        // L[0..4] cover words i-2..i+2; the output word is L[2].
+        uint p[5], s[5];
+        for (int j = 0; j < 5; ++j) {
+            p[j] = row_word(r, i - 2 + j);
+            s[j] = p[j];
+        }
+        int radius = 0;
+        for (int step = 1; radius < MDIS; step <<= 1) {
+            const int sh = min(step, MDIS - radius);
+            uint np[5], ns[5];
+            for (int j = 0; j < 5; ++j) {
+                np[j] = p[j] | (p[j] << sh) | ((j > 0) ? (p[j - 1] >> (32 - sh)) : 0u);
+                ns[j] = s[j] | (s[j] >> sh) | ((j < 4) ? (s[j + 1] << (32 - sh)) : 0u);
+            }
+            for (int j = 0; j < 5; ++j) {
+                p[j] = np[j];
+                s[j] = ns[j];
+            }
+            radius += sh;
+        }
+        uint res = p[2] | s[2];
+        // The predicate never sets bits past WIDTH, but the dilation shifts
+        // bits up into them and the row kernel's span scan reads every stored
+        // word, so clear them on the last word of the row.
+        if (i == nwords - 1 && (WIDTH & 31) != 0) {
+            res &= (1u << (WIDTH & 31)) - 1u;
+        }
+        dilout[base + i] = res;
+    }
+}
+
+#endif  // ENTRY_MASKDILATE
+
 #if defined(ENTRY_BLIT)
 
-// Direct-to-frame output rows (VK_EXT_external_memory_host path, default off).
-// The interp rows produced by ENTRY_ROW (or vcheck) sit tight in dev_buf at b7;
-// the output frame's own memory is bound as b1, so this pass spreads those rows
-// into the frame at its real row pitch and interp parity, replacing the CPU
-// blit (a staging read plus a frame write, ~20% of the frame) with a GPU pass
-// (~1 ms of frame latency at 2160p). The transfer engine was tried for this and
-// is not usable: a multi-region vkCmdCopyBuffer with one region per interp row
-// costs ~13 us per region in situ, i.e. ~14 ms of frame latency.
+// Output-plane writer: every row of the output frame plane (binding 2, pitch
+// `dst_stride`) is either an interpolated row (binding 0 = the interp rows,
+// vout when vcheck > 0 else dst) or a kept source row (binding 1 = the input
+// frame plane at `src_stride`). Writing the kept rows here instead of copying
+// the source plane keeps the whole output in one dispatch.
 layout(local_size_x = 256) in;
 
 void main() {
     const uint i = gl_GlobalInvocationID.x;
-    const int total = pc.rows * WIDTH;
+    const int total = 2 * pc.rows * WIDTH;
     if (int(i) >= total) return;
-    const int r = int(i) / WIDTH;
+    const int y = int(i) / WIDTH;
     const int x = int(i) % WIDTH;
-    dst[pc.dst_base + (pc.field + 2 * r) * pc.dst_stride + x] =
-        vout[pc.vout_base + r * WIDTH + x];
+    const int off = 1 - pc.field;
+    if (((y - pc.field) & 1) == 0) {
+        const int r = (y - pc.field) >> 1;
+        // A GLSL `if` on a specialization constant folds at pipeline creation;
+        // `#if` would evaluate the identifier as 0 instead.
+        if (VCHECK_MODE > 0) {
+            blit_out[y * pc.dst_stride + x] = blit_in[pc.vout_base + r * WIDTH + x];
+        } else {
+            blit_out[y * pc.dst_stride + x] = blit_in[pc.dst_base + r * WIDTH + x];
+        }
+    } else {
+        // Kept output row y holds source row y (dh=0, where the kept parity is
+        // 1:1) or source row (y-off)/2 (dh=1, kept and interp rows interleave).
+        const int sy = (pc.src_step == 1) ? ((y - off) >> 1) : y;
+        blit_out[y * pc.dst_stride + x] = blit_src[pc.raw_base + sy * pc.src_stride + x];
+    }
 }
 
 #endif  // ENTRY_BLIT
 
 #if defined(ENTRY_XPOSE)
 
-// EEDI3H upload transpose: K (WIDTH rows of `rows` elements, binding 0) ->
-// R' (`rows` rows of WIDTH elements, binding 9). `rows` is K's row length;
-// WIDTH (spec constant) is the kernel width, i.e. the number of source rows
-// the host deinterleaved. Plain 16x16 tiled transpose with an LDS stage so
+// Horizontal kept-row transpose: the source plane is read in frame order
+// (binding 0, pitch `src_stride`) and written as the pad builder's packed
+// layout R' (binding 1, `rows` rows of WIDTH elements): R'[k][y] =
+// src[y][src_first + src_step*k]. Plain 16x16 tiled transpose with an LDS stage so
 // both the global load and the global store are coalesced; the interior of
 // the pad kernel's own layout is unchanged, so nothing downstream changes.
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -1491,7 +1703,8 @@ void main() {
         const int y = by + ty;
         SHARED_T v = SHARED_T(0);
         if (k < pc.rows && y < WIDTH) {
-            v = SHARED_T(xsrc[pc.raw_base + y * pc.rows + k]);
+            v = SHARED_T(xsrc[pc.raw_base + y * pc.src_stride +
+                              pc.src_first + pc.src_step * k]);
         }
         xposeTile[ty][tx] = v;
     }
@@ -1559,27 +1772,28 @@ void main() {
         const int k = bx + tx;
         const int y = by + ty;
         if (k < pc.rows && y < WIDTH) {
-            // Plane-relative element offset (both the b1 o0 region and the b10
-            // staging output are addressed from their own base).
-            const int off = y * (2 * pc.rows) + 2 * k;
+            // Frame-order output offset (pitch `dst_stride`) and the packed
+            // o0 offset (2*rows elements per row).
+            const int o = y * pc.dst_stride + 2 * k;
+            const int o0 = y * (2 * pc.rows) + 2 * k;
             if (pc.comp_fuse == 1) {
                 // First AA horizontal sub-pass: park the assembled plane in the
                 // device-local binding so the second sub-pass can merge against
-                // it without a PCIe round trip.
-                cdst[pc.dst_base + off + pc.field] = IO_TYPE(compV[tx][ty]);
-                cdst[pc.dst_base + off + (1 - pc.field)] = IO_TYPE(compR[tx][ty]);
+                // it without a round trip.
+                cdst[pc.out_base + o0 + pc.field] = IO_TYPE(compV[tx][ty]);
+                cdst[pc.out_base + o0 + (1 - pc.field)] = IO_TYPE(compR[tx][ty]);
             } else if (pc.comp_fuse == 2) {
                 // Second AA horizontal sub-pass: O_1 is assembled here and
                 // averaged 50/50 with O_0 (in cdst) exactly like std.Merge's
-                // u16 (a+b+1)>>1 / f32 0.5a+0.5b, then written straight to the
-                // staging download.
-                cout2[pc.out_base + off + pc.field] = IO_TYPE(merge_avg(
-                    SHARED_T(cdst[pc.dst_base + off + pc.field]), compV[tx][ty]));
-                cout2[pc.out_base + off + (1 - pc.field)] = IO_TYPE(merge_avg(
-                    SHARED_T(cdst[pc.dst_base + off + (1 - pc.field)]), compR[tx][ty]));
+                // u16 (a+b+1)>>1 / f32 0.5a+0.5b, then written straight into
+                // the output frame.
+                cout2[o + pc.field] = IO_TYPE(merge_avg(
+                    SHARED_T(cdst[pc.out_base + o0 + pc.field]), compV[tx][ty]));
+                cout2[o + (1 - pc.field)] = IO_TYPE(merge_avg(
+                    SHARED_T(cdst[pc.out_base + o0 + (1 - pc.field)]), compR[tx][ty]));
             } else {
-                cout2[pc.out_base + off + pc.field] = IO_TYPE(compV[tx][ty]);
-                cout2[pc.out_base + off + (1 - pc.field)] = IO_TYPE(compR[tx][ty]);
+                cout2[o + pc.field] = IO_TYPE(compV[tx][ty]);
+                cout2[o + (1 - pc.field)] = IO_TYPE(compR[tx][ty]);
             }
         }
     }
@@ -1590,11 +1804,11 @@ void main() {
 #if defined(ENTRY_ASSEMBLEV)
 
 // EEDI3AA vertical merge: one dispatch per plane, one thread per output
-// element. `pc.field` is the FIRST sub-pass's interp parity; every row whose
-// parity matches it takes that sub-pass's vout rows and the OTHER sub-pass's
-// compacted source rows (that sub-pass kept the complementary parity), and
-// vice versa. `pc.rows` is the vertical pass's interp-row count, so the output
-// plane has 2*pc.rows rows (dh is not supported on this path).
+// element. `pc.field` is the FIRST sub-pass's interp parity; a row whose parity
+// matches it takes that sub-pass's vout rows and vice versa. The source row is
+// read from the input frame plane directly (binding 0, pitch `src_stride`).
+// `pc.rows` is the vertical pass's interp-row count, so the output plane has
+// 2*pc.rows rows (dh is not supported on this path).
 layout(local_size_x = 256) in;
 
 void main() {
@@ -1605,17 +1819,16 @@ void main() {
     const int x = int(idx) % WIDTH;
     const int p = y & 1;
     const int r = y >> 1;
-    // src[y] lives in the upload gathered for field (1 - p); vout comes from
-    // the sub-pass whose interp parity IS p.
-    const int raw_base = (p == pc.field) ? pc.raw2_base : pc.raw_base;
+    // vout comes from the sub-pass whose interp parity IS p; the source value
+    // is just row y of the input frame.
     const int vout_base = (p == pc.field) ? pc.vout_base : pc.vout2_base;
-    const int i = raw_base + r * WIDTH + x;
+    const int i = pc.raw_base + y * pc.src_stride + x;
     const int j = vout_base + r * WIDTH + x;
 #if BITS == 16
     asm_out[pc.out_base + int(idx)] =
-        IO_TYPE((int(asm_raw[i]) + int(asm_vout[j]) + 1) >> 1);
+        IO_TYPE((int(asm_src[i]) + int(asm_vout[j]) + 1) >> 1);
 #else
-    asm_out[pc.out_base + int(idx)] = 0.5f * asm_raw[i] + 0.5f * asm_vout[j];
+    asm_out[pc.out_base + int(idx)] = 0.5f * asm_src[i] + 0.5f * asm_vout[j];
 #endif
 }
 

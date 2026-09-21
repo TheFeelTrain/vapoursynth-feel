@@ -23,24 +23,30 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    WIDTH, HEIGHT, NOISE_MKV, assert_preserves_frame_props, plane as _plane,
-    reference_compare, reference_or_skip, reference_spec, right_half_mask,
+    WIDTH, HEIGHT, NOISE_MKV, assert_preserves_frame_props, cpu_node,
+    plane as _plane, reference_compare, reference_or_skip, reference_spec,
+    right_half_mask,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
 
 def _runh(clip, field=1, num_streams=1, **kwargs):
-    return vs.core.vsfeel.EEDI3H(
+    """EEDI3H as a clip the test can read pixels from (see conftest.cpu_node)."""
+    return cpu_node(vs.core.vsfeel.EEDI3H(
         clip,
         field=field,
         num_streams=num_streams,
         **kwargs,
-    )
+    ))
 
 
 def _oracle(clip, field=1, num_streams=1, mclip=None, sclip=None, **kwargs):
-    """Transpose(EEDI3(Transpose(clip))) with transposed aux clips."""
+    """Transpose(EEDI3(Transpose(clip))) with transposed aux clips.
+
+    Only the final node is downloaded: the intermediate chain stays GPU
+    resident, which std.Transpose handles in place.
+    """
     t = vs.core.std.Transpose(clip)
     tm = vs.core.std.Transpose(mclip) if mclip is not None else None
     ts = vs.core.std.Transpose(sclip) if sclip is not None else None
@@ -50,7 +56,7 @@ def _oracle(clip, field=1, num_streams=1, mclip=None, sclip=None, **kwargs):
     if ts is not None:
         kw["sclip"] = ts
     inner = vs.core.vsfeel.EEDI3(t, field=field, num_streams=num_streams, **kw)
-    return vs.core.std.Transpose(inner)
+    return cpu_node(vs.core.std.Transpose(inner))
 
 
 def _assert_oracle_exact(clip, dtype, out_w, out_h, frames, field, mclip=None,

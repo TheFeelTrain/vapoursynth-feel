@@ -396,6 +396,16 @@ def read_plane(frame, plane, dtype):
         ctypes.cast(frame.get_read_ptr(plane), ctypes.POINTER(ctypes.c_uint8)),
         shape=(h, frame.get_stride(plane)))
     return raw[:, :w * dt.itemsize].copy().view(dt).reshape(h, w)
+
+
+def cpu_node(node):
+    """A clip whose frames the host can read (see conftest.cpu_node).
+
+    Inside a comparison subprocess a GPU-resident frame has no host pointer, so
+    reading pixels requires std.GPUDownload; a CPU node passes through.
+    """
+    import vapoursynth as _vs
+    return _vs.core.std.GPUDownload(clip=node) if node.gpu_resident else node
 '''
 
 

@@ -35,7 +35,7 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    WIDTH, HEIGHT, NOISE_MKV, assert_preserves_frame_props,
+    WIDTH, HEIGHT, NOISE_MKV, assert_preserves_frame_props, cpu_node,
     dtype_for_bits as _dtype, eval_parallel, half_mask as _mask, plane as _plane,
 )
 
@@ -51,13 +51,18 @@ F32_TOL = 1e-6
 
 
 def _aa(clip, field=3, num_streams=1, **kwargs):
-    return vs.core.vsfeel.EEDI3AA(
+    """EEDI3AA as a clip the test can read pixels from (see conftest.cpu_node)."""
+    return cpu_node(vs.core.vsfeel.EEDI3AA(
         clip, field=field, num_streams=num_streams, **kwargs
-    )
+    ))
 
 
 def _oracle(clip, field=3, num_streams=1, mclip=None, sclip=None, **kwargs):
-    """The exact based_aa chain, built from the same plugin."""
+    """The exact based_aa chain, built from the same plugin.
+
+    Only the final node is downloaded: the intermediate EEDI3 -> Merge ->
+    EEDI3H chain stays GPU resident.
+    """
     kw = dict(kwargs)
     if mclip is not None:
         kw["mclip"] = mclip
@@ -66,7 +71,7 @@ def _oracle(clip, field=3, num_streams=1, mclip=None, sclip=None, **kwargs):
     v = vs.core.vsfeel.EEDI3(clip, field=field, num_streams=num_streams, **kw)
     vm = vs.core.std.Merge(v[::2], v[1::2])
     h = vs.core.vsfeel.EEDI3H(vm, field=field, num_streams=num_streams, **kw)
-    return vs.core.std.Merge(h[::2], h[1::2])
+    return cpu_node(vs.core.std.Merge(h[::2], h[1::2]))
 
 
 def _assert_oracle(clip, dtype, frames, field=3, mclip=None, sclip=None,

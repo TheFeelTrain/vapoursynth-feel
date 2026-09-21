@@ -276,6 +276,17 @@ foreach(bits IN LISTS VK_BITS)
         "eedi3_${bits}_assemblev|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_ASSEMBLEV")
 endforeach()
 
+# EEDI3 mask preparation: one variant per mask element format (the mask plane is
+# read straight out of the core's GPU frame, so its type is compile-time), and
+# per source layout for the dilate kernel (raw plane vs the packed transposed
+# predicate matrix ENTRY_MASKPACK writes). These do not depend on the io depth.
+foreach(mbits IN ITEMS 8 16 32)
+    list(APPEND VK_EEDI3_VARIANTS
+        "eedi3_maskpack_${mbits}|eedi3.comp|--target-env=vulkan1.3 -DENTRY_MASKPACK -DMASK_BITS=${mbits}"
+        "eedi3_maskdilate_${mbits}_raw|eedi3.comp|--target-env=vulkan1.3 -DENTRY_MASKDILATE -DMASK_BITS=${mbits} -DMASK_TRANS=0"
+        "eedi3_maskdilate_${mbits}_tr|eedi3.comp|--target-env=vulkan1.3 -DENTRY_MASKDILATE -DMASK_BITS=${mbits} -DMASK_TRANS=1")
+endforeach()
+
 # NNEDI3: prescreener + cooperative predictor. Three predictor variants for
 # the shipped PXP selection: PXP=8 needs a 256-vec4 shared stride, wide
 # networks (PXP=4) the 288 one, and FS<=64 the 64-stride small tile (4KB LDS

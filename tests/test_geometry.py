@@ -153,7 +153,7 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     if VSFEEL_ORACLE:
         print("REF ok", flush=True)
     try:
-        ref_node = build_ref()
+        ref_node = cpu_node(build_ref())
         ref_frames = [[read_plane(ref_node.get_frame(n), p, dtype)
                        for p in planes] for n in frames]
     except SystemExit:
@@ -170,7 +170,8 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 
     # --- vsfeel phase ---
     try:
-        my_node = build_my()
+        # Pixels are read directly, so a GPU-resident node is downloaded first.
+        my_node = cpu_node(build_my())
         worst = 0.0
         for n, ref_planes in zip(frames, ref_frames):
             frame = my_node.get_frame(n)

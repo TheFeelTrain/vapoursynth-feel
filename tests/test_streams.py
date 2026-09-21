@@ -33,7 +33,7 @@ import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import eval_parallel, format_dtype, plane_to_ndarray
+from conftest import cpu_node, eval_parallel, format_dtype, plane_to_ndarray
 
 STREAM_COUNTS = (1, 3, 4, 6, 8, 16, 32)
 TINY_SIZE = 64
@@ -121,7 +121,7 @@ def test_num_streams_matches_serial(stream_clips, name, build, clip_name):
     """
     clip = stream_clips[clip_name]
     dtype = format_dtype(clip.format)
-    ref = [plane_to_ndarray(build(clip, 1).get_frame(n), 0, dtype)
+    ref = [plane_to_ndarray(cpu_node(build(clip, 1)).get_frame(n), 0, dtype)
            for n in range(clip.num_frames)]
 
     bad = []

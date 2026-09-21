@@ -2,26 +2,50 @@
 
 Status: **shipped** — family-A semantics (eedi3m/eedi3vk2), f32 DP, u16 bit-exact
 vs eedi3vk2. EEDI3, EEDI3H (native transposed-plane, no `std.Transpose` nodes) and
-EEDI3AA (fused based_aa chain) share every kernel, gather and buffer. The parallel
-vcheck is the default; AA's two horizontal sub-passes are one command buffer.
+EEDI3AA (fused based_aa chain) share every kernel, geometry and pipeline. Runs on
+the **R80 GPU API**: `clip/sclip/mclip:vnode:gpu` in and `ffGPUOutput` out, one
+exec pool, and no host upload/download/gather/blit machinery at all. The parallel
+vcheck is the default.
 
-Benchmark defaults: 2000 f, ns=8, real based_aa mask, 2x2160p, field=3, mdis=20,
-vcheck=2.
+Benchmark defaults: 2000 f, real based_aa clip, 2x2160p, field=3, mdis=20,
+vcheck=2. `MANGOHUD=0 python3 tools/benchmark.py --filter eedi3 vsfeel vszipcl`.
 
-| depth | vsfeel | vszipcl | speedup |
+| clip | vsfeel | vszipcl | speedup |
 |---|---|---|---|
-| u16 | 628 (622/628) | 214 (213/216) | 2.94x |
-| fp32 | 318 (316/319) | 186 (184/191) | 1.71x |
+| u16 | 384 | 214 | 1.8x |
+| fp32 | 246 | 186 | 1.3x |
 
-EEDI3H ~378, EEDI3AA ~160 fps (u16) at the same config.
+Interleaved same-session A/B against the pre-port build (2 reps, `--repeat 2`,
+graded medians): EEDI3 **612 → 384 fps (−37%)**, EEDI3H 417 → 401 (−4%),
+EEDI3AA 155 → 148 (−4.5%). `--gpu-cache` (input pre-uploaded) on the port:
+EEDI3 380 → 417, EEDI3H 400 → 488, EEDI3AA 149 → 146.
+
+- **The remaining EEDI3 gap is the R80 API's single compute queue.** The core
+  creates exactly one compute queue (`VSVulkanCoreHandles`), and the row kernel
+  launches only `rows` workgroups of a latency-bound scan: 1080 waves at 2x2160p
+  leaves the GPU under-occupied, so throughput comes from running several frames'
+  rows at once. The pre-port filter used up to 8 Vulkan queues (measured: forcing
+  it to one queue drops it 987 → 416 fps, i.e. the whole difference is cross-queue
+  overlap). Consecutive *dispatches inside one command buffer* do overlap
+  (measured 1080p: one row dispatch 2.25 ms, ×2 1.45 ms/frame, ×4 1.10), so the
+  port records a **batch of output frames per submission, phase by phase** (all
+  pads, then all rows with no barrier between them, then all vchecks, then all
+  tails) and caches the frames the sibling `getFrame` calls then take. The batch
+  is sized to ~1 GiB of scratch per submission (`VSFEEL_EEDI3_BATCH`): swept on
+  the graded workload B=2 374, B=4 378, B=6 318, B=8 276 fps, and raising
+  `VS_VULKAN_MAX_VRAM_MB` leaves B=8 at 278, so the knee is B=4 and the limiter is
+  VRAM (per-frame scratch is 208 MB, 170 MB of it `pbt`).
+- **Next lever if EEDI3 must reach parity:** shrink the scratch so a larger batch
+  fits. `pbt` is `rows*width*tpitch` bytes of ±1 int8 deltas; 2-bit packing cuts it
+  4x, which would let B=8 fit and is the only measured path to ~8 frames of row
+  overlap.
+- EEDI3H and EEDI3AA are already at parity because their transposed row kernel
+  launches `width/2` = 1920 workgroups per frame (vs 1080), which nearly fills the
+  GPU on its own.
 
 - **The graded `mclip` was 100% zero until round 14**, making DP/backtrack, vcheck
   and vcopy dead code. Pre-round-14 verdicts describe that path and are marked
   *(stale)*; the accuracy work and correctness fixes from those rounds are unaffected.
-- Cost model, honest since round 20: row kernel **~17%** of the vertical frame
-  (~25% of EEDI3AA), vcheck ~14%; round 27 spread the vcheck over 1080 workgroups.
-  Round 29's GPU stage marks put the row kernel at **3.485 of 3.86 ms** of the
-  ns=1 GPU frame.
 - `src/eedi3.comp`: MDIS 20 → TPITCH 41, CENTER 20, BT_TILE 32, SGSIZE 32, K 2,
   RING_CAP 7. `VCHECK_LDS` defaults to 0 (global-read form, round 21); the parallel
   vcheck (`VCHECK_PARA=6`) is the default since round 27.
@@ -48,12 +72,19 @@ LDS stage, clip → R', sclip → B') and `ENTRY_COMPOSE`; EEDI3AA adds `ENTRY_A
 - Span-skip: lane 0 scans the packed mask words for the first set bit into shared
   `rowXmin`; a fully-masked row takes a parallel cubic loop, else the DP starts at
   `max(1,xmin)` with an analytic predecessor seed and the walk stops left of `xmin`.
-- Memory path: cached system-RAM staging + a device-local `pad_dev` mirror, plus a
-  `DEVICE_LOCAL|HOST_VISIBLE|COHERENT` per-resource `up_dev` written by the NT path
-  and read directly (ReBAR; `_mm_sfence()` before submit). `VSFEEL_EEDI3_NOREBAR=1`
-  restores staging + H2D.
-- One `FramePool<Eedi3Resource>` per instance; per-width pipelines deduplicated in
-  `d->width_pipes`. `num_queues = min(num_streams, queue_count)` (knee 8).
+- Memory path (R80): every input plane is read straight out of the core's GPU
+  frame at its own pitch and every kernel writes into the output frame's own
+  memory; the mask predicate/dilation and the horizontal transpose are GPU
+  kernels too. The per-frame scratch (pad, dst, pbt, dmap, cint, vout, bits, R',
+  B', v, o0, rempty) is one `createGPUBuffer` per frame handed to the exec
+  context with `gpuExecUsesBuffer`, so the pool reclaims it when the submission
+  completes. One `Eedi3Job` per frame per sub-pass feeds `record_pass`, which is
+  split into `kPrep`/`kRow`/`kVcheck`/`kTail` phases so a batch's frames can be
+  recorded with no barrier between their row dispatches. Output frames are
+  batched (`d->batch_size`, `VSFEEL_EEDI3_BATCH`) and cached for the sibling
+  `getFrame` calls; `d->width_pipes` still deduplicates per-width pipelines.
+  `num_streams` and `device_id` are accepted and ignored: depth is the core's
+  pool, the device is `core.set_vulkan_device`.
 
 ### vcheck contract (family A)
 
@@ -647,30 +678,15 @@ the reason a variant failed, not as a current number.
 
 ## Debug env vars (verified against `src/eedi3.cpp`)
 
-- `VSFEEL_EEDI3_NOREBAR` — force staging + H2D DMA instead of host-direct ReBAR.
-- `VSFEEL_EEDI3_VOUTDEV` — `=0` forces `vout` to staging (EEDI3H default: device-local).
-- `VSFEEL_EEDI3_DSTHOST` — `=1` per-frame host-pointer output import (default off).
-- `VSFEEL_EEDI3_AATIGHT` — `=0` restores the pre-round-21 EEDI3AA compose.
-- `VSFEEL_EEDI3AA_HFUSE` — set selects the fused single-CB AA horizontal stage; unset
-  is the two-submission A/B control.
 - `VSFEEL_EEDI3_VCLDS` — `=1` forces the LDS vcheck ping-pong back (global is default).
 - `VSFEEL_EEDI3_VPARA` — vcheck form: 0 = serial row walk (A/B control), 1..6 =
   parallel with that many Jacobi steps. Default 6 (bit-exact on the test surface).
-- `VSFEEL_EEDI3_QUEUES` — queue cap override (default `min(num_streams, queue_count)`).
-- `VSFEEL_EEDI3_COPY` — 0..7 bit mask: bit0 NT raw gather, bit1 NT kept rows, bit2 NT blit.
-- `VSFEEL_EEDI3_MASKFUSE` — `=0` A/Bs the pre-round-19 two-pass mask path.
-- `VSFEEL_EEDI3_PAIR` — `=0` disables the fused kept+interp column gather.
-- `VSFEEL_EEDI3_PADPAR` — `=0` disables the pad parity skip (full pad build).
-- `VSFEEL_EEDI3_BLITCONTIG` — one contiguous copy instead of per-row strided copies.
-- `VSFEEL_EEDI3_RAWSTAGE` — raw gather into staging (implies the DMA path).
-- `VSFEEL_EEDI3_TRACE` — host phase trace.
-- `VSFEEL_EEDI3_HBENCH` / `_HFRAME` — host stage split; `HFRAME=N` samples frame N (`-1` periodic).
-- `VSFEEL_EEDI3_GBENCH` — GPU stage-boundary timestamps at ns=1, mean deltas every 50 frames.
-- `VSFEEL_EEDI3_PTRTRACE` — sclip plane-pointer trace (temporary diagnostic).
-- `VSFEEL_EEDI3_{NOBLIT,NOSCLIP,NORAW,NOH2D,NOVC,NOPAD,NOXFER,NOXPOSE,NOCOMPOSE,NOMASKX}` — ablation opt-outs (`NOBLIT` errors on EEDI3AA).
-- `VSFEEL_EEDI3AA_HBENCH` / `_HFRAME` — EEDI3AA host stage split.
+- `VSFEEL_EEDI3_BATCH` — output frames recorded per submission (default: sized to
+  ~1 GiB of scratch, clamped 2..8; 4 at 2x2160p). `=1` is the unbatched A/B control.
+- `VSFEEL_EEDI3_TRACE` — one-shot banner: VRAM accounting, per-plane region layout,
+  spec constants per geometry.
+- `VSFEEL_EEDI3_TIMING` — per-frame host stage split (acquire/alloc/record/submit).
+- `VSFEEL_EEDI3_SYNC` — additionally wait each submission out and report its wall time
+  (serializes the pipeline; for GPU-time measurements at depth 1).
 - `EEDI3_PROBE` — CMake cache var: ablation level 0/1/2/3/4/5/6/7/8/9/10/12 (11, 13+ unused).
-- `EEDI3_MAXW` — CMake cache var: LDS vcheck max width → `-DMAXW` + `-DEEDI3_MAXW_LDS` (default 4096).
-
-Temporary diagnostics flagged for deletion before landing but still in the tree:
-`NOXPOSE`, `NOCOMPOSE`, `NOMASKX`, `PTRTRACE`.
+- `EEDI3_MAXW` — CMake cache var: LDS vcheck max width -> `-DMAXW` + `-DEEDI3_MAXW_LDS` (default 4096).

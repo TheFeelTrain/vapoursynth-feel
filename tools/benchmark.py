@@ -177,6 +177,7 @@ def make_aa_vpy(
     eedi3_field: int = 3,
     bits: int = AA_MASK_BITS,
     cache_bytes: int | None = None,
+    gpu_cache: bool = False,
 ) -> str:
     """Real-clip vpy that mirrors vsaa.based_aa's EEDI3 usage:
 
@@ -212,6 +213,26 @@ def make_aa_vpy(
             )
         else:
             cap_lines = f"m = min({cache_frames}, ss.num_frames)\n"
+        if gpu_cache:
+            # --gpu-cache: hand the arms device-resident frames directly, so the
+            # timed region has no GPUUpload stage in the graph. Both device
+            # caches are warmed into the core's own frame cache while the script
+            # is evaluated (outside the timed region), exactly like make_vpy's
+            # clip_gpu; serving them through a Python ModifyFrame instead costs
+            # more than the upload it removes (see make_vpy).
+            cache_build = (
+                "_gpu_ss = core.std.GPUUpload(clip=_ss_served)\n"
+                "_gpu_msk = core.std.GPUUpload(clip=_msk_served)\n"
+                "_gpu_warm = [_gpu_ss.get_frame(n) for n in range(m)]\n"
+                "_gpu_mwarm = [_gpu_msk.get_frame(n) for n in range(m)]\n"
+                f"clip = (_gpu_ss * -(-{frames} // m)).std.Trim(0, {frames} - 1)\n"
+                f"mclip = (_gpu_msk * -(-{frames} // m)).std.Trim(0, {frames} - 1)\n"
+            )
+        else:
+            cache_build = (
+                f"clip = (_ss_served * -(-{frames} // m)).std.Trim(0, {frames} - 1)\n"
+                f"mclip = (_msk_served * -(-{frames} // m)).std.Trim(0, {frames} - 1)\n"
+            )
         cache_lines = f"""\
 {cap_lines}_ss_frames = [ss.get_frame(n) for n in range(m)]
 _msk_frames = [mclip.get_frame(n) for n in range(m)]
@@ -220,9 +241,10 @@ def _serve_ss(n, f):
 def _serve_msk(n, f):
     return _msk_frames[n % m]
 _blank = ss.std.BlankClip()
-clip = (_blank.std.ModifyFrame(_blank, _serve_ss) * -(-{frames} // m)).std.Trim(0, {frames} - 1)
+_ss_served = _blank.std.ModifyFrame(_blank, _serve_ss)
 _blankm = mclip.std.BlankClip()
-mclip = (_blankm.std.ModifyFrame(_blankm, _serve_msk) * -(-{frames} // m)).std.Trim(0, {frames} - 1)
+_msk_served = _blankm.std.ModifyFrame(_blankm, _serve_msk)
+{cache_build}
 sclip = {f"core.std.Interleave([clip, clip])" if eedi3_field > 1 else "clip"}
 """
     else:
@@ -510,6 +532,29 @@ def _eedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[st
     }
 
 
+def _eedi3h_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
+    """The horizontal EEDI3: the same call surface as _eedi3_build, one name up.
+
+    eedi3vk2 does not register an EEDI3H, so the references are vszipcl and
+    vszipcu (which do).
+    """
+    ns_num = resolve_streams(spec, ns)
+    use_mclip = getattr(ns, "eedi3_mclip", True)
+    common = (
+        f"field={ns.eedi3_field}, mdis={ns.eedi3_mdis}, nrad={ns.eedi3_nrad}, "
+        f"alpha={ns.eedi3_alpha}, beta={ns.eedi3_beta}, gamma={ns.eedi3_gamma}, "
+        f"vcheck={ns.eedi3_vcheck}, vthresh0={ns.eedi3_vthresh0}, "
+        f"vthresh1={ns.eedi3_vthresh1}, vthresh2={ns.eedi3_vthresh2}"
+    )
+    with_mclip = common + (", sclip=sclip, mclip=mclip" if use_mclip else ", sclip=sclip")
+    with_sclip = f"{common}, sclip=sclip"
+    return {
+        "vsfeel": f"core.vsfeel.EEDI3H({clip}, {with_mclip}, num_streams={ns_num})",
+        "vszipcl": f"core.vszipcl.EEDI3H({clip}, {with_sclip}, num_streams={ns_num})",
+        "vszipcu": f"core.vszipcu.EEDI3H({clip}, {with_sclip}, num_streams={ns_num})",
+    }
+
+
 def _vsaa_eedi3_backend(plugin: str) -> str | None:
     """Name of the ``vsaa`` ``EEDI3.Backend`` member that drives ``plugin``.
 
@@ -738,6 +783,33 @@ FILTERS: dict[str, FilterSpec] = {
         input="depth(get_y(clip), 16)",
         aa=True,
         default_streams=8,
+        # vsfeel's EEDI3 is vnode:gpu; the reference arms are not.
+        gpu_plugins=frozenset({"vsfeel"}),
+    ),
+    "eedi3h": FilterSpec(
+        title="EEDI3H (horizontal)",
+        default_frames=2000,
+        args=[
+            # Same surface as the eedi3 entry; EEDI3H interpolates columns.
+            Arg("field", "--eedi3-field", "eedi3_field", int, 3),
+            Arg("mdis", "--eedi3-mdis", "eedi3_mdis", int, 20),
+            Arg("nrad", "--eedi3-nrad", "eedi3_nrad", int, 2),
+            Arg("alpha", "--eedi3-alpha", "eedi3_alpha", float, 0.125),
+            Arg("beta", "--eedi3-beta", "eedi3_beta", float, 0.25),
+            Arg("gamma", "--eedi3-gamma", "eedi3_gamma", float, 40.0),
+            Arg("vcheck", "--eedi3-vcheck", "eedi3_vcheck", int, 2),
+            Arg("vthresh0", "--eedi3-vthresh0", "eedi3_vthresh0", float, 12.0),
+            Arg("vthresh1", "--eedi3-vthresh1", "eedi3_vthresh1", float, 24.0),
+            Arg("vthresh2", "--eedi3-vthresh2", "eedi3_vthresh2", float, 4.0),
+            Arg("mclip", "--eedi3-mclip", "eedi3_mclip", _str_to_bool, True,
+                "pass the vsaa edge mask as mclip to vsfeel (default: true)"),
+        ],
+        build=_eedi3h_build,
+        input="depth(get_y(clip), 16)",
+        aa=True,
+        default_streams=8,
+        # vsfeel's EEDI3H is vnode:gpu; the reference arms are not.
+        gpu_plugins=frozenset({"vsfeel"}),
     ),
     "eedi3aa": FilterSpec(
         title="EEDI3AA (based_aa)",
@@ -765,6 +837,8 @@ FILTERS: dict[str, FilterSpec] = {
         input="depth(get_y(clip), 16)",
         aa=True,
         default_streams=8,
+        # vsfeel's EEDI3AA is vnode:gpu; the reference arms are not.
+        gpu_plugins=frozenset({"vsfeel"}),
     ),
     "nnedi3": FilterSpec(
         title="NNEDI3",
@@ -872,7 +946,8 @@ def bench_aa(plugin: str, chain: str, clip: str, frames: int,
              eedi3_field: int = 3,
              bits: int = AA_MASK_BITS,
              cache_bytes: int | None = None,
-             timeout: float = DEFAULT_TIMEOUT) -> float | None:
+             timeout: float = DEFAULT_TIMEOUT,
+             gpu_cache: bool = False) -> float | None:
     """Run an EEDI3 anti-aliasing style benchmark (see make_aa_vpy)."""
     vpy = make_aa_vpy(
         clip=clip,
@@ -883,6 +958,7 @@ def bench_aa(plugin: str, chain: str, clip: str, frames: int,
         eedi3_field=eedi3_field,
         bits=bits,
         cache_bytes=cache_bytes,
+        gpu_cache=gpu_cache,
     )
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"bench_{plugin}.vpy"
@@ -955,7 +1031,7 @@ def _run_once(spec: FilterSpec, ns: argparse.Namespace, plugin: str, chain: str,
         budget = ns.aa_cache_mb * 1024 * 1024 if ns.aa_cache_mb else None
         return bench_aa(plugin, chain, ns.clip, frames, cache_frames,
                         getattr(ns, "eedi3_field", 3), ns.bits or AA_MASK_BITS,
-                        budget, ns.timeout)
+                        budget, ns.timeout, gpu_cache=gpu_cache)
     return bench(plugin, chain, ns.clip, frames, synth, cache_frames, cache_conv,
                  ns.timeout, gpu_cache=gpu_cache, gpu_cache_mb=ns.gpu_cache_mb)
 
@@ -1010,12 +1086,16 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
         # --gpu-cache: rebuild the calls that accept a GPU-resident input against
         # the pre-uploaded clip. Everything else keeps the CPU cache, so the two
         # kinds of arm can sit in one run without either being handicapped.
+        # The AA vpy is rebuilt per arm instead: with the flag it makes clip,
+        # mclip and sclip device resident under their own names, so the chain
+        # string needs no clip_gpu substitution.
         gpu_arms: list[str] = []
         if getattr(ns, "gpu_cache", False) and spec.gpu_plugins:
-            gpu_calls = spec.build(ns, "clip_gpu", spec)
             gpu_arms = [p for p in calls if p in spec.gpu_plugins]
-            for p in gpu_arms:
-                calls[p] = gpu_calls[p]
+            if not spec.aa:
+                gpu_calls = spec.build(ns, "clip_gpu", spec)
+                for p in gpu_arms:
+                    calls[p] = gpu_calls[p]
         plugins = resolve_plugins(ns.plugins or list(calls), calls, spec.title)
         plugins = _resolve_pair(ns, calls, plugins, spec.title)
         if not plugins:

@@ -2,8 +2,10 @@
 
 Status: **shipped** — `core.vsfeel.EEDI3AA` (`src/eedi3.cpp:4939`), on the shared
 `EEDI3`/`EEDI3H` argument string: the exact `based_aa` chain
-`Merge(H(Merge(V(x))))` in **one plugin call, two submits**, both 50/50 merges
-folded into the kernels. Bit-exact vs the two-call chain for u16, a few ulp for
+`Merge(H(Merge(V(x))))` in **one plugin call, one submit**, both 50/50 merges
+folded into the kernels. Runs on the R80 GPU API (`vnode:gpu` in/out, one exec
+pool) and batches output frames per submission like `EEDI3` (see
+`notes/EEDI3.md`); `field`, `mdis`, `nrad` and `vcheck` are unchanged. Bit-exact vs the two-call chain for u16, a few ulp for
 f32. Specialised `dh=false`, `field>1`, single-rate. The `vsfeel/vsaa.py`
 wrapper, the `eedi3aa` benchmark entry (1000 f, ns=8) and `tests/test_eedi3aa.py`
 ship.
@@ -12,7 +14,8 @@ Scoreboard, real based_aa clip (jpbd 2x Point → 3840x2160 GRAY16, 600 f, ns=8)
 
 | arm | fps |
 |---|---|
-| vsfeel `EEDI3AA` (fused) | 96.3 |
+| vsfeel `EEDI3AA` (fused, pre-port build) | 96.3 |
+| vsfeel `EEDI3AA` (R80 port, interleaved A/B) | 148.2 vs 155.4 (-4.5%) |
 | vsfeel two-call chain (order-reversed A/B, 6×600 f) | 98.9 (fused 100.2 → **1.01–1.07x**) |
 | vszipcl chain (best reference) | 45.3 |
 | vszipcu / eedi3vk2 chain | 25.8 / 28.1 |

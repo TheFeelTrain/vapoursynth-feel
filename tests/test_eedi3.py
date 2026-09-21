@@ -44,8 +44,8 @@ import vapoursynth as vs
 
 from conftest import (
     WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_preserves_frame_props,
-    compare_or_skip, dtype_for_bits as _dtype, eval_parallel, frame_to_ndarray,
-    plane as _plane, reference_or_skip, right_half_mask,
+    compare_or_skip, cpu_node, dtype_for_bits as _dtype, eval_parallel,
+    frame_to_ndarray, plane as _plane, reference_or_skip, right_half_mask,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -56,12 +56,13 @@ pytestmark = pytest.mark.usefixtures("noise_gray")
 
 
 def _run(clip, field=1, num_streams=1, **kwargs):
-    return vs.core.vsfeel.EEDI3(
+    """EEDI3 as a clip the test can read pixels from (see conftest.cpu_node)."""
+    return cpu_node(vs.core.vsfeel.EEDI3(
         clip,
         field=field,
         num_streams=num_streams,
         **kwargs,
-    )
+    ))
 
 
 def _interp_rows(h, n, field):
@@ -161,6 +162,8 @@ print("REF ok", flush=True)
 # --- vsfeel phase ---
 try:
     my_node = core.vsfeel.EEDI3(clip, **my_kw)
+    # Pixels are read directly, so a GPU-resident node is downloaded first.
+    my_node = core.std.GPUDownload(clip=my_node) if my_node.gpu_resident else my_node
     maxdiff = 0.0
     for n in frames:
         a = read_plane(my_node.get_frame(n), 0, dt)
@@ -423,6 +426,8 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     try:
         for kwargs, rframes in zip(cases, ref_frames):
             my_node = core.vsfeel.EEDI3(clip, **kwargs)
+            # Pixels are read directly, so a GPU-resident node is downloaded.
+            my_node = core.std.GPUDownload(clip=my_node) if my_node.gpu_resident else my_node
             dmax = 0.0
             for n, b in zip(frames, rframes):
                 a = read_plane(my_node.get_frame(n), 0, dt)
