@@ -1978,8 +1978,13 @@ static void vsfeel_eedi3_create(
     auto sz_io = [&](const Eedi3PlaneConfig & c) {
         return static_cast<VkDeviceSize>(c.rows) * c.width * elem;
     };
-    auto sz_pbt = [&](const Eedi3PlaneConfig & c) {
-        return static_cast<VkDeviceSize>(c.rows) * c.width * c.tpitch;
+    auto sz_pbt = [](const Eedi3PlaneConfig & c) {
+        // Must match the shader's pbt layout: with two directions per lane
+        // (tpitch 33..64) the deltas pack to a nibble each, one byte per lane
+        // pair -- 16 bytes per column -- and everything else stays int8.
+        const VkDeviceSize stride =
+            (c.tpitch > 32 && c.tpitch <= 64) ? 16 : static_cast<VkDeviceSize>(c.tpitch);
+        return static_cast<VkDeviceSize>(c.rows) * c.width * stride;
     };
     auto sz_pad = [&](const Eedi3PlaneConfig & c) {
         return static_cast<VkDeviceSize>(c.pad_stride) * c.pad_height * pad_elem;
@@ -2054,23 +2059,54 @@ static void vsfeel_eedi3_create(
     }
     d->scratch_bytes = std::max(total, VkDeviceSize(4));
 
+    if (d->trace) {
+        VSVulkanCoreInfo info {};
+        char verr[256] {};
+        if (d->gpu->api->getVulkanCoreInfo(core, &info, verr, sizeof(verr)) == 0) {
+            fprintf(stderr, "[eedi3] vram allocated=%.0f budget=%.0f limit=%.0f MiB\n",
+                static_cast<double>(info.allocated) / (1024.0 * 1024.0),
+                static_cast<double>(info.budget) / (1024.0 * 1024.0),
+                static_cast<double>(info.limit) / (1024.0 * 1024.0));
+        }
+        for (int plane = 0; plane < numPlanes; ++plane) {
+            if (!d->process[plane]) {
+                continue;
+            }
+            const auto & c = d->planes[plane];
+            fprintf(stderr,
+                "[eedi3] plane %d w=%d rows=%d scratch=%.1f MiB pbt=%.1f MiB "
+                "pad=%.1f MiB\n",
+                plane, c.width, c.rows,
+                static_cast<double>(d->scratch_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(c.pbt_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(c.pad_bytes) / (1024.0 * 1024.0));
+        }
+    }
+
     // Batch size. A submission's frames overlap only inside it (one compute
-    // queue), so a bigger batch overlaps more -- up to where its scratch no
-    // longer fits the device. Swept on the graded 2x2160p EEDI3 workload:
-    // B=2 374, B=4 378, B=6 318, B=8 276 fps, and raising the VRAM limit
-    // leaves B=8 at 278, so the knee is B=4 there and the limit is VRAM, not
-    // the core's in-flight budget. Aim for about a gibibyte of scratch per
-    // submission (also a quarter of the VRAM limit, whichever is smaller),
-    // never below two frames so a submission can overlap at all.
+    // queue), so a bigger batch overlaps more -- but only up to a knee that
+    // moves with the frame size. Swept on the graded 2x2160p EEDI3 workload
+    // (masked, so most rows take the cheap cubic branch): with the packed pbt
+    // B=2 387, B=4 381, B=6 323, B=8 277 fps, and the same sweep with a 3.7x
+    // smaller scratch (mdis=5) still preferred 4 over 8, so the knee is not
+    // memory -- it is VRAM-independent and the batch simply must not grow with
+    // the frame. At 1080p, where one frame is 4x cheaper, B=8 wins (1273 vs
+    // 892 fps). That is what the byte target below encodes: ~512 MiB of
+    // scratch per submission lands on 4 at 2x2160p and 8 at 1080p, and never
+    // below two frames so a submission can overlap at all.
     // VSFEEL_EEDI3_BATCH overrides.
     {
         VSVulkanCoreInfo info {};
         char verr[256] {};
-        VkDeviceSize target = VkDeviceSize(1) << 30;
+        // EEDI3AA's four sub-passes make a frame ~4x heavier, so it drains a
+        // batch slower and its knee is 4 where the single-stage filters' is 2
+        // (swept on the graded workload: EEDI3 2->406/4->389, EEDI3AA 2->142
+        // /4->157 fps at 2x2160p).
+        VkDeviceSize target = VkDeviceSize(d->aa ? 512 : 256) << 20;
         if (d->gpu->api->getVulkanCoreInfo(core, &info, verr, sizeof(verr)) == 0 &&
             info.limit > 0) {
             target = std::min(target,
-                              static_cast<VkDeviceSize>(info.limit) / 8);
+                              static_cast<VkDeviceSize>(info.limit) / 16);
         }
         target = std::max(target, VkDeviceSize(256) << 20);
         const int auto_batch = static_cast<int>(std::clamp<VkDeviceSize>(
@@ -2100,10 +2136,10 @@ static void vsfeel_eedi3_create(
         };
         if (d->trace) {
             fprintf(stderr, "[eedi3] spec w=%d nrad=%d mdis=%d mclip=%d sclip=%d "
-                            "vcheck=%d lszr=%d lszv=%d horiz=%d\n",
+                            "vcheck=%d lszr=%d lszv=%d horiz=%d batch=%d\n",
                     spec.width, spec.nrad, spec.mdis, spec.has_mclip,
                     spec.has_sclip, spec.vcheck, spec.lsz_row, spec.lsz_vcheck,
-                    key.horiz ? 1 : 0);
+                    key.horiz ? 1 : 0, d->batch_size);
         }
         Eedi3Pipelines p;
         auto add = [&](const uint32_t * code, size_t size, const char * tag,

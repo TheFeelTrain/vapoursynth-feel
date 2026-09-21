@@ -592,6 +592,39 @@ float combine_interior(int dy, int x, int u, float s0, float s1, float s2) {
 const int SGSIZE = 32;                       // == workgroup size (host sets it)
 const int K = (TPITCH + SGSIZE - 1) / SGSIZE;  // directions per lane
 
+// pbt column layout. The relative predecessor delta is -1/0/+1, so when each
+// lane owns exactly two directions (MDIS 17..31, i.e. K == 2, which includes
+// the mdis=20 default) the whole column packs into one nibble per lane -- 16
+// bytes instead of TPITCH=41, a 2.6x cut in the row kernel's store traffic
+// (measured worth ~10% of the frame ungated; PROBE=4). Even lanes combine their
+// odd neighbour's nibble through a shuffle and store one byte, so the packing
+// adds no barrier. Other K keep the plain int8 column.
+const bool PB_PACK = (K == 2);
+const int PB_STRIDE = PB_PACK ? (SGSIZE / 2) : TPITCH;   // bytes per column
+
+int pbt_delta(const int base, const int x, const int e) {
+    if (PB_PACK) {
+        const uint b = uint(pbt[base + x * PB_STRIDE + (e >> 2)]);
+        return int((b >> uint((e & 3) * 2)) & 3u) - 1;
+    }
+    return int(pbt[base + x * PB_STRIDE + e]);
+}
+
+// Packed store: lane `lane` owns directions 2*lane and 2*lane+1, one nibble.
+// The odd lane's nibble reaches its even partner through a shuffle, so a single
+// even lane writes the whole byte and there is no write-write race.
+void pbt_store_pair(const int base, const int x, const int lane, const int c0, const int c1) {
+    const uint nib = (uint(c0 + 1) & 3u) | ((uint(c1 + 1) & 3u) << 2);
+    const uint hi = subgroupShuffleXor(nib, 1u) & 0xFu;
+    if ((lane & 1) == 0) {
+        pbt[base + x * PB_STRIDE + (lane >> 1)] = int8_t(nib | (hi << 4));
+    }
+}
+
+void pbt_store_one(const int base, const int x, const int e, const int v) {
+    pbt[base + x * PB_STRIDE + e] = int8_t(v);
+}
+
 // tileF carries the per-column direction from the lane-0 backtrack walk to the
 // parallel interpolate lanes. (The old tileSh staging buffer is gone: the walk
 // now reads pbt directly from global — see the backtrack comment.)
@@ -614,7 +647,7 @@ void main() {
     const int lane = int(gl_SubgroupInvocationID);
     const int r = int(gl_WorkGroupID.y);
     const int dy = pc.field + 2 * r;
-    const int pbt_row = pc.pbt_base + r * (WIDTH * TPITCH);
+    const int pbt_row = pc.pbt_base + r * (WIDTH * PB_STRIDE);
     const int laneBase = lane * K;
 
 #if PROBE == 3
@@ -749,7 +782,9 @@ void main() {
         const bool masked = (HAS_MCLIP != 0 && !bmask_local(xd));
 
         float cur[K];
-        int cRel[K];
+        // Sized for the packed store, which reads both entries when K == 2;
+        // K == 1 still indexes cRel[0] only.
+        int cRel[K > 1 ? K : 2];
 
         if (masked) {
             // Masked column: cost row + backtrack row carry from the previous
@@ -779,19 +814,24 @@ void main() {
                     }
                 }
             }
-            for (int j = 0; j < K; j++) {
-                if (laneBase + j < TPITCH)
+            if (PB_PACK) {
+                pbt_store_pair(pbt_row, xd - 1, lane, cRel[0], cRel[1]);
+            } else {
+                for (int j = 0; j < K; j++) {
+                    if (laneBase + j < TPITCH) {
 #if PROBE == 1
-                    pbt[pbt_row + (xd - 1) * TPITCH + laneBase + j] = int8_t(0);
+                        pbt_store_one(pbt_row, xd - 1, laneBase + j, 0);
 #elif PROBE == 4
-                    ;  // diagnostics: no pbt store at all (traffic ablation)
+                        ;  // diagnostics: no pbt store at all (traffic ablation)
 #elif PROBE == 9
-                    // diagnostics: keep the DP, write every column to the SAME
-                    // 41 bytes (no xd in the address) -> ~zero store traffic.
-                    pbt[pbt_row + laneBase + j] = int8_t(cRel[j]);
+                        // diagnostics: keep the DP, write every column to the
+                        // SAME bytes (no xd in the address) -> ~zero traffic.
+                        pbt_store_one(pbt_row, 0, laneBase + j, cRel[j]);
 #else
-                    pbt[pbt_row + (xd - 1) * TPITCH + laneBase + j] = int8_t(cRel[j]);
+                        pbt_store_one(pbt_row, xd - 1, laneBase + j, cRel[j]);
 #endif
+                    }
+                }
             }
         } else {
             // Unmasked column: gather the previous column's path costs
@@ -870,15 +910,25 @@ void main() {
                     const float pcost = min(bval + ccost, FLT_MAX_09);
                     cur[j] = pcost;
                     cRel[j] = idx - u;
+                }
+                if (PB_PACK) {
+                    // Both of this lane's deltas now exist; the packed form
+                    // stores once per lane pair, so it sits outside the loop.
+                    pbt_store_pair(pbt_row, xd - 1, lane, cRel[0], cRel[1]);
+                } else {
+                    for (int j = 0; j < K; j++) {
+                        if (laneBase + j < TPITCH) {
 #if PROBE == 1
-                    pbt[pbt_row + (xd - 1) * TPITCH + i] = int8_t(0);
+                            pbt_store_one(pbt_row, xd - 1, laneBase + j, 0);
 #elif PROBE == 4
-                    ;  // diagnostics: no pbt store at all (traffic ablation)
+                            ;  // diagnostics: no pbt store at all (traffic ablation)
 #elif PROBE == 9
-                    pbt[pbt_row + i] = int8_t(cRel[j]);
+                            pbt_store_one(pbt_row, 0, laneBase + j, cRel[j]);
 #else
-                    pbt[pbt_row + (xd - 1) * TPITCH + i] = int8_t(cRel[j]);
+                            pbt_store_one(pbt_row, xd - 1, laneBase + j, cRel[j]);
 #endif
+                        }
+                    }
                 }
             }
         }
@@ -929,7 +979,7 @@ void main() {
     // the probe that isolated the round-15 finding: uncoupled 718/606 fps
     // (vc0/vc2) versus 308/264 coupled, while the DP+stores alone and the
     // backtrack alone are each ~free.
-    const int pbt_src = (r >= 1) ? (pbt_row - WIDTH * TPITCH) : pbt_row;
+    const int pbt_src = (r >= 1) ? (pbt_row - WIDTH * PB_STRIDE) : pbt_row;
 #else
     const int pbt_src = pbt_row;
 #endif
@@ -982,7 +1032,7 @@ void main() {
             int f = fcarry;
             const int xlo = max(x0, xmin);
             for (int x = x0 + n - 1; x >= xlo; --x) {
-                f += int(pbt[pbt_src + x * TPITCH + CENTER + f]);
+                f += pbt_delta(pbt_src, x, CENTER + f);
                 tileF[x - x0] = int8_t(f);
             }
             fcarry = f;
@@ -995,28 +1045,28 @@ void main() {
             // address f-independent (loads can issue ahead / MLP), so 7 vs 8
             // isolates the cost of the dependent-address chain itself.
             {
-                const int pbt_old = (r >= 1) ? (pbt_row - WIDTH * TPITCH) : pbt_row;
+                const int pbt_old = (r >= 1) ? (pbt_row - WIDTH * PB_STRIDE) : pbt_row;
                 int f2 = 0;
 #if PROBE == 7
                 for (int x = x0 + n - 1; x >= xlo; --x)
-                    f2 += int(pbt[pbt_old + x * TPITCH + CENTER + f2]);
+                    f2 += pbt_delta(pbt_old, x, CENTER + f2);
 #elif PROBE == 8
                 for (int x = x0 + n - 1; x >= xlo; --x)
-                    f2 += int(pbt[pbt_old + x * TPITCH + CENTER]);
+                    f2 += pbt_delta(pbt_old, x, CENTER);
 #else
                 // PROBE 10: f-independent address AND explicitly unrolled by 4, so
                 // four independent loads issue back-to-back (memory-level
                 // parallelism). 8 vs 10 answers "is the walk latency-bound?".
                 int x = x0 + n - 1;
                 for (; x >= xlo + 3; x -= 4) {
-                    const int a = int(pbt[pbt_old + x * TPITCH + CENTER]);
-                    const int b = int(pbt[pbt_old + (x - 1) * TPITCH + CENTER]);
-                    const int c = int(pbt[pbt_old + (x - 2) * TPITCH + CENTER]);
-                    const int d = int(pbt[pbt_old + (x - 3) * TPITCH + CENTER]);
+                    const int a = pbt_delta(pbt_old, x, CENTER);
+                    const int b = pbt_delta(pbt_old, x - 1, CENTER);
+                    const int c = pbt_delta(pbt_old, x - 2, CENTER);
+                    const int d = pbt_delta(pbt_old, x - 3, CENTER);
                     f2 += a + b + c + d;
                 }
                 for (; x >= xlo; --x)
-                    f2 += int(pbt[pbt_old + x * TPITCH + CENTER]);
+                    f2 += pbt_delta(pbt_old, x, CENTER);
 #endif
                 // Consume f2 without touching the output. The old form wrote 0
                 // to the empty-row flag when `f2 == pc.pbt_base` -- a value no

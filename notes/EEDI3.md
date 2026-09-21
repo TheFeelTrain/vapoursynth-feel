@@ -21,34 +21,42 @@ EEDI3AA 155 → 148 (−4.5%). `--gpu-cache` (input pre-uploaded) on the port:
 EEDI3 380 → 417, EEDI3H 400 → 488, EEDI3AA 149 → 146.
 
 - **The remaining EEDI3 gap is the R80 API's single compute queue.** The core
-  creates exactly one compute queue (`VSVulkanCoreHandles`), and the row kernel
-  launches only `rows` workgroups of a latency-bound scan: 1080 waves at 2x2160p
-  leaves the GPU under-occupied, so throughput comes from running several frames'
-  rows at once. The pre-port filter used up to 8 Vulkan queues (measured: forcing
-  it to one queue drops it 987 → 416 fps, i.e. the whole difference is cross-queue
-  overlap). Consecutive *dispatches inside one command buffer* do overlap
-  (measured 1080p: one row dispatch 2.25 ms, ×2 1.45 ms/frame, ×4 1.10), so the
-  port records a **batch of output frames per submission, phase by phase** (all
-  pads, then all rows with no barrier between them, then all vchecks, then all
-  tails) and caches the frames the sibling `getFrame` calls then take. The batch
-  is sized to ~1 GiB of scratch per submission (`VSFEEL_EEDI3_BATCH`): swept on
-  the graded workload B=2 374, B=4 378, B=6 318, B=8 276 fps, and raising
-  `VS_VULKAN_MAX_VRAM_MB` leaves B=8 at 278, so the knee is B=4 and the limiter is
-  VRAM (per-frame scratch is 208 MB, 170 MB of it `pbt`).
-- **Next lever if EEDI3 must reach parity:** shrink the scratch so a larger batch
-  fits. `pbt` is `rows*width*tpitch` bytes of ±1 int8 deltas; 2-bit packing cuts it
-  4x, which would let B=8 fit and is the only measured path to ~8 frames of row
-  overlap.
-- EEDI3H and EEDI3AA are already at parity because their transposed row kernel
-  launches `width/2` = 1920 workgroups per frame (vs 1080), which nearly fills the
-  GPU on its own.
-
-- **The graded `mclip` was 100% zero until round 14**, making DP/backtrack, vcheck
-  and vcopy dead code. Pre-round-14 verdicts describe that path and are marked
-  *(stale)*; the accuracy work and correctness fixes from those rounds are unaffected.
-- `src/eedi3.comp`: MDIS 20 → TPITCH 41, CENTER 20, BT_TILE 32, SGSIZE 32, K 2,
-  RING_CAP 7. `VCHECK_LDS` defaults to 0 (global-read form, round 21); the parallel
-  vcheck (`VCHECK_PARA=6`) is the default since round 27.
+  creates exactly one compute queue (`VSVulkanCoreHandles.computeQueueIndex`; the
+  transfer-queue commit 1be682f2 adds more *transfer* queues, which only changed
+  the upload/download legs — measured +5% on EEDI3H and +4% on EEDI3AA, nothing on
+  the vertical path). The row kernel launches only `rows` workgroups of a
+  latency-bound scan: 1080 waves at 2x2160p leaves the GPU under-occupied, so
+  throughput comes from running several frames' rows at once. The pre-port filter
+  used up to 8 Vulkan queues (forcing it to one drops it 987 → 416 fps at 1080p,
+  i.e. the whole difference is cross-queue overlap). Consecutive *dispatches
+  inside one command buffer* do overlap (1080p: one row dispatch 2.25 ms, ×2
+  1.45 ms/frame, ×4 1.10), so the port records a **batch of output frames per
+  submission, phase by phase** (all pads, then all rows with no barrier between
+  them, then all vchecks, then all tails) and caches the frames the sibling
+  `getFrame` calls then take.
+- **Batch size (`VSFEEL_EEDI3_BATCH`, default from a ~256 MiB scratch target,
+  512 for EEDI3AA).** Swept on the graded 2x2160p workload: EEDI3 B=2 406,
+  B=4 389, B=8 282 fps; EEDI3AA B=2 142, **B=4 157**, B=8 103. The knee is *not*
+  memory — B=8 loses just the same with a 3.7x smaller scratch (mdis=5), and
+  raising `VS_VULKAN_MAX_VRAM_MB` changes nothing. It is the submit path:
+  `gpuExecSubmit` costs 346 us/frame at B=4 against 670 at B=8, i.e. it grows
+  faster than the frame count, and a batch that drains quickly (the masked rows
+  early-out) reaches the point where that dominates sooner. That is also why the
+  packed pbt below *lowered* the knee from 4 to 2.
+- **`pbt` is 2-bit packed** when a lane owns exactly two directions (TPITCH
+  33..64, i.e. mdis 17..31, which includes the default 20): each lane builds a
+  nibble and only even lanes store, combining their odd neighbour's nibble
+  through a `subgroupShuffleXor`, so no barrier and no write race. Column stride
+  41 → 16 bytes, and the whole per-frame scratch at 2x2160p 225 → 120 MiB (pbt
+  170 → 63). Bit-exact vs the pre-port build on the whole 16-config sweep
+  (mdis 5/20/40 cover the K=1/K=2/K=3 paths). The stores were worth ~10% of the
+  frame ungated (PROBE=4, no pbt store, 406 vs 367 fps); packing recovers about a
+  third of that and moved the batch knee down, for ~7% on the graded vertical
+  workload (374 at the old 1 GiB target → 403).
+- **Next lever if EEDI3 must reach parity:** the queue, not the kernel. Nothing in
+  the R80 API offers a second compute queue, so the remaining ~1.5x would need the
+  row kernel to fill the GPU by itself — e.g. splitting each row's column walk
+  across workgroups with a boundary fixup.
 
 ## Implementation (current)
 

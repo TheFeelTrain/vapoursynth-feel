@@ -15,7 +15,7 @@ Scoreboard, real based_aa clip (jpbd 2x Point → 3840x2160 GRAY16, 600 f, ns=8)
 | arm | fps |
 |---|---|
 | vsfeel `EEDI3AA` (fused, pre-port build) | 96.3 |
-| vsfeel `EEDI3AA` (R80 port, interleaved A/B) | 148.2 vs 155.4 (-4.5%) |
+| vsfeel `EEDI3AA` (R80 port, interleaved A/B) | 159.2 vs 153.2 (**+4%**) |
 | vsfeel two-call chain (order-reversed A/B, 6×600 f) | 98.9 (fused 100.2 → **1.01–1.07x**) |
 | vszipcl chain (best reference) | 45.3 |
 | vszipcu / eedi3vk2 chain | 25.8 / 28.1 |
