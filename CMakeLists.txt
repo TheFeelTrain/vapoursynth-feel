@@ -210,11 +210,11 @@ endforeach()
 # The fused kernel uses subgroup barriers instead of workgroup barriers
 # (each 16-lane block lives entirely in one wavefront), so SPIR-V 1.3+ is
 # required.
-set(VK_DFT_ENTRIES pad_slot pad_direct col2im)
-set(VK_DFT_ENTRY_DEFS -DENTRY_PAD_SLOT -DENTRY_PAD_DIRECT -DENTRY_COL2IM)
+set(VK_DFT_ENTRIES pad col2im)
+set(VK_DFT_ENTRY_DEFS -DENTRY_PAD -DENTRY_COL2IM)
 set(VK_DFT_VARIANTS)
 foreach(bits IN LISTS VK_BITS)
-    foreach(entry_i RANGE 0 2)
+    foreach(entry_i RANGE 0 1)
         list(GET VK_DFT_ENTRIES ${entry_i} entry)
         list(GET VK_DFT_ENTRY_DEFS ${entry_i} entry_def)
         list(APPEND VK_DFT_VARIANTS
@@ -222,10 +222,7 @@ foreach(bits IN LISTS VK_BITS)
     endforeach()
     foreach(radius RANGE 0 3)
         list(APPEND VK_DFT_VARIANTS
-            "dfttest_${bits}_fused_r${radius}|dfttest.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_FUSED -DRADIUS=${radius}"
-            # slot-direct fused variant (no padded-fallback branch in im2col);
-            # used when every temporal slice of the frame lives in a slot
-            "dfttest_${bits}_fused_direct_r${radius}|dfttest.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_FUSED -DFUSED_DIRECT -DRADIUS=${radius}")
+            "dfttest_${bits}_fused_r${radius}|dfttest.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_FUSED -DRADIUS=${radius}")
     endforeach()
 endforeach()
 

@@ -31,10 +31,11 @@ using namespace std::string_literals;
 // and the vs-dfttest2 hiprtc backend (dft_kernels.hpp + kernel.hpp).
 //
 // Pipeline per processed plane:
-//   host: reflection-pad each of the (2*radius+1) source planes into staging
+//   pad:     reflect-pad each of the (2*radius+1) GPU source frame planes into
+//            a device-local buffer (one dispatch per temporal slice)
 //   fused:   per 16x16 block, im2col + window, 3D DFT, frequency filter,
 //            inverse DFT, writes the center temporal slice to a float buffer
-//   col2im:  overlap-adds the windowed blocks into the final plane
+//   col2im:  overlap-adds the windowed blocks straight into the output plane
 // ---------------------------------------------------------------------------
 
 constexpr int BS = 16;              // spatial block size (sbsize, fixed)
@@ -370,6 +371,14 @@ static int calcPadNum(int size, int block_step) {
 // ---------------------------------------------------------------------------
 // Filter state
 // ---------------------------------------------------------------------------
+//
+// DFTTest runs on the R80 GPU API: the input clip is GPU resident, the filter
+// reads the core's frame planes and writes a GPU output frame, and the core
+// owns every transfer (std.GPUUpload/GPUDownload). Per output frame a single
+// recording pads each of the tw temporal source planes into a device-local
+// buffer, runs the fused im2col+3D-DFT+filter+inverse kernel, then overlap-adds
+// (col2im) straight into the output frame plane. There is no host copy, no
+// frame cache and no filter-owned semaphore: one exec pool, one submission.
 
 struct DftPlaneConfig {
     int width {};                   // frame plane pixels
@@ -377,118 +386,55 @@ struct DftPlaneConfig {
     int pw {};                      // padded dims
     int ph {};
     int num_blocks {};              // block grid
-    VkDeviceSize upload_offset {};  // staging byte offset of the tight upload region
-    VkDeviceSize upload_bytes {};   // tw * height * width * bytes (tight rows)
-    VkDeviceSize padded_offset {};  // padded buffer byte offset
     VkDeviceSize padded_bytes {};   // tw * pw * ph * bytes
-    VkDeviceSize download_offset {};// staging byte offset of the output region
-    VkDeviceSize download_bytes {}; // h * width * bytes (tight rows)
-    VkDeviceSize spatial_offset {}; // float element offset into the spatial buffer
-    VkDeviceSize slot_offset {};    // slot buffer byte offset of this plane's slot region
-    VkDeviceSize slot_plane_bytes {}; // pw * ph * bytes (one padded plane)
+    VkDeviceSize spatial_bytes {};  // num_blocks * 256 floats
 };
 
-// per-resource stable metadata (the pool moves DFTTestResource objects, so the
-// frame generation counter lives in a stable allocation)
-struct ResMeta {
-    std::atomic<long long> frame_gen { 0 };
-};
-
-// per-slot frame-cache state (index: plane * slot_count + slot). A slot
-// owns exactly one source frame (gen) at a time: the first frame that needs
-// it pads it (claim) and every later frame whose window contains it just
-// D2D-copies it (commit). A slot may only be reclaimed for a different
-// source once all committed readers' resources have been reused (their
-// frames are then fully done, copies included), which is checked against
-// frame_gen — no host fence waits, no deadlocks. `sem` holds the current
-// generation's binary semaphores: fresh per generation (created at claim,
-// destroyed at reclaim), so a stale signal can never leak across
-// generations.
-struct SlotState {
-    long long gen { -1 };        // source frame the slot owns (-1 = empty)
-    std::vector<std::pair<int, long long>> committed; // readers: {res_id, frame_gen}
-    VkSemaphore sem {};          // one TIMELINE semaphore, reused across generations
-    uint64_t signal {};          // timeline value the current generation's pad signals;
-                                 // every reader of this generation waits on this value
-                                 // (timeline waits are non-destructive, so any number
-                                 // of repeated frame processings can wait on one value)
-};
-
-struct DFTTestResource {
-        int id {};
-        VkBuffer staging {};
-    VkDeviceMemory staging_mem {};
-    // ReBAR upload buffer (host-mapped VRAM): the CPU memcpy of the tight
-    // upload planes lands directly in VRAM, so the pad kernel reads VRAM
-    // instead of GTT over PCIe. Falls back to staging (up_direct=false)
-    // when no host-visible device-local memory exists. Download stays in
-    // staging (CPU reads from the VRAM BAR are ~1 GB/s; SDMA->GTT wins).
-    VkBuffer up_buf {};
-    VkDeviceMemory up_mem {};
-    void * up_map {};
-    bool up_direct {};
-    VkBuffer padded_buf {};         // device-local padded source planes
-    VkDeviceMemory padded_mem {};
-    VkBuffer spatial_buf {};        // device-local float block buffer
-    VkDeviceMemory spatial_mem {};
-    VkCommandPool pool {};
-    VkCommandBuffer cmd {};      // per-frame fused + col2im (slot-direct addresses)
-    // one pad command buffer per (plane, temporal slice): a pad op records
-    // and submits its own at claim time; a per-op buffer guarantees a buffer
-    // is never re-recorded while its previous submission is still executing
-    std::vector<VkCommandBuffer> cmd_pad {};
-    VkFence fence {};
-    // GPU timestamp query pool: 8 slots (reset/copy-avail barrier, pad end,
-    // copy end, fused end, col2im end + spares). Written+read back only when
-    // VSFEEL_DFTTEST_QBENCH=1 on frame 0; zero cost otherwise (no queries
-    // recorded in the normal path).
-    VkQueryPool qpool {};
-    VkBuffer qbuf {};             // device->host readable timestamp results
-    VkDeviceMemory qmem {};
-    uint64_t * qmap {};
-    VkDescriptorSet desc_set {};
-    VkDescriptorSet pad_set {};   // same layout; binding 1 = upload buffer (up_buf when up_direct)
-    VkQueue queue {};
-    std::mutex * queue_lock {};
-    float * map {};
-    uint32_t staging_type_index {};
-};
-
+// Every offset pushed to the shader is int32; the per-plane buffers below are
+// separate allocations, so the bases are 0 and only the plane-internal offsets
+// (spatial float index, pad slice) carry real values.
 struct DftPushConstants {
-    int32_t padded_base;    // byte offset into the padded buffer
-    int32_t spatial_base;   // float element offset into the spatial buffer
-    int32_t dst_base;       // byte offset of the download region in staging
-    int32_t src_base;       // byte offset of the upload region in staging
-    int32_t pad_t0;         // temporal plane the pad kernel processes (frame cache)
-    int32_t wt_base;        // float element offset of window[] in wt
-    int32_t wf_base;        // float element offset of window_freq[] in wt (-1 if !zmean)
-    int32_t sigma_base;     // float element offset of sigma[] in wt (-1 if scalar)
+    int32_t padded_base;
+    int32_t spatial_base;
+    int32_t dst_base;
+    int32_t src_base;
+    int32_t pad_t0;
+    int32_t wt_base;
+    int32_t wf_base;
+    int32_t sigma_base;
     int32_t radius;
     int32_t block_step;
     int32_t width;
     int32_t height;
-    int32_t src_stride;     // upload plane row stride in elements
-    int32_t dst_stride;     // frame plane row stride in elements
-    int32_t filter_type;
+    int32_t src_stride;
+    int32_t dst_stride;
     float sigma;
     float sigma2;
     float pmin;
     float pmax;
     float beta;
-    // slot-direct fused: per-temporal-slice byte offset into the slot buffer
-    // (slot_buf), or -1 when the slice was direct-padded into padded_buf
-    // (all slots busy) and must be read from there instead.
-    int32_t slot_base[7];
+};
+
+// GPU-timing probe (VSFEEL_DFFTEST_GPUTRACE=<frame>, default 100 under
+// VSFEEL_DEBUG=2): one warm frame stamps the head, pad, fused and col2im
+// boundaries of the first processed plane into a query pool, whose results the
+// same command buffer copies into a mapped buffer. The host waits the
+// submission out once to read them.
+struct DftGpuProbe {
+    VkQueryPool query {};
+    GpuBuffer buf;
+    uint64_t * map {};
+    std::atomic<int> armed { 0 };
 };
 
 struct DftData {
-    VSNode * node;
-    const VSVideoInfo * vi;
-    int num_streams;
-    int bits, bytes;
+    VSNode * node {};
+    const VSVideoInfo * vi {};
 
-    int radius, block_step;
-    int filter_type;
+    int bits {}, elem_bytes {};
+    bool process[3] { false, false, false };
+
+    int radius {}, block_step {}, filter_type {}, tw {};
     bool zmean {};
     bool sigma_is_scalar { true };
     float sigma_scalar {};          // scaled by wscale when ftype < 2
@@ -496,206 +442,78 @@ struct DftData {
     float pmin {};
     float pmax {};
     float beta {};                  // f0beta (unscaled)
-    int tw {};
 
-    bool process[3] { false, false, false };
-
-    std::shared_ptr<VK_Device> device;
+    std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
     VkPipelineLayout pipeline_layout {};
-    VkDescriptorPool desc_pool {};
-    VkShaderModule pad_slot_module {};
-    VkShaderModule pad_direct_module {};
-    VkShaderModule col2im_module {};
-    VkShaderModule fused_module[4] {};
-    VkShaderModule fused_direct_module[4] {};
-    VkPipeline pad_slot_pipeline {};
-    VkPipeline pad_direct_pipeline {};
+    VkPipeline pad_pipeline {};
     VkPipeline col2im_pipeline {};
     VkPipeline fused_pipeline[4] {};
-    VkPipeline fused_direct_pipeline[4] {};
 
     // shared constant buffer: window, then window_freq, then the sigma array
-    VkBuffer wt_buf {};
-    VkDeviceMemory wt_mem {};
-    float * wt_map {};
-    uint32_t wt_type_index {};
-    VkDeviceSize wt_bytes {};
+    GpuBuffer wt;
     int32_t wf_base {};             // float offset of window_freq (-1 if !zmean)
     int32_t sigma_base {};          // float offset of sigma array (-1 if scalar)
-    // ReBAR available (any host-visible device-local memory type)? Decided
-    // per-resource at allocation (buffer memory requirements may exclude
-    // the host-visible type); the flag records the outcome of resource 0.
-    bool up_direct_ok { true };
 
-    VkDeviceSize upload_total {};   // tight upload planes region (staging)
-    VkDeviceSize download_total {}; // output region (staging)
-    VkDeviceSize staging_total {};  // staging allocation size (upload+download+dump)
-    VkDeviceSize padded_total {};   // padded planes region (device-local)
-    VkDeviceSize spatial_total {};  // float elements across planes
-    VkDeviceSize slot_total {};     // frame-cache slot region (device-local)
-
-    // padded-source frame cache: each source frame is reflect-pad'd once into a
-    // slot and reused across the tw-frame window via D2D copies (vszipcl-style).
-    // Works for any num_streams: the slot state machine (gen / committed readers
-    // under slot_lock) decides who pads and who reads; cross-queue visibility is
-    // provided by per-slot semaphores (the pad submit signals, the copy submit
-    // waits). The pad is submitted at claim time (under slot_lock) so a backward
-    // semaphore dependency on the queue is impossible, and a slot is only
-    // reclaimed once every committed reader's resource has been reused (frame
-    // done), so no host fence waits are needed.
-    VkBuffer slot_buf {};
-    VkDeviceMemory slot_mem {};
-    int slot_count {};              // K slots per plane
-    std::mutex slot_lock {};
-    std::vector<SlotState> slots {};
-    std::vector<std::unique_ptr<ResMeta>> res_meta {};
     std::array<DftPlaneConfig, 3> planes {};
-    FramePool<DFTTestResource> pool;
+    VSGPUExecPool * pool {};
 
-    // ---- debug timing accumulators ----
-    // Gated on VSFEEL_DFTTEST_TIMING at create time: the per-frame clocks and
-    // atomic accumulations are pure overhead on the default path (they were
-    // recorded unconditionally even though nothing ever printed them).
+    // VSFEEL_DFFTEST_GPUTRACE=<frame>: one-shot GPU kernel timings on a warm
+    // frame. Only created when the compute queue family can timestamp at all
+    // (writing one where timestampValidBits is 0 can hang the engine).
+    bool gpu_trace { false };
+    int gpu_trace_frame { 100 };
+    DftGpuProbe probe;
+
+    // VSFEEL_DFTTEST_TIMING=1: per-frame host stage split. The host side is
+    // only acquire/record/submit now, but the split still says whether a frame
+    // is host- or GPU-bound, which no kernel timing can.
     bool host_timing { false };
-    std::atomic<uint64_t> t_acquire_ns {0}, t_upload_ns {0}, t_submit_ns {0},
-        t_wait_ns {0}, t_download_ns {0}, t_total_ns {0};
-    std::atomic<uint64_t> nframes {0};
+    std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
+        ht_total_ns {}, ht_n {};
 
     ~DftData() {
-        uint64_t n = nframes.load();
-        if (n && vsfeel_debug_probe("VSFEEL_DFTTEST_TIMING")) {
+        if (host_timing && ht_n.load()) {
+            const double n = static_cast<double>(ht_n.load());
             fprintf(stderr,
-                "[dfttest-timing] frames=%llu avg_total=%.3fms acquire=%.3fms upload=%.3fms submit=%.3fms wait=%.3fms download=%.3fms\n",
-                (unsigned long long)n,
-                t_total_ns.load() / 1e6 / n, t_acquire_ns.load() / 1e6 / n,
-                t_upload_ns.load() / 1e6 / n, t_submit_ns.load() / 1e6 / n,
-                t_wait_ns.load() / 1e6 / n, t_download_ns.load() / 1e6 / n);
+                "[dfttest-timing] frames=%.0f per-frame us: acquire=%7.1f "
+                "record=%7.1f submit=%7.1f total=%7.1f\n",
+                n, ht_acquire_ns.load() / 1000.0 / n,
+                ht_record_ns.load() / 1000.0 / n,
+                ht_submit_ns.load() / 1000.0 / n, ht_total_ns.load() / 1000.0 / n);
         }
-        if (!device) {
+        if (!gpu) {
             return;
         }
-        VkDevice dev = device->device;
-        // retire this instance's own submissions (per queue) instead of
-        // idling the whole device, which other filters may be sharing
-        retire_instance(pool);
-
-        for (auto & resource : pool.items) {
-            if (resource.map) {
-                vkUnmapMemory(dev, resource.staging_mem);
-            }
-            if (resource.up_map) {
-                vkUnmapMemory(dev, resource.up_mem);
-            }
-            if (resource.up_mem) {
-                vkFreeMemory(dev, resource.up_mem, nullptr);
-            }
-            if (resource.up_buf) {
-                vkDestroyBuffer(dev, resource.up_buf, nullptr);
-            }
-            if (resource.padded_mem) {
-                vkFreeMemory(dev, resource.padded_mem, nullptr);
-            }
-            if (resource.padded_buf) {
-                vkDestroyBuffer(dev, resource.padded_buf, nullptr);
-            }
-            if (resource.spatial_mem) {
-                vkFreeMemory(dev, resource.spatial_mem, nullptr);
-            }
-            if (resource.spatial_buf) {
-                vkDestroyBuffer(dev, resource.spatial_buf, nullptr);
-            }
-            if (resource.qmap) {
-                vkUnmapMemory(dev, resource.qmem);
-            }
-            if (resource.qmem) {
-                vkFreeMemory(dev, resource.qmem, nullptr);
-            }
-            if (resource.qbuf) {
-                vkDestroyBuffer(dev, resource.qbuf, nullptr);
-            }
-            if (resource.qpool) {
-                vkDestroyQueryPool(dev, resource.qpool, nullptr);
-            }
-            if (!resource.cmd_pad.empty()) {
-                vkFreeCommandBuffers(dev, resource.pool,
-                    static_cast<uint32_t>(resource.cmd_pad.size()),
-                    resource.cmd_pad.data());
-            }
-            destroy_common(dev, resource);
+        // The pool drains every submission it made before it returns, so the
+        // pipelines and layouts below are safe to destroy afterwards.
+        if (pool) {
+            gpu->api->freeGPUExecPool(pool);
+            pool = nullptr;
         }
-
-        for (auto & st : slots) {
-            if (st.sem) {
-                vkDestroySemaphore(dev, st.sem, nullptr);
-            }
+        VkDevice dev = gpu->device;
+        if (pad_pipeline) {
+            gpu->vk->vkDestroyPipeline(dev, pad_pipeline, nullptr);
         }
-        if (slot_mem) {
-            vkFreeMemory(dev, slot_mem, nullptr);
-        }
-        if (slot_buf) {
-            vkDestroyBuffer(dev, slot_buf, nullptr);
-        }
-
-        if (wt_map) {
-            vkUnmapMemory(dev, wt_mem);
-        }
-        if (wt_mem) {
-            vkFreeMemory(dev, wt_mem, nullptr);
-        }
-        if (wt_buf) {
-            vkDestroyBuffer(dev, wt_buf, nullptr);
-        }
-
-        if (pad_slot_pipeline) {
-            vkDestroyPipeline(dev, pad_slot_pipeline, nullptr);
-        }
-        if (pad_direct_pipeline) {
-            vkDestroyPipeline(dev, pad_direct_pipeline, nullptr);
+        if (col2im_pipeline) {
+            gpu->vk->vkDestroyPipeline(dev, col2im_pipeline, nullptr);
         }
         for (auto & p : fused_pipeline) {
             if (p) {
-                vkDestroyPipeline(dev, p, nullptr);
+                gpu->vk->vkDestroyPipeline(dev, p, nullptr);
             }
-        }
-        for (auto & p : fused_direct_pipeline) {
-            if (p) {
-                vkDestroyPipeline(dev, p, nullptr);
-            }
-        }
-        if (col2im_pipeline) {
-            vkDestroyPipeline(dev, col2im_pipeline, nullptr);
-        }
-        if (desc_pool) {
-            vkDestroyDescriptorPool(dev, desc_pool, nullptr);
         }
         if (pipeline_layout) {
-            vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
+            gpu->vk->vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
         }
         if (set_layout) {
-            vkDestroyDescriptorSetLayout(dev, set_layout, nullptr);
+            gpu->vk->vkDestroyDescriptorSetLayout(dev, set_layout, nullptr);
         }
-        if (pad_slot_module) {
-            vkDestroyShaderModule(dev, pad_slot_module, nullptr);
+        gpu_destroy_buffer(*gpu, wt);
+        if (probe.query) {
+            gpu->vk->vkDestroyQueryPool(dev, probe.query, nullptr);
         }
-        if (pad_direct_module) {
-            vkDestroyShaderModule(dev, pad_direct_module, nullptr);
-        }
-        for (auto & m : fused_module) {
-            if (m) {
-                vkDestroyShaderModule(dev, m, nullptr);
-            }
-        }
-        for (auto & m : fused_direct_module) {
-            if (m) {
-                vkDestroyShaderModule(dev, m, nullptr);
-            }
-        }
-        if (col2im_module) {
-            vkDestroyShaderModule(dev, col2im_module, nullptr);
-        }
-
-        release_device(device);
+        gpu_destroy_buffer(*gpu, probe.buf);
     }
 };
 
@@ -703,15 +521,16 @@ struct DftData {
 // Pipeline creation
 // ---------------------------------------------------------------------------
 
-// DFTTest's two per-invocation variants: the env overrides exist so a probe
+// The fused kernel's variant is baked in as specialization constants so the
+// dead filter branches (and their divisions) vanish, matching the reference's
+// compile-time `#if FILTER_TYPE` selection. The env overrides exist so a probe
 // run can force a subgroup size (or deliberately request an invalid one and
 // watch the driver reject it).
 static std::variant<VkPipeline, std::string> create_pipeline(
-    const VK_Device & dev, VkShaderModule module, VkPipelineLayout layout,
-    uint32_t required_subgroup_size = 0, int32_t filter_type = -1,
-    int32_t zmean = -1) {
+    const GPUDevice & gpu, VkPipelineLayout layout, const uint32_t * code,
+    size_t code_size, int32_t filter_type = -1, int32_t zmean = -1) {
 
-    uint32_t subgroup_size = required_subgroup_size;
+    uint32_t subgroup_size = gpu.has_subgroup_size(32) ? 32 : 0;
     if (const int sw = env_int("VSFEEL_DFTTEST_SGSIZE", 0); sw > 0) {
         subgroup_size = static_cast<uint32_t>(sw);
     }
@@ -720,9 +539,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     }
 
     // Build the spec-constant map from an explicit (id, value) list so the
-    // offset always matches the slot the value is stored in; the old
-    // positional form delivered spec_values[0] as constant 2 when
-    // filter_type < 0 and zmean >= 0.
+    // offset always matches the slot the value is stored in.
     VkSpecializationMapEntry spec_entries[2] {};
     int32_t spec_values[2] {};
     uint32_t n_spec = 0;
@@ -741,362 +558,336 @@ static std::variant<VkPipeline, std::string> create_pipeline(
         ++n_spec;
     }
 
-    return create_compute_pipeline(dev, module, layout,
+    return gpu_create_pipeline(gpu, code, code_size, layout,
         n_spec ? spec_entries : nullptr, n_spec ? spec_values : nullptr,
         n_spec, n_spec * sizeof(int32_t), "dfttest", subgroup_size);
 }
 
-// Records the per-plane fused + col2im dispatch sequence.
-static bool trivial_kernels() {
-    static const bool v = env_flag("VSFEEL_DFTTEST_TRIVIAL");
-    return v;
-}
-
 static bool dfttest_trace() {
-    static const bool v = vsfeel_debug_trace("VSFEEL_DFTTEST_TRACE");
+    static const bool v = vsfeel_debug_trace("VSFEEL_DFFTEST_TRACE");
     return v;
 }
 
-// Frame-cache slot operation for one (plane, temporal slice) of an output
-// frame: the source frame f is either new (padded now, into its slot or
-// directly into the padded buffer if every slot is busy) or already cached
-// (D2D-copied from its slot).
-struct SlotOp {
-    int plane {};
-    int t {};
-    int slot { -1 };           // owning slot, or -1 (direct pad, no copy)
-    VkDeviceSize slot_base {};
-    bool is_pad {};
-    int which {};  // reader offset: n - pad_frame (selects the slot semaphore)
-};
 
 static DftPushConstants base_pc(const DftData & d) {
-    DftPushConstants pc {
-        .padded_base = 0,
-        .spatial_base = 0,
-        .dst_base = 0,
-        .src_base = 0,
-        .pad_t0 = 0,
-        .wt_base = 0,
-        .wf_base = d.wf_base,
-        .sigma_base = d.sigma_base,
-        .radius = d.radius,
-        .block_step = d.block_step,
-        .width = 0,
-        .height = 0,
-        .src_stride = 0,
-        .dst_stride = 0,
-        .filter_type = d.filter_type,
-        .sigma = d.sigma_scalar,
-        .sigma2 = d.sigma2,
-        .pmin = d.pmin,
-        .pmax = d.pmax,
-        .beta = d.beta
-    };
-    for (int i = 0; i < 7; ++i) {
-        pc.slot_base[i] = -1;
-    }
+    DftPushConstants pc {};
+    pc.wt_base = 0;
+    pc.wf_base = d.wf_base;
+    pc.sigma_base = d.sigma_base;
+    pc.radius = d.radius;
+    pc.block_step = d.block_step;
+    pc.sigma = d.sigma_scalar;
+    pc.sigma2 = d.sigma2;
+    pc.pmin = d.pmin;
+    pc.pmax = d.pmax;
+    pc.beta = d.beta;
     return pc;
 }
 
-// Appends one pad dispatch (an open command buffer) for a pad op: into the
-// shared slot (pad_slot_pipeline) or, when the op has no slot, straight into
-// the resource's padded buffer (pad_direct_pipeline).
-static void record_one_pad_dispatch(
-    VkCommandBuffer cmd, const DftData & d, const DFTTestResource & resource,
-    const SlotOp & op) {
+// ---------------------------------------------------------------------------
+// Frame processing
+// ---------------------------------------------------------------------------
 
-    const auto & cfg = d.planes[op.plane];
-    DftPushConstants pc = base_pc(d);
-    // the pad kernels apply the temporal offset themselves (pc.pad_t0 *
-    // up_slice); do not add it to src_base as well
-    pc.src_base = static_cast<int32_t>(cfg.upload_offset);
-    pc.pad_t0 = op.t;
-    pc.width = cfg.width;
-    pc.height = cfg.height;
-    pc.src_stride = cfg.width;
-    pc.dst_stride = cfg.width;
+// GPU input, GPU output: the kernels read the core's source frame planes
+// directly (pad) and write the output frame plane (col2im). The core owns
+// every transfer.
+static const VSFrame * dft_gpu_frame(
+    DftData * d, int n, VSFrameContext * frameCtx, VSCore * core,
+    const VSAPI * vsapi) {
 
-    if (op.slot >= 0) {
-        pc.padded_base = static_cast<int32_t>(op.slot_base);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.pad_slot_pipeline);
-    } else {
-        pc.padded_base = static_cast<int32_t>(cfg.padded_offset);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.pad_direct_pipeline);
+    const int numPlanes = d->vi->format.numPlanes;
+    const int tw = d->tw;
+
+    std::array<const VSFrame *, 7> src {};
+    for (int t = 0; t < tw; ++t) {
+        const int idx = std::clamp(n - d->radius + t, 0, d->vi->numFrames - 1);
+        src[t] = vsapi->getFrameFilter(idx, d->node, frameCtx);
     }
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        d.pipeline_layout, 0, 1, &resource.pad_set, 0, nullptr);
-    vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-        0, sizeof(DftPushConstants), &pc);
-    const uint32_t max_grid_x = d.device->limits.maxComputeWorkGroupCount[0];
-    const uint32_t max_grid_y = d.device->limits.maxComputeWorkGroupCount[1];
-    const uint32_t gx = std::min<uint32_t>(
-        (static_cast<uint32_t>(cfg.pw) + 31) / 32, max_grid_x);
-    const uint32_t gy = std::min<uint32_t>(
-        (static_cast<uint32_t>(cfg.ph) + 7) / 8, max_grid_y);
-    vkCmdDispatch(cmd, std::max(gx, 1u), std::max(gy, 1u), 1);
-}
+    const VSFrame * center = src[d->radius];
 
-// Records the slot-pad command buffer (resource.cmd_pad[0]): one pad
-// dispatch per pad op. Used by the GPU bench (debug); in the normal flow
-// each pad op records and submits its own command buffer at claim time.
-static std::optional<std::string> record_pad_cb(
-    const DftData & d, DFTTestResource & resource, const std::vector<SlotOp> & ops) {
+    bool any_process = false, all_process = true;
+    for (int p = 0; p < numPlanes; ++p) {
+        any_process |= d->process[p];
+        all_process &= d->process[p];
+    }
 
-    VkCommandBuffer cmd = resource.cmd_pad[0];
-
-    VkCommandBufferBeginInfo begin_info {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .pInheritanceInfo = nullptr
+    // Unprocessed planes ride along from the center frame, keeping their own
+    // producer pairs; everything processed is written by this submission.
+    // newVideoFrame2 infers residency from the plane sources, so a frame with no
+    // source plane at all has to come from newGPUVideoFrame.
+    const int pl[] = { 0, 1, 2 };
+    const VSFrame * fr[] = {
+        d->process[0] ? nullptr : center,
+        d->process[1] ? nullptr : center,
+        d->process[2] ? nullptr : center
     };
-    if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
-        return "vkBeginCommandBuffer (pad) failed";
-    }
-
-    if (!trivial_kernels()) {
-        for (const SlotOp & op : ops) {
-            if (!op.is_pad) {
-                continue;
-            }
-            record_one_pad_dispatch(cmd, d, resource, op);
+    VSFrame * dst = all_process
+        ? d->gpu->api->newGPUVideoFrame(&d->vi->format, d->vi->width,
+              d->vi->height, center, core)
+        : vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height,
+              fr, pl, center, core);
+    if (!dst) {
+        vsfeel_trace_error("DFTTest", n, "failed to allocate the output frame",
+                           d->gpu.get());
+        vsapi->setFilterError("DFTTest: failed to allocate the output frame", frameCtx);
+        for (int t = 0; t < tw; ++t) {
+            vsapi->freeFrame(src[t]);
         }
+        return nullptr;
     }
 
-    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-        return "vkEndCommandBuffer (pad) failed";
+    // Nothing to run: every plane shares from the center frame, so the frame is
+    // already complete and an empty submission would only cost a round trip.
+    if (!any_process) {
+        for (int t = 0; t < tw; ++t) {
+            vsapi->freeFrame(src[t]);
+        }
+        return dst;
     }
-    return std::nullopt;
-}
 
-// Test-only fault injection: VSFEEL_DFTTEST_FAILPAD=N fails the Nth *slot* pad
-// submit, so the claim-rollback path below stays reachable. Direct pads are not
-// counted. Unset in normal use (one branch on a cached value).
-static bool fail_slot_pad_submit() {
-    static const int nth = [] {
-        return env_int("VSFEEL_DFTTEST_FAILPAD", 0);
-    }();
-    if (nth <= 0) {
-        return false;
-    }
-    static std::atomic<int> seen { 0 };
-    return seen.fetch_add(1, std::memory_order_relaxed) + 1 == nth;
-}
+    auto t0 = d->host_timing ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point {};
+    vsfeel_trace_frame_begin();
+    vsfeel_trace_mark("acquire");
 
-// Records and submits one pad op's command buffer immediately (called at
-// claim time, still holding slot_lock; takes queue_lock). Signalling the
-// slot's timeline semaphore here — before any reader of this generation can
-// commit — makes a backward semaphore dependency on the queue impossible:
-// every reader's copy submit is queued after this pad submit.
-static bool submit_pad_op(
-    const DftData & d, DFTTestResource & resource, const SlotOp & op) {
-
-    // Before the failure check: the trail's last mark names the step that failed.
-    vsfeel_trace_mark("pad");
-    if (op.slot >= 0 && fail_slot_pad_submit()) {
-        return false;
-    }
-    const VkDevice dev = d.device->device;
-    VkCommandBuffer cmd = resource.cmd_pad[op.plane * d.tw + op.t];
-    VkCommandBufferBeginInfo begin_info {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .pInheritanceInfo = nullptr
+    char errbuf[512] {};
+    VSGPUExecContext * ctx = d->gpu->api->gpuExecAcquire(d->pool, errbuf, sizeof(errbuf));
+    auto fail = [&](const std::string & message) -> const VSFrame * {
+        if (ctx) {
+            d->gpu->api->gpuExecAbandon(ctx);
+            ctx = nullptr;
+        }
+        vsfeel_trace_error("DFTTest", n, message, d->gpu.get());
+        vsapi->setFilterError(("DFTTest: " + message).c_str(), frameCtx);
+        vsapi->freeFrame(dst);
+        for (int t = 0; t < tw; ++t) {
+            vsapi->freeFrame(src[t]);
+        }
+        return nullptr;
     };
-    if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
-        return false;
+    if (!ctx) {
+        return fail("could not acquire a recording context: "s + errbuf);
     }
-    if (!trivial_kernels()) {
-        record_one_pad_dispatch(cmd, d, resource, op);
-    }
-    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-        return false;
-    }
+    auto t1 = d->host_timing ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point {};
 
-    if (op.slot >= 0) {
-        const auto & st = d.slots[op.plane * d.slot_count + op.slot];
-        // Signals the slot's timeline semaphore to st.signal (non-destructive:
-        // any number of reader copies may wait on the same value).
-        return submit_timeline(dev, resource.queue, resource.queue_lock, cmd,
-            {}, {}, {}, st.sem, st.signal, VK_NULL_HANDLE) == VK_SUCCESS;
-    }
-    return submit_timeline(dev, resource.queue, resource.queue_lock, cmd,
-        {}, {}, {}, VK_NULL_HANDLE, 0, VK_NULL_HANDLE) == VK_SUCCESS;
-}
-
-static bool qbench_on() {
-    static const bool v = env_flag("VSFEEL_DFTTEST_QBENCH");
-    return v;
-}
-
-// One-shot gate: timestamps are recorded for a single frame only (frame 0),
-// otherwise later frames reusing the same resource reset/rewrite the pool
-// before the readback CB runs.
-// The armed frame id (set by qbench_arm); readback runs only for it.
-static std::atomic<int> qbench_frame { -1 };
-static int qbench_frame_idx() {
-    static const int v = [] {
-        return env_int("VSFEEL_DFTTEST_QBENCH", 100);
-    }();
-    return v;
-}
-static bool qbench_arm(int n) {
-    static std::atomic<int> done { 0 };
-    if (!qbench_on() || n != qbench_frame_idx()) {
-        return false;
-    }
-    int expect = 0;
-    if (done.compare_exchange_strong(expect, 1)) {
-        qbench_frame.store(n);
-        return true;
-    }
-    return false;
-}
-
-
-// Timestamp helpers (qbench only): q0 = fused-CB head, q1 = after the
-// slot-visibility barrier, q2 = fused end, q3 = col2im end. Reset + written
-// by the fused CB itself (single submitted CB — no cross-CB races).
-static void qwrite(VkCommandBuffer cmd, VkQueryPool pool, uint32_t q) {
-    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, pool, q);
-}
-
-// Records the pre-recorded fused + col2im command buffer (resource.cmd).
-// slot_base[t] carries the frame's per-slice slot addresses (or -1 for a
-// direct-padded slice); empty (creation-time record) means all -1.
-static std::optional<std::string> record_fused_col2im_cb(
-    const DftData & d, DFTTestResource & resource,
-    bool with_fused, bool with_col2im, bool qb = false,
-    const int32_t * slot_base3x7 = nullptr, int tw_direct = 0) {
-
-    VkCommandBuffer cmd = resource.cmd;
-
-    VkCommandBufferBeginInfo begin_info {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .pInheritanceInfo = nullptr
-    };
-    if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
-        return "vkBeginCommandBuffer (fused) failed";
+    vsfeel_trace_mark("record");
+    VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
+    const VkPhysicalDeviceLimits & lim = d->gpu->limits;
+    const bool gputrace = d->gpu_trace && n == d->gpu_trace_frame &&
+        d->probe.armed.exchange(1) == 0;
+    int probe_plane = -1;
+    if (gputrace) {
+        for (int p = 0; p < numPlanes && probe_plane < 0; ++p) {
+            if (d->process[p]) {
+                probe_plane = p;
+            }
+        }
+        d->gpu->vk->vkCmdResetQueryPool(cmd, d->probe.query, 0, 4);
+        d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+            d->probe.query, 0);
     }
 
-    // slot-direct: the pad kernels (submitted earlier, possibly on another
-    // queue) wrote the slots this fused reads. Same-queue ordering is free;
-    // visibility needs this barrier (cross-queue pods additionally wait on
-    // the slot timeline semaphores at submit time).
-    if (qb && resource.qpool) {
-        vkCmdResetQueryPool(cmd, resource.qpool, 0, 8);
-        qwrite(cmd, resource.qpool, 0);
-    }
-    if (!trivial_kernels() && with_fused) {
-        VkMemoryBarrier slot_barrier {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
-        };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &slot_barrier, 0, nullptr, 0, nullptr);
-    }
-    if (qb && resource.qpool && with_fused) {
-        qwrite(cmd, resource.qpool, 1);
-    }
-
-    const DftPushConstants base = base_pc(d);
-    const uint32_t max_grid_x = d.device->limits.maxComputeWorkGroupCount[0];
-    const uint32_t max_grid_y = d.device->limits.maxComputeWorkGroupCount[1];
-
-    for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
-        if (!d.process[plane]) {
+    for (int plane = 0; plane < numPlanes; ++plane) {
+        if (!d->process[plane]) {
             continue;
         }
-        if (trivial_kernels()) {
-            continue;
-        }
-        const auto & cfg = d.planes[plane];
+        const auto & cfg = d->planes[plane];
 
-        DftPushConstants pc = base;
-        if (slot_base3x7) {
-            for (int t = 0; t < 7; ++t) {
-                pc.slot_base[t] = slot_base3x7[plane * 7 + t];
-            }
+        // Per-frame scratch: the padded source window and the float block
+        // buffer. Both are handed to the context, which recycles them once the
+        // submission completes (the pool's size buckets make this cheap).
+        GpuBuffer padded {}, spatial {};
+        if (auto e = gpu_frame_buffer(*d->gpu, core, ctx, cfg.padded_bytes, padded);
+            !e.empty()) {
+            return fail("padded buffer: " + e);
         }
-        pc.padded_base = static_cast<int32_t>(cfg.padded_offset);
-        pc.spatial_base = static_cast<int32_t>(cfg.spatial_offset);
-        pc.dst_base = static_cast<int32_t>(d.upload_total + cfg.download_offset);
-        pc.src_base = static_cast<int32_t>(cfg.upload_offset);
-        pc.width = cfg.width;
-        pc.height = cfg.height;
-        pc.src_stride = cfg.width;
-        pc.dst_stride = cfg.width;
-
-        if (with_fused) {
-            // fused kernel (SUB_BLOCKS=8 blocks per 128-thread workgroup).
-            // Slot-direct variant when every slice of the window is
-            // slot-backed (no padded-fallback branch in im2col); else the
-            // mixed variant. Opt out with VSFEEL_DFTTEST_FUSEDDIRECT=0.
-            bool all_direct = slot_base3x7 != nullptr;
-            if (all_direct) {
-                for (int t = 0; t < tw_direct; ++t) {
-                    if (slot_base3x7[plane * 7 + t] < 0) {
-                        all_direct = false;
-                        break;
-                    }
-                }
-            }
-            static const bool allow_direct =
-                env_int("VSFEEL_DFTTEST_FUSEDDIRECT", 1) != 0;
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                (allow_direct && all_direct) ? d.fused_direct_pipeline[d.radius] :
-                                               d.fused_pipeline[d.radius]);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
-            vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                0, sizeof(DftPushConstants), &pc);
-            const uint32_t blocks = static_cast<uint32_t>(cfg.num_blocks);
-            const uint32_t sub_blocks = blocks / 8 + (blocks % 8 != 0 ? 1 : 0);
-            const uint32_t grid_x = std::min<uint32_t>(sub_blocks, max_grid_x);
-            vkCmdDispatch(cmd, std::max(grid_x, 1u), 1, 1);
-            if (qb && resource.qpool) {
-                qwrite(cmd, resource.qpool, 2);
-            }
+        if (auto e = gpu_frame_buffer(*d->gpu, core, ctx, cfg.spatial_bytes, spatial);
+            !e.empty()) {
+            return fail("spatial buffer: " + e);
         }
 
-        if (with_col2im) {
-            // the col2im kernel reads the fused kernel's writes
-            VkMemoryBarrier mem_barrier {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+        VSVulkanPlaneInfo dst_plane {};
+        if (d->gpu->api->getGPUPlane(dst, plane, &dst_plane)) {
+            return fail("output plane " + std::to_string(plane) + " is not GPU resident");
+        }
+        const int dst_stride = static_cast<int>(
+            vsapi->getStride(dst, plane) / d->elem_bytes);
+
+        // pad and col2im both walk the padded plane, so they share a grid
+        const uint32_t plane_gx = std::max(std::min<uint32_t>(
+            (static_cast<uint32_t>(cfg.pw) + 31u) / 32u, lim.maxComputeWorkGroupCount[0]), 1u);
+        const uint32_t plane_gy = std::max(std::min<uint32_t>(
+            (static_cast<uint32_t>(cfg.ph) + 7u) / 8u, lim.maxComputeWorkGroupCount[1]), 1u);
+        const uint32_t blocks = static_cast<uint32_t>(cfg.num_blocks);
+        const uint32_t fused_gx = std::max(std::min<uint32_t>(
+            (blocks + 7u) / 8u, lim.maxComputeWorkGroupCount[0]), 1u);
+
+        // pad: one dispatch per temporal slice, reading its own source frame
+        // plane (so the temporal offset lives in the buffer bound at binding 3,
+        // not in an address the kernel walks).
+        vsfeel_trace_mark("pad");
+        for (int t = 0; t < tw; ++t) {
+            VSVulkanPlaneInfo sp {};
+            if (d->gpu->api->getGPUPlane(src[t], plane, &sp)) {
+                return fail("source plane " + std::to_string(plane) +
+                            " is not GPU resident");
+            }
+            const VkBuffer buffers[5] {
+                d->wt.buffer, padded.buffer, spatial.buffer,
+                sp.buffer, dst_plane.buffer
             };
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+            DftPushConstants pc = base_pc(*d);
+            pc.pad_t0 = t;
+            pc.width = cfg.width;
+            pc.height = cfg.height;
+            pc.src_stride = static_cast<int32_t>(
+                vsapi->getStride(src[t], plane) / d->elem_bytes);
+            pc.dst_stride = dst_stride;
+            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                d->pad_pipeline);
+            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 5);
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc, sizeof(pc));
+            d->gpu->vk->vkCmdDispatch(cmd, plane_gx, plane_gy, 1);
+        }
+        gpu_barrier(*d->gpu, cmd);
+        if (gputrace && plane == probe_plane) {
+            d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                d->probe.query, 1);
+        }
 
-            // col2im kernel
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.col2im_pipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
-            vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                0, sizeof(DftPushConstants), &pc);
-            const uint32_t grid_x = std::min<uint32_t>(
-                (static_cast<uint32_t>(cfg.pw) + 31) / 32, max_grid_x);
-            const uint32_t grid_y = std::min<uint32_t>(
-                (static_cast<uint32_t>(cfg.ph) + 7) / 8, max_grid_y);
-            vkCmdDispatch(cmd, std::max(grid_x, 1u), std::max(grid_y, 1u), 1);
-            if (qb && resource.qpool && with_col2im) {
-                qwrite(cmd, resource.qpool, 3);
+        // fused: im2col + spatial/temporal DFT + filter + inverse, writing the
+        // center temporal slice of each block into the spatial buffer.
+        vsfeel_trace_mark("fused");
+        {
+            VSVulkanPlaneInfo sp {};
+            if (d->gpu->api->getGPUPlane(center, plane, &sp)) {
+                return fail("center plane " + std::to_string(plane) +
+                            " is not GPU resident");
             }
+            const VkBuffer buffers[5] {
+                d->wt.buffer, padded.buffer, spatial.buffer,
+                sp.buffer, dst_plane.buffer
+            };
+            DftPushConstants pc = base_pc(*d);
+            pc.width = cfg.width;
+            pc.height = cfg.height;
+            pc.src_stride = static_cast<int32_t>(
+                vsapi->getStride(center, plane) / d->elem_bytes);
+            pc.dst_stride = dst_stride;
+            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                d->fused_pipeline[d->radius]);
+            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 5);
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc, sizeof(pc));
+            d->gpu->vk->vkCmdDispatch(cmd, fused_gx, 1, 1);
+        }
+        gpu_barrier(*d->gpu, cmd);
+        if (gputrace && plane == probe_plane) {
+            d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                d->probe.query, 2);
+        }
+
+        // col2im: overlap-add the windowed blocks straight into the output plane
+        vsfeel_trace_mark("col2im");
+        {
+            const VkBuffer buffers[5] {
+                d->wt.buffer, padded.buffer, spatial.buffer,
+                padded.buffer, dst_plane.buffer
+            };
+            DftPushConstants pc = base_pc(*d);
+            pc.width = cfg.width;
+            pc.height = cfg.height;
+            pc.src_stride = static_cast<int32_t>(
+                vsapi->getStride(center, plane) / d->elem_bytes);
+            pc.dst_stride = dst_stride;
+            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                d->col2im_pipeline);
+            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 5);
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc, sizeof(pc));
+            d->gpu->vk->vkCmdDispatch(cmd, plane_gx, plane_gy, 1);
+        }
+        if (gputrace && plane == probe_plane) {
+            d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                d->probe.query, 3);
+        }
+    }
+    if (gputrace) {
+        d->gpu->vk->vkCmdCopyQueryPoolResults(cmd, d->probe.query, 0, 4,
+            d->probe.buf.buffer, 0, sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    }
+    auto t2 = d->host_timing ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point {};
+
+    // The pool turns the source planes' producer pairs into device-side waits
+    // and publishes the output's producers; frames stay alive until the
+    // submission completes. Clamped temporal boundaries map several slices to
+    // one frame, so identical frames are declared once.
+    for (int t = 0; t < tw; ++t) {
+        bool dup = false;
+        for (int u = 0; u < t; ++u) {
+            dup |= src[u] == src[t];
+        }
+        if (!dup) {
+            d->gpu->api->gpuExecReadsFrame(ctx, src[t]);
+        }
+    }
+    for (int p = 0; p < numPlanes; ++p) {
+        if (d->process[p]) {
+            d->gpu->api->gpuExecWritesPlane(ctx, dst, p);
         }
     }
 
-    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-        return "vkEndCommandBuffer (fused) failed";
+    vsfeel_trace_mark("submit");
+    uint64_t signaled = 0;
+    const int submit_error = d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf, sizeof(errbuf));
+    ctx = nullptr;  // consumed either way
+    if (submit_error) {
+        return fail("submit failed: "s + errbuf);
     }
-    return std::nullopt;
+    auto t3 = d->host_timing ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point {};
+
+    if (d->host_timing) {
+        const auto ns = [](auto a, auto b) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+        };
+        d->ht_acquire_ns += ns(t0, t1);
+        d->ht_record_ns += ns(t1, t2);
+        d->ht_submit_ns += ns(t2, t3);
+        d->ht_total_ns += ns(t0, t3);
+        d->ht_n.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (dfttest_trace()) {
+        fprintf(stderr, "[dfttest-trace] n=%d tw=%d submitted\n", n, tw);
+    }
+
+    if (gputrace) {
+        // One-shot probe: wait this submission out so the query results are
+        // final, then read the mapped copy the command buffer made.
+        char perr[256] {};
+        if (d->gpu->api->gpuExecWaitValue(d->pool, signaled, perr, sizeof(perr)) == gdDrained) {
+            const double period = lim.timestampPeriod;
+            const auto us = [period](uint64_t a, uint64_t b) {
+                return static_cast<double>(b - a) * period / 1000.0;
+            };
+            const uint64_t * ts = d->probe.map;
+            fprintf(stderr,
+                "[dfttest-gpu] n=%d pad=%.1fus fused=%.1fus col2im=%.1fus total=%.1fus\n",
+                n, us(ts[0], ts[1]), us(ts[1], ts[2]), us(ts[2], ts[3]),
+                us(ts[0], ts[3]));
+        } else {
+            fprintf(stderr, "[dfttest-gpu] probe wait failed: %s\n", perr);
+        }
+    }
+
+    for (int t = 0; t < tw; ++t) {
+        vsapi->freeFrame(src[t]);
+    }
+
+    return dst;
 }
 
 static const VSFrame *VS_CC DftGetFrame(
@@ -1111,568 +902,13 @@ static const VSFrame *VS_CC DftGetFrame(
         for (int i = start; i <= end; ++i) {
             vsapi->requestFrameFilter(i, d->node, frameCtx);
         }
-    } else if (activationReason == arAllFramesReady) {
-        const int tw = d->tw;
-
-        std::array<const VSFrame *, 7> src {};
-        for (int t = 0; t < tw; ++t) {
-            const int idx = std::clamp(n - d->radius + t, 0, d->vi->numFrames - 1);
-            src[t] = vsapi->getFrameFilter(idx, d->node, frameCtx);
-        }
-        const VSFrame * center = src[d->radius];
-
-        const int pl[] = { 0, 1, 2 };
-        const VSFrame * fr[] = {
-            d->process[0] ? nullptr : center,
-            d->process[1] ? nullptr : center,
-            d->process[2] ? nullptr : center
-        };
-
-        VSFrame * dst = vsapi->newVideoFrame2(
-            &d->vi->format, d->vi->width, d->vi->height, fr, pl, center, core);
-
-        auto t0 = d->host_timing ? std::chrono::steady_clock::now()
-                                 : std::chrono::steady_clock::time_point {};
-
-        // Note on the frame cache and out-of-order processing: the slot
-        // state (gen/committed) under slot_lock decides who pads a slot (the
-        // first frame that touches it, in wall-clock order) and who reads it.
-        // The pad is submitted at claim time, still under slot_lock, and
-        // signals the slot's TIMELINE semaphore to a fresh per-generation
-        // value. Every reader — including readers of the same generation
-        // caused by the same frame being processed more than once (the
-        // scheduler / chained filters can request one frame repeatedly) —
-        // waits on that value, and timeline waits are non-destructive, so any
-        // number of copies may wait on the same signal: no second consumer can
-        // starve. A slot is only reclaimed for a new source once every
-        // committed reader's resource has been reused (frame_gen advanced past
-        // their commit generation), which implies their frames — copies
-        // included — are fully done, so the overwrite never races a reader's
-        // copy, and destroying the timeline semaphore is safe (all its waits
-        // have resolved). No host fence waits anywhere: no deadlocks.
-        vsfeel_trace_frame_begin();
-        d->pool.semaphore.acquire();
-        d->pool.lock.lock();
-        auto resource = std::move(d->pool.items.back());
-        d->pool.items.pop_back();
-        d->pool.lock.unlock();
-        vsfeel_trace_mark("pool");
-
-        auto set_error = [&](const std::string & error_message) {
-            vsfeel_trace_error("DFTTest", n, error_message, d->device.get());
-            d->pool.give_back(std::move(resource));
-            vsapi->setFilterError(("DFTTest: " + error_message).c_str(), frameCtx);
-            for (int t = 0; t < tw; ++t) {
-                vsapi->freeFrame(src[t]);
-            }
-            vsapi->freeFrame(dst);
-            return nullptr;
-        };
-
-        VkDevice dev = d->device->device;
-        float * map = resource.map;
-
-        // Frame generation for this resource: a slot may only be reclaimed
-        // for a new source once every committed reader's resource has been
-        // reused (frame_gen advanced past their commit generation), which
-        // implies those frames — copies included — are fully done.
-        const long long my_gen =
-            d->res_meta[resource.id]->frame_gen.fetch_add(1, std::memory_order_relaxed) + 1;
-
-        if (dfttest_trace()) {
-            fprintf(stderr, "[dfttest-trace] n=%d res=%d gen=%lld start\n",
-                n, resource.id, (long long)my_gen);
-        }
-
-        auto t2 = d->host_timing ? std::chrono::steady_clock::now()
-                                 : std::chrono::steady_clock::time_point {};
-
-        const bool coherent =
-            !!(d->device->mem_props.memoryTypes[resource.staging_type_index].propertyFlags &
-               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-        // Padded-source frame cache: each source frame of the temporal window
-        // is either already reflect-pad'd into a slot (D2D copy) or new
-        // (upload + pad into a slot now; if every slot is busy, pad the slice
-        // straight into this resource's padded buffer instead). The slot state
-        // machine (under slot_lock) decides who pads (first frame in
-        // wall-clock order) and who reads. See the note above for why the pad
-        // is submitted at claim time and how slot reclamation stays safe.
-        std::vector<SlotOp> ops;
-        ops.reserve(d->vi->format.numPlanes * tw);
-        std::vector<std::pair<VkSemaphore, uint64_t>> waits;
-        waits.reserve(ops.capacity());
-        const bool force_pad = env_flag("VSFEEL_DFTTEST_FORCEPAD");
-        for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-            if (!d->process[plane]) {
-                continue;
-            }
-            const auto & cfg = d->planes[plane];
-            const size_t row_bytes = static_cast<size_t>(cfg.width) * d->bytes;
-            for (int t = 0; t < tw; ++t) {
-                const int idx = std::clamp(n - d->radius + t, 0, d->vi->numFrames - 1);
-                const int which = n - std::max(0, idx - d->radius);
-                SlotOp op;
-                op.plane = plane;
-                op.t = t;
-                op.which = which;
-
-                // find the slot that owns this source (any slot may hold it:
-                // reclamation can move a source off its natural slot)
-                auto find_owner = [&]() {
-                    for (int s = 0; s < d->slot_count; ++s) {
-                        if (d->slots[plane * d->slot_count + s].gen == idx) {
-                            return s;
-                        }
-                    }
-                    return -1;
-                };
-
-                // register this frame as a reader of the slot's current generation and
-                // wait on the generation's timeline value. Timeline waits are
-                // NON-DESTRUCTIVE: any number of frame processings of the same
-                // generation (e.g. the same frame n requested twice by the
-                // scheduler / chained filters) may wait on the same value.
-                // (Pair-deduped: at temporal boundaries two slices of one
-                // frame map to the same source, hence the same slot and value.)
-                auto commit_reader = [&](int s) {
-                    SlotState & st = d->slots[plane * d->slot_count + s];
-                    st.committed.push_back({ resource.id, my_gen });
-                    op.slot = s;
-                    op.slot_base = cfg.slot_offset +
-                        static_cast<VkDeviceSize>(s) * cfg.slot_plane_bytes;
-                    bool dup = false;
-                    for (const auto & w : waits) {
-                        if (w.first == st.sem && w.second == st.signal) {
-                            dup = true;
-                            break;
-                        }
-                    }
-                    if (!dup) {
-                        waits.emplace_back(st.sem, st.signal);
-                    }
-                };
-
-                bool done = false;
-                {
-                    std::lock_guard lk(d->slot_lock);
-                    if (!force_pad) {
-                        const int owner = find_owner();
-                        if (owner >= 0) {
-                            commit_reader(owner);
-                            done = true;
-                        }
-                    }
-                }
-                if (!done) {
-                    // padder candidate: upload this source plane to this
-                    // resource's upload region (ReBAR VRAM when up_direct,
-                    // else staging), then re-claim (another frame may have
-                    // padded this source in the meantime, in which case this
-                    // upload was wasted)
-                    const uint8_t * srcp = vsapi->getReadPtr(src[t], plane);
-                    const int src_stride = vsapi->getStride(src[t], plane);
-                    uint8_t * up_base = resource.up_direct ?
-                        reinterpret_cast<uint8_t *>(resource.up_map) :
-                        reinterpret_cast<uint8_t *>(map);
-                    uint8_t * dstp = up_base + cfg.upload_offset +
-                        static_cast<size_t>(t) * cfg.upload_bytes / tw;
-                    if (src_stride == static_cast<int>(row_bytes)) {
-                        if (resource.up_direct) {
-                            memcpy(dstp, srcp, static_cast<size_t>(cfg.height) * row_bytes);
-                        } else {
-                            copy_stream_out(dstp, srcp, static_cast<size_t>(cfg.height) * row_bytes);
-                        }
-                    } else {
-                        for (int y = 0; y < cfg.height; ++y) {
-                            if (resource.up_direct) {
-                                memcpy(dstp + static_cast<size_t>(y) * row_bytes,
-                                    srcp + static_cast<size_t>(y) * src_stride, row_bytes);
-                            } else {
-                                copy_stream_out(dstp + static_cast<size_t>(y) * row_bytes,
-                                    srcp + static_cast<size_t>(y) * src_stride, row_bytes);
-                            }
-                        }
-                    }
-                    if (!coherent && !resource.up_direct) {
-                        checkVK(flush_range(*d->device, resource.staging_mem,
-                            cfg.upload_offset +
-                                static_cast<size_t>(t) * cfg.upload_bytes / tw,
-                            cfg.upload_bytes / tw, d->staging_total));
-                    }
-
-                    std::lock_guard lk(d->slot_lock);
-                    int owner = -1;
-                    if (!force_pad) {
-                        owner = find_owner();
-                    }
-                    if (owner >= 0) {
-                        commit_reader(owner);
-                        done = true;
-                    } else {
-                        // padder: the slot may be taken iff it is empty or its
-                        // old generation's readers are all done (their
-                        // resources reused); natural slot first, then any free
-                        auto slot_free = [&](const SlotState & st) {
-                            if (st.gen == -1) {
-                                return true;
-                            }
-                            for (const auto & cr : st.committed) {
-                                if (d->res_meta[cr.first]->frame_gen.load(
-                                        std::memory_order_relaxed) <= cr.second) {
-                                    return false;
-                                }
-                            }
-                            return true;
-                        };
-                        const int natural = static_cast<int>(idx % d->slot_count);
-                        int slot = -1;
-                        for (int i = 0; i < d->slot_count; ++i) {
-                            const int s = (natural + i) % d->slot_count;
-                            if (slot_free(d->slots[plane * d->slot_count + s])) {
-                                slot = s;
-                                break;
-                            }
-                        }
-                        if (slot >= 0) {
-                            SlotState & st = d->slots[plane * d->slot_count + slot];
-                            if (st.gen != -1) {
-                                if (dfttest_trace()) {
-                                    fprintf(stderr,
-                                        "[dfttest-trace]   n=%d reclaim p%d slot=%d oldgen=%lld newgen=%d\n",
-                                        n, plane, slot, (long long)st.gen, idx);
-                                }
-                            }
-                            if (!st.sem) {
-                                VkSemaphoreCreateInfo sem_info {
-                                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-                                    .pNext = nullptr,
-                                    .flags = 0
-                                };
-                                VkSemaphoreTypeCreateInfo type_info {
-                                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
-                                    .pNext = nullptr,
-                                    .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
-                                    .initialValue = 0
-                                };
-                                sem_info.pNext = &type_info;
-                                checkVK(vkCreateSemaphore(dev, &sem_info, nullptr, &st.sem));
-                            }
-                            st.gen = idx;
-                            st.committed = { { resource.id, my_gen } };
-                            // fresh timeline value for this generation: the pad
-                            // below signals it; every reader waits on it
-                            st.signal += 1;
-                            op.slot = slot;
-                            op.slot_base = cfg.slot_offset +
-                                static_cast<VkDeviceSize>(slot) * cfg.slot_plane_bytes;
-                            op.is_pad = true;
-                            if (!submit_pad_op(*d, resource, op)) {
-                                // The claim already set gen/committed and bumped the
-                                // signal, but the pad that would signal it failed.
-                                // A later reader committing to this generation would
-                                // submit a wait on a value that never arrives, and
-                                // RADV will not run a submit behind such a wait on the
-                                // same queue: permanent queue/host wedge. Roll the slot
-                                // back to empty so the next frame re-pads it.
-                                st.gen = -1;
-                                st.committed.clear();
-                                return set_error("vkQueueSubmit (pad) failed");
-                            }
-                        } else {
-                            // every slot is busy: pad this slice straight into
-                            // the padded buffer (no slot, no copy, no sems)
-                            op.is_pad = true;
-                            if (!submit_pad_op(*d, resource, op)) {
-                                return set_error("vkQueueSubmit (pad direct) failed");
-                            }
-                        }
-                    }
-                }
-
-                if (dfttest_trace()) {
-                    fprintf(stderr, "[dfttest-trace]   n=%d op p%d t%d idx=%d slot=%d which=%d %s\n",
-                        n, plane, t, idx, op.slot, which, op.is_pad ? "PAD" : "read");
-                }
-                ops.push_back(op);
-            }
-        }
-
-        auto t3 = d->host_timing ? std::chrono::steady_clock::now()
-                                 : std::chrono::steady_clock::time_point {};
-
-        if (const int iters = env_int("VSFEEL_DFTTEST_GPU_BENCH", 0);
-            iters > 0 && n == 0) {
-            VkDevice dev0 = d->device->device;
-            // the ops loop already submitted this frame's pads; wait for the
-            // queue to drain before re-recording their command buffers
-            vkDeviceWaitIdle(dev0);
-            // slot-direct fused needs this frame's slot addresses
-            int32_t gb_slot_base[3][7];
-            for (int p = 0; p < 3; ++p) {
-                for (int t = 0; t < 7; ++t) {
-                    gb_slot_base[p][t] = -1;
-                }
-            }
-            for (const SlotOp & op : ops) {
-                if (op.slot >= 0) {
-                    gb_slot_base[op.plane][op.t] = static_cast<int32_t>(op.slot_base);
-                }
-            }
-            auto bench_stage = [&](int stage, const char * name) {
-                if (record_pad_cb(*d, resource, ops)) {
-                    return;
-                }
-                if (record_fused_col2im_cb(*d, resource, stage >= 1, stage >= 2, false,
-                        &gb_slot_base[0][0], d->tw)) {
-                    return;
-                }
-                auto gb_start = std::chrono::steady_clock::now();
-                for (int i = 0; i < iters; ++i) {
-                    std::lock_guard lock(*resource.queue_lock);
-                    vkResetFences(dev0, 1, &resource.fence);
-                    VkCommandBuffer pad_cb = resource.cmd_pad[0];
-                    VkSubmitInfo pad_si {
-                        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                        .pNext = nullptr,
-                        .commandBufferCount = 1,
-                        .pCommandBuffers = &pad_cb
-                    };
-                    vkQueueSubmit(resource.queue, 1, &pad_si, VK_NULL_HANDLE);
-                    if (stage >= 1) {
-                        VkCommandBuffer cb = resource.cmd;
-                        VkSubmitInfo si2 {
-                            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                            .pNext = nullptr,
-                            .commandBufferCount = 1,
-                            .pCommandBuffers = &cb
-                        };
-                        vkQueueSubmit(resource.queue, 1, &si2, resource.fence);
-                        vkWaitForFences(dev0, 1, &resource.fence, VK_TRUE, UINT64_MAX);
-                    } else {
-                        vkQueueSubmit(resource.queue, 1, &pad_si, resource.fence);
-                        vkWaitForFences(dev0, 1, &resource.fence, VK_TRUE, UINT64_MAX);
-                    }
-                }
-                auto gb_end = std::chrono::steady_clock::now();
-                double ms = std::chrono::duration_cast<std::chrono::nanoseconds>(gb_end - gb_start).count() / 1e6 / iters;
-                fprintf(stderr, "[dfttest-gpubench] %-20s %.4f ms\n", name, ms);
-            };
-            bench_stage(0, "pad");
-            bench_stage(1, "pad+fused");
-            bench_stage(2, "pad+fused+col2im");
-        }
-
-        const bool qb = qbench_arm(n);
-        // slot-direct: per-slice slot addresses for the fused kernel (-1 =
-        // direct-padded slice, already in padded_buf). One row per plane.
-        int32_t slot_base[3][7];
-        for (int p = 0; p < 3; ++p) {
-            for (int t = 0; t < 7; ++t) {
-                slot_base[p][t] = -1;
-            }
-        }
-        for (const SlotOp & op : ops) {
-            if (op.slot >= 0) {
-                slot_base[op.plane][op.t] = static_cast<int32_t>(op.slot_base);
-            }
-        }
-
-        if (dfttest_trace()) {
-            fprintf(stderr, "[dfttest-trace]   n=%d res=%d submit: waits=%zu\n",
-                n, resource.id, waits.size());
-        }
-
-        // slot-direct fused submit: waits on the slot generations (pads may
-        // run on another queue) at COMPUTE stage; the head barrier in cmd
-        // covers same-queue visibility. The copy CB is now empty (kept for
-        // qbench stamps only) — no separate submit.
-        {
-            if (const auto err = record_fused_col2im_cb(*d, resource, true, true, qb,
-                    &slot_base[0][0], d->tw)) {
-                set_error(*err);
-                return nullptr;
-            }
-            std::vector<VkPipelineStageFlags> wait_stages(waits.size(),
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-            std::vector<VkSemaphore> wait_sems(waits.size());
-            std::vector<uint64_t> wait_vals(waits.size());
-            for (size_t i = 0; i < waits.size(); ++i) {
-                wait_sems[i] = waits[i].first;
-                wait_vals[i] = waits[i].second;
-            }
-            vsfeel_trace_mark("sub fused");
-            checkVK(submit_timeline(dev, resource.queue, resource.queue_lock,
-                resource.cmd, wait_sems, wait_vals, wait_stages,
-                VK_NULL_HANDLE, 0, resource.fence));
-            if (dfttest_trace()) {
-                fprintf(stderr, "[dfttest-trace]   n=%d res=%d fused submitted\n", n, resource.id);
-            }
-        }
-
-        auto t4 = d->host_timing ? std::chrono::steady_clock::now()
-                                 : std::chrono::steady_clock::time_point {};
-        if (dfttest_trace()) {
-            fprintf(stderr, "[dfttest-trace]   n=%d res=%d wait fence\n", n, resource.id);
-        }
-        vsfeel_trace_mark("wait");
-        checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
-        auto t5 = d->host_timing ? std::chrono::steady_clock::now()
-                                 : std::chrono::steady_clock::time_point {};
-
-        // Steady-state per-stage GPU times (qbench only, frame 0): copy the
-        // 4 availability-stamped timestamps back with a throwaway CB and
-        // print pad/copy/fused/col2im deltas. timestampPeriod is 10 ns/tick.
-        if (qbench_on() && resource.qpool && n == qbench_frame.load()) {
-            VkCommandBuffer qcmd;
-            VkCommandBufferAllocateInfo qai {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                .pNext = nullptr,
-                .commandPool = resource.pool,
-                .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                .commandBufferCount = 1
-            };
-            if (vkAllocateCommandBuffers(dev, &qai, &qcmd) == VK_SUCCESS) {
-                VkCommandBufferBeginInfo qbi {
-                    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-                checkVK(vkBeginCommandBuffer(qcmd, &qbi));
-                VkBufferCopy qbc { .srcOffset = 0, .dstOffset = 0,
-                    .size = 8 * sizeof(uint64_t) };
-                vkCmdCopyQueryPoolResults(qcmd, resource.qpool, 0, 4, resource.qbuf,
-                    0, sizeof(uint64_t),
-                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-                (void)qbc;
-                checkVK(vkEndCommandBuffer(qcmd));
-                checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
-                    qcmd, resource.fence));
-                checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
-                vkFreeCommandBuffers(dev, resource.pool, 1, &qcmd);
-                const uint64_t * ts = resource.qmap;
-                fprintf(stderr,
-                    "[dfttest-qbench] pad_end=%.1f copy_end=%.1f fused_end=%.1f col2im_end=%.1f (us, from copy-CB start; period=10ns)\n",
-                    ts[0] * 10.0 / 1000.0, ts[1] * 10.0 / 1000.0,
-                    ts[2] * 10.0 / 1000.0, ts[3] * 10.0 / 1000.0);
-                fprintf(stderr,
-                    "[dfttest-qbench] headbar=%.1fus fused=%.1fus col2im=%.1fus\n",
-                    (ts[1] - ts[0]) * 10.0 / 1000.0,
-                    (ts[2] - ts[1]) * 10.0 / 1000.0,
-                    (ts[3] - ts[2]) * 10.0 / 1000.0);
-            }
-        }
-
-        if (const int dump_n = env_int("VSFEEL_DFTTEST_DUMP_PAD", -1); dump_n >= 0 && n == dump_n) {
-            VkDeviceSize dump_size = 0;
-            for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-                if (d->process[plane]) {
-                    dump_size = d->planes[plane].padded_bytes;
-                }
-            }
-            {
-                VkCommandBufferAllocateInfo ai {
-                    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                    .commandPool = resource.pool,
-                    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                    .commandBufferCount = 1
-                };
-                VkCommandBuffer dcmd;
-                checkVK(vkAllocateCommandBuffers(dev, &ai, &dcmd));
-                VkCommandBufferBeginInfo bi { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-                checkVK(vkBeginCommandBuffer(dcmd, &bi));
-                const char * const dump_path = env_str("VSFEEL_DFTTEST_DUMP_PATH");
-                const VkDeviceSize dump_offset = d->upload_total + d->download_total;
-                if (!dump_path || !*dump_path) {
-                    vkFreeCommandBuffers(dev, resource.pool, 1, &dcmd);
-                    return set_error("VSFEEL_DFTTEST_DUMP_PATH must name the dump file");
-                }
-                // hard bound: an out-of-range copy faults the GPU; the dump
-                // region is reserved at creation for exactly this size
-                if (dump_offset + dump_size > d->staging_total) {
-                    vkFreeCommandBuffers(dev, resource.pool, 1, &dcmd);
-                    return set_error("dump region does not fit in staging");
-                }
-                VkBufferCopy bc { .srcOffset = 0, .dstOffset = dump_offset, .size = dump_size };
-                vkCmdCopyBuffer(dcmd, resource.padded_buf, resource.staging, 1, &bc);
-                checkVK(vkEndCommandBuffer(dcmd));
-                checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
-                    dcmd, resource.fence));
-                checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
-                if (!coherent) {
-                    VkMappedMemoryRange dump_range {
-                        .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                        .pNext = nullptr,
-                        .memory = resource.staging_mem,
-                        .offset = 0,
-                        .size = VK_WHOLE_SIZE,
-                    };
-                    checkVK(vkInvalidateMappedMemoryRanges(dev, 1, &dump_range));
-                }
-                FILE * f = fopen(dump_path, "wb");
-                if (!f) {
-                    vkFreeCommandBuffers(dev, resource.pool, 1, &dcmd);
-                    return set_error(std::string("cannot open dump path: ") + dump_path);
-                }
-                fwrite(reinterpret_cast<const uint8_t *>(map) + dump_offset, 1, dump_size, f);
-                fclose(f);
-                vkFreeCommandBuffers(dev, resource.pool, 1, &dcmd);
-            }
-        }
-
-        if (!coherent) {
-            std::vector<VkMappedMemoryRange> ranges;
-            ranges.reserve(d->vi->format.numPlanes);
-            for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-                if (!d->process[plane]) {
-                    continue;
-                }
-                const auto & cfg = d->planes[plane];
-                ranges.push_back(mapped_range(*d->device, resource.staging_mem,
-                    d->upload_total + cfg.download_offset, cfg.download_bytes,
-                    d->staging_total));
-            }
-            checkVK(vkInvalidateMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
-        }
-
-        for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-            if (!d->process[plane]) {
-                continue;
-            }
-            const auto & cfg = d->planes[plane];
-            const int dst_stride = vsapi->getStride(dst, plane);
-            const int row_bytes = cfg.width * d->bytes;
-            const uint8_t * h_bufferp = reinterpret_cast<const uint8_t *>(map) +
-                d->upload_total + cfg.download_offset;
-            uint8_t * dstp = vsapi->getWritePtr(dst, plane);
-            for (int y = 0; y < cfg.height; ++y) {
-                copy_stream_read(dstp + static_cast<size_t>(y) * dst_stride,
-                    h_bufferp + static_cast<size_t>(y) * row_bytes, row_bytes);
-            }
-        }
-
-        d->pool.give_back(std::move(resource));
-
-        auto t6 = d->host_timing ? std::chrono::steady_clock::now()
-                                 : std::chrono::steady_clock::time_point {};
-        if (d->host_timing) {
-            // acquire = ticket wait + pool pop (t0 -> t2); upload = the frame
-            // memcpy/flush and the pad submits (t2 -> t3); these plus the
-            // remaining stages sum to avg_total.
-            d->t_acquire_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t0).count();
-            d->t_upload_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count();
-            d->t_submit_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t4 - t3).count();
-            d->t_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t5 - t4).count();
-            d->t_download_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t6 - t5).count();
-            d->t_total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t6 - t0).count();
-            d->nframes.fetch_add(1, std::memory_order::relaxed);
-        }
-
-        for (int t = 0; t < tw; ++t) {
-            vsapi->freeFrame(src[t]);
-        }
-
-        return dst;
+        return nullptr;
+    }
+    if (activationReason != arAllFramesReady) {
+        return nullptr;
     }
 
-    return nullptr;
+    return dft_gpu_frame(d, n, frameCtx, core, vsapi);
 }
 
 // ---------------------------------------------------------------------------
@@ -1683,9 +919,7 @@ static void VS_CC DftFree(
     void *instanceData, [[maybe_unused]] VSCore *core, const VSAPI *vsapi) {
 
     DftData * d = static_cast<DftData *>(instanceData);
-
     vsapi->freeNode(d->node);
-
     delete d;
 }
 
@@ -1704,7 +938,7 @@ static void VS_CC DftCreate(
     int error;
 
     auto set_error = [&](const std::string & error_message) {
-        vsfeel_trace_error("DFTTest", -1, error_message, d->device.get());
+        vsfeel_trace_error("DFTTest", -1, error_message, d->gpu.get());
         vsapi->mapSetError(out, ("DFTTest: " + error_message).c_str());
         vsapi->freeNode(d->node);
     };
@@ -1718,7 +952,7 @@ static void VS_CC DftCreate(
         return set_error("input must be 16 bit integer or 32 bit float, Gray/YUV/RGB, constant format.");
     }
     d->bits = bits;
-    d->bytes = bits / 8;
+    d->elem_bytes = bits / 8;
 
     int ftype = vsh::int64ToIntS(vsapi->mapGetInt(in, "ftype", 0, &error));
     if (error) {
@@ -1857,11 +1091,13 @@ static void VS_CC DftCreate(
     }
 
     int device_id = vsh::int64ToIntS(vsapi->mapGetInt(in, "device_id", 0, &error));
-    if (error) {
-        device_id = 0;
-    }
-    if (device_id < 0) {
-        return set_error("invalid device ID.");
+    // Device selection moved to the core (core.set_vulkan_device): one Vulkan
+    // device per process, picked before any GPU filter runs. The argument stays
+    // accepted so existing scripts keep loading; a negative one is still an
+    // error because it never selected anything.
+    if (!error && device_id < 0) {
+        return set_error("\"device_id\" must be non-negative; under the R80 GPU API "
+                         "device selection is core.set_vulkan_device");
     }
     int num_streams = vsh::int64ToIntS(vsapi->mapGetInt(in, "num_streams", 0, &error));
     if (error) {
@@ -1870,7 +1106,9 @@ static void VS_CC DftCreate(
     if (num_streams < 1 || num_streams > 32) {
         return set_error("num_streams must be 1..32.");
     }
-    d->num_streams = num_streams;
+    // "num_streams" no longer selects anything: how many frames are in flight
+    // is the core's call now (the exec pool sizes its ring from its worker
+    // count). It stays validated so existing scripts keep the same errors.
 
     d->radius = (tbsize - 1) / 2;
     d->block_step = sbsize - sosize;
@@ -1913,14 +1151,12 @@ static void VS_CC DftCreate(
     const int subH = fmt.subSamplingH;
 
     // Per-plane geometry
-    VkDeviceSize upload_sum = 0;
-    VkDeviceSize download_sum = 0;
-    VkDeviceSize padded_sum = 0;
-    VkDeviceSize spatial_sum = 0;
+    bool any_plane = false;
     for (int plane = 0; plane < num_planes; ++plane) {
         if (!d->process[plane]) {
             continue;
         }
+        any_plane = true;
         auto & cfg = d->planes[plane];
         cfg.width = (plane == 0) ? d->vi->width : d->vi->width >> subW;
         cfg.height = (plane == 0) ? d->vi->height : d->vi->height >> subH;
@@ -1939,48 +1175,19 @@ static void VS_CC DftCreate(
 
         const VkDeviceSize pad_elems = static_cast<VkDeviceSize>(cfg.pw) * cfg.ph;
         const VkDeviceSize nblk = cfg.num_blocks;
-
-        cfg.upload_offset = upload_sum;
-        cfg.upload_bytes = static_cast<VkDeviceSize>(d->tw) * cfg.height * cfg.width * d->bytes;
-        upload_sum += cfg.upload_bytes;
-
-        cfg.padded_offset = padded_sum;
-        cfg.padded_bytes = static_cast<VkDeviceSize>(d->tw) * pad_elems * d->bytes;
-        padded_sum += cfg.padded_bytes;
-
-        cfg.download_offset = download_sum;
-        cfg.download_bytes = static_cast<VkDeviceSize>(cfg.height) * cfg.width * d->bytes;
-        download_sum += cfg.download_bytes;
-
-        cfg.spatial_offset = spatial_sum;
-        spatial_sum += nblk * 256;           // floats (center slice only)
-
-        cfg.slot_plane_bytes = pad_elems * d->bytes;
+        cfg.padded_bytes = static_cast<VkDeviceSize>(d->tw) * pad_elems * d->elem_bytes;
+        cfg.spatial_bytes = nblk * 256 * sizeof(float);
 
         // Every region below is addressed by an int32 push constant, so bound
-        // each per-plane region in the units the shader actually uses: bytes
-        // for the padded/download/upload bases, float elements for spatial.
+        // each per-plane region in the units the shader actually uses.
         if (d->tw * pad_elems >= (1ll << 31) ||
-            cfg.upload_bytes >= (1ll << 31) ||
             cfg.padded_bytes >= (1ll << 31) ||
-            cfg.slot_plane_bytes >= (1ll << 31) ||
             nblk * 256 >= (1ll << 31)) {
             return set_error("frame too large (a plane region exceeds the 2^31 addressing limit).");
         }
     }
-    if (upload_sum == 0) {
+    if (!any_plane) {
         return set_error("no planes to process.");
-    }
-    d->upload_total = (upload_sum + 31) & ~VkDeviceSize(31);
-    d->download_total = (download_sum + 31) & ~VkDeviceSize(31);
-    d->padded_total = (padded_sum + 31) & ~VkDeviceSize(31);
-    d->spatial_total = (spatial_sum + 7) & ~VkDeviceSize(7);
-    // dst_base is upload_total + the plane's download offset, so the two sums
-    // together (not just each one) have to stay inside int32.
-    if (upload_sum >= (1ull << 31) || download_sum >= (1ull << 31) ||
-        padded_sum >= (1ull << 31) || spatial_sum >= (1ull << 31) ||
-        d->upload_total + download_sum >= (1ull << 31)) {
-        return set_error("frame too large (a buffer region exceeds the 2^31 addressing limit).");
     }
 
     const auto window = getWindow(d->radius, d->block_step, swin, sbeta, twin, tbeta);
@@ -2096,119 +1303,33 @@ static void VS_CC DftCreate(
     }
 
     {
-        const auto result = get_device(device_id);
+        const auto result = get_gpu_device(core, vsapi);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
-        d->device = std::get<std::shared_ptr<VK_Device>>(result);
-    }
-
-    if (auto e = require_vulkan_1_3(*d->device, "DFTTest")) {
-        return set_error(*e);
-    }
-
-    VkDevice dev = d->device->device;
-
-    // In-flight depth: two resources are enough to keep the GPU fed (one
-    // frame's fused+col2im runs while the next frame uploads/records/submits
-    // on the host); deeper pools only add VRAM (~142 MiB per resource at
-    // 1080p GRAY16: tw padded slices + the num_blocks*256 float spatial
-    // buffer). Measured 2026-09-08 (RX 7900XTX, real-clip cached bench):
-    // S=2 keeps 99.5% of S=8 throughput (994 vs 1000 fps ns=1, 1096 vs 1101
-    // ns=4, chained x3/x5 equal-or-faster) at ~1/4 the VRAM (306 vs 1182
-    // MiB). A single in-flight frame cannot overlap host work with GPU work
-    // (~640 vs ~1000 fps), hence the floor of 2. An explicit num_streams
-    // above the floor is still honoured (deeper ticket + more queues).
-    int effective_streams = std::max(d->num_streams, 2);
-    if (const int es = env_int("VSFEEL_DFTTEST_STREAMS", 0); es > 0) {
-        effective_streams = es;
-    }
-
-    // frame-cache slots: a slot holds one padded source plane; K must exceed the
-    // number of distinct source frames in flight (S-1 behind + 1 ahead + reuse).
-    // Slot-direct fused reads the slots in place, so a whole temporal window
-    // must fit when processing serially: keep at least tw slots so the
-    // direct-pad fallback stays a rare out-of-order path, not the norm.
-    d->slot_count = std::max(effective_streams + 3, d->tw);
-    {
-        VkDeviceSize slot_sum = 0;
-        for (int plane = 0; plane < num_planes; ++plane) {
-            if (!d->process[plane]) {
-                continue;
-            }
-            auto & cfg = d->planes[plane];
-            cfg.slot_offset = slot_sum;
-            slot_sum += static_cast<VkDeviceSize>(d->slot_count) * cfg.slot_plane_bytes;
-        }
-        d->slot_total = (slot_sum + 31) & ~VkDeviceSize(31);
-        // slot_base[] is an int32 byte offset into the slot buffer and the
-        // fused-direct variant has no fallback guard, so the whole cache has
-        // to fit inside int32.
-        if (d->slot_total >= (1ull << 31)) {
-            return set_error("frame too large (the slot cache exceeds the 2^31 "
-                             "addressing limit; lower num_streams or the temporal radius).");
-        }
+        d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
     }
 
     // ------------------------------------------------------------------
-    // Pipeline layout, descriptor set layout and descriptor pool
+    // Push-descriptor layout and pipeline layout
     // ------------------------------------------------------------------
+    // One descriptor set per dispatch through the push descriptor set: each
+    // recording rebinds its own view of the planes (binding 3 is a different
+    // source frame per pad dispatch), so nothing is allocated from a pool.
     {
-        VkDescriptorSetLayoutBinding bindings[5] {
-            { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        };
-
-        VkDescriptorSetLayoutCreateInfo layout_info {
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .bindingCount = 5,
-            .pBindings = bindings
-        };
-
-        checkVK(vkCreateDescriptorSetLayout(
-            d->device->device, &layout_info, nullptr, &d->set_layout));
+        const auto result = gpu_push_set_layout(*d->gpu, 5);
+        if (std::holds_alternative<std::string>(result)) {
+            return set_error(std::get<std::string>(result));
+        }
+        d->set_layout = std::get<VkDescriptorSetLayout>(result);
     }
     {
-        VkPushConstantRange push_constant_range {
-            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-            .offset = 0,
-            .size = sizeof(DftPushConstants)
-        };
-
-        VkPipelineLayoutCreateInfo pipeline_layout_info {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .setLayoutCount = 1,
-            .pSetLayouts = &d->set_layout,
-            .pushConstantRangeCount = 1,
-            .pPushConstantRanges = &push_constant_range
-        };
-
-        checkVK(vkCreatePipelineLayout(
-            d->device->device, &pipeline_layout_info, nullptr, &d->pipeline_layout));
-    }
-    {
-        VkDescriptorPoolSize pool_size {
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10 * static_cast<uint32_t>(effective_streams)
-        };
-
-        VkDescriptorPoolCreateInfo pool_info {
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .maxSets = 2 * static_cast<uint32_t>(effective_streams),
-            .poolSizeCount = 1,
-            .pPoolSizes = &pool_size
-        };
-
-        checkVK(vkCreateDescriptorPool(
-            d->device->device, &pool_info, nullptr, &d->desc_pool));
+        const auto result = gpu_pipeline_layout(*d->gpu, d->set_layout,
+            sizeof(DftPushConstants));
+        if (std::holds_alternative<std::string>(result)) {
+            return set_error(std::get<std::string>(result));
+        }
+        d->pipeline_layout = std::get<VkPipelineLayout>(result);
     }
 
     // ------------------------------------------------------------------
@@ -2219,180 +1340,89 @@ static void VS_CC DftCreate(
         const size_t n_freq = zmean ? static_cast<size_t>(d->tw) * 16 * 9 * 2 : 0;
         const size_t n_sigma = sigma_array.empty() ? 0 : static_cast<size_t>(d->tw) * 16 * 9;
 
-        d->wt_bytes = static_cast<VkDeviceSize>((n_window + n_freq + n_sigma) * sizeof(float));
-        d->wt_bytes = std::max<VkDeviceSize>(d->wt_bytes, 16);
+        VkDeviceSize wt_bytes = static_cast<VkDeviceSize>(
+            (n_window + n_freq + n_sigma) * sizeof(float));
+        wt_bytes = std::max<VkDeviceSize>(wt_bytes, 16);
         d->wf_base = zmean ? static_cast<int32_t>(n_window) : -1;
         d->sigma_base = !sigma_array.empty() ? static_cast<int32_t>(n_window + n_freq) : -1;
 
-        VkBufferCreateInfo buffer_info {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .size = d->wt_bytes,
-            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-            .queueFamilyIndexCount = 0,
-            .pQueueFamilyIndices = nullptr
-        };
-        checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &d->wt_buf));
-        {
-            const auto result = allocate_memory(*d->device, d->wt_buf,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->wt_mem = std::get<AllocatedMemory>(result).memory;
-            d->wt_type_index = std::get<AllocatedMemory>(result).type_index;
+        // Host visible and coherent, so a plain memcpy lands and no flush is
+        // needed; the table is tiny and read through L2 every frame.
+        auto e = gpu_make_buffer(*d->gpu, core, wt_bytes, d->wt,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!e.empty()) {
+            return set_error("window buffer: " + e);
         }
-        checkVK(vkMapMemory(dev, d->wt_mem, 0, d->wt_bytes, 0, reinterpret_cast<void **>(&d->wt_map)));
-
+        if (d->wt.mapped == nullptr) {
+            return set_error("window buffer is not host visible");
+        }
+        auto * map = static_cast<float *>(d->wt.mapped);
         for (size_t i = 0; i < n_window; ++i) {
-            d->wt_map[i] = static_cast<float>(window[i]);
+            map[i] = static_cast<float>(window[i]);
         }
         if (zmean) {
             for (size_t i = 0; i < n_freq; ++i) {
-                d->wt_map[n_window + i] = static_cast<float>(window_freq[i]);
+                map[n_window + i] = static_cast<float>(window_freq[i]);
             }
         }
         if (!sigma_array.empty()) {
             for (size_t i = 0; i < n_sigma; ++i) {
-                d->wt_map[n_window + n_freq + i] = static_cast<float>(sigma_array[i]);
+                map[n_window + n_freq + i] = static_cast<float>(sigma_array[i]);
             }
-        }
-
-        const bool wt_coherent =
-            !!(d->device->mem_props.memoryTypes[d->wt_type_index].propertyFlags &
-               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (!wt_coherent) {
-            VkMappedMemoryRange flush_range {
-                .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                .pNext = nullptr,
-                .memory = d->wt_mem,
-                .offset = 0,
-                .size = VK_WHOLE_SIZE
-            };
-            checkVK(vkFlushMappedMemoryRanges(dev, 1, &flush_range));
         }
     }
 
     // ------------------------------------------------------------------
-    // Shader modules and pipelines
+    // Pipelines
     // ------------------------------------------------------------------
     {
-        const uint32_t * pad_slot_code = nullptr;
-        size_t pad_slot_size = 0;
-        const uint32_t * pad_direct_code = nullptr;
-        size_t pad_direct_size = 0;
+        const uint32_t * pad_code = nullptr;
+        size_t pad_size = 0;
         const uint32_t * col2im_code = nullptr;
         size_t col2im_size = 0;
         const uint32_t * fused_code[4] {};
         size_t fused_size[4] {};
-        const uint32_t * fused_direct_code[4] {};
-        size_t fused_direct_size[4] {};
         switch (d->bits) {
             case 16:
-                pad_slot_code = dfttest_16_pad_slot_spv; pad_slot_size = dfttest_16_pad_slot_spv_size;
-                pad_direct_code = dfttest_16_pad_direct_spv; pad_direct_size = dfttest_16_pad_direct_spv_size;
+                pad_code = dfttest_16_pad_spv; pad_size = dfttest_16_pad_spv_size;
                 col2im_code = dfttest_16_col2im_spv; col2im_size = dfttest_16_col2im_spv_size;
                 fused_code[0] = dfttest_16_fused_r0_spv; fused_size[0] = dfttest_16_fused_r0_spv_size;
                 fused_code[1] = dfttest_16_fused_r1_spv; fused_size[1] = dfttest_16_fused_r1_spv_size;
                 fused_code[2] = dfttest_16_fused_r2_spv; fused_size[2] = dfttest_16_fused_r2_spv_size;
                 fused_code[3] = dfttest_16_fused_r3_spv; fused_size[3] = dfttest_16_fused_r3_spv_size;
-                fused_direct_code[0] = dfttest_16_fused_direct_r0_spv; fused_direct_size[0] = dfttest_16_fused_direct_r0_spv_size;
-                fused_direct_code[1] = dfttest_16_fused_direct_r1_spv; fused_direct_size[1] = dfttest_16_fused_direct_r1_spv_size;
-                fused_direct_code[2] = dfttest_16_fused_direct_r2_spv; fused_direct_size[2] = dfttest_16_fused_direct_r2_spv_size;
-                fused_direct_code[3] = dfttest_16_fused_direct_r3_spv; fused_direct_size[3] = dfttest_16_fused_direct_r3_spv_size;
                 break;
             case 32:
-                pad_slot_code = dfttest_32_pad_slot_spv; pad_slot_size = dfttest_32_pad_slot_spv_size;
-                pad_direct_code = dfttest_32_pad_direct_spv; pad_direct_size = dfttest_32_pad_direct_spv_size;
+                pad_code = dfttest_32_pad_spv; pad_size = dfttest_32_pad_spv_size;
                 col2im_code = dfttest_32_col2im_spv; col2im_size = dfttest_32_col2im_spv_size;
                 fused_code[0] = dfttest_32_fused_r0_spv; fused_size[0] = dfttest_32_fused_r0_spv_size;
                 fused_code[1] = dfttest_32_fused_r1_spv; fused_size[1] = dfttest_32_fused_r1_spv_size;
                 fused_code[2] = dfttest_32_fused_r2_spv; fused_size[2] = dfttest_32_fused_r2_spv_size;
                 fused_code[3] = dfttest_32_fused_r3_spv; fused_size[3] = dfttest_32_fused_r3_spv_size;
-                fused_direct_code[0] = dfttest_32_fused_direct_r0_spv; fused_direct_size[0] = dfttest_32_fused_direct_r0_spv_size;
-                fused_direct_code[1] = dfttest_32_fused_direct_r1_spv; fused_direct_size[1] = dfttest_32_fused_direct_r1_spv_size;
-                fused_direct_code[2] = dfttest_32_fused_direct_r2_spv; fused_direct_size[2] = dfttest_32_fused_direct_r2_spv_size;
-                fused_direct_code[3] = dfttest_32_fused_direct_r3_spv; fused_direct_size[3] = dfttest_32_fused_direct_r3_spv_size;
                 break;
             default:
                 return set_error("unsupported bit depth");
         }
 
         {
-            const auto result = create_shader_module(*d->device, pad_slot_code, pad_slot_size);
+            const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
+                pad_code, pad_size);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
-            d->pad_slot_module = std::get<VkShaderModule>(result);
-        }
-        {
-            const auto result = create_shader_module(*d->device, pad_direct_code, pad_direct_size);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->pad_direct_module = std::get<VkShaderModule>(result);
+            d->pad_pipeline = std::get<VkPipeline>(result);
         }
         for (int r = 0; r < 4; ++r) {
-            const auto result = create_shader_module(*d->device, fused_code[r], fused_size[r]);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->fused_module[r] = std::get<VkShaderModule>(result);
-        }
-        for (int r = 0; r < 4; ++r) {
-            const auto result = create_shader_module(*d->device, fused_direct_code[r], fused_direct_size[r]);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->fused_direct_module[r] = std::get<VkShaderModule>(result);
-        }
-        {
-            const auto result = create_shader_module(*d->device, col2im_code, col2im_size);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->col2im_module = std::get<VkShaderModule>(result);
-        }
-        {
-            const auto result = create_pipeline(*d->device, d->pad_slot_module, d->pipeline_layout,
-                d->device->subgroup_size_control ? 32 : 0);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->pad_slot_pipeline = std::get<VkPipeline>(result);
-        }
-        {
-            const auto result = create_pipeline(*d->device, d->pad_direct_module, d->pipeline_layout,
-                d->device->subgroup_size_control ? 32 : 0);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->pad_direct_pipeline = std::get<VkPipeline>(result);
-        }
-        for (int r = 0; r < 4; ++r) {
-            const auto result = create_pipeline(*d->device, d->fused_module[r], d->pipeline_layout,
-                d->device->subgroup_size_control ? 32 : 0, d->filter_type,
-                d->zmean ? 1 : 0);
+            const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
+                fused_code[r], fused_size[r], d->filter_type, d->zmean ? 1 : 0);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
             d->fused_pipeline[r] = std::get<VkPipeline>(result);
         }
-        for (int r = 0; r < 4; ++r) {
-            const auto result = create_pipeline(*d->device, d->fused_direct_module[r], d->pipeline_layout,
-                d->device->subgroup_size_control ? 32 : 0, d->filter_type,
-                d->zmean ? 1 : 0);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->fused_direct_pipeline[r] = std::get<VkPipeline>(result);
-        }
         {
-            const auto result = create_pipeline(*d->device, d->col2im_module, d->pipeline_layout,
-                d->device->subgroup_size_control ? 32 : 0);
+            const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
+                col2im_code, col2im_size);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -2401,421 +1431,102 @@ static void VS_CC DftCreate(
     }
 
     // ------------------------------------------------------------------
-    // Buffers and resources
+    // The output plane stride has to be known before the frame path runs: the
+    // core's GPU frames keep the CPU stride, so it is read off a scratch CPU
+    // frame here and re-read per frame (getStride applies to both).
     // ------------------------------------------------------------------
-    const VkDeviceSize min_size = 4;
-    // The dump path copies one whole padded plane into staging. Reserve a third
-    // region for it, past upload and download, or the copy would clobber the
-    // download and overflow the allocation (VUID-vkCmdCopyBuffer-size-00116,
-    // which faults the GPU). Only when the debug flag is set.
-    VkDeviceSize staging_size = std::max(d->upload_total + d->download_total, 2 * min_size);
-    if (env_flag("VSFEEL_DFTTEST_DUMP_PAD")) {
-        staging_size += std::max(d->padded_total, min_size);
-    }
-    d->staging_total = staging_size;
-    const VkDeviceSize padded_size = std::max(d->padded_total, min_size);
-    const VkDeviceSize spatial_size = std::max<VkDeviceSize>(
-        d->spatial_total * sizeof(float), min_size);
-
-    d->pool.semaphore.current.store(effective_streams - 1, std::memory_order::relaxed);
-    d->pool.reserve(effective_streams);
-
-    // ---- frame-cache slot buffer (semaphores are created per generation) ----
     {
-        const VkDeviceSize slot_size = std::max(d->slot_total, VkDeviceSize(4));
-        VkBufferCreateInfo buffer_info {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .size = slot_size,
-            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-            .queueFamilyIndexCount = 0,
-            .pQueueFamilyIndices = nullptr
+        VSFrame * probe = vsapi->newVideoFrame(&fmt, d->vi->width, d->vi->height,
+                                               nullptr, core);
+        if (probe == nullptr) {
+            return set_error("could not allocate a probe frame to read the plane stride");
+        }
+        for (int plane = 0; plane < num_planes; ++plane) {
+            if (!d->process[plane]) {
+                continue;
+            }
+            const auto & cfg = d->planes[plane];
+            const int stride = static_cast<int>(vsapi->getStride(probe, plane) / d->elem_bytes);
+            const int64_t last = static_cast<int64_t>(cfg.height - 1) * stride +
+                cfg.width - 1;
+            if (last > INT32_MAX) {
+                vsapi->freeFrame(probe);
+                return set_error("plane " + std::to_string(plane) + " is too large: " +
+                    std::to_string(cfg.width) + "x" + std::to_string(cfg.height) +
+                    " at stride " + std::to_string(stride) +
+                    " overflows the kernel's 32-bit addressing");
+            }
+        }
+        vsapi->freeFrame(probe);
+    }
+
+    {
+        char err[512] {};
+        d->pool = d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
+        if (d->pool == nullptr) {
+            return set_error("createGPUExecPool failed: "s + err);
+        }
+    }
+
+    // GPU-timing probe: only when the queue family can timestamp at all, since
+    // vkCmdWriteTimestamp2 there is invalid usage and a driver taking one can
+    // hang the engine.
+    d->gpu_trace_frame = env_int("VSFEEL_DFFTEST_GPUTRACE", 100);
+    d->gpu_trace = vsfeel_debug_probe("VSFEEL_DFFTEST_GPUTRACE") &&
+        vsfeel_probe_timestamps(*d->gpu, "DFTTest");
+    if (d->gpu_trace) {
+        VkQueryPoolCreateInfo qp_info {
+            .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType = VK_QUERY_TYPE_TIMESTAMP,
+            .queryCount = 4
         };
-        checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &d->slot_buf));
-        const auto result = allocate_memory(
-            *d->device, d->slot_buf, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (std::holds_alternative<std::string>(result)) {
-            return set_error(std::get<std::string>(result));
+        if (d->gpu->vk->vkCreateQueryPool(d->gpu->device, &qp_info, nullptr,
+                &d->probe.query) != VK_SUCCESS) {
+            d->probe.query = VK_NULL_HANDLE;
+            d->gpu_trace = false;
         }
-        d->slot_mem = std::get<AllocatedMemory>(result).memory;
-
-        d->slots.resize(num_planes * d->slot_count);
     }
-
-    // Queue sharing is swept independently of the stream count (see
-    // resolve_queue_cap): override with VSFEEL_DFTTEST_QUEUES=N. The cap is
-    // resolved from the in-flight stream count (effective_streams), not the
-    // user's num_streams, so the knob is reachable at the shipped default.
-    const uint32_t num_queues = resolve_queue_cap(effective_streams, d->device->queue_count, "VSFEEL_DFFTEST_QUEUES", 2);
-
-    for (int i = 0; i < effective_streams; ++i) {
-        // Owned by the pool while it is being built: a mid-loop error return
-        // tears it down in ~DftData instead of leaking it (see
-        // FramePool::emplace).
-        DFTTestResource & resource = d->pool.emplace();
-
-        {
-            VkBufferCreateInfo buffer_info {
-                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .size = staging_size,
-                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = nullptr
-            };
-            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.staging));
-        }
-        {
-            const auto result = allocate_memory(
-                *d->device, resource.staging,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            resource.staging_mem = std::get<AllocatedMemory>(result).memory;
-            resource.staging_type_index = std::get<AllocatedMemory>(result).type_index;
-        }
-
-        // ReBAR upload buffer: host-mapped VRAM the CPU writes directly.
-        // Falls back (up_direct=false, staging upload region is used) when
-        // the buffer cannot be backed by host-visible *and coherent*
-        // device-local memory: this path is a plain CPU memcpy with no flush, so
-        // a non-coherent type would feed the pad stale bytes.
-        // Opt out with VSFEEL_DFTTEST_UPDIRECT=0.
-        {
-            const bool want_direct = env_int("VSFEEL_DFTTEST_UPDIRECT", 1) != 0;
-            resource.up_direct = false;
-            if (want_direct && d->upload_total > 0) {
-                VkBufferCreateInfo up_info {
-                    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                    .pNext = nullptr,
-                    .flags = 0,
-                    .size = std::max(d->upload_total, VkDeviceSize(4)),
-                    .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                    .queueFamilyIndexCount = 0,
-                    .pQueueFamilyIndices = nullptr
-                };
-                checkVK(vkCreateBuffer(dev, &up_info, nullptr, &resource.up_buf));
-                const auto up_result = allocate_memory(
-                    *d->device, resource.up_buf,
-                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                if (!std::holds_alternative<std::string>(up_result)) {
-                    const uint32_t ti = std::get<AllocatedMemory>(up_result).type_index;
-                    const auto flags =
-                        d->device->mem_props.memoryTypes[ti].propertyFlags;
-                    if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
-                        (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
-                        (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-                        resource.up_mem = std::get<AllocatedMemory>(up_result).memory;
-                        checkVK(vkMapMemory(dev, resource.up_mem, 0,
-                            std::max(d->upload_total, VkDeviceSize(4)), 0,
-                            &resource.up_map));
-                        resource.up_direct = true;
-                    } else {
-                        vkFreeMemory(dev, std::get<AllocatedMemory>(up_result).memory,
-                            nullptr);
-                        vkDestroyBuffer(dev, resource.up_buf, nullptr);
-                        resource.up_buf = VK_NULL_HANDLE;
-                    }
-                } else {
-                    vkDestroyBuffer(dev, resource.up_buf, nullptr);
-                    resource.up_buf = VK_NULL_HANDLE;
-                }
-            }
-            if (i == 0) {
-                d->up_direct_ok = resource.up_direct;
-                if (vsfeel_debug_flag("VSFEEL_DFTTEST_DBG")) {
-                    fprintf(stderr, "[dfttest] up_direct=%d\n", resource.up_direct ? 1 : 0);
-                }
-            }
-        }
-
-        {
-            VkBufferCreateInfo buffer_info {
-                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .size = padded_size,
-                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = nullptr
-            };
-            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.padded_buf));
-        }
-        {
-            const auto result = allocate_memory(
-                *d->device, resource.padded_buf, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            resource.padded_mem = std::get<AllocatedMemory>(result).memory;
-        }
-
-        {
-            VkBufferCreateInfo buffer_info {
-                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .size = spatial_size,
-                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = nullptr
-            };
-            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.spatial_buf));
-        }
-        {
-            const auto result = allocate_memory(
-                *d->device, resource.spatial_buf, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            resource.spatial_mem = std::get<AllocatedMemory>(result).memory;
-        }
-
-        {
-            VkCommandPoolCreateInfo pool_info {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-                .pNext = nullptr,
-                // this filter re-records its command buffers every frame
-                // (pad/fused/col2im); implicit reset at vkBeginCommandBuffer
-                // requires the pool flag, otherwise the buffer must be in the
-                // initial state (VUID-vkBeginCommandBuffer-commandBuffer-00050)
-                .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-                .queueFamilyIndex = d->device->queue_family
-            };
-            checkVK(vkCreateCommandPool(dev, &pool_info, nullptr, &resource.pool));
-        }
-        {
-            const uint32_t n_pad = static_cast<uint32_t>(d->tw) * num_planes;
-            VkCommandBufferAllocateInfo alloc_info {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                .pNext = nullptr,
-                .commandPool = resource.pool,
-                .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                .commandBufferCount = 1 + n_pad
-            };
-            std::vector<VkCommandBuffer> cbs(1 + n_pad);
-            checkVK(vkAllocateCommandBuffers(dev, &alloc_info, cbs.data()));
-            resource.cmd = cbs[0];
-            resource.cmd_pad.assign(cbs.begin() + 1, cbs.end());
-        }
-        {
-            VkFenceCreateInfo fence_info {
-                .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0
-            };
-            checkVK(vkCreateFence(dev, &fence_info, nullptr, &resource.fence));
-        }
-        // Timestamp query pool + host-readable result buffer (qbench only;
-        // allocated always — 8×8 B + query pool object is negligible).
-        if (vsfeel_probe_timestamps(*d->device, "DFTTest")) {
-            VkQueryPoolCreateInfo qpool_info {
-                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .queryType = VK_QUERY_TYPE_TIMESTAMP,
-                .queryCount = 8,
-                .pipelineStatistics = 0
-            };
-            checkVK(vkCreateQueryPool(dev, &qpool_info, nullptr, &resource.qpool));
-        }
-        {
-            VkBufferCreateInfo buffer_info {
-                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .size = 8 * sizeof(uint64_t),
-                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = nullptr
-            };
-            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.qbuf));
-        }
-        {
-            const auto result = allocate_memory(
-                *d->device, resource.qbuf,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            resource.qmem = std::get<AllocatedMemory>(result).memory;
-        }
-        checkVK(vkMapMemory(dev, resource.qmem, 0, 8 * sizeof(uint64_t), 0,
-            reinterpret_cast<void **>(&resource.qmap)));
-        resource.id = i;
-        d->res_meta.push_back(std::make_unique<ResMeta>());
-        {
-            VkDescriptorSetAllocateInfo alloc_info {
-                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                .pNext = nullptr,
-                .descriptorPool = d->desc_pool,
-                .descriptorSetCount = 1,
-                .pSetLayouts = &d->set_layout
-            };
-            checkVK(vkAllocateDescriptorSets(dev, &alloc_info, &resource.desc_set));
-            checkVK(vkAllocateDescriptorSets(dev, &alloc_info, &resource.pad_set));
-        }
-
-        {
-            VkDescriptorBufferInfo wt_info {
-                .buffer = d->wt_buf,
-                .offset = 0,
-                .range = VK_WHOLE_SIZE
-            };
-            VkDescriptorBufferInfo staging_info {
-                .buffer = resource.staging,
-                .offset = 0,
-                .range = staging_size
-            };
-            VkDescriptorBufferInfo upload_info {
-                .buffer = resource.up_direct ? resource.up_buf : resource.staging,
-                .offset = 0,
-                .range = VK_WHOLE_SIZE
-            };
-            VkDescriptorBufferInfo spatial_info {
-                .buffer = resource.spatial_buf,
-                .offset = 0,
-                .range = VK_WHOLE_SIZE
-            };
-            VkDescriptorBufferInfo padded_info {
-                .buffer = resource.padded_buf,
-                .offset = 0,
-                .range = VK_WHOLE_SIZE
-            };
-            VkDescriptorBufferInfo slot_info {
-                .buffer = d->slot_buf,
-                .offset = 0,
-                .range = VK_WHOLE_SIZE
-            };
-
-            VkWriteDescriptorSet writes[5] {
-                {
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext = nullptr,
-                    .dstSet = resource.desc_set,
-                    .dstBinding = 0,
-                    .dstArrayElement = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pImageInfo = nullptr,
-                    .pBufferInfo = &wt_info,
-                    .pTexelBufferView = nullptr
-                },
-                {
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext = nullptr,
-                    .dstSet = resource.desc_set,
-                    .dstBinding = 1,
-                    .dstArrayElement = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pImageInfo = nullptr,
-                    .pBufferInfo = &staging_info,
-                    .pTexelBufferView = nullptr
-                },
-                {
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext = nullptr,
-                    .dstSet = resource.desc_set,
-                    .dstBinding = 2,
-                    .dstArrayElement = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pImageInfo = nullptr,
-                    .pBufferInfo = &spatial_info,
-                    .pTexelBufferView = nullptr
-                },
-                {
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext = nullptr,
-                    .dstSet = resource.desc_set,
-                    .dstBinding = 3,
-                    .dstArrayElement = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pImageInfo = nullptr,
-                    .pBufferInfo = &padded_info,
-                    .pTexelBufferView = nullptr
-                },
-                {
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext = nullptr,
-                    .dstSet = resource.desc_set,
-                    .dstBinding = 4,
-                    .dstArrayElement = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pImageInfo = nullptr,
-                    .pBufferInfo = &slot_info,
-                    .pTexelBufferView = nullptr
-                },
-            };
-
-            vkUpdateDescriptorSets(dev, 5, writes, 0, nullptr);
-
-            VkWriteDescriptorSet pad_write {
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .pNext = nullptr,
-                .dstSet = resource.pad_set,
-                .dstBinding = 1,
-                .dstArrayElement = 0,
-                .descriptorCount = 1,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .pImageInfo = nullptr,
-                .pBufferInfo = &upload_info,
-                .pTexelBufferView = nullptr
-            };
-            // pad_set shares bindings 0/2/3/4 with desc_set; only binding 1
-            // (upload reads) differs. Copy the rest, then override binding 1.
-            VkCopyDescriptorSet copies[1] {
-                {
-                    .sType = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET,
-                    .pNext = nullptr,
-                    .srcSet = resource.desc_set,
-                    .srcBinding = 0,
-                    .srcArrayElement = 0,
-                    .dstSet = resource.pad_set,
-                    .dstBinding = 0,
-                    .dstArrayElement = 0,
-                    .descriptorCount = 5
-                }
-            };
-            vkUpdateDescriptorSets(dev, 0, nullptr, 1, copies);
-            vkUpdateDescriptorSets(dev, 1, &pad_write, 0, nullptr);
-        }
-
-        checkVK(vkMapMemory(dev, resource.staging_mem, 0, staging_size, 0, reinterpret_cast<void **>(&resource.map)));
-
-        resource.queue = d->device->queues[i % num_queues].queue;
-        resource.queue_lock = d->device->queues[i % num_queues].lock.get();
-
-        if (const auto err = record_fused_col2im_cb(*d, resource, true, true)) {
-            return set_error(*err);
+    if (d->gpu_trace) {
+        auto e = gpu_make_buffer(*d->gpu, core, 4 * sizeof(uint64_t), d->probe.buf,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            0, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (!e.empty() || d->probe.buf.mapped == nullptr) {
+            d->gpu_trace = false;
+        } else {
+            d->probe.map = static_cast<uint64_t *>(d->probe.buf.mapped);
         }
     }
 
-    VSFilterDependency deps[1] = {
-        { d->node, d->radius > 0 ? rpGeneral : rpStrictSpatial }
-    };
+    if (vsfeel_debug_flag("VSFEEL_DFTTEST_VRAM")) {
+        VkDeviceSize per_frame = 0;
+        for (int plane = 0; plane < num_planes; ++plane) {
+            if (d->process[plane]) {
+                per_frame += d->planes[plane].padded_bytes + d->planes[plane].spatial_bytes;
+            }
+        }
+        fprintf(stderr, "[dfttest] %.1f MiB per in-flight frame "
+                        "(%d planes, tw=%d, %u bytes); tw is re-padded every frame\n",
+            per_frame / (1024.0 * 1024.0), num_planes, d->tw,
+            static_cast<unsigned>(per_frame));
+    }
 
     DftData *data = d.release();
 
-    vsapi->createVideoFilter(
-        out, "DFTTest", data->vi,
-        DftGetFrame, DftFree,
-        fmParallel, deps, 1, data, core);
+    VSFilterDependency deps[1] = {
+        { data->node, data->radius > 0 ? rpGeneral : rpStrictSpatial }
+    };
+
+    // ffGPUOutput: the frames this filter returns live in VRAM and carry their
+    // own producer pairs, so the core never downloads them for a consumer that
+    // does not need host pixels.
+    VSNode * result = vsapi->createVideoFilterEx2(
+        "DFTTest", data->vi, DftGetFrame, DftFree,
+        fmParallel, ffGPUOutput, deps, 1, data, core);
+    if (result == nullptr) {
+        vsapi->mapSetError(out, "DFTTest: filter creation failed");
+        return;
+    }
+    vsapi->mapConsumeNode(out, "clip", result, maAppend);
 }
 
 // ---------------------------------------------------------------------------
@@ -2823,9 +1534,12 @@ static void VS_CC DftCreate(
 // ---------------------------------------------------------------------------
 
 void vsfeel_register_dfttest(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
+    // Under the R80 GPU API both the input and the output are GPU resident: the
+    // core inserts the upload for a CPU clip and a GPUDownload for a CPU
+    // consumer, so the filter itself never moves a frame.
     vspapi->registerFunction(
         "DFTTest",
-        "clip:vnode;"
+        "clip:vnode:gpu;"
         "ftype:int:opt;"
         "sigma:float:opt;"
         "sigma2:float:opt;"
@@ -2848,7 +1562,7 @@ void vsfeel_register_dfttest(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
         "planes:int[]:opt;"
         "device_id:int:opt;"
         "num_streams:int:opt;",
-        "clip:vnode;",
+        "clip:vnode:gpu;",
         DftCreate, nullptr, plugin
     );
 }

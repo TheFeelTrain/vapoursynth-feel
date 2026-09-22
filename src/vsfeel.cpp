@@ -1020,6 +1020,8 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
             dev->queue_family, dev->timestamp_valid_bits, dev->subgroup_size,
             dev->min_subgroup_size, dev->max_subgroup_size,
             static_cast<unsigned long long>(dev->max_storage_buffer_range));
+        fprintf(stderr, "[vsfeel] transfer queue family %u index %u\n",
+            handles.transferQueueFamily, handles.transferQueueIndex);
         fprintf(stderr, "[vsfeel] optional features: float16=%d float64=%d float32Atomics=%d\n",
             dev->feat_float16, dev->feat_float64, dev->feat_atomic_float32_add);
     }

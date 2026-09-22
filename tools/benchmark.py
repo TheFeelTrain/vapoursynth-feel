@@ -758,6 +758,9 @@ FILTERS: dict[str, FilterSpec] = {
         build=_dfttest_build,
         input="depth(get_y(clip), 16)",
         default_streams=1,
+        # vsfeel's DFTTest runs on the R80 GPU API (vnode:gpu in/out); the
+        # references are CPU filters.
+        gpu_plugins=frozenset({"vsfeel"}),
     ),
     "nlmeans": FilterSpec(
         title="NLMeans",

@@ -53,7 +53,7 @@ def test_bm3d_runs_via_jetpack(noise_gray):
 def test_dfttest_runs_via_jetpack(noise_gray):
     dft = DFTTest(noise_gray, backend=_backend())
     out = dft.denoise({0.0: 16.0, 0.5: 8.0, 1.0: 0.0}, tr=1)
-    assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
+    assert np.isfinite(frame_to_ndarray(cpu_node(out).get_frame(0))).all()
 
 
 def test_eedi3_runs_via_vsaa(noise_gray):

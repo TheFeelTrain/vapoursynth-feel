@@ -35,6 +35,32 @@ order-alternated same-session reps through `tools/benchmark.py`:
 
 - The R80 figure is the same in both rows (1649 vs 1654): the timed unit is a CPU
   sink, so the upload is free and only the output `GPUDownload` costs.
+- **Root cause of the exposed download, and why it cannot be fixed in-filter:
+  the core runs one Vulkan queue on this device.** `vsvulkan.cpp:729-735` only
+  recognises a family with `TRANSFER` and *neither* `COMPUTE` nor `GRAPHICS` as a
+  transfer family; that is the only thing that makes `transferPtr`/`downloadPtr`
+  diverge from `computeQ` (`vsvulkan.cpp:882-895`, defaults at
+  `vsvulkan.h:754-755`). RADV NAVI31 has no such family (family 0 =
+  gfx+compute+transfer, family 1 = compute+transfer), so the device is created
+  with `queueCount = 1` (`vsvulkan.cpp:740-744`) and every submission in the
+  process — every filter dispatch, every upload, every download — reaches that
+  one `VkQueue` in submission order. `downloadPlanes` therefore records its
+  `vkCmdCopyBuffer2` (`vsvulkanframe.cpp:445`) on the same queue as our kernels
+  and it cannot overlap them: per frame it is kernel + copy, which is why more
+  streams, batching and even a second vspipe process all measure flat.
+- **`GPUDownload` is the only asymmetric leg.** On ReBAR the upload is a plain
+  memcpy into the mapped plane with no submission at all
+  (`vsvulkanframe.cpp:259-276`), so it is free. The download cannot take its
+  direct path: that requires `HOST_CACHED` plane memory
+  (`vsvulkanframe.cpp:363-367`), and a discrete card's planes are
+  `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` but not cached (reading the BAR runs
+  at 0.02 GB/s). It therefore stages: `stride*height` bytes VRAM → a cached host
+  readback slot (4 slots, `vscore.cpp:1491`; slot memory at
+  `vsvulkanframe.cpp:185-193`) by a GPU copy, then a host memcpy. At 1080p u16
+  that is 4.1 MB ≈ 0.10–0.16 ms at PCIe speed — the measured gap (0.606 vs
+  0.507 ms). The pre-R80 build issued no copy at all (its kernel's stores went
+  straight to host memory) and had all four queues of family 1
+  (`vsfeel.cpp:481-516`), which is where the whole difference lives.
 - **The kernel is not the regression — it is ISA-identical.** `RADV_DEBUG=shaderstats`
   (R=9, BITS=16, pipeline cache off): new 3101 instructions / 14700 B code / 192
   VGPR / 0 spill; pre-R80 3102 / 14708 / 192 / 0. `glslc -O` output is 315 vs 321
@@ -164,6 +190,30 @@ filter.
 - The CPU-sink cost is the core's `GPUDownload`; there is no in-filter lever.
   Measure a GPU-resident chain (`--gpu-cache`) before concluding anything about
   the filter's own throughput.
+- **The fix for the exposed download is core-side, not plugin-side.** Before
+  anything else, the core should create more than one queue from a compute family
+  that has them (this device's family 1 has four; the pre-R80 plugin device made
+  all four, `vsfeel.cpp:481-516`) and put `downloadPool` on the second, the way
+  `downloadPtr` already does for devices with a dedicated transfer family. A
+  plugin cannot do it: `vkCreateDevice` was given one queue, so no second
+  `VkQueue` exists to submit the copy to, and `vqTransfer` resolves to the same
+  queue (`vsvulkan.h:452-462`).
+- **That core fix was built and measured (2026-09-21).** A local core with the
+  second compute-family queue wired to `downloadQ` (2 queues requested from
+  family 1; buffer sharing deliberately left `EXCLUSIVE` since both queues are
+  one family) passes the full suite (800) and changes the numbers like this,
+  interleaved same-session, 1080p GRAY16, `-r 8`:
+  - core-only `GPUUpload → GPUDownload` + k `BoxBlur(r=96)`: T1 1059 → **1541 fps
+    (+45%)**, and the download's exposed fixed cost goes from +0.152 ms to fully
+    hidden — the fix does what it says.
+  - Bilateral: 1660 → 1715 fps (**+3.3%**), flat ±1% across `-r` 4…32 (−1% at
+    `-r` 2).
+  So a second queue only pays when the kernel leaves the GPU with idle capacity
+  to fill. Bilateral's R=9 dispatch keeps it 93–97% busy, so the download copy
+  still competes for the same GPU rather than hiding behind it; the 16% is not
+  recovered. Do not expect this fix to close the CPU-sink gap for this filter.
+  The patched core is installed on this box with the stock one kept at
+  `tmp/libvapoursynth.so.4.orig`.
 - **EEDI3-style batching is a measured dead end here; do not implement it.**
   EEDI3 batched because one row dispatch (1080 small workgroups of a
   latency-bound scan) left the GPU under-occupied, so stacking frames' dispatches

@@ -32,20 +32,23 @@ import vapoursynth as vs
 from conftest import (
     WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_changes_on_noise,
     assert_preserves_frame_props, assert_temporal_order_consistent,
-    check_all_frames_finite, compare_or_skip, eval_parallel, frame_to_ndarray,
-    plane as _plane, reference_compare, reference_or_skip, reference_spec,
+    check_all_frames_finite, compare_or_skip, cpu_node, eval_parallel,
+    frame_to_ndarray, plane as _plane, reference_compare, reference_or_skip,
+    reference_spec,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
 
 def _run(clip, tbsize=3, num_streams=1, **kwargs):
-    return vs.core.vsfeel.DFTTest(
+    # DFTTest runs on the R80 GPU API (vnode:gpu in/out), so every test that
+    # reads pixels goes through std.GPUDownload first (see conftest.cpu_node).
+    return cpu_node(vs.core.vsfeel.DFTTest(
         clip,
         tbsize=tbsize,
         num_streams=num_streams,
         **kwargs,
-    )
+    ))
 
 
 def _ref_compare(fmt, params, frames=(0, 11, 23), planes=None):
@@ -135,13 +138,10 @@ def test_dfttest_parallel_load_consistent_16bit(noise_16bit):
 @pytest.mark.parametrize("bits", [None, 16], ids=["32bit", "16bit"])
 def test_dfttest_vspipe_pipelined_no_hang(num_streams, bits):
     """vspipe's pipelined reader plus VapourSynth's prefetch activate frames
-    11+ ahead of the in-flight frames. With the old batched pad submit, a
-    reader's copy submit could land on the queue before the padder's pad
-    submit; RADV stalls the queue behind the unsignaled semaphore wait and
-    the whole run hangs with the GPU idle. Pads are now submitted at claim
-    time (before any dependent reader can commit), so the backward
-    dependency is structurally impossible — this test times out if it
-    regresses.
+    11+ ahead of the in-flight frames, the request pattern that used to stall
+    the queue behind an unsignaled slot semaphore. Under the R80 GPU API every
+    submission's ordering comes from the core's exec pool and producer pairs,
+    so this test times out if that pipelining regresses.
 
     Runs the real benchmark as a subprocess (synthetic BlankClip, the
     reproducer's workload) so that vspipe's reader, not a Python get_frame
@@ -171,33 +171,25 @@ def test_dfttest_vspipe_pipelined_no_hang(num_streams, bits):
 
 @pytest.mark.parametrize("chained", [3])
 def test_dfttest_vspipe_pipelined_chained_no_hang_16bit(chained, tmp_path):
-    """Chained DFTTest instances streamed through vspipe must not deadlock
-    (regression for the timeline-semaphore frame-cache fix).
+    """Chained DFTTest instances streamed through vspipe must not deadlock.
 
     User-reported bug: chaining DFTTest instances deadlocks at 3+ ("1 or 2
-    works but 3 or higher does not"). With binary slot semaphores one pad
-    signal serves exactly one reader; when an upstream frame is processed
-    again while a previous processing of it is still in flight, the second
-    consumer's copy submit waits on an already-consumed semaphore. RADV
-    stalls the queue and the run hangs with the GPU idle.
-
-    The slots now signal a timeline semaphore to a fresh per-generation
-    value, and timeline waits are non-destructive: any number of copies may
-    wait on one value, so a second consumer can never starve. This test
-    drives the exact user scenario — N chained instances on a synthetic
-    GRAY16 clip via vspipe's pipelined reader — and fails on a hang
+    works but 3 or higher does not"). The pre-R80 frame cache signalled one
+    binary semaphore per pad, so an upstream frame processed again while a
+    previous processing was still in flight left the second consumer waiting
+    on an already-consumed signal; RADV stalls the queue and the run hangs
+    with the GPU idle. Under the R80 GPU API the filter holds no cross-frame
+    state at all — every frame is padded and filtered in its own submission
+    and the core's producer pairs carry the ordering — so this now guards the
+    same scenario against a regression in that pipeline, and fails on a hang
     (timeout) or a non-zero exit.
 
     The probe line inside the chain loop is the reload trigger: wrapper
     libraries (e.g. vsdenoise's check_progressive) sample a frame of each
     intermediate node while the script evaluates, and the streaming pass
     then re-requests those frames while the probe's processing is still
-    in flight — the "processed again while in flight" condition fires at
-    frame 0. Without the probe the old plugin only stalled after tens of
-    thousands of frames (timing-dependent, 9k-37k observed), which made a
-    short test flaky. With the probe the pre-fix plugin hangs at frame zero
-    every time (verified: 3/3 hangs at LEN=200, 3/3 completes on the fixed
-    build), so the clip only needs to be a few hundred frames long.
+    in flight, so the "processed again while in flight" condition fires at
+    frame 0 rather than tens of thousands of frames in.
     """
     script = tmp_path / "chained.py"
     script.write_text(textwrap.dedent(f"""\
@@ -354,7 +346,8 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     results = []
     try:
         for kwargs, rframes in zip(cases, ref_frames):
-            my_node = core.vsfeel.DFTTest(clip, num_streams=1, **kwargs)
+            my_node = core.std.GPUDownload(
+                clip=core.vsfeel.DFTTest(clip, num_streams=1, **kwargs))
             worst = 0.0
             for n, rplanes in zip(frames, rframes):
                 my_frame = my_node.get_frame(n)
