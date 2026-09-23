@@ -728,15 +728,8 @@ static void VS_CC NLMeansCreate(
         return set_error("wref must be >= 0.");
     }
 
-    const int num_streams = vsh::int64ToIntS(vsapi->mapGetInt(in, "num_streams", 0, &error));
-    if (!error && (num_streams < 1 || num_streams > 32)) {
-        return set_error("num_streams must be 1..32.");
-    }
-    // "num_streams" is accepted for compatibility and no longer selects
-    // anything: how many frames are in flight is the core's call now.
-    if (!error && vsfeel_debug_flag("VSFEEL_NLMEANS_DEPRECATED")) {
-        fprintf(stderr, "[nlmeans] num_streams is ignored under the R80 GPU API\n");
-    }
+    // num_streams is a registered no-op: in-flight depth is the core's
+    // (exec pool ring) call, so the argument is accepted and never read.
 
     int device_id = vsh::int64ToIntS(vsapi->mapGetInt(in, "device_id", 0, &error));
     if (error) {

@@ -35,7 +35,7 @@ import pytest
 from conftest import COMPARE_PRELUDE, NOISE_MKV
 
 # Filters and the arguments the cycle test runs them with.  The concurrency test
-# reuses them on a 64x64 crop with num_streams=2.
+# reuses them on a 64x64 crop.
 FILTERS = ["Bilateral", "GaussBlur", "DFTTest", "NLMeans", "BM3Dv2",
            "EEDI3", "EEDI3H", "EEDI3AA", "NNEDI3"]
 
@@ -94,11 +94,9 @@ def make_clips():
     return g32, g16
 
 
-def build(name, g32, g16, num_streams=None):
+def build(name, g32, g16):
     clip = g16 if name in _WIDE else g32
     kwargs = dict(_KWARGS[name])
-    if num_streams is not None:
-        kwargs["num_streams"] = num_streams
     return getattr(CORE.vsfeel, name)(clip, **kwargs)
 
 
@@ -222,7 +220,7 @@ def main():
     # solo oracle first: one node at a time, nothing else resident
     solo = {}
     for name in NAMES:
-        node = cpu_node(build(name, c32, c16, num_streams=2))
+        node = cpu_node(build(name, c32, c16))
         solo[name] = [read_plane(node.get_frame(n), 0, _DTYPE[name])
                       for n in range(FRAMES)]
         del node
@@ -230,7 +228,7 @@ def main():
 
     # every filter resident at once, each evaluated from its own thread and
     # released together by a barrier so the GPU work actually overlaps
-    nodes = {name: cpu_node(build(name, c32, c16, num_streams=2)) for name in NAMES}
+    nodes = {name: cpu_node(build(name, c32, c16)) for name in NAMES}
     results = {}
     errors = []
     barrier = threading.Barrier(len(NAMES))

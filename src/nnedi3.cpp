@@ -921,17 +921,10 @@ static void VS_CC Nnedi3Create(
         return set_error("invalid device ID.");
     }
 
-    int num_streams = vsh::int64ToIntS(vsapi->mapGetInt(in, "num_streams", 0, &error));
-    if (error) {
-        num_streams = 4;
-    }
-    if (num_streams < 1 || num_streams > 32) {
-        return set_error("num_streams must be 1..32.");
-    }
-    // num_streams and device_id are accepted for compatibility: under the R80
-    // GPU API the core owns the one device and sizes the exec pool itself.
-    (void)num_streams;
+    // device_id is accepted for compatibility: the core owns the one device.
     (void)device_id;
+    // num_streams is a registered no-op: in-flight depth is the core's
+    // (exec pool ring) call, so the argument is accepted and never read.
 
     if (d->field > 1) {
         if (d->vi_out.numFrames > INT32_MAX / 2) {

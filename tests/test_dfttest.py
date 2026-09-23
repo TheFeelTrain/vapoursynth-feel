@@ -40,13 +40,12 @@ from conftest import (
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
 
-def _run(clip, tbsize=3, num_streams=1, **kwargs):
+def _run(clip, tbsize=3, **kwargs):
     # DFTTest runs on the R80 GPU API (vnode:gpu in/out), so every test that
     # reads pixels goes through std.GPUDownload first (see conftest.cpu_node).
     return cpu_node(vs.core.vsfeel.DFTTest(
         clip,
         tbsize=tbsize,
-        num_streams=num_streams,
         **kwargs,
     ))
 
@@ -63,35 +62,28 @@ def _ref_compare(fmt, params, frames=(0, 11, 23), planes=None):
 # Determinism / stream count
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("num_streams", [1, 4])
-def test_dfttest_deterministic_32bit(noise_gray, num_streams):
-    a = _run(noise_gray, num_streams=num_streams)
-    b = _run(noise_gray, num_streams=num_streams)
+def test_dfttest_deterministic_32bit(noise_gray):
+    a = _run(noise_gray)
+    b = _run(noise_gray)
     for n in (0, 11, 23):
         d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
         assert np.abs(d).max() < 1e-6, f"nondeterministic output at frame {n}"
 
 
-def test_dfttest_multi_stream_matches_single_32bit(noise_gray):
-    a = _run(noise_gray, num_streams=4)
-    b = _run(noise_gray, num_streams=1)
-    for n in (0, 11, 23):
-        d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
-        assert np.abs(d).max() < 1e-6, f"num_streams mismatch at frame {n}"
 
 
 def test_dfttest_preserves_frame_props(noise_gray):
     """The temporal cache must republish the source frame's properties."""
-    assert_preserves_frame_props(_run, noise_gray, tbsize=3, num_streams=1)
+    assert_preserves_frame_props(_run, noise_gray, tbsize=3)
 
 
 def test_dfttest_parallel_load_consistent_32bit(noise_gray):
-    """Two parallel num_streams=4 runs must match the serial path, and each
+    """Two parallel runs must match the serial path, and each
     other — the request pattern that exposes stale descriptor bindings,
     fence misuse and command-pool reuse violations under load."""
-    a = eval_parallel(_run, noise_gray, num_streams=4)
-    b = eval_parallel(_run, noise_gray, num_streams=4)
-    ref = _run(noise_gray, num_streams=1)
+    a = eval_parallel(_run, noise_gray)
+    b = eval_parallel(_run, noise_gray)
+    ref = _run(noise_gray)
     for n in range(noise_gray.num_frames):
         r = frame_to_ndarray(ref.get_frame(n))
         assert np.abs(a[n] - r).max() < 1e-6, f"parallel 1/serial mismatch at frame {n}"
@@ -99,30 +91,22 @@ def test_dfttest_parallel_load_consistent_32bit(noise_gray):
         assert np.abs(a[n] - b[n]).max() < 1e-6, f"nondeterministic output at frame {n}"
 
 
-@pytest.mark.parametrize("num_streams", [1, 4])
-def test_dfttest_deterministic_16bit(noise_16bit, num_streams):
-    a = _run(noise_16bit, num_streams=num_streams)
-    b = _run(noise_16bit, num_streams=num_streams)
+def test_dfttest_deterministic_16bit(noise_16bit):
+    a = _run(noise_16bit)
+    b = _run(noise_16bit)
     for n in (0, 11, 23):
         fa = _plane(a.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         fb = _plane(b.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         assert np.array_equal(fa, fb), f"nondeterministic output at frame {n}"
 
 
-def test_dfttest_multi_stream_matches_single_16bit(noise_16bit):
-    a = _run(noise_16bit, num_streams=4)
-    b = _run(noise_16bit, num_streams=1)
-    for n in (0, 11, 23):
-        fa = _plane(a.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
-        fb = _plane(b.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
-        assert np.array_equal(fa, fb), f"num_streams mismatch at frame {n}"
 
 
 def test_dfttest_parallel_load_consistent_16bit(noise_16bit):
     """16-bit mirror of test_dfttest_parallel_load_consistent."""
-    a = eval_parallel(_run, noise_16bit, dtype=np.uint16, num_streams=4)
-    b = eval_parallel(_run, noise_16bit, dtype=np.uint16, num_streams=4)
-    ref = _run(noise_16bit, num_streams=1)
+    a = eval_parallel(_run, noise_16bit, dtype=np.uint16)
+    b = eval_parallel(_run, noise_16bit, dtype=np.uint16)
+    ref = _run(noise_16bit)
     for n in range(noise_16bit.num_frames):
         r = _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         assert np.array_equal(a[n], r), f"parallel 1/serial mismatch at frame {n}"
@@ -134,9 +118,8 @@ def test_dfttest_parallel_load_consistent_16bit(noise_16bit):
 # Pipelined-reader stress (regression)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("num_streams", [1, 4])
 @pytest.mark.parametrize("bits", [None, 16], ids=["32bit", "16bit"])
-def test_dfttest_vspipe_pipelined_no_hang(num_streams, bits):
+def test_dfttest_vspipe_pipelined_no_hang(bits):
     """vspipe's pipelined reader plus VapourSynth's prefetch activate frames
     11+ ahead of the in-flight frames, the request pattern that used to stall
     the queue behind an unsignaled slot semaphore. Under the R80 GPU API every
@@ -153,8 +136,6 @@ def test_dfttest_vspipe_pipelined_no_hang(num_streams, bits):
            "--filter", "dfttest", "vsfeel"]
     if bits:
         cmd += ["--bits", str(bits)]
-    if num_streams != 1:
-        cmd += ["--num-streams", str(num_streams)]
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=120,
@@ -229,14 +210,14 @@ def test_dfttest_frame_request_order_matches_serial():
     read shows up only when the frames arrive out of sequence.
     """
     assert_temporal_order_consistent(
-        "DFTTest", {"tbsize": 3, "num_streams": 4}, tol=0.0, timeout=300)
+        "DFTTest", {"tbsize": 3}, tol=0.0, timeout=300)
 
 
 @pytest.mark.parametrize("nframes", [1, 2])
 def test_dfttest_short_clip_temporal_window(nframes):
     """A clip shorter than tbsize must still be order-independent."""
     assert_temporal_order_consistent(
-        "DFTTest", {"tbsize": 3, "num_streams": 4}, tol=0.0,
+        "DFTTest", {"tbsize": 3}, tol=0.0,
         nframes=nframes, timeout=300)
 
 
@@ -246,12 +227,9 @@ def test_dfttest_short_clip_temporal_window(nframes):
 
 @pytest.mark.parametrize("tbsize", [1, 3, 5, 7])
 def test_dfttest_no_nan_all_frames_32bit(noise_gray, tbsize):
-    check_all_frames_finite(_run, noise_gray, tbsize=tbsize, num_streams=1)
+    check_all_frames_finite(_run, noise_gray, tbsize=tbsize)
 
 
-@pytest.mark.parametrize("num_streams", [2, 4])
-def test_dfttest_no_nan_all_frames_multi_stream_32bit(noise_gray, num_streams):
-    check_all_frames_finite(_run, noise_gray, tbsize=3, num_streams=num_streams)
 
 
 @pytest.mark.parametrize("tbsize", [1, 3, 5, 7])
@@ -262,14 +240,10 @@ def test_dfttest_no_nan_all_frames_16bit(noise_16bit, tbsize):
     ``isfinite(uint16)`` cannot fail, so the meaningful assertion is that the
     filter actually altered the noise input.
     """
-    out = _run(noise_16bit, tbsize=tbsize, num_streams=1)
+    out = _run(noise_16bit, tbsize=tbsize)
     assert_changes_on_noise(out, noise_16bit, what="DFTTest")
 
 
-@pytest.mark.parametrize("num_streams", [2, 4])
-def test_dfttest_no_nan_all_frames_multi_stream_16bit(noise_16bit, num_streams):
-    out = _run(noise_16bit, tbsize=3, num_streams=num_streams)
-    assert_changes_on_noise(out, noise_16bit, what="DFTTest")
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +321,7 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     try:
         for kwargs, rframes in zip(cases, ref_frames):
             my_node = core.std.GPUDownload(
-                clip=core.vsfeel.DFTTest(clip, num_streams=1, **kwargs))
+                clip=core.vsfeel.DFTTest(clip, **kwargs))
             worst = 0.0
             for n, rplanes in zip(frames, rframes):
                 my_frame = my_node.get_frame(n)
@@ -462,8 +436,8 @@ def test_dfttest_yuv_passthrough_32bit(noise_gray):
     yuv = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
     assert yuv.format.color_family == vs.YUV
 
-    out = _run(yuv, planes=[0], num_streams=1)
-    ref = _run(noise_gray, num_streams=1)
+    out = _run(yuv, planes=[0])
+    ref = _run(noise_gray)
 
     for n in (0, 11, 23):
         f = out.get_frame(n)
@@ -493,8 +467,8 @@ def test_dfttest_yuv_passthrough_16bit(noise_16bit):
     yuv = core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
     assert yuv.format.color_family == vs.YUV
 
-    out = _run(yuv, planes=[0], num_streams=1)
-    ref = _run(noise_16bit, num_streams=1)
+    out = _run(yuv, planes=[0])
+    ref = _run(noise_16bit)
 
     for n in (0, 11, 23):
         d = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64) \
@@ -536,7 +510,7 @@ def test_dfttest_planes_chroma_leaves_luma_untouched(noise_gray):
     core = vs.core
     src = core.fmtc.bitdepth(core.bs.VideoSource(NOISE_MKV), bits=32,
                              fulls=True, fulld=True)
-    out = _run(src, planes=[1, 2], num_streams=1)
+    out = _run(src, planes=[1, 2])
     for n in (0, 11, 23):
         f = out.get_frame(n)
         s = src.get_frame(n)
@@ -626,11 +600,6 @@ def test_dfttest_rejects_bad_planes(noise_gray):
         _run(noise_gray, planes=[5])
 
 
-def test_dfttest_rejects_bad_num_streams(noise_gray):
-    with pytest.raises(vs.Error):
-        _run(noise_gray, num_streams=0)
-    with pytest.raises(vs.Error):
-        _run(noise_gray, num_streams=33)
 
 
 def test_dfttest_rejects_10bit(noise_8bit):

@@ -178,8 +178,8 @@ addressing guard exists.
 
 **The estimate cache is sized for the in-flight working set by default;
 `VSFEEL_BM3D_CACHE=1` restores a window of seek margin.** An in-flight
-frame needs the stacks of centre frames `[n-r, n+r]`, so `num_streams`
-concurrent frames span `num_streams + 2r` slots — that is `res_cap` now. The
+frame needs the stacks of centre frames `[n-r, n+r]`, so the fixed
+two-stream depth spans `2 + 2r` slots — that is `res_cap` now. The
 default used to add `tw` more so an out-of-order (seek) request finds a warm
 slot instead of waiting in the acquire; that margin costs `tw/(ns+2r+tw)` of the
 largest buffer, which is what made radius 4 fail to allocate on an 8 GiB card.

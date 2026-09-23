@@ -460,19 +460,8 @@ static void VS_CC GaussCreate(
         return set_error("invalid device ID.");
     }
 
-    int num_streams = vsh::int64ToIntS(vsapi->mapGetInt(in, "num_streams", 0, &error));
-    const bool streams_given = !error;
-    if (error) {
-        num_streams = 4;
-    }
-    if (num_streams < 1 || num_streams > 32) {
-        return set_error("num_streams must be 1..32.");
-    }
-    // "num_streams" is accepted for compatibility and no longer selects
-    // anything: how many frames are in flight is the core's call now.
-    if (streams_given && vsfeel_debug_flag("VSFEEL_GAUSS_DEPRECATED")) {
-        fprintf(stderr, "[gaussblur] num_streams is ignored under the R80 GPU API\n");
-    }
+    // num_streams is a registered no-op: in-flight depth is the core's
+    // (exec pool ring) call, so the argument is accepted and never read.
 
     // sigma defaults: plane 0 = 0.5; chroma = sigma[0]/sqrt((1<<subW)*(1<<subH))
     // (computed in double, then narrowed); plane 2 = plane 1

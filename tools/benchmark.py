@@ -16,7 +16,6 @@ Usage:
     python3 tools/benchmark.py --filter gaussblur --gauss-sigma 5.0
     python3 tools/benchmark.py --filter gaussblur --repeat 5      # median of 5, alternating order
     python3 tools/benchmark.py --filter dfttest --pair vszipcl    # same-session pair + ratio
-    python3 tools/benchmark.py --filter bilateral --streams 1,2,4,8
     python3 tools/benchmark.py --frames 500 --clip /path/to/input.mkv
     python3 tools/benchmark.py --no-cache          # live decode: full chain incl. BestSource
     python3 tools/benchmark.py --check-fresh       # refuse to run against a stale .so
@@ -401,14 +400,6 @@ def _str_to_bool(v: str) -> bool:
     raise argparse.ArgumentTypeError(f"invalid boolean value: {v!r}")
 
 
-def _int_list(v: str) -> list[int]:
-    """argparse parser for a comma-separated run list, e.g. ``1,2,4,8``."""
-    try:
-        return [int(x) for x in v.split(",") if x.strip()]
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"invalid comma-separated int list: {v!r}")
-
-
 @dataclass
 class FilterSpec:
     title: str
@@ -417,7 +408,6 @@ class FilterSpec:
     build: Callable[[argparse.Namespace, str, "FilterSpec"], dict[str, str]]
     input: str = "depth(get_y(clip), 16)"  # clip expression the filter is applied to
     synth_format: str | None = "vs.GRAY16"  # BlankClip format for --synthetic (None disables)
-    default_streams: int = 4  # bench --num-streams default; see resolve_streams()
     # When set, the real-clip benchmark uses a custom vpy (see make_aa_vpy) that
     # doubles the input with a Point upscale and feeds the filter auxiliary clips
     # derived from it. Only sensible for EEDI3-style AA benchmarks.
@@ -429,38 +419,23 @@ class FilterSpec:
     gpu_plugins: frozenset[str] = frozenset()
 
 
-def resolve_streams(spec: FilterSpec, ns: argparse.Namespace) -> int:
-    """The one place the benchmark decides which ``num_streams`` it passes.
-
-    Builders, ``args_desc`` and the ``--streams`` sweep all call this, so the
-    printed header and the value actually handed to each plugin cannot drift
-    apart. ``--num-streams`` wins when given; otherwise the filter spec's
-    ``default_streams`` is the single source of truth.
-    """
-    return ns.num_streams if ns.num_streams is not None else spec.default_streams
-
-
 def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
-    ns_num = resolve_streams(spec, ns)
     common = (
         f"sigma={ns.bm3d_sigma}, radius={ns.bm3d_radius}, "
         f"bm_range={ns.bm3d_bm_range}, ps_range={ns.bm3d_ps_range}, "
         f"block_step={ns.bm3d_block_step}"
     )
-    with_streams = f"{common}, num_streams={ns_num}"
     return {
-        "vsfeel": f"core.vsfeel.BM3Dv2({clip}, {with_streams})",
-        "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {with_streams})",
-        # The Vulkan reference streams itself through the core (no num_streams).
+        "vsfeel": f"core.vsfeel.BM3Dv2({clip}, {common})",
+        "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {common})",
         "bm3dvk": f"core.bm3dvk.BM3Dv2({clip}, {common})"
     }
 
 
 def _bilateral_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
-    ns_num = resolve_streams(spec, ns)
     args = (
         f"sigma_spatial={ns.bilateral_sigma_spatial}, "
-        f"sigma_color={ns.bilateral_sigma_color}, num_streams={ns_num}"
+        f"sigma_color={ns.bilateral_sigma_color}"
     )
     return {
         "vsfeel": f"core.vsfeel.Bilateral({clip}, {args})",
@@ -470,8 +445,7 @@ def _bilateral_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dic
 
 
 def _gauss_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
-    ns_num = resolve_streams(spec, ns)
-    args = f"sigma={ns.gauss_sigma}, num_streams={ns_num}"
+    args = f"sigma={ns.gauss_sigma}"
     return {
         "vsfeel": f"core.vsfeel.GaussBlur({clip}, {args})",
         "vszipcl": f"core.vszipcl.GaussBlur({clip}, {args})",
@@ -480,15 +454,13 @@ def _gauss_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[st
 
 
 def _dfttest_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
-    # all three plugins share the vszipcu parameter surface; FilterSpec's
-    # default_streams=1 keeps the benchmark on the references' own default
-    num_streams = resolve_streams(spec, ns)
+    # all three plugins share the vszipcu parameter surface
     args = (
         f"ftype={ns.dfttest_ftype}, sigma={ns.dfttest_sigma}, sigma2={ns.dfttest_sigma2}, "
         f"pmin={ns.dfttest_pmin}, pmax={ns.dfttest_pmax}, sbsize=16, sosize={ns.dfttest_sosize}, "
         f"tbsize={ns.dfttest_tbsize}, swin={ns.dfttest_swin}, twin={ns.dfttest_twin}, "
         f"sbeta={ns.dfttest_sbeta}, tbeta={ns.dfttest_tbeta}, zmean={ns.dfttest_zmean}, "
-        f"f0beta={ns.dfttest_f0beta}, num_streams={num_streams}"
+        f"f0beta={ns.dfttest_f0beta}"
     )
     return {
         "vsfeel": f"core.vsfeel.DFTTest({clip}, {args})",
@@ -498,18 +470,15 @@ def _dfttest_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
 
 
 def _nlmeans_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
-    ns_num = resolve_streams(spec, ns)
     args = (
         f"d={ns.nlmeans_d}, a={ns.nlmeans_a}, s={ns.nlmeans_s}, h={ns.nlmeans_h}, "
-        f"wmode={ns.nlmeans_wmode}, wref={ns.nlmeans_wref}, channels='UV', "
-        f"num_streams={ns_num}"
+        f"wmode={ns.nlmeans_wmode}, wref={ns.nlmeans_wref}, channels='UV'"
     )
     return {
         "vsfeel": f"core.vsfeel.NLMeans({clip}, {args})",
         "vszipcl": f"core.vszipcl.NLMeans({clip}, {args})",
         "vszipcu": f"core.vszipcu.NLMeans({clip}, {args})",
         "nlm_hip": f"core.nlm_hip.NLMeans({clip}, {args})",
-        # The Vulkan reference streams itself through the core (no num_streams).
         "knlmvk": (
             f"core.knlmvk.KNLMeans({clip}, d={ns.nlmeans_d}, a={ns.nlmeans_a}, "
             f"s={ns.nlmeans_s}, h={ns.nlmeans_h}, wmode={ns.nlmeans_wmode}, "
@@ -528,7 +497,6 @@ def _eedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[st
     --eedi3-mclip 0 drops the mclip from the vsfeel/eedi3vk2 calls.
 
     """
-    ns_num = resolve_streams(spec, ns)
     use_mclip = getattr(ns, "eedi3_mclip", True)
     common = (
         f"field={ns.eedi3_field}, mdis={ns.eedi3_mdis}, nrad={ns.eedi3_nrad}, "
@@ -538,9 +506,9 @@ def _eedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[st
     )
     if getattr(ns, "synthetic", False):
         return {
-            "vsfeel": f"core.vsfeel.EEDI3({clip}, {common}, num_streams={ns_num})",
-            "eedi3vk2": f"core.eedi3vk2.EEDI3({clip}, {common}, num_streams={ns_num})",
-            "vszipcl": f"core.vszipcl.EEDI3({clip}, {common}, num_streams={ns_num})"
+            "vsfeel": f"core.vsfeel.EEDI3({clip}, {common})",
+            "eedi3vk2": f"core.eedi3vk2.EEDI3({clip}, {common})",
+            "vszipcl": f"core.vszipcl.EEDI3({clip}, {common})"
         }
     if use_mclip:
         mcap = "sclip=sclip, mclip=mclip"
@@ -549,9 +517,9 @@ def _eedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[st
     with_mclip = f"{common}, {mcap}"
     with_sclip = f"{common}, sclip=sclip"
     return {
-        "vsfeel": f"core.vsfeel.EEDI3({clip}, {with_mclip}, num_streams={ns_num})",
-        "eedi3vk2": f"core.eedi3vk2.EEDI3({clip}, {with_mclip}, num_streams={ns_num})",
-        "vszipcl": f"core.vszipcl.EEDI3({clip}, {with_sclip}, num_streams={ns_num})"
+        "vsfeel": f"core.vsfeel.EEDI3({clip}, {with_mclip})",
+        "eedi3vk2": f"core.eedi3vk2.EEDI3({clip}, {with_mclip})",
+        "vszipcl": f"core.vszipcl.EEDI3({clip}, {with_sclip})"
     }
 
 
@@ -561,7 +529,6 @@ def _eedi3h_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[s
     eedi3vk2 does not register an EEDI3H, so the references are vszipcl and
     vszipcu (which do).
     """
-    ns_num = resolve_streams(spec, ns)
     use_mclip = getattr(ns, "eedi3_mclip", True)
     common = (
         f"field={ns.eedi3_field}, mdis={ns.eedi3_mdis}, nrad={ns.eedi3_nrad}, "
@@ -572,9 +539,9 @@ def _eedi3h_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[s
     with_mclip = common + (", sclip=sclip, mclip=mclip" if use_mclip else ", sclip=sclip")
     with_sclip = f"{common}, sclip=sclip"
     return {
-        "vsfeel": f"core.vsfeel.EEDI3H({clip}, {with_mclip}, num_streams={ns_num})",
-        "vszipcl": f"core.vszipcl.EEDI3H({clip}, {with_sclip}, num_streams={ns_num})",
-        "vszipcu": f"core.vszipcu.EEDI3H({clip}, {with_sclip}, num_streams={ns_num})",
+        "vsfeel": f"core.vsfeel.EEDI3H({clip}, {with_mclip})",
+        "vszipcl": f"core.vszipcl.EEDI3H({clip}, {with_sclip})",
+        "vszipcu": f"core.vszipcu.EEDI3H({clip}, {with_sclip})",
     }
 
 
@@ -615,7 +582,6 @@ def _eedi3aa_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
     single-rate ``clip`` as sclip, which is what based_aa does (its
     antialiaser interleaves it itself).
     """
-    ns_num = resolve_streams(spec, ns)
     use_mclip = getattr(ns, "eedi3_mclip", True)
     field = ns.eedi3_field
     if field <= 1:
@@ -647,8 +613,7 @@ def _eedi3aa_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
         out = {
             "vsfeel": (
                 f"core.vsfeel.EEDI3AA({clip}, field={field}, {common_plugin}, "
-                f"sclip=core.std.Interleave([{clip}, {clip}]), "
-                f"num_streams={ns_num})"
+                f"sclip=core.std.Interleave([{clip}, {clip}])"
             ),
         }
         for p in ("eedi3vk2", "vszipcl", "vszipcu"):
@@ -658,8 +623,7 @@ def _eedi3aa_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
             out[p] = (
                 "from vsaa import EEDI3 as _VsaaEEDI3\n"
                 f"_VsaaEEDI3(backend=_VsaaEEDI3.Backend.{member}, {common_vsaa})"
-                f".antialias({clip}, tff={tff}, sclip={clip}, "
-                f"num_streams={ns_num})"
+                f".antialias({clip}, tff={tff}, sclip={clip})"
             )
         return out
 
@@ -667,8 +631,7 @@ def _eedi3aa_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
     aa_aux = "sclip=clip" + (", mclip=mclip" if use_mclip else "")
     out: dict[str, str] = {
         "vsfeel": (
-            f"core.vsfeel.EEDI3AA({clip}, field={field}, {common_plugin}, {aux}, "
-            f"num_streams={ns_num})"
+            f"core.vsfeel.EEDI3AA({clip}, field={field}, {common_plugin}, {aux})"
         ),
     }
     for p in ("eedi3vk2", "vszipcl", "vszipcu"):
@@ -678,13 +641,12 @@ def _eedi3aa_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
         out[p] = (
             "from vsaa import EEDI3 as _VsaaEEDI3\n"
             f"_VsaaEEDI3(backend=_VsaaEEDI3.Backend.{member}, {common_vsaa})"
-            f".antialias({clip}, tff={tff}, {aa_aux}, num_streams={ns_num})"
+            f".antialias({clip}, tff={tff}, {aa_aux})"
         )
     return out
 
 
 def _nnedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
-    ns_num = resolve_streams(spec, ns)
     common = (
         f"field={ns.nnedi3_field}, dh={ns.nnedi3_dh}, "
         f"nsize={ns.nnedi3_nsize}, nns={ns.nnedi3_nns}, qual={ns.nnedi3_qual}, "
@@ -693,9 +655,9 @@ def _nnedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[s
     if ns.nnedi3_planes:
         common += f", planes=[{ns.nnedi3_planes}]"
     return {
-        "vsfeel": f"core.vsfeel.NNEDI3({clip}, {common}, num_streams={ns_num})",
-        "nnedi3vk": f"core.nnedi3vk.NNEDI3({clip}, {common}, num_streams={ns_num})",
-        "vszipcu": f"core.vszipcu.NNEDI3({clip}, {common}, num_streams={ns_num})",
+        "vsfeel": f"core.vsfeel.NNEDI3({clip}, {common})",
+        "nnedi3vk": f"core.nnedi3vk.NNEDI3({clip}, {common})",
+        "vszipcu": f"core.vszipcu.NNEDI3({clip}, {common})",
     }
 
 
@@ -711,7 +673,6 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("block_step", "--bm3d-block-step", "bm3d_block_step", int, 4),
         ],
         build=_bm3d_build,
-        default_streams=2,  # matches the filter's shipped default
         input="depth(get_y(clip), 32)",
         synth_format="vs.GRAYS",
         # vsfeel's BM3Dv2 runs on the R80 GPU API (vnode:gpu in/out); so does
@@ -761,7 +722,6 @@ FILTERS: dict[str, FilterSpec] = {
         ],
         build=_dfttest_build,
         input="depth(get_y(clip), 16)",
-        default_streams=1,
         # vsfeel's DFTTest runs on the R80 GPU API (vnode:gpu in/out); the
         # references are CPU filters.
         gpu_plugins=frozenset({"vsfeel"}),
@@ -781,7 +741,6 @@ FILTERS: dict[str, FilterSpec] = {
         # chroma denoising on the subsampled planes is NLMeans' main use case
         input="depth(clip, 16)",
         synth_format="vs.YUV420P16",
-        default_streams=2,
         # vsfeel's NLMeans is vnode:gpu under the R80 GPU API; knlmvk always was.
         gpu_plugins=frozenset({"vsfeel", "knlmvk"}),
     ),
@@ -814,7 +773,6 @@ FILTERS: dict[str, FilterSpec] = {
         # (used by the hang tests) falls back to a plain 1x GRAY16 call.
         input="depth(get_y(clip), 16)",
         aa=True,
-        default_streams=8,
         # vsfeel's EEDI3 is vnode:gpu; the reference arms are not.
         gpu_plugins=frozenset({"vsfeel"}),
     ),
@@ -839,7 +797,6 @@ FILTERS: dict[str, FilterSpec] = {
         build=_eedi3h_build,
         input="depth(get_y(clip), 16)",
         aa=True,
-        default_streams=8,
         # vsfeel's EEDI3H is vnode:gpu; the reference arms are not.
         gpu_plugins=frozenset({"vsfeel"}),
     ),
@@ -868,7 +825,6 @@ FILTERS: dict[str, FilterSpec] = {
         # (see _eedi3aa_build — the reference arms ARE the vsaa antialiaser).
         input="depth(get_y(clip), 16)",
         aa=True,
-        default_streams=8,
         # vsfeel's EEDI3AA is vnode:gpu; the reference arms are not.
         gpu_plugins=frozenset({"vsfeel"}),
     ),
@@ -886,7 +842,6 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("pscrn", "--nnedi3-pscrn", "nnedi3_pscrn", int, 4),
         ],
         build=_nnedi3_build,
-        default_streams=4,
         # vsfeel's NNEDI3 is vnode:gpu under the R80 GPU API; the references
         # stay on the CPU cache.
         gpu_plugins=frozenset({"vsfeel"}),
@@ -1032,7 +987,6 @@ def _fmt_stats(values: list[float]) -> str:
 
 def args_desc(spec: FilterSpec, ns: argparse.Namespace) -> str:
     pairs = [f"{a.key}={getattr(ns, a.dest)}" for a in spec.args]
-    pairs.append(f"num_streams={resolve_streams(spec, ns)}")
     return ", ".join(pairs)
 
 
@@ -1131,95 +1085,80 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
         clip_desc = str(ns.clip)
     bits_desc = f" | bits: {ns.bits}" if ns.bits else ""
 
-    streams_values = ns.streams or [ns.num_streams]
-    order: list[str] = []
-    sweep: dict[int | None, dict[str, float]] = {}
-    for streams in streams_values:
-        ns.num_streams = streams
-        calls = spec.build(ns, input_expr, spec)
-        # --gpu-cache: every arm consumes the device-resident frames, so the
-        # run matches a chain whose upstream node is a GPU filter. Arms whose
-        # filter declares vnode:gpu take them directly; a legacy CPU filter gets
-        # them through std.GPUDownload and pays that transfer, which is what the
-        # real chain would charge it. (An arm that would have been handed a CPU
-        # cache instead is not a fair comparison -- its neighbour's input is in
-        # VRAM and it would never see that.)
-        #
-        # The AA vpy is rebuilt per arm rather than substituting names: with
-        # download_inputs it defines clip/mclip/sclip as downloads of the warmed
-        # device frames, so the chain string stays as it is.
-        gpu_arms: list[str] = []
-        download_arms: list[str] = []
-        if getattr(ns, "gpu_cache", False):
-            gpu_arms = list(calls)
-            download_arms = [p for p in calls if p not in spec.gpu_plugins]
-            if not spec.aa:
-                gpu_calls = spec.build(ns, "clip_gpu", spec)
-                dl_calls = spec.build(
-                    ns, "core.std.GPUDownload(clip=clip_gpu)", spec)
-                for p in calls:
-                    calls[p] = gpu_calls[p] if p in spec.gpu_plugins else dl_calls[p]
-        plugins = resolve_plugins(ns.plugins or list(calls), calls, spec.title)
-        plugins = _resolve_pair(ns, calls, plugins, spec.title)
-        if not plugins:
-            sys.exit(f"no valid plugins requested for --filter {ns.filter}")
-        if not order:
-            order = plugins
-        print(f"{spec.title} benchmark | {frames} frames | clip: {clip_desc}{bits_desc}")
-        print(f"args: {args_desc(spec, ns)}")
-        gpu_desc = ""
-        if getattr(ns, "gpu_cache", False):
-            if not gpu_arms:
-                gpu_desc = " | gpu cache: no GPU-input arm in this filter"
-            elif cache_frames:
-                gpu_desc = (f" | gpu cache: {ns.gpu_cache_mb} MiB; "
-                            f"download arms: {', '.join(download_arms) or 'none'}")
-            else:
-                # No preload to mirror (BlankClip or --no-cache): the arms get a
-                # GPUUpload-fed clip, which is what the graph would insert anyway.
-                gpu_desc = (f" | gpu cache: live upload; download arms: "
-                            f"{', '.join(download_arms) or 'none'}")
-        print(f"{_cache_desc(spec, ns, synth, cache_frames)}{gpu_desc} | "
-              f"repeat: {ns.repeat} | timeout: {ns.timeout:g}s\n")
+    calls = spec.build(ns, input_expr, spec)
+    # --gpu-cache: every arm consumes the device-resident frames, so the
+    # run matches a chain whose upstream node is a GPU filter. Arms whose
+    # filter declares vnode:gpu take them directly; a legacy CPU filter gets
+    # them through std.GPUDownload and pays that transfer, which is what the
+    # real chain would charge it. (An arm that would have been handed a CPU
+    # cache instead is not a fair comparison -- its neighbour's input is in
+    # VRAM and it would never see that.)
+    #
+    # The AA vpy is rebuilt per arm rather than substituting names: with
+    # download_inputs it defines clip/mclip/sclip as downloads of the warmed
+    # device frames, so the chain string stays as it is.
+    gpu_arms: list[str] = []
+    download_arms: list[str] = []
+    if getattr(ns, "gpu_cache", False):
+        gpu_arms = list(calls)
+        download_arms = [p for p in calls if p not in spec.gpu_plugins]
+        if not spec.aa:
+            gpu_calls = spec.build(ns, "clip_gpu", spec)
+            dl_calls = spec.build(
+                ns, "core.std.GPUDownload(clip=clip_gpu)", spec)
+            for p in calls:
+                calls[p] = gpu_calls[p] if p in spec.gpu_plugins else dl_calls[p]
+    plugins = resolve_plugins(ns.plugins or list(calls), calls, spec.title)
+    plugins = _resolve_pair(ns, calls, plugins, spec.title)
+    if not plugins:
+        sys.exit(f"no valid plugins requested for --filter {ns.filter}")
+    print(f"{spec.title} benchmark | {frames} frames | clip: {clip_desc}{bits_desc}")
+    print(f"args: {args_desc(spec, ns)}")
+    gpu_desc = ""
+    if getattr(ns, "gpu_cache", False):
+        if not gpu_arms:
+            gpu_desc = " | gpu cache: no GPU-input arm in this filter"
+        elif cache_frames:
+            gpu_desc = (f" | gpu cache: {ns.gpu_cache_mb} MiB; "
+                        f"download arms: {', '.join(download_arms) or 'none'}")
+        else:
+            # No preload to mirror (BlankClip or --no-cache): the arms get a
+            # GPUUpload-fed clip, which is what the graph would insert anyway.
+            gpu_desc = (f" | gpu cache: live upload; download arms: "
+                        f"{', '.join(download_arms) or 'none'}")
+    print(f"{_cache_desc(spec, ns, synth, cache_frames)}{gpu_desc} | "
+          f"repeat: {ns.repeat} | timeout: {ns.timeout:g}s\n")
 
-        runs: dict[str, list[float]] = {p: [] for p in plugins}
-        for r in range(ns.repeat):
-            # Alternate the plugin order between repeats so clock/thermal drift
-            # is shared between the arms instead of favouring the first one.
-            reverse = ns.interleave and r % 2 == 1
-            for plugin in (list(reversed(plugins)) if reverse else plugins):
-                fps = _run_once(spec, ns, plugin, calls[plugin], frames, synth,
-                                cache_frames, cache_conv,
-                                gpu_cache=plugin in gpu_arms,
-                                download_inputs=plugin in download_arms)
-                if fps is not None:
-                    runs[plugin].append(fps)
-        for plugin in plugins:
-            if runs[plugin]:
-                print(f"  {plugin:10s}  {_fmt_stats(runs[plugin])}")
-            else:
-                print(f"  {plugin:10s}  unavailable / failed")
-        print()
+    runs: dict[str, list[float]] = {p: [] for p in plugins}
+    for r in range(ns.repeat):
+        # Alternate the plugin order between repeats so clock/thermal drift
+        # is shared between the arms instead of favouring the first one.
+        reverse = ns.interleave and r % 2 == 1
+        for plugin in (list(reversed(plugins)) if reverse else plugins):
+            fps = _run_once(spec, ns, plugin, calls[plugin], frames, synth,
+                            cache_frames, cache_conv,
+                            gpu_cache=plugin in gpu_arms,
+                            download_inputs=plugin in download_arms)
+            if fps is not None:
+                runs[plugin].append(fps)
+    for plugin in plugins:
+        if runs[plugin]:
+            print(f"  {plugin:10s}  {_fmt_stats(runs[plugin])}")
+        else:
+            print(f"  {plugin:10s}  unavailable / failed")
+    print()
 
-        if ns.pair and len(plugins) == 2 and runs[plugins[0]] and runs[plugins[1]]:
-            a, b = plugins
-            ma, mb = statistics.median(runs[a]), statistics.median(runs[b])
-            print(f"  pair: {a} {ma:9.2f} fps vs {b} {mb:9.2f} fps -> {ma / mb:.3f}x\n")
+    if ns.pair and len(plugins) == 2 and runs[plugins[0]] and runs[plugins[1]]:
+        a, b = plugins
+        ma, mb = statistics.median(runs[a]), statistics.median(runs[b])
+        print(f"  pair: {a} {ma:9.2f} fps vs {b} {mb:9.2f} fps -> {ma / mb:.3f}x\n")
 
-        sweep[streams] = {p: statistics.median(v) for p, v in runs.items() if v}
-        valid = sorted(sweep[streams].items(), key=lambda x: x[1], reverse=True)
-        if len(valid) > 1:
-            for rank, (plugin, fps) in enumerate(valid, 1):
-                print(f"  {rank}. {plugin:10s} {fps:9.2f} fps")
-            print()
-
-    if len(streams_values) > 1:
-        print("  num_streams sweep (median fps):")
-        print("    streams  " + "".join(f"{p:>12s}" for p in order))
-        for streams in streams_values:
-            row = sweep.get(streams, {})
-            cells = "".join(f"{row[p]:12.2f}" if p in row else f"{'-':>12s}" for p in order)
-            print(f"    {str(streams):>7s}  {cells}")
+    valid = sorted(
+        ((p, statistics.median(v)) for p, v in runs.items() if v),
+        key=lambda x: x[1], reverse=True)
+    if len(valid) > 1:
+        for rank, (plugin, fps) in enumerate(valid, 1):
+            print(f"  {rank}. {plugin:10s} {fps:9.2f} fps")
         print()
 
 
@@ -1284,9 +1223,6 @@ def parse_args() -> argparse.Namespace:
                         help="filter to benchmark (default: all)")
     parser.add_argument("--frames", type=int, default=None,
                         help="frames to time (default: per-filter, see FILTERS)")
-    parser.add_argument("--num-streams", type=int, default=None,
-                        help="num_streams passed to the filters (default: each "
-                             "filter's bench default, see FilterSpec.default_streams)")
     parser.add_argument("--clip", default=DEFAULT_CLIP, help="input clip path")
     parser.add_argument("--synthetic", action="store_true",
                         help="use a synthetic 1920x1080 BlankClip instead of --clip "
@@ -1324,10 +1260,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                         help=f"kill a vspipe run after this many seconds "
                              f"(default: {DEFAULT_TIMEOUT:g})")
-    parser.add_argument("--streams", type=_int_list, default=None,
-                        metavar="N[,N...]",
-                        help="sweep num_streams over these values instead of "
-                             "--num-streams, e.g. --streams 1,2,4,8")
     parser.add_argument("--pair", nargs="?", const="auto", default=None, metavar="PLUGIN",
                         help="same-session pairing: run only vsfeel and one "
                              "reference (default: the first requested reference) "

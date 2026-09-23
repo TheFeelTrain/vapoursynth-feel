@@ -31,17 +31,16 @@ from conftest import (
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
 
-def _runh(clip, field=1, num_streams=1, **kwargs):
+def _runh(clip, field=1, **kwargs):
     """EEDI3H as a clip the test can read pixels from (see conftest.cpu_node)."""
     return cpu_node(vs.core.vsfeel.EEDI3H(
         clip,
         field=field,
-        num_streams=num_streams,
         **kwargs,
     ))
 
 
-def _oracle(clip, field=1, num_streams=1, mclip=None, sclip=None, **kwargs):
+def _oracle(clip, field=1, mclip=None, sclip=None, **kwargs):
     """Transpose(EEDI3(Transpose(clip))) with transposed aux clips.
 
     Only the final node is downloaded: the intermediate chain stays GPU
@@ -55,7 +54,7 @@ def _oracle(clip, field=1, num_streams=1, mclip=None, sclip=None, **kwargs):
         kw["mclip"] = tm
     if ts is not None:
         kw["sclip"] = ts
-    inner = vs.core.vsfeel.EEDI3(t, field=field, num_streams=num_streams, **kw)
+    inner = vs.core.vsfeel.EEDI3(t, field=field, **kw)
     return cpu_node(vs.core.std.Transpose(inner))
 
 
@@ -172,7 +171,7 @@ def test_eedi3h_vszipcl_loose(noise_16bit):
     reference_or_skip("vszipcl", "EEDI3H")
     spec = reference_spec(
         "vszipcl", "EEDI3H", "gray16", frames=(0, 11),
-        kwargs=dict(field=1, mdis=5, nrad=1, vcheck=2, num_streams=1))
+        kwargs=dict(field=1, mdis=5, nrad=1, vcheck=2))
     payload = reference_compare(spec)
     assert (payload["width"], payload["height"]) == (WIDTH, HEIGHT)
     assert payload["ndiff_frac"] < 0.05, "too many pixels differ"
@@ -244,18 +243,15 @@ def test_eedi3h_masked_region_is_horizontal_cubic(noise_16bit):
         f"masked px {row},{col}: {d[row, col]} vs hcubic {taps}")
 
 
-def test_eedi3h_determinism_and_streams(noise_16bit):
-    """Repeated runs and stream counts agree exactly."""
+def test_eedi3h_determinism(noise_16bit):
+    """Repeated runs agree exactly."""
     clip = noise_16bit
     kw = dict(field=1, mdis=5, nrad=1, vcheck=2)
-    a = _plane(_runh(clip, num_streams=1, **kw).get_frame(3),
+    a = _plane(_runh(clip, **kw).get_frame(3),
                0, WIDTH, HEIGHT, np.uint16)
-    b = _plane(_runh(clip, num_streams=1, **kw).get_frame(3),
+    b = _plane(_runh(clip, **kw).get_frame(3),
                0, WIDTH, HEIGHT, np.uint16)
     assert np.array_equal(a, b)
-    c = _plane(_runh(clip, num_streams=4, **kw).get_frame(3),
-               0, WIDTH, HEIGHT, np.uint16)
-    assert np.array_equal(a, c)
 
 
 def test_eedi3h_yuv_planes(noise_16bit):
@@ -351,10 +347,6 @@ def test_eedi3h_rejects_bad_planes(noise_16bit):
         _runh(noise_16bit, field=1, planes=[5])
 
 
-def test_eedi3h_rejects_bad_num_streams(noise_16bit):
-    for bad in (0, 33):
-        with pytest.raises(vs.Error):
-            _runh(noise_16bit, field=1, num_streams=bad)
 
 
 def test_eedi3h_rejects_bad_device_id(noise_16bit):

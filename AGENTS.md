@@ -38,16 +38,6 @@ Speed matters more than code size or elegance. Do not be afraid to rewrite a
 filter wholesale if it makes it meaningfully faster, as long as it stays
 correct and keeps passing the tests.
 
-**Per-stream efficiency is the metric, not raw per-frame throughput.** A filter
-that only looks fast because it burns 24 streams on a 24 GB card is a worse
-result than one that matches it at 8. `num_streams = 8` is the **maximum**
-default any filter should ship: it is the established sweet spot across the
-existing filters, keeps per-instance VRAM bounded, and leaves headroom in a
-user's surrounding graph. If a filter only wins above 8 streams, treat that as
-evidence the per-stream path is inefficient — find the inefficiency rather than
-raising the count. Sweep below 8 as well (4 and 6 are common knees) and ship
-the lowest count that reaches the plateau.
-
 When tuning, use the benchmark (below) to measure before/after, and treat the
 GPUs documented here as the target. `MANGOHUD=0` should be set for every
 benchmark run — it does not change results, it just suppresses extra messages
@@ -116,7 +106,7 @@ runs it. Plugins are described separately in `PLUGINS`.
   - `python3 tools/benchmark.py --filter <name>` — one filter
   - `python3 tools/benchmark.py --filter <name> vsfeel vszipcl` — a subset of
     plugins, to compare against references
-  - `--frames N`, `--num-streams N`, `--clip PATH` to control the run
+  - `--frames N`, `--clip PATH` to control the run
 - The default clip is `/home/encode/test/jpbd.mkv` (1920x1080, YUV420P8).
 - By default the run **caches real frames in RAM**: the first `--cache-frames`
   (default 1000) frames are decoded while vspipe evaluates the script, and its
@@ -238,10 +228,10 @@ All filters share an inline (zero-overhead, C++20) plumbing layer in
   `gpu_frame_buffer` scratch alive until the submission completes, and sizes
   its own ring — the host never waits per frame. Model on the ported filters:
   stateless on gaussblur/bilateral/nnedi3, cached/temporal on bm3d/dfttest.
-- **`FramePool<T>` / `ticket_semaphore`** — the pre-R80 per-stream resource
-  pool, kept only for BM3D (the one filter that still records its own command
-  pools/buffers/fences). New filters should not need it: the exec pool sizes
-  its own ring.
+- **`FramePool<T>` / `ticket_semaphore`** — the per-stream resource pool,
+  kept only for BM3D (the one filter that still records its own command
+  pools, buffers and fences). New filters should not need it: the exec pool
+  sizes its own ring.
 - **`gpu_submit(...)`** — the one raw-submit helper (BM3D's own command
   buffers): takes the core's queue lock around the submit alone, as a leaf,
   and allocates nothing inside it.
@@ -287,11 +277,9 @@ resources.
 
 **What stays per-filter:** frame caches (temporal three: DFTTest slot cache,
 NLMeans tile cache, BM3D ring/result stacks), shaders + launch config, sync
-choreography (pad→copy→fused ordering, device-side waits), cache sizing. The
-pre-R80 queue-cap / stream machinery (`num_queues`, `resource.queue`,
-in-flight `num_streams` pools, `VSFEEL_<FILTER>_QUEUES`) is gone with the
-port: the core owns the one compute queue and the exec pool sizes its own
-ring; BM3D keeps its own streams for its own submissions.
+choreography (pad→copy→fused ordering, device-side waits), cache sizing.
+BM3D records its own command buffers, fences and streams; every other filter
+is one recorded command buffer per frame through the exec pool.
 
 When porting a new filter, model the stateless path on gaussblur/bilateral
 or nnedi3 (no cache) and the cached/timeline path on bm3d.
@@ -341,9 +329,10 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   recycled frame memory and produce phantom nondeterminism.
 - **Trust only end-to-end benchmark fps medians over hundreds of frames.**
   Microsecond GPU traces swing ±10–20% run-to-run (clock variance); a change
-  that does not move the fps median did not happen. Streams share the compute
-  queue, so per-kernel timings taken from multi-stream runs include the other
-  stream's interleaved work — attribute kernels only in single-stream traces.
+  that does not move the fps median did not happen. Concurrent submissions
+  share the compute queue, so per-kernel timings taken from a deep pipeline
+  include the other frames' interleaved work — attribute kernels only in
+  serialized traces.
   Identical binaries swing between invocations too, so compare same-session
   pairs or medians over 1000+ frames, never single short bursts. A
   comments-only rebuild that moves a one-shot trace is clock variance, not a
@@ -362,10 +351,10 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   `tools/install.sh` — one command that does both and does not exit until the
   installed copy's sha256 matches the build — then test in a separate command.
 - **Prove the host/GPU split before optimizing anything.** Add a small
-  env-gated chrono probe around the frame path (CPU staging / GPU
-  submit-wait / download-and-blit) and read it on real content first — kernel
+  env-gated chrono probe around the frame path (acquire / record / submit)
+  and read it on real content first — kernel
   work that looks dominant from reading code is routinely not the bottleneck.
-  Reset the stage clock after every blocking acquire (pool take, fence wait)
+  Reset the stage clock after every blocking acquire
   so waits never leak into the next stage, and cross-check summed stages
   against wall-clock before trusting any split — a stage reporting
   milliseconds for a microsecond memcpy is a timer bug, not a finding.
@@ -387,66 +376,14 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   binary** — ten lines, and both arms are measured under identical conditions.
   Reach for the scratch C program only to rule a mechanism *out*, never to
   pick a winner.
-- **When every host stage costs about the same, you are bound by a shared
-  resource — not by a hot loop.** EEDI3's ladder read blit ~20%, upload gather
-  ~16%, vcheck ~10%, sclip ~10%, and no stage dominated. Additive costs of
-  similar size mean the host memory path; a single dominant item means a loop
-  to optimize. Tell them apart with the ladder (one stage, then pairs, then
-  all), and expect the fix to be "move fewer bytes", not "make a loop
-  tighter". Related: **aggregate CPU copy bandwidth falls as thread count
-  rises** (measured ~101 GB/s at 2 threads vs ~54 at 8), so more streams can
-  *reduce* total host throughput.
-- **Host orchestration is usually half the performance.** Expect to spend as
-  much effort on memory pooling, upload/download paths, cross-stream cache
-  sharing, and dispatch/fence structure as on kernels. The big wins come from
-  removing work — fusing passes to cut dispatches/barriers/fences, uploading
-  once via DMA straight into its final layout, pointing the consumer at the
-  cache in place (per-slice/per-tile source addresses via push constants,
-  e.g. a `slot_base[]` table with a `-1` = fallback sentinel) instead of
-  copying cache→working set and then reading it, sharing immutable data
-  lock-free across streams (only writers exclude readers) — not from making
-  the surviving instructions cleverer. The existing fence/resource-reuse gate
-  usually already covers the new (longer) cache lifetime, so no new sync is
-  needed.
 - **Minimize bytes moved, then minimize copies — and count reads per source
   byte, not just copies.** Transfer buffers in the narrowest
   exactly-representable type and widen on load (native u16 pad instead of f32
-  halved EEDI3's upload, H2D and pad-read traffic at once). Then audit the
+  halved EEDI3's pad-build and pad-read traffic at once). Then audit the
   frame for any buffer whose *same source bytes* are read by two different
   loops: merging a second pass into the first while the row is still cache-hot
   is nearly free and was worth +3.5% on EEDI3 while deleting 8.3 MB/frame of
   pure DRAM re-reads.
-- **Upload path (measured on the 7900XTX, and it has flipped repeatedly —
-  re-measure per filter).** The winner is **NT stores directly into a
-  host-visible VRAM buffer** (`DEVICE_LOCAL|HOST_VISIBLE|COHERENT`, mapped
-  once, `_mm_sfence()` before submit, no H2D copy and no transfer→compute
-  barrier): +29% on EEDI3 over cached-system-RAM staging + `vkCmdCopyBuffer`.
-  The catch is that the host-visible device-local types here are **uncached**,
-  so ordinary cached stores into them are catastrophic (measured 27.6 fps) —
-  only the NT store form is fast. Within the older staging approach, NT stores
-  also beat plain `memcpy` in situ (400–417 vs 331 fps over 8 combos). The
-  isolated microbenchmark said the OPPOSITE (memcpy 0.14 vs NT 0.51 ms/frame) —
-  see the probe rule below: **an isolated copy benchmark proposes, only an
-  in-situ same-session A/B decides.**
-  **UNRESOLVED CONTRADICTION — measure before trusting either side:** a
-  previous session recorded the reverse for a plain 64 GB/s vs 31 GB/s
-  throughput comparison (memcpy into ReBAR VRAM *beating* NT stores). Both
-  numbers are real measurements on this box, so the winner evidently depends
-  on the buffer, size, or access pattern. Treat the upload path as
-  unfixed: implement it behind an env opt-out, sweep both arms in situ, and
-  record which one won and for what shape.
-  Downloads stay kernel-direct (the GPU writing results straight into host
-  staging beat a device-local buffer + SDMA D2H, 568 vs 553 fps); CPU reads
-  from the VRAM BAR remain ~1 GB/s, so never let the CPU read results back
-  from a VRAM buffer. **A download pass costs what it stores, not what it
-  computes, and flat scaling is the tell.** BM3D's aggregation measured
-  ~0.32 ms at TW = 1, 5 and 9 alike, and vectorising it to `vec4` changed
-  nothing, because 8.3 MB of fp32 results at ~26 GB/s over PCIe *is* the whole
-  cost. So (a) read a final pass's scaling before optimizing its compute, and
-  (b) kernel-direct download and host-pointer import cannot help — the
-  GPU→host store is the floor, not the host copy that follows it. For scale,
-  ~0.32 ms/frame is a hard floor at 1080p fp32, i.e. `fps ≤ 1/(kernel + 0.32)`
-  for any filter that returns a frame to the host.
 - **Do not invoke a graph node to normalize an input your kernel only reads as
   a predicate.** EEDI3 forced every mask through `SetFrameProps(_Range=1) ->
   resize.Point -> Gray8` so the kernel could test `byte != 0` — a whole extra
@@ -457,73 +394,18 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   from it; a monotone transform or a threshold can usually be folded into the
   native data. Verify equivalence exhaustively when the domain is small
   (65536 values is a proof, not a hope).
-- **Port a proven memory path to the next filter before tuning kernels.**
-  Once a transfer structure wins on one filter (device-local buffers,
-  host-direct upload, kernel-direct download, native element types), port
-  the whole structure wholesale to the next filter with the same IO shape
-  before spending anything on kernel cleverness — it routinely contributes
-  most of the absolute gain. Ablate each leg with its opt-out env flag so
-  the contribution is measured, and keep those flags as durable tuning
-  knobs rather than deleting them as one-shot diagnostics.
-- **Sweep in-flight depth; set the default at the knee, and never above 8.**
-  Throughput vs `num_streams` is never flat and never monotonic — measure it,
-  set the filter default at the knee, and state the per-stream VRAM cost next
-  to it. Count the **caches whose size is derived from `num_streams`**, not
-  just the per-stream buffers: BM3D's `res_cap = tw + ns + 2r` and
-  `src_ring = 4r + ns` meant ns 4 → 2 saved 23% of *total* VRAM (1107 vs
-  1440 MiB at 1080p r=2), not the ~11% the per-stream staging suggested. Print
-  the budget at creation behind a `VSFEEL_<FILTER>_VRAM=1` banner so the figure
-  is measured rather than estimated, and size each allocation for what a
-  dispatch actually writes, not for the cache it lands in (BM3D's staging was
-  ring-sized for `4r+ns` slots but only `4r+1` are ever written).
-  Measure the knee at the request depth you care about: `vspipe`'s own default
-  is ~32 concurrent requests, deeper than most real consumers, which is why
-  BM3D reverses (ns=2 wins at 1–3 requests, loses ~1% at 32) — a depth-dependent
-  win that only exists at 32 is not a shipping win.
-  **`num_streams = 8` is the hard maximum for a shipped default** (see
-  "The goal"); a knee above 8 means the per-stream path needs work, not a
-  higher count. Queue count and buffer count (ticket depth) are independent:
-  the knee is typically 2 (frame N runs on the GPU while N+1
-  uploads/records/submits), and deeper pools only add VRAM.
-  **Re-sweep the knee after every structural change** — it is a property of
-  where the bottleneck sits, so shifting work between host and GPU moves it.
-  EEDI3's knee went 8 → 12 when the upload path was made cheaper, and DFTTest's
-  went 8 → 2 when the frame cache landed. Never inherit depth constants, or
-  knee conclusions, across redesigns.
-  Implementations tied at one depth can differ 2x at another (queue
-  starvation vs GPU saturation).
-- **Sweep queue sharing independently of stream count (pre-R80, superseded).**
-  The old path let each filter cap how many of the device's compute queues its
-  streams spread over: with one stream per queue, each queue drained while its
-  worker did post-fence CPU work (download memcpy + bookkeeping + next upload)
-  before the next submit, leaving idle bubbles; sharing a queue across streams
-  kept a next CB queued, and oversubscribing won double digits while collapsing
-  run-to-run variance — a variance drop alongside the speedup confirmed the
-  bubble mechanism. No filter selects queues under the R80 API (the core owns
-  the one compute queue) and `VSFEEL_<FILTER>_QUEUES` no longer exists; the
-  mechanism survives as the reason the exec pool keeps several recordings in
-  flight, and the re-sweep-after-structure-changes rule still applies to
-  anything a filter does size itself (scratch, caches, batch depths).
 - **Sweep workgroup shape across workload configs, not just the default.**
   The best tile is a function of the algorithm's workload params (window
   radius, taps, halo overfetch), not a universal constant — a shape that
   ties at one config can win 50% at another and collapse at a third, so
   sweep the matrix (block candidates × representative configs) and re-verify
-  under the final queue cap, since overlap changes amplify or shrink shape
-  effects. Where the matrix shows a clear workload-dependent winner, auto-
+  under the shipped configuration, since overlap changes amplify or shrink
+  shape effects. Where the matrix shows a clear workload-dependent winner, auto-
   select the default from the workload params (only when the user leaves the
   args unset — the `mapGetInt` error flag distinguishes explicit from
   default, and explicit args are always respected). Never inherit shapes
   across redesigns: a spill-free shape at one radius can spill at another,
   so check `shaderstats` (VGPR spill/scratch) per matrix cell.
-- **Decide allocation-dependent fast paths before the resource loop.**
-  If a fast path depends on a memory type existing (host-visible
-  device-local for direct upload, and so on), probe once up front and store
-  an immutable global bool — never mutate a shared flag per resource inside
-  the creation loop (a mid-loop flip desyncs already-recorded command buffers
-  from the frame-time upload/download base). Superseded in detail by the R80
-  port — the core's allocator picks memory types now — but the rule stands for
-  any probe a filter still keeps.
 - **Spec constants cannot size arrays in GLSL.** If an array dimension must
   vary, gate it with a compile-time `-D` define instead.
 - **Respect the compiler's register tradeoffs.** ACO raises VGPRs deliberately
@@ -556,25 +438,6 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
 - **Run Vulkan validation layers when output is inexplicable**
   (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`); they found a zeroed
   buffer-binding table in minutes.
-- **The CPU-side staging code deserves as much scrutiny as the shaders.**
-  Once the host path is the limiter, the wins are in the C++: EEDI3's
-  single largest absolute cost was a scalar per-row loop in the *host* code
-  (6.1 ms/frame, ~22× slower than the SIMD rewrite), not anything on the GPU.
-  Two patterns to hunt:
-  - **Serial scans carrying a scalar across iterations** (`last = ...` style
-    state that each step depends on). If the loop computes a *window* property
-    (is-any-set, coverage, box-sum reachability), it is usually a **dilation**,
-    and dilations compose (`dil_a ∘ dil_b == dil_(a+b)`) — so a packed-bit
-    formulation collapses O(N) serial steps into O(log N) shift-OR passes
-    over machine words. 6.1 → 0.28 ms/frame here. Pack predicate bits with
-    `_mm256_cmpeq_epi8` + `movemask`, or for u16 with an xor-bias + signed
-    `cmpgt` + `movemask` (remember `cmpgt` is strict: for `v >= T` the
-    constant is `T-1`).
-  - **Repeated reads of one source buffer by separate loops** (see the
-    read-counting rule above).
-  Prove a new SIMD kernel against a brute-force oracle over randomized inputs
-  *before* wiring it in, including a fallback path for shapes the vector form
-  cannot express (narrow rows, oversized parameters).
 - **A bimodal measurement is a bug to chase, and the harness's memory budget
   is part of the measurement.** One binary swung 143–260 fps on consecutive
   fp32 runs while the GPU-bound reference stayed flat at ~190. The cause was
@@ -755,7 +618,7 @@ working tree and describe what should be committed.
    run an ablation ladder (remove-all / remove-half) to find which side is
    actually the limiter. Do not assume it is the kernels.
 5. Optimize / port, keeping each candidate behind an env opt-out so it can be
-   A/B'd in situ, and re-sweep the stream knee afterwards. Rebuild and install
-   with `tools/install.sh` (it does both), then re-measure.
+   A/B'd in situ, and re-measure afterwards. Rebuild and install with
+   `tools/install.sh` (it does both), then re-measure.
 6. Re-benchmark and re-test; keep going until vsfeel is faster than the
    references while still passing all tests.

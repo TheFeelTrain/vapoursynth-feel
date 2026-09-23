@@ -34,7 +34,7 @@ _LIFECYCLE_SCRIPT = textwrap.dedent(f"""\
     # a longer clip so the worker threads keep submitting frames throughout
     clip = core.std.Loop(f32, 3)
 
-    steady = core.vsfeel.GaussBlur(clip, sigma=[2.0], num_streams=4)
+    steady = core.vsfeel.GaussBlur(clip, sigma=[2.0])
     n_frames = steady.num_frames
     stop = threading.Event()
     errors = []
@@ -61,14 +61,14 @@ _LIFECYCLE_SCRIPT = textwrap.dedent(f"""\
     # the workers above keep the GPU busy
     try:
         for _ in range(3):
-            tmp = core.vsfeel.DFTTest(clip, sigma=1.0, num_streams=2)
+            tmp = core.vsfeel.DFTTest(clip, sigma=1.0)
             tmp.get_frame(1)
             del tmp
             tmp = core.vsfeel.Bilateral(f32, sigma_spatial=[3.0],
-                                        sigma_color=[0.05], num_streams=2)
+                                        sigma_color=[0.05])
             tmp.get_frame(1)
             del tmp
-            tmp = core.vsfeel.BM3Dv2(clip, sigma=[0.7], radius=1, num_streams=2)
+            tmp = core.vsfeel.BM3Dv2(clip, sigma=[0.7], radius=1)
             tmp.get_frame(1)
             del tmp
             core.clear_cache()

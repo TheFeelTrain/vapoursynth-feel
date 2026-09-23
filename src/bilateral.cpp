@@ -503,12 +503,8 @@ static void VS_CC BilateralCreate(
                          "device selection is core.set_vulkan_device");
     }
 
-    // "num_streams" is accepted for compatibility and no longer selects
-    // anything: how many frames are in flight is the core's call now.
-    if (vsapi->mapGetInt(in, "num_streams", 0, &error), !error &&
-        vsfeel_debug_flag("VSFEEL_BILAT_DEPRECATED")) {
-        fprintf(stderr, "[bilateral] num_streams is ignored under the R80 GPU API\n");
-    }
+    // num_streams is a registered no-op: in-flight depth is the core's
+    // (exec pool ring) call, so the argument is accepted and never read.
 
     bool use_shared_memory = !!vsapi->mapGetInt(in, "use_shared_memory", 0, &error);
     if (error) {

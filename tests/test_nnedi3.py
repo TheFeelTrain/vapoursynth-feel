@@ -33,7 +33,7 @@ from conftest import (
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
 
-def _run(clip, field=1, num_streams=1, **kwargs):
+def _run(clip, field=1, **kwargs):
     """NNEDI3 as a clip the test can read pixels from (see conftest.cpu_node).
 
     Under the R80 GPU API the filter takes and returns ``vnode:gpu`` frames, so
@@ -43,7 +43,6 @@ def _run(clip, field=1, num_streams=1, **kwargs):
     return cpu_node(vs.core.vsfeel.NNEDI3(
         clip,
         field=field,
-        num_streams=num_streams,
         **kwargs,
     ))
 
@@ -170,24 +169,11 @@ def test_nnedi3_deterministic(noise_gray, noise_16bit, bits):
         assert np.abs(d).max() == 0, f"nondeterministic output at frame {n}"
 
 
-@pytest.mark.parametrize("bits", [16, 32])
-def test_nnedi3_multi_stream_matches_single(noise_gray, noise_16bit, bits):
-    clip = noise_16bit if bits == 16 else noise_gray
-    a = _run(clip, nsize=0, num_streams=4)
-    b = _run(clip, nsize=0, num_streams=1)
-    for n in (0, 11, 23):
-        fa, fb = a.get_frame(n), b.get_frame(n)
-        if bits == 16:
-            d = _plane(fa, 0, WIDTH, HEIGHT).astype(np.int32) - \
-                _plane(fb, 0, WIDTH, HEIGHT).astype(np.int32)
-        else:
-            d = frame_to_ndarray(fa) - frame_to_ndarray(fb)
-        assert np.abs(d).max() == 0, f"stream-count divergence at frame {n}"
 
 
 def test_nnedi3_parallel_load_consistent(noise_16bit):
-    expect = _plane(_run(noise_16bit, num_streams=1).get_frame(5), 0)
-    got = eval_parallel(_run, noise_16bit, num_streams=4)
+    expect = _plane(_run(noise_16bit).get_frame(5), 0)
+    got = eval_parallel(_run, noise_16bit)
     assert np.abs(got[5].astype(np.int32) - expect.astype(np.int32)).max() == 0
 
 
@@ -237,7 +223,7 @@ def test_nnedi3_changes_noise_16bit(noise_16bit):
 
 def test_nnedi3_preserves_frame_props(noise_16bit):
     """field=1 keeps the duration while tagging the output progressive."""
-    assert_preserves_frame_props(_run, noise_16bit, field=1, num_streams=1)
+    assert_preserves_frame_props(_run, noise_16bit, field=1)
 
 
 # ---------------------------------------------------------------------------
@@ -303,9 +289,6 @@ def test_nnedi3_rejects_bad_planes(noise_16bit):
         _run(noise_16bit, planes=[3])
 
 
-def test_nnedi3_rejects_bad_num_streams(noise_16bit):
-    with pytest.raises(vs.Error):
-        _run(noise_16bit, num_streams=0)
 
 
 def test_nnedi3_rejects_odd_height(noise_16bit):

@@ -50,14 +50,14 @@ F32_TOL = 1e-6
 # ---------------------------------------------------------------------------
 
 
-def _aa(clip, field=3, num_streams=1, **kwargs):
+def _aa(clip, field=3, **kwargs):
     """EEDI3AA as a clip the test can read pixels from (see conftest.cpu_node)."""
     return cpu_node(vs.core.vsfeel.EEDI3AA(
-        clip, field=field, num_streams=num_streams, **kwargs
+        clip, field=field, **kwargs
     ))
 
 
-def _oracle(clip, field=3, num_streams=1, mclip=None, sclip=None, **kwargs):
+def _oracle(clip, field=3, mclip=None, sclip=None, **kwargs):
     """The exact based_aa chain, built from the same plugin.
 
     Only the final node is downloaded: the intermediate EEDI3 -> Merge ->
@@ -68,9 +68,9 @@ def _oracle(clip, field=3, num_streams=1, mclip=None, sclip=None, **kwargs):
         kw["mclip"] = mclip
     if sclip is not None:
         kw["sclip"] = sclip
-    v = vs.core.vsfeel.EEDI3(clip, field=field, num_streams=num_streams, **kw)
+    v = vs.core.vsfeel.EEDI3(clip, field=field, **kw)
     vm = vs.core.std.Merge(v[::2], v[1::2])
-    h = vs.core.vsfeel.EEDI3H(vm, field=field, num_streams=num_streams, **kw)
+    h = vs.core.vsfeel.EEDI3H(vm, field=field, **kw)
     return cpu_node(vs.core.std.Merge(h[::2], h[1::2]))
 
 
@@ -248,14 +248,13 @@ def test_eedi3aa_yuv_plane0_only(bits):
 # Determinism / streams / parallel load
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("num_streams", [1, 4])
 @pytest.mark.parametrize("bits", [16, 32], ids=["16bit", "32bit"])
-def test_eedi3aa_deterministic(noise_gray, noise_16bit, bits, num_streams):
+def test_eedi3aa_deterministic(noise_gray, noise_16bit, bits):
     clip = noise_16bit if bits == 16 else noise_gray
     kw = dict(sclip=_interleave2(clip), mclip=_mask(clip, bits),
               vcheck=2, mdis=5, nrad=1)
-    a = _aa(clip, num_streams=num_streams, **kw)
-    b = _aa(clip, num_streams=num_streams, **kw)
+    a = _aa(clip, **kw)
+    b = _aa(clip, **kw)
     dtype = _dtype(bits)
     for n in (0, 11, 23):
         fa = _plane(a.get_frame(n), 0, WIDTH, HEIGHT, dtype)
@@ -266,33 +265,18 @@ def test_eedi3aa_deterministic(noise_gray, noise_16bit, bits, num_streams):
             assert np.abs(fa - fb).max() < F32_TOL
 
 
-@pytest.mark.parametrize("bits", [16, 32], ids=["16bit", "32bit"])
-def test_eedi3aa_multi_stream_matches_single(noise_gray, noise_16bit, bits):
-    clip = noise_16bit if bits == 16 else noise_gray
-    kw = dict(sclip=_interleave2(clip), mclip=_mask(clip, bits),
-              vcheck=2, mdis=5, nrad=1)
-    a = _aa(clip, num_streams=4, **kw)
-    b = _aa(clip, num_streams=1, **kw)
-    dtype = _dtype(bits)
-    for n in (0, 11, 23):
-        fa = _plane(a.get_frame(n), 0, WIDTH, HEIGHT, dtype)
-        fb = _plane(b.get_frame(n), 0, WIDTH, HEIGHT, dtype)
-        if bits == 16:
-            assert np.array_equal(fa, fb), f"num_streams mismatch at frame {n}"
-        else:
-            assert np.abs(fa - fb).max() < F32_TOL
 
 
 def test_eedi3aa_parallel_load_consistent(noise_16bit):
-    """Two parallel num_streams=4 runs must match the serial path and each
+    """Two parallel runs must match the serial path and each
     other — the request pattern that exposes stale descriptor bindings, fence
     misuse and command-pool reuse violations under load."""
     clip = noise_16bit
     kw = dict(sclip=_interleave2(clip), mclip=_mask(clip, 16),
               vcheck=2, mdis=5, nrad=1)
-    a = eval_parallel(_aa, clip, num_streams=4, **kw)
-    b = eval_parallel(_aa, clip, num_streams=4, **kw)
-    ref = _aa(clip, num_streams=1, **kw)
+    a = eval_parallel(_aa, clip, **kw)
+    b = eval_parallel(_aa, clip, **kw)
+    ref = _aa(clip, **kw)
     for n in range(clip.num_frames):
         r = _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         assert np.array_equal(a[n], r), f"parallel 1/serial mismatch at frame {n}"
@@ -332,7 +316,7 @@ def test_eedi3aa_props_match_chain(noise_16bit):
 def test_eedi3aa_preserves_frame_props(noise_gray):
     """field=3 halves the duration (fps doubles) but must keep every other tag."""
     assert_preserves_frame_props(
-        _aa, noise_gray, field=3, duration_factor=2, num_streams=1,
+        _aa, noise_gray, field=3, duration_factor=2,
         sclip=_interleave2(noise_gray))
 
 
@@ -356,11 +340,6 @@ def test_eedi3aa_rejects_8bit(noise_8bit):
         _aa(noise_8bit, field=3)
 
 
-def test_eedi3aa_rejects_bad_num_streams(noise_16bit):
-    with pytest.raises(vs.Error):
-        _aa(noise_16bit, field=3, num_streams=0)
-    with pytest.raises(vs.Error):
-        _aa(noise_16bit, field=3, num_streams=64)
 
 
 def test_eedi3aa_sclip_needs_2n_frames(noise_16bit):
@@ -373,6 +352,6 @@ def test_eedi3aa_is_pure_plugin_extension(noise_16bit):
     """EEDI3/EEDI3H are untouched: their own output must still equal the
     composed chain (the fused filter is additive)."""
     clip = noise_16bit
-    v = vs.core.vsfeel.EEDI3(clip, field=3, num_streams=1, vcheck=2, mdis=5,
+    v = vs.core.vsfeel.EEDI3(clip, field=3, vcheck=2, mdis=5,
                              nrad=1)
     assert v.num_frames == 2 * clip.num_frames  # EEDI3 still doubles the rate

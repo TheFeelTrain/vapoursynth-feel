@@ -37,7 +37,7 @@ PS_RANGE = 7
 BLOCK_STEP = 4
 
 
-def _run(clip, radius=2, num_streams=1, **kwargs):
+def _run(clip, radius=2, **kwargs):
     return BM3D(
         clip,
         sigma=SIGMA,
@@ -45,35 +45,34 @@ def _run(clip, radius=2, num_streams=1, **kwargs):
         bm_range=BM_RANGE,
         ps_range=PS_RANGE,
         block_step=BLOCK_STEP,
-        num_streams=num_streams,
         **kwargs,
     )
 
 
 def test_bm3dv2_parallel_load_matches_serial(noise_gray):
-    """Parallel request load with num_streams=4 must produce the same pixel
+    """Parallel request load must produce the same pixel
     values as the serial path.
 
     This is the request pattern that exposed stale descriptor bindings, fence
     misuse and command pool reuse violations under load on strict drivers
     (black or garbage output only when frames are processed concurrently).
     """
-    par = eval_parallel(_run, noise_gray, radius=2, num_streams=4)
-    ref = _run(noise_gray, radius=2, num_streams=1)
+    par = eval_parallel(_run, noise_gray, radius=2)
+    ref = _run(noise_gray, radius=2)
     for n in range(noise_gray.num_frames):
         d = par[n] - frame_to_ndarray(ref.get_frame(n))
         assert np.abs(d).max() < 1e-5, f"parallel/serial mismatch at frame {n}"
 
 
 def test_bm3dv2_parallel_load_deterministic(noise_gray):
-    """Two parallel num_streams=4 runs must produce identical output.
+    """Two parallel runs must produce identical output.
 
     A fence attached to two in-flight submissions makes frame results depend
     on the completion order of the streams, which only shows up when many
     frames are in flight at once.
     """
-    a = eval_parallel(_run, noise_gray, radius=2, num_streams=4)
-    b = eval_parallel(_run, noise_gray, radius=2, num_streams=4)
+    a = eval_parallel(_run, noise_gray, radius=2)
+    b = eval_parallel(_run, noise_gray, radius=2)
     for n in range(noise_gray.num_frames):
         d = a[n] - b[n]
         assert np.abs(d).max() < 1e-5, f"nondeterministic output at frame {n}"
@@ -85,17 +84,14 @@ def test_bm3dv2_no_nan_all_frames(noise_gray, radius):
 
     A brand new filter instance is created per parametrized test.
     """
-    check_all_frames_finite(_run, noise_gray, radius=radius, num_streams=1)
+    check_all_frames_finite(_run, noise_gray, radius=radius)
 
 
-@pytest.mark.parametrize("num_streams", [2, 4])
-def test_bm3dv2_no_nan_all_frames_multi_stream(noise_gray, num_streams):
-    check_all_frames_finite(_run, noise_gray, radius=2, num_streams=num_streams)
 
 
 def test_bm3dv2_deterministic(noise_gray):
-    a = _run(noise_gray, radius=2, num_streams=1)
-    b = _run(noise_gray, radius=2, num_streams=1)
+    a = _run(noise_gray, radius=2)
+    b = _run(noise_gray, radius=2)
     for n in (0, 11, 23):
         d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
         # BM3D's aggregation uses float atomics, so two runs differ only by
@@ -104,23 +100,8 @@ def test_bm3dv2_deterministic(noise_gray):
         assert np.abs(d).max() < 1e-5, f"nondeterministic output at frame {n}"
 
 
-def test_bm3dv2_deterministic_multi_stream(noise_gray):
-    """Two separate num_streams=4 instances must produce the same output."""
-    a = _run(noise_gray, radius=2, num_streams=4)
-    b = _run(noise_gray, radius=2, num_streams=4)
-    for n in (0, 11, 23):
-        d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
-        assert np.abs(d).max() < 1e-5, f"nondeterministic output at frame {n}"
 
 
-def test_bm3dv2_multi_stream_matches_single(noise_gray):
-    """The pipelined num_streams=4 path must produce the same result as the
-    serial num_streams=1 path."""
-    a = _run(noise_gray, radius=2, num_streams=4)
-    b = _run(noise_gray, radius=2, num_streams=1)
-    for n in (0, 11, 23):
-        d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
-        assert np.abs(d).max() < 1e-5, f"num_streams mismatch at frame {n}"
 
 
 def test_bm3dv2_nosearch_matches_search_on_constant_clip(monkeypatch):
@@ -133,9 +114,9 @@ def test_bm3dv2_nosearch_matches_search_on_constant_clip(monkeypatch):
     clip = vs.core.std.BlankClip(
         width=64, height=64, format=vs.GRAYS, length=3, color=0.5)
     monkeypatch.delenv("BM3D_NOSEARCH", raising=False)
-    search = _run(clip, radius=2, num_streams=1)
+    search = _run(clip, radius=2)
     monkeypatch.setenv("BM3D_NOSEARCH", "1")
-    nosearch = _run(clip, radius=2, num_streams=1)
+    nosearch = _run(clip, radius=2)
     for n in range(3):
         a = frame_to_ndarray(search.get_frame(n))
         b = frame_to_ndarray(nosearch.get_frame(n))
@@ -167,12 +148,12 @@ def test_bm3dv2_ref_final_pass(noise_gray):
     """A basic estimate passed as \"ref\" drives the final (Wiener) pass.
 
     The final output must be finite on every frame, deterministic between two
-    sequential num_streams=1 instances, and differ from the basic estimate
+    sequential instances, and differ from the basic estimate
     (the Wiener refinement changes the pixels rather than copying them).
     """
-    basic = _run(noise_gray, radius=2, num_streams=1)
-    a = _run(noise_gray, radius=2, num_streams=1, ref=basic)
-    b = _run(noise_gray, radius=2, num_streams=1, ref=basic)
+    basic = _run(noise_gray, radius=2)
+    a = _run(noise_gray, radius=2, ref=basic)
+    b = _run(noise_gray, radius=2, ref=basic)
     for n in (0, 11, 23):
         fa = frame_to_ndarray(a.get_frame(n))
         fb = frame_to_ndarray(b.get_frame(n))
@@ -200,7 +181,7 @@ def test_bm3dv2_rejects_dimensions_below_block(w, h):
     with pytest.raises(vs.Error):
         BM3D(
             _blank(w, h), sigma=SIGMA, radius=2, bm_range=BM_RANGE,
-            ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=1,
+            ps_range=PS_RANGE, block_step=BLOCK_STEP,
         )
 
 
@@ -208,7 +189,7 @@ def test_bm3dv2_accepts_exactly_8x8():
     """An 8x8 clip is the smallest supported geometry and must run."""
     out = BM3D(
         _blank(8, 8), sigma=SIGMA, radius=2, bm_range=BM_RANGE,
-        ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=1,
+        ps_range=PS_RANGE, block_step=BLOCK_STEP,
     )
     a = frame_to_ndarray(out.get_frame(0))
     assert a.shape == (8, 8)
@@ -227,7 +208,7 @@ def test_bm3dv2_rejects_int32_res_overflow():
     with pytest.raises(vs.Error, match="32-bit"):
         BM3D(
             _blank(7680, 4320), sigma=SIGMA, radius=4, bm_range=BM_RANGE,
-            ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=4,
+            ps_range=PS_RANGE, block_step=BLOCK_STEP,
         )
 
 
@@ -235,7 +216,7 @@ def test_bm3dv2_accepts_radius4_within_addressing_limit():
     """The guard must not reject radius 4 when the stack stays addressable."""
     out = BM3D(
         _blank(8, 8), sigma=SIGMA, radius=4, bm_range=BM_RANGE,
-        ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=4,
+        ps_range=PS_RANGE, block_step=BLOCK_STEP,
     )
     assert out.num_frames == 3
 
@@ -250,10 +231,10 @@ def test_bm3dv2_device_id(noise_gray):
     diff ~2e-8, the atomic-order run-to-run floor).
     """
     with pytest.raises(vs.Error):
-        _run(noise_gray, num_streams=1, device_id=-1)
-    a = _run(noise_gray, num_streams=1, device_id=0)
-    b = _run(noise_gray, num_streams=1)
-    c = _run(noise_gray, num_streams=1, device_id=99)
+        _run(noise_gray, device_id=-1)
+    a = _run(noise_gray, device_id=0)
+    b = _run(noise_gray)
+    c = _run(noise_gray, device_id=99)
     for n in (0, 11, 23):
         d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
         assert np.abs(d).max() < 1e-5, f"device_id=0 differs from default at frame {n}"
@@ -268,7 +249,7 @@ def test_bm3dv2_preserves_gray_frame_props(noise_gray):
     ``SetFrameProps``; the surviving equivalent key ``_Range`` is tagged
     instead. ``MyTag`` verifies arbitrary application metadata.
     """
-    assert_preserves_frame_props(_run, noise_gray, radius=2, num_streams=1)
+    assert_preserves_frame_props(_run, noise_gray, radius=2)
 
 
 def test_bm3dv2_yuv_passthrough(noise_gray):
@@ -278,8 +259,8 @@ def test_bm3dv2_yuv_passthrough(noise_gray):
     yuv = vs.core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
     assert yuv.format.color_family == vs.YUV
 
-    out = _run(yuv, radius=2, num_streams=1)
-    ref = _run(noise_gray, radius=2, num_streams=1)
+    out = _run(yuv, radius=2)
+    ref = _run(noise_gray, radius=2)
 
     for n in (0, 11, 23):
         f = out.get_frame(n)
@@ -303,11 +284,11 @@ def test_bm3dv2_sigma_below_epsilon_passes_through(noise_gray, sigma, use_ref):
     if use_ref:
         basic = BM3D(
             noise_gray, sigma=SIGMA, radius=2, bm_range=BM_RANGE,
-            ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=1)
+            ps_range=PS_RANGE, block_step=BLOCK_STEP)
         _ = frame_to_ndarray(basic.get_frame(0))
     out = BM3D(
         noise_gray, sigma=sigma, radius=2, bm_range=BM_RANGE,
-        ps_range=PS_RANGE, block_step=BLOCK_STEP, num_streams=1,
+        ps_range=PS_RANGE, block_step=BLOCK_STEP,
         **({"ref": basic} if use_ref else {}))
     for n in (0, 11, 23):
         a = frame_to_ndarray(out.get_frame(n))
@@ -347,16 +328,16 @@ _SEEK_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 
     order = [0, 64, 1, 65, 2, 13, 79, 40, 95, 3]
 
-    # Serial num_streams=1 run is the self-consistency oracle.
+    # A serial run is the self-consistency oracle.
     try:
-        base = vsfeel(clip, num_streams=1, **kwargs)
+        base = vsfeel(clip, **kwargs)
         ref = {{n: read_plane(base.get_frame(n), 0, np.float32) for n in order}}
     except Exception as exc:
         print("VSFEEL fail: serial run: %s: %s" % (type(exc).__name__, exc), flush=True)
         raise SystemExit(3)
     print("REF ok", flush=True)
 
-    out = vsfeel(clip, num_streams=4, **kwargs)
+    out = vsfeel(clip, **kwargs)
     got = {{}}
     errors = {{}}
 
@@ -390,14 +371,14 @@ _SEEK_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 
 def test_bm3dv2_seek_collision_self_consistent():
     """R5: the 0/64/1/65/2 schedule on a 96-frame clip must not deadlock and
-    must match a num_streams=1 run (measured max diff ~2e-8)."""
+    must match a serial run (measured max diff ~2e-8)."""
     try:
         worst = run_compare_subprocess(_SEEK_SCRIPT, [], timeout=300)
     except ReferenceUnavailable as exc:
         # There is no external reference here: anything that dies before the
         # serial run completes is a vsfeel failure, not a missing reference.
         raise AssertionError(f"seek-schedule subprocess failed early: {exc}") from exc
-    assert worst < 1e-5, f"num_streams=4 seek schedule mismatch: {worst}"
+    assert worst < 1e-5, f"seek schedule mismatch: {worst}"
 
 
 def test_bm3dv2_seek_collision_single_queue():
@@ -426,7 +407,7 @@ def test_bm3dv2_frame_request_order_matches_serial():
     assert_temporal_order_consistent(
         "BM3Dv2",
         {"sigma": SIGMA, "radius": 2, "bm_range": BM_RANGE, "ps_range": PS_RANGE,
-         "block_step": BLOCK_STEP, "num_streams": 4},
+         "block_step": BLOCK_STEP},
         tol=1e-5, timeout=300)
 
 
@@ -436,7 +417,7 @@ def test_bm3dv2_short_clip_temporal_window(nframes):
     assert_temporal_order_consistent(
         "BM3Dv2",
         {"sigma": SIGMA, "radius": 2, "bm_range": BM_RANGE, "ps_range": PS_RANGE,
-         "block_step": BLOCK_STEP, "num_streams": 4},
+         "block_step": BLOCK_STEP},
         tol=1e-5, nframes=nframes, timeout=300)
 
 
@@ -463,9 +444,6 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     core.max_cache_size = 1024 * 56
     src = core.bs.VideoSource({NOISE_MKV!r})
     clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
-
-    if ref != "bm3dhip":
-        kwargs["num_streams"] = 1
 
     frames = (0, 11, 23)
 
@@ -637,8 +615,8 @@ def test_bm3dv2_matches_reference(noise_gray, radius):
 @pytest.mark.parametrize("extractor_exp", [3, 6, 8])
 def test_bm3dv2_extractor_exp_is_bit_reproducible(noise_gray, extractor_exp):
     """Two runs at extractor_exp >= 3 must be identical (reference: exact)."""
-    a = _run(noise_gray, radius=2, num_streams=1, extractor_exp=extractor_exp)
-    b = _run(noise_gray, radius=2, num_streams=1, extractor_exp=extractor_exp)
+    a = _run(noise_gray, radius=2, extractor_exp=extractor_exp)
+    b = _run(noise_gray, radius=2, extractor_exp=extractor_exp)
     for n in (0, 11, 23):
         fa = frame_to_ndarray(a.get_frame(n))
         fb = frame_to_ndarray(b.get_frame(n))
@@ -650,8 +628,8 @@ def test_bm3dv2_extractor_exp_changes_aggregation(noise_gray):
     """A 2^20 extractor quantises the atomic addends to a 0.125 grid, which
     must move the output (the reference goes non-finite at 2^20). An output
     identical to extractor_exp=0 means the constant is folded away again."""
-    base = _run(noise_gray, radius=2, num_streams=1, extractor_exp=0)
-    coarse = _run(noise_gray, radius=2, num_streams=1, extractor_exp=20)
+    base = _run(noise_gray, radius=2, extractor_exp=0)
+    coarse = _run(noise_gray, radius=2, extractor_exp=20)
     for n in (0, 11, 23):
         d = np.abs(frame_to_ndarray(base.get_frame(n))
                    - frame_to_ndarray(coarse.get_frame(n)))

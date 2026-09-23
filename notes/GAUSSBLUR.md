@@ -14,8 +14,8 @@ Design (current):
 - `WIDTH/HEIGHT/STRIDE/KLEN/RAD` are specialization constants read off a probe
   frame at creation; five push-descriptor bindings (`wt`, `src`, `dst`, `tmp`,
   `dst` dword view), only `tmp_elem`/`wt_base` push constants carry values.
-- Unprocessed planes ride along via `newVideoFrame2`; `num_streams` and
-  `device_id` are accepted and **ignored** (still validated 1..32 / ≥ 0).
+- Unprocessed planes ride along via `newVideoFrame2`; `num_streams` is a
+  registered no-op, `device_id` ≥ 0 is still enforced.
 - Runs need `RADV_EXPERIMENTAL=transfer_queue`, which `tools/benchmark.py`
   forces (mechanism: `notes/BILATERAL.md`).
 - The filter sits at the API's transfer ceiling: a bare core
@@ -149,8 +149,6 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
 
 - `VSFEEL_GAUSS_TIMING=1` — per-frame host stage `[gauss-timing]` averages
   (acquire/record/submit/total) at instance destruction.
-- `VSFEEL_GAUSS_DEPRECATED=1` — creation banner when `num_streams` is passed
-  (it is ignored).
 - `VSFEEL_DEBUG=1|2`, `VSFEEL_TRACE=1|2` — the shared error trace and trail
   (`acquire`/`record`/`submit` marks are recorded in the frame path).
 - Removed with the legacy path: `VSFEEL_GAUSS_HD`, `VSFEEL_GAUSS_KD`,

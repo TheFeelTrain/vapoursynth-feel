@@ -756,18 +756,6 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
     }
 }
 
-// Record one whole sub-pass: all four phases with a barrier between them.
-static void record_pass_all(const Eedi3Data & d, VkCommandBuffer cmd,
-                            const Eedi3Job & job) {
-    record_pass(d, cmd, &job, 1, PassPhase::kPrep);
-    gpu_barrier(*d.gpu, cmd);
-    record_pass(d, cmd, &job, 1, PassPhase::kRow);
-    gpu_barrier(*d.gpu, cmd);
-    record_pass(d, cmd, &job, 1, PassPhase::kVcheck);
-    gpu_barrier(*d.gpu, cmd);
-    record_pass(d, cmd, &job, 1, PassPhase::kTail);
-}
-
 // ---------------------------------------------------------------------------
 // Output-frame batching
 // ---------------------------------------------------------------------------
@@ -1746,17 +1734,10 @@ static void vsfeel_eedi3_create(
         return set_error("invalid device ID.");
     }
 
-    int num_streams = vsh::int64ToIntS(vsapi->mapGetInt(in, "num_streams", 0, &err));
-    if (err) {
-        num_streams = 8;
-    }
-    if (num_streams < 1 || num_streams > 32) {
-        return set_error("num_streams must be 1..32.");
-    }
-    // num_streams and device_id are accepted for compatibility: under the R80
-    // GPU API the core owns the one device and sizes the exec pool itself.
-    (void)num_streams;
+    // device_id is accepted for compatibility: the core owns the one device.
     (void)device_id;
+    // num_streams is a registered no-op: in-flight depth is the core's
+    // (exec pool ring) call, so the argument is accepted and never read.
 
     if (const char * vp = env_str("VSFEEL_EEDI3_VPARA")) {
         const int v = atoi(vp);

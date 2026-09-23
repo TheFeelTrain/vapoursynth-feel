@@ -1385,12 +1385,8 @@ static void VS_CC BM3DCreate(
     }
     d->ps_range = ps_range[0];
 
-    // "num_streams" is accepted for compatibility and no longer selects
-    // anything: how many frames are in flight is the core's call now, and the
-    // two-stream depth this filter's caches are sized for is fixed below.
-    if (vsapi->mapGetInt(in, "num_streams", 0, &error), !error && vsfeel_debug_flag("VSFEEL_BM3D_DEPRECATED")) {
-        fprintf(stderr, "[bm3d] num_streams is ignored under the R80 GPU API\n");
-    }
+    // num_streams is a registered no-op: the cache and stream depths this
+    // filter's working sets are sized for are the fixed two below.
     d->num_streams = 2;
 
     int device_id = vsh::int64ToIntS(vsapi->mapGetInt(in, "device_id", 0, &error));
@@ -1537,10 +1533,9 @@ static void VS_CC BM3DCreate(
             char msg[256];
             snprintf(msg, sizeof(msg),
                 "frame is too large: the estimate cache needs %llu floats per "
-                "plane (radius %d, num_streams %d), which overflows the 32-bit "
-                "kernel addressing; reduce num_streams or radius",
-                static_cast<unsigned long long>(res_floats), d->radius,
-                d->num_streams);
+                "plane (radius %d), which overflows the 32-bit kernel "
+                "addressing; reduce radius",
+                static_cast<unsigned long long>(res_floats), d->radius);
             return set_error(msg);
         }
     }
@@ -1549,7 +1544,6 @@ static void VS_CC BM3DCreate(
     {
         VkDeviceSize src_size = 0;
         VkDeviceSize res_size = 0;
-        VkDeviceSize dst_size = 0;
         (void)res_size;
         for (int plane = 0; plane < d->n_planes; ++plane) {
             const auto & p = d->planes[plane];
@@ -1558,7 +1552,6 @@ static void VS_CC BM3DCreate(
             const int clips = d->final ? 2 : 1;
             src_size += static_cast<VkDeviceSize>(d->src_ring) * clips * p.pe;
             res_size += static_cast<VkDeviceSize>(d->res_cap) * d->tw * 2 * p.pe;
-            dst_size += p.pe;
         }
         d->src_size = src_size;
         d->res_size_per_plane = static_cast<VkDeviceSize>(d->res_cap) * d->tw * 2 * d->planes[0].pe;
@@ -1584,11 +1577,11 @@ static void VS_CC BM3DCreate(
                 // card"; name the size and what shrinks it.
                 char msg[320];
                 snprintf(msg, sizeof(msg),
-                    "%s; the estimate cache needs %.0f MiB (radius %d, "
-                    "num_streams %d): lower radius or num_streams",
+                    "%s; the estimate cache needs %.0f MiB (radius %d): "
+                    "lower radius",
                     err.c_str(),
                     static_cast<double>(res_size) * 4.0 / (1024.0 * 1024.0),
-                    d->radius, d->num_streams);
+                    d->radius);
                 return set_error(msg);
             }
         }

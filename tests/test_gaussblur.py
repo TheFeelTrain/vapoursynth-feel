@@ -30,7 +30,7 @@ from conftest import (
 pytestmark = pytest.mark.usefixtures("noise_gray")
 
 
-def _run(clip, sigma=2.0, num_streams=1, **kwargs):
+def _run(clip, sigma=2.0, **kwargs):
     """GaussBlur as a clip the test can read pixels from.
 
     Under the R80 GPU API the filter takes and returns ``vnode:gpu`` frames, so
@@ -40,7 +40,6 @@ def _run(clip, sigma=2.0, num_streams=1, **kwargs):
     return cpu_node(vs.core.vsfeel.GaussBlur(
         clip,
         sigma=sigma,
-        num_streams=num_streams,
         **kwargs,
     ))
 
@@ -57,25 +56,19 @@ def test_gaussblur_deterministic_32bit(noise_gray):
         assert np.abs(d).max() < 1e-6, f"nondeterministic output at frame {n}"
 
 
-def test_gaussblur_multi_stream_matches_single_32bit(noise_gray):
-    a = _run(noise_gray, sigma=5.0, num_streams=4)
-    b = _run(noise_gray, sigma=5.0, num_streams=1)
-    for n in (0, 11, 23):
-        d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
-        assert np.abs(d).max() < 1e-6, f"num_streams mismatch at frame {n}"
 
 
 def test_gaussblur_parallel_load_matches_serial_32bit(noise_gray):
-    par = eval_parallel(_run, noise_gray, sigma=10.0, num_streams=4)
-    ref = _run(noise_gray, sigma=10.0, num_streams=1)
+    par = eval_parallel(_run, noise_gray, sigma=10.0)
+    ref = _run(noise_gray, sigma=10.0)
     for n in range(noise_gray.num_frames):
         d = par[n] - frame_to_ndarray(ref.get_frame(n))
         assert np.abs(d).max() < 1e-6, f"parallel/serial mismatch at frame {n}"
 
 
 def test_gaussblur_parallel_load_deterministic_32bit(noise_gray):
-    a = eval_parallel(_run, noise_gray, sigma=10.0, num_streams=4)
-    b = eval_parallel(_run, noise_gray, sigma=10.0, num_streams=4)
+    a = eval_parallel(_run, noise_gray, sigma=10.0)
+    b = eval_parallel(_run, noise_gray, sigma=10.0)
     for n in range(noise_gray.num_frames):
         d = a[n] - b[n]
         assert np.abs(d).max() < 1e-6, f"nondeterministic output at frame {n}"
@@ -90,26 +83,19 @@ def test_gaussblur_deterministic_16bit(noise_16bit):
         assert np.array_equal(fa, fb), f"nondeterministic output at frame {n}"
 
 
-def test_gaussblur_multi_stream_matches_single_16bit(noise_16bit):
-    a = _run(noise_16bit, sigma=5.0, num_streams=4)
-    b = _run(noise_16bit, sigma=5.0, num_streams=1)
-    for n in (0, 11, 23):
-        fa = _plane(a.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
-        fb = _plane(b.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
-        assert np.array_equal(fa, fb), f"num_streams mismatch at frame {n}"
 
 
 def test_gaussblur_parallel_load_matches_serial_16bit(noise_16bit):
-    par = eval_parallel(_run, noise_16bit, dtype=np.uint16, sigma=10.0, num_streams=4)
-    ref = _run(noise_16bit, sigma=10.0, num_streams=1)
+    par = eval_parallel(_run, noise_16bit, dtype=np.uint16, sigma=10.0)
+    ref = _run(noise_16bit, sigma=10.0)
     for n in range(noise_16bit.num_frames):
         fb = _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         assert np.array_equal(par[n], fb), f"parallel/serial mismatch at frame {n}"
 
 
 def test_gaussblur_parallel_load_deterministic_16bit(noise_16bit):
-    a = eval_parallel(_run, noise_16bit, dtype=np.uint16, sigma=10.0, num_streams=4)
-    b = eval_parallel(_run, noise_16bit, dtype=np.uint16, sigma=10.0, num_streams=4)
+    a = eval_parallel(_run, noise_16bit, dtype=np.uint16, sigma=10.0)
+    b = eval_parallel(_run, noise_16bit, dtype=np.uint16, sigma=10.0)
     for n in range(noise_16bit.num_frames):
         assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
 
@@ -145,7 +131,7 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 
     # --- reference phase: materialise and copy before touching vsfeel ---
     try:
-        ref_node = core.vszipcl.GaussBlur(clip, sigma=sigma, num_streams=1)
+        ref_node = core.vszipcl.GaussBlur(clip, sigma=sigma)
         ref_frames = {{n: [read_plane(ref_node.get_frame(n), p, dtype)
                            for p in range(planes)]
                        for n in (3, 11, 23)}}
@@ -155,7 +141,7 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     print("REF ok", flush=True)
 
     # --- vsfeel phase (GPU-resident output downloaded for the host reads) ---
-    my_node = cpu_node(core.vsfeel.GaussBlur(clip, sigma=sigma, num_streams=1))
+    my_node = cpu_node(core.vsfeel.GaussBlur(clip, sigma=sigma))
     worst = 0.0
     for n in (3, 11, 23):
         fm = my_node.get_frame(n)
@@ -265,7 +251,7 @@ def test_gaussblur_sigma_zero_passthrough_yuv_16bit(noise_gray):
     """16-bit mirror of test_gaussblur_sigma_zero_passthrough_yuv."""
     src = vs.core.bs.VideoSource(NOISE_MKV)
     yuv = vs.core.resize.Bicubic(src, format=vs.YUV420P16)
-    out = _run(yuv, sigma=[0.0, 3.0], num_streams=1)
+    out = _run(yuv, sigma=[0.0, 3.0])
     for n in (0, 11, 23):
         f = out.get_frame(n)
         s = yuv.get_frame(n)
@@ -286,7 +272,7 @@ def test_gaussblur_sigma_zero_passthrough_yuv_32bit(noise_gray):
     """sigma=0 on luma copies that plane through while chroma is blurred."""
     src = vs.core.bs.VideoSource(NOISE_MKV)
     yuv = vs.core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
-    out = _run(yuv, sigma=[0.0, 3.0], num_streams=1)
+    out = _run(yuv, sigma=[0.0, 3.0])
     for n in (0, 11, 23):
         f = out.get_frame(n)
         s = yuv.get_frame(n)
@@ -310,13 +296,13 @@ def test_gaussblur_changes_noise_16bit(noise_16bit):
     vszipcl is absent, so this is the invariant that fails for an identity
     implementation.
     """
-    out = _run(noise_16bit, sigma=2.0, num_streams=1)
+    out = _run(noise_16bit, sigma=2.0)
     assert_changes_on_noise(out, noise_16bit, what="GaussBlur")
 
 
 def test_gaussblur_preserves_frame_props(noise_gray):
     """GaussBlur must republish the source frame's properties."""
-    assert_preserves_frame_props(_run, noise_gray, sigma=2.0, num_streams=1)
+    assert_preserves_frame_props(_run, noise_gray, sigma=2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -347,11 +333,6 @@ def test_gaussblur_rejects_bad_bitdepth(noise_8bit):
         _run(clip)
 
 
-def test_gaussblur_rejects_bad_num_streams(noise_gray):
-    with pytest.raises(vs.Error):
-        _run(noise_gray, num_streams=0)
-    with pytest.raises(vs.Error):
-        _run(noise_gray, num_streams=33)
 
 
 # ---------------------------------------------------------------------------
@@ -391,8 +372,8 @@ def test_gaussblur_per_plane_sigma_matches_reference_yuv_16bit(noise_gray, sigma
 def test_gaussblur_per_plane_sigma_gray_32bit(noise_gray):
     """On a single-plane clip only element 0 is used; extra elements must not
     change the result (must equal the scalar run bit-exactly)."""
-    scalar = _run(noise_gray, sigma=2.0, num_streams=1)
-    array = _run(noise_gray, sigma=[2.0, 99.0, 0.25], num_streams=1)
+    scalar = _run(noise_gray, sigma=2.0)
+    array = _run(noise_gray, sigma=[2.0, 99.0, 0.25])
     for n in (0, 11):
         a = frame_to_ndarray(scalar.get_frame(n))
         b = frame_to_ndarray(array.get_frame(n))
@@ -415,8 +396,8 @@ def test_gaussblur_rejects_radius_ge_dimension():
     small = core.std.BlankClip(format=vs.GRAYS, width=32, height=32, length=2)
     for sigma in (16.0, 32.0, 100.0):
         with pytest.raises(vs.Error, match=r"radius >= dimension"):
-            _run(small, sigma=sigma, num_streams=1)
-    ok = _run(small, sigma=4.0, num_streams=1)
+            _run(small, sigma=sigma)
+    ok = _run(small, sigma=4.0)
     assert np.isfinite(frame_to_ndarray(ok.get_frame(0))).all()
 
 
@@ -428,4 +409,4 @@ def test_gaussblur_rejects_radius_ge_dimension_per_plane(noise_gray):
                                length=2)
     # chroma plane is 32x32; sigma 16 exceeds it while luma (64) is fine
     with pytest.raises(vs.Error, match=r"radius >= dimension"):
-        _run(small, sigma=[2.0, 16.0, 16.0], num_streams=1)
+        _run(small, sigma=[2.0, 16.0, 16.0])

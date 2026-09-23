@@ -55,19 +55,17 @@ def _compare(fmt, frames, params, guide=None):
 
 
 def test_bilateral_output_finite_32bit(noise_gray):
-    for num_streams in (1, 2):
-        out = _run(
-            noise_gray,
-            sigma_spatial=SIGMA_SPATIAL,
-            sigma_color=SIGMA_COLOR,
-            num_streams=num_streams,
-        )
-        assert_gray32(out)
-        for n in (0, 10, 23):
-            frame = out.get_frame(n)
-            a = frame_to_ndarray(frame)
-            assert np.isfinite(a).all(), f"non-finite output at frame {n}"
-            assert a.min() >= 0.0 and a.max() <= 1.0
+    out = _run(
+        noise_gray,
+        sigma_spatial=SIGMA_SPATIAL,
+        sigma_color=SIGMA_COLOR,
+    )
+    assert_gray32(out)
+    for n in (0, 10, 23):
+        frame = out.get_frame(n)
+        a = frame_to_ndarray(frame)
+        assert np.isfinite(a).all(), f"non-finite output at frame {n}"
+        assert a.min() >= 0.0 and a.max() <= 1.0
 
 
 def test_bilateral_defaults_run_32bit(noise_gray):
@@ -99,8 +97,7 @@ def test_bilateral_rejects_10bit(noise_8bit):
 
 def test_bilateral_matches_reference_32bit(noise_gray):
     """Default parameters stay close to the reference implementation."""
-    params = dict(sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR,
-                  num_streams=2)
+    params = dict(sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
     worst = _compare("gray32", (0, 11, 23), params)
     assert worst < REF_TOL, f"max diff {worst}"
 
@@ -224,16 +221,14 @@ def test_bilateral_ref_clip_matches_reference_32bit(noise_gray):
 def test_bilateral_output_finite_16bit(noise_16bit):
     """The 16-bit output must be finite AND actually filtered: an identity
     implementation used to pass the uint16 finiteness/range check."""
-    for num_streams in (1, 2):
-        out = _run(
-            noise_16bit,
-            sigma_spatial=SIGMA_SPATIAL,
-            sigma_color=SIGMA_COLOR,
-            num_streams=num_streams,
-        )
-        assert out.format.id == noise_16bit.format.id
-        assert_changes_on_noise(out, noise_16bit, frames=(10,),
-                                what="bilateral")
+    out = _run(
+        noise_16bit,
+        sigma_spatial=SIGMA_SPATIAL,
+        sigma_color=SIGMA_COLOR,
+    )
+    assert out.format.id == noise_16bit.format.id
+    assert_changes_on_noise(out, noise_16bit, frames=(10,),
+                            what="bilateral")
 
 
 def test_bilateral_defaults_run_16bit(noise_16bit):
@@ -246,7 +241,7 @@ def test_bilateral_preserves_frame_props(noise_gray):
     """Bilateral must republish the source frame's properties."""
     assert_preserves_frame_props(
         _run, noise_gray, sigma_spatial=SIGMA_SPATIAL,
-        sigma_color=SIGMA_COLOR, num_streams=1)
+        sigma_color=SIGMA_COLOR)
 
 
 def test_bilateral_deterministic_16bit(noise_16bit):
@@ -281,7 +276,7 @@ BLOCK_SHAPES = [(16, 16), (8, 32), (32, 8), (64, 1), (1, 64), (16, 8), (4, 4)]
                          ids=[f"{x}x{y}" for x, y in BLOCK_SHAPES])
 def test_bilateral_block_shape_does_not_change_output_32bit(
         noise_gray, block_x, block_y):
-    kwargs = dict(sigma_spatial=3.0, sigma_color=0.05, num_streams=1)
+    kwargs = dict(sigma_spatial=3.0, sigma_color=0.05)
     default = _run(noise_gray, **kwargs)
     shaped = _run(noise_gray, block_x=block_x, block_y=block_y, **kwargs)
     for n in (0, 11, 23):
@@ -295,7 +290,7 @@ def test_bilateral_block_shape_does_not_change_output_32bit(
                          ids=[f"{x}x{y}" for x, y in BLOCK_SHAPES])
 def test_bilateral_block_shape_does_not_change_output_16bit(
         noise_16bit, block_x, block_y):
-    kwargs = dict(sigma_spatial=3.0, sigma_color=0.05, num_streams=1)
+    kwargs = dict(sigma_spatial=3.0, sigma_color=0.05)
     default = _run(noise_16bit, **kwargs)
     shaped = _run(noise_16bit, block_x=block_x, block_y=block_y, **kwargs)
     for n in (0, 11, 23):
@@ -322,7 +317,7 @@ def test_bilateral_negative_block_is_clamped_not_rejected(noise_gray):
     at :733. Output is still correct (the shape has no semantic effect); the
     validation is just inconsistent with ``block_x=0``, which errors.
     """
-    kwargs = dict(sigma_spatial=3.0, sigma_color=0.05, num_streams=1)
+    kwargs = dict(sigma_spatial=3.0, sigma_color=0.05)
     default = _run(noise_gray, **kwargs)
     for bx, by in [(-1, 8), (8, -1), (-1, -1)]:
         shaped = _run(noise_gray, block_x=bx, block_y=by, **kwargs)
@@ -370,10 +365,9 @@ def test_bilateral_per_plane_arrays_match_reference_16bit(noise_16bit, kwargs):
 def test_bilateral_per_plane_arrays_gray_32bit(noise_gray):
     """A three-element array on a single-plane clip: only element 0 is used,
     and the result must equal the scalar-parameter run exactly."""
-    scalar = _run(noise_gray, sigma_spatial=2.0, sigma_color=0.05,
-                  num_streams=1)
+    scalar = _run(noise_gray, sigma_spatial=2.0, sigma_color=0.05)
     array = _run(noise_gray, sigma_spatial=[2.0, 1.5, 1.0],
-                 sigma_color=[0.05, 0.03, 0.02], num_streams=1)
+                 sigma_color=[0.05, 0.03, 0.02])
     for n in (0, 11):
         a = frame_to_ndarray(scalar.get_frame(n))
         b = frame_to_ndarray(array.get_frame(n))

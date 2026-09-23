@@ -10,8 +10,7 @@ grouping did not divide the width.
 The tests crop a 640-wide Gray clip to 630/638 px (the yuv420 variants also
 give half-width chroma rows) and compare the affected filters against the
 matching reference (vszipcl, eedi3vk2, nnedi3vk).  They also cover a
-``num_streams=4`` variant and a top/bottom crop; the reference always stays
-serial, so those cases double as multi-stream-vs-serial checks.  EEDI3H and
+top/bottom crop.  EEDI3H and
 EEDI3AA have no exact external reference, so their oracle is the same plugin's
 composition (Transpose -> EEDI3 -> Transpose, and Merge(EEDI3H(Merge(EEDI3)))).
 
@@ -75,7 +74,6 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     color = spec.get("color", "gray")
     params = spec.get("params", {{}})
     frames = spec.get("frames", [0, 1, 2])
-    streams = spec.get("streams", 1)
     filter_ = spec["filter"]
 
     if filter_ == "nnedi3":
@@ -114,39 +112,39 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 
     def build_ref():
         if filter_ == "dfttest":
-            return core.vszipcl.DFTTest(main, num_streams=1, **params)
+            return core.vszipcl.DFTTest(main, **params)
         if filter_ == "gaussblur":
-            return core.vszipcl.GaussBlur(main, num_streams=1, **params)
+            return core.vszipcl.GaussBlur(main, **params)
         if filter_ == "bilateral":
-            return core.vszipcl.Bilateral(main, ref=guide, num_streams=1,
+            return core.vszipcl.Bilateral(main, ref=guide,
                                           **params)
         if filter_ == "bm3d":
-            return core.vszipcl.BM3Dv2(main, num_streams=1, **params)
+            return core.vszipcl.BM3Dv2(main, **params)
         if filter_ == "nnedi3":
-            return core.nnedi3vk.NNEDI3(main, field=1, num_streams=1, **params)
+            return core.nnedi3vk.NNEDI3(main, field=1, **params)
         if filter_ == "nlmeans":
-            return core.vszipcl.NLMeans(main, num_streams=1, **params)
+            return core.vszipcl.NLMeans(main, **params)
         if filter_ == "eedi3":
-            return core.eedi3vk2.EEDI3(main, num_streams=1, **params)
+            return core.eedi3vk2.EEDI3(main, **params)
         if filter_ == "eedi3h":
             t = core.std.Transpose(main)
             return core.std.Transpose(
-                core.vsfeel.EEDI3(t, num_streams=1, **params))
+                core.vsfeel.EEDI3(t, **params))
         if filter_ == "eedi3aa":
-            v = core.vsfeel.EEDI3(main, num_streams=1, **params)
+            v = core.vsfeel.EEDI3(main, **params)
             vm = core.std.Merge(v[::2], v[1::2])
-            h = core.vsfeel.EEDI3H(vm, num_streams=1, **params)
+            h = core.vsfeel.EEDI3H(vm, **params)
             return core.std.Merge(h[::2], h[1::2])
         raise SystemExit("bad filter %r" % filter_)
 
     def build_my():
         if filter_ == "bilateral":
-            return core.vsfeel.Bilateral(main, ref=guide, num_streams=streams,
+            return core.vsfeel.Bilateral(main, ref=guide,
                                          **params)
         if filter_ == "nnedi3":
-            return core.vsfeel.NNEDI3(main, field=1, num_streams=streams,
+            return core.vsfeel.NNEDI3(main, field=1,
                                       **params)
-        return getattr(core.vsfeel, NAMES[filter_])(main, num_streams=streams,
+        return getattr(core.vsfeel, NAMES[filter_])(main,
                                                     **params)
 
     # --- reference/oracle phase: materialise and copy before touching vsfeel ---
@@ -192,7 +190,6 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     print("RESULT " + json.dumps({{"maxdiff": worst, "width": main.width,
                                   "height": main.height, "color": color,
                                   "planes": planes, "frames": list(frames),
-                                  "streams": streams,
                                   "num_frames": my_node.num_frames}}), flush=True)
 """)
 
@@ -220,18 +217,16 @@ _CROP_BOTTOM = 3
 CASES = []
 
 
-def _add(filter_, bits, width, guide, params, tol, color="gray", streams=1,
+def _add(filter_, bits, width, guide, params, tol, color="gray",
          top=0, bottom=0):
     spec = {"filter": filter_, "bits": bits, "width": width, "guide": guide,
             "color": color, "params": params, "frames": FRAMES,
-            "streams": streams, "top": top, "bottom": bottom}
+            "top": top, "bottom": bottom}
     cid = "%s-%s-w%d" % (filter_, "f32" if bits == 32 else "u16", width)
     if guide:
         cid += "-guide"
     if color == "yuv420":
         cid += "-yuv420"
-    if streams != 1:
-        cid += "-s%d" % streams
     if top or bottom:
         cid += "-v%d_%d" % (top, bottom)
     CASES.append(pytest.param(spec, tol, id=cid))
@@ -275,15 +270,6 @@ for _w in WIDTHS:
     _add("bilateral", 32, _w, 0, _BILATERAL_PARAMS, TOL_F32_ULP, "yuv420")
     _add("bilateral", 16, _w, 0, _BILATERAL_PARAMS, TOL_U16_LSB, "yuv420")
 
-# num_streams=4 under cropped geometry.  The reference/oracle stays serial, so
-# these are also multi-stream-vs-serial checks at a non-tight pitch (EEDI3
-# ships with num_streams=8, so 4 exercises the lower sweep point).
-_add("nnedi3", 16, 630, 0, _NNEDI3_PARAMS, TOL_U16_LSB, streams=4)
-_add("eedi3", 16, 630, 0, _EEDI3_PARAMS, TOL_EEDI3_16, streams=4)
-_add("eedi3h", 16, 630, 0, _EEDI3H_PARAMS, TOL_ORACLE_EXACT, streams=4)
-_add("eedi3aa", 16, 630, 0, _EEDI3AA_PARAMS, TOL_ORACLE_EXACT, streams=4)
-_add("nlmeans", 32, 630, 0, _NLMEANS_PARAMS, TOL_NLMEANS_32, streams=4)
-
 # Vertical crop: a non-zero row origin and a shorter plane exercise the row
 # staging / pad-origin path that the right-only crop leaves at row 0.
 _add("dfttest", 32, 630, 0, _DFTTEST_PARAMS, TOL_F32_ULP,
@@ -316,11 +302,9 @@ def test_cropped_width_matches_reference(spec, tol):
     assert payload["height"] == \
         HEIGHT - spec.get("top", 0) - spec.get("bottom", 0), (
         f"unexpected output height {payload['height']} for {spec}")
-    assert payload["streams"] == spec.get("streams", 1)
     assert payload["frames"] == spec["frames"]
     maxdiff = float(payload["maxdiff"])
     assert maxdiff <= tol, (
         f"{spec['filter']} bits={spec['bits']} width={spec['width']} "
-        f"streams={spec.get('streams', 1)} "
         f"crop=({spec.get('top', 0)},{spec.get('bottom', 0)}) "
         f"guide={spec.get('guide', 0)}: max diff {maxdiff} > tol {tol}")

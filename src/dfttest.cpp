@@ -1099,16 +1099,8 @@ static void VS_CC DftCreate(
         return set_error("\"device_id\" must be non-negative; under the R80 GPU API "
                          "device selection is core.set_vulkan_device");
     }
-    int num_streams = vsh::int64ToIntS(vsapi->mapGetInt(in, "num_streams", 0, &error));
-    if (error) {
-        num_streams = 1;
-    }
-    if (num_streams < 1 || num_streams > 32) {
-        return set_error("num_streams must be 1..32.");
-    }
-    // "num_streams" no longer selects anything: how many frames are in flight
-    // is the core's call now (the exec pool sizes its ring from its worker
-    // count). It stays validated so existing scripts keep the same errors.
+    // num_streams is a registered no-op: in-flight depth is the core's
+    // (exec pool ring) call, so the argument is accepted and never read.
 
     d->radius = (tbsize - 1) / 2;
     d->block_step = sbsize - sosize;

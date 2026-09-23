@@ -308,8 +308,6 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     dev->api = api;
     dev->vk = vk;
     dev->handles = handles;
-    dev->instance = handles.instance;
-    dev->physical_device = handles.physicalDevice;
     dev->device = handles.device;
     dev->queue_family = handles.computeQueueFamily;
     dev->pipeline_cache_lock = new std::mutex();
@@ -336,17 +334,11 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     vk->vkGetPhysicalDeviceProperties2(handles.physicalDevice, &props);
     dev->limits = props.properties.limits;
     dev->api_version = props.properties.apiVersion;
-    dev->max_storage_buffer_range = props.properties.limits.maxStorageBufferRange;
     dev->subgroup_size = subgroup.subgroupSize;
     dev->min_subgroup_size = size_control.minSubgroupSize;
     dev->max_subgroup_size = size_control.maxSubgroupSize;
     dev->subgroup_shuffle =
         (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT) != 0;
-
-    VkPhysicalDeviceMemoryProperties2 mem {};
-    mem.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
-    vk->vkGetPhysicalDeviceMemoryProperties2(handles.physicalDevice, &mem);
-    dev->mem_props = mem.memoryProperties;
 
     uint32_t families = 0;
     vk->vkGetPhysicalDeviceQueueFamilyProperties2(handles.physicalDevice, &families, nullptr);
@@ -360,9 +352,8 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
             family_props[handles.computeQueueFamily].queueFamilyProperties.timestampValidBits;
     }
 
-    // shaderFloat64 and shaderFloat16 are optional in the core's baseline, so a
-    // kernel that needs one asks the physical device rather than assuming --
-    // and what the device reports is what the core enabled.
+    // The atomic-float feature is the one a filter's aggregation kernels ask
+    // about; it rides the 1.2/1.3 feature chain the query below populates.
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float {};
     atomic_float.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
     VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT atomic_float2 {};
@@ -391,8 +382,6 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features.pNext = &f12;
     vk->vkGetPhysicalDeviceFeatures2(handles.physicalDevice, &features);
-    dev->feat_float16 = f12.shaderFloat16 != 0;
-    dev->feat_float64 = features.features.shaderFloat64 != 0;
     dev->feat_atomic_float32_add = has_atomic_float &&
         (atomic_float.shaderBufferFloat32Atomics || atomic_float.shaderBufferFloat32AtomicAdd);
 
@@ -413,11 +402,11 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
                         "maxStorageBufferRange=%llu\n",
             dev->queue_family, dev->timestamp_valid_bits, dev->subgroup_size,
             dev->min_subgroup_size, dev->max_subgroup_size,
-            static_cast<unsigned long long>(dev->max_storage_buffer_range));
+            static_cast<unsigned long long>(dev->limits.maxStorageBufferRange));
         fprintf(stderr, "[vsfeel] transfer queue family %u index %u\n",
             handles.transferQueueFamily, handles.transferQueueIndex);
-        fprintf(stderr, "[vsfeel] optional features: float16=%d float64=%d float32Atomics=%d\n",
-            dev->feat_float16, dev->feat_float64, dev->feat_atomic_float32_add);
+        fprintf(stderr, "[vsfeel] optional features: float32Atomics=%d\n",
+            dev->feat_atomic_float32_add);
     }
 
     g_gpu_devices.emplace(handles.device, dev);

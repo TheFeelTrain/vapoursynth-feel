@@ -228,8 +228,6 @@ SDMA and the port reaches parity without any core change.
   (acquire/record/submit/total) at instance destruction.
 - `VSFEEL_DEBUG=1|2`, `VSFEEL_TRACE=1|2` — the shared error trace and trail
   (`acquire`/`record`/`submit` marks are recorded in the frame path).
-- `VSFEEL_BILAT_DEPRECATED=1` — prints a creation banner when `num_streams` is
-  passed (it is ignored).
 - Removed with the legacy path: `VSFEEL_BILAT_HD`, `VSFEEL_BILAT_KD`,
   `VSFEEL_BILAT_QUEUES`, `VSFEEL_BILAT_NOCPU`, `VSFEEL_BILAT_NODL`,
   `VSFEEL_BILAT_NODISPATCH`, `VSFEEL_BILAT_TRACE`.

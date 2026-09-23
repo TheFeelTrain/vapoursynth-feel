@@ -8,8 +8,8 @@ Status: **shipped on the R80 GPU API.** Design (current):
   (`std.GPUUpload`/`std.GPUDownload`); the filter owns its pipelines, three
   weight buffers and one exec pool — no staging, per-stream resources,
   download-slot pool, descriptor pool, fences, queue cap or queue choice.
-  `num_streams`/`device_id` are accepted and **ignored** (validated 1..32 /
-  ≥ 0), `device` chosen by `core.set_vulkan_device`.
+  `num_streams` is a registered no-op, `device_id` ≥ 0 is still enforced,
+  and the device is chosen by `core.set_vulkan_device`.
 - The kernels read the source plane in place (field row `f` → source row
   `DH ? f : 2f+parity` at the plane's own pitch) and write interpolated row `r`
   straight into the output plane at `2r + (1-parity)`. `ENTRY_KEEP` copies the
@@ -29,7 +29,7 @@ Status: **shipped on the R80 GPU API.** Design (current):
   frames) runs 2316 fps.
 
 Scoreboard — jpbd 1080p GRAY16, bench defaults (`field=3 dh=0 nsize=0 nns=4
-qual=2 etype=0 pscrn=4 num_streams=4`), interleaved pre-R80/R80 rounds through
+qual=2 etype=0 pscrn=4`), interleaved pre-R80/R80 rounds through
 `tools/benchmark.py`, arm order alternated, medians:
 
 | input to vsfeel | pre-R80 | R80 port | delta |

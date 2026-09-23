@@ -55,12 +55,11 @@ pytestmark = pytest.mark.usefixtures("noise_gray")
 # ---------------------------------------------------------------------------
 
 
-def _run(clip, field=1, num_streams=1, **kwargs):
+def _run(clip, field=1, **kwargs):
     """EEDI3 as a clip the test can read pixels from (see conftest.cpu_node)."""
     return cpu_node(vs.core.vsfeel.EEDI3(
         clip,
         field=field,
-        num_streams=num_streams,
         **kwargs,
     ))
 
@@ -201,12 +200,11 @@ def _mc_compare(bits, frames, kwargs, mclip=False, sclip=None):
 # Determinism / stream count
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("num_streams", [1, 4])
 @pytest.mark.parametrize("bits,field", [(16, 1), (32, 1)], ids=["16bit", "32bit"])
-def test_eedi3_deterministic(noise_gray, noise_16bit, bits, field, num_streams):
+def test_eedi3_deterministic(noise_gray, noise_16bit, bits, field):
     clip = noise_16bit if bits == 16 else noise_gray
-    a = _run(clip, field=field, num_streams=num_streams)
-    b = _run(clip, field=field, num_streams=num_streams)
+    a = _run(clip, field=field)
+    b = _run(clip, field=field)
     dtype = _dtype(bits)
     for n in (0, 11, 23):
         fa = _plane(a.get_frame(n), 0, WIDTH, HEIGHT, dtype)
@@ -217,30 +215,17 @@ def test_eedi3_deterministic(noise_gray, noise_16bit, bits, field, num_streams):
             assert np.abs(fa - fb).max() < 1e-6, f"nondeterministic output at frame {n}"
 
 
-@pytest.mark.parametrize("bits", [16, 32], ids=["16bit", "32bit"])
-def test_eedi3_multi_stream_matches_single(noise_gray, noise_16bit, bits):
-    clip = noise_16bit if bits == 16 else noise_gray
-    a = _run(clip, num_streams=4)
-    b = _run(clip, num_streams=1)
-    dtype = _dtype(bits)
-    for n in (0, 11, 23):
-        fa = _plane(a.get_frame(n), 0, WIDTH, HEIGHT, dtype)
-        fb = _plane(b.get_frame(n), 0, WIDTH, HEIGHT, dtype)
-        if bits == 16:
-            assert np.array_equal(fa, fb), f"num_streams mismatch at frame {n}"
-        else:
-            assert np.abs(fa - fb).max() < 1e-6, f"num_streams mismatch at frame {n}"
 
 
 @pytest.mark.parametrize("bits", [16, 32], ids=["16bit", "32bit"])
 def test_eedi3_parallel_load_consistent(noise_gray, noise_16bit, bits):
-    """Two parallel num_streams=4 runs must match the serial path, and each
+    """Two parallel runs must match the serial path, and each
     other — the request pattern that exposes stale descriptor bindings, fence
     misuse and command-pool reuse violations under load."""
     clip = noise_16bit if bits == 16 else noise_gray
-    a = eval_parallel(_run, clip, num_streams=4)
-    b = eval_parallel(_run, clip, num_streams=4)
-    ref = _run(clip, num_streams=1)
+    a = eval_parallel(_run, clip)
+    b = eval_parallel(_run, clip)
+    ref = _run(clip)
     dtype = _dtype(bits)
     for n in range(clip.num_frames):
         r = _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, dtype)
@@ -258,9 +243,9 @@ def test_eedi3_parallel_vcheck_matches_serial(noise_16bit, monkeypatch):
     """The shipped parallel vcheck and the serial walk (VSFEEL_EEDI3_VPARA=0,
     the A/B control) must agree exactly on the noise clip."""
     monkeypatch.setenv("VSFEEL_EEDI3_VPARA", "0")
-    serial = _run(noise_16bit, field=1, num_streams=1)
+    serial = _run(noise_16bit, field=1)
     monkeypatch.delenv("VSFEEL_EEDI3_VPARA")
-    parallel = _run(noise_16bit, field=1, num_streams=1)
+    parallel = _run(noise_16bit, field=1)
     for n in (0, 11, 23):
         a = _plane(serial.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         b = _plane(parallel.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
@@ -273,16 +258,15 @@ def test_eedi3_preserves_frame_props(noise_gray):
     ``_FieldBased`` is set to progressive by the filter; the tagged duration
     and custom metadata must survive unchanged.
     """
-    assert_preserves_frame_props(_run, noise_gray, field=1, num_streams=1)
+    assert_preserves_frame_props(_run, noise_gray, field=1)
 
 
 # ---------------------------------------------------------------------------
 # Pipelined-reader stress (regression)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("num_streams", [1, 4])
 @pytest.mark.parametrize("bits", [None, 16], ids=["32bit", "16bit"])
-def test_eedi3_vspipe_pipelined_no_hang(num_streams, bits):
+def test_eedi3_vspipe_pipelined_no_hang(bits):
     """vspipe's pipelined reader plus VapourSynth's prefetch drive frame
     requests far ahead of the in-flight frames; a queue stall or a
     resource-pool misuse deadlocks or crashes the whole run. Runs the real
@@ -293,8 +277,6 @@ def test_eedi3_vspipe_pipelined_no_hang(num_streams, bits):
            "--filter", "eedi3", "vsfeel"]
     if bits:
         cmd += ["--bits", str(bits)]
-    if num_streams != 1:
-        cmd += ["--num-streams", str(num_streams)]
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=120,
@@ -314,33 +296,22 @@ def test_eedi3_vspipe_pipelined_no_hang(num_streams, bits):
 # ---------------------------------------------------------------------------
 
 def test_eedi3_no_nan_all_frames_32bit(noise_gray):
-    out = _run(noise_gray, num_streams=1)
+    out = _run(noise_gray)
     for n in range(out.num_frames):
         a = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.float32)
         assert np.isfinite(a).all(), f"non-finite output at frame {n}"
 
 
-def test_eedi3_no_nan_all_frames_multi_stream_32bit(noise_gray):
-    out = _run(noise_gray, num_streams=4)
-    for n in range(out.num_frames):
-        a = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.float32)
-        assert np.isfinite(a).all(), f"non-finite output at frame {n}"
 
 
 def test_eedi3_in_range_all_frames_16bit(noise_16bit):
-    out = _run(noise_16bit, num_streams=1)
+    out = _run(noise_16bit)
     for n in range(out.num_frames):
         a = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         assert a.max() <= 65535
         assert a.min() >= 0
 
 
-@pytest.mark.parametrize("num_streams", [2, 4])
-def test_eedi3_in_range_all_frames_multi_stream_16bit(noise_16bit, num_streams):
-    out = _run(noise_16bit, num_streams=num_streams)
-    for n in range(out.num_frames):
-        a = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
-        assert a.max() <= 65535
 
 
 # ---------------------------------------------------------------------------
@@ -684,8 +655,8 @@ def test_eedi3_yuv_passthrough_16bit(noise_16bit):
     yuv = core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
     assert yuv.format.color_family == vs.YUV
 
-    out = _run(yuv, planes=[0], num_streams=1)
-    ref = _run(noise_16bit, num_streams=1)
+    out = _run(yuv, planes=[0])
+    ref = _run(noise_16bit)
 
     for n in (0, 11, 23):
         d = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64) \
@@ -704,8 +675,8 @@ def test_eedi3_yuv_passthrough_32bit(noise_gray):
     core = vs.core
     src = core.bs.VideoSource(NOISE_MKV)
     yuv = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
-    out = _run(yuv, planes=[0], num_streams=1)
-    ref = _run(noise_gray, num_streams=1)
+    out = _run(yuv, planes=[0])
+    ref = _run(noise_gray)
     for n in (0, 11, 23):
         f = out.get_frame(n)
         d = frame_to_ndarray(f) - frame_to_ndarray(ref.get_frame(n))
@@ -848,11 +819,6 @@ def test_eedi3_rejects_bad_planes(noise_16bit):
         _run(noise_16bit, planes=[5])
 
 
-def test_eedi3_rejects_bad_num_streams(noise_16bit):
-    with pytest.raises(vs.Error):
-        _run(noise_16bit, num_streams=0)
-    with pytest.raises(vs.Error):
-        _run(noise_16bit, num_streams=33)
 
 
 def test_eedi3_rejects_mclip_not_gray(noise_16bit):

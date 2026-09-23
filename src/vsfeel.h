@@ -300,10 +300,9 @@ inline constexpr VkDeviceSize align32(VkDeviceSize v) {
 // Pool of per-frame resources guarded by a ticket semaphore. `take()` blocks
 // on the semaphore (only `current` frames in flight per instance), then pops
 // the most recently released resource under the pool lock; `give_back()`
-// returns the resource and releases one ticket. The user of the pool
-// initializes `pool.semaphore.current` to `num_streams - 1` before first use,
-// so the in-flight depth is num_streams regardless of anything else the
-// instance does.
+// returns the resource and releases one ticket. Its user initializes
+// `pool.semaphore.current` to its in-flight depth minus one before first use,
+// so the depth is fixed at pool construction.
 template <typename T>
 struct FramePool {
     ticket_semaphore semaphore;
@@ -317,17 +316,6 @@ struct FramePool {
     void push(T && r) {
         std::lock_guard guard(lock);
         items.push_back(std::move(r));
-    }
-
-    // Push-then-fill variant of push() for creation loops: the resource is
-    // owned by the pool from the moment it exists, so an early error return
-    // leaves it to be torn down by the filter destructor instead of
-    // abandoning its buffers, device memory, mapped windows, command pool and
-    // fence. The caller must have reserved capacity up front and must not
-    // touch the pool concurrently while filling the returned reference.
-    T & emplace() {
-        std::lock_guard guard(lock);
-        return items.emplace_back();
     }
 
     T take() {
@@ -367,16 +355,10 @@ struct GPUDevice {
     const VSVulkanFunctions * vk {};
     VSVulkanCoreHandles handles {};
 
-    // Raw handles, named so the kernel side of a filter reads the same way it
-    // would against a device it owned.
-    VkInstance instance {};
-    VkPhysicalDevice physical_device {};
     VkDevice device {};
     VkQueue compute_queue {};
 
-    VkPhysicalDeviceMemoryProperties mem_props {};
     VkPhysicalDeviceLimits limits {};
-    VkDeviceSize max_storage_buffer_range {};
     uint32_t api_version {};
     uint32_t queue_family {};
     // VkQueueFamilyProperties::timestampValidBits for the core's compute queue
@@ -387,12 +369,10 @@ struct GPUDevice {
     uint32_t subgroup_size { 32 };
     uint32_t min_subgroup_size { 32 };
     uint32_t max_subgroup_size { 32 };
-    // Both are required by the core's device baseline (Vulkan 1.3 features), so
-    // unlike the legacy path there is nothing to check before using them.
+    // Both are required by the core's device baseline (Vulkan 1.3 features) --
+    // there is nothing to check before using them.
     bool subgroup_size_control { true };
     bool subgroup_shuffle { true };
-    bool feat_float16 { false };
-    bool feat_float64 { false };
     bool feat_atomic_float32_add { false };
 
     // Persistent pipeline cache, shared by every instance on this device: the

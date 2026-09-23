@@ -63,7 +63,7 @@ GRAY16 (all planes processed) is at parity in a manual same-session pair
   no bounds checks. The compose writes the whole tile (margins zeroed) and the
   interior is a straight copy of the core's plane at its own row stride.
 - `num_streams`/`device_id` are accepted for compatibility and no longer select
-  anything; `num_streams` is still validated 1..32 and `device_id < 0` is still
+  anything; `num_streams` is a registered no-op and `device_id < 0` is still
   an error.
 
 ### Kernels (`src/nlmeans.comp`)
@@ -188,5 +188,4 @@ Flags are `VSFEEL_NLMEANS_<FLAG>`.
 - `VSFEEL_NLMEANS_PACK=N` — entries per W/A round (clamped 1..16384; default
   from the 64 MiB ring budget).
 - `VSFEEL_NLMEANS_VRAM=1` — creation banner with ring/window/per-frame bytes.
-- `VSFEEL_NLMEANS_DEPRECATED=1` — banner when the ignored `num_streams` is set.
 - `VSFEEL_DEBUG`/`VSFEEL_TRACE` and `RADV_DEBUG=asm|shaderstats` as elsewhere.

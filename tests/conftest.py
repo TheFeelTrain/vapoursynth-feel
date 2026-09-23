@@ -577,8 +577,8 @@ def reference_compare(spec, timeout=600.0):
 # the graph asks for its frames in: vspipe requests frames concurrently and the
 # scheduler re-requests in-flight frames (DFTTest's notes prove it), which is the
 # only pattern that exposes a cache holder/lifetime bug.  Each ordering runs on
-# a *fresh* node under the subprocess timeout, while the num_streams=1 serial
-# run is the oracle, so a hang fails the test instead of the suite.
+# a *fresh* node under the subprocess timeout, while a single serial run is
+# the oracle, so a hang fails the test instead of the suite.
 #
 # The orders are fixed (no RNG): forward proves the oracle path, reverse and
 # "far" request temporally distant neighbours, interleave and scramble thrash
