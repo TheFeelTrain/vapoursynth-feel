@@ -5,15 +5,19 @@ that the package imports and its duck-typed backend runs through the
 unmodified vs-jetpack wrappers.
 """
 
+import dataclasses
+
 import numpy as np
 import pytest
+import vapoursynth as vs
 
 from conftest import cpu_node, frame_to_ndarray
 
 pytest.importorskip("vstools")
 pytest.importorskip("vsaa")
 
-from vsaa import EEDI3  # noqa: E402
+from vsaa import EEDI3, NNEDI3  # noqa: E402
+from vsaa import based_aa  # noqa: E402
 from vsdenoise import bm3d, nl_means  # noqa: E402
 from vsdenoise.fft import DFTTest  # noqa: E402
 from vsrgtools import bilateral, gauss_blur  # noqa: E402
@@ -81,7 +85,56 @@ def test_eedi3aa_subclass_is_a_vsaa_eedi3():
     assert vsfeel.EEDI3().backend is vsfeel.Backend
     assert vsfeel.EEDI3(backend=EEDI3.Backend.CPU).backend is EEDI3.Backend.CPU
     # `import vsfeel` must not require vsaa: the subclass is built on access.
-    assert vsfeel.__all__ == ["Backend", "FeelBackend", "EEDI3"]
+    assert vsfeel.__all__ == ["Backend", "FeelBackend", "EEDI3", "NNEDI3"]
+
+
+def test_nnedi3_subclass_is_a_vsaa_nnedi3():
+    """vsfeel.NNEDI3 keeps the reference's field surface exactly."""
+    assert issubclass(vsfeel.NNEDI3, NNEDI3)
+    assert [f.name for f in dataclasses.fields(vsfeel.NNEDI3)] == [
+        f.name for f in dataclasses.fields(NNEDI3)]
+    assert vsfeel.NNEDI3(nsize=3, nns=2, pscrn=1).copy(nsize=4).nsize == 4
+    # vs.core.vsfeel.NNEDI3 is a fresh Function object per access, so compare
+    # the plugin namespace rather than object identity.
+    func = vsfeel.NNEDI3()._deinterlacer_function
+    assert (func.plugin.namespace, func.name) == ("vsfeel", "NNEDI3")
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"nsize": 1, "nns": 2, "qual": 1, "etype": 1, "pscrn": 0},
+        {"nsize": 5, "nns": 0, "pscrn": 3},
+    ],
+)
+def test_nnedi3_via_vsaa_matches_direct_call(noise_16bit, kwargs):
+    """The wrapper adds only field/dh mapping over core.vsfeel.NNEDI3."""
+    wrapped = cpu_node(vsfeel.NNEDI3(**kwargs).deinterlace(
+        noise_16bit, tff=True, double_rate=False))
+    direct = cpu_node(vs.core.vsfeel.NNEDI3(
+        noise_16bit, field=1,
+        nsize=kwargs.get("nsize", 0), nns=kwargs.get("nns", 4),
+        qual=kwargs.get("qual", 2), etype=kwargs.get("etype", 0),
+        pscrn=kwargs.get("pscrn", 4)))
+    for n in (0, 7):
+        assert np.array_equal(frame_to_ndarray(wrapped.get_frame(n), dtype=np.uint16),
+                              frame_to_ndarray(direct.get_frame(n), dtype=np.uint16))
+
+
+def test_nnedi3_supersample_doubles_dims(noise_16bit):
+    out = cpu_node(vsfeel.NNEDI3().scale(noise_16bit, 2 * noise_16bit.width, 2 * noise_16bit.height))
+    assert (out.width, out.height) == (2 * noise_16bit.width, 2 * noise_16bit.height)
+    assert np.isfinite(frame_to_ndarray(out.get_frame(0), dtype=np.uint16)).all()
+
+
+def test_based_aa_with_vsfeel_supersampler_and_antialiaser(noise_gray):
+    """The documented drop-in combo runs end to end."""
+    out = cpu_node(based_aa(
+        noise_gray, supersampler=vsfeel.NNEDI3(), antialiaser=vsfeel.EEDI3(),
+        postfilter=False))
+    assert (out.width, out.height) == (noise_gray.width, noise_gray.height)
+    assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
 
 
 def test_eedi3aa_matches_the_two_call_chain(noise_16bit):

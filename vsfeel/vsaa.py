@@ -1,11 +1,11 @@
-"""vsaa integration: a fused EEDI3 antialiaser backed by ``vsfeel.EEDI3AA``.
+"""vsaa integration: vsfeel-backed EEDI3 and NNEDI3 wrappers.
 
 Usage:
 
     from vsaa import based_aa
     import vsfeel
 
-    aa = based_aa(clip, antialiaser=vsfeel.EEDI3())
+    aa = based_aa(clip, supersampler=vsfeel.NNEDI3(), antialiaser=vsfeel.EEDI3())
 """
 
 from __future__ import annotations
@@ -16,12 +16,13 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import vapoursynth as vs
 
-__all__ = ["EEDI3"]
+__all__ = ["EEDI3", "NNEDI3"]
 
 from jetpytools import fallback
 from vsaa.deinterlacers import Deinterlacer
 from vsaa.deinterlacers import EEDI3 as _VsaaEEDI3
-from vstools import VSFunctionNoArgs, core
+from vsaa.deinterlacers import NNEDI3 as _VsaaNNEDI3
+from vstools import VSFunctionAllArgs, VSFunctionNoArgs, core
 
 from .backend import Backend as _FeelBackend
 
@@ -95,3 +96,17 @@ class EEDI3(_VsaaEEDI3):
             )
 
         return super().antialias(clip, direction=direction, **kwargs)
+
+
+@dataclass
+class NNEDI3(_VsaaNNEDI3):
+    """``vsaa`` NNEDI3 supersampler backed by ``core.vsfeel.NNEDI3``.
+
+    Same fields and methods as the base class, so it drops into any
+    ``supersampler=``/``scaler=`` slot, but every interpolation runs on the
+    vsfeel GPU plugin. ``gpu`` selects no backend here and is ignored.
+    """
+
+    @property
+    def _deinterlacer_function(self) -> VSFunctionAllArgs:
+        return core.vsfeel.NNEDI3

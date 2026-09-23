@@ -103,6 +103,11 @@ qual=2 etype=0 pscrn=4`), interleaved pre-R80/R80 rounds through
 - `field` is registered **required** (the `:opt` + null-error-pointer history
   killed the process); 16-bit integer and 32-bit float input only; `field>1`
   doubles `vi_out` with the unknown-length (`numFrames == -1`) guard.
+- `vsfeel/vsaa.py`: `NNEDI3(vsaa.deinterlacers.NNEDI3)` overrides only
+  `_deinterlacer_function` to return `core.vsfeel.NNEDI3` (field/dh and the
+  `nsize`/`nns`/`qual`/`etype`/`pscrn` mapping come from the base class, so
+  they cannot drift); `vsfeel.NNEDI3` is a PEP-562 lazy re-export alongside
+  `EEDI3`, so `import vsfeel` never needs vsaa.
 
 ## Historical
 

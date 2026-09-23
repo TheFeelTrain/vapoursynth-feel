@@ -25,21 +25,22 @@ manager — no vs-jetpack changes needed:
 
 ``based_aa``'s EEDI3 antialiaser runs two EEDI3 calls plus two ``std.Merge``
 nodes; ``vsfeel.EEDI3`` is a subclass of ``vsaa``'s antialiaser that replaces
-that whole chain with the fused ``core.vsfeel.EEDI3AA`` call:
+that whole chain with the fused ``core.vsfeel.EEDI3AA`` call. ``vsfeel.NNEDI3``
+is the same idea for the supersampler, running ``core.vsfeel.NNEDI3``:
 
-    aa = based_aa(clip, antialiaser=vsfeel.EEDI3())
+    aa = based_aa(clip, supersampler=vsfeel.NNEDI3(), antialiaser=vsfeel.EEDI3())
 
-It is resolved lazily (PEP 562), so ``import vsfeel`` never requires vsaa.
+They are resolved lazily (PEP 562), so ``import vsfeel`` never requires vsaa.
 """
 
 from .backend import Backend, FeelBackend
 
-__all__ = ["Backend", "FeelBackend", "EEDI3"]
+__all__ = ["Backend", "FeelBackend", "EEDI3", "NNEDI3"]
 
 
 def __getattr__(name: str):  # pragma: no cover - thin lazy re-export
-    if name == "EEDI3":
-        from .vsaa import EEDI3
+    if name in ("EEDI3", "NNEDI3"):
+        from . import vsaa
 
-        return EEDI3
+        return getattr(vsaa, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
