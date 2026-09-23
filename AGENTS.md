@@ -228,13 +228,14 @@ All filters share an inline (zero-overhead, C++20) plumbing layer in
   `gpu_frame_buffer` scratch alive until the submission completes, and sizes
   its own ring — the host never waits per frame. Model on the ported filters:
   stateless on gaussblur/bilateral/nnedi3, cached/temporal on bm3d/dfttest.
-- **`FramePool<T>` / `ticket_semaphore`** — the per-stream resource pool,
-  kept only for BM3D (the one filter that still records its own command
-  pools, buffers and fences). New filters should not need it: the exec pool
-  sizes its own ring.
-- **`gpu_submit(...)`** — the one raw-submit helper (BM3D's own command
-  buffers): takes the core's queue lock around the submit alone, as a leaf,
-  and allocates nothing inside it.
+- **Cross-frame private caches** (BM3D's estimate stacks and source ring) stay
+  possible without owning submissions: a slot carries a *submitted* ready flag
+  instead of a timeline value (the pool allocates values at submit, so a writer
+  cannot name one when it reserves), a reader waits host side until its writers'
+  estimations are submitted, and a full `vkCmdPipelineBarrier` at the *start* of
+  the reader's first command buffer supplies the execution and memory dependency
+  — a pipeline barrier's first scope is every earlier command in submission
+  order on that queue. Never signal or hand-roll the pool's timeline.
 - **`env_flag` / `env_int` / `env_str`** — env-gated debug flags; keep one env
   name per filter (`VSFEEL_DFTTEST_TRACE`, `BM3D_TRACE`, ...). Read per-filter
   *diagnostic* flags through **`vsfeel_debug_flag(name)`** (one-shot: creation
@@ -273,16 +274,17 @@ instantiate a shared template must have a **unique name per filter**
 (`Bm3dStream` — never `VK_Resource`). Same mangled name + different
 `sizeof` across TUs lets the linker COMDAT-fold one TU's instantiation over
 the others, mis-striding the pool's vector and corrupting in-flight
-resources.
+resources. (The template that bit us, `FramePool<T>`, is gone; the rule
+stands for any shared template a filter instantiates with its own type.)
 
 **What stays per-filter:** frame caches (temporal three: DFTTest slot cache,
-NLMeans tile cache, BM3D ring/result stacks), shaders + launch config, sync
-choreography (pad→copy→fused ordering, device-side waits), cache sizing.
-BM3D records its own command buffers, fences and streams; every other filter
-is one recorded command buffer per frame through the exec pool.
+NLMeans tile cache, BM3D estimate/source rings), shaders + launch config, sync
+choreography (pad→copy→fused ordering, cross-frame ready flags), cache sizing.
+Every filter now records through the core's exec pool: one context per
+submission, never its own command pool, timeline or fence.
 
 When porting a new filter, model the stateless path on gaussblur/bilateral
-or nnedi3 (no cache) and the cached/timeline path on bm3d.
+or nnedi3 (no cache) and the cached/temporal path on dfttest or bm3d.
 
 ## Porting discipline
 

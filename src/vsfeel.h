@@ -46,27 +46,6 @@ using namespace std::string_literals;
     }                                                                               \
 } while(0)
 
-struct ticket_semaphore {
-    std::atomic<intptr_t> ticket {};
-    std::atomic<intptr_t> current {};
-
-    void acquire() noexcept {
-        intptr_t tk { ticket.fetch_add(1, std::memory_order::acquire) };
-        while (true) {
-            intptr_t curr { current.load(std::memory_order::acquire) };
-            if (tk <= curr) {
-                return;
-            }
-            current.wait(curr, std::memory_order::relaxed);
-        }
-    }
-
-    void release() noexcept {
-        current.fetch_add(1, std::memory_order::release);
-        current.notify_all();
-    }
-};
-
 // Env flags. Every filter flag goes through one of these so the naming and the
 // `getenv` parsing live in a single place; each filter keeps its own names
 // (VSFEEL_DFTTEST_TRACE, VSFEEL_BM3D_TRACE, ...) so flipping one filter's
@@ -294,48 +273,6 @@ inline constexpr VkDeviceSize align32(VkDeviceSize v) {
 }
 
 // ---------------------------------------------------------------------------
-// Shared per-frame plumbing (zero-overhead inline helpers)
-// ---------------------------------------------------------------------------
-
-// Pool of per-frame resources guarded by a ticket semaphore. `take()` blocks
-// on the semaphore (only `current` frames in flight per instance), then pops
-// the most recently released resource under the pool lock; `give_back()`
-// returns the resource and releases one ticket. Its user initializes
-// `pool.semaphore.current` to its in-flight depth minus one before first use,
-// so the depth is fixed at pool construction.
-template <typename T>
-struct FramePool {
-    ticket_semaphore semaphore;
-    std::vector<T> items;
-    std::mutex lock;
-
-    void reserve(size_t n) {
-        items.reserve(n);
-    }
-
-    void push(T && r) {
-        std::lock_guard guard(lock);
-        items.push_back(std::move(r));
-    }
-
-    T take() {
-        semaphore.acquire();
-        std::lock_guard guard(lock);
-        T r = std::move(items.back());
-        items.pop_back();
-        return r;
-    }
-
-    void give_back(T && r) {
-        {
-            std::lock_guard guard(lock);
-            items.push_back(std::move(r));
-        }
-        semaphore.release();
-    }
-};
-
-// ---------------------------------------------------------------------------
 // R80 GPU API (VSVulkan4): the device the core owns
 // ---------------------------------------------------------------------------
 //
@@ -507,59 +444,6 @@ inline void gpu_push_constants(const GPUDevice & g, VkCommandBuffer cmd,
     info.size = bytes;
     info.pValues = data;
     g.vk->vkCmdPushConstants2(cmd, &info);
-}
-
-// How many timeline waits one submission may carry. A frame's window gives at
-// most one wait per writer plus one per source producer.
-constexpr uint32_t GPU_MAX_SUBMIT_WAITS = 32;
-
-// Submit one command buffer on the core's compute queue, optionally waiting on
-// timeline (semaphore, value) pairs and optionally signalling one. The queue
-// lock is taken around the submit alone -- it is a leaf, so nothing else may
-// run inside the bracket -- and a timeline value is always allocated by the
-// caller before the call, which is what keeps signals in numeric order on any
-// one timeline.
-//
-// The 1.4 spelling (vkQueueSubmit2) is the only one the core's table carries;
-// timeline values travel in VkSemaphoreSubmitInfo rather than a separate
-// chained struct.
-inline VkResult gpu_submit(const GPUDevice & g, VSCore * core, VkCommandBuffer cmd,
-                           const VkSemaphore * waits, const uint64_t * values,
-                           uint32_t wait_count, VkPipelineStageFlags2 wait_stage,
-                           VkSemaphore signal_sem, uint64_t signal_value,
-                           VkFence fence) {
-    VkSemaphoreSubmitInfo wait_infos[GPU_MAX_SUBMIT_WAITS] {};
-    for (uint32_t i = 0; i < wait_count; ++i) {
-        wait_infos[i].sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-        wait_infos[i].semaphore = waits[i];
-        wait_infos[i].value = values[i];
-        wait_infos[i].stageMask = wait_stage;
-    }
-
-    VkSemaphoreSubmitInfo signal_info {};
-    signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-    signal_info.semaphore = signal_sem;
-    signal_info.value = signal_value;
-    // Everything the submission writes must be visible when the signal fires.
-    signal_info.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-
-    VkCommandBufferSubmitInfo cb_info {};
-    cb_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
-    cb_info.commandBuffer = cmd;
-
-    VkSubmitInfo2 info {};
-    info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
-    info.waitSemaphoreInfoCount = wait_count;
-    info.pWaitSemaphoreInfos = wait_count ? wait_infos : nullptr;
-    info.commandBufferInfoCount = 1;
-    info.pCommandBufferInfos = &cb_info;
-    info.signalSemaphoreInfoCount = signal_sem != VK_NULL_HANDLE ? 1u : 0u;
-    info.pSignalSemaphoreInfos = signal_sem != VK_NULL_HANDLE ? &signal_info : nullptr;
-
-    g.api->lockVulkanQueue(core, vqCompute);
-    const VkResult result = g.vk->vkQueueSubmit2(g.compute_queue, 1, &info, fence);
-    g.api->unlockVulkanQueue(core, vqCompute);
-    return result;
 }
 
 // Compute-to-compute barrier with both scopes. Every pass that follows one that

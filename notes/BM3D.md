@@ -24,34 +24,39 @@ Current design:
   issue before any reduce/insert consumes them.
 - Degenerate paths: `sigma < FLT_EPSILON` passes the plane through (a source
   copy), like the installed references' `PROC_MASK`.
-- Per-frame resources live in `FramePool<Bm3dStream>`; cross-frame handoff is
-  per-stream timeline semaphores plus `res_holders` reservation tokens.
-- The estimation submits **one command buffer per recomputed window position**
-  (a full-recompute frame has up to 2r+1 of them), so no single submission can
-  reach Windows' TDR watchdog on a slow card (`VSFEEL_BM3D_SPLIT=0` reverts).
+- **Everything goes through the core's exec pool** (`createGPUExecPool` /
+  `gpuExecAcquire` / `gpuExecSubmit`); the filter owns no command pool, timeline
+  or fence. The estimation is one submission per recomputed window position (a
+  full-recompute frame has up to 2r+1 of them) so no single submission can reach
+  Windows' TDR watchdog on a slow card (`VSFEEL_BM3D_SPLIT=0` reverts), then one
+  aggregation submission whose output plane the pool publishes.
+- The estimate stacks and source ring stay private VRAM buffers. Cross-frame
+  handoff is a per-slot *submitted* ready flag: a reader waits host side until
+  its writers' estimations are submitted, then a full pipeline barrier at the
+  start of its first command buffer supplies the execution and memory dependency
+  (a barrier's first scope is every earlier command in submission order on the
+  queue, so no per-frame semaphore wait is needed). A reader never holds a
+  recording context while waiting, so the pool's ring cannot deadlock.
 - Runs on the R80 GPU API: `clip:vnode:gpu` in and out with `ffGPUOutput`, so
   the core's `GPUUpload`/`GPUDownload` cross the bus and a consumer waits on the
-  plane's producer pair. Device, queue lock and buffer pool come from the core;
-  the filter keeps per-stream `VSGPUTimeline`s and submits through `gpu_submit`,
-  because the estimate cache needs values allocated before recording.
-- A frame returns with its submission running: the stream gate is `drain_value`,
-  the timeline value the next user of that stream waits on, not a fence.
+  plane's producer pair; device choice, queue locking and the buffer pool are the
+  core's.
 - `num_streams` and `device_id` are accepted and **ignored** -- depth is the
-  core's, device choice is `core.set_vulkan_device`; the pool is fixed at 2.
+  core's, device choice is `core.set_vulkan_device`; the cache depth stays 2.
 
-Performance — 1080p GRAY32, jpbd, `tools/benchmark.py -f bm3dv2 vsfeel vszipcl`,
-1000 frames × 3 interleaved, sigma 0.7, radius 2, bm_range 16, ps_range 7,
-block_step 4:
+Performance — 1080p GRAY32, jpbd, `tools/benchmark.py -f bm3dv2 vsfeel vszipcl
+bm3dvk`, 1000 frames × 3 interleaved, sigma 0.7, radius 2, bm_range 16,
+ps_range 7, block_step 4:
 
-| | fps | GPU est. kernel | GPU agg | VRAM (r=2) |
-|---|---|---|---|---|
-| vsfeel | **295.9-302.9** | — | — | 554 MiB |
-| vszipcl | 46.5 | — | — | — |
+| | fps | note |
+|---|---|---|
+| vsfeel | **332.8** | exec-pool port |
+| bm3dvk | 54.8 | R80 reference |
+| vszipcl | 41.6 | |
 
-The R80 GPU API port costs 4-6% on this CPU-sink benchmark (314.4 → 297.0 fps
-same-session); the upload stage is free and the download is the whole cost --
-see the port round under Historical. Before that port the same command gave
-190.5 fps at ns=4 (kernel 4.94 + agg 0.33 ms), i.e. 4.6x → 6.7x over vszipcl.
+vsfeel is 6.1x the faster reference. The first R80 API port (2026-09-20) cost
+4-6% on this CPU-sink benchmark; the exec-pool port (2026-09-23) is **+1%** in
+three interleaved A/B runs against the raw-submit build -- see Historical.
 
 ## Implementation notes that the code alone does not show
 
@@ -82,6 +87,27 @@ see the port round under Historical. Before that port the same command gave
 ## Historical
 
 Chronological; each entry keeps the mechanism, not the story.
+
+- **2026-09-23 — exec-pool port: +1%.** Replaced BM3D's per-stream
+  command pools, timelines and raw `gpu_submit` with the core's exec pool, and
+  deleted `FramePool`/`ticket_semaphore`/`gpu_submit` from `vsfeel.h`. The
+  blocking change: the pool allocates timeline values at submit, so the cache's
+  pre-reservation `(timeline, value)` writer pairs became per-slot *submitted*
+  flags. Cross-frame visibility and execution ordering now ride a leading
+  `vkCmdPipelineBarrier` in the reader's first submission rather than per-frame
+  semaphore waits; the reader also waits for a writer's *submission* where the
+  old code waited for completion, which is safe because a barrier's first
+  synchronization scope is every earlier command in submission order on that
+  queue. The estimation-before-aggregation overlap, the TDR split, the cache
+  sizing and the radius-0 private slot are unchanged. Cross-frame waits happen
+  with no recording context held and the acquisition order makes the wait graph
+  acyclic, so the pool ring cannot deadlock. Three independent interleaved
+  same-session A/B runs of 3 rounds x 3 reps (1080p jpbd GRAY32 r=2, 1000
+  frames): 335.1/332.3/332.0 vs 335.9/335.3/335.7, 334.0/331.0/330.7 vs
+  333.6/334.1/333.9 and 333.2/332.1/333.3 vs 331.2/336.6/336.8 fps (old vs
+  new), i.e. +1.0%, +0.9% and +1.0% on the medians. 71/71 BM3D tests; full
+  suite green (732 passed; also green with `VSFEEL_BM3D_SPLIT=0` and
+  `VSFEEL_BM3D_CACHE=1`).
 
 - **2026-09-20 — R80 GPU API port: -4..6% on a CPU sink, upload free, download
   the whole cost.** Same-session pairs, 1080p GRAY32 r=2 1000 frames x3:
@@ -298,7 +324,8 @@ cached at creation, not read per frame.
   are vsfeel inventions, not reference behaviour, and NOSEARCH distorts the
   temporal search as well (see the ablation note).
 - `VSFEEL_BM3D_DUMP=1` / `VSFEEL_BM3D_GPUTRACE=1` — slot dump / GPU timestamps.
-  The GPU probe now reads the query pool when the next frame drains the stream,
-  because a frame no longer waits for its own work.
+  The probe waits each instrumented frame's aggregation out (the query pool is
+  shared, so the path serializes) and reads `vkGetQueryPoolResults` on the host;
+  it averages over 50 frames and never runs in a benchmark.
 - `VSFEEL_BM3D_HD`, `VSFEEL_BM3D_QUEUES` — **gone** with the pre-R80 transfer and
   queue-selection code.
