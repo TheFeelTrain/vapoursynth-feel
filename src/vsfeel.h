@@ -237,7 +237,7 @@ const char * vk_result_string(VkResult result);
 // its worker does post-fence CPU work before the next submit, leaving idle
 // bubbles; sharing a queue across streams keeps a next command buffer queued.
 // The default cap is a filter-specific starting point; `env_name` (e.g.
-// "VSFEEL_GAUSS_QUEUES") overrides it as a durable tuning knob. The result is
+// "VSFEEL_NNEDI3_QUEUES") overrides it as a durable tuning knob. The result is
 // always clamped to [1, min(num_streams, queue_count)].
 inline uint32_t resolve_queue_cap(int num_streams, uint32_t queue_count,
                                   const char * env_name, uint32_t default_cap) {

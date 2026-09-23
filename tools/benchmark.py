@@ -737,6 +737,9 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("sigma", "--gauss-sigma", "gauss_sigma", float, 16.0),
         ],
         build=_gauss_build,
+        # vsfeel's GaussBlur is vnode:gpu under the R80 GPU API; the
+        # references stay on the CPU cache.
+        gpu_plugins=frozenset({"vsfeel"}),
     ),
     "dfttest": FilterSpec(
         title="DFTTest",

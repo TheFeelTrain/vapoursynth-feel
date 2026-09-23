@@ -41,7 +41,7 @@ def test_nl_means_runs_via_jetpack(noise_gray):
 
 
 def test_gauss_blur_runs_via_jetpack(noise_gray):
-    out = gauss_blur(noise_gray, 1.5, backend=_backend())
+    out = cpu_node(gauss_blur(noise_gray, 1.5, backend=_backend()))
     assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
 
 
@@ -114,6 +114,7 @@ def test_backend_context_routes_singletons(noise_gray):
         # implicit backend= (AUTO -> singleton) now routes through vsfeel
         assert np.isfinite(frame_to_ndarray(cpu_node(
             bilateral(noise_gray, sigmaS=3.0, sigmaR=0.02)).get_frame(0))).all()
-        assert np.isfinite(frame_to_ndarray(gauss_blur(noise_gray, 1.5).get_frame(0))).all()
+        assert np.isfinite(frame_to_ndarray(cpu_node(
+            gauss_blur(noise_gray, 1.5)).get_frame(0))).all()
     assert bilateral.backend == old_bilateral
     assert gauss_blur.backend == old_gauss

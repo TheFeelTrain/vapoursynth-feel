@@ -9,7 +9,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -30,186 +29,113 @@ using namespace std::string_literals;
 // ---------------------------------------------------------------------------
 // Filter state
 // ---------------------------------------------------------------------------
+//
+// GaussBlur runs on the R80 GPU API: `vnode:gpu` in, `ffGPUOutput` out, so the
+// core owns every transfer (std.GPUUpload/GPUDownload) and the filter reads the
+// core's frame planes and writes the output frame's planes in place. What it
+// owns is its pipelines, the constant kernel-weights buffer and one exec pool
+// -- no staging buffers, no per-stream resources, no fences, no queue cap.
 
 // Work-group / code-path constants matching the reference implementations
 // (vszipcl gaussglur.zig and vszipcu gaussblur.zig).
 constexpr int BLK_X = 16;
 constexpr int BLK_Y = 8;
-constexpr int VRT = 3;         // output rows per thread, small path
-constexpr int LARGE_R = 8;     // outputs per thread, large path
-constexpr int LARGE_THRESHOLD = 32;  // radius <= 32 => fused small path
+constexpr int VRT = 3;              // output rows per thread, small path
+constexpr int LARGE_R = 8;          // outputs per thread, large path
+constexpr int LARGE_THRESHOLD = 32; // radius <= 32 => fused small path
 
 struct GaussPlaneConfig {
-    int width {};                    // pixels
-    int height {};                   // pixels
-    int stride {};                   // pitch in elements (round_up(width, 16b/elem))
-    int pitch_bytes {};              // row pitch in bytes
-    int ksize {};                    // kernel taps
-    int radius {};                   // ksize / 2
-    bool small {};                   // fused small path vs two-pass large path
-    VkPipeline pipeline {};          // small path (gauss_blur entry)
-    VkPipeline v_pipeline {};        // large path vertical pass
-    VkPipeline h_pipeline {};        // large path horizontal pass
-    uint32_t grid_x {};
-    uint32_t grid_y {};              // small path dispatch
-    uint32_t v_grid_x {};
-    uint32_t v_grid_y {};            // large vertical dispatch
-    uint32_t h_grid_x {};
-    uint32_t h_grid_y {};            // large horizontal dispatch
-    VkDeviceSize upload_offset {};   // bytes, offset within staging upload area
-    VkDeviceSize upload_size {};     // bytes
-    VkDeviceSize download_offset {}; // bytes, offset within staging download area
-    VkDeviceSize download_size {};   // bytes
-    VkDeviceSize src_elem {};        // element offset into the VRAM source buffer
-    VkDeviceSize dst_elem {};        // element offset into the VRAM destination buffer
-    VkDeviceSize dst_stage_elem {};  // element offset of the download region in staging
-    VkDeviceSize tmp_elem {};        // float element offset into the VRAM tmp buffer
-    VkDeviceSize tmp_offset {};      // bytes, offset within tmp area (large path)
-    VkDeviceSize tmp_size {};        // bytes
-    uint32_t wt_base {};             // float element offset into the weights buffer
-};
-
-struct GaussBlurResource {
-    VkBuffer staging {};
-    VkDeviceMemory staging_mem {};
-    VkBuffer src_buf {};        // device-local input planes (VRAM)
-    VkDeviceMemory src_mem {};
-    void * src_map {};          // mapped VRAM window when the upload is host-direct
-    uint32_t src_type_index {};
-    VkBuffer dst_buf {};        // device-local output planes (VRAM)
-    VkDeviceMemory dst_mem {};
-    VkBuffer tmp_buf {};         // device-local float intermediate (large path)
-    VkDeviceMemory tmp_mem {};
-    VkCommandPool pool {};
-    VkCommandBuffer cmd {};
-    VkFence fence {};
-    VkDescriptorSet desc_set {};
-    VkQueue queue {};
-    std::mutex * queue_lock {};
-    float * map {};
-    uint32_t staging_type_index {};
+    int width {};         // visible pixels
+    int height {};
+    int stride {};        // the core's plane pitch in elements
+    int ksize {};         // kernel taps
+    int radius {};        // ksize / 2
+    bool small {};        // fused small path vs two-pass large path
+    VkPipeline pipeline {};   // small path (gauss entry)
+    VkPipeline v_pipeline {}; // large path vertical pass
+    VkPipeline h_pipeline {}; // large path horizontal pass
+    uint32_t grid_x {}, grid_y {};
+    uint32_t v_grid_x {}, v_grid_y {};
+    uint32_t h_grid_x {}, h_grid_y {};
+    VkDeviceSize tmp_elem {}; // float offset of this plane's two-pass scratch
+    uint32_t wt_base {};      // float offset into the weights buffer
 };
 
 struct GaussData {
-    VSNode * node;
-    const VSVideoInfo * vi;
+    VSNode * node {};
+    const VSVideoInfo * vi {};
 
-    int device_id, num_streams;
-    int bits, elem_bytes;
+    int bits {}, elem_bytes {};
     bool process[3] { true, true, true };
 
-    std::shared_ptr<VK_Device> device;
+    std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
     VkPipelineLayout pipeline_layout {};
-    VkDescriptorPool desc_pool {};
-    VkShaderModule module {};      // fused small path (gauss entry)
-    VkShaderModule v_module {};    // large path vertical pass
-    VkShaderModule h_module {};    // large path horizontal pass
-
-    // shared, constant weights buffer (all configs' kernels concatenated)
-    VkBuffer wt_buf {};
-    VkDeviceMemory wt_mem {};
-    float * wt_map {};
-    uint32_t wt_type_index {};
-    VkDeviceSize wt_bytes {};
-
-    VkDeviceSize upload_total {};
-    VkDeviceSize download_total {};
-    VkDeviceSize tmp_total {};
-    bool host_direct_upload {};  // src VRAM is host-mapped (ReBAR): no H2D copy
-    bool kd_download {};         // kernels write the GTT download staging directly
     std::array<GaussPlaneConfig, 3> planes {};
-    FramePool<GaussBlurResource> pool;
+
+    // All processed planes' kernels concatenated, host visible so creation
+    // fills it with one memcpy; the kernels read it every dispatch.
+    GpuBuffer wt {};
+    // Float scratch of the two-pass path (large planes only): one transient
+    // buffer per frame, handed to the recording context.
+    VkDeviceSize tmp_total {};
+    VSGPUExecPool * pool {};
+
+    // VSFEEL_GAUSS_TIMING=1: per-frame host stage split. Under the API the host
+    // side is only acquire/record/submit, but the split still says whether the
+    // frame is host- or GPU-bound, which no kernel timing can.
+    bool host_timing { false };
+    std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
+        ht_total_ns {}, ht_n {};
 
     ~GaussData() {
-        if (!device) {
+        if (host_timing && ht_n.load()) {
+            const double n = static_cast<double>(ht_n.load());
+            fprintf(stderr,
+                "[gauss-timing] frames=%.0f per-frame us: acquire=%7.1f "
+                "record=%7.1f submit=%7.1f total=%7.1f\n",
+                n, ht_acquire_ns.load() / 1000.0 / n,
+                ht_record_ns.load() / 1000.0 / n,
+                ht_submit_ns.load() / 1000.0 / n, ht_total_ns.load() / 1000.0 / n);
+        }
+        if (!gpu) {
             return;
         }
-        VkDevice dev = device->device;
-        // retire this instance's own submissions (per queue) instead of
-        // idling the whole device, which other filters may be sharing
-        retire_instance(pool);
-
-        for (auto & resource : pool.items) {
-            if (resource.map) {
-                vkUnmapMemory(dev, resource.staging_mem);
-            }
-            if (resource.src_map) {
-                vkUnmapMemory(dev, resource.src_mem);
-            }
-            if (resource.tmp_mem) {
-                vkFreeMemory(dev, resource.tmp_mem, nullptr);
-            }
-            if (resource.tmp_buf) {
-                vkDestroyBuffer(dev, resource.tmp_buf, nullptr);
-            }
-            if (resource.dst_mem) {
-                vkFreeMemory(dev, resource.dst_mem, nullptr);
-            }
-            if (resource.dst_buf) {
-                vkDestroyBuffer(dev, resource.dst_buf, nullptr);
-            }
-            if (resource.src_mem) {
-                vkFreeMemory(dev, resource.src_mem, nullptr);
-            }
-            if (resource.src_buf) {
-                vkDestroyBuffer(dev, resource.src_buf, nullptr);
-            }
-            destroy_common(dev, resource);
+        // The pool drains every submission it made before it returns, so the
+        // pipelines, layouts and weights below are safe to destroy afterwards.
+        if (pool) {
+            gpu->api->freeGPUExecPool(pool);
+            pool = nullptr;
         }
-
-        if (wt_map) {
-            vkUnmapMemory(dev, wt_mem);
-        }
-        if (wt_mem) {
-            vkFreeMemory(dev, wt_mem, nullptr);
-        }
-        if (wt_buf) {
-            vkDestroyBuffer(dev, wt_buf, nullptr);
-        }
-
-        VkPipeline destroyed_pipelines[9] {};
+        VkDevice dev = gpu->device;
+        VkPipeline destroyed[9] {};
         int num_destroyed = 0;
         for (auto & plane : planes) {
-            const VkPipeline pipelines[3] { plane.pipeline, plane.v_pipeline, plane.h_pipeline };
-            for (int p = 0; p < 3; ++p) {
-                if (!pipelines[p]) {
+            const VkPipeline pipelines[3] {
+                plane.pipeline, plane.v_pipeline, plane.h_pipeline
+            };
+            for (VkPipeline p : pipelines) {
+                if (!p) {
                     continue;
                 }
-                bool already_destroyed = false;
+                bool seen = false;
                 for (int i = 0; i < num_destroyed; ++i) {
-                    if (destroyed_pipelines[i] == pipelines[p]) {
-                        already_destroyed = true;
-                        break;
-                    }
+                    seen |= destroyed[i] == p;
                 }
-                if (already_destroyed) {
+                if (seen) {
                     continue;
                 }
-                destroyed_pipelines[num_destroyed++] = pipelines[p];
-                vkDestroyPipeline(dev, pipelines[p], nullptr);
+                destroyed[num_destroyed++] = p;
+                gpu->vk->vkDestroyPipeline(dev, p, nullptr);
             }
         }
-        if (desc_pool) {
-            vkDestroyDescriptorPool(dev, desc_pool, nullptr);
-        }
         if (pipeline_layout) {
-            vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
+            gpu->vk->vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
         }
         if (set_layout) {
-            vkDestroyDescriptorSetLayout(dev, set_layout, nullptr);
+            gpu->vk->vkDestroyDescriptorSetLayout(dev, set_layout, nullptr);
         }
-        if (module) {
-            vkDestroyShaderModule(dev, module, nullptr);
-        }
-        if (v_module) {
-            vkDestroyShaderModule(dev, v_module, nullptr);
-        }
-        if (h_module) {
-            vkDestroyShaderModule(dev, h_module, nullptr);
-        }
-
-        release_device(device);
+        gpu_destroy_buffer(*gpu, wt);
     }
 };
 
@@ -269,207 +195,198 @@ static std::vector<float> get_gauss_kernel(float sigma) {
 // Pipeline creation
 // ---------------------------------------------------------------------------
 
+struct GaussSpecData {
+    int32_t width;
+    int32_t height;
+    int32_t stride;
+    int32_t ksize;
+    int32_t radius;
+};
+
+static constexpr std::array<VkSpecializationMapEntry, 5> spec_entries {{
+    { 0, 0, sizeof(int32_t) },
+    { 1, 4, sizeof(int32_t) },
+    { 2, 8, sizeof(int32_t) },
+    { 3, 12, sizeof(int32_t) },
+    { 4, 16, sizeof(int32_t) },
+}};
+
 static std::variant<VkPipeline, std::string> create_pipeline(
-    const VK_Device & dev, const GaussPlaneConfig & cfg,
-    VkShaderModule module, VkPipelineLayout layout) {
+    const GPUDevice & gpu, VkPipelineLayout layout,
+    const uint32_t * code, size_t code_size, const GaussSpecData & spec) {
 
-    struct Spec {
-        int32_t width, height, stride, ksize, radius;
-    } spec { cfg.width, cfg.height, cfg.stride, cfg.ksize, cfg.radius };
-
-    const std::array<VkSpecializationMapEntry, 5> entries {{
-        { 0,  0, sizeof(int32_t) },
-        { 1,  4, sizeof(int32_t) },
-        { 2,  8, sizeof(int32_t) },
-        { 3, 12, sizeof(int32_t) },
-        { 4, 16, sizeof(int32_t) },
-    }};
-
-    return create_compute_pipeline(dev, module, layout, entries.data(), &spec,
-        static_cast<uint32_t>(entries.size()), sizeof(spec), "gaussblur");
+    return gpu_create_pipeline(gpu, code, code_size, layout, spec_entries.data(),
+        &spec, static_cast<uint32_t>(spec_entries.size()), sizeof(spec),
+        "gaussblur");
 }
 
-// Records the dispatch sequence for all planes into a single pre-recorded
-// command buffer. The frame bytes are moved by two big DMA copies at the
-// head and tail (staging upload area -> VRAM src, VRAM dst -> staging
-// download area); the kernels then read and write device-local VRAM only.
-// All plane regions are disjoint, so the dispatches of different planes can
-// overlap on the GPU.
-static std::optional<std::string> record_command_buffer(
-    const GaussData & d, GaussBlurResource & resource, bool with_copies = true) {
+// ---------------------------------------------------------------------------
+// Frame processing
+// ---------------------------------------------------------------------------
 
-    VkCommandBufferBeginInfo begin_info {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .pInheritanceInfo = nullptr
+// GPU input: the kernels read the source planes and write the output frame's
+// planes in place. The core owns every transfer.
+static const VSFrame * gauss_gpu_frame(
+    GaussData * d, int n, VSFrameContext * frameCtx, VSCore * core,
+    const VSAPI * vsapi) {
+
+    const int numPlanes = d->vi->format.numPlanes;
+    const VSFrame * src = vsapi->getFrameFilter(n, d->node, frameCtx);
+
+    // Creation guarantees at least one processed plane; unprocessed ones ride
+    // along from the source frame, keeping their own producer pairs.
+    // newVideoFrame2 infers residency from the plane sources, so a frame with no
+    // source plane at all has to come from newGPUVideoFrame.
+    bool all_process = true;
+    for (int p = 0; p < numPlanes; ++p) {
+        all_process &= d->process[p];
+    }
+    const int pl[] = { 0, 1, 2 };
+    const VSFrame * fr[] = {
+        d->process[0] ? nullptr : src,
+        d->process[1] ? nullptr : src,
+        d->process[2] ? nullptr : src
     };
-
-    if (vkBeginCommandBuffer(resource.cmd, &begin_info) != VK_SUCCESS) {
-        return "vkBeginCommandBuffer failed";
+    VSFrame * dst = all_process
+        ? d->gpu->api->newGPUVideoFrame(&d->vi->format, d->vi->width,
+              d->vi->height, src, core)
+        : vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height,
+              fr, pl, src, core);
+    if (!dst) {
+        vsfeel_trace_error("GaussBlur", n, "failed to allocate the output frame",
+                           d->gpu.get());
+        vsapi->setFilterError("GaussBlur: failed to allocate the output frame",
+                              frameCtx);
+        vsapi->freeFrame(src);
+        return nullptr;
     }
 
-        // upload: staging -> VRAM src (one copy, all planes are contiguous).
-        // Skipped when the src VRAM is host-mapped: the CPU memcpy of the
-        // frame already landed the bytes in VRAM before submission.
-        if (with_copies && !d.host_direct_upload && d.upload_total > 0) {
-            const VkBufferCopy upload_region { 0, 0, d.upload_total };
-            vkCmdCopyBuffer(resource.cmd, resource.staging, resource.src_buf,
-                1, &upload_region);
-            VkMemoryBarrier copy_barrier {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
-            };
-            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &copy_barrier, 0, nullptr, 0, nullptr);
+    auto t0 = d->host_timing ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point {};
+    vsfeel_trace_frame_begin();
+    vsfeel_trace_mark("acquire");
+
+    char errbuf[512] {};
+    VSGPUExecContext * ctx = d->gpu->api->gpuExecAcquire(d->pool, errbuf, sizeof(errbuf));
+    auto fail = [&](const std::string & message) -> const VSFrame * {
+        if (ctx) {
+            d->gpu->api->gpuExecAbandon(ctx);
+            ctx = nullptr;
         }
-
-        for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
-            if (!d.process[plane]) {
-                continue;
-            }
-            const auto & cfg = d.planes[plane];
-
-            // push constants are element offsets into the bound buffers;
-            // wt_base is a float element offset into the weights buffer.
-            // kd_download: the output SSBO is the GTT staging (the kernels'
-            // plain coalesced stores land straight in host memory); the dst
-            // push constant then addresses the staging download region.
-            const int32_t push_constants[4] {
-                static_cast<int32_t>(cfg.src_elem),
-                static_cast<int32_t>(d.kd_download ? cfg.dst_stage_elem : cfg.dst_elem),
-                static_cast<int32_t>(cfg.tmp_elem),
-                static_cast<int32_t>(cfg.wt_base)
-            };
-
-            if (cfg.small) {
-                vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.pipeline);
-                vkCmdBindDescriptorSets(
-                    resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                    d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
-                vkCmdPushConstants(
-                    resource.cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                    0, sizeof(push_constants), push_constants);
-                vkCmdDispatch(resource.cmd, cfg.grid_x, cfg.grid_y, 1);
-            } else {
-                // vertical pass: src -> float tmp
-                vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.v_pipeline);
-                vkCmdBindDescriptorSets(
-                    resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                    d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
-                vkCmdPushConstants(
-                    resource.cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                    0, sizeof(push_constants), push_constants);
-                vkCmdDispatch(resource.cmd, cfg.v_grid_x, cfg.v_grid_y, 1);
-
-                // the horizontal pass reads the vertical pass' writes
-                {
-                    VkMemoryBarrier mem_barrier {
-                        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                        .pNext = nullptr,
-                        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
-                    };
-                    vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
-                }
-
-                // horizontal pass: float tmp -> dst
-                vkCmdBindPipeline(resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.h_pipeline);
-                vkCmdBindDescriptorSets(
-                    resource.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                    d.pipeline_layout, 0, 1, &resource.desc_set, 0, nullptr);
-                vkCmdPushConstants(
-                    resource.cmd, d.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                    0, sizeof(push_constants), push_constants);
-                vkCmdDispatch(resource.cmd, cfg.h_grid_x, cfg.h_grid_y, 1);
-            }
-        }
-
-        // download: VRAM dst -> staging (one copy, all planes contiguous).
-        // Skipped for kd_download — the kernels already wrote the staging
-        // download region directly (plain stores, no atomics).
-        if (with_copies && !d.kd_download && d.download_total > 0) {
-            VkMemoryBarrier kernel_barrier {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT
-            };
-            vkCmdPipelineBarrier(resource.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &kernel_barrier, 0, nullptr, 0, nullptr);
-            const VkBufferCopy download_region { 0, d.upload_total, d.download_total };
-            vkCmdCopyBuffer(resource.cmd, resource.dst_buf, resource.staging,
-                1, &download_region);
-        }
-
-    if (vkEndCommandBuffer(resource.cmd) != VK_SUCCESS) {
-        return "vkEndCommandBuffer failed";
-    }
-
-    return std::nullopt;
-}
-
-// Env-gated per-frame GPU probe (n==0 only, like dfttest's GPU_BENCH): times
-// the full pre-recorded command buffer (DMA copies + kernels) and a
-// kernels-only recording, printing per-iteration µs to stderr.
-static void gpu_bench_probe(GaussData * d, GaussBlurResource & resource, int n) {
-    static const int iters = std::max(env_int("VSFEEL_GAUSS_GPU_BENCH", 0), 1);
-    if (!env_flag("VSFEEL_GAUSS_GPU_BENCH") || n != 0) {
-        return;
-    }
-    VkDevice dev = d->device->device;
-
-    vkDeviceWaitIdle(dev);
-
-    auto submit_once = [&]() {
-        if (submit_with_fence(dev, resource.queue, resource.queue_lock,
-                resource.cmd, resource.fence) != VK_SUCCESS) {
-            fprintf(stderr, "[gaussblur-gpu-bench] submit failed\n");
-        }
-        if (vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
-            fprintf(stderr, "[gaussblur-gpu-bench] fence wait failed\n");
-        }
+        vsfeel_trace_error("GaussBlur", n, message, d->gpu.get());
+        vsapi->setFilterError(("GaussBlur: " + message).c_str(), frameCtx);
+        vsapi->freeFrame(dst);
+        vsapi->freeFrame(src);
+        return nullptr;
     };
-
-    // warm everything up (caches, pipelines)
-    for (int i = 0; i < 3; ++i) {
-        submit_once();
+    if (!ctx) {
+        return fail("could not acquire a recording context: "s + errbuf);
     }
+    auto t1 = d->host_timing ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point {};
 
-    auto time_cbs = [&](const char * name) {
-        auto start = std::chrono::steady_clock::now();
-        for (int i = 0; i < iters; ++i) {
-            submit_once();
+    // Two-pass scratch: one transient float buffer per frame, retired by the
+    // submission (the pool's size buckets make per-frame allocation cheap).
+    // The fused small path never reads it.
+    GpuBuffer tmp {};
+    if (d->tmp_total > 0) {
+        if (auto e = gpu_frame_buffer(*d->gpu, core, ctx, d->tmp_total, tmp);
+            !e.empty()) {
+            return fail("temp buffer: " + e);
         }
-        auto stop = std::chrono::steady_clock::now();
-        const double us =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start).count()
-            / 1000.0 / iters;
-        fprintf(stderr, "[gaussblur-gpu-bench] %-*s %9.1f us/frame\n",
-            28, name, us);
-    };
-
-    // 1) full pre-recorded CB: copies + kernels
-    time_cbs("full (copies+kernels)");
-
-    // 2) kernels only: record a CB without the two DMA copies (the src VRAM
-    //    already holds frame 0's bytes from the warmup, so output is valid)
-    if (record_command_buffer(*d, resource, false)) {
-        fprintf(stderr, "[gaussblur-gpu-bench] kernels-only re-record failed\n");
-        return;
     }
-    time_cbs("kernels only");
 
-    // 3) copies only: re-record the full CB, dispatch nothing — not needed:
-    //    full minus kernels-only is the copy cost. Restore the full CB and
-    //    submit it once so the recorded state matches the steady state.
-    if (record_command_buffer(*d, resource)) {
-        fprintf(stderr, "[gaussblur-gpu-bench] restore re-record failed\n");
+    vsfeel_trace_mark("record");
+    VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
+
+    // The plane dispatches touch disjoint buffers (and disjoint scratch
+    // regions), so no barrier is needed between them; only the two passes of
+    // one plane's large path are ordered.
+    for (int p = 0; p < numPlanes; ++p) {
+        if (!d->process[p]) {
+            continue;
+        }
+        const auto & cfg = d->planes[p];
+
+        VSVulkanPlaneInfo sp {};
+        if (d->gpu->api->getGPUPlane(src, p, &sp)) {
+            return fail("source plane " + std::to_string(p) + " is not GPU resident");
+        }
+        VSVulkanPlaneInfo dp {};
+        if (d->gpu->api->getGPUPlane(dst, p, &dp)) {
+            return fail("output plane " + std::to_string(p) + " is not GPU resident");
+        }
+
+        // Binding 4 is the dword view of the destination (packed pair stores
+        // of the horizontal pass). Without a two-pass plane there is no
+        // scratch to bind, so the source stands in where no shader reads it.
+        const VkBuffer buffers[5] {
+            d->wt.buffer, sp.buffer, dp.buffer,
+            d->tmp_total > 0 ? tmp.buffer : sp.buffer, dp.buffer
+        };
+        gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 5);
+
+        // Element offsets into the bound buffers: src and dst are whole plane
+        // buffers now, so both bases are 0; only the scratch region and the
+        // weights offset carry values.
+        const int32_t push[4] {
+            0, 0,
+            static_cast<int32_t>(cfg.tmp_elem),
+            static_cast<int32_t>(cfg.wt_base)
+        };
+        gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push, sizeof(push));
+
+        if (cfg.small) {
+            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                          cfg.pipeline);
+            d->gpu->vk->vkCmdDispatch(cmd, cfg.grid_x, cfg.grid_y, 1);
+        } else {
+            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                          cfg.v_pipeline);
+            d->gpu->vk->vkCmdDispatch(cmd, cfg.v_grid_x, cfg.v_grid_y, 1);
+
+            // the horizontal pass reads the vertical pass' writes
+            gpu_barrier(*d->gpu, cmd);
+
+            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                          cfg.h_pipeline);
+            d->gpu->vk->vkCmdDispatch(cmd, cfg.h_grid_x, cfg.h_grid_y, 1);
+        }
     }
-    fprintf(stderr, "[gaussblur-gpu-bench] done\n");
+    auto t2 = d->host_timing ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point {};
+
+    d->gpu->api->gpuExecReadsFrame(ctx, src);
+    for (int p = 0; p < numPlanes; ++p) {
+        if (d->process[p]) {
+            d->gpu->api->gpuExecWritesPlane(ctx, dst, p);
+        }
+    }
+
+    vsfeel_trace_mark("submit");
+    uint64_t signaled = 0;
+    const int submit_error = d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf, sizeof(errbuf));
+    ctx = nullptr;  // consumed either way
+    if (submit_error) {
+        return fail("submit failed: "s + errbuf);
+    }
+    auto t3 = d->host_timing ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point {};
+
+    if (d->host_timing) {
+        const auto ns = [](auto a, auto b) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+        };
+        d->ht_acquire_ns += ns(t0, t1);
+        d->ht_record_ns += ns(t1, t2);
+        d->ht_submit_ns += ns(t2, t3);
+        d->ht_total_ns += ns(t0, t3);
+        d->ht_n.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    vsapi->freeFrame(src);
+    return dst;
 }
 
 static const VSFrame *VS_CC GaussGetFrame(
@@ -480,149 +397,13 @@ static const VSFrame *VS_CC GaussGetFrame(
 
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
-    } else if (activationReason == arAllFramesReady) {
-        const VSFrame * src = vsapi->getFrameFilter(n, d->node, frameCtx);
-
-        const int pl[] = { 0, 1, 2 };
-        const VSFrame * fr[] = {
-            d->process[0] ? nullptr : src,
-            d->process[1] ? nullptr : src,
-            d->process[2] ? nullptr : src
-        };
-
-        VSFrame * dst = vsapi->newVideoFrame2(
-            &d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
-
-        vsfeel_trace_frame_begin();
-        auto resource = d->pool.take();
-        vsfeel_trace_mark("pool");
-
-        auto set_error = [&](const std::string & error_message) {
-            vsfeel_trace_error("GaussBlur", n, error_message, d->device.get());
-            d->pool.give_back(std::move(resource));
-            vsapi->setFilterError(("GaussBlur: " + error_message).c_str(), frameCtx);
-            vsapi->freeFrame(src);
-            vsapi->freeFrame(dst);
-            return nullptr;
-        };
-
-        VkDevice dev = d->device->device;
-        float * map = resource.map;
-
-        // env-gated instrumentation (no-op unless VSFEEL_GAUSS_GPU_BENCH is
-        // set); must run before this frame's upload so the staged bytes are
-        // in place for its re-runs
-        gpu_bench_probe(d, resource, n);
-
-        const bool coherent =
-            !!(d->device->mem_props.memoryTypes[resource.staging_type_index].propertyFlags &
-               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-        // the upload target is either the host-mapped VRAM src window
-        // (host-direct path: the bytes land in VRAM with no GPU copy) or the
-        // staging upload area (the command buffer's H2D copy moves them)
-        uint8_t * const upload_base = d->host_direct_upload
-            ? static_cast<uint8_t *>(resource.src_map)
-            : static_cast<uint8_t *>(static_cast<void *>(map));
-        // Coherence of the allocation the upload actually writes. The
-        // host-direct path only engages on a coherent device-local type, but
-        // the staging fallback can land on the non-coherent host-visible
-        // memory allocate_memory deliberately permits — there the flush below
-        // is required, and keying it off the destination allocation (instead
-        // of off `host_direct_upload`) is what keeps it reachable.
-        const uint32_t upload_type = d->host_direct_upload
-            ? resource.src_type_index : resource.staging_type_index;
-        const bool upload_coherent =
-            !!(d->device->mem_props.memoryTypes[upload_type].propertyFlags &
-               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-        for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-            if (!d->process[plane]) {
-                continue;
-            }
-
-            int height = vsapi->getFrameHeight(src, plane);
-            const auto & cfg = d->planes[plane];
-
-            auto srcp = vsapi->getReadPtr(src, plane);
-            auto dstp = upload_base + cfg.upload_offset;
-
-            // raw byte copy of the plane, honouring the GPU plane pitch (the
-            // visible width rounded up to 16 bytes) and the frame's stride;
-            // plain memcpy: the mapped VRAM window is write-combined, and
-            // streaming stores measured slower (11 vs 22.5 GB/s)
-            copy_plane_out(dstp, cfg.pitch_bytes, srcp, vsapi->getStride(src, plane),
-                static_cast<size_t>(cfg.width) * d->elem_bytes, height,
-                !d->host_direct_upload);
-        }
-
-        if (!upload_coherent) {
-            std::vector<VkMappedMemoryRange> ranges;
-            ranges.reserve(d->vi->format.numPlanes);
-            for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-                if (!d->process[plane]) {
-                    continue;
-                }
-                const auto & cfg = d->planes[plane];
-                ranges.push_back(mapped_range(*d->device,
-                    d->host_direct_upload ? resource.src_mem : resource.staging_mem,
-                    cfg.upload_offset, cfg.upload_size));
-            }
-            checkVK(vkFlushMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
-        }
-
-        // On the staging path the upload is NT-stored; drain the weak stores
-        // before the GPU is told to read the upload window.
-        _mm_sfence();
-
-        vsfeel_trace_mark("submit");
-        checkVK(submit_with_fence(dev, resource.queue, resource.queue_lock,
-            resource.cmd, resource.fence));
-
-        vsfeel_trace_mark("wait");
-        checkVK(vkWaitForFences(dev, 1, &resource.fence, VK_TRUE, UINT64_MAX));
-
-        if (!coherent) {
-            std::vector<VkMappedMemoryRange> ranges;
-            ranges.reserve(d->vi->format.numPlanes);
-            for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-                if (!d->process[plane]) {
-                    continue;
-                }
-                const auto & cfg = d->planes[plane];
-                ranges.push_back(mapped_range(*d->device, resource.staging_mem,
-                    d->upload_total + cfg.download_offset, cfg.download_size));
-            }
-            checkVK(vkInvalidateMappedMemoryRanges(dev, static_cast<uint32_t>(ranges.size()), ranges.data()));
-        }
-
-        for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-            if (!d->process[plane]) {
-                continue;
-            }
-
-            int height = vsapi->getFrameHeight(src, plane);
-            const auto & cfg = d->planes[plane];
-
-            auto dstp = vsapi->getWritePtr(dst, plane);
-            const uint8_t * h_bufferp =
-                static_cast<const uint8_t *>(static_cast<const void *>(map)) + d->upload_total + cfg.download_offset;
-
-            // raw byte copy of the plane, honouring the GPU plane pitch and
-            // the destination frame's stride
-            copy_plane_read(dstp, vsapi->getStride(dst, plane), h_bufferp,
-                cfg.pitch_bytes, static_cast<size_t>(cfg.width) * d->elem_bytes,
-                height);
-        }
-
-        d->pool.give_back(std::move(resource));
-
-        vsapi->freeFrame(src);
-
-        return dst;
+        return nullptr;
+    }
+    if (activationReason != arAllFramesReady) {
+        return nullptr;
     }
 
-    return nullptr;
+    return gauss_gpu_frame(d, n, frameCtx, core, vsapi);
 }
 
 // ---------------------------------------------------------------------------
@@ -645,13 +426,15 @@ static void VS_CC GaussCreate(
 
     auto d { std::make_unique<GaussData>() };
 
+    d->host_timing = vsfeel_debug_probe("VSFEEL_GAUSS_TIMING");
+
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
 
     int error;
 
     auto set_error = [&](const std::string & error_message) {
-        vsfeel_trace_error("GaussBlur", -1, error_message, d->device.get());
+        vsfeel_trace_error("GaussBlur", -1, error_message, d->gpu.get());
         vsapi->mapSetError(out, ("GaussBlur: " + error_message).c_str());
         vsapi->freeNode(d->node);
     };
@@ -660,7 +443,8 @@ static void VS_CC GaussCreate(
     const int bits = fmt.bitsPerSample;
     const bool depth_ok = (fmt.sampleType == stFloat && bits == 32) ||
                           (fmt.sampleType == stInteger && bits == 16);
-    if (!depth_ok || d->vi->width <= 0 || d->vi->height <= 0 ||
+    if (!vsh::isConstantVideoFormat(d->vi) || !depth_ok || d->vi->width <= 0 ||
+        d->vi->height <= 0 ||
         (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV && fmt.colorFamily != cfRGB)) {
         return set_error("input bitdepth must be 16 (integer) or 32 (float), Gray/YUV/RGB.");
     }
@@ -677,13 +461,18 @@ static void VS_CC GaussCreate(
     }
 
     int num_streams = vsh::int64ToIntS(vsapi->mapGetInt(in, "num_streams", 0, &error));
+    const bool streams_given = !error;
     if (error) {
         num_streams = 4;
     }
     if (num_streams < 1 || num_streams > 32) {
         return set_error("num_streams must be 1..32.");
     }
-    d->num_streams = num_streams;
+    // "num_streams" is accepted for compatibility and no longer selects
+    // anything: how many frames are in flight is the core's call now.
+    if (streams_given && vsfeel_debug_flag("VSFEEL_GAUSS_DEPRECATED")) {
+        fprintf(stderr, "[gaussblur] num_streams is ignored under the R80 GPU API\n");
+    }
 
     // sigma defaults: plane 0 = 0.5; chroma = sigma[0]/sqrt((1<<subW)*(1<<subH))
     // (computed in double, then narrowed); plane 2 = plane 1
@@ -716,12 +505,28 @@ static void VS_CC GaussCreate(
     }
 
     {
-        const auto result = get_device(device_id);
+        const auto result = get_gpu_device(core, vsapi);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
-        d->device = std::get<std::shared_ptr<VK_Device>>(result);
-        d->device_id = device_id;
+        d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
+    }
+
+    // The plane geometry has to be the one the core's GPU frames carry, because
+    // kernel addressing is STRIDE elements per row. A GPU frame's stride is the
+    // CPU frame's stride, so it is read off a scratch frame here rather than
+    // guessed from an alignment rule.
+    int plane_stride[3] {};
+    {
+        VSFrame * probe = vsapi->newVideoFrame(&fmt, d->vi->width, d->vi->height,
+                                               nullptr, core);
+        if (probe == nullptr) {
+            return set_error("could not allocate a probe frame to read the plane stride");
+        }
+        for (int p = 0; p < fmt.numPlanes; ++p) {
+            plane_stride[p] = static_cast<int>(vsapi->getStride(probe, p) / d->elem_bytes);
+        }
+        vsapi->freeFrame(probe);
     }
 
     // Per-plane configuration, with deduplication for identical planes
@@ -741,15 +546,25 @@ static void VS_CC GaussCreate(
     std::array<bool, 3> plane_valid {};
     std::array<int, 3> plane_cfg {};
 
-    for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
+    for (int plane = 0; plane < fmt.numPlanes; ++plane) {
         if (!d->process[plane]) {
             continue;
         }
 
         const int plane_width = (plane == 0) ? d->vi->width : d->vi->width >> subW;
         const int plane_height = (plane == 0) ? d->vi->height : d->vi->height >> subH;
-        const int pitch_bytes = (plane_width * d->elem_bytes + 15) & ~15;
-        const int stride = pitch_bytes / d->elem_bytes;
+        const int stride = plane_stride[plane];
+
+        // The kernel addresses the plane through signed 32-bit element
+        // offsets; reject a plane whose last element would not fit rather than
+        // letting it wrap and read outside the buffer.
+        const int64_t last = static_cast<int64_t>(plane_height - 1) * stride + plane_width - 1;
+        if (last > INT32_MAX) {
+            return set_error("plane " + std::to_string(plane) + " is too large: " +
+                std::to_string(plane_width) + "x" + std::to_string(plane_height) +
+                " at stride " + std::to_string(stride) +
+                " overflows the kernel's 32-bit addressing");
+        }
 
         const ConfigKey key { plane_width, plane_height, stride, sigma[plane] };
 
@@ -779,10 +594,8 @@ static void VS_CC GaussCreate(
 
     const int n_cfg = static_cast<int>(keys.size());
 
-    VkDevice dev = d->device->device;
-
-    // Determine the code path per config: the fused small path only when its
-    // shared-memory tile fits the device.
+    // Code path per config: the fused small path only when its shared-memory
+    // tile fits the device.
     std::array<bool, 3> cfg_small {};
     for (int ci = 0; ci < n_cfg; ++ci) {
         const int ksize = static_cast<int>(weights[ci].size());
@@ -790,245 +603,128 @@ static void VS_CC GaussCreate(
         const size_t tile_bytes =
             static_cast<size_t>(VRT) * BLK_Y * (BLK_X + 2 * radius) * sizeof(float);
         cfg_small[ci] = radius <= LARGE_THRESHOLD &&
-            tile_bytes <= std::min<size_t>(48 * 1024, d->device->limits.maxComputeSharedMemorySize);
+            tile_bytes <= std::min<size_t>(48 * 1024, d->gpu->limits.maxComputeSharedMemorySize);
     }
 
-    // Pipeline layout, descriptor set layout and descriptor pool
+    // Push descriptor layout: one whole-buffer binding per shader buffer, so
+    // each dispatch rebinds its own view of the planes and nothing is
+    // allocated from a descriptor pool.
     {
-        VkDescriptorSetLayoutBinding bindings[5] {
-            { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            // raw dword view of the 16-bit dst buffer (packed pair stores in
-            // the large-path horizontal pass; unused by other entries)
-            { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        };
-
-        VkDescriptorSetLayoutCreateInfo layout_info {
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .bindingCount = 5,
-            .pBindings = bindings
-        };
-
-        checkVK(vkCreateDescriptorSetLayout(
-            d->device->device, &layout_info, nullptr, &d->set_layout));
+        const auto result = gpu_push_set_layout(*d->gpu, 5);
+        if (std::holds_alternative<std::string>(result)) {
+            return set_error(std::get<std::string>(result));
+        }
+        d->set_layout = std::get<VkDescriptorSetLayout>(result);
     }
     {
-        VkPushConstantRange push_constant_range {
-            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-            .offset = 0,
-            .size = 4 * sizeof(int32_t)
-        };
-
-        VkPipelineLayoutCreateInfo pipeline_layout_info {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .setLayoutCount = 1,
-            .pSetLayouts = &d->set_layout,
-            .pushConstantRangeCount = 1,
-            .pPushConstantRanges = &push_constant_range
-        };
-
-        checkVK(vkCreatePipelineLayout(
-            d->device->device, &pipeline_layout_info, nullptr, &d->pipeline_layout));
-    }
-    {
-        VkDescriptorPoolSize pool_size {
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 * static_cast<uint32_t>(d->num_streams)
-        };
-
-        VkDescriptorPoolCreateInfo pool_info {
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .maxSets = static_cast<uint32_t>(d->num_streams),
-            .poolSizeCount = 1,
-            .pPoolSizes = &pool_size
-        };
-
-        checkVK(vkCreateDescriptorPool(
-            d->device->device, &pool_info, nullptr, &d->desc_pool));
+        const auto result = gpu_pipeline_layout(*d->gpu, d->set_layout,
+            4 * sizeof(int32_t));
+        if (std::holds_alternative<std::string>(result)) {
+            return set_error(std::get<std::string>(result));
+        }
+        d->pipeline_layout = std::get<VkPipelineLayout>(result);
     }
 
-    // Weights buffer: all configs' kernels concatenated
+    // Weights buffer: all configs' kernels concatenated.
     {
         VkDeviceSize wt_bytes = 0;
         for (const auto & w : weights) {
             wt_bytes += static_cast<VkDeviceSize>(w.size()) * sizeof(float);
         }
-        d->wt_bytes = std::max<VkDeviceSize>(wt_bytes, 4);
+        wt_bytes = std::max<VkDeviceSize>(wt_bytes, 4);
 
-        VkBufferCreateInfo buffer_info {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .size = d->wt_bytes,
-            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-            .queueFamilyIndexCount = 0,
-            .pQueueFamilyIndices = nullptr
-        };
-        checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &d->wt_buf));
-        {
-            const auto result = allocate_memory(*d->device, d->wt_buf,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->wt_mem = std::get<AllocatedMemory>(result).memory;
-            d->wt_type_index = std::get<AllocatedMemory>(result).type_index;
+        auto e = gpu_make_buffer(*d->gpu, core, wt_bytes, d->wt,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!e.empty()) {
+            return set_error("weights buffer: " + e);
         }
-        checkVK(vkMapMemory(dev, d->wt_mem, 0, d->wt_bytes, 0, reinterpret_cast<void **>(&d->wt_map)));
-
+        if (d->wt.mapped == nullptr) {
+            return set_error("weights buffer is not host visible");
+        }
+        auto * map = static_cast<float *>(d->wt.mapped);
         uint32_t wt_base = 0;
         for (int ci = 0; ci < n_cfg; ++ci) {
-            std::memcpy(d->wt_map + wt_base, weights[ci].data(),
+            std::memcpy(map + wt_base, weights[ci].data(),
                 weights[ci].size() * sizeof(float));
             wt_base += static_cast<uint32_t>(weights[ci].size());
         }
-
-        const bool wt_coherent =
-            !!(d->device->mem_props.memoryTypes[d->wt_type_index].propertyFlags &
-               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (!wt_coherent) {
-            VkMappedMemoryRange flush_range {
-                .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                .pNext = nullptr,
-                .memory = d->wt_mem,
-                .offset = 0,
-                .size = VK_WHOLE_SIZE
-            };
-            checkVK(vkFlushMappedMemoryRanges(dev, 1, &flush_range));
-        }
+        // The buffer may have landed in the host-visible VRAM BAR, whose
+        // mapping is write-combining: the first submission must not read a
+        // tail the CPU store buffer has not drained yet.
+        _mm_sfence();
     }
 
-    // Shader modules (create lazily — only those actually used)
-    {
-        const uint32_t * gauss_code = nullptr;
-        size_t gauss_size = 0;
-        const uint32_t * vert_code = nullptr;
-        size_t vert_size = 0;
-        const uint32_t * horiz_code = nullptr;
-        size_t horiz_size = 0;
-        switch (d->bits) {
-            case 16:
-                gauss_code = gaussblur_16_gauss_spv;  gauss_size = gaussblur_16_gauss_spv_size;
-                vert_code = gaussblur_16_vert_spv;    vert_size = gaussblur_16_vert_spv_size;
-                horiz_code = gaussblur_16_horiz_spv;  horiz_size = gaussblur_16_horiz_spv_size;
-                break;
-            case 32:
-                gauss_code = gaussblur_32_gauss_spv;  gauss_size = gaussblur_32_gauss_spv_size;
-                vert_code = gaussblur_32_vert_spv;    vert_size = gaussblur_32_vert_spv_size;
-                horiz_code = gaussblur_32_horiz_spv;  horiz_size = gaussblur_32_horiz_spv_size;
-                break;
-            default:
-                return set_error("unsupported bit depth");
-        }
-
-        bool need_gauss = false;
-        bool need_large = false;
-        for (int ci = 0; ci < n_cfg; ++ci) {
-            need_gauss |= cfg_small[ci];
-            need_large |= !cfg_small[ci];
-        }
-
-        if (need_gauss) {
-            const auto result = create_shader_module(*d->device, gauss_code, gauss_size);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            d->module = std::get<VkShaderModule>(result);
-        }
-        if (need_large) {
-            {
-                const auto result = create_shader_module(*d->device, vert_code, vert_size);
-                if (std::holds_alternative<std::string>(result)) {
-                    return set_error(std::get<std::string>(result));
-                }
-                d->v_module = std::get<VkShaderModule>(result);
-            }
-            {
-                const auto result = create_shader_module(*d->device, horiz_code, horiz_size);
-                if (std::holds_alternative<std::string>(result)) {
-                    return set_error(std::get<std::string>(result));
-                }
-                d->h_module = std::get<VkShaderModule>(result);
-            }
-        }
+    // Shader blobs, selected by bit depth (the entry point by code path).
+    const uint32_t * gauss_code = nullptr;
+    size_t gauss_size = 0;
+    const uint32_t * vert_code = nullptr;
+    size_t vert_size = 0;
+    const uint32_t * horiz_code = nullptr;
+    size_t horiz_size = 0;
+    switch (d->bits) {
+        case 16:
+            gauss_code = gaussblur_16_gauss_spv;  gauss_size = gaussblur_16_gauss_spv_size;
+            vert_code = gaussblur_16_vert_spv;    vert_size = gaussblur_16_vert_spv_size;
+            horiz_code = gaussblur_16_horiz_spv;  horiz_size = gaussblur_16_horiz_spv_size;
+            break;
+        default:
+            gauss_code = gaussblur_32_gauss_spv;  gauss_size = gaussblur_32_gauss_spv_size;
+            vert_code = gaussblur_32_vert_spv;    vert_size = gaussblur_32_vert_spv_size;
+            horiz_code = gaussblur_32_horiz_spv;  horiz_size = gaussblur_32_horiz_spv_size;
+            break;
     }
 
-    // Per-plane pipelines, with deduplication for identical plane configs
-    const uint32_t max_grid_x = d->device->limits.maxComputeWorkGroupCount[0];
-    const uint32_t max_grid_y = d->device->limits.maxComputeWorkGroupCount[1];
+    const uint32_t max_grid_x = d->gpu->limits.maxComputeWorkGroupCount[0];
+    const uint32_t max_grid_y = d->gpu->limits.maxComputeWorkGroupCount[1];
 
+    // Per-plane pipelines, grids and scratch layout. A plane identical to an
+    // earlier one reuses its pipelines and offsets outright.
     auto & planes = d->planes;
+    VkDeviceSize tmp_total = 0;
+    uint32_t wt_running = 0;
 
-    // Deduplicated pipelines: reuse an existing pipeline for identical configs
-    std::array<VkPipeline, 3> cfg_pipeline {};
-    std::array<VkPipeline, 3> cfg_v_pipeline {};
-    std::array<VkPipeline, 3> cfg_h_pipeline {};
-    std::array<bool, 3> cfg_created {};
-
-    for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
+    for (int plane = 0; plane < fmt.numPlanes; ++plane) {
         if (!plane_valid[plane]) {
             continue;
         }
         const int ci = plane_cfg[plane];
-        if (cfg_created[ci]) {
+        GaussPlaneConfig & cfg = planes[plane];
+
+        // Two-pass scratch region, assigned per plane even when the pipelines
+        // are reused: identical planes' dispatches are unordered within one
+        // command buffer, so sharing one region would race (WAR between the
+        // reused plane's horizontal pass and this one's vertical pass).
+        VkDeviceSize plane_tmp_elem = 0;
+        if (!cfg_small[ci]) {
+            const auto & pkey = plane_keys[plane];
+            const VkDeviceSize bytes =
+                static_cast<VkDeviceSize>(pkey.h) * pkey.stride * sizeof(float);
+            const VkDeviceSize off = align32(tmp_total);
+            const int64_t last_tmp =
+                static_cast<int64_t>(off / 4) +
+                static_cast<int64_t>(pkey.h) * pkey.stride;
+            if (last_tmp > INT32_MAX) {
+                return set_error("plane " + std::to_string(plane) +
+                    " two-pass scratch overflows the kernel's 32-bit addressing");
+            }
+            plane_tmp_elem = off / 4;
+            tmp_total = align32(off + bytes);
+        }
+
+        bool found = false;
+        for (int other = 0; other < plane; ++other) {
+            if (plane_valid[other] && plane_cfg[other] == ci) {
+                cfg = planes[other];
+                cfg.tmp_elem = plane_tmp_elem;
+                found = true;
+                break;
+            }
+        }
+        if (found) {
             continue;
         }
 
-        const auto & key = keys[ci];
-        const int ksize = static_cast<int>(weights[ci].size());
-        const int radius = ksize / 2;
-
-        GaussPlaneConfig cfg;
-        cfg.width = key.w;
-        cfg.height = key.h;
-        cfg.stride = key.stride;
-        cfg.ksize = ksize;
-        cfg.radius = radius;
-        cfg.small = cfg_small[ci];
-
-        if (cfg.small) {
-            const auto result = create_pipeline(*d->device, cfg, d->module, d->pipeline_layout);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            cfg_pipeline[ci] = std::get<VkPipeline>(result);
-        } else {
-            {
-                const auto result = create_pipeline(*d->device, cfg, d->v_module, d->pipeline_layout);
-                if (std::holds_alternative<std::string>(result)) {
-                    return set_error(std::get<std::string>(result));
-                }
-                cfg_v_pipeline[ci] = std::get<VkPipeline>(result);
-            }
-            {
-                const auto result = create_pipeline(*d->device, cfg, d->h_module, d->pipeline_layout);
-                if (std::holds_alternative<std::string>(result)) {
-                    return set_error(std::get<std::string>(result));
-                }
-                cfg_h_pipeline[ci] = std::get<VkPipeline>(result);
-            }
-        }
-        cfg_created[ci] = true;
-    }
-
-    // assign the pipeline handles and grid sizes to the planes
-    std::array<bool, 3> wt_assigned {};
-    uint32_t wt_base = 0;
-    for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-        if (!plane_valid[plane]) {
-            continue;
-        }
-        const int ci = plane_cfg[plane];
-        auto & cfg = planes[plane];
         const auto & key = plane_keys[plane];
         const int ksize = static_cast<int>(weights[ci].size());
         const int radius = ksize / 2;
@@ -1036,13 +732,10 @@ static void VS_CC GaussCreate(
         cfg.width = key.w;
         cfg.height = key.h;
         cfg.stride = key.stride;
-        cfg.pitch_bytes = cfg.stride * d->elem_bytes;
         cfg.ksize = ksize;
         cfg.radius = radius;
         cfg.small = cfg_small[ci];
-        cfg.pipeline = cfg_pipeline[ci];
-        cfg.v_pipeline = cfg_v_pipeline[ci];
-        cfg.h_pipeline = cfg_h_pipeline[ci];
+        cfg.tmp_elem = plane_tmp_elem;
 
         cfg.grid_x = static_cast<uint32_t>(std::min<int64_t>(
             (cfg.width + BLK_X - 1) / BLK_X, static_cast<int64_t>(max_grid_x)));
@@ -1057,373 +750,71 @@ static void VS_CC GaussCreate(
         cfg.h_grid_y = static_cast<uint32_t>(std::min<int64_t>(
             (cfg.height + BLK_Y - 1) / BLK_Y, static_cast<int64_t>(max_grid_y)));
 
-        if (wt_assigned[ci]) {
-            // reuse the weights offset of the first plane sharing this config
-            for (int other = 0; other < plane; ++other) {
-                if (plane_valid[other] && plane_cfg[other] == ci) {
-                    cfg.wt_base = planes[other].wt_base;
-                    break;
-                }
-            }
-        } else {
-            wt_assigned[ci] = true;
-            cfg.wt_base = wt_base;
-            wt_base += static_cast<uint32_t>(weights[ci].size());
-        }
-    }
+        cfg.wt_base = wt_running;
+        wt_running += static_cast<uint32_t>(weights[ci].size());
 
-    // Buffer region offsets (raw bytes), each region 32-byte aligned so the
-    // streaming copies can use aligned loads/stores. The staging layout and
-    // the VRAM src/dst layouts are identical, so one DMA copy per direction
-    // moves every plane at once.
-    VkDeviceSize upload_total = 0;
-    VkDeviceSize download_total = 0;
-    VkDeviceSize tmp_total = 0;
+        const GaussSpecData spec {
+            .width = cfg.width,
+            .height = cfg.height,
+            .stride = cfg.stride,
+            .ksize = cfg.ksize,
+            .radius = cfg.radius
+        };
 
-    for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-        if (!plane_valid[plane]) {
-            continue;
-        }
-        auto & cfg = planes[plane];
-        const VkDeviceSize plane_bytes =
-            static_cast<VkDeviceSize>(cfg.height) * cfg.pitch_bytes;
-        const VkDeviceSize tmp_bytes =
-            plane_bytes * (4 / d->elem_bytes);
-
-        cfg.upload_offset = align32(upload_total);
-        cfg.upload_size = plane_bytes;
-        upload_total = align32(cfg.upload_offset + cfg.upload_size);
-
-        cfg.download_offset = align32(download_total);
-        cfg.download_size = plane_bytes;
-        download_total = align32(cfg.download_offset + cfg.download_size);
-
-        // the VRAM buffers mirror the staging layout byte-for-byte
-        cfg.src_elem = cfg.upload_offset / d->elem_bytes;
-        cfg.dst_elem = cfg.download_offset / d->elem_bytes;
-
-        cfg.tmp_offset = align32(tmp_total);
-        cfg.tmp_size = tmp_bytes;
-        cfg.tmp_elem = cfg.tmp_offset / 4;
-        tmp_total = align32(cfg.tmp_offset + cfg.tmp_size);
-    }
-
-    d->upload_total = upload_total;
-    d->download_total = download_total;
-    d->tmp_total = tmp_total;
-
-    // kd download addresses the staging download area, which begins at the
-    // FINAL upload_total — only known now, after every plane was laid out
-    for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-        if (!plane_valid[plane]) {
-            continue;
-        }
-        auto & cfg = planes[plane];
-        cfg.dst_stage_elem = (upload_total + cfg.download_offset) / d->elem_bytes;
-    }
-
-    const VkDeviceSize min_size = 4;
-    // the host-visible staging only carries raw plane bytes; the kernels'
-    // src/dst/tmp live in device-local VRAM (see below)
-    const VkDeviceSize staging_size = std::max(upload_total + download_total, 2 * min_size);
-    const VkDeviceSize src_size = std::max(upload_total, min_size);
-    const VkDeviceSize dst_size = std::max(download_total, min_size);
-    const VkDeviceSize tmp_size = std::max(tmp_total, min_size);
-
-    // Resources
-    // host-direct upload: the CPU memcpy writes the host-mapped VRAM src
-    // window directly (no GPU-side H2D copy); opt out with VSFEEL_GAUSS_HD=0
-    // (plain VRAM src + staging upload + in-CB copy)
-    d->host_direct_upload = env_int("VSFEEL_GAUSS_HD", 1) != 0;
-    // kernel-direct download: the blur kernels' plain coalesced stores write
-    // the GTT staging download region over PCIe directly, removing the
-    // GPU-side D2H copy; opt out with VSFEEL_GAUSS_KD=0 for the VRAM+copy path
-    d->kd_download = env_int("VSFEEL_GAUSS_KD", 1) != 0;
-    d->pool.semaphore.current.store(d->num_streams - 1, std::memory_order::relaxed);
-    d->pool.reserve(d->num_streams);
-
-    // Queue sharing is swept independently of the stream count (see
-    // resolve_queue_cap): override with VSFEEL_GAUSS_QUEUES=N.
-    uint32_t num_queues = resolve_queue_cap(d->num_streams,
-        d->device->queue_count, "VSFEEL_GAUSS_QUEUES", 1);
-
-    for (int i = 0; i < d->num_streams; ++i) {
-        // Owned by the pool while it is being built: a mid-loop error return
-        // tears it down in ~GaussData instead of leaking it (see
-        // FramePool::emplace).
-        GaussBlurResource & resource = d->pool.emplace();
-
-        {
-            VkBufferCreateInfo buffer_info {
-                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .size = staging_size,
-                // STORAGE_BUFFER: with kd_download the blur kernels write the
-                // download region as an SSBO; TRANSFER_*: the H2D/D2H copies
-                // of the non-host-direct paths
-                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = nullptr
-            };
-            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.staging));
-        }
-
-        {
-            const auto result = allocate_memory(
-                *d->device, resource.staging,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        if (cfg.small) {
+            const auto result = create_pipeline(
+                *d->gpu, d->pipeline_layout, gauss_code, gauss_size, spec);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
-            resource.staging_mem = std::get<AllocatedMemory>(result).memory;
-            resource.staging_type_index = std::get<AllocatedMemory>(result).type_index;
-        }
-
-        // device-local input planes: the kernels read them. With ReBAR the
-        // buffer is host-mapped so the CPU memcpy writes VRAM directly and
-        // the command buffer needs no H2D copy; if no host-visible device-
-        // local memory exists, fall back to a plain VRAM buffer filled by
-        // the H2D copy (with_copies recording).
-        {
-            VkBufferCreateInfo buffer_info {
-                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .size = src_size,
-                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = nullptr
-            };
-            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.src_buf));
-
-            auto result = allocate_memory(
-                *d->device, resource.src_buf,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            if (std::holds_alternative<std::string>(result)) {
-                result = allocate_memory(
-                    *d->device, resource.src_buf, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            cfg.pipeline = std::get<VkPipeline>(result);
+        } else {
+            {
+                const auto result = create_pipeline(
+                    *d->gpu, d->pipeline_layout, vert_code, vert_size, spec);
                 if (std::holds_alternative<std::string>(result)) {
                     return set_error(std::get<std::string>(result));
                 }
-            } else if (d->host_direct_upload) {
-                // only take the host-mapped path when the allocation really
-                // is device-local (allocate_memory may relax the requirement)
-                const uint32_t ti = std::get<AllocatedMemory>(result).type_index;
-                const auto flags = d->device->mem_props.memoryTypes[ti].propertyFlags;
-                d->host_direct_upload =
-                    (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
-                    (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
-                    (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                cfg.v_pipeline = std::get<VkPipeline>(result);
             }
-            resource.src_mem = std::get<AllocatedMemory>(result).memory;
-            resource.src_type_index = std::get<AllocatedMemory>(result).type_index;
-            if (d->host_direct_upload) {
-                checkVK(vkMapMemory(dev, resource.src_mem, 0, src_size, 0, &resource.src_map));
+            {
+                const auto result = create_pipeline(
+                    *d->gpu, d->pipeline_layout, horiz_code, horiz_size, spec);
+                if (std::holds_alternative<std::string>(result)) {
+                    return set_error(std::get<std::string>(result));
+                }
+                cfg.h_pipeline = std::get<VkPipeline>(result);
             }
         }
+    }
+    d->tmp_total = tmp_total;
 
-        // device-local output planes: the kernels write them, the D2H DMA
-        // copy reads them. Not needed when the kernels write the staging
-        // download region directly (kd_download).
-        if (!d->kd_download) {
-            VkBufferCreateInfo buffer_info {
-                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .size = dst_size,
-                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = nullptr
-            };
-            checkVK(vkCreateBuffer(dev, &buffer_info, nullptr, &resource.dst_buf));
-
-            const auto result = allocate_memory(
-                *d->device, resource.dst_buf, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            resource.dst_mem = std::get<AllocatedMemory>(result).memory;
-        }
-
-        // the large path's float intermediate buffer: device-local so the two
-        // passes never round-trip it through host (PCIe) memory. Only created
-        // when some plane needs the large path; the small path never touches
-        // binding 3.
-        if (d->tmp_total > 0) {
-            VkBufferCreateInfo tmp_buffer_info {
-                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .size = tmp_size,
-                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = nullptr
-            };
-            checkVK(vkCreateBuffer(dev, &tmp_buffer_info, nullptr, &resource.tmp_buf));
-
-            const auto tmp_result = allocate_memory(
-                *d->device, resource.tmp_buf, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            if (std::holds_alternative<std::string>(tmp_result)) {
-                return set_error(std::get<std::string>(tmp_result));
-            }
-            resource.tmp_mem = std::get<AllocatedMemory>(tmp_result).memory;
-        }
-
-        {
-            VkCommandPoolCreateInfo pool_info {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .queueFamilyIndex = d->device->queue_family
-            };
-            checkVK(vkCreateCommandPool(dev, &pool_info, nullptr, &resource.pool));
-        }
-
-        {
-            VkCommandBufferAllocateInfo alloc_info {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                .pNext = nullptr,
-                .commandPool = resource.pool,
-                .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                .commandBufferCount = 1
-            };
-            checkVK(vkAllocateCommandBuffers(dev, &alloc_info, &resource.cmd));
-        }
-
-        {
-            VkFenceCreateInfo fence_info {
-                .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0
-            };
-            checkVK(vkCreateFence(dev, &fence_info, nullptr, &resource.fence));
-        }
-
-        {
-            VkDescriptorSetAllocateInfo alloc_info {
-                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                .pNext = nullptr,
-                .descriptorPool = d->desc_pool,
-                .descriptorSetCount = 1,
-                .pSetLayouts = &d->set_layout
-            };
-            checkVK(vkAllocateDescriptorSets(dev, &alloc_info, &resource.desc_set));
-        }
-
-        {
-            VkDescriptorBufferInfo wt_info {
-                .buffer = d->wt_buf,
-                .offset = 0,
-                .range = VK_WHOLE_SIZE
-            };
-            VkDescriptorBufferInfo src_info {
-                .buffer = resource.src_buf,
-                .offset = 0,
-                .range = VK_WHOLE_SIZE
-            };
-            VkDescriptorBufferInfo dst_info {
-                .buffer = d->kd_download ? resource.staging : resource.dst_buf,
-                .offset = 0,
-                .range = staging_size
-            };
-            VkDescriptorBufferInfo tmp_info {
-                .buffer = resource.tmp_buf ? resource.tmp_buf : resource.src_buf,
-                .offset = 0,
-                .range = VK_WHOLE_SIZE
-            };
-
-            VkWriteDescriptorSet writes[5] {
-                {
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext = nullptr,
-                    .dstSet = resource.desc_set,
-                    .dstBinding = 0,
-                    .dstArrayElement = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pImageInfo = nullptr,
-                    .pBufferInfo = &wt_info,
-                    .pTexelBufferView = nullptr
-                },
-                {
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext = nullptr,
-                    .dstSet = resource.desc_set,
-                    .dstBinding = 1,
-                    .dstArrayElement = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pImageInfo = nullptr,
-                    .pBufferInfo = &src_info,
-                    .pTexelBufferView = nullptr
-                },
-                {
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext = nullptr,
-                    .dstSet = resource.desc_set,
-                    .dstBinding = 2,
-                    .dstArrayElement = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pImageInfo = nullptr,
-                    .pBufferInfo = &dst_info,
-                    .pTexelBufferView = nullptr
-                },
-                {
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext = nullptr,
-                    .dstSet = resource.desc_set,
-                    .dstBinding = 3,
-                    .dstArrayElement = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pImageInfo = nullptr,
-                    .pBufferInfo = &tmp_info,
-                    .pTexelBufferView = nullptr
-                },
-                {
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext = nullptr,
-                    .dstSet = resource.desc_set,
-                    .dstBinding = 4,
-                    .dstArrayElement = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pImageInfo = nullptr,
-                    .pBufferInfo = &dst_info,   // same buffer as binding 2, seen as dwords
-                    .pTexelBufferView = nullptr
-                },
-            };
-
-            vkUpdateDescriptorSets(dev, 5, writes, 0, nullptr);
-        }
-
-        checkVK(vkMapMemory(dev, resource.staging_mem, 0, staging_size, 0, reinterpret_cast<void **>(&resource.map)));
-
-        resource.queue = d->device->queues[i % num_queues].queue;
-        resource.queue_lock = d->device->queues[i % num_queues].lock.get();
-
-        if (const auto err = record_command_buffer(*d, resource)) {
-            return set_error(*err);
+    {
+        char err[512] {};
+        d->pool = d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
+        if (d->pool == nullptr) {
+            return set_error("createGPUExecPool failed: "s + err);
         }
     }
 
-    VSFilterDependency deps[1] = {{d->node, rpStrictSpatial}};
+    GaussData * data = d.release();
 
-    GaussData *data = d.release();
+    // A spatial filter, so the strict-spatial request pattern is the honest
+    // declaration.
+    VSFilterDependency deps[1] = {{ data->node, rpStrictSpatial }};
 
-    vsapi->createVideoFilter(
-        out, "GaussBlur", data->vi,
+    // ffGPUOutput: the frames this filter returns live in VRAM and carry their
+    // own producer pairs, so the core never downloads them for a consumer that
+    // does not need host pixels.
+    VSNode * result = vsapi->createVideoFilterEx2(
+        "GaussBlur", data->vi,
         GaussGetFrame, GaussFree,
-        fmParallel, deps, 1, data, core);
+        fmParallel, ffGPUOutput, deps, 1, data, core);
+    if (result == nullptr) {
+        vsapi->mapSetError(out, "GaussBlur: filter creation failed");
+        return;
+    }
+    vsapi->mapConsumeNode(out, "clip", result, maAppend);
 }
 
 // ---------------------------------------------------------------------------
@@ -1433,11 +824,11 @@ static void VS_CC GaussCreate(
 void vsfeel_register_gaussblur(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
     vspapi->registerFunction(
         "GaussBlur",
-        "clip:vnode;"
+        "clip:vnode:gpu;"
         "sigma:float[]:opt;"
         "device_id:int:opt;"
         "num_streams:int:opt;",
-        "clip:vnode;",
+        "clip:vnode:gpu;",
         GaussCreate, nullptr, plugin
     );
 }

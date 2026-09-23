@@ -21,8 +21,9 @@
  * input is the raw code (no scaling), integer output rounds to nearest even
  * and saturates (convert_*_sat_rte).
  *
- * All buffers live in device-local VRAM (the host moves frames in/out with
- * DMA copies in the same command buffer). Compile-time variants:
+ * Buffers: src/dst are the core's own GPU frame planes (vnode: in/out),
+ * `tmp` is a transient per-frame scratch buffer for the two-pass path, `wt`
+ * is the constant weights buffer. Compile-time variants:
  * -DBITS=16|32. The 16-bit path uses native uint16_t SSBO elements (the
  * device enables storageBuffer16BitAccess), so loads and stores are plain
  * coalesced element accesses — no shift/mask unpacking, no dword packing,

@@ -23,7 +23,7 @@ import vapoursynth as vs
 
 from conftest import (
     WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_changes_on_noise,
-    assert_preserves_frame_props, compare_or_skip, eval_parallel,
+    assert_preserves_frame_props, compare_or_skip, cpu_node, eval_parallel,
     frame_to_ndarray, plane as _plane, reference_or_skip,
 )
 
@@ -31,12 +31,18 @@ pytestmark = pytest.mark.usefixtures("noise_gray")
 
 
 def _run(clip, sigma=2.0, num_streams=1, **kwargs):
-    return vs.core.vsfeel.GaussBlur(
+    """GaussBlur as a clip the test can read pixels from.
+
+    Under the R80 GPU API the filter takes and returns ``vnode:gpu`` frames, so
+    a CPU clip is auto-uploaded by the core and the output is downloaded before
+    the host reads it (see conftest.cpu_node).
+    """
+    return cpu_node(vs.core.vsfeel.GaussBlur(
         clip,
         sigma=sigma,
         num_streams=num_streams,
         **kwargs,
-    )
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +154,8 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
         raise SystemExit(2)
     print("REF ok", flush=True)
 
-    # --- vsfeel phase ---
-    my_node = core.vsfeel.GaussBlur(clip, sigma=sigma, num_streams=1)
+    # --- vsfeel phase (GPU-resident output downloaded for the host reads) ---
+    my_node = cpu_node(core.vsfeel.GaussBlur(clip, sigma=sigma, num_streams=1))
     worst = 0.0
     for n in (3, 11, 23):
         fm = my_node.get_frame(n)
