@@ -22,8 +22,8 @@ Design (current):
 - Unprocessed planes (`sigma < FLT_EPSILON`) ride along from the source through
   `newVideoFrame2`, keeping their own producer pairs; nothing is submitted when
   every plane is unprocessed.
-- `num_streams` and `device_id` are accepted and **ignored**: depth is the core's
-  call and device choice is `core.set_vulkan_device`.
+- `num_streams` and `device_id` are registered no-ops (never read): depth is
+  the core's call and device choice is `core.set_vulkan_device`.
 - **`RADV_EXPERIMENTAL=transfer_queue` is required for the numbers below**, and
   `tools/benchmark.py` now forces it. Without it RADV exposes no transfer-only
   queue family, so the core's `GPUDownload` is a copy on the graphics engine

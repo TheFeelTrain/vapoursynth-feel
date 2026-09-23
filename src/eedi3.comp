@@ -1774,13 +1774,14 @@ void main() {
 #if defined(ENTRY_COMPOSE)
 
 // EEDI3H output assembly: the output plane O (WIDTH rows of 2*rows columns)
-// transposed back into frame order from R' (kept, binding 9) and vout
-// (interpolated, binding 7):  O[y][2k+p] = (p == field) ? vout[k][y] : R'[k][y].
-// Both sources are read with y (the fast axis of the output) varying across
-// the lanes, and the output is written with x varying, so a plain transpose
-// via LDS: load into shV/shR indexed by [k][y], store from [k][y] with the
-// thread roles swapped between the phases. The assembled plane goes out
-// through binding 10 (the staging download), so the sources are untouched.
+// transposed back into frame order from R' (kept, binding 0) and the
+// interpolated values (binding 1):  O[y][2k+p] = (p == field) ? vout[k][y] :
+// R'[k][y]. Both sources are read with y (the fast axis of the output) varying
+// across the lanes, and the output is written with x varying, so a plain
+// transpose via LDS: load into shV/shR indexed by [k][y], store from [k][y]
+// with the thread roles swapped between the phases. The assembled plane goes
+// straight into the output frame plane (binding 2), so the sources are
+// untouched.
 layout(local_size_x = 16, local_size_y = 16) in;
 
 shared SHARED_T compV[16][17];

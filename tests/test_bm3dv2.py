@@ -113,9 +113,9 @@ def test_bm3dv2_nosearch_matches_search_on_constant_clip(monkeypatch):
     """
     clip = vs.core.std.BlankClip(
         width=64, height=64, format=vs.GRAYS, length=3, color=0.5)
-    monkeypatch.delenv("BM3D_NOSEARCH", raising=False)
+    monkeypatch.delenv("VSFEEL_BM3D_NOSEARCH", raising=False)
     search = _run(clip, radius=2)
-    monkeypatch.setenv("BM3D_NOSEARCH", "1")
+    monkeypatch.setenv("VSFEEL_BM3D_NOSEARCH", "1")
     nosearch = _run(clip, radius=2)
     for n in range(3):
         a = frame_to_ndarray(search.get_frame(n))
@@ -222,24 +222,21 @@ def test_bm3dv2_accepts_radius4_within_addressing_limit():
 
 
 def test_bm3dv2_device_id(noise_gray):
-    """device_id is accepted for compatibility and no longer selects anything.
+    """device_id and num_streams are accepted no-ops.
 
-    Under the R80 GPU API the core owns the one Vulkan device per process, so
-    the choice moved to ``core.set_vulkan_device``. A negative id never
-    selected anything and still fails at creation; a positive or out-of-range
-    one is ignored, and the result must equal the default run (measured max
-    diff ~2e-8, the atomic-order run-to-run floor).
+    Under the R80 GPU API the core owns the one Vulkan device per process and
+    sizes in-flight depth itself, so both arguments are registered only so
+    existing scripts keep loading. Any value, including a negative one, must be
+    ignored and produce the default result (measured max diff ~2e-8, the
+    atomic-order run-to-run floor).
     """
-    with pytest.raises(vs.Error):
-        _run(noise_gray, device_id=-1)
-    a = _run(noise_gray, device_id=0)
     b = _run(noise_gray)
-    c = _run(noise_gray, device_id=99)
-    for n in (0, 11, 23):
-        d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
-        assert np.abs(d).max() < 1e-5, f"device_id=0 differs from default at frame {n}"
-        d = frame_to_ndarray(c.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
-        assert np.abs(d).max() < 1e-5, f"device_id=99 differs from default at frame {n}"
+    for kwargs in (dict(device_id=0), dict(device_id=-1), dict(device_id=99),
+                   dict(num_streams=0), dict(num_streams=64)):
+        a = _run(noise_gray, **kwargs)
+        for n in (0, 11, 23):
+            d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
+            assert np.abs(d).max() < 1e-5, f"{kwargs} differs from default at frame {n}"
 
 
 def test_bm3dv2_preserves_gray_frame_props(noise_gray):

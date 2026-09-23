@@ -14,8 +14,8 @@ Design (current):
 - `WIDTH/HEIGHT/STRIDE/KLEN/RAD` are specialization constants read off a probe
   frame at creation; five push-descriptor bindings (`wt`, `src`, `dst`, `tmp`,
   `dst` dword view), only `tmp_elem`/`wt_base` push constants carry values.
-- Unprocessed planes ride along via `newVideoFrame2`; `num_streams` is a
-  registered no-op, `device_id` ≥ 0 is still enforced.
+- Unprocessed planes ride along via `newVideoFrame2`; `num_streams` and
+  `device_id` are registered no-ops (never read).
 - Runs need `RADV_EXPERIMENTAL=transfer_queue`, which `tools/benchmark.py`
   forces (mechanism: `notes/BILATERAL.md`).
 - The filter sits at the API's transfer ceiling: a bare core

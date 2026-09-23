@@ -97,11 +97,7 @@ inline const char * env_str(const char * env) {
 
 inline int vsfeel_debug_level() {
     static const int level = [] {
-        // VSFEEL_DBG is the pre-rename spelling, kept working for one release.
         const char * v = std::getenv("VSFEEL_DEBUG");
-        if (!v || !*v) {
-            v = std::getenv("VSFEEL_DBG");
-        }
         if (!v || !*v || std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0) {
             return 0;
         }

@@ -32,6 +32,10 @@ constexpr int MAX_RADIUS = 4;
 // The shader does the search-window arithmetic ((2*range+1)^2, x±range) in
 // int32; beyond this, absurd-but-accepted values overflow it.
 constexpr int kMaxSearchRange = 8192;
+// In-flight frames the private caches are sized for. The core's exec pool owns
+// the real pipelining depth; this is the working set the estimate/source rings
+// cover, kept at the old two-stream depth for VRAM.
+constexpr int kInflightFrames = 2;
 
 struct Bm3dPlane {
     int width {};
@@ -88,7 +92,7 @@ struct BM3DData {
     VSNode * ref_node {};   // optional basic-estimate clip (final/Wiener pass)
     const VSVideoInfo * vi;
 
-    int radius, num_streams = 2;
+    int radius;
     int tw;                          // 2 * radius + 1
     float sigma;                     // scaled luma sigma
     float sigma_u, sigma_v;
@@ -161,8 +165,8 @@ struct BM3DData {
     // Cached at creation: the timestamp query pool only exists when the env
     // var was set then, so recording must not be driven by a frame-time getenv.
     bool gpu_trace { false };
-    // Trace/dump flags are read once: the frame path used to call getenv (and
-    // the legacy-name fallback) sixteen times per frame on the default path.
+    // Trace/dump flags are read once: the frame path used to call getenv
+    // sixteen times per frame on the default path.
     bool trace { false };
     bool dump { false };
     // Submit one command buffer per recomputed window position instead of one
@@ -231,8 +235,8 @@ static std::variant<VkPipeline, std::string> create_bm3d_pipeline(
     } spec {
         plane.width, plane.height, plane.stride, sigma_y,
         d.block_step, d.bm_range, d.radius, d.ps_num, d.ps_range, d.extractor,
-        (env_flag("VSFEEL_BM3D_NOSEARCH") || env_flag("BM3D_NOSEARCH")) ? 1 : 0,
-        (env_flag("VSFEEL_BM3D_NOESTIMATE") || env_flag("BM3D_NOESTIMATE")) ? 1 : 0,
+        env_flag("VSFEEL_BM3D_NOSEARCH") ? 1 : 0,
+        env_flag("VSFEEL_BM3D_NOESTIMATE") ? 1 : 0,
         d.src_ring,
         d.final ? 1 : 0
     };
@@ -518,12 +522,6 @@ static void collect_est_positions(BM3DData * d, Bm3dFrame & fr, int n) {
     }
 }
 
-// Record the estimation phase of the command buffer (staging copies, the
-// zero-fills and the search/estimate dispatches). It has no dependency on the
-// other in-flight frames: the src ring is sized for the union of all their
-// windows, and each frame only writes its own res slot. It is submitted before
-// the cross-frame wait so the GPU is busy with this heavy work while the host
-// blocks on the previous frames' timelines.
 // The three buffers both kernels address, in the order the shader declares
 // them: estimate stacks, source ring, destination plane.
 static void bm3d_bind(const GPUDevice & gpu, VkCommandBuffer cmd,
@@ -1058,11 +1056,11 @@ static void VS_CC BM3DCreate(
     d->host_timing = vsfeel_debug_probe("VSFEEL_BM3D_TIMING");
     // The timestamp pool is created only when this is set, so every later
     // recording/readback must use the cached flag, not a frame-time getenv.
-    d->gpu_trace = vsfeel_debug_probe("VSFEEL_BM3D_GPUTRACE") || env_flag("BM3D_GPUTRACE");
-    // Cached too: the frame path must not pay a getenv (plus the legacy-name
-    // fallback) for flags that are fixed per instance.
-    d->trace = vsfeel_debug_trace("VSFEEL_BM3D_TRACE") || env_flag("BM3D_TRACE");
-    d->dump = env_flag("VSFEEL_BM3D_DUMP") || env_flag("BM3D_DUMP");
+    d->gpu_trace = vsfeel_debug_probe("VSFEEL_BM3D_GPUTRACE");
+    // Cached too: the frame path must not pay a getenv for a flag that is fixed
+    // per instance.
+    d->trace = vsfeel_debug_trace("VSFEEL_BM3D_TRACE");
+    d->dump = env_flag("VSFEEL_BM3D_DUMP");
     d->split_est = env_int("VSFEEL_BM3D_SPLIT", 1) != 0;
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
@@ -1209,19 +1207,8 @@ static void VS_CC BM3DCreate(
     }
     d->ps_range = ps_range[0];
 
-    // num_streams is a registered no-op: the cache and stream depths this
-    // filter's working sets are sized for are the fixed two below.
-    d->num_streams = 2;
-
-    int device_id = vsh::int64ToIntS(vsapi->mapGetInt(in, "device_id", 0, &error));
-    // Device selection moved to the core (core.set_vulkan_device): one Vulkan
-    // device per process, picked before any GPU filter runs. The argument stays
-    // accepted so existing scripts keep loading; a negative one is still an
-    // error because it never selected anything.
-    if (!error && device_id < 0) {
-        return set_error("\"device_id\" must be non-negative; under the R80 GPU API "
-                         "device selection is core.set_vulkan_device");
-    }
+    // device_id and num_streams are registered but never read: the core owns
+    // the one device and sizes in-flight depth itself (exec pool ring).
 
     // at radius 0 every frame only touches its own slot and never depends on
     // the previous frames' estimates, so give each in-flight frame its own
@@ -1231,17 +1218,17 @@ static void VS_CC BM3DCreate(
     // frame, so they only need to cover the working set of the concurrent
     // frames (like the reference's fused-mode accumulator cache); anything
     // beyond that (e.g. seeking) blocks in the acquire instead of corrupting.
-    d->src_ring = (d->radius == 0) ? d->num_streams : 4 * d->radius + d->num_streams;
+    d->src_ring = (d->radius == 0) ? kInflightFrames : 4 * d->radius + kInflightFrames;
     // One in-flight frame needs the stacks of centre frames [n-r, n+r], so
-    // num_streams concurrent frames span num_streams + 2r slots. That working
-    // set is the default: the estimate cache is the largest allocation, and on
-    // an 8 GiB card the slack below is the difference between running radius 4
-    // and failing to allocate. VSFEEL_BM3D_CACHE=1 adds a whole extra window,
-    // so an out-of-order (seek) request finds a warm slot instead of waiting in
-    // the acquire, for tw/(ns+2r+tw) more VRAM.
-    const int res_working_set = d->num_streams + 2 * d->radius;
+    // kInflightFrames concurrent frames span kInflightFrames + 2r slots. That
+    // working set is the default: the estimate cache is the largest allocation,
+    // and on an 8 GiB card the slack below is the difference between running
+    // radius 4 and failing to allocate. VSFEEL_BM3D_CACHE=1 adds a whole extra
+    // window, so an out-of-order (seek) request finds a warm slot instead of
+    // waiting in the acquire, for tw/(ns+2r+tw) more VRAM.
+    const int res_working_set = kInflightFrames + 2 * d->radius;
     const bool cache_slack = env_int("VSFEEL_BM3D_CACHE", 0) != 0;
-    d->res_cap = (d->radius == 0) ? d->num_streams
+    d->res_cap = (d->radius == 0) ? kInflightFrames
         : (cache_slack ? res_working_set + d->tw : res_working_set);
 
     const int extractor_exp = vsh::int64ToIntS(vsapi->mapGetInt(in, "extractor_exp", 0, &error));
@@ -1469,10 +1456,10 @@ static void VS_CC BM3DCreate(
         const double res_only = static_cast<double>(d->res_size_per_plane) * 4.0;
         fprintf(stderr,
             "[bm3d] vram: src=%.1f MiB res=%.1f MiB (%.0f%% of total) -> total=%.1f MiB "
-            "(radius=%d streams=%d res_cap=%d src_ring=%d stride=%d)\n",
+            "(radius=%d inflight=%d res_cap=%d src_ring=%d stride=%d)\n",
             static_cast<double>(d->src_size) * 4.0 / mib, res_only / mib,
             100.0 * res_only / total, total / mib,
-            d->radius, d->num_streams, d->res_cap, d->src_ring, d->planes[0].stride);
+            d->radius, kInflightFrames, d->res_cap, d->src_ring, d->planes[0].stride);
     }
 
     d->src_frame.assign(d->src_ring, -1);
@@ -1483,8 +1470,8 @@ static void VS_CC BM3DCreate(
     d->res_writer.assign(d->res_cap, -1);
     d->res_ready.assign(d->res_cap, 0);
     d->res_holders.resize(d->res_cap);
-    d->r0_free.reserve(d->num_streams);
-    for (int i = 0; i < d->num_streams; ++i) {
+    d->r0_free.reserve(kInflightFrames);
+    for (int i = 0; i < kInflightFrames; ++i) {
         d->r0_free.push_back(i);
     }
 

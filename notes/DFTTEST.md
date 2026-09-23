@@ -56,8 +56,8 @@ dfttest vsfeel`, interleaved pre-port/R80 pairs, `--repeat 2`:
 - Push descriptors with five whole-buffer bindings (`wt`, `padded`, `spatial`,
   `src` plane, `dst` plane). Binding 3 is a different source frame per pad
   dispatch, which is why nothing is allocated from a descriptor pool.
-- `num_streams` and `device_id` are accepted and ignored: depth is the core's
-  call, device choice is `core.set_vulkan_device`.
+- `num_streams` and `device_id` are registered no-ops (never read): depth is
+  the core's call, device choice is `core.set_vulkan_device`.
 
 ### Kernels (`src/dfttest.comp`)
 

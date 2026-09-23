@@ -28,7 +28,7 @@ dev = [
 
 [project.urls]
 "Source Code" = "https://github.com/TheFeelTrain/vapoursynth-feel"
-"Bug Tracker" = "https://github.com/TheFeelTrain/vapoursynth-feel"
+"Bug Tracker" = "https://github.com/TheFeelTrain/vapoursynth-feel/issues"
 
 [tool.hatch.version]
 source = "vcs"

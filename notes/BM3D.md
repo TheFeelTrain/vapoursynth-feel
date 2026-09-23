@@ -41,8 +41,9 @@ Current design:
   the core's `GPUUpload`/`GPUDownload` cross the bus and a consumer waits on the
   plane's producer pair; device choice, queue locking and the buffer pool are the
   core's.
-- `num_streams` and `device_id` are accepted and **ignored** -- depth is the
-  core's, device choice is `core.set_vulkan_device`; the cache depth stays 2.
+- `num_streams` and `device_id` are registered no-ops (never read) -- depth is
+  the core's, device choice is `core.set_vulkan_device`; the cache depth is a
+  fixed two (`kInflightFrames`).
 
 Performance — 1080p GRAY32, jpbd, `tools/benchmark.py -f bm3dv2 vsfeel vszipcl
 bm3dvk`, 1000 frames × 3 interleaved, sigma 0.7, radius 2, bm_range 16,
@@ -306,8 +307,7 @@ per-instance staging once before the stream loop; the DB machine is unchanged.
 
 ## Debug env vars
 
-Standardised on `VSFEEL_BM3D_<FLAG>`; the pre-standardisation `BM3D_<FLAG>`
-spelling still works for one release (new name wins). All route through the
+All flags are `VSFEEL_BM3D_<FLAG>`, routed through the
 `env_flag`/`env_int`/`env_str` helpers in `vsfeel.h`; `TRACE` and `DUMP` are
 cached at creation, not read per frame.
 

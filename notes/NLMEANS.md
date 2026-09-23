@@ -22,8 +22,8 @@ Status: **shipped on the R80 GPU API.** Verified against
   last acc round are unchanged from the pre-R80 implementation.
 - Accuracy: identical to the pre-R80 implementation on every tested config
   (≤1 LSB 16-bit, ≤6.6e-5 fp32 vs vszipcl).
-- `num_streams` and `device_id` are accepted and ignored: depth is the core's
-  exec ring, device choice is `core.set_vulkan_device`.
+- `num_streams` and `device_id` are registered no-ops (never read): depth is
+  the core's exec ring, device choice is `core.set_vulkan_device`.
 
 Scoreboard — jpbd 1080p YUV420P16, `d=2 a=2 s=4 h=0.2 wmode=0 wref=1
 channels=UV`, 3000 frames, `tools/benchmark.py --filter nlmeans vsfeel`,
@@ -62,9 +62,8 @@ GRAY16 (all planes processed) is at parity in a manual same-session pair
   layer)`. The `PAD` margin is the reference's zero border, so the sweep needs
   no bounds checks. The compose writes the whole tile (margins zeroed) and the
   interior is a straight copy of the core's plane at its own row stride.
-- `num_streams`/`device_id` are accepted for compatibility and no longer select
-  anything; `num_streams` is a registered no-op and `device_id < 0` is still
-  an error.
+- `num_streams`/`device_id` stay registered so existing scripts load; both are
+  never read (see the banner).
 
 ### Kernels (`src/nlmeans.comp`)
 

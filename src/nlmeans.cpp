@@ -728,16 +728,8 @@ static void VS_CC NLMeansCreate(
         return set_error("wref must be >= 0.");
     }
 
-    // num_streams is a registered no-op: in-flight depth is the core's
-    // (exec pool ring) call, so the argument is accepted and never read.
-
-    int device_id = vsh::int64ToIntS(vsapi->mapGetInt(in, "device_id", 0, &error));
-    if (error) {
-        device_id = 0;
-    }
-    if (device_id < 0) {
-        return set_error("invalid device ID.");
-    }
+    // device_id and num_streams are registered but never read: the core owns
+    // the one device and sizes in-flight depth itself (exec pool ring).
 
     const char * chstr = vsapi->mapGetData(in, "channels", 0, &error);
     if (error || !chstr) {
@@ -848,7 +840,7 @@ static void VS_CC NLMeansCreate(
         constexpr int64_t U4A_RING_BUDGET = 64LL << 20;
         int64_t pack = U4A_RING_BUDGET / std::max<int64_t>(bytes_per_pack, 1);
         pack = std::clamp<int64_t>(pack, 1, 16384);
-        const int pack_env = env_int("VSFEEL_NLMEANS_PACK", env_int("NLMEANS_PACK", 0));
+        const int pack_env = env_int("VSFEEL_NLMEANS_PACK", 0);
         if (pack_env > 0) {
             pack = std::clamp<int64_t>(pack_env, 1, 16384);
         }

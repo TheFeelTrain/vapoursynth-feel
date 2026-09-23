@@ -17,7 +17,7 @@
  * inverse transforms, and a col2im overlap-add of the windowed blocks.
  *
  * Parity notes (do not alter): the FFT codelet bodies are transcribed
- * verbatim (FMA/FMS/FNMA/FNMS as plain float arithmetic, constants rounded
+ * verbatim (FMA/FMS/FNMS as plain float arithmetic, constants rounded
  * to the exact float32 values the C casts produce), the shared-memory
  * transpose uses a 17-float2 stride to avoid bank conflicts exactly like the
  * reference, the filter math (wiener / hard / multiply / bandpass / power /
@@ -140,7 +140,6 @@ int calc_pad_num(int size, int block_step) {
 
 #define FMA(a, b, c) (((a) * (b)) + (c))
 #define FMS(a, b, c) (((a) * (b)) - (c))
-#define FNMA(a, b, c) (- (((a) * (b)) + (c)))
 #define FNMS(a, b, c) ((c) - ((a) * (b)))
 
 // ./gen_r2cf.native -standalone -with-rs 2 -with-csr 2 -with-csi 2 -fma -n 16

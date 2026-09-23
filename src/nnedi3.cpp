@@ -913,18 +913,8 @@ static void VS_CC Nnedi3Create(
         }
     }
 
-    int device_id = vsh::int64ToIntS(vsapi->mapGetInt(in, "device_id", 0, &error));
-    if (error) {
-        device_id = 0;
-    }
-    if (device_id < 0) {
-        return set_error("invalid device ID.");
-    }
-
-    // device_id is accepted for compatibility: the core owns the one device.
-    (void)device_id;
-    // num_streams is a registered no-op: in-flight depth is the core's
-    // (exec pool ring) call, so the argument is accepted and never read.
+    // device_id and num_streams are registered but never read: the core owns
+    // the one device and sizes in-flight depth itself (exec pool ring).
 
     if (d->field > 1) {
         if (d->vi_out.numFrames > INT32_MAX / 2) {

@@ -349,9 +349,14 @@ def test_eedi3h_rejects_bad_planes(noise_16bit):
 
 
 
-def test_eedi3h_rejects_bad_device_id(noise_16bit):
-    with pytest.raises(vs.Error):
-        _runh(noise_16bit, field=1, device_id=-1)
+def test_eedi3h_ignores_device_id_and_num_streams(noise_16bit):
+    """Both are registered no-ops: any value must be ignored."""
+    base = _runh(noise_16bit, field=1)
+    ref = _plane(base.get_frame(5), 0)
+    for kw in (dict(device_id=-1), dict(device_id=99),
+               dict(num_streams=0), dict(num_streams=64)):
+        out = _plane(_runh(noise_16bit, field=1, **kw).get_frame(5), 0)
+        assert np.array_equal(out, ref), f"{kw} changed the output"
 
 
 def test_eedi3h_rejects_mclip_not_gray(noise_16bit):

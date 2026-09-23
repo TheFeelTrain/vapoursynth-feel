@@ -573,7 +573,6 @@ def test_no_nan_all_frames_16bit(noise_16bit, radius):
         (dict(wmode=-1), r"wmode must be 0\.\.3"),
         (dict(wmode=4), r"wmode must be 0\.\.3"),
         (dict(wref=-0.5), r"wref must be >= 0"),
-        (dict(device_id=-1), r"invalid device ID"),
         (dict(channels="bogus"), r"'channels' must be 'Y' with Gray"),
         (dict(channels="UV"), r"'channels' must be 'Y' with Gray"),
     ],

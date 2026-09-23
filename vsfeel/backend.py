@@ -91,15 +91,6 @@ class FeelBackend:
 
         return clip.std.Transpose(), kwargs | {"sclip": sclip, "mclip": mclip}
 
-    num_streams: int | None = None
-    """Override for the plugin's ``num_streams`` argument.
-
-    ``None`` (the default) leaves the argument unset, so every filter uses its
-    own plugin default (DFTTest 1; NLMeans 2; Bilateral/BM3Dv2/GaussBlur/NNEDI3
-    4; EEDI3 8). Set this to an int to force one value for all filters, or pass
-    ``num_streams=`` to a wrapper for a single call — an explicit wrapper
-    keyword always wins."""
-
     def resolve(self) -> Self:
         """Resolve this backend to itself.
 
@@ -110,8 +101,6 @@ class FeelBackend:
         return self
 
     def _dispatch(self, func: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> vs.VideoNode:
-        if "num_streams" not in kwargs and self.num_streams is not None:
-            kwargs = {**kwargs, "num_streams": self.num_streams}
         return getattr(args[0].vsfeel, func)(*args[1:], **kwargs)
 
     def Bilateral(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:  # noqa: N802
@@ -135,10 +124,9 @@ class FeelBackend:
         """Run ``core.vsfeel.EEDI3`` (mirrors ``EEDI3.Backend.EEDI3``).
 
         vsfeel supports ``mclip`` natively, so both aux clips always pass
-        through; only ``num_streams`` is injected, like every other entry
-        point here. ``field`` is required positionally (matching the
-        reference), so unlike the other entry points this cannot be called
-        with keywords alone.
+        through. ``field`` is required positionally (matching the reference),
+        so unlike the other entry points this cannot be called with keywords
+        alone.
         """
         if self.supports_mclip:
             aux = {"sclip": sclip, "mclip": mclip}

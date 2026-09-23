@@ -237,7 +237,7 @@ All filters share an inline (zero-overhead, C++20) plumbing layer in
   — a pipeline barrier's first scope is every earlier command in submission
   order on that queue. Never signal or hand-roll the pool's timeline.
 - **`env_flag` / `env_int` / `env_str`** — env-gated debug flags; keep one env
-  name per filter (`VSFEEL_DFTTEST_TRACE`, `BM3D_TRACE`, ...). Read per-filter
+  name per filter (`VSFEEL_DFTTEST_TRACE`, `VSFEEL_BM3D_TRACE`, ...). Read per-filter
   *diagnostic* flags through **`vsfeel_debug_flag(name)`** (one-shot: creation
   banners, fallback notices), **`vsfeel_debug_trace(name)`** (per-frame traces)
   or **`vsfeel_debug_probe(name)`** (measurement: host `TIMING`, GPU

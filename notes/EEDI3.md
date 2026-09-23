@@ -91,8 +91,8 @@ LDS stage, clip → R', sclip → B') and `ENTRY_COMPOSE`; EEDI3AA adds `ENTRY_A
   recorded with no barrier between their row dispatches. Output frames are
   batched (`d->batch_size`, `VSFEEL_EEDI3_BATCH`) and cached for the sibling
   `getFrame` calls; `d->width_pipes` still deduplicates per-width pipelines.
-  `num_streams` and `device_id` are accepted and ignored: depth is the core's
-  pool, the device is `core.set_vulkan_device`.
+  `num_streams` and `device_id` are registered no-ops (never read): depth is
+  the core's pool, the device is `core.set_vulkan_device`.
 
 ### vcheck contract (family A)
 

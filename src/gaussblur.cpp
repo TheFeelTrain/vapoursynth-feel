@@ -452,16 +452,8 @@ static void VS_CC GaussCreate(
     d->bits = bits;
     d->elem_bytes = bits / 8;
 
-    int device_id = vsh::int64ToIntS(vsapi->mapGetInt(in, "device_id", 0, &error));
-    if (error) {
-        device_id = 0;
-    }
-    if (device_id < 0) {
-        return set_error("invalid device ID.");
-    }
-
-    // num_streams is a registered no-op: in-flight depth is the core's
-    // (exec pool ring) call, so the argument is accepted and never read.
+    // device_id and num_streams are registered but never read: the core owns
+    // the one device and sizes in-flight depth itself (exec pool ring).
 
     // sigma defaults: plane 0 = 0.5; chroma = sigma[0]/sqrt((1<<subW)*(1<<subH))
     // (computed in double, then narrowed); plane 2 = plane 1

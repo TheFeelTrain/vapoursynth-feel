@@ -8,8 +8,8 @@ Status: **shipped on the R80 GPU API.** Design (current):
   (`std.GPUUpload`/`std.GPUDownload`); the filter owns its pipelines, three
   weight buffers and one exec pool — no staging, per-stream resources,
   download-slot pool, descriptor pool, fences, queue cap or queue choice.
-  `num_streams` is a registered no-op, `device_id` ≥ 0 is still enforced,
-  and the device is chosen by `core.set_vulkan_device`.
+  `num_streams` and `device_id` are registered no-ops (never read), and the
+  device is chosen by `core.set_vulkan_device`.
 - The kernels read the source plane in place (field row `f` → source row
   `DH ? f : 2f+parity` at the plane's own pitch) and write interpolated row `r`
   straight into the output plane at `2r + (1-parity)`. `ENTRY_KEEP` copies the

@@ -20,11 +20,7 @@ Reference columns are `vszipcl` for all filters except `nnedi3vk` for NNEDI3.
 
 Each figure is the median of 3 `tools/benchmark.py --bits <16|32>` runs on an RX 7900 XTX.
 
-## Common Arguments
-
-`device_id=0` selects the GPU. `num_streams` sets how many frames the filter processes concurrently. 
-
-More streams means more VRAM. Default values should be the most efficient.
+## Notes
 
 All filters support 16-bit integer and 32-bit float input except for BM3Dv2, which is 32-bit only.
 
@@ -41,9 +37,7 @@ core.vsfeel.Bilateral(clip clip[,
     float[] sigma_color=0.02,       # edge sensitivity: how different pixels may be to blend; depth-normalized
     int[]   radius,                 # per-plane blur window radius; default max(1, round(sigma_spatial*3))
     int     use_shared_memory=1,    # faster on-chip kernel while the window fits; falls back otherwise
-    int     block_x, int block_y,   # GPU thread-block dims; auto-tuned when unset (32 x 8, x16 when radius > 12)
-    int     device_id=0, 
-    int     num_streams=4])                   
+    int     block_x, int block_y])  # GPU thread-block dims; auto-tuned when unset (32 x 8, x16 when radius > 12)
 ```
 
 ### BM3Dv2
@@ -59,9 +53,7 @@ core.vsfeel.BM3Dv2(clip clip[,
     int[]   bm_range=9,             # per-plane spatial search radius in pixels (> 0)
     int[]   ps_num=2,               # motion-predicted candidates seeding each temporal search
     int[]   ps_range=4,             # search radius around each predicted candidate, in pixels
-    int     extractor_exp=0         # aggregation weight bias; 0 = off, >= 3 = reproducible output
-    int     device_id=0, 
-    int     num_streams=2])       
+    int     extractor_exp=0])       # aggregation weight bias; 0 = off, >= 3 = reproducible output
 ```
 32-bit float only. Chroma passes through unprocessed.
 
@@ -96,9 +88,7 @@ core.vsfeel.DFTTest(clip clip[,
     float[] ssy,                    # slocation along the Y axis only
     float[] sst,                    # slocation along time only
     int     ssystem=0,              # slocation scale: 0 = relative to block size, 1 = absolute
-    int[]   planes,                 # planes to process; default: all
-    int     device_id=0, 
-    int     num_streams=1])
+    int[]   planes])                # planes to process; default: all
 ```
 
 ### EEDI3
@@ -124,9 +114,7 @@ core.vsfeel.EEDI3(clip clip, int field[,   # and EEDI3H, same args, horizontal
     float   vthresh1=64.0,
     float   vthresh2=4.0,
     int     dh=False,               # double-height output keeping every source line (no field extracted)
-    int[]   planes,                 # planes to process; default: all
-    int     device_id=0, 
-    int     num_streams=8])
+    int[]   planes])                # planes to process; default: all
 ```
 `field` 2/3 are the double-rate variants (not allowed with `dh=True`).
 
@@ -136,9 +124,7 @@ core.vsfeel.EEDI3(clip clip, int field[,   # and EEDI3H, same args, horizontal
 
 ```python
 core.vsfeel.GaussBlur(clip clip[,
-    float[] sigma=0.5,              # blur strength; per-plane, chroma default = sigma[0]/sqrt((1<<ssw)*(1<<ssh))
-    int     device_id=0, 
-    int     num_streams=4])
+    float[] sigma=0.5])             # blur strength; per-plane, chroma default = sigma[0]/sqrt((1<<ssw)*(1<<ssh))
 ```
 
 ### NLMeans
@@ -156,9 +142,7 @@ core.vsfeel.NLMeans(clip clip[,
                                     #   0 = exp(-x) | 1 = max(1-x, 0)
                                     #   2 = max(1-x, 0)**2 | 3 = max(1-x, 0)**8
     float   wref=1.0,               # >= 0: weight of the pixel itself
-    string  channels="auto",        # planes to process, jointly for YUV/RGB; auto picks by format
-    int     device_id=0, 
-    int     num_streams=2])
+    string  channels="auto"])       # planes to process, jointly for YUV/RGB; auto picks by format
 ```
 `channels="YUV"` requires 4:4:4 so on subsampled clips run a `"Y"` pass and a `"UV"` pass instead.
 
@@ -177,9 +161,7 @@ core.vsfeel.NNEDI3(clip clip, int field[,
                                     #   1=original, 2..4=new levels 0..2 (higher = fewer pixels
                                     #   left to cubic interpolation: slower, slightly better)
     int     dh=False,               # double-height output keeping every source line (no field extracted)
-    int[]   planes,                 # planes to process; default: all
-    int     device_id=0, 
-    int     num_streams=4])
+    int[]   planes])                # planes to process; default: all
 ```
 `field` 2/3 are the double-rate variants (not allowed with `dh=True`).
 

@@ -1090,17 +1090,8 @@ static void VS_CC DftCreate(
         }
     }
 
-    int device_id = vsh::int64ToIntS(vsapi->mapGetInt(in, "device_id", 0, &error));
-    // Device selection moved to the core (core.set_vulkan_device): one Vulkan
-    // device per process, picked before any GPU filter runs. The argument stays
-    // accepted so existing scripts keep loading; a negative one is still an
-    // error because it never selected anything.
-    if (!error && device_id < 0) {
-        return set_error("\"device_id\" must be non-negative; under the R80 GPU API "
-                         "device selection is core.set_vulkan_device");
-    }
-    // num_streams is a registered no-op: in-flight depth is the core's
-    // (exec pool ring) call, so the argument is accepted and never read.
+    // device_id and num_streams are registered but never read: the core owns
+    // the one device and sizes in-flight depth itself (exec pool ring).
 
     d->radius = (tbsize - 1) / 2;
     d->block_step = sbsize - sosize;
