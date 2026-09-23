@@ -24,78 +24,25 @@ Design (current):
   every plane is unprocessed.
 - `num_streams` and `device_id` are accepted and **ignored**: depth is the core's
   call and device choice is `core.set_vulkan_device`.
+- **`RADV_EXPERIMENTAL=transfer_queue` is required for the numbers below**, and
+  `tools/benchmark.py` now forces it. Without it RADV exposes no transfer-only
+  queue family, so the core's `GPUDownload` is a copy on the graphics engine
+  that competes with the kernel; with it the copy moves to SDMA and costs
+  nothing. Every −16% figure in this file's history predates that and is void.
 
-Performance — 1080p GRAY16 jpbd, 5000 frames, sigma 3.0/0.02 (R=9), 4
-order-alternated same-session reps through `tools/benchmark.py`:
+Performance — 1080p GRAY16 jpbd, 5000 frames, sigma 3.0/0.02 (R=9), interleaved
+pre-R80/R80 pairs through `tools/benchmark.py`, `--repeat 2`:
 
 | input to vsfeel | pre-R80 | R80 port | delta |
 |---|---|---|---|
-| CPU cache (benchmark default) | 1972 | 1649 | **−16.4%** |
-| `--gpu-cache` (pre-uploaded GPU clip) | 1369 | 1654 | **+20.8%** |
+| CPU cache (benchmark default) | 1982.1 | 1980.5 | **−0.1%** |
+| `--gpu-cache` (pre-uploaded GPU clip) | 1975.3 | 1974.0 | **−0.1%** |
 
-- The R80 figure is the same in both rows (1649 vs 1654): the timed unit is a CPU
-  sink, so the upload is free and only the output `GPUDownload` costs.
-- **Root cause of the exposed download, and why it cannot be fixed in-filter:
-  the core runs one Vulkan queue on this device.** `vsvulkan.cpp:729-735` only
-  recognises a family with `TRANSFER` and *neither* `COMPUTE` nor `GRAPHICS` as a
-  transfer family; that is the only thing that makes `transferPtr`/`downloadPtr`
-  diverge from `computeQ` (`vsvulkan.cpp:882-895`, defaults at
-  `vsvulkan.h:754-755`). RADV NAVI31 has no such family (family 0 =
-  gfx+compute+transfer, family 1 = compute+transfer), so the device is created
-  with `queueCount = 1` (`vsvulkan.cpp:740-744`) and every submission in the
-  process — every filter dispatch, every upload, every download — reaches that
-  one `VkQueue` in submission order. `downloadPlanes` therefore records its
-  `vkCmdCopyBuffer2` (`vsvulkanframe.cpp:445`) on the same queue as our kernels
-  and it cannot overlap them: per frame it is kernel + copy, which is why more
-  streams, batching and even a second vspipe process all measure flat.
-- **`GPUDownload` is the only asymmetric leg.** On ReBAR the upload is a plain
-  memcpy into the mapped plane with no submission at all
-  (`vsvulkanframe.cpp:259-276`), so it is free. The download cannot take its
-  direct path: that requires `HOST_CACHED` plane memory
-  (`vsvulkanframe.cpp:363-367`), and a discrete card's planes are
-  `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` but not cached (reading the BAR runs
-  at 0.02 GB/s). It therefore stages: `stride*height` bytes VRAM → a cached host
-  readback slot (4 slots, `vscore.cpp:1491`; slot memory at
-  `vsvulkanframe.cpp:185-193`) by a GPU copy, then a host memcpy. At 1080p u16
-  that is 4.1 MB ≈ 0.10–0.16 ms at PCIe speed — the measured gap (0.606 vs
-  0.507 ms). The pre-R80 build issued no copy at all (its kernel's stores went
-  straight to host memory) and had all four queues of family 1
-  (`vsfeel.cpp:481-516`), which is where the whole difference lives.
-- **The kernel is not the regression — it is ISA-identical.** `RADV_DEBUG=shaderstats`
-  (R=9, BITS=16, pipeline cache off): new 3101 instructions / 14700 B code / 192
-  VGPR / 0 spill; pre-R80 3102 / 14708 / 192 / 0. `glslc -O` output is 315 vs 321
-  SPIR-V lines. The shader rewrite (three whole-buffer bindings, no push
-  constants) did not move the machine code.
-- **The frame is kernel-dominated.** A temporary timestamp probe around the
-  dispatches (BlankClip GRAY16 1080p, `-r 1`, serialized for a clean read):
-  R=3 0.080 ms, R=9 0.507, R=12 0.678, R=24 2.442. At R=9 the measured 0.507 ms
-  is exactly the pre-R80 frame time (1972 fps) and 84% of the post-port frame
-  (0.606 ms), so the pre-port filter was already running at the kernel floor
-  with its host copies fully overlapped, and the port exposes ~0.10 ms of it.
-- The absolute delta tracks the kernel, not a fixed transfer: R=3 −9.3%
-  (2450→2222), R=9 −16.4% (1972→1649), R=24 −8.8% (408→372, a 2.44 ms kernel
-  hides most of the transfer).
-- Transfer decomposition on a BlankClip GRAY16 1080p graph: an upload+download
-  round trip with no filter is 2414 fps (0.414 ms/frame) at the benchmark's
-  default request depth; adding Bilateral is 1668 fps (0.599 ms). Only ~0.10 of
-  that 0.414 ms is exposed — the rest already overlaps the kernel.
-- The filter is not the limiter: `vspipe --filter-time` on the same graph
-  (3000 frames, `-r 8`) puts Bilateral at **3.97 % / 0.07 s** of summed thread
-  time (23 µs/frame) against `GPUDownload` 735.62 % / 13.24 s and `GPUUpload`
-  32.72 % / 0.59 s. Bilateral's whole host side is a 3.8 % ceiling for any
-  submission-side change.
-- The port wins exactly where a resident chain is involved: fed a GPU clip the
-  old filter had to `GPUDownload` it first, the new one reads VRAM in place.
-- vs `vszipcl` on the CPU sink: 1645 vs 1538 (**+7%**), still the fastest arm.
-- Host split (`VSFEEL_BILAT_TIMING=1`, 3000 frames, decode-bound run): acquire
-  19.1 / record 5.8 / submit 59.0 µs per frame — the host is nowhere near the
-  wall; the wall is the core's download, which the filter cannot change.
+- The R80 figure is the same in both rows: the timed unit is a CPU sink, so the
+  upload is free, and with the transfer queue the download is free too.
+- vs `vszipcl` in a separate same-session pair: 2009 vs 1329 fps (**+51%**).
 
-Benchmark call: `MANGOHUD=0 python3 tools/benchmark.py --filter bilateral
-[vsfeel vszipcl] [--gpu-cache] [--bits 32] [--bilateral-sigma-spatial X
---bilateral-sigma-color Y]`.
-
-## Implementation (current)
+## Implementation
 
 `src/bilateral.cpp` + `src/bilateral_shared.comp` / `src/bilateral_plain.comp`.
 
@@ -116,6 +63,60 @@ Benchmark call: `MANGOHUD=0 python3 tools/benchmark.py --filter bilateral
 - 16-bit rounding is `uint(v*PEAK + 0.5) & 0xFFFF`, matching the reference's
   round-half-away inside the 1-LSB test tolerance.
 
+## Performance
+
+- **The exposed download was a copy on the graphics engine; the fix is a driver
+  opt-in, not a core change.** RADV gates its dedicated transfer-only SDMA
+  family behind one (`radv_transfer_queue_enabled` in
+  `radv_physical_device.c`); the Mesa 26.0 notes spell the switch
+  `RADV_PERFTEST=transfer_queue`, but this machine's Mesa 26.3-devel honours
+  only `RADV_EXPERIMENTAL=transfer_queue` and silently ignores the old name.
+  With it the device reports family 3 = `TRANSFER|SPARSE_BINDING` ×2, the
+  core's existing code points `transferPtr`/`downloadPtr` at it
+  (`vsvulkan.cpp:882-895`), and the copy leaves the graphics engine: Bilateral
+  **1590 → 2079 fps (+31%)** on interleaved pairs, DFTTest +22%, EEDI3 +16%,
+  EEDI3AA +13%, BM3Dv2 +10% — each at 97–100% of its "download node deleted"
+  ceiling, output byte-identical.
+- **`GPUDownload` is the only asymmetric leg.** On ReBAR the upload is a plain
+  memcpy into the mapped plane with no submission at all
+  (`vsvulkanframe.cpp:259-276`), so it is free. The download cannot take its
+  direct path — that requires `HOST_CACHED` plane memory
+  (`vsvulkanframe.cpp:363-367`), and a discrete card's planes are
+  `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` but not cached (reading the BAR runs
+  at 0.02 GB/s) — so it stages `stride*height` bytes VRAM → a cached host
+  readback slot by a GPU copy, then a host memcpy (4 slots, `vscore.cpp:1491`;
+  slot memory at `vsvulkanframe.cpp:185-193`). At 1080p u16 that copy is 4.1 MB
+  ≈ 0.10–0.16 ms: the measured pre-opt-in gap was 0.606 vs 0.507 ms.
+- **The kernel is not the regression — it is ISA-identical.** `RADV_DEBUG=shaderstats`
+  (R=9, BITS=16, pipeline cache off): new 3101 instructions / 14700 B code / 192
+  VGPR / 0 spill; pre-R80 3102 / 14708 / 192 / 0. `glslc -O` output is 315 vs 321
+  SPIR-V lines. The shader rewrite (three whole-buffer bindings, no push
+  constants) did not move the machine code.
+- **The frame is kernel-dominated.** A timestamp probe around the dispatches
+  (BlankClip GRAY16 1080p, `-r 1`, serialized for a clean read): R=3 0.080 ms,
+  R=9 0.507, R=12 0.678, R=24 2.442. At R=9 the 0.507 ms was exactly the pre-R80
+  frame time (1972 fps) and 84% of the pre-opt-in post-port frame (0.606 ms), so
+  the pre-port filter was already at the kernel floor with its host copies fully
+  overlapped. This is also why the pre-opt-in delta tracked the kernel: R=3
+  −9.3%, R=9 −16.4%, R=24 −8.8% (a 2.44 ms kernel hides most of the transfer).
+- Transfer decomposition on a BlankClip GRAY16 1080p graph: an upload+download
+  round trip with no filter is 2414 fps (0.414 ms/frame) at the benchmark's
+  default request depth; adding Bilateral is 1668 fps (0.599 ms). Only ~0.10 of
+  that 0.414 ms was exposed — the rest already overlapped the kernel.
+- The filter is not the limiter: `vspipe --filter-time` on the same graph
+  (3000 frames, `-r 8`) puts Bilateral at **3.97 % / 0.07 s** of summed thread
+  time (23 µs/frame) against `GPUDownload` 735.62 % / 13.24 s and `GPUUpload`
+  32.72 % / 0.59 s.
+- Host split (`VSFEEL_BILAT_TIMING=1`, 3000 frames): acquire 19.1 / record 5.8 /
+  submit 59.0 µs per frame — the host is nowhere near the wall, which is why the
+  pre-port gap had to be the core's download.
+- The port wins exactly where a resident chain is involved: fed a GPU clip the
+  old filter had to `GPUDownload` it first, the new one reads VRAM in place.
+
+Benchmark call: `MANGOHUD=0 python3 tools/benchmark.py --filter bilateral
+[vsfeel vszipcl] [--gpu-cache] [--bits 32] [--bilateral-sigma-spatial X
+--bilateral-sigma-color Y]`.
+
 ## Historical
 
 ### 2026-09-21 — R80 GPU API port
@@ -131,6 +132,20 @@ mechanism `notes/BM3D.md` records for its −4% port, with the difference that
 Bilateral is light enough for the download to dominate. The pre-R80 numbers in
 this file's older rounds are therefore void — do not quote them as the current
 filter.
+
+### 2026-09-21 — the gap was a driver opt-in, not a second queue
+
+Two core-side attempts were built and measured before the real cause was found,
+both neutral and both reverted: `downloadPool` on a second *compute-family*
+queue (family 1 index 1) and the full form (uploads index 1, downloads index 2).
+A second queue of the same family is the same engine as the compute queue, so
+the copy still competed with the dispatches — the core-only `GPUUpload →
+GPUDownload` + k BoxBlur(r=96) probe that read as +45% did not transfer to a
+plugin's submission. RADV exposes a genuinely separate engine only through its
+dedicated transfer-only SDMA family, and gates that behind an opt-in. With
+`RADV_EXPERIMENTAL=transfer_queue` (the Mesa 26.0 notes call it
+`RADV_PERFTEST=transfer_queue`; current Mesa ignores that name) the copy moves to
+SDMA and the port reaches parity without any core change.
 
 ### Pre-R80 host path (deleted, mechanism kept)
 
@@ -187,53 +202,25 @@ filter.
 
 ## Open work
 
-- The CPU-sink cost is the core's `GPUDownload`; there is no in-filter lever.
-  Measure a GPU-resident chain (`--gpu-cache`) before concluding anything about
-  the filter's own throughput.
-- **The fix for the exposed download is core-side, not plugin-side.** Before
-  anything else, the core should create more than one queue from a compute family
-  that has them (this device's family 1 has four; the pre-R80 plugin device made
-  all four, `vsfeel.cpp:481-516`) and put `downloadPool` on the second, the way
-  `downloadPtr` already does for devices with a dedicated transfer family. A
-  plugin cannot do it: `vkCreateDevice` was given one queue, so no second
-  `VkQueue` exists to submit the copy to, and `vqTransfer` resolves to the same
-  queue (`vsvulkan.h:452-462`).
-- **That core fix was built and measured (2026-09-21).** A local core with the
-  second compute-family queue wired to `downloadQ` (2 queues requested from
-  family 1; buffer sharing deliberately left `EXCLUSIVE` since both queues are
-  one family) passes the full suite (800) and changes the numbers like this,
-  interleaved same-session, 1080p GRAY16, `-r 8`:
-  - core-only `GPUUpload → GPUDownload` + k `BoxBlur(r=96)`: T1 1059 → **1541 fps
-    (+45%)**, and the download's exposed fixed cost goes from +0.152 ms to fully
-    hidden — the fix does what it says.
-  - Bilateral: 1660 → 1715 fps (**+3.3%**), flat ±1% across `-r` 4…32 (−1% at
-    `-r` 2).
-  So a second queue only pays when the kernel leaves the GPU with idle capacity
-  to fill. Bilateral's R=9 dispatch keeps it 93–97% busy, so the download copy
-  still competes for the same GPU rather than hiding behind it; the 16% is not
-  recovered. Do not expect this fix to close the CPU-sink gap for this filter.
-  The patched core is installed on this box with the stock one kept at
-  `tmp/libvapoursynth.so.4.orig`.
+- **Nothing is open on the transfer path.** The pre-port gap was the missing
+  `RADV_EXPERIMENTAL=transfer_queue` opt-in, not a core or filter defect, and it
+  is closed. Measure a GPU-resident chain (`--gpu-cache`) before concluding
+  anything about the filter's own throughput.
+- The only remaining lever is the kernel itself: at R=9 it is 84% of the frame
+  and is ALU/`exp2`-bound, and the block-shape, wave32, unroll and vec4 sweeps
+  below already came back empty — a kernel project, not a scheduling one.
 - **EEDI3-style batching is a measured dead end here; do not implement it.**
   EEDI3 batched because one row dispatch (1080 small workgroups of a
-  latency-bound scan) left the GPU under-occupied, so stacking frames' dispatches
-  in one command buffer filled it. Bilateral's R=9 dispatch is 60×135 = 8100
-  workgroups of 256 threads and the GPU is already **93–97% busy with a single
-  node** (BlankClip GRAY16 1080p, polled `gpu_busy_percent`); there is no idle to
-  fill. Chaining k nodes scales the frame linearly (0.606 / 1.031 / 1.906 ms for
-  k=1/2/4), the kernel is ISA-identical to the pre-port build, and the filter's
-  entire host side is 23 µs/frame — so the ceiling for any submission-count
-  change is ~4%, and batching additionally makes each batch's first download wait
-  for B frames of kernel work, which lengthens the exposed transfer rather than
-  hiding it. The exposed cost belongs to the downstream `GPUDownload`, which the
-  filter's submission structure does not own.
-- The only lever that could close the R=9 gap is the kernel itself: it is 84% of
-  the frame, so a ~20% kernel speedup would put the port at pre-port parity. It
-  is ALU/`exp2`-bound, and the block-shape/wave32/unroll/vec4 sweeps below
-  already came back empty, so treat this as a kernel project, not a scheduling one.
+  latency-bound scan) left the GPU under-occupied. Bilateral's R=9 dispatch is
+  60×135 = 8100 workgroups of 256 threads and the GPU is already **93–97% busy
+  with a single node** (BlankClip GRAY16 1080p, polled `gpu_busy_percent`), so
+  there is no idle to fill: chaining k nodes scales the frame linearly
+  (0.606 / 1.031 / 1.906 ms for k=1/2/4) and the filter's whole host side is
+  23 µs/frame.
 - Do not re-introduce a host transfer path to "win back" the CPU sink: the old
   one is exactly what the port deleted, and it lost the resident-chain case.
-- Do not retry the LDS-register tradeoffs listed above.
+- Do not retry the LDS/register tradeoffs or the second-compute-queue attempt
+  listed under Historical.
 
 ## Debug env vars
 

@@ -14,8 +14,8 @@ import vapoursynth as vs
 
 from conftest import (
     assert_changes_on_noise, assert_gray32, assert_preserves_frame_props,
-    assert_temporal_order_consistent, eval_parallel, max_diff, plane as _plane,
-    reference_compare, reference_or_skip, reference_spec,
+    assert_temporal_order_consistent, cpu_node, eval_parallel, max_diff,
+    plane as _plane, reference_compare, reference_or_skip, reference_spec,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -24,7 +24,13 @@ H_PARAM = 1.2
 
 
 def _run(clip, num_streams=1, **kwargs):
-    return vs.core.vsfeel.NLMeans(clip, num_streams=num_streams, **kwargs)
+    """NLMeans as a clip the test can read pixels from.
+
+    Under the R80 GPU API the filter takes and returns ``vnode:gpu`` frames, so
+    a CPU clip is auto-uploaded by the core and the output is downloaded before
+    the host reads it (see conftest.cpu_node).
+    """
+    return cpu_node(vs.core.vsfeel.NLMeans(clip, num_streams=num_streams, **kwargs))
 
 
 def _ref_compare(fmt, frames, params, planes=None, guide=None, crop=None):
@@ -639,26 +645,31 @@ def test_reject_rclip_format_mismatch(noise_gray, noise_16bit):
         _run(noise_gray, d=0, rclip=noise_16bit)
 
 
-def test_reject_window_larger_than_slot_pool():
-    """A frame at n >= d must hold one full window (clips*C*(2d+1) slots) at
-    once. When the 512 MiB pool cap cannot cover that, creation must reject
-    the configuration: the all-or-nothing acquire would otherwise wait on
-    cache_cv forever (it holds no slots and never submits, so nothing can
-    notify it). 1080p f32 YUV444 at d=16 is the minimal case: pool 70,
-    needs 99."""
+def test_window_larger_than_old_slot_pool_runs():
+    """A window larger than the removed 512 MiB slot pool must now run.
+
+    The old design kept its own padded slot pool and rejected any config whose
+    full window did not fit 512 MiB (1080p f32 YUV444 d=16 was the minimal
+    case). Under the R80 GPU API the temporal frames live in the core's GPU
+    frame cache and the per-frame scratch is transient, so the same *shape*
+    must create and evaluate. The geometry is shrunk to keep the test cheap;
+    the noise-clip d=16 case above already covers correctness.
+    """
     core = vs.core
-    src = core.std.BlankClip(None, 1920, 1080, vs.YUV444PS, length=40,
+    src = core.std.BlankClip(None, 320, 240, vs.YUV444PS, length=20,
                              color=[0.5, 0.5, 0.5])
-    with pytest.raises(vs.Error,
-                       match=r"needs 99 cache slots .* budget allows 70"):
-        _run(src, channels="YUV", d=16)
-
-
-def test_accept_window_that_fits_the_slot_pool():
-    """Control for the case above: the same geometry in luma at d=16 needs
-    only 33 slots and must still create and evaluate frame n = d."""
-    core = vs.core
-    src = core.std.BlankClip(None, 1920, 1080, vs.GRAYS, length=40,
-                             color=[0.5])
-    out = _run(src, d=16)
+    out = _run(src, channels="YUV", d=16)
     assert out.get_frame(16) is not None
+
+
+def test_cpu_and_gpu_input_match(noise_gray):
+    """The core's auto-upload of a CPU clip must match an explicit GPUUpload.
+
+    This is the filter-level mirror of the benchmark's ``--gpu-cache`` arm: the
+    same node fed a CPU clip (auto GPUUpload) and a resident GPU clip has to
+    produce identical pixels.
+    """
+    cpu = _run(noise_gray, d=2, num_streams=1)
+    gpu = cpu_node(vs.core.vsfeel.NLMeans(
+        vs.core.std.GPUUpload(clip=noise_gray), d=2, num_streams=1))
+    assert max_diff(cpu, gpu) == 0.0

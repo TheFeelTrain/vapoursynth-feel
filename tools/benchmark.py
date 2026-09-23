@@ -23,8 +23,9 @@ Usage:
 
 Every plugin is timed --repeat times (default 3) and the median is reported with
 min/max/spread; the plugin order alternates between repeats so clock/thermal
-drift hits both arms of a comparison equally. MANGOHUD=0 is forced and each
-vspipe run is killed after --timeout seconds.
+drift hits both arms of a comparison equally. Each vspipe run gets the
+environment from ``vspipe_env()`` -- MANGOHUD off, and RADV's transfer-only
+SDMA queue opted into -- and is killed after --timeout seconds.
 
 By default the first --cache-frames frames of the real clip are decoded and
 held in RAM while vspipe is still evaluating the script (its fps figure only
@@ -778,8 +779,8 @@ FILTERS: dict[str, FilterSpec] = {
         input="depth(clip, 16)",
         synth_format="vs.YUV420P16",
         default_streams=2,
-        # knlmvk is vnode:gpu; vsfeel's NLMeans is not ported to the GPU API yet.
-        gpu_plugins=frozenset({"knlmvk"}),
+        # vsfeel's NLMeans is vnode:gpu under the R80 GPU API; knlmvk always was.
+        gpu_plugins=frozenset({"vsfeel", "knlmvk"}),
     ),
     "eedi3": FilterSpec(
         title="EEDI3",
@@ -903,6 +904,20 @@ def _tail(text: str | bytes | None, lines: int = 15) -> str:
     return "\n".join(text.splitlines()[-lines:])
 
 
+def vspipe_env() -> dict[str, str]:
+    """MANGOHUD off (it is only a display overlay), and RADV's transfer-only SDMA
+    queue opted into: without it every GPU filter's download is a graphics-engine
+    copy that competes with the kernel (+10-31% with it; `notes/BILATERAL.md`).
+    Any other experimental flags the caller set are preserved.
+    """
+    env = {**os.environ, "MANGOHUD": "0"}
+    flags = [f for f in env.get("RADV_EXPERIMENTAL", "").split(",") if f]
+    if "transfer_queue" not in flags:
+        flags.append("transfer_queue")
+    env["RADV_EXPERIMENTAL"] = ",".join(flags)
+    return env
+
+
 def run_vspipe(vpy_path: Path, frames: int, timeout: float = DEFAULT_TIMEOUT) -> float | None:
     """Time one vspipe run; return its fps, or None if the run failed.
 
@@ -912,8 +927,7 @@ def run_vspipe(vpy_path: Path, frames: int, timeout: float = DEFAULT_TIMEOUT) ->
     header advertises is not a measurement.
     """
     cmd = ["vspipe", "--start", "0", "--end", str(frames - 1), str(vpy_path), "/dev/null"]
-    # MANGOHUD is only a display overlay; disable it so it never perturbs a run.
-    env = {**os.environ, "MANGOHUD": "0"}
+    env = vspipe_env()
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
                                 timeout=timeout, env=env)

@@ -36,7 +36,7 @@ def test_bilateral_runs_via_jetpack(noise_gray):
 
 
 def test_nl_means_runs_via_jetpack(noise_gray):
-    out = nl_means(noise_gray, h=1.2, tr=1, a=2, s=4, backend=_backend())
+    out = cpu_node(nl_means(noise_gray, h=1.2, tr=1, a=2, s=4, backend=_backend()))
     assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
 
 

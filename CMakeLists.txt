@@ -164,11 +164,12 @@ endif()
 # The <defs> fields are quoted so that entries stay one CMake list element even
 # when they carry spaces; separate_arguments() splits them back into arguments.
 #
-# --target-env is deliberately left as it is here (bilateral/gaussblur/
-# nlmeans compile as SPIR-V 1.0, dfttest/eedi3/nnedi3 as 1.6). Unifying it is a
+# --target-env is deliberately left as it is here (bilateral/gaussblur
+# compile as SPIR-V 1.0, dfttest/eedi3/nnedi3/nlmeans as 1.6). Unifying it is a
 # codegen change and belongs in its own measured commit, not in this refactor.
 # bm3d is 1.6 as well: its group transpose is a subgroup shuffle, which needs
-# SPIR-V 1.3+.
+# SPIR-V 1.3+; nlmeans is 1.6 because it reads the core's GPU frame planes
+# through buffer references (PhysicalStorageBuffer), a 1.2+ feature.
 
 set(VK_BITS "16" "32")
 
@@ -226,17 +227,19 @@ foreach(bits IN LISTS VK_BITS)
     endforeach()
 endforeach()
 
-# NLMeans: weight / accumulation entry points per io variant (16-bit int,
-# 32-bit float); everything else is a specialization constant.
-set(VK_NLM_ENTRIES weight acc)
-set(VK_NLM_ENTRY_DEFS -DENTRY_WEIGHT -DENTRY_ACC)
+# NLMeans: compose / weight / accumulation entry points per io variant (16-bit
+# int, 32-bit float); everything else is a specialization constant. vulkan1.4
+# (SPIR-V 1.6) because the compose pass names the core's GPU frame planes
+# through buffer references.
+set(VK_NLM_ENTRIES compose weight acc)
+set(VK_NLM_ENTRY_DEFS -DENTRY_COMPOSE -DENTRY_WEIGHT -DENTRY_ACC)
 set(VK_NLM_VARIANTS)
 foreach(bits IN LISTS VK_BITS)
-    foreach(entry_i RANGE 0 1)
+    foreach(entry_i RANGE 0 2)
         list(GET VK_NLM_ENTRIES ${entry_i} entry)
         list(GET VK_NLM_ENTRY_DEFS ${entry_i} entry_def)
         list(APPEND VK_NLM_VARIANTS
-            "nlmeans_${bits}_${entry}|nlmeans.comp|-DBITS=${bits} ${entry_def}")
+            "nlmeans_${bits}_${entry}|nlmeans.comp|--target-env=vulkan1.4 -DBITS=${bits} ${entry_def}")
     endforeach()
 endforeach()
 
