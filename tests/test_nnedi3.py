@@ -26,7 +26,7 @@ import vapoursynth as vs
 
 from conftest import (
     WIDTH, HEIGHT, NOISE_MKV, assert_changes_on_noise,
-    assert_preserves_frame_props, eval_parallel, frame_to_ndarray,
+    assert_preserves_frame_props, cpu_node, eval_parallel, frame_to_ndarray,
     plane as _plane, reference_compare, reference_or_skip, reference_spec,
 )
 
@@ -34,12 +34,18 @@ pytestmark = pytest.mark.usefixtures("noise_gray")
 
 
 def _run(clip, field=1, num_streams=1, **kwargs):
-    return vs.core.vsfeel.NNEDI3(
+    """NNEDI3 as a clip the test can read pixels from (see conftest.cpu_node).
+
+    Under the R80 GPU API the filter takes and returns ``vnode:gpu`` frames, so
+    a CPU clip is auto-uploaded by the core and the output is downloaded before
+    the host reads it.
+    """
+    return cpu_node(vs.core.vsfeel.NNEDI3(
         clip,
         field=field,
         num_streams=num_streams,
         **kwargs,
-    )
+    ))
 
 
 def _ref_compare(fmt, frames, params, planes=None):

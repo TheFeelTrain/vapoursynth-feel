@@ -887,6 +887,9 @@ FILTERS: dict[str, FilterSpec] = {
         ],
         build=_nnedi3_build,
         default_streams=4,
+        # vsfeel's NNEDI3 is vnode:gpu under the R80 GPU API; the references
+        # stay on the CPU cache.
+        gpu_plugins=frozenset({"vsfeel"}),
     ),
 }
 

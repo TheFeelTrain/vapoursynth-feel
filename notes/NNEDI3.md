@@ -2,292 +2,242 @@
 
 *vsfeel's Vulkan port of nnedi3vk (refs `VapourSynth-nnedi3vk` / `vapoursynth-zipcu` / CPU `znedi3`).*
 
-Status: **shipped**, `num_streams = 4` (`1..32`), ~8 MB VRAM/stream plus
-`num_streams + 2` shared GTT download slots (per-instance VRAM 33.8 MiB measured
-at ns=4, 1080p GRAY16 — unchanged: the download staging is host memory, and the
-split adds 2 slots ≈ 4 MB system RAM). Scoreboard is one session, median-of-3,
-jpbd 1080p GRAY16 bench defaults (`field=3 dh=0 nsize=0 nns=4 qual=2 etype=0
-pscrn=4`, 2000 frames); nnedi3vk in the ref column:
+Status: **shipped on the R80 GPU API.** Design (current):
 
-| ns | vsfeel | ref | ratio |
+- `clip:vnode:gpu` in, `ffGPUOutput` out: the core owns every transfer
+  (`std.GPUUpload`/`std.GPUDownload`); the filter owns its pipelines, three
+  weight buffers and one exec pool — no staging, per-stream resources,
+  download-slot pool, descriptor pool, fences, queue cap or queue choice.
+  `num_streams`/`device_id` are accepted and **ignored** (validated 1..32 /
+  ≥ 0), `device` chosen by `core.set_vulkan_device`.
+- The kernels read the source plane in place (field row `f` → source row
+  `DH ? f : 2f+parity` at the plane's own pitch) and write interpolated row `r`
+  straight into the output plane at `2r + (1-parity)`. `ENTRY_KEEP` copies the
+  kept rows and, on a skipped plane under `dh`, zero-fills the interpolated
+  rows. `DH`/`ZERO` are spec constants (ids 9/10; 11 spec entries total).
+- Per frame: one transient device-local scratch (`width*rows*4 B` list +
+  16 B indirect struct per plane) handed to the recording context; five push
+  words `{list_elem, src_stride, dst_stride, parity, ind_elem}`.
+- Persistent VRAM: the three weight buffers (worst config qual2/nsize3/nns4 ≈
+  1.2 MB, host-visible, device-local preferred) plus pipelines; transient
+  4.2 MB scratch per in-flight frame (1080p GRAY16 `field=3`), bounded by the
+  exec ring; src/output frames are core-owned.
+- Runs need `RADV_EXPERIMENTAL=transfer_queue`, which `tools/benchmark.py`
+  forces (mechanism: `notes/BILATERAL.md`).
+- The filter sits at the API's transfer ceiling: a bare core
+  `GPUUpload→GPUDownload` graph (same cached real-clip vpy, no filter, 5000
+  frames) runs 2316 fps.
+
+Scoreboard — jpbd 1080p GRAY16, bench defaults (`field=3 dh=0 nsize=0 nns=4
+qual=2 etype=0 pscrn=4 num_streams=4`), interleaved pre-R80/R80 rounds through
+`tools/benchmark.py`, arm order alternated, medians:
+
+| input to vsfeel | pre-R80 | R80 port | delta |
 |---|---|---|---|
-| 1 | 1574 | 1633 | 0.96 |
-| 2 | 2625 | 2501 | 1.05 |
-| 4 (shipped) | 2961 | 2628 | **1.13** |
-| 6 | 2966 | 2638 | 1.12 |
-| 8 | 3028 | 2674 | 1.13 |
+| CPU cache (benchmark default), 5000 f ×3, 4 rounds | 3034 | 2695 | **−11.2%** |
+| `--gpu-cache` (resident GPU clip), 3000 f ×2, 3 rounds | 2156 | 2739 | **+27.0%** |
 
-- Bench `default_streams = 4` too. 4 is within ~2% of the 6/8 plateau and stays
-  the shipped default on per-stream efficiency (734 vs 375 fps/stream).
-- The remaining ns=1 gap (0.96) is host/copy side: the interp scatter alone is
-  worth +15% at ns=4 and +8% at ns=1 (SKIPIL ablation) and is DRAM-bound, not
-  instruction-bound. Kernels are at parity (pre 55 / pred 195-200 / copy 89 µs
-  vs ref 34 / 179 / 89).
+- References, same-session pairs: CPU cache (5000 f ×3) — vsfeel **2652**,
+  nnedi3vk 2908 → **0.91x**; `--gpu-cache` (3000 f ×2) — vsfeel **2740**,
+  nnedi3vk 2031 → **1.35x (#1)**. The port wins exactly where a resident chain
+  is involved; the CPU-sink row keeps the pre-port reference shape inverted for
+  the mechanism below.
+- Mechanism of the CPU-sink delta (same as `notes/GAUSSBLUR.md` and
+  `notes/BM3D.md`): the pre-R80 kernel stores *were* the download (D2H of the
+  interpolated half only) and the NT ReBAR pack *was* the upload, so the old
+  build moved one full-frame DMA less than the core's round trip and never ran
+  `GPUDownload` at all. Forcing **one** core download into the old build's own
+  chain (`--gpu-cache` row above) drops it 3034 → 2156 fps (−29%): the delta
+  is the deleted transfer path, not the filter. Nothing in-filter can remove it
+  under the `vnode:gpu` contract — do not chase it here.
+- Kernels at parity: `VSFEEL_NNEDI3_TSTAMP=100` (GRAY16, warm frame) gives
+  pre 76 / pred 192 / total 268 µs — pred against the pre-port uncontended
+  195–200, and the pre-port segment includes keep + indirect fills where the
+  old stamp was prescreen alone. The old inline copy stamp (89 µs D2H on the
+  compute queue) is gone from compute entirely. Host split
+  (`VSFEEL_NNEDI3_TIMING=1`, 5000 f): record 7.5 / submit 58.9 µs per frame —
+  acquire's ~1000 µs mean is the exec ring wait, a sleep, not host work.
 - Agreement: nnedi3vk vs vszipcu **BIT-EXACT** (maxdiff 0, frames 0/5/11, all
-  planes, noise_24f → YUV420P8 field=1); vs CPU znedi3 maxdiff 5, ~1% px (CPU
-  float ordering) — **nnedi3vk is ground truth**.
-- Accuracy, 25 tests: 16-bit within **1 LSB** (isolated 1-code flips from
-  serial-vs-butterfly reduction order), GRAYS within **~3e-8** (bound 1e-6). Sweeps
-  field 0/1/2/3, dh, planes subsets, nsize 0..6, nns 0..4, qual 1/2, etype 0/1,
-  pscrn 0..4 across GRAY16/YUV420P16/GRAYS, plus determinism, 1-vs-4 streams,
-  parallel load and props.
-- The `PAD`/`ASSEMBLE`/`COUNT` kernels and the `pad_buf`/`asm_buf` they fed are
-  **deleted**; live per-stream VRAM 15.0 → 8.7 MB measured (`mem_info_vram_used`
-  delta, 1080p GRAY16, 4 streams). Weights
-  `src/nnedi3_weights.bin`, 13,574,928 B, md5 `5c97e25c4a7277d06d3e3851373f1065`.
+  planes, noise_24f → YUV420P8 field=1); vs CPU znedi3 maxdiff 5, ~1 % px
+  (CPU float ordering) — **nnedi3vk is ground truth**.
+- Accuracy (unchanged by the port, `tests/test_nnedi3.py` green under
+  `cpu_node`): 16-bit within **1 LSB** (isolated 1-code flips from
+  serial-vs-butterfly reduction order), GRAYS within **~3e-8** (bound 1e-6).
+  Sweeps field 0/1/2/3, dh, planes subsets, nsize 0..6, nns 0..4, qual 1/2,
+  etype 0/1, pscrn 0..4 across GRAY16/YUV420P16/GRAYS, plus determinism,
+  1-vs-4 streams, parallel load, geometry tails and props. Full suite: 800
+  green via `tools/test.sh` (one unrelated NLMeans `a=64,d=16` contention
+  flake, passes serially — see `notes/NLMEANS.md`).
+- Weights `src/nnedi3_weights.bin`, 13,574,928 B, md5
+  `5c97e25c4a7277d06d3e3851373f1065`.
 
-## Algorithm (both references)
+## Implementation
 
-Per plane (output W×H, interp rows = H/2): **field extract** (kept rows per
-`parity`, all in `dh`) → **pad** to `(W+48)×(rows+6)`,
-`f = clamp(i-(MARGIN_V-fp))`, `c = clamp(x-MARGIN_H)`, `fp = 1-parity`,
-`MARGIN_H=24`, `MARGIN_V=3` → **prescreen** → **predict** → **interleave**.
+`src/nnedi3.cpp` + `src/nnedi3.comp`.
 
-- **Prescreen** (skipped at pscrn=0): a small NN picks cubic vs predictor. pscrn=1:
-  12×4 window, 3 layers (4/4/4), 1 px/thread; pscrn≥2: 16×4, 2 layers (4/4),
-  4 px/thread. Accepted → cubic `(-3,19,19,-3)/32` on rows r+1..r+4; rejected
-  indices compacted into a list by atomics. Strict non-FMA (`precise`) — the
-  verdict must match bit-for-bit or the pixel sets diverge.
-- **Predict**: per listed pixel an XDIM×YDIM window (nsize 8×6…48×6, 8×4…32×4),
-  mean/variance normalize, 2-layer NN (softmax + Elliott, nns 16…256), wae5 blend,
-  `qual` passes averaged. Explicit FMA, subgroup butterfly reductions,
-  `exp(clamp(s,-80,80))`.
-- **Interleave**: `_FieldBased=0`, `_Field` deleted, duration halved; `field>1`
-  doubles the rate (parity flips on odd outputs; `_FieldBased` drives parity when
-  present). Weight blob (f32 LE):
-  `ps_old(kernel_l0[4][48], bias_l0[4], kernel_l1[4][4], bias_l1[4],
-  kernel_l2[4][8], bias_l2[4])`; 3× `ps_new(l0[256] transposed, bias_l0[4],
-  l1[16], bias_l1[4])`; then etype 0..1 × nns-sel 0..4 × nsize 0..6: q1+q2 ×
-  `(softmax[nns·fs], elliott[nns·fs], softmax_bias[nns], elliott_bias[nns])`,
-  unselected combos skipped as `4·nns·fs+4·nns` floats.
-- Host prep: prescreener ÷ pixel_half (0.5 f32, peak/2 int), model mean-subtract;
-  upload per qual pass `pdW[(q·fs+k)·N+p]` = (sm,el), `pdB[q·2N+p]` = (smB, elB).
-
-## Implementation (what ships)
-
-`src/nnedi3.comp` — two entries, BITS=16/32, plus `predict_n4` (`-DPXP=4
--DSHSTRIDE=288u`) and `predict_n4s` (`-DPXP=4 -DSHSTRIDE=64u`):
-
-- `ENTRY_PRESCREEN` — 128 threads, one per pixel group (P=1 at pscrn=1, else 4);
-  cubic taps + verdict inline, cubic store or list compaction (one `atomicAdd` per
-  workgroup). Clamps the field for its own window reads and **maintains the indirect
-  width itself** (`atomicMax(groupsX)` off the `atomicAdd` return) — no count
-  dispatch. Grid `ceil(rows*ceil(width/P)/128)`.
-- `ENTRY_PREDICT` — 128 threads = 4 subgroups, one per PXP pixels; PXP = 8 when
-  `ceil(nns/32) <= 2 && fs <= 128` else 4; shared tile `shTile[4*SHSTRIDE]` —
-  `SHSTRIDE` is always a `-D` (256 for the PXP=8 default, 288 for `n4`, 64 for
-  `n4s`). Subgroup-add window stats, GEMV from the shared tile, wae5 blend.
-  Indirect off the prescreen count for pscrn>0, direct grid for pscrn=0.
-
-`src/nnedi3.cpp`: `FramePool` of `Nnedi3Resource` (ODR-unique); host-mapped ReBAR
-upload staging (`DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`), device-local
-dst/list/indirect buffers, persistent-mapped weights; descriptors 0-6 per stream;
-5 push words `{list, up, dst, parity, d_base}`.
-
-- **Two pre-recorded compute CBs per resource** (one per parity, at create), each
-  per plane: indirect-struct reset (list mode only) → prescreen → barrier →
-  indirect predict → barrier (`no H2D`, no GPU pad, no assemble, no transfer
-  queue). A third CB per resource is **re-recorded every frame**
-  (`record_copy_command_buffer`, pool created with `RESET_COMMAND_BUFFER`) because
-  the D2H destination is chosen per frame: the interp `vkCmdCopyBuffer` plus the
-  `TRANSFER_WRITE → HOST_READ` barrier. Both CBs go out as one `vkQueueSubmit`.
-  Per frame: CPU pack → take a download slot → submit → host scatter.
-- **Download slots** (`Nnedi3Download`): `num_streams + 2` host-visible GTT
-  staging buffers pooled apart from the streams, so the stream is handed back as
-  soon as its fence signals — the next frame packs while this frame's scatter is
-  still reading the slot (the reference's rb-slot pattern).
-- Pack: tight field rows via `copy_stream_rows` (NT) + `_mm_sfence()`, reading the
-  kept rows out of `dst` for non-dh (copied from `src` pre-acquire, cache-hot);
-  kept lines are copied **before** `pool.take()` to overlap other frames' GPU work.
-- Args: field/dh/planes/nsize/nns/qual/etype/pscrn/device_id/num_streams; 16-bit
-  int + 32-bit float only (8-bit/f16 rejected); `field:int;` is **required**.
+- Frame path (`Nnedi3GetFrame`): source frame → output frame
+  (`newGPUVideoFrame`, or `newVideoFrame2` sharing unprocessed planes —
+  **always fresh under `dh`**, since the keep kernel expands them there) →
+  parity from `_Field`/`_FieldBased`/`field` (double-rate flips on odd `n`) →
+  acquire, transient scratch (list mode only), record per plane: keep →
+  fill the indirect struct `{0,1,1,0}` → transfer→compute barrier →
+  prescreen → compute→(compute|indirect) barrier → indirect predict →
+  declare reads/writes → submit → props (`_FieldBased=0`, `_Field` deleted,
+  `field>1` halves duration). Plane regions are disjoint, so nothing else is
+  ordered.
+- Grids: prescreen `ceil(rows*ceil(width/P)/128)` (P=1 at pscrn=1 else 4 —
+  grouping is per ROW, so this exact form is what covers non-divisible row
+  tails); predict indirect off the prescreen count (prescreen keeps `groupsX`
+  via `atomicMax` off its `atomicAdd` — no count kernel); direct grid
+  `ceil(width*rows/(4*PXP))` for pscrn=0; keep grid linearized over x and y
+  (`ID.y * groups.x * 256 + ID.x`) so a 4K double-rate plane stays under the
+  65535-group x limit.
+- Pipelines deduplicated per `{width, rows, pscrn, xdim, ydim, nns, qual,
+  zero}`; predict module by the shader's own rule (PXP=8 when
+  `ceil(nns/32)<=2 && fs<=128`, PXP=4 small-tile `SHSTRIDE=64` when `fs<=64`,
+  PXP=4 otherwise). Prescreen/predict ask 32-lane full subgroups; the keep
+  writer takes the driver's default.
+- Weights: blob parsed at creation (prescreener mean/scale, model
+  mean-subtraction projected out), packed into three vec4/vec2-layout blobs
+  and written through persistently mapped host-visible buffers + `_mm_sfence`.
+- `field` is registered **required** (the `:opt` + null-error-pointer history
+  killed the process); 16-bit integer and 32-bit float input only; `field>1`
+  doubles `vi_out` with the unknown-length (`numFrames == -1`) guard.
 
 ## Historical
 
-### 2026-09-20 — download slot pool split (+7.7% at 1 stream, neutral at ns>=4)
+Pre-R80 rounds below were measured on the deleted transfer path — their fps
+figures are void as current-filter numbers (same marker as
+`notes/BILATERAL.md`); mechanisms are kept.
 
-- Same-session alternating pairs, jpbd 1080p GRAY16 bench defaults, ns=1:
-  1473 → 1587 fps (4 rounds of median-of-3; per-config spread 1-3%). The stream
-  now goes back after its fence, so the next frame's pack overlaps this frame's
-  scatter. ns=2 2546 → 2560, ns=4 2922 → 2890: at >=4 streams the scatter already
-  overlaps, and the extra concurrency only adds memory contention (BENCH shows
-  pack 450 → 593 us/frame, kept 839 → 989).
-- The scatter is the biggest single host cost: `SKIPIL=1` (skip the stride-2 NT
-  scatter only) is +15% at ns=4 (3069 → 3541) and +8% at ns=1. It is DRAM-write
-  bound (~24 GB/s over 540 rows), so an instruction diet cannot remove it — only
-  overlap or fewer bytes.
-- `copy_stream_rows` hoists the per-row NT alignment prologue (one call per plane,
-  one alignment computation): ~1% of the interp stage at ns=1 (85.1 → 84.3 us),
-  nothing end-to-end. Kept anyway (strictly less work; also covers the pitched
-  fallback).
-- `SHSTRIDE` (the dead `#if defined(SHSTRIDE)`/GLSL-const trap): default predict
-  variant now gets `-DSHSTRIDE=256u`, `n4` 288, `n4s` 64. **No LDS change**:
-  RADV reports 15360 B for PXP=8 before and after because it sizes by the used
-  range, not the declared array. Latent-OOB fix only.
-- `if (e >= FS)` → `if (FS % 32 != 0 && e >= FS)` (reference form): the SPIR-V
-  gains the spec-constant `SMod`, but the ACO ISA is byte-identical — for FS a
-  multiple of 32 the old guard already folded (lane <= 31, `t` unrolled). Kept as
-  source truth; no perf change.
-- Sweeps on the final binary: queue cap 2 still best (Q1 2811 / Q2 3007 / Q3 2884
-  / Q4 2967 at ns=4); ns 4/6/8 = 2961/2966/3028, so 4 stays the shipped default.
+### 2026-09-23 — R80 GPU API port
 
-### 2026-09-20 — dead pad/assemble/count path deleted (38% of per-stream VRAM)
+- Ripped: ReBAR upload staging + `copy_stream_rows` pack, the kept-line host
+  memcpy (pre-`take` overlap), the download-slot pool and host interp
+  scatter, two pre-recorded parity CBs + the per-frame D2H copy CB,
+  `FramePool<Nnedi3Resource>`, the descriptor pool/sets, `upload_weights`
+  staging H2D, `resolve_queue_cap`/queue assignment, `submit_with_fence` waits,
+  and the `BENCH`/`COUNT`/`SKIPIL`/`QUEUES` knobs. Shader side: `loadPad`
+  indexes the source plane directly (was: packed upload staging), `storeDst`
+  writes the pitched output plane (was: packed device dst), `ENTRY_KEEP` added.
+- Method: MVP first (one frame per submission, 57/57 reference tests green on
+  the first build), then the interleaved A/B above; the `--gpu-cache` row and
+  the bare-transfer control are what localized the delta to the core's
+  `GPUDownload` rather than the filter.
+- The port also deleted the legacy shared layer from `src/vsfeel.h`/
+  `src/vsfeel.cpp` with NNEDI3 as its last user: `VK_Device`/`get_device`,
+  `volkInitialize`, the legacy pipeline-cache path, `allocate_memory`,
+  `copy_*`/`mapped_range` helpers, `retire_instance`, `submit_with_fence`,
+  `submit_timeline`, `destroy_common`, `rebar_available`,
+  `require_vulkan_1_3` and the `VK_EXT_device_fault` dump (the core's device
+  has no extensions). `FramePool`/`ticket_semaphore` stay for BM3D.
 
-The pad/assemble/count entries had been undispatched since the pad was fused
-into window reads and the download went to the packed interp rows, but
-`pad_buf` + `asm_buf` were still allocated and the pad/count/assemble pipelines
-and modules still created per instance. Deleted: both buffers, the three
-pipelines and their modules, `MARGIN_H`/`MARGIN_V`, `pad_stride`/`pad_h`/
-`pad_grid_*`/`pred_grid_x`/`asm_grid_*`/`pad_elem`/`pad_offset`/`asm_elem`/
-`asm_offset`, the dead descriptor bindings (9 → 7), the staging
-`STORAGE_BUFFER` usage flag, and the six `{16,32}_{pad,count,assemble}` SPIR-V
-outputs. Measured `mem_info_vram_used` around a 4-stream 1080p GRAY16 instance:
-60.1 → 34.9 MB, i.e. **24.1 MB freed / 6.0 MB per stream** (matches the 6.29 MB
-the two buffers sized). No fps change; 800-test suite green.
+### 2026-09-23 — output-frame batching measured flat, reverted
 
-### 2026-09-04 — MVP: fused build, bit-exact with vszipcu, ~1130 fps vs ~2095 (~0.54x), 2 streams
+EEDI3's fix for the single-queue world (one submission carrying a batch of
+frames, phase-recorded, claim/publish cache) was ported and swept
+`VSFEEL_NNEDI3_BATCH` 1/2/4/8/auto at 3000 f ×3: **2689 / 2684 / 2682 / 2667 /
+2654 — flat, B=1 nominally fastest.** Mechanism of the miss: unlike EEDI3's
+latency-bound row kernel, one predict grid already saturates the compute
+queue, and the wall is downstream (the core's `GPUDownload`, see the banner),
+so submission structure cannot move it — confirmed by gpu_busy 81 % idle
+pattern matching a download-bound pipeline, not a starved queue. Host
+record+submit did fall ~66 → ~23 µs/frame, but with no fps gain the
+machinery (claims, cache, multi-frame requests) was reverted as unneeded;
+re-test before reintroducing it, together with whatever changed the transfer
+floor.
 
-### 2026-09-05 — prescreen list + cooperative predict split
+### 2026-09-20 — download slot pool split (pre-R80, +7.7 % at ns=1)
 
-- Two bugs fixed in the new split. Predict's GRIDPX loop tail was `#if 0`-disabled
-  (only 32k px computed), and the indirect count word (offset 12) was never reset,
-  so it accumulated across frames on the reused resource (frame 23 = +5173) and
-  stale list entries let predict overwrite cubic-accepted pixels. Third
-  `vkCmdFillBuffer`, verified by COUNT readbacks + order-swap probes. Then 46/46.
-- **Fused kernel tried, REVERTED.** `ENTRY_FUSED` (verdict inline + serial
-  chunked-neuron predict, no list/subgroups) passed 46/46 but timestamps showed
-  **pred 464 µs vs split 178 µs** — verdict on the full grid, FMA-starved ISA
-  (222 fmac vs 339 mul + 484 add), wall 824 vs ~1960 fps; a chunk-32→8 neuron tile
-  would not have fixed the verdict-full-grid cost.
-- Session ended RED (28 passed / 18 failed; pscrn=2/3/4 only, interp rows only,
-  nondeterministic across fresh instances); later fixed, shared-L0 was the suspect.
+The slot pool was separated from the streams so a stream returned at its
+fence while the host scatter still read the slot: 1473 → 1587 fps ns=1
+(5000-frame medians); neutral at ns≥4. Superseded — both pools are deleted.
 
-### 2026-09-05 continued — transfer queue → GPU pad → GPU assemble
+### 2026-09-20 — dead pad/assemble/count path deleted (pre-R80)
 
-Each verified 46/46; **all were later deleted**. **Count folded into prescreen**
-(`atomicMax` off `atomicAdd`): +~90 fps at 2s. **Zero-copy ReBAR upload** (H2D +
-`field_buf` deleted): h2dpad 95 → 17 µs, **+~300 fps at 2s** (1775 → 2078
-official, 2210 best-of-3). **Kept lines pre-acquire**: +~100 fps at 4s (2029 →
-2200), and a cleaner pre-vs-post-fence re-test was neutral (2006 vs 2025) — the
-reference's win is its rb-slot pool releasing the stream early. **Transfer-queue
-split submit**: NOXFER A/B showed copy-overlap delta ≈ 0, so D2H was never the
-bottleneck. **GPU pad kernel**: pack NT ~300 µs vs memcpy ~440 µs at 2s (synth
-proof: pred 7 µs empty vs 190 µs real). **GPU assemble** + **decoupled host
-overlap** (snapshot + early `give_back`): the missing predict→assemble barrier
-failed 21 tests with 927-970 wrong interp pixels (odd rows, ~half = source, i.e.
-stale dst); **SKIPIL fix** had the timing path skip copies without returning the
-resource, draining the pool.
+`pad_buf`/`asm_buf`, three undispatched pipelines and their SPIR-V outputs
+removed: `mem_info_vram_used` 60.1 → 34.9 MB around a 4-stream 1080p GRAY16
+instance (24.1 MB freed). Mechanism kept: audit what a dispatch actually
+touches, not what once existed — same rule that later killed `BENCH`/`COUNT`.
 
-### 2026-09-06 — the push past parity
+### 2026-09-05/06 — the pre-R80 structure was assembled one measurement at a time
 
-Each step best-of-3/median-of-5 same-session, real-world defaults; start 2s 0.79x,
-4s 0.83x. Delete GPU assemble, D2H packed interp only (it shipped 4 MB of which the
-host used 2 MB): +8% (2s → 0.93); pack reads kept rows from `dst` not `src`
-(4s → 0.96-0.99). `predict_n4s`: the fixed `shTile[4*288]` (18 KB, LDS 15360 B)
-throttled small-window occupancy, so FS≤64 now uses 256 vec4 (4 KB, LDS 4096 B);
-4s → 0.99. **Transfer queue deleted, always inline** (submit + timeline + sync cost
-more than 2 MB of overlap): 1s 0.80 → 0.87, 2s 0.96, 4s 1.05 (first lead). **Pad
-fused into window reads** (`loadPad` clamps the tight field, `fp = 1-parity`):
-deletes the pad dispatch + barrier (+20 µs GPU), clamp ALU 3-7 µs.
-`REQUIRE_FULL_SUBGROUPS` on prescreen/predict; redundant host barrier deleted
-(`vkQueueSubmit` orders the pack); pre-recorded parity CBs; UPTO deleted; timestamp
-slots 5 → 4 (0=top 1=pre 2=pred 3=copy).
+Mechanisms still live in the shipped design: prescreen **list + indirect
+launch** (fused kernel tried and reverted: pred 464 vs 178 µs — verdict on the
+full grid loses); `atomicMax` folded the count kernel away; pad folded into
+the window reads (`loadPad` clamps the field directly); exact indirect grid
+kept (over-launch refuted below); `REQUIRE_FULL_SUBGROUPS` on the cooperative
+kernels only; one-shot ReBAR upload (`NT stores + sfence`) — now the core's
+upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
 
-### Measured dead ends (mechanism + why it lost)
+### Measured dead ends (mechanisms)
 
-- **Predict over-launch REFUTED.** Full-grid direct with early exit: pred 268 vs
-  223 µs GPU, 1892 vs 2055 fps at 2s — exiting subgroups still pay window-gather +
-  occupancy before the `firstPix` check.
-- **PXP=16 restructure REVERTED.** Per-pixel shared stride 32
-  (`warp*288 + 15*32 + 31 > 1152`) overflows `shTile[4*288]` for warp≥1 → OOB
-  shared writes → fresh-instance nondeterminism (maxdiff ~3000, 26 failed); rule:
-  re-derive the shared footprint (≤1152 vec4) for any PXP/stride change.
-- **Pack writer: NT wins — judge on `benchmark.py`, not a microbench.** An isolated heap
-  microbench said memcpy 41 vs NT 65 µs; both real mappings said the opposite (GTT:
-  NT+sfence ~300 vs memcpy ~440 at 2s; ReBAR: 1s NT 1075 vs memcpy 1027).
-- **`copy_stream_read` faults on an unaligned SOURCE** (`_mm256_stream_load_si256`
-  is an aligned load) → SIGSEGV; never assume source alignment. Not used here.
-- **UPTO + TSTAMP together HANG**: a truncated CB never writes queries 2..4, so the
-  `WAIT_BIT` readback blocks forever; run stage truncation with BENCH only.
-- **Every producer→consumer dispatch pair needs an explicit barrier** — back-to-back
-  dispatches order nothing. Prescreen→predict needs SHADER_WRITE → SHADER_READ *and*
-  INDIRECT_COMMAND_READ; predict→copy SHADER_WRITE → TRANSFER_READ.
-- **YUV multi-plane: shader and host push layouts must change atomically.** Chroma
-  corrupted with ≥2 planes in one sequence — the host wrote per-plane indirect
-  structs (5th push word `d_base`) while the shader read plane 0's globals. The
-  4→5-word mismatch compiled and passed GRAY (single plane → offset 0), so only a
-  YUV run catches it.
-- **Scalar-GEMV stash: rejected.** Per-pixel accumulation + `subgroupBroadcast` wae5
-  exploded predict ISA to **47357** (from 1674) and was wrong for PPL>1, root cause
-  never found; re-derive from the committed vec4 form, never patch the stash.
-- **7900XTX has no dedicated DMA family** (GFX 1q / COMPUTE 4q / video-dec/encode):
-  the "transfer queue" was a second same-family compute queue, worth +75 fps
-  (1755 → 1830) at 2s but net negative with submit/timeline cost. **pscrn=0 is at
-  parity** (ours 177 vs ref 191 fps 1-stream, pred 4742 µs both over the full
-  1M-px grid), so the math is fine; the sparse path (prescreen + list + indirect) is
-  the gap. **D2H timestamps were bogus** while the transfer queue existed —
-  copy(ts) ~20-22 µs for 4 MB, impossible over PCIe.
+- **Predict over-launch REFUTED.** Full-grid direct with early exit: pred 268
+  vs 223 µs, 1892 vs 2055 fps at 2 streams — exiting subgroups still pay the
+  window gather; the exact indirect grid ships.
+- **PXP=16 restructure REVERTED.** Per-pixel shared stride 32 overflowed
+  `shTile[4*288]` for warp≥1 → OOB shared writes, fresh-instance nondeterminism
+  (maxdiff ~3000). Rule: re-derive the shared footprint (≤1152 vec4) for any
+  PXP/stride change; `SHSTRIDE` is always a `-D` so array and addressing cannot
+  drift apart.
+- **Every producer→consumer dispatch pair needs an explicit barrier** —
+  back-to-back dispatches order nothing. Prescreen→predict needs
+  SHADER_WRITE → SHADER_READ *and* INDIRECT_COMMAND_READ; the indirect-struct
+  fill needs TRANSFER → COMPUTE (both ship as the two `VkMemoryBarrier2`
+  helpers in `src/nnedi3.cpp`).
+- **YUV multi-plane: shader and host push layouts must change atomically.**
+  Chroma corrupted when the host's per-plane `ind_elem` outgrew the shader's
+  globals — a 4→5-word mismatch compiled and passed GRAY (single plane →
+  offset 0), so only a YUV run catches it (`test_nnedi3_yuv_matches_reference`).
+- **Scalar-GEMV stash: rejected.** Per-pixel accumulation + broadcast exploded
+  predict ISA to 47357 (from 1674) and was wrong for PPL>1; re-derive from the
+  committed vec4 form, never patch the stash.
+- **An isolated copy microbenchmark proposed the wrong pack writer** (heap said
+  memcpy 41 vs NT 65 µs; both real mappings said the opposite) — judge copy
+  paths on `benchmark.py`. The pack itself is deleted with the port; the rule
+  stands (AGENTS "microbenchmark proposes, in-situ A/B decides").
+- **pscrn=0 is at parity** (177 vs ref 191 fps 1-stream pre-port, pred ~4.7 ms
+  both over the full grid): the math is fine; the sparse path was where the
+  old gap lived. **7900XTX has no dedicated DMA family** — the old "transfer
+  queue" was a second compute queue, worth ~75 fps, net negative (deleted);
+  today `RADV_EXPERIMENTAL=transfer_queue` exposes the real transfer family the
+  core downloads on.
 
-### Reference orchestration (read, not mirrored)
+### Cross-cutting hardening (pre-R80 fixes, still shipped)
 
-vszipcu HIP `process()` is fully serial per frame (pack before acquire, interleave
-after release) and over-launches `ceilDiv(w*rows,16)` blocks with a `firstPix` early
-exit — no indirect/count/atomicMax, no transfer queue, 430 µs. nnedi3vk uses push
-descriptors, pools readback slots separately (`numRbSlots = numStreams+2`), sizes
-`subgroupsPerWG = min(4, maxWG/sgSize)`, and uploads with `PREFER_DEVICE` ReBAR. Our
-kernels match theirs in total (1-stream jpbd 1080p: ref H2D 129 / pad 32 / pre 53 /
-pred 81-122 / D2H 87 ≈ 380 µs vs ours ≈ 350 µs), so the gap was never kernel math;
-H2D was ours to lose (~80 µs for 2 MB vs their 129).
+- `field` registered required — `:opt` with a null error pointer took
+  `VS_FATAL_ERROR` → `std::terminate`; test `test_nnedi3_requires_field`.
+- Prescreen grid under-coverage: host must compute
+  `ceil(rows*ceil(width/P)/128)` (per-row grouping), never
+  `ceil(width*rows/(P*128))` — the tail of every non-divisible row was left
+  unwritten and uninitialized VRAM reached the output (YUV420P16 1924x1080:
+  182 garbage chroma px/frame). Covered by the `test_geometry.py` nnedi3 rows.
+- Validation layer: `REQUIRE_FULL_SUBGROUPS_BIT` only on the cooperative
+  kernels (prescreen/predict) — `gpu_create_pipeline` takes the flag
+  explicitly; covered by `tests/test_validation.py`.
+- `numFrames == -1` is the unknown-length sentinel: `field>1` doubling is
+  guarded (`numFrames > 0`), same fix as EEDI3.
 
 ## Open work
 
-- **Host bill, both halves copy-bound**: the interp scatter (2 MB stride-2 NT
-  stores, ~24 GB/s) is worth +15% at ns=4 / +8% at ns=1 when skipped; the kept
-  stride-2 memcpy (~8 GB/s effective) is the other half. Both need *fewer host
-  bytes*, not a tighter loop — `VK_EXT_external_memory_host` zero-copy is the
-  only exit and EEDI3 measured it catastrophic on this driver (not retried).
-- **Prescreen is ~2.8x the reference** (140 vs 50 µs when measured): compare ISA
-  against their pattern (scalar `float v[EPL]`, warp shuffles, no shared), check
-  VGPR/occupancy and the `precise` chains.
-- **MVP limit**: `dh` + a planes subset zeroes interp lines on skipped planes (the
-  reference leaves them uninitialized).
+- **CPU-sink row trails nnedi3vk (0.91x)** — structural: the references write
+  CPU-native output with their own overlapped transfers while the API mandates
+  a core `GPUDownload` for a CPU consumer. Same trade already shipped for
+  GaussBlur (−6.1 %), BM3D (−4 %) and Bilateral (−0.1 %); the resident row is
+  where this port wins (1.35x). Nothing left to optimize inside the filter.
+- **Prescreen vs reference ~2.8x claim is pre-port** (40 µs gap on old
+  stamps): re-measure against nnedi3vk's kernels on the current binary before
+  quoting it.
+- **MVP limit**: `dh` + a planes subset zeroes interp lines on skipped planes
+  (the reference leaves them uninitialized) — kept deliberately, tests rely on
+  vsfeel's defined behavior.
 
 ## Debug env vars (all in `src/nnedi3.cpp`)
 
 | env | what it does |
 |---|---|
-| `VSFEEL_NNEDI3_TSTAMP` | per-frame GPU timestamps: 0=top 1=pre 2=pred 3=copy |
-| `VSFEEL_NNEDI3_BENCH` | per-frame host phase averages printed at teardown |
-| `VSFEEL_NNEDI3_COUNT` | read back the prescreen pixel count |
-| `VSFEEL_NNEDI3_SKIPIL` | skip the download copies (timing only, garbage out) |
-| `VSFEEL_NNEDI3_QUEUES=N` | override the queue cap (default 2) |
+| `VSFEEL_NNEDI3_TSTAMP=<frame>` | one-shot GPU stamps for that frame: top / prescreen done / predict done (default 100; gated on the queue family's `timestampValidBits`) |
+| `VSFEEL_NNEDI3_TIMING=1` | per-frame host stage averages (acquire/record/submit/total) printed at teardown |
 
-`VSFEEL_NNEDI3_PREDIRECT` survives only as the measured-numbers comment on the
-over-launch refutation; `UPTO`, `SPLITIL`, `NOXFER`, `UPGTT` no longer exist.
-
-## Cross-cutting hardening
-
-- Flush/invalidate use the shared `mapped_range` helpers
-  (`minNonCoherentAtomSize`/`VK_WHOLE_SIZE` rounding); a creation error is torn down
-  by `~Nnedi3Data` via `FramePool::emplace()`; creation preflights `apiVersion`
-  instead of failing opaquely at pipeline creation.
-- `field` is registered required: as `:opt;` with a null error pointer it took
-  `VS_FATAL_ERROR` → `std::terminate` (SIGABRT 134) that `try/except` could not
-  catch. Test `tests/test_nnedi3.py::test_nnedi3_requires_field`.
-- Prescreen grid under-coverage: the host used `ceil(width*rows/(P*128))`, but the
-  shader groups per row, so the exact need is `ceil(rows*ceil(width/P)/128)`; when P
-  did not divide width the last row's tail was never dispatched and **uninitialized
-  VRAM reached the output** (YUV420P16 1924x1080: 182 garbage chroma px/frame,
-  0..65527). Matches `nnedi3vk.cpp:1121-1123`; 630/638 is bit-exact in
-  `tests/test_geometry.py` (640/626/610 also 0 codes). Unknown length: `field > 1`
-  doubled the `-1` sentinel to `-2`, now guarded with `numFrames > 0` (same fix as
-  EEDI3); `field=2/3` still doubles 24 → 48.
-- **Validation-layer defect, fixed:** `VK_LAYER_KHRONOS_validation` flagged two
-  pipeline creations with `VUID-VkPipelineShaderStageCreateInfo-flags-02759` — the
-  32-wide pad and count kernels were given `REQUIRE_FULL_SUBGROUPS_BIT` while the
-  device's default subgroup size is 64, with neither
-  `ALLOW_VARYING_SUBGROUP_SIZE` nor an explicit required size. Only the cooperative
-  kernels (prescreen, predict) run subgroup intrinsics, so `create_pipeline` now
-  takes `full_subgroups` and it is set only for those two. Covered by
-  `tests/test_validation.py` (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`,
-  fail on `Validation Error`/`VUID`).
+`BENCH`, `COUNT`, `SKIPIL` and `QUEUES` were deleted with the pre-R80
+machinery; `TSTAMP` became a one-shot probe and `BENCH` was renamed `TIMING`.

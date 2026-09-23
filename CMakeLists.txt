@@ -287,19 +287,22 @@ foreach(mbits IN ITEMS 8 16 32)
         "eedi3_maskdilate_${mbits}_tr|eedi3.comp|--target-env=vulkan1.3 -DENTRY_MASKDILATE -DMASK_BITS=${mbits} -DMASK_TRANS=1")
 endforeach()
 
-# NNEDI3: prescreener + cooperative predictor. Three predictor variants for
-# the shipped PXP selection: PXP=8 needs a 256-vec4 shared stride, wide
-# networks (PXP=4) the 288 one, and FS<=64 the 64-stride small tile (4KB LDS
-# instead of 16/18KB). SHSTRIDE is always a -D so the array dimension and the
-# addressing cannot disagree. The predictor needs subgroup ops + the Vulkan
-# memory model, so SPIR-V 1.3+.
+# NNEDI3: prescreener + cooperative predictor + the kept-row writer. Three
+# predictor variants for the shipped PXP selection: PXP=8 needs a 256-vec4
+# shared stride, wide networks (PXP=4) the 288 one, and FS<=64 the 64-stride
+# small tile (4KB LDS instead of 16/18KB). SHSTRIDE is always a -D so the
+# array dimension and the addressing cannot disagree. dh / the dh zero-fill
+# are specialization constants, so the kept-row writer needs one variant per
+# io depth. The predictor needs subgroup ops + the Vulkan memory model, so
+# SPIR-V 1.3+.
 set(VK_NNEDI3_VARIANTS)
 foreach(bits IN LISTS VK_BITS)
     list(APPEND VK_NNEDI3_VARIANTS
         "nnedi3_${bits}_prescreen|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PRESCREEN"
         "nnedi3_${bits}_predict|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PREDICT -DSHSTRIDE=256u"
         "nnedi3_${bits}_predict_n4|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=288u"
-        "nnedi3_${bits}_predict_n4s|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=64u")
+        "nnedi3_${bits}_predict_n4s|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=64u"
+        "nnedi3_${bits}_keep|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_KEEP")
 endforeach()
 
 set(VK_VARIANTS

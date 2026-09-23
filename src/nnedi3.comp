@@ -14,11 +14,19 @@
  * indirectly off the prescreen-maintained count. No prescreening
  * (pscrn=0) runs predict directly over every pixel.
  *
- * Exactly one of ENTRY_PRESCREEN / ENTRY_PREDICT is defined at compile time:
+ * Exactly one of ENTRY_PRESCREEN / ENTRY_PREDICT / ENTRY_KEEP is defined at
+ * compile time:
  *
  *   ENTRY_PRESCREEN — per output pixel group: cubic taps, prescreener
  *                     decision, cubic store or list compaction
  *   ENTRY_PREDICT   — predictor network over listed (or all) pixels
+ *   ENTRY_KEEP      — kept (and, under dh on a skipped plane, zeroed) rows
+ *                     straight into the output frame plane
+ *
+ * The kernels read the source frame plane in place at its own row pitch
+ * (field row f is source row DH ? f : 2f+parity) and write interpolated
+ * rows straight into the output frame plane at row 2r + (1-parity), so the
+ * host moves no pixels at all.
  *
  * Formula order mirrors the references so results agree to ~1 LSB:
  * - cubic and all prescreener dots accumulate `precise` (no FMA contraction,
@@ -57,16 +65,24 @@ layout(constant_id = 5) const int YDIM = 4;
 layout(constant_id = 6) const int NNS = 32;
 layout(constant_id = 7) const int QUAL = 1;
 layout(constant_id = 8) const int USE_LIST = 1;
+// dh doubles the height: the whole source plane is the field, otherwise the
+// field is every second source row starting at pc.parity (ENTRY_KEEP only
+// reads ZERO).
+layout(constant_id = 9) const int DH = 0;
+layout(constant_id = 10) const int ZERO = 0;
 
 const int FS = XDIM * YDIM;
 
+// The source frame plane at its own row pitch (the whole plane buffer, so
+// there is no element base).
 layout(std430, binding = 0) readonly buffer FieldBuf { IO_TYPE fieldBuf[]; };
+// The output frame plane at its own row pitch.
 layout(std430, binding = 1) buffer DstBuf { IO_TYPE dstBuf[]; };
 // Rejected-pixel list (prescreen writes, predict reads) and the indirect
 // dispatch struct {groupsX, groupsY, groupsZ, count} (host fills {0,1,1,0},
 // prescreen bumps via subgroup-aggregated atomics, predict reads count and
-// launches indirectly off groupsX). Multi-plane clips pack one struct per
-// plane; pc.d_base selects this dispatch's struct (uint index into indBuf).
+// launches indirectly off groupsX). Both are regions of one per-frame scratch
+// buffer; pc.a_base / pc.d_base select this plane's regions.
 layout(std430, binding = 5) buffer ListBuf { uint listBuf[]; };
 layout(std430, binding = 6) buffer IndBuf { uint indBuf[]; };
 // Prescreener weights as vec4s: layer-0 transposed (vec k holds all four
@@ -77,28 +93,27 @@ layout(std430, binding = 2) readonly restrict buffer PsWeights { vec4 psW[]; };
 layout(std430, binding = 3) readonly restrict buffer PdWeights { vec2 pdW[]; };
 layout(std430, binding = 4) readonly restrict buffer PdBias { vec2 pdB[]; };
 
-// Per-dispatch buffer bases (IO_TYPE elements, except the list which is
-// uints):
-//   prescreen: A=list, B=field (tight upload), C=packed interp rows (+parity)
-//   predict:   A=list, B=field (tight upload), C=packed interp rows (+parity)
+// Per-dispatch values: the two frame-plane row pitches in IO_TYPE elements,
+// the source field parity, and the list / indirect-struct region bases of
+// this plane's scratch (uint elements).
 layout(push_constant) uniform PushConstants {
     int a_base;
-    int b_base;
-    int c_base;
+    int src_stride;
+    int dst_stride;
     int parity;
     int d_base;
 } pc;
 
 // Window read fused from the pad kernel: pad[i][x] =
 // field[clamp(i-(MARGIN_V-fp))][clamp(x-MARGIN_H)] with fp=1-parity.
-// Reading the tight field directly with the same clamp deletes the pad
-// kernel + pad buffer + barrier (pad writes 4MB + window re-reads; the
-// clamp ALU is noise next to the 130MB of L2-hit window traffic).
+// The clamp runs in field space; the field row then maps to its source plane
+// row (every second row starting at parity, or the whole plane under dh).
 float loadPad(int row, int col) {
     const int fp = 1 - pc.parity;
     const int f = clamp(row - (MARGIN_V - fp), 0, ROWS - 1);
     const int c = clamp(col - MARGIN_H, 0, WIDTH - 1);
-    const int idx = pc.b_base + f * WIDTH + c;
+    const int sy = (DH != 0) ? f : (2 * f + pc.parity);
+    const int idx = sy * pc.src_stride + c;
 #if BITS == 32
     return fieldBuf[idx];
 #else
@@ -106,13 +121,15 @@ float loadPad(int row, int col) {
 #endif
 }
 
-void storeDst(int idx, float v) {
+// Interpolated field row r lands on output row 2r + fp at the output pitch.
+void storeDst(int r, int x, float v) {
+    const int idx = (2 * r + (1 - pc.parity)) * pc.dst_stride + x;
 #if BITS == 32
-    dstBuf[pc.c_base + idx] = v;
+    dstBuf[idx] = v;
 #else
     // glslc -O chokes on direct float->uint16_t (OpUConvert); go through
     // uint with an explicit mask (same workaround as the other filters)
-    dstBuf[pc.c_base + idx] = uint16_t(uint(clamp(roundEven(v), 0.0, float(PEAK))) & 0xFFFFu);
+    dstBuf[idx] = uint16_t(uint(clamp(roundEven(v), 0.0, float(PEAK))) & 0xFFFFu);
 #endif
 }
 
@@ -252,7 +269,7 @@ void main() {
             if ((needMask & (1u << n)) != 0u)
                 pixIdx[cnt++] = idx;
             else
-                storeDst(int(idx), cubicRow(r, x + MARGIN_H));
+                storeDst(r, x, cubicRow(r, x + MARGIN_H));
         }
     }
 
@@ -412,7 +429,9 @@ shared vec4 shTile[4 * SHSTRIDE];
             [[unroll]] for (int px = 0; px < 8; px++) { \
                 if (px >= PXP || uint(px) >= (NPX)) \
                     break; \
-                storeDst(int(idxs[px]), result[px] / float(QUAL)); \
+                const uint si = idxs[px]; \
+                storeDst(int(si / uint(WIDTH)), int(si % uint(WIDTH)), \
+                         result[px] / float(QUAL)); \
             } \
         } \
     }
@@ -432,6 +451,43 @@ void main() {
     if (firstPix >= npix)
         return;
     PREDICT_UNIT(firstPix, min(uint(PXP), npix - firstPix))
+}
+
+#elif defined(ENTRY_KEEP)
+
+// Kept-row writer: output rows of parity pc.parity are copies of their source
+// row (identity when dh=0, the field row when dh=1). On a skipped plane under
+// dh the interpolated rows have no producer, so ZERO fills them -- the output
+// frame plane is fresh memory there and the host used to zero it itself.
+//
+// The grid is linearized across x and y (i = ID.y * groups.x * 256 + ID.x),
+// which keeps a 4K double-rate plane (16.6M pixels) under the guaranteed
+// 65535 workgroup limit in x.
+layout(local_size_x = 256, local_size_y = 1) in;
+
+void main() {
+    const int per_group = int(gl_NumWorkGroups.x) * 256;
+    const int i = int(gl_GlobalInvocationID.y) * per_group +
+                  int(gl_GlobalInvocationID.x);
+    const int total = (ZERO != 0) ? (2 * ROWS * WIDTH) : (ROWS * WIDTH);
+    if (i >= total)
+        return;
+    const int x = i % WIDTH;
+    if (ZERO != 0) {
+        const int y = i / WIDTH;
+        if (((y - pc.parity) & 1) == 0) {
+            const int r = (y - pc.parity) >> 1;
+            dstBuf[y * pc.dst_stride + x] = fieldBuf[r * pc.src_stride + x];
+        } else {
+            // storeDst addresses exactly the (1-parity) rows by construction.
+            storeDst((y - (1 - pc.parity)) >> 1, x, 0.0);
+        }
+    } else {
+        const int r = i / WIDTH;
+        const int y = 2 * r + pc.parity;
+        const int sy = (DH != 0) ? r : y;
+        dstBuf[y * pc.dst_stride + x] = fieldBuf[sy * pc.src_stride + x];
+    }
 }
 
 #endif

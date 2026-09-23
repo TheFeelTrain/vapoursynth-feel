@@ -229,28 +229,22 @@ loop if-converts into loads issued on both sides plus de-dualized ALU and
 All filters share an inline (zero-overhead, C++20) plumbing layer in
 `src/vsfeel.h`. New filters must build on it — do not re-invent this wheel:
 
-- **`FramePool<T>`** — per-instance pool of per-frame resources: a
-  `ticket_semaphore` (caps in-flight frames), `std::vector<T> items`, and a
-  `std::mutex lock`. `take()` blocks on the semaphore then pops the LIFO
-  under the lock; `give_back(t)` pushes under the lock and releases the
-  ticket. Init before first use: set `pool.semaphore.current` to
-  `num_streams - 1`, `pool.reserve(num_streams)`, `pool.push(...)` one per
-  created resource. Every filter's per-frame `struct` lives in such a pool;
-  take at frame start, give back at frame end **and on every error path**
-  (the `set_error` lambda pattern). dfttest inlines the take sequence so it
-  can timestamp between acquire and lock; `pool.take()` suffices otherwise.
-- **`destroy_common(dev, r)`** — frees the shared fields: cmd buffer, command
-  pool, fence, staging buffer + memory. The filter unmaps mapped pointers
-  *before* and destroys its filter-specific objects (extra command buffers,
-  timeline semaphores, query pools, temporaries) on either side of the call.
-- **`submit_with_fence(dev, queue, *qlock, cb, fence)`** and
-  **`submit_timeline(dev, queue, *qlock, cb, waits, values, stages,
-  signal_sem, signal_value, fence)`** — every `vkQueueSubmit` must go through
-  these: they take the queue's lock (shared `std::mutex` on every `VK_Queue`
-  — all submits to a shared device/queue must serialize on it) and reset the
-  fence inside the lock. `submit_timeline` takes equal-sized wait
-  vectors (semaphore, value, stage) and optionally signals a timeline value;
-  waits are non-destructive so any number of consumers can wait on one signal.
+- **The exec-pool frame path** (what every filter builds on now): record one
+  command buffer per output frame from `gpuExecAcquire` /
+  `gpuExecCommandBuffer`, declare inputs with `gpuExecReadsFrame` and outputs
+  with `gpuExecWritesPlane`, then `gpuExecSubmit`; `gpuExecAbandon` on every
+  error path before submit. The pool turns producer pairs into device-side
+  waits, publishes the outputs' pairs, keeps the frames and any
+  `gpu_frame_buffer` scratch alive until the submission completes, and sizes
+  its own ring — the host never waits per frame. Model on the ported filters:
+  stateless on gaussblur/bilateral/nnedi3, cached/temporal on bm3d/dfttest.
+- **`FramePool<T>` / `ticket_semaphore`** — the pre-R80 per-stream resource
+  pool, kept only for BM3D (the one filter that still records its own command
+  pools/buffers/fences). New filters should not need it: the exec pool sizes
+  its own ring.
+- **`gpu_submit(...)`** — the one raw-submit helper (BM3D's own command
+  buffers): takes the core's queue lock around the submit alone, as a leaf,
+  and allocates nothing inside it.
 - **`env_flag` / `env_int` / `env_str`** — env-gated debug flags; keep one env
   name per filter (`VSFEEL_DFTTEST_TRACE`, `BM3D_TRACE`, ...). Read per-filter
   *diagnostic* flags through **`vsfeel_debug_flag(name)`** (one-shot: creation
@@ -261,8 +255,8 @@ All filters share an inline (zero-overhead, C++20) plumbing layer in
   trace — turns the one-shot ones on, and `=2` adds the per-frame firehose and
   the probes, because a hang needs the kernel times as much as the trace.
   A level-2 run is instrumented, so never benchmark it. **A GPU-timing probe
-  must also be gated on `VK_Device::timestamp_valid_bits`** (via
-  `vsfeel_probe_timestamps`): `vkCmdWriteTimestamp` is invalid usage on a queue
+  must also be gated on `GPUDevice::timestamp_valid_bits`** (via
+  `vsfeel_probe_timestamps`): a `vkCmdWriteTimestamp2` is invalid usage on a queue
   family that reports 0, and a driver taking one anyway can hang the engine —
   a machine-wide freeze and bugcheck, not a lost device. Gate the *flag*, not
   just the query pool: a filter that writes timestamps off the flag alone would
@@ -271,39 +265,36 @@ All filters share an inline (zero-overhead, C++20) plumbing layer in
   lambda calls this first, so **one** switch (`VSFEEL_DEBUG=1`, or `VSFEEL_TRACE`
   alone: `=1`, `=2` for no line cap) names the filter, the output frame
   (`create` at filter creation) and the
-  order of every error, prints the device/driver banner, and on
-  `VK_ERROR_DEVICE_LOST` asks the driver for its own fault report
-  (`VK_EXT_device_fault`: description, faulting address and kind, vendor code,
-  vendor crash dump). The order is the point: a lost device makes every later
+  order of every error. (No `VK_EXT_device_fault` dump on this path: the core
+  creates its device with no extensions.) The order is the point: a lost
+  device makes every later
   call fail, so the `(first)` line is the only informative one. Add the call
   whenever a new error path is added — a filter that reports through
-  `vsapi->mapSetError` directly bypasses it. Pass `d->device.get()`, which is
+  `vsapi->mapSetError` directly bypasses it. Pass `d->gpu.get()`, which is
   null before device creation.
 - **`vsfeel_trace_frame_begin()` / `vsfeel_trace_mark(stage)`** — the trail the
   first error dumps: call `frame_begin` when the frame path starts and mark each
-  step *before* it runs (`pool`, `rec cb1`, `sub cb1`, `wait cb1`, ...), so the
+  step *before* it runs (`acquire`, `record`, `submit`, ...), so the
   last mark names the step that failed. Marks are inert unless tracing is on;
   thread_local, because the frame path is synchronous per worker thread.
 
 **ODR rule (learned the hard way):** a filter-local struct used to
 instantiate a shared template must have a **unique name per filter**
-(`DFTTestResource`, `GaussBlurResource`, `BilateralResource`, `NLStream`,
-`Bm3dStream` — never `VK_Resource`). Same mangled name + different
+(`Bm3dStream` — never `VK_Resource`). Same mangled name + different
 `sizeof` across TUs lets the linker COMDAT-fold one TU's instantiation over
 the others, mis-striding the pool's vector and corrupting in-flight
 resources.
 
 **What stays per-filter:** frame caches (temporal three: DFTTest slot cache,
 NLMeans tile cache, BM3D ring/result stacks), shaders + launch config, sync
-choreography (pad→copy→fused ordering, host vs device waits), queue/stream
-assignment, cache sizing. `num_queues = min(num_streams, queue_count)` is only
-the starting point — the cap is swept per filter (see the queue-sharing rule
-below), `resource.queue = device->queues[i % num_queues]`; in-flight depth is
-`num_streams` (DFTTest uses `max(num_streams, 2)` — queue count and buffer
-count are independent; see the knee rule below).
+choreography (pad→copy→fused ordering, device-side waits), cache sizing. The
+pre-R80 queue-cap / stream machinery (`num_queues`, `resource.queue`,
+in-flight `num_streams` pools, `VSFEEL_<FILTER>_QUEUES`) is gone with the
+port: the core owns the one compute queue and the exec pool sizes its own
+ring; BM3D keeps its own streams for its own submissions.
 
 When porting a new filter, model the stateless path on gaussblur/bilateral
-(fence-only, no cache) and the cached/timeline path on bm3d.
+or nnedi3 (no cache) and the cached/timeline path on bm3d.
 
 ## Porting discipline
 
@@ -501,17 +492,18 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   knee conclusions, across redesigns.
   Implementations tied at one depth can differ 2x at another (queue
   starvation vs GPU saturation).
-- **Sweep queue sharing independently of stream count.**
-  `min(num_streams, queue_count)` is only the starting point. With one
-  stream per queue, each queue drains while its worker does post-fence CPU
-  work (download memcpy + bookkeeping + next upload) before the next submit,
-  leaving idle bubbles; sharing a queue across streams keeps a next CB
-  queued. Sweep the cap (`min(num_streams, queue_count, CAP)` for
-  CAP = 1..queue_count, via a `VSFEEL_<FILTER>_QUEUES` env override kept as
-  a durable tuning knob) at the graded depth. Oversubscribing queues can win
-  double digits and collapse run-to-run variance — a variance drop alongside
-  the speedup confirms the bubble mechanism. Re-sweep after memory-path
-  changes, since removing copies changes bubble sizes.
+- **Sweep queue sharing independently of stream count (pre-R80, superseded).**
+  The old path let each filter cap how many of the device's compute queues its
+  streams spread over: with one stream per queue, each queue drained while its
+  worker did post-fence CPU work (download memcpy + bookkeeping + next upload)
+  before the next submit, leaving idle bubbles; sharing a queue across streams
+  kept a next CB queued, and oversubscribing won double digits while collapsing
+  run-to-run variance — a variance drop alongside the speedup confirmed the
+  bubble mechanism. No filter selects queues under the R80 API (the core owns
+  the one compute queue) and `VSFEEL_<FILTER>_QUEUES` no longer exists; the
+  mechanism survives as the reason the exec pool keeps several recordings in
+  flight, and the re-sweep-after-structure-changes rule still applies to
+  anything a filter does size itself (scratch, caches, batch depths).
 - **Sweep workgroup shape across workload configs, not just the default.**
   The best tile is a function of the algorithm's workload params (window
   radius, taps, halo overfetch), not a universal constant — a shape that
@@ -528,11 +520,10 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   If a fast path depends on a memory type existing (host-visible
   device-local for direct upload, and so on), probe once up front and store
   an immutable global bool — never mutate a shared flag per resource inside
-  the creation loop. `allocate_memory` relaxes requirements per buffer, so a
-  mid-loop flip desyncs already-recorded command buffers (copy vs no-copy)
-  from the frame-time upload/download base used by all resources. When the
-  fast path is unavailable, every resource must take the fallback
-  consistently.
+  the creation loop (a mid-loop flip desyncs already-recorded command buffers
+  from the frame-time upload/download base). Superseded in detail by the R80
+  port — the core's allocator picks memory types now — but the rule stands for
+  any probe a filter still keeps.
 - **Spec constants cannot size arrays in GLSL.** If an array dimension must
   vary, gate it with a compile-time `-D` define instead.
 - **Respect the compiler's register tradeoffs.** ACO raises VGPRs deliberately
