@@ -581,7 +581,16 @@ static void VS_CC GaussCreate(
     const int n_cfg = static_cast<int>(keys.size());
 
     // Code path per config: the fused small path only when its shared-memory
-    // tile fits the device.
+    // tile fits the device. The tile is `vblur[VRT*BLK_Y][BLK_X + 2*RAD]`, and
+    // the largest one the small path can ask for is 7 680 B (radius
+    // LARGE_THRESHOLD), under the 16 KiB of workgroup memory Vulkan guarantees --
+    // so the device limit cannot reject a small path, and the hardcoded 48 KiB
+    // cap that used to sit beside it never bound anything. The static_assert is
+    // what keeps that claim true: raise LARGE_THRESHOLD or the block and the
+    // build stops instead of silently falling back to the two-pass path.
+    static_assert(VRT * BLK_Y * (BLK_X + 2 * LARGE_THRESHOLD) *
+                  static_cast<int>(sizeof(float)) <= 16384,
+        "the fused small path must fit the guaranteed workgroup memory");
     std::array<bool, 3> cfg_small {};
     for (int ci = 0; ci < n_cfg; ++ci) {
         const int ksize = static_cast<int>(weights[ci].size());
@@ -589,7 +598,7 @@ static void VS_CC GaussCreate(
         const size_t tile_bytes =
             static_cast<size_t>(VRT) * BLK_Y * (BLK_X + 2 * radius) * sizeof(float);
         cfg_small[ci] = radius <= LARGE_THRESHOLD &&
-            tile_bytes <= std::min<size_t>(48 * 1024, d->gpu->limits.maxComputeSharedMemorySize);
+            tile_bytes <= d->gpu->limits.maxComputeSharedMemorySize;
     }
 
     // Push descriptor layout: one whole-buffer binding per shader buffer, so

@@ -68,6 +68,12 @@ medians:
   one memcpy + `_mm_sfence()` (may land in the write-combined VRAM BAR).
 - Scratch is ~7.9 MiB transient per in-flight frame at 1080p GRAY16 sigma=16;
   `gpu_frame_buffer` retires it with the submission.
+- The fused small path covers `radius <= 32` and declares
+  `vblur[VRT*BLK_Y][BLK_X + 2*RAD]` — 7 680 B at the widest radius, under the
+  16 KiB of workgroup memory Vulkan guarantees, so the device's own limit is the
+  only check that can reject it (`gaussblur.cpp` static_asserts that bound).
+  Wider kernels take the two-pass vertical + horizontal path, which declares no
+  shared memory.
 - int32 guards on the plane's last element and the scratch end (same 32-bit
   addressing bound as Bilateral).
 - 6 SPIR-V variants (gauss/vert/horiz × 2 depths) are unchanged; only the
@@ -89,6 +95,10 @@ medians:
   frames): vertical 118 µs, horizontal 177 µs, H2D 153 µs, D2H 152 µs.
 
 ## Historical
+
+- **The fused path's 48 KiB tile cap was dead.** The widest small-path tile is
+  7 680 B, so `min(48 KiB, device LDS)` was always decided by the device; the cap
+  is gone and the device limit is now the only check. No perf change.
 
 ### 2026-09-22 — R80 GPU API port
 

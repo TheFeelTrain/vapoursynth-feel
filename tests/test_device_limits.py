@@ -233,3 +233,48 @@ def test_nlmeans_ring_is_capped_by_the_vram_budget():
     # One pack is the floor (a run group has to fit), so a ring smaller than
     # that is not expressible; above it the ring never exceeds the budget.
     assert ring2 <= max(budget2, ring2 / pack2) + 1e-6
+
+
+# ---------------------------------------------------------------------------
+# GaussBlur: the fused path's tile vs the guaranteed workgroup memory
+# ---------------------------------------------------------------------------
+
+_GAUSS_SCRIPT = r'''
+import sys
+
+import vapoursynth as vs
+
+core = vs.core
+clip = core.std.BlankClip(width=640, height=360, format=vs.GRAYS, length=3)
+core.vsfeel.GaussBlur(clip, sigma=float(sys.argv[1]))
+'''
+
+
+def _gauss_lds(sigma, env=None):
+    """The `lds=` of every gaussblur pipeline that creation created.
+
+    The fused small path makes one pipeline carrying the tile; the two-pass path
+    makes two (vert + horiz) with no shared memory at all, so the numbers say
+    which path each config took.
+    """
+    run_env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1", **(env or {})}
+    proc = subprocess.run([sys.executable, "-c", _GAUSS_SCRIPT, str(sigma)],
+                          capture_output=True, text=True, timeout=600, env=run_env)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return [int(m) for m in re.findall(r"pipeline gaussblur .* lds=(\d+)", proc.stderr)]
+
+
+def test_gaussblur_small_path_fits_the_guaranteed_workgroup_memory():
+    """The fused path's largest tile is 7 680 B, under the 16 KiB floor.
+
+    That is why the 48 KiB cap that used to sit beside the device check could
+    never bind: the small path's tile is `VRT*BLK_Y*(BLK_X + 2*RAD)` floats and
+    `RAD` is capped by LARGE_THRESHOLD well below it. Pinned so a change to
+    either constant fails loudly (`gaussblur.cpp`'s static_assert catches it at
+    build time as well), and so the device's own limit stays the check that
+    decides which path a config takes.
+    """
+    floor = {"VSFEEL_LIMIT_SHARED_MEMORY": "16384"}   # the Vulkan minimum
+    lds = [v for sigma in (2.0, 5.0, 8.0, 11.0) for v in _gauss_lds(sigma, floor)]
+    assert 7680 in lds, lds            # the largest tile the small path asks for
+    assert max(lds) <= 16384, lds      # and it fits the floor
