@@ -115,6 +115,12 @@ Pre-R80 rounds below were measured on the deleted transfer path — their fps
 figures are void as current-filter numbers (same marker as
 `notes/BILATERAL.md`); mechanisms are kept.
 
+- **The coop kernels' subgroup requirements are checked, not assumed** — prescreen
+  and predict reduce across lanes with subgroup arithmetic and count lanes with
+  ballot, and only BASIC is mandatory in Vulkan. Both are required at creation
+  (ballot only when `use_list` builds a prescreen), and the 32-lane request is
+  resolved against the device instead of being passed through unconditionally.
+
 ### 2026-09-23 — R80 GPU API port
 
 - Ripped: ReBAR upload staging + `copy_stream_rows` pack, the kept-line host

@@ -450,11 +450,12 @@ static constexpr std::array<VkSpecializationMapEntry, 11> spec_entries = [] {
 static std::variant<VkPipeline, std::string> create_pipeline(
     const GPUDevice & gpu, const Nnedi3Spec & spec, const uint32_t * code,
     size_t code_size, VkPipelineLayout layout,
-    uint32_t required_subgroup_size = 0, bool full_subgroups = false) {
+    uint32_t required_subgroup_size = 0, uint32_t workgroup_invocations = 0,
+    bool full_subgroups = false) {
 
     return gpu_create_pipeline(gpu, code, code_size, layout, spec_entries.data(),
         &spec, static_cast<uint32_t>(spec_entries.size()), sizeof(spec), "nnedi3",
-        required_subgroup_size, full_subgroups);
+        required_subgroup_size, workgroup_invocations, full_subgroups);
 }
 
 // The indirect struct arrives through vkCmdFillBuffer, and prescreen's
@@ -1109,8 +1110,21 @@ static void VS_CC Nnedi3Create(
         keep_code = nnedi3_32_keep_spv; keep_size = nnedi3_32_keep_spv_size;
     }
 
-    // The cooperative predictor needs one 32-lane subgroup per 4 pixels.
-    if (!d->gpu->has_subgroup_size(32)) {
+    // The cooperative predictor needs one 32-lane subgroup per 4 pixels, and it
+    // counts active lanes with the subgroup arithmetic intrinsics -- which
+    // Vulkan does not mandate (only BASIC is). The prescreen ballots on top of
+    // that; the kept-row writer uses no subgroup op at all.
+    constexpr uint32_t kCoopInvocations = 128;   // local_size_x of both kernels
+    if (!d->gpu->has_subgroup_ops(VK_SUBGROUP_FEATURE_ARITHMETIC_BIT)) {
+        return set_error("device cannot run the NNEDI3 predictor kernel (it needs "
+                         "subgroup arithmetic operations).");
+    }
+    if (d->use_list && !d->gpu->has_subgroup_ops(VK_SUBGROUP_FEATURE_BALLOT_BIT)) {
+        return set_error("device cannot run the NNEDI3 prescreen kernel (it needs "
+                         "subgroup ballot operations).");
+    }
+    uint32_t pred_subgroup_size = 0;
+    if (!d->gpu->resolve_subgroup_size(32, kCoopInvocations, pred_subgroup_size)) {
         return set_error("device cannot run 32-lane subgroups "
                          "(required by the predictor kernel).");
     }
@@ -1210,7 +1224,8 @@ static void VS_CC Nnedi3Create(
             if (d->process[plane]) {
                 if (d->use_list) {
                     const auto result = create_pipeline(*d->gpu, spec, pre_code,
-                        pre_size, d->pipeline_layout, 32, /*full_subgroups=*/true);
+                        pre_size, d->pipeline_layout, pred_subgroup_size,
+                        kCoopInvocations, /*full_subgroups=*/true);
                     if (std::holds_alternative<std::string>(result)) {
                         return set_error(std::get<std::string>(result));
                     }
@@ -1225,7 +1240,8 @@ static void VS_CC Nnedi3Create(
                         mod_size = net_fs <= 64 ? pred_n4s_size : pred_n4_size;
                     }
                     const auto result = create_pipeline(*d->gpu, spec, mod, mod_size,
-                        d->pipeline_layout, 32, /*full_subgroups=*/true);
+                        d->pipeline_layout, pred_subgroup_size, kCoopInvocations,
+                        /*full_subgroups=*/true);
                     if (std::holds_alternative<std::string>(result)) {
                         return set_error(std::get<std::string>(result));
                     }

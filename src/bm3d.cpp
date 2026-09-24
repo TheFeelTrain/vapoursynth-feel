@@ -256,16 +256,19 @@ static std::variant<VkPipeline, std::string> create_bm3d_pipeline(
         { 12, 48, sizeof(int32_t) },
         { 13, 52, sizeof(int32_t) },
     }};
-    // The kernel's 8-lane shuffles need a pinned wave width; the core's device
-    // baseline guarantees subgroup size control, so 32 is always available.
-    // VSFEEL_BM3D_SUBGROUP=64 forces the wave64 path.
+    // The kernel's 8-lane shuffles keep each aligned 8-lane group inside one
+    // subgroup, and 32 is the measured-best width on the target GPU
+    // (VSFEEL_BM3D_SUBGROUP=64 forces the wave64 path). The request is checked
+    // against the device: subgroup size control is in the core's baseline, but
+    // the size itself is not, so a device that cannot provide it is told so
+    // here instead of at dispatch.
     const int forced_subgroup = env_int("VSFEEL_BM3D_SUBGROUP", 0);
     const uint32_t subgroup_size = forced_subgroup > 0
         ? static_cast<uint32_t>(forced_subgroup)
         : 32u;
     return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(), &spec,
         static_cast<uint32_t>(entries.size()), sizeof(spec), "bm3d",
-        subgroup_size);
+        subgroup_size, /*workgroup_invocations=*/32);
 }
 
 static std::variant<VkPipeline, std::string> create_agg_pipeline(
@@ -1270,10 +1273,11 @@ static void VS_CC BM3DCreate(
             d->cas_atomics ? "CAS loop (no buffer float32 add atomics available)"
                            : "hardware buffer float atomics");
     }
-    // The 8x8 group transposes and the group-8 reduction are subgroup shuffles.
-    // The spec only makes SUBGROUP_FEATURE_BASIC_BIT mandatory, so a device
-    // without SHUFFLE would either reject the module or mis-execute.
-    if (!d->gpu->subgroup_shuffle) {
+    // The 8x8 group transposes and the group-8 reduction are subgroup shuffles,
+    // and the kernel's per-lane layout puts each 8-lane group inside one
+    // subgroup, so a device without the shuffle intrinsics cannot run it. BASIC
+    // is the only operation Vulkan mandates, so this is a real check.
+    if (!d->gpu->has_subgroup_ops(VK_SUBGROUP_FEATURE_SHUFFLE_BIT)) {
         return set_error("subgroup shuffle is not supported by this device "
                          "(VK_SUBGROUP_FEATURE_SHUFFLE_BIT is required)");
     }

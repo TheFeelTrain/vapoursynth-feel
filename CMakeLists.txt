@@ -209,7 +209,8 @@ endforeach()
 # (0..3, i.e. tbsize 1/3/5/7) so its loops unroll and the working array
 # stays in registers (the reference does the same via `#define RADIUS`).
 # The fused kernel uses subgroup barriers instead of workgroup barriers
-# (each 16-lane block lives entirely in one wavefront), so SPIR-V 1.3+ is
+# (each 16-lane block lives entirely in one subgroup, which the host enforces by
+# requiring a subgroup size that is a multiple of 16), so SPIR-V 1.3+ is
 # required.
 set(VK_DFT_ENTRIES pad col2im)
 set(VK_DFT_ENTRY_DEFS -DENTRY_PAD -DENTRY_COL2IM)

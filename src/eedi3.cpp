@@ -1795,7 +1795,17 @@ static void vsfeel_eedi3_create(
     const int max_invoc = static_cast<int>(lim.maxComputeWorkGroupInvocations);
     const int max_x = static_cast<int>(lim.maxComputeWorkGroupSize[0]);
     const int lsz_vcheck = std::min({ 1024, max_invoc, max_x });
-    if (!d->gpu->has_subgroup_size(SGSIZE)) {
+    // The row kernel addresses gl_SubgroupInvocationID as a lane index (K
+    // columns per lane of a 32-lane row), so it needs exactly 32-lane
+    // subgroups, and its backtrack/interpolate stage moves data between lanes
+    // with shuffle and shuffle-relative, neither of which Vulkan mandates.
+    if (!d->gpu->has_subgroup_ops(VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
+                                  VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT)) {
+        return set_error("device cannot run the EEDI3 row kernel (it needs "
+                         "subgroup shuffle and shuffle-relative operations)");
+    }
+    uint32_t row_subgroup_size = 0;
+    if (!d->gpu->resolve_subgroup_size(SGSIZE, SGSIZE, row_subgroup_size)) {
         return set_error("device cannot run the EEDI3 row kernel (needs 32-lane "
                          "subgroups, natively or via subgroup size control)");
     }
@@ -2114,20 +2124,22 @@ static void vsfeel_eedi3_create(
         }
         Eedi3Pipelines p;
         auto add = [&](const uint32_t * code, size_t size, const char * tag,
-                       uint32_t subgroup, VkPipeline * dst) -> std::optional<std::string> {
+                       uint32_t subgroup, VkPipeline * dst,
+                       uint32_t invocations = 0) -> std::optional<std::string> {
             if (!code) {
                 return std::nullopt;
             }
             auto r = gpu_create_pipeline(*d->gpu, code, size, d->pipeline_layout,
                 row_entries.data(), &spec, static_cast<uint32_t>(row_entries.size()),
-                sizeof(spec), tag, subgroup);
+                sizeof(spec), tag, subgroup, invocations);
             if (std::holds_alternative<std::string>(r)) {
                 return std::get<std::string>(r);
             }
             *dst = std::get<VkPipeline>(r);
             return std::nullopt;
         };
-        if (auto e = add(d->row_code, d->row_size, "eedi3-row", SGSIZE, &p.row)) {
+        if (auto e = add(d->row_code, d->row_size, "eedi3-row", row_subgroup_size,
+                         &p.row, SGSIZE)) {
             return e;
         }
         p.vcheck_para = para_ok;

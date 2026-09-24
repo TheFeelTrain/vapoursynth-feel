@@ -212,11 +212,14 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     const GPUDevice & gpu, VkPipelineLayout layout,
     const uint32_t * code, size_t code_size, const NLMeansSpecData & spec) {
 
-    // explicit wave32, same knob the legacy build used (measured neutral here)
-    const uint32_t subgroup_size = gpu.has_subgroup_size(32) ? 32 : 0;
+    // Explicit wave32, same knob the legacy build used (measured neutral here).
+    // No kernel here uses a subgroup intrinsic, so this is a launch-shape
+    // choice, not a requirement: take the default when 32 is not on offer.
+    constexpr uint32_t kInvocations = 32 * 8;
+    const uint32_t subgroup_size = gpu.has_subgroup_size(32, kInvocations) ? 32 : 0;
     return gpu_create_pipeline(gpu, code, code_size, layout, spec_entries.data(),
         &spec, static_cast<uint32_t>(spec_entries.size()), sizeof(spec),
-        "nlmeans", subgroup_size);
+        "nlmeans", subgroup_size, kInvocations);
 }
 
 // Device address of a frame plane buffer, for the per-frame address table.

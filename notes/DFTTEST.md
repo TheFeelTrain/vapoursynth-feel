@@ -71,6 +71,11 @@ dfttest vsfeel`, interleaved pre-port/R80 pairs, `--repeat 2`:
   constants (the dead filter branches and their divisions vanish); wave32 is
   requested. `SUB_BLOCKS=8` (128-thread workgroups) and the 288-float
   bank-conflict-free transpose window (10 240 B LDS) are unchanged.
+- Each 16-lane tile exchanges `trans` across `subgroupBarrier()`, whose scope is
+  **one subgroup**, so the size in use has to be a multiple of 16 — wave32 is
+  requested when the device offers it, and when it does not, the driver's default
+  is accepted only if it is a multiple of 16. Otherwise creation fails with that
+  reason instead of running tiles that span two subgroups.
 - FFTW codelets, window/sigma table math, filter formulas and the reflect-pad
   rule are unchanged from the ported reference; only the buffers the data comes
   from and goes to changed.
@@ -143,6 +148,15 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 - **ODR COMDAT hazard** — filters that instantiate the shared `FramePool<T>`
   with a filter-local struct of the same name but different size silently
   corrupt the pool. No `FramePool` here any more; the rule lives in `AGENTS.md`.
+- **The subgroup size was assumed, not checked** — the fused kernel used to take
+  whatever default the device reported. Measured on lavapipe (the one device here
+  whose subgroups are 8 lanes wide, `VSFEEL_DFFTEST_SGSIZE=8` to reproduce the old
+  selection) it still matched gfx1100 to 3.7e-9 (one ulp), because a software
+  backend implements the subgroup-scoped barrier as a workgroup one; on hardware
+  with real 8-lane subgroups the same selection is a race, so the requirement is
+  now enforced at creation. `src/vsfeel.h` also gained the two checks the request
+  was missing: size control actually enabled, and subgroups per workgroup within
+  `maxComputeWorkgroupSubgroups`.
 - Dead ends that stay dead: `SUB_BLOCKS=16` (worse), the LDS-slice fused
   restructure (2x slower, LDS-bound), a host-side cache with mutex/cv
   ordered-submission waits (starves the worker pool).
@@ -168,5 +182,7 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 - `VSFEEL_DFFTEST_TRACE=1` — one line per submitted frame.
 - `VSFEEL_DFFTEST_VRAM=1` — per-in-flight-frame scratch banner.
 - `VSFEEL_DFFTEST_SGSIZE=N`, `VSFEEL_DFFTEST_SGSIZE_INVALID` — force (or
-  deliberately break) the requested subgroup size.
+  deliberately break) the requested subgroup size; both bypass the multiple-of-16
+  requirement above on purpose, and an unsupported size is still rejected when the
+  pipeline is created.
 - `RADV_DEBUG=asm`, `RADV_DEBUG=shaderstats` — ACO ISA and VGPR/LDS/occupancy.

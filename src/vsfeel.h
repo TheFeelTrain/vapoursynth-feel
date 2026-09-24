@@ -302,10 +302,17 @@ struct GPUDevice {
     uint32_t subgroup_size { 32 };
     uint32_t min_subgroup_size { 32 };
     uint32_t max_subgroup_size { 32 };
-    // Both are required by the core's device baseline (Vulkan 1.3 features) --
-    // there is nothing to check before using them.
-    bool subgroup_size_control { true };
-    bool subgroup_shuffle { true };
+    // How many subgroups one compute workgroup may split into when its
+    // pipeline requires a subgroup size.
+    uint32_t max_compute_workgroup_subgroups { 1 };
+    // The core's baseline requires both, but nothing in this plugin may assume
+    // it: requesting a subgroup size or full subgroups is invalid usage unless
+    // the feature is actually enabled, so they are queried and read.
+    bool subgroup_size_control { false };
+    bool compute_full_subgroups { false };
+    // VkSubgroupFeatureFlags: only COMPUTE/fragment BASIC is mandatory in
+    // Vulkan 1.1, so every other intrinsic a kernel uses has to be checked.
+    VkSubgroupFeatureFlags subgroup_ops {};
     // shaderBufferFloat32AtomicAdd specifically -- atomic exchange support
     // alone does not let a kernel use atomicAdd on a float buffer.
     bool feat_atomic_float32_add { false };
@@ -323,12 +330,43 @@ struct GPUDevice {
     // weak reference for exactly that reason.
     ~GPUDevice();
 
-    bool has_subgroup_size(uint32_t size) const {
-        if (subgroup_size == size) {
+    bool has_subgroup_ops(VkSubgroupFeatureFlags ops) const {
+        return (subgroup_ops & ops) == ops;
+    }
+
+    // Whether a pipeline for a workgroup of `workgroup_invocations` invocations
+    // may be created with requiredSubgroupSize = `size`. requiredSubgroupSize is
+    // a power of two inside [minSubgroupSize, maxSubgroupSize] and invalid usage
+    // otherwise, size control has to be enabled, and the workgroup must not
+    // split into more subgroups than maxComputeWorkgroupSubgroups allows.
+    bool has_subgroup_size(uint32_t size, uint32_t workgroup_invocations) const {
+        if (!subgroup_size_control || size == 0) {
+            return false;
+        }
+        if ((size & (size - 1)) != 0) {
+            return false;
+        }
+        if (size < min_subgroup_size || size > max_subgroup_size) {
+            return false;
+        }
+        const uint64_t groups =
+            (static_cast<uint64_t>(workgroup_invocations) + size - 1) / size;
+        return groups <= max_compute_workgroup_subgroups;
+    }
+
+    // Resolves a kernel's fixed subgroup-size requirement: `required` receives
+    // the value to pass as requiredSubgroupSize (0 leaves the driver's default,
+    // which is already the wanted size), and the result says whether the device
+    // can run the kernel at all. A kernel that addresses gl_SubgroupInvocationID
+    // as a lane index needs the size itself, not merely something in range.
+    bool resolve_subgroup_size(uint32_t size, uint32_t workgroup_invocations,
+                               uint32_t & required) const {
+        required = 0;
+        if (has_subgroup_size(size, workgroup_invocations)) {
+            required = size;
             return true;
         }
-        return subgroup_size_control && min_subgroup_size <= size &&
-            size <= max_subgroup_size;
+        return size == subgroup_size;
     }
 };
 
@@ -509,13 +547,15 @@ inline std::variant<VkPipelineLayout, std::string> gpu_pipeline_layout(
 // constants. maintenance5 is part of the core's baseline, so the module is
 // chained straight into pipeline creation and never exists as an object.
 // `entries` == nullptr means no specialization; `required_subgroup_size` 0
-// leaves the driver's default width alone. `tag` only names the pipeline in the
-// VSFEEL_DEBUG banner.
+// leaves the driver's default width alone, and any non-zero request is checked
+// against the device for the `workgroup_invocations` the kernel launches with.
+// `tag` only names the pipeline in the VSFEEL_DEBUG banner.
 inline std::variant<VkPipeline, std::string> gpu_create_pipeline(
     const GPUDevice & g, const uint32_t * code, size_t code_size,
     VkPipelineLayout layout, const VkSpecializationMapEntry * entries,
     const void * values, uint32_t entry_count, size_t values_size, const char * tag,
-    uint32_t required_subgroup_size = 0, bool full_subgroups = false) {
+    uint32_t required_subgroup_size = 0, uint32_t workgroup_invocations = 0,
+    bool full_subgroups = false) {
 
     if (entries == nullptr) {
         entry_count = 0;
@@ -523,13 +563,20 @@ inline std::variant<VkPipeline, std::string> gpu_create_pipeline(
         values_size = 0;
     }
     if (vsfeel_debug_enabled()) {
-        fprintf(stderr, "[vsfeel] pipeline %s subgroup=%u spec=%u\n",
-            tag, required_subgroup_size, entry_count);
+        fprintf(stderr, "[vsfeel] pipeline %s subgroup=%u local=%u spec=%u\n",
+            tag, required_subgroup_size, workgroup_invocations, entry_count);
     }
-    if (required_subgroup_size != 0 && !g.has_subgroup_size(required_subgroup_size)) {
+    if (required_subgroup_size != 0 &&
+        !g.has_subgroup_size(required_subgroup_size, workgroup_invocations)) {
         return std::string(tag) + " requests subgroup size " +
-            std::to_string(required_subgroup_size) +
-            ", which this device cannot provide";
+            std::to_string(required_subgroup_size) + " for a workgroup of " +
+            std::to_string(workgroup_invocations) +
+            " invocations, which is not a subgroup size this device supports";
+    }
+    // REQUIRE_FULL_SUBGROUPS is only valid with the computeFullSubgroups feature.
+    if (full_subgroups && !g.compute_full_subgroups) {
+        return std::string(tag) +
+            " needs full subgroups, which this device does not support";
     }
 
     VkShaderModuleCreateInfo module_info {};

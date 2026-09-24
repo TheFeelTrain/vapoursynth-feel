@@ -521,6 +521,18 @@ struct DftData {
 // Pipeline creation
 // ---------------------------------------------------------------------------
 
+// The fused kernel's shared memory is one tile per 16 invocations, exchanged
+// across subgroupBarrier() -- a barrier whose scope is one subgroup -- so every
+// aligned 16-lane tile has to live inside a single subgroup. That holds when the
+// subgroup size in use is a multiple of 16, and only then; 32 is what the target
+// GPU is tuned for. The pad/col2im kernels do not use subgroups but are given
+// the same required size, so the count the device limits, subgroups per
+// workgroup, is read off the largest of the three launches.
+constexpr uint32_t kFusedInvocations = 8 * 16;      // local_size_x = SUB_BLOCKS * 16
+constexpr uint32_t kPadInvocations = 32 * 8;        // local_size_x * local_size_y
+constexpr uint32_t kMaxInvocations =
+    kPadInvocations > kFusedInvocations ? kPadInvocations : kFusedInvocations;
+
 // The fused kernel's variant is baked in as specialization constants so the
 // dead filter branches (and their divisions) vanish, matching the reference's
 // compile-time `#if FILTER_TYPE` selection. The env overrides exist so a probe
@@ -528,14 +540,32 @@ struct DftData {
 // watch the driver reject it).
 static std::variant<VkPipeline, std::string> create_pipeline(
     const GPUDevice & gpu, VkPipelineLayout layout, const uint32_t * code,
-    size_t code_size, int32_t filter_type = -1, int32_t zmean = -1) {
+    size_t code_size, uint32_t invocations, int32_t filter_type = -1,
+    int32_t zmean = -1) {
 
-    uint32_t subgroup_size = gpu.has_subgroup_size(32) ? 32 : 0;
-    if (const int sw = env_int("VSFEEL_DFTTEST_SGSIZE", 0); sw > 0) {
-        subgroup_size = static_cast<uint32_t>(sw);
-    }
-    if (env_flag("VSFEEL_DFTTEST_SGSIZE_INVALID")) {
+    // The probe knobs win over the default selection below on purpose: they
+    // exist so a run can force a subgroup size, or deliberately request one the
+    // device does not offer and watch it be rejected.
+    const int forced_sgsize = env_int("VSFEEL_DFFTEST_SGSIZE", 0);
+    const bool forced_invalid = env_flag("VSFEEL_DFFTEST_SGSIZE_INVALID");
+
+    // Ask for 32 when the device can be asked at all; otherwise keep the
+    // driver's default only if it is itself a multiple of 16. Taking any
+    // default, as this did before, ran the fused kernel on a device whose
+    // subgroups are 8 lanes wide with every 16-lane tile split across two
+    // subgroups: a silent race the subgroup barrier cannot order.
+    uint32_t subgroup_size = 0;
+    if (forced_invalid) {
         subgroup_size = 17;   // invalid on purpose, to test driver validation
+    } else if (forced_sgsize > 0) {
+        subgroup_size = static_cast<uint32_t>(forced_sgsize);
+    } else if (gpu.has_subgroup_size(32, kMaxInvocations)) {
+        subgroup_size = 32;
+    } else if (gpu.subgroup_size % 16 != 0) {
+        return std::string("dfttest's fused kernel needs a subgroup size that is "
+            "a multiple of 16 lanes (16-lane tiles share data across a subgroup "
+            "barrier); this device's default is ") +
+            std::to_string(gpu.subgroup_size) + ", and it cannot be asked for another";
     }
 
     // Build the spec-constant map from an explicit (id, value) list so the
@@ -560,7 +590,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
 
     return gpu_create_pipeline(gpu, code, code_size, layout,
         n_spec ? spec_entries : nullptr, n_spec ? spec_values : nullptr,
-        n_spec, n_spec * sizeof(int32_t), "dfttest", subgroup_size);
+        n_spec, n_spec * sizeof(int32_t), "dfttest", subgroup_size, invocations);
 }
 
 static bool dfttest_trace() {
@@ -1389,7 +1419,7 @@ static void VS_CC DftCreate(
 
         {
             const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                pad_code, pad_size);
+                pad_code, pad_size, kPadInvocations);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -1397,7 +1427,8 @@ static void VS_CC DftCreate(
         }
         for (int r = 0; r < 4; ++r) {
             const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                fused_code[r], fused_size[r], d->filter_type, d->zmean ? 1 : 0);
+                fused_code[r], fused_size[r], kFusedInvocations,
+                d->filter_type, d->zmean ? 1 : 0);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -1405,7 +1436,7 @@ static void VS_CC DftCreate(
         }
         {
             const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                col2im_code, col2im_size);
+                col2im_code, col2im_size, kPadInvocations);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }

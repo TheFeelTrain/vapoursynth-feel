@@ -175,6 +175,13 @@ Rounds in order. Perf totals from rounds 2–13 are **void** (zero-mask path, be
 the correctness fixes, accuracy proofs and mechanisms in those rounds survive and
 are kept. Superseded detail is deleted, not archived.
 
+- **The row kernel's subgroup requirements are checked, not assumed** — it
+  addresses `gl_SubgroupInvocationID` as a lane index (so it needs exactly 32-lane
+  subgroups, requested when the device offers them) and moves data between lanes
+  with shuffle and shuffle-relative. Only BASIC is mandatory in Vulkan, so both
+  operations are now required at creation; a device without them gets a clear
+  error instead of a pipeline the driver may mis-execute.
+
 ### Pre-round-14 — the benchmark's mask was broken
 
 The harness passed an already-scaled threshold to `Morpho.binarize_mask`, which

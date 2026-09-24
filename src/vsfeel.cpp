@@ -337,8 +337,8 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     dev->subgroup_size = subgroup.subgroupSize;
     dev->min_subgroup_size = size_control.minSubgroupSize;
     dev->max_subgroup_size = size_control.maxSubgroupSize;
-    dev->subgroup_shuffle =
-        (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT) != 0;
+    dev->max_compute_workgroup_subgroups = size_control.maxComputeWorkgroupSubgroups;
+    dev->subgroup_ops = subgroup.supportedOperations;
 
     uint32_t families = 0;
     vk->vkGetPhysicalDeviceQueueFamilyProperties2(handles.physicalDevice, &families, nullptr);
@@ -382,6 +382,12 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features.pNext = &f12;
     vk->vkGetPhysicalDeviceFeatures2(handles.physicalDevice, &features);
+    // The subgroup size-control features are read out of the same 1.3 chain;
+    // the core's baseline requires them, but a pipeline may only request a
+    // subgroup size or full subgroups while the bit is actually set.
+    dev->subgroup_size_control = f13.subgroupSizeControl == VK_TRUE;
+    dev->compute_full_subgroups = f13.computeFullSubgroups == VK_TRUE;
+
     // The aggregation kernel calls atomicAdd on a float storage buffer, which
     // is shaderBufferFloat32AtomicAdd alone: shaderBufferFloat32Atomics (load,
     // store, exchange) is a separate feature and a device may report it
@@ -404,10 +410,14 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
             VK_API_VERSION_MAJOR(dev->api_version), VK_API_VERSION_MINOR(dev->api_version),
             VK_API_VERSION_MAJOR(p.driverVersion), VK_API_VERSION_MINOR(p.driverVersion),
             VK_API_VERSION_PATCH(p.driverVersion));
-        fprintf(stderr, "[vsfeel] queue family %u (timestamps=%u), subgroup %u [%u..%u], "
+        fprintf(stderr, "[vsfeel] queue family %u (timestamps=%u), subgroup %u [%u..%u] "
+                        "ops=0x%x maxWorkgroupSubgroups=%u (control=%d full=%d), "
                         "maxStorageBufferRange=%llu\n",
             dev->queue_family, dev->timestamp_valid_bits, dev->subgroup_size,
             dev->min_subgroup_size, dev->max_subgroup_size,
+            static_cast<unsigned>(dev->subgroup_ops),
+            dev->max_compute_workgroup_subgroups, dev->subgroup_size_control,
+            dev->compute_full_subgroups,
             static_cast<unsigned long long>(dev->limits.maxStorageBufferRange));
         fprintf(stderr, "[vsfeel] transfer queue family %u index %u\n",
             handles.transferQueueFamily, handles.transferQueueIndex);

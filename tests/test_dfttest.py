@@ -424,6 +424,20 @@ def test_dfttest_rejects_8bit(noise_8bit):
         vs.core.vsfeel.DFTTest(noise_8bit)
 
 
+def test_dfttest_rejects_unsupported_subgroup_size(noise_gray, monkeypatch):
+    """A subgroup size the device cannot provide must fail at creation.
+
+    The fused kernel's 16-lane tiles exchange shared memory across a subgroup
+    barrier, so the size in use has to be a multiple of 16; the knob forces 17,
+    which no device offers (requiredSubgroupSize has to be a power of two inside
+    the range the device reports). Creation, not the first frame, has to fail:
+    a pipeline built on an unsupported size is invalid usage from the start.
+    """
+    monkeypatch.setenv("VSFEEL_DFFTEST_SGSIZE_INVALID", "1")
+    with pytest.raises(vs.Error):
+        vs.core.vsfeel.DFTTest(noise_gray)
+
+
 # ---------------------------------------------------------------------------
 # Formats and plane handling
 # ---------------------------------------------------------------------------
