@@ -101,7 +101,7 @@ struct BM3DData {
     bool chroma;
     bool final {};                   // true when a "ref" clip is given
     float extractor;
-    bool cas_atomics {};             // aggregate with the CAS kernel (no float atomics)
+    bool cas_atomics {};             // aggregate with the CAS kernel (no float32 add atomics)
 
     std::shared_ptr<GPUDevice> gpu;
     // Only the destructor needs it, and the destructor has no VSAPI argument.
@@ -1256,16 +1256,18 @@ static void VS_CC BM3DCreate(
     // (a machine-wide freeze, not just a lost device): keep it off there.
     d->gpu_trace = d->gpu_trace && vsfeel_probe_timestamps(*d->gpu, "BM3D");
 
-    // The BM3D kernels accumulate into float SSBOs. Hardware buffer float
-    // atomics need VK_EXT_shader_atomic_float, which no pre-RDNA3 AMD driver
-    // reports (RADV: GFX11+; the Windows driver does not expose it on Polaris
-    // either); on anything older the accumulation falls back to the CAS loop
-    // the OpenCL reference itself uses (atom_add_f), so the filter runs
-    // everywhere instead of failing at creation.
+    // The BM3D kernels accumulate into float SSBOs with atomicAdd, which needs
+    // shaderBufferFloat32AtomicAdd: VK_EXT_shader_atomic_float reports the
+    // load/store/exchange atomics separately, so that bit alone must not select
+    // this path. No pre-RDNA3 AMD driver reports the add at all (RADV: GFX11+;
+    // the Windows driver does not expose it on Polaris either); on anything
+    // older the accumulation falls back to the CAS loop the OpenCL reference
+    // itself uses (atom_add_f), so the filter runs everywhere instead of
+    // failing at creation.
     d->cas_atomics = env_flag("VSFEEL_BM3D_CAS") || !d->gpu->feat_atomic_float32_add;
     if (vsfeel_device_info_enabled()) {
         fprintf(stderr, "[bm3d] aggregation: %s\n",
-            d->cas_atomics ? "CAS loop (no buffer float atomics available)"
+            d->cas_atomics ? "CAS loop (no buffer float32 add atomics available)"
                            : "hardware buffer float atomics");
     }
     // The 8x8 group transposes and the group-8 reduction are subgroup shuffles.

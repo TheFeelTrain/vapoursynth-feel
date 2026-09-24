@@ -352,8 +352,8 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
             family_props[handles.computeQueueFamily].queueFamilyProperties.timestampValidBits;
     }
 
-    // The atomic-float feature is the one a filter's aggregation kernels ask
-    // about; it rides the 1.2/1.3 feature chain the query below populates.
+    // The atomic-float features the aggregation kernels ask about; they ride
+    // the 1.2/1.3 feature chain the query below populates.
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float {};
     atomic_float.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
     VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT atomic_float2 {};
@@ -382,8 +382,14 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features.pNext = &f12;
     vk->vkGetPhysicalDeviceFeatures2(handles.physicalDevice, &features);
-    dev->feat_atomic_float32_add = has_atomic_float &&
-        (atomic_float.shaderBufferFloat32Atomics || atomic_float.shaderBufferFloat32AtomicAdd);
+    // The aggregation kernel calls atomicAdd on a float storage buffer, which
+    // is shaderBufferFloat32AtomicAdd alone: shaderBufferFloat32Atomics (load,
+    // store, exchange) is a separate feature and a device may report it
+    // without the add. The core enables the atomic-float extension pair only
+    // when the device offers both, with the bits it reports, so the extension
+    // pair presence plus that bit is what the created device actually has.
+    dev->feat_atomic_float32_add = has_atomic_float2 &&
+        atomic_float.shaderBufferFloat32AtomicAdd;
 
     load_gpu_pipeline_cache(*dev, props.properties);
 
@@ -405,7 +411,7 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
             static_cast<unsigned long long>(dev->limits.maxStorageBufferRange));
         fprintf(stderr, "[vsfeel] transfer queue family %u index %u\n",
             handles.transferQueueFamily, handles.transferQueueIndex);
-        fprintf(stderr, "[vsfeel] optional features: float32Atomics=%d\n",
+        fprintf(stderr, "[vsfeel] optional features: float32AtomicAdd=%d\n",
             dev->feat_atomic_float32_add);
     }
 

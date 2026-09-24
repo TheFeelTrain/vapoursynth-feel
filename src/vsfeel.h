@@ -306,6 +306,8 @@ struct GPUDevice {
     // there is nothing to check before using them.
     bool subgroup_size_control { true };
     bool subgroup_shuffle { true };
+    // shaderBufferFloat32AtomicAdd specifically -- atomic exchange support
+    // alone does not let a kernel use atomicAdd on a float buffer.
     bool feat_atomic_float32_add { false };
 
     // Persistent pipeline cache, shared by every instance on this device: the

@@ -104,6 +104,25 @@ def test_bm3dv2_deterministic(noise_gray):
 
 
 
+def test_bm3dv2_cas_fallback_matches_hardware_atomics(noise_gray, monkeypatch):
+    """The CAS arm a device without float32 add atomics gets must match.
+
+    `VSFEEL_BM3D_CAS=1` forces the `-DNO_FLOAT_ATOMICS` kernel the host selects
+    when the device has no `shaderBufferFloat32AtomicAdd`; the two arms add in
+    a different order, so this is also what bounds that order's effect.
+    """
+    monkeypatch.delenv("VSFEEL_BM3D_CAS", raising=False)
+    hardware = _run(noise_gray, radius=2)
+    monkeypatch.setenv("VSFEEL_BM3D_CAS", "1")
+    cas = _run(noise_gray, radius=2)
+    for n in (0, 11, 23):
+        a = frame_to_ndarray(hardware.get_frame(n))
+        b = frame_to_ndarray(cas.get_frame(n))
+        assert np.isfinite(b).all(), f"non-finite CAS output at frame {n}"
+        # measured 2.98e-8 (add-order rounding) on the noise clip
+        assert np.abs(a - b).max() < 1e-5, f"CAS vs hardware atomics at frame {n}"
+
+
 def test_bm3dv2_nosearch_matches_search_on_constant_clip(monkeypatch):
     """The no-search arm must initialise the shared match tables, or the
     aggregation indexes stale LDS.

@@ -10,7 +10,9 @@ Current design:
   one warp of 32 lanes = 4 sub-groups of 8 lanes, one 8x8 block each) and
   `bm3d_agg.comp` (temporal aggregation over the TW = 2r+1 stack slices).
 - Estimation accumulates with hardware buffer float atomics where the device
-  has them (`VK_EXT_shader_atomic_float`; RADV gates it at GFX11). Everywhere
+  has them (`VK_EXT_shader_atomic_float` + its float2 companion, and
+  `shaderBufferFloat32AtomicAdd` set — the plain `...Atomics` load/store/exchange
+  bit is a separate feature and not enough; RADV gates both at GFX11). Everywhere
   else the same kernel's `-DNO_FLOAT_ATOMICS` build runs the reference's own
   `atom_add_f` CAS loop; the host picks per device, `VSFEEL_BM3D_CAS=1` forces
   it (see Historical for the cost).
