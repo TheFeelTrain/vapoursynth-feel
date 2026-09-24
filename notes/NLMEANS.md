@@ -173,7 +173,9 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   LDS-resident union tiles): neutral; the warm weight kernel is ALU/LDS/barrier
   bound, not load bound.
 - **Round packing >1** (bigger W/A rings): pack=2 tied, 4/8 lost; rings >33 MB
-  stream u4a through DRAM.
+  stream u4a through DRAM. The 64 MiB target is capped by the core's VRAM limit,
+  so a device with a smaller allowance packs fewer entries per round instead of
+  planning the optimum anyway.
 - **`a=64, d=16` hard-recovers the GPU when the device is shared** — a
   co-scheduled weight sweep is the trigger, not an OOB or a timeout. Do not run
   it beside another GPU client; `-n 8 --dist loadfile` keeps it serial per file.
@@ -185,6 +187,6 @@ Flags are `VSFEEL_NLMEANS_<FLAG>`.
 - `VSFEEL_NLMEANS_TIMING=1` — per-frame host stage split (acquire/record/submit).
 - `VSFEEL_NLMEANS_GPUTRACE=1[,frame]` — one-shot per-batch GPU timestamps.
 - `VSFEEL_NLMEANS_PACK=N` — entries per W/A round (clamped 1..16384; default
-  from the 64 MiB ring budget).
+  from the 64 MiB ring budget, itself capped by the core's VRAM limit).
 - `VSFEEL_NLMEANS_VRAM=1` — creation banner with ring/window/per-frame bytes.
 - `VSFEEL_DEBUG`/`VSFEEL_TRACE` and `RADV_DEBUG=asm|shaderstats` as elsewhere.

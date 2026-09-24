@@ -134,9 +134,9 @@ figures are void as current-filter numbers (same marker as
   128-invocation device gets "needs a 32x8x1 workgroup (256 invocations)" per
   kernel rather than a `vkCreateComputePipelines` failure; `tools/shader_limits.py`
   prints the per-variant numbers those checks are built from, and
-  `VSFEEL_LIMIT_SHARED_MEMORY` / `VSFEEL_LIMIT_INVOCATIONS` clamp the reported
-  limits down so the paths are testable on a GPU that fits everything
-  (`tests/test_device_limits.py`).
+  `VSFEEL_LIMIT_SHARED_MEMORY` / `VSFEEL_LIMIT_INVOCATIONS` /
+  `VSFEEL_LIMIT_VRAM_BUDGET` clamp the reported limits down so the paths are
+  testable on a GPU that fits everything (`tests/test_device_limits.py`).
 
 ### 2026-09-23 — R80 GPU API port
 

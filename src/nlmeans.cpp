@@ -126,6 +126,7 @@ struct NLMeansData {
     int guide_off {};          // window tile offset of the guide half
     int qb {};
     uint32_t pack {1};         // sweep rounds: entries per weight+acc round
+    int64_t ring_budget {64LL << 20};  // u4a ring target, capped by the core
     int slots {};              // u4a ring slots = ring_base * pack
 
     // create()-time q-sweep tables (stride-8 rows), shared by all recordings
@@ -847,12 +848,21 @@ static void VS_CC NLMeansCreate(
     // plane-ring budget allows: the kernels' arithmetic is cheap next to the
     // fixed per-dispatch/barrier drain. Keep the ring cache-friendly (~64 MiB):
     // measured optimum on the target GPU, larger rings stream weights through
-    // DRAM between the weight and accumulation launches.
+    // DRAM between the weight and accumulation launches. That optimum is capped
+    // by the core's budget -- the target GPU has room for the whole 64 MiB, a
+    // device with a smaller allowance packs fewer entries per round. One pack is
+    // the floor: the run groups have to fit, so a ring smaller than that is not
+    // expressible and the core's allocator is what rejects it.
     {
         const int64_t ring_base_slots = (dd == 0) ? d->qb : 2 * static_cast<int64_t>(d->qb);
         const int64_t bytes_per_pack = ring_base_slots * d->npix * sizeof(uint16_t);
-        constexpr int64_t U4A_RING_BUDGET = 64LL << 20;
-        int64_t pack = U4A_RING_BUDGET / std::max<int64_t>(bytes_per_pack, 1);
+        int64_t ring_budget = 64LL << 20;
+        if (const VkDeviceSize budget = vsfeel_vram_limit(*d->gpu, core); budget > 0) {
+            ring_budget = std::min<int64_t>(ring_budget,
+                static_cast<int64_t>(budget / 16));
+        }
+        d->ring_budget = ring_budget;
+        int64_t pack = ring_budget / std::max<int64_t>(bytes_per_pack, 1);
         pack = std::clamp<int64_t>(pack, 1, 16384);
         const int pack_env = env_int("VSFEEL_NLMEANS_PACK", 0);
         if (pack_env > 0) {
@@ -1095,9 +1105,10 @@ static void VS_CC NLMeansCreate(
         const double per_frame = ring_mib + window_mib +
             static_cast<double>(d->npix) * (d->channels + 2) *
                 sizeof(float) / mib;
-        fprintf(stderr, "[nlmeans] %.1f MiB per in-flight frame (ring %.1f MiB, "
-                        "%d slots, pack %u; window %.1f MiB, %dx%d tiles)\n",
-            per_frame, ring_mib, d->slots, d->pack, window_mib, d->pstride, d->ph);
+        fprintf(stderr, "[nlmeans] %.1f MiB per in-flight frame (ring %.1f MiB of "
+                        "%.1f MiB, %d slots, pack %u; window %.1f MiB, %dx%d tiles)\n",
+            per_frame, ring_mib, static_cast<double>(d->ring_budget) / mib,
+            d->slots, d->pack, window_mib, d->pstride, d->ph);
     }
 
     NLMeansData * data = d.release();

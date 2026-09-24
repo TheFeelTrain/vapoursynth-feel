@@ -388,6 +388,31 @@ inline bool vsfeel_probe_timestamps(const GPUDevice & dev, const char * tag) {
     return false;
 }
 
+// The core's VRAM eviction limit for this process (VSVulkanCoreInfo::limit), or
+// 0 when it reports none. Every tuned allocation target in the plugin is capped
+// by this: the optimums behind them were measured on a 24 GiB card, so a device
+// (or a setMaxVRAMUse) with a smaller allowance must not have them planned
+// anyway. VSFEEL_LIMIT_VRAM_BUDGET lowers it further, so a small device's path
+// can be exercised on a large GPU.
+inline VkDeviceSize vsfeel_vram_limit(const GPUDevice & dev, VSCore * core) {
+    VSVulkanCoreInfo info {};
+    char err[256] {};
+    const bool known = dev.api->getVulkanCoreInfo(core, &info, err, sizeof(err)) == 0 &&
+        info.limit > 0;
+    VkDeviceSize limit = known ? static_cast<VkDeviceSize>(info.limit) : 0;
+    // Parsed by hand rather than through env_int: this is a byte count, and any
+    // interesting allowance overflows an int.
+    if (const char * v = env_str("VSFEEL_LIMIT_VRAM_BUDGET")) {
+        char * end = nullptr;
+        const long long parsed = std::strtoll(v, &end, 10);
+        if (end != v && parsed > 0) {
+            limit = known ? std::min(limit, static_cast<VkDeviceSize>(parsed))
+                          : static_cast<VkDeviceSize>(parsed);
+        }
+    }
+    return limit;
+}
+
 // A buffer from the core's pool. `handle` owns it; the rest is what a kernel or
 // the host needs to use it.
 struct GpuBuffer {

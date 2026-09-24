@@ -2074,24 +2074,29 @@ static void vsfeel_eedi3_create(
     // the frame. At 1080p, where one frame is 4x cheaper, B=8 wins (1273 vs
     // 892 fps). That is what the byte target below encodes: ~512 MiB of
     // scratch per submission lands on 4 at 2x2160p and 8 at 1080p, and never
-    // below two frames so a submission can overlap at all.
+    // below two frames while the device's budget can host two.
     // VSFEEL_EEDI3_BATCH overrides.
     {
-        VSVulkanCoreInfo info {};
-        char verr[256] {};
         // EEDI3AA's four sub-passes make a frame ~4x heavier, so it drains a
         // batch slower and its knee is 4 where the single-stage filters' is 2
         // (swept on the graded workload: EEDI3 2->406/4->389, EEDI3AA 2->142
         // /4->157 fps at 2x2160p).
-        VkDeviceSize target = VkDeviceSize(d->aa ? 512 : 256) << 20;
-        if (d->gpu->api->getVulkanCoreInfo(core, &info, verr, sizeof(verr)) == 0 &&
-            info.limit > 0) {
-            target = std::min(target,
-                              static_cast<VkDeviceSize>(info.limit) / 16);
-        }
-        target = std::max(target, VkDeviceSize(256) << 20);
-        const int auto_batch = static_cast<int>(std::clamp<VkDeviceSize>(
+        //
+        // The target above is the measured value, capped by the core's budget.
+        // The floor that used to follow -- max(target, 256 MiB) -- undid that
+        // cap, so a device whose whole allowance was under 4 GiB planned the
+        // tuned 256 MiB of scratch regardless. Two frames are what a submission
+        // needs to overlap at all; when the budget cannot host two, the batch
+        // drops to one instead of the budget giving way.
+        const VkDeviceSize budget = vsfeel_vram_limit(*d->gpu, core);
+        const VkDeviceSize cap = budget > 0 ? budget / 16 : ~VkDeviceSize(0);
+        const VkDeviceSize target =
+            std::min(VkDeviceSize(d->aa ? 512 : 256) << 20, cap);
+        int auto_batch = static_cast<int>(std::clamp<VkDeviceSize>(
             target / std::max<VkDeviceSize>(d->scratch_bytes, 1), 2, 8));
+        if (VkDeviceSize(auto_batch) * d->scratch_bytes > cap) {
+            auto_batch = 1;
+        }
         d->batch_size = std::clamp(env_int("VSFEEL_EEDI3_BATCH", auto_batch), 1, 8);
     }
 

@@ -541,6 +541,8 @@ dispatch, not creation).
 `VSFEEL_EEDI3_GBENCH=1` stage marks (`s0..s4` = pass start/xpose/pad/row/vcheck): row
 kernel **s2 = 3.485 of 3.86 ms** at 1080p ns=1 — ~90% of the GPU frame.
 
+- **Tuned targets yield to the budget** — the batch target and NLMeans' u4a ring
+  are measured optimums, now capped by the core's VRAM limit; no perf change here.
 - **SGSIZE 64 / K=1: +2% on EEDI3AA, neutral on EEDI3, not shipped.** EEDI3 585.9 →
   580.7 (ns=8, 2000 f, 4 pairs); EEDI3AA 142.1 → 145.8 and 142.8 → 145.6 (two runs,
   4 pairs each), the 64-lane arm winning 7 of 8. Not shipped: ~2% on one workload is
@@ -562,16 +564,12 @@ kernel **s2 = 3.485 of 3.86 ms** at 1080p ns=1 — ~90% of the GPU frame.
 
 - **Row kernel register pressure**: `RING_CAP` is not it. Trimming the fixed
   bound to `2*NRAD+1` leaves the compiled row kernel **byte-identical** at
-  nrad=1/2/3 (same code size and instruction count, VGPR 96/96/120, 16/16/12
-  subgroups/SIMD, no spills): the `if (k >= RN) break` guard is dead once the
-  driver specializes `NRAD`, so the unused ring slots were never allocated, and
-  the ring is register state, not LDS (LDS is 1 024 B). At nrad=1/2 occupancy is
-  already at the 16-subgroup cap; at nrad=3 `RING_CAP == RN` exactly. (Spec
-  constants *can* size arrays here — `notes/NLMEANS.md` ships it — so the
-  earlier "no `-D` escape" reasoning was wrong about the mechanism but right
-  about the answer.) The remaining lever is the `K=2` direction state. ACO
-  raises VGPRs deliberately for load ILP, so a lower count with new spills or
-  schedule damage is a regression.
+  nrad=1/2/3 (VGPR 96/96/120, 16/16/12 subgroups/SIMD, no spills): the
+  `if (k >= RN) break` guard is dead once the driver specializes `NRAD`, and the
+  ring is register state, not LDS (1 024 B). At nrad=3 `RING_CAP == RN` exactly,
+  so the remaining lever is the `K=2` direction state. (Spec constants *can* size
+  arrays here — `notes/NLMEANS.md` ships it.) ACO raises VGPRs deliberately for
+  load ILP, so a lower count with new spills or schedule damage is a regression.
 - **Split the walk into its own dispatch, one lane per ROW.** Today one lane of a
   32-lane workgroup runs the walk while the kernel is issue-bound, so this is a
   *lane-utilisation* change, not a chain fix (round 20/29). Ceiling 11.9% of the
@@ -696,8 +694,9 @@ the reason a variant failed, not as a current number.
 - `VSFEEL_EEDI3_VCLDS` — `=1` forces the LDS vcheck ping-pong back (global is default).
 - `VSFEEL_EEDI3_VPARA` — vcheck form: 0 = serial row walk (A/B control), 1..6 =
   parallel with that many Jacobi steps. Default 6 (bit-exact on the test surface).
-- `VSFEEL_EEDI3_BATCH` — output frames recorded per submission (default: sized to
-  ~1 GiB of scratch, clamped 2..8; 4 at 2x2160p). `=1` is the unbatched A/B control.
+- `VSFEEL_EEDI3_BATCH` — output frames recorded per submission (default: the
+  measured target capped by the core's VRAM limit, ~1 GiB of scratch clamped 2..8,
+  4 at 2x2160p; 1 when the budget cannot hold two frames). `=1` is the A/B control.
 - `VSFEEL_EEDI3_TRACE` — one-shot banner: VRAM accounting, per-plane region layout,
   spec constants per geometry.
 - `VSFEEL_EEDI3_TIMING` — per-frame host stage split (acquire/alloc/record/submit).
