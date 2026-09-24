@@ -52,6 +52,12 @@ def build(name, params):
         return core.vsfeel.NNEDI3(clip, field=1, **params)
     if name == "eedi3":
         return core.vsfeel.EEDI3(clip, field=1, **params)
+    if name == "eedi3h":
+        return core.vsfeel.EEDI3H(clip, field=1, **params)
+    if name == "eedi3aa":
+        # AA runs a vertical and a transposed horizontal pass; both have their own
+        # plane geometry and therefore their own folded grids.
+        return core.vsfeel.EEDI3AA(clip, field=2, **params)
     if name == "bm3d":
         return core.vsfeel.BM3Dv2(clip, **params)
     if name == "dfttest":
@@ -278,3 +284,67 @@ def test_gaussblur_small_path_fits_the_guaranteed_workgroup_memory():
     lds = [v for sigma in (2.0, 5.0, 8.0, 11.0) for v in _gauss_lds(sigma, floor)]
     assert 7680 in lds, lds            # the largest tile the small path asks for
     assert max(lds) <= 16384, lds      # and it fits the floor
+
+
+# ---------------------------------------------------------------------------
+# Dispatch grids and resource limits
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_grids_fold_into_y_when_x_is_small():
+    """A grid wider than the device's X count must still cover every element.
+
+    Vulkan guarantees only 65535 workgroups per dimension, and this box reports
+    exactly that in Y while X is 2^32-1; the kernels fold a 1D grid into
+    `ID.y * NumWorkGroups.x + ID.x` and the host (or the compaction, for the
+    indirect predictor) sizes X and Y to match. Forcing X to 4 exercises both
+    paths; anything the fold drops is a pixel the kernel never writes, so the
+    digests have to match the unconstrained run exactly.
+    """
+    cases = [
+        {"label": "nnedi3-direct", "filter": "nnedi3", "params": {"pscrn": 0}},
+        {"label": "nnedi3-indirect", "filter": "nnedi3", "params": {"pscrn": 2}},
+        {"label": "eedi3", "filter": "eedi3"},
+        {"label": "eedi3h", "filter": "eedi3h"},
+        {"label": "eedi3aa", "filter": "eedi3aa"},
+    ]
+    default = _run_limits(cases)
+    folded = _run_limits(cases, {"VSFEEL_LIMIT_GRID_X": "4"})
+    for case in cases:
+        label = case["label"]
+        assert default[label].get("finite") is True, default[label]
+        assert folded[label].get("finite") is True, folded[label]
+        assert folded[label]["sha1"] == default[label]["sha1"], label
+
+
+def test_dispatch_grid_overflow_is_reported():
+    """An element count that cannot fit X and Y must fail naming the kernel."""
+    cases = [
+        {"label": "nnedi3", "filter": "nnedi3", "params": {"pscrn": 0}},
+        {"label": "eedi3", "filter": "eedi3"},
+    ]
+    res = _run_limits(cases, {"VSFEEL_LIMIT_GRID_X": "1", "VSFEEL_LIMIT_GRID_Y": "1"})
+    for case in cases:
+        err = res[case["label"]].get("error", "")
+        assert "workgroups" in err and "1x1" in err, res[case["label"]]
+
+
+def test_storage_buffer_range_limit_is_reported():
+    """Every binding is VK_WHOLE_SIZE, so maxStorageBufferRange caps the buffer.
+
+    BM3D's estimate cache is the filter that reaches it first (190 MiB at 1080p,
+    over the 128 MiB core minimum), so a small forced range must come back as the
+    buffer's size against the limit rather than a driver failure.
+    """
+    res = _run_limits([{"label": "bm3d", "filter": "bm3d"}],
+                      {"VSFEEL_LIMIT_STORAGE_RANGE": str(1 << 20)})
+    err = res["bm3d"].get("error", "")
+    assert "maxStorageBufferRange" in err and str(1 << 20) in err, res["bm3d"]
+
+
+def test_push_descriptor_limit_is_reported():
+    """The binding count is bounded by maxPushDescriptors, checked explicitly."""
+    res = _run_limits([{"label": "nlmeans", "filter": "nlmeans"}],
+                      {"VSFEEL_LIMIT_PUSH_DESCRIPTORS": "4"})
+    err = res["nlmeans"].get("error", "")
+    assert "push descriptors" in err and "4" in err, res["nlmeans"]

@@ -490,9 +490,10 @@ passes). All bit-identical to the previous build unless stated.
   628.68 fps, +26%**; EEDI3AA (1000-frame reps) **108.3 → 160.2 fps, +48%**.
 - **The drift is a blend decision flip, and extra Jacobi steps decay it
   geometrically.** At `a == 1` the output is `cint_s` whatever `d2p` is, so feeding
-  the predecessor row's own (one-step-less) parallel value reproduces the serial value
-  at those pixels. Level N = N-1 extra steps. Drift vs the serial walk, real jpbd
-  frames 300-305, benchmark config:
+  the predecessor row's own (one-step-less) parallel value reproduces the serial
+  value there; level N = N-1 extra steps. Drift vs the serial walk, real jpbd
+  frames 300-305, benchmark config (fps column mixes two adjacent sessions; the
+  vertical path pays nothing for the steps, EEDI3AA ~5 points):
 
   | level | EEDI3 fps | u16 max (of 65535) | fp32 max |
   |---|---|---|---|
@@ -501,9 +502,6 @@ passes). All bit-identical to the previous build unless stated.
   | 3 | 635.7 | 580 on 0.018% | 0.021 on 0.037% |
   | 5 | — | 36 on 0.003% | 0.0017 on 0.012% |
   | 6 | 628.7 | 5 on 0.0007% | 2.8e-4 on 0.006% |
-
-  (The fps column mixes two adjacent sessions; the vertical path pays nothing for the
-  steps, EEDI3AA ~5 points.)
 - **Default is level 6**, the lowest that is bit-exact on the whole tested surface:
   all 236 EEDI3/EEDI3H/EEDI3AA tests pass unmodified, u16 vs eedi3vk2 stays 0 and
   fp32 stays at the serial ulp on the noise clip. Level 3 is the first that is not.
@@ -543,11 +541,15 @@ kernel **s2 = 3.485 of 3.86 ms** at 1080p ns=1 — ~90% of the GPU frame.
 
 - **Tuned targets yield to the budget** — the batch target and NLMeans' u4a ring
   are measured optimums, now capped by the core's VRAM limit; no perf change here.
+- **The four 1D dispatches folded into Y** — pad/vcopy/assemble/blit were one
+  element per thread and reach ~130k workgroups at 8K, over the 65535-per-
+  dimension limit; they now index `ID.y * NumWorkGroups.x + ID.x` and the host
+  sizes both, erroring when even that cannot fit. Verified bit-identical with
+  `VSFEEL_LIMIT_GRID_X=4`.
 - **SGSIZE 64 / K=1: +2% on EEDI3AA, neutral on EEDI3, not shipped.** EEDI3 585.9 →
-  580.7 (ns=8, 2000 f, 4 pairs); EEDI3AA 142.1 → 145.8 and 142.8 → 145.6 (two runs,
-  4 pairs each), the 64-lane arm winning 7 of 8. Not shipped: ~2% on one workload is
-  at this box's resolution, for a compile-time `-D`, a second row module, a second
-  pipeline cache and device-limit handling.
+  580.7 (ns=8, 2000 f, 4 pairs); EEDI3AA 142.1 → 145.8 and 142.8 → 145.6 (4 pairs
+  each), the 64-lane arm winning 7 of 8. Not shipped: ~2% on one workload at this
+  box's resolution costs a `-D`, a second row module and its device-limit handling.
 - **The walk has no chain to fix.** `idx` is already absolute in the DP; only the
   store relativizes it (`cRel[j] = idx - u`), so storing `idx` already makes the
   walk's loads f-independent — exactly PROBE 8, which ties PROBE 7 (451.4 vs 453.9)
@@ -565,12 +567,12 @@ kernel **s2 = 3.485 of 3.86 ms** at 1080p ns=1 — ~90% of the GPU frame.
 - **Row kernel register pressure**: `RING_CAP` is not it. Trimming the fixed
   bound to `2*NRAD+1` leaves the compiled row kernel **byte-identical** at
   nrad=1/2/3 (VGPR 96/96/120, 16/16/12 subgroups/SIMD, no spills): the
-  `if (k >= RN) break` guard is dead once the driver specializes `NRAD`, and the
-  ring is register state, not LDS (1 024 B). At nrad=3 `RING_CAP == RN` exactly,
-  so the remaining lever is the `K=2` direction state. (Spec constants *can* size
-  arrays here — `notes/NLMEANS.md` ships it.) ACO raises VGPRs deliberately for
-  load ILP, so a lower count with new spills or schedule damage is a regression.
-- **Split the walk into its own dispatch, one lane per ROW.** Today one lane of a
+  `if (k >= RN) break` guard is dead once the driver specializes `NRAD`, the ring
+  is register state, not LDS (1 024 B), and at nrad=3 `RING_CAP == RN` exactly, so
+  the lever is the `K=2` direction state. (Spec constants *can* size arrays here —
+  `notes/NLMEANS.md` ships it.) ACO raises VGPRs for load ILP deliberately: a
+  lower count with new spills or schedule damage is a regression.
+- **Split the walk into its own dispatch, one lane per ROW.** One lane of a
   32-lane workgroup runs the walk while the kernel is issue-bound, so this is a
   *lane-utilisation* change, not a chain fix (round 20/29). Ceiling 11.9% of the
   frame against a ~5% measurement floor, so expected value is a point or two. Shape:

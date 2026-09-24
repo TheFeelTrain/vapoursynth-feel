@@ -123,6 +123,32 @@ def test_bm3dv2_cas_fallback_matches_hardware_atomics(noise_gray, monkeypatch):
         assert np.abs(a - b).max() < 1e-5, f"CAS vs hardware atomics at frame {n}"
 
 
+def test_bm3dv2_cas_fallback_holds_at_small_block_step(noise_gray, monkeypatch):
+    """The CAS arm must stay exact where contention is highest.
+
+    One res element receives up to `8 * ceil(8 / block_step)^2` adds, so
+    block_step=1 is the worst case (512) and a retry budget below it silently
+    drops addends: measured against the hardware arm at block_step=1, the old
+    32-retry bound put 16 of 4096 pixels 1e-5..6.1e-5 out, while the derived 512
+    lands at 7e-9 (float add order alone). The bound is what this pins.
+    """
+    def small_step(clip):
+        return BM3D(clip, sigma=SIGMA, radius=2, bm_range=BM_RANGE,
+                    ps_range=PS_RANGE, block_step=1)
+
+    monkeypatch.setenv("VSFEEL_BM3D_CAS", "1")
+    cas = small_step(noise_gray)
+    monkeypatch.delenv("VSFEEL_BM3D_CAS", raising=False)
+    hardware = small_step(noise_gray)
+    for n in (0, 11):
+        a = frame_to_ndarray(hardware.get_frame(n))
+        b = frame_to_ndarray(cas.get_frame(n))
+        assert np.isfinite(b).all(), f"non-finite CAS output at frame {n}"
+        assert np.abs(a - b).max() < 1e-7, (
+            f"CAS lost an addend at block_step=1, frame {n}: "
+            f"{np.abs(a - b).max():g}")
+
+
 def test_bm3dv2_nosearch_matches_search_on_constant_clip(monkeypatch):
     """The no-search arm must initialise the shared match tables, or the
     aggregation indexes stale LDS.

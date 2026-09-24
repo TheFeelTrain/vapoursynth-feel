@@ -143,6 +143,17 @@ const int BT_TILE = 32;
 #define MAXW 4096
 #endif
 
+// Linear work index for the 1D element-wise kernels. The grid may be folded
+// into Y when the element count exceeds the device's per-dimension workgroup
+// limit, so the workgroup index is ID.y * NumWorkGroups.x + ID.x; ID.x alone
+// would leave the fold unwritten. The host sizes the grid the same way.
+// `local_x` is the kernel's local_size_x: this sits above every
+// `layout(local_size...)`, where gl_WorkGroupSize is not available yet.
+uint flat_index(uint local_x) {
+    return (uint(gl_WorkGroupID.y) * uint(gl_NumWorkGroups.x) +
+            uint(gl_WorkGroupID.x)) * local_x + uint(gl_LocalInvocationID.x);
+}
+
 // Entry points that touch only the raw/pad buffers, not the row-kernel
 // helpers (pad_get/conn_cost/...), so those helpers must not be compiled in.
 #if defined(ENTRY_PAD) || defined(ENTRY_XPOSE) || defined(ENTRY_COMPOSE) || \
@@ -1453,7 +1464,7 @@ void main() {
 layout(local_size_x = 256) in;
 
 void main() {
-    const uint i = gl_GlobalInvocationID.x;
+    const uint i = flat_index(256u);
     const int total = pc.rows * WIDTH;
     if (int(i) >= total) return;
     const int r = int(i) / WIDTH;
@@ -1506,7 +1517,7 @@ void main() {
 layout(local_size_x = 256) in;
 
 void main() {
-    const uint idx = gl_GlobalInvocationID.x;
+    const uint idx = flat_index(256u);
     const int total = pc.pad_stride * pc.pad_height;
     if (int(idx) >= total) return;
     const int py = int(idx) / pc.pad_stride;
@@ -1704,7 +1715,7 @@ void main() {
 layout(local_size_x = 256) in;
 
 void main() {
-    const uint i = gl_GlobalInvocationID.x;
+    const uint i = flat_index(256u);
     const int total = 2 * pc.rows * WIDTH;
     if (int(i) >= total) return;
     const int y = int(i) / WIDTH;
@@ -1863,7 +1874,7 @@ void main() {
 layout(local_size_x = 256) in;
 
 void main() {
-    const uint idx = gl_GlobalInvocationID.x;
+    const uint idx = flat_index(256u);
     const int total = 2 * pc.rows * WIDTH;
     if (int(idx) >= total) return;
     const int y = int(idx) / WIDTH;

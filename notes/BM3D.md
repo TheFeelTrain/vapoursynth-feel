@@ -91,6 +91,20 @@ three interleaved A/B runs against the raw-submit build -- see Historical.
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **The CAS fallback's retry bound was below what the kernel can contend.**
+  `res_add`'s compare-exchange loop is capped so a stuck retry cannot reset the
+  device (the reference's unbounded `do/while`); one res element receives at most
+  `8 * ceil(8 / block_step)^2` adds, so the old 32 was exactly the bound *only at
+  the tuned block_step=4* and short of it for every smaller step (512 at 1).
+  Measured with a NaN-store probe: block_step=1 exhausted it (1074 NaN pixels
+  over the clip's frames); against the hardware-atomic arm, the old bound put 16
+  of 4096 pixels 1e-5..6.1e-5 out, the derived 512 lands at 7e-9 (add order
+  alone). `test_bm3dv2_cas_fallback_holds_at_small_block_step` pins it.
+  The last-resort store now lands on a freshly re-read value (bounded, and
+  unreachable for every supported block_step) and `gpu_make_buffer` refuses a
+  buffer over `maxStorageBufferRange`, which BM3D's 190 MiB estimate cache
+  exceeds before the other filters' scratch do.
+
 - **2026-09-23 — exec-pool port: +1%.** Replaced BM3D's per-stream
   command pools, timelines and raw `gpu_submit` with the core's exec pool, and
   deleted `FramePool`/`ticket_semaphore`/`gpu_submit` from `vsfeel.h`. The

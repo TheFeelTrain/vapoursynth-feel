@@ -173,7 +173,9 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   LDS-resident union tiles): neutral; the warm weight kernel is ALU/LDS/barrier
   bound, not load bound.
 - **Round packing >1** (bigger W/A rings): pack=2 tied, 4/8 lost; rings >33 MB
-  stream u4a through DRAM. The 64 MiB target is capped by the core's VRAM limit,
+  stream u4a through DRAM. Its 10-binding push-descriptor layout is bounded by
+  `maxPushDescriptors` (checked at layout creation; the per-stage pool limits do
+  not apply to push descriptors), which RADV reports at the minimum of 32. The 64 MiB target is capped by the core's VRAM limit,
   so a device with a smaller allowance packs fewer entries per round instead of
   planning the optimum anyway.
 - **`a=64, d=16` hard-recovers the GPU when the device is shared** — a

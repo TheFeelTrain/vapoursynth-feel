@@ -257,15 +257,28 @@ static std::variant<VkPipeline, std::string> create_bm3d_pipeline(
         { 13, 52, sizeof(int32_t) },
     }};
     // The kernel's 8-lane shuffles keep each aligned 8-lane group inside one
-    // subgroup, and 32 is the measured-best width on the target GPU
-    // (VSFEEL_BM3D_SUBGROUP=64 forces the wave64 path). The request is checked
-    // against the device: subgroup size control is in the core's baseline, but
-    // the size itself is not, so a device that cannot provide it is told so
-    // here instead of at dispatch.
+    // subgroup, so any width that is a multiple of 8 runs it; 32 is the measured
+    // best on the target GPU (VSFEEL_BM3D_SUBGROUP=64 forces the wave64 path,
+    // and the request is validated when the pipeline is created). A device that
+    // cannot be asked for 32 keeps its own width when that already suits the
+    // groups, and is otherwise asked for 16; only a device whose width both is
+    // not a multiple of 8 and cannot be changed is refused.
     const int forced_subgroup = env_int("VSFEEL_BM3D_SUBGROUP", 0);
-    const uint32_t subgroup_size = forced_subgroup > 0
-        ? static_cast<uint32_t>(forced_subgroup)
-        : 32u;
+    uint32_t subgroup_size = 0;
+    if (forced_subgroup > 0) {
+        subgroup_size = static_cast<uint32_t>(forced_subgroup);
+    } else if (gpu.has_subgroup_size(32, 32)) {
+        subgroup_size = 32;
+    } else if (gpu.subgroup_size % 8 == 0) {
+        subgroup_size = 0;
+    } else if (gpu.has_subgroup_size(16, 32)) {
+        subgroup_size = 16;
+    } else {
+        return "BM3D needs a subgroup size that is a multiple of 8 lanes "
+               "(its 8-lane groups share data with subgroup shuffles), and this "
+               "device's is " + std::to_string(gpu.subgroup_size) +
+               " and cannot be changed"s;
+    }
     // LDS: l_e/l_x/l_y/l_s are [4][64] each, three int arrays and one float.
     const GpuWorkgroup workgroup { .x = 32, .shared_bytes = 4 * 64 * 4 * 4 };
     return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(), &spec,

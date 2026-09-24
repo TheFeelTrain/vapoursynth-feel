@@ -166,6 +166,13 @@ struct Eedi3PlaneConfig {
     int tpitch {};                    // 2*mdis + 1
     Eedi3Pipelines pipes {};          // shared per geometry (see width_pipes)
 
+    // Grids of the four 1D element-wise dispatches, folded into X/Y (see
+    // vsfeel_fold_grid): pad, vcopy, the AA assemble merge and the blit.
+    uint32_t pad_grid_x {}, pad_grid_y {1};
+    uint32_t vcopy_grid_x {}, vcopy_grid_y {1};
+    uint32_t asm_grid_x {}, asm_grid_y {1};
+    uint32_t blit_grid_x {}, blit_grid_y {1};
+
     // region offsets (bytes into the per-frame scratch buffer) and sizes
     VkDeviceSize pad_off {}, pad_bytes {};
     VkDeviceSize dst_off {}, dst_bytes {};
@@ -183,6 +190,35 @@ struct Eedi3PlaneConfig {
     VkDeviceSize o0_off {}, o0_bytes {};
     VkDeviceSize v_off {}, v_bytes {};
 };
+
+// Fills the 1D dispatch grids of `c` (pad / vcopy / assemble / blit), folding
+// each element count into X and Y because a dispatch may not exceed the device's
+// per-dimension workgroup count -- they reach ~130k workgroups at 8K. Returns an
+// error naming the kernel when even the folded grid cannot fit. Every plane
+// config needs this, including the AA pass's transposed `aplanes`.
+static std::optional<std::string> eedi3_fill_grids(const GPUDevice & gpu,
+                                                   Eedi3PlaneConfig & c) {
+    auto fold_1d = [&](uint64_t elems, const char * what, uint32_t & gx,
+                       uint32_t & gy) -> std::optional<std::string> {
+        std::string message;
+        if (!vsfeel_fold_grid(gpu.limits, (elems + 255) / 256, what, gx, gy, message)) {
+            return message;
+        }
+        return std::nullopt;
+    };
+    const uint64_t rows_x_width = static_cast<uint64_t>(c.rows) * c.width;
+    if (auto e = fold_1d(static_cast<uint64_t>(c.pad_stride) * c.pad_height,
+                         "eedi3's pad", c.pad_grid_x, c.pad_grid_y)) {
+        return e;
+    }
+    if (auto e = fold_1d(rows_x_width, "eedi3's vcopy", c.vcopy_grid_x, c.vcopy_grid_y)) {
+        return e;
+    }
+    if (auto e = fold_1d(2 * rows_x_width, "eedi3's assemble", c.asm_grid_x, c.asm_grid_y)) {
+        return e;
+    }
+    return fold_1d(2 * rows_x_width, "eedi3's blit", c.blit_grid_x, c.blit_grid_y);
+}
 
 // What a recorded pass does after the row kernel + vcheck.
 enum class PassTail {
@@ -582,8 +618,7 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                 pc.rows = cfg.rows;
                 pc.pad_src_pitched = horiz ? 0 : 1;
                 pc_push(d, cmd, pc);
-                const int total = cfg.pad_stride * cfg.pad_height;
-                dispatch(d, cmd, (total + 255) / 256);
+                dispatch(d, cmd, cfg.pad_grid_x, cfg.pad_grid_y);
             }
         }
 
@@ -657,8 +692,7 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                         in.scratch, in.scratch, in.scratch, in.scratch,
                         in.scratch, sclip_buf, in.scratch, in.scratch });
                     pc_push(d, cmd, pc);
-                    const int total = cfg.rows * cfg.width;
-                    dispatch(d, cmd, (total + 255) / 256);
+                    dispatch(d, cmd, cfg.vcopy_grid_x, cfg.vcopy_grid_y);
                     gpu_barrier(*d.gpu, cmd);
                 }
                 bind_pipe(d, cmd, cfg.pipes.vcheck);
@@ -696,7 +730,7 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                 bind_pipe(d, cmd, cfg.pipes.assemble);
                 bind_bufs(d, cmd, { in.src[plane], in.scratch, in.scratch, in.scratch });
                 pc_push(d, cmd, pc);
-                dispatch(d, cmd, (2 * cfg.rows * cfg.width + 255) / 256);
+                dispatch(d, cmd, cfg.asm_grid_x, cfg.asm_grid_y);
             }
             continue;
         }
@@ -750,8 +784,7 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
             bind_pipe(d, cmd, cfg.pipes.blit);
             bind_bufs(d, cmd, { in.scratch, in.src[plane], in.out[plane] });
             pc_push(d, cmd, pc);
-            const int total = 2 * cfg.rows * cfg.width;
-            dispatch(d, cmd, (total + 255) / 256);
+            dispatch(d, cmd, cfg.blit_grid_x, cfg.blit_grid_y);
         }
     }
 }
@@ -1924,6 +1957,9 @@ static void vsfeel_eedi3_create(
             a.tpitch = tpitch;
             a.pad_stride = (a.width + MARGIN_H * 2 + 15) & ~15;
             a.pad_height = a.height + MARGIN_V * 2;
+            if (auto e = eedi3_fill_grids(*d->gpu, a)) {
+                return set_error(*e);
+            }
         }
     }
     for (int plane = 0; plane < numPlanes; ++plane) {
@@ -1945,6 +1981,10 @@ static void vsfeel_eedi3_create(
         cfg.tpitch = tpitch;
         cfg.pad_stride = (kw + MARGIN_H * 2 + 15) & ~15;
         cfg.pad_height = kh + MARGIN_V * 2;
+
+        if (auto e = eedi3_fill_grids(*d->gpu, cfg)) {
+            return set_error(*e);
+        }
     }
 
     // Region layout. The vertical and horizontal geometries of an AA instance

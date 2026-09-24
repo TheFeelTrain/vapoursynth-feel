@@ -323,8 +323,11 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
         }
     }
 
+    VkPhysicalDevicePushDescriptorProperties push_desc {};
+    push_desc.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES;
     VkPhysicalDeviceSubgroupProperties subgroup {};
     subgroup.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+    subgroup.pNext = &push_desc;
     VkPhysicalDeviceSubgroupSizeControlProperties size_control {};
     size_control.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
     subgroup.pNext = &size_control;
@@ -339,6 +342,9 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     dev->max_subgroup_size = size_control.maxSubgroupSize;
     dev->max_compute_workgroup_subgroups = size_control.maxComputeWorkgroupSubgroups;
     dev->subgroup_ops = subgroup.supportedOperations;
+    if (push_desc.maxPushDescriptors > 0) {
+        dev->max_push_descriptors = push_desc.maxPushDescriptors;
+    }
 
     // Test knobs: lower the reported compute limits so the small-device paths can
     // be exercised on a GPU that has room for everything (a build for a 16 KiB /
@@ -351,6 +357,24 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     if (const int cap = env_int("VSFEEL_LIMIT_INVOCATIONS", 0); cap > 0 &&
         static_cast<uint32_t>(cap) < dev->limits.maxComputeWorkGroupInvocations) {
         dev->limits.maxComputeWorkGroupInvocations = static_cast<uint32_t>(cap);
+    }
+    // The grid dims matter on real hardware too: this box reports 2^32-1 in X but
+    // exactly 65535 in Y, which is what the dispatch folds are sized against.
+    if (const int cap = env_int("VSFEEL_LIMIT_GRID_X", 0); cap > 0 &&
+        static_cast<uint32_t>(cap) < dev->limits.maxComputeWorkGroupCount[0]) {
+        dev->limits.maxComputeWorkGroupCount[0] = static_cast<uint32_t>(cap);
+    }
+    if (const int cap = env_int("VSFEEL_LIMIT_GRID_Y", 0); cap > 0 &&
+        static_cast<uint32_t>(cap) < dev->limits.maxComputeWorkGroupCount[1]) {
+        dev->limits.maxComputeWorkGroupCount[1] = static_cast<uint32_t>(cap);
+    }
+    if (const int cap = env_int("VSFEEL_LIMIT_STORAGE_RANGE", 0); cap > 0 &&
+        static_cast<uint32_t>(cap) < dev->limits.maxStorageBufferRange) {
+        dev->limits.maxStorageBufferRange = static_cast<uint32_t>(cap);
+    }
+    if (const int cap = env_int("VSFEEL_LIMIT_PUSH_DESCRIPTORS", 0); cap > 0 &&
+        static_cast<uint32_t>(cap) < dev->max_push_descriptors) {
+        dev->max_push_descriptors = static_cast<uint32_t>(cap);
     }
 
     uint32_t families = 0;
@@ -431,11 +455,15 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
             dev->max_compute_workgroup_subgroups, dev->subgroup_size_control,
             dev->compute_full_subgroups);
         fprintf(stderr, "[vsfeel] compute limits: invocations=%u, size=%ux%ux%u, "
-                        "shared=%u bytes, maxStorageBufferRange=%llu\n",
+                        "shared=%u bytes, groups=%ux%ux%u, storageRange=%llu, "
+                        "pushDescriptors=%u\n",
             dev->limits.maxComputeWorkGroupInvocations,
             dev->limits.maxComputeWorkGroupSize[0], dev->limits.maxComputeWorkGroupSize[1],
             dev->limits.maxComputeWorkGroupSize[2], dev->limits.maxComputeSharedMemorySize,
-            static_cast<unsigned long long>(dev->limits.maxStorageBufferRange));
+            dev->limits.maxComputeWorkGroupCount[0], dev->limits.maxComputeWorkGroupCount[1],
+            dev->limits.maxComputeWorkGroupCount[2],
+            static_cast<unsigned long long>(dev->limits.maxStorageBufferRange),
+            dev->max_push_descriptors);
         fprintf(stderr, "[vsfeel] transfer queue family %u index %u\n",
             handles.transferQueueFamily, handles.transferQueueIndex);
         fprintf(stderr, "[vsfeel] optional features: float32AtomicAdd=%d\n",

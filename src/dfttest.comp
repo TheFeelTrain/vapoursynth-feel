@@ -1559,7 +1559,10 @@ void main() {
 #if defined(ENTRY_FUSED)
 
 #ifndef SUB_BLOCKS
-#define SUB_BLOCKS 8   // blocks processed per workgroup (8 * 16 = 128 threads, 2 wave64 on RDNA)
+// Blocks per workgroup: 8 * 16 = 128 threads. The host requires a subgroup size
+// that is a multiple of 16 (32 on the target GPU, so four subgroups), which is
+// what keeps a 16-lane tile inside one subgroup for the subgroupBarrier below.
+#define SUB_BLOCKS 8
 #endif
 
 shared float trans[SUB_BLOCKS * TR_SUB];

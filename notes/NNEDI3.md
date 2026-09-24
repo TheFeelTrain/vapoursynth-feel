@@ -121,6 +121,19 @@ Pre-R80 rounds below were measured on the deleted transfer path — their fps
 figures are void as current-filter numbers (same marker as
 `notes/BILATERAL.md`); mechanisms are kept.
 
+- **The dispatch grids folded into Y** — every dimension is capped at 65535
+  workgroups (this box's Y limit; X only looks unlimited here), and a 3840x2160
+  `pscrn=0` plane needs 129600 of them, so the grid would have been dispatched
+  truncated -- pixels silently never written. Both kernels now index
+  `ID.y * NumWorkGroups.x + ID.x`, the host folds the direct grids and the
+  compaction publishes the folded Y for the indirect predictor. Verified
+  bit-identical with `VSFEEL_LIMIT_GRID_X=4` (`tests/test_device_limits.py`).
+- **Weight-buffer locality is reported, not fixed** — the three weight buffers
+  ask for host-visible + device-local-preferred, which lands them in VRAM on a
+  ReBAR window, and the predictor streams the matrix per subgroup. On a device
+  whose host-visible memory is not device-local they end up read over the bus,
+  so creation now says so under `VSFEEL_DEBUG=1`; a one-time upload into a
+  device-local copy is the fix to benchmark on such a device.
 - **The coop kernels' subgroup requirements are checked, not assumed** — prescreen
   and predict reduce across lanes with subgroup arithmetic and count lanes with
   ballot, and only BASIC is mandatory in Vulkan. Both are required at creation

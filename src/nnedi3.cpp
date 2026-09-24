@@ -321,8 +321,8 @@ static std::optional<std::string> parse_weights(int nsize, int nns_sel, int etyp
 struct Nnedi3Plane {
     int width {};
     int rows {};                      // field rows == interpolated output rows
-    uint32_t pre_grid_x {};           // prescreen dispatch (128-thread groups)
-    uint32_t pred_grid_direct_x {};   // direct predict grid (pscrn == 0)
+    uint32_t pre_grid_x {}, pre_grid_y {1};            // prescreen dispatch
+    uint32_t pred_grid_direct_x {}, pred_grid_direct_y {1};  // direct predict
     uint32_t keep_grid_x {}, keep_grid_y {};
     VkPipeline pre_pipeline {};       // null when pscrn == 0 or the plane is skipped under dh
     VkPipeline pred_pipeline {};
@@ -682,8 +682,14 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
             continue;
         }
 
-        const int32_t push[5] { cfg.list_elem, src_stride, dst_stride, parity,
-                                cfg.ind_elem };
+        // max_grid_x rides along so the compaction can cap X and publish the Y
+        // extent it folded into; clamped to INT32_MAX so the int32 push word
+        // round-trips (devices may report an X limit of 2^32-1).
+        const int32_t push[6] { cfg.list_elem, src_stride, dst_stride, parity,
+                                cfg.ind_elem,
+                                static_cast<int32_t>(std::min<uint32_t>(
+                                    d->gpu->limits.maxComputeWorkGroupCount[0],
+                                    INT32_MAX)) };
         if (d->use_list) {
             // Reset this plane's indirect struct to {groupsX, groupsY,
             // groupsZ, count} = {0, 1, 1, 0}: prescreen bumps the count and
@@ -699,7 +705,7 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
             gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push, sizeof(push));
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           cfg.pre_pipeline);
-            d->gpu->vk->vkCmdDispatch(cmd, cfg.pre_grid_x, 1, 1);
+            d->gpu->vk->vkCmdDispatch(cmd, cfg.pre_grid_x, cfg.pre_grid_y, 1);
         }
         if (gputrace && p == probe_plane) {
             d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -719,7 +725,8 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
             gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push, sizeof(push));
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           cfg.pred_pipeline);
-            d->gpu->vk->vkCmdDispatch(cmd, cfg.pred_grid_direct_x, 1, 1);
+            d->gpu->vk->vkCmdDispatch(cmd, cfg.pred_grid_direct_x,
+                                      cfg.pred_grid_direct_y, 1);
         }
         if (gputrace && p == probe_plane) {
             d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
@@ -1056,7 +1063,7 @@ static void VS_CC Nnedi3Create(
     }
     {
         const auto result = gpu_pipeline_layout(*d->gpu, d->set_layout,
-            5 * sizeof(int32_t));
+            6 * sizeof(int32_t));
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -1077,6 +1084,18 @@ static void VS_CC Nnedi3Create(
         }
         if (buf.mapped == nullptr) {
             return std::string(what) + " buffer is not host visible";
+        }
+        // The predictor streams the whole matrix per subgroup, so a weight
+        // buffer that did not land in device-local memory is read over the bus
+        // on every workgroup. There is no host-visible VRAM on such a device to
+        // prefer, and a one-time upload into a device-local copy is the fix to
+        // measure there, so say which memory the allocation got.
+        if (vsfeel_device_info_enabled() &&
+            (buf.memory_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+            fprintf(stderr, "[nnedi3] %s weights are not device-local "
+                            "(memoryFlags=0x%x): the predictor reads them per "
+                            "subgroup\n",
+                what, static_cast<unsigned>(buf.memory_flags));
         }
         std::memcpy(buf.mapped, values.data(), values.size() * sizeof(float));
         // The mapping may be the host-visible VRAM BAR (write-combining): the
@@ -1148,6 +1167,22 @@ static void VS_CC Nnedi3Create(
     // and FS<=128) use the PXP=8 module, wide networks the PXP=4 one (the
     // shader's own PXP rule), FS<=64 the small-tile PXP=4 module.
     const uint32_t max_grid_x = d->gpu->limits.maxComputeWorkGroupCount[0];
+    const uint32_t max_grid_y = d->gpu->limits.maxComputeWorkGroupCount[1];
+
+    // A dispatch may not exceed the device's per-dimension workgroup count
+    // (Vulkan guarantees only 65535, and this box reports exactly that in Y), so
+    // a 1D grid wider than X is folded into Y -- every kernel here linearizes
+    // the workgroup id as ID.y * NumWorkGroups.x + ID.x. Y carries the same
+    // limit, hence the error.
+    auto fold_grid = [&](uint64_t groups, const char * what,
+                         uint32_t & gx_out, uint32_t & gy_out)
+            -> std::optional<std::string> {
+        std::string message;
+        if (!vsfeel_fold_grid(d->gpu->limits, groups, what, gx_out, gy_out, message)) {
+            return message;
+        }
+        return std::nullopt;
+    };
     const auto use_pxp8 = [](int net_nns, int net_fs) {
         return ((net_nns + 31) / 32 <= 2) && (net_fs <= 128);
     };
@@ -1184,20 +1219,28 @@ static void VS_CC Nnedi3Create(
             // group of 128 threads. The shader groups pixels per ROW as
             // ceil(width/P), so the grid must cover rows*ceil(width/P)
             // threads -- never ceil(width*rows/P), which leaves the tail of
-            // every non-divisible row unwritten.
-            const uint32_t pps = d->pscrn == 1 ? 1 : 4;
-            const uint32_t groups_per_row =
-                (static_cast<uint32_t>(cfg.width) + pps - 1) / pps;
-            cfg.pre_grid_x = std::min<uint32_t>(
-                (static_cast<uint32_t>(cfg.rows) * groups_per_row + 127) / 128,
-                max_grid_x);
+            // every non-divisible row unwritten. Only the list path dispatches
+            // it, so only that path has to fit the device's group count.
+            if (d->use_list) {
+                const uint32_t pps = d->pscrn == 1 ? 1 : 4;
+                const uint32_t groups_per_row =
+                    (static_cast<uint32_t>(cfg.width) + pps - 1) / pps;
+                if (auto e = fold_grid(
+                        (static_cast<uint32_t>(cfg.rows) * groups_per_row + 127) / 128,
+                        "prescreen", cfg.pre_grid_x, cfg.pre_grid_y)) {
+                    return set_error(*e);
+                }
+            }
             // cooperative direct grid (pscrn==0): 4 subgroups x PXP pixels
             // per 128-thread workgroup.
             const int host_pxp = use_pxp8(d->nns, d->xdim * d->ydim) ? 8 : 4;
             const uint32_t ppg = static_cast<uint32_t>(4 * host_pxp);
-            cfg.pred_grid_direct_x = std::min<uint32_t>(
-                (static_cast<uint32_t>(cfg.width) * static_cast<uint32_t>(cfg.rows) + ppg - 1) / ppg,
-                max_grid_x);
+            if (auto e = fold_grid(
+                    (static_cast<uint32_t>(cfg.width) * static_cast<uint32_t>(cfg.rows) + ppg - 1) / ppg,
+                    "direct predictor", cfg.pred_grid_direct_x,
+                    cfg.pred_grid_direct_y)) {
+                return set_error(*e);
+            }
 
             // Scratch regions: the list holds one uint per field pixel, then
             // this plane's 16-byte indirect struct.
@@ -1218,7 +1261,7 @@ static void VS_CC Nnedi3Create(
             const int64_t gx = std::clamp<int64_t>((total + 255) / 256, 1, max_grid_x);
             cfg.keep_grid_x = static_cast<uint32_t>(gx);
             cfg.keep_grid_y = static_cast<uint32_t>(
-                std::clamp<int64_t>((total + 256 * gx - 1) / (256 * gx), 1, max_grid_x));
+                std::clamp<int64_t>((total + 256 * gx - 1) / (256 * gx), 1, max_grid_y));
         }
 
         int ki = 0;

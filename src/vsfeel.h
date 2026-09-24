@@ -313,9 +313,24 @@ struct GPUDevice {
     // VkSubgroupFeatureFlags: only COMPUTE/fragment BASIC is mandatory in
     // Vulkan 1.1, so every other intrinsic a kernel uses has to be checked.
     VkSubgroupFeatureFlags subgroup_ops {};
+    // VkPhysicalDevicePushDescriptorProperties::maxPushDescriptors: the binding
+    // count a push-descriptor set layout may use.
+    uint32_t max_push_descriptors { 32 };
     // shaderBufferFloat32AtomicAdd specifically -- atomic exchange support
     // alone does not let a kernel use atomicAdd on a float buffer.
     bool feat_atomic_float32_add { false };
+
+    // The shaders' other extensions are deliberately unchecked, because the
+    // core's device baseline guarantees them on the logical device (see
+    // VSVulkan4.h: every REQUIRED entry there is mandatory for the Vulkan 1.4
+    // device the core creates): GL_EXT_shader_16bit_storage needs
+    // storageBuffer16BitAccess (Vulkan11 baseline), GL_EXT_shader_8bit_storage
+    // and GL_EXT_shader_explicit_arithmetic_types_int8 need
+    // storageBuffer8BitAccess + shaderInt8, GL_KHR_memory_scope_semantics needs
+    // vulkanMemoryModel, and GL_EXT_buffer_reference needs bufferDeviceAddress
+    // (all Vulkan12 baseline). Only the features the baseline does *not* require
+    // -- subgroup size control/full subgroups, the subgroup operation bits, the
+    // float-atomic extension, push-descriptor counts -- are queried above.
 
     // Persistent pipeline cache, shared by every instance on this device: the
     // core exposes no cache of its own, and compiling from SPIR-V is seconds
@@ -413,6 +428,31 @@ inline VkDeviceSize vsfeel_vram_limit(const GPUDevice & dev, VSCore * core) {
     return limit;
 }
 
+// Folds a 1D workgroup count into the device's per-dimension limits: a dispatch
+// may not exceed maxComputeWorkGroupCount[i] (Vulkan guarantees only 65535, and
+// this box reports exactly that in Y while X is 2^32-1), so X is capped and the
+// remainder goes into Y. Kernels that opt in index their work as
+// `ID.y * NumWorkGroups.x + ID.x`. Returns false, with `error` naming the
+// kernel and both limits, when even the folded grid cannot fit.
+inline bool vsfeel_fold_grid(const VkPhysicalDeviceLimits & limits,
+                             uint64_t groups, const char * what,
+                             uint32_t & gx_out, uint32_t & gy_out,
+                             std::string & error) {
+    const uint64_t max_x = limits.maxComputeWorkGroupCount[0];
+    const uint64_t max_y = limits.maxComputeWorkGroupCount[1];
+    const uint64_t gx = std::max<uint64_t>(1, std::min(groups, max_x));
+    const uint64_t gy = (groups + gx - 1) / gx;
+    if (gy > max_y) {
+        error = std::string(what) + " needs " + std::to_string(groups) +
+            " workgroups, more than this device can dispatch (" +
+            std::to_string(max_x) + "x" + std::to_string(max_y) + ")";
+        return false;
+    }
+    gx_out = static_cast<uint32_t>(gx);
+    gy_out = static_cast<uint32_t>(gy);
+    return true;
+}
+
 // A buffer from the core's pool. `handle` owns it; the rest is what a kernel or
 // the host needs to use it.
 struct GpuBuffer {
@@ -435,6 +475,17 @@ inline std::string gpu_make_buffer(const GPUDevice & g, VSCore * core,
                                    VkMemoryPropertyFlags preferred = 0,
                                    VkBufferUsageFlags extra_usage = 0,
                                    VkBufferUsageFlags exclude = 0) {
+    // Every binding here is VK_WHOLE_SIZE, so the descriptor's range is the
+    // buffer's size and maxStorageBufferRange (Vulkan's core minimum is 128 MiB)
+    // caps it: BM3D's estimate cache is ~190 MiB at 1080p, DFTTest's block
+    // buffer ~136 MiB, and a 2x2160p EEDI3 scratch is larger still. Refuse
+    // clearly rather than fail inside the driver, or bind a truncated range
+    // that the shader's addressing would walk off.
+    if (bytes > g.limits.maxStorageBufferRange) {
+        return "a " + std::to_string(bytes) + "-byte buffer exceeds this device's "
+            "maxStorageBufferRange (" + std::to_string(g.limits.maxStorageBufferRange) +
+            " bytes); lower the filter's size parameters or use one with a larger range"s;
+    }
     char err[512] {};
     VSVulkanBufferInfo info {};
     const VkBufferUsageFlags usage =
@@ -527,8 +578,19 @@ inline void gpu_barrier(const GPUDevice & g, VkCommandBuffer cmd) {
 
 // Descriptor set layout for `bindings` storage buffers, in push descriptor
 // form: no pool, no allocation, nothing to free but the layout itself.
+// A push-descriptor layout's binding count is bounded by maxPushDescriptors
+// (VUID-VkDescriptorSetLayoutCreateInfo-flags-00281), not by the per-stage
+// pool limits -- which is what lets the 7..10 buffer bindings above sit on a
+// device reporting the minimum of 4 there. maxPushDescriptors is at least 32,
+// so a conformant device always fits, but the count is checked rather than
+// assumed.
 inline std::variant<VkDescriptorSetLayout, std::string> gpu_push_set_layout(
     const GPUDevice & g, uint32_t bindings) {
+    if (bindings > g.max_push_descriptors) {
+        return "a pipeline needs " + std::to_string(bindings) +
+            " push descriptors, more than this device's " +
+            std::to_string(g.max_push_descriptors);
+    }
     VkDescriptorSetLayoutBinding b[GPU_MAX_BINDINGS] {};
     for (uint32_t i = 0; i < bindings; ++i) {
         b[i].binding = i;

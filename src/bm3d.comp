@@ -62,9 +62,16 @@ layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
 // is an atomic load that returns the current value without changing it.
 // The loop is bounded on purpose: an unbounded retry that cannot make progress
 // spins the GPU until the driver resets the device (seen as
-// VK_ERROR_DEVICE_LOST with no fault). 32 rounds is far above any real
-// contention; past that a plain store drops one addend instead of the device.
-#define RES_ADD_RETRIES 32
+// VK_ERROR_DEVICE_LOST with no fault). The bound is not a guess -- one element
+// can receive at most `8 * ceil(8 / BLOCK_STEP)^2` adds (the eight matches of
+// every reference block whose 8x8 window covers the pixel), and each failed
+// compare-exchange means another one of those landed, so after that many
+// failures the next attempt must succeed. 512 is that figure at the smallest
+// supported BLOCK_STEP (1, 8 * 64); at the tuned BLOCK_STEP=4 it is 32. A
+// bounded loop is safe, an unbounded one is not, and the old 32 was short of
+// the bound for every block_step below 4 -- measured with a NaN-store probe:
+// block_step=1 exhausted it (1074 NaN pixels over the noise clip's frames).
+#define RES_ADD_RETRIES 512
 void res_add(int idx, float val) {
 #ifndef NO_FLOAT_ATOMICS
     atomicAdd(res[idx], val);
@@ -78,7 +85,11 @@ void res_add(int idx, float val) {
         }
         assumed = old;
     }
-    res_u[idx] = floatBitsToUint(uintBitsToFloat(assumed) + val);
+    // Unreachable for every supported block_step (see above); if it is ever
+    // taken, land the add on the freshest value rather than on the one the loop
+    // started from, which is the least lossy store this can do.
+    const uint latest = atomicCompSwap(res_u[idx], 0u, 0u);
+    res_u[idx] = floatBitsToUint(uintBitsToFloat(latest) + val);
 #endif
 }
 

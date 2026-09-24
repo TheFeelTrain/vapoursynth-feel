@@ -102,6 +102,7 @@ layout(push_constant) uniform PushConstants {
     int dst_stride;
     int parity;
     int d_base;
+    int max_grid_x;   // device maxComputeWorkGroupCount[0], for the Y fold below
 } pc;
 
 // Window read fused from the pad kernel: pad[i][x] =
@@ -238,7 +239,11 @@ layout(local_size_x = 128) in;
 void main() {
     const int P = (PSCRN == 1) ? 1 : 4; // pixels per thread
     const int xg = (WIDTH + P - 1) / P;
-    const int gid = int(gl_GlobalInvocationID.x);
+    // The grid folds into Y when the pixel groups exceed the device's X group
+    // limit, so the work index is ID.y * NumWorkGroups.x + ID.x (the host sizes
+    // the grid the same way); ID.x alone would leave the fold unwritten.
+    const int gid = int((uint(gl_WorkGroupID.y) * uint(gl_NumWorkGroups.x) +
+                         uint(gl_WorkGroupID.x)) * 128u + gl_LocalInvocationIndex);
     const int r = gid / xg;
     const int xbase = (gid % xg) * P;
     const bool valid = r < ROWS;
@@ -285,7 +290,13 @@ void main() {
     if (subgroupElect() && total > 0u) {
         base = atomicAdd(indBuf[pc.d_base + 3], total);
         const uint ppg = uint(4 * ((((NNS + 31) / 32) <= 2) && (FS <= 128) ? 8 : 4));
-        atomicMax(indBuf[pc.d_base], (base + total + ppg - 1u) / ppg);
+        // X is capped at the device's per-dimension limit and the rest goes into
+        // Y, which the predictor folds back in. Both counts only grow, so
+        // atomicMax is enough; the host leaves Y at 1 for an empty plane.
+        const uint groups = (base + total + ppg - 1u) / ppg;
+        atomicMax(indBuf[pc.d_base], min(groups, uint(pc.max_grid_x)));
+        atomicMax(indBuf[pc.d_base + 1],
+                  (groups + uint(pc.max_grid_x) - 1u) / uint(pc.max_grid_x));
     }
     base = subgroupBroadcastFirst(base);
     const uint off = base + subgroupExclusiveAdd(uint(cnt));
@@ -451,7 +462,12 @@ void main() {
     // direct off the host-computed pixel grid): one work unit per subgroup;
     // out-of-range subgroups exit immediately, no loop tail. Four subgroups
     // per 128-thread workgroup.
-    const uint firstPix = (uint(gl_WorkGroupID.x) * 4u + warp) * uint(PXP);
+    // Same Y fold as the prescreen: the grid can be wider than the device's
+    // per-dimension group limit (indirect, so the count comes from the
+    // compaction above), and ID.x alone would drop everything past that limit.
+    const uint wg = uint(gl_WorkGroupID.y) * uint(gl_NumWorkGroups.x) +
+        uint(gl_WorkGroupID.x);
+    const uint firstPix = (wg * 4u + warp) * uint(PXP);
     if (firstPix >= npix)
         return;
     PREDICT_UNIT(firstPix, min(uint(PXP), npix - firstPix))
