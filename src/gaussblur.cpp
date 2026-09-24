@@ -213,11 +213,16 @@ static constexpr std::array<VkSpecializationMapEntry, 5> spec_entries {{
 
 static std::variant<VkPipeline, std::string> create_pipeline(
     const GPUDevice & gpu, VkPipelineLayout layout,
-    const uint32_t * code, size_t code_size, const GaussSpecData & spec) {
+    const uint32_t * code, size_t code_size, const GaussSpecData & spec,
+    size_t tile_bytes) {
 
+    // All three kernels launch 16x8; only the fused small path declares the
+    // `vblur` tile, whose bytes the caller computed for this config.
+    const GpuWorkgroup workgroup { .x = 16, .y = 8,
+        .shared_bytes = static_cast<uint32_t>(tile_bytes) };
     return gpu_create_pipeline(gpu, code, code_size, layout, spec_entries.data(),
         &spec, static_cast<uint32_t>(spec_entries.size()), sizeof(spec),
-        "gaussblur");
+        "gaussblur", 0, workgroup);
 }
 
 // ---------------------------------------------------------------------------
@@ -743,8 +748,10 @@ static void VS_CC GaussCreate(
         };
 
         if (cfg.small) {
+            const size_t tile_bytes = static_cast<size_t>(VRT) * BLK_Y *
+                (BLK_X + 2 * radius) * sizeof(float);
             const auto result = create_pipeline(
-                *d->gpu, d->pipeline_layout, gauss_code, gauss_size, spec);
+                *d->gpu, d->pipeline_layout, gauss_code, gauss_size, spec, tile_bytes);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -752,7 +759,7 @@ static void VS_CC GaussCreate(
         } else {
             {
                 const auto result = create_pipeline(
-                    *d->gpu, d->pipeline_layout, vert_code, vert_size, spec);
+                    *d->gpu, d->pipeline_layout, vert_code, vert_size, spec, 0);
                 if (std::holds_alternative<std::string>(result)) {
                     return set_error(std::get<std::string>(result));
                 }
@@ -760,7 +767,7 @@ static void VS_CC GaussCreate(
             }
             {
                 const auto result = create_pipeline(
-                    *d->gpu, d->pipeline_layout, horiz_code, horiz_size, spec);
+                    *d->gpu, d->pipeline_layout, horiz_code, horiz_size, spec, 0);
                 if (std::holds_alternative<std::string>(result)) {
                     return set_error(std::get<std::string>(result));
                 }

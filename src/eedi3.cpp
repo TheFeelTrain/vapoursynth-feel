@@ -2125,21 +2125,26 @@ static void vsfeel_eedi3_create(
         Eedi3Pipelines p;
         auto add = [&](const uint32_t * code, size_t size, const char * tag,
                        uint32_t subgroup, VkPipeline * dst,
-                       uint32_t invocations = 0) -> std::optional<std::string> {
+                       GpuWorkgroup workgroup = {}) -> std::optional<std::string> {
             if (!code) {
                 return std::nullopt;
             }
             auto r = gpu_create_pipeline(*d->gpu, code, size, d->pipeline_layout,
                 row_entries.data(), &spec, static_cast<uint32_t>(row_entries.size()),
-                sizeof(spec), tag, subgroup, invocations);
+                sizeof(spec), tag, subgroup, workgroup);
             if (std::holds_alternative<std::string>(r)) {
                 return std::get<std::string>(r);
             }
             *dst = std::get<VkPipeline>(r);
             return std::nullopt;
         };
+        // Row kernel LDS: tileF[BT_TILE] + rowXmin + the packed mask words
+        // `bmaskSh[(WIDTH + 31) / 32]` (eedi3.comp:631), at this plane's width.
+        const uint32_t row_shared = 32 + 4 +
+            4 * ((static_cast<uint32_t>(spec.width) + 31) / 32);
         if (auto e = add(d->row_code, d->row_size, "eedi3-row", row_subgroup_size,
-                         &p.row, SGSIZE)) {
+                         &p.row, GpuWorkgroup { .x = SGSIZE,
+                             .shared_bytes = row_shared })) {
             return e;
         }
         p.vcheck_para = para_ok;
@@ -2152,44 +2157,55 @@ static void vsfeel_eedi3_create(
             const size_t vc_size = p.vcheck_para
                 ? d->vcheck_para_size[d->vcheck_para - 1]
                 : (p.vcheck_lds ? d->vcheck_lds_size : d->vcheck_size);
-            if (auto e = add(vc_code, vc_size, "eedi3-vcheck", 0, &p.vcheck)) {
+            // tlineSh[2][MAXW] is the LDS variant's whole footprint.
+            if (auto e = add(vc_code, vc_size, "eedi3-vcheck", 0, &p.vcheck,
+                             GpuWorkgroup { .x = static_cast<uint32_t>(lsz_vcheck),
+                                 .shared_bytes = p.vcheck_lds
+                                     ? 2 * MAXW_LDS * 4u : 0u })) {
                 return e;
             }
             if (mclip_on && !p.vcheck_lds && !p.vcheck_para) {
                 if (auto e = add(d->vcopy_code, d->vcopy_size, "eedi3-vcopy", 0,
-                                 &p.vcopy)) {
+                                 &p.vcopy, GpuWorkgroup { .x = 256 })) {
                     return e;
                 }
             }
         }
-        if (auto e = add(d->pad_code, d->pad_size, "eedi3-pad", 0, &p.pad)) {
+        if (auto e = add(d->pad_code, d->pad_size, "eedi3-pad", 0, &p.pad,
+                         GpuWorkgroup { .x = 256 })) {
             return e;
         }
-        if (auto e = add(d->blit_code, d->blit_size, "eedi3-blit", 0, &p.blit)) {
+        if (auto e = add(d->blit_code, d->blit_size, "eedi3-blit", 0, &p.blit,
+                         GpuWorkgroup { .x = 256 })) {
             return e;
         }
-        if (auto e = add(d->xpose_code, d->xpose_size, "eedi3-xpose", 0, &p.xpose)) {
+        if (auto e = add(d->xpose_code, d->xpose_size, "eedi3-xpose", 0, &p.xpose,
+                         GpuWorkgroup { .x = 16, .y = 16, .shared_bytes = 16 * 17 * 4 })) {
             return e;
         }
         if (auto e = add(d->compose_code, d->compose_size, "eedi3-compose", 0,
-                         &p.compose)) {
+                         &p.compose, GpuWorkgroup { .x = 16, .y = 16,
+                             .shared_bytes = 2 * 16 * 17 * 4 })) {
             return e;
         }
         if (auto e = add(d->assemble_code, d->assemble_size, "eedi3-assemblev", 0,
-                         &p.assemble)) {
+                         &p.assemble, GpuWorkgroup { .x = 256 })) {
             return e;
         }
         if (mclip_on) {
             if (auto e = add(d->maskpack_code[fmt], d->maskpack_size[fmt],
-                             "eedi3-maskpack", 0, &p.maskpack)) {
+                             "eedi3-maskpack", 0, &p.maskpack,
+                             GpuWorkgroup { .x = 32, .shared_bytes = 32 * 4 })) {
                 return e;
             }
             if (auto e = add(d->maskdilate_raw_code[fmt], d->maskdilate_raw_size[fmt],
-                             "eedi3-maskdilate", 0, &p.maskdilate_raw)) {
+                             "eedi3-maskdilate", 0, &p.maskdilate_raw,
+                             GpuWorkgroup { .x = 64 })) {
                 return e;
             }
             if (auto e = add(d->maskdilate_tr_code[fmt], d->maskdilate_tr_size[fmt],
-                             "eedi3-maskdilate-tr", 0, &p.maskdilate_tr)) {
+                             "eedi3-maskdilate-tr", 0, &p.maskdilate_tr,
+                             GpuWorkgroup { .x = 64 })) {
                 return e;
             }
         }

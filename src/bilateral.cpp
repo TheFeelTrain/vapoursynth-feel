@@ -167,8 +167,16 @@ static std::variant<VkPipeline, std::string> create_pipeline(
         entries = plain_entries.data();
         entry_count = static_cast<uint32_t>(std::size(plain_entries));
     }
+    // `buf[SHARED_FLOATS]` is the spec constant below, so the shared kernel's
+    // static LDS is exactly this many floats; the plain kernel declares none.
+    const GpuWorkgroup workgroup {
+        .x = static_cast<uint32_t>(spec.block_x),
+        .y = static_cast<uint32_t>(spec.block_y),
+        .shared_bytes = use_shared
+            ? static_cast<uint32_t>(spec.shared_floats * sizeof(float)) : 0u
+    };
     return gpu_create_pipeline(dev, code, code_size, layout, entries, &spec,
-        entry_count, sizeof(spec), "bilateral");
+        entry_count, sizeof(spec), "bilateral", 0, workgroup);
 }
 
 // ---------------------------------------------------------------------------
@@ -531,18 +539,30 @@ static void VS_CC BilateralCreate(
     {
         const VkPhysicalDeviceLimits & limits = d->gpu->limits;
 
-        // shrink the default block size if the device cannot host it
+        // A block over a limit (or a negative one, which the unsigned cast in
+        // the comparison turns into one) falls back to 16x16, as it always has.
         if (static_cast<uint32_t>(block_x) > limits.maxComputeWorkGroupSize[0] ||
             static_cast<uint32_t>(block_y) > limits.maxComputeWorkGroupSize[1] ||
             static_cast<uint32_t>(block_x) * block_y > limits.maxComputeWorkGroupInvocations) {
-            block_x = std::min<int>(16, limits.maxComputeWorkGroupSize[0]);
-            block_y = std::min<int>(16, limits.maxComputeWorkGroupSize[1]);
+            block_x = std::min<int>(16, static_cast<int>(limits.maxComputeWorkGroupSize[0]));
+            block_y = std::min<int>(16, static_cast<int>(limits.maxComputeWorkGroupSize[1]));
+        }
+        // That fallback is still 256 invocations, so halve the shape until the
+        // device accepts it: 16x16 failed on a device whose limit is the Vulkan
+        // minimum of 128. Both dimensions are spec constants and the grid
+        // follows them, so any shape here is valid.
+        const auto over_budget = [&] {
+            return static_cast<uint64_t>(block_x) * static_cast<uint64_t>(block_y) >
+                limits.maxComputeWorkGroupInvocations;
+        };
+        while (block_y > 1 && over_budget()) {
+            block_y /= 2;
+        }
+        while (block_x > 1 && over_budget()) {
+            block_x /= 2;
         }
 
-        if (block_x <= 0 || block_y <= 0 ||
-            static_cast<uint32_t>(block_x) > limits.maxComputeWorkGroupSize[0] ||
-            static_cast<uint32_t>(block_y) > limits.maxComputeWorkGroupSize[1] ||
-            static_cast<uint32_t>(block_x) * block_y > limits.maxComputeWorkGroupInvocations) {
+        if (block_x <= 0 || block_y <= 0 || over_budget()) {
             return set_error("invalid \"block_x\"/\"block_y\" for this device");
         }
     }

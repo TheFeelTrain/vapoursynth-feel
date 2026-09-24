@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "vapoursynth-feel"
 dynamic = ["version"]
-description = "GPU-accelerated VapourSynth filters (Vulkan)"
+description = "GPU-accelerated filters in Vulkan for VapourSynth"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -14,7 +14,7 @@ authors = [{ name = "TheFeelTrain" }]
 maintainers = [
     { name = "TheFeelTrain", email = "the@feeltra.in" }
 ]
-dependencies = ["vapoursynth>=74"]
+dependencies = ["vapoursynth>=80"]
 
 [dependency-groups]
 dev = [

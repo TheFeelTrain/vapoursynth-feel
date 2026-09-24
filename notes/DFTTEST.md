@@ -171,6 +171,13 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   The fix was the driver opt-in, not filter code.
 - **Fused codegen residue**: remaining IM2COL/window ALU and pointer-walk
   strength reduction. col2im is already ~2x the references; leave it.
+- `pad`/`col2im` are 32x8 (256 invocations, the plugin's largest workgroup):
+  a device at the Vulkan minimum of 128 cannot run DFTTest at all and now says
+  so at creation (`tests/test_device_limits.py`). The local size is a literal in
+  the shader and the grid is sized from it, so a smaller variant means a `-D`
+  plus the matching grid math in `DftCreate` — worth doing only if such a device
+  turns up. NLMeans, EEDI3's copy kernels, NNEDI3's keep/pad and BM3D's
+  aggregation are in the same position.
 
 ## Debug env vars
 

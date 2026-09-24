@@ -266,9 +266,11 @@ static std::variant<VkPipeline, std::string> create_bm3d_pipeline(
     const uint32_t subgroup_size = forced_subgroup > 0
         ? static_cast<uint32_t>(forced_subgroup)
         : 32u;
+    // LDS: l_e/l_x/l_y/l_s are [4][64] each, three int arrays and one float.
+    const GpuWorkgroup workgroup { .x = 32, .shared_bytes = 4 * 64 * 4 * 4 };
     return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(), &spec,
         static_cast<uint32_t>(entries.size()), sizeof(spec), "bm3d",
-        subgroup_size, /*workgroup_invocations=*/32);
+        subgroup_size, workgroup);
 }
 
 static std::variant<VkPipeline, std::string> create_agg_pipeline(
@@ -285,8 +287,10 @@ static std::variant<VkPipeline, std::string> create_agg_pipeline(
         { 2,  8, sizeof(int32_t) },
         { 3, 12, sizeof(int32_t) },
     }};
+    // The aggregation kernel is a plain 32x8 grid-stride kernel with no LDS.
     return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(), &spec,
-        static_cast<uint32_t>(entries.size()), sizeof(spec), "bm3d_agg");
+        static_cast<uint32_t>(entries.size()), sizeof(spec), "bm3d_agg", 0,
+        GpuWorkgroup { .x = 32, .y = 8 });
 }
 
 // ---------------------------------------------------------------------------

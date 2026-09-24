@@ -340,6 +340,19 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     dev->max_compute_workgroup_subgroups = size_control.maxComputeWorkgroupSubgroups;
     dev->subgroup_ops = subgroup.supportedOperations;
 
+    // Test knobs: lower the reported compute limits so the small-device paths can
+    // be exercised on a GPU that has room for everything (a build for a 16 KiB /
+    // 128-invocation device is otherwise untestable here). They only ever clamp
+    // down, so a real limit is never raised.
+    if (const int cap = env_int("VSFEEL_LIMIT_SHARED_MEMORY", 0); cap > 0 &&
+        static_cast<uint32_t>(cap) < dev->limits.maxComputeSharedMemorySize) {
+        dev->limits.maxComputeSharedMemorySize = static_cast<uint32_t>(cap);
+    }
+    if (const int cap = env_int("VSFEEL_LIMIT_INVOCATIONS", 0); cap > 0 &&
+        static_cast<uint32_t>(cap) < dev->limits.maxComputeWorkGroupInvocations) {
+        dev->limits.maxComputeWorkGroupInvocations = static_cast<uint32_t>(cap);
+    }
+
     uint32_t families = 0;
     vk->vkGetPhysicalDeviceQueueFamilyProperties2(handles.physicalDevice, &families, nullptr);
     std::vector<VkQueueFamilyProperties2> family_props(families);
@@ -411,13 +424,17 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
             VK_API_VERSION_MAJOR(p.driverVersion), VK_API_VERSION_MINOR(p.driverVersion),
             VK_API_VERSION_PATCH(p.driverVersion));
         fprintf(stderr, "[vsfeel] queue family %u (timestamps=%u), subgroup %u [%u..%u] "
-                        "ops=0x%x maxWorkgroupSubgroups=%u (control=%d full=%d), "
-                        "maxStorageBufferRange=%llu\n",
+                        "ops=0x%x maxWorkgroupSubgroups=%u (control=%d full=%d)\n",
             dev->queue_family, dev->timestamp_valid_bits, dev->subgroup_size,
             dev->min_subgroup_size, dev->max_subgroup_size,
             static_cast<unsigned>(dev->subgroup_ops),
             dev->max_compute_workgroup_subgroups, dev->subgroup_size_control,
-            dev->compute_full_subgroups,
+            dev->compute_full_subgroups);
+        fprintf(stderr, "[vsfeel] compute limits: invocations=%u, size=%ux%ux%u, "
+                        "shared=%u bytes, maxStorageBufferRange=%llu\n",
+            dev->limits.maxComputeWorkGroupInvocations,
+            dev->limits.maxComputeWorkGroupSize[0], dev->limits.maxComputeWorkGroupSize[1],
+            dev->limits.maxComputeWorkGroupSize[2], dev->limits.maxComputeSharedMemorySize,
             static_cast<unsigned long long>(dev->limits.maxStorageBufferRange));
         fprintf(stderr, "[vsfeel] transfer queue family %u index %u\n",
             handles.transferQueueFamily, handles.transferQueueIndex);

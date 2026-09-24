@@ -307,11 +307,15 @@ const int PXP = ((((NNS + 31) / 32) <= 2) && (FS <= 128)) ? 8 : 4;
 const int EPLX = (FS + 31) / 32;
 const int PPL = (NNS + 31) / 32;
 
-// Shared tile stride in vec4 rows. Must always be a -D: the array dimension
+// Shared tile stride in vec4 rows: one row per window element (PXP=4) or 256
+// for the two-pixel-pair PXP=8 form. Must always be a -D: the array dimension
 // below cannot depend on PXP/FS (spec constants), and the old GLSL-const
 // fallback silently disagreed with the #if that sized the array, so PXP=8
-// addressed 256 while 288 was allocated. The default variant is selected by
-// the host only for PXP=8 (256), n4 for PXP=4 (288), n4s for FS<=64 (64).
+// addressed 256 while 288 was allocated. The host picks the module from FS and
+// the device's shared-memory limit: the default variant for PXP=8 (256), n4 for
+// PXP=4 (288, every window), n4m for FS<=192 (192, for 16 KiB devices) and n4s
+// for FS<=64 (64). A stride below FS would read another subgroup's rows, so the
+// host's table is what keeps these in range.
 #ifndef SHSTRIDE
 #define SHSTRIDE 288u
 #endif

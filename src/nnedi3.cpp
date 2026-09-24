@@ -64,6 +64,16 @@ constexpr int NNEDI3_XDIM[7] { 8, 16, 32, 48, 8, 16, 32 };
 constexpr int NNEDI3_YDIM[7] { 6, 6, 6, 6, 4, 4, 4 };
 constexpr int NNEDI3_NNS[5] { 16, 32, 64, 128, 256 };
 
+// Static LDS of each predict module: `shared vec4 shTile[4 * SHSTRIDE]`
+// (nnedi3.comp:319) times the four subgroups of the 128-thread workgroup. The
+// window is `xdim * ydim` rows per subgroup, so 288 covers every network
+// (xdim 48) and 192 covers all but that one. Re-derive with
+// `python3 tools/shader_limits.py`.
+constexpr uint32_t kPredictLdsPxp8 = 4 * 256 * 16;   // 16 KiB
+constexpr uint32_t kPredictLdsN4 = 4 * 288 * 16;     // 18 KiB
+constexpr uint32_t kPredictLdsN4m = 4 * 192 * 16;    // 12 KiB
+constexpr uint32_t kPredictLdsN4s = 4 * 64 * 16;     // 4 KiB
+
 // Weight blob linked into the binary (see CMakeLists.txt): objcopy on every
 // toolchain that has it, an RCDATA resource on Windows, where none does.
 #if !defined(_WIN32)
@@ -450,12 +460,12 @@ static constexpr std::array<VkSpecializationMapEntry, 11> spec_entries = [] {
 static std::variant<VkPipeline, std::string> create_pipeline(
     const GPUDevice & gpu, const Nnedi3Spec & spec, const uint32_t * code,
     size_t code_size, VkPipelineLayout layout,
-    uint32_t required_subgroup_size = 0, uint32_t workgroup_invocations = 0,
+    uint32_t required_subgroup_size = 0, GpuWorkgroup workgroup = {},
     bool full_subgroups = false) {
 
     return gpu_create_pipeline(gpu, code, code_size, layout, spec_entries.data(),
         &spec, static_cast<uint32_t>(spec_entries.size()), sizeof(spec), "nnedi3",
-        required_subgroup_size, workgroup_invocations, full_subgroups);
+        required_subgroup_size, workgroup, full_subgroups);
 }
 
 // The indirect struct arrives through vkCmdFillBuffer, and prescreen's
@@ -1092,6 +1102,8 @@ static void VS_CC Nnedi3Create(
     size_t pred_size = 0;
     const uint32_t * pred_n4_code = nullptr;
     size_t pred_n4_size = 0;
+    const uint32_t * pred_n4m_code = nullptr;
+    size_t pred_n4m_size = 0;
     const uint32_t * pred_n4s_code = nullptr;
     size_t pred_n4s_size = 0;
     const uint32_t * keep_code = nullptr;
@@ -1100,12 +1112,14 @@ static void VS_CC Nnedi3Create(
         pre_code = nnedi3_16_prescreen_spv; pre_size = nnedi3_16_prescreen_spv_size;
         pred_code = nnedi3_16_predict_spv; pred_size = nnedi3_16_predict_spv_size;
         pred_n4_code = nnedi3_16_predict_n4_spv; pred_n4_size = nnedi3_16_predict_n4_spv_size;
+        pred_n4m_code = nnedi3_16_predict_n4m_spv; pred_n4m_size = nnedi3_16_predict_n4m_spv_size;
         pred_n4s_code = nnedi3_16_predict_n4s_spv; pred_n4s_size = nnedi3_16_predict_n4s_spv_size;
         keep_code = nnedi3_16_keep_spv; keep_size = nnedi3_16_keep_spv_size;
     } else {
         pre_code = nnedi3_32_prescreen_spv; pre_size = nnedi3_32_prescreen_spv_size;
         pred_code = nnedi3_32_predict_spv; pred_size = nnedi3_32_predict_spv_size;
         pred_n4_code = nnedi3_32_predict_n4_spv; pred_n4_size = nnedi3_32_predict_n4_spv_size;
+        pred_n4m_code = nnedi3_32_predict_n4m_spv; pred_n4m_size = nnedi3_32_predict_n4m_spv_size;
         pred_n4s_code = nnedi3_32_predict_n4s_spv; pred_n4s_size = nnedi3_32_predict_n4s_spv_size;
         keep_code = nnedi3_32_keep_spv; keep_size = nnedi3_32_keep_spv_size;
     }
@@ -1225,22 +1239,40 @@ static void VS_CC Nnedi3Create(
                 if (d->use_list) {
                     const auto result = create_pipeline(*d->gpu, spec, pre_code,
                         pre_size, d->pipeline_layout, pred_subgroup_size,
-                        kCoopInvocations, /*full_subgroups=*/true);
+                        GpuWorkgroup { .x = kCoopInvocations },
+                        /*full_subgroups=*/true);
                     if (std::holds_alternative<std::string>(result)) {
                         return set_error(std::get<std::string>(result));
                     }
                     pre_pipes[n_keys] = std::get<VkPipeline>(result);
                 }
                 {
+                    // The predict module is picked by the window size: the PXP=8
+                    // one addresses 256 vec4 rows, and the PXP=4 ones one row per
+                    // element, so `n4` (288 rows, 18 KiB) covers every window and
+                    // `n4m` (192) covers all but the 48x6 network. Take the small
+                    // tile only where the device cannot hold the big one, so the
+                    // measured variant is what runs wherever it fits.
                     const int net_fs = d->xdim * d->ydim;
+                    uint32_t lds = kPredictLdsPxp8;
                     const uint32_t * mod = pred_code;
                     size_t mod_size = pred_size;
                     if (!use_pxp8(d->nns, net_fs)) {
-                        mod = net_fs <= 64 ? pred_n4s_code : pred_n4_code;
-                        mod_size = net_fs <= 64 ? pred_n4s_size : pred_n4_size;
+                        if (net_fs <= 64) {
+                            mod = pred_n4s_code; mod_size = pred_n4s_size;
+                            lds = kPredictLdsN4s;
+                        } else if (net_fs <= 192 &&
+                                   d->gpu->limits.maxComputeSharedMemorySize < kPredictLdsN4) {
+                            mod = pred_n4m_code; mod_size = pred_n4m_size;
+                            lds = kPredictLdsN4m;
+                        } else {
+                            mod = pred_n4_code; mod_size = pred_n4_size;
+                            lds = kPredictLdsN4;
+                        }
                     }
                     const auto result = create_pipeline(*d->gpu, spec, mod, mod_size,
-                        d->pipeline_layout, pred_subgroup_size, kCoopInvocations,
+                        d->pipeline_layout, pred_subgroup_size,
+                        GpuWorkgroup { .x = kCoopInvocations, .shared_bytes = lds },
                         /*full_subgroups=*/true);
                     if (std::holds_alternative<std::string>(result)) {
                         return set_error(std::get<std::string>(result));
@@ -1250,7 +1282,8 @@ static void VS_CC Nnedi3Create(
             }
             {
                 const auto result = create_pipeline(*d->gpu, spec, keep_code,
-                    keep_size, d->pipeline_layout);
+                    keep_size, d->pipeline_layout, 0,
+                    GpuWorkgroup { .x = 256 });
                 if (std::holds_alternative<std::string>(result)) {
                     return set_error(std::get<std::string>(result));
                 }

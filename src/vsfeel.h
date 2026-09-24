@@ -543,18 +543,34 @@ inline std::variant<VkPipelineLayout, std::string> gpu_pipeline_layout(
     return layout;
 }
 
+// A compute pipeline's workgroup shape and its static shared-memory footprint,
+// as written in the shader it was compiled from (per-variant numbers are what
+// `tools/shader_limits.py` prints off the built SPIR-V). Vulkan guarantees only
+// 128 invocations, 128 per dimension and 16 KiB of workgroup memory, and several
+// kernels here ask for 256 invocations or 18 KiB, so every pipeline has to be
+// measured against the device before it is created rather than left to fail
+// inside vkCreateComputePipelines.
+struct GpuWorkgroup {
+    uint32_t x { 1 };
+    uint32_t y { 1 };
+    uint32_t z { 1 };
+    uint32_t shared_bytes {};
+
+    uint32_t invocations() const { return x * y * z; }
+};
+
 // Compute pipeline from an embedded SPIR-V blob plus its specialization
 // constants. maintenance5 is part of the core's baseline, so the module is
 // chained straight into pipeline creation and never exists as an object.
 // `entries` == nullptr means no specialization; `required_subgroup_size` 0
 // leaves the driver's default width alone, and any non-zero request is checked
-// against the device for the `workgroup_invocations` the kernel launches with.
-// `tag` only names the pipeline in the VSFEEL_DEBUG banner.
+// against the device for the `workgroup` the kernel launches with. `tag` only
+// names the pipeline in the VSFEEL_DEBUG banner.
 inline std::variant<VkPipeline, std::string> gpu_create_pipeline(
     const GPUDevice & g, const uint32_t * code, size_t code_size,
     VkPipelineLayout layout, const VkSpecializationMapEntry * entries,
     const void * values, uint32_t entry_count, size_t values_size, const char * tag,
-    uint32_t required_subgroup_size = 0, uint32_t workgroup_invocations = 0,
+    uint32_t required_subgroup_size = 0, GpuWorkgroup workgroup = {},
     bool full_subgroups = false) {
 
     if (entries == nullptr) {
@@ -563,14 +579,40 @@ inline std::variant<VkPipeline, std::string> gpu_create_pipeline(
         values_size = 0;
     }
     if (vsfeel_debug_enabled()) {
-        fprintf(stderr, "[vsfeel] pipeline %s subgroup=%u local=%u spec=%u\n",
-            tag, required_subgroup_size, workgroup_invocations, entry_count);
+        fprintf(stderr, "[vsfeel] pipeline %s subgroup=%u local=%ux%ux%u lds=%u spec=%u\n",
+            tag, required_subgroup_size, workgroup.x, workgroup.y, workgroup.z,
+            workgroup.shared_bytes, entry_count);
     }
+
+    // Workgroup shape and shared memory against what the device reports. The
+    // shader's own static LDS is what binds; the driver would reject the
+    // pipeline anyway, so this is about saying which kernel and which number.
+    const uint32_t invocations = workgroup.invocations();
+    const VkPhysicalDeviceLimits & lim = g.limits;
+    if (workgroup.x > lim.maxComputeWorkGroupSize[0] ||
+        workgroup.y > lim.maxComputeWorkGroupSize[1] ||
+        workgroup.z > lim.maxComputeWorkGroupSize[2] ||
+        invocations > lim.maxComputeWorkGroupInvocations) {
+        return std::string(tag) + " needs a " + std::to_string(workgroup.x) + "x" +
+            std::to_string(workgroup.y) + "x" + std::to_string(workgroup.z) +
+            " workgroup (" + std::to_string(invocations) +
+            " invocations); this device allows at most " +
+            std::to_string(lim.maxComputeWorkGroupInvocations) + " invocations ("
+            + std::to_string(lim.maxComputeWorkGroupSize[0]) + "x" +
+            std::to_string(lim.maxComputeWorkGroupSize[1]) + "x" +
+            std::to_string(lim.maxComputeWorkGroupSize[2]) + " per dimension)";
+    }
+    if (workgroup.shared_bytes > lim.maxComputeSharedMemorySize) {
+        return std::string(tag) + " needs " + std::to_string(workgroup.shared_bytes) +
+            " bytes of workgroup memory; this device allows " +
+            std::to_string(lim.maxComputeSharedMemorySize);
+    }
+
     if (required_subgroup_size != 0 &&
-        !g.has_subgroup_size(required_subgroup_size, workgroup_invocations)) {
+        !g.has_subgroup_size(required_subgroup_size, invocations)) {
         return std::string(tag) + " requests subgroup size " +
             std::to_string(required_subgroup_size) + " for a workgroup of " +
-            std::to_string(workgroup_invocations) +
+            std::to_string(invocations) +
             " invocations, which is not a subgroup size this device supports";
     }
     // REQUIRE_FULL_SUBGROUPS is only valid with the computeFullSubgroups feature.

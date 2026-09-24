@@ -210,16 +210,27 @@ struct NLMeansData {
 
 static std::variant<VkPipeline, std::string> create_pipeline(
     const GPUDevice & gpu, VkPipelineLayout layout,
-    const uint32_t * code, size_t code_size, const NLMeansSpecData & spec) {
+    const uint32_t * code, size_t code_size, const NLMeansSpecData & spec,
+    bool weight_pass) {
 
     // Explicit wave32, same knob the legacy build used (measured neutral here).
     // No kernel here uses a subgroup intrinsic, so this is a launch-shape
     // choice, not a requirement: take the default when 32 is not on offer.
-    constexpr uint32_t kInvocations = 32 * 8;
-    const uint32_t subgroup_size = gpu.has_subgroup_size(32, kInvocations) ? 32 : 0;
+    //
+    // LDS: only ENTRY_WEIGHT declares the two tiles,
+    // `dist[VRT_RESULT*BY + 2*NLM_S][BX + 2*NLM_S]` and
+    // `hsum[VRT_RESULT*BY + 2*NLM_S][BX]` (nlmeans.comp:156), sized here for
+    // BX=32, BY=8, VRT_RESULT=3 and a search radius of NLM_S = spec.s.
+    const uint32_t rows = 3 * 8 + 2 * static_cast<uint32_t>(spec.s);
+    const GpuWorkgroup workgroup { .x = 32, .y = 8,
+        .shared_bytes = weight_pass
+            ? (rows * (32 + 2 * static_cast<uint32_t>(spec.s)) + rows * 32) * 4u
+            : 0u };
+    const uint32_t subgroup_size =
+        gpu.has_subgroup_size(32, workgroup.invocations()) ? 32 : 0;
     return gpu_create_pipeline(gpu, code, code_size, layout, spec_entries.data(),
         &spec, static_cast<uint32_t>(spec_entries.size()), sizeof(spec),
-        "nlmeans", subgroup_size, kInvocations);
+        "nlmeans", subgroup_size, workgroup);
 }
 
 // Device address of a frame plane buffer, for the per-frame address table.
@@ -1043,7 +1054,7 @@ static void VS_CC NLMeansCreate(
         }
         {
             const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                compose_code, compose_size, spec);
+                compose_code, compose_size, spec, false);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -1051,7 +1062,7 @@ static void VS_CC NLMeansCreate(
         }
         {
             const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                weight_code, weight_size, spec);
+                weight_code, weight_size, spec, true);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -1059,7 +1070,7 @@ static void VS_CC NLMeansCreate(
         }
         {
             const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                acc_code, acc_size, spec);
+                acc_code, acc_size, spec, false);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }

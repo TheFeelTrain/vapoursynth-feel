@@ -528,10 +528,9 @@ struct DftData {
 // GPU is tuned for. The pad/col2im kernels do not use subgroups but are given
 // the same required size, so the count the device limits, subgroups per
 // workgroup, is read off the largest of the three launches.
-constexpr uint32_t kFusedInvocations = 8 * 16;      // local_size_x = SUB_BLOCKS * 16
-constexpr uint32_t kPadInvocations = 32 * 8;        // local_size_x * local_size_y
-constexpr uint32_t kMaxInvocations =
-    kPadInvocations > kFusedInvocations ? kPadInvocations : kFusedInvocations;
+constexpr GpuWorkgroup kFusedWorkgroup { .x = 8 * 16,   // SUB_BLOCKS * 16
+    .shared_bytes = (8 * 288 + 8) * 4 };                // trans[SUB_BLOCKS*TR_SUB] + s_gf
+constexpr GpuWorkgroup kPadWorkgroup { .x = 32, .y = 8 };
 
 // The fused kernel's variant is baked in as specialization constants so the
 // dead filter branches (and their divisions) vanish, matching the reference's
@@ -540,7 +539,7 @@ constexpr uint32_t kMaxInvocations =
 // watch the driver reject it).
 static std::variant<VkPipeline, std::string> create_pipeline(
     const GPUDevice & gpu, VkPipelineLayout layout, const uint32_t * code,
-    size_t code_size, uint32_t invocations, int32_t filter_type = -1,
+    size_t code_size, GpuWorkgroup workgroup, int32_t filter_type = -1,
     int32_t zmean = -1) {
 
     // The probe knobs win over the default selection below on purpose: they
@@ -559,7 +558,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
         subgroup_size = 17;   // invalid on purpose, to test driver validation
     } else if (forced_sgsize > 0) {
         subgroup_size = static_cast<uint32_t>(forced_sgsize);
-    } else if (gpu.has_subgroup_size(32, kMaxInvocations)) {
+    } else if (gpu.has_subgroup_size(32, kPadWorkgroup.invocations())) {
         subgroup_size = 32;
     } else if (gpu.subgroup_size % 16 != 0) {
         return std::string("dfttest's fused kernel needs a subgroup size that is "
@@ -590,8 +589,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
 
     return gpu_create_pipeline(gpu, code, code_size, layout,
         n_spec ? spec_entries : nullptr, n_spec ? spec_values : nullptr,
-        n_spec, n_spec * sizeof(int32_t), "dfttest", subgroup_size, invocations);
-}
+        n_spec, n_spec * sizeof(int32_t), "dfttest", subgroup_size, workgroup);}
 
 static bool dfttest_trace() {
     static const bool v = vsfeel_debug_trace("VSFEEL_DFFTEST_TRACE");
@@ -1419,7 +1417,7 @@ static void VS_CC DftCreate(
 
         {
             const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                pad_code, pad_size, kPadInvocations);
+                pad_code, pad_size, kPadWorkgroup);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -1427,7 +1425,7 @@ static void VS_CC DftCreate(
         }
         for (int r = 0; r < 4; ++r) {
             const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                fused_code[r], fused_size[r], kFusedInvocations,
+                fused_code[r], fused_size[r], kFusedWorkgroup,
                 d->filter_type, d->zmean ? 1 : 0);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
@@ -1436,7 +1434,7 @@ static void VS_CC DftCreate(
         }
         {
             const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                col2im_code, col2im_size, kPadInvocations);
+                col2im_code, col2im_size, kPadWorkgroup);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }

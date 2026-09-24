@@ -97,6 +97,12 @@ qual=2 etype=0 pscrn=4`), interleaved pre-R80/R80 rounds through
   `ceil(nns/32)<=2 && fs<=128`, PXP=4 small-tile `SHSTRIDE=64` when `fs<=64`,
   PXP=4 otherwise). Prescreen/predict ask 32-lane full subgroups; the keep
   writer takes the driver's default.
+- The predict module's tile is `4 * SHSTRIDE` vec4 rows: 16 KiB for PXP=8
+  (256), 18 KiB for `n4` (288, every PXP=4 window), 12 KiB for `n4m` (192) and
+  4 KiB for `n4s` (64). `n4m` takes over from `n4` only where the device cannot
+  hold 18 KiB and the window is at most 192 rows, so the measured module still
+  runs wherever it fits. The FS=96 `n4m` arm is bit-identical to `n4`
+  (`tests/test_device_limits.py`, sha1 of the plane).
 - Weights: blob parsed at creation (prescreener mean/scale, model
   mean-subtraction projected out), packed into three vec4/vec2-layout blobs
   and written through persistently mapped host-visible buffers + `_mm_sfence`.
@@ -120,6 +126,17 @@ figures are void as current-filter numbers (same marker as
   ballot, and only BASIC is mandatory in Vulkan. Both are required at creation
   (ballot only when `use_list` builds a prescreen), and the 32-lane request is
   resolved against the device instead of being passed through unconditionally.
+- **The 18 KiB predict tile had no smaller variant for a 16 KiB device** — `n4`
+  is `4 * 288` vec4, more than a device may report, so `n4m` (`SHSTRIDE=192`,
+  12 KiB) now covers every window but the 48x6 network and FS=288 reports
+  `18432` against the limit instead of failing inside the driver. Every pipeline
+  is measured against the device the same way (`gpu_create_pipeline`), so a
+  128-invocation device gets "needs a 32x8x1 workgroup (256 invocations)" per
+  kernel rather than a `vkCreateComputePipelines` failure; `tools/shader_limits.py`
+  prints the per-variant numbers those checks are built from, and
+  `VSFEEL_LIMIT_SHARED_MEMORY` / `VSFEEL_LIMIT_INVOCATIONS` clamp the reported
+  limits down so the paths are testable on a GPU that fits everything
+  (`tests/test_device_limits.py`).
 
 ### 2026-09-23 — R80 GPU API port
 
