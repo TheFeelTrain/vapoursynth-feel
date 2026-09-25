@@ -170,6 +170,11 @@ under-reported every stage 10x).
   flushed them, so a non-coherent device would gather a stale `v`; mirrored
   EEDI3's invalidate per fence wait. No perf change; no-op here (133/133 with a
   forced-`coherent=false` build, zero VUIDs).
+- **2026-09-25 — the per-submission scratch is cleared before any pass runs**
+  (`src/eedi3.cpp`), so a pass reading a region it never wrote in that submission
+  gets 0, the benign value for every flag in it, instead of recycled pool
+  contents. Measured inert on healthy frames (no pixel changes); `..._NOCLEAR=1`
+  restores the old behaviour. No perf change.
 - **Round 8 — hardening.** The shared `mapped_range`/`flush_range`/
   `invalidate_range` helpers replaced all hand-built 32-byte-aligned
   `VkMappedMemoryRange`s (`src/vsfeel.h:196`), and the shared
@@ -212,6 +217,10 @@ cap is `VSFEEL_EEDI3_QUEUES`, not `..._EEDI3AA_QUEUES`.
   gathers, bit1 final blit); `..._AATIGHT=0` two-plane + CPU merged compose;
   `..._VCLDS=1` LDS ping-pong vcheck; `..._MASKFUSE=0`/`..._PAIR=0` the shared
   EEDI3H mask-fuse and aliased-pair-gather ablations, applied to the AA gathers.
+- `..._POISON=<hex>[:<region>]` — fill the scratch (or one region: `pad`, `dst`,
+  `dmap`, `rempty`, `vout`, …) before the passes, so two runs with two patterns
+  differ exactly on the pixels that depend on unwritten scratch; `..._NOCLEAR=1`
+  drops the per-submission clear. Both change output by design.
 - Shared ablation knobs the AA path honours: `_NORAW`, `_NOSCLIP`, `_NOVC`,
   `_NOXPOSE`, `_NOCOMPOSE`, `_NOMASKX`, `_NOPAD`, `_NOH2D`, `_NOXFER`, `_PADPAR`,
   `_RAWSTAGE`, `_BLITCONTIG`, `_DSTHOST` (`_NOBLIT` is rejected); `_PTRTRACE` and

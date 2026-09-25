@@ -1215,6 +1215,71 @@ static const VSFrame *VS_CC Eedi3GetFrame(
 // stage runs the transposed-parity source twice and merges into the
 // intermediate frame v in VRAM; the horizontal stage then runs twice on v, with
 // the second compose merging the two planes straight into the output frame.
+// Fill a scratch range and make it visible to the compute stage.
+static void eedi3_fill_scratch(const Eedi3Data & d, VkCommandBuffer cmd, VkBuffer buf,
+                               VkDeviceSize off, VkDeviceSize bytes, uint32_t pattern) {
+    VkDeviceSize size = bytes & ~static_cast<VkDeviceSize>(3);
+    if (!size) {
+        return;
+    }
+    d.gpu->vk->vkCmdFillBuffer(cmd, buf, off, size, pattern);
+    VkMemoryBarrier2 mb {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    VkDependencyInfo dep {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &mb;
+    d.gpu->vk->vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+// Diagnostic: fill the scratch, or one named region of it, with a caller-chosen
+// pattern (VSFEEL_EEDI3_POISON=<hex>[:<region>]). Two runs then differ exactly
+// on pixels that depend on unwritten scratch. Changes output by design.
+static void eedi3_poison_scratch(const Eedi3Data & d, VkCommandBuffer cmd, VkBuffer buf,
+                                 uint32_t pattern, const std::string & only) {
+    struct Region {
+        const char * name;
+        VkDeviceSize Eedi3PlaneConfig::* off;
+        VkDeviceSize Eedi3PlaneConfig::* bytes;
+    };
+    static const Region regions[] {
+        { "pad", &Eedi3PlaneConfig::pad_off, &Eedi3PlaneConfig::pad_bytes },
+        { "dst", &Eedi3PlaneConfig::dst_off, &Eedi3PlaneConfig::dst_bytes },
+        { "dst2", &Eedi3PlaneConfig::dst2_off, &Eedi3PlaneConfig::dst2_bytes },
+        { "pbt", &Eedi3PlaneConfig::pbt_off, &Eedi3PlaneConfig::pbt_bytes },
+        { "dmap", &Eedi3PlaneConfig::dmap_off, &Eedi3PlaneConfig::dmap_bytes },
+        { "rempty", &Eedi3PlaneConfig::rempty_off, &Eedi3PlaneConfig::rempty_bytes },
+        { "cint", &Eedi3PlaneConfig::cint_off, &Eedi3PlaneConfig::cint_bytes },
+        { "vout", &Eedi3PlaneConfig::vout_off, &Eedi3PlaneConfig::vout_bytes },
+        { "vout2", &Eedi3PlaneConfig::vout2_off, &Eedi3PlaneConfig::vout2_bytes },
+        { "bits", &Eedi3PlaneConfig::bits_off, &Eedi3PlaneConfig::bits_bytes },
+        { "pred", &Eedi3PlaneConfig::pred_off, &Eedi3PlaneConfig::pred_bytes },
+        { "rt", &Eedi3PlaneConfig::rt_off, &Eedi3PlaneConfig::rt_bytes },
+        { "rtS", &Eedi3PlaneConfig::rtS_off, &Eedi3PlaneConfig::rtS_bytes },
+        { "o0", &Eedi3PlaneConfig::o0_off, &Eedi3PlaneConfig::o0_bytes },
+        { "v", &Eedi3PlaneConfig::v_off, &Eedi3PlaneConfig::v_bytes },
+    };
+    if (only.empty()) {
+        eedi3_fill_scratch(d, cmd, buf, 0, d.scratch_bytes, pattern);
+        return;
+    }
+    for (const Eedi3PlaneConfig * cfg : { d.planes.data(), d.aplanes.data() }) {
+        for (int plane = 0; plane < d.vi->format.numPlanes; ++plane) {
+            for (const Region & r : regions) {
+                if (only == r.name) {
+                    eedi3_fill_scratch(d, cmd, buf, cfg[plane].*(r.off),
+                                       cfg[plane].*(r.bytes), pattern);
+                }
+            }
+        }
+    }
+}
+
 static const VSFrame *VS_CC Eedi3AaGetFrame(
     int n, int activationReason, void *instanceData,
     [[maybe_unused]] void **frameData, VSFrameContext *frameCtx, VSCore *core,
@@ -1330,12 +1395,32 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
         const int fh0 = d->field & 1, fh1 = 1 - fh0;
 
         GpuBuffer scratch;
+        // TRANSFER_DST: the scratch is filled (cleared) below.
         if (const std::string e = gpu_make_buffer(*d->gpu, core, d->scratch_bytes, scratch,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); !e.empty()) {
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT); !e.empty()) {
             vsapi->freeFrame(dst);
             return fail("scratch allocation failed: " + e);
         }
         d->gpu->api->gpuExecUsesBuffer(ctx, scratch.handle);
+
+        // Recycled pool memory: clear it so a pass reading a region it never
+        // wrote gets 0, the benign value for every flag in it, rather than
+        // another submission's contents. VSFEEL_EEDI3_NOCLEAR=1 skips this.
+        if (!env_flag("VSFEEL_EEDI3_NOCLEAR")) {
+            eedi3_fill_scratch(*d, cmd, scratch.buffer, 0, d->scratch_bytes, 0);
+        }
+        {
+            const char * poison = env_str("VSFEEL_EEDI3_POISON");
+            if (poison) {
+                const char * colon = std::strchr(poison, ':');
+                const std::string spec(poison, colon
+                    ? static_cast<size_t>(colon - poison) : std::strlen(poison));
+                eedi3_poison_scratch(*d, cmd, scratch.buffer,
+                    static_cast<uint32_t>(std::strtoul(spec.c_str(), nullptr, 0)),
+                    colon ? std::string(colon + 1) : std::string());
+            }
+        }
 
         VkBuffer mask {};
         int mask_stride = 0;
