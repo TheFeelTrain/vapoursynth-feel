@@ -4,6 +4,12 @@
 output frame, temporal aggregation over the stack window). Numerically faithful
 to vszipcl; see the tolerance policy in `tests/test_bm3dv2.py`.
 
+Current correctness and performance fixes: all BM3D radii use exact per-candidate
+SSD scores with a flattened candidate partition; per-slot witness clearing is
+ordered with estimation, and radius-0 fallback uses its private source slot.
+BM3D tests pass; the 1000-frame jpbd benchmark is 766.5 fps for the exact
+sigma=0.7, radius=2, bm_range=9, ps_range=4, block_step=8 config.
+
 Current design:
 
 - Two kernels: `bm3d.comp` (block match + group + collaborative transform,
@@ -16,14 +22,14 @@ Current design:
   else the same kernel's `-DNO_FLOAT_ATOMICS` build runs the reference's own
   `atom_add_f` CAS loop; the host picks per device, `VSFEEL_BM3D_CAS=1` forces
   it (see Historical for the cost).
-- The spatial search scans the (2*bm_range+1)² window with a per-lane row
-  partition and a **sliding column-SSD window**; each sub-group lane keeps its
-  own top-8, which `merge_group` 8-way-merges.
-- Each temporal direction/t step scans PS_NUM PS_RANGE windows around the
-  previous step's matches; **its per-lane list is only PS_NUM deep**, which the
-  Round below shows is equivalent and the largest single win in this file.
-- The scan body is unrolled four candidates wide; the four new column loads
-  issue before any reduce/insert consumes them.
+- The spatial and temporal scans use a flattened candidate partition; every
+  lane evaluates the same direct SSD, then each subgroup merges its local top-K.
+  Adjacent lanes cover adjacent candidate origins for better source-load locality.
+- Candidate SSDs compare each source patch against the same fixed 8x8 reference
+  patch; reuse of shifted SSD column sums is invalid because it shifts the fixed
+  reference columns too.
+- Temporal per-window lists are only PS_NUM deep; the top-k merge proof is in
+  Historical. The full spatial list stays 8 deep.
 - Degenerate paths: `sigma < FLT_EPSILON` passes the plane through (a source
   copy), like the installed references' `PROC_MASK`.
 - **Everything goes through the core's exec pool** (`createGPUExecPool` /
@@ -53,7 +59,7 @@ ps_range 7, block_step 4:
 
 | | fps | note |
 |---|---|---|
-| vsfeel | **332.8** | exec-pool port |
+| vsfeel | **332.8** | exec-pool port; different benchmark config from the current working-tree scan |
 | bm3dvk | 54.8 | R80 reference |
 | vszipcl | 41.6 | |
 
@@ -153,6 +159,18 @@ Chronological; each entry keeps the mechanism, not the story.
   reservations hung the next frame. Benchmark-harness traps found here are
   commented in `tools/benchmark.py` (`--gpu-cache`), not repeated.
 
+- **Block matching reused shifted SSD columns incorrectly.** For radius 0–2,
+  each candidate's cached source-column errors were compared against shifted
+  columns of the fixed reference patch, changing candidate ranks. All radii now
+  use exact SSD scores with a flattened candidate partition; on the jpbd
+  benchmark config above, 647 → 766.5 fps; 75/75 BM3D tests pass.
+- **Concurrent first-use tag clearing could erase witnesses.** `tags_cleared`
+  raced across parallel callbacks, and a whole-buffer clear could submit after
+  another estimate wrote tags. Each estimate now clears only its exclusively
+  reserved slot in the same ordered command buffer.
+- **Radius-0 aggregation fallback used a frame-derived ring slot.** Radius 0
+  reserves private slots that need not equal `frame % ring`; fallback now uses
+  the reservation's slot. No performance change intended.
 - **2026-09-25 — the aggregation trusted slices that were not this frame's.**
   `acc/acw` never checked that the TW slices it summed were the output frame's
   own contributions, so a zero-filled slot divided by zero (black band), a partly
@@ -172,13 +190,9 @@ settles to ±0.2% on repeat. Kernel ms is the metric for kernel work: the fence
 is depth-invariant (5.4 → 5.6 ms over radius 1..8) and fps is flat from ns=2 to
 ns=8, so the GPU is the wall. Graded fps is quoted separately.
 
-1. **Four-wide sliding scan (`scan_row`) — 4.943 → 3.96 ms.** A rolled loop
-   leaves the next candidate's eight loads behind the previous candidate's
-   ~60-instruction insert, and every wave stalls on the same `s_waitcnt` at the
-   same time. Issuing four candidates' new-column loads before any of them is
-   consumed fixes that: 2-wide reached 4.168, 4-wide 3.963, 8-wide 4.093
-   (register pressure starts to bite). Same operations in the same order, so
-   bit-identical.
+1. **Four-wide `scan_row` optimization — superseded by the SSD correctness fix.**
+   Its timings described the old shifted-column reuse and are not valid for the
+   corrected exact per-candidate SSD path; do not quote them for current code.
 2. **Pack the candidate's (x, y) into one word — 3.96 → 3.72 ms.** The insert
    shifts three arrays per position instead of four; x gets 16 bits and y 15,
    which is why creation now rejects dimensions above 65535x32767.
@@ -321,6 +335,8 @@ per-instance staging once before the stream loop; the DB machine is unchanged.
 
 **Method rules**
 
+- BM3D reference comparisons cover match-selection-sensitive inputs only
+  incompletely: add structured horizontal patterns before changing SSD math.
 - Grade kernel changes on `VSFEEL_BM3D_GPUTRACE=1` at `-r 1` over a few hundred
   frames (repeat once: the printed value settles to ±0.2%), then confirm fps
   with an interleaved `tools/benchmark.py` pair over 1000+ frames. A one-shot

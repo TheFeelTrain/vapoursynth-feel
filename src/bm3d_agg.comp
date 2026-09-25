@@ -27,6 +27,8 @@ layout(constant_id = 3) const int TW = 5;
 layout(std430, binding = 0) readonly buffer ResBuf { vec4 res4[]; };
 layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
 layout(std430, binding = 3) readonly buffer TagBuf { uint tags[]; };
+layout(std430, binding = 4) buffer SkipBuf { uint skipped[]; };
+layout(std430, binding = 5) buffer RefuseBuf { uint refusal[]; };
 layout(std430, binding = 2) buffer DstBuf { vec4 dst4[]; };
 
 layout(push_constant) uniform PushConstants {
@@ -83,6 +85,22 @@ void main() {
     // complete stack has a nonzero weight (its own block always contributes), so
     // a zero weight here is proof the contribution is missing, and the honest
     // output for it is the source frame's own pixel: undenoised, never corrupt.
+    if (o == 0 && used < TW) {
+        // Count refusals, and record the first one: the witness value found
+        // against the one wanted tells the two causes apart -- 0 means the
+        // slice was never written, anything else means it holds another
+        // frame's stacks. refusal[0] is the one-shot claim.
+        atomicAdd(skipped[0], 1u);
+        if (atomicCompSwap(refusal[0], 0u, 1u) == 0u) {
+            for (int i = 0; i < TW; ++i) {
+                if (tags[pc.tags_at[i]] != uint(pc.expect[i])) {
+                    refusal[2] = uint(pc.expect[i]);
+                    refusal[3] = tags[pc.tags_at[i]];
+                    break;
+                }
+            }
+        }
+    }
     if (used > 0 && acw.x > 0.0 && acw.y > 0.0 && acw.z > 0.0 && acw.w > 0.0) {
         dst4[o] = acc / acw;
     } else {

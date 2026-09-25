@@ -125,8 +125,11 @@ struct BM3DData {
 
     VkDeviceSize res_size_per_plane {};  // floats per plane in the res buffer
     GpuBuffer tags {};                    // per-(slot, slice) frame witness
+    GpuBuffer skipped {};                 // host-visible: dispatches that skipped a slice
+    volatile uint32_t * skipped_mapped {};
+    GpuBuffer refusal {};                 // host-visible: first refusal fingerprint
+    volatile uint32_t * refusal_mapped {};
     VkDeviceSize tags_size {};            // uints
-    bool tags_cleared { false };
     int nframes {};
 
     // Per-frame-keyed caches of the res estimate stacks and the source
@@ -210,6 +213,23 @@ struct BM3DData {
         gpu_destroy_buffer(*gpu, res);
         gpu_destroy_buffer(*gpu, src);
         gpu_destroy_buffer(*gpu, tags);
+        if (skipped_mapped) {
+            const uint32_t n = *skipped_mapped;
+            if (n) {
+                fprintf(stderr, "[bm3d] %u dispatches skipped an unwitnessed slice\n", n);
+            }
+        }
+        if (refusal_mapped && refusal_mapped[0]) {
+            const uint32_t frame = refusal_mapped[1];
+            const uint32_t expected = refusal_mapped[2];
+            const uint32_t found = refusal_mapped[3];
+            fprintf(stderr, "[bm3d] first refusal: frame %u wanted witness %u, found %u"
+                    " -- %s\n", frame, expected, found,
+                    found == 0 ? "slice never written (fill without estimation)"
+                               : "slice holds another frame's stacks (recycled slot)");
+        }
+        gpu_destroy_buffer(*gpu, skipped);
+        gpu_destroy_buffer(*gpu, refusal);
         if (pipeline_layout) gpu->vk->vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
         if (set_layout) gpu->vk->vkDestroyDescriptorSetLayout(dev, set_layout, nullptr);
         for (auto & p : planes) {
@@ -555,9 +575,10 @@ static void collect_est_positions(BM3DData * d, Bm3dFrame & fr, int n) {
 // them: estimate stacks, source ring, destination plane.
 static void bm3d_bind(const GPUDevice & gpu, VkCommandBuffer cmd,
                       VkPipelineLayout layout, VkBuffer src, VkBuffer res,
-                      VkBuffer dst, VkBuffer tags) {
-    const VkBuffer bufs[4] { res, src, dst, tags };
-    gpu_push_buffers(gpu, cmd, layout, bufs, 4);
+                      VkBuffer dst, VkBuffer tags, VkBuffer skipped,
+                      VkBuffer refusal) {
+    const VkBuffer bufs[6] { res, src, dst, tags, skipped, refusal };
+    gpu_push_buffers(gpu, cmd, layout, bufs, 6);
 }
 
 // A whole-command barrier: every write made visible to every later read. Used
@@ -595,14 +616,19 @@ static void record_est_position(BM3DData * d, const Bm3dFrame & fr, VkCommandBuf
         const VkDeviceSize res_off = (static_cast<VkDeviceSize>(slot) * d->tw * 2 * pe +
             static_cast<VkDeviceSize>(plane) * d->res_size_per_plane);
         d->gpu->vk->vkCmdFillBuffer(cmd, d->res.buffer, res_off * 4, d->tw * 2 * pe * 4, 0);
+        // Clear only this exclusively reserved slot's witnesses in the same
+        // ordered submission; a filter-wide lazy clear races first frames.
+        d->gpu->vk->vkCmdFillBuffer(cmd, d->tags.buffer,
+            static_cast<VkDeviceSize>(slot) * d->tw * 4,
+            static_cast<VkDeviceSize>(d->tw) * 4, 0);
 
-        // the zero-fill must be visible to the atomic accumulation that
-        // follows it in the next dispatch
+        // Both the zero-fill and the tag clear precede the estimation dispatch.
         bm3d_full_barrier(*d->gpu, cmd);
 
         d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.bm3d_pipeline);
         bm3d_bind(*d->gpu, cmd, d->pipeline_layout, d->src.buffer, d->res.buffer,
-                  dst_plane, d->tags.buffer);
+                  dst_plane, d->tags.buffer, d->skipped.buffer,
+                  d->refusal.buffer);
         {
             const int32_t pushes[5] {
                 static_cast<int32_t>(res_off),
@@ -611,13 +637,6 @@ static void record_est_position(BM3DData * d, const Bm3dFrame & fr, VkCommandBuf
                 static_cast<int32_t>((r == 0) ? fr.slot0 : 0),
                 static_cast<int32_t>(static_cast<VkDeviceSize>(slot) * d->tw)
             };
-            // Tags start undefined, so clear them once per filter instance: 0
-            // means "never written" and is never a valid witness.
-            if (!d->tags_cleared) {
-                d->gpu->vk->vkCmdFillBuffer(cmd, d->tags.buffer, 0, d->tags_size * 4, 0);
-                bm3d_full_barrier(*d->gpu, cmd);
-                d->tags_cleared = true;
-            }
             gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, pushes, sizeof(pushes));
         }
         d->gpu->vk->vkCmdDispatch(cmd, p.bm3d_grid_x, p.bm3d_grid_y, 1);
@@ -768,12 +787,14 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame & fr, VkCommandBuffer 
         // without this bind the dispatch runs on undefined descriptor state
         // (black output, and device loss under concurrent submissions)
         bm3d_bind(*d->gpu, cmd, d->pipeline_layout, d->src.buffer, d->res.buffer,
-                  dst_plane, d->tags.buffer);
+                  dst_plane, d->tags.buffer, d->skipped.buffer,
+                  d->refusal.buffer);
         {
             const int clips = d->final ? 2 : 1;
             // The fallback source pixel: the *source* half of this frame's slot
             // in the ring, exactly where record_src_copies put it.
-            const int src_slot = ((n % d->src_ring) + d->src_ring) % d->src_ring;
+            const int src_slot = (r == 0) ? fr.slot0
+                : ((n % d->src_ring) + d->src_ring) % d->src_ring;
             const VkDeviceSize src_base =
                 static_cast<VkDeviceSize>(src_slot) * clips * d->planes[0].pe +
                 static_cast<VkDeviceSize>(clips - 1) * pe +
@@ -806,6 +827,9 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame & fr, VkCommandBuffer 
                     static_cast<VkDeviceSize>(fr.win_slots[i]) * d->tw + z);
             }
             pushes[27] = static_cast<int32_t>(src_base);
+            if (d->refusal_mapped && !d->refusal_mapped[0]) {
+                d->refusal_mapped[1] = static_cast<uint32_t>(n);
+            }
             // Invariant check: at aggregation time this frame still holds its
             // slots, so each must still record the frame whose stack the
             // aggregation is about to read. A mismatch means the stack belongs
@@ -1368,7 +1392,7 @@ static void VS_CC BM3DCreate(
         // Push descriptors: the bindings change every frame (the destination
         // plane is the frame's own storage), so nothing is allocated from a
         // pool and nothing survives the command buffer.
-        const auto result = gpu_push_set_layout(*d->gpu, 4);
+        const auto result = gpu_push_set_layout(*d->gpu, 6);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -1461,6 +1485,32 @@ static void VS_CC BM3DCreate(
             if (!err.empty()) {
                 return set_error("the per-slice frame witness could not be "
                     "allocated: " + err);
+            }
+        }
+        {
+            std::string err = gpu_make_buffer(*d->gpu, core, 4, d->skipped,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (!err.empty()) {
+                return set_error("the skip counter could not be allocated: " + err);
+            }
+            d->skipped_mapped = static_cast<volatile uint32_t *>(d->skipped.mapped);
+            if (d->skipped_mapped) {
+                *d->skipped_mapped = 0;
+            }
+        }
+        {
+            std::string err = gpu_make_buffer(*d->gpu, core, 16, d->refusal,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (!err.empty()) {
+                return set_error("the refusal report could not be allocated: " + err);
+            }
+            d->refusal_mapped = static_cast<volatile uint32_t *>(d->refusal.mapped);
+            for (int i = 0; i < 4; ++i) {
+                if (d->refusal_mapped) {
+                    d->refusal_mapped[i] = 0;
+                }
             }
         }
 

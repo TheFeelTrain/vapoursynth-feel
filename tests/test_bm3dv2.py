@@ -149,6 +149,48 @@ def test_bm3dv2_cas_fallback_holds_at_small_block_step(noise_gray, monkeypatch):
             f"{np.abs(a - b).max():g}")
 
 
+def test_bm3dv2_disjoint_first_estimates_keep_slice_witnesses(noise_gray):
+    """Concurrent opposite-end windows must not clear each other's tags."""
+    import threading
+
+    clip = noise_gray.std.CropAbs(width=64, height=64)
+    kwargs = dict(sigma=SIGMA, radius=2, bm_range=2, ps_range=1, block_step=4)
+    reference = BM3D(clip, **kwargs)
+    expected = {n: frame_to_ndarray(reference.get_frame(n)) for n in (0, 23)}
+
+    for _ in range(3):
+        out = BM3D(clip, **kwargs)
+        gate = threading.Barrier(2)
+        got, errors = {}, []
+
+        def worker(n):
+            try:
+                gate.wait()
+                got[n] = frame_to_ndarray(out.get_frame(n))
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in (0, 23)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert not errors, f"concurrent first estimates failed: {errors}"
+        for n in (0, 23):
+            assert np.abs(got[n] - expected[n]).max() < 1e-5, (
+                f"first-use tag clear corrupted frame {n}")
+
+
+def test_bm3dv2_radius0_concurrent_first_use_and_fallback(noise_gray, monkeypatch):
+    """Concurrent first requests must preserve private tags and fallback input."""
+    monkeypatch.setenv("VSFEEL_BM3D_NOESTIMATE", "1")
+    actual = eval_parallel(_run, noise_gray, radius=0)
+    for n in range(noise_gray.num_frames):
+        expected = frame_to_ndarray(noise_gray.get_frame(n))
+        assert np.array_equal(actual[n], expected), (
+            f"radius-zero fallback read the wrong source slot at frame {n}")
+
+
 def test_bm3dv2_nosearch_matches_search_on_constant_clip(monkeypatch):
     """The no-search arm must initialise the shared match tables, or the
     aggregation indexes stale LDS.

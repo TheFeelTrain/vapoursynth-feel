@@ -922,23 +922,22 @@ void main() {
                     cur[j] = pcost;
                     cRel[j] = idx - u;
                 }
-                if (PB_PACK) {
-                    // Both of this lane's deltas now exist; the packed form
-                    // stores once per lane pair, so it sits outside the loop.
-                    pbt_store_pair(pbt_row, xd - 1, lane, cRel[0], cRel[1]);
-                } else {
-                    for (int j = 0; j < K; j++) {
-                        if (laneBase + j < TPITCH) {
+            }
+            if (PB_PACK) {
+                // Both lane-owned deltas are initialized before the byte store.
+                pbt_store_pair(pbt_row, xd - 1, lane, cRel[0], cRel[1]);
+            } else {
+                for (int j = 0; j < K; j++) {
+                    if (laneBase + j < TPITCH) {
 #if PROBE == 1
-                            pbt_store_one(pbt_row, xd - 1, laneBase + j, 0);
+                        pbt_store_one(pbt_row, xd - 1, laneBase + j, 0);
 #elif PROBE == 4
-                            ;  // diagnostics: no pbt store at all (traffic ablation)
+                        ;  // diagnostics: no pbt store at all (traffic ablation)
 #elif PROBE == 9
-                            pbt_store_one(pbt_row, 0, laneBase + j, cRel[j]);
+                        pbt_store_one(pbt_row, 0, laneBase + j, cRel[j]);
 #else
-                            pbt_store_one(pbt_row, xd - 1, laneBase + j, cRel[j]);
+                        pbt_store_one(pbt_row, xd - 1, laneBase + j, cRel[j]);
 #endif
-                        }
                     }
                 }
             }

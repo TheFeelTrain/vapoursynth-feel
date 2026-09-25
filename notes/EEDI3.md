@@ -171,6 +171,10 @@ identical everywhere):
 
 ## Historical
 
+- **Undefined packed-pbt read in the K=2 DP loop.** The paired predecessor byte
+  was stored during the per-direction loop and read the not-yet-initialized
+  second delta; the write now follows both delta calculations. No perf change.
+
 Rounds in order. Perf totals from rounds 2–13 are **void** (zero-mask path, below);
 the correctness fixes, accuracy proofs and mechanisms in those rounds survive and
 are kept. Superseded detail is deleted, not archived.

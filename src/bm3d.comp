@@ -366,44 +366,6 @@ void insertN(int depth, inout float e[8], inout int xy[8], inout int sq[8],
     }
 }
 
-// Sliding-window scan of the candidate columns [left..right] at row `cy`, in
-// the exact order the reference scans them (so the top-8 tie-break by sequence
-// index is unchanged). Four columns in flight: a single pending load would
-// stall the whole wave, and the previous candidate's insert is a long
-// dependency chain the next candidates' loads hide behind.
-void scan_row(int depth, const float cur[64], int base_idx, int cy, int left,
-              int right, int sq0, inout float pe[8], inout int pxy[8],
-              inout int ps[8]) {
-    float col[8];
-    for (int c = 0; c < 8; ++c) {
-        col[c] = col_ssd(cur, base_idx, cy, left + c, c);
-    }
-    insertN(depth, pe, pxy, ps, reduce_cols(col), left, cy, sq0);
-    int cx = left + 1;
-    for (; cx + 3 <= right; cx += 4) {
-        const float n0 = col_ssd(cur, base_idx, cy, cx + 7, 7);
-        const float n1 = col_ssd(cur, base_idx, cy, cx + 8, 7);
-        const float n2 = col_ssd(cur, base_idx, cy, cx + 9, 7);
-        const float n3 = col_ssd(cur, base_idx, cy, cx + 10, 7);
-        for (int c = 0; c < 7; ++c) col[c] = col[c + 1];
-        col[7] = n0;
-        insertN(depth, pe, pxy, ps, reduce_cols(col), cx, cy, sq0 + (cx - left));
-        for (int c = 0; c < 7; ++c) col[c] = col[c + 1];
-        col[7] = n1;
-        insertN(depth, pe, pxy, ps, reduce_cols(col), cx + 1, cy, sq0 + (cx - left) + 1);
-        for (int c = 0; c < 7; ++c) col[c] = col[c + 1];
-        col[7] = n2;
-        insertN(depth, pe, pxy, ps, reduce_cols(col), cx + 2, cy, sq0 + (cx - left) + 2);
-        for (int c = 0; c < 7; ++c) col[c] = col[c + 1];
-        col[7] = n3;
-        insertN(depth, pe, pxy, ps, reduce_cols(col), cx + 3, cy, sq0 + (cx - left) + 3);
-    }
-    for (; cx <= right; ++cx) {
-        for (int c = 0; c < 7; ++c) col[c] = col[c + 1];
-        col[7] = col_ssd(cur, base_idx, cy, cx + 7, 7);
-        insertN(depth, pe, pxy, ps, reduce_cols(col), cx, cy, sq0 + (cx - left));
-    }
-}
 
 void ginsert8(inout float e[8], inout int xs[8], inout int ys[8], inout int zs[8],
               float err_, int cx_, int cy_, int cz_) {
@@ -605,27 +567,18 @@ void main() {
         const int top = max(y - BM_RANGE, 0);
         const int bottom = min(y + BM_RANGE, HEIGHT - 8);
         const int rw = right - left + 1;
-        // At low radius the sliding-window scan is used (much fewer source
-        // reads); at radius >= 3 the per-lane row partition differs enough
-        // from the stride-8 reference partition to shift the top-8 selection,
-        // so there the exact stride-8 scan is kept instead.
-        if (RADIUS < 3) {
-            for (int cy = top + sub_lane_id; cy <= bottom; cy += 8) {
-                scan_row(8, cur, srcpc_base, cy, left, right, (cy - top) * rw, pe, pxy, ps);
-            }
-        } else {
-            const int total = (bottom - top + 1) * rw;
-            int row_i = top + sub_lane_id / rw;
-            int col_i = left + sub_lane_id % rw;
-            #pragma unroll 2
-            for (int s = sub_lane_id; s < total; s += 8) {
-                const float error = ssd_err(cur, srcpc_base, col_i, row_i);
-                insertN(8, pe, pxy, ps, error, col_i, row_i, s);
-                col_i += 8;
-                while (col_i > right) {
-                    col_i -= rw;
-                    row_i += 1;
-                }
+        const int total = (bottom - top + 1) * rw;
+        int row_i = top + sub_lane_id / rw;
+        int col_i = left + sub_lane_id % rw;
+        #pragma unroll 2
+        #pragma unroll 2
+        for (int s = sub_lane_id; s < total; s += 8) {
+            const float error = ssd_err(cur, srcpc_base, col_i, row_i);
+            insertN(8, pe, pxy, ps, error, col_i, row_i, s);
+            col_i += 8;
+            while (col_i > right) {
+                col_i -= rw;
+                row_i += 1;
             }
         }
         barrier();
@@ -682,23 +635,17 @@ void main() {
                     const int bottom = min(cys[i] + PS_RANGE, HEIGHT - 8);
                     const int rw = right - left + 1;
                     const int seq_base = i * ((2 * PS_RANGE + 1) * (2 * PS_RANGE + 1));
-                    if (RADIUS < 3) {
-                        for (int cy = top + sub_lane_id; cy <= bottom; cy += 8) {
-                            scan_row(PS_NUM, cur, temporal_srcpc, cy, left, right, seq_base + (cy - top) * rw, pe, pxy, ps);
-                        }
-                    } else {
-                        const int total = (bottom - top + 1) * rw;
-                        int row_i = top + sub_lane_id / rw;
-                        int col_i = left + sub_lane_id % rw;
-                        #pragma unroll 2
-                        for (int s = sub_lane_id; s < total; s += 8) {
-                            const float error = ssd_err(cur, temporal_srcpc, col_i, row_i);
-                            insertN(PS_NUM, pe, pxy, ps, error, col_i, row_i, seq_base + s);
-                            col_i += 8;
-                            while (col_i > right) {
-                                col_i -= rw;
-                                row_i += 1;
-                            }
+                    const int total = (bottom - top + 1) * rw;
+                    int row_i = top + sub_lane_id / rw;
+                    int col_i = left + sub_lane_id % rw;
+                    #pragma unroll 2
+                    for (int s = sub_lane_id; s < total; s += 8) {
+                        const float error = ssd_err(cur, temporal_srcpc, col_i, row_i);
+                        insertN(PS_NUM, pe, pxy, ps, error, col_i, row_i, seq_base + s);
+                        col_i += 8;
+                        while (col_i > right) {
+                            col_i -= rw;
+                            row_i += 1;
                         }
                     }
                 }
