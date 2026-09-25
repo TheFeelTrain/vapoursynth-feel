@@ -124,6 +124,9 @@ struct BM3DData {
     GpuBuffer res;
 
     VkDeviceSize res_size_per_plane {};  // floats per plane in the res buffer
+    GpuBuffer tags {};                    // per-(slot, slice) frame witness
+    VkDeviceSize tags_size {};            // uints
+    bool tags_cleared { false };
     int nframes {};
 
     // Per-frame-keyed caches of the res estimate stacks and the source
@@ -172,6 +175,11 @@ struct BM3DData {
     // Submit one command buffer per recomputed window position instead of one
     // holding them all (VSFEEL_BM3D_SPLIT=0 restores the single submission).
     bool split_est { true };
+    // Diagnostic only: VSFEEL_BM3D_NOCHUNKBAR=1 drops the leading barrier of
+    // every chunk but the first, restoring the ordering this filter shipped
+    // with before the chunk-fill/aggregation race was found. Used by
+    // test_bm3dv2_chunk_fill_vs_aggregation to show the ordering matters.
+    bool nochunkbar { false };
     std::atomic<uint64_t> ht_acquire_ns {}, ht_source_ns {}, ht_est_ns {},
         ht_agg_ns {}, ht_release_ns {}, ht_total_ns {}, ht_n {};
 
@@ -201,6 +209,7 @@ struct BM3DData {
         }
         gpu_destroy_buffer(*gpu, res);
         gpu_destroy_buffer(*gpu, src);
+        gpu_destroy_buffer(*gpu, tags);
         if (pipeline_layout) gpu->vk->vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
         if (set_layout) gpu->vk->vkDestroyDescriptorSetLayout(dev, set_layout, nullptr);
         for (auto & p : planes) {
@@ -546,9 +555,9 @@ static void collect_est_positions(BM3DData * d, Bm3dFrame & fr, int n) {
 // them: estimate stacks, source ring, destination plane.
 static void bm3d_bind(const GPUDevice & gpu, VkCommandBuffer cmd,
                       VkPipelineLayout layout, VkBuffer src, VkBuffer res,
-                      VkBuffer dst) {
-    const VkBuffer bufs[3] { res, src, dst };
-    gpu_push_buffers(gpu, cmd, layout, bufs, 3);
+                      VkBuffer dst, VkBuffer tags) {
+    const VkBuffer bufs[4] { res, src, dst, tags };
+    gpu_push_buffers(gpu, cmd, layout, bufs, 4);
 }
 
 // A whole-command barrier: every write made visible to every later read. Used
@@ -592,14 +601,23 @@ static void record_est_position(BM3DData * d, const Bm3dFrame & fr, VkCommandBuf
         bm3d_full_barrier(*d->gpu, cmd);
 
         d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.bm3d_pipeline);
-        bm3d_bind(*d->gpu, cmd, d->pipeline_layout, d->src.buffer, d->res.buffer, dst_plane);
+        bm3d_bind(*d->gpu, cmd, d->pipeline_layout, d->src.buffer, d->res.buffer,
+                  dst_plane, d->tags.buffer);
         {
-            const int32_t pushes[4] {
+            const int32_t pushes[5] {
                 static_cast<int32_t>(res_off),
                 m_i,
                 nf,
-                static_cast<int32_t>((r == 0) ? fr.slot0 : 0)
+                static_cast<int32_t>((r == 0) ? fr.slot0 : 0),
+                static_cast<int32_t>(static_cast<VkDeviceSize>(slot) * d->tw)
             };
+            // Tags start undefined, so clear them once per filter instance: 0
+            // means "never written" and is never a valid witness.
+            if (!d->tags_cleared) {
+                d->gpu->vk->vkCmdFillBuffer(cmd, d->tags.buffer, 0, d->tags_size * 4, 0);
+                bm3d_full_barrier(*d->gpu, cmd);
+                d->tags_cleared = true;
+            }
             gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, pushes, sizeof(pushes));
         }
         d->gpu->vk->vkCmdDispatch(cmd, p.bm3d_grid_x, p.bm3d_grid_y, 1);
@@ -675,15 +693,20 @@ static void record_est_chunk(BM3DData * d, VSGPUExecContext * ctx, const Bm3dFra
                              VkBuffer dst_plane, bool gputrace) {
     VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
 
-    if (c == 0) {
-        // Order this frame's writes (the ring copies and every slot zero-fill)
-        // behind everything already submitted on the queue. The cross-frame
-        // handoff is exactly this: a reader waited host side until the writer's
-        // estimation was submitted, so the writer's commands are earlier in
-        // submission order and this barrier covers both the execution and the
-        // memory dependency. It also orders the overwrite of a recycled slot
-        // after the previous reader's aggregation.
+    // Every chunk starts behind everything already submitted on the queue, not
+    // just the first one: chunk 0 carries the ring copies and every later
+    // chunk's dispatch reads them, so without this they may execute against
+    // whatever the slot held before. A barrier's first scope is every earlier
+    // command in submission order on the queue -- the same handoff the
+    // cross-frame readers use -- and it also orders this frame's writes (the
+    // copies and every slot zero-fill) behind everything already queued, and
+    // the overwrite of a recycled slot behind the previous reader's
+    // aggregation.
+    if (c == 0 || !d->nochunkbar) {
         bm3d_full_barrier(*d->gpu, cmd);
+    }
+
+    if (c == 0) {
         record_src_copies(d, fr, cmd, window);
         // the estimation dispatches read the freshly copied source/ref frames,
         // so make the transfer writes visible to the compute stage before
@@ -744,9 +767,19 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame & fr, VkCommandBuffer 
         // aggregation is recorded separately from the estimation phase, so
         // without this bind the dispatch runs on undefined descriptor state
         // (black output, and device loss under concurrent submissions)
-        bm3d_bind(*d->gpu, cmd, d->pipeline_layout, d->src.buffer, d->res.buffer, dst_plane);
+        bm3d_bind(*d->gpu, cmd, d->pipeline_layout, d->src.buffer, d->res.buffer,
+                  dst_plane, d->tags.buffer);
         {
-            int32_t bases[9] {};
+            const int clips = d->final ? 2 : 1;
+            // The fallback source pixel: the *source* half of this frame's slot
+            // in the ring, exactly where record_src_copies put it.
+            const int src_slot = ((n % d->src_ring) + d->src_ring) % d->src_ring;
+            const VkDeviceSize src_base =
+                static_cast<VkDeviceSize>(src_slot) * clips * d->planes[0].pe +
+                static_cast<VkDeviceSize>(clips - 1) * pe +
+                static_cast<VkDeviceSize>(plane) * d->src_size;
+            int32_t pushes[28] {};
+            int32_t * bases = pushes;
             if (r == 0) {
                 // non-temporal: aggregate the single center slice
                 const int32_t base = static_cast<int32_t>(
@@ -762,7 +795,36 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame & fr, VkCommandBuffer 
                         static_cast<VkDeviceSize>(z) * 2 * pe);
                 }
             }
-            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, bases, sizeof(bases));
+            for (int i = 0; i < d->tw; ++i) {
+                // The frame the reference's aggPlane intends for slice i: the
+                // slot for position m_i holds the window centred on m_i, so its
+                // slice agg_z(i) is the contribution of that frame.
+                const int m_i = std::clamp(n - r + i, 0, nf - 1);
+                const int z = agg_z(i, n, nf, r);
+                pushes[9 + i] = std::clamp(m_i - r + z, 0, nf - 1) + 1;
+                pushes[18 + i] = static_cast<int32_t>(
+                    static_cast<VkDeviceSize>(fr.win_slots[i]) * d->tw + z);
+            }
+            pushes[27] = static_cast<int32_t>(src_base);
+            // Invariant check: at aggregation time this frame still holds its
+            // slots, so each must still record the frame whose stack the
+            // aggregation is about to read. A mismatch means the stack belongs
+            // to another frame -- the intermittent contaminant band.
+            if (d->trace) {
+                for (int i = 0; i < d->tw; ++i) {
+                    const int want = std::clamp(n - r + i, 0, nf - 1);
+                    const int slot = fr.win_slots[i];
+                    if (d->res_frame[slot] != want) {
+                        fprintf(stderr, "[t] n=%d agg slot %d holds frame %d, "
+                                "wants %d (holder %d)\n", n, slot,
+                                d->res_frame[slot], want, d->res_writer[slot]);
+                    }
+                    if (!d->res_ready[slot]) {
+                        fprintf(stderr, "[t] n=%d agg slot %d NOT READY\n", n, slot);
+                    }
+                }
+            }
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, pushes, sizeof(pushes));
         }
         // the estimation kernel's atomic accumulation (and the fill that
         // zeroes the slots) must be visible to the aggregation reads; the
@@ -1082,6 +1144,7 @@ static void VS_CC BM3DCreate(
     d->trace = vsfeel_debug_trace("VSFEEL_BM3D_TRACE");
     d->dump = env_flag("VSFEEL_BM3D_DUMP");
     d->split_est = env_int("VSFEEL_BM3D_SPLIT", 1) != 0;
+    d->nochunkbar = env_flag("VSFEEL_BM3D_NOCHUNKBAR");
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
@@ -1305,14 +1368,15 @@ static void VS_CC BM3DCreate(
         // Push descriptors: the bindings change every frame (the destination
         // plane is the frame's own storage), so nothing is allocated from a
         // pool and nothing survives the command buffer.
-        const auto result = gpu_push_set_layout(*d->gpu, 3);
+        const auto result = gpu_push_set_layout(*d->gpu, 4);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
         d->set_layout = std::get<VkDescriptorSetLayout>(result);
     }
     {
-        const auto result = gpu_pipeline_layout(*d->gpu, d->set_layout, 9 * sizeof(int32_t));
+        const auto result = // 10 ints: the aggregation's bases[9] plus its source-fallback offset
+        gpu_pipeline_layout(*d->gpu, d->set_layout, 28 * sizeof(int32_t));
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -1389,6 +1453,16 @@ static void VS_CC BM3DCreate(
         }
         d->src_size = src_size;
         d->res_size_per_plane = static_cast<VkDeviceSize>(d->res_cap) * d->tw * 2 * d->planes[0].pe;
+        d->tags_size = static_cast<VkDeviceSize>(d->res_cap) * d->tw;
+        {
+            std::string err = gpu_make_buffer(*d->gpu, core, d->tags_size * 4, d->tags,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            if (!err.empty()) {
+                return set_error("the per-slice frame witness could not be "
+                    "allocated: " + err);
+            }
+        }
 
         // Both buffers come from the core's pool, so they count against the
         // VRAM budget the frame cache and the thread pool's admission control

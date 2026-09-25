@@ -153,6 +153,17 @@ Chronological; each entry keeps the mechanism, not the story.
   reservations hung the next frame. Benchmark-harness traps found here are
   commented in `tools/benchmark.py` (`--gpu-cache`), not repeated.
 
+- **2026-09-25 — the aggregation trusted slices that were not this frame's.**
+  `acc/acw` never checked that the TW slices it summed were the output frame's
+  own contributions, so a zero-filled slot divided by zero (black band), a partly
+  accumulated one averaged short (dim band), and a recycled one contributed
+  another frame's patch groups (the band that matched no frame). The estimation
+  now witnesses each slice (`tags[slot * TW + z]` in `bm3d.comp`) and the
+  aggregation skips any slice whose witness is not the frame it intends,
+  falling back to the source pixel when none survive (`bm3d_agg.comp`,
+  expectation computed in `bm3d.cpp`); 73/73 reference tests pass, and with the
+  witnesses zeroed the output is bit-exact the source. No perf change.
+
 ## Round: the block-match scan (2026-09-21, +64% end to end)
 
 Everything above is a whole-kernel time from a warm single-request
@@ -345,3 +356,4 @@ cached at creation, not read per frame.
   it averages over 50 frames and never runs in a benchmark.
 - `VSFEEL_BM3D_HD`, `VSFEEL_BM3D_QUEUES` — **gone** with the pre-R80 transfer and
   queue-selection code.
+

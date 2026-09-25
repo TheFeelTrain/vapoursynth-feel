@@ -53,6 +53,12 @@ layout(std430, binding = 0) buffer ResBuf { float res[]; };
 layout(std430, binding = 0) coherent buffer ResBuf { uint res_u[]; };
 #endif
 layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
+// Per-(slot, slice) witness: the frame index the estimation kernel wrote that
+// slice for (frame + 1, so 0 means "never written"). The aggregation refuses a
+// slice whose witness is not the frame it intends to read, which makes it
+// impossible to aggregate another frame's data -- the intermittent contaminant
+// band -- no matter what the slot bookkeeping or the host-side timing does.
+layout(std430, binding = 3) buffer TagBuf { uint tags[]; };
 
 // Adds val to the float at res[idx]. The no-extension form is the reference's
 // atom_add_f: a CAS loop over the uint bits, one fadd per round like the
@@ -98,6 +104,7 @@ layout(push_constant) uniform PushConstants {
     int nmod;      // center frame index of the window
     int nframes;   // total frame count (for boundary clamping)
     int src_slot;  // radius 0: the stream's private source slot
+    int tag_base;  // first tag index of this slot (slot * TW)
 } pc;
 
 // absolute frame index of the window position z (clamped at the boundaries)
@@ -543,6 +550,16 @@ void collaborative_wiener(inout float denoising_patch[64], inout float ref_patch
 }
 
 void main() {
+    // Witness what this dispatch writes: one tag per window slice, holding the
+    // frame it is the contribution of. A slot whose estimation never ran keeps
+    // the zero fill or the previous occupant's tag, and the aggregation skips
+    // those slices instead of reading them.
+    if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u) {
+        for (int z = 0; z < KRADIUS * 2 + 1; ++z) {
+            tags[pc.tag_base + z] = uint(src_frame(z) + 1);
+        }
+    }
+
     const int lid = int(gl_LocalInvocationID.x);
     const int group = lid >> 3;
     const int sub_lane_id = lid & 7;

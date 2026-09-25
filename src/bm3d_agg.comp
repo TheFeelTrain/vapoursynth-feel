@@ -25,10 +25,15 @@ layout(constant_id = 2) const int STRIDE = 1920;
 layout(constant_id = 3) const int TW = 5;
 
 layout(std430, binding = 0) readonly buffer ResBuf { vec4 res4[]; };
+layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
+layout(std430, binding = 3) readonly buffer TagBuf { uint tags[]; };
 layout(std430, binding = 2) buffer DstBuf { vec4 dst4[]; };
 
 layout(push_constant) uniform PushConstants {
-    int bases[9];  // float offsets of the TW wdst slices within the res buffer
+    int bases[9];   // element offsets of the TW wdst slices within the res buffer
+    int expect[9];  // frame tag each slice must carry (frame + 1)
+    int tags_at[9]; // tag index of each slice (slot * TW + z)
+    int src_base;   // element offset of this frame's source plane in the src ring
 } pc;
 
 const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
@@ -55,11 +60,33 @@ void main() {
 
     vec4 acc = vec4(0.0);
     vec4 acw = vec4(0.0);
+    int used = 0;
     for (int i = 0; i < TW; ++i) {
+        // Only slices the estimation kernel witnessed for the frame this
+        // aggregation wants may contribute: a slice left as the zero fill, one
+        // whose estimation never landed, or one still holding a recycled
+        // frame's stacks is skipped rather than averaged in.
+        if (tags[pc.tags_at[i]] != uint(pc.expect[i])) {
+            continue;
+        }
         const int b = (pc.bases[i] >> 2) + o;
         acc += res4[b];
         acw += res4[b + tstride4];
+        used++;
     }
 
-    dst4[o] = acc / acw;
+    // A slot whose estimation never landed (still the zero fill, or only partly
+    // accumulated) leaves acw at 0 or short, and acc/acw then divides by zero or
+    // averages a partial stack: that is the intermittent band -- black where the
+    // whole slot was lost, dimmed where part of it was, and carrying a previous
+    // frame's patch groups where the slot was recycled. Every pixel of a
+    // complete stack has a nonzero weight (its own block always contributes), so
+    // a zero weight here is proof the contribution is missing, and the honest
+    // output for it is the source frame's own pixel: undenoised, never corrupt.
+    if (used > 0 && acw.x > 0.0 && acw.y > 0.0 && acw.z > 0.0 && acw.w > 0.0) {
+        dst4[o] = acc / acw;
+    } else {
+        const int so = pc.src_base + y * STRIDE + x;
+        dst4[o] = vec4(src[so], src[so + 1], src[so + 2], src[so + 3]);
+    }
 }
