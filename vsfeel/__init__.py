@@ -1,7 +1,7 @@
 """Use vsfeel's GPU filters through vs-jetpack wrappers.
 
 vsfeel ships with a drop-in backend for the ``backend=`` argument of
-vs-jetpack filters (vsrgtools, vsdenoise, ...). Just pass it in:
+vs-jetpack filters. Just pass it in:
 
     import vsfeel
 
@@ -16,26 +16,22 @@ vs-jetpack filters (vsrgtools, vsdenoise, ...). Just pass it in:
 
 To also route the *internal* filters vs-jetpack calls on its own (e.g. the
 bilateral postfilter inside ``vsaa.based_aa``), use the backend as a context
-manager — no vs-jetpack changes needed:
+manager:
 
     from vsaa import based_aa
 
     with vsfeel.Backend():
-        based = based_aa(clip, backend=vsfeel.Backend)
+        based = based_aa(clip, supersampler=vsfeel.NNEDI3(), antialiaser=vsfeel.EEDI3())
 
 ``based_aa``'s EEDI3 antialiaser runs two EEDI3 calls plus two ``std.Merge``
 nodes; ``vsfeel.EEDI3`` is a subclass of ``vsaa``'s antialiaser that replaces
-that whole chain with the fused ``core.vsfeel.EEDI3AA`` call. ``vsfeel.NNEDI3``
+that whole chain with the fused ``core.vsfeel.EEDI3`` call. ``vsfeel.NNEDI3``
 is the same idea for the supersampler, running ``core.vsfeel.NNEDI3``:
-
-    aa = based_aa(clip, supersampler=vsfeel.NNEDI3(), antialiaser=vsfeel.EEDI3())
-
-They are resolved lazily (PEP 562), so ``import vsfeel`` never requires vsaa.
 """
 
 from .backend import Backend, FeelBackend
 
-__all__ = ["Backend", "FeelBackend", "EEDI3", "NNEDI3"]
+__all__ = ["EEDI3", "NNEDI3", "Backend", "FeelBackend"]
 
 
 def __getattr__(name: str):  # pragma: no cover - thin lazy re-export

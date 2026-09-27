@@ -30,6 +30,12 @@ def _backend():
     return vsfeel.Backend
 
 
+# The wrapper's no-argument fields are based_aa's own antialiaser settings, not
+# vsaa's bare EEDI3 ones; every fused-vs-chain comparison below must name them
+# explicitly or it compares two different filters.
+AA_PARAMS = dict(alpha=0.125, beta=0.25, gamma=40.0, vthresh=(12.0, 24.0, 4.0))
+
+
 def test_backend_resolves():
     assert vsfeel.Backend.resolve() is vsfeel.Backend
 
@@ -139,8 +145,10 @@ def test_based_aa_with_vsfeel_supersampler_and_antialiaser(noise_gray):
 
 def test_eedi3aa_matches_the_two_call_chain(noise_16bit):
     """The fused antialiaser reproduces the base class's chain bit-exactly."""
-    fused = cpu_node(vsfeel.EEDI3(backend=_backend(), mdis=5, nrad=1).antialias(noise_16bit))
-    chain = cpu_node(EEDI3(backend=_backend(), mdis=5, nrad=1).antialias(noise_16bit))
+    fused = cpu_node(vsfeel.EEDI3(
+        backend=_backend(), mdis=5, nrad=1, **AA_PARAMS).antialias(noise_16bit))
+    chain = cpu_node(EEDI3(
+        backend=_backend(), mdis=5, nrad=1, **AA_PARAMS).antialias(noise_16bit))
     assert fused.num_frames == chain.num_frames == noise_16bit.num_frames
     for n in (0, 5, 23):
         a = frame_to_ndarray(fused.get_frame(n), dtype=np.uint16)
@@ -150,13 +158,40 @@ def test_eedi3aa_matches_the_two_call_chain(noise_16bit):
 
 def test_eedi3aa_falls_back_for_non_both(noise_16bit):
     """direction != BOTH keeps the base class's single-direction path."""
-    fused = cpu_node(vsfeel.EEDI3(backend=_backend()).antialias(
+    fused = cpu_node(vsfeel.EEDI3(backend=_backend(), **AA_PARAMS).antialias(
         noise_16bit, direction=EEDI3.AADirection.HORIZONTAL))
-    chain = cpu_node(EEDI3(backend=_backend()).antialias(
+    chain = cpu_node(EEDI3(backend=_backend(), **AA_PARAMS).antialias(
         noise_16bit, direction=EEDI3.AADirection.HORIZONTAL))
     for n in (0, 11):
         assert np.array_equal(frame_to_ndarray(fused.get_frame(n), dtype=np.uint16),
                               frame_to_ndarray(chain.get_frame(n), dtype=np.uint16))
+
+
+def test_eedi3aa_no_arg_defaults_match_based_aa(noise_gray, monkeypatch):
+    """`vsfeel.EEDI3()` must be the antialiaser ``based_aa`` builds for itself.
+
+    ``based_aa`` only builds its own EEDI3 when the caller passes none, so
+    capture exactly what it passes there and require the wrapper's no-argument
+    fields to reproduce all of it. Without this, ``antialiaser=vsfeel.EEDI3()``
+    silently ran different EEDI3 parameters than ``backend=vsfeel.Backend``.
+    """
+    import vsaa.funcs as _funcs
+
+    captured = {}
+    real = _funcs.EEDI3
+
+    class _Spy(real):  # type: ignore[misc, valid-type]
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(_funcs, "EEDI3", _Spy)
+    based_aa(noise_gray, supersampler=False, backend=_backend())
+    assert captured, "based_aa did not build its default EEDI3"
+
+    wrapper = vsfeel.EEDI3()
+    for field, value in captured.items():
+        assert getattr(wrapper, field) == value, field
 
 
 def test_backend_context_routes_singletons(noise_gray):

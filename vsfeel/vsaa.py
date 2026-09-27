@@ -19,9 +19,9 @@ if TYPE_CHECKING:
 __all__ = ["EEDI3", "NNEDI3"]
 
 from jetpytools import fallback
-from vsaa.deinterlacers import Deinterlacer
 from vsaa.deinterlacers import EEDI3 as _VsaaEEDI3
 from vsaa.deinterlacers import NNEDI3 as _VsaaNNEDI3
+from vsaa.deinterlacers import Deinterlacer
 from vstools import VSFunctionAllArgs, VSFunctionNoArgs, core
 
 from .backend import Backend as _FeelBackend
@@ -49,13 +49,11 @@ class EEDI3(_VsaaEEDI3):
 
     Only ``antialias(direction=BOTH)`` in double-rate mode takes the fused
     path; every other call is delegated to the base implementation unchanged.
-
-    ``backend`` defaults to ``vsfeel.Backend``: constructing the vsfeel
-    antialiaser and then asking for another plugin's backend is contradictory,
-    so that is what an omitted argument means. Pass ``backend=`` explicitly to
-    override it.
     """
 
+    alpha: float = 0.125
+    gamma: float = 40.0
+    vthresh: tuple[float | None, float | None, float | None] | None = (12.0, 24.0, 4.0)
     backend: Any = _FeelBackend
 
     def antialias(  # type: ignore[override]
@@ -101,10 +99,6 @@ class EEDI3(_VsaaEEDI3):
 @dataclass
 class NNEDI3(_VsaaNNEDI3):
     """``vsaa`` NNEDI3 supersampler backed by ``core.vsfeel.NNEDI3``.
-
-    Same fields and methods as the base class, so it drops into any
-    ``supersampler=``/``scaler=`` slot, but every interpolation runs on the
-    vsfeel GPU plugin. ``gpu`` selects no backend here and is ignored.
     """
 
     @property
