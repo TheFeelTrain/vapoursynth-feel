@@ -428,8 +428,7 @@ def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
     return {
         "vsfeel": f"core.vsfeel.BM3Dv2({clip}, {common})",
         "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {common})",
-        "bm3dvk": f"core.bm3dvk.BM3Dv2({clip}, {common})",
-        "bm3dhip": f"core.bm3dvk.BM3Dv2({clip}, {common})",
+        "bm3dvk": f"core.bm3dvk.BM3Dv2({clip}, {common})"
     }
 
 
@@ -441,8 +440,7 @@ def _bilateral_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dic
     return {
         "vsfeel": f"core.vsfeel.Bilateral({clip}, {args})",
         "vszipcl": f"core.vszipcl.Bilateral({clip}, {args})",
-        "vszipcu": f"core.vszipcu.Bilateral({clip}, {args})",
-        "bilateralhip": f"core.bilateralhip.Bilateral({clip}, {args})"
+        "vszipcu": f"core.vszipcu.Bilateral({clip}, {args})"
     }
 
 
@@ -480,7 +478,6 @@ def _nlmeans_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
         "vsfeel": f"core.vsfeel.NLMeans({clip}, {args})",
         "vszipcl": f"core.vszipcl.NLMeans({clip}, {args})",
         "vszipcu": f"core.vszipcu.NLMeans({clip}, {args})",
-        "nlm_hip": f"core.nlm_hip.NLMeans({clip}, {args})",
         "knlmvk": (
             f"core.knlmvk.KNLMeans({clip}, d={ns.nlmeans_d}, a={ns.nlmeans_a}, "
             f"s={ns.nlmeans_s}, h={ns.nlmeans_h}, wmode={ns.nlmeans_wmode}, "
@@ -1116,19 +1113,7 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
         sys.exit(f"no valid plugins requested for --filter {ns.filter}")
     print(f"{spec.title} benchmark | {frames} frames | clip: {clip_desc}{bits_desc}")
     print(f"args: {args_desc(spec, ns)}")
-    gpu_desc = ""
-    if getattr(ns, "gpu_cache", False):
-        if not gpu_arms:
-            gpu_desc = " | gpu cache: no GPU-input arm in this filter"
-        elif cache_frames:
-            gpu_desc = (f" | gpu cache: {ns.gpu_cache_mb} MiB; "
-                        f"download arms: {', '.join(download_arms) or 'none'}")
-        else:
-            # No preload to mirror (BlankClip or --no-cache): the arms get a
-            # GPUUpload-fed clip, which is what the graph would insert anyway.
-            gpu_desc = (f" | gpu cache: live upload; download arms: "
-                        f"{', '.join(download_arms) or 'none'}")
-    print(f"{_cache_desc(spec, ns, synth, cache_frames)}{gpu_desc} | "
+    print(f"{_cache_desc(spec, ns, synth, cache_frames)} | "
           f"repeat: {ns.repeat} | timeout: {ns.timeout:g}s\n")
 
     runs: dict[str, list[float]] = {p: [] for p in plugins}

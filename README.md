@@ -6,29 +6,25 @@ Primarily optimized for running on RDNA 3 with the RADV driver on Linux.
 
 ## Performance
 
-| Filter    | u16 vsfeel | u16 ref | u16 speedup | fp32 vsfeel | fp32 ref | fp32 speedup |
-|-----------|-----------:|--------:|------------:|------------:|---------:|-------------:|
-| Bilateral | 1903       | 1484    | 1.28x       | 1250        | 763      | 1.64x        |
-| BM3Dv2    | -          | -       | -           | 315         | 47       | 6.72x        |
-| DFTTest   | 1531       | 899     | 1.70x       | 1131        | 631      | 1.79x        |
-| EEDI3     | 628        | 214     | 2.93x       | 318         | 186      | 1.71x        |
-| GaussBlur | 2516       | 1599    | 1.57x       | 1267        | 756      | 1.68x        |
-| NLMeans   | 1094       | 767     | 1.43x       | 1015        | 672      | 1.51x        |
-| NNEDI3    | 2996       | 2677    | 1.12x       | 1580        | 1415     | 1.12x        |
+| Filter     | vsfeel u16 | vszipcl u16 | vulkan u16 | | vsfeel fp32 | vszipcl fp32 | vulkan fp32 | | Avg. Speedup |
+|------------|-----------:|------------:|-----------:|-|------------:|-------------:|------------:|-|-------------:|
+| Bilateral  | 2170       | 580         | -          | | 1142        | 387          | -           | | 3.43x        |
+| BM3Dv2     | -          | -           | -          | | 995         | 119          | 280         | | 3.55x        |
+| DFTTest    | 1431       | 833         | -          | | 1134        | 488          | -           | | 1.94x        |
+| EEDI3 (AA) | 165        | 25          | 36         | | 121         | 25           | 29          | | 4.40x        |
+| GaussBlur  | 2325       | 1298        | -          | | 1145        | 797          | -           | | 1.66x        |
+| NLMeans    | 1043       | 452         | 603        | | 735         | 462          | 593         | | 1.49x        |
+| NNEDI3     | 2703       | -           | 2004       | | 1393        | -            | 1008        | | 1.36x        |
 
-Reference columns are `vszipcl` for all filters except `nnedi3vk` for NNEDI3.
+Measured on a RX 7900 XTX using `tools/benchmark.py <filter> --bits <16|32>` with a 1080p YUV420P input clip.
 
-Each figure is the median of 3 `tools/benchmark.py --bits <16|32>` runs on an RX 7900 XTX.
-
-## Notes
-
-All filters support 16-bit integer and 32-bit float input except for BM3Dv2, which is 32-bit only.
+vulkan column: bm3dvk, eedi3vk2, knlmvk, nnedi3vk
 
 ## Filters
 
 ### Bilateral
 
-[Bilateral filter](https://en.wikipedia.org/wiki/Bilateral_filter) is a non-linear, edge-preserving and noise-reducing smoothing filter for images. The intensity value at each pixel in an image is replaced by a weighted average of intensity values from nearby pixels. This weight can be based on a Gaussian distribution.
+A [Bilateral filter](https://en.wikipedia.org/wiki/Bilateral_filter) is a non-linear, edge-preserving and noise-reducing smoothing filter for images. The intensity value at each pixel in an image is replaced by a weighted average of intensity values from nearby pixels. This weight can be based on a Gaussian distribution.
 
 ```python
 core.vsfeel.Bilateral(clip clip[,
@@ -199,7 +195,7 @@ To also route the *internal* filters vs-jetpack calls on its own (e.g. the bilat
 from vsaa import based_aa
 
 with vsfeel.Backend():
-    based = based_aa(clip, backend=vsfeel.Backend)
+    based = based_aa(clip, antialiaser=vsfeel.EEDI3())
 ```
 
 ## Manual Compilation
