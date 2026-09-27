@@ -146,7 +146,12 @@ def make_vpy(
     else:
         clip_expr = f"BestSource(cachepath=None).source({clip!r}, 32)"
         cache_setup = ""
-        gpu_lines = "clip_gpu = core.std.GPUUpload(clip=clip)\n" if gpu_cache else ""
+        # --gpu-cache uploads the *converted* clip (the cache path does the same
+        # before its upload): `clip_gpu` has to be the frames the chain would
+        # otherwise read, format and depth included, not the raw source.
+        conv = f"clip = {cache_conv}\n" if (gpu_cache and cache_conv) else ""
+        gpu_lines = (conv + "clip_gpu = core.std.GPUUpload(clip=clip)\n"
+                     if gpu_cache else "")
     return f"""\
 from vssource import BestSource
 from vstools import core, depth, get_y
@@ -270,8 +275,28 @@ _msk_served = _blankm.std.ModifyFrame(_blankm, _serve_msk)
 sclip = {f"core.std.Interleave([clip, clip])" if eedi3_field > 1 else "clip"}
 """
     else:
-        sclip_expr = "core.std.Interleave([ss, ss])" if eedi3_field > 1 else "clip"
-        cache_lines = f"clip = ss\nsclip = {sclip_expr}\n"
+        # --no-cache (or --cache-frames 0): no preload to move off the clock,
+        # but --gpu-cache still has to put the live frames on the device or the
+        # run is reported as GPU-fed while the graph holds no GPU node at all.
+        if gpu_cache:
+            gpu_sclip = ("core.std.Interleave([clip_gpu, clip_gpu])"
+                         if eedi3_field > 1 else "clip_gpu")
+            if download_inputs:
+                names = (
+                    "clip = core.std.GPUDownload(clip=clip_gpu)\n"
+                    "mclip = core.std.GPUDownload(clip=mclip_gpu)\n"
+                    "sclip = core.std.GPUDownload(clip=sclip_gpu)\n"
+                )
+            else:
+                names = "clip = clip_gpu\nmclip = mclip_gpu\nsclip = sclip_gpu\n"
+            cache_lines = (
+                "clip_gpu = core.std.GPUUpload(clip=ss)\n"
+                "mclip_gpu = core.std.GPUUpload(clip=mclip)\n"
+                f"sclip_gpu = {gpu_sclip}\n"
+            ) + names
+        else:
+            sclip_expr = "core.std.Interleave([ss, ss])" if eedi3_field > 1 else "clip"
+            cache_lines = f"clip = ss\nsclip = {sclip_expr}\n"
     return f"""\
 from vssource import BestSource
 from vstools import core, depth, get_y
@@ -1010,6 +1035,17 @@ def _input_for_bits(expr: str, bits: int) -> str:
                   lambda m: f"depth({m.group(1)}, {bits})", expr)
 
 
+def _input_on(expr: str, clip: str) -> str:
+    """Point a filter's input expression at another clip node.
+
+    The expression is Python source over the name ``clip`` (e.g.
+    ``depth(get_y(clip), 16)``), so the substitution is whole-word: the
+    replacement itself contains ``clip`` (``clip_gpu``,
+    ``GPUDownload(clip=clip_gpu)``) and ``mclip``/``BlankClip`` must survive.
+    """
+    return re.sub(r"\bclip\b", clip, expr)
+
+
 def _cache_desc(spec: FilterSpec, ns: argparse.Namespace, synth: str | None,
                 cache_frames: int | None) -> str:
     if synth is not None:
@@ -1074,8 +1110,10 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
     # AA filters, which used to fall back to a hardcoded 400-frame preload.
     cache_frames = ns.cache_frames if (ns.cached and synth is None and ns.cache_frames) else None
     # the cache holds frames in the filter's input format (e.g. depth(clip,16))
-    # so the timed region measures only filter throughput, like --synthetic
-    cache_conv = input_expr if cache_frames else None
+    # so the timed region measures only filter throughput, like --synthetic.
+    # --gpu-cache needs it even without a preload: the device frames have to be
+    # uploaded in the filter's input format, not the raw source's.
+    cache_conv = input_expr if (cache_frames or getattr(ns, "gpu_cache", False)) else None
     if synth:
         clip_desc = f"BlankClip 1920x1080 {synth.removeprefix('vs.')}"
     elif spec.aa:
@@ -1102,9 +1140,13 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
         gpu_arms = list(calls)
         download_arms = [p for p in calls if p not in spec.gpu_plugins]
         if not spec.aa:
-            gpu_calls = spec.build(ns, "clip_gpu", spec)
+            # Only the clip node changes; the chain keeps the filter's own
+            # input expression. Building these on the bare `clip_gpu` instead
+            # dropped it, so a --no-cache arm was handed the raw source format
+            # rather than `depth(get_y(clip), N)`.
+            gpu_calls = spec.build(ns, _input_on(input_expr, "clip_gpu"), spec)
             dl_calls = spec.build(
-                ns, "core.std.GPUDownload(clip=clip_gpu)", spec)
+                ns, _input_on(input_expr, "core.std.GPUDownload(clip=clip_gpu)"), spec)
             for p in calls:
                 calls[p] = gpu_calls[p] if p in spec.gpu_plugins else dl_calls[p]
     plugins = resolve_plugins(ns.plugins or list(calls), calls, spec.title)

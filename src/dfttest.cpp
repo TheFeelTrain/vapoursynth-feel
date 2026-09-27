@@ -415,7 +415,7 @@ struct DftPushConstants {
     float beta;
 };
 
-// GPU-timing probe (VSFEEL_DFFTEST_GPUTRACE=<frame>, default 100 under
+// GPU-timing probe (VSFEEL_DFTTEST_GPUTRACE=<frame>, default 100 under
 // VSFEEL_DEBUG=2): one warm frame stamps the head, pad, fused and col2im
 // boundaries of the first processed plane into a query pool, whose results the
 // same command buffer copies into a mapped buffer. The host waits the
@@ -458,7 +458,7 @@ struct DftData {
     std::array<DftPlaneConfig, 3> planes {};
     VSGPUExecPool * pool {};
 
-    // VSFEEL_DFFTEST_GPUTRACE=<frame>: one-shot GPU kernel timings on a warm
+    // VSFEEL_DFTTEST_GPUTRACE=<frame>: one-shot GPU kernel timings on a warm
     // frame. Only created when the compute queue family can timestamp at all
     // (writing one where timestampValidBits is 0 can hang the engine).
     bool gpu_trace { false };
@@ -545,8 +545,8 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     // The probe knobs win over the default selection below on purpose: they
     // exist so a run can force a subgroup size, or deliberately request one the
     // device does not offer and watch it be rejected.
-    const int forced_sgsize = env_int("VSFEEL_DFFTEST_SGSIZE", 0);
-    const bool forced_invalid = env_flag("VSFEEL_DFFTEST_SGSIZE_INVALID");
+    const int forced_sgsize = env_int("VSFEEL_DFTTEST_SGSIZE", 0);
+    const bool forced_invalid = env_flag("VSFEEL_DFTTEST_SGSIZE_INVALID");
 
     // Ask for 32 when the device can be asked at all; otherwise keep the
     // driver's default only if it is itself a multiple of 16. Taking any
@@ -592,7 +592,7 @@ static std::variant<VkPipeline, std::string> create_pipeline(
         n_spec, n_spec * sizeof(int32_t), "dfttest", subgroup_size, workgroup);}
 
 static bool dfttest_trace() {
-    static const bool v = vsfeel_debug_trace("VSFEEL_DFFTEST_TRACE");
+    static const bool v = vsfeel_debug_trace("VSFEEL_DFTTEST_TRACE");
     return v;
 }
 
@@ -1483,8 +1483,8 @@ static void VS_CC DftCreate(
     // GPU-timing probe: only when the queue family can timestamp at all, since
     // vkCmdWriteTimestamp2 there is invalid usage and a driver taking one can
     // hang the engine.
-    d->gpu_trace_frame = env_int("VSFEEL_DFFTEST_GPUTRACE", 100);
-    d->gpu_trace = vsfeel_debug_probe("VSFEEL_DFFTEST_GPUTRACE") &&
+    d->gpu_trace_frame = env_int("VSFEEL_DFTTEST_GPUTRACE", 100);
+    d->gpu_trace = vsfeel_debug_probe("VSFEEL_DFTTEST_GPUTRACE") &&
         vsfeel_probe_timestamps(*d->gpu, "DFTTest");
     if (d->gpu_trace) {
         VkQueryPoolCreateInfo qp_info {

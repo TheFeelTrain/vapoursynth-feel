@@ -433,7 +433,7 @@ def test_dfttest_rejects_unsupported_subgroup_size(noise_gray, monkeypatch):
     the range the device reports). Creation, not the first frame, has to fail:
     a pipeline built on an unsupported size is invalid usage from the start.
     """
-    monkeypatch.setenv("VSFEEL_DFFTEST_SGSIZE_INVALID", "1")
+    monkeypatch.setenv("VSFEEL_DFTTEST_SGSIZE_INVALID", "1")
     with pytest.raises(vs.Error):
         vs.core.vsfeel.DFTTest(noise_gray)
 

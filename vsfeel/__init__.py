@@ -31,7 +31,7 @@ is the same idea for the supersampler, running ``core.vsfeel.NNEDI3``:
 
 from .backend import Backend, FeelBackend
 
-__all__ = ["EEDI3", "NNEDI3", "Backend", "FeelBackend"]
+__all__ = ["Backend", "FeelBackend", "EEDI3", "NNEDI3"]
 
 
 def __getattr__(name: str):  # pragma: no cover - thin lazy re-export

@@ -50,7 +50,7 @@ dfttest vsfeel`, interleaved pre-port/R80 pairs, `--repeat 2`:
   window (`tw*pw*ph*bytes`) and the float block buffer (`num_blocks*256*4`) —
   handed to the context with `gpuExecUsesBuffer`. Allocation is measurably free:
   at 1080p GRAY16 that is 12.97 + 136.0 MB per in-flight frame (142.1 MiB,
-  `VSFEEL_DFFTEST_VRAM=1` banner), and aliasing the block buffer onto the padded
+  `VSFEEL_DFTTEST_VRAM=1` banner), and aliasing the block buffer onto the padded
   one changes the frame time by <1%. Depth is the core's exec ring (2..8
   contexts), not `num_streams`.
 - Push descriptors with five whole-buffer bindings (`wt`, `padded`, `spatial`,
@@ -150,7 +150,7 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   corrupt the pool. No `FramePool` here any more; the rule lives in `AGENTS.md`.
 - **The subgroup size was assumed, not checked** — the fused kernel used to take
   whatever default the device reported. Measured on lavapipe (the one device here
-  whose subgroups are 8 lanes wide, `VSFEEL_DFFTEST_SGSIZE=8` to reproduce the old
+  whose subgroups are 8 lanes wide, `VSFEEL_DFTTEST_SGSIZE=8` to reproduce the old
   selection) it still matched gfx1100 to 3.7e-9 (one ulp), because a software
   backend implements the subgroup-scoped barrier as a workgroup one; on hardware
   with real 8-lane subgroups the same selection is a race, so the requirement is
@@ -181,14 +181,14 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
 ## Debug env vars
 
-- `VSFEEL_DFFTEST_GPUTRACE=<frame>` — one-shot warm GPU timings for that frame
+- `VSFEEL_DFTTEST_GPUTRACE=<frame>` — one-shot warm GPU timings for that frame
   (`pad`/`fused`/`col2im`/total); defaults to frame 100 and requires the queue
   family to report timestamp bits.
-- `VSFEEL_DFFTEST_TIMING=1` — per-frame host stage averages
+- `VSFEEL_DFTTEST_TIMING=1` — per-frame host stage averages
   (`acquire`/`record`/`submit`).
-- `VSFEEL_DFFTEST_TRACE=1` — one line per submitted frame.
-- `VSFEEL_DFFTEST_VRAM=1` — per-in-flight-frame scratch banner.
-- `VSFEEL_DFFTEST_SGSIZE=N`, `VSFEEL_DFFTEST_SGSIZE_INVALID` — force (or
+- `VSFEEL_DFTTEST_TRACE=1` — one line per submitted frame.
+- `VSFEEL_DFTTEST_VRAM=1` — per-in-flight-frame scratch banner.
+- `VSFEEL_DFTTEST_SGSIZE=N`, `VSFEEL_DFTTEST_SGSIZE_INVALID` — force (or
   deliberately break) the requested subgroup size; both bypass the multiple-of-16
   requirement above on purpose, and an unsupported size is still rejected when the
   pipeline is created.
