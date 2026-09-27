@@ -330,7 +330,7 @@ PLUGINS = {
     "bm3dhip": Plugin("bm3dhip"),
     "nlm_hip": Plugin("nlm_hip"),
     "bm3dvk": Plugin("bm3dvk"),
-    "knlmvk": Plugin("knlmvk"),
+    "knlmvk": Plugin("knlmvk")
 }
 
 
@@ -428,7 +428,8 @@ def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
     return {
         "vsfeel": f"core.vsfeel.BM3Dv2({clip}, {common})",
         "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {common})",
-        "bm3dvk": f"core.bm3dvk.BM3Dv2({clip}, {common})"
+        "bm3dvk": f"core.bm3dvk.BM3Dv2({clip}, {common})",
+        "bm3dhip": f"core.bm3dvk.BM3Dv2({clip}, {common})",
     }
 
 
@@ -440,7 +441,8 @@ def _bilateral_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dic
     return {
         "vsfeel": f"core.vsfeel.Bilateral({clip}, {args})",
         "vszipcl": f"core.vszipcl.Bilateral({clip}, {args})",
-        "vszipcu": f"core.vszipcu.Bilateral({clip}, {args})"
+        "vszipcu": f"core.vszipcu.Bilateral({clip}, {args})",
+        "bilateralhip": f"core.bilateralhip.Bilateral({clip}, {args})"
     }
 
 
@@ -465,7 +467,7 @@ def _dfttest_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
     return {
         "vsfeel": f"core.vsfeel.DFTTest({clip}, {args})",
         "vszipcl": f"core.vszipcl.DFTTest({clip}, {args})",
-        "vszipcu": f"core.vszipcu.DFTTest({clip}, {args})",
+        "vszipcu": f"core.vszipcu.DFTTest({clip}, {args})"
     }
 
 
@@ -668,9 +670,9 @@ FILTERS: dict[str, FilterSpec] = {
         args=[
             Arg("sigma", "--bm3d-sigma", "bm3d_sigma", float, 0.7),
             Arg("radius", "--bm3d-radius", "bm3d_radius", int, 2),
-            Arg("bm_range", "--bm3d-bm-range", "bm3d_bm_range", int, 16),
-            Arg("ps_range", "--bm3d-ps-range", "bm3d_ps_range", int, 7),
-            Arg("block_step", "--bm3d-block-step", "bm3d_block_step", int, 4),
+            Arg("bm_range", "--bm3d-bm-range", "bm3d_bm_range", int, 9),
+            Arg("ps_range", "--bm3d-ps-range", "bm3d_ps_range", int, 4),
+            Arg("block_step", "--bm3d-block-step", "bm3d_block_step", int, 8),
         ],
         build=_bm3d_build,
         input="depth(get_y(clip), 32)",

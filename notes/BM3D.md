@@ -43,8 +43,11 @@ Current design:
   its writers' estimations are submitted, then a full pipeline barrier at the
   start of its first command buffer supplies the execution and memory dependency
   (a barrier's first scope is every earlier command in submission order on the
-  queue, so no per-frame semaphore wait is needed). A reader never holds a
-  recording context while waiting, so the pool's ring cannot deadlock.
+  queue, so no per-frame semaphore wait is needed). The barrier's access scopes
+  span both directions -- the slots are *written* again here, so writes-before-
+  reads alone would leave the write-after-write half to the stage masks. A reader
+  never holds a recording context while waiting, so the pool's ring cannot
+  deadlock.
 - Runs on the R80 GPU API: `clip:vnode:gpu` in and out with `ffGPUOutput`, so
   the core's `GPUUpload`/`GPUDownload` cross the bus and a consumer waits on the
   plane's producer pair; device choice, queue locking and the buffer pool are the
@@ -181,6 +184,13 @@ Chronological; each entry keeps the mechanism, not the story.
   falling back to the source pixel when none survive (`bm3d_agg.comp`,
   expectation computed in `bm3d.cpp`); 73/73 reference tests pass, and with the
   witnesses zeroed the output is bit-exact the source. No perf change.
+- **2026-09-26 — the handoff barrier only ordered writes before reads.** A slot
+  is refilled one frame after it is freed, so the reuse rides on that one
+  barrier; its `dstAccessMask` had no write bit, leaving the write-after-write
+  half with no memory dependency (invisible while submissions never overlap).
+  Both access scopes now cover both directions; no perf change. The `tags`
+  witness cannot see a late *ring* copy -- the estimation writes the witness
+  itself -- so a clean witness report does not clear that path.
 
 ## Round: the block-match scan (2026-09-21, +64% end to end)
 
@@ -358,6 +368,9 @@ cached at creation, not read per frame.
 - `VSFEEL_BM3D_TIMING=1` — host-stage split per frame (cached at creation).
 - `VSFEEL_BM3D_VRAM=1` — creation-time VRAM budget (pooled buffers only now).
 - `VSFEEL_BM3D_SPLIT=0` — one estimation submission per frame (pre-TDR-split).
+- `VSFEEL_BM3D_RINGWAIT=1` — wait the ring copier's submission out host side
+  instead of riding the handoff barrier (diagnostic for a ring copy that lands
+  late, which the `tags` witness cannot see).
 - `VSFEEL_BM3D_CACHE=1` — add the seek margin back to the estimate cache
   (0, the default, sizes it for the working set; see the VRAM paragraph for the
   +36..41%).

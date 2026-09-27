@@ -149,6 +149,12 @@ struct BM3DData {
     std::vector<int> src_frame {};   // frame index whose data each src slot holds
     std::vector<int> src_writer {};  // frame that reserved each src slot for copying
     std::vector<uint8_t> src_ready {};  // its estimation submission is enqueued
+    // Diagnostic (VSFEEL_BM3D_RINGWAIT): the ring copier's chunk-0 submission
+    // value per frame, so a reader can wait the copy out instead of trusting
+    // the barrier. The witness covers the estimate slots but cannot see a ring
+    // copy that lands late (the estimation writes the witness itself).
+    bool ring_wait { false };
+    std::vector<uint64_t> chunk0_value {};
     std::vector<std::vector<uint64_t>> src_holders {};  // reservation tokens
     std::vector<int> res_frame {};   // frame index whose stack each res slot holds
     std::vector<int> res_writer {};  // frame that computed each res slot's content
@@ -493,20 +499,44 @@ static void publish_est_submitted(BM3DData * d, const Bm3dFrame & fr) {
 
 // Wait host side until every source slot this frame reads has been submitted by
 // its copier. The frame holds those slots, so the writer cannot be re-reserved
-// underneath it.
+// underneath it. With VSFEEL_BM3D_RINGWAIT the copier's copy is additionally
+// waited out on the device, which lifts the whole handoff off the barrier's
+// scopes (diagnostic: the witness cannot see a ring copy that lands late).
 static void wait_src_submitted(BM3DData * d, const Bm3dFrame & fr) {
     if (d->radius == 0) {
         return;
     }
-    std::unique_lock lock(d->cache_lock);
-    d->cache_cv.wait(lock, [&] {
+    std::vector<uint64_t> waits;
+    {
+        std::unique_lock lock(d->cache_lock);
+        d->cache_cv.wait(lock, [&] {
+            for (int k = 0; k < fr.n_src; ++k) {
+                if (!fr.upload_new[k] && !d->src_ready[fr.src_slot[k]]) {
+                    return false;
+                }
+            }
+            return true;
+        });
+        if (!d->ring_wait) {
+            return;
+        }
         for (int k = 0; k < fr.n_src; ++k) {
-            if (!fr.upload_new[k] && !d->src_ready[fr.src_slot[k]]) {
-                return false;
+            if (fr.upload_new[k]) {
+                continue;
+            }
+            const int writer = d->src_writer[fr.src_slot[k]];
+            if (writer >= 0 && writer < static_cast<int>(d->chunk0_value.size())) {
+                const uint64_t value = d->chunk0_value[writer];
+                if (value != 0) {
+                    waits.push_back(value);
+                }
             }
         }
-        return true;
-    });
+    }
+    for (const uint64_t value : waits) {
+        char err[256] {};
+        d->gpu->api->gpuExecWaitValue(d->exec, value, err, sizeof(err));
+    }
 }
 
 // Same for the estimate stacks the aggregation reads.
@@ -581,16 +611,16 @@ static void bm3d_bind(const GPUDevice & gpu, VkCommandBuffer cmd,
     gpu_push_buffers(gpu, cmd, layout, bufs, 6);
 }
 
-// A whole-command barrier: every write made visible to every later read. Used
-// where the producer and consumer are different dispatches or different
-// submissions, which is what the cache handoff needs.
+// A whole-command barrier across submissions: the slots are written again here
+// (zero-fill, ring copies, atomics) while an earlier frame may still be reading
+// or writing them, and only write-after-read needs no memory dependency of its own.
 static void bm3d_full_barrier(const GPUDevice & gpu, VkCommandBuffer cmd) {
     VkMemoryBarrier2 mb {};
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
     mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
     mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT;
+    mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
     VkDependencyInfo dep {};
     dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dep.memoryBarrierCount = 1;
@@ -1048,8 +1078,13 @@ static const VSFrame *VS_CC BM3DGetFrame(
                 }
             }
             record_est_chunk(d, ctx, fr, n, c, chunks, window, dst_plane.buffer, gputrace);
-            if (d->gpu->api->gpuExecSubmit(ctx, nullptr, errbuf, sizeof(errbuf))) {
+            uint64_t signaled = 0;
+            if (d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf, sizeof(errbuf))) {
                 return set_error("estimation submit failed: "s + errbuf);
+            }
+            if (c == 0 && n < static_cast<int>(d->chunk0_value.size())) {
+                // The ring copy rides in chunk 0; RINGWAIT readers wait this out.
+                d->chunk0_value[n] = signaled;
             }
         }
         for (const VSFrame * f : sources) {
@@ -1169,6 +1204,9 @@ static void VS_CC BM3DCreate(
     d->dump = env_flag("VSFEEL_BM3D_DUMP");
     d->split_est = env_int("VSFEEL_BM3D_SPLIT", 1) != 0;
     d->nochunkbar = env_flag("VSFEEL_BM3D_NOCHUNKBAR");
+    // Diagnostic: wait the ring copier's submission out host side instead of
+    // riding the handoff barrier (see wait_src_submitted).
+    d->ring_wait = env_flag("VSFEEL_BM3D_RINGWAIT");
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
@@ -1609,6 +1647,7 @@ static void VS_CC BM3DCreate(
             d->radius, kInflightFrames, d->res_cap, d->src_ring, d->planes[0].stride);
     }
 
+    d->chunk0_value.assign(static_cast<size_t>(d->nframes), 0);
     d->src_frame.assign(d->src_ring, -1);
     d->src_writer.assign(d->src_ring, -1);
     d->src_ready.assign(d->src_ring, 0);

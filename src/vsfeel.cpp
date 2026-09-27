@@ -327,9 +327,11 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     push_desc.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES;
     VkPhysicalDeviceSubgroupProperties subgroup {};
     subgroup.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
-    subgroup.pNext = &push_desc;
     VkPhysicalDeviceSubgroupSizeControlProperties size_control {};
     size_control.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
+    // Chain push_desc off size_control: assigning subgroup.pNext twice dropped
+    // it, so maxPushDescriptors stayed at its default and the query was dead.
+    size_control.pNext = &push_desc;
     subgroup.pNext = &size_control;
     VkPhysicalDeviceProperties2 props {};
     props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
