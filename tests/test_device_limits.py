@@ -348,3 +348,48 @@ def test_push_descriptor_limit_is_reported():
                       {"VSFEEL_LIMIT_PUSH_DESCRIPTORS": "4"})
     err = res["nlmeans"].get("error", "")
     assert "push descriptors" in err and "4" in err, res["nlmeans"]
+
+
+def test_two_dimensional_grid_overflow_is_reported():
+    """Bilateral and GaussBlur cannot fold an over-wide plane into Y.
+
+    Their kernels address a tile as (ID.x, ID.y), so a width past the device's
+    X group limit has nowhere to go: it must fail with the grid and the limits
+    rather than dispatch a clamped grid that leaves the tail unwritten.
+    """
+    cases = [{"label": "bilateral", "filter": "bilateral"},
+             {"label": "gaussblur", "filter": "gaussblur"}]
+    res = _run_limits(cases, {"VSFEEL_LIMIT_GRID_X": "4"})
+    for case in cases:
+        err = res[case["label"]].get("error", "")
+        assert "workgroup grid" in err and "4x" in err, res[case["label"]]
+
+
+def test_subgroup_size_requests_require_compute_stage_support():
+    """A required-size mask without COMPUTE must degrade, not break.
+
+    Requesting requiredSubgroupSize for a stage outside
+    requiredSubgroupSizeStages is invalid usage, so with the mask cleared the
+    filters whose default width already fits (DFTTest, NLMeans, BM3D) must run
+    unchanged, and the two that need exactly 32 lanes (NNEDI3, EEDI3) must say
+    so rather than hand the driver an invalid required size.
+    """
+    labels = ["dfttest", "nlmeans", "bm3d"]
+    cases = [{"label": name, "filter": name} for name in labels]
+    default = _run_limits(cases)
+    cleared = _run_limits(cases, {"VSFEEL_LIMIT_SUBGROUP_STAGES": "0"})
+    for label in labels:
+        assert default[label].get("finite") is True, default[label]
+        assert cleared[label].get("finite") is True, cleared[label]
+    # BM3D aggregates with atomicAdd, so its last bits differ run to run and a
+    # digest cannot be compared across processes; the other two are exact.
+    for label in ("dfttest", "nlmeans"):
+        assert cleared[label]["sha1"] == default[label]["sha1"], label
+
+    strict = [{"label": "nnedi3", "filter": "nnedi3"},
+              {"label": "eedi3", "filter": "eedi3"}]
+    res = _run_limits(strict, {"VSFEEL_LIMIT_SUBGROUP_STAGES": "0"})
+    for case in strict:
+        err = res[case["label"]].get("error", "")
+        assert "32-lane subgroups" in err, res[case["label"]]
+

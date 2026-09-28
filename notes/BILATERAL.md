@@ -180,6 +180,11 @@ SDMA and the port reaches parity without any core change.
   (1742) > 16x8 (1707) > 16x16 (1705), R=12 32x16 (1360) ≈ 32x8, R=24 16x16
   (345) ≫ 16x8 (228). The auto rule (`32x8` R≤12, `32x16` above) is unchanged by
   the port.
+- **An over-wide plane is refused, not truncated.** The kernel addresses a tile
+  as (ID.x, ID.y), so a width past `maxComputeWorkGroupCount[0]` has nowhere to
+  fold: the grid used to be clamped and the tail silently unwritten (2 097 120 px
+  at 32-wide blocks on a 65 535-group device). Creation now errors naming the
+  grid and the device's limits.
 - **Dead ends, with mechanism.**
   - ISA instruction counts are not comparable: our fully-unrolled 361-tap shared
     loop is ~3100 instructions with VOPD=0, the reference's rolled LLVM body

@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -732,18 +733,45 @@ static void VS_CC GaussCreate(
         cfg.small = cfg_small[ci];
         cfg.tmp_elem = plane_tmp_elem;
 
-        cfg.grid_x = static_cast<uint32_t>(std::min<int64_t>(
-            (cfg.width + BLK_X - 1) / BLK_X, static_cast<int64_t>(max_grid_x)));
-        cfg.grid_y = static_cast<uint32_t>(std::min<int64_t>(
-            (cfg.height + VRT * BLK_Y - 1) / (VRT * BLK_Y), static_cast<int64_t>(max_grid_y)));
-        cfg.v_grid_x = static_cast<uint32_t>(std::min<int64_t>(
-            (cfg.width + BLK_X - 1) / BLK_X, static_cast<int64_t>(max_grid_x)));
-        cfg.v_grid_y = static_cast<uint32_t>(std::min<int64_t>(
-            ((cfg.height + LARGE_R - 1) / LARGE_R + BLK_Y - 1) / BLK_Y, static_cast<int64_t>(max_grid_y)));
-        cfg.h_grid_x = static_cast<uint32_t>(std::min<int64_t>(
-            ((cfg.width + LARGE_R - 1) / LARGE_R + BLK_X - 1) / BLK_X, static_cast<int64_t>(max_grid_x)));
-        cfg.h_grid_y = static_cast<uint32_t>(std::min<int64_t>(
-            (cfg.height + BLK_Y - 1) / BLK_Y, static_cast<int64_t>(max_grid_y)));
+        const int64_t small_x = (cfg.width + BLK_X - 1) / BLK_X;
+        const int64_t small_y = (cfg.height + VRT * BLK_Y - 1) / (VRT * BLK_Y);
+        const int64_t v_x = (cfg.width + BLK_X - 1) / BLK_X;
+        const int64_t v_y = ((cfg.height + LARGE_R - 1) / LARGE_R + BLK_Y - 1) / BLK_Y;
+        const int64_t h_x = ((cfg.width + LARGE_R - 1) / LARGE_R + BLK_X - 1) / BLK_X;
+        const int64_t h_y = (cfg.height + BLK_Y - 1) / BLK_Y;
+        // A 2D grid cannot fold an over-wide plane into Y the way the 1D
+        // kernels do: refuse it instead of dispatching a clamped grid that
+        // leaves everything past the limit unwritten. Only the chosen path's
+        // grids matter -- the other path's taller grid may exceed a limit the
+        // shape in use does not.
+        const auto over = [&](int64_t gx, int64_t gy,
+                              const char * what) -> std::optional<std::string> {
+            if (gx <= max_grid_x && gy <= max_grid_y) {
+                return std::nullopt;
+            }
+            return "plane " + std::to_string(plane) + "'s " + what +
+                " needs a " + std::to_string(gx) + "x" + std::to_string(gy) +
+                " workgroup grid, more than this device can dispatch (" +
+                std::to_string(max_grid_x) + "x" + std::to_string(max_grid_y) + ")";
+        };
+        if (cfg.small) {
+            if (auto e = over(small_x, small_y, "fused pass")) {
+                return set_error(*e);
+            }
+        } else {
+            if (auto e = over(v_x, v_y, "vertical pass")) {
+                return set_error(*e);
+            }
+            if (auto e = over(h_x, h_y, "horizontal pass")) {
+                return set_error(*e);
+            }
+        }
+        cfg.grid_x = static_cast<uint32_t>(small_x);
+        cfg.grid_y = static_cast<uint32_t>(small_y);
+        cfg.v_grid_x = static_cast<uint32_t>(v_x);
+        cfg.v_grid_y = static_cast<uint32_t>(v_y);
+        cfg.h_grid_x = static_cast<uint32_t>(h_x);
+        cfg.h_grid_y = static_cast<uint32_t>(h_y);
 
         cfg.wt_base = wt_running;
         wt_running += static_cast<uint32_t>(weights[ci].size());

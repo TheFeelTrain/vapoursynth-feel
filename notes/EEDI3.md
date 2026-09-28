@@ -485,6 +485,13 @@ passes). All bit-identical to the previous build unless stated.
   convention; that one is silenced for the plugin and the baseline enforced in
   CMakeLists.
 
+- **Batch-cache races returned `nullptr` with no error**: `getFrame` checked the
+  cache and then took the frame under two separate locks, so a sibling batch
+  could evict it in the gap, and the producer took its own frame after
+  publishing, where a concurrent publish's eviction could win it. The claim and
+  take are one `eedi3_take_or_claim` now and `eedi3_publish` hands `first` back
+  under the same lock. No perf change.
+
 ### Round 27 — the vcheck is parallel by default; a Jacobi ladder controls drift
 
 - **The serial row walk is gone from the shipped path.** Row r takes `d2p` from the

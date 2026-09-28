@@ -305,6 +305,10 @@ struct GPUDevice {
     // How many subgroups one compute workgroup may split into when its
     // pipeline requires a subgroup size.
     uint32_t max_compute_workgroup_subgroups { 1 };
+    // VkPhysicalDeviceSubgroupSizeControlProperties::requiredSubgroupSizeStages:
+    // requesting a size for a stage the mask excludes is invalid usage, and the
+    // mask may omit COMPUTE even when size control itself is enabled.
+    VkShaderStageFlags subgroup_size_stages {};
     // The core's baseline requires both, but nothing in this plugin may assume
     // it: requesting a subgroup size or full subgroups is invalid usage unless
     // the feature is actually enabled, so they are queried and read.
@@ -352,10 +356,14 @@ struct GPUDevice {
     // Whether a pipeline for a workgroup of `workgroup_invocations` invocations
     // may be created with requiredSubgroupSize = `size`. requiredSubgroupSize is
     // a power of two inside [minSubgroupSize, maxSubgroupSize] and invalid usage
-    // otherwise, size control has to be enabled, and the workgroup must not
-    // split into more subgroups than maxComputeWorkgroupSubgroups allows.
+    // otherwise, size control has to be enabled for the COMPUTE stage, and the
+    // workgroup must not split into more subgroups than
+    // maxComputeWorkgroupSubgroups allows.
     bool has_subgroup_size(uint32_t size, uint32_t workgroup_invocations) const {
         if (!subgroup_size_control || size == 0) {
+            return false;
+        }
+        if ((subgroup_size_stages & VK_SHADER_STAGE_COMPUTE_BIT) == 0) {
             return false;
         }
         if ((size & (size - 1)) != 0) {

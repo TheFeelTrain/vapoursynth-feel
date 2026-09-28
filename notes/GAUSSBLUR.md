@@ -99,6 +99,10 @@ medians:
 - **The fused path's 48 KiB tile cap was dead.** The widest small-path tile is
   7 680 B, so `min(48 KiB, device LDS)` was always decided by the device; the cap
   is gone and the device limit is now the only check. No perf change.
+- **An over-wide plane is refused, not truncated.** Both passes tile by
+  (ID.x, ID.y), so the old clamped grids left everything past
+  `maxComputeWorkGroupCount[0]` (1 048 560 px at BLK_X=16 on a 65 535-group
+  device) unwritten. Creation now errors naming the failing pass and the limits.
 
 ### 2026-09-22 — R80 GPU API port
 

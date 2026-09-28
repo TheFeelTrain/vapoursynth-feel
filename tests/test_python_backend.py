@@ -194,6 +194,32 @@ def test_eedi3aa_no_arg_defaults_match_based_aa(noise_gray, monkeypatch):
         assert getattr(wrapper, field) == value, field
 
 
+def test_eedi3aa_fused_path_requires_a_vsfeel_backend(noise_gray, monkeypatch):
+    """An explicit CPU or reference backend keeps the base class's chain.
+
+    EEDI3AA is vsfeel's fused implementation, so taking it when the caller
+    selected another backend would silently run a different filter. vsaa's
+    ``Backend.FEEL`` resolves to the same vsfeel namespace and stays fused.
+    """
+    import vsaa.deinterlacers as _deinterlacers
+
+    calls: list[object] = []
+
+    def spy(self, clip, direction=None, **kwargs):
+        calls.append(direction)
+        return clip
+
+    monkeypatch.setattr(_deinterlacers.EEDI3, "antialias", spy)
+
+    out = vsfeel.EEDI3(backend=EEDI3.Backend.CPU).antialias(noise_gray)
+    assert calls and out is noise_gray, "CPU backend must not take the fused path"
+
+    for backend in (_backend(), EEDI3.Backend.FEEL):
+        calls.clear()
+        vsfeel.EEDI3(backend=backend).antialias(noise_gray)
+        assert not calls, f"{backend} must take the fused path"
+
+
 def test_backend_context_routes_singletons(noise_gray):
     old_bilateral, old_gauss = bilateral.backend, gauss_blur.backend
     with _backend()():

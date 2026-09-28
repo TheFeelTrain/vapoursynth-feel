@@ -258,6 +258,15 @@ upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
   explicitly; covered by `tests/test_validation.py`.
 - `numFrames == -1` is the unknown-length sentinel: `field>1` doubling is
   guarded (`numFrames > 0`), same fix as EEDI3.
+- Pipeline teardown deduped into a fixed six-entry set, so a YUV420 `dh` clip
+  with `planes=[0,1]` (seven pipelines: two processed planes plus the skipped
+  plane's zero-fill keep) leaked the seventh. The set is unbounded now.
+- `has_subgroup_size` read the size bounds but not
+  `requiredSubgroupSizeStages`, so a device whose mask omits COMPUTE was handed
+  an invalid `requiredSubgroupSize`. It is refused now: DFTTest/NLMeans/BM3D
+  fall back to the driver's width, while NNEDI3 and EEDI3, which need exactly
+  32 lanes, report that instead. `VSFEEL_LIMIT_SUBGROUP_STAGES` clamps the mask
+  for `tests/test_device_limits.py`.
 
 ## Open work
 

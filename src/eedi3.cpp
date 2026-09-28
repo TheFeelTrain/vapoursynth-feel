@@ -809,19 +809,6 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
 // transfers to it), and leftover entries are dropped once they are older than
 // three batches.
 
-// Take the cached output frame `n`, transferring ownership. NULL when absent.
-static VSFrame * eedi3_take_cached(Eedi3Data * d, const int n) {
-    std::lock_guard guard(d->cache_lock);
-    for (auto it = d->cache.begin(); it != d->cache.end(); ++it) {
-        if (it->first == n) {
-            VSFrame * frame = it->second;
-            d->cache.erase(it);
-            return frame;
-        }
-    }
-    return nullptr;
-}
-
 static bool eedi3_cache_has(const Eedi3Data * d, const int n) {
     for (const auto & e : d->cache) {
         if (e.first == n) {
@@ -831,13 +818,19 @@ static bool eedi3_cache_has(const Eedi3Data * d, const int n) {
     return false;
 }
 
-// Claim [n, last] so only this thread records it. False when another thread
-// published frame n while we waited: the caller then takes it.
-static bool eedi3_claim_batch(Eedi3Data * d, const int n, const int last) {
+// Take cached frame `n` if it is there, else claim [n, last] for this thread.
+// One lock covers both, so a frame another batch published cannot be evicted in
+// the gap between "it is cached" and "take it" -- that gap used to fall through
+// to a NULL return with no filter error. NULL means the caller owns the claim.
+static VSFrame * eedi3_take_or_claim(Eedi3Data * d, const int n, const int last) {
     std::unique_lock lock(d->cache_lock);
     for (;;) {
-        if (eedi3_cache_has(d, n)) {
-            return false;
+        for (auto it = d->cache.begin(); it != d->cache.end(); ++it) {
+            if (it->first == n) {
+                VSFrame * frame = it->second;
+                d->cache.erase(it);
+                return frame;
+            }
         }
         bool busy = false;
         for (const auto & c : d->claims) {
@@ -848,7 +841,7 @@ static bool eedi3_claim_batch(Eedi3Data * d, const int n, const int last) {
         }
         if (!busy) {
             d->claims.emplace_back(n, last);
-            return true;
+            return nullptr;
         }
         d->cache_cv.wait(lock, [&] {
             if (eedi3_cache_has(d, n)) {
@@ -875,12 +868,16 @@ static void eedi3_release_claim(Eedi3Data * d, const int first, const int last) 
     d->cache_cv.notify_all();
 }
 
-// Publish freshly computed frames and drop the claim. The oldest entries are
-// evicted past three batches' worth; their frames are freed outside the lock.
-static void eedi3_publish(Eedi3Data * d, const int first, const int last,
-                          std::vector<std::pair<int, VSFrame *>> & produced,
-                          const VSAPI * vsapi) {
+// Publish freshly computed frames, hand frame `first` back to the caller and
+// drop the claim. The take happens under the same lock as the publish, so a
+// sibling batch publishing (and evicting) concurrently cannot take it first.
+// The oldest entries are evicted past three batches' worth; their frames are
+// freed outside the lock.
+static VSFrame * eedi3_publish(Eedi3Data * d, const int first, const int last,
+                               std::vector<std::pair<int, VSFrame *>> & produced,
+                               const VSAPI * vsapi) {
     std::vector<VSFrame *> victims;
+    VSFrame * mine = nullptr;
     {
         std::lock_guard guard(d->cache_lock);
         for (auto & p : produced) {
@@ -892,11 +889,19 @@ static void eedi3_publish(Eedi3Data * d, const int first, const int last,
             victims.push_back(d->cache.front().second);
             d->cache.erase(d->cache.begin());
         }
+        for (auto it = d->cache.begin(); it != d->cache.end(); ++it) {
+            if (it->first == first) {
+                mine = it->second;
+                d->cache.erase(it);
+                break;
+            }
+        }
     }
     eedi3_release_claim(d, first, last);
     for (VSFrame * v : victims) {
         vsapi->freeFrame(v);
     }
+    return mine;
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,11 +1030,8 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         return nullptr;
     }
 
-    if (VSFrame * hit = eedi3_take_cached(d, n)) {
+    if (VSFrame * hit = eedi3_take_or_claim(d, n, last)) {
         return hit;
-    }
-    if (!eedi3_claim_batch(d, n, last)) {
-        return eedi3_take_cached(d, n);   // published while we waited
     }
 
     vsfeel_trace_frame_begin();
@@ -1207,8 +1209,12 @@ static const VSFrame *VS_CC Eedi3GetFrame(
             }
         }
     }
-    eedi3_publish(d, n, last, produced, vsapi);
-    return eedi3_take_cached(d, n);
+    if (VSFrame * out = eedi3_publish(d, n, last, produced, vsapi)) {
+        return out;
+    }
+    // publish takes `first` under the cache lock, so this cannot happen; if it
+    // ever does, say so rather than returning null with no filter error.
+    return fail("the batch's own frame was evicted before it could be returned");
 }
 
 // EEDI3AA: the whole based_aa EEDI3 chain in one submission. The vertical
@@ -1305,11 +1311,8 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
         return nullptr;
     }
 
-    if (VSFrame * hit = eedi3_take_cached(d, n)) {
+    if (VSFrame * hit = eedi3_take_or_claim(d, n, last)) {
         return hit;
-    }
-    if (!eedi3_claim_batch(d, n, last)) {
-        return eedi3_take_cached(d, n);   // published while we waited
     }
 
     vsfeel_trace_frame_begin();
@@ -1590,8 +1593,12 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
         VSMap * props = vsapi->getFramePropertiesRW(p.second);
         vsapi->mapSetInt(props, "_FieldBased", VSC_FIELD_PROGRESSIVE, maReplace);
     }
-    eedi3_publish(d, n, last, produced, vsapi);
-    return eedi3_take_cached(d, n);
+    if (VSFrame * out = eedi3_publish(d, n, last, produced, vsapi)) {
+        return out;
+    }
+    // publish takes `first` under the cache lock, so this cannot happen; if it
+    // ever does, say so rather than returning null with no filter error.
+    return fail("the batch's own frame was evicted before it could be returned");
 }
 
 static void VS_CC Eedi3Free(void *instanceData, [[maybe_unused]] VSCore *core,

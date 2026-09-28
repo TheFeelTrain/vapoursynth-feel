@@ -43,6 +43,17 @@ def _fusable_format(clip: vs.VideoNode) -> bool:
     return False
 
 
+def _feel_backend(backend: Any) -> bool:
+    """Whether ``backend`` routes EEDI3 to the vsfeel plugin.
+
+    The fused ``EEDI3AA`` call is only the vsfeel backend's chain: a CPU or
+    reference backend must keep the base class's two-pass implementation. Both
+    vsfeel's own backend objects and vsaa's ``Backend.FEEL`` member carry the
+    ``vsfeel`` namespace as their ``value``.
+    """
+    return getattr(backend, "value", None) == _FeelBackend.value
+
+
 @dataclass
 class EEDI3(_VsaaEEDI3):
     """``vsaa`` EEDI3 antialiaser that fuses based_aa's chain into one call.
@@ -70,6 +81,7 @@ class EEDI3(_VsaaEEDI3):
             and self.double_rate
             and not self.transpose_first
             and not isinstance(sclip, Deinterlacer)
+            and _feel_backend(self.backend)
             and _fusable_format(clip)
         ):
             if sclip:

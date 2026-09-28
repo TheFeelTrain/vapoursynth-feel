@@ -343,6 +343,7 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     dev->min_subgroup_size = size_control.minSubgroupSize;
     dev->max_subgroup_size = size_control.maxSubgroupSize;
     dev->max_compute_workgroup_subgroups = size_control.maxComputeWorkgroupSubgroups;
+    dev->subgroup_size_stages = size_control.requiredSubgroupSizeStages;
     dev->subgroup_ops = subgroup.supportedOperations;
     if (push_desc.maxPushDescriptors > 0) {
         dev->max_push_descriptors = push_desc.maxPushDescriptors;
@@ -377,6 +378,12 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     if (const int cap = env_int("VSFEEL_LIMIT_PUSH_DESCRIPTORS", 0); cap > 0 &&
         static_cast<uint32_t>(cap) < dev->max_push_descriptors) {
         dev->max_push_descriptors = static_cast<uint32_t>(cap);
+    }
+    // AND the required-size stage mask down, so a device whose mask omits
+    // COMPUTE can be exercised without one. >= 0 rather than > 0: clearing it
+    // to 0 is the interesting case.
+    if (const int mask = env_int("VSFEEL_LIMIT_SUBGROUP_STAGES", -1); mask >= 0) {
+        dev->subgroup_size_stages &= static_cast<VkShaderStageFlags>(mask);
     }
 
     uint32_t families = 0;
@@ -450,12 +457,12 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
             VK_API_VERSION_MAJOR(p.driverVersion), VK_API_VERSION_MINOR(p.driverVersion),
             VK_API_VERSION_PATCH(p.driverVersion));
         fprintf(stderr, "[vsfeel] queue family %u (timestamps=%u), subgroup %u [%u..%u] "
-                        "ops=0x%x maxWorkgroupSubgroups=%u (control=%d full=%d)\n",
+                        "ops=0x%x maxWorkgroupSubgroups=%u (control=%d full=%d stages=0x%x)\n",
             dev->queue_family, dev->timestamp_valid_bits, dev->subgroup_size,
             dev->min_subgroup_size, dev->max_subgroup_size,
             static_cast<unsigned>(dev->subgroup_ops),
             dev->max_compute_workgroup_subgroups, dev->subgroup_size_control,
-            dev->compute_full_subgroups);
+            dev->compute_full_subgroups, static_cast<unsigned>(dev->subgroup_size_stages));
         fprintf(stderr, "[vsfeel] compute limits: invocations=%u, size=%ux%ux%u, "
                         "shared=%u bytes, groups=%ux%ux%u, storageRange=%llu, "
                         "pushDescriptors=%u\n",

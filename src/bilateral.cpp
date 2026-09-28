@@ -668,10 +668,21 @@ static void VS_CC BilateralCreate(
         cfg.height = key.height;
         cfg.stride = key.stride;
 
-        cfg.grid_x = static_cast<uint32_t>(std::min<int64_t>(
-            (cfg.width - 1) / block_x + 1, static_cast<int64_t>(max_grid_x)));
-        cfg.grid_y = static_cast<uint32_t>(std::min<int64_t>(
-            (cfg.height - 1) / block_y + 1, static_cast<int64_t>(max_grid_y)));
+        // A 2D grid, so an over-wide plane cannot be folded into Y the way the
+        // 1D kernels do: refuse it instead of dispatching a clamped grid that
+        // would leave everything past the limit unwritten.
+        const int64_t grid_x = (cfg.width - 1) / block_x + 1;
+        const int64_t grid_y = (cfg.height - 1) / block_y + 1;
+        if (grid_x > static_cast<int64_t>(max_grid_x) ||
+            grid_y > static_cast<int64_t>(max_grid_y)) {
+            return set_error("plane " + std::to_string(plane) + " (" +
+                std::to_string(cfg.width) + "x" + std::to_string(cfg.height) +
+                ") needs a " + std::to_string(grid_x) + "x" + std::to_string(grid_y) +
+                " workgroup grid, more than this device can dispatch (" +
+                std::to_string(max_grid_x) + "x" + std::to_string(max_grid_y) + ")");
+        }
+        cfg.grid_x = static_cast<uint32_t>(grid_x);
+        cfg.grid_y = static_cast<uint32_t>(grid_y);
 
         const int tile_x = 2 * key.radius + block_x;
         const int tile_y = 2 * key.radius + block_y;

@@ -402,24 +402,21 @@ struct Nnedi3Data {
             pool = nullptr;
         }
         VkDevice dev = gpu->device;
-        VkPipeline seen[6] {};
-        int n_seen = 0;
+        // One pipeline per (plane, role): three planes times pre/pred/keep. A
+        // fixed six-entry dedup set leaked the seventh -- YUV420 with dh and
+        // planes=[0,1] makes one for each processed plane plus the skipped
+        // plane's zero-fill keep.
+        std::vector<VkPipeline> seen;
         for (auto & plane : planes) {
             const VkPipeline pipes[3] {
                 plane.pre_pipeline, plane.pred_pipeline, plane.keep_pipeline
             };
             for (VkPipeline p : pipes) {
-                if (!p) {
+                if (!p || std::find(seen.begin(), seen.end(), p) != seen.end()) {
                     continue;
                 }
-                bool dup = false;
-                for (int i = 0; i < n_seen; ++i) {
-                    dup |= seen[i] == p;
-                }
-                if (!dup && n_seen < 6) {
-                    seen[n_seen++] = p;
-                    gpu->vk->vkDestroyPipeline(dev, p, nullptr);
-                }
+                seen.push_back(p);
+                gpu->vk->vkDestroyPipeline(dev, p, nullptr);
             }
         }
         if (pipeline_layout) {
