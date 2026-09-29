@@ -94,6 +94,20 @@ def _interleave2(clip):
     return vs.core.std.Interleave([clip, clip])
 
 
+def _assert_oracle_planes(clip, dtype, frames, compare_planes, tol=0.0, **kwargs):
+    """Like :func:`_assert_oracle`, but over an explicit plane subset."""
+    mine = _aa(clip, **kwargs)
+    ref = _oracle(clip, **kwargs)
+    worst = 0.0
+    for n in frames:
+        fm, fr = mine.get_frame(n), ref.get_frame(n)
+        for p in compare_planes:
+            a = _plane(fm, p, fm.width, fm.height, dtype).astype(np.float64)
+            b = _plane(fr, p, fr.width, fr.height, dtype).astype(np.float64)
+            worst = max(worst, float(np.abs(a - b).max()))
+    assert worst <= tol, f"oracle mismatch: {worst} > {tol}"
+
+
 def _interleave_distinct(clip):
     """A 2N-frame sclip whose two sub-frames do not alias."""
     return vs.core.std.Interleave([clip, clip.std.Invert()])
@@ -244,6 +258,21 @@ def test_eedi3aa_yuv_plane0_only(bits):
             assert np.array_equal(a, b), f"chroma plane {p} not passed through"
 
 
+@pytest.mark.parametrize("bits", [16, 32], ids=["16bit", "32bit"])
+def test_eedi3aa_yuv_chroma_only(bits):
+    """planes=[1] still takes the fused 50/50 merge for chroma.
+
+    The fuse flag was read from ``planes[0]``'s config for the whole dispatch,
+    so a subset omitting plane 0 wrote one unmerged horizontal sub-pass.
+    """
+    clip = _yuv(bits)
+    _assert_oracle_planes(
+        clip, _dtype(bits), [0, 5, 23], compare_planes=[1],
+        tol=0.0 if bits == 16 else F32_TOL,
+        planes=[1], sclip=_interleave2(clip), mclip=_mask(clip, bits),
+        vcheck=2, mdis=5, nrad=1)
+
+
 # ---------------------------------------------------------------------------
 # Determinism / streams / parallel load
 # ---------------------------------------------------------------------------
@@ -333,6 +362,28 @@ def test_eedi3aa_rejects_bad_field(noise_16bit, field):
 def test_eedi3aa_rejects_dh(noise_16bit):
     with pytest.raises(vs.Error):
         _aa(noise_16bit, field=3, dh=1)
+
+
+def test_eedi3aa_rejects_odd_width(noise_16bit):
+    """An odd processed plane width leaves the last output column unwritten.
+
+    AA's horizontal geometry truncates at ``in_w / 2`` and the compose kernel
+    writes both columns only for ``k < rows``, so column ``in_w - 1`` was never
+    written and kept recycled VRAM.
+    """
+    odd = vs.core.std.Crop(noise_16bit, right=1)
+    assert odd.width % 2 == 1
+    with pytest.raises(vs.Error):
+        _aa(odd, field=3)
+
+
+def test_eedi3aa_rejects_odd_chroma_width():
+    """The odd axis is per processed plane: 630 luma -> 315 chroma rejects."""
+    odd = vs.core.std.Crop(_yuv(16), right=10)
+    with pytest.raises(vs.Error):
+        _aa(odd, field=3)
+    # Luma-only never touches the odd chroma plane, so it must still create.
+    _aa(odd, field=3, planes=[0])
 
 
 def test_eedi3aa_rejects_8bit(noise_8bit):

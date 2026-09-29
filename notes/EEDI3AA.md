@@ -184,6 +184,17 @@ under-reported every stage 10x).
   map, testing plan, benchmarking plan and risk list are all realised in code,
   and its `VSFEEL_EEDI3AA_QUEUES` knob never existed (the cap is
   `VSFEEL_EEDI3_QUEUES`).
+- **2026-09-29 — odd AA plane geometry rejected.** `a.rows = in_w / 2` left the
+  last column of an odd processed plane width unwritten (the compose kernel
+  stores only columns `2k`/`2k+1`), i.e. recycled VRAM every frame; the
+  create-time parity guard now checks both axes for `d->aa`, and `vsfeel/vsaa.py`
+  falls back to the chain for odd geometry. No perf change.
+- **2026-09-29 — the fused 50/50 merge is per plane.** The fuse flag was read
+  once from `planes[0].o0_bytes`, so a `planes` subset omitting plane 0
+  (`planes=[1]`) dispatched `comp_fuse=0` and wrote one unmerged horizontal
+  sub-pass; each plane now reads its own `cfg.o0_bytes`. Measured 1229 codes off
+  the chain at 16-bit, `planes=[1]`, mdis=5, nrad=1, frame 0 of the noise clip,
+  before the fix. No perf change.
 
 ## Open work
 
@@ -232,8 +243,10 @@ cap is `VSFEEL_EEDI3_QUEUES`, not `..._EEDI3AA_QUEUES`.
 3/20/40, nrad 0..3, vcheck 0..3, alpha/beta/gamma corners, Gray8/16/32 mclip
 present/absent, aliased and distinct sclip; the same for f32 under a 1e-6 bound
 (measured max 5.96e-8); `_FieldBased` progressive/TFF/BFF input; YUV420 all
-planes and `planes=[0]`; determinism, multi-stream and parallel load; props
+planes, `planes=[0]` (chroma passthrough) and `planes=[1]` (chroma-only must take
+the fused merge vs the chain); odd processed-plane width and odd subsampled
+chroma width rejected; determinism, multi-stream and parallel load; props
 (N frames, input fps, `_FieldBased` progressive) vs the chain; input validation.
-`tests/test_python_backend.py` adds 3 wrapper tests. Whole suite **603 passed**;
-collected EEDI3-family total **214** (`test_eedi3.py` 40 + `test_eedi3h.py` 11 +
-133 + the wrapper group).
+`tests/test_python_backend.py` adds the wrapper cases (fused == chain, the
+`direction != BOTH` fallback, backend selection, odd-geometry fallback). Whole
+suite **763 passed** via `tools/test.sh`.

@@ -741,23 +741,26 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
             // the second merges against it straight into the output frame.
             // The interp source lives on its own binding, so the fused merge
             // works with or without a vcheck.
-            const bool fuse = d.aa && planes[0].o0_bytes > 0;
             for (int plane = 0; plane < numPlanes; ++plane) {
                 if (!d.process[plane]) {
                     continue;
                 }
                 const auto & cfg = planes[plane];
+                // Per plane: an unprocessed plane's regions are never placed, so
+                // a planes subset omitting plane 0 must not drop the merge for
+                // the others.
+                const bool pfuse = d.aa && cfg.o0_bytes > 0;
                 Eedi3PushConstants pc {};
                 pc.pad_base = static_cast<int32_t>(cfg.rt_off / elem);
                 pc.vout_base = static_cast<int32_t>(
                     (second ? cfg.vout2_off : cfg.vout_off) / elem);
                 pc.dst_base = static_cast<int32_t>(
                     (second ? cfg.dst2_off : cfg.dst_off) / elem);
-                pc.out_base = fuse ? static_cast<int32_t>(cfg.o0_off / elem) : 0;
+                pc.out_base = pfuse ? static_cast<int32_t>(cfg.o0_off / elem) : 0;
                 pc.dst_stride = in.out_stride[plane];
                 pc.field = field;
                 pc.rows = cfg.rows;
-                pc.comp_fuse = fuse ? (second ? 2 : 1) : 0;
+                pc.comp_fuse = pfuse ? (second ? 2 : 1) : 0;
                 bind_pipe(d, cmd, cfg.pipes.compose);
                 bind_bufs(d, cmd, { in.scratch, in.scratch, in.out[plane], in.scratch });
                 pc_push(d, cmd, pc);
@@ -1718,13 +1721,21 @@ static void vsfeel_eedi3_create(
     }
     if (!d->dh) {
         for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
-            const int axis = d->horiz
-                ? (d->vi->width >> (plane > 0 ? d->vi->format.subSamplingW : 0))
-                : (d->vi->height >> (plane > 0 ? d->vi->format.subSamplingH : 0));
-            if (d->process[plane] && (axis & 1)) {
-                return set_error(d->horiz
-                    ? "plane's width must be mod 2 when dh=False"
-                    : "plane's height must be mod 2 when dh=False");
+            if (!d->process[plane]) {
+                continue;
+            }
+            const int pw = d->vi->width >>
+                (plane > 0 ? d->vi->format.subSamplingW : 0);
+            const int ph = d->vi->height >>
+                (plane > 0 ? d->vi->format.subSamplingH : 0);
+            // EEDI3AA runs the horizontal geometry internally too (a.rows =
+            // in_w / 2), so both axes must be even even though d->horiz is
+            // false; the single-axis filters keep checking their own axis.
+            if ((d->horiz || d->aa) && (pw & 1)) {
+                return set_error("plane's width must be mod 2 when dh=False");
+            }
+            if ((!d->horiz || d->aa) && (ph & 1)) {
+                return set_error("plane's height must be mod 2 when dh=False");
             }
         }
     }

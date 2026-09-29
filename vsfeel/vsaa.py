@@ -43,6 +43,33 @@ def _fusable_format(clip: vs.VideoNode) -> bool:
     return False
 
 
+def _fusable_geometry(clip: vs.VideoNode, planes: Any = None) -> bool:
+    """Whether every plane EEDI3AA would process has even dimensions.
+
+    ``EEDI3AA`` runs the horizontal geometry internally, so unlike ``EEDI3`` it
+    truncates an odd plane width (and leaves the last column unwritten); odd
+    geometry therefore keeps the chain, which refuses the same clip. ``planes``
+    is the plugin's own selection, so ``None`` means every plane.
+    """
+    fmt = clip.format
+    if fmt is None:
+        return False
+    if planes is None:
+        selected: Any = range(fmt.num_planes)
+    elif isinstance(planes, int):
+        selected = [planes]
+    else:
+        selected = planes
+    for p in selected:
+        if not 0 <= p < fmt.num_planes:
+            return True  # out of range: let the plugin report it
+        ss_w = fmt.subsampling_w if p > 0 and fmt.num_planes > 1 else 0
+        ss_h = fmt.subsampling_h if p > 0 and fmt.num_planes > 1 else 0
+        if ((clip.width >> ss_w) & 1) or ((clip.height >> ss_h) & 1):
+            return False
+    return True
+
+
 def _feel_backend(backend: Any) -> bool:
     """Whether ``backend`` routes EEDI3 to the vsfeel plugin.
 
@@ -83,6 +110,7 @@ class EEDI3(_VsaaEEDI3):
             and not isinstance(sclip, Deinterlacer)
             and _feel_backend(self.backend)
             and _fusable_format(clip)
+            and _fusable_geometry(clip, args.get("planes"))
         ):
             if sclip:
                 if isinstance(sclip, VSFunctionNoArgs):

@@ -194,6 +194,24 @@ def test_eedi3aa_no_arg_defaults_match_based_aa(noise_gray, monkeypatch):
         assert getattr(wrapper, field) == value, field
 
 
+def test_eedi3aa_falls_back_for_odd_geometry(noise_16bit, monkeypatch):
+    """EEDI3AA needs both plane axes even, so odd geometry keeps the chain."""
+    import vsaa.deinterlacers as _deinterlacers
+
+    calls: list[int] = []
+
+    def spy(self, clip, direction=None, **kwargs):
+        calls.append(clip.width)
+        return clip
+
+    monkeypatch.setattr(_deinterlacers.EEDI3, "antialias", spy)
+    odd = vs.core.std.Crop(noise_16bit, right=1)
+    assert odd.width % 2 == 1
+    out = vsfeel.EEDI3(backend=_backend()).antialias(odd)
+    assert calls == [odd.width], "odd width must not take the fused path"
+    assert out is odd
+
+
 def test_eedi3aa_fused_path_requires_a_vsfeel_backend(noise_gray, monkeypatch):
     """An explicit CPU or reference backend keeps the base class's chain.
 
