@@ -600,6 +600,18 @@ def test_dfttest_rejects_nonfinite_beta(noise_gray):
         _run(noise_gray, tbeta=float("inf"))
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"swin": 4, "sbeta": 1e15}, {"twin": 4, "tbeta": 1e15}],
+    ids=["sbeta", "tbeta"],
+)
+def test_dfttest_rejects_overflowing_bessel_window(noise_gray, kwargs):
+    # A finite beta can still overflow the Kaiser series and produce a NaN
+    # window; that used to reach fsum, whose expansion then ran off its array.
+    with pytest.raises(vs.Error):
+        _run(noise_gray, **kwargs)
+
+
 def test_dfttest_rejects_odd_sigma_arrays(noise_gray):
     with pytest.raises(vs.Error):
         _run(noise_gray, slocation=[0.0, 1.0, 2.0])

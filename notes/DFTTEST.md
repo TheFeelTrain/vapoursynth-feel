@@ -157,6 +157,12 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   now enforced at creation. `src/vsfeel.h` also gained the two checks the request
   was missing: size control actually enabled, and subgroups per workgroup within
   `maxComputeWorkgroupSubgroups`.
+- **Non-finite window vs `fsum`** — mode 4 (`swin`/`twin` 4) overflows its
+  Bessel series to `inf/inf = NaN` for `|beta| ≳ 4e11`, and NaN makes every
+  `lo != 0.0` test in the Shewchuk sum true, so the expansion grew one slot per
+  window value and wrote up to 704 doubles past `partials[64]`. Creation now
+  rejects a non-finite window; `fsum` bails to NaN at the array bound. No perf
+  change.
 - Dead ends that stay dead: `SUB_BLOCKS=16` (worse), the LDS-slice fused
   restructure (2x slower, LDS-bound), a host-side cache with mutex/cv
   ordered-submission waits (starves the worker pool).

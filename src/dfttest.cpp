@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <numbers>
@@ -148,6 +149,11 @@ static double fsum(const double * values, size_t n) {
     double partials[64] {};
     size_t n_partials = 0;
     for (size_t item = 0; item < n; ++item) {
+        // NaN/Inf inputs make every `lo != 0.0` test true, so the expansion
+        // grows one entry per item and would run off the array.
+        if (n_partials + 1 >= 64) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
         double x = values[item];
         size_t i = 0;
         for (size_t j = 0; j < n_partials; ++j) {
@@ -1202,6 +1208,10 @@ static void VS_CC DftCreate(
     }
 
     const auto window = getWindow(d->radius, d->block_step, swin, sbeta, twin, tbeta);
+    if (!std::all_of(window.begin(), window.end(),
+                     [](double v) { return std::isfinite(v); })) {
+        return set_error("sbeta/tbeta produce a non-finite window; use a smaller |beta|.");
+    }
 
     // wscale = Shewchuk sum of the squared window
     std::vector<double> sq(window.size());
