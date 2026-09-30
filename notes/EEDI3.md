@@ -701,10 +701,11 @@ the reason a variant failed, not as a current number.
   ladder answered host-vs-GPU faster and more robustly; an early query-pool attempt
   hung the queue. (`GBENCH` is the one exception, and only for stage boundaries at
   ns=1.)
-- **Prove the stage split with the ablation ladder, not theory**: the
-  `VSFEEL_EEDI3_*` opt-outs (`NOBLIT`, `NOSCLIP`, `NORAW`, `NOH2D`, `NOVC`, `NOPAD`,
-  plus `NOREBAR`) at ns=8, and `HBENCH` + `HFRAME` for the host split. Additive costs
-  of similar size mean a shared memory path; one dominant item means a loop.
+- **Prove the stage split with the ablation ladder, not theory.** The
+  `VSFEEL_EEDI3_*` ablation opt-outs that made that ladder cheap (`NOBLIT`,
+  `NOSCLIP`, `NORAW`, `NOH2D`, `NOVC`, `NOPAD`, `NOREBAR`) were removed with the
+  R80 port; the lesson stands. Additive costs of similar size mean a shared
+  memory path; one dominant item means a loop.
 - **An ablation that removes a producer must reproduce what the consumer reads**
   (`PROBE=2/5` leave `dmap` stale → cheaper vcheck → overstated row kernel). Same
   class as round 19's "ablations that change the data are not ablations".
@@ -723,13 +724,19 @@ the reason a variant failed, not as a current number.
 - `VSFEEL_EEDI3_VCLDS` — `=1` forces the LDS vcheck ping-pong back (global is default).
 - `VSFEEL_EEDI3_VPARA` — vcheck form: 0 = serial row walk (A/B control), 1..6 =
   parallel with that many Jacobi steps. Default 6 (bit-exact on the test surface).
-- `VSFEEL_EEDI3_BATCH` — output frames recorded per submission (default: the
-  measured target capped by the core's VRAM limit, ~1 GiB of scratch clamped 2..8,
-  4 at 2x2160p; 1 when the budget cannot hold two frames). `=1` is the A/B control.
+- `VSFEEL_EEDI3_BATCH` — output frames recorded per submission (default: a
+  ~256 MiB scratch target, 512 for EEDI3AA, capped by the core's VRAM allowance;
+  clamped 2..8, which lands on 2 at 2x2160p for EEDI3 and 4 for EEDI3AA, 8 at
+  1080p; drops to 1 when the allowance cannot hold two frames). `=1` is the A/B
+  control.
 - `VSFEEL_EEDI3_TRACE` — one-shot banner: VRAM accounting, per-plane region layout,
   spec constants per geometry.
 - `VSFEEL_EEDI3_TIMING` — per-frame host stage split (acquire/alloc/record/submit).
 - `VSFEEL_EEDI3_SYNC` — additionally wait each submission out and report its wall time
   (serializes the pipeline; for GPU-time measurements at depth 1).
+- `VSFEEL_EEDI3_NOCLEAR` — EEDI3AA's frame path only: skip the per-submission
+  scratch clear (0 fill).
+- `VSFEEL_EEDI3_POISON` — EEDI3AA only: `<hex>[:<region>]` overlays a pattern on
+  the scratch, or one named region, before the passes. Changes output by design.
 - `EEDI3_PROBE` — CMake cache var: ablation level 0/1/2/3/4/5/6/7/8/9/10/12 (11, 13+ unused).
 - `EEDI3_MAXW` — CMake cache var: LDS vcheck max width -> `-DMAXW` + `-DEEDI3_MAXW_LDS` (default 4096).

@@ -4,6 +4,12 @@ GPU-accelerated filters in Vulkan for VapourSynth.
 
 Primarily optimized for running on RDNA 3 with the RADV driver on Linux.
 
+VapourSynth R80+ and a Vulkan 1.4 capable GPU are required.
+
+```bash
+pip install vapoursynth-feel
+```
+
 ## Performance
 
 | Filter     | vsfeel u16 | vszipcl u16 | vulkan u16 | vsfeel fp32 | vszipcl fp32 | vulkan fp32 | Speedup |

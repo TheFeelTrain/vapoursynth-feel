@@ -2247,9 +2247,10 @@ static void vsfeel_eedi3_create(
     // smaller scratch (mdis=5) still preferred 4 over 8, so the knee is not
     // memory -- it is VRAM-independent and the batch simply must not grow with
     // the frame. At 1080p, where one frame is 4x cheaper, B=8 wins (1273 vs
-    // 892 fps). That is what the byte target below encodes: ~512 MiB of
-    // scratch per submission lands on 4 at 2x2160p and 8 at 1080p, and never
-    // below two frames while the device's budget can host two.
+    // 892 fps). That is what the byte target below encodes: a 256 MiB scratch
+    // target (512 for EEDI3AA's four sub-passes) lands on 2 at 2x2160p for
+    // EEDI3 and 4 for EEDI3AA, 8 at 1080p, and never below two frames while the
+    // device's budget can host two.
     // VSFEEL_EEDI3_BATCH overrides.
     {
         // EEDI3AA's four sub-passes make a frame ~4x heavier, so it drains a

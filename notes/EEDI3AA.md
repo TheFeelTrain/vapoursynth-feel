@@ -1,6 +1,6 @@
 # EEDI3AA — notes
 
-Status: **shipped** — `core.vsfeel.EEDI3AA` (`src/eedi3.cpp:4939`), on the shared
+Status: **shipped** — `core.vsfeel.EEDI3AA` (`src/eedi3.cpp:2508`), on the shared
 `EEDI3`/`EEDI3H` argument string: the exact `based_aa` chain
 `Merge(H(Merge(V(x))))` in **one plugin call, one submit**, both 50/50 merges
 folded into the kernels. Runs on the R80 GPU API (`vnode:gpu` in/out, one exec
@@ -31,46 +31,52 @@ Measured, not assumed — do not re-derive from intuition.
   samples): u16 `(a+b+1)>>1` (0 mismatches; `(a+b)>>1` 263 wrong, half-even
   131); f32 `0.5f*a + 0.5f*b` bitwise. The fused merge is **integer u16, after**
   the vcheck's quantisation.
-- **Parity** (`src/eedi3.cpp:2502-2512`): `field = d->field & 1`, overridden by
-  the frame's `_FieldBased` (TOP→1, BOTTOM→0), then `(n&1) ^ field`. Vertical
-  sub-frames take the input's `_FieldBased`; horizontal ones take `field & 1`
-  with **no override**, because their input `v` is always
-  `_FieldBased=PROGRESSIVE` (`src/eedi3.cpp:2776`) — wrong here is a silent
-  one-parity-wide error.
+- **Parity** (`src/eedi3.cpp:1109-1119`, `:1390-1403`): `field = d->field & 1`,
+  overridden by the frame's `_FieldBased` (TOP→1, BOTTOM→0), then `(n&1) ^ field`.
+  Vertical sub-frames take the input's `_FieldBased`; horizontal ones take
+  `field & 1` with **no override**, because their input `v` is a progressive
+  scratch region, not a frame (`src/eedi3.cpp:1390-1392`) — wrong here is a
+  silent one-parity-wide error.
 - **Merge pairing:** output frame `k` pairs sub-frames `2k`/`2k+1`, both from
-  input frame `k` (`sn = n/2`).
+  input frame `k` (`src/eedi3.cpp:1358-1403`).
 - **Props:** N frames at the input's fps, `_FieldBased` progressive; the fused
-  filter must **not** halve `_DurationNum` the way each chained call does.
+  filter must **not** halve `_DurationNum` the way each chained call does
+  (`src/eedi3.cpp:2041-2053`, `:1598-1601`).
 - **Additive only:** EEDI3/EEDI3H and their tests stay untouched. Out of scope
   (falls back to the chain): `direction != BOTH`, `double_rate=False`,
   `transpose_first`, a `Deinterlacer` sclip, unsupported formats.
 
 ## Implementation
 
-- `ENTRY_ASSEMBLEV` (vertical merge, one dispatch per plane) and `ENTRY_COMPOSE`
-  with `comp_fuse` 1/2, where sub-pass 0 parks its plane in device-local `o0`
-  and sub-pass 1 reads it back and averages — `src/eedi3.comp:1491,1412`.
-- `record_pass(planes, horiz, second, tail, direct)` + `PassTail` +
-  `record_h2d_copy`: one CB records several sub-passes, so EEDI3/EEDI3H keep
-  their old shape; it opens with a full compute barrier so pbt/dst/built-pad/R'
-  are reused between sub-passes.
-- `vsfeel_eedi3_create` `aa` mode: vertical geometry in `planes`, horizontal in
-  `aplanes`; byte-identical regions (raw/sclip/dst/vout/pbt/dmap/cint) shared,
-  only the differing ones doubled (raw2/sclip2/bits2/dst2/vout2/out2/v).
-- `Eedi3AaGetFrame` (`src/eedi3.cpp:2437`): CB1 = vertical sub-pass 1 (tail
-  none) + 2 (assemble-v); host gathers `v` for both horizontal sub-passes; CB2 =
-  horizontal sub-pass 1 + 2 (compose, VRAM-fused); CPU does a plain row blit.
-- **Two extra descriptor sets** (AA needs both geometries' views at once, which
-  `d->horiz` cannot express): `desc_set_h` for horizontal row/vcheck/compose
-  (b0/b5/b9 = pad_dev) and `desc_set_xp` for xpose + the horizontal pad builder
-  (b0 = upload, b8/b9 = pad_dev) — `src/eedi3.cpp:864-873`. Aligning them was
-  the biggest bug: with the wrong set, b9 was the upload buffer while the code
-  used pad_dev-relative offsets, so under ReBAR the horizontal stage read/wrote
-  out of bounds (all-zero output); non-ReBAR masked it, which is why
-  `VSFEEL_EEDI3_NOREBAR=1` was bit-exact and the default was not.
+- `ENTRY_ASSEMBLEV` is the vertical merge (one dispatch per plane) and
+  `ENTRY_COMPOSE` carries `comp_fuse` 1/2: sub-pass 0 parks its plane in the
+  device-local `o0` region, sub-pass 1 reads it back and averages —
+  `src/eedi3.comp:1858` and `:1777`, fuse arms `:1833`/`:1839`.
+- `record_pass(d, cmd, jobs, njobs, phase)` over `PassPhase`
+  `kPrep`/`kRow`/`kVcheck`/`kTail`; one `Eedi3Job` per frame per sub-pass
+  (`src/eedi3.cpp:473-484`).
+- `Eedi3AaGetFrame` (`src/eedi3.cpp:1294`): one exec context and one CB for the
+  whole batch. Four sub-pass groups run in order — vertical v0, vertical v1
+  (`kAssembleV`), horizontal h0, horizontal h1 (`kCompose`) — each `kPrep` →
+  barrier → `kRow` → barrier → `kVcheck` → barrier → `kTail`, with a barrier
+  between groups (`src/eedi3.cpp:1552-1571`). All four share the frame's one
+  scratch buffer (`src/eedi3.cpp:1405-1413`); the vertical merge writes the
+  intermediate `v` into the scratch's `v` region and the horizontal pass reads it
+  from there, so nothing is gathered to the host and there is no CPU blit.
+- Output is `newGPUVideoFrame` when every plane is processed, else
+  `newVideoFrame2` sharing the unprocessed planes from the source
+  (`src/eedi3.cpp:1383-1385`).
+- The scratch is filled with 0 once per submission so a pass reading a region it
+  never wrote gets the benign value; `VSFEEL_EEDI3_NOCLEAR=1` opts out and
+  `VSFEEL_EEDI3_POISON` overlays a chosen pattern (`src/eedi3.cpp:1415-1431`).
+- `vsfeel_eedi3_create` `aa` mode: vertical geometry in `planes`, horizontal (the
+  transpose) in `aplanes`, sized up front for the larger of the two; every region
+  the two geometries share is placed once at `max(V, H)` and they alias it
+  (`src/eedi3.cpp:2070-2114`, `:2117-2207`).
 - `vsfeel/vsaa.py`: `EEDI3(vsaa.deinterlacers.EEDI3)` overrides `antialias` to
-  emit one `EEDI3AA` call, else `super()`; `vsfeel.EEDI3` is a PEP-562 lazy
-  re-export, so `import vsfeel` never needs vsaa.
+  emit one `EEDI3AA` call when a `_fusable_geometry`/`_fusable_format` check
+  passes, else `super()`; `vsfeel.EEDI3` is a PEP-562 lazy re-export, so
+  `import vsfeel` never needs vsaa.
 - `tools/benchmark.py`: reference arms are the `vsaa` EEDI3 antialiaser itself
   (`should_h`/`supports_mclip`/the `Interleave([s,s])` sclip/`field = tff + 2`
   all come from vsaa, so they cannot drift); the fused arm calls
@@ -78,8 +84,8 @@ Measured, not assumed — do not re-derive from intuition.
 
 ## Historical
 
-**Cost model** (2x-2160p, mdis=20, vcheck=2, ns=1, steady state, four sub-passes
-/ two submissions) from the `VSFEEL_EEDI3_GBENCH` profiler:
+**Cost model** (pre-R80; 2x-2160p, mdis=20, vcheck=2, ns=1, steady state, four
+sub-passes / two submissions) from the `VSFEEL_EEDI3_GBENCH` profiler:
 
 | stage | x4 / frame | share |
 |---|---|---|
@@ -115,14 +121,13 @@ under-reported every stage 10x).
   kernel deleted, but that arm leaves `dmap` stale so vcheck takes its cheap
   `dirc == 0` branch; the faithful ablation (`PROBE=12`, real dmap) is ~1.25x.
 - **The LDS vcheck IS engaged at the benchmark width**: gate is
-  `use_lds = lds_ok && key.width <= MAXW_LDS`, `MAXW_LDS = 4096`
-  (`src/eedi3.cpp:758,4322`) — a **column count**, not bytes; 3840 ≤ 4096.
-  `ENTRY_VCHECK` nonetheless defaults to the global-read (empty-row-skipping)
-  form (`VSFEEL_EEDI3_VCLDS=1` restores the LDS ping-pong), and the two
-  horizontal planes are 50/50-merged inside `ENTRY_COMPOSE` in VRAM
-  (`VSFEEL_EEDI3_AATIGHT=0` restores the two-plane + CPU form; vcheck 0 falls
-  back). Together, round 6: fused 89.7 → 108.8 fps (1200 f × 4 order-reversed
-  reps), bit-exact vs the old path (30 real 4K frames, 497 MB/arm
+  `p.vcheck_lds = !p.vcheck_para && want_lds && d->have_lds && key.width <= MAXW_LDS`,
+  `MAXW_LDS = 4096` (`src/eedi3.cpp:70`, `:2335-2336`) — a **column count**, not
+  bytes; 3840 ≤ 4096. `ENTRY_VCHECK` nonetheless defaults to the global-read
+  (empty-row-skipping) form (`VSFEEL_EEDI3_VCLDS=1` restores the LDS ping-pong),
+  and the two horizontal planes are 50/50-merged inside `ENTRY_COMPOSE` in VRAM
+  (vcheck 0 falls back). Together, round 6: fused 89.7 → 108.8 fps (1200 f × 4
+  order-reversed reps), bit-exact vs the old path (30 real 4K frames, 497 MB/arm
   byte-identical); `benchmark.py --filter eedi3aa` then measured ~121 fps at ns=8
   (vszipcl 48.6, eedi3vk2 36.2).
 - **Dead end — GPU K compaction (`ENTRY_ASSEMBLEK`).** One kernel merging
@@ -165,7 +170,8 @@ under-reported every stage 10x).
 - **Rounds 4/5 — cost model, then corrections.** The profiler gave the table
   above and superseded round 2; it was never committed, and "the LDS vcheck is
   off at 3840" was wrong (see the `MAXW_LDS` bullet).
-- **Round 7 — correctness.** `Eedi3AaGetFrame` never *invalidated* the two
+- **Round 7 — correctness (pre-R80; the host staging path is gone).**
+  `Eedi3AaGetFrame` never *invalidated* the two
   GPU-written staging regions it reads (merged `v`, the composed planes), only
   flushed them, so a non-coherent device would gather a stale `v`; mirrored
   EEDI3's invalidate per fence wait. No perf change; no-op here (133/133 with a
@@ -175,15 +181,14 @@ under-reported every stage 10x).
   gets 0, the benign value for every flag in it, instead of recycled pool
   contents. Measured inert on healthy frames (no pixel changes); `..._NOCLEAR=1`
   restores the old behaviour. No perf change.
-- **Round 8 — hardening.** The shared `mapped_range`/`flush_range`/
-  `invalidate_range` helpers replaced all hand-built 32-byte-aligned
-  `VkMappedMemoryRange`s (`src/vsfeel.h:196`), and the shared
-  `deint_row_u16/f32` streaming-store predicate now tests the pointer, not the
-  element index — `aa_gather_horizontal` inherited both.
+- **Round 8 — hardening (superseded by the R80 port).** The hand-built
+  32-byte-aligned `VkMappedMemoryRange`s and the `deint_row_u16/f32`
+  streaming-store predicate were removed with the upload/download path; no live
+  code to preserve.
 - **Superseded design brief**: its buffer-reuse map, implementation order, reuse
-  map, testing plan, benchmarking plan and risk list are all realised in code,
-  and its `VSFEEL_EEDI3AA_QUEUES` knob never existed (the cap is
-  `VSFEEL_EEDI3_QUEUES`).
+  map, testing plan, benchmarking plan and risk list are all realised in code.
+  Its `VSFEEL_EEDI3AA_QUEUES` knob never existed, and neither does the
+  `VSFEEL_EEDI3_QUEUES` cap it named — the core owns the one compute queue.
 - **2026-09-29 — odd AA plane geometry rejected.** `a.rows = in_w / 2` left the
   last column of an odd processed plane width unwritten (the compose kernel
   stores only columns `2k`/`2k+1`), i.e. recycled VRAM every frame; the
@@ -195,12 +200,14 @@ under-reported every stage 10x).
   sub-pass; each plane now reads its own `cfg.o0_bytes`. Measured 1229 codes off
   the chain at 16-bit, `planes=[1]`, mdis=5, nrad=1, frame 0 of the noise clip,
   before the fix. No perf change.
-- **2026-09-29 — the wrappers drop parameters the plugin never declared.**
-  vs-jetpack's EEDI3 dataclass forwards `hp`, which
-  `core.vsfeel.EEDI3`/`EEDI3H`/`EEDI3AA` do not register, so VapourSynth rejected
-  the call before dispatch and every wrapper path failed to build.
-  `FeelBackend._dispatch` and the fused path now filter kwargs against the
-  plugin's own `__signature__` (`vsfeel/backend.py`). No perf change.
+- **2026-09-29 — the wrappers drop parameters the plugin does not declare.**
+  vs-jetpack's EEDI3 dataclass forwards its own keys (`hp` at the time, which no
+  vsfeel entry registered), and VapourSynth rejects unknown keywords before
+  dispatch, so every wrapper path failed to build. `FeelBackend._dispatch` and
+  the fused path now filter kwargs against the plugin's own `__signature__`
+  (`vsfeel/backend.py`); the argument string later grew
+  `hp`/`ucubic`/`cost3`/`opt` as accepted no-ops, so the filter is now defensive.
+  No perf change.
 
 ## Open work
 
@@ -217,31 +224,30 @@ under-reported every stage 10x).
   at 4K, written and re-read by the backtrack — any experiment needs its own
   probe, not `PROBE=4`.
 - **No GPU stage profiler in the tree**; restoring it is the prerequisite for
-  attributing anything. `_NOVC`/`_NOXPOSE`/`_NOCOMPOSE`/`_NOMASKX` and
-  `_PTRTRACE` are diagnostics slated for deletion before landing.
+  attributing anything. The ablation/diagnostic knobs named in the rounds above
+  have been removed; the live set is below.
 
 ## Debug env vars
 
-All are `VSFEEL_EEDI3_*`; there is no `..._EEDI3AA_*` namespacing, and the queue
-cap is `VSFEEL_EEDI3_QUEUES`, not `..._EEDI3AA_QUEUES`.
+All are `VSFEEL_EEDI3_*`; there is no `..._EEDI3AA_*` namespacing. EEDI3AA reads
+the shared core's knobs plus its own `..._NOCLEAR`/`..._POISON`.
 
-- `..._AA_HBENCH` + `..._AA_HFRAME=<n>` — host-stage split (vGather / vRec /
-  vWait / hGather / hRec / hWait / merge / total), shape of EEDI3's `_HBENCH`.
-- `..._GBENCH` — GPU stage timestamps (one query pool per submission; a shared
-  pool never becomes available), read host-side after the fence; not in the tree.
-- `..._QUEUES=N` queue cap; `..._NOREBAR=1` force the H2D path; `..._VOUTDEV` /
-  `..._COPY` the vout DMA form and non-temporal load/store bits (bit0 upload
-  gathers, bit1 final blit); `..._AATIGHT=0` two-plane + CPU merged compose;
-  `..._VCLDS=1` LDS ping-pong vcheck; `..._MASKFUSE=0`/`..._PAIR=0` the shared
-  EEDI3H mask-fuse and aliased-pair-gather ablations, applied to the AA gathers.
-- `..._POISON=<hex>[:<region>]` — fill the scratch (or one region: `pad`, `dst`,
-  `dmap`, `rempty`, `vout`, …) before the passes, so two runs with two patterns
-  differ exactly on the pixels that depend on unwritten scratch; `..._NOCLEAR=1`
-  drops the per-submission clear. Both change output by design.
-- Shared ablation knobs the AA path honours: `_NORAW`, `_NOSCLIP`, `_NOVC`,
-  `_NOXPOSE`, `_NOCOMPOSE`, `_NOMASKX`, `_NOPAD`, `_NOH2D`, `_NOXFER`, `_PADPAR`,
-  `_RAWSTAGE`, `_BLITCONTIG`, `_DSTHOST` (`_NOBLIT` is rejected); `_PTRTRACE` and
-  `_TRACE` are diagnostics.
+- `..._BATCH=<n>` — output frames per submission (default from the scratch
+  target, see `notes/EEDI3.md`); `=1` is the A/B control.
+- `..._VPARA=<n>` — vcheck form: 0 = serial row walk (A/B control), 1..6 =
+  parallel with that many Jacobi steps (default 6).
+- `..._VCLDS=1` — force the LDS vcheck ping-pong back (global reads are default).
+- `..._NOCLEAR=1` — skip the per-submission scratch clear.
+- `..._POISON=<hex>[:<region>]` — fill the scratch, or one region (`pad`, `dst`,
+  `dmap`, `rempty`, `vout`, `o0`, `v`, …), with a pattern, so two runs differ
+  exactly on the pixels that depend on unwritten scratch. Changes output by
+  design.
+- `..._TIMING=1` — per-frame host stage split (acquire/alloc/record/submit).
+- `..._SYNC=1` — additionally wait each submission out and report its wall time.
+- `..._TRACE=1` — one-shot creation banner: VRAM accounting, per-plane region
+  layout.
+- `EEDI3_PROBE` / `EEDI3_MAXW` — CMake cache vars: shader ablation level and the
+  LDS vcheck max width (`-DMAXW`, `-DEEDI3_MAXW_LDS`); see `notes/EEDI3.md`.
 
 ## Tests
 
@@ -256,4 +262,4 @@ chroma width rejected; determinism, multi-stream and parallel load; props
 `tests/test_python_backend.py` adds the wrapper cases (fused == chain, the
 `direction != BOTH` fallback, backend selection, odd-geometry fallback,
 forwarded parameters the plugin does not declare). Whole
-suite **764 passed** via `tools/test.sh`.
+suite **803 passed** via `tools/test.sh`.

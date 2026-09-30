@@ -559,5 +559,3 @@ else()
     install(TARGETS vsfeel LIBRARY RUNTIME)
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vk/manifest.vs" DESTINATION .)
 endif()
-
-# wo39 rebuild probe comment
