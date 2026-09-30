@@ -45,7 +45,10 @@ jobs:
   # manylinux image so the glibc symbol floor is the policy's, not the runner's.
   # The arm64 leg runs on GitHub's native arm64 runner, which is what lets the
   # image build without emulation.
-  manylinux-wheel:
+  linux-wheel:
+    # Only the architecture in the check name: the default expands every matrix
+    # key, which spells out the runner image and the wheel platform tag too.
+    name: linux-wheel (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
@@ -94,7 +97,7 @@ jobs:
         bash .github/scripts/pypi_dist.sh fetch "vapoursynth_feel-${GITHUB_REF_NAME#v}-py3-none-${{ matrix.plat }}.whl" wheelhouse
     - uses: actions/upload-artifact@v7
       with:
-        name: manylinux-wheel-${{ matrix.arch }}
+        name: linux-wheel-${{ matrix.arch }}
         path: wheelhouse
         if-no-files-found: ignore
 
@@ -102,6 +105,7 @@ jobs:
   # target is pinned so the tag in the filename, the binaries' LC_BUILD_VERSION
   # and the vapoursynth wheels the plugin runs under (macosx_13_0) agree.
   macos-wheel:
+    name: macos-wheel (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
@@ -240,7 +244,7 @@ jobs:
     environment:
       name: pypi
       url: https://pypi.org/project/vapoursynth-feel/
-    needs: [sdist, manylinux-wheel, macos-wheel, windows-wheel]
+    needs: [sdist, linux-wheel, macos-wheel, windows-wheel]
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     steps:
@@ -285,7 +289,7 @@ jobs:
     # Separate from the PyPI upload on purpose: the two channels are
     # independent, so whichever one fails, the other still completes.
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
-    needs: [sdist, manylinux-wheel, macos-wheel, windows-wheel]
+    needs: [sdist, linux-wheel, macos-wheel, windows-wheel]
     runs-on: ubuntu-latest
     permissions:
       contents: write   # attach assets to the release
