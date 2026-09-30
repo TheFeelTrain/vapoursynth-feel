@@ -15,7 +15,8 @@ env:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    # 26.04, not latest: noble's glslc is 2023.8 and rejects --target-env=vulkan1.4.
+    runs-on: ubuntu-26.04
     steps:
     - uses: actions/checkout@v7
 

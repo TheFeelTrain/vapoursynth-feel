@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <numbers>
 #include <optional>
 #include <string>
 #include <utility>
@@ -155,7 +156,7 @@ static std::vector<float> get_gauss_kernel(float sigma) {
 
     const int half_taps = taps / 2;
     const float factor =
-        1.0f / (static_cast<float>(std::sqrt(2.0 * M_PI)) * sigma);
+        1.0f / (static_cast<float>(std::sqrt(2.0 * std::numbers::pi)) * sigma);
 
     std::vector<double> kernel;
     kernel.reserve(half_taps);
