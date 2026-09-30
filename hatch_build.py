@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import platform
 import shutil
 import subprocess
@@ -8,32 +9,59 @@ from pathlib import Path
 from typing import Any
 
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
-from packaging import tags
 
-# The plugin is x86-64 on Linux and Windows. Every TU gets AVX2, the host code
-# needs a POSIX or Win32 process/cache API, and the NNEDI3 weights are embedded
-# with objcopy or an RC resource.
+# Linux, macOS and Windows on x86-64 and arm64. The host code needs a POSIX or
+# Win32 process/cache API, x86-64 additionally gets AVX2, and the NNEDI3
+# weights are embedded with an RC resource on Windows and the assembler's
+# .incbin everywhere else.
 _SUPPORTED_PLATFORMS = {
-    ("linux", "x86_64"), ("linux", "amd64"),
+    ("linux", "x86_64"), ("linux", "amd64"), ("linux", "aarch64"),
+    ("darwin", "x86_64"), ("darwin", "arm64"),
     ("win32", "x86_64"), ("win32", "amd64"),
 }
+
+# Per-platform plugin library filename and the extension CMake installs.
+_LIBRARY_NAMES = {
+    "win32": ("vsfeel.dll", ".dll"),
+    "darwin": ("libvsfeel.dylib", ".dylib"),
+}
+_LIBRARY_NAMES_DEFAULT = ("libvsfeel.so", ".so")
 
 
 def plugin_library_name(platform_name: str | None = None) -> str:
     """Plugin library filename CMake produces for ``platform_name``."""
     platform_name = sys.platform if platform_name is None else platform_name
-    return "vsfeel.dll" if platform_name == "win32" else "libvsfeel.so"
+    return _LIBRARY_NAMES.get(platform_name, _LIBRARY_NAMES_DEFAULT)[0]
+
+
+def platform_tag() -> str:
+    """Wheel platform tag for the library this build produces.
+
+    macOS is derived from MACOSX_DEPLOYMENT_TARGET, which is what the compiler is
+    given too, rather than from sysconfig or packaging: both report the
+    *interpreter's* own build target, which can be newer than what this build
+    targets, and a wheel claiming a newer floor than its binary needs only fails
+    on the user's machine. Without the variable the running macOS version is used.
+    """
+    if sys.platform == "darwin":
+        target = os.environ.get("MACOSX_DEPLOYMENT_TARGET") or platform.mac_ver()[0]
+        # Only the first two components: the tag spells 26.0.1 as macosx_26_0.
+        major, minor = (target.split(".") + ["0"])[:2]
+        return f"macosx_{major}_{minor or 0}_{platform.machine()}"
+    # linux_x86_64 / linux_aarch64 / win_amd64; CI retags the Linux one to
+    # manylinux with auditwheel.
+    return sysconfig.get_platform().replace("-", "_").replace(".", "_")
 
 
 def find_staged_library(staged: Path, platform_name: str | None = None) -> Path:
     """The plugin library CMake installed into ``staged`` for this platform.
 
-    Derived from the platform rather than picked as the first ``.so``/``.dll``
-    under ``install/``: a stale or foreign-platform file must fail the build
-    instead of being silently staged into the wheel.
+    Derived from the platform rather than picked as the first ``.so``, ``.dylib``
+    or ``.dll`` under ``install/``: a stale or foreign-platform file must fail the
+    build instead of being silently staged into the wheel.
     """
     platform_name = sys.platform if platform_name is None else platform_name
-    suffix = ".dll" if platform_name == "win32" else ".so"
+    suffix = _LIBRARY_NAMES.get(platform_name, _LIBRARY_NAMES_DEFAULT)[1]
     want = staged / plugin_library_name(platform_name)
     libs = sorted(p for p in staged.glob(f"*{suffix}") if p.is_file())
     if libs != [want]:
@@ -84,8 +112,8 @@ class CustomHook(BuildHookInterface):
     def initialize(self, version: str, build_data: dict[str, Any]) -> None:
         if (sys.platform, platform.machine().lower()) not in _SUPPORTED_PLATFORMS:
             raise RuntimeError(
-                "vapoursynth-feel builds only on Linux and Windows x86-64 "
-                f"(got {sys.platform}/{platform.machine()})."
+                "vapoursynth-feel builds only on Linux, macOS and Windows "
+                f"x86-64/arm64 (got {sys.platform}/{platform.machine()})."
             )
 
         # Root-relative: the wheel's include list is root-relative, so staging
@@ -100,9 +128,8 @@ class CustomHook(BuildHookInterface):
 
         build_data["pure_python"] = False
         # A `py3-none-<platform>` wheel: the payload is a VapourSynth plugin, not
-        # a CPython extension, so no python/abi tag is involved. The Linux tag is
-        # rewritten to manylinux by auditwheel in CI.
-        build_data["tag"] = f"py3-none-{next(tags.platform_tags())}"
+        # a CPython extension, so no python/abi tag is involved.
+        build_data["tag"] = f"py3-none-{platform_tag()}"
 
         cmake = find_tool("cmake")
         cmake_args = [
@@ -121,6 +148,14 @@ class CustomHook(BuildHookInterface):
             # find one on PATH (it generates the SPIR-V header at build time).
             "-D", f"Python3_EXECUTABLE={sys.executable}",
         ]
+        # Passed explicitly rather than left to CMake's env-var pickup: the
+        # cached value in a reused build tree would otherwise win, and the tag
+        # above and the binaries' LC_BUILD_VERSION have to agree.
+        if sys.platform == "darwin" and os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
+            cmake_args += [
+                "-D",
+                f"CMAKE_OSX_DEPLOYMENT_TARGET={os.environ['MACOSX_DEPLOYMENT_TARGET']}",
+            ]
         include_dir = vapoursynth_include_dir()
         if include_dir is not None:
             cmake_args += ["-D", f"VS_INCLUDE_DIR={include_dir}"]

@@ -46,9 +46,16 @@ if [[ -z $plugin_dir ]]; then
 fi
 [[ -n $plugin_dir ]] || die "autodetected an empty plugin directory"
 
-build_lib=$build_dir/libvsfeel.so
+# CMake spells the library per platform (libvsfeel.so / libvsfeel.dylib); the
+# manifest names it without an extension, so only the file names differ here.
+case "$(uname -s)" in
+    Darwin) lib_name=libvsfeel.dylib ;;
+    *)      lib_name=libvsfeel.so ;;
+esac
+
+build_lib=$build_dir/$lib_name
 install_subdir=$plugin_dir/vsfeel
-install_lib=$install_subdir/libvsfeel.so
+install_lib=$install_subdir/$lib_name
 
 hash_file() {
     [[ -f $1 ]] || die "expected a file at $1"

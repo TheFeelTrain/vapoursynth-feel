@@ -16,8 +16,6 @@
 
 #include <strings.h>
 
-#include <immintrin.h>
-
 #include <VapourSynth4.h>
 #include <VSHelper4.h>
 
@@ -432,7 +430,7 @@ static const VSFrame * nlmeans_gpu_frame(NLMeansData * d, int n,
     // The table may have landed in the host-visible VRAM BAR, whose mapping is
     // write-combined: without this the GPU can read a stale pointer, or a
     // half-written one, before the CPU store buffer drains.
-    _mm_sfence();
+    store_fence();
 
     VkBuffer dst_buf[3] {};
     for (int c = 0; c < C; ++c) {
@@ -1106,7 +1104,7 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         // Same write-combining caveat as the per-frame address table: these
         // tables may live in the host-visible VRAM BAR, and the first
         // submission must not read a tail that has not drained yet.
-        _mm_sfence();
+        store_fence();
     }
 
     {

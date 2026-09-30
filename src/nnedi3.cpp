@@ -16,9 +16,6 @@
 #include <variant>
 #include <vector>
 
-// _mm_sfence for ordering the weight stores before the first dispatch.
-#include <immintrin.h>
-
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -72,12 +69,13 @@ constexpr uint32_t kPredictLdsN4 = 4 * 288 * 16;   // 18 KiB
 constexpr uint32_t kPredictLdsN4m = 4 * 192 * 16;  // 12 KiB
 constexpr uint32_t kPredictLdsN4s = 4 * 64 * 16;   // 4 KiB
 
-// Weight blob linked into the binary (see CMakeLists.txt): objcopy on every
-// toolchain that has it, an RCDATA resource on Windows, where none does.
+// Weight blob linked into the binary (see CMakeLists.txt): the assembler's
+// .incbin everywhere except Windows, which embeds the same bytes as an RCDATA
+// resource because no toolchain there ships objcopy.
 #if !defined(_WIN32)
 extern "C" {
-extern const uint8_t _binary_nnedi3_weights_bin_start[];
-extern const uint8_t _binary_nnedi3_weights_bin_end[];
+extern const uint8_t nnedi3_weights_bin_start[];
+extern const uint8_t nnedi3_weights_bin_end[];
 }
 #endif
 
@@ -110,7 +108,7 @@ static std::span<const uint8_t> weights_blob() {
     }();
     return blob;
 #else
-    return { _binary_nnedi3_weights_bin_start, _binary_nnedi3_weights_bin_end };
+    return { nnedi3_weights_bin_start, nnedi3_weights_bin_end };
 #endif
 }
 
@@ -1186,7 +1184,7 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         std::memcpy(buf.mapped, values.data(), values.size() * sizeof(float));
         // The mapping may be the host-visible VRAM BAR (write-combining): the
         // first dispatch must not read a tail the CPU store buffer missed.
-        _mm_sfence();
+        store_fence();
         return {};
     };
     if (std::string e = make_weights(d->ps, ps_blob, "prescreener weights");

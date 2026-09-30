@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.29.0", "hatch-vcs", "packaging", "cmake>=3.21", "vapoursynth>=80"]
+requires = ["hatchling>=1.29.0", "hatch-vcs", "cmake>=3.21", "vapoursynth>=80"]
 build-backend = "hatchling.build"
 
 [project]
@@ -47,12 +47,13 @@ include = [
     "/LICENSE",
 ]
 
-# The plugin is x86-64 Linux and Windows (see the platform guard in
-# hatch_build.py), so a wheel carries exactly one platform's library.
+# The plugin is Linux, macOS and Windows (x86-64 and arm64; see the platform
+# guard in hatch_build.py), so a wheel carries exactly one platform's library.
 [tool.hatch.build.targets.wheel]
 include = ["/vapoursynth/plugins/vsfeel", "/vsfeel"]
 artifacts = [
     "/vapoursynth/plugins/vsfeel/*.so",
+    "/vapoursynth/plugins/vsfeel/*.dylib",
     "/vapoursynth/plugins/vsfeel/*.dll",
     "/vapoursynth/plugins/vsfeel/manifest.vs",
 ]

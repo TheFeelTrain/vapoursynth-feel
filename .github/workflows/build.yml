@@ -43,9 +43,24 @@ jobs:
   # Nothing links libvulkan (the R80 GPU API hands the plugin the core's
   # dispatch table), so auditwheel can retag the wheel to manylinux. Built in the
   # manylinux image so the glibc symbol floor is the policy's, not the runner's.
-  linux-wheel:
-    runs-on: ubuntu-latest
-    container: quay.io/pypa/manylinux_2_34_x86_64
+  # The arm64 leg runs on GitHub's native arm64 runner, which is what lets the
+  # image build without emulation.
+  manylinux-wheel:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - arch: x86_64
+          runner: ubuntu-latest
+          image: quay.io/pypa/manylinux_2_34_x86_64
+          plat: manylinux_2_34_x86_64
+        - arch: aarch64
+          runner: ubuntu-24.04-arm
+          image: quay.io/pypa/manylinux_2_34_aarch64
+          plat: manylinux_2_34_aarch64
+
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
     env:
       FORCE_BUILD: ${{ github.event.inputs.force_build }}
     steps:
@@ -56,7 +71,7 @@ jobs:
       id: published
       shell: bash
       run: |
-        if bash .github/scripts/pypi_dist.sh published "vapoursynth_feel-${GITHUB_REF_NAME#v}-py3-none-manylinux_2_34_x86_64.whl"; then
+        if bash .github/scripts/pypi_dist.sh published "vapoursynth_feel-${GITHUB_REF_NAME#v}-py3-none-${{ matrix.plat }}.whl"; then
           echo "skip=true" >> "$GITHUB_OUTPUT"
         else
           echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -70,17 +85,86 @@ jobs:
         PY=/opt/python/cp312-cp312/bin/python
         "$PY" -m pip install --upgrade build auditwheel
         "$PY" -m build --wheel --outdir dist
-        "$PY" -m auditwheel repair --plat manylinux_2_34_x86_64 -w wheelhouse dist/*.whl
+        "$PY" -m auditwheel repair --plat ${{ matrix.plat }} -w wheelhouse dist/*.whl
     - name: Reuse the published wheel
       if: steps.published.outputs.skip == 'true'
       shell: bash
       run: |
         mkdir -p wheelhouse
-        bash .github/scripts/pypi_dist.sh fetch "vapoursynth_feel-${GITHUB_REF_NAME#v}-py3-none-manylinux_2_34_x86_64.whl" wheelhouse
+        bash .github/scripts/pypi_dist.sh fetch "vapoursynth_feel-${GITHUB_REF_NAME#v}-py3-none-${{ matrix.plat }}.whl" wheelhouse
     - uses: actions/upload-artifact@v7
       with:
-        name: linux-wheel
+        name: manylinux-wheel-${{ matrix.arch }}
         path: wheelhouse
+        if-no-files-found: ignore
+
+  # macOS has no container: the wheel builds on the host, and the deployment
+  # target is pinned so the tag in the filename, the binaries' LC_BUILD_VERSION
+  # and the vapoursynth wheels the plugin runs under (macosx_13_0) agree.
+  macos-wheel:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - arch: arm64
+          runner: macos-26
+        - arch: x86_64
+          runner: macos-26-intel
+
+    runs-on: ${{ matrix.runner }}
+    env:
+      FORCE_BUILD: ${{ github.event.inputs.force_build }}
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - name: Is the wheel already published?
+      id: published
+      run: |
+        if bash .github/scripts/pypi_dist.sh published "vapoursynth_feel-${GITHUB_REF_NAME#v}-py3-none-macosx_13_0_${{ matrix.arch }}.whl"; then
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+        fi
+    - uses: actions/setup-python@v7
+      if: steps.published.outputs.skip != 'true'
+      with:
+        python-version: "3.13"
+    # glslc is the only GLSL/SPIR-V compiler that is a drop-in for the shader
+    # rules, and CMake refuses to configure without it. Homebrew bottles shaderc
+    # for Apple silicon only, so the Intel leg builds it from source; that is the
+    # same recipe the reference plugins' macOS jobs use.
+    - name: Install glslc
+      if: steps.published.outputs.skip != 'true'
+      run: brew install shaderc
+    - name: Build
+      if: steps.published.outputs.skip != 'true'
+      run: |
+        python -m pip install --upgrade build
+        python -m build --wheel --outdir dist
+    # The platform tag comes from MACOSX_DEPLOYMENT_TARGET, not from the build
+    # machine's macOS; check both the name and what the binary itself asks for,
+    # so a wheel tagged for 13.0 whose LC_BUILD_VERSION says otherwise (which
+    # would only fail on a user's older Mac) cannot reach the release.
+    - name: Check the wheel's platform
+      if: steps.published.outputs.skip != 'true'
+      run: |
+        wheel=$(ls dist/*.whl)
+        [[ $wheel == *-py3-none-macosx_13_0_${{ matrix.arch }}.whl ]] ||
+          { echo "::error::unexpected wheel platform tag: $wheel"; exit 1; }
+        unzip -q "$wheel" -d unpacked
+        lib=$(find unpacked -name '*.dylib')
+        vtool -show-build "$lib"
+        vtool -show-build "$lib" | grep -Eq 'minos[[:space:]]+13\.0' ||
+          { echo "::error::$lib does not target macOS 13.0"; exit 1; }
+    - name: Reuse the published wheel
+      if: steps.published.outputs.skip == 'true'
+      run: bash .github/scripts/pypi_dist.sh fetch "vapoursynth_feel-${GITHUB_REF_NAME#v}-py3-none-macosx_13_0_${{ matrix.arch }}.whl" dist
+    - uses: actions/upload-artifact@v7
+      with:
+        name: macos-wheel-${{ matrix.arch }}
+        path: dist
         if-no-files-found: ignore
 
   windows-wheel:
@@ -156,7 +240,7 @@ jobs:
     environment:
       name: pypi
       url: https://pypi.org/project/vapoursynth-feel/
-    needs: [sdist, linux-wheel, windows-wheel]
+    needs: [sdist, manylinux-wheel, macos-wheel, windows-wheel]
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     steps:
@@ -201,7 +285,7 @@ jobs:
     # Separate from the PyPI upload on purpose: the two channels are
     # independent, so whichever one fails, the other still completes.
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
-    needs: [sdist, linux-wheel, windows-wheel]
+    needs: [sdist, manylinux-wheel, macos-wheel, windows-wheel]
     runs-on: ubuntu-latest
     permissions:
       contents: write   # attach assets to the release

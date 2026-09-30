@@ -38,6 +38,14 @@ using namespace std::string_literals;
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 #endif
 
+// Order CPU stores before a submission that lets the GPU read them: the
+// host-visible VRAM BAR is write-combining, so a dispatch can otherwise observe
+// a half-written table. A full fence because it is once per table, and because
+// the portable spelling is what lets this build on arm64 as well as x86-64.
+inline void store_fence() {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
 #define checkVK(expr)                                                          \
     do {                                                                       \
         if (VkResult __result = (expr); __result != VK_SUCCESS) [[unlikely]] { \

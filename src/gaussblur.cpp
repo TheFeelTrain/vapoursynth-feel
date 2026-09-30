@@ -16,8 +16,6 @@
 #include <variant>
 #include <vector>
 
-#include <immintrin.h>
-
 #include <VapourSynth4.h>
 #include <VSHelper4.h>
 
@@ -670,7 +668,7 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
         // The buffer may have landed in the host-visible VRAM BAR, whose
         // mapping is write-combining: the first submission must not read a
         // tail the CPU store buffer has not drained yet.
-        _mm_sfence();
+        store_fence();
     }
 
     // Shader blobs, selected by bit depth (the entry point by code path).

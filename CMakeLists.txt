@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.21)
 project(vapoursynth-feel LANGUAGES C CXX)
 
 # The NNEDI3 weight blob is linked in as an RCDATA resource on Windows, where
-# the default toolchains ship no objcopy.
+# no toolchain ships objcopy, and with the assembler's .incbin elsewhere.
 if(WIN32)
     enable_language(RC)
 endif()
@@ -410,10 +410,12 @@ set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h" PROPE
 
 # NNEDI3 weights: link the raw blob straight into the binary so the 13.5 MB
 # never passes through the compiler, and the wheel stays self-contained
-# (reference/ is not shipped). objcopy turns it into an object exposing
-# _binary_nnedi3_weights_bin_{start,end}; MSVC has no objcopy, so Windows
-# embeds the same bytes as an RCDATA resource that nnedi3.cpp reads with
-# FindResource (see weights_blob()).
+# (reference/ is not shipped). Windows embeds it as an RCDATA resource that
+# nnedi3.cpp reads with FindResource (see weights_blob()); everywhere else a
+# generated assembly stub pulls the same file into read-only data with the
+# assembler's .incbin. That needs no objcopy, which is what makes it work on
+# macOS, and it is the assembler of the target toolchain, so the object's
+# architecture follows the build without an objcopy target name to keep in step.
 if(WIN32)
     configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3_weights.bin"
                    "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.bin" COPYONLY)
@@ -422,23 +424,36 @@ if(WIN32)
          "NNEDI3_WEIGHTS RCDATA \"nnedi3_weights.bin\"\n")
     set(VSFEEL_WEIGHTS_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.rc")
 else()
-    find_program(VK_OBJCOPY objcopy REQUIRED)
-    add_custom_command(
-        OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.o"
-        COMMAND ${CMAKE_COMMAND} -E copy
-                "${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3_weights.bin"
-                "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.bin"
-        # run under the output dir so the embedded symbols derive from the bare
-        # filename (_binary_nnedi3_weights_bin_{start,end}), not the build path
-        COMMAND ${VK_OBJCOPY} --input binary --output elf64-x86-64
-                --binary-architecture i386:x86-64
-                nnedi3_weights.bin nnedi3_weights.o
-        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3_weights.bin"
-        VERBATIM)
-    set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.o"
-        PROPERTIES GENERATED TRUE)
-    set(VSFEEL_WEIGHTS_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.o")
+    enable_language(ASM)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3_weights.bin"
+                   "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.bin" COPYONLY)
+    # The labels spell the C symbols nnedi3.cpp declares: Mach-O prefixes a
+    # leading underscore, ELF does not. .private_extern / .hidden keep the
+    # 13.5 MB out of the shared library's dynamic symbol table.
+    if(APPLE)
+        set(VSFEEL_WEIGHTS_SECTION ".section __DATA,__const\n")
+        set(VSFEEL_WEIGHTS_LABEL "_nnedi3_weights_bin_")
+        set(VSFEEL_WEIGHTS_VISIBILITY ".private_extern")
+    else()
+        set(VSFEEL_WEIGHTS_SECTION ".section .rodata\n")
+        set(VSFEEL_WEIGHTS_LABEL "nnedi3_weights_bin_")
+        set(VSFEEL_WEIGHTS_VISIBILITY ".hidden")
+    endif()
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.S"
+        "${VSFEEL_WEIGHTS_SECTION}"
+        ".globl ${VSFEEL_WEIGHTS_LABEL}start\n"
+        "${VSFEEL_WEIGHTS_VISIBILITY} ${VSFEEL_WEIGHTS_LABEL}start\n"
+        "${VSFEEL_WEIGHTS_LABEL}start:\n"
+        ".incbin \"${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.bin\"\n"
+        ".globl ${VSFEEL_WEIGHTS_LABEL}end\n"
+        "${VSFEEL_WEIGHTS_VISIBILITY} ${VSFEEL_WEIGHTS_LABEL}end\n"
+        "${VSFEEL_WEIGHTS_LABEL}end:\n")
+    # The stub only references the blob; the assembler reads it, so the build
+    # system has to be told the dependency explicitly.
+    set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.S"
+        PROPERTIES GENERATED TRUE
+                   OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/nnedi3_weights.bin")
+    set(VSFEEL_WEIGHTS_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/nnedi3_weights.S")
 endif()
 
 # Plugin
@@ -460,11 +475,26 @@ if(WIN32)
     # never find it.
     set_target_properties(vsfeel PROPERTIES PREFIX "")
 endif()
+# AVX2 is x86-only, and nothing here uses its intrinsics, so an ARM target
+# builds the portable code instead. On by default because every other processor
+# this builds for is x86-64: an unrecognized CMAKE_SYSTEM_PROCESSOR (MinGW and
+# some generators) must not silently drop the flag from a shipped x86 wheel.
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" VSFEEL_PROCESSOR)
+set(VSFEEL_AVX2 ON)
+if(VSFEEL_PROCESSOR MATCHES "^(arm|aarch64)")
+    set(VSFEEL_AVX2 OFF)
+endif()
+
 if(MSVC)
     # The sources are UTF-8 with non-ASCII punctuation in comments and messages.
-    target_compile_options(vsfeel PRIVATE /arch:AVX2 /utf-8 /EHsc)
+    target_compile_options(vsfeel PRIVATE /utf-8 /EHsc)
+    if(VSFEEL_AVX2)
+        target_compile_options(vsfeel PRIVATE /arch:AVX2)
+    endif()
 else()
-    target_compile_options(vsfeel PRIVATE -mavx2)
+    if(VSFEEL_AVX2)
+        target_compile_options(vsfeel PRIVATE -mavx2)
+    endif()
     # Keep everything internal; the plugin only needs to export
     # VapourSynthPluginInit2 (VS_EXTERNAL_API marks it).
     target_compile_options(vsfeel PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
