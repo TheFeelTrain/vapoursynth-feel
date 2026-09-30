@@ -5,17 +5,12 @@ the input: it exercises the filter on high-frequency content without any flat
 or black regions.
 
 Reference comparisons run against core.vszipcl.Bilateral when that plugin is
-installed, with a two-tier "close enough" policy:
-
-- REF_TOL (1e-6 on the normalized [0, 1] scale) for everything where both
-  sides compute the same math — measured diffs are float32 noise (~1e-8).
-- BORDER_TOL (0.01) only for wide-sigma configs, where the reference's own
-  kernel variants disagree at frame borders (edge-clamp vs window truncation),
-  a semantic difference worth up to ~7e-3 on noise input.
-
-16-bit integer output is compared in whole output codes (<= 1 LSB): both
-sides round nearly identical fp32 results once, so codes differ by at most
-one rounding step. Self-consistency checks (determinism) remain exact.
+installed: REF_TOL (1e-6 on the normalized [0, 1] scale) for float32, where
+both sides compute the same math and measured diffs are float32 noise (~1e-8,
+including the wide-sigma configs measured at 5.6e-9). 16-bit integer output is
+compared in whole output codes (<= 1 LSB, 2 for the widest sigma), since both
+sides round nearly identical fp32 results once. Self-consistency checks
+(determinism) remain exact.
 
 Every reference comparison runs in a subprocess (``reference_compare``) so a
 reference crash cannot take the pytest process down with it.
@@ -38,7 +33,6 @@ pytestmark = pytest.mark.usefixtures("noise_gray")
 SIGMA_SPATIAL = 3.0
 SIGMA_COLOR = 0.05
 REF_TOL = 1e-6
-BORDER_TOL = 0.01
 
 
 def _run(clip, **kwargs):
@@ -114,17 +108,15 @@ def test_bilateral_matches_reference_16bit(noise_16bit):
 
 
 # The 32-bit sweeps above are mirrored at 16-bit (whole-code comparison).
-# Measured on the noise clip: every non-border config lands at 1 LSB; the
-# wide-sigma border case (staging tile > LDS budget, where the reference's
-# own kernel variants disagree at borders) measured 328 codes, bound by the
-# BORDER_TOL equivalent in 16-bit codes (0.01 * 65535).
-BORDER_TOL_CODES = 655.0
+# Measured on the noise clip: every config lands within one output code; the
+# widest sigma gets 2 for rounding headroom.
+WIDE_SIGMA_TOL_CODES = 2.0
 
 
 @pytest.mark.parametrize("sigma_spatial,sigma_color,tol", [
     (1.0, 0.02, 1.0),
     (4.0, 0.05, 1.0),
-    (8.0, 0.15, BORDER_TOL_CODES),
+    (8.0, 0.15, WIDE_SIGMA_TOL_CODES),
 ], ids=["small-sigma", "default-like", "wide-sigma"])
 def test_bilateral_sigma_sweep_matches_reference_16bit(
         noise_16bit, sigma_spatial, sigma_color, tol):
@@ -167,9 +159,7 @@ def test_bilateral_yuv_matches_reference_16bit(noise_gray, use_shared_memory):
 @pytest.mark.parametrize("sigma_spatial,sigma_color,tol", [
     (1.0, 0.02, REF_TOL),
     (4.0, 0.05, REF_TOL),
-    # radius 24: the staging tile exceeds the 48 KiB shared-memory budget,
-    # where the reference's own kernel variants diverge at borders.
-    (8.0, 0.15, BORDER_TOL),
+    (8.0, 0.15, REF_TOL),
 ], ids=["small-sigma", "default-like", "wide-sigma"])
 def test_bilateral_sigma_sweep_matches_reference_32bit(noise_gray, sigma_spatial, sigma_color, tol):
     """Sigma grid on float input; radius is auto-derived from sigma_spatial."""
@@ -188,8 +178,8 @@ def test_bilateral_radius_sweep_matches_reference_32bit(noise_gray, radius):
 
 @pytest.mark.parametrize("use_shared_memory", [True, False], ids=["shared", "plain"])
 def test_bilateral_shader_variants_match_vszipcl_32bit(noise_gray, use_shared_memory):
-    """Both shader variants track the reference (borders may differ between
-    variants, exactly like the reference's own _sm/_gl pair)."""
+    """Both shader variants (shared LDS tile and plain gather) track the
+    reference to fp32 noise."""
     worst = _compare("gray32", (0, 23),
                      dict(sigma_spatial=2.0, sigma_color=0.05,
                           use_shared_memory=use_shared_memory))
@@ -376,6 +366,49 @@ def test_bilateral_per_plane_arrays_gray_32bit(noise_gray):
                      dict(sigma_spatial=[2.0, 1.5, 1.0],
                           sigma_color=[0.05, 0.03, 0.02]))
     assert worst < REF_TOL, f"max diff {worst}"
+
+
+# ---------------------------------------------------------------------------
+# Per-plane processing mask (unprocessed planes share from the source)
+# ---------------------------------------------------------------------------
+#
+# A zero sigma_spatial/sigma_color turns a plane off. On YUV that leaves the
+# output allocated through newVideoFrame2 with the source chroma planes, so the
+# unprocessed chroma must be passed through bit-identically while the luma is
+# still filtered. No other test reaches that share path.
+
+def test_bilateral_zero_chroma_sigma_shares_chroma_32bit(noise_yuv32):
+    src = noise_yuv32
+    out = _run(src, sigma_spatial=[2.0, 0.0, 0.0])
+    assert out.format.id == src.format.id
+    for n in (0, 11, 23):
+        f = out.get_frame(n)
+        s = src.get_frame(n)
+        assert not np.array_equal(_plane(f, 0, src.width, src.height),
+                                  _plane(s, 0, src.width, src.height)), \
+            f"luma was not filtered at frame {n}"
+        for p in (1, 2):
+            w, h = src.width >> 1, src.height >> 1
+            assert np.array_equal(_plane(f, p, w, h), _plane(s, p, w, h)), \
+                f"chroma{p} changed at frame {n}"
+
+
+def test_bilateral_zero_chroma_sigma_shares_chroma_16bit(noise_yuv420_16):
+    """16-bit mirror of the share-path test (whole codes)."""
+    src = noise_yuv420_16
+    out = _run(src, sigma_spatial=[2.0, 0.0, 0.0])
+    assert out.format.id == src.format.id
+    for n in (0, 11, 23):
+        f = out.get_frame(n)
+        s = src.get_frame(n)
+        d = _plane(f, 0, src.width, src.height, np.uint16).astype(np.int64) \
+            - _plane(s, 0, src.width, src.height, np.uint16).astype(np.int64)
+        assert np.abs(d).max() > 0, f"luma was not filtered at frame {n}"
+        for p in (1, 2):
+            w, h = src.width >> 1, src.height >> 1
+            assert np.array_equal(_plane(f, p, w, h, np.uint16),
+                                  _plane(s, p, w, h, np.uint16)), \
+                f"chroma{p} changed at frame {n}"
 
 
 # ---------------------------------------------------------------------------

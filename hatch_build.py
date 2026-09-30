@@ -19,6 +19,32 @@ _SUPPORTED_PLATFORMS = {
 }
 
 
+def plugin_library_name(platform_name: str | None = None) -> str:
+    """Plugin library filename CMake produces for ``platform_name``."""
+    platform_name = sys.platform if platform_name is None else platform_name
+    return "vsfeel.dll" if platform_name == "win32" else "libvsfeel.so"
+
+
+def find_staged_library(staged: Path, platform_name: str | None = None) -> Path:
+    """The plugin library CMake installed into ``staged`` for this platform.
+
+    Derived from the platform rather than picked as the first ``.so``/``.dll``
+    under ``install/``: a stale or foreign-platform file must fail the build
+    instead of being silently staged into the wheel.
+    """
+    platform_name = sys.platform if platform_name is None else platform_name
+    suffix = ".dll" if platform_name == "win32" else ".so"
+    want = staged / plugin_library_name(platform_name)
+    libs = sorted(p for p in staged.glob(f"*{suffix}") if p.is_file())
+    if libs != [want]:
+        raise RuntimeError(
+            f"expected exactly {want.name} in {staged}/, got "
+            f"{[p.name for p in libs] or 'nothing'} — CMake install did not "
+            f"produce this platform's ({platform_name}) plugin library."
+        )
+    return want
+
+
 def find_tool(name: str) -> str:
     """Locate a build tool, preferring PATH.
 
@@ -68,6 +94,9 @@ class CustomHook(BuildHookInterface):
         self.target_dir = root / "vapoursynth/plugins/vsfeel"
         self.build_dir = root / "build/pack"   # scratch configure/build tree (gitignored)
         self.install_dir = root / "install"    # cmake --install staging prefix
+        # install/ is gitignored and reused checkouts keep it around, so a stale
+        # (possibly foreign-platform) library must not survive into this build.
+        shutil.rmtree(self.install_dir, ignore_errors=True)
 
         build_data["pure_python"] = False
         # A `py3-none-<platform>` wheel: the payload is a VapourSynth plugin, not
@@ -108,25 +137,20 @@ class CustomHook(BuildHookInterface):
             check=True, cwd=root,
         )
 
-        # Copy exactly this platform's plugin library into the wheel. A missing
-        # file fails the build loudly instead of silently shipping an empty,
-        # unloadable wheel.
-        libs = sorted(p for p in self.install_dir.rglob("*")
-                      if p.is_file() and p.suffix in (".so", ".dll"))
-        if not libs:
+        # Copy exactly the library and manifest CMake just installed for this
+        # platform. The library path is derived, not globbed over install/, so a
+        # stale or foreign-platform file can never be staged.
+        staged = self.install_dir / self.target_dir.relative_to(root)
+        lib = find_staged_library(staged)
+        manifest = staged / "manifest.vs"
+        if not manifest.is_file():
             raise RuntimeError(
-                f"CMake install produced no vsfeel library under {self.install_dir}/ "
-                "— the plugin failed to compile/link."
-            )
-        manifests = sorted(self.install_dir.rglob("manifest.vs"))
-        if not manifests:
-            raise RuntimeError(
-                f"CMake install produced no manifest.vs under {self.install_dir}/."
+                f"CMake install produced no manifest.vs under {staged}/."
             )
 
         self.target_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(libs[0], self.target_dir)
-        shutil.copy2(manifests[0], self.target_dir)
+        shutil.copy2(lib, self.target_dir)
+        shutil.copy2(manifest, self.target_dir)
 
     def finalize(self, version: str, build_data: dict[str, Any], artifact_path: str) -> None:
         # The wheel is already assembled here; drop the staged tree (vapoursynth/…)

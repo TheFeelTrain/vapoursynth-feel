@@ -1,14 +1,20 @@
-"""Build plumbing: plugin version reporting and the SPIR-V header generator."""
+"""Build plumbing: plugin version reporting, the SPIR-V header generator, and
+the shipped build tools (benchmark script generation, wheel staging)."""
 
+import importlib.util
 import re
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
+import pytest
 import vapoursynth as vs
 
 ROOT = Path(__file__).resolve().parents[1]
 GENERATOR = ROOT / "src" / "gen_spirv_header.py"
+BENCHMARK = ROOT / "tools" / "benchmark.py"
+HATCH_BUILD = ROOT / "hatch_build.py"
 
 # A minimal header-only SPIR-V module: magic, version, generator, bound,
 # schema. The generator only inspects the header, so this exercises it fully.
@@ -57,3 +63,72 @@ def test_generator_rejects_a_non_spirv_module(tmp_path):
     assert proc.returncode != 0
     assert not out.exists()
     assert "not SPIR-V" in proc.stderr
+
+
+def _load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_benchmark_synthetic_scripts_compile_and_eval(monkeypatch):
+    """Every ``--synthetic`` vpy the benchmark can emit must compile and run.
+
+    The eedi3aa arm used to leave its outermost call unclosed and the eedi3h
+    arm referenced undefined ``sclip``/``mclip``; both made the run die before
+    any plugin call, which the harness reports only as "unavailable / failed".
+    Compiling the generated vpy catches the SyntaxError, and evaluating each
+    call against a stubbed ``core`` catches the undefined names.
+    """
+    bench = _load_module("benchmark", BENCHMARK)
+    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic"])
+    ns = bench.parse_args()
+    assert ns.synthetic
+    for name, spec in bench.FILTERS.items():
+        calls = spec.build(ns, spec.input, spec)
+        assert "vsfeel" in calls, name
+        for plugin, chain in calls.items():
+            vpy = bench.make_vpy(
+                clip=spec.input, extra=bench._plugin_loader(plugin), chain=chain,
+                frames=1, synth_format=spec.synth_format)
+            compile(vpy, f"<{name}/{plugin}>", "exec")
+            if chain.startswith("from "):
+                continue  # reference arms import vsaa, which may be absent
+            # The names the generated vpy prelude defines; the chain only ever
+            # reads the clip and the vstools helpers applied to it.
+            env = {"core": MagicMock(), "clip": object(),
+                   "depth": MagicMock(), "get_y": MagicMock()}
+            exec(chain, env)
+
+
+def test_hatch_stages_exactly_this_platforms_library(tmp_path):
+    """A stale foreign-platform library must fail the wheel build, not ship."""
+    pytest.importorskip("hatchling")
+    hb = _load_module("hatch_build", HATCH_BUILD)
+    staged = tmp_path / "vapoursynth/plugins/vsfeel"
+    staged.mkdir(parents=True)
+    (staged / "libvsfeel.so").write_bytes(b"so")
+
+    assert hb.find_staged_library(staged, "linux") == staged / "libvsfeel.so"
+    assert hb.plugin_library_name("win32") == "vsfeel.dll"
+
+    # A Windows DLL left behind by an earlier build is ignored on Linux, and a
+    # Linux-only staging cannot satisfy a Windows build.
+    (staged / "vsfeel.dll").write_bytes(b"dll")
+    assert hb.find_staged_library(staged, "linux") == staged / "libvsfeel.so"
+    dll_only = tmp_path / "dll_only"
+    dll_only.mkdir()
+    (dll_only / "vsfeel.dll").write_bytes(b"dll")
+    with pytest.raises(RuntimeError):
+        hb.find_staged_library(dll_only, "linux")
+    assert hb.find_staged_library(dll_only, "win32") == dll_only / "vsfeel.dll"
+
+    # The old "first .so sorted() finds" pick would silently stage this one.
+    (staged / "libother.so").write_bytes(b"other")
+    with pytest.raises(RuntimeError):
+        hb.find_staged_library(staged, "linux")
+
+    # Nothing staged at all is an error too.
+    with pytest.raises(RuntimeError):
+        hb.find_staged_library(tmp_path / "empty", "linux")

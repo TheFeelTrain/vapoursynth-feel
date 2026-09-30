@@ -119,6 +119,13 @@ Benchmark call: `MANGOHUD=0 python3 tools/benchmark.py --filter bilateral
 
 ## Historical
 
+### 2026-09-30 — 16-bit SSBOs need the StorageBuffer class
+
+`bilateral_shared_16`/`bilateral_plain_16` carried the same invalid SPIR-V 1.0
+Uniform+BufferBlock 16-bit buffer access as GaussBlur (mechanism and feature
+names in `notes/GAUSSBLUR.md`); both now build with `--target-env=vulkan1.1`.
+Bit-exact vs vszipcl, 32-bit SPIR-V unchanged.
+
 ### 2026-09-30 — creation-failure leak
 
 `createVideoFilterEx2` returns `nullptr` without running the free callback when
@@ -212,11 +219,15 @@ SDMA and the port reaches parity without any core change.
     at R=24: 100 fps vs 345 — halo reuse is essential.
   - Vectorising the shared gather to `vec4` changed nothing at R=24 (loads are
     not the limiter).
-- **Flagged, not changed**: `tests/test_bilateral.py` still bounds the wide-sigma
-  cases by `BORDER_TOL` / `BORDER_TOL_CODES` with a mechanism comment that
-  predates the LDS fix; measured now the shared kernel agrees with the reference
-  to 1 code / ≤5.6e-9 at every sigma, so the bound is ~655x (16-bit) looser than
-  measured. Left for the test-integrity work orders.
+- **Test bounds tightened to the measured agreement, gate covered** (test-only,
+  no perf change). The wide-sigma cases were bounded by a `BORDER_TOL`
+  (655 codes 16-bit) whose comment described a staging-tile/border mechanism
+  that is not on the shipped path; the shared kernel agrees with the reference
+  to 1 code / ≤5.6e-9 at every sigma, so the bound is now REF_TOL and 2 codes.
+  Added coverage for the automatic LDS gate (a forced 12288-byte device must
+  pick the plain kernel — radius 24's 20 480 B tile no longer fits — and match
+  the explicit plain run bit-for-bit) and for the per-plane share path
+  (`sigma_spatial=[2.0, 0, 0]` must copy chroma through bit-identically).
 
 ## Open work
 

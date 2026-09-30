@@ -26,8 +26,9 @@ _LAYER = "VK_LAYER_KHRONOS_validation"
 
 # One frame per filter, exercising the creation path and the frame path
 # (temporal / multi-pass filters get three frames).
-FILTERS = ["Bilateral", "GaussBlur", "DFTTest", "NLMeans", "BM3Dv2",
-           "EEDI3", "EEDI3H", "EEDI3AA", "NNEDI3"]
+FILTERS = ["Bilateral", "Bilateral16", "GaussBlur", "GaussBlurLarge",
+           "DFTTest", "NLMeans", "BM3Dv2", "EEDI3", "EEDI3H", "EEDI3AA",
+           "NNEDI3"]
 
 _SCRIPT = textwrap.dedent(f"""\
     import sys
@@ -46,8 +47,19 @@ _SCRIPT = textwrap.dedent(f"""\
 
     if name == "Bilateral":
         node = core.vsfeel.Bilateral(g32, sigma_spatial=3.0, sigma_color=0.05)
+    elif name == "Bilateral16":
+        # The 16-bit SSBOs take the StorageBuffer-class codegen that needs
+        # storageBuffer16BitAccess; the SPIR-V 1.0 Uniform+BufferBlock form
+        # would need the feature the core does not enable.
+        node = core.vsfeel.Bilateral(g16, sigma_spatial=3.0, sigma_color=0.05)
     elif name == "GaussBlur":
         node = core.vsfeel.GaussBlur(g32, sigma=2.0)
+    elif name == "GaussBlurLarge":
+        # sigma=20 derives radius 60 > LARGE_THRESHOLD, so this is the two-pass
+        # path: separate horizontal/vertical dispatches, the push-descriptor
+        # set, the barrier, and the 16-bit packed store through the aliased
+        # binding 4 that only ENTRY_HORIZ && BITS == 16 declares.
+        node = core.vsfeel.GaussBlur(g16, sigma=20.0)
     elif name == "DFTTest":
         node = core.vsfeel.DFTTest(g32, tbsize=3)
     elif name == "NLMeans":

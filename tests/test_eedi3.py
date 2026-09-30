@@ -44,9 +44,10 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_preserves_frame_props,
-    compare_or_skip, cpu_node, dtype_for_bits as _dtype, eval_parallel,
-    frame_to_ndarray, plane as _plane, reference_or_skip, right_half_mask,
+    WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_changes_on_noise,
+    assert_preserves_frame_props, compare_or_skip, cpu_node,
+    dtype_for_bits as _dtype, eval_parallel, frame_to_ndarray, plane as _plane,
+    reference_or_skip, right_half_mask,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -306,11 +307,15 @@ def test_eedi3_no_nan_all_frames_32bit(noise_gray):
 
 
 def test_eedi3_in_range_all_frames_16bit(noise_16bit):
+    """The uint16 path must keep the input format and actually filter it.
+
+    ``max <= 65535`` on a uint16 array cannot fail, so the meaningful checks
+    are format-id equality (no silent depth/format change) and an anti-vacuity
+    assertion that the noise was altered.
+    """
     out = _run(noise_16bit)
-    for n in range(out.num_frames):
-        a = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
-        assert a.max() <= 65535
-        assert a.min() >= 0
+    assert out.format.id == noise_16bit.format.id
+    assert_changes_on_noise(out, noise_16bit, what="EEDI3")
 
 
 

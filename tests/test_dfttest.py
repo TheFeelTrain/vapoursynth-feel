@@ -387,17 +387,26 @@ def test_dfttest_matches_reference_16bit(noise_16bit, kwargs):
 
 
 # Window indices 0..11 on both axes, sigma2, the legal sosize surface (incl.
-# the two >50% overlaps and their divisor rule), every f0beta variant, and
-# ftype 2/3/4 with a non-default sigma. Batched per depth: one process per
+# the two >50% overlaps and their divisor rule), every f0beta variant, ftype
+# 2/3/4 with a non-default sigma, the per-axis ssystem=0 product, a Kaiser
+# temporal window that actually reads tbeta, and sigma2 on the ftype=3 gain
+# (the default ftype=0 never reads it). Batched per depth: one process per
 # config would take minutes. Measured worst 3e-8 (fp32), 0 in 16-bit.
 DFTEST_PARAM_SWEEP = (
     [{"swin": v} for v in range(12)]
     + [{"twin": v} for v in range(12)]
     + [{"sigma2": 2.0}, {"sigma2": 16.0}]
-    + [{"sosize": v} for v in (0, 8, 14, 15)]
+    # 9/10/11/13 are illegal (>50% overlap whose divisor rule fails); the rest
+    # of 0..15 is the legal surface.
+    + [{"sosize": v} for v in (0, 1, 2, 3, 5, 6, 7, 8, 14, 15)]
     + [{"f0beta": v} for v in (0.0, 0.25, 2.0, 4.0)]
     + [{"ftype": t, "sigma": 4.0, "pmin": 10.0, "pmax": 200.0}
        for t in (2, 3, 4)]
+    + [{"ssx": [0.0, 4.0, 1.0, 9.0], "ssy": [0.0, 3.0, 1.0, 7.0],
+        "sst": [0.0, 2.0, 1.0, 5.0], "ssystem": 0}]
+    + [{"swin": 4, "sbeta": 3.0, "twin": 4, "tbeta": 3.0}]
+    + [{"ftype": 3, "sigma": 4.0, "sigma2": 16.0,
+        "pmin": 10.0, "pmax": 200.0}]
 )
 
 

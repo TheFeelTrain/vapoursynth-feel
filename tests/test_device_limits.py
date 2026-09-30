@@ -65,7 +65,9 @@ def build(name, params):
     if name == "nlmeans":
         return core.vsfeel.NLMeans(clip, **params)
     if name == "bilateral":
-        return core.vsfeel.Bilateral(clip, sigma_spatial=6.0, sigma_color=0.1)
+        kwargs = {"sigma_spatial": 6.0, "sigma_color": 0.1}
+        kwargs.update(params)
+        return core.vsfeel.Bilateral(clip, **kwargs)
     if name == "gaussblur":
         return core.vsfeel.GaussBlur(clip, sigma=2.0)
     raise SystemExit("unknown filter %r" % name)
@@ -265,6 +267,39 @@ def test_nlmeans_pack_is_capped_by_the_grid_z_limit():
     # Creation alone cannot see an over-limit dispatch; the frame run must.
     res = _run_limits([{"label": "nlmeans", "filter": "nlmeans"}], force)
     assert res["nlmeans"].get("finite") is True, res["nlmeans"]
+
+
+def test_bilateral_auto_lds_gate_falls_back_to_the_plain_kernel():
+    """The automatic LDS gate must pick the plain kernel when the tile is over
+    budget, exactly as an explicit use_shared_memory=False does.
+
+    Every bilateral test elsewhere passes use_shared_memory explicitly, so the
+    automatic branch never ran. sigma_spatial=8 derives radius 24 with the
+    auto-tuned 32x16 block, whose shared tile is (2*24+32)*(2*24+16)*4 =
+    20480 B: it fits the device's 64 KiB but not a forced 12288-byte limit.
+    Both runs below therefore use the plain kernel, and must agree bit-for-bit.
+    """
+    params = {"sigma_spatial": 8.0, "sigma_color": 0.15}
+    auto = _run_limits(
+        [{"label": "auto", "filter": "bilateral", "params": params}],
+        {"VSFEEL_LIMIT_SHARED_MEMORY": "12288"})
+    plain = _run_limits(
+        [{"label": "plain", "filter": "bilateral",
+          "params": {**params, "use_shared_memory": False}}],
+        {"VSFEEL_LIMIT_SHARED_MEMORY": "12288"})
+    assert auto["auto"].get("finite") is True, auto["auto"]
+    assert plain["plain"].get("finite") is True, plain["plain"]
+    assert auto["auto"]["sha1"] == plain["plain"]["sha1"], \
+        "the auto LDS gate did not select the plain kernel"
+
+    # Anti-vacuity: on the unconstrained device the same config takes the
+    # shared kernel, whose wide-radius output differs from the plain one, so a
+    # forced limit that changed nothing would leave these hashes equal.
+    shared = _run_limits([{"label": "shared", "filter": "bilateral",
+                           "params": params}])
+    assert shared["shared"].get("finite") is True, shared["shared"]
+    assert shared["shared"]["sha1"] != plain["plain"]["sha1"], \
+        "the forced LDS limit did not change the selected kernel"
 
 
 # ---------------------------------------------------------------------------

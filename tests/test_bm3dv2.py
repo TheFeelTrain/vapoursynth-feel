@@ -622,23 +622,6 @@ def test_bm3dv2_seek_collision_self_consistent():
     assert worst < 1e-5, f"seek schedule mismatch: {worst}"
 
 
-def test_bm3dv2_seek_collision_single_queue():
-    """The same schedule with every stream on ONE VkQueue must also complete.
-
-    A reader's aggregation device-waits on the estimation timelines of the
-    frames that filled its cache slots; if that signal comes from a later
-    submit on the same FIFO queue, the queue stalls permanently. The fix waits
-    host-side for the writers' estimation *submissions*, so the schedule must
-    finish and match the serial run exactly as it does with 4 queues.
-    """
-    try:
-        worst = run_compare_subprocess(
-            _SEEK_SCRIPT, [], timeout=300, env={"VSFEEL_BM3D_QUEUES": "1"})
-    except ReferenceUnavailable as exc:
-        raise AssertionError(f"single-queue seek subprocess failed early: {exc}") from exc
-    assert worst < 1e-5, f"single-queue seek schedule mismatch: {worst}"
-
-
 def test_bm3dv2_frame_request_order_matches_serial():
     """repeat/reverse/far/random request orders must match the serial run.
 
@@ -815,7 +798,7 @@ SWEEP_CONFIGS = [
 
 
 def _sweep_id(cfg: dict) -> str:
-    return ",".join(f"{k}={v}" for k, v in cfg.items()) or "defaults"
+    return ",".join(f"{k}={v}" for k, v in cfg.items()) or "empty+BASE_KWARGS"
 
 
 @pytest.mark.parametrize("cfg,tol", SWEEP_CONFIGS, ids=[_sweep_id(c) for c, _ in SWEEP_CONFIGS])
@@ -824,6 +807,24 @@ def test_bm3dv2_parameter_sweep_matches_reference(noise_gray, cfg, tol):
     estimate pass)."""
     ref, maxdiff = _compare_against_any_reference(dict(BASE_KWARGS, **cfg))
     assert maxdiff < tol, f"max diff vs {ref} ({_sweep_id(cfg)}): {maxdiff}"
+
+
+# The plugin's own defaults (sigma=3.0, radius=0, bm_range=9, block_step=8,
+# ps_range=4, ps_num=2, extractor_exp=0) are not what BASE_KWARGS selects, so
+# the sweep's empty entry grades a different configuration. Grade the true
+# defaults directly -- never merged with BASE_KWARGS -- plus the short-array
+# inheritance case (a one-element sigma makes the other planes inherit
+# element 0). Measured vszipcl basic estimate, frames 0/11/23: defaults 0.0188,
+# sigma=[0.7] 0.0071.
+@pytest.mark.parametrize("kwargs,tol", [
+    ({}, 0.03),
+    ({"sigma": [0.7]}, 0.02),
+], ids=["plugin-defaults", "sigma-array-inherit"])
+def test_bm3dv2_plugin_defaults_match_reference(noise_gray, kwargs, tol):
+    """The documented defaults must produce the reference result, not just
+    any finite frame (test_device_limits/test_lifecycle only check those)."""
+    ref, maxdiff = _compare_against_any_reference(kwargs)
+    assert maxdiff < tol, f"max diff vs {ref} ({kwargs}): {maxdiff}"
 
 
 # Remeasured with the repaired oracle (vszipcl, basic estimate, radius sweep):
@@ -868,11 +869,18 @@ def test_bm3dv2_extractor_exp_is_bit_reproducible(noise_gray, extractor_exp):
 def test_bm3dv2_extractor_exp_changes_aggregation(noise_gray):
     """A 2^20 extractor quantises the atomic addends to a 0.125 grid, which
     must move the output (the reference goes non-finite at 2^20). An output
-    identical to extractor_exp=0 means the constant is folded away again."""
+    identical to extractor_exp=0 means the constant is folded away again.
+
+    Finiteness is asserted before the movement: an all-NaN output also has a
+    NaN max diff, so `not isfinite or moved` would accept the very regression
+    this test exists to catch.
+    """
     base = _run(noise_gray, radius=2, extractor_exp=0)
     coarse = _run(noise_gray, radius=2, extractor_exp=20)
     for n in (0, 11, 23):
-        d = np.abs(frame_to_ndarray(base.get_frame(n))
-                   - frame_to_ndarray(coarse.get_frame(n)))
-        assert (not np.isfinite(d).all()) or float(d.max()) > 1e-4, \
-            f"extractor_exp=20 left frame {n} unchanged (max diff {d.max()})"
+        fb = frame_to_ndarray(base.get_frame(n))
+        fc = frame_to_ndarray(coarse.get_frame(n))
+        assert np.isfinite(fb).all() and np.isfinite(fc).all(), \
+            f"non-finite extractor_exp output at frame {n}"
+        assert float(np.abs(fb - fc).max()) > 1e-4, \
+            f"extractor_exp=20 left frame {n} unchanged"

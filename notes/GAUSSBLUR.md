@@ -96,6 +96,14 @@ medians:
 
 ## Historical
 
+- **The 16-bit variants were invalid Vulkan** (build/correctness only, no perf
+  change). SPIR-V 1.0 emits `buffer` blocks as Uniform + BufferBlock, so a
+  16-bit element needs `uniformAndStorageBuffer16BitAccess` — a feature the
+  core's device baseline does not enable — and the validation layer flagged it.
+  The 16-bit variants (all three entries) now build with
+  `--target-env=vulkan1.1`, which emits the StorageBuffer class covered by the
+  baseline's `storageBuffer16BitAccess`; bit-exact vs vszipcl, 32-bit SPIR-V
+  unchanged.
 - **The fused path's 48 KiB tile cap was dead.** The widest small-path tile is
   7 680 B, so `min(48 KiB, device LDS)` was always decided by the device; the cap
   is gone and the device limit is now the only check. No perf change.

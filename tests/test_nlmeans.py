@@ -345,17 +345,24 @@ def test_wref0_low_h_is_finite_uv_32bit(noise_yuv32):
 
 
 def test_wref0_low_h_envelope_16bit(noise_16bit):
-    """Pin the measured deviation at the envelope edge (h=1.2, wref=0)."""
+    """Bound the known fp16 weight-ring defect at the envelope edge (h=1.2, wref=0).
+
+    The ring can flush every tap to zero and the kernel falls back to the
+    centre sample, so the output deviates from vszipcl by thousands of codes
+    (measured ~4400-4600 LSB here; see the README's NLMeans accuracy note).
+    Only an upper bound is asserted: the defect is documented, not enshrined,
+    so fixing it can only lower the number.
+    """
     worst = _ref_compare("gray16", ENVELOPE_FRAMES,
                          dict(d=0, wref=0.0))
-    assert 1000.0 < worst < 6000.0, f"fp16 weight-ring envelope moved: {worst}"
+    assert worst < 6000.0, f"fp16 weight-ring envelope moved: {worst}"
 
 
 def test_wref0_low_h_envelope_32bit(noise_gray):
-    """Pin the same edge at fp32 (float units, ~4573 codes measured)."""
+    """Upper bound on the same edge at fp32 (float units; measured ~0.07)."""
     worst = _ref_compare("gray32", ENVELOPE_FRAMES,
                          dict(d=0, wref=0.0))
-    assert 0.03 < worst < 0.12, f"fp16 weight-ring envelope moved: {worst}"
+    assert worst < 0.12, f"fp16 weight-ring envelope moved: {worst}"
 
 
 def test_yuv_channels_uv_temporal_matches_reference_32bit(noise_yuv32):

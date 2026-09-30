@@ -165,20 +165,28 @@ endif()
 # when they carry spaces; separate_arguments() splits them back into arguments.
 #
 # --target-env is deliberately left as it is here (bilateral/gaussblur
-# compile as SPIR-V 1.0, dfttest/eedi3/nnedi3/nlmeans as 1.6). Unifying it is a
-# codegen change and belongs in its own measured commit, not in this refactor.
+# compile as SPIR-V 1.0, except their 16-bit variants; dfttest/eedi3/
+# nnedi3/nlmeans as 1.6). Unifying it is a codegen change and belongs in its own
+# measured commit, not in this refactor.
 # bm3d is 1.6 as well: its group transpose is a subgroup shuffle, which needs
 # SPIR-V 1.3+; nlmeans is 1.6 because it reads the core's GPU frame planes
 # through buffer references (PhysicalStorageBuffer), a 1.2+ feature.
 
 set(VK_BITS "16" "32")
 
-# Bilateral: one entry point per file, per io variant.
+# Bilateral: one entry point per file, per io variant. The 16-bit SSBOs need
+# the StorageBuffer class for the same reason as gaussblur's (see below); the
+# 32-bit variants keep their SPIR-V 1.0 codegen.
 set(VK_BILATERAL_VARIANTS)
 foreach(component IN ITEMS shared plain)
     foreach(bits IN LISTS VK_BITS)
+        if(bits EQUAL 16)
+            set(VK_BILATERAL_ENV --target-env=vulkan1.1)
+        else()
+            set(VK_BILATERAL_ENV "")
+        endif()
         list(APPEND VK_BILATERAL_VARIANTS
-            "bilateral_${component}_${bits}|bilateral_${component}.comp|-DBITS=${bits}")
+            "bilateral_${component}_${bits}|bilateral_${component}.comp|-DBITS=${bits} ${VK_BILATERAL_ENV}")
     endforeach()
 endforeach()
 
@@ -196,11 +204,22 @@ set(VK_GAUSS_ENTRIES gauss vert horiz)
 set(VK_GAUSS_ENTRY_DEFS -DENTRY_GAUSS -DENTRY_VERT -DENTRY_HORIZ)
 set(VK_GAUSS_VARIANTS)
 foreach(bits IN LISTS VK_BITS)
+    # SPIR-V 1.0 emits buffer blocks as Uniform + BufferBlock, so a 16-bit
+    # element needs uniformAndStorageBuffer16BitAccess -- a feature the core's
+    # device baseline does not enable (the validation layer flags it). Vulkan1.1
+    # is the smallest target that emits the StorageBuffer class instead, which
+    # the baseline's storageBuffer16BitAccess covers. The 32-bit variants keep
+    # their SPIR-V 1.0 codegen.
+    if(bits EQUAL 16)
+        set(VK_GAUSS_ENV --target-env=vulkan1.1)
+    else()
+        set(VK_GAUSS_ENV "")
+    endif()
     foreach(entry_i RANGE 0 2)
         list(GET VK_GAUSS_ENTRIES ${entry_i} entry)
         list(GET VK_GAUSS_ENTRY_DEFS ${entry_i} entry_def)
         list(APPEND VK_GAUSS_VARIANTS
-            "gaussblur_${bits}_${entry}|gaussblur.comp|-DBITS=${bits} ${entry_def}")
+            "gaussblur_${bits}_${entry}|gaussblur.comp|-DBITS=${bits} ${entry_def} ${VK_GAUSS_ENV}")
     endforeach()
 endforeach()
 

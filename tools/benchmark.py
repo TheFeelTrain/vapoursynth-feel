@@ -560,6 +560,14 @@ def _eedi3h_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[s
         f"vcheck={ns.eedi3_vcheck}, vthresh0={ns.eedi3_vthresh0}, "
         f"vthresh1={ns.eedi3_vthresh1}, vthresh2={ns.eedi3_vthresh2}"
     )
+    if getattr(ns, "synthetic", False):
+        # The synthetic vpy defines only `clip` (no ss/mask): the same plain
+        # 1x call _eedi3_build emits, with no aux clips to reference.
+        return {
+            "vsfeel": f"core.vsfeel.EEDI3H({clip}, {common})",
+            "vszipcl": f"core.vszipcl.EEDI3H({clip}, {common})",
+            "vszipcu": f"core.vszipcu.EEDI3H({clip}, {common})",
+        }
     with_mclip = common + (", sclip=sclip, mclip=mclip" if use_mclip else ", sclip=sclip")
     with_sclip = f"{common}, sclip=sclip"
     return {
@@ -637,7 +645,7 @@ def _eedi3aa_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
         out = {
             "vsfeel": (
                 f"core.vsfeel.EEDI3AA({clip}, field={field}, {common_plugin}, "
-                f"sclip=core.std.Interleave([{clip}, {clip}])"
+                f"sclip=core.std.Interleave([{clip}, {clip}]))"
             ),
         }
         for p in ("eedi3vk2", "vszipcl", "vszipcu"):
