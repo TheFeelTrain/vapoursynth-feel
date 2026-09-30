@@ -1,0 +1,59 @@
+# Static analysis for the C++ host code, run by tools/lint.sh and CI. Needs
+# build/compile_commands.json (tools/install.sh writes it).
+#
+# The list is curated, not `bugprone-*` wholesale: each check below was measured
+# against the tree and the tree is clean under it. Checks that were disabled and
+# why:
+#
+#   bugprone-easily-swappable-parameters
+#       fires on any two adjacent parameters of the same type. The Vulkan/VS
+#       entry points are full of them by definition; not actionable.
+#   bugprone-narrowing-conversions
+#       the double/float narrowing here is deliberate: the ported math narrows
+#       where the reference does.
+#   bugprone-invalid-enum-default-initialization
+#       Vulkan flag enums have no zero enumerator, but 0 is the documented
+#       "none" for VkShaderStageFlags and friends.
+#   bugprone-implicit-widening-of-multiplication-result
+#       every hit was a small compile-time product (2 * radius + 1) or an
+#       operand already widened at its declaration; the checker cannot see
+#       either.
+#   performance-enum-size
+#       asks for a smaller underlying type on enums. An ABI/size suggestion,
+#       not a defect.
+#   portability-avoid-pragma-once
+#       Google-style rule; `#pragma once` is this tree's convention.
+#   readability-redundant-member-init
+#       the tree initializes every member with `{}` uniformly. The check only
+#       strips it from class-typed members, and it contradicts cppcheck's
+#       uninitMemberVarNoCtor, which wants the opposite.
+#
+# GLSL is not covered here: clang-tidy cannot parse it. The shaders are gated by
+# `glslc -Werror` and spirv-val in the build instead.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-invalid-enum-default-initialization,
+  -bugprone-implicit-widening-of-multiplication-result,
+  performance-*,
+  -performance-enum-size,
+  portability-*,
+  -portability-avoid-pragma-once,
+  clang-analyzer-*,
+  modernize-use-nullptr,
+  modernize-use-override,
+  readability-braces-around-statements,
+  readability-container-size-empty,
+  readability-qualified-auto,
+  readability-redundant-casting,
+  readability-redundant-inline-specifier,
+  -readability-redundant-member-init
+
+# Only report findings in the plugin's own headers, not in Vulkan-Headers, volk
+# or VSVulkan4.h.
+HeaderFilterRegex: '.*/src/.*'
+
+# The tree is clean, so any finding is a new one: fail on it.
+WarningsAsErrors: '*'

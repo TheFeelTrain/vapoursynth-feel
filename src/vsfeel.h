@@ -40,11 +40,13 @@ using namespace std::string_literals;
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 #endif
 
-#define checkVK(expr) do {                                                          \
-    if (VkResult __result = (expr); __result != VK_SUCCESS) [[unlikely]] {          \
-        return set_error("'"s + #expr + "' failed: " + vk_result_string(__result));\
-    }                                                                               \
-} while(0)
+#define checkVK(expr)                                                          \
+    do {                                                                       \
+        if (VkResult __result = (expr); __result != VK_SUCCESS) [[unlikely]] { \
+            return set_error("'"s + #expr +                                    \
+                             "' failed: " + vk_result_string(__result));       \
+        }                                                                      \
+    } while (0)
 
 // Env flags. Every filter flag goes through one of these so the naming and the
 // `getenv` parsing live in a single place; each filter keeps its own names
@@ -99,7 +101,8 @@ inline const char * env_str(const char * env) {
 inline int vsfeel_debug_level() {
     static const int level = [] {
         const char * v = std::getenv("VSFEEL_DEBUG");
-        if (!v || !*v || std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0) {
+        if (!v || !*v || std::strcmp(v, "0") == 0 ||
+            std::strcmp(v, "false") == 0) {
             return 0;
         }
         return std::strcmp(v, "2") == 0 ? 2 : 1;
@@ -117,7 +120,8 @@ inline int vsfeel_trace_level() {
             return 2;
         }
         const char * v = std::getenv("VSFEEL_TRACE");
-        if (!v || !*v || std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0) {
+        if (!v || !*v || std::strcmp(v, "0") == 0 ||
+            std::strcmp(v, "false") == 0) {
             return 0;
         }
         return std::strcmp(v, "2") == 0 ? 2 : 1;
@@ -201,15 +205,15 @@ inline void vsfeel_trace_mark(const char * stage) {
     }
     trail.stage[trail.count] = stage;
     trail.ms[trail.count] = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - trail.t0).count();
+                                std::chrono::steady_clock::now() - trail.t0)
+                                .count();
     ++trail.count;
 }
 
 const char * vk_result_string(VkResult result);
 
 inline void vsfeel_trace_error(const char * filter, int frame,
-                               const std::string & message,
-                               const GPUDevice *) {
+                               const std::string & message, const GPUDevice *) {
     const int level = vsfeel_trace_level();
     if (level == 0) {
         return;
@@ -241,10 +245,12 @@ inline void vsfeel_trace_error(const char * filter, int frame,
     }
 
     const double ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - start).count();
-    std::fprintf(stderr, "[vsfeel-trace] %-9s %-9s #%-3llu %-7s t=+%.1fms: %s\n",
-        filter, where, static_cast<unsigned long long>(seq),
-        seq == 1 ? "(first)" : "", ms, one_line.c_str());
+                          std::chrono::steady_clock::now() - start)
+                          .count();
+    std::fprintf(stderr,
+                 "[vsfeel-trace] %-9s %-9s #%-3llu %-7s t=+%.1fms: %s\n",
+                 filter, where, static_cast<unsigned long long>(seq),
+                 seq == 1 ? "(first)" : "", ms, one_line.c_str());
 
     // How far the failing frame got: the error names the call that failed, the
     // trail says which stage of the frame that call belongs to. First error
@@ -265,7 +271,7 @@ inline void vsfeel_trace_error(const char * filter, int frame,
 // Round a size or offset up to a 32-byte boundary. The per-frame buffers pack
 // their plane regions this way so each region is 32-byte aligned (what
 // non-temporal access and descriptor offsets both want).
-inline constexpr VkDeviceSize align32(VkDeviceSize v) {
+constexpr VkDeviceSize align32(VkDeviceSize v) {
     return (v + 31) & ~VkDeviceSize(31);
 }
 
@@ -348,6 +354,13 @@ struct GPUDevice {
     // weak reference for exactly that reason.
     ~GPUDevice();
 
+    // One device per VkDevice, reached through a shared_ptr: copying the handle
+    // bundle would double-destroy it. Declaring these suppresses the implicit
+    // default constructor, hence the explicit one.
+    GPUDevice() = default;
+    GPUDevice(const GPUDevice &) = delete;
+    GPUDevice & operator=(const GPUDevice &) = delete;
+
     bool has_subgroup_ops(VkSubgroupFeatureFlags ops) const {
         return (subgroup_ops & ops) == ops;
     }
@@ -358,7 +371,8 @@ struct GPUDevice {
     // otherwise, size control has to be enabled for the COMPUTE stage, and the
     // workgroup must not split into more subgroups than
     // maxComputeWorkgroupSubgroups allows.
-    bool has_subgroup_size(uint32_t size, uint32_t workgroup_invocations) const {
+    bool has_subgroup_size(uint32_t size,
+                           uint32_t workgroup_invocations) const {
         if (!subgroup_size_control || size == 0) {
             return false;
         }
@@ -394,8 +408,8 @@ struct GPUDevice {
 
 // The core's device, brought up on first use and shared per VkDevice. Fails with
 // the core's message when no usable device exists.
-std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
-    VSCore * core, const VSAPI * vsapi);
+std::variant<std::shared_ptr<GPUDevice>, std::string>
+get_gpu_device(VSCore * core, const VSAPI * vsapi);
 
 // GPU-timing probes: a timestamp write where timestampValidBits is 0 can hang
 // the engine, so every probe is gated on this and says so once when skipped.
@@ -404,8 +418,10 @@ inline bool vsfeel_probe_timestamps(const GPUDevice & dev, const char * tag) {
         return true;
     }
     if (vsfeel_debug_enabled()) {
-        fprintf(stderr, "[vsfeel] %s: queue family %u reports 0 timestamp bits; "
-                        "GPU timings disabled\n", tag, dev.queue_family);
+        fprintf(stderr,
+                "[vsfeel] %s: queue family %u reports 0 timestamp bits; "
+                "GPU timings disabled\n",
+                tag, dev.queue_family);
     }
     return false;
 }
@@ -419,7 +435,8 @@ inline bool vsfeel_probe_timestamps(const GPUDevice & dev, const char * tag) {
 inline VkDeviceSize vsfeel_vram_limit(const GPUDevice & dev, VSCore * core) {
     VSVulkanCoreInfo info {};
     char err[256] {};
-    const bool known = dev.api->getVulkanCoreInfo(core, &info, err, sizeof(err)) == 0 &&
+    const bool known =
+        dev.api->getVulkanCoreInfo(core, &info, err, sizeof(err)) == 0 &&
         info.limit > 0;
     VkDeviceSize limit = known ? static_cast<VkDeviceSize>(info.limit) : 0;
     // Parsed by hand rather than through env_int: this is a byte count, and any
@@ -451,8 +468,8 @@ inline bool vsfeel_fold_grid(const VkPhysicalDeviceLimits & limits,
     const uint64_t gy = (groups + gx - 1) / gx;
     if (gy > max_y) {
         error = std::string(what) + " needs " + std::to_string(groups) +
-            " workgroups, more than this device can dispatch (" +
-            std::to_string(max_x) + "x" + std::to_string(max_y) + ")";
+                " workgroups, more than this device can dispatch (" +
+                std::to_string(max_x) + "x" + std::to_string(max_y) + ")";
         return false;
     }
     gx_out = static_cast<uint32_t>(gx);
@@ -469,7 +486,9 @@ struct GpuBuffer {
     VkDeviceSize size {};
     VkMemoryPropertyFlags memory_flags {};
 
-    explicit operator bool() const { return handle != nullptr; }
+    explicit operator bool() const {
+        return handle != nullptr;
+    }
 };
 
 // Storage buffer from the pool; empty return means success, otherwise the
@@ -487,16 +506,18 @@ inline std::string gpu_make_buffer(const GPUDevice & g, VSCore * core,
     // clearly rather than fail inside the driver, or bind a truncated range
     // that the shader's addressing would walk off.
     if (bytes > g.limits.maxStorageBufferRange) {
-        return "a " + std::to_string(bytes) + "-byte buffer exceeds this device's "
-            "maxStorageBufferRange (" + std::to_string(g.limits.maxStorageBufferRange) +
-            " bytes); lower the filter's size parameters or use one with a larger range"s;
+        return "a " + std::to_string(bytes) +
+               "-byte buffer exceeds this device's "
+               "maxStorageBufferRange (" +
+               std::to_string(g.limits.maxStorageBufferRange) +
+               " bytes); lower the filter's size parameters or use one with a larger range"s;
     }
     char err[512] {};
     VSVulkanBufferInfo info {};
     const VkBufferUsageFlags usage =
         (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | extra_usage);
     out.handle = g.api->createGPUBuffer(core, bytes, usage, required, preferred,
-        &info, err, sizeof(err));
+                                        &info, err, sizeof(err));
     if (!out.handle) {
         return err;
     }
@@ -511,9 +532,11 @@ inline std::string gpu_make_buffer(const GPUDevice & g, VSCore * core,
 // for: handed to the context, destroyed when that submission is known complete.
 inline std::string gpu_frame_buffer(const GPUDevice & g, VSCore * core,
                                     VSGPUExecContext * ctx, VkDeviceSize bytes,
-                                    GpuBuffer & out, VkBufferUsageFlags extra_usage = 0) {
-    std::string err = gpu_make_buffer(g, core, bytes, out,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, extra_usage);
+                                    GpuBuffer & out,
+                                    VkBufferUsageFlags extra_usage = 0) {
+    std::string err =
+        gpu_make_buffer(g, core, bytes, out,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, extra_usage);
     if (!err.empty()) {
         return err;
     }
@@ -550,7 +573,7 @@ inline void gpu_push_buffers(const GPUDevice & g, VkCommandBuffer cmd,
         writes[i].pBufferInfo = &infos[i];
     }
     g.vk->vkCmdPushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0,
-        count, writes);
+                                 count, writes);
 }
 
 inline void gpu_push_constants(const GPUDevice & g, VkCommandBuffer cmd,
@@ -575,7 +598,7 @@ inline void gpu_barrier(const GPUDevice & g, VkCommandBuffer cmd) {
     mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
     mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
-        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
     VkDependencyInfo dep {};
     dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dep.memoryBarrierCount = 1;
@@ -591,13 +614,14 @@ inline void gpu_barrier(const GPUDevice & g, VkCommandBuffer cmd) {
 // device reporting the minimum of 4 there. maxPushDescriptors is at least 32,
 // so a conformant device always fits, but the count is checked rather than
 // assumed.
-inline std::variant<VkDescriptorSetLayout, std::string> gpu_push_set_layout(
-    const GPUDevice & g, uint32_t bindings) {
+inline std::variant<VkDescriptorSetLayout, std::string>
+gpu_push_set_layout(const GPUDevice & g, uint32_t bindings) {
     if (bindings > g.max_push_descriptors || bindings > GPU_MAX_BINDINGS) {
         return "a pipeline needs " + std::to_string(bindings) +
-            " push descriptors, more than the " +
-            std::to_string(std::min(g.max_push_descriptors, GPU_MAX_BINDINGS)) +
-            " this build supports";
+               " push descriptors, more than the " +
+               std::to_string(
+                   std::min(g.max_push_descriptors, GPU_MAX_BINDINGS)) +
+               " this build supports";
     }
     VkDescriptorSetLayoutBinding b[GPU_MAX_BINDINGS] {};
     for (uint32_t i = 0; i < bindings; ++i) {
@@ -612,14 +636,16 @@ inline std::variant<VkDescriptorSetLayout, std::string> gpu_push_set_layout(
     info.bindingCount = bindings;
     info.pBindings = b;
     VkDescriptorSetLayout layout {};
-    if (g.vk->vkCreateDescriptorSetLayout(g.device, &info, nullptr, &layout) != VK_SUCCESS) {
+    if (g.vk->vkCreateDescriptorSetLayout(g.device, &info, nullptr, &layout) !=
+        VK_SUCCESS) {
         return "vkCreateDescriptorSetLayout failed"s;
     }
     return layout;
 }
 
-inline std::variant<VkPipelineLayout, std::string> gpu_pipeline_layout(
-    const GPUDevice & g, VkDescriptorSetLayout set, uint32_t push_bytes) {
+inline std::variant<VkPipelineLayout, std::string>
+gpu_pipeline_layout(const GPUDevice & g, VkDescriptorSetLayout set,
+                    uint32_t push_bytes) {
     VkPushConstantRange range {};
     range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     range.size = push_bytes;
@@ -632,7 +658,8 @@ inline std::variant<VkPipelineLayout, std::string> gpu_pipeline_layout(
         info.pPushConstantRanges = &range;
     }
     VkPipelineLayout layout {};
-    if (g.vk->vkCreatePipelineLayout(g.device, &info, nullptr, &layout) != VK_SUCCESS) {
+    if (g.vk->vkCreatePipelineLayout(g.device, &info, nullptr, &layout) !=
+        VK_SUCCESS) {
         return "vkCreatePipelineLayout failed"s;
     }
     return layout;
@@ -651,7 +678,9 @@ struct GpuWorkgroup {
     uint32_t z { 1 };
     uint32_t shared_bytes {};
 
-    uint32_t invocations() const { return x * y * z; }
+    uint32_t invocations() const {
+        return x * y * z;
+    }
 };
 
 // Compute pipeline from an embedded SPIR-V blob plus its specialization
@@ -664,9 +693,9 @@ struct GpuWorkgroup {
 inline std::variant<VkPipeline, std::string> gpu_create_pipeline(
     const GPUDevice & g, const uint32_t * code, size_t code_size,
     VkPipelineLayout layout, const VkSpecializationMapEntry * entries,
-    const void * values, uint32_t entry_count, size_t values_size, const char * tag,
-    uint32_t required_subgroup_size = 0, GpuWorkgroup workgroup = {},
-    bool full_subgroups = false) {
+    const void * values, uint32_t entry_count, size_t values_size,
+    const char * tag, uint32_t required_subgroup_size = 0,
+    GpuWorkgroup workgroup = {}, bool full_subgroups = false) {
 
     if (entries == nullptr) {
         entry_count = 0;
@@ -674,7 +703,9 @@ inline std::variant<VkPipeline, std::string> gpu_create_pipeline(
         values_size = 0;
     }
     if (vsfeel_debug_enabled()) {
-        fprintf(stderr, "[vsfeel] pipeline %s subgroup=%u local=%ux%ux%u lds=%u spec=%u\n",
+        fprintf(
+            stderr,
+            "[vsfeel] pipeline %s subgroup=%u local=%ux%ux%u lds=%u spec=%u\n",
             tag, required_subgroup_size, workgroup.x, workgroup.y, workgroup.z,
             workgroup.shared_bytes, entry_count);
     }
@@ -688,32 +719,36 @@ inline std::variant<VkPipeline, std::string> gpu_create_pipeline(
         workgroup.y > lim.maxComputeWorkGroupSize[1] ||
         workgroup.z > lim.maxComputeWorkGroupSize[2] ||
         invocations > lim.maxComputeWorkGroupInvocations) {
-        return std::string(tag) + " needs a " + std::to_string(workgroup.x) + "x" +
-            std::to_string(workgroup.y) + "x" + std::to_string(workgroup.z) +
-            " workgroup (" + std::to_string(invocations) +
-            " invocations); this device allows at most " +
-            std::to_string(lim.maxComputeWorkGroupInvocations) + " invocations ("
-            + std::to_string(lim.maxComputeWorkGroupSize[0]) + "x" +
-            std::to_string(lim.maxComputeWorkGroupSize[1]) + "x" +
-            std::to_string(lim.maxComputeWorkGroupSize[2]) + " per dimension)";
+        return std::string(tag) + " needs a " + std::to_string(workgroup.x) +
+               "x" + std::to_string(workgroup.y) + "x" +
+               std::to_string(workgroup.z) + " workgroup (" +
+               std::to_string(invocations) +
+               " invocations); this device allows at most " +
+               std::to_string(lim.maxComputeWorkGroupInvocations) +
+               " invocations (" +
+               std::to_string(lim.maxComputeWorkGroupSize[0]) + "x" +
+               std::to_string(lim.maxComputeWorkGroupSize[1]) + "x" +
+               std::to_string(lim.maxComputeWorkGroupSize[2]) +
+               " per dimension)";
     }
     if (workgroup.shared_bytes > lim.maxComputeSharedMemorySize) {
-        return std::string(tag) + " needs " + std::to_string(workgroup.shared_bytes) +
-            " bytes of workgroup memory; this device allows " +
-            std::to_string(lim.maxComputeSharedMemorySize);
+        return std::string(tag) + " needs " +
+               std::to_string(workgroup.shared_bytes) +
+               " bytes of workgroup memory; this device allows " +
+               std::to_string(lim.maxComputeSharedMemorySize);
     }
 
     if (required_subgroup_size != 0 &&
         !g.has_subgroup_size(required_subgroup_size, invocations)) {
         return std::string(tag) + " requests subgroup size " +
-            std::to_string(required_subgroup_size) + " for a workgroup of " +
-            std::to_string(invocations) +
-            " invocations, which is not a subgroup size this device supports";
+               std::to_string(required_subgroup_size) + " for a workgroup of " +
+               std::to_string(invocations) +
+               " invocations, which is not a subgroup size this device supports";
     }
     // REQUIRE_FULL_SUBGROUPS is only valid with the computeFullSubgroups feature.
     if (full_subgroups && !g.compute_full_subgroups) {
         return std::string(tag) +
-            " needs full subgroups, which this device does not support";
+               " needs full subgroups, which this device does not support";
     }
 
     VkShaderModuleCreateInfo module_info {};
@@ -735,10 +770,11 @@ inline std::variant<VkPipeline, std::string> gpu_create_pipeline(
     VkPipelineShaderStageCreateInfo stage {};
     stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stage.pNext = &module_info;
-    stage.flags = full_subgroups
-        ? VkPipelineShaderStageCreateFlags(
-              VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT)
-        : VkPipelineShaderStageCreateFlags(0);
+    stage.flags =
+        full_subgroups
+            ? VkPipelineShaderStageCreateFlags(
+                  VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT)
+            : VkPipelineShaderStageCreateFlags(0);
     stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     stage.pName = "main";
     if (entry_count > 0) {
@@ -762,8 +798,8 @@ inline std::variant<VkPipeline, std::string> gpu_create_pipeline(
         // vkCreateComputePipelines requires the host to serialize access to the
         // shared cache.
         std::lock_guard lock(*g.pipeline_cache_lock);
-        result = g.vk->vkCreateComputePipelines(
-            g.device, g.pipeline_cache, 1, &info, nullptr, &pipeline);
+        result = g.vk->vkCreateComputePipelines(g.device, g.pipeline_cache, 1,
+                                                &info, nullptr, &pipeline);
     }
     if (result != VK_SUCCESS) {
         return "vkCreateComputePipelines failed: "s + vk_result_string(result);

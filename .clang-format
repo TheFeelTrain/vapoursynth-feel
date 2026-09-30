@@ -1,0 +1,53 @@
+# C++ host code only. The .comp shaders are hand-formatted: clang-format parses
+# GLSL as C++, which reflows `layout(...) buffer X { T v[]; };` and the
+# push-constant struct into multi-line shapes and is not worth the damage.
+#
+# The profile is fitted to the style the tree already used (4 spaces, attached
+# braces, `T * p` pointers, ~80 columns), so running it is a whitespace commit
+# rather than a restyle.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++20
+
+ColumnLimit: 80
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+# `const char * v`, not `const char *v`: the star keeps a space on both sides.
+PointerAlignment: Middle
+DerivePointerAlignment: false
+
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+
+# Never sort or regroup includes. The groups are deliberate: VapourSynth4.h has
+# to precede VSVulkan4.h, and vsfeel.h sets VS_USE_API_43 before either.
+SortIncludes: Never
+IncludeBlocks: Preserve
+
+AlignConsecutiveMacros: Consecutive
+AlignTrailingComments: true
+AlignOperands: true
+MaxEmptyLinesToKeep: 2
+SpaceAfterCStyleCast: false
+SeparateDefinitionBlocks: Leave
+
+# Do not rewrap comments. They are already laid out by hand (and some carry
+# ASCII diagrams); reflowing them turns a whitespace-only commit into a
+# prose-diff for no gain.
+ReflowComments: false
+
+# Do not split long string literals into adjacent ones. The tree already uses
+# adjacent-literal concatenation deliberately (the argument-list strings), so a
+# split mid-sentence is noise that makes the message hard to grep for.
+BreakStringLiterals: false
+
+# `bool process[3] { true, true, true };` and `{ 0, sizeof(int) }` - the tree
+# spaces out braced lists.
+Cpp11BracedListStyle: false
+SpaceBeforeCpp11BracedList: true

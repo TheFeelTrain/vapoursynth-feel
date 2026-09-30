@@ -1,0 +1,28 @@
+# Editor defaults for the whole tree. Every rule here matches what the sources
+# already do, so this freezes the convention instead of changing it; tools/lint.sh
+# checks the same things. .clang-format owns C++ line breaking and indentation.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# The GLSL kernels are hand-formatted to the same 80 columns as the host code
+# (clang-format cannot be pointed at them: it parses GLSL as C++ and reflows
+# buffer blocks and push-constant structs into unreadable shapes).
+[*.{cpp,h,comp}]
+max_line_length = 80
+
+[*.{yml,yaml,json}]
+indent_size = 2
+
+[*.md]
+# Markdown hard line breaks are two trailing spaces.
+trim_trailing_whitespace = false
+
+[Makefile]
+indent_style = tab

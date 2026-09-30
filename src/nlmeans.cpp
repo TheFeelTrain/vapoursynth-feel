@@ -62,12 +62,15 @@ struct NLMeansSpecData {
     float wref;
     float h2_inv_norm;
     int32_t guide_off;
+    // Zero the compose pad stores; see PAD_ZERO in nlmeans.comp for why this is
+    // a spec constant rather than a literal.
+    float pad_zero;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 14> spec_entries {{
-    { 0,  0, sizeof(int32_t) },
-    { 1,  4, sizeof(int32_t) },
-    { 2,  8, sizeof(int32_t) },
+static constexpr std::array<VkSpecializationMapEntry, 15> spec_entries { {
+    { 0, 0, sizeof(int32_t) },
+    { 1, 4, sizeof(int32_t) },
+    { 2, 8, sizeof(int32_t) },
     { 3, 12, sizeof(int32_t) },
     { 4, 16, sizeof(int32_t) },
     { 5, 20, sizeof(int32_t) },
@@ -79,7 +82,8 @@ static constexpr std::array<VkSpecializationMapEntry, 14> spec_entries {{
     { 11, 44, sizeof(float) },
     { 12, 48, sizeof(float) },
     { 13, 52, sizeof(int32_t) },
-}};
+    { 14, 56, sizeof(float) },
+} };
 
 // Workgroup tile geometry of the weight kernel (must match nlmeans.comp).
 constexpr int BLK_X = 32;
@@ -102,33 +106,34 @@ struct Variant {
 
 struct NLMeansData {
     VSNode * node {};
-    VSNode * ref_node {};   // optional guide clip
+    VSNode * ref_node {}; // optional guide clip
     const VSVideoInfo * vi {};
 
     int bits {}, elem_bytes {};
     bool has_ref {};
 
-    int ref_mode {};        // 0 luma, 1 chroma, 2 yuv, 3 rgb
-    int channels {};        // processed channel count (1/2/3)
-    int plane0 {};          // first processed VS plane
+    int ref_mode {}; // 0 luma, 1 chroma, 2 yuv, 3 rgb
+    int channels {}; // processed channel count (1/2/3)
+    int plane0 {};   // first processed VS plane
     bool process[3] { true, true, true };
 
     int d {}, a {}, s {}, wmode {};
     float h_param {}, wref_param {};
 
-    int width {}, height {};   // processed lattice dims (chroma-subsampled for UV)
-    int stride {};             // plane stride in elements
+    int width {},
+        height {}; // processed lattice dims (chroma-subsampled for UV)
+    int stride {}; // plane stride in elements
     int64_t npix {};
-    int pad {};                // padded-window margin (= a)
-    int pstride {};            // padded tile pitch
-    int ph {};                 // padded tile height
+    int pad {};     // padded-window margin (= a)
+    int pstride {}; // padded tile pitch
+    int ph {};      // padded tile height
     int64_t tile_elems {};
-    int clips {};              // 1, or 2 with rclip
-    int guide_off {};          // window tile offset of the guide half
+    int clips {};     // 1, or 2 with rclip
+    int guide_off {}; // window tile offset of the guide half
     int qb {};
-    uint32_t pack {1};         // sweep rounds: entries per weight+acc round
-    int64_t ring_budget {64LL << 20};  // u4a ring target, capped by the core
-    int slots {};              // u4a ring slots = ring_base * pack
+    uint32_t pack { 1 }; // sweep rounds: entries per weight+acc round
+    int64_t ring_budget { 64LL << 20 }; // u4a ring target, capped by the core
+    int slots {};                       // u4a ring slots = ring_base * pack
 
     // create()-time q-sweep tables (stride-8 rows), shared by all recordings
     std::vector<int> wq_host;
@@ -163,11 +168,12 @@ struct NLMeansData {
         if (host_timing && ht_n.load()) {
             const double n = static_cast<double>(ht_n.load());
             fprintf(stderr,
-                "[nlmeans-timing] frames=%.0f per-frame us: acquire=%7.1f "
-                "record=%7.1f submit=%7.1f total=%7.1f\n",
-                n, ht_acquire_ns.load() / 1000.0 / n,
-                ht_record_ns.load() / 1000.0 / n,
-                ht_submit_ns.load() / 1000.0 / n, ht_total_ns.load() / 1000.0 / n);
+                    "[nlmeans-timing] frames=%.0f per-frame us: acquire=%7.1f "
+                    "record=%7.1f submit=%7.1f total=%7.1f\n",
+                    n, ht_acquire_ns.load() / 1000.0 / n,
+                    ht_record_ns.load() / 1000.0 / n,
+                    ht_submit_ns.load() / 1000.0 / n,
+                    ht_total_ns.load() / 1000.0 / n);
         }
         if (!gpu) {
             return;
@@ -210,10 +216,10 @@ struct NLMeansData {
 // Pipeline creation
 // ---------------------------------------------------------------------------
 
-static std::variant<VkPipeline, std::string> create_pipeline(
-    const GPUDevice & gpu, VkPipelineLayout layout,
-    const uint32_t * code, size_t code_size, const NLMeansSpecData & spec,
-    bool weight_pass) {
+static std::variant<VkPipeline, std::string>
+create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
+                const uint32_t * code, size_t code_size,
+                const NLMeansSpecData & spec, bool weight_pass) {
 
     // Explicit wave32, same knob the legacy build used (measured neutral here).
     // No kernel here uses a subgroup intrinsic, so this is a launch-shape
@@ -224,15 +230,21 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     // `hsum[VRT_RESULT*BY + 2*NLM_S][BX]` (nlmeans.comp:156), sized here for
     // BX=32, BY=8, VRT_RESULT=3 and a search radius of NLM_S = spec.s.
     const uint32_t rows = 3 * 8 + 2 * static_cast<uint32_t>(spec.s);
-    const GpuWorkgroup workgroup { .x = 32, .y = 8,
+    const GpuWorkgroup workgroup {
+        .x = 32,
+        .y = 8,
         .shared_bytes = weight_pass
-            ? (rows * (32 + 2 * static_cast<uint32_t>(spec.s)) + rows * 32) * 4u
-            : 0u };
+                            ? (rows * (32 + 2 * static_cast<uint32_t>(spec.s)) +
+                               rows * 32) *
+                                  4u
+                            : 0u
+    };
     const uint32_t subgroup_size =
         gpu.has_subgroup_size(32, workgroup.invocations()) ? 32 : 0;
-    return gpu_create_pipeline(gpu, code, code_size, layout, spec_entries.data(),
-        &spec, static_cast<uint32_t>(spec_entries.size()), sizeof(spec),
-        "nlmeans", subgroup_size, workgroup);
+    return gpu_create_pipeline(
+        gpu, code, code_size, layout, spec_entries.data(), &spec,
+        static_cast<uint32_t>(spec_entries.size()), sizeof(spec), "nlmeans",
+        subgroup_size, workgroup);
 }
 
 // Device address of a frame plane buffer, for the per-frame address table.
@@ -247,9 +259,9 @@ static VkDeviceAddress plane_address(const GPUDevice & gpu, VkBuffer buffer) {
 // Frame processing
 // ---------------------------------------------------------------------------
 
-static const VSFrame * nlmeans_gpu_frame(
-    NLMeansData * d, int n, VSFrameContext * frameCtx, VSCore * core,
-    const VSAPI * vsapi) {
+static const VSFrame * nlmeans_gpu_frame(NLMeansData * d, int n,
+                                         VSFrameContext * frameCtx,
+                                         VSCore * core, const VSAPI * vsapi) {
 
     const int C = d->channels;
     const int L = 2 * d->d + 1;
@@ -290,20 +302,20 @@ static const VSFrame * nlmeans_gpu_frame(
     // newVideoFrame2 infers residency from the plane sources, so a frame with no
     // source plane at all has to come from newGPUVideoFrame.
     const int pl[] = { 0, 1, 2 };
-    const VSFrame * fr[] = {
-        d->process[0] ? nullptr : center,
-        d->process[1] ? nullptr : center,
-        d->process[2] ? nullptr : center
-    };
-    VSFrame * dst = all_process
-        ? d->gpu->api->newGPUVideoFrame(&d->vi->format, d->vi->width,
-              d->vi->height, center, core)
-        : vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height,
-              fr, pl, center, core);
+    const VSFrame * fr[] = { d->process[0] ? nullptr : center,
+                             d->process[1] ? nullptr : center,
+                             d->process[2] ? nullptr : center };
+    VSFrame * dst =
+        all_process
+            ? d->gpu->api->newGPUVideoFrame(&d->vi->format, d->vi->width,
+                                            d->vi->height, center, core)
+            : vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height,
+                                    fr, pl, center, core);
     if (!dst) {
         vsfeel_trace_error("NLMeans", n, "failed to allocate the output frame",
                            d->gpu.get());
-        vsapi->setFilterError("NLMeans: failed to allocate the output frame", frameCtx);
+        vsapi->setFilterError("NLMeans: failed to allocate the output frame",
+                              frameCtx);
         cleanup_frames();
         return nullptr;
     }
@@ -314,7 +326,8 @@ static const VSFrame * nlmeans_gpu_frame(
     vsfeel_trace_mark("acquire");
 
     char errbuf[512] {};
-    VSGPUExecContext * ctx = d->gpu->api->gpuExecAcquire(d->pool_owned, errbuf, sizeof(errbuf));
+    VSGPUExecContext * ctx =
+        d->gpu->api->gpuExecAcquire(d->pool_owned, errbuf, sizeof(errbuf));
     auto fail = [&](const std::string & message) -> const VSFrame * {
         if (ctx) {
             d->gpu->api->gpuExecAbandon(ctx);
@@ -335,13 +348,14 @@ static const VSFrame * nlmeans_gpu_frame(
     vsfeel_trace_mark("record");
     VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
 
-    const bool gputrace = d->gputrace && n == static_cast<int>(d->gputrace_frame) &&
-        d->ts_armed.exchange(1) == 0;
+    const bool gputrace = d->gputrace &&
+                          n == static_cast<int>(d->gputrace_frame) &&
+                          d->ts_armed.exchange(1) == 0;
     uint32_t ts_used = 0;
     if (gputrace) {
         d->gpu->vk->vkCmdResetQueryPool(cmd, d->ts_query, 0, NLMEANS_TS_MAX);
-        d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-            d->ts_query, 0);
+        d->gpu->vk->vkCmdWriteTimestamp2(
+            cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, d->ts_query, 0);
         ts_used = NLMEANS_TS_RESERVED;
     }
 
@@ -350,16 +364,20 @@ static const VSFrame * nlmeans_gpu_frame(
     // 64 MiB ring budget below.
     GpuBuffer u4a {}, u2 {}, u5 {};
     if (auto e = gpu_frame_buffer(*d->gpu, core, ctx,
-            static_cast<VkDeviceSize>(d->npix) * d->slots * sizeof(uint16_t), u4a);
+                                  static_cast<VkDeviceSize>(d->npix) *
+                                      d->slots * sizeof(uint16_t),
+                                  u4a);
         !e.empty()) {
         return fail("weight ring: " + e);
     }
-    if (auto e = gpu_frame_buffer(*d->gpu, core, ctx,
+    if (auto e = gpu_frame_buffer(
+            *d->gpu, core, ctx,
             static_cast<VkDeviceSize>(d->npix) * (C + 1) * sizeof(float), u2);
         !e.empty()) {
         return fail("accumulator buffer: " + e);
     }
-    if (auto e = gpu_frame_buffer(*d->gpu, core, ctx,
+    if (auto e = gpu_frame_buffer(
+            *d->gpu, core, ctx,
             static_cast<VkDeviceSize>(d->npix) * sizeof(float), u5);
         !e.empty()) {
         return fail("max-weight buffer: " + e);
@@ -369,8 +387,9 @@ static const VSFrame * nlmeans_gpu_frame(
     // (clip, channel, temporal layer). Rebuilt every frame by the compose pass.
     GpuBuffer window {};
     if (auto e = gpu_frame_buffer(*d->gpu, core, ctx,
-            static_cast<VkDeviceSize>(d->clips) * C * L * d->tile_elems *
-                d->elem_bytes, window);
+                                  static_cast<VkDeviceSize>(d->clips) * C * L *
+                                      d->tile_elems * d->elem_bytes,
+                                  window);
         !e.empty()) {
         return fail("temporal window: " + e);
     }
@@ -378,10 +397,12 @@ static const VSFrame * nlmeans_gpu_frame(
     // Address table: [0, C*L) source planes, [C*L, 2*C*L) guide planes.
     GpuBuffer addr {};
     if (auto e = gpu_make_buffer(*d->gpu, core,
-            static_cast<VkDeviceSize>(2) * C * L * sizeof(VkDeviceAddress), addr,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+                                 static_cast<VkDeviceSize>(2) * C * L *
+                                     sizeof(VkDeviceAddress),
+                                 addr,
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                 VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
         !e.empty()) {
         return fail("address table: " + e);
     }
@@ -425,29 +446,30 @@ static const VSFrame * nlmeans_gpu_frame(
         dst_buf[c] = dp.buffer;
     }
     for (int c = C; c < 3; ++c) {
+        // C is the validated channel count (1..3), so this only fills the
+        // unused tail; the analyzer cannot see that bound.
+        // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
         dst_buf[c] = dst_buf[0];
     }
 
-    const VkBuffer buffers[10] {
-        addr.buffer, window.buffer,
-        dst_buf[0], dst_buf[1], dst_buf[2],
-        d->tables_wq.buffer, d->tables_aq.buffer,
-        u4a.buffer, u2.buffer, u5.buffer
-    };
+    const VkBuffer buffers[10] { addr.buffer,         window.buffer,
+                                 dst_buf[0],          dst_buf[1],
+                                 dst_buf[2],          d->tables_wq.buffer,
+                                 d->tables_aq.buffer, u4a.buffer,
+                                 u2.buffer,           u5.buffer };
     gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 10);
 
     // Compose: copy every (clip, channel, layer) plane into its padded tile.
     // The sweep then reads one buffer with 32-bit offsets.
     vsfeel_trace_mark("compose");
     {
-        const uint32_t cgx = static_cast<uint32_t>(
-            (d->pstride + BLK_X - 1) / BLK_X);
-        const uint32_t cgy = static_cast<uint32_t>(
-            (d->ph + BLK_Y - 1) / BLK_Y);
+        const uint32_t cgx =
+            static_cast<uint32_t>((d->pstride + BLK_X - 1) / BLK_X);
+        const uint32_t cgy = static_cast<uint32_t>((d->ph + BLK_Y - 1) / BLK_Y);
         d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            d->compose_pipeline);
+                                      d->compose_pipeline);
         d->gpu->vk->vkCmdDispatch(cmd, cgx, cgy,
-            static_cast<uint32_t>(d->clips) * C * L);
+                                  static_cast<uint32_t>(d->clips) * C * L);
         gpu_barrier(*d->gpu, cmd);
     }
 
@@ -473,47 +495,49 @@ static const VSFrame * nlmeans_gpu_frame(
             // COMPUTE_SHADER, not TOP_OF_PIPE: gpu_barrier only names the
             // compute stage, so a top-of-pipe stamp is free to be taken before
             // the previous round's accumulation retires.
-            d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                d->ts_query, ts_used++);
+            d->gpu->vk->vkCmdWriteTimestamp2(
+                cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, d->ts_query,
+                ts_used++);
         }
         {
-            const int32_t w_push[4] {
-                static_cast<int32_t>(v.w_base + p0), 0, 0, 0
-            };
+            const int32_t w_push[4] { static_cast<int32_t>(v.w_base + p0), 0, 0,
+                                      0 };
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                d->weight_pipeline);
-            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, w_push, sizeof(w_push));
+                                          d->weight_pipeline);
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, w_push,
+                               sizeof(w_push));
             d->gpu->vk->vkCmdDispatch(cmd, gx, gy_w, p1 - p0);
         }
         gpu_barrier(*d->gpu, cmd);
         if (gputrace && ts_used < NLMEANS_TS_MAX) {
-            d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
-                d->ts_query, ts_used++);
+            d->gpu->vk->vkCmdWriteTimestamp2(
+                cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->ts_query,
+                ts_used++);
         }
 
         {
-            const int32_t a_push[4] {
-                static_cast<int32_t>(v.q_base + q0), static_cast<int32_t>(nb),
-                bi == 0 ? 1 : 0,
-                q0 + nb >= v.q_cnt ? 1 : 0
-            };
+            const int32_t a_push[4] { static_cast<int32_t>(v.q_base + q0),
+                                      static_cast<int32_t>(nb), bi == 0 ? 1 : 0,
+                                      q0 + nb >= v.q_cnt ? 1 : 0 };
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                d->acc_pipeline);
-            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, a_push, sizeof(a_push));
+                                          d->acc_pipeline);
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, a_push,
+                               sizeof(a_push));
             d->gpu->vk->vkCmdDispatch(cmd, gx, gy, 1);
         }
         gpu_barrier(*d->gpu, cmd);
         if (gputrace && ts_used < NLMEANS_TS_MAX) {
-            d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
-                d->ts_query, ts_used++);
+            d->gpu->vk->vkCmdWriteTimestamp2(
+                cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->ts_query,
+                ts_used++);
         }
 
         q0 += nb;
         ++bi;
     }
     if (gputrace) {
-        d->gpu->vk->vkCmdCopyQueryPoolResults(cmd, d->ts_query, 0, ts_used,
-            d->ts_buf.buffer, 0, sizeof(uint64_t),
+        d->gpu->vk->vkCmdCopyQueryPoolResults(
+            cmd, d->ts_query, 0, ts_used, d->ts_buf.buffer, 0, sizeof(uint64_t),
             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     }
     auto t2 = d->host_timing ? std::chrono::steady_clock::now()
@@ -547,8 +571,9 @@ static const VSFrame * nlmeans_gpu_frame(
 
     vsfeel_trace_mark("submit");
     uint64_t signaled = 0;
-    const int submit_error = d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf, sizeof(errbuf));
-    ctx = nullptr;  // consumed either way
+    const int submit_error =
+        d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf, sizeof(errbuf));
+    ctx = nullptr; // consumed either way
     if (submit_error) {
         return fail("submit failed: "s + errbuf);
     }
@@ -558,7 +583,8 @@ static const VSFrame * nlmeans_gpu_frame(
     if (d->host_timing) {
         const auto ns = [](auto a, auto b) {
             return static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                    .count());
         };
         d->ht_acquire_ns += ns(t0, t1);
         d->ht_record_ns += ns(t1, t2);
@@ -569,8 +595,8 @@ static const VSFrame * nlmeans_gpu_frame(
 
     if (gputrace) {
         char perr[256] {};
-        if (d->gpu->api->gpuExecWaitValue(d->pool_owned, signaled, perr, sizeof(perr)) ==
-            gdDrained) {
+        if (d->gpu->api->gpuExecWaitValue(d->pool_owned, signaled, perr,
+                                          sizeof(perr)) == gdDrained) {
             const double period = d->gpu->limits.timestampPeriod;
             const auto us = [period](uint64_t a, uint64_t b) {
                 return static_cast<double>(b - a) * period / 1000.0;
@@ -580,7 +606,8 @@ static const VSFrame * nlmeans_gpu_frame(
             double first_w = 0.0, first_a = 0.0, first_gap = 0.0;
             uint32_t nw = 0;
             uint64_t prev = ts[0];
-            for (uint32_t s = NLMEANS_TS_RESERVED; s + NLMEANS_TS_PER_ROUND - 1 < ts_used;
+            for (uint32_t s = NLMEANS_TS_RESERVED;
+                 s + NLMEANS_TS_PER_ROUND - 1 < ts_used;
                  s += NLMEANS_TS_PER_ROUND) {
                 const double gap = us(prev, ts[s]);
                 const double w = us(ts[s], ts[s + 1]);
@@ -597,8 +624,10 @@ static const VSFrame * nlmeans_gpu_frame(
                 }
                 prev = ts[s + 2];
             }
-            const uint32_t rounds = (ts_used - NLMEANS_TS_RESERVED) / NLMEANS_TS_PER_ROUND;
-            fprintf(stderr,
+            const uint32_t rounds =
+                (ts_used - NLMEANS_TS_RESERVED) / NLMEANS_TS_PER_ROUND;
+            fprintf(
+                stderr,
                 "[nlmeans-gpu] n=%d batches=%u total=%.1fus first gap=%.1f w=%.1f a=%.1f "
                 "rest_avg gap=%.1f w=%.1f a=%.1f\n",
                 n, rounds, us(ts[0], prev), first_gap, first_w, first_a,
@@ -613,9 +642,12 @@ static const VSFrame * nlmeans_gpu_frame(
     return dst;
 }
 
-static const VSFrame *VS_CC NLMeansGetFrame(
-    int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData,
-    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+static const VSFrame * VS_CC NLMeansGetFrame(int n, int activationReason,
+                                             void * instanceData,
+                                             [[maybe_unused]] void ** frameData,
+                                             VSFrameContext * frameCtx,
+                                             VSCore * core,
+                                             const VSAPI * vsapi) {
 
     NLMeansData * d = static_cast<NLMeansData *>(instanceData);
 
@@ -637,8 +669,9 @@ static const VSFrame *VS_CC NLMeansGetFrame(
     return nlmeans_gpu_frame(d, n, frameCtx, core, vsapi);
 }
 
-static void VS_CC NLMeansFree(
-    void *instanceData, [[maybe_unused]] VSCore *core, const VSAPI *vsapi) {
+static void VS_CC NLMeansFree(void * instanceData,
+                              [[maybe_unused]] VSCore * core,
+                              const VSAPI * vsapi) {
 
     NLMeansData * d = static_cast<NLMeansData *>(instanceData);
     if (d->ref_node) {
@@ -652,9 +685,9 @@ static void VS_CC NLMeansFree(
 // Creation
 // ---------------------------------------------------------------------------
 
-static void VS_CC NLMeansCreate(
-    const VSMap *in, VSMap *out, [[maybe_unused]] void *userData,
-    VSCore *core, const VSAPI *vsapi) {
+static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
+                                [[maybe_unused]] void * userData, VSCore * core,
+                                const VSAPI * vsapi) {
 
     auto d { std::make_unique<NLMeansData>() };
 
@@ -679,8 +712,8 @@ static void VS_CC NLMeansCreate(
     if (d->has_ref) {
         const VSVideoInfo * rvi = vsapi->getVideoInfo(d->ref_node);
         if (!vsh::isSameVideoInfo(rvi, d->vi) ||
-            rvi->numFrames != d->vi->numFrames ||
-            rvi->width != d->vi->width || rvi->height != d->vi->height) {
+            rvi->numFrames != d->vi->numFrames || rvi->width != d->vi->width ||
+            rvi->height != d->vi->height) {
             return set_error("'rclip' must match the source clip's format, "
                              "dimensions and frame count.");
         }
@@ -746,7 +779,8 @@ static void VS_CC NLMeansCreate(
         return set_error("wmode must be 0..3.");
     }
 
-    d->wref_param = static_cast<float>(vsapi->mapGetFloat(in, "wref", 0, &error));
+    d->wref_param =
+        static_cast<float>(vsapi->mapGetFloat(in, "wref", 0, &error));
     if (error) {
         d->wref_param = 1.0f;
     }
@@ -766,50 +800,51 @@ static void VS_CC NLMeansCreate(
     };
 
     switch (fmt.colorFamily) {
-        case cfGray:
-            if (!(eq(chstr, "Y") || eq(chstr, "auto"))) {
-                return set_error("'channels' must be 'Y' with Gray.");
+    case cfGray:
+        if (!(eq(chstr, "Y") || eq(chstr, "auto"))) {
+            return set_error("'channels' must be 'Y' with Gray.");
+        }
+        d->ref_mode = REF_LUMA;
+        d->channels = 1;
+        d->plane0 = 0;
+        break;
+    case cfYUV:
+        if (eq(chstr, "YUV")) {
+            if (fmt.subSamplingW != 0 || fmt.subSamplingH != 0) {
+                return set_error("'channels'='YUV' requires 4:4:4.");
             }
+            d->ref_mode = REF_YUV;
+            d->channels = 3;
+            d->plane0 = 0;
+        } else if (eq(chstr, "Y") || eq(chstr, "auto")) {
             d->ref_mode = REF_LUMA;
             d->channels = 1;
             d->plane0 = 0;
-            break;
-        case cfYUV:
-            if (eq(chstr, "YUV")) {
-                if (fmt.subSamplingW != 0 || fmt.subSamplingH != 0) {
-                    return set_error("'channels'='YUV' requires 4:4:4.");
-                }
-                d->ref_mode = REF_YUV;
-                d->channels = 3;
-                d->plane0 = 0;
-            } else if (eq(chstr, "Y") || eq(chstr, "auto")) {
-                d->ref_mode = REF_LUMA;
-                d->channels = 1;
-                d->plane0 = 0;
-            } else if (eq(chstr, "UV")) {
-                d->ref_mode = REF_CHROMA;
-                d->channels = 2;
-                d->plane0 = 1;
-            } else {
-                return set_error("'channels' must be 'YUV', 'Y' or 'UV' with YUV.");
-            }
-            break;
-        case cfRGB:
-            if (!(eq(chstr, "RGB") || eq(chstr, "auto"))) {
-                return set_error("'channels' must be 'RGB' with RGB.");
-            }
-            d->ref_mode = REF_RGB;
-            d->channels = 3;
-            d->plane0 = 0;
-            break;
-        default:
-            return set_error("unsupported color family.");
+        } else if (eq(chstr, "UV")) {
+            d->ref_mode = REF_CHROMA;
+            d->channels = 2;
+            d->plane0 = 1;
+        } else {
+            return set_error("'channels' must be 'YUV', 'Y' or 'UV' with YUV.");
+        }
+        break;
+    case cfRGB:
+        if (!(eq(chstr, "RGB") || eq(chstr, "auto"))) {
+            return set_error("'channels' must be 'RGB' with RGB.");
+        }
+        d->ref_mode = REF_RGB;
+        d->channels = 3;
+        d->plane0 = 0;
+        break;
+    default:
+        return set_error("unsupported color family.");
     }
 
     const int ssw = fmt.subSamplingW;
     const int ssh = fmt.subSamplingH;
     d->width = (d->ref_mode == REF_CHROMA) ? d->vi->width >> ssw : d->vi->width;
-    d->height = (d->ref_mode == REF_CHROMA) ? d->vi->height >> ssh : d->vi->height;
+    d->height =
+        (d->ref_mode == REF_CHROMA) ? d->vi->height >> ssh : d->vi->height;
 
     if (2 * aa + 1 > d->width || 2 * aa + 1 > d->height) {
         return set_error("research window (2*a+1) larger than the frame.");
@@ -835,12 +870,14 @@ static void VS_CC NLMeansCreate(
     // kernel addressing is STRIDE elements per row. A GPU frame's stride is the
     // CPU frame's stride, so it is read off a scratch frame here.
     {
-        VSFrame * probe = vsapi->newVideoFrame(&fmt, d->vi->width, d->vi->height,
-                                               nullptr, core);
+        VSFrame * probe = vsapi->newVideoFrame(&fmt, d->vi->width,
+                                               d->vi->height, nullptr, core);
         if (probe == nullptr) {
-            return set_error("could not allocate a probe frame to read the plane stride");
+            return set_error(
+                "could not allocate a probe frame to read the plane stride");
         }
-        d->stride = static_cast<int>(vsapi->getStride(probe, d->plane0) / d->elem_bytes);
+        d->stride = static_cast<int>(vsapi->getStride(probe, d->plane0) /
+                                     d->elem_bytes);
         vsapi->freeFrame(probe);
     }
     d->npix = static_cast<int64_t>(d->stride) * d->height;
@@ -865,12 +902,15 @@ static void VS_CC NLMeansCreate(
     // the floor: the run groups have to fit, so a ring smaller than that is not
     // expressible and the core's allocator is what rejects it.
     {
-        const int64_t ring_base_slots = (dd == 0) ? d->qb : 2 * static_cast<int64_t>(d->qb);
-        const int64_t bytes_per_pack = ring_base_slots * d->npix * sizeof(uint16_t);
+        const int64_t ring_base_slots =
+            (dd == 0) ? d->qb : 2 * static_cast<int64_t>(d->qb);
+        const int64_t bytes_per_pack =
+            ring_base_slots * d->npix * sizeof(uint16_t);
         int64_t ring_budget = 64LL << 20;
-        if (const VkDeviceSize budget = vsfeel_vram_limit(*d->gpu, core); budget > 0) {
+        if (const VkDeviceSize budget = vsfeel_vram_limit(*d->gpu, core);
+            budget > 0) {
             ring_budget = std::min<int64_t>(ring_budget,
-                static_cast<int64_t>(budget / 16));
+                                            static_cast<int64_t>(budget / 16));
         }
         d->ring_budget = ring_budget;
         int64_t pack = ring_budget / std::max<int64_t>(bytes_per_pack, 1);
@@ -885,7 +925,8 @@ static void VS_CC NLMeansCreate(
         const int64_t rows_per_entry = (dd == 0) ? 1 : 2;
         const int64_t z_limit = std::max<int64_t>(
             static_cast<int64_t>(d->gpu->limits.maxComputeWorkGroupCount[2]) /
-                (rows_per_entry * d->qb), 1);
+                (rows_per_entry * d->qb),
+            1);
         pack = std::clamp<int64_t>(pack, 1, std::min<int64_t>(16384, z_limit));
         d->pack = static_cast<uint32_t>(pack);
     }
@@ -894,12 +935,12 @@ static void VS_CC NLMeansCreate(
     // int32 addressing bound of the device-side layouts (the reference falls
     // back to 64-bit indices here; we reject instead)
     {
-        const int64_t window_elems = d->clips * static_cast<int64_t>(d->channels) *
-            (2 * dd + 1) * d->tile_elems;
-        const int64_t idx_max = std::max({
-            d->npix * static_cast<int64_t>(d->slots),
-            d->npix * static_cast<int64_t>(d->channels),
-            window_elems });
+        const int64_t window_elems = d->clips *
+                                     static_cast<int64_t>(d->channels) *
+                                     (2 * dd + 1) * d->tile_elems;
+        const int64_t idx_max = std::max(
+            { d->npix * static_cast<int64_t>(d->slots),
+              d->npix * static_cast<int64_t>(d->channels), window_elems });
         if (idx_max >= (INT64_C(1) << 31)) {
             return set_error("resolution/temporal radius combination exceeds "
                              "the addressable range.");
@@ -925,43 +966,50 @@ static void VS_CC NLMeansCreate(
                 for (int j = -aa; j <= aa; ++j) {
                     for (int i = -aa; i <= aa; ++i) {
                         if (static_cast<int64_t>(kk) * spt_area +
-                                static_cast<int64_t>(j) * spt_side + i < 0) {
+                                static_cast<int64_t>(j) * spt_side + i <
+                            0) {
                             const uint32_t b_local = q_idx % batch;
                             if (b_local == 0) {
                                 v.w_boff.push_back(static_cast<uint32_t>(
                                     d->wq_host.size() / 8 - v.w_base));
                             }
-                            const int slot_c = (dd == 0)
-                                ? static_cast<int>(b_local)
-                                : 2 * static_cast<int>(b_local);
+                            const int slot_c =
+                                (dd == 0) ? static_cast<int>(b_local)
+                                          : 2 * static_cast<int>(b_local);
                             const int slot_m = (kk != 0) ? slot_c + 1 : slot_c;
-                            const int wrow_c[8] { dd, i, j, kk, slot_c, 0, 0, 0 };
-                            d->wq_host.insert(d->wq_host.end(), std::begin(wrow_c),
-                                std::end(wrow_c));
+                            const int wrow_c[8] {
+                                dd, i, j, kk, slot_c, 0, 0, 0
+                            };
+                            d->wq_host.insert(d->wq_host.end(),
+                                              std::begin(wrow_c),
+                                              std::end(wrow_c));
                             if (kk != 0) {
-                                const int wrow_m[8] { dd - kk, i, j, kk, slot_m, 0, 0, 0 };
-                                d->wq_host.insert(d->wq_host.end(), std::begin(wrow_m),
-                                    std::end(wrow_m));
+                                const int wrow_m[8] { dd - kk, i, j, kk,
+                                                      slot_m,  0, 0, 0 };
+                                d->wq_host.insert(d->wq_host.end(),
+                                                  std::begin(wrow_m),
+                                                  std::end(wrow_m));
                             }
-                            const int arow[8] { i, j, kk, slot_c, slot_m, 0, 0, 0 };
-                            d->aq_host.insert(d->aq_host.end(), std::begin(arow),
-                                std::end(arow));
+                            const int arow[8] { i,      j, kk, slot_c,
+                                                slot_m, 0, 0,  0 };
+                            d->aq_host.insert(d->aq_host.end(),
+                                              std::begin(arow), std::end(arow));
                             ++q_idx;
                         }
                     }
                 }
             }
-            v.w_boff.push_back(static_cast<uint32_t>(
-                d->wq_host.size() / 8 - v.w_base));
+            v.w_boff.push_back(
+                static_cast<uint32_t>(d->wq_host.size() / 8 - v.w_base));
             v.q_cnt = q_idx;
         }
     }
 
     d->gputrace = vsfeel_debug_probe("VSFEEL_NLMEANS_GPUTRACE") &&
-        vsfeel_probe_timestamps(*d->gpu, "NLMeans");
+                  vsfeel_probe_timestamps(*d->gpu, "NLMeans");
     if (d->gputrace) {
-        d->gputrace_frame = static_cast<uint32_t>(
-            env_int("VSFEEL_NLMEANS_GPUTRACE", 100));
+        d->gputrace_frame =
+            static_cast<uint32_t>(env_int("VSFEEL_NLMEANS_GPUTRACE", 100));
         VkQueryPoolCreateInfo qp_info {
             .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
             .flags = 0,
@@ -969,16 +1017,17 @@ static void VS_CC NLMeansCreate(
             .queryCount = NLMEANS_TS_MAX
         };
         if (d->gpu->vk->vkCreateQueryPool(d->gpu->device, &qp_info, nullptr,
-                &d->ts_query) != VK_SUCCESS) {
+                                          &d->ts_query) != VK_SUCCESS) {
             d->ts_query = VK_NULL_HANDLE;
             d->gputrace = false;
         }
     }
     if (d->gputrace) {
         auto e = gpu_make_buffer(*d->gpu, core,
-            NLMEANS_TS_MAX * sizeof(uint64_t), d->ts_buf,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            0, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                                 NLMEANS_TS_MAX * sizeof(uint64_t), d->ts_buf,
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                 0, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         if (!e.empty() || d->ts_buf.mapped == nullptr) {
             d->gputrace = false;
         } else {
@@ -993,22 +1042,21 @@ static void VS_CC NLMeansCreate(
     float denom = 3.0f * d->h_param;
     denom *= d->h_param;
     denom *= s_size;
-    const NLMeansSpecData spec {
-        .width = d->width,
-        .height = d->height,
-        .stride = d->stride,
-        .pstride = d->pstride,
-        .ph = d->ph,
-        .pad = d->pad,
-        .s = d->s,
-        .d = d->d,
-        .ref = d->ref_mode,
-        .channels = d->channels,
-        .wmode = d->wmode,
-        .wref = d->wref_param,
-        .h2_inv_norm = nlm_norm / denom,
-        .guide_off = d->guide_off
-    };
+    const NLMeansSpecData spec { .width = d->width,
+                                 .height = d->height,
+                                 .stride = d->stride,
+                                 .pstride = d->pstride,
+                                 .ph = d->ph,
+                                 .pad = d->pad,
+                                 .s = d->s,
+                                 .d = d->d,
+                                 .ref = d->ref_mode,
+                                 .channels = d->channels,
+                                 .wmode = d->wmode,
+                                 .wref = d->wref_param,
+                                 .h2_inv_norm = nlm_norm / denom,
+                                 .guide_off = d->guide_off,
+                                 .pad_zero = 0.0f };
 
     {
         const auto result = gpu_push_set_layout(*d->gpu, 10);
@@ -1018,8 +1066,8 @@ static void VS_CC NLMeansCreate(
         d->set_layout = std::get<VkDescriptorSetLayout>(result);
     }
     {
-        const auto result = gpu_pipeline_layout(*d->gpu, d->set_layout,
-            4 * sizeof(int32_t));
+        const auto result =
+            gpu_pipeline_layout(*d->gpu, d->set_layout, 4 * sizeof(int32_t));
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -1033,8 +1081,9 @@ static void VS_CC NLMeansCreate(
         const VkDeviceSize wq_bytes =
             static_cast<VkDeviceSize>(d->wq_host.size()) * sizeof(int32_t);
         auto e = gpu_make_buffer(*d->gpu, core, wq_bytes, d->tables_wq,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (!e.empty()) {
             return set_error("wq table: " + e);
         }
@@ -1046,8 +1095,9 @@ static void VS_CC NLMeansCreate(
         const VkDeviceSize aq_bytes =
             static_cast<VkDeviceSize>(d->aq_host.size()) * sizeof(int32_t);
         e = gpu_make_buffer(*d->gpu, core, aq_bytes, d->tables_aq,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (!e.empty()) {
             return set_error("aq table: " + e);
         }
@@ -1082,24 +1132,26 @@ static void VS_CC NLMeansCreate(
             acc_size = nlmeans_32_acc_spv_size;
         }
         {
-            const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                compose_code, compose_size, spec, false);
+            const auto result =
+                create_pipeline(*d->gpu, d->pipeline_layout, compose_code,
+                                compose_size, spec, false);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
             d->compose_pipeline = std::get<VkPipeline>(result);
         }
         {
-            const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                weight_code, weight_size, spec, true);
+            const auto result =
+                create_pipeline(*d->gpu, d->pipeline_layout, weight_code,
+                                weight_size, spec, true);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
             d->weight_pipeline = std::get<VkPipeline>(result);
         }
         {
-            const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                acc_code, acc_size, spec, false);
+            const auto result = create_pipeline(
+                *d->gpu, d->pipeline_layout, acc_code, acc_size, spec, false);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -1109,7 +1161,8 @@ static void VS_CC NLMeansCreate(
 
     {
         char err[512] {};
-        d->pool_owned = d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
+        d->pool_owned =
+            d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
         if (d->pool_owned == nullptr) {
             return set_error("createGPUExecPool failed: "s + err);
         }
@@ -1117,36 +1170,35 @@ static void VS_CC NLMeansCreate(
 
     if (vsfeel_debug_flag("VSFEEL_NLMEANS_VRAM")) {
         const double mib = 1024.0 * 1024.0;
-        const double ring_mib = static_cast<double>(d->npix) * d->slots *
-            sizeof(uint16_t) / mib;
+        const double ring_mib =
+            static_cast<double>(d->npix) * d->slots * sizeof(uint16_t) / mib;
         const double window_mib = static_cast<double>(d->clips) * d->channels *
-            (2 * d->d + 1) * d->tile_elems * d->elem_bytes / mib;
+                                  (2 * d->d + 1) * d->tile_elems *
+                                  d->elem_bytes / mib;
         const double per_frame = ring_mib + window_mib +
-            static_cast<double>(d->npix) * (d->channels + 2) *
-                sizeof(float) / mib;
-        fprintf(stderr, "[nlmeans] %.1f MiB per in-flight frame (ring %.1f MiB of "
-                        "%.1f MiB, %d slots, pack %u; window %.1f MiB, %dx%d tiles)\n",
-            per_frame, ring_mib, static_cast<double>(d->ring_budget) / mib,
-            d->slots, d->pack, window_mib, d->pstride, d->ph);
+                                 static_cast<double>(d->npix) *
+                                     (d->channels + 2) * sizeof(float) / mib;
+        fprintf(stderr,
+                "[nlmeans] %.1f MiB per in-flight frame (ring %.1f MiB of "
+                "%.1f MiB, %d slots, pack %u; window %.1f MiB, %dx%d tiles)\n",
+                per_frame, ring_mib, static_cast<double>(d->ring_budget) / mib,
+                d->slots, d->pack, window_mib, d->pstride, d->ph);
     }
 
     NLMeansData * data = d.release();
 
     // A temporal filter requests frames outside n, which the strict-spatial
     // policy does not permit; only d = 0 is purely spatial.
-    const VSRequestPattern policy =
-        data->d > 0 ? rpGeneral : rpStrictSpatial;
-    VSFilterDependency deps[2] = {
-        { data->node, policy },
-        { data->ref_node, policy }
-    };
+    const VSRequestPattern policy = data->d > 0 ? rpGeneral : rpStrictSpatial;
+    VSFilterDependency deps[2] = { { data->node, policy },
+                                   { data->ref_node, policy } };
 
     // ffGPUOutput: the frames this filter returns live in VRAM and carry their
     // own producer pairs, so the core never downloads them for a consumer that
     // does not need host pixels.
     VSNode * result = vsapi->createVideoFilterEx2(
-        "NLMeans", data->vi, NLMeansGetFrame, NLMeansFree,
-        fmParallel, ffGPUOutput, deps, data->has_ref ? 2 : 1, data, core);
+        "NLMeans", data->vi, NLMeansGetFrame, NLMeansFree, fmParallel,
+        ffGPUOutput, deps, data->has_ref ? 2 : 1, data, core);
     if (result == nullptr) {
         vsapi->mapSetError(out, "NLMeans: filter creation failed");
         return;
@@ -1157,20 +1209,17 @@ static void VS_CC NLMeansCreate(
 } // namespace
 
 void vsfeel_register_nlmeans(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
-    vspapi->registerFunction(
-        "NLMeans",
-        "clip:vnode:gpu;"
-        "d:int:opt;"
-        "a:int:opt;"
-        "s:int:opt;"
-        "h:float:opt;"
-        "wmode:int:opt;"
-        "wref:float:opt;"
-        "channels:data:opt;"
-        "rclip:vnode:gpu:opt;"
-        "device_id:int:opt;"
-        "num_streams:int:opt;",
-        "clip:vnode:gpu;",
-        NLMeansCreate, nullptr, plugin
-    );
+    vspapi->registerFunction("NLMeans",
+                             "clip:vnode:gpu;"
+                             "d:int:opt;"
+                             "a:int:opt;"
+                             "s:int:opt;"
+                             "h:float:opt;"
+                             "wmode:int:opt;"
+                             "wref:float:opt;"
+                             "channels:data:opt;"
+                             "rclip:vnode:gpu:opt;"
+                             "device_id:int:opt;"
+                             "num_streams:int:opt;",
+                             "clip:vnode:gpu;", NLMeansCreate, nullptr, plugin);
 }

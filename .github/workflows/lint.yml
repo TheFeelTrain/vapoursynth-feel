@@ -1,0 +1,55 @@
+name: Lint
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# The two clang tools are pinned rather than taken from the runner's apt
+# (LLVM 18 on 24.04): clang-format's output changes between LLVM majors, so a CI
+# formatter that disagrees with the developer's box makes the format gate
+# useless. The PyPI packages ship the same binaries as upstream.
+env:
+  CLANG_FORMAT_VERSION: "22.1.8"
+  CLANG_TIDY_VERSION: "22.1.8"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: System tools (glslc, spirv-val, cppcheck)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          glslc spirv-tools cppcheck
+
+    - name: Pinned clang tools and VapourSynth headers
+      run: |
+        python3 -m venv .venv
+        .venv/bin/pip install --upgrade pip
+        .venv/bin/pip install \
+          "clang-format==${CLANG_FORMAT_VERSION}" \
+          "clang-tidy==${CLANG_TIDY_VERSION}" \
+          "vapoursynth>=80"
+        # The venv's bin must come first: it supplies clang-format, clang-tidy,
+        # python and the `vapoursynth get-include` CLI CMake locates the headers
+        # through.
+        echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+    - name: Configure (compile database on, host warnings as errors)
+      run: |
+        cmake -S . -B build \
+          -D CMAKE_BUILD_TYPE=Release \
+          -D CMAKE_EXPORT_COMPILE_COMMANDS=ON \
+          -D VSFEEL_WERROR=ON \
+          -D Python3_EXECUTABLE="$PWD/.venv/bin/python"
+
+    # Builds the host with -Werror and every shader with glslc -Werror, then
+    # validates each emitted module with spirv-val (the shader-validate target).
+    - name: Build
+      run: cmake --build build --parallel
+
+    - name: Lint
+      run: tools/lint.sh

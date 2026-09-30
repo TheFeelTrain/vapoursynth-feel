@@ -7,10 +7,10 @@
 #include <cstring>
 #include <filesystem>
 #if defined(_WIN32)
-#  include <io.h>       // _access
-#  include <process.h>  // _getpid
+#include <io.h>      // _access
+#include <process.h> // _getpid
 #else
-#  include <unistd.h>   // access, getpid
+#include <unistd.h> // access, getpid
 #endif
 #include <map>
 #include <memory>
@@ -35,15 +35,22 @@ using namespace std::string_literals;
 
 const char * vk_result_string(VkResult result) {
     switch (result) {
-        case VK_SUCCESS:                      return "VK_SUCCESS";
-        case VK_ERROR_OUT_OF_HOST_MEMORY:     return "VK_ERROR_OUT_OF_HOST_MEMORY";
-        case VK_ERROR_OUT_OF_DEVICE_MEMORY:   return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
-        case VK_ERROR_INITIALIZATION_FAILED:  return "VK_ERROR_INITIALIZATION_FAILED";
-        case VK_ERROR_DEVICE_LOST:            return "VK_ERROR_DEVICE_LOST";
-        case VK_ERROR_INCOMPATIBLE_DRIVER:    return "VK_ERROR_INCOMPATIBLE_DRIVER";
-        case VK_ERROR_EXTENSION_NOT_PRESENT:  return "VK_ERROR_EXTENSION_NOT_PRESENT";
-        default:
-            return "<unknown VkResult>";
+    case VK_SUCCESS:
+        return "VK_SUCCESS";
+    case VK_ERROR_OUT_OF_HOST_MEMORY:
+        return "VK_ERROR_OUT_OF_HOST_MEMORY";
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY:
+        return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+    case VK_ERROR_INITIALIZATION_FAILED:
+        return "VK_ERROR_INITIALIZATION_FAILED";
+    case VK_ERROR_DEVICE_LOST:
+        return "VK_ERROR_DEVICE_LOST";
+    case VK_ERROR_INCOMPATIBLE_DRIVER:
+        return "VK_ERROR_INCOMPATIBLE_DRIVER";
+    case VK_ERROR_EXTENSION_NOT_PRESENT:
+        return "VK_ERROR_EXTENSION_NOT_PRESENT";
+    default:
+        return "<unknown VkResult>";
     }
 }
 
@@ -81,12 +88,13 @@ static int process_id() {
 #endif
 }
 
-static std::string pipeline_cache_path_for(const VkPhysicalDeviceProperties & props) {
+static std::string
+pipeline_cache_path_for(const VkPhysicalDeviceProperties & props) {
     const char * override_env = std::getenv("VSFEEL_PIPELINE_CACHE");
     if (override_env != nullptr) {
-        const std::string value { override_env };
+        std::string value { override_env };
         if (value.empty() || value == "0") {
-            return {};   // explicitly disabled
+            return {}; // explicitly disabled
         }
         return value;
     }
@@ -94,7 +102,8 @@ static std::string pipeline_cache_path_for(const VkPhysicalDeviceProperties & pr
     std::string dir;
     if (const char * xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg) {
         dir = xdg;
-    } else if (const char * local = std::getenv("LOCALAPPDATA"); local && *local) {
+    } else if (const char * local = std::getenv("LOCALAPPDATA");
+               local && *local) {
         dir = local;
     } else if (const char * home = std::getenv("HOME"); home && *home) {
         dir = std::string(home) + "/.cache";
@@ -121,7 +130,8 @@ static std::string pipeline_cache_path_for(const VkPhysicalDeviceProperties & pr
     };
     if (!usable(dir)) {
         std::error_code ec;
-        const std::string tmp = (std::filesystem::temp_directory_path(ec) / "vsfeel").string();
+        const std::string tmp =
+            (std::filesystem::temp_directory_path(ec) / "vsfeel").string();
         if (ec || !usable(tmp)) {
             return {};
         }
@@ -140,6 +150,8 @@ static std::string pipeline_cache_path_for(const VkPhysicalDeviceProperties & pr
 // string without leading digits leaves them all zero.
 static std::array<uint32_t, 3> version_components() {
     std::array<uint32_t, 3> parts { 0, 0, 0 };
+    // The version string is ours; a component that does not parse stays zero.
+    // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion)
     std::sscanf(VSFEEL_VERSION, "%u.%u.%u", &parts[0], &parts[1], &parts[2]);
     return parts;
 }
@@ -161,11 +173,13 @@ static bool device_extension_present(const VSVulkanFunctions * vk,
                                      VkPhysicalDevice physical,
                                      const char * name) {
     uint32_t count = 0;
-    if (vk->vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr) != VK_SUCCESS) {
+    if (vk->vkEnumerateDeviceExtensionProperties(physical, nullptr, &count,
+                                                 nullptr) != VK_SUCCESS) {
         return false;
     }
     std::vector<VkExtensionProperties> props(count);
-    if (vk->vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, props.data()) != VK_SUCCESS) {
+    if (vk->vkEnumerateDeviceExtensionProperties(physical, nullptr, &count,
+                                                 props.data()) != VK_SUCCESS) {
         return false;
     }
     for (const auto & p : props) {
@@ -180,7 +194,8 @@ static bool device_extension_present(const VSVulkanFunctions * vk,
 // through the core's dispatch table. The VkPipelineCache object is the plugin's
 // own: the GPU API exposes no cache of the core's, and compiling from SPIR-V is
 // seconds per spec-constant variant on RADV.
-static void load_gpu_pipeline_cache(GPUDevice & dev, const VkPhysicalDeviceProperties & props) {
+static void load_gpu_pipeline_cache(GPUDevice & dev,
+                                    const VkPhysicalDeviceProperties & props) {
     dev.pipeline_cache_path = pipeline_cache_path_for(props);
     if (dev.pipeline_cache_path.empty()) {
         return;
@@ -195,7 +210,8 @@ static void load_gpu_pipeline_cache(GPUDevice & dev, const VkPhysicalDevicePrope
                 const long size = std::ftell(f);
                 if (size > 0 && std::fseek(f, 0, SEEK_SET) == 0) {
                     initial.resize(static_cast<size_t>(size));
-                    if (std::fread(initial.data(), 1, initial.size(), f) != initial.size()) {
+                    if (std::fread(initial.data(), 1, initial.size(), f) !=
+                        initial.size()) {
                         initial.clear();
                     }
                 }
@@ -211,15 +227,18 @@ static void load_gpu_pipeline_cache(GPUDevice & dev, const VkPhysicalDevicePrope
     info.initialDataSize = initial.size();
     info.pInitialData = initial.empty() ? nullptr : initial.data();
 
-    VkResult result = dev.vk->vkCreatePipelineCache(dev.device, &info, nullptr, &dev.pipeline_cache);
+    VkResult result = dev.vk->vkCreatePipelineCache(dev.device, &info, nullptr,
+                                                    &dev.pipeline_cache);
     if (result != VK_SUCCESS && !initial.empty()) {
         if (vsfeel_debug_enabled()) {
-            fprintf(stderr, "[vsfeel] pipeline cache rejected (%s), starting empty\n",
-                vk_result_string(result));
+            fprintf(stderr,
+                    "[vsfeel] pipeline cache rejected (%s), starting empty\n",
+                    vk_result_string(result));
         }
         info.initialDataSize = 0;
         info.pInitialData = nullptr;
-        result = dev.vk->vkCreatePipelineCache(dev.device, &info, nullptr, &dev.pipeline_cache);
+        result = dev.vk->vkCreatePipelineCache(dev.device, &info, nullptr,
+                                               &dev.pipeline_cache);
     }
     if (result != VK_SUCCESS) {
         dev.pipeline_cache = VK_NULL_HANDLE;
@@ -228,7 +247,7 @@ static void load_gpu_pipeline_cache(GPUDevice & dev, const VkPhysicalDevicePrope
     }
     if (vsfeel_debug_enabled()) {
         fprintf(stderr, "[vsfeel] pipeline cache %s (%zu B loaded)\n",
-            dev.pipeline_cache_path.c_str(), initial.size());
+                dev.pipeline_cache_path.c_str(), initial.size());
     }
 }
 
@@ -239,19 +258,22 @@ static void load_gpu_pipeline_cache(GPUDevice & dev, const VkPhysicalDevicePrope
 static std::atomic<uint64_t> g_pipeline_cache_save_seq { 0 };
 
 static void save_gpu_pipeline_cache(GPUDevice & dev) {
-    if (dev.pipeline_cache == VK_NULL_HANDLE || dev.pipeline_cache_path.empty()) {
+    if (dev.pipeline_cache == VK_NULL_HANDLE ||
+        dev.pipeline_cache_path.empty()) {
         return;
     }
     try {
         std::lock_guard lock(*dev.pipeline_cache_lock);
 
         size_t size = 0;
-        if (dev.vk->vkGetPipelineCacheData(dev.device, dev.pipeline_cache, &size, nullptr) != VK_SUCCESS ||
+        if (dev.vk->vkGetPipelineCacheData(dev.device, dev.pipeline_cache,
+                                           &size, nullptr) != VK_SUCCESS ||
             size == 0) {
             return;
         }
         std::vector<uint8_t> data(size);
-        if (dev.vk->vkGetPipelineCacheData(dev.device, dev.pipeline_cache, &size, data.data()) != VK_SUCCESS) {
+        if (dev.vk->vkGetPipelineCacheData(dev.device, dev.pipeline_cache,
+                                           &size, data.data()) != VK_SUCCESS) {
             return;
         }
         data.resize(size);
@@ -259,18 +281,22 @@ static void save_gpu_pipeline_cache(GPUDevice & dev) {
         if (const size_t slash = dev.pipeline_cache_path.find_last_of('/');
             slash != std::string::npos) {
             std::error_code ec;
-            std::filesystem::create_directories(dev.pipeline_cache_path.substr(0, slash), ec);
+            std::filesystem::create_directories(
+                dev.pipeline_cache_path.substr(0, slash), ec);
         }
 
-        const std::string tmp_path = dev.pipeline_cache_path + "." +
+        const std::string tmp_path =
+            dev.pipeline_cache_path + "." +
             std::to_string(static_cast<unsigned long>(process_id())) + "." +
-            std::to_string(g_pipeline_cache_save_seq.fetch_add(1, std::memory_order_relaxed)) +
+            std::to_string(g_pipeline_cache_save_seq.fetch_add(
+                1, std::memory_order_relaxed)) +
             ".tmp";
         FILE * f = std::fopen(tmp_path.c_str(), "wb");
         if (f == nullptr) {
             return;
         }
-        const bool written = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+        const bool written =
+            std::fwrite(data.data(), 1, data.size(), f) == data.size();
         std::fclose(f);
         if (!written) {
             std::remove(tmp_path.c_str());
@@ -281,7 +307,7 @@ static void save_gpu_pipeline_cache(GPUDevice & dev) {
         if (ec) {
             std::remove(tmp_path.c_str());
         }
-    } catch (...) {
+    } catch (...) { // NOLINT(bugprone-empty-catch)
         // Runs from ~GPUDevice, which is implicitly noexcept: a failed save is
         // a cache miss on the next process, never a terminate.
     }
@@ -299,8 +325,8 @@ GPUDevice::~GPUDevice() {
     pipeline_cache_lock = nullptr;
 }
 
-std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
-    VSCore * core, const VSAPI * vsapi) {
+std::variant<std::shared_ptr<GPUDevice>, std::string>
+get_gpu_device(VSCore * core, const VSAPI * vsapi) {
 
     const VSVULKANAPI * api = vsapi->getVulkanAPI();
     if (api == nullptr) {
@@ -313,13 +339,15 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     if (api->getVulkanHandles(core, &handles, err, sizeof(err))) {
         return std::string(err);
     }
-    const VSVulkanFunctions * vk = api->getVulkanFunctions(core, err, sizeof(err));
+    const VSVulkanFunctions * vk =
+        api->getVulkanFunctions(core, err, sizeof(err));
     if (vk == nullptr) {
         return std::string(err);
     }
 
     std::lock_guard lock(g_gpu_lock);
-    if (auto it = g_gpu_devices.find(handles.device); it != g_gpu_devices.end()) {
+    if (auto it = g_gpu_devices.find(handles.device);
+        it != g_gpu_devices.end()) {
         if (auto live = it->second.lock()) {
             return live;
         }
@@ -345,11 +373,13 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     }
 
     VkPhysicalDevicePushDescriptorProperties push_desc {};
-    push_desc.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES;
+    push_desc.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES;
     VkPhysicalDeviceSubgroupProperties subgroup {};
     subgroup.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
     VkPhysicalDeviceSubgroupSizeControlProperties size_control {};
-    size_control.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
+    size_control.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
     // Chain push_desc off size_control: assigning subgroup.pNext twice dropped
     // it, so maxPushDescriptors stayed at its default and the query was dead.
     size_control.pNext = &push_desc;
@@ -363,7 +393,8 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     dev->subgroup_size = subgroup.subgroupSize;
     dev->min_subgroup_size = size_control.minSubgroupSize;
     dev->max_subgroup_size = size_control.maxSubgroupSize;
-    dev->max_compute_workgroup_subgroups = size_control.maxComputeWorkgroupSubgroups;
+    dev->max_compute_workgroup_subgroups =
+        size_control.maxComputeWorkgroupSubgroups;
     dev->subgroup_size_stages = size_control.requiredSubgroupSizeStages;
     dev->subgroup_ops = subgroup.supportedOperations;
     if (push_desc.maxPushDescriptors > 0) {
@@ -377,66 +408,80 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     // be exercised on a GPU that has room for everything (a build for a 16 KiB /
     // 128-invocation device is otherwise untestable here). They only ever clamp
     // down, so a real limit is never raised.
-    if (const int cap = env_int("VSFEEL_LIMIT_SHARED_MEMORY", 0); cap > 0 &&
+    if (const int cap = env_int("VSFEEL_LIMIT_SHARED_MEMORY", 0);
+        cap > 0 &&
         static_cast<uint32_t>(cap) < dev->limits.maxComputeSharedMemorySize) {
         dev->limits.maxComputeSharedMemorySize = static_cast<uint32_t>(cap);
     }
-    if (const int cap = env_int("VSFEEL_LIMIT_INVOCATIONS", 0); cap > 0 &&
-        static_cast<uint32_t>(cap) < dev->limits.maxComputeWorkGroupInvocations) {
+    if (const int cap = env_int("VSFEEL_LIMIT_INVOCATIONS", 0);
+        cap > 0 && static_cast<uint32_t>(cap) <
+                       dev->limits.maxComputeWorkGroupInvocations) {
         dev->limits.maxComputeWorkGroupInvocations = static_cast<uint32_t>(cap);
     }
     // The grid dims matter on real hardware too: this box reports 2^32-1 in X but
     // exactly 65535 in Y, which is what the dispatch folds are sized against.
-    if (const int cap = env_int("VSFEEL_LIMIT_GRID_X", 0); cap > 0 &&
+    if (const int cap = env_int("VSFEEL_LIMIT_GRID_X", 0);
+        cap > 0 &&
         static_cast<uint32_t>(cap) < dev->limits.maxComputeWorkGroupCount[0]) {
         dev->limits.maxComputeWorkGroupCount[0] = static_cast<uint32_t>(cap);
     }
-    if (const int cap = env_int("VSFEEL_LIMIT_GRID_Y", 0); cap > 0 &&
+    if (const int cap = env_int("VSFEEL_LIMIT_GRID_Y", 0);
+        cap > 0 &&
         static_cast<uint32_t>(cap) < dev->limits.maxComputeWorkGroupCount[1]) {
         dev->limits.maxComputeWorkGroupCount[1] = static_cast<uint32_t>(cap);
     }
-    if (const int cap = env_int("VSFEEL_LIMIT_GRID_Z", 0); cap > 0 &&
+    if (const int cap = env_int("VSFEEL_LIMIT_GRID_Z", 0);
+        cap > 0 &&
         static_cast<uint32_t>(cap) < dev->limits.maxComputeWorkGroupCount[2]) {
         dev->limits.maxComputeWorkGroupCount[2] = static_cast<uint32_t>(cap);
     }
-    if (const int cap = env_int("VSFEEL_LIMIT_STORAGE_RANGE", 0); cap > 0 &&
+    if (const int cap = env_int("VSFEEL_LIMIT_STORAGE_RANGE", 0);
+        cap > 0 &&
         static_cast<uint32_t>(cap) < dev->limits.maxStorageBufferRange) {
         dev->limits.maxStorageBufferRange = static_cast<uint32_t>(cap);
     }
-    if (const int cap = env_int("VSFEEL_LIMIT_PUSH_DESCRIPTORS", 0); cap > 0 &&
-        static_cast<uint32_t>(cap) < dev->max_push_descriptors) {
+    if (const int cap = env_int("VSFEEL_LIMIT_PUSH_DESCRIPTORS", 0);
+        cap > 0 && static_cast<uint32_t>(cap) < dev->max_push_descriptors) {
         dev->max_push_descriptors = static_cast<uint32_t>(cap);
     }
     // AND the required-size stage mask down, so a device whose mask omits
     // COMPUTE can be exercised without one. >= 0 rather than > 0: clearing it
     // to 0 is the interesting case.
-    if (const int mask = env_int("VSFEEL_LIMIT_SUBGROUP_STAGES", -1); mask >= 0) {
+    if (const int mask = env_int("VSFEEL_LIMIT_SUBGROUP_STAGES", -1);
+        mask >= 0) {
         dev->subgroup_size_stages &= static_cast<VkShaderStageFlags>(mask);
     }
 
     uint32_t families = 0;
-    vk->vkGetPhysicalDeviceQueueFamilyProperties2(handles.physicalDevice, &families, nullptr);
+    vk->vkGetPhysicalDeviceQueueFamilyProperties2(handles.physicalDevice,
+                                                  &families, nullptr);
     std::vector<VkQueueFamilyProperties2> family_props(families);
     for (auto & f : family_props) {
         f.sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2;
     }
-    vk->vkGetPhysicalDeviceQueueFamilyProperties2(handles.physicalDevice, &families, family_props.data());
+    vk->vkGetPhysicalDeviceQueueFamilyProperties2(
+        handles.physicalDevice, &families, family_props.data());
     if (handles.computeQueueFamily < families) {
         dev->timestamp_valid_bits =
-            family_props[handles.computeQueueFamily].queueFamilyProperties.timestampValidBits;
+            family_props[handles.computeQueueFamily]
+                .queueFamilyProperties.timestampValidBits;
     }
 
     // The atomic-float features the aggregation kernels ask about; they ride
     // the 1.2/1.3 feature chain the query below populates.
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float {};
-    atomic_float.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+    atomic_float.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
     VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT atomic_float2 {};
-    atomic_float2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT;
+    atomic_float2.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT;
     // A feature struct of an unsupported extension must not be chained.
-    const bool has_atomic_float = device_extension_present(vk, handles.physicalDevice,
-        VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
-    const bool has_atomic_float2 = has_atomic_float && device_extension_present(vk,
-        handles.physicalDevice, VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME);
+    const bool has_atomic_float = device_extension_present(
+        vk, handles.physicalDevice, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+    const bool has_atomic_float2 =
+        has_atomic_float &&
+        device_extension_present(vk, handles.physicalDevice,
+                                 VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME);
     void * feature_tail = nullptr;
     if (has_atomic_float2) {
         feature_tail = &atomic_float2;
@@ -468,8 +513,8 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     // without the add. The core enables the atomic-float extension pair only
     // when the device offers both, with the bits it reports, so the extension
     // pair presence plus that bit is what the created device actually has.
-    dev->feat_atomic_float32_add = has_atomic_float2 &&
-        atomic_float.shaderBufferFloat32AtomicAdd;
+    dev->feat_atomic_float32_add =
+        has_atomic_float2 && atomic_float.shaderBufferFloat32AtomicAdd;
 
     load_gpu_pipeline_cache(*dev, props.properties);
 
@@ -477,34 +522,44 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
         const VkPhysicalDeviceProperties & p = props.properties;
         // One banner per device: enough to tell which build, GPU, driver and
         // cache file a run is actually using.
-        fprintf(stderr,
+        fprintf(
+            stderr,
             "[vsfeel] version=%s commit=%s device: %s (Vulkan %u.%u, driver %u.%u.%u)\n",
-            VSFEEL_VERSION, VSFEEL_COMMIT,
-            p.deviceName,
-            VK_API_VERSION_MAJOR(dev->api_version), VK_API_VERSION_MINOR(dev->api_version),
-            VK_API_VERSION_MAJOR(p.driverVersion), VK_API_VERSION_MINOR(p.driverVersion),
+            VSFEEL_VERSION, VSFEEL_COMMIT, p.deviceName,
+            VK_API_VERSION_MAJOR(dev->api_version),
+            VK_API_VERSION_MINOR(dev->api_version),
+            VK_API_VERSION_MAJOR(p.driverVersion),
+            VK_API_VERSION_MINOR(p.driverVersion),
             VK_API_VERSION_PATCH(p.driverVersion));
-        fprintf(stderr, "[vsfeel] queue family %u (timestamps=%u), subgroup %u [%u..%u] "
-                        "ops=0x%x maxWorkgroupSubgroups=%u (control=%d full=%d stages=0x%x)\n",
+        fprintf(
+            stderr,
+            "[vsfeel] queue family %u (timestamps=%u), subgroup %u [%u..%u] "
+            "ops=0x%x maxWorkgroupSubgroups=%u (control=%d full=%d stages=0x%x)\n",
             dev->queue_family, dev->timestamp_valid_bits, dev->subgroup_size,
             dev->min_subgroup_size, dev->max_subgroup_size,
             static_cast<unsigned>(dev->subgroup_ops),
             dev->max_compute_workgroup_subgroups, dev->subgroup_size_control,
-            dev->compute_full_subgroups, static_cast<unsigned>(dev->subgroup_size_stages));
-        fprintf(stderr, "[vsfeel] compute limits: invocations=%u, size=%ux%ux%u, "
-                        "shared=%u bytes, groups=%ux%ux%u, storageRange=%llu, "
-                        "pushDescriptors=%u\n",
+            dev->compute_full_subgroups,
+            static_cast<unsigned>(dev->subgroup_size_stages));
+        fprintf(
+            stderr,
+            "[vsfeel] compute limits: invocations=%u, size=%ux%ux%u, "
+            "shared=%u bytes, groups=%ux%ux%u, storageRange=%llu, "
+            "pushDescriptors=%u\n",
             dev->limits.maxComputeWorkGroupInvocations,
-            dev->limits.maxComputeWorkGroupSize[0], dev->limits.maxComputeWorkGroupSize[1],
-            dev->limits.maxComputeWorkGroupSize[2], dev->limits.maxComputeSharedMemorySize,
-            dev->limits.maxComputeWorkGroupCount[0], dev->limits.maxComputeWorkGroupCount[1],
+            dev->limits.maxComputeWorkGroupSize[0],
+            dev->limits.maxComputeWorkGroupSize[1],
+            dev->limits.maxComputeWorkGroupSize[2],
+            dev->limits.maxComputeSharedMemorySize,
+            dev->limits.maxComputeWorkGroupCount[0],
+            dev->limits.maxComputeWorkGroupCount[1],
             dev->limits.maxComputeWorkGroupCount[2],
             static_cast<unsigned long long>(dev->limits.maxStorageBufferRange),
             dev->max_push_descriptors);
         fprintf(stderr, "[vsfeel] transfer queue family %u index %u\n",
-            handles.transferQueueFamily, handles.transferQueueIndex);
+                handles.transferQueueFamily, handles.transferQueueIndex);
         fprintf(stderr, "[vsfeel] optional features: float32AtomicAdd=%d\n",
-            dev->feat_atomic_float32_add);
+                dev->feat_atomic_float32_add);
     }
 
     // insert_or_assign, not emplace: the lookup above falls through on an
@@ -523,23 +578,23 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
 // from Python as well as from the VSFEEL_DEBUG banner (which also prints the
 // commit -- the version can come from a packaging build untrusted by design,
 // the commit cannot).
-static void VS_CC versionReport(const VSMap *, VSMap * out, void *, VSCore *, const VSAPI * vsapi) {
+static void VS_CC versionReport(const VSMap *, VSMap * out, void *, VSCore *,
+                                const VSAPI * vsapi) {
     vsapi->mapSetData(out, "version", VSFEEL_VERSION,
-        static_cast<int>(std::strlen(VSFEEL_VERSION)), dtUtf8, 0);
+                      static_cast<int>(std::strlen(VSFEEL_VERSION)), dtUtf8, 0);
 }
 
 VS_EXTERNAL_API(void)
-VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
+VapourSynthPluginInit2(VSPlugin * plugin, const VSPLUGINAPI * vspapi) {
     const auto version = version_components();
-    vspapi->configPlugin(
-        "com.thefeeltrain.vsfeel",
-        "vsfeel",
-        "GPU-accelerated VapourSynth filters (Vulkan)",
-        VS_MAKE_VERSION(static_cast<int>(version[0]), static_cast<int>(version[1])),
-        VAPOURSYNTH_API_VERSION, 0, plugin
-    );
+    vspapi->configPlugin("com.thefeeltrain.vsfeel", "vsfeel",
+                         "GPU-accelerated VapourSynth filters (Vulkan)",
+                         VS_MAKE_VERSION(static_cast<int>(version[0]),
+                                         static_cast<int>(version[1])),
+                         VAPOURSYNTH_API_VERSION, 0, plugin);
 
-    vspapi->registerFunction("Version", "", "version:data;", versionReport, nullptr, plugin);
+    vspapi->registerFunction("Version", "", "version:data;", versionReport,
+                             nullptr, plugin);
 
     vsfeel_register_bilateral(vspapi, plugin);
     vsfeel_register_bm3dv2(vspapi, plugin);

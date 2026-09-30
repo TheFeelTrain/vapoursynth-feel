@@ -46,12 +46,12 @@ constexpr int LARGE_R = 8;          // outputs per thread, large path
 constexpr int LARGE_THRESHOLD = 32; // radius <= 32 => fused small path
 
 struct GaussPlaneConfig {
-    int width {};         // visible pixels
+    int width {}; // visible pixels
     int height {};
-    int stride {};        // the core's plane pitch in elements
-    int ksize {};         // kernel taps
-    int radius {};        // ksize / 2
-    bool small {};        // fused small path vs two-pass large path
+    int stride {};            // the core's plane pitch in elements
+    int ksize {};             // kernel taps
+    int radius {};            // ksize / 2
+    bool small {};            // fused small path vs two-pass large path
     VkPipeline pipeline {};   // small path (gauss entry)
     VkPipeline v_pipeline {}; // large path vertical pass
     VkPipeline h_pipeline {}; // large path horizontal pass
@@ -93,11 +93,12 @@ struct GaussData {
         if (host_timing && ht_n.load()) {
             const double n = static_cast<double>(ht_n.load());
             fprintf(stderr,
-                "[gauss-timing] frames=%.0f per-frame us: acquire=%7.1f "
-                "record=%7.1f submit=%7.1f total=%7.1f\n",
-                n, ht_acquire_ns.load() / 1000.0 / n,
-                ht_record_ns.load() / 1000.0 / n,
-                ht_submit_ns.load() / 1000.0 / n, ht_total_ns.load() / 1000.0 / n);
+                    "[gauss-timing] frames=%.0f per-frame us: acquire=%7.1f "
+                    "record=%7.1f submit=%7.1f total=%7.1f\n",
+                    n, ht_acquire_ns.load() / 1000.0 / n,
+                    ht_record_ns.load() / 1000.0 / n,
+                    ht_submit_ns.load() / 1000.0 / n,
+                    ht_total_ns.load() / 1000.0 / n);
         }
         if (!gpu) {
             return;
@@ -112,9 +113,8 @@ struct GaussData {
         VkPipeline destroyed[9] {};
         int num_destroyed = 0;
         for (auto & plane : planes) {
-            const VkPipeline pipelines[3] {
-                plane.pipeline, plane.v_pipeline, plane.h_pipeline
-            };
+            const VkPipeline pipelines[3] { plane.pipeline, plane.v_pipeline,
+                                            plane.h_pipeline };
             for (VkPipeline p : pipelines) {
                 if (!p) {
                     continue;
@@ -154,7 +154,8 @@ static std::vector<float> get_gauss_kernel(float sigma) {
     }
 
     const int half_taps = taps / 2;
-    const float factor = 1.0f / (static_cast<float>(std::sqrt(2.0 * M_PI)) * sigma);
+    const float factor =
+        1.0f / (static_cast<float>(std::sqrt(2.0 * M_PI)) * sigma);
 
     std::vector<double> kernel;
     kernel.reserve(half_taps);
@@ -162,7 +163,7 @@ static std::vector<float> get_gauss_kernel(float sigma) {
         const double xd = static_cast<double>(x);
         const float denom = (2.0f * sigma) * sigma;
         const double value = static_cast<double>(factor) *
-            std::exp(-(xd * xd) / static_cast<double>(denom));
+                             std::exp(-(xd * xd) / static_cast<double>(denom));
         kernel.push_back(value);
     }
 
@@ -204,26 +205,28 @@ struct GaussSpecData {
     int32_t radius;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 5> spec_entries {{
+static constexpr std::array<VkSpecializationMapEntry, 5> spec_entries { {
     { 0, 0, sizeof(int32_t) },
     { 1, 4, sizeof(int32_t) },
     { 2, 8, sizeof(int32_t) },
     { 3, 12, sizeof(int32_t) },
     { 4, 16, sizeof(int32_t) },
-}};
+} };
 
-static std::variant<VkPipeline, std::string> create_pipeline(
-    const GPUDevice & gpu, VkPipelineLayout layout,
-    const uint32_t * code, size_t code_size, const GaussSpecData & spec,
-    size_t tile_bytes) {
+static std::variant<VkPipeline, std::string>
+create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
+                const uint32_t * code, size_t code_size,
+                const GaussSpecData & spec, size_t tile_bytes) {
 
     // All three kernels launch 16x8; only the fused small path declares the
     // `vblur` tile, whose bytes the caller computed for this config.
-    const GpuWorkgroup workgroup { .x = 16, .y = 8,
-        .shared_bytes = static_cast<uint32_t>(tile_bytes) };
-    return gpu_create_pipeline(gpu, code, code_size, layout, spec_entries.data(),
-        &spec, static_cast<uint32_t>(spec_entries.size()), sizeof(spec),
-        "gaussblur", 0, workgroup);
+    const GpuWorkgroup workgroup {
+        .x = 16, .y = 8, .shared_bytes = static_cast<uint32_t>(tile_bytes)
+    };
+    return gpu_create_pipeline(gpu, code, code_size, layout,
+                               spec_entries.data(), &spec,
+                               static_cast<uint32_t>(spec_entries.size()),
+                               sizeof(spec), "gaussblur", 0, workgroup);
 }
 
 // ---------------------------------------------------------------------------
@@ -232,9 +235,9 @@ static std::variant<VkPipeline, std::string> create_pipeline(
 
 // GPU input: the kernels read the source planes and write the output frame's
 // planes in place. The core owns every transfer.
-static const VSFrame * gauss_gpu_frame(
-    GaussData * d, int n, VSFrameContext * frameCtx, VSCore * core,
-    const VSAPI * vsapi) {
+static const VSFrame * gauss_gpu_frame(GaussData * d, int n,
+                                       VSFrameContext * frameCtx, VSCore * core,
+                                       const VSAPI * vsapi) {
 
     const int numPlanes = d->vi->format.numPlanes;
     const VSFrame * src = vsapi->getFrameFilter(n, d->node, frameCtx);
@@ -248,19 +251,18 @@ static const VSFrame * gauss_gpu_frame(
         all_process &= d->process[p];
     }
     const int pl[] = { 0, 1, 2 };
-    const VSFrame * fr[] = {
-        d->process[0] ? nullptr : src,
-        d->process[1] ? nullptr : src,
-        d->process[2] ? nullptr : src
-    };
-    VSFrame * dst = all_process
-        ? d->gpu->api->newGPUVideoFrame(&d->vi->format, d->vi->width,
-              d->vi->height, src, core)
-        : vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height,
-              fr, pl, src, core);
+    const VSFrame * fr[] = { d->process[0] ? nullptr : src,
+                             d->process[1] ? nullptr : src,
+                             d->process[2] ? nullptr : src };
+    VSFrame * dst =
+        all_process
+            ? d->gpu->api->newGPUVideoFrame(&d->vi->format, d->vi->width,
+                                            d->vi->height, src, core)
+            : vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height,
+                                    fr, pl, src, core);
     if (!dst) {
-        vsfeel_trace_error("GaussBlur", n, "failed to allocate the output frame",
-                           d->gpu.get());
+        vsfeel_trace_error("GaussBlur", n,
+                           "failed to allocate the output frame", d->gpu.get());
         vsapi->setFilterError("GaussBlur: failed to allocate the output frame",
                               frameCtx);
         vsapi->freeFrame(src);
@@ -273,7 +275,8 @@ static const VSFrame * gauss_gpu_frame(
     vsfeel_trace_mark("acquire");
 
     char errbuf[512] {};
-    VSGPUExecContext * ctx = d->gpu->api->gpuExecAcquire(d->pool, errbuf, sizeof(errbuf));
+    VSGPUExecContext * ctx =
+        d->gpu->api->gpuExecAcquire(d->pool, errbuf, sizeof(errbuf));
     auto fail = [&](const std::string & message) -> const VSFrame * {
         if (ctx) {
             d->gpu->api->gpuExecAbandon(ctx);
@@ -316,31 +319,30 @@ static const VSFrame * gauss_gpu_frame(
 
         VSVulkanPlaneInfo sp {};
         if (d->gpu->api->getGPUPlane(src, p, &sp)) {
-            return fail("source plane " + std::to_string(p) + " is not GPU resident");
+            return fail("source plane " + std::to_string(p) +
+                        " is not GPU resident");
         }
         VSVulkanPlaneInfo dp {};
         if (d->gpu->api->getGPUPlane(dst, p, &dp)) {
-            return fail("output plane " + std::to_string(p) + " is not GPU resident");
+            return fail("output plane " + std::to_string(p) +
+                        " is not GPU resident");
         }
 
         // Binding 4 is the dword view of the destination (packed pair stores
         // of the horizontal pass). Without a two-pass plane there is no
         // scratch to bind, so the source stands in where no shader reads it.
-        const VkBuffer buffers[5] {
-            d->wt.buffer, sp.buffer, dp.buffer,
-            d->tmp_total > 0 ? tmp.buffer : sp.buffer, dp.buffer
-        };
+        const VkBuffer buffers[5] { d->wt.buffer, sp.buffer, dp.buffer,
+                                    d->tmp_total > 0 ? tmp.buffer : sp.buffer,
+                                    dp.buffer };
         gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 5);
 
         // Element offsets into the bound buffers: src and dst are whole plane
         // buffers now, so both bases are 0; only the scratch region and the
         // weights offset carry values.
-        const int32_t push[4] {
-            0, 0,
-            static_cast<int32_t>(cfg.tmp_elem),
-            static_cast<int32_t>(cfg.wt_base)
-        };
-        gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push, sizeof(push));
+        const int32_t push[4] { 0, 0, static_cast<int32_t>(cfg.tmp_elem),
+                                static_cast<int32_t>(cfg.wt_base) };
+        gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push,
+                           sizeof(push));
 
         if (cfg.small) {
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -371,8 +373,9 @@ static const VSFrame * gauss_gpu_frame(
 
     vsfeel_trace_mark("submit");
     uint64_t signaled = 0;
-    const int submit_error = d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf, sizeof(errbuf));
-    ctx = nullptr;  // consumed either way
+    const int submit_error =
+        d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf, sizeof(errbuf));
+    ctx = nullptr; // consumed either way
     if (submit_error) {
         return fail("submit failed: "s + errbuf);
     }
@@ -382,7 +385,8 @@ static const VSFrame * gauss_gpu_frame(
     if (d->host_timing) {
         const auto ns = [](auto a, auto b) {
             return static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                    .count());
         };
         d->ht_acquire_ns += ns(t0, t1);
         d->ht_record_ns += ns(t1, t2);
@@ -395,9 +399,11 @@ static const VSFrame * gauss_gpu_frame(
     return dst;
 }
 
-static const VSFrame *VS_CC GaussGetFrame(
-    int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData,
-    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+static const VSFrame * VS_CC GaussGetFrame(int n, int activationReason,
+                                           void * instanceData,
+                                           [[maybe_unused]] void ** frameData,
+                                           VSFrameContext * frameCtx,
+                                           VSCore * core, const VSAPI * vsapi) {
 
     GaussData * d = static_cast<GaussData *>(instanceData);
 
@@ -416,8 +422,8 @@ static const VSFrame *VS_CC GaussGetFrame(
 // Creation
 // ---------------------------------------------------------------------------
 
-static void VS_CC GaussFree(
-    void *instanceData, [[maybe_unused]] VSCore *core, const VSAPI *vsapi) {
+static void VS_CC GaussFree(void * instanceData, [[maybe_unused]] VSCore * core,
+                            const VSAPI * vsapi) {
 
     GaussData * d = static_cast<GaussData *>(instanceData);
 
@@ -426,9 +432,9 @@ static void VS_CC GaussFree(
     delete d;
 }
 
-static void VS_CC GaussCreate(
-    const VSMap *in, VSMap *out, [[maybe_unused]] void *userData,
-    VSCore *core, const VSAPI *vsapi) {
+static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
+                              [[maybe_unused]] void * userData, VSCore * core,
+                              const VSAPI * vsapi) {
 
     auto d { std::make_unique<GaussData>() };
 
@@ -451,8 +457,10 @@ static void VS_CC GaussCreate(
                           (fmt.sampleType == stInteger && bits == 16);
     if (!vsh::isConstantVideoFormat(d->vi) || !depth_ok || d->vi->width <= 0 ||
         d->vi->height <= 0 ||
-        (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV && fmt.colorFamily != cfRGB)) {
-        return set_error("input bitdepth must be 16 (integer) or 32 (float), Gray/YUV/RGB.");
+        (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV &&
+         fmt.colorFamily != cfRGB)) {
+        return set_error(
+            "input bitdepth must be 16 (integer) or 32 (float), Gray/YUV/RGB.");
     }
 
     d->bits = bits;
@@ -465,15 +473,18 @@ static void VS_CC GaussCreate(
     // (computed in double, then narrowed); plane 2 = plane 1
     const int subW = fmt.subSamplingW;
     const int subH = fmt.subSamplingH;
-    std::array<float, 3> sigma;
+    std::array<float, 3> sigma {};
     for (int i = 0; i < std::ssize(sigma); ++i) {
-        sigma[i] = static_cast<float>(vsapi->mapGetFloat(in, "sigma", i, &error));
+        sigma[i] =
+            static_cast<float>(vsapi->mapGetFloat(in, "sigma", i, &error));
         if (error) {
             if (i == 0) {
                 sigma[i] = 0.5f;
             } else if (i == 1) {
-                const double sub_factor = std::sqrt(static_cast<double>((1 << subH) * (1 << subW)));
-                sigma[i] = static_cast<float>(static_cast<double>(sigma[0]) / sub_factor);
+                const double sub_factor =
+                    std::sqrt(static_cast<double>((1 << subH) * (1 << subW)));
+                sigma[i] = static_cast<float>(static_cast<double>(sigma[0]) /
+                                              sub_factor);
             } else {
                 sigma[i] = sigma[i - 1];
             }
@@ -488,7 +499,8 @@ static void VS_CC GaussCreate(
         any_process |= d->process[i];
     }
     if (!any_process) {
-        return set_error("all planes have sigma < FLT_EPSILON (nothing to process).");
+        return set_error(
+            "all planes have sigma < FLT_EPSILON (nothing to process).");
     }
 
     {
@@ -505,13 +517,15 @@ static void VS_CC GaussCreate(
     // guessed from an alignment rule.
     int plane_stride[3] {};
     {
-        VSFrame * probe = vsapi->newVideoFrame(&fmt, d->vi->width, d->vi->height,
-                                               nullptr, core);
+        VSFrame * probe = vsapi->newVideoFrame(&fmt, d->vi->width,
+                                               d->vi->height, nullptr, core);
         if (probe == nullptr) {
-            return set_error("could not allocate a probe frame to read the plane stride");
+            return set_error(
+                "could not allocate a probe frame to read the plane stride");
         }
         for (int p = 0; p < fmt.numPlanes; ++p) {
-            plane_stride[p] = static_cast<int>(vsapi->getStride(probe, p) / d->elem_bytes);
+            plane_stride[p] =
+                static_cast<int>(vsapi->getStride(probe, p) / d->elem_bytes);
         }
         vsapi->freeFrame(probe);
     }
@@ -538,19 +552,23 @@ static void VS_CC GaussCreate(
             continue;
         }
 
-        const int plane_width = (plane == 0) ? d->vi->width : d->vi->width >> subW;
-        const int plane_height = (plane == 0) ? d->vi->height : d->vi->height >> subH;
+        const int plane_width =
+            (plane == 0) ? d->vi->width : d->vi->width >> subW;
+        const int plane_height =
+            (plane == 0) ? d->vi->height : d->vi->height >> subH;
         const int stride = plane_stride[plane];
 
         // The kernel addresses the plane through signed 32-bit element
         // offsets; reject a plane whose last element would not fit rather than
         // letting it wrap and read outside the buffer.
-        const int64_t last = static_cast<int64_t>(plane_height - 1) * stride + plane_width - 1;
+        const int64_t last =
+            static_cast<int64_t>(plane_height - 1) * stride + plane_width - 1;
         if (last > INT32_MAX) {
-            return set_error("plane " + std::to_string(plane) + " is too large: " +
-                std::to_string(plane_width) + "x" + std::to_string(plane_height) +
-                " at stride " + std::to_string(stride) +
-                " overflows the kernel's 32-bit addressing");
+            return set_error("plane " + std::to_string(plane) +
+                             " is too large: " + std::to_string(plane_width) +
+                             "x" + std::to_string(plane_height) +
+                             " at stride " + std::to_string(stride) +
+                             " overflows the kernel's 32-bit addressing");
         }
 
         const ConfigKey key { plane_width, plane_height, stride, sigma[plane] };
@@ -563,13 +581,15 @@ static void VS_CC GaussCreate(
         }
         if (ci == std::ssize(keys)) {
             if (key.sigma > static_cast<float>(std::min(key.w, key.h))) {
-                return set_error("sigma too large for plane (radius >= dimension).");
+                return set_error(
+                    "sigma too large for plane (radius >= dimension).");
             }
             auto kernel = get_gauss_kernel(key.sigma);
             const int ksize = static_cast<int>(kernel.size());
             const int radius = ksize / 2;
             if (radius > key.w - 1 || radius > key.h - 1) {
-                return set_error("sigma too large for plane (radius >= dimension).");
+                return set_error(
+                    "sigma too large for plane (radius >= dimension).");
             }
             keys.push_back(key);
             weights.push_back(std::move(kernel));
@@ -589,17 +609,19 @@ static void VS_CC GaussCreate(
     // cap that used to sit beside it never bound anything. The static_assert is
     // what keeps that claim true: raise LARGE_THRESHOLD or the block and the
     // build stops instead of silently falling back to the two-pass path.
-    static_assert(VRT * BLK_Y * (BLK_X + 2 * LARGE_THRESHOLD) *
-                  static_cast<int>(sizeof(float)) <= 16384,
+    static_assert(
+        VRT * BLK_Y * (BLK_X + 2 * LARGE_THRESHOLD) *
+                static_cast<int>(sizeof(float)) <=
+            16384,
         "the fused small path must fit the guaranteed workgroup memory");
     std::array<bool, 3> cfg_small {};
     for (int ci = 0; ci < n_cfg; ++ci) {
         const int ksize = static_cast<int>(weights[ci].size());
         const int radius = ksize / 2;
-        const size_t tile_bytes =
-            static_cast<size_t>(VRT) * BLK_Y * (BLK_X + 2 * radius) * sizeof(float);
+        const size_t tile_bytes = static_cast<size_t>(VRT) * BLK_Y *
+                                  (BLK_X + 2 * radius) * sizeof(float);
         cfg_small[ci] = radius <= LARGE_THRESHOLD &&
-            tile_bytes <= d->gpu->limits.maxComputeSharedMemorySize;
+                        tile_bytes <= d->gpu->limits.maxComputeSharedMemorySize;
     }
 
     // Push descriptor layout: one whole-buffer binding per shader buffer, so
@@ -613,8 +635,8 @@ static void VS_CC GaussCreate(
         d->set_layout = std::get<VkDescriptorSetLayout>(result);
     }
     {
-        const auto result = gpu_pipeline_layout(*d->gpu, d->set_layout,
-            4 * sizeof(int32_t));
+        const auto result =
+            gpu_pipeline_layout(*d->gpu, d->set_layout, 4 * sizeof(int32_t));
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -630,8 +652,9 @@ static void VS_CC GaussCreate(
         wt_bytes = std::max<VkDeviceSize>(wt_bytes, 4);
 
         auto e = gpu_make_buffer(*d->gpu, core, wt_bytes, d->wt,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (!e.empty()) {
             return set_error("weights buffer: " + e);
         }
@@ -642,7 +665,7 @@ static void VS_CC GaussCreate(
         uint32_t wt_base = 0;
         for (int ci = 0; ci < n_cfg; ++ci) {
             std::memcpy(map + wt_base, weights[ci].data(),
-                weights[ci].size() * sizeof(float));
+                        weights[ci].size() * sizeof(float));
             wt_base += static_cast<uint32_t>(weights[ci].size());
         }
         // The buffer may have landed in the host-visible VRAM BAR, whose
@@ -659,16 +682,22 @@ static void VS_CC GaussCreate(
     const uint32_t * horiz_code = nullptr;
     size_t horiz_size = 0;
     switch (d->bits) {
-        case 16:
-            gauss_code = gaussblur_16_gauss_spv;  gauss_size = gaussblur_16_gauss_spv_size;
-            vert_code = gaussblur_16_vert_spv;    vert_size = gaussblur_16_vert_spv_size;
-            horiz_code = gaussblur_16_horiz_spv;  horiz_size = gaussblur_16_horiz_spv_size;
-            break;
-        default:
-            gauss_code = gaussblur_32_gauss_spv;  gauss_size = gaussblur_32_gauss_spv_size;
-            vert_code = gaussblur_32_vert_spv;    vert_size = gaussblur_32_vert_spv_size;
-            horiz_code = gaussblur_32_horiz_spv;  horiz_size = gaussblur_32_horiz_spv_size;
-            break;
+    case 16:
+        gauss_code = gaussblur_16_gauss_spv;
+        gauss_size = gaussblur_16_gauss_spv_size;
+        vert_code = gaussblur_16_vert_spv;
+        vert_size = gaussblur_16_vert_spv_size;
+        horiz_code = gaussblur_16_horiz_spv;
+        horiz_size = gaussblur_16_horiz_spv_size;
+        break;
+    default:
+        gauss_code = gaussblur_32_gauss_spv;
+        gauss_size = gaussblur_32_gauss_spv_size;
+        vert_code = gaussblur_32_vert_spv;
+        vert_size = gaussblur_32_vert_spv_size;
+        horiz_code = gaussblur_32_horiz_spv;
+        horiz_size = gaussblur_32_horiz_spv_size;
+        break;
     }
 
     const uint32_t max_grid_x = d->gpu->limits.maxComputeWorkGroupCount[0];
@@ -697,11 +726,11 @@ static void VS_CC GaussCreate(
             const VkDeviceSize bytes =
                 static_cast<VkDeviceSize>(pkey.h) * pkey.stride * sizeof(float);
             const VkDeviceSize off = align32(tmp_total);
-            const int64_t last_tmp =
-                static_cast<int64_t>(off / 4) +
-                static_cast<int64_t>(pkey.h) * pkey.stride;
+            const int64_t last_tmp = static_cast<int64_t>(off / 4) +
+                                     static_cast<int64_t>(pkey.h) * pkey.stride;
             if (last_tmp > INT32_MAX) {
-                return set_error("plane " + std::to_string(plane) +
+                return set_error(
+                    "plane " + std::to_string(plane) +
                     " two-pass scratch overflows the kernel's 32-bit addressing");
             }
             plane_tmp_elem = off / 4;
@@ -755,9 +784,10 @@ static void VS_CC GaussCreate(
                 return std::nullopt;
             }
             return "plane " + std::to_string(plane) + "'s " + what +
-                " needs a " + std::to_string(gx) + "x" + std::to_string(gy) +
-                " workgroup grid, more than this device can dispatch (" +
-                std::to_string(max_grid_x) + "x" + std::to_string(max_grid_y) + ")";
+                   " needs a " + std::to_string(gx) + "x" + std::to_string(gy) +
+                   " workgroup grid, more than this device can dispatch (" +
+                   std::to_string(max_grid_x) + "x" +
+                   std::to_string(max_grid_y) + ")";
         };
         if (cfg.small) {
             if (auto e = over(small_x, small_y, "fused pass")) {
@@ -781,19 +811,18 @@ static void VS_CC GaussCreate(
         cfg.wt_base = wt_running;
         wt_running += static_cast<uint32_t>(weights[ci].size());
 
-        const GaussSpecData spec {
-            .width = cfg.width,
-            .height = cfg.height,
-            .stride = cfg.stride,
-            .ksize = cfg.ksize,
-            .radius = cfg.radius
-        };
+        const GaussSpecData spec { .width = cfg.width,
+                                   .height = cfg.height,
+                                   .stride = cfg.stride,
+                                   .ksize = cfg.ksize,
+                                   .radius = cfg.radius };
 
         if (cfg.small) {
             const size_t tile_bytes = static_cast<size_t>(VRT) * BLK_Y *
-                (BLK_X + 2 * radius) * sizeof(float);
-            const auto result = create_pipeline(
-                *d->gpu, d->pipeline_layout, gauss_code, gauss_size, spec, tile_bytes);
+                                      (BLK_X + 2 * radius) * sizeof(float);
+            const auto result =
+                create_pipeline(*d->gpu, d->pipeline_layout, gauss_code,
+                                gauss_size, spec, tile_bytes);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -808,8 +837,9 @@ static void VS_CC GaussCreate(
                 cfg.v_pipeline = std::get<VkPipeline>(result);
             }
             {
-                const auto result = create_pipeline(
-                    *d->gpu, d->pipeline_layout, horiz_code, horiz_size, spec, 0);
+                const auto result =
+                    create_pipeline(*d->gpu, d->pipeline_layout, horiz_code,
+                                    horiz_size, spec, 0);
                 if (std::holds_alternative<std::string>(result)) {
                     return set_error(std::get<std::string>(result));
                 }
@@ -821,7 +851,8 @@ static void VS_CC GaussCreate(
 
     {
         char err[512] {};
-        d->pool = d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
+        d->pool =
+            d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
         if (d->pool == nullptr) {
             return set_error("createGPUExecPool failed: "s + err);
         }
@@ -831,15 +862,14 @@ static void VS_CC GaussCreate(
 
     // A spatial filter, so the strict-spatial request pattern is the honest
     // declaration.
-    VSFilterDependency deps[1] = {{ data->node, rpStrictSpatial }};
+    VSFilterDependency deps[1] = { { data->node, rpStrictSpatial } };
 
     // ffGPUOutput: the frames this filter returns live in VRAM and carry their
     // own producer pairs, so the core never downloads them for a consumer that
     // does not need host pixels.
     VSNode * result = vsapi->createVideoFilterEx2(
-        "GaussBlur", data->vi,
-        GaussGetFrame, GaussFree,
-        fmParallel, ffGPUOutput, deps, 1, data, core);
+        "GaussBlur", data->vi, GaussGetFrame, GaussFree, fmParallel,
+        ffGPUOutput, deps, 1, data, core);
     if (result == nullptr) {
         vsapi->mapSetError(out, "GaussBlur: filter creation failed");
         return;
@@ -852,13 +882,10 @@ static void VS_CC GaussCreate(
 // ---------------------------------------------------------------------------
 
 void vsfeel_register_gaussblur(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
-    vspapi->registerFunction(
-        "GaussBlur",
-        "clip:vnode:gpu;"
-        "sigma:float[]:opt;"
-        "device_id:int:opt;"
-        "num_streams:int:opt;",
-        "clip:vnode:gpu;",
-        GaussCreate, nullptr, plugin
-    );
+    vspapi->registerFunction("GaussBlur",
+                             "clip:vnode:gpu;"
+                             "sigma:float[]:opt;"
+                             "device_id:int:opt;"
+                             "num_streams:int:opt;",
+                             "clip:vnode:gpu;", GaussCreate, nullptr, plugin);
 }

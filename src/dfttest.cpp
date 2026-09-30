@@ -39,7 +39,7 @@ using namespace std::string_literals;
 //   col2im:  overlap-adds the windowed blocks straight into the output plane
 // ---------------------------------------------------------------------------
 
-constexpr int BS = 16;              // spatial block size (sbsize, fixed)
+constexpr int BS = 16; // spatial block size (sbsize, fixed)
 
 // ---------------------------------------------------------------------------
 // Host-side window / sigma table math (ported from vszipcu dfttest.zig)
@@ -68,32 +68,48 @@ static double getWindowValue(double location, int size, int mode, double beta) {
     const double size_f = static_cast<double>(size);
     const double temp = std::numbers::pi * location / size_f;
     switch (mode) {
-        case 0: return 0.5 * (1.0 - std::cos(2.0 * temp));
-        case 1: return 0.53836 - 0.46164 * std::cos(2.0 * temp);
-        case 2: return 0.42 - 0.5 * std::cos(2.0 * temp) + 0.08 * std::cos(4.0 * temp);
-        case 3: return 0.35875 - 0.48829 * std::cos(2.0 * temp) + 0.14128 * std::cos(4.0 * temp)
-                - 0.01168 * std::cos(6.0 * temp);
-        case 4: {
-            const double v = 2.0 * location / size_f - 1.0;
-            return besselI0(std::numbers::pi * beta * std::sqrt(1.0 - v * v)) /
-                   besselI0(std::numbers::pi * beta);
-        }
-        case 5: return 0.27105140069342415
-                - 0.433297939234486060 * std::cos(2.0 * temp)
-                + 0.218122999543110620 * std::cos(4.0 * temp)
-                - 0.065925446388030898 * std::cos(6.0 * temp)
-                + 0.010811742098372268 * std::cos(8.0 * temp)
-                - 7.7658482522509342e-4 * std::cos(10.0 * temp)
-                + 1.3887217350903198e-5 * std::cos(12.0 * temp);
-        case 6: return 0.2810639 - 0.5208972 * std::cos(2.0 * temp) + 0.1980399 * std::cos(4.0 * temp);
-        case 7: return 1.0;
-        case 8: return 1.0 - 2.0 * std::abs(location - size_f / 2.0) / size_f;
-        case 9: return 0.62 - 0.48 * (location / size_f - 0.5) - 0.38 * std::cos(2.0 * temp);
-        case 10: return 0.355768 - 0.487396 * std::cos(2.0 * temp) + 0.144232 * std::cos(4.0 * temp)
-                 - 0.012604 * std::cos(6.0 * temp);
-        case 11: return 0.3635819 - 0.4891775 * std::cos(2.0 * temp) + 0.1365995 * std::cos(4.0 * temp)
-                 - 0.0106411 * std::cos(6.0 * temp);
-        default: return 0.0;
+    case 0:
+        return 0.5 * (1.0 - std::cos(2.0 * temp));
+    case 1:
+        return 0.53836 - 0.46164 * std::cos(2.0 * temp);
+    case 2:
+        return 0.42 - 0.5 * std::cos(2.0 * temp) + 0.08 * std::cos(4.0 * temp);
+    case 3:
+        return 0.35875 - 0.48829 * std::cos(2.0 * temp) +
+               0.14128 * std::cos(4.0 * temp) - 0.01168 * std::cos(6.0 * temp);
+    case 4: {
+        const double v = 2.0 * location / size_f - 1.0;
+        return besselI0(std::numbers::pi * beta * std::sqrt(1.0 - v * v)) /
+               besselI0(std::numbers::pi * beta);
+    }
+    case 5:
+        return 0.27105140069342415 -
+               0.433297939234486060 * std::cos(2.0 * temp) +
+               0.218122999543110620 * std::cos(4.0 * temp) -
+               0.065925446388030898 * std::cos(6.0 * temp) +
+               0.010811742098372268 * std::cos(8.0 * temp) -
+               7.7658482522509342e-4 * std::cos(10.0 * temp) +
+               1.3887217350903198e-5 * std::cos(12.0 * temp);
+    case 6:
+        return 0.2810639 - 0.5208972 * std::cos(2.0 * temp) +
+               0.1980399 * std::cos(4.0 * temp);
+    case 7:
+        return 1.0;
+    case 8:
+        return 1.0 - 2.0 * std::abs(location - size_f / 2.0) / size_f;
+    case 9:
+        return 0.62 - 0.48 * (location / size_f - 0.5) -
+               0.38 * std::cos(2.0 * temp);
+    case 10:
+        return 0.355768 - 0.487396 * std::cos(2.0 * temp) +
+               0.144232 * std::cos(4.0 * temp) -
+               0.012604 * std::cos(6.0 * temp);
+    case 11:
+        return 0.3635819 - 0.4891775 * std::cos(2.0 * temp) +
+               0.1365995 * std::cos(4.0 * temp) -
+               0.0106411 * std::cos(6.0 * temp);
+    default:
+        return 0.0;
     }
 }
 
@@ -113,24 +129,27 @@ static void normalizeWindow(double * window, int size, int step) {
     }
 }
 
-static std::vector<double> getWindow(
-    int radius, int block_step, int swin, double sbeta, int twin, double tbeta) {
+static std::vector<double> getWindow(int radius, int block_step, int swin,
+                                     double sbeta, int twin, double tbeta) {
 
     const int tw = 2 * radius + 1;
 
     double temporal[7] {};
     for (int i = 0; i < tw; ++i) {
-        temporal[i] = getWindowValue(static_cast<double>(i) + 0.5, tw, twin, tbeta);
+        temporal[i] =
+            getWindowValue(static_cast<double>(i) + 0.5, tw, twin, tbeta);
     }
 
     double spatial[16] {};
     for (int i = 0; i < 16; ++i) {
-        spatial[i] = getWindowValue(static_cast<double>(i) + 0.5, BS, swin, sbeta);
+        spatial[i] =
+            getWindowValue(static_cast<double>(i) + 0.5, BS, swin, sbeta);
     }
     normalizeWindow(spatial, BS, block_step);
 
     std::vector<double> window(static_cast<size_t>(tw) * 256);
-    const double div = std::sqrt(static_cast<double>(tw)) * static_cast<double>(BS);
+    const double div =
+        std::sqrt(static_cast<double>(tw)) * static_cast<double>(BS);
     size_t idx = 0;
     for (int t = 0; t < tw; ++t) {
         for (int s1 = 0; s1 < 16; ++s1) {
@@ -189,7 +208,8 @@ static double fsum(const double * values, size_t n) {
             break;
         }
     }
-    if (k > 0 && ((lo < 0.0 && partials[k - 1] < 0.0) || (lo > 0.0 && partials[k - 1] > 0.0))) {
+    if (k > 0 && ((lo < 0.0 && partials[k - 1] < 0.0) ||
+                  (lo > 0.0 && partials[k - 1] > 0.0))) {
         const double y2 = lo * 2.0;
         const double x2 = hi + y2;
         if (y2 == x2 - hi) {
@@ -203,12 +223,14 @@ struct Complex {
     double re, im;
 };
 
-static void dftReal(Complex * dst, size_t dst_stride, const double * src, size_t src_stride, int n) {
+static void dftReal(Complex * dst, size_t dst_stride, const double * src,
+                    size_t src_stride, int n) {
     const int out_num = n / 2 + 1;
     for (int i = 0; i < out_num; ++i) {
         Complex sum {};
         for (int j = 0; j < n; ++j) {
-            const double imag = static_cast<double>(-2 * i * j) * std::numbers::pi / static_cast<double>(n);
+            const double imag = static_cast<double>(-2 * i * j) *
+                                std::numbers::pi / static_cast<double>(n);
             const double s = src[static_cast<size_t>(j) * src_stride];
             sum.re += s * std::cos(imag);
             sum.im += s * std::sin(imag);
@@ -222,7 +244,8 @@ static void dftCplx(Complex * dst, const Complex * src, int n, size_t stride) {
     for (int i = 0; i < n; ++i) {
         Complex sum {};
         for (int j = 0; j < n; ++j) {
-            const double imag = static_cast<double>(-2 * i * j) * std::numbers::pi / static_cast<double>(n);
+            const double imag = static_cast<double>(-2 * i * j) *
+                                std::numbers::pi / static_cast<double>(n);
             const double wre = std::cos(imag);
             const double wim = std::sin(imag);
             const Complex & s = src[static_cast<size_t>(j) * stride];
@@ -237,8 +260,9 @@ static void dftCplx(Complex * dst, const Complex * src, int n, size_t stride) {
 }
 
 // 3D real DFT of the (tw x 16 x 16) window; returns tw*16*9 complex pairs.
-static std::vector<double> rdftTables(int radius, const std::vector<double> & input) {
-    const size_t tw = static_cast<size_t>(2 * radius + 1);
+static std::vector<double> rdftTables(int radius,
+                                      const std::vector<double> & input) {
+    const size_t tw = 2 * static_cast<size_t>(radius) + 1;
     const size_t cols = 9;
     const size_t csize = tw * 16 * cols;
 
@@ -265,11 +289,13 @@ static std::vector<double> rdftTables(int radius, const std::vector<double> & in
     }
     for (size_t i = 0; i < tw; ++i) {
         for (size_t j = 0; j < cols; ++j) {
-            dftCplx(output2.data() + i * 16 * cols + j, output.data() + i * 16 * cols + j, BS, cols);
+            dftCplx(output2.data() + i * 16 * cols + j,
+                    output.data() + i * 16 * cols + j, BS, cols);
         }
     }
     for (size_t i = 0; i < 16 * cols; ++i) {
-        dftCplx(output.data() + i, output2.data() + i, static_cast<int>(tw), 16 * cols);
+        dftCplx(output.data() + i, output2.data() + i, static_cast<int>(tw),
+                16 * cols);
     }
     std::vector<double> ret(csize * 2);
     for (size_t i = 0; i < csize; ++i) {
@@ -283,9 +309,12 @@ enum class Norm { identity, sqrt, cbrt };
 
 static double applyNorm(Norm n, double x) {
     switch (n) {
-        case Norm::identity: return x;
-        case Norm::sqrt: return std::sqrt(x);
-        case Norm::cbrt: return std::pow(x, 1.0 / 3.0);
+    case Norm::identity:
+        return x;
+    case Norm::sqrt:
+        return std::sqrt(x);
+    case Norm::cbrt:
+        return std::pow(x, 1.0 / 3.0);
     }
     return x;
 }
@@ -349,12 +378,14 @@ static double getLocation(int position, int length) {
     }
     const int half = length / 2;
     if (position > half) {
-        return static_cast<double>(length - position) / static_cast<double>(half);
+        return static_cast<double>(length - position) /
+               static_cast<double>(half);
     }
     return static_cast<double>(position) / static_cast<double>(half);
 }
 
-static std::optional<double> getSigma(int position, int length, const SigmaFunc & func) {
+static std::optional<double> getSigma(int position, int length,
+                                      const SigmaFunc & func) {
     if (length == 1) {
         return 1.0;
     }
@@ -367,7 +398,8 @@ static std::optional<double> getSigma(int position, int length, const SigmaFunc 
 
 static int calcPadSize(int size, int block_step) {
     const int rem = size % BS;
-    return size + (rem != 0 ? BS - rem : 0) + std::max(BS - block_step, block_step) * 2;
+    return size + (rem != 0 ? BS - rem : 0) +
+           std::max(BS - block_step, block_step) * 2;
 }
 
 static int calcPadNum(int size, int block_step) {
@@ -387,13 +419,13 @@ static int calcPadNum(int size, int block_step) {
 // frame cache and no filter-owned semaphore: one exec pool, one submission.
 
 struct DftPlaneConfig {
-    int width {};                   // frame plane pixels
+    int width {}; // frame plane pixels
     int height {};
-    int pw {};                      // padded dims
+    int pw {}; // padded dims
     int ph {};
-    int num_blocks {};              // block grid
-    VkDeviceSize padded_bytes {};   // tw * pw * ph * bytes
-    VkDeviceSize spatial_bytes {};  // num_blocks * 256 floats
+    int num_blocks {};             // block grid
+    VkDeviceSize padded_bytes {};  // tw * pw * ph * bytes
+    VkDeviceSize spatial_bytes {}; // num_blocks * 256 floats
 };
 
 // The push constants narrow every pitch to int32, and the creation-time
@@ -401,7 +433,8 @@ struct DftPlaneConfig {
 // the pitches it actually reads and writes (source pitches are not probed at
 // creation at all).
 static bool dft_offsets_fit(const DftPlaneConfig & cfg, int stride) {
-    return static_cast<int64_t>(cfg.height - 1) * stride + cfg.width - 1 <= INT32_MAX;
+    return static_cast<int64_t>(cfg.height - 1) * stride + cfg.width - 1 <=
+           INT32_MAX;
 }
 
 // Every offset pushed to the shader is int32; the per-plane buffers below are
@@ -451,11 +484,11 @@ struct DftData {
     int radius {}, block_step {}, filter_type {}, tw {};
     bool zmean {};
     bool sigma_is_scalar { true };
-    float sigma_scalar {};          // scaled by wscale when ftype < 2
+    float sigma_scalar {}; // scaled by wscale when ftype < 2
     float sigma2 {};
     float pmin {};
     float pmax {};
-    float beta {};                  // f0beta (unscaled)
+    float beta {}; // f0beta (unscaled)
 
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
@@ -466,8 +499,8 @@ struct DftData {
 
     // shared constant buffer: window, then window_freq, then the sigma array
     GpuBuffer wt;
-    int32_t wf_base {};             // float offset of window_freq (-1 if !zmean)
-    int32_t sigma_base {};          // float offset of sigma array (-1 if scalar)
+    int32_t wf_base {};    // float offset of window_freq (-1 if !zmean)
+    int32_t sigma_base {}; // float offset of sigma array (-1 if scalar)
 
     std::array<DftPlaneConfig, 3> planes {};
     VSGPUExecPool * pool {};
@@ -490,11 +523,12 @@ struct DftData {
         if (host_timing && ht_n.load()) {
             const double n = static_cast<double>(ht_n.load());
             fprintf(stderr,
-                "[dfttest-timing] frames=%.0f per-frame us: acquire=%7.1f "
-                "record=%7.1f submit=%7.1f total=%7.1f\n",
-                n, ht_acquire_ns.load() / 1000.0 / n,
-                ht_record_ns.load() / 1000.0 / n,
-                ht_submit_ns.load() / 1000.0 / n, ht_total_ns.load() / 1000.0 / n);
+                    "[dfttest-timing] frames=%.0f per-frame us: acquire=%7.1f "
+                    "record=%7.1f submit=%7.1f total=%7.1f\n",
+                    n, ht_acquire_ns.load() / 1000.0 / n,
+                    ht_record_ns.load() / 1000.0 / n,
+                    ht_submit_ns.load() / 1000.0 / n,
+                    ht_total_ns.load() / 1000.0 / n);
         }
         if (!gpu) {
             return;
@@ -542,8 +576,10 @@ struct DftData {
 // GPU is tuned for. The pad/col2im kernels do not use subgroups but are given
 // the same required size, so the count the device limits, subgroups per
 // workgroup, is read off the largest of the three launches.
-constexpr GpuWorkgroup kFusedWorkgroup { .x = 8 * 16,   // SUB_BLOCKS * 16
-    .shared_bytes = (8 * 288 + 8) * 4 };                // trans[SUB_BLOCKS*TR_SUB] + s_gf
+constexpr GpuWorkgroup kFusedWorkgroup {
+    .x = 8 * 16, // SUB_BLOCKS * 16
+    .shared_bytes = (8 * 288 + 8) * 4
+}; // trans[SUB_BLOCKS*TR_SUB] + s_gf
 constexpr GpuWorkgroup kPadWorkgroup { .x = 32, .y = 8 };
 
 // The fused kernel's variant is baked in as specialization constants so the
@@ -551,10 +587,10 @@ constexpr GpuWorkgroup kPadWorkgroup { .x = 32, .y = 8 };
 // compile-time `#if FILTER_TYPE` selection. The env overrides exist so a probe
 // run can force a subgroup size (or deliberately request an invalid one and
 // watch the driver reject it).
-static std::variant<VkPipeline, std::string> create_pipeline(
-    const GPUDevice & gpu, VkPipelineLayout layout, const uint32_t * code,
-    size_t code_size, GpuWorkgroup workgroup, int32_t filter_type = -1,
-    int32_t zmean = -1) {
+static std::variant<VkPipeline, std::string>
+create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
+                const uint32_t * code, size_t code_size, GpuWorkgroup workgroup,
+                int32_t filter_type = -1, int32_t zmean = -1) {
 
     // The probe knobs win over the default selection below on purpose: they
     // exist so a run can force a subgroup size, or deliberately request one the
@@ -569,16 +605,18 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     // subgroups: a silent race the subgroup barrier cannot order.
     uint32_t subgroup_size = 0;
     if (forced_invalid) {
-        subgroup_size = 17;   // invalid on purpose, to test driver validation
+        subgroup_size = 17; // invalid on purpose, to test driver validation
     } else if (forced_sgsize > 0) {
         subgroup_size = static_cast<uint32_t>(forced_sgsize);
     } else if (gpu.has_subgroup_size(32, kPadWorkgroup.invocations())) {
         subgroup_size = 32;
     } else if (gpu.subgroup_size % 16 != 0) {
-        return std::string("dfttest's fused kernel needs a subgroup size that is "
-            "a multiple of 16 lanes (16-lane tiles share data across a subgroup "
-            "barrier); this device's default is ") +
-            std::to_string(gpu.subgroup_size) + ", and it cannot be asked for another";
+        return std::string(
+                   "dfttest's fused kernel needs a subgroup size that is "
+                   "a multiple of 16 lanes (16-lane tiles share data across a subgroup "
+                   "barrier); this device's default is ") +
+               std::to_string(gpu.subgroup_size) +
+               ", and it cannot be asked for another";
     }
 
     // Build the spec-constant map from an explicit (id, value) list so the
@@ -588,22 +626,26 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     uint32_t n_spec = 0;
     if (filter_type >= 0) {
         spec_entries[n_spec] = { .constantID = 1,
-            .offset = static_cast<uint32_t>(n_spec * sizeof(int32_t)),
-            .size = sizeof(int32_t) };
+                                 .offset = static_cast<uint32_t>(
+                                     n_spec * sizeof(int32_t)),
+                                 .size = sizeof(int32_t) };
         spec_values[n_spec] = filter_type;
         ++n_spec;
     }
     if (zmean >= 0) {
         spec_entries[n_spec] = { .constantID = 2,
-            .offset = static_cast<uint32_t>(n_spec * sizeof(int32_t)),
-            .size = sizeof(int32_t) };
+                                 .offset = static_cast<uint32_t>(
+                                     n_spec * sizeof(int32_t)),
+                                 .size = sizeof(int32_t) };
         spec_values[n_spec] = zmean;
         ++n_spec;
     }
 
-    return gpu_create_pipeline(gpu, code, code_size, layout,
-        n_spec ? spec_entries : nullptr, n_spec ? spec_values : nullptr,
-        n_spec, n_spec * sizeof(int32_t), "dfttest", subgroup_size, workgroup);}
+    return gpu_create_pipeline(
+        gpu, code, code_size, layout, n_spec ? spec_entries : nullptr,
+        n_spec ? spec_values : nullptr, n_spec, n_spec * sizeof(int32_t),
+        "dfttest", subgroup_size, workgroup);
+}
 
 static bool dfttest_trace() {
     static const bool v = vsfeel_debug_trace("VSFEEL_DFTTEST_TRACE");
@@ -633,9 +675,9 @@ static DftPushConstants base_pc(const DftData & d) {
 // GPU input, GPU output: the kernels read the core's source frame planes
 // directly (pad) and write the output frame plane (col2im). The core owns
 // every transfer.
-static const VSFrame * dft_gpu_frame(
-    DftData * d, int n, VSFrameContext * frameCtx, VSCore * core,
-    const VSAPI * vsapi) {
+static const VSFrame * dft_gpu_frame(DftData * d, int n,
+                                     VSFrameContext * frameCtx, VSCore * core,
+                                     const VSAPI * vsapi) {
 
     const int numPlanes = d->vi->format.numPlanes;
     const int tw = d->tw;
@@ -660,20 +702,20 @@ static const VSFrame * dft_gpu_frame(
     // newVideoFrame2 infers residency from the plane sources, so a frame with no
     // source plane at all has to come from newGPUVideoFrame.
     const int pl[] = { 0, 1, 2 };
-    const VSFrame * fr[] = {
-        d->process[0] ? nullptr : center,
-        d->process[1] ? nullptr : center,
-        d->process[2] ? nullptr : center
-    };
-    VSFrame * dst = all_process
-        ? d->gpu->api->newGPUVideoFrame(&d->vi->format, d->vi->width,
-              d->vi->height, center, core)
-        : vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height,
-              fr, pl, center, core);
+    const VSFrame * fr[] = { d->process[0] ? nullptr : center,
+                             d->process[1] ? nullptr : center,
+                             d->process[2] ? nullptr : center };
+    VSFrame * dst =
+        all_process
+            ? d->gpu->api->newGPUVideoFrame(&d->vi->format, d->vi->width,
+                                            d->vi->height, center, core)
+            : vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height,
+                                    fr, pl, center, core);
     if (!dst) {
         vsfeel_trace_error("DFTTest", n, "failed to allocate the output frame",
                            d->gpu.get());
-        vsapi->setFilterError("DFTTest: failed to allocate the output frame", frameCtx);
+        vsapi->setFilterError("DFTTest: failed to allocate the output frame",
+                              frameCtx);
         for (int t = 0; t < tw; ++t) {
             vsapi->freeFrame(src[t]);
         }
@@ -686,7 +728,8 @@ static const VSFrame * dft_gpu_frame(
     vsfeel_trace_mark("acquire");
 
     char errbuf[512] {};
-    VSGPUExecContext * ctx = d->gpu->api->gpuExecAcquire(d->pool, errbuf, sizeof(errbuf));
+    VSGPUExecContext * ctx =
+        d->gpu->api->gpuExecAcquire(d->pool, errbuf, sizeof(errbuf));
     auto fail = [&](const std::string & message) -> const VSFrame * {
         if (ctx) {
             d->gpu->api->gpuExecAbandon(ctx);
@@ -710,7 +753,7 @@ static const VSFrame * dft_gpu_frame(
     VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
     const VkPhysicalDeviceLimits & lim = d->gpu->limits;
     const bool gputrace = d->gpu_trace && n == d->gpu_trace_frame &&
-        d->probe.armed.exchange(1) == 0;
+                          d->probe.armed.exchange(1) == 0;
     int probe_plane = -1;
     if (gputrace) {
         for (int p = 0; p < numPlanes && probe_plane < 0; ++p) {
@@ -719,8 +762,8 @@ static const VSFrame * dft_gpu_frame(
             }
         }
         d->gpu->vk->vkCmdResetQueryPool(cmd, d->probe.query, 0, 4);
-        d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-            d->probe.query, 0);
+        d->gpu->vk->vkCmdWriteTimestamp2(
+            cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, d->probe.query, 0);
     }
 
     for (int plane = 0; plane < numPlanes; ++plane) {
@@ -733,34 +776,44 @@ static const VSFrame * dft_gpu_frame(
         // buffer. Both are handed to the context, which recycles them once the
         // submission completes (the pool's size buckets make this cheap).
         GpuBuffer padded {}, spatial {};
-        if (auto e = gpu_frame_buffer(*d->gpu, core, ctx, cfg.padded_bytes, padded);
+        if (auto e =
+                gpu_frame_buffer(*d->gpu, core, ctx, cfg.padded_bytes, padded);
             !e.empty()) {
             return fail("padded buffer: " + e);
         }
-        if (auto e = gpu_frame_buffer(*d->gpu, core, ctx, cfg.spatial_bytes, spatial);
+        if (auto e = gpu_frame_buffer(*d->gpu, core, ctx, cfg.spatial_bytes,
+                                      spatial);
             !e.empty()) {
             return fail("spatial buffer: " + e);
         }
 
         VSVulkanPlaneInfo dst_plane {};
         if (d->gpu->api->getGPUPlane(dst, plane, &dst_plane)) {
-            return fail("output plane " + std::to_string(plane) + " is not GPU resident");
+            return fail("output plane " + std::to_string(plane) +
+                        " is not GPU resident");
         }
-        const int dst_stride = static_cast<int>(
-            vsapi->getStride(dst, plane) / d->elem_bytes);
+        const int dst_stride =
+            static_cast<int>(vsapi->getStride(dst, plane) / d->elem_bytes);
         if (!dft_offsets_fit(cfg, dst_stride)) {
             return fail("plane " + std::to_string(plane) + " output pitch " +
-                std::to_string(dst_stride) + " overflows the kernel's 32-bit addressing");
+                        std::to_string(dst_stride) +
+                        " overflows the kernel's 32-bit addressing");
         }
 
         // pad and col2im both walk the padded plane, so they share a grid
-        const uint32_t plane_gx = std::max(std::min<uint32_t>(
-            (static_cast<uint32_t>(cfg.pw) + 31u) / 32u, lim.maxComputeWorkGroupCount[0]), 1u);
-        const uint32_t plane_gy = std::max(std::min<uint32_t>(
-            (static_cast<uint32_t>(cfg.ph) + 7u) / 8u, lim.maxComputeWorkGroupCount[1]), 1u);
+        const uint32_t plane_gx = std::max(
+            std::min<uint32_t>((static_cast<uint32_t>(cfg.pw) + 31u) / 32u,
+                               lim.maxComputeWorkGroupCount[0]),
+            1u);
+        const uint32_t plane_gy = std::max(
+            std::min<uint32_t>((static_cast<uint32_t>(cfg.ph) + 7u) / 8u,
+                               lim.maxComputeWorkGroupCount[1]),
+            1u);
         const uint32_t blocks = static_cast<uint32_t>(cfg.num_blocks);
-        const uint32_t fused_gx = std::max(std::min<uint32_t>(
-            (blocks + 7u) / 8u, lim.maxComputeWorkGroupCount[0]), 1u);
+        const uint32_t fused_gx =
+            std::max(std::min<uint32_t>((blocks + 7u) / 8u,
+                                        lim.maxComputeWorkGroupCount[0]),
+                     1u);
 
         // pad: one dispatch per temporal slice, reading its own source frame
         // plane (so the temporal offset lives in the buffer bound at binding 3,
@@ -772,10 +825,9 @@ static const VSFrame * dft_gpu_frame(
                 return fail("source plane " + std::to_string(plane) +
                             " is not GPU resident");
             }
-            const VkBuffer buffers[5] {
-                d->wt.buffer, padded.buffer, spatial.buffer,
-                sp.buffer, dst_plane.buffer
-            };
+            const VkBuffer buffers[5] { d->wt.buffer, padded.buffer,
+                                        spatial.buffer, sp.buffer,
+                                        dst_plane.buffer };
             DftPushConstants pc = base_pc(*d);
             pc.pad_t0 = t;
             pc.width = cfg.width;
@@ -783,21 +835,23 @@ static const VSFrame * dft_gpu_frame(
             const int src_stride = static_cast<int>(
                 vsapi->getStride(src[t], plane) / d->elem_bytes);
             if (!dft_offsets_fit(cfg, src_stride)) {
-                return fail("plane " + std::to_string(plane) + " source pitch " +
-                    std::to_string(src_stride) + " overflows the kernel's 32-bit addressing");
+                return fail("plane " + std::to_string(plane) +
+                            " source pitch " + std::to_string(src_stride) +
+                            " overflows the kernel's 32-bit addressing");
             }
             pc.src_stride = src_stride;
             pc.dst_stride = dst_stride;
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                d->pad_pipeline);
+                                          d->pad_pipeline);
             gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 5);
-            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc, sizeof(pc));
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc,
+                               sizeof(pc));
             d->gpu->vk->vkCmdDispatch(cmd, plane_gx, plane_gy, 1);
         }
         gpu_barrier(*d->gpu, cmd);
         if (gputrace && plane == probe_plane) {
-            d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
-                d->probe.query, 1);
+            d->gpu->vk->vkCmdWriteTimestamp2(
+                cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->probe.query, 1);
         }
 
         // fused: im2col + spatial/temporal DFT + filter + inverse, writing the
@@ -809,10 +863,9 @@ static const VSFrame * dft_gpu_frame(
                 return fail("center plane " + std::to_string(plane) +
                             " is not GPU resident");
             }
-            const VkBuffer buffers[5] {
-                d->wt.buffer, padded.buffer, spatial.buffer,
-                sp.buffer, dst_plane.buffer
-            };
+            const VkBuffer buffers[5] { d->wt.buffer, padded.buffer,
+                                        spatial.buffer, sp.buffer,
+                                        dst_plane.buffer };
             DftPushConstants pc = base_pc(*d);
             pc.width = cfg.width;
             pc.height = cfg.height;
@@ -820,24 +873,24 @@ static const VSFrame * dft_gpu_frame(
                 vsapi->getStride(center, plane) / d->elem_bytes);
             pc.dst_stride = dst_stride;
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                d->fused_pipeline[d->radius]);
+                                          d->fused_pipeline[d->radius]);
             gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 5);
-            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc, sizeof(pc));
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc,
+                               sizeof(pc));
             d->gpu->vk->vkCmdDispatch(cmd, fused_gx, 1, 1);
         }
         gpu_barrier(*d->gpu, cmd);
         if (gputrace && plane == probe_plane) {
-            d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
-                d->probe.query, 2);
+            d->gpu->vk->vkCmdWriteTimestamp2(
+                cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->probe.query, 2);
         }
 
         // col2im: overlap-add the windowed blocks straight into the output plane
         vsfeel_trace_mark("col2im");
         {
-            const VkBuffer buffers[5] {
-                d->wt.buffer, padded.buffer, spatial.buffer,
-                padded.buffer, dst_plane.buffer
-            };
+            const VkBuffer buffers[5] { d->wt.buffer, padded.buffer,
+                                        spatial.buffer, padded.buffer,
+                                        dst_plane.buffer };
             DftPushConstants pc = base_pc(*d);
             pc.width = cfg.width;
             pc.height = cfg.height;
@@ -845,19 +898,20 @@ static const VSFrame * dft_gpu_frame(
                 vsapi->getStride(center, plane) / d->elem_bytes);
             pc.dst_stride = dst_stride;
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                d->col2im_pipeline);
+                                          d->col2im_pipeline);
             gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 5);
-            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc, sizeof(pc));
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc,
+                               sizeof(pc));
             d->gpu->vk->vkCmdDispatch(cmd, plane_gx, plane_gy, 1);
         }
         if (gputrace && plane == probe_plane) {
-            d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
-                d->probe.query, 3);
+            d->gpu->vk->vkCmdWriteTimestamp2(
+                cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->probe.query, 3);
         }
     }
     if (gputrace) {
-        d->gpu->vk->vkCmdCopyQueryPoolResults(cmd, d->probe.query, 0, 4,
-            d->probe.buf.buffer, 0, sizeof(uint64_t),
+        d->gpu->vk->vkCmdCopyQueryPoolResults(
+            cmd, d->probe.query, 0, 4, d->probe.buf.buffer, 0, sizeof(uint64_t),
             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     }
     auto t2 = d->host_timing ? std::chrono::steady_clock::now()
@@ -884,8 +938,9 @@ static const VSFrame * dft_gpu_frame(
 
     vsfeel_trace_mark("submit");
     uint64_t signaled = 0;
-    const int submit_error = d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf, sizeof(errbuf));
-    ctx = nullptr;  // consumed either way
+    const int submit_error =
+        d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf, sizeof(errbuf));
+    ctx = nullptr; // consumed either way
     if (submit_error) {
         return fail("submit failed: "s + errbuf);
     }
@@ -895,7 +950,8 @@ static const VSFrame * dft_gpu_frame(
     if (d->host_timing) {
         const auto ns = [](auto a, auto b) {
             return static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                    .count());
         };
         d->ht_acquire_ns += ns(t0, t1);
         d->ht_record_ns += ns(t1, t2);
@@ -912,13 +968,15 @@ static const VSFrame * dft_gpu_frame(
         // One-shot probe: wait this submission out so the query results are
         // final, then read the mapped copy the command buffer made.
         char perr[256] {};
-        if (d->gpu->api->gpuExecWaitValue(d->pool, signaled, perr, sizeof(perr)) == gdDrained) {
+        if (d->gpu->api->gpuExecWaitValue(d->pool, signaled, perr,
+                                          sizeof(perr)) == gdDrained) {
             const double period = lim.timestampPeriod;
             const auto us = [period](uint64_t a, uint64_t b) {
                 return static_cast<double>(b - a) * period / 1000.0;
             };
             const uint64_t * ts = d->probe.map;
-            fprintf(stderr,
+            fprintf(
+                stderr,
                 "[dfttest-gpu] n=%d pad=%.1fus fused=%.1fus col2im=%.1fus total=%.1fus\n",
                 n, us(ts[0], ts[1]), us(ts[1], ts[2]), us(ts[2], ts[3]),
                 us(ts[0], ts[3]));
@@ -934,9 +992,11 @@ static const VSFrame * dft_gpu_frame(
     return dst;
 }
 
-static const VSFrame *VS_CC DftGetFrame(
-    int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData,
-    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+static const VSFrame * VS_CC DftGetFrame(int n, int activationReason,
+                                         void * instanceData,
+                                         [[maybe_unused]] void ** frameData,
+                                         VSFrameContext * frameCtx,
+                                         VSCore * core, const VSAPI * vsapi) {
 
     DftData * d = static_cast<DftData *>(instanceData);
 
@@ -959,17 +1019,17 @@ static const VSFrame *VS_CC DftGetFrame(
 // Creation
 // ---------------------------------------------------------------------------
 
-static void VS_CC DftFree(
-    void *instanceData, [[maybe_unused]] VSCore *core, const VSAPI *vsapi) {
+static void VS_CC DftFree(void * instanceData, [[maybe_unused]] VSCore * core,
+                          const VSAPI * vsapi) {
 
     DftData * d = static_cast<DftData *>(instanceData);
     vsapi->freeNode(d->node);
     delete d;
 }
 
-static void VS_CC DftCreate(
-    const VSMap *in, VSMap *out, [[maybe_unused]] void *userData,
-    VSCore *core, const VSAPI *vsapi) {
+static void VS_CC DftCreate(const VSMap * in, VSMap * out,
+                            [[maybe_unused]] void * userData, VSCore * core,
+                            const VSAPI * vsapi) {
 
     auto d { std::make_unique<DftData>() };
 
@@ -992,8 +1052,10 @@ static void VS_CC DftCreate(
     const bool depth_ok = (fmt.sampleType == stFloat && bits == 32) ||
                           (fmt.sampleType == stInteger && bits == 16);
     if (!depth_ok || d->vi->width <= 0 || d->vi->height <= 0 ||
-        (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV && fmt.colorFamily != cfRGB)) {
-        return set_error("input must be 16 bit integer or 32 bit float, Gray/YUV/RGB, constant format.");
+        (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV &&
+         fmt.colorFamily != cfRGB)) {
+        return set_error(
+            "input must be 16 bit integer or 32 bit float, Gray/YUV/RGB, constant format.");
     }
     d->bits = bits;
     d->elem_bytes = bits / 8;
@@ -1022,7 +1084,8 @@ static void VS_CC DftCreate(
     if (error) {
         pmax = 500.0;
     }
-    if (!std::isfinite(sigma) || !std::isfinite(sigma2) || !std::isfinite(pmin) || !std::isfinite(pmax)) {
+    if (!std::isfinite(sigma) || !std::isfinite(sigma2) ||
+        !std::isfinite(pmin) || !std::isfinite(pmax)) {
         return set_error("sigma/sigma2/pmin/pmax must be finite.");
     }
 
@@ -1041,7 +1104,8 @@ static void VS_CC DftCreate(
         return set_error("sosize must be 0..15.");
     }
     if (sosize > 8 && sbsize % (sbsize - sosize) != 0) {
-        return set_error("spatial overlap > 50% requires that sbsize-sosize is a divisor of sbsize.");
+        return set_error(
+            "spatial overlap > 50% requires that sbsize-sosize is a divisor of sbsize.");
     }
     int tbsize = vsh::int64ToIntS(vsapi->mapGetInt(in, "tbsize", 0, &error));
     if (error) {
@@ -1051,7 +1115,8 @@ static void VS_CC DftCreate(
         return set_error("tbsize must be odd, 1..7 (temporal radius 0..3).");
     }
     if (tbsize % 2 == 0) {
-        return set_error("tbsize must be odd (dfttest2 silently aliases even values to tbsize-1).");
+        return set_error(
+            "tbsize must be odd (dfttest2 silently aliases even values to tbsize-1).");
     }
     int swin = vsh::int64ToIntS(vsapi->mapGetInt(in, "swin", 0, &error));
     if (error) {
@@ -1130,7 +1195,8 @@ static void VS_CC DftCreate(
     const int array_counts[4] { n_slocation, n_ssx, n_ssy, n_sst };
     for (int cnt : array_counts) {
         if (cnt != 0 && (cnt % 2 != 0 || cnt < 2)) {
-            return set_error("number of elements in slocation/ssx/ssy/sst must be a non-zero multiple of 2.");
+            return set_error(
+                "number of elements in slocation/ssx/ssy/sst must be a non-zero multiple of 2.");
         }
     }
 
@@ -1146,7 +1212,8 @@ static void VS_CC DftCreate(
     const int num_planes = fmt.numPlanes;
     if (vsapi->mapNumElements(in, "planes") > 0) {
         for (int i = 0; i < vsapi->mapNumElements(in, "planes"); ++i) {
-            const int idx = vsh::int64ToIntS(vsapi->mapGetInt(in, "planes", i, &error));
+            const int idx =
+                vsh::int64ToIntS(vsapi->mapGetInt(in, "planes", i, &error));
             if (idx < 0 || idx >= num_planes) {
                 return set_error("plane index out of range.");
             }
@@ -1188,34 +1255,40 @@ static void VS_CC DftCreate(
         cfg.pw = calcPadSize(cfg.width, d->block_step);
         cfg.ph = calcPadSize(cfg.height, d->block_step);
         cfg.num_blocks = calcPadNum(cfg.width, d->block_step) *
-            calcPadNum(cfg.height, d->block_step);
+                         calcPadNum(cfg.height, d->block_step);
 
         // single-fold reflect_pad requires pad <= dim-1
         const int ox = (cfg.pw - cfg.width) / 2;
         const int oy = (cfg.ph - cfg.height) / 2;
         if (ox > cfg.width - 1 || (cfg.pw - cfg.width - ox) > cfg.width - 1 ||
-            oy > cfg.height - 1 || (cfg.ph - cfg.height - oy) > cfg.height - 1) {
-            return set_error("a processed plane is too small for the padded block layout.");
+            oy > cfg.height - 1 ||
+            (cfg.ph - cfg.height - oy) > cfg.height - 1) {
+            return set_error(
+                "a processed plane is too small for the padded block layout.");
         }
 
-        const VkDeviceSize pad_elems = static_cast<VkDeviceSize>(cfg.pw) * cfg.ph;
+        const VkDeviceSize pad_elems =
+            static_cast<VkDeviceSize>(cfg.pw) * cfg.ph;
         const VkDeviceSize nblk = cfg.num_blocks;
-        cfg.padded_bytes = static_cast<VkDeviceSize>(d->tw) * pad_elems * d->elem_bytes;
+        cfg.padded_bytes =
+            static_cast<VkDeviceSize>(d->tw) * pad_elems * d->elem_bytes;
         cfg.spatial_bytes = nblk * 256 * sizeof(float);
 
         // Every region below is addressed by an int32 push constant, so bound
         // each per-plane region in the units the shader actually uses.
         if (d->tw * pad_elems >= (1ll << 31) ||
-            cfg.padded_bytes >= (1ll << 31) ||
-            nblk * 256 >= (1ll << 31)) {
-            return set_error("frame too large (a plane region exceeds the 2^31 addressing limit).");
+            cfg.padded_bytes >= (1ll << 31) || nblk * 256 >= (1ll << 31)) {
+            return set_error(
+                "frame too large (a plane region exceeds the 2^31 addressing limit).");
         }
     }
 
-    const auto window = getWindow(d->radius, d->block_step, swin, sbeta, twin, tbeta);
+    const auto window =
+        getWindow(d->radius, d->block_step, swin, sbeta, twin, tbeta);
     if (!std::all_of(window.begin(), window.end(),
                      [](double v) { return std::isfinite(v); })) {
-        return set_error("sbeta/tbeta produce a non-finite window; use a smaller |beta|.");
+        return set_error(
+            "sbeta/tbeta produce a non-finite window; use a smaller |beta|.");
     }
 
     // wscale = Shewchuk sum of the squared window
@@ -1226,11 +1299,14 @@ static void VS_CC DftCreate(
     const double wscale = fsum(sq.data(), sq.size());
 
     // sigma array (per-bin) unless every sigma source is scalar
-    d->sigma_is_scalar = (slocation == nullptr && ssx == nullptr && ssy == nullptr && sst == nullptr);
+    d->sigma_is_scalar = (slocation == nullptr && ssx == nullptr &&
+                          ssy == nullptr && sst == nullptr);
     std::vector<double> sigma_array;
     if (!d->sigma_is_scalar) {
-        const Norm norm = (slocation != nullptr && ssystem == 1) ? Norm::identity
-            : (tbsize == 1) ? Norm::sqrt : Norm::cbrt;
+        const Norm norm = (slocation != nullptr && ssystem == 1)
+                              ? Norm::identity
+                          : (tbsize == 1) ? Norm::sqrt
+                                          : Norm::cbrt;
 
         // slocation is the one shared 3-D table: all three axes use the same
         // function, so the per-axis sources are just aliases of it.
@@ -1283,7 +1359,8 @@ static void VS_CC DftCreate(
                     const double ly = getLocation(y, BS);
                     for (int x = 0; x < BS / 2 + 1; ++x) {
                         const double lx = getLocation(x, BS);
-                        const double location = std::sqrt((lt * lt + ly * ly + lx * lx) / ndim);
+                        const double location =
+                            std::sqrt((lt * lt + ly * ly + lx * lx) / ndim);
                         const auto v = ft.eval(location);
                         if (!v) {
                             fail = true;
@@ -1296,7 +1373,8 @@ static void VS_CC DftCreate(
             }
         }
         if (fail) {
-            return set_error("slocation/ssx/ssy/sst must cover the full [0, 1] frequency range.");
+            return set_error(
+                "slocation/ssx/ssy/sst must cover the full [0, 1] frequency range.");
         }
     }
 
@@ -1351,7 +1429,7 @@ static void VS_CC DftCreate(
     }
     {
         const auto result = gpu_pipeline_layout(*d->gpu, d->set_layout,
-            sizeof(DftPushConstants));
+                                                sizeof(DftPushConstants));
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -1363,20 +1441,24 @@ static void VS_CC DftCreate(
     // ------------------------------------------------------------------
     {
         const size_t n_window = static_cast<size_t>(d->tw) * 256;
-        const size_t n_freq = zmean ? static_cast<size_t>(d->tw) * 16 * 9 * 2 : 0;
-        const size_t n_sigma = sigma_array.empty() ? 0 : static_cast<size_t>(d->tw) * 16 * 9;
+        const size_t n_freq =
+            zmean ? static_cast<size_t>(d->tw) * 16 * 9 * 2 : 0;
+        const size_t n_sigma =
+            sigma_array.empty() ? 0 : static_cast<size_t>(d->tw) * 16 * 9;
 
         VkDeviceSize wt_bytes = static_cast<VkDeviceSize>(
             (n_window + n_freq + n_sigma) * sizeof(float));
         wt_bytes = std::max<VkDeviceSize>(wt_bytes, 16);
         d->wf_base = zmean ? static_cast<int32_t>(n_window) : -1;
-        d->sigma_base = !sigma_array.empty() ? static_cast<int32_t>(n_window + n_freq) : -1;
+        d->sigma_base =
+            !sigma_array.empty() ? static_cast<int32_t>(n_window + n_freq) : -1;
 
         // Host visible and coherent, so a plain memcpy lands and no flush is
         // needed; the table is tiny and read through L2 every frame.
         auto e = gpu_make_buffer(*d->gpu, core, wt_bytes, d->wt,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (!e.empty()) {
             return set_error("window buffer: " + e);
         }
@@ -1410,46 +1492,59 @@ static void VS_CC DftCreate(
         const uint32_t * fused_code[4] {};
         size_t fused_size[4] {};
         switch (d->bits) {
-            case 16:
-                pad_code = dfttest_16_pad_spv; pad_size = dfttest_16_pad_spv_size;
-                col2im_code = dfttest_16_col2im_spv; col2im_size = dfttest_16_col2im_spv_size;
-                fused_code[0] = dfttest_16_fused_r0_spv; fused_size[0] = dfttest_16_fused_r0_spv_size;
-                fused_code[1] = dfttest_16_fused_r1_spv; fused_size[1] = dfttest_16_fused_r1_spv_size;
-                fused_code[2] = dfttest_16_fused_r2_spv; fused_size[2] = dfttest_16_fused_r2_spv_size;
-                fused_code[3] = dfttest_16_fused_r3_spv; fused_size[3] = dfttest_16_fused_r3_spv_size;
-                break;
-            case 32:
-                pad_code = dfttest_32_pad_spv; pad_size = dfttest_32_pad_spv_size;
-                col2im_code = dfttest_32_col2im_spv; col2im_size = dfttest_32_col2im_spv_size;
-                fused_code[0] = dfttest_32_fused_r0_spv; fused_size[0] = dfttest_32_fused_r0_spv_size;
-                fused_code[1] = dfttest_32_fused_r1_spv; fused_size[1] = dfttest_32_fused_r1_spv_size;
-                fused_code[2] = dfttest_32_fused_r2_spv; fused_size[2] = dfttest_32_fused_r2_spv_size;
-                fused_code[3] = dfttest_32_fused_r3_spv; fused_size[3] = dfttest_32_fused_r3_spv_size;
-                break;
-            default:
-                return set_error("unsupported bit depth");
+        case 16:
+            pad_code = dfttest_16_pad_spv;
+            pad_size = dfttest_16_pad_spv_size;
+            col2im_code = dfttest_16_col2im_spv;
+            col2im_size = dfttest_16_col2im_spv_size;
+            fused_code[0] = dfttest_16_fused_r0_spv;
+            fused_size[0] = dfttest_16_fused_r0_spv_size;
+            fused_code[1] = dfttest_16_fused_r1_spv;
+            fused_size[1] = dfttest_16_fused_r1_spv_size;
+            fused_code[2] = dfttest_16_fused_r2_spv;
+            fused_size[2] = dfttest_16_fused_r2_spv_size;
+            fused_code[3] = dfttest_16_fused_r3_spv;
+            fused_size[3] = dfttest_16_fused_r3_spv_size;
+            break;
+        case 32:
+            pad_code = dfttest_32_pad_spv;
+            pad_size = dfttest_32_pad_spv_size;
+            col2im_code = dfttest_32_col2im_spv;
+            col2im_size = dfttest_32_col2im_spv_size;
+            fused_code[0] = dfttest_32_fused_r0_spv;
+            fused_size[0] = dfttest_32_fused_r0_spv_size;
+            fused_code[1] = dfttest_32_fused_r1_spv;
+            fused_size[1] = dfttest_32_fused_r1_spv_size;
+            fused_code[2] = dfttest_32_fused_r2_spv;
+            fused_size[2] = dfttest_32_fused_r2_spv_size;
+            fused_code[3] = dfttest_32_fused_r3_spv;
+            fused_size[3] = dfttest_32_fused_r3_spv_size;
+            break;
+        default:
+            return set_error("unsupported bit depth");
         }
 
         {
-            const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                pad_code, pad_size, kPadWorkgroup);
+            const auto result = create_pipeline(
+                *d->gpu, d->pipeline_layout, pad_code, pad_size, kPadWorkgroup);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
             d->pad_pipeline = std::get<VkPipeline>(result);
         }
         for (int r = 0; r < 4; ++r) {
-            const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                fused_code[r], fused_size[r], kFusedWorkgroup,
-                d->filter_type, d->zmean ? 1 : 0);
+            const auto result = create_pipeline(
+                *d->gpu, d->pipeline_layout, fused_code[r], fused_size[r],
+                kFusedWorkgroup, d->filter_type, d->zmean ? 1 : 0);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
             d->fused_pipeline[r] = std::get<VkPipeline>(result);
         }
         {
-            const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                col2im_code, col2im_size, kPadWorkgroup);
+            const auto result =
+                create_pipeline(*d->gpu, d->pipeline_layout, col2im_code,
+                                col2im_size, kPadWorkgroup);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -1459,7 +1554,8 @@ static void VS_CC DftCreate(
 
     {
         char err[512] {};
-        d->pool = d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
+        d->pool =
+            d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
         if (d->pool == nullptr) {
             return set_error("createGPUExecPool failed: "s + err);
         }
@@ -1470,7 +1566,7 @@ static void VS_CC DftCreate(
     // hang the engine.
     d->gpu_trace_frame = env_int("VSFEEL_DFTTEST_GPUTRACE", 100);
     d->gpu_trace = vsfeel_debug_probe("VSFEEL_DFTTEST_GPUTRACE") &&
-        vsfeel_probe_timestamps(*d->gpu, "DFTTest");
+                   vsfeel_probe_timestamps(*d->gpu, "DFTTest");
     if (d->gpu_trace) {
         VkQueryPoolCreateInfo qp_info {
             .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
@@ -1478,15 +1574,17 @@ static void VS_CC DftCreate(
             .queryCount = 4
         };
         if (d->gpu->vk->vkCreateQueryPool(d->gpu->device, &qp_info, nullptr,
-                &d->probe.query) != VK_SUCCESS) {
+                                          &d->probe.query) != VK_SUCCESS) {
             d->probe.query = VK_NULL_HANDLE;
             d->gpu_trace = false;
         }
     }
     if (d->gpu_trace) {
-        auto e = gpu_make_buffer(*d->gpu, core, 4 * sizeof(uint64_t), d->probe.buf,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            0, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        auto e =
+            gpu_make_buffer(*d->gpu, core, 4 * sizeof(uint64_t), d->probe.buf,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                            0, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         if (!e.empty() || d->probe.buf.mapped == nullptr) {
             d->gpu_trace = false;
         } else {
@@ -1498,16 +1596,18 @@ static void VS_CC DftCreate(
         VkDeviceSize per_frame = 0;
         for (int plane = 0; plane < num_planes; ++plane) {
             if (d->process[plane]) {
-                per_frame += d->planes[plane].padded_bytes + d->planes[plane].spatial_bytes;
+                per_frame += d->planes[plane].padded_bytes +
+                             d->planes[plane].spatial_bytes;
             }
         }
-        fprintf(stderr, "[dfttest] %.1f MiB per in-flight frame "
-                        "(%d planes, tw=%d, %u bytes); tw is re-padded every frame\n",
-            per_frame / (1024.0 * 1024.0), num_planes, d->tw,
-            static_cast<unsigned>(per_frame));
+        fprintf(stderr,
+                "[dfttest] %.1f MiB per in-flight frame "
+                "(%d planes, tw=%d, %u bytes); tw is re-padded every frame\n",
+                per_frame / (1024.0 * 1024.0), num_planes, d->tw,
+                static_cast<unsigned>(per_frame));
     }
 
-    DftData *data = d.release();
+    DftData * data = d.release();
 
     VSFilterDependency deps[1] = {
         { data->node, data->radius > 0 ? rpGeneral : rpStrictSpatial }
@@ -1517,8 +1617,8 @@ static void VS_CC DftCreate(
     // own producer pairs, so the core never downloads them for a consumer that
     // does not need host pixels.
     VSNode * result = vsapi->createVideoFilterEx2(
-        "DFTTest", data->vi, DftGetFrame, DftFree,
-        fmParallel, ffGPUOutput, deps, 1, data, core);
+        "DFTTest", data->vi, DftGetFrame, DftFree, fmParallel, ffGPUOutput,
+        deps, 1, data, core);
     if (result == nullptr) {
         // The core returns nullptr without running the free callback when the
         // node constructor throws, so release the instance through it here.
@@ -1537,32 +1637,29 @@ void vsfeel_register_dfttest(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
     // Under the R80 GPU API both the input and the output are GPU resident: the
     // core inserts the upload for a CPU clip and a GPUDownload for a CPU
     // consumer, so the filter itself never moves a frame.
-    vspapi->registerFunction(
-        "DFTTest",
-        "clip:vnode:gpu;"
-        "ftype:int:opt;"
-        "sigma:float:opt;"
-        "sigma2:float:opt;"
-        "pmin:float:opt;"
-        "pmax:float:opt;"
-        "sbsize:int:opt;"
-        "sosize:int:opt;"
-        "tbsize:int:opt;"
-        "swin:int:opt;"
-        "twin:int:opt;"
-        "sbeta:float:opt;"
-        "tbeta:float:opt;"
-        "zmean:int:opt;"
-        "f0beta:float:opt;"
-        "ssystem:int:opt;"
-        "slocation:float[]:opt;"
-        "ssx:float[]:opt;"
-        "ssy:float[]:opt;"
-        "sst:float[]:opt;"
-        "planes:int[]:opt;"
-        "device_id:int:opt;"
-        "num_streams:int:opt;",
-        "clip:vnode:gpu;",
-        DftCreate, nullptr, plugin
-    );
+    vspapi->registerFunction("DFTTest",
+                             "clip:vnode:gpu;"
+                             "ftype:int:opt;"
+                             "sigma:float:opt;"
+                             "sigma2:float:opt;"
+                             "pmin:float:opt;"
+                             "pmax:float:opt;"
+                             "sbsize:int:opt;"
+                             "sosize:int:opt;"
+                             "tbsize:int:opt;"
+                             "swin:int:opt;"
+                             "twin:int:opt;"
+                             "sbeta:float:opt;"
+                             "tbeta:float:opt;"
+                             "zmean:int:opt;"
+                             "f0beta:float:opt;"
+                             "ssystem:int:opt;"
+                             "slocation:float[]:opt;"
+                             "ssx:float[]:opt;"
+                             "ssy:float[]:opt;"
+                             "sst:float[]:opt;"
+                             "planes:int[]:opt;"
+                             "device_id:int:opt;"
+                             "num_streams:int:opt;",
+                             "clip:vnode:gpu;", DftCreate, nullptr, plugin);
 }

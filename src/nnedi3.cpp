@@ -20,13 +20,13 @@
 #include <immintrin.h>
 
 #if defined(_WIN32)
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  include <windows.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 #include <volk.h>
@@ -69,10 +69,10 @@ constexpr int NNEDI3_NNS[5] { 16, 32, 64, 128, 256 };
 // window is `xdim * ydim` rows per subgroup, so 288 covers every network
 // (xdim 48) and 192 covers all but that one. Re-derive with
 // `python3 tools/shader_limits.py`.
-constexpr uint32_t kPredictLdsPxp8 = 4 * 256 * 16;   // 16 KiB
-constexpr uint32_t kPredictLdsN4 = 4 * 288 * 16;     // 18 KiB
-constexpr uint32_t kPredictLdsN4m = 4 * 192 * 16;    // 12 KiB
-constexpr uint32_t kPredictLdsN4s = 4 * 64 * 16;     // 4 KiB
+constexpr uint32_t kPredictLdsPxp8 = 4 * 256 * 16; // 16 KiB
+constexpr uint32_t kPredictLdsN4 = 4 * 288 * 16;   // 18 KiB
+constexpr uint32_t kPredictLdsN4m = 4 * 192 * 16;  // 12 KiB
+constexpr uint32_t kPredictLdsN4s = 4 * 64 * 16;   // 4 KiB
 
 // Weight blob linked into the binary (see CMakeLists.txt): objcopy on every
 // toolchain that has it, an RCDATA resource on Windows, where none does.
@@ -85,19 +85,21 @@ extern const uint8_t _binary_nnedi3_weights_bin_end[];
 
 static std::span<const uint8_t> weights_blob() {
 #if defined(_WIN32)
-    static const std::span<const uint8_t> blob = []() -> std::span<const uint8_t> {
+    static const std::span<const uint8_t> blob =
+        []() -> std::span<const uint8_t> {
         HMODULE module = nullptr;
         // Our own module, not the host executable's: FindResourceW(nullptr, …)
         // searches the process image, which is VapourSynth, not this plugin.
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               reinterpret_cast<LPCWSTR>(&weights_blob), &module) == 0) {
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&weights_blob),
+                               &module) == 0) {
             return {};
         }
         // MAKEINTRESOURCEW(10) is RT_RCDATA in its wide form: RT_RCDATA itself
         // follows the UNICODE macro, which must not decide whether this builds.
-        const HRSRC res = FindResourceW(module, L"NNEDI3_WEIGHTS",
-                                        MAKEINTRESOURCEW(10));
+        const HRSRC res =
+            FindResourceW(module, L"NNEDI3_WEIGHTS", MAKEINTRESOURCEW(10));
         if (res == nullptr) {
             return {};
         }
@@ -213,40 +215,62 @@ static void model_prep_pass(std::vector<float> & sm, std::vector<float> & el,
     }
 }
 
-static std::optional<std::string> parse_weights(int nsize, int nns_sel, int etype,
-                                                int pscrn, double pixel_half,
-                                                PsOldWeights & ps_old,
-                                                PsNewWeights & ps_new,
-                                                ModelWeights & model) {
+static std::optional<std::string>
+parse_weights(int nsize, int nns_sel, int etype, int pscrn, double pixel_half,
+              PsOldWeights & ps_old, PsNewWeights & ps_new,
+              ModelWeights & model) {
     const std::span<const uint8_t> blob = weights_blob();
     if (blob.empty()) {
         return "weight blob missing from the plugin binary";
     }
+    // The blob is the raw weight array linked in as bytes; the linker aligns
+    // it, so reinterpreting it as float is the point rather than a mistake.
+    // cppcheck-suppress invalidPointerCast
     const auto * data = reinterpret_cast<const float *>(blob.data());
     const size_t count = blob.size() / sizeof(float);
     WeightReader r { data, count, 0 };
 
     for (int n = 0; n < 4; ++n) {
-        if (!r.read(ps_old.k0[n], 48)) return "weight blob truncated (ps_old l0)";
+        if (!r.read(ps_old.k0[n], 48)) {
+            return "weight blob truncated (ps_old l0)";
+        }
     }
-    if (!r.read(ps_old.b0, 4)) return "weight blob truncated (ps_old b0)";
+    if (!r.read(ps_old.b0, 4)) {
+        return "weight blob truncated (ps_old b0)";
+    }
     for (int n = 0; n < 4; ++n) {
-        if (!r.read(ps_old.k1[n], 4)) return "weight blob truncated (ps_old l1)";
+        if (!r.read(ps_old.k1[n], 4)) {
+            return "weight blob truncated (ps_old l1)";
+        }
     }
-    if (!r.read(ps_old.b1, 4)) return "weight blob truncated (ps_old b1)";
+    if (!r.read(ps_old.b1, 4)) {
+        return "weight blob truncated (ps_old b1)";
+    }
     for (int n = 0; n < 4; ++n) {
-        if (!r.read(ps_old.k2[n], 8)) return "weight blob truncated (ps_old l2)";
+        if (!r.read(ps_old.k2[n], 8)) {
+            return "weight blob truncated (ps_old l2)";
+        }
     }
-    if (!r.read(ps_old.b2, 4)) return "weight blob truncated (ps_old b2)";
+    if (!r.read(ps_old.b2, 4)) {
+        return "weight blob truncated (ps_old b2)";
+    }
 
     PsNewWeights all_new[3] {};
     for (int i = 0; i < 3; ++i) {
         float l0s[4 * 64] {};
         float l1s[4 * 4] {};
-        if (!r.read(l0s, 4 * 64)) return "weight blob truncated (ps_new l0)";
-        if (!r.read(all_new[i].b0, 4)) return "weight blob truncated (ps_new b0)";
-        if (!r.read(l1s, 4 * 4)) return "weight blob truncated (ps_new l1)";
-        if (!r.read(all_new[i].b1, 4)) return "weight blob truncated (ps_new b1)";
+        if (!r.read(l0s, 4 * 64)) {
+            return "weight blob truncated (ps_new l0)";
+        }
+        if (!r.read(all_new[i].b0, 4)) {
+            return "weight blob truncated (ps_new b0)";
+        }
+        if (!r.read(l1s, 4 * 4)) {
+            return "weight blob truncated (ps_new l1)";
+        }
+        if (!r.read(all_new[i].b1, 4)) {
+            return "weight blob truncated (ps_new b1)";
+        }
         for (int n = 0; n < 4; ++n) {
             for (int k = 0; k < 64; ++k) {
                 all_new[i].k0[n][k] = l0s[(k / 8) * 32 + n * 8 + k % 8];
@@ -262,7 +286,8 @@ static std::optional<std::string> parse_weights(int nsize, int nns_sel, int etyp
         for (int i = 0; i < 5; ++i) {
             for (int j = 0; j < 7; ++j) {
                 const size_t nns = NNEDI3_NNS[i];
-                const size_t fs = static_cast<size_t>(NNEDI3_XDIM[j]) * NNEDI3_YDIM[j];
+                const size_t fs =
+                    static_cast<size_t>(NNEDI3_XDIM[j]) * NNEDI3_YDIM[j];
                 if (m == etype && i == nns_sel && j == nsize) {
                     model.xdim = NNEDI3_XDIM[j];
                     model.ydim = NNEDI3_YDIM[j];
@@ -308,9 +333,11 @@ static std::optional<std::string> parse_weights(int nsize, int nns_sel, int etyp
         prescreener_prep(ps_new.k0, pixel_half);
     }
     model_prep_pass(model.sm1, model.el1, model.sm_b1,
-        model.sm1.size() / static_cast<size_t>(model.nns), model.nns);
+                    model.sm1.size() / static_cast<size_t>(model.nns),
+                    model.nns);
     model_prep_pass(model.sm2, model.el2, model.sm_b2,
-        model.sm2.size() / static_cast<size_t>(model.nns), model.nns);
+                    model.sm2.size() / static_cast<size_t>(model.nns),
+                    model.nns);
     return std::nullopt;
 }
 
@@ -320,18 +347,19 @@ static std::optional<std::string> parse_weights(int nsize, int nns_sel, int etyp
 
 struct Nnedi3Plane {
     int width {};
-    int rows {};                      // field rows == interpolated output rows
-    uint32_t pre_grid_x {}, pre_grid_y {1};            // prescreen dispatch
-    uint32_t pred_grid_direct_x {}, pred_grid_direct_y {1};  // direct predict
+    int rows {}; // field rows == interpolated output rows
+    uint32_t pre_grid_x {}, pre_grid_y { 1 }; // prescreen dispatch
+    uint32_t pred_grid_direct_x {}, pred_grid_direct_y { 1 }; // direct predict
     uint32_t keep_grid_x {}, keep_grid_y {};
-    VkPipeline pre_pipeline {};       // null when pscrn == 0 or the plane is skipped under dh
+    VkPipeline
+        pre_pipeline {}; // null when pscrn == 0 or the plane is skipped under dh
     VkPipeline pred_pipeline {};
     VkPipeline keep_pipeline {};
     // Regions of the per-frame scratch buffer (the rejected-pixel list and
     // the indirect dispatch struct), one pair per plane.
     VkDeviceSize list_offset {};
     VkDeviceSize ind_offset {};
-    int32_t list_elem {};             // uint element offsets into the scratch
+    int32_t list_elem {}; // uint element offsets into the scratch
     int32_t ind_elem {};
 };
 
@@ -353,7 +381,7 @@ struct Nnedi3Data {
     int field {};
     bool dh {};
     int qual {}, pscrn {};
-    bool use_list {};               // prescreen compacts a list (pscrn > 0)
+    bool use_list {}; // prescreen compacts a list (pscrn > 0)
     int peak {}, elem_bytes {};
     int xdim {}, ydim {}, nns {};
     bool process[3] { true, true, true };
@@ -386,11 +414,12 @@ struct Nnedi3Data {
         if (host_timing && ht_n.load()) {
             const double n = static_cast<double>(ht_n.load());
             fprintf(stderr,
-                "[nnedi3-timing] frames=%.0f per-frame us: acquire=%7.1f "
-                "record=%7.1f submit=%7.1f total=%7.1f\n",
-                n, ht_acquire_ns.load() / 1000.0 / n,
-                ht_record_ns.load() / 1000.0 / n,
-                ht_submit_ns.load() / 1000.0 / n, ht_total_ns.load() / 1000.0 / n);
+                    "[nnedi3-timing] frames=%.0f per-frame us: acquire=%7.1f "
+                    "record=%7.1f submit=%7.1f total=%7.1f\n",
+                    n, ht_acquire_ns.load() / 1000.0 / n,
+                    ht_record_ns.load() / 1000.0 / n,
+                    ht_submit_ns.load() / 1000.0 / n,
+                    ht_total_ns.load() / 1000.0 / n);
         }
         if (!gpu) {
             return;
@@ -408,11 +437,11 @@ struct Nnedi3Data {
         // plane's zero-fill keep.
         std::vector<VkPipeline> seen;
         for (auto & plane : planes) {
-            const VkPipeline pipes[3] {
-                plane.pre_pipeline, plane.pred_pipeline, plane.keep_pipeline
-            };
+            const VkPipeline pipes[3] { plane.pre_pipeline, plane.pred_pipeline,
+                                        plane.keep_pipeline };
             for (VkPipeline p : pipes) {
-                if (!p || std::find(seen.begin(), seen.end(), p) != seen.end()) {
+                if (!p ||
+                    std::find(seen.begin(), seen.end(), p) != seen.end()) {
                     continue;
                 }
                 seen.push_back(p);
@@ -446,7 +475,8 @@ struct Nnedi3Spec {
 static constexpr std::array<VkSpecializationMapEntry, 11> spec_entries = [] {
     std::array<VkSpecializationMapEntry, 11> e {};
     for (uint32_t i = 0; i < 11; ++i) {
-        e[i] = { i, i * static_cast<uint32_t>(sizeof(int32_t)), sizeof(int32_t) };
+        e[i] = { i, i * static_cast<uint32_t>(sizeof(int32_t)),
+                 sizeof(int32_t) };
     }
     return e;
 }();
@@ -454,21 +484,23 @@ static constexpr std::array<VkSpecializationMapEntry, 11> spec_entries = [] {
 // The cooperative kernels (prescreen, predict) keep subgroup-uniform control
 // flow and run subgroup intrinsics, so they ask for full 32-lane subgroups;
 // the kept-row writer is a plain copy and takes the driver's default width.
-static std::variant<VkPipeline, std::string> create_pipeline(
-    const GPUDevice & gpu, const Nnedi3Spec & spec, const uint32_t * code,
-    size_t code_size, VkPipelineLayout layout,
-    uint32_t required_subgroup_size = 0, GpuWorkgroup workgroup = {},
-    bool full_subgroups = false) {
+static std::variant<VkPipeline, std::string>
+create_pipeline(const GPUDevice & gpu, const Nnedi3Spec & spec,
+                const uint32_t * code, size_t code_size,
+                VkPipelineLayout layout, uint32_t required_subgroup_size = 0,
+                GpuWorkgroup workgroup = {}, bool full_subgroups = false) {
 
-    return gpu_create_pipeline(gpu, code, code_size, layout, spec_entries.data(),
-        &spec, static_cast<uint32_t>(spec_entries.size()), sizeof(spec), "nnedi3",
+    return gpu_create_pipeline(
+        gpu, code, code_size, layout, spec_entries.data(), &spec,
+        static_cast<uint32_t>(spec_entries.size()), sizeof(spec), "nnedi3",
         required_subgroup_size, workgroup, full_subgroups);
 }
 
 // The indirect struct arrives through vkCmdFillBuffer, and prescreen's
 // atomics feed the indirect launch: both need explicit edges, back-to-back
 // commands order nothing.
-static void barrier_transfer_to_compute(const GPUDevice & g, VkCommandBuffer cmd) {
+static void barrier_transfer_to_compute(const GPUDevice & g,
+                                        VkCommandBuffer cmd) {
     VkMemoryBarrier2 mb {};
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
     mb.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -483,7 +515,8 @@ static void barrier_transfer_to_compute(const GPUDevice & g, VkCommandBuffer cmd
     g.vk->vkCmdPipelineBarrier2(cmd, &dep);
 }
 
-static void barrier_prescreen_to_predict(const GPUDevice & g, VkCommandBuffer cmd) {
+static void barrier_prescreen_to_predict(const GPUDevice & g,
+                                         VkCommandBuffer cmd) {
     VkMemoryBarrier2 mb {};
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
     mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -505,9 +538,12 @@ static void barrier_prescreen_to_predict(const GPUDevice & g, VkCommandBuffer cm
 
 // GPU input, GPU output: the kernels read the source plane and write the
 // output frame's planes in place; the core owns every transfer.
-static const VSFrame *VS_CC Nnedi3GetFrame(
-    int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData,
-    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
+                                            void * instanceData,
+                                            [[maybe_unused]] void ** frameData,
+                                            VSFrameContext * frameCtx,
+                                            VSCore * core,
+                                            const VSAPI * vsapi) {
 
     Nnedi3Data * d = static_cast<Nnedi3Data *>(instanceData);
 
@@ -533,20 +569,20 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
         all_process &= d->process[p];
     }
     const int pl[] = { 0, 1, 2 };
-    const VSFrame * fr[] = {
-        (!d->dh && !d->process[0]) ? src : nullptr,
-        (!d->dh && !d->process[1]) ? src : nullptr,
-        (!d->dh && !d->process[2]) ? src : nullptr
-    };
-    VSFrame * dst = (all_process || d->dh)
-        ? d->gpu->api->newGPUVideoFrame(&d->vi_out.format, d->vi_out.width,
-              d->vi_out.height, src, core)
-        : vsapi->newVideoFrame2(&d->vi_out.format, d->vi_out.width, d->vi_out.height,
-              fr, pl, src, core);
+    const VSFrame * fr[] = { (!d->dh && !d->process[0]) ? src : nullptr,
+                             (!d->dh && !d->process[1]) ? src : nullptr,
+                             (!d->dh && !d->process[2]) ? src : nullptr };
+    VSFrame * dst =
+        (all_process || d->dh)
+            ? d->gpu->api->newGPUVideoFrame(&d->vi_out.format, d->vi_out.width,
+                                            d->vi_out.height, src, core)
+            : vsapi->newVideoFrame2(&d->vi_out.format, d->vi_out.width,
+                                    d->vi_out.height, fr, pl, src, core);
     if (!dst) {
         vsfeel_trace_error("NNEDI3", n, "failed to allocate the output frame",
                            d->gpu.get());
-        vsapi->setFilterError("NNEDI3: failed to allocate the output frame", frameCtx);
+        vsapi->setFilterError("NNEDI3: failed to allocate the output frame",
+                              frameCtx);
         vsapi->freeFrame(src);
         return nullptr;
     }
@@ -560,13 +596,13 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
         int err;
         const VSMap * props = vsapi->getFramePropertiesRO(src);
         if (d->dh) {
-            parity = static_cast<int>(vsapi->mapGetIntSaturated(props, "_Field", 0, &err));
+            parity = vsapi->mapGetIntSaturated(props, "_Field", 0, &err);
             if (err) {
                 parity = default_parity;
             }
         } else if (d->field > 1) {
-            const int field_based = static_cast<int>(
-                vsapi->mapGetIntSaturated(props, "_FieldBased", 0, &err));
+            const int field_based =
+                vsapi->mapGetIntSaturated(props, "_FieldBased", 0, &err);
             if (field_based == VSC_FIELD_BOTTOM) {
                 parity = 1;
             } else if (field_based == VSC_FIELD_TOP) {
@@ -588,7 +624,8 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
     char errbuf[512] {};
     auto t0 = d->host_timing ? std::chrono::steady_clock::now()
                              : std::chrono::steady_clock::time_point {};
-    VSGPUExecContext * ctx = d->gpu->api->gpuExecAcquire(d->pool, errbuf, sizeof(errbuf));
+    VSGPUExecContext * ctx =
+        d->gpu->api->gpuExecAcquire(d->pool, errbuf, sizeof(errbuf));
     auto fail = [&](const std::string & message) -> const VSFrame * {
         if (ctx) {
             d->gpu->api->gpuExecAbandon(ctx);
@@ -611,9 +648,10 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
     // per-frame allocation cheap). pscrn=0 needs neither.
     GpuBuffer scratch {};
     if (d->use_list) {
-        if (const auto e = gpu_frame_buffer(*d->gpu, core, ctx, d->scratch_bytes,
-                scratch,
-                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (const auto e =
+                gpu_frame_buffer(*d->gpu, core, ctx, d->scratch_bytes, scratch,
+                                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                                     VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             !e.empty()) {
             return fail("scratch buffer: " + e);
         }
@@ -622,8 +660,8 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
     vsfeel_trace_mark("record");
     VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
 
-    const bool gputrace = d->gpu_trace &&
-        n == d->gpu_trace_frame && d->probe.armed.exchange(1) == 0;
+    const bool gputrace = d->gpu_trace && n == d->gpu_trace_frame &&
+                          d->probe.armed.exchange(1) == 0;
     int probe_plane = -1;
     for (int p = 0; p < numPlanes && probe_plane < 0; ++p) {
         if (d->process[p]) {
@@ -632,8 +670,8 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
     }
     if (gputrace) {
         d->gpu->vk->vkCmdResetQueryPool(cmd, d->probe.query, 0, 3);
-        d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-            d->probe.query, 0);
+        d->gpu->vk->vkCmdWriteTimestamp2(
+            cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, d->probe.query, 0);
     }
 
     // Plane dispatches touch disjoint buffers (and disjoint scratch regions),
@@ -648,29 +686,36 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
 
         VSVulkanPlaneInfo sp {};
         if (d->gpu->api->getGPUPlane(src, p, &sp)) {
-            return fail("source plane " + std::to_string(p) + " is not GPU resident");
+            return fail("source plane " + std::to_string(p) +
+                        " is not GPU resident");
         }
         VSVulkanPlaneInfo dp {};
         if (d->gpu->api->getGPUPlane(dst, p, &dp)) {
-            return fail("output plane " + std::to_string(p) + " is not GPU resident");
+            return fail("output plane " + std::to_string(p) +
+                        " is not GPU resident");
         }
-        const int src_stride = static_cast<int>(vsapi->getStride(src, p) / d->elem_bytes);
-        const int dst_stride = static_cast<int>(vsapi->getStride(dst, p) / d->elem_bytes);
+        const int src_stride =
+            static_cast<int>(vsapi->getStride(src, p) / d->elem_bytes);
+        const int dst_stride =
+            static_cast<int>(vsapi->getStride(dst, p) / d->elem_bytes);
 
         // All seven bindings re-pushed per dispatch; the scratch slots stand
         // in where this entry statically reads nothing (see src/nnedi3.comp).
-        const VkBuffer buffers[7] {
-            sp.buffer, dp.buffer, d->ps.buffer, d->pdw.buffer, d->pdb.buffer,
-            d->use_list ? scratch.buffer : sp.buffer,
-            d->use_list ? scratch.buffer : sp.buffer
-        };
+        const VkBuffer buffers[7] { sp.buffer,
+                                    dp.buffer,
+                                    d->ps.buffer,
+                                    d->pdw.buffer,
+                                    d->pdb.buffer,
+                                    d->use_list ? scratch.buffer : sp.buffer,
+                                    d->use_list ? scratch.buffer : sp.buffer };
         gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 7);
 
         // Kept rows (and the dh zero-fill of a skipped plane) straight into
         // the output plane; they overlap nothing the network writes.
         {
             const int32_t push[5] { 0, src_stride, dst_stride, parity, 0 };
-            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push, sizeof(push));
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push,
+                               sizeof(push));
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           cfg.keep_pipeline);
             d->gpu->vk->vkCmdDispatch(cmd, cfg.keep_grid_x, cfg.keep_grid_y, 1);
@@ -682,7 +727,10 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
         // max_grid_x rides along so the compaction can cap X and publish the Y
         // extent it folded into; clamped to INT32_MAX so the int32 push word
         // round-trips (devices may report an X limit of 2^32-1).
-        const int32_t push[6] { cfg.list_elem, src_stride, dst_stride, parity,
+        const int32_t push[6] { cfg.list_elem,
+                                src_stride,
+                                dst_stride,
+                                parity,
                                 cfg.ind_elem,
                                 static_cast<int32_t>(std::min<uint32_t>(
                                     d->gpu->limits.maxComputeWorkGroupCount[0],
@@ -699,14 +747,15 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
 
             // Prescreen: cubic stores into the output plane plus rejected-pixel
             // compaction into the list.
-            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push, sizeof(push));
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push,
+                               sizeof(push));
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           cfg.pre_pipeline);
             d->gpu->vk->vkCmdDispatch(cmd, cfg.pre_grid_x, cfg.pre_grid_y, 1);
         }
         if (gputrace && p == probe_plane) {
-            d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                d->probe.query, 1);
+            d->gpu->vk->vkCmdWriteTimestamp2(
+                cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, d->probe.query, 1);
         }
         if (d->use_list) {
             // The predictor launches off the count prescreen accumulated.
@@ -714,26 +763,29 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
             // launch was SLOWER -- exiting subgroups still pay the window
             // gather -- so the exact indirect grid stays.)
             barrier_prescreen_to_predict(*d->gpu, cmd);
-            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push, sizeof(push));
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push,
+                               sizeof(push));
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           cfg.pred_pipeline);
-            d->gpu->vk->vkCmdDispatchIndirect(cmd, scratch.buffer, cfg.ind_offset);
+            d->gpu->vk->vkCmdDispatchIndirect(cmd, scratch.buffer,
+                                              cfg.ind_offset);
         } else {
-            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push, sizeof(push));
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push,
+                               sizeof(push));
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           cfg.pred_pipeline);
             d->gpu->vk->vkCmdDispatch(cmd, cfg.pred_grid_direct_x,
                                       cfg.pred_grid_direct_y, 1);
         }
         if (gputrace && p == probe_plane) {
-            d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
-                d->probe.query, 2);
+            d->gpu->vk->vkCmdWriteTimestamp2(
+                cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->probe.query, 2);
         }
     }
 
     if (gputrace) {
-        d->gpu->vk->vkCmdCopyQueryPoolResults(cmd, d->probe.query, 0, 3,
-            d->probe.buf.buffer, 0, sizeof(uint64_t),
+        d->gpu->vk->vkCmdCopyQueryPoolResults(
+            cmd, d->probe.query, 0, 3, d->probe.buf.buffer, 0, sizeof(uint64_t),
             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     }
     auto t2 = d->host_timing ? std::chrono::steady_clock::now()
@@ -751,8 +803,9 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
 
     vsfeel_trace_mark("submit");
     uint64_t signaled = 0;
-    const int submit_error = d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf, sizeof(errbuf));
-    ctx = nullptr;  // consumed either way
+    const int submit_error =
+        d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf, sizeof(errbuf));
+    ctx = nullptr; // consumed either way
     if (submit_error) {
         return fail("submit failed: "s + errbuf);
     }
@@ -762,7 +815,8 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
     if (d->host_timing) {
         const auto ns = [](auto a, auto b) {
             return static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                    .count());
         };
         d->ht_acquire_ns += ns(t0, t1);
         d->ht_record_ns += ns(t1, t2);
@@ -775,15 +829,16 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
         // One-shot probe: wait this submission out so the query results are
         // final, then read the mapped copy the command buffer made.
         char perr[256] {};
-        if (d->gpu->api->gpuExecWaitValue(d->pool, signaled, perr, sizeof(perr)) ==
-            gdDrained) {
+        if (d->gpu->api->gpuExecWaitValue(d->pool, signaled, perr,
+                                          sizeof(perr)) == gdDrained) {
             const double period = d->gpu->limits.timestampPeriod;
             const auto us = [period](uint64_t a, uint64_t b) {
                 return static_cast<double>(b - a) * period / 1000.0;
             };
             const uint64_t * ts = d->probe.map;
-            fprintf(stderr, "[nnedi3-gpu] n=%d pre=%.1fus pred=%.1fus total=%.1fus\n",
-                n, us(ts[0], ts[1]), us(ts[1], ts[2]), us(ts[0], ts[2]));
+            fprintf(stderr,
+                    "[nnedi3-gpu] n=%d pre=%.1fus pred=%.1fus total=%.1fus\n",
+                    n, us(ts[0], ts[1]), us(ts[1], ts[2]), us(ts[0], ts[2]));
         } else {
             fprintf(stderr, "[nnedi3-gpu] probe wait failed: %s\n", perr);
         }
@@ -812,8 +867,9 @@ static const VSFrame *VS_CC Nnedi3GetFrame(
 // Creation
 // ---------------------------------------------------------------------------
 
-static void VS_CC Nnedi3Free(
-    void *instanceData, [[maybe_unused]] VSCore *core, const VSAPI *vsapi) {
+static void VS_CC Nnedi3Free(void * instanceData,
+                             [[maybe_unused]] VSCore * core,
+                             const VSAPI * vsapi) {
 
     Nnedi3Data * d = static_cast<Nnedi3Data *>(instanceData);
 
@@ -822,9 +878,9 @@ static void VS_CC Nnedi3Free(
     delete d;
 }
 
-static void VS_CC Nnedi3Create(
-    const VSMap *in, VSMap *out, [[maybe_unused]] void *userData,
-    VSCore *core, const VSAPI *vsapi) {
+static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
+                               [[maybe_unused]] void * userData, VSCore * core,
+                               const VSAPI * vsapi) {
 
     auto d { std::make_unique<Nnedi3Data>() };
 
@@ -845,14 +901,17 @@ static void VS_CC Nnedi3Create(
     const bool depth_ok = (fmt.sampleType == stInteger && bits == 16) ||
                           (fmt.sampleType == stFloat && bits == 32);
     if (!depth_ok || d->vi->width <= 0 || d->vi->height <= 0 ||
-        (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV && fmt.colorFamily != cfRGB)) {
-        return set_error("only 16-bit integer and 32-bit float Gray/YUV/RGB input supported.");
+        (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV &&
+         fmt.colorFamily != cfRGB)) {
+        return set_error(
+            "only 16-bit integer and 32-bit float Gray/YUV/RGB input supported.");
     }
 
     d->peak = fmt.sampleType == stInteger ? (1 << bits) - 1 : 0;
     d->elem_bytes = bits / 8;
 
-    d->field = vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "field", 0, nullptr));
+    d->field =
+        vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "field", 0, nullptr));
     if (d->field < 0 || d->field > 3) {
         return set_error("field must be 0, 1, 2, or 3.");
     }
@@ -870,7 +929,8 @@ static void VS_CC Nnedi3Create(
             d->process[i] = false;
         }
         for (int i = 0; i < num_plane_args; ++i) {
-            const int p = vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "planes", i, nullptr));
+            const int p = vsh::int64ToIntS(
+                vsapi->mapGetIntSaturated(in, "planes", i, nullptr));
             if (p < 0 || p >= fmt.numPlanes) {
                 return set_error("plane index out of range.");
             }
@@ -888,17 +948,22 @@ static void VS_CC Nnedi3Create(
         return set_error("no planes to process.");
     }
 
-    const int nsize = vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "nsize", 0, &error));
+    const int nsize =
+        vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "nsize", 0, &error));
     const int nsize_v = error ? 6 : nsize;
-    const int nns_sel = vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "nns", 0, &error));
+    const int nns_sel =
+        vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "nns", 0, &error));
     const int nns_v = error ? 1 : nns_sel;
-    d->qual = vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "qual", 0, &error));
+    d->qual =
+        vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "qual", 0, &error));
     if (error) {
         d->qual = 1;
     }
-    const int etype = vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "etype", 0, &error));
+    const int etype =
+        vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "etype", 0, &error));
     const int etype_v = error ? 0 : etype;
-    d->pscrn = vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "pscrn", 0, &error));
+    d->pscrn =
+        vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "pscrn", 0, &error));
     if (error) {
         d->pscrn = 2;
     }
@@ -939,7 +1004,8 @@ static void VS_CC Nnedi3Create(
             if (((2 * h) >> sub_h) != 2 * in_h) {
                 return set_error("output plane height must be even when dh is "
                                  "true; the input height has to be a multiple "
-                                 "of " + std::to_string(1 << sub_h) + ".");
+                                 "of " +
+                                 std::to_string(1 << sub_h) + ".");
             }
         } else if ((in_h & 1) != 0) {
             return set_error("plane height must be mod 2 when dh is false.");
@@ -982,9 +1048,10 @@ static void VS_CC Nnedi3Create(
     ModelWeights model {};
     {
         const double pixel_half = fmt.sampleType == stFloat
-            ? 0.5 : static_cast<double>(d->peak) / 2.0;
-        if (const auto err = parse_weights(
-                nsize_v, nns_v, etype_v, d->pscrn, pixel_half, ps_old, ps_new, model)) {
+                                      ? 0.5
+                                      : static_cast<double>(d->peak) / 2.0;
+        if (const auto err = parse_weights(nsize_v, nns_v, etype_v, d->pscrn,
+                                           pixel_half, ps_old, ps_new, model)) {
             return set_error(*err);
         }
     }
@@ -1080,8 +1147,8 @@ static void VS_CC Nnedi3Create(
         d->set_layout = std::get<VkDescriptorSetLayout>(result);
     }
     {
-        const auto result = gpu_pipeline_layout(*d->gpu, d->set_layout,
-            6 * sizeof(int32_t));
+        const auto result =
+            gpu_pipeline_layout(*d->gpu, d->set_layout, 6 * sizeof(int32_t));
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -1093,9 +1160,11 @@ static void VS_CC Nnedi3Create(
     // predictor streams the whole matrix per subgroup and thrashes L2.
     auto make_weights = [&](GpuBuffer & buf, const std::vector<float> & values,
                             const char * what) -> std::string {
-        std::string e = gpu_make_buffer(*d->gpu, core,
+        std::string e = gpu_make_buffer(
+            *d->gpu, core,
             std::max<VkDeviceSize>(values.size() * sizeof(float), 4), buf,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (!e.empty()) {
             return std::string(what) + " buffer: " + e;
@@ -1110,10 +1179,11 @@ static void VS_CC Nnedi3Create(
         // measure there, so say which memory the allocation got.
         if (vsfeel_device_info_enabled() &&
             (buf.memory_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
-            fprintf(stderr, "[nnedi3] %s weights are not device-local "
-                            "(memoryFlags=0x%x): the predictor reads them per "
-                            "subgroup\n",
-                what, static_cast<unsigned>(buf.memory_flags));
+            fprintf(stderr,
+                    "[nnedi3] %s weights are not device-local "
+                    "(memoryFlags=0x%x): the predictor reads them per "
+                    "subgroup\n",
+                    what, static_cast<unsigned>(buf.memory_flags));
         }
         std::memcpy(buf.mapped, values.data(), values.size() * sizeof(float));
         // The mapping may be the host-visible VRAM BAR (write-combining): the
@@ -1121,13 +1191,16 @@ static void VS_CC Nnedi3Create(
         _mm_sfence();
         return {};
     };
-    if (std::string e = make_weights(d->ps, ps_blob, "prescreener weights"); !e.empty()) {
+    if (std::string e = make_weights(d->ps, ps_blob, "prescreener weights");
+        !e.empty()) {
         return set_error(e);
     }
-    if (std::string e = make_weights(d->pdw, pdw_blob, "predictor weights"); !e.empty()) {
+    if (std::string e = make_weights(d->pdw, pdw_blob, "predictor weights");
+        !e.empty()) {
         return set_error(e);
     }
-    if (std::string e = make_weights(d->pdb, pdb_blob, "predictor biases"); !e.empty()) {
+    if (std::string e = make_weights(d->pdb, pdb_blob, "predictor biases");
+        !e.empty()) {
         return set_error(e);
     }
 
@@ -1146,36 +1219,52 @@ static void VS_CC Nnedi3Create(
     const uint32_t * keep_code = nullptr;
     size_t keep_size = 0;
     if (d->elem_bytes == 2) {
-        pre_code = nnedi3_16_prescreen_spv; pre_size = nnedi3_16_prescreen_spv_size;
-        pred_code = nnedi3_16_predict_spv; pred_size = nnedi3_16_predict_spv_size;
-        pred_n4_code = nnedi3_16_predict_n4_spv; pred_n4_size = nnedi3_16_predict_n4_spv_size;
-        pred_n4m_code = nnedi3_16_predict_n4m_spv; pred_n4m_size = nnedi3_16_predict_n4m_spv_size;
-        pred_n4s_code = nnedi3_16_predict_n4s_spv; pred_n4s_size = nnedi3_16_predict_n4s_spv_size;
-        keep_code = nnedi3_16_keep_spv; keep_size = nnedi3_16_keep_spv_size;
+        pre_code = nnedi3_16_prescreen_spv;
+        pre_size = nnedi3_16_prescreen_spv_size;
+        pred_code = nnedi3_16_predict_spv;
+        pred_size = nnedi3_16_predict_spv_size;
+        pred_n4_code = nnedi3_16_predict_n4_spv;
+        pred_n4_size = nnedi3_16_predict_n4_spv_size;
+        pred_n4m_code = nnedi3_16_predict_n4m_spv;
+        pred_n4m_size = nnedi3_16_predict_n4m_spv_size;
+        pred_n4s_code = nnedi3_16_predict_n4s_spv;
+        pred_n4s_size = nnedi3_16_predict_n4s_spv_size;
+        keep_code = nnedi3_16_keep_spv;
+        keep_size = nnedi3_16_keep_spv_size;
     } else {
-        pre_code = nnedi3_32_prescreen_spv; pre_size = nnedi3_32_prescreen_spv_size;
-        pred_code = nnedi3_32_predict_spv; pred_size = nnedi3_32_predict_spv_size;
-        pred_n4_code = nnedi3_32_predict_n4_spv; pred_n4_size = nnedi3_32_predict_n4_spv_size;
-        pred_n4m_code = nnedi3_32_predict_n4m_spv; pred_n4m_size = nnedi3_32_predict_n4m_spv_size;
-        pred_n4s_code = nnedi3_32_predict_n4s_spv; pred_n4s_size = nnedi3_32_predict_n4s_spv_size;
-        keep_code = nnedi3_32_keep_spv; keep_size = nnedi3_32_keep_spv_size;
+        pre_code = nnedi3_32_prescreen_spv;
+        pre_size = nnedi3_32_prescreen_spv_size;
+        pred_code = nnedi3_32_predict_spv;
+        pred_size = nnedi3_32_predict_spv_size;
+        pred_n4_code = nnedi3_32_predict_n4_spv;
+        pred_n4_size = nnedi3_32_predict_n4_spv_size;
+        pred_n4m_code = nnedi3_32_predict_n4m_spv;
+        pred_n4m_size = nnedi3_32_predict_n4m_spv_size;
+        pred_n4s_code = nnedi3_32_predict_n4s_spv;
+        pred_n4s_size = nnedi3_32_predict_n4s_spv_size;
+        keep_code = nnedi3_32_keep_spv;
+        keep_size = nnedi3_32_keep_spv_size;
     }
 
     // The cooperative predictor needs one 32-lane subgroup per 4 pixels, and it
     // counts active lanes with the subgroup arithmetic intrinsics -- which
     // Vulkan does not mandate (only BASIC is). The prescreen ballots on top of
     // that; the kept-row writer uses no subgroup op at all.
-    constexpr uint32_t kCoopInvocations = 128;   // local_size_x of both kernels
+    constexpr uint32_t kCoopInvocations = 128; // local_size_x of both kernels
     if (!d->gpu->has_subgroup_ops(VK_SUBGROUP_FEATURE_ARITHMETIC_BIT)) {
-        return set_error("device cannot run the NNEDI3 predictor kernel (it needs "
-                         "subgroup arithmetic operations).");
+        return set_error(
+            "device cannot run the NNEDI3 predictor kernel (it needs "
+            "subgroup arithmetic operations).");
     }
-    if (d->use_list && !d->gpu->has_subgroup_ops(VK_SUBGROUP_FEATURE_BALLOT_BIT)) {
-        return set_error("device cannot run the NNEDI3 prescreen kernel (it needs "
-                         "subgroup ballot operations).");
+    if (d->use_list &&
+        !d->gpu->has_subgroup_ops(VK_SUBGROUP_FEATURE_BALLOT_BIT)) {
+        return set_error(
+            "device cannot run the NNEDI3 prescreen kernel (it needs "
+            "subgroup ballot operations).");
     }
     uint32_t pred_subgroup_size = 0;
-    if (!d->gpu->resolve_subgroup_size(32, kCoopInvocations, pred_subgroup_size)) {
+    if (!d->gpu->resolve_subgroup_size(32, kCoopInvocations,
+                                       pred_subgroup_size)) {
         return set_error("device cannot run 32-lane subgroups "
                          "(required by the predictor kernel).");
     }
@@ -1192,11 +1281,11 @@ static void VS_CC Nnedi3Create(
     // a 1D grid wider than X is folded into Y -- every kernel here linearizes
     // the workgroup id as ID.y * NumWorkGroups.x + ID.x. Y carries the same
     // limit, hence the error.
-    auto fold_grid = [&](uint64_t groups, const char * what,
-                         uint32_t & gx_out, uint32_t & gy_out)
-            -> std::optional<std::string> {
+    auto fold_grid = [&](uint64_t groups, const char * what, uint32_t & gx_out,
+                         uint32_t & gy_out) -> std::optional<std::string> {
         std::string message;
-        if (!vsfeel_fold_grid(d->gpu->limits, groups, what, gx_out, gy_out, message)) {
+        if (!vsfeel_fold_grid(d->gpu->limits, groups, what, gx_out, gy_out,
+                              message)) {
             return message;
         }
         return std::nullopt;
@@ -1205,7 +1294,9 @@ static void VS_CC Nnedi3Create(
         return ((net_nns + 31) / 32 <= 2) && (net_fs <= 128);
     };
 
-    struct Key { int w, rows, pscrn, xdim, ydim, nns, qual, zero; };
+    struct Key {
+        int w, rows, pscrn, xdim, ydim, nns, qual, zero;
+    };
     std::array<Key, 3> keys {};
     std::array<VkPipeline, 3> pre_pipes {};
     std::array<VkPipeline, 3> pred_pipes {};
@@ -1222,12 +1313,15 @@ static void VS_CC Nnedi3Create(
             continue;
         }
         auto & cfg = d->planes[plane];
-        const int in_w = plane == 0 ? d->vi->width : d->vi->width >> fmt.subSamplingW;
-        const int in_h = plane == 0 ? d->vi->height : d->vi->height >> fmt.subSamplingH;
+        const int in_w =
+            plane == 0 ? d->vi->width : d->vi->width >> fmt.subSamplingW;
+        const int in_h =
+            plane == 0 ? d->vi->height : d->vi->height >> fmt.subSamplingH;
         cfg.width = in_w;
         cfg.rows = d->dh ? in_h : in_h / 2;
         // 2* in the bound: the dh zero-fill indexes the whole doubled output.
-        if (static_cast<int64_t>(2) * cfg.width * cfg.rows >= (int64_t(1) << 31) ||
+        if (static_cast<int64_t>(2) * cfg.width * cfg.rows >=
+                (int64_t(1) << 31) ||
             cfg.rows < 1 || cfg.width < 1) {
             return set_error("plane geometry out of range.");
         }
@@ -1244,7 +1338,9 @@ static void VS_CC Nnedi3Create(
                 const uint32_t groups_per_row =
                     (static_cast<uint32_t>(cfg.width) + pps - 1) / pps;
                 if (auto e = fold_grid(
-                        (static_cast<uint32_t>(cfg.rows) * groups_per_row + 127) / 128,
+                        (static_cast<uint32_t>(cfg.rows) * groups_per_row +
+                         127) /
+                            128,
                         "prescreen", cfg.pre_grid_x, cfg.pre_grid_y)) {
                     return set_error(*e);
                 }
@@ -1253,18 +1349,21 @@ static void VS_CC Nnedi3Create(
             // per 128-thread workgroup.
             const int host_pxp = use_pxp8(d->nns, d->xdim * d->ydim) ? 8 : 4;
             const uint32_t ppg = static_cast<uint32_t>(4 * host_pxp);
-            if (auto e = fold_grid(
-                    (static_cast<uint32_t>(cfg.width) * static_cast<uint32_t>(cfg.rows) + ppg - 1) / ppg,
-                    "direct predictor", cfg.pred_grid_direct_x,
-                    cfg.pred_grid_direct_y)) {
+            if (auto e = fold_grid((static_cast<uint32_t>(cfg.width) *
+                                        static_cast<uint32_t>(cfg.rows) +
+                                    ppg - 1) /
+                                       ppg,
+                                   "direct predictor", cfg.pred_grid_direct_x,
+                                   cfg.pred_grid_direct_y)) {
                 return set_error(*e);
             }
 
             // Scratch regions: the list holds one uint per field pixel, then
             // this plane's 16-byte indirect struct.
             cfg.list_offset = align32(list_run);
-            list_run = align32(cfg.list_offset +
-                static_cast<VkDeviceSize>(cfg.width) * cfg.rows * sizeof(uint32_t));
+            list_run =
+                align32(cfg.list_offset + static_cast<VkDeviceSize>(cfg.width) *
+                                              cfg.rows * sizeof(uint32_t));
             cfg.ind_offset = align32(list_run);
             list_run = align32(cfg.ind_offset + 16);
             cfg.list_elem = static_cast<int32_t>(cfg.list_offset / 4);
@@ -1274,12 +1373,13 @@ static void VS_CC Nnedi3Create(
         // The kept-row writer's grid is linearized over x and y, so a 4K
         // double-rate plane stays under the 65535-group x limit.
         {
-            const int64_t total = static_cast<int64_t>(zero ? 2 : 1) *
-                cfg.rows * cfg.width;
-            const int64_t gx = std::clamp<int64_t>((total + 255) / 256, 1, max_grid_x);
+            const int64_t total =
+                static_cast<int64_t>(zero ? 2 : 1) * cfg.rows * cfg.width;
+            const int64_t gx =
+                std::clamp<int64_t>((total + 255) / 256, 1, max_grid_x);
             cfg.keep_grid_x = static_cast<uint32_t>(gx);
-            cfg.keep_grid_y = static_cast<uint32_t>(
-                std::clamp<int64_t>((total + 256 * gx - 1) / (256 * gx), 1, max_grid_y));
+            cfg.keep_grid_y = static_cast<uint32_t>(std::clamp<int64_t>(
+                (total + 256 * gx - 1) / (256 * gx), 1, max_grid_y));
         }
 
         int ki = 0;
@@ -1293,8 +1393,10 @@ static void VS_CC Nnedi3Create(
         }
         if (ki == n_keys) {
             const Nnedi3Spec spec {
-                cfg.width, cfg.rows, d->peak, d->pscrn, d->xdim, d->ydim, d->nns,
-                d->qual, d->use_list ? 1 : 0, d->dh ? 1 : 0, zero ? 1 : 0
+                cfg.width,     cfg.rows,    d->peak,
+                d->pscrn,      d->xdim,     d->ydim,
+                d->nns,        d->qual,     d->use_list ? 1 : 0,
+                d->dh ? 1 : 0, zero ? 1 : 0
             };
             // Each handle lands in d->planes the moment it is created: a later
             // create for this key (keep is the 256-invocation one) can still
@@ -1302,10 +1404,11 @@ static void VS_CC Nnedi3Create(
             // in a local staging array would leak.
             if (d->process[plane]) {
                 if (d->use_list) {
-                    const auto result = create_pipeline(*d->gpu, spec, pre_code,
-                        pre_size, d->pipeline_layout, pred_subgroup_size,
-                        GpuWorkgroup { .x = kCoopInvocations },
-                        /*full_subgroups=*/true);
+                    const auto result =
+                        create_pipeline(*d->gpu, spec, pre_code, pre_size,
+                                        d->pipeline_layout, pred_subgroup_size,
+                                        GpuWorkgroup { .x = kCoopInvocations },
+                                        /*full_subgroups=*/true);
                     if (std::holds_alternative<std::string>(result)) {
                         return set_error(std::get<std::string>(result));
                     }
@@ -1325,21 +1428,27 @@ static void VS_CC Nnedi3Create(
                     size_t mod_size = pred_size;
                     if (!use_pxp8(d->nns, net_fs)) {
                         if (net_fs <= 64) {
-                            mod = pred_n4s_code; mod_size = pred_n4s_size;
+                            mod = pred_n4s_code;
+                            mod_size = pred_n4s_size;
                             lds = kPredictLdsN4s;
                         } else if (net_fs <= 192 &&
-                                   d->gpu->limits.maxComputeSharedMemorySize < kPredictLdsN4) {
-                            mod = pred_n4m_code; mod_size = pred_n4m_size;
+                                   d->gpu->limits.maxComputeSharedMemorySize <
+                                       kPredictLdsN4) {
+                            mod = pred_n4m_code;
+                            mod_size = pred_n4m_size;
                             lds = kPredictLdsN4m;
                         } else {
-                            mod = pred_n4_code; mod_size = pred_n4_size;
+                            mod = pred_n4_code;
+                            mod_size = pred_n4_size;
                             lds = kPredictLdsN4;
                         }
                     }
-                    const auto result = create_pipeline(*d->gpu, spec, mod, mod_size,
-                        d->pipeline_layout, pred_subgroup_size,
-                        GpuWorkgroup { .x = kCoopInvocations, .shared_bytes = lds },
-                        /*full_subgroups=*/true);
+                    const auto result =
+                        create_pipeline(*d->gpu, spec, mod, mod_size,
+                                        d->pipeline_layout, pred_subgroup_size,
+                                        GpuWorkgroup { .x = kCoopInvocations,
+                                                       .shared_bytes = lds },
+                                        /*full_subgroups=*/true);
                     if (std::holds_alternative<std::string>(result)) {
                         return set_error(std::get<std::string>(result));
                     }
@@ -1348,8 +1457,8 @@ static void VS_CC Nnedi3Create(
                 }
             }
             {
-                const auto result = create_pipeline(*d->gpu, spec, keep_code,
-                    keep_size, d->pipeline_layout, 0,
+                const auto result = create_pipeline(
+                    *d->gpu, spec, keep_code, keep_size, d->pipeline_layout, 0,
                     GpuWorkgroup { .x = 256 });
                 if (std::holds_alternative<std::string>(result)) {
                     return set_error(std::get<std::string>(result));
@@ -1357,8 +1466,8 @@ static void VS_CC Nnedi3Create(
                 keep_pipes[n_keys] = std::get<VkPipeline>(result);
                 cfg.keep_pipeline = keep_pipes[n_keys];
             }
-            keys[n_keys] = { cfg.width, cfg.rows, d->pscrn, d->xdim, d->ydim,
-                             d->nns, d->qual, zero };
+            keys[n_keys] = { cfg.width, cfg.rows, d->pscrn, d->xdim,
+                             d->ydim,   d->nns,   d->qual,  zero };
             ++n_keys;
         } else {
             // A key already built by an earlier plane: share its handles.
@@ -1373,7 +1482,7 @@ static void VS_CC Nnedi3Create(
     // a timestamp write where timestampValidBits is 0 can hang the engine.
     d->gpu_trace_frame = env_int("VSFEEL_NNEDI3_TSTAMP", 100);
     d->gpu_trace = vsfeel_debug_probe("VSFEEL_NNEDI3_TSTAMP") &&
-        vsfeel_probe_timestamps(*d->gpu, "NNEDI3");
+                   vsfeel_probe_timestamps(*d->gpu, "NNEDI3");
     if (d->gpu_trace) {
         VkQueryPoolCreateInfo qp_info {
             .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
@@ -1382,15 +1491,17 @@ static void VS_CC Nnedi3Create(
             .queryCount = 3
         };
         if (d->gpu->vk->vkCreateQueryPool(d->gpu->device, &qp_info, nullptr,
-                &d->probe.query) != VK_SUCCESS) {
+                                          &d->probe.query) != VK_SUCCESS) {
             d->probe.query = VK_NULL_HANDLE;
             d->gpu_trace = false;
         }
     }
     if (d->gpu_trace) {
-        auto e = gpu_make_buffer(*d->gpu, core, 3 * sizeof(uint64_t), d->probe.buf,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            0, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        auto e =
+            gpu_make_buffer(*d->gpu, core, 3 * sizeof(uint64_t), d->probe.buf,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                            0, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         if (!e.empty() || d->probe.buf.mapped == nullptr) {
             d->gpu_trace = false;
         } else {
@@ -1400,13 +1511,16 @@ static void VS_CC Nnedi3Create(
 
     {
         char err[512] {};
-        d->pool = d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
+        d->pool =
+            d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
         if (d->pool == nullptr) {
             return set_error("createGPUExecPool failed: "s + err);
         }
     }
 
-    VSFilterDependency deps[1] = {{ d->node, d->field > 1 ? rpGeneral : rpStrictSpatial }};
+    VSFilterDependency deps[1] = {
+        { d->node, d->field > 1 ? rpGeneral : rpStrictSpatial }
+    };
 
     Nnedi3Data * data = d.release();
 
@@ -1414,9 +1528,8 @@ static void VS_CC Nnedi3Create(
     // own producer pairs, so the core never downloads them for a consumer that
     // does not need host pixels.
     VSNode * result = vsapi->createVideoFilterEx2(
-        "NNEDI3", &data->vi_out,
-        Nnedi3GetFrame, Nnedi3Free,
-        fmParallel, ffGPUOutput, deps, 1, data, core);
+        "NNEDI3", &data->vi_out, Nnedi3GetFrame, Nnedi3Free, fmParallel,
+        ffGPUOutput, deps, 1, data, core);
     if (result == nullptr) {
         vsapi->mapSetError(out, "NNEDI3: filter creation failed");
         return;
@@ -1432,20 +1545,17 @@ void vsfeel_register_nnedi3(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
     // Under the R80 GPU API every input and the output are GPU resident: the
     // core inserts the upload for a CPU clip and a GPUDownload for a CPU
     // consumer, so the filter itself never moves a frame.
-    vspapi->registerFunction(
-        "NNEDI3",
-        "clip:vnode:gpu;"
-        "field:int;"
-        "dh:int:opt;"
-        "planes:int[]:opt;"
-        "nsize:int:opt;"
-        "nns:int:opt;"
-        "qual:int:opt;"
-        "etype:int:opt;"
-        "pscrn:int:opt;"
-        "device_id:int:opt;"
-        "num_streams:int:opt;",
-        "clip:vnode:gpu;",
-        Nnedi3Create, nullptr, plugin
-    );
+    vspapi->registerFunction("NNEDI3",
+                             "clip:vnode:gpu;"
+                             "field:int;"
+                             "dh:int:opt;"
+                             "planes:int[]:opt;"
+                             "nsize:int:opt;"
+                             "nns:int:opt;"
+                             "qual:int:opt;"
+                             "etype:int:opt;"
+                             "pscrn:int:opt;"
+                             "device_id:int:opt;"
+                             "num_streams:int:opt;",
+                             "clip:vnode:gpu;", Nnedi3Create, nullptr, plugin);
 }

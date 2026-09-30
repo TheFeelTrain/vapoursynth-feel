@@ -63,6 +63,11 @@ layout(constant_id = 12) const float H2_INV_NORM = 1.0;
 // window tile offset of the guide half: 0 when the guide is the source clip,
 // NLM_CHANNELS*(2*NLM_D+1) when rclip is given
 layout(constant_id = 13) const int GUIDE_OFF = 0;
+// Zero for the compose pass's pad/tail. A literal there folds to
+// OpConstant %ushort, which needs Int16 (shaderInt16) -- outside the device
+// baseline, and spirv-val rejects the module for it. A spec constant stays a
+// 32-bit value, so the store is an OpUConvert instead (as in to_vtype).
+layout(constant_id = 14) const float PAD_ZERO = 0.0;
 
 #define LAYERS     (2*NLM_D+1)
 #define TILE_ELEMS (PSTRIDE*PH)
@@ -135,7 +140,7 @@ void main() {
     if (px >= PAD && px < PAD + VI_DIM_X && py >= PAD && py < PAD + VI_DIM_Y) {
         u1[idx] = addr.img[tile].v[(py - PAD)*STRIDE + (px - PAD)];
     } else {
-        u1[idx] = VTYPE(0);
+        u1[idx] = to_vtype(PAD_ZERO);
     }
 }
 

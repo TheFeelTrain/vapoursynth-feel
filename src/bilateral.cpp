@@ -39,9 +39,9 @@ using namespace std::string_literals;
 constexpr int kMaxRadius = 32767;
 
 struct BilateralPlaneConfig {
-    int width {};          // visible pixels
+    int width {}; // visible pixels
     int height {};
-    int stride {};         // the core's plane pitch in elements
+    int stride {}; // the core's plane pitch in elements
     VkPipeline pipeline {};
     uint32_t grid_x {};
     uint32_t grid_y {};
@@ -49,7 +49,7 @@ struct BilateralPlaneConfig {
 
 struct BilateralData {
     VSNode * node {};
-    VSNode * ref_node {};   // optional guide clip
+    VSNode * ref_node {}; // optional guide clip
     const VSVideoInfo * vi {};
 
     int bits {}, elem_bytes {};
@@ -72,11 +72,12 @@ struct BilateralData {
         if (host_timing && ht_n.load()) {
             const double n = static_cast<double>(ht_n.load());
             fprintf(stderr,
-                "[bilat-timing] frames=%.0f per-frame us: acquire=%7.1f "
-                "record=%7.1f submit=%7.1f total=%7.1f\n",
-                n, ht_acquire_ns.load() / 1000.0 / n,
-                ht_record_ns.load() / 1000.0 / n,
-                ht_submit_ns.load() / 1000.0 / n, ht_total_ns.load() / 1000.0 / n);
+                    "[bilat-timing] frames=%.0f per-frame us: acquire=%7.1f "
+                    "record=%7.1f submit=%7.1f total=%7.1f\n",
+                    n, ht_acquire_ns.load() / 1000.0 / n,
+                    ht_record_ns.load() / 1000.0 / n,
+                    ht_submit_ns.load() / 1000.0 / n,
+                    ht_total_ns.load() / 1000.0 / n);
         }
         if (!gpu) {
             return;
@@ -132,10 +133,10 @@ struct BilateralSpecData {
     int32_t block_y;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 12> shared_entries {{
-    { 0,  0, sizeof(int32_t) },
-    { 1,  4, sizeof(int32_t) },
-    { 2,  8, sizeof(int32_t) },
+static constexpr std::array<VkSpecializationMapEntry, 12> shared_entries { {
+    { 0, 0, sizeof(int32_t) },
+    { 1, 4, sizeof(int32_t) },
+    { 2, 8, sizeof(int32_t) },
     { 3, 12, sizeof(float) },
     { 4, 16, sizeof(float) },
     { 5, 20, sizeof(int32_t) },
@@ -145,23 +146,24 @@ static constexpr std::array<VkSpecializationMapEntry, 12> shared_entries {{
     { 9, 36, sizeof(int32_t) },
     { 10, 40, sizeof(int32_t) },
     { 11, 44, sizeof(int32_t) },
-}};
+} };
 
-static constexpr std::array<VkSpecializationMapEntry, 9> plain_entries {{
-    { 0,  0, sizeof(int32_t) },
-    { 1,  4, sizeof(int32_t) },
-    { 2,  8, sizeof(int32_t) },
+static constexpr std::array<VkSpecializationMapEntry, 9> plain_entries { {
+    { 0, 0, sizeof(int32_t) },
+    { 1, 4, sizeof(int32_t) },
+    { 2, 8, sizeof(int32_t) },
     { 3, 12, sizeof(float) },
     { 4, 16, sizeof(float) },
     { 5, 20, sizeof(int32_t) },
     { 6, 24, sizeof(int32_t) },
     { 10, 40, sizeof(int32_t) },
     { 11, 44, sizeof(int32_t) },
-}};
+} };
 
-static std::variant<VkPipeline, std::string> create_pipeline(
-    const GPUDevice & dev, bool use_shared, const BilateralSpecData & spec,
-    const uint32_t * code, size_t code_size, VkPipelineLayout layout) {
+static std::variant<VkPipeline, std::string>
+create_pipeline(const GPUDevice & dev, bool use_shared,
+                const BilateralSpecData & spec, const uint32_t * code,
+                size_t code_size, VkPipelineLayout layout) {
 
     const VkSpecializationMapEntry * entries;
     uint32_t entry_count;
@@ -177,11 +179,13 @@ static std::variant<VkPipeline, std::string> create_pipeline(
     const GpuWorkgroup workgroup {
         .x = static_cast<uint32_t>(spec.block_x),
         .y = static_cast<uint32_t>(spec.block_y),
-        .shared_bytes = use_shared
-            ? static_cast<uint32_t>(spec.shared_floats * sizeof(float)) : 0u
+        .shared_bytes = use_shared ? static_cast<uint32_t>(spec.shared_floats *
+                                                           sizeof(float))
+                                   : 0u
     };
     return gpu_create_pipeline(dev, code, code_size, layout, entries, &spec,
-        entry_count, sizeof(spec), "bilateral", 0, workgroup);
+                               entry_count, sizeof(spec), "bilateral", 0,
+                               workgroup);
 }
 
 // ---------------------------------------------------------------------------
@@ -200,14 +204,14 @@ static void bilateral_process_mask(const BilateralData & d, int numPlanes,
 
 // GPU input: the kernels read the source (and guide) planes and write the output
 // frame's planes in place. The core owns every transfer.
-static const VSFrame * bilateral_gpu_frame(
-    BilateralData * d, int n, VSFrameContext * frameCtx, VSCore * core,
-    const VSAPI * vsapi) {
+static const VSFrame * bilateral_gpu_frame(BilateralData * d, int n,
+                                           VSFrameContext * frameCtx,
+                                           VSCore * core, const VSAPI * vsapi) {
 
     const int numPlanes = d->vi->format.numPlanes;
     const VSFrame * src = vsapi->getFrameFilter(n, d->node, frameCtx);
-    const VSFrame * ref = d->ref_node
-        ? vsapi->getFrameFilter(n, d->ref_node, frameCtx) : nullptr;
+    const VSFrame * ref =
+        d->ref_node ? vsapi->getFrameFilter(n, d->ref_node, frameCtx) : nullptr;
 
     bool any_process = false, all_process = true;
     bilateral_process_mask(*d, numPlanes, any_process, all_process);
@@ -217,20 +221,20 @@ static const VSFrame * bilateral_gpu_frame(
     // newVideoFrame2 infers residency from the plane sources, so a frame with no
     // source plane at all has to come from newGPUVideoFrame.
     const int pl[] = { 0, 1, 2 };
-    const VSFrame * fr[] = {
-        d->process[0] ? nullptr : src,
-        d->process[1] ? nullptr : src,
-        d->process[2] ? nullptr : src
-    };
-    VSFrame * dst = all_process
-        ? d->gpu->api->newGPUVideoFrame(&d->vi->format, d->vi->width,
-              d->vi->height, src, core)
-        : vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height,
-              fr, pl, src, core);
+    const VSFrame * fr[] = { d->process[0] ? nullptr : src,
+                             d->process[1] ? nullptr : src,
+                             d->process[2] ? nullptr : src };
+    VSFrame * dst =
+        all_process
+            ? d->gpu->api->newGPUVideoFrame(&d->vi->format, d->vi->width,
+                                            d->vi->height, src, core)
+            : vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height,
+                                    fr, pl, src, core);
     if (!dst) {
-        vsfeel_trace_error("BilateralVK", n, "failed to allocate the output frame",
-                           d->gpu.get());
-        vsapi->setFilterError("BilateralVK: failed to allocate the output frame", frameCtx);
+        vsfeel_trace_error("BilateralVK", n,
+                           "failed to allocate the output frame", d->gpu.get());
+        vsapi->setFilterError(
+            "BilateralVK: failed to allocate the output frame", frameCtx);
         if (ref) {
             vsapi->freeFrame(ref);
         }
@@ -254,7 +258,8 @@ static const VSFrame * bilateral_gpu_frame(
     vsfeel_trace_mark("acquire");
 
     char errbuf[512] {};
-    VSGPUExecContext * ctx = d->gpu->api->gpuExecAcquire(d->pool, errbuf, sizeof(errbuf));
+    VSGPUExecContext * ctx =
+        d->gpu->api->gpuExecAcquire(d->pool, errbuf, sizeof(errbuf));
     auto fail = [&](const std::string & message) -> const VSFrame * {
         if (ctx) {
             d->gpu->api->gpuExecAbandon(ctx);
@@ -285,26 +290,31 @@ static const VSFrame * bilateral_gpu_frame(
         }
         VSVulkanPlaneInfo src_plane {};
         if (d->gpu->api->getGPUPlane(src, p, &src_plane)) {
-            return fail("source plane " + std::to_string(p) + " is not GPU resident");
+            return fail("source plane " + std::to_string(p) +
+                        " is not GPU resident");
         }
         VSVulkanPlaneInfo dst_plane {};
         if (d->gpu->api->getGPUPlane(dst, p, &dst_plane)) {
-            return fail("output plane " + std::to_string(p) + " is not GPU resident");
+            return fail("output plane " + std::to_string(p) +
+                        " is not GPU resident");
         }
         VkBuffer ref_buffer = src_plane.buffer;
         if (d->ref_node) {
             VSVulkanPlaneInfo ref_plane {};
             if (d->gpu->api->getGPUPlane(ref, p, &ref_plane)) {
-                return fail("guide plane " + std::to_string(p) + " is not GPU resident");
+                return fail("guide plane " + std::to_string(p) +
+                            " is not GPU resident");
             }
             ref_buffer = ref_plane.buffer;
         }
 
         const auto & cfg = d->planes[p];
-        d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cfg.pipeline);
+        d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                      cfg.pipeline);
         // binding 2 is the guide; without one the source stands in for it and
         // the shader's HAS_REF==0 path never reads it
-        const VkBuffer buffers[3] { src_plane.buffer, dst_plane.buffer, ref_buffer };
+        const VkBuffer buffers[3] { src_plane.buffer, dst_plane.buffer,
+                                    ref_buffer };
         gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 3);
         d->gpu->vk->vkCmdDispatch(cmd, cfg.grid_x, cfg.grid_y, 1);
     }
@@ -323,8 +333,9 @@ static const VSFrame * bilateral_gpu_frame(
 
     vsfeel_trace_mark("submit");
     uint64_t signaled = 0;
-    const int submit_error = d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf, sizeof(errbuf));
-    ctx = nullptr;  // consumed either way
+    const int submit_error =
+        d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf, sizeof(errbuf));
+    ctx = nullptr; // consumed either way
     if (submit_error) {
         return fail("submit failed: "s + errbuf);
     }
@@ -334,7 +345,8 @@ static const VSFrame * bilateral_gpu_frame(
     if (d->host_timing) {
         const auto ns = [](auto a, auto b) {
             return static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                    .count());
         };
         d->ht_acquire_ns += ns(t0, t1);
         d->ht_record_ns += ns(t1, t2);
@@ -350,9 +362,10 @@ static const VSFrame * bilateral_gpu_frame(
     return dst;
 }
 
-static const VSFrame *VS_CC BilateralGetFrame(
-    int n, int activationReason, void *instanceData, [[maybe_unused]] void **frameData,
-    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+static const VSFrame * VS_CC
+BilateralGetFrame(int n, int activationReason, void * instanceData,
+                  [[maybe_unused]] void ** frameData, VSFrameContext * frameCtx,
+                  VSCore * core, const VSAPI * vsapi) {
 
     BilateralData * d = static_cast<BilateralData *>(instanceData);
 
@@ -374,8 +387,9 @@ static const VSFrame *VS_CC BilateralGetFrame(
 // Creation
 // ---------------------------------------------------------------------------
 
-static void VS_CC BilateralFree(
-    void *instanceData, [[maybe_unused]] VSCore *core, const VSAPI *vsapi) {
+static void VS_CC BilateralFree(void * instanceData,
+                                [[maybe_unused]] VSCore * core,
+                                const VSAPI * vsapi) {
 
     BilateralData * d = static_cast<BilateralData *>(instanceData);
 
@@ -387,9 +401,9 @@ static void VS_CC BilateralFree(
     delete d;
 }
 
-static void VS_CC BilateralCreate(
-    const VSMap *in, VSMap *out, [[maybe_unused]] void *userData,
-    VSCore *core, const VSAPI *vsapi) {
+static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
+                                  [[maybe_unused]] void * userData,
+                                  VSCore * core, const VSAPI * vsapi) {
 
     auto d { std::make_unique<BilateralData>() };
 
@@ -413,14 +427,11 @@ static void VS_CC BilateralCreate(
         vsapi->freeNode(d->node);
     };
 
-    if (auto [bps, sample] = std::pair{
-            d->vi->format.bitsPerSample,
-            d->vi->format.sampleType
-        };
+    if (auto [bps, sample] =
+            std::pair { d->vi->format.bitsPerSample, d->vi->format.sampleType };
         !vsh::isConstantVideoFormat(d->vi) ||
         (sample == stInteger && bps != 16) ||
-        (sample == stFloat && bps != 32)
-    ) {
+        (sample == stFloat && bps != 32)) {
         return set_error("input bitdepth must be 16 (integer) or 32 (float).");
     }
 
@@ -428,14 +439,15 @@ static void VS_CC BilateralCreate(
     d->elem_bytes = d->bits / 8;
 
     if (has_ref) {
-        const auto ref_vi = vsapi->getVideoInfo(d->ref_node);
+        const auto * const ref_vi = vsapi->getVideoInfo(d->ref_node);
         if (!vsh::isSameVideoInfo(d->vi, ref_vi) ||
             d->vi->numFrames != ref_vi->numFrames) {
-            return set_error("\"ref\" must be of the same format and dimensions as \"clip\"");
+            return set_error(
+                "\"ref\" must be of the same format and dimensions as \"clip\"");
         }
     }
 
-    std::array<float, 3> sigma_spatial;
+    std::array<float, 3> sigma_spatial {};
     for (int i = 0; i < std::ssize(sigma_spatial); ++i) {
         sigma_spatial[i] = static_cast<float>(
             vsapi->mapGetFloat(in, "sigma_spatial", i, &error));
@@ -452,7 +464,8 @@ static void VS_CC BilateralCreate(
                 sigma_spatial[i] = sigma_spatial[i - 1];
             }
         } else if (!std::isfinite(sigma_spatial[i]) || sigma_spatial[i] < 0.f) {
-            return set_error("\"sigma_spatial\" must be finite and non-negative");
+            return set_error(
+                "\"sigma_spatial\" must be finite and non-negative");
         }
 
         if (sigma_spatial[i] < FLT_EPSILON) {
@@ -460,13 +473,14 @@ static void VS_CC BilateralCreate(
         }
     }
 
-    std::array<float, 3> sigma_spatial_scaled;
+    std::array<float, 3> sigma_spatial_scaled {};
     for (int i = 0; i < std::ssize(sigma_spatial); ++i) {
-        sigma_spatial_scaled[i] = (-0.5f / (sigma_spatial[i] * sigma_spatial[i])) *
+        sigma_spatial_scaled[i] =
+            (-0.5f / (sigma_spatial[i] * sigma_spatial[i])) *
             std::numbers::log2e_v<float>;
     }
 
-    std::array<float, 3> sigma_color;
+    std::array<float, 3> sigma_color {};
     for (int i = 0; i < std::ssize(sigma_color); ++i) {
         sigma_color[i] = static_cast<float>(
             vsapi->mapGetFloat(in, "sigma_color", i, &error));
@@ -482,25 +496,27 @@ static void VS_CC BilateralCreate(
         }
     }
 
-    std::array<float, 3> sigma_color_scaled;
+    std::array<float, 3> sigma_color_scaled {};
     for (int i = 0; i < std::ssize(sigma_color); ++i) {
         if (sigma_color[i] < FLT_EPSILON) {
             d->process[i] = false;
         } else {
-            sigma_color_scaled[i] = (-0.5f / (sigma_color[i] * sigma_color[i])) *
+            sigma_color_scaled[i] =
+                (-0.5f / (sigma_color[i] * sigma_color[i])) *
                 std::numbers::log2e_v<float>;
         }
     }
 
-    std::array<int, 3> radius;
+    std::array<int, 3> radius {};
     for (int i = 0; i < std::ssize(radius); ++i) {
         radius[i] = vsh::int64ToIntS(vsapi->mapGetInt(in, "radius", i, &error));
 
         if (error) {
             // clamp before the cast: a huge finite sigma would otherwise make
             // the float-to-int conversion undefined (the reference clamps too)
-            radius[i] = std::max(1, static_cast<int>(
-                std::min(std::roundf(sigma_spatial[i] * 3.f), 1000000.f)));
+            radius[i] = std::max(
+                1, static_cast<int>(std::min(
+                       std::roundf(sigma_spatial[i] * 3.f), 1000000.f)));
         } else if (radius[i] <= 0) {
             return set_error("\"radius\" must be positive");
         }
@@ -509,15 +525,18 @@ static void VS_CC BilateralCreate(
         // the derived one above reaches 1e6, both of which wrap the tile math
         // that sizes LDS later in this function.
         if (radius[i] > kMaxRadius) {
-            return set_error("\"radius\" (explicit or derived from sigma_spatial) "
-                "must be at most " + std::to_string(kMaxRadius));
+            return set_error(
+                "\"radius\" (explicit or derived from sigma_spatial) "
+                "must be at most " +
+                std::to_string(kMaxRadius));
         }
     }
 
     // device_id and num_streams are registered but never read: the core owns
     // the one device and sizes in-flight depth itself (exec pool ring).
 
-    bool use_shared_memory = !!vsapi->mapGetInt(in, "use_shared_memory", 0, &error);
+    bool use_shared_memory =
+        !!vsapi->mapGetInt(in, "use_shared_memory", 0, &error);
     if (error) {
         use_shared_memory = true;
     }
@@ -554,19 +573,25 @@ static void VS_CC BilateralCreate(
 
         // A block over a limit (or a negative one, which the unsigned cast in
         // the comparison turns into one) falls back to 16x16, as it always has.
-        if (static_cast<uint32_t>(block_x) > limits.maxComputeWorkGroupSize[0] ||
-            static_cast<uint32_t>(block_y) > limits.maxComputeWorkGroupSize[1] ||
-            static_cast<uint32_t>(block_x) * block_y > limits.maxComputeWorkGroupInvocations) {
-            block_x = std::min<int>(16, static_cast<int>(limits.maxComputeWorkGroupSize[0]));
-            block_y = std::min<int>(16, static_cast<int>(limits.maxComputeWorkGroupSize[1]));
+        if (static_cast<uint32_t>(block_x) >
+                limits.maxComputeWorkGroupSize[0] ||
+            static_cast<uint32_t>(block_y) >
+                limits.maxComputeWorkGroupSize[1] ||
+            static_cast<uint32_t>(block_x) * block_y >
+                limits.maxComputeWorkGroupInvocations) {
+            block_x = std::min<int>(
+                16, static_cast<int>(limits.maxComputeWorkGroupSize[0]));
+            block_y = std::min<int>(
+                16, static_cast<int>(limits.maxComputeWorkGroupSize[1]));
         }
         // That fallback is still 256 invocations, so halve the shape until the
         // device accepts it: 16x16 failed on a device whose limit is the Vulkan
         // minimum of 128. Both dimensions are spec constants and the grid
         // follows them, so any shape here is valid.
         const auto over_budget = [&] {
-            return static_cast<uint64_t>(block_x) * static_cast<uint64_t>(block_y) >
-                limits.maxComputeWorkGroupInvocations;
+            return static_cast<uint64_t>(block_x) *
+                       static_cast<uint64_t>(block_y) >
+                   limits.maxComputeWorkGroupInvocations;
         };
         while (block_y > 1 && over_budget()) {
             block_y /= 2;
@@ -607,10 +632,12 @@ static void VS_CC BilateralCreate(
         VSFrame * probe = vsapi->newVideoFrame(&d->vi->format, d->vi->width,
                                                d->vi->height, nullptr, core);
         if (probe == nullptr) {
-            return set_error("could not allocate a probe frame to read the plane stride");
+            return set_error(
+                "could not allocate a probe frame to read the plane stride");
         }
         for (int p = 0; p < d->vi->format.numPlanes; ++p) {
-            plane_stride[p] = static_cast<int>(vsapi->getStride(probe, p) / d->elem_bytes);
+            plane_stride[p] =
+                static_cast<int>(vsapi->getStride(probe, p) / d->elem_bytes);
         }
         vsapi->freeFrame(probe);
     }
@@ -629,8 +656,9 @@ static void VS_CC BilateralCreate(
         int radius;
 
         bool operator==(const PipelineKey & other) const noexcept {
-            return width == other.width && height == other.height && stride == other.stride &&
-                   ss == other.ss && sc == other.sc && radius == other.radius;
+            return width == other.width && height == other.height &&
+                   stride == other.stride && ss == other.ss && sc == other.sc &&
+                   radius == other.radius;
         }
     };
     std::array<PipelineKey, 3> pipeline_keys {};
@@ -651,18 +679,22 @@ static void VS_CC BilateralCreate(
         // The kernel addresses a plane through signed 32-bit element offsets;
         // reject a plane whose last element would not fit rather than letting it
         // wrap and write outside the buffer.
-        const int64_t last = static_cast<int64_t>(plane_height - 1) * stride + plane_width - 1;
+        const int64_t last =
+            static_cast<int64_t>(plane_height - 1) * stride + plane_width - 1;
         if (last > INT32_MAX) {
-            return set_error("plane " + std::to_string(plane) + " is too large: " +
-                std::to_string(plane_width) + "x" + std::to_string(plane_height) +
-                " at stride " + std::to_string(stride) +
-                " overflows the kernel's 32-bit addressing");
+            return set_error("plane " + std::to_string(plane) +
+                             " is too large: " + std::to_string(plane_width) +
+                             "x" + std::to_string(plane_height) +
+                             " at stride " + std::to_string(stride) +
+                             " overflows the kernel's 32-bit addressing");
         }
 
-        pipeline_keys[plane] = {
-            plane_width, plane_height, stride,
-            sigma_spatial_scaled[plane], sigma_color_scaled[plane], radius[plane]
-        };
+        pipeline_keys[plane] = { plane_width,
+                                 plane_height,
+                                 stride,
+                                 sigma_spatial_scaled[plane],
+                                 sigma_color_scaled[plane],
+                                 radius[plane] };
         pipeline_valid[plane] = true;
     }
 
@@ -688,11 +720,14 @@ static void VS_CC BilateralCreate(
         const int64_t grid_y = (cfg.height - 1) / block_y + 1;
         if (grid_x > static_cast<int64_t>(max_grid_x) ||
             grid_y > static_cast<int64_t>(max_grid_y)) {
-            return set_error("plane " + std::to_string(plane) + " (" +
+            return set_error(
+                "plane " + std::to_string(plane) + " (" +
                 std::to_string(cfg.width) + "x" + std::to_string(cfg.height) +
-                ") needs a " + std::to_string(grid_x) + "x" + std::to_string(grid_y) +
+                ") needs a " + std::to_string(grid_x) + "x" +
+                std::to_string(grid_y) +
                 " workgroup grid, more than this device can dispatch (" +
-                std::to_string(max_grid_x) + "x" + std::to_string(max_grid_y) + ")");
+                std::to_string(max_grid_x) + "x" + std::to_string(max_grid_y) +
+                ")");
         }
         cfg.grid_x = static_cast<uint32_t>(grid_x);
         cfg.grid_y = static_cast<uint32_t>(grid_y);
@@ -706,7 +741,8 @@ static void VS_CC BilateralCreate(
 
         // gate on the device's real LDS limit: the old hardcoded 48 KiB cap sent
         // wide radii that still fit to the ~4x slower plain kernel
-        plane_shared[plane] = use_shared_memory &&
+        plane_shared[plane] =
+            use_shared_memory &&
             shared_bytes <= d->gpu->limits.maxComputeSharedMemorySize;
     }
 
@@ -715,16 +751,20 @@ static void VS_CC BilateralCreate(
     const uint32_t * plain_code = nullptr;
     size_t plain_size = 0;
     switch (d->bits) {
-        case 16:
-            shared_code = bilateral_shared_16_spv; shared_size = bilateral_shared_16_spv_size;
-            plain_code = bilateral_plain_16_spv; plain_size = bilateral_plain_16_spv_size;
-            break;
-        case 32:
-            shared_code = bilateral_shared_32_spv; shared_size = bilateral_shared_32_spv_size;
-            plain_code = bilateral_plain_32_spv; plain_size = bilateral_plain_32_spv_size;
-            break;
-        default:
-            return set_error("unsupported bit depth");
+    case 16:
+        shared_code = bilateral_shared_16_spv;
+        shared_size = bilateral_shared_16_spv_size;
+        plain_code = bilateral_plain_16_spv;
+        plain_size = bilateral_plain_16_spv_size;
+        break;
+    case 32:
+        shared_code = bilateral_shared_32_spv;
+        shared_size = bilateral_shared_32_spv_size;
+        plain_code = bilateral_plain_32_spv;
+        plain_size = bilateral_plain_32_spv_size;
+        break;
+    default:
+        return set_error("unsupported bit depth");
     }
 
     for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
@@ -753,26 +793,24 @@ static void VS_CC BilateralCreate(
         const size_t shared_bytes =
             static_cast<size_t>(1 + has_ref) * tile_x * tile_y * sizeof(float);
 
-        BilateralSpecData spec {
-            .width = key.width,
-            .height = key.height,
-            .stride = key.stride,
-            .sigma_spatial_scaled = key.ss,
-            .sigma_color_scaled = key.sc,
-            .radius = key.radius,
-            .has_ref = has_ref,
-            .tile_x = tile_x,
-            .tile_y = tile_y,
-            .shared_floats = static_cast<int32_t>(shared_bytes / sizeof(float)),
-            .block_x = block_x,
-            .block_y = block_y
-        };
+        BilateralSpecData spec { .width = key.width,
+                                 .height = key.height,
+                                 .stride = key.stride,
+                                 .sigma_spatial_scaled = key.ss,
+                                 .sigma_color_scaled = key.sc,
+                                 .radius = key.radius,
+                                 .has_ref = has_ref,
+                                 .tile_x = tile_x,
+                                 .tile_y = tile_y,
+                                 .shared_floats = static_cast<int32_t>(
+                                     shared_bytes / sizeof(float)),
+                                 .block_x = block_x,
+                                 .block_y = block_y };
 
         const auto result = create_pipeline(
             *d->gpu, plane_shared[plane], spec,
             plane_shared[plane] ? shared_code : plain_code,
-            plane_shared[plane] ? shared_size : plain_size,
-            d->pipeline_layout);
+            plane_shared[plane] ? shared_size : plain_size, d->pipeline_layout);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -781,28 +819,26 @@ static void VS_CC BilateralCreate(
 
     {
         char err[512] {};
-        d->pool = d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
+        d->pool =
+            d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
         if (d->pool == nullptr) {
             return set_error("createGPUExecPool failed: "s + err);
         }
     }
 
-    BilateralData *data = d.release();
+    BilateralData * data = d.release();
 
     // A spatial filter, so the strict-spatial request pattern is the honest
     // declaration for both inputs.
-    VSFilterDependency deps[2] = {
-        { data->node, rpStrictSpatial },
-        { data->ref_node, rpStrictSpatial }
-    };
+    VSFilterDependency deps[2] = { { data->node, rpStrictSpatial },
+                                   { data->ref_node, rpStrictSpatial } };
 
     // ffGPUOutput: the frames this filter returns live in VRAM and carry their
     // own producer pairs, so the core never downloads them for a consumer that
     // does not need host pixels.
     VSNode * result = vsapi->createVideoFilterEx2(
-        "Bilateral", data->vi,
-        BilateralGetFrame, BilateralFree,
-        fmParallel, ffGPUOutput, deps, data->ref_node ? 2 : 1, data, core);
+        "Bilateral", data->vi, BilateralGetFrame, BilateralFree, fmParallel,
+        ffGPUOutput, deps, data->ref_node ? 2 : 1, data, core);
     if (result == nullptr) {
         // The core returns nullptr without running the free callback when the
         // node constructor throws, so release the instance through it here.
@@ -818,19 +854,17 @@ static void VS_CC BilateralCreate(
 // ---------------------------------------------------------------------------
 
 void vsfeel_register_bilateral(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
-    vspapi->registerFunction(
-        "Bilateral",
-        "clip:vnode:gpu;"
-        "sigma_spatial:float[]:opt;"
-        "sigma_color:float[]:opt;"
-        "radius:int[]:opt;"
-        "device_id:int:opt;"
-        "num_streams:int:opt;"
-        "use_shared_memory:int:opt;"
-        "block_x:int:opt;"
-        "block_y:int:opt;"
-        "ref:vnode:gpu:opt;",
-        "clip:vnode:gpu;",
-        BilateralCreate, nullptr, plugin
-    );
+    vspapi->registerFunction("Bilateral",
+                             "clip:vnode:gpu;"
+                             "sigma_spatial:float[]:opt;"
+                             "sigma_color:float[]:opt;"
+                             "radius:int[]:opt;"
+                             "device_id:int:opt;"
+                             "num_streams:int:opt;"
+                             "use_shared_memory:int:opt;"
+                             "block_x:int:opt;"
+                             "block_y:int:opt;"
+                             "ref:vnode:gpu:opt;",
+                             "clip:vnode:gpu;", BilateralCreate, nullptr,
+                             plugin);
 }

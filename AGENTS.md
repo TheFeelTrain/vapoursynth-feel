@@ -12,8 +12,8 @@ implemented in **Vulkan** (GLSL compute shaders compiled to SPIR-V with
 results equivalent to, a reference implementation in the `reference/` folder.
 
 The primary GPU this project is developed and tuned against is an **AMD Radeon
-RX 7900XTX (RDNA3, gfx1100)**. Optimizations are targeted at that GPU, but do
-consider other configurations if possible.
+RX 7900XTX (RDNA3, gfx1100)**. Optimizations are targeted at that GPU, but
+other configurations should be considered when possible.
 
 ## The `reference/` folder is READ-ONLY
 
@@ -30,17 +30,17 @@ implementations (e.g. `vapoursynth-zipcl`, `vapoursynth-zipcu`,
 
 ## The goal
 
-Make every vsfeel filter **faster than the reference implementations** on the
-target GPU. Concretely, the benchmark should show vsfeel beating the fastest
-reference (vszipcl / vszipcu, whichever is faster) by a comfortable margin.
+Make every vsfeel filter **faster than the reference implementations**. 
+Concretely, the benchmark should show vsfeel beating the fastest
+reference (usually vszipcl) by a comfortable margin.
 
 Speed matters more than code size or elegance. Do not be afraid to rewrite a
 filter wholesale if it makes it meaningfully faster, as long as it stays
-correct and keeps passing the tests.
+correct and passes all tests.
 
 When tuning, use the benchmark (below) to measure before/after, and treat the
 GPUs documented here as the target. `MANGOHUD=0` should be set for every
-benchmark run — it does not change results, it just suppresses extra messages
+benchmark run. It does not change results, it just suppresses extra messages
 in the output.
 
 ## Comments and docstrings
@@ -49,9 +49,7 @@ Keep them short and only where the code is not self-explanatory: aim for 3
 lines or less, say *why* rather than *what*, and do not restate the code. Test
 docstrings are a few lines at most. Notes files (`notes/<filter>.md`) may be
 longer, but do not pad them. Never cite work-order or report IDs (`WO-55`,
-`§I.11`, `T9`) in code, comments, docstrings or notes: those files are untracked
-working documents, so a checkout reader cannot resolve the codes. When a
-number matters, put it next to the config that produced it.
+`§I.11`, `T9`) in code, comments, docstrings or notes.
 
 ## Testing
 
@@ -59,7 +57,7 @@ Every filter needs **comprehensive unit tests** in `tests/`, run with pytest.
 The committed `tests/noise_24f.mkv` clip (24 frames of random noise) is the
 standard test input.
 
-- Tests must verify **correctness against the reference behaviour** and
+- Tests must verify **correctness against the reference behavior** and
   **self-consistency** (determinism across runs, multi-stream vs single-stream
   agreement, parallel-load consistency).
 - The `tests/` folder has `conftest.py` with shared fixtures/helpers
@@ -118,7 +116,7 @@ runs it. Plugins are described separately in `PLUGINS`.
 To benchmark a single filter against the references:
 
 ```bash
-MANGOHUD=0 python3 tools/benchmark.py --filter dfttest vsfeel vszipcl
+python3 tools/benchmark.py --filter dfttest vsfeel vszipcl
 ```
 
 This prints fps for each plugin and ranks them. Compare vsfeel's fps against
@@ -128,9 +126,8 @@ frames.
 Two-tier measurement keeps the iteration loop tight: screen candidates with a
 fast custom `.vpy` + `vspipe` (a few hundred frames, BlankClip or a small
 cached real clip), and grade only on full `benchmark.py` same-session pairs over
-1000+ frames (a `rep_<filter>.sh` loop of 5000-frame ×3 repeats settles
-medians). A one-off fast-vpy number that later pairs contradict was noise,
-not a finding.
+1000+ frames (a `tools/benchmark.py` run gives the median of 3 runs by default). 
+A one-off fast-vpy number that later pairs contradict was noise, not a finding.
 
 ## Comparing a vsfeel kernel against the reference kernels
 
@@ -537,7 +534,8 @@ The SPIR-V shaders are compiled at build time and embedded into a generated C++
 header (`spirv_binaries.h`) via `src/gen_spirv_header.py`. Adding a shader
 variant is one line in the owning component's `VK_*_VARIANTS` table in
 `CMakeLists.txt` — an `"<out>|<source>|<defs>"` entry naming the output, the
-`.comp` file and every `-D` (including `--target-env`). `add_spv_variant()`
+`.comp` file and every `-D`; `--target-env=vulkan1.4` is not in the table because
+every variant uses it (the R80 core's device baseline). `add_spv_variant()`
 turns each entry into the `glslc` rule and collects the outputs into
 `VK_SPV_OUTPUTS`, which is generated, not edited by hand. The header script
 (`--out <header> <spv...>`) derives symbol names from the filenames
@@ -559,7 +557,7 @@ the filter's creation function — nothing else.
 Every variant rule also depends on a generated `<out>.spv.flags` stamp holding
 that variant's `glslc` arguments. Ninja would rebuild on a flag-only change by
 itself, but the default Makefiles generator does not: without the stamp a
-changed `-D`, `--target-env` or `PROBE`/`MAXW` cache value leaves a stale
+changed `-D` or `PROBE`/`MAXW` cache value leaves a stale
 `.spv` in place and silently ships the old kernel (a stale probe kernel already
 invalidated a round of measurements once). The stamp is written with
 `file(GENERATE)` and content-hashed, so an unrelated `CMakeLists.txt` edit does
@@ -587,6 +585,36 @@ Measured on the full suite when it was 443 tests: **~7.5 min cold → ~3.5 min f
 the run that builds the cache → ~2.5 min warm**. The suite has since grown to
 789 tests (522 s serial, ~2.5 min via `tools/test.sh` — see Testing). The first
 run after a driver or `glslc` update pays the compile again by design.
+
+## Code quality (lint)
+
+`tools/lint.sh` is the single entry point, and CI runs exactly it
+(`.github/workflows/lint.yml`). Four gates:
+
+- **format** — `clang-format --dry-run --Werror` over `src/*.cpp` and `src/*.h`
+  (`.clang-format`); `tools/lint.sh --fix` rewrites in place.
+- **shaders** — the build's `shader-validate` target: every variant is compiled
+  with `glslc -Werror` and each emitted module is checked with `spirv-val`
+  against `vulkan1.4`. A shader that compiles but is not valid SPIR-V fails the
+  build here (this is what caught a 16-bit constant needing `Int16`).
+- **tidy** — `clang-tidy` over the compile database (`.clang-tidy`).
+- **cppcheck** — over the same database.
+
+The last three need a configured `build/` — they read `compile_commands.json`
+and `build/vk_spv/`, which `tools/install.sh` writes. A gate whose tool is
+missing reports `skipped`; a gate whose build directory is missing fails,
+because then it did not run.
+
+The `.comp` shaders are deliberately **not** clang-format'd: clang-format parses
+GLSL as C++ and reflows the buffer blocks and the push-constant struct into
+unreadable shapes. They are hand-formatted to the same 80 columns and gated by
+the shader build instead; `.editorconfig` records the whitespace conventions for
+both.
+
+CI pins `clang-format`/`clang-tidy` to the version the tree was formatted with
+(the PyPI wheels), because formatter output changes between LLVM majors and the
+runner's apt packages are older. `VSFEEL_WERROR=ON` (a configure option, off by
+default) turns the host warning baseline into an error; the lint job sets it.
 
 ## Use web searches
 

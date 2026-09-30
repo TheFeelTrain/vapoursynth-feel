@@ -125,16 +125,16 @@ struct Eedi3RowSpec {
     int32_t lsz_vcheck;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 8> row_entries {{
-    { 0,  0, sizeof(int32_t) },
-    { 1,  4, sizeof(int32_t) },
-    { 2,  8, sizeof(int32_t) },
+static constexpr std::array<VkSpecializationMapEntry, 8> row_entries { {
+    { 0, 0, sizeof(int32_t) },
+    { 1, 4, sizeof(int32_t) },
+    { 2, 8, sizeof(int32_t) },
     { 3, 12, sizeof(int32_t) },
     { 4, 16, sizeof(int32_t) },
     { 5, 20, sizeof(int32_t) },
     { 6, 24, sizeof(int32_t) },
     { 7, 28, sizeof(int32_t) },
-}};
+} };
 
 struct Eedi3Pipelines {
     VkPipeline row {};
@@ -155,22 +155,22 @@ struct Eedi3Pipelines {
 // Per-geometry plane description: kernel dims, region offsets into the per
 // frame scratch buffer, and the pipelines that run it.
 struct Eedi3PlaneConfig {
-    int width {};                     // kernel plane width (row kernel's WIDTH)
-    int height {};                    // kernel plane height
-    int out_w {};                     // output (frame order) plane dims
+    int width {};  // kernel plane width (row kernel's WIDTH)
+    int height {}; // kernel plane height
+    int out_w {};  // output (frame order) plane dims
     int out_h {};
-    int rows {};                      // interp rows == height / 2
-    int pad_stride {};                // pad elements per padded row
-    int pad_height {};                // padded rows == height + 2*MARGIN_V
-    int tpitch {};                    // 2*mdis + 1
-    Eedi3Pipelines pipes {};          // shared per geometry (see width_pipes)
+    int rows {};             // interp rows == height / 2
+    int pad_stride {};       // pad elements per padded row
+    int pad_height {};       // padded rows == height + 2*MARGIN_V
+    int tpitch {};           // 2*mdis + 1
+    Eedi3Pipelines pipes {}; // shared per geometry (see width_pipes)
 
     // Grids of the four 1D element-wise dispatches, folded into X/Y (see
     // vsfeel_fold_grid): pad, vcopy, the AA assemble merge and the blit.
-    uint32_t pad_grid_x {}, pad_grid_y {1};
-    uint32_t vcopy_grid_x {}, vcopy_grid_y {1};
-    uint32_t asm_grid_x {}, asm_grid_y {1};
-    uint32_t blit_grid_x {}, blit_grid_y {1};
+    uint32_t pad_grid_x {}, pad_grid_y { 1 };
+    uint32_t vcopy_grid_x {}, vcopy_grid_y { 1 };
+    uint32_t asm_grid_x {}, asm_grid_y { 1 };
+    uint32_t blit_grid_x {}, blit_grid_y { 1 };
 
     // region offsets (bytes into the per-frame scratch buffer) and sizes
     VkDeviceSize pad_off {}, pad_bytes {};
@@ -200,7 +200,8 @@ static std::optional<std::string> eedi3_fill_grids(const GPUDevice & gpu,
     auto fold_1d = [&](uint64_t elems, const char * what, uint32_t & gx,
                        uint32_t & gy) -> std::optional<std::string> {
         std::string message;
-        if (!vsfeel_fold_grid(gpu.limits, (elems + 255) / 256, what, gx, gy, message)) {
+        if (!vsfeel_fold_grid(gpu.limits, (elems + 255) / 256, what, gx, gy,
+                              message)) {
             return message;
         }
         return std::nullopt;
@@ -210,36 +211,39 @@ static std::optional<std::string> eedi3_fill_grids(const GPUDevice & gpu,
                          "eedi3's pad", c.pad_grid_x, c.pad_grid_y)) {
         return e;
     }
-    if (auto e = fold_1d(rows_x_width, "eedi3's vcopy", c.vcopy_grid_x, c.vcopy_grid_y)) {
+    if (auto e = fold_1d(rows_x_width, "eedi3's vcopy", c.vcopy_grid_x,
+                         c.vcopy_grid_y)) {
         return e;
     }
-    if (auto e = fold_1d(2 * rows_x_width, "eedi3's assemble", c.asm_grid_x, c.asm_grid_y)) {
+    if (auto e = fold_1d(2 * rows_x_width, "eedi3's assemble", c.asm_grid_x,
+                         c.asm_grid_y)) {
         return e;
     }
-    return fold_1d(2 * rows_x_width, "eedi3's blit", c.blit_grid_x, c.blit_grid_y);
+    return fold_1d(2 * rows_x_width, "eedi3's blit", c.blit_grid_x,
+                   c.blit_grid_y);
 }
 
 // What a recorded pass does after the row kernel + vcheck.
 enum class PassTail {
-    kBlit,        // vertical: write interp + kept rows into the output plane
-    kCompose,     // horizontal: assemble the frame-order plane
-    kAssembleV,   // EEDI3AA vertical merge into the intermediate frame v
-    kNone,        // EEDI3AA's first vertical sub-pass
+    kBlit,      // vertical: write interp + kept rows into the output plane
+    kCompose,   // horizontal: assemble the frame-order plane
+    kAssembleV, // EEDI3AA vertical merge into the intermediate frame v
+    kNone,      // EEDI3AA's first vertical sub-pass
 };
 
 // Everything a recorded pass needs to address: the pass's source planes, the
 // mask/sclip planes, the output frame planes and the shared scratch buffer.
 struct Eedi3PassInputs {
-    VkBuffer src[MAX_PLANES] {};       // source for xpose/pad/blit
-    int src_base[MAX_PLANES] {};       // element base into src[]
-    int src_stride[MAX_PLANES] {};     // source row pitch, io elements
-    VkBuffer mask {};                  // single Gray mask plane
-    int mask_stride {};                // mask row pitch, mask elements
-    VkBuffer sclip[MAX_PLANES] {};     // sclip planes (vertical xpose/vcheck)
-    int sclip_stride[MAX_PLANES] {};   // sclip row pitch, io elements
-    VkBuffer out[MAX_PLANES] {};       // output frame planes
-    int out_stride[MAX_PLANES] {};     // output row pitch, io elements
-    VkBuffer scratch {};               // per-frame scratch buffer
+    VkBuffer src[MAX_PLANES] {};     // source for xpose/pad/blit
+    int src_base[MAX_PLANES] {};     // element base into src[]
+    int src_stride[MAX_PLANES] {};   // source row pitch, io elements
+    VkBuffer mask {};                // single Gray mask plane
+    int mask_stride {};              // mask row pitch, mask elements
+    VkBuffer sclip[MAX_PLANES] {};   // sclip planes (vertical xpose/vcheck)
+    int sclip_stride[MAX_PLANES] {}; // sclip row pitch, io elements
+    VkBuffer out[MAX_PLANES] {};     // output frame planes
+    int out_stride[MAX_PLANES] {};   // output row pitch, io elements
+    VkBuffer scratch {};             // per-frame scratch buffer
 };
 
 struct Eedi3Data {
@@ -253,8 +257,8 @@ struct Eedi3Data {
 
     int field {}, nrad { 2 }, mdis { 20 }, vcheck { 2 };
     bool dh {};
-    bool horiz { false };   // run the whole pipeline on the transposed plane
-    bool aa { false };      // fused based_aa vertical-then-horizontal chain
+    bool horiz { false }; // run the whole pipeline on the transposed plane
+    bool aa { false };    // fused based_aa vertical-then-horizontal chain
     std::array<Eedi3PlaneConfig, MAX_PLANES> aplanes {};
 
     // vcheck d2p source. Levels trade accuracy for work: 1 = the un-vchecked
@@ -343,11 +347,12 @@ struct Eedi3Data {
 
     // Output-frame batching (see the batching section above).
     int batch_size { 4 };
-    int max_out { -1 };            // last valid output frame index, -1 if unknown
+    int max_out { -1 }; // last valid output frame index, -1 if unknown
     std::mutex cache_lock;
     std::condition_variable cache_cv;
-    std::vector<std::pair<int, VSFrame *>> cache;   // computed frames awaiting a caller
-    std::vector<std::pair<int, int>> claims;        // ranges being recorded
+    std::vector<std::pair<int, VSFrame *>>
+        cache; // computed frames awaiting a caller
+    std::vector<std::pair<int, int>> claims; // ranges being recorded
 
     ~Eedi3Data();
 };
@@ -355,12 +360,14 @@ struct Eedi3Data {
 Eedi3Data::~Eedi3Data() {
     if (host_timing && ht_n.load()) {
         const double n = static_cast<double>(ht_n.load());
-        fprintf(stderr,
+        fprintf(
+            stderr,
             "[eedi3-timing] frames=%.0f per-frame us: acquire=%7.1f alloc=%7.1f "
             "record=%7.1f submit=%7.1f wait=%7.1f total=%7.1f\n",
-            n, ht_acquire_ns.load() / 1000.0 / n, ht_alloc_ns.load() / 1000.0 / n,
-            ht_record_ns.load() / 1000.0 / n, ht_submit_ns.load() / 1000.0 / n,
-            ht_fence_ns.load() / 1000.0 / n, ht_total_ns.load() / 1000.0 / n);
+            n, ht_acquire_ns.load() / 1000.0 / n,
+            ht_alloc_ns.load() / 1000.0 / n, ht_record_ns.load() / 1000.0 / n,
+            ht_submit_ns.load() / 1000.0 / n, ht_fence_ns.load() / 1000.0 / n,
+            ht_total_ns.load() / 1000.0 / n);
     }
     if (!gpu) {
         return;
@@ -374,15 +381,16 @@ Eedi3Data::~Eedi3Data() {
     const GPUDevice & g = *gpu;
     std::vector<VkPipeline> destroyed;
     for (auto & [key, p] : width_pipes) {
-        const VkPipeline all[] {
-            p.row, p.vcheck, p.pad, p.vcopy, p.blit, p.xpose, p.compose,
-            p.maskpack, p.maskdilate_raw, p.maskdilate_tr, p.assemble
-        };
+        const VkPipeline all[] { p.row,           p.vcheck,   p.pad,
+                                 p.vcopy,         p.blit,     p.xpose,
+                                 p.compose,       p.maskpack, p.maskdilate_raw,
+                                 p.maskdilate_tr, p.assemble };
         for (VkPipeline pipe : all) {
             if (!pipe) {
                 continue;
             }
-            if (std::find(destroyed.begin(), destroyed.end(), pipe) == destroyed.end()) {
+            if (std::find(destroyed.begin(), destroyed.end(), pipe) ==
+                destroyed.end()) {
                 destroyed.push_back(pipe);
                 g.vk->vkDestroyPipeline(g.device, pipe, nullptr);
             }
@@ -405,7 +413,8 @@ static void pc_push(const Eedi3Data & d, VkCommandBuffer cmd,
     gpu_push_constants(*d.gpu, cmd, d.pipeline_layout, &pc, sizeof(pc));
 }
 
-static void bind_pipe(const Eedi3Data & d, VkCommandBuffer cmd, VkPipeline pipe) {
+static void bind_pipe(const Eedi3Data & d, VkCommandBuffer cmd,
+                      VkPipeline pipe) {
     d.gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
 }
 
@@ -426,7 +435,8 @@ static void dispatch(const Eedi3Data & d, VkCommandBuffer cmd, int x, int y = 1,
                      int z = 1) {
     // Every Vulkan entry point goes through the core's loaded table: nothing
     // links or initializes the loader on this path.
-    d.gpu->vk->vkCmdDispatch(cmd, static_cast<uint32_t>(x), static_cast<uint32_t>(y),
+    d.gpu->vk->vkCmdDispatch(cmd, static_cast<uint32_t>(x),
+                             static_cast<uint32_t>(y),
                              static_cast<uint32_t>(z));
 }
 
@@ -442,7 +452,8 @@ static void eedi3_add_timing(Eedi3Data & d, uint64_t signaled,
     }
     const auto ns = [](auto a, auto b) {
         return static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+            std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                .count());
     };
     d.ht_acquire_ns += ns(t0, t1);
     d.ht_alloc_ns += ns(t1, t2);
@@ -456,7 +467,8 @@ static void eedi3_add_timing(Eedi3Data & d, uint64_t signaled,
         d.gpu->api->gpuExecWaitValue(d.pool, signaled, werr, sizeof(werr));
         d.ht_fence_ns += static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - w0).count());
+                std::chrono::steady_clock::now() - w0)
+                .count());
     }
 }
 
@@ -530,7 +542,8 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                         pc.src_step = mstep;
                         pc_push(d, cmd, pc);
                         const int mask_w = cfg.rows * mstep;
-                        dispatch(d, cmd, (mask_w + 31) / 32, (cfg.width + 31) / 32);
+                        dispatch(d, cmd, (mask_w + 31) / 32,
+                                 (cfg.width + 31) / 32);
                         gpu_barrier(*d.gpu, cmd);
 
                         bind_pipe(d, cmd, pipes.maskdilate_tr);
@@ -575,7 +588,8 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                     pc.src_first = kept_first;
                     pc.src_step = kept_step;
                     pc_push(d, cmd, pc);
-                    dispatch(d, cmd, (cfg.rows + 15) / 16, (cfg.width + 15) / 16);
+                    dispatch(d, cmd, (cfg.rows + 15) / 16,
+                             (cfg.width + 15) / 16);
 
                     if (d.vcheck > 0 && d.sclip_node) {
                         bind_pipe(d, cmd, cfg.pipes.xpose);
@@ -590,7 +604,8 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                         spc.src_first = field;
                         spc.src_step = 2;
                         pc_push(d, cmd, spc);
-                        dispatch(d, cmd, (cfg.rows + 15) / 16, (cfg.width + 15) / 16);
+                        dispatch(d, cmd, (cfg.rows + 15) / 16,
+                                 (cfg.width + 15) / 16);
                     }
                     gpu_barrier(*d.gpu, cmd);
                 }
@@ -605,10 +620,12 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                 bind_pipe(d, cmd, cfg.pipes.pad);
                 // Horizontally the pad builder reads the packed R' in the
                 // scratch buffer; vertically it reads the source frame plane.
-                bind_bufs(d, cmd, { horiz ? in.scratch : in.src[plane], in.scratch });
+                bind_bufs(d, cmd,
+                          { horiz ? in.scratch : in.src[plane], in.scratch });
                 Eedi3PushConstants pc {};
-                pc.raw_base = horiz ? static_cast<int32_t>(cfg.rt_off / pad_elem)
-                                    : in.src_base[plane];
+                pc.raw_base = horiz
+                                  ? static_cast<int32_t>(cfg.rt_off / pad_elem)
+                                  : in.src_base[plane];
                 pc.src_stride = horiz ? 0 : in.src_stride[plane];
                 pc.src_first = kept_first;
                 pc.src_step = kept_step;
@@ -632,7 +649,8 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
             pc.pbt_base = static_cast<int32_t>(cfg.pbt_off);
             pc.dmap_base = static_cast<int32_t>(cfg.dmap_off);
             pc.bmask_base = static_cast<int32_t>(cfg.bits_off / 4);
-            pc.sclip_base = horiz ? static_cast<int32_t>(cfg.rtS_off / elem) : 0;
+            pc.sclip_base =
+                horiz ? static_cast<int32_t>(cfg.rtS_off / elem) : 0;
             pc.sclip_stride = horiz ? 0 : in.sclip_stride[plane];
             pc.cint_base = static_cast<int32_t>(cfg.cint_off / elem);
             pc.vout_base = static_cast<int32_t>(
@@ -664,12 +682,12 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                     continue;
                 }
                 const auto & cfg = planes[plane];
-                const VkBuffer sclip_buf = (horiz || !in.sclip[plane])
-                    ? in.scratch : in.sclip[plane];
+                const VkBuffer sclip_buf =
+                    (horiz || !in.sclip[plane]) ? in.scratch : in.sclip[plane];
                 bind_pipe(d, cmd, cfg.pipes.row);
-                bind_bufs(d, cmd, {
-                    in.scratch, in.scratch, in.scratch, in.scratch,
-                    in.scratch, sclip_buf, in.scratch, in.scratch });
+                bind_bufs(d, cmd,
+                          { in.scratch, in.scratch, in.scratch, in.scratch,
+                            in.scratch, sclip_buf, in.scratch, in.scratch });
                 pc_push(d, cmd, row_pc(cfg, plane));
                 dispatch(d, cmd, 1, cfg.rows);
             }
@@ -681,25 +699,27 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                     continue;
                 }
                 const auto & cfg = planes[plane];
-                const VkBuffer sclip_buf = (horiz || !in.sclip[plane])
-                    ? in.scratch : in.sclip[plane];
+                const VkBuffer sclip_buf =
+                    (horiz || !in.sclip[plane]) ? in.scratch : in.sclip[plane];
                 const Eedi3PushConstants pc = row_pc(cfg, plane);
                 // Fully-masked rows are copied in parallel so the serial walk
                 // only visits non-empty rows (the LDS and parallel forms carry
                 // every row and need no copy pass).
-                if (d.mclip_node && !cfg.pipes.vcheck_lds && !cfg.pipes.vcheck_para) {
+                if (d.mclip_node && !cfg.pipes.vcheck_lds &&
+                    !cfg.pipes.vcheck_para) {
                     bind_pipe(d, cmd, cfg.pipes.vcopy);
-                    bind_bufs(d, cmd, {
-                        in.scratch, in.scratch, in.scratch, in.scratch,
-                        in.scratch, sclip_buf, in.scratch, in.scratch });
+                    bind_bufs(d, cmd,
+                              { in.scratch, in.scratch, in.scratch, in.scratch,
+                                in.scratch, sclip_buf, in.scratch,
+                                in.scratch });
                     pc_push(d, cmd, pc);
                     dispatch(d, cmd, cfg.vcopy_grid_x, cfg.vcopy_grid_y);
                     gpu_barrier(*d.gpu, cmd);
                 }
                 bind_pipe(d, cmd, cfg.pipes.vcheck);
-                bind_bufs(d, cmd, {
-                    in.scratch, in.scratch, in.scratch, in.scratch,
-                    in.scratch, sclip_buf, in.scratch, in.scratch });
+                bind_bufs(d, cmd,
+                          { in.scratch, in.scratch, in.scratch, in.scratch,
+                            in.scratch, sclip_buf, in.scratch, in.scratch });
                 pc_push(d, cmd, pc);
                 dispatch(d, cmd, 1, cfg.pipes.vcheck_para ? cfg.rows : 1);
             }
@@ -729,7 +749,9 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                 pc.field = first_field;
                 pc.rows = cfg.rows;
                 bind_pipe(d, cmd, cfg.pipes.assemble);
-                bind_bufs(d, cmd, { in.src[plane], in.scratch, in.scratch, in.scratch });
+                bind_bufs(
+                    d, cmd,
+                    { in.src[plane], in.scratch, in.scratch, in.scratch });
                 pc_push(d, cmd, pc);
                 dispatch(d, cmd, cfg.asm_grid_x, cfg.asm_grid_y);
             }
@@ -757,13 +779,16 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                     (second ? cfg.vout2_off : cfg.vout_off) / elem);
                 pc.dst_base = static_cast<int32_t>(
                     (second ? cfg.dst2_off : cfg.dst_off) / elem);
-                pc.out_base = pfuse ? static_cast<int32_t>(cfg.o0_off / elem) : 0;
+                pc.out_base =
+                    pfuse ? static_cast<int32_t>(cfg.o0_off / elem) : 0;
                 pc.dst_stride = in.out_stride[plane];
                 pc.field = field;
                 pc.rows = cfg.rows;
                 pc.comp_fuse = pfuse ? (second ? 2 : 1) : 0;
                 bind_pipe(d, cmd, cfg.pipes.compose);
-                bind_bufs(d, cmd, { in.scratch, in.scratch, in.out[plane], in.scratch });
+                bind_bufs(
+                    d, cmd,
+                    { in.scratch, in.scratch, in.out[plane], in.scratch });
                 pc_push(d, cmd, pc);
                 dispatch(d, cmd, (cfg.rows + 15) / 16, (cfg.width + 15) / 16);
             }
@@ -826,7 +851,8 @@ static bool eedi3_cache_has(const Eedi3Data * d, const int n) {
 // One lock covers both, so a frame another batch published cannot be evicted in
 // the gap between "it is cached" and "take it" -- that gap used to fall through
 // to a NULL return with no filter error. NULL means the caller owns the claim.
-static VSFrame * eedi3_take_or_claim(Eedi3Data * d, const int n, const int last) {
+static VSFrame * eedi3_take_or_claim(Eedi3Data * d, const int n,
+                                     const int last) {
     std::unique_lock lock(d->cache_lock);
     for (;;) {
         for (auto it = d->cache.begin(); it != d->cache.end(); ++it) {
@@ -861,7 +887,8 @@ static VSFrame * eedi3_take_or_claim(Eedi3Data * d, const int n, const int last)
     }
 }
 
-static void eedi3_release_claim(Eedi3Data * d, const int first, const int last) {
+static void eedi3_release_claim(Eedi3Data * d, const int first,
+                                const int last) {
     std::lock_guard guard(d->cache_lock);
     for (auto it = d->claims.begin(); it != d->claims.end(); ++it) {
         if (it->first == first && it->second == last) {
@@ -877,9 +904,10 @@ static void eedi3_release_claim(Eedi3Data * d, const int first, const int last) 
 // sibling batch publishing (and evicting) concurrently cannot take it first.
 // The oldest entries are evicted past three batches' worth; their frames are
 // freed outside the lock.
-static VSFrame * eedi3_publish(Eedi3Data * d, const int first, const int last,
-                               std::vector<std::pair<int, VSFrame *>> & produced,
-                               const VSAPI * vsapi) {
+static VSFrame *
+eedi3_publish(Eedi3Data * d, const int first, const int last,
+              std::vector<std::pair<int, VSFrame *>> & produced,
+              const VSAPI * vsapi) {
     std::vector<VSFrame *> victims;
     VSFrame * mine = nullptr;
     {
@@ -922,15 +950,18 @@ struct Eedi3FrameGuard {
     int frame {};
 };
 
-static const VSFrame * eedi3_error(Eedi3FrameGuard & guard, VSFrameContext * frameCtx,
-                                   const VSAPI * vsapi, VSFrame * dst, const char * what,
+static const VSFrame * eedi3_error(Eedi3FrameGuard & guard,
+                                   VSFrameContext * frameCtx,
+                                   const VSAPI * vsapi, VSFrame * dst,
+                                   const char * what,
                                    const std::string & message) {
     if (guard.ctx && !guard.submitted) {
         guard.d.gpu->api->gpuExecAbandon(guard.ctx);
     }
     vsfeel_trace_error(guard.d.aa ? "EEDI3AA" : "EEDI3VK", guard.frame, message,
                        guard.d.gpu.get());
-    vsapi->setFilterError((std::string(what) + ": " + message).c_str(), frameCtx);
+    vsapi->setFilterError((std::string(what) + ": " + message).c_str(),
+                          frameCtx);
     if (dst) {
         vsapi->freeFrame(dst);
     }
@@ -940,9 +971,9 @@ static const VSFrame * eedi3_error(Eedi3FrameGuard & guard, VSFrameContext * fra
 // Fill the shared mask/sclip planes once (they are the same for every pass).
 static bool fill_mask_sclip(const Eedi3Data & d, const VSAPI * vsapi,
                             const VSFrame * scp, const VSFrame * mcp,
-                            VkBuffer sclip[MAX_PLANES], int sclip_stride[MAX_PLANES],
-                            VkBuffer & mask, int & mask_stride,
-                            std::string & err) {
+                            VkBuffer sclip[MAX_PLANES],
+                            int sclip_stride[MAX_PLANES], VkBuffer & mask,
+                            int & mask_stride, std::string & err) {
     const int numPlanes = d.vi->format.numPlanes;
     for (int plane = 0; plane < numPlanes; ++plane) {
         sclip[plane] = VK_NULL_HANDLE;
@@ -950,12 +981,13 @@ static bool fill_mask_sclip(const Eedi3Data & d, const VSAPI * vsapi,
         if (scp && d.vcheck > 0 && d.process[plane]) {
             VSVulkanPlaneInfo pi {};
             if (d.gpu->api->getGPUPlane(scp, plane, &pi)) {
-                err = "sclip plane " + std::to_string(plane) + " is not GPU resident";
+                err = "sclip plane " + std::to_string(plane) +
+                      " is not GPU resident";
                 return false;
             }
             sclip[plane] = pi.buffer;
-            sclip_stride[plane] = static_cast<int>(
-                vsapi->getStride(scp, plane) / d.elem_bytes);
+            sclip_stride[plane] =
+                static_cast<int>(vsapi->getStride(scp, plane) / d.elem_bytes);
         }
     }
     mask = VK_NULL_HANDLE;
@@ -967,15 +999,15 @@ static bool fill_mask_sclip(const Eedi3Data & d, const VSAPI * vsapi,
             return false;
         }
         mask = pi.buffer;
-        mask_stride = static_cast<int>(
-            vsapi->getStride(mcp, 0) / (d.mclip_bits / 8));
+        mask_stride =
+            static_cast<int>(vsapi->getStride(mcp, 0) / (d.mclip_bits / 8));
     }
     return true;
 }
 
-static bool fill_out_planes(const Eedi3Data & d, const VSAPI * vsapi, const VSFrame * dst,
-                            VkBuffer out[MAX_PLANES], int out_stride[MAX_PLANES],
-                            std::string & err) {
+static bool fill_out_planes(const Eedi3Data & d, const VSAPI * vsapi,
+                            const VSFrame * dst, VkBuffer out[MAX_PLANES],
+                            int out_stride[MAX_PLANES], std::string & err) {
     const int numPlanes = d.vi->format.numPlanes;
     for (int plane = 0; plane < numPlanes; ++plane) {
         out[plane] = VK_NULL_HANDLE;
@@ -985,12 +1017,13 @@ static bool fill_out_planes(const Eedi3Data & d, const VSAPI * vsapi, const VSFr
         }
         VSVulkanPlaneInfo pi {};
         if (d.gpu->api->getGPUPlane(dst, plane, &pi)) {
-            err = "the output plane " + std::to_string(plane) + " is not GPU resident";
+            err = "the output plane " + std::to_string(plane) +
+                  " is not GPU resident";
             return false;
         }
         out[plane] = pi.buffer;
-        out_stride[plane] = static_cast<int>(
-            vsapi->getStride(dst, plane) / d.elem_bytes);
+        out_stride[plane] =
+            static_cast<int>(vsapi->getStride(dst, plane) / d.elem_bytes);
     }
     return true;
 }
@@ -1004,15 +1037,16 @@ static inline int eedi3_clip_index(const Eedi3Data & d, const int n) {
 // Last output frame of the batch starting at n.
 static inline int eedi3_batch_last(const Eedi3Data & d, const int n) {
     if (d.max_out < 0) {
-        return n;   // unknown length: never request past the end
+        return n; // unknown length: never request past the end
     }
     return std::min(n + d.batch_size - 1, d.max_out);
 }
 
-static const VSFrame *VS_CC Eedi3GetFrame(
-    int n, int activationReason, void *instanceData,
-    [[maybe_unused]] void **frameData, VSFrameContext *frameCtx, VSCore *core,
-    const VSAPI *vsapi) {
+static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
+                                           void * instanceData,
+                                           [[maybe_unused]] void ** frameData,
+                                           VSFrameContext * frameCtx,
+                                           VSCore * core, const VSAPI * vsapi) {
 
     Eedi3Data * d = static_cast<Eedi3Data *>(instanceData);
     const int last = eedi3_batch_last(*d, n);
@@ -1042,7 +1076,8 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     vsfeel_trace_mark("frames");
 
     const int numPlanes = d->vi->format.numPlanes;
-    const int out_height = (d->dh && !d->horiz) ? d->vi->height * 2 : d->vi->height;
+    const int out_height =
+        (d->dh && !d->horiz) ? d->vi->height * 2 : d->vi->height;
     const int out_width = (d->dh && d->horiz) ? d->vi->width * 2 : d->vi->width;
 
     // Processed planes are freshly allocated; unprocessed ones may share the
@@ -1057,7 +1092,8 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     const bool timing = d->host_timing;
     const auto now = [] { return std::chrono::steady_clock::now(); };
     const auto t0 = timing ? now() : std::chrono::steady_clock::time_point {};
-    VSGPUExecContext * ctx = d->gpu->api->gpuExecAcquire(d->pool, errbuf, sizeof(errbuf));
+    VSGPUExecContext * ctx =
+        d->gpu->api->gpuExecAcquire(d->pool, errbuf, sizeof(errbuf));
     Eedi3FrameGuard guard { *d, ctx, false, n };
     std::vector<const VSFrame *> inputs;
     std::vector<std::pair<int, VSFrame *>> produced;
@@ -1081,10 +1117,13 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     for (int j = n; j <= last; ++j) {
         const int sn = eedi3_clip_index(*d, j);
         const VSFrame * src = vsapi->getFrameFilter(sn, d->node, frameCtx);
-        const VSFrame * scp = (d->vcheck > 0 && d->sclip_node)
-            ? vsapi->getFrameFilter(j, d->sclip_node, frameCtx) : nullptr;
-        const VSFrame * mcp = d->mclip_node
-            ? vsapi->getFrameFilter(sn, d->mclip_node, frameCtx) : nullptr;
+        const VSFrame * scp =
+            (d->vcheck > 0 && d->sclip_node)
+                ? vsapi->getFrameFilter(j, d->sclip_node, frameCtx)
+                : nullptr;
+        const VSFrame * mcp =
+            d->mclip_node ? vsapi->getFrameFilter(sn, d->mclip_node, frameCtx)
+                          : nullptr;
         inputs.push_back(src);
         if (scp) {
             inputs.push_back(scp);
@@ -1094,14 +1133,15 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         }
 
         const int pl[] = { 0, 1, 2 };
-        const VSFrame * fr[] = {
-            (!d->dh && !d->process[0]) ? src : nullptr,
-            (!d->dh && !d->process[1]) ? src : nullptr,
-            (!d->dh && !d->process[2]) ? src : nullptr
-        };
-        VSFrame * dst = all_processed
-            ? d->gpu->api->newGPUVideoFrame(&d->vi->format, out_width, out_height, src, core)
-            : vsapi->newVideoFrame2(&d->vi->format, out_width, out_height, fr, pl, src, core);
+        const VSFrame * fr[] = { (!d->dh && !d->process[0]) ? src : nullptr,
+                                 (!d->dh && !d->process[1]) ? src : nullptr,
+                                 (!d->dh && !d->process[2]) ? src : nullptr };
+        VSFrame * dst =
+            all_processed
+                ? d->gpu->api->newGPUVideoFrame(&d->vi->format, out_width,
+                                                out_height, src, core)
+                : vsapi->newVideoFrame2(&d->vi->format, out_width, out_height,
+                                        fr, pl, src, core);
         if (!dst) {
             return fail("failed to allocate an output frame");
         }
@@ -1120,8 +1160,10 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         }
 
         GpuBuffer scratch;
-        if (const std::string e = gpu_make_buffer(*d->gpu, core, d->scratch_bytes, scratch,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); !e.empty()) {
+        if (const std::string e =
+                gpu_make_buffer(*d->gpu, core, d->scratch_bytes, scratch,
+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            !e.empty()) {
             vsapi->freeFrame(dst);
             return fail("scratch allocation failed: " + e);
         }
@@ -1152,12 +1194,13 @@ static const VSFrame *VS_CC Eedi3GetFrame(
             VSVulkanPlaneInfo pi {};
             if (d->gpu->api->getGPUPlane(src, plane, &pi)) {
                 vsapi->freeFrame(dst);
-                return fail("clip plane " + std::to_string(plane) + " is not GPU resident");
+                return fail("clip plane " + std::to_string(plane) +
+                            " is not GPU resident");
             }
             in.src[plane] = pi.buffer;
             in.src_base[plane] = 0;
-            in.src_stride[plane] = static_cast<int>(
-                vsapi->getStride(src, plane) / d->elem_bytes);
+            in.src_stride[plane] =
+                static_cast<int>(vsapi->getStride(src, plane) / d->elem_bytes);
         }
         jobs.push_back(job);
         produced.emplace_back(j, dst);
@@ -1190,7 +1233,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     uint64_t signaled = 0;
     errbuf[0] = '\0';
     if (d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf, sizeof(errbuf))) {
-        guard.ctx = nullptr;   // consumed either way
+        guard.ctx = nullptr; // consumed either way
         return fail("submit failed: "s + errbuf);
     }
     guard.submitted = true;
@@ -1202,11 +1245,14 @@ static const VSFrame *VS_CC Eedi3GetFrame(
 
     for (auto & p : produced) {
         VSMap * props = vsapi->getFramePropertiesRW(p.second);
-        vsapi->mapSetInt(props, "_FieldBased", VSC_FIELD_PROGRESSIVE, maReplace);
+        vsapi->mapSetInt(props, "_FieldBased", VSC_FIELD_PROGRESSIVE,
+                         maReplace);
         if (d->field > 1) {
             int errNum, errDen;
-            int64_t durationNum = vsapi->mapGetInt(props, "_DurationNum", 0, &errNum);
-            int64_t durationDen = vsapi->mapGetInt(props, "_DurationDen", 0, &errDen);
+            int64_t durationNum =
+                vsapi->mapGetInt(props, "_DurationNum", 0, &errNum);
+            int64_t durationDen =
+                vsapi->mapGetInt(props, "_DurationDen", 0, &errDen);
             if (!errNum && !errDen) {
                 vsh::muldivRational(&durationNum, &durationDen, 1, 2);
                 vsapi->mapSetInt(props, "_DurationNum", durationNum, maReplace);
@@ -1219,7 +1265,8 @@ static const VSFrame *VS_CC Eedi3GetFrame(
     }
     // publish takes `first` under the cache lock, so this cannot happen; if it
     // ever does, say so rather than returning null with no filter error.
-    return fail("the batch's own frame was evicted before it could be returned");
+    return fail(
+        "the batch's own frame was evicted before it could be returned");
 }
 
 // EEDI3AA: the whole based_aa EEDI3 chain in one submission. The vertical
@@ -1227,8 +1274,9 @@ static const VSFrame *VS_CC Eedi3GetFrame(
 // intermediate frame v in VRAM; the horizontal stage then runs twice on v, with
 // the second compose merging the two planes straight into the output frame.
 // Fill a scratch range and make it visible to the compute stage.
-static void eedi3_fill_scratch(const Eedi3Data & d, VkCommandBuffer cmd, VkBuffer buf,
-                               VkDeviceSize off, VkDeviceSize bytes, uint32_t pattern) {
+static void eedi3_fill_scratch(const Eedi3Data & d, VkCommandBuffer cmd,
+                               VkBuffer buf, VkDeviceSize off,
+                               VkDeviceSize bytes, uint32_t pattern) {
     VkDeviceSize size = bytes & ~static_cast<VkDeviceSize>(3);
     if (!size) {
         return;
@@ -1240,7 +1288,7 @@ static void eedi3_fill_scratch(const Eedi3Data & d, VkCommandBuffer cmd, VkBuffe
     mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
-        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
     VkDependencyInfo dep {};
     dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dep.memoryBarrierCount = 1;
@@ -1251,8 +1299,9 @@ static void eedi3_fill_scratch(const Eedi3Data & d, VkCommandBuffer cmd, VkBuffe
 // Diagnostic: fill the scratch, or one named region of it, with a caller-chosen
 // pattern (VSFEEL_EEDI3_POISON=<hex>[:<region>]). Two runs then differ exactly
 // on pixels that depend on unwritten scratch. Changes output by design.
-static void eedi3_poison_scratch(const Eedi3Data & d, VkCommandBuffer cmd, VkBuffer buf,
-                                 uint32_t pattern, const std::string & only) {
+static void eedi3_poison_scratch(const Eedi3Data & d, VkCommandBuffer cmd,
+                                 VkBuffer buf, uint32_t pattern,
+                                 const std::string & only) {
     struct Region {
         const char * name;
         VkDeviceSize Eedi3PlaneConfig::* off;
@@ -1264,10 +1313,12 @@ static void eedi3_poison_scratch(const Eedi3Data & d, VkCommandBuffer cmd, VkBuf
         { "dst2", &Eedi3PlaneConfig::dst2_off, &Eedi3PlaneConfig::dst2_bytes },
         { "pbt", &Eedi3PlaneConfig::pbt_off, &Eedi3PlaneConfig::pbt_bytes },
         { "dmap", &Eedi3PlaneConfig::dmap_off, &Eedi3PlaneConfig::dmap_bytes },
-        { "rempty", &Eedi3PlaneConfig::rempty_off, &Eedi3PlaneConfig::rempty_bytes },
+        { "rempty", &Eedi3PlaneConfig::rempty_off,
+          &Eedi3PlaneConfig::rempty_bytes },
         { "cint", &Eedi3PlaneConfig::cint_off, &Eedi3PlaneConfig::cint_bytes },
         { "vout", &Eedi3PlaneConfig::vout_off, &Eedi3PlaneConfig::vout_bytes },
-        { "vout2", &Eedi3PlaneConfig::vout2_off, &Eedi3PlaneConfig::vout2_bytes },
+        { "vout2", &Eedi3PlaneConfig::vout2_off,
+          &Eedi3PlaneConfig::vout2_bytes },
         { "bits", &Eedi3PlaneConfig::bits_off, &Eedi3PlaneConfig::bits_bytes },
         { "pred", &Eedi3PlaneConfig::pred_off, &Eedi3PlaneConfig::pred_bytes },
         { "rt", &Eedi3PlaneConfig::rt_off, &Eedi3PlaneConfig::rt_bytes },
@@ -1291,10 +1342,12 @@ static void eedi3_poison_scratch(const Eedi3Data & d, VkCommandBuffer cmd, VkBuf
     }
 }
 
-static const VSFrame *VS_CC Eedi3AaGetFrame(
-    int n, int activationReason, void *instanceData,
-    [[maybe_unused]] void **frameData, VSFrameContext *frameCtx, VSCore *core,
-    const VSAPI *vsapi) {
+static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
+                                             void * instanceData,
+                                             [[maybe_unused]] void ** frameData,
+                                             VSFrameContext * frameCtx,
+                                             VSCore * core,
+                                             const VSAPI * vsapi) {
 
     Eedi3Data * d = static_cast<Eedi3Data *>(instanceData);
     const int last = eedi3_batch_last(*d, n);
@@ -1333,7 +1386,8 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
     const bool timing = d->host_timing;
     const auto now = [] { return std::chrono::steady_clock::now(); };
     const auto t0 = timing ? now() : std::chrono::steady_clock::time_point {};
-    VSGPUExecContext * ctx = d->gpu->api->gpuExecAcquire(d->pool, errbuf, sizeof(errbuf));
+    VSGPUExecContext * ctx =
+        d->gpu->api->gpuExecAcquire(d->pool, errbuf, sizeof(errbuf));
     Eedi3FrameGuard guard { *d, ctx, false, n };
     std::vector<const VSFrame *> inputs;
     std::vector<std::pair<int, VSFrame *>> produced;
@@ -1357,12 +1411,17 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
 
     for (int j = n; j <= last; ++j) {
         const VSFrame * src = vsapi->getFrameFilter(j, d->node, frameCtx);
-        const VSFrame * scp0 = (d->vcheck > 0 && d->sclip_node)
-            ? vsapi->getFrameFilter(2 * j, d->sclip_node, frameCtx) : nullptr;
-        const VSFrame * scp1 = (d->vcheck > 0 && d->sclip_node)
-            ? vsapi->getFrameFilter(2 * j + 1, d->sclip_node, frameCtx) : nullptr;
-        const VSFrame * mcp = d->mclip_node
-            ? vsapi->getFrameFilter(j, d->mclip_node, frameCtx) : nullptr;
+        const VSFrame * scp0 =
+            (d->vcheck > 0 && d->sclip_node)
+                ? vsapi->getFrameFilter(2 * j, d->sclip_node, frameCtx)
+                : nullptr;
+        const VSFrame * scp1 =
+            (d->vcheck > 0 && d->sclip_node)
+                ? vsapi->getFrameFilter(2 * j + 1, d->sclip_node, frameCtx)
+                : nullptr;
+        const VSFrame * mcp =
+            d->mclip_node ? vsapi->getFrameFilter(j, d->mclip_node, frameCtx)
+                          : nullptr;
         inputs.push_back(src);
         if (scp0) {
             inputs.push_back(scp0);
@@ -1375,14 +1434,15 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
         }
 
         const int pl[] = { 0, 1, 2 };
-        const VSFrame * fr[] = {
-            !d->process[0] ? src : nullptr,
-            !d->process[1] ? src : nullptr,
-            !d->process[2] ? src : nullptr
-        };
-        VSFrame * dst = all_processed
-            ? d->gpu->api->newGPUVideoFrame(&d->vi->format, d->vi->width, d->vi->height, src, core)
-            : vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
+        const VSFrame * fr[] = { !d->process[0] ? src : nullptr,
+                                 !d->process[1] ? src : nullptr,
+                                 !d->process[2] ? src : nullptr };
+        VSFrame * dst =
+            all_processed
+                ? d->gpu->api->newGPUVideoFrame(&d->vi->format, d->vi->width,
+                                                d->vi->height, src, core)
+                : vsapi->newVideoFrame2(&d->vi->format, d->vi->width,
+                                        d->vi->height, fr, pl, src, core);
         if (!dst) {
             return fail("failed to allocate an output frame");
         }
@@ -1404,9 +1464,11 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
 
         GpuBuffer scratch;
         // TRANSFER_DST: the scratch is filled (cleared) below.
-        if (const std::string e = gpu_make_buffer(*d->gpu, core, d->scratch_bytes, scratch,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT); !e.empty()) {
+        if (const std::string e =
+                gpu_make_buffer(*d->gpu, core, d->scratch_bytes, scratch,
+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                                VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            !e.empty()) {
             vsapi->freeFrame(dst);
             return fail("scratch allocation failed: " + e);
         }
@@ -1422,10 +1484,13 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
             const char * poison = env_str("VSFEEL_EEDI3_POISON");
             if (poison) {
                 const char * colon = std::strchr(poison, ':');
-                const std::string spec(poison, colon
-                    ? static_cast<size_t>(colon - poison) : std::strlen(poison));
-                eedi3_poison_scratch(*d, cmd, scratch.buffer,
-                    static_cast<uint32_t>(std::strtoul(spec.c_str(), nullptr, 0)),
+                const std::string spec(
+                    poison, colon ? static_cast<size_t>(colon - poison)
+                                  : std::strlen(poison));
+                eedi3_poison_scratch(
+                    *d, cmd, scratch.buffer,
+                    static_cast<uint32_t>(
+                        std::strtoul(spec.c_str(), nullptr, 0)),
                     colon ? std::string(colon + 1) : std::string());
             }
         }
@@ -1439,10 +1504,11 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
                 return fail("mclip is not GPU resident");
             }
             mask = pi.buffer;
-            mask_stride = static_cast<int>(
-                vsapi->getStride(mcp, 0) / (d->mclip_bits / 8));
+            mask_stride = static_cast<int>(vsapi->getStride(mcp, 0) /
+                                           (d->mclip_bits / 8));
         }
-        auto sclip_planes = [&](const VSFrame * scf, VkBuffer * out, int * strides) {
+        auto sclip_planes = [&](const VSFrame * scf, VkBuffer * out,
+                                int * strides) {
             for (int plane = 0; plane < numPlanes; ++plane) {
                 out[plane] = VK_NULL_HANDLE;
                 strides[plane] = 0;
@@ -1454,8 +1520,8 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
                     return false;
                 }
                 out[plane] = pi.buffer;
-                strides[plane] = static_cast<int>(
-                    vsapi->getStride(scf, plane) / d->elem_bytes);
+                strides[plane] = static_cast<int>(vsapi->getStride(scf, plane) /
+                                                  d->elem_bytes);
             }
             return true;
         };
@@ -1524,7 +1590,8 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
                     VSVulkanPlaneInfo pi {};
                     if (d->gpu->api->getGPUPlane(src, plane, &pi)) {
                         vsapi->freeFrame(dst);
-                        return fail("clip plane " + std::to_string(plane) + " is not GPU resident");
+                        return fail("clip plane " + std::to_string(plane) +
+                                    " is not GPU resident");
                     }
                     in.src[plane] = pi.buffer;
                     in.src_base[plane] = 0;
@@ -1534,8 +1601,10 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
             }
         }
         // Output planes (used by the horizontal compose tail).
-        if (!fill_out_planes(*d, vsapi, dst, h0.in.out, h0.in.out_stride, err) ||
-            !fill_out_planes(*d, vsapi, dst, h1.in.out, h1.in.out_stride, err)) {
+        if (!fill_out_planes(*d, vsapi, dst, h0.in.out, h0.in.out_stride,
+                             err) ||
+            !fill_out_planes(*d, vsapi, dst, h1.in.out, h1.in.out_stride,
+                             err)) {
             vsapi->freeFrame(dst);
             return fail(err);
         }
@@ -1597,18 +1666,20 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
     }
     for (auto & p : produced) {
         VSMap * props = vsapi->getFramePropertiesRW(p.second);
-        vsapi->mapSetInt(props, "_FieldBased", VSC_FIELD_PROGRESSIVE, maReplace);
+        vsapi->mapSetInt(props, "_FieldBased", VSC_FIELD_PROGRESSIVE,
+                         maReplace);
     }
     if (VSFrame * out = eedi3_publish(d, n, last, produced, vsapi)) {
         return out;
     }
     // publish takes `first` under the cache lock, so this cannot happen; if it
     // ever does, say so rather than returning null with no filter error.
-    return fail("the batch's own frame was evicted before it could be returned");
+    return fail(
+        "the batch's own frame was evicted before it could be returned");
 }
 
-static void VS_CC Eedi3Free(void *instanceData, [[maybe_unused]] VSCore *core,
-                            const VSAPI *vsapi) {
+static void VS_CC Eedi3Free(void * instanceData, [[maybe_unused]] VSCore * core,
+                            const VSAPI * vsapi) {
     Eedi3Data * d = static_cast<Eedi3Data *>(instanceData);
     vsapi->freeNode(d->node);
     vsapi->freeNode(d->sclip_node);
@@ -1625,9 +1696,9 @@ static void VS_CC Eedi3Free(void *instanceData, [[maybe_unused]] VSCore *core,
 // Creation
 // ---------------------------------------------------------------------------
 
-static void vsfeel_eedi3_create(
-    const VSMap *in, VSMap *out, [[maybe_unused]] void *userData,
-    VSCore *core, const VSAPI *vsapi, bool horiz, bool aa) {
+static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
+                                [[maybe_unused]] void * userData, VSCore * core,
+                                const VSAPI * vsapi, bool horiz, bool aa) {
 
     auto d { std::make_unique<Eedi3Data>() };
     int err = 0;
@@ -1656,19 +1727,19 @@ static void vsfeel_eedi3_create(
         }
     };
 
-    if (auto [bps, sample] = std::pair{
-            d->vi->format.bitsPerSample, d->vi->format.sampleType };
+    if (auto [bps, sample] =
+            std::pair { d->vi->format.bitsPerSample, d->vi->format.sampleType };
         !vsh::isConstantVideoFormat(d->vi) ||
         (sample == stInteger && bps != 16) ||
-        (sample == stFloat && bps != 32)
-    ) {
+        (sample == stFloat && bps != 32)) {
         return set_error("input bitdepth must be 16 (integer) or 32 (float).");
     }
 
     d->bits = d->vi->format.bitsPerSample;
     d->elem_bytes = d->bits / 8;
 
-    d->field = vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "field", 0, nullptr));
+    d->field =
+        vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "field", 0, nullptr));
     d->dh = !!vsapi->mapGetInt(in, "dh", 0, &err);
     err = 0;
 
@@ -1677,7 +1748,8 @@ static void vsfeel_eedi3_create(
         d->process[i] = (m <= 0);
     }
     for (int i = 0; i < m; ++i) {
-        const int n = vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "planes", i, nullptr));
+        const int n = vsh::int64ToIntS(
+            vsapi->mapGetIntSaturated(in, "planes", i, nullptr));
         if (n < 0 || n >= d->vi->format.numPlanes) {
             return set_error("plane index out of range");
         }
@@ -1693,19 +1765,21 @@ static void vsfeel_eedi3_create(
     if (d->dh) {
         for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
             if (!d->process[plane]) {
-                return set_error("dh=True requires every plane to be processed");
+                return set_error(
+                    "dh=True requires every plane to be processed");
             }
         }
     }
 
     auto get_float = [&](const char * key, float def) {
         err = 0;
-        const float v = static_cast<float>(vsapi->mapGetFloatSaturated(in, key, 0, &err));
+        const float v = vsapi->mapGetFloatSaturated(in, key, 0, &err);
         return err ? def : v;
     };
     auto get_int = [&](const char * key, int def) {
         err = 0;
-        const int v = vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, key, 0, &err));
+        const int v =
+            vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, key, 0, &err));
         return err ? def : v;
     };
 
@@ -1721,8 +1795,9 @@ static void vsfeel_eedi3_create(
 
     // NaN passes every range comparison below (they are all false), and
     // mapGetFloatSaturated is a plain cast, so reject non-finite values first.
-    if (!std::isfinite(d->alpha) || !std::isfinite(d->beta) || !std::isfinite(d->gamma) ||
-        !std::isfinite(vthresh0) || !std::isfinite(vthresh1) || !std::isfinite(d->vthresh2)) {
+    if (!std::isfinite(d->alpha) || !std::isfinite(d->beta) ||
+        !std::isfinite(d->gamma) || !std::isfinite(vthresh0) ||
+        !std::isfinite(vthresh1) || !std::isfinite(d->vthresh2)) {
         return set_error("alpha, beta, gamma and vthresh0/1/2 must be finite");
     }
 
@@ -1752,10 +1827,10 @@ static void vsfeel_eedi3_create(
             if (!d->process[plane]) {
                 continue;
             }
-            const int pw = d->vi->width >>
-                (plane > 0 ? d->vi->format.subSamplingW : 0);
-            const int ph = d->vi->height >>
-                (plane > 0 ? d->vi->format.subSamplingH : 0);
+            const int pw =
+                d->vi->width >> (plane > 0 ? d->vi->format.subSamplingW : 0);
+            const int ph =
+                d->vi->height >> (plane > 0 ? d->vi->format.subSamplingH : 0);
             // EEDI3AA runs the horizontal geometry internally too (a.rows =
             // in_w / 2), so both axes must be even even though d->horiz is
             // false; the single-axis filters keep checking their own axis.
@@ -1791,8 +1866,10 @@ static void vsfeel_eedi3_create(
     if (d->vcheck < 0 || d->vcheck > 3) {
         return set_error("vcheck must be 0, 1, 2, or 3");
     }
-    if (d->vcheck > 0 && (vthresh0 <= 0.0f || vthresh1 <= 0.0f || d->vthresh2 <= 0.0f)) {
-        return set_error("vthresh0, vthresh1 and vthresh2 must be greater than 0.0");
+    if (d->vcheck > 0 &&
+        (vthresh0 <= 0.0f || vthresh1 <= 0.0f || d->vthresh2 <= 0.0f)) {
+        return set_error(
+            "vthresh0, vthresh1 and vthresh2 must be greater than 0.0");
     }
 
     // mclip must be a single Gray plane (vszip CPU semantic). Gray16 integer and
@@ -1800,7 +1877,7 @@ static void vsfeel_eedi3_create(
     // depths keep the reference SetFrameProps(_Range=1) + resize.Point -> Gray8
     // conversion, which the core then uploads like any other CPU clip.
     if (d->mclip_node) {
-        const auto mvi = vsapi->getVideoInfo(d->mclip_node);
+        const auto * const mvi = vsapi->getVideoInfo(d->mclip_node);
         if (mvi->format.colorFamily != cfGray) {
             return set_error("mclip must be Gray");
         }
@@ -1811,20 +1888,25 @@ static void vsfeel_eedi3_create(
             return set_error("mclip's number of frames doesn't match");
         }
 
-        if (mvi->format.bitsPerSample == 16 && mvi->format.sampleType == stInteger) {
+        if (mvi->format.bitsPerSample == 16 &&
+            mvi->format.sampleType == stInteger) {
             d->mclip_bits = 16;
-        } else if (mvi->format.bitsPerSample == 32 && mvi->format.sampleType == stFloat) {
+        } else if (mvi->format.bitsPerSample == 32 &&
+                   mvi->format.sampleType == stFloat) {
             d->mclip_bits = 32;
-        } else if (mvi->format.bitsPerSample != 8 || mvi->format.sampleType != stInteger) {
+        } else if (mvi->format.bitsPerSample != 8 ||
+                   mvi->format.sampleType != stInteger) {
             VSMap * args = vsapi->createMap();
             vsapi->mapConsumeNode(args, "clip", d->mclip_node, maReplace);
-            d->mclip_node = nullptr;  // ownership moved into args
+            d->mclip_node = nullptr; // ownership moved into args
 
             vsapi->mapSetInt(args, "_Range", 1, maReplace);
-            VSMap * ret = vsapi->invoke(
-                vsapi->getPluginByID(VSH_STD_PLUGIN_ID, core), "SetFrameProps", args);
+            VSMap * ret =
+                vsapi->invoke(vsapi->getPluginByID(VSH_STD_PLUGIN_ID, core),
+                              "SetFrameProps", args);
             if (vsapi->mapGetError(ret)) {
-                vsfeel_trace_error("EEDI3VK", -1, vsapi->mapGetError(ret), d->gpu.get());
+                vsfeel_trace_error("EEDI3VK", -1, vsapi->mapGetError(ret),
+                                   d->gpu.get());
                 vsapi->mapSetError(out, vsapi->mapGetError(ret));
                 vsapi->freeMap(args);
                 vsapi->freeMap(ret);
@@ -1835,16 +1917,22 @@ static void vsfeel_eedi3_create(
                 return;
             }
             vsapi->clearMap(args);
-            vsapi->mapConsumeNode(args, "clip", vsapi->mapGetNode(ret, "clip", 0, nullptr), maReplace);
+            vsapi->mapConsumeNode(args, "clip",
+                                  vsapi->mapGetNode(ret, "clip", 0, nullptr),
+                                  maReplace);
             vsapi->freeMap(ret);
 
-            vsapi->mapSetInt(args, "format", vsapi->queryVideoFormatID(
-                cfGray, stInteger, 8, 0, 0, core), maReplace);
-            ret = vsapi->invoke(
-                vsapi->getPluginByID(VSH_RESIZE_PLUGIN_ID, core), "Point", args);
+            vsapi->mapSetInt(
+                args, "format",
+                vsapi->queryVideoFormatID(cfGray, stInteger, 8, 0, 0, core),
+                maReplace);
+            ret =
+                vsapi->invoke(vsapi->getPluginByID(VSH_RESIZE_PLUGIN_ID, core),
+                              "Point", args);
             vsapi->freeMap(args);
             if (vsapi->mapGetError(ret)) {
-                vsfeel_trace_error("EEDI3VK", -1, vsapi->mapGetError(ret), d->gpu.get());
+                vsfeel_trace_error("EEDI3VK", -1, vsapi->mapGetError(ret),
+                                   d->gpu.get());
                 vsapi->mapSetError(out, vsapi->mapGetError(ret));
                 vsapi->freeMap(ret);
                 vsapi->freeNode(d->node);
@@ -1863,7 +1951,7 @@ static void vsfeel_eedi3_create(
     // the output doubles the frame count and under dh it doubles one axis, so
     // the sclip describes the OUTPUT.
     if (d->vcheck > 0 && d->sclip_node) {
-        const auto svi = vsapi->getVideoInfo(d->sclip_node);
+        const auto * const svi = vsapi->getVideoInfo(d->sclip_node);
         VSVideoInfo out_vi = *d->vi;
         if (d->field > 1) {
             if (d->vi->numFrames > INT32_MAX / 2) {
@@ -1892,6 +1980,8 @@ static void vsfeel_eedi3_create(
     // the one device and sizes in-flight depth itself (exec pool ring).
 
     if (const char * vp = env_str("VSFEEL_EEDI3_VPARA")) {
+        // The range check below is the validation; a malformed value falls to 0.
+        // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion)
         const int v = atoi(vp);
         d->vcheck_para = (v >= 0 && v <= Eedi3Data::VCHECK_PARA_LEVELS) ? v : 0;
     }
@@ -1924,7 +2014,8 @@ static void vsfeel_eedi3_create(
     }
     {
         char errbuf[512] {};
-        d->pool = d->gpu->api->createGPUExecPool(core, vqCompute, errbuf, sizeof(errbuf));
+        d->pool = d->gpu->api->createGPUExecPool(core, vqCompute, errbuf,
+                                                 sizeof(errbuf));
         if (!d->pool) {
             return set_error("createGPUExecPool failed: "s + errbuf);
         }
@@ -1968,71 +2059,95 @@ static void vsfeel_eedi3_create(
     }
     uint32_t row_subgroup_size = 0;
     if (!d->gpu->resolve_subgroup_size(SGSIZE, SGSIZE, row_subgroup_size)) {
-        return set_error("device cannot run the EEDI3 row kernel (needs 32-lane "
-                         "subgroups, natively or via subgroup size control)");
+        return set_error(
+            "device cannot run the EEDI3 row kernel (needs 32-lane "
+            "subgroups, natively or via subgroup size control)");
     }
 
     // Shader blobs for this io depth.
     switch (d->bits) {
-        case 16:
-            d->row_code = eedi3_16_row_spv; d->row_size = eedi3_16_row_spv_size;
-            d->vcheck_code = eedi3_16_vcheck_spv; d->vcheck_size = eedi3_16_vcheck_spv_size;
-            d->vcheck_lds_code = eedi3_16_vcheck_lds_spv;
-            d->vcheck_lds_size = eedi3_16_vcheck_lds_spv_size;
-            d->vcheck_para_code = { eedi3_16_vcheck_para_spv, eedi3_16_vcheck_para_j1_spv,
-                eedi3_16_vcheck_para_j2_spv, eedi3_16_vcheck_para_j3_spv,
-                eedi3_16_vcheck_para_j4_spv, eedi3_16_vcheck_para_j5_spv };
-            d->vcheck_para_size = { eedi3_16_vcheck_para_spv_size,
-                eedi3_16_vcheck_para_j1_spv_size, eedi3_16_vcheck_para_j2_spv_size,
-                eedi3_16_vcheck_para_j3_spv_size, eedi3_16_vcheck_para_j4_spv_size,
-                eedi3_16_vcheck_para_j5_spv_size };
-            d->pad_code = eedi3_16_pad_spv; d->pad_size = eedi3_16_pad_spv_size;
-            d->vcopy_code = eedi3_16_vcopy_spv; d->vcopy_size = eedi3_16_vcopy_spv_size;
-            d->blit_code = eedi3_16_blit_spv; d->blit_size = eedi3_16_blit_spv_size;
-            d->xpose_code = eedi3_16_xpose_spv; d->xpose_size = eedi3_16_xpose_spv_size;
-            d->compose_code = eedi3_16_compose_spv; d->compose_size = eedi3_16_compose_spv_size;
-            d->assemble_code = eedi3_16_assemblev_spv;
-            d->assemble_size = eedi3_16_assemblev_spv_size;
-            break;
-        case 32:
-            d->row_code = eedi3_32_row_spv; d->row_size = eedi3_32_row_spv_size;
-            d->vcheck_code = eedi3_32_vcheck_spv; d->vcheck_size = eedi3_32_vcheck_spv_size;
-            d->vcheck_lds_code = eedi3_32_vcheck_lds_spv;
-            d->vcheck_lds_size = eedi3_32_vcheck_lds_spv_size;
-            d->vcheck_para_code = { eedi3_32_vcheck_para_spv, eedi3_32_vcheck_para_j1_spv,
-                eedi3_32_vcheck_para_j2_spv, eedi3_32_vcheck_para_j3_spv,
-                eedi3_32_vcheck_para_j4_spv, eedi3_32_vcheck_para_j5_spv };
-            d->vcheck_para_size = { eedi3_32_vcheck_para_spv_size,
-                eedi3_32_vcheck_para_j1_spv_size, eedi3_32_vcheck_para_j2_spv_size,
-                eedi3_32_vcheck_para_j3_spv_size, eedi3_32_vcheck_para_j4_spv_size,
-                eedi3_32_vcheck_para_j5_spv_size };
-            d->pad_code = eedi3_32_pad_spv; d->pad_size = eedi3_32_pad_spv_size;
-            d->vcopy_code = eedi3_32_vcopy_spv; d->vcopy_size = eedi3_32_vcopy_spv_size;
-            d->blit_code = eedi3_32_blit_spv; d->blit_size = eedi3_32_blit_spv_size;
-            d->xpose_code = eedi3_32_xpose_spv; d->xpose_size = eedi3_32_xpose_spv_size;
-            d->compose_code = eedi3_32_compose_spv; d->compose_size = eedi3_32_compose_spv_size;
-            d->assemble_code = eedi3_32_assemblev_spv;
-            d->assemble_size = eedi3_32_assemblev_spv_size;
-            break;
-        default:
-            return set_error("unsupported bit depth");
+    case 16:
+        d->row_code = eedi3_16_row_spv;
+        d->row_size = eedi3_16_row_spv_size;
+        d->vcheck_code = eedi3_16_vcheck_spv;
+        d->vcheck_size = eedi3_16_vcheck_spv_size;
+        d->vcheck_lds_code = eedi3_16_vcheck_lds_spv;
+        d->vcheck_lds_size = eedi3_16_vcheck_lds_spv_size;
+        d->vcheck_para_code = {
+            eedi3_16_vcheck_para_spv,    eedi3_16_vcheck_para_j1_spv,
+            eedi3_16_vcheck_para_j2_spv, eedi3_16_vcheck_para_j3_spv,
+            eedi3_16_vcheck_para_j4_spv, eedi3_16_vcheck_para_j5_spv
+        };
+        d->vcheck_para_size = {
+            eedi3_16_vcheck_para_spv_size,    eedi3_16_vcheck_para_j1_spv_size,
+            eedi3_16_vcheck_para_j2_spv_size, eedi3_16_vcheck_para_j3_spv_size,
+            eedi3_16_vcheck_para_j4_spv_size, eedi3_16_vcheck_para_j5_spv_size
+        };
+        d->pad_code = eedi3_16_pad_spv;
+        d->pad_size = eedi3_16_pad_spv_size;
+        d->vcopy_code = eedi3_16_vcopy_spv;
+        d->vcopy_size = eedi3_16_vcopy_spv_size;
+        d->blit_code = eedi3_16_blit_spv;
+        d->blit_size = eedi3_16_blit_spv_size;
+        d->xpose_code = eedi3_16_xpose_spv;
+        d->xpose_size = eedi3_16_xpose_spv_size;
+        d->compose_code = eedi3_16_compose_spv;
+        d->compose_size = eedi3_16_compose_spv_size;
+        d->assemble_code = eedi3_16_assemblev_spv;
+        d->assemble_size = eedi3_16_assemblev_spv_size;
+        break;
+    case 32:
+        d->row_code = eedi3_32_row_spv;
+        d->row_size = eedi3_32_row_spv_size;
+        d->vcheck_code = eedi3_32_vcheck_spv;
+        d->vcheck_size = eedi3_32_vcheck_spv_size;
+        d->vcheck_lds_code = eedi3_32_vcheck_lds_spv;
+        d->vcheck_lds_size = eedi3_32_vcheck_lds_spv_size;
+        d->vcheck_para_code = {
+            eedi3_32_vcheck_para_spv,    eedi3_32_vcheck_para_j1_spv,
+            eedi3_32_vcheck_para_j2_spv, eedi3_32_vcheck_para_j3_spv,
+            eedi3_32_vcheck_para_j4_spv, eedi3_32_vcheck_para_j5_spv
+        };
+        d->vcheck_para_size = {
+            eedi3_32_vcheck_para_spv_size,    eedi3_32_vcheck_para_j1_spv_size,
+            eedi3_32_vcheck_para_j2_spv_size, eedi3_32_vcheck_para_j3_spv_size,
+            eedi3_32_vcheck_para_j4_spv_size, eedi3_32_vcheck_para_j5_spv_size
+        };
+        d->pad_code = eedi3_32_pad_spv;
+        d->pad_size = eedi3_32_pad_spv_size;
+        d->vcopy_code = eedi3_32_vcopy_spv;
+        d->vcopy_size = eedi3_32_vcopy_spv_size;
+        d->blit_code = eedi3_32_blit_spv;
+        d->blit_size = eedi3_32_blit_spv_size;
+        d->xpose_code = eedi3_32_xpose_spv;
+        d->xpose_size = eedi3_32_xpose_spv_size;
+        d->compose_code = eedi3_32_compose_spv;
+        d->compose_size = eedi3_32_compose_spv_size;
+        d->assemble_code = eedi3_32_assemblev_spv;
+        d->assemble_size = eedi3_32_assemblev_spv_size;
+        break;
+    default:
+        return set_error("unsupported bit depth");
     }
     d->maskpack_code = { eedi3_maskpack_8_spv, eedi3_maskpack_16_spv,
                          eedi3_maskpack_32_spv };
     d->maskpack_size = { eedi3_maskpack_8_spv_size, eedi3_maskpack_16_spv_size,
                          eedi3_maskpack_32_spv_size };
-    d->maskdilate_raw_code = { eedi3_maskdilate_8_raw_spv, eedi3_maskdilate_16_raw_spv,
+    d->maskdilate_raw_code = { eedi3_maskdilate_8_raw_spv,
+                               eedi3_maskdilate_16_raw_spv,
                                eedi3_maskdilate_32_raw_spv };
     d->maskdilate_raw_size = { eedi3_maskdilate_8_raw_spv_size,
                                eedi3_maskdilate_16_raw_spv_size,
                                eedi3_maskdilate_32_raw_spv_size };
-    d->maskdilate_tr_code = { eedi3_maskdilate_8_tr_spv, eedi3_maskdilate_16_tr_spv,
+    d->maskdilate_tr_code = { eedi3_maskdilate_8_tr_spv,
+                              eedi3_maskdilate_16_tr_spv,
                               eedi3_maskdilate_32_tr_spv };
     d->maskdilate_tr_size = { eedi3_maskdilate_8_tr_spv_size,
                               eedi3_maskdilate_16_tr_spv_size,
                               eedi3_maskdilate_32_tr_spv_size };
     d->have_lds = d->vcheck > 0 && d->vcheck_lds_code &&
-        d->gpu->limits.maxComputeSharedMemorySize >= 2 * MAXW_LDS * sizeof(float);
+                  d->gpu->limits.maxComputeSharedMemorySize >=
+                      2 * MAXW_LDS * sizeof(float);
 
     const int numPlanes = d->vi->format.numPlanes;
     const int subW = d->vi->format.subSamplingW;
@@ -2075,7 +2190,8 @@ static void vsfeel_eedi3_create(
                 continue;
             }
             const int in_w = (plane == 0) ? d->vi->width : d->vi->width >> subW;
-            const int in_h = (plane == 0) ? d->vi->height : d->vi->height >> subH;
+            const int in_h =
+                (plane == 0) ? d->vi->height : d->vi->height >> subH;
             auto & a = d->aplanes[plane];
             a.width = in_h;
             a.height = in_w;
@@ -2098,8 +2214,8 @@ static void vsfeel_eedi3_create(
         const int in_w = (plane == 0) ? d->vi->width : d->vi->width >> subW;
         const int in_h = (plane == 0) ? d->vi->height : d->vi->height >> subH;
         const int kw = d->horiz ? in_h : in_w;
-        const int kh = d->horiz ? (d->dh ? 2 * in_w : in_w)
-                                : (d->dh ? 2 * in_h : in_h);
+        const int kh =
+            d->horiz ? (d->dh ? 2 * in_w : in_w) : (d->dh ? 2 * in_h : in_h);
         cfg.width = kw;
         cfg.height = kh;
         cfg.rows = kh / 2;
@@ -2130,12 +2246,14 @@ static void vsfeel_eedi3_create(
         // Must match the shader's pbt layout: with two directions per lane
         // (tpitch 33..64) the deltas pack to a nibble each, one byte per lane
         // pair -- 16 bytes per column -- and everything else stays int8.
-        const VkDeviceSize stride =
-            (c.tpitch > 32 && c.tpitch <= 64) ? 16 : static_cast<VkDeviceSize>(c.tpitch);
+        const VkDeviceSize stride = (c.tpitch > 32 && c.tpitch <= 64)
+                                        ? 16
+                                        : static_cast<VkDeviceSize>(c.tpitch);
         return static_cast<VkDeviceSize>(c.rows) * c.width * stride;
     };
     auto sz_pad = [&](const Eedi3PlaneConfig & c) {
-        return static_cast<VkDeviceSize>(c.pad_stride) * c.pad_height * pad_elem;
+        return static_cast<VkDeviceSize>(c.pad_stride) * c.pad_height *
+               pad_elem;
     };
     auto sz_bits = [&](const Eedi3PlaneConfig & c) {
         return static_cast<VkDeviceSize>((c.width + 31) / 32) * c.rows * 4;
@@ -2143,13 +2261,15 @@ static void vsfeel_eedi3_create(
     auto sz_rt = [&](const Eedi3PlaneConfig & c) {
         return static_cast<VkDeviceSize>(c.rows) * c.width * pad_elem;
     };
-    auto shared = [&](VkDeviceSize va, VkDeviceSize ha,
-                      VkDeviceSize & voff, VkDeviceSize & vlen,
-                      VkDeviceSize & hoff, VkDeviceSize & hlen) {
+    auto shared = [&](VkDeviceSize va, VkDeviceSize ha, VkDeviceSize & voff,
+                      VkDeviceSize & vlen, VkDeviceSize & hoff,
+                      VkDeviceSize & hlen) {
         const VkDeviceSize bytes = std::max(va, ha);
         const VkDeviceSize off = place(bytes);
-        voff = off; vlen = bytes;
-        hoff = off; hlen = bytes;
+        voff = off;
+        vlen = bytes;
+        hoff = off;
+        hlen = bytes;
     };
 
     for (int plane = 0; plane < numPlanes; ++plane) {
@@ -2159,32 +2279,36 @@ static void vsfeel_eedi3_create(
         auto & V = d->planes[plane];
         auto & H = d->aa ? d->aplanes[plane] : d->planes[plane];
         const bool has_io = true;
-        shared(sz_pad(V), sz_pad(H), V.pad_off, V.pad_bytes, H.pad_off, H.pad_bytes);
-        shared(sz_io(V), sz_io(H), V.dst_off, V.dst_bytes, H.dst_off, H.dst_bytes);
-        shared(d->aa ? sz_io(V) : 0, d->aa ? sz_io(H) : 0,
-               V.dst2_off, V.dst2_bytes, H.dst2_off, H.dst2_bytes);
-        shared(sz_pbt(V), sz_pbt(H), V.pbt_off, V.pbt_bytes, H.pbt_off, H.pbt_bytes);
+        shared(sz_pad(V), sz_pad(H), V.pad_off, V.pad_bytes, H.pad_off,
+               H.pad_bytes);
+        shared(sz_io(V), sz_io(H), V.dst_off, V.dst_bytes, H.dst_off,
+               H.dst_bytes);
+        shared(d->aa ? sz_io(V) : 0, d->aa ? sz_io(H) : 0, V.dst2_off,
+               V.dst2_bytes, H.dst2_off, H.dst2_bytes);
+        shared(sz_pbt(V), sz_pbt(H), V.pbt_off, V.pbt_bytes, H.pbt_off,
+               H.pbt_bytes);
         shared(d->vcheck > 0 ? sz_io(V) : 0, d->vcheck > 0 ? sz_io(H) : 0,
                V.dmap_off, V.dmap_bytes, H.dmap_off, H.dmap_bytes);
         shared((d->vcheck > 0 && !d->sclip_node) ? sz_io(V) : 0,
-               (d->vcheck > 0 && !d->sclip_node) ? sz_io(H) : 0,
-               V.cint_off, V.cint_bytes, H.cint_off, H.cint_bytes);
+               (d->vcheck > 0 && !d->sclip_node) ? sz_io(H) : 0, V.cint_off,
+               V.cint_bytes, H.cint_off, H.cint_bytes);
         shared((d->vcheck > 0 || d->aa) ? sz_io(V) : 0,
-               (d->vcheck > 0 || d->aa) ? sz_io(H) : 0,
-               V.vout_off, V.vout_bytes, H.vout_off, H.vout_bytes);
-        shared(d->aa ? sz_io(V) : 0, d->aa ? sz_io(H) : 0,
-               V.vout2_off, V.vout2_bytes, H.vout2_off, H.vout2_bytes);
-        shared(static_cast<VkDeviceSize>(V.rows), static_cast<VkDeviceSize>(H.rows),
-               V.rempty_off, V.rempty_bytes, H.rempty_off, H.rempty_bytes);
+               (d->vcheck > 0 || d->aa) ? sz_io(H) : 0, V.vout_off,
+               V.vout_bytes, H.vout_off, H.vout_bytes);
+        shared(d->aa ? sz_io(V) : 0, d->aa ? sz_io(H) : 0, V.vout2_off,
+               V.vout2_bytes, H.vout2_off, H.vout2_bytes);
+        shared(static_cast<VkDeviceSize>(V.rows),
+               static_cast<VkDeviceSize>(H.rows), V.rempty_off, V.rempty_bytes,
+               H.rempty_off, H.rempty_bytes);
         shared(d->mclip_node ? sz_bits(V) : 0, d->mclip_node ? sz_bits(H) : 0,
                V.bits_off, V.bits_bytes, H.bits_off, H.bits_bytes);
-        shared(0, d->mclip_node ? sz_bits(H) : 0,
-               V.pred_off, V.pred_bytes, H.pred_off, H.pred_bytes);
+        shared(0, d->mclip_node ? sz_bits(H) : 0, V.pred_off, V.pred_bytes,
+               H.pred_off, H.pred_bytes);
         shared(0, sz_rt(H), V.rt_off, V.rt_bytes, H.rt_off, H.rt_bytes);
-        shared(0, (d->vcheck > 0 && d->sclip_node) ? sz_io(H) : 0,
-               V.rtS_off, V.rtS_bytes, H.rtS_off, H.rtS_bytes);
-        const VkDeviceSize plane_io = static_cast<VkDeviceSize>(V.out_w) *
-            V.out_h * elem;
+        shared(0, (d->vcheck > 0 && d->sclip_node) ? sz_io(H) : 0, V.rtS_off,
+               V.rtS_bytes, H.rtS_off, H.rtS_bytes);
+        const VkDeviceSize plane_io =
+            static_cast<VkDeviceSize>(V.out_w) * V.out_h * elem;
         // Without a vcheck the row kernel's dst IS the interp value, so point
         // the assembler's vout/vout2 regions at it (bit-exact: the elements are
         // the same, only the name differs).
@@ -2198,11 +2322,10 @@ static void vsfeel_eedi3_create(
             H.dst2_off = H.vout2_off;
             H.dst2_bytes = H.vout2_bytes;
         }
-        shared(d->aa ? plane_io : 0,
-               d->aa ? plane_io : 0,
-               V.o0_off, V.o0_bytes, H.o0_off, H.o0_bytes);
-        shared(d->aa ? plane_io : 0, d->aa ? plane_io : 0,
-               V.v_off, V.v_bytes, H.v_off, H.v_bytes);
+        shared(d->aa ? plane_io : 0, d->aa ? plane_io : 0, V.o0_off, V.o0_bytes,
+               H.o0_off, H.o0_bytes);
+        shared(d->aa ? plane_io : 0, d->aa ? plane_io : 0, V.v_off, V.v_bytes,
+               H.v_off, H.v_bytes);
         (void)has_io;
     }
     d->scratch_bytes = std::max(total, VkDeviceSize(4));
@@ -2211,25 +2334,29 @@ static void vsfeel_eedi3_create(
     // index with int, so bounding the total bounds every base+index pair.
     if (d->scratch_bytes > static_cast<VkDeviceSize>(INT32_MAX)) {
         return set_error("the per-frame scratch (" +
-            std::to_string(d->scratch_bytes >> 20) + " MiB) exceeds the 2 GiB int32 "
-            "addressing limit; lower mdis or the frame size");
+                         std::to_string(d->scratch_bytes >> 20) +
+                         " MiB) exceeds the 2 GiB int32 "
+                         "addressing limit; lower mdis or the frame size");
     }
 
     if (d->trace) {
         VSVulkanCoreInfo info {};
         char verr[256] {};
-        if (d->gpu->api->getVulkanCoreInfo(core, &info, verr, sizeof(verr)) == 0) {
-            fprintf(stderr, "[eedi3] vram allocated=%.0f budget=%.0f limit=%.0f MiB\n",
-                static_cast<double>(info.allocated) / (1024.0 * 1024.0),
-                static_cast<double>(info.budget) / (1024.0 * 1024.0),
-                static_cast<double>(info.limit) / (1024.0 * 1024.0));
+        if (d->gpu->api->getVulkanCoreInfo(core, &info, verr, sizeof(verr)) ==
+            0) {
+            fprintf(stderr,
+                    "[eedi3] vram allocated=%.0f budget=%.0f limit=%.0f MiB\n",
+                    static_cast<double>(info.allocated) / (1024.0 * 1024.0),
+                    static_cast<double>(info.budget) / (1024.0 * 1024.0),
+                    static_cast<double>(info.limit) / (1024.0 * 1024.0));
         }
         for (int plane = 0; plane < numPlanes; ++plane) {
             if (!d->process[plane]) {
                 continue;
             }
             const auto & c = d->planes[plane];
-            fprintf(stderr,
+            fprintf(
+                stderr,
                 "[eedi3] plane %d w=%d rows=%d scratch=%.1f MiB pbt=%.1f MiB "
                 "pad=%.1f MiB\n",
                 plane, c.width, c.rows,
@@ -2273,7 +2400,8 @@ static void vsfeel_eedi3_create(
         if (VkDeviceSize(auto_batch) * d->scratch_bytes > cap) {
             auto_batch = 1;
         }
-        d->batch_size = std::clamp(env_int("VSFEEL_EEDI3_BATCH", auto_batch), 1, 8);
+        d->batch_size =
+            std::clamp(env_int("VSFEEL_EEDI3_BATCH", auto_batch), 1, 8);
     }
 
     // Pipelines, one set per distinct geometry.
@@ -2281,37 +2409,40 @@ static void vsfeel_eedi3_create(
     const bool sclip_on = d->vcheck > 0 && d->sclip_node != nullptr;
     const int fmt = (d->mclip_bits == 16) ? 1 : (d->mclip_bits == 32 ? 2 : 0);
     const bool para_ok = d->vcheck > 0 && d->vcheck_para >= 1 &&
-        d->vcheck_para <= Eedi3Data::VCHECK_PARA_LEVELS &&
-        d->vcheck_para_code[d->vcheck_para - 1] != nullptr;
+                         d->vcheck_para <= Eedi3Data::VCHECK_PARA_LEVELS &&
+                         d->vcheck_para_code[d->vcheck_para - 1] != nullptr;
 
-    auto get_pipes = [&](const Eedi3Data::WidthKey & key,
-                         Eedi3Pipelines & result) -> std::optional<std::string> {
+    auto get_pipes =
+        [&](const Eedi3Data::WidthKey & key,
+            Eedi3Pipelines & result) -> std::optional<std::string> {
         for (auto & [k, p] : d->width_pipes) {
             if (k == key) {
                 result = p;
                 return std::nullopt;
             }
         }
-        Eedi3RowSpec spec {
-            key.width, d->nrad, d->mdis, mclip_on ? 1 : 0, sclip_on ? 1 : 0,
-            d->vcheck, SGSIZE, lsz_vcheck
-        };
+        Eedi3RowSpec spec { key.width,        d->nrad,          d->mdis,
+                            mclip_on ? 1 : 0, sclip_on ? 1 : 0, d->vcheck,
+                            SGSIZE,           lsz_vcheck };
         if (d->trace) {
-            fprintf(stderr, "[eedi3] spec w=%d nrad=%d mdis=%d mclip=%d sclip=%d "
-                            "vcheck=%d lszr=%d lszv=%d horiz=%d batch=%d\n",
+            fprintf(stderr,
+                    "[eedi3] spec w=%d nrad=%d mdis=%d mclip=%d sclip=%d "
+                    "vcheck=%d lszr=%d lszv=%d horiz=%d batch=%d\n",
                     spec.width, spec.nrad, spec.mdis, spec.has_mclip,
                     spec.has_sclip, spec.vcheck, spec.lsz_row, spec.lsz_vcheck,
                     key.horiz ? 1 : 0, d->batch_size);
         }
-        auto add = [&](const uint32_t * code, size_t size, const char * tag,
-                       uint32_t subgroup, VkPipeline * dst,
-                       GpuWorkgroup workgroup = {}) -> std::optional<std::string> {
+        auto add =
+            [&](const uint32_t * code, size_t size, const char * tag,
+                uint32_t subgroup, VkPipeline * dst,
+                GpuWorkgroup workgroup = {}) -> std::optional<std::string> {
             if (!code) {
                 return std::nullopt;
             }
-            auto r = gpu_create_pipeline(*d->gpu, code, size, d->pipeline_layout,
-                row_entries.data(), &spec, static_cast<uint32_t>(row_entries.size()),
-                sizeof(spec), tag, subgroup, workgroup);
+            auto r = gpu_create_pipeline(
+                *d->gpu, code, size, d->pipeline_layout, row_entries.data(),
+                &spec, static_cast<uint32_t>(row_entries.size()), sizeof(spec),
+                tag, subgroup, workgroup);
             if (std::holds_alternative<std::string>(r)) {
                 return std::get<std::string>(r);
             }
@@ -2325,28 +2456,32 @@ static void vsfeel_eedi3_create(
         Eedi3Pipelines & p = d->width_pipes.back().second;
         // Row kernel LDS: tileF[BT_TILE] + rowXmin + the packed mask words
         // `bmaskSh[(WIDTH + 31) / 32]` (eedi3.comp:631), at this plane's width.
-        const uint32_t row_shared = 32 + 4 +
-            4 * ((static_cast<uint32_t>(spec.width) + 31) / 32);
-        if (auto e = add(d->row_code, d->row_size, "eedi3-row", row_subgroup_size,
-                         &p.row, GpuWorkgroup { .x = SGSIZE,
-                             .shared_bytes = row_shared })) {
+        const uint32_t row_shared =
+            32 + 4 + 4 * ((static_cast<uint32_t>(spec.width) + 31) / 32);
+        if (auto e =
+                add(d->row_code, d->row_size, "eedi3-row", row_subgroup_size,
+                    &p.row,
+                    GpuWorkgroup { .x = SGSIZE, .shared_bytes = row_shared })) {
             return e;
         }
         p.vcheck_para = para_ok;
-        p.vcheck_lds = !p.vcheck_para && want_lds && d->have_lds &&
-            key.width <= MAXW_LDS;
+        p.vcheck_lds =
+            !p.vcheck_para && want_lds && d->have_lds && key.width <= MAXW_LDS;
         if (d->vcheck > 0) {
-            const uint32_t * vc_code = p.vcheck_para
-                ? d->vcheck_para_code[d->vcheck_para - 1]
-                : (p.vcheck_lds ? d->vcheck_lds_code : d->vcheck_code);
-            const size_t vc_size = p.vcheck_para
-                ? d->vcheck_para_size[d->vcheck_para - 1]
-                : (p.vcheck_lds ? d->vcheck_lds_size : d->vcheck_size);
+            const uint32_t * vc_code =
+                p.vcheck_para
+                    ? d->vcheck_para_code[d->vcheck_para - 1]
+                    : (p.vcheck_lds ? d->vcheck_lds_code : d->vcheck_code);
+            const size_t vc_size =
+                p.vcheck_para
+                    ? d->vcheck_para_size[d->vcheck_para - 1]
+                    : (p.vcheck_lds ? d->vcheck_lds_size : d->vcheck_size);
             // tlineSh[2][MAXW] is the LDS variant's whole footprint.
             if (auto e = add(vc_code, vc_size, "eedi3-vcheck", 0, &p.vcheck,
-                             GpuWorkgroup { .x = static_cast<uint32_t>(lsz_vcheck),
-                                 .shared_bytes = p.vcheck_lds
-                                     ? 2 * MAXW_LDS * 4u : 0u })) {
+                             GpuWorkgroup {
+                                 .x = static_cast<uint32_t>(lsz_vcheck),
+                                 .shared_bytes =
+                                     p.vcheck_lds ? 2 * MAXW_LDS * 4u : 0u })) {
                 return e;
             }
             if (mclip_on && !p.vcheck_lds && !p.vcheck_para) {
@@ -2365,42 +2500,50 @@ static void vsfeel_eedi3_create(
         // xpose/compose for its transposed keys, and neither EEDI3AA nor
         // EEDI3H ever dispatches blit.
         if (!d->aa && !key.horiz) {
-            if (auto e = add(d->blit_code, d->blit_size, "eedi3-blit", 0, &p.blit,
-                             GpuWorkgroup { .x = 256 })) {
+            if (auto e = add(d->blit_code, d->blit_size, "eedi3-blit", 0,
+                             &p.blit, GpuWorkgroup { .x = 256 })) {
                 return e;
             }
         }
         if (key.horiz) {
-            if (auto e = add(d->xpose_code, d->xpose_size, "eedi3-xpose", 0, &p.xpose,
-                             GpuWorkgroup { .x = 16, .y = 16, .shared_bytes = 16 * 17 * 4 })) {
+            if (auto e = add(
+                    d->xpose_code, d->xpose_size, "eedi3-xpose", 0, &p.xpose,
+                    GpuWorkgroup {
+                        .x = 16, .y = 16, .shared_bytes = 16 * 17 * 4 })) {
                 return e;
             }
-            if (auto e = add(d->compose_code, d->compose_size, "eedi3-compose", 0,
-                             &p.compose, GpuWorkgroup { .x = 16, .y = 16,
-                                 .shared_bytes = 2 * 16 * 17 * 4 })) {
+            if (auto e = add(
+                    d->compose_code, d->compose_size, "eedi3-compose", 0,
+                    &p.compose,
+                    GpuWorkgroup {
+                        .x = 16, .y = 16, .shared_bytes = 2 * 16 * 17 * 4 })) {
                 return e;
             }
         } else if (d->aa) {
-            if (auto e = add(d->assemble_code, d->assemble_size, "eedi3-assemblev", 0,
-                             &p.assemble, GpuWorkgroup { .x = 256 })) {
+            if (auto e =
+                    add(d->assemble_code, d->assemble_size, "eedi3-assemblev",
+                        0, &p.assemble, GpuWorkgroup { .x = 256 })) {
                 return e;
             }
         }
         if (mclip_on) {
             if (key.horiz) {
-                if (auto e = add(d->maskpack_code[fmt], d->maskpack_size[fmt],
-                                 "eedi3-maskpack", 0, &p.maskpack,
-                                 GpuWorkgroup { .x = 32, .shared_bytes = 32 * 4 })) {
+                if (auto e =
+                        add(d->maskpack_code[fmt], d->maskpack_size[fmt],
+                            "eedi3-maskpack", 0, &p.maskpack,
+                            GpuWorkgroup { .x = 32, .shared_bytes = 32 * 4 })) {
                     return e;
                 }
-                if (auto e = add(d->maskdilate_tr_code[fmt], d->maskdilate_tr_size[fmt],
-                                 "eedi3-maskdilate-tr", 0, &p.maskdilate_tr,
-                                 GpuWorkgroup { .x = 64 })) {
+                if (auto e =
+                        add(d->maskdilate_tr_code[fmt],
+                            d->maskdilate_tr_size[fmt], "eedi3-maskdilate-tr",
+                            0, &p.maskdilate_tr, GpuWorkgroup { .x = 64 })) {
                     return e;
                 }
             } else if (auto e = add(d->maskdilate_raw_code[fmt],
-                                    d->maskdilate_raw_size[fmt], "eedi3-maskdilate", 0,
-                                    &p.maskdilate_raw, GpuWorkgroup { .x = 64 })) {
+                                    d->maskdilate_raw_size[fmt],
+                                    "eedi3-maskdilate", 0, &p.maskdilate_raw,
+                                    GpuWorkgroup { .x = 64 })) {
                 return e;
             }
         }
@@ -2413,15 +2556,15 @@ static void vsfeel_eedi3_create(
             continue;
         }
         auto & cfg = d->planes[plane];
-        Eedi3Data::WidthKey key { cfg.width, cfg.rows, cfg.tpitch, cfg.pad_stride,
-                                  cfg.pad_height, d->horiz };
+        Eedi3Data::WidthKey key { cfg.width,      cfg.rows,       cfg.tpitch,
+                                  cfg.pad_stride, cfg.pad_height, d->horiz };
         if (auto e = get_pipes(key, cfg.pipes)) {
             return set_error(*e);
         }
         if (d->aa) {
             auto & a = d->aplanes[plane];
-            Eedi3Data::WidthKey akey { a.width, a.rows, a.tpitch, a.pad_stride,
-                                       a.pad_height, true };
+            Eedi3Data::WidthKey akey { a.width,      a.rows,       a.tpitch,
+                                       a.pad_stride, a.pad_height, true };
             if (auto e = get_pipes(akey, a.pipes)) {
                 return set_error(*e);
             }
@@ -2435,7 +2578,8 @@ static void vsfeel_eedi3_create(
         deps.push_back({ d->sclip_node, rpStrictSpatial });
     }
     if (d->mclip_node) {
-        deps.push_back({ d->mclip_node, general ? rpGeneral : rpStrictSpatial });
+        deps.push_back(
+            { d->mclip_node, general ? rpGeneral : rpStrictSpatial });
     }
 
     Eedi3Data * data = d.release();
@@ -2444,8 +2588,8 @@ static void vsfeel_eedi3_create(
     // does not need host pixels.
     VSNode * result = vsapi->createVideoFilterEx2(
         aa ? "EEDI3AA" : (horiz ? "EEDI3H" : "EEDI3"), &out_video,
-        aa ? Eedi3AaGetFrame : Eedi3GetFrame, Eedi3Free,
-        fmParallel, ffGPUOutput, deps.data(), static_cast<int>(deps.size()), data, core);
+        aa ? Eedi3AaGetFrame : Eedi3GetFrame, Eedi3Free, fmParallel,
+        ffGPUOutput, deps.data(), static_cast<int>(deps.size()), data, core);
     if (result == nullptr) {
         vsapi->mapSetError(out, "EEDI3: filter creation failed");
         return;
@@ -2457,21 +2601,18 @@ static void vsfeel_eedi3_create(
 // Registration
 // ---------------------------------------------------------------------------
 
-static void VS_CC Eedi3Create(
-    const VSMap *in, VSMap *out, void *userData,
-    VSCore *core, const VSAPI *vsapi) {
+static void VS_CC Eedi3Create(const VSMap * in, VSMap * out, void * userData,
+                              VSCore * core, const VSAPI * vsapi) {
     vsfeel_eedi3_create(in, out, userData, core, vsapi, false, false);
 }
 
-static void VS_CC Eedi3HCreate(
-    const VSMap *in, VSMap *out, void *userData,
-    VSCore *core, const VSAPI *vsapi) {
+static void VS_CC Eedi3HCreate(const VSMap * in, VSMap * out, void * userData,
+                               VSCore * core, const VSAPI * vsapi) {
     vsfeel_eedi3_create(in, out, userData, core, vsapi, true, false);
 }
 
-static void VS_CC Eedi3AaCreate(
-    const VSMap *in, VSMap *out, void *userData,
-    VSCore *core, const VSAPI *vsapi) {
+static void VS_CC Eedi3AaCreate(const VSMap * in, VSMap * out, void * userData,
+                                VSCore * core, const VSAPI * vsapi) {
     vsfeel_eedi3_create(in, out, userData, core, vsapi, false, true);
 }
 
@@ -2479,35 +2620,31 @@ void vsfeel_register_eedi3(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
     // Under the R80 GPU API every input and the output are GPU resident: the
     // core inserts the upload for a CPU clip and a GPUDownload for a CPU
     // consumer, so the filter itself never moves a frame.
-    const char * eedi3_args =
-        "clip:vnode:gpu;"
-        "field:int;"
-        "dh:int:opt;"
-        "planes:int[]:opt;"
-        "alpha:float:opt;"
-        "beta:float:opt;"
-        "gamma:float:opt;"
-        "nrad:int:opt;"
-        "mdis:int:opt;"
-        "hp:int:opt;"
-        "ucubic:int:opt;"
-        "cost3:int:opt;"
-        "opt:int:opt;"
-        "vcheck:int:opt;"
-        "vthresh0:float:opt;"
-        "vthresh1:float:opt;"
-        "vthresh2:float:opt;"
-        "sclip:vnode:gpu:opt;"
-        "mclip:vnode:gpu:opt;"
-        "device_id:int:opt;"
-        "num_streams:int:opt;";
-    vspapi->registerFunction(
-        "EEDI3", eedi3_args, "clip:vnode:gpu;", Eedi3Create, nullptr, plugin);
-    vspapi->registerFunction(
-        "EEDI3H", eedi3_args, "clip:vnode:gpu;", Eedi3HCreate, nullptr, plugin);
-    vspapi->registerFunction(
-        "EEDI3AA", eedi3_args, "clip:vnode:gpu;", Eedi3AaCreate, nullptr, plugin);
+    const char * eedi3_args = "clip:vnode:gpu;"
+                              "field:int;"
+                              "dh:int:opt;"
+                              "planes:int[]:opt;"
+                              "alpha:float:opt;"
+                              "beta:float:opt;"
+                              "gamma:float:opt;"
+                              "nrad:int:opt;"
+                              "mdis:int:opt;"
+                              "hp:int:opt;"
+                              "ucubic:int:opt;"
+                              "cost3:int:opt;"
+                              "opt:int:opt;"
+                              "vcheck:int:opt;"
+                              "vthresh0:float:opt;"
+                              "vthresh1:float:opt;"
+                              "vthresh2:float:opt;"
+                              "sclip:vnode:gpu:opt;"
+                              "mclip:vnode:gpu:opt;"
+                              "device_id:int:opt;"
+                              "num_streams:int:opt;";
+    vspapi->registerFunction("EEDI3", eedi3_args, "clip:vnode:gpu;",
+                             Eedi3Create, nullptr, plugin);
+    vspapi->registerFunction("EEDI3H", eedi3_args, "clip:vnode:gpu;",
+                             Eedi3HCreate, nullptr, plugin);
+    vspapi->registerFunction("EEDI3AA", eedi3_args, "clip:vnode:gpu;",
+                             Eedi3AaCreate, nullptr, plugin);
 }
-
-
-

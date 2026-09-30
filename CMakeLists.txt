@@ -30,6 +30,13 @@ FetchContent_Declare(volk
 FetchContent_MakeAvailable(volk)
 
 find_program(VK_GLSLC glslc)
+# Optional: validates each variant's SPIR-V against the environment glslc was
+# given. Not every toolchain that ships glslc ships SPIRV-Tools, so a build
+# without it skips validation instead of failing.
+find_program(VK_SPIRV_VAL spirv-val)
+# Every shader targets vulkan1.4 (SPIR-V 1.6), the core's R80 device baseline.
+# Named once because the two tools spell the flag differently.
+set(VK_SPV_ENV vulkan1.4)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 find_package(Git QUIET)
@@ -136,10 +143,16 @@ message(STATUS "vapoursynth-feel commit ${VSFEEL_COMMIT}")
 
 # Helpers
 function(configure_common target)
-    target_compile_features(${target} PUBLIC cxx_std_20)
+    # CXX_STANDARD + REQUIRED, not just the cxx_std_20 feature: a compiler whose
+    # default already satisfies the feature (GCC 16 defaults to C++20) leaves
+    # CMake free to drop the -std flag, so the tree was built with the compiler's
+    # default and with extensions on despite CXX_EXTENSIONS OFF. Clang defaults
+    # to C++17, where the tree does not compile. Pin it.
     set_target_properties(${target} PROPERTIES
-        POSITION_INDEPENDENT_CODE ON
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
         CXX_EXTENSIONS OFF
+        POSITION_INDEPENDENT_CODE ON
     )
 endfunction()
 
@@ -164,29 +177,21 @@ endif()
 # The <defs> fields are quoted so that entries stay one CMake list element even
 # when they carry spaces; separate_arguments() splits them back into arguments.
 #
-# --target-env is deliberately left as it is here (bilateral/gaussblur
-# compile as SPIR-V 1.0, except their 16-bit variants; dfttest/eedi3/
-# nnedi3/nlmeans as 1.6). Unifying it is a codegen change and belongs in its own
-# measured commit, not in this refactor.
-# bm3d is 1.6 as well: its group transpose is a subgroup shuffle, which needs
-# SPIR-V 1.3+; nlmeans is 1.6 because it reads the core's GPU frame planes
-# through buffer references (PhysicalStorageBuffer), a 1.2+ feature.
+# Every variant compiles for vulkan1.4 (SPIR-V 1.6), the R80 core's device
+# baseline, so no entry names a --target-env. That target is what puts a 16-bit
+# SSBO in the StorageBuffer class (SPIR-V 1.0 emitted Uniform + BufferBlock,
+# needing uniformAndStorageBuffer16BitAccess, which the baseline lacks) and
+# covers the subgroup ops (1.3+), buffer references and Vulkan memory model the
+# kernels rely on.
 
 set(VK_BITS "16" "32")
 
-# Bilateral: one entry point per file, per io variant. The 16-bit SSBOs need
-# the StorageBuffer class for the same reason as gaussblur's (see below); the
-# 32-bit variants keep their SPIR-V 1.0 codegen.
+# Bilateral: one entry point per file, per io variant.
 set(VK_BILATERAL_VARIANTS)
 foreach(component IN ITEMS shared plain)
     foreach(bits IN LISTS VK_BITS)
-        if(bits EQUAL 16)
-            set(VK_BILATERAL_ENV --target-env=vulkan1.1)
-        else()
-            set(VK_BILATERAL_ENV "")
-        endif()
         list(APPEND VK_BILATERAL_VARIANTS
-            "bilateral_${component}_${bits}|bilateral_${component}.comp|-DBITS=${bits} ${VK_BILATERAL_ENV}")
+            "bilateral_${component}_${bits}|bilateral_${component}.comp|-DBITS=${bits}")
     endforeach()
 endforeach()
 
@@ -194,8 +199,8 @@ endforeach()
 # same kernel with the aggregation on atomicCompSwap, for devices without
 # buffer float atomics; see src/bm3d.comp.
 set(VK_BM3D_VARIANTS
-    "bm3d|bm3d.comp|--target-env=vulkan1.3"
-    "bm3d_cas|bm3d.comp|--target-env=vulkan1.3 -DNO_FLOAT_ATOMICS"
+    "bm3d|bm3d.comp|"
+    "bm3d_cas|bm3d.comp|-DNO_FLOAT_ATOMICS"
     "bm3d_agg|bm3d_agg.comp|")
 
 # GaussBlur: one kernel with three entry points (fused small path + the two
@@ -204,22 +209,11 @@ set(VK_GAUSS_ENTRIES gauss vert horiz)
 set(VK_GAUSS_ENTRY_DEFS -DENTRY_GAUSS -DENTRY_VERT -DENTRY_HORIZ)
 set(VK_GAUSS_VARIANTS)
 foreach(bits IN LISTS VK_BITS)
-    # SPIR-V 1.0 emits buffer blocks as Uniform + BufferBlock, so a 16-bit
-    # element needs uniformAndStorageBuffer16BitAccess -- a feature the core's
-    # device baseline does not enable (the validation layer flags it). Vulkan1.1
-    # is the smallest target that emits the StorageBuffer class instead, which
-    # the baseline's storageBuffer16BitAccess covers. The 32-bit variants keep
-    # their SPIR-V 1.0 codegen.
-    if(bits EQUAL 16)
-        set(VK_GAUSS_ENV --target-env=vulkan1.1)
-    else()
-        set(VK_GAUSS_ENV "")
-    endif()
     foreach(entry_i RANGE 0 2)
         list(GET VK_GAUSS_ENTRIES ${entry_i} entry)
         list(GET VK_GAUSS_ENTRY_DEFS ${entry_i} entry_def)
         list(APPEND VK_GAUSS_VARIANTS
-            "gaussblur_${bits}_${entry}|gaussblur.comp|-DBITS=${bits} ${entry_def} ${VK_GAUSS_ENV}")
+            "gaussblur_${bits}_${entry}|gaussblur.comp|-DBITS=${bits} ${entry_def}")
     endforeach()
 endforeach()
 
@@ -239,18 +233,18 @@ foreach(bits IN LISTS VK_BITS)
         list(GET VK_DFT_ENTRIES ${entry_i} entry)
         list(GET VK_DFT_ENTRY_DEFS ${entry_i} entry_def)
         list(APPEND VK_DFT_VARIANTS
-            "dfttest_${bits}_${entry}|dfttest.comp|--target-env=vulkan1.3 -DBITS=${bits} ${entry_def}")
+            "dfttest_${bits}_${entry}|dfttest.comp|-DBITS=${bits} ${entry_def}")
     endforeach()
     foreach(radius RANGE 0 3)
         list(APPEND VK_DFT_VARIANTS
-            "dfttest_${bits}_fused_r${radius}|dfttest.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_FUSED -DRADIUS=${radius}")
+            "dfttest_${bits}_fused_r${radius}|dfttest.comp|-DBITS=${bits} -DENTRY_FUSED -DRADIUS=${radius}")
     endforeach()
 endforeach()
 
 # NLMeans: compose / weight / accumulation entry points per io variant (16-bit
-# int, 32-bit float); everything else is a specialization constant. vulkan1.4
-# (SPIR-V 1.6) because the compose pass names the core's GPU frame planes
-# through buffer references.
+# int, 32-bit float); everything else is a specialization constant. The compose
+# pass names the core's GPU frame planes through buffer references
+# (PhysicalStorageBuffer).
 set(VK_NLM_ENTRIES compose weight acc)
 set(VK_NLM_ENTRY_DEFS -DENTRY_COMPOSE -DENTRY_WEIGHT -DENTRY_ACC)
 set(VK_NLM_VARIANTS)
@@ -259,14 +253,14 @@ foreach(bits IN LISTS VK_BITS)
         list(GET VK_NLM_ENTRIES ${entry_i} entry)
         list(GET VK_NLM_ENTRY_DEFS ${entry_i} entry_def)
         list(APPEND VK_NLM_VARIANTS
-            "nlmeans_${bits}_${entry}|nlmeans.comp|--target-env=vulkan1.4 -DBITS=${bits} ${entry_def}")
+            "nlmeans_${bits}_${entry}|nlmeans.comp|-DBITS=${bits} ${entry_def}")
     endforeach()
 endforeach()
 
 # EEDI3: row kernel (one 32-lane WG per interp row, subgroup-register DP
 # with shuffles) + vcheck kernel (single WG serial row walk), per io
 # variant (16 int, 32 float). The row kernel needs subgroup ops + the
-# Vulkan memory model, so SPIR-V 1.3+ (vulkan1.3 target) is required.
+# Vulkan memory model, so SPIR-V 1.3+ is required.
 # PROBE and MAXW are cache variables: PROBE is a diagnostics-only ablation
 # level, MAXW is the max plane width the vcheck LDS ping-pong can hold, kept in
 # step with the host's fit check (EEDI3_MAXW_LDS) so the two cannot drift into a
@@ -276,24 +270,24 @@ set(EEDI3_MAXW "4096" CACHE STRING "EEDI3 vcheck LDS max plane width")
 set(VK_EEDI3_VARIANTS)
 foreach(bits IN LISTS VK_BITS)
     list(APPEND VK_EEDI3_VARIANTS
-        "eedi3_${bits}_row|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_ROW"
-        "eedi3_${bits}_vcheck|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK"
-        "eedi3_${bits}_vcheck_lds|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_LDS=1"
-        "eedi3_${bits}_vcheck_para|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=1"
-        "eedi3_${bits}_vcheck_para_j1|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=2"
-        "eedi3_${bits}_vcheck_para_j2|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=3"
-        "eedi3_${bits}_vcheck_para_j3|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=4"
-        "eedi3_${bits}_vcheck_para_j4|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=5"
-        "eedi3_${bits}_vcheck_para_j5|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=6"
+        "eedi3_${bits}_row|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_ROW"
+        "eedi3_${bits}_vcheck|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK"
+        "eedi3_${bits}_vcheck_lds|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_LDS=1"
+        "eedi3_${bits}_vcheck_para|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=1"
+        "eedi3_${bits}_vcheck_para_j1|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=2"
+        "eedi3_${bits}_vcheck_para_j2|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=3"
+        "eedi3_${bits}_vcheck_para_j3|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=4"
+        "eedi3_${bits}_vcheck_para_j4|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=5"
+        "eedi3_${bits}_vcheck_para_j5|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=6"
         # upload kernels: mirror-pad builder + empty-row vcheck copy and the
         # assemble/transpose passes (plain 1D kernels, fixed local size, no
-        # subgroup ops); vulkan1.3 target keeps one rule for the file.
-        "eedi3_${bits}_pad|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PAD"
-        "eedi3_${bits}_vcopy|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_VCOPY"
-        "eedi3_${bits}_blit|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_BLIT"
-        "eedi3_${bits}_xpose|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_XPOSE"
-        "eedi3_${bits}_compose|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_COMPOSE"
-        "eedi3_${bits}_assemblev|eedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_ASSEMBLEV")
+        # subgroup ops).
+        "eedi3_${bits}_pad|eedi3.comp|-DBITS=${bits} -DENTRY_PAD"
+        "eedi3_${bits}_vcopy|eedi3.comp|-DBITS=${bits} -DENTRY_VCOPY"
+        "eedi3_${bits}_blit|eedi3.comp|-DBITS=${bits} -DENTRY_BLIT"
+        "eedi3_${bits}_xpose|eedi3.comp|-DBITS=${bits} -DENTRY_XPOSE"
+        "eedi3_${bits}_compose|eedi3.comp|-DBITS=${bits} -DENTRY_COMPOSE"
+        "eedi3_${bits}_assemblev|eedi3.comp|-DBITS=${bits} -DENTRY_ASSEMBLEV")
 endforeach()
 
 # EEDI3 mask preparation: one variant per mask element format (the mask plane is
@@ -302,9 +296,9 @@ endforeach()
 # predicate matrix ENTRY_MASKPACK writes). These do not depend on the io depth.
 foreach(mbits IN ITEMS 8 16 32)
     list(APPEND VK_EEDI3_VARIANTS
-        "eedi3_maskpack_${mbits}|eedi3.comp|--target-env=vulkan1.3 -DENTRY_MASKPACK -DMASK_BITS=${mbits}"
-        "eedi3_maskdilate_${mbits}_raw|eedi3.comp|--target-env=vulkan1.3 -DENTRY_MASKDILATE -DMASK_BITS=${mbits} -DMASK_TRANS=0"
-        "eedi3_maskdilate_${mbits}_tr|eedi3.comp|--target-env=vulkan1.3 -DENTRY_MASKDILATE -DMASK_BITS=${mbits} -DMASK_TRANS=1")
+        "eedi3_maskpack_${mbits}|eedi3.comp|-DENTRY_MASKPACK -DMASK_BITS=${mbits}"
+        "eedi3_maskdilate_${mbits}_raw|eedi3.comp|-DENTRY_MASKDILATE -DMASK_BITS=${mbits} -DMASK_TRANS=0"
+        "eedi3_maskdilate_${mbits}_tr|eedi3.comp|-DENTRY_MASKDILATE -DMASK_BITS=${mbits} -DMASK_TRANS=1")
 endforeach()
 
 # NNEDI3: prescreener + cooperative predictor + the kept-row writer. Three
@@ -318,12 +312,12 @@ endforeach()
 set(VK_NNEDI3_VARIANTS)
 foreach(bits IN LISTS VK_BITS)
     list(APPEND VK_NNEDI3_VARIANTS
-        "nnedi3_${bits}_prescreen|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PRESCREEN"
-        "nnedi3_${bits}_predict|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PREDICT -DSHSTRIDE=256u"
-        "nnedi3_${bits}_predict_n4|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=288u"
-        "nnedi3_${bits}_predict_n4m|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=192u"
-        "nnedi3_${bits}_predict_n4s|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=64u"
-        "nnedi3_${bits}_keep|nnedi3.comp|--target-env=vulkan1.3 -DBITS=${bits} -DENTRY_KEEP")
+        "nnedi3_${bits}_prescreen|nnedi3.comp|-DBITS=${bits} -DENTRY_PRESCREEN"
+        "nnedi3_${bits}_predict|nnedi3.comp|-DBITS=${bits} -DENTRY_PREDICT -DSHSTRIDE=256u"
+        "nnedi3_${bits}_predict_n4|nnedi3.comp|-DBITS=${bits} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=288u"
+        "nnedi3_${bits}_predict_n4m|nnedi3.comp|-DBITS=${bits} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=192u"
+        "nnedi3_${bits}_predict_n4s|nnedi3.comp|-DBITS=${bits} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=64u"
+        "nnedi3_${bits}_keep|nnedi3.comp|-DBITS=${bits} -DENTRY_KEEP")
 endforeach()
 
 set(VK_VARIANTS
@@ -342,11 +336,10 @@ set(VK_VARIANTS
 #
 # Each rule also DEPENDS on a per-variant flags file holding that variant's
 # glslc arguments. Ninja tracks the command line itself, but the default Unix
-# Makefiles generator does not: without the stamp a -D, a --target-env or a
-# PROBE/MAXW cache change leaves a stale .spv behind and silently ships the old
-# kernel. The file is written with file(GENERATE) (content-hash: only a real
-# flag change touches it, so an unrelated CMakeLists edit does not recompile
-# the shaders).
+# Makefiles generator does not: without the stamp a -D or a PROBE/MAXW cache
+# change leaves a stale .spv behind and silently ships the old kernel. The file
+# is written with file(GENERATE) (content-hash: only a real flag change touches
+# it, so an unrelated CMakeLists edit does not recompile the shaders).
 function(add_spv_variant out source defs)
     separate_arguments(flags UNIX_COMMAND "${defs}")
 
@@ -354,18 +347,36 @@ function(add_spv_variant out source defs)
     set(stamp "${VK_SPV_DIR}/${out}.spv.flags")
     file(GENERATE OUTPUT "${stamp}" CONTENT "${flags}\n")
 
+    # -Werror: every variant is warning-free today, so a glslang warning is a
+    # real signal rather than noise to scroll past.
     add_custom_command(
         OUTPUT "${spv}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${VK_SPV_DIR}"
-        COMMAND "${VK_GLSLC}" -O -fshader-stage=compute ${flags} -o "${spv}" "${source}"
+        COMMAND "${VK_GLSLC}" -O -Werror --target-env=${VK_SPV_ENV} -fshader-stage=compute ${flags} -o "${spv}" "${source}"
         DEPENDS "${source}" "${stamp}"
         VERBATIM)
     set(VK_SPV_OUTPUTS ${VK_SPV_OUTPUTS} "${spv}" PARENT_SCOPE)
+
+    # Validate the module the compiler actually emitted, not the GLSL: it is the
+    # only step that sees the capability / memory-model / type rules a driver may
+    # enforce (spirv-val here rejects a 16-bit constant under a 16-bit-storage
+    # module, which glslc accepts and RADV runs anyway).
+    if(VK_SPIRV_VAL)
+        set(val_stamp "${VK_SPV_DIR}/${out}.spv.validated")
+        add_custom_command(
+            OUTPUT "${val_stamp}"
+            COMMAND "${VK_SPIRV_VAL}" --target-env ${VK_SPV_ENV} "${spv}"
+            COMMAND "${CMAKE_COMMAND}" -E touch "${val_stamp}"
+            DEPENDS "${spv}"
+            VERBATIM)
+        set(VK_SPV_VALIDATED ${VK_SPV_VALIDATED} "${val_stamp}" PARENT_SCOPE)
+    endif()
 endfunction()
 
 if(VK_GLSLC)
     set(VK_SPV_DIR "${CMAKE_CURRENT_BINARY_DIR}/vk_spv")
     set(VK_SPV_OUTPUTS)
+    set(VK_SPV_VALIDATED)
     foreach(variant IN LISTS VK_VARIANTS)
         string(REPLACE "|" ";" variant_fields "${variant}")
         list(LENGTH variant_fields field_count)
@@ -380,6 +391,15 @@ if(VK_GLSLC)
         endif()
         add_spv_variant("${out}" "${CMAKE_CURRENT_SOURCE_DIR}/src/${source}" "${defs}")
     endforeach()
+
+    # Part of the default build, so an invalid module cannot be compiled, linked
+    # and tested before anyone notices. Skipped (not failed) without spirv-val.
+    if(VK_SPIRV_VAL)
+        add_custom_target(shader-validate ALL DEPENDS ${VK_SPV_VALIDATED})
+        message(STATUS "Shader SPIR-V validated with ${VK_SPIRV_VAL}")
+    else()
+        message(STATUS "spirv-val not found: shader SPIR-V validation disabled")
+    endif()
 else()
     message(FATAL_ERROR "glslc not found")
 endif()
@@ -458,9 +478,16 @@ endif()
 # Build the plugin with a real warning baseline so defects do not accumulate.
 # -Wmissing-field-initializers is deliberately excluded: vsfeel.h silences it
 # for the Vulkan/VapourSynth designated-initializer convention.
+# The tree is warning-free today; VSFEEL_WERROR turns the baseline into a gate
+# for CI, where a new warning should stop the job rather than scroll past. Off
+# by default so a compiler upgrade does not break a local build mid-edit.
+option(VSFEEL_WERROR "Treat host compiler warnings as errors" OFF)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(vsfeel PRIVATE
         -Wall -Wextra -Wshadow -Wno-missing-field-initializers)
+    if(VSFEEL_WERROR)
+        target_compile_options(vsfeel PRIVATE -Werror)
+    endif()
 endif()
 # Keep the host's EEDI3 vcheck LDS fit check in step with the -DMAXW the shader
 # was compiled with (defined above, in the EEDI3 shader block).
