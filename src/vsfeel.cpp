@@ -21,8 +21,6 @@
 #include <variant>
 #include <vector>
 
-#include <volk.h>
-
 #include <VapourSynth4.h>
 
 #include "vsfeel.h"

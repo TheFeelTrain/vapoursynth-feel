@@ -8,26 +8,20 @@ if(WIN32)
     enable_language(RC)
 endif()
 
-# Vulkan is reached through volk, which dlopens the loader at runtime: nothing
-# links libvulkan, and that is what lets the Linux wheel be manylinux (no
-# manylinux policy whitelists libvulkan.so.1). The headers are pinned by hash
+# Vulkan types and enums come from the pinned Vulkan-Headers; nothing links
+# libvulkan, because the R80 GPU API hands the plugin the core's dispatch table
+# (VSVulkanFunctions) and no vk* function is called directly. That is what lets
+# the Linux wheel be manylinux (no manylinux policy whitelists libvulkan.so.1)
+# and the Windows DLL need no import library. The headers are pinned by hash
 # rather than taken from a Vulkan SDK so a bare container can build the plugin;
-# release tarballs are used instead of git clones because they are an order of
-# magnitude smaller and need no git.
+# a release tarball is used instead of a git clone because it is an order of
+# magnitude smaller and needs no git.
 include(FetchContent)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)   # volk is a static lib linked into a .so
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)   # the plugin is a shared library
 FetchContent_Declare(vulkan_headers
     URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.357.0.tar.gz
     URL_HASH SHA256=e87dce08116151f6b6d7de6b6faf41498e87e6cf848ff16fa3bd5402190ad4a3)
 FetchContent_MakeAvailable(vulkan_headers)
-# Pin volk to the fetched headers: left to itself it prefers a system Vulkan
-# SDK, so the same commit would compile against different headers per machine.
-set(VULKAN_HEADERS_INSTALL_DIR "${vulkan_headers_SOURCE_DIR}" CACHE PATH
-    "Vulkan headers used to build volk" FORCE)
-FetchContent_Declare(volk
-    URL https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.4.357.0.tar.gz
-    URL_HASH SHA256=6400c7b23e24d17e4f04bac49b55b06c4e87677d33398e90344743ec73560ca6)
-FetchContent_MakeAvailable(volk)
 
 find_program(VK_GLSLC glslc)
 # Optional: validates each variant's SPIR-V against the environment glslc was
@@ -471,8 +465,8 @@ if(MSVC)
     target_compile_options(vsfeel PRIVATE /arch:AVX2 /utf-8 /EHsc)
 else()
     target_compile_options(vsfeel PRIVATE -mavx2)
-    # Keep volk's vk* function pointers and everything else internal; the plugin
-    # only needs to export VapourSynthPluginInit2 (VS_EXTERNAL_API marks it).
+    # Keep everything internal; the plugin only needs to export
+    # VapourSynthPluginInit2 (VS_EXTERNAL_API marks it).
     target_compile_options(vsfeel PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
 endif()
 # Build the plugin with a real warning baseline so defects do not accumulate.
@@ -502,7 +496,7 @@ if(WIN32 AND NOT MSVC)
     # VapourSynth install. -s drops the symbol table from the release DLL.
     target_link_options(vsfeel PRIVATE -static-libgcc -static-libstdc++ -static -s)
 endif()
-target_link_libraries(vsfeel PRIVATE volk::volk)
+target_link_libraries(vsfeel PRIVATE Vulkan::Headers)
 target_include_directories(vsfeel PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 # Config header

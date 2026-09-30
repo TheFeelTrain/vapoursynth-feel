@@ -29,8 +29,6 @@
 #include <windows.h>
 #endif
 
-#include <volk.h>
-
 #include <VapourSynth4.h>
 #include <VSConstants4.h>
 #include <VSHelper4.h>

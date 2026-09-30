@@ -40,9 +40,9 @@ jobs:
         path: dist
         if-no-files-found: ignore
 
-  # Vulkan is loaded through volk at runtime, so the wheel links no libvulkan
-  # and auditwheel can retag it to manylinux. Built in the manylinux image so
-  # the glibc symbol floor is the policy's, not the runner's.
+  # Nothing links libvulkan (the R80 GPU API hands the plugin the core's
+  # dispatch table), so auditwheel can retag the wheel to manylinux. Built in the
+  # manylinux image so the glibc symbol floor is the policy's, not the runner's.
   linux-wheel:
     runs-on: ubuntu-latest
     container: quay.io/pypa/manylinux_2_34_x86_64

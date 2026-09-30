@@ -51,8 +51,8 @@ Checks: >
   readability-redundant-inline-specifier,
   -readability-redundant-member-init
 
-# Only report findings in the plugin's own headers, not in Vulkan-Headers, volk
-# or VSVulkan4.h.
+# Only report findings in the plugin's own headers, not in Vulkan-Headers or
+# VSVulkan4.h.
 HeaderFilterRegex: '.*/src/.*'
 
 # The tree is clean, so any finding is a new one: fail on it.

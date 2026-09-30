@@ -19,8 +19,6 @@
 #include <variant>
 #include <vector>
 
-#include <volk.h>
-
 // The GPU API this plugin targets (VSAPI::getVulkanAPI) only exists from API
 // 4.3 on. The build defines it for every TU; the guard keeps a TU that includes
 // VapourSynth4.h through some other path from silently dropping to API 4.0.
