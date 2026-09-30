@@ -37,8 +37,8 @@
  * - integer store rounds to nearest even and saturates (rintf semantics).
  *
  * The model weights arrive mean-subtracted from the host (same projection
- * the references bake in), so the in-shader normalization is v*mstd2 with
- * the window mean re-added only in the final wae5 blend.
+ * the references bake in), so the shared window tile is normalized by m2 and
+ * the window mean is re-added only in the final wae5 blend.
  *
  * Compile-time variants: -DBITS=16|32 (uint16_t / float IO).
  */
@@ -378,7 +378,6 @@ shared vec4 shTile[4 * SHSTRIDE];
             } \
             mstd0[px] = m0; \
             mstd1[px] = m1; \
-            mstd2[px] = m2; \
             result[px] = 0.0; \
             [[unroll]] for (int t = 0; t < EPLX; t++) { \
                 const int e = int(lane) + t * 32; \
@@ -456,7 +455,7 @@ void main() {
     const uint warp = gl_SubgroupID;
     const uint npix = (USE_LIST != 0) ? indBuf[pc.d_base + 3] : uint(WIDTH) * uint(ROWS);
     uint idxs[8];
-    float mstd0[8], mstd1[8], mstd2[8], result[8];
+    float mstd0[8], mstd1[8], result[8];
 
     // Exact-sized grids in both modes (indirect off the compacted count,
     // direct off the host-computed pixel grid): one work unit per subgroup;

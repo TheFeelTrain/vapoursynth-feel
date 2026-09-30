@@ -128,7 +128,10 @@ def _yuv420p16():
 def test_nnedi3_yuv_matches_reference():
     yuv = _yuv420p16()
     assert yuv.format.color_family == vs.YUV
-    for kwargs in ({}, {"planes": [0]}, {"planes": [1, 2]}, {"nsize": 0}):
+    # dh doubles the luma height; the chroma writers have to cover the whole
+    # (2*h) >> subSamplingH plane, last row included.
+    for kwargs in ({}, {"planes": [0]}, {"planes": [1, 2]}, {"nsize": 0},
+                   {"dh": True}):
         payload = _ref_compare("yuv420_16", (0, 11), kwargs)
         assert payload["maxdiff"] <= 1, kwargs
 
@@ -295,3 +298,16 @@ def test_nnedi3_rejects_odd_height(noise_16bit):
     odd = noise_16bit.std.Crop(bottom=1)
     with pytest.raises(vs.Error):
         _run(odd).get_frame(0)
+
+
+def test_nnedi3_rejects_dh_over_int32_height():
+    """dh doubles vi_out.height, an int, so it has to refuse heights past
+    INT32_MAX/2 *before* the multiply (the geometry check only fires after the
+    signed overflow). BlankClip builds the node without allocating the frame,
+    so the guard is exercised at creation. The message is asserted because a
+    wrapped height would otherwise still be rejected, with a different error.
+    """
+    clip = vs.core.std.BlankClip(width=1, height=1 << 30, format=vs.GRAY16,
+                                 length=1)
+    with pytest.raises(vs.Error, match="too tall"):
+        vs.core.vsfeel.NNEDI3(clip, field=1, dh=True)

@@ -188,8 +188,8 @@ static void prescreener_prep(float (&k0)[4][W], double pixel_half) {
 }
 
 // Model prep: project the per-neuron means and the shared mean filter out of
-// the weights (one pass per qual), so the shader normalizes with v*mstd2 and
-// re-adds the window mean only in the final blend.
+// the weights (one pass per qual), so the shader normalizes the window by m2
+// and re-adds the window mean only in the final blend.
 static void model_prep_pass(std::vector<float> & sm, std::vector<float> & el,
                             std::vector<float> & sm_b, size_t fs, size_t nns) {
     std::vector<double> sm_means(nns), el_means(nns), mean_filter(fs, 0.0);
@@ -919,12 +919,30 @@ static void VS_CC Nnedi3Create(
     }
     d->use_list = d->pscrn > 0;
 
-    if (!d->dh) {
-        for (int plane = 0; plane < fmt.numPlanes; ++plane) {
-            const int ph = d->vi->height >> (plane > 0 ? fmt.subSamplingH : 0);
-            if (d->process[plane] && (ph & 1) != 0) {
-                return set_error("plane height must be mod 2 when dh is false.");
+    // The keep and predict writers together cover exactly 2*rows output rows
+    // per plane (rows is the field height, so 2*rows is `height` when dh is
+    // off and the whole doubled plane when it is on). The core sizes a
+    // subsampled plane as `height >> subSamplingH`, which under dh is one row
+    // taller than that whenever the input height is not a multiple of
+    // 2^subSamplingH -- that last row would keep recycled memory. Only an
+    // out-of-spec source can declare such a height; reject it here.
+    for (int plane = 0; plane < fmt.numPlanes; ++plane) {
+        // A plane the filter never dispatches on (dh off, plane unprocessed)
+        // is shared from the source and needs no coverage check.
+        if (!d->process[plane] && !d->dh) {
+            continue;
+        }
+        const int sub_h = plane > 0 ? fmt.subSamplingH : 0;
+        const int64_t h = d->vi->height;
+        const int64_t in_h = h >> sub_h;
+        if (d->dh) {
+            if (((2 * h) >> sub_h) != 2 * in_h) {
+                return set_error("output plane height must be even when dh is "
+                                 "true; the input height has to be a multiple "
+                                 "of " + std::to_string(1 << sub_h) + ".");
             }
+        } else if ((in_h & 1) != 0) {
+            return set_error("plane height must be mod 2 when dh is false.");
         }
     }
 
@@ -942,6 +960,9 @@ static void VS_CC Nnedi3Create(
         vsh::muldivRational(&d->vi_out.fpsNum, &d->vi_out.fpsDen, 2, 1);
     }
     if (d->dh) {
+        if (d->vi_out.height > INT32_MAX / 2) {
+            return set_error("resulting clip is too tall.");
+        }
         d->vi_out.height *= 2;
     }
 
@@ -1275,6 +1296,10 @@ static void VS_CC Nnedi3Create(
                 cfg.width, cfg.rows, d->peak, d->pscrn, d->xdim, d->ydim, d->nns,
                 d->qual, d->use_list ? 1 : 0, d->dh ? 1 : 0, zero ? 1 : 0
             };
+            // Each handle lands in d->planes the moment it is created: a later
+            // create for this key (keep is the 256-invocation one) can still
+            // fail, and the destructor walks only d->planes, so a handle left
+            // in a local staging array would leak.
             if (d->process[plane]) {
                 if (d->use_list) {
                     const auto result = create_pipeline(*d->gpu, spec, pre_code,
@@ -1285,6 +1310,7 @@ static void VS_CC Nnedi3Create(
                         return set_error(std::get<std::string>(result));
                     }
                     pre_pipes[n_keys] = std::get<VkPipeline>(result);
+                    cfg.pre_pipeline = pre_pipes[n_keys];
                 }
                 {
                     // The predict module is picked by the window size: the PXP=8
@@ -1318,6 +1344,7 @@ static void VS_CC Nnedi3Create(
                         return set_error(std::get<std::string>(result));
                     }
                     pred_pipes[n_keys] = std::get<VkPipeline>(result);
+                    cfg.pred_pipeline = pred_pipes[n_keys];
                 }
             }
             {
@@ -1328,14 +1355,17 @@ static void VS_CC Nnedi3Create(
                     return set_error(std::get<std::string>(result));
                 }
                 keep_pipes[n_keys] = std::get<VkPipeline>(result);
+                cfg.keep_pipeline = keep_pipes[n_keys];
             }
             keys[n_keys] = { cfg.width, cfg.rows, d->pscrn, d->xdim, d->ydim,
                              d->nns, d->qual, zero };
             ++n_keys;
+        } else {
+            // A key already built by an earlier plane: share its handles.
+            cfg.pre_pipeline = pre_pipes[ki];
+            cfg.pred_pipeline = pred_pipes[ki];
+            cfg.keep_pipeline = keep_pipes[ki];
         }
-        cfg.pre_pipeline = pre_pipes[ki];
-        cfg.pred_pipeline = pred_pipes[ki];
-        cfg.keep_pipeline = keep_pipes[ki];
     }
     d->scratch_bytes = d->use_list ? std::max<VkDeviceSize>(list_run, 16) : 4;
 

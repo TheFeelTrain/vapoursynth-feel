@@ -97,12 +97,20 @@ def test_validation_layer_smoke(filter_name):
 
 
 _LEAK_SCRIPT = textwrap.dedent("""\
+    import sys
+
     import vapoursynth as vs
 
     core = vs.core
     clip = core.std.BlankClip(width=640, height=360, format=vs.GRAY16, length=2)
+    name = sys.argv[1]
     try:
-        core.vsfeel.EEDI3(clip, field=1, mdis=5, nrad=1)
+        if name == "EEDI3":
+            core.vsfeel.EEDI3(clip, field=1, mdis=5, nrad=1)
+        elif name == "NNEDI3":
+            core.vsfeel.NNEDI3(clip, field=1)
+        else:
+            raise SystemExit("unknown filter %r" % name)
     except vs.Error:
         pass
     else:
@@ -111,19 +119,22 @@ _LEAK_SCRIPT = textwrap.dedent("""\
 """)
 
 
-def test_failed_creation_does_not_leak_pipelines():
+@pytest.mark.parametrize("filter_name", ["EEDI3", "NNEDI3"])
+def test_failed_creation_does_not_leak_pipelines(filter_name):
     """A creation that fails partway must destroy the pipelines it already made.
 
-    Under ``VSFEEL_LIMIT_INVOCATIONS=128`` the pad pipeline (256 invocations)
-    fails after the row and vcheck pipelines were created, so an abandoned
-    partial set is exactly two leaked ``VkPipeline`` objects -- which the
-    validation layer names at ``vkDestroyDevice``
-    (``VUID-vkDestroyDevice-device-05137``).
+    Under ``VSFEEL_LIMIT_INVOCATIONS=128`` a 256-invocation pipeline fails
+    after the earlier 128-invocation ones were created, so an abandoned
+    partial set is exactly the pipelines already built -- which the validation
+    layer names at ``vkDestroyDevice``
+    (``VUID-vkDestroyDevice-device-05137``). EEDI3 loses two (row, vcheck)
+    before pad; NNEDI3 loses two (prescreen, predict) before the kept-row
+    writer.
     """
     env = {**os.environ, "VK_INSTANCE_LAYERS": _LAYER,
            "VK_LOADER_DEBUG": "layer", "VSFEEL_LIMIT_INVOCATIONS": "128",
            "MANGOHUD": "0"}
-    proc = subprocess.run([sys.executable, "-c", _LEAK_SCRIPT],
+    proc = subprocess.run([sys.executable, "-c", _LEAK_SCRIPT, filter_name],
                           capture_output=True, text=True, timeout=300, env=env)
     stdout, stderr = proc.stdout, proc.stderr
     tail = ("--- stdout tail ---\n%s\n--- stderr tail ---\n%s"
@@ -134,11 +145,12 @@ def test_failed_creation_does_not_leak_pipelines():
         pytest.skip(f"{_LAYER} is not installed")
 
     assert proc.returncode == 0 and "LEAK OK" in stdout, (
-        f"the failing EEDI3 creation did not reach its own error path\n{tail}")
+        f"the failing {filter_name} creation did not reach its own "
+        f"error path\n{tail}")
 
     hits = [line for line in stdout.splitlines() + stderr.splitlines()
             if "not been destroyed" in line or "05137" in line]
     assert not hits, (
-        "a failed EEDI3 creation leaked Vulkan objects:\n"
+        f"a failed {filter_name} creation leaked Vulkan objects:\n"
         + "\n".join(hits[:10]) + "\n" + tail)
 

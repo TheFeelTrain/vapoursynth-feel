@@ -211,6 +211,28 @@ kept (over-launch refuted below); `REQUIRE_FULL_SUBGROUPS` on the cooperative
 kernels only; one-shot ReBAR upload (`NT stores + sfence`) — now the core's
 upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
 
+### Creation-time hardening — correctness pass, no perf change
+
+- **Pipelines are owned from the first create.** Each handle lands in
+  `d->planes` the moment it is created; the local `pre/pred/keep` arrays are
+  only the key→handle dedup table. A device that cannot hold the
+  kept-row writer's 256-invocation workgroup (128 forced) failed *after*
+  prescreen and predict were built, and those two lived in the staging arrays
+  the destructor never walked — validation named the leak at `vkDestroyDevice`.
+- **`dh` plane geometry is validated.** The keep and predict writers cover
+  exactly `2*(height >> subSamplingH)` rows, but the core sizes a subsampled
+  plane as `(2*height) >> subSamplingH` — one row taller when the input height
+  is not a multiple of `2^subSamplingH`, leaving the last chroma row unwritten.
+  That height is rejected now; the `!dh` mod-2 check is the same loop. No core
+  source can declare one (BlankClip/Crop/AddBorders and fmtc all validate, and
+  R81's `create_video_frame` refuses unaligned dimensions), so the guard only
+  fires for an out-of-spec third-party source.
+- **`dh` refuses a height past `INT32_MAX/2`** before doubling `vi_out.height`
+  (an `int`); the later geometry check would otherwise fire only after the
+  signed overflow.
+- **`mstd2` deleted** (written, never read — the tile is normalized through the
+  local `m2`); the header/host comments naming it are gone.
+
 ### Measured dead ends (mechanisms)
 
 - **Predict over-launch REFUTED.** Full-grid direct with early exit: pred 268
