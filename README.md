@@ -28,12 +28,12 @@ A [Bilateral filter](https://en.wikipedia.org/wiki/Bilateral_filter) is a non-li
 
 ```python
 core.vsfeel.Bilateral(clip clip[,
-    clip    ref,                    # guide clip: weights from ref, values from clip
     float[] sigma_spatial=3.0,      # spatial blur reach; per-plane, chroma default = sigma[0]/sqrt((1<<ssw)*(1<<ssh))
     float[] sigma_color=0.02,       # edge sensitivity: how different pixels may be to blend; depth-normalized
     int[]   radius,                 # per-plane blur window radius; default max(1, round(sigma_spatial*3))
     int     use_shared_memory=1,    # faster on-chip kernel while the window fits; falls back otherwise
-    int     block_x, int block_y])  # GPU thread-block dims; auto-tuned when unset (32 x 8, x16 when radius > 12)
+    int     block_x, int block_y,   # GPU thread-block dims; auto-tuned when unset (32 x 8, x16 when radius > 12)
+    clip    ref])                   # guide clip: weights from ref, values from clip
 ```
 
 ### BM3Dv2
@@ -44,12 +44,12 @@ core.vsfeel.Bilateral(clip clip[,
 core.vsfeel.BM3Dv2(clip clip[,
     clip    ref,                    # basic-estimate clip for the Wiener (final) pass
     float[] sigma=3.0,              # denoising strength per-plane; below FLT_EPSILON skips the plane
-    int     radius=0,               # temporal search radius in frames, 0..4 (0 = spatial only)
     int[]   block_step=8,           # per-plane block grid spacing, 1..8; smaller = fewer artifacts, slower
-    int[]   bm_range=9,             # per-plane spatial search radius in pixels (> 0)
-    int[]   ps_num=2,               # motion-predicted candidates seeding each temporal search
-    int[]   ps_range=4,             # search radius around each predicted candidate, in pixels
-    int     extractor_exp=0])       # aggregation weight bias; 0 = off, >= 3 = reproducible output
+    int[]   bm_range=9,             # per-plane spatial search radius in pixels, 1..8192
+    int     radius=0,               # temporal search radius in frames, 0..4 (0 = spatial only)
+    int[]   ps_num=2,               # motion-predicted candidates seeding each temporal search, 1..8
+    int[]   ps_range=4,             # search radius around each predicted candidate, in pixels, 1..8192
+    int     extractor_exp=0])       # aggregation weight bias, -126..127; 0 = off, >= 3 = reproducible output
 ```
 32-bit float only. Chroma passes through unprocessed.
 
@@ -71,19 +71,20 @@ core.vsfeel.DFTTest(clip clip[,
     int     sbsize=16,              # spatial block size; must be 16 in this backend
     int     sosize=12,              # spatial overlap, 0..15; >50% needs (sbsize-sosize) | sbsize
     int     tbsize=3,               # temporal block size; ODD, 1..7 (1 = spatial only)
-    int     swin=0,                 # spatial window: 0=hanning 1=hamming 2=blackman
-    int     twin=7,                 # temporal window: 3=4-term b-harris 4=kaiser-bessel
-                                    #   5=7-term b-harris 6=flat top 7=rectangular 8=bartlett
-                                    #   9=bartlett-hann 10=nuttall 11=blackman-nuttall
+    int     swin=0,                 # spatial window, 0..11: 0=hanning 1=hamming 2=blackman
+                                    #   3=4-term b-harris 4=kaiser-bessel 5=7-term b-harris
+                                    #   6=flat top 7=rectangular 8=bartlett 9=bartlett-hann
+                                    #   10=nuttall 11=blackman-nuttall
+    int     twin=7,                 # temporal window, the same 0..11 set; default 7=rectangular
     float   sbeta=2.5,              # kaiser-bessel beta (swin=4 only)
     float   tbeta=2.5,              # kaiser-bessel beta (twin=4 only)
     int     zmean=1,                # subtract the windowed mean before filtering
     float   f0beta=1.0,             # ftype=0 exponent (1.0 = plain Wiener, 0.5 = sqrt)
+    int     ssystem=0,              # slocation scale: 0 = relative to block size, 1 = absolute
     float[] slocation,              # frequency-dependent sigma: [freq, sigma, freq, sigma, ...]
     float[] ssx,                    # slocation along the X axis only
     float[] ssy,                    # slocation along the Y axis only
     float[] sst,                    # slocation along time only
-    int     ssystem=0,              # slocation scale: 0 = relative to block size, 1 = absolute
     int[]   planes])                # planes to process; default: all
 ```
 
@@ -93,8 +94,8 @@ EEDI3 is an edge-directed interpolator for deinterlacing and upscaling. For each
 
 ```python
 core.vsfeel.EEDI3(clip clip, int field[,   # and EEDI3H, same args, horizontal
-    clip    sclip,                  # source for the vcheck comparison
-    clip    mclip,                  # edge mask; fully-masked spans are skipped
+    int     dh=False,               # double-height output keeping every source line (no field extracted)
+    int[]   planes,                 # planes to process; default: all
     float   alpha=0.2,              # 0..1 (alpha+beta <= 1): weight given to connecting similar
                                     #   neighborhoods. Larger = more lines/edges connected
     float   beta=0.25,              # 0..1: weight given to the vertical difference created by
@@ -109,8 +110,8 @@ core.vsfeel.EEDI3(clip clip, int field[,   # and EEDI3H, same args, horizontal
     float   vthresh0=32.0,          # vcheck thresholds; all must be > 0 when vcheck > 0
     float   vthresh1=64.0,
     float   vthresh2=4.0,
-    int     dh=False,               # double-height output keeping every source line (no field extracted)
-    int[]   planes])                # planes to process; default: all
+    clip    sclip,                  # source for the vcheck comparison
+    clip    mclip])                 # edge mask; fully-masked spans are skipped
 ```
 `field` 2/3 are the double-rate variants (not allowed with `dh=True`).
 
@@ -129,7 +130,6 @@ core.vsfeel.GaussBlur(clip clip[,
 
 ```python
 core.vsfeel.NLMeans(clip clip[,
-    clip    rclip,                  # weights computed from rclip, values from clip
     int     d=1,                    # temporal radius; 0 = spatial only
     int     a=2,                    # search-window radius, 1..64
     int     s=4,                    # patch radius, 0..8
@@ -138,7 +138,8 @@ core.vsfeel.NLMeans(clip clip[,
                                     #   0 = exp(-x) | 1 = max(1-x, 0)
                                     #   2 = max(1-x, 0)**2 | 3 = max(1-x, 0)**8
     float   wref=1.0,               # >= 0: weight of the pixel itself
-    string  channels="auto"])       # planes to process, jointly for YUV/RGB; auto picks by format
+    string  channels="auto",        # planes to process, jointly for YUV/RGB; auto picks by format
+    clip    rclip])                 # weights computed from rclip, values from clip
 ```
 `channels="YUV"` requires 4:4:4 so on subsampled clips run a `"Y"` pass and a `"UV"` pass instead.
 
@@ -148,16 +149,16 @@ NNEDI3 is a neural-network edge-directed interpolator for deinterlacing and upsc
 
 ```python
 core.vsfeel.NNEDI3(clip clip, int field[,
+    int     dh=False,               # double-height output keeping every source line (no field extracted)
+    int[]   planes,                 # planes to process; default: all
     int     nsize=6,                # predictor neighborhood, 0..6: 0=8x6 1=16x6 2=32x6
                                     #   3=48x6 4=8x4 5=16x4 6=32x4
     int     nns=1,                  # predictor neurons, 0..4: 0=16 1=32 2=64 3=128 4=256
     int     qual=1,                 # 1 or 2: number of predictor passes averaged
     int     etype=0,                # 0 = weights trained on absolute error, 1 = squared error
-    int     pscrn=2,                # prescreener, 0..4: 0=off (predict every pixel)
+    int     pscrn=2])               # prescreener, 0..4: 0=off (predict every pixel)
                                     #   1=original, 2..4=new levels 0..2 (higher = fewer pixels
                                     #   left to cubic interpolation: slower, slightly better)
-    int     dh=False,               # double-height output keeping every source line (no field extracted)
-    int[]   planes])                # planes to process; default: all
 ```
 `field` 2/3 are the double-rate variants (not allowed with `dh=True`).
 
