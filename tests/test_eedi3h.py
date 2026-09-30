@@ -347,6 +347,13 @@ def test_eedi3h_rejects_bad_planes(noise_16bit):
         _runh(noise_16bit, field=1, planes=[5])
 
 
+def test_eedi3h_rejects_dh_with_a_planes_subset():
+    """dh cannot leave a plane unprocessed (see test_eedi3.py)."""
+    src = vs.core.bs.VideoSource(NOISE_MKV)
+    yuv = vs.core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
+    with pytest.raises(vs.Error):
+        _runh(yuv, field=1, dh=1, planes=[0])
+    _runh(yuv, field=1, dh=1)   # every plane under dh is still legal
 
 
 def test_eedi3h_ignores_device_id_and_num_streams(noise_16bit):

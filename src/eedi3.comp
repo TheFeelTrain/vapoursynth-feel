@@ -762,8 +762,9 @@ void main() {
 
     if (HAS_MCLIP != 0 && xmin > 1) {
         // Analytic predecessor seed for the jump over the masked left tail
-        // [1, xmin): columns 0-1 are masked (else xmin <= 1), so xd==1 would
-        // have zeroed pRel to -u; each later masked column xd applies fixups
+        // [1, xmin): columns 0-1 are masked (else xmin <= 1); eedi3m pins
+        // column 1's cost row to zero with cRel = -u, and each later masked
+        // column xd applies fixups
         // cRel = +/-1 at lanes u = -/+(pumax) with pumax = min(xd-1, WIDTH-xd)
         // (values pp stay all zeros — masked columns only copy them). The
         // last fixup hit wins; both ramps give the same value (-sign(u)), so
@@ -802,27 +803,19 @@ void main() {
             // column (eedi3m semantics); the two extreme entries get fixups so
             // the path stays inside the narrower reachable set. Rolling state
             // is invalid (windows could not advance over this column).
-            if (xd == 1) {
-                // ccosts at column 1 were never computed (pinned 0); backtrack
-                // pointers zeroed (absolute v = 0 -> rel = -u).
-                for (int j = 0; j < K; j++) {
-                    cur[j] = 0.0f;
-                    cRel[j] = -(laneBase + j - CENTER);
-                    rolled[j] = false;
-                }
-            } else {
-                const int pumax = min(xd - 1, WIDTH - xd);
-                for (int j = 0; j < K; j++) {
-                    const int i = laneBase + j;
-                    cur[j] = pp[j];
-                    cRel[j] = pRel[j];
-                    rolled[j] = false;
-                    if (pumax < MDIS) {
-                        if (i == CENTER - pumax)
-                            cRel[j] = (1 - pumax) - (i - CENTER);
-                        else if (i == CENTER + pumax)
-                            cRel[j] = (pumax - 1) - (i - CENTER);
-                    }
+            // xd == 1 is never masked here: bmask is a +-MDIS dilation, so
+            // bmask[0] or bmask[1] set implies bmask[1] set (MDIS >= 1).
+            const int pumax = min(xd - 1, WIDTH - xd);
+            for (int j = 0; j < K; j++) {
+                const int i = laneBase + j;
+                cur[j] = pp[j];
+                cRel[j] = pRel[j];
+                rolled[j] = false;
+                if (pumax < MDIS) {
+                    if (i == CENTER - pumax)
+                        cRel[j] = (1 - pumax) - (i - CENTER);
+                    else if (i == CENTER + pumax)
+                        cRel[j] = (pumax - 1) - (i - CENTER);
                 }
             }
             if (PB_PACK) {

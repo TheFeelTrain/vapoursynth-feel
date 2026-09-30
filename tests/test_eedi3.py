@@ -33,6 +33,7 @@ Run from the repository root:  python -m pytest tests/test_eedi3.py
 
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -819,6 +820,48 @@ def test_eedi3_rejects_bad_planes(noise_16bit):
         _run(noise_16bit, planes=[5])
 
 
+def _yuv16():
+    core = vs.core
+    return core.fmtc.bitdepth(core.bs.VideoSource(NOISE_MKV), bits=16,
+                              fulls=True, fulld=True)
+
+
+def test_eedi3_rejects_dh_with_a_planes_subset():
+    """dh cannot leave a plane unprocessed.
+
+    The kept-plane passthrough points newVideoFrame2 at the source frame, which
+    makes the whole output a CPU frame; the GPU output path then fails per
+    frame on a plane that is not GPU resident. Both halves of the condition are
+    checked so the guard is not just "dh is refused".
+    """
+    yuv = _yuv16()
+    for planes in ([0], [1], [1, 2]):
+        with pytest.raises(vs.Error):
+            _run(yuv, field=1, dh=1, planes=planes)
+    _run(yuv, field=1, dh=1)        # every plane under dh is still legal
+    _run(yuv, field=1, planes=[0])  # and the subset without dh is too
+
+
+@pytest.mark.parametrize("name", ["alpha", "beta", "gamma",
+                                  "vthresh0", "vthresh1", "vthresh2"])
+def test_eedi3_rejects_non_finite_params(noise_16bit, name):
+    """NaN is false against every range comparison, so it used to reach the
+    push constants; +/-inf is only caught by the one-sided gamma/vthresh2
+    checks (alpha/beta reject +inf through their upper bound)."""
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(vs.Error):
+            _run(noise_16bit, **{name: bad})
+
+
+def test_eedi3_rejects_scratch_over_two_gib():
+    """Every scratch region base is an int32 push constant and the kernels
+    index with int, so a frame whose per-frame scratch passes 2 GiB must be
+    refused at creation (8192x8000 at mdis=40 measures ~2970 MiB) instead of
+    wrapping the addressing."""
+    clip = vs.core.std.BlankClip(width=8192, height=8000, format=vs.GRAY16,
+                                 length=1)
+    with pytest.raises(vs.Error):
+        vs.core.vsfeel.EEDI3(clip, field=1, mdis=40)
 
 
 def test_eedi3_rejects_mclip_not_gray(noise_16bit):
@@ -922,3 +965,101 @@ def test_eedi3_sclip_content_matches_vk2(noise_16bit):
             changed = True
     assert changed, "sclip content did not affect the output (test is vacuous)"
 
+
+# ---------------------------------------------------------------------------
+# Host-path probe and the creation-time pipeline set
+# ---------------------------------------------------------------------------
+
+_TIMING_SCRIPT = textwrap.dedent('''\
+    import sys
+    import vapoursynth as vs
+
+    core = vs.core
+    src = core.bs.VideoSource(sys.argv[1])
+    g16 = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
+                             bits=16, fulls=True, fulld=True)
+    node = core.vsfeel.EEDI3(g16, field=1, mdis=5, nrad=1)
+    for n in range(100):
+        node.get_frame(n % node.num_frames)
+    del node
+    core.clear_cache()
+    print("TIMING DONE", flush=True)
+''')
+
+
+def test_eedi3_timing_probe_has_an_alloc_stage():
+    """VSFEEL_EEDI3_TIMING's `alloc` sample is taken after the frame-setup
+    loop, not re-passed as the acquire sample (which made it structurally 0
+    and folded all allocation into `record`)."""
+    env = {**os.environ, "MANGOHUD": "0", "VSFEEL_EEDI3_TIMING": "1"}
+    proc = subprocess.run(
+        [sys.executable, "-c", _TIMING_SCRIPT, str(NOISE_MKV)],
+        capture_output=True, text=True, timeout=600, env=env)
+    assert proc.returncode == 0 and "TIMING DONE" in proc.stdout, (
+        proc.stderr[-2000:])
+    m = re.search(r"\[eedi3-timing\] frames=(\d+) per-frame us: "
+                  r"acquire=\s*([\d.]+)\s+alloc=\s*([\d.]+)", proc.stderr)
+    assert m, proc.stderr[-2000:]
+    assert int(m.group(1)) > 0
+    assert float(m.group(3)) > 0.0, "the alloc stage is still zero"
+
+
+_PIPELINE_SCRIPT = textwrap.dedent('''\
+    import sys
+    import vapoursynth as vs
+
+    core = vs.core
+    src = core.bs.VideoSource(sys.argv[1])
+    g16 = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
+                             bits=16, fulls=True, fulld=True)
+    name, mclip = sys.argv[2], sys.argv[3] == "1"
+    kw = {"mclip": core.std.ShufflePlanes(src, 0, vs.GRAY)} if mclip else {}
+    getattr(core.vsfeel, name)(g16, field=2 if name == "EEDI3AA" else 1,
+                               mdis=5, nrad=1, **kw)
+''')
+
+
+def _eedi3_pipeline_tags(name, mclip):
+    """The `eedi3-*` pipeline tags the variant created, from the debug banner."""
+    env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1"}
+    proc = subprocess.run(
+        [sys.executable, "-c", _PIPELINE_SCRIPT, str(NOISE_MKV), name,
+         "1" if mclip else "0"],
+        capture_output=True, text=True, timeout=600, env=env)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return set(re.findall(r"\[vsfeel\] pipeline (eedi3-[a-z-]+)", proc.stderr))
+
+
+def test_eedi3_creates_only_the_pipelines_a_variant_dispatches():
+    """Gate creation on the key's variant, not d->horiz.
+
+    A vertical EEDI3 can never bind xpose/compose/assemble, EEDI3H never binds
+    blit, and only horizontal keys build the transposed mask pair -- creating
+    them all for every key paid first-run compile time and VRAM for kernels the
+    invocation cannot dispatch. The AA cases are the trap: EEDI3AA has
+    horiz == false yet needs xpose/compose for its transposed keys, so the gate
+    must read the key's `horiz`.
+    """
+    v = _eedi3_pipeline_tags("EEDI3", False)
+    assert {"eedi3-row", "eedi3-vcheck", "eedi3-pad", "eedi3-blit"} <= v
+    assert not v & {"eedi3-xpose", "eedi3-compose", "eedi3-assemblev",
+                    "eedi3-maskpack", "eedi3-maskdilate", "eedi3-maskdilate-tr"}
+
+    h = _eedi3_pipeline_tags("EEDI3H", False)
+    assert {"eedi3-row", "eedi3-vcheck", "eedi3-xpose", "eedi3-compose"} <= h
+    assert not h & {"eedi3-blit", "eedi3-assemblev", "eedi3-maskdilate"}
+
+    a = _eedi3_pipeline_tags("EEDI3AA", False)
+    assert {"eedi3-row", "eedi3-xpose", "eedi3-compose", "eedi3-assemblev"} <= a
+    assert "eedi3-blit" not in a
+
+    # The mask pair follows the key's axis: the vertical pass dilates the raw
+    # mask row, the horizontal one transposes it into a bit matrix first.
+    vm = _eedi3_pipeline_tags("EEDI3", True)
+    assert "eedi3-maskdilate" in vm and "eedi3-maskdilate-tr" not in vm
+    hm = _eedi3_pipeline_tags("EEDI3H", True)
+    assert {"eedi3-maskpack", "eedi3-maskdilate-tr"} <= hm
+    assert "eedi3-maskdilate" not in hm
+    am = _eedi3_pipeline_tags("EEDI3AA", True)
+    assert {"eedi3-maskpack", "eedi3-maskdilate",
+            "eedi3-maskdilate-tr"} <= am

@@ -199,9 +199,8 @@ fully-masked early-out (real `vsaa`: `scale_mask(60, 8, 32)` = 15420). Measured
 (700 f, ns=8): all-zero 593 fps vs vszipcl 203, real mask 274 / 202.
 
 **Void perf record (do not quote):** rounds 2–13's totals, standings and
-stream/queue knees — 74.6 → 107 → 155-167 → 363 → 398 → 604 @8s — plus round 7's
-"streams plateau at 8", round 10's "host is the wall / the DP is −1%", round 10's
-ladder and the ReBAR +29%. Rounds 14/15/20 supersede the cost model.
+stream/queue knees, and round 10's "host is the wall / the DP is −1%" ladder.
+Rounds 14/15/20 supersede the cost model.
 
 What survives, by mechanism:
 
@@ -284,12 +283,10 @@ What survives, by mechanism:
 
 - Honest ladder (900-frame runs, ns=8): **vcheck+vcopy 18-27%**, pad ~8%, raw gather
   ~8%, sclip gather ~7%, blit 4-5%, ReBAR upload **+14%** (kept).
-- LDS ping-pong vcheck re-tested (round 6's "flat-to-worse" was degenerate):
-  interleaved 900-frame pairs global mean 295 vs LDS mean **304** (+3%, tighter) →
-  default then, reversed again in 21. Bit-exact vs eedi3vk2 and vs the global path.
+- LDS ping-pong vcheck re-tested (round 6's "flat" was degenerate): +3% on 900-frame
+  pairs then, reversed again in 21. Bit-exact vs eedi3vk2 and the global path.
 - Pad parity skip **+0.8%** (4/4 pairs): every read pad row has parity
-  `(field+1)&1`; `VSFEEL_EEDI3_PADPAR=0` restores the full build. Queue cap 3 →
-  256-269 fps, 4/6/8 → 294-322 (tie); default stays 8.
+  `(field+1)&1`; `VSFEEL_EEDI3_PADPAR=0` restores the full build.
 - Structured-mclip nondeterminism found here (fixed 16.2).
 
 ### Round 15 — row kernel is the dominant cost (overturns round 10)
@@ -366,9 +363,8 @@ row kernel (round 20).
   Traps: **loop order matters more than byte count** (k-outermost keeps 64 row
   streams open and re-reads the mask frame per block, 2x slower), and the mask cost is
   the READ not the ALU.
-- Round-19 dead ends: CPU merge of the kept columns (`compose_tight`, −4.8% over 8
-  order-reversed reps); k-outermost mask tiling (2x slower); **ablations that change
-  the data are not ablations** (`NOMASKX` showed +33% by keeping stale bits).
+- Round-19 dead ends: `compose_tight` CPU merge (−4.8%, 8 pairs); k-outermost mask
+  tiling (2x slower); `NOMASKX`'s +33% was stale bits, not a win.
 - **Why EEDI3H cannot be closed further**: the mask read is 16.6 MB vs 8.3 (a
   transposed plane needs all `height` rows) and compose+blit is 49.8 MB vs 33.2 (the
   output must be assembled from transposed interp values *and* kept columns). Every
@@ -380,12 +376,9 @@ row kernel (round 20).
 ### Round 20 — pbt-packing / walk-chain levers are DEAD; probe harness was broken
 
 - **Harness bug**: `ENTRY_ROW`'s guard was `#if PROBE >= 3` instead of `== 3`, so
-  levels 4-7 returned immediately — a **1656-byte empty kernel** vs 43720 B for
-  PROBE=0. All round-15 `PROBE=4/5/6` numbers are void. Fixed; the shipping PROBE=0
-  binary is byte-identical. New levels: 7 = real walk + an extra discarded walk over
-  the previous row's pbt (f-dependent), 8 = same with an f-independent address,
-  9 = DP with every column stored to the same 41 bytes, 10 = 8 with a 4x unroll,
-  12 = faithful no-row-kernel.
+  levels 4-7 returned immediately (1656 B vs 43720 B), voiding every round-15
+  `PROBE=4/5/6` number. New levels: 7/8 = an extra walk (f-dependent / independent),
+  9 = all columns to one address, 10 = 8 unrolled 4x, 12 = faithful no-row-kernel.
 - Current vertical cost model (3 interleaved reps, within-arm spread <0.5%):
 
   | build | fps | frame | attributable |
@@ -437,10 +430,9 @@ row kernel (round 20).
   PCIe line rate; a VRAM write + SDMA D2H moves the same bytes at the same rate.
   **Zipcl is not a counterexample**: its absolute horizontal overhead is 0.48 ms vs
   0.67, but its vertical baseline is 2.5x slower so the ratio looks worse.
-- Re-confirmed dead ends: `COPY=7` (cached blit load instead of NT) horizontal
-  387.4 → 377.1; per-frame host-pointer import still catastrophic; `QUEUES=8` still
-  wins (526.8/394.5 vs 519.9/387.2 at cap 4); `NOPAD`/`NOXPOSE` remain unusable as
-  cost ablations because they change the row kernel's input and branch mix.
+- Re-confirmed dead ends: `COPY=7` (cached blit load) 387.4 → 377.1 horizontal;
+  host-pointer import still catastrophic; `QUEUES=8` still wins; `NOPAD`/`NOXPOSE`
+  stay unusable as ablations (they change the row kernel's input and branch mix).
 
 ### Rounds 22-26 — cross-cutting correctness and probe hygiene
 
@@ -544,11 +536,9 @@ finished, so they need neither the host nor a second fence between them. One CB,
   15 GRAY geometries x u16/f32 + 7 multi-plane cases, 0 mismatches, including the
   fused GPU merge (`comp_fuse` == `_mm256_avg_epu16`).
 
-Bounded out on the way: pre-recording the CBs (`record` 0.01-0.02 ms/frame =
-≤0.07%); the pair gather alone (neutral, 21.933 → 21.881 ms); not building AA's
-vertical `xpose`/`compose` (premise false — AA's *horizontal* sub-pass dispatches
-`xpose`, and `create_pipeline` with a null module returns a pipeline that faults at
-dispatch, not creation).
+Bounded out: pre-recording the CBs (`record` 0.01-0.02 ms/frame, ≤0.07%) and the
+pair gather alone (neutral). A null module in `create_pipeline` faults at *dispatch*,
+not creation, so "AA's vertical keys need no xpose/compose" was false anyway.
 
 ### Round 29 — row-kernel levers: SGSIZE 64 is +2% on AA only; the walk is not the lever
 
@@ -577,6 +567,27 @@ kernel **s2 = 3.485 of 3.86 ms** at 1080p ns=1 — ~90% of the GPU frame.
   bought nothing. 376 `s_waitcnt` with **171 inter-wait gaps of 2 instructions**; the
   137 `v_dual_*` pack fine, so it is dependency, not scheduler. 485 `v_cvt_f32_i32`
   are a red herring (not issue-bound).
+
+### Round 30 — creation-time hardening and variant-gated pipelines
+
+Cross-cutting correctness pass: no perf change, output byte-identical.
+
+- **Validation**: `dh` now requires every plane — a `planes` subset made a CPU output
+  frame that failed per frame (#6); scratch over 2 GiB (int32 region bases) and
+  non-finite `alpha`/`beta`/`gamma`/`vthresh*` (NaN is false against every range
+  check) are rejected at creation (#24/#25).
+- **Partial pipeline sets are owned from the first create** (#15): a failed later
+  kernel abandoned a stack struct with no destructor, so a 128-invocation device
+  leaked 2 `VkPipeline`s that validation named at `vkDestroyDevice`.
+- **Pipelines are created per key's `horiz`, not `d->horiz`** (#35): a vertical
+  EEDI3 built xpose/compose/assemble, EEDI3H built blit, and every key built both
+  mask dilation forms, for kernels the invocation cannot dispatch. AA keeps its
+  transposed keys.
+- **Probe + dead code** (#26/#38): the host `alloc` stage takes its own post-setup
+  sample (it re-passed `t1`, so `alloc` was structurally 0); `src_h`,
+  `mclip_native16/32` and the row kernel's unreachable `xd == 1` masked arm
+  (`bmask` is a ±MDIS dilation, so `bmask[0] | bmask[1]` set implies `bmask[1]`) are
+  gone; `opt` stays, registered and read.
 
 ## Open work
 

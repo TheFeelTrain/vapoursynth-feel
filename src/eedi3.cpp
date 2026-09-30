@@ -157,7 +157,6 @@ struct Eedi3Pipelines {
 struct Eedi3PlaneConfig {
     int width {};                     // kernel plane width (row kernel's WIDTH)
     int height {};                    // kernel plane height
-    int src_h {};                     // source plane height (gather geometry)
     int out_w {};                     // output (frame order) plane dims
     int out_h {};
     int rows {};                      // interp rows == height / 2
@@ -270,7 +269,6 @@ struct Eedi3Data {
     // straight from the GPU plane (no conversion node); other depths keep the
     // reference SetFrameProps(_Range=1) + resize.Point -> Gray8 path.
     int mclip_bits { 8 };
-    bool mclip_native16 {}, mclip_native32 {};
 
     float alpha { 0.2f }, beta { 0.25f }, gamma { 20.0f };
     float vthresh2 { 4.0f };
@@ -1162,6 +1160,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         produced.emplace_back(j, dst);
     }
 
+    const auto t2 = timing ? now() : std::chrono::steady_clock::time_point {};
     vsfeel_trace_mark("record");
     const int njobs = static_cast<int>(jobs.size());
     record_pass(*d, cmd, jobs.data(), njobs, PassPhase::kPrep);
@@ -1192,7 +1191,7 @@ static const VSFrame *VS_CC Eedi3GetFrame(
         return fail("submit failed: "s + errbuf);
     }
     guard.submitted = true;
-    eedi3_add_timing(*d, signaled, t0, t1, t1, t3, now());
+    eedi3_add_timing(*d, signaled, t0, t1, t2, t3, now());
 
     for (const VSFrame * f : inputs) {
         vsapi->freeFrame(f);
@@ -1545,6 +1544,7 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
         produced.emplace_back(j, dst);
     }
 
+    const auto t2 = timing ? now() : std::chrono::steady_clock::time_point {};
     vsfeel_trace_mark("record");
     // One sub-pass group at a time: a frame's later stages read what its earlier
     // ones wrote, so the groups stay ordered, but within a group every frame's
@@ -1587,7 +1587,7 @@ static const VSFrame *VS_CC Eedi3AaGetFrame(
         return fail("submit failed: "s + errbuf);
     }
     guard.submitted = true;
-    eedi3_add_timing(*d, signaled, t0, t1, t1, t3, now());
+    eedi3_add_timing(*d, signaled, t0, t1, t2, t3, now());
 
     for (const VSFrame * f : inputs) {
         vsapi->freeFrame(f);
@@ -1684,6 +1684,17 @@ static void vsfeel_eedi3_create(
         d->process[n] = true;
     }
 
+    // dh's output keeps an unprocessed plane only by pointing newVideoFrame2 at
+    // the source frame, which makes the whole output a CPU frame; the GPU frame
+    // path needs every plane, so a planes subset under dh cannot be honoured.
+    if (d->dh) {
+        for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
+            if (!d->process[plane]) {
+                return set_error("dh=True requires every plane to be processed");
+            }
+        }
+    }
+
     auto get_float = [&](const char * key, float def) {
         err = 0;
         const float v = static_cast<float>(vsapi->mapGetFloatSaturated(in, key, 0, &err));
@@ -1704,6 +1715,13 @@ static void vsfeel_eedi3_create(
     float vthresh0 = get_float("vthresh0", 32.0f);
     float vthresh1 = get_float("vthresh1", 64.0f);
     d->vthresh2 = get_float("vthresh2", 4.0f);
+
+    // NaN passes every range comparison below (they are all false), and
+    // mapGetFloatSaturated is a plain cast, so reject non-finite values first.
+    if (!std::isfinite(d->alpha) || !std::isfinite(d->beta) || !std::isfinite(d->gamma) ||
+        !std::isfinite(vthresh0) || !std::isfinite(vthresh1) || !std::isfinite(d->vthresh2)) {
+        return set_error("alpha, beta, gamma and vthresh0/1/2 must be finite");
+    }
 
     // Compat no-ops (registered like the other legacy args, never read):
     // eedi3m's `opt` (SIMD level; the GPU path is always AVX2-class),
@@ -1791,10 +1809,8 @@ static void vsfeel_eedi3_create(
         }
 
         if (mvi->format.bitsPerSample == 16 && mvi->format.sampleType == stInteger) {
-            d->mclip_native16 = true;
             d->mclip_bits = 16;
         } else if (mvi->format.bitsPerSample == 32 && mvi->format.sampleType == stFloat) {
-            d->mclip_native32 = true;
             d->mclip_bits = 32;
         } else if (mvi->format.bitsPerSample != 8 || mvi->format.sampleType != stInteger) {
             VSMap * args = vsapi->createMap();
@@ -2058,7 +2074,6 @@ static void vsfeel_eedi3_create(
             const int in_w = (plane == 0) ? d->vi->width : d->vi->width >> subW;
             const int in_h = (plane == 0) ? d->vi->height : d->vi->height >> subH;
             auto & a = d->aplanes[plane];
-            a.src_h = in_h;
             a.width = in_h;
             a.height = in_w;
             a.rows = in_w / 2;
@@ -2082,7 +2097,6 @@ static void vsfeel_eedi3_create(
         const int kw = d->horiz ? in_h : in_w;
         const int kh = d->horiz ? (d->dh ? 2 * in_w : in_w)
                                 : (d->dh ? 2 * in_h : in_h);
-        cfg.src_h = in_h;
         cfg.width = kw;
         cfg.height = kh;
         cfg.rows = kh / 2;
@@ -2190,6 +2204,14 @@ static void vsfeel_eedi3_create(
     }
     d->scratch_bytes = std::max(total, VkDeviceSize(4));
 
+    // Every region base is narrowed to an int32 push constant and the kernels
+    // index with int, so bounding the total bounds every base+index pair.
+    if (d->scratch_bytes > static_cast<VkDeviceSize>(INT32_MAX)) {
+        return set_error("the per-frame scratch (" +
+            std::to_string(d->scratch_bytes >> 20) + " MiB) exceeds the 2 GiB int32 "
+            "addressing limit; lower mdis or the frame size");
+    }
+
     if (d->trace) {
         VSVulkanCoreInfo info {};
         char verr[256] {};
@@ -2277,7 +2299,6 @@ static void vsfeel_eedi3_create(
                     spec.has_sclip, spec.vcheck, spec.lsz_row, spec.lsz_vcheck,
                     key.horiz ? 1 : 0, d->batch_size);
         }
-        Eedi3Pipelines p;
         auto add = [&](const uint32_t * code, size_t size, const char * tag,
                        uint32_t subgroup, VkPipeline * dst,
                        GpuWorkgroup workgroup = {}) -> std::optional<std::string> {
@@ -2293,6 +2314,11 @@ static void vsfeel_eedi3_create(
             *dst = std::get<VkPipeline>(r);
             return std::nullopt;
         };
+        // The set is owned from the first create: an early error return then
+        // leaves every handle already created to the destructor, which walks
+        // width_pipes, instead of leaking the partial set.
+        d->width_pipes.emplace_back(key, Eedi3Pipelines {});
+        Eedi3Pipelines & p = d->width_pipes.back().second;
         // Row kernel LDS: tileF[BT_TILE] + rowXmin + the packed mask words
         // `bmaskSh[(WIDTH + 31) / 32]` (eedi3.comp:631), at this plane's width.
         const uint32_t row_shared = 32 + 4 +
@@ -2330,41 +2356,50 @@ static void vsfeel_eedi3_create(
                          GpuWorkgroup { .x = 256 })) {
             return e;
         }
-        if (auto e = add(d->blit_code, d->blit_size, "eedi3-blit", 0, &p.blit,
-                         GpuWorkgroup { .x = 256 })) {
-            return e;
+        // Only the kernels this key's variant dispatches, gated on the key's
+        // `horiz` (not d->horiz): EEDI3AA has horiz == false yet needs
+        // xpose/compose for its transposed keys, and neither EEDI3AA nor
+        // EEDI3H ever dispatches blit.
+        if (!d->aa && !key.horiz) {
+            if (auto e = add(d->blit_code, d->blit_size, "eedi3-blit", 0, &p.blit,
+                             GpuWorkgroup { .x = 256 })) {
+                return e;
+            }
         }
-        if (auto e = add(d->xpose_code, d->xpose_size, "eedi3-xpose", 0, &p.xpose,
-                         GpuWorkgroup { .x = 16, .y = 16, .shared_bytes = 16 * 17 * 4 })) {
-            return e;
-        }
-        if (auto e = add(d->compose_code, d->compose_size, "eedi3-compose", 0,
-                         &p.compose, GpuWorkgroup { .x = 16, .y = 16,
-                             .shared_bytes = 2 * 16 * 17 * 4 })) {
-            return e;
-        }
-        if (auto e = add(d->assemble_code, d->assemble_size, "eedi3-assemblev", 0,
-                         &p.assemble, GpuWorkgroup { .x = 256 })) {
-            return e;
+        if (key.horiz) {
+            if (auto e = add(d->xpose_code, d->xpose_size, "eedi3-xpose", 0, &p.xpose,
+                             GpuWorkgroup { .x = 16, .y = 16, .shared_bytes = 16 * 17 * 4 })) {
+                return e;
+            }
+            if (auto e = add(d->compose_code, d->compose_size, "eedi3-compose", 0,
+                             &p.compose, GpuWorkgroup { .x = 16, .y = 16,
+                                 .shared_bytes = 2 * 16 * 17 * 4 })) {
+                return e;
+            }
+        } else if (d->aa) {
+            if (auto e = add(d->assemble_code, d->assemble_size, "eedi3-assemblev", 0,
+                             &p.assemble, GpuWorkgroup { .x = 256 })) {
+                return e;
+            }
         }
         if (mclip_on) {
-            if (auto e = add(d->maskpack_code[fmt], d->maskpack_size[fmt],
-                             "eedi3-maskpack", 0, &p.maskpack,
-                             GpuWorkgroup { .x = 32, .shared_bytes = 32 * 4 })) {
-                return e;
-            }
-            if (auto e = add(d->maskdilate_raw_code[fmt], d->maskdilate_raw_size[fmt],
-                             "eedi3-maskdilate", 0, &p.maskdilate_raw,
-                             GpuWorkgroup { .x = 64 })) {
-                return e;
-            }
-            if (auto e = add(d->maskdilate_tr_code[fmt], d->maskdilate_tr_size[fmt],
-                             "eedi3-maskdilate-tr", 0, &p.maskdilate_tr,
-                             GpuWorkgroup { .x = 64 })) {
+            if (key.horiz) {
+                if (auto e = add(d->maskpack_code[fmt], d->maskpack_size[fmt],
+                                 "eedi3-maskpack", 0, &p.maskpack,
+                                 GpuWorkgroup { .x = 32, .shared_bytes = 32 * 4 })) {
+                    return e;
+                }
+                if (auto e = add(d->maskdilate_tr_code[fmt], d->maskdilate_tr_size[fmt],
+                                 "eedi3-maskdilate-tr", 0, &p.maskdilate_tr,
+                                 GpuWorkgroup { .x = 64 })) {
+                    return e;
+                }
+            } else if (auto e = add(d->maskdilate_raw_code[fmt],
+                                    d->maskdilate_raw_size[fmt], "eedi3-maskdilate", 0,
+                                    &p.maskdilate_raw, GpuWorkgroup { .x = 64 })) {
                 return e;
             }
         }
-        d->width_pipes.emplace_back(key, p);
         result = p;
         return std::nullopt;
     };
