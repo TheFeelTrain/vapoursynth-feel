@@ -102,6 +102,25 @@ three interleaved A/B runs against the raw-submit build -- see Historical.
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **Creation-failure leak.** `createVideoFilterEx2` returns `nullptr` without
+  running the free callback when the node constructor throws, so the instance
+  released just before the call would leak its buffers, its exec pool and both
+  node references. The `nullptr` arm now releases through `BM3DFree`; same
+  mechanism as `notes/DFTTEST.md`. No perf change.
+
+- **Shared plumbing hardening** (no observable behaviour). The device registry
+  `insert_or_assign`s instead of `emplace`ing: an expired `weak_ptr` stayed as
+  the key, so every later call rebuilt the device (queries, mutex, cache read)
+  and two live instances overwrote each other's cache snapshot. The
+  pipeline-cache load and save can no longer throw out of `get_gpu_device` or
+  the implicitly `noexcept` `~GPUDevice`, `is_directory` uses the `error_code`
+  overload, and the save temp name carries a per-save counter so two devices in
+  one process cannot rename over each other. `max_push_descriptors` is clamped
+  to `GPU_MAX_BINDINGS` on read and the push-descriptor helpers bound their
+  fixed arrays. `GpuBuffer::address` (always 0 and never read),
+  `GPUDevice::handles`/`compute_queue` (the queue check now uses a local) and
+  `gpu_make_buffer`'s never-supplied `exclude` are deleted.
+
 - **The vs-jetpack wrapper rejects `chroma=True`.** The plugin denoises luma
   only and passes chroma through, but the wrapper advertised `chroma` and
   dropped it, so vsdenoise's forced `chroma=True` on YUV444 silently ran the

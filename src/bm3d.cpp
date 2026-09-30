@@ -1738,6 +1738,9 @@ static void VS_CC BM3DCreate(
         BM3DGetFrame, BM3DFree,
         fmParallel, ffGPUOutput, deps, data->ref_node ? 2 : 1, data, core);
     if (result == nullptr) {
+        // The core returns nullptr without running the free callback when the
+        // node constructor throws, so release the instance through it here.
+        BM3DFree(data, core, vsapi);
         vsapi->mapSetError(out, "BM3D: filter creation failed");
         return;
     }

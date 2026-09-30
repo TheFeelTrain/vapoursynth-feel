@@ -50,13 +50,14 @@ using namespace std::string_literals;
 // `getenv` parsing live in a single place; each filter keeps its own names
 // (VSFEEL_DFTTEST_TRACE, VSFEEL_BM3D_TRACE, ...) so flipping one filter's
 // debugging never affects another.
-// A flag is on when it is set to anything other than an empty string or "0",
-// so `VAR=0` disables it the way every other switch reads. Presence alone used
-// to be the test, which made the documented "=0 to restore the old path"
-// controls impossible to use and silently enabled debug/ablation paths.
+// A flag is on when it is set to anything other than an empty string, "0" or
+// "false", so `VAR=0`/`VAR=false` disable it the way the debug/trace parsers
+// read. Presence alone used to be the test, which made the documented "=0 to
+// restore the old path" controls impossible to use and silently enabled
+// debug/ablation paths.
 inline bool env_flag(const char * env) {
     const char * v = std::getenv(env);
-    return v && *v && std::strcmp(v, "0") != 0;
+    return v && *v && std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0;
 }
 
 inline int env_int(const char * env, int default_value) {
@@ -286,10 +287,8 @@ constexpr uint32_t GPU_MAX_BINDINGS = 32;
 struct GPUDevice {
     const VSVULKANAPI * api {};
     const VSVulkanFunctions * vk {};
-    VSVulkanCoreHandles handles {};
 
     VkDevice device {};
-    VkQueue compute_queue {};
 
     VkPhysicalDeviceLimits limits {};
     uint32_t api_version {};
@@ -466,7 +465,6 @@ inline bool vsfeel_fold_grid(const VkPhysicalDeviceLimits & limits,
 struct GpuBuffer {
     VSGPUBuffer * handle {};
     VkBuffer buffer {};
-    VkDeviceAddress address {};
     void * mapped {};
     VkDeviceSize size {};
     VkMemoryPropertyFlags memory_flags {};
@@ -481,8 +479,7 @@ inline std::string gpu_make_buffer(const GPUDevice & g, VSCore * core,
                                    VkDeviceSize bytes, GpuBuffer & out,
                                    VkMemoryPropertyFlags required,
                                    VkMemoryPropertyFlags preferred = 0,
-                                   VkBufferUsageFlags extra_usage = 0,
-                                   VkBufferUsageFlags exclude = 0) {
+                                   VkBufferUsageFlags extra_usage = 0) {
     // Every binding here is VK_WHOLE_SIZE, so the descriptor's range is the
     // buffer's size and maxStorageBufferRange (Vulkan's core minimum is 128 MiB)
     // caps it: BM3D's estimate cache is ~190 MiB at 1080p, DFTTest's block
@@ -497,14 +494,13 @@ inline std::string gpu_make_buffer(const GPUDevice & g, VSCore * core,
     char err[512] {};
     VSVulkanBufferInfo info {};
     const VkBufferUsageFlags usage =
-        ((VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | extra_usage) & ~exclude);
+        (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | extra_usage);
     out.handle = g.api->createGPUBuffer(core, bytes, usage, required, preferred,
         &info, err, sizeof(err));
     if (!out.handle) {
         return err;
     }
     out.buffer = info.buffer;
-    out.address = info.address;
     out.mapped = info.mapped;
     out.size = info.size;
     out.memory_flags = info.memoryFlags;
@@ -538,6 +534,9 @@ inline void gpu_destroy_buffer(const GPUDevice & g, GpuBuffer & b) {
 inline void gpu_push_buffers(const GPUDevice & g, VkCommandBuffer cmd,
                              VkPipelineLayout layout, const VkBuffer * buffers,
                              uint32_t count) {
+    // The arrays are fixed at GPU_MAX_BINDINGS; a call site that binds more would
+    // write past them, so clamp rather than trust the caller.
+    count = std::min(count, GPU_MAX_BINDINGS);
     VkDescriptorBufferInfo infos[GPU_MAX_BINDINGS] {};
     VkWriteDescriptorSet writes[GPU_MAX_BINDINGS] {};
     for (uint32_t i = 0; i < count; ++i) {
@@ -594,10 +593,11 @@ inline void gpu_barrier(const GPUDevice & g, VkCommandBuffer cmd) {
 // assumed.
 inline std::variant<VkDescriptorSetLayout, std::string> gpu_push_set_layout(
     const GPUDevice & g, uint32_t bindings) {
-    if (bindings > g.max_push_descriptors) {
+    if (bindings > g.max_push_descriptors || bindings > GPU_MAX_BINDINGS) {
         return "a pipeline needs " + std::to_string(bindings) +
-            " push descriptors, more than this device's " +
-            std::to_string(g.max_push_descriptors);
+            " push descriptors, more than the " +
+            std::to_string(std::min(g.max_push_descriptors, GPU_MAX_BINDINGS)) +
+            " this build supports";
     }
     VkDescriptorSetLayoutBinding b[GPU_MAX_BINDINGS] {};
     for (uint32_t i = 0; i < bindings; ++i) {

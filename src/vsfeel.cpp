@@ -112,7 +112,9 @@ static std::string pipeline_cache_path_for(const VkPhysicalDeviceProperties & pr
         }
         std::error_code ec;
         std::filesystem::create_directories(d, ec);
-        if (ec && !std::filesystem::is_directory(d)) {
+        // Non-throwing stat: an EACCES/ELOOP here must be a cache miss, not an
+        // exception escaping get_gpu_device across the C ABI.
+        if (ec && !std::filesystem::is_directory(d, ec)) {
             return false;
         }
         return directory_writable(d);
@@ -185,17 +187,23 @@ static void load_gpu_pipeline_cache(GPUDevice & dev, const VkPhysicalDevicePrope
     }
 
     std::vector<uint8_t> initial;
-    if (FILE * f = std::fopen(dev.pipeline_cache_path.c_str(), "rb")) {
-        if (std::fseek(f, 0, SEEK_END) == 0) {
-            const long size = std::ftell(f);
-            if (size > 0 && std::fseek(f, 0, SEEK_SET) == 0) {
-                initial.resize(static_cast<size_t>(size));
-                if (std::fread(initial.data(), 1, initial.size(), f) != initial.size()) {
-                    initial.clear();
+    // Best effort: a resize failure or any other throw is a cache miss, not a
+    // filter error, and this runs under get_gpu_device across the C ABI.
+    try {
+        if (FILE * f = std::fopen(dev.pipeline_cache_path.c_str(), "rb")) {
+            if (std::fseek(f, 0, SEEK_END) == 0) {
+                const long size = std::ftell(f);
+                if (size > 0 && std::fseek(f, 0, SEEK_SET) == 0) {
+                    initial.resize(static_cast<size_t>(size));
+                    if (std::fread(initial.data(), 1, initial.size(), f) != initial.size()) {
+                        initial.clear();
+                    }
                 }
             }
+            std::fclose(f);
         }
-        std::fclose(f);
+    } catch (...) {
+        initial.clear();
     }
 
     VkPipelineCacheCreateInfo info {};
@@ -224,45 +232,58 @@ static void load_gpu_pipeline_cache(GPUDevice & dev, const VkPhysicalDevicePrope
     }
 }
 
+// Unique per save: two GPUDevices in one process (two cores, or a device
+// rebuilt after the registry entry expired) must not rename the same temp file
+// over each other. The destructor also cannot throw, so the whole save body
+// below is guarded.
+static std::atomic<uint64_t> g_pipeline_cache_save_seq { 0 };
+
 static void save_gpu_pipeline_cache(GPUDevice & dev) {
     if (dev.pipeline_cache == VK_NULL_HANDLE || dev.pipeline_cache_path.empty()) {
         return;
     }
-    std::lock_guard lock(*dev.pipeline_cache_lock);
+    try {
+        std::lock_guard lock(*dev.pipeline_cache_lock);
 
-    size_t size = 0;
-    if (dev.vk->vkGetPipelineCacheData(dev.device, dev.pipeline_cache, &size, nullptr) != VK_SUCCESS ||
-        size == 0) {
-        return;
-    }
-    std::vector<uint8_t> data(size);
-    if (dev.vk->vkGetPipelineCacheData(dev.device, dev.pipeline_cache, &size, data.data()) != VK_SUCCESS) {
-        return;
-    }
-    data.resize(size);
+        size_t size = 0;
+        if (dev.vk->vkGetPipelineCacheData(dev.device, dev.pipeline_cache, &size, nullptr) != VK_SUCCESS ||
+            size == 0) {
+            return;
+        }
+        std::vector<uint8_t> data(size);
+        if (dev.vk->vkGetPipelineCacheData(dev.device, dev.pipeline_cache, &size, data.data()) != VK_SUCCESS) {
+            return;
+        }
+        data.resize(size);
 
-    if (const size_t slash = dev.pipeline_cache_path.find_last_of('/');
-        slash != std::string::npos) {
+        if (const size_t slash = dev.pipeline_cache_path.find_last_of('/');
+            slash != std::string::npos) {
+            std::error_code ec;
+            std::filesystem::create_directories(dev.pipeline_cache_path.substr(0, slash), ec);
+        }
+
+        const std::string tmp_path = dev.pipeline_cache_path + "." +
+            std::to_string(static_cast<unsigned long>(process_id())) + "." +
+            std::to_string(g_pipeline_cache_save_seq.fetch_add(1, std::memory_order_relaxed)) +
+            ".tmp";
+        FILE * f = std::fopen(tmp_path.c_str(), "wb");
+        if (f == nullptr) {
+            return;
+        }
+        const bool written = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+        std::fclose(f);
+        if (!written) {
+            std::remove(tmp_path.c_str());
+            return;
+        }
         std::error_code ec;
-        std::filesystem::create_directories(dev.pipeline_cache_path.substr(0, slash), ec);
-    }
-
-    const std::string tmp_path = dev.pipeline_cache_path + "." +
-        std::to_string(static_cast<unsigned long>(process_id())) + ".tmp";
-    FILE * f = std::fopen(tmp_path.c_str(), "wb");
-    if (f == nullptr) {
-        return;
-    }
-    const bool written = std::fwrite(data.data(), 1, data.size(), f) == data.size();
-    std::fclose(f);
-    if (!written) {
-        std::remove(tmp_path.c_str());
-        return;
-    }
-    std::error_code ec;
-    std::filesystem::rename(tmp_path, dev.pipeline_cache_path, ec);
-    if (ec) {
-        std::remove(tmp_path.c_str());
+        std::filesystem::rename(tmp_path, dev.pipeline_cache_path, ec);
+        if (ec) {
+            std::remove(tmp_path.c_str());
+        }
+    } catch (...) {
+        // Runs from ~GPUDevice, which is implicitly noexcept: a failed save is
+        // a cache miss on the next process, never a terminate.
     }
 }
 
@@ -307,18 +328,18 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     auto dev = std::make_shared<GPUDevice>();
     dev->api = api;
     dev->vk = vk;
-    dev->handles = handles;
     dev->device = handles.device;
     dev->queue_family = handles.computeQueueFamily;
     dev->pipeline_cache_lock = new std::mutex();
 
     {
+        VkQueue compute_queue = VK_NULL_HANDLE;
         VkDeviceQueueInfo2 queue_info {};
         queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2;
         queue_info.queueFamilyIndex = handles.computeQueueFamily;
         queue_info.queueIndex = handles.computeQueueIndex;
-        vk->vkGetDeviceQueue2(handles.device, &queue_info, &dev->compute_queue);
-        if (dev->compute_queue == VK_NULL_HANDLE) {
+        vk->vkGetDeviceQueue2(handles.device, &queue_info, &compute_queue);
+        if (compute_queue == VK_NULL_HANDLE) {
             return "the core's compute queue could not be resolved"s;
         }
     }
@@ -346,7 +367,10 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
     dev->subgroup_size_stages = size_control.requiredSubgroupSizeStages;
     dev->subgroup_ops = subgroup.supportedOperations;
     if (push_desc.maxPushDescriptors > 0) {
-        dev->max_push_descriptors = push_desc.maxPushDescriptors;
+        // Clamped to the helper's fixed arrays: a device reporting more than
+        // GPU_MAX_BINDINGS must not make gpu_push_set_layout index past them.
+        dev->max_push_descriptors =
+            std::min(push_desc.maxPushDescriptors, GPU_MAX_BINDINGS);
     }
 
     // Test knobs: lower the reported compute limits so the small-device paths can
@@ -483,7 +507,10 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
             dev->feat_atomic_float32_add);
     }
 
-    g_gpu_devices.emplace(handles.device, dev);
+    // insert_or_assign, not emplace: the lookup above falls through on an
+    // expired weak_ptr, and emplace is a no-op on the dead key, which would
+    // leave the fresh device unregistered and rebuild one per call.
+    g_gpu_devices.insert_or_assign(handles.device, dev);
 
     return dev;
 }

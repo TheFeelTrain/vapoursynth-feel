@@ -117,6 +117,18 @@ force-pad / fail-pad probes: 2854 lines of C++ became 1565.
 
 The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
+- **Creation-failure leak** (correctness-only, no perf change).
+  `createVideoFilterEx2` returns `nullptr` without running the free callback when
+  the node constructor throws (the defensive `isValidVideoInfo` path), so the
+  instance released just before the call leaked its buffers, its exec pool and
+  its node reference. The `nullptr` arm now releases through `DftFree`; BM3D and
+  Bilateral have the same fix.
+- **`env_flag` accepted `"false"`** (correctness-only, no perf change). Only
+  `"0"` and the empty string disabled a flag, so
+  `VSFEEL_DFTTEST_SGSIZE_INVALID=false` still forced the invalid subgroup size and
+  failed creation (and every `env_flag`-gated ablation, e.g. BM3D's `NOSEARCH`,
+  read as on). It now rejects `"false"` like the debug/trace parsers; pinned by
+  `test_dfttest_env_flag_false_is_disabled`.
 - **Dead creation-time stride probe removed** (correctness-only, no perf change).
   It allocated a full-size CPU frame at creation to bound the *output* pitch for
   32-bit addressing, while the frame path re-reads the pitch anyway and never

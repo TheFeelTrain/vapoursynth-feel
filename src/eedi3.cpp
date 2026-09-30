@@ -414,6 +414,9 @@ static void bind_bufs(const Eedi3Data & d, VkCommandBuffer cmd,
     std::array<VkBuffer, GPU_MAX_BINDINGS> arr {};
     uint32_t n = 0;
     for (VkBuffer b : bufs) {
+        if (n >= GPU_MAX_BINDINGS) {
+            break;
+        }
         arr[n++] = b;
     }
     gpu_push_buffers(*d.gpu, cmd, d.pipeline_layout, arr.data(), n);

@@ -438,6 +438,27 @@ def test_dfttest_rejects_unsupported_subgroup_size(noise_gray, monkeypatch):
         vs.core.vsfeel.DFTTest(noise_gray)
 
 
+def test_dfttest_env_flag_false_is_disabled(noise_gray, monkeypatch):
+    """`VAR=false` must disable a flag, not enable it.
+
+    env_flag rejected only "0", so `VSFEEL_DFTTEST_SGSIZE_INVALID=false` still
+    forced the invalid subgroup size and failed creation. It must now behave
+    exactly like the default, while "1" still forces the probe.
+    """
+    monkeypatch.delenv("VSFEEL_DFTTEST_SGSIZE_INVALID", raising=False)
+    default = _run(noise_gray)
+    monkeypatch.setenv("VSFEEL_DFTTEST_SGSIZE_INVALID", "false")
+    disabled = _run(noise_gray)
+    for n in (0, 11):
+        a = frame_to_ndarray(default.get_frame(n))
+        b = frame_to_ndarray(disabled.get_frame(n))
+        assert np.array_equal(a, b), f"VAR=false enabled the probe at frame {n}"
+
+    monkeypatch.setenv("VSFEEL_DFTTEST_SGSIZE_INVALID", "1")
+    with pytest.raises(vs.Error):
+        vs.core.vsfeel.DFTTest(noise_gray)
+
+
 # ---------------------------------------------------------------------------
 # Formats and plane handling
 # ---------------------------------------------------------------------------

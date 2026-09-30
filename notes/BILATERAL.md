@@ -119,6 +119,13 @@ Benchmark call: `MANGOHUD=0 python3 tools/benchmark.py --filter bilateral
 
 ## Historical
 
+### 2026-09-30 — creation-failure leak
+
+`createVideoFilterEx2` returns `nullptr` without running the free callback when
+the node constructor throws, so the instance released just before the call would
+leak its buffers and both node references. The `nullptr` arm now releases through
+`BilateralFree`; same mechanism as `notes/DFTTEST.md`. No perf change.
+
 ### 2026-09-21 — R80 GPU API port
 
 The whole pre-R80 transfer path was deleted: per-stream mapped staging, the

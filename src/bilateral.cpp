@@ -804,6 +804,9 @@ static void VS_CC BilateralCreate(
         BilateralGetFrame, BilateralFree,
         fmParallel, ffGPUOutput, deps, data->ref_node ? 2 : 1, data, core);
     if (result == nullptr) {
+        // The core returns nullptr without running the free callback when the
+        // node constructor throws, so release the instance through it here.
+        BilateralFree(data, core, vsapi);
         vsapi->mapSetError(out, "BilateralVK: filter creation failed");
         return;
     }

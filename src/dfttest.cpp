@@ -1520,6 +1520,9 @@ static void VS_CC DftCreate(
         "DFTTest", data->vi, DftGetFrame, DftFree,
         fmParallel, ffGPUOutput, deps, 1, data, core);
     if (result == nullptr) {
+        // The core returns nullptr without running the free callback when the
+        // node constructor throws, so release the instance through it here.
+        DftFree(data, core, vsapi);
         vsapi->mapSetError(out, "DFTTest: filter creation failed");
         return;
     }
