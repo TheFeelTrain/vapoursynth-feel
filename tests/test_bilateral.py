@@ -393,3 +393,21 @@ def test_bilateral_rejects_nonpositive_radius(noise_gray):
     for bad in (0, -1):
         with pytest.raises(vs.Error):
             _run(noise_gray, radius=bad)
+
+
+@pytest.mark.parametrize("bad", [32768, 46341, 2**31 - 1])
+def test_bilateral_rejects_oversized_radius(noise_gray, bad):
+    """A radius past 32767 wraps the signed-32-bit tile and distance math; it
+    must be refused at creation. Only construction happens here, so a missing
+    check fails instead of dispatching a kernel that never finishes.
+    """
+    with pytest.raises(vs.Error):
+        vs.core.vsfeel.Bilateral(noise_gray, sigma_spatial=3.0,
+                                 sigma_color=0.05, radius=bad)
+
+
+def test_bilateral_rejects_sigma_spatial_that_derives_oversized_radius(noise_gray):
+    """The auto-derived radius (``round(3*sigma_spatial)``, capped at 1e6) must
+    hit the same bound as an explicit one."""
+    with pytest.raises(vs.Error):
+        vs.core.vsfeel.Bilateral(noise_gray, sigma_spatial=1e6, sigma_color=0.05)

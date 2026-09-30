@@ -185,6 +185,12 @@ SDMA and the port reaches parity without any core change.
   fold: the grid used to be clamped and the tail silently unwritten (2 097 120 px
   at 32-wide blocks on a 65 535-group device). Creation now errors naming the
   grid and the device's limits.
+- **`radius` is bounded at 32767** (correctness-only, no perf change). The tile
+  math (`2*radius + block`) and the squared-distance term are signed 32-bit: the
+  explicit branch reached `INT_MAX`, wrapping the tile so a shared kernel could
+  be built whose LDS indices ran off the end (or a plain kernel that loops over
+  the plane), and the sigma-derived branch reached 1e6. Both are now rejected at
+  creation.
 - **Dead ends, with mechanism.**
   - ISA instruction counts are not comparable: our fully-unrolled 361-tap shared
     loop is ~3100 instructions with VOPD=0, the reference's rolled LLVM body

@@ -117,6 +117,13 @@ force-pad / fail-pad probes: 2854 lines of C++ became 1565.
 
 The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
+- **Dead creation-time stride probe removed** (correctness-only, no perf change).
+  It allocated a full-size CPU frame at creation to bound the *output* pitch for
+  32-bit addressing, while the frame path re-reads the pitch anyway and never
+  bounded the *source* pitches at all. The probe frame is gone and the bound now
+  runs per frame on the real output and source pitches (`dft_offsets_fit`), so it
+  covers more than before. `any_process`/`any_plane` were dead too (`planes`
+  cannot be an empty array without the `empty` marker).
 - **Slot-direct frame cache** — each source frame reflect-padded once into a
   shared device-local slot, fused reading the slots in place via `slot_base[7]`,
   reclaim gated on a per-resource `frame_gen` and published on per-slot

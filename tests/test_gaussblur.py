@@ -15,6 +15,7 @@ Run from the repository root:  python -m pytest tests/test_gaussblur.py
 """
 
 import json
+import math
 import textwrap
 
 import numpy as np
@@ -410,3 +411,127 @@ def test_gaussblur_rejects_radius_ge_dimension_per_plane(noise_gray):
     # chroma plane is 32x32; sigma 16 exceeds it while luma (64) is fine
     with pytest.raises(vs.Error, match=r"radius >= dimension"):
         _run(small, sigma=[2.0, 16.0, 16.0])
+
+
+# ---------------------------------------------------------------------------
+# Non-finite footprint (two-pass path)
+# ---------------------------------------------------------------------------
+#
+# The rolling weight window pads out-of-kernel taps with wreg[j] == 0.0f. That
+# is an exact no-op for finite operands, but fma(NaN, 0, s) is NaN: without an
+# explicit skip, one non-finite sample can poison extra rows/columns (up to
+# R-1 = 7, thread-aligned). The reference skips those taps by index, so the
+# footprint must match exactly.
+
+def _gauss_radius(sigma):
+    """Kernel radius the host derives for ``sigma`` (see get_gauss_kernel).
+
+    The host rounds the tap count up to odd, then builds a symmetric kernel of
+    ``2*(taps//2) - 1`` entries, so the radius is ``taps//2 - 1``.
+    """
+    taps = math.ceil(sigma * 6.0 + 1.0)
+    if taps % 2 == 0:
+        taps += 1
+    return taps // 2 - 1
+
+
+def _poke_nonfinite(clip, value, oy, ox):
+    """``clip`` with ``value`` written to plane 0 at (oy, ox) on every frame."""
+    def poke(n, f):
+        out = f.copy()
+        np.asarray(out[0])[oy, ox] = value
+        return out
+    return clip.std.ModifyFrame(clip, poke)
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
+def test_gaussblur_nonfinite_footprint_is_one_kernel_window_32bit(
+        noise_gray, value):
+    """A single non-finite pixel may only affect its kernel window.
+
+    Pixel (oy, ox) is interior, so with the padding taps skipped the output is
+    non-finite exactly on the radius square and bit-identical to a finite run
+    everywhere else. Whether the padding taps (plain zero-weight FMAs) are
+    skipped is compiler-dependent, so this oracle does not catch every build;
+    the reference comparison below does.
+    """
+    sigma = 40.0                       # radius 119 -> the two-pass path
+    radius = _gauss_radius(sigma)
+    oy, ox = HEIGHT // 2 + 3, WIDTH // 2 + 5
+    clean = _run(noise_gray, sigma=sigma)
+    bad = _run(_poke_nonfinite(noise_gray, value, oy, ox), sigma=sigma)
+
+    footprint = np.zeros((HEIGHT, WIDTH), dtype=bool)
+    footprint[oy - radius:oy + radius + 1, ox - radius:ox + radius + 1] = True
+
+    for n in (3, 11, 23):
+        a = _plane(bad.get_frame(n), 0)
+        b = _plane(clean.get_frame(n), 0)
+        assert np.array_equal(np.isfinite(a), ~footprint), (
+            f"{value!r} at ({oy},{ox}): footprint is not the kernel window on "
+            f"frame {n} ({int((np.isfinite(a) != ~footprint).sum())} pixels off)")
+        assert np.array_equal(a[~footprint], b[~footprint]), (
+            f"finite pixels changed by a {value!r} sample on frame {n}")
+
+
+_NONFINITE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
+    import sys
+    import json
+    import numpy as np
+    import vapoursynth as vs
+    from vstools import core
+
+    kind, sigma = sys.argv[1], json.loads(sys.argv[2])
+    bad = {{"nan": np.float32("nan"), "inf": np.float32("inf"),
+            "-inf": np.float32("-inf")}}[kind]
+
+    src = core.bs.VideoSource({NOISE_MKV!r})
+    clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
+                              bits=32, fulls=True, fulld=True)
+    oy, ox = clip.height // 2 + 3, clip.width // 2 + 5
+
+    def poke(n, f):
+        out = f.copy()
+        np.asarray(out[0])[oy, ox] = bad
+        return out
+    clip = core.std.ModifyFrame(clip, clip, poke)
+
+    try:
+        ref_node = core.vszipcl.GaussBlur(clip, sigma=sigma)
+        ref = {{n: read_plane(ref_node.get_frame(n), 0, np.float32)
+                for n in (3, 11, 23)}}
+    except Exception as exc:
+        print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
+        raise SystemExit(2)
+    print("REF ok", flush=True)
+
+    my_node = cpu_node(core.vsfeel.GaussBlur(clip, sigma=sigma))
+    mismatch = 0
+    maxdiff = 0.0
+    for n in (3, 11, 23):
+        a = read_plane(my_node.get_frame(n), 0, np.float32)
+        b = ref[n]
+        finite_a, finite_b = np.isfinite(a), np.isfinite(b)
+        mismatch += int((finite_a != finite_b).sum())
+        both = finite_a & finite_b
+        if both.any():
+            maxdiff = max(maxdiff, float(np.abs(a[both].astype(np.float64)
+                                                    - b[both].astype(np.float64)).max()))
+    print("RESULT " + json.dumps({{"mismatch": mismatch, "maxdiff": maxdiff}}),
+          flush=True)
+""")
+
+
+@pytest.mark.parametrize("kind", ["nan", "inf", "-inf"])
+@pytest.mark.parametrize("sigma", [20.0, 40.0])
+def test_gaussblur_nonfinite_footprint_matches_reference_32bit(kind, sigma):
+    """The non-finite footprint and the finite pixels must match vszipcl."""
+    reference_or_skip("vszipcl", "GaussBlur")
+    result = compare_or_skip(_NONFINITE_SCRIPT, [kind, json.dumps(sigma)],
+                             timeout=300)
+    assert result["mismatch"] == 0, (
+        f"{kind} sigma={sigma}: {result['mismatch']} pixels disagree on "
+        f"finiteness vs vszipcl")
+    assert result["maxdiff"] == 0.0, (
+        f"{kind} sigma={sigma}: finite pixels differ from vszipcl by "
+        f"{result['maxdiff']}")

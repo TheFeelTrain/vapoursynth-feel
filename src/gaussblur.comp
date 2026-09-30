@@ -132,6 +132,15 @@ int mirror(int i, int dim) {
     return i;
 }
 
+// One tap of the rolling-window accumulation. The window is padded with
+// w == 0.0f taps, which are an exact no-op only for finite operands:
+// fma(NaN/Inf, 0, s) is NaN. The reference skips those taps by index instead,
+// so they must be skipped here too or a single non-finite sample would spread
+// up to R-1 extra rows/columns further than the reference does.
+float accum(float v, float w, float s) {
+    return w != 0.0f ? fma(v, w, s) : s;
+}
+
 #if defined(ENTRY_GAUSS)
 
 // the tile of vertically blurred columns: VRT*BLK_Y output rows wide, with a
@@ -185,7 +194,9 @@ void main() {
 
 // Large path, vertical pass. R consecutive output rows per thread; the rolling
 // weight window reproduces the per-pixel ascending-k FMAs exactly (taps past
-// the kernel length carry wreg[j] == 0.0f, an exact no-op).
+// the kernel length carry wreg[j] == 0.0f, skipped by accum()). KLEN is always
+// odd (get_gauss_kernel rounds it up), so taps is even and the loop below can
+// issue both taps of an iteration unconditionally.
 //
 // Optimizations over the naive rolling window (bit-exactness preserved — the
 // FMA sequence per output pixel is unchanged):
@@ -219,22 +230,16 @@ void main() {
             // both tap rows are issued before either FMA batch, so the VMEM
             // engine has two loads in flight instead of stalling per tap
             const float v0 = load_value_raw(idx0 + k * STRIDE);
-            if (k + 1 < taps) {
-                const float v1 = load_value_raw(idx0 + (k + 1) * STRIDE);
-                #pragma unroll
-                for (int j = 0; j < R; ++j)
-                    sum[j] = fma(v0, wreg[j], sum[j]);
-                #pragma unroll
-                for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
-                wreg[0] = (k + 1 < KLEN) ? wt[pc.wt_base + k + 1] : 0.0f;
-                #pragma unroll
-                for (int j = 0; j < R; ++j)
-                    sum[j] = fma(v1, wreg[j], sum[j]);
-            } else {
-                #pragma unroll
-                for (int j = 0; j < R; ++j)
-                    sum[j] = fma(v0, wreg[j], sum[j]);
-            }
+            const float v1 = load_value_raw(idx0 + (k + 1) * STRIDE);
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                sum[j] = accum(v0, wreg[j], sum[j]);
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+            wreg[0] = (k + 1 < KLEN) ? wt[pc.wt_base + k + 1] : 0.0f;
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                sum[j] = accum(v1, wreg[j], sum[j]);
         }
     } else {
         for (int k = 0; k < KLEN + (R - 1); ++k) {
@@ -247,7 +252,7 @@ void main() {
             const float v = load_value(sy * STRIDE + x);
             #pragma unroll
             for (int j = 0; j < R; ++j)
-                sum[j] = fma(v, wreg[j], sum[j]);
+                sum[j] = accum(v, wreg[j], sum[j]);
         }
     }
     #pragma unroll
@@ -288,22 +293,16 @@ void main() {
             for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
             wreg[0] = (k < KLEN) ? wt[pc.wt_base + k] : 0.0f;
             const float v0 = tmp[base + k];
-            if (k + 1 < taps) {
-                const float v1 = tmp[base + k + 1];
-                #pragma unroll
-                for (int j = 0; j < R; ++j)
-                    sum[j] = fma(v0, wreg[j], sum[j]);
-                #pragma unroll
-                for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
-                wreg[0] = (k + 1 < KLEN) ? wt[pc.wt_base + k + 1] : 0.0f;
-                #pragma unroll
-                for (int j = 0; j < R; ++j)
-                    sum[j] = fma(v1, wreg[j], sum[j]);
-            } else {
-                #pragma unroll
-                for (int j = 0; j < R; ++j)
-                    sum[j] = fma(v0, wreg[j], sum[j]);
-            }
+            const float v1 = tmp[base + k + 1];
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                sum[j] = accum(v0, wreg[j], sum[j]);
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+            wreg[0] = (k + 1 < KLEN) ? wt[pc.wt_base + k + 1] : 0.0f;
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                sum[j] = accum(v1, wreg[j], sum[j]);
         }
         store_row_packed(row, x0, sum);
     } else {
@@ -317,7 +316,7 @@ void main() {
             const float v = tmp[pc.tmp_base + row + sx];
             #pragma unroll
             for (int j = 0; j < R; ++j)
-                sum[j] = fma(v, wreg[j], sum[j]);
+                sum[j] = accum(v, wreg[j], sum[j]);
         }
         #pragma unroll
         for (int j = 0; j < R; ++j) {

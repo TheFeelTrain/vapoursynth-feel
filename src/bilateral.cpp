@@ -33,6 +33,11 @@ using namespace std::string_literals;
 // core owns every transfer (std.GPUUpload/GPUDownload). The filter owns no copy
 // of the pixels — one pipeline per plane and one exec pool is all of it.
 
+// Largest radius whose tile math (2*radius + block) and squared-distance term
+// (2*radius^2) stay inside signed 32-bit int; past this the kernel indexes out
+// of LDS or loops over the whole plane.
+constexpr int kMaxRadius = 32767;
+
 struct BilateralPlaneConfig {
     int width {};          // visible pixels
     int height {};
@@ -498,6 +503,14 @@ static void VS_CC BilateralCreate(
                 std::min(std::roundf(sigma_spatial[i] * 3.f), 1000000.f)));
         } else if (radius[i] <= 0) {
             return set_error("\"radius\" must be positive");
+        }
+
+        // Bound the *final* radius: the explicit branch reaches INT_MAX, and
+        // the derived one above reaches 1e6, both of which wrap the tile math
+        // that sizes LDS later in this function.
+        if (radius[i] > kMaxRadius) {
+            return set_error("\"radius\" (explicit or derived from sigma_spatial) "
+                "must be at most " + std::to_string(kMaxRadius));
         }
     }
 

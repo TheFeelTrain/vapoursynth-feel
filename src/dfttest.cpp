@@ -396,6 +396,14 @@ struct DftPlaneConfig {
     VkDeviceSize spatial_bytes {};  // num_blocks * 256 floats
 };
 
+// The push constants narrow every pitch to int32, and the creation-time
+// padded-plane bound does not cover (height-1)*stride, so the frame path bounds
+// the pitches it actually reads and writes (source pitches are not probed at
+// creation at all).
+static bool dft_offsets_fit(const DftPlaneConfig & cfg, int stride) {
+    return static_cast<int64_t>(cfg.height - 1) * stride + cfg.width - 1 <= INT32_MAX;
+}
+
 // Every offset pushed to the shader is int32; the per-plane buffers below are
 // separate allocations, so the bases are 0 and only the plane-internal offsets
 // (spatial float index, pad slice) carry real values.
@@ -639,9 +647,11 @@ static const VSFrame * dft_gpu_frame(
     }
     const VSFrame * center = src[d->radius];
 
-    bool any_process = false, all_process = true;
+    // Every plane is either processed or shared from the center frame, and
+    // `planes` cannot be empty (the core rejects empty arrays without the
+    // `empty` marker), so at least one plane is always processed.
+    bool all_process = true;
     for (int p = 0; p < numPlanes; ++p) {
-        any_process |= d->process[p];
         all_process &= d->process[p];
     }
 
@@ -668,15 +678,6 @@ static const VSFrame * dft_gpu_frame(
             vsapi->freeFrame(src[t]);
         }
         return nullptr;
-    }
-
-    // Nothing to run: every plane shares from the center frame, so the frame is
-    // already complete and an empty submission would only cost a round trip.
-    if (!any_process) {
-        for (int t = 0; t < tw; ++t) {
-            vsapi->freeFrame(src[t]);
-        }
-        return dst;
     }
 
     auto t0 = d->host_timing ? std::chrono::steady_clock::now()
@@ -747,6 +748,10 @@ static const VSFrame * dft_gpu_frame(
         }
         const int dst_stride = static_cast<int>(
             vsapi->getStride(dst, plane) / d->elem_bytes);
+        if (!dft_offsets_fit(cfg, dst_stride)) {
+            return fail("plane " + std::to_string(plane) + " output pitch " +
+                std::to_string(dst_stride) + " overflows the kernel's 32-bit addressing");
+        }
 
         // pad and col2im both walk the padded plane, so they share a grid
         const uint32_t plane_gx = std::max(std::min<uint32_t>(
@@ -775,8 +780,13 @@ static const VSFrame * dft_gpu_frame(
             pc.pad_t0 = t;
             pc.width = cfg.width;
             pc.height = cfg.height;
-            pc.src_stride = static_cast<int32_t>(
+            const int src_stride = static_cast<int>(
                 vsapi->getStride(src[t], plane) / d->elem_bytes);
+            if (!dft_offsets_fit(cfg, src_stride)) {
+                return fail("plane " + std::to_string(plane) + " source pitch " +
+                    std::to_string(src_stride) + " overflows the kernel's 32-bit addressing");
+            }
+            pc.src_stride = src_stride;
             pc.dst_stride = dst_stride;
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                 d->pad_pipeline);
@@ -1168,12 +1178,10 @@ static void VS_CC DftCreate(
     const int subH = fmt.subSamplingH;
 
     // Per-plane geometry
-    bool any_plane = false;
     for (int plane = 0; plane < num_planes; ++plane) {
         if (!d->process[plane]) {
             continue;
         }
-        any_plane = true;
         auto & cfg = d->planes[plane];
         cfg.width = (plane == 0) ? d->vi->width : d->vi->width >> subW;
         cfg.height = (plane == 0) ? d->vi->height : d->vi->height >> subH;
@@ -1202,9 +1210,6 @@ static void VS_CC DftCreate(
             nblk * 256 >= (1ll << 31)) {
             return set_error("frame too large (a plane region exceeds the 2^31 addressing limit).");
         }
-    }
-    if (!any_plane) {
-        return set_error("no planes to process.");
     }
 
     const auto window = getWindow(d->radius, d->block_step, swin, sbeta, twin, tbeta);
@@ -1450,36 +1455,6 @@ static void VS_CC DftCreate(
             }
             d->col2im_pipeline = std::get<VkPipeline>(result);
         }
-    }
-
-    // ------------------------------------------------------------------
-    // The output plane stride has to be known before the frame path runs: the
-    // core's GPU frames keep the CPU stride, so it is read off a scratch CPU
-    // frame here and re-read per frame (getStride applies to both).
-    // ------------------------------------------------------------------
-    {
-        VSFrame * probe = vsapi->newVideoFrame(&fmt, d->vi->width, d->vi->height,
-                                               nullptr, core);
-        if (probe == nullptr) {
-            return set_error("could not allocate a probe frame to read the plane stride");
-        }
-        for (int plane = 0; plane < num_planes; ++plane) {
-            if (!d->process[plane]) {
-                continue;
-            }
-            const auto & cfg = d->planes[plane];
-            const int stride = static_cast<int>(vsapi->getStride(probe, plane) / d->elem_bytes);
-            const int64_t last = static_cast<int64_t>(cfg.height - 1) * stride +
-                cfg.width - 1;
-            if (last > INT32_MAX) {
-                vsapi->freeFrame(probe);
-                return set_error("plane " + std::to_string(plane) + " is too large: " +
-                    std::to_string(cfg.width) + "x" + std::to_string(cfg.height) +
-                    " at stride " + std::to_string(stride) +
-                    " overflows the kernel's 32-bit addressing");
-            }
-        }
-        vsapi->freeFrame(probe);
     }
 
     {

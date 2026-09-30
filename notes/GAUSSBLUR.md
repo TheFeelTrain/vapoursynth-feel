@@ -23,7 +23,7 @@ Design (current):
   2373 fps, GaussBlur 2352 fps — the CPU-sink delta below is the deleted
   HD/KD transfer path, not the filter.
 
-Scoreboard — jpbd 1080p GRAY16, sigma=16 (radius 48 → two-pass), 3000 frames,
+Scoreboard — jpbd 1080p GRAY16, sigma=16 (radius 47 → two-pass), 3000 frames,
 interleaved pre-R80/R80 pairs through `tools/benchmark.py --repeat 1`, 3 rounds,
 medians:
 
@@ -142,6 +142,18 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
   unconditional `_mm_sfence()` before submit for the NT-staged upload, creation
   errors torn down by `~GaussData` via `FramePool::emplace()`, frame-path
   `set_error` frees `dst`. All but the sfence were deleted with the port.
+- **Non-finite samples no longer spread past the kernel window.** The two-pass
+  rolling window pads out-of-kernel taps with `wreg[j] == 0.0f`; that is an
+  exact no-op only for finite operands, because `fma(NaN, 0, s)` is NaN. The
+  poison is thread-aligned (up to `R-1` extra rows/cols) but ACO sometimes folds
+  `fma(v, 0, s)` to `s`, so it showed up as a rectangle instead of a square and
+  only in some pipelines. Each accumulation now skips zero-weight taps
+  (`accum()`), matching vszipcl's per-index skip bit-for-bit; the unreachable
+  `k + 1 < taps` else arms went with it (KLEN is always odd, so `taps` is even).
+  Grid counts (`width + BLK_X - 1` and friends) are now computed in `int64_t`,
+  so a near-`INT32_MAX` plane cannot wrap one before the quotient widens. No
+  perf change: VGPR 48 / 32 subgroups/SIMD / 0 spills both ways, same-session
+  A/B medians within the ±3% run-to-run spread.
 
 ## Open work
 

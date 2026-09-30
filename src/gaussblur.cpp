@@ -733,12 +733,17 @@ static void VS_CC GaussCreate(
         cfg.small = cfg_small[ci];
         cfg.tmp_elem = plane_tmp_elem;
 
-        const int64_t small_x = (cfg.width + BLK_X - 1) / BLK_X;
-        const int64_t small_y = (cfg.height + VRT * BLK_Y - 1) / (VRT * BLK_Y);
-        const int64_t v_x = (cfg.width + BLK_X - 1) / BLK_X;
-        const int64_t v_y = ((cfg.height + LARGE_R - 1) / LARGE_R + BLK_Y - 1) / BLK_Y;
-        const int64_t h_x = ((cfg.width + LARGE_R - 1) / LARGE_R + BLK_X - 1) / BLK_X;
-        const int64_t h_y = (cfg.height + BLK_Y - 1) / BLK_Y;
+        // 64-bit: a width/height near INT32_MAX would otherwise overflow the
+        // additions before the quotient widens, and a wrapped grid could pass
+        // the `over` test and be dispatched.
+        const int64_t w = cfg.width;
+        const int64_t h = cfg.height;
+        const int64_t small_x = (w + BLK_X - 1) / BLK_X;
+        const int64_t small_y = (h + VRT * BLK_Y - 1) / (VRT * BLK_Y);
+        const int64_t v_x = (w + BLK_X - 1) / BLK_X;
+        const int64_t v_y = ((h + LARGE_R - 1) / LARGE_R + BLK_Y - 1) / BLK_Y;
+        const int64_t h_x = ((w + LARGE_R - 1) / LARGE_R + BLK_X - 1) / BLK_X;
+        const int64_t h_y = (h + BLK_Y - 1) / BLK_Y;
         // A 2D grid cannot fold an over-wide plane into Y the way the 1D
         // kernels do: refuse it instead of dispatching a clamped grid that
         // leaves everything past the limit unwritten. Only the chosen path's
