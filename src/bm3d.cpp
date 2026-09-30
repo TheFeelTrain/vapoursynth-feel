@@ -96,7 +96,6 @@ struct BM3DData {
     int radius;
     int tw;                          // 2 * radius + 1
     float sigma;                     // scaled luma sigma
-    float sigma_u, sigma_v;
     int block_step, bm_range, ps_num, ps_range;
     bool process;
     bool chroma;
@@ -105,8 +104,6 @@ struct BM3DData {
     bool cas_atomics {};             // aggregate with the CAS kernel (no float32 add atomics)
 
     std::shared_ptr<GPUDevice> gpu;
-    // Only the destructor needs it, and the destructor has no VSAPI argument.
-    const VSAPI * vsapi {};
     VkDescriptorSetLayout set_layout {};
     VkPipelineLayout pipeline_layout {};
     std::array<Bm3dPlane, 3> planes {};
@@ -150,6 +147,10 @@ struct BM3DData {
     std::vector<int> src_frame {};   // frame index whose data each src slot holds
     std::vector<int> src_writer {};  // frame that reserved each src slot for copying
     std::vector<uint8_t> src_ready {};  // its estimation submission is enqueued
+    // Set when a frame of this instance fails before its chunk-0 submission: its
+    // ring keys were cleared, so a reader already waiting on one must be
+    // released and then fail rather than read a slot that was never copied.
+    bool failed {};
     // Diagnostic (VSFEEL_BM3D_RINGWAIT): the ring copier's chunk-0 submission
     // value per frame, so a reader can wait the copy out instead of trusting
     // the barrier. The witness covers the estimate slots but cannot see a ring
@@ -185,11 +186,10 @@ struct BM3DData {
     // Submit one command buffer per recomputed window position instead of one
     // holding them all (VSFEEL_BM3D_SPLIT=0 restores the single submission).
     bool split_est { true };
-    // Diagnostic only: VSFEEL_BM3D_NOCHUNKBAR=1 drops the leading barrier of
-    // every chunk but the first, restoring the ordering this filter shipped
-    // with before the chunk-fill/aggregation race was found. Used by
-    // test_bm3dv2_chunk_fill_vs_aggregation to show the ordering matters.
-    bool nochunkbar { false };
+    // VSFEEL_BM3D_FAULT=<n> fails frame n's estimation on a fresh instance,
+    // before its chunk-0 submission, so tests can exercise the error path's
+    // cache handoff (-1 disables).
+    int fault_frame { -1 };
     std::atomic<uint64_t> ht_acquire_ns {}, ht_source_ns {}, ht_est_ns {},
         ht_agg_ns {}, ht_release_ns {}, ht_total_ns {}, ht_n {};
 
@@ -328,13 +328,12 @@ static std::variant<VkPipeline, std::string> create_agg_pipeline(
     VkPipelineLayout layout) {
 
     struct Spec {
-        int32_t width, height, stride, tw;
-    } spec { plane.width, plane.height, plane.stride, d.tw };
-    const std::array<VkSpecializationMapEntry, 4> entries {{
-        { 0,  0, sizeof(int32_t) },
-        { 1,  4, sizeof(int32_t) },
-        { 2,  8, sizeof(int32_t) },
-        { 3, 12, sizeof(int32_t) },
+        int32_t height, stride, tw;
+    } spec { plane.height, plane.stride, d.tw };
+    const std::array<VkSpecializationMapEntry, 3> entries {{
+        { 0, 0, sizeof(int32_t) },
+        { 1, 4, sizeof(int32_t) },
+        { 2, 8, sizeof(int32_t) },
     }};
     // The aggregation kernel is a plain 32x8 grid-stride kernel with no LDS.
     return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(), &spec,
@@ -476,10 +475,7 @@ static void acquire_cache(BM3DData * d, Bm3dFrame & fr, int n) {
 
 // The slots this frame wrote are submitted, so a reader waiting on them may
 // record and submit: submission order on the one compute queue plus the
-// reader's leading barrier is the whole cross-frame handoff. Called on the
-// error path too, where the frame will never submit -- a reader must proceed
-// (and fail on its own) rather than block forever on a signal that is never
-// coming; that is the same trade the legacy host-signalled timeline made.
+// reader's leading barrier is the whole cross-frame handoff.
 static void publish_est_submitted(BM3DData * d, const Bm3dFrame & fr) {
     if (d->radius == 0) {
         return;   // radius 0 slots are private to one frame
@@ -498,6 +494,43 @@ static void publish_est_submitted(BM3DData * d, const Bm3dFrame & fr) {
     d->cache_cv.notify_all();
 }
 
+// A frame that will never submit must not advertise slots it never wrote. The
+// ring copies live only in chunk 0, so when that submission did not land the
+// source keys are cleared: a later frame then copies those frames itself
+// instead of block-matching against whatever the slot held. The failure flag
+// releases a reader already blocked on a cleared ready flag (it would otherwise
+// hang) and makes it fail instead of reading the slot. The res keys stay as
+// published: the per-slice witness in `tags` makes an unwritten stack refuse
+// itself and fall back to the source pixel, which the cleared ring keys make
+// honest again.
+static void fail_pending_frame(BM3DData * d, const Bm3dFrame & fr, bool ring_copied) {
+    if (d->radius == 0) {
+        return;   // radius 0 slots are private to one frame
+    }
+    std::lock_guard lock(d->cache_lock);
+    d->failed = true;
+    for (int i = 0; i < d->tw; ++i) {
+        if (fr.win_recompute[i]) {
+            d->res_ready[fr.win_slots[i]] = 1;
+        }
+    }
+    for (int k = 0; k < fr.n_src; ++k) {
+        if (!fr.upload_new[k]) {
+            continue;
+        }
+        d->src_frame[fr.src_slot[k]] = ring_copied ? fr.src_lo + k : -1;
+        d->src_ready[fr.src_slot[k]] = ring_copied ? 1 : 0;
+    }
+    d->cache_cv.notify_all();
+}
+
+// True once any frame of this instance has failed: the cache's keys are no
+// longer trustworthy, so a reader must fail fast instead of reading a slot.
+static bool frame_failed(BM3DData * d) {
+    std::lock_guard lock(d->cache_lock);
+    return d->failed;
+}
+
 // Wait host side until every source slot this frame reads has been submitted by
 // its copier. The frame holds those slots, so the writer cannot be re-reserved
 // underneath it. With VSFEEL_BM3D_RINGWAIT the copier's copy is additionally
@@ -511,6 +544,9 @@ static void wait_src_submitted(BM3DData * d, const Bm3dFrame & fr) {
     {
         std::unique_lock lock(d->cache_lock);
         d->cache_cv.wait(lock, [&] {
+            if (d->failed) {
+                return true;   // the copier will never submit; let the caller fail
+            }
             for (int k = 0; k < fr.n_src; ++k) {
                 if (!fr.upload_new[k] && !d->src_ready[fr.src_slot[k]]) {
                     return false;
@@ -547,6 +583,9 @@ static void wait_res_submitted(BM3DData * d, const Bm3dFrame & fr) {
     }
     std::unique_lock lock(d->cache_lock);
     d->cache_cv.wait(lock, [&] {
+        if (d->failed) {
+            return true;   // the writer will never submit; let the caller fail
+        }
         for (int i = 0; i < d->tw; ++i) {
             if (!fr.win_recompute[i] && !d->res_ready[fr.win_slots[i]]) {
                 return false;
@@ -751,10 +790,9 @@ static void record_est_chunk(BM3DData * d, VSGPUExecContext * ctx, const Bm3dFra
     // cross-frame readers use -- and it also orders this frame's writes (the
     // copies and every slot zero-fill) behind everything already queued, and
     // the overwrite of a recycled slot behind the previous reader's
-    // aggregation.
-    if (c == 0 || !d->nochunkbar) {
-        bm3d_full_barrier(*d->gpu, cmd);
-    }
+    // aggregation. Dropping it after chunk 0 re-enables the fill/aggregation
+    // race, so it is not an optional barrier.
+    bm3d_full_barrier(*d->gpu, cmd);
 
     if (c == 0) {
         record_src_copies(d, fr, cmd, window);
@@ -864,8 +902,11 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame & fr, VkCommandBuffer 
             // Invariant check: at aggregation time this frame still holds its
             // slots, so each must still record the frame whose stack the
             // aggregation is about to read. A mismatch means the stack belongs
-            // to another frame -- the intermittent contaminant band.
-            if (d->trace) {
+            // to another frame -- the intermittent contaminant band. Radius 0
+            // has no window table (its slots are private), so there is nothing
+            // to check; the reads need cache_lock like every other table read.
+            if (d->trace && d->radius > 0) {
+                std::lock_guard lock(d->cache_lock);
                 for (int i = 0; i < d->tw; ++i) {
                     const int want = std::clamp(n - r + i, 0, nf - 1);
                     const int slot = fr.win_slots[i];
@@ -977,14 +1018,17 @@ static const VSFrame *VS_CC BM3DGetFrame(
 
         std::vector<Bm3dWindowCopy> window(static_cast<size_t>(fr.n_src));
         std::vector<const VSFrame *> sources;
+        // Chunk 0 is the submission that records the ring copies; until it
+        // lands, the src keys this frame committed at acquire are promises, not
+        // facts (see fail_pending_frame).
+        bool ring_copied = false;
 
         const auto set_error = [&](const std::string & error_message) -> const VSFrame * {
             vsfeel_trace_error("BM3D", n, error_message, d->gpu.get());
-            // A reader may be waiting for this frame's estimation; mark the
-            // slots submitted so it goes ahead instead of blocking forever on
-            // a signal that is never coming. This frame's own output is an
-            // error either way.
-            publish_est_submitted(d, fr);
+            // A reader may be waiting for this frame's estimation; it must be
+            // released instead of blocking forever on a signal that is never
+            // coming. This frame's own output is an error either way.
+            fail_pending_frame(d, fr, ring_copied);
             release_cache(d, fr);
             for (const VSFrame * f : sources) {
                 vsapi->freeFrame(f);
@@ -993,6 +1037,13 @@ static const VSFrame *VS_CC BM3DGetFrame(
             vsapi->freeFrame(dst);
             return nullptr;
         };
+
+        // Fault injection for the error-path test: fail after the reservations
+        // exist but before anything was recorded, so the test exercises exactly
+        // the window where a src key is committed but its copy never lands.
+        if (n == d->fault_frame) {
+            return set_error("injected estimation fault");
+        }
 
         // Copy only the frames whose cache slots the acquire reserved. The
         // needed range is the union of every window that this record's
@@ -1059,6 +1110,9 @@ static const VSFrame *VS_CC BM3DGetFrame(
         // frames; wait host side until those copies have been submitted. This
         // frame holds the slots, so no writer can be re-reserved underneath it.
         wait_src_submitted(d, fr);
+        if (frame_failed(d)) {
+            return set_error("a source frame's estimation never submitted");
+        }
 
         // The estimation is submitted first, so the GPU stays busy with the
         // heavy kernels while the host waits for the writers of the
@@ -1087,6 +1141,9 @@ static const VSFrame *VS_CC BM3DGetFrame(
                 // The ring copy rides in chunk 0; RINGWAIT readers wait this out.
                 d->chunk0_value[n] = signaled;
             }
+            if (c == 0) {
+                ring_copied = true;
+            }
         }
         for (const VSFrame * f : sources) {
             vsapi->freeFrame(f);
@@ -1102,6 +1159,9 @@ static const VSFrame *VS_CC BM3DGetFrame(
         // every stack writer has submitted (see publish_est_submitted). The
         // waits follow cache-acquisition order, which is acyclic.
         wait_res_submitted(d, fr);
+        if (frame_failed(d)) {
+            return set_error("an estimate stack's writer never submitted");
+        }
 
         char aerr[512] {};
         VSGPUExecContext * agg_ctx = d->gpu->api->gpuExecAcquire(d->exec, aerr, sizeof(aerr));
@@ -1204,7 +1264,7 @@ static void VS_CC BM3DCreate(
     d->trace = vsfeel_debug_trace("VSFEEL_BM3D_TRACE");
     d->dump = env_flag("VSFEEL_BM3D_DUMP");
     d->split_est = env_int("VSFEEL_BM3D_SPLIT", 1) != 0;
-    d->nochunkbar = env_flag("VSFEEL_BM3D_NOCHUNKBAR");
+    d->fault_frame = env_int("VSFEEL_BM3D_FAULT", -1);
     // Diagnostic: wait the ring copier's submission out host side instead of
     // riding the handoff barrier (see wait_src_submitted).
     d->ring_wait = env_flag("VSFEEL_BM3D_RINGWAIT");
@@ -1296,8 +1356,6 @@ static void VS_CC BM3DCreate(
         sv *= sigma_factor;
     }
     d->sigma = sigma[0];
-    d->sigma_u = sigma[1];
-    d->sigma_v = sigma[2];
 
     std::array<int, 3> block_step;
     for (int i = 0; i < std::ssize(block_step); ++i) {
@@ -1395,7 +1453,6 @@ static void VS_CC BM3DCreate(
         }
         d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
     }
-    d->vsapi = vsapi;
 
     // The GPU-timing probe is invalid usage on a queue family whose
     // timestampValidBits is 0, where a timestamp write can hang the engine

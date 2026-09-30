@@ -68,22 +68,25 @@ layout(std430, binding = 3) buffer TagBuf { uint tags[]; };
 // is an atomic load that returns the current value without changing it.
 // The loop is bounded on purpose: an unbounded retry that cannot make progress
 // spins the GPU until the driver resets the device (seen as
-// VK_ERROR_DEVICE_LOST with no fault). The bound is not a guess -- one element
-// can receive at most `8 * ceil(8 / BLOCK_STEP)^2` adds (the eight matches of
-// every reference block whose 8x8 window covers the pixel), and each failed
-// compare-exchange means another one of those landed, so after that many
-// failures the next attempt must succeed. 512 is that figure at the smallest
-// supported BLOCK_STEP (1, 8 * 64); at the tuned BLOCK_STEP=4 it is 32. A
-// bounded loop is safe, an unbounded one is not, and the old 32 was short of
-// the bound for every block_step below 4 -- measured with a NaN-store probe:
-// block_step=1 exhausted it (1074 NaN pixels over the noise clip's frames).
-#define RES_ADD_RETRIES 512
+// VK_ERROR_DEVICE_LOST with no fault). The bound is a contention bound, derived
+// from the kernel's own geometry: one element can receive one add per matched
+// patch from every reference block whose search window reaches it, and the
+// blocks that can reach it are spaced BLOCK_STEP over a span of
+// 2 * BM_RANGE + 8 origins, so at most 8 * (ceil((2 * BM_RANGE + 8) /
+// BLOCK_STEP) + 1)^2 adds -- the 8 matches of each block. That is 968 at
+// bm_range=16/block_step=4 and 13448 at bm_range=16/block_step=1. Erring high
+// is safe: a failed exchange means another one of those adds landed, so the
+// true retry count is below it.
+// Unsigned arithmetic keeps the derivation in range at BM_RANGE's 8192 cap
+// (the maximum, 8 * 16393^2, is still below 2^32).
 void res_add(int idx, float val) {
 #ifndef NO_FLOAT_ATOMICS
     atomicAdd(res[idx], val);
 #else
+    uint cells = (2u * uint(BM_RANGE) + 8u + uint(BLOCK_STEP) - 1u) / uint(BLOCK_STEP) + 1u;
+    uint retries = 8u * cells * cells;
     uint assumed = atomicCompSwap(res_u[idx], 0u, 0u);
-    for (int i = 0; i < RES_ADD_RETRIES; ++i) {
+    for (uint i = 0u; i < retries; ++i) {
         const uint old = atomicCompSwap(res_u[idx], assumed,
                                         floatBitsToUint(uintBitsToFloat(assumed) + val));
         if (old == assumed) {
@@ -91,11 +94,11 @@ void res_add(int idx, float val) {
         }
         assumed = old;
     }
-    // Unreachable for every supported block_step (see above); if it is ever
-    // taken, land the add on the freshest value rather than on the one the loop
-    // started from, which is the least lossy store this can do.
+    // Unreachable for every accepted config (the bound above is exact), but if
+    // it is ever taken, land the add atomically on the freshest value: a plain
+    // store races a concurrent atomic writer and silently loses its addend.
     const uint latest = atomicCompSwap(res_u[idx], 0u, 0u);
-    res_u[idx] = floatBitsToUint(uintBitsToFloat(latest) + val);
+    atomicCompSwap(res_u[idx], latest, floatBitsToUint(uintBitsToFloat(latest) + val));
 #endif
 }
 
@@ -317,24 +320,6 @@ float ssd_err(const float cur[64], const int base_idx, int cx, int cy) {
     return ((col[0] + col[1]) + (col[2] + col[3])) + ((col[4] + col[5]) + (col[6] + col[7]));
 }
 
-// squared error of a single patch column: cur column `c` (0..7) vs the source
-// column at x = X, summed over the 8 rows (used by the sliding-window scan)
-float col_ssd(const float cur[64], const int base_idx, int cy, int X, int c) {
-    float errors[2] = float[2](0.0f, 0.0f);
-    for (int i = 0; i < 8; ++i) {
-        float val = cur[c * 8 + i] - src[base_idx + (cy + i) * STRIDE + X];
-        errors[i % 2] += val * val;
-    }
-    return errors[0] + errors[1];
-}
-
-// combine 8 column sums in the exact order of the reference's ssd_err so the
-// sliding-window scan keeps each candidate's SSD bit-identical to a full 8x8
-// recompute (only the per-lane candidate partition differs)
-float reduce_cols(const float col[8]) {
-    return ((col[0] + col[1]) + (col[2] + col[3])) + ((col[4] + col[5]) + (col[6] + col[7]));
-}
-
 // The candidate's (x, y) pair travels packed in one word: the insert shifts one
 // array per position, and folding x and y into a single word makes that three
 // arrays instead of four.
@@ -390,7 +375,7 @@ void ginsert8(inout float e[8], inout int xs[8], inout int ys[8], inout int zs[8
 // `n` entries of the merged list are produced. The temporal searches only
 // consume the top PS_NUM, so they ask for that many and their lanes hold only
 // that many.
-void merge_group(int n, int base, out float me[8], out int mx[8], out int my[8], out int ms[8]) {
+void merge_group(int n, int base, out float me[8], out int mx[8], out int my[8]) {
     const int lane = int(gl_LocalInvocationID.x);
     const int group = lane >> 3;
     int head[8];
@@ -417,7 +402,6 @@ void merge_group(int n, int base, out float me[8], out int mx[8], out int my[8],
         me[k] = be;
         mx[k] = l_x[group][base + bl * 8 + bh];
         my[k] = l_y[group][base + bl * 8 + bh];
-        ms[k] = bs;
         for (int l = 0; l < 8; ++l) {
             head[l] += (l == bl) ? 1 : 0;
         }
@@ -589,8 +573,7 @@ void main() {
             l_s[group][sub_lane_id * 8 + k] = ps[k];
         }
         barrier();
-        int gseq[8];
-        merge_group(8, 0, ge, gx, gy, gseq);
+        merge_group(8, 0, ge, gx, gy);
         for (int k = 0; k < 8; ++k) gz[k] = KRADIUS;
     }
 
@@ -660,8 +643,8 @@ void main() {
                 barrier();
                 if (sub_lane_id == 0) {
                     float fe[8];
-                    int fx[8], fy[8], fs[8];
-                    merge_group(PS_NUM, 0, fe, fx, fy, fs);
+                    int fx[8], fy[8];
+                    merge_group(PS_NUM, 0, fe, fx, fy);
                     for (int i = 0; i < PS_NUM; ++i) {
                         ginsert8(ge, gx, gy, gz, fe[i], fx[i], fy[i], temporal_index);
                     }

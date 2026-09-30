@@ -6,7 +6,9 @@ to vszipcl; see the tolerance policy in `tests/test_bm3dv2.py`.
 
 Current correctness and performance fixes: all BM3D radii use exact per-candidate
 SSD scores with a flattened candidate partition; per-slot witness clearing is
-ordered with estimation, and radius-0 fallback uses its private source slot.
+ordered with estimation, radius-0 fallback uses its private source slot, and a
+frame that failed before its ring copy submitted clears those source keys and
+fails its readers instead of leaking stale slots.
 BM3D tests pass; the 1000-frame jpbd benchmark is 766.5 fps for the exact
 sigma=0.7, radius=2, bm_range=9, ps_range=4, block_step=8 config.
 
@@ -104,19 +106,54 @@ Chronological; each entry keeps the mechanism, not the story.
   only and passes chroma through, but the wrapper advertised `chroma` and
   dropped it, so vsdenoise's forced `chroma=True` on YUV444 silently ran the
   luma path. The wrapper now raises on `chroma=True`; no perf change.
-- **The CAS fallback's retry bound was below what the kernel can contend.**
+- **The CAS fallback's retry bound counted the wrong contributors.**
   `res_add`'s compare-exchange loop is capped so a stuck retry cannot reset the
-  device (the reference's unbounded `do/while`); one res element receives at most
-  `8 * ceil(8 / block_step)^2` adds, so the old 32 was exactly the bound *only at
-  the tuned block_step=4* and short of it for every smaller step (512 at 1).
-  Measured with a NaN-store probe: block_step=1 exhausted it (1074 NaN pixels
-  over the clip's frames); against the hardware-atomic arm, the old bound put 16
-  of 4096 pixels 1e-5..6.1e-5 out, the derived 512 lands at 7e-9 (add order
-  alone). `test_bm3dv2_cas_fallback_holds_at_small_block_step` pins it.
-  The last-resort store now lands on a freshly re-read value (bounded, and
-  unreachable for every supported block_step) and `gpu_make_buffer` refuses a
-  buffer over `maxStorageBufferRange`, which BM3D's 190 MiB estimate cache
-  exceeds before the other filters' scratch do.
+  device (the reference's unbounded `do/while`). The bound is a *contention*
+  bound: one res element receives one add per matched patch from every reference
+  block whose search window can reach it, i.e. `8 * (ceil((2*bm_range + 8) /
+  block_step) + 1)^2` -- 968 at bm_range=16/block_step=4, 13448 at
+  bm_range=16/block_step=1 -- not the
+  `8 * ceil(8 / block_step)^2` the old comment derived from blocks merely
+  covering the pixel. The old 32 was short of it at every step: measured with a
+  NaN-store probe, block_step=1 exhausted 32 (1074 NaN pixels over the clip's
+  frames), while against the hardware-atomic arm 32 put 16 of 4096 pixels
+  1e-5..6.1e-5 out. `res_add` now derives the bound in the shader from
+  BLOCK_STEP/BM_RANGE (unsigned, so BM_RANGE's 8192 cap cannot overflow it) and
+  its unreachable last-resort path is an atomic exchange rather than a store
+  that could drop a concurrent writer's addend. The bound is static; the
+  accuracy it protects is pinned by
+  `test_bm3dv2_cas_fallback_holds_at_small_block_step`. `gpu_make_buffer`
+  refuses a buffer over `maxStorageBufferRange`, which BM3D's 190 MiB estimate
+  cache exceeds before the other filters' scratch do.
+
+- **A failed frame advertised ring copies that never landed.** `acquire_cache`
+  commits a source slot's key before any command buffer exists, and the error
+  path marked every such slot ready, so a later (or concurrent) frame skipped
+  the copy and block-matched against the slot's previous contents or
+  uninitialised VRAM -- measured 0.038 max diff against a clean run at frame 1.
+  The error path now clears the keys whose chunk-0 copy did not submit, and a
+  per-instance failure flag releases a reader already blocked on a cleared
+  ready flag and fails it rather than hanging on a signal that never comes. The
+  success path and the hardware-atomic kernel are untouched; no perf change.
+  `VSFEEL_BM3D_FAULT` plus the error-path test pin it.
+
+- **`VSFEEL_BM3D_NOCHUNKBAR` is gone.** It dropped the leading whole-queue
+  barrier of every chunk after 0 -- exactly what orders a later chunk's dispatch
+  and a recycled slot's overwrite behind chunk 0's ring copies -- so a switch
+  that disables a correctness barrier with no test proving the ordering is
+  needed is a footgun. The barrier is unconditional now; the default path never
+  took the branch, so no perf or behaviour change.
+
+- **Radius-0 trace false-alarmed and read the cache unlocked.** The
+  window-invariant block only has meaning at radius > 0 (radius 0 never fills
+  the tables, so it printed "holds frame -1"/"NOT READY" for every frame); it is
+  gated on radius and now takes `cache_lock` like every other table read. At the
+  same time the dead tail went: `bm3d.cpp`'s `vsapi`/`sigma_u`/`sigma_v`,
+  `bm3d.comp`'s `col_ssd`/`reduce_cols`, `merge_group`'s unused `ms` output with
+  the `gseq`/`fs` arrays, and `bm3d_agg.comp`'s unreferenced WIDTH spec constant
+  (host entry renumbered). No perf change: 982.9 vs 977.6 fps for the old
+  binary (500f jpbd 1080p GRAY32 r=2 bm_range=9 ps_range=4 block_step=8, both
+  inside a 4-7% run spread). The false-invariant test pins the gate.
 
 - **2026-09-23 — exec-pool port: +1%.** Replaced BM3D's per-stream
   command pools, timelines and raw `gpu_submit` with the core's exec pool, and
@@ -318,12 +355,6 @@ per-instance staging once before the stream loop; the DB machine is unchanged.
   than the temporal one. Dropping the sequence index from the spatial list
   (recovering `sq = (cy-top)*rw + (cx-left)` from the packed coordinates at
   merge time, which is exact) is worth ~2% of the frame and was not taken.
-- **Dead plumbing.** `merge_group`'s `ms` output and the spatial `gseq` array
-  are unused tails of the port (`ms`/`fs` were already dead before this round).
-- **The row-init column batches** (8 `col_ssd` per row per lane, 21 rows per
-  lane per frame) are ~15% of kernel instructions and are inherent to the
-  sliding window. The spatial scan also wastes ~18% of its wave iterations on
-  the final row, where only 1 of 8 lanes is active.
 - The estimate phase's 0.40 ms has not been decomposed into transform vs
   atomics. The CAS build bounds it (below): its +0.66 ms/frame for a
   read-modify-write loop means the two `atomicAdd`s are most of that 0.40 ms.
@@ -387,6 +418,11 @@ cached at creation, not read per frame.
   The probe waits each instrumented frame's aggregation out (the query pool is
   shared, so the path serializes) and reads `vkGetQueryPoolResults` on the host;
   it averages over 50 frames and never runs in a benchmark.
+- `VSFEEL_BM3D_FAULT=<n>` — fail frame `n`'s estimation on a fresh instance,
+  after its cache reservations but before any command buffer; the error-path
+  test uses it to pin the ring-key clearing and the reader release.
+- `VSFEEL_BM3D_NOCHUNKBAR` — **gone**: it dropped the leading barrier of every
+  chunk after 0, which is what orders them behind chunk 0's ring copies.
 - `VSFEEL_BM3D_HD`, `VSFEEL_BM3D_QUEUES` — **gone** with the pre-R80 transfer and
   queue-selection code.
 

@@ -10,6 +10,9 @@ Run from the repository root:  python -m pytest tests/test_bm3dv2.py
 """
 
 import json
+import os
+import subprocess
+import sys
 import textwrap
 
 import numpy as np
@@ -126,11 +129,13 @@ def test_bm3dv2_cas_fallback_matches_hardware_atomics(noise_gray, monkeypatch):
 def test_bm3dv2_cas_fallback_holds_at_small_block_step(noise_gray, monkeypatch):
     """The CAS arm must stay exact where contention is highest.
 
-    One res element receives up to `8 * ceil(8 / block_step)^2` adds, so
-    block_step=1 is the worst case (512) and a retry budget below it silently
-    drops addends: measured against the hardware arm at block_step=1, the old
-    32-retry bound put 16 of 4096 pixels 1e-5..6.1e-5 out, while the derived 512
-    lands at 7e-9 (float add order alone). The bound is what this pins.
+    One res element receives up to `8 * (ceil((2*bm_range + 8)/block_step) +
+    1)^2` adds -- every matched patch of every reference block whose search
+    window can reach it -- so block_step=1 is the worst case (13448 at
+    bm_range=16) and a retry budget below it can silently drop addends: the
+    old 32-retry bound put 16 of 4096 pixels 1e-5..6.1e-5 out against the
+    hardware arm, while the geometry-derived bound lands at 7e-9 (float add
+    order alone). The bound is what this pins.
     """
     def small_step(clip):
         return BM3D(clip, sigma=SIGMA, radius=2, bm_range=BM_RANGE,
@@ -189,6 +194,158 @@ def test_bm3dv2_radius0_concurrent_first_use_and_fallback(noise_gray, monkeypatc
         expected = frame_to_ndarray(noise_gray.get_frame(n))
         assert np.array_equal(actual[n], expected), (
             f"radius-zero fallback read the wrong source slot at frame {n}")
+
+
+# ---------------------------------------------------------------------------
+# Error-path cache handoff and the radius-0 trace
+# ---------------------------------------------------------------------------
+
+# Both scripts run the plugin in a subprocess (the trace the filter prints goes
+# to stderr, and the error-path test must not hang the suite) and reuse
+# conftest's stride-aware readers.
+_SUBPROCESS_PRELUDE = r'''
+import json
+import sys
+sys.path.insert(0, sys.argv[1])
+from conftest import NOISE_MKV, frame_to_ndarray
+import numpy as np
+import vapoursynth as vs
+from vapoursynth import core
+
+
+def source():
+    if hasattr(core, "bs"):
+        return core.bs.VideoSource(NOISE_MKV)
+    return core.ffms2.Source(NOISE_MKV)
+
+
+def gray32():
+    return core.fmtc.bitdepth(core.std.ShufflePlanes(source(), 0, vs.GRAY),
+                              bits=32, fulls=True, fulld=True)
+'''
+
+_TRACE_SCRIPT = _SUBPROCESS_PRELUDE + r'''
+node = core.vsfeel.BM3Dv2(gray32(), sigma=0.7, radius=int(sys.argv[2]),
+                          bm_range=16, ps_range=7, block_step=4)
+for n in range(4):
+    node.get_frame(n)
+print("TRACE OK")
+'''
+
+_FAULT_SCRIPT = _SUBPROCESS_PRELUDE + r'''
+import threading
+
+
+def build():
+    return core.std.GPUDownload(clip=core.vsfeel.BM3Dv2(
+        gray32(), sigma=0.7, radius=2, bm_range=16, ps_range=7, block_step=4))
+
+
+oracle = build()
+report = {}
+
+# Sequential: frame 0's ring copies never land, then frame 1 needs the same
+# source window its keys advertise. It must fail, not denoise against the stale
+# slot contents.
+node = build()
+try:
+    node.get_frame(0)
+    report["seq0"] = "ok"
+except Exception as exc:
+    report["seq0"] = type(exc).__name__
+try:
+    frame = node.get_frame(1)
+    report["seq1"] = "ok"
+    report["seq1_maxdiff"] = float(np.abs(
+        frame_to_ndarray(frame) - frame_to_ndarray(oracle.get_frame(1))).max())
+except Exception as exc:
+    report["seq1"] = type(exc).__name__
+
+# Concurrent: one thread can reserve the other's slot as a reader before the
+# writer's fault lands; the wait must be released, so the run cannot hang.
+node = build()
+result, got = {}, {}
+gate = threading.Barrier(2)
+
+
+def worker(n):
+    try:
+        gate.wait()
+        got[n] = node.get_frame(n)
+        result[n] = "ok"
+    except Exception as exc:
+        result[n] = type(exc).__name__
+
+
+threads = [threading.Thread(target=worker, args=(n,)) for n in (0, 1)]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join()
+report["con0"], report["con1"] = result.get(0, "missing"), result.get(1, "missing")
+if result.get(1) == "ok":
+    report["con1_maxdiff"] = float(np.abs(
+        frame_to_ndarray(got[1]) - frame_to_ndarray(oracle.get_frame(1))).max())
+print("RESULT " + json.dumps(report))
+'''
+
+
+def _result_payload(stdout):
+    payload = None
+    for line in stdout.splitlines():
+        if line.startswith("RESULT "):
+            payload = json.loads(line[len("RESULT "):])
+    assert payload is not None, stdout[-2000:]
+    return payload
+
+
+def _run_subprocess_script(script, *argv, env=None):
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    run_env = {**os.environ, "MANGOHUD": "0", **(env or {})}
+    return subprocess.run(
+        [sys.executable, "-c", script, tests_dir, *map(str, argv)],
+        capture_output=True, text=True, timeout=600, env=run_env)
+
+
+def test_bm3dv2_radius0_trace_prints_no_false_invariant():
+    """A radius-0 trace must not claim the window tables hold frame -1.
+
+    Radius 0 returns before the window-cache phase, so `res_frame`/`res_ready`
+    keep their creation values; the invariant block used to print "holds frame
+    -1" and "NOT READY" for every radius-0 frame, and read those tables without
+    the cache lock the acquire/publish/wait path takes.
+    """
+    proc = _run_subprocess_script(
+        _TRACE_SCRIPT, 0, env={"VSFEEL_BM3D_TRACE": "1"})
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "TRACE OK" in proc.stdout, proc.stdout[-2000:]
+    assert "NOT READY" not in proc.stderr, proc.stderr[-2000:]
+    assert "holds frame -1" not in proc.stderr, proc.stderr[-2000:]
+    # The trace really ran (otherwise the two absences above are vacuous).
+    assert "submitted" in proc.stderr, proc.stderr[-2000:]
+
+
+def test_bm3dv2_failed_estimation_never_publishes_uncopied_sources():
+    """A frame whose ring copy never landed must not leave the source keys set.
+
+    `VSFEEL_BM3D_FAULT=0` fails frame 0 after `acquire_cache` committed its
+    source keys but before any chunk-0 command buffer, so the copies it
+    promised never happened. A later frame keyed to the same source frame must
+    not block-match against the slot's previous contents or uninitialised VRAM:
+    it has to fail, and a concurrent reader that already reserved the slot must
+    be released rather than block forever on a ready flag that never comes.
+    """
+    proc = _run_subprocess_script(
+        _FAULT_SCRIPT, env={"VSFEEL_BM3D_FAULT": "0"})
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    payload = _result_payload(proc.stdout)
+    assert payload["seq0"] != "ok", payload
+    assert payload["seq1"] != "ok", (
+        f"a later frame denoised against an uncopied source slot: {payload}")
+    assert payload["con0"] != "ok", payload
+    # A concurrent frame that got its own copies in first may finish correctly;
+    # it must never finish on the failed frame's slot.
+    assert payload["con1"] != "ok" or payload["con1_maxdiff"] < 1e-5, payload
 
 
 def test_bm3dv2_nosearch_matches_search_on_constant_clip(monkeypatch):
