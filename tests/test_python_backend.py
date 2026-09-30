@@ -6,6 +6,7 @@ unmodified vs-jetpack wrappers.
 """
 
 import dataclasses
+import threading
 
 import numpy as np
 import pytest
@@ -83,6 +84,45 @@ def test_eedi3h_fallback_matches_native(noise_gray):
     assert np.array_equal(frame_to_ndarray(native.get_frame(0)), frame_to_ndarray(fallback.get_frame(0)))
 
 
+def test_eedi3h_fallback_transposes_aux_clips(noise_16bit):
+    """The no-H fallback transposes sclip and mclip, not just the source.
+
+    Compares the fallback against the native transpose-oracle chain with a
+    distinct 2N-frame sclip and a non-None mclip, frame for frame.
+    """
+    from conftest import half_mask
+
+    clip = noise_16bit
+    # Single-direction interpolation keeps N frames, so the sclip is N-frame
+    # here (the 2N form only exists for the fused double-rate path).
+    sclip = clip.std.Invert()
+    mclip = half_mask(clip, 16)
+    kw = dict(mdis=5, nrad=1, vcheck=2,
+              alpha=0.125, beta=0.25, gamma=40.0,
+              vthresh=(12.0, 24.0, 4.0))
+
+    class _NoH(vsfeel.FeelBackend):
+        supports_h = False
+
+    fallback = cpu_node(EEDI3(backend=_NoH(), **kw).antialias(
+        clip, direction=EEDI3.AADirection.HORIZONTAL,
+        sclip=sclip, mclip=mclip))
+    # The fallback's own shape: transpose everything, run the vertical
+    # interpolation, transpose back. Rebuilt here so that removing either
+    # .std.Transpose() call in FeelBackend.transpose fails the comparison.
+    t = vs.core.std.Transpose(clip)
+    ts = sclip.std.Transpose()
+    tm = mclip.std.Transpose()
+    expect = cpu_node(EEDI3(backend=_backend(), **kw).antialias(
+        t, direction=EEDI3.AADirection.VERTICAL, sclip=ts, mclip=tm))
+    expect = vs.core.std.Transpose(expect)
+    assert fallback.num_frames == expect.num_frames == clip.num_frames
+    for n in (0, 5, clip.num_frames - 1):
+        a = frame_to_ndarray(fallback.get_frame(n), dtype=np.uint16)
+        b = frame_to_ndarray(expect.get_frame(n), dtype=np.uint16)
+        assert np.array_equal(a, b), f"aux-clip fallback mismatch at frame {n}"
+
+
 def test_eedi3aa_subclass_is_a_vsaa_eedi3():
     """vsfeel.EEDI3 is a lazy subclass, so based_aa's isinstance checks pass."""
     assert issubclass(vsfeel.EEDI3, EEDI3)
@@ -154,6 +194,38 @@ def test_eedi3aa_matches_the_two_call_chain(noise_16bit):
         a = frame_to_ndarray(fused.get_frame(n), dtype=np.uint16)
         b = frame_to_ndarray(chain.get_frame(n), dtype=np.uint16)
         assert np.array_equal(a, b), f"fused chain mismatch at frame {n}"
+
+
+def test_eedi3aa_sclip_subframes_are_distinct(noise_16bit):
+    """The fused 2N-frame sclip interleave keeps distinct sub-frames distinct.
+
+    Feeds an N-frame sclip whose content differs from the source (inverted
+    clip) through the wrapper: the wrapper's Interleave([s, s]) doubling must
+    carry that content into both fused sub-frames, exactly like the base
+    class's chain. A wrong doubling (dropped or reordered) fails bit-exactly.
+    """
+    clip = noise_16bit
+    inv = clip.std.Invert()
+    kw = dict(mdis=5, nrad=1, **AA_PARAMS)
+    fused = cpu_node(vsfeel.EEDI3(
+        backend=_backend(), sclip=inv, **kw).antialias(clip))
+    chain = cpu_node(EEDI3(
+        backend=_backend(), sclip=inv, **kw).antialias(clip))
+    assert fused.num_frames == chain.num_frames == clip.num_frames
+    for n in (0, 5, 23):
+        a = frame_to_ndarray(fused.get_frame(n), dtype=np.uint16)
+        b = frame_to_ndarray(chain.get_frame(n), dtype=np.uint16)
+        assert np.array_equal(a, b), f"distinct-sclip mismatch at frame {n}"
+    # The inverted sclip must actually change the output vs no sclip
+    # (sanity that the content is meaningful, not a vacuous equality).
+    plain = cpu_node(vsfeel.EEDI3(
+        backend=_backend(), **kw).antialias(clip))
+    changed = any(
+        not np.array_equal(
+            frame_to_ndarray(fused.get_frame(n), dtype=np.uint16),
+            frame_to_ndarray(plain.get_frame(n), dtype=np.uint16))
+        for n in (0, 5, 23))
+    assert changed, "distinct sclip did not affect the output (test is vacuous)"
 
 
 def test_wrapper_drops_params_the_plugin_rejects(noise_16bit, monkeypatch):
@@ -239,8 +311,7 @@ def test_eedi3aa_fused_path_requires_a_vsfeel_backend(noise_gray, monkeypatch):
     """An explicit CPU or reference backend keeps the base class's chain.
 
     EEDI3AA is vsfeel's fused implementation, so taking it when the caller
-    selected another backend would silently run a different filter. vsaa's
-    ``Backend.FEEL`` resolves to the same vsfeel namespace and stays fused.
+    selected another backend would silently run a different filter.
     """
     import vsaa.deinterlacers as _deinterlacers
 
@@ -255,10 +326,9 @@ def test_eedi3aa_fused_path_requires_a_vsfeel_backend(noise_gray, monkeypatch):
     out = vsfeel.EEDI3(backend=EEDI3.Backend.CPU).antialias(noise_gray)
     assert calls and out is noise_gray, "CPU backend must not take the fused path"
 
-    for backend in (_backend(), EEDI3.Backend.FEEL):
-        calls.clear()
-        vsfeel.EEDI3(backend=backend).antialias(noise_gray)
-        assert not calls, f"{backend} must take the fused path"
+    calls.clear()
+    vsfeel.EEDI3(backend=_backend()).antialias(noise_gray)
+    assert not calls, "vsfeel backend must take the fused path"
 
 
 def test_backend_context_routes_singletons(noise_gray):
@@ -271,5 +341,69 @@ def test_backend_context_routes_singletons(noise_gray):
             bilateral(noise_gray, sigmaS=3.0, sigmaR=0.02)).get_frame(0))).all()
         assert np.isfinite(frame_to_ndarray(cpu_node(
             gauss_blur(noise_gray, 1.5)).get_frame(0))).all()
+    assert bilateral.backend == old_bilateral
+    assert gauss_blur.backend == old_gauss
+
+
+def test_bm3d_wrapper_rejects_chroma(noise_gray):
+    """vsdenoise forces chroma=True on YUV444, which vsfeel cannot honour.
+
+    The wrapper's advertised ``chroma`` parameter must raise instead of
+    silently denoising luma only; chroma=False (and the default) still run.
+    """
+    from vsdenoise import bm3d as _bm3d
+
+    yuv444 = vs.core.resize.Point(noise_gray, format=vs.YUV444PS)
+    with pytest.raises(vs.Error, match="chroma"):
+        _bm3d(yuv444, 0.7, tr=2, profile=_bm3d.Profile.FAST,
+              backend=_backend())
+    # An explicit chroma=False is a vsdenoise-level duplicate (it forces its
+    # own geometry-derived value too), so cover the pass-through at the
+    # wrapper entry point instead: Gray keeps the default path running.
+    out = _bm3d(noise_gray, 0.7, tr=2, profile=_bm3d.Profile.FAST,
+                backend=_backend())
+    assert np.isfinite(frame_to_ndarray(
+        cpu_node(out).get_frame(0))).all()
+
+
+def test_backend_context_is_thread_safe():
+    """Threads serialize on the context instead of cross-restoring.
+
+    The vsrgtools singletons are process-global; without the lock one thread
+    can restore the CPU backend while the other is still inside, leaking
+    vsfeel past the block. Each thread holds the block in turn and must see
+    vsfeel throughout; the defaults must restore afterwards.
+    """
+    old_bilateral, old_gauss = bilateral.backend, gauss_blur.backend
+    errors: list[str] = []
+
+    def worker(i):
+        try:
+            with _backend()():
+                assert bilateral.backend is _backend()
+                assert gauss_blur.backend is _backend()
+        except BaseException as exc:  # noqa: BLE001 — collected below
+            errors.append(f"thread {i}: {type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(15)
+    assert not [t for t in threads if t.is_alive()], "context threads hung"
+    assert not errors, "; ".join(errors)
+    assert bilateral.backend == old_bilateral
+    assert gauss_blur.backend == old_gauss
+
+
+def test_backend_context_nesting_restores_in_order():
+    """Nesting composes: each level restores its own previous value."""
+    old_bilateral, old_gauss = bilateral.backend, gauss_blur.backend
+    outer = vsfeel.FeelBackend()
+    with outer():
+        assert bilateral.backend is outer
+        with _backend()():
+            assert bilateral.backend is _backend()
+        assert bilateral.backend is outer
     assert bilateral.backend == old_bilateral
     assert gauss_blur.backend == old_gauss

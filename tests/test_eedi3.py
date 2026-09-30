@@ -881,6 +881,25 @@ def test_eedi3_sclip_dh_requires_doubled_height(noise_16bit):
     assert payload["maxdiff"] == 0, "dh sclip mismatch"
 
 
+def test_eedi3_compat_args_are_accepted_noops(noise_16bit):
+    """eedi3m/eedi3vk2/vsaa compat args are registered and byte-identical.
+
+    ``opt`` (eedi3m SIMD level), ``hp`` (eedi3vk2 half-pel), ``ucubic`` and
+    ``cost3`` (deprecated vsaa) all select behaviour vsfeel always runs
+    (AVX2-class path, full-pel search, cubic fill, three-window costs), so
+    any value must reproduce the default output exactly.
+    """
+    base = dict(field=1, mdis=5, nrad=1, vcheck=2)
+    ref = [_plane(_run(noise_16bit, **base).get_frame(n), 0, WIDTH, HEIGHT,
+                  np.uint16) for n in (0, 11)]
+    for kw in ({"opt": 0}, {"opt": 3}, {"hp": 0}, {"hp": 1},
+               {"ucubic": 0}, {"ucubic": 1}, {"cost3": 0}, {"cost3": 1}):
+        out = _run(noise_16bit, **base, **kw)
+        for n, want in zip((0, 11), ref):
+            got = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
+            assert np.array_equal(got, want), f"{kw} changed frame {n}"
+
+
 def test_eedi3_sclip_content_matches_vk2(noise_16bit):
     """sclip is the vcheck reference: with vcheck > 0 the output must use the
     sclip content (shifted noise, never equal to the vertical cubic) exactly

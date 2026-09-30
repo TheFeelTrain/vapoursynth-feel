@@ -1705,8 +1705,15 @@ static void vsfeel_eedi3_create(
     float vthresh1 = get_float("vthresh1", 64.0f);
     d->vthresh2 = get_float("vthresh2", 4.0f);
 
-    // opt accepted for eedi3m parity but ignored (GPU is always AVX2-class)
+    // Compat no-ops (registered like the other legacy args, never read):
+    // eedi3m's `opt` (SIMD level; the GPU path is always AVX2-class),
+    // eedi3vk2's `hp` (half-pel search; vsfeel always runs the full-pel
+    // family-A search), and the deprecated vsaa `ucubic`/`cost3` (vsfeel
+    // always runs cubic fill + three-window costs, i.e. both on).
     (void)get_int("opt", 0);
+    (void)get_int("hp", 0);
+    (void)get_int("ucubic", 1);
+    (void)get_int("cost3", 1);
 
     if (d->field < 0 || d->field > 3) {
         return set_error("field must be 0, 1, 2, or 3");
@@ -2443,6 +2450,10 @@ void vsfeel_register_eedi3(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
         "gamma:float:opt;"
         "nrad:int:opt;"
         "mdis:int:opt;"
+        "hp:int:opt;"
+        "ucubic:int:opt;"
+        "cost3:int:opt;"
+        "opt:int:opt;"
         "vcheck:int:opt;"
         "vthresh0:float:opt;"
         "vthresh1:float:opt;"

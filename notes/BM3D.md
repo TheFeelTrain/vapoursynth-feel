@@ -100,6 +100,10 @@ three interleaved A/B runs against the raw-submit build -- see Historical.
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **The vs-jetpack wrapper rejects `chroma=True`.** The plugin denoises luma
+  only and passes chroma through, but the wrapper advertised `chroma` and
+  dropped it, so vsdenoise's forced `chroma=True` on YUV444 silently ran the
+  luma path. The wrapper now raises on `chroma=True`; no perf change.
 - **The CAS fallback's retry bound was below what the kernel can contend.**
   `res_add`'s compare-exchange loop is capped so a stuck retry cannot reset the
   device (the reference's unbounded `do/while`); one res element receives at most

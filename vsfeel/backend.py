@@ -7,6 +7,7 @@ see the package docstring in ``__init__.py`` for usage examples.
 from __future__ import annotations
 
 import inspect
+import threading
 from collections.abc import Generator, MutableMapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Self
@@ -15,6 +16,13 @@ if TYPE_CHECKING:
     import vapoursynth as vs
 
 __all__ = ["Backend", "FeelBackend"]
+
+# Serializes the context manager below: the vsrgtools singletons are
+# process-global, so two threads swapping them at once would cross-restore
+# (A restores CPU while B is still inside, B then restores the value it
+# captured and leaks vsfeel past the block). RLock keeps same-thread
+# nesting working.
+_backend_lock = threading.RLock()
 
 
 def _drop_unsupported(func: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -34,8 +42,10 @@ class _FeelBM3DPlugin:
     """Stand-in for the ``core.vsfeel`` plugin surface.
 
     Exposes ``BM3Dv2`` with a signature extended by the parameters other
-    BM3Dv2 plugins accept (``chroma``, ...); arguments vsfeel does not support
-    are silently dropped before calling the real function.
+    BM3Dv2 plugins accept (``chroma``, ...). vsfeel denoises luma only and
+    passes chroma through (see the plugin's own chroma-passthrough test), so
+    a ``chroma=True`` request cannot be honoured and is rejected instead of
+    being silently dropped before calling the real function.
     """
 
     def __init__(self) -> None:
@@ -46,6 +56,15 @@ class _FeelBM3DPlugin:
         chroma = inspect.Parameter("chroma", inspect.Parameter.KEYWORD_ONLY, default=False)
 
         def bm3d_v2(*args: Any, **kwargs: Any) -> vs.VideoNode:
+            # vsdenoise passes chroma twice (once in its own kwargs, once
+            # forced from the clip geometry), so pop it before the duplicate
+            # becomes a TypeError.
+            chroma = kwargs.pop("chroma", False)
+            if chroma:
+                raise vs.Error(
+                    "core.vsfeel.BM3Dv2 does not support chroma=True "
+                    "(luma only, chroma passes through unprocessed)"
+                )
             return func(*args, **_drop_unsupported(func, kwargs))
 
         bm3d_v2.__signature__ = sig.replace(parameters=[*sig.parameters.values(), chroma])  # type: ignore[attr-defined]
@@ -208,7 +227,9 @@ class FeelBackend:
         Implementation note: the singletons validate assignments through a
         ``Backend(value)`` enum constructor that rejects foreign objects,
         so this writes their ``_backend`` slots directly instead of going
-        through the property setters.
+        through the property setters. The swap is serialized on a
+        module-level RLock, so threads entering the block nest instead of
+        interleaving snapshots.
         """
         targets: list[Any] = []
         if bilateral:
@@ -225,14 +246,15 @@ class FeelBackend:
                 targets.append(_gauss_blur)
             except ImportError:
                 pass
-        saved = [fn._backend for fn in targets]
-        for fn in targets:
-            fn._backend = self
-        try:
-            yield self
-        finally:
-            for fn, old in zip(targets, saved):
-                fn._backend = old
+        with _backend_lock:
+            saved = [fn._backend for fn in targets]
+            for fn in targets:
+                fn._backend = self
+            try:
+                yield self
+            finally:
+                for fn, old in zip(targets, saved):
+                    fn._backend = old
 
 
 Backend = FeelBackend()

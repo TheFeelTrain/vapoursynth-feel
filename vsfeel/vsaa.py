@@ -75,9 +75,9 @@ def _feel_backend(backend: Any) -> bool:
     """Whether ``backend`` routes EEDI3 to the vsfeel plugin.
 
     The fused ``EEDI3AA`` call is only the vsfeel backend's chain: a CPU or
-    reference backend must keep the base class's two-pass implementation. Both
-    vsfeel's own backend objects and vsaa's ``Backend.FEEL`` member carry the
-    ``vsfeel`` namespace as their ``value``.
+    reference backend must keep the base class's two-pass implementation.
+    vsfeel's own backend objects carry the ``vsfeel`` namespace as their
+    ``value``.
     """
     return getattr(backend, "value", None) == _FeelBackend.value
 

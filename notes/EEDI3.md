@@ -171,6 +171,11 @@ identical everywhere):
 
 ## Historical
 
+- **Compat args `opt`/`hp`/`ucubic`/`cost3` are registered accepted no-ops.**
+  They select behaviour vsfeel always runs (AVX2-class path, full-pel
+  family-A search, cubic fill, three-window costs), so any value is
+  byte-identical to the default (`test_eedi3_compat_args_are_accepted_noops`).
+  `hp` used to fail dispatch (vsaa forwards it); no perf change.
 - **Undefined packed-pbt read in the K=2 DP loop.** The paired predecessor byte
   was stored during the per-direction loop and read the not-yet-initialized
   second delta; the write now follows both delta calculations. No perf change.
