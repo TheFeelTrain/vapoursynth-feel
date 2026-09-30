@@ -25,6 +25,7 @@ from vsaa.deinterlacers import Deinterlacer
 from vstools import VSFunctionAllArgs, VSFunctionNoArgs, core
 
 from .backend import Backend as _FeelBackend
+from .backend import _drop_unsupported
 
 _AADirection = _VsaaEEDI3.AADirection
 
@@ -124,13 +125,14 @@ class EEDI3(_VsaaEEDI3):
 
             tff = fallback(args.pop("tff", self.tff), True)
 
-            return core.vsfeel.EEDI3AA(
+            func = core.vsfeel.EEDI3AA
+            return func(
                 clip,
                 tff + 2,
                 dh=False,
                 sclip=sclip,
                 mclip=mclip,
-                **args,
+                **_drop_unsupported(func, args),
             )
 
         return super().antialias(clip, direction=direction, **kwargs)

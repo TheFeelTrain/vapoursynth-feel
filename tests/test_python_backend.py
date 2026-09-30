@@ -156,6 +156,29 @@ def test_eedi3aa_matches_the_two_call_chain(noise_16bit):
         assert np.array_equal(a, b), f"fused chain mismatch at frame {n}"
 
 
+def test_wrapper_drops_params_the_plugin_rejects(noise_16bit, monkeypatch):
+    """vs-jetpack forwards parameters vsfeel's EEDI3 entry points never declare.
+
+    Recent vsaa emits ``hp`` from ``get_deint_args``; VapourSynth rejects an
+    unknown keyword before dispatch, so the fused and the chain path must both
+    filter it out instead of failing to build.
+    """
+    import vsaa.deinterlacers as _deinterlacers
+
+    real = _deinterlacers.EEDI3.get_deint_args
+
+    def with_hp(self, **kwargs):
+        return real(self, **kwargs) | {"hp": False}
+
+    monkeypatch.setattr(_deinterlacers.EEDI3, "get_deint_args", with_hp)
+
+    fused = cpu_node(vsfeel.EEDI3(**AA_PARAMS).antialias(noise_16bit))
+    chain = cpu_node(EEDI3(backend=_backend(), **AA_PARAMS).antialias(noise_16bit))
+
+    for out in (fused, chain):
+        assert np.isfinite(frame_to_ndarray(out.get_frame(0), dtype=np.uint16)).all()
+
+
 def test_eedi3aa_falls_back_for_non_both(noise_16bit):
     """direction != BOTH keeps the base class's single-direction path."""
     fused = cpu_node(vsfeel.EEDI3(backend=_backend(), **AA_PARAMS).antialias(

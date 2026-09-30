@@ -17,6 +17,19 @@ if TYPE_CHECKING:
 __all__ = ["Backend", "FeelBackend"]
 
 
+def _drop_unsupported(func: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return ``kwargs`` without the keys ``func`` does not declare.
+
+    vs-jetpack forwards its own parameters (recent releases send ``hp`` to
+    EEDI3) and VapourSynth rejects unknown keywords before dispatch, so the
+    plugin's signature is the only reliable filter.
+    """
+    signature = getattr(func, "__signature__", None)
+    if signature is None:
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in signature.parameters}
+
+
 class _FeelBM3DPlugin:
     """Stand-in for the ``core.vsfeel`` plugin surface.
 
@@ -29,12 +42,11 @@ class _FeelBM3DPlugin:
         import vapoursynth as vs
 
         func = vs.core.vsfeel.BM3Dv2
-        accepted = frozenset(func.__signature__.parameters)
         sig = func.__signature__
         chroma = inspect.Parameter("chroma", inspect.Parameter.KEYWORD_ONLY, default=False)
 
         def bm3d_v2(*args: Any, **kwargs: Any) -> vs.VideoNode:
-            return func(*args, **{k: v for k, v in kwargs.items() if k in accepted})
+            return func(*args, **_drop_unsupported(func, kwargs))
 
         bm3d_v2.__signature__ = sig.replace(parameters=[*sig.parameters.values(), chroma])  # type: ignore[attr-defined]
         self.BM3Dv2 = bm3d_v2
@@ -101,7 +113,8 @@ class FeelBackend:
         return self
 
     def _dispatch(self, func: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> vs.VideoNode:
-        return getattr(args[0].vsfeel, func)(*args[1:], **kwargs)
+        plugin_func = getattr(args[0].vsfeel, func)
+        return plugin_func(*args[1:], **_drop_unsupported(plugin_func, kwargs))
 
     def Bilateral(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:  # noqa: N802
         return self._dispatch("Bilateral", (clip, *args), kwargs)

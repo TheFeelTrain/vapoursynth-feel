@@ -195,6 +195,12 @@ under-reported every stage 10x).
   sub-pass; each plane now reads its own `cfg.o0_bytes`. Measured 1229 codes off
   the chain at 16-bit, `planes=[1]`, mdis=5, nrad=1, frame 0 of the noise clip,
   before the fix. No perf change.
+- **2026-09-29 — the wrappers drop parameters the plugin never declared.**
+  vs-jetpack's EEDI3 dataclass forwards `hp`, which
+  `core.vsfeel.EEDI3`/`EEDI3H`/`EEDI3AA` do not register, so VapourSynth rejected
+  the call before dispatch and every wrapper path failed to build.
+  `FeelBackend._dispatch` and the fused path now filter kwargs against the
+  plugin's own `__signature__` (`vsfeel/backend.py`). No perf change.
 
 ## Open work
 
@@ -248,5 +254,6 @@ the fused merge vs the chain); odd processed-plane width and odd subsampled
 chroma width rejected; determinism, multi-stream and parallel load; props
 (N frames, input fps, `_FieldBased` progressive) vs the chain; input validation.
 `tests/test_python_backend.py` adds the wrapper cases (fused == chain, the
-`direction != BOTH` fallback, backend selection, odd-geometry fallback). Whole
-suite **763 passed** via `tools/test.sh`.
+`direction != BOTH` fallback, backend selection, odd-geometry fallback,
+forwarded parameters the plugin does not declare). Whole
+suite **764 passed** via `tools/test.sh`.
