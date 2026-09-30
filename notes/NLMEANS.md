@@ -144,6 +144,18 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 - **Boundary/rclip fixes**: the guide half's slot table used the full-window
   stride when `n < d` and read past the vector (fixed key offset), and holder
   identity is a per-reservation token, not a frame index.
+- **Validation hardening (no perf change).** `h` is rejected unless finite and
+  > 0: `+Inf` drove `h2_inv_norm` to 0 and turned the filter into a plain box
+  mean where the reference errors. `VSFEEL_NLMEANS_PACK` and the ring-budget
+  default are clamped so the weight dispatch's Z — one table row per sweep
+  entry, two when the temporal offset is non-zero, so up to `2*qb*pack` — fits
+  `maxComputeWorkGroupCount[2]`; a tiny frame could pass the guaranteed 65535 on
+  the default alone. The unreachable `any_process` early return is gone (every
+  plane0/channels combination processes at least one plane).
+- **GPU-trace stage labels.** The probe wrote three stamps per round but the
+  summary consumed two, so "weight"/"acc" rotated over weight, acc and the
+  inter-round gap and the batch count printed 1.5× the rounds. It now consumes
+  three (weight start/end, accum end) and reports the gap separately.
 
 ## Open work
 
@@ -188,7 +200,8 @@ Flags are `VSFEEL_NLMEANS_<FLAG>`.
 
 - `VSFEEL_NLMEANS_TIMING=1` — per-frame host stage split (acquire/record/submit).
 - `VSFEEL_NLMEANS_GPUTRACE=1[,frame]` — one-shot per-batch GPU timestamps.
-- `VSFEEL_NLMEANS_PACK=N` — entries per W/A round (clamped 1..16384; default
-  from the 64 MiB ring budget, itself capped by the core's VRAM limit).
+- `VSFEEL_NLMEANS_PACK=N` — entries per W/A round (clamped 1..16384, and so the
+  weight dispatch's Z fits the device's group-count limit; default from the
+  64 MiB ring budget, itself capped by the core's VRAM limit).
 - `VSFEEL_NLMEANS_VRAM=1` — creation banner with ring/window/per-frame bytes.
 - `VSFEEL_DEBUG`/`VSFEEL_TRACE` and `RADV_DEBUG=asm|shaderstats` as elsewhere.

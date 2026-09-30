@@ -86,10 +86,11 @@ constexpr int BLK_X = 32;
 constexpr int BLK_Y = 8;
 constexpr int VRT_RESULT = 3;
 
-// GPU-trace timestamp pool size: slots 0..3 fixed, then one pair per
-// weight+acc batch.
+// GPU-trace timestamp pool size: slot 0 is the frame start, then three stamps
+// per weight+acc round (weight start, weight end, accumulation end).
 constexpr uint32_t NLMEANS_TS_MAX = 130;
-constexpr uint32_t NLMEANS_TS_RESERVED = 4;
+constexpr uint32_t NLMEANS_TS_RESERVED = 1;
+constexpr uint32_t NLMEANS_TS_PER_ROUND = 3;
 
 // One sweep-table variant per reachable temporal boundary count m=min(d, n).
 struct Variant {
@@ -270,9 +271,8 @@ static const VSFrame * nlmeans_gpu_frame(
     }
     const VSFrame * center = frames[d->d];
 
-    bool any_process = false, all_process = true;
+    bool all_process = true;
     for (int p = 0; p < numPlanes; ++p) {
-        any_process |= d->process[p];
         all_process &= d->process[p];
     }
 
@@ -306,13 +306,6 @@ static const VSFrame * nlmeans_gpu_frame(
         vsapi->setFilterError("NLMeans: failed to allocate the output frame", frameCtx);
         cleanup_frames();
         return nullptr;
-    }
-
-    // Nothing to run: every plane shares from the center frame, so the frame is
-    // already complete and an empty submission would only cost a round trip.
-    if (!any_process) {
-        cleanup_frames();
-        return dst;
     }
 
     auto t0 = d->host_timing ? std::chrono::steady_clock::now()
@@ -477,7 +470,10 @@ static const VSFrame * nlmeans_gpu_frame(
         const uint32_t p1 = v.w_boff[bi + 1];
 
         if (gputrace && ts_used < NLMEANS_TS_MAX) {
-            d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+            // COMPUTE_SHADER, not TOP_OF_PIPE: gpu_barrier only names the
+            // compute stage, so a top-of-pipe stamp is free to be taken before
+            // the previous round's accumulation retires.
+            d->gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                 d->ts_query, ts_used++);
         }
         {
@@ -580,21 +576,34 @@ static const VSFrame * nlmeans_gpu_frame(
                 return static_cast<double>(b - a) * period / 1000.0;
             };
             const uint64_t * ts = d->ts_map;
-            double sum_w = 0.0, sum_a = 0.0, first_w = 0.0, first_a = 0.0;
+            double sum_w = 0.0, sum_a = 0.0, sum_gap = 0.0;
+            double first_w = 0.0, first_a = 0.0, first_gap = 0.0;
             uint32_t nw = 0;
             uint64_t prev = ts[0];
-            for (uint32_t s = NLMEANS_TS_RESERVED; s + 1 < ts_used; s += 2) {
-                const double w = us(prev, ts[s]);
-                const double a = us(ts[s], ts[s + 1]);
-                if (s == NLMEANS_TS_RESERVED) { first_w = w; first_a = a; }
-                else { sum_w += w; sum_a += a; ++nw; }
-                prev = ts[s + 1];
+            for (uint32_t s = NLMEANS_TS_RESERVED; s + NLMEANS_TS_PER_ROUND - 1 < ts_used;
+                 s += NLMEANS_TS_PER_ROUND) {
+                const double gap = us(prev, ts[s]);
+                const double w = us(ts[s], ts[s + 1]);
+                const double a = us(ts[s + 1], ts[s + 2]);
+                if (s == NLMEANS_TS_RESERVED) {
+                    first_gap = gap;
+                    first_w = w;
+                    first_a = a;
+                } else {
+                    sum_gap += gap;
+                    sum_w += w;
+                    sum_a += a;
+                    ++nw;
+                }
+                prev = ts[s + 2];
             }
+            const uint32_t rounds = (ts_used - NLMEANS_TS_RESERVED) / NLMEANS_TS_PER_ROUND;
             fprintf(stderr,
-                "[nlmeans-gpu] n=%d batches=%u total=%.1fus first w=%.1f a=%.1f "
-                "rest_avg w=%.1f a=%.1f\n",
-                n, (ts_used - NLMEANS_TS_RESERVED) / 2, us(ts[0], prev),
-                first_w, first_a, nw ? sum_w / nw : 0.0, nw ? sum_a / nw : 0.0);
+                "[nlmeans-gpu] n=%d batches=%u total=%.1fus first gap=%.1f w=%.1f a=%.1f "
+                "rest_avg gap=%.1f w=%.1f a=%.1f\n",
+                n, rounds, us(ts[0], prev), first_gap, first_w, first_a,
+                nw ? sum_gap / nw : 0.0, nw ? sum_w / nw : 0.0,
+                nw ? sum_a / nw : 0.0);
         } else {
             fprintf(stderr, "[nlmeans-gpu] probe wait failed: %s\n", perr);
         }
@@ -723,8 +732,10 @@ static void VS_CC NLMeansCreate(
     if (error) {
         d->h_param = 1.2f;
     }
-    if (!(d->h_param > 0.0f)) {
-        return set_error("h must be > 0.");
+    // +Inf would make h2_inv_norm 0 and the filter an unweighted box mean; the
+    // reference rejects every non-finite h.
+    if (!std::isfinite(d->h_param) || d->h_param <= 0.0f) {
+        return set_error("h must be finite and > 0.");
     }
 
     d->wmode = vsh::int64ToIntS(vsapi->mapGetInt(in, "wmode", 0, &error));
@@ -863,11 +874,19 @@ static void VS_CC NLMeansCreate(
         }
         d->ring_budget = ring_budget;
         int64_t pack = ring_budget / std::max<int64_t>(bytes_per_pack, 1);
-        pack = std::clamp<int64_t>(pack, 1, 16384);
         const int pack_env = env_int("VSFEEL_NLMEANS_PACK", 0);
         if (pack_env > 0) {
-            pack = std::clamp<int64_t>(pack_env, 1, 16384);
+            pack = pack_env;
         }
+        // A dispatch may not exceed maxComputeWorkGroupCount[2] and the weight
+        // dispatch's Z is the batch's row count, one or two rows per sweep entry
+        // (two whenever the temporal offset is non-zero). Vulkan guarantees at
+        // least 65535 there, so at least one entry always fits.
+        const int64_t rows_per_entry = (dd == 0) ? 1 : 2;
+        const int64_t z_limit = std::max<int64_t>(
+            static_cast<int64_t>(d->gpu->limits.maxComputeWorkGroupCount[2]) /
+                (rows_per_entry * d->qb), 1);
+        pack = std::clamp<int64_t>(pack, 1, std::min<int64_t>(16384, z_limit));
         d->pack = static_cast<uint32_t>(pack);
     }
     d->slots = ((dd == 0) ? d->qb : 2 * d->qb) * static_cast<int>(d->pack);

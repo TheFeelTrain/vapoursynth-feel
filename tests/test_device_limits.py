@@ -241,6 +241,32 @@ def test_nlmeans_ring_is_capped_by_the_vram_budget():
     assert ring2 <= max(budget2, ring2 / pack2) + 1e-6
 
 
+def test_nlmeans_pack_is_capped_by_the_grid_z_limit():
+    """The weight dispatch's Z is a batch's row count: one or two per entry.
+
+    A batch of ``qb*pack`` sweep entries dispatches one workgroup per table row
+    and every entry with a non-zero temporal offset emits two, so ``pack`` has
+    to yield to ``maxComputeWorkGroupCount[2]`` rather than dispatch an invalid
+    grid. The default already fits the guaranteed 65535; the forced limit here
+    (640x360, d=3 -> qb=8) is well below it, so the banner must show the clamp
+    and the frame must still evaluate.
+    """
+    rows_per_entry = 2          # d=3: every kk != 0 entry emits a +q and a -q row
+    qb = 8                      # 640x360 is under the qb=8 threshold
+    z_limit = 16
+
+    _, _, pack = _nlmeans_ring(_trace("nlmeans"))
+    assert pack * rows_per_entry * qb <= 65535, pack
+
+    force = {"VSFEEL_LIMIT_GRID_Z": str(z_limit), "VSFEEL_NLMEANS_PACK": "16384"}
+    _, _, capped = _nlmeans_ring(_trace("nlmeans", force))
+    assert capped == z_limit // (rows_per_entry * qb), capped
+
+    # Creation alone cannot see an over-limit dispatch; the frame run must.
+    res = _run_limits([{"label": "nlmeans", "filter": "nlmeans"}], force)
+    assert res["nlmeans"].get("finite") is True, res["nlmeans"]
+
+
 # ---------------------------------------------------------------------------
 # GaussBlur: the fused path's tile vs the guaranteed workgroup memory
 # ---------------------------------------------------------------------------

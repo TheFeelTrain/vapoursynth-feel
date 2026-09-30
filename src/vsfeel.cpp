@@ -371,6 +371,10 @@ std::variant<std::shared_ptr<GPUDevice>, std::string> get_gpu_device(
         static_cast<uint32_t>(cap) < dev->limits.maxComputeWorkGroupCount[1]) {
         dev->limits.maxComputeWorkGroupCount[1] = static_cast<uint32_t>(cap);
     }
+    if (const int cap = env_int("VSFEEL_LIMIT_GRID_Z", 0); cap > 0 &&
+        static_cast<uint32_t>(cap) < dev->limits.maxComputeWorkGroupCount[2]) {
+        dev->limits.maxComputeWorkGroupCount[2] = static_cast<uint32_t>(cap);
+    }
     if (const int cap = env_int("VSFEEL_LIMIT_STORAGE_RANGE", 0); cap > 0 &&
         static_cast<uint32_t>(cap) < dev->limits.maxStorageBufferRange) {
         dev->limits.maxStorageBufferRange = static_cast<uint32_t>(cap);
