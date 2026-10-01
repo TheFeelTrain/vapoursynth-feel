@@ -83,7 +83,7 @@ jobs:
       run: |
         python3 -m venv .venv
         .venv/bin/pip install --upgrade pip
-        .venv/bin/pip install pytest "vapoursynth>=80"
+        .venv/bin/pip install pytest numpy "vapoursynth>=80"
 
     - name: GPU-less tests
       # The version test needs the installed GPU plugin, so it stays local;
