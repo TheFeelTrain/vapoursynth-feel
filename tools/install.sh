@@ -5,6 +5,9 @@
 # by hand: a failed compile used to be indistinguishable from a successful one,
 # and the notes record a phantom bug traced to a stale .spv shipped that way.
 #
+# Run `uv sync` first: the plugin is built against the project venv's VapourSynth
+# headers and installed into that venv's plugin directory.
+#
 # Usage: tools/install.sh [-b BUILD_DIR] [-p PLUGIN_DIR] [-c BUILD_TYPE]
 #
 set -euo pipefail
@@ -18,12 +21,28 @@ build_dir=${VSFEEL_BUILD_DIR:-$root_dir/build}
 plugin_dir=${VSFEEL_PLUGIN_DIR:-}
 build_type=Release
 
+# The uv venv (`uv sync`) supplies the VapourSynth the plugin is built against
+# and installed into: its headers pin the API level, and get_plugin_dir() is the
+# venv's own plugin directory, so a build never lands in the system tree or
+# links against a different VapourSynth release. VSFEEL_PYTHON overrides it.
+py=${VSFEEL_PYTHON:-}
+if [[ -z $py ]]; then
+    if [[ -x $root_dir/.venv/bin/python ]]; then
+        py=$root_dir/.venv/bin/python
+    else
+        py=python3
+        printf 'install.sh: no .venv; falling back to %s (run `uv sync` first)\n' \
+            "$(command -v python3)" >&2
+    fi
+fi
+
 usage() {
     cat <<EOF
 usage: tools/install.sh [-b DIR] [-p DIR] [-c TYPE]
   -b DIR   build directory (default: $build_dir; env VSFEEL_BUILD_DIR)
   -p DIR   VapourSynth plugin root (default: autodetected; env VSFEEL_PLUGIN_DIR)
   -c TYPE  CMake build type (default: $build_type)
+  interpreter: $py (env VSFEEL_PYTHON; default: the project .venv)
 EOF
 }
 
@@ -41,10 +60,16 @@ done
 # Ask the module that will actually load the plugin where its plugins live, so a
 # venv or a differently-versioned Python cannot install into the wrong tree.
 if [[ -z $plugin_dir ]]; then
-    plugin_dir=$(python3 -c 'import vapoursynth as vs; print(vs.get_plugin_dir())') \
-        || die "cannot import vapoursynth; pass -p DIR or set VSFEEL_PLUGIN_DIR"
+    plugin_dir=$("$py" -c 'import vapoursynth as vs; print(vs.get_plugin_dir())') \
+        || die "cannot import vapoursynth from $py; pass -p DIR or set VSFEEL_PLUGIN_DIR"
 fi
 [[ -n $plugin_dir ]] || die "autodetected an empty plugin directory"
+
+# The same interpreter's headers, passed explicitly so CMake cannot pick up a
+# distribution pkg-config file instead (see the VS_INCLUDE_DIR branch there).
+vs_include=$("$py" -c 'import os, vapoursynth as vs; print(os.path.join(os.path.dirname(vs.__file__), "include"))') \
+    || die "cannot locate VapourSynth headers from $py"
+[[ -f $vs_include/VapourSynth4.h ]] || die "no VapourSynth4.h under $vs_include"
 
 # CMake spells the library per platform (libvsfeel.so / libvsfeel.dylib); the
 # manifest names it without an extension, so only the file names differ here.
@@ -69,9 +94,13 @@ hash_file() {
 echo "==> configure $root_dir in $build_dir ($build_type)"
 # CMAKE_EXPORT_COMPILE_COMMANDS stays on: tools/lint.sh's tidy/cppcheck gates
 # read build/compile_commands.json, and this script is the documented remedy
-# when it is missing.
+# when it is missing. Python3_EXECUTABLE and VS_INCLUDE_DIR pin the build to the
+# venv interpreter and its VapourSynth headers rather than whatever CMake and
+# pkg-config find on PATH.
 cmake -S "$root_dir" -B "$build_dir" -D "CMAKE_BUILD_TYPE=$build_type" \
-    -D CMAKE_EXPORT_COMPILE_COMMANDS=ON
+    -D CMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -D "Python3_EXECUTABLE=$py" \
+    -D "VS_INCLUDE_DIR=$vs_include"
 
 echo "==> build"
 cmake --build "$build_dir" --config "$build_type"

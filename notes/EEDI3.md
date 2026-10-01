@@ -687,7 +687,7 @@ the reason a variant failed, not as a current number.
   `queues=4`; at 900 it was a tie (clock ramp).
 - **Effects under ~5% are not measurable on this box** (round 20's bimodal state —
   not clocks, thermals, host CPU or harness memory). Grade the median per-pair ratio
-  over >=5 order-reversed 2000-frame pairs (`tmp/probeab.py`, `tmp/probeabaa.py`);
+  over >=5 order-reversed 2000-frame pairs (`.scratch/probeab.py`, `.scratch/probeabaa.py`);
   treat a single-pair <5% claim as unproven. The vertical arm is *not* less noisy than
   EEDI3AA — it looked stable for an hour, then swung 20%.
 - **Never compare a number recorded in a different command.** The same committed

@@ -51,6 +51,25 @@ docstrings are a few lines at most. Notes files (`notes/<filter>.md`) may be
 longer, but do not pad them. Never cite work-order or report IDs (`WO-55`,
 `§I.11`, `T9`) in code, comments, docstrings or notes.
 
+## Environment (uv)
+
+The dev environment is the project venv, not the system Python or the system
+VapourSynth: `uv sync` builds `.venv` from `uv.lock` and `.python-version` (a
+uv-managed CPython), and `tools/install.sh` installs the plugin into that venv's
+plugin directory. The core is pinned to the `vapoursynth==81rc1` pre-release in
+the `dev` group (the R81 changes move the benchmark; the published requirement
+stays `vapoursynth>=80`). The `dev` group also supplies pytest/xdist, numpy,
+vsjetpack and the reference plugins the suite and the benchmark compare against
+(`vszipcl` from git plus `fmtconv` from JET's vs-wheels index, `eedi3vk2`, 
+`nnedi3vk`, `bm3dvk`, `nlm_hip`, `knlmmeansvk`, `zsmooth`, `bestsource`, 
+`edgemasks`, `resize2`, `descale`). `uv sync --group lint` adds the pinned 
+clang-format/clang-tidy/ruff. Never `pip install` into this tree, and never rely 
+on a system plugin being visible. `tools/*.sh` and `uv run` pick the venv up on 
+their own. One-time per venv, run `.venv/bin/vapoursynth config`: the wheel's 
+`vspipe` embeds CPython through VSScript, whose autodetection cannot find a 
+`libpython` for uv's statically linked CPython, and the registration is what 
+makes the benchmark and the vspipe hang tests work.
+
 ## Testing
 
 Every filter needs **comprehensive unit tests** in `tests/`, run with pytest.
@@ -63,7 +82,7 @@ standard test input.
 - The `tests/` folder has `conftest.py` with shared fixtures/helpers
   (`WIDTH`, `HEIGHT`, `NOISE_MKV`, `frame_to_ndarray`, ...).
 - Always run the full test suite for the filter you touch before and after
-  changes: `python -m pytest tests/test_<filter>.py -q`.
+  changes: `tools/test.sh tests/test_<filter>.py -q`.
 - Run the whole suite with **`tools/test.sh`** (extra args are passed through,
   default target `tests`). It uses pytest-xdist (`dev` dependency group) with
   `--dist loadfile` and caps workers at 8. Do not raise the cap and
@@ -98,9 +117,9 @@ runs it. Plugins are described separately in `PLUGINS`.
 - Timing is done with `vspipe`, so results are comparable across plugins and
   with the earlier per-plugin scripts.
 - Usage:
-  - `python3 tools/benchmark.py` — all filters
-  - `python3 tools/benchmark.py --filter <name>` — one filter
-  - `python3 tools/benchmark.py --filter <name> vsfeel vszipcl` — a subset of
+  - `uv run tools/benchmark.py` — all filters
+  - `uv run tools/benchmark.py --filter <name>` — one filter
+  - `uv run tools/benchmark.py --filter <name> vsfeel vszipcl` — a subset of
     plugins, to compare against references
   - `--frames N`, `--clip PATH` to control the run
 - The default clip is `/home/encode/test/jpbd.mkv` (1920x1080, YUV420P8).
@@ -114,7 +133,7 @@ runs it. Plugins are described separately in `PLUGINS`.
 To benchmark a single filter against the references:
 
 ```bash
-python3 tools/benchmark.py --filter dfttest vsfeel vszipcl
+uv run tools/benchmark.py --filter dfttest vsfeel vszipcl
 ```
 
 This prints fps for each plugin and ranks them. Compare vsfeel's fps against
@@ -493,6 +512,7 @@ invisible to VapourSynth, so the tests and the benchmark quietly keep exercising
 the previous binary.
 
 ```bash
+uv sync                          # create/refresh the venv (first time, and after dependency changes)
 tools/install.sh                 # configure + build + install, then hash-verify
 tools/install.sh -h              # -b build dir, -p plugin dir, -c build type
 ```
@@ -501,8 +521,11 @@ That one command configures `build/` (Release) with CMake + `glslc` (the Vulkan
 shader compiler), compiles the plugin, copies `libvsfeel.so` into
 VapourSynth's plugin directory, and **fails unless the installed copy's sha256
 equals the build's**. It asks `vapoursynth.get_plugin_dir()` where the running
-Python loads plugins from, so a venv installs into the venv;
-`VSFEEL_BUILD_DIR` and `VSFEEL_PLUGIN_DIR` override the autodetection. A run
+Python loads plugins from, so the project venv installs into the venv's plugin
+directory (the system tree is never touched); its headers are passed explicitly
+as `VS_INCLUDE_DIR` so the build cannot pick up a distribution `pkg-config` file
+for a different VapourSynth release instead. `VSFEEL_PYTHON` overrides the
+interpreter, `VSFEEL_BUILD_DIR` and `VSFEEL_PLUGIN_DIR` the autodetection. A run
 whose plugin directory already matches the build is a no-op.
 
 The bare CMake rules are only for a compile-only check that must not touch the
@@ -587,7 +610,10 @@ run after a driver or `glslc` update pays the compile again by design.
 ## Code quality (lint)
 
 `tools/lint.sh` is the single entry point, and CI runs exactly it
-(`.github/workflows/lint.yml`). Five gates:
+(`.github/workflows/lint.yml`). The pinned clang-format/clang-tidy/ruff come
+from the `lint` dependency group (`uv sync --group lint`), and the script puts
+`.venv/bin` first on `PATH`, so a local run and CI use the same versions.
+Five gates:
 
 - **format** — `clang-format --dry-run --Werror` over `src/*.cpp` and `src/*.h`
   (`.clang-format`); `tools/lint.sh --fix` rewrites in place.
@@ -606,7 +632,7 @@ and `build/vk_spv/`, which `tools/install.sh` writes. A gate whose tool is
 missing reports `skipped`; a gate whose build directory is missing fails,
 because then it did not run.
 
-After changing a shader or a `-D`, run `python3 tools/shader_limits.py` and
+After changing a shader or a `-D`, run `uv run python tools/shader_limits.py` and
 compare its workgroup/LDS table against the `GpuWorkgroup` literals at each
 `gpu_create_pipeline` call site. CI runs it as its own step so the table
 lands in the log next to the validation.
@@ -633,10 +659,10 @@ reference projects' own documentation and discussions.
 ## Scratch files
 
 Do all scratch work (temporary scripts, probe outputs, intermediate artifacts)
-in the repo's `tmp/` folder instead of the system `/tmp`. Under the sandboxed
+in the repo's `.scratch/` folder instead of the system `/tmp`. Under the sandboxed
 shell, `/tmp` is a fresh tmpfs per shell call, so files written there are
-cleared between commands — anything a later command needs must live under the
-workspace (`tmp/`).
+cleared between commands. Anything a later command needs must live under the
+workspace (`.scratch/`).
 
 ## Commits
 
@@ -648,8 +674,9 @@ working tree and describe what should be committed.
 
 1. Read the reference implementation for the filter in `reference/`.
 2. Check the current vsfeel implementation and its tests.
-3. Build and install with `tools/install.sh` (one command, hash-verified), then
-   run the benchmark + tests to get a baseline.
+3. `uv sync` once per checkout (and after dependency changes), then build and
+   install with `tools/install.sh` (one command, hash-verified), and run the
+   benchmark + tests to get a baseline.
 4. **Measure the host/GPU split before optimizing** (the chrono probe), then
    run an ablation ladder (remove-all / remove-half) to find which side is
    actually the limiter. Do not assume it is the kernels.

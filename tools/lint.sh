@@ -13,14 +13,14 @@
 #   tidy      clang-tidy over the compile database, per .clang-tidy
 #   cppcheck  cppcheck over the compile database
 #   ruff      ruff check over vsfeel/ tools/ hatch_build.py
-#             src/gen_spirv_header.py tests/ (ruff is installed as a
-#             pinned PyPI package in CI; RUFF names a local substitute)
+#             src/gen_spirv_header.py tests/
 #
 # shaders/tidy/cppcheck need a configured build directory (they read
-# build/compile_commands.json and build/vk_spv/); tools/install.sh writes both.
-# VSFEEL_BUILD_DIR moves it. CLANG_FORMAT / CLANG_TIDY / CPPCHECK name the
-# binaries, so a pinned version can be substituted. RUFF names the ruff
-# binary (default: the `ruff` on PATH).
+# build/compile_commands.json and build/vk_spv/); tools/install.sh writes
+# both. VSFEEL_BUILD_DIR moves it. The project venv's bin comes first on PATH,
+# so the pinned clang-format/clang-tidy/ruff from the `lint` dependency group
+# (`uv sync --group lint`) are what runs; CLANG_FORMAT / CLANG_TIDY / CPPCHECK /
+# RUFF name a binary explicitly to bypass that.
 #
 # A gate whose tool is missing reports SKIP rather than passing quietly; a gate
 # whose build directory is missing is an error, because then it did not run.
@@ -29,6 +29,13 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(cd -- "$script_dir/.." && pwd)
 build_dir=${VSFEEL_BUILD_DIR:-$root_dir/build}
+
+# The lint wheels are a dependency group, not system packages; putting the venv
+# first is what makes a local run use the same versions CI does.
+if [[ -d $root_dir/.venv/bin ]]; then
+    PATH=$root_dir/.venv/bin:$PATH
+    export PATH
+fi
 
 clang_format=${CLANG_FORMAT:-clang-format}
 clang_tidy=${CLANG_TIDY:-clang-tidy}

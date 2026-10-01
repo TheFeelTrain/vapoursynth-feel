@@ -5,16 +5,6 @@ on:
   pull_request:
   workflow_dispatch:
 
-# The two clang tools are pinned rather than taken from the runner's apt
-# (LLVM 18 on 24.04): clang-format's output changes between LLVM majors, so a CI
-# formatter that disagrees with the developer's box makes the format gate
-# useless. The PyPI packages ship the same binaries as upstream. Ruff is
-# pinned for the same reason (new releases add rules).
-env:
-  CLANG_FORMAT_VERSION: "22.1.8"
-  CLANG_TIDY_VERSION: "22.1.8"
-  RUFF_VERSION: "0.16.9"
-
 jobs:
   lint:
     # 26.04, not latest: noble's glslc is 2023.8 and rejects --target-env=vulkan1.4.
@@ -28,19 +18,18 @@ jobs:
         sudo apt-get install -y --no-install-recommends \
           glslc spirv-tools cppcheck
 
-    - name: Pinned clang tools and VapourSynth headers
-      run: |
-        python3 -m venv .venv
-        .venv/bin/pip install --upgrade pip
-        .venv/bin/pip install \
-          "clang-format==${CLANG_FORMAT_VERSION}" \
-          "clang-tidy==${CLANG_TIDY_VERSION}" \
-          "ruff==${RUFF_VERSION}" \
-          "vapoursynth>=80"
-        # The venv's bin must come first: it supplies clang-format, clang-tidy,
-        # ruff, python and the `vapoursynth get-include` CLI CMake locates the
-        # headers through.
-        echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+    # The interpreter, VapourSynth and the pinned clang-format/clang-tidy/ruff
+    # all come from uv.lock, so this job runs the environment a developer gets
+    # from `uv sync --group lint`, and tools/lint.sh picks the venv binaries up
+    # from PATH. The `dev` group (reference plugins) is not needed here, hence
+    # --no-default-groups.
+    - name: Install uv
+      uses: astral-sh/setup-uv@v10
+      with:
+        enable-cache: true
+
+    - name: Sync the lint environment
+      run: uv sync --locked --no-default-groups --group lint
 
     - name: Configure (compile database on, host warnings as errors)
       run: |
@@ -53,7 +42,7 @@ jobs:
     # Builds the host with -Werror and every shader with glslc -Werror, then
     # validates each emitted module with spirv-val (the shader-validate target).
     # Also prints every shader variant's workgroup/LDS footprint: run
-    # `python3 tools/shader_limits.py` after changing a shader or a -D and
+    # `python tools/shader_limits.py` after changing a shader or a -D and
     # compare against the GpuWorkgroup literals at each gpu_create_pipeline
     # call site. A stale .spv left behind by a dropped CMake variant is
     # marked, so it cannot pose as live. CI surfaces the table here so a
@@ -63,7 +52,7 @@ jobs:
       run: cmake --build build --parallel
 
     - name: Shader limits
-      run: .venv/bin/python tools/shader_limits.py
+      run: uv run --no-sync python tools/shader_limits.py
 
     - name: Lint
       run: tools/lint.sh
@@ -79,16 +68,18 @@ jobs:
       with:
         fetch-depth: 0   # hatch-vcs derives the version from git tags
 
-    - name: Test dependencies
-      run: |
-        python3 -m venv .venv
-        .venv/bin/pip install --upgrade pip
-        .venv/bin/pip install pytest numpy "vapoursynth>=80"
+    - name: Install uv
+      uses: astral-sh/setup-uv@v10
+      with:
+        enable-cache: true
+
+    - name: Sync the test environment
+      run: uv sync --locked --no-default-groups --group test
 
     - name: GPU-less tests
       # The version test needs the installed GPU plugin, so it stays local;
       # these five never touch a device (header generator, benchmark vpy
       # generation, wheel staging).
       run: |
-        .venv/bin/python -m pytest tests/test_build.py -q \
+        uv run --no-sync python -m pytest tests/test_build.py -q \
           -k "generator or benchmark or hatch"

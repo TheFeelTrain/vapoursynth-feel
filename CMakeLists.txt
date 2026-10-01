@@ -566,16 +566,24 @@ set(VSFEEL_INSTALL_DIR "" CACHE STRING "Relative plugin staging directory")
 
 set(VS_PLUGIN_DIR "")
 
-if(PKG_CONFIG_FOUND)
-    pkg_search_module(VS vapoursynth)
-endif()
+# An explicit -DVS_INCLUDE_DIR wins over discovery. A dev venv ships the headers
+# of the VapourSynth the plugin will actually run under, and pkg-config would
+# otherwise silently pin the build to the distribution's copy instead (a
+# different release, since the venv installs its own vapoursynth wheel).
+set(VS_INCLUDE_DIR "" CACHE PATH "Path to VapourSynth headers (containing VapourSynth4.h)")
 
-if(VS_FOUND)
-    message(STATUS "Found VapourSynth R${VS_VERSION}")
-    target_include_directories(vsfeel PRIVATE ${VS_INCLUDE_DIRS})
+if(VS_INCLUDE_DIR)
+    message(STATUS "Using VapourSynth headers from ${VS_INCLUDE_DIR} (explicit)")
+    target_include_directories(vsfeel PRIVATE "${VS_INCLUDE_DIR}")
 else()
-    set(VS_INCLUDE_DIR "" CACHE PATH "Path to VapourSynth headers (containing VapourSynth4.h)")
-    if(NOT VS_INCLUDE_DIR)
+    if(PKG_CONFIG_FOUND)
+        pkg_search_module(VS vapoursynth)
+    endif()
+
+    if(VS_FOUND)
+        message(STATUS "Found VapourSynth R${VS_VERSION}")
+        target_include_directories(vsfeel PRIVATE ${VS_INCLUDE_DIRS})
+    else()
         # No pkg-config, which is the norm on Windows and in manylinux build
         # containers. The vapoursynth package ships its own CLI that knows where
         # its headers are, and it is on PATH in an isolated build environment.
@@ -589,30 +597,30 @@ else()
             set(VS_INCLUDE_DIR "${_vs_cli_include}" CACHE PATH
                 "Path to VapourSynth headers (containing VapourSynth4.h)" FORCE)
         endif()
-    endif()
-    if(NOT VS_INCLUDE_DIR)
-        # Fallback for when that CLI is not on PATH: ask the interpreter CMake
-        # found, though it may not be the one the build environment installed
-        # the headers into.
-        execute_process(
-            COMMAND "${Python3_EXECUTABLE}" -c
-                "import os, vapoursynth; print(os.path.join(os.path.dirname(vapoursynth.__file__), 'include'))"
-            OUTPUT_VARIABLE _vs_py_include
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-        if(_vs_py_include AND EXISTS "${_vs_py_include}/VapourSynth4.h")
-            set(VS_INCLUDE_DIR "${_vs_py_include}" CACHE PATH
-                "Path to VapourSynth headers (containing VapourSynth4.h)" FORCE)
+        if(NOT VS_INCLUDE_DIR)
+            # Fallback for when that CLI is not on PATH: ask the interpreter CMake
+            # found, though it may not be the one the build environment installed
+            # the headers into.
+            execute_process(
+                COMMAND "${Python3_EXECUTABLE}" -c
+                    "import os, vapoursynth; print(os.path.join(os.path.dirname(vapoursynth.__file__), 'include'))"
+                OUTPUT_VARIABLE _vs_py_include
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET
+            )
+            if(_vs_py_include AND EXISTS "${_vs_py_include}/VapourSynth4.h")
+                set(VS_INCLUDE_DIR "${_vs_py_include}" CACHE PATH
+                    "Path to VapourSynth headers (containing VapourSynth4.h)" FORCE)
+            endif()
         endif()
+        if(NOT VS_INCLUDE_DIR)
+            message(FATAL_ERROR
+                "VapourSynth headers not found. Install the vapoursynth Python "
+                "package or configure with -DVS_INCLUDE_DIR=<dir containing VapourSynth4.h>")
+        endif()
+        message(STATUS "Using VapourSynth headers from ${VS_INCLUDE_DIR}")
+        target_include_directories(vsfeel PRIVATE "${VS_INCLUDE_DIR}")
     endif()
-    if(NOT VS_INCLUDE_DIR)
-        message(FATAL_ERROR
-            "VapourSynth headers not found. Install the vapoursynth Python "
-            "package or configure with -DVS_INCLUDE_DIR=<dir containing VapourSynth4.h>")
-    endif()
-    message(STATUS "Using VapourSynth headers from ${VS_INCLUDE_DIR}")
-    target_include_directories(vsfeel PRIVATE "${VS_INCLUDE_DIR}")
 endif()
 
 # Where the running VapourSynth loads plugins from. Skipped when the packaging

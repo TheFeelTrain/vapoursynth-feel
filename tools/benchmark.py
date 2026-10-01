@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env uv run
 """Benchmark vsfeel filters against the reference implementations.
 
 The benchmark is data-driven: every filter is described by one entry in the
@@ -10,15 +10,15 @@ new reference plugin = one new entry.
 Timing is done with vspipe so results stay comparable across plugins.
 
 Usage:
-    python3 tools/benchmark.py                                   # all filters
-    python3 tools/benchmark.py --filter gaussblur                # one filter
-    python3 tools/benchmark.py --filter gaussblur vsfeel vszipcl # subset of plugins
-    python3 tools/benchmark.py --filter gaussblur --gauss-sigma 5.0
-    python3 tools/benchmark.py --filter gaussblur --repeat 5      # median of 5, alternating order
-    python3 tools/benchmark.py --filter dfttest --pair vszipcl    # same-session pair + ratio
-    python3 tools/benchmark.py --frames 500 --clip /path/to/input.mkv
-    python3 tools/benchmark.py --no-cache          # live decode: full chain incl. BestSource
-    python3 tools/benchmark.py --check-fresh       # refuse to run against a stale .so
+    uv run tools/benchmark.py                                   # all filters
+    uv run tools/benchmark.py --filter gaussblur                # one filter
+    uv run tools/benchmark.py --filter gaussblur vsfeel vszipcl # subset of plugins
+    uv run tools/benchmark.py --filter gaussblur --gauss-sigma 5.0
+    uv run tools/benchmark.py --filter gaussblur --repeat 5      # median of 5, alternating order
+    uv run tools/benchmark.py --filter dfttest --pair vszipcl    # same-session pair + ratio
+    uv run tools/benchmark.py --frames 500 --clip /path/to/input.mkv
+    uv run tools/benchmark.py --no-cache          # live decode: full chain incl. BestSource
+    uv run tools/benchmark.py --check-fresh       # refuse to run against a stale .so
 
 Every plugin is timed --repeat times (default 3) and the median is reported with
 min/max/spread; the plugin order alternates between repeats so clock/thermal
@@ -351,7 +351,6 @@ PLUGINS = {
     "vszipcu": Plugin("vszipcu"),
     "eedi3vk2": Plugin("eedi3vk2"),
     "nnedi3vk": Plugin("nnedi3vk"),
-    "bilateralhip": Plugin("bilateralhip"),
     "bm3dhip": Plugin("bm3dhip"),
     "nlm_hip": Plugin("nlm_hip"),
     "bm3dvk": Plugin("bm3dvk"),
@@ -796,7 +795,7 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("vthresh0", "--eedi3-vthresh0", "eedi3_vthresh0", float, 12.0),
             Arg("vthresh1", "--eedi3-vthresh1", "eedi3_vthresh1", float, 24.0),
             Arg("vthresh2", "--eedi3-vthresh2", "eedi3_vthresh2", float, 4.0),
-            Arg("mclip", "--eedi3-mclip", "eedi3_mclip", _str_to_bool, True,
+            Arg("mclip", "--eedi3-mclip", "eedi3_mclip", _str_to_bool, True,  # pyright: ignore[reportArgumentType]
                 "pass the vsaa edge mask as mclip to vsfeel/eedi3vk2 (default: true)"),
         ],
         build=_eedi3_build,
@@ -823,7 +822,7 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("vthresh0", "--eedi3-vthresh0", "eedi3_vthresh0", float, 12.0),
             Arg("vthresh1", "--eedi3-vthresh1", "eedi3_vthresh1", float, 24.0),
             Arg("vthresh2", "--eedi3-vthresh2", "eedi3_vthresh2", float, 4.0),
-            Arg("mclip", "--eedi3-mclip", "eedi3_mclip", _str_to_bool, True,
+            Arg("mclip", "--eedi3-mclip", "eedi3_mclip", _str_to_bool, True,  # pyright: ignore[reportArgumentType]
                 "pass the vsaa edge mask as mclip to vsfeel (default: true)"),
         ],
         build=_eedi3h_build,
@@ -848,7 +847,7 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("vthresh0", "--eedi3-vthresh0", "eedi3_vthresh0", float, 12.0),
             Arg("vthresh1", "--eedi3-vthresh1", "eedi3_vthresh1", float, 24.0),
             Arg("vthresh2", "--eedi3-vthresh2", "eedi3_vthresh2", float, 4.0),
-            Arg("mclip", "--eedi3-mclip", "eedi3_mclip", _str_to_bool, True,
+            Arg("mclip", "--eedi3-mclip", "eedi3_mclip", _str_to_bool, True,  # pyright: ignore[reportArgumentType]
                 "pass the vsaa edge mask as mclip (default: true)"),
         ],
         build=_eedi3aa_build,
@@ -911,6 +910,23 @@ def vspipe_env() -> dict[str, str]:
     return env
 
 
+def vspipe_binary() -> str:
+    """The vspipe belonging to the interpreter running this script.
+
+    A bare ``vspipe`` resolves through PATH, which on a dev box is the system
+    VapourSynth — a different core, loading a different plugin directory from
+    the project venv's. That silently benchmarks the system libvsfeel (or a
+    stale copy) instead of the one tools/install.sh just installed. VSPIPE
+    overrides the lookup.
+    """
+    override = os.environ.get("VSPIPE")
+    if override:
+        return override
+    suffix = ".exe" if os.name == "nt" else ""
+    sibling = Path(sys.executable).with_name(f"vspipe{suffix}")
+    return str(sibling) if sibling.is_file() else "vspipe"
+
+
 def run_vspipe(vpy_path: Path, frames: int, timeout: float = DEFAULT_TIMEOUT) -> float | None:
     """Time one vspipe run; return its fps, or None if the run failed.
 
@@ -919,7 +935,8 @@ def run_vspipe(vpy_path: Path, frames: int, timeout: float = DEFAULT_TIMEOUT) ->
     other than the one requested — timing a different amount of work than the
     header advertises is not a measurement.
     """
-    cmd = ["vspipe", "--start", "0", "--end", str(frames - 1), str(vpy_path), "/dev/null"]
+    cmd = [vspipe_binary(), "--start", "0", "--end", str(frames - 1),
+           str(vpy_path), "/dev/null"]
     env = vspipe_env()
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
@@ -1343,6 +1360,8 @@ def main() -> None:
         sys.exit(f"--repeat must be >= 1, got {ns.repeat}")
     if ns.aa_cache_mb < 0:
         sys.exit(f"--aa-cache-mb must be >= 0, got {ns.aa_cache_mb}")
+    # Named once: which VapourSynth the numbers came from is part of the result.
+    print(f"vspipe: {vspipe_binary()}", file=sys.stderr)
     if ns.check_fresh:
         check_fresh(ns.vsfeel_so or _default_plugin_so(), ns.build_so)
     filters = list(FILTERS) if ns.filter == "all" else [ns.filter]

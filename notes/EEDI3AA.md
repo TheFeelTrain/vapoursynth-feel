@@ -27,7 +27,7 @@ materialise (Historical).
 
 Measured, not assumed — do not re-derive from intuition.
 
-- **`std.Merge(a,b)` weight 0.5** (`tmp/merge_semantics.py`, random GRAY16, 512
+- **`std.Merge(a,b)` weight 0.5** (`.scratch/merge_semantics.py`, random GRAY16, 512
   samples): u16 `(a+b+1)>>1` (0 mismatches; `(a+b)>>1` 263 wrong, half-even
   131); f32 `0.5f*a + 0.5f*b` bitwise. The fused merge is **integer u16, after**
   the vcheck's quantisation.

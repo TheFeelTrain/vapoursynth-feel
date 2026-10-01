@@ -8,16 +8,16 @@ vapoursynth/
 
 # Reference implementations and scratch work (read-only / throwaway)
 reference/
-tmp/
+.scratch/
 
 # Python
 __pycache__/
 .venv/
 dist/
-uv.lock
 
 # Test / profiling caches and artefacts
 .pytest_cache/
+.ruff_cache/
 .rocprofv3/
 *.ffindex
 *.bsindex
