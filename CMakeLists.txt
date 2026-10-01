@@ -389,7 +389,6 @@ if(VK_GLSLC)
     # Part of the default build, so an invalid module cannot be compiled, linked
     # and tested before anyone notices. Skipped (not failed) without spirv-val.
     if(VK_SPIRV_VAL)
-        add_custom_target(shader-validate ALL DEPENDS ${VK_SPV_VALIDATED})
         message(STATUS "Shader SPIR-V validated with ${VK_SPIRV_VAL}")
     else()
         message(STATUS "spirv-val not found: shader SPIR-V validation disabled")
@@ -398,12 +397,25 @@ else()
     message(FATAL_ERROR "glslc not found")
 endif()
 
+# spirv_binaries.h is a source of the plugin, so hanging the .spv and
+# .validated rules off it keeps every shader rule in one target's build.make.
+# A second target depending on the same .spv files (as shader-validate used to)
+# made the Makefiles generator duplicate each glslc rule into both targets'
+# sub-makes: `cmake --build --parallel` then ran glslc twice on one output, and
+# spirv-val could read a half-written module ("Invalid SPIR-V magic number").
+# The header waits on the validation stamps, which wait on the modules, so
+# validation still gates the plugin build.
+if(VK_SPIRV_VAL)
+    set(VK_SPV_HEADER_DEPS ${VK_SPV_VALIDATED})
+else()
+    set(VK_SPV_HEADER_DEPS ${VK_SPV_OUTPUTS})
+endif()
 add_custom_command(
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
     COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/src/gen_spirv_header.py"
             --out "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
             ${VK_SPV_OUTPUTS}
-    DEPENDS ${VK_SPV_OUTPUTS}
+    DEPENDS ${VK_SPV_HEADER_DEPS}
             "${CMAKE_CURRENT_SOURCE_DIR}/src/gen_spirv_header.py"
     VERBATIM)
 set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h" PROPERTIES GENERATED TRUE)
@@ -469,6 +481,15 @@ add_library(vsfeel SHARED
     "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
     ${VSFEEL_WEIGHTS_SOURCE})
 configure_common(vsfeel)
+
+# Target-level alias for tools/lint.sh: the shader rules live in the plugin
+# target (see the spirv_binaries.h comment above), so this only orders the two
+# and never re-declares a .spv output.
+if(VK_SPIRV_VAL)
+    add_custom_target(shader-validate)
+    add_dependencies(shader-validate vsfeel)
+endif()
+
 if(WIN32)
     # The manifest above names the plugin "vsfeel", so the file must be
     # vsfeel.dll: MinGW would otherwise emit libvsfeel.dll and the host would
