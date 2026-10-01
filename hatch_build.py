@@ -10,10 +10,10 @@ from typing import Any
 
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
-# Linux, macOS and Windows on x86-64 and arm64. The host code needs a POSIX or
-# Win32 process/cache API, x86-64 additionally gets AVX2, and the NNEDI3
-# weights are embedded with an RC resource on Windows and the assembler's
-# .incbin everywhere else.
+# Linux (x86-64 and arm64), macOS (x86-64 and arm64) and Windows
+# (x86-64 only). The host code needs a POSIX or Win32 process/cache API,
+# x86-64 additionally gets AVX2, and the NNEDI3 weights are embedded with
+# an RC resource on Windows and the assembler's .incbin everywhere else.
 _SUPPORTED_PLATFORMS = {
     ("linux", "x86_64"), ("linux", "amd64"), ("linux", "aarch64"),
     ("darwin", "x86_64"), ("darwin", "arm64"),
@@ -112,8 +112,9 @@ class CustomHook(BuildHookInterface):
     def initialize(self, version: str, build_data: dict[str, Any]) -> None:
         if (sys.platform, platform.machine().lower()) not in _SUPPORTED_PLATFORMS:
             raise RuntimeError(
-                "vapoursynth-feel builds only on Linux, macOS and Windows "
-                f"x86-64/arm64 (got {sys.platform}/{platform.machine()})."
+                "vapoursynth-feel builds only on Linux and macOS x86-64/arm64 "
+                "and Windows x86-64 "
+                f"(got {sys.platform}/{platform.machine()})."
             )
 
         # Root-relative: the wheel's include list is root-relative, so staging

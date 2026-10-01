@@ -530,7 +530,7 @@ target_link_libraries(vsfeel PRIVATE Vulkan::Headers)
 target_include_directories(vsfeel PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 # Config header
-configure_file(config.h.in config.h)
+configure_file(src/config.h.in config.h)
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 # VapourSynth discovery & installation

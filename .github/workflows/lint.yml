@@ -8,10 +8,12 @@ on:
 # The two clang tools are pinned rather than taken from the runner's apt
 # (LLVM 18 on 24.04): clang-format's output changes between LLVM majors, so a CI
 # formatter that disagrees with the developer's box makes the format gate
-# useless. The PyPI packages ship the same binaries as upstream.
+# useless. The PyPI packages ship the same binaries as upstream. Ruff is
+# pinned for the same reason (new releases add rules).
 env:
   CLANG_FORMAT_VERSION: "22.1.8"
   CLANG_TIDY_VERSION: "22.1.8"
+  RUFF_VERSION: "0.16.9"
 
 jobs:
   lint:
@@ -33,10 +35,11 @@ jobs:
         .venv/bin/pip install \
           "clang-format==${CLANG_FORMAT_VERSION}" \
           "clang-tidy==${CLANG_TIDY_VERSION}" \
+          "ruff==${RUFF_VERSION}" \
           "vapoursynth>=80"
         # The venv's bin must come first: it supplies clang-format, clang-tidy,
-        # python and the `vapoursynth get-include` CLI CMake locates the headers
-        # through.
+        # ruff, python and the `vapoursynth get-include` CLI CMake locates the
+        # headers through.
         echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
     - name: Configure (compile database on, host warnings as errors)
@@ -49,8 +52,43 @@ jobs:
 
     # Builds the host with -Werror and every shader with glslc -Werror, then
     # validates each emitted module with spirv-val (the shader-validate target).
+    # Also prints every shader variant's workgroup/LDS footprint: run
+    # `python3 tools/shader_limits.py` after changing a shader or a -D and
+    # compare against the GpuWorkgroup literals at each gpu_create_pipeline
+    # call site. A stale .spv left behind by a dropped CMake variant is
+    # marked, so it cannot pose as live. CI surfaces the table here so a
+    # variant that outgrew its device limits is visible in the log next to
+    # the validation that would otherwise pass it.
     - name: Build
       run: cmake --build build --parallel
 
+    - name: Shader limits
+      run: .venv/bin/python tools/shader_limits.py
+
     - name: Lint
       run: tools/lint.sh
+
+  test:
+    # GPU-less tests only: GitHub runners have no Vulkan device, so this runs
+    # the tests that never touch the plugin — build plumbing (SPIR-V header
+    # generator, benchmark vpy generation, wheel staging). Everything else
+    # needs the installed GPU plugin and stays local (tools/test.sh).
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0   # hatch-vcs derives the version from git tags
+
+    - name: Test dependencies
+      run: |
+        python3 -m venv .venv
+        .venv/bin/pip install --upgrade pip
+        .venv/bin/pip install pytest "vapoursynth>=80"
+
+    - name: GPU-less tests
+      # The version test needs the installed GPU plugin, so it stays local;
+      # these five never touch a device (header generator, benchmark vpy
+      # generation, wheel staging).
+      run: |
+        .venv/bin/python -m pytest tests/test_build.py -q \
+          -k "generator or benchmark or hatch"

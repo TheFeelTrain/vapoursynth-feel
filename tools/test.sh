@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 #
 # Run the pytest suite in parallel. Use this instead of a bare `pytest tests`:
-# the suite is 357 one-shot subprocesses (median 1.4 s each, ~95% of the serial
-# wall time), so it parallelises ~4x, but the worker count must stay capped and
-# distribution must stay file-level.
-#
-#   -pytest-xdist -n 8 --dist loadfile : 789 tests in ~133 s (serial: 522 s)
+# the suite is mostly one-shot subprocesses (median ~1.4 s each, the bulk of
+# the serial wall time), so it parallelises well, but the worker count must
+# stay capped and distribution must stay file-level.
 #
 # More than 8 workers exhausts the GPU (`vkQueueSubmit failed`), and a plain
 # `-n 8` is flaky because NLMeans a=64,d=16 hard-recovers the GPU whenever

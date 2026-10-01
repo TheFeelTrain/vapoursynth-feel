@@ -257,9 +257,9 @@ def test_gaussblur_sigma_zero_passthrough_yuv_16bit(noise_gray):
         f = out.get_frame(n)
         s = yuv.get_frame(n)
         # luma copied through bit-identically
-        l = _plane(f, 0, WIDTH, HEIGHT, np.uint16)
-        ls = _plane(s, 0, WIDTH, HEIGHT, np.uint16)
-        assert np.array_equal(l, ls), f"luma changed at frame {n}"
+        lum = _plane(f, 0, WIDTH, HEIGHT, np.uint16)
+        lum_src = _plane(s, 0, WIDTH, HEIGHT, np.uint16)
+        assert np.array_equal(lum, lum_src), f"luma changed at frame {n}"
         # chroma is actually blurred (differs from input)
         for p in (1, 2):
                 w = WIDTH // 2
@@ -278,9 +278,9 @@ def test_gaussblur_sigma_zero_passthrough_yuv_32bit(noise_gray):
         f = out.get_frame(n)
         s = yuv.get_frame(n)
         # luma copied through bit-identically
-        l = frame_to_ndarray(f)
-        ls = frame_to_ndarray(s)
-        assert np.array_equal(l, ls), f"luma changed at frame {n}"
+        lum = frame_to_ndarray(f)
+        lum_src = frame_to_ndarray(s)
+        assert np.array_equal(lum, lum_src), f"luma changed at frame {n}"
         # chroma is actually blurred (differs from input)
         for p in (1, 2):
                 w = WIDTH // 2

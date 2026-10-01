@@ -26,9 +26,7 @@ import re
 import subprocess
 import sys
 
-import numpy as np
 import pytest
-import vapoursynth as vs
 
 from conftest import COMPARE_PRELUDE, NOISE_MKV, run_compare_subprocess
 

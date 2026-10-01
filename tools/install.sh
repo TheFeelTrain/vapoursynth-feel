@@ -67,7 +67,11 @@ hash_file() {
 }
 
 echo "==> configure $root_dir in $build_dir ($build_type)"
-cmake -S "$root_dir" -B "$build_dir" -D "CMAKE_BUILD_TYPE=$build_type"
+# CMAKE_EXPORT_COMPILE_COMMANDS stays on: tools/lint.sh's tidy/cppcheck gates
+# read build/compile_commands.json, and this script is the documented remedy
+# when it is missing.
+cmake -S "$root_dir" -B "$build_dir" -D "CMAKE_BUILD_TYPE=$build_type" \
+    -D CMAKE_EXPORT_COMPILE_COMMANDS=ON
 
 echo "==> build"
 cmake --build "$build_dir" --config "$build_type"

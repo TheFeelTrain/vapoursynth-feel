@@ -272,7 +272,7 @@ _ss_served = _blank.std.ModifyFrame(_blank, _serve_ss)
 _blankm = mclip.std.BlankClip()
 _msk_served = _blankm.std.ModifyFrame(_blankm, _serve_msk)
 {cache_build}
-sclip = {f"core.std.Interleave([clip, clip])" if eedi3_field > 1 else "clip"}
+sclip = {"core.std.Interleave([clip, clip])" if eedi3_field > 1 else "clip"}
 """
     else:
         # --no-cache (or --cache-frames 0): no preload to move off the clock,
@@ -1329,7 +1329,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     ns = parse_args()
+    # The default clip is the dev box's file; on any other machine fall back
+    # to a synthetic BlankClip instead of failing on a missing path. An
+    # explicit --clip still has to exist.
+    if ns.clip == DEFAULT_CLIP and not Path(ns.clip).exists() and not ns.synthetic:
+        print(f"note: default clip {DEFAULT_CLIP!r} not found; "
+              "using --synthetic BlankClip instead", file=sys.stderr)
+        ns.synthetic = True
     ns.clip = str(Path(ns.clip).expanduser().resolve())
+    if not ns.synthetic and not Path(ns.clip).is_file():
+        sys.exit(f"--clip not found: {ns.clip}")
     if ns.repeat < 1:
         sys.exit(f"--repeat must be >= 1, got {ns.repeat}")
     if ns.aa_cache_mb < 0:

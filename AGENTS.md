@@ -66,9 +66,7 @@ standard test input.
   changes: `python -m pytest tests/test_<filter>.py -q`.
 - Run the whole suite with **`tools/test.sh`** (extra args are passed through,
   default target `tests`). It uses pytest-xdist (`dev` dependency group) with
-  `--dist loadfile` and caps workers at 8. Measured on the RX 7900XTX, 789
-  tests: **522 s serial, ~2.5 min via `tools/test.sh`** (133–146 s observed).
-  Do not raise the cap and
+  `--dist loadfile` and caps workers at 8. Do not raise the cap and
   do not drop `loadfile`: 16 workers fail with `vkQueueSubmit failed` (GPU
   exhaustion), and a plain `-n 8` is flaky because NLMeans `a=64, d=16`
   hard-recovers the GPU whenever another client shares it — file-level
@@ -582,15 +580,14 @@ flushed to a file:
   incompatible data. The file is written via a unique temp file + rename, so
   concurrent test subprocesses cannot corrupt it.
 
-Measured on the full suite when it was 443 tests: **~7.5 min cold → ~3.5 min for
-the run that builds the cache → ~2.5 min warm**. The suite has since grown to
-789 tests (522 s serial, ~2.5 min via `tools/test.sh` — see Testing). The first
+Measured on the full suite: **~7.5 min cold → ~3.5 min for
+the run that builds the cache → ~2.5 min warm**. The first
 run after a driver or `glslc` update pays the compile again by design.
 
 ## Code quality (lint)
 
 `tools/lint.sh` is the single entry point, and CI runs exactly it
-(`.github/workflows/lint.yml`). Four gates:
+(`.github/workflows/lint.yml`). Five gates:
 
 - **format** — `clang-format --dry-run --Werror` over `src/*.cpp` and `src/*.h`
   (`.clang-format`); `tools/lint.sh --fix` rewrites in place.
@@ -600,11 +597,19 @@ run after a driver or `glslc` update pays the compile again by design.
   build here (this is what caught a 16-bit constant needing `Int16`).
 - **tidy** — `clang-tidy` over the compile database (`.clang-tidy`).
 - **cppcheck** — over the same database.
+- **ruff** — `ruff check` over `vsfeel/`, `tools/`, `hatch_build.py`,
+  `src/gen_spirv_header.py` and `tests/` (see `[tool.ruff.lint]` in
+  `pyproject.toml` for the curated check set).
 
-The last three need a configured `build/` — they read `compile_commands.json`
+The middle three need a configured `build/` — they read `compile_commands.json`
 and `build/vk_spv/`, which `tools/install.sh` writes. A gate whose tool is
 missing reports `skipped`; a gate whose build directory is missing fails,
 because then it did not run.
+
+After changing a shader or a `-D`, run `python3 tools/shader_limits.py` and
+compare its workgroup/LDS table against the `GpuWorkgroup` literals at each
+`gpu_create_pipeline` call site. CI runs it as its own step so the table
+lands in the log next to the validation.
 
 The `.comp` shaders are deliberately **not** clang-format'd: clang-format parses
 GLSL as C++ and reflows the buffer blocks and the push-constant struct into
