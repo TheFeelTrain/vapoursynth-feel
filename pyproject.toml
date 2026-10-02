@@ -81,6 +81,7 @@ include = [
     "/CMakeLists.txt",
     "/hatch_build.py",
     "/README.md",
+    "/CHANGELOG.md",
     "/LICENSE",
 ]
 
