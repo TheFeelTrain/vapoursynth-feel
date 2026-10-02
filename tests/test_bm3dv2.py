@@ -411,37 +411,13 @@ def test_bm3dv2_rejects_radius17(noise_gray):
 def test_bm3dv2_accepts_reference_radius_cap(noise_gray, radius):
     """The radius cap must match the references' (vszipcl 16, bm3dvk 15).
 
-    Windows this wide no longer fit the aggregation's push-constant table, so
-    this is also the derived arm's end-to-end smoke test.
+    Windows this wide are the end-to-end case for the aggregation's derived
+    per-slice table, which replaced the push-constant one.
     """
     out = _run(noise_gray, radius=radius)
     for n in (0, 23):
         a = frame_to_ndarray(out.get_frame(n))
         assert np.isfinite(a).all(), f"non-finite output at frame {n}"
-
-
-def test_bm3dv2_derived_aggregation_matches_legacy(noise_gray, monkeypatch):
-    """The derived per-slice table must agree with the host's table.
-
-    Windows up to nine slices use the host-precomputed push-constant table and
-    wider ones derive it in the kernel; forcing the derived arm on a small
-    window (VSFEEL_BM3D_DERIVE=1) holds the two against each other over the
-    whole range the legacy table covers, boundaries included. Both arms read
-    the same stacks, so the only expected difference is the float-atomics
-    ordering floor (~3e-8 measured).
-    """
-    monkeypatch.delenv("VSFEEL_BM3D_DERIVE", raising=False)
-    for radius in (0, 1, 2, 3, 4):
-        legacy = _run(noise_gray, radius=radius)
-        monkeypatch.setenv("VSFEEL_BM3D_DERIVE", "1")
-        derived = _run(noise_gray, radius=radius)
-        monkeypatch.delenv("VSFEEL_BM3D_DERIVE")
-        for n in (0, 11, 23):
-            a = frame_to_ndarray(legacy.get_frame(n))
-            b = frame_to_ndarray(derived.get_frame(n))
-            assert np.isfinite(b).all(), f"non-finite derived output at frame {n}"
-            d = float(np.abs(a - b).max())
-            assert d < 1e-5, f"derived vs legacy at radius {radius}, frame {n}: {d:g}"
 
 
 def test_bm3dv2_rejects_bad_ref_format(noise_gray):

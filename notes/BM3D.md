@@ -33,13 +33,15 @@ Current design:
   reference columns too.
 - Temporal per-window lists are only PS_NUM deep; the top-k merge proof is in
   Historical. The full spatial list stays 8 deep.
-- The aggregation's per-slice table (estimate offset, witness index, expected
-  witness) is host-precomputed into the push constants for windows up to nine
-  slices, and derived in the kernel for wider ones (`radius > 4`), where three
-  tw-wide int arrays no longer fit the 128 bytes of push constants every device
-  guarantees. Both arms compute the same integers; `VSFEEL_BM3D_DERIVE=1` forces
-  the derived one, which is how the tests hold them against each other over the
-  range the legacy table still covers.
+- The aggregation derives its per-slice table (estimate offset, witness index,
+  expected witness) in the kernel from the window centre, ring capacity and
+  `aggZ`, in vec4 units; the host's push-constant table stopped fitting at
+  `tw = 11` and measuring the derived one showed parity, so there is one path.
+- `radius` accepts up to 16 (vszipcl's cap; bm3dvk stops at 15), but that is
+  the argument cap, not the practical one: the estimate cache is a single
+  buffer growing as `(2+2r)(2r+1)` plane pairs, so the device's 4 GiB
+  `maxStorageBufferRange` binds first. 1080p runs radius 7 and refuses 8,
+  640x360 reaches 16; every refusal is a creation-time error naming the size.
 - Degenerate paths: `sigma < FLT_EPSILON` passes the plane through (a source
   copy), like the installed references' `PROC_MASK`.
 - **Everything goes through the core's exec pool** (`createGPUExecPool` /
@@ -110,26 +112,19 @@ three interleaved A/B runs against the raw-submit build -- see Historical.
 
 Chronological; each entry keeps the mechanism, not the story.
 
-- **2026-10-02 — radius cap 4 → 16 (the references'), small radii unchanged.**
-  vszipcl accepts 16 and bm3dvk 15; vsfeel stopped at 4 because the aggregation
-  carried its per-slice table (estimate offset, witness index, expected witness,
-  three tw-wide int arrays) in push constants, which stops fitting the 128 bytes
-  every device guarantees at tw = 11. Wider windows now derive slot, slice index
-  and witness in the kernel from the window centre and the ring capacity (a spec
-  constant, so the slot modulo is a multiply-shift), working in vec4 units;
-  windows up to nine slices keep the host table and its code path unchanged.
-  Interleaved same-session A/B against the previous build, jpbd 1080p GRAY32:
-  3000-frame medians radius 0 1149.8 vs 1152.9, radius 2 943.2 vs 937.4 (4
-  rounds each), radius 4 651.3 vs 644.5 fps — parity inside the harness's own
-  ±2% spread. The two arms are within noise of each other at a narrow window
-  (radius 2, five interleaved 1000-frame medians 959.9 legacy vs 940.1 derived;
-  radius 4 646.7 vs 645.6 fps), so wide windows pay nothing measurable for the
-  derived table. Correctness: derived vs legacy at radius 0..4 within 3.0e-8
-  (the atomic-ordering floor), and radius 5/6 — the first windows wider than the
-  table — match vszipcl like the narrower ones. VRAM is quadratic in the radius
-  (`res_cap * tw * 2` plane pairs), so 1080p rejects above radius 10 on the
-  addressing guard while 640x360 runs 16 (2.07 GiB); the source ring got the
-  same int32 guard, which radius 4's 18 slots never needed.
+- **2026-10-02 — radius cap 4 → 16 (the references'), one aggregation path.**
+  The cap was the aggregation's per-slice table in push constants (three
+  tw-wide int arrays, which stop fitting the 128 bytes every device guarantees
+  at `tw = 11`), not VRAM. A kernel-derived table and the host's shipped side by
+  side first: they agreed at radius 0..4 within 3.0e-8 (the atomic-ordering
+  floor), and an ABBA-interleaved A/B put them at parity (1000-frame jpbd 1080p
+  GRAY32 medians radius 0 1106.9 vs 1114.7, radius 2 945.6 vs 935.6, radius 4
+  636.9 vs 637.3 fps), so the host table was deleted rather than kept as a
+  second path. Graded against the previous build, 3000-frame medians: radius 0
+  1149.8 vs 1152.9, radius 2 943.2 vs 937.4, radius 4 651.3 vs 644.5 fps. The
+  surviving path matches vszipcl at radius 0..6 on the test clip and 0..7 on
+  real 1080p content (jpbd, benchmark args, frames 0/11/60/137, worst 0.0095;
+  Wiener ref pass within 1.4e-4), and both kernels now share one 20-byte block.
 
 - **Creation-failure leak.** `createVideoFilterEx2` returns `nullptr` without
   running the free callback when the node constructor throws, so the instance
@@ -435,6 +430,12 @@ per-instance staging once before the stream loop; the DB machine is unchanged.
   with an interleaved `tools/benchmark.py` pair over 1000+ frames. A one-shot
   `-r 1` fps figure mixes in the ~1.4 ms host path and moves for unrelated
   reasons.
+- A straight A/B alternation favours whichever arm runs first (4 of 5 rounds
+  here, worth ~2%); interleave ABBA within each round before reading any
+  difference under ~3%.
+- Radius limits are geometry-dependent and the suite's clip is 640x360: check
+  the benchmark clip at 1080p before quoting a cap (it is 7 there, not the 10
+  the int32 guard alone implies).
 - The GPU timestamp accumulator had two bugs until this round — it added
   `uint64_t * float` into an `atomic<uint64_t>` (truncating) and divided ns by
   `1e3` while printing "ms", so every figure it printed before 2026-09-21 is
@@ -459,8 +460,6 @@ cached at creation, not read per frame.
   +36..41%).
 - `VSFEEL_BM3D_CAS=1` — force the atomicCompSwap aggregation build on a device
   that has buffer float atomics (A/B measurement only).
-- `VSFEEL_BM3D_DERIVE=1` — force the derived per-slice aggregation table on a
-  window narrow enough to use the host's (A/B measurement and test only).
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs; both
   are vsfeel inventions, not reference behaviour, and NOSEARCH distorts the
   temporal search as well (see the ablation note).

@@ -4,17 +4,14 @@
  * BM3D temporal aggregation kernel. For each output pixel, sums the
  * pre-aggregated estimates (wdst) and weights (weight) of the TW stacked
  * result slices (TW = 2 * RADIUS + 1, matching the reference implementation's
- * aggPlane loop) and divides. The division is fp32, as in every reference
- * (zipcl's aggPlane divides floats, BM3DCUDA multiplies by an f32 reciprocal);
- * fp64 would run at 1/16 rate on RDNA3 for a rounding difference no reference
- * makes.
- *
- * The per-slice table (estimate offset, witness index, expected witness) is
- * either handed over in the push constants (DERIVE == 0, windows up to nine
- * slices, which is what fits the 128-byte budget every device guarantees) or
- * derived from the window geometry in the kernel (DERIVE == 1, any window).
- * Both arms compute the same integers; the constant folds at pipeline
- * creation, so a pipeline carries only one of them.
+ * aggPlane loop) and divides. The per-slice table (estimate offset, witness
+ * index, expected witness) is derived from the window geometry instead of
+ * being handed over in push constants: at TW = 33 it is three times the 128
+ * bytes every device guarantees, and deriving it costs nothing measurable at
+ * TW = 5 either (ABBA-measured parity, see notes/BM3D.md). The division is
+ * fp32, as in every reference (zipcl's aggPlane divides floats, BM3DCUDA
+ * multiplies by an f32 reciprocal); fp64 would run at 1/16 rate on RDNA3 for
+ * a rounding difference no reference makes.
  *
  * One thread covers four adjacent columns through vec4 accesses (the plane
  * pitch is already a multiple of four floats, so every slice base, row offset
@@ -30,7 +27,6 @@ layout(constant_id = 1) const int STRIDE = 1920;
 layout(constant_id = 2) const int TW = 5;
 layout(constant_id = 3) const int RADIUS = 2;
 layout(constant_id = 4) const int RES_CAP = 6;
-layout(constant_id = 5) const int DERIVE = 0;
 
 layout(std430, binding = 0) readonly buffer ResBuf { vec4 res4[]; };
 layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
@@ -40,17 +36,11 @@ layout(std430, binding = 5) buffer RefuseBuf { uint refusal[]; };
 layout(std430, binding = 2) buffer DstBuf { vec4 dst4[]; };
 
 layout(push_constant) uniform PushConstants {
-    // DERIVE == 0 only: the host's per-slice table, in the order the slices
-    // are aggregated. Unused (and left zero) on the derived arm.
-    int bases[9];   // element offsets of the TW wdst slices within the res buffer
-    int expect[9];  // frame tag each slice must carry (frame + 1)
-    int tags_at[9]; // tag index of each slice (slot * TW + z)
-    int src_base;   // element offset of this frame's source plane in the src ring
-    // DERIVE == 1 only: the window the slices belong to.
     int n;          // centre frame index
     int nframes;    // total frame count (for boundary clamping)
     int slot0;      // radius 0: the frame's private estimate slot
     int plane_off4; // this plane's result region, in vec4 elements
+    int src_base;   // element offset of this frame's source plane in the src ring
 } pc;
 
 const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
@@ -98,43 +88,31 @@ void main() {
     // with identical output.
     const int o = (y * STRIDE + x) >> 2;
     const int tstride4 = TEMPORAL_STRIDE >> 2;
+    // vec4 units throughout: with the host's addressing guard holding, every
+    // factor and product below stays inside int32 for any accepted config (see
+    // the estimate-cache guard in bm3d.cpp).
+    const int slot_stride4 = TW * 2 * tstride4;
+    const int slice_stride4 = 2 * tstride4;
 
     vec4 acc = vec4(0.0);
     vec4 acw = vec4(0.0);
     int used = 0;
-    if (DERIVE == 0) {
-        for (int i = 0; i < TW; ++i) {
-            // Only slices the estimation kernel witnessed for the frame this
-            // aggregation wants may contribute: a slice left as the zero fill,
-            // one whose estimation never landed, or one still holding a
-            // recycled frame's stacks is skipped rather than averaged in.
-            if (tags[pc.tags_at[i]] != uint(pc.expect[i])) {
-                continue;
-            }
-            const int b = (pc.bases[i] >> 2) + o;
-            acc += res4[b];
-            acw += res4[b + tstride4];
-            used++;
+    for (int i = 0; i < TW; ++i) {
+        // Only slices the estimation kernel witnessed for the frame this
+        // aggregation wants may contribute: a slice left as the zero fill, one
+        // whose estimation never landed, or one still holding a recycled
+        // frame's stacks is skipped rather than averaged in.
+        const int z = agg_z(i);
+        const int m = clamp(pc.n - RADIUS + i, 0, pc.nframes - 1);
+        const int slot = slot_of(m);
+        if (tags[slot * TW + z] != uint(expect_of(m, z))) {
+            continue;
         }
-    } else {
-        // vec4 units throughout: with the host's addressing guard holding, each
-        // factor and each product below stays inside int32 for every accepted
-        // configuration (see the estimate-cache guard in bm3d.cpp).
-        const int slot_stride4 = TW * 2 * tstride4;
-        const int slice_stride4 = 2 * tstride4;
-        for (int i = 0; i < TW; ++i) {
-            const int z = agg_z(i);
-            const int m = clamp(pc.n - RADIUS + i, 0, pc.nframes - 1);
-            const int slot = slot_of(m);
-            if (tags[slot * TW + z] != uint(expect_of(m, z))) {
-                continue;
-            }
-            const int b =
-                slot * slot_stride4 + pc.plane_off4 + z * slice_stride4 + o;
-            acc += res4[b];
-            acw += res4[b + tstride4];
-            used++;
-        }
+        const int b =
+            slot * slot_stride4 + pc.plane_off4 + z * slice_stride4 + o;
+        acc += res4[b];
+        acw += res4[b + tstride4];
+        used++;
     }
 
     // A slot whose estimation never landed (still the zero fill, or only partly
@@ -153,17 +131,10 @@ void main() {
         atomicAdd(skipped[0], 1u);
         if (atomicCompSwap(refusal[0], 0u, 1u) == 0u) {
             for (int i = 0; i < TW; ++i) {
-                int want;
-                int at;
-                if (DERIVE == 0) {
-                    want = pc.expect[i];
-                    at = pc.tags_at[i];
-                } else {
-                    const int z = agg_z(i);
-                    const int m = clamp(pc.n - RADIUS + i, 0, pc.nframes - 1);
-                    want = expect_of(m, z);
-                    at = slot_of(m) * TW + z;
-                }
+                const int z = agg_z(i);
+                const int m = clamp(pc.n - RADIUS + i, 0, pc.nframes - 1);
+                const int want = expect_of(m, z);
+                const int at = slot_of(m) * TW + z;
                 if (tags[at] != uint(want)) {
                     refusal[2] = uint(want);
                     refusal[3] = tags[at];
