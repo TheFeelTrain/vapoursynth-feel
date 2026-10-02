@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - BM3Dv2's `radius` now accepts up to 16 instead of 4, matching vszipcl.
+- BM3Dv2 now denoises all planes of YUV and RGB clips and supports the joint 4:4:4 `chroma` mode.
 
 ## [1.0.0] - 2026-10-01
 

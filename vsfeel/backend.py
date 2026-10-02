@@ -42,10 +42,9 @@ class _FeelBM3DPlugin:
     """Stand-in for the ``core.vsfeel`` plugin surface.
 
     Exposes ``BM3Dv2`` with a signature extended by the parameters other
-    BM3Dv2 plugins accept (``chroma``, ...). vsfeel denoises luma only and
-    passes chroma through (see the plugin's own chroma-passthrough test), so
-    a ``chroma=True`` request cannot be honoured and is rejected instead of
-    being silently dropped before calling the real function.
+    BM3Dv2 plugins accept (``chroma``, ...). vsfeel's BM3Dv2 takes ``chroma``
+    itself now (the reference's joint 4:4:4 entry), so the wrapper forwards it
+    and only drops what the plugin does not declare.
     """
 
     def __init__(self) -> None:
@@ -53,21 +52,23 @@ class _FeelBM3DPlugin:
 
         func = vs.core.vsfeel.BM3Dv2
         sig = func.__signature__
-        chroma = inspect.Parameter("chroma", inspect.Parameter.KEYWORD_ONLY, default=False)
+        if "chroma" not in sig.parameters:
+            # Older plugin builds do not declare it; advertising it keeps the
+            # wrapper's surface identical to the other BM3Dv2 plugins.
+            chroma = inspect.Parameter("chroma", inspect.Parameter.KEYWORD_ONLY, default=False)
+            sig = sig.replace(parameters=[*sig.parameters.values(), chroma])
 
         def bm3d_v2(*args: Any, **kwargs: Any) -> vs.VideoNode:
             # vsdenoise passes chroma twice (once in its own kwargs, once
             # forced from the clip geometry), so pop it before the duplicate
             # becomes a TypeError.
-            chroma = kwargs.pop("chroma", False)
-            if chroma:
-                raise vs.Error(
-                    "core.vsfeel.BM3Dv2 does not support chroma=True "
-                    "(luma only, chroma passes through unprocessed)"
-                )
-            return func(*args, **_drop_unsupported(func, kwargs))
+            chroma_value = kwargs.pop("chroma", False)
+            forwarded = _drop_unsupported(func, kwargs)
+            if "chroma" in sig.parameters:
+                forwarded["chroma"] = int(bool(chroma_value))
+            return func(*args, **forwarded)
 
-        bm3d_v2.__signature__ = sig.replace(parameters=[*sig.parameters.values(), chroma])  # type: ignore[attr-defined]
+        bm3d_v2.__signature__ = sig  # type: ignore[attr-defined]
         self.BM3Dv2 = bm3d_v2
 
 

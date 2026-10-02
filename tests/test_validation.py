@@ -34,6 +34,8 @@ FILTERS = [
     "DFTTest",
     "NLMeans",
     "BM3Dv2",
+    "BM3Dv2Color",
+    "BM3Dv2Joint",
     "EEDI3",
     "EEDI3H",
     "EEDI3AA",
@@ -77,6 +79,17 @@ _SCRIPT = textwrap.dedent(f"""\
     elif name == "BM3Dv2":
         node = core.vsfeel.BM3Dv2(g32, sigma=0.7, radius=2, bm_range=16,
                                   ps_range=7, block_step=4)
+    elif name == "BM3Dv2Color":
+        # Three per-plane entries live at once: separate source rings, estimate
+        # stacks and witness regions, one aggregation dispatch per plane.
+        yuv = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
+        node = core.vsfeel.BM3Dv2(yuv, sigma=[0.7, 0.5, 0.5], radius=2,
+                                  bm_range=2, ps_range=1, block_step=4)
+    elif name == "BM3Dv2Joint":
+        # The joint 4:4:4 entry: one packed stack holding all three planes.
+        yuv444 = core.resize.Bicubic(src, format=vs.YUV444PS)
+        node = core.vsfeel.BM3Dv2(yuv444, sigma=[0.7, 0.7, 0.7], radius=2,
+                                  bm_range=2, ps_range=1, block_step=4, chroma=1)
     elif name == "EEDI3":
         node = core.vsfeel.EEDI3(g16, field=1)
     elif name == "EEDI3H":

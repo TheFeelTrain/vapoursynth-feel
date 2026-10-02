@@ -616,8 +616,21 @@ core = vs.core
 core.max_cache_size = spec.get("max_cache_size", 256)
 
 src = core.bs.VideoSource(spec["source"])
-clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
-                          bits=32, fulls=True, fulld=True)
+# ``clip`` names the input the filter is graded on; the default is the Gray32
+# clip every single-plane filter uses. A filter that processes chroma is graded
+# on a color clip instead, so its per-plane caches see the real thing.
+kind = spec.get("clip", "gray32")
+if kind == "gray32":
+    clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
+                              bits=32, fulls=True, fulld=True)
+elif kind == "yuv420_32":
+    clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
+elif kind == "yuv444_32":
+    clip = core.resize.Bicubic(src, format=vs.YUV444PS)
+elif kind == "rgb32":
+    clip = core.resize.Bicubic(src, format=vs.RGBS, matrix_in_s="709")
+else:
+    raise SystemExit("bad clip kind %r" % kind)
 if spec.get("nframes"):
     clip = core.std.Loop(clip, times=spec["nframes"])
 
@@ -677,21 +690,23 @@ print("RESULT " + json.dumps({"orders": worst, "num_frames": nf}), flush=True)
 )
 
 
-def temporal_order_diff(filter_name, params, nframes=None, plane=0, timeout=600.0):
+def temporal_order_diff(filter_name, params, nframes=None, plane=0, clip="gray32", timeout=600.0):
     """Worst pixel diff per frame-request ordering, against the serial run.
 
     ``filter_name`` is the ``core.vsfeel`` function; ``params`` its keyword
-    arguments (temporal radius/window set by the caller); ``nframes`` loops the
-    clip to that length, which is how the 1- and 2-frame cases are built.  Skips
-    from the reference protocol are turned into failures: there is no external
-    reference here, so anything that dies before the oracle completes is a
-    vsfeel failure, not a missing plugin.
+    arguments (temporal radius/window set by the caller); ``clip`` names the
+    input kind (see the script above); ``nframes`` loops the clip to that
+    length, which is how the 1- and 2-frame cases are built.  Skips from the
+    reference protocol are turned into failures: there is no external reference
+    here, so anything that dies before the oracle completes is a vsfeel
+    failure, not a missing plugin.
     """
     spec = {
         "source": NOISE_MKV,
         "filter": filter_name,
         "params": params,
         "plane": plane,
+        "clip": clip,
         "max_cache_size": 256,
     }
     if nframes is not None:
@@ -706,10 +721,12 @@ def temporal_order_diff(filter_name, params, nframes=None, plane=0, timeout=600.
 
 
 def assert_temporal_order_consistent(
-    filter_name, params, tol=1e-5, nframes=None, plane=0, timeout=600.0
+    filter_name, params, tol=1e-5, nframes=None, plane=0, clip="gray32", timeout=600.0
 ):
     """Every request order must reproduce the serial result within ``tol``."""
-    worst = temporal_order_diff(filter_name, params, nframes=nframes, plane=plane, timeout=timeout)
+    worst = temporal_order_diff(
+        filter_name, params, nframes=nframes, plane=plane, clip=clip, timeout=timeout
+    )
     bad = {name: w for name, w in worst.items() if w > tol}
     assert not bad, (
         f"{filter_name} output depends on frame-request order (tol {tol:g}, params {params}): {bad}"

@@ -275,6 +275,9 @@ for _w in WIDTHS:
     _add("gaussblur", 16, _w, 0, _GAUSS_PARAMS, 0.0, "yuv420")
     _add("bilateral", 32, _w, 0, _BILATERAL_PARAMS, TOL_F32_ULP, "yuv420")
     _add("bilateral", 16, _w, 0, _BILATERAL_PARAMS, TOL_U16_LSB, "yuv420")
+    # BM3D denoises every plane, so the half-width chroma rows are part of the
+    # graded surface now (they were passed through before).
+    _add("bm3d", 32, _w, 0, _BM3D_PARAMS, TOL_BM3D, "yuv420")
 
 # Vertical crop: a non-zero row origin and a shorter plane exercise the row
 # staging / pad-origin path that the right-only crop leaves at row 0.

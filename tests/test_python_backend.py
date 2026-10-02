@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import cpu_node, frame_to_ndarray
+from conftest import NOISE_MKV, cpu_node, frame_to_ndarray, plane_to_ndarray
 
 pytest.importorskip("vstools")
 pytest.importorskip("vsaa")
@@ -377,22 +377,29 @@ def test_backend_context_routes_singletons(noise_gray):
     assert gauss_blur.backend == old_gauss
 
 
-def test_bm3d_wrapper_rejects_chroma(noise_gray):
-    """vsdenoise forces chroma=True on YUV444, which vsfeel cannot honour.
+def test_bm3d_wrapper_forwards_chroma(noise_gray):
+    """vsdenoise forces chroma=True on YUV444; the wrapper must forward it.
 
-    The wrapper's advertised ``chroma`` parameter must raise instead of
-    silently denoising luma only; chroma=False (and the default) still run.
+    The plugin's BM3Dv2 implements the reference's joint 4:4:4 entry, so a
+    chroma=True request runs it instead of being rejected (the wrapper used to
+    raise while the plugin denoised luma only). The clip is a real 4:4:4
+    conversion of the noise source: a Gray clip resized to 4:4:4 has constant
+    (neutral) chroma, which no filter can move. Gray keeps the default path.
     """
     from vsdenoise import bm3d as _bm3d
 
-    yuv444 = vs.core.resize.Point(noise_gray, format=vs.YUV444PS)
-    with pytest.raises(vs.Error, match="chroma"):
-        _bm3d(yuv444, 0.7, tr=2, profile=_bm3d.Profile.FAST, backend=_backend())
+    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(NOISE_MKV), format=vs.YUV444PS)
+    out = cpu_node(_bm3d(yuv444, 0.7, tr=2, profile=_bm3d.Profile.FAST, backend=_backend()))
+    for plane in range(3):
+        a = plane_to_ndarray(out.get_frame(0), plane)
+        b = plane_to_ndarray(yuv444.get_frame(0), plane)
+        assert np.isfinite(a).all(), f"non-finite plane {plane}"
+        assert float(np.abs(a - b).max()) > 1e-4, f"plane {plane} was not denoised"
     # An explicit chroma=False is a vsdenoise-level duplicate (it forces its
     # own geometry-derived value too), so cover the pass-through at the
     # wrapper entry point instead: Gray keeps the default path running.
-    out = _bm3d(noise_gray, 0.7, tr=2, profile=_bm3d.Profile.FAST, backend=_backend())
-    assert np.isfinite(frame_to_ndarray(cpu_node(out).get_frame(0))).all()
+    gray_out = _bm3d(noise_gray, 0.7, tr=2, profile=_bm3d.Profile.FAST, backend=_backend())
+    assert np.isfinite(frame_to_ndarray(cpu_node(gray_out).get_frame(0))).all()
 
 
 def test_backend_context_is_thread_safe():

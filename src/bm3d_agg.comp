@@ -27,6 +27,13 @@ layout(constant_id = 1) const int STRIDE = 1920;
 layout(constant_id = 2) const int TW = 5;
 layout(constant_id = 3) const int RADIUS = 2;
 layout(constant_id = 4) const int RES_CAP = 6;
+// Planes packed into one estimate slot: 1 for the reference's per-plane entries,
+// 3 for a joint chroma entry ([slot][plane][TW][2][HEIGHT][STRIDE]).
+layout(constant_id = 5) const int NPLANES = 1;
+// First witness slot of this entry's own region of the shared tag buffer: each
+// entry keys its estimate slots by frame index, so entries that hold different
+// frames in the same slot index must not share witnesses.
+layout(constant_id = 6) const int TAG_BASE = 0;
 
 layout(std430, binding = 0) readonly buffer ResBuf { vec4 res4[]; };
 layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
@@ -91,7 +98,7 @@ void main() {
     // vec4 units throughout: with the host's addressing guard holding, every
     // factor and product below stays inside int32 for any accepted config (see
     // the estimate-cache guard in bm3d.cpp).
-    const int slot_stride4 = TW * 2 * tstride4;
+    const int slot_stride4 = NPLANES * TW * 2 * tstride4;
     const int slice_stride4 = 2 * tstride4;
 
     vec4 acc = vec4(0.0);
@@ -105,7 +112,7 @@ void main() {
         const int z = agg_z(i);
         const int m = clamp(pc.n - RADIUS + i, 0, pc.nframes - 1);
         const int slot = slot_of(m);
-        if (tags[slot * TW + z] != uint(expect_of(m, z))) {
+        if (tags[(TAG_BASE + slot) * TW + z] != uint(expect_of(m, z))) {
             continue;
         }
         const int b =
@@ -134,7 +141,7 @@ void main() {
                 const int z = agg_z(i);
                 const int m = clamp(pc.n - RADIUS + i, 0, pc.nframes - 1);
                 const int want = expect_of(m, z);
-                const int at = slot_of(m) * TW + z;
+                const int at = (TAG_BASE + slot_of(m)) * TW + z;
                 if (tags[at] != uint(want)) {
                     refusal[2] = uint(want);
                     refusal[3] = tags[at];

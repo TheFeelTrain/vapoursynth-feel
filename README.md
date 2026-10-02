@@ -55,9 +55,10 @@ core.vsfeel.BM3Dv2(clip clip[,
     int     radius=0,               # temporal search radius in frames, 0..16 (0 = spatial only)
     int[]   ps_num=2,               # motion-predicted candidates seeding each temporal search, 1..8
     int[]   ps_range=4,             # search radius around each predicted candidate, in pixels, 1..8192
-    int     extractor_exp=0])       # aggregation weight bias, -126..127; 0 = off, >= 3 = reproducible output
+    bool    chroma=False,           # True = one joint 4:4:4 entry, whose groups come from luma
+    int     extractor_exp=0])       # aggregation weight bias, 0..127; 0 = off, >= 3 = reproducible output
 ```
-32-bit float only. Chroma passes through unprocessed.
+32-bit float Gray, YUV or RGB. `chroma=True` requires YUV444.
 
 ### DFTTest
 

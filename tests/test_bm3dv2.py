@@ -554,11 +554,14 @@ def test_bm3dv2_preserves_gray_frame_props(noise_gray):
     assert_preserves_frame_props(_run, noise_gray, radius=2)
 
 
-def test_bm3dv2_yuv_passthrough(noise_gray):
-    """A full YUV clip is accepted: the luma must match the Gray output and
-    the chroma planes must be copied through bit-identically."""
-    src = vs.core.bs.VideoSource(NOISE_MKV)
-    yuv = vs.core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
+def test_bm3dv2_chroma_planes_are_denoised(noise_gray):
+    """A YUV clip is denoised on every plane, luma exactly as the Gray path.
+
+    The references denoise each plane independently by default (per-plane
+    geometry, parameters and sigma), so a plane left equal to the source is the
+    old luma-only passthrough, not a denoised result.
+    """
+    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(NOISE_MKV), bits=32, fulls=True, fulld=True)
     assert yuv.format.color_family == vs.YUV
 
     out = _run(yuv, radius=2)
@@ -566,15 +569,226 @@ def test_bm3dv2_yuv_passthrough(noise_gray):
 
     for n in (0, 11, 23):
         f = out.get_frame(n)
-        # luma is denoised identically to the Gray path
+        # luma is denoised identically to the Gray path (atomic-order floor)
         d = frame_to_ndarray(f) - frame_to_ndarray(ref.get_frame(n))
         assert np.abs(d).max() < 1e-5, f"luma mismatch at frame {n}"
-        # chroma is passed through unchanged (stride-aware copy)
+        # every plane moved away from the source
         s = yuv.get_frame(n)
-        for plane in (1, 2):
+        for plane in range(yuv.format.num_planes):
             a = plane_to_ndarray(f, plane)
             b = plane_to_ndarray(s, plane)
-            assert np.array_equal(a, b), f"chroma{plane} changed at frame {n}"
+            assert np.isfinite(a).all(), f"non-finite plane {plane} at frame {n}"
+            assert float(np.abs(a - b).max()) > 1e-4, (
+                f"plane {plane} was left at the source value at frame {n}"
+            )
+
+
+@pytest.mark.parametrize("sigma", [[0.7, 0.0, 0.0], [0.0, 0.7, 0.0]])
+def test_bm3dv2_unprocessed_plane_is_source_copy(sigma):
+    """A plane whose sigma is below FLT_EPSILON is a bit-exact source copy,
+    while the others are still denoised (the reference's PROC_MASK)."""
+    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(NOISE_MKV), bits=32, fulls=True, fulld=True)
+    out = BM3D(
+        yuv, sigma=sigma, radius=2, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=BLOCK_STEP
+    )
+    for n in (0, 11, 23):
+        f = out.get_frame(n)
+        s = yuv.get_frame(n)
+        for plane in range(yuv.format.num_planes):
+            a = plane_to_ndarray(f, plane)
+            b = plane_to_ndarray(s, plane)
+            assert np.isfinite(a).all(), f"non-finite plane {plane} at frame {n}"
+            if sigma[plane] == 0.0:
+                assert np.array_equal(a, b), f"sigma=0 plane {plane} changed at frame {n}"
+            else:
+                assert float(np.abs(a - b).max()) > 1e-4, (
+                    f"sigma={sigma[plane]} plane {plane} was not denoised at frame {n}"
+                )
+
+
+def test_bm3dv2_all_planes_below_epsilon_returns_source():
+    """Every plane below FLT_EPSILON hands the source clip back unchanged.
+
+    Both references' BM3Dv2 take this shortcut instead of building a filter, so
+    the result is bit-exact. The core auto-uploads a CPU clip for the plugin's
+    ``vnode:gpu`` argument, so the node it hands back is GPU resident like any
+    other BM3Dv2 output.
+    """
+    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(NOISE_MKV), bits=32, fulls=True, fulld=True)
+    out = vs.core.vsfeel.BM3Dv2(yuv, sigma=[0.0], radius=2)
+    assert out.gpu_resident, "BM3Dv2 output must stay GPU resident"
+    node = cpu_node(out)
+    for n in (0, 11, 23):
+        a, b = node.get_frame(n), yuv.get_frame(n)
+        for plane in range(yuv.format.num_planes):
+            assert np.array_equal(plane_to_ndarray(a, plane), plane_to_ndarray(b, plane)), (
+                f"plane {plane} changed at frame {n}"
+            )
+
+
+def test_bm3dv2_per_plane_parameters_are_honoured():
+    """Each plane runs with its own sigma/block_step/bm_range/ps_num/ps_range.
+
+    Two runs that differ only in plane 1's parameters must differ on plane 1
+    and agree elsewhere: a filter that ignored the per-plane arrays would
+    produce identical frames.
+    """
+    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(NOISE_MKV), bits=32, fulls=True, fulld=True)
+    base = dict(
+        sigma=[0.7, 0.7, 0.7],
+        radius=2,
+        bm_range=[16, 16, 16],
+        ps_range=[7, 7, 7],
+        block_step=[4, 4, 4],
+        ps_num=[2, 2, 2],
+    )
+    other = dict(
+        base, sigma=[0.7, 0.3, 0.7], block_step=[4, 8, 4], bm_range=[16, 4, 16], ps_range=[7, 2, 7]
+    )
+    a = BM3D(yuv, **base)
+    b = BM3D(yuv, **other)
+    for n in (0, 11, 23):
+        for plane in range(3):
+            d = float(
+                np.abs(
+                    plane_to_ndarray(a.get_frame(n), plane)
+                    - plane_to_ndarray(b.get_frame(n), plane)
+                ).max()
+            )
+            if plane == 1:
+                assert d > 1e-4, f"plane 1 parameters were ignored at frame {n}"
+            else:
+                assert d < 1e-5, f"plane {plane} changed with plane 1's parameters"
+
+
+def test_bm3dv2_chroma_requires_yuv444():
+    """chroma=True is the reference's joint entry and needs 4:4:4 input."""
+    yuv420 = vs.core.fmtc.bitdepth(
+        vs.core.bs.VideoSource(NOISE_MKV), bits=32, fulls=True, fulld=True
+    )
+    with pytest.raises(vs.Error, match="YUV444"):
+        vs.core.vsfeel.BM3Dv2(yuv420, sigma=0.7, chroma=1)
+    rgb = vs.core.resize.Bicubic(
+        vs.core.bs.VideoSource(NOISE_MKV), format=vs.RGBS, matrix_in_s="709"
+    )
+    with pytest.raises(vs.Error, match="YUV444"):
+        vs.core.vsfeel.BM3Dv2(rgb, sigma=0.7, chroma=1)
+
+
+def test_bm3dv2_joint_chroma_denoises_every_plane():
+    """chroma=True packs the three 4:4:4 planes into one entry; a sigma-zero
+    plane of that entry is skipped and comes from the source."""
+    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(NOISE_MKV), format=vs.YUV444PS)
+    out = BM3D(
+        yuv444,
+        sigma=[0.7, 0.7, 0.7],
+        radius=2,
+        bm_range=BM_RANGE,
+        ps_range=PS_RANGE,
+        block_step=BLOCK_STEP,
+        chroma=1,
+    )
+    for n in (0, 11, 23):
+        f, s = out.get_frame(n), yuv444.get_frame(n)
+        for plane in range(3):
+            a = plane_to_ndarray(f, plane)
+            assert np.isfinite(a).all(), f"non-finite plane {plane} at frame {n}"
+            assert float(np.abs(a - plane_to_ndarray(s, plane)).max()) > 1e-4, (
+                f"joint plane {plane} was not denoised at frame {n}"
+            )
+
+    mixed = BM3D(
+        yuv444,
+        sigma=[0.7, 0.0, 0.7],
+        radius=2,
+        bm_range=BM_RANGE,
+        ps_range=PS_RANGE,
+        block_step=BLOCK_STEP,
+        chroma=1,
+    )
+    for n in (0, 11):
+        f, s = mixed.get_frame(n), yuv444.get_frame(n)
+        assert np.array_equal(plane_to_ndarray(f, 1), plane_to_ndarray(s, 1)), (
+            f"joint sigma=0 plane 1 changed at frame {n}"
+        )
+        assert float(np.abs(plane_to_ndarray(f, 0) - plane_to_ndarray(s, 0)).max()) > 1e-4
+
+
+def test_bm3dv2_joint_chroma_shares_luma_groups():
+    """Joint mode is not the per-plane mode: its chroma planes are filtered
+    with the groups block matching found on luma, so the two differ."""
+    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(NOISE_MKV), format=vs.YUV444PS)
+    kw = dict(
+        sigma=[0.7, 0.7, 0.7], radius=2, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=BLOCK_STEP
+    )
+    separate = BM3D(yuv444, **kw)
+    joint = BM3D(yuv444, chroma=1, **kw)
+    for n in (0, 11, 23):
+        for plane in (1, 2):
+            d = float(
+                np.abs(
+                    plane_to_ndarray(joint.get_frame(n), plane)
+                    - plane_to_ndarray(separate.get_frame(n), plane)
+                ).max()
+            )
+            assert d > 1e-4, f"plane {plane} is identical in joint and per-plane mode"
+        d0 = float(
+            np.abs(
+                plane_to_ndarray(joint.get_frame(n), 0) - plane_to_ndarray(separate.get_frame(n), 0)
+            ).max()
+        )
+        assert d0 < 1e-5, f"joint mode changed luma at frame {n}"
+
+
+def test_bm3dv2_rgb_is_denoised():
+    """RGB input runs all three planes like the references do."""
+    rgb = vs.core.resize.Bicubic(
+        vs.core.bs.VideoSource(NOISE_MKV), format=vs.RGBS, matrix_in_s="709"
+    )
+    out = BM3D(
+        rgb, sigma=0.7, radius=2, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=BLOCK_STEP
+    )
+    for n in (0, 11, 23):
+        f, s = out.get_frame(n), rgb.get_frame(n)
+        for plane in range(3):
+            a = plane_to_ndarray(f, plane)
+            assert np.isfinite(a).all(), f"non-finite RGB plane {plane} at frame {n}"
+            assert float(np.abs(a - plane_to_ndarray(s, plane)).max()) > 1e-4, (
+                f"RGB plane {plane} was not denoised at frame {n}"
+            )
+
+
+def test_bm3dv2_rejects_subsampled_plane_below_block():
+    """A processed chroma plane smaller than the 8x8 block must be refused.
+
+    The kernel clamps block origins to (dimension - 8), so an 8-row YUV420 clip
+    (4-row chroma) would address before its plane's buffer.
+    """
+    yuv420 = vs.core.fmtc.bitdepth(
+        vs.core.bs.VideoSource(NOISE_MKV), bits=32, fulls=True, fulld=True
+    )
+    small = vs.core.std.CropAbs(yuv420, width=640, height=8)
+    with pytest.raises(vs.Error, match="8x8"):
+        vs.core.vsfeel.BM3Dv2(small, sigma=0.7, radius=1)
+    # the same clip is fine when only luma is denoised
+    ok = vs.core.vsfeel.BM3Dv2(small, sigma=[0.7, 0.0], radius=1)
+    assert ok.num_frames == small.num_frames
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"sigma": [0.7, 0.7, 0.7]},
+        {"sigma": [0.7], "chroma": 1},
+    ],
+)
+def test_bm3dv2_accepts_yuv444(kwargs):
+    """The per-plane and joint entry points both accept 4:4:4 input."""
+    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(NOISE_MKV), format=vs.YUV444PS)
+    out = BM3D(yuv444, radius=1, bm_range=2, ps_range=1, block_step=4, **kwargs)
+    for n in (0, 5):
+        for plane in range(3):
+            assert np.isfinite(plane_to_ndarray(out.get_frame(n), plane)).all()
 
 
 @pytest.mark.parametrize("sigma", [0.0, 1e-9])
@@ -744,6 +958,9 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     ref = sys.argv[1]
     kwargs = json.loads(sys.argv[2])
     ref_pass = int(sys.argv[3])
+    spec = json.loads(sys.argv[4])
+    kind = spec.get("clip", "gray32")
+    frames = spec.get("frames", [0, 11, 23])
 
     def vsfeel(clip, **kw):
         # The host cannot read a GPU-resident frame's pixels, and this script
@@ -753,9 +970,22 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 
     core.max_cache_size = 1024 * 56
     src = core.bs.VideoSource({NOISE_MKV!r})
-    clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
+    if kind == "gray32":
+        clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
+    elif kind == "yuv420_32":
+        clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
+    elif kind == "yuv444_32":
+        clip = core.resize.Bicubic(src, format=vs.YUV444PS)
+    elif kind == "rgb32":
+        clip = core.resize.Bicubic(src, format=vs.RGBS, matrix_in_s="709")
+    else:
+        raise SystemExit("bad clip kind %r" % kind)
 
-    frames = (0, 11, 23)
+    planes = list(range(clip.format.num_planes))
+
+    def read_all(node, n):
+        frame = node.get_frame(n)
+        return [read_plane(frame, p, np.float32) for p in planes]
 
     basic = None
     if ref_pass:
@@ -764,7 +994,7 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
         # reference; the frames stay cached for the reference below.
         try:
             basic = vsfeel(clip, **kwargs)
-            _ = [read_plane(basic.get_frame(n), 0, np.float32) for n in frames]
+            _ = [read_all(basic, n) for n in frames]
         except Exception as exc:
             print("VSFEEL fail: basic estimate: %s: %s" % (type(exc).__name__, exc), flush=True)
             raise SystemExit(3)
@@ -776,7 +1006,7 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
             ref_node = getattr(core, ref).BM3Dv2(clip, ref=basic, **kwargs)
         else:
             ref_node = getattr(core, ref).BM3Dv2(clip, **kwargs)
-        ref_frames = [read_plane(ref_node.get_frame(n), 0, np.float32) for n in frames]
+        ref_frames = [read_all(ref_node, n) for n in frames]
     except Exception as exc:
         print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
         raise SystemExit(2)
@@ -786,52 +1016,79 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     my_node = (vsfeel(clip, ref=basic, **kwargs) if ref_pass
                else vsfeel(clip, **kwargs))
     worst = 0.0
-    for n, b in zip(frames, ref_frames):
-        a = read_plane(my_node.get_frame(n), 0, np.float32)
-        if not (np.isfinite(a).all() and np.isfinite(b).all()):
-            print("VSFEEL fail: non-finite at frame %d" % n, flush=True)
-            raise SystemExit(3)
-        worst = max(worst, float(np.abs(a - b).max()))
-    print("RESULT " + json.dumps(worst), flush=True)
+    per_plane = [0.0] * len(planes)
+    for n, ref_planes in zip(frames, ref_frames):
+        my_planes = read_all(my_node, n)
+        for i, (a, b) in enumerate(zip(my_planes, ref_planes)):
+            if not (np.isfinite(a).all() and np.isfinite(b).all()):
+                print("VSFEEL fail: non-finite at frame %d plane %d" % (n, planes[i]), flush=True)
+                raise SystemExit(3)
+            d = float(np.abs(a - b).max())
+            per_plane[i] = max(per_plane[i], d)
+            worst = max(worst, d)
+    print("RESULT " + json.dumps({{"maxdiff": worst, "per_plane": per_plane}}), flush=True)
 """)
 
 BASE_KWARGS = dict(sigma=0.7, radius=2, bm_range=16, ps_range=7, block_step=4)
 
 
 def _max_diff_vs_reference(
-    kwargs: dict, ref: str, ref_pass: bool = False, timeout: float = 600
-) -> float:
-    """Run the comparison in a subprocess.
+    kwargs: dict,
+    ref: str,
+    ref_pass: bool = False,
+    clip: str = "gray32",
+    frames=(0, 11, 23),
+    timeout: float = 600,
+) -> dict:
+    """Run the comparison in a subprocess; returns ``maxdiff``/``per_plane``.
 
     Raises :class:`ReferenceUnavailable` when ``ref`` is missing/failed and
     :class:`AssertionError` (with the captured tail) when vsfeel failed.
     """
+    spec = {"clip": clip, "frames": list(frames)}
     return run_compare_subprocess(
         _COMPARE_SCRIPT,
-        [ref, json.dumps(kwargs), str(int(ref_pass))],
+        [ref, json.dumps(kwargs), str(int(ref_pass)), json.dumps(spec)],
         timeout=timeout,
     )
 
 
-def _compare_against_any_reference(kwargs: dict, ref_pass: bool = False) -> tuple[str, float]:
-    """Try vszipcl then bm3dhip; skip only if none is usable."""
+def _compare_against_any_reference(
+    kwargs: dict, ref_pass: bool = False, clip: str = "gray32"
+) -> tuple[str, dict]:
+    """Try vszipcl, then bm3dhip; skip only if none is usable.
+
+    ``clip`` names the input the comparison runs on (see the compare script);
+    the color kinds grade the chroma planes as well as luma.
+    """
     reasons = []
     for ref in ("vszipcl", "bm3dhip"):
         if not hasattr(vs.core, ref) or not hasattr(getattr(vs.core, ref), "BM3Dv2"):
             reasons.append(f"{ref}: not installed")
             continue
         try:
-            return ref, _max_diff_vs_reference(kwargs, ref, ref_pass=ref_pass)
+            return ref, _max_diff_vs_reference(kwargs, ref, ref_pass=ref_pass, clip=clip)
         except ReferenceUnavailable as exc:
             reasons.append(f"{ref}: {exc}")
     skip_or_fail_reference("no usable reference plugin (vszipcl/bm3dhip): " + "; ".join(reasons))
 
 
+def _compare_against_bm3dvk(kwargs: dict, ref_pass: bool = False, clip: str = "yuv444_32"):
+    """bm3dvk first (the preferred reference where the two disagree), then the
+    others through the shared helper."""
+    if hasattr(vs.core, "bm3dvk") and hasattr(vs.core.bm3dvk, "BM3Dv2"):
+        try:
+            return "bm3dvk", _max_diff_vs_reference(kwargs, "bm3dvk", ref_pass=ref_pass, clip=clip)
+        except ReferenceUnavailable:
+            pass
+    return _compare_against_any_reference(kwargs, ref_pass=ref_pass, clip=clip)
+
+
 def test_bm3dv2_ref_matches_reference(noise_gray):
     """The final (Wiener) pass must closely match the reference implementations
     when given the same basic-estimate ref clip."""
-    ref, maxdiff = _compare_against_any_reference(dict(BASE_KWARGS), ref_pass=True)
-    assert maxdiff < 0.01, f"max diff vs {ref} (ref pass): {maxdiff}"
+    ref, payload = _compare_against_any_reference(dict(BASE_KWARGS), ref_pass=True)
+    assert payload["maxdiff"] < 0.01, f"max diff vs {ref} (ref pass): {payload}"
 
 
 # Parameter sweep around the defaults: every entry is merged over
@@ -892,8 +1149,8 @@ def _sweep_id(cfg: dict) -> str:
 def test_bm3dv2_parameter_sweep_matches_reference(noise_gray, cfg, tol):
     """Parameter grid around the defaults must track the reference (basic
     estimate pass)."""
-    ref, maxdiff = _compare_against_any_reference(dict(BASE_KWARGS, **cfg))
-    assert maxdiff < tol, f"max diff vs {ref} ({_sweep_id(cfg)}): {maxdiff}"
+    ref, payload = _compare_against_any_reference(dict(BASE_KWARGS, **cfg))
+    assert payload["maxdiff"] < tol, f"max diff vs {ref} ({_sweep_id(cfg)}): {payload}"
 
 
 # The plugin's own defaults (sigma=3.0, radius=0, bm_range=9, block_step=8,
@@ -914,8 +1171,8 @@ def test_bm3dv2_parameter_sweep_matches_reference(noise_gray, cfg, tol):
 def test_bm3dv2_plugin_defaults_match_reference(noise_gray, kwargs, tol):
     """The documented defaults must produce the reference result, not just
     any finite frame (test_device_limits/test_lifecycle only check those)."""
-    ref, maxdiff = _compare_against_any_reference(kwargs)
-    assert maxdiff < tol, f"max diff vs {ref} ({kwargs}): {maxdiff}"
+    ref, payload = _compare_against_any_reference(kwargs)
+    assert payload["maxdiff"] < tol, f"max diff vs {ref} ({kwargs}): {payload}"
 
 
 # Remeasured with the repaired oracle (vszipcl, basic estimate, radius sweep):
@@ -933,8 +1190,8 @@ def test_bm3dv2_matches_reference(noise_gray, radius):
     runs in a subprocess: a crashed reference must not take down the suite.
     bm3dhip implements the same algorithm and is expected to match vszipcl.
     """
-    ref, maxdiff = _compare_against_any_reference(dict(BASE_KWARGS, radius=radius))
-    assert maxdiff < 0.01, f"max diff vs {ref}: {maxdiff}"
+    ref, payload = _compare_against_any_reference(dict(BASE_KWARGS, radius=radius))
+    assert payload["maxdiff"] < 0.01, f"max diff vs {ref}: {payload}"
 
 
 # ---------------------------------------------------------------------------
@@ -981,3 +1238,192 @@ def test_bm3dv2_extractor_exp_changes_aggregation(noise_gray):
             f"non-finite extractor_exp output at frame {n}"
         )
         assert float(np.abs(fb - fc).max()) > 1e-4, f"extractor_exp=20 left frame {n} unchanged"
+
+
+# ---------------------------------------------------------------------------
+# Multi-plane reference comparison
+# ---------------------------------------------------------------------------
+#
+# The default (per-plane) mode block-matches every plane on its own content at
+# its own geometry; chroma=True is the references' joint entry, where one
+# kernel filters all three 4:4:4 planes with the groups found on luma. Both are
+# graded against bm3dvk (the preferred reference where the two disagree) with
+# vszipcl/bm3dhip as the fallback. Tolerances are the same measurement-bounded
+# kind as the luma sweep: the residual is a handful of block-match decisions
+# that flip on rounding order, not a systematic difference.
+#
+# Measured per-plane maxima, bm3dvk, frames 0/11/23 (640x360 noise clip):
+# yuv420 r2 0.0066/0.0068/0.0079, yuv444 r2 0.0070/0.0052/0.0056,
+# rgb r2 0.0077/0.0071/0.0075, joint yuv444 r2 0.0070/0.0054/0.0056,
+# joint r0 0.0061/2.4e-7/2.4e-7, per-plane params 0.0066/0.0164/0.0099,
+# Wiener ref pass (joint) 0.0027/0.0016/0.0014. The 0.02 bound covers the
+# loosest with headroom; the joint-r0 chroma planes agree at ulp level.
+MULTIPLANE_CLIPS = [
+    ("yuv420_32", 0.02),
+    ("yuv444_32", 0.02),
+    ("rgb32", 0.02),
+]
+
+
+@pytest.mark.parametrize("clip,tol", MULTIPLANE_CLIPS, ids=[c for c, _ in MULTIPLANE_CLIPS])
+def test_bm3dv2_color_clip_matches_reference(clip, tol):
+    """Every plane of a color clip must track the reference's per-plane mode."""
+    ref, payload = _compare_against_bm3dvk(dict(BASE_KWARGS), clip=clip)
+    assert payload["maxdiff"] < tol, f"max diff vs {ref} ({clip}): {payload}"
+
+
+@pytest.mark.parametrize(
+    "kwargs,tol",
+    [
+        ({"chroma": 1}, 0.02),
+        ({"chroma": 1, "radius": 0}, 0.02),
+        ({"chroma": 1, "radius": 1}, 0.02),
+        ({"chroma": 1, "radius": 3}, 0.03),
+        ({"chroma": 1, "sigma": [0.5, 1.1, 0.3]}, 0.03),
+        ({"chroma": 1, "sigma": [0.7, 0.0, 0.9]}, 0.03),
+        ({"chroma": 1, "sigma": [0.0, 0.7, 0.7]}, 0.02),
+        ({"chroma": 1, "block_step": 1}, 0.03),
+        ({"chroma": 1, "ps_num": 5}, 0.03),
+        ({"chroma": 1, "extractor_exp": 6}, 0.03),
+    ],
+    ids=[
+        "r2",
+        "r0",
+        "r1",
+        "r3",
+        "per-plane-sigma",
+        "mixed-sigma",
+        "luma-skipped",
+        "block-step-1",
+        "ps-num-5",
+        "extractor-6",
+    ],
+)
+def test_bm3dv2_joint_chroma_matches_reference(kwargs, tol):
+    """chroma=True must reproduce the reference's joint (luma-grouped) entry."""
+    ref, payload = _compare_against_bm3dvk(dict(BASE_KWARGS, **kwargs), clip="yuv444_32")
+    assert payload["maxdiff"] < tol, f"max diff vs {ref} (chroma=1, {kwargs}): {payload}"
+
+
+@pytest.mark.parametrize(
+    "clip,kwargs",
+    [
+        ("yuv420_32", {}),
+        ("yuv444_32", {}),
+        ("rgb32", {}),
+        (
+            "yuv420_32",
+            {
+                "sigma": [0.7, 0.4, 1.2],
+                "bm_range": [16, 4, 12],
+                "ps_range": [7, 2, 6],
+                "block_step": [4, 8, 6],
+                "ps_num": [2, 3, 1],
+            },
+        ),
+        ("yuv420_32", {"sigma": [0.7, 0.0, 0.0]}),
+        ("yuv444_32", {"chroma": 1}),
+    ],
+    ids=["yuv420", "yuv444", "rgb", "per-plane-params", "mixed-sigma", "joint"],
+)
+def test_bm3dv2_color_ref_pass_matches_reference(clip, kwargs):
+    """The Wiener pass must match on color clips too, both entry modes."""
+    ref, payload = _compare_against_bm3dvk(dict(BASE_KWARGS, **kwargs), ref_pass=True, clip=clip)
+    assert payload["maxdiff"] < 0.02, f"max diff vs {ref} ({clip}, {kwargs}, ref pass): {payload}"
+
+
+def test_bm3dv2_per_plane_params_match_reference():
+    """Per-plane parameter arrays must land on the reference's per-plane run."""
+    kwargs = dict(
+        sigma=[0.7, 0.4, 1.2],
+        radius=2,
+        bm_range=[16, 4, 12],
+        ps_range=[7, 2, 6],
+        block_step=[4, 8, 6],
+        ps_num=[2, 3, 1],
+    )
+    ref, payload = _compare_against_bm3dvk(kwargs, clip="yuv420_32")
+    assert payload["maxdiff"] < 0.03, f"max diff vs {ref} (per-plane params): {payload}"
+
+
+# ---------------------------------------------------------------------------
+# Multi-plane self-consistency
+# ---------------------------------------------------------------------------
+#
+# The per-entry caches (source ring, estimate stacks, witnesses) are separate
+# tables now, so the request-order and parallel-load oracles are re-run on a
+# color clip where three entries are live at once.
+
+
+def _yuv420_clip():
+    return vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(NOISE_MKV), bits=32, fulls=True, fulld=True)
+
+
+def test_bm3dv2_color_parallel_load_matches_serial():
+    """Three live entries must survive the deep parallel pipeline."""
+    clip = _yuv420_clip()
+    kwargs = dict(sigma=0.7, radius=2, bm_range=2, ps_range=1, block_step=4)
+    par = eval_parallel(BM3D, clip, plane=1, **kwargs)
+    ref = BM3D(clip, **kwargs)
+    for n in range(clip.num_frames):
+        d = par[n] - plane_to_ndarray(ref.get_frame(n), 1)
+        assert np.abs(d).max() < 1e-5, f"parallel/serial chroma mismatch at frame {n}"
+
+
+def test_bm3dv2_color_parallel_load_repeated():
+    """The per-entry reservation is atomic, so concurrent neighbours must drain.
+
+    Reserving one entry at a time deadlocked roughly 40% of concurrent
+    three-entry runs (see notes/BM3D.md): a frame could hold entry 0's slots
+    while waiting for entry 1's, against the mirror image. Each round is a fresh
+    node under eval_parallel's worker timeout, so a regression fails with a
+    stuck-worker report instead of hanging the suite.
+    """
+    clip = _yuv420_clip().std.CropAbs(width=320, height=180)
+    kwargs = dict(sigma=0.7, radius=2, bm_range=2, ps_range=1, block_step=4)
+    for round_ in range(3):
+        frames = eval_parallel(BM3D, clip, plane=2, timeout=120.0, **kwargs)
+        assert all(np.isfinite(f).all() for f in frames), f"non-finite round {round_}"
+
+
+def test_bm3dv2_color_deterministic():
+    """Two runs must agree per plane (the atomic-order floor, ~3e-8)."""
+    clip = _yuv420_clip()
+    kwargs = dict(sigma=0.7, radius=2, bm_range=2, ps_range=1, block_step=4)
+    a, b = BM3D(clip, **kwargs), BM3D(clip, **kwargs)
+    for n in (0, 11, 23):
+        for plane in range(3):
+            d = plane_to_ndarray(a.get_frame(n), plane) - plane_to_ndarray(b.get_frame(n), plane)
+            assert np.abs(d).max() < 1e-5, f"nondeterministic plane {plane} at frame {n}"
+
+
+@pytest.mark.parametrize("clip", ["yuv420_32", "yuv444_32", "rgb32"])
+def test_bm3dv2_color_frame_request_order_matches_serial(clip):
+    """Every request order must reproduce the serial run on a color clip."""
+    assert_temporal_order_consistent(
+        "BM3Dv2",
+        {"sigma": 0.7, "radius": 2, "bm_range": 2, "ps_range": 1, "block_step": 4},
+        tol=1e-5,
+        nframes=12,
+        clip=clip,
+        timeout=300,
+    )
+
+
+def test_bm3dv2_joint_frame_request_order_matches_serial():
+    """The joint entry's three planes share one slot and one witness table."""
+    assert_temporal_order_consistent(
+        "BM3Dv2",
+        {
+            "sigma": [0.7, 0.7, 0.7],
+            "radius": 2,
+            "bm_range": 2,
+            "ps_range": 1,
+            "block_step": 4,
+            "chroma": 1,
+        },
+        tol=1e-5,
+        nframes=12,
+        clip="yuv444_32",
+        timeout=300,
+    )

@@ -2,7 +2,11 @@
 
 **shipped.** Vulkan port of vszipcl's BM3D (fused mode: one estimation pass per
 output frame, temporal aggregation over the stack window). Numerically faithful
-to vszipcl; see the tolerance policy in `tests/test_bm3dv2.py`.
+to vszipcl and bm3dvk; see the tolerance policy in `tests/test_bm3dv2.py`.
+Every plane of a color clip is denoised: one entry per processed plane by
+default, or one joint 4:4:4 entry under `chroma=True`, whose groups come from luma.
+A plane below its sigma threshold is a bit-exact source copy, and with all of
+them below it the filter is the source clip.
 
 Current correctness and performance fixes: all BM3D radii use exact per-candidate
 SSD scores with a flattened candidate partition; per-slot witness clearing is
@@ -13,11 +17,37 @@ BM3D tests pass; the 1000-frame jpbd benchmark is ~940 fps for the exact
 sigma=0.7, radius=2, bm_range=9, ps_range=4, block_step=8 config (930-1015
 across sessions).
 
-Current design:
+Scoreboard — 1080p GRAY32, jpbd, `tools/benchmark.py -f bm3dv2 vsfeel vszipcl
+bm3dvk`, 1000 frames × 3 interleaved, sigma 0.7, radius 2, bm_range 16,
+ps_range 7, block_step 4:
+
+| | fps | note |
+|---|---|---|
+| vsfeel | **332.8** | exec-pool port; different benchmark config from the current working-tree scan |
+| bm3dvk | 54.8 | R80 reference |
+| vszipcl | 41.6 | |
+
+vsfeel is 6.1x the faster reference.
+
+## Implementation
 
 - Two kernels: `bm3d.comp` (block match + group + collaborative transform,
   one warp of 32 lanes = 4 sub-groups of 8 lanes, one 8x8 block each) and
   `bm3d_agg.comp` (temporal aggregation over the TW = 2r+1 stack slices).
+- One *entry* per processed plane, or one entry over all three planes of a
+  4:4:4 clip under `chroma=True`. An entry owns a source ring and an estimate
+  stack laid out `[slot][clip][plane][h][stride]` / `[slot][plane][tw][2][h][stride]`;
+  all planes of an entry share one geometry, so the plane stride is a spec
+  constant. NPLANES folds to 1 for the per-plane mode, so the single-plane
+  kernel is unchanged.
+- Per-plane parameters (`sigma`, `block_step`, `bm_range`, `ps_num`,
+  `ps_range`) are read per plane with the references' inheritance rule; chroma
+  planes use the format's subsampled geometry. In the joint entry the search
+  parameters are plane 0's and only the sigmas differ, exactly as the
+  reference's joint kernel.
+- The witness (`tags`) has one region per entry: entries key their slots by
+  frame index, so two entries can hold different frames in the same slot index
+  and must not share witnesses.
 - Estimation accumulates with hardware buffer float atomics where the device
   has them (`VK_EXT_shader_atomic_float` + its float2 companion, and
   `shaderBufferFloat32AtomicAdd` set — the plain `...Atomics` load/store/exchange
@@ -37,52 +67,52 @@ Current design:
   expected witness) in the kernel from the window centre, ring capacity and
   `aggZ`, in vec4 units; the host's push-constant table stopped fitting at
   `tw = 11` and measuring the derived one showed parity, so there is one path.
-- `radius` accepts up to 16 (vszipcl's cap; bm3dvk stops at 15), but that is
+  One dispatch per processed plane, each with its entry's buffers and its own
+  geometry.
+- `radius` accepts up to 16 (vszipcl's cap; bm3dvk stops at 15, a driver
+  binding-count limit its VAggregate has and this filter does not), but that is
   the argument cap, not the practical one: the estimate cache is a single
   buffer growing as `(2+2r)(2r+1)` plane pairs, so the device's 4 GiB
   `maxStorageBufferRange` binds first. 1080p runs radius 7 and refuses 8,
   640x360 reaches 16; every refusal is a creation-time error naming the size.
-- Degenerate paths: `sigma < FLT_EPSILON` passes the plane through (a source
-  copy), like the installed references' `PROC_MASK`.
+- Degenerate paths: `sigma < FLT_EPSILON` copies that plane through, and with
+  no plane above the threshold the filter is not built at all (the references'
+  all-zero shortcut: `BM3Dv2` hands the clip back).
+- `extractor_exp` is validated as bm3dvk does, `[0, 127]`.
 - **Everything goes through the core's exec pool** (`createGPUExecPool` /
   `gpuExecAcquire` / `gpuExecSubmit`); the filter owns no command pool, timeline
   or fence. The estimation is one submission per recomputed window position (a
-  full-recompute frame has up to 2r+1 of them) so no single submission can reach
-  Windows' TDR watchdog on a slow card (`VSFEEL_BM3D_SPLIT=0` reverts), then one
-  aggregation submission whose output plane the pool publishes.
-- The estimate stacks and source ring stay private VRAM buffers. Cross-frame
-  handoff is a per-slot *submitted* ready flag: a reader waits host side until
-  its writers' estimations are submitted, then a full pipeline barrier at the
-  start of its first command buffer supplies the execution and memory dependency
-  (a barrier's first scope is every earlier command in submission order on the
-  queue, so no per-frame semaphore wait is needed). The barrier's access scopes
-  span both directions -- the slots are *written* again here, so writes-before-
-  reads alone would leave the write-after-write half to the stage masks. A reader
-  never holds a recording context while waiting, so the pool's ring cannot
-  deadlock.
+  full-recompute frame has up to 2r+1 of them, each carrying one position of
+  every entry) so no single submission can reach Windows' TDR watchdog on a slow
+  card (`VSFEEL_BM3D_SPLIT=0` reverts), then one aggregation submission whose
+  output planes the pool publishes.
+- The estimate stacks and source rings stay private VRAM buffers, one pair per
+  entry. Cross-frame handoff is a per-slot *submitted* ready flag: a reader waits
+  host side until its writers' estimations are submitted, then a full pipeline
+  barrier at the start of its first command buffer supplies the execution and
+  memory dependency (a barrier's first scope is every earlier command in
+  submission order on the queue, so no per-frame semaphore wait is needed). The
+  barrier's access scopes span both directions -- the slots are *written* again
+  here, so writes-before-reads alone would leave the write-after-write half to
+  the stage masks. A reader never holds a recording context while waiting, so the
+  pool's ring cannot deadlock.
 - Runs on the R80 GPU API: `clip:vnode:gpu` in and out with `ffGPUOutput`, so
   the core's `GPUUpload`/`GPUDownload` cross the bus and a consumer waits on the
   plane's producer pair; device choice, queue locking and the buffer pool are the
-  core's.
+  core's. A plane that is not processed is shared from the centre source frame
+  (`newVideoFrame2`), and only the planes the aggregation writes are published;
+  when every plane is processed the frame is all-fresh (`newGPUVideoFrame`).
 - `num_streams` and `device_id` are registered no-ops (never read) -- depth is
   the core's, device choice is `core.set_vulkan_device`; the cache depth is a
   fixed two (`kInflightFrames`).
+- The 8-lane transposes and the group-8 reduction are `subgroupShuffleXor`
+  butterflies (register-only, no LDS, no barrier) and reproduce the
+  reference's exact reduction tree.
+- `extractor_exp`'s `(x + E) - E` pre-rounding must stay under GLSL `precise`:
+  RADV folds the pair to `x` when E is a known spec constant, which makes the
+  parameter inert (fixed, see Historical).
 
-Performance — 1080p GRAY32, jpbd, `tools/benchmark.py -f bm3dv2 vsfeel vszipcl
-bm3dvk`, 1000 frames × 3 interleaved, sigma 0.7, radius 2, bm_range 16,
-ps_range 7, block_step 4:
-
-| | fps | note |
-|---|---|---|
-| vsfeel | **332.8** | exec-pool port; different benchmark config from the current working-tree scan |
-| bm3dvk | 54.8 | R80 reference |
-| vszipcl | 41.6 | |
-
-vsfeel is 6.1x the faster reference. The first R80 API port (2026-09-20) cost
-4-6% on this CPU-sink benchmark; the exec-pool port (2026-09-23) is **+1%** in
-three interleaved A/B runs against the raw-submit build -- see Historical.
-
-## Implementation
+## Performance
 
 - **The block-matching search is the whole filter.** At r=2/step 4 it is ~85%
   of the estimation kernel; the collaborative transform + patch loads + all
@@ -101,16 +131,33 @@ three interleaved A/B runs against the raw-submit build -- see Historical.
   mechanism is the dynamic LDS addressing, not the memory traffic. Do not
   retry an LDS variant here; the win came from *reducing the data* (list depth,
   packed coordinates) instead.
-- The 8-lane transposes and the group-8 reduction are `subgroupShuffleXor`
-  butterflies (register-only, no LDS, no barrier) and reproduce the
-  reference's exact reduction tree.
-- `extractor_exp`'s `(x + E) - E` pre-rounding must stay under GLSL `precise`:
-  RADV folds the pair to `x` when E is a known spec constant, which makes the
-  parameter inert (fixed, see Historical).
+- The first R80 API port (2026-09-20) cost 4-6% on this CPU-sink benchmark; the
+  exec-pool port (2026-09-23) is **+1%** in three interleaved A/B runs against
+  the raw-submit build -- see Historical.
+- The multi-plane round did not move the luma path: NPLANES == 1 compiles to
+  6131 vs 6133 instructions at the same VGPR/SGPR/LDS (192/108/4096 B, 8
+  waves/SIMD), and 12 interleaved ABBA pairs of the 1000-frame jpbd 1080p
+  GRAY32 scan (benchmark defaults) put the medians at 935 vs 924 fps (+1.1%,
+  inside this harness's spread). VRAM grows with the planes, the estimate cache
+  being per entry: 4:2:0 is 1.5x the luma-only footprint and 4:4:4/RGB is 3x.
 
 ## Historical
 
 Chronological; each entry keeps the mechanism, not the story.
+
+- **2026-10-02 — every plane is denoised (chroma was a passthrough).** The
+  filter ran one luma entry and shared chroma from the source; both references
+  instead denoise each plane independently, or all three jointly under
+  `chroma=True`. One entry per plane, per-plane parameters, the joint 4:4:4 entry,
+  RGB input, the `[0, 127]` `extractor_exp` range and the all-zero shortcut
+  landed together. Measured against bm3dvk (640x360, frames 0/11/23), worst
+  per-plane: 4:2:0 0.0079, 4:4:4 0.0070, RGB 0.0077, joint 0.0070, joint radius
+  0 0.0061, Wiener ref passes 0.0040. No luma-path perf change (see
+  Performance). The cache reservation is atomic across entries: reserving one at
+  a time deadlocked ~40% of the color ref-pass comparisons (a reader holds a
+  slot whose writer has not published, so a frame holding entry 0 while waiting
+  for entry 1 cycles against the mirror image), pinned by the color parallel-load
+  test.
 
 - **2026-10-02 — radius cap 4 → 16 (the references'), one aggregation path.**
   The cap was the aggregation's per-slice table in push constants (three
@@ -145,10 +192,10 @@ Chronological; each entry keeps the mechanism, not the story.
   `GPUDevice::handles`/`compute_queue` (the queue check now uses a local) and
   `gpu_make_buffer`'s never-supplied `exclude` are deleted.
 
-- **The vs-jetpack wrapper rejects `chroma=True`.** The plugin denoises luma
-  only and passes chroma through, but the wrapper advertised `chroma` and
-  dropped it, so vsdenoise's forced `chroma=True` on YUV444 silently ran the
-  luma path. The wrapper now raises on `chroma=True`; no perf change.
+- **The vs-jetpack wrapper advertised `chroma` and dropped it.** vsdenoise's
+  forced `chroma=True` on YUV444 silently ran the luma path; the wrapper raised
+  instead until the plugin implemented the joint entry (see the multi-plane
+  round, which forwards it again). No perf change.
 - **The CAS fallback's retry bound counted the wrong contributors.**
   `res_add`'s compare-exchange loop is capped so a stuck retry cannot reset the
   device (the reference's unbounded `do/while`). The bound is a *contention*
@@ -406,8 +453,11 @@ per-instance staging once before the stream loop; the DB machine is unchanged.
   `shaderSharedFloat32AtomicAdd` (which RADV does expose from GFX8) cannot help,
   because a group's 8 matched patches land anywhere in the plane — there is no
   per-workgroup LDS tile to accumulate into.
-- `sigma` is scaled per plane but only luma is processed; the YUV path copies
-  chroma. No measurements needed unless a user asks.
+- **Color clips cost the planes, and the cache is per entry.** 4:2:0 is 1.5x
+  the luma-only estimate/source footprint and 4:4:4/RGB is 3x, all in the same
+  `maxStorageBufferRange` budget, so the practical radius on a color clip is
+  lower than the luma table implies. The joint entry's kernel time is unmeasured
+  (one shared search for three planes, so well under 3x the per-plane path).
 
 **Do not re-derive** (measured, not theory):
 
@@ -425,6 +475,11 @@ per-instance staging once before the stream loop; the DB machine is unchanged.
 
 - BM3D reference comparisons cover match-selection-sensitive inputs only
   incompletely: add structured horizontal patterns before changing SSD math.
+- **bm3dvk is the preferred oracle where the two references disagree** (the
+  user's call): grade new behaviour against it first, and fall back to
+  vszipcl/bm3dhip only when it is unavailable. The luma sweep's tolerances stay
+  calibrated against vszipcl — re-measuring all of them for a ~0.002 shift is
+  churn, and both references sit within the same bounds.
 - Grade kernel changes on `VSFEEL_BM3D_GPUTRACE=1` at `-r 1` over a few hundred
   frames (repeat once: the printed value settles to ±0.2%), then confirm fps
   with an interleaved `tools/benchmark.py` pair over 1000+ frames. A one-shot
@@ -432,7 +487,9 @@ per-instance staging once before the stream loop; the DB machine is unchanged.
   reasons.
 - A straight A/B alternation favours whichever arm runs first (4 of 5 rounds
   here, worth ~2%); interleave ABBA within each round before reading any
-  difference under ~3%.
+  difference under ~3%. This harness's own spread is ±5-10% per invocation even
+  for one binary (measured 916..1037 fps on consecutive runs of the same build),
+  so a luma-path regression claim needs several interleaved pairs, not one.
 - Radius limits are geometry-dependent and the suite's clip is 640x360: check
   the benchmark clip at 1080p before quoting a cap (it is 7 there, not the 10
   the int32 guard alone implies).

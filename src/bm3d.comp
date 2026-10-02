@@ -38,11 +38,29 @@ layout(constant_id = 10) const int NOSEARCH = 0;
 layout(constant_id = 11) const int NOESTIMATE = 0;
 layout(constant_id = 12) const int SRC_RING = 9;  // 4 * RADIUS + 1 (window union)
 layout(constant_id = 13) const int FINAL = 0;    // Wiener (ref) pass vs hard thresholding
+// Per-plane sigmas and the plane count of one entry. The reference's default
+// mode builds one entry per plane (NPLANES = 1, every group plane is its own
+// first plane); chroma mode builds one entry over all three, where the group
+// comes from luma and each plane is filtered with its own sigma. In that joint
+// mode a plane whose sigma is below FLT_EPSILON is skipped, exactly as the
+// reference's `if (sigma < FLT_EPS_) continue`, and the host copies it through.
+layout(constant_id = 14) const float SIGMA_U = 0.0;
+layout(constant_id = 15) const float SIGMA_V = 0.0;
+layout(constant_id = 16) const int NPLANES = 1;
 
 const int KRADIUS = RADIUS;
 const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
+const int TW = 2 * KRADIUS + 1;
+// One entry's packed buffers are [slot][clip][plane][HEIGHT][STRIDE] (src) and
+// [slot][plane][TW][2][HEIGHT][STRIDE] (res): all planes of one entry share
+// their geometry, so a plane is one TEMPORAL_STRIDE hop away and the res slice
+// offsets the aggregation takes are TW * 2 * TEMPORAL_STRIDE apart.
+const int CLIP_STRIDE = NPLANES * TEMPORAL_STRIDE;
+const int SLOT_STRIDE = (FINAL != 0 ? 2 : 1) * CLIP_STRIDE;
+const int RES_PLANE_STRIDE = TW * 2 * TEMPORAL_STRIDE;
 
 const float FLT_MAX_ = 3.402823466e+38f;
+const float FLT_EPS_ = 1.192092896e-07f;
 const int INT_MAX_ = 0x7fffffff;
 
 #ifndef NO_FLOAT_ATOMICS
@@ -124,17 +142,17 @@ int slot_base(int z) {
     return src_frame(z) % SRC_RING;
 }
 
-// float offset of the frame at window position z in the clip used for block
-// matching and, in final mode, as the Wiener reference (clip 0). In final mode
-// each ring slot holds [ref][source], so the slot stride doubles.
-int src_search(int z) {
-    return slot_base(z) * TEMPORAL_STRIDE * (FINAL != 0 ? 2 : 1);
+// float offset of `plane`'s frame at window position z in the clip used for
+// block matching and, in final mode, as the Wiener reference (clip 0). In final
+// mode each ring slot holds [ref][source], so the slot stride doubles.
+int src_search(int z, int plane) {
+    return slot_base(z) * SLOT_STRIDE + plane * TEMPORAL_STRIDE;
 }
 
 // float offset of the same frame in the clip that is actually denoised (the
 // source clip: clip 1 in final mode, the same as the search clip otherwise)
-int src_input(int z) {
-    return src_search(z) + (FINAL != 0 ? TEMPORAL_STRIDE : 0);
+int src_input(int z, int plane) {
+    return src_search(z, plane) + (FINAL != 0 ? CLIP_STRIDE : 0);
 }
 
 shared float l_e[4][64];
@@ -408,7 +426,7 @@ void merge_group(int n, int base, out float me[8], out int mx[8], out int my[8])
     }
 }
 
-float hard_thresholding_s(inout float data[64]) {
+float hard_thresholding_s(inout float data[64], float sigma) {
     const int lane = int(gl_LocalInvocationID.x);
     float ks[4] = float[4](0.0f, 0.0f, 0.0f, 0.0f);
 
@@ -417,9 +435,9 @@ float hard_thresholding_s(inout float data[64]) {
 
         float thr;
         if (i == 0) {
-            thr = (lane % 8) != 0 ? SIGMA_Y : 0.0f;
+            thr = (lane % 8) != 0 ? sigma : 0.0f;
         } else {
-            thr = SIGMA_Y;
+            thr = sigma;
         }
 
         bool flag = abs(val) >= thr;
@@ -434,7 +452,8 @@ float hard_thresholding_s(inout float data[64]) {
     return 1.0f / k;
 }
 
-void collaborative_hard(inout float denoising_patch[64], out float adaptive_weight) {
+void collaborative_hard(inout float denoising_patch[64], float sigma,
+                       out float adaptive_weight) {
     const int lane = int(gl_LocalInvocationID.x);
     for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8(denoising_patch);
@@ -442,7 +461,7 @@ void collaborative_hard(inout float denoising_patch[64], out float adaptive_weig
     }
     transform_pack8_1d(denoising_patch);
 
-    adaptive_weight = hard_thresholding_s(denoising_patch);
+    adaptive_weight = hard_thresholding_s(denoising_patch, sigma);
 
     for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8_inv(denoising_patch);
@@ -453,13 +472,13 @@ void collaborative_hard(inout float denoising_patch[64], out float adaptive_weig
 
 // Wiener filtering: the coefficient is derived from the (basic-estimate)
 // reference patch and applied to the transformed noisy patch
-float wiener_filtering_s(inout float data[64], inout float ref[64]) {
+float wiener_filtering_s(inout float data[64], inout float ref[64], float sigma) {
     const int lane = int(gl_LocalInvocationID.x);
     float ks[4] = float[4](0.0f, 0.0f, 0.0f, 0.0f);
     for (int i = 0; i < 64; ++i) {
         float val = data[i];
         float ref_val = ref[i];
-        float coeff = (ref_val * ref_val) / (ref_val * ref_val + SIGMA_Y * SIGMA_Y);
+        float coeff = (ref_val * ref_val) / (ref_val * ref_val + sigma * sigma);
         if (i == 0) {
             coeff = (lane % 8) != 0 ? coeff : 1.0f;
         }
@@ -473,7 +492,7 @@ float wiener_filtering_s(inout float data[64], inout float ref[64]) {
 }
 
 void collaborative_wiener(inout float denoising_patch[64], inout float ref_patch[64],
-                          out float adaptive_weight) {
+                          float sigma, out float adaptive_weight) {
     for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8(denoising_patch);
         transpose_pack8(denoising_patch);
@@ -486,7 +505,7 @@ void collaborative_wiener(inout float denoising_patch[64], inout float ref_patch
     }
     transform_pack8_1d(ref_patch);
 
-    adaptive_weight = wiener_filtering_s(denoising_patch, ref_patch);
+    adaptive_weight = wiener_filtering_s(denoising_patch, ref_patch, sigma);
 
     for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8_inv(denoising_patch);
@@ -520,7 +539,7 @@ void main() {
     int x = min(is_active ? x0 : 0, WIDTH - 8);
     y = min(y, HEIGHT - 8);
 
-    const int srcpc_base = src_search(KRADIUS);
+    const int srcpc_base = src_search(KRADIUS, 0);
     float cur[64];
     for (int c = 0; c < 8; ++c) {
         for (int i = 0; i < 8; ++i) {
@@ -596,7 +615,7 @@ void main() {
 
             for (int t = 1; t <= KRADIUS; ++t) {
                 const int temporal_index = KRADIUS + direction * t;
-                const int temporal_srcpc = src_search(temporal_index);
+                const int temporal_srcpc = src_search(temporal_index, 0);
 
                 int cxs[PS_NUM], cys[PS_NUM];
                 for (int i = 0; i < PS_NUM; ++i) {
@@ -688,13 +707,24 @@ void main() {
     barrier();
 
     if (NOESTIMATE == 0) {
-    float denoising_patch[64];
-    float ref_patch[64];
+    // One entry covers NPLANES planes; at NPLANES == 1 the bounds fold and this
+    // is the single-plane kernel it has always been. The group (gx/gy/gz) is
+    // luma's in every case: a joint chroma entry filters each plane with the
+    // groups block matching found on plane 0, as the reference does.
+    for (int plane = 0; plane < NPLANES; ++plane) {
+        const float sigma = (plane == 0) ? SIGMA_Y : ((plane == 1) ? SIGMA_U : SIGMA_V);
 
-    {
-        float sigma = SIGMA_Y;
+        // Joint entry: a plane below the threshold is not denoised (the
+        // reference's `if (sigma < FLT_EPS_) continue`); the host copies it
+        // through from the source clip instead.
+        if (NPLANES > 1 && sigma < FLT_EPS_) {
+            continue;
+        }
 
-        const int rplane = pc.res_off;
+        const int rplane = pc.res_off + plane * RES_PLANE_STRIDE;
+
+        float denoising_patch[64];
+        float ref_patch[64];
 
         float adaptive_weight;
         {
@@ -702,8 +732,8 @@ void main() {
                 const int tmp_x = l_x[group][i];
                 const int tmp_y = l_y[group][i];
                 const int tmp_z = l_s[group][i];
-                const int refp = src_search(tmp_z) + tmp_y * STRIDE + tmp_x + sub_lane_id;
-                const int srcp = src_input(tmp_z) + tmp_y * STRIDE + tmp_x + sub_lane_id;
+                const int refp = src_search(tmp_z, plane) + tmp_y * STRIDE + tmp_x + sub_lane_id;
+                const int srcp = src_input(tmp_z, plane) + tmp_y * STRIDE + tmp_x + sub_lane_id;
                 for (int j = 0; j < 8; ++j) {
                     denoising_patch[i * 8 + j] = src[srcp + j * STRIDE];
                     if (FINAL != 0) {
@@ -712,9 +742,9 @@ void main() {
                 }
             }
             if (FINAL != 0) {
-                collaborative_wiener(denoising_patch, ref_patch, adaptive_weight);
+                collaborative_wiener(denoising_patch, ref_patch, sigma, adaptive_weight);
             } else {
-                collaborative_hard(denoising_patch, adaptive_weight);
+                collaborative_hard(denoising_patch, sigma, adaptive_weight);
             }
         }
 
