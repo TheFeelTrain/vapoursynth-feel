@@ -2,40 +2,37 @@
 
 All notable changes to this project are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Changed
+
+- BM3Dv2's `radius` now accepts up to 16 instead of 4, matching vszipcl.
 
 ## [1.0.0] - 2026-10-01
 
-This is a major version because the plugin moved to the VapourSynth R80 GPU API.
-The core now owns the device, the queues and the transfers, and frames stay on
-the GPU from input to output.
+This is a major version because the plugin moved to the VapourSynth R80 GPU API. The core now owns the device, the queues and the transfers, and frames stay on the GPU from input to output.
 
 ### Added
 
 - macOS and arm64 wheels.
-- Capability checks at filter creation, so an unsupported device or argument is
-  reported instead of failing later.
-- A shader limits check, which compares every compiled kernel against the
-  workgroup and shared memory sizes the host declares for it.
-- Linting and code quality gates for the C++ host code, the GLSL kernels and the
-  Python tooling, plus a CI job for the tests that need no GPU.
+- Capability checks at filter creation, so an unsupported device or argument is reported instead of failing later.
+- A shader limits check, which compares every compiled kernel against the workgroup and shared memory sizes the host declares for it.
+- Linting and code quality gates for the C++ host code, the GLSL kernels and the Python tooling, plus a CI job for the tests that need no GPU.
 - A `uv` development environment with a lockfile.
 
 ### Changed
 
-- All nine filters were ported to the R80 GPU API. The plugin no longer creates
-  its own device, queues or host transfer path.
+- All nine filters were ported to the R80 GPU API. The plugin no longer creates its own device, queues or host transfer path.
 - Frame caches are capped by the core's VRAM budget instead of fixed sizes.
 - Invalid arguments and unsupported input are rejected at creation time.
-- Python packaging was reworked. Wheel and sdist contents are pinned, and every
-  build is verified before publishing.
+- Python packaging was reworked. Wheel and sdist contents are pinned, and every build is verified before publishing.
 
 ### Fixed
 
 - Resource leaks on creation and frame error paths across every filter.
-- Frame cache races in BM3Dv2's rings and EEDI3's batched output, which could
-  read a wrong or recycled frame.
+- Frame cache races in BM3Dv2's rings and EEDI3's batched output, which could read a wrong or recycled frame.
 - EEDI3AA's per plane merge, and its handling of odd plane geometry.
 - Benchmark and test harness bugs that reported misleading results.
 
@@ -43,9 +40,7 @@ the GPU from input to output.
 
 ### Added
 
-- `VSFEEL_DEBUG`, a single switch for a device banner, cache information and an
-  error trace naming the filter and the frame. `VSFEEL_DEBUG=2` adds per frame
-  traces and GPU timings.
+- `VSFEEL_DEBUG` prints a device banner and a full error trace. `=2` adds per frame traces and GPU timings.
 
 ### Changed
 
@@ -54,35 +49,30 @@ the GPU from input to output.
 
 ### Fixed
 
-- BM3Dv2 could hang the driver on long submissions. The estimation now submits
-  one window position at a time.
+- BM3Dv2 could hang the driver on long submissions. The estimation now submits one window position at a time.
 - A BM3Dv2 cache slot could be overwritten by a stale writer.
 - `env_flag=0` was treated as enabled in some filters.
 - Subgroup support was assumed rather than checked in several creation paths.
 - Upload fixes for EEDI3 and BM3Dv2 on devices without a ReBAR heap.
-- GPU timing probes are only armed when the queue family reports valid
-  timestamps.
+- GPU timing probes are only armed when the queue family reports valid timestamps.
 - Small fixes in DFTTest's fused transpose window and NNEDI3's download slots.
 
 ## [0.2.1] - 2026-09-20
 
 ### Fixed
 
-- BM3Dv2 now works on GPUs without buffer float atomics, using a compare and
-  swap aggregation path.
+- BM3Dv2 now works on GPUs without buffer float atomics, using a compare and swap aggregation path.
 
 ## [0.2.0] - 2026-09-20
 
 ### Added
 
-- Tests for temporal frame order, cropped geometry, stream counts and resource
-  boundedness. The suite now runs in parallel.
+- Tests for temporal frame order, cropped geometry, stream counts and resource boundedness. The suite now runs in parallel.
 
 ### Changed
 
 - The Vulkan requirement was lowered from 1.4 to 1.3.
-- BM3Dv2 matching is faster, with a wider scan, subgroup operations and uploads
-  staged in host visible memory.
+- BM3Dv2 matching is faster, with a wider scan, subgroup operations and uploads staged in host visible memory.
 - EEDI3's vertical consistency check runs in parallel, which is a large speedup.
 - EEDI3AA's two horizontal passes share one submission.
 - Shader, pipeline and buffer helpers are shared by all filters in `vsfeel.h`.
@@ -91,12 +81,9 @@ the GPU from input to output.
 
 ### Added
 
-- First release: Bilateral, BM3Dv2, GaussBlur, DFTTest, NLMeans, EEDI3, EEDI3H,
-  EEDI3AA and NNEDI3, all implemented as Vulkan compute shaders driven from C++.
-- A benchmark harness comparing every filter against the reference
-  implementations.
-- vs-jetpack backend integration, so the filters can be used through the
-  vs-jetpack wrappers.
+- First release: Bilateral, BM3Dv2, GaussBlur, DFTTest, NLMeans, EEDI3, EEDI3H, EEDI3AA and NNEDI3, all implemented as Vulkan compute shaders driven from C++.
+- A benchmark harness comparing every filter against the reference implementations.
+- vs-jetpack backend integration, so the filters can be used through the vs-jetpack wrappers.
 - Windows and Linux wheels, built and published by CI.
 
 [1.0.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/0.2.2...1.0.0

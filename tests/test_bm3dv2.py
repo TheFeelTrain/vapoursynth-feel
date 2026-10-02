@@ -75,6 +75,20 @@ def test_bm3dv2_parallel_load_matches_serial(noise_gray):
         assert np.abs(d).max() < 1e-5, f"parallel/serial mismatch at frame {n}"
 
 
+def test_bm3dv2_wide_radius_parallel_load_matches_serial(noise_gray):
+    """The widest window must survive the deep pipeline like the narrow ones.
+
+    At radius 16 one output frame spans 33 estimate slots and 65 source
+    frames, i.e. the instance's whole cache working set at once; a parallel
+    request load is what exercises that ring under contention.
+    """
+    par = eval_parallel(_run, noise_gray, radius=16)
+    ref = _run(noise_gray, radius=16)
+    for n in range(noise_gray.num_frames):
+        d = par[n] - frame_to_ndarray(ref.get_frame(n))
+        assert np.abs(d).max() < 1e-5, f"parallel/serial mismatch at frame {n}"
+
+
 def test_bm3dv2_parallel_load_deterministic(noise_gray):
     """Two parallel runs must produce identical output.
 
@@ -89,7 +103,7 @@ def test_bm3dv2_parallel_load_deterministic(noise_gray):
         assert np.abs(d).max() < 1e-5, f"nondeterministic output at frame {n}"
 
 
-@pytest.mark.parametrize("radius", [0, 1, 2, 3, 4])
+@pytest.mark.parametrize("radius", [0, 1, 2, 3, 4, 16])
 def test_bm3dv2_no_nan_all_frames(noise_gray, radius):
     """Output must be finite on every frame (incl. boundaries) for each radius.
 
@@ -387,10 +401,47 @@ def test_bm3dv2_rejects_gray8(noise_8bit):
         _run(noise_8bit)
 
 
-def test_bm3dv2_rejects_radius5(noise_gray):
-    """Radius > 4 is unsupported and must be rejected up front."""
+def test_bm3dv2_rejects_radius17(noise_gray):
+    """Radius > 16 is unsupported and must be rejected up front."""
     with pytest.raises(vs.Error):
-        _run(noise_gray, radius=5)
+        _run(noise_gray, radius=17)
+
+
+@pytest.mark.parametrize("radius", [15, 16])
+def test_bm3dv2_accepts_reference_radius_cap(noise_gray, radius):
+    """The radius cap must match the references' (vszipcl 16, bm3dvk 15).
+
+    Windows this wide no longer fit the aggregation's push-constant table, so
+    this is also the derived arm's end-to-end smoke test.
+    """
+    out = _run(noise_gray, radius=radius)
+    for n in (0, 23):
+        a = frame_to_ndarray(out.get_frame(n))
+        assert np.isfinite(a).all(), f"non-finite output at frame {n}"
+
+
+def test_bm3dv2_derived_aggregation_matches_legacy(noise_gray, monkeypatch):
+    """The derived per-slice table must agree with the host's table.
+
+    Windows up to nine slices use the host-precomputed push-constant table and
+    wider ones derive it in the kernel; forcing the derived arm on a small
+    window (VSFEEL_BM3D_DERIVE=1) holds the two against each other over the
+    whole range the legacy table covers, boundaries included. Both arms read
+    the same stacks, so the only expected difference is the float-atomics
+    ordering floor (~3e-8 measured).
+    """
+    monkeypatch.delenv("VSFEEL_BM3D_DERIVE", raising=False)
+    for radius in (0, 1, 2, 3, 4):
+        legacy = _run(noise_gray, radius=radius)
+        monkeypatch.setenv("VSFEEL_BM3D_DERIVE", "1")
+        derived = _run(noise_gray, radius=radius)
+        monkeypatch.delenv("VSFEEL_BM3D_DERIVE")
+        for n in (0, 11, 23):
+            a = frame_to_ndarray(legacy.get_frame(n))
+            b = frame_to_ndarray(derived.get_frame(n))
+            assert np.isfinite(b).all(), f"non-finite derived output at frame {n}"
+            d = float(np.abs(a - b).max())
+            assert d < 1e-5, f"derived vs legacy at radius {radius}, frame {n}: {d:g}"
 
 
 def test_bm3dv2_rejects_bad_ref_format(noise_gray):
@@ -893,8 +944,12 @@ def test_bm3dv2_plugin_defaults_match_reference(noise_gray, kwargs, tol):
 
 # Remeasured with the repaired oracle (vszipcl, basic estimate, radius sweep):
 # radius 0/1/2/3/4 = 0.00708/0.00742/0.00786/0.00285/0.00300; the Wiener ref
-# pass = 0.00273. The 0.01 bound covers all of them with margin.
-@pytest.mark.parametrize("radius", [0, 1, 2, 3, 4])
+# pass = 0.00273. The 0.01 bound covers all of them with margin. Radius 5 and 6
+# are the first windows wider than the aggregation's push-constant table, i.e.
+# the derived arm's reference comparison; the references' own cap (16) is
+# covered by the self-consistency tests instead, because at that window the
+# reference's fused accumulator cache alone wants gigabytes.
+@pytest.mark.parametrize("radius", [0, 1, 2, 3, 4, 5, 6])
 def test_bm3dv2_matches_reference(noise_gray, radius):
     """vsfeel must closely match vszipcl, falling back to bm3dhip.
 

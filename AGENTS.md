@@ -51,6 +51,23 @@ docstrings are a few lines at most. Notes files (`notes/<filter>.md`) may be
 longer, but do not pad them. Never cite work-order or report IDs (`WO-55`,
 `§I.11`, `T9`) in code, comments, docstrings or notes.
 
+## Changelog (CHANGELOG.md)
+
+Keep a Changelog format, newest first, with an `## [Unreleased]` section for
+what has landed since the last tag. Write the entry with the change, not at
+release time. One bullet per user-visible change, under `Added`, `Changed`,
+`Fixed` or `Removed`:
+
+- **Short and high level.** One line per bullet, and no hard wrap: Markdown
+  reflows it, so a source line break buys nothing and only makes a one word edit
+  reflow several lines. Say what a user would notice rather than how it works.
+  No implementation notes, no buffer or push-constant budgets, no function or
+  kernel names.
+- **No em-dashes.** Use a comma, a full stop or parentheses.
+- **A bug fix is one line**: what was wrong, at the level a user would see it.
+
+The notes files carry the mechanism; the changelog carries the result.
+
 ## Environment (uv)
 
 The dev environment is the project venv, not the system Python or the system

@@ -27,7 +27,12 @@ using namespace std::string_literals;
 
 namespace {
 
-constexpr int MAX_RADIUS = 4;
+// The reference implementations' cap: vszipcl accepts 16, bm3dvk 15.
+constexpr int MAX_RADIUS = 16;
+// Window width whose per-slice table still fits the 128 bytes of push constants
+// every device guarantees; wider windows derive the table in the kernel
+// instead (see bm3d_agg.comp).
+constexpr int kLegacyTw = 9;
 // The shader does the search-window arithmetic ((2*range+1)^2, x±range) in
 // int32; beyond this, absurd-but-accepted values overflow it.
 constexpr int kMaxSearchRange = 8192;
@@ -106,6 +111,9 @@ struct BM3DData {
     float extractor {};
     bool
         cas_atomics {}; // aggregate with the CAS kernel (no float32 add atomics)
+    // Aggregate with the kernel's derived per-slice table: forced by a window
+    // wider than the push-constant table, or by VSFEEL_BM3D_DERIVE for A/B.
+    bool derive {};
 
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
@@ -353,12 +361,16 @@ create_agg_pipeline(const GPUDevice & gpu, const Bm3dPlane & plane,
                     VkPipelineLayout layout) {
 
     struct Spec {
-        int32_t height, stride, tw;
-    } spec { plane.height, plane.stride, d.tw };
-    const std::array<VkSpecializationMapEntry, 3> entries { {
+        int32_t height, stride, tw, radius, res_cap, derive;
+    } spec { plane.height, plane.stride, d.tw,
+             d.radius,     d.res_cap,    d.derive ? 1 : 0 };
+    const std::array<VkSpecializationMapEntry, 6> entries { {
         { 0, 0, sizeof(int32_t) },
         { 1, 4, sizeof(int32_t) },
         { 2, 8, sizeof(int32_t) },
+        { 3, 12, sizeof(int32_t) },
+        { 4, 16, sizeof(int32_t) },
+        { 5, 20, sizeof(int32_t) },
     } };
     // The aggregation kernel is a plain 32x8 grid-stride kernel with no LDS.
     return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(),
@@ -915,36 +927,53 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame & fr,
                 static_cast<VkDeviceSize>(src_slot) * clips * d->planes[0].pe +
                 static_cast<VkDeviceSize>(clips - 1) * pe +
                 static_cast<VkDeviceSize>(plane) * d->src_size;
-            int32_t pushes[28] {};
+            // Push constant layout mirrors the shader's block: the host's
+            // per-slice table (three tw-wide arrays) then src_base, then the
+            // four scalars the derived arm reads instead of the table.
+            int32_t pushes[32] {};
             int32_t * bases = pushes;
-            if (r == 0) {
-                // non-temporal: aggregate the single center slice
-                const int32_t base = static_cast<int32_t>(
-                    static_cast<VkDeviceSize>(fr.win_slots[0]) * 2 * pe +
-                    static_cast<VkDeviceSize>(plane) * d->res_size_per_plane);
+            if (!d->derive) {
+                if (r == 0) {
+                    // non-temporal: aggregate the single center slice
+                    const int32_t base = static_cast<int32_t>(
+                        static_cast<VkDeviceSize>(fr.win_slots[0]) * 2 * pe +
+                        static_cast<VkDeviceSize>(plane) *
+                            d->res_size_per_plane);
+                    for (int i = 0; i < d->tw; ++i) {
+                        bases[i] = base;
+                    }
+                } else {
+                    for (int i = 0; i < d->tw; ++i) {
+                        const int z = agg_z(i, n, nf, r);
+                        bases[i] = static_cast<int32_t>(
+                            static_cast<VkDeviceSize>(fr.win_slots[i]) * d->tw *
+                                2 * pe +
+                            static_cast<VkDeviceSize>(plane) *
+                                d->res_size_per_plane +
+                            static_cast<VkDeviceSize>(z) * 2 * pe);
+                    }
+                }
                 for (int i = 0; i < d->tw; ++i) {
-                    bases[i] = base;
+                    // The frame the reference's aggPlane intends for slice i:
+                    // the slot for position m_i holds the window centred on
+                    // m_i, so its slice agg_z(i) is the contribution of that
+                    // frame.
+                    const int m_i = std::clamp(n - r + i, 0, nf - 1);
+                    const int z = agg_z(i, n, nf, r);
+                    pushes[9 + i] = std::clamp(m_i - r + z, 0, nf - 1) + 1;
+                    pushes[18 + i] = static_cast<int32_t>(
+                        static_cast<VkDeviceSize>(fr.win_slots[i]) * d->tw + z);
                 }
             } else {
-                for (int i = 0; i < d->tw; ++i) {
-                    const int z = agg_z(i, n, nf, r);
-                    bases[i] = static_cast<int32_t>(
-                        static_cast<VkDeviceSize>(fr.win_slots[i]) * d->tw * 2 *
-                            pe +
-                        static_cast<VkDeviceSize>(plane) *
-                            d->res_size_per_plane +
-                        static_cast<VkDeviceSize>(z) * 2 * pe);
-                }
-            }
-            for (int i = 0; i < d->tw; ++i) {
-                // The frame the reference's aggPlane intends for slice i: the
-                // slot for position m_i holds the window centred on m_i, so its
-                // slice agg_z(i) is the contribution of that frame.
-                const int m_i = std::clamp(n - r + i, 0, nf - 1);
-                const int z = agg_z(i, n, nf, r);
-                pushes[9 + i] = std::clamp(m_i - r + z, 0, nf - 1) + 1;
-                pushes[18 + i] = static_cast<int32_t>(
-                    static_cast<VkDeviceSize>(fr.win_slots[i]) * d->tw + z);
+                // The kernel rebuilds slot, slice and witness from these; the
+                // estimate offsets are then computed in vec4 elements, which
+                // is why the plane offset is divided here.
+                pushes[28] = n;
+                pushes[29] = nf;
+                pushes[30] = (r == 0) ? fr.slot0 : 0;
+                pushes[31] =
+                    static_cast<int32_t>(static_cast<VkDeviceSize>(plane) *
+                                         d->res_size_per_plane / 4);
             }
             pushes[27] = static_cast<int32_t>(src_base);
             if (d->refusal_mapped && !d->refusal_mapped[0]) {
@@ -1479,10 +1508,15 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     if (error) {
         d->radius = 0;
     }
-    if (d->radius < 0 || d->radius > 4) {
-        return set_error("\"radius\" must be in range [0, 4]");
+    if (d->radius < 0 || d->radius > MAX_RADIUS) {
+        return set_error("\"radius\" must be in range [0, "s +
+                         std::to_string(MAX_RADIUS) + "]");
     }
     d->tw = 2 * d->radius + 1;
+    // Wider windows than the push constants can carry derive their per-slice
+    // table in the kernel; VSFEEL_BM3D_DERIVE forces the same arm on a small
+    // window, which is how the two arms are held against each other.
+    d->derive = d->tw > kLegacyTw || env_flag("VSFEEL_BM3D_DERIVE");
 
     std::array<int, 3> ps_num {};
     for (int i = 0; i < std::ssize(ps_num); ++i) {
@@ -1597,8 +1631,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     }
     {
         const auto
-            result = // 10 ints: the aggregation's bases[9] plus its source-fallback offset
-            gpu_pipeline_layout(*d->gpu, d->set_layout, 28 * sizeof(int32_t));
+            result = // 32 ints: the aggregation's per-slice table + its scalars
+            gpu_pipeline_layout(*d->gpu, d->set_layout, 32 * sizeof(int32_t));
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -1683,6 +1717,19 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         d->res_size_per_plane =
             static_cast<VkDeviceSize>(d->res_cap) * d->tw * 2 * d->planes[0].pe;
         d->tags_size = static_cast<VkDeviceSize>(d->res_cap) * d->tw;
+        // The source ring is addressed through the same signed 32-bit offsets
+        // as the estimate stacks (src_search in bm3d.comp), and a window that
+        // reaches 4r+1 frames grows it with the radius, so it needs its own
+        // guard: a wrapped ring offset would read another slot's plane.
+        if (src_size > static_cast<VkDeviceSize>(INT32_MAX)) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "frame is too large: the source ring needs %llu floats "
+                     "(radius %d), which overflows the 32-bit kernel "
+                     "addressing; reduce radius",
+                     static_cast<unsigned long long>(src_size), d->radius);
+            return set_error(msg);
+        }
         {
             std::string err =
                 gpu_make_buffer(*d->gpu, core, d->tags_size * 4, d->tags,

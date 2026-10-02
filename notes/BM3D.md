@@ -9,8 +9,9 @@ SSD scores with a flattened candidate partition; per-slot witness clearing is
 ordered with estimation, radius-0 fallback uses its private source slot, and a
 frame that failed before its ring copy submitted clears those source keys and
 fails its readers instead of leaking stale slots.
-BM3D tests pass; the 1000-frame jpbd benchmark is 766.5 fps for the exact
-sigma=0.7, radius=2, bm_range=9, ps_range=4, block_step=8 config.
+BM3D tests pass; the 1000-frame jpbd benchmark is ~940 fps for the exact
+sigma=0.7, radius=2, bm_range=9, ps_range=4, block_step=8 config (930-1015
+across sessions).
 
 Current design:
 
@@ -32,6 +33,13 @@ Current design:
   reference columns too.
 - Temporal per-window lists are only PS_NUM deep; the top-k merge proof is in
   Historical. The full spatial list stays 8 deep.
+- The aggregation's per-slice table (estimate offset, witness index, expected
+  witness) is host-precomputed into the push constants for windows up to nine
+  slices, and derived in the kernel for wider ones (`radius > 4`), where three
+  tw-wide int arrays no longer fit the 128 bytes of push constants every device
+  guarantees. Both arms compute the same integers; `VSFEEL_BM3D_DERIVE=1` forces
+  the derived one, which is how the tests hold them against each other over the
+  range the legacy table still covers.
 - Degenerate paths: `sigma < FLT_EPSILON` passes the plane through (a source
   copy), like the installed references' `PROC_MASK`.
 - **Everything goes through the core's exec pool** (`createGPUExecPool` /
@@ -101,6 +109,27 @@ three interleaved A/B runs against the raw-submit build -- see Historical.
 ## Historical
 
 Chronological; each entry keeps the mechanism, not the story.
+
+- **2026-10-02 — radius cap 4 → 16 (the references'), small radii unchanged.**
+  vszipcl accepts 16 and bm3dvk 15; vsfeel stopped at 4 because the aggregation
+  carried its per-slice table (estimate offset, witness index, expected witness,
+  three tw-wide int arrays) in push constants, which stops fitting the 128 bytes
+  every device guarantees at tw = 11. Wider windows now derive slot, slice index
+  and witness in the kernel from the window centre and the ring capacity (a spec
+  constant, so the slot modulo is a multiply-shift), working in vec4 units;
+  windows up to nine slices keep the host table and its code path unchanged.
+  Interleaved same-session A/B against the previous build, jpbd 1080p GRAY32:
+  3000-frame medians radius 0 1149.8 vs 1152.9, radius 2 943.2 vs 937.4 (4
+  rounds each), radius 4 651.3 vs 644.5 fps — parity inside the harness's own
+  ±2% spread. The two arms are within noise of each other at a narrow window
+  (radius 2, five interleaved 1000-frame medians 959.9 legacy vs 940.1 derived;
+  radius 4 646.7 vs 645.6 fps), so wide windows pay nothing measurable for the
+  derived table. Correctness: derived vs legacy at radius 0..4 within 3.0e-8
+  (the atomic-ordering floor), and radius 5/6 — the first windows wider than the
+  table — match vszipcl like the narrower ones. VRAM is quadratic in the radius
+  (`res_cap * tw * 2` plane pairs), so 1080p rejects above radius 10 on the
+  addressing guard while 640x360 runs 16 (2.07 GiB); the source ring got the
+  same int32 guard, which radius 4's 18 slots never needed.
 
 - **Creation-failure leak.** `createVideoFilterEx2` returns `nullptr` without
   running the free callback when the node constructor throws, so the instance
@@ -430,6 +459,8 @@ cached at creation, not read per frame.
   +36..41%).
 - `VSFEEL_BM3D_CAS=1` — force the atomicCompSwap aggregation build on a device
   that has buffer float atomics (A/B measurement only).
+- `VSFEEL_BM3D_DERIVE=1` — force the derived per-slice aggregation table on a
+  window narrow enough to use the host's (A/B measurement and test only).
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs; both
   are vsfeel inventions, not reference behaviour, and NOSEARCH distorts the
   temporal search as well (see the ablation note).
