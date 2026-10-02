@@ -20,6 +20,10 @@ concurrency:
 jobs:
   sdist:
     runs-on: ubuntu-latest
+    # Every build job finishes in about two minutes. Without a cap, a stalled
+    # download sits on GitHub's six hour default instead of failing, and the
+    # publishing jobs below wait on it the whole time.
+    timeout-minutes: 10
     env:
       FORCE_BUILD: ${{ github.event.inputs.force_build }}
     steps:
@@ -44,6 +48,7 @@ jobs:
     - uses: actions/upload-artifact@v7
       with:
         name: sdist
+        overwrite: true
         path: dist
         if-no-files-found: ignore
 
@@ -71,6 +76,7 @@ jobs:
 
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.image }}
+    timeout-minutes: 10
     env:
       FORCE_BUILD: ${{ github.event.inputs.force_build }}
     steps:
@@ -88,7 +94,7 @@ jobs:
         fi
     - name: Install glslc
       if: steps.published.outputs.skip != 'true'
-      run: dnf -y install glslc
+      run: dnf -y --setopt=timeout=60 --setopt=retries=2 install glslc
     - name: Build and repair
       if: steps.published.outputs.skip != 'true'
       run: |
@@ -105,6 +111,7 @@ jobs:
     - uses: actions/upload-artifact@v7
       with:
         name: linux-wheel-${{ matrix.arch }}
+        overwrite: true
         path: wheelhouse
         if-no-files-found: ignore
 
@@ -123,6 +130,7 @@ jobs:
           runner: macos-26-intel
 
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
     env:
       FORCE_BUILD: ${{ github.event.inputs.force_build }}
       MACOSX_DEPLOYMENT_TARGET: "13.0"
@@ -175,11 +183,13 @@ jobs:
     - uses: actions/upload-artifact@v7
       with:
         name: macos-wheel-${{ matrix.arch }}
+        overwrite: true
         path: dist
         if-no-files-found: ignore
 
   windows-wheel:
     runs-on: windows-latest
+    timeout-minutes: 10
     env:
       FORCE_BUILD: ${{ github.event.inputs.force_build }}
     defaults:
@@ -242,6 +252,7 @@ jobs:
     - uses: actions/upload-artifact@v7
       with:
         name: windows-wheel
+        overwrite: true
         path: dist
         if-no-files-found: ignore
 
@@ -252,8 +263,13 @@ jobs:
       name: pypi
       url: https://pypi.org/project/vapoursynth-feel/
     needs: [sdist, linux-wheel, macos-wheel, windows-wheel]
-    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    # Publish whatever was built even when a platform failed or stalled. PyPI
+    # takes the rest on a re-run, and each build job above skips a distribution
+    # it already finds published, so a re-run rebuilds only what is missing.
+    # Without always() one stalled leg publishes nothing at all.
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/') && contains(needs.*.result, 'success') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - uses: actions/download-artifact@v8
       with:
@@ -295,9 +311,12 @@ jobs:
   release-assets:
     # Separate from the PyPI upload on purpose: the two channels are
     # independent, so whichever one fails, the other still completes.
-    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    # Same always() reasoning as publish: attach what exists, and a re-run
+    # --clobbers the rest onto the same release.
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/') && contains(needs.*.result, 'success') }}
     needs: [sdist, linux-wheel, macos-wheel, windows-wheel]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write   # attach assets to the release
     steps:

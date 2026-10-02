@@ -15,6 +15,10 @@ jobs:
   lint:
     # 26.04, not latest: noble's glslc is 2023.8 and rejects --target-env=vulkan1.4.
     runs-on: ubuntu-26.04
+    # About five minutes normally, most of it clang-tidy and cppcheck. The cap is
+    # there so a stalled download fails instead of sitting on the six hour
+    # default.
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@v7
 
@@ -86,6 +90,7 @@ jobs:
     # generator, benchmark vpy generation, wheel staging). Everything else
     # needs the installed GPU plugin and stays local (tools/test.sh).
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@v7
       with:
