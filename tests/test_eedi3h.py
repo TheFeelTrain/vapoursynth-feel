@@ -15,7 +15,7 @@ Agreement measured on the noise clip:
   ~1.7% pixels differ, max a few hundred LSB (measured 594, frac>1 0.02%).
   Loose sanity bounds only.
 
-Run from the repository root:  python -m pytest tests/test_eedi3h.py
+Run from the repository root:  uv run python -m pytest tests/test_eedi3h.py
 """
 
 import numpy as np

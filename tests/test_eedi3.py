@@ -28,7 +28,7 @@ Agreement measured on the noise clip (640x360, interp rows only):
 Self-consistency (determinism across streams/runs, multi-stream == single,
 parallel load) is exact.
 
-Run from the repository root:  python -m pytest tests/test_eedi3.py
+Run from the repository root:  uv run python -m pytest tests/test_eedi3.py
 """
 
 import json

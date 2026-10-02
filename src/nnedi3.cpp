@@ -63,7 +63,7 @@ constexpr int NNEDI3_NNS[5] { 16, 32, 64, 128, 256 };
 // (nnedi3.comp:319) times the four subgroups of the 128-thread workgroup. The
 // window is `xdim * ydim` rows per subgroup, so 288 covers every network
 // (xdim 48) and 192 covers all but that one. Re-derive with
-// `python3 tools/shader_limits.py`.
+// `uv run python tools/shader_limits.py`.
 constexpr uint32_t kPredictLdsPxp8 = 4 * 256 * 16; // 16 KiB
 constexpr uint32_t kPredictLdsN4 = 4 * 288 * 16;   // 18 KiB
 constexpr uint32_t kPredictLdsN4m = 4 * 192 * 16;  // 12 KiB

@@ -378,8 +378,8 @@ def compare_or_skip(code, argv=(), timeout=600.0):
         skip_or_fail_reference(f"reference unavailable: {exc}")
 
 
-# Inline prelude for the compare scripts (they run under ``python -c`` and
-# cannot import this module).  ``read_plane`` is the stride-aware, copying
+# Inline prelude for the compare scripts (they run as ``python -c`` subprocesses
+# and cannot import this module).  ``read_plane`` is the stride-aware, copying
 # reader the subprocess uses for every plane.
 COMPARE_PRELUDE = '''\
 import ctypes

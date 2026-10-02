@@ -8,7 +8,7 @@ exec pool, and no host upload/download/gather/blit machinery at all. The paralle
 vcheck is the default.
 
 Benchmark defaults: 2000 f, real based_aa clip, 2x2160p, field=3, mdis=20,
-vcheck=2. `MANGOHUD=0 python3 tools/benchmark.py --filter eedi3 vsfeel vszipcl`.
+vcheck=2. `MANGOHUD=0 uv run tools/benchmark.py --filter eedi3 vsfeel vszipcl`.
 
 | clip | vsfeel | vszipcl | speedup |
 |---|---|---|---|
@@ -60,7 +60,7 @@ EEDI3 380 → 417, EEDI3H 400 → 488, EEDI3AA 149 → 146.
 
 ## Implementation (current)
 
-Benchmark call: `MANGOHUD=0 python3 tools/benchmark.py --filter eedi3 vsfeel
+Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter eedi3 vsfeel
 vszipcl` (and `--filter eedi3aa`, `--filter eedi3h` where registered).
 
 Two GPU passes per plane: `ENTRY_PAD` expands eedi3m's mirrors in VRAM from the

@@ -113,7 +113,7 @@ pre-R80/R80 pairs through `tools/benchmark.py`, `--repeat 2`:
 - The port wins exactly where a resident chain is involved: fed a GPU clip the
   old filter had to `GPUDownload` it first, the new one reads VRAM in place.
 
-Benchmark call: `MANGOHUD=0 python3 tools/benchmark.py --filter bilateral
+Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter bilateral
 [vsfeel vszipcl] [--gpu-cache] [--bits 32] [--bilateral-sigma-spatial X
 --bilateral-sigma-color Y]`.
 

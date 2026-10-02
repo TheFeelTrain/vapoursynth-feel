@@ -22,7 +22,7 @@ cycles add ~5 MB more, allocator warmup rather than a per-cycle leak).  The
 limits below sit above that floor and still trip on a per-process leak of
 roughly 30 KiB per cycle.
 
-Run from the repository root:  python -m pytest tests/test_resources.py
+Run from the repository root:  uv run python -m pytest tests/test_resources.py
 """
 
 import json

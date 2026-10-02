@@ -14,7 +14,7 @@ a pixel within an ulp of sigma can flip to/from zero — those keep a looser
 bound. 16-bit integer output is compared as whole output codes (<= 1 LSB).
 Self-consistency checks remain exact.
 
-Run from the repository root:  python -m pytest tests/test_dfttest.py
+Run from the repository root:  uv run python -m pytest tests/test_dfttest.py
 """
 
 import json

@@ -6,7 +6,7 @@ temporal pipeline: frames 0..23 must all produce finite output with no NaN
 (regression: boundary frames intermittently produced NaN before the atomics
 were made visible to the aggregation kernel).
 
-Run from the repository root:  python -m pytest tests/test_bm3dv2.py
+Run from the repository root:  uv run python -m pytest tests/test_bm3dv2.py
 """
 
 import json

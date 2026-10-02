@@ -15,7 +15,7 @@ sides round nearly identical fp32 results once. Self-consistency checks
 Every reference comparison runs in a subprocess (``reference_compare``) so a
 reference crash cannot take the pytest process down with it.
 
-Run from the repository root:  python -m pytest tests/test_bilateral.py
+Run from the repository root:  uv run python -m pytest tests/test_bilateral.py
 """
 
 import numpy as np

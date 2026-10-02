@@ -27,7 +27,7 @@ Self-consistency (determinism across runs, multi-stream == single stream,
 parallel load) is exact. The chain's props (N frames, input fps,
 ``_FieldBased=PROGRESSIVE``) are asserted against the two-call chain.
 
-Run from the repository root:  python -m pytest tests/test_eedi3aa.py
+Run from the repository root:  uv run python -m pytest tests/test_eedi3aa.py
 """
 
 import numpy as np

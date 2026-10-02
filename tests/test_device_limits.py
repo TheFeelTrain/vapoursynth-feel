@@ -17,7 +17,7 @@ VSFEEL_LIMIT_SHARED_MEMORY, VSFEEL_LIMIT_VRAM_BUDGET). Those are read once per
 process when the core's device is brought up, so each case runs in its own
 subprocess.
 
-Run from the repository root:  python -m pytest tests/test_device_limits.py
+Run from the repository root:  uv run python -m pytest tests/test_device_limits.py
 """
 
 import json

@@ -11,7 +11,7 @@ every config tried, both code paths, both bit depths, YUV included), so no
 numeric tolerance is needed; only reference crashes are tolerated (the
 comparison runs in a subprocess).
 
-Run from the repository root:  python -m pytest tests/test_gaussblur.py
+Run from the repository root:  uv run python -m pytest tests/test_gaussblur.py
 """
 
 import json

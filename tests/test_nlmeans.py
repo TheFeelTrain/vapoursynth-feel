@@ -5,7 +5,7 @@ the input. The noise content makes every parameter axis observable: NLM must
 actually alter it, and any misindexing of the padded window or sweep tables
 shows up as a large diff against the reference implementation.
 
-Run from the repository root:  python -m pytest tests/test_nlmeans.py
+Run from the repository root:  uv run python -m pytest tests/test_nlmeans.py
 """
 
 import numpy as np

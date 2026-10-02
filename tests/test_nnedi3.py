@@ -17,7 +17,7 @@ Agreement measured on the noise clip (see notes/NNEDI3.md):
 
 Self-consistency (determinism across runs, multi-stream == single) is exact.
 
-Run from the repository root:  python -m pytest tests/test_nnedi3.py
+Run from the repository root:  uv run python -m pytest tests/test_nnedi3.py
 """
 
 import numpy as np

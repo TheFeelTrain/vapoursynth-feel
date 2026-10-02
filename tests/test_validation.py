@@ -10,7 +10,7 @@ The layer reports to stdout on this loader; both streams are scanned.  A
 test cannot pass vacuously on a box without it (the loader silently ignores a
 missing ``VK_INSTANCE_LAYERS`` entry).
 
-Run from the repository root:  python -m pytest tests/test_validation.py
+Run from the repository root:  uv run python -m pytest tests/test_validation.py
 """
 
 import os

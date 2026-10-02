@@ -7,10 +7,10 @@ device before creating a pipeline -- which means the numbers it checks have to
 match the SPIR-V. This prints them straight out of `build/vk_spv/*.spv`, which is
 the source of truth once the shaders are compiled:
 
-    python3 tools/shader_limits.py                 # every variant
-    python3 tools/shader_limits.py 'build/vk_spv/nnedi3*'
-    python3 tools/shader_limits.py -v              # also list the Workgroup vars
-    python3 tools/shader_limits.py --check         # fail if the host disagrees
+    uv run python tools/shader_limits.py                 # every variant
+    uv run python tools/shader_limits.py 'build/vk_spv/nnedi3*'
+    uv run python tools/shader_limits.py -v              # also list the Workgroup vars
+    uv run python tools/shader_limits.py --check         # fail if the host disagrees
 
 Local size comes from OpExecutionMode LocalSize; a dimension the host supplies at
 creation (OpExecutionModeId, e.g. bilateral's block or eedi3's row width) prints
