@@ -104,6 +104,13 @@ suite **803 passed** via `tools/test.sh`.
 
 ## Historical
 
+- **2026-10-02 — the `oracle_32bit[case4-*]` failures were the EEDI3 core, not
+  the AA chain.** They measured 0.002 against the 1e-6 oracle because the fused
+  chain's f32 EEDI3 sub-passes lost DP argmins to missing `precise` qualifiers
+  and incremental window sums; both are fixed in `src/eedi3.comp` and the case
+  is back at 0. The premise (which pixels the distinct sclip leaves alone) was
+  never content-specific.
+
 **Cost model** (pre-R80; 2x-2160p, mdis=20, vcheck=2, ns=1, steady state, four
 sub-passes / two submissions) from the `VSFEEL_EEDI3_GBENCH` profiler:
 
@@ -230,11 +237,6 @@ under-reported every stage 10x).
   No perf change.
 
 ## Open work
-
-- **Three `oracle_32bit[case4-*]` comparisons fail on the new test clip
-  (2026-10-02)**, at 0.002 against a 1e-6 oracle. The case's premise (which
-  pixels the distinct sclip leaves alone) is content-specific; it needs a
-  content-aware oracle rather than a looser bound.
 
 - **A parallel vcheck is the only path past 1.33x** (47% of the frame), and it
   changes the shared EEDI3 core, which would speed up EEDI3/EEDI3H by the same

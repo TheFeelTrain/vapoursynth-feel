@@ -12,6 +12,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - BM3Dv2 follows VapourSynth-BM3D for block matching and filtering instead of the BM3DCUDA.
 - BM3Dv2 denoises all planes of YUV clips and supports the joint 4:4:4 `chroma=True` mode.
 
+### Fixed
+
+- EEDI3 and EEDI3H are bit-exact with eedi3vk2 in fp32
+- NLMeans more closely matches vszipcl in fp32 and u16
+
 ## [1.0.0] - 2026-10-01
 
 This is a major version because the plugin moved to the VapourSynth R80 GPU API. The core now owns the device, the queues and the transfers, and frames stay on the GPU from input to output.

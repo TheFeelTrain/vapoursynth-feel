@@ -126,13 +126,14 @@ def test_temporal_differs_from_spatial_32bit(clip_gray):
 
 # --- correctness vs the reference --------------------------------------------
 
-# Parameter sweep vs vszipcl. Tolerance set from measurement: diffs come
-# from fp32 accumulation order in the weighted average (more taps at larger
-# a/s accumulate more), landing in the 0 .. 6e-5 band across all configs and
-# all special paths (UV/RGB joint, rclip guide, cropped stride). The bound
-# keeps ~40% headroom over the worst measurement while still catching real
-# misindexing (which produces O(0.1..1) errors).
-NLMEANS_REF_TOL = 1e-4
+# Parameter sweep vs vszipcl. Tolerance set from measurement: diffs come from
+# fp32 accumulation order in the weighted average (more taps at larger a/s
+# accumulate more), landing at <= 4.4e-6 across all configs and all special
+# paths (UV/RGB joint, rclip guide, cropped stride, a=64, d=16); the rest of
+# the surface is <= 1e-6. The bound keeps 2.3x headroom over the worst
+# measurement while still catching real misindexing (O(0.1..1) errors) and a
+# return of the reduced-precision weight ring (which measured 2.1e-3 at a=64).
+NLMEANS_REF_TOL = 1e-5
 
 REFERENCE_CASES = [
     {"d": 0},
@@ -147,9 +148,10 @@ REFERENCE_CASES = [
     {"d": 0, "s": 8},
     {"d": 0, "h": 0.3},
     {"d": 0, "h": 6.0},
-    # wref=0 at the default h is outside the fp16 weight ring's envelope (see
-    # the envelope tests below); at h=3.0 both sides agree to ~1 code.
-    {"d": 0, "wref": 0.0, "h": 3.0},
+    # No wref=0 entry: the reference's own weighted average is degenerate there
+    # and it emits NaN (1533 samples on frame 0 at h=3.0, 53983 at h=1.2; nlm_hip
+    # agrees), so there is no oracle to compare against. vsfeel's finiteness and
+    # its centre-sample fallback are pinned by the wref0 tests below.
 ]
 
 
@@ -176,23 +178,58 @@ def test_matches_reference_16bit(clip_16bit, kwargs):
     assert worst <= 1.0, f"max LSB diff vs vszipcl {kwargs}: {worst}"
 
 
+# Second, independent implementation (KNLMeansCL's Vulkan port) on the spatial
+# surface, where it agrees with vsfeel bit-for-bit at f32 and within 1 LSB at
+# u16: a cross-check that the vszipcl agreement is not a shared quirk. Only d=0
+# configs - knlmvk's temporal pairing differs (measured 3.7e-2 at d=2, 1.4e-1
+# for d=1 a=3 s=3 h=3.0 wref=0.4) and it is that far from vszipcl too, so it is
+# not an oracle for the temporal path or for wref=0 (where it is 1.4e-1 from
+# vsfeel while vszipcl evaluates 0/0).
+KNLMVK_CASES = [
+    {"d": 0},
+    {"d": 0, "a": 4},
+    {"d": 0, "s": 8},
+    {"d": 0, "wmode": 2, "h": 2.0},
+    {"d": 0, "wmode": 3},
+    {"d": 0, "h": 0.3},
+]
+
+
+def _knlmvk_compare(fmt, kwargs, frames=(0, 11, 23)):
+    """Worst diff vs knlmvk (subprocess; skips if it is not installed)."""
+    reference_or_skip("knlmvk", "KNLMeans")
+    spec = reference_spec(
+        "knlmvk", "KNLMeans", fmt, frames=frames, kwargs=kwargs, vsfeel_filter="NLMeans"
+    )
+    return reference_compare(spec)["maxdiff"]
+
+
+@pytest.mark.parametrize("kwargs", KNLMVK_CASES, ids=lambda kw: str(kw))
+def test_spatial_matches_knlmvk_32bit(clip_gray, kwargs):
+    worst = _knlmvk_compare("gray32", dict(**kwargs))
+    assert worst <= 1e-6, f"max diff vs knlmvk {kwargs}: {worst}"
+
+
+@pytest.mark.parametrize("kwargs", KNLMVK_CASES, ids=lambda kw: str(kw))
+def test_spatial_matches_knlmvk_16bit(clip_16bit, kwargs):
+    worst = _knlmvk_compare("gray16", dict(**kwargs))
+    assert worst <= 1.0, f"max LSB diff vs knlmvk {kwargs}: {worst}"
+
+
 # Positive maxima of the three radii (a=64, s=8, d=16): the m=0..2
 # sweep-table variants and run-group boundaries the a<=4 / d<=2 sweep misses.
-# At the default h=1.2 the largest push the fp16 weight ring to its envelope
-# (a=64 2.02e-3, s=8+a=64 1.42e-2) while the same configs at h=3.0 land at
-# 1.6e-6 and wmode 1/2/3 at a=64 stays ~1e-6, so the drift is weight
-# quantisation, not indexing. d=16 with s=8 and a=64 together is omitted: it
-# hard-recovers the GPU.
+# Every entry is at the shared NLMEANS_REF_TOL now: the fp32 weight ring holds
+# the whole surface at <= 4.4e-6 (measured). d=16 with s=8 and a=64 together is
+# omitted: it hard-recovers the GPU.
 POSITIVE_MAX_CASES = [
     # (kwargs, bound, measured)
-    ({"d": 0, "a": 64}, 3e-3, 2.02e-3),
-    ({"d": 0, "s": 8, "a": 64}, 2e-2, 1.42e-2),
-    ({"d": 0, "a": 64, "h": 3.0}, NLMEANS_REF_TOL, 1.61e-6),
-    ({"d": 0, "s": 8, "a": 64, "h": 3.0}, NLMEANS_REF_TOL, 1.46e-6),
-    ({"d": 16}, NLMEANS_REF_TOL, 4.22e-6),
-    # d=16 together with a=64 is omitted: its reference comparison reports a
-    # ~0.07 max diff in-session, does not reproduce standalone, and is recorded
-    # as open work in notes/NLMEANS.md.
+    ({"d": 0, "a": 64}, NLMEANS_REF_TOL, 7.2e-7),
+    ({"d": 0, "s": 8, "a": 64}, NLMEANS_REF_TOL, 4.2e-7),
+    ({"d": 0, "a": 64, "h": 3.0}, NLMEANS_REF_TOL, 4.35e-6),
+    ({"d": 0, "s": 8, "a": 64, "h": 3.0}, NLMEANS_REF_TOL, 4.10e-6),
+    ({"d": 16}, NLMEANS_REF_TOL, 1.55e-6),
+    ({"d": 16, "s": 8}, NLMEANS_REF_TOL, 1.43e-6),
+    # d=16 together with a=64 is omitted: it hard-recovers the GPU.
 ]
 
 
@@ -209,8 +246,9 @@ POSITIVE_MAX_16_CASES = [
     ({"d": 16}, 1.0, 1),
     ({"d": 16, "s": 8}, 1.0, 1),
     # d=16 with a=64 omitted for the same reason as the 32-bit list.
-    ({"d": 0, "a": 64}, 200.0, 133),  # fp16 weight envelope at h=1.2
-    ({"d": 0, "a": 64, "h": 3.0}, 1.0, 1),  # same config, weights representable
+    ({"d": 0, "a": 64}, 1.0, 1),
+    ({"d": 0, "s": 8, "a": 64}, 1.0, 1),
+    ({"d": 0, "a": 64, "h": 3.0}, 1.0, 1),
     ({"d": 0, "s": 8, "a": 64, "h": 3.0}, 1.0, 1),
 ]
 
@@ -221,8 +259,7 @@ POSITIVE_MAX_16_CASES = [
     ids=[str(kw) for kw, _, _ in POSITIVE_MAX_16_CASES],
 )
 def test_matches_reference_positive_maxima_16bit(clip_16bit, kwargs, bound, measured):
-    """16-bit mirror: whole output codes. The a=64/h=1.2 entry carries the
-    same fp16-weight envelope (133 codes) and is 1 code at h=3.0."""
+    """16-bit mirror: whole output codes, every entry at the 1 LSB floor."""
     worst = _ref_compare("gray16", (0, 11, 23), dict(**kwargs))
     assert worst <= bound, (
         f"max LSB diff vs vszipcl {kwargs}: {worst} (bound {bound}, was {measured})"
@@ -271,17 +308,11 @@ def test_yuv_channels_uv_matches_reference_32bit(clip_yuv32):
 # The luma sweeps above only exercise 1 channel; the 16-bit 'UV' path was once
 # broken while every other depth/channel-count combination stayed correct, so
 # the 2-channel sweep must run at BOTH depths. Parameter list mirrors
-# REFERENCE_CASES. Tolerances measured on the noise clip:
-#   - 32-bit: worst 8.31e-5 across the sweep (fp32 accumulation order),
-#     bound NLMEANS_REF_TOL as for the luma sweep.
-#   - 16-bit: worst 4 codes (integer rounding + fp32 order on the subsampled
-#     lattice), bound 8.0 with 2x headroom. The wref=0 case is run with h=3.0
-#     instead of the default h=1.2: with wref=0 the tiny exp() weights of a
-#     noise clip fall into fp16 subnormals (x4096 store), which drifts the
-#     weighted average by thousands of codes at h=1.2 (measured 4421 LSB for
-#     UV16 and 4619 LSB for GRAY16 identically - a general 16-bit property of
-#     the fp16 weight ring, not a per-channel indexing fault), and drops to
-#     1 LSB at h=3.0.
+# REFERENCE_CASES. Tolerances measured on this clip with the fp32 weight ring:
+#   - 32-bit: worst 2.4e-7 across the sweep (fp32 accumulation order), bound
+#     NLMEANS_REF_TOL as for the luma sweep.
+#   - 16-bit: worst 1 code (integer rounding + fp32 order on the subsampled
+#     lattice), i.e. the whole list sits at the 1 LSB floor.
 
 UV32_CASES = [
     {"d": 0},
@@ -314,10 +345,11 @@ UV16_CASES = [
     {"d": 0, "s": 8},
     {"d": 0, "h": 0.3},
     {"d": 0, "h": 6.0},
-    {"d": 0, "wref": 0.0, "h": 3.0},  # see note above
+    # No wref=0 entry, same reason as the luma sweep above (the reference emits
+    # non-finite pixels there in both the f32 and the saturated-65535 u16 path).
 ]
 
-UV16_REF_TOL = 8.0
+UV16_REF_TOL = 1.0
 
 
 @pytest.mark.parametrize("kwargs", UV32_CASES, ids=lambda kw: str(kw))
@@ -336,10 +368,10 @@ ENVELOPE_FRAMES = (0, 11, 23)
 
 
 def test_wref0_low_h_is_finite_32bit(clip_gray):
-    """A fully flushed weight ring must fall back to the centre sample, not 0/0.
+    """Nothing in the wref=0 envelope may produce 0/0.
 
-    Covers both the exp() ring (wmode 0, fp16 flush) and the truncated modes
-    (wmode 1-3, max(1-arg,0) == 0 for every tap).
+    Covers both the exp() ring (wmode 0) and the truncated modes (wmode 1-3,
+    whose weights are all exactly 0 for arg >= 1).
     """
     for h in (0.6, 1.0, 1.2):
         for wmode in (0, 1, 2, 3):
@@ -357,23 +389,25 @@ def test_wref0_low_h_is_finite_uv_32bit(clip_yuv32):
             assert np.isfinite(_plane(out.get_frame(n), p)).all(), f"n={n} p={p}"
 
 
-def test_wref0_low_h_envelope_16bit(clip_16bit):
-    """Bound the known fp16 weight-ring defect at the envelope edge (h=1.2, wref=0).
+def test_wref0_flushed_ring_returns_centre_sample(clip_gray, clip_16bit):
+    """A fully flushed weight ring must return the centre sample exactly.
 
-    The ring can flush every tap to zero and the kernel falls back to the
-    centre sample, so the output deviates from vszipcl by thousands of codes
-    (measured ~4400-4600 LSB here; see the README's NLMeans accuracy note).
-    Only an upper bound is asserted: the defect is documented, not enshrined,
-    so fixing it can only lower the number.
+    wref=0 with a small h drives every tap's weight below the ring's range
+    (wmode 0, measured: bit-exact from h <= 0.1) or truncates every weight to
+    zero (wmode 1-3), so the total weight is 0 and the finish must fall back to
+    the centre sample instead of evaluating 0/0. The reference cannot bound
+    this: vszipcl and nlm_hip both emit NaN in the same regime (1533 samples on
+    frame 0 at h=3.0, 53983 at h=1.2), which is why the oracle here is the
+    source clip.
     """
-    worst = _ref_compare("gray16", ENVELOPE_FRAMES, dict(d=0, wref=0.0))
-    assert worst < 6000.0, f"fp16 weight-ring envelope moved: {worst}"
-
-
-def test_wref0_low_h_envelope_32bit(clip_gray):
-    """Upper bound on the same edge at fp32 (float units; measured ~0.07)."""
-    worst = _ref_compare("gray32", ENVELOPE_FRAMES, dict(d=0, wref=0.0))
-    assert worst < 0.12, f"fp16 weight-ring envelope moved: {worst}"
+    for clip, dt in ((clip_gray, np.float32), (clip_16bit, np.uint16)):
+        for h in (1e-4, 1e-2, 0.1):
+            for wmode in (0, 1, 2, 3):
+                out = _run(clip, d=0, h=h, wmode=wmode, wref=0.0)
+                for n in ENVELOPE_FRAMES:
+                    got = _plane(out.get_frame(n), 0, dtype=dt)
+                    src = _plane(clip.get_frame(n), 0, dtype=dt)
+                    assert np.array_equal(got, src), f"h={h} wmode={wmode} n={n}"
 
 
 def test_yuv_channels_uv_temporal_matches_reference_32bit(clip_yuv32):

@@ -25,7 +25,7 @@ import textwrap
 
 import pytest
 
-from conftest import COMPARE_PRELUDE, HEIGHT, CLIP_PATH, compare_or_skip
+from conftest import COMPARE_PRELUDE, HEIGHT, CLIP_FRAMES, CLIP_PATH, compare_or_skip
 
 WIDTHS = (630, 638)
 FRAMES = [0, 1, 2]
@@ -44,8 +44,8 @@ CROP_FROM = 640
 #   eedi3      u16: bit-exact vs eedi3vk2 (shared surface); f32 ~1 ulp
 #   eedi3h     u16/f32: 0.0 vs the same-plugin transpose oracle
 #   eedi3aa    u16: 0.0; f32: a few ulp of the fused chain (~6e-8 measured)
-#   nlmeans    u16: <= 1 code; f32: <= 6e-5 (sweep band documented in
-#                     test_nlmeans.py; 1e-4 bound here)
+#   nlmeans    u16: <= 1 code; f32: <= 7.2e-7 (1e-5 bound here, the same
+#                     fp32-accumulation-order band as test_nlmeans.py)
 # The yuv420 cases exercise half-width chroma: at 630 luma px the chroma rows
 # are 315 samples, i.e. 630 bytes for u16 (22 mod 32) — the alignment that made
 # the old DFTTest download helper fault.
@@ -57,7 +57,7 @@ TOL_EEDI3_32 = 1e-6
 TOL_ORACLE_EXACT = 0.0
 TOL_EEDI3AA_32 = 1e-6
 TOL_NLMEANS_16 = 1.0
-TOL_NLMEANS_32 = 1e-4
+TOL_NLMEANS_32 = 1e-5
 
 _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     import json
@@ -83,6 +83,10 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 
     core.max_cache_size = 512
     src = core.bs.VideoSource({CLIP_PATH!r})
+    # Same length as the fixtures (the file is 300 frames): a temporal filter
+    # sees a different window at the last frame otherwise.
+    if src.num_frames > {CLIP_FRAMES}:
+        src = core.std.Trim(src, first=0, length={CLIP_FRAMES})
     if color == "yuv420":
         # subsampled chroma: the chroma planes are half width, so their rows
         # are a different (and typically less aligned) length than luma's
@@ -164,6 +168,15 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
         print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
         raise SystemExit(2)
     if not VSFEEL_ORACLE:
+        # A non-finite reference sample is a broken oracle, not a vsfeel
+        # failure. (EEDI3H/EEDI3AA's oracle *is* vsfeel's own composition, so
+        # for those the check below stays a vsfeel failure.)
+        for n, ref_planes in zip(frames, ref_frames):
+            for p, b in zip(planes, ref_planes):
+                if not np.isfinite(b.astype(np.float64)).all():
+                    print("REF unavailable: non-finite reference at frame %d plane %d"
+                          % (n, p), flush=True)
+                    raise SystemExit(2)
         print("REF ok", flush=True)
 
     # --- vsfeel phase ---
@@ -175,8 +188,7 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
             frame = my_node.get_frame(n)
             for p, b in zip(planes, ref_planes):
                 a = read_plane(frame, p, dtype)
-                if not (np.isfinite(a.astype(np.float64)).all()
-                        and np.isfinite(b.astype(np.float64)).all()):
+                if not np.isfinite(a.astype(np.float64)).all():
                     print("VSFEEL fail: non-finite output at frame %d plane %d"
                           % (n, p), flush=True)
                     raise SystemExit(3)

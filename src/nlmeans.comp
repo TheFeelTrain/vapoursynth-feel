@@ -33,7 +33,7 @@
 #define BITS 16
 #endif
 
-// the weight ring is fp16 regardless of the io depth
+// the weight ring is fp32 regardless of the io depth (see WeightBuf below)
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_buffer_reference : require
 
@@ -87,9 +87,12 @@ layout(std430, binding = 3) writeonly buffer Dst1 { VTYPE d1[]; };
 layout(std430, binding = 4) writeonly buffer Dst2 { VTYPE d2[]; };
 layout(std430, binding = 5) readonly buffer WQBuf { int wq[]; };
 layout(std430, binding = 6) readonly buffer AQBuf { int aq[]; };
-// weights live as fp16: halves the sweep-ring traffic; close-enough numerics
-// by the same policy as BM3Dv2
-layout(std430, binding = 7) buffer WeightBuf { float16_t u4a[]; };
+// Weights are fp32 like the reference's u4a. An fp16 ring (x4096 to dodge the
+// subnormal cliff) halves the sweep-ring traffic but quantises every weight to
+// 2^-11 relative, which on real content drifts the weighted average by up to
+// ~2e-3 fp32 / ~180 codes u16 at a=64: the fp32 ring holds the whole
+// comparison surface at <=1 LSB for ~7% (measured, jpbd 1080p UV16 d=2).
+layout(std430, binding = 7) buffer WeightBuf { float u4a[]; };
 layout(std430, binding = 8) buffer AccBuf { float u2[]; };
 layout(std430, binding = 9) buffer MaxBuf { float u5[]; };
 
@@ -118,9 +121,9 @@ VTYPE to_vtype(float v) {
 #endif
 }
 
-// The fp16 weight ring can flush every tap to zero at low h with wref=0
-// (see README's NLMeans accuracy note); fall back to the centre sample
-// instead of evaluating 0/0.
+// A weight ring can still flush every tap to zero at low h with wref=0 (and
+// the reference emits NaN there); fall back to the centre sample instead of
+// evaluating 0/0.
 float finish_sample(float ctr, float m, float acc, float accw) {
     const float den = m + accw;
     return den > 0.0f ? (ctr*m + acc) / den : ctr;
@@ -328,9 +331,7 @@ void main() {
         } else {
             float c = max(1.0f - arg, 0.0f); c = c*c; c = c*c; w = c*c;
         }
-        // x4096 keeps small weights inside fp16's normal range (no
-        // subnormal cliff); acc rescales on load
-        u4a[slot*U4_LAYER + y*STRIDE + x] = float16_t(w * 4096.0f);
+        u4a[slot*U4_LAYER + y*STRIDE + x] = w;
     }
 }
 
@@ -365,10 +366,10 @@ void main() {
             const int r = (q_base + b) * 8;
             const int qx = aq[r+0], qy = aq[r+1], qz = aq[r+2];
             const int sc = aq[r+3], sm = aq[r+4];
-            const float u4 = float(u4a[sc*U4_LAYER + g]) * (1.0f/4096.0f);
+            const float u4 = u4a[sc*U4_LAYER + g];
             const int xm = x-qx, ym = y-qy;
             const float u4_mq = (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
-                                ? 0.0f : float(u4a[sm*U4_LAYER + ym*STRIDE + xm]) * (1.0f/4096.0f);
+                                ? 0.0f : u4a[sm*U4_LAYER + ym*STRIDE + xm];
             u5v = max(u4, max(u4_mq, u5v));
             const int qps = qy*PSTRIDE + qx;
             const float pq0 = load_src((NLM_D+qz)*TILE_ELEMS, gpad + qps);
@@ -390,10 +391,10 @@ void main() {
             const int r = (q_base + b) * 8;
             const int qx = aq[r+0], qy = aq[r+1], qz = aq[r+2];
             const int sc = aq[r+3], sm = aq[r+4];
-            const float u4 = float(u4a[sc*U4_LAYER + g]) * (1.0f/4096.0f);
+            const float u4 = u4a[sc*U4_LAYER + g];
             const int xm = x-qx, ym = y-qy;
             const float u4_mq = (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
-                                ? 0.0f : float(u4a[sm*U4_LAYER + ym*STRIDE + xm]) * (1.0f/4096.0f);
+                                ? 0.0f : u4a[sm*U4_LAYER + ym*STRIDE + xm];
             u5v = max(u4, max(u4_mq, u5v));
             const int qps = qy*PSTRIDE + qx;
             const float pq0 = load_src((NLM_D+qz)*TILE_ELEMS, gpad + qps);
@@ -420,10 +421,10 @@ void main() {
             const int r = (q_base + b) * 8;
             const int qx = aq[r+0], qy = aq[r+1], qz = aq[r+2];
             const int sc = aq[r+3], sm = aq[r+4];
-            const float u4 = float(u4a[sc*U4_LAYER + g]) * (1.0f/4096.0f);
+            const float u4 = u4a[sc*U4_LAYER + g];
             const int xm = x-qx, ym = y-qy;
             const float u4_mq = (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
-                                ? 0.0f : float(u4a[sm*U4_LAYER + ym*STRIDE + xm]) * (1.0f/4096.0f);
+                                ? 0.0f : u4a[sm*U4_LAYER + ym*STRIDE + xm];
             u5v = max(u4, max(u4_mq, u5v));
             const int qps = qy*PSTRIDE + qx;
             const float pq0 = load_src((NLM_D+qz)*TILE_ELEMS, gpad + qps);

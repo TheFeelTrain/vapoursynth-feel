@@ -105,6 +105,10 @@ struct NLMeansData {
     VSNode * ref_node {}; // optional guide clip
     const VSVideoInfo * vi {};
 
+    // u4a element width. fp32 keeps the weights bit-comparable with the
+    // reference; the shader's WeightBuf must match.
+    static constexpr int64_t kWeightBytes = sizeof(float);
+
     int bits {}, elem_bytes {};
     bool has_ref {};
 
@@ -128,8 +132,8 @@ struct NLMeansData {
     int guide_off {}; // window tile offset of the guide half
     int qb {};
     uint32_t pack { 1 }; // sweep rounds: entries per weight+acc round
-    int64_t ring_budget { 64LL << 20 }; // u4a ring target, capped by the core
-    int slots {};                       // u4a ring slots = ring_base * pack
+    int64_t ring_budget { 128LL << 20 }; // u4a ring target, capped by the core
+    int slots {};                        // u4a ring slots = ring_base * pack
 
     // create()-time q-sweep tables (stride-8 rows), shared by all recordings
     std::vector<int> wq_host;
@@ -361,7 +365,7 @@ static const VSFrame * nlmeans_gpu_frame(NLMeansData * d, int n,
     GpuBuffer u4a {}, u2 {}, u5 {};
     if (auto e = gpu_frame_buffer(*d->gpu, core, ctx,
                                   static_cast<VkDeviceSize>(d->npix) *
-                                      d->slots * sizeof(uint16_t),
+                                      d->slots * NLMeansData::kWeightBytes,
                                   u4a);
         !e.empty()) {
         return fail("weight ring: " + e);
@@ -890,19 +894,21 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
 
     // Pack as many sweep entries into one weight+accumulation round as the u4a
     // plane-ring budget allows: the kernels' arithmetic is cheap next to the
-    // fixed per-dispatch/barrier drain. Keep the ring cache-friendly (~64 MiB):
-    // measured optimum on the target GPU, larger rings stream weights through
-    // DRAM between the weight and accumulation launches. That optimum is capped
-    // by the core's budget -- the target GPU has room for the whole 64 MiB, a
-    // device with a smaller allowance packs fewer entries per round. One pack is
-    // the floor: the run groups have to fit, so a ring smaller than that is not
-    // expressible and the core's allocator is what rejects it.
+    // fixed per-dispatch/barrier drain. The ring is fp32 (see the shader's
+    // WeightBuf) and budgeted at 128 MiB so `pack` stays at the measured
+    // optimum of the older fp16 layout: halving it for the same bytes costs
+    // more in extra rounds than the wider ring costs in DRAM traffic, and the
+    // reference's own u4a is fp32 too. The budget is capped by the core's
+    // VRAM allowance -- a device with a smaller allowance packs fewer entries
+    // per round. One pack is the floor: the run groups have to fit, so a ring
+    // smaller than that is not expressible and the core's allocator is what
+    // rejects it.
     {
         const int64_t ring_base_slots =
             (dd == 0) ? d->qb : 2 * static_cast<int64_t>(d->qb);
         const int64_t bytes_per_pack =
-            ring_base_slots * d->npix * sizeof(uint16_t);
-        int64_t ring_budget = 64LL << 20;
+            ring_base_slots * d->npix * NLMeansData::kWeightBytes;
+        int64_t ring_budget = 128LL << 20;
         if (const VkDeviceSize budget = vsfeel_vram_limit(*d->gpu, core);
             budget > 0) {
             ring_budget = std::min<int64_t>(ring_budget,
@@ -1166,8 +1172,8 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
 
     if (vsfeel_debug_flag("VSFEEL_NLMEANS_VRAM")) {
         const double mib = 1024.0 * 1024.0;
-        const double ring_mib =
-            static_cast<double>(d->npix) * d->slots * sizeof(uint16_t) / mib;
+        const double ring_mib = static_cast<double>(d->npix) * d->slots *
+                                NLMeansData::kWeightBytes / mib;
         const double window_mib = static_cast<double>(d->clips) * d->channels *
                                   (2 * d->d + 1) * d->tile_elems *
                                   d->elem_bytes / mib;

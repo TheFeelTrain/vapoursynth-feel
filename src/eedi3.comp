@@ -437,9 +437,12 @@ void store_dst_val(int r, int x, float v) {
 // Vertical 4-tap cubic at column x of interp dst row dy (kept rows dy +/- 1
 // and dy +/- 3). Integer formats reproduce the clamp/round of the int cubic
 // through store_dst_val / the cint quantizer; float uses exact weights.
+// `precise` mirrors eedi3vk2's cubic4: contracted into an FMA, the two-term
+// float cubic is an ulp off on essentially every interpolated pixel.
 float cubic_float(int dy, int x) {
-    return 0.5625f * (pad_get(dy - 1, x) + pad_get(dy + 1, x))
-         - 0.0625f * (pad_get(dy - 3, x) + pad_get(dy + 3, x));
+    precise float t = 0.5625f * (pad_get(dy - 1, x) + pad_get(dy + 1, x))
+                    - 0.0625f * (pad_get(dy - 3, x) + pad_get(dy + 3, x));
+    return t;
 }
 
 // Connection cost for interp dst row dy, column x, direction u.
@@ -491,7 +494,14 @@ float conn_cost(int dy, int x, int u) {
     const float v = abs(pad_get(dy - 1, x) - ip) + abs(pad_get(dy + 1, x) - ip);
 #endif
 
-    return pc.alpha * (s0 + S1 + S2) + pc.beta * float(abs(u)) + pc.rw * v;
+    // Combine order and `precise` mirror eedi3vk2's combineCost. Without
+    // precise the compiler contracts alpha*(s0+s1+s2)+beta*|u| into an FMA, an
+    // ulp off the reference, which flips near-tie argmins: u16 lost its
+    // bit-exactness on real content (1 LSB on a few pixels per frame).
+    precise float cost = pc.alpha * (s0 + S1 + S2);
+    cost += pc.beta * float(abs(u));
+    cost += pc.rw * v;
+    return cost;
 }
 
 // ---------------------------------------------------------------------------
@@ -502,9 +512,9 @@ float conn_cost(int dy, int x, int u) {
 // a window costs ONE new leading-term eval (9 pad loads) instead of the full
 // (2*NRAD+1)-term recompute (~90 loads). Measured: full conn_cost per
 // (column, direction) is ~70% of row-kernel time (zeroing it took vcheck=0
-// full-DP 2160p from 116 -> 278 fps). For u16 the pad values are exact
-// integers < 2^24 so window sums are exact regardless of accumulation order;
-// f32 may differ from the reference in rounding order by ~ulp (acceptable).
+// full-DP 2160p from 116 -> 278 fps). The cost always comes from
+// ring_sum(ring), the k-order re-sum eedi3vk2's orderedSum uses, so the
+// rolling path is bit-exact with the reference at both depths.
 //
 // The three windows of cost3 (cost3 is always on):
 //   s0(x,u) = sum_k A(x+u+k, x-u+k)
@@ -522,35 +532,42 @@ float rowA(int dy, int i, int j) {
 }
 
 // Seed the three windows at column x (fresh full evaluation, k ascending).
-void roll_seed(int dy, int x, int u, out float s0, out float s1, out float s2,
+void roll_seed(int dy, int x, int u,
                inout float r0[RING_CAP], inout float r1[RING_CAP],
                inout float r2[RING_CAP]) {
-    s0 = 0.0f; s1 = 0.0f; s2 = 0.0f;
     for (int k = 0; k < RING_CAP; ++k) {
         if (k >= RN) break;
-        const float t0 = rowA(dy, x + u + k - NRAD, x - u + k - NRAD);
-        const float t1 = rowA(dy, x + k - NRAD, x - 2 * u + k - NRAD);
-        const float t2 = rowA(dy, x + 2 * u + k - NRAD, x + k - NRAD);
-        r0[k] = t0; r1[k] = t1; r2[k] = t2;
-        s0 += t0; s1 += t1; s2 += t2;
+        r0[k] = rowA(dy, x + u + k - NRAD, x - u + k - NRAD);
+        r1[k] = rowA(dy, x + k - NRAD, x - 2 * u + k - NRAD);
+        r2[k] = rowA(dy, x + 2 * u + k - NRAD, x + k - NRAD);
     }
 }
 
 // Advance the seeded windows from column x to column x+1.
-void roll_push(int dy, int x, int u, inout float s0, inout float s1, inout float s2,
+void roll_push(int dy, int x, int u,
                inout float r0[RING_CAP], inout float r1[RING_CAP],
                inout float r2[RING_CAP]) {
     const float l0 = rowA(dy, x + u + NRAD + 1, x - u + NRAD + 1);
     const float l1 = rowA(dy, x + NRAD + 1, x - 2 * u + NRAD + 1);
     const float l2 = rowA(dy, x + 2 * u + NRAD + 1, x + NRAD + 1);
-    s0 += l0 - r0[0];
-    s1 += l1 - r1[0];
-    s2 += l2 - r2[0];
     for (int k = 0; k < RING_CAP - 1; ++k) {
         if (k >= RN - 1) break;
         r0[k] = r0[k + 1]; r1[k] = r1[k + 1]; r2[k] = r2[k + 1];
     }
     r0[RN - 1] = l0; r1[RN - 1] = l1; r2[RN - 1] = l2;
+}
+
+// Re-sum one term ring in k order, exactly like eedi3vk2's orderedSum: the
+// reference derives every rolled cost from the re-summed ring, and an
+// incremental accumulator drifts from it by an ulp of f32 per column, which
+// flips near-tie argmins on real content.
+float ring_sum(in float r[RING_CAP]) {
+    precise float s = 0.0f;
+    for (int k = 0; k < RING_CAP; ++k) {
+        if (k >= RN) break;
+        s += r[k];
+    }
+    return s;
 }
 
 // Combined cost (cost3 semantics, mirroring conn_cost's tail) from window
@@ -569,7 +586,14 @@ float combine_interior(int dy, int x, int u, float s0, float s1, float s2) {
     const float ip = (pad_get(dy - 1, x + u) + pad_get(dy + 1, x - u)) * 0.5f;
     const float v = abs(pad_get(dy - 1, x) - ip) + abs(pad_get(dy + 1, x) - ip);
 #endif
-    return pc.alpha * (s0 + S1 + S2) + pc.beta * float(abs(u)) + pc.rw * v;
+    // Combine order and `precise` mirror eedi3vk2's combineCost. Without
+    // precise the compiler contracts alpha*(s0+s1+s2)+beta*|u| into an FMA, an
+    // ulp off the reference, which flips near-tie argmins: u16 lost its
+    // bit-exactness on real content (1 LSB on a few pixels per frame).
+    precise float cost = pc.alpha * (s0 + S1 + S2);
+    cost += pc.beta * float(abs(u));
+    cost += pc.rw * v;
+    return cost;
 }
 #endif  // !ENTRY_PAD
 #if defined(ENTRY_ROW)
@@ -592,8 +616,8 @@ float combine_interior(int dy, int x, int u, float s0, float s1, float s2) {
 // consecutive unmasked interior columns; a masked column or a column outside
 // the direction's interior band invalidates the state (next interior column
 // reseeds with the full window). This matches the barrier version's cost math
-// bit-for-bit (same roll_seed/roll_push/combine_interior), so u16 stays
-// bit-exact vs eedi3vk2 and f32 keeps its ~1 ulp measured band.
+// bit-for-bit (same roll_seed/roll_push/ring_sum/combine_interior), so both
+// depths stay bit-exact vs eedi3vk2.
 //
 // The workgroup is a single 32-lane subgroup; each workgroup processes one
 // interpolated row. The host requests requiredSubgroupSize = 32 for this
@@ -741,14 +765,12 @@ void main() {
     // Per-direction DP state (registers). u = laneBase + j - CENTER.
     float pp[K];   // previous column's path costs
     int pRel[K];   // previous column's relative backtrack delta (mclip copy)
-    float s0[K], s1[K], s2[K];          // rolling window sums
     float r0[K][RING_CAP], r1[K][RING_CAP], r2[K][RING_CAP];  // term rings
     bool rolled[K];                     // rolling state valid (unmasked interior run)
 
     for (int j = 0; j < K; j++) {
         pp[j] = 0.0f;
         pRel[j] = 0;
-        s0[j] = 0.0f; s1[j] = 0.0f; s2[j] = 0.0f;
         rolled[j] = false;
     }
 
@@ -881,14 +903,13 @@ void main() {
                         const bool interior = (xd >= 2 * au && xd <= WIDTH - 1 - 2 * au);
                         if (interior) {
                             if (!rolled[j]) {
-                                roll_seed(dy, xd, u, s0[j], s1[j], s2[j],
-                                          r0[j], r1[j], r2[j]);
+                                roll_seed(dy, xd, u, r0[j], r1[j], r2[j]);
                                 rolled[j] = true;
                             } else {
-                                roll_push(dy, xd - 1, u, s0[j], s1[j], s2[j],
-                                          r0[j], r1[j], r2[j]);
+                                roll_push(dy, xd - 1, u, r0[j], r1[j], r2[j]);
                             }
-                            ccost = combine_interior(dy, xd, u, s0[j], s1[j], s2[j]);
+                            ccost = combine_interior(dy, xd, u, ring_sum(r0[j]),
+                                                     ring_sum(r1[j]), ring_sum(r2[j]));
                         } else {
                             rolled[j] = false;
                             ccost = conn_cost(dy, xd, u);
@@ -898,20 +919,23 @@ void main() {
                     // DP relax over v in [u-1, u+1] (subset of |v| <= umax2 by
                     // construction), ascending v, strict < keeps the lowest v
                     // on ties. ext[e] = pp of direction laneBase + e - 1.
+                    // `precise` as in eedi3vk2: gamma*|dd|+ext contracted into
+                    // an FMA is an ulp off and flips near-tie argmins.
                     float bval = FLT_MAX_V;
                     int idx = 0;
                     for (int dd = -1; dd <= 1; dd++) {
                         const int v = u + dd;
                         if (abs(v) <= umax2) {
-                            const float z = ext[j + 1 + dd] + pc.gamma * float(abs(dd));
-                            const float cc = min(z, FLT_MAX_09);
+                            precise const float z =
+                                ext[j + 1 + dd] + pc.gamma * float(abs(dd));
+                            precise const float cc = min(z, FLT_MAX_09);
                             if (cc < bval) {
                                 bval = cc;
                                 idx = v;
                             }
                         }
                     }
-                    const float pcost = min(bval + ccost, FLT_MAX_09);
+                    precise const float pcost = min(bval + ccost, FLT_MAX_09);
                     cur[j] = pcost;
                     cRel[j] = idx - u;
                 }
@@ -1117,12 +1141,17 @@ void main() {
             } else {
                 // ucubic always on: 4-tap cubic along the direction when the
                 // 3*|dir| taps stay in the frame, else the 2-tap average.
+                // `precise` as in eedi3vk2's cubic4/avg2 (see cubic_float).
                 const int ad3 = abs(3 * dir);
                 if (x >= ad3 && x <= WIDTH - 1 - ad3) {
-                    oval = 0.5625f * (pad_get(dy - 1, x + dir) + pad_get(dy + 1, x - dir))
-                         - 0.0625f * (pad_get(dy - 3, x + 3 * dir) + pad_get(dy + 3, x - 3 * dir));
+                    precise float t =
+                        0.5625f * (pad_get(dy - 1, x + dir) + pad_get(dy + 1, x - dir))
+                      - 0.0625f * (pad_get(dy - 3, x + 3 * dir) + pad_get(dy + 3, x - 3 * dir));
+                    oval = t;
                 } else {
-                    oval = (pad_get(dy - 1, x + dir) + pad_get(dy + 1, x - dir)) * 0.5f;
+                    precise float t =
+                        (pad_get(dy - 1, x + dir) + pad_get(dy + 1, x - dir)) * 0.5f;
+                    oval = t;
                 }
             }
             if (VCHECK_MODE > 0) {
@@ -1258,11 +1287,14 @@ float vc_blend(int r, int x, float pr) {
         mdiff0 = max(d0, d1);
         mdiff1 = max(d2, d3);
     }
-    const float a0 = float(mdiff0) * pc.vth0r;
-    const float a1 = float(mdiff1) * pc.vth1r;
-    const float a2 = max((pc.vth2 - float(abs(dirc))) * pc.vth2r, 0.0f);
-    const float a = min(max(a0, max(a1, a2)), 1.0f);
-    const float blend = (1.0f - a) * float(dCi) + a * cint_s;
+    // `precise` as in eedi3vk2's vcheck: the a0/a1/a2/blend chain contracted
+    // into FMAs is an ulp off, which flips the truncating u16 store by 1 code
+    // on the pixels where the blend is fractional (0 < a < 1).
+    precise const float a0 = float(mdiff0) * pc.vth0r;
+    precise const float a1 = float(mdiff1) * pc.vth1r;
+    precise const float a2 = max((pc.vth2 - float(abs(dirc))) * pc.vth2r, 0.0f);
+    precise const float a = min(max(a0, max(a1, a2)), 1.0f);
+    precise const float blend = (1.0f - a) * float(dCi) + a * cint_s;
     return float(min(max(int(blend), 0), 65535));
 #else
     const float dCi = load_dst_val(r, x);
@@ -1273,15 +1305,17 @@ float vc_blend(int r, int x, float pr) {
     const float v1nx = pad_get(yf + 1, x - dirc);
     const float v1p0 = pad_get(yf - 1, x);
     const float v1n0 = pad_get(yf + 1, x);
-    const float it = (pr + dm) * 0.5f;
-    const float ib = (dCp + dNm) * 0.5f;
-    const float vt = abs(pr - v1px) + abs(dCp - v1px);
-    const float vb = abs(dNm - v1nx) + abs(dm - v1nx);
-    const float vc = abs(dCi - v1p0) + abs(dCi - v1n0);
-    const float d0 = abs(it - v1p0);
-    const float d1 = abs(ib - v1n0);
-    const float d2 = abs(vt - vc);
-    const float d3 = abs(vb - vc);
+    // `precise` as in eedi3vk2's vcheck (its d0..d3/it/ib/vt/vb/a0..a are all
+    // precise): contraction into FMAs is an ulp off and shifts the blend.
+    precise const float it = (pr + dm) * 0.5f;
+    precise const float ib = (dCp + dNm) * 0.5f;
+    precise const float vt = abs(pr - v1px) + abs(dCp - v1px);
+    precise const float vb = abs(dNm - v1nx) + abs(dm - v1nx);
+    precise const float vc = abs(dCi - v1p0) + abs(dCi - v1n0);
+    precise const float d0 = abs(it - v1p0);
+    precise const float d1 = abs(ib - v1n0);
+    precise const float d2 = abs(vt - vc);
+    precise const float d3 = abs(vb - vc);
     float mdiff0, mdiff1;
     if (VCHECK_MODE == 1) {
         mdiff0 = min(d0, d1);
@@ -1293,11 +1327,12 @@ float vc_blend(int r, int x, float pr) {
         mdiff0 = max(d0, d1);
         mdiff1 = max(d2, d3);
     }
-    const float a0 = mdiff0 * pc.vth0r;
-    const float a1 = mdiff1 * pc.vth1r;
-    const float a2 = max((pc.vth2 - float(abs(dirc))) * pc.vth2r, 0.0f);
-    const float a = min(max(a0, max(a1, a2)), 1.0f);
-    return (1.0f - a) * dCi + a * cint_s;
+    precise const float a0 = mdiff0 * pc.vth0r;
+    precise const float a1 = mdiff1 * pc.vth1r;
+    precise const float a2 = max((pc.vth2 - float(abs(dirc))) * pc.vth2r, 0.0f);
+    precise const float a = min(max(a0, max(a1, a2)), 1.0f);
+    precise const float res = (1.0f - a) * dCi + a * cint_s;
+    return res;
 #endif
 }
 

@@ -7,7 +7,7 @@ shared parameter surface). eedi3m (original CPU implementation) is used only
 as a coarse cross-check where useful; it is not an oracle (its default AVX2
 float DP flips a handful of argmins vs the GPU family).
 
-Agreement measured on the noise clip (640x360, interp rows only):
+Agreement measured on the real-content clip (640x360, interp rows only):
 
 * u16 (GRAY16): vsfeel == eedi3vk2 BIT-EXACT (max diff 0) across every shared
   config tested: field 0/1/2/3, dh, mdis 3..40, nrad 0..3, vcheck 0..3, custom
@@ -16,10 +16,17 @@ Agreement measured on the noise clip (640x360, interp rows only):
   Interleave([s, s])), 2x height under dh. mclip stays at the source N frames
   (Gray8/Gray16/Gray32 masks; vsfeel converts the mask to Gray8 internally,
   eedi3vk2 needs the clip's format - both then agree bit-exactly).
-* f32 (GRAYS): vsfeel vs eedi3vk2 within ~1 ulp (7.45e-9 on the noise clip);
-  a few parameter corners (e.g. gamma=5 with vcheck) show isolated DP
-  argmin flips worth up to a few e-3 on a handful of pixels (measured
-  5.45e-3). Configs with flips use a looser bound.
+* f32 (GRAYS): the same surface is bit-exact too. The window sums are
+  re-summed in the reference's k order and the cost/relax/vcheck/cubic float
+  expressions carry the reference's `precise` qualifiers (see
+  src/eedi3.comp); without them an FMA contraction is an ulp off and flips
+  near-tie DP argmins, which on real content was worth up to 4.9e-2 on a few
+  pixels. The one exception is alpha=beta=0.5 (remainingWeight 0, so the blend
+  is pure): a few pixels per frame land 1..18 ulp out (5.36e-7 max).
+* vsfeel vs eedi3m (the installed CPU reference) diverges on tiny sparse
+  flip sets (up to ~1500 px of 115200, max ~3276) that are IDENTICAL to the
+  eedi3m-vs-eedi3vk2 flip sets: both GPU implementations share one float-DP
+  ordering while eedi3m's differs. Hence eedi3m is only a loose oracle here.
 * vsfeel vs eedi3m (the installed CPU reference) diverges on tiny sparse
   flip sets (up to ~1500 px of 115200, max ~3276) that are IDENTICAL to the
   eedi3m-vs-eedi3vk2 flip sets: both GPU implementations share one float-DP
@@ -46,6 +53,7 @@ import vapoursynth as vs
 from conftest import (
     WIDTH,
     HEIGHT,
+    CLIP_FRAMES,
     CLIP_PATH,
     COMPARE_PRELUDE,
     assert_changes_on_clip,
@@ -135,6 +143,10 @@ def interp_rows(h, n, field):
 
 spec = json.loads(sys.argv[1])
 src = core.bs.VideoSource(spec["source"])
+# Same length as the fixtures: the file is 300 frames, and a longer source
+# changes the output frame count under field>1 and the sclip it has to match.
+if src.num_frames > spec["nframes"]:
+    src = core.std.Trim(src, first=0, length=spec["nframes"])
 bits = spec["bits"]
 clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                           bits=bits, fulls=True, fulld=True)
@@ -172,6 +184,11 @@ try:
 except Exception as exc:
     print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
     raise SystemExit(2)
+# A non-finite reference sample is a broken oracle, not a vsfeel failure.
+for n, b in ref_frames.items():
+    if not np.isfinite(b.astype(np.float64)).all():
+        print("REF unavailable: non-finite reference at frame %d" % n, flush=True)
+        raise SystemExit(2)
 print("REF ok", flush=True)
 
 # --- vsfeel phase ---
@@ -183,8 +200,7 @@ try:
     for n in frames:
         a = read_plane(my_node.get_frame(n), 0, dt)
         b = ref_frames[n]
-        if not (np.isfinite(a.astype(np.float64)).all()
-                and np.isfinite(b.astype(np.float64)).all()):
+        if not np.isfinite(a.astype(np.float64)).all():
             print("VSFEEL fail: non-finite at frame %d" % n, flush=True)
             raise SystemExit(3)
         d = np.abs(a.astype(np.float64) - b.astype(np.float64))
@@ -210,6 +226,7 @@ def _mc_compare(bits, frames, kwargs, mclip=False, sclip=None):
     reference_or_skip("eedi3vk2", "EEDI3")
     spec = {
         "source": CLIP_PATH,
+        "nframes": CLIP_FRAMES,
         "bits": bits,
         "frames": list(frames),
         "kwargs": dict(kwargs),
@@ -355,9 +372,8 @@ def test_eedi3_in_range_all_frames_16bit(clip_16bit):
 # Reference comparison: eedi3vk2 (bit-exact oracle on the shared surface)
 # ---------------------------------------------------------------------------
 
-# (kwargs, tolerance). u16 is bit-exact -> 0. f32 is ~1 ulp except a few
-# parameter corners with DP argmin flips (looser bound, measured <= 5.5e-3
-# on this clip; kept well below the visible eedi3m band).
+# (kwargs, tolerance). Both depths are bit-exact against eedi3vk2 -> 0; the one
+# f32 exception is the flat-weight alpha=beta=0.5 corner (see REFERENCE_CASES_32).
 REFERENCE_CASES_16 = [
     ({"field": 1}, 0),  # defaults
     ({"field": 1, "mdis": 5, "nrad": 1, "vcheck": 0}, 0),
@@ -386,20 +402,22 @@ REFERENCE_CASES_16 = [
 ]
 
 REFERENCE_CASES_32 = [
-    # f32 uses rolling window sums (see src/eedi3.comp) so accumulation order
-    # differs from the reference by ~1 ulp (measured 7.45e-9); the strict
-    # cases sit at 1e-6 headroom for that, the DP-argmin corners at 5e-3.
-    ({"field": 1}, 1e-6),
-    ({"field": 1, "mdis": 5, "nrad": 1, "vcheck": 0}, 1e-6),
-    ({"field": 1, "mdis": 3, "nrad": 3, "vcheck": 1}, 1e-6),
-    ({"field": 1, "mdis": 10, "nrad": 0, "vcheck": 3}, 1e-6),
-    ({"field": 0, "mdis": 5, "nrad": 1, "vcheck": 0}, 1e-6),
-    ({"field": 1, "dh": 1, "mdis": 5, "nrad": 1, "vcheck": 0}, 1e-6),
-    ({"field": 1, "dh": 1, "mdis": 20, "nrad": 3, "vcheck": 2}, 1e-6),
-    ({"field": 2, "mdis": 5, "nrad": 1, "vcheck": 0}, 1e-6),
-    ({"field": 3, "mdis": 5, "nrad": 1, "vcheck": 0}, 1e-6),
-    ({"field": 1, "alpha": 0.0, "beta": 0.0, "gamma": 5.0}, 5e-3),
-    ({"field": 1, "alpha": 0.5, "beta": 0.5}, 0.05),
+    # The rolling window sums are re-summed in the reference's k order and the
+    # cost/relax/vcheck/cubic expressions carry the reference's `precise`
+    # qualifiers, so f32 is bit-exact too (measured 0 on every case below).
+    # alpha=beta=0.5 is the exception: with remainingWeight == 0 the blend is
+    # pure and a handful of pixels per frame land 1..18 ulp out (5.36e-7 max).
+    ({"field": 1}, 0),
+    ({"field": 1, "mdis": 5, "nrad": 1, "vcheck": 0}, 0),
+    ({"field": 1, "mdis": 3, "nrad": 3, "vcheck": 1}, 0),
+    ({"field": 1, "mdis": 10, "nrad": 0, "vcheck": 3}, 0),
+    ({"field": 0, "mdis": 5, "nrad": 1, "vcheck": 0}, 0),
+    ({"field": 1, "dh": 1, "mdis": 5, "nrad": 1, "vcheck": 0}, 0),
+    ({"field": 1, "dh": 1, "mdis": 20, "nrad": 3, "vcheck": 2}, 0),
+    ({"field": 2, "mdis": 5, "nrad": 1, "vcheck": 0}, 0),
+    ({"field": 3, "mdis": 5, "nrad": 1, "vcheck": 0}, 0),
+    ({"field": 1, "alpha": 0.0, "beta": 0.0, "gamma": 5.0}, 0),
+    ({"field": 1, "alpha": 0.5, "beta": 0.5}, 1e-6),
     (
         {
             "field": 1,
@@ -410,7 +428,7 @@ REFERENCE_CASES_32 = [
             "vthresh1": 8.0,
             "vthresh2": 16.0,
         },
-        1e-6,
+        0,
     ),
 ]
 
@@ -447,6 +465,13 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     except Exception as exc:
         print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
         raise SystemExit(2)
+    # A non-finite reference sample is a broken oracle, not a vsfeel failure.
+    for kwargs, rframes in zip(cases, ref_frames):
+        for n, b in zip(frames, rframes):
+            if not np.isfinite(b.astype(np.float64)).all():
+                print("REF unavailable: non-finite reference at frame %d for %s"
+                      % (n, kwargs), flush=True)
+                raise SystemExit(2)
     print("REF ok", flush=True)
 
     # --- vsfeel phase ---
@@ -459,8 +484,7 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
             dmax = 0.0
             for n, b in zip(frames, rframes):
                 a = read_plane(my_node.get_frame(n), 0, dt)
-                if not (np.isfinite(a.astype(np.float64)).all()
-                        and np.isfinite(b.astype(np.float64)).all()):
+                if not np.isfinite(a.astype(np.float64)).all():
                     print("VSFEEL fail: non-finite at frame %d for %s" % (n, kwargs), flush=True)
                     raise SystemExit(3)
                 rows = row_mask(a.shape[0], n, kwargs.get('field', 1))
@@ -669,8 +693,10 @@ def test_eedi3_mclip_long_mask_off_prefix(clip_16bit, mdis, nrad):
 
 def test_eedi3_mclip_masked_region_is_vertical_cubic(clip_16bit):
     """Inside a masked (black) region the interpolated pixel is the vertical
-    cubic of the two kept rows; verify on a mid-frame interp row where all
-    four taps are interior."""
+    cubic of the two kept rows; verify on mid-frame interp rows where all four
+    taps are interior. The cubic is the reference's integer form,
+    ``(9*(p1+n1) - (p3+n3) + 8) >> 4``, and the masked region reproduces it
+    exactly (the pre-fix expectation read p3/n3 as the same row)."""
     clip = clip_16bit
     kw = dict(field=1, mdis=5, nrad=1, vcheck=0)
     m16 = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
@@ -681,16 +707,22 @@ def test_eedi3_mclip_masked_region_is_vertical_cubic(clip_16bit):
         s = src.get_frame(n)
         d = _plane(f, 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
         a = _plane(s, 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
-        # a mid interp row: taps at ROW-3, ROW-1, ROW+1, ROW+3 are interior
-        row = 31
-        y1, y3 = row - 1, row - 3
-        x = WIDTH * 3 // 4  # deep in the masked black half
-        taps = (
-            9 * (int(a[y1, x]) + int(a[y1 + 2, x])) - (int(a[y3, x]) + int(a[y3 + 4, x])) + 8
-        ) // 16
-        assert abs(int(d[row, x]) - int(taps)) <= 1, (
-            f"masked px {row},{x}: {d[row, x]} vs cubic {taps}"
-        )
+        # mid interp rows: taps at ROW-3, ROW-1, ROW+1, ROW+3 are all interior
+        for row in (31, 101, 201):
+            for x in (WIDTH * 3 // 4, WIDTH * 3 // 4 + 20, WIDTH - 40):
+                cubic = (
+                    9 * (int(a[row - 1, x]) + int(a[row + 1, x]))
+                    - (int(a[row - 3, x]) + int(a[row + 3, x]))
+                    + 8
+                ) >> 4
+                assert int(d[row, x]) == cubic, f"masked px {row},{x}: {d[row, x]} vs cubic {cubic}"
+        # anti-vacuity: the unmasked half is interpolated, not the cubic
+        cubic_left = (
+            9 * (a[31 - 1, : WIDTH // 2] + a[31 + 1, : WIDTH // 2])
+            - (a[31 - 3, : WIDTH // 2] + a[31 + 3, : WIDTH // 2])
+            + 8
+        ) >> 4
+        assert int((d[31, : WIDTH // 2] != cubic_left).sum()) > 0
 
 
 @pytest.mark.parametrize("field", [2, 3], ids=["field2", "field3"])

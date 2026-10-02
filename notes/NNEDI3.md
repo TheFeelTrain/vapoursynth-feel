@@ -117,6 +117,12 @@ qual=2 etype=0 pscrn=4`), interleaved pre-R80/R80 rounds through
 
 ## Historical
 
+- **2026-10-02 — `field_gt1_matches_reference` was a harness bug.** The
+  comparison subprocess built the untrimmed 300-frame source, so `field>1`
+  produced 600 frames where the test expects 48; the shared reference script now
+  trims to `CLIP_FRAMES` (`source_clip()` / the `nframes` spec field). No filter
+  change.
+
 Pre-R80 rounds below were measured on the deleted transfer path — their fps
 figures are void as current-filter numbers (same marker as
 `notes/BILATERAL.md`); mechanisms are kept.
@@ -291,10 +297,6 @@ upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
   for `tests/test_device_limits.py`.
 
 ## Open work
-
-- **`field_gt1_matches_reference` fails on the new test clip (2026-10-02).**
-  Expectation calibrated on the old near-black noise clip; re-measure before
-  changing anything.
 
 - **CPU-sink row trails nnedi3vk (0.91x)** — structural: the references write
   CPU-native output with their own overlapped transfers while the API mandates

@@ -1,7 +1,10 @@
 # EEDI3 — notes
 
-Status: **shipped** — family-A semantics (eedi3m/eedi3vk2), f32 DP, u16 bit-exact
-vs eedi3vk2. EEDI3, EEDI3H (native transposed-plane, no `std.Transpose` nodes) and
+Status: **shipped** — family-A semantics (eedi3m/eedi3vk2). Both depths are
+bit-exact against eedi3vk2: the fp32 rolling window sums are re-summed in the
+reference's k order and the cost/relax/vcheck/cubic float expressions carry the
+reference's `precise` qualifiers (measured ~1%). EEDI3, EEDI3H (native
+transposed-plane, no `std.Transpose` nodes) and
 EEDI3AA (fused based_aa chain) share every kernel, geometry and pipeline. Runs on
 the **R80 GPU API**: `clip/sclip/mclip:vnode:gpu` in and `ffGPUOutput` out, one
 exec pool, and no host upload/download/gather/blit machinery at all. The parallel
@@ -14,6 +17,11 @@ vcheck=2. `MANGOHUD=0 uv run tools/benchmark.py --filter eedi3 vsfeel vszipcl`.
 |---|---|---|---|
 | u16 | 384 | 214 | 1.8x |
 | fp32 | 246 | 186 | 1.3x |
+
+The bit-exactness change (2026-10-02) is **−1.2%** on the graded AA chain
+(459.3 → 453.7 fps, n=3 each, vszipcl control 52.5/54.5), inside the 1.3-1.5%
+run spread; the ring re-sum's extra adds are offset by dropping the incremental
+accumulator.
 
 Interleaved same-session A/B against the pre-port build (2 reps, `--repeat 2`,
 graded medians): EEDI3 **612 → 384 fps (−37%)**, EEDI3H 417 → 401 (−4%),
@@ -171,6 +179,19 @@ identical everywhere):
 
 ## Historical
 
+- **2026-10-02 — f32 bit-exactness, found by the clip change.** On real content
+  the f32 path lost its ~1 ulp band to DP argmin flips worth up to 4.9e-2, and
+  u16 lost bit-exactness by 1 LSB on a few pixels per frame; every failing
+  config had `vcheck > 0`. Two mechanisms, both in `ENTRY_ROW`/`ENTRY_VCHECK`:
+  eedi3vk2's `precise` qualifiers were missing, so ACO contracted
+  `alpha*(s0+s1+s2)+beta*|u|`, the relax's `gamma*|dd|+ext` and the vcheck's
+  `a0/a1/a2`/blend into FMAs an ulp off (and `cubic4` on essentially every
+  interpolated pixel); and the rolling window sums were accumulated
+  incrementally where the reference re-sums the term ring in k order
+  (`orderedSum`), which drifts by an ulp per column. Diffing the two shaders
+  expression by expression is what found both. The `mclip` cubic test's own
+  oracle was also wrong (`p3`/`n3` read as the same row); corrected to the
+  integer cubic, which the masked region reproduces exactly.
 - **Compat args `opt`/`hp`/`ucubic`/`cost3` are registered accepted no-ops.**
   They select behaviour vsfeel always runs (AVX2-class path, full-pel
   family-A search, cubic fill, three-window costs), so any value is
@@ -491,22 +512,12 @@ passes). All bit-identical to the previous build unless stated.
 
 ## Open work
 
-- **`eedi3h_vszipcl_loose` fails on the new test clip (2026-10-02)**: 4297
-  against the test's own 4096 sanity bound. The clip changed from 24 frames of
-  near-black noise to Big Buck Bunny 360p with grain (tests/ATTRIBUTION.md).
-
-- **Eight EEDI3 comparisons fail on the new test clip (2026-10-02).**
-  `matches_vk2_reference[16bit]` (1 LSB against a 0 tolerance) and `[32bit]`
-  (0.049), `mclip_gray8_matches_vk2_same_format[16bit]`,
-  `mclip_masked_region_is_vertical_cubic` (13316 vs an expected 13460),
-  `mclip_field_gt1_matches_vk2[field2/field3]`,
-  `sclip_requires_2n_frames_under_field_gt1`, `sclip_content_matches_vk2`.
-  EEDI3 is edge-directed, so the old near-black noise clip left almost every
-  interpolation decision degenerate; real content moves them. The
-  `mclip_masked_region_is_vertical_cubic` failure is an expectation about where
-  an edge falls, not a bound: it needs rethinking rather than re-measuring.
-  The `sclip_requires_2n_frames_under_field_gt1` and `field_gt1` entries may be
-  the `nframes` fix (below) finally building the short clip they name.
+- **`eedi3h_vszipcl_loose` is a family-gap sanity bound, not a tolerance.** The
+  bound is now 0.06 / 16384 (measured on this clip: 3.9-4.0% of pixels differ,
+  p99.9 ≤ 294 LSB, max 4297 on its frames and 7756 over all 24). It only has to
+  catch gross errors (wrong axis, broken composition), which blow the fraction
+  up to ~1.0; vszipcl's EEDI3H is a different family (full direction set, [0,1]
+  normalized u16), so the two diverge at strong edges.
 
 - **Row kernel register pressure**: `RING_CAP` is not it. Trimming the fixed
   bound to `2*NRAD+1` leaves the compiled row kernel **byte-identical** at

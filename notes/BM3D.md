@@ -133,6 +133,13 @@ unchanged from the pre-mawen binary (798 vs 790 fps, adjacent 400-frame runs).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-10-02 — two clip-change failures were test bugs.** `chroma_planes_are_denoised`
+  built its YUV clip from the untrimmed 300-frame source while the Gray fixture
+  is 24, so frame 23 saw a different temporal window (`source_clip()` now). The
+  `cas_fallback` bound was an absolute 1e-7 calibrated on near-black pixels; both
+  arms are scheduler-order accumulations of 13448 addends, so the floor scales
+  with the value (4.2e-7 at |max| ~ 1) and is now a full-scale-relative 1e-5,
+  7x under a dropped addend. No perf change.
 - **2026-10-02 — filtering becomes mawen's.** The kernel kept vszipcl's
   conventions (non-strict threshold, global-DC exemption, sigma rounded to
   `lambda * 0.75`), which left a 0.0197 speckle floor against the CPU even with
@@ -227,12 +234,6 @@ Chronological; each entry keeps the mechanism, not the story.
 
 ## Open work
 
-- **Two self-consistency tests fail on the new test clip (2026-10-02)**:
-  `cas_fallback_holds_at_small_block_step` and `chroma_planes_are_denoised`. The
-  clip is Big Buck Bunny 360p with grain now: real chroma, and an amplitude range
-  where the CAS and hardware-atomic arms can round apart. (Two harness bugs the
-  longer clip exposed are fixed: `std.Loop(times=nframes)` multiplied the clip
-  length, and the fixtures handed out all 300 frames.)
 - **The CPU's tie order cannot be reproduced**: `std::partial_sort` over an
   error-only key leaves equal distances unspecified, and its SSE accumulation
   orders the SSD differently. `(error, y, x)` is the documented portable choice,

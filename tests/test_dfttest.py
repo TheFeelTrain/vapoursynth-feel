@@ -46,6 +46,7 @@ from conftest import (
     reference_compare,
     reference_or_skip,
     reference_spec,
+    source_clip,
 )
 
 pytestmark = pytest.mark.usefixtures("clip_gray")
@@ -514,13 +515,12 @@ def test_dfttest_yuv_passthrough_32bit(clip_gray):
     """A full YUV clip is accepted; with planes=[0] the chroma planes must be
     copied through bit-identically and the luma must match the Gray output."""
     core = vs.core
-    src = core.bs.VideoSource(CLIP_PATH)
+    src = source_clip()
     yuv = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
     assert yuv.format.color_family == vs.YUV
 
     out = _run(yuv, planes=[0])
     ref = _run(clip_gray)
-
     for n in (0, 11, 23):
         f = out.get_frame(n)
         d = frame_to_ndarray(f) - frame_to_ndarray(ref.get_frame(n))
@@ -545,7 +545,7 @@ def test_dfttest_yuv_passthrough_16bit(clip_16bit):
     """16-bit mirror of test_dfttest_yuv_passthrough: chroma copied through
     bit-identically, luma matches the gray16 output."""
     core = vs.core
-    src = core.bs.VideoSource(CLIP_PATH)
+    src = source_clip()
     yuv = core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
     assert yuv.format.color_family == vs.YUV
 

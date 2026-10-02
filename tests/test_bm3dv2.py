@@ -34,6 +34,7 @@ from conftest import (
     run_compare_subprocess,
     skip_or_fail_reference,
     cpu_node,
+    source_clip,
 )
 
 
@@ -143,7 +144,9 @@ def test_bm3dv2_cas_fallback_matches_hardware_atomics(clip_gray, monkeypatch):
         a = frame_to_ndarray(hardware.get_frame(n))
         b = frame_to_ndarray(cas.get_frame(n))
         assert np.isfinite(b).all(), f"non-finite CAS output at frame {n}"
-        # measured 2.98e-8 (add-order rounding) on the noise clip
+        # same accumulation-order floor as the nondeterminism test above:
+        # the arm against itself measures 2.4e-7..3.6e-7 on real content, and
+        # cross-arm is 3.0e-7 (frames 0/11/23, |max| ~ 1)
         assert np.abs(a - b).max() < 1e-5, f"CAS vs hardware atomics at frame {n}"
 
 
@@ -155,8 +158,8 @@ def test_bm3dv2_cas_fallback_holds_at_small_block_step(clip_gray, monkeypatch):
     window can reach it -- so block_step=1 is the worst case (13448 at
     bm_range=16) and a retry budget below it can silently drop addends: the
     old 32-retry bound put 16 of 4096 pixels 1e-5..6.1e-5 out against the
-    hardware arm, while the geometry-derived bound lands at 7e-9 (float add
-    order alone). The bound is what this pins.
+    hardware arm, while the geometry-derived bound lands at float add order
+    alone. The bound is what this pins.
     """
 
     def small_step(clip):
@@ -166,12 +169,20 @@ def test_bm3dv2_cas_fallback_holds_at_small_block_step(clip_gray, monkeypatch):
     cas = small_step(clip_gray)
     monkeypatch.delenv("VSFEEL_BM3D_CAS", raising=False)
     hardware = small_step(clip_gray)
+    # Both arms add the same 13448 addends in a scheduler-dependent order, so
+    # the comparison floor is the arms' own spread, not exactness: measured
+    # 4.2e-7 (hardware vs itself) and 5.4e-7 (cross-arm) at |max| ~ 1, frames
+    # 0/11. A dropped addend moves one element by 1/13448 of an addend, ~7e-5
+    # of the result, so 1e-5 still separates the two (the two runs must be
+    # scaled, since the same order noise was 7e-9 on the old near-black clip).
     for n in (0, 11):
         a = frame_to_ndarray(hardware.get_frame(n))
         b = frame_to_ndarray(cas.get_frame(n))
         assert np.isfinite(b).all(), f"non-finite CAS output at frame {n}"
-        assert np.abs(a - b).max() < 1e-7, (
-            f"CAS lost an addend at block_step=1, frame {n}: {np.abs(a - b).max():g}"
+        scale = max(1.0, float(np.abs(a).max()))
+        worst = float(np.abs(a - b).max()) / scale
+        assert worst < 1e-5, (
+            f"CAS lost an addend at block_step=1, frame {n}: {worst:g} of full scale"
         )
 
 
@@ -566,7 +577,7 @@ def test_bm3dv2_chroma_planes_are_denoised(clip_gray):
     geometry, parameters and sigma), so a plane left equal to the source is the
     old luma-only passthrough, not a denoised result.
     """
-    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(CLIP_PATH), bits=32, fulls=True, fulld=True)
+    yuv = vs.core.fmtc.bitdepth(source_clip(), bits=32, fulls=True, fulld=True)
     assert yuv.format.color_family == vs.YUV
 
     out = _run(yuv, radius=2)

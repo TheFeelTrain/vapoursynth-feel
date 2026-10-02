@@ -185,12 +185,12 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 - Dead ends that stay dead: `SUB_BLOCKS=16` (worse), the LDS-slice fused
   restructure (2x slower, LDS-bound), a host-side cache with mutex/cv
   ordered-submission waits (starves the worker pool).
+- **`yuv_passthrough_*` was a test bug, not a filter bug (2026-10-02).** The YUV
+  clip was built from the untrimmed 300-frame source while the Gray fixture is 24
+  frames, so frame 23 (the fixture's last) saw a different temporal window; both
+  sides now come from `source_clip()`. No perf change.
 
 ## Open work
-
-- **`yuv_passthrough_32bit` and `_16bit` fail on the new test clip
-  (2026-10-02).** Passthrough expectations were calibrated on near-black noise;
-  re-measure with real content, which has chroma the old clip did not.
 
 - Do not re-derive: every in-filter alternative to the download was measured
   and rejected — a second *compute-family* queue for the copy (neutral: same

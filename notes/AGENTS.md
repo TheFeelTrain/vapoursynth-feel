@@ -108,6 +108,12 @@ and gets one line here, not a section per note.
   produces. `nframes=1/2` builds the short-clip cases. Tolerance is 0 for the
   slot/tile caches; BM3D uses 1e-5 because its atomicAdd aggregation has a
   ~3e-8 ordering floor.
+- `source_clip()` / the `nframes` spec field — every clip a test or comparison
+  subprocess builds from the committed 300-frame file must be trimmed to
+  `CLIP_FRAMES`, the length the fixtures expose. Otherwise a temporal filter's
+  last frame sees a different window than the fixture it is compared against,
+  and a frame-doubling filter (EEDI3/NNEDI3 `field>1`) doubles 300 frames
+  instead of 24.
 
 ## Short vs long — worked examples
 

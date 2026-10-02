@@ -31,6 +31,17 @@ def _source(path, frames=CLIP_FRAMES):
     return clip
 
 
+def source_clip(frames=CLIP_FRAMES):
+    """The committed test clip, trimmed to the fixture length.
+
+    Every clip a test derives from the source must go through here: the file is
+    300 frames but the fixtures expose ``CLIP_FRAMES``, and a filter with
+    temporal state sees a different window at the 24-frame boundary than at
+    frame 24 of the full file.
+    """
+    return _source(CLIP_PATH, frames)
+
+
 def _plane_size(frame, plane):
     """Visible width/height of ``plane`` in this frame's format."""
     fmt = frame.format
@@ -442,6 +453,11 @@ core = vs.core
 
 def build_clip(spec):
     src = core.bs.VideoSource(spec["source"])
+    # The fixtures expose CLIP_FRAMES frames; the subprocess must build the
+    # same clip or a temporal filter sees a different window at its last frame.
+    nframes = spec.get("nframes")
+    if nframes and src.num_frames > nframes:
+        src = core.std.Trim(src, first=0, length=nframes)
     gray = lambda: core.std.ShufflePlanes(src, 0, vs.GRAY)
     kind = spec["clip"]
     if kind == "gray8":
@@ -503,11 +519,24 @@ try:
     if ref_func is None:
         raise RuntimeError("no %s.%s reference" % (spec["plugin"], spec["filter"]))
     ref_node = ref_func(clip, **kwargs)
+    # A GPU-resident reference (knlmvk) has no host pointer, so it is
+    # downloaded first; a CPU-resident one passes through untouched.
+    ref_node = cpu_node(ref_node)
     ref_frames = [[read_plane(ref_node.get_frame(n), p, dt) for p in planes]
                   for n in frames]
 except Exception as exc:
     print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
     raise SystemExit(2)
+# A non-finite reference sample makes the comparison meaningless, and reporting
+# it as a vsfeel failure has already misled one investigation: treat it as an
+# unavailable oracle. (NLMeans wref=0 is the case that does this: the reference
+# evaluates 0/0 where vsfeel falls back to a finite centre sample.)
+for n, ref_planes in zip(frames, ref_frames):
+    for p, b in zip(planes, ref_planes):
+        if not np.isfinite(b.astype(np.float64)).all():
+            print("REF unavailable: non-finite reference at frame %d plane %d" % (n, p),
+                  flush=True)
+            raise SystemExit(2)
 print("REF ok", flush=True)
 
 # --- vsfeel phase ---
@@ -520,8 +549,7 @@ try:
         frame = my_node.get_frame(n)
         for p, b in zip(planes, ref_planes):
             a = read_plane(frame, p, dt)
-            if not (np.isfinite(a.astype(np.float64)).all()
-                    and np.isfinite(b.astype(np.float64)).all()):
+            if not np.isfinite(a.astype(np.float64)).all():
                 print("VSFEEL fail: non-finite at frame %d plane %d" % (n, p), flush=True)
                 raise SystemExit(3)
             d = np.abs(a.astype(np.float64) - b.astype(np.float64))
@@ -568,6 +596,7 @@ def reference_spec(
         "clip": clip,
         "plugin": plugin,
         "filter": filter,
+        "nframes": int(CLIP_FRAMES),
         "frames": list(frames),
         "kwargs": dict(kwargs or {}),
     }
@@ -723,9 +752,10 @@ def temporal_order_diff(filter_name, params, nframes=None, plane=0, clip="gray32
         "plane": plane,
         "clip": clip,
         "max_cache_size": 256,
+        # Same length as the fixtures: the full 300-frame file makes every
+        # order run 12x longer and covers nothing the first 24 frames do not.
+        "nframes": int(CLIP_FRAMES if nframes is None else nframes),
     }
-    if nframes is not None:
-        spec["nframes"] = int(nframes)
     try:
         payload = run_compare_subprocess(TEMPORAL_ORDER_SCRIPT, [json.dumps(spec)], timeout=timeout)
     except ReferenceUnavailable as exc:

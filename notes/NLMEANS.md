@@ -11,17 +11,17 @@ Status: **shipped on the R80 GPU API.** Verified against
   context, build a tiny address table of every `(clip, channel, layer)` plane
   address, **compose** those planes once into one zero-padded device-local
   window, barrier, then the interleaved weight/accumulation sweep rounds,
-  submit. Scratch (window, fp16 weight ring, u2, u5) is per-frame from
+  submit. Scratch (window, fp32 weight ring, u2, u5) is per-frame from
   `createGPUBuffer`, retired by the submission.
 - The sweep kernels keep the pre-R80 padded-tile indexing (`(y+PAD)*PSTRIDE`,
   `layer*TILE_ELEMS`), i.e. 32-bit offsets into one storage buffer. Reading the
   core's per-layer planes directly through buffer references costs 64-bit
   addressing per load and ~10% on the chroma benchmark (see Performance).
 - Sweep tables (`wq`/`aq`, stride-8 rows, `qb` batches, variants by
-  `m=min(d,n)`), the fp16 weight ring, `first`-flag init and the finish in the
+  `m=min(d,n)`), the fp32 weight ring, `first`-flag init and the finish in the
   last acc round are unchanged from the pre-R80 implementation.
-- Accuracy: identical to the pre-R80 implementation on every tested config
-  (≤1 LSB 16-bit, ≤6.6e-5 fp32 vs vszipcl).
+- Accuracy: ≤1 LSB 16-bit and ≤4.4e-6 fp32 against vszipcl across the whole
+  parameter surface (spatial, temporal, joint, rclip, cropped, `a=64`, `d=16`).
 - `num_streams` and `device_id` are registered no-ops (never read): depth is
   the core's exec ring, device choice is `core.set_vulkan_device`.
 
@@ -37,6 +37,11 @@ interleaved pre-port/R80 pairs, `--repeat 3` (vszipcl control flat at
 
 GRAY16 (all planes processed) is at parity in a manual same-session pair
 (281 vs 279 fps, ~0.7%).
+
+The fp32 weight ring (2026-10-02) replaces the fp16 one and costs **−7.2%** on
+the same config: same-session pair, 1080.2 → 1002.4 fps (vszipcl control flat at
+548.9/551.4, n=3 each). The rings are the same size (576 slots, pack 36); only
+the element width doubled (128 MiB budget).
 
 ## Implementation
 
@@ -83,6 +88,15 @@ GRAY16 (all planes processed) is at parity in a manual same-session pair
 
 ## Performance
 
+- **The fp32 weight ring is an accuracy purchase, not a free one.** The fp16
+  ring (×4096 to dodge the subnormal cliff) quantises every weight to 2^-11
+  relative, which on real content drifts the weighted average by up to 2.1e-3
+  fp32 / ~180 codes u16 at `a=64` and ~6 codes on the cropped geometry - the
+  recorded 1 LSB band held only on the old near-black clip, where every weight
+  sat on exactly 4096. fp32 collapses the whole comparison surface to ≤1 LSB /
+  ≤4.4e-6 for −7.2%: the ring carries 2x the bytes at the same pack, which the
+  measured optimum wants at 128 MiB rather than 64 (halving pack costs more in
+  rounds than the wider ring costs in DRAM traffic).
 - **The compose pass exists for codegen, not correctness.** Reaching each
   `(channel, layer)` plane directly with buffer references cost 64-bit address
   arithmetic on every guide load: the UV weight kernel compiled to 1515 ACO
@@ -137,10 +151,12 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 - **Kernel levers (measured, still shipped).** Exact per-instance LDS sizing
   via spec-constant array dims (+13% weight batch); native u16 io (+14%);
   interior/border tile split with batched loads and no per-cell checks in the
-  interior (+32%); fp16 weight ring ×4096 (drift ≤5 LSB / ~1e-4).
-- **fp16 ring cliff**: unscaled weights <6e-5 lose mantissa bits exponentially;
-  `w*4096` on store, `1/4096` on load fixed it. `finish_sample` returns the
-  centre sample on a zero total weight instead of 0/0.
+  interior (+32%).
+- **fp16 weight ring ×4096**: unscaled weights <6e-5 lose mantissa bits
+  exponentially, so `w*4096` on store and `1/4096` on load replaced them; drift
+  measured ≤5 LSB / ~1e-4 on the old clip, up to ~180 LSB on real content at
+  `a=64` (superseded by the fp32 ring above). `finish_sample` returns the centre
+  sample on a zero total weight instead of 0/0; that fallback stays.
 - **Boundary/rclip fixes**: the guide half's slot table used the full-window
   stride when `n < d` and read past the vector (fixed key offset), and holder
   identity is a per-reservation token, not a frame index.
@@ -159,30 +175,28 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
 ## Open work
 
-- **The test clip changed (2026-10-02) and eight NLMeans comparisons fail on
-  it.** The suite now runs on Big Buck Bunny 360p with a grain layer
-  (`tests/ATTRIBUTION.md`) instead of 24 frames of near-black noise. Failing:
-  `matches_reference_32bit[d=0,wref=0.0,h=3.0]`, `uv_matches_reference_16bit`
-  (same config), `wref0_low_h_envelope_16bit/32bit`,
-  `rclip_guide_matches_reference_16bit` and the four `positive_maxima` `a=64`
-  entries (138/180 LSB where 1 was measured). The `wref=0` family is not a
-  vsfeel bug: on this clip **vszipcl returns NaN on every frame** for
-  `d=0, wref=0.0, h=3.0` while vsfeel stays finite, so those comparisons have a
-  broken oracle. The `a=64` entries are the unstable configuration described
-  below, now drifting ~100x further than the recorded bound.
-- **`d=16` with `a=64` fails its reference comparison in-session and needs
-  fixing.** The `test_matches_reference_positive_maxima_*` entries for that
-  configuration are removed: they report a max diff around 0.07 (32-bit) and
-  ~530 codes (16-bit) against recorded values of 6.97e-5 and 5, but the same
-  comparison returns the recorded 6.97e-5 when run standalone through
-  `conftest.reference_compare`, and the pre-change binary fails it identically
-  -- so the trigger is the session, not the kernel. The configuration is the
-  one already known to hard-recover the GPU when the device is shared (see
-  "Do not retry"); the first thing to establish is whether the reference side
-  or the vsfeel side moves, by pinning both outputs and diffing them across a
-  session.
+- **`wref=0` has no usable oracle on real content.** With the fp32 ring the
+  comparison surface is ≤1 LSB / ≤4.4e-6 everywhere except this family, where
+  the reference's own weighted average is degenerate: at `d=0, wref=0, h=1.2`
+  vszipcl has 53983 non-finite samples on frame 0 (and 1533 at `h=3.0`; nlm_hip
+  agrees) because its total weight is 0, and where it is finite it divides by a
+  denormal sum, landing up to 0.8 from both vsfeel and knlmvk. knlmvk is finite
+  there (same centre-sample fallback as vsfeel) but 0.14 away from it, so it is
+  not an oracle either. What is pinned instead: vsfeel's finiteness, and the
+  exact fallback (`wref=0` with `h <= 0.1` or `wmode 1-3` returns the source
+  bit-for-bit at both depths, both of which the reference cannot do).
+- **knlmvk is a second spatial oracle only.** It agrees with vsfeel
+  bit-for-bit at f32 and within 1 LSB at u16 on `d=0` configs (measured across
+  the sweep), which is worth keeping as an independent cross-check, but its
+  temporal pairing differs: 3.7e-2 at `d=2` and 1.4e-1 at
+  `d=1 a=3 s=3 h=3.0 wref=0.4`, and it is that far from vszipcl too.
+- **`d=16` with `a=64`**: still omitted from the positive-maxima lists (it
+  hard-recovers the GPU when the device is shared); with the fp32 ring the
+  `a=64` entries next to it are all within 4.4e-6, so the in-session drift
+  recorded earlier was the fp16 ring being measured under contention.
 - **Subgroup-shuffle box sums** to cut LDS phases (complex).
-- **fp16 `dist`/`hsum` LDS arrays** with range scaling — numerics risk.
+- **fp16 `dist`/`hsum` LDS arrays** with range scaling — numerics risk (the
+  weight ring's own fp16 experiment failed this way; see Performance).
 - **Incremental window cache**: copy only newly-entered layers instead of
   rebuilding the whole window, if a large-`d` workload ever makes the copy
   matter.
