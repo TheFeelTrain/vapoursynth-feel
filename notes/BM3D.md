@@ -82,7 +82,7 @@ vsfeel is 6.1x the faster reference. The first R80 API port (2026-09-20) cost
 4-6% on this CPU-sink benchmark; the exec-pool port (2026-09-23) is **+1%** in
 three interleaved A/B runs against the raw-submit build -- see Historical.
 
-## Implementation notes that the code alone does not show
+## Implementation
 
 - **The block-matching search is the whole filter.** At r=2/step 4 it is ~85%
   of the estimation kernel; the collaborative transform + patch loads + all
@@ -276,7 +276,7 @@ Chronological; each entry keeps the mechanism, not the story.
   witness cannot see a late *ring* copy -- the estimation writes the witness
   itself -- so a clean witness report does not clear that path.
 
-## Round: the block-match scan (2026-09-21, +64% end to end)
+### 2026-09-21 — the block-match scan (+64% end to end)
 
 Everything above is a whole-kernel time from a warm single-request
 `VSFEEL_BM3D_GPUTRACE=1` run (`-r 1`, 300 frames, 1080p GRAY32 defaults), which
@@ -474,4 +474,3 @@ cached at creation, not read per frame.
   chunk after 0, which is what orders them behind chunk 0's ring copies.
 - `VSFEEL_BM3D_HD`, `VSFEEL_BM3D_QUEUES` — **gone** with the pre-R80 transfer and
   queue-selection code.
-

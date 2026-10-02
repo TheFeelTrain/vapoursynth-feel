@@ -1,5 +1,9 @@
 # Filter notes — conventions
 
+**Binding for every file in this directory.** This file is injected
+automatically whenever you read or edit anything under `notes/`. The fixed
+shape, the budget and the rules that do not bend are requirements.
+
 One file per filter (`BILATERAL.md`, `BM3D.md`, `DFTTEST.md`, `EEDI3.md`,
 `EEDI3AA.md`, `GAUSSBLUR.md`, `NLMEANS.md`, `NNEDI3.md`). They are **tracked**
 in git: the durable design record, not scratch memory.
@@ -9,26 +13,36 @@ virtue and the history is not the point — the *current design*, the *measured
 mechanisms*, and the *open questions* are. A change that needs three paragraphs
 is rare; most need one bullet.
 
+## The gate
+
+`tools/notes_check.py` — the `notes` gate in `tools/lint.sh`, which CI runs on
+every push — checks the mechanical half of this file: the title, the part names
+and their order, both line budgets, the file index above, and report IDs in the
+text. A note that fails it is a defect to fix, not a style disagreement.
+
 ## Fixed shape (every file, in this order)
 
-1. `# <Filter> — notes` (exact form; no "performance notes", no port tag).
-2. **Status banner** — one of `shipped` / `iterating` / `designed`, the current
-   design in at most ~10 lines of bullets, and the current scoreboard. A reader
-   who stops here must not be misled about what the code does today.
-3. **Implementation** — the structure that ships, derived from `src/`.
-4. **Performance** — one table of the current graded numbers, with the config
-   in the caption.
-5. **Historical** — superseded rounds, in the order they happened.
-6. **Open work** — remaining paths, do-not-retry list, method rules.
-7. **Debug env vars** — the live knobs, one line each.
+1. `# <Filter> — notes` — exact form, no suffix, no port tag.
+2. **Status banner** (no heading) — the state (`shipped` / `iterating` /
+   `designed`), the design that ships, and the scoreboard table. A reader who
+   stops here must not be misled about what the code does today.
+3. `## Implementation` — the structure that ships, derived from `src/`.
+4. `## Performance` — optional; the mechanisms behind the current numbers.
+5. `## Historical` — superseded rounds, in the order they happened.
+6. `## Open work` — remaining paths, do-not-retry list, method rules.
+7. `## Debug env vars` — the live knobs, one line each.
 
-Use these part names even where a file has only a stub for a part. Consistency
-across filters is worth more than a slightly better bespoke heading.
+Use these part names even where a file has only a stub for a part, and no
+others at the top level: anything else is a `###` subsection of the part it
+belongs to (`### Do not retry` under **Open work**, `### Tests` under
+**Implementation**). Consistency across filters is worth more than a slightly
+better bespoke heading.
 
-The **Performance** table lives in the status banner — do not repeat it as a
-separate section. Cross-cutting correctness passes (validation hardening,
-error-path fixes, `sfence` ordering) are not rounds of their own: at most one
-bullet each, under **Historical**.
+The scoreboard **table** lives in the status banner. `## Performance` explains
+the mechanisms behind those numbers and never repeats the table.
+Cross-cutting correctness passes (validation hardening, error-path fixes,
+`sfence` ordering) are not rounds of their own: at most one bullet each, under
+**Historical**.
 
 ## Writing style
 
@@ -36,8 +50,9 @@ bullet each, under **Historical**.
   measured; evidence follows. Never make the reader reach the end to learn.
 - **Tables for numbers, bullets for mechanisms, prose for neither.** If a
   paragraph has more than ~4 lines, it should be a bullet list.
-- **One entry per round or date**, headed `## Round N — <claim>` or
-  `## <date> — <claim>`. The heading states the result, not the topic.
+- **One entry per round or date**, inside `## Historical`: either a
+  `### Rounds N–M — <claim>` / `### <date> — <claim>` heading, or a
+  `- **<date> — <claim>.**` bullet. It states the result, not the topic.
 - **Quote a number only with its config** (depth, geometry, streams, sigma,
   frames) and whether it was a graded median or a screen.
 - **A correctness-only change gets one line**: what was wrong, what the fix is,
@@ -49,9 +64,10 @@ bullet each, under **Historical**.
 
 ## Keeping it short
 
-- Keep the whole file under ~700 lines, with the **live part** (banner through
-  open work) under ~300. It is a limit on new writing, not a target to grow
-  into: when a file crosses it, compress its history rather than appending.
+- Keep the whole file under ~700 lines and the **live part** — everything
+  except the `## Historical` section — under ~350. Both are limits on new
+  writing, not targets to grow into: when a file crosses one, compress rather
+  than append.
 - **Delete perf conclusions that were measured on a broken benchmark.** If the
   harness, input, or mask was wrong, the round's numbers are void: keep the
   accuracy proofs, correctness fixes and mechanisms, and replace the perf record
@@ -98,7 +114,7 @@ and gets one line here, not a section per note.
 Correctness-only fix:
 
 ```markdown
-## Round 7 — invalidate GPU-written staging before the CPU reads it
+### Round 7 — invalidate GPU-written staging before the CPU reads it
 u16/f32 download read stale cache lines because the invalidate range was
 missing on the cached path. Now invalidated per plane; no perf change.
 ```
@@ -106,7 +122,7 @@ missing on the cached path. Now invalidated per plane; no perf change.
 A perf round that earned its space:
 
 ```markdown
-## Round 10 — host path was the wall (+15% at ns=4)
+### Round 10 — host path was the wall (+15% at ns=4)
 CPU staging, not the kernel, was the limiter (upload gather 6.1 ms/frame).
 Replaced the serial scan with a SIMD dilation: 6.1 → 0.28 ms/frame, ns=4
 1530 → 1760 fps (jpbd 1080p GRAY16, 5000-frame medians). Re-swept ns: knee

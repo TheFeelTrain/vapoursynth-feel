@@ -23,7 +23,9 @@ Scoreboard, real based_aa clip (jpbd 2x Point → 3840x2160 GRAY16, 600 f, ns=8)
 **≈2.1x the best reference chain.** The brief's 1.6–1.8x projection did not
 materialise (Historical).
 
-## Semantics that must be reproduced exactly
+## Implementation
+
+### Semantics that must be reproduced exactly
 
 Measured, not assumed — do not re-derive from intuition.
 
@@ -47,8 +49,6 @@ Measured, not assumed — do not re-derive from intuition.
 - **Additive only:** EEDI3/EEDI3H and their tests stay untouched. Out of scope
   (falls back to the chain): `direction != BOTH`, `double_rate=False`,
   `transpose_first`, a `Deinterlacer` sclip, unsupported formats.
-
-## Implementation
 
 - `ENTRY_ASSEMBLEV` is the vertical merge (one dispatch per plane) and
   `ENTRY_COMPOSE` carries `comp_fuse` 1/2: sub-pass 0 parks its plane in the
@@ -86,6 +86,21 @@ Measured, not assumed — do not re-derive from intuition.
   (`should_h`/`supports_mclip`/the `Interleave([s,s])` sclip/`field = tff + 2`
   all come from vsaa, so they cannot drift); the fused arm calls
   `core.vsfeel.EEDI3AA` directly.
+
+### Tests
+
+`tests/test_eedi3aa.py` — **133 tests**: u16 exact oracle over field 2/3, mdis
+3/20/40, nrad 0..3, vcheck 0..3, alpha/beta/gamma corners, Gray8/16/32 mclip
+present/absent, aliased and distinct sclip; the same for f32 under a 1e-6 bound
+(measured max 5.96e-8); `_FieldBased` progressive/TFF/BFF input; YUV420 all
+planes, `planes=[0]` (chroma passthrough) and `planes=[1]` (chroma-only must take
+the fused merge vs the chain); odd processed-plane width and odd subsampled
+chroma width rejected; determinism, multi-stream and parallel load; props
+(N frames, input fps, `_FieldBased` progressive) vs the chain; input validation.
+`tests/test_python_backend.py` adds the wrapper cases (fused == chain, the
+`direction != BOTH` fallback, backend selection, odd-geometry fallback,
+forwarded parameters the plugin does not declare). Whole
+suite **803 passed** via `tools/test.sh`.
 
 ## Historical
 
@@ -253,18 +268,3 @@ the shared core's knobs plus its own `..._NOCLEAR`/`..._POISON`.
   layout.
 - `EEDI3_PROBE` / `EEDI3_MAXW` — CMake cache vars: shader ablation level and the
   LDS vcheck max width (`-DMAXW`, `-DEEDI3_MAXW_LDS`); see `notes/EEDI3.md`.
-
-## Tests
-
-`tests/test_eedi3aa.py` — **133 tests**: u16 exact oracle over field 2/3, mdis
-3/20/40, nrad 0..3, vcheck 0..3, alpha/beta/gamma corners, Gray8/16/32 mclip
-present/absent, aliased and distinct sclip; the same for f32 under a 1e-6 bound
-(measured max 5.96e-8); `_FieldBased` progressive/TFF/BFF input; YUV420 all
-planes, `planes=[0]` (chroma passthrough) and `planes=[1]` (chroma-only must take
-the fused merge vs the chain); odd processed-plane width and odd subsampled
-chroma width rejected; determinism, multi-stream and parallel load; props
-(N frames, input fps, `_FieldBased` progressive) vs the chain; input validation.
-`tests/test_python_backend.py` adds the wrapper cases (fused == chain, the
-`direction != BOTH` fallback, backend selection, odd-geometry fallback,
-forwarded parameters the plugin does not declare). Whole
-suite **803 passed** via `tools/test.sh`.

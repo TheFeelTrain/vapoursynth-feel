@@ -304,7 +304,9 @@ upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
   (the reference leaves them uninitialized) — kept deliberately, tests rely on
   vsfeel's defined behavior.
 
-## Debug env vars (all in `src/nnedi3.cpp`)
+## Debug env vars
+
+All in `src/nnedi3.cpp`.
 
 | env | what it does |
 |---|---|

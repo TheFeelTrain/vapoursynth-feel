@@ -508,12 +508,14 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   including dead ends, so nothing is re-derived or retried later. The notes
   are **tracked**: they are the durable design record, visible to every checkout
   and the first thing a new contributor reads, so durable findings belong there
-  rather than only in a code comment. **Read `notes/README.md` first and follow
+  rather than only in a code comment. **Read `notes/AGENTS.md` first and follow
   it** — it is the authority on the notes (section shape, style, and the line
-  budget, which `notes/EEDI3.md` is already over), so nothing about how to write
-  them is repeated here. Keep entries short regardless: conclusion first, a
-  number only with its config, one line for a correctness-only change, mechanism
-  not story.
+  budgets, which `tools/notes_check.py` enforces on every lint run), so nothing
+  about how to write them is repeated here. (It is also injected automatically
+  once you touch a file in `notes/`, but only after that tool call, so read it
+  before writing a new note file.) Keep entries short regardless: conclusion
+  first, a number only with its config, one line for a correctness-only change,
+  mechanism not story.
   **Worked examples of most rules above live in `notes/EEDI3.md`
   rounds 10–12** (host-bounded frames, the SIMD dilation rewrite, the ReBAR
   upload, the boundary-input oracle bug, the harness-memory bimodality, and a
@@ -630,7 +632,7 @@ run after a driver or `glslc` update pays the compile again by design.
 (`.github/workflows/lint.yml`). The pinned clang-format/clang-tidy/ruff come
 from the `lint` dependency group (`uv sync --group lint`), and the script puts
 `.venv/bin` first on `PATH`, so a local run and CI use the same versions.
-Five gates:
+Six gates:
 
 - **format** — `clang-format --dry-run --Werror` over `src/*.cpp` and `src/*.h`
   (`.clang-format`); `tools/lint.sh --fix` rewrites in place.
@@ -643,6 +645,10 @@ Five gates:
 - **ruff** — `ruff check` over `vsfeel/`, `tools/`, `hatch_build.py`,
   `src/gen_spirv_header.py` and `tests/` (see `[tool.ruff.lint]` in
   `pyproject.toml` for the curated check set).
+- **notes** — `tools/notes_check.py` over `notes/*.md`, against
+  `notes/AGENTS.md`: the fixed parts and their order, both line budgets, the
+  file index, report IDs. It reads no build directory, so it also runs on a
+  bare checkout.
 
 The middle three need a configured `build/` — they read `compile_commands.json`
 and `build/vk_spv/`, which `tools/install.sh` writes. A gate whose tool is

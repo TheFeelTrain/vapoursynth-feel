@@ -170,7 +170,7 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 - Residual kernel gap vs vszipcl: cooperative-matrix (WMMA) box sums and launch
   structure.
 
-## Do not retry
+### Do not retry
 
 - **Buffer-reference reads in the sweep kernels** — measured −10% on 1080p
   `channels='UV'` (mechanism above). The compose is cheaper.

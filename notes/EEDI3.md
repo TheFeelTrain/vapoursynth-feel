@@ -58,7 +58,7 @@ EEDI3 380 → 417, EEDI3H 400 → 488, EEDI3AA 149 → 146.
   row kernel to fill the GPU by itself — e.g. splitting each row's column walk
   across workgroups with a boundary fixup.
 
-## Implementation (current)
+## Implementation
 
 Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter eedi3 vsfeel
 vszipcl` (and `--filter eedi3aa`, `--filter eedi3h` where registered).
@@ -526,7 +526,7 @@ passes). All bit-identical to the previous build unless stated.
   relaxation still requires measuring the drift on the noise clip and updating
   `tests/test_eedi3.py` in the same change.
 
-## Do-not-retry (mechanism, not verdict)
+### Do not retry
 
 *(stale)* marks a verdict measured on the degenerate pre-round-14 config — kept as
 the reason a variant failed, not as a current number.
@@ -581,7 +581,7 @@ the reason a variant failed, not as a current number.
   plugin (vsfeel 61 vs 220, vszipcl 39 vs 200) because the timed region starts
   re-running the decode/mask chain. Shrink the harness's own frame cache instead.
 
-## Method rules
+### Method rules
 
 - **Grade sweeps at >=900 frames**: a 700-frame queue sweep reported +14% for
   `queues=4`; at 900 it was a tie (clock ramp).
@@ -619,7 +619,7 @@ the reason a variant failed, not as a current number.
   *writes*** (round 16.2's structured-mclip bug). Regression test
   `test_eedi3_mclip_long_mask_off_prefix`, mutation-verified.
 
-## Debug env vars (verified against `src/eedi3.cpp`)
+## Debug env vars
 
 - `VSFEEL_EEDI3_VCLDS` — `=1` forces the LDS vcheck ping-pong back (global is default).
 - `VSFEEL_EEDI3_VPARA` — vcheck form: 0 = serial row walk (A/B control), 1..6 =

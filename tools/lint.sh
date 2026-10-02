@@ -16,6 +16,7 @@
 #   cppcheck  cppcheck over the compile database
 #   ruff      ruff check + ruff format --check over vsfeel/ tools/
 #             hatch_build.py src/gen_spirv_header.py tests/
+#   notes     tools/notes_check.py over notes/*.md, per notes/AGENTS.md
 #
 # shaders/tidy/cppcheck need a configured build directory (they read
 # build/compile_commands.json and build/vk_spv/); tools/install.sh writes
@@ -53,7 +54,7 @@ gates=()
 usage() {
     cat <<EOF
 usage: tools/lint.sh [--fix] [gate ...]
-  gates: format shaders tidy cppcheck ruff   (default: all of them)
+  gates: format shaders tidy cppcheck ruff notes   (default: all of them)
   --fix  apply clang-format -i, clang-tidy --fix and ruff's fixes first
 EOF
 }
@@ -62,12 +63,12 @@ for arg in "$@"; do
     case $arg in
         --fix) fix=1 ;;
         -h|--help) usage; exit 0 ;;
-        format|shaders|tidy|cppcheck|ruff) gates+=("$arg") ;;
+        format|shaders|tidy|cppcheck|ruff|notes) gates+=("$arg") ;;
         *) printf 'lint.sh: unknown argument %s (try --help)\n' "$arg" >&2; exit 2 ;;
     esac
 done
 if [ "${#gates[@]}" -eq 0 ]; then
-    gates=(format shaders tidy cppcheck ruff)
+    gates=(format shaders tidy cppcheck ruff notes)
 fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -156,6 +157,15 @@ gate_ruff() {
     fi
     "$ruff" check "${files[@]}"
     "$ruff" format --check "${files[@]}"
+}
+
+gate_notes() {
+    have "$python" || { skip "$python"; return 2; }
+    # notes/AGENTS.md is the authority on the notes; this checks the half of it a
+    # machine can read: the fixed parts and their order, both line budgets, the
+    # file index, report IDs. It reads no build directory, so unlike the three
+    # gates above it also runs on a bare checkout.
+    "$python" "$root_dir/tools/notes_check.py" "$root_dir/notes"
 }
 
 status=()
