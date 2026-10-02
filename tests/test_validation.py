@@ -26,9 +26,19 @@ _LAYER = "VK_LAYER_KHRONOS_validation"
 
 # One frame per filter, exercising the creation path and the frame path
 # (temporal / multi-pass filters get three frames).
-FILTERS = ["Bilateral", "Bilateral16", "GaussBlur", "GaussBlurLarge",
-           "DFTTest", "NLMeans", "BM3Dv2", "EEDI3", "EEDI3H", "EEDI3AA",
-           "NNEDI3"]
+FILTERS = [
+    "Bilateral",
+    "Bilateral16",
+    "GaussBlur",
+    "GaussBlurLarge",
+    "DFTTest",
+    "NLMeans",
+    "BM3Dv2",
+    "EEDI3",
+    "EEDI3H",
+    "EEDI3AA",
+    "NNEDI3",
+]
 
 _SCRIPT = textwrap.dedent(f"""\
     import sys
@@ -86,26 +96,35 @@ _SCRIPT = textwrap.dedent(f"""\
 
 @pytest.mark.parametrize("filter_name", FILTERS)
 def test_validation_layer_smoke(filter_name):
-    env = {**os.environ, "VK_INSTANCE_LAYERS": _LAYER,
-           "VK_LOADER_DEBUG": "layer", "MANGOHUD": "0"}
-    proc = subprocess.run([sys.executable, "-c", _SCRIPT, filter_name],
-                          capture_output=True, text=True, timeout=300, env=env)
+    env = {**os.environ, "VK_INSTANCE_LAYERS": _LAYER, "VK_LOADER_DEBUG": "layer", "MANGOHUD": "0"}
+    proc = subprocess.run(
+        [sys.executable, "-c", _SCRIPT, filter_name],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
     stdout, stderr = proc.stdout, proc.stderr
-    tail = ("--- stdout tail ---\n%s\n--- stderr tail ---\n%s"
-            % (stdout[-2000:], stderr[-2000:]))
+    tail = "--- stdout tail ---\n%s\n--- stderr tail ---\n%s" % (stdout[-2000:], stderr[-2000:])
 
-    if not any("Insert instance layer" in line and _LAYER in line
-               for line in stderr.splitlines()):
+    if not any("Insert instance layer" in line and _LAYER in line for line in stderr.splitlines()):
         pytest.skip(f"{_LAYER} is not installed")
 
     assert proc.returncode == 0 and "VALIDATION OK" in stdout, (
-        f"{filter_name} failed to evaluate under the validation layer\n{tail}")
+        f"{filter_name} failed to evaluate under the validation layer\n{tail}"
+    )
 
-    hits = [line for line in stdout.splitlines() + stderr.splitlines()
-            if "Validation Error" in line or "VUID" in line]
+    hits = [
+        line
+        for line in stdout.splitlines() + stderr.splitlines()
+        if "Validation Error" in line or "VUID" in line
+    ]
     assert not hits, (
         f"{filter_name}: {len(hits)} validation-layer message(s):\n"
-        + "\n".join(hits[:10]) + "\n" + tail)
+        + "\n".join(hits[:10])
+        + "\n"
+        + tail
+    )
 
 
 _LEAK_SCRIPT = textwrap.dedent("""\
@@ -143,26 +162,38 @@ def test_failed_creation_does_not_leak_pipelines(filter_name):
     before pad; NNEDI3 loses two (prescreen, predict) before the kept-row
     writer.
     """
-    env = {**os.environ, "VK_INSTANCE_LAYERS": _LAYER,
-           "VK_LOADER_DEBUG": "layer", "VSFEEL_LIMIT_INVOCATIONS": "128",
-           "MANGOHUD": "0"}
-    proc = subprocess.run([sys.executable, "-c", _LEAK_SCRIPT, filter_name],
-                          capture_output=True, text=True, timeout=300, env=env)
+    env = {
+        **os.environ,
+        "VK_INSTANCE_LAYERS": _LAYER,
+        "VK_LOADER_DEBUG": "layer",
+        "VSFEEL_LIMIT_INVOCATIONS": "128",
+        "MANGOHUD": "0",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", _LEAK_SCRIPT, filter_name],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
     stdout, stderr = proc.stdout, proc.stderr
-    tail = ("--- stdout tail ---\n%s\n--- stderr tail ---\n%s"
-            % (stdout[-2000:], stderr[-2000:]))
+    tail = "--- stdout tail ---\n%s\n--- stderr tail ---\n%s" % (stdout[-2000:], stderr[-2000:])
 
-    if not any("Insert instance layer" in line and _LAYER in line
-               for line in stderr.splitlines()):
+    if not any("Insert instance layer" in line and _LAYER in line for line in stderr.splitlines()):
         pytest.skip(f"{_LAYER} is not installed")
 
     assert proc.returncode == 0 and "LEAK OK" in stdout, (
-        f"the failing {filter_name} creation did not reach its own "
-        f"error path\n{tail}")
+        f"the failing {filter_name} creation did not reach its own error path\n{tail}"
+    )
 
-    hits = [line for line in stdout.splitlines() + stderr.splitlines()
-            if "not been destroyed" in line or "05137" in line]
+    hits = [
+        line
+        for line in stdout.splitlines() + stderr.splitlines()
+        if "not been destroyed" in line or "05137" in line
+    ]
     assert not hits, (
         f"a failed {filter_name} creation leaked Vulkan objects:\n"
-        + "\n".join(hits[:10]) + "\n" + tail)
-
+        + "\n".join(hits[:10])
+        + "\n"
+        + tail
+    )

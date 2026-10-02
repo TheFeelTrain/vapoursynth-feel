@@ -17,13 +17,13 @@ from conftest import cpu_node, frame_to_ndarray
 pytest.importorskip("vstools")
 pytest.importorskip("vsaa")
 
-from vsaa import EEDI3, NNEDI3  # noqa: E402
-from vsaa import based_aa  # noqa: E402
-from vsdenoise import bm3d, nl_means  # noqa: E402
-from vsdenoise.fft import DFTTest  # noqa: E402
-from vsrgtools import bilateral, gauss_blur  # noqa: E402
+from vsaa import EEDI3, NNEDI3
+from vsaa import based_aa
+from vsdenoise import bm3d, nl_means
+from vsdenoise.fft import DFTTest
+from vsrgtools import bilateral, gauss_blur
 
-import vsfeel  # noqa: E402
+import vsfeel
 
 
 def _backend():
@@ -73,15 +73,19 @@ def test_eedi3_runs_via_vsaa(noise_gray):
 
 
 def test_eedi3h_fallback_matches_native(noise_gray):
-    native = cpu_node(EEDI3(backend=_backend()).antialias(
-        noise_gray, direction=EEDI3.AADirection.HORIZONTAL))
+    native = cpu_node(
+        EEDI3(backend=_backend()).antialias(noise_gray, direction=EEDI3.AADirection.HORIZONTAL)
+    )
 
     class _NoH(vsfeel.FeelBackend):
         supports_h = False
 
-    fallback = cpu_node(EEDI3(backend=_NoH()).antialias(
-        noise_gray, direction=EEDI3.AADirection.HORIZONTAL))
-    assert np.array_equal(frame_to_ndarray(native.get_frame(0)), frame_to_ndarray(fallback.get_frame(0)))
+    fallback = cpu_node(
+        EEDI3(backend=_NoH()).antialias(noise_gray, direction=EEDI3.AADirection.HORIZONTAL)
+    )
+    assert np.array_equal(
+        frame_to_ndarray(native.get_frame(0)), frame_to_ndarray(fallback.get_frame(0))
+    )
 
 
 def test_eedi3h_fallback_transposes_aux_clips(noise_16bit):
@@ -97,24 +101,29 @@ def test_eedi3h_fallback_transposes_aux_clips(noise_16bit):
     # here (the 2N form only exists for the fused double-rate path).
     sclip = clip.std.Invert()
     mclip = half_mask(clip, 16)
-    kw = dict(mdis=5, nrad=1, vcheck=2,
-              alpha=0.125, beta=0.25, gamma=40.0,
-              vthresh=(12.0, 24.0, 4.0))
+    kw = dict(
+        mdis=5, nrad=1, vcheck=2, alpha=0.125, beta=0.25, gamma=40.0, vthresh=(12.0, 24.0, 4.0)
+    )
 
     class _NoH(vsfeel.FeelBackend):
         supports_h = False
 
-    fallback = cpu_node(EEDI3(backend=_NoH(), **kw).antialias(
-        clip, direction=EEDI3.AADirection.HORIZONTAL,
-        sclip=sclip, mclip=mclip))
+    fallback = cpu_node(
+        EEDI3(backend=_NoH(), **kw).antialias(
+            clip, direction=EEDI3.AADirection.HORIZONTAL, sclip=sclip, mclip=mclip
+        )
+    )
     # The fallback's own shape: transpose everything, run the vertical
     # interpolation, transpose back. Rebuilt here so that removing either
     # .std.Transpose() call in FeelBackend.transpose fails the comparison.
     t = vs.core.std.Transpose(clip)
     ts = sclip.std.Transpose()
     tm = mclip.std.Transpose()
-    expect = cpu_node(EEDI3(backend=_backend(), **kw).antialias(
-        t, direction=EEDI3.AADirection.VERTICAL, sclip=ts, mclip=tm))
+    expect = cpu_node(
+        EEDI3(backend=_backend(), **kw).antialias(
+            t, direction=EEDI3.AADirection.VERTICAL, sclip=ts, mclip=tm
+        )
+    )
     expect = vs.core.std.Transpose(expect)
     assert fallback.num_frames == expect.num_frames == clip.num_frames
     for n in (0, 5, clip.num_frames - 1):
@@ -138,7 +147,8 @@ def test_nnedi3_subclass_is_a_vsaa_nnedi3():
     """vsfeel.NNEDI3 keeps the reference's field surface exactly."""
     assert issubclass(vsfeel.NNEDI3, NNEDI3)
     assert [f.name for f in dataclasses.fields(vsfeel.NNEDI3)] == [
-        f.name for f in dataclasses.fields(NNEDI3)]
+        f.name for f in dataclasses.fields(NNEDI3)
+    ]
     assert vsfeel.NNEDI3(nsize=3, nns=2, pscrn=1).copy(nsize=4).nsize == 4
     # vs.core.vsfeel.NNEDI3 is a fresh Function object per access, so compare
     # the plugin namespace rather than object identity.
@@ -156,39 +166,52 @@ def test_nnedi3_subclass_is_a_vsaa_nnedi3():
 )
 def test_nnedi3_via_vsaa_matches_direct_call(noise_16bit, kwargs):
     """The wrapper adds only field/dh mapping over core.vsfeel.NNEDI3."""
-    wrapped = cpu_node(vsfeel.NNEDI3(**kwargs).deinterlace(
-        noise_16bit, tff=True, double_rate=False))
-    direct = cpu_node(vs.core.vsfeel.NNEDI3(
-        noise_16bit, field=1,
-        nsize=kwargs.get("nsize", 0), nns=kwargs.get("nns", 4),
-        qual=kwargs.get("qual", 2), etype=kwargs.get("etype", 0),
-        pscrn=kwargs.get("pscrn", 4)))
+    wrapped = cpu_node(
+        vsfeel.NNEDI3(**kwargs).deinterlace(noise_16bit, tff=True, double_rate=False)
+    )
+    direct = cpu_node(
+        vs.core.vsfeel.NNEDI3(
+            noise_16bit,
+            field=1,
+            nsize=kwargs.get("nsize", 0),
+            nns=kwargs.get("nns", 4),
+            qual=kwargs.get("qual", 2),
+            etype=kwargs.get("etype", 0),
+            pscrn=kwargs.get("pscrn", 4),
+        )
+    )
     for n in (0, 7):
-        assert np.array_equal(frame_to_ndarray(wrapped.get_frame(n), dtype=np.uint16),
-                              frame_to_ndarray(direct.get_frame(n), dtype=np.uint16))
+        assert np.array_equal(
+            frame_to_ndarray(wrapped.get_frame(n), dtype=np.uint16),
+            frame_to_ndarray(direct.get_frame(n), dtype=np.uint16),
+        )
 
 
 def test_nnedi3_supersample_doubles_dims(noise_16bit):
-    out = cpu_node(vsfeel.NNEDI3().scale(noise_16bit, 2 * noise_16bit.width, 2 * noise_16bit.height))
+    out = cpu_node(
+        vsfeel.NNEDI3().scale(noise_16bit, 2 * noise_16bit.width, 2 * noise_16bit.height)
+    )
     assert (out.width, out.height) == (2 * noise_16bit.width, 2 * noise_16bit.height)
     assert np.isfinite(frame_to_ndarray(out.get_frame(0), dtype=np.uint16)).all()
 
 
 def test_based_aa_with_vsfeel_supersampler_and_antialiaser(noise_gray):
     """The documented drop-in combo runs end to end."""
-    out = cpu_node(based_aa(
-        noise_gray, supersampler=vsfeel.NNEDI3(), antialiaser=vsfeel.EEDI3(),
-        postfilter=False))
+    out = cpu_node(
+        based_aa(
+            noise_gray, supersampler=vsfeel.NNEDI3(), antialiaser=vsfeel.EEDI3(), postfilter=False
+        )
+    )
     assert (out.width, out.height) == (noise_gray.width, noise_gray.height)
     assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
 
 
 def test_eedi3aa_matches_the_two_call_chain(noise_16bit):
     """The fused antialiaser reproduces the base class's chain bit-exactly."""
-    fused = cpu_node(vsfeel.EEDI3(
-        backend=_backend(), mdis=5, nrad=1, **AA_PARAMS).antialias(noise_16bit))
-    chain = cpu_node(EEDI3(
-        backend=_backend(), mdis=5, nrad=1, **AA_PARAMS).antialias(noise_16bit))
+    fused = cpu_node(
+        vsfeel.EEDI3(backend=_backend(), mdis=5, nrad=1, **AA_PARAMS).antialias(noise_16bit)
+    )
+    chain = cpu_node(EEDI3(backend=_backend(), mdis=5, nrad=1, **AA_PARAMS).antialias(noise_16bit))
     assert fused.num_frames == chain.num_frames == noise_16bit.num_frames
     for n in (0, 5, 23):
         a = frame_to_ndarray(fused.get_frame(n), dtype=np.uint16)
@@ -207,10 +230,8 @@ def test_eedi3aa_sclip_subframes_are_distinct(noise_16bit):
     clip = noise_16bit
     inv = clip.std.Invert()
     kw = dict(mdis=5, nrad=1, **AA_PARAMS)
-    fused = cpu_node(vsfeel.EEDI3(
-        backend=_backend(), sclip=inv, **kw).antialias(clip))
-    chain = cpu_node(EEDI3(
-        backend=_backend(), sclip=inv, **kw).antialias(clip))
+    fused = cpu_node(vsfeel.EEDI3(backend=_backend(), sclip=inv, **kw).antialias(clip))
+    chain = cpu_node(EEDI3(backend=_backend(), sclip=inv, **kw).antialias(clip))
     assert fused.num_frames == chain.num_frames == clip.num_frames
     for n in (0, 5, 23):
         a = frame_to_ndarray(fused.get_frame(n), dtype=np.uint16)
@@ -218,13 +239,14 @@ def test_eedi3aa_sclip_subframes_are_distinct(noise_16bit):
         assert np.array_equal(a, b), f"distinct-sclip mismatch at frame {n}"
     # The inverted sclip must actually change the output vs no sclip
     # (sanity that the content is meaningful, not a vacuous equality).
-    plain = cpu_node(vsfeel.EEDI3(
-        backend=_backend(), **kw).antialias(clip))
+    plain = cpu_node(vsfeel.EEDI3(backend=_backend(), **kw).antialias(clip))
     changed = any(
         not np.array_equal(
             frame_to_ndarray(fused.get_frame(n), dtype=np.uint16),
-            frame_to_ndarray(plain.get_frame(n), dtype=np.uint16))
-        for n in (0, 5, 23))
+            frame_to_ndarray(plain.get_frame(n), dtype=np.uint16),
+        )
+        for n in (0, 5, 23)
+    )
     assert changed, "distinct sclip did not affect the output (test is vacuous)"
 
 
@@ -253,13 +275,21 @@ def test_wrapper_drops_params_the_plugin_rejects(noise_16bit, monkeypatch):
 
 def test_eedi3aa_falls_back_for_non_both(noise_16bit):
     """direction != BOTH keeps the base class's single-direction path."""
-    fused = cpu_node(vsfeel.EEDI3(backend=_backend(), **AA_PARAMS).antialias(
-        noise_16bit, direction=EEDI3.AADirection.HORIZONTAL))
-    chain = cpu_node(EEDI3(backend=_backend(), **AA_PARAMS).antialias(
-        noise_16bit, direction=EEDI3.AADirection.HORIZONTAL))
+    fused = cpu_node(
+        vsfeel.EEDI3(backend=_backend(), **AA_PARAMS).antialias(
+            noise_16bit, direction=EEDI3.AADirection.HORIZONTAL
+        )
+    )
+    chain = cpu_node(
+        EEDI3(backend=_backend(), **AA_PARAMS).antialias(
+            noise_16bit, direction=EEDI3.AADirection.HORIZONTAL
+        )
+    )
     for n in (0, 11):
-        assert np.array_equal(frame_to_ndarray(fused.get_frame(n), dtype=np.uint16),
-                              frame_to_ndarray(chain.get_frame(n), dtype=np.uint16))
+        assert np.array_equal(
+            frame_to_ndarray(fused.get_frame(n), dtype=np.uint16),
+            frame_to_ndarray(chain.get_frame(n), dtype=np.uint16),
+        )
 
 
 def test_eedi3aa_no_arg_defaults_match_based_aa(noise_gray, monkeypatch):
@@ -337,10 +367,12 @@ def test_backend_context_routes_singletons(noise_gray):
         assert bilateral.backend is _backend()
         assert gauss_blur.backend is _backend()
         # implicit backend= (AUTO -> singleton) now routes through vsfeel
-        assert np.isfinite(frame_to_ndarray(cpu_node(
-            bilateral(noise_gray, sigmaS=3.0, sigmaR=0.02)).get_frame(0))).all()
-        assert np.isfinite(frame_to_ndarray(cpu_node(
-            gauss_blur(noise_gray, 1.5)).get_frame(0))).all()
+        assert np.isfinite(
+            frame_to_ndarray(cpu_node(bilateral(noise_gray, sigmaS=3.0, sigmaR=0.02)).get_frame(0))
+        ).all()
+        assert np.isfinite(
+            frame_to_ndarray(cpu_node(gauss_blur(noise_gray, 1.5)).get_frame(0))
+        ).all()
     assert bilateral.backend == old_bilateral
     assert gauss_blur.backend == old_gauss
 
@@ -355,15 +387,12 @@ def test_bm3d_wrapper_rejects_chroma(noise_gray):
 
     yuv444 = vs.core.resize.Point(noise_gray, format=vs.YUV444PS)
     with pytest.raises(vs.Error, match="chroma"):
-        _bm3d(yuv444, 0.7, tr=2, profile=_bm3d.Profile.FAST,
-              backend=_backend())
+        _bm3d(yuv444, 0.7, tr=2, profile=_bm3d.Profile.FAST, backend=_backend())
     # An explicit chroma=False is a vsdenoise-level duplicate (it forces its
     # own geometry-derived value too), so cover the pass-through at the
     # wrapper entry point instead: Gray keeps the default path running.
-    out = _bm3d(noise_gray, 0.7, tr=2, profile=_bm3d.Profile.FAST,
-                backend=_backend())
-    assert np.isfinite(frame_to_ndarray(
-        cpu_node(out).get_frame(0))).all()
+    out = _bm3d(noise_gray, 0.7, tr=2, profile=_bm3d.Profile.FAST, backend=_backend())
+    assert np.isfinite(frame_to_ndarray(cpu_node(out).get_frame(0))).all()
 
 
 def test_backend_context_is_thread_safe():
@@ -382,7 +411,7 @@ def test_backend_context_is_thread_safe():
             with _backend()():
                 assert bilateral.backend is _backend()
                 assert gauss_blur.backend is _backend()
-        except BaseException as exc:  # noqa: BLE001 — collected below
+        except BaseException as exc:  # deliberate: collected and reported below
             errors.append(f"thread {i}: {type(exc).__name__}: {exc}")
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]

@@ -196,8 +196,7 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 _BILATERAL_PARAMS = {"sigma_spatial": 3.0, "sigma_color": 0.05}
 _DFTTEST_PARAMS = {"tbsize": 3}
 _GAUSS_PARAMS = {"sigma": 2.0}
-_BM3D_PARAMS = {"sigma": 0.7, "radius": 1, "bm_range": 16, "ps_range": 7,
-                "block_step": 4}
+_BM3D_PARAMS = {"sigma": 0.7, "radius": 1, "bm_range": 16, "ps_range": 7, "block_step": 4}
 # Default pscrn (2) means P=4 pixels/thread, the grouping that under-covered.
 _NNEDI3_PARAMS = {"pscrn": 2}
 # EEDI3 family: the config eedi3vk2 agrees with bit-exactly on u16.
@@ -217,11 +216,18 @@ _CROP_BOTTOM = 3
 CASES = []
 
 
-def _add(filter_, bits, width, guide, params, tol, color="gray",
-         top=0, bottom=0):
-    spec = {"filter": filter_, "bits": bits, "width": width, "guide": guide,
-            "color": color, "params": params, "frames": FRAMES,
-            "top": top, "bottom": bottom}
+def _add(filter_, bits, width, guide, params, tol, color="gray", top=0, bottom=0):
+    spec = {
+        "filter": filter_,
+        "bits": bits,
+        "width": width,
+        "guide": guide,
+        "color": color,
+        "params": params,
+        "frames": FRAMES,
+        "top": top,
+        "bottom": bottom,
+    }
     cid = "%s-%s-w%d" % (filter_, "f32" if bits == 32 else "u16", width)
     if guide:
         cid += "-guide"
@@ -272,20 +278,13 @@ for _w in WIDTHS:
 
 # Vertical crop: a non-zero row origin and a shorter plane exercise the row
 # staging / pad-origin path that the right-only crop leaves at row 0.
-_add("dfttest", 32, 630, 0, _DFTTEST_PARAMS, TOL_F32_ULP,
-     top=_CROP_TOP, bottom=_CROP_BOTTOM)
-_add("bilateral", 32, 630, 0, _BILATERAL_PARAMS, TOL_F32_ULP,
-     top=_CROP_TOP, bottom=_CROP_BOTTOM)
-_add("nnedi3", 16, 630, 0, _NNEDI3_PARAMS, TOL_U16_LSB,
-     top=_CROP_TOP, bottom=_CROP_BOTTOM)
-_add("eedi3", 16, 630, 0, _EEDI3_PARAMS, TOL_EEDI3_16,
-     top=_CROP_TOP, bottom=_CROP_BOTTOM)
-_add("eedi3h", 16, 630, 0, _EEDI3H_PARAMS, TOL_ORACLE_EXACT,
-     top=_CROP_TOP, bottom=_CROP_BOTTOM)
-_add("eedi3aa", 16, 630, 0, _EEDI3AA_PARAMS, TOL_ORACLE_EXACT,
-     top=_CROP_TOP, bottom=_CROP_BOTTOM)
-_add("nlmeans", 32, 630, 0, _NLMEANS_PARAMS, TOL_NLMEANS_32,
-     top=_CROP_TOP, bottom=_CROP_BOTTOM)
+_add("dfttest", 32, 630, 0, _DFTTEST_PARAMS, TOL_F32_ULP, top=_CROP_TOP, bottom=_CROP_BOTTOM)
+_add("bilateral", 32, 630, 0, _BILATERAL_PARAMS, TOL_F32_ULP, top=_CROP_TOP, bottom=_CROP_BOTTOM)
+_add("nnedi3", 16, 630, 0, _NNEDI3_PARAMS, TOL_U16_LSB, top=_CROP_TOP, bottom=_CROP_BOTTOM)
+_add("eedi3", 16, 630, 0, _EEDI3_PARAMS, TOL_EEDI3_16, top=_CROP_TOP, bottom=_CROP_BOTTOM)
+_add("eedi3h", 16, 630, 0, _EEDI3H_PARAMS, TOL_ORACLE_EXACT, top=_CROP_TOP, bottom=_CROP_BOTTOM)
+_add("eedi3aa", 16, 630, 0, _EEDI3AA_PARAMS, TOL_ORACLE_EXACT, top=_CROP_TOP, bottom=_CROP_BOTTOM)
+_add("nlmeans", 32, 630, 0, _NLMEANS_PARAMS, TOL_NLMEANS_32, top=_CROP_TOP, bottom=_CROP_BOTTOM)
 
 
 @pytest.mark.parametrize("spec,tol", CASES)
@@ -298,13 +297,15 @@ def test_cropped_width_matches_reference(spec, tol):
     """
     payload = compare_or_skip(_GEOM_SCRIPT, [json.dumps(spec)], timeout=300)
     assert payload["width"] == spec["width"], (
-        f"unexpected output width {payload['width']} for {spec}")
-    assert payload["height"] == \
-        HEIGHT - spec.get("top", 0) - spec.get("bottom", 0), (
-        f"unexpected output height {payload['height']} for {spec}")
+        f"unexpected output width {payload['width']} for {spec}"
+    )
+    assert payload["height"] == HEIGHT - spec.get("top", 0) - spec.get("bottom", 0), (
+        f"unexpected output height {payload['height']} for {spec}"
+    )
     assert payload["frames"] == spec["frames"]
     maxdiff = float(payload["maxdiff"])
     assert maxdiff <= tol, (
         f"{spec['filter']} bits={spec['bits']} width={spec['width']} "
         f"crop=({spec.get('top', 0)},{spec.get('bottom', 0)}) "
-        f"guide={spec.get('guide', 0)}: max diff {maxdiff} > tol {tol}")
+        f"guide={spec.get('guide', 0)}: max diff {maxdiff} > tol {tol}"
+    )

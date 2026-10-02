@@ -106,5 +106,9 @@ vapoursynth-vszipcl = { git = "https://github.com/dnjulek/vapoursynth-zipcl", re
 [tool.pytest.ini_options]
 addopts = "-p no:vsengine"
 
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F"]
+select = ["E4", "E7", "E9", "F", "W291", "W292", "W293", "RUF100"]

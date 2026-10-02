@@ -1,6 +1,6 @@
 # EEDI3AA — notes
 
-Status: **shipped** — `core.vsfeel.EEDI3AA` (`src/eedi3.cpp:2508`), on the shared
+Status: **shipped** — `core.vsfeel.EEDI3AA` (`Eedi3AaCreate`, `src/eedi3.cpp`), on the shared
 `EEDI3`/`EEDI3H` argument string: the exact `based_aa` chain
 `Merge(H(Merge(V(x))))` in **one plugin call, one submit**, both 50/50 merges
 folded into the kernels. Runs on the R80 GPU API (`vnode:gpu` in/out, one exec
@@ -31,17 +31,19 @@ Measured, not assumed — do not re-derive from intuition.
   samples): u16 `(a+b+1)>>1` (0 mismatches; `(a+b)>>1` 263 wrong, half-even
   131); f32 `0.5f*a + 0.5f*b` bitwise. The fused merge is **integer u16, after**
   the vcheck's quantisation.
-- **Parity** (`src/eedi3.cpp:1109-1119`, `:1390-1403`): `field = d->field & 1`,
-  overridden by the frame's `_FieldBased` (TOP→1, BOTTOM→0), then `(n&1) ^ field`.
-  Vertical sub-frames take the input's `_FieldBased`; horizontal ones take
-  `field & 1` with **no override**, because their input `v` is a progressive
-  scratch region, not a frame (`src/eedi3.cpp:1390-1392`) — wrong here is a
-  silent one-parity-wide error.
+- **Parity** (`Eedi3GetFrame`'s `field`, `Eedi3AaGetFrame`'s `base`/`fh0`):
+  `field = d->field & 1`, overridden by the frame's `_FieldBased` (TOP→1,
+  BOTTOM→0), then `(n&1) ^ field`. Vertical sub-frames take the input's
+  `_FieldBased`; horizontal ones take `field & 1` with **no override**, because
+  their input `v` is a progressive scratch region, not a frame
+  (`Eedi3AaGetFrame`, the `fh0`/`fh1` comment) — wrong here is a silent
+  one-parity-wide error.
 - **Merge pairing:** output frame `k` pairs sub-frames `2k`/`2k+1`, both from
-  input frame `k` (`src/eedi3.cpp:1358-1403`).
+  input frame `k` (`Eedi3AaGetFrame`, one `Eedi3Job` per sub-pass per frame).
 - **Props:** N frames at the input's fps, `_FieldBased` progressive; the fused
   filter must **not** halve `_DurationNum` the way each chained call does
-  (`src/eedi3.cpp:2041-2053`, `:1598-1601`).
+  (`Eedi3GetFrame` halves it under `d->field > 1`; `Eedi3AaGetFrame` only sets
+  `_FieldBased`).
 - **Additive only:** EEDI3/EEDI3H and their tests stay untouched. Out of scope
   (falls back to the chain): `direction != BOTH`, `double_rate=False`,
   `transpose_first`, a `Deinterlacer` sclip, unsupported formats.
@@ -51,28 +53,31 @@ Measured, not assumed — do not re-derive from intuition.
 - `ENTRY_ASSEMBLEV` is the vertical merge (one dispatch per plane) and
   `ENTRY_COMPOSE` carries `comp_fuse` 1/2: sub-pass 0 parks its plane in the
   device-local `o0` region, sub-pass 1 reads it back and averages —
-  `src/eedi3.comp:1858` and `:1777`, fuse arms `:1833`/`:1839`.
+  `ENTRY_ASSEMBLEV`/`ENTRY_COMPOSE` in `src/eedi3.comp`, the `comp_fuse` arms in
+  the compose entry point.
 - `record_pass(d, cmd, jobs, njobs, phase)` over `PassPhase`
   `kPrep`/`kRow`/`kVcheck`/`kTail`; one `Eedi3Job` per frame per sub-pass
-  (`src/eedi3.cpp:473-484`).
-- `Eedi3AaGetFrame` (`src/eedi3.cpp:1294`): one exec context and one CB for the
-  whole batch. Four sub-pass groups run in order — vertical v0, vertical v1
-  (`kAssembleV`), horizontal h0, horizontal h1 (`kCompose`) — each `kPrep` →
-  barrier → `kRow` → barrier → `kVcheck` → barrier → `kTail`, with a barrier
-  between groups (`src/eedi3.cpp:1552-1571`). All four share the frame's one
-  scratch buffer (`src/eedi3.cpp:1405-1413`); the vertical merge writes the
-  intermediate `v` into the scratch's `v` region and the horizontal pass reads it
-  from there, so nothing is gathered to the host and there is no CPU blit.
+  (`Eedi3Job`/`PassPhase`/`record_pass`, `src/eedi3.cpp`).
+- `Eedi3AaGetFrame`: one exec context and one CB for the whole batch. Four
+  sub-pass groups run in order — vertical v0, vertical v1 (`kAssembleV`),
+  horizontal h0, horizontal h1 (`kCompose`) — each `kPrep` → barrier → `kRow` →
+  barrier → `kVcheck` → barrier → `kTail`, with a barrier between groups
+  (`Eedi3AaGetFrame`'s four-sub-pass loop). All four share the frame's one
+  scratch buffer (the `GpuBuffer scratch` in `Eedi3AaGetFrame`); the vertical
+  merge writes the intermediate `v` into the scratch's `v` region and the
+  horizontal pass reads it from there, so nothing is gathered to the host and
+  there is no CPU blit.
 - Output is `newGPUVideoFrame` when every plane is processed, else
   `newVideoFrame2` sharing the unprocessed planes from the source
-  (`src/eedi3.cpp:1383-1385`).
+  (`Eedi3AaGetFrame`).
 - The scratch is filled with 0 once per submission so a pass reading a region it
   never wrote gets the benign value; `VSFEEL_EEDI3_NOCLEAR=1` opts out and
-  `VSFEEL_EEDI3_POISON` overlays a chosen pattern (`src/eedi3.cpp:1415-1431`).
+  `VSFEEL_EEDI3_POISON` overlays a chosen pattern (`eedi3_fill_scratch` /
+  `eedi3_poison_scratch`, called from `Eedi3AaGetFrame`).
 - `vsfeel_eedi3_create` `aa` mode: vertical geometry in `planes`, horizontal (the
   transpose) in `aplanes`, sized up front for the larger of the two; every region
   the two geometries share is placed once at `max(V, H)` and they alias it
-  (`src/eedi3.cpp:2070-2114`, `:2117-2207`).
+  (`vsfeel_eedi3_create`'s `d->aa` / `aplanes` branch).
 - `vsfeel/vsaa.py`: `EEDI3(vsaa.deinterlacers.EEDI3)` overrides `antialias` to
   emit one `EEDI3AA` call when a `_fusable_geometry`/`_fusable_format` check
   passes, else `super()`; `vsfeel.EEDI3` is a PEP-562 lazy re-export, so
@@ -122,7 +127,7 @@ under-reported every stage 10x).
   `dirc == 0` branch; the faithful ablation (`PROBE=12`, real dmap) is ~1.25x.
 - **The LDS vcheck IS engaged at the benchmark width**: gate is
   `p.vcheck_lds = !p.vcheck_para && want_lds && d->have_lds && key.width <= MAXW_LDS`,
-  `MAXW_LDS = 4096` (`src/eedi3.cpp:70`, `:2335-2336`) — a **column count**, not
+  `MAXW_LDS` (`src/eedi3.cpp`, from `-DEEDI3_MAXW_LDS`) — a **column count**, not
   bytes; 3840 ≤ 4096. `ENTRY_VCHECK` nonetheless defaults to the global-read
   (empty-row-skipping) form (`VSFEEL_EEDI3_VCLDS=1` restores the LDS ping-pong),
   and the two horizontal planes are 50/50-merged inside `ENTRY_COMPOSE` in VRAM

@@ -25,9 +25,18 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    WIDTH, HEIGHT, NOISE_MKV, assert_changes_on_noise,
-    assert_preserves_frame_props, cpu_node, eval_parallel, frame_to_ndarray,
-    plane as _plane, reference_compare, reference_or_skip, reference_spec,
+    WIDTH,
+    HEIGHT,
+    NOISE_MKV,
+    assert_changes_on_noise,
+    assert_preserves_frame_props,
+    cpu_node,
+    eval_parallel,
+    frame_to_ndarray,
+    plane as _plane,
+    reference_compare,
+    reference_or_skip,
+    reference_spec,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -40,11 +49,13 @@ def _run(clip, field=1, **kwargs):
     a CPU clip is auto-uploaded by the core and the output is downloaded before
     the host reads it.
     """
-    return cpu_node(vs.core.vsfeel.NNEDI3(
-        clip,
-        field=field,
-        **kwargs,
-    ))
+    return cpu_node(
+        vs.core.vsfeel.NNEDI3(
+            clip,
+            field=field,
+            **kwargs,
+        )
+    )
 
 
 def _ref_compare(fmt, frames, params, planes=None):
@@ -56,8 +67,7 @@ def _ref_compare(fmt, frames, params, planes=None):
     reference_or_skip("nnedi3vk", "NNEDI3")
     params = dict(params)
     params.setdefault("field", 1)
-    spec = reference_spec("nnedi3vk", "NNEDI3", fmt, frames=frames,
-                          planes=planes, kwargs=params)
+    spec = reference_spec("nnedi3vk", "NNEDI3", fmt, frames=frames, planes=planes, kwargs=params)
     return reference_compare(spec)
 
 
@@ -89,8 +99,9 @@ REFERENCE_CASES_16 = [
 ]
 
 
-@pytest.mark.parametrize("kwargs", REFERENCE_CASES_16,
-                         ids=[str(sorted(k.items())) for k in REFERENCE_CASES_16])
+@pytest.mark.parametrize(
+    "kwargs", REFERENCE_CASES_16, ids=[str(sorted(k.items())) for k in REFERENCE_CASES_16]
+)
 def test_nnedi3_matches_reference_16bit(noise_16bit, kwargs):
     payload = _ref_compare("gray16", (0, 11, 23), kwargs)
     assert payload["maxdiff"] <= 1, kwargs
@@ -130,8 +141,7 @@ def test_nnedi3_yuv_matches_reference():
     assert yuv.format.color_family == vs.YUV
     # dh doubles the luma height; the chroma writers have to cover the whole
     # (2*h) >> subSamplingH plane, last row included.
-    for kwargs in ({}, {"planes": [0]}, {"planes": [1, 2]}, {"nsize": 0},
-                   {"dh": True}):
+    for kwargs in ({}, {"planes": [0]}, {"planes": [1, 2]}, {"nsize": 0}, {"dh": True}):
         payload = _ref_compare("yuv420_16", (0, 11), kwargs)
         assert payload["maxdiff"] <= 1, kwargs
 
@@ -140,14 +150,25 @@ def test_nnedi3_yuv_matches_reference():
 # Reference agreement, float32 (bit-exact floats on configs tried)
 # ---------------------------------------------------------------------------
 
-REFERENCE_CASES_32 = [{}, {"pscrn": 0}, {"pscrn": 1}, {"qual": 2},
-                      {"etype": 1}, {"nsize": 0}, {"nns": 4}, {"field": 0},
-                      # float-path gaps: field 2/3 and dh (16-bit only before)
-                      {"field": 2}, {"field": 3}, {"dh": True}]
+REFERENCE_CASES_32 = [
+    {},
+    {"pscrn": 0},
+    {"pscrn": 1},
+    {"qual": 2},
+    {"etype": 1},
+    {"nsize": 0},
+    {"nns": 4},
+    {"field": 0},
+    # float-path gaps: field 2/3 and dh (16-bit only before)
+    {"field": 2},
+    {"field": 3},
+    {"dh": True},
+]
 
 
-@pytest.mark.parametrize("kwargs", REFERENCE_CASES_32,
-                         ids=[str(sorted(k.items())) for k in REFERENCE_CASES_32])
+@pytest.mark.parametrize(
+    "kwargs", REFERENCE_CASES_32, ids=[str(sorted(k.items())) for k in REFERENCE_CASES_32]
+)
 def test_nnedi3_matches_reference_32bit(noise_gray, kwargs):
     payload = _ref_compare("gray32", (0, 11), kwargs)
     assert payload["maxdiff"] <= 1e-6, kwargs
@@ -157,6 +178,7 @@ def test_nnedi3_matches_reference_32bit(noise_gray, kwargs):
 # Determinism / stream count
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("bits", [16, 32])
 def test_nnedi3_deterministic(noise_gray, noise_16bit, bits):
     clip = noise_16bit if bits == 16 else noise_gray
@@ -165,13 +187,12 @@ def test_nnedi3_deterministic(noise_gray, noise_16bit, bits):
     for n in (0, 11, 23):
         fa, fb = a.get_frame(n), b.get_frame(n)
         if bits == 16:
-            d = _plane(fa, 0, WIDTH, HEIGHT).astype(np.int32) - \
-                _plane(fb, 0, WIDTH, HEIGHT).astype(np.int32)
+            d = _plane(fa, 0, WIDTH, HEIGHT).astype(np.int32) - _plane(fb, 0, WIDTH, HEIGHT).astype(
+                np.int32
+            )
         else:
             d = frame_to_ndarray(fa) - frame_to_ndarray(fb)
         assert np.abs(d).max() == 0, f"nondeterministic output at frame {n}"
-
-
 
 
 def test_nnedi3_parallel_load_consistent(noise_16bit):
@@ -183,6 +204,7 @@ def test_nnedi3_parallel_load_consistent(noise_16bit):
 # ---------------------------------------------------------------------------
 # Frame geometry / properties
 # ---------------------------------------------------------------------------
+
 
 def test_nnedi3_field_gt1_doubles_frames(noise_16bit):
     out = _run(noise_16bit, field=3)
@@ -232,6 +254,7 @@ def test_nnedi3_preserves_frame_props(noise_16bit):
 # ---------------------------------------------------------------------------
 # Input validation
 # ---------------------------------------------------------------------------
+
 
 def test_nnedi3_requires_field(noise_16bit):
     """`field` is a required argument (EEDI3 does the same).
@@ -292,8 +315,6 @@ def test_nnedi3_rejects_bad_planes(noise_16bit):
         _run(noise_16bit, planes=[3])
 
 
-
-
 def test_nnedi3_rejects_odd_height(noise_16bit):
     odd = noise_16bit.std.Crop(bottom=1)
     with pytest.raises(vs.Error):
@@ -307,7 +328,6 @@ def test_nnedi3_rejects_dh_over_int32_height():
     so the guard is exercised at creation. The message is asserted because a
     wrapped height would otherwise still be rejected, with a different error.
     """
-    clip = vs.core.std.BlankClip(width=1, height=1 << 30, format=vs.GRAY16,
-                                 length=1)
+    clip = vs.core.std.BlankClip(width=1, height=1 << 30, format=vs.GRAY16, length=1)
     with pytest.raises(vs.Error, match="too tall"):
         vs.core.vsfeel.NNEDI3(clip, field=1, dh=True)

@@ -48,7 +48,7 @@ def read_spv(path: Path) -> bytes:
 def emit_spv(f, name: str, data: bytes) -> None:
     f.write(f"static const uint32_t {name}_spv[] = {{\n    ")
     for i in range(0, len(data), 4):
-        value = int.from_bytes(data[i:i + 4], "little")
+        value = int.from_bytes(data[i : i + 4], "little")
         f.write(f"0x{value:08x}u, ")
         if (i // 4 + 1) % 8 == 0:
             f.write("\n    ")

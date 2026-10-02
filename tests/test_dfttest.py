@@ -30,10 +30,21 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_changes_on_noise,
-    assert_preserves_frame_props, assert_temporal_order_consistent,
-    check_all_frames_finite, compare_or_skip, cpu_node, eval_parallel,
-    frame_to_ndarray, plane as _plane, reference_compare, reference_or_skip,
+    WIDTH,
+    HEIGHT,
+    NOISE_MKV,
+    COMPARE_PRELUDE,
+    assert_changes_on_noise,
+    assert_preserves_frame_props,
+    assert_temporal_order_consistent,
+    check_all_frames_finite,
+    compare_or_skip,
+    cpu_node,
+    eval_parallel,
+    frame_to_ndarray,
+    plane as _plane,
+    reference_compare,
+    reference_or_skip,
     reference_spec,
 )
 
@@ -43,18 +54,19 @@ pytestmark = pytest.mark.usefixtures("noise_gray")
 def _run(clip, tbsize=3, **kwargs):
     # DFTTest runs on the R80 GPU API (vnode:gpu in/out), so every test that
     # reads pixels goes through std.GPUDownload first (see conftest.cpu_node).
-    return cpu_node(vs.core.vsfeel.DFTTest(
-        clip,
-        tbsize=tbsize,
-        **kwargs,
-    ))
+    return cpu_node(
+        vs.core.vsfeel.DFTTest(
+            clip,
+            tbsize=tbsize,
+            **kwargs,
+        )
+    )
 
 
 def _ref_compare(fmt, params, frames=(0, 11, 23), planes=None):
     """Worst diff vs vszipcl over ``frames`` (subprocess; skips if absent)."""
     reference_or_skip("vszipcl", "DFTTest")
-    spec = reference_spec("vszipcl", "DFTTest", fmt, frames=frames,
-                          planes=planes, kwargs=params)
+    spec = reference_spec("vszipcl", "DFTTest", fmt, frames=frames, planes=planes, kwargs=params)
     return reference_compare(spec)["maxdiff"]
 
 
@@ -62,14 +74,13 @@ def _ref_compare(fmt, params, frames=(0, 11, 23), planes=None):
 # Determinism / stream count
 # ---------------------------------------------------------------------------
 
+
 def test_dfttest_deterministic_32bit(noise_gray):
     a = _run(noise_gray)
     b = _run(noise_gray)
     for n in (0, 11, 23):
         d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
         assert np.abs(d).max() < 1e-6, f"nondeterministic output at frame {n}"
-
-
 
 
 def test_dfttest_preserves_frame_props(noise_gray):
@@ -100,8 +111,6 @@ def test_dfttest_deterministic_16bit(noise_16bit):
         assert np.array_equal(fa, fb), f"nondeterministic output at frame {n}"
 
 
-
-
 def test_dfttest_parallel_load_consistent_16bit(noise_16bit):
     """16-bit mirror of test_dfttest_parallel_load_consistent."""
     a = eval_parallel(_run, noise_16bit, dtype=np.uint16)
@@ -118,6 +127,7 @@ def test_dfttest_parallel_load_consistent_16bit(noise_16bit):
 # Pipelined-reader stress (regression)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("bits", [None, 16], ids=["32bit", "16bit"])
 def test_dfttest_vspipe_pipelined_no_hang(bits):
     """vspipe's pipelined reader plus VapourSynth's prefetch activate frames
@@ -132,21 +142,34 @@ def test_dfttest_vspipe_pipelined_no_hang(bits):
     (float32 default and --bits 16 integer path).
     """
     bench = Path(__file__).resolve().parent.parent / "tools" / "benchmark.py"
-    cmd = [sys.executable, str(bench), "--synthetic", "--frames", "200",
-           "--filter", "dfttest", "vsfeel"]
+    cmd = [
+        sys.executable,
+        str(bench),
+        "--synthetic",
+        "--frames",
+        "200",
+        "--filter",
+        "dfttest",
+        "vsfeel",
+    ]
     if bits:
         cmd += ["--bits", str(bits)]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
             env={**os.environ, "MANGOHUD": "0"},
         )
     except subprocess.TimeoutExpired:
         pytest.fail("benchmark run hung (queue stall / semaphore deadlock)")
     assert result.returncode == 0, (
-        f"bench exited {result.returncode}:\n{result.stdout}\n{result.stderr}")
-    fps_line = next((line for line in result.stdout.splitlines()
-                     if "vsfeel" in line and "fps" in line), None)
+        f"bench exited {result.returncode}:\n{result.stdout}\n{result.stderr}"
+    )
+    fps_line = next(
+        (line for line in result.stdout.splitlines() if "vsfeel" in line and "fps" in line), None
+    )
     assert fps_line, f"no vsfeel fps line:\n{result.stdout}\n{result.stderr}"
 
 
@@ -173,7 +196,8 @@ def test_dfttest_vspipe_pipelined_chained_no_hang_16bit(chained, tmp_path):
     frame 0 rather than tens of thousands of frames in.
     """
     script = tmp_path / "chained.py"
-    script.write_text(textwrap.dedent(f"""\
+    script.write_text(
+        textwrap.dedent(f"""\
         import vapoursynth as vs
         core = vs.core
         core.max_cache_size = 1024 * 8
@@ -182,26 +206,33 @@ def test_dfttest_vspipe_pipelined_chained_no_hang_16bit(chained, tmp_path):
             clip = core.vsfeel.DFTTest(clip, sigma=7.0, tbsize=1)
             clip.get_frame(0)   # eval-time probe (see docstring)
         clip.set_output()
-    """))
+    """)
+    )
     vspipe = shutil.which("vspipe")
     assert vspipe, "vspipe not on PATH"
     try:
         result = subprocess.run(
             [vspipe, "-p", str(script), "/dev/null"],
-            capture_output=True, text=True, timeout=45,
+            capture_output=True,
+            text=True,
+            timeout=45,
             env={**os.environ, "MANGOHUD": "0"},
         )
     except subprocess.TimeoutExpired:
-        pytest.fail("chained DFTTest vspipe run hung (timeline slot-semaphore "
-                    "regression: a consumer waited on a value the pad never "
-                    "signalled)")
+        pytest.fail(
+            "chained DFTTest vspipe run hung (timeline slot-semaphore "
+            "regression: a consumer waited on a value the pad never "
+            "signalled)"
+        )
     assert result.returncode == 0, (
-        f"vspipe exited {result.returncode}:\n{result.stdout}\n{result.stderr}")
+        f"vspipe exited {result.returncode}:\n{result.stdout}\n{result.stderr}"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Frame-request order and short clips (temporal cache)
 # ---------------------------------------------------------------------------
+
 
 def test_dfttest_frame_request_order_matches_serial():
     """The cached temporal window must not depend on the request order.
@@ -209,27 +240,25 @@ def test_dfttest_frame_request_order_matches_serial():
     vspipe's scheduler re-requests in-flight frames, so a wrong or stale slot
     read shows up only when the frames arrive out of sequence.
     """
-    assert_temporal_order_consistent(
-        "DFTTest", {"tbsize": 3}, tol=0.0, timeout=300)
+    assert_temporal_order_consistent("DFTTest", {"tbsize": 3}, tol=0.0, timeout=300)
 
 
 @pytest.mark.parametrize("nframes", [1, 2])
 def test_dfttest_short_clip_temporal_window(nframes):
     """A clip shorter than tbsize must still be order-independent."""
     assert_temporal_order_consistent(
-        "DFTTest", {"tbsize": 3}, tol=0.0,
-        nframes=nframes, timeout=300)
+        "DFTTest", {"tbsize": 3}, tol=0.0, nframes=nframes, timeout=300
+    )
 
 
 # ---------------------------------------------------------------------------
 # All frames finite (temporal boundary handling)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("tbsize", [1, 3, 5, 7])
 def test_dfttest_no_nan_all_frames_32bit(noise_gray, tbsize):
     check_all_frames_finite(_run, noise_gray, tbsize=tbsize)
-
-
 
 
 @pytest.mark.parametrize("tbsize", [1, 3, 5, 7])
@@ -244,8 +273,6 @@ def test_dfttest_no_nan_all_frames_16bit(noise_16bit, tbsize):
     assert_changes_on_noise(out, noise_16bit, what="DFTTest")
 
 
-
-
 # ---------------------------------------------------------------------------
 # Reference comparison
 # ---------------------------------------------------------------------------
@@ -258,23 +285,29 @@ def test_dfttest_no_nan_all_frames_16bit(noise_16bit, tbsize):
 # up as isolated speckle worth up to ~sigma/255 on the normalized scale.
 REF_TOL = 1e-6
 REFERENCE_CASES = [
-    ({}, REF_TOL),                                                  # defaults
-    ({"tbsize": 1}, REF_TOL),                                       # spatial only
+    ({}, REF_TOL),  # defaults
+    ({"tbsize": 1}, REF_TOL),  # spatial only
     ({"tbsize": 5}, REF_TOL),
-    ({"tbsize": 7, "sosize": 4}, REF_TOL),                          # radius 3, 75% overlap
-    ({"sosize": 12}, REF_TOL),                                      # >50% overlap
-    ({"zmean": 0}, REF_TOL),                                        # no zero-mean
+    ({"tbsize": 7, "sosize": 4}, REF_TOL),  # radius 3, 75% overlap
+    ({"sosize": 12}, REF_TOL),  # >50% overlap
+    ({"zmean": 0}, REF_TOL),  # no zero-mean
     ({"swin": 4, "sbeta": 3.0, "twin": 2, "tbeta": 4.0}, REF_TOL),  # custom windows
-    ({"ftype": 2}, REF_TOL),                                        # multiply
-    ({"ftype": 3, "pmin": 10.0, "pmax": 200.0}, REF_TOL),           # bandpass
-    ({"ftype": 4, "pmin": 10.0, "pmax": 200.0}, REF_TOL),           # rnlm-like
-    ({"ftype": 0, "f0beta": 0.5}, REF_TOL),                         # sqrt wiener
+    ({"ftype": 2}, REF_TOL),  # multiply
+    ({"ftype": 3, "pmin": 10.0, "pmax": 200.0}, REF_TOL),  # bandpass
+    ({"ftype": 4, "pmin": 10.0, "pmax": 200.0}, REF_TOL),  # rnlm-like
+    ({"ftype": 0, "f0beta": 0.5}, REF_TOL),  # sqrt wiener
     ({"slocation": [0.0, 2.0, 0.5, 8.0, 1.0, 12.0], "ssystem": 0}, REF_TOL),
     ({"slocation": [0.0, 2.0, 0.5, 8.0, 1.0, 12.0], "ssystem": 1}, REF_TOL),
-    ({"ssx": [0.0, 4.0, 1.0, 9.0], "ssy": [0.0, 3.0, 1.0, 7.0],
-      "sst": [0.0, 2.0, 1.0, 5.0], "ssystem": 1}, REF_TOL),
-    ({"swin": 4, "sbeta": 3.0, "twin": 2, "tbeta": 4.0,
-      "ftype": 1, "sigma": 4.0}, 5e-3),
+    (
+        {
+            "ssx": [0.0, 4.0, 1.0, 9.0],
+            "ssy": [0.0, 3.0, 1.0, 7.0],
+            "sst": [0.0, 2.0, 1.0, 5.0],
+            "ssystem": 1,
+        },
+        REF_TOL,
+    ),
+    ({"swin": 4, "sbeta": 3.0, "twin": 2, "tbeta": 4.0, "ftype": 1, "sigma": 4.0}, 5e-3),
     # ftype=1 (hard threshold) is boundary-sensitive (see above).
     ({"ftype": 1, "sigma": 4.0}, 5e-3),
 ]
@@ -400,13 +433,17 @@ DFTEST_PARAM_SWEEP = (
     # of 0..15 is the legal surface.
     + [{"sosize": v} for v in (0, 1, 2, 3, 5, 6, 7, 8, 14, 15)]
     + [{"f0beta": v} for v in (0.0, 0.25, 2.0, 4.0)]
-    + [{"ftype": t, "sigma": 4.0, "pmin": 10.0, "pmax": 200.0}
-       for t in (2, 3, 4)]
-    + [{"ssx": [0.0, 4.0, 1.0, 9.0], "ssy": [0.0, 3.0, 1.0, 7.0],
-        "sst": [0.0, 2.0, 1.0, 5.0], "ssystem": 0}]
+    + [{"ftype": t, "sigma": 4.0, "pmin": 10.0, "pmax": 200.0} for t in (2, 3, 4)]
+    + [
+        {
+            "ssx": [0.0, 4.0, 1.0, 9.0],
+            "ssy": [0.0, 3.0, 1.0, 7.0],
+            "sst": [0.0, 2.0, 1.0, 5.0],
+            "ssystem": 0,
+        }
+    ]
     + [{"swin": 4, "sbeta": 3.0, "twin": 4, "tbeta": 3.0}]
-    + [{"ftype": 3, "sigma": 4.0, "sigma2": 16.0,
-        "pmin": 10.0, "pmax": 200.0}]
+    + [{"ftype": 3, "sigma": 4.0, "sigma2": 16.0, "pmin": 10.0, "pmax": 200.0}]
 )
 
 
@@ -472,6 +509,7 @@ def test_dfttest_env_flag_false_is_disabled(noise_gray, monkeypatch):
 # Formats and plane handling
 # ---------------------------------------------------------------------------
 
+
 def test_dfttest_yuv_passthrough_32bit(noise_gray):
     """A full YUV clip is accepted; with planes=[0] the chroma planes must be
     copied through bit-identically and the luma must match the Gray output."""
@@ -515,8 +553,9 @@ def test_dfttest_yuv_passthrough_16bit(noise_16bit):
     ref = _run(noise_16bit)
 
     for n in (0, 11, 23):
-        d = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64) \
-            - _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
+        d = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64) - _plane(
+            ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint16
+        ).astype(np.int64)
         assert np.abs(d).max() == 0, f"luma mismatch at frame {n}"
         s = yuv.get_frame(n)
         for plane in (1, 2):
@@ -543,8 +582,7 @@ def test_dfttest_planes_chroma_only_32bit():
 
 def test_dfttest_planes_chroma_only_16bit():
     """16-bit mirror of test_dfttest_planes_chroma_only (whole codes)."""
-    worst = _ref_compare("yuv420_16", {"tbsize": 1, "planes": [1, 2]},
-                         planes=(1, 2))
+    worst = _ref_compare("yuv420_16", {"tbsize": 1, "planes": [1, 2]}, planes=(1, 2))
     assert worst <= 1.0, f"max diff {worst}"
 
 
@@ -552,23 +590,25 @@ def test_dfttest_planes_chroma_leaves_luma_untouched(noise_gray):
     """With planes=[1,2] the unprocessed luma must be copied through
     bit-identically while both chroma planes change."""
     core = vs.core
-    src = core.fmtc.bitdepth(core.bs.VideoSource(NOISE_MKV), bits=32,
-                             fulls=True, fulld=True)
+    src = core.fmtc.bitdepth(core.bs.VideoSource(NOISE_MKV), bits=32, fulls=True, fulld=True)
     out = _run(src, planes=[1, 2])
     for n in (0, 11, 23):
         f = out.get_frame(n)
         s = src.get_frame(n)
-        assert np.array_equal(_plane(f, 0, WIDTH, HEIGHT), _plane(s, 0, WIDTH, HEIGHT)), \
+        assert np.array_equal(_plane(f, 0, WIDTH, HEIGHT), _plane(s, 0, WIDTH, HEIGHT)), (
             f"luma changed at frame {n}"
+        )
         for p in (1, 2):
             w, h = src.width >> 1, src.height >> 1
-            assert not np.array_equal(_plane(f, p, w, h), _plane(s, p, w, h)), \
+            assert not np.array_equal(_plane(f, p, w, h), _plane(s, p, w, h)), (
                 f"chroma{p} was not filtered at frame {n}"
+            )
 
 
 # ---------------------------------------------------------------------------
 # Input validation
 # ---------------------------------------------------------------------------
+
 
 def test_dfttest_rejects_bad_ftype(noise_gray):
     with pytest.raises(vs.Error):
@@ -654,8 +694,6 @@ def test_dfttest_rejects_bad_planes(noise_gray):
         _run(noise_gray, planes=[0, 0])
     with pytest.raises(vs.Error):
         _run(noise_gray, planes=[5])
-
-
 
 
 def test_dfttest_rejects_10bit(noise_8bit):

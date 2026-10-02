@@ -77,6 +77,10 @@ class FeelBackend:
     One instance serves every vs-jetpack wrapper: each wrapper only ever
     invokes the entry point matching its own filter, so the same object can be
     passed to ``vsrgtools.bilateral``, ``vsdenoise.bm3d``, ... alike.
+
+    The entry-point methods are deliberately PascalCase: vs-jetpack looks them
+    up by the filter's own name, and ``_dispatch`` forwards the same spelling
+    to ``core.vsfeel``.
     """
 
     value = "vsfeel"
@@ -135,16 +139,16 @@ class FeelBackend:
         plugin_func = getattr(args[0].vsfeel, func)
         return plugin_func(*args[1:], **_drop_unsupported(plugin_func, kwargs))
 
-    def Bilateral(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:  # noqa: N802
+    def Bilateral(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:
         return self._dispatch("Bilateral", (clip, *args), kwargs)
 
-    def NLMeans(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:  # noqa: N802
+    def NLMeans(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:
         return self._dispatch("NLMeans", (clip, *args), kwargs)
 
-    def DFTTest(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:  # noqa: N802
+    def DFTTest(self, clip: vs.VideoNode, *args: Any, **kwargs: Any) -> vs.VideoNode:
         return self._dispatch("DFTTest", (clip, *args), kwargs)
 
-    def EEDI3(  # noqa: N802
+    def EEDI3(
         self,
         clip: vs.VideoNode,
         field: int,
@@ -166,7 +170,7 @@ class FeelBackend:
             aux = {"sclip": sclip}
         return self._dispatch("EEDI3", (clip, field, *args), aux | kwargs)
 
-    def EEDI3H(  # noqa: N802
+    def EEDI3H(
         self,
         clip: vs.VideoNode,
         field: int,

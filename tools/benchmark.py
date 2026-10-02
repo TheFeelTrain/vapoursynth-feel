@@ -55,6 +55,7 @@ DEFAULT_TIMEOUT = 900  # seconds per vspipe run (H1: a hang must not hang the ha
 AA_CACHE_MB = 6144
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+
 def make_vpy(
     clip: str,
     extra: str,
@@ -91,8 +92,7 @@ def make_vpy(
     if synth_format:
         # synthetic clip: measure pure filter throughput, no decode bottleneck
         clip_expr = (
-            "core.std.BlankClip(width=1920, height=1080, "
-            f"format={synth_format}, length={frames})"
+            f"core.std.BlankClip(width=1920, height=1080, format={synth_format}, length={frames})"
         )
         cache_setup = ""
         gpu_lines = "clip_gpu = core.std.GPUUpload(clip=clip)\n" if gpu_cache else ""
@@ -110,11 +110,15 @@ def make_vpy(
         # The GPU copy of the cache is whole frames in VRAM, so it gets a byte
         # budget of its own; both caches then serve the same span.
         size_lines = (
-            "_fbytes = (clip.width * clip.height * clip.format.bytes_per_sample\n"
-            "           * clip.format.num_planes)\n"
-            f"_cap = max(1, {gpu_cache_mb} * 1024 * 1024 // _fbytes)\n"
-            f"m = min({cache_frames}, _cap, clip.num_frames)\n"
-        ) if (gpu_cache and gpu_cache_mb) else f"m = min({cache_frames}, clip.num_frames)\n"
+            (
+                "_fbytes = (clip.width * clip.height * clip.format.bytes_per_sample\n"
+                "           * clip.format.num_planes)\n"
+                f"_cap = max(1, {gpu_cache_mb} * 1024 * 1024 // _fbytes)\n"
+                f"m = min({cache_frames}, _cap, clip.num_frames)\n"
+            )
+            if (gpu_cache and gpu_cache_mb)
+            else f"m = min({cache_frames}, clip.num_frames)\n"
+        )
         # The cap has to be measured on the cached format, so with --gpu-cache
         # the conversion comes first; without it the order is unchanged.
         if gpu_cache:
@@ -150,8 +154,7 @@ def make_vpy(
         # before its upload): `clip_gpu` has to be the frames the chain would
         # otherwise read, format and depth included, not the raw source.
         conv = f"clip = {cache_conv}\n" if (gpu_cache and cache_conv) else ""
-        gpu_lines = (conv + "clip_gpu = core.std.GPUUpload(clip=clip)\n"
-                     if gpu_cache else "")
+        gpu_lines = conv + "clip_gpu = core.std.GPUUpload(clip=clip)\n" if gpu_cache else ""
     return f"""\
 from vssource import BestSource
 from vstools import core, depth, get_y
@@ -171,11 +174,13 @@ clip = {clip_expr}
 {chain}.set_output()
 """
 
+
 # ---------------------------------------------------------------------------
 # AA-style vpy (EEDI3 anti-aliasing benchmark, mirrors vsaa.based_aa)
 # ---------------------------------------------------------------------------
 
 AA_MASK_BITS = 16  # mask/depth chain runs at 16-bit like the ss clip
+
 
 def make_aa_vpy(
     clip: str,
@@ -252,8 +257,9 @@ def make_aa_vpy(
                 f"mclip_gpu = (_gpu_msk * -(-{frames} // m)).std.Trim(0, {frames} - 1)\n"
                 f"sclip_gpu = {{sclip_expr}}\n"
             ) + names
-            gpu_sclip = ("core.std.Interleave([clip_gpu, clip_gpu])"
-                         if eedi3_field > 1 else "clip_gpu")
+            gpu_sclip = (
+                "core.std.Interleave([clip_gpu, clip_gpu])" if eedi3_field > 1 else "clip_gpu"
+            )
             cache_build = cache_build.replace("{sclip_expr}", gpu_sclip)
         else:
             cache_build = (
@@ -279,8 +285,9 @@ sclip = {"core.std.Interleave([clip, clip])" if eedi3_field > 1 else "clip"}
         # but --gpu-cache still has to put the live frames on the device or the
         # run is reported as GPU-fed while the graph holds no GPU node at all.
         if gpu_cache:
-            gpu_sclip = ("core.std.Interleave([clip_gpu, clip_gpu])"
-                         if eedi3_field > 1 else "clip_gpu")
+            gpu_sclip = (
+                "core.std.Interleave([clip_gpu, clip_gpu])" if eedi3_field > 1 else "clip_gpu"
+            )
             if download_inputs:
                 names = (
                     "clip = core.std.GPUDownload(clip=clip_gpu)\n"
@@ -339,6 +346,7 @@ mclip = core.resize.Point(mask, mask.width * 2, mask.height * 2)
 # Plugin registry
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Plugin:
     name: str
@@ -354,7 +362,7 @@ PLUGINS = {
     "bm3dhip": Plugin("bm3dhip"),
     "nlm_hip": Plugin("nlm_hip"),
     "bm3dvk": Plugin("bm3dvk"),
-    "knlmvk": Plugin("knlmvk")
+    "knlmvk": Plugin("knlmvk"),
 }
 
 
@@ -367,13 +375,12 @@ def _plugin_loader(plugin: str) -> str:
     """
     if plugin not in PLUGINS:
         raise SystemExit(
-            f"unknown plugin {plugin!r}: not in PLUGINS "
-            f"({', '.join(sorted(PLUGINS))})")
+            f"unknown plugin {plugin!r}: not in PLUGINS ({', '.join(sorted(PLUGINS))})"
+        )
     return PLUGINS[plugin].loader or ""
 
 
-def resolve_plugins(requested: list[str], calls: dict[str, str],
-                    title: str) -> list[str]:
+def resolve_plugins(requested: list[str], calls: dict[str, str], title: str) -> list[str]:
     """Filter ``requested`` down to the plugins that provide this filter.
 
     Unknown names and plugins that do not implement the filter are reported on
@@ -393,6 +400,7 @@ def resolve_plugins(requested: list[str], calls: dict[str, str],
 # ---------------------------------------------------------------------------
 # Filter registry
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class Arg:
@@ -452,19 +460,16 @@ def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
     return {
         "vsfeel": f"core.vsfeel.BM3Dv2({clip}, {common})",
         "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {common})",
-        "bm3dvk": f"core.bm3dvk.BM3Dv2({clip}, {common})"
+        "bm3dvk": f"core.bm3dvk.BM3Dv2({clip}, {common})",
     }
 
 
 def _bilateral_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
-    args = (
-        f"sigma_spatial={ns.bilateral_sigma_spatial}, "
-        f"sigma_color={ns.bilateral_sigma_color}"
-    )
+    args = f"sigma_spatial={ns.bilateral_sigma_spatial}, sigma_color={ns.bilateral_sigma_color}"
     return {
         "vsfeel": f"core.vsfeel.Bilateral({clip}, {args})",
         "vszipcl": f"core.vszipcl.Bilateral({clip}, {args})",
-        "vszipcu": f"core.vszipcu.Bilateral({clip}, {args})"
+        "vszipcu": f"core.vszipcu.Bilateral({clip}, {args})",
     }
 
 
@@ -489,7 +494,7 @@ def _dfttest_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
     return {
         "vsfeel": f"core.vsfeel.DFTTest({clip}, {args})",
         "vszipcl": f"core.vszipcl.DFTTest({clip}, {args})",
-        "vszipcu": f"core.vszipcu.DFTTest({clip}, {args})"
+        "vszipcu": f"core.vszipcu.DFTTest({clip}, {args})",
     }
 
 
@@ -531,7 +536,7 @@ def _eedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[st
         return {
             "vsfeel": f"core.vsfeel.EEDI3({clip}, {common})",
             "eedi3vk2": f"core.eedi3vk2.EEDI3({clip}, {common})",
-            "vszipcl": f"core.vszipcl.EEDI3({clip}, {common})"
+            "vszipcl": f"core.vszipcl.EEDI3({clip}, {common})",
         }
     if use_mclip:
         mcap = "sclip=sclip, mclip=mclip"
@@ -542,7 +547,7 @@ def _eedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[st
     return {
         "vsfeel": f"core.vsfeel.EEDI3({clip}, {with_mclip})",
         "eedi3vk2": f"core.eedi3vk2.EEDI3({clip}, {with_mclip})",
-        "vszipcl": f"core.vszipcl.EEDI3({clip}, {with_sclip})"
+        "vszipcl": f"core.vszipcl.EEDI3({clip}, {with_sclip})",
     }
 
 
@@ -620,7 +625,8 @@ def _eedi3aa_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
         # merges); a single-rate field has no fused form to grade.
         raise SystemExit(
             "the eedi3aa benchmark grades the double-rate chain only "
-            f"(field 2 or 3), got --eedi3-field {field}")
+            f"(field 2 or 3), got --eedi3-field {field}"
+        )
     # vsfeel's plugin takes the three thresholds separately; the vsaa
     # antialiaser carries based_aa's `vthresh=(v0, v1, v2)` object field and
     # expands it itself.
@@ -661,9 +667,7 @@ def _eedi3aa_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
     aux = "sclip=sclip, mclip=mclip" if use_mclip else "sclip=sclip"
     aa_aux = "sclip=clip" + (", mclip=mclip" if use_mclip else "")
     out: dict[str, str] = {
-        "vsfeel": (
-            f"core.vsfeel.EEDI3AA({clip}, field={field}, {common_plugin}, {aux})"
-        ),
+        "vsfeel": (f"core.vsfeel.EEDI3AA({clip}, field={field}, {common_plugin}, {aux})"),
     }
     for p in ("eedi3vk2", "vszipcl", "vszipcu"):
         member = _vsaa_eedi3_backend(p)
@@ -714,7 +718,9 @@ FILTERS: dict[str, FilterSpec] = {
         title="Bilateral",
         default_frames=5000,
         args=[
-            Arg("sigma_spatial", "--bilateral-sigma-spatial", "bilateral_sigma_spatial", float, 3.0),
+            Arg(
+                "sigma_spatial", "--bilateral-sigma-spatial", "bilateral_sigma_spatial", float, 3.0
+            ),
             Arg("sigma_color", "--bilateral-sigma-color", "bilateral_sigma_color", float, 0.02),
         ],
         build=_bilateral_build,
@@ -795,8 +801,14 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("vthresh0", "--eedi3-vthresh0", "eedi3_vthresh0", float, 12.0),
             Arg("vthresh1", "--eedi3-vthresh1", "eedi3_vthresh1", float, 24.0),
             Arg("vthresh2", "--eedi3-vthresh2", "eedi3_vthresh2", float, 4.0),
-            Arg("mclip", "--eedi3-mclip", "eedi3_mclip", _str_to_bool, True,  # pyright: ignore[reportArgumentType]
-                "pass the vsaa edge mask as mclip to vsfeel/eedi3vk2 (default: true)"),
+            Arg(
+                "mclip",
+                "--eedi3-mclip",
+                "eedi3_mclip",
+                _str_to_bool,
+                True,  # pyright: ignore[reportArgumentType]
+                "pass the vsaa edge mask as mclip to vsfeel/eedi3vk2 (default: true)",
+            ),
         ],
         build=_eedi3_build,
         # Real runs mirror vsaa.based_aa: source at 16-bit, vsaa edge mask,
@@ -822,8 +834,14 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("vthresh0", "--eedi3-vthresh0", "eedi3_vthresh0", float, 12.0),
             Arg("vthresh1", "--eedi3-vthresh1", "eedi3_vthresh1", float, 24.0),
             Arg("vthresh2", "--eedi3-vthresh2", "eedi3_vthresh2", float, 4.0),
-            Arg("mclip", "--eedi3-mclip", "eedi3_mclip", _str_to_bool, True,  # pyright: ignore[reportArgumentType]
-                "pass the vsaa edge mask as mclip to vsfeel (default: true)"),
+            Arg(
+                "mclip",
+                "--eedi3-mclip",
+                "eedi3_mclip",
+                _str_to_bool,
+                True,  # pyright: ignore[reportArgumentType]
+                "pass the vsaa edge mask as mclip to vsfeel (default: true)",
+            ),
         ],
         build=_eedi3h_build,
         input="depth(get_y(clip), 16)",
@@ -847,8 +865,14 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("vthresh0", "--eedi3-vthresh0", "eedi3_vthresh0", float, 12.0),
             Arg("vthresh1", "--eedi3-vthresh1", "eedi3_vthresh1", float, 24.0),
             Arg("vthresh2", "--eedi3-vthresh2", "eedi3_vthresh2", float, 4.0),
-            Arg("mclip", "--eedi3-mclip", "eedi3_mclip", _str_to_bool, True,  # pyright: ignore[reportArgumentType]
-                "pass the vsaa edge mask as mclip (default: true)"),
+            Arg(
+                "mclip",
+                "--eedi3-mclip",
+                "eedi3_mclip",
+                _str_to_bool,
+                True,  # pyright: ignore[reportArgumentType]
+                "pass the vsaa edge mask as mclip (default: true)",
+            ),
         ],
         build=_eedi3aa_build,
         # Grades the whole based_aa EEDI3 chain: vsfeel's fused call against
@@ -884,8 +908,7 @@ FILTERS: dict[str, FilterSpec] = {
 # vspipe timing
 # ---------------------------------------------------------------------------
 
-_FPS_RE = re.compile(
-    r"Output\s+(\d+)\s+frames?\s+in\s+[\d.]+\s+seconds?\s+\(([\d.]+)\s*fps\)")
+_FPS_RE = re.compile(r"Output\s+(\d+)\s+frames?\s+in\s+[\d.]+\s+seconds?\s+\(([\d.]+)\s*fps\)")
 
 
 def _tail(text: str | bytes | None, lines: int = 15) -> str:
@@ -935,12 +958,10 @@ def run_vspipe(vpy_path: Path, frames: int, timeout: float = DEFAULT_TIMEOUT) ->
     other than the one requested — timing a different amount of work than the
     header advertises is not a measurement.
     """
-    cmd = [vspipe_binary(), "--start", "0", "--end", str(frames - 1),
-           str(vpy_path), "/dev/null"]
+    cmd = [vspipe_binary(), "--start", "0", "--end", str(frames - 1), str(vpy_path), "/dev/null"]
     env = vspipe_env()
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=timeout, env=env)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired as exc:
         print(f"  [vspipe timed out after {timeout:g}s] {vpy_path.name}", file=sys.stderr)
         tail = _tail(exc.stderr)
@@ -966,16 +987,25 @@ def run_vspipe(vpy_path: Path, frames: int, timeout: float = DEFAULT_TIMEOUT) ->
         return None
     got, fps = int(match.group(1)), float(match.group(2))
     if got != frames:
-        print(f"  [vspipe reported {got} frames, expected {frames}] {vpy_path.name}",
-              file=sys.stderr)
+        print(
+            f"  [vspipe reported {got} frames, expected {frames}] {vpy_path.name}", file=sys.stderr
+        )
         return None
     return fps
 
 
-def bench(plugin: str, chain: str, clip: str, frames: int, synth_format: str | None,
-          cache_frames: int | None = None, cache_conv: str | None = None,
-          timeout: float = DEFAULT_TIMEOUT, gpu_cache: bool = False,
-          gpu_cache_mb: int | None = None) -> float | None:
+def bench(
+    plugin: str,
+    chain: str,
+    clip: str,
+    frames: int,
+    synth_format: str | None,
+    cache_frames: int | None = None,
+    cache_conv: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    gpu_cache: bool = False,
+    gpu_cache_mb: int | None = None,
+) -> float | None:
     vpy = make_vpy(
         clip=clip,
         extra=_plugin_loader(plugin),
@@ -993,14 +1023,19 @@ def bench(plugin: str, chain: str, clip: str, frames: int, synth_format: str | N
         return run_vspipe(path, frames, timeout)
 
 
-def bench_aa(plugin: str, chain: str, clip: str, frames: int,
-             cache_frames: int | None = None,
-             eedi3_field: int = 3,
-             bits: int = AA_MASK_BITS,
-             cache_bytes: int | None = None,
-             timeout: float = DEFAULT_TIMEOUT,
-             gpu_cache: bool = False,
-             download_inputs: bool = False) -> float | None:
+def bench_aa(
+    plugin: str,
+    chain: str,
+    clip: str,
+    frames: int,
+    cache_frames: int | None = None,
+    eedi3_field: int = 3,
+    bits: int = AA_MASK_BITS,
+    cache_bytes: int | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    gpu_cache: bool = False,
+    download_inputs: bool = False,
+) -> float | None:
     """Run an EEDI3 anti-aliasing style benchmark (see make_aa_vpy)."""
     vpy = make_aa_vpy(
         clip=clip,
@@ -1030,8 +1065,7 @@ def _fmt_stats(values: list[float]) -> str:
         return f"{values[0]:9.2f} fps  [n=1 (--repeat 1 has no spread)]"
     median, lo, hi = _stats(values)
     spread = 100.0 * (hi - lo) / median if median else 0.0
-    return (f"{median:9.2f} fps  [min {lo:8.2f} max {hi:8.2f} "
-            f"spread {spread:4.1f}%] n={len(values)}")
+    return f"{median:9.2f} fps  [min {lo:8.2f} max {hi:8.2f} spread {spread:4.1f}%] n={len(values)}"
 
 
 def args_desc(spec: FilterSpec, ns: argparse.Namespace) -> str:
@@ -1044,8 +1078,7 @@ def _format_for_bits(fmt: str, bits: int) -> str:
     bit depth (GRAYS <-> GRAY16, YUV420PS <-> YUV420P16, ...)."""
     m = re.match(r"^(vs\.[A-Za-z0-9]+?)(S|16|PS|P16)$", fmt)
     if not m:
-        raise SystemExit(
-            f"--bits {bits}: cannot map synthetic format {fmt!r} to {bits}-bit")
+        raise SystemExit(f"--bits {bits}: cannot map synthetic format {fmt!r} to {bits}-bit")
     base = m.group(1)
     suffix = "16" if bits == 16 else "S"
     if not base.endswith("GRAY"):
@@ -1056,8 +1089,7 @@ def _format_for_bits(fmt: str, bits: int) -> str:
 def _input_for_bits(expr: str, bits: int) -> str:
     """Override the depth argument of the cache-conversion expression
     (``depth(X, N)`` -> ``depth(X, bits)``)."""
-    return re.sub(r"depth\(([^,]+), \d+\)",
-                  lambda m: f"depth({m.group(1)}, {bits})", expr)
+    return re.sub(r"depth\(([^,]+), \d+\)", lambda m: f"depth({m.group(1)}, {bits})", expr)
 
 
 def _input_on(expr: str, clip: str) -> str:
@@ -1071,22 +1103,30 @@ def _input_on(expr: str, clip: str) -> str:
     return re.sub(r"\bclip\b", clip, expr)
 
 
-def _cache_desc(spec: FilterSpec, ns: argparse.Namespace, synth: str | None,
-                cache_frames: int | None) -> str:
+def _cache_desc(
+    spec: FilterSpec, ns: argparse.Namespace, synth: str | None, cache_frames: int | None
+) -> str:
     if synth is not None:
         return "cache: N/A (BlankClip)"
     if cache_frames is None:
         return "cache: N/A"
     if spec.aa:
-        return (f"cache: 2x luma+mclip"
-                f"{ns.aa_cache_mb} MiB byte budget")
+        return f"cache: 2x luma+mclip{ns.aa_cache_mb} MiB byte budget"
     return f"cache: first {cache_frames} frames"
 
 
-def _run_once(spec: FilterSpec, ns: argparse.Namespace, plugin: str, chain: str,
-              frames: int, synth: str | None, cache_frames: int | None,
-              cache_conv: str | None, gpu_cache: bool = False,
-              download_inputs: bool = False) -> float | None:
+def _run_once(
+    spec: FilterSpec,
+    ns: argparse.Namespace,
+    plugin: str,
+    chain: str,
+    frames: int,
+    synth: str | None,
+    cache_frames: int | None,
+    cache_conv: str | None,
+    gpu_cache: bool = False,
+    download_inputs: bool = False,
+) -> float | None:
     """One timed vspipe run of one plugin: the repeat/interleave unit.
 
     `gpu_cache` says this arm's chain consumes device-resident frames, so the
@@ -1096,16 +1136,36 @@ def _run_once(spec: FilterSpec, ns: argparse.Namespace, plugin: str, chain: str,
     """
     if spec.aa and synth is None:
         budget = ns.aa_cache_mb * 1024 * 1024 if ns.aa_cache_mb else None
-        return bench_aa(plugin, chain, ns.clip, frames, cache_frames,
-                        getattr(ns, "eedi3_field", 3), ns.bits or AA_MASK_BITS,
-                        budget, ns.timeout, gpu_cache=gpu_cache,
-                        download_inputs=download_inputs)
-    return bench(plugin, chain, ns.clip, frames, synth, cache_frames, cache_conv,
-                 ns.timeout, gpu_cache=gpu_cache, gpu_cache_mb=ns.gpu_cache_mb)
+        return bench_aa(
+            plugin,
+            chain,
+            ns.clip,
+            frames,
+            cache_frames,
+            getattr(ns, "eedi3_field", 3),
+            ns.bits or AA_MASK_BITS,
+            budget,
+            ns.timeout,
+            gpu_cache=gpu_cache,
+            download_inputs=download_inputs,
+        )
+    return bench(
+        plugin,
+        chain,
+        ns.clip,
+        frames,
+        synth,
+        cache_frames,
+        cache_conv,
+        ns.timeout,
+        gpu_cache=gpu_cache,
+        gpu_cache_mb=ns.gpu_cache_mb,
+    )
 
 
-def _resolve_pair(ns: argparse.Namespace, calls: dict[str, str],
-                  plugins: list[str], title: str) -> list[str]:
+def _resolve_pair(
+    ns: argparse.Namespace, calls: dict[str, str], plugins: list[str], title: str
+) -> list[str]:
     """``--pair``: keep only the vsfeel arm and one reference."""
     if ns.pair is None:
         return plugins
@@ -1171,7 +1231,8 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
             # rather than `depth(get_y(clip), N)`.
             gpu_calls = spec.build(ns, _input_on(input_expr, "clip_gpu"), spec)
             dl_calls = spec.build(
-                ns, _input_on(input_expr, "core.std.GPUDownload(clip=clip_gpu)"), spec)
+                ns, _input_on(input_expr, "core.std.GPUDownload(clip=clip_gpu)"), spec
+            )
             for p in calls:
                 calls[p] = gpu_calls[p] if p in spec.gpu_plugins else dl_calls[p]
     plugins = resolve_plugins(ns.plugins or list(calls), calls, spec.title)
@@ -1180,19 +1241,29 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
         sys.exit(f"no valid plugins requested for --filter {ns.filter}")
     print(f"{spec.title} benchmark | {frames} frames | clip: {clip_desc}{bits_desc}")
     print(f"args: {args_desc(spec, ns)}")
-    print(f"{_cache_desc(spec, ns, synth, cache_frames)} | "
-          f"repeat: {ns.repeat} | timeout: {ns.timeout:g}s\n")
+    print(
+        f"{_cache_desc(spec, ns, synth, cache_frames)} | "
+        f"repeat: {ns.repeat} | timeout: {ns.timeout:g}s\n"
+    )
 
     runs: dict[str, list[float]] = {p: [] for p in plugins}
     for r in range(ns.repeat):
         # Alternate the plugin order between repeats so clock/thermal drift
         # is shared between the arms instead of favouring the first one.
         reverse = ns.interleave and r % 2 == 1
-        for plugin in (list(reversed(plugins)) if reverse else plugins):
-            fps = _run_once(spec, ns, plugin, calls[plugin], frames, synth,
-                            cache_frames, cache_conv,
-                            gpu_cache=plugin in gpu_arms,
-                            download_inputs=plugin in download_arms)
+        for plugin in list(reversed(plugins)) if reverse else plugins:
+            fps = _run_once(
+                spec,
+                ns,
+                plugin,
+                calls[plugin],
+                frames,
+                synth,
+                cache_frames,
+                cache_conv,
+                gpu_cache=plugin in gpu_arms,
+                download_inputs=plugin in download_arms,
+            )
             if fps is not None:
                 runs[plugin].append(fps)
     for plugin in plugins:
@@ -1208,8 +1279,8 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
         print(f"  pair: {a} {ma:9.2f} fps vs {b} {mb:9.2f} fps -> {ma / mb:.3f}x\n")
 
     valid = sorted(
-        ((p, statistics.median(v)) for p, v in runs.items() if v),
-        key=lambda x: x[1], reverse=True)
+        ((p, statistics.median(v)) for p, v in runs.items() if v), key=lambda x: x[1], reverse=True
+    )
     if len(valid) > 1:
         for rank, (plugin, fps) in enumerate(valid, 1):
             print(f"  {rank}. {plugin:10s} {fps:9.2f} fps")
@@ -1219,6 +1290,7 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 # Freshness: never benchmark a stale plugin binary
 # ---------------------------------------------------------------------------
+
 
 def _default_plugin_so() -> Path | None:
     """Installed libvsfeel.so path, discovered without importing the core."""
@@ -1250,11 +1322,15 @@ def check_fresh(install_so: Path | None, build_so: Path | None) -> None:
     if not build.exists():
         sys.exit(f"--check-fresh: built plugin not found: {build} (build first)")
     if _sha256(build) != _sha256(install_so):
-        sys.exit(f"--check-fresh: {install_so} differs from {build}; "
-                 "copy the built .so into the plugin directory")
-    stale = [p for p in sorted(REPO_ROOT.glob("src/*"))
-             if p.suffix in (".cpp", ".h", ".comp")
-             and p.stat().st_mtime > build.stat().st_mtime]
+        sys.exit(
+            f"--check-fresh: {install_so} differs from {build}; "
+            "copy the built .so into the plugin directory"
+        )
+    stale = [
+        p
+        for p in sorted(REPO_ROOT.glob("src/*"))
+        if p.suffix in (".cpp", ".h", ".comp") and p.stat().st_mtime > build.stat().st_mtime
+    ]
     if (REPO_ROOT / "CMakeLists.txt").stat().st_mtime > build.stat().st_mtime:
         stale.append(REPO_ROOT / "CMakeLists.txt")
     if stale:
@@ -1267,68 +1343,137 @@ def check_fresh(install_so: Path | None, build_so: Path | None) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark vsfeel filters against the reference implementations."
     )
-    parser.add_argument("plugins", nargs="*",
-                        help="plugins to run (default: every plugin providing the filter)")
-    parser.add_argument("-f", "--filter", choices=[*FILTERS, "all"], default="all",
-                        help="filter to benchmark (default: all)")
-    parser.add_argument("--frames", type=int, default=None,
-                        help="frames to time (default: per-filter, see FILTERS)")
+    parser.add_argument(
+        "plugins", nargs="*", help="plugins to run (default: every plugin providing the filter)"
+    )
+    parser.add_argument(
+        "-f",
+        "--filter",
+        choices=[*FILTERS, "all"],
+        default="all",
+        help="filter to benchmark (default: all)",
+    )
+    parser.add_argument(
+        "--frames", type=int, default=None, help="frames to time (default: per-filter, see FILTERS)"
+    )
     parser.add_argument("--clip", default=DEFAULT_CLIP, help="input clip path")
-    parser.add_argument("--synthetic", action="store_true",
-                        help="use a synthetic 1920x1080 BlankClip instead of --clip "
-                             "(decoder-independent, measures pure filter throughput)")
-    parser.add_argument("--bits", type=int, choices=(16, 32), default=None,
-                        help="benchmark the 16-bit or 32-bit input path: with "
-                             "--synthetic this swaps the BlankClip format, otherwise "
-                             "it overrides the cached-frame conversion depth "
-                             "(default: each filter's configured depth)")
-    parser.add_argument("--cache", dest="cached", action="store_true", default=True,
-                        help="default mode: decode the first --cache-frames frames of the real clip "
-                             "into RAM before vspipe starts timing (removes the BestSource bottleneck "
-                             "while keeping real content; frames loop to reach --frames)")
-    parser.add_argument("--no-cache", dest="cached", action="store_false",
-                        help="decode live during timing instead (measures the full chain, "
-                             "bottlenecked by BestSource at ~630 fps)")
-    parser.add_argument("--cache-frames", type=int, default=1000,
-                        help="number of leading frames to preload with --cache (default: 1000)")
-    parser.add_argument("--gpu-cache", action="store_true",
-                        help="preload the cached frames on the device and hand them to every "
-                             "arm, so the run matches a chain whose upstream node is a GPU "
-                             "filter. Filters taking vnode:gpu input consume them directly; "
-                             "every other plugin gets them through std.GPUDownload and pays "
-                             "that transfer, as it would mid-chain")
-    parser.add_argument("--gpu-cache-mb", type=int, default=6144,
-                        help="VRAM budget for --gpu-cache frames; the cached span is capped "
-                             "to what fits, for both caches (default: 6144)")
-    parser.add_argument("--repeat", "--repeats", dest="repeat", type=int, default=3,
-                        help="timed runs per plugin; the median is reported with "
-                             "min/max/spread and the plugin order alternates "
-                             "(default: 3)")
-    parser.add_argument("--no-interleave", dest="interleave", action="store_false",
-                        help="do not alternate the plugin order between repeats "
-                             "(interleaving is on by default)")
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
-                        help=f"kill a vspipe run after this many seconds "
-                             f"(default: {DEFAULT_TIMEOUT:g})")
-    parser.add_argument("--pair", nargs="?", const="auto", default=None, metavar="PLUGIN",
-                        help="same-session pairing: run only vsfeel and one "
-                             "reference (default: the first requested reference) "
-                             "back-to-back and print the fps ratio")
-    parser.add_argument("--aa-cache-mb", type=int, default=AA_CACHE_MB,
-                        help="byte budget for the EEDI3 AA Python cache, in MiB "
-                             f"(default: {AA_CACHE_MB}); this budget is in addition "
-                             "to VapourSynth's own frame cache")
-    parser.add_argument("--check-fresh", action="store_true",
-                        help="refuse to run unless the installed .so matches the "
-                             "build and is newer than every source")
-    parser.add_argument("--vsfeel-so", type=Path, default=None,
-                        help="path to the installed libvsfeel.so (default: discovered)")
-    parser.add_argument("--build-so", type=Path, default=None,
-                        help="path to build/libvsfeel.so (default: build/<installed name>)")
+    parser.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="use a synthetic 1920x1080 BlankClip instead of --clip "
+        "(decoder-independent, measures pure filter throughput)",
+    )
+    parser.add_argument(
+        "--bits",
+        type=int,
+        choices=(16, 32),
+        default=None,
+        help="benchmark the 16-bit or 32-bit input path: with "
+        "--synthetic this swaps the BlankClip format, otherwise "
+        "it overrides the cached-frame conversion depth "
+        "(default: each filter's configured depth)",
+    )
+    parser.add_argument(
+        "--cache",
+        dest="cached",
+        action="store_true",
+        default=True,
+        help="default mode: decode the first --cache-frames frames of the real clip "
+        "into RAM before vspipe starts timing (removes the BestSource bottleneck "
+        "while keeping real content; frames loop to reach --frames)",
+    )
+    parser.add_argument(
+        "--no-cache",
+        dest="cached",
+        action="store_false",
+        help="decode live during timing instead (measures the full chain, "
+        "bottlenecked by BestSource at ~630 fps)",
+    )
+    parser.add_argument(
+        "--cache-frames",
+        type=int,
+        default=1000,
+        help="number of leading frames to preload with --cache (default: 1000)",
+    )
+    parser.add_argument(
+        "--gpu-cache",
+        action="store_true",
+        help="preload the cached frames on the device and hand them to every "
+        "arm, so the run matches a chain whose upstream node is a GPU "
+        "filter. Filters taking vnode:gpu input consume them directly; "
+        "every other plugin gets them through std.GPUDownload and pays "
+        "that transfer, as it would mid-chain",
+    )
+    parser.add_argument(
+        "--gpu-cache-mb",
+        type=int,
+        default=6144,
+        help="VRAM budget for --gpu-cache frames; the cached span is capped "
+        "to what fits, for both caches (default: 6144)",
+    )
+    parser.add_argument(
+        "--repeat",
+        "--repeats",
+        dest="repeat",
+        type=int,
+        default=3,
+        help="timed runs per plugin; the median is reported with "
+        "min/max/spread and the plugin order alternates "
+        "(default: 3)",
+    )
+    parser.add_argument(
+        "--no-interleave",
+        dest="interleave",
+        action="store_false",
+        help="do not alternate the plugin order between repeats (interleaving is on by default)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help=f"kill a vspipe run after this many seconds (default: {DEFAULT_TIMEOUT:g})",
+    )
+    parser.add_argument(
+        "--pair",
+        nargs="?",
+        const="auto",
+        default=None,
+        metavar="PLUGIN",
+        help="same-session pairing: run only vsfeel and one "
+        "reference (default: the first requested reference) "
+        "back-to-back and print the fps ratio",
+    )
+    parser.add_argument(
+        "--aa-cache-mb",
+        type=int,
+        default=AA_CACHE_MB,
+        help="byte budget for the EEDI3 AA Python cache, in MiB "
+        f"(default: {AA_CACHE_MB}); this budget is in addition "
+        "to VapourSynth's own frame cache",
+    )
+    parser.add_argument(
+        "--check-fresh",
+        action="store_true",
+        help="refuse to run unless the installed .so matches the "
+        "build and is newer than every source",
+    )
+    parser.add_argument(
+        "--vsfeel-so",
+        type=Path,
+        default=None,
+        help="path to the installed libvsfeel.so (default: discovered)",
+    )
+    parser.add_argument(
+        "--build-so",
+        type=Path,
+        default=None,
+        help="path to build/libvsfeel.so (default: build/<installed name>)",
+    )
 
     # Filters may share CLI flags (eedi3 and eedi3aa expose the same EEDI3
     # surface); register each flag once.
@@ -1338,8 +1483,9 @@ def parse_args() -> argparse.Namespace:
             if arg.flag in seen_flags:
                 continue
             seen_flags.add(arg.flag)
-            parser.add_argument(arg.flag, dest=arg.dest, type=arg.type,
-                                default=arg.default, help=arg.help)
+            parser.add_argument(
+                arg.flag, dest=arg.dest, type=arg.type, default=arg.default, help=arg.help
+            )
 
     return parser.parse_args()
 
@@ -1350,8 +1496,10 @@ def main() -> None:
     # to a synthetic BlankClip instead of failing on a missing path. An
     # explicit --clip still has to exist.
     if ns.clip == DEFAULT_CLIP and not Path(ns.clip).exists() and not ns.synthetic:
-        print(f"note: default clip {DEFAULT_CLIP!r} not found; "
-              "using --synthetic BlankClip instead", file=sys.stderr)
+        print(
+            f"note: default clip {DEFAULT_CLIP!r} not found; using --synthetic BlankClip instead",
+            file=sys.stderr,
+        )
         ns.synthetic = True
     ns.clip = str(Path(ns.clip).expanduser().resolve())
     if not ns.synthetic and not Path(ns.clip).is_file():

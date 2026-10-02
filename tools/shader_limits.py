@@ -61,11 +61,11 @@ class Module:
         self.words = struct.unpack("<%dI" % (len(data) // 4), data)
         if self.words[0] != SPIRV_MAGIC:
             raise ValueError("not a SPIR-V module")
-        self.types = {}        # id -> (opcode, operands)
-        self.constants = {}    # id -> int
+        self.types = {}  # id -> (opcode, operands)
+        self.constants = {}  # id -> int
         self.spec_ids = set()
-        self.variables = []    # (type id, storage class)
-        self.composites = {}   # id -> constituent ids
+        self.variables = []  # (type id, storage class)
+        self.composites = {}  # id -> constituent ids
         self.local_size_ids = None
         self.local_size = None
         self.workgroup_size_id = None
@@ -79,16 +79,19 @@ class Module:
             count, op = w[i] >> 16, w[i] & 0xFFFF
             if count == 0:
                 break
-            a = list(w[i + 1:i + count])
+            a = list(w[i + 1 : i + count])
             if op in range(OP_TYPE_VOID, OP_TYPE_POINTER + 1):
                 self.types[a[0]] = (op, a)
             elif op == OP_CONSTANT:
                 self.constants[a[1]] = a[2]
             elif op in (OP_CONSTANT_COMPOSITE, OP_SPEC_CONSTANT_COMPOSITE):
                 self.composites[a[1]] = a[2:]
-            elif (op == OP_DECORATE and len(a) >= 3 and
-                  a[1] == DECORATION_BUILTIN and
-                  a[2] == BUILTIN_WORKGROUP_SIZE):
+            elif (
+                op == OP_DECORATE
+                and len(a) >= 3
+                and a[1] == DECORATION_BUILTIN
+                and a[2] == BUILTIN_WORKGROUP_SIZE
+            ):
                 self.workgroup_size_id = a[0]
             elif op == OP_SPEC_CONSTANT:
                 self.spec_ids.add(a[1])
@@ -195,20 +198,29 @@ def embedded_variants(header):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("pattern", nargs="?", default="build/vk_spv/*.spv",
-                    help="glob of SPIR-V files (default: build/vk_spv/*.spv)")
-    ap.add_argument("-v", "--verbose", action="store_true",
-                    help="list each Workgroup variable and its size")
-    ap.add_argument("--header", default="build/spirv_binaries.h",
-                    help="generated header naming the embedded variants; a "
-                         ".spv missing from it is marked stale (default: "
-                         "build/spirv_binaries.h)")
+    ap.add_argument(
+        "pattern",
+        nargs="?",
+        default="build/vk_spv/*.spv",
+        help="glob of SPIR-V files (default: build/vk_spv/*.spv)",
+    )
+    ap.add_argument(
+        "-v", "--verbose", action="store_true", help="list each Workgroup variable and its size"
+    )
+    ap.add_argument(
+        "--header",
+        default="build/spirv_binaries.h",
+        help="generated header naming the embedded variants; a "
+        ".spv missing from it is marked stale (default: "
+        "build/spirv_binaries.h)",
+    )
     args = ap.parse_args()
 
     paths = sorted(glob.glob(args.pattern))
     if not paths:
-        print("no SPIR-V matched %r; build first (tools/install.sh)" % args.pattern,
-              file=sys.stderr)
+        print(
+            "no SPIR-V matched %r; build first (tools/install.sh)" % args.pattern, file=sys.stderr
+        )
         return 1
     embedded = embedded_variants(args.header)
 
@@ -227,17 +239,29 @@ def main():
                 invocations *= d
         shared, dynamic = module.shared_bytes()
         name = path.rsplit("/", 1)[-1]
-        stem = name[:-len(".spv")] if name.endswith(".spv") else name
-        stale = "  (stale: not in %s)" % args.header if (
-            embedded is not None and stem not in embedded) else ""
-        print("%-34s %-14s %-6s %s%s%s" % (
-            name, "x".join(str(d) for d in local),
-            invocations if invocations else "-",
-            shared, " +?" if dynamic else "", stale))
+        stem = name[: -len(".spv")] if name.endswith(".spv") else name
+        stale = (
+            "  (stale: not in %s)" % args.header
+            if (embedded is not None and stem not in embedded)
+            else ""
+        )
+        print(
+            "%-34s %-14s %-6s %s%s%s"
+            % (
+                name,
+                "x".join(str(d) for d in local),
+                invocations if invocations else "-",
+                shared,
+                " +?" if dynamic else "",
+                stale,
+            )
+        )
         if args.verbose:
             for type_id, size in module.workgroup_vars():
-                print("%-34s   Workgroup var %%%d: %s" % (
-                    "", type_id, "dynamic" if size is None else "%d B" % size))
+                print(
+                    "%-34s   Workgroup var %%%d: %s"
+                    % ("", type_id, "dynamic" if size is None else "%d B" % size)
+                )
     return 0
 
 

@@ -31,7 +31,9 @@ import pytest
 from conftest import COMPARE_PRELUDE, NOISE_MKV, run_compare_subprocess
 
 # Every filter that needs a 256-invocation workgroup, plus one that fits 128.
-_LIMITS_SCRIPT = COMPARE_PRELUDE + r'''
+_LIMITS_SCRIPT = (
+    COMPARE_PRELUDE
+    + r"""
 import hashlib
 import json
 import sys
@@ -83,7 +85,8 @@ for case in spec["cases"]:
         out[label] = {"error": "%s: %s" % (type(exc).__name__, exc)}
 print("REF ok", flush=True)
 print("RESULT " + json.dumps(out), flush=True)
-'''
+"""
+)
 
 # name -> kwargs; the empty ones just take the filter's defaults.
 _256_KERNELS = ["dfttest", "nlmeans", "eedi3", "nnedi3", "bm3d"]
@@ -92,8 +95,7 @@ _256_KERNELS = ["dfttest", "nlmeans", "eedi3", "nnedi3", "bm3d"]
 def _run_limits(cases, env=None):
     """Run every case in a fresh process, optionally under a limit override."""
     spec = {"source": NOISE_MKV, "cases": cases}
-    return run_compare_subprocess(_LIMITS_SCRIPT, [json.dumps(spec)],
-                                  env=env or {})
+    return run_compare_subprocess(_LIMITS_SCRIPT, [json.dumps(spec)], env=env or {})
 
 
 def test_workgroup_limit_is_reported_per_kernel():
@@ -159,7 +161,7 @@ def test_shared_memory_limit_selects_the_small_predict_tile():
 # the same creation twice: once on the device's real budget, once with the knob
 # forcing a smaller one. Creation only -- no frame is evaluated.
 
-_BUDGET_SCRIPT = r'''
+_BUDGET_SCRIPT = r"""
 import sys
 
 import vapoursynth as vs
@@ -173,15 +175,20 @@ if sys.argv[1] == "eedi3":
 else:
     clip = core.std.BlankClip(width=640, height=360, format=vs.GRAYS, length=3)
     core.vsfeel.NLMeans(clip, d=3)
-'''
+"""
 
 
 def _trace(which, env=None):
     """stderr of a creation run, with that filter's trace flag turned on."""
     trace_flag = "VSFEEL_EEDI3_TRACE" if which == "eedi3" else "VSFEEL_NLMEANS_VRAM"
     run_env = {**os.environ, "MANGOHUD": "0", trace_flag: "1", **(env or {})}
-    proc = subprocess.run([sys.executable, "-c", _BUDGET_SCRIPT, which],
-                          capture_output=True, text=True, timeout=600, env=run_env)
+    proc = subprocess.run(
+        [sys.executable, "-c", _BUDGET_SCRIPT, which],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=run_env,
+    )
     assert proc.returncode == 0, proc.stderr[-2000:]
     return proc.stderr
 
@@ -219,7 +226,8 @@ def test_eedi3_batch_is_capped_by_the_vram_budget():
     # the five the floor used to pick here.
     tiny_mib = scratch * 8
     scratch2, batch2, limit2 = _eedi3_batch(
-        _trace("eedi3", {"VSFEEL_LIMIT_VRAM_BUDGET": str(int(tiny_mib) << 20)}))
+        _trace("eedi3", {"VSFEEL_LIMIT_VRAM_BUDGET": str(int(tiny_mib) << 20)})
+    )
     assert batch2 == 1, (batch2, scratch2, tiny_mib)
     cap2 = min(limit2, tiny_mib) / 16
     assert batch2 * scratch2 <= max(cap2, scratch2) + 1e-6
@@ -233,8 +241,9 @@ def test_nlmeans_ring_is_capped_by_the_vram_budget():
     assert ring <= budget_mib + 1e-6
 
     # A quarter of the tuned ring budget must pack fewer entries per round.
-    ring2, budget2, pack2 = _nlmeans_ring(_trace("nlmeans", {
-        "VSFEEL_LIMIT_VRAM_BUDGET": str(int(budget_mib / 4 * 16) << 20)}))
+    ring2, budget2, pack2 = _nlmeans_ring(
+        _trace("nlmeans", {"VSFEEL_LIMIT_VRAM_BUDGET": str(int(budget_mib / 4 * 16) << 20)})
+    )
     assert pack2 < pack, (pack, pack2, ring, budget_mib)
     # One pack is the floor (a run group has to fit), so a ring smaller than
     # that is not expressible; above it the ring never exceeds the budget.
@@ -251,8 +260,8 @@ def test_nlmeans_pack_is_capped_by_the_grid_z_limit():
     (640x360, d=3 -> qb=8) is well below it, so the banner must show the clamp
     and the frame must still evaluate.
     """
-    rows_per_entry = 2          # d=3: every kk != 0 entry emits a +q and a -q row
-    qb = 8                      # 640x360 is under the qb=8 threshold
+    rows_per_entry = 2  # d=3: every kk != 0 entry emits a +q and a -q row
+    qb = 8  # 640x360 is under the qb=8 threshold
     z_limit = 16
 
     _, _, pack = _nlmeans_ring(_trace("nlmeans"))
@@ -280,31 +289,39 @@ def test_bilateral_auto_lds_gate_falls_back_to_the_plain_kernel():
     params = {"sigma_spatial": 8.0, "sigma_color": 0.15}
     auto = _run_limits(
         [{"label": "auto", "filter": "bilateral", "params": params}],
-        {"VSFEEL_LIMIT_SHARED_MEMORY": "12288"})
+        {"VSFEEL_LIMIT_SHARED_MEMORY": "12288"},
+    )
     plain = _run_limits(
-        [{"label": "plain", "filter": "bilateral",
-          "params": {**params, "use_shared_memory": False}}],
-        {"VSFEEL_LIMIT_SHARED_MEMORY": "12288"})
+        [
+            {
+                "label": "plain",
+                "filter": "bilateral",
+                "params": {**params, "use_shared_memory": False},
+            }
+        ],
+        {"VSFEEL_LIMIT_SHARED_MEMORY": "12288"},
+    )
     assert auto["auto"].get("finite") is True, auto["auto"]
     assert plain["plain"].get("finite") is True, plain["plain"]
-    assert auto["auto"]["sha1"] == plain["plain"]["sha1"], \
+    assert auto["auto"]["sha1"] == plain["plain"]["sha1"], (
         "the auto LDS gate did not select the plain kernel"
+    )
 
     # Anti-vacuity: on the unconstrained device the same config takes the
     # shared kernel, whose wide-radius output differs from the plain one, so a
     # forced limit that changed nothing would leave these hashes equal.
-    shared = _run_limits([{"label": "shared", "filter": "bilateral",
-                           "params": params}])
+    shared = _run_limits([{"label": "shared", "filter": "bilateral", "params": params}])
     assert shared["shared"].get("finite") is True, shared["shared"]
-    assert shared["shared"]["sha1"] != plain["plain"]["sha1"], \
+    assert shared["shared"]["sha1"] != plain["plain"]["sha1"], (
         "the forced LDS limit did not change the selected kernel"
+    )
 
 
 # ---------------------------------------------------------------------------
 # GaussBlur: the fused path's tile vs the guaranteed workgroup memory
 # ---------------------------------------------------------------------------
 
-_GAUSS_SCRIPT = r'''
+_GAUSS_SCRIPT = r"""
 import sys
 
 import vapoursynth as vs
@@ -312,7 +329,7 @@ import vapoursynth as vs
 core = vs.core
 clip = core.std.BlankClip(width=640, height=360, format=vs.GRAYS, length=3)
 core.vsfeel.GaussBlur(clip, sigma=float(sys.argv[1]))
-'''
+"""
 
 
 def _gauss_lds(sigma, env=None):
@@ -323,8 +340,13 @@ def _gauss_lds(sigma, env=None):
     which path each config took.
     """
     run_env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1", **(env or {})}
-    proc = subprocess.run([sys.executable, "-c", _GAUSS_SCRIPT, str(sigma)],
-                          capture_output=True, text=True, timeout=600, env=run_env)
+    proc = subprocess.run(
+        [sys.executable, "-c", _GAUSS_SCRIPT, str(sigma)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=run_env,
+    )
     assert proc.returncode == 0, proc.stderr[-2000:]
     return [int(m) for m in re.findall(r"pipeline gaussblur .* lds=(\d+)", proc.stderr)]
 
@@ -339,10 +361,10 @@ def test_gaussblur_small_path_fits_the_guaranteed_workgroup_memory():
     build time as well), and so the device's own limit stays the check that
     decides which path a config takes.
     """
-    floor = {"VSFEEL_LIMIT_SHARED_MEMORY": "16384"}   # the Vulkan minimum
+    floor = {"VSFEEL_LIMIT_SHARED_MEMORY": "16384"}  # the Vulkan minimum
     lds = [v for sigma in (2.0, 5.0, 8.0, 11.0) for v in _gauss_lds(sigma, floor)]
-    assert 7680 in lds, lds            # the largest tile the small path asks for
-    assert max(lds) <= 16384, lds      # and it fits the floor
+    assert 7680 in lds, lds  # the largest tile the small path asks for
+    assert max(lds) <= 16384, lds  # and it fits the floor
 
 
 # ---------------------------------------------------------------------------
@@ -395,16 +417,18 @@ def test_storage_buffer_range_limit_is_reported():
     over the 128 MiB core minimum), so a small forced range must come back as the
     buffer's size against the limit rather than a driver failure.
     """
-    res = _run_limits([{"label": "bm3d", "filter": "bm3d"}],
-                      {"VSFEEL_LIMIT_STORAGE_RANGE": str(1 << 20)})
+    res = _run_limits(
+        [{"label": "bm3d", "filter": "bm3d"}], {"VSFEEL_LIMIT_STORAGE_RANGE": str(1 << 20)}
+    )
     err = res["bm3d"].get("error", "")
     assert "maxStorageBufferRange" in err and str(1 << 20) in err, res["bm3d"]
 
 
 def test_push_descriptor_limit_is_reported():
     """The binding count is bounded by maxPushDescriptors, checked explicitly."""
-    res = _run_limits([{"label": "nlmeans", "filter": "nlmeans"}],
-                      {"VSFEEL_LIMIT_PUSH_DESCRIPTORS": "4"})
+    res = _run_limits(
+        [{"label": "nlmeans", "filter": "nlmeans"}], {"VSFEEL_LIMIT_PUSH_DESCRIPTORS": "4"}
+    )
     err = res["nlmeans"].get("error", "")
     assert "push descriptors" in err and "4" in err, res["nlmeans"]
 
@@ -416,8 +440,10 @@ def test_two_dimensional_grid_overflow_is_reported():
     X group limit has nowhere to go: it must fail with the grid and the limits
     rather than dispatch a clamped grid that leaves the tail unwritten.
     """
-    cases = [{"label": "bilateral", "filter": "bilateral"},
-             {"label": "gaussblur", "filter": "gaussblur"}]
+    cases = [
+        {"label": "bilateral", "filter": "bilateral"},
+        {"label": "gaussblur", "filter": "gaussblur"},
+    ]
     res = _run_limits(cases, {"VSFEEL_LIMIT_GRID_X": "4"})
     for case in cases:
         err = res[case["label"]].get("error", "")
@@ -445,10 +471,8 @@ def test_subgroup_size_requests_require_compute_stage_support():
     for label in ("dfttest", "nlmeans"):
         assert cleared[label]["sha1"] == default[label]["sha1"], label
 
-    strict = [{"label": "nnedi3", "filter": "nnedi3"},
-              {"label": "eedi3", "filter": "eedi3"}]
+    strict = [{"label": "nnedi3", "filter": "nnedi3"}, {"label": "eedi3", "filter": "eedi3"}]
     res = _run_limits(strict, {"VSFEEL_LIMIT_SUBGROUP_STAGES": "0"})
     for case in strict:
         err = res[case["label"]].get("error", "")
         assert "32-lane subgroups" in err, res[case["label"]]
-

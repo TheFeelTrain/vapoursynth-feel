@@ -15,9 +15,13 @@ from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 # x86-64 additionally gets AVX2, and the NNEDI3 weights are embedded with
 # an RC resource on Windows and the assembler's .incbin everywhere else.
 _SUPPORTED_PLATFORMS = {
-    ("linux", "x86_64"), ("linux", "amd64"), ("linux", "aarch64"),
-    ("darwin", "x86_64"), ("darwin", "arm64"),
-    ("win32", "x86_64"), ("win32", "amd64"),
+    ("linux", "x86_64"),
+    ("linux", "amd64"),
+    ("linux", "aarch64"),
+    ("darwin", "x86_64"),
+    ("darwin", "arm64"),
+    ("win32", "x86_64"),
+    ("win32", "amd64"),
 }
 
 # Per-platform plugin library filename and the extension CMake installs.
@@ -121,8 +125,8 @@ class CustomHook(BuildHookInterface):
         # must not depend on the process CWD.
         root = Path(self.root).resolve()
         self.target_dir = root / "vapoursynth/plugins/vsfeel"
-        self.build_dir = root / "build/pack"   # scratch configure/build tree (gitignored)
-        self.install_dir = root / "install"    # cmake --install staging prefix
+        self.build_dir = root / "build/pack"  # scratch configure/build tree (gitignored)
+        self.install_dir = root / "install"  # cmake --install staging prefix
         # install/ is gitignored and reused checkouts keep it around, so a stale
         # (possibly foreign-platform) library must not survive into this build.
         shutil.rmtree(self.install_dir, ignore_errors=True)
@@ -134,20 +138,28 @@ class CustomHook(BuildHookInterface):
 
         cmake = find_tool("cmake")
         cmake_args = [
-            cmake, "-S", str(root), "-B", str(self.build_dir),
-            "-D", "CMAKE_BUILD_TYPE=Release",
+            cmake,
+            "-S",
+            str(root),
+            "-B",
+            str(self.build_dir),
+            "-D",
+            "CMAKE_BUILD_TYPE=Release",
             # hatch-vcs is the single version source; embed the version it
             # resolved for this build instead of letting CMake guess one
-            "-D", f"VSFEEL_VERSION={version}",
+            "-D",
+            f"VSFEEL_VERSION={version}",
             # stage into install/<target_dir> instead of the live VapourSynth
             # plugin directory (which is an absolute path when vapoursynth is
             # importable, and cmake --install ignores --prefix for those).
             # Relative on purpose: an absolute DESTINATION would bypass the
             # --prefix under which finalize cleans up.
-            "-D", f"VSFEEL_INSTALL_DIR={self.target_dir.relative_to(root)}",
+            "-D",
+            f"VSFEEL_INSTALL_DIR={self.target_dir.relative_to(root)}",
             # The build environment's interpreter, so CMake does not have to
             # find one on PATH (it generates the SPIR-V header at build time).
-            "-D", f"Python3_EXECUTABLE={sys.executable}",
+            "-D",
+            f"Python3_EXECUTABLE={sys.executable}",
         ]
         # Passed explicitly rather than left to CMake's env-var pickup: the
         # cached value in a reused build tree would otherwise win, and the tag
@@ -162,15 +174,22 @@ class CustomHook(BuildHookInterface):
             cmake_args += ["-D", f"VS_INCLUDE_DIR={include_dir}"]
         subprocess.run(cmake_args, check=True, cwd=root)
         subprocess.run(
-            [cmake, "--build", str(self.build_dir), "--config", "Release",
-             "--parallel"],
-            check=True, cwd=root,
+            [cmake, "--build", str(self.build_dir), "--config", "Release", "--parallel"],
+            check=True,
+            cwd=root,
         )
         subprocess.run(
-            [cmake, "--install", str(self.build_dir),
-             "--config", "Release",   # multi-config generators (Visual Studio)
-             "--prefix", str(self.install_dir)],
-            check=True, cwd=root,
+            [
+                cmake,
+                "--install",
+                str(self.build_dir),
+                "--config",
+                "Release",  # multi-config generators (Visual Studio)
+                "--prefix",
+                str(self.install_dir),
+            ],
+            check=True,
+            cwd=root,
         )
 
         # Copy exactly the library and manifest CMake just installed for this
@@ -180,9 +199,7 @@ class CustomHook(BuildHookInterface):
         lib = find_staged_library(staged)
         manifest = staged / "manifest.vs"
         if not manifest.is_file():
-            raise RuntimeError(
-                f"CMake install produced no manifest.vs under {staged}/."
-            )
+            raise RuntimeError(f"CMake install produced no manifest.vs under {staged}/.")
 
         self.target_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(lib, self.target_dir)

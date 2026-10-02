@@ -20,12 +20,20 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    NOISE_MKV, COMPARE_PRELUDE, ReferenceUnavailable,
-    assert_preserves_frame_props, assert_temporal_order_consistent,
-    check_all_frames_finite, eval_parallel, frame_to_ndarray,
-    plane_to_ndarray, run_compare_subprocess, skip_or_fail_reference,
+    NOISE_MKV,
+    COMPARE_PRELUDE,
+    ReferenceUnavailable,
+    assert_preserves_frame_props,
+    assert_temporal_order_consistent,
+    check_all_frames_finite,
+    eval_parallel,
+    frame_to_ndarray,
+    plane_to_ndarray,
+    run_compare_subprocess,
+    skip_or_fail_reference,
     cpu_node,
 )
+
 
 def BM3D(*args, **kwargs):
     """BM3Dv2 as a clip the test can read pixels from (see conftest.cpu_node)."""
@@ -90,8 +98,6 @@ def test_bm3dv2_no_nan_all_frames(noise_gray, radius):
     check_all_frames_finite(_run, noise_gray, radius=radius)
 
 
-
-
 def test_bm3dv2_deterministic(noise_gray):
     a = _run(noise_gray, radius=2)
     b = _run(noise_gray, radius=2)
@@ -101,10 +107,6 @@ def test_bm3dv2_deterministic(noise_gray):
         # atomic-order rounding (~2e-8 measured); the 1e-5 bound is the
         # established self-consistency bound.
         assert np.abs(d).max() < 1e-5, f"nondeterministic output at frame {n}"
-
-
-
-
 
 
 def test_bm3dv2_cas_fallback_matches_hardware_atomics(noise_gray, monkeypatch):
@@ -137,9 +139,9 @@ def test_bm3dv2_cas_fallback_holds_at_small_block_step(noise_gray, monkeypatch):
     hardware arm, while the geometry-derived bound lands at 7e-9 (float add
     order alone). The bound is what this pins.
     """
+
     def small_step(clip):
-        return BM3D(clip, sigma=SIGMA, radius=2, bm_range=BM_RANGE,
-                    ps_range=PS_RANGE, block_step=1)
+        return BM3D(clip, sigma=SIGMA, radius=2, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=1)
 
     monkeypatch.setenv("VSFEEL_BM3D_CAS", "1")
     cas = small_step(noise_gray)
@@ -150,8 +152,8 @@ def test_bm3dv2_cas_fallback_holds_at_small_block_step(noise_gray, monkeypatch):
         b = frame_to_ndarray(cas.get_frame(n))
         assert np.isfinite(b).all(), f"non-finite CAS output at frame {n}"
         assert np.abs(a - b).max() < 1e-7, (
-            f"CAS lost an addend at block_step=1, frame {n}: "
-            f"{np.abs(a - b).max():g}")
+            f"CAS lost an addend at block_step=1, frame {n}: {np.abs(a - b).max():g}"
+        )
 
 
 def test_bm3dv2_disjoint_first_estimates_keep_slice_witnesses(noise_gray):
@@ -183,7 +185,8 @@ def test_bm3dv2_disjoint_first_estimates_keep_slice_witnesses(noise_gray):
         assert not errors, f"concurrent first estimates failed: {errors}"
         for n in (0, 23):
             assert np.abs(got[n] - expected[n]).max() < 1e-5, (
-                f"first-use tag clear corrupted frame {n}")
+                f"first-use tag clear corrupted frame {n}"
+            )
 
 
 def test_bm3dv2_radius0_concurrent_first_use_and_fallback(noise_gray, monkeypatch):
@@ -193,7 +196,8 @@ def test_bm3dv2_radius0_concurrent_first_use_and_fallback(noise_gray, monkeypatc
     for n in range(noise_gray.num_frames):
         expected = frame_to_ndarray(noise_gray.get_frame(n))
         assert np.array_equal(actual[n], expected), (
-            f"radius-zero fallback read the wrong source slot at frame {n}")
+            f"radius-zero fallback read the wrong source slot at frame {n}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +207,7 @@ def test_bm3dv2_radius0_concurrent_first_use_and_fallback(noise_gray, monkeypatc
 # Both scripts run the plugin in a subprocess (the trace the filter prints goes
 # to stderr, and the error-path test must not hang the suite) and reuse
 # conftest's stride-aware readers.
-_SUBPROCESS_PRELUDE = r'''
+_SUBPROCESS_PRELUDE = r"""
 import json
 import sys
 sys.path.insert(0, sys.argv[1])
@@ -222,17 +226,22 @@ def source():
 def gray32():
     return core.fmtc.bitdepth(core.std.ShufflePlanes(source(), 0, vs.GRAY),
                               bits=32, fulls=True, fulld=True)
-'''
+"""
 
-_TRACE_SCRIPT = _SUBPROCESS_PRELUDE + r'''
+_TRACE_SCRIPT = (
+    _SUBPROCESS_PRELUDE
+    + r"""
 node = core.vsfeel.BM3Dv2(gray32(), sigma=0.7, radius=int(sys.argv[2]),
                           bm_range=16, ps_range=7, block_step=4)
 for n in range(4):
     node.get_frame(n)
 print("TRACE OK")
-'''
+"""
+)
 
-_FAULT_SCRIPT = _SUBPROCESS_PRELUDE + r'''
+_FAULT_SCRIPT = (
+    _SUBPROCESS_PRELUDE
+    + r"""
 import threading
 
 
@@ -287,14 +296,15 @@ if result.get(1) == "ok":
     report["con1_maxdiff"] = float(np.abs(
         frame_to_ndarray(got[1]) - frame_to_ndarray(oracle.get_frame(1))).max())
 print("RESULT " + json.dumps(report))
-'''
+"""
+)
 
 
 def _result_payload(stdout):
     payload = None
     for line in stdout.splitlines():
         if line.startswith("RESULT "):
-            payload = json.loads(line[len("RESULT "):])
+            payload = json.loads(line[len("RESULT ") :])
     assert payload is not None, stdout[-2000:]
     return payload
 
@@ -304,7 +314,11 @@ def _run_subprocess_script(script, *argv, env=None):
     run_env = {**os.environ, "MANGOHUD": "0", **(env or {})}
     return subprocess.run(
         [sys.executable, "-c", script, tests_dir, *map(str, argv)],
-        capture_output=True, text=True, timeout=600, env=run_env)
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=run_env,
+    )
 
 
 def test_bm3dv2_radius0_trace_prints_no_false_invariant():
@@ -315,8 +329,7 @@ def test_bm3dv2_radius0_trace_prints_no_false_invariant():
     -1" and "NOT READY" for every radius-0 frame, and read those tables without
     the cache lock the acquire/publish/wait path takes.
     """
-    proc = _run_subprocess_script(
-        _TRACE_SCRIPT, 0, env={"VSFEEL_BM3D_TRACE": "1"})
+    proc = _run_subprocess_script(_TRACE_SCRIPT, 0, env={"VSFEEL_BM3D_TRACE": "1"})
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert "TRACE OK" in proc.stdout, proc.stdout[-2000:]
     assert "NOT READY" not in proc.stderr, proc.stderr[-2000:]
@@ -335,13 +348,13 @@ def test_bm3dv2_failed_estimation_never_publishes_uncopied_sources():
     it has to fail, and a concurrent reader that already reserved the slot must
     be released rather than block forever on a ready flag that never comes.
     """
-    proc = _run_subprocess_script(
-        _FAULT_SCRIPT, env={"VSFEEL_BM3D_FAULT": "0"})
+    proc = _run_subprocess_script(_FAULT_SCRIPT, env={"VSFEEL_BM3D_FAULT": "0"})
     assert proc.returncode == 0, proc.stderr[-2000:]
     payload = _result_payload(proc.stdout)
     assert payload["seq0"] != "ok", payload
     assert payload["seq1"] != "ok", (
-        f"a later frame denoised against an uncopied source slot: {payload}")
+        f"a later frame denoised against an uncopied source slot: {payload}"
+    )
     assert payload["con0"] != "ok", payload
     # A concurrent frame that got its own copies in first may finish correctly;
     # it must never finish on the failed frame's slot.
@@ -355,8 +368,7 @@ def test_bm3dv2_nosearch_matches_search_on_constant_clip(monkeypatch):
     Before the fix a constant clip came out 99.5% NaN; it now matches the
     searched run to one ulp.
     """
-    clip = vs.core.std.BlankClip(
-        width=64, height=64, format=vs.GRAYS, length=3, color=0.5)
+    clip = vs.core.std.BlankClip(width=64, height=64, format=vs.GRAYS, length=3, color=0.5)
     monkeypatch.delenv("VSFEEL_BM3D_NOSEARCH", raising=False)
     search = _run(clip, radius=2)
     monkeypatch.setenv("VSFEEL_BM3D_NOSEARCH", "1")
@@ -411,6 +423,7 @@ def test_bm3dv2_ref_final_pass(noise_gray):
 # Input validation (creation time, before GPU resources are allocated)
 # ---------------------------------------------------------------------------
 
+
 def _blank(w, h):
     return vs.core.std.BlankClip(width=w, height=h, format=vs.GRAYS, length=3)
 
@@ -424,16 +437,24 @@ def test_bm3dv2_rejects_dimensions_below_block(w, h):
     """
     with pytest.raises(vs.Error):
         BM3D(
-            _blank(w, h), sigma=SIGMA, radius=2, bm_range=BM_RANGE,
-            ps_range=PS_RANGE, block_step=BLOCK_STEP,
+            _blank(w, h),
+            sigma=SIGMA,
+            radius=2,
+            bm_range=BM_RANGE,
+            ps_range=PS_RANGE,
+            block_step=BLOCK_STEP,
         )
 
 
 def test_bm3dv2_accepts_exactly_8x8():
     """An 8x8 clip is the smallest supported geometry and must run."""
     out = BM3D(
-        _blank(8, 8), sigma=SIGMA, radius=2, bm_range=BM_RANGE,
-        ps_range=PS_RANGE, block_step=BLOCK_STEP,
+        _blank(8, 8),
+        sigma=SIGMA,
+        radius=2,
+        bm_range=BM_RANGE,
+        ps_range=PS_RANGE,
+        block_step=BLOCK_STEP,
     )
     a = frame_to_ndarray(out.get_frame(0))
     assert a.shape == (8, 8)
@@ -451,16 +472,24 @@ def test_bm3dv2_rejects_int32_res_overflow():
     """
     with pytest.raises(vs.Error, match="32-bit"):
         BM3D(
-            _blank(7680, 4320), sigma=SIGMA, radius=4, bm_range=BM_RANGE,
-            ps_range=PS_RANGE, block_step=BLOCK_STEP,
+            _blank(7680, 4320),
+            sigma=SIGMA,
+            radius=4,
+            bm_range=BM_RANGE,
+            ps_range=PS_RANGE,
+            block_step=BLOCK_STEP,
         )
 
 
 def test_bm3dv2_accepts_radius4_within_addressing_limit():
     """The guard must not reject radius 4 when the stack stays addressable."""
     out = BM3D(
-        _blank(8, 8), sigma=SIGMA, radius=4, bm_range=BM_RANGE,
-        ps_range=PS_RANGE, block_step=BLOCK_STEP,
+        _blank(8, 8),
+        sigma=SIGMA,
+        radius=4,
+        bm_range=BM_RANGE,
+        ps_range=PS_RANGE,
+        block_step=BLOCK_STEP,
     )
     assert out.num_frames == 3
 
@@ -475,8 +504,13 @@ def test_bm3dv2_device_id(noise_gray):
     atomic-order run-to-run floor).
     """
     b = _run(noise_gray)
-    for kwargs in (dict(device_id=0), dict(device_id=-1), dict(device_id=99),
-                   dict(num_streams=0), dict(num_streams=64)):
+    for kwargs in (
+        dict(device_id=0),
+        dict(device_id=-1),
+        dict(device_id=99),
+        dict(num_streams=0),
+        dict(num_streams=64),
+    ):
         a = _run(noise_gray, **kwargs)
         for n in (0, 11, 23):
             d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
@@ -524,13 +558,23 @@ def test_bm3dv2_sigma_below_epsilon_passes_through(noise_gray, sigma, use_ref):
     basic = None
     if use_ref:
         basic = BM3D(
-            noise_gray, sigma=SIGMA, radius=2, bm_range=BM_RANGE,
-            ps_range=PS_RANGE, block_step=BLOCK_STEP)
+            noise_gray,
+            sigma=SIGMA,
+            radius=2,
+            bm_range=BM_RANGE,
+            ps_range=PS_RANGE,
+            block_step=BLOCK_STEP,
+        )
         _ = frame_to_ndarray(basic.get_frame(0))
     out = BM3D(
-        noise_gray, sigma=sigma, radius=2, bm_range=BM_RANGE,
-        ps_range=PS_RANGE, block_step=BLOCK_STEP,
-        **({"ref": basic} if use_ref else {}))
+        noise_gray,
+        sigma=sigma,
+        radius=2,
+        bm_range=BM_RANGE,
+        ps_range=PS_RANGE,
+        block_step=BLOCK_STEP,
+        **({"ref": basic} if use_ref else {}),
+    )
     for n in (0, 11, 23):
         a = frame_to_ndarray(out.get_frame(n))
         b = frame_to_ndarray(noise_gray.get_frame(n))
@@ -630,9 +674,16 @@ def test_bm3dv2_frame_request_order_matches_serial():
     """
     assert_temporal_order_consistent(
         "BM3Dv2",
-        {"sigma": SIGMA, "radius": 2, "bm_range": BM_RANGE, "ps_range": PS_RANGE,
-         "block_step": BLOCK_STEP},
-        tol=1e-5, timeout=300)
+        {
+            "sigma": SIGMA,
+            "radius": 2,
+            "bm_range": BM_RANGE,
+            "ps_range": PS_RANGE,
+            "block_step": BLOCK_STEP,
+        },
+        tol=1e-5,
+        timeout=300,
+    )
 
 
 @pytest.mark.parametrize("nframes", [1, 2])
@@ -640,9 +691,17 @@ def test_bm3dv2_short_clip_temporal_window(nframes):
     """A clip shorter than 2*radius+1 must still be order-independent."""
     assert_temporal_order_consistent(
         "BM3Dv2",
-        {"sigma": SIGMA, "radius": 2, "bm_range": BM_RANGE, "ps_range": PS_RANGE,
-         "block_step": BLOCK_STEP},
-        tol=1e-5, nframes=nframes, timeout=300)
+        {
+            "sigma": SIGMA,
+            "radius": 2,
+            "bm_range": BM_RANGE,
+            "ps_range": PS_RANGE,
+            "block_step": BLOCK_STEP,
+        },
+        tol=1e-5,
+        nframes=nframes,
+        timeout=300,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -712,15 +771,17 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 BASE_KWARGS = dict(sigma=0.7, radius=2, bm_range=16, ps_range=7, block_step=4)
 
 
-def _max_diff_vs_reference(kwargs: dict, ref: str, ref_pass: bool = False,
-                           timeout: float = 600) -> float:
+def _max_diff_vs_reference(
+    kwargs: dict, ref: str, ref_pass: bool = False, timeout: float = 600
+) -> float:
     """Run the comparison in a subprocess.
 
     Raises :class:`ReferenceUnavailable` when ``ref`` is missing/failed and
     :class:`AssertionError` (with the captured tail) when vsfeel failed.
     """
     return run_compare_subprocess(
-        _COMPARE_SCRIPT, [ref, json.dumps(kwargs), str(int(ref_pass))],
+        _COMPARE_SCRIPT,
+        [ref, json.dumps(kwargs), str(int(ref_pass))],
         timeout=timeout,
     )
 
@@ -736,8 +797,7 @@ def _compare_against_any_reference(kwargs: dict, ref_pass: bool = False) -> tupl
             return ref, _max_diff_vs_reference(kwargs, ref, ref_pass=ref_pass)
         except ReferenceUnavailable as exc:
             reasons.append(f"{ref}: {exc}")
-    skip_or_fail_reference(
-        "no usable reference plugin (vszipcl/bm3dhip): " + "; ".join(reasons))
+    skip_or_fail_reference("no usable reference plugin (vszipcl/bm3dhip): " + "; ".join(reasons))
 
 
 def test_bm3dv2_ref_matches_reference(noise_gray):
@@ -816,10 +876,14 @@ def test_bm3dv2_parameter_sweep_matches_reference(noise_gray, cfg, tol):
 # inheritance case (a one-element sigma makes the other planes inherit
 # element 0). Measured vszipcl basic estimate, frames 0/11/23: defaults 0.0188,
 # sigma=[0.7] 0.0071.
-@pytest.mark.parametrize("kwargs,tol", [
-    ({}, 0.03),
-    ({"sigma": [0.7]}, 0.02),
-], ids=["plugin-defaults", "sigma-array-inherit"])
+@pytest.mark.parametrize(
+    "kwargs,tol",
+    [
+        ({}, 0.03),
+        ({"sigma": [0.7]}, 0.02),
+    ],
+    ids=["plugin-defaults", "sigma-array-inherit"],
+)
 def test_bm3dv2_plugin_defaults_match_reference(noise_gray, kwargs, tol):
     """The documented defaults must produce the reference result, not just
     any finite frame (test_device_limits/test_lifecycle only check those)."""
@@ -854,6 +918,7 @@ def test_bm3dv2_matches_reference(noise_gray, radius):
 # path's ISA is unchanged. After the fix, two fresh ns=1 runs are
 # bit-identical at 3/6/8 (3.7e-8 at 0) and the output tracks the reference.
 
+
 @pytest.mark.parametrize("extractor_exp", [3, 6, 8])
 def test_bm3dv2_extractor_exp_is_bit_reproducible(noise_gray, extractor_exp):
     """Two runs at extractor_exp >= 3 must be identical (reference: exact)."""
@@ -862,8 +927,9 @@ def test_bm3dv2_extractor_exp_is_bit_reproducible(noise_gray, extractor_exp):
     for n in (0, 11, 23):
         fa = frame_to_ndarray(a.get_frame(n))
         fb = frame_to_ndarray(b.get_frame(n))
-        assert np.array_equal(fa, fb), \
+        assert np.array_equal(fa, fb), (
             f"extractor_exp={extractor_exp} not reproducible at frame {n}"
+        )
 
 
 def test_bm3dv2_extractor_exp_changes_aggregation(noise_gray):
@@ -880,7 +946,7 @@ def test_bm3dv2_extractor_exp_changes_aggregation(noise_gray):
     for n in (0, 11, 23):
         fb = frame_to_ndarray(base.get_frame(n))
         fc = frame_to_ndarray(coarse.get_frame(n))
-        assert np.isfinite(fb).all() and np.isfinite(fc).all(), \
+        assert np.isfinite(fb).all() and np.isfinite(fc).all(), (
             f"non-finite extractor_exp output at frame {n}"
-        assert float(np.abs(fb - fc).max()) > 1e-4, \
-            f"extractor_exp=20 left frame {n} unchanged"
+        )
+        assert float(np.abs(fb - fc).max()) > 1e-4, f"extractor_exp=20 left frame {n} unchanged"

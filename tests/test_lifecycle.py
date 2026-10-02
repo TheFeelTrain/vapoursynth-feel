@@ -96,7 +96,9 @@ def test_concurrent_create_destroy_with_active_graph(noise_gray):
     try:
         proc = subprocess.run(
             [sys.executable, "-c", _LIFECYCLE_SCRIPT],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True,
+            text=True,
+            timeout=300,
         )
     except subprocess.TimeoutExpired as exc:
         pytest.fail(
@@ -105,9 +107,11 @@ def test_concurrent_create_destroy_with_active_graph(noise_gray):
             % ((exc.stdout or "")[-2000:], (exc.stderr or "")[-2000:])
         )
     out = proc.stdout or ""
-    assert "LIFECYCLE fail" not in out, (
-        "concurrent lifecycle failure:\n%s\n--- stderr ---\n%s"
-        % (out[-2000:], (proc.stderr or "")[-2000:]))
+    assert "LIFECYCLE fail" not in out, "concurrent lifecycle failure:\n%s\n--- stderr ---\n%s" % (
+        out[-2000:],
+        (proc.stderr or "")[-2000:],
+    )
     assert proc.returncode == 0 and "RESULT " in out, (
         "lifecycle subprocess exited %s\n--- stdout ---\n%s\n--- stderr ---\n%s"
-        % (proc.returncode, out[-2000:], (proc.stderr or "")[-2000:]))
+        % (proc.returncode, out[-2000:], (proc.stderr or "")[-2000:])
+    )

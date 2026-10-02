@@ -12,8 +12,8 @@
 #   shaders   glslc -Werror + spirv-val, through the build's shader-validate target
 #   tidy      clang-tidy over the compile database, per .clang-tidy
 #   cppcheck  cppcheck over the compile database
-#   ruff      ruff check over vsfeel/ tools/ hatch_build.py
-#             src/gen_spirv_header.py tests/
+#   ruff      ruff check + ruff format --check over vsfeel/ tools/
+#             hatch_build.py src/gen_spirv_header.py tests/
 #
 # shaders/tidy/cppcheck need a configured build directory (they read
 # build/compile_commands.json and build/vk_spv/); tools/install.sh writes
@@ -49,7 +49,7 @@ usage() {
     cat <<EOF
 usage: tools/lint.sh [--fix] [gate ...]
   gates: format shaders tidy cppcheck ruff   (default: all of them)
-  --fix  apply clang-format -i and clang-tidy --fix first
+  --fix  apply clang-format -i, clang-tidy --fix and ruff's fixes first
 EOF
 }
 
@@ -128,11 +128,14 @@ gate_cppcheck() {
 gate_ruff() {
     have "$ruff" || { skip "$ruff"; return 2; }
     # The check set is curated in pyproject.toml [tool.ruff lint]: low-noise
-    # correctness rules (pyflakes, pycodestyle-error, ambiguous names) that
-    # the whole tree passes, rather than the full default set whose style
-    # opinions (line length, %-format, blind-except in test harnesses) the
-    # tree deliberately does not follow. Keep the gate and the config in
-    # step: a new finding means a new defect, not new style to debate.
+    # correctness rules (pyflakes, pycodestyle-error, the whitespace
+    # .editorconfig requires, dead noqa directives) that the whole tree passes,
+    # rather than the full default set whose style opinions (%-format,
+    # blind-except in test harnesses) the tree deliberately does not follow.
+    # Keep the gate and the config in step: a new finding means a new defect,
+    # not new style to debate. Line breaking is not in that set: it is
+    # ruff format's job, checked below against [tool.ruff] line-length, the
+    # same way clang-format gates the C++ side.
     local files=("$root_dir"/vsfeel "$root_dir"/tools "$root_dir"/hatch_build.py
         "$root_dir"/src/gen_spirv_header.py "$root_dir"/tests)
     if [ "$fix" -eq 1 ]; then
@@ -140,6 +143,7 @@ gate_ruff() {
         "$ruff" format --quiet "${files[@]}" || true
     fi
     "$ruff" check "${files[@]}"
+    "$ruff" format --check "${files[@]}"
 }
 
 status=()

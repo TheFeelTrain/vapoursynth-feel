@@ -169,13 +169,14 @@ def eval_parallel(filter_func, clip, plane=0, dtype=None, timeout=180.0, **kwarg
     def worker(n):
         try:
             frames[n] = plane_to_ndarray(
-                node.get_frame(n), plane,
-                format_dtype(node.format) if dtype is None else dtype)
+                node.get_frame(n), plane, format_dtype(node.format) if dtype is None else dtype
+            )
         except BaseException as exc:  # reported below; must not die silently
             errors.append(f"frame {n}: {type(exc).__name__}: {exc}")
 
-    threads = [threading.Thread(target=worker, args=(n,), daemon=True)
-               for n in range(node.num_frames)]
+    threads = [
+        threading.Thread(target=worker, args=(n,), daemon=True) for n in range(node.num_frames)
+    ]
     deadline = time.monotonic() + timeout
     for t in threads:
         t.start()
@@ -184,8 +185,8 @@ def eval_parallel(filter_func, clip, plane=0, dtype=None, timeout=180.0, **kwarg
     hung = sum(1 for t in threads if t.is_alive())
     assert not errors, f"parallel load failed: {'; '.join(errors[:4])}"
     assert hung == 0, (
-        f"parallel load deadlocked: {hung}/{len(threads)} workers still alive "
-        f"after {timeout:g}s")
+        f"parallel load deadlocked: {hung}/{len(threads)} workers still alive after {timeout:g}s"
+    )
     assert all(f is not None for f in frames)
     return frames
 
@@ -217,7 +218,9 @@ def check_all_frames_finite(filter_func, clip, **kwargs):
 
 def pytest_addoption(parser):
     parser.addoption(
-        "--require-references", action="store_true", default=False,
+        "--require-references",
+        action="store_true",
+        default=False,
         help="fail instead of skipping when a reference plugin is unavailable",
     )
 
@@ -242,8 +245,7 @@ def skip_or_fail_reference(reason):
     ``--require-references`` (which exists to keep a missing reference from
     silently deleting the correctness net)."""
     if _REQUIRE_REFERENCES:
-        pytest.fail(f"reference required but unavailable "
-                    f"(--require-references): {reason}")
+        pytest.fail(f"reference required but unavailable (--require-references): {reason}")
     pytest.skip(reason)
 
 
@@ -296,7 +298,10 @@ def run_compare_subprocess(code, argv=(), timeout=600.0, env=None):
     try:
         proc = subprocess.run(
             [sys.executable, "-c", code, *argv],
-            capture_output=True, text=True, timeout=timeout, env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=run_env,
         )
         stdout = _as_text(proc.stdout)
         stderr = _as_text(proc.stderr)
@@ -317,45 +322,46 @@ def run_compare_subprocess(code, argv=(), timeout=600.0, env=None):
         if s == _REF_OK:
             ref_ok = True
         elif s.startswith(_REF_UNAVAILABLE):
-            ref_reason = s[len(_REF_UNAVAILABLE):].strip()
+            ref_reason = s[len(_REF_UNAVAILABLE) :].strip()
         elif s.startswith(_VSFEEL_FAIL):
-            vsfeel_reason = s[len(_VSFEEL_FAIL):].strip()
+            vsfeel_reason = s[len(_VSFEEL_FAIL) :].strip()
         elif s.startswith(_RESULT):
-            payload = s[len(_RESULT):].strip()
+            payload = s[len(_RESULT) :].strip()
 
-    status = ("timed out after %.0fs" % timeout if timed_out
-              else "exited %s" % returncode)
-    diag = (
-        "compare subprocess %s\n--- stdout tail ---\n%s\n--- stderr tail ---\n%s"
-        % (status, _tail(stdout), _tail(stderr))
+    status = "timed out after %.0fs" % timeout if timed_out else "exited %s" % returncode
+    diag = "compare subprocess %s\n--- stdout tail ---\n%s\n--- stderr tail ---\n%s" % (
+        status,
+        _tail(stdout),
+        _tail(stderr),
     )
 
     if vsfeel_reason is not None:
         raise AssertionError(
             "vsfeel failed in comparison subprocess: %s\n%s"
-            % (vsfeel_reason or "unspecified", diag))
+            % (vsfeel_reason or "unspecified", diag)
+        )
     if ref_reason is not None:
         raise ReferenceUnavailable(ref_reason or "unspecified reference failure")
     if timed_out:
         if ref_ok:
             raise AssertionError(
                 "comparison subprocess timed out after %.0fs; the reference "
-                "materialised, so vsfeel or the comparison hung\n%s"
-                % (timeout, diag))
+                "materialised, so vsfeel or the comparison hung\n%s" % (timeout, diag)
+            )
         raise ReferenceUnavailable(
-            "reference subprocess timed out after %.0fs before materialising\n%s"
-            % (timeout, diag))
+            "reference subprocess timed out after %.0fs before materialising\n%s" % (timeout, diag)
+        )
     if not ref_ok:
         raise ReferenceUnavailable(
-            "reference subprocess failed before materialising (exit %s)\n%s"
-            % (returncode, diag))
+            "reference subprocess failed before materialising (exit %s)\n%s" % (returncode, diag)
+        )
     if returncode != 0:
         raise AssertionError(
             "comparison subprocess exited %s after the reference materialised\n%s"
-            % (returncode, diag))
+            % (returncode, diag)
+        )
     if payload is None:
-        raise AssertionError(
-            "comparison subprocess produced no RESULT line\n%s" % diag)
+        raise AssertionError("comparison subprocess produced no RESULT line\n%s" % diag)
     try:
         return json.loads(payload)
     except ValueError as exc:
@@ -419,7 +425,9 @@ def cpu_node(node):
 # builds the clip, materialises the reference before touching vsfeel, then
 # compares the requested frames/planes.
 
-REFERENCE_SCRIPT = COMPARE_PRELUDE + r'''
+REFERENCE_SCRIPT = (
+    COMPARE_PRELUDE
+    + r"""
 import json
 import sys
 import vapoursynth as vs
@@ -527,12 +535,22 @@ print("RESULT " + json.dumps({
     "height": my_node.height,
     "num_frames": my_node.num_frames,
 }), flush=True)
-'''
+"""
+)
 
 
-def reference_spec(plugin, filter, clip, frames=(0, 11, 23), planes=None,
-                   kwargs=None, guide=None, guide_kwarg="ref", crop=None,
-                   vsfeel_filter=None):
+def reference_spec(
+    plugin,
+    filter,
+    clip,
+    frames=(0, 11, 23),
+    planes=None,
+    kwargs=None,
+    guide=None,
+    guide_kwarg="ref",
+    crop=None,
+    vsfeel_filter=None,
+):
     """Build the JSON spec consumed by :data:`REFERENCE_SCRIPT`.
 
     ``clip`` names the input format ("gray32", "gray16", "yuv420_16", ...);
@@ -584,7 +602,9 @@ def reference_compare(spec, timeout=600.0):
 # "far" request temporally distant neighbours, interleave and scramble thrash
 # the frame cache, and "revisit" re-requests frames the node already served.
 
-TEMPORAL_ORDER_SCRIPT = COMPARE_PRELUDE + r'''
+TEMPORAL_ORDER_SCRIPT = (
+    COMPARE_PRELUDE
+    + r"""
 import json
 import sys
 from math import gcd
@@ -653,11 +673,11 @@ for name, order in orders.items():
     worst[name] = w
 
 print("RESULT " + json.dumps({"orders": worst, "num_frames": nf}), flush=True)
-'''
+"""
+)
 
 
-def temporal_order_diff(filter_name, params, nframes=None, plane=0,
-                        timeout=600.0):
+def temporal_order_diff(filter_name, params, nframes=None, plane=0, timeout=600.0):
     """Worst pixel diff per frame-request ordering, against the serial run.
 
     ``filter_name`` is the ``core.vsfeel`` function; ``params`` its keyword
@@ -667,13 +687,17 @@ def temporal_order_diff(filter_name, params, nframes=None, plane=0,
     reference here, so anything that dies before the oracle completes is a
     vsfeel failure, not a missing plugin.
     """
-    spec = {"source": NOISE_MKV, "filter": filter_name, "params": params,
-            "plane": plane, "max_cache_size": 256}
+    spec = {
+        "source": NOISE_MKV,
+        "filter": filter_name,
+        "params": params,
+        "plane": plane,
+        "max_cache_size": 256,
+    }
     if nframes is not None:
         spec["nframes"] = int(nframes)
     try:
-        payload = run_compare_subprocess(TEMPORAL_ORDER_SCRIPT,
-                                         [json.dumps(spec)], timeout=timeout)
+        payload = run_compare_subprocess(TEMPORAL_ORDER_SCRIPT, [json.dumps(spec)], timeout=timeout)
     except ReferenceUnavailable as exc:
         raise AssertionError(
             f"temporal-order subprocess failed before the oracle completed: {exc}"
@@ -681,15 +705,15 @@ def temporal_order_diff(filter_name, params, nframes=None, plane=0,
     return payload["orders"]
 
 
-def assert_temporal_order_consistent(filter_name, params, tol=1e-5,
-                                     nframes=None, plane=0, timeout=600.0):
+def assert_temporal_order_consistent(
+    filter_name, params, tol=1e-5, nframes=None, plane=0, timeout=600.0
+):
     """Every request order must reproduce the serial result within ``tol``."""
-    worst = temporal_order_diff(filter_name, params, nframes=nframes,
-                                plane=plane, timeout=timeout)
+    worst = temporal_order_diff(filter_name, params, nframes=nframes, plane=plane, timeout=timeout)
     bad = {name: w for name, w in worst.items() if w > tol}
     assert not bad, (
-        f"{filter_name} output depends on frame-request order "
-        f"(tol {tol:g}, params {params}): {bad}")
+        f"{filter_name} output depends on frame-request order (tol {tol:g}, params {params}): {bad}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -700,13 +724,16 @@ def assert_temporal_order_consistent(filter_name, params, tol=1e-5,
 # clip's geometry from an argument because mclip is built at the *destination*
 # geometry (EEDI3H transposes, so its mask is built at the source height).
 
+
 def right_half_mask(width, height, length, bits):
     """Gray mask clip: white left half, black right half (drives mclip)."""
     half = width // 2
-    black = vs.core.std.BlankClip(format=vs.GRAY8, width=half, height=height,
-                                  length=length, color=[0])
-    white = vs.core.std.BlankClip(format=vs.GRAY8, width=half, height=height,
-                                  length=length, color=[255])
+    black = vs.core.std.BlankClip(
+        format=vs.GRAY8, width=half, height=height, length=length, color=[0]
+    )
+    white = vs.core.std.BlankClip(
+        format=vs.GRAY8, width=half, height=height, length=length, color=[255]
+    )
     mask8 = vs.core.std.StackHorizontal([white, black])
     return vs.core.fmtc.bitdepth(mask8, bits=bits, fulls=True, fulld=True)
 
@@ -715,11 +742,19 @@ def half_mask(clip, bits, left_white=True):
     """Half-white / half-black Gray mask at ``bits``, at ``clip``'s geometry."""
     half = clip.width // 2
     white = vs.core.std.BlankClip(
-        format=vs.GRAY8, width=half, height=clip.height,
-        length=clip.num_frames, color=[255 if left_white else 0])
+        format=vs.GRAY8,
+        width=half,
+        height=clip.height,
+        length=clip.num_frames,
+        color=[255 if left_white else 0],
+    )
     black = vs.core.std.BlankClip(
-        format=vs.GRAY8, width=clip.width - half, height=clip.height,
-        length=clip.num_frames, color=[0 if left_white else 255])
+        format=vs.GRAY8,
+        width=clip.width - half,
+        height=clip.height,
+        length=clip.num_frames,
+        color=[0 if left_white else 255],
+    )
     m8 = vs.core.std.StackHorizontal([white, black])
     if bits == 8:
         return m8
@@ -729,12 +764,12 @@ def half_mask(clip, bits, left_white=True):
 # Tags an output frame must carry through from the source frame. ``_Range`` is
 # the surviving equivalent of the deprecated ``_ColorRange`` (remapped by
 # SetFrameProps); ``MyTag`` covers arbitrary application metadata.
-PROP_TAGS = {"_DurationNum": 1001, "_DurationDen": 24000, "_Range": 0,
-             "MyTag": 7}
+PROP_TAGS = {"_DurationNum": 1001, "_DurationDen": 24000, "_Range": 0, "MyTag": 7}
 
 
-def assert_preserves_frame_props(filter_func, clip, frames=(0, 11, 23),
-                                 duration_factor=1, **kwargs):
+def assert_preserves_frame_props(
+    filter_func, clip, frames=(0, 11, 23), duration_factor=1, **kwargs
+):
     """The output must republish the source frame's properties, tag for tag.
 
     ``duration_factor`` divides the source duration, matching the reference
@@ -762,6 +797,7 @@ def assert_preserves_frame_props(filter_func, clip, frames=(0, 11, 23),
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="session")
 def noise_gray():
@@ -793,8 +829,7 @@ def _resized(fmt, **kwargs):
 @pytest.fixture(scope="session")
 def noise_yuv32():
     """YUV420PS (float32) version of the noise clip (chroma is subsampled)."""
-    return vs.core.fmtc.bitdepth(_source(NOISE_MKV), bits=32, fulls=True,
-                                 fulld=True)
+    return vs.core.fmtc.bitdepth(_source(NOISE_MKV), bits=32, fulls=True, fulld=True)
 
 
 @pytest.fixture(scope="session")

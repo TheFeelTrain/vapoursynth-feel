@@ -13,9 +13,17 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    assert_changes_on_noise, assert_gray32, assert_preserves_frame_props,
-    assert_temporal_order_consistent, cpu_node, eval_parallel, max_diff,
-    plane as _plane, reference_compare, reference_or_skip, reference_spec,
+    assert_changes_on_noise,
+    assert_gray32,
+    assert_preserves_frame_props,
+    assert_temporal_order_consistent,
+    cpu_node,
+    eval_parallel,
+    max_diff,
+    plane as _plane,
+    reference_compare,
+    reference_or_skip,
+    reference_spec,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -40,9 +48,17 @@ def _ref_compare(fmt, frames, params, planes=None, guide=None, crop=None):
     ``guide`` describes the rclip when the case uses one.
     """
     reference_or_skip("vszipcl", "NLMeans")
-    spec = reference_spec("vszipcl", "NLMeans", fmt, frames=frames,
-                          planes=planes, kwargs=params, guide=guide,
-                          guide_kwarg="rclip", crop=crop)
+    spec = reference_spec(
+        "vszipcl",
+        "NLMeans",
+        fmt,
+        frames=frames,
+        planes=planes,
+        kwargs=params,
+        guide=guide,
+        guide_kwarg="rclip",
+        crop=crop,
+    )
     return reference_compare(spec)["maxdiff"]
 
 
@@ -179,13 +195,12 @@ POSITIVE_MAX_CASES = [
 ]
 
 
-@pytest.mark.parametrize("kwargs,bound,measured", POSITIVE_MAX_CASES,
-                         ids=[str(kw) for kw, _, _ in POSITIVE_MAX_CASES])
-def test_matches_reference_positive_maxima_32bit(noise_gray, kwargs, bound,
-                                                 measured):
+@pytest.mark.parametrize(
+    "kwargs,bound,measured", POSITIVE_MAX_CASES, ids=[str(kw) for kw, _, _ in POSITIVE_MAX_CASES]
+)
+def test_matches_reference_positive_maxima_32bit(noise_gray, kwargs, bound, measured):
     worst = _ref_compare("gray32", (0, 11, 23), dict(**kwargs))
-    assert worst < bound, \
-        f"max diff vs vszipcl {kwargs}: {worst} (bound {bound}, was {measured})"
+    assert worst < bound, f"max diff vs vszipcl {kwargs}: {worst} (bound {bound}, was {measured})"
 
 
 POSITIVE_MAX_16_CASES = [
@@ -194,21 +209,24 @@ POSITIVE_MAX_16_CASES = [
     ({"d": 16, "s": 8}, 1.0, 1),
     ({"d": 16, "a": 64}, 8.0, 5),
     ({"d": 16, "a": 64, "h": 3.0}, 1.0, 1),
-    ({"d": 0, "a": 64}, 200.0, 133),          # fp16 weight envelope at h=1.2
-    ({"d": 0, "a": 64, "h": 3.0}, 1.0, 1),    # same config, weights representable
+    ({"d": 0, "a": 64}, 200.0, 133),  # fp16 weight envelope at h=1.2
+    ({"d": 0, "a": 64, "h": 3.0}, 1.0, 1),  # same config, weights representable
     ({"d": 0, "s": 8, "a": 64, "h": 3.0}, 1.0, 1),
 ]
 
 
-@pytest.mark.parametrize("kwargs,bound,measured", POSITIVE_MAX_16_CASES,
-                         ids=[str(kw) for kw, _, _ in POSITIVE_MAX_16_CASES])
-def test_matches_reference_positive_maxima_16bit(noise_16bit, kwargs, bound,
-                                                 measured):
+@pytest.mark.parametrize(
+    "kwargs,bound,measured",
+    POSITIVE_MAX_16_CASES,
+    ids=[str(kw) for kw, _, _ in POSITIVE_MAX_16_CASES],
+)
+def test_matches_reference_positive_maxima_16bit(noise_16bit, kwargs, bound, measured):
     """16-bit mirror: whole output codes. The a=64/h=1.2 entry carries the
     same fp16-weight envelope (133 codes) and is 1 code at h=3.0."""
     worst = _ref_compare("gray16", (0, 11, 23), dict(**kwargs))
-    assert worst <= bound, \
+    assert worst <= bound, (
         f"max LSB diff vs vszipcl {kwargs}: {worst} (bound {bound}, was {measured})"
+    )
 
 
 def test_yuv_default_denises_luma_copies_chroma_32bit(noise_yuv32):
@@ -230,8 +248,7 @@ def test_yuv_default_denises_luma_copies_chroma_16bit(noise_yuv420_16):
         fa = _plane(out.get_frame(5), p)
         fb = _plane(src.get_frame(5), p)
         assert np.array_equal(fa, fb), f"chroma{p} changed"
-    worst = _ref_compare("yuv420_16", (5,), dict(d=0),
-                         planes=(0,))
+    worst = _ref_compare("yuv420_16", (5,), dict(d=0), planes=(0,))
     assert worst <= 1.0
 
 
@@ -245,9 +262,7 @@ def test_yuv_channels_uv_matches_reference_32bit(noise_yuv32):
     assert max_diff(out, src, planes=(0,), frames=(5,)) == 0.0
     assert max_diff(out, src, planes=(1, 2), frames=(5,)) > 0.0
 
-    worst = _ref_compare("yuv32", (0, 11, 23),
-                         dict(d=0, channels="UV", h=1.5),
-                         planes=(1, 2))
+    worst = _ref_compare("yuv32", (0, 11, 23), dict(d=0, channels="UV", h=1.5), planes=(1, 2))
     assert worst < NLMEANS_REF_TOL
 
 
@@ -307,20 +322,18 @@ UV16_REF_TOL = 8.0
 
 @pytest.mark.parametrize("kwargs", UV32_CASES, ids=lambda kw: str(kw))
 def test_uv_matches_reference_32bit(noise_yuv32, kwargs):
-    worst = _ref_compare("yuv32", (0, 11, 23),
-                         dict(channels="UV", **kwargs),
-                         planes=(1, 2))
+    worst = _ref_compare("yuv32", (0, 11, 23), dict(channels="UV", **kwargs), planes=(1, 2))
     assert worst < NLMEANS_REF_TOL, f"max diff vs vszipcl {kwargs}: {worst}"
 
 
 @pytest.mark.parametrize("kwargs", UV16_CASES, ids=lambda kw: str(kw))
 def test_uv_matches_reference_16bit(noise_yuv420_16, kwargs):
-    worst = _ref_compare("yuv420_16", (0, 11, 23),
-                         dict(channels="UV", **kwargs),
-                         planes=(1, 2))
+    worst = _ref_compare("yuv420_16", (0, 11, 23), dict(channels="UV", **kwargs), planes=(1, 2))
     assert worst <= UV16_REF_TOL, f"max LSB diff vs vszipcl {kwargs}: {worst}"
 
+
 ENVELOPE_FRAMES = (0, 11, 23)
+
 
 def test_wref0_low_h_is_finite_32bit(noise_gray):
     """A fully flushed weight ring must fall back to the centre sample, not 0/0.
@@ -353,22 +366,18 @@ def test_wref0_low_h_envelope_16bit(noise_16bit):
     Only an upper bound is asserted: the defect is documented, not enshrined,
     so fixing it can only lower the number.
     """
-    worst = _ref_compare("gray16", ENVELOPE_FRAMES,
-                         dict(d=0, wref=0.0))
+    worst = _ref_compare("gray16", ENVELOPE_FRAMES, dict(d=0, wref=0.0))
     assert worst < 6000.0, f"fp16 weight-ring envelope moved: {worst}"
 
 
 def test_wref0_low_h_envelope_32bit(noise_gray):
     """Upper bound on the same edge at fp32 (float units; measured ~0.07)."""
-    worst = _ref_compare("gray32", ENVELOPE_FRAMES,
-                         dict(d=0, wref=0.0))
+    worst = _ref_compare("gray32", ENVELOPE_FRAMES, dict(d=0, wref=0.0))
     assert worst < 0.12, f"fp16 weight-ring envelope moved: {worst}"
 
 
 def test_yuv_channels_uv_temporal_matches_reference_32bit(noise_yuv32):
-    worst = _ref_compare("yuv32", (0, 11, 23),
-                         dict(d=1, channels="UV", h=1.5),
-                         planes=(1, 2))
+    worst = _ref_compare("yuv32", (0, 11, 23), dict(d=1, channels="UV", h=1.5), planes=(1, 2))
     assert worst < NLMEANS_REF_TOL
 
 
@@ -376,21 +385,18 @@ def test_yuv444_joint_matches_reference_16bit(noise_yuv444_16):
     # joint processing sums distances across three planes before rounding,
     # so the fp divergence reaches two output codes (measured); single-plane
     # paths stay within one
-    worst = _ref_compare("yuv444_16", (0, 11, 23),
-                         dict(d=0, channels="YUV", h=1.0))
+    worst = _ref_compare("yuv444_16", (0, 11, 23), dict(d=0, channels="YUV", h=1.0))
     assert worst <= 2.0
 
 
 def test_rgb_joint_matches_reference_32bit(noise_rgb32):
-    worst = _ref_compare("rgb32", (0, 11, 23),
-                         dict(d=1, h=1.0))
+    worst = _ref_compare("rgb32", (0, 11, 23), dict(d=1, h=1.0))
     assert worst < NLMEANS_REF_TOL
 
 
 def test_rgb_joint_matches_reference_16bit(noise_rgb16):
     """16-bit mirror of test_rgb_joint_matches_reference (whole codes)."""
-    worst = _ref_compare("rgb16", (0, 11, 23),
-                         dict(d=1, h=1.0))
+    worst = _ref_compare("rgb16", (0, 11, 23), dict(d=1, h=1.0))
     assert worst <= 1.0
 
 
@@ -415,9 +421,12 @@ def test_rclip_guide_matches_reference_32bit(noise_gray):
     mine = _run(src, d=0, h=1.5, rclip=guide)
     plain = _run(src, d=0, h=1.5)
     assert max_diff(mine, plain, frames=(5,)) > 0.0
-    worst = _ref_compare("gray32", (0, 11, 23),
-                         dict(d=0, h=1.5),
-                         guide={"kind": "boxblur", "hradius": 5, "vradius": 5})
+    worst = _ref_compare(
+        "gray32",
+        (0, 11, 23),
+        dict(d=0, h=1.5),
+        guide={"kind": "boxblur", "hradius": 5, "vradius": 5},
+    )
     assert worst < NLMEANS_REF_TOL
 
 
@@ -428,9 +437,12 @@ def test_rclip_guide_matches_reference_16bit(noise_16bit):
     mine = _run(src, d=0, h=1.5, rclip=guide)
     plain = _run(src, d=0, h=1.5)
     assert max_diff(mine, plain, frames=(5,)) > 0.0
-    worst = _ref_compare("gray16", (0, 11, 23),
-                         dict(d=0, h=1.5),
-                         guide={"kind": "boxblur", "hradius": 5, "vradius": 5})
+    worst = _ref_compare(
+        "gray16",
+        (0, 11, 23),
+        dict(d=0, h=1.5),
+        guide={"kind": "boxblur", "hradius": 5, "vradius": 5},
+    )
     assert worst <= 1.0
 
 
@@ -440,9 +452,12 @@ def test_rclip_temporal_matches_reference_early_frames(noise_gray, d):
     guide clip's slot table used to be indexed with the full-window stride
     and read past win_slots. Pre-fix diff vs vszipcl was 2.4e-2 (d=1) and
     6.7e-3 (d=2); frames n >= d matched to ~1e-6."""
-    worst = _ref_compare("gray32", (0, 1, 2, 3),
-                         dict(d=d, h=1.5),
-                         guide={"kind": "boxblur", "hradius": 5, "vradius": 5})
+    worst = _ref_compare(
+        "gray32",
+        (0, 1, 2, 3),
+        dict(d=d, h=1.5),
+        guide={"kind": "boxblur", "hradius": 5, "vradius": 5},
+    )
     assert worst < NLMEANS_REF_TOL, f"max diff vs vszipcl (d={d}): {worst}"
 
 
@@ -450,8 +465,7 @@ def test_stride_handling_matches_reference_32bit(noise_gray):
     # a cropped frame keeps its parent's (wider) stride; the filter must
     # handle non-tight pitches identically to the reference
     assert noise_gray.std.Crop(left=27).width < noise_gray.width
-    worst = _ref_compare("gray32", (0, 11, 23), dict(d=1),
-                         crop={"left": 27})
+    worst = _ref_compare("gray32", (0, 11, 23), dict(d=1), crop={"left": 27})
     assert worst < NLMEANS_REF_TOL
 
 
@@ -459,8 +473,7 @@ def test_stride_handling_matches_reference_16bit(noise_16bit):
     """16-bit mirror of test_stride_handling_matches_reference (whole
     codes)."""
     assert noise_16bit.std.Crop(left=27).width < noise_16bit.width
-    worst = _ref_compare("gray16", (0, 11, 23), dict(d=1),
-                         crop={"left": 27})
+    worst = _ref_compare("gray16", (0, 11, 23), dict(d=1), crop={"left": 27})
     assert worst <= 1.0
 
 
@@ -479,21 +492,14 @@ def test_deterministic_serial_16bit(noise_16bit):
     assert max_diff(a, b) == 0.0
 
 
-
-
-
-
-
-
-
-
 def test_parallel_load_matches_serial_32bit(noise_gray):
     par = eval_parallel(_run, noise_gray, d=2)
     ref = _run(noise_gray, d=2)
     for n in range(noise_gray.num_frames):
         fb = _plane(ref.get_frame(n), 0)
-        assert np.abs(par[n].astype(np.float64) - fb).max() == 0.0, \
+        assert np.abs(par[n].astype(np.float64) - fb).max() == 0.0, (
             f"parallel/serial mismatch at frame {n}"
+        )
 
 
 def test_parallel_load_matches_serial_16bit(noise_16bit):
@@ -501,8 +507,9 @@ def test_parallel_load_matches_serial_16bit(noise_16bit):
     ref = _run(noise_16bit, d=2)
     for n in range(noise_16bit.num_frames):
         fb = _plane(ref.get_frame(n), 0)
-        assert np.abs(par[n].astype(np.float64) - fb).max() == 0.0, \
+        assert np.abs(par[n].astype(np.float64) - fb).max() == 0.0, (
             f"parallel/serial mismatch at frame {n}"
+        )
 
 
 def test_parallel_load_deterministic_32bit(noise_gray):
@@ -521,6 +528,7 @@ def test_parallel_load_deterministic_16bit(noise_16bit):
 
 # --- frame-request order / short clips ---------------------------------------
 
+
 @pytest.mark.parametrize("d", [2, 16])
 def test_frame_request_order_matches_serial(d):
     """The tile cache must return the same pixels whatever order frames arrive.
@@ -529,16 +537,13 @@ def test_frame_request_order_matches_serial(d):
     token can be freed while another request still reads it; only an
     out-of-sequence request pattern makes that observable.
     """
-    assert_temporal_order_consistent(
-        "NLMeans", {"d": d}, tol=0.0, timeout=300)
+    assert_temporal_order_consistent("NLMeans", {"d": d}, tol=0.0, timeout=300)
 
 
 @pytest.mark.parametrize("nframes", [1, 2])
 def test_short_clip_temporal_window(nframes):
     """A clip shorter than the temporal window is order-independent too."""
-    assert_temporal_order_consistent(
-        "NLMeans", {"d": 2}, tol=0.0, nframes=nframes,
-        timeout=300)
+    assert_temporal_order_consistent("NLMeans", {"d": 2}, tol=0.0, nframes=nframes, timeout=300)
 
 
 @pytest.mark.parametrize("radius", [0, 1, 2])
@@ -549,8 +554,6 @@ def test_no_nan_all_frames_32bit(noise_gray, radius):
         a = _plane(out.get_frame(n), 0)
         assert np.isfinite(a).all(), f"non-finite output at frame {n}"
         assert (a >= 0.0).all() and (a <= 1.0).all(), f"out-of-range output at frame {n}"
-
-
 
 
 @pytest.mark.parametrize("radius", [0, 1, 2])
@@ -640,8 +643,7 @@ def test_window_larger_than_old_slot_pool_runs():
     the noise-clip d=16 case above already covers correctness.
     """
     core = vs.core
-    src = core.std.BlankClip(None, 320, 240, vs.YUV444PS, length=20,
-                             color=[0.5, 0.5, 0.5])
+    src = core.std.BlankClip(None, 320, 240, vs.YUV444PS, length=20, color=[0.5, 0.5, 0.5])
     out = _run(src, channels="YUV", d=16)
     assert out.get_frame(16) is not None
 
@@ -654,6 +656,5 @@ def test_cpu_and_gpu_input_match(noise_gray):
     produce identical pixels.
     """
     cpu = _run(noise_gray, d=2)
-    gpu = cpu_node(vs.core.vsfeel.NLMeans(
-        vs.core.std.GPUUpload(clip=noise_gray), d=2))
+    gpu = cpu_node(vs.core.vsfeel.NLMeans(vs.core.std.GPUUpload(clip=noise_gray), d=2))
     assert max_diff(cpu, gpu) == 0.0

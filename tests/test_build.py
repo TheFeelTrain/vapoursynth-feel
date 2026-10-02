@@ -27,7 +27,8 @@ def run_generator(tmp_path, data):
     out = tmp_path / "shader.h"
     proc = subprocess.run(
         [sys.executable, str(GENERATOR), "--out", str(out), str(spv)],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     return proc, out
 
@@ -90,15 +91,23 @@ def test_benchmark_synthetic_scripts_compile_and_eval(monkeypatch):
         assert "vsfeel" in calls, name
         for plugin, chain in calls.items():
             vpy = bench.make_vpy(
-                clip=spec.input, extra=bench._plugin_loader(plugin), chain=chain,
-                frames=1, synth_format=spec.synth_format)
+                clip=spec.input,
+                extra=bench._plugin_loader(plugin),
+                chain=chain,
+                frames=1,
+                synth_format=spec.synth_format,
+            )
             compile(vpy, f"<{name}/{plugin}>", "exec")
             if chain.startswith("from "):
                 continue  # reference arms import vsaa, which may be absent
             # The names the generated vpy prelude defines; the chain only ever
             # reads the clip and the vstools helpers applied to it.
-            env = {"core": MagicMock(), "clip": object(),
-                   "depth": MagicMock(), "get_y": MagicMock()}
+            env = {
+                "core": MagicMock(),
+                "clip": object(),
+                "depth": MagicMock(),
+                "get_y": MagicMock(),
+            }
             exec(chain, env)
 
 

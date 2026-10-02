@@ -36,8 +36,17 @@ from conftest import COMPARE_PRELUDE, NOISE_MKV
 
 # Filters and the arguments the cycle test runs them with.  The concurrency test
 # reuses them on a 64x64 crop.
-FILTERS = ["Bilateral", "GaussBlur", "DFTTest", "NLMeans", "BM3Dv2",
-           "EEDI3", "EEDI3H", "EEDI3AA", "NNEDI3"]
+FILTERS = [
+    "Bilateral",
+    "GaussBlur",
+    "DFTTest",
+    "NLMeans",
+    "BM3Dv2",
+    "EEDI3",
+    "EEDI3H",
+    "EEDI3AA",
+    "NNEDI3",
+]
 
 CYCLES = 200
 WARMUP = 20  # device / pipeline-cache / allocator settling, discarded
@@ -171,7 +180,9 @@ def sample():
     }
 '''
 
-_CYCLE_SCRIPT = _COMMON + r'''
+_CYCLE_SCRIPT = (
+    _COMMON
+    + r"""
 def main():
     name = sys.argv[1]
     g32, g16 = make_clips()
@@ -205,9 +216,13 @@ def main():
 
 
 main()
-'''
+"""
+)
 
-_CONCURRENCY_SCRIPT = COMPARE_PRELUDE + _COMMON + r'''
+_CONCURRENCY_SCRIPT = (
+    COMPARE_PRELUDE
+    + _COMMON
+    + r"""
 SIZE = 64
 FRAMES = 4
 
@@ -263,12 +278,13 @@ def main():
 
 
 main()
-'''
+"""
+)
 
-_CYCLE_SCRIPT = (_CYCLE_SCRIPT.replace("__NOISE_MKV__", repr(NOISE_MKV))
-                 .replace("__CYCLES__", str(CYCLES)))
-_CONCURRENCY_SCRIPT = _CONCURRENCY_SCRIPT.replace("__NOISE_MKV__",
-                                                  repr(NOISE_MKV))
+_CYCLE_SCRIPT = _CYCLE_SCRIPT.replace("__NOISE_MKV__", repr(NOISE_MKV)).replace(
+    "__CYCLES__", str(CYCLES)
+)
+_CONCURRENCY_SCRIPT = _CONCURRENCY_SCRIPT.replace("__NOISE_MKV__", repr(NOISE_MKV))
 
 
 def _run(script, argv=(), timeout=600.0):
@@ -276,7 +292,9 @@ def _run(script, argv=(), timeout=600.0):
     try:
         proc = subprocess.run(
             [sys.executable, "-c", script, *[str(a) for a in argv]],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
         pytest.fail(
@@ -284,15 +302,17 @@ def _run(script, argv=(), timeout=600.0):
             "--- stderr tail ---\n%s"
             % (timeout, (exc.stdout or "")[-2000:], (exc.stderr or "")[-2000:])
         )
-    tail = ("--- stdout tail ---\n%s\n--- stderr tail ---\n%s"
-            % ((proc.stdout or "")[-2000:], (proc.stderr or "")[-2000:]))
+    tail = "--- stdout tail ---\n%s\n--- stderr tail ---\n%s" % (
+        (proc.stdout or "")[-2000:],
+        (proc.stderr or "")[-2000:],
+    )
     payload = None
     for line in (proc.stdout or "").splitlines():
         if line.startswith("RESULT "):
-            payload = line[len("RESULT "):].strip()
+            payload = line[len("RESULT ") :].strip()
     assert proc.returncode == 0 and payload is not None, (
-        "resource subprocess exited %s without a RESULT line\n%s"
-        % (proc.returncode, tail))
+        "resource subprocess exited %s without a RESULT line\n%s" % (proc.returncode, tail)
+    )
     return json.loads(payload)
 
 
@@ -320,13 +340,24 @@ def _trend(samples):
 
 
 def _format(key, trend, limit=None):
-    text = ("  %-4s first %8.2f MB  last %8.2f MB  rise %+7.2f MB  "
-            "min-rise %+7.2f MB  min %8.2f  max %8.2f"
-            % (key, trend["first"] / 1048576, trend["last"] / 1048576,
-               trend["rise"] / 1048576, trend["min_rise"] / 1048576,
-               trend["min"] / 1048576, trend["max"] / 1048576))
-    return (text + "  (limit %.0f MB)" % (limit / 1048576) if limit is not None
-            else text + "  (reported only)")
+    text = (
+        "  %-4s first %8.2f MB  last %8.2f MB  rise %+7.2f MB  "
+        "min-rise %+7.2f MB  min %8.2f  max %8.2f"
+        % (
+            key,
+            trend["first"] / 1048576,
+            trend["last"] / 1048576,
+            trend["rise"] / 1048576,
+            trend["min_rise"] / 1048576,
+            trend["min"] / 1048576,
+            trend["max"] / 1048576,
+        )
+    )
+    return (
+        text + "  (limit %.0f MB)" % (limit / 1048576)
+        if limit is not None
+        else text + "  (reported only)"
+    )
 
 
 @pytest.mark.parametrize("filter_name", FILTERS)
@@ -342,30 +373,40 @@ def test_create_destroy_cycles_keep_memory_bounded(filter_name):
     payload = _run(_CYCLE_SCRIPT, [filter_name], timeout=600.0)
     samples = payload["samples"]
     assert payload["cycles"] == CYCLES and len(samples) == CYCLES, (
-        "%s: expected %d cycles, got %d" % (filter_name, CYCLES,
-                                            len(samples)))
+        "%s: expected %d cycles, got %d" % (filter_name, CYCLES, len(samples))
+    )
 
     keys = ("vram", "gtt", "cpu", "rss", "dev")
     graded = ("vram", "gtt", "cpu", "rss")
     trends = {k: _trend([s[k] for s in samples]) for k in keys}
-    limits = {"vram": GPU_RISE_LIMIT, "gtt": GPU_RISE_LIMIT,
-              "cpu": GPU_RISE_LIMIT, "rss": RSS_RISE_LIMIT}
+    limits = {
+        "vram": GPU_RISE_LIMIT,
+        "gtt": GPU_RISE_LIMIT,
+        "cpu": GPU_RISE_LIMIT,
+        "rss": RSS_RISE_LIMIT,
+    }
 
-    report = ["%s: %d cycles, %.1f ms/cycle"
-              % (filter_name, payload["cycles"],
-                 1000.0 * payload["secs"] / payload["cycles"])]
+    report = [
+        "%s: %d cycles, %.1f ms/cycle"
+        % (filter_name, payload["cycles"], 1000.0 * payload["secs"] / payload["cycles"])
+    ]
     for key in keys:
-        report.append("  %-4s unavailable" % key if trends[key] is None
-                      else _format(key, trends[key], limits.get(key)))
-    report.append("  device released after teardown: %s (teardown %r)"
-                  % (payload["teardown"] in (None, [0, 0, 0]),
-                     payload["teardown"]))
+        report.append(
+            "  %-4s unavailable" % key
+            if trends[key] is None
+            else _format(key, trends[key], limits.get(key))
+        )
+    report.append(
+        "  device released after teardown: %s (teardown %r)"
+        % (payload["teardown"] in (None, [0, 0, 0]), payload["teardown"])
+    )
     print("\n".join(report), flush=True)
 
     assert trends["rss"] is not None, "no RSS samples were taken"
     assert trends["vram"] is not None or trends["dev"] is not None, (
         "no GPU memory accounting available (both per-process DRM fdinfo and "
-        "sysfs mem_info_vram_used are missing)\n" + "\n".join(report))
+        "sysfs mem_info_vram_used are missing)\n" + "\n".join(report)
+    )
 
     bad = []
     for key in graded:
@@ -374,11 +415,15 @@ def test_create_destroy_cycles_keep_memory_bounded(filter_name):
             continue
         grew = max(trend["rise"], trend["min_rise"])
         if grew > limits[key]:
-            bad.append("%s grew %.2f MB over %d cycles (limit %.0f MB)"
-                       % (key, grew / 1048576, CYCLES, limits[key] / 1048576))
-    assert not bad, (
-        "%s leaks over repeated create/destroy cycles:\n  %s\n%s"
-        % (filter_name, "\n  ".join(bad), "\n".join(report)))
+            bad.append(
+                "%s grew %.2f MB over %d cycles (limit %.0f MB)"
+                % (key, grew / 1048576, CYCLES, limits[key] / 1048576)
+            )
+    assert not bad, "%s leaks over repeated create/destroy cycles:\n  %s\n%s" % (
+        filter_name,
+        "\n  ".join(bad),
+        "\n".join(report),
+    )
 
     # The per-cycle trends above are the leak check. The teardown figure is
     # reported only: under the R80 GPU API the core owns the one device, so it
@@ -397,14 +442,14 @@ def test_mixed_filter_concurrency_matches_solo():
     runs under this load.
     """
     payload = _run(_CONCURRENCY_SCRIPT, timeout=900.0)
-    assert not payload["errors"], (
-        "mixed-filter concurrency raised: %s" % "; ".join(payload["errors"]))
+    assert not payload["errors"], "mixed-filter concurrency raised: %s" % "; ".join(
+        payload["errors"]
+    )
 
     missing = [n for n in FILTERS if payload["diffs"].get(n) is None]
     assert not missing, "no concurrent output for: %s" % ", ".join(missing)
 
-    bad = {n: d for n, d in payload["diffs"].items()
-           if d is not None and d != 0.0}
+    bad = {n: d for n, d in payload["diffs"].items() if d is not None and d != 0.0}
     assert not bad, (
-        "concurrent output differs from the solo run (self-consistency must be "
-        "exact): %s" % bad)
+        "concurrent output differs from the solo run (self-consistency must be exact): %s" % bad
+    )

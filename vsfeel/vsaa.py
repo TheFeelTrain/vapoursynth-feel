@@ -140,8 +140,7 @@ class EEDI3(_VsaaEEDI3):
 
 @dataclass
 class NNEDI3(_VsaaNNEDI3):
-    """``vsaa`` NNEDI3 supersampler backed by ``core.vsfeel.NNEDI3``.
-    """
+    """``vsaa`` NNEDI3 supersampler backed by ``core.vsfeel.NNEDI3``."""
 
     @property
     def _deinterlacer_function(self) -> VSFunctionAllArgs:

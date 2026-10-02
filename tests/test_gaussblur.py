@@ -23,9 +23,18 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    WIDTH, HEIGHT, NOISE_MKV, COMPARE_PRELUDE, assert_changes_on_noise,
-    assert_preserves_frame_props, compare_or_skip, cpu_node, eval_parallel,
-    frame_to_ndarray, plane as _plane, reference_or_skip,
+    WIDTH,
+    HEIGHT,
+    NOISE_MKV,
+    COMPARE_PRELUDE,
+    assert_changes_on_noise,
+    assert_preserves_frame_props,
+    compare_or_skip,
+    cpu_node,
+    eval_parallel,
+    frame_to_ndarray,
+    plane as _plane,
+    reference_or_skip,
 )
 
 pytestmark = pytest.mark.usefixtures("noise_gray")
@@ -38,16 +47,19 @@ def _run(clip, sigma=2.0, **kwargs):
     a CPU clip is auto-uploaded by the core and the output is downloaded before
     the host reads it (see conftest.cpu_node).
     """
-    return cpu_node(vs.core.vsfeel.GaussBlur(
-        clip,
-        sigma=sigma,
-        **kwargs,
-    ))
+    return cpu_node(
+        vs.core.vsfeel.GaussBlur(
+            clip,
+            sigma=sigma,
+            **kwargs,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
 # Determinism / stream count
 # ---------------------------------------------------------------------------
+
 
 def test_gaussblur_deterministic_32bit(noise_gray):
     a = _run(noise_gray, sigma=2.0)
@@ -55,8 +67,6 @@ def test_gaussblur_deterministic_32bit(noise_gray):
     for n in (0, 11, 23):
         d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
         assert np.abs(d).max() < 1e-6, f"nondeterministic output at frame {n}"
-
-
 
 
 def test_gaussblur_parallel_load_matches_serial_32bit(noise_gray):
@@ -82,8 +92,6 @@ def test_gaussblur_deterministic_16bit(noise_16bit):
         fa = _plane(a.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         fb = _plane(b.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         assert np.array_equal(fa, fb), f"nondeterministic output at frame {n}"
-
-
 
 
 def test_gaussblur_parallel_load_matches_serial_16bit(noise_16bit):
@@ -193,8 +201,7 @@ def test_gaussblur_matches_reference_large_32bit(noise_gray, sigma):
     assert maxdiff == 0.0, f"large path max diff: {maxdiff}"
 
 
-@pytest.mark.parametrize("sigma", [0.5, 2.0, 5.0, 10.0, 10.5, 11.0, 12.0,
-                                   20.0, 30.0, 40.0, 80.0])
+@pytest.mark.parametrize("sigma", [0.5, 2.0, 5.0, 10.0, 10.5, 11.0, 12.0, 20.0, 30.0, 40.0, 80.0])
 def test_gaussblur_matches_reference_16bit(noise_gray, sigma):
     """16-bit integer input must be bit-identical on both code paths — the
     same sigma sweep (small path, transition, large path) as the 32-bit
@@ -226,12 +233,13 @@ def test_gaussblur_matches_reference_yuv_16bit(noise_gray, sigma):
 # Sanity / numerical behaviour
 # ---------------------------------------------------------------------------
 
+
 def test_gaussblur_sigma_small_vs_large_consistent_32bit(noise_gray):
     """Both code paths (fused small and two-pass large) blur the same constant
     plane to the same value."""
     core = vs.core
     flat = core.std.BlankClip(noise_gray, color=[0.5])
-    out = _run(flat, sigma=20.0)   # large path
+    out = _run(flat, sigma=20.0)  # large path
     for n in (0,):
         a = frame_to_ndarray(out.get_frame(n))
         assert np.abs(a - 0.5).max() < 1e-3, "large path does not preserve a constant plane"
@@ -241,11 +249,10 @@ def test_gaussblur_sigma_small_vs_large_consistent_16bit(noise_16bit):
     """16-bit mirror of the constant-plane check (both code paths)."""
     core = vs.core
     flat = core.std.BlankClip(noise_16bit, color=[32768])
-    out = _run(flat, sigma=20.0)   # large path
+    out = _run(flat, sigma=20.0)  # large path
     for n in (0,):
         a = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.float64)
-        assert np.abs(a - 32768.0).max() < 66.0, \
-            "large path does not preserve a constant plane"
+        assert np.abs(a - 32768.0).max() < 66.0, "large path does not preserve a constant plane"
 
 
 def test_gaussblur_sigma_zero_passthrough_yuv_16bit(noise_gray):
@@ -262,11 +269,11 @@ def test_gaussblur_sigma_zero_passthrough_yuv_16bit(noise_gray):
         assert np.array_equal(lum, lum_src), f"luma changed at frame {n}"
         # chroma is actually blurred (differs from input)
         for p in (1, 2):
-                w = WIDTH // 2
-                h = HEIGHT // 2
-                a = _plane(f, p, w, h, np.uint16)
-                b = _plane(s, p, w, h, np.uint16)
-                assert not np.array_equal(a, b), f"chroma{p} not blurred at frame {n}"
+            w = WIDTH // 2
+            h = HEIGHT // 2
+            a = _plane(f, p, w, h, np.uint16)
+            b = _plane(s, p, w, h, np.uint16)
+            assert not np.array_equal(a, b), f"chroma{p} not blurred at frame {n}"
 
 
 def test_gaussblur_sigma_zero_passthrough_yuv_32bit(noise_gray):
@@ -283,11 +290,11 @@ def test_gaussblur_sigma_zero_passthrough_yuv_32bit(noise_gray):
         assert np.array_equal(lum, lum_src), f"luma changed at frame {n}"
         # chroma is actually blurred (differs from input)
         for p in (1, 2):
-                w = WIDTH // 2
-                h = HEIGHT // 2
-                a = _plane(f, p, w, h)
-                b = _plane(s, p, w, h)
-                assert not np.array_equal(a, b), f"chroma{p} not blurred at frame {n}"
+            w = WIDTH // 2
+            h = HEIGHT // 2
+            a = _plane(f, p, w, h)
+            b = _plane(s, p, w, h)
+            assert not np.array_equal(a, b), f"chroma{p} not blurred at frame {n}"
 
 
 def test_gaussblur_changes_noise_16bit(noise_16bit):
@@ -309,6 +316,7 @@ def test_gaussblur_preserves_frame_props(noise_gray):
 # ---------------------------------------------------------------------------
 # Input validation
 # ---------------------------------------------------------------------------
+
 
 def test_gaussblur_rejects_all_copy_through(noise_gray):
     with pytest.raises(vs.Error):
@@ -334,8 +342,6 @@ def test_gaussblur_rejects_bad_bitdepth(noise_8bit):
         _run(clip)
 
 
-
-
 # ---------------------------------------------------------------------------
 # Per-plane sigma arrays
 # ---------------------------------------------------------------------------
@@ -345,25 +351,31 @@ def test_gaussblur_rejects_bad_bitdepth(noise_8bit):
 # default implicitly. Must stay bit-exact.
 
 
-@pytest.mark.parametrize("sigma,tol", [
-    ([2.0, 1.0, 1.0], 0.0),          # explicit chroma-rule values
-    ([2.0, 3.0, 4.0], 0.0),          # increasing, all processed
-    ([0.0, 2.0, 2.0], 0.0),          # luma passes through
-    ([20.0, 2.0, 2.0], 0.0),         # large path on luma only
-    ([0.5, 10.5, 30.0], 0.0),        # one sigma per code path
-], ids=["chroma-rule", "increasing", "luma-passthrough", "luma-large",
-        "per-plane-paths"])
-def test_gaussblur_per_plane_sigma_matches_reference_yuv_32bit(
-        noise_gray, sigma, tol):
+@pytest.mark.parametrize(
+    "sigma,tol",
+    [
+        ([2.0, 1.0, 1.0], 0.0),  # explicit chroma-rule values
+        ([2.0, 3.0, 4.0], 0.0),  # increasing, all processed
+        ([0.0, 2.0, 2.0], 0.0),  # luma passes through
+        ([20.0, 2.0, 2.0], 0.0),  # large path on luma only
+        ([0.5, 10.5, 30.0], 0.0),  # one sigma per code path
+    ],
+    ids=["chroma-rule", "increasing", "luma-passthrough", "luma-large", "per-plane-paths"],
+)
+def test_gaussblur_per_plane_sigma_matches_reference_yuv_32bit(noise_gray, sigma, tol):
     maxdiff = _max_diff_vs_reference("yuv32", sigma)
     assert maxdiff <= tol, f"yuv32 per-plane sigma max diff ({sigma}): {maxdiff}"
 
 
-@pytest.mark.parametrize("sigma", [
-    [2.0, 1.0, 1.0],
-    [2.0, 3.0, 4.0],
-    [0.0, 2.0, 2.0],
-], ids=["chroma-rule", "increasing", "luma-passthrough"])
+@pytest.mark.parametrize(
+    "sigma",
+    [
+        [2.0, 1.0, 1.0],
+        [2.0, 3.0, 4.0],
+        [0.0, 2.0, 2.0],
+    ],
+    ids=["chroma-rule", "increasing", "luma-passthrough"],
+)
 def test_gaussblur_per_plane_sigma_matches_reference_yuv_16bit(noise_gray, sigma):
     """16-bit mirror of the per-plane array sweep (bit-exact)."""
     maxdiff = _max_diff_vs_reference("yuv16", sigma)
@@ -386,6 +398,7 @@ def test_gaussblur_per_plane_sigma_gray_32bit(noise_gray):
 # radius >= dimension error
 # ---------------------------------------------------------------------------
 
+
 def test_gaussblur_rejects_radius_ge_dimension():
     """A kernel radius reaching the plane dimension would read past the
     mirror-clamped window and must be rejected at creation.
@@ -406,8 +419,7 @@ def test_gaussblur_rejects_radius_ge_dimension_per_plane(noise_gray):
     """The check is per processed plane: a large chroma sigma on a small
     subsampled chroma plane must be rejected even when luma is fine."""
     core = vs.core
-    small = core.std.BlankClip(format=vs.YUV420PS, width=64, height=64,
-                               length=2)
+    small = core.std.BlankClip(format=vs.YUV420PS, width=64, height=64, length=2)
     # chroma plane is 32x32; sigma 16 exceeds it while luma (64) is fine
     with pytest.raises(vs.Error, match=r"radius >= dimension"):
         _run(small, sigma=[2.0, 16.0, 16.0])
@@ -423,6 +435,7 @@ def test_gaussblur_rejects_radius_ge_dimension_per_plane(noise_gray):
 # R-1 = 7, thread-aligned). The reference skips those taps by index, so the
 # footprint must match exactly.
 
+
 def _gauss_radius(sigma):
     """Kernel radius the host derives for ``sigma`` (see get_gauss_kernel).
 
@@ -437,16 +450,17 @@ def _gauss_radius(sigma):
 
 def _poke_nonfinite(clip, value, oy, ox):
     """``clip`` with ``value`` written to plane 0 at (oy, ox) on every frame."""
+
     def poke(n, f):
         out = f.copy()
         np.asarray(out[0])[oy, ox] = value
         return out
+
     return clip.std.ModifyFrame(clip, poke)
 
 
 @pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
-def test_gaussblur_nonfinite_footprint_is_one_kernel_window_32bit(
-        noise_gray, value):
+def test_gaussblur_nonfinite_footprint_is_one_kernel_window_32bit(noise_gray, value):
     """A single non-finite pixel may only affect its kernel window.
 
     Pixel (oy, ox) is interior, so with the padding taps skipped the output is
@@ -455,23 +469,25 @@ def test_gaussblur_nonfinite_footprint_is_one_kernel_window_32bit(
     skipped is compiler-dependent, so this oracle does not catch every build;
     the reference comparison below does.
     """
-    sigma = 40.0                       # radius 119 -> the two-pass path
+    sigma = 40.0  # radius 119 -> the two-pass path
     radius = _gauss_radius(sigma)
     oy, ox = HEIGHT // 2 + 3, WIDTH // 2 + 5
     clean = _run(noise_gray, sigma=sigma)
     bad = _run(_poke_nonfinite(noise_gray, value, oy, ox), sigma=sigma)
 
     footprint = np.zeros((HEIGHT, WIDTH), dtype=bool)
-    footprint[oy - radius:oy + radius + 1, ox - radius:ox + radius + 1] = True
+    footprint[oy - radius : oy + radius + 1, ox - radius : ox + radius + 1] = True
 
     for n in (3, 11, 23):
         a = _plane(bad.get_frame(n), 0)
         b = _plane(clean.get_frame(n), 0)
         assert np.array_equal(np.isfinite(a), ~footprint), (
             f"{value!r} at ({oy},{ox}): footprint is not the kernel window on "
-            f"frame {n} ({int((np.isfinite(a) != ~footprint).sum())} pixels off)")
+            f"frame {n} ({int((np.isfinite(a) != ~footprint).sum())} pixels off)"
+        )
         assert np.array_equal(a[~footprint], b[~footprint]), (
-            f"finite pixels changed by a {value!r} sample on frame {n}")
+            f"finite pixels changed by a {value!r} sample on frame {n}"
+        )
 
 
 _NONFINITE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
@@ -527,11 +543,10 @@ _NONFINITE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 def test_gaussblur_nonfinite_footprint_matches_reference_32bit(kind, sigma):
     """The non-finite footprint and the finite pixels must match vszipcl."""
     reference_or_skip("vszipcl", "GaussBlur")
-    result = compare_or_skip(_NONFINITE_SCRIPT, [kind, json.dumps(sigma)],
-                             timeout=300)
+    result = compare_or_skip(_NONFINITE_SCRIPT, [kind, json.dumps(sigma)], timeout=300)
     assert result["mismatch"] == 0, (
-        f"{kind} sigma={sigma}: {result['mismatch']} pixels disagree on "
-        f"finiteness vs vszipcl")
+        f"{kind} sigma={sigma}: {result['mismatch']} pixels disagree on finiteness vs vszipcl"
+    )
     assert result["maxdiff"] == 0.0, (
-        f"{kind} sigma={sigma}: finite pixels differ from vszipcl by "
-        f"{result['maxdiff']}")
+        f"{kind} sigma={sigma}: finite pixels differ from vszipcl by {result['maxdiff']}"
+    )
