@@ -8,8 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- BM3Dv2's `radius` now accepts up to 16 instead of 4, matching vszipcl.
-- BM3Dv2 now denoises all planes of YUV and RGB clips and supports the joint 4:4:4 `chroma` mode.
+- BM3Dv2 accepts up to `radius=16` instead of 4, matching vszipcl.
+- BM3Dv2 follows VapourSynth-BM3D for block matching and filtering instead of the BM3DCUDA.
+- BM3Dv2 denoises all planes of YUV clips and supports the joint 4:4:4 `chroma=True` mode.
 
 ## [1.0.0] - 2026-10-01
 
@@ -41,7 +42,7 @@ This is a major version because the plugin moved to the VapourSynth R80 GPU API.
 
 ### Added
 
-- `VSFEEL_DEBUG` prints a device banner and a full error trace. `=2` adds per frame traces and GPU timings.
+- `VSFEEL_DEBUG=1` prints a device banner and a full error trace. `VSFEEL_DEBUG=2` adds per frame traces and GPU timings.
 
 ### Changed
 

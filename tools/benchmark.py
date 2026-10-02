@@ -457,8 +457,14 @@ def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
         f"bm_range={ns.bm3d_bm_range}, ps_range={ns.bm3d_ps_range}, "
         f"block_step={ns.bm3d_block_step}"
     )
+    # th_mse only exists in vsfeel, and a value that accepts every candidate
+    # makes its groups as large as the references' fixed eight: the only way to
+    # compare the two matchers on the same amount of filtering work.
+    feel = common
+    if ns.bm3d_th_mse is not None:
+        feel = f"{common}, th_mse={ns.bm3d_th_mse}"
     return {
-        "vsfeel": f"core.vsfeel.BM3Dv2({clip}, {common})",
+        "vsfeel": f"core.vsfeel.BM3Dv2({clip}, {feel})",
         "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {common})",
         "bm3dvk": f"core.bm3dvk.BM3Dv2({clip}, {common})",
     }
@@ -706,6 +712,15 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("bm_range", "--bm3d-bm-range", "bm3d_bm_range", int, 9),
             Arg("ps_range", "--bm3d-ps-range", "bm3d_ps_range", int, 4),
             Arg("block_step", "--bm3d-block-step", "bm3d_block_step", int, 8),
+            Arg(
+                "th_mse",
+                "--bm3d-th-mse",
+                "bm3d_th_mse",
+                float,
+                None,
+                "vsfeel only: matching threshold in 8-bit MSE units (default: "
+                "the stage's sigma-scaled value)",
+            ),
         ],
         build=_bm3d_build,
         input="depth(get_y(clip), 32)",

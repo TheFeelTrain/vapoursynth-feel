@@ -25,7 +25,7 @@ import vapoursynth as vs
 from conftest import (
     WIDTH,
     HEIGHT,
-    NOISE_MKV,
+    CLIP_PATH,
     assert_preserves_frame_props,
     cpu_node,
     plane as _plane,
@@ -35,7 +35,7 @@ from conftest import (
     right_half_mask,
 )
 
-pytestmark = pytest.mark.usefixtures("noise_gray")
+pytestmark = pytest.mark.usefixtures("clip_gray")
 
 
 def _runh(clip, field=1, **kwargs):
@@ -139,45 +139,45 @@ def _dh_out_w(kw):
 @pytest.mark.parametrize(
     "kw", ORACLE_CASES_16, ids=[f"case{i}" for i in range(len(ORACLE_CASES_16))]
 )
-def test_eedi3h_transpose_oracle_16bit(noise_16bit, kw):
+def test_eedi3h_transpose_oracle_16bit(clip_16bit, kw):
     """u16 EEDI3H == Transpose(EEDI3(Transpose)) bit-exactly."""
     field = kw.get("field", 1)
     out_w = _dh_out_w(kw)
-    frames = [0, 11] if field <= 1 else [0, 5, 2 * noise_16bit.num_frames - 1]
-    _assert_oracle_exact(noise_16bit, np.uint16, out_w, HEIGHT, frames, **kw)
+    frames = [0, 11] if field <= 1 else [0, 5, 2 * clip_16bit.num_frames - 1]
+    _assert_oracle_exact(clip_16bit, np.uint16, out_w, HEIGHT, frames, **kw)
 
 
 @pytest.mark.parametrize(
     "kw", ORACLE_CASES_32, ids=[f"case{i}" for i in range(len(ORACLE_CASES_32))]
 )
-def test_eedi3h_transpose_oracle_32bit(noise_gray, kw):
+def test_eedi3h_transpose_oracle_32bit(clip_gray, kw):
     """f32 EEDI3H == Transpose(EEDI3(Transpose)) bit-exactly."""
     field = kw.get("field", 1)
     out_w = _dh_out_w(kw)
-    frames = [0, 11] if field <= 1 else [0, 5, 2 * noise_gray.num_frames - 1]
-    _assert_oracle_exact(noise_gray, np.float32, out_w, HEIGHT, frames, **kw)
+    frames = [0, 11] if field <= 1 else [0, 5, 2 * clip_gray.num_frames - 1]
+    _assert_oracle_exact(clip_gray, np.float32, out_w, HEIGHT, frames, **kw)
 
 
-def test_eedi3h_transpose_oracle_mclip(noise_16bit):
+def test_eedi3h_transpose_oracle_mclip(clip_16bit):
     """mclip flows through the composition transposed (exact)."""
-    clip = noise_16bit
+    clip = clip_16bit
     kw = dict(field=1, mdis=5, nrad=1, vcheck=2)
     m = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 8)
     _assert_oracle_exact(clip, np.uint16, WIDTH, HEIGHT, [0, 11], mclip=m, **kw)
 
 
-def test_eedi3h_transpose_oracle_sclip(noise_16bit):
+def test_eedi3h_transpose_oracle_sclip(clip_16bit):
     """sclip (2N frames under field>1) flows through transposed (exact)."""
-    clip = noise_16bit
+    clip = clip_16bit
     kw = dict(field=3, mdis=5, nrad=1, vcheck=2)
     s = vs.core.std.Interleave([clip, clip])
     n_out = 2 * clip.num_frames
     _assert_oracle_exact(clip, np.uint16, WIDTH, HEIGHT, [0, 5, n_out - 1], sclip=s, **kw)
 
 
-def test_eedi3h_transpose_oracle_mclip_sclip(noise_16bit):
+def test_eedi3h_transpose_oracle_mclip_sclip(clip_16bit):
     """mclip + sclip together (exact)."""
-    clip = noise_16bit
+    clip = clip_16bit
     kw = dict(field=1, mdis=20, nrad=2, vcheck=2)
     m = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 8)
     _assert_oracle_exact(clip, np.uint16, WIDTH, HEIGHT, [0, 11], mclip=m, sclip=clip, **kw)
@@ -188,7 +188,7 @@ def test_eedi3h_transpose_oracle_mclip_sclip(noise_16bit):
 # ---------------------------------------------------------------------------
 
 
-def test_eedi3h_vszipcl_loose(noise_16bit):
+def test_eedi3h_vszipcl_loose(clip_16bit):
     """Rough agreement with vszipcl.EEDI3H (family gap, not an oracle).
 
     Measured on noise: ~1.7% pixels differ, max a few hundred LSB. Catches
@@ -215,9 +215,9 @@ def test_eedi3h_vszipcl_loose(noise_16bit):
 # ---------------------------------------------------------------------------
 
 
-def test_eedi3h_output_dims_and_props(noise_16bit):
+def test_eedi3h_output_dims_and_props(clip_16bit):
     """Width/height/frames follow the horizontal convention."""
-    clip = noise_16bit
+    clip = clip_16bit
     base = _runh(clip, field=1, mdis=5)
     assert (base.width, base.height) == (WIDTH, HEIGHT)
     assert base.num_frames == clip.num_frames
@@ -238,14 +238,14 @@ def test_eedi3h_output_dims_and_props(noise_16bit):
         )
 
 
-def test_eedi3h_preserves_frame_props(noise_gray):
+def test_eedi3h_preserves_frame_props(clip_gray):
     """The transpose composition must keep the source frame's properties."""
-    assert_preserves_frame_props(_runh, noise_gray, field=1, mdis=5, nrad=1, vcheck=0)
+    assert_preserves_frame_props(_runh, clip_gray, field=1, mdis=5, nrad=1, vcheck=0)
 
 
-def test_eedi3h_rejects_odd_width(noise_16bit):
+def test_eedi3h_rejects_odd_width(clip_16bit):
     """The interpolated (horizontal) axis must be mod 2 when dh=False."""
-    odd = noise_16bit.std.Crop(right=1)
+    odd = clip_16bit.std.Crop(right=1)
     assert odd.width % 2 == 1
     with pytest.raises(vs.Error):
         _runh(odd, field=1, mdis=5).get_frame(0)
@@ -255,14 +255,14 @@ def test_eedi3h_rejects_odd_width(noise_16bit):
     ok.get_frame(0)
 
 
-def test_eedi3h_masked_region_is_horizontal_cubic(noise_16bit):
+def test_eedi3h_masked_region_is_horizontal_cubic(clip_16bit):
     """Inside a masked (black) region the pixel is the HORIZONTAL cubic of
     the two kept columns (mirror of EEDI3's vertical-cubic guarantee)."""
-    clip = noise_16bit
+    clip = clip_16bit
     kw = dict(field=0, mdis=5, nrad=1, vcheck=0)
     m = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
     out = _runh(clip, mclip=m, **kw)
-    src = noise_16bit
+    src = clip_16bit
     f = out.get_frame(0)
     s = src.get_frame(0)
     d = _plane(f, 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
@@ -281,18 +281,18 @@ def test_eedi3h_masked_region_is_horizontal_cubic(noise_16bit):
     )
 
 
-def test_eedi3h_determinism(noise_16bit):
+def test_eedi3h_determinism(clip_16bit):
     """Repeated runs agree exactly."""
-    clip = noise_16bit
+    clip = clip_16bit
     kw = dict(field=1, mdis=5, nrad=1, vcheck=2)
     a = _plane(_runh(clip, **kw).get_frame(3), 0, WIDTH, HEIGHT, np.uint16)
     b = _plane(_runh(clip, **kw).get_frame(3), 0, WIDTH, HEIGHT, np.uint16)
     assert np.array_equal(a, b)
 
 
-def test_eedi3h_yuv_planes(noise_16bit):
+def test_eedi3h_yuv_planes(clip_16bit):
     """YUV input works; unprocessed chroma passes through (exact oracle)."""
-    src = vs.core.std.ShufflePlanes(noise_16bit, [0, 0, 0], vs.YUV)
+    src = vs.core.std.ShufflePlanes(clip_16bit, [0, 0, 0], vs.YUV)
     src = vs.core.resize.Bicubic(src, format=vs.YUV420P16)
     kw = dict(field=1, mdis=5, nrad=1, vcheck=0, planes=[0])
     my = _runh(src, **kw)
@@ -316,30 +316,30 @@ def test_eedi3h_yuv_planes(noise_16bit):
 # dh checks apply to.
 
 
-def test_eedi3h_rejects_8bit(noise_8bit):
+def test_eedi3h_rejects_8bit(clip_8bit):
     with pytest.raises(vs.Error):
-        _runh(noise_8bit, field=1)
+        _runh(clip_8bit, field=1)
 
 
-def test_eedi3h_rejects_10bit(noise_8bit):
-    clip = vs.core.fmtc.bitdepth(noise_8bit, bits=10)
+def test_eedi3h_rejects_10bit(clip_8bit):
+    clip = vs.core.fmtc.bitdepth(clip_8bit, bits=10)
     with pytest.raises(vs.Error):
         _runh(clip, field=1)
 
 
-def test_eedi3h_rejects_bad_field(noise_16bit):
+def test_eedi3h_rejects_bad_field(clip_16bit):
     for bad in (-1, 4):
         with pytest.raises(vs.Error):
-            _runh(noise_16bit, field=bad)
+            _runh(clip_16bit, field=bad)
 
 
-def test_eedi3h_rejects_dh_with_field_gt1(noise_16bit):
+def test_eedi3h_rejects_dh_with_field_gt1(clip_16bit):
     for field in (2, 3):
         with pytest.raises(vs.Error):
-            _runh(noise_16bit, field=field, dh=1)
+            _runh(clip_16bit, field=field, dh=1)
 
 
-def test_eedi3h_rejects_bad_alpha_beta(noise_16bit):
+def test_eedi3h_rejects_bad_alpha_beta(clip_16bit):
     for kw in (
         {"alpha": -0.1},
         {"alpha": 1.5},
@@ -348,103 +348,103 @@ def test_eedi3h_rejects_bad_alpha_beta(noise_16bit):
         {"beta": -0.1},
     ):
         with pytest.raises(vs.Error):
-            _runh(noise_16bit, field=1, **kw)
+            _runh(clip_16bit, field=1, **kw)
 
 
-def test_eedi3h_rejects_bad_gamma(noise_16bit):
+def test_eedi3h_rejects_bad_gamma(clip_16bit):
     with pytest.raises(vs.Error):
-        _runh(noise_16bit, field=1, gamma=-1.0)
+        _runh(clip_16bit, field=1, gamma=-1.0)
 
 
-def test_eedi3h_rejects_bad_nrad(noise_16bit):
+def test_eedi3h_rejects_bad_nrad(clip_16bit):
     for bad in (-1, 4):
         with pytest.raises(vs.Error):
-            _runh(noise_16bit, field=1, nrad=bad)
+            _runh(clip_16bit, field=1, nrad=bad)
 
 
-def test_eedi3h_rejects_bad_mdis(noise_16bit):
+def test_eedi3h_rejects_bad_mdis(clip_16bit):
     for bad in (0, 41):
         with pytest.raises(vs.Error):
-            _runh(noise_16bit, field=1, mdis=bad)
+            _runh(clip_16bit, field=1, mdis=bad)
 
 
-def test_eedi3h_rejects_bad_vcheck(noise_16bit):
+def test_eedi3h_rejects_bad_vcheck(clip_16bit):
     for bad in (-1, 4):
         with pytest.raises(vs.Error):
-            _runh(noise_16bit, field=1, vcheck=bad)
+            _runh(clip_16bit, field=1, vcheck=bad)
 
 
-def test_eedi3h_rejects_bad_vthresh(noise_16bit):
+def test_eedi3h_rejects_bad_vthresh(clip_16bit):
     for kw in ({"vthresh0": 0.0}, {"vthresh1": -5.0}, {"vthresh2": 0.0}):
         with pytest.raises(vs.Error):
-            _runh(noise_16bit, field=1, vcheck=2, **kw)
+            _runh(clip_16bit, field=1, vcheck=2, **kw)
     # ignored when vcheck == 0
-    _runh(noise_16bit, field=1, vcheck=0, vthresh0=0.0)
+    _runh(clip_16bit, field=1, vcheck=0, vthresh0=0.0)
 
 
-def test_eedi3h_rejects_bad_planes(noise_16bit):
+def test_eedi3h_rejects_bad_planes(clip_16bit):
     with pytest.raises(vs.Error):
-        _runh(noise_16bit, field=1, planes=[0, 0])
+        _runh(clip_16bit, field=1, planes=[0, 0])
     with pytest.raises(vs.Error):
-        _runh(noise_16bit, field=1, planes=[5])
+        _runh(clip_16bit, field=1, planes=[5])
 
 
 def test_eedi3h_rejects_dh_with_a_planes_subset():
     """dh cannot leave a plane unprocessed (see test_eedi3.py)."""
-    src = vs.core.bs.VideoSource(NOISE_MKV)
+    src = vs.core.bs.VideoSource(CLIP_PATH)
     yuv = vs.core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
     with pytest.raises(vs.Error):
         _runh(yuv, field=1, dh=1, planes=[0])
     _runh(yuv, field=1, dh=1)  # every plane under dh is still legal
 
 
-def test_eedi3h_ignores_device_id_and_num_streams(noise_16bit):
+def test_eedi3h_ignores_device_id_and_num_streams(clip_16bit):
     """Both are registered no-ops: any value must be ignored."""
-    base = _runh(noise_16bit, field=1)
+    base = _runh(clip_16bit, field=1)
     ref = _plane(base.get_frame(5), 0)
     for kw in (dict(device_id=-1), dict(device_id=99), dict(num_streams=0), dict(num_streams=64)):
-        out = _plane(_runh(noise_16bit, field=1, **kw).get_frame(5), 0)
+        out = _plane(_runh(clip_16bit, field=1, **kw).get_frame(5), 0)
         assert np.array_equal(out, ref), f"{kw} changed the output"
 
 
-def test_eedi3h_rejects_mclip_not_gray(noise_16bit):
-    src = vs.core.bs.VideoSource(NOISE_MKV)
+def test_eedi3h_rejects_mclip_not_gray(clip_16bit):
+    src = vs.core.bs.VideoSource(CLIP_PATH)
     yuv = vs.core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
     with pytest.raises(vs.Error):
-        _runh(noise_16bit, field=1, mclip=yuv)
+        _runh(clip_16bit, field=1, mclip=yuv)
 
 
-def test_eedi3h_rejects_mclip_wrong_dims(noise_16bit):
+def test_eedi3h_rejects_mclip_wrong_dims(clip_16bit):
     small = vs.core.std.BlankClip(
-        format=vs.GRAY8, width=100, height=100, length=noise_16bit.num_frames, color=[128]
+        format=vs.GRAY8, width=100, height=100, length=clip_16bit.num_frames, color=[128]
     )
     with pytest.raises(vs.Error):
-        _runh(noise_16bit, field=1, mclip=small)
+        _runh(clip_16bit, field=1, mclip=small)
 
 
-def test_eedi3h_rejects_mclip_wrong_frames(noise_16bit):
+def test_eedi3h_rejects_mclip_wrong_frames(clip_16bit):
     short = vs.core.std.BlankClip(
         format=vs.GRAY8, width=WIDTH, height=HEIGHT, length=1, color=[128]
     )
     with pytest.raises(vs.Error):
-        _runh(noise_16bit, field=1, mclip=short)
+        _runh(clip_16bit, field=1, mclip=short)
 
 
-def test_eedi3h_rejects_sclip_wrong_dims_when_vcheck(noise_16bit):
+def test_eedi3h_rejects_sclip_wrong_dims_when_vcheck(clip_16bit):
     """sclip is validated only when vcheck > 0 (eedi3m semantics)."""
     small = vs.core.std.BlankClip(
-        format=vs.GRAY16, width=100, height=100, length=noise_16bit.num_frames
+        format=vs.GRAY16, width=100, height=100, length=clip_16bit.num_frames
     )
     with pytest.raises(vs.Error):
-        _runh(noise_16bit, field=1, vcheck=2, sclip=small)
+        _runh(clip_16bit, field=1, vcheck=2, sclip=small)
     # ignored (not validated) when vcheck == 0
-    _runh(noise_16bit, field=1, vcheck=0, sclip=small)
+    _runh(clip_16bit, field=1, vcheck=0, sclip=small)
 
 
-def test_eedi3h_sclip_requires_2n_frames_under_field_gt1(noise_16bit):
+def test_eedi3h_sclip_requires_2n_frames_under_field_gt1(clip_16bit):
     """sclip describes the OUTPUT: field > 1 doubles the frame count, so the
     sclip must carry 2N frames (one per output frame, as based_aa builds it)."""
-    clip = noise_16bit
+    clip = clip_16bit
     N = clip.num_frames
     base = dict(field=3, mdis=5, nrad=1, vcheck=2)
     with pytest.raises(vs.Error):
@@ -457,10 +457,10 @@ def test_eedi3h_sclip_requires_2n_frames_under_field_gt1(noise_16bit):
     out.get_frame(2 * N - 1)
 
 
-def test_eedi3h_sclip_dh_requires_doubled_width(noise_16bit):
+def test_eedi3h_sclip_dh_requires_doubled_width(clip_16bit):
     """Under dh EEDI3H doubles the output WIDTH (not the height), so the sclip
     must be twice as wide as the source."""
-    clip = noise_16bit
+    clip = clip_16bit
     base = dict(field=1, dh=1, mdis=5, nrad=1, vcheck=2)
     with pytest.raises(vs.Error):
         _runh(clip, sclip=clip, **base)  # 1x width: wrong

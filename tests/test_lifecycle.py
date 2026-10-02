@@ -18,7 +18,7 @@ import textwrap
 
 import pytest
 
-from conftest import NOISE_MKV
+from conftest import CLIP_PATH
 
 _LIFECYCLE_SCRIPT = textwrap.dedent(f"""\
     import sys
@@ -28,7 +28,7 @@ _LIFECYCLE_SCRIPT = textwrap.dedent(f"""\
     core = vs.core
     core.max_cache_size = 512
 
-    src = core.bs.VideoSource({NOISE_MKV!r})
+    src = core.bs.VideoSource({CLIP_PATH!r})
     gray = core.std.ShufflePlanes(src, 0, vs.GRAY)
     f32 = core.fmtc.bitdepth(gray, bits=32, fulls=True, fulld=True)
     # a longer clip so the worker threads keep submitting frames throughout
@@ -87,10 +87,10 @@ _LIFECYCLE_SCRIPT = textwrap.dedent(f"""\
 """)
 
 
-def test_concurrent_create_destroy_with_active_graph(noise_gray):
+def test_concurrent_create_destroy_with_active_graph(clip_gray):
     """Creating/destroying nodes must not disturb a concurrently running graph.
 
-    ``noise_gray`` is requested only so this test depends on the usual source
+    ``clip_gray`` is requested only so this test depends on the usual source
     setup; the subprocess builds its own graph.
     """
     try:

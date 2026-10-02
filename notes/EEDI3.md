@@ -491,6 +491,23 @@ passes). All bit-identical to the previous build unless stated.
 
 ## Open work
 
+- **`eedi3h_vszipcl_loose` fails on the new test clip (2026-10-02)**: 4297
+  against the test's own 4096 sanity bound. The clip changed from 24 frames of
+  near-black noise to Big Buck Bunny 360p with grain (tests/ATTRIBUTION.md).
+
+- **Eight EEDI3 comparisons fail on the new test clip (2026-10-02).**
+  `matches_vk2_reference[16bit]` (1 LSB against a 0 tolerance) and `[32bit]`
+  (0.049), `mclip_gray8_matches_vk2_same_format[16bit]`,
+  `mclip_masked_region_is_vertical_cubic` (13316 vs an expected 13460),
+  `mclip_field_gt1_matches_vk2[field2/field3]`,
+  `sclip_requires_2n_frames_under_field_gt1`, `sclip_content_matches_vk2`.
+  EEDI3 is edge-directed, so the old near-black noise clip left almost every
+  interpolation decision degenerate; real content moves them. The
+  `mclip_masked_region_is_vertical_cubic` failure is an expectation about where
+  an edge falls, not a bound: it needs rethinking rather than re-measuring.
+  The `sclip_requires_2n_frames_under_field_gt1` and `field_gt1` entries may be
+  the `nframes` fix (below) finally building the short clip they name.
+
 - **Row kernel register pressure**: `RING_CAP` is not it. Trimming the fixed
   bound to `2*NRAD+1` leaves the compiled row kernel **byte-identical** at
   nrad=1/2/3 (VGPR 96/96/120, 16/16/12 subgroups/SIMD, no spills): the

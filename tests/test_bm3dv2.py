@@ -1,7 +1,7 @@
 """Unit tests for core.vsfeel.BM3Dv2.
 
-The committed tests/noise_24f.mkv clip (24 frames of random noise) is used as
-the input. The noise content exposes the boundary/clamping behaviour of the
+The committed tests/bigbuckbunny_360p_grain.mp4 clip (real 360p content with
+baked-in grain) is used as the input. The noise content exposes the boundary/clamping behaviour of the
 temporal pipeline: frames 0..23 must all produce finite output with no NaN
 (regression: boundary frames intermittently produced NaN before the atomics
 were made visible to the aggregation kernel).
@@ -11,16 +11,18 @@ Run from the repository root:  uv run python -m pytest tests/test_bm3dv2.py
 
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import numpy as np
 import pytest
 import vapoursynth as vs
 
 from conftest import (
-    NOISE_MKV,
+    CLIP_PATH,
     COMPARE_PRELUDE,
     ReferenceUnavailable,
     assert_preserves_frame_props,
@@ -35,12 +37,15 @@ from conftest import (
 )
 
 
+_CPU_AVAILABLE = hasattr(vs.core, "bm3d") and hasattr(vs.core.bm3d, "VBasic")
+
+
 def BM3D(*args, **kwargs):
     """BM3Dv2 as a clip the test can read pixels from (see conftest.cpu_node)."""
     return cpu_node(vs.core.vsfeel.BM3Dv2(*args, **kwargs))
 
 
-pytestmark = pytest.mark.usefixtures("noise_gray")
+pytestmark = pytest.mark.usefixtures("clip_gray")
 
 SIGMA = 0.7
 BM_RANGE = 16
@@ -60,7 +65,7 @@ def _run(clip, radius=2, **kwargs):
     )
 
 
-def test_bm3dv2_parallel_load_matches_serial(noise_gray):
+def test_bm3dv2_parallel_load_matches_serial(clip_gray):
     """Parallel request load must produce the same pixel
     values as the serial path.
 
@@ -68,53 +73,53 @@ def test_bm3dv2_parallel_load_matches_serial(noise_gray):
     misuse and command pool reuse violations under load on strict drivers
     (black or garbage output only when frames are processed concurrently).
     """
-    par = eval_parallel(_run, noise_gray, radius=2)
-    ref = _run(noise_gray, radius=2)
-    for n in range(noise_gray.num_frames):
+    par = eval_parallel(_run, clip_gray, radius=2)
+    ref = _run(clip_gray, radius=2)
+    for n in range(clip_gray.num_frames):
         d = par[n] - frame_to_ndarray(ref.get_frame(n))
         assert np.abs(d).max() < 1e-5, f"parallel/serial mismatch at frame {n}"
 
 
-def test_bm3dv2_wide_radius_parallel_load_matches_serial(noise_gray):
+def test_bm3dv2_wide_radius_parallel_load_matches_serial(clip_gray):
     """The widest window must survive the deep pipeline like the narrow ones.
 
     At radius 16 one output frame spans 33 estimate slots and 65 source
     frames, i.e. the instance's whole cache working set at once; a parallel
     request load is what exercises that ring under contention.
     """
-    par = eval_parallel(_run, noise_gray, radius=16)
-    ref = _run(noise_gray, radius=16)
-    for n in range(noise_gray.num_frames):
+    par = eval_parallel(_run, clip_gray, radius=16)
+    ref = _run(clip_gray, radius=16)
+    for n in range(clip_gray.num_frames):
         d = par[n] - frame_to_ndarray(ref.get_frame(n))
         assert np.abs(d).max() < 1e-5, f"parallel/serial mismatch at frame {n}"
 
 
-def test_bm3dv2_parallel_load_deterministic(noise_gray):
+def test_bm3dv2_parallel_load_deterministic(clip_gray):
     """Two parallel runs must produce identical output.
 
     A fence attached to two in-flight submissions makes frame results depend
     on the completion order of the streams, which only shows up when many
     frames are in flight at once.
     """
-    a = eval_parallel(_run, noise_gray, radius=2)
-    b = eval_parallel(_run, noise_gray, radius=2)
-    for n in range(noise_gray.num_frames):
+    a = eval_parallel(_run, clip_gray, radius=2)
+    b = eval_parallel(_run, clip_gray, radius=2)
+    for n in range(clip_gray.num_frames):
         d = a[n] - b[n]
         assert np.abs(d).max() < 1e-5, f"nondeterministic output at frame {n}"
 
 
 @pytest.mark.parametrize("radius", [0, 1, 2, 3, 4, 16])
-def test_bm3dv2_no_nan_all_frames(noise_gray, radius):
+def test_bm3dv2_no_nan_all_frames(clip_gray, radius):
     """Output must be finite on every frame (incl. boundaries) for each radius.
 
     A brand new filter instance is created per parametrized test.
     """
-    check_all_frames_finite(_run, noise_gray, radius=radius)
+    check_all_frames_finite(_run, clip_gray, radius=radius)
 
 
-def test_bm3dv2_deterministic(noise_gray):
-    a = _run(noise_gray, radius=2)
-    b = _run(noise_gray, radius=2)
+def test_bm3dv2_deterministic(clip_gray):
+    a = _run(clip_gray, radius=2)
+    b = _run(clip_gray, radius=2)
     for n in (0, 11, 23):
         d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
         # BM3D's aggregation uses float atomics, so two runs differ only by
@@ -123,7 +128,7 @@ def test_bm3dv2_deterministic(noise_gray):
         assert np.abs(d).max() < 1e-5, f"nondeterministic output at frame {n}"
 
 
-def test_bm3dv2_cas_fallback_matches_hardware_atomics(noise_gray, monkeypatch):
+def test_bm3dv2_cas_fallback_matches_hardware_atomics(clip_gray, monkeypatch):
     """The CAS arm a device without float32 add atomics gets must match.
 
     `VSFEEL_BM3D_CAS=1` forces the `-DNO_FLOAT_ATOMICS` kernel the host selects
@@ -131,9 +136,9 @@ def test_bm3dv2_cas_fallback_matches_hardware_atomics(noise_gray, monkeypatch):
     a different order, so this is also what bounds that order's effect.
     """
     monkeypatch.delenv("VSFEEL_BM3D_CAS", raising=False)
-    hardware = _run(noise_gray, radius=2)
+    hardware = _run(clip_gray, radius=2)
     monkeypatch.setenv("VSFEEL_BM3D_CAS", "1")
-    cas = _run(noise_gray, radius=2)
+    cas = _run(clip_gray, radius=2)
     for n in (0, 11, 23):
         a = frame_to_ndarray(hardware.get_frame(n))
         b = frame_to_ndarray(cas.get_frame(n))
@@ -142,7 +147,7 @@ def test_bm3dv2_cas_fallback_matches_hardware_atomics(noise_gray, monkeypatch):
         assert np.abs(a - b).max() < 1e-5, f"CAS vs hardware atomics at frame {n}"
 
 
-def test_bm3dv2_cas_fallback_holds_at_small_block_step(noise_gray, monkeypatch):
+def test_bm3dv2_cas_fallback_holds_at_small_block_step(clip_gray, monkeypatch):
     """The CAS arm must stay exact where contention is highest.
 
     One res element receives up to `8 * (ceil((2*bm_range + 8)/block_step) +
@@ -158,9 +163,9 @@ def test_bm3dv2_cas_fallback_holds_at_small_block_step(noise_gray, monkeypatch):
         return BM3D(clip, sigma=SIGMA, radius=2, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=1)
 
     monkeypatch.setenv("VSFEEL_BM3D_CAS", "1")
-    cas = small_step(noise_gray)
+    cas = small_step(clip_gray)
     monkeypatch.delenv("VSFEEL_BM3D_CAS", raising=False)
-    hardware = small_step(noise_gray)
+    hardware = small_step(clip_gray)
     for n in (0, 11):
         a = frame_to_ndarray(hardware.get_frame(n))
         b = frame_to_ndarray(cas.get_frame(n))
@@ -170,11 +175,11 @@ def test_bm3dv2_cas_fallback_holds_at_small_block_step(noise_gray, monkeypatch):
         )
 
 
-def test_bm3dv2_disjoint_first_estimates_keep_slice_witnesses(noise_gray):
+def test_bm3dv2_disjoint_first_estimates_keep_slice_witnesses(clip_gray):
     """Concurrent opposite-end windows must not clear each other's tags."""
     import threading
 
-    clip = noise_gray.std.CropAbs(width=64, height=64)
+    clip = clip_gray.std.CropAbs(width=64, height=64)
     kwargs = dict(sigma=SIGMA, radius=2, bm_range=2, ps_range=1, block_step=4)
     reference = BM3D(clip, **kwargs)
     expected = {n: frame_to_ndarray(reference.get_frame(n)) for n in (0, 23)}
@@ -203,12 +208,12 @@ def test_bm3dv2_disjoint_first_estimates_keep_slice_witnesses(noise_gray):
             )
 
 
-def test_bm3dv2_radius0_concurrent_first_use_and_fallback(noise_gray, monkeypatch):
+def test_bm3dv2_radius0_concurrent_first_use_and_fallback(clip_gray, monkeypatch):
     """Concurrent first requests must preserve private tags and fallback input."""
     monkeypatch.setenv("VSFEEL_BM3D_NOESTIMATE", "1")
-    actual = eval_parallel(_run, noise_gray, radius=0)
-    for n in range(noise_gray.num_frames):
-        expected = frame_to_ndarray(noise_gray.get_frame(n))
+    actual = eval_parallel(_run, clip_gray, radius=0)
+    for n in range(clip_gray.num_frames):
+        expected = frame_to_ndarray(clip_gray.get_frame(n))
         assert np.array_equal(actual[n], expected), (
             f"radius-zero fallback read the wrong source slot at frame {n}"
         )
@@ -225,7 +230,7 @@ _SUBPROCESS_PRELUDE = r"""
 import json
 import sys
 sys.path.insert(0, sys.argv[1])
-from conftest import NOISE_MKV, frame_to_ndarray
+from conftest import CLIP_PATH, frame_to_ndarray
 import numpy as np
 import vapoursynth as vs
 from vapoursynth import core
@@ -233,8 +238,8 @@ from vapoursynth import core
 
 def source():
     if hasattr(core, "bs"):
-        return core.bs.VideoSource(NOISE_MKV)
-    return core.ffms2.Source(NOISE_MKV)
+        return core.bs.VideoSource(CLIP_PATH)
+    return core.ffms2.Source(CLIP_PATH)
 
 
 def gray32():
@@ -396,47 +401,47 @@ def test_bm3dv2_nosearch_matches_search_on_constant_clip(monkeypatch):
         assert np.abs(b - 0.5).max() < 1e-6, f"no-search left the constant at frame {n}"
 
 
-def test_bm3dv2_rejects_gray8(noise_8bit):
+def test_bm3dv2_rejects_gray8(clip_8bit):
     with pytest.raises(vs.Error):
-        _run(noise_8bit)
+        _run(clip_8bit)
 
 
-def test_bm3dv2_rejects_radius17(noise_gray):
+def test_bm3dv2_rejects_radius17(clip_gray):
     """Radius > 16 is unsupported and must be rejected up front."""
     with pytest.raises(vs.Error):
-        _run(noise_gray, radius=17)
+        _run(clip_gray, radius=17)
 
 
 @pytest.mark.parametrize("radius", [15, 16])
-def test_bm3dv2_accepts_reference_radius_cap(noise_gray, radius):
+def test_bm3dv2_accepts_reference_radius_cap(clip_gray, radius):
     """The radius cap must match the references' (vszipcl 16, bm3dvk 15).
 
     Windows this wide are the end-to-end case for the aggregation's derived
     per-slice table, which replaced the push-constant one.
     """
-    out = _run(noise_gray, radius=radius)
+    out = _run(clip_gray, radius=radius)
     for n in (0, 23):
         a = frame_to_ndarray(out.get_frame(n))
         assert np.isfinite(a).all(), f"non-finite output at frame {n}"
 
 
-def test_bm3dv2_rejects_bad_ref_format(noise_gray):
+def test_bm3dv2_rejects_bad_ref_format(clip_gray):
     """A \"ref\" with a different format/size must be rejected up front."""
-    bad = noise_gray.std.AddBorders(right=1)
+    bad = clip_gray.std.AddBorders(right=1)
     with pytest.raises(vs.Error):
-        _run(noise_gray, ref=bad)
+        _run(clip_gray, ref=bad)
 
 
-def test_bm3dv2_ref_final_pass(noise_gray):
+def test_bm3dv2_ref_final_pass(clip_gray):
     """A basic estimate passed as \"ref\" drives the final (Wiener) pass.
 
     The final output must be finite on every frame, deterministic between two
     sequential instances, and differ from the basic estimate
     (the Wiener refinement changes the pixels rather than copying them).
     """
-    basic = _run(noise_gray, radius=2)
-    a = _run(noise_gray, radius=2, ref=basic)
-    b = _run(noise_gray, radius=2, ref=basic)
+    basic = _run(clip_gray, radius=2)
+    a = _run(clip_gray, radius=2, ref=basic)
+    b = _run(clip_gray, radius=2, ref=basic)
     for n in (0, 11, 23):
         fa = frame_to_ndarray(a.get_frame(n))
         fb = frame_to_ndarray(b.get_frame(n))
@@ -521,7 +526,7 @@ def test_bm3dv2_accepts_radius4_within_addressing_limit():
     assert out.num_frames == 3
 
 
-def test_bm3dv2_device_id(noise_gray):
+def test_bm3dv2_device_id(clip_gray):
     """device_id and num_streams are accepted no-ops.
 
     Under the R80 GPU API the core owns the one Vulkan device per process and
@@ -530,7 +535,7 @@ def test_bm3dv2_device_id(noise_gray):
     ignored and produce the default result (measured max diff ~2e-8, the
     atomic-order run-to-run floor).
     """
-    b = _run(noise_gray)
+    b = _run(clip_gray)
     for kwargs in (
         dict(device_id=0),
         dict(device_id=-1),
@@ -538,34 +543,34 @@ def test_bm3dv2_device_id(noise_gray):
         dict(num_streams=0),
         dict(num_streams=64),
     ):
-        a = _run(noise_gray, **kwargs)
+        a = _run(clip_gray, **kwargs)
         for n in (0, 11, 23):
             d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
             assert np.abs(d).max() < 1e-5, f"{kwargs} differs from default at frame {n}"
 
 
-def test_bm3dv2_preserves_gray_frame_props(noise_gray):
+def test_bm3dv2_preserves_gray_frame_props(clip_gray):
     """R13: the grayscale path must keep the source frame's properties.
 
     ``_ColorRange`` is deprecated in VapourSynth R79 and is remapped by
     ``SetFrameProps``; the surviving equivalent key ``_Range`` is tagged
     instead. ``MyTag`` verifies arbitrary application metadata.
     """
-    assert_preserves_frame_props(_run, noise_gray, radius=2)
+    assert_preserves_frame_props(_run, clip_gray, radius=2)
 
 
-def test_bm3dv2_chroma_planes_are_denoised(noise_gray):
+def test_bm3dv2_chroma_planes_are_denoised(clip_gray):
     """A YUV clip is denoised on every plane, luma exactly as the Gray path.
 
     The references denoise each plane independently by default (per-plane
     geometry, parameters and sigma), so a plane left equal to the source is the
     old luma-only passthrough, not a denoised result.
     """
-    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(NOISE_MKV), bits=32, fulls=True, fulld=True)
+    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(CLIP_PATH), bits=32, fulls=True, fulld=True)
     assert yuv.format.color_family == vs.YUV
 
     out = _run(yuv, radius=2)
-    ref = _run(noise_gray, radius=2)
+    ref = _run(clip_gray, radius=2)
 
     for n in (0, 11, 23):
         f = out.get_frame(n)
@@ -587,7 +592,7 @@ def test_bm3dv2_chroma_planes_are_denoised(noise_gray):
 def test_bm3dv2_unprocessed_plane_is_source_copy(sigma):
     """A plane whose sigma is below FLT_EPSILON is a bit-exact source copy,
     while the others are still denoised (the reference's PROC_MASK)."""
-    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(NOISE_MKV), bits=32, fulls=True, fulld=True)
+    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(CLIP_PATH), bits=32, fulls=True, fulld=True)
     out = BM3D(
         yuv, sigma=sigma, radius=2, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=BLOCK_STEP
     )
@@ -614,7 +619,7 @@ def test_bm3dv2_all_planes_below_epsilon_returns_source():
     ``vnode:gpu`` argument, so the node it hands back is GPU resident like any
     other BM3Dv2 output.
     """
-    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(NOISE_MKV), bits=32, fulls=True, fulld=True)
+    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(CLIP_PATH), bits=32, fulls=True, fulld=True)
     out = vs.core.vsfeel.BM3Dv2(yuv, sigma=[0.0], radius=2)
     assert out.gpu_resident, "BM3Dv2 output must stay GPU resident"
     node = cpu_node(out)
@@ -633,7 +638,7 @@ def test_bm3dv2_per_plane_parameters_are_honoured():
     and agree elsewhere: a filter that ignored the per-plane arrays would
     produce identical frames.
     """
-    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(NOISE_MKV), bits=32, fulls=True, fulld=True)
+    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(CLIP_PATH), bits=32, fulls=True, fulld=True)
     base = dict(
         sigma=[0.7, 0.7, 0.7],
         radius=2,
@@ -664,12 +669,12 @@ def test_bm3dv2_per_plane_parameters_are_honoured():
 def test_bm3dv2_chroma_requires_yuv444():
     """chroma=True is the reference's joint entry and needs 4:4:4 input."""
     yuv420 = vs.core.fmtc.bitdepth(
-        vs.core.bs.VideoSource(NOISE_MKV), bits=32, fulls=True, fulld=True
+        vs.core.bs.VideoSource(CLIP_PATH), bits=32, fulls=True, fulld=True
     )
     with pytest.raises(vs.Error, match="YUV444"):
         vs.core.vsfeel.BM3Dv2(yuv420, sigma=0.7, chroma=1)
     rgb = vs.core.resize.Bicubic(
-        vs.core.bs.VideoSource(NOISE_MKV), format=vs.RGBS, matrix_in_s="709"
+        vs.core.bs.VideoSource(CLIP_PATH), format=vs.RGBS, matrix_in_s="709"
     )
     with pytest.raises(vs.Error, match="YUV444"):
         vs.core.vsfeel.BM3Dv2(rgb, sigma=0.7, chroma=1)
@@ -678,7 +683,7 @@ def test_bm3dv2_chroma_requires_yuv444():
 def test_bm3dv2_joint_chroma_denoises_every_plane():
     """chroma=True packs the three 4:4:4 planes into one entry; a sigma-zero
     plane of that entry is skipped and comes from the source."""
-    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(NOISE_MKV), format=vs.YUV444PS)
+    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(CLIP_PATH), format=vs.YUV444PS)
     out = BM3D(
         yuv444,
         sigma=[0.7, 0.7, 0.7],
@@ -717,7 +722,7 @@ def test_bm3dv2_joint_chroma_denoises_every_plane():
 def test_bm3dv2_joint_chroma_shares_luma_groups():
     """Joint mode is not the per-plane mode: its chroma planes are filtered
     with the groups block matching found on luma, so the two differ."""
-    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(NOISE_MKV), format=vs.YUV444PS)
+    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(CLIP_PATH), format=vs.YUV444PS)
     kw = dict(
         sigma=[0.7, 0.7, 0.7], radius=2, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=BLOCK_STEP
     )
@@ -743,7 +748,7 @@ def test_bm3dv2_joint_chroma_shares_luma_groups():
 def test_bm3dv2_rgb_is_denoised():
     """RGB input runs all three planes like the references do."""
     rgb = vs.core.resize.Bicubic(
-        vs.core.bs.VideoSource(NOISE_MKV), format=vs.RGBS, matrix_in_s="709"
+        vs.core.bs.VideoSource(CLIP_PATH), format=vs.RGBS, matrix_in_s="709"
     )
     out = BM3D(
         rgb, sigma=0.7, radius=2, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=BLOCK_STEP
@@ -765,7 +770,7 @@ def test_bm3dv2_rejects_subsampled_plane_below_block():
     (4-row chroma) would address before its plane's buffer.
     """
     yuv420 = vs.core.fmtc.bitdepth(
-        vs.core.bs.VideoSource(NOISE_MKV), bits=32, fulls=True, fulld=True
+        vs.core.bs.VideoSource(CLIP_PATH), bits=32, fulls=True, fulld=True
     )
     small = vs.core.std.CropAbs(yuv420, width=640, height=8)
     with pytest.raises(vs.Error, match="8x8"):
@@ -784,7 +789,7 @@ def test_bm3dv2_rejects_subsampled_plane_below_block():
 )
 def test_bm3dv2_accepts_yuv444(kwargs):
     """The per-plane and joint entry points both accept 4:4:4 input."""
-    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(NOISE_MKV), format=vs.YUV444PS)
+    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(CLIP_PATH), format=vs.YUV444PS)
     out = BM3D(yuv444, radius=1, bm_range=2, ps_range=1, block_step=4, **kwargs)
     for n in (0, 5):
         for plane in range(3):
@@ -793,13 +798,13 @@ def test_bm3dv2_accepts_yuv444(kwargs):
 
 @pytest.mark.parametrize("sigma", [0.0, 1e-9])
 @pytest.mark.parametrize("use_ref", [False, True])
-def test_bm3dv2_sigma_below_epsilon_passes_through(noise_gray, sigma, use_ref):
+def test_bm3dv2_sigma_below_epsilon_passes_through(clip_gray, sigma, use_ref):
     """A plane whose sigma is below FLT_EPSILON is a bit-exact source copy,
     as in the reference's PROC_MASK. Covers the old sigma=0 + ref 0/0 NaN."""
     basic = None
     if use_ref:
         basic = BM3D(
-            noise_gray,
+            clip_gray,
             sigma=SIGMA,
             radius=2,
             bm_range=BM_RANGE,
@@ -808,7 +813,7 @@ def test_bm3dv2_sigma_below_epsilon_passes_through(noise_gray, sigma, use_ref):
         )
         _ = frame_to_ndarray(basic.get_frame(0))
     out = BM3D(
-        noise_gray,
+        clip_gray,
         sigma=sigma,
         radius=2,
         bm_range=BM_RANGE,
@@ -818,7 +823,7 @@ def test_bm3dv2_sigma_below_epsilon_passes_through(noise_gray, sigma, use_ref):
     )
     for n in (0, 11, 23):
         a = frame_to_ndarray(out.get_frame(n))
-        b = frame_to_ndarray(noise_gray.get_frame(n))
+        b = frame_to_ndarray(clip_gray.get_frame(n))
         assert np.isfinite(a).all(), f"non-finite output at frame {n}"
         assert np.array_equal(a, b), f"sigma={sigma} plane not passed through at {n}"
 
@@ -840,7 +845,7 @@ _SEEK_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     from vstools import core
 
     core.max_cache_size = 512
-    src = core.bs.VideoSource({NOISE_MKV!r})
+    src = core.bs.VideoSource({CLIP_PATH!r})
     gray = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                               bits=32, fulls=True, fulld=True)
     clip = core.std.Loop(gray, times=4)
@@ -946,198 +951,412 @@ def test_bm3dv2_short_clip_temporal_window(nframes):
 
 
 # ---------------------------------------------------------------------------
-# Reference comparison
+# Matching threshold (th_mse), group sizes and temporal real-frame bounds
 # ---------------------------------------------------------------------------
 
-_COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
-    import json
-    import sys
-    import vapoursynth as vs
-    from vstools import core
 
-    ref = sys.argv[1]
-    kwargs = json.loads(sys.argv[2])
-    ref_pass = int(sys.argv[3])
-    spec = json.loads(sys.argv[4])
-    kind = spec.get("clip", "gray32")
-    frames = spec.get("frames", [0, 11, 23])
+def _structured_clip(nframes, seed=5, size=64):
+    """A drifting pattern plus noise, so thresholds actually reject candidates.
 
-    def vsfeel(clip, **kw):
-        # The host cannot read a GPU-resident frame's pixels, and this script
-        # reads them directly, so the node is downloaded here.
-        node = core.vsfeel.BM3Dv2(clip, **kw)
-        return core.std.GPUDownload(clip=node) if node.gpu_resident else node
+    The committed noise clip is far too low-amplitude: its sigma-scaled default
+    threshold accepts every candidate, which makes every group a full eight and
+    hides the retention and length-N contracts entirely.
+    """
+    rng = np.random.default_rng(seed)
+    ys, xs = np.mgrid[0:size, 0:size].astype(np.float32)
+    arr = np.zeros((nframes, size, size), dtype=np.float32)
+    for f in range(nframes):
+        base = 0.5 + 0.3 * np.sin((xs + 3.0 * f) * 0.3) * np.cos(ys * 0.2)
+        arr[f] = (base + rng.normal(0, 0.05, (size, size))).astype(np.float32)
 
-    core.max_cache_size = 1024 * 56
-    src = core.bs.VideoSource({NOISE_MKV!r})
-    if kind == "gray32":
-        clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
-    elif kind == "yuv420_32":
-        clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
-    elif kind == "yuv444_32":
-        clip = core.resize.Bicubic(src, format=vs.YUV444PS)
-    elif kind == "rgb32":
-        clip = core.resize.Bicubic(src, format=vs.RGBS, matrix_in_s="709")
-    else:
-        raise SystemExit("bad clip kind %r" % kind)
+    src = vs.core.std.BlankClip(width=size, height=size, format=vs.GRAYS, length=nframes)
 
-    planes = list(range(clip.format.num_planes))
+    def setter(n, f):
+        out = f.copy()
+        plane = np.asarray(out[0])
+        plane[:] = arr[n][: plane.shape[0], : plane.shape[1]]
+        return out
 
-    def read_all(node, n):
-        frame = node.get_frame(n)
-        return [read_plane(frame, p, np.float32) for p in planes]
+    return vs.core.std.ModifyFrame(src, src, setter), arr
 
-    basic = None
-    if ref_pass:
-        # The reference consumes vsfeel's basic estimate as its guide. Force
-        # that clip here so a vsfeel failure is not mislabelled as a missing
-        # reference; the frames stay cached for the reference below.
-        try:
-            basic = vsfeel(clip, **kwargs)
-            _ = [read_all(basic, n) for n in frames]
-        except Exception as exc:
-            print("VSFEEL fail: basic estimate: %s: %s" % (type(exc).__name__, exc), flush=True)
-            raise SystemExit(3)
 
-    # --- reference phase: materialise and copy before touching vsfeel's
-    #     graded node ---
+@pytest.mark.parametrize("bad", [-1.0, -1e-9, float("nan"), float("inf"), float("-inf")])
+def test_bm3dv2_rejects_bad_th_mse(clip_gray, bad):
+    """A threshold that is negative or not finite has no meaning and must be
+    rejected at creation, before any GPU resource exists."""
+    with pytest.raises(vs.Error):
+        _run(clip_gray, th_mse=bad)
+
+
+def test_bm3dv2_accepts_enormous_finite_th_mse(clip_gray):
+    """A finite but unrepresentable threshold saturates to the largest float
+    instead of narrowing to infinity."""
+    out = _run(clip_gray, th_mse=1e300)
+    assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
+
+
+def test_bm3dv2_validates_th_mse_before_the_all_zero_shortcut():
+    """BM3Dv2 returns the source clip when every sigma is zero; an invalid
+    th_mse must still be an error rather than being conditionally accepted."""
+    with pytest.raises(vs.Error):
+        vs.core.vsfeel.BM3Dv2(_blank(64, 64), sigma=[0.0], th_mse=-1.0)
+
+
+def test_bm3dv2_th_mse_selects_the_group():
+    """A rejecting threshold must produce a different result from a permissive
+    one, and zero must behave as the reference-only group."""
+    clip, _ = _structured_clip(5)
+    kwargs = dict(sigma=[8.0], radius=2, bm_range=9, ps_range=4, block_step=8)
+    loose = frame_to_ndarray(BM3D(clip, th_mse=1e6, **kwargs).get_frame(2))
+    tight = frame_to_ndarray(BM3D(clip, th_mse=300.0, **kwargs).get_frame(2))
+    zero = frame_to_ndarray(BM3D(clip, th_mse=0.0, **kwargs).get_frame(2))
+    assert np.isfinite(loose).all() and np.isfinite(tight).all()
+    assert np.abs(loose - tight).max() > 1e-3, "the threshold changed nothing"
+    assert np.abs(loose - zero).max() > 1e-3
+    # The reference-only group cannot grow with the radius: no temporal
+    # neighbour enters a group the threshold never lets it into.
+    r0 = frame_to_ndarray(
+        BM3D(
+            clip, sigma=[8.0], th_mse=0.0, radius=0, bm_range=9, ps_range=4, block_step=8
+        ).get_frame(2)
+    )
+    assert np.abs(r0 - zero).max() < 1e-5
+
+
+@pytest.mark.parametrize(
+    "th", [0.0, 50.0, 100.0, 150.0, 200.0, 240.0, 280.0, 300.0, 350.0, 500.0, 1e6]
+)
+def test_bm3dv2_length_n_transform_round_trips(th):
+    """With a near-zero threshold every coefficient survives, so the forward
+    and inverse group transforms of length N must return the input exactly,
+    for whatever N each reference block's group happens to have. A wrong
+    length-N normalization shows up here as a scaled (8/N) output."""
+    clip, arr = _structured_clip(5)
+    out = frame_to_ndarray(
+        BM3D(
+            clip, sigma=[1e-4], radius=2, bm_range=9, ps_range=4, block_step=8, th_mse=th
+        ).get_frame(2)
+    )
+    assert np.isfinite(out).all()
+    assert np.abs(out - arr[2]).max() < 1e-5
+
+
+@pytest.mark.parametrize("nframes,radii", [(1, (0, 16)), (2, (1, 16))])
+def test_bm3dv2_searches_only_real_frames(nframes, radii):
+    """A clip with no temporal neighbours must ignore the radius entirely: the
+    window must not search, or aggregate, the same endpoint frame once per
+    out-of-range window position."""
+    clip, _ = _structured_clip(nframes)
+    kwargs = dict(sigma=[8.0], bm_range=9, ps_range=4, block_step=8)
+    for n in range(nframes):
+        a = frame_to_ndarray(BM3D(clip, radius=radii[0], **kwargs).get_frame(n))
+        b = frame_to_ndarray(BM3D(clip, radius=radii[1], **kwargs).get_frame(n))
+        assert np.abs(a - b).max() < 1e-5, f"frame {n}: radius {radii} disagree"
+
+
+def test_bm3dv2_aggregates_only_real_neighbours():
+    """An output frame may only depend on the real estimate centres inside the
+    clip, so extending the clip beyond n + 2*radius must leave output n alone
+    (each of its centres searches no further than m + radius)."""
+    short, _ = _structured_clip(9)
+    long, _ = _structured_clip(13)
+    kwargs = dict(sigma=[8.0], radius=2, bm_range=9, ps_range=4, block_step=8)
+    for n in range(5):
+        a = frame_to_ndarray(BM3D(short, **kwargs).get_frame(n))
+        b = frame_to_ndarray(BM3D(long, **kwargs).get_frame(n))
+        assert np.abs(a - b).max() < 1e-5, f"frame {n} depends on the clip's tail"
+
+
+def test_bm3dv2_mixed_group_sizes_have_no_nan():
+    """Groups of different sizes coexist in one workgroup; every frame of a
+    clip whose thresholds span full, partial and reference-only groups must be
+    finite and still denoise."""
+    clip, arr = _structured_clip(7)
+    kwargs = dict(sigma=[8.0], radius=3, bm_range=9, ps_range=4, block_step=4)
+    for th in (0.0, 250.0, 320.0, 400.0, 1e6):
+        out = BM3D(clip, th_mse=th, **kwargs)
+        for n in (0, 3, 6):
+            a = frame_to_ndarray(out.get_frame(n))
+            assert np.isfinite(a).all(), f"non-finite at frame {n}, th_mse={th}"
+        assert np.abs(frame_to_ndarray(out.get_frame(3)) - arr[3]).max() > 1e-4
+
+
+_DCT_CASE = re.compile(r"case (\d+):(.*?)break;", re.S)
+_DCT_SUM = re.compile(r"o(\d) = (.*?);")
+
+
+def _dct_expr(expr, identity):
+    """Evaluate one generated forward row into a length-8 coefficient vector."""
+    acc = np.zeros(8, dtype=np.float64)
+    while True:
+        fma = re.match(r"^fma\((-?[\d.e+-]+)f, v\[(\d)\], (.*)\)$", expr)
+        mul = re.match(r"^(-?[\d.e+-]+)f \* v\[(\d)\]$", expr)
+        if fma:
+            acc += np.float64(np.float32(fma.group(1))) * identity[int(fma.group(2))]
+            expr = fma.group(3)
+            continue
+        if mul:
+            acc += np.float64(np.float32(mul.group(1))) * identity[int(mul.group(2))]
+            break
+        if expr == "0.0f":
+            break
+        neg = re.match(r"^-v\[(\d)\]$", expr)
+        pos = re.match(r"^v\[(\d)\]$", expr)
+        assert neg or pos, expr
+        acc += (-1.0 if neg else 1.0) * identity[int((neg or pos).group(1))]
+        break
+    return np.float32(acc)
+
+
+def _parse_dct(source, name):
+    """Read one length-N transform out of the shader as a list of matrices."""
+    body = re.search(
+        rf"void {name}\(inout float v\[8\], int n\) \{{(.*?)\n\}}", source, re.S
+    ).group(1)
+    identity = np.eye(8, dtype=np.float32)
+    out = {}
+    for case in _DCT_CASE.finditer(body):
+        mat = np.zeros((8, 8), dtype=np.float32)
+        for row in _DCT_SUM.finditer(case.group(2)):
+            mat[int(row.group(1))] = _dct_expr(row.group(2).strip(), identity)
+        out[int(case.group(1))] = mat
+    return out
+
+
+def test_bm3dv2_group_dct_tables_are_a_scaled_dct_ii_pair():
+    """The generated length-N tables must be a scaled DCT-II with
+    A^T A = 2N I and an inverse that is exactly A's transpose: the filtering
+    sigma and the 1/(512N) normalization are derived from that gain."""
+    source = (Path(__file__).resolve().parents[1] / "src" / "bm3d.comp").read_text()
+    fwd = _parse_dct(source, "group_dct_fwd_n")
+    inv = _parse_dct(source, "group_dct_inv_n")
+    assert sorted(fwd) == list(range(1, 8))
+    assert sorted(inv) == list(range(1, 8))
+    for n in range(1, 8):
+        a = fwd[n][:n, :n]
+        assert np.allclose(fwd[n][n:], 0.0) and np.allclose(inv[n][n:], 0.0)
+        assert np.allclose(a.T @ a / (2 * n), np.eye(n), atol=1e-6), n
+        assert np.allclose(inv[n][:n, :n], a.T), n
+        # A_1[0][0] = sqrt(2): a one-member group is not the identity, so the
+        # normalization really is 1/(512N) at every N rather than 1/512.
+        assert fwd[n][0, 0] == pytest.approx(np.sqrt(2.0), rel=1e-7)
+
+
+# ---------------------------------------------------------------------------
+# Reference comparison: mawen's CPU V-BM3D, the implementation we ported
+# ---------------------------------------------------------------------------
+#
+# This is the only oracle. vszipcl and bm3dvk implement the *CUDA* matcher and
+# the CUDA filtering conventions, so they answer a different question and are
+# not compared against at all (see notes/BM3D.md).
+#
+# The CPU plugin is driven as `VBasic` + `VAggregate` for the temporal stages
+# and as `Basic` for the radius-zero spatial one, with every parameter the two
+# sides share set explicitly (`block_size=8`, `group_size=8`, `bm_step=1`,
+# `ps_step=1`, and `matrix=1` to pin the CPU's color-matrix norm to the bt709
+# value vsfeel's sigma and threshold factors carry). `th_mse` is passed
+# explicitly whenever vsfeel is given one, and otherwise reproduced from the
+# documented stage default.
+#
+# The residual is the CPU's unspecified tie order and its SSE accumulation
+# order: equal-distance blocks are ordered arbitrarily by `std::partial_sort`,
+# and one flipped seed moves the whole predictive chain. It therefore grows
+# with how ambiguous the content's block distances are; the bounds below are
+# measurements on the committed clip, not theory.
+
+_CPU_SCRIPT = (
+    COMPARE_PRELUDE
+    + r"""
+import json
+import sys
+
+import numpy as np
+import vapoursynth as vs
+
+core = vs.core
+core.max_cache_size = 2048
+spec = json.loads(sys.argv[1])
+kind = spec["clip"]
+feel = dict(spec["kwargs"])
+frames = spec["frames"]
+stage = spec["stage"]
+planes = None
+
+source = core.bs.VideoSource(spec["source"])
+if kind == "gray32":
+    clip = core.fmtc.bitdepth(core.std.ShufflePlanes(source, 0, vs.GRAY), bits=32,
+                              fulls=True, fulld=True)
+elif kind == "yuv420_32":
+    clip = core.fmtc.bitdepth(source, bits=32, fulls=True, fulld=True)
+elif kind == "yuv444_32":
+    clip = core.resize.Bicubic(source, format=vs.YUV444PS)
+elif kind == "rgb32":
+    clip = core.resize.Bicubic(source, format=vs.RGBS, matrix_in_s="709")
+else:
+    raise SystemExit("bad clip kind %r" % kind)
+planes = list(range(clip.format.num_planes))
+
+
+def read_all(node, n):
+    return [read_plane(node.get_frame(n), p, np.float32) for p in planes]
+
+
+def vsfeel(clip, **kw):
+    node = core.vsfeel.BM3Dv2(clip, **kw)
+    return core.std.GPUDownload(clip=node) if node.gpu_resident else node
+
+
+feel.setdefault("sigma", [0.7])
+feel.setdefault("radius", 2)
+feel.setdefault("bm_range", 9)
+feel.setdefault("ps_range", 4)
+feel.setdefault("ps_num", 2)
+feel.setdefault("block_step", 8)
+
+sigma = feel["sigma"]
+if not isinstance(sigma, (list, tuple)):
+    sigma = [sigma]
+radius = feel["radius"]
+
+# bm3d.Basic is the spatial-only filter: it takes no temporal parameters.
+cpu = dict(
+    sigma=list(sigma),
+    block_size=8,
+    block_step=feel["block_step"],
+    group_size=8,
+    bm_range=feel["bm_range"],
+    bm_step=1,
+    matrix=1,
+)
+if stage != "image":
+    cpu.update(radius=radius, ps_num=feel["ps_num"], ps_range=feel["ps_range"],
+               ps_step=1)
+if "th_mse" in feel:
+    cpu["th_mse"] = feel["th_mse"]
+else:
+    # The CPU's own stage defaults, in its user domain.
+    cpu["th_mse"] = (200.0 + sigma[0] * 10.0) if stage == "final" else (400.0 + sigma[0] * 80.0)
+
+# The final stage runs both sides on the *same* guide (vsfeel's basic estimate),
+# so the comparison isolates the Wiener pass.
+guide = None
+if stage == "final":
     try:
-        if ref_pass:
-            ref_node = getattr(core, ref).BM3Dv2(clip, ref=basic, **kwargs)
-        else:
-            ref_node = getattr(core, ref).BM3Dv2(clip, **kwargs)
-        ref_frames = [read_all(ref_node, n) for n in frames]
+        guide = vsfeel(clip, sigma=list(sigma), radius=radius,
+                       block_step=feel["block_step"], bm_range=feel["bm_range"],
+                       ps_num=feel["ps_num"], ps_range=feel["ps_range"])
+        _ = [read_all(guide, n) for n in frames]
     except Exception as exc:
-        print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
-        raise SystemExit(2)
-    print("REF ok", flush=True)
+        print("VSFEEL fail: basic estimate: %s: %s" % (type(exc).__name__, exc), flush=True)
+        raise SystemExit(3)
 
-    # --- vsfeel phase ---
-    my_node = (vsfeel(clip, ref=basic, **kwargs) if ref_pass
-               else vsfeel(clip, **kwargs))
-    worst = 0.0
-    per_plane = [0.0] * len(planes)
-    for n, ref_planes in zip(frames, ref_frames):
-        my_planes = read_all(my_node, n)
-        for i, (a, b) in enumerate(zip(my_planes, ref_planes)):
-            if not (np.isfinite(a).all() and np.isfinite(b).all()):
-                print("VSFEEL fail: non-finite at frame %d plane %d" % (n, planes[i]), flush=True)
-                raise SystemExit(3)
-            d = float(np.abs(a - b).max())
-            per_plane[i] = max(per_plane[i], d)
-            worst = max(worst, d)
-    print("RESULT " + json.dumps({{"maxdiff": worst, "per_plane": per_plane}}), flush=True)
-""")
+try:
+    if stage == "image":
+        ref_node = core.bm3d.Basic(clip, **cpu)
+    else:
+        basic = core.bm3d.VBasic(clip, **cpu)
+        if stage == "final":
+            final = core.bm3d.VFinal(clip, ref=guide, **cpu)
+            ref_node = core.bm3d.VAggregate(final, radius=radius, sample=vs.FLOAT)
+        else:
+            ref_node = core.bm3d.VAggregate(basic, radius=radius, sample=vs.FLOAT)
+    ref_frames = [read_all(ref_node, n) for n in frames]
+except Exception as exc:
+    print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
+    raise SystemExit(2)
+print("REF ok", flush=True)
+
+my_node = vsfeel(clip, **dict(feel, **({"ref": guide} if stage == "final" else {})))
+worst = 0.0
+per_plane = [0.0] * len(planes)
+for n, ref_planes in zip(frames, ref_frames):
+    my_planes = read_all(my_node, n)
+    for i, (a, b) in enumerate(zip(my_planes, ref_planes)):
+        if not (np.isfinite(a).all() and np.isfinite(b).all()):
+            print("VSFEEL fail: non-finite at frame %d plane %d" % (n, planes[i]), flush=True)
+            raise SystemExit(3)
+        d = float(np.abs(a - b).max())
+        per_plane[i] = max(per_plane[i], d)
+        worst = max(worst, d)
+print("RESULT " + json.dumps({"maxdiff": worst, "per_plane": per_plane}), flush=True)
+"""
+)
+
+
+def _cpu_compare(kwargs, stage="basic", clip="gray32", frames=(0, 11, 23)):
+    """Worst per-plane diff against the CPU implementation, in a subprocess."""
+    if not _CPU_AVAILABLE:
+        skip_or_fail_reference("the CPU bm3d plugin (Basic/VBasic/VAggregate) is not installed")
+    spec = {
+        "source": CLIP_PATH,
+        "clip": clip,
+        "frames": list(frames),
+        "kwargs": dict(kwargs),
+        "stage": stage,
+    }
+    return run_compare_subprocess(_CPU_SCRIPT, [json.dumps(spec)], timeout=1800)
+
 
 BASE_KWARGS = dict(sigma=0.7, radius=2, bm_range=16, ps_range=7, block_step=4)
 
-
-def _max_diff_vs_reference(
-    kwargs: dict,
-    ref: str,
-    ref_pass: bool = False,
-    clip: str = "gray32",
-    frames=(0, 11, 23),
-    timeout: float = 600,
-) -> dict:
-    """Run the comparison in a subprocess; returns ``maxdiff``/``per_plane``.
-
-    Raises :class:`ReferenceUnavailable` when ``ref`` is missing/failed and
-    :class:`AssertionError` (with the captured tail) when vsfeel failed.
-    """
-    spec = {"clip": clip, "frames": list(frames)}
-    return run_compare_subprocess(
-        _COMPARE_SCRIPT,
-        [ref, json.dumps(kwargs), str(int(ref_pass)), json.dumps(spec)],
-        timeout=timeout,
-    )
+# Measured on the committed clip (640x360 Big Buck Bunny + grain), frames
+# 0/11/23, worst plane. The CPU is `VBasic`+`VAggregate` (or `Basic` at radius
+# 0) with the parameters above and its own stage default for th_mse. The spread
+# across radii is the tie-order residual growing with the number of prediction
+# steps; radius 0 has no temporal chain at all, so it lands an order of
+# magnitude tighter.
+RADIUS_CASES = [
+    # (radius, stage, bound, measured)
+    (0, "image", 8e-3, 0.00382),
+    (1, "basic", 5e-3, 0.00221),
+    (2, "basic", 5e-3, 0.00173),
+    (3, "basic", 5e-3, 0.00184),
+    (4, "basic", 5e-3, 0.00162),
+    (5, "basic", 5e-3, 0.00190),
+    (6, "basic", 5e-3, 0.00161),
+]
 
 
-def _compare_against_any_reference(
-    kwargs: dict, ref_pass: bool = False, clip: str = "gray32"
-) -> tuple[str, dict]:
-    """Try vszipcl, then bm3dhip; skip only if none is usable.
-
-    ``clip`` names the input the comparison runs on (see the compare script);
-    the color kinds grade the chroma planes as well as luma.
-    """
-    reasons = []
-    for ref in ("vszipcl", "bm3dhip"):
-        if not hasattr(vs.core, ref) or not hasattr(getattr(vs.core, ref), "BM3Dv2"):
-            reasons.append(f"{ref}: not installed")
-            continue
-        try:
-            return ref, _max_diff_vs_reference(kwargs, ref, ref_pass=ref_pass, clip=clip)
-        except ReferenceUnavailable as exc:
-            reasons.append(f"{ref}: {exc}")
-    skip_or_fail_reference("no usable reference plugin (vszipcl/bm3dhip): " + "; ".join(reasons))
+@pytest.mark.parametrize(
+    "radius,stage,bound,measured", RADIUS_CASES, ids=[str(c[0]) for c in RADIUS_CASES]
+)
+def test_bm3dv2_matches_cpu_radius(clip_gray, radius, stage, bound, measured):
+    """Every supported radius must track the CPU implementation."""
+    payload = _cpu_compare(dict(BASE_KWARGS, radius=radius), stage=stage)
+    assert payload["maxdiff"] < bound, f"radius {radius} vs CPU: {payload} (was {measured})"
 
 
-def _compare_against_bm3dvk(kwargs: dict, ref_pass: bool = False, clip: str = "yuv444_32"):
-    """bm3dvk first (the preferred reference where the two disagree), then the
-    others through the shared helper."""
-    if hasattr(vs.core, "bm3dvk") and hasattr(vs.core.bm3dvk, "BM3Dv2"):
-        try:
-            return "bm3dvk", _max_diff_vs_reference(kwargs, "bm3dvk", ref_pass=ref_pass, clip=clip)
-        except ReferenceUnavailable:
-            pass
-    return _compare_against_any_reference(kwargs, ref_pass=ref_pass, clip=clip)
-
-
-def test_bm3dv2_ref_matches_reference(noise_gray):
-    """The final (Wiener) pass must closely match the reference implementations
-    when given the same basic-estimate ref clip."""
-    ref, payload = _compare_against_any_reference(dict(BASE_KWARGS), ref_pass=True)
-    assert payload["maxdiff"] < 0.01, f"max diff vs {ref} (ref pass): {payload}"
-
-
-# Parameter sweep around the defaults: every entry is merged over
-# BASE_KWARGS and compared against the reference (basic estimate).
-#
-# Tolerances are set from measurement. The basic estimate is sensitive to
-# block-match decisions made near the bm_range threshold: a microscopic fp
-# difference in distance accumulation can flip a block in or out of its
-# group, which shows up as isolated speckle (<0.1% of pixels, spread over
-# the whole frame). Larger sigma / more grouped blocks make this more
-# likely, hence the looser bounds there. Remeasured with the repaired
-# stride-aware/pinning oracle (vszipcl, basic estimate, frames 0/11/23):
-# defaults 0.00786, sigma=0.3 0.00256, sigma=1.5 0.02025, block_step=2
-# 0.00648, bm_range=9 0.00866, bm_range=22 0.00873, ps_range=5 0.00793,
-# ps_range=9 0.00732, ps_num=5 0.01226, extractor_exp=6 0.00806.
-#
-# Filled-in ranges (same oracle/session): block_step 1..8 worst 0.0132,
-# ps_num 1..8 0.0124, bm_range 1/4/32 0.0087, extractor_exp 3/8 0.0111,
-# radius=1 0.0074. The 0.02 bound covers the loosest with ~50% headroom.
+# The parameter sweep around the defaults, every entry merged over
+# BASE_KWARGS and graded against the CPU implementation. extractor_exp is
+# absent on purpose: it is a vsfeel/vszipcl accumulation knob the CPU plugin
+# does not have, so it is covered by the self-consistency tests instead.
 SWEEP_CONFIGS = [
-    ({}, 0.01),
-    ({"sigma": 0.3}, 0.01),
-    ({"sigma": 1.5}, 0.03),
-    ({"block_step": 2}, 0.01),
-    ({"block_step": 1}, 0.01),
-    ({"block_step": 3}, 0.01),
-    ({"block_step": 5}, 0.02),
-    ({"block_step": 6}, 0.02),
-    ({"block_step": 7}, 0.02),
-    ({"block_step": 8}, 0.02),
-    ({"bm_range": 9}, 0.01),
-    ({"bm_range": 22}, 0.01),
-    ({"bm_range": 1}, 0.01),
-    ({"bm_range": 4}, 0.01),
-    ({"bm_range": 32}, 0.01),
-    ({"ps_range": 5}, 0.01),
-    ({"ps_range": 9}, 0.01),
-    ({"ps_num": 5}, 0.02),
-    ({"ps_num": 1}, 0.02),
-    ({"ps_num": 2}, 0.02),
-    ({"ps_num": 3}, 0.02),
-    ({"ps_num": 4}, 0.02),
-    ({"ps_num": 6}, 0.02),
-    ({"ps_num": 7}, 0.02),
-    ({"ps_num": 8}, 0.02),
-    ({"extractor_exp": 6}, 0.01),
-    ({"extractor_exp": 3}, 0.02),
-    ({"extractor_exp": 8}, 0.02),
-    ({"radius": 1}, 0.01),
+    # (kwargs, bound, measured)
+    ({}, 5e-3, 0.00173),
+    ({"sigma": 0.3}, 5e-3, 0.00063),
+    ({"sigma": 1.5}, 1.2e-2, 0.00558),
+    ({"block_step": 1}, 5e-3, 0.00167),
+    ({"block_step": 2}, 5e-3, 0.00168),
+    ({"block_step": 3}, 5e-3, 0.00158),
+    ({"block_step": 5}, 1.2e-2, 0.00287),
+    ({"block_step": 6}, 1.2e-2, 0.00344),
+    ({"block_step": 7}, 1.2e-2, 0.00355),
+    ({"block_step": 8}, 1.2e-2, 0.00467),
+    ({"bm_range": 1}, 5e-3, 0.00173),
+    ({"bm_range": 4}, 5e-3, 0.00173),
+    ({"bm_range": 9}, 5e-3, 0.00195),
+    ({"bm_range": 22}, 5e-3, 0.00173),
+    ({"bm_range": 32}, 5e-3, 0.00167),
+    ({"ps_range": 5}, 5e-3, 0.00173),
+    ({"ps_range": 9}, 5e-3, 0.00177),
+    ({"ps_num": 1}, 5e-3, 0.00181),
+    ({"ps_num": 2}, 5e-3, 0.00173),
+    ({"ps_num": 3}, 5e-3, 0.00173),
+    ({"ps_num": 4}, 5e-3, 0.00173),
+    ({"ps_num": 5}, 5e-3, 0.00173),
+    ({"ps_num": 6}, 5e-3, 0.00180),
+    ({"ps_num": 7}, 5e-3, 0.00193),
+    ({"ps_num": 8}, 5e-3, 0.00201),
 ]
 
 
@@ -1145,205 +1364,85 @@ def _sweep_id(cfg: dict) -> str:
     return ",".join(f"{k}={v}" for k, v in cfg.items()) or "empty+BASE_KWARGS"
 
 
-@pytest.mark.parametrize("cfg,tol", SWEEP_CONFIGS, ids=[_sweep_id(c) for c, _ in SWEEP_CONFIGS])
-def test_bm3dv2_parameter_sweep_matches_reference(noise_gray, cfg, tol):
-    """Parameter grid around the defaults must track the reference (basic
-    estimate pass)."""
-    ref, payload = _compare_against_any_reference(dict(BASE_KWARGS, **cfg))
-    assert payload["maxdiff"] < tol, f"max diff vs {ref} ({_sweep_id(cfg)}): {payload}"
-
-
-# The plugin's own defaults (sigma=3.0, radius=0, bm_range=9, block_step=8,
-# ps_range=4, ps_num=2, extractor_exp=0) are not what BASE_KWARGS selects, so
-# the sweep's empty entry grades a different configuration. Grade the true
-# defaults directly -- never merged with BASE_KWARGS -- plus the short-array
-# inheritance case (a one-element sigma makes the other planes inherit
-# element 0). Measured vszipcl basic estimate, frames 0/11/23: defaults 0.0188,
-# sigma=[0.7] 0.0071.
 @pytest.mark.parametrize(
-    "kwargs,tol",
-    [
-        ({}, 0.03),
-        ({"sigma": [0.7]}, 0.02),
-    ],
-    ids=["plugin-defaults", "sigma-array-inherit"],
+    "cfg,bound,measured", SWEEP_CONFIGS, ids=[_sweep_id(c) for c, _, _ in SWEEP_CONFIGS]
 )
-def test_bm3dv2_plugin_defaults_match_reference(noise_gray, kwargs, tol):
-    """The documented defaults must produce the reference result, not just
-    any finite frame (test_device_limits/test_lifecycle only check those)."""
-    ref, payload = _compare_against_any_reference(kwargs)
-    assert payload["maxdiff"] < tol, f"max diff vs {ref} ({kwargs}): {payload}"
+def test_bm3dv2_parameter_sweep_matches_cpu(clip_gray, cfg, bound, measured):
+    """Parameter grid around the defaults, graded against the CPU plugin."""
+    payload = _cpu_compare(dict(BASE_KWARGS, **cfg))
+    assert payload["maxdiff"] < bound, f"max diff vs CPU ({cfg}): {payload} (was {measured})"
 
 
-# Remeasured with the repaired oracle (vszipcl, basic estimate, radius sweep):
-# radius 0/1/2/3/4 = 0.00708/0.00742/0.00786/0.00285/0.00300; the Wiener ref
-# pass = 0.00273. The 0.01 bound covers all of them with margin. Radius 5 and 6
-# are the first windows wider than the aggregation's push-constant table, i.e.
-# the derived arm's reference comparison; the references' own cap (16) is
-# covered by the self-consistency tests instead, because at that window the
-# reference's fused accumulator cache alone wants gigabytes.
-@pytest.mark.parametrize("radius", [0, 1, 2, 3, 4, 5, 6])
-def test_bm3dv2_matches_reference(noise_gray, radius):
-    """vsfeel must closely match vszipcl, falling back to bm3dhip.
+@pytest.mark.parametrize(
+    "kwargs,bound,measured",
+    [
+        ({}, 5e-3, 0.00173),
+        ({"sigma": [0.5, 1.1, 0.3]}, 5e-3, 0.00136),
+        ({"th_mse": 1200.0}, 5e-3, 0.00173),
+        ({"ps_num": 5}, 5e-3, 0.00173),
+    ],
+    ids=["plugin-defaults", "sigma-array-inherit", "explicit-th-mse", "ps-num-5"],
+)
+def test_bm3dv2_plugin_defaults_match_cpu(clip_gray, kwargs, bound, measured):
+    """The documented defaults must produce the CPU's result, not just any
+    finite frame (test_device_limits/test_lifecycle only check those)."""
+    payload = _cpu_compare(dict(BASE_KWARGS, **kwargs))
+    assert payload["maxdiff"] < bound, f"max diff vs CPU ({kwargs}): {payload}"
 
-    The reference plugins are crash-prone on some drivers, so the comparison
-    runs in a subprocess: a crashed reference must not take down the suite.
-    bm3dhip implements the same algorithm and is expected to match vszipcl.
+
+def test_bm3dv2_th_mse_matches_cpu(clip_gray):
+    """An explicit th_mse must reproduce the CPU's run at the same value.
+
+    The two domains line up exactly (`th_mse` is multiplied by the same
+    color-matrix norm on both sides), so a systematic unit error shows up as a
+    different group and a large diff."""
+    for th in (600.0, 1040.0, 2000.0):
+        payload = _cpu_compare(dict(BASE_KWARGS, th_mse=th))
+        assert payload["maxdiff"] < 5e-3, f"th_mse={th} vs CPU: {payload}"
+
+
+def test_bm3dv2_final_stage_matches_cpu(clip_gray):
+    """The Wiener pass, with both sides driven by the same guide.
+
+    The guide is vsfeel's basic estimate, so this isolates the final stage's
+    matching and Wiener shrinkage from any basic-stage difference."""
+    payload = _cpu_compare(BASE_KWARGS, stage="final")
+    assert payload["maxdiff"] < 2e-3, f"final pass vs CPU: {payload} (was 0.00052)"
+
+
+def test_bm3dv2_luma_only_color_matches_cpu():
+    """A colour clip with chroma disabled must match the CPU on luma.
+
+    Only the luma plane is comparable: the CPU scales a plane's sigma by that
+    plane's colour-matrix norm (normY/normU/normV) while vsfeel's factors carry
+    normY for every plane, and its RGB input goes through no opponent-colour
+    transform at all. With `sigma=[x, 0, 0]` both sides process luma alone, so
+    the domains are identical. 4:4:4 because the CPU's plugin refuses
+    subsampled input when chroma is processed.
     """
-    ref, payload = _compare_against_any_reference(dict(BASE_KWARGS, radius=radius))
-    assert payload["maxdiff"] < 0.01, f"max diff vs {ref}: {payload}"
+    payload = _cpu_compare(dict(BASE_KWARGS, sigma=[0.7, 0.0, 0.0]), clip="yuv444_32")
+    assert payload["per_plane"][0] < 5e-3, f"luma vs CPU: {payload}"
 
 
-# ---------------------------------------------------------------------------
-# extractor_exp: the documented ">= 3 = bitwise reproducible" claim
-# ---------------------------------------------------------------------------
-#
-# The reference pre-rounds the atomic addends with `(x + E) - E`
-# (kernel.cu:741-742), which makes the sums order-independent. EXTRACTOR is a
-# spec constant, so RADV used to constant-fold the pair back to x and the
-# parameter was a silent no-op (identical ISA for 0 and 20). bm3d.comp now
-# computes it under `precise` inside `if (EXTRACTOR != 0.0)`; the default
-# path's ISA is unchanged. After the fix, two fresh ns=1 runs are
-# bit-identical at 3/6/8 (3.7e-8 at 0) and the output tracks the reference.
+def test_bm3dv2_per_plane_color_matches_cpu():
+    """All three planes of a 4:4:4 clip, chroma included.
 
-
-@pytest.mark.parametrize("extractor_exp", [3, 6, 8])
-def test_bm3dv2_extractor_exp_is_bit_reproducible(noise_gray, extractor_exp):
-    """Two runs at extractor_exp >= 3 must be identical (reference: exact)."""
-    a = _run(noise_gray, radius=2, extractor_exp=extractor_exp)
-    b = _run(noise_gray, radius=2, extractor_exp=extractor_exp)
-    for n in (0, 11, 23):
-        fa = frame_to_ndarray(a.get_frame(n))
-        fb = frame_to_ndarray(b.get_frame(n))
-        assert np.array_equal(fa, fb), (
-            f"extractor_exp={extractor_exp} not reproducible at frame {n}"
-        )
-
-
-def test_bm3dv2_extractor_exp_changes_aggregation(noise_gray):
-    """A 2^20 extractor quantises the atomic addends to a 0.125 grid, which
-    must move the output (the reference goes non-finite at 2^20). An output
-    identical to extractor_exp=0 means the constant is folded away again.
-
-    Finiteness is asserted before the movement: an all-NaN output also has a
-    NaN max diff, so `not isfinite or moved` would accept the very regression
-    this test exists to catch.
+    The chroma thresholds differ by the normU/normV ratio (0.64/0.68 against
+    normY 0.75), so this is a close but not exact domain; the measured bound
+    carries that, and it still catches a gross matcher or indexing error on
+    chroma. The joint `chroma=True` entry has no CPU equivalent at all and is
+    covered by the self-consistency tests.
     """
-    base = _run(noise_gray, radius=2, extractor_exp=0)
-    coarse = _run(noise_gray, radius=2, extractor_exp=20)
-    for n in (0, 11, 23):
-        fb = frame_to_ndarray(base.get_frame(n))
-        fc = frame_to_ndarray(coarse.get_frame(n))
-        assert np.isfinite(fb).all() and np.isfinite(fc).all(), (
-            f"non-finite extractor_exp output at frame {n}"
-        )
-        assert float(np.abs(fb - fc).max()) > 1e-4, f"extractor_exp=20 left frame {n} unchanged"
+    payload = _cpu_compare(BASE_KWARGS, clip="yuv444_32")
+    assert payload["maxdiff"] < 2e-2, f"color vs CPU: {payload} (was 0.00676)"
 
 
-# ---------------------------------------------------------------------------
-# Multi-plane reference comparison
-# ---------------------------------------------------------------------------
-#
-# The default (per-plane) mode block-matches every plane on its own content at
-# its own geometry; chroma=True is the references' joint entry, where one
-# kernel filters all three 4:4:4 planes with the groups found on luma. Both are
-# graded against bm3dvk (the preferred reference where the two disagree) with
-# vszipcl/bm3dhip as the fallback. Tolerances are the same measurement-bounded
-# kind as the luma sweep: the residual is a handful of block-match decisions
-# that flip on rounding order, not a systematic difference.
-#
-# Measured per-plane maxima, bm3dvk, frames 0/11/23 (640x360 noise clip):
-# yuv420 r2 0.0066/0.0068/0.0079, yuv444 r2 0.0070/0.0052/0.0056,
-# rgb r2 0.0077/0.0071/0.0075, joint yuv444 r2 0.0070/0.0054/0.0056,
-# joint r0 0.0061/2.4e-7/2.4e-7, per-plane params 0.0066/0.0164/0.0099,
-# Wiener ref pass (joint) 0.0027/0.0016/0.0014. The 0.02 bound covers the
-# loosest with headroom; the joint-r0 chroma planes agree at ulp level.
-MULTIPLANE_CLIPS = [
-    ("yuv420_32", 0.02),
-    ("yuv444_32", 0.02),
-    ("rgb32", 0.02),
-]
-
-
-@pytest.mark.parametrize("clip,tol", MULTIPLANE_CLIPS, ids=[c for c, _ in MULTIPLANE_CLIPS])
-def test_bm3dv2_color_clip_matches_reference(clip, tol):
-    """Every plane of a color clip must track the reference's per-plane mode."""
-    ref, payload = _compare_against_bm3dvk(dict(BASE_KWARGS), clip=clip)
-    assert payload["maxdiff"] < tol, f"max diff vs {ref} ({clip}): {payload}"
-
-
-@pytest.mark.parametrize(
-    "kwargs,tol",
-    [
-        ({"chroma": 1}, 0.02),
-        ({"chroma": 1, "radius": 0}, 0.02),
-        ({"chroma": 1, "radius": 1}, 0.02),
-        ({"chroma": 1, "radius": 3}, 0.03),
-        ({"chroma": 1, "sigma": [0.5, 1.1, 0.3]}, 0.03),
-        ({"chroma": 1, "sigma": [0.7, 0.0, 0.9]}, 0.03),
-        ({"chroma": 1, "sigma": [0.0, 0.7, 0.7]}, 0.02),
-        ({"chroma": 1, "block_step": 1}, 0.03),
-        ({"chroma": 1, "ps_num": 5}, 0.03),
-        ({"chroma": 1, "extractor_exp": 6}, 0.03),
-    ],
-    ids=[
-        "r2",
-        "r0",
-        "r1",
-        "r3",
-        "per-plane-sigma",
-        "mixed-sigma",
-        "luma-skipped",
-        "block-step-1",
-        "ps-num-5",
-        "extractor-6",
-    ],
-)
-def test_bm3dv2_joint_chroma_matches_reference(kwargs, tol):
-    """chroma=True must reproduce the reference's joint (luma-grouped) entry."""
-    ref, payload = _compare_against_bm3dvk(dict(BASE_KWARGS, **kwargs), clip="yuv444_32")
-    assert payload["maxdiff"] < tol, f"max diff vs {ref} (chroma=1, {kwargs}): {payload}"
-
-
-@pytest.mark.parametrize(
-    "clip,kwargs",
-    [
-        ("yuv420_32", {}),
-        ("yuv444_32", {}),
-        ("rgb32", {}),
-        (
-            "yuv420_32",
-            {
-                "sigma": [0.7, 0.4, 1.2],
-                "bm_range": [16, 4, 12],
-                "ps_range": [7, 2, 6],
-                "block_step": [4, 8, 6],
-                "ps_num": [2, 3, 1],
-            },
-        ),
-        ("yuv420_32", {"sigma": [0.7, 0.0, 0.0]}),
-        ("yuv444_32", {"chroma": 1}),
-    ],
-    ids=["yuv420", "yuv444", "rgb", "per-plane-params", "mixed-sigma", "joint"],
-)
-def test_bm3dv2_color_ref_pass_matches_reference(clip, kwargs):
-    """The Wiener pass must match on color clips too, both entry modes."""
-    ref, payload = _compare_against_bm3dvk(dict(BASE_KWARGS, **kwargs), ref_pass=True, clip=clip)
-    assert payload["maxdiff"] < 0.02, f"max diff vs {ref} ({clip}, {kwargs}, ref pass): {payload}"
-
-
-def test_bm3dv2_per_plane_params_match_reference():
-    """Per-plane parameter arrays must land on the reference's per-plane run."""
-    kwargs = dict(
-        sigma=[0.7, 0.4, 1.2],
-        radius=2,
-        bm_range=[16, 4, 12],
-        ps_range=[7, 2, 6],
-        block_step=[4, 8, 6],
-        ps_num=[2, 3, 1],
+def test_bm3dv2_color_ref_pass_matches_cpu():
+    """The Wiener pass on luma of a colour clip, chroma disabled."""
+    payload = _cpu_compare(
+        dict(BASE_KWARGS, sigma=[0.7, 0.0, 0.0]), stage="final", clip="yuv444_32"
     )
-    ref, payload = _compare_against_bm3dvk(kwargs, clip="yuv420_32")
-    assert payload["maxdiff"] < 0.03, f"max diff vs {ref} (per-plane params): {payload}"
+    assert payload["per_plane"][0] < 5e-3, f"colour final pass vs CPU: {payload}"
 
 
 # ---------------------------------------------------------------------------
@@ -1356,7 +1455,7 @@ def test_bm3dv2_per_plane_params_match_reference():
 
 
 def _yuv420_clip():
-    return vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(NOISE_MKV), bits=32, fulls=True, fulld=True)
+    return vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(CLIP_PATH), bits=32, fulls=True, fulld=True)
 
 
 def test_bm3dv2_color_parallel_load_matches_serial():

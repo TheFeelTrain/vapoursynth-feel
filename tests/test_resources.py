@@ -32,7 +32,7 @@ import sys
 
 import pytest
 
-from conftest import COMPARE_PRELUDE, NOISE_MKV
+from conftest import COMPARE_PRELUDE, CLIP_PATH
 
 # Filters and the arguments the cycle test runs them with.  The concurrency test
 # reuses them on a 64x64 crop.
@@ -70,7 +70,7 @@ import time
 import numpy as np
 import vapoursynth as vs
 
-NOISE_MKV = __NOISE_MKV__
+CLIP_PATH = __NOISE_MKV__
 CORE = vs.core
 CORE.max_cache_size = 64
 
@@ -96,7 +96,7 @@ _KWARGS = {
 
 
 def make_clips():
-    src = CORE.bs.VideoSource(NOISE_MKV)
+    src = CORE.bs.VideoSource(CLIP_PATH)
     g = CORE.std.ShufflePlanes(src, 0, vs.GRAY)
     g32 = CORE.fmtc.bitdepth(g, bits=32, fulls=True, fulld=True)
     g16 = CORE.fmtc.bitdepth(g, bits=16, fulls=True, fulld=True)
@@ -281,10 +281,10 @@ main()
 """
 )
 
-_CYCLE_SCRIPT = _CYCLE_SCRIPT.replace("__NOISE_MKV__", repr(NOISE_MKV)).replace(
+_CYCLE_SCRIPT = _CYCLE_SCRIPT.replace("__NOISE_MKV__", repr(CLIP_PATH)).replace(
     "__CYCLES__", str(CYCLES)
 )
-_CONCURRENCY_SCRIPT = _CONCURRENCY_SCRIPT.replace("__NOISE_MKV__", repr(NOISE_MKV))
+_CONCURRENCY_SCRIPT = _CONCURRENCY_SCRIPT.replace("__NOISE_MKV__", repr(CLIP_PATH))
 
 
 def _run(script, argv=(), timeout=600.0):

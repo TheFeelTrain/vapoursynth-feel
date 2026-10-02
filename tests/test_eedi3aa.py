@@ -37,7 +37,7 @@ import vapoursynth as vs
 from conftest import (
     WIDTH,
     HEIGHT,
-    NOISE_MKV,
+    CLIP_PATH,
     assert_preserves_frame_props,
     cpu_node,
     dtype_for_bits as _dtype,
@@ -46,7 +46,7 @@ from conftest import (
     plane as _plane,
 )
 
-pytestmark = pytest.mark.usefixtures("noise_gray")
+pytestmark = pytest.mark.usefixtures("clip_gray")
 
 # Tolerance for f32: measured 5.96e-8 (a few ulp); the repo's ulp-level tier.
 F32_TOL = 1e-6
@@ -165,9 +165,9 @@ ORACLE_CASES_16 = [
 @pytest.mark.parametrize(
     "kw", ORACLE_CASES_16, ids=[f"case{i}" for i in range(len(ORACLE_CASES_16))]
 )
-def test_eedi3aa_oracle_16bit(noise_16bit, kw, mc):
+def test_eedi3aa_oracle_16bit(clip_16bit, kw, mc):
     """u16 EEDI3AA == the two-call based_aa chain, bit-exactly."""
-    clip = noise_16bit
+    clip = clip_16bit
     mclip = None if mc == "none" else _mask(clip, int(mc[1:]))
     frames = [0, 11, clip.num_frames - 1]
     _assert_oracle(clip, np.uint16, frames, mclip=mclip, sclip=_interleave2(clip), **kw)
@@ -177,10 +177,10 @@ def test_eedi3aa_oracle_16bit(noise_16bit, kw, mc):
     "sc", ["none", "alias", "distinct"], ids=["sclip0", "sclip-alias", "sclip-distinct"]
 )
 @pytest.mark.parametrize("kw", ORACLE_CASES_16[:4], ids=[f"case{i}" for i in range(4)])
-def test_eedi3aa_oracle_16bit_sclip_forms(noise_16bit, kw, sc):
+def test_eedi3aa_oracle_16bit_sclip_forms(clip_16bit, kw, sc):
     """The three sclip shapes: absent, based_aa's aliased Interleave([s, s]),
     and a genuinely distinct 2N-frame clip."""
-    clip = noise_16bit
+    clip = clip_16bit
     sclip = {"none": None, "alias": _interleave2(clip), "distinct": _interleave_distinct(clip)}[sc]
     _assert_oracle(clip, np.uint16, [0, 11, 23], mclip=_mask(clip, 16), sclip=sclip, **kw)
 
@@ -212,9 +212,9 @@ ORACLE_CASES_32 = [
 @pytest.mark.parametrize(
     "kw", ORACLE_CASES_32, ids=[f"case{i}" for i in range(len(ORACLE_CASES_32))]
 )
-def test_eedi3aa_oracle_32bit(noise_gray, kw, mc, sc):
+def test_eedi3aa_oracle_32bit(clip_gray, kw, mc, sc):
     """f32 EEDI3AA == the chain within a few ulp (documented F32_TOL)."""
-    clip = noise_gray
+    clip = clip_gray
     mclip = None if mc == "none" else _mask(clip, int(mc[1:]))
     sclip = {"none": None, "alias": _interleave2(clip), "distinct": _interleave_distinct(clip)}[sc]
     _assert_oracle(
@@ -229,8 +229,8 @@ def test_eedi3aa_oracle_32bit(noise_gray, kw, mc, sc):
 
 @pytest.mark.parametrize("fb", [0, 1, 2], ids=["prog", "tff", "bff"])
 @pytest.mark.parametrize("bits", [16, 32], ids=["16bit", "32bit"])
-def test_eedi3aa_field_based_input(noise_gray, noise_16bit, bits, fb):
-    clip = noise_16bit if bits == 16 else noise_gray
+def test_eedi3aa_field_based_input(clip_gray, clip_16bit, bits, fb):
+    clip = clip_16bit if bits == 16 else clip_gray
     tagged = vs.core.std.SetFrameProps(clip, _FieldBased=fb)
     dtype = _dtype(bits)
     tol = 0.0 if bits == 16 else F32_TOL
@@ -255,9 +255,9 @@ def test_eedi3aa_field_based_input(noise_gray, noise_16bit, bits, fb):
 
 def _yuv(bits):
     src = (
-        vs.core.bs.VideoSource(NOISE_MKV)
+        vs.core.bs.VideoSource(CLIP_PATH)
         if hasattr(vs.core, "bs")
-        else vs.core.ffms2.Source(NOISE_MKV)
+        else vs.core.ffms2.Source(CLIP_PATH)
     )
     return vs.core.fmtc.bitdepth(src, bits=bits, fulls=True, fulld=True)
 
@@ -339,8 +339,8 @@ def test_eedi3aa_yuv_chroma_only(bits):
 
 
 @pytest.mark.parametrize("bits", [16, 32], ids=["16bit", "32bit"])
-def test_eedi3aa_deterministic(noise_gray, noise_16bit, bits):
-    clip = noise_16bit if bits == 16 else noise_gray
+def test_eedi3aa_deterministic(clip_gray, clip_16bit, bits):
+    clip = clip_16bit if bits == 16 else clip_gray
     kw = dict(sclip=_interleave2(clip), mclip=_mask(clip, bits), vcheck=2, mdis=5, nrad=1)
     a = _aa(clip, **kw)
     b = _aa(clip, **kw)
@@ -354,11 +354,11 @@ def test_eedi3aa_deterministic(noise_gray, noise_16bit, bits):
             assert np.abs(fa - fb).max() < F32_TOL
 
 
-def test_eedi3aa_parallel_load_consistent(noise_16bit):
+def test_eedi3aa_parallel_load_consistent(clip_16bit):
     """Two parallel runs must match the serial path and each
     other — the request pattern that exposes stale descriptor bindings, fence
     misuse and command-pool reuse violations under load."""
-    clip = noise_16bit
+    clip = clip_16bit
     kw = dict(sclip=_interleave2(clip), mclip=_mask(clip, 16), vcheck=2, mdis=5, nrad=1)
     a = eval_parallel(_aa, clip, **kw)
     b = eval_parallel(_aa, clip, **kw)
@@ -375,9 +375,9 @@ def test_eedi3aa_parallel_load_consistent(noise_16bit):
 # ---------------------------------------------------------------------------
 
 
-def test_eedi3aa_single_rate_and_props(noise_16bit):
+def test_eedi3aa_single_rate_and_props(clip_16bit):
     """N in, N out at the input's fps, progressive, matching the chain."""
-    clip = noise_16bit
+    clip = clip_16bit
     out = _aa(clip, sclip=_interleave2(clip), mclip=_mask(clip, 16))
     assert out.num_frames == clip.num_frames
     assert (out.fps_num, out.fps_den) == (clip.fps_num, clip.fps_den)
@@ -385,8 +385,8 @@ def test_eedi3aa_single_rate_and_props(noise_16bit):
     assert out.get_frame(0).props.get("_FieldBased") == 0
 
 
-def test_eedi3aa_props_match_chain(noise_16bit):
-    clip = noise_16bit
+def test_eedi3aa_props_match_chain(clip_16bit):
+    clip = clip_16bit
     kw = dict(sclip=_interleave2(clip), mclip=_mask(clip, 16))
     mine = _aa(clip, **kw)
     ref = _oracle(clip, **kw)
@@ -400,10 +400,10 @@ def test_eedi3aa_props_match_chain(noise_16bit):
         assert pm.get("_DurationDen") == pr.get("_DurationDen")
 
 
-def test_eedi3aa_preserves_frame_props(noise_gray):
+def test_eedi3aa_preserves_frame_props(clip_gray):
     """field=3 halves the duration (fps doubles) but must keep every other tag."""
     assert_preserves_frame_props(
-        _aa, noise_gray, field=3, duration_factor=2, sclip=_interleave2(noise_gray)
+        _aa, clip_gray, field=3, duration_factor=2, sclip=_interleave2(clip_gray)
     )
 
 
@@ -413,24 +413,24 @@ def test_eedi3aa_preserves_frame_props(noise_gray):
 
 
 @pytest.mark.parametrize("field", [0, 1, 4, -1])
-def test_eedi3aa_rejects_bad_field(noise_16bit, field):
+def test_eedi3aa_rejects_bad_field(clip_16bit, field):
     with pytest.raises(vs.Error):
-        _aa(noise_16bit, field=field)
+        _aa(clip_16bit, field=field)
 
 
-def test_eedi3aa_rejects_dh(noise_16bit):
+def test_eedi3aa_rejects_dh(clip_16bit):
     with pytest.raises(vs.Error):
-        _aa(noise_16bit, field=3, dh=1)
+        _aa(clip_16bit, field=3, dh=1)
 
 
-def test_eedi3aa_rejects_odd_width(noise_16bit):
+def test_eedi3aa_rejects_odd_width(clip_16bit):
     """An odd processed plane width leaves the last output column unwritten.
 
     AA's horizontal geometry truncates at ``in_w / 2`` and the compose kernel
     writes both columns only for ``k < rows``, so column ``in_w - 1`` was never
     written and kept recycled VRAM.
     """
-    odd = vs.core.std.Crop(noise_16bit, right=1)
+    odd = vs.core.std.Crop(clip_16bit, right=1)
     assert odd.width % 2 == 1
     with pytest.raises(vs.Error):
         _aa(odd, field=3)
@@ -445,20 +445,20 @@ def test_eedi3aa_rejects_odd_chroma_width():
     _aa(odd, field=3, planes=[0])
 
 
-def test_eedi3aa_rejects_8bit(noise_8bit):
+def test_eedi3aa_rejects_8bit(clip_8bit):
     with pytest.raises(vs.Error):
-        _aa(noise_8bit, field=3)
+        _aa(clip_8bit, field=3)
 
 
-def test_eedi3aa_sclip_needs_2n_frames(noise_16bit):
+def test_eedi3aa_sclip_needs_2n_frames(clip_16bit):
     """field > 1 describes the doubled output, so sclip must be 2N frames."""
     with pytest.raises(vs.Error):
-        _aa(noise_16bit, field=3, sclip=noise_16bit)
+        _aa(clip_16bit, field=3, sclip=clip_16bit)
 
 
-def test_eedi3aa_is_pure_plugin_extension(noise_16bit):
+def test_eedi3aa_is_pure_plugin_extension(clip_16bit):
     """EEDI3/EEDI3H are untouched: their own output must still equal the
     composed chain (the fused filter is additive)."""
-    clip = noise_16bit
+    clip = clip_16bit
     v = vs.core.vsfeel.EEDI3(clip, field=3, vcheck=2, mdis=5, nrad=1)
     assert v.num_frames == 2 * clip.num_frames  # EEDI3 still doubles the rate

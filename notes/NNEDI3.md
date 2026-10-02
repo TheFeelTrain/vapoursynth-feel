@@ -292,6 +292,10 @@ upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
 
 ## Open work
 
+- **`field_gt1_matches_reference` fails on the new test clip (2026-10-02).**
+  Expectation calibrated on the old near-black noise clip; re-measure before
+  changing anything.
+
 - **CPU-sink row trails nnedi3vk (0.91x)** — structural: the references write
   CPU-native output with their own overlapped transfers while the API mandates
   a core `GPUDownload` for a CPU consumer. Same trade already shipped for

@@ -188,6 +188,10 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
 ## Open work
 
+- **`yuv_passthrough_32bit` and `_16bit` fail on the new test clip
+  (2026-10-02).** Passthrough expectations were calibrated on near-black noise;
+  re-measure with real content, which has chroma the old clip did not.
+
 - Do not re-derive: every in-filter alternative to the download was measured
   and rejected — a second *compute-family* queue for the copy (neutral: same
   engine), the core's host-visible direct-read path with streaming loads (fast

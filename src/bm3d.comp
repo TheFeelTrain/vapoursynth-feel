@@ -11,15 +11,25 @@
 #extension GL_KHR_shader_subgroup_shuffle : enable
 
 /*
- * BM3D collaborative hard-thresholding kernel (Vulkan port of the vszipcl
- * OpenCL kernel). One workgroup = one warp of 32 lanes; 4 groups of 8 lanes
- * each process one 8x8 block. The per-lane layout is [match(8) x row(8)] with
- * the block column provided by the lane id, so the 2D transform uses shared
- * memory transposes between the 8 lanes of a group.
+ * BM3D collaborative-filtering kernel. One workgroup = one warp of 32 lanes;
+ * 4 groups of 8 lanes each process one 8x8 reference block. The per-lane layout
+ * is [member(8) x row(8)] with the block column provided by the lane id, so the
+ * 2D transform uses shared memory transposes between the 8 lanes of a group.
  *
- * Compile-time variants: -DBITS not used; the kernel is specialized through
- * specialization constants (WIDTH..EXTRACTOR) so the pipeline can be built
- * once per plane configuration.
+ * Block matching follows mawen's CPU matcher (reference/VapourSynth-BM3D):
+ * the reference block is reserved at group index 0, the current frame is
+ * searched over its clipped bm_range rectangle, and every neighbouring frame is
+ * searched over the *union* of the clipped predictive windows around the
+ * surviving seeds -- each origin exactly once, which is what the CPU's
+ * GenSearchPos/std::unique produces. A frame keeps its best eight qualifying
+ * candidates (the prediction seeds are only its first ps_num), the two temporal
+ * directions each restart from the current frame's seeds, and the group keeps
+ * concatenation order until it overflows past eight, at which point the seven
+ * best of the tail are kept. The group can be shorter than eight, so the
+ * collaborative transform along the group axis has length N = group size.
+ *
+ * Compile-time variants: the kernel is specialized through specialization
+ * constants (WIDTH..TRACE) so the pipeline can be built once per configuration.
  */
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
@@ -47,6 +57,14 @@ layout(constant_id = 13) const int FINAL = 0;    // Wiener (ref) pass vs hard th
 layout(constant_id = 14) const float SIGMA_U = 0.0;
 layout(constant_id = 15) const float SIGMA_V = 0.0;
 layout(constant_id = 16) const int NPLANES = 1;
+// Matching threshold in SSD units (the host converts the user's 8-bit MSE
+// threshold with 64/255^2). Acceptance is inclusive, as the CPU's
+// `dist <= thSSE` is; zero means the reference-only group.
+layout(constant_id = 17) const float TH_SSE = 1.0;
+// Match trace (debug): writes the selected group of one (workgroup, group) pair
+// into the buffer bound as the unused destination binding. Folded away when 0,
+// so the production kernel carries no trace code at all.
+layout(constant_id = 18) const int TRACE = 0;
 
 const int KRADIUS = RADIUS;
 const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
@@ -71,6 +89,9 @@ layout(std430, binding = 0) buffer ResBuf { float res[]; };
 layout(std430, binding = 0) coherent buffer ResBuf { uint res_u[]; };
 #endif
 layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
+// The destination plane of the aggregation. The estimation dispatch binds the
+// trace buffer here instead: it never writes a destination.
+layout(std430, binding = 2) buffer TraceBuf { uint trace[]; };
 // Per-(slot, slice) witness: the frame index the estimation kernel wrote that
 // slice for (frame + 1, so 0 means "never written"). The aggregation refuses a
 // slice whose witness is not the frame it intends to read, which makes it
@@ -122,15 +143,18 @@ void res_add(int idx, float val) {
 
 layout(push_constant) uniform PushConstants {
     int res_off;   // float offset of this plane's result region
-    int nmod;      // center frame index of the window
-    int nframes;   // total frame count (for boundary clamping)
+    int nmod;      // centre frame index of the window
+    int nframes;   // total frame count (temporal bounds)
     int src_slot;  // radius 0: the stream's private source slot
     int tag_base;  // first tag index of this slot (slot * TW)
+    int trace_xy;  // TRACE: packed origin to record, else -1
 } pc;
 
-// absolute frame index of the window position z (clamped at the boundaries)
+// Absolute frame index of window position z. Only z in [zlo, zhi] is a real
+// frame; a window position outside that range is not searched and its result
+// slice is left unwritten, so an endpoint frame is never matched twice.
 int src_frame(int z) {
-    return min(max(pc.nmod - KRADIUS + z, 0), pc.nframes - 1);
+    return pc.nmod - KRADIUS + z;
 }
 
 // ring slot holding the frame at window position z (at radius 0 the stream's
@@ -155,10 +179,18 @@ int src_input(int z, int plane) {
     return src_search(z, plane) + (FINAL != 0 ? CLIP_STRIDE : 0);
 }
 
+// Per-lane candidate lists: [8 lanes][8 entries], the key is (error, packed yx).
 shared float l_e[4][64];
-shared int l_x[4][64];
-shared int l_y[4][64];
-shared int l_s[4][64];
+shared int l_xy[4][64];
+// Prediction seeds of the temporal chain, one row per 8-lane group. They live
+// in shared memory because every lane of the group reads all of them: a
+// register array indexed by a runtime seed count would spill to scratch.
+shared int s_x[4][8];
+shared int s_y[4][8];
+// The current frame's seeds, kept so both temporal directions start from the
+// same list.
+shared int s0_x[4][8];
+shared int s0_y[4][8];
 
 
 void dct_fwd(inout float v[8]) {
@@ -273,7 +305,7 @@ void transform_pack8_inv(inout float data[64]) {
 }
 
 void transform_pack8_1d(inout float data[64]) {
-    // stride 8 groups: the 8 matches at a fixed position
+    // stride 8 groups: the 8 members at a fixed position
     for (int it = 0; it < 8; ++it) {
         float v[8];
         for (int i = 0; i < 8; ++i) v[i] = data[it + i * 8];
@@ -287,6 +319,198 @@ void transform_pack8_1d_inv(inout float data[64]) {
         float v[8];
         for (int i = 0; i < 8; ++i) v[i] = data[it + i * 8];
         dct_inv(v);
+        for (int i = 0; i < 8; ++i) data[it + i * 8] = v[i];
+    }
+}
+
+// Length-N scaled DCT-II pair (n in [1, 8); n == 8 uses the fast path).
+// A_N^T A_N = 2N I, so the group-axis round trip gain is 2N.
+void group_dct_fwd_n(inout float v[8], int n) {
+    float o0, o1, o2, o3, o4, o5, o6, o7;
+    switch (n) {
+    case 1:
+        o0 = 1.41421354f * v[0];
+        o1 = 0.0f;
+        o2 = 0.0f;
+        o3 = 0.0f;
+        o4 = 0.0f;
+        o5 = 0.0f;
+        o6 = 0.0f;
+        o7 = 0.0f;
+        break;
+    case 2:
+        o0 = fma(1.41421354f, v[1], 1.41421354f * v[0]);
+        o1 = fma(-1.41421354f, v[1], 1.41421354f * v[0]);
+        o2 = 0.0f;
+        o3 = 0.0f;
+        o4 = 0.0f;
+        o5 = 0.0f;
+        o6 = 0.0f;
+        o7 = 0.0f;
+        break;
+    case 3:
+        o0 = fma(1.41421354f, v[2], fma(1.41421354f, v[1], 1.41421354f * v[0]));
+        o1 = fma(-1.73205078f, v[2], 1.73205078f * v[0]);
+        o2 = fma(1.0f, v[2], fma(-2.0f, v[1], 1.0f * v[0]));
+        o3 = 0.0f;
+        o4 = 0.0f;
+        o5 = 0.0f;
+        o6 = 0.0f;
+        o7 = 0.0f;
+        break;
+    case 4:
+        o0 = fma(1.41421354f, v[3], fma(1.41421354f, v[2], fma(1.41421354f, v[1], 1.41421354f * v[0])));
+        o1 = fma(-1.84775901f, v[3], fma(-0.765366852f, v[2], fma(0.765366852f, v[1], 1.84775901f * v[0])));
+        o2 = fma(1.41421354f, v[3], fma(-1.41421354f, v[2], fma(-1.41421354f, v[1], 1.41421354f * v[0])));
+        o3 = fma(-0.765366852f, v[3], fma(1.84775901f, v[2], fma(-1.84775901f, v[1], 0.765366852f * v[0])));
+        o4 = 0.0f;
+        o5 = 0.0f;
+        o6 = 0.0f;
+        o7 = 0.0f;
+        break;
+    case 5:
+        o0 = fma(1.41421354f, v[4], fma(1.41421354f, v[3], fma(1.41421354f, v[2], fma(1.41421354f, v[1], 1.41421354f * v[0]))));
+        o1 = fma(-1.90211308f, v[4], fma(-1.17557049f, v[3], fma(1.17557049f, v[1], 1.90211308f * v[0])));
+        o2 = fma(1.61803401f, v[4], fma(-0.618034005f, v[3], fma(-2.0f, v[2], fma(-0.618034005f, v[1], 1.61803401f * v[0]))));
+        o3 = fma(-1.17557049f, v[4], fma(1.90211308f, v[3], fma(-1.90211308f, v[1], 1.17557049f * v[0])));
+        o4 = fma(0.618034005f, v[4], fma(-1.61803401f, v[3], fma(2.0f, v[2], fma(-1.61803401f, v[1], 0.618034005f * v[0]))));
+        o5 = 0.0f;
+        o6 = 0.0f;
+        o7 = 0.0f;
+        break;
+    case 6:
+        o0 = fma(1.41421354f, v[5], fma(1.41421354f, v[4], fma(1.41421354f, v[3], fma(1.41421354f, v[2], fma(1.41421354f, v[1], 1.41421354f * v[0])))));
+        o1 = fma(-1.93185163f, v[5], fma(-1.41421354f, v[4], fma(-0.517638087f, v[3], fma(0.517638087f, v[2], fma(1.41421354f, v[1], 1.93185163f * v[0])))));
+        o2 = fma(1.73205078f, v[5], fma(-1.73205078f, v[3], fma(-1.73205078f, v[2], 1.73205078f * v[0])));
+        o3 = fma(-1.41421354f, v[5], fma(1.41421354f, v[4], fma(1.41421354f, v[3], fma(-1.41421354f, v[2], fma(-1.41421354f, v[1], 1.41421354f * v[0])))));
+        o4 = fma(1.0f, v[5], fma(-2.0f, v[4], fma(1.0f, v[3], fma(1.0f, v[2], fma(-2.0f, v[1], 1.0f * v[0])))));
+        o5 = fma(-0.517638087f, v[5], fma(1.41421354f, v[4], fma(-1.93185163f, v[3], fma(1.93185163f, v[2], fma(-1.41421354f, v[1], 0.517638087f * v[0])))));
+        o6 = 0.0f;
+        o7 = 0.0f;
+        break;
+    case 7:
+        o0 = fma(1.41421354f, v[6], fma(1.41421354f, v[5], fma(1.41421354f, v[4], fma(1.41421354f, v[3], fma(1.41421354f, v[2], fma(1.41421354f, v[1], 1.41421354f * v[0]))))));
+        o1 = fma(-1.9498558f, v[6], fma(-1.56366301f, v[5], fma(-0.867767453f, v[4], fma(0.867767453f, v[2], fma(1.56366301f, v[1], 1.9498558f * v[0])))));
+        o2 = fma(1.8019377f, v[6], fma(0.445041865f, v[5], fma(-1.24697959f, v[4], fma(-2.0f, v[3], fma(-1.24697959f, v[2], fma(0.445041865f, v[1], 1.8019377f * v[0]))))));
+        o3 = fma(-1.56366301f, v[6], fma(0.867767453f, v[5], fma(1.9498558f, v[4], fma(-1.9498558f, v[2], fma(-0.867767453f, v[1], 1.56366301f * v[0])))));
+        o4 = fma(1.24697959f, v[6], fma(-1.8019377f, v[5], fma(-0.445041865f, v[4], fma(2.0f, v[3], fma(-0.445041865f, v[2], fma(-1.8019377f, v[1], 1.24697959f * v[0]))))));
+        o5 = fma(-0.867767453f, v[6], fma(1.9498558f, v[5], fma(-1.56366301f, v[4], fma(1.56366301f, v[2], fma(-1.9498558f, v[1], 0.867767453f * v[0])))));
+        o6 = fma(0.445041865f, v[6], fma(-1.24697959f, v[5], fma(1.8019377f, v[4], fma(-2.0f, v[3], fma(1.8019377f, v[2], fma(-1.24697959f, v[1], 0.445041865f * v[0]))))));
+        o7 = 0.0f;
+        break;
+    default:
+        o0 = v[0]; o1 = v[1]; o2 = v[2]; o3 = v[3];
+        o4 = v[4]; o5 = v[5]; o6 = v[6]; o7 = v[7];
+        break;
+    }
+    v[0] = o0; v[1] = o1; v[2] = o2; v[3] = o3;
+    v[4] = o4; v[5] = o5; v[6] = o6; v[7] = o7;
+}
+
+void group_dct_inv_n(inout float v[8], int n) {
+    float o0, o1, o2, o3, o4, o5, o6, o7;
+    switch (n) {
+    case 1:
+        o0 = 1.41421354f * v[0];
+        o1 = 0.0f;
+        o2 = 0.0f;
+        o3 = 0.0f;
+        o4 = 0.0f;
+        o5 = 0.0f;
+        o6 = 0.0f;
+        o7 = 0.0f;
+        break;
+    case 2:
+        o0 = fma(1.41421354f, v[1], 1.41421354f * v[0]);
+        o1 = fma(-1.41421354f, v[1], 1.41421354f * v[0]);
+        o2 = 0.0f;
+        o3 = 0.0f;
+        o4 = 0.0f;
+        o5 = 0.0f;
+        o6 = 0.0f;
+        o7 = 0.0f;
+        break;
+    case 3:
+        o0 = fma(1.0f, v[2], fma(1.73205078f, v[1], 1.41421354f * v[0]));
+        o1 = fma(-2.0f, v[2], 1.41421354f * v[0]);
+        o2 = fma(1.0f, v[2], fma(-1.73205078f, v[1], 1.41421354f * v[0]));
+        o3 = 0.0f;
+        o4 = 0.0f;
+        o5 = 0.0f;
+        o6 = 0.0f;
+        o7 = 0.0f;
+        break;
+    case 4:
+        o0 = fma(0.765366852f, v[3], fma(1.41421354f, v[2], fma(1.84775901f, v[1], 1.41421354f * v[0])));
+        o1 = fma(-1.84775901f, v[3], fma(-1.41421354f, v[2], fma(0.765366852f, v[1], 1.41421354f * v[0])));
+        o2 = fma(1.84775901f, v[3], fma(-1.41421354f, v[2], fma(-0.765366852f, v[1], 1.41421354f * v[0])));
+        o3 = fma(-0.765366852f, v[3], fma(1.41421354f, v[2], fma(-1.84775901f, v[1], 1.41421354f * v[0])));
+        o4 = 0.0f;
+        o5 = 0.0f;
+        o6 = 0.0f;
+        o7 = 0.0f;
+        break;
+    case 5:
+        o0 = fma(0.618034005f, v[4], fma(1.17557049f, v[3], fma(1.61803401f, v[2], fma(1.90211308f, v[1], 1.41421354f * v[0]))));
+        o1 = fma(-1.61803401f, v[4], fma(-1.90211308f, v[3], fma(-0.618034005f, v[2], fma(1.17557049f, v[1], 1.41421354f * v[0]))));
+        o2 = fma(2.0f, v[4], fma(-2.0f, v[2], 1.41421354f * v[0]));
+        o3 = fma(-1.61803401f, v[4], fma(1.90211308f, v[3], fma(-0.618034005f, v[2], fma(-1.17557049f, v[1], 1.41421354f * v[0]))));
+        o4 = fma(0.618034005f, v[4], fma(-1.17557049f, v[3], fma(1.61803401f, v[2], fma(-1.90211308f, v[1], 1.41421354f * v[0]))));
+        o5 = 0.0f;
+        o6 = 0.0f;
+        o7 = 0.0f;
+        break;
+    case 6:
+        o0 = fma(0.517638087f, v[5], fma(1.0f, v[4], fma(1.41421354f, v[3], fma(1.73205078f, v[2], fma(1.93185163f, v[1], 1.41421354f * v[0])))));
+        o1 = fma(-1.41421354f, v[5], fma(-2.0f, v[4], fma(-1.41421354f, v[3], fma(1.41421354f, v[1], 1.41421354f * v[0]))));
+        o2 = fma(1.93185163f, v[5], fma(1.0f, v[4], fma(-1.41421354f, v[3], fma(-1.73205078f, v[2], fma(0.517638087f, v[1], 1.41421354f * v[0])))));
+        o3 = fma(-1.93185163f, v[5], fma(1.0f, v[4], fma(1.41421354f, v[3], fma(-1.73205078f, v[2], fma(-0.517638087f, v[1], 1.41421354f * v[0])))));
+        o4 = fma(1.41421354f, v[5], fma(-2.0f, v[4], fma(1.41421354f, v[3], fma(-1.41421354f, v[1], 1.41421354f * v[0]))));
+        o5 = fma(-0.517638087f, v[5], fma(1.0f, v[4], fma(-1.41421354f, v[3], fma(1.73205078f, v[2], fma(-1.93185163f, v[1], 1.41421354f * v[0])))));
+        o6 = 0.0f;
+        o7 = 0.0f;
+        break;
+    case 7:
+        o0 = fma(0.445041865f, v[6], fma(0.867767453f, v[5], fma(1.24697959f, v[4], fma(1.56366301f, v[3], fma(1.8019377f, v[2], fma(1.9498558f, v[1], 1.41421354f * v[0]))))));
+        o1 = fma(-1.24697959f, v[6], fma(-1.9498558f, v[5], fma(-1.8019377f, v[4], fma(-0.867767453f, v[3], fma(0.445041865f, v[2], fma(1.56366301f, v[1], 1.41421354f * v[0]))))));
+        o2 = fma(1.8019377f, v[6], fma(1.56366301f, v[5], fma(-0.445041865f, v[4], fma(-1.9498558f, v[3], fma(-1.24697959f, v[2], fma(0.867767453f, v[1], 1.41421354f * v[0]))))));
+        o3 = fma(-2.0f, v[6], fma(2.0f, v[4], fma(-2.0f, v[2], 1.41421354f * v[0])));
+        o4 = fma(1.8019377f, v[6], fma(-1.56366301f, v[5], fma(-0.445041865f, v[4], fma(1.9498558f, v[3], fma(-1.24697959f, v[2], fma(-0.867767453f, v[1], 1.41421354f * v[0]))))));
+        o5 = fma(-1.24697959f, v[6], fma(1.9498558f, v[5], fma(-1.8019377f, v[4], fma(0.867767453f, v[3], fma(0.445041865f, v[2], fma(-1.56366301f, v[1], 1.41421354f * v[0]))))));
+        o6 = fma(0.445041865f, v[6], fma(-0.867767453f, v[5], fma(1.24697959f, v[4], fma(-1.56366301f, v[3], fma(1.8019377f, v[2], fma(-1.9498558f, v[1], 1.41421354f * v[0]))))));
+        o7 = 0.0f;
+        break;
+    default:
+        o0 = v[0]; o1 = v[1]; o2 = v[2]; o3 = v[3];
+        o4 = v[4]; o5 = v[5]; o6 = v[6]; o7 = v[7];
+        break;
+    }
+    v[0] = o0; v[1] = o1; v[2] = o2; v[3] = o3;
+    v[4] = o4; v[5] = o5; v[6] = o6; v[7] = o7;
+}
+
+void transform_group_fwd(inout float data[64], int n) {
+    if (n == 8) {
+        transform_pack8_1d(data);
+        return;
+    }
+    for (int it = 0; it < 8; ++it) {
+        float v[8];
+        for (int i = 0; i < 8; ++i) v[i] = data[it + i * 8];
+        group_dct_fwd_n(v, n);
+        for (int i = 0; i < 8; ++i) data[it + i * 8] = v[i];
+    }
+}
+
+void transform_group_inv(inout float data[64], int n) {
+    if (n == 8) {
+        transform_pack8_1d_inv(data);
+        return;
+    }
+    for (int it = 0; it < 8; ++it) {
+        float v[8];
+        for (int i = 0; i < 8; ++i) v[i] = data[it + i * 8];
+        group_dct_inv_n(v, n);
         for (int i = 0; i < 8; ++i) data[it + i * 8] = v[i];
     }
 }
@@ -325,209 +549,347 @@ float reduce_group8(float x) {
     return x;
 }
 
+// Sum of squared differences in the CPU reference's accumulation order: four
+// accumulators, each taking column k and column k+4 of one row before the next
+// row (the SSE path of BlockSSD, whose width is a whole multiple of 8), then
+// one left-to-right scalar fold. Near-ties and threshold boundaries are
+// decided by this order, so matching it keeps the two matchers' discrete
+// decisions together.
 float ssd_err(const float cur[64], const int base_idx, int cx, int cy) {
-    float col[8];
-    for (int c = 0; c < 8; ++c) {
-        float errors[2] = float[2](0.0f, 0.0f);
-        for (int i = 0; i < 8; ++i) {
-            float val = cur[c * 8 + i] - src[base_idx + (cy + i) * STRIDE + (cx + c)];
-            errors[i % 2] += val * val;
-        }
-        col[c] = errors[0] + errors[1];
+    float a0 = 0.0f;
+    float a1 = 0.0f;
+    float a2 = 0.0f;
+    float a3 = 0.0f;
+    for (int i = 0; i < 8; ++i) {
+        const int row = base_idx + (cy + i) * STRIDE + cx;
+        const float d0 = cur[0 * 8 + i] - src[row + 0];
+        const float d1 = cur[1 * 8 + i] - src[row + 1];
+        const float d2 = cur[2 * 8 + i] - src[row + 2];
+        const float d3 = cur[3 * 8 + i] - src[row + 3];
+        const float d4 = cur[4 * 8 + i] - src[row + 4];
+        const float d5 = cur[5 * 8 + i] - src[row + 5];
+        const float d6 = cur[6 * 8 + i] - src[row + 6];
+        const float d7 = cur[7 * 8 + i] - src[row + 7];
+        a0 = a0 + d0 * d0;
+        a1 = a1 + d1 * d1;
+        a2 = a2 + d2 * d2;
+        a3 = a3 + d3 * d3;
+        a0 = a0 + d4 * d4;
+        a1 = a1 + d5 * d5;
+        a2 = a2 + d6 * d6;
+        a3 = a3 + d7 * d7;
     }
-    return ((col[0] + col[1]) + (col[2] + col[3])) + ((col[4] + col[5]) + (col[6] + col[7]));
+    return ((a0 + a1) + a2) + a3;
 }
 
 // The candidate's (x, y) pair travels packed in one word: the insert shifts one
-// array per position, and folding x and y into a single word makes that three
-// arrays instead of four.
+// array per position, and folding x and y into a single word makes that two
+// arrays instead of three. Packing y in the high half makes the packed word
+// order the origins the way the CPU enumerates them -- ascending y, then
+// ascending x -- which is the tie policy for equal distances.
 const int XY_SHIFT = 16;
 int pack_xy(int cx, int cy) { return (cx & 0xFFFF) | (cy << XY_SHIFT); }
 
-// `depth` is a compile-time constant at every call site: the spatial search
-// needs all 8 group members, while a temporal per-window list is only ever
-// consumed down to its top PS_NUM entries (merge_group is asked for PS_NUM,
-// and the window centres read back only the first PS_NUM). A depth-PS_NUM list
-// makes the insert shift one element instead of seven and holds six registers
-// instead of twenty-four.
-void insertN(int depth, inout float e[8], inout int xy[8], inout int sq[8],
-             float err_, int cx_, int cy_, int cs_) {
-    if (err_ < e[depth - 1]) {
-        const int xy_ = pack_xy(cx_, cy_);
-        int pos = depth;
-        for (int k = depth - 1; k >= 0; --k) {
-            pos = (err_ < e[k]) ? k : pos;
-        }
-        for (int k = depth - 1; k >= 1; --k) {
-            e[k]  = (k == pos) ? err_ : ((k > pos) ? e[k - 1] : e[k]);
-            xy[k] = (k == pos) ? xy_ : ((k > pos) ? xy[k - 1] : xy[k]);
-            sq[k] = (k == pos) ? cs_ : ((k > pos) ? sq[k - 1] : sq[k]);
-        }
-        e[0]  = (pos == 0) ? err_ : e[0];
-        xy[0] = (pos == 0) ? xy_ : xy[0];
-        sq[0] = (pos == 0) ? cs_ : sq[0];
+// Sorted insert of one candidate into a per-lane top-8, ordered by
+// (error, y, x). The key is a strict weak ordering shared by every list in this
+// file, so per-lane lists merge into the same order the CPU's stable_sort of
+// the union produces.
+void insert_cand(inout float e[8], inout int xy[8], float err_, int xy_) {
+    if (err_ > e[7] || (err_ == e[7] && xy_ >= xy[7])) {
+        return;
     }
+    int pos = 7;
+    for (int k = 6; k >= 0; --k) {
+        pos = (err_ < e[k] || (err_ == e[k] && xy_ < xy[k])) ? k : pos;
+    }
+    for (int k = 7; k >= 1; --k) {
+        e[k] = (k == pos) ? err_ : ((k > pos) ? e[k - 1] : e[k]);
+        xy[k] = (k == pos) ? xy_ : ((k > pos) ? xy[k - 1] : xy[k]);
+    }
+    e[0] = (pos == 0) ? err_ : e[0];
+    xy[0] = (pos == 0) ? xy_ : xy[0];
 }
 
-
-void ginsert8(inout float e[8], inout int xs[8], inout int ys[8], inout int zs[8],
-              float err_, int cx_, int cy_, int cz_) {
-    if (err_ < e[7]) {
-        int pos = 8;
-        for (int k = 7; k >= 0; --k) {
-            pos = (err_ < e[k]) ? k : pos;
-        }
-        for (int k = 7; k >= 1; --k) {
-            e[k]  = (k == pos) ? err_ : ((k > pos) ? e[k - 1] : e[k]);
-            xs[k] = (k == pos) ? cx_ : ((k > pos) ? xs[k - 1] : xs[k]);
-            ys[k] = (k == pos) ? cy_ : ((k > pos) ? ys[k - 1] : ys[k]);
-            zs[k] = (k == pos) ? cz_ : ((k > pos) ? zs[k - 1] : zs[k]);
-        }
-        e[0]  = (pos == 0) ? err_ : e[0];
-        xs[0] = (pos == 0) ? cx_ : xs[0];
-        ys[0] = (pos == 0) ? cy_ : ys[0];
-        zs[0] = (pos == 0) ? cz_ : zs[0];
-    }
-}
-
-// `n` entries of the merged list are produced. The temporal searches only
-// consume the top PS_NUM, so they ask for that many and their lanes hold only
-// that many.
-void merge_group(int n, int base, out float me[8], out int mx[8], out int my[8]) {
-    const int lane = int(gl_LocalInvocationID.x);
-    const int group = lane >> 3;
+// 8-way merge of the per-lane lists into the group's best `n` entries, in the
+// same (error, y, x) order. A per-lane top-n recovers the group's top-n: the
+// entries each lane dropped are below its own n-th, so they are below the
+// n-th of the union too. `count` is the number of real entries; the tail is
+// filled with the sentinel so callers can loop over all 8 without a runtime
+// bound. When `seeds` is set the first PS_NUM entries are also published as the
+// prediction seeds of the next temporal frame.
+void merge_group(int n, bool seeds, out int count, out float me[8], out int mxy[8]) {
+    const int lid = int(gl_LocalInvocationID.x);
+    const int group = lid >> 3;
+    const int sl = lid & 7;
     int head[8];
     for (int l = 0; l < 8; ++l) head[l] = 0;
-    for (int k = 0; k < n; ++k) {
-        int bl = 0;
+    count = 0;
+    for (int k = 0; k < 8; ++k) {
+        int bl = -1;
         int bh = 0;
         float be = FLT_MAX_;
-        int bs = INT_MAX_;
-        bool found = false;
-        for (int l = 0; l < 8; ++l) {
-            int hv = head[l];
-            bool valid = hv < n;
-            int idx = base + l * 8 + (valid ? hv : 0);
-            float e = valid ? l_e[group][idx] : FLT_MAX_;
-            int sq = valid ? l_s[group][idx] : INT_MAX_;
-            bool better = valid && (!found || e < be || (e == be && sq < bs));
-            bl = better ? l : bl;
-            bh = better ? hv : bh;
-            be = better ? e : be;
-            bs = better ? sq : bs;
-            found = found || valid;
+        int bx = INT_MAX_;
+        if (k < n) {
+            for (int l = 0; l < 8; ++l) {
+                const int hv = head[l];
+                const bool has = hv < n;
+                const int idx = l * 8 + (has ? hv : 0);
+                const float e = has ? l_e[group][idx] : FLT_MAX_;
+                const int x = has ? l_xy[group][idx] : INT_MAX_;
+                // An unfilled slot holds the sentinel error, which no real
+                // distance reaches, so it is not an entry.
+                const bool valid = has && e < FLT_MAX_;
+                const bool better = valid && (bl < 0 || e < be || (e == be && x < bx));
+                bl = better ? l : bl;
+                bh = better ? hv : bh;
+                be = better ? e : be;
+                bx = better ? x : bx;
+            }
         }
         me[k] = be;
-        mx[k] = l_x[group][base + bl * 8 + bh];
-        my[k] = l_y[group][base + bl * 8 + bh];
-        for (int l = 0; l < 8; ++l) {
-            head[l] += (l == bl) ? 1 : 0;
+        mxy[k] = bx;
+        if (bl < 0) {
+            continue;
+        }
+        count = k + 1;
+        head[bl] += 1;
+        if (seeds && k < PS_NUM && sl == 0) {
+            s_x[group][k] = bx & 0xFFFF;
+            s_y[group][k] = bx >> XY_SHIFT;
         }
     }
 }
 
-float hard_thresholding_s(inout float data[64], float sigma) {
-    const int lane = int(gl_LocalInvocationID.x);
-    float ks[4] = float[4](0.0f, 0.0f, 0.0f, 0.0f);
-
-    for (int i = 0; i < 64; ++i) {
-        float val = data[i];
-
-        float thr;
-        if (i == 0) {
-            thr = (lane % 8) != 0 ? sigma : 0.0f;
-        } else {
-            thr = sigma;
+// Append one retained candidate to the combined group, in CPU concatenation
+// order. While the list is short the order is the concatenation itself -- the
+// CPU only sorts when it has to drop something -- and once the ninth entry
+// arrives the tail becomes the best seven, ordered by error with arrival order
+// breaking ties. The reference stays at index 0 throughout.
+void group_add(inout float ge[8], inout int gxy[8], inout int gz[8],
+               inout int gcount, inout bool overflow,
+               float err_, int xy_, int z_) {
+    if (gcount < 8) {
+        ge[gcount] = err_;
+        gxy[gcount] = xy_;
+        gz[gcount] = z_;
+        gcount += 1;
+        return;
+    }
+    if (!overflow) {
+        overflow = true;
+        // Stable insertion sort of the tail (indices 1..7) by error; equal
+        // errors keep their concatenation order.
+        for (int a = 2; a < 8; ++a) {
+            const float ke = ge[a];
+            const int kx = gxy[a];
+            const int kz = gz[a];
+            int b = a;
+            for (int s = 1; s < 7; ++s) {
+                if (b > 1 && ge[b - 1] > ke) {
+                    ge[b] = ge[b - 1];
+                    gxy[b] = gxy[b - 1];
+                    gz[b] = gz[b - 1];
+                    --b;
+                }
+            }
+            ge[b] = ke;
+            gxy[b] = kx;
+            gz[b] = kz;
         }
+    }
+    int pos = 8;
+    for (int k = 7; k >= 1; --k) {
+        pos = (err_ < ge[k]) ? k : pos;
+    }
+    if (pos > 7) {
+        return;
+    }
+    for (int k = 7; k > pos; --k) {
+        ge[k] = ge[k - 1];
+        gxy[k] = gxy[k - 1];
+        gz[k] = gz[k - 1];
+    }
+    ge[pos] = err_;
+    gxy[pos] = xy_;
+    gz[pos] = z_;
+}
 
-        bool flag = abs(val) >= thr;
+// The group-axis noise standard deviation scales with the square root of the
+// transform gain: 512N against 4096 at N = 8, so sqrt(N/8). At N = 8 the factor
+// is exactly one and nothing changes.
+float sigma_for_n(float sigma, int n) {
+    return sigma * sqrt(float(n) * 0.125f);
+}
 
-        ks[i % 4] += flag ? 1.0f : 0.0f;
-        data[i] = flag ? (val * (1.0f / 4096.0f)) : 0.0f;
+// Counts and thresholds the 64N real coefficients of the group (never the
+// padding of a shorter group) and applies the inverse 512N gain.
+//
+// `sigma` is the CPU's `thrBase`: in this kernel's transform domain the
+// coefficient is the CPU's divided by sqrt(2) per DC axis, which turns the
+// CPU's per-axis threshold `thrBase * sqrt(2)^flag` into this uniform one. The
+// comparison is strict, as the CPU's `*srcp > *thrp || *srcp < -*thrp` is, and
+// no coefficient is exempt -- the CPU has no global-DC special case.
+float hard_thresholding_s(inout float data[64], float sigma, int n) {
+    float ks[4] = float[4](0.0f, 0.0f, 0.0f, 0.0f);
+    const float scale = 1.0f / (512.0f * float(n));
+
+    for (int i = 0; i < 8; ++i) {
+        if (i >= n) {
+            continue;
+        }
+        for (int j = 0; j < 8; ++j) {
+            const int idx = i * 8 + j;
+            const float val = data[idx];
+            const bool keep = abs(val) > sigma;
+            ks[j % 4] += keep ? 1.0f : 0.0f;
+            data[idx] = keep ? (val * scale) : 0.0f;
+        }
     }
 
     float k = (ks[0] + ks[1]) + (ks[2] + ks[3]);
     k = reduce_group8(k);
 
-    return 1.0f / k;
+    // The CPU's `retainedCoefs < 1 ? 1 : 1/retainedCoefs`: a group whose every
+    // coefficient was thresholded away still carries a weight of one.
+    return 1.0f / max(k, 1.0f);
 }
 
-void collaborative_hard(inout float denoising_patch[64], float sigma,
-                       out float adaptive_weight) {
-    const int lane = int(gl_LocalInvocationID.x);
+void collaborative_hard(inout float denoising_patch[64], float sigma, int n,
+                        out float adaptive_weight) {
     for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8(denoising_patch);
         transpose_pack8(denoising_patch);
     }
-    transform_pack8_1d(denoising_patch);
+    transform_group_fwd(denoising_patch, n);
 
-    adaptive_weight = hard_thresholding_s(denoising_patch, sigma);
+    adaptive_weight = hard_thresholding_s(denoising_patch, sigma_for_n(sigma, n), n);
 
     for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8_inv(denoising_patch);
         transpose_pack8(denoising_patch);
     }
-    transform_pack8_1d_inv(denoising_patch);
+    transform_group_inv(denoising_patch, n);
 }
 
 // Wiener filtering: the coefficient is derived from the (basic-estimate)
-// reference patch and applied to the transformed noisy patch
-float wiener_filtering_s(inout float data[64], inout float ref[64], float sigma) {
-    const int lane = int(gl_LocalInvocationID.x);
+// reference patch and applied to the transformed noisy patch. The CPU's
+// `WienerShrink` computes it for every coefficient (the global DC included)
+// and falls back to one when the denominator is zero.
+float wiener_filtering_s(inout float data[64], inout float ref[64], float sigma, int n) {
     float ks[4] = float[4](0.0f, 0.0f, 0.0f, 0.0f);
-    for (int i = 0; i < 64; ++i) {
-        float val = data[i];
-        float ref_val = ref[i];
-        float coeff = (ref_val * ref_val) / (ref_val * ref_val + sigma * sigma);
-        if (i == 0) {
-            coeff = (lane % 8) != 0 ? coeff : 1.0f;
+    const float scale = 1.0f / (512.0f * float(n));
+    const float sgmsqr = sigma * sigma;
+    for (int i = 0; i < 8; ++i) {
+        if (i >= n) {
+            continue;
         }
-        val *= coeff;
-        ks[i % 4] += coeff * coeff;
-        data[i] = val * (1.0f / 4096.0f);
+        for (int j = 0; j < 8; ++j) {
+            const int idx = i * 8 + j;
+            const float val = data[idx];
+            const float ref_sqr = ref[idx] * ref[idx];
+            const float den = ref_sqr + sgmsqr;
+            const float coeff = den > 0.0f ? ref_sqr / den : 1.0f;
+            ks[j % 4] += coeff * coeff;
+            data[idx] = val * coeff * scale;
+        }
     }
     float k = (ks[0] + ks[1]) + (ks[2] + ks[3]);
     k = reduce_group8(k);
-    return 1.0f / k;
+    // The CPU's `L2Wiener = Max(FLT_EPSILON, L2Wiener)`.
+    return 1.0f / max(k, FLT_EPS_);
 }
 
 void collaborative_wiener(inout float denoising_patch[64], inout float ref_patch[64],
-                          float sigma, out float adaptive_weight) {
+                          float sigma, int n, out float adaptive_weight) {
     for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8(denoising_patch);
         transpose_pack8(denoising_patch);
     }
-    transform_pack8_1d(denoising_patch);
+    transform_group_fwd(denoising_patch, n);
 
     for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8(ref_patch);
         transpose_pack8(ref_patch);
     }
-    transform_pack8_1d(ref_patch);
+    transform_group_fwd(ref_patch, n);
 
-    adaptive_weight = wiener_filtering_s(denoising_patch, ref_patch, sigma);
+    adaptive_weight = wiener_filtering_s(denoising_patch, ref_patch,
+                                         sigma_for_n(sigma, n), n);
 
     for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8_inv(denoising_patch);
         transpose_pack8(denoising_patch);
     }
-    transform_pack8_1d_inv(denoising_patch);
+    transform_group_inv(denoising_patch, n);
+}
+
+// The clipped predictive window of one seed, as the CPU's _SearchBoundary
+// builds it at search_step = 1: [max(seed - range, 0), min(seed + range, dim - 8)].
+// Membership in such a window is what the union's first-window ownership test
+// needs, and a candidate enumerated inside one window is always in the image,
+// so the clipped and unclipped tests agree for it.
+struct Window {
+    int left;
+    int right;
+    int top;
+    int bottom;
+    int rw;
+    int total;
+};
+
+Window make_window(int sx, int sy, int range, int maxx, int maxy) {
+    Window w;
+    w.left = max(sx - range, 0);
+    w.right = min(sx + range, maxx);
+    w.top = max(sy - range, 0);
+    w.bottom = min(sy + range, maxy);
+    w.rw = w.right - w.left + 1;
+    w.total = (w.bottom - w.top + 1) * w.rw;
+    return w;
+}
+
+// Walk this lane's share of a window's origins, row-major. `row`/`col` are
+// carried as state so the walk costs one add per step instead of a division.
+struct Walk {
+    int row;
+    int col;
+};
+
+Walk walk_start(const Window w, int sl) {
+    Walk k;
+    k.row = w.top + sl / w.rw;
+    k.col = w.left + sl % w.rw;
+    return k;
+}
+
+void walk_step(inout Walk k, const Window w) {
+    k.col += 8;
+    while (k.col > w.right) {
+        k.col -= w.rw;
+        k.row += 1;
+    }
 }
 
 void main() {
-    // Witness what this dispatch writes: one tag per window slice, holding the
-    // frame it is the contribution of. A slot whose estimation never ran keeps
-    // the zero fill or the previous occupant's tag, and the aggregation skips
-    // those slices instead of reading them.
+    const int m = pc.nmod;
+    // Real temporal extent of this centre's window: only frames that exist are
+    // searched, and their slices are the only ones written.
+    const int zlo = max(KRADIUS - m, 0);
+    const int zhi = min(2 * KRADIUS, pc.nframes - 1 - m + KRADIUS);
+
+    // Witness what this dispatch writes: one tag per real window slice, holding
+    // the frame it is the contribution of. Slices outside [zlo, zhi] keep the
+    // zero fill, so the aggregation skips them instead of reading a clamped
+    // copy of an endpoint frame.
     if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u) {
-        for (int z = 0; z < KRADIUS * 2 + 1; ++z) {
+        for (int z = zlo; z <= zhi; ++z) {
             tags[pc.tag_base + z] = uint(src_frame(z) + 1);
         }
     }
 
     const int lid = int(gl_LocalInvocationID.x);
     const int group = lid >> 3;
-    const int sub_lane_id = lid & 7;
+    const int sl = lid & 7;
     const int gid = int(gl_WorkGroupID.x);
 
     const int x0 = (4 * gid + group) * BLOCK_STEP;
@@ -536,179 +898,194 @@ void main() {
         return;
     }
     const bool is_active = x0 < WIDTH - 8 + BLOCK_STEP;
-    int x = min(is_active ? x0 : 0, WIDTH - 8);
+    const int x = min(is_active ? x0 : 0, WIDTH - 8);
     y = min(y, HEIGHT - 8);
 
-    const int srcpc_base = src_search(KRADIUS, 0);
+    const int anchor_pc = src_search(KRADIUS, 0);
     float cur[64];
     for (int c = 0; c < 8; ++c) {
         for (int i = 0; i < 8; ++i) {
-            cur[c * 8 + i] = src[srcpc_base + (y + i) * STRIDE + (x + c)];
+            cur[c * 8 + i] = src[anchor_pc + (y + i) * STRIDE + (x + c)];
         }
     }
+
+    // The reference block is the group's first member and is never matched
+    // again: the current-frame scan excludes it by origin. A zero threshold
+    // stops the search here, which is the CPU's `thMSE <= 0` reference-only
+    // group.
+    const bool searching = TH_SSE > 0.0f && NOSEARCH == 0;
 
     float ge[8];
-    int gx[8], gy[8], gz[8];
-    if (NOSEARCH != 0) {
-        for (int k = 0; k < 8; ++k) {
-            ge[k] = 0.0f;
-            gx[k] = x;
-            gy[k] = y;
-            gz[k] = KRADIUS;
-        }
-    } else {
+    int gxy[8];
+    int gz[8];
+    for (int k = 0; k < 8; ++k) {
+        ge[k] = 0.0f;
+        gxy[k] = pack_xy(x, y);
+        gz[k] = KRADIUS;
+    }
+    int gcount = 1;
+    bool goverflow = false;
+
+    // ---- current frame: the reference plus its best seven other origins ----
     {
         float pe[8];
-        int pxy[8], ps[8];
+        int pxy[8];
         for (int k = 0; k < 8; ++k) {
             pe[k] = FLT_MAX_;
-            pxy[k] = 0;
-            ps[k] = INT_MAX_;
+            pxy[k] = INT_MAX_;
         }
-        const int left = max(x - BM_RANGE, 0);
-        const int right = min(x + BM_RANGE, WIDTH - 8);
-        const int top = max(y - BM_RANGE, 0);
-        const int bottom = min(y + BM_RANGE, HEIGHT - 8);
-        const int rw = right - left + 1;
-        const int total = (bottom - top + 1) * rw;
-        int row_i = top + sub_lane_id / rw;
-        int col_i = left + sub_lane_id % rw;
-        #pragma unroll 2
-        #pragma unroll 2
-        for (int s = sub_lane_id; s < total; s += 8) {
-            const float error = ssd_err(cur, srcpc_base, col_i, row_i);
-            insertN(8, pe, pxy, ps, error, col_i, row_i, s);
-            col_i += 8;
-            while (col_i > right) {
-                col_i -= rw;
-                row_i += 1;
+        if (is_active && searching) {
+            const Window w = make_window(x, y, BM_RANGE, WIDTH - 8, HEIGHT - 8);
+            Walk k = walk_start(w, sl);
+            for (int s = sl; s < w.total; s += 8) {
+                if (k.col != x || k.row != y) {
+                    const float err = ssd_err(cur, anchor_pc, k.col, k.row);
+                    if (err <= TH_SSE) {
+                        insert_cand(pe, pxy, err, pack_xy(k.col, k.row));
+                    }
+                }
+                walk_step(k, w);
             }
         }
         barrier();
         for (int k = 0; k < 8; ++k) {
-            l_e[group][sub_lane_id * 8 + k] = pe[k];
-            l_x[group][sub_lane_id * 8 + k] = pxy[k] & 0xFFFF;
-            l_y[group][sub_lane_id * 8 + k] = pxy[k] >> XY_SHIFT;
-            l_s[group][sub_lane_id * 8 + k] = ps[k];
+            l_e[group][sl * 8 + k] = pe[k];
+            l_xy[group][sl * 8 + k] = pxy[k];
         }
         barrier();
-        merge_group(8, 0, ge, gx, gy);
-        for (int k = 0; k < 8; ++k) gz[k] = KRADIUS;
+        float ce[8];
+        int cxy[8];
+        int cc;
+        merge_group(8, false, cc, ce, cxy);
+        // At most seven non-reference entries, so the combined list cannot
+        // overflow here and the CPU's stable_sort of a short list is exactly
+        // this concatenation order.
+        for (int k = 0; k < 8; ++k) {
+            if (k < cc && k < 7) {
+                group_add(ge, gxy, gz, gcount, goverflow, ce[k], cxy[k], KRADIUS);
+            }
+        }
     }
+    const int current_count = gcount;
+    const int seed_count = min(PS_NUM, current_count);
 
-    {
-        int sx[8], sy[8];
+    // Both temporal directions restart from this list, so keep a copy that the
+    // backward chain cannot overwrite.
+    if (sl == 0) {
         for (int k = 0; k < 8; ++k) {
-            sx[k] = gx[k];
-            sy[k] = gy[k];
+            s0_x[group][k] = gxy[k] & 0xFFFF;
+            s0_y[group][k] = gxy[k] >> XY_SHIFT;
+            s_x[group][k] = gxy[k] & 0xFFFF;
+            s_y[group][k] = gxy[k] >> XY_SHIFT;
         }
+    }
+    barrier();
 
-        for (int direction = -1; direction <= 1; direction += 2) {
-            barrier();
-            if (sub_lane_id == 0) {
-                for (int k = 0; k < 8; ++k) {
-                    l_x[group][k] = sx[k];
-                    l_y[group][k] = sy[k];
-                }
+    for (int direction = -1; direction <= 1; direction += 2) {
+        // Everyone is done reading the seeds of the previous direction before
+        // the forward chain rewrites them.
+        barrier();
+        if (direction > 0 && sl == 0) {
+            for (int k = 0; k < 8; ++k) {
+                s_x[group][k] = s0_x[group][k];
+                s_y[group][k] = s0_y[group][k];
             }
+        }
+        int ns = seed_count;
+        const int nt = searching ? min(KRADIUS, (direction < 0)
+                                                     ? m
+                                                     : pc.nframes - 1 - m)
+                                 : 0;
+        for (int t = 1; t <= nt; ++t) {
+            const int z = KRADIUS + direction * t;
+            // Publishes the seeds the previous frame retained (or the restart).
             barrier();
-
-            for (int t = 1; t <= KRADIUS; ++t) {
-                const int temporal_index = KRADIUS + direction * t;
-                const int temporal_srcpc = src_search(temporal_index, 0);
-
-                int cxs[PS_NUM], cys[PS_NUM];
-                for (int i = 0; i < PS_NUM; ++i) {
-                    cxs[i] = l_x[group][i];
-                    cys[i] = l_y[group][i];
-                }
-
-                float pe[8];
-                int pxy[8], ps[8];
-                for (int k = 0; k < PS_NUM; ++k) {
-                    pe[k] = FLT_MAX_;
-                    pxy[k] = 0;
-                    ps[k] = INT_MAX_;
-                }
-                for (int i = 0; i < PS_NUM; ++i) {
-                    const int left = max(cxs[i] - PS_RANGE, 0);
-                    const int right = min(cxs[i] + PS_RANGE, WIDTH - 8);
-                    const int top = max(cys[i] - PS_RANGE, 0);
-                    const int bottom = min(cys[i] + PS_RANGE, HEIGHT - 8);
-                    const int rw = right - left + 1;
-                    const int seq_base = i * ((2 * PS_RANGE + 1) * (2 * PS_RANGE + 1));
-                    const int total = (bottom - top + 1) * rw;
-                    int row_i = top + sub_lane_id / rw;
-                    int col_i = left + sub_lane_id % rw;
-                    #pragma unroll 2
-                    for (int s = sub_lane_id; s < total; s += 8) {
-                        const float error = ssd_err(cur, temporal_srcpc, col_i, row_i);
-                        insertN(PS_NUM, pe, pxy, ps, error, col_i, row_i, seq_base + s);
-                        col_i += 8;
-                        while (col_i > right) {
-                            col_i -= rw;
-                            row_i += 1;
+            float pe[8];
+            int pxy[8];
+            for (int k = 0; k < 8; ++k) {
+                pe[k] = FLT_MAX_;
+                pxy[k] = INT_MAX_;
+            }
+            if (is_active && ns > 0) {
+                // Union of the clipped predictive windows, each origin
+                // evaluated once: an origin owned by an earlier window is
+                // skipped before its pixels are read. Windows all share
+                // PS_RANGE, so membership is the two comparisons below.
+                const int spc = src_search(z, 0);
+                for (int i = 0; i < 8; ++i) {
+                    if (i >= ns) {
+                        continue;
+                    }
+                    const int sx = s_x[group][i];
+                    const int sy = s_y[group][i];
+                    const Window w = make_window(sx, sy, PS_RANGE, WIDTH - 8,
+                                                 HEIGHT - 8);
+                    Walk k = walk_start(w, sl);
+                    for (int s = sl; s < w.total; s += 8) {
+                        bool owned = true;
+                        for (int j = 0; j < 8; ++j) {
+                            if (j >= i) {
+                                continue;
+                            }
+                            const int px = s_x[group][j];
+                            const int py = s_y[group][j];
+                            const bool in_j = abs(k.col - px) <= PS_RANGE &&
+                                              abs(k.row - py) <= PS_RANGE;
+                            owned = owned && !in_j;
                         }
+                        if (owned) {
+                            const float err = ssd_err(cur, spc, k.col, k.row);
+                            if (err <= TH_SSE) {
+                                insert_cand(pe, pxy, err, pack_xy(k.col, k.row));
+                            }
+                        }
+                        walk_step(k, w);
                     }
                 }
-
-                barrier();
-                for (int k = 0; k < PS_NUM; ++k) {
-                    l_e[group][sub_lane_id * 8 + k] = pe[k];
-                    l_x[group][sub_lane_id * 8 + k] = pxy[k] & 0xFFFF;
-                    l_y[group][sub_lane_id * 8 + k] = pxy[k] >> XY_SHIFT;
-                    l_s[group][sub_lane_id * 8 + k] = ps[k];
-                }
-                barrier();
-                if (sub_lane_id == 0) {
-                    float fe[8];
-                    int fx[8], fy[8];
-                    merge_group(PS_NUM, 0, fe, fx, fy);
-                    for (int i = 0; i < PS_NUM; ++i) {
-                        ginsert8(ge, gx, gy, gz, fe[i], fx[i], fy[i], temporal_index);
-                    }
-                    for (int k = 0; k < PS_NUM; ++k) {
-                        l_x[group][k] = fx[k];
-                        l_y[group][k] = fy[k];
-                    }
-                }
-                barrier();
             }
+            for (int k = 0; k < 8; ++k) {
+                l_e[group][sl * 8 + k] = pe[k];
+                l_xy[group][sl * 8 + k] = pxy[k];
+            }
+            barrier();
+            float fe[8];
+            int fxy[8];
+            int fc;
+            merge_group(8, true, fc, fe, fxy);
+            for (int k = 0; k < 8; ++k) {
+                if (k < fc) {
+                    group_add(ge, gxy, gz, gcount, goverflow, fe[k], fxy[k], z);
+                }
+            }
+            if (TRACE != 0 && is_active && sl == 0 && gxy[0] == pc.trace_xy) {
+                const int base = 38 + ((direction < 0 ? 0 : KRADIUS) + t - 1) * 2;
+                trace[base] = uint(fc);
+                trace[base + 1] = uint(min(PS_NUM, fc));
+            }
+            ns = min(PS_NUM, fc);
         }
-    }
     }
 
-    // The aggregation phase indexes these tables unconditionally, so the
-    // NOSEARCH arm must flush its synthetic group instead of leaving stale LDS.
-    barrier();
-    if (sub_lane_id == 0) {
-        int match = 0;
+    const int n = min(gcount, 8);
+
+    if (TRACE != 0 && is_active && sl == 0 && gxy[0] == pc.trace_xy) {
+        trace[0] = 0x0B3D0001u;
+        trace[1] = uint(n);
+        trace[2] = uint(gcount);
+        trace[3] = goverflow ? 1u : 0u;
+        trace[4] = uint(current_count);
+        trace[5] = uint(seed_count);
         for (int k = 0; k < 8; ++k) {
-            int m = ((gx[k] == x) && (gy[k] == y)) ? 1 : 0;
-            m = (m != 0 && (gz[k] == KRADIUS)) ? 1 : 0;
-            match += m;
-        }
-        if (match == 0) {
-            for (int k = 7; k >= 1; --k) {
-                gx[k] = gx[k - 1];
-                gy[k] = gy[k - 1];
-                gz[k] = gz[k - 1];
-            }
-            gx[0] = x;
-            gy[0] = y;
-            gz[0] = KRADIUS;
-        }
-        for (int k = 0; k < 8; ++k) {
-            l_x[group][k] = gx[k];
-            l_y[group][k] = gy[k];
-            l_s[group][k] = gz[k];
+            trace[6 + 4 * k + 0] = uint(gxy[k] & 0xFFFF);
+            trace[6 + 4 * k + 1] = uint(gxy[k] >> XY_SHIFT);
+            trace[6 + 4 * k + 2] = uint(gz[k]);
+            trace[6 + 4 * k + 3] = floatBitsToUint(ge[k]);
         }
     }
-    barrier();
 
     if (NOESTIMATE == 0) {
     // One entry covers NPLANES planes; at NPLANES == 1 the bounds fold and this
-    // is the single-plane kernel it has always been. The group (gx/gy/gz) is
+    // is the single-plane kernel it has always been. The group (gxy, gz) is
     // luma's in every case: a joint chroma entry filters each plane with the
     // groups block matching found on plane 0, as the reference does.
     for (int plane = 0; plane < NPLANES; ++plane) {
@@ -729,34 +1106,46 @@ void main() {
         float adaptive_weight;
         {
             for (int i = 0; i < 8; ++i) {
-                const int tmp_x = l_x[group][i];
-                const int tmp_y = l_y[group][i];
-                const int tmp_z = l_s[group][i];
-                const int refp = src_search(tmp_z, plane) + tmp_y * STRIDE + tmp_x + sub_lane_id;
-                const int srcp = src_input(tmp_z, plane) + tmp_y * STRIDE + tmp_x + sub_lane_id;
-                for (int j = 0; j < 8; ++j) {
-                    denoising_patch[i * 8 + j] = src[srcp + j * STRIDE];
-                    if (FINAL != 0) {
-                        ref_patch[i * 8 + j] = src[refp + j * STRIDE];
+                // A block outside the group is padding: it is zeroed instead of
+                // loaded, so no address is ever built from an unused match.
+                if (i < n) {
+                    const int mx = gxy[i] & 0xFFFF;
+                    const int my = gxy[i] >> XY_SHIFT;
+                    const int mz = gz[i];
+                    const int refp = src_search(mz, plane) + my * STRIDE + mx + sl;
+                    const int srcp = src_input(mz, plane) + my * STRIDE + mx + sl;
+                    for (int j = 0; j < 8; ++j) {
+                        denoising_patch[i * 8 + j] = src[srcp + j * STRIDE];
+                        if (FINAL != 0) {
+                            ref_patch[i * 8 + j] = src[refp + j * STRIDE];
+                        }
+                    }
+                } else {
+                    for (int j = 0; j < 8; ++j) {
+                        denoising_patch[i * 8 + j] = 0.0f;
+                        ref_patch[i * 8 + j] = 0.0f;
                     }
                 }
             }
             if (FINAL != 0) {
-                collaborative_wiener(denoising_patch, ref_patch, sigma, adaptive_weight);
+                collaborative_wiener(denoising_patch, ref_patch, sigma, n, adaptive_weight);
             } else {
-                collaborative_hard(denoising_patch, sigma, adaptive_weight);
+                collaborative_hard(denoising_patch, sigma, n, adaptive_weight);
             }
         }
 
         if (is_active) {
-            const int wdstpc = rplane + sub_lane_id;
-            const int weightpc = rplane + TEMPORAL_STRIDE + sub_lane_id;
+            const int wdstpc = rplane + sl;
+            const int weightpc = rplane + TEMPORAL_STRIDE + sl;
 
             for (int i = 0; i < 8; ++i) {
-                const int tmp_x = l_x[group][i];
-                const int tmp_y = l_y[group][i];
-                const int tmp_z = l_s[group][i];
-                const int offset = tmp_z * 2 * TEMPORAL_STRIDE + tmp_y * STRIDE + tmp_x;
+                if (i >= n) {
+                    continue;
+                }
+                const int mx = gxy[i] & 0xFFFF;
+                const int my = gxy[i] >> XY_SHIFT;
+                const int mz = gz[i];
+                const int offset = mz * 2 * TEMPORAL_STRIDE + my * STRIDE + mx;
 
                 for (int j = 0; j < 8; ++j) {
                     float wdst_val = adaptive_weight * denoising_patch[i * 8 + j];
@@ -783,4 +1172,3 @@ void main() {
     }
     }
 }
-

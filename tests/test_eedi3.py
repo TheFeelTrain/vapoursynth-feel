@@ -1,7 +1,7 @@
 """Unit tests for core.vsfeel.EEDI3.
 
-The committed tests/noise_24f.mkv clip (24 frames of random noise) is used as
-the input. The vsfeel implementation is a brand-new Vulkan port of the EEDI3
+The committed tests/bigbuckbunny_360p_grain.mp4 clip (real 360p content with
+baked-in grain) is used as the input. The vsfeel implementation is a brand-new Vulkan port of the EEDI3
 family-A algorithm; the reference oracle is eedi3vk2 (Vulkan, bit-exact on the
 shared parameter surface). eedi3m (original CPU implementation) is used only
 as a coarse cross-check where useful; it is not an oracle (its default AVX2
@@ -46,9 +46,9 @@ import vapoursynth as vs
 from conftest import (
     WIDTH,
     HEIGHT,
-    NOISE_MKV,
+    CLIP_PATH,
     COMPARE_PRELUDE,
-    assert_changes_on_noise,
+    assert_changes_on_clip,
     assert_preserves_frame_props,
     compare_or_skip,
     cpu_node,
@@ -60,7 +60,7 @@ from conftest import (
     right_half_mask,
 )
 
-pytestmark = pytest.mark.usefixtures("noise_gray")
+pytestmark = pytest.mark.usefixtures("clip_gray")
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -209,7 +209,7 @@ def _mc_compare(bits, frames, kwargs, mclip=False, sclip=None):
     """Compare vsfeel against eedi3vk2 for an mclip/sclip case (subprocess)."""
     reference_or_skip("eedi3vk2", "EEDI3")
     spec = {
-        "source": NOISE_MKV,
+        "source": CLIP_PATH,
         "bits": bits,
         "frames": list(frames),
         "kwargs": dict(kwargs),
@@ -225,8 +225,8 @@ def _mc_compare(bits, frames, kwargs, mclip=False, sclip=None):
 
 
 @pytest.mark.parametrize("bits,field", [(16, 1), (32, 1)], ids=["16bit", "32bit"])
-def test_eedi3_deterministic(noise_gray, noise_16bit, bits, field):
-    clip = noise_16bit if bits == 16 else noise_gray
+def test_eedi3_deterministic(clip_gray, clip_16bit, bits, field):
+    clip = clip_16bit if bits == 16 else clip_gray
     a = _run(clip, field=field)
     b = _run(clip, field=field)
     dtype = _dtype(bits)
@@ -240,11 +240,11 @@ def test_eedi3_deterministic(noise_gray, noise_16bit, bits, field):
 
 
 @pytest.mark.parametrize("bits", [16, 32], ids=["16bit", "32bit"])
-def test_eedi3_parallel_load_consistent(noise_gray, noise_16bit, bits):
+def test_eedi3_parallel_load_consistent(clip_gray, clip_16bit, bits):
     """Two parallel runs must match the serial path, and each
     other — the request pattern that exposes stale descriptor bindings, fence
     misuse and command-pool reuse violations under load."""
-    clip = noise_16bit if bits == 16 else noise_gray
+    clip = clip_16bit if bits == 16 else clip_gray
     a = eval_parallel(_run, clip)
     b = eval_parallel(_run, clip)
     ref = _run(clip)
@@ -261,26 +261,26 @@ def test_eedi3_parallel_load_consistent(noise_gray, noise_16bit, bits):
             assert np.abs(a[n] - b[n]).max() < 1e-6, f"nondeterministic output at frame {n}"
 
 
-def test_eedi3_parallel_vcheck_matches_serial(noise_16bit, monkeypatch):
+def test_eedi3_parallel_vcheck_matches_serial(clip_16bit, monkeypatch):
     """The shipped parallel vcheck and the serial walk (VSFEEL_EEDI3_VPARA=0,
     the A/B control) must agree exactly on the noise clip."""
     monkeypatch.setenv("VSFEEL_EEDI3_VPARA", "0")
-    serial = _run(noise_16bit, field=1)
+    serial = _run(clip_16bit, field=1)
     monkeypatch.delenv("VSFEEL_EEDI3_VPARA")
-    parallel = _run(noise_16bit, field=1)
+    parallel = _run(clip_16bit, field=1)
     for n in (0, 11, 23):
         a = _plane(serial.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         b = _plane(parallel.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         assert np.array_equal(a, b), f"serial/parallel vcheck mismatch at frame {n}"
 
 
-def test_eedi3_preserves_frame_props(noise_gray):
+def test_eedi3_preserves_frame_props(clip_gray):
     """field=1 (no frame doubling) must keep every source property.
 
     ``_FieldBased`` is set to progressive by the filter; the tagged duration
     and custom metadata must survive unchanged.
     """
-    assert_preserves_frame_props(_run, noise_gray, field=1)
+    assert_preserves_frame_props(_run, clip_gray, field=1)
 
 
 # ---------------------------------------------------------------------------
@@ -332,23 +332,23 @@ def test_eedi3_vspipe_pipelined_no_hang(bits):
 # ---------------------------------------------------------------------------
 
 
-def test_eedi3_no_nan_all_frames_32bit(noise_gray):
-    out = _run(noise_gray)
+def test_eedi3_no_nan_all_frames_32bit(clip_gray):
+    out = _run(clip_gray)
     for n in range(out.num_frames):
         a = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.float32)
         assert np.isfinite(a).all(), f"non-finite output at frame {n}"
 
 
-def test_eedi3_in_range_all_frames_16bit(noise_16bit):
+def test_eedi3_in_range_all_frames_16bit(clip_16bit):
     """The uint16 path must keep the input format and actually filter it.
 
     ``max <= 65535`` on a uint16 array cannot fail, so the meaningful checks
     are format-id equality (no silent depth/format change) and an anti-vacuity
     assertion that the noise was altered.
     """
-    out = _run(noise_16bit)
-    assert out.format.id == noise_16bit.format.id
-    assert_changes_on_noise(out, noise_16bit, what="EEDI3")
+    out = _run(clip_16bit)
+    assert out.format.id == clip_16bit.format.id
+    assert_changes_on_clip(out, clip_16bit, what="EEDI3")
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +422,7 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     bits = int(sys.argv[2])
     cases = json.loads(sys.argv[1])
     core = vs.core
-    src = core.bs.VideoSource({NOISE_MKV!r})
+    src = core.bs.VideoSource({CLIP_PATH!r})
     clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                               bits=bits, fulls=True, fulld=True)
     dt = np.uint16 if bits == 16 else np.float32
@@ -519,7 +519,7 @@ def test_eedi3_matches_vk2_reference(bits, cases):
 
 
 @pytest.mark.parametrize("bits", [16, 32], ids=["16bit", "32bit"])
-def test_eedi3_mclip_gray8_matches_vk2_same_format(noise_gray, noise_16bit, bits):
+def test_eedi3_mclip_gray8_matches_vk2_same_format(clip_gray, clip_16bit, bits):
     """vsfeel's Gray8 mask must equal eedi3vk2's same-format mask exactly on
     the shared surface (vk2 requires the clip's own format)."""
     kw = dict(field=1, mdis=5, nrad=1, vcheck=2)
@@ -530,10 +530,10 @@ def test_eedi3_mclip_gray8_matches_vk2_same_format(noise_gray, noise_16bit, bits
         assert payload["maxdiff"] < 1e-6, "mclip mismatch"
 
 
-def test_eedi3_mclip_auto_converts_gray16_gray32(noise_gray, noise_16bit):
+def test_eedi3_mclip_auto_converts_gray16_gray32(clip_gray, clip_16bit):
     """Mask Gray16 and Gray32 are auto-converted to Gray8 internally and must
     give the same result as an explicit Gray8 mask."""
-    clip = noise_16bit
+    clip = clip_16bit
     kw = dict(field=1, mdis=20, nrad=3, vcheck=2)
     m8 = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 8)
     m16 = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
@@ -583,7 +583,7 @@ def _float_mask_clip(arr, length):
 
 @pytest.mark.parametrize("kind", ["ramp", "checker"])
 @pytest.mark.parametrize("mdis,nrad", [(5, 1), (20, 3)])
-def test_eedi3_mclip_float_native_matches_reference_conversion(noise_16bit, kind, mdis, nrad):
+def test_eedi3_mclip_float_native_matches_reference_conversion(clip_16bit, kind, mdis, nrad):
     """A GrayS float mask is now handled natively (no SetFrameProps ->
     resize.Point -> Gray8 node). It must produce exactly what the deleted
     reference conversion produced, including at the predicate boundary.
@@ -595,7 +595,7 @@ def test_eedi3_mclip_float_native_matches_reference_conversion(noise_16bit, kind
     above it), which is the ONLY input class that can see the strict-vs-
     non-strict comparison (verified by mutating ">" to ">=": the ramp and
     checker cases both fail)."""
-    clip = noise_16bit
+    clip = clip_16bit
     kw = dict(field=1, mdis=mdis, nrad=nrad, vcheck=0)
     mid = np.float32(0.5) / np.float32(255.0)
     above = np.nextafter(mid, np.float32(2.0), dtype=np.float32)
@@ -624,7 +624,7 @@ def test_eedi3_mclip_float_native_matches_reference_conversion(noise_16bit, kind
 
 
 @pytest.mark.parametrize("mdis,nrad", [(5, 1), (20, 3)])
-def test_eedi3_mclip_long_mask_off_prefix(noise_16bit, mdis, nrad):
+def test_eedi3_mclip_long_mask_off_prefix(clip_16bit, mdis, nrad):
     """A mask that is OFF for a long left prefix puts the first DP column far
     to the right. Every column left of it must still be written (the vertical
     cubic). The backtrack used to `break` out of its tile loop once a whole
@@ -633,7 +633,7 @@ def test_eedi3_mclip_long_mask_off_prefix(noise_16bit, mdis, nrad):
     (This is the structured-mclip nondeterminism tracked from round 14; the
     existing tests missed it because their half/half mask puts the mask ON on
     the left, i.e. first DP column 0.)"""
-    clip = noise_16bit
+    clip = clip_16bit
     kw = dict(field=1, mdis=mdis, nrad=nrad, vcheck=0)
     half = WIDTH // 2
     black = vs.core.std.BlankClip(
@@ -667,15 +667,15 @@ def test_eedi3_mclip_long_mask_off_prefix(noise_16bit, mdis, nrad):
         )
 
 
-def test_eedi3_mclip_masked_region_is_vertical_cubic(noise_16bit):
+def test_eedi3_mclip_masked_region_is_vertical_cubic(clip_16bit):
     """Inside a masked (black) region the interpolated pixel is the vertical
     cubic of the two kept rows; verify on a mid-frame interp row where all
     four taps are interior."""
-    clip = noise_16bit
+    clip = clip_16bit
     kw = dict(field=1, mdis=5, nrad=1, vcheck=0)
     m16 = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
     out = _run(clip, mclip=m16, **kw)
-    src = noise_16bit
+    src = clip_16bit
     for n in (0,):
         f = out.get_frame(n)
         s = src.get_frame(n)
@@ -694,17 +694,17 @@ def test_eedi3_mclip_masked_region_is_vertical_cubic(noise_16bit):
 
 
 @pytest.mark.parametrize("field", [2, 3], ids=["field2", "field3"])
-def test_eedi3_mclip_field_gt1_matches_vk2(noise_16bit, field):
+def test_eedi3_mclip_field_gt1_matches_vk2(clip_16bit, field):
     """mclip combined with frame doubling: the mask (N frames, one per source
     frame) must drive both output parities exactly like eedi3vk2."""
-    n_src = noise_16bit.num_frames
+    n_src = clip_16bit.num_frames
     kw = dict(field=field, mdis=5, nrad=1, vcheck=2)
     payload = _mc_compare(16, (0, 5, n_src, 2 * n_src - 1), kw, mclip=True)
     assert payload["num_frames"] == 2 * n_src
     assert payload["maxdiff"] == 0, f"mclip field={field} mismatch"
 
 
-def test_eedi3_mclip_dh_matches_vk2(noise_16bit):
+def test_eedi3_mclip_dh_matches_vk2(clip_16bit):
     """mclip combined with dh (doubled height)."""
     kw = dict(field=1, dh=1, mdis=5, nrad=1, vcheck=2)
     payload = _mc_compare(16, (0, 11, 23), kw, mclip=True)
@@ -717,16 +717,16 @@ def test_eedi3_mclip_dh_matches_vk2(noise_16bit):
 # ---------------------------------------------------------------------------
 
 
-def test_eedi3_yuv_passthrough_16bit(noise_16bit):
+def test_eedi3_yuv_passthrough_16bit(clip_16bit):
     """A full YUV clip is accepted; with planes=[0] the chroma planes must be
     copied through bit-identically and the luma must match the Gray output."""
     core = vs.core
-    src = core.bs.VideoSource(NOISE_MKV)
+    src = core.bs.VideoSource(CLIP_PATH)
     yuv = core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
     assert yuv.format.color_family == vs.YUV
 
     out = _run(yuv, planes=[0])
-    ref = _run(noise_16bit)
+    ref = _run(clip_16bit)
 
     for n in (0, 11, 23):
         d = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64) - _plane(
@@ -742,12 +742,12 @@ def test_eedi3_yuv_passthrough_16bit(noise_16bit):
             assert np.array_equal(a, b), f"chroma{plane} changed at frame {n}"
 
 
-def test_eedi3_yuv_passthrough_32bit(noise_gray):
+def test_eedi3_yuv_passthrough_32bit(clip_gray):
     core = vs.core
-    src = core.bs.VideoSource(NOISE_MKV)
+    src = core.bs.VideoSource(CLIP_PATH)
     yuv = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
     out = _run(yuv, planes=[0])
-    ref = _run(noise_gray)
+    ref = _run(clip_gray)
     for n in (0, 11, 23):
         f = out.get_frame(n)
         d = frame_to_ndarray(f) - frame_to_ndarray(ref.get_frame(n))
@@ -816,7 +816,7 @@ def noise_16bit_or_skip():
     # session fixture helper for tests that don't want the pytest fixture name
     from conftest import _source
 
-    src = _source(NOISE_MKV)
+    src = _source(CLIP_PATH)
     y = vs.core.std.ShufflePlanes(src, 0, vs.GRAY)
     return vs.core.fmtc.bitdepth(y, bits=16, fulls=True, fulld=True)
 
@@ -826,29 +826,29 @@ def noise_16bit_or_skip():
 # ---------------------------------------------------------------------------
 
 
-def test_eedi3_rejects_8bit(noise_8bit):
+def test_eedi3_rejects_8bit(clip_8bit):
     with pytest.raises(vs.Error):
-        _run(noise_8bit)
+        _run(clip_8bit)
 
 
-def test_eedi3_rejects_10bit(noise_8bit):
-    clip = vs.core.fmtc.bitdepth(noise_8bit, bits=10)
+def test_eedi3_rejects_10bit(clip_8bit):
+    clip = vs.core.fmtc.bitdepth(clip_8bit, bits=10)
     with pytest.raises(vs.Error):
         _run(clip)
 
 
-def test_eedi3_rejects_bad_field(noise_16bit):
+def test_eedi3_rejects_bad_field(clip_16bit):
     for bad in (-1, 4):
         with pytest.raises(vs.Error):
-            _run(noise_16bit, field=bad)
+            _run(clip_16bit, field=bad)
 
 
-def test_eedi3_rejects_dh_with_field_gt1(noise_16bit):
+def test_eedi3_rejects_dh_with_field_gt1(clip_16bit):
     with pytest.raises(vs.Error):
-        _run(noise_16bit, field=2, dh=1)
+        _run(clip_16bit, field=2, dh=1)
 
 
-def test_eedi3_rejects_bad_alpha_beta(noise_16bit):
+def test_eedi3_rejects_bad_alpha_beta(clip_16bit):
     for kw in (
         {"alpha": -0.1},
         {"alpha": 1.5},
@@ -857,50 +857,50 @@ def test_eedi3_rejects_bad_alpha_beta(noise_16bit):
         {"beta": -0.1},
     ):
         with pytest.raises(vs.Error):
-            _run(noise_16bit, **kw)
+            _run(clip_16bit, **kw)
 
 
-def test_eedi3_rejects_bad_gamma(noise_16bit):
+def test_eedi3_rejects_bad_gamma(clip_16bit):
     with pytest.raises(vs.Error):
-        _run(noise_16bit, gamma=-1.0)
+        _run(clip_16bit, gamma=-1.0)
 
 
-def test_eedi3_rejects_bad_nrad(noise_16bit):
+def test_eedi3_rejects_bad_nrad(clip_16bit):
     for bad in (-1, 4):
         with pytest.raises(vs.Error):
-            _run(noise_16bit, nrad=bad)
+            _run(clip_16bit, nrad=bad)
 
 
-def test_eedi3_rejects_bad_mdis(noise_16bit):
+def test_eedi3_rejects_bad_mdis(clip_16bit):
     for bad in (0, 41):
         with pytest.raises(vs.Error):
-            _run(noise_16bit, mdis=bad)
+            _run(clip_16bit, mdis=bad)
 
 
-def test_eedi3_rejects_bad_vcheck(noise_16bit):
+def test_eedi3_rejects_bad_vcheck(clip_16bit):
     for bad in (-1, 4):
         with pytest.raises(vs.Error):
-            _run(noise_16bit, vcheck=bad)
+            _run(clip_16bit, vcheck=bad)
 
 
-def test_eedi3_rejects_bad_vthresh(noise_16bit):
+def test_eedi3_rejects_bad_vthresh(clip_16bit):
     for kw in ({"vthresh0": 0.0}, {"vthresh1": -5.0}, {"vthresh2": 0.0}):
         with pytest.raises(vs.Error):
-            _run(noise_16bit, vcheck=2, **kw)
+            _run(clip_16bit, vcheck=2, **kw)
     # vthresh ignored when vcheck == 0
-    _run(noise_16bit, vcheck=0, vthresh0=0.0)
+    _run(clip_16bit, vcheck=0, vthresh0=0.0)
 
 
-def test_eedi3_rejects_bad_planes(noise_16bit):
+def test_eedi3_rejects_bad_planes(clip_16bit):
     with pytest.raises(vs.Error):
-        _run(noise_16bit, planes=[0, 0])
+        _run(clip_16bit, planes=[0, 0])
     with pytest.raises(vs.Error):
-        _run(noise_16bit, planes=[5])
+        _run(clip_16bit, planes=[5])
 
 
 def _yuv16():
     core = vs.core
-    return core.fmtc.bitdepth(core.bs.VideoSource(NOISE_MKV), bits=16, fulls=True, fulld=True)
+    return core.fmtc.bitdepth(core.bs.VideoSource(CLIP_PATH), bits=16, fulls=True, fulld=True)
 
 
 def test_eedi3_rejects_dh_with_a_planes_subset():
@@ -920,13 +920,13 @@ def test_eedi3_rejects_dh_with_a_planes_subset():
 
 
 @pytest.mark.parametrize("name", ["alpha", "beta", "gamma", "vthresh0", "vthresh1", "vthresh2"])
-def test_eedi3_rejects_non_finite_params(noise_16bit, name):
+def test_eedi3_rejects_non_finite_params(clip_16bit, name):
     """NaN is false against every range comparison, so it used to reach the
     push constants; +/-inf is only caught by the one-sided gamma/vthresh2
     checks (alpha/beta reject +inf through their upper bound)."""
     for bad in (float("nan"), float("inf")):
         with pytest.raises(vs.Error):
-            _run(noise_16bit, **{name: bad})
+            _run(clip_16bit, **{name: bad})
 
 
 def test_eedi3_rejects_scratch_over_two_gib():
@@ -939,46 +939,46 @@ def test_eedi3_rejects_scratch_over_two_gib():
         vs.core.vsfeel.EEDI3(clip, field=1, mdis=40)
 
 
-def test_eedi3_rejects_mclip_not_gray(noise_16bit):
-    src = vs.core.bs.VideoSource(NOISE_MKV)
+def test_eedi3_rejects_mclip_not_gray(clip_16bit):
+    src = vs.core.bs.VideoSource(CLIP_PATH)
     yuv = vs.core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
     with pytest.raises(vs.Error):
-        _run(noise_16bit, mclip=yuv)
+        _run(clip_16bit, mclip=yuv)
 
 
-def test_eedi3_rejects_mclip_wrong_dims(noise_16bit):
+def test_eedi3_rejects_mclip_wrong_dims(clip_16bit):
     core = vs.core
     small = core.std.BlankClip(
-        format=vs.GRAY8, width=100, height=100, length=noise_16bit.num_frames, color=[128]
+        format=vs.GRAY8, width=100, height=100, length=clip_16bit.num_frames, color=[128]
     )
     with pytest.raises(vs.Error):
-        _run(noise_16bit, mclip=small)
+        _run(clip_16bit, mclip=small)
 
 
-def test_eedi3_rejects_mclip_wrong_frames(noise_16bit):
+def test_eedi3_rejects_mclip_wrong_frames(clip_16bit):
     core = vs.core
     short = core.std.BlankClip(format=vs.GRAY8, width=WIDTH, height=HEIGHT, length=1, color=[128])
     with pytest.raises(vs.Error):
-        _run(noise_16bit, mclip=short)
+        _run(clip_16bit, mclip=short)
 
 
-def test_eedi3_rejects_sclip_wrong_dims_when_vcheck(noise_16bit):
+def test_eedi3_rejects_sclip_wrong_dims_when_vcheck(clip_16bit):
     """sclip is validated only when vcheck > 0 (eedi3m semantics)."""
     core = vs.core
     small = core.std.BlankClip(
-        format=vs.GRAY16, width=100, height=100, length=noise_16bit.num_frames
+        format=vs.GRAY16, width=100, height=100, length=clip_16bit.num_frames
     )
     with pytest.raises(vs.Error):
-        _run(noise_16bit, vcheck=2, sclip=small)
+        _run(clip_16bit, vcheck=2, sclip=small)
     # ignored (not validated) when vcheck == 0
-    _run(noise_16bit, vcheck=0, sclip=small)
+    _run(clip_16bit, vcheck=0, sclip=small)
 
 
-def test_eedi3_sclip_requires_2n_frames_under_field_gt1(noise_16bit):
+def test_eedi3_sclip_requires_2n_frames_under_field_gt1(clip_16bit):
     """sclip describes the OUTPUT: under field>1 the sclip must have 2N frames
     (one per output frame, like based_aa's Interleave([s, s])). N-frame sclips
     are rejected; the 2N one is accepted and bit-exact vs eedi3vk2."""
-    clip = noise_16bit
+    clip = clip_16bit
     N = clip.num_frames
     base = dict(field=3, mdis=5, nrad=1, vcheck=2)
     with pytest.raises(vs.Error):
@@ -989,9 +989,9 @@ def test_eedi3_sclip_requires_2n_frames_under_field_gt1(noise_16bit):
     assert payload["maxdiff"] == 0, "field=3 sclip mismatch"
 
 
-def test_eedi3_sclip_dh_requires_doubled_height(noise_16bit):
+def test_eedi3_sclip_dh_requires_doubled_height(clip_16bit):
     """Under dh the output doubles in height, so sclip must be 2x tall too."""
-    clip = noise_16bit
+    clip = clip_16bit
     base = dict(field=1, dh=1, mdis=5, nrad=1, vcheck=2)
     with pytest.raises(vs.Error):
         _run(clip, sclip=clip, **base)  # 1x height: wrong
@@ -1000,7 +1000,7 @@ def test_eedi3_sclip_dh_requires_doubled_height(noise_16bit):
     assert payload["maxdiff"] == 0, "dh sclip mismatch"
 
 
-def test_eedi3_compat_args_are_accepted_noops(noise_16bit):
+def test_eedi3_compat_args_are_accepted_noops(clip_16bit):
     """eedi3m/eedi3vk2/vsaa compat args are registered and byte-identical.
 
     ``opt`` (eedi3m SIMD level), ``hp`` (eedi3vk2 half-pel), ``ucubic`` and
@@ -1010,7 +1010,7 @@ def test_eedi3_compat_args_are_accepted_noops(noise_16bit):
     """
     base = dict(field=1, mdis=5, nrad=1, vcheck=2)
     ref = [
-        _plane(_run(noise_16bit, **base).get_frame(n), 0, WIDTH, HEIGHT, np.uint16) for n in (0, 11)
+        _plane(_run(clip_16bit, **base).get_frame(n), 0, WIDTH, HEIGHT, np.uint16) for n in (0, 11)
     ]
     for kw in (
         {"opt": 0},
@@ -1022,17 +1022,17 @@ def test_eedi3_compat_args_are_accepted_noops(noise_16bit):
         {"cost3": 0},
         {"cost3": 1},
     ):
-        out = _run(noise_16bit, **base, **kw)
+        out = _run(clip_16bit, **base, **kw)
         for n, want in zip((0, 11), ref):
             got = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
             assert np.array_equal(got, want), f"{kw} changed frame {n}"
 
 
-def test_eedi3_sclip_content_matches_vk2(noise_16bit):
+def test_eedi3_sclip_content_matches_vk2(clip_16bit):
     """sclip is the vcheck reference: with vcheck > 0 the output must use the
     sclip content (shifted noise, never equal to the vertical cubic) exactly
     like eedi3vk2 does. Guards the sclip row staging / Interleave parity."""
-    clip = noise_16bit
+    clip = clip_16bit
     base = dict(field=1, mdis=5, nrad=1, vcheck=2)
     payload = _mc_compare(16, (0, 11, 23), base, sclip="shift")
     assert payload["maxdiff"] == 0, "sclip mismatch"
@@ -1078,7 +1078,7 @@ def test_eedi3_timing_probe_has_an_alloc_stage():
     and folded all allocation into `record`)."""
     env = {**os.environ, "MANGOHUD": "0", "VSFEEL_EEDI3_TIMING": "1"}
     proc = subprocess.run(
-        [sys.executable, "-c", _TIMING_SCRIPT, str(NOISE_MKV)],
+        [sys.executable, "-c", _TIMING_SCRIPT, str(CLIP_PATH)],
         capture_output=True,
         text=True,
         timeout=600,
@@ -1114,7 +1114,7 @@ def _eedi3_pipeline_tags(name, mclip):
     """The `eedi3-*` pipeline tags the variant created, from the debug banner."""
     env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1"}
     proc = subprocess.run(
-        [sys.executable, "-c", _PIPELINE_SCRIPT, str(NOISE_MKV), name, "1" if mclip else "0"],
+        [sys.executable, "-c", _PIPELINE_SCRIPT, str(CLIP_PATH), name, "1" if mclip else "0"],
         capture_output=True,
         text=True,
         timeout=600,

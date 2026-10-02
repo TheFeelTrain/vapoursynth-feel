@@ -28,7 +28,7 @@ import sys
 
 import pytest
 
-from conftest import COMPARE_PRELUDE, NOISE_MKV, run_compare_subprocess
+from conftest import COMPARE_PRELUDE, CLIP_PATH, run_compare_subprocess
 
 # Every filter that needs a 256-invocation workgroup, plus one that fits 128.
 _LIMITS_SCRIPT = (
@@ -94,7 +94,7 @@ _256_KERNELS = ["dfttest", "nlmeans", "eedi3", "nnedi3", "bm3d"]
 
 def _run_limits(cases, env=None):
     """Run every case in a fresh process, optionally under a limit override."""
-    spec = {"source": NOISE_MKV, "cases": cases}
+    spec = {"source": CLIP_PATH, "cases": cases}
     return run_compare_subprocess(_LIMITS_SCRIPT, [json.dumps(spec)], env=env or {})
 
 

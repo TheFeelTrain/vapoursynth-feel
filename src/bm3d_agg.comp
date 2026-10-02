@@ -2,21 +2,16 @@
 
 /*
  * BM3D temporal aggregation kernel. For each output pixel, sums the
- * pre-aggregated estimates (wdst) and weights (weight) of the TW stacked
- * result slices (TW = 2 * RADIUS + 1, matching the reference implementation's
- * aggPlane loop) and divides. The per-slice table (estimate offset, witness
- * index, expected witness) is derived from the window geometry instead of
- * being handed over in push constants: at TW = 33 it is three times the 128
- * bytes every device guarantees, and deriving it costs nothing measurable at
- * TW = 5 either (ABBA-measured parity, see notes/BM3D.md). The division is
- * fp32, as in every reference (zipcl's aggPlane divides floats, BM3DCUDA
- * multiplies by an f32 reciprocal); fp64 would run at 1/16 rate on RDNA3 for
- * a rounding difference no reference makes.
+ * pre-aggregated estimates (wdst) and weights (weight) of the real estimate
+ * stacks that saw this frame and divides. A stack centred on frame m holds its
+ * contribution to frame n in slice z = n - m + R; every centre in
+ * [n - R, n + R] that exists is accumulated exactly once, so an endpoint frame
+ * is never counted several times through a clamped window position.
  *
  * One thread covers four adjacent columns through vec4 accesses (the plane
  * pitch is already a multiple of four floats, so every slice base, row offset
  * and column is 16-byte aligned). Scalar loads left the kernel bound by its
- * ten interleaved load streams rather than by bytes: the same bytes move in a
+ * interleaved load streams rather than by bytes: the same bytes move in a
  * quarter of the instructions.
  */
 
@@ -44,7 +39,7 @@ layout(std430, binding = 2) buffer DstBuf { vec4 dst4[]; };
 
 layout(push_constant) uniform PushConstants {
     int n;          // centre frame index
-    int nframes;    // total frame count (for boundary clamping)
+    int nframes;    // total frame count (temporal bounds)
     int slot0;      // radius 0: the frame's private estimate slot
     int plane_off4; // this plane's result region, in vec4 elements
     int src_base;   // element offset of this frame's source plane in the src ring
@@ -52,28 +47,15 @@ layout(push_constant) uniform PushConstants {
 
 const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
 
-// Absolute frame index of window position z (clamped at the clip boundaries),
-// as the reference's aggZ.
-int agg_z(int i) {
-    return min(max(2 * RADIUS - i, pc.n - pc.nframes + 1 + RADIUS),
-               pc.n + RADIUS);
-}
-
-// Ring slot holding the estimate stack of the window centred on frame m: the
-// host keys a slot by that centre frame. Radius 0's slots are private to one
-// in-flight frame rather than keyed by frame index, so the host hands its own
-// slot over. RES_CAP is a constant here, so the modulo is a multiply-shift.
+// Ring slot holding the estimate stack centred on frame m: the host keys a slot
+// by that centre frame. Radius 0's slots are private to one in-flight frame
+// rather than keyed by frame index, so the host hands its own slot over.
+// RES_CAP is a constant here, so the modulo is a multiply-shift.
 int slot_of(int m) {
     if (RADIUS == 0) {
         return pc.slot0;
     }
     return int(uint(m) % uint(RES_CAP));
-}
-
-// The frame whose contribution slice z of that window is, as the estimation
-// kernel's witness stores it (frame + 1, so 0 means "never written").
-int expect_of(int m, int z) {
-    return clamp(m - RADIUS + z, 0, pc.nframes - 1) + 1;
 }
 
 void main() {
@@ -101,18 +83,23 @@ void main() {
     const int slot_stride4 = NPLANES * TW * 2 * tstride4;
     const int slice_stride4 = 2 * tstride4;
 
+    // Only the centres that exist contribute; each of them writes exactly one
+    // slice for this output frame.
+    const int mlo = max(pc.n - RADIUS, 0);
+    const int mhi = min(pc.n + RADIUS, pc.nframes - 1);
+    const uint want = uint(pc.n + 1);
+
     vec4 acc = vec4(0.0);
     vec4 acw = vec4(0.0);
     int used = 0;
-    for (int i = 0; i < TW; ++i) {
-        // Only slices the estimation kernel witnessed for the frame this
-        // aggregation wants may contribute: a slice left as the zero fill, one
-        // whose estimation never landed, or one still holding a recycled
-        // frame's stacks is skipped rather than averaged in.
-        const int z = agg_z(i);
-        const int m = clamp(pc.n - RADIUS + i, 0, pc.nframes - 1);
+    for (int m = mlo; m <= mhi; ++m) {
+        const int z = pc.n - m + RADIUS;
         const int slot = slot_of(m);
-        if (tags[(TAG_BASE + slot) * TW + z] != uint(expect_of(m, z))) {
+        // Only slices the estimation kernel witnessed for this output frame may
+        // contribute: a slice left as the zero fill, one whose estimation never
+        // landed, or one still holding a recycled frame's stacks is skipped
+        // rather than averaged in.
+        if (tags[(TAG_BASE + slot) * TW + z] != want) {
             continue;
         }
         const int b =
@@ -130,19 +117,21 @@ void main() {
     // complete stack has a nonzero weight (its own block always contributes), so
     // a zero weight here is proof the contribution is missing, and the honest
     // output for it is the source frame's own pixel: undenoised, never corrupt.
-    if (o == 0 && used < TW) {
+    // A centre only contributes to this output frame when its group matched a
+    // block in it, so a short stack is normal once the threshold rejects: only
+    // a stack with no contribution at all is the failure the source fallback
+    // exists for (the output would otherwise be the zero fill).
+    if (o == 0 && used == 0) {
         // Count refusals, and record the first one: the witness value found
         // against the one wanted tells the two causes apart -- 0 means the
         // slice was never written, anything else means it holds another
         // frame's stacks. refusal[0] is the one-shot claim.
         atomicAdd(skipped[0], 1u);
         if (atomicCompSwap(refusal[0], 0u, 1u) == 0u) {
-            for (int i = 0; i < TW; ++i) {
-                const int z = agg_z(i);
-                const int m = clamp(pc.n - RADIUS + i, 0, pc.nframes - 1);
-                const int want = expect_of(m, z);
+            for (int m = mlo; m <= mhi; ++m) {
+                const int z = pc.n - m + RADIUS;
                 const int at = (TAG_BASE + slot_of(m)) * TW + z;
-                if (tags[at] != uint(want)) {
+                if (tags[at] != want) {
                     refusal[2] = uint(want);
                     refusal[3] = tags[at];
                     break;

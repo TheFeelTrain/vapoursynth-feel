@@ -12,18 +12,23 @@ import pytest
 import vapoursynth as vs
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-NOISE_MKV = os.path.join(TESTS_DIR, "noise_24f.mkv")
+CLIP_PATH = os.path.join(TESTS_DIR, "bigbuckbunny_360p_grain.mp4")
+CLIP_FRAMES = 24
 WIDTH = 640
 HEIGHT = 360
 
 
-def _source(path):
+def _source(path, frames=CLIP_FRAMES):
     core = vs.core
     if hasattr(core, "bs"):
-        return core.bs.VideoSource(path)
-    if hasattr(core, "ffms2"):
-        return core.ffms2.Source(path)
-    raise RuntimeError("no source plugin available (need bs or ffms2)")
+        clip = core.bs.VideoSource(path)
+    elif hasattr(core, "ffms2"):
+        clip = core.ffms2.Source(path)
+    else:
+        raise RuntimeError("no source plugin available (need bs or ffms2)")
+    if frames is not None and clip.num_frames > frames:
+        clip = core.std.Trim(clip, first=0, length=frames)
+    return clip
 
 
 def _plane_size(frame, plane):
@@ -119,7 +124,7 @@ def assert_all_frames_finite(node, frames=None, plane=0):
         assert np.isfinite(a).all(), f"non-finite output at frame {n}"
 
 
-def assert_changes_on_noise(out, src, frames=None, plane=0, what="filter"):
+def assert_changes_on_clip(out, src, frames=None, plane=0, what="filter"):
     """Anti-vacuity: ``out`` must alter ``src`` somewhere.
 
     A finiteness (or uint16 range) assertion alone passes for an identity
@@ -550,14 +555,16 @@ def reference_spec(
     guide_kwarg="ref",
     crop=None,
     vsfeel_filter=None,
+    source=None,
 ):
     """Build the JSON spec consumed by :data:`REFERENCE_SCRIPT`.
 
     ``clip`` names the input format ("gray32", "gray16", "yuv420_16", ...);
-    ``guide`` is a JSONable description of the joint-filter clip, if any.
+    ``guide`` is a JSONable description of the joint-filter clip, if any;
+    ``source`` overrides the input file (default: the committed noise clip).
     """
     spec = {
-        "source": NOISE_MKV,
+        "source": source or CLIP_PATH,
         "clip": clip,
         "plugin": plugin,
         "filter": filter,
@@ -632,7 +639,14 @@ elif kind == "rgb32":
 else:
     raise SystemExit("bad clip kind %r" % kind)
 if spec.get("nframes"):
-    clip = core.std.Loop(clip, times=spec["nframes"])
+    # Exactly that many frames. `std.Loop(times=N)` *multiplies* the clip's
+    # length instead: with `nframes=12` on the 300-frame source it built a
+    # 3600-frame clip and the order tests took minutes, and the 1/2-frame
+    # short-clip tests never saw a short clip at all.
+    want = int(spec["nframes"])
+    if want > clip.num_frames:
+        clip = core.std.Loop(clip, times=(want + clip.num_frames - 1) // clip.num_frames)
+    clip = core.std.Trim(clip, first=0, length=want)
 
 nf = clip.num_frames
 plane = spec.get("plane", 0)
@@ -644,7 +658,8 @@ key = next(k for k in range(3, 2 * nf + 3, 2) if gcd(k, nf) == 1)
 scramble = [(i * key) % nf for i in range(nf)]
 far = sorted(range(nf), key=lambda n: (abs(n - nf // 2), n))
 interleave = list(range(0, nf, 2)) + [n for n in range(nf) if n % 2][::-1]
-revisit = [n for n in [0, 3, 3, 1, 5, 1, nf - 1, 0, nf - 2, 2, nf - 1]]
+# Folded into range so the short-clip cases stay valid (nf can be 1).
+revisit = [n % nf for n in [0, 3, 3, 1, 5, 1, nf - 1, 0, nf - 2, 2, nf - 1]]
 orders = {
     "forward": list(range(nf)),
     "reverse": list(range(nf))[::-1],
@@ -702,7 +717,7 @@ def temporal_order_diff(filter_name, params, nframes=None, plane=0, clip="gray32
     failure, not a missing plugin.
     """
     spec = {
-        "source": NOISE_MKV,
+        "source": CLIP_PATH,
         "filter": filter_name,
         "params": params,
         "plane": plane,
@@ -817,60 +832,60 @@ def assert_preserves_frame_props(
 
 
 @pytest.fixture(scope="session")
-def noise_gray():
-    """GrayS float32 clip of the committed 24-frame random-noise video."""
-    src = _source(NOISE_MKV)
+def clip_gray():
+    """GrayS float32 clip of the test clip."""
+    src = _source(CLIP_PATH)
     y = vs.core.std.ShufflePlanes(src, 0, vs.GRAY)
     return vs.core.fmtc.bitdepth(y, bits=32, fulls=True, fulld=True)
 
 
 @pytest.fixture(scope="session")
-def noise_8bit():
+def clip_8bit():
     """GRAY8 clip of the same video (for input-validation tests)."""
-    src = _source(NOISE_MKV)
+    src = _source(CLIP_PATH)
     return vs.core.std.ShufflePlanes(src, 0, vs.GRAY)
 
 
 @pytest.fixture(scope="session")
-def noise_16bit():
+def clip_16bit():
     """GRAY16 clip of the same video (integer reference comparison)."""
-    src = _source(NOISE_MKV)
+    src = _source(CLIP_PATH)
     y = vs.core.std.ShufflePlanes(src, 0, vs.GRAY)
     return vs.core.fmtc.bitdepth(y, bits=16, fulls=True, fulld=True)
 
 
 def _resized(fmt, **kwargs):
-    return vs.core.resize.Bicubic(_source(NOISE_MKV), format=fmt, **kwargs)
+    return vs.core.resize.Bicubic(_source(CLIP_PATH), format=fmt, **kwargs)
 
 
 @pytest.fixture(scope="session")
-def noise_yuv32():
-    """YUV420PS (float32) version of the noise clip (chroma is subsampled)."""
-    return vs.core.fmtc.bitdepth(_source(NOISE_MKV), bits=32, fulls=True, fulld=True)
+def clip_yuv32():
+    """YUV420PS (float32) version of the clip (chroma is subsampled)."""
+    return vs.core.fmtc.bitdepth(_source(CLIP_PATH), bits=32, fulls=True, fulld=True)
 
 
 @pytest.fixture(scope="session")
-def noise_yuv420_16():
+def clip_yuv420_16():
     """YUV420P16 version (subsampled chroma lattice, for the 16-bit 'UV'
     sweep)."""
     return _resized(vs.YUV420P16)
 
 
 @pytest.fixture(scope="session")
-def noise_yuv444_16():
+def clip_yuv444_16():
     """YUV444P16 version (for joint 'YUV' processing)."""
     return _resized(vs.YUV444P16)
 
 
 @pytest.fixture(scope="session")
-def noise_rgb32():
-    """RGBS version of the noise clip."""
+def clip_rgb32():
+    """RGBS version of the clip."""
     return _resized(vs.RGBS, matrix_in_s="709")
 
 
 @pytest.fixture(scope="session")
-def noise_rgb16():
-    """RGB48 (16-bit integer) version of the noise clip."""
+def clip_rgb16():
+    """RGB48 (16-bit integer) version of the clip."""
     return _resized(vs.RGB48, matrix_in_s="709")
 
 

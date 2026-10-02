@@ -20,7 +20,7 @@ import textwrap
 
 import pytest
 
-from conftest import NOISE_MKV
+from conftest import CLIP_PATH
 
 _LAYER = "VK_LAYER_KHRONOS_validation"
 
@@ -49,9 +49,9 @@ _SCRIPT = textwrap.dedent(f"""\
     name = sys.argv[1]
     core = vs.core
     if hasattr(core, "bs"):
-        src = core.bs.VideoSource({NOISE_MKV!r})
+        src = core.bs.VideoSource({CLIP_PATH!r})
     else:
-        src = core.ffms2.Source({NOISE_MKV!r})
+        src = core.ffms2.Source({CLIP_PATH!r})
     g32 = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                              bits=32, fulls=True, fulld=True)
     g16 = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),

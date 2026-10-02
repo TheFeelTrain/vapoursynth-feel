@@ -101,14 +101,17 @@ struct Bm3dGroup {
 // call: a frame's window reservations are described by this struct, and what a
 // reader needs afterwards lives in the reservation tables (see BM3DData).
 struct Bm3dGroupFrame {
+    // window position maps to a real frame (radius 0 and the clip's ends have
+    // fewer than tw valid positions)
+    std::array<bool, 2 * MAX_RADIUS + 1> win_valid {};
     // this frame computes it
     std::array<bool, 2 * MAX_RADIUS + 1> win_recompute {};
     // res slot per window position
     std::array<int, 2 * MAX_RADIUS + 1> win_slots {};
     // frame that wrote it (trace)
     std::array<int, 2 * MAX_RADIUS + 1> win_writer {};
-    // Window positions this frame must compute, deduplicated (a clamped window
-    // maps several positions onto one slot and one centre frame).
+    // Window positions this frame must compute, in order. Each valid position
+    // is a distinct centre frame, so there is nothing to deduplicate.
     std::array<int, 2 * MAX_RADIUS + 1> est_pos {};
     int n_pos {};
     int src_lo {};
@@ -153,6 +156,12 @@ struct BM3DData {
     int tw {};     // 2 * radius + 1
     bool final {}; // true when a "ref" clip is given
     float extractor {};
+    // Matching threshold in the shader's SSD domain: the user's 8-bit MSE
+    // threshold times the CPU's color-matrix norm and 64/255^2. Exactly zero
+    // means the reference-only group, as the CPU's non-positive thMSE does.
+    float th_sse { 1.0f };
+    // Kept for the match trace's parameter snapshot only.
+    float th_mse { 0.0f };
     bool
         cas_atomics {}; // aggregate with the CAS kernel (no float32 add atomics)
     // chroma=True: one joint entry over the clip's three 4:4:4 planes, whose
@@ -182,6 +191,16 @@ struct BM3DData {
     volatile uint32_t * skipped_mapped {};
     GpuBuffer refusal {}; // host-visible: first refusal fingerprint
     volatile uint32_t * refusal_mapped {};
+    // Debug match trace (VSFEEL_BM3D_MATCHTRACE=frame,x,y): the traced dispatch
+    // is the one that estimates the requested centre frame itself, and the
+    // kernel records the group of the reference block at (x, y) into this
+    // host-visible buffer, which the frame path dumps once the submission it
+    // rode on has completed.
+    int trace_frame { -1 };
+    int trace_x {};
+    int trace_y {};
+    GpuBuffer match_trace {};
+    volatile uint32_t * match_trace_mapped {};
     VkDeviceSize tags_size {}; // uints
     int nframes {};
 
@@ -293,6 +312,7 @@ struct BM3DData {
         }
         gpu_destroy_buffer(*gpu, skipped);
         gpu_destroy_buffer(*gpu, refusal);
+        gpu_destroy_buffer(*gpu, match_trace);
         if (pipeline_layout) {
             gpu->vk->vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
         }
@@ -321,7 +341,8 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
         return i < group.n_planes ? d.planes[group.planes[i]].sigma : 0.0f;
     };
     // The block below is the shader's spec-constant ids in order: 0..13 are the
-    // original single-plane block, 14..16 the joint-entry additions.
+    // original single-plane block, 14..16 the joint-entry additions, 17 the
+    // matching threshold, 18 the match trace.
     struct Spec {
         int32_t width, height, stride;
         float sigma_y;
@@ -330,6 +351,8 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
         int32_t nosearch, noestimate, src_ring, final;
         float sigma_u, sigma_v;
         int32_t nplanes;
+        float th_sse;
+        int32_t trace;
     } spec { first.width,
              first.height,
              first.stride,
@@ -346,25 +369,29 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
              d.final ? 1 : 0,
              group_sigma(1),
              group_sigma(2),
-             group.n_planes };
-    const std::array<VkSpecializationMapEntry, 17> entries { {
-        { 0, 0, sizeof(int32_t) },
-        { 1, 4, sizeof(int32_t) },
-        { 2, 8, sizeof(int32_t) },
-        { 3, 12, sizeof(float) },
-        { 4, 16, sizeof(int32_t) },
-        { 5, 20, sizeof(int32_t) },
-        { 6, 24, sizeof(int32_t) },
-        { 7, 28, sizeof(int32_t) },
-        { 8, 32, sizeof(int32_t) },
-        { 9, 36, sizeof(float) },
-        { 10, 40, sizeof(int32_t) },
-        { 11, 44, sizeof(int32_t) },
-        { 12, 48, sizeof(int32_t) },
-        { 13, 52, sizeof(int32_t) },
-        { 14, 56, sizeof(float) },
-        { 15, 60, sizeof(float) },
-        { 16, 64, sizeof(int32_t) },
+             group.n_planes,
+             d.th_sse,
+             d.trace_frame >= 0 ? 1 : 0 };
+    const std::array<VkSpecializationMapEntry, 19> entries { {
+        { 0, offsetof(Spec, width), sizeof(int32_t) },
+        { 1, offsetof(Spec, height), sizeof(int32_t) },
+        { 2, offsetof(Spec, stride), sizeof(int32_t) },
+        { 3, offsetof(Spec, sigma_y), sizeof(float) },
+        { 4, offsetof(Spec, block_step), sizeof(int32_t) },
+        { 5, offsetof(Spec, bm_range), sizeof(int32_t) },
+        { 6, offsetof(Spec, radius), sizeof(int32_t) },
+        { 7, offsetof(Spec, ps_num), sizeof(int32_t) },
+        { 8, offsetof(Spec, ps_range), sizeof(int32_t) },
+        { 9, offsetof(Spec, extractor), sizeof(float) },
+        { 10, offsetof(Spec, nosearch), sizeof(int32_t) },
+        { 11, offsetof(Spec, noestimate), sizeof(int32_t) },
+        { 12, offsetof(Spec, src_ring), sizeof(int32_t) },
+        { 13, offsetof(Spec, final), sizeof(int32_t) },
+        { 14, offsetof(Spec, sigma_u), sizeof(float) },
+        { 15, offsetof(Spec, sigma_v), sizeof(float) },
+        { 16, offsetof(Spec, nplanes), sizeof(int32_t) },
+        { 17, offsetof(Spec, th_sse), sizeof(float) },
+        { 18, offsetof(Spec, trace), sizeof(int32_t) },
     } };
     // The kernel's 8-lane shuffles keep each aligned 8-lane group inside one
     // subgroup, so any width that is a multiple of 8 runs it; 32 is the measured
@@ -389,8 +416,10 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
                "device's is " +
                std::to_string(gpu.subgroup_size) + " and cannot be changed"s;
     }
-    // LDS: l_e/l_x/l_y/l_s are [4][64] each, three int arrays and one float.
-    const GpuWorkgroup workgroup { .x = 32, .shared_bytes = 4 * 64 * 4 * 4 };
+    // LDS: l_e/l_xy are the per-lane candidate lists [8 lanes][8 entries], and
+    // s_x/s_y/s0_x/s0_y hold the prediction seeds of each 8-lane group.
+    const GpuWorkgroup workgroup { .x = 32,
+                                   .shared_bytes = (2 * 64 + 4 * 8) * 4 * 4 };
     return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(),
                                &spec, static_cast<uint32_t>(entries.size()),
                                sizeof(spec), "bm3d", subgroup_size, workgroup);
@@ -456,6 +485,7 @@ static void acquire_cache(BM3DData * d, Bm3dFrame & fr, int n) {
         auto & gf = fr.g[gi];
         gf.win_slots.fill(-1);
         gf.win_writer.fill(-1);
+        gf.win_valid.fill(false);
         gf.win_recompute.fill(false);
         gf.upload_new.fill(false);
         gf.src_slot.fill(-1);
@@ -504,6 +534,7 @@ static void acquire_cache(BM3DData * d, Bm3dFrame & fr, int n) {
             auto & gf = fr.g[gi];
             gf.win_slots.fill(-1);
             gf.win_writer.fill(-1);
+            gf.win_valid.fill(false);
             gf.win_recompute.fill(false);
             gf.upload_new.fill(false);
             gf.src_slot.fill(-1);
@@ -512,14 +543,17 @@ static void acquire_cache(BM3DData * d, Bm3dFrame & fr, int n) {
             // not leave half-applied reservations behind, or a retry would treat
             // the abandoned slots as cached and never recompute them.
             for (int i = 0; i < d->tw; ++i) {
-                const int m = std::clamp(n - r + i, 0, nf - 1);
+                // Window positions outside the clip are not estimate centres at
+                // all: an output frame near the start has fewer than tw real
+                // centres, and the missing ones must not alias the endpoint.
+                const int m = n - r + i;
+                if (m < 0 || m >= nf) {
+                    continue;
+                }
+                gf.win_valid[i] = true;
                 const int slot = m % g.res_cap;
                 gf.win_slots[i] = slot;
                 gf.win_writer[i] = g.res_writer[slot];
-                // A clamped window maps several positions onto one slot, so this
-                // must be decided from the state *before* phase 2 mutates it: the
-                // later positions would otherwise look cached and keep the stale
-                // writer of the slot's previous contents as a dependency.
                 gf.win_recompute[i] = (g.res_frame[slot] != m);
                 if (gf.win_recompute[i] && !g.res_holders[slot].empty()) {
                     ok = false; // slot in use by an in-flight frame
@@ -553,16 +587,17 @@ static void acquire_cache(BM3DData * d, Bm3dFrame & fr, int n) {
             auto & g = d->groups[gi];
             auto & gf = fr.g[gi];
             for (int i = 0; i < d->tw; ++i) {
-                const int m = std::clamp(n - r + i, 0, nf - 1);
+                if (!gf.win_valid[i]) {
+                    continue;
+                }
+                const int m = n - r + i;
                 const int slot = gf.win_slots[i];
                 if (gf.win_recompute[i]) {
-                    if (g.res_frame[slot] != m) { // first position mapping here
-                        g.res_frame[slot] = m;
-                        g.res_writer[slot] = n;
-                        g.res_ready[slot] = 0;
-                    }
-                    // every position that maps here drops the previous writer's
-                    // dependency: this frame overwrites the slot's contents
+                    g.res_frame[slot] = m;
+                    g.res_writer[slot] = n;
+                    g.res_ready[slot] = 0;
+                    // this frame overwrites the slot's contents, so it owes the
+                    // previous writer nothing
                     gf.win_writer[i] = -1;
                 }
                 g.res_holders[slot].push_back(fr.token);
@@ -594,7 +629,7 @@ static void publish_est_submitted(BM3DData * d, const Bm3dFrame & fr) {
         auto & g = d->groups[gi];
         const auto & gf = fr.g[gi];
         for (int i = 0; i < d->tw; ++i) {
-            if (gf.win_recompute[i]) {
+            if (gf.win_valid[i] && gf.win_recompute[i]) {
                 g.res_ready[gf.win_slots[i]] = 1;
             }
         }
@@ -627,7 +662,7 @@ static void fail_pending_frame(BM3DData * d, const Bm3dFrame & fr,
         auto & g = d->groups[gi];
         const auto & gf = fr.g[gi];
         for (int i = 0; i < d->tw; ++i) {
-            if (gf.win_recompute[i]) {
+            if (gf.win_valid[i] && gf.win_recompute[i]) {
                 g.res_ready[gf.win_slots[i]] = 1;
             }
         }
@@ -717,7 +752,8 @@ static void wait_res_submitted(BM3DData * d, const Bm3dFrame & fr) {
             const auto & g = d->groups[gi];
             const auto & gf = fr.g[gi];
             for (int i = 0; i < d->tw; ++i) {
-                if (!gf.win_recompute[i] && !g.res_ready[gf.win_slots[i]]) {
+                if (gf.win_valid[i] && !gf.win_recompute[i] &&
+                    !g.res_ready[gf.win_slots[i]]) {
                     return false;
                 }
             }
@@ -739,6 +775,9 @@ static void release_cache(BM3DData * d, const Bm3dFrame & fr) {
         }
         std::lock_guard lock(d->cache_lock);
         for (int i = 0; i < d->tw; ++i) {
+            if (!gf.win_valid[i]) {
+                continue;
+            }
             auto & h = g.res_holders[gf.win_slots[i]];
             h.erase(std::remove(h.begin(), h.end(), fr.token), h.end());
         }
@@ -750,33 +789,24 @@ static void release_cache(BM3DData * d, const Bm3dFrame & fr) {
     }
 }
 
-// Window positions whose estimate this frame must compute. A clamped window
-// collapses several positions onto one slot and one centre frame, i.e.
-// identical dispatches whose fills wipe each other, so only one is kept.
-static void collect_est_positions(BM3DData * d, Bm3dGroupFrame & gf, int n) {
+// Window positions whose estimate this frame must compute. Every valid
+// position is a distinct centre frame with its own slot, so nothing is
+// deduplicated here; positions outside the clip compute nothing at all.
+static void collect_est_positions(BM3DData * d, Bm3dGroupFrame & gf) {
     gf.n_pos = 0;
     if (d->radius == 0) {
         gf.est_pos[gf.n_pos++] = 0;
         return;
     }
     for (int i = 0; i < d->tw; ++i) {
-        if (!gf.win_recompute[i]) {
-            continue;
-        }
-        const int m_i = std::clamp(n - d->radius + i, 0, d->nframes - 1);
-        const int slot = gf.win_slots[i];
-        bool duplicate_later = false;
-        for (int j = i + 1; j < d->tw && !duplicate_later; ++j) {
-            duplicate_later =
-                gf.win_recompute[j] && gf.win_slots[j] == slot &&
-                std::clamp(n - d->radius + j, 0, d->nframes - 1) == m_i;
-        }
-        if (!duplicate_later) {
+        if (gf.win_valid[i] && gf.win_recompute[i]) {
             gf.est_pos[gf.n_pos++] = i;
         }
     }
 }
 
+// The three buffers both kernels address, in the order the shader declares
+// them: estimate stacks, source ring, destination plane.
 // The three buffers both kernels address, in the order the shader declares
 // them: estimate stacks, source ring, destination plane.
 static void bm3d_bind(const GPUDevice & gpu, VkCommandBuffer cmd,
@@ -785,6 +815,56 @@ static void bm3d_bind(const GPUDevice & gpu, VkCommandBuffer cmd,
                       VkBuffer refusal) {
     const VkBuffer bufs[6] { res, src, dst, tags, skipped, refusal };
     gpu_push_buffers(gpu, cmd, layout, bufs, 6);
+}
+
+// Dump the group the matcher selected for the traced reference block, once the
+// submission that recorded it has completed. The layout is the one the kernel
+// writes: a marker, the counts, then the eight (x, y, z, error) slots, then the
+// per-frame retained/seed counts of both temporal directions.
+static void dump_match_trace(const BM3DData * d, int trace_x, int trace_y) {
+    const volatile uint32_t * t = d->match_trace_mapped;
+    if (!t) {
+        return;
+    }
+    if (t[0] != 0x0B3D0001u) {
+        fprintf(stderr,
+                "[bm3d-trace] (%d, %d): no group matched -- the origin must be "
+                "one of the matcher's reference-block positions\n",
+                trace_x, trace_y);
+        return;
+    }
+    const auto as_float = [](uint32_t bits) {
+        return std::bit_cast<float>(bits);
+    };
+    fprintf(stderr,
+            "[bm3d-trace] x=%d y=%d th_mse=%.9g th_sse=%.9g n=%u retained=%u "
+            "overflow=%u current=%u seeds=%u\n",
+            trace_x, trace_y, static_cast<double>(d->th_mse),
+            static_cast<double>(d->th_sse), t[1], t[2], t[3], t[4], t[5]);
+    for (uint32_t k = 0; k < 8; ++k) {
+        fprintf(stderr, "[bm3d-trace] member %u x=%u y=%u z=%u err=%.9g\n", k,
+                t[6 + 4 * k], t[7 + 4 * k], t[8 + 4 * k],
+                static_cast<double>(as_float(t[9 + 4 * k])));
+    }
+    // The frame counters only exist when the kernel ran the predictive chain;
+    // a zero threshold (or the no-search diagnostic) stops it before the first
+    // neighbour, and the words are then just the buffer's zero fill.
+    if (d->th_sse <= 0.0f || env_flag("VSFEEL_BM3D_NOSEARCH")) {
+        return;
+    }
+    for (int direction = -1; direction <= 1; direction += 2) {
+        const int nt = std::min(d->radius, direction < 0 ? d->trace_frame
+                                                         : d->nframes - 1 -
+                                                               d->trace_frame);
+        for (int step = 1; step <= nt; ++step) {
+            const int base =
+                38 + ((direction < 0 ? 0 : d->radius) + step - 1) * 2;
+            fprintf(stderr,
+                    "[bm3d-trace] %s step=%d frame=%d retained=%u seeds=%u\n",
+                    direction < 0 ? "bwd" : "fwd", step,
+                    d->trace_frame + direction * step, t[base], t[base + 1]);
+        }
+    }
 }
 
 // A whole-command barrier across submissions: the slots are written again here
@@ -819,7 +899,7 @@ static void record_est_position(BM3DData * d, const Bm3dFrame & fr,
     const auto & gf = fr.g[gi];
     const int i = gf.est_pos[c];
     const int slot = gf.win_slots[i];
-    const int m_i = std::clamp(n - r + i, 0, nf - 1);
+    const int m_i = n - r + i;
     if (d->dump) {
         fprintf(stderr, "[d] n=%d entry %d computes slot %d for frame %d\n", n,
                 gi, slot, m_i);
@@ -843,18 +923,34 @@ static void record_est_position(BM3DData * d, const Bm3dFrame & fr,
     // Both the zero-fill and the tag clear precede the estimation dispatch.
     bm3d_full_barrier(*d->gpu, cmd);
 
+    // The match trace rides on the destination binding, which the estimation
+    // kernel never writes: only the dispatch that estimates the traced centre
+    // frame itself records, and only the group holding the requested reference
+    // block matches inside the kernel.
+    int32_t trace_xy = -1;
+    if (d->trace_frame >= 0 && n == d->trace_frame && m_i == d->trace_frame) {
+        trace_xy =
+            static_cast<int32_t>((d->trace_x & 0xFFFF) | (d->trace_y << 16));
+    }
+    const VkBuffer dst_bind = trace_xy >= 0 ? d->match_trace.buffer : dst_plane;
+
     d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                   g.bm3d_pipeline);
     // The estimation kernel reads only the estimate stacks and the source ring;
     // the destination binding carries the output plane and is unused here.
     bm3d_bind(*d->gpu, cmd, d->pipeline_layout, g.src.buffer, g.res.buffer,
-              dst_plane, d->tags.buffer, d->skipped.buffer, d->refusal.buffer);
+              dst_bind, d->tags.buffer, d->skipped.buffer, d->refusal.buffer);
     {
-        const int32_t pushes[5] {
-            static_cast<int32_t>(res_off), m_i, nf,
-            static_cast<int32_t>((r == 0) ? fr.slot0[gi] : 0),
+        const int32_t slot0_push =
+            static_cast<int32_t>((r == 0) ? fr.slot0[gi] : 0);
+        const int32_t pushes[6] {
+            static_cast<int32_t>(res_off),
+            m_i,
+            nf,
+            slot0_push,
             static_cast<int32_t>(static_cast<VkDeviceSize>(g.tag_base + slot) *
-                                 d->tw)
+                                 d->tw),
+            trace_xy
         };
         gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, pushes,
                            sizeof(pushes));
@@ -1035,7 +1131,10 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame & fr,
         if (d->trace && r > 0) {
             std::lock_guard lock(d->cache_lock);
             for (int i = 0; i < d->tw; ++i) {
-                const int want = std::clamp(n - r + i, 0, nf - 1);
+                if (!gf.win_valid[i]) {
+                    continue;
+                }
+                const int want = n - r + i;
                 const int slot = gf.win_slots[i];
                 if (g.res_frame[slot] != want) {
                     fprintf(stderr,
@@ -1087,10 +1186,10 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame & fr,
                 // estimate offsets are then computed in vec4 elements, which is
                 // why the plane offset is divided here. Same five ints as the
                 // estimation kernel's block, so both share one layout.
-                const int32_t pushes[5] { n, nf, (r == 0) ? fr.slot0[gi] : 0,
-                                          static_cast<int32_t>(
-                                              static_cast<VkDeviceSize>(pi) *
-                                              d->tw * 2 * g.pe / 4),
+                const int32_t slot0_push = (r == 0) ? fr.slot0[gi] : 0;
+                const int32_t plane_off4 = static_cast<int32_t>(
+                    static_cast<VkDeviceSize>(pi) * d->tw * 2 * g.pe / 4);
+                const int32_t pushes[5] { n, nf, slot0_push, plane_off4,
                                           static_cast<int32_t>(src_base) };
                 if (d->refusal_mapped && !d->refusal_mapped[0]) {
                     d->refusal_mapped[1] = static_cast<uint32_t>(n);
@@ -1286,7 +1385,7 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
 
         int max_pos = 0;
         for (int gi = 0; gi < d->n_groups; ++gi) {
-            collect_est_positions(d, fr.g[gi], n);
+            collect_est_positions(d, fr.g[gi]);
             max_pos = std::max(max_pos, fr.g[gi].n_pos);
         }
         const int chunks = (d->split_est && max_pos > 0) ? max_pos : 1;
@@ -1303,11 +1402,13 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
                     }
                 }
                 for (int i = 0; i < d->tw; ++i) {
-                    if (!gf.win_recompute[i]) {
-                        fprintf(stderr,
-                                "[t] n=%d entry %d reads res slot %d (writer "
-                                "w=%d)\n",
-                                n, gi, gf.win_slots[i], gf.win_writer[i]);
+                    if (gf.win_valid[i] && !gf.win_recompute[i]) {
+                        fprintf(
+                            stderr,
+                            "[t] n=%d entry %d reads res slot %d for centre "
+                            "%d (writer w=%d)\n",
+                            n, gi, gf.win_slots[i], n - d->radius + i,
+                            gf.win_writer[i]);
                     }
                 }
             }
@@ -1398,6 +1499,17 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
                                  : std::chrono::steady_clock::time_point {};
         if (d->trace) {
             fprintf(stderr, "[t] n=%d submitted (%d est chunks)\n", n, chunks);
+        }
+
+        if (d->trace_frame >= 0 && n == d->trace_frame) {
+            // The trace rode on this frame's estimation submission, so waiting
+            // the aggregation out leaves it final. Debug only: this is the one
+            // blocking readback, and only for the traced frame.
+            char terr[256] {};
+            if (d->gpu->api->gpuExecWaitValue(d->exec, agg_value, terr,
+                                              sizeof(terr)) == gdDrained) {
+                dump_match_trace(d, d->trace_x, d->trace_y);
+            }
         }
 
         if (gputrace) {
@@ -1498,6 +1610,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // Diagnostic: wait the ring copier's submission out host side instead of
     // riding the handoff barrier (see wait_src_submitted).
     d->ring_wait = env_flag("VSFEEL_BM3D_RINGWAIT");
+    // Debug oracle: VSFEEL_BM3D_MATCHTRACE=<frame>,<x>,<y> records the group
+    // the matcher selects for one reference block of one centre frame.
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
@@ -1512,6 +1626,29 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             vsapi->freeNode(d->ref_node);
         }
     };
+
+    if (const char * spec = env_str("VSFEEL_BM3D_MATCHTRACE")) {
+        // <frame>,<x>,<y>, parsed with strtol so a malformed value is an error
+        // rather than a silently truncated one.
+        std::array<int, 3> vals {};
+        const char * p = spec;
+        bool ok = true;
+        for (size_t i = 0; i < vals.size() && ok; ++i) {
+            char * end = nullptr;
+            const long v = std::strtol(p, &end, 10);
+            ok = end != p && v >= 0 && v <= INT32_MAX;
+            vals[i] = static_cast<int>(v);
+            const bool last = i + 1 == vals.size();
+            ok = ok && *end == (last ? '\0' : ',');
+            p = end + 1;
+        }
+        if (!ok) {
+            return set_error("VSFEEL_BM3D_MATCHTRACE must be <frame>,<x>,<y>");
+        }
+        d->trace_frame = vals[0];
+        d->trace_x = vals[1];
+        d->trace_y = vals[2];
+    }
 
     // optional "ref": a basic-estimate clip used for the final (Wiener) pass;
     // the block matching runs on it and its patches provide the Wiener
@@ -1591,6 +1728,43 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         d->planes[i].process = sigma[i] >= FLT_EPSILON;
         any_process = any_process || d->planes[i].process;
     }
+    // th_mse: the CPU matcher's threshold in 8-bit MSE units, derived from the
+    // shared sigma[0] when omitted (mawen's fast profile). It is validated
+    // before the all-zero-sigma shortcut so an invalid value is never
+    // conditionally accepted, and converted to the shader's SSD domain once:
+    // MSE_8bit = SSD * 255^2 / 64.
+    //
+    // The CPU scales both its threshold and its sigmas by normY, the norm of
+    // the RGB->YUV luma row of its color matrix (0.7496 for the bt709 default
+    // at HD). The sigma factors above already carry that 0.75, so the threshold
+    // carries the same constant and the two stay in the same units.
+    {
+        double th_mse = vsapi->mapGetFloat(in, "th_mse", 0, &error);
+        if (error) {
+            th_mse = d->final ? (200.0 + sigma[0] * 10.0)
+                              : (400.0 + sigma[0] * 80.0);
+        } else if (!std::isfinite(th_mse) || th_mse < 0.0) {
+            return set_error(
+                "\"th_mse\" must be a finite non-negative number of 8-bit MSE "
+                "units (0 selects the reference block alone)");
+        }
+        constexpr double kMatrixNormY = 0.7496149945138504;
+        double th_sse = th_mse * kMatrixNormY * (64.0 / (255.0 * 255.0));
+        if (th_sse > static_cast<double>(FLT_MAX)) {
+            // A finite but enormous threshold accepts every finite distance; a
+            // saturated float keeps that meaning instead of narrowing to inf.
+            th_sse = static_cast<double>(FLT_MAX);
+        }
+        d->th_mse = static_cast<float>(th_mse);
+        d->th_sse = static_cast<float>(th_sse);
+        if (th_mse > 0.0 && d->th_sse == 0.0f) {
+            // Underflowed to zero, which the kernel reads as "reference only";
+            // the smallest denormal keeps the search on, as the CPU's positive
+            // threshold does.
+            d->th_sse = FLT_TRUE_MIN;
+        }
+    }
+
     if (!any_process) {
         // Nothing to denoise: hand the source clip straight back, as the
         // references' BM3Dv2 does. Before any GPU resource exists, so the
@@ -1606,8 +1780,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // match the reference sigma scaling exactly (different factor for the
     // final Wiener pass); a skipped plane keeps exactly zero so the kernel's
     // epsilon test cannot disagree with the unscaled decision above
-    const float sigma_factor = d->final ? std::bit_cast<float>(0x3e40c0c1u)
-                                        : std::bit_cast<float>(0x3f021bb6u);
+    const float sigma_factor = d->final ? std::bit_cast<float>(0x3e40a76cu)
+                                        : std::bit_cast<float>(0x3f020a9cu);
     for (int i = 0; i < d->num_planes; ++i) {
         d->planes[i].sigma =
             d->planes[i].process ? sigma[i] * sigma_factor : 0.0f;
@@ -1774,8 +1948,9 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         d->set_layout = std::get<VkDescriptorSetLayout>(result);
     }
     {
-        const auto result = // 5 ints, the same block both kernels take
-            gpu_pipeline_layout(*d->gpu, d->set_layout, 5 * sizeof(int32_t));
+        const auto result = // 6 ints; the aggregation kernel declares the
+                            // first 5 of the same block
+            gpu_pipeline_layout(*d->gpu, d->set_layout, 6 * sizeof(int32_t));
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -1900,6 +2075,35 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         res_total += g.res_size;
     }
 
+    if (d->trace_frame >= 0) {
+        if (d->trace_frame >= d->nframes) {
+            return set_error(
+                "VSFEEL_BM3D_MATCHTRACE frame is outside the clip");
+        }
+        // The kernel only visits reference-block origins: multiples of the
+        // block step, plus the clamped final origin at (dimension - 8) when it
+        // is not already on that grid. Snapping would silently trace a
+        // different block than the one asked for, which is exactly the kind of
+        // quiet substitution a matching oracle must not do.
+        const int bs = d->planes[0].block_step;
+        const auto is_origin = [bs](int v, int dim) {
+            const int last = dim - 8;
+            return v >= 0 && v <= last &&
+                   (v == last || (v % bs == 0 && v < last + bs));
+        };
+        if (!is_origin(d->trace_x, d->planes[0].width) ||
+            !is_origin(d->trace_y, d->planes[0].height)) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "VSFEEL_BM3D_MATCHTRACE origin (%d, %d) is not a "
+                     "reference-block position: block_step is %d and the plane "
+                     "is %dx%d",
+                     d->trace_x, d->trace_y, bs, d->planes[0].width,
+                     d->planes[0].height);
+            return set_error(msg);
+        }
+    }
+
     // shared buffers
     d->tags_size = static_cast<VkDeviceSize>(d->n_groups) * res_cap * d->tw;
     {
@@ -1947,6 +2151,29 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             for (int i = 0; i < 4; ++i) {
                 if (d->refusal_mapped) {
                     d->refusal_mapped[i] = 0;
+                }
+            }
+        }
+        if (d->trace_frame >= 0) {
+            // One record is the marker, five counts, eight (x, y, z, error)
+            // slots and two counts per temporal frame and direction.
+            constexpr VkDeviceSize kTraceWords = 5 + 8 * 4 + 2 * 2 * MAX_RADIUS;
+            std::string err =
+                gpu_make_buffer(*d->gpu, core, kTraceWords * 4, d->match_trace,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (!err.empty()) {
+                return set_error("the match trace buffer could not be "
+                                 "allocated: " +
+                                 err);
+            }
+            d->match_trace_mapped =
+                static_cast<volatile uint32_t *>(d->match_trace.mapped);
+            if (d->match_trace_mapped) {
+                for (VkDeviceSize i = 0; i < kTraceWords; ++i) {
+                    d->match_trace_mapped[i] = 0;
                 }
             }
         }
@@ -2122,6 +2349,7 @@ void vsfeel_register_bm3dv2(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
                              "radius:int:opt;"
                              "ps_num:int[]:opt;"
                              "ps_range:int[]:opt;"
+                             "th_mse:float:opt;"
                              "chroma:int:opt;"
                              "num_streams:int:opt;"
                              "extractor_exp:int:opt;"

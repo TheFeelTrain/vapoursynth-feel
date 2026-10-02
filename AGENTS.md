@@ -90,14 +90,17 @@ makes the benchmark and the vspipe hang tests work.
 ## Testing
 
 Every filter needs **comprehensive unit tests** in `tests/`, run with pytest.
-The committed `tests/noise_24f.mkv` clip (24 frames of random noise) is the
-standard test input.
+The committed `tests/bigbuckbunny_360p_grain.mp4` clip is the standard test 
+input. The fixtures expose its first 24 frames (`CLIP_FRAMES`): the helpers 
+iterate every frame they are handed, so the whole file would make a full run 
+12x longer without covering anything new. A test that needs a longer run asks 
+for one explicitly.
 
 - Tests must verify **correctness against the reference behavior** and
   **self-consistency** (determinism across runs, multi-stream vs single-stream
   agreement, parallel-load consistency).
 - The `tests/` folder has `conftest.py` with shared fixtures/helpers
-  (`WIDTH`, `HEIGHT`, `NOISE_MKV`, `frame_to_ndarray`, ...).
+  (`WIDTH`, `HEIGHT`, `CLIP_PATH`, `frame_to_ndarray`, ...).
 - Always run the full test suite for the filter you touch before and after
   changes: `tools/test.sh tests/test_<filter>.py -q`.
 - Run the whole suite with **`tools/test.sh`** (extra args are passed through,

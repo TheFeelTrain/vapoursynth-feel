@@ -25,7 +25,7 @@ import textwrap
 
 import pytest
 
-from conftest import COMPARE_PRELUDE, HEIGHT, NOISE_MKV, compare_or_skip
+from conftest import COMPARE_PRELUDE, HEIGHT, CLIP_PATH, compare_or_skip
 
 WIDTHS = (630, 638)
 FRAMES = [0, 1, 2]
@@ -82,7 +82,7 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
         assert bits == 16 and color == "gray", (bits, color)
 
     core.max_cache_size = 512
-    src = core.bs.VideoSource({NOISE_MKV!r})
+    src = core.bs.VideoSource({CLIP_PATH!r})
     if color == "yuv420":
         # subsampled chroma: the chroma planes are half width, so their rows
         # are a different (and typically less aligned) length than luma's
