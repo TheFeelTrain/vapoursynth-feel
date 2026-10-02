@@ -632,10 +632,11 @@ and `build/vk_spv/`, which `tools/install.sh` writes. A gate whose tool is
 missing reports `skipped`; a gate whose build directory is missing fails,
 because then it did not run.
 
-After changing a shader or a `-D`, run `uv run python tools/shader_limits.py` and
-compare its workgroup/LDS table against the `GpuWorkgroup` literals at each
-`gpu_create_pipeline` call site. CI runs it as its own step so the table
-lands in the log next to the validation.
+After changing a shader or a `-D`, run `uv run python tools/shader_limits.py` for
+the workgroup/LDS table; `--check` compares that table against the `GpuWorkgroup`
+literals at each `gpu_create_pipeline` call site and fails on a mismatch. The lint
+run does it for you (`tools/lint.sh shaders`), and CI runs both so the table lands
+in the log next to the validation.
 
 The `.comp` shaders are deliberately **not** clang-format'd: clang-format parses
 GLSL as C++ and reflows the buffer blocks and the push-constant struct into

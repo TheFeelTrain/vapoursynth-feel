@@ -10,6 +10,13 @@ on:
         type: boolean
         default: false
 
+# The wheel matrix is four runners plus the sdist on every push, and a branch
+# that is pushed twice in a minute does not need both sets. A release must never
+# be cancelled, so tag refs keep their own group and opt out of the cancellation.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   sdist:
     runs-on: ubuntu-latest

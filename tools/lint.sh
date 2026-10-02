@@ -9,7 +9,9 @@
 #
 # Gates:
 #   format    clang-format over src/*.cpp src/*.h, per .clang-format
-#   shaders   glslc -Werror + spirv-val, through the build's shader-validate target
+#   shaders   glslc -Werror + spirv-val, through the build's shader-validate
+#             target, then tools/shader_limits.py --check against the host's
+#             GpuWorkgroup literals
 #   tidy      clang-tidy over the compile database, per .clang-tidy
 #   cppcheck  cppcheck over the compile database
 #   ruff      ruff check + ruff format --check over vsfeel/ tools/
@@ -41,6 +43,9 @@ clang_format=${CLANG_FORMAT:-clang-format}
 clang_tidy=${CLANG_TIDY:-clang-tidy}
 cppcheck=${CPPCHECK:-cppcheck}
 ruff=${RUFF:-ruff}
+# tools/shader_limits.py is stdlib-only, so any interpreter runs it; the venv is
+# what PATH resolves to after the block above whenever one exists.
+python=${VSFEEL_PYTHON:-python3}
 
 fix=0
 gates=()
@@ -97,6 +102,13 @@ gate_shaders() {
     # spirv-val. The target exists only when spirv-val was found at configure
     # time, so a build without SPIRV-Tools fails here instead of passing.
     cmake --build "$build_dir" --target shader-validate
+    # The host declares each pipeline's workgroup and LDS before creating it (the
+    # device-limit check reads those numbers), so the SPIR-V and the
+    # `GpuWorkgroup` literals have to agree; --check does that comparison instead
+    # of leaving it to whoever remembers to read the table.
+    "$python" "$root_dir/tools/shader_limits.py" --check \
+        --src "$root_dir/src" --header "$build_dir/spirv_binaries.h" \
+        "$build_dir/vk_spv/*.spv"
 }
 
 gate_tidy() {

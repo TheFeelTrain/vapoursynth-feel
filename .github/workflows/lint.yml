@@ -5,6 +5,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Same per-ref grouping as the build workflow: a superseded push's lint run has
+# nothing to say about the commit that replaced it. Tags keep their own group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   lint:
     # 26.04, not latest: noble's glslc is 2023.8 and rejects --target-env=vulkan1.4.
@@ -41,19 +47,23 @@ jobs:
 
     # Builds the host with -Werror and every shader with glslc -Werror, then
     # validates each emitted module with spirv-val (the shader-validate target).
-    # Also prints every shader variant's workgroup/LDS footprint: run
-    # `python tools/shader_limits.py` after changing a shader or a -D and
-    # compare against the GpuWorkgroup literals at each gpu_create_pipeline
-    # call site. A stale .spv left behind by a dropped CMake variant is
-    # marked, so it cannot pose as live. CI surfaces the table here so a
-    # variant that outgrew its device limits is visible in the log next to
-    # the validation that would otherwise pass it.
+    # Also prints every shader variant's workgroup/LDS footprint, so a variant
+    # that outgrew its device limits is visible in the log next to the validation
+    # that would otherwise pass it, and --checks it against the GpuWorkgroup
+    # literals at each gpu_create_pipeline call site: the host's device-limit
+    # check reads those numbers, so the two drifting apart is a real defect.
+    # A stale .spv left behind by a dropped CMake variant is marked, so it
+    # cannot pose as live.
     - name: Build
       run: cmake --build build --parallel
 
     - name: Shader limits
-      run: uv run --no-sync python tools/shader_limits.py
+      run: |
+        uv run --no-sync python tools/shader_limits.py
+        uv run --no-sync python tools/shader_limits.py --check
 
+    # Runs the shaders gate again (`shader-validate` plus the same --check), so
+    # tools/lint.sh stays the single entry point a contributor runs locally.
     - name: Lint
       run: tools/lint.sh
 

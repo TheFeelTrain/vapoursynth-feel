@@ -14,10 +14,21 @@ set -euo pipefail
 INDEX="https://pypi.org/simple/vapoursynth-feel/"
 
 url_of() {
-    # Anchored on the whole name, so e.g. foo.whl cannot match foo.whl.metadata.
+    # Fixed-string matching, not a regex: a distribution filename is full of
+    # dots, which a regex would read as wildcards and could match another file.
+    # The URL is cut at the '#' so the name has to be the path's last segment,
+    # which is also what stops `foo.whl` matching `foo.whl.metadata`.
+    local file=$1
     curl -fsS "${INDEX}" 2>/dev/null |
-        grep -oE "https://[^\"#]*/${1}(#|\$)" |
-        head -1 | cut -d'#' -f1 || true
+        grep -oE 'https://[^"#]*' |
+        while IFS= read -r url; do
+            case ${url} in
+                */"${file}")
+                    printf '%s\n' "${url}"
+                    break
+                    ;;
+            esac
+        done || true
 }
 
 case "${1:-}" in

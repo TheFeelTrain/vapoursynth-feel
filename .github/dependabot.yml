@@ -1,0 +1,29 @@
+version: 2
+updates:
+  # Workflows pin actions to their moving major tags (`actions/checkout@v7`),
+  # which is what this keeps current. Grouped, so a bump round is one PR.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "CI"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # pyproject.toml + uv.lock (the `uv` ecosystem covers both). Monthly and
+  # grouped on purpose: the tree pins deliberately — the lint group's
+  # clang-format/clang-tidy are the versions the tree is formatted with, and
+  # VapourSynth is held at a pre-release — so each round is a decision, not a
+  # routine merge. `dev` holds the reference plugins the suite grades against,
+  # whose own releases move the benchmark.
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "deps"
+    groups:
+      uv:
+        patterns: ["*"]
