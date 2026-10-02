@@ -489,6 +489,11 @@ dependencies = [
     { name = "vapoursynth" },
 ]
 
+[package.optional-dependencies]
+jetpack = [
+    { name = "vsjetpack" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "hatchling" },
@@ -525,7 +530,11 @@ test = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "vapoursynth", specifier = ">=80" }]
+requires-dist = [
+    { name = "vapoursynth", specifier = ">=80" },
+    { name = "vsjetpack", marker = "extra == 'jetpack'", specifier = ">=2.2" },
+]
+provides-extras = ["jetpack"]
 
 [package.metadata.requires-dev]
 dev = [

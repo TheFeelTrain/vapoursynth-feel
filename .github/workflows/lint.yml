@@ -33,6 +33,19 @@ jobs:
       uses: astral-sh/setup-uv@v10.2.0
       with:
         enable-cache: true
+        # The project pins python-preference = "only-managed", and setup-uv does
+        # not cache managed interpreters by default, so every job downloads a
+        # ~35 MB CPython. Caching it also makes the lockfile check below cost
+        # about a second instead of an interpreter download.
+        cache-python: true
+
+    # A dependency edit (pyproject.toml, or any group) committed without a
+    # matching `uv lock` makes every --locked sync fail. This reports the same
+    # thing first, by name and before the venv is built: "The lockfile ...
+    # needs to be updated", "run `uv lock`". Same interpreter and resolution as
+    # the sync, so it cannot disagree with it.
+    - name: Check the lockfile is current
+      run: uv lock --check
 
     - name: Sync the lint environment
       run: uv sync --locked --no-default-groups --group lint
@@ -82,6 +95,12 @@ jobs:
       uses: astral-sh/setup-uv@v10.2.0
       with:
         enable-cache: true
+        cache-python: true
+
+    # Same guard as the lint job: a stale lock is named here rather than
+    # surfacing as a failure inside the sync.
+    - name: Check the lockfile is current
+      run: uv lock --check
 
     - name: Sync the test environment
       run: uv sync --locked --no-default-groups --group test
