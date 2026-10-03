@@ -189,13 +189,17 @@ foreach(component IN ITEMS shared plain)
     endforeach()
 endforeach()
 
-# BM3D: two single-entry files, no io variants (float only). bm3d_cas is the
-# same kernel with the aggregation on atomicCompSwap, for devices without
-# buffer float atomics; see src/bm3d.comp.
+# BM3D: an estimation kernel (float ring and float estimate stacks at every
+# input depth, so no io variant), an aggregation kernel per destination sample
+# type (16 int, 32 float), a copy-and-widen kernel for integer input, and a
+# _cas estimation variant with the accumulation on atomicCompSwap for devices
+# without buffer float atomics; see src/bm3d.comp.
 set(VK_BM3D_VARIANTS
     "bm3d|bm3d.comp|"
     "bm3d_cas|bm3d.comp|-DNO_FLOAT_ATOMICS"
-    "bm3d_agg|bm3d_agg.comp|")
+    "bm3d_agg_32|bm3d_agg.comp|-DBITS=32"
+    "bm3d_agg_16|bm3d_agg.comp|-DBITS=16"
+    "bm3d_copy16|bm3d_copy.comp|")
 
 # GaussBlur: one kernel with three entry points (fused small path + the two
 # large-path passes), per io variant (16 int, 32 float).

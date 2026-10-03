@@ -1,4 +1,6 @@
 #version 450
+// Native 16-bit samples in the destination plane.
+#extension GL_EXT_shader_16bit_storage : require
 
 /*
  * BM3D temporal aggregation kernel. For each output pixel, sums the
@@ -13,7 +15,23 @@
  * and column is 16-byte aligned). Scalar loads left the kernel bound by its
  * interleaved load streams rather than by bytes: the same bytes move in a
  * quarter of the instructions.
+ *
+ * -DBITS=16|32 selects the destination plane's element type. The estimate
+ * stacks and the source ring are float either way: the stacks hold the
+ * reference's weighted sums, and the ring is already widened at copy time (see
+ * bm3d_copy.comp), which is what keeps the matcher's inner loop free of a
+ * conversion per candidate sample.
  */
+
+#if !defined(BITS)
+#define BITS 32
+#endif
+
+#if BITS == 16
+#define PEAK 65535.0f
+#else
+#define PEAK 1.0f
+#endif
 
 layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
 
@@ -35,7 +53,13 @@ layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
 layout(std430, binding = 3) readonly buffer TagBuf { uint tags[]; };
 layout(std430, binding = 4) buffer SkipBuf { uint skipped[]; };
 layout(std430, binding = 5) buffer RefuseBuf { uint refusal[]; };
+// The destination plane keeps its vec4 form at depth 32 (the store stays one
+// 16-byte access per thread); at depth 16 it is four native samples.
+#if BITS == 16
+layout(std430, binding = 2) buffer DstBuf { uint16_t dst16[]; };
+#else
 layout(std430, binding = 2) buffer DstBuf { vec4 dst4[]; };
+#endif
 
 layout(push_constant) uniform PushConstants {
     int n;          // centre frame index
@@ -56,6 +80,24 @@ int slot_of(int m) {
         return pc.slot0;
     }
     return int(uint(m) % uint(RES_CAP));
+}
+
+// One accumulated result to a native output sample, or to a float if the clip
+// is float: the reference's Float2Int scales by 65535, adds 0.5, clips to the
+// format's [0, 65535] and truncates, `Clip(v * gain + 0.5, floor, ceil)`. The
+// clip is not optional -- the weight sums num/den can land an ulp above 1.0,
+// and a bare mask-and-truncate would wrap that to 0.
+void store_result(int x, int y, vec4 v) {
+#if BITS == 16
+    const int o = y * STRIDE + x;
+    const vec4 s = clamp(v * PEAK + 0.5f, vec4(0.0f), vec4(PEAK));
+    dst16[o + 0] = uint16_t(uint(s.x));
+    dst16[o + 1] = uint16_t(uint(s.y));
+    dst16[o + 2] = uint16_t(uint(s.z));
+    dst16[o + 3] = uint16_t(uint(s.w));
+#else
+    dst4[(y * STRIDE + x) >> 2] = v;
+#endif
 }
 
 void main() {
@@ -140,9 +182,12 @@ void main() {
         }
     }
     if (used > 0 && acw.x > 0.0 && acw.y > 0.0 && acw.z > 0.0 && acw.w > 0.0) {
-        dst4[o] = acc / acw;
+        store_result(x, y, acc / acw);
     } else {
+        // The fallback is the source frame's own pixel, to the same output
+        // scale as the rest of the frame.
         const int so = pc.src_base + y * STRIDE + x;
-        dst4[o] = vec4(src[so], src[so + 1], src[so + 2], src[so + 3]);
+        store_result(x, y,
+                     vec4(src[so], src[so + 1], src[so + 2], src[so + 3]));
     }
 }

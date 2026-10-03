@@ -172,6 +172,13 @@ struct BM3DData {
     VkDescriptorSetLayout set_layout {};
     VkPipelineLayout pipeline_layout {};
     int num_planes {}; // planes of the clip's format
+    // Sample type of the clip's own planes: 16 for an integer clip. The ring,
+    // the estimate stacks and every kernel's arithmetic are float either way;
+    // only the copy into the ring and the aggregation's store differ.
+    int bits {};
+    int elem_bytes {};
+    // Integer input only: widens each copied plane into the ring. Null otherwise.
+    VkPipeline copy_pipeline {};
     std::array<Bm3dPlane, 3> planes {};
     // One entry per processed plane, or a single one covering all three under
     // chroma=True. Every buffer a kernel reads lives in its entry.
@@ -249,8 +256,23 @@ struct BM3DData {
     int fault_frame { -1 };
     std::atomic<uint64_t> ht_acquire_ns {}, ht_source_ns {}, ht_est_ns {},
         ht_agg_ns {}, ht_release_ns {}, ht_total_ns {}, ht_n {};
+    std::atomic<uint64_t> ht_cpu_acquire {}, ht_cpu_source {}, ht_cpu_est {},
+        ht_cpu_agg {}, ht_cpu_release {}, ht_cpu_total {};
 
     ~BM3DData() {
+        if (host_timing && ht_n.load()) {
+            fprintf(
+                stderr,
+                "[bm3d-cpu] frames=%.0f per-frame CPU us: acquire=%7.1f "
+                "source=%7.1f est=%7.1f agg=%7.1f release=%7.1f total=%7.1f\n",
+                static_cast<double>(ht_n.load()),
+                ht_cpu_acquire.load() / 1000.0 / ht_n.load(),
+                ht_cpu_source.load() / 1000.0 / ht_n.load(),
+                ht_cpu_est.load() / 1000.0 / ht_n.load(),
+                ht_cpu_agg.load() / 1000.0 / ht_n.load(),
+                ht_cpu_release.load() / 1000.0 / ht_n.load(),
+                ht_cpu_total.load() / 1000.0 / ht_n.load());
+        }
         if (host_timing && ht_n.load()) {
             const double n = static_cast<double>(ht_n.load());
             fprintf(
@@ -276,6 +298,9 @@ struct BM3DData {
         }
         if (probe.query) {
             gpu->vk->vkDestroyQueryPool(dev, probe.query, nullptr);
+        }
+        if (copy_pipeline) {
+            gpu->vk->vkDestroyPipeline(dev, copy_pipeline, nullptr);
         }
         for (auto & g : groups) {
             gpu_destroy_buffer(*gpu, g.res);
@@ -449,6 +474,21 @@ create_agg_pipeline(const GPUDevice & gpu, const Bm3dPlane & plane,
                                &spec, static_cast<uint32_t>(entries.size()),
                                sizeof(spec), "bm3d_agg", 0,
                                GpuWorkgroup { .x = 32, .y = 8 });
+}
+
+// The copy-and-widen kernel an integer input needs: one linear range per source
+// plane, 256 threads per workgroup, no LDS. It declares the first two bindings
+// of the estimation kernels' set layout (source plane, ring) and an 8-byte
+// prefix of their push-constant block, so the same pipeline layout serves it.
+static std::variant<VkPipeline, std::string>
+create_copy_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
+                     const uint32_t * code, size_t code_size) {
+    // The name is unique per file on purpose: tools/shader_limits.py keys its
+    // workgroup table by variable name, so reusing `workgroup` here would
+    // shadow the estimation kernel's and report a false mismatch.
+    const GpuWorkgroup kCopyWorkgroup { .x = 256 };
+    return gpu_create_pipeline(gpu, code, code_size, layout, nullptr, nullptr,
+                               0, 0, "bm3d_copy", 0, kCopyWorkgroup);
 }
 
 // ---------------------------------------------------------------------------
@@ -969,12 +1009,30 @@ struct Bm3dWindowCopy {
 // dispatches may need, clamped to [n-2r, n+2r]) into each entry's src ring.
 // Every entry packs [clip][plane] per slot, so a plane is one `pe` hop away and
 // the slot stride spans the entry's planes.
+//
+// The ring is float at both input depths: an integer clip's samples are widened
+// once, here, by bm3d_copy16 rather than on every load in the matcher (see that
+// shader). Offsets are in elements, so the destination stride stays the source
+// plane's element stride and the copy is one linear range either way.
 static void record_src_copies(BM3DData * d, const Bm3dFrame & fr,
                               VkCommandBuffer cmd,
                               const std::vector<Bm3dWindowCopy> & window) {
     const int clips = d->final ? 2 : 1;
     const auto copy_plane = [&](VkBuffer src, VkBuffer dst, VkDeviceSize offset,
                                 VkDeviceSize bytes) {
+        if (d->bits == 16) {
+            const uint32_t count = static_cast<uint32_t>(bytes);
+            const uint32_t off = static_cast<uint32_t>(offset);
+            const VkBuffer bufs[2] { src, dst };
+            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                          d->copy_pipeline);
+            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, bufs, 2);
+            const uint32_t pushes[2] { off, count };
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, pushes,
+                               sizeof(pushes));
+            d->gpu->vk->vkCmdDispatch(cmd, (count + 255u) / 256u, 1, 1);
+            return;
+        }
         VkBufferCopy2 region {};
         region.sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2;
         region.srcOffset = 0;
@@ -1270,6 +1328,13 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
         // at creation, so there is nothing further to do for a skipped one.
 
         vsfeel_trace_frame_begin();
+        const auto cpu_now = [] {
+            struct timespec ts {};
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+            return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+                   static_cast<uint64_t>(ts.tv_nsec);
+        };
+        auto c0 = d->host_timing ? cpu_now() : 0ull;
         auto t0 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
         vsfeel_trace_mark("acquire");
@@ -1291,6 +1356,7 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
         // waiting).
         Bm3dFrame fr;
         acquire_cache(d, fr, n);
+        auto c_t1 = d->host_timing ? cpu_now() : 0ull;
         auto t1 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
 
@@ -1366,6 +1432,7 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
                 sources.push_back(rsrc);
             }
         }
+        auto c_t2 = d->host_timing ? cpu_now() : 0ull;
         auto t2 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
 
@@ -1461,6 +1528,7 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
             vsapi->freeFrame(f);
         }
         sources.clear();
+        auto c_t3 = d->host_timing ? cpu_now() : 0ull;
         auto t3 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
         // Everything this frame wrote is in the queue now, so a reader may go
@@ -1495,6 +1563,7 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
                                        sizeof(aerr))) {
             return set_error("aggregation submit failed: "s + aerr);
         }
+        auto c_t4 = d->host_timing ? cpu_now() : 0ull;
         auto t4 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
         if (d->trace) {
@@ -1552,6 +1621,7 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
         // frame's recompute is ordered after it by the queue, and its leading
         // barrier completes the ordering.
         release_cache(d, fr);
+        auto c_t5 = d->host_timing ? cpu_now() : 0ull;
         auto t5 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
 
@@ -1567,6 +1637,12 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
             d->ht_agg_ns += us(t3, t4);
             d->ht_release_ns += us(t4, t5);
             d->ht_total_ns += us(t0, t5);
+            d->ht_cpu_acquire += c_t1 - c0;
+            d->ht_cpu_source += c_t2 - c_t1;
+            d->ht_cpu_est += c_t3 - c_t2;
+            d->ht_cpu_agg += c_t4 - c_t3;
+            d->ht_cpu_release += c_t5 - c_t4;
+            d->ht_cpu_total += c_t5 - c0;
             d->ht_n.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -1675,10 +1751,15 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     }
 
     if (d->vi->width <= 0 || d->vi->height <= 0 ||
-        d->vi->format.sampleType != stFloat ||
-        d->vi->format.bitsPerSample != 32) {
-        return set_error("only constant format 32 bit float input supported");
+        !((d->vi->format.sampleType == stFloat &&
+           d->vi->format.bitsPerSample == 32) ||
+          (d->vi->format.sampleType == stInteger &&
+           d->vi->format.bitsPerSample == 16))) {
+        return set_error("only constant format 16 bit integer or 32 bit float "
+                         "input supported");
     }
+    d->bits = d->vi->format.bitsPerSample;
+    d->elem_bytes = d->bits / 8;
 
     if (d->vi->format.colorFamily != cfGray &&
         d->vi->format.colorFamily != cfYUV &&
@@ -1972,7 +2053,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         }
         for (int plane = 0; plane < d->num_planes; ++plane) {
             plane_stride_elems[plane] = static_cast<int>(
-                vsapi->getStride(probe, plane) / sizeof(float));
+                vsapi->getStride(probe, plane) / d->elem_bytes);
         }
         vsapi->freeFrame(probe);
     }
@@ -2065,7 +2146,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         if (g.src_size > static_cast<VkDeviceSize>(INT32_MAX)) {
             char msg[256];
             snprintf(msg, sizeof(msg),
-                     "frame is too large: the source ring needs %llu floats "
+                     "frame is too large: the source ring needs %llu samples "
                      "(radius %d), which overflows the 32-bit kernel "
                      "addressing; reduce radius",
                      static_cast<unsigned long long>(g.src_size), d->radius);
@@ -2230,6 +2311,15 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // pipelines: one estimation pipeline per entry (its planes share the
     // geometry and the search parameters, only the sigmas differ) and one
     // aggregation pipeline per processed plane.
+    if (d->bits == 16) {
+        const auto result = create_copy_pipeline(
+            *d->gpu, d->pipeline_layout, bm3d_copy16_spv, bm3d_copy16_spv_size);
+        if (std::holds_alternative<std::string>(result)) {
+            return set_error(std::get<std::string>(result));
+        }
+        d->copy_pipeline = std::get<VkPipeline>(result);
+    }
+
     for (int gi = 0; gi < d->n_groups; ++gi) {
         auto & g = d->groups[gi];
         const auto & first = d->planes[g.planes[0]];
@@ -2254,8 +2344,13 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
                 continue; // a joint entry's skipped plane is never dispatched
             }
             const auto result =
-                create_agg_pipeline(*d->gpu, p, g, *d, bm3d_agg_spv,
-                                    bm3d_agg_spv_size, d->pipeline_layout);
+                d->bits == 16
+                    ? create_agg_pipeline(*d->gpu, p, g, *d, bm3d_agg_16_spv,
+                                          bm3d_agg_16_spv_size,
+                                          d->pipeline_layout)
+                    : create_agg_pipeline(*d->gpu, p, g, *d, bm3d_agg_32_spv,
+                                          bm3d_agg_32_spv_size,
+                                          d->pipeline_layout);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -2282,17 +2377,18 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // download buffer. Gated by an env flag so a normal creation prints nothing.
     if (vsfeel_debug_flag("VSFEEL_BM3D_VRAM")) {
         const double mib = 1024.0 * 1024.0;
-        const double total = static_cast<double>(src_total + res_total) * 4.0;
+        const double src_bytes = static_cast<double>(src_total) * 4.0;
+        const double res_bytes = static_cast<double>(res_total) * 4.0;
+        const double total = src_bytes + res_bytes;
         fprintf(
             stderr,
             "[bm3d] vram: src=%.1f MiB res=%.1f MiB (%.0f%% of total) -> total=%.1f MiB "
             "(planes=%d entries=%d radius=%d inflight=%d res_cap=%d src_ring=%d "
-            "stride=%d)\n",
-            static_cast<double>(src_total) * 4.0 / mib,
-            static_cast<double>(res_total) * 4.0 / mib,
+            "stride=%d bits=%d)\n",
+            src_bytes / mib, res_bytes / mib,
             100.0 * static_cast<double>(res_total) / (total > 0 ? total : 1.0),
             total / mib, d->num_planes, d->n_groups, d->radius, kInflightFrames,
-            res_cap, src_ring, d->planes[0].stride);
+            res_cap, src_ring, d->planes[0].stride, d->bits);
     }
 
     d->chunk0_value.assign(static_cast<size_t>(d->nframes), 0);

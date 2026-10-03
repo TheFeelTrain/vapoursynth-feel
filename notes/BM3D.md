@@ -30,21 +30,42 @@ Scoreboard — 1080p jpbd, `tools/benchmark.py -f bm3dv2`, harness defaults
 
 | | fps | |
 |---|---|---|
-| vsfeel | **942** | mawen matcher and filtering |
-| bm3dvk | 296 | fixed 8-member groups |
-| vszipcl | 133 | |
+| vsfeel | **952** | mawen matcher and filtering |
+| vsfeel, 16 bit in | **970** | same kernels, half the io bytes |
+| bm3dvk | 295 | fixed 8-member groups |
+| vszipcl | 136 | |
 
-3.2x the faster reference, but not on equal work: they always group eight while
-the default threshold accepts ~80% of candidates here and the top-eight
-selection does the filtering. vsfeel was 845 fps before the bookkeeping round
-below; the reference columns are the same session as the 942 and swing with the
-box like everything else here (bm3dvk measured 237 in an earlier one).
+vsfeel's median over five runs was 952 (921-957); the reference columns are one
+run from the same session and swing with the box like everything else here
+(bm3dvk measured 237 in an earlier one). 3.2x the faster reference, but not on
+equal work: they always group eight while the default threshold accepts ~80% of
+candidates here and the top-eight selection does the filtering. vsfeel was 845
+fps before the bookkeeping round below. The 16 bit row is a same-session pair
+against fp32 (970 vs 932 fps, `--bits 16` against `--bits 32`, 1000 frames x3
+each, interleaved).
+
+16 bit input is the same filter, not a second one: the ring, the estimate
+stacks and every kernel's arithmetic are float at both depths, an integer
+clip's samples are widened once when they are copied into the ring, and the
+aggregation rounds its result back to native samples. A 16 bit chain therefore
+also drops the caller's `depth()` conversion node and uploads half the bytes,
+which is where the visible speedup is (see Performance).
 
 ## Implementation
 
-- Two kernels: `bm3d.comp` (match, group, collaborative transform; one warp of
-  32 lanes = four 8-lane groups, one 8x8 block each) and `bm3d_agg.comp`
-  (aggregation over the TW = 2r+1 stack slices).
+- Three kernels: `bm3d.comp` (match, group, collaborative transform; one warp of
+  32 lanes = four 8-lane groups, one 8x8 block each), `bm3d_agg.comp`
+  (aggregation over the TW = 2r+1 stack slices) and `bm3d_copy.comp`, which
+  widens an integer clip's planes into the ring as it copies them (gain 1/65535
+  with no offset, the reference's `Int2Float`). Only the aggregation's store is
+  depth-specific (`-DBITS`), rounding with the reference's `Float2Int`:
+  `clamp(v * 65535 + 0.5, 0, 65535)` then truncate. The clamp is load-bearing,
+  a weight sum can land an ulp above 1.0 and a bare mask would wrap it to 0.
+- A 16 bit clip is **full range**, like the fp32 path and every other vsfeel
+  filter. The CPU reference instead scales an *integer* clip by the frame's
+  `_Range` property, limited range mapping `[16<<(b-8), 235<<(b-8)]` to `[0, 1]`
+  and clipping the output back, so the two sides only meet in one domain on a
+  `_Range=1` clip and the comparison tests pin it.
 - One entry per processed plane, or one over all three planes of a 4:4:4 clip
   under `chroma=True`. An entry owns a source ring and an estimate stack laid out
   `[slot][clip][plane][h][stride]` and `[slot][plane][tw][2][h][stride]`; an
@@ -77,9 +98,11 @@ box like everything else here (bm3dvk measured 237 in an earlier one).
   shared memory: every lane of a group reads all of them, and a register array
   indexed by a runtime count would spill to scratch. The seeds of the earlier
   predictive windows are read into registers once per window, not per candidate.
-- Each walk evaluates four candidates per iteration (stride 32), so the
-  scheduler has four independent load chains in flight; the walk state is
-  stepped between the candidates so a row wrap lands correctly.
+- Each walk evaluates one candidate per iteration through the shared
+  `scan_cand` helper (skip the reference origin, SSD, threshold, insert).
+  Unrolling the walk to two or four candidates per iteration was tried and
+  lost: it buys load-level parallelism but costs a wave of occupancy, and the
+  loop is latency-bound, not issue-bound (see Performance).
 - The group keeps concatenation order until it overflows past eight, and only
   then keeps the reference plus the best seven of the tail. Each frame's list is
   consumed best-first and an overflowing group's tail is sorted, so the loop
@@ -138,26 +161,66 @@ box like everything else here (bm3dvk measured 237 in an earlier one).
 ## Performance
 
 - **The candidate bookkeeping, not the SSD, was the cost.** A per-candidate
-  ablation ladder on the estimation kernel (fps, 1080p jpd, harness config)
-  prices the pieces as: search 42% of the frame, estimate/transform 12.5%,
-  aggregation 13%, slot zero-fill ~2%. Removing the SSD itself is worth 32%.
-  The load-bearing discovery is that every piece of per-candidate code is
-  if-converted: the warp pays the insert's ~90 instructions whenever *any* lane
-  passes the gate, so per-lane gating buys nothing on its own.
-- The bookkeeping round (same config, 1000 frames x3): **845 -> 941 fps**. The
-  four changes, each verified by an interleaved same-binary A/B over 1200-2000
-  frames: the ownership test's LDS seeds became registers (its 8 LDS loads each
-  carried a full `lgkmcnt(0)` drain, per candidate); the merge became a
-  shuffle tournament; the per-lane lists moved out of LDS entirely; the walk
-  evaluates four candidates per iteration.
+  ablation ladder on the estimation kernel (fps, 1080p jpbd, harness config)
+  prices the pieces as: search ~29% of the frame, estimate/transform 8.7%,
+  aggregation ~13%, slot zero-fill ~2%. The load-bearing discovery is that every
+  piece of per-candidate code is if-converted: the warp pays the insert's ~80
+  instructions whenever *any* lane passes the gate, so per-lane gating buys
+  nothing on its own. `gpu_busy_percent` is 100% through a default-config run
+  (and ~10% during the harness's cache preload, which is what a mistimed poll
+  sees), so the frame really is GPU-bound and kernel work is what pays.
+- The bookkeeping round (1000 frames x3): **845 -> 952 fps** (median of five). Changes, each
+  verified by a fine-interleaved same-binary A/B over 2000-frame runs: the
+  ownership test's LDS seeds became registers (its 8 LDS loads each carried a
+  full `lgkmcnt(0)` drain, per candidate); the merge became a shuffle
+  tournament; the per-lane candidate lists left shared memory for registers
+  (which also removed the barriers around them); the walks share one
+  `scan_cand` helper; `group_add` stops at the first entry that cannot beat an
+  overflowed group's worst.
+- **Do not unroll the walk.** The loop body is 309 instructions per candidate
+  (SSD 45%, insert 27%, addressing 9%, waits 6%, scheduler `s_delay_alu` 14%),
+  and evaluating several candidates per iteration only raises the register
+  count: 1-wide is 168 VGPRs / 9 waves/SIMD, 2-wide 192 / 8, 4-wide 192 / 8.
+  Fine-interleaved A/B: 1-wide beats 2-wide by 1.6% and 4-wide by 2.7%. The
+  earlier "the unroll helps" readings were taken against a baselines that had
+  drifted (see Method rules).
+- **A u16 ring is a pessimisation; widen at copy time (+3%, and the u16 filter
+  would otherwise be 15% slower).** The first 16 bit build kept the ring in u16
+  and widened on load. That kernel's whole job is the SSD: each source sample is
+  re-read once per candidate origin (~500 per 8x8 block) out of an L1-resident
+  26x26 window, so halving the bytes saves no DRAM traffic at all while the load
+  path grows from 3 issue slots per sample (load, `v_dual_sub_f32`, `v_fmac`) to
+  ~6 (the vectorized `buffer_load_b128` plus `v_alignbyte`/`v_lshrrev`/
+  `v_cvt_u32_u16` extraction, then cvt, mul, sub, fma) -- ISA counts confirm it:
+  same 241 VMEM, +636 VALU, +20% inverse throughput. Measured in one scratch A/B
+  (1080p jpbd, r=2, 800 frames x3): estimation kernel 0.95 -> 1.27 ms, filter 747
+  -> 644 fps. Widening in the copy kernel instead
+  pays it on 2.07M samples per frame rather than on every candidate read, and
+  turns the halved io into a win: 970 fps against fp32's 932 (`tools/benchmark.py
+  -f bm3dv2 --bits 16`, 1000 frames x3, same session, interleaved). A real 16 bit
+  chain -- cached 16 bit source, no `depth()` node, half the upload -- is 846 vs
+  634 fps in a same-harness A/B (1080p jpbd, r=2, 600 frames x3, screen; the fp32
+  arm pays its conversion inside the timed region, the u16 arm does not).
+- Other denoisers gain more from u16 and for the same reason: their kernels
+  stream each byte once or twice with a handful of ALU ops per tap, so halving
+  the bytes is nearly free (same harness, same cached source, 1080p:
+  GaussBlur 2284 vs 1093, DFTTest 1132 vs 911, NLMeans 243 vs 221). BM3D's
+  matcher is the opposite end -- ~3 ALU ops per sample per candidate against
+  bytes that are already L1-resident -- so its u16 win is the io alone, and its
+  88% of per-frame bytes that are *not* io (the float estimate stacks and the
+  float atomic accumulation, both required by the reference's 16 bit output)
+  cannot be narrowed.
 - Marginal cost per candidate per lane: 0.0032 ms (`bm_range`), 0.0030
   (`ps_range`), with a ~1.4-2.0 ms intercept at tiny windows.
 - **LDS is a trap here.** Three attempts to move kernel-live data into shared
   memory each raised VGPRs 216 -> 240 and dropped occupancy 7 -> 6 waves/SIMD,
   losing 5-90%: the cost is dynamic LDS addressing, not traffic. The wins came
-  from reducing the data instead. A fourth attempt (the reference patch, 64
-  registers per lane, in `l_cur`) cost 3.5% for the same reason: 64 extra LDS
-  reads per candidate beat the 64 registers it freed.
+  from reducing the data instead. Two more attempts confirmed it: the reference
+  patch (64 registers per lane) in `l_cur` cost 3.5%, and the group arrays
+  (`g_e`/`g_xy`/`g_z`, 24 registers) in shared memory cost 5.8% even though they
+  cut VGPRs 192 -> 144 (8 -> 10 waves) and code size 118 -> 80 KB: the group
+  assembly is a serial chain of dynamic-index accesses, and LDS latency in that
+  chain costs more than the occupancy buys.
 - Colour costs the planes: 4:2:0 is 1.5x the luma-only estimate/source footprint
   and 4:4:4/RGB 3x, all inside the same `maxStorageBufferRange` budget.
 - The multi-plane round did not move the luma path (NPLANES == 1: 6131 vs 6133
@@ -167,7 +230,14 @@ box like everything else here (bm3dvk measured 237 in an earlier one).
 
 Chronological; each entry keeps the mechanism, not the story.
 
-- **2026-10-03 — the search's bookkeeping was the whole cost (+11%).** The
+- **2026-10-03 — 16 bit input ships as a fp32 ring widened at copy time.** The
+  u16-ring build and the mechanism behind its 15% loss are under Performance.
+  Three kernels now (`bm3d_copy.comp` is new), `-DBITS` only on the
+  aggregation's store, and the reference's 16 bit output is the oracle
+  (`VAggregate(sample=INTEGER)`, `Basic` at radius 0). The u16 tests pin that
+  output to the fp32 one rounded, within the aggregation's one-code jitter, over
+  five configurations.
+- **2026-10-03 — the search's bookkeeping was the whole cost (+12%).** The
   matcher's per-candidate work is dominated by code that if-converts, so the
   fix was to shrink it, not to gate it:
   - the union's ownership test read `s_x`/`s_y` per candidate, 8 LDS loads each
@@ -181,16 +251,26 @@ Chronological; each entry keeps the mechanism, not the story.
     `l_e`/`l_xy` arrays at all;
   - `insert_cand`'s position scan plus two-array shift became one compare-
     exchange per slot;
-  - the walks evaluate four candidates per iteration (stride 32), which gives
-    the scheduler independent load chains; 2-wide was worth ~1% over 1-wide,
-    4-wide another ~1%;
   - `group_add` bails out of a frame's list once an entry cannot beat the
     overflowing group's worst (the list is ascending, so the rest cannot
-    either). Each is exact: the merged order is still `(error, y, x)`, the seeds
-    and `count` are unchanged, and the full BM3D test suite passes.
-  - Not taken: reordering the group-key compare to drop the `xy` tie-break
-    (invalid for the temporal walk, whose union enumeration is not in scan
-    order), and moving the reference patch to LDS (see Performance).
+    either).
+  Each is exact: the merged order is still `(error, y, x)`, the seeds and
+  `count` are unchanged, and the full BM3D test suite passes.
+- **2026-10-03 — the walk unroll was a mis-read, and 1-wide is the shape that
+  ships.** Unrolling looked like a win against baselines that had drifted
+  between builds (an ABBA whose arm order tracked a monotonic drift, and later
+  an A/B arm that `git show HEAD:src/bm3d.comp` had quietly turned into a copy
+  of the optimized kernel once the work was committed). Re-measured with the
+  unroll as the *only* difference and the arms fine-interleaved in one binary:
+  1-wide 168 VGPRs/9 waves beats 2-wide 192/8 by 1.6% and 4-wide 192/8 by 2.7%.
+  The final verification, 1-wide production vs the pre-round kernel, 8 samples
+  per arm: 877 vs 803 fps, no overlap.
+- **2026-10-03 — not taken.** Reordering the group-key compare to drop the `xy`
+  tie-break (invalid for the temporal walk, whose union enumeration is not in
+  scan order); dropping the layout-restoring transposes from the collaborative
+  filter (it moves the Wiener `sum coeff^2` grouping to different coefficients,
+  a rounding change for ~2% of the frame); moving the reference patch or the
+  group arrays to LDS (see Performance).
 
 - **2026-10-02 — the CPU oracle was a stale build; the residual is the tie
   order.** PyPI's 10.1 predates `reference/` (upstream force-pushed the
@@ -340,9 +420,23 @@ Chronological; each entry keeps the mechanism, not the story.
 
 ### Method rules
 
-- Grade kernel changes on `VSFEEL_BM3D_GPUTRACE=1` at `-r 1` over a few hundred
-  frames (the printed value settles to ±0.2%), then confirm with an interleaved
-  `tools/benchmark.py` pair over 1000+ frames.
+- **Put both kernels in one binary and alternate runs seconds apart.** A
+  build-per-arm ABBA is not enough: the box drifts 5-10% over tens of minutes,
+  nonlinearly, so arms that are minutes apart are not comparable (the same
+  A/B read +7.3% one session, +0.7% the next, and -3% under the real harness).
+  Two variants in one `.so`, selected by an env var at creation, alternate in
+  ~4 s; the drift then cancels and 8 samples per arm separate a 2% effect.
+  Remove the scaffolding before finishing.
+- `git show HEAD:<file>` is the *committed* file: after the work is committed it
+  silently returns the new code, and an A/B "against the original" becomes a
+  comparison of the kernel with itself. Keep the original under `.scratch/`.
+- Grade with `tools/benchmark.py` (median of 3 x 1000 frames) for the number
+  that matters, and with a fine-interleaved A/B for the decision. The screen's
+  numbers track the harness's within its spread, once the vpy matches (same
+  `cache_frames`/`cache_conv`, no `--gpu-cache`).
+- A single `gpu_busy_percent` sample is meaningless: during a timed run the GPU
+  is at 100%, but a poll taken a second late sees the harness's cache preload
+  (10%). Sample in a loop and keep the maximum.
 - Interleave ABBA within a round before reading any difference under ~3%: this
   harness swings ±5-10% per invocation even for one binary.
 - Radius limits are geometry-dependent: check 1080p before quoting a cap (7

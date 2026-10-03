@@ -9,6 +9,7 @@ were made visible to the aggregation kernel).
 Run from the repository root:  uv run python -m pytest tests/test_bm3dv2.py
 """
 
+import ctypes
 import json
 import os
 import re
@@ -25,6 +26,7 @@ from conftest import (
     CLIP_PATH,
     COMPARE_PRELUDE,
     ReferenceUnavailable,
+    assert_all_frames_finite,
     assert_preserves_frame_props,
     assert_temporal_order_consistent,
     check_all_frames_finite,
@@ -1191,6 +1193,10 @@ kind = spec["clip"]
 feel = dict(spec["kwargs"])
 frames = spec["frames"]
 stage = spec["stage"]
+# "int16": both sides produce 16 bit integer output -- vsfeel's u16 path and the
+# CPU's VAggregate(sample=INTEGER) / Basic -- so every plane is read back as
+# samples scaled into [0, 1] and one bound covers both input depths.
+int16 = spec.get("sample") == "int16"
 planes = None
 
 source = core.bs.VideoSource(spec["source"])
@@ -1203,13 +1209,29 @@ elif kind == "yuv444_32":
     clip = core.resize.Bicubic(source, format=vs.YUV444PS)
 elif kind == "rgb32":
     clip = core.resize.Bicubic(source, format=vs.RGBS, matrix_in_s="709")
+elif kind == "gray16":
+    clip = core.fmtc.bitdepth(core.std.ShufflePlanes(source, 0, vs.GRAY), bits=16,
+                              fulls=True, fulld=True)
+elif kind == "yuv444_16":
+    clip = core.resize.Bicubic(source, format=vs.YUV444P16)
 else:
     raise SystemExit("bad clip kind %r" % kind)
+if int16:
+    # The CPU scales an *integer* clip by the frame's _Range: limited (or
+    # absent) maps [16 << (b-8), 235 << (b-8)] to [0, 1] and clips the output
+    # back. vsfeel's u16 path is full range, like its fp32 one and like every
+    # other vsfeel filter, so the two sides only meet in the same domain on a
+    # full-range clip.
+    clip = core.std.SetFrameProp(clip, prop="_Range", intval=1)
 planes = list(range(clip.format.num_planes))
 
 
 def read_all(node, n):
-    return [read_plane(node.get_frame(n), p, np.float32) for p in planes]
+    frame = node.get_frame(n)
+    if frame.format.sample_type == vs.INTEGER:
+        return [read_plane(frame, p, np.uint16).astype(np.float64) / 65535.0
+                for p in planes]
+    return [read_plane(frame, p, np.float32) for p in planes]
 
 
 def vsfeel(clip, **kw):
@@ -1262,15 +1284,16 @@ if stage == "final":
         raise SystemExit(3)
 
 try:
+    sample = vs.INTEGER if int16 else vs.FLOAT
     if stage == "image":
         ref_node = core.bm3d.Basic(clip, **cpu)
     else:
         basic = core.bm3d.VBasic(clip, **cpu)
         if stage == "final":
             final = core.bm3d.VFinal(clip, ref=guide, **cpu)
-            ref_node = core.bm3d.VAggregate(final, radius=radius, sample=vs.FLOAT)
+            ref_node = core.bm3d.VAggregate(final, radius=radius, sample=sample)
         else:
-            ref_node = core.bm3d.VAggregate(basic, radius=radius, sample=vs.FLOAT)
+            ref_node = core.bm3d.VAggregate(basic, radius=radius, sample=sample)
     ref_frames = [read_all(ref_node, n) for n in frames]
 except Exception as exc:
     print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
@@ -1294,7 +1317,7 @@ print("RESULT " + json.dumps({"maxdiff": worst, "per_plane": per_plane}), flush=
 )
 
 
-def _cpu_compare(kwargs, stage="basic", clip="gray32", frames=(0, 11, 23)):
+def _cpu_compare(kwargs, stage="basic", clip="gray32", frames=(0, 11, 23), sample="float"):
     """Worst per-plane diff against the CPU implementation, in a subprocess."""
     if not _CPU_AVAILABLE:
         skip_or_fail_reference("the CPU bm3d plugin (Basic/VBasic/VAggregate) is not installed")
@@ -1304,6 +1327,7 @@ def _cpu_compare(kwargs, stage="basic", clip="gray32", frames=(0, 11, 23)):
         "frames": list(frames),
         "kwargs": dict(kwargs),
         "stage": stage,
+        "sample": sample,
     }
     return run_compare_subprocess(_CPU_SCRIPT, [json.dumps(spec)], timeout=1800)
 
@@ -1454,6 +1478,246 @@ def test_bm3dv2_color_ref_pass_matches_cpu():
         dict(BASE_KWARGS, sigma=[0.7, 0.0, 0.0]), stage="final", clip="yuv444_32"
     )
     assert payload["per_plane"][0] < 1e-3, f"colour final pass vs CPU: {payload}"
+
+
+# ---------------------------------------------------------------------------
+# 16 bit integer input
+# ---------------------------------------------------------------------------
+#
+# The u16 path is the fp32 path with a different transport: the source ring and
+# the estimate stacks hold float at both depths, an integer clip's samples are
+# widened once when the ring is filled (gain 1/65535 with no offset, the
+# reference's Int2Float), and the aggregation rounds its result back to native
+# samples (its Float2Int). Nothing about the algorithm changes, which is why it
+# is graded against the fp32 comparisons' own bounds.
+#
+# The oracle is the CPU plugin's 16 bit output: VBasic + VAggregate at
+# sample=INTEGER, or plain Basic at radius 0. The CPU scales an *integer* clip
+# by the frame's _Range property (limited range maps [4096, 60160] to [0, 1]
+# and clips the output back), so _CPU_SCRIPT pins _Range=1: vsfeel's u16 path
+# is full range, like its fp32 path and every other vsfeel filter, and the two
+# sides only meet in the same domain on a full-range clip.
+
+U16_BASE = BASE_KWARGS
+
+
+def _std_args(**kwargs):
+    """The module's standard test arguments, with `kwargs` overriding them."""
+    args = dict(
+        sigma=SIGMA,
+        radius=2,
+        bm_range=BM_RANGE,
+        ps_range=PS_RANGE,
+        block_step=BLOCK_STEP,
+    )
+    args.update(kwargs)
+    return args
+
+
+def _run16(clip, **kwargs):
+    """BM3Dv2 at the standard test arguments (depth-agnostic: the fp32 arm of
+    the equivalence test below uses it too, on a widened clip)."""
+    return BM3D(clip, **_std_args(**kwargs))
+
+
+def _u16_compare(kwargs, stage="basic", clip="gray16", frames=(0, 11, 23)):
+    return _cpu_compare(
+        dict(U16_BASE, **kwargs), stage=stage, clip=clip, frames=frames, sample="int16"
+    )
+
+
+# Measured like RADIUS_CASES above, on the same clip and frames, with the
+# u16 arm in place of the fp32 one: the residual is the CPU's tie order, the
+# same one the fp32 comparisons carry, plus at most one output code.
+U16_CASES = [
+    # (radius, stage, bound, measured)
+    (0, "image", 4e-3, 0.00113),
+    (1, "basic", 4e-3, 0.00116),
+    (2, "basic", 4e-3, 0.00116),
+    (4, "basic", 4e-3, 0.00119),
+]
+
+
+@pytest.mark.parametrize(
+    "radius,stage,bound,measured", U16_CASES, ids=[f"r{c[0]}" for c in U16_CASES]
+)
+def test_bm3dv2_u16_matches_cpu(clip_16bit, radius, stage, bound, measured):
+    """Every supported radius must track the CPU's 16 bit output."""
+    payload = _u16_compare(dict(radius=radius), stage=stage)
+    assert payload["maxdiff"] < bound, f"u16 radius {radius} vs CPU: {payload} (was {measured})"
+
+
+U16_SWEEP = [
+    # (kwargs, bound, measured)
+    ({}, 3e-3, 0.00116),
+    ({"sigma": 1.5}, 6e-3, 0.00272),
+    ({"sigma": 0.3}, 2e-3, 0.00055),
+    ({"block_step": 1}, 1.5e-3, 0.00041),
+    ({"block_step": 8}, 8e-3, 0.00327),
+    ({"bm_range": 4}, 3e-3, 0.00117),
+    ({"ps_range": 9}, 3e-3, 0.00131),
+    ({"ps_num": 5}, 3e-3, 0.00102),
+    ({"th_mse": 1200.0}, 3e-3, 0.00116),
+]
+
+
+@pytest.mark.parametrize(
+    "cfg,bound,measured", U16_SWEEP, ids=[_sweep_id(c) for c, _, _ in U16_SWEEP]
+)
+def test_bm3dv2_u16_parameter_sweep_matches_cpu(clip_16bit, cfg, bound, measured):
+    """The parameter grid around the defaults, on an integer clip."""
+    payload = _u16_compare(cfg)
+    assert payload["maxdiff"] < bound, f"u16 max diff vs CPU ({cfg}): {payload} (was {measured})"
+
+
+def test_bm3dv2_u16_final_stage_matches_cpu(clip_16bit):
+    """The Wiener pass on an integer clip, both sides driven by the same guide.
+
+    The guide is vsfeel's own u16 basic estimate, so this isolates the final
+    stage's matching and shrinkage from any basic-stage difference -- and it
+    also exercises the second ring section (the `ref` clip is widened by the
+    same copy kernel as the source)."""
+    payload = _u16_compare({}, stage="final")
+    assert payload["maxdiff"] < 1e-3, f"u16 final pass vs CPU: {payload} (was 0.00062)"
+
+
+def test_bm3dv2_u16_joint_chroma_matches_cpu():
+    """The joint 4:4:4 entry on an integer clip.
+
+    Same close-but-not-exact chroma domain as the fp32 colour test: the CPU
+    scales each plane's sigma by that plane's matrix norm, vsfeel carries
+    normY for all three."""
+    payload = _u16_compare({"sigma": [0.7, 0.7, 0.7]}, clip="yuv444_16")
+    assert payload["maxdiff"] < 1.5e-2, f"u16 joint chroma vs CPU: {payload}"
+
+
+def _widen_to_floats(clip16):
+    """The exact floats the ring copy produces for each sample.
+
+    bm3d_copy16 writes `float(int(sample)) * (1.0f / 65535.0f)`; reproducing it
+    in numpy (one float32 multiply of the same two operands) is what makes the
+    fp32 arm below see bit-identical data, and therefore what makes the
+    equality assertion meaningful rather than a tolerance.
+    """
+    scale = np.float32(1.0 / 65535.0)
+    base = clip16.resize.Point(format=vs.GRAYS)
+
+    def widen(n, f):
+        src, tmpl = f
+        out = tmpl.copy()
+        raw = np.ctypeslib.as_array(
+            ctypes.cast(out.get_write_ptr(0), ctypes.POINTER(ctypes.c_uint8)),
+            shape=(out.height, out.get_stride(0)),
+        )
+        s = np.ctypeslib.as_array(
+            ctypes.cast(src.get_read_ptr(0), ctypes.POINTER(ctypes.c_uint8)),
+            shape=(src.height, src.get_stride(0)),
+        )
+        u = s[:, : src.width * 2].copy().view(np.uint16)
+        raw[:, : out.width * 4].view(np.float32)[:] = u.astype(np.float32) * scale
+        return out
+
+    return vs.core.std.ModifyFrame(base, [clip16, base], widen)
+
+
+def _u16_path_is_the_fp32_path(clip16, **kwargs):
+    """u16 output vs the fp32 output on widened input, in whole codes."""
+    u16_out = _run16(clip16, **kwargs)
+    f32_out = BM3D(_widen_to_floats(clip16), **_std_args(**kwargs))
+    worst = 0
+    for n in (0, 11, 23):
+        a = plane_to_ndarray(u16_out.get_frame(n), 0, np.uint16).astype(np.int32)
+        v = plane_to_ndarray(f32_out.get_frame(n), 0, np.float32)
+        b = np.floor(
+            np.clip(
+                v * np.float32(65535.0) + np.float32(0.5),
+                np.float32(0.0),
+                np.float32(65535.0),
+            )
+        ).astype(np.int32)
+        worst = max(worst, int(np.abs(a - b).max()))
+    return worst
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"sigma": 1.5}, {"radius": 0}, {"block_step": 1}, {"extractor_exp": 1}],
+    ids=["default", "sigma1.5", "radius0", "block_step1", "extractor"],
+)
+def test_bm3dv2_u16_is_the_fp32_path_with_a_rounded_store(clip_16bit, kwargs):
+    """The u16 output must be the fp32 result, rounded to native samples.
+
+    Both arms run the same estimation kernel over bit-identical floats (the
+    fp32 arm is fed exactly what the copy kernel widens the integer clip to),
+    so the only admissible difference is the store's rounding plus the
+    aggregation's accumulation order -- and the latter is already known to
+    jitter by one code between runs (the fp32 self-consistency tests carry
+    it). Measured: 1 code at every configuration here, which this pins: a
+    wrong gain, offset, clamp or rounding would show up as thousands.
+    """
+    worst = _u16_path_is_the_fp32_path(clip_16bit, **kwargs)
+    assert worst <= 1, f"u16 output is not the fp32 result rounded ({kwargs}): {worst} codes"
+
+
+def test_bm3dv2_u16_output_is_16_bit_and_keeps_props(clip_16bit):
+    """An integer clip stays integer, keeps its frame properties, and changes."""
+    out = _run16(clip_16bit)
+    fmt = out.format
+    assert fmt.sample_type == vs.INTEGER and fmt.bits_per_sample == 16
+    assert_all_frames_finite(out)
+    src = plane_to_ndarray(clip_16bit.get_frame(11), 0, np.uint16).astype(np.int32)
+    got = plane_to_ndarray(out.get_frame(11), 0, np.uint16).astype(np.int32)
+    assert np.abs(got - src).max() > 8, "the u16 path did not denoise"
+    assert_preserves_frame_props(_run16, clip_16bit, radius=2)
+
+
+def test_bm3dv2_u16_parallel_load_matches_serial(clip_16bit):
+    """The parallel request load must agree with the serial one, in codes."""
+    par = eval_parallel(_run16, clip_16bit, radius=2, dtype=np.uint16)
+    ref = _run16(clip_16bit, radius=2)
+    for n in range(clip_16bit.num_frames):
+        d = par[n].astype(np.int32) - plane_to_ndarray(ref.get_frame(n), 0, np.uint16).astype(
+            np.int32
+        )
+        assert np.abs(d).max() <= 1, f"u16 parallel/serial mismatch at frame {n}"
+
+
+def test_bm3dv2_u16_deterministic(clip_16bit):
+    """Two runs must agree within the aggregation's one-code jitter."""
+    a = eval_parallel(_run16, clip_16bit, radius=2, dtype=np.uint16)
+    b = eval_parallel(_run16, clip_16bit, radius=2, dtype=np.uint16)
+    for n in range(clip_16bit.num_frames):
+        d = np.abs(a[n].astype(np.int32) - b[n].astype(np.int32))
+        assert d.max() <= 1, f"u16 nondeterministic output at frame {n}"
+
+
+def test_bm3dv2_u16_cas_fallback_matches_hardware_atomics(clip_16bit, monkeypatch):
+    """The no-float-atomics accumulation must agree on an integer clip too."""
+    monkeypatch.setenv("VSFEEL_BM3D_CAS", "1")
+    a = _run16(clip_16bit, radius=2)
+    monkeypatch.delenv("VSFEEL_BM3D_CAS")
+    b = _run16(clip_16bit, radius=2)
+    for n in (0, 11, 23):
+        d = np.abs(
+            plane_to_ndarray(a.get_frame(n), 0, np.uint16).astype(np.int32)
+            - plane_to_ndarray(b.get_frame(n), 0, np.uint16).astype(np.int32)
+        )
+        assert d.max() <= 1, f"u16 CAS vs hardware atomics at frame {n}"
+
+
+def test_bm3dv2_u16_rejects_a_float_ref(clip_16bit, clip_gray):
+    """A \"ref\" of the other depth must be rejected up front."""
+    with pytest.raises(vs.Error):
+        _run16(clip_16bit, ref=_run(clip_gray, radius=2))
+
+
+def test_bm3dv2_u16_zero_sigma_returns_the_source(clip_16bit):
+    """All planes below epsilon hand the integer clip straight back."""
+    out = cpu_node(vs.core.vsfeel.BM3Dv2(clip_16bit, sigma=0.0))
+    assert out.format.id == clip_16bit.format.id
+    a = plane_to_ndarray(out.get_frame(3), 0, np.uint16)
+    b = plane_to_ndarray(cpu_node(clip_16bit).get_frame(3), 0, np.uint16)
+    assert np.array_equal(a, b)
 
 
 # ---------------------------------------------------------------------------

@@ -34,6 +34,7 @@ FILTERS = [
     "DFTTest",
     "NLMeans",
     "BM3Dv2",
+    "BM3Dv2_16",
     "BM3Dv2Color",
     "BM3Dv2Joint",
     "EEDI3",
@@ -78,6 +79,12 @@ _SCRIPT = textwrap.dedent(f"""\
         node = core.vsfeel.NLMeans(g32, d=2)
     elif name == "BM3Dv2":
         node = core.vsfeel.BM3Dv2(g32, sigma=0.7, radius=2, bm_range=16,
+                                  ps_range=7, block_step=4)
+    elif name == "BM3Dv2_16":
+        # The integer input path: the copy-and-widen kernel rides the
+        # estimation kernel's descriptor set and push-constant block, and the
+        # aggregation writes native samples into the output plane.
+        node = core.vsfeel.BM3Dv2(g16, sigma=0.7, radius=2, bm_range=16,
                                   ps_range=7, block_step=4)
     elif name == "BM3Dv2Color":
         # Three per-plane entries live at once: separate source rings, estimate
