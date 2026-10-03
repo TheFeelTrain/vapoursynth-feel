@@ -32,10 +32,14 @@ constexpr int MAX_RADIUS = 16;
 // The shader does the search-window arithmetic ((2*range+1)^2, x±range) in
 // int32; beyond this, absurd-but-accepted values overflow it.
 constexpr int kMaxSearchRange = 8192;
-// In-flight frames the private caches are sized for. The core's exec pool owns
-// the real pipelining depth; this is the working set the estimate/source rings
-// cover, kept at the old two-stream depth for VRAM.
-constexpr int kInflightFrames = 2;
+// In-flight frames the private caches are sized for. The core's exec pool keeps
+// min(threads, 8) recording contexts, and a frame uses two of them (estimation
+// and aggregation), so four frames are what the pool can actually overlap; the
+// rings are sized for that. Sizing them for two instead leaves the host path
+// exactly at the GPU's pace, where every handoff delay stalls the GPU (measured
+// 8% run-to-run swing, and 6% slower on average). VSFEEL_BM3D_INFLIGHT lowers
+// it to trade pipeline depth back for VRAM on a small card.
+constexpr int kInflightFrames = 4;
 
 struct Bm3dPlane {
     int width {};
@@ -1949,8 +1953,15 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // frame, so they only need to cover the working set of the concurrent
     // frames (like the reference's fused-mode accumulator cache); anything
     // beyond that (e.g. seeking) blocks in the acquire instead of corrupting.
-    const int src_ring =
-        (d->radius == 0) ? kInflightFrames : 4 * d->radius + kInflightFrames;
+    int inflight =
+        std::clamp(env_int("VSFEEL_BM3D_INFLIGHT", kInflightFrames), 1, 8);
+    const auto src_ring_of = [r = d->radius](int n) {
+        return (r == 0) ? n : 4 * r + n;
+    };
+    const auto res_cap_of = [r = d->radius, tw = d->tw](int n, bool slack) {
+        return (r == 0) ? n : (slack ? n + 2 * r + tw : n + 2 * r);
+    };
+    int src_ring = src_ring_of(inflight);
     // One in-flight frame needs the stacks of centre frames [n-r, n+r], so
     // kInflightFrames concurrent frames span kInflightFrames + 2r slots. That
     // working set is the default: the estimate cache is the largest allocation,
@@ -1958,12 +1969,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // radius 4 and failing to allocate. VSFEEL_BM3D_CACHE=1 adds a whole extra
     // window, so an out-of-order (seek) request finds a warm slot instead of
     // waiting in the acquire, for tw/(ns+2r+tw) more VRAM.
-    const int res_working_set = kInflightFrames + 2 * d->radius;
     const bool cache_slack = env_int("VSFEEL_BM3D_CACHE", 0) != 0;
-    const int res_cap =
-        (d->radius == 0)
-            ? kInflightFrames
-            : (cache_slack ? res_working_set + d->tw : res_working_set);
+    int res_cap = res_cap_of(inflight, cache_slack);
 
     const int extractor_exp =
         vsh::int64ToIntS(vsapi->mapGetInt(in, "extractor_exp", 0, &error));
@@ -2118,17 +2125,43 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
 
     VkDeviceSize src_total = 0;
     VkDeviceSize res_total = 0;
+    // One entry's buffers, sized from the current pipeline depth. The estimate
+    // cache is by far the largest allocation and a device's
+    // maxStorageBufferRange binds before VRAM does at the top of the radius
+    // range (1080p radius 7 on a 4 GiB-range card), so the depth gives way
+    // first: two frames are the floor the recording pipeline needs to overlap
+    // with execution at all, and the deeper default is worth having only while
+    // it fits.
+    for (;;) {
+        bool fits = true;
+        src_total = 0;
+        res_total = 0;
+        for (int gi = 0; gi < d->n_groups && fits; ++gi) {
+            auto & g = d->groups[gi];
+            g.src_ring = src_ring;
+            g.res_cap = res_cap;
+            g.tag_base = gi * res_cap;
+            // In final mode each ring slot holds [ref][source], so the ring
+            // doubles.
+            const int clips = d->final ? 2 : 1;
+            g.src_size = static_cast<VkDeviceSize>(g.src_ring) * clips *
+                         g.n_planes * g.pe;
+            g.res_size = static_cast<VkDeviceSize>(g.res_cap) * d->tw * 2 *
+                         g.n_planes * g.pe;
+            fits = g.res_size * 4 <= d->gpu->limits.maxStorageBufferRange &&
+                   g.src_size * 4 <= d->gpu->limits.maxStorageBufferRange;
+            src_total += g.src_size;
+            res_total += g.res_size;
+        }
+        if (fits || inflight <= 2) {
+            break;
+        }
+        --inflight;
+        src_ring = src_ring_of(inflight);
+        res_cap = res_cap_of(inflight, cache_slack);
+    }
     for (int gi = 0; gi < d->n_groups; ++gi) {
         auto & g = d->groups[gi];
-        g.src_ring = src_ring;
-        g.res_cap = res_cap;
-        g.tag_base = gi * res_cap;
-        // In final mode each ring slot holds [ref][source], so the ring doubles.
-        const int clips = d->final ? 2 : 1;
-        g.src_size =
-            static_cast<VkDeviceSize>(g.src_ring) * clips * g.n_planes * g.pe;
-        g.res_size = static_cast<VkDeviceSize>(g.res_cap) * d->tw * 2 *
-                     g.n_planes * g.pe;
         // Both buffers are addressed through signed 32-bit offsets: the
         // estimation kernel takes a slot's result base as a push constant and
         // computes the source ring's through src_search, so a region at or
@@ -2152,8 +2185,6 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
                      static_cast<unsigned long long>(g.src_size), d->radius);
             return set_error(msg);
         }
-        src_total += g.src_size;
-        res_total += g.res_size;
     }
 
     if (d->trace_frame >= 0) {
@@ -2387,7 +2418,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             "stride=%d bits=%d)\n",
             src_bytes / mib, res_bytes / mib,
             100.0 * static_cast<double>(res_total) / (total > 0 ? total : 1.0),
-            total / mib, d->num_planes, d->n_groups, d->radius, kInflightFrames,
+            total / mib, d->num_planes, d->n_groups, d->radius, inflight,
             res_cap, src_ring, d->planes[0].stride, d->bits);
     }
 
@@ -2402,8 +2433,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         g.res_writer.assign(g.res_cap, -1);
         g.res_ready.assign(g.res_cap, 0);
         g.res_holders.resize(g.res_cap);
-        g.r0_free.reserve(kInflightFrames);
-        for (int i = 0; i < kInflightFrames; ++i) {
+        g.r0_free.reserve(inflight);
+        for (int i = 0; i < inflight; ++i) {
             g.r0_free.push_back(i);
         }
     }

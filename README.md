@@ -15,14 +15,14 @@ pip install vapoursynth-feel
 | Filter     | vsfeel u16 | vszipcl u16 | vulkan u16 | vsfeel fp32 | vszipcl fp32 | vulkan fp32 | Speedup |
 |------------|-----------:|------------:|-----------:|------------:|-------------:|------------:|--------:|
 | Bilateral  | 2170       | 580         | -          | 1142        | 387          | -           | 3.43x   |
-| BM3Dv2     | -          | -           | -          | 995         | 119          | 280         | 3.55x   |
+| BM3Dv2     | 985        | -           | -          | 966         | 119          | 280         | 3.48x   |
 | DFTTest    | 1431       | 833         | -          | 1134        | 488          | -           | 1.94x   |
 | EEDI3 (AA) | 165        | 25          | 36         | 121         | 25           | 29          | 4.40x   |
 | GaussBlur  | 2325       | 1298        | -          | 1145        | 797          | -           | 1.66x   |
 | NLMeans    | 1043       | 452         | 603        | 735         | 462          | 593         | 1.49x   |
 | NNEDI3     | 2703       | -           | 2004       | 1393        | -            | 1008        | 1.36x   |
 
-Measured on a RX 7900 XTX using `tools/benchmark.py --filter <filter> --bits <16|32>` with a 1080p YUV420P input clip.
+Measured on a RX 7900 XTX using `tools/benchmark.py --filter <filter> --bits <16|32>` with a 1080p clip.
 
 vulkan column: bm3dvk, eedi3vk2, knlmvk, nnedi3vk
 
@@ -58,7 +58,7 @@ core.vsfeel.BM3Dv2(clip clip[,
     bool    chroma=False,           # True = one joint 4:4:4 entry, whose groups come from luma
     int     extractor_exp=0])       # aggregation weight bias, 0..127; 0 = off, >= 3 = reproducible output
 ```
-32-bit float Gray, YUV or RGB. `chroma=True` requires YUV444.
+`chroma=True` requires YUV444.
 
 ### DFTTest
 

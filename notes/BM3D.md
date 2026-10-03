@@ -30,12 +30,14 @@ Scoreboard — 1080p jpbd, `tools/benchmark.py -f bm3dv2`, harness defaults
 
 | | fps | |
 |---|---|---|
-| vsfeel | **952** | mawen matcher and filtering |
-| vsfeel, 16 bit in | **970** | same kernels, half the io bytes |
+| vsfeel | **982** | mawen matcher and filtering |
+| vsfeel, 16 bit in | **1004** | same kernels, half the io bytes |
 | bm3dvk | 295 | fixed 8-member groups |
 | vszipcl | 136 | |
 
-vsfeel's median over five runs was 952 (921-957); the reference columns are one
+vsfeel's medians here are 5000-frame x3 runs after the in-flight-depth fix below
+(the same session measured 869-947 before it, which is the swing that round
+removed); the reference columns are one
 run from the same session and swing with the box like everything else here
 (bm3dvk measured 237 in an earlier one). 3.2x the faster reference, but not on
 equal work: they always group eight while the default threshold accepts ~80% of
@@ -131,9 +133,11 @@ which is where the visible speedup is (see Performance).
   load/store/exchange bit is not enough), else the same kernel's
   `-DNO_FLOAT_ATOMICS` build runs the reference's `atom_add_f` CAS loop
   (`VSFEEL_BM3D_CAS=1` forces it).
-- Radius accepts up to 16, but the estimate cache binds first: it grows as
-  `(2+2r)(2r+1)` plane pairs, so 1080p runs radius 7 and refuses 8 while 640x360
-  reaches 16. Every refusal is a creation-time error naming the size.
+- Radius accepts up to 16, but the estimate cache binds first (it grows as
+  `(2+2r)(2r+1)` plane pairs): 1080p runs 7 and refuses 8, 640x360 reaches 16.
+  The rings hold the pipeline depth the core's pool can overlap (four frames,
+  `VSFEEL_BM3D_INFLIGHT`), stepping back to two before a `maxStorageBufferRange`
+  costs a radius step. Every refusal names the size.
 - Degenerate paths: `sigma < FLT_EPSILON` copies a plane through, and with no
   plane above it the filter is not built (the clip is handed back). Validation
   runs before that shortcut: `extractor_exp` `[0, 127]` as bm3dvk does, `th_mse`
@@ -177,6 +181,15 @@ which is where the visible speedup is (see Performance).
   (which also removed the barriers around them); the walks share one
   `scan_cand` helper; `group_add` stops at the first entry that cannot beat an
   overflowed group's worst.
+- **The run-to-run swing was pipeline depth, not the kernels (+5%; spread 8.7%
+  -> 2.8%).** The rings were sized for two in-flight frames, and the source
+  ring's reuse distance makes that a hard serialization (a third frame blocks in
+  `acquire_cache`), which put the host recording path -- 1.5 ms of est plus
+  0.5 ms of agg per frame against a 1.04 ms GPU frame -- exactly at the GPU's
+  pace, so any release-to-acquire handoff delay idled the GPU. Six alternating
+  1000-frame invocations: 871-947 fps (8.7%) against DFTTest's 2.8%; sized for
+  the four frames the pool can overlap (`min(threads, 8)` contexts, two
+  submissions per frame): 933-960 (2.8%), +5% mean. Depth 6-8 add <1% for 175 MiB.
 - **Do not unroll the walk.** The loop body is 309 instructions per candidate
   (SSD 45%, insert 27%, addressing 9%, waits 6%, scheduler `s_delay_alu` 14%),
   and evaluating several candidates per iteration only raises the register
@@ -411,6 +424,15 @@ Chronological; each entry keeps the mechanism, not the story.
 
 ### Do not retry
 
+- **Interleaving the estimate stack's `num`/`den` arrays.** Three layouts, all
+  neutral or worse (1080p r=2, 5000 frames x3, same-binary interleaved A/B):
+  `den` read from an adjacent address (same bytes, one stream) -4%; a
+  row-interleaved slice `[y][num row][den row]` (same size and slot offsets, the
+  rows 7.7 KB apart instead of 8.3 MB) -3%..+1%; and an aggregation dispatch
+  that does *no* work is **25% slower** -- its reads consume the lines the
+  estimation just wrote, so skipping them moves that writeback into the next
+  frame. The cost is volume (83 MB/frame of reads and of slot fill at r=2), not
+  pattern; only accumulating into output-frame accumulators would shrink it.
 - Any LDS restructure here — see the mechanism under Performance.
 - `#pragma unroll`: glslc ignores it in GLSL and ACO already unrolls fixed-trip
   loops; the remaining variable-trip scans are unrolled by hand.
@@ -458,6 +480,8 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
   instead of riding the handoff barrier (the `tags` witness cannot see a late
   ring copy).
 - `VSFEEL_BM3D_CACHE=1` — add the seek margin back to the estimate cache.
+- `VSFEEL_BM3D_INFLIGHT=<1..8>` — frames the rings are sized for (default 4;
+  lower it to trade pipeline depth for VRAM).
 - `VSFEEL_BM3D_CAS=1` — force the CAS aggregation build on a device that has
   buffer float atomics (A/B only).
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs.

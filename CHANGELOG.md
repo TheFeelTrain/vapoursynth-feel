@@ -12,7 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- BM3Dv2 is about 12% faster at the default settings.
+- BM3Dv2 is about 17% faster with less run-to-run variance.
 - BM3Dv2 accepts up to `radius=16` instead of 4, matching vszipcl.
 - BM3Dv2 follows VapourSynth-BM3D for block matching and filtering instead of the BM3DCUDA.
 - BM3Dv2 denoises all planes of YUV clips and supports the joint 4:4:4 `chroma=True` mode.
