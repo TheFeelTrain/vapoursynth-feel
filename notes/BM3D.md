@@ -5,12 +5,19 @@ are mawen's CPU V-BM3D (`reference/VapourSynth-BM3D`), so output differs from an
 CUDA-matcher build. The CPU plugin is the only oracle, driven from
 `tests/test_bm3dv2.py` (`bm3d.Basic`, `VBasic`/`VFinal` + `VAggregate`).
 
-- Agreement with it: single-member groups **4e-7**, matched groups on
-  well-separated content **5e-4**, ambiguous content a few 1e-2. The residual is
-  the CPU's unspecified tie order (`std::partial_sort` over an error-only key)
-  plus its SSE accumulation order, amplified by the predictive chain.
+- **Agreement: exact except the CPU's tie order.** Reference-only groups
+  (`th_mse=0`) agree to 2.4e-7. Over all 32400 reference blocks of frame 28885
+  (1080p, r=0, bm_range 9, step 8) both matchers take the same key multiset, in
+  the same order, with **zero** ranking differences; 2088 blocks differ only in
+  which equally-distant candidate libstdc++'s `partial_sort` kept, the kernel's
+  `(error, y, x)` order being stable. A stable-sort reference build lands 4.4x
+  closer on that frame (mean 5.15e-5 -> 1.18e-5), which prices the tie order.
+- The SSD is the CPU's accumulation order but not its rounding: ACO fuses the
+  multiply-adds where the SSE path rounds every product, so ~1/3 of candidates
+  differ by 1 ulp.
 - The matcher is graded coordinate-for-coordinate against a scalar model of the
-  CPU source (`tests/bm3d_oracle.py` + `VSFEEL_BM3D_MATCHTRACE`), 26 configs.
+  CPU source (`tests/bm3d_oracle.py` + `VSFEEL_BM3D_MATCHTRACE`), 26 configs;
+  its SSD reduction now matches the per-row lane order above.
 - Every plane of a colour clip is denoised: one entry per plane, or one joint
   4:4:4 entry under `chroma=True` whose groups come from luma. A plane below its
   sigma threshold is a bit-exact source copy; all planes below it and the filter
@@ -57,6 +64,9 @@ unchanged from the pre-mawen binary (798 vs 790 fps, adjacent 400-frame runs).
   seeds. Candidates are partitioned across lanes for a direct per-candidate SSD
   against the same fixed reference patch -- shifted-column reuse is invalid --
   and each subgroup merges its own top-K.
+- The merge makes the selection exactly the global top-K by `(error, y, x)` (a
+  dropped entry is below its lane's K-th, hence below the union's K-th), so it
+  is the **stable** top-K, which the CPU's `std::partial_sort` is not.
 - The group keeps concatenation order until it overflows past eight, and only
   then keeps the reference plus the best seven of the tail.
 - Per-lane candidate lists are 8 deep in shared memory (`l_e`/`l_xy`), as are the
@@ -133,6 +143,14 @@ unchanged from the pre-mawen binary (798 vs 790 fps, adjacent 400-frame runs).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-10-02 — the CPU oracle was a stale build; the residual is the tie
+  order.** PyPI's 10.1 predates `reference/` (upstream force-pushed the
+  September commits away, so the wheel lacks the per-coefficient Wiener variance
+  and zero-distance matches), which is what every unexplained CPU-comparison
+  residual came from. The dev group pins that commit; the bounds are re-measured
+  against it (~2-3x tighter, the Wiener pass 2e-3 -> 5e-4 at 4.7e-5..8.9e-5),
+  and the same run prices the rest as `partial_sort`'s tie order. No kernel
+  change, no perf change.
 - **2026-10-02 — two clip-change failures were test bugs.** `chroma_planes_are_denoised`
   built its YUV clip from the untrimmed 300-frame source while the Gray fixture
   is 24, so frame 23 saw a different temporal window (`source_clip()` now). The
@@ -234,10 +252,16 @@ Chronological; each entry keeps the mechanism, not the story.
 
 ## Open work
 
-- **The CPU's tie order cannot be reproduced**: `std::partial_sort` over an
-  error-only key leaves equal distances unspecified, and its SSE accumulation
-  orders the SSD differently. `(error, y, x)` is the documented portable choice,
-  and the residual against the CPU on ambiguous content is that difference.
+- **Emulating libstdc++'s `partial_sort` is not worth its price.** The survivors
+  among tied candidates are heap positions, not a positional rule (neither
+  first- nor last-in-scan matches, and dropping the large-key candidates the
+  heap evicts early changes 2113 of 32400 outcomes), so exactness needs the
+  whole candidate sequence replayed through a 7-element heap: ~940 keys per
+  block in LDS plus a serial pass, ~+25% on a kernel whose search is already the
+  whole filter, and correctness tied to one STL's heap.
+- **The 1-ulp SSD divergence is a deliberate trade**: `precise` on the
+  accumulators costs ~8 ALU ops per row (the fused multiply-add is the search's
+  throughput) to buy back ~10% of the tie floor.
 - **The search is the remaining kernel cost**, and the only one: the
   sigma-scaled threshold rejects most candidates on real content, so the filter
   cost behind it is small. The union's ownership test is 4 int ops per candidate

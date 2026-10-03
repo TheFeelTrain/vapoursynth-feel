@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - EEDI3 and EEDI3H are bit-exact with eedi3vk2 in fp32
 - NLMeans more closely matches vszipcl in fp32 and u16
+- Only rewrite the pipeline cache when a process compiled something new
 
 ## [1.0.0] - 2026-10-01
 

@@ -413,19 +413,9 @@ wheels = [
 [[package]]
 name = "vapoursynth-bm3d"
 version = "10.1"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/HomeOfVapourSynthEvolution/VapourSynth-BM3D?rev=cd89118e33ba6cbfd7b447115425dcb98905e0e6#cd89118e33ba6cbfd7b447115425dcb98905e0e6" }
 dependencies = [
     { name = "vapoursynth" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/65/83/ecba54a88f9ec1df08a5ad8aa5ef8cd861fff7911018e821dee206b24289/vapoursynth_bm3d-10.1.tar.gz", hash = "sha256:f6cd25142008b1c4843e727bcc3746479198439ac800e258240c6ab0009ea115", size = 59070, upload-time = "2026-05-04T15:14:57.452Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e4/44/96863c54b25ef0c6c60b18797c198228c4e25d5253cb3f4c26acdf233ea0/vapoursynth_bm3d-10.1-py3-none-macosx_15_0_arm64.whl", hash = "sha256:3872acde1a0f534b0bff0b548ba4e1f09446340c68f4254956254bf01d56cd94", size = 456272, upload-time = "2026-05-04T15:14:44.007Z" },
-    { url = "https://files.pythonhosted.org/packages/f2/e5/2b2b9b2fd1d02f1ac7441d601eb6765c68654dcae08f7338f8a158088f57/vapoursynth_bm3d-10.1-py3-none-macosx_15_0_x86_64.whl", hash = "sha256:4f03685ed1f86801dd14a972a6c3aab9e5b06605a15b8b3cedf10a0dcb7f681d", size = 1383661, upload-time = "2026-05-04T15:14:46.212Z" },
-    { url = "https://files.pythonhosted.org/packages/15/aa/a937cbd369290dc1be3ea4050d59a41463362f381fda41ed7dad12ffb132/vapoursynth_bm3d-10.1-py3-none-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6ba0d6793aa31fd940ed792fbe9313a4c1deefcfde80b27f47034aa150fe69d9", size = 715646, upload-time = "2026-05-04T15:14:48.136Z" },
-    { url = "https://files.pythonhosted.org/packages/22/4a/8c68963e3d26444c7472030930a614785b572201d77289b460656e913366/vapoursynth_bm3d-10.1-py3-none-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6e03cf629643e6f36dfaadc8fed4df7bbba09dbcf481f4df99ae84da102040f0", size = 1229192, upload-time = "2026-05-04T15:14:49.961Z" },
-    { url = "https://files.pythonhosted.org/packages/60/58/3a2dd1b3a118fdf3ede6c0075ce92f1b672bba7c04b2e12100603e9f46ec/vapoursynth_bm3d-10.1-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:008e5250388f7fc10594476724766f35a0335d4c5ce475d3c4f56582212cd094", size = 1840476, upload-time = "2026-05-04T15:14:51.688Z" },
-    { url = "https://files.pythonhosted.org/packages/ce/70/40cdccf03125757f8e085eb3717cf3632fd758c613f9059710a424ffac9b/vapoursynth_bm3d-10.1-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:50fad4bc9b92a17529f7486d7ba44d02f1159463317b343b988b42e84b013da1", size = 2036662, upload-time = "2026-05-04T15:14:53.716Z" },
-    { url = "https://files.pythonhosted.org/packages/33/6e/a14555e217ea00c74faedcb3e4d66e17aeeb7b596e59fc1a83f88111a463/vapoursynth_bm3d-10.1-py3-none-win_amd64.whl", hash = "sha256:5919bd23d43b8a19d7112609d4288e500a8f1f51859ce1d04d2b7e28c75b17ac", size = 2203134, upload-time = "2026-05-04T15:14:55.767Z" },
 ]
 
 [[package]]
@@ -564,7 +554,7 @@ dev = [
     { name = "pytest-xdist" },
     { name = "vapoursynth", specifier = "==81rc1" },
     { name = "vapoursynth-bestsource", specifier = ">=22" },
-    { name = "vapoursynth-bm3d", specifier = ">=10.1" },
+    { name = "vapoursynth-bm3d", git = "https://github.com/HomeOfVapourSynthEvolution/VapourSynth-BM3D?rev=cd89118e33ba6cbfd7b447115425dcb98905e0e6" },
     { name = "vapoursynth-bm3dvk", specifier = ">=1.0" },
     { name = "vapoursynth-descale", specifier = ">=12" },
     { name = "vapoursynth-edgemasks", specifier = ">=4.1" },

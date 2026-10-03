@@ -1311,20 +1311,19 @@ def _cpu_compare(kwargs, stage="basic", clip="gray32", frames=(0, 11, 23)):
 BASE_KWARGS = dict(sigma=0.7, radius=2, bm_range=16, ps_range=7, block_step=4)
 
 # Measured on the committed clip (640x360 Big Buck Bunny + grain), frames
-# 0/11/23, worst plane. The CPU is `VBasic`+`VAggregate` (or `Basic` at radius
-# 0) with the parameters above and its own stage default for th_mse. The spread
-# across radii is the tie-order residual growing with the number of prediction
-# steps; radius 0 has no temporal chain at all, so it lands an order of
-# magnitude tighter.
+# 0/11/23, worst plane, against the reference build the dev group pins. The CPU
+# is `VBasic`+`VAggregate` (or `Basic` at radius 0) with the parameters above
+# and its own stage default for th_mse. The residuals are the CPU's own tie
+# order and one SSD ulp, not porting error: see notes/BM3D.md.
 RADIUS_CASES = [
     # (radius, stage, bound, measured)
-    (0, "image", 8e-3, 0.00382),
-    (1, "basic", 5e-3, 0.00221),
-    (2, "basic", 5e-3, 0.00173),
-    (3, "basic", 5e-3, 0.00184),
-    (4, "basic", 5e-3, 0.00162),
-    (5, "basic", 5e-3, 0.00190),
-    (6, "basic", 5e-3, 0.00161),
+    (0, "image", 4e-3, 0.00144),
+    (1, "basic", 4e-3, 0.00129),
+    (2, "basic", 4e-3, 0.00126),
+    (3, "basic", 4e-3, 0.00113),
+    (4, "basic", 4e-3, 0.00117),
+    (5, "basic", 4e-3, 0.00190),
+    (6, "basic", 4e-3, 0.00161),
 ]
 
 
@@ -1343,31 +1342,31 @@ def test_bm3dv2_matches_cpu_radius(clip_gray, radius, stage, bound, measured):
 # does not have, so it is covered by the self-consistency tests instead.
 SWEEP_CONFIGS = [
     # (kwargs, bound, measured)
-    ({}, 5e-3, 0.00173),
-    ({"sigma": 0.3}, 5e-3, 0.00063),
-    ({"sigma": 1.5}, 1.2e-2, 0.00558),
-    ({"block_step": 1}, 5e-3, 0.00167),
-    ({"block_step": 2}, 5e-3, 0.00168),
-    ({"block_step": 3}, 5e-3, 0.00158),
-    ({"block_step": 5}, 1.2e-2, 0.00287),
-    ({"block_step": 6}, 1.2e-2, 0.00344),
-    ({"block_step": 7}, 1.2e-2, 0.00355),
-    ({"block_step": 8}, 1.2e-2, 0.00467),
-    ({"bm_range": 1}, 5e-3, 0.00173),
-    ({"bm_range": 4}, 5e-3, 0.00173),
-    ({"bm_range": 9}, 5e-3, 0.00195),
-    ({"bm_range": 22}, 5e-3, 0.00173),
-    ({"bm_range": 32}, 5e-3, 0.00167),
-    ({"ps_range": 5}, 5e-3, 0.00173),
-    ({"ps_range": 9}, 5e-3, 0.00177),
-    ({"ps_num": 1}, 5e-3, 0.00181),
-    ({"ps_num": 2}, 5e-3, 0.00173),
-    ({"ps_num": 3}, 5e-3, 0.00173),
-    ({"ps_num": 4}, 5e-3, 0.00173),
-    ({"ps_num": 5}, 5e-3, 0.00173),
-    ({"ps_num": 6}, 5e-3, 0.00180),
-    ({"ps_num": 7}, 5e-3, 0.00193),
-    ({"ps_num": 8}, 5e-3, 0.00201),
+    ({}, 3e-3, 0.00126),
+    ({"sigma": 0.3}, 1.5e-3, 0.00044),
+    ({"sigma": 1.5}, 5e-3, 0.00201),
+    ({"block_step": 1}, 1.5e-3, 0.00037),
+    ({"block_step": 2}, 1.5e-3, 0.00050),
+    ({"block_step": 3}, 2e-3, 0.00071),
+    ({"block_step": 5}, 6e-3, 0.00231),
+    ({"block_step": 6}, 6e-3, 0.00222),
+    ({"block_step": 7}, 7e-3, 0.00272),
+    ({"block_step": 8}, 8e-3, 0.00309),
+    ({"bm_range": 1}, 3e-3, 0.00117),
+    ({"bm_range": 4}, 3e-3, 0.00116),
+    ({"bm_range": 9}, 3e-3, 0.00125),
+    ({"bm_range": 22}, 3e-3, 0.00129),
+    ({"bm_range": 32}, 3e-3, 0.00126),
+    ({"ps_range": 5}, 3e-3, 0.00105),
+    ({"ps_range": 9}, 3e-3, 0.00126),
+    ({"ps_num": 1}, 3e-3, 0.00125),
+    ({"ps_num": 2}, 3e-3, 0.00126),
+    ({"ps_num": 3}, 3e-3, 0.00113),
+    ({"ps_num": 4}, 3e-3, 0.00113),
+    ({"ps_num": 5}, 3e-3, 0.00094),
+    ({"ps_num": 6}, 3e-3, 0.00097),
+    ({"ps_num": 7}, 3e-3, 0.00097),
+    ({"ps_num": 8}, 3e-3, 0.00097),
 ]
 
 
@@ -1387,10 +1386,10 @@ def test_bm3dv2_parameter_sweep_matches_cpu(clip_gray, cfg, bound, measured):
 @pytest.mark.parametrize(
     "kwargs,bound,measured",
     [
-        ({}, 5e-3, 0.00173),
-        ({"sigma": [0.5, 1.1, 0.3]}, 5e-3, 0.00136),
-        ({"th_mse": 1200.0}, 5e-3, 0.00173),
-        ({"ps_num": 5}, 5e-3, 0.00173),
+        ({}, 3e-3, 0.00126),
+        ({"sigma": [0.5, 1.1, 0.3]}, 2e-3, 0.00074),
+        ({"th_mse": 1200.0}, 3e-3, 0.00126),
+        ({"ps_num": 5}, 3e-3, 0.00094),
     ],
     ids=["plugin-defaults", "sigma-array-inherit", "explicit-th-mse", "ps-num-5"],
 )
@@ -1409,16 +1408,17 @@ def test_bm3dv2_th_mse_matches_cpu(clip_gray):
     different group and a large diff."""
     for th in (600.0, 1040.0, 2000.0):
         payload = _cpu_compare(dict(BASE_KWARGS, th_mse=th))
-        assert payload["maxdiff"] < 5e-3, f"th_mse={th} vs CPU: {payload}"
+        assert payload["maxdiff"] < 3e-3, f"th_mse={th} vs CPU: {payload}"
 
 
 def test_bm3dv2_final_stage_matches_cpu(clip_gray):
     """The Wiener pass, with both sides driven by the same guide.
 
     The guide is vsfeel's basic estimate, so this isolates the final stage's
-    matching and Wiener shrinkage from any basic-stage difference."""
+    matching and Wiener shrinkage from any basic-stage difference. Its
+    accumulation order jitters the result by ~2e-5 between processes."""
     payload = _cpu_compare(BASE_KWARGS, stage="final")
-    assert payload["maxdiff"] < 2e-3, f"final pass vs CPU: {payload} (was 0.00052)"
+    assert payload["maxdiff"] < 5e-4, f"final pass vs CPU: {payload} (was 0.00052)"
 
 
 def test_bm3dv2_luma_only_color_matches_cpu():
@@ -1432,7 +1432,7 @@ def test_bm3dv2_luma_only_color_matches_cpu():
     subsampled input when chroma is processed.
     """
     payload = _cpu_compare(dict(BASE_KWARGS, sigma=[0.7, 0.0, 0.0]), clip="yuv444_32")
-    assert payload["per_plane"][0] < 5e-3, f"luma vs CPU: {payload}"
+    assert payload["per_plane"][0] < 3e-3, f"luma vs CPU: {payload}"
 
 
 def test_bm3dv2_per_plane_color_matches_cpu():
@@ -1445,7 +1445,7 @@ def test_bm3dv2_per_plane_color_matches_cpu():
     covered by the self-consistency tests.
     """
     payload = _cpu_compare(BASE_KWARGS, clip="yuv444_32")
-    assert payload["maxdiff"] < 2e-2, f"color vs CPU: {payload} (was 0.00676)"
+    assert payload["maxdiff"] < 1.5e-2, f"color vs CPU: {payload} (was 0.00676)"
 
 
 def test_bm3dv2_color_ref_pass_matches_cpu():
@@ -1453,7 +1453,7 @@ def test_bm3dv2_color_ref_pass_matches_cpu():
     payload = _cpu_compare(
         dict(BASE_KWARGS, sigma=[0.7, 0.0, 0.0]), stage="final", clip="yuv444_32"
     )
-    assert payload["per_plane"][0] < 5e-3, f"colour final pass vs CPU: {payload}"
+    assert payload["per_plane"][0] < 1e-3, f"colour final pass vs CPU: {payload}"
 
 
 # ---------------------------------------------------------------------------

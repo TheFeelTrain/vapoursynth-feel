@@ -353,6 +353,9 @@ struct GPUDevice {
     VkPipelineCache pipeline_cache {};
     std::mutex * pipeline_cache_lock {};
     std::string pipeline_cache_path;
+    // Size of the blob the cache was seeded with: a process that compiled
+    // nothing new must not rewrite ~150 MB at exit.
+    size_t pipeline_cache_loaded_size {};
 
     // The core owns the device and destroys it with the core, so the cache has
     // to be flushed while the last reference here is still dropped -- an

@@ -243,6 +243,7 @@ static void load_gpu_pipeline_cache(GPUDevice & dev,
         dev.pipeline_cache_path.clear();
         return;
     }
+    dev.pipeline_cache_loaded_size = initial.size();
     if (vsfeel_debug_enabled()) {
         fprintf(stderr, "[vsfeel] pipeline cache %s (%zu B loaded)\n",
                 dev.pipeline_cache_path.c_str(), initial.size());
@@ -267,6 +268,14 @@ static void save_gpu_pipeline_cache(GPUDevice & dev) {
         if (dev.vk->vkGetPipelineCacheData(dev.device, dev.pipeline_cache,
                                            &size, nullptr) != VK_SUCCESS ||
             size == 0) {
+            return;
+        }
+        // The blob only grows when a pipeline is added, so an unchanged size
+        // means nothing was compiled beyond what is already on disk. Without
+        // this every short-lived process rewrote the whole (~150 MB) file at
+        // exit. A same-size change is simply not persisted: a cache miss next
+        // run, never a wrong result.
+        if (size == dev.pipeline_cache_loaded_size) {
             return;
         }
         std::vector<uint8_t> data(size);

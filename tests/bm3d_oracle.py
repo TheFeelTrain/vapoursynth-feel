@@ -32,22 +32,22 @@ def matching_threshold(th_mse):
 
 
 def ssd(cur, plane, cx, cy):
-    """Sum of squared differences in the shader's accumulation order.
+    """Sum of squared differences in the reference's accumulation order.
 
     ``cur`` is an 8x8 block indexed ``[column][row]`` and ``plane`` a 2D plane.
-    Per column the even and odd rows accumulate separately and are then added;
-    the eight column sums fold as a four-wide tree.
+    The SSE path loads one row at a time with lanes over x, so lane j takes
+    column j and column j+4 of each row before the next row; the four lanes then
+    fold left to right. Verified against the kernel's own numbers through
+    ``VSFEEL_BM3D_MATCHTRACE``.
     """
-    col = []
-    for c in range(8):
-        d = np.float32(cur[c] - plane[cy : cy + 8, cx + c])
-        sq = np.float32(d * d)
-        even = np.float32(np.float32(np.float32(sq[0] + sq[2]) + sq[4]) + sq[6])
-        odd = np.float32(np.float32(np.float32(sq[1] + sq[3]) + sq[5]) + sq[7])
-        col.append(np.float32(even + odd))
-    lo = np.float32(np.float32(col[0] + col[1]) + np.float32(col[2] + col[3]))
-    hi = np.float32(np.float32(col[4] + col[5]) + np.float32(col[6] + col[7]))
-    return np.float32(lo + hi)
+    a = [np.float32(0.0)] * 4
+    for i in range(8):
+        for j in range(4):
+            d = np.float32(cur[j, i] - plane[cy + i, cx + j])
+            a[j] = np.float32(a[j] + np.float32(d * d))
+            d = np.float32(cur[j + 4, i] - plane[cy + i, cx + j + 4])
+            a[j] = np.float32(a[j] + np.float32(d * d))
+    return np.float32(np.float32(np.float32(a[0] + a[1]) + a[2]) + a[3])
 
 
 def clipped_window(sx, sy, radius, w, h):

@@ -79,8 +79,13 @@ stays `vapoursynth>=80`). The `dev` group also supplies pytest/xdist, numpy,
 vsjetpack and the reference plugins the suite and the benchmark compare against
 (`vszipcl` from git plus `fmtconv` from JET's vs-wheels index, `eedi3vk2`, 
 `nnedi3vk`, `bm3dvk`, `nlm_hip`, `knlmmeansvk`, `zsmooth`, `bestsource`, 
-`edgemasks`, `resize2`, `descale`). `uv sync --group lint` adds the pinned 
-clang-format/clang-tidy/ruff. Never `pip install` into this tree, and never rely 
+`edgemasks`, `resize2`, `descale`). `vapoursynth-bm3d` is pinned to the git
+commit `reference/VapourSynth-BM3D` is checked out at, not the PyPI wheel: the
+wheel is an older tree (its September commits were force-pushed away upstream),
+and BM3Dv2 is graded against the reference source. That commit is a dangling
+object on GitHub, so re-resolving needs it to still be fetchable; the local
+checkout under `reference/` is the fallback. `uv sync --group lint` adds the
+pinned clang-format/clang-tidy/ruff. Never `pip install` into this tree, and never rely 
 on a system plugin being visible. `tools/*.sh` and `uv run` pick the venv up on 
 their own. One-time per venv, run `.venv/bin/vapoursynth config`: the wheel's 
 `vspipe` embeds CPython through VSScript, whose autodetection cannot find a 
@@ -623,11 +628,16 @@ flushed to a file:
 - the driver's `pipelineCacheUUID` is both the filename and part of the cache
   contents, so a driver/device change misses instead of feeding the driver
   incompatible data. The file is written via a unique temp file + rename, so
-  concurrent test subprocesses cannot corrupt it.
+  concurrent test subprocesses cannot corrupt it;
+- the write is **skipped when the blob is the size it was loaded at**, so a
+  process that compiled nothing new leaves the file alone. Without that check
+  every short-lived process rewrote it at exit: 25.8 GB of device writes for
+  `tests/test_bm3dv2.py` alone, 0.2 GB after it.
 
 Measured on the full suite: **~7.5 min cold → ~3.5 min for
-the run that builds the cache → ~2.5 min warm**. The first
-run after a driver or `glslc` update pays the compile again by design.
+the run that builds the cache → 142 s warm** (904 tests, 323 s before the write
+check). The first run after a driver or `glslc` update pays the compile again by
+design.
 
 ## Code quality (lint)
 

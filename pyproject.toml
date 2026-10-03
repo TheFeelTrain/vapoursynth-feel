@@ -57,7 +57,7 @@ dev = [
     "vapoursynth-nlm-hip>=4",
     "vapoursynth-knlmeansvk>=2.0",
     "vapoursynth-zsmooth>=0.20",
-    "vapoursynth-bm3d>=10.1",
+    "vapoursynth-bm3d",
 ]
 
 lint = [
@@ -109,6 +109,7 @@ url = "https://jaded-encoding-thaumaturgy.github.io/vs-wheels/simple"
 [tool.uv.sources]
 vapoursynth-fmtconv = { index = "vs-wheels" }
 vapoursynth-vszipcl = { git = "https://github.com/dnjulek/vapoursynth-zipcl", rev = "2c1b97742bf4f086f0bd31d26ba630e834c661ed" }
+vapoursynth-bm3d = { git = "https://github.com/HomeOfVapourSynthEvolution/VapourSynth-BM3D", rev = "cd89118e33ba6cbfd7b447115425dcb98905e0e6" }
 
 [tool.pytest.ini_options]
 addopts = "-p no:vsengine"
