@@ -156,6 +156,8 @@ ORACLE_CASES_16 = [
         vthresh1=24.0,
         vthresh2=4.0,
     ),
+    dict(field=3, vcheck=2, mdis=5, nrad=1, hp=1),
+    dict(field=2, vcheck=2, mdis=20, nrad=2, hp=1),
 ]
 
 
@@ -190,6 +192,7 @@ ORACLE_CASES_32 = [
     dict(field=3, vcheck=0, mdis=5, nrad=1),
     dict(field=3, vcheck=3, mdis=20, nrad=2),
     dict(field=2, vcheck=2, mdis=5, nrad=1),
+    dict(field=3, vcheck=2, mdis=5, nrad=1, hp=1),
     dict(
         field=3,
         vcheck=2,

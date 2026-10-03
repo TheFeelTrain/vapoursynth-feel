@@ -216,6 +216,10 @@ _EEDI3_PARAMS = {"field": 1, "mdis": 5, "nrad": 1, "vcheck": 2}
 _EEDI3H_PARAMS = {"field": 1, "mdis": 5, "nrad": 1, "vcheck": 2}
 # EEDI3AA only accepts field 2/3; 3 is the two-call based_aa form.
 _EEDI3AA_PARAMS = {"field": 3, "mdis": 5, "nrad": 1, "vcheck": 2}
+# hp (the reference's half-pel search): the doubled direction set and its
+# even/odd interpolation meet a non-multiple-of-32 plane width here.
+_EEDI3_HP_PARAMS = {"field": 1, "mdis": 5, "nrad": 1, "vcheck": 2, "hp": 1}
+_EEDI3AA_HP_PARAMS = {"field": 3, "mdis": 5, "nrad": 1, "vcheck": 2, "hp": 1}
 # A measured-vs-vszipcl NLMeans config (see test_nlmeans.REFERENCE_CASES).
 _NLMEANS_PARAMS = {"d": 1, "a": 3, "s": 3, "h": 3.0, "wref": 0.4}
 
@@ -273,6 +277,8 @@ for _w in WIDTHS:
     _add("eedi3h", 32, _w, 0, _EEDI3H_PARAMS, TOL_ORACLE_EXACT)
     _add("eedi3aa", 16, _w, 0, _EEDI3AA_PARAMS, TOL_ORACLE_EXACT)
     _add("eedi3aa", 32, _w, 0, _EEDI3AA_PARAMS, TOL_EEDI3AA_32)
+    _add("eedi3", 16, _w, 0, _EEDI3_HP_PARAMS, TOL_EEDI3_16)
+    _add("eedi3aa", 16, _w, 0, _EEDI3AA_HP_PARAMS, TOL_ORACLE_EXACT)
     _add("nlmeans", 16, _w, 0, _NLMEANS_PARAMS, TOL_NLMEANS_16)
     _add("nlmeans", 32, _w, 0, _NLMEANS_PARAMS, TOL_NLMEANS_32)
 

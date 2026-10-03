@@ -107,11 +107,15 @@ struct Eedi3PushConstants {
     int32_t vout2_base;
     int32_t comp_fuse;
     int32_t pad_src_pitched;
+    int32_t hp_base; // half-pel rows (b8) element base
 };
-static_assert(sizeof(Eedi3PushConstants) == 31 * sizeof(int32_t),
+// Exactly the guaranteed 128 B of push constants (maxPushConstantsSize is 256
+// on the reference device, but a conformant device may report 128).
+static_assert(sizeof(Eedi3PushConstants) == 32 * sizeof(int32_t),
               "push constants size");
 
-// Row/vcheck specialization block (constant ids 0-5 and the two local sizes).
+// Row/vcheck specialization block (constant ids 0-5 and the two local sizes,
+// plus 8 = HPF).
 struct Eedi3RowSpec {
     int32_t width;
     int32_t nrad;
@@ -121,9 +125,10 @@ struct Eedi3RowSpec {
     int32_t vcheck;
     int32_t lsz_row;
     int32_t lsz_vcheck;
+    int32_t hpf;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 8> row_entries { {
+static constexpr std::array<VkSpecializationMapEntry, 9> row_entries { {
     { 0, 0, sizeof(int32_t) },
     { 1, 4, sizeof(int32_t) },
     { 2, 8, sizeof(int32_t) },
@@ -132,6 +137,7 @@ static constexpr std::array<VkSpecializationMapEntry, 8> row_entries { {
     { 5, 20, sizeof(int32_t) },
     { 6, 24, sizeof(int32_t) },
     { 7, 28, sizeof(int32_t) },
+    { 8, 32, sizeof(int32_t) },
 } };
 
 struct Eedi3Pipelines {
@@ -146,6 +152,7 @@ struct Eedi3Pipelines {
     VkPipeline maskdilate_raw {};
     VkPipeline maskdilate_tr {};
     VkPipeline assemble {};
+    VkPipeline hpfill {};
     bool vcheck_lds {};
     bool vcheck_para {};
 };
@@ -186,6 +193,7 @@ struct Eedi3PlaneConfig {
     VkDeviceSize rtS_off {}, rtS_bytes {};
     VkDeviceSize o0_off {}, o0_bytes {};
     VkDeviceSize v_off {}, v_bytes {};
+    VkDeviceSize hp_off {}, hp_bytes {}; // hp only (half-pel rows)
 };
 
 // Fills the 1D dispatch grids of `c` (pad / vcopy / assemble / blit), folding
@@ -255,6 +263,9 @@ struct Eedi3Data {
 
     int field {}, nrad { 2 }, mdis { 20 }, vcheck { 2 };
     bool dh {};
+    // hp: eedi3vk2's half-pel search (the DP walks half-pel directions, TPITCH
+    // doubles and the s0 cost comes from the hpfill precompute).
+    bool hp {};
     bool horiz { false }; // run the whole pipeline on the transposed plane
     bool aa { false };    // fused based_aa vertical-then-horizontal chain
     std::array<Eedi3PlaneConfig, MAX_PLANES> aplanes {};
@@ -316,6 +327,8 @@ struct Eedi3Data {
     size_t compose_size {};
     const uint32_t * assemble_code {};
     size_t assemble_size {};
+    const uint32_t * hpfill_code {};
+    size_t hpfill_size {};
     // mask kernels, indexed by mask format (0 = 8 bit, 1 = 16, 2 = 32)
     std::array<const uint32_t *, 3> maskpack_code {};
     std::array<size_t, 3> maskpack_size {};
@@ -382,7 +395,7 @@ Eedi3Data::~Eedi3Data() {
         const VkPipeline all[] { p.row,           p.vcheck,   p.pad,
                                  p.vcopy,         p.blit,     p.xpose,
                                  p.compose,       p.maskpack, p.maskdilate_raw,
-                                 p.maskdilate_tr, p.assemble };
+                                 p.maskdilate_tr, p.assemble, p.hpfill };
         for (VkPipeline pipe : all) {
             if (!pipe) {
                 continue;
@@ -480,7 +493,9 @@ static void eedi3_add_timing(Eedi3Data & d, uint64_t signaled,
 // of its row kernels with no barrier between them, and so on. That is what
 // lets several frames' latency-bound row kernels share the one compute queue
 // the core exposes (a single frame's `rows` workgroups cannot fill the GPU).
-enum class PassPhase { kPrep, kRow, kVcheck, kTail };
+// hp's half-pel precompute gets its own phase between the pad builders (which
+// it reads) and the row kernels (which read it).
+enum class PassPhase { kPrep, kHp, kRow, kVcheck, kTail };
 
 // One frame's inputs for one sub-pass.
 struct Eedi3Job {
@@ -642,6 +657,7 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
         auto row_pc = [&](const Eedi3PlaneConfig & cfg, const int plane) {
             Eedi3PushConstants pc {};
             pc.pad_base = static_cast<int32_t>(cfg.pad_off / pad_elem);
+            pc.hp_base = static_cast<int32_t>(cfg.hp_off / elem);
             pc.dst_base = static_cast<int32_t>(
                 (second ? cfg.dst2_off : cfg.dst_off) / elem);
             pc.pbt_base = static_cast<int32_t>(cfg.pbt_off);
@@ -672,6 +688,34 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
             return pc;
         };
 
+        if (phase == PassPhase::kHp) {
+            // hp only: precompute the half-pel rows of every written pad row,
+            // one workgroup per row. ENTRY_PAD wrote the pad in the previous
+            // phase, ENTRY_ROW reads these rows in the next one.
+            for (int plane = 0; plane < numPlanes; ++plane) {
+                if (!d.process[plane]) {
+                    continue;
+                }
+                const auto & cfg = planes[plane];
+                Eedi3PushConstants pc {};
+                pc.pad_base = static_cast<int32_t>(cfg.pad_off / pad_elem);
+                pc.pad_stride = cfg.pad_stride;
+                pc.field = field;
+                pc.rows = cfg.rows;
+                pc.hp_base = static_cast<int32_t>(cfg.hp_off / elem);
+                bind_pipe(d, cmd, cfg.pipes.hpfill);
+                // b0 is the pad, b8 the half-pel rows; the rest of the layout
+                // is unread by this kernel.
+                bind_bufs(d, cmd,
+                          { in.scratch, in.scratch, in.scratch, in.scratch,
+                            in.scratch, in.scratch, in.scratch, in.scratch,
+                            in.scratch });
+                pc_push(d, cmd, pc);
+                // Rows written: MARGIN_V + field - 3 step 2, rows + 3 of them.
+                dispatch(d, cmd, cfg.rows + 3);
+            }
+        }
+
         if (phase == PassPhase::kRow) {
             // Row kernel: one workgroup per interp row. Recorded with no
             // barrier between jobs so the batch's rows all share the queue.
@@ -685,7 +729,8 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                 bind_pipe(d, cmd, cfg.pipes.row);
                 bind_bufs(d, cmd,
                           { in.scratch, in.scratch, in.scratch, in.scratch,
-                            in.scratch, sclip_buf, in.scratch, in.scratch });
+                            in.scratch, sclip_buf, in.scratch, in.scratch,
+                            in.scratch });
                 pc_push(d, cmd, row_pc(cfg, plane));
                 dispatch(d, cmd, 1, cfg.rows);
             }
@@ -1209,6 +1254,10 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
     const int njobs = static_cast<int>(jobs.size());
     record_pass(*d, cmd, jobs.data(), njobs, PassPhase::kPrep);
     gpu_barrier(*d->gpu, cmd);
+    if (d->hp) {
+        record_pass(*d, cmd, jobs.data(), njobs, PassPhase::kHp);
+        gpu_barrier(*d->gpu, cmd);
+    }
     record_pass(*d, cmd, jobs.data(), njobs, PassPhase::kRow);
     gpu_barrier(*d->gpu, cmd);
     record_pass(*d, cmd, jobs.data(), njobs, PassPhase::kVcheck);
@@ -1627,6 +1676,10 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
         const int nj = static_cast<int>(J.size());
         record_pass(*d, cmd, J.data(), nj, PassPhase::kPrep);
         gpu_barrier(*d->gpu, cmd);
+        if (d->hp) {
+            record_pass(*d, cmd, J.data(), nj, PassPhase::kHp);
+            gpu_barrier(*d->gpu, cmd);
+        }
         record_pass(*d, cmd, J.data(), nj, PassPhase::kRow);
         gpu_barrier(*d->gpu, cmd);
         record_pass(*d, cmd, J.data(), nj, PassPhase::kVcheck);
@@ -1787,6 +1840,7 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     d->nrad = get_int("nrad", 2);
     d->mdis = get_int("mdis", 20);
     d->vcheck = get_int("vcheck", 2);
+    d->hp = get_int("hp", 0) != 0;
     float vthresh0 = get_float("vthresh0", 32.0f);
     float vthresh1 = get_float("vthresh1", 64.0f);
     d->vthresh2 = get_float("vthresh2", 4.0f);
@@ -1800,12 +1854,12 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     }
 
     // Compat no-ops (registered like the other legacy args, never read):
-    // eedi3m's `opt` (SIMD level; the GPU path is always AVX2-class),
-    // eedi3vk2's `hp` (half-pel search; vsfeel always runs the full-pel
-    // family-A search), and the deprecated vsaa `ucubic`/`cost3` (vsfeel
-    // always runs cubic fill + three-window costs, i.e. both on).
+    // eedi3m's `opt` (SIMD level; the GPU path is always AVX2-class) and the
+    // deprecated vsaa `ucubic`/`cost3` (vsfeel always runs cubic fill +
+    // three-window costs, i.e. both on). eedi3m registers `hp` the same way
+    // ("only full pel is implemented"), but eedi3vk2 and vszip implement the
+    // half-pel search, so vsfeel does too (see d->hp below).
     (void)get_int("opt", 0);
-    (void)get_int("hp", 0);
     (void)get_int("ucubic", 1);
     (void)get_int("cost3", 1);
 
@@ -1998,7 +2052,9 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     }
 
     {
-        const auto layout = gpu_push_set_layout(*d->gpu, 8);
+        // b0 pad, b1 dst, b2 pbt, b3 dmap, b4 bmask, b5 sclip, b6 cint,
+        // b7 vout, b8 hp.
+        const auto layout = gpu_push_set_layout(*d->gpu, 9);
         if (std::holds_alternative<std::string>(layout)) {
             return set_error(std::get<std::string>(layout));
         }
@@ -2041,6 +2097,11 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     d->rcp_vth0 = 1.0f / vthresh0;
     d->rcp_vth1 = 1.0f / vthresh1;
     d->rcp_vth2 = 1.0f / d->vthresh2;
+    // hp halves the relax's direction penalty (the reference's scaledGamma):
+    // one half-pel step is half a full-pel one.
+    if (d->hp) {
+        d->gamma *= 0.5f;
+    }
 
     const auto & lim = d->gpu->limits;
     const int max_invoc = static_cast<int>(lim.maxComputeWorkGroupInvocations);
@@ -2093,6 +2154,8 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         d->compose_size = eedi3_16_compose_spv_size;
         d->assemble_code = eedi3_16_assemblev_spv;
         d->assemble_size = eedi3_16_assemblev_spv_size;
+        d->hpfill_code = eedi3_16_hpfill_spv;
+        d->hpfill_size = eedi3_16_hpfill_spv_size;
         break;
     case 32:
         d->row_code = eedi3_32_row_spv;
@@ -2123,6 +2186,8 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         d->compose_size = eedi3_32_compose_spv_size;
         d->assemble_code = eedi3_32_assemblev_spv;
         d->assemble_size = eedi3_32_assemblev_spv_size;
+        d->hpfill_code = eedi3_32_hpfill_spv;
+        d->hpfill_size = eedi3_32_hpfill_spv_size;
         break;
     default:
         return set_error("unsupported bit depth");
@@ -2176,7 +2241,9 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     // -1, and then a batch is always one frame: requesting past the end fails).
     d->max_out = (out_video.numFrames > 0) ? out_video.numFrames - 1 : -1;
 
-    const int tpitch = 2 * d->mdis + 1;
+    // pbt column stride (must match TPITCH in the shader): hp doubles the
+    // direction set, so its columns are 4*mdis+1 bytes wide.
+    const int tpitch = 2 * d->mdis * (d->hp ? 2 : 1) + 1;
     const int pad_elem = pad_elem_bytes(d->bits);
     const int elem = d->elem_bytes;
 
@@ -2240,11 +2307,12 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     auto sz_io = [&](const Eedi3PlaneConfig & c) {
         return static_cast<VkDeviceSize>(c.rows) * c.width * elem;
     };
-    auto sz_pbt = [](const Eedi3PlaneConfig & c) {
+    auto sz_pbt = [&](const Eedi3PlaneConfig & c) {
         // Must match the shader's pbt layout: with two directions per lane
         // (tpitch 33..64) the deltas pack to a nibble each, one byte per lane
-        // pair -- 16 bytes per column -- and everything else stays int8.
-        const VkDeviceSize stride = (c.tpitch > 32 && c.tpitch <= 64)
+        // pair -- 16 bytes per column -- and everything else stays int8. hp's
+        // deltas span +-2, so its columns are always the full TPITCH.
+        const VkDeviceSize stride = (!d->hp && c.tpitch > 32 && c.tpitch <= 64)
                                         ? 16
                                         : static_cast<VkDeviceSize>(c.tpitch);
         return static_cast<VkDeviceSize>(c.rows) * c.width * stride;
@@ -2252,6 +2320,12 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     auto sz_pad = [&](const Eedi3PlaneConfig & c) {
         return static_cast<VkDeviceSize>(c.pad_stride) * c.pad_height *
                pad_elem;
+    };
+    auto sz_hp = [&](const Eedi3PlaneConfig & c) {
+        // One half-pel element per padded row and column (WIDTH per row), in
+        // the native io type like the reference's hp scratch.
+        return d->hp ? static_cast<VkDeviceSize>(c.width) * c.pad_height * elem
+                     : 0;
     };
     auto sz_bits = [&](const Eedi3PlaneConfig & c) {
         return static_cast<VkDeviceSize>((c.width + 31) / 32) * c.rows * 4;
@@ -2279,6 +2353,7 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         const bool has_io = true;
         shared(sz_pad(V), sz_pad(H), V.pad_off, V.pad_bytes, H.pad_off,
                H.pad_bytes);
+        shared(sz_hp(V), sz_hp(H), V.hp_off, V.hp_bytes, H.hp_off, H.hp_bytes);
         shared(sz_io(V), sz_io(H), V.dst_off, V.dst_bytes, H.dst_off,
                H.dst_bytes);
         shared(d->aa ? sz_io(V) : 0, d->aa ? sz_io(H) : 0, V.dst2_off,
@@ -2421,14 +2496,14 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         }
         Eedi3RowSpec spec { key.width,        d->nrad,          d->mdis,
                             mclip_on ? 1 : 0, sclip_on ? 1 : 0, d->vcheck,
-                            SGSIZE,           lsz_vcheck };
+                            SGSIZE,           lsz_vcheck,       d->hp ? 2 : 1 };
         if (d->trace) {
             fprintf(stderr,
                     "[eedi3] spec w=%d nrad=%d mdis=%d mclip=%d sclip=%d "
-                    "vcheck=%d lszr=%d lszv=%d horiz=%d batch=%d\n",
+                    "vcheck=%d lszr=%d lszv=%d horiz=%d hp=%d batch=%d\n",
                     spec.width, spec.nrad, spec.mdis, spec.has_mclip,
                     spec.has_sclip, spec.vcheck, spec.lsz_row, spec.lsz_vcheck,
-                    key.horiz ? 1 : 0, d->batch_size);
+                    key.horiz ? 1 : 0, spec.hpf, d->batch_size);
         }
         auto add =
             [&](const uint32_t * code, size_t size, const char * tag,
@@ -2492,6 +2567,12 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         if (auto e = add(d->pad_code, d->pad_size, "eedi3-pad", 0, &p.pad,
                          GpuWorkgroup { .x = 256 })) {
             return e;
+        }
+        if (d->hp) {
+            if (auto e = add(d->hpfill_code, d->hpfill_size, "eedi3-hpfill", 0,
+                             &p.hpfill, GpuWorkgroup { .x = 256 })) {
+                return e;
+            }
         }
         // Only the kernels this key's variant dispatches, gated on the key's
         // `horiz` (not d->horiz): EEDI3AA has horiz == false yet needs

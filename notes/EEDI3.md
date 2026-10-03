@@ -1,32 +1,29 @@
 # EEDI3 — notes
 
 Status: **shipped** — family-A semantics (eedi3m/eedi3vk2). Both depths are
-bit-exact against eedi3vk2: the fp32 rolling window sums are re-summed in the
-reference's k order and the cost/relax/vcheck/cubic float expressions carry the
-reference's `precise` qualifiers (measured ~1%). EEDI3, EEDI3H (native
-transposed-plane, no `std.Transpose` nodes) and
-EEDI3AA (fused based_aa chain) share every kernel, geometry and pipeline. Runs on
-the **R80 GPU API**: `clip/sclip/mclip:vnode:gpu` in and `ffGPUOutput` out, one
-exec pool, and no host upload/download/gather/blit machinery at all. The parallel
-vcheck is the default.
+bit-exact against eedi3vk2: the fp32 rolling sums are re-summed in the
+reference's k order and the cost/relax/vcheck/cubic float expressions carry its
+`precise` qualifiers. `hp` (which eedi3m only registers; eedi3vk2, vszip and
+vszipcl implement it) is live and bit-exact too. EEDI3, EEDI3H (native
+transposed-plane) and EEDI3AA (fused based_aa chain) share every kernel,
+geometry and pipeline. Runs on the **R80 GPU API**: `clip/sclip/mclip:vnode:gpu` in and
+`ffGPUOutput` out, one exec pool, and no host upload/download/gather/blit
+machinery at all. The parallel vcheck is the default.
 
 Benchmark defaults: 2000 f, real based_aa clip, 2x2160p, field=3, mdis=20,
 vcheck=2. `MANGOHUD=0 uv run tools/benchmark.py --filter eedi3 vsfeel vszipcl`.
 
-| clip | vsfeel | vszipcl | speedup |
-|---|---|---|---|
-| u16 | 384 | 214 | 1.8x |
-| fp32 | 246 | 186 | 1.3x |
+| clip | vsfeel | eedi3vk2 | vszipcl | speedup |
+|---|---|---|---|---|
+| u16 | 384 | — | 214 | 1.8x |
+| fp32 | 246 | — | 186 | 1.3x |
+| u16 hp | 198 | 80 | 48 | 2.5x |
 
-The bit-exactness change (2026-10-02) is **−1.2%** on the graded AA chain
-(459.3 → 453.7 fps, n=3 each, vszipcl control 52.5/54.5), inside the 1.3-1.5%
-run spread; the ring re-sum's extra adds are offset by dropping the incremental
-accumulator.
-
-Interleaved same-session A/B against the pre-port build (2 reps, `--repeat 2`,
-graded medians): EEDI3 **612 → 384 fps (−37%)**, EEDI3H 417 → 401 (−4%),
-EEDI3AA 155 → 148 (−4.5%). `--gpu-cache` (input pre-uploaded) on the port:
-EEDI3 380 → 417, EEDI3H 400 → 488, EEDI3AA 149 → 146.
+The hp row is a 600 f same-session pair of the same workload (`--eedi3-hp 1`);
+there hp costs vsfeel **2.3x** (451 → 198 fps against eedi3vk2's 141 → 80 and
+vszipcl's 62 → 48) because the direction set doubles (TPITCH 41 → 81, K 2 → 3),
+the relax widens to ±2 and the `pbt` column grows 16 → 81 bytes (320 MiB at
+4K).
 
 - **The remaining EEDI3 gap is the R80 API's single compute queue.** The core
   creates exactly one compute queue (`VSVulkanCoreHandles.computeQueueIndex`; the
@@ -36,21 +33,20 @@ EEDI3 380 → 417, EEDI3H 400 → 488, EEDI3AA 149 → 146.
   latency-bound scan: 1080 waves at 2x2160p leaves the GPU under-occupied, so
   throughput comes from running several frames' rows at once. The pre-port filter
   used up to 8 Vulkan queues (forcing it to one drops it 987 → 416 fps at 1080p,
-  i.e. the whole difference is cross-queue overlap). Consecutive *dispatches
-  inside one command buffer* do overlap (1080p: one row dispatch 2.25 ms, ×2
-  1.45 ms/frame, ×4 1.10), so the port records a **batch of output frames per
-  submission, phase by phase** (all pads, then all rows with no barrier between
-  them, then all vchecks, then all tails) and caches the frames the sibling
-  `getFrame` calls then take.
+  i.e. the whole difference is cross-queue overlap), and consecutive dispatches
+  inside one command buffer do overlap (1080p: one row dispatch 2.25 ms, ×2
+  1.45 ms/frame, ×4 1.10), so a submission carries a **batch of output frames,
+  phase by phase** (all pads, all hpfills, all rows with no barrier between
+  them, all vchecks, all tails) and caches the frames the sibling `getFrame`
+  calls then take.
 - **Batch size (`VSFEEL_EEDI3_BATCH`, default from a ~256 MiB scratch target,
   512 for EEDI3AA).** Swept on the graded 2x2160p workload: EEDI3 B=2 406,
   B=4 389, B=8 282 fps; EEDI3AA B=2 142, **B=4 157**, B=8 103. The knee is *not*
-  memory — B=8 loses just the same with a 3.7x smaller scratch (mdis=5), and
-  raising `VS_VULKAN_MAX_VRAM_MB` changes nothing. It is the submit path:
-  `gpuExecSubmit` costs 346 us/frame at B=4 against 670 at B=8, i.e. it grows
-  faster than the frame count, and a batch that drains quickly (the masked rows
-  early-out) reaches the point where that dominates sooner. That is also why the
-  packed pbt below *lowered* the knee from 4 to 2.
+  memory — B=8 loses just the same with a 3.7x smaller scratch (mdis=5) — it is
+  the submit path (`gpuExecSubmit` 346 us/frame at B=4 against 670 at B=8, i.e.
+  it grows faster than the frame count, and a batch that drains quickly reaches
+  the point where that dominates sooner). That is also why the packed pbt below
+  *lowered* the knee from 4 to 2.
 - **`pbt` is 2-bit packed** when a lane owns exactly two directions (TPITCH
   33..64, i.e. mdis 17..31, which includes the default 20): each lane builds a
   nibble and only even lanes store, combining their odd neighbour's nibble
@@ -59,8 +55,8 @@ EEDI3 380 → 417, EEDI3H 400 → 488, EEDI3AA 149 → 146.
   170 → 63). Bit-exact vs the pre-port build on the whole 16-config sweep
   (mdis 5/20/40 cover the K=1/K=2/K=3 paths). The stores were worth ~10% of the
   frame ungated (PROBE=4, no pbt store, 406 vs 367 fps); packing recovers about a
-  third of that and moved the batch knee down, for ~7% on the graded vertical
-  workload (374 at the old 1 GiB target → 403).
+  third of that, for ~7% on the graded vertical workload (374 at the old 1 GiB
+  target → 403). hp cannot pack: its deltas span ±2.
 - **Next lever if EEDI3 must reach parity:** the queue, not the kernel. Nothing in
   the R80 API offers a second compute queue, so the remaining ~1.5x would need the
   row kernel to fill the GPU by itself — e.g. splitting each row's column walk
@@ -69,7 +65,8 @@ EEDI3 380 → 417, EEDI3H 400 → 488, EEDI3AA 149 → 146.
 ## Implementation
 
 Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter eedi3 vsfeel
-vszipcl` (and `--filter eedi3aa`, `--filter eedi3h` where registered).
+vszipcl` (and `--filter eedi3aa`, `--filter eedi3h` where registered;
+`--eedi3-hp 1` for the half-pel search).
 
 Two GPU passes per plane: `ENTRY_PAD` expands eedi3m's mirrors in VRAM from the
 tight kept-row upload; `ENTRY_ROW` does the DP + backtrack; `ENTRY_VCHECK`
@@ -77,6 +74,17 @@ finalises each interp row. EEDI3H adds `ENTRY_XPOSE` (16x16 tiled transpose with
 LDS stage, clip → R', sclip → B') and `ENTRY_COMPOSE`; EEDI3AA adds `ENTRY_ASSEMBLEV`
 (vertical merge of the two sub-frames) and reuses `ENTRY_COMPOSE` with a
 `comp_fuse` push constant.
+
+### hp (half-pel search)
+
+Spec constant 8 (`HPF`) = 2 doubles `TPITCH`/`CENTER` (u in half-pel units): the
+s1/s2 windows and gates take the half-pel direction, s0 windows the half-pel rows
+for odd u and the kept rows at half the offset for even u, the relax widens to ±2
+with a halved gamma, and interpolate/vcheck get even/odd (2-/4-tap) forms.
+`ENTRY_HPFILL` (one workgroup per written pad row, its own phase between pad and
+row) precomputes them into region `hp` (binding 8, `WIDTH` per pad row) like the
+reference's hpfill kernel; hp's `pbt` deltas span ±2, so its columns are full
+`TPITCH`.
 
 - `ENTRY_ROW` is a subgroup-register DP: one 32-lane workgroup per interp row, each
   lane owning `K = ceil(TPITCH/SGSIZE)` consecutive directions in private registers,
@@ -91,12 +99,12 @@ LDS stage, clip → R', sclip → B') and `ENTRY_COMPOSE`; EEDI3AA adds `ENTRY_A
 - Memory path (R80): every input plane is read straight out of the core's GPU
   frame at its own pitch and every kernel writes into the output frame's own
   memory; the mask predicate/dilation and the horizontal transpose are GPU
-  kernels too. The per-frame scratch (pad, dst, pbt, dmap, cint, vout, bits, R',
-  B', v, o0, rempty) is one `createGPUBuffer` per frame handed to the exec
+  kernels too. The per-frame scratch (pad, hp, dst, pbt, dmap, cint, vout, bits,
+  R', B', v, o0, rempty) is one `createGPUBuffer` per frame handed to the exec
   context with `gpuExecUsesBuffer`, so the pool reclaims it when the submission
   completes. One `Eedi3Job` per frame per sub-pass feeds `record_pass`, which is
-  split into `kPrep`/`kRow`/`kVcheck`/`kTail` phases so a batch's frames can be
-  recorded with no barrier between their row dispatches. Output frames are
+  split into `kPrep`/`kHp`/`kRow`/`kVcheck`/`kTail` phases so a batch's frames can
+  be recorded with no barrier between their row dispatches. Output frames are
   batched (`d->batch_size`, `VSFEEL_EEDI3_BATCH`) and cached for the sibling
   `getFrame` calls; `d->width_pipes` still deduplicates per-width pipelines.
   `num_streams` and `device_id` are registered no-ops (never read): depth is
@@ -179,6 +187,20 @@ identical everywhere):
 
 ## Historical
 
+- **2026-10-03 — hp (half-pel search), bit-exact against eedi3vk2.** `hp` was
+  an accepted no-op (eedi3m registers it that way: "only full pel is
+  implemented"); eedi3vk2, vszip and vszipcl implement it, so vsfeel does too.
+  Ported from eedi3vk2's `HPF == 2` paths (doubled direction set, the hpfill
+  precompute, the half-pel s0 window and cost combine, the ±2 relax, the halved
+  gamma, the even/odd interpolate and vcheck forms). Two traps: the host's pbt
+  stride had to double with hp (a half-sized region corrupted the frame), and
+  the reference's float 2-tap average in the *even* interpolate branch carries
+  the integer `+1` (u16 must not add it: its store already rounds half-up). The
+  mclip fixups are replicated verbatim, including the MDIS-based lane indices
+  that in hp land outside the reachable set for mdis ≥ 3. Bit-exact vs eedi3vk2
+  hp=1 on u16 (mdis 1..40, nrad 0..3, vcheck 0..3, field 0..3, dh, sclip, mclip
+  right/left/all) ; f32 too, except nrad=3 at mdis ≥ 25 (1.19e-7, the parallel
+  vcheck's Jacobi residual). hp costs 2.3x the full-pel row.
 - **2026-10-02 — f32 bit-exactness, found by the clip change.** On real content
   the f32 path lost its ~1 ulp band to DP argmin flips worth up to 4.9e-2, and
   u16 lost bit-exactness by 1 LSB on a few pixels per frame; every failing
@@ -189,17 +211,21 @@ identical everywhere):
   interpolated pixel); and the rolling window sums were accumulated
   incrementally where the reference re-sums the term ring in k order
   (`orderedSum`), which drifts by an ulp per column. Diffing the two shaders
-  expression by expression is what found both. The `mclip` cubic test's own
-  oracle was also wrong (`p3`/`n3` read as the same row); corrected to the
-  integer cubic, which the masked region reproduces exactly.
-- **Compat args `opt`/`hp`/`ucubic`/`cost3` are registered accepted no-ops.**
-  They select behaviour vsfeel always runs (AVX2-class path, full-pel
-  family-A search, cubic fill, three-window costs), so any value is
-  byte-identical to the default (`test_eedi3_compat_args_are_accepted_noops`).
-  `hp` used to fail dispatch (vsaa forwards it); no perf change.
-- **Undefined packed-pbt read in the K=2 DP loop.** The paired predecessor byte
+  expression by expression is what found both; the ring re-sum costs −1.2% (459.3
+  → 453.7 fps on the graded chain, inside the run spread). The `mclip` cubic
+  test's own oracle was also wrong (`p3`/`n3` read as the same row); corrected to
+  the integer cubic, which the masked region reproduces exactly.
+- **Compat args `opt`/`ucubic`/`cost3` are registered accepted no-ops.** They
+  select behaviour vsfeel always runs (AVX2-class path, cubic fill, three-window
+  costs), so any value is byte-identical to the default
+  (`test_eedi3_compat_args_are_accepted_noops`); `hp` used to fail dispatch
+  (vsaa forwards it). No perf change.
+- **The R80 port's own cost** (same-session A/B against the pre-port build, 2
+  reps, graded medians): EEDI3 **612 → 384 fps**, EEDI3H 417 → 401, EEDI3AA
+  155 → 148.
+- **Undefined packed-pbt read in the K=2 DP loop**: the paired predecessor byte
   was stored during the per-direction loop and read the not-yet-initialized
-  second delta; the write now follows both delta calculations. No perf change.
+  second delta. No perf change.
 
 Rounds in order. Perf totals from rounds 2–13 are **void** (zero-mask path, below);
 the correctness fixes, accuracy proofs and mechanisms in those rounds survive and
@@ -537,6 +563,9 @@ passes). All bit-identical to the previous build unless stated.
   the interpolate pass reads instead of `tileF`, plus re-deriving the `xmin` and
   rightmost-column special cases. Gate on the bit-exact oracle before measuring.
 - **SGSIZE 64 / K=1** — +2% on EEDI3AA only; not shipped (round 29).
+- **hp's row cost**: three structural items ride on the doubled window work —
+  the pbt column is 81 bytes at full TPITCH (hp's ±2 deltas would fit 3 bits),
+  K = 3 keeps 69 ring registers live per lane, and hpfill is its own phase.
 - `ENTRY_PAD` div/mod by `pad_stride`, `ENTRY_VCOPY`/`ENTRY_BLIT` div by `WIDTH`: a
   2D dispatch removes them. Per-plane passes, not the row kernel; unmeasured.
 - BT_TILE as a spec constant swept {16,32,64}; hoisting the duplicated `cubic_float`

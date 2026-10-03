@@ -9,10 +9,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - BM3Dv2 now accepts 16-bit integer input.
+- EEDI3, EEDI3H, and EEDI3AA implement `hp` (the half-pel search), bit-exact with eedi3vk2.
 
 ### Changed
 
-- BM3Dv2 is about 17% faster with less run-to-run variance.
+- BM3Dv2 is about 5% faster with less run-to-run variance.
 - BM3Dv2 accepts up to `radius=16` instead of 4, matching vszipcl.
 - BM3Dv2 follows VapourSynth-BM3D for block matching and filtering instead of the BM3DCUDA.
 - BM3Dv2 denoises all planes of YUV clips and supports the joint 4:4:4 `chroma=True` mode.
@@ -21,7 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - EEDI3 and EEDI3H are bit-exact with eedi3vk2 in fp32.
 - NLMeans more closely matches vszipcl in fp32 and u16.
-- Only rewrite the pipeline cache when a process compiled something new.
+- The pipeline cache is only rewritten when a process compiled something new.
 
 ## [1.0.0] - 2026-10-01
 

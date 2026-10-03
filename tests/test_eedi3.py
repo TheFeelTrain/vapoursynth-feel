@@ -23,6 +23,12 @@ Agreement measured on the real-content clip (640x360, interp rows only):
   near-tie DP argmins, which on real content was worth up to 4.9e-2 on a few
   pixels. The one exception is alpha=beta=0.5 (remainingWeight 0, so the blend
   is pure): a few pixels per frame land 1..18 ulp out (5.36e-7 max).
+* hp (the half-pel search eedi3vk2 and vszip implement; eedi3m only registers
+  it): u16 is bit-exact on the whole shared surface too (mdis 1..40, nrad 0..3,
+  vcheck 0..3, field 0..3, dh, sclip, and every mclip shape including the long
+  masked left tail the row kernel jumps over). f32 is bit-exact except nrad=3
+  at mdis >= 25, where the parallel vcheck's Jacobi chain leaves ~1 ulp
+  (1.19e-7 measured) on a handful of pixels.
 * vsfeel vs eedi3m (the installed CPU reference) diverges on tiny sparse
   flip sets (up to ~1500 px of 115200, max ~3276) that are IDENTICAL to the
   eedi3m-vs-eedi3vk2 flip sets: both GPU implementations share one float-DP
@@ -133,6 +139,19 @@ def right_half_mask(width, height, length, bits):
     return core.fmtc.bitdepth(mask8, bits=bits, fulls=True, fulld=True)
 
 
+def left_off_mask(width, height, length, bits):
+    # Mask OFF on the left: the first DP column (xmin) sits far right, so the
+    # reference walks the masked tail column by column where vsfeel uses its
+    # analytic seed.
+    half = width // 2
+    black = core.std.BlankClip(format=vs.GRAY8, width=half, height=height,
+                               length=length, color=[0])
+    white = core.std.BlankClip(format=vs.GRAY8, width=width - half,
+                               height=height, length=length, color=[255])
+    mask8 = core.std.StackHorizontal([black, white])
+    return core.fmtc.bitdepth(mask8, bits=bits, fulls=True, fulld=True)
+
+
 def interp_rows(h, n, field):
     fbase = field & 1
     eff = fbase if field <= 1 else ((n & 1) ^ fbase)
@@ -158,7 +177,15 @@ field = kwargs.get("field", 1)
 ref_kw = dict(kwargs)
 my_kw = dict(kwargs)
 if spec.get("mclip"):
-    mask = right_half_mask(clip.width, clip.height, clip.num_frames, 16)
+    mask_kind = spec.get("mask", "right")
+    if mask_kind == "left":
+        mask = left_off_mask(clip.width, clip.height, clip.num_frames, 16)
+    elif mask_kind == "all":
+        mask = core.std.BlankClip(format=vs.GRAY16, width=clip.width,
+                                  height=clip.height, length=clip.num_frames,
+                                  color=[65535])
+    else:
+        mask = right_half_mask(clip.width, clip.height, clip.num_frames, 16)
     my_kw["mclip"] = mask
     ref_kw["mclip"] = mask if bits == 16 else core.fmtc.bitdepth(
         mask, bits=32, fulls=True, fulld=True)
@@ -221,7 +248,7 @@ print("RESULT " + json.dumps({"maxdiff": maxdiff,
 )
 
 
-def _mc_compare(bits, frames, kwargs, mclip=False, sclip=None):
+def _mc_compare(bits, frames, kwargs, mclip=False, sclip=None, mask="right"):
     """Compare vsfeel against eedi3vk2 for an mclip/sclip case (subprocess)."""
     reference_or_skip("eedi3vk2", "EEDI3")
     spec = {
@@ -232,6 +259,7 @@ def _mc_compare(bits, frames, kwargs, mclip=False, sclip=None):
         "kwargs": dict(kwargs),
         "mclip": bool(mclip),
         "sclip": sclip,
+        "mask": mask,
     }
     return compare_or_skip(_MC_COMPARE_SCRIPT, [json.dumps(spec)], timeout=600)
 
@@ -399,6 +427,31 @@ REFERENCE_CASES_16 = [
         },
         0,
     ),
+    # hp (eedi3vk2's half-pel search). mdis 1/3/8/20/40 cover the
+    # K = 1/2/3/6 lane splits and the tpitch 33..64 band where full-pel packs
+    # its backtrack deltas (hp cannot: its deltas span +-2).
+    ({"field": 1, "hp": 1}, 0),
+    ({"field": 1, "hp": 1, "mdis": 1, "nrad": 0, "vcheck": 0}, 0),
+    ({"field": 1, "hp": 1, "mdis": 3, "nrad": 3, "vcheck": 1}, 0),
+    ({"field": 1, "hp": 1, "mdis": 8, "nrad": 1, "vcheck": 0}, 0),
+    ({"field": 1, "hp": 1, "mdis": 20, "nrad": 2, "vcheck": 3}, 0),
+    ({"field": 1, "hp": 1, "mdis": 40, "nrad": 3, "vcheck": 2}, 0),
+    ({"field": 0, "hp": 1, "mdis": 5, "nrad": 1, "vcheck": 2}, 0),
+    ({"field": 1, "hp": 1, "dh": 1, "mdis": 5, "nrad": 1, "vcheck": 2}, 0),
+    ({"field": 3, "hp": 1, "mdis": 5, "nrad": 1, "vcheck": 0}, 0),
+    (
+        {
+            "field": 1,
+            "hp": 1,
+            "mdis": 20,
+            "nrad": 3,
+            "vcheck": 2,
+            "alpha": 0.0,
+            "beta": 0.0,
+            "gamma": 5.0,
+        },
+        0,
+    ),
 ]
 
 REFERENCE_CASES_32 = [
@@ -427,6 +480,32 @@ REFERENCE_CASES_32 = [
             "vthresh0": 128.0,
             "vthresh1": 8.0,
             "vthresh2": 16.0,
+        },
+        0,
+    ),
+    # hp is bit-exact too, except nrad=3 at mdis >= 25: there the parallel
+    # vcheck's Jacobi chain leaves ~1 ulp (1.19e-7 measured) on a handful of
+    # pixels (the repo's ulp-level float32 tier), so those two use 1e-6.
+    ({"field": 1, "hp": 1}, 0),
+    ({"field": 1, "hp": 1, "mdis": 1, "nrad": 0, "vcheck": 0}, 0),
+    ({"field": 1, "hp": 1, "mdis": 3, "nrad": 3, "vcheck": 1}, 0),
+    ({"field": 1, "hp": 1, "mdis": 8, "nrad": 1, "vcheck": 0}, 0),
+    ({"field": 1, "hp": 1, "mdis": 20, "nrad": 2, "vcheck": 3}, 0),
+    ({"field": 1, "hp": 1, "mdis": 40, "nrad": 3, "vcheck": 2}, 1e-6),
+    ({"field": 1, "hp": 1, "mdis": 31, "nrad": 3, "vcheck": 2}, 1e-6),
+    ({"field": 0, "hp": 1, "mdis": 5, "nrad": 1, "vcheck": 2}, 0),
+    ({"field": 1, "hp": 1, "dh": 1, "mdis": 5, "nrad": 1, "vcheck": 2}, 0),
+    ({"field": 3, "hp": 1, "mdis": 5, "nrad": 1, "vcheck": 0}, 0),
+    (
+        {
+            "field": 1,
+            "hp": 1,
+            "mdis": 20,
+            "nrad": 3,
+            "vcheck": 2,
+            "alpha": 0.0,
+            "beta": 0.0,
+            "gamma": 5.0,
         },
         0,
     ),
@@ -745,6 +824,59 @@ def test_eedi3_mclip_dh_matches_vk2(clip_16bit):
 
 
 # ---------------------------------------------------------------------------
+# hp (half-pel) reference comparisons on the mask/sclip paths
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mask", ["right", "left", "all"])
+@pytest.mark.parametrize("bits", [16, 32], ids=["16bit", "32bit"])
+def test_eedi3_hp_mclip_matches_vk2(bits, mask):
+    """hp + mclip on the three mask shapes that select different mask paths:
+    right = the DP starts at column 0, left = a long masked left tail (the row
+    kernel jumps over it with the analytic seed, whose hp fixups the reference
+    applies column by column), all = the mask is on everywhere."""
+    kw = dict(field=1, hp=1, mdis=5, nrad=1, vcheck=2)
+    payload = _mc_compare(bits, (0, 11), kw, mclip=True, mask=mask)
+    if bits == 16:
+        assert payload["maxdiff"] == 0, f"hp mclip({mask}) mismatch"
+    else:
+        assert payload["maxdiff"] < 1e-6, f"hp mclip({mask}) mismatch"
+
+
+def test_eedi3_hp_mclip_long_prefix_matches_vk2(clip_16bit):
+    """The masked left tail (xmin far right) at a larger mdis, where the hp
+    fixup lanes and the tail's ramp geometry differ most from full-pel."""
+    kw = dict(field=1, hp=1, mdis=20, nrad=3, vcheck=2)
+    payload = _mc_compare(16, (0, 11), kw, mclip=True, mask="left")
+    assert payload["maxdiff"] == 0, "hp mclip long prefix mismatch"
+
+
+def test_eedi3_hp_mclip_dh_matches_vk2(clip_16bit):
+    """hp + mclip + dh (a doubled, transposed-geometry pad with hp rows)."""
+    kw = dict(field=1, hp=1, dh=1, mdis=5, nrad=1, vcheck=2)
+    payload = _mc_compare(16, (0, 11), kw, mclip=True, mask="left")
+    assert payload["height"] == 2 * HEIGHT
+    assert payload["maxdiff"] == 0, "hp mclip dh mismatch"
+
+
+def test_eedi3_hp_mclip_field_gt1_matches_vk2(clip_16bit):
+    """hp + mclip with frame doubling (one mask frame driving both parities)."""
+    n_src = clip_16bit.num_frames
+    kw = dict(field=3, hp=1, mdis=5, nrad=1, vcheck=2)
+    payload = _mc_compare(16, (0, n_src, 2 * n_src - 1), kw, mclip=True)
+    assert payload["num_frames"] == 2 * n_src
+    assert payload["maxdiff"] == 0, "hp mclip field=3 mismatch"
+
+
+def test_eedi3_hp_sclip_matches_vk2(clip_16bit):
+    """hp + sclip: the vcheck's cint is replaced by the caller's clip, and the
+    d2p term halves the direction (hp's a2 measures full-pel units)."""
+    kw = dict(field=1, hp=1, mdis=20, nrad=2, vcheck=2)
+    payload = _mc_compare(16, (0, 11, 23), kw, sclip="shift")
+    assert payload["maxdiff"] == 0, "hp sclip mismatch"
+
+
+# ---------------------------------------------------------------------------
 # Formats and plane handling
 # ---------------------------------------------------------------------------
 
@@ -1033,12 +1165,14 @@ def test_eedi3_sclip_dh_requires_doubled_height(clip_16bit):
 
 
 def test_eedi3_compat_args_are_accepted_noops(clip_16bit):
-    """eedi3m/eedi3vk2/vsaa compat args are registered and byte-identical.
+    """eedi3m/vsaa compat args are registered and byte-identical.
 
-    ``opt`` (eedi3m SIMD level), ``hp`` (eedi3vk2 half-pel), ``ucubic`` and
-    ``cost3`` (deprecated vsaa) all select behaviour vsfeel always runs
-    (AVX2-class path, full-pel search, cubic fill, three-window costs), so
-    any value must reproduce the default output exactly.
+    ``opt`` (eedi3m SIMD level) and ``ucubic``/``cost3`` (deprecated vsaa) all
+    select behaviour vsfeel always runs (AVX2-class path, cubic fill,
+    three-window costs), so any value must reproduce the default output
+    exactly. ``hp`` is not one of them: eedi3vk2 and vszip implement the
+    half-pel search, so vsfeel does too, and the hp tests below pin that it is
+    live and matches the reference.
     """
     base = dict(field=1, mdis=5, nrad=1, vcheck=2)
     ref = [
@@ -1047,8 +1181,6 @@ def test_eedi3_compat_args_are_accepted_noops(clip_16bit):
     for kw in (
         {"opt": 0},
         {"opt": 3},
-        {"hp": 0},
-        {"hp": 1},
         {"ucubic": 0},
         {"ucubic": 1},
         {"cost3": 0},
@@ -1058,6 +1190,31 @@ def test_eedi3_compat_args_are_accepted_noops(clip_16bit):
         for n, want in zip((0, 11), ref):
             got = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
             assert np.array_equal(got, want), f"{kw} changed frame {n}"
+
+
+@pytest.mark.parametrize("bits", [16, 32], ids=["16bit", "32bit"])
+def test_eedi3_hp_differs_from_fullpel(clip_gray, clip_16bit, bits):
+    """``hp`` is live: the half-pel search must change the interpolated rows
+    (an inert parameter would make the whole hp surface vacuous) and must be as
+    deterministic as every other mode."""
+    clip = clip_16bit if bits == 16 else clip_gray
+    dtype = _dtype(bits)
+    base = dict(field=1, mdis=5, nrad=1, vcheck=2)
+    full = _run(clip, **base)
+    hp_a = _run(clip, hp=1, **base)
+    hp_b = _run(clip, hp=1, **base)
+    changed = 0
+    for n in (0, 11):
+        a = _plane(full.get_frame(n), 0, WIDTH, HEIGHT, dtype)
+        b = _plane(hp_a.get_frame(n), 0, WIDTH, HEIGHT, dtype)
+        c = _plane(hp_b.get_frame(n), 0, WIDTH, HEIGHT, dtype)
+        rows = _interp_rows(HEIGHT, n, 1)
+        changed += int((a[rows] != b[rows]).sum())
+        if bits == 16:
+            assert np.array_equal(b, c), f"hp nondeterministic at frame {n}"
+        else:
+            assert np.abs(b - c).max() < 1e-6, f"hp nondeterministic at frame {n}"
+    assert changed > 0, "hp=True produced the full-pel output (parameter is inert)"
 
 
 def test_eedi3_sclip_content_matches_vk2(clip_16bit):
@@ -1135,18 +1292,28 @@ _PIPELINE_SCRIPT = textwrap.dedent("""\
     src = core.bs.VideoSource(sys.argv[1])
     g16 = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                              bits=16, fulls=True, fulld=True)
-    name, mclip = sys.argv[2], sys.argv[3] == "1"
+    name, mclip, hp = sys.argv[2], sys.argv[3] == "1", sys.argv[4] == "1"
     kw = {"mclip": core.std.ShufflePlanes(src, 0, vs.GRAY)} if mclip else {}
+    if hp:
+        kw["hp"] = 1
     getattr(core.vsfeel, name)(g16, field=2 if name == "EEDI3AA" else 1,
                                mdis=5, nrad=1, **kw)
 """)
 
 
-def _eedi3_pipeline_tags(name, mclip):
+def _eedi3_pipeline_tags(name, mclip, hp=False):
     """The `eedi3-*` pipeline tags the variant created, from the debug banner."""
     env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1"}
     proc = subprocess.run(
-        [sys.executable, "-c", _PIPELINE_SCRIPT, str(CLIP_PATH), name, "1" if mclip else "0"],
+        [
+            sys.executable,
+            "-c",
+            _PIPELINE_SCRIPT,
+            str(CLIP_PATH),
+            name,
+            "1" if mclip else "0",
+            "1" if hp else "0",
+        ],
         capture_output=True,
         text=True,
         timeout=600,
@@ -1194,3 +1361,11 @@ def test_eedi3_creates_only_the_pipelines_a_variant_dispatches():
     assert "eedi3-maskdilate" not in hm
     am = _eedi3_pipeline_tags("EEDI3AA", True)
     assert {"eedi3-maskpack", "eedi3-maskdilate", "eedi3-maskdilate-tr"} <= am
+
+
+def test_eedi3_creates_the_hpfill_pipeline_only_for_hp():
+    """The half-pel precompute exists only when hp is on (it is a full extra
+    dispatch per plane), for every variant."""
+    for name in ("EEDI3", "EEDI3H", "EEDI3AA"):
+        assert "eedi3-hpfill" not in _eedi3_pipeline_tags(name, False)
+        assert "eedi3-hpfill" in _eedi3_pipeline_tags(name, False, hp=True)

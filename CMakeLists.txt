@@ -278,9 +278,11 @@ foreach(bits IN LISTS VK_BITS)
         "eedi3_${bits}_vcheck_para_j4|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=5"
         "eedi3_${bits}_vcheck_para_j5|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=6"
         # upload kernels: mirror-pad builder + empty-row vcheck copy and the
-        # assemble/transpose passes (plain 1D kernels, fixed local size, no
-        # subgroup ops).
+        # upload kernels: mirror-pad builder + hp's half-pel precompute +
+        # empty-row vcheck copy and the assemble/transpose passes (plain 1D
+        # kernels, fixed local size, no subgroup ops).
         "eedi3_${bits}_pad|eedi3.comp|-DBITS=${bits} -DENTRY_PAD"
+        "eedi3_${bits}_hpfill|eedi3.comp|-DBITS=${bits} -DENTRY_HPFILL"
         "eedi3_${bits}_vcopy|eedi3.comp|-DBITS=${bits} -DENTRY_VCOPY"
         "eedi3_${bits}_blit|eedi3.comp|-DBITS=${bits} -DENTRY_BLIT"
         "eedi3_${bits}_xpose|eedi3.comp|-DBITS=${bits} -DENTRY_XPOSE"

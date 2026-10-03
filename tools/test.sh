@@ -42,6 +42,15 @@ if [[ -d $root_dir/.venv/bin ]]; then
     export PATH
 fi
 
+# Every filter's comparison subprocess loads the Vulkan implicit layers, and
+# MangoHud's overlay is one of them when MANGOHUD is set in the shell. Under
+# heavy parallel load its own teardown thread aborts ("free(): invalid
+# pointer") in a process whose comparison already succeeded, which the harness
+# reports as a filter failure. Results do not depend on the overlay (AGENTS.md
+# asks for MANGOHUD=0 on every timed run), so the suite forces it off; run
+# pytest directly to keep the shell's setting.
+export MANGOHUD=0
+
 # One command: cap at 8 workers, never trust `-n auto` (32 on the dev box).
 workers=${VSFEEL_TEST_WORKERS:-$(nproc 2>/dev/null || echo 8)}
 case $workers in

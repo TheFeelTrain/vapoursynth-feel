@@ -111,6 +111,10 @@ ORACLE_CASES_16 = [
     dict(field=3, mdis=5, nrad=1, vcheck=2),
     dict(field=3, mdis=20, nrad=2, vcheck=2),
     dict(field=1, mdis=5, nrad=1, vcheck=2, dh=1),
+    dict(field=1, mdis=5, nrad=1, vcheck=2, hp=1),
+    dict(field=1, mdis=20, nrad=2, vcheck=2, hp=1),
+    dict(field=1, mdis=3, nrad=3, vcheck=0, hp=1),
+    dict(field=1, mdis=5, nrad=1, vcheck=2, hp=1, dh=1),
 ]
 
 ORACLE_CASES_32 = [
@@ -130,6 +134,8 @@ ORACLE_CASES_32 = [
     ),
     dict(field=3, mdis=5, nrad=1, vcheck=2),
     dict(field=1, mdis=5, nrad=1, vcheck=2, dh=1),
+    dict(field=1, mdis=5, nrad=1, vcheck=2, hp=1),
+    dict(field=1, mdis=20, nrad=2, vcheck=2, hp=1),
 ]
 
 

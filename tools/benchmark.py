@@ -538,6 +538,8 @@ def _eedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[st
         f"vcheck={ns.eedi3_vcheck}, vthresh0={ns.eedi3_vthresh0}, "
         f"vthresh1={ns.eedi3_vthresh1}, vthresh2={ns.eedi3_vthresh2}"
     )
+    if ns.eedi3_hp:
+        common += ", hp=1"
     if getattr(ns, "synthetic", False):
         return {
             "vsfeel": f"core.vsfeel.EEDI3({clip}, {common})",
@@ -570,6 +572,8 @@ def _eedi3h_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[s
         f"vcheck={ns.eedi3_vcheck}, vthresh0={ns.eedi3_vthresh0}, "
         f"vthresh1={ns.eedi3_vthresh1}, vthresh2={ns.eedi3_vthresh2}"
     )
+    if ns.eedi3_hp:
+        common += ", hp=1"
     if getattr(ns, "synthetic", False):
         # The synthetic vpy defines only `clip` (no ss/mask): the same plain
         # 1x call _eedi3_build emits, with no aux clips to reference.
@@ -824,6 +828,14 @@ FILTERS: dict[str, FilterSpec] = {
                 True,  # pyright: ignore[reportArgumentType]
                 "pass the vsaa edge mask as mclip to vsfeel/eedi3vk2 (default: true)",
             ),
+            Arg(
+                "hp",
+                "--eedi3-hp",
+                "eedi3_hp",
+                _str_to_bool,
+                False,  # pyright: ignore[reportArgumentType]
+                "run the half-pel search (hp=1) on every plugin that implements it",
+            ),
         ],
         build=_eedi3_build,
         # Real runs mirror vsaa.based_aa: source at 16-bit, vsaa edge mask,
@@ -856,6 +868,14 @@ FILTERS: dict[str, FilterSpec] = {
                 _str_to_bool,
                 True,  # pyright: ignore[reportArgumentType]
                 "pass the vsaa edge mask as mclip to vsfeel (default: true)",
+            ),
+            Arg(
+                "hp",
+                "--eedi3-hp",
+                "eedi3_hp",
+                _str_to_bool,
+                False,  # pyright: ignore[reportArgumentType]
+                "run the half-pel search (hp=1) on every plugin that implements it",
             ),
         ],
         build=_eedi3h_build,

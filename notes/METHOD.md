@@ -263,6 +263,11 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   lowering `max_cache_size` instead made the timed region re-run the upstream
   chain and collapsed *every* plugin by 3–4× — a much more confusing failure
   than the original noise.
+- **A comparison subprocess that aborts with `free(): invalid pointer` after
+  printing `RESULT` is MangoHud, not the filter.** Its overlay is an implicit
+  Vulkan layer, and its own teardown thread aborts under high subprocess
+  concurrency (measured 4/128 on the unmodified tree, 0/48 with `MANGOHUD=0`,
+  backtrace inside `libMangoHud.so`); `tools/test.sh` now forces `MANGOHUD=0`.
 - **Decompose kernel cost with short-lived probes**, not theory: kill the
   theory with arithmetic before coding anything — bandwidth math (taps ×
   bytes × pixels vs bus), value-range math (min/max exponent vs subnormal),

@@ -46,13 +46,24 @@
  *   b5 sclip  io type, rows x WIDTH (only VCHECK > 0 && HAS_SCLIP)
  *   b6 cint   io type, rows x WIDTH vertical cubic per pixel (only when
  *             VCHECK > 0 && !HAS_SCLIP)
+ *   b7 vout   io type, rows x WIDTH vcheck output rows
+ *   b8 hp     io type, padHeight x WIDTH half-pel rows (only HPF > 1)
  *
+ * ENTRY_HPFILL grid (rows + 3): one workgroup per written pad row (hp only).
  * ENTRY_ROW grid (1, rows): one workgroup per interpolated row.
  * ENTRY_VCHECK grid (1, 1): one workgroup per plane; serial row walk. With
  * VCHECK_PARA the grid is (1, rows): one workgroup per row.
  *
  * Spec constants: 0 WIDTH, 1 NRAD, 2 MDIS, 3 HAS_MCLIP, 4 HAS_SCLIP,
- * 5 VCHECK_MODE, 6 local_size_row, 7 local_size_vcheck.
+ * 5 VCHECK_MODE, 6 local_size_row, 7 local_size_vcheck, 8 HPF.
+ *
+ * hp (HPF == 2) doubles the direction set (u in half-pel units, TPITCH =
+ * 4*MDIS+1) and takes the s0 window from the precomputed half-pel rows instead
+ * of the kept rows; s1/s2 keep the kept rows at the half-pel direction (their
+ * spatial offset is twice the direction in both modes), the relax window
+ * widens to +-2, the host halves gamma and the interpolate step has its own
+ * even/odd direction forms. vcheck halves the direction in its a2 term and
+ * uses the reference's 2-tap/4-tap forms.
  */
 
 #if !defined(BITS)
@@ -87,9 +98,13 @@ layout(constant_id = 2) const int MDIS = 20;
 layout(constant_id = 3) const int HAS_MCLIP = 0;
 layout(constant_id = 4) const int HAS_SCLIP = 0;
 layout(constant_id = 5) const int VCHECK_MODE = 2;
+// Search resolution: 1 = full-pel (the default), 2 = half-pel (`hp=1`: the DP
+// walks the direction set at half-pel steps and the s0 cost comes from the
+// half-pel rows ENTRY_HPFILL builds).
+layout(constant_id = 8) const int HPF = 1;
 
-const int TPITCH = 2 * MDIS + 1;
-const int CENTER = MDIS;
+const int TPITCH = 2 * MDIS * HPF + 1;
+const int CENTER = MDIS * HPF;
 const int MARGIN_H = 12;
 const int MARGIN_V = 4;
 
@@ -157,7 +172,7 @@ uint flat_index(uint local_x) {
 // Entry points that touch only the raw/pad buffers, not the row-kernel
 // helpers (pad_get/conn_cost/...), so those helpers must not be compiled in.
 #if defined(ENTRY_PAD) || defined(ENTRY_XPOSE) || defined(ENTRY_COMPOSE) || \
-    defined(ENTRY_ASSEMBLEV) || defined(ENTRY_BLIT) || \
+    defined(ENTRY_ASSEMBLEV) || defined(ENTRY_BLIT) || defined(ENTRY_HPFILL) || \
     defined(ENTRY_MASKPACK) || defined(ENTRY_MASKDILATE)
 #define ENTRY_NO_HELPERS 1
 #endif
@@ -248,6 +263,24 @@ layout(std430, binding = 0) readonly buffer AsmSrc { IO_TYPE asm_src[]; };
 layout(std430, binding = 1) readonly buffer AsmVout { IO_TYPE asm_vout[]; };
 layout(std430, binding = 2) readonly buffer AsmVout2 { IO_TYPE asm_vout2[]; };
 layout(std430, binding = 3) writeonly buffer AsmOut { IO_TYPE asm_out[]; };
+#elif defined(ENTRY_HPFILL)
+// Half-pel precompute (hp only): binding 0 is the built pad (read like
+// ENTRY_PAD's output, `pad_stride` per row), binding 8 the half-pel rows the
+// row kernel reads (WIDTH elements per pad row, native io type).
+layout(std430, binding = 0) readonly buffer HpPad {
+#if BITS == 16
+    uint16_t hppad[];
+#else
+    float hppad[];
+#endif
+};
+layout(std430, binding = 8) writeonly buffer HpOut {
+#if BITS == 16
+    uint16_t hpout[];
+#else
+    float hpout[];
+#endif
+};
 #elif defined(ENTRY_PAD)
 // ENTRY_PAD expands the mirror margins into the built pad (binding 1). Its
 // source (binding 0) is either the input frame plane read in frame order with
@@ -333,6 +366,8 @@ layout(std430, binding = 4) readonly buffer BmaskBuf { uint bmask[]; };
 layout(std430, binding = 5) readonly buffer SclipBuf { IO_TYPE sclip[]; };
 layout(std430, binding = 6) buffer CintBuf { IO_TYPE cint[]; };
 layout(std430, binding = 7) buffer VoutBuf { IO_TYPE vout[]; };
+// Half-pel rows (hp only), built by ENTRY_HPFILL; WIDTH elements per pad row.
+layout(std430, binding = 8) readonly buffer HpBuf { IO_TYPE hp[]; };
 #endif
 
 layout(push_constant) uniform PC {
@@ -378,8 +413,11 @@ layout(push_constant) uniform PC {
     //   2 = second sub-pass: read O_0 from binding 3, assemble O_1 and write
     //       the 50/50 merge of the two straight to the output frame.
     int comp_fuse;
-    // ENTRY_PAD only: 1 when the source is the packed R' (horizontal).
+    // ENTRY_PAD: 1 = the source is a pitched frame plane (0 = the packed R');
+    // ENTRY_ROW/ENTRY_VCHECK: 1 = sclip is the packed B'.
     int pad_src_pitched;
+    // ENTRY_HPFILL / ENTRY_ROW: io-element base of the half-pel rows (b8).
+    int hp_base;
 } pc;
 
 // Padded-plane access at OUTPUT dst-row coordinates. copyPad places every
@@ -445,61 +483,106 @@ float cubic_float(int dy, int x) {
     return t;
 }
 
-// Connection cost for interp dst row dy, column x, direction u.
-// u16: s0/s1/s2/v are integer SAD sums accumulated in float (exact, terms
-// stay below 2^24). Cost combine matches eedi3m's float order.
-float conn_cost(int dy, int x, int u) {
-    const int u2 = 2 * u;
-    float s0 = 0.0f;
-    float s1 = 0.0f;
-    float s2 = 0.0f;
-    const bool s1_ok = (u >= 0 && x >= u2) || (u <= 0 && x < WIDTH + u2);
-    const bool s2_ok = (u <= 0 && x >= -u2) || (u >= 0 && x < WIDTH - u2);
+// ---------------------------------------------------------------------------
+// hp (half-pel) mode.
+//
+// hp doubles the direction set: u is in half-pel units, TPITCH = 4*MDIS+1 and
+// |u| <= 2*MDIS. s1/s2 and their validity gates use the half-pel direction
+// directly (their spatial offset is twice the direction, as in full-pel); s0
+// windows the half-pel rows for odd u and the kept rows at the halved offset
+// for even u. Every other difference is the interpolate and vcheck shape.
+// ---------------------------------------------------------------------------
 
-    for (int k = -NRAD; k <= NRAD; ++k) {
-        s0 += abs(pad_get(dy - 3, x + u + k) - pad_get(dy - 1, x - u + k))
-            + abs(pad_get(dy - 1, x + u + k) - pad_get(dy + 1, x - u + k))
-            + abs(pad_get(dy + 1, x + u + k) - pad_get(dy + 3, x - u + k));
-        if (s1_ok) {
-            s1 += abs(pad_get(dy - 3, x + k) - pad_get(dy - 1, x - u2 + k))
-                + abs(pad_get(dy - 1, x + k) - pad_get(dy + 1, x - u2 + k))
-                + abs(pad_get(dy + 1, x + k) - pad_get(dy + 3, x - u2 + k));
-        }
-        if (s2_ok) {
-            s2 += abs(pad_get(dy - 3, x + u2 + k) - pad_get(dy - 1, x + k))
-                + abs(pad_get(dy - 1, x + u2 + k) - pad_get(dy + 1, x + k))
-                + abs(pad_get(dy + 1, x + u2 + k) - pad_get(dy + 3, x + k));
-        }
-    }
-    const float S1 = s1_ok ? s1 : (s2_ok ? s2 : s0);
-    const float S2 = s2_ok ? s2 : S1;
-
-    // cost3 is always on (GPU family semantics: eedi3vk2/vszip* have no
-    // cost3 switch and always divide alpha by 3 and sum s0+s1+s2).
-    // ip is the inner 2-tap average. eedi3m computes it in INTEGER domain
-    // ((a + b + 1) >> 1 == round-half-up on the exact mean) for integer
-    // formats, which feeds an integer |x - ip| difference — for odd sums the
-    // plain float midpoint (a+b)/2 differs by 0.5, shifting the v penalty by
-    // up to 1 and flipping near-tie argmins (seen at nrad=3). Reproduce the
-    // integer v exactly. Float formats use the exact midpoint.
+// Half-pel value between columns i and i+1 of the kept-parity pad row
+// MARGIN_V + dst_row, as ENTRY_HPFILL wrote it. The reference clamps the
+// column (its plane is padHeight x WIDTH, one row per pad row).
+float hp_get(int dst_row, int i) {
+    i = clamp(i, 0, WIDTH - 2);
 #if BITS == 16
-    const float t1 = pad_get(dy - 1, x + u);
-    const float t2 = pad_get(dy + 1, x - u);
-    const float ip = floor((t1 + t2 + 1.0f) * 0.5f);
+    return float(int(hp[pc.hp_base + (MARGIN_V + dst_row) * WIDTH + i]));
+#else
+    return hp[pc.hp_base + (MARGIN_V + dst_row) * WIDTH + i];
+#endif
+}
+
+// A(i,j) over the half-pel rows (the reference's evalAhp).
+float rowA_hp(int dy, int i, int j) {
+    return abs(hp_get(dy - 3, i) - hp_get(dy - 1, j))
+         + abs(hp_get(dy - 1, i) - hp_get(dy + 1, j))
+         + abs(hp_get(dy + 1, i) - hp_get(dy + 3, j));
+}
+
+// s1/s2's column offset, which is also the offset their gates test: 2*u
+// full-pel, u in half-pel units (the same spatial distance).
+int s12_off(int u) { return (HPF == 1) ? 2 * u : u; }
+
+// s0's column offsets for direction u, plus whether its terms come from the
+// half-pel rows (odd half-pel directions).
+void s0_geom(int u, out int di, out int dj, out bool hpr) {
+    if (HPF == 1) {
+        di = u;
+        dj = -u;
+        hpr = false;
+    } else {
+        const int u2 = u >> 1;
+        const bool odd = (u & 1) != 0;
+        di = u2;
+        dj = -u2 - (odd ? 1 : 0);
+        hpr = odd;
+    }
+}
+
+// Cost combine shared by the full recompute and the rolled windows (the
+// reference's combineCost / combineCostHp). cost3 is always on (GPU family
+// semantics: eedi3vk2/vszip* have no cost3 switch and always divide alpha by
+// 3 and sum s0+s1+s2).
+// ip is the inner 2-tap average. eedi3m computes it in INTEGER domain
+// ((a + b + 1) >> 1 == round-half-up on the exact mean) for integer formats,
+// which feeds an integer |x - ip| difference — for odd sums the plain float
+// midpoint (a+b)/2 differs by 0.5, shifting the v penalty by up to 1 and
+// flipping near-tie argmins (seen at nrad=3). Reproduce the integer v exactly.
+// Float formats use the exact midpoint. Half-pel directions take ip from the
+// half-pel rows and halve the beta term (u is in half-pel units).
+float combine_cost(int dy, int x, int u, float s0, float s1, float s2) {
+    float ip;
     const float c1 = pad_get(dy - 1, x);
     const float c2 = pad_get(dy + 1, x);
-    const float v = abs(c1 - ip) + abs(c2 - ip);
+#if BITS == 16
+    if (HPF == 1) {
+        ip = floor((pad_get(dy - 1, x + u) + pad_get(dy + 1, x - u) + 1.0f)
+                   * 0.5f);
+    } else if ((u & 1) == 0) {
+        const int u2 = u >> 1;
+        ip = floor((pad_get(dy - 1, x + u2) + pad_get(dy + 1, x - u2) + 1.0f)
+                   * 0.5f);
+    } else {
+        const int u2 = u >> 1;
+        ip = floor((hp_get(dy - 1, x + u2) + hp_get(dy + 1, x - u2 - 1) + 1.0f)
+                   * 0.5f);
+    }
 #else
-    const float ip = (pad_get(dy - 1, x + u) + pad_get(dy + 1, x - u)) * 0.5f;
-    const float v = abs(pad_get(dy - 1, x) - ip) + abs(pad_get(dy + 1, x) - ip);
+    if (HPF == 1) {
+        ip = (pad_get(dy - 1, x + u) + pad_get(dy + 1, x - u)) * 0.5f;
+    } else if ((u & 1) == 0) {
+        const int u2 = u >> 1;
+        ip = (pad_get(dy - 1, x + u2) + pad_get(dy + 1, x - u2)) * 0.5f;
+    } else {
+        const int u2 = u >> 1;
+        ip = (hp_get(dy - 1, x + u2) + hp_get(dy + 1, x - u2 - 1)) * 0.5f;
+    }
 #endif
+    const float v = abs(c1 - ip) + abs(c2 - ip);
 
     // Combine order and `precise` mirror eedi3vk2's combineCost. Without
     // precise the compiler contracts alpha*(s0+s1+s2)+beta*|u| into an FMA, an
     // ulp off the reference, which flips near-tie argmins: u16 lost its
     // bit-exactness on real content (1 LSB on a few pixels per frame).
-    precise float cost = pc.alpha * (s0 + S1 + S2);
-    cost += pc.beta * float(abs(u));
+    precise float cost = pc.alpha * (s0 + s1 + s2);
+    if (HPF == 1) {
+        cost += pc.beta * float(abs(u));
+    } else {
+        cost += (pc.beta * float(abs(u))) * 0.5f;
+    }
     cost += pc.rw * v;
     return cost;
 }
@@ -521,7 +604,8 @@ float conn_cost(int dy, int x, int u) {
 //   s1(x,u) = sum_k A(x+k,   x-2u+k)
 //   s2(x,u) = sum_k A(x+2u+k, x+k)
 // with A(i,j) = |p3(i)-p1(j)| + |p1(i)-n1(j)| + |n1(i)-n3(j)| over the four
-// kept rows around the interpolated dst row (p3 = dy-3 ... n3 = dy+3).
+// kept rows around the interpolated dst row (p3 = dy-3 ... n3 = dy+3); hp
+// re-weights them through s0_geom/s12_off above.
 const int RING_CAP = 7;   // >= 2*NRAD+1 for NRAD <= 3 (fixed bound -> registers)
 #define RN (2 * NRAD + 1)
 
@@ -531,15 +615,24 @@ float rowA(int dy, int i, int j) {
          + abs(pad_get(dy + 1, i) - pad_get(dy + 3, j));
 }
 
+// One s0 term: the kept-row A, or its half-pel form for odd hp directions.
+float s0_term(int dy, int i, int j, bool hpr) {
+    return hpr ? rowA_hp(dy, i, j) : rowA(dy, i, j);
+}
+
 // Seed the three windows at column x (fresh full evaluation, k ascending).
 void roll_seed(int dy, int x, int u,
                inout float r0[RING_CAP], inout float r1[RING_CAP],
                inout float r2[RING_CAP]) {
+    int di, dj;
+    bool hpr;
+    s0_geom(u, di, dj, hpr);
+    const int o = s12_off(u);
     for (int k = 0; k < RING_CAP; ++k) {
         if (k >= RN) break;
-        r0[k] = rowA(dy, x + u + k - NRAD, x - u + k - NRAD);
-        r1[k] = rowA(dy, x + k - NRAD, x - 2 * u + k - NRAD);
-        r2[k] = rowA(dy, x + 2 * u + k - NRAD, x + k - NRAD);
+        r0[k] = s0_term(dy, x + di + k - NRAD, x + dj + k - NRAD, hpr);
+        r1[k] = rowA(dy, x + k - NRAD, x - o + k - NRAD);
+        r2[k] = rowA(dy, x + o + k - NRAD, x + k - NRAD);
     }
 }
 
@@ -547,9 +640,13 @@ void roll_seed(int dy, int x, int u,
 void roll_push(int dy, int x, int u,
                inout float r0[RING_CAP], inout float r1[RING_CAP],
                inout float r2[RING_CAP]) {
-    const float l0 = rowA(dy, x + u + NRAD + 1, x - u + NRAD + 1);
-    const float l1 = rowA(dy, x + NRAD + 1, x - 2 * u + NRAD + 1);
-    const float l2 = rowA(dy, x + 2 * u + NRAD + 1, x + NRAD + 1);
+    int di, dj;
+    bool hpr;
+    s0_geom(u, di, dj, hpr);
+    const int o = s12_off(u);
+    const float l0 = s0_term(dy, x + di + NRAD + 1, x + dj + NRAD + 1, hpr);
+    const float l1 = rowA(dy, x + NRAD + 1, x - o + NRAD + 1);
+    const float l2 = rowA(dy, x + o + NRAD + 1, x + NRAD + 1);
     for (int k = 0; k < RING_CAP - 1; ++k) {
         if (k >= RN - 1) break;
         r0[k] = r0[k + 1]; r1[k] = r1[k + 1]; r2[k] = r2[k + 1];
@@ -570,32 +667,36 @@ float ring_sum(in float r[RING_CAP]) {
     return s;
 }
 
-// Combined cost (cost3 semantics, mirroring conn_cost's tail) from window
-// sums that are all valid (interior columns: every gate holds).
-float combine_interior(int dy, int x, int u, float s0, float s1, float s2) {
-    const float S1 = s1;
-    const float S2 = s2;
-#if BITS == 16
-    const float t1 = pad_get(dy - 1, x + u);
-    const float t2 = pad_get(dy + 1, x - u);
-    const float ip = floor((t1 + t2 + 1.0f) * 0.5f);
-    const float c1 = pad_get(dy - 1, x);
-    const float c2 = pad_get(dy + 1, x);
-    const float v = abs(c1 - ip) + abs(c2 - ip);
-#else
-    const float ip = (pad_get(dy - 1, x + u) + pad_get(dy + 1, x - u)) * 0.5f;
-    const float v = abs(pad_get(dy - 1, x) - ip) + abs(pad_get(dy + 1, x) - ip);
-#endif
-    // Combine order and `precise` mirror eedi3vk2's combineCost. Without
-    // precise the compiler contracts alpha*(s0+s1+s2)+beta*|u| into an FMA, an
-    // ulp off the reference, which flips near-tie argmins: u16 lost its
-    // bit-exactness on real content (1 LSB on a few pixels per frame).
-    precise float cost = pc.alpha * (s0 + S1 + S2);
-    cost += pc.beta * float(abs(u));
-    cost += pc.rw * v;
-    return cost;
+// Full connection-cost recompute for column x, direction u (full-pel units, or
+// half-pel units when hp is on). Used at column 0 and at every column outside
+// a direction's interior band. The s1/s2 gates are the reference's: they test
+// the spatial offset the window itself steps by.
+float conn_cost(int dy, int x, int u) {
+    float s0 = 0.0f;
+    float s1 = 0.0f;
+    float s2 = 0.0f;
+    int di, dj;
+    bool hpr;
+    s0_geom(u, di, dj, hpr);
+    const int o = s12_off(u);
+    const bool s1_ok = (u >= 0 && x >= o) || (u <= 0 && x < WIDTH + o);
+    const bool s2_ok = (u <= 0 && x >= -o) || (u >= 0 && x < WIDTH - o);
+
+    for (int k = -NRAD; k <= NRAD; ++k) {
+        s0 += s0_term(dy, x + di + k, x + dj + k, hpr);
+        if (s1_ok) {
+            s1 += rowA(dy, x + k, x - o + k);
+        }
+        if (s2_ok) {
+            s2 += rowA(dy, x + o + k, x + k);
+        }
+    }
+    const float S1 = s1_ok ? s1 : (s2_ok ? s2 : s0);
+    const float S2 = s2_ok ? s2 : S1;
+
+    return combine_cost(dy, x, u, s0, S1, S2);
 }
-#endif  // !ENTRY_PAD
+#endif  // ENTRY_NO_HELPERS
 #if defined(ENTRY_ROW)
 
 // Per-interp-row DP in REGISTERS with subgroup shuffles (eedi3vk2 structure):
@@ -633,8 +734,9 @@ const int K = (TPITCH + SGSIZE - 1) / SGSIZE;  // directions per lane
 // bytes instead of TPITCH=41, a 2.6x cut in the row kernel's store traffic
 // (measured worth ~10% of the frame ungated; PROBE=4). Even lanes combine their
 // odd neighbour's nibble through a shuffle and store one byte, so the packing
-// adds no barrier. Other K keep the plain int8 column.
-const bool PB_PACK = (K == 2);
+// adds no barrier. Other K keep the plain int8 column; hp always does (its
+// deltas span +-2 and do not fit a nibble).
+const bool PB_PACK = (K == 2 && HPF == 1);
 const int PB_STRIDE = PB_PACK ? (SGSIZE / 2) : TPITCH;   // bytes per column
 
 int pbt_delta(const int base, const int x, const int e) {
@@ -676,6 +778,64 @@ layout(local_size_x_id = 6) in;
 bool bmask_local(int x) {
     if (HAS_MCLIP == 0) return true;
     return (bmaskSh[x >> 5] & (1u << (x & 31))) != 0u;
+}
+
+// Interpolate along direction `dir` (full-pel, or half-pel when hp is on),
+// ucubic semantics always on: the 4-tap cubic along the direction when its
+// taps stay in the frame, else the 2-tap average. Half-pel directions are
+// even (the taps land on the kept rows, at half the direction) or odd (two
+// adjacent full-pel taps per row, whose sum the cubic weights by 9/32 and
+// -1/32). `precise` as in eedi3vk2's cubic4/avg2 (see cubic_float).
+float interp_dir(int dy, int x, int dir) {
+    if (HPF == 1) {
+        const int ad3 = abs(3 * dir);
+        if (x >= ad3 && x <= WIDTH - 1 - ad3) {
+            precise float t =
+                0.5625f * (pad_get(dy - 1, x + dir) + pad_get(dy + 1, x - dir))
+              - 0.0625f * (pad_get(dy - 3, x + 3 * dir) + pad_get(dy + 3, x - 3 * dir));
+            return t;
+        }
+        precise float t =
+            (pad_get(dy - 1, x + dir) + pad_get(dy + 1, x - dir)) * 0.5f;
+        return t;
+    }
+    if ((dir & 1) == 0) {
+        const int d2 = dir >> 1;
+        const int ad = abs(d2);
+        if (x >= ad * 3 && x <= WIDTH - 1 - ad * 3) {
+            precise float t =
+                0.5625f * (pad_get(dy - 1, x + d2) + pad_get(dy + 1, x - d2))
+              - 0.0625f * (pad_get(dy - 3, x + 3 * d2) + pad_get(dy + 3, x - 3 * d2));
+            return t;
+        }
+        // The reference's float 2-tap average in this branch adds 1 (the
+        // integer +1 of its round-half-up); replicated verbatim. u16 stores
+        // through the round-half-up quantizer, so it must not add it there.
+#if BITS == 16
+        precise float t =
+            (pad_get(dy - 1, x + d2) + pad_get(dy + 1, x - d2)) * 0.5f;
+#else
+        precise float t =
+            (pad_get(dy - 1, x + d2) + pad_get(dy + 1, x - d2) + 1.0f) * 0.5f;
+#endif
+        return t;
+    }
+    const int d20 = dir >> 1;
+    const int d21 = (dir + 1) >> 1;
+    const int d30 = (dir * 3) >> 1;
+    const int d31 = (dir * 3 + 1) >> 1;
+    const int ad = max(abs(d30), abs(d31));
+    if (x >= ad && x <= WIDTH - 1 - ad) {
+        precise float c0 = pad_get(dy - 3, x + d30) + pad_get(dy - 3, x + d31);
+        precise float c1 = pad_get(dy - 1, x + d20) + pad_get(dy - 1, x + d21);
+        precise float c2 = pad_get(dy + 1, x - d20) + pad_get(dy + 1, x - d21);
+        precise float c3 = pad_get(dy + 3, x - d30) + pad_get(dy + 3, x - d31);
+        precise float t = 0.28125f * (c1 + c2) - 0.03125f * (c0 + c3);
+        return t;
+    }
+    precise float t = (pad_get(dy - 1, x + d20) + pad_get(dy - 1, x + d21)
+                     + pad_get(dy + 1, x - d20) + pad_get(dy + 1, x - d21)) * 0.25f;
+    return t;
 }
 
 void main() {
@@ -794,25 +954,74 @@ void main() {
         // == |u| (rising ramp: xd = |u|+1 < xmin; falling ramp: xd = WIDTH-|u|,
         // only reachable when the span starts in the last |u| columns).
         // Bit-exact vs running the skipped iterations (verified in tests).
-        for (int j = 0; j < K; j++) {
-            const int i = laneBase + j;
-            if (i < TPITCH) {
-                const int u = i - CENTER;
-                const int au = abs(u);
-                if (au >= 1 && au <= MDIS) {
-                    const bool hit = (au <= xmin - 2) ||
-                        (xmin > WIDTH - au && au <= WIDTH - 2);
-                    pRel[j] = hit ? ((u > 0) ? -1 : 1) : -u;
-                } else {
-                    pRel[j] = -u;
+        if (HPF == 1) {
+            for (int j = 0; j < K; j++) {
+                const int i = laneBase + j;
+                if (i < TPITCH) {
+                    const int u = i - CENTER;
+                    const int au = abs(u);
+                    if (au >= 1 && au <= MDIS) {
+                        const bool hit = (au <= xmin - 2) ||
+                            (xmin > WIDTH - au && au <= WIDTH - 2);
+                        pRel[j] = hit ? ((u > 0) ? -1 : 1) : -u;
+                    } else {
+                        pRel[j] = -u;
+                    }
                 }
+            }
+        } else {
+            // hp: the reference indexes its fixup lanes from MDIS (not CENTER,
+            // which hp doubles), so each lane is hit by at most one column per
+            // condition and the later column wins (condition A on a tie). A
+            // candidate pumax = p hits the rising column p+1 and the falling
+            // column WIDTH-p; the two ramps never disagree because only the
+            // valid one of them can equal pumax.
+            for (int j = 0; j < K; j++) {
+                const int i = laneBase + j;
+                if (i >= TPITCH) {
+                    continue;
+                }
+                const int u = i - CENTER;
+                int col = 1;   // the xd == 1 zeroing
+                int rel = -u;
+                const int qa = MDIS - i;
+                if (qa >= 0) {
+                    const int p = (qa + 1) >> 1;
+                    if (p >= 1 && p < MDIS && 2 * p <= WIDTH - 1) {
+                        const int val = 2 * (1 - p) - u;
+                        if (p + 1 < xmin && p + 1 > col) {
+                            col = p + 1;
+                            rel = val;
+                        }
+                        if (WIDTH - p >= 2 && WIDTH - p < xmin && WIDTH - p > col) {
+                            col = WIDTH - p;
+                            rel = val;
+                        }
+                    }
+                }
+                const int qb = i - MDIS;
+                if (qb >= 0) {
+                    const int p = (qb + 1) >> 1;
+                    if (p >= 1 && p < MDIS && 2 * p <= WIDTH - 1) {
+                        const int val = 2 * (p - 1) - u;
+                        if (p + 1 < xmin && p + 1 > col) {
+                            col = p + 1;
+                            rel = val;
+                        }
+                        if (WIDTH - p >= 2 && WIDTH - p < xmin && WIDTH - p > col) {
+                            col = WIDTH - p;
+                            rel = val;
+                        }
+                    }
+                }
+                pRel[j] = rel;
             }
         }
     }
 
     const int xstart = max(1, xmin);
     for (int xd = xstart; xd < WIDTH; xd++) {
-        const int umax = min(min(xd, WIDTH - 1 - xd), MDIS);
+        const int umax = min(min(xd, WIDTH - 1 - xd), MDIS) * HPF;
         const bool masked = (HAS_MCLIP != 0 && !bmask_local(xd));
 
         float cur[K];
@@ -822,9 +1031,9 @@ void main() {
 
         if (masked) {
             // Masked column: cost row + backtrack row carry from the previous
-            // column (eedi3m semantics); the two extreme entries get fixups so
-            // the path stays inside the narrower reachable set. Rolling state
-            // is invalid (windows could not advance over this column).
+            // column (eedi3m semantics); the extreme entries get fixups so the
+            // path stays inside the narrower reachable set. Rolling state is
+            // invalid (windows could not advance over this column).
             // xd == 1 is never masked here: bmask is a +-MDIS dilation, so
             // bmask[0] or bmask[1] set implies bmask[1] set (MDIS >= 1).
             const int pumax = min(xd - 1, WIDTH - xd);
@@ -834,10 +1043,20 @@ void main() {
                 cRel[j] = pRel[j];
                 rolled[j] = false;
                 if (pumax < MDIS) {
-                    if (i == CENTER - pumax)
-                        cRel[j] = (1 - pumax) - (i - CENTER);
-                    else if (i == CENTER + pumax)
-                        cRel[j] = (pumax - 1) - (i - CENTER);
+                    if (HPF == 1) {
+                        if (i == CENTER - pumax)
+                            cRel[j] = (1 - pumax) - (i - CENTER);
+                        else if (i == CENTER + pumax)
+                            cRel[j] = (pumax - 1) - (i - CENTER);
+                    } else {
+                        // Verbatim from the reference, including its MDIS-based
+                        // lane indices (which in hp mostly land outside the
+                        // reachable set) and its two lanes per side.
+                        if (i == MDIS - pumax * 2 || i == MDIS - pumax * 2 + 1)
+                            cRel[j] = (1 - pumax) * 2 - (i - CENTER);
+                        else if (i == MDIS + pumax * 2 - 1 || i == MDIS + pumax * 2)
+                            cRel[j] = (pumax - 1) * 2 - (i - CENTER);
+                    }
                 }
             }
             if (PB_PACK) {
@@ -861,11 +1080,12 @@ void main() {
             }
         } else {
             // Unmasked column: gather the previous column's path costs
-            // [laneBase - 1, laneBase + K] from the subgroup's registers (the
-            // +-1 neighbour window of the relax), then per-direction cost + DP.
-            float ext[K + 2];
-            for (int e = 0; e < K + 2; e++) {
-                const int idx = e - 1;   // relative to laneBase
+            // [laneBase - HPF, laneBase + K + HPF) from the subgroup's
+            // registers (the relax's predecessor window), then per-direction
+            // cost + DP.
+            float ext[K + 2 * HPF];
+            for (int e = 0; e < K + 2 * HPF; e++) {
+                const int idx = e - HPF;   // relative to laneBase
                 if (idx < 0) {
                     const int q = (-idx + K - 1) / K;
                     ext[e] = subgroupShuffleUp(pp[idx + q * K], q);
@@ -877,7 +1097,7 @@ void main() {
                 }
             }
 
-            const int umax2 = min(min(xd - 1, WIDTH - xd), MDIS);
+            const int umax2 = min(min(xd - 1, WIDTH - xd), MDIS) * HPF;
 
             for (int j = 0; j < K; j++) {
                 const int i = laneBase + j;
@@ -900,7 +1120,11 @@ void main() {
                         // unmasked interior one, which still costs one 9-load
                         // seed instead of a ~51-load full conn_cost recompute
                         // per unmasked direction.
-                        const bool interior = (xd >= 2 * au && xd <= WIDTH - 1 - 2 * au);
+                        // The interior band is the span where the s1/s2 gates
+                        // hold; their offset is 2*u full-pel and u half-pel.
+                        const int reach = (HPF == 1) ? 2 * au : au;
+                        const bool interior =
+                            (xd >= reach && xd <= WIDTH - 1 - reach);
                         if (interior) {
                             if (!rolled[j]) {
                                 roll_seed(dy, xd, u, r0[j], r1[j], r2[j]);
@@ -908,26 +1132,27 @@ void main() {
                             } else {
                                 roll_push(dy, xd - 1, u, r0[j], r1[j], r2[j]);
                             }
-                            ccost = combine_interior(dy, xd, u, ring_sum(r0[j]),
-                                                     ring_sum(r1[j]), ring_sum(r2[j]));
+                            ccost = combine_cost(dy, xd, u, ring_sum(r0[j]),
+                                                 ring_sum(r1[j]), ring_sum(r2[j]));
                         } else {
                             rolled[j] = false;
                             ccost = conn_cost(dy, xd, u);
                         }
                     }
 
-                    // DP relax over v in [u-1, u+1] (subset of |v| <= umax2 by
-                    // construction), ascending v, strict < keeps the lowest v
-                    // on ties. ext[e] = pp of direction laneBase + e - 1.
+                    // DP relax over v in [u-HPF, u+HPF] (subset of
+                    // |v| <= umax2 by construction), ascending v, strict <
+                    // keeps the lowest v on ties. ext[e] = pp of direction
+                    // laneBase + e - HPF.
                     // `precise` as in eedi3vk2: gamma*|dd|+ext contracted into
                     // an FMA is an ulp off and flips near-tie argmins.
                     float bval = FLT_MAX_V;
                     int idx = 0;
-                    for (int dd = -1; dd <= 1; dd++) {
+                    for (int dd = -HPF; dd <= HPF; dd++) {
                         const int v = u + dd;
                         if (abs(v) <= umax2) {
                             precise const float z =
-                                ext[j + 1 + dd] + pc.gamma * float(abs(dd));
+                                ext[j + HPF + dd] + pc.gamma * float(abs(dd));
                             precise const float cc = min(z, FLT_MAX_09);
                             if (cc < bval) {
                                 bval = cc;
@@ -1139,20 +1364,7 @@ void main() {
                 dval = 0;
                 oval = cubic_float(dy, x);
             } else {
-                // ucubic always on: 4-tap cubic along the direction when the
-                // 3*|dir| taps stay in the frame, else the 2-tap average.
-                // `precise` as in eedi3vk2's cubic4/avg2 (see cubic_float).
-                const int ad3 = abs(3 * dir);
-                if (x >= ad3 && x <= WIDTH - 1 - ad3) {
-                    precise float t =
-                        0.5625f * (pad_get(dy - 1, x + dir) + pad_get(dy + 1, x - dir))
-                      - 0.0625f * (pad_get(dy - 3, x + 3 * dir) + pad_get(dy + 3, x - 3 * dir));
-                    oval = t;
-                } else {
-                    precise float t =
-                        (pad_get(dy - 1, x + dir) + pad_get(dy + 1, x - dir)) * 0.5f;
-                    oval = t;
-                }
+                oval = interp_dir(dy, x, dir);
             }
             if (VCHECK_MODE > 0) {
                 dmap[pc.dmap_base + r * WIDTH + x] = int8_t(dval);
@@ -1251,26 +1463,48 @@ float vc_cint_s(int r, int x) {
 }
 
 // One pixel's blend. The caller has already established do_row, dirc != 0 and
-// the direction test; `pr` is the d2p term.
-float vc_blend(int r, int x, float pr) {
+// the direction test; `pr`/`pr2` are the d2p term at the direction's two half
+// offsets (columns x + dirc>>1 and x + (dirc+1)>>1), which coincide in
+// full-pel mode and for even half-pel directions. `precise` as in eedi3vk2's
+// vcheck (its d0..d3/it/ib/vt/vb/a0..a are all precise): contraction into FMAs
+// is an ulp off and shifts the blend.
+float vc_blend(int r, int x, float pr, float pr2) {
     const int yf = pc.field + 2 * r;
     const int dirc = int(dmap[pc.dmap_base + r * WIDTH + x]);
     const int dn = (r + 1 < pc.rows) ? (r + 1) : r;
     const float cint_s = vc_cint_s(r, x);
+    // a2 measures the direction in full-pel units; hp's are half-pel.
+    const int dircv = (HPF == 2) ? (abs(dirc) >> 1) : abs(dirc);
 #if BITS == 16
     const int dCi = int(load_dst_val(r, x));
-    const int dCp = int(load_dst_val(r, x + dirc));
-    const int dm  = int(load_dst_val(r, x - dirc));
-    const int dNm = int(load_dst_val(dn, x - dirc));
-    const int v1px = int(pad_get(yf - 1, x + dirc));
-    const int v1nx = int(pad_get(yf + 1, x - dirc));
     const int v1p0 = int(pad_get(yf - 1, x));
     const int v1n0 = int(pad_get(yf + 1, x));
-    const int p = int(pr);
-    const int it = (p + dm + 1) >> 1;
-    const int ib = (dCp + dNm + 1) >> 1;
-    const int vt = abs(p - v1px) + abs(dCp - v1px);
-    const int vb = abs(dNm - v1nx) + abs(dm - v1nx);
+    int it, ib, vt, vb;
+    if (HPF == 1 || (dirc & 1) == 0) {
+        const int d2 = (HPF == 1) ? dirc : (dirc >> 1);
+        const int dCp = int(load_dst_val(r, x + d2));
+        const int dm  = int(load_dst_val(r, x - d2));
+        const int dNm = int(load_dst_val(dn, x - d2));
+        const int v1px = int(pad_get(yf - 1, x + d2));
+        const int v1nx = int(pad_get(yf + 1, x - d2));
+        it = (int(pr) + dm + 1) >> 1;
+        ib = (dCp + dNm + 1) >> 1;
+        vt = abs(int(pr) - v1px) + abs(dCp - v1px);
+        vb = abs(dNm - v1nx) + abs(dm - v1nx);
+    } else {
+        const int d20 = dirc >> 1;
+        const int d21 = (dirc + 1) >> 1;
+        const int pa2p = int(pr) + int(pr2) + 1;
+        const int pa1p = int(pad_get(yf - 1, x + d20)) + int(pad_get(yf - 1, x + d21)) + 1;
+        const int ps0 = int(load_dst_val(r, x - d20)) + int(load_dst_val(r, x - d21)) + 1;
+        const int pa0 = int(load_dst_val(r, x + d20)) + int(load_dst_val(r, x + d21)) + 1;
+        const int ps1n = int(pad_get(yf + 1, x - d20)) + int(pad_get(yf + 1, x - d21)) + 1;
+        const int ps2n = int(load_dst_val(dn, x - d20)) + int(load_dst_val(dn, x - d21)) + 1;
+        it = (pa2p + ps0) >> 2;
+        ib = (pa0 + ps2n) >> 2;
+        vt = (abs(pa2p - pa1p) + abs(pa0 - pa1p)) >> 1;
+        vb = (abs(ps2n - ps1n) + abs(ps0 - ps1n)) >> 1;
+    }
     const int vc = abs(dCi - v1p0) + abs(dCi - v1n0);
     const int d0 = abs(it - v1p0);
     const int d1 = abs(ib - v1n0);
@@ -1292,25 +1526,40 @@ float vc_blend(int r, int x, float pr) {
     // on the pixels where the blend is fractional (0 < a < 1).
     precise const float a0 = float(mdiff0) * pc.vth0r;
     precise const float a1 = float(mdiff1) * pc.vth1r;
-    precise const float a2 = max((pc.vth2 - float(abs(dirc))) * pc.vth2r, 0.0f);
+    precise const float a2 = max((pc.vth2 - float(dircv)) * pc.vth2r, 0.0f);
     precise const float a = min(max(a0, max(a1, a2)), 1.0f);
     precise const float blend = (1.0f - a) * float(dCi) + a * cint_s;
     return float(min(max(int(blend), 0), 65535));
 #else
     const float dCi = load_dst_val(r, x);
-    const float dCp = load_dst_val(r, x + dirc);
-    const float dm  = load_dst_val(r, x - dirc);
-    const float dNm = load_dst_val(dn, x - dirc);
-    const float v1px = pad_get(yf - 1, x + dirc);
-    const float v1nx = pad_get(yf + 1, x - dirc);
     const float v1p0 = pad_get(yf - 1, x);
     const float v1n0 = pad_get(yf + 1, x);
-    // `precise` as in eedi3vk2's vcheck (its d0..d3/it/ib/vt/vb/a0..a are all
-    // precise): contraction into FMAs is an ulp off and shifts the blend.
-    precise const float it = (pr + dm) * 0.5f;
-    precise const float ib = (dCp + dNm) * 0.5f;
-    precise const float vt = abs(pr - v1px) + abs(dCp - v1px);
-    precise const float vb = abs(dNm - v1nx) + abs(dm - v1nx);
+    precise float it, ib, vt, vb;
+    if (HPF == 1 || (dirc & 1) == 0) {
+        const int d2 = (HPF == 1) ? dirc : (dirc >> 1);
+        const float dCp = load_dst_val(r, x + d2);
+        const float dm  = load_dst_val(r, x - d2);
+        const float dNm = load_dst_val(dn, x - d2);
+        const float v1px = pad_get(yf - 1, x + d2);
+        const float v1nx = pad_get(yf + 1, x - d2);
+        it = (pr + dm) * 0.5f;
+        ib = (dCp + dNm) * 0.5f;
+        vt = abs(pr - v1px) + abs(dCp - v1px);
+        vb = abs(dNm - v1nx) + abs(dm - v1nx);
+    } else {
+        const int d20 = dirc >> 1;
+        const int d21 = (dirc + 1) >> 1;
+        precise const float pa2p = pr + pr2;
+        precise const float pa1p = pad_get(yf - 1, x + d20) + pad_get(yf - 1, x + d21);
+        precise const float ps0 = load_dst_val(r, x - d20) + load_dst_val(r, x - d21);
+        precise const float pa0 = load_dst_val(r, x + d20) + load_dst_val(r, x + d21);
+        precise const float ps1n = pad_get(yf + 1, x - d20) + pad_get(yf + 1, x - d21);
+        precise const float ps2n = load_dst_val(dn, x - d20) + load_dst_val(dn, x - d21);
+        it = (pa2p + ps0) * 0.25f;
+        ib = (pa0 + ps2n) * 0.25f;
+        vt = (abs(pa2p - pa1p) + abs(pa0 - pa1p)) * 0.5f;
+        vb = (abs(ps2n - ps1n) + abs(ps0 - ps1n)) * 0.5f;
+    }
     precise const float vc = abs(dCi - v1p0) + abs(dCi - v1n0);
     precise const float d0 = abs(it - v1p0);
     precise const float d1 = abs(ib - v1n0);
@@ -1329,7 +1578,7 @@ float vc_blend(int r, int x, float pr) {
     }
     precise const float a0 = mdiff0 * pc.vth0r;
     precise const float a1 = mdiff1 * pc.vth1r;
-    precise const float a2 = max((pc.vth2 - float(abs(dirc))) * pc.vth2r, 0.0f);
+    precise const float a2 = max((pc.vth2 - float(dircv)) * pc.vth2r, 0.0f);
     precise const float a = min(max(a0, max(a1, a2)), 1.0f);
     precise const float res = (1.0f - a) * dCi + a * cint_s;
     return res;
@@ -1337,8 +1586,10 @@ float vc_blend(int r, int x, float pr) {
 }
 
 // One pixel: the early-out decisions live here, the blend math in vc_blend.
-// PR_EXPR is the d2p term and is evaluated only where it is actually used.
-#define DEF_VC_EVAL(NAME, PR_EXPR)                                        \
+// PR_FN(r, i) is the d2p term at column i, evaluated only where it is used;
+// the blend needs it at one column full-pel and at up to two in hp mode
+// (the direction's two half offsets).
+#define DEF_VC_EVAL(NAME, PR_FN)                                          \
 float NAME(int r, int x) {                                                \
     const int y = MARGIN_V + pc.field + 2 * r;                            \
     if (!(y >= 6 && y < pc.pad_height - 6)) {                             \
@@ -1355,8 +1606,13 @@ float NAME(int r, int x) {                                                \
     if (max(dirc * dirt, dirc * dirb) < 0 || (dirt == dirb && dirt == 0)) { \
         return vc_cint_s(r, x);                                           \
     }                                                                     \
-    const float pr = (r >= 1) ? (PR_EXPR) : 0.0f;                         \
-    return vc_blend(r, x, pr);                                            \
+    if (r < 1) {                                                          \
+        return vc_blend(r, x, 0.0f, 0.0f);                                \
+    }                                                                     \
+    const int d20 = (HPF == 1) ? dirc : (dirc >> 1);                      \
+    const float pr = PR_FN(r, x + d20);                                   \
+    const float pr2 = (HPF == 1) ? pr : PR_FN(r, x + ((dirc + 1) >> 1));  \
+    return vc_blend(r, x, pr, pr2);                                       \
 }
 
 #if VCHECK_PARA
@@ -1373,23 +1629,29 @@ float vc_para_quant(float v) {
 // value as the d2p term. Pixels whose predecessor's blend was already fully
 // determined (a == 1 -> cint_s) then see exactly the serial value, which is
 // where most of the drift lives, so a few steps decay it geometrically.
-#define DEF_VC_EVAL_J(NAME, PREV) \
-    DEF_VC_EVAL(NAME, vc_para_quant(PREV(r - 1, x + dirc)))
-DEF_VC_EVAL(vc_eval_0, load_dst_val(r - 1, x + dirc))
+#define DEF_VC_PR(NAME, PREV) \
+    float NAME(int r, int i) { return vc_para_quant(PREV(r - 1, i)); }
+float vc_pr_0(int r, int i) { return load_dst_val(r - 1, i); }
+DEF_VC_EVAL(vc_eval_0, vc_pr_0)
 #if VCHECK_PARA >= 2
-DEF_VC_EVAL_J(vc_eval_1, vc_eval_0)
+DEF_VC_PR(vc_pr_1, vc_eval_0)
+DEF_VC_EVAL(vc_eval_1, vc_pr_1)
 #endif
 #if VCHECK_PARA >= 3
-DEF_VC_EVAL_J(vc_eval_2, vc_eval_1)
+DEF_VC_PR(vc_pr_2, vc_eval_1)
+DEF_VC_EVAL(vc_eval_2, vc_pr_2)
 #endif
 #if VCHECK_PARA >= 4
-DEF_VC_EVAL_J(vc_eval_3, vc_eval_2)
+DEF_VC_PR(vc_pr_3, vc_eval_2)
+DEF_VC_EVAL(vc_eval_3, vc_pr_3)
 #endif
 #if VCHECK_PARA >= 5
-DEF_VC_EVAL_J(vc_eval_4, vc_eval_3)
+DEF_VC_PR(vc_pr_4, vc_eval_3)
+DEF_VC_EVAL(vc_eval_4, vc_pr_4)
 #endif
 #if VCHECK_PARA >= 6
-DEF_VC_EVAL_J(vc_eval_5, vc_eval_4)
+DEF_VC_PR(vc_pr_5, vc_eval_4)
+DEF_VC_EVAL(vc_eval_5, vc_pr_5)
 #endif
 #if VCHECK_PARA >= 6
 #define VC_PARA_EVAL vc_eval_5
@@ -1407,11 +1669,11 @@ DEF_VC_EVAL_J(vc_eval_5, vc_eval_4)
 float vc_eval(int r, int x) { return VC_PARA_EVAL(r, x); }
 #else
 #if VCHECK_LDS
-#define VC_PR_EXPR tlineSh[g_prev][x + dirc]
+float vc_pr(int r, int i) { return tlineSh[g_prev][i]; }
 #else
-#define VC_PR_EXPR vc_read_vout(r - 1, x + dirc)
+float vc_pr(int r, int i) { return vc_read_vout(r - 1, i); }
 #endif
-DEF_VC_EVAL(vc_eval, VC_PR_EXPR)
+DEF_VC_EVAL(vc_eval, vc_pr)
 #endif
 
 // One interp row. The serial form calls this once per row from a top-down walk;
@@ -1588,6 +1850,55 @@ void main() {
 }
 
 #endif  // ENTRY_PAD
+
+#if defined(ENTRY_HPFILL)
+
+// Half-pel row precompute (hp only): one workgroup per written pad row, each
+// writing the 4-tap half-pel interpolation of that row (the reference's
+// hpfill kernel). The written rows are the kept-parity pad rows the row kernel
+// reads (`MARGIN_V + dst_row` with dst_row = field + 2r +/- {1,3}), i.e.
+// MARGIN_V + field - 3 step 2, `rows + 3` of them. Interior columns are the
+// ucubic cubic, the two edge columns its 2-tap average; both are evaluated as
+// exact integer-valued floats so the u16 store's round-half-up + clamp is the
+// reference's `(9*(i0+i1) - (o0+o1) + 8) >> 4` / `(a+b+1) >> 1`.
+layout(local_size_x = 256) in;
+
+void main() {
+    const int pad_row = MARGIN_V + pc.field - 3 + 2 * int(gl_WorkGroupID.x);
+    const int in_base = pc.pad_base + pad_row * pc.pad_stride + MARGIN_H;
+    const int out_base = pc.hp_base + pad_row * WIDTH;
+
+    for (int i = int(gl_LocalInvocationID.x); i < WIDTH - 1; i += 256) {
+#if BITS == 16
+        const float a = float(int(hppad[in_base + i]));
+        const float b = float(int(hppad[in_base + i + 1]));
+#else
+        const float a = hppad[in_base + i];
+        const float b = hppad[in_base + i + 1];
+#endif
+        float o;
+        if (i == 0 || i == WIDTH - 2) {
+            o = (a + b) * 0.5f;
+        } else {
+#if BITS == 16
+            const float l = float(int(hppad[in_base + i - 1]));
+            const float r = float(int(hppad[in_base + i + 2]));
+#else
+            const float l = hppad[in_base + i - 1];
+            const float r = hppad[in_base + i + 2];
+#endif
+            precise float t = 0.5625f * (a + b) - 0.0625f * (l + r);
+            o = t;
+        }
+#if BITS == 16
+        hpout[out_base + i] = uint16_t(uint(clamp(floor(o + 0.5f), 0.0f, PEAK)));
+#else
+        hpout[out_base + i] = o;
+#endif
+    }
+}
+
+#endif  // ENTRY_HPFILL
 
 #if defined(ENTRY_MASKPACK)
 
