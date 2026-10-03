@@ -30,14 +30,15 @@ Scoreboard — 1080p jpbd, `tools/benchmark.py -f bm3dv2`, harness defaults
 
 | | fps | |
 |---|---|---|
-| vsfeel | **637** | mawen matcher and filtering |
-| bm3dvk | 237 | fixed 8-member groups |
-| vszipcl | 125 | |
+| vsfeel | **942** | mawen matcher and filtering |
+| bm3dvk | 296 | fixed 8-member groups |
+| vszipcl | 133 | |
 
-2.7x the faster reference, but not on equal work: they always group eight while
-the default threshold rejects most candidates here. At `th_mse=1e6` (full groups)
-vsfeel is 720 fps, so the extra members hide behind the search. Throughput is
-unchanged from the pre-mawen binary (798 vs 790 fps, adjacent 400-frame runs).
+3.2x the faster reference, but not on equal work: they always group eight while
+the default threshold accepts ~80% of candidates here and the top-eight
+selection does the filtering. vsfeel was 845 fps before the bookkeeping round
+below; the reference columns are the same session as the 942 and swing with the
+box like everything else here (bm3dvk measured 237 in an earlier one).
 
 ## Implementation
 
@@ -66,13 +67,24 @@ unchanged from the pre-mawen binary (798 vs 790 fps, adjacent 400-frame runs).
   and each subgroup merges its own top-K.
 - The merge makes the selection exactly the global top-K by `(error, y, x)` (a
   dropped entry is below its lane's K-th, hence below the union's K-th), so it
-  is the **stable** top-K, which the CPU's `std::partial_sort` is not.
+  is the **stable** top-K, which the CPU's `std::partial_sort` is not. It is a
+  three-round `subgroupShuffleXor` tournament over the lanes' heads: all eight
+  lanes walk it, so every lane ends up with identical copies and no LDS round
+  trip, head table or 64-entry scan is needed.
+- Per-lane candidate lists are 8 deep in **registers**, one sorted list per lane
+  (`pe`/`pxy`), updated by a single compare-exchange per slot. Only the
+  prediction seeds (`s_x`/`s_y`, plus `s0_*` for the forward restart) live in
+  shared memory: every lane of a group reads all of them, and a register array
+  indexed by a runtime count would spill to scratch. The seeds of the earlier
+  predictive windows are read into registers once per window, not per candidate.
+- Each walk evaluates four candidates per iteration (stride 32), so the
+  scheduler has four independent load chains in flight; the walk state is
+  stepped between the candidates so a row wrap lands correctly.
 - The group keeps concatenation order until it overflows past eight, and only
-  then keeps the reference plus the best seven of the tail.
-- Per-lane candidate lists are 8 deep in shared memory (`l_e`/`l_xy`), as are the
-  prediction seeds (`s_x`/`s_y`, plus `s0_*` for the forward restart): every lane
-  of a group reads all of them, and a register array indexed by a runtime count
-  spills to scratch.
+  then keeps the reference plus the best seven of the tail. Each frame's list is
+  consumed best-first and an overflowing group's tail is sorted, so the loop
+  stops at the first entry that cannot beat the tail's worst; the rest cannot
+  either.
 - The group-axis transform is a length-N scaled DCT-II (generated tables for
   N = 1..7, the fast butterfly at N = 8) with `A^T A = 2N I`: threshold and
   Wiener shrinkage use `sigma * sqrt(N/8)` and inverse gain `1/(512N)`, and count
@@ -125,15 +137,27 @@ unchanged from the pre-mawen binary (798 vs 790 fps, adjacent 400-frame runs).
 
 ## Performance
 
-- **The search is the whole filter.** At r=2/step 4 it is ~85% of the estimation
-  kernel; the transform, patch loads and all 133.8 M float atomics together are
-  ~0.4 ms/frame, the zero-fill and ring copies ~0.1 ms.
+- **The candidate bookkeeping, not the SSD, was the cost.** A per-candidate
+  ablation ladder on the estimation kernel (fps, 1080p jpd, harness config)
+  prices the pieces as: search 42% of the frame, estimate/transform 12.5%,
+  aggregation 13%, slot zero-fill ~2%. Removing the SSD itself is worth 32%.
+  The load-bearing discovery is that every piece of per-candidate code is
+  if-converted: the warp pays the insert's ~90 instructions whenever *any* lane
+  passes the gate, so per-lane gating buys nothing on its own.
+- The bookkeeping round (same config, 1000 frames x3): **845 -> 941 fps**. The
+  four changes, each verified by an interleaved same-binary A/B over 1200-2000
+  frames: the ownership test's LDS seeds became registers (its 8 LDS loads each
+  carried a full `lgkmcnt(0)` drain, per candidate); the merge became a
+  shuffle tournament; the per-lane lists moved out of LDS entirely; the walk
+  evaluates four candidates per iteration.
 - Marginal cost per candidate per lane: 0.0032 ms (`bm_range`), 0.0030
   (`ps_range`), with a ~1.4-2.0 ms intercept at tiny windows.
 - **LDS is a trap here.** Three attempts to move kernel-live data into shared
   memory each raised VGPRs 216 -> 240 and dropped occupancy 7 -> 6 waves/SIMD,
   losing 5-90%: the cost is dynamic LDS addressing, not traffic. The wins came
-  from reducing the data instead.
+  from reducing the data instead. A fourth attempt (the reference patch, 64
+  registers per lane, in `l_cur`) cost 3.5% for the same reason: 64 extra LDS
+  reads per candidate beat the 64 registers it freed.
 - Colour costs the planes: 4:2:0 is 1.5x the luma-only estimate/source footprint
   and 4:4:4/RGB 3x, all inside the same `maxStorageBufferRange` budget.
 - The multi-plane round did not move the luma path (NPLANES == 1: 6131 vs 6133
@@ -142,6 +166,31 @@ unchanged from the pre-mawen binary (798 vs 790 fps, adjacent 400-frame runs).
 ## Historical
 
 Chronological; each entry keeps the mechanism, not the story.
+
+- **2026-10-03 — the search's bookkeeping was the whole cost (+11%).** The
+  matcher's per-candidate work is dominated by code that if-converts, so the
+  fix was to shrink it, not to gate it:
+  - the union's ownership test read `s_x`/`s_y` per candidate, 8 LDS loads each
+    followed by `s_waitcnt lgkmcnt(0)`; the seeds now live in registers (seed 0
+    is enough for `PS_NUM == 2`, since `ns <= PS_NUM`, so the rest folds) and
+    the per-window loop is rolled;
+  - `merge_group`'s 8x8 head-table scan (measured at ~2300 instructions per
+    call from the ISA, ~4600 per call site) became a three-round
+    `subgroupShuffleXor` tournament that leaves identical copies in every lane,
+    so the per-lane lists no longer need an LDS round trip, a barrier, or the
+    `l_e`/`l_xy` arrays at all;
+  - `insert_cand`'s position scan plus two-array shift became one compare-
+    exchange per slot;
+  - the walks evaluate four candidates per iteration (stride 32), which gives
+    the scheduler independent load chains; 2-wide was worth ~1% over 1-wide,
+    4-wide another ~1%;
+  - `group_add` bails out of a frame's list once an entry cannot beat the
+    overflowing group's worst (the list is ascending, so the rest cannot
+    either). Each is exact: the merged order is still `(error, y, x)`, the seeds
+    and `count` are unchanged, and the full BM3D test suite passes.
+  - Not taken: reordering the group-key compare to drop the `xy` tie-break
+    (invalid for the temporal walk, whose union enumeration is not in scan
+    order), and moving the reference patch to LDS (see Performance).
 
 - **2026-10-02 — the CPU oracle was a stale build; the residual is the tie
   order.** PyPI's 10.1 predates `reference/` (upstream force-pushed the

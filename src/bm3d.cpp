@@ -416,10 +416,10 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
                "device's is " +
                std::to_string(gpu.subgroup_size) + " and cannot be changed"s;
     }
-    // LDS: l_e/l_xy are the per-lane candidate lists [8 lanes][8 entries], and
-    // s_x/s_y/s0_x/s0_y hold the prediction seeds of each 8-lane group.
-    const GpuWorkgroup workgroup { .x = 32,
-                                   .shared_bytes = (2 * 64 + 4 * 8) * 4 * 4 };
+    // LDS: s_x/s_y/s0_x/s0_y hold the prediction seeds of each 8-lane group
+    // (four arrays of 8 entries per group). The per-lane candidate lists live in
+    // registers now, so nothing else is shared.
+    const GpuWorkgroup workgroup { .x = 32, .shared_bytes = 4 * 8 * 4 * 4 };
     return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(),
                                &spec, static_cast<uint32_t>(entries.size()),
                                sizeof(spec), "bm3d", subgroup_size, workgroup);
@@ -2120,7 +2120,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         }
         {
             std::string err =
-                gpu_make_buffer(*d->gpu, core, 4, d->skipped,
+                gpu_make_buffer(*d->gpu, core, 4 * sizeof(uint32_t), d->skipped,
                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -2132,7 +2132,9 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             d->skipped_mapped =
                 static_cast<volatile uint32_t *>(d->skipped.mapped);
             if (d->skipped_mapped) {
-                *d->skipped_mapped = 0;
+                for (int i = 0; i < 4; ++i) {
+                    d->skipped_mapped[i] = 0;
+                }
             }
         }
         {

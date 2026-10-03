@@ -179,9 +179,6 @@ int src_input(int z, int plane) {
     return src_search(z, plane) + (FINAL != 0 ? CLIP_STRIDE : 0);
 }
 
-// Per-lane candidate lists: [8 lanes][8 entries], the key is (error, packed yx).
-shared float l_e[4][64];
-shared int l_xy[4][64];
 // Prediction seeds of the temporal chain, one row per 8-lane group. They live
 // in shared memory because every lane of the group reads all of them: a
 // register array indexed by a runtime seed count would spill to scratch.
@@ -598,64 +595,85 @@ void insert_cand(inout float e[8], inout int xy[8], float err_, int xy_) {
     if (err_ > e[7] || (err_ == e[7] && xy_ >= xy[7])) {
         return;
     }
-    int pos = 7;
-    for (int k = 6; k >= 0; --k) {
-        pos = (err_ < e[k] || (err_ == e[k] && xy_ < xy[k])) ? k : pos;
+    // One compare-exchange per slot: the entry sinks to its place instead of a
+    // position scan plus a two-array shift. Same (error, xy) order as the
+    // scan-and-shift form.
+    float v = err_;
+    int vxy = xy_;
+    for (int k = 0; k < 8; ++k) {
+        const float te = e[k];
+        const int tx = xy[k];
+        const bool take = v < te || (v == te && vxy < tx);
+        e[k] = take ? v : te;
+        xy[k] = take ? vxy : tx;
+        v = take ? te : v;
+        vxy = take ? tx : vxy;
     }
-    for (int k = 7; k >= 1; --k) {
-        e[k] = (k == pos) ? err_ : ((k > pos) ? e[k - 1] : e[k]);
-        xy[k] = (k == pos) ? xy_ : ((k > pos) ? xy[k - 1] : xy[k]);
+}
+
+// Evaluate one candidate of a scan and keep it if it qualifies. Written as a
+// function so a walk body can evaluate several candidates per iteration: their
+// SSDs are independent, which gives the scheduler more than one chain of loads
+// to keep in flight.
+void scan_cand(inout float e[8], inout int xy[8], const float cur[64],
+               int base_idx, int cx, int cy, bool skip_ref, int rx, int ry) {
+    if (skip_ref && cx == rx && cy == ry) {
+        return;
     }
-    e[0] = (pos == 0) ? err_ : e[0];
-    xy[0] = (pos == 0) ? xy_ : xy[0];
+    const float err = ssd_err(cur, base_idx, cx, cy);
+    if (err <= TH_SSE) {
+        insert_cand(e, xy, err, pack_xy(cx, cy));
+    }
 }
 
 // 8-way merge of the per-lane lists into the group's best `n` entries, in the
-// same (error, y, x) order. A per-lane top-n recovers the group's top-n: the
-// entries each lane dropped are below its own n-th, so they are below the
-// n-th of the union too. `count` is the number of real entries; the tail is
-// filled with the sentinel so callers can loop over all 8 without a runtime
-// bound. When `seeds` is set the first PS_NUM entries are also published as the
-// prediction seeds of the next temporal frame.
-void merge_group(int n, bool seeds, out int count, out float me[8], out int mxy[8]) {
+// same (error, y, x) order. Every lane walks the same tournament -- three
+// shuffle rounds pick the smallest head across the eight lists -- so all lanes
+// end up holding identical copies of the result and no LDS round trip, head
+// table or 64-entry scan is needed. A per-lane top-n recovers the group's
+// top-n: the entries each lane dropped are below its own n-th, so they are
+// below the n-th of the union too.
+void merge_group(int n, bool seeds, out int count, out float me[8], out int mxy[8],
+                 const float e[8], const int xy[8]) {
     const int lid = int(gl_LocalInvocationID.x);
     const int group = lid >> 3;
     const int sl = lid & 7;
-    int head[8];
-    for (int l = 0; l < 8; ++l) head[l] = 0;
+    float ke[8];
+    int kx[8];
+    for (int i = 0; i < 8; ++i) {
+        ke[i] = i < n ? e[i] : FLT_MAX_;
+        kx[i] = i < n ? xy[i] : INT_MAX_;
+    }
     count = 0;
-    for (int k = 0; k < 8; ++k) {
-        int bl = -1;
-        int bh = 0;
-        float be = FLT_MAX_;
-        int bx = INT_MAX_;
-        if (k < n) {
-            for (int l = 0; l < 8; ++l) {
-                const int hv = head[l];
-                const bool has = hv < n;
-                const int idx = l * 8 + (has ? hv : 0);
-                const float e = has ? l_e[group][idx] : FLT_MAX_;
-                const int x = has ? l_xy[group][idx] : INT_MAX_;
-                // An unfilled slot holds the sentinel error, which no real
-                // distance reaches, so it is not an entry.
-                const bool valid = has && e < FLT_MAX_;
-                const bool better = valid && (bl < 0 || e < be || (e == be && x < bx));
-                bl = better ? l : bl;
-                bh = better ? hv : bh;
-                be = better ? e : be;
-                bx = better ? x : bx;
+    for (int out_k = 0; out_k < 8; ++out_k) {
+        float be = ke[0];
+        int bx = kx[0];
+        int winner = sl;
+        for (int d = 1; d < 8; d <<= 1) {
+            const float oe = subgroupShuffleXor(be, d);
+            const int ox = subgroupShuffleXor(bx, d);
+            const int ol = subgroupShuffleXor(winner, d);
+            const bool better = oe < be || (oe == be && ox < bx);
+            be = better ? oe : be;
+            bx = better ? ox : bx;
+            winner = better ? ol : winner;
+        }
+        // The shuffle rounds must run for every lane, so there is no early
+        // break: a sentinel head is simply not counted as an entry.
+        me[out_k] = be;
+        mxy[out_k] = bx;
+        count = be < FLT_MAX_ ? out_k + 1 : count;
+        if (seeds && be < FLT_MAX_ && out_k < PS_NUM && sl == 0) {
+            s_x[group][out_k] = bx & 0xFFFF;
+            s_y[group][out_k] = bx >> XY_SHIFT;
+        }
+        if (sl == winner) {
+            for (int i = 0; i < 7; ++i) {
+                ke[i] = ke[i + 1];
+                kx[i] = kx[i + 1];
             }
-        }
-        me[k] = be;
-        mxy[k] = bx;
-        if (bl < 0) {
-            continue;
-        }
-        count = k + 1;
-        head[bl] += 1;
-        if (seeds && k < PS_NUM && sl == 0) {
-            s_x[group][k] = bx & 0xFFFF;
-            s_y[group][k] = bx >> XY_SHIFT;
+            ke[7] = FLT_MAX_;
+            kx[7] = INT_MAX_;
         }
     }
 }
@@ -908,7 +926,6 @@ void main() {
             cur[c * 8 + i] = src[anchor_pc + (y + i) * STRIDE + (x + c)];
         }
     }
-
     // The reference block is the group's first member and is never matched
     // again: the current-frame scan excludes it by origin. A zero threshold
     // stops the search here, which is the CPU's `thMSE <= 0` reference-only
@@ -937,30 +954,35 @@ void main() {
         if (is_active && searching) {
             const Window w = make_window(x, y, BM_RANGE, WIDTH - 8, HEIGHT - 8);
             Walk k = walk_start(w, sl);
-            for (int s = sl; s < w.total; s += 8) {
-                if (k.col != x || k.row != y) {
-                    const float err = ssd_err(cur, anchor_pc, k.col, k.row);
-                    if (err <= TH_SSE) {
-                        insert_cand(pe, pxy, err, pack_xy(k.col, k.row));
+            for (int s = sl; s < w.total; s += 32) {
+                int c[4];
+                int r[4];
+                for (int q = 0; q < 4; ++q) {
+                    c[q] = k.col;
+                    r[q] = k.row;
+                    walk_step(k, w);
+                }
+                for (int q = 0; q < 4; ++q) {
+                    if (s + 8 * q < w.total) {
+                        scan_cand(pe, pxy, cur, anchor_pc, c[q], r[q], true, x, y);
                     }
                 }
-                walk_step(k, w);
             }
         }
-        barrier();
-        for (int k = 0; k < 8; ++k) {
-            l_e[group][sl * 8 + k] = pe[k];
-            l_xy[group][sl * 8 + k] = pxy[k];
-        }
-        barrier();
         float ce[8];
         int cxy[8];
         int cc;
-        merge_group(8, false, cc, ce, cxy);
+        merge_group(8, false, cc, ce, cxy, pe, pxy);
         // At most seven non-reference entries, so the combined list cannot
         // overflow here and the CPU's stable_sort of a short list is exactly
         // this concatenation order.
         for (int k = 0; k < 8; ++k) {
+            // ce is ascending by (error, xy) and an overflowed group keeps its
+            // tail sorted, so once one entry cannot beat the tail's worst none
+            // of the rest can: group_add would drop them all anyway.
+            if (goverflow && k < cc && k < 7 && ce[k] >= ge[7]) {
+                break;
+            }
             if (k < cc && k < 7) {
                 group_add(ge, gxy, gz, gcount, goverflow, ce[k], cxy[k], KRADIUS);
             }
@@ -1012,47 +1034,53 @@ void main() {
                 // skipped before its pixels are read. Windows all share
                 // PS_RANGE, so membership is the two comparisons below.
                 const int spc = src_search(z, 0);
-                for (int i = 0; i < 8; ++i) {
-                    if (i >= ns) {
-                        continue;
-                    }
+                // The seeds of the earlier windows are loop invariant: read
+                // per candidate, each one costs an LDS load plus a full LDS
+                // drain (lgkmcnt(0)) before the comparisons can run. Seed 0 is
+                // kept in registers here; with PS_NUM == 2 no other seed can
+                // ever be needed (ns <= PS_NUM), so the rest of the walk over
+                // earlier windows folds away entirely.
+                const int px0 = s_x[group][0];
+                const int py0 = s_y[group][0];
+                for (int i = 0; i < ns; ++i) {
                     const int sx = s_x[group][i];
                     const int sy = s_y[group][i];
                     const Window w = make_window(sx, sy, PS_RANGE, WIDTH - 8,
                                                  HEIGHT - 8);
                     Walk k = walk_start(w, sl);
-                    for (int s = sl; s < w.total; s += 8) {
-                        bool owned = true;
-                        for (int j = 0; j < 8; ++j) {
-                            if (j >= i) {
-                                continue;
-                            }
-                            const int px = s_x[group][j];
-                            const int py = s_y[group][j];
-                            const bool in_j = abs(k.col - px) <= PS_RANGE &&
-                                              abs(k.row - py) <= PS_RANGE;
-                            owned = owned && !in_j;
+                    for (int s = sl; s < w.total; s += 32) {
+                        int c[4];
+                        int r[4];
+                        for (int q = 0; q < 4; ++q) {
+                            c[q] = k.col;
+                            r[q] = k.row;
+                            walk_step(k, w);
                         }
-                        if (owned) {
-                            const float err = ssd_err(cur, spc, k.col, k.row);
-                            if (err <= TH_SSE) {
-                                insert_cand(pe, pxy, err, pack_xy(k.col, k.row));
+                        for (int q = 0; q < 4; ++q) {
+                            bool owned = true;
+                            for (int j = 0; j < PS_NUM; ++j) {
+                                if (j < i) {
+                                    const int px = j == 0 ? px0 : s_x[group][j];
+                                    const int py = j == 0 ? py0 : s_y[group][j];
+                                    owned = owned && !(abs(c[q] - px) <= PS_RANGE &&
+                                                       abs(r[q] - py) <= PS_RANGE);
+                                }
+                            }
+                            if (owned && s + 8 * q < w.total) {
+                                scan_cand(pe, pxy, cur, spc, c[q], r[q], false, 0, 0);
                             }
                         }
-                        walk_step(k, w);
                     }
                 }
             }
-            for (int k = 0; k < 8; ++k) {
-                l_e[group][sl * 8 + k] = pe[k];
-                l_xy[group][sl * 8 + k] = pxy[k];
-            }
-            barrier();
             float fe[8];
             int fxy[8];
             int fc;
-            merge_group(8, true, fc, fe, fxy);
+            merge_group(8, true, fc, fe, fxy, pe, pxy);
             for (int k = 0; k < 8; ++k) {
+                if (goverflow && k < fc && fe[k] >= ge[7]) {
+                    break;
+                }
                 if (k < fc) {
                     group_add(ge, gxy, gz, gcount, goverflow, fe[k], fxy[k], z);
                 }
