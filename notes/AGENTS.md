@@ -5,8 +5,9 @@ automatically whenever you read or edit anything under `notes/`. The fixed
 shape, the budget and the rules that do not bend are requirements.
 
 One file per filter (`BILATERAL.md`, `BM3D.md`, `DFTTEST.md`, `EEDI3.md`,
-`EEDI3AA.md`, `GAUSSBLUR.md`, `NLMEANS.md`, `NNEDI3.md`). They are **tracked**
-in git: the durable design record, not scratch memory.
+`EEDI3AA.md`, `GAUSSBLUR.md`, `NLMEANS.md`, `NNEDI3.md`), plus one cross-cutting
+file (`METHOD.md`). They are **tracked** in git: the durable design record, not
+scratch memory.
 
 These files are read by people deciding what to try next. Length is not a
 virtue and the history is not the point — the *current design*, the *measured
@@ -17,10 +18,11 @@ is rare; most need one bullet.
 
 `tools/notes_check.py` — the `notes` gate in `tools/lint.sh`, which CI runs on
 every push — checks the mechanical half of this file: the title, the part names
-and their order, both line budgets, the file index above, and report IDs in the
-text. A note that fails it is a defect to fix, not a style disagreement.
+and their order (for filter notes), the line budgets, the file index above, and
+report IDs in the text. A note that fails it is a defect to fix, not a style
+disagreement.
 
-## Fixed shape (every file, in this order)
+## Fixed shape (filter notes, in this order)
 
 1. `# <Filter> — notes` — exact form, no suffix, no port tag.
 2. **Status banner** (no heading) — the state (`shipped` / `iterating` /
@@ -43,6 +45,17 @@ the mechanisms behind those numbers and never repeats the table.
 Cross-cutting correctness passes (validation hardening, error-path fixes,
 `sfence` ordering) are not rounds of their own: at most one bullet each, under
 **Historical**.
+
+## Cross-cutting notes
+
+`METHOD.md` documents method that belongs to no single filter: the order to work
+in (its `## Typical workflow`), comparing a vsfeel kernel against the reference
+kernels, and the porting discipline. The fixed shape above is for filter notes; a
+cross-cutting note carries its own `##` sections instead, with no status banner,
+scoreboard or `## Historical`. The rest still binds it: the title form, the
+writing style below, dead ends keeping their mechanism, and a 350-line budget on
+the whole file — a filter note's live-part budget, which is what it has instead
+of a history section. `tools/notes_check.py` holds it to exactly that.
 
 ## Writing style
 

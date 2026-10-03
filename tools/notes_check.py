@@ -23,6 +23,11 @@ Checked, per note:
   * no report IDs (`WO-55`, `§I.11`) leaked in from a work order;
   * no trailing whitespace, and the file ends in exactly one newline.
 
+A cross-cutting note (`METHOD.md`) documents method rather than one filter, so
+the fixed parts above do not apply to it: its `##` sections are its own, and it
+gets one budget -- a filter note's live-part figure -- on the whole file. The
+title and the mechanical rules are still checked.
+
 And once for the directory: the file index in notes/AGENTS.md lists exactly the
 notes that exist, so adding a filter cannot leave the index stale.
 
@@ -49,12 +54,20 @@ REQUIRED = ("Implementation", "Historical", "Open work", "Debug env vars")
 HISTORICAL = "Historical"
 TOTAL_MAX = 700
 LIVE_MAX = 350
+# A cross-cutting note has no history section, so it gets one budget on the whole
+# file: a filter note's live-part figure.
+CROSS_CUTTING_MAX = LIVE_MAX
 
 # Banned in code, comments and notes alike: they name a work order, not a thing
 # a reader of the tree can look up.
 REPORT_ID = re.compile(r"WO-\d+|§[IVX0-9]")
 
 CONVENTIONS = "AGENTS.md"
+
+# Notes that document method rather than one filter. They carry their own `##`
+# sections, so the fixed shape does not apply; notes/AGENTS.md is the authority
+# on which files these are.
+CROSS_CUTTING = ("METHOD.md",)
 
 
 def unfenced(lines):
@@ -119,9 +132,6 @@ def check_note(path):
             )
         rank = max(rank, position)
 
-    total = len(lines)
-    if total > TOTAL_MAX:
-        problems.append((total, "file is %d lines, over the %d-line budget" % (total, TOTAL_MAX)))
     live = live_lines(lines, found)
     if live > LIVE_MAX:
         problems.append(
@@ -132,6 +142,25 @@ def check_note(path):
             )
         )
 
+    return problems + mechanical(lines, text, TOTAL_MAX)
+
+
+def check_cross_cutting(path):
+    """Return the problems in one cross-cutting note, which has no fixed shape."""
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    problems = []
+    if not lines or not TITLE.match(lines[0]):
+        problems.append((1, "title must be exactly '# <Name> — notes'"))
+    return problems + mechanical(lines, text, CROSS_CUTTING_MAX)
+
+
+def mechanical(lines, text, total_max):
+    """Return the problems every note has, fixed shape or not."""
+    problems = []
+    total = len(lines)
+    if total > total_max:
+        problems.append((total, "file is %d lines, over the %d-line budget" % (total, total_max)))
     for number, line in unfenced(lines):
         if REPORT_ID.search(line):
             problems.append((number, "report ID in the text; notes name things, not work orders"))
@@ -145,6 +174,13 @@ def check_note(path):
         problems.append((total, "file must not end with a blank line"))
 
     return problems
+
+
+def check(path):
+    """Return the problems in one note, dispatching on the note's kind."""
+    if path.name in CROSS_CUTTING:
+        return check_cross_cutting(path)
+    return check_note(path)
 
 
 def check_index(directory):
@@ -196,7 +232,7 @@ def main():
 
     failed = 0
     for path in files:
-        for number, message in check_note(path):
+        for number, message in check(path):
             print("%s:%d: %s" % (path, number, message))
             failed = 1
     for target in targets:

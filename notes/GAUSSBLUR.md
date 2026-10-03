@@ -167,7 +167,7 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
 
 - **Workgroup-shape sweep across sigma ∈ {4, 16, 40, 80}** — never done, and
   the port did not touch the kernels or their `16x8` launch, so it still
-  applies (sweep block candidates × configs per `AGENTS.md`).
+  applies (sweep block candidates × configs per `notes/METHOD.md`).
 - If a kernel-vs-copy split is ever needed again, build the warm
   in-command-buffer timestamp probe in the dfttest/nlmeans form;
   `VSFEEL_GAUSS_GPU_BENCH` (it idled the device from a frame callback without
