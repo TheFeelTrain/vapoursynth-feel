@@ -1251,8 +1251,12 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame & fr,
                 const int32_t slot0_push = (r == 0) ? fr.slot0[gi] : 0;
                 const int32_t plane_off4 = static_cast<int32_t>(
                     static_cast<VkDeviceSize>(pi) * d->tw * 2 * g.pe / 4);
+                // Named rather than cast inside the list: cppcheck reads a cast
+                // alone on an initializer's continuation line as a discarded
+                // expression statement (constStatement), in some versions only.
+                const int32_t src_base_push = static_cast<int32_t>(src_base);
                 const int32_t pushes[5] { n, nf, slot0_push, plane_off4,
-                                          static_cast<int32_t>(src_base) };
+                                          src_base_push };
                 if (d->refusal_mapped && !d->refusal_mapped[0]) {
                     d->refusal_mapped[1] = static_cast<uint32_t>(n);
                 }

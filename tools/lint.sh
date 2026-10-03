@@ -170,8 +170,27 @@ gate_notes() {
 
 status=()
 failed=0
+# The tool's own version next to the gate. clang-format/clang-tidy/ruff come from
+# the pinned lint group, cppcheck from the system (apt on CI, the distro here),
+# so a finding that reproduces on neither box is a version difference, and the
+# log has to show which one ran.
+gate_version() {
+    # clang-tidy prints a banner first, so take the first line naming a version.
+    case $1 in
+        format) "$clang_format" --version 2>/dev/null | grep -m1 -i version ;;
+        tidy) "$clang_tidy" --version 2>/dev/null | grep -m1 -i version ;;
+        cppcheck) "$cppcheck" --version 2>/dev/null | head -1 ;;
+        ruff) "$ruff" --version 2>/dev/null | head -1 ;;
+        *) : ;;
+    esac
+}
 for gate in "${gates[@]}"; do
-    printf '==> %s\n' "$gate"
+    version=$(gate_version "$gate")
+    if [ -n "$version" ]; then
+        printf '==> %s (%s)\n' "$gate" "$version"
+    else
+        printf '==> %s\n' "$gate"
+    fi
     rc=0
     "gate_$gate" || rc=$?
     case $rc in

@@ -644,8 +644,11 @@ design.
 `tools/lint.sh` is the single entry point, and CI runs exactly it
 (`.github/workflows/lint.yml`). The pinned clang-format/clang-tidy/ruff come
 from the `lint` dependency group (`uv sync --group lint`), and the script puts
-`.venv/bin` first on `PATH`, so a local run and CI use the same versions.
-Six gates:
+`.venv/bin` first on `PATH`, so a local run and CI use the same versions --
+except `cppcheck`, which is a system package (apt on CI, the distro locally) and
+whose findings do drift between releases. `lint.sh` prints each gate's version
+so that difference is visible in the log; a finding that reproduces on neither
+box is a version difference, not a defect. Six gates:
 
 - **format** — `clang-format --dry-run --Werror` over `src/*.cpp` and `src/*.h`
   (`.clang-format`); `tools/lint.sh --fix` rewrites in place.
@@ -654,7 +657,8 @@ Six gates:
   against `vulkan1.4`. A shader that compiles but is not valid SPIR-V fails the
   build here (this is what caught a 16-bit constant needing `Int16`).
 - **tidy** — `clang-tidy` over the compile database (`.clang-tidy`).
-- **cppcheck** — over the same database.
+- **cppcheck** — over the same database; the one tool whose version is not
+  pinned, so its findings can differ between a developer's box and CI.
 - **ruff** — `ruff check` over `vsfeel/`, `tools/`, `hatch_build.py`,
   `src/gen_spirv_header.py` and `tests/` (see `[tool.ruff.lint]` in
   `pyproject.toml` for the curated check set).
