@@ -17,6 +17,7 @@ Scoreboard, real based_aa clip (jpbd 2x Point → 3840x2160 GRAY16, 600 f, ns=8)
 | vsfeel `EEDI3AA` (fused, pre-port build) | 96.3 |
 | vsfeel `EEDI3AA` (R80 port, interleaved A/B) | 159.2 vs 153.2 (**+4%**) |
 | vsfeel two-call chain (order-reversed A/B, 6×600 f) | 98.9 (fused 100.2 → **1.01–1.07x**) |
+| vsfeel `EEDI3AA` (batch knee re-swept, 4×1000 f order-reversed) | 183.1 → **198.7 (+8.5%)** |
 | vszipcl chain (best reference) | 45.3 |
 | vszipcu / eedi3vk2 chain | 25.8 / 28.1 |
 
@@ -102,6 +103,38 @@ chroma width rejected; determinism, multi-stream and parallel load; props
 forwarded parameters the plugin does not declare). Whole
 suite **803 passed** via `tools/test.sh`.
 
+## Performance
+
+**Read the scoreboard with the screen quiet.** The frame is GPU bound, and an
+active display (KWin compositing, or this page in a browser) holds
+`gpu_busy_percent` at 12-18 even at idle, which comes straight off the top: the
+same build and batch measured 192.5 fps with the monitor off and 171.3 with it on
+(`notes/METHOD.md`). The scoreboard's numbers are screen-quiet.
+
+`VSFEEL_EEDI3_GPUTIME=1` stamps every phase of every sub-pass inside the
+submission's command buffer (it waits that submission out, so it serializes the
+pipeline: a diagnostic, never a benchmark config). 2x2160p u16, mclip+sclip,
+batch 4, per batch of ~3 frames:
+
+| sub-pass | prep | row | vcheck | tail |
+|---|---|---|---|---|
+| v0 (vertical, parity 0) | 1971* | 3729 | 128 | - |
+| v1 (vertical, parity 1) | 291 | 3625 | 132 | 172 (assembleV) |
+| h0 (horizontal) | 409 | 3009 | 135 | 73 (compose) |
+| h1 (horizontal) | 416 | 2989 | 135 | 178 (compose+fuse) |
+
+\* v0's prep also carries the command buffer's prologue: the wait for the input
+upload's producer pairs, which is PCIe time, not compute. The real prep is ~291
+us per sub-pass.
+
+So the **row kernel is 77% of the GPU time**, prep 18%, vcheck 3%, tail 2.4%; the
+GPU is ~88% busy and the frame is GPU bound (removing the input uploads with
+`--gpu-cache` does not help). Ablating the row kernel end to end takes the graded
+run 172 -> 281 fps, i.e. **the row kernel is 39% of the frame**, which is where
+the batch and row-kernel work below pays off. The kernel itself is attributed in
+`notes/EEDI3.md`'s Performance section; the short version is that it is
+ALU-issue bound at ~1 IPC, not load bound.
+
 ## Historical
 
 - **2026-10-02 — the `oracle_32bit[case4-*]` failures were the EEDI3 core, not
@@ -185,6 +218,16 @@ under-reported every stage 10x).
 
 ### Round history
 
+- **2026-10-03 — the batch knee moves to 4 and the row kernel is priced.** Re-swept
+  the batch under the harness's own RADV env (the transfer queue is what sets the
+  knee): B=3 189 / **B=4 198** / B=5 197 / B=6 175 fps, so the auto rule's target
+  went 512 → 768 MiB with the cap at `budget/12`. With the shared core's row-kernel
+  work (notes/EEDI3.md), an order-reversed 4×1000 f same-session pair measures
+  183.1 → **198.7 fps (+8.5%)**; 971 tests pass. The GPUTIME attribution (Performance)
+  is new: it is what showed the row kernel at 77% of the GPU and the input-upload
+  wait hiding inside v0's prep, i.e. that this filter is GPU bound where the
+  vertical one is transfer bound.
+
 - **Round 2 — implemented**, 585/585 tests green. The 1.6–1.8x projection
   failed: worth 1.0–1.07x over the vsfeel chain, only the two `std.Merge` nodes
   and the intermediate frame materialisation (~9%).
@@ -245,14 +288,16 @@ under-reported every stage 10x).
   width-independent form (previous row in registers via subgroup shuffles, or a
   tiled LDS window) — pure constant-factor, identical output, safe to land. Even
   a 2x vcheck is ~1.2x end-to-end; 1.5x needs it *plus* the row kernel.
-- **Row kernel / `pbt`**: both named levers are measured dead (above); the one
-  remaining structural idea is a walk dispatch with one lane per row (~5–9%
-  projected, not attempted). `pbt` is `W*rows*tpitch` int8 = 170 MB per sub-pass
-  at 4K, written and re-read by the backtrack — any experiment needs its own
-  probe, not `PROBE=4`.
-- **No GPU stage profiler in the tree**; restoring it is the prerequisite for
-  attributing anything. The ablation/diagnostic knobs named in the rounds above
-  have been removed; the live set is below.
+- **Row kernel / `pbt`**: both named levers are measured dead (above). The row
+  kernel is 39% of the graded frame, and its own attribution (`notes/EEDI3.md`,
+  Performance) leaves exactly one large item: the ring shift register (PROBE=15,
+  12.0% of the kernel). Reaching it needs the column loop unrolled by RN with a
+  compile-time ring base, which is a hand unroll and a rotation of the `roll_seed`
+  write indices.
+- **Batch knee, re-measured under the harness's RADV env** (the transfer queue is
+  what sets it): EEDI3AA 2x2160p B=3 189 / **B=4 198** / B=5 197 / B=6 175 fps.
+  The auto rule's 512 MiB scratch target landed on 3, so it is 768 MiB now and the
+  budget cap is `budget/12`; both are tuned constants, not invariants.
 
 ## Debug env vars
 
@@ -261,6 +306,10 @@ the shared core's knobs plus its own `..._NOCLEAR`/`..._POISON`.
 
 - `..._BATCH=<n>` — output frames per submission (default from the scratch
   target, see `notes/EEDI3.md`); `=1` is the A/B control.
+- `..._GPUTIME=1` — per-phase GPU timestamps inside the
+  submission's own command buffer (serializes the pipeline; diagnostic only).
+- `..._SKIP=<kernels>` — omit `mask,pad,row,vcheck,tail` from the
+  recording, to price a kernel end to end. Changes the output.
 - `..._VPARA=<n>` — vcheck form: 0 = serial row walk (A/B control), 1..6 =
   parallel with that many Jacobi steps (default 6).
 - `..._VCLDS=1` — force the LDS vcheck ping-pong back (global reads are default).

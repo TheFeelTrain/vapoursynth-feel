@@ -164,6 +164,13 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   signature). Same-session pairs stay fair through all of it — grade on those,
   and lengthen the run before trusting any absolute number (short runs are
   clock-ramp-sensitive).
+- **An active display is a ~12% tax on every absolute number.** KWin compositing
+  (plus any browser drawing on the same GPU) holds `gpu_busy_percent` at 12-18
+  *at idle*, and a GPU-bound filter pays it straight off the top: the same binary,
+  same batch and same command measured **192.5 fps with the monitor off and 171.3
+  with it on**. That is the whole of a "the notes say 200, I see 175" gap, so read
+  `gpu_busy_percent` before believing any absolute figure, and record the display
+  state next to one. Same-session interleaved pairs stay fair through it.
 - **Prove the host/GPU split before optimizing anything.** Add a small
   env-gated chrono probe around the frame path (acquire / record / submit)
   and read it on real content first — kernel

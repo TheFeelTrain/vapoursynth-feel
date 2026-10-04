@@ -64,15 +64,40 @@ if [ "$#" -eq 0 ]; then
     set -- tests
 fi
 
+# A flags-only invocation (`tools/test.sh -q`) must still target `tests`: with
+# no path at all pytest collects from the rootdir, sweeps in the reference/
+# trees, and their test modules share basenames with ours, which makes pytest's
+# rootdir-based module naming fail every tests/test_*.py with "import file
+# mismatch". Any non-flag argument naming an existing path is an explicit
+# target; anything else (`-k eedi3`, `loadfile`) is not.
+target_given=
+for arg in "$@"; do
+    case $arg in
+        -*) continue ;;
+    esac
+    if [ -e "$arg" ]; then
+        target_given=1
+    fi
+done
+if [ -z "$target_given" ]; then
+    set -- "$@" tests
+fi
+
 cd -- "$root_dir"
 
+# reference/ is read-only porting material, never part of this suite: it holds
+# the references' own tests plus their dependency trees (lvsfunc, vs-jetpack),
+# which are not ours to run and whose collection is what breaks ours.
+ignore_reference=(--ignore=reference)
+
 if [ "$workers" -le 1 ]; then
-    exec "$py" -m pytest -q "$@"
+    exec "$py" -m pytest -q "${ignore_reference[@]}" "$@"
 fi
 
 if ! "$py" -c 'import xdist' >/dev/null 2>&1; then
     printf 'test.sh: pytest-xdist is not installed (dev dependency group); running serially\n' >&2
-    exec "$py" -m pytest -q "$@"
+    exec "$py" -m pytest -q "${ignore_reference[@]}" "$@"
 fi
 
-exec "$py" -m pytest -q -n "$workers" --dist loadfile "$@"
+exec "$py" -m pytest -q -n "$workers" --dist loadfile \
+    "${ignore_reference[@]}" "$@"

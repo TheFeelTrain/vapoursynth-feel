@@ -213,14 +213,20 @@ def test_eedi3_batch_is_capped_by_the_vram_budget():
     """The tuned batch must yield to the budget it was capped by.
 
     The old code floored the target back up to 256 MiB *after* capping it at
-    limit/16, so a small allowance was ignored: the batch could plan several
-    times the cap as scratch. Two frames are the minimum a submission needs to
-    overlap, so the batch only drops below two when even those do not fit.
+    limit/CAP_DIVISOR, so a small allowance was ignored: the batch could plan
+    several times the cap as scratch. Two frames are the minimum a submission
+    needs to overlap, so the batch only drops below two when even those do not
+    fit.
     """
+    # The divisor the batch planner caps its tuned scratch target with. It is
+    # 12 rather than 16 because EEDI3AA's measured knee (batch 4 at 2x2160p,
+    # 670 MiB of scratch) sits just above limit/16 on a 10 GiB allowance.
+    cap_divisor = 12
     scratch, batch, limit_mib = _eedi3_batch(_trace("eedi3"))
-    if limit_mib / 16 >= 2 * scratch:
+    cap = limit_mib / cap_divisor
+    if cap >= 2 * scratch:
         assert batch >= 2, (batch, scratch, limit_mib)
-    assert batch * scratch <= max(limit_mib / 16, scratch) + 1e-6
+    assert batch * scratch <= max(cap, scratch) + 1e-6
 
     # A budget whose cap is half a frame cannot host two frames: one frame, not
     # the five the floor used to pick here.
@@ -229,7 +235,7 @@ def test_eedi3_batch_is_capped_by_the_vram_budget():
         _trace("eedi3", {"VSFEEL_LIMIT_VRAM_BUDGET": str(int(tiny_mib) << 20)})
     )
     assert batch2 == 1, (batch2, scratch2, tiny_mib)
-    cap2 = min(limit2, tiny_mib) / 16
+    cap2 = min(limit2, tiny_mib) / cap_divisor
     assert batch2 * scratch2 <= max(cap2, scratch2) + 1e-6
 
 

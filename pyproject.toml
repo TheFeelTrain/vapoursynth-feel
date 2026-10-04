@@ -113,6 +113,7 @@ vapoursynth-bm3d = { git = "https://github.com/HomeOfVapourSynthEvolution/Vapour
 
 [tool.pytest.ini_options]
 addopts = "-p no:vsengine"
+norecursedirs = [".*", "*.egg", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}", "reference"]
 
 [tool.ruff]
 line-length = 100

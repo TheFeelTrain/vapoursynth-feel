@@ -110,6 +110,11 @@ const int MARGIN_V = 4;
 
 // backtrack + interpolate tile width (columns)
 const int BT_TILE = 32;
+// Derived from WIDTH exactly as the host derives cfg.pad_stride (16-aligned),
+// so pad addresses are compile-time row strides plus constant offsets instead
+// of a runtime pitch multiply per tap.
+#define PAD_STRIDE ((WIDTH + 2 * MARGIN_H + 15) & ~15)
+
 // Diagnostics-only ablation level (0 = full kernel; 1 = store a zero pbt; 2 =
 // return after the mask pack/span scan; 3 = return at entry; 4 = skip the pbt
 // stores entirely; 5 = return after the DP, no backtrack; 6 = backtrack reads
@@ -126,7 +131,12 @@ const int BT_TILE = 32;
 // 10 = 8's walk with an explicit 4x unroll so independent loads can overlap.
 // 12 = like 2 but dmap is filled with a realistic direction pattern first, so
 // the downstream vcheck's branch mix matches the real kernel.
-// There is no PROBE 11 (the numbering skips it); 13 and above are unused.
+// There is no PROBE 11 (the numbering skips it). 13-19 and 22 are the row
+// kernel's cost ladder: 13 = pad loads and their converts gone; 14 = one
+// leading term instead of three; 15 = no ring shift; 16 = ring_sum of one term;
+// 17 = combine's blend/cost ALU gone; 18 = relax replaced by the centre
+// candidate; 19 = predecessor gather replaced by constants; 22 = interp_dir's
+// direction guard forced true.
 // Kept as a tuning instrument. NOTE (round 20): the entry guard used to be
 // `PROBE >= 3`, so levels 4-7 silently compiled to an EMPTY kernel (1656 B of
 // SPIR-V, against 43720 B for PROBE=0) and the old "only 2/4/6 produced the
@@ -430,12 +440,17 @@ layout(push_constant) uniform PC {
 // have the raw/pad buffers.)
 #if !defined(ENTRY_NO_HELPERS)
 float pad_get(int dst_row, int col) {
-#if BITS == 16
+#if PROBE == 13
+    // Diagnostics: the cost-window ALU with the pad loads (and their u16->float
+    // converts) removed. Same instruction structure, no memory traffic, so the
+    // difference against PROBE=0 is what the loads themselves cost.
+    return float(pc.pad_base + (MARGIN_V + dst_row) * 3 + MARGIN_H + col);
+#elif BITS == 16
     // Widen via int (int(uint16) already compiles under the 16-bit storage
     // extension; a direct float(uint16) would need int16 arithmetic); exact.
-    return float(int(pad[pc.pad_base + (MARGIN_V + dst_row) * pc.pad_stride + MARGIN_H + col]));
+    return float(int(pad[pc.pad_base + (MARGIN_V + dst_row) * PAD_STRIDE + MARGIN_H + col]));
 #else
-    return pad[pc.pad_base + (MARGIN_V + dst_row) * pc.pad_stride + MARGIN_H + col];
+    return pad[pc.pad_base + (MARGIN_V + dst_row) * PAD_STRIDE + MARGIN_H + col];
 #endif
 }
 
@@ -543,10 +558,12 @@ void s0_geom(int u, out int di, out int dj, out bool hpr) {
 // flipping near-tie argmins (seen at nrad=3). Reproduce the integer v exactly.
 // Float formats use the exact midpoint. Half-pel directions take ip from the
 // half-pel rows and halve the beta term (u is in half-pel units).
-float combine_cost(int dy, int x, int u, float s0, float s1, float s2) {
+// c1/c2 are pad_get(dy-1,x) and pad_get(dy+1,x): the same for every direction
+// of a column, so the rolling caller loads them once per column instead of once
+// per direction.
+float combine_cost_taps(int dy, int x, int u, float s0, float s1, float s2,
+                        float c1, float c2) {
     float ip;
-    const float c1 = pad_get(dy - 1, x);
-    const float c2 = pad_get(dy + 1, x);
 #if BITS == 16
     if (HPF == 1) {
         ip = floor((pad_get(dy - 1, x + u) + pad_get(dy + 1, x - u) + 1.0f)
@@ -571,6 +588,11 @@ float combine_cost(int dy, int x, int u, float s0, float s1, float s2) {
         ip = (hp_get(dy - 1, x + u2) + hp_get(dy + 1, x - u2 - 1)) * 0.5f;
     }
 #endif
+#if PROBE == 17
+    // Diagnostics: the combine's blend term and cost weighting removed (keeps
+    // the three window sums and the two centre taps). Sizes the cost ALU.
+    return s0 + s1 + s2;
+#endif
     const float v = abs(c1 - ip) + abs(c2 - ip);
 
     // Combine order and `precise` mirror eedi3vk2's combineCost. Without
@@ -585,6 +607,11 @@ float combine_cost(int dy, int x, int u, float s0, float s1, float s2) {
     }
     cost += pc.rw * v;
     return cost;
+}
+
+float combine_cost(int dy, int x, int u, float s0, float s1, float s2) {
+    return combine_cost_taps(dy, x, u, s0, s1, s2, pad_get(dy - 1, x),
+                             pad_get(dy + 1, x));
 }
 
 // ---------------------------------------------------------------------------
@@ -609,10 +636,31 @@ float combine_cost(int dy, int x, int u, float s0, float s1, float s2) {
 const int RING_CAP = 7;   // >= 2*NRAD+1 for NRAD <= 3 (fixed bound -> registers)
 #define RN (2 * NRAD + 1)
 
+// rowA's two operand triples. Kept apart from the combination because a caller
+// that needs one side for two different windows (s1's i-side and s2's j-side
+// are both the column x+NRAD+1 triple) can then load it once.
+struct RowASides {
+    float i0, i1, i2;  // rows dy-3, dy-1, dy+1 at the first column
+    float j0, j1, j2;  // rows dy-1, dy+1, dy+3 at the second
+};
+
+RowASides rowA_load(int dy, int i, int j) {
+    RowASides s;
+    s.i0 = pad_get(dy - 3, i);
+    s.i1 = pad_get(dy - 1, i);
+    s.i2 = pad_get(dy + 1, i);
+    s.j0 = pad_get(dy - 1, j);
+    s.j1 = pad_get(dy + 1, j);
+    s.j2 = pad_get(dy + 3, j);
+    return s;
+}
+
+float rowA_combine(in RowASides s) {
+    return abs(s.i0 - s.j0) + abs(s.i1 - s.j1) + abs(s.i2 - s.j2);
+}
+
 float rowA(int dy, int i, int j) {
-    return abs(pad_get(dy - 3, i) - pad_get(dy - 1, j))
-         + abs(pad_get(dy - 1, i) - pad_get(dy + 1, j))
-         + abs(pad_get(dy + 1, i) - pad_get(dy + 3, j));
+    return rowA_combine(rowA_load(dy, i, j));
 }
 
 // One s0 term: the kept-row A, or its half-pel form for odd hp directions.
@@ -644,14 +692,42 @@ void roll_push(int dy, int x, int u,
     bool hpr;
     s0_geom(u, di, dj, hpr);
     const int o = s12_off(u);
+#if PROBE == 14
+    // Diagnostics: one leading term instead of three (the other two reuse it),
+    // so the rolling path does a third of the pad loads. Answers what killing
+    // the three-window redundancy would be worth before implementing it.
     const float l0 = s0_term(dy, x + di + NRAD + 1, x + dj + NRAD + 1, hpr);
-    const float l1 = rowA(dy, x + NRAD + 1, x - o + NRAD + 1);
-    const float l2 = rowA(dy, x + o + NRAD + 1, x + NRAD + 1);
+    const float l1 = l0;
+    const float l2 = l0;
+#else
+    const float l0 = s0_term(dy, x + di + NRAD + 1, x + dj + NRAD + 1, hpr);
+    // s1's i-side and s2's j-side are both the column c = x+NRAD+1 triple over
+    // rows (dy-3, dy-1, dy+1) and (dy-1, dy+1, dy+3): four distinct taps, so
+    // load the column once instead of six taps for two rowA evaluations.
+    const int c = x + NRAD + 1;
+    const float c0 = pad_get(dy - 3, c);
+    const float c1 = pad_get(dy - 1, c);
+    const float c2 = pad_get(dy + 1, c);
+    const float c3 = pad_get(dy + 3, c);
+    const float l1 = abs(c0 - pad_get(dy - 1, c - o))
+                   + abs(c1 - pad_get(dy + 1, c - o))
+                   + abs(c2 - pad_get(dy + 3, c - o));
+    const float l2 = abs(pad_get(dy - 3, c + o) - c1)
+                   + abs(pad_get(dy - 1, c + o) - c2)
+                   + abs(pad_get(dy + 1, c + o) - c3);
+#endif
+#if PROBE == 15
+    // Diagnostics: no ring shift (the new term overwrites in place). Keeps the
+    // load/ALU structure, drops the 4 movs per ring per column, so the
+    // difference against PROBE=0 is what the shift register costs.
+    r0[RN - 1] = l0; r1[RN - 1] = l1; r2[RN - 1] = l2;
+#else
     for (int k = 0; k < RING_CAP - 1; ++k) {
         if (k >= RN - 1) break;
         r0[k] = r0[k + 1]; r1[k] = r1[k + 1]; r2[k] = r2[k + 1];
     }
     r0[RN - 1] = l0; r1[RN - 1] = l1; r2[RN - 1] = l2;
+#endif
 }
 
 // Re-sum one term ring in k order, exactly like eedi3vk2's orderedSum: the
@@ -659,12 +735,17 @@ void roll_push(int dy, int x, int u,
 // incremental accumulator drifts from it by an ulp of f32 per column, which
 // flips near-tie argmins on real content.
 float ring_sum(in float r[RING_CAP]) {
+#if PROBE == 16
+    // Diagnostics: one term instead of RN (drops RN-1 adds per ring).
+    return r[0];
+#else
     precise float s = 0.0f;
     for (int k = 0; k < RING_CAP; ++k) {
         if (k >= RN) break;
         s += r[k];
     }
     return s;
+#endif
 }
 
 // Full connection-cost recompute for column x, direction u (full-pel units, or
@@ -696,46 +777,14 @@ float conn_cost(int dy, int x, int u) {
 
     return combine_cost(dy, x, u, s0, S1, S2);
 }
-#endif  // ENTRY_NO_HELPERS
-#if defined(ENTRY_ROW)
-
-// Per-interp-row DP in REGISTERS with subgroup shuffles (eedi3vk2 structure):
-// one workgroup of SGSIZE lanes per interpolated row, each lane owns
-// K = ceil(TPITCH / SGSIZE) consecutive directions in private registers, so
-// the per-column relax reads its +-1 predecessor window from the other lanes'
-// registers via subgroupShuffleUp/Down — zero workgroup barriers in the column
-// loop. Masked columns (mclip) are near-free: cur = pp register copy + pumax
-// fixups + one pbt byte per lane. Backtrack/interpolate happens tile-by-tile
-// (BT_TILE columns per tile) from a shared copy of the relative-delta pbt
-// rows, exactly like eedi3vk2.
-//
-// pbt stores RELATIVE predecessor deltas (idx - u, int8), so backtracking
-// accumulates: fpath[x] = fpath[x+1] + pbt[x][CENTER + fpath[x+1]].
-//
-// Connection costs keep the rolling window sums per direction (s0/s1/s2 +
-// RING_CAP term rings per owned direction). Rolling is only valid across
-// consecutive unmasked interior columns; a masked column or a column outside
-// the direction's interior band invalidates the state (next interior column
-// reseeds with the full window). This matches the barrier version's cost math
-// bit-for-bit (same roll_seed/roll_push/ring_sum/combine_interior), so both
-// depths stay bit-exact vs eedi3vk2.
-//
-// The workgroup is a single 32-lane subgroup; each workgroup processes one
-// interpolated row. The host requests requiredSubgroupSize = 32 for this
-// pipeline (RDNA3's native 64-lane wavefront is split via the subgroup size
-// control feature). NOTE (round 6): a 2-subgroup x 2-row-per-WG variant was
-// tried and measured SLOWER on the mclip workload (see notes) — keep 1 row/WG.
-const int SGSIZE = 32;                       // == workgroup size (host sets it)
+const int SGSIZE = 32;                         // == row workgroup size
 const int K = (TPITCH + SGSIZE - 1) / SGSIZE;  // directions per lane
-
 // pbt column layout. The relative predecessor delta is -1/0/+1, so when each
 // lane owns exactly two directions (MDIS 17..31, i.e. K == 2, which includes
 // the mdis=20 default) the whole column packs into one nibble per lane -- 16
-// bytes instead of TPITCH=41, a 2.6x cut in the row kernel's store traffic
-// (measured worth ~10% of the frame ungated; PROBE=4). Even lanes combine their
-// odd neighbour's nibble through a shuffle and store one byte, so the packing
-// adds no barrier. Other K keep the plain int8 column; hp always does (its
-// deltas span +-2 and do not fit a nibble).
+// bytes instead of TPITCH=41. Even lanes combine their odd neighbour's nibble
+// through a shuffle and store one byte, so the packing adds no barrier. Other
+// K keep the plain int8 column; hp always does (its deltas span +-2).
 const bool PB_PACK = (K == 2 && HPF == 1);
 const int PB_STRIDE = PB_PACK ? (SGSIZE / 2) : TPITCH;   // bytes per column
 
@@ -747,39 +796,6 @@ int pbt_delta(const int base, const int x, const int e) {
     return int(pbt[base + x * PB_STRIDE + e]);
 }
 
-// Packed store: lane `lane` owns directions 2*lane and 2*lane+1, one nibble.
-// The odd lane's nibble reaches its even partner through a shuffle, so a single
-// even lane writes the whole byte and there is no write-write race.
-void pbt_store_pair(const int base, const int x, const int lane, const int c0, const int c1) {
-    const uint nib = (uint(c0 + 1) & 3u) | ((uint(c1 + 1) & 3u) << 2);
-    const uint hi = subgroupShuffleXor(nib, 1u) & 0xFu;
-    if ((lane & 1) == 0) {
-        pbt[base + x * PB_STRIDE + (lane >> 1)] = int8_t(nib | (hi << 4));
-    }
-}
-
-void pbt_store_one(const int base, const int x, const int e, const int v) {
-    pbt[base + x * PB_STRIDE + e] = int8_t(v);
-}
-
-// tileF carries the per-column direction from the lane-0 backtrack walk to the
-// parallel interpolate lanes. (The old tileSh staging buffer is gone: the walk
-// now reads pbt directly from global — see the backtrack comment.)
-shared int8_t tileF[BT_TILE];
-shared uint bmaskSh[(WIDTH + 31) / 32];
-// First unmasked column of this row (WIDTH = fully masked). Written by lane
-// 0 after the pack loop, read by all lanes after a barrier.
-shared int rowXmin;
-
-layout(local_size_x_id = 6) in;
-
-// Shared packed-bit test of the current row's mask (bmaskSh filled by the
-// pack loop in main). HAS_MCLIP == 0 pipelines return true (nothing masked).
-bool bmask_local(int x) {
-    if (HAS_MCLIP == 0) return true;
-    return (bmaskSh[x >> 5] & (1u << (x & 31))) != 0u;
-}
-
 // Interpolate along direction `dir` (full-pel, or half-pel when hp is on),
 // ucubic semantics always on: the 4-tap cubic along the direction when its
 // taps stay in the frame, else the 2-tap average. Half-pel directions are
@@ -788,7 +804,15 @@ bool bmask_local(int x) {
 // -1/32). `precise` as in eedi3vk2's cubic4/avg2 (see cubic_float).
 float interp_dir(int dy, int x, int dir) {
     if (HPF == 1) {
+#if PROBE == 22
+        // Diagnostics: the direction guard forced true, so the 2-tap path is
+        // dead and the branch uniform, while the taps keep the real per-lane
+        // direction (their addresses stay uncoalesced). Splits PROBE=20's win
+        // into "branch/code" and "load addresses".
+        const int ad3 = 0;
+#else
         const int ad3 = abs(3 * dir);
+#endif
         if (x >= ad3 && x <= WIDTH - 1 - ad3) {
             precise float t =
                 0.5625f * (pad_get(dy - 1, x + dir) + pad_get(dy + 1, x - dir))
@@ -836,6 +860,76 @@ float interp_dir(int dy, int x, int dir) {
     precise float t = (pad_get(dy - 1, x + d20) + pad_get(dy - 1, x + d21)
                      + pad_get(dy + 1, x - d20) + pad_get(dy + 1, x - d21)) * 0.25f;
     return t;
+}
+
+#endif  // ENTRY_NO_HELPERS
+#if defined(ENTRY_ROW)
+
+// Per-interp-row DP in REGISTERS with subgroup shuffles (eedi3vk2 structure):
+// one workgroup of SGSIZE lanes per interpolated row, each lane owns
+// K = ceil(TPITCH / SGSIZE) consecutive directions in private registers, so
+// the per-column relax reads its +-1 predecessor window from the other lanes'
+// registers via subgroupShuffleUp/Down — zero workgroup barriers in the column
+// loop. Masked columns (mclip) are near-free: cur = pp register copy + pumax
+// fixups + one pbt byte per lane. Backtrack/interpolate happens tile-by-tile
+// rows, exactly like eedi3vk2.
+//
+// pbt stores RELATIVE predecessor deltas (idx - u, int8), so backtracking
+// accumulates: fpath[x] = fpath[x+1] + pbt[x][CENTER + fpath[x+1]].
+//
+// Connection costs keep the rolling window sums per direction (s0/s1/s2 +
+// RING_CAP term rings per owned direction). Rolling is only valid across
+// consecutive unmasked interior columns; a masked column or a column outside
+// the direction's interior band invalidates the state (next interior column
+// reseeds with the full window). This matches the barrier version's cost math
+// bit-for-bit (same roll_seed/roll_push/ring_sum/combine_interior), so both
+// depths stay bit-exact vs eedi3vk2.
+//
+// The workgroup is a single 32-lane subgroup; each workgroup processes one
+// interpolated row. The host requests requiredSubgroupSize = 32 for this
+// pipeline (RDNA3's native 64-lane wavefront is split via the subgroup size
+// control feature). NOTE (round 6): a 2-subgroup x 2-row-per-WG variant was
+// tried and measured SLOWER on the mclip workload (see notes) — keep 1 row/WG.
+
+// pbt column layout. The relative predecessor delta is -1/0/+1, so when each
+// lane owns exactly two directions (MDIS 17..31, i.e. K == 2, which includes
+// the mdis=20 default) the whole column packs into one nibble per lane -- 16
+// bytes instead of TPITCH=41, a 2.6x cut in the row kernel's store traffic
+// (measured worth ~10% of the frame ungated; PROBE=4). Even lanes combine their
+// odd neighbour's nibble through a shuffle and store one byte, so the packing
+// adds no barrier. Other K keep the plain int8 column; hp always does (its
+// deltas span +-2 and do not fit a nibble).
+// Packed store: lane `lane` owns directions 2*lane and 2*lane+1, one nibble.
+// The odd lane's nibble reaches its even partner through a shuffle, so a single
+// even lane writes the whole byte and there is no write-write race.
+void pbt_store_pair(const int base, const int x, const int lane, const int c0, const int c1) {
+    const uint nib = (uint(c0 + 1) & 3u) | ((uint(c1 + 1) & 3u) << 2);
+    const uint hi = subgroupShuffleXor(nib, 1u) & 0xFu;
+    if ((lane & 1) == 0) {
+        pbt[base + x * PB_STRIDE + (lane >> 1)] = int8_t(nib | (hi << 4));
+    }
+}
+
+void pbt_store_one(const int base, const int x, const int e, const int v) {
+    pbt[base + x * PB_STRIDE + e] = int8_t(v);
+}
+
+// tileF carries the per-column direction from the lane-0 backtrack walk to the
+// parallel interpolate lanes. (The old tileSh staging buffer is gone: the walk
+// now reads pbt directly from global — see the backtrack comment.)
+shared int8_t tileF[BT_TILE];
+shared uint bmaskSh[(WIDTH + 31) / 32];
+// First unmasked column of this row (WIDTH = fully masked). Written by lane
+// 0 after the pack loop, read by all lanes after a barrier.
+shared int rowXmin;
+
+layout(local_size_x_id = 6) in;
+
+// Shared packed-bit test of the current row's mask (bmaskSh filled by the
+// pack loop in main). HAS_MCLIP == 0 pipelines return true (nothing masked).
+bool bmask_local(int x) {
+    if (HAS_MCLIP == 0) return true;
+    return (bmaskSh[x >> 5] & (1u << (x & 31))) != 0u;
 }
 
 void main() {
@@ -1020,9 +1114,14 @@ void main() {
     }
 
     const int xstart = max(1, xmin);
+    // Columns where EVERY direction's s1/s2 gates hold, so the per-direction
+    // `interior` test (and its conn_cost fallback) folds to a constant.
+    const int deep_lo = 2 * MDIS * HPF;
+    const int deep_hi = WIDTH - 1 - 2 * MDIS * HPF;
     for (int xd = xstart; xd < WIDTH; xd++) {
         const int umax = min(min(xd, WIDTH - 1 - xd), MDIS) * HPF;
         const bool masked = (HAS_MCLIP != 0 && !bmask_local(xd));
+        const bool deep = (xd >= deep_lo && xd <= deep_hi);
 
         float cur[K];
         // Sized for the packed store, which reads both entries when K == 2;
@@ -1084,6 +1183,17 @@ void main() {
             // registers (the relax's predecessor window), then per-direction
             // cost + DP.
             float ext[K + 2 * HPF];
+#if PROBE == 19
+            // A per-column value that does not come from the previous column's
+            // DP state, so the relax stays alive but the chain is cut.
+            const float ccost_seed = cx1 + cx2;
+            // Diagnostics: the predecessor gather replaced by constants, so the
+            // DP stops depending on the previous column (no shuffles, no
+            // loop-carried chain) while the relax's instructions stay.
+            for (int e = 0; e < K + 2 * HPF; e++) {
+                ext[e] = float(e) + ccost_seed;
+            }
+#else
             for (int e = 0; e < K + 2 * HPF; e++) {
                 const int idx = e - HPF;   // relative to laneBase
                 if (idx < 0) {
@@ -1096,8 +1206,13 @@ void main() {
                     ext[e] = pp[idx];
                 }
             }
+#endif
 
             const int umax2 = min(min(xd - 1, WIDTH - xd), MDIS) * HPF;
+
+            // combine_cost's two centre taps are per-column, not per-direction.
+            const float cx1 = pad_get(dy - 1, xd);
+            const float cx2 = pad_get(dy + 1, xd);
 
             for (int j = 0; j < K; j++) {
                 const int i = laneBase + j;
@@ -1124,7 +1239,7 @@ void main() {
                         // hold; their offset is 2*u full-pel and u half-pel.
                         const int reach = (HPF == 1) ? 2 * au : au;
                         const bool interior =
-                            (xd >= reach && xd <= WIDTH - 1 - reach);
+                            deep || (xd >= reach && xd <= WIDTH - 1 - reach);
                         if (interior) {
                             if (!rolled[j]) {
                                 roll_seed(dy, xd, u, r0[j], r1[j], r2[j]);
@@ -1132,8 +1247,9 @@ void main() {
                             } else {
                                 roll_push(dy, xd - 1, u, r0[j], r1[j], r2[j]);
                             }
-                            ccost = combine_cost(dy, xd, u, ring_sum(r0[j]),
-                                                 ring_sum(r1[j]), ring_sum(r2[j]));
+                            ccost = combine_cost_taps(
+                                dy, xd, u, ring_sum(r0[j]), ring_sum(r1[j]),
+                                ring_sum(r2[j]), cx1, cx2);
                         } else {
                             rolled[j] = false;
                             ccost = conn_cost(dy, xd, u);
@@ -1146,20 +1262,40 @@ void main() {
                     // laneBase + e - HPF.
                     // `precise` as in eedi3vk2: gamma*|dd|+ext contracted into
                     // an FMA is an ulp off and flips near-tie argmins.
+#if PROBE == 18
+                    // Diagnostics: the relax chain replaced by the centre
+                    // candidate. Sizes the DP's min/compare work.
+                    const float bval = ext[j + HPF];
+                    const int idx = u;
+#else
+                    // |dd| is a compile-time constant per unrolled step, so the
+                    // multiply folds to one gamma (or 2*gamma at hp's outer
+                    // steps) with no runtime cost -- but it must stay: hp's
+                    // dd = +-2 is gamma*2, not gamma. `precise` keeps
+                    // gamma*|dd| + ext from contracting into an FMA, which is an
+                    // ulp off the reference and flips near-tie argmins.
+                    // An out-of-range candidate becomes +inf, which the
+                    // reference's guard skips identically (strict < against the
+                    // same FLT_MAX initial value leaves idx at 0 either way).
                     float bval = FLT_MAX_V;
                     int idx = 0;
                     for (int dd = -HPF; dd <= HPF; dd++) {
                         const int v = u + dd;
-                        if (abs(v) <= umax2) {
-                            precise const float z =
-                                ext[j + HPF + dd] + pc.gamma * float(abs(dd));
-                            precise const float cc = min(z, FLT_MAX_09);
-                            if (cc < bval) {
-                                bval = cc;
-                                idx = v;
-                            }
-                        }
+                        precise const float z = (dd == 0)
+                            ? ext[j + HPF]
+                            : ext[j + HPF + dd] +
+                                  pc.gamma * float(abs(dd));
+                        const float cand =
+                            (abs(v) <= umax2) ? min(z, FLT_MAX_09) : FLT_MAX_V;
+                        // Branchless on purpose: both guards are per-lane, so a
+                        // real branch diverges on almost every column and the
+                        // wave pays the reconvergence for a two-instruction
+                        // body. Selects keep it in the vector pipe.
+                        const bool take = cand < bval;
+                        bval = take ? cand : bval;
+                        idx = take ? v : idx;
                     }
+#endif
                     precise const float pcost = min(bval + ccost, FLT_MAX_09);
                     cur[j] = pcost;
                     cRel[j] = idx - u;
@@ -1190,7 +1326,6 @@ void main() {
             pRel[j] = cRel[j];
         }
     }
-
     // Make the pbt writes visible to this subgroup's backtrack reads.
     subgroupMemoryBarrier();
     subgroupBarrier();
@@ -1384,7 +1519,6 @@ void main() {
         subgroupBarrier();   // tileF reads done before the next (leftward) tile overwrites it
     }
 }
-
 #endif  // ENTRY_ROW
 
 #if defined(ENTRY_VCHECK)
@@ -1807,10 +1941,10 @@ layout(local_size_x = 256) in;
 
 void main() {
     const uint idx = flat_index(256u);
-    const int total = pc.pad_stride * pc.pad_height;
+    const int total = PAD_STRIDE * pc.pad_height;
     if (int(idx) >= total) return;
-    const int py = int(idx) / pc.pad_stride;
-    const int px = int(idx) % pc.pad_stride;
+    const int py = int(idx) / PAD_STRIDE;
+    const int px = int(idx) % PAD_STRIDE;
     const int off = 1 - pc.field;
     const int pad_w = WIDTH + 2 * MARGIN_H;
 
@@ -1841,10 +1975,10 @@ void main() {
 
     if (pc.pad_src_pitched != 0) {
         const int sy = pc.src_first + pc.src_step * kk;
-        padOut[pc.pad_base + py * pc.pad_stride + px] =
+        padOut[pc.pad_base + py * PAD_STRIDE + px] =
             pdsrc[pc.raw_base + sy * pc.src_stride + sx];
     } else {
-        padOut[pc.pad_base + py * pc.pad_stride + px] =
+        padOut[pc.pad_base + py * PAD_STRIDE + px] =
             pdsrc[pc.raw_base + kk * WIDTH + sx];
     }
 }
@@ -1865,7 +1999,7 @@ layout(local_size_x = 256) in;
 
 void main() {
     const int pad_row = MARGIN_V + pc.field - 3 + 2 * int(gl_WorkGroupID.x);
-    const int in_base = pc.pad_base + pad_row * pc.pad_stride + MARGIN_H;
+    const int in_base = pc.pad_base + pad_row * PAD_STRIDE + MARGIN_H;
     const int out_base = pc.hp_base + pad_row * WIDTH;
 
     for (int i = int(gl_LocalInvocationID.x); i < WIDTH - 1; i += 256) {

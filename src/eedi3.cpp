@@ -57,6 +57,8 @@ constexpr int MARGIN_V = 4;
 constexpr int MAX_PLANES = 3;
 // One 32-lane subgroup per interp row (see the row kernel).
 constexpr int SGSIZE = 32;
+// Backtrack tile width; must match BT_TILE in eedi3.comp (row kernel LDS).
+constexpr int BT_TILE = 32;
 
 // Compile-time max plane width for the shared-memory (LDS) vcheck variant. The
 // single source is EEDI3_MAXW in CMakeLists.txt, which passes -DMAXW to the
@@ -225,8 +227,11 @@ static std::optional<std::string> eedi3_fill_grids(const GPUDevice & gpu,
                          c.asm_grid_y)) {
         return e;
     }
-    return fold_1d(2 * rows_x_width, "eedi3's blit", c.blit_grid_x,
-                   c.blit_grid_y);
+    if (auto e = fold_1d(2 * rows_x_width, "eedi3's blit", c.blit_grid_x,
+                         c.blit_grid_y)) {
+        return e;
+    }
+    return std::nullopt;
 }
 
 // What a recorded pass does after the row kernel + vcheck.
@@ -350,6 +355,10 @@ struct Eedi3Data {
     // whether the frame is GPU- or host-bound. Every stage is clocked after the
     // previous blocking call so a wait never leaks into the next stage.
     bool host_timing { false };
+    // VSFEEL_EEDI3_SKIP diagnostics: omit a kernel from the recording so its
+    // GPU cost can be read off an end-to-end A/B.
+    bool skip_mask { false }, skip_pad { false }, skip_row { false },
+        skip_vcheck { false }, skip_tail { false };
     // VSFEEL_EEDI3_SYNC=1: wait the submission out and report its wall time. It
     // serializes the pipeline, so it measures one frame's GPU time alone.
     bool sync_wait { false };
@@ -365,7 +374,34 @@ struct Eedi3Data {
         cache; // computed frames awaiting a caller
     std::vector<std::pair<int, int>> claims; // ranges being recorded
 
+    // Scratch reuse (VSFEEL_EEDI3_SCRATCH_REUSE=1): a per-instance free list
+    // of scratch buffers the exec pool hands back through gpuExecRetain when
+    // the submission using them retires. A steady-state graph then reuses one
+    // buffer per frame in flight instead of allocating and destroying the
+    // whole (100+ MiB) region set on every frame.
+    // VSFEEL_EEDI3_GPUTIME=1: timestamp the phases of one submission at a time
+    // (the readback waits that submission out, so the probe serializes the
+    // pipeline by design -- never benchmark with it on).
+    bool gpu_time { false };
+    VkQueryPool qt_pool {};
+    std::mutex qt_lock;
+    static constexpr int QT_STAMPS = 17;
+    std::atomic<uint64_t> qt_ns[QT_STAMPS] {};
+    std::atomic<uint64_t> qt_n {};
+
+    bool scratch_reuse { false };
+    int scratch_cap { 8 };
+    std::mutex scratch_lock;
+    std::vector<GpuBuffer> scratch_free;
+
     ~Eedi3Data();
+};
+
+// Lease handed to gpuExecRetain; the release callback returns the buffer to
+// the free list (or destroys it when the list is already deep enough).
+struct Eedi3ScratchLease {
+    Eedi3Data * d {};
+    GpuBuffer buf {};
 };
 
 Eedi3Data::~Eedi3Data() {
@@ -388,6 +424,18 @@ Eedi3Data::~Eedi3Data() {
     if (pool) {
         gpu->api->freeGPUExecPool(pool);
         pool = nullptr;
+    }
+    if (qt_pool) {
+        if (qt_n.load()) {
+            const double n = static_cast<double>(qt_n.load());
+            fprintf(stderr, "[eedi3-gputime] batches=%.0f per-batch us:", n);
+            for (int i = 0; i + 1 < QT_STAMPS; ++i) {
+                fprintf(stderr, " s%d=%7.1f", i, qt_ns[i].load() / 1000.0 / n);
+            }
+            fprintf(stderr, "\n");
+        }
+        gpu->vk->vkDestroyQueryPool(gpu->device, qt_pool, nullptr);
+        qt_pool = nullptr;
     }
     const GPUDevice & g = *gpu;
     std::vector<VkPipeline> destroyed;
@@ -418,6 +466,52 @@ Eedi3Data::~Eedi3Data() {
 // ---------------------------------------------------------------------------
 // Recording helpers
 // ---------------------------------------------------------------------------
+
+// GPU phase timing (VSFEEL_EEDI3_GPUTIME). Stamps sit inside the submission's
+// own command buffer and the readback waits that submission out, so the probe
+// serializes the pipeline -- it is a diagnostic, never a benchmark config.
+static void eedi3_qt_stamp(const Eedi3Data & d, VkCommandBuffer cmd,
+                           const int idx) {
+    if (!d.gpu_time || !d.qt_pool) {
+        return;
+    }
+    d.gpu->vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                    d.qt_pool, static_cast<uint32_t>(idx));
+}
+
+static void eedi3_qt_report(Eedi3Data & d, const int used) {
+    if (!d.gpu_time || !d.qt_pool || used < 2 || used > Eedi3Data::QT_STAMPS) {
+        return;
+    }
+    uint64_t ts[Eedi3Data::QT_STAMPS] {};
+    const VkResult r = d.gpu->vk->vkGetQueryPoolResults(
+        d.gpu->device, d.qt_pool, 0, static_cast<uint32_t>(used),
+        sizeof(uint64_t) * static_cast<size_t>(used), ts, sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (r != VK_SUCCESS) {
+        return;
+    }
+    const double period = static_cast<double>(d.gpu->limits.timestampPeriod);
+    for (int i = 0; i + 1 < used; ++i) {
+        if (ts[i + 1] >= ts[i]) {
+            d.qt_ns[i] += static_cast<uint64_t>(
+                static_cast<double>(ts[i + 1] - ts[i]) * period);
+        }
+    }
+    d.qt_n += 1;
+}
+
+// Holds the probe's serialization for one submission and releases it however
+// the frame path exits.
+struct Eedi3QtGuard {
+    Eedi3Data * d {};
+    bool active {};
+    ~Eedi3QtGuard() {
+        if (active) {
+            d->qt_lock.unlock();
+        }
+    }
+};
 
 static void pc_push(const Eedi3Data & d, VkCommandBuffer cmd,
                     const Eedi3PushConstants & pc) {
@@ -535,7 +629,7 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
             // along x; horizontally its interp-parity columns are first
             // transposed into the predicate bit matrix (ENTRY_MASKPACK) and
             // then dilated along y, which is the same matrix transposed.
-            if (d.mclip_node) {
+            if (d.mclip_node && !d.skip_mask) {
                 const int32_t mfirst = d.dh ? 0 : field;
                 const int32_t mstep = d.dh ? 1 : 2;
                 for (int plane = 0; plane < numPlanes; ++plane) {
@@ -625,6 +719,9 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
             }
 
             // Mirror-pad builder: one thread per padded element.
+            if (d.skip_pad) {
+                continue;
+            }
             for (int plane = 0; plane < numPlanes; ++plane) {
                 if (!d.process[plane]) {
                     continue;
@@ -716,7 +813,7 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
             }
         }
 
-        if (phase == PassPhase::kRow) {
+        if (phase == PassPhase::kRow && !d.skip_row) {
             // Row kernel: one workgroup per interp row. Recorded with no
             // barrier between jobs so the batch's rows all share the queue.
             for (int plane = 0; plane < numPlanes; ++plane) {
@@ -736,7 +833,7 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
             }
         }
 
-        if (phase == PassPhase::kVcheck && d.vcheck > 0) {
+        if (phase == PassPhase::kVcheck && d.vcheck > 0 && !d.skip_vcheck) {
             for (int plane = 0; plane < numPlanes; ++plane) {
                 if (!d.process[plane]) {
                     continue;
@@ -768,7 +865,8 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
             }
         }
 
-        if (phase != PassPhase::kTail || tail == PassTail::kNone) {
+        if (phase != PassPhase::kTail || tail == PassTail::kNone ||
+            d.skip_tail) {
             continue;
         }
 
@@ -1155,6 +1253,15 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
         return fail("could not acquire a recording context: "s + errbuf);
     }
     VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
+    Eedi3QtGuard qt {};
+    if (d->gpu_time && d->qt_pool) {
+        d->qt_lock.lock();
+        qt.d = d;
+        qt.active = true;
+        d->gpu->vk->vkCmdResetQueryPool(cmd, d->qt_pool, 0,
+                                        Eedi3Data::QT_STAMPS);
+        eedi3_qt_stamp(*d, cmd, 0);
+    }
     const auto t1 = timing ? now() : std::chrono::steady_clock::time_point {};
 
     for (int j = n; j <= last; ++j) {
@@ -1254,15 +1361,20 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
     const int njobs = static_cast<int>(jobs.size());
     record_pass(*d, cmd, jobs.data(), njobs, PassPhase::kPrep);
     gpu_barrier(*d->gpu, cmd);
+    eedi3_qt_stamp(*d, cmd, 1);
     if (d->hp) {
         record_pass(*d, cmd, jobs.data(), njobs, PassPhase::kHp);
         gpu_barrier(*d->gpu, cmd);
     }
+    eedi3_qt_stamp(*d, cmd, 2);
     record_pass(*d, cmd, jobs.data(), njobs, PassPhase::kRow);
     gpu_barrier(*d->gpu, cmd);
+    eedi3_qt_stamp(*d, cmd, 3);
     record_pass(*d, cmd, jobs.data(), njobs, PassPhase::kVcheck);
     gpu_barrier(*d->gpu, cmd);
+    eedi3_qt_stamp(*d, cmd, 4);
     record_pass(*d, cmd, jobs.data(), njobs, PassPhase::kTail);
+    eedi3_qt_stamp(*d, cmd, 5);
     vsfeel_trace_mark("submit");
     const auto t3 = timing ? now() : std::chrono::steady_clock::time_point {};
 
@@ -1284,6 +1396,13 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
         return fail("submit failed: "s + errbuf);
     }
     guard.submitted = true;
+    if (qt.active) {
+        char werr[256] {};
+        d->gpu->api->gpuExecWaitValue(d->pool, signaled, werr, sizeof(werr));
+        eedi3_qt_report(*d, 6);
+        d->qt_lock.unlock();
+        qt.active = false;
+    }
     eedi3_add_timing(*d, signaled, t0, t1, t2, t3, now());
 
     for (const VSFrame * f : inputs) {
@@ -1454,6 +1573,15 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
         return fail("could not acquire a recording context: "s + errbuf);
     }
     VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
+    Eedi3QtGuard qt {};
+    if (d->gpu_time && d->qt_pool) {
+        d->qt_lock.lock();
+        qt.d = d;
+        qt.active = true;
+        d->gpu->vk->vkCmdResetQueryPool(cmd, d->qt_pool, 0,
+                                        Eedi3Data::QT_STAMPS);
+        eedi3_qt_stamp(*d, cmd, 0);
+    }
     const auto t1 = timing ? now() : std::chrono::steady_clock::time_point {};
 
     for (int j = n; j <= last; ++j) {
@@ -1674,20 +1802,25 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
             continue;
         }
         const int nj = static_cast<int>(J.size());
+        int stamp = sub * 4 + 1;
         record_pass(*d, cmd, J.data(), nj, PassPhase::kPrep);
         gpu_barrier(*d->gpu, cmd);
+        eedi3_qt_stamp(*d, cmd, stamp++);
         if (d->hp) {
             record_pass(*d, cmd, J.data(), nj, PassPhase::kHp);
             gpu_barrier(*d->gpu, cmd);
         }
         record_pass(*d, cmd, J.data(), nj, PassPhase::kRow);
         gpu_barrier(*d->gpu, cmd);
+        eedi3_qt_stamp(*d, cmd, stamp++);
         record_pass(*d, cmd, J.data(), nj, PassPhase::kVcheck);
         gpu_barrier(*d->gpu, cmd);
+        eedi3_qt_stamp(*d, cmd, stamp++);
         record_pass(*d, cmd, J.data(), nj, PassPhase::kTail);
         if (sub < 3) {
             gpu_barrier(*d->gpu, cmd);
         }
+        eedi3_qt_stamp(*d, cmd, stamp);
     }
     vsfeel_trace_mark("submit");
     const auto t3 = timing ? now() : std::chrono::steady_clock::time_point {};
@@ -1710,6 +1843,13 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
         return fail("submit failed: "s + errbuf);
     }
     guard.submitted = true;
+    if (qt.active) {
+        char werr[256] {};
+        d->gpu->api->gpuExecWaitValue(d->pool, signaled, werr, sizeof(werr));
+        eedi3_qt_report(*d, 17);
+        d->qt_lock.unlock();
+        qt.active = false;
+    }
     eedi3_add_timing(*d, signaled, t0, t1, t2, t3, now());
 
     for (const VSFrame * f : inputs) {
@@ -2031,12 +2171,50 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     // device_id and num_streams are registered but never read: the core owns
     // the one device and sizes in-flight depth itself (exec pool ring).
 
+    // VSFEEL_EEDI3_SKIP: comma-separated kernel names to leave out of the
+    // recording (mask, pad, row, vcheck, tail), for attributing GPU cost. It
+    // changes the output by design, so it is a diagnostics-only knob and never
+    // a substitute for a real opt-out.
+    if (const char * sk = vsfeel_debug_probe("VSFEEL_EEDI3_SKIP")
+                              ? env_str("VSFEEL_EEDI3_SKIP")
+                              : nullptr) {
+        const std::string s(sk);
+        size_t pos = 0;
+        while (pos <= s.size()) {
+            const size_t comma = s.find(',', pos);
+            const std::string name =
+                s.substr(pos, comma == std::string::npos ? std::string::npos
+                                                         : comma - pos);
+            if (name == "mask") {
+                d->skip_mask = true;
+            } else if (name == "pad") {
+                d->skip_pad = true;
+            } else if (name == "row") {
+                d->skip_row = true;
+            } else if (name == "vcheck") {
+                d->skip_vcheck = true;
+            } else if (name == "tail") {
+                d->skip_tail = true;
+            } else if (name.empty()) {
+                // trailing/duplicate comma
+            } else if (vsfeel_debug_enabled()) {
+                fprintf(stderr, "[eedi3] unknown VSFEEL_EEDI3_SKIP name '%s'\n",
+                        name.c_str());
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            pos = comma + 1;
+        }
+    }
+
     if (const char * vp = env_str("VSFEEL_EEDI3_VPARA")) {
         // The range check below is the validation; a malformed value falls to 0.
         // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion)
         const int v = atoi(vp);
         d->vcheck_para = (v >= 0 && v <= Eedi3Data::VCHECK_PARA_LEVELS) ? v : 0;
     }
+    d->gpu_time = vsfeel_debug_probe("VSFEEL_EEDI3_GPUTIME");
     const bool want_lds = env_flag("VSFEEL_EEDI3_VCLDS");
     d->trace = vsfeel_debug_flag("VSFEEL_EEDI3_TRACE");
     d->host_timing = vsfeel_debug_probe("VSFEEL_EEDI3_TIMING");
@@ -2072,6 +2250,25 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
                                                  sizeof(errbuf));
         if (!d->pool) {
             return set_error("createGPUExecPool failed: "s + errbuf);
+        }
+    }
+
+    // VSFEEL_EEDI3_GPUTIME: a timestamp write on a queue family reporting zero
+    // valid bits is invalid usage (and on a lenient driver can hang the
+    // engine), so the probe is gated on the core's own answer.
+    if (d->gpu_time) {
+        if (!vsfeel_probe_timestamps(*d->gpu, "eedi3")) {
+            d->gpu_time = false;
+        } else {
+            VkQueryPoolCreateInfo qi {};
+            qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qi.queryCount = static_cast<uint32_t>(Eedi3Data::QT_STAMPS);
+            if (d->gpu->vk->vkCreateQueryPool(d->gpu->device, &qi, nullptr,
+                                              &d->qt_pool) != VK_SUCCESS) {
+                d->qt_pool = nullptr;
+                d->gpu_time = false;
+            }
         }
     }
 
@@ -2360,8 +2557,10 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
                V.dst2_bytes, H.dst2_off, H.dst2_bytes);
         shared(sz_pbt(V), sz_pbt(H), V.pbt_off, V.pbt_bytes, H.pbt_off,
                H.pbt_bytes);
-        shared(d->vcheck > 0 ? sz_io(V) : 0, d->vcheck > 0 ? sz_io(H) : 0,
-               V.dmap_off, V.dmap_bytes, H.dmap_off, H.dmap_bytes);
+        // dmap is the walk's direction buffer as well as the vcheck's, so it is
+        // needed even when vcheck == 0 (the interpolate reads it either way).
+        shared(sz_io(V), sz_io(H), V.dmap_off, V.dmap_bytes, H.dmap_off,
+               H.dmap_bytes);
         shared((d->vcheck > 0 && !d->sclip_node) ? sz_io(V) : 0,
                (d->vcheck > 0 && !d->sclip_node) ? sz_io(H) : 0, V.cint_off,
                V.cint_bytes, H.cint_off, H.cint_bytes);
@@ -2465,9 +2664,23 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         // needs to overlap at all; when the budget cannot host two, the batch
         // drops to one instead of the budget giving way.
         const VkDeviceSize budget = vsfeel_vram_limit(*d->gpu, core);
-        const VkDeviceSize cap = budget > 0 ? budget / 16 : ~VkDeviceSize(0);
+        const VkDeviceSize cap = budget > 0 ? budget / 12 : ~VkDeviceSize(0);
+        // Re-swept with the harness's own environment (RADV transfer queue on,
+        // which is what moves the input uploads off the compute queue): EEDI3
+        // 2x2160p B=1 355 / **B=2 470** / B=3 463 / B=4 453 / B=6 390 / B=8 339
+        // (order-reversed 2000 f). The knee is sharp and the transfer queue is
+        // what puts it at 2, so sweep batches with that env or the answer is
+        // wrong.
         const VkDeviceSize target =
-            std::min(VkDeviceSize(d->aa ? 512 : 256) << 20, cap);
+            std::min(VkDeviceSize(d->aa ? 768 : 256) << 20, cap);
+        // Swept with the harness's own environment (RADV's transfer queue on,
+        // which is what keeps the input uploads off the compute queue), real
+        // clip, order-reversed, 2x2160p: EEDI3 B=1 355 / **B=2 470** / B=3 463
+        // / B=4 453 / B=6 390 / B=8 339 (2000 f); EEDI3AA **B=4 198** / B=5 197
+        // / B=3 189 / B=6 175 (1000 f). Neither knee moves with the transfer
+        // queue off, so sweep batches in the harness's env or the answer is
+        // wrong. EEDI3's 119.8 MiB scratch then wants a 256 MiB target and
+        // EEDI3AA's 167.4 MiB wants 768.
         int auto_batch = static_cast<int>(std::clamp<VkDeviceSize>(
             target / std::max<VkDeviceSize>(d->scratch_bytes, 1), 2, 8));
         if (VkDeviceSize(auto_batch) * d->scratch_bytes > cap) {
@@ -2500,10 +2713,12 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         if (d->trace) {
             fprintf(stderr,
                     "[eedi3] spec w=%d nrad=%d mdis=%d mclip=%d sclip=%d "
-                    "vcheck=%d lszr=%d lszv=%d horiz=%d hp=%d batch=%d\n",
+                    "vcheck=%d lszr=%d lszv=%d horiz=%d hp=%d batch=%d "
+                    "skip=%d%d%d%d%d\n",
                     spec.width, spec.nrad, spec.mdis, spec.has_mclip,
                     spec.has_sclip, spec.vcheck, spec.lsz_row, spec.lsz_vcheck,
-                    key.horiz ? 1 : 0, spec.hpf, d->batch_size);
+                    key.horiz ? 1 : 0, spec.hpf, d->batch_size, d->skip_mask,
+                    d->skip_pad, d->skip_row, d->skip_vcheck, d->skip_tail);
         }
         auto add =
             [&](const uint32_t * code, size_t size, const char * tag,
@@ -2528,9 +2743,9 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         d->width_pipes.emplace_back(key, Eedi3Pipelines {});
         Eedi3Pipelines & p = d->width_pipes.back().second;
         // Row kernel LDS: tileF[BT_TILE] + rowXmin + the packed mask words
-        // `bmaskSh[(WIDTH + 31) / 32]` (eedi3.comp:631), at this plane's width.
+        // `bmaskSh[(WIDTH + 31) / 32]`, at this plane's width.
         const uint32_t row_shared =
-            32 + 4 + 4 * ((static_cast<uint32_t>(spec.width) + 31) / 32);
+            4 + BT_TILE + 4 * ((static_cast<uint32_t>(spec.width) + 31) / 32);
         if (auto e =
                 add(d->row_code, d->row_size, "eedi3-row", row_subgroup_size,
                     &p.row,
