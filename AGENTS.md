@@ -151,6 +151,11 @@ runs it. Plugins are described separately in `PLUGINS`.
   - `uv run tools/benchmark.py --filter <name> vsfeel vszipcl` — a subset of
     plugins, to compare against references
   - `--frames N`, `--clip PATH` to control the run
+  - `--gpu-cache` hands every arm device-resident frames, the chain a GPU
+    filter actually runs in (a CPU filter pays the download it would pay
+    there); `--no-download` crops each arm's output to 8x8, which takes
+    vspipe's implicit output download out of the fps. Both together time a GPU
+    filter's own compute; `notes/METHOD.md` has what the mode's residual costs.
 - The default clip is `/home/encode/test/jpbd.mkv` (1920x1080, YUV420P8).
 - By default the run **caches real frames in RAM**: the first `--cache-frames`
   (default 1000) frames are decoded while vspipe evaluates the script, and its

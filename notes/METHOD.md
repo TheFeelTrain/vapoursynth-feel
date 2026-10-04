@@ -164,13 +164,24 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   signature). Same-session pairs stay fair through all of it — grade on those,
   and lengthen the run before trusting any absolute number (short runs are
   clock-ramp-sensitive).
-- **An active display is a ~12% tax on every absolute number.** KWin compositing
-  (plus any browser drawing on the same GPU) holds `gpu_busy_percent` at 12-18
-  *at idle*, and a GPU-bound filter pays it straight off the top: the same binary,
-  same batch and same command measured **192.5 fps with the monitor off and 171.3
-  with it on**. That is the whole of a "the notes say 200, I see 175" gap, so read
-  `gpu_busy_percent` before believing any absolute figure, and record the display
-  state next to one. Same-session interleaved pairs stay fair through it.
+- **A GPU filter's fps carries the chain's transfers until `--no-download`
+  takes the output side out of it.** vspipe's output node is a CPU node, so the
+  core downloads a GPU-resident output, and at 1080p that copy alone runs at
+  ~2.3k fps: a bare `GPUUpload→GPUDownload` graph measures it, and so does any
+  filter faster than it. `--no-download` appends `CropAbs(8,8)` to the chain,
+  so the filter still writes whole frames and only the copy shrinks. Same-session
+  pairs (`--gpu-cache`, jpbd 1080p, 1000 frames, 3 interleaved repeats, medians):
+  GaussBlur 2282 → **4461** fps (+96%, it was copy-bound), Bilateral 2188 → 2119
+  and DFTTest 1456 → 1380 (−3/−5%: both were already compute-bound, and the crop
+  is one more GPU node), NLMeans 980 → 971. So the flag is also the test for
+  *which* side a filter is on.
+  **Read the residual before the number**: what survives the crop is the download
+  path's per-frame acquire/submit/host-wait plus the crop node, ~0.22 ms/frame —
+  a bare cropped chain measures 3.9k fps in *both* input arrangements, and a
+  filtered chain can land just above it (GaussBlur's 4461), so a figure in the
+  4k range is the mode's own cost, not the filter's. A filter whose compute is
+  genuinely below ~0.25 ms/frame cannot be resolved this way at all: use
+  in-command-buffer GPU timestamps instead (the per-filter probes in the notes).
 - **Prove the host/GPU split before optimizing anything.** Add a small
   env-gated chrono probe around the frame path (acquire / record / submit)
   and read it on real content first — kernel

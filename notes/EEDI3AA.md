@@ -105,11 +105,11 @@ suite **803 passed** via `tools/test.sh`.
 
 ## Performance
 
-**Read the scoreboard with the screen quiet.** The frame is GPU bound, and an
-active display (KWin compositing, or this page in a browser) holds
-`gpu_busy_percent` at 12-18 even at idle, which comes straight off the top: the
-same build and batch measured 192.5 fps with the monitor off and 171.3 with it on
-(`notes/METHOD.md`). The scoreboard's numbers are screen-quiet.
+**Absolute fps is state-dependent; the table is one session's medians.** The same
+build has measured 161 to 198 fps on this workload with *identical* GPU work (two
+runs 11% apart reported phase sums of 22719 and 22921 µs per batch, so the kernels
+and clocks matched and only the gaps between submissions differed). Grade on
+same-session interleaved pairs (`notes/METHOD.md`).
 
 `VSFEEL_EEDI3_GPUTIME=1` stamps every phase of every sub-pass inside the
 submission's command buffer (it waits that submission out, so it serializes the

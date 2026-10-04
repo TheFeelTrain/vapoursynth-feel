@@ -111,6 +111,52 @@ def test_benchmark_synthetic_scripts_compile_and_eval(monkeypatch):
             exec(chain, env)
 
 
+def test_benchmark_no_download_is_a_chain_suffix(monkeypatch):
+    """``--no-download`` must stay a suffix of every chain it is applied to.
+
+    The eedi3aa reference arms begin with a ``from vsaa import`` line, so a
+    crop that enclosed the chain instead of following it would be a SyntaxError
+    for exactly those arms.
+    """
+    bench = _load_module("benchmark", BENCHMARK)
+    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic", "--no-download"])
+    ns = bench.parse_args()
+    assert ns.no_download
+    assert "8x8" in bench._mode_desc(ns)
+    for name, spec in bench.FILTERS.items():
+        for plugin, chain in spec.build(ns, spec.input, spec).items():
+            cropped = bench.no_download_chain(chain)
+            assert cropped.endswith(
+                f".std.CropAbs(width={bench.NO_DOWNLOAD_WINDOW}, height={bench.NO_DOWNLOAD_WINDOW})"
+            ), name
+            vpy = bench.make_vpy(
+                clip=spec.input,
+                extra=bench._plugin_loader(plugin),
+                chain=cropped,
+                frames=1,
+                synth_format=spec.synth_format,
+            )
+            compile(vpy, f"<{name}/{plugin}>", "exec")
+            if chain.startswith("from "):
+                continue  # reference arms import vsaa, which may be absent
+            env = {
+                "core": MagicMock(),
+                "clip": object(),
+                "depth": MagicMock(),
+                "get_y": MagicMock(),
+            }
+            exec(cropped, env)
+
+
+def test_benchmark_default_mode_does_not_crop(monkeypatch):
+    """The crop is opt-in: a default run's header must not claim the mode."""
+    bench = _load_module("benchmark", BENCHMARK)
+    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic"])
+    ns = bench.parse_args()
+    assert not ns.no_download
+    assert bench._mode_desc(ns) == ""
+
+
 def test_hatch_stages_exactly_this_platforms_library(tmp_path):
     """A stale foreign-platform library must fail the wheel build, not ship."""
     pytest.importorskip("hatchling")

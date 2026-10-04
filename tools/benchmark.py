@@ -18,6 +18,7 @@ Usage:
     uv run tools/benchmark.py --filter dfttest --pair vszipcl    # same-session pair + ratio
     uv run tools/benchmark.py --frames 500 --clip /path/to/input.mkv
     uv run tools/benchmark.py --no-cache          # live decode: full chain incl. BestSource
+    uv run tools/benchmark.py --filter gaussblur --gpu-cache --no-download
     uv run tools/benchmark.py --check-fresh       # refuse to run against a stale .so
 
 Every plugin is timed --repeat times (default 3) and the median is reported with
@@ -31,6 +32,11 @@ held in RAM while vspipe is still evaluating the script (its fps figure only
 covers the output loop), so timing reflects real-content filter throughput
 without the BestSource decode bottleneck. --synthetic swaps real content for a
 BlankClip; --no-cache restores live decoding.
+
+--no-download crops every chain's output to 8x8, so vspipe's implicit output
+download leaves the fps and a filter the copy was hiding shows its own speed
+(GaussBlur 2282 -> 4461 fps with --gpu-cache). The filter still runs its
+full-frame kernels; notes/METHOD.md has what the mode's residual costs.
 """
 
 import argparse
@@ -53,6 +59,10 @@ DEFAULT_TIMEOUT = 900  # seconds per vspipe run (H1: a hang must not hang the ha
 # frames (H8). The budget is exclusive of VapourSynth's own 48 GB frame cache,
 # which is additive: 6 GiB keeps the pair well under the incident point.
 AA_CACHE_MB = 6144
+# Output side of --no-download: what vspipe's implicit GPUDownload copies
+# instead of the whole frame. Size is not a knob (2x2..64x64 measured within
+# 1.6%); 8x8 just leaves chroma margin on subsampled formats.
+NO_DOWNLOAD_WINDOW = 8
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -364,6 +374,16 @@ PLUGINS = {
     "bm3dvk": Plugin("bm3dvk"),
     "knlmvk": Plugin("knlmvk"),
 }
+
+
+def no_download_chain(chain: str) -> str:
+    """Append the --no-download tail crop to a chain expression.
+
+    Must be a suffix, not a wrapper: the eedi3aa reference arms begin with a
+    ``from vsaa import`` line, which no enclosing expression survives. CropAbs,
+    because an absolute window makes the chain's geometry irrelevant.
+    """
+    return f"{chain}.std.CropAbs(width={NO_DOWNLOAD_WINDOW}, height={NO_DOWNLOAD_WINDOW})"
 
 
 def _plugin_loader(plugin: str) -> str:
@@ -1150,6 +1170,16 @@ def _cache_desc(
     return f"cache: first {cache_frames} frames"
 
 
+def _mode_desc(ns: argparse.Namespace) -> str:
+    """The run header's mode field: a --no-download number means something else."""
+    if not ns.no_download:
+        return ""
+    return (
+        f" | mode: --no-download (output cropped to "
+        f"{NO_DOWNLOAD_WINDOW}x{NO_DOWNLOAD_WINDOW}, download out of the fps)"
+    )
+
+
 def _run_once(
     spec: FilterSpec,
     ns: argparse.Namespace,
@@ -1169,6 +1199,9 @@ def _run_once(
     does not accept them and so has to pay std.GPUDownload for them, which is
     what a real chain would make it pay.
     """
+    if ns.no_download:
+        # Every arm's chain passes through here, so the crop lands exactly once.
+        chain = no_download_chain(chain)
     if spec.aa and synth is None:
         budget = ns.aa_cache_mb * 1024 * 1024 if ns.aa_cache_mb else None
         return bench_aa(
@@ -1277,7 +1310,7 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
     print(f"{spec.title} benchmark | {frames} frames | clip: {clip_desc}{bits_desc}")
     print(f"args: {args_desc(spec, ns)}")
     print(
-        f"{_cache_desc(spec, ns, synth, cache_frames)} | "
+        f"{_cache_desc(spec, ns, synth, cache_frames)}{_mode_desc(ns)} | "
         f"repeat: {ns.repeat} | timeout: {ns.timeout:g}s\n"
     )
 
@@ -1450,6 +1483,16 @@ def parse_args() -> argparse.Namespace:
         default=6144,
         help="VRAM budget for --gpu-cache frames; the cached span is capped "
         "to what fits, for both caches (default: 6144)",
+    )
+    parser.add_argument(
+        "--no-download",
+        dest="no_download",
+        action="store_true",
+        help="crop each arm's output to "
+        f"{NO_DOWNLOAD_WINDOW}x{NO_DOWNLOAD_WINDOW}, so vspipe's implicit "
+        "GPUDownload copies the crop instead of the whole frame and stops "
+        "dominating a GPU filter's fps. The filter still runs its full-frame "
+        "kernels; add --gpu-cache to drop the input side too",
     )
     parser.add_argument(
         "--repeat",
