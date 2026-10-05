@@ -541,7 +541,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "vapoursynth", specifier = ">=80" },
-    { name = "vsjetpack", marker = "extra == 'jetpack'", specifier = ">=2.2" },
+    { name = "vsjetpack", marker = "extra == 'jetpack'", specifier = ">=2.2.6" },
 ]
 provides-extras = ["jetpack"]
 
@@ -566,7 +566,7 @@ dev = [
     { name = "vapoursynth-resize2", specifier = ">=0.4.2" },
     { name = "vapoursynth-vszipcl", git = "https://github.com/dnjulek/vapoursynth-zipcl?rev=2c1b97742bf4f086f0bd31d26ba630e834c661ed" },
     { name = "vapoursynth-zsmooth", specifier = ">=0.20" },
-    { name = "vsjetpack", specifier = ">=2.2" },
+    { name = "vsjetpack", specifier = ">=2.2.6" },
 ]
 lint = [
     { name = "clang-format", specifier = "==22.1.8" },
@@ -709,7 +709,7 @@ wheels = [
 
 [[package]]
 name = "vsjetpack"
-version = "2.2.4"
+version = "2.2.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jetpytools" },
@@ -721,7 +721,7 @@ dependencies = [
     { name = "vapoursynth-akarin" },
     { name = "vapoursynth-vszip" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6a/a1/6cb6f3ae6c8e445b742489c7f34cc29007b3190ab41ca06090e5e3b32e28/vsjetpack-2.2.4.tar.gz", hash = "sha256:2022801a199fd32e5e2959290d88ed1926ded865e052b2e0b24daa544fad1406", size = 604474, upload-time = "2026-08-28T15:09:44.892Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a7/9c/7c44757910e8aa05b2f466b86e3d3b15bbf056a34741c094d4efeb44e0b8/vsjetpack-2.2.6.tar.gz", hash = "sha256:54b90e82e6c9864d7becbbd4fffc29fc2f6e1e0216b475734026521c88f732c3", size = 609076, upload-time = "2026-10-04T19:48:59.922Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/92/f0/336279cacbb1d1aa612047030550990e6e0f7332913dcf24b205a3dc59d9/vsjetpack-2.2.4-py3-none-any.whl", hash = "sha256:2526f0645ff7185d31600e8f273baab2fb8dd42d8892dd0e6bcbfd9f0480dc5f", size = 437323, upload-time = "2026-08-28T15:09:42.393Z" },
+    { url = "https://files.pythonhosted.org/packages/50/32/9359de2b97f25528a62c666f21eaf80893787db468658f3c4bcb52b5aa4f/vsjetpack-2.2.6-py3-none-any.whl", hash = "sha256:5835d0a4011555ea29bbba15055fbf605d5668b8bd6832f36866ef0c56e0e335", size = 440600, upload-time = "2026-10-04T19:48:57.273Z" },
 ]

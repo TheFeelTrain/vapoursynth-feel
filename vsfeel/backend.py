@@ -47,16 +47,23 @@ class _FeelBM3DPlugin:
     and only drops what the plugin does not declare.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, func: Any = None) -> None:
         import vapoursynth as vs
 
-        func = vs.core.vsfeel.BM3Dv2
-        sig = func.__signature__
-        if "chroma" not in sig.parameters:
-            # Older plugin builds do not declare it; advertising it keeps the
-            # wrapper's surface identical to the other BM3Dv2 plugins.
+        # Injectable so the forwarding can be tested against a build whose
+        # BM3Dv2 does not declare `chroma` (see tests/test_python_backend.py).
+        func = func if func is not None else vs.core.vsfeel.BM3Dv2
+        native = func.__signature__
+        # The *native* signature, not the advertised one below, decides what is
+        # safe to forward: an older build that does not declare ``chroma``
+        # rejects it as an unsupported argument.
+        declares_chroma = "chroma" in native.parameters
+        sig = native
+        if not declares_chroma:
+            # Advertising it keeps the wrapper's surface identical to the other
+            # BM3Dv2 plugins.
             chroma = inspect.Parameter("chroma", inspect.Parameter.KEYWORD_ONLY, default=False)
-            sig = sig.replace(parameters=[*sig.parameters.values(), chroma])
+            sig = native.replace(parameters=[*native.parameters.values(), chroma])
 
         def bm3d_v2(*args: Any, **kwargs: Any) -> vs.VideoNode:
             # vsdenoise passes chroma twice (once in its own kwargs, once
@@ -64,7 +71,7 @@ class _FeelBM3DPlugin:
             # becomes a TypeError.
             chroma_value = kwargs.pop("chroma", False)
             forwarded = _drop_unsupported(func, kwargs)
-            if "chroma" in sig.parameters:
+            if declares_chroma:
                 forwarded["chroma"] = int(bool(chroma_value))
             return func(*args, **forwarded)
 

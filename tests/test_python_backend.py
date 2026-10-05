@@ -6,6 +6,7 @@ unmodified vs-jetpack wrappers.
 """
 
 import dataclasses
+import inspect
 import threading
 
 import numpy as np
@@ -24,6 +25,7 @@ from vsdenoise.fft import DFTTest
 from vsrgtools import bilateral, gauss_blur
 
 import vsfeel
+from vsfeel.backend import _FeelBM3DPlugin
 
 
 def _backend():
@@ -247,26 +249,118 @@ def test_eedi3aa_sclip_subframes_are_distinct(clip_16bit):
 
 
 def test_wrapper_drops_params_the_plugin_rejects(clip_16bit, monkeypatch):
-    """vs-jetpack forwards parameters vsfeel's EEDI3 entry points never declare.
+    """A parameter vsfeel's entry points never declare is filtered, not fatal.
 
-    Recent vsaa emits ``hp`` from ``get_deint_args``; VapourSynth rejects an
-    unknown keyword before dispatch, so the fused and the chain path must both
-    filter it out instead of failing to build.
+    VapourSynth rejects an unknown keyword before dispatch, so the fused and
+    the chain path must both drop it instead of failing to build. (``hp`` used
+    to be that parameter; the plugin declares it now, so its forwarding is
+    pinned by ``test_eedi3_wrapper_forwards_hp``.)
     """
     import vsaa.deinterlacers as _deinterlacers
 
     real = _deinterlacers.EEDI3.get_deint_args
 
-    def with_hp(self, **kwargs):
-        return real(self, **kwargs) | {"hp": False}
+    def with_bogus(self, **kwargs):
+        return real(self, **kwargs) | {"vsfeel_no_such_param": False}
 
-    monkeypatch.setattr(_deinterlacers.EEDI3, "get_deint_args", with_hp)
+    monkeypatch.setattr(_deinterlacers.EEDI3, "get_deint_args", with_bogus)
 
     fused = cpu_node(vsfeel.EEDI3(**AA_PARAMS).antialias(clip_16bit))
     chain = cpu_node(EEDI3(backend=_backend(), **AA_PARAMS).antialias(clip_16bit))
 
     for out in (fused, chain):
         assert np.isfinite(frame_to_ndarray(out.get_frame(0), dtype=np.uint16)).all()
+
+
+def test_eedi3_wrapper_forwards_hp(clip_16bit):
+    """vs-jetpack sends EEDI3's ``hp``; every vsfeel entry point declares it.
+
+    The wrapper filtered ``hp`` out while the plugin did not declare it, so
+    each path is compared against the plugin call driven with ``hp``: the
+    chain against the base class's vertical pass plus its double-rate merge
+    (a bare vs-jetpack EEDI3 keeps its own ``vthresh`` default), and the fused
+    path against ``EEDI3AA``. ``hp=False`` must differ from ``hp=True`` or the
+    comparison would be vacuous.
+    """
+    clip = clip_16bit
+    # (alpha, beta, gamma, nrad, mdis) and the two vthresh defaults in play:
+    # a bare vsaa EEDI3 carries (32, 64, 4), vsfeel's fused wrapper (12, 24, 4).
+    bare = dict(alpha=0.125, beta=0.25, gamma=40.0, nrad=1, mdis=5)
+    bare_vth = dict(vthresh0=32.0, vthresh1=64.0, vthresh2=4.0)
+    fused_vth = dict(vthresh0=12.0, vthresh1=24.0, vthresh2=4.0)
+
+    fused = cpu_node(vsfeel.EEDI3(hp=True, mdis=5, nrad=1, **AA_PARAMS).antialias(clip))
+    want_fused = cpu_node(vs.core.vsfeel.EEDI3AA(clip, 3, False, hp=1, **bare, **fused_vth))
+
+    raw = vs.core.vsfeel.EEDI3(clip, 3, False, hp=1, **bare, **bare_vth)
+    want_chain = cpu_node(vs.core.std.Merge(raw[::2], raw[1::2]))
+    chain = cpu_node(
+        EEDI3(backend=_backend(), hp=True, **bare).antialias(
+            clip, direction=EEDI3.AADirection.VERTICAL
+        )
+    )
+    plain = cpu_node(
+        EEDI3(backend=_backend(), hp=False, **bare).antialias(
+            clip, direction=EEDI3.AADirection.VERTICAL
+        )
+    )
+
+    for n in (0, 5, 23):
+        a = frame_to_ndarray(fused.get_frame(n), dtype=np.uint16)
+        b = frame_to_ndarray(want_fused.get_frame(n), dtype=np.uint16)
+        assert np.array_equal(a, b), f"fused path did not forward hp at frame {n}"
+        c = frame_to_ndarray(chain.get_frame(n), dtype=np.uint16)
+        d = frame_to_ndarray(want_chain.get_frame(n), dtype=np.uint16)
+        assert np.array_equal(c, d), f"chain did not forward hp at frame {n}"
+        e = frame_to_ndarray(plain.get_frame(n), dtype=np.uint16)
+        assert not np.array_equal(c, e), f"hp did not change the output at frame {n}"
+
+
+class _StubBM3D:
+    """A ``core.vsfeel.BM3Dv2`` stand-in with an explicit signature.
+
+    ``_drop_unsupported`` and the wrapper read ``__signature__``, which a plain
+    Python callable does not set, so the stub provides one like the plugin does.
+    """
+
+    def __init__(self, declares_chroma: bool) -> None:
+        self.calls: list[dict[str, object]] = []
+        params = [
+            inspect.Parameter("clip", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+            inspect.Parameter("sigma", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
+        ]
+        if declares_chroma:
+            params.append(
+                inspect.Parameter("chroma", inspect.Parameter.KEYWORD_ONLY, default=False)
+            )
+        self.__signature__ = inspect.Signature(params)
+
+    def __call__(self, clip, **kwargs):
+        self.calls.append(kwargs)
+        return clip
+
+
+def test_bm3d_wrapper_keeps_chroma_off_an_older_plugin():
+    """A build whose BM3Dv2 has no ``chroma`` argument must not be sent one.
+
+    The wrapper advertises ``chroma`` so vsdenoise still sees the reference's
+    surface, but the *native* signature decides what is forwarded: the older
+    build rejects the keyword as unsupported, so forwarding ``chroma=0`` broke
+    every ordinary BM3D call.
+    """
+    clip = object()
+    old = _StubBM3D(declares_chroma=False)
+    wrapped = _FeelBM3DPlugin(old).BM3Dv2
+    wrapped(clip, sigma=0.7)
+    wrapped(clip, sigma=0.7, chroma=True)
+    assert old.calls == [{"sigma": 0.7}, {"sigma": 0.7}]
+    assert "chroma" in inspect.signature(wrapped).parameters
+
+    new = _StubBM3D(declares_chroma=True)
+    wrapped = _FeelBM3DPlugin(new).BM3Dv2
+    wrapped(clip, sigma=0.7)
+    wrapped(clip, sigma=0.7, chroma=True)
+    assert new.calls == [{"sigma": 0.7, "chroma": 0}, {"sigma": 0.7, "chroma": 1}]
 
 
 def test_eedi3aa_falls_back_for_non_both(clip_16bit):

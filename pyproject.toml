@@ -30,7 +30,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-jetpack = ["vsjetpack>=2.2"]
+jetpack = ["vsjetpack>=2.2.6"]
 
 [dependency-groups]
 test = [
@@ -44,7 +44,7 @@ test = [
 dev = [
     { include-group = "test" },
     "vapoursynth==81rc1",
-    "vsjetpack>=2.2",
+    "vsjetpack>=2.2.6",
     "vapoursynth-bestsource>=22",
     "vapoursynth-edgemasks>=4.1",
     "vapoursynth-fmtconv>=31",

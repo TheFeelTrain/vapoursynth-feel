@@ -218,6 +218,16 @@ under-reported every stage 10x).
 
 ### Round history
 
+- **2026-10-05 — the wrapper forwards `hp`, and reads the native signature.**
+  vs-jetpack 2.2.6 sends EEDI3's `hp` (2.2.4 carried the field but never put it
+  in `get_deint_args`), and vsfeel registers `hp` as the half-pel search, so the
+  2026-09-29 note's "accepted no-op" reading no longer holds for it: the
+  signature filter forwards it, and the chain and the fused path match the
+  plugin call bit-exactly with `hp` set. The same round, the BM3Dv2 wrapper
+  decided what to forward from its own *advertised* signature (which always
+  appends `chroma`), so a build whose BM3Dv2 has no `chroma` still received
+  `chroma=0` and failed; the native signature decides now. No perf change.
+
 - **2026-10-03 — the batch knee moves to 4 and the row kernel is priced.** Re-swept
   the batch under the harness's own RADV env (the transfer queue is what sets the
   knee): B=3 189 / **B=4 198** / B=5 197 / B=6 175 fps, so the auto rule's target
