@@ -47,6 +47,9 @@ layout(constant_id = 5) const int NPLANES = 1;
 // entry keys its estimate slots by frame index, so entries that hold different
 // frames in the same slot index must not share witnesses.
 layout(constant_id = 6) const int TAG_BASE = 0;
+// YUV chroma plane: the ring holds it centred on zero (see bm3d_copy.comp), so
+// the integer store adds the neutral code back before rounding.
+layout(constant_id = 7) const int CHROMA = 0;
 
 layout(std430, binding = 0) readonly buffer ResBuf { vec4 res4[]; };
 layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
@@ -84,13 +87,15 @@ int slot_of(int m) {
 
 // One accumulated result to a native output sample, or to a float if the clip
 // is float: the reference's Float2Int scales by 65535, adds 0.5, clips to the
-// format's [0, 65535] and truncates, `Clip(v * gain + 0.5, floor, ceil)`. The
-// clip is not optional -- the weight sums num/den can land an ulp above 1.0,
-// and a bare mask-and-truncate would wrap that to 0.
+// format's [0, 65535] and truncates, `Clip(v * gain + 0.5, floor, ceil)`. A
+// chroma plane carries the 32768 neutral the copy kernel removed. The clip is
+// not optional -- the weight sums num/den can land an ulp above 1.0, and a bare
+// mask-and-truncate would wrap that to 0.
 void store_result(int x, int y, vec4 v) {
 #if BITS == 16
     const int o = y * STRIDE + x;
-    const vec4 s = clamp(v * PEAK + 0.5f, vec4(0.0f), vec4(PEAK));
+    const float bias = (CHROMA != 0) ? 32768.0f : 0.0f;
+    const vec4 s = clamp(v * PEAK + bias + 0.5f, vec4(0.0f), vec4(PEAK));
     dst16[o + 0] = uint16_t(uint(s.x));
     dst16[o + 1] = uint16_t(uint(s.y));
     dst16[o + 2] = uint16_t(uint(s.z));

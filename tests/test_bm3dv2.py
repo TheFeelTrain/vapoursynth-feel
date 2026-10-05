@@ -1446,11 +1446,11 @@ def test_bm3dv2_final_stage_matches_cpu(clip_gray):
 
 
 def test_bm3dv2_luma_only_color_matches_cpu():
-    """A colour clip with chroma disabled must match the CPU on luma.
+    """A color clip with chroma disabled must match the CPU on luma.
 
     Only the luma plane is comparable: the CPU scales a plane's sigma by that
-    plane's colour-matrix norm (normY/normU/normV) while vsfeel's factors carry
-    normY for every plane, and its RGB input goes through no opponent-colour
+    plane's color-matrix norm (normY/normU/normV) while vsfeel's factors carry
+    normY for every plane, and its RGB input goes through no opponent-color
     transform at all. With `sigma=[x, 0, 0]` both sides process luma alone, so
     the domains are identical. 4:4:4 because the CPU's plugin refuses
     subsampled input when chroma is processed.
@@ -1473,11 +1473,11 @@ def test_bm3dv2_per_plane_color_matches_cpu():
 
 
 def test_bm3dv2_color_ref_pass_matches_cpu():
-    """The Wiener pass on luma of a colour clip, chroma disabled."""
+    """The Wiener pass on luma of a color clip, chroma disabled."""
     payload = _cpu_compare(
         dict(BASE_KWARGS, sigma=[0.7, 0.0, 0.0]), stage="final", clip="yuv444_32"
     )
-    assert payload["per_plane"][0] < 1e-3, f"colour final pass vs CPU: {payload}"
+    assert payload["per_plane"][0] < 1e-3, f"color final pass vs CPU: {payload}"
 
 
 # ---------------------------------------------------------------------------
@@ -1486,10 +1486,10 @@ def test_bm3dv2_color_ref_pass_matches_cpu():
 #
 # The u16 path is the fp32 path with a different transport: the source ring and
 # the estimate stacks hold float at both depths, an integer clip's samples are
-# widened once when the ring is filled (gain 1/65535 with no offset, the
-# reference's Int2Float), and the aggregation rounds its result back to native
-# samples (its Float2Int). Nothing about the algorithm changes, which is why it
-# is graded against the fp32 comparisons' own bounds.
+# widened once when the ring is filled (gain 1/65535, plus the 32768 neutral on
+# a YUV chroma plane, the reference's Int2Float), and the aggregation rounds its
+# result back to native samples (its Float2Int). Nothing about the algorithm
+# changes, which is why it is graded against the fp32 comparisons' own bounds.
 #
 # The oracle is the CPU plugin's 16 bit output: VBasic + VAggregate at
 # sample=INTEGER, or plain Basic at radius 0. The CPU scales an *integer* clip
@@ -1584,7 +1584,7 @@ def test_bm3dv2_u16_final_stage_matches_cpu(clip_16bit):
 def test_bm3dv2_u16_joint_chroma_matches_cpu():
     """The joint 4:4:4 entry on an integer clip.
 
-    Same close-but-not-exact chroma domain as the fp32 colour test: the CPU
+    Same close-but-not-exact chroma domain as the fp32 color test: the CPU
     scales each plane's sigma by that plane's matrix norm, vsfeel carries
     normY for all three."""
     payload = _u16_compare({"sigma": [0.7, 0.7, 0.7]}, clip="yuv444_16")
@@ -1637,6 +1637,74 @@ def _u16_path_is_the_fp32_path(clip16, **kwargs):
         ).astype(np.int32)
         worst = max(worst, int(np.abs(a - b).max()))
     return worst
+
+
+def _widen_yuv444_to_floats(clip16):
+    """The exact floats the ring copy produces for a YUV444 integer clip.
+
+    Luma is `sample * (1/65535)`; a chroma plane has its 32768 neutral removed
+    first (the reference's chroma Int2Float). Feeding the fp32 arm these exact
+    floats is what makes the comparison below an equality in whole codes rather
+    than a tolerance.
+    """
+    scale = np.float32(1.0 / 65535.0)
+    base = clip16.resize.Point(format=vs.YUV444PS)
+
+    def widen(n, f):
+        src, tmpl = f
+        out = tmpl.copy()
+        for p in range(3):
+            v = plane_to_ndarray(src, p, np.uint16).astype(np.int32)
+            v = (v - (0 if p == 0 else 32768)).astype(np.float32) * scale
+            raw = np.ctypeslib.as_array(
+                ctypes.cast(out.get_write_ptr(p), ctypes.POINTER(ctypes.c_uint8)),
+                shape=(out.height, out.get_stride(p)),
+            )
+            raw[:, : out.width * 4].view(np.float32)[:] = v
+        return out
+
+    return vs.core.std.ModifyFrame(base, [clip16, base], widen)
+
+
+def _u16_yuv_path_is_the_fp32_path(clip16, **kwargs):
+    """Worst whole-code u16 vs fp32 difference over the three planes."""
+    u16_out = _run16(clip16, **kwargs)
+    f32_out = BM3D(_widen_yuv444_to_floats(clip16), **_std_args(**kwargs))
+    worst = 0
+    for n in (0, 11, 23):
+        for p in range(3):
+            a = plane_to_ndarray(u16_out.get_frame(n), p, np.uint16).astype(np.int32)
+            v = plane_to_ndarray(f32_out.get_frame(n), p, np.float32)
+            bias = np.float32(0.0 if p == 0 else 32768.0)
+            b = np.floor(
+                np.clip(
+                    v * np.float32(65535.0) + bias + np.float32(0.5),
+                    np.float32(0.0),
+                    np.float32(65535.0),
+                )
+            ).astype(np.int32)
+            worst = max(worst, int(np.abs(a - b).max()))
+    return worst
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"sigma": [0.0, 0.7, 0.7]}, {"sigma": [0.0, 0.7, 0.7], "chroma": 1}],
+    ids=["all-planes", "chroma-only", "chroma-only-joint"],
+)
+def test_bm3dv2_u16_color_is_the_fp32_path_with_a_rounded_store(kwargs):
+    """Chrominance crosses depths like luma: the 32768 neutral is transport.
+
+    In the fp32 arm a chroma plane is centred on zero; the integer arm must
+    remove the neutral code on the copy and put it back on the store, or it
+    filters a plane offset by 0.5 and disagrees with the fp32 arm by tens of
+    codes on the DC term. The chroma-only cases also cover plane 0 being
+    unprocessed, which leaves the estimation kernel's unused destination
+    binding without a plane-0 buffer.
+    """
+    clip16 = vs.core.resize.Bicubic(source_clip(), format=vs.YUV444P16)
+    worst = _u16_yuv_path_is_the_fp32_path(clip16, **kwargs)
+    assert worst <= 1, f"u16 color output is not the fp32 result rounded ({kwargs}): {worst} codes"
 
 
 @pytest.mark.parametrize(

@@ -5,9 +5,13 @@
  * The source ring's copy kernel for an integer input clip: widens the plane's
  * native samples into the ring's float working domain while copying it.
  *
- * The widening is the reference's Int2Float (gain 1/65535, no offset), so an
- * integer clip reaches the estimator as exactly the numbers a float clip of the
- * same content would, and the two depths share one estimation kernel.
+ * The widening is the reference's Int2Float (gain 1/65535, plus the chroma
+ * neutral), so an integer clip reaches the estimator as exactly the numbers a
+ * float clip of the same content would, and the two depths share one
+ * estimation kernel. A YUV chroma plane is centred on 32768, which the
+ * reference's float chroma domain puts at zero, so pc.center carries that
+ * neutral code there and 0 on luma and RGB; without it a constant 0.5 rides
+ * into the thresholded/scaled DC term.
  *
  * It has to happen here, once per source sample, rather than on load in the
  * matcher: the matcher reads each source sample once per candidate origin (a
@@ -30,12 +34,21 @@ layout(std430, binding = 1) writeonly buffer DstBuf { float dst[]; };
 layout(push_constant) uniform PushConstants {
     uint dst_off; // first destination element of this plane
     uint count;   // elements to convert
+    int center;   // 32768 on a YUV chroma plane, 0 otherwise
 } pc;
 
 void main() {
-    const uint i = gl_GlobalInvocationID.x;
+    // The grid folds into Y when the element count exceeds the device's X
+    // workgroup limit, so the element index is ID.y * NumWorkGroups.x + ID.x
+    // (the host sizes the grid the same way); ID.x alone would leave the fold
+    // unwritten. See vsfeel_fold_grid.
+    const uint i = (uint(gl_WorkGroupID.y) * uint(gl_NumWorkGroups.x) +
+                    uint(gl_WorkGroupID.x)) *
+                       256u +
+                   uint(gl_LocalInvocationIndex);
     if (i >= pc.count) {
         return;
     }
-    dst[pc.dst_off + i] = float(int(src[i])) * (1.0f / 65535.0f);
+    dst[pc.dst_off + i] =
+        (float(int(src[i])) - float(pc.center)) * (1.0f / 65535.0f);
 }

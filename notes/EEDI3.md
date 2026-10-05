@@ -576,7 +576,7 @@ passes). All bit-identical to the previous build unless stated.
 - `ENTRY_PAD` div/mod by `pad_stride`, `ENTRY_VCOPY`/`ENTRY_BLIT` div by `WIDTH`: a
   2D dispatch removes them. Per-plane passes, not the row kernel.
 - **Fuse the vcheck across planes** (one launch, `gl_WorkGroupID.y = plane`, as
-  vszipcl does) — YUV-only, cannot move the Gray flagship, real for colour AA.
+  vszipcl does) — YUV-only, cannot move the Gray flagship, real for color AA.
 - **The graded vertical number is a transfer budget, not a kernel budget.** ~50 MB
   per output frame crosses PCIe (sclip every frame, clip+mclip every other, the
   output download); the filter's kernels are 8.9% of it. The one lever inside the

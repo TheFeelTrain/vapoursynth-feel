@@ -18,7 +18,7 @@ CUDA-matcher build. The CPU plugin is the only oracle, driven from
 - The matcher is graded coordinate-for-coordinate against a scalar model of the
   CPU source (`tests/bm3d_oracle.py` + `VSFEEL_BM3D_MATCHTRACE`), 26 configs;
   its SSD reduction now matches the per-row lane order above.
-- Every plane of a colour clip is denoised: one entry per plane, or one joint
+- Every plane of a color clip is denoised: one entry per plane, or one joint
   4:4:4 entry under `chroma=True` whose groups come from luma. A plane below its
   sigma threshold is a bit-exact source copy; all planes below it and the filter
   is the source clip.
@@ -55,14 +55,14 @@ which is where the visible speedup is (see Performance).
 
 ## Implementation
 
-- Three kernels: `bm3d.comp` (match, group, collaborative transform; one warp of
-  32 lanes = four 8-lane groups, one 8x8 block each), `bm3d_agg.comp`
-  (aggregation over the TW = 2r+1 stack slices) and `bm3d_copy.comp`, which
-  widens an integer clip's planes into the ring as it copies them (gain 1/65535
-  with no offset, the reference's `Int2Float`). Only the aggregation's store is
-  depth-specific (`-DBITS`), rounding with the reference's `Float2Int`:
-  `clamp(v * 65535 + 0.5, 0, 65535)` then truncate. The clamp is load-bearing,
-  a weight sum can land an ulp above 1.0 and a bare mask would wrap it to 0.
+- Three kernels: `bm3d.comp` (match, group, transform; one warp of 32 lanes =
+  four 8-lane groups, one 8x8 block each), `bm3d_agg.comp` (aggregation over the
+  TW = 2r+1 stack slices) and `bm3d_copy.comp`, which widens an integer clip's
+  planes into the ring as it copies them (gain 1/65535, less the 32768 neutral
+  on YUV chroma, the reference's `Int2Float`). Only the store is depth-specific
+  (`-DBITS`), rounding like the reference's `Float2Int`: `clamp(v * 65535 + bias
+  + 0.5, 0, 65535)`, bias 32768 on chroma, then truncate. The clamp is
+  load-bearing; a bare mask would wrap a weight sum past 1.0 to 0.
 - A 16 bit clip is **full range**, like the fp32 path and every other vsfeel
   filter. The CPU reference instead scales an *integer* clip by the frame's
   `_Range` property, limited range mapping `[16<<(b-8), 235<<(b-8)]` to `[0, 1]`
@@ -234,7 +234,7 @@ which is where the visible speedup is (see Performance).
   cut VGPRs 192 -> 144 (8 -> 10 waves) and code size 118 -> 80 KB: the group
   assembly is a serial chain of dynamic-index accesses, and LDS latency in that
   chain costs more than the occupancy buys.
-- Colour costs the planes: 4:2:0 is 1.5x the luma-only estimate/source footprint
+- Color costs the planes: 4:2:0 is 1.5x the luma-only estimate/source footprint
   and 4:4:4/RGB 3x, all inside the same `maxStorageBufferRange` budget.
 - The multi-plane round did not move the luma path (NPLANES == 1: 6131 vs 6133
   instructions, 192/108/4096 B, 8 waves/SIMD; 12 ABBA pairs at 935 vs 924 fps).
@@ -243,6 +243,18 @@ which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-10-05 — integer chroma: the neutral code and a null binding.** A YUV
+  chroma plane is centred on zero in the reference's float domain, so the copy
+  now subtracts 32768 and the store adds it back; the u16 arm had been filtering
+  a plane offset by 0.5, which showed as up to 30 codes against the fp32 arm on
+  360p YUV444P16 (now <= 1, the store's jitter; r=2, frames 0/11/23).
+  Chroma-only `sigma` also left plane 0 unprocessed, so the estimation kernel's
+  unused destination binding was null, invalid without `nullDescriptor`; it now
+  binds a processed plane's output. No perf change.
+- **2026-10-05 — the ring copy's grid folds into X and Y.** A 4096x4096 plane is
+  65536 workgroups, past the X limit Vulkan only guarantees; `bm3d_copy.comp`
+  now indexes `ID.y * NumWorkGroups.x + ID.x` and the host folds with
+  `vsfeel_fold_grid`, per entry. No perf change on this GPU (X is unconstrained).
 - **2026-10-03 — 16 bit input ships as a fp32 ring widened at copy time.** The
   u16-ring build and the mechanism behind its 15% loss are under Performance.
   Three kernels now (`bm3d_copy.comp` is new), `-DBITS` only on the
@@ -313,7 +325,7 @@ Chronological; each entry keeps the mechanism, not the story.
   per plane, per-plane parameters, the joint 4:4:4 entry, RGB input, the
   `[0, 127]` extractor range and the all-zero shortcut landed together. The cache
   reservation is atomic across entries: reserving one at a time deadlocked ~40%
-  of colour ref-pass comparisons (a frame holding entry 0 while waiting for
+  of color ref-pass comparisons (a frame holding entry 0 while waiting for
   entry 1, against the mirror image).
 - **2026-10-02 — radius cap 4 -> 16 and one aggregation path.** The cap was the
   per-slice table in push constants (three tw-wide int arrays stop fitting the

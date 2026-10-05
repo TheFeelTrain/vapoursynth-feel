@@ -51,6 +51,9 @@ struct Bm3dPlane {
     // unscaled decision the host made).
     float sigma {};
     bool process {};
+    // A YUV chroma plane: its ring and output conversion carry the 32768
+    // neutral code (see bm3d_copy.comp and bm3d_agg.comp).
+    bool chroma {};
     int block_step {};
     int bm_range {};
     int ps_num {};
@@ -72,6 +75,11 @@ struct Bm3dGroup {
     VkPipeline bm3d_pipeline {};
     uint32_t bm3d_grid_x {};
     uint32_t bm3d_grid_y {};
+    // The copy-and-widen dispatch for this entry's plane extent, folded into X
+    // and Y because one dimension's workgroup count can exceed the device's
+    // limit at 4K and above.
+    uint32_t copy_grid_x {};
+    uint32_t copy_grid_y {};
 
     int src_ring {};          // cache slots for the source window
     int res_cap {};           // cache slots for the per-frame estimate stacks
@@ -461,10 +469,12 @@ create_agg_pipeline(const GPUDevice & gpu, const Bm3dPlane & plane,
                     VkPipelineLayout layout) {
 
     struct Spec {
-        int32_t height, stride, tw, radius, res_cap, nplanes, tag_base;
-    } spec { plane.height,  plane.stride,   d.tw,          d.radius,
-             group.res_cap, group.n_planes, group.tag_base };
-    const std::array<VkSpecializationMapEntry, 7> entries { {
+        int32_t height, stride, tw, radius, res_cap, nplanes, tag_base, chroma;
+    } spec {
+        plane.height,  plane.stride,   d.tw,           d.radius,
+        group.res_cap, group.n_planes, group.tag_base, plane.chroma ? 1 : 0
+    };
+    const std::array<VkSpecializationMapEntry, 8> entries { {
         { 0, 0, sizeof(int32_t) },
         { 1, 4, sizeof(int32_t) },
         { 2, 8, sizeof(int32_t) },
@@ -472,6 +482,7 @@ create_agg_pipeline(const GPUDevice & gpu, const Bm3dPlane & plane,
         { 4, 16, sizeof(int32_t) },
         { 5, 20, sizeof(int32_t) },
         { 6, 24, sizeof(int32_t) },
+        { 7, 28, sizeof(int32_t) },
     } };
     // The aggregation kernel is a plain 32x8 grid-stride kernel with no LDS.
     return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(),
@@ -482,8 +493,8 @@ create_agg_pipeline(const GPUDevice & gpu, const Bm3dPlane & plane,
 
 // The copy-and-widen kernel an integer input needs: one linear range per source
 // plane, 256 threads per workgroup, no LDS. It declares the first two bindings
-// of the estimation kernels' set layout (source plane, ring) and an 8-byte
-// prefix of their push-constant block, so the same pipeline layout serves it.
+// of the estimation kernels' set layout (source plane, ring) and its own block
+// inside their push-constant range, so the same pipeline layout serves it.
 static std::variant<VkPipeline, std::string>
 create_copy_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
                      const uint32_t * code, size_t code_size) {
@@ -1023,18 +1034,21 @@ static void record_src_copies(BM3DData * d, const Bm3dFrame & fr,
                               const std::vector<Bm3dWindowCopy> & window) {
     const int clips = d->final ? 2 : 1;
     const auto copy_plane = [&](VkBuffer src, VkBuffer dst, VkDeviceSize offset,
-                                VkDeviceSize bytes) {
+                                VkDeviceSize bytes, const Bm3dGroup & g,
+                                bool chroma) {
         if (d->bits == 16) {
-            const uint32_t count = static_cast<uint32_t>(bytes);
-            const uint32_t off = static_cast<uint32_t>(offset);
+            const int32_t count = static_cast<int32_t>(bytes);
+            const int32_t off = static_cast<int32_t>(offset);
             const VkBuffer bufs[2] { src, dst };
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           d->copy_pipeline);
             gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, bufs, 2);
-            const uint32_t pushes[2] { off, count };
+            const int32_t pushes[3] { off, count, chroma ? 32768 : 0 };
             gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, pushes,
                                sizeof(pushes));
-            d->gpu->vk->vkCmdDispatch(cmd, (count + 255u) / 256u, 1, 1);
+            // The grid is the entry's extent at creation, so it covers this
+            // plane's (never larger) count; past pc.count a thread returns.
+            d->gpu->vk->vkCmdDispatch(cmd, g.copy_grid_x, g.copy_grid_y, 1);
             return;
         }
         VkBufferCopy2 region {};
@@ -1075,11 +1089,11 @@ static void record_src_copies(BM3DData * d, const Bm3dFrame & fr,
                                static_cast<VkDeviceSize>(clips - 1) *
                                    g.n_planes * g.pe +
                                static_cast<VkDeviceSize>(pi) * g.pe,
-                           g.pe);
+                           g.pe, g, d->planes[plane].chroma);
                 if (d->final) {
                     copy_plane(w.ref[plane], g.src.buffer,
                                slot_base + static_cast<VkDeviceSize>(pi) * g.pe,
-                               g.pe);
+                               g.pe, g, d->planes[plane].chroma);
                 }
             }
         }
@@ -1457,6 +1471,14 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
             }
             dst_planes[plane] = plane_info.buffer;
         }
+        // The estimation kernel's destination binding is unused unless it is
+        // tracing (which binds the trace buffer instead), but an unused binding
+        // still may not be null: chroma-only processing leaves plane 0
+        // unprocessed, so bind any processed plane's output there.
+        VkBuffer est_dst = VK_NULL_HANDLE;
+        for (int plane = 0; plane < d->num_planes && !est_dst; ++plane) {
+            est_dst = dst_planes[plane];
+        }
 
         int max_pos = 0;
         for (int gi = 0; gi < d->n_groups; ++gi) {
@@ -1517,7 +1539,7 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
                     d->gpu->api->gpuExecReadsFrame(ctx, f);
                 }
             }
-            record_est_chunk(d, ctx, fr, n, c, chunks, window, dst_planes[0],
+            record_est_chunk(d, ctx, fr, n, c, chunks, window, est_dst,
                              gputrace);
             uint64_t signaled = 0;
             if (d->gpu->api->gpuExecSubmit(ctx, &signaled, errbuf,
@@ -2073,12 +2095,19 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // the format (no subsampling for 4:4:4 and RGB).
     const int subW = d->vi->format.subSamplingW;
     const int subH = d->vi->format.subSamplingH;
+    // YUV chroma (planes 1 and 2; a 4-plane clip's alpha is neither) is centred
+    // on zero in the reference's float domain, so the integer copy removes its
+    // 32768 neutral and the store adds it back. Luma and RGB keep the plain
+    // full-range normalisation, which is what a float clip of the same content
+    // already holds for them.
+    const bool yuv = d->vi->format.colorFamily == cfYUV;
     for (int plane = 0; plane < d->num_planes; ++plane) {
         auto & p = d->planes[plane];
         p.width = (plane == 0) ? d->vi->width : d->vi->width >> subW;
         p.height = (plane == 0) ? d->vi->height : d->vi->height >> subH;
         p.stride = plane_stride_elems[plane];
         p.pe = static_cast<VkDeviceSize>(p.stride) * p.height;
+        p.chroma = yuv && plane > 0 && plane < 3;
         if (p.stride < p.width) {
             return set_error("the core reported an unexpected plane stride");
         }
@@ -2124,6 +2153,20 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             g.n_planes = 1;
             g.planes[0] = plane;
             g.pe = d->planes[plane].pe;
+        }
+    }
+
+    // The ring copy's 1D grid, folded into X and Y: a 4096x4096 plane alone
+    // needs 65536 workgroups, one past the X limit Vulkan only guarantees.
+    // Every copy of an entry uses its pe, so one folded grid per entry covers
+    // both the source and the ref ring sections.
+    for (int gi = 0; gi < d->n_groups; ++gi) {
+        auto & g = d->groups[gi];
+        std::string err;
+        if (!vsfeel_fold_grid(
+                d->gpu->limits, (static_cast<uint64_t>(g.pe) + 255) / 256,
+                "bm3d's ring copy", g.copy_grid_x, g.copy_grid_y, err)) {
+            return set_error(err);
         }
     }
 
