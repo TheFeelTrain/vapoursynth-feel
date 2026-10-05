@@ -48,11 +48,34 @@ class _FeelBM3DPlugin:
     """
 
     def __init__(self, func: Any = None) -> None:
-        import vapoursynth as vs
-
         # Injectable so the forwarding can be tested against a build whose
         # BM3Dv2 does not declare `chroma` (see tests/test_python_backend.py).
-        func = func if func is not None else vs.core.vsfeel.BM3Dv2
+        self._func = func
+
+    def _target(self) -> Any:
+        if self._func is not None:
+            return self._func
+
+        import vapoursynth as vs
+
+        # Resolved against the core that is live *now*, never captured: see
+        # the `BM3Dv2` docstring.
+        return vs.core.vsfeel.BM3Dv2
+
+    @property
+    def BM3Dv2(self) -> Any:
+        """The ``BM3Dv2`` entry point, built against the live core.
+
+        A fresh wrapper per access, because the ``Backend`` singleton outlives
+        the VapourSynth environment: vsview's reload destroys the environment
+        and creates a new core, and a ``Function`` captured from the old one
+        calls ``Core.ensure_valid()`` on the destroyed core ("Use of invalidated
+        Core"). ``vsdenoise`` reaches this through ``Backend.plugin`` on every
+        call, so looking the function up here is what keeps it reload-safe
+        (``vsdenoise``'s own ``Backend.plugin`` is a ``core.lazy`` proxy for the
+        same reason).
+        """
+        func = self._target()
         native = func.__signature__
         # The *native* signature, not the advertised one below, decides what is
         # safe to forward: an older build that does not declare ``chroma``
@@ -76,7 +99,7 @@ class _FeelBM3DPlugin:
             return func(*args, **forwarded)
 
         bm3d_v2.__signature__ = sig  # type: ignore[attr-defined]
-        self.BM3Dv2 = bm3d_v2
+        return bm3d_v2
 
 
 class FeelBackend:

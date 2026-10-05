@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-10-05
+
+### Fixed
+
+- BM3D through vs-jetpack's `backend=vsfeel.Backend` raised "Use of invalidated Core" after a vsview script reload
+
 ## [1.1.0] - 2026-10-05
 
 All filters now have full feature parity with other implementations and are more accurate.
@@ -103,6 +109,7 @@ The plugin has moved to the VapourSynth R80 GPU API. The core now owns the devic
 - vs-jetpack backend integration, so the filters can be used through the vs-jetpack wrappers
 - Windows and Linux wheels, built and published by CI
 
+[1.1.1]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.0...1.1.1
 [1.1.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.0.0...1.1.0
 [1.0.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/0.2.2...1.0.0
 [0.2.2]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/0.2.1...0.2.2

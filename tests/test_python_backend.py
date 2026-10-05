@@ -7,6 +7,9 @@ unmodified vs-jetpack wrappers.
 
 import dataclasses
 import inspect
+import os
+import subprocess
+import sys
 import threading
 
 import numpy as np
@@ -361,6 +364,84 @@ def test_bm3d_wrapper_keeps_chroma_off_an_older_plugin():
     wrapped(clip, sigma=0.7)
     wrapped(clip, sigma=0.7, chroma=True)
     assert new.calls == [{"sigma": 0.7, "chroma": 0}, {"sigma": 0.7, "chroma": 1}]
+
+
+# Two environment generations in one process, the way vsview's reload drives
+# them: the first build caches the module singletons, then its environment dies
+# and a second one runs the same script.
+_RELOAD_SCRIPT = """
+import sys
+sys.path.insert(0, {repo!r})
+
+import vapoursynth as vs
+
+
+class _Policy(vs.EnvironmentPolicy):
+    def __init__(self):
+        self._current = None
+
+    def on_policy_registered(self, api):
+        self._api = api
+        self._current = None
+
+    def on_policy_cleared(self):
+        self._api = None
+
+    def get_current_environment(self):
+        return self._current
+
+    def set_environment(self, environment):
+        self._current = environment
+
+    def is_alive(self, environment):
+        return environment is self._current
+
+
+pol = _Policy()
+vs.register_policy(pol)
+try:
+    for generation in range(2):
+        env = pol._api.create_environment()
+        wrapped = pol._api.wrap_environment(env)
+        try:
+            with wrapped.use():
+                import vsfeel
+                from vsdenoise import bm3d
+                from vsdenoise.blockmatch import BM3D
+
+                clip = vs.core.std.BlankClip(format=vs.GRAYS, width=64, height=64, length=3)
+                bm3d(clip, 0.7, 1, profile=BM3D.Profile.FAST, backend=vsfeel.Backend)
+        finally:
+            pol._api.destroy_environment(env)
+finally:
+    pol._api.unregister_policy()
+
+print("RELOAD-OK")
+"""
+
+
+def test_bm3d_backend_survives_an_environment_reload():
+    """The Backend singleton must not pin the environment it first ran in.
+
+    vsview's reload destroys the VapourSynth environment while keeping imported
+    modules cached. ``Backend.plugin`` used to cache the resolved
+    ``core.vsfeel.BM3Dv2`` Function, which kept the destroyed core alive, so the
+    next ``bm3d(...)`` through the wrapper raised "Use of invalidated Core (the
+    environment has been destroyed)". ``vsdenoise`` reaches the function through
+    ``backend.plugin.BM3Dv2`` on every call, so this has to resolve against the
+    live core.
+    """
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(vsfeel.__file__)))
+    proc = subprocess.run(
+        [sys.executable, "-c", _RELOAD_SCRIPT.format(repo=repo)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0, (
+        f"reload subprocess failed:\n{proc.stdout[-2000:]}\n{proc.stderr[-3000:]}"
+    )
+    assert "RELOAD-OK" in proc.stdout
 
 
 def test_eedi3aa_falls_back_for_non_both(clip_16bit):
