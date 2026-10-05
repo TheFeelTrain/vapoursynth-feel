@@ -982,8 +982,15 @@ static void record_est_position(BM3DData * d, const Bm3dFrame & fr,
     // kernel never writes: only the dispatch that estimates the traced centre
     // frame itself records, and only the group holding the requested reference
     // block matches inside the kernel.
+    //
+    // The traced centre is estimated once and then served from the cache, so
+    // whichever output frame computes it has to carry the trace: requiring the
+    // output frame to be the traced one too left the trace unrecorded whenever
+    // an earlier frame (n - radius) got there first, which is what a sequential
+    // request load does. The dump still waits for the traced frame's own
+    // aggregation, by which point the holder's estimation has been waited out.
     int32_t trace_xy = -1;
-    if (d->trace_frame >= 0 && n == d->trace_frame && m_i == d->trace_frame) {
+    if (d->trace_frame >= 0 && m_i == d->trace_frame) {
         trace_xy =
             static_cast<int32_t>((d->trace_x & 0xFFFF) | (d->trace_y << 16));
     }
@@ -2316,9 +2323,11 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             }
         }
         if (d->trace_frame >= 0) {
-            // One record is the marker, five counts, eight (x, y, z, error)
-            // slots and two counts per temporal frame and direction.
-            constexpr VkDeviceSize kTraceWords = 5 + 8 * 4 + 2 * 2 * MAX_RADIUS;
+            // One record is the marker, the five counts that follow it, eight
+            // (x, y, z, error) slots and two counts per temporal frame and
+            // direction: 6 + 32 + 4 * radius words, all of which the kernel
+            // writes (the last temporal word of a radius-16 trace is index 101).
+            constexpr VkDeviceSize kTraceWords = 6 + 8 * 4 + 2 * 2 * MAX_RADIUS;
             std::string err =
                 gpu_make_buffer(*d->gpu, core, kTraceWords * 4, d->match_trace,
                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |

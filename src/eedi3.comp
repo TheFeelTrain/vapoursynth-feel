@@ -1182,6 +1182,12 @@ void main() {
             // [laneBase - HPF, laneBase + K + HPF) from the subgroup's
             // registers (the relax's predecessor window), then per-direction
             // cost + DP.
+            // combine_cost's two centre taps are per-column, not per-direction.
+            // They are read by the relax below and seed the PROBE == 19
+            // predecessor stand-in, so they have to be declared before it.
+            const float cx1 = pad_get(dy - 1, xd);
+            const float cx2 = pad_get(dy + 1, xd);
+
             float ext[K + 2 * HPF];
 #if PROBE == 19
             // A per-column value that does not come from the previous column's
@@ -1209,10 +1215,6 @@ void main() {
 #endif
 
             const int umax2 = min(min(xd - 1, WIDTH - xd), MDIS) * HPF;
-
-            // combine_cost's two centre taps are per-column, not per-direction.
-            const float cx1 = pad_get(dy - 1, xd);
-            const float cx2 = pad_get(dy + 1, xd);
 
             for (int j = 0; j < K; j++) {
                 const int i = laneBase + j;

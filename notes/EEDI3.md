@@ -544,6 +544,9 @@ passes). All bit-identical to the previous build unless stated.
   hoisted the DP relax's `gamma*|dd|` to a bare `gamma` — valid only at full-pel (hp's
   `dd = ±2` is `2*gamma`), which failed the 12 hp tests; restored, no perf change.
 
+- **2026-10-05 — `EEDI3_PROBE=19` did not compile.** The 2026-10-03 hoist moved
+  `combine_cost`'s centre taps below the probe block, which seeds from them.
+
 ## Open work
 
 - **`eedi3h_vszipcl_loose` is a family-gap sanity bound, not a tolerance**: 0.06 /
@@ -594,8 +597,7 @@ passes). All bit-identical to the previous build unless stated.
 
 ### Do not retry
 
-*(stale)* marks a verdict measured on the degenerate pre-round-14 config — kept as
-the reason a variant failed, not as a current number.
+*(stale)*: verdict from the degenerate pre-round-14 config; mechanism kept.
 
 - **Breaking the walk's serial load chain** by lookahead, ±1 candidate windows, or a
   layout making the address f-independent: 453.9 / 451.4 / 457.0 fps — identical —
@@ -637,11 +639,8 @@ the reason a variant failed, not as a current number.
   on pbt (259 → 229); `restrict` on pbt (214 → 201); `[[unroll]]` on the K-direction
   loops (227 → 196); dropping `HOST_CACHED` from staging (collapsed to 43 fps — NT
   loads need WB/WC memory).
-- **Queue cap** (`VSFEEL_EEDI3_QUEUES`, pre-port, gone with the one-queue R80 API):
-  3 loses ~20%, 4/6/8 tie.
 - **`core.max_cache_size` in the benchmark harness**: lowering it collapses *every*
-  plugin (vsfeel 61 vs 220, vszipcl 39 vs 200) because the timed region starts
-  re-running the decode/mask chain. Shrink the harness's own frame cache instead.
+  plugin (vsfeel 61 vs 220, vszipcl 39 vs 200) by re-running the decode/mask chain.
 
 ### Method rules
 

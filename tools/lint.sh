@@ -87,9 +87,9 @@ gate_format() {
     have "$clang_format" || { skip "$clang_format"; return 2; }
     local files=("$root_dir"/src/*.cpp "$root_dir"/src/*.h)
     if [ "$fix" -eq 1 ]; then
-        "$clang_format" -i "${files[@]}"
+        "$clang_format" -i "${files[@]}" || return 1
     else
-        "$clang_format" --dry-run --Werror "${files[@]}"
+        "$clang_format" --dry-run --Werror "${files[@]}" || return 1
     fi
 }
 
@@ -102,14 +102,18 @@ gate_shaders() {
     # Recompiles stale .spv (glslc -Werror) and validates every module with
     # spirv-val. The target exists only when spirv-val was found at configure
     # time, so a build without SPIRV-Tools fails here instead of passing.
-    cmake --build "$build_dir" --target shader-validate
+    # Each step guards its own status: the gates run under `gate_x || rc=$?`,
+    # which turns safe-mode off inside them, so an unguarded failure would let
+    # the next step's success (a limit check against existing artifacts) mask
+    # it. `return 1`, never `return $?`: exit status 2 is reserved for SKIP.
+    cmake --build "$build_dir" --target shader-validate || return 1
     # The host declares each pipeline's workgroup and LDS before creating it (the
     # device-limit check reads those numbers), so the SPIR-V and the
     # `GpuWorkgroup` literals have to agree; --check does that comparison instead
     # of leaving it to whoever remembers to read the table.
     "$python" "$root_dir/tools/shader_limits.py" --check \
         --src "$root_dir/src" --header "$build_dir/spirv_binaries.h" \
-        "$build_dir/vk_spv/*.spv"
+        "$build_dir/vk_spv/*.spv" || return 1
 }
 
 gate_tidy() {
@@ -121,7 +125,7 @@ gate_tidy() {
         # state, not the pre-fix one.
         "$clang_tidy" -p "$build_dir" --fix --quiet "${files[@]}" || true
     fi
-    "$clang_tidy" -p "$build_dir" --quiet "${files[@]}"
+    "$clang_tidy" -p "$build_dir" --quiet "${files[@]}" || return 1
 }
 
 gate_cppcheck() {
@@ -135,7 +139,7 @@ gate_cppcheck() {
         --inline-suppr --quiet --error-exitcode=1 \
         --suppress=missingIncludeSystem \
         --suppress='*:*/vapoursynth/include/*' \
-        --template='{file}:{line}: {severity}: {message} [{id}]'
+        --template='{file}:{line}: {severity}: {message} [{id}]' || return 1
 }
 
 gate_ruff() {
@@ -155,8 +159,10 @@ gate_ruff() {
         "$ruff" check --fix --quiet "${files[@]}" || true
         "$ruff" format --quiet "${files[@]}" || true
     fi
-    "$ruff" check "${files[@]}"
-    "$ruff" format --check "${files[@]}"
+    # Both halves report, and both guard: a `ruff check` finding must not be
+    # masked by a clean `ruff format --check` (see gate_shaders).
+    "$ruff" check "${files[@]}" || return 1
+    "$ruff" format --check "${files[@]}" || return 1
 }
 
 gate_notes() {
@@ -165,7 +171,7 @@ gate_notes() {
     # machine can read: the fixed parts and their order, both line budgets, the
     # file index, report IDs. It reads no build directory, so unlike the three
     # gates above it also runs on a bare checkout.
-    "$python" "$root_dir/tools/notes_check.py" "$root_dir/notes"
+    "$python" "$root_dir/tools/notes_check.py" "$root_dir/notes" || return 1
 }
 
 status=()
@@ -176,11 +182,14 @@ failed=0
 # log has to show which one ran.
 gate_version() {
     # clang-tidy prints a banner first, so take the first line naming a version.
+    # A tool the gate will skip must not abort the run here: this probes before
+    # the gate's own availability check, and `set -e` would exit on the failed
+    # substitution, so the missing-tool SKIP never printed.
     case $1 in
-        format) "$clang_format" --version 2>/dev/null | grep -m1 -i version ;;
-        tidy) "$clang_tidy" --version 2>/dev/null | grep -m1 -i version ;;
-        cppcheck) "$cppcheck" --version 2>/dev/null | head -1 ;;
-        ruff) "$ruff" --version 2>/dev/null | head -1 ;;
+        format) "$clang_format" --version 2>/dev/null | grep -m1 -i version || true ;;
+        tidy) "$clang_tidy" --version 2>/dev/null | grep -m1 -i version || true ;;
+        cppcheck) "$cppcheck" --version 2>/dev/null | head -1 || true ;;
+        ruff) "$ruff" --version 2>/dev/null | head -1 || true ;;
         *) : ;;
     esac
 }
@@ -193,6 +202,8 @@ for gate in "${gates[@]}"; do
     fi
     rc=0
     "gate_$gate" || rc=$?
+    # 2 is the gates' reserved "tool missing" status; every real failure is a 1,
+    # so a tool that happens to exit 2 cannot masquerade as skipped.
     case $rc in
         0) status+=("$gate: ok") ;;
         2) status+=("$gate: skipped") ;;

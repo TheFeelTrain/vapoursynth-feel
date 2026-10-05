@@ -1798,7 +1798,7 @@ def test_bm3dv2_u16_zero_sigma_returns_the_source(clip_16bit):
 
 
 def _yuv420_clip():
-    return vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(CLIP_PATH), bits=32, fulls=True, fulld=True)
+    return vs.core.fmtc.bitdepth(source_clip(), bits=32, fulls=True, fulld=True)
 
 
 def test_bm3dv2_color_parallel_load_matches_serial():

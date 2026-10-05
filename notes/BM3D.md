@@ -243,6 +243,17 @@ which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-10-05 — the match trace's record and its recording.** `kTraceWords`
+  counted five header words for the marker plus the five counts and allocated
+  101, but the kernel writes index 5 and, at radius 16, its last temporal word is
+  index 101: the buffer and the host mapping were a word short (the new
+  radius-16 case reads 0 where the oracle wants 2 with the old size). Tracing
+  also required the *output* frame to be the traced one, so a sequential load
+  (frame - radius estimates the centre first, the traced frame then reads it from
+  the cache) recorded nothing and the dumper reported "no group matched";
+  whichever frame computes the traced centre carries it now. The colour parallel
+  tests also trim through `source_clip()`, so they use the fixtures' 24 frames
+  instead of the file's 300. No perf change.
 - **2026-10-05 — integer chroma: the neutral code and a null binding.** A YUV
   chroma plane is centred on zero in the reference's float domain, so the copy
   now subtracts 32768 and the store adds it back; the u16 arm had been filtering

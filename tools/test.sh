@@ -69,13 +69,16 @@ fi
 # trees, and their test modules share basenames with ours, which makes pytest's
 # rootdir-based module naming fail every tests/test_*.py with "import file
 # mismatch". Any non-flag argument naming an existing path is an explicit
-# target; anything else (`-k eedi3`, `loadfile`) is not.
+# target; anything else (`-k eedi3`, `loadfile`) is not. A pytest node id
+# (`tests/test_x.py::test_y`) is not a path either, so only the part before the
+# first `::` is tested: treating the whole id as missing appends `tests` and
+# silently expands an isolated case into the whole suite.
 target_given=
 for arg in "$@"; do
     case $arg in
         -*) continue ;;
     esac
-    if [ -e "$arg" ]; then
+    if [ -e "${arg%%::*}" ]; then
         target_given=1
     fi
 done

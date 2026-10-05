@@ -62,23 +62,27 @@ for job in jobs:
         job["frame"], job["x"], job["y"])
     node = core.vsfeel.BM3Dv2(clip, **job["kwargs"])
     node = core.std.GPUDownload(clip=node) if node.gpu_resident else node
-    node.get_frame(job["frame"])
+    if job.get("sequence"):
+        for f in range(job["frame"] + 1):
+            node.get_frame(f)
+    else:
+        node.get_frame(job["frame"])
     print("DONE " + job["id"], flush=True)
 """
 )
 
 
-def make_clip(kind, seed=11):
+def make_clip(kind, seed=11, nframes=NFRAMES):
     rng = np.random.default_rng(seed)
     if kind == "noise":
-        return rng.normal(0.5, 0.08, (NFRAMES, H, W)).astype(np.float32)
+        return rng.normal(0.5, 0.08, (nframes, H, W)).astype(np.float32)
     if kind == "grad":
         # Stronger noise and a faster drift than "motion": the block distances
         # spread over the threshold, so group sizes of one, two, three and
         # seven all occur instead of every frame filling up.
         ys, xs = np.mgrid[0:H, 0:W].astype(np.float32)
-        out = np.zeros((NFRAMES, H, W), dtype=np.float32)
-        for f in range(NFRAMES):
+        out = np.zeros((nframes, H, W), dtype=np.float32)
+        for f in range(nframes):
             base = 0.5 + 0.3 * np.sin((xs + 3.0 * f) * 0.3) * np.cos(ys * 0.2)
             out[f] = (base + rng.normal(0, 0.05, (H, W))).astype(np.float32)
         return out
@@ -86,8 +90,8 @@ def make_clip(kind, seed=11):
     # neighbouring frame matches well at a shifted origin, so the per-frame
     # retained counts vary instead of all filling up.
     ys, xs = np.mgrid[0:H, 0:W].astype(np.float32)
-    out = np.zeros((NFRAMES, H, W), dtype=np.float32)
-    for f in range(NFRAMES):
+    out = np.zeros((nframes, H, W), dtype=np.float32)
+    for f in range(nframes):
         base = 0.5 + 0.25 * np.sin((xs + 2.0 * f + 40.0) * 0.35) * np.cos(ys * 0.21)
         out[f] = (base + rng.normal(0, 0.01, (H, W))).astype(np.float32)
     return out
@@ -305,6 +309,66 @@ def test_bm3dv2_threshold_zero_is_reference_only(traces):
     assert got["retained"] == 1
     assert got["members"][0][:3] == (8, 8, 2)
     assert got["frames"] == []
+
+
+def test_bm3dv2_matcher_trace_survives_the_estimate_cache(tmp_path):
+    """An earlier request may compute the traced centre; the trace must follow.
+
+    A sequential load (0..frame, what vspipe produces) has frame - radius
+    estimate the traced centre first, so by the time the traced frame is
+    requested its centre comes from the estimate cache and no dispatch records
+    the trace. Each sequential trace must equal the single-request one, which
+    is what the other matcher cases exercise.
+    """
+    path = tmp_path / "clip.npy"
+    np.save(path, make_clip("noise"))
+    jobs = [
+        dict(id=kind, frame=3, x=8, y=8, kwargs=base_kwargs(**extra), sequence=seq)
+        for kind, extra, seq in (
+            ("single_r2", {}, False),
+            ("seq_r2", {}, True),
+            ("single_r3", {"radius": 3}, False),
+            ("seq_r3", {"radius": 3}, True),
+        )
+    ]
+    got = dict(zip([j["id"] for j in jobs], _run_batch(path, jobs)))
+    for single, seq in (("single_r2", "seq_r2"), ("single_r3", "seq_r3")):
+        assert got[seq] is not None, "the sequential load lost the trace"
+        assert got[seq] == got[single], f"{seq} differs from {single}"
+
+
+@pytest.mark.parametrize("sequence", [False, True], ids=["single", "sequential"])
+def test_bm3dv2_radius16_trace_reaches_its_last_temporal_word(tmp_path, sequence):
+    """radius 16 makes the record 102 words (the last counter is index 101).
+
+    The buffer used to be one word short, so the kernel's last temporal write
+    and the dumper's read of it landed past both the buffer and its mapping. A
+    33-frame clip gives 16 steps in each direction, and the oracle's per-frame
+    counts must survive for every one of them.
+    """
+    frame, radius = 16, 16
+    clip = make_clip("noise", nframes=2 * radius + 1)
+    path = tmp_path / "clip.npy"
+    np.save(path, clip)
+    kwargs = base_kwargs(radius=radius)
+    job = dict(id="r16", frame=frame, x=8, y=8, kwargs=kwargs, sequence=sequence)
+    got = _run_batch(path, [job])[0]
+    assert got is not None, "the radius-16 trace was never recorded"
+
+    _, info = match_group(
+        frame,
+        8,
+        8,
+        clip,
+        radius,
+        kwargs["bm_range"],
+        kwargs["ps_num"],
+        kwargs["ps_range"],
+        default_th(kwargs["sigma"][0]),
+    )
+    want = [(f, len(m), min(kwargs["ps_num"], len(m))) for f, m in info["frames"]]
+    assert len(want) == 2 * radius
+    assert sorted((f, r, s) for (_, f, r, s) in got["frames"]) == sorted(want)
 
 
 def test_bm3dv2_trace_rejects_a_non_origin(tmp_path):
