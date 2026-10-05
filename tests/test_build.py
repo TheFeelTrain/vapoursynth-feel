@@ -1,5 +1,6 @@
 """Build plumbing: plugin version reporting, the SPIR-V header generator, and
-the shipped build tools (benchmark script generation, wheel staging)."""
+the shipped build tools (the shader-limits checker, benchmark script
+generation, wheel staging)."""
 
 import importlib.util
 import re
@@ -14,6 +15,7 @@ import vapoursynth as vs
 ROOT = Path(__file__).resolve().parents[1]
 GENERATOR = ROOT / "src" / "gen_spirv_header.py"
 BENCHMARK = ROOT / "tools" / "benchmark.py"
+SHADER_LIMITS = ROOT / "tools" / "shader_limits.py"
 HATCH_BUILD = ROOT / "hatch_build.py"
 
 # A minimal header-only SPIR-V module: magic, version, generator, bound,
@@ -71,6 +73,28 @@ def _load_module(name, path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_shader_limits_stem_survives_windows_globs():
+    """A glob result must reduce to a variant stem on either platform.
+
+    glob echoes the pattern's separators and joins the matched tail with the
+    platform's own, so a forward-slash pattern on Windows yields
+    ``build/vk_spv\\eedi3_32_row.spv``. Splitting on ``/`` alone then leaves the
+    directory in the stem, which matches no host declaration: every module is
+    reported unchecked and ``--check`` passes without comparing anything.
+    """
+    limits = _load_module("shader_limits", SHADER_LIMITS)
+    for path in (
+        "build/vk_spv/eedi3_32_row.spv",
+        "build/vk_spv\\eedi3_32_row.spv",
+        "build\\vk_spv\\eedi3_32_row.spv",
+        "eedi3_32_row.spv",
+    ):
+        assert limits.path_basename(path) == "eedi3_32_row.spv", path
+        assert limits.variant_stem(path) == "eedi3_32_row", path
+    # A non-.spv match keeps its whole name (the pattern is user-supplied).
+    assert limits.variant_stem("build\\vk_spv\\notes.txt") == "notes.txt"
 
 
 def test_benchmark_synthetic_scripts_compile_and_eval(monkeypatch):

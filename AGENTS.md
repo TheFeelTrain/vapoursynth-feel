@@ -69,6 +69,10 @@ component first and ends with a full stop. Entries read like this:
   function names, no buffer budgets, no rationale, and no "Added support for ..."
   openers.
 - **No em-dashes.** Use a comma, a full stop or parentheses.
+- **Only what the last release did differently.** An entry is read by someone
+  upgrading from the last tag, so a bug in something that has only ever existed
+  in this `[Unreleased]` section is not an entry: no release ever had it, and
+  fixing it only makes the unreleased feature work as first documented.
 
 The notes files carry the mechanism; the changelog carries the result.
 

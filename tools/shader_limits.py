@@ -212,6 +212,24 @@ def embedded_variants(header):
     return set(re.findall(r"static const uint32_t ([a-z0-9_]+)_spv\[\]", text))
 
 
+def path_basename(path):
+    """The file name of a glob result, whichever separator the platform used.
+
+    `glob` echoes the separators of the pattern and joins the matched tail with
+    the platform's own, so a Windows run hands back `build/vk_spv\\eedi3_row.spv`
+    for a forward-slash pattern. Splitting on `/` alone therefore returns the
+    whole path there, which then matches no host declaration and leaves every
+    module reported unchecked instead of compared.
+    """
+    return path.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def variant_stem(path):
+    """The variant name a `.spv` path carries, i.e. its name without the suffix."""
+    name = path_basename(path)
+    return name[: -len(".spv")] if name.endswith(".spv") else name
+
+
 # ---------------------------------------------------------------------------
 # Host-side expectations (--check)
 # ---------------------------------------------------------------------------
@@ -656,8 +674,8 @@ def main():
             for d in local:
                 invocations *= d
         shared, dynamic = module.shared_bytes()
-        name = path.rsplit("/", 1)[-1]
-        stem = name[: -len(".spv")] if name.endswith(".spv") else name
+        name = path_basename(path)
+        stem = variant_stem(path)
         modules[stem] = module
         if args.check:
             continue

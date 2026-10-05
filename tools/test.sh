@@ -22,23 +22,26 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(cd -- "$script_dir/.." && pwd)
+# shellcheck source=tools/venv.sh
+. "$script_dir/venv.sh"
 
 py=${VSFEEL_PYTHON:-}
 if [[ -z $py ]]; then
-    if [[ -x $root_dir/.venv/bin/python ]]; then
-        py=$root_dir/.venv/bin/python
-    else
-        py=python3
+    if ! py=$(vsfeel_venv_python "$root_dir"); then
+        py=$(vsfeel_system_python) || {
+            printf 'test.sh: no Python interpreter found (run `uv sync` first)\n' >&2
+            exit 1
+        }
         printf 'test.sh: no .venv; falling back to %s (run `uv sync` first)\n' \
-            "$(command -v python3)" >&2
+            "$py" >&2
     fi
 fi
 
 # The venv's bin first: tests shell out to `vspipe` (test_dfttest/test_eedi3),
 # and a PATH lookup that found the system one would drive the system plugin
 # directory instead of the library this checkout just built.
-if [[ -d $root_dir/.venv/bin ]]; then
-    PATH=$root_dir/.venv/bin:$PATH
+if venv_bin=$(vsfeel_venv_bin "$root_dir"); then
+    PATH=$venv_bin:$PATH
     export PATH
 fi
 

@@ -16,6 +16,8 @@ die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(cd -- "$script_dir/.." && pwd)
+# shellcheck source=tools/venv.sh
+. "$script_dir/venv.sh"
 
 build_dir=${VSFEEL_BUILD_DIR:-$root_dir/build}
 plugin_dir=${VSFEEL_PLUGIN_DIR:-}
@@ -27,12 +29,12 @@ build_type=Release
 # links against a different VapourSynth release. VSFEEL_PYTHON overrides it.
 py=${VSFEEL_PYTHON:-}
 if [[ -z $py ]]; then
-    if [[ -x $root_dir/.venv/bin/python ]]; then
-        py=$root_dir/.venv/bin/python
-    else
-        py=python3
+    if ! py=$(vsfeel_venv_python "$root_dir"); then
+        if ! py=$(vsfeel_system_python); then
+            die "no Python interpreter found (run \`uv sync\` first)"
+        fi
         printf 'install.sh: no .venv; falling back to %s (run `uv sync` first)\n' \
-            "$(command -v python3)" >&2
+            "$py" >&2
     fi
 fi
 

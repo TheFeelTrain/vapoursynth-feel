@@ -31,12 +31,14 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(cd -- "$script_dir/.." && pwd)
+# shellcheck source=tools/venv.sh
+. "$script_dir/venv.sh"
 build_dir=${VSFEEL_BUILD_DIR:-$root_dir/build}
 
 # The lint wheels are a dependency group, not system packages; putting the venv
 # first is what makes a local run use the same versions CI does.
-if [[ -d $root_dir/.venv/bin ]]; then
-    PATH=$root_dir/.venv/bin:$PATH
+if venv_bin=$(vsfeel_venv_bin "$root_dir"); then
+    PATH=$venv_bin:$PATH
     export PATH
 fi
 
@@ -44,9 +46,18 @@ clang_format=${CLANG_FORMAT:-clang-format}
 clang_tidy=${CLANG_TIDY:-clang-tidy}
 cppcheck=${CPPCHECK:-cppcheck}
 ruff=${RUFF:-ruff}
-# tools/shader_limits.py is stdlib-only, so any interpreter runs it; the venv is
-# what PATH resolves to after the block above whenever one exists.
-python=${VSFEEL_PYTHON:-python3}
+# tools/shader_limits.py and tools/notes_check.py are stdlib-only, so any
+# interpreter runs them: the venv's when there is one (it is also what the PATH
+# block above resolves `python3` to), else the system's.
+python=${VSFEEL_PYTHON:-}
+if [[ -z $python ]]; then
+    if ! python=$(vsfeel_venv_python "$root_dir"); then
+        python=$(vsfeel_system_python) || {
+            printf 'lint.sh: no Python interpreter found (run `uv sync` first)\n' >&2
+            exit 1
+        }
+    fi
+fi
 
 fix=0
 gates=()
