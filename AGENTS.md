@@ -57,21 +57,22 @@ Keep a Changelog format, newest first, with an `## [Unreleased]` section for
 what has landed since the last tag. Write the entry with the change, not at
 release time. One bullet per user-visible change, under `Added`, `Changed`,
 `Fixed` or `Removed`: one unwrapped source line that names the filter or
-component first and ends with a full stop. Entries read like this:
+component first. Entries read like this:
 
 ```markdown
-- BM3Dv2 accepts up to `radius=16` instead of 4, matching vszipcl.
-- A BM3Dv2 cache slot could be overwritten by a stale writer.
-- Upload fixes for EEDI3 and BM3Dv2 on devices without a ReBAR heap.
+- BM3Dv2 accepts up to `radius=16` instead of 4, matching vszipcl
+- A BM3Dv2 cache slot could be overwritten by a stale writer
+- Upload fixes for EEDI3 and BM3Dv2 on devices without a ReBAR heap
 ```
 
 - **Short and high level.** What a user notices, not how it works: no kernel or
   function names, no buffer budgets, no rationale, and no "Added support for ..."
-  openers.
-- **No em-dashes.** Use a comma, a full stop or parentheses.
+  openers. A fix to the development tooling (`tools/`, the lint and notes gates, 
+  the benchmark harness) is not an entry either. Strictly user-facing changes.
+- **No em-dashes.** Use a comma, a full stop, or parentheses.
 - **Only what the last release did differently.** An entry is read by someone
   upgrading from the last tag, so a bug in something that has only ever existed
-  in this `[Unreleased]` section is not an entry: no release ever had it, and
+  in the `[Unreleased]` section is not an entry: no release ever had it, and
   fixing it only makes the unreleased feature work as first documented.
 
 The notes files carry the mechanism; the changelog carries the result.
