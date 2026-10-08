@@ -176,6 +176,10 @@ struct BM3DData {
     float th_mse { 0.0f };
     bool
         cas_atomics {}; // aggregate with the CAS kernel (no float32 add atomics)
+    // Stage the group's reference patch in shared memory instead of 64 registers
+    // per lane: Nvidia cannot afford the registers, AMD cannot afford the LDS
+    // traffic. See create_bm3d_pipeline and src/bm3d.comp.
+    bool patch_lds {};
     // chroma=True: one joint entry over the clip's three 4:4:4 planes, whose
     // groups come from luma (the references' "chroma" mode).
     bool joint {};
@@ -454,11 +458,13 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
                std::to_string(gpu.subgroup_size) + " and cannot be changed"s;
     }
     // LDS: s_x/s_y/s0_x/s0_y hold the prediction seeds of each 8-lane group
-    // (four arrays of 8 entries per group), plus one reference patch per group
-    // (4 x 65 floats; the odd stride keeps the four groups in different banks).
-    // The per-lane candidate lists live in registers, so nothing else is shared.
+    // (four arrays of 8 entries per group), plus the group's reference patch
+    // when it is staged there (4 x 65 floats; the odd stride keeps the four
+    // groups in different banks). The per-lane candidate lists live in
+    // registers, so nothing else is shared.
+    const uint32_t patch_bytes = d.patch_lds ? 4 * 65 * 4 : 0;
     const GpuWorkgroup workgroup { .x = 32,
-                                   .shared_bytes = 4 * 8 * 4 * 4 + 4 * 65 * 4 };
+                                   .shared_bytes = 4 * 8 * 4 * 4 + patch_bytes };
     return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(),
                                &spec, static_cast<uint32_t>(entries.size()),
                                sizeof(spec), "bm3d", subgroup_size, workgroup);
@@ -2044,10 +2050,17 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         d->gpu->feat_atomic_float32_add &&
         (d->gpu->vendor_id == 0x1002u || env_flag("VSFEEL_BM3D_FLOAT_ATOMICS"));
     d->cas_atomics = env_flag("VSFEEL_BM3D_CAS") || !hw_atomics;
+    // Nvidia is register-bound here (128 registers and a 215808-byte binary with
+    // the patch in registers, against 168 and 128256 without it), AMD is not and
+    // pays about 10% for the LDS traffic. VSFEEL_BM3D_PATCH_LDS overrides.
+    d->patch_lds =
+        d->gpu->vendor_id == 0x10DEu || env_flag("VSFEEL_BM3D_PATCH_LDS");
     if (vsfeel_device_info_enabled()) {
         fprintf(stderr, "[bm3d] aggregation: %s\n",
                 d->cas_atomics ? "CAS loop (atom_add_f fallback)"
                                : "hardware buffer float atomics");
+        fprintf(stderr, "[bm3d] reference patch: %s\n",
+                d->patch_lds ? "shared memory" : "per-lane registers");
     }
     // The 8x8 group transposes and the group-8 reduction are subgroup shuffles,
     // and the kernel's per-lane layout puts each 8-lane group inside one
@@ -2413,18 +2426,35 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         auto & g = d->groups[gi];
         const auto & first = d->planes[g.planes[0]];
         {
-            // A one-plane entry gets the loop-free build: a one-trip loop over
+            // A one-plane entry gets the loop-free build (a one-trip loop over
             // the NPLANES spec constant still costs Nvidia about 2x, because it
-            // keeps the whole body inside a loop and spills (see src/bm3d.comp).
+            // keeps the whole body inside a loop and spills), and Nvidia gets
+            // the build that stages the reference patch in shared memory. See
+            // src/bm3d.comp for both.
             const bool one_plane = g.n_planes == 1;
-            const uint32_t * code =
-                d->cas_atomics
-                    ? (one_plane ? bm3d_cas_1plane_spv : bm3d_cas_spv)
-                    : (one_plane ? bm3d_1plane_spv : bm3d_spv);
-            const size_t code_size =
-                d->cas_atomics
-                    ? (one_plane ? bm3d_cas_1plane_spv_size : bm3d_cas_spv_size)
-                    : (one_plane ? bm3d_1plane_spv_size : bm3d_spv_size);
+            const uint32_t * code = nullptr;
+            size_t code_size = 0;
+            if (d->cas_atomics) {
+                code = d->patch_lds
+                           ? (one_plane ? bm3d_cas_lds_1plane_spv
+                                        : bm3d_cas_lds_spv)
+                           : (one_plane ? bm3d_cas_1plane_spv : bm3d_cas_spv);
+                code_size =
+                    d->patch_lds
+                        ? (one_plane ? bm3d_cas_lds_1plane_spv_size
+                                     : bm3d_cas_lds_spv_size)
+                        : (one_plane ? bm3d_cas_1plane_spv_size
+                                     : bm3d_cas_spv_size);
+            } else {
+                code = d->patch_lds
+                           ? (one_plane ? bm3d_lds_1plane_spv : bm3d_lds_spv)
+                           : (one_plane ? bm3d_1plane_spv : bm3d_spv);
+                code_size =
+                    d->patch_lds
+                        ? (one_plane ? bm3d_lds_1plane_spv_size
+                                     : bm3d_lds_spv_size)
+                        : (one_plane ? bm3d_1plane_spv_size : bm3d_spv_size);
+            }
             const auto result = create_bm3d_pipeline(
                 *d->gpu, *d, g, code, code_size, d->pipeline_layout);
             if (std::holds_alternative<std::string>(result)) {
