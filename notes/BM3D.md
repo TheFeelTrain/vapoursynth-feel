@@ -255,19 +255,22 @@ which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
-- **2026-10-08 — the Nvidia slowdown was the search's 4-wide walk staging.** The
-  V-BM3D matcher parked four candidate coordinates per step in `int c[4]` /
-  `int r[4]`; `walk_step`'s wrap loop keeps the compiler from unrolling the
-  staging loop, so on Nvidia those live in scratch and every `ssd_err` address
-  waits on a scratch round trip the compiler cannot reorder. The op count had
-  gone *down* (`insert_cand` beats `insertN`), so it was never work: 0dad9c8
-  127.3 fps against f36a6ef 1.22 fps, and 449.5 against 240.4 under
+- **2026-10-08 — the Nvidia slowdown was struct staging in the search walk.** The
+  V-BM3D matcher's two walk loops stage state that Nvidia's backend will not
+  promote: the four candidate coordinates (`int c[4]` / `int r[4]`) and, worse,
+  `Window`/`Walk` structs crossing `make_window`/`walk_start`/`walk_step`, which
+  run once per candidate. `walk_step` now takes scalars and the window fields are
+  hoisted into scalars before the loop, so the per-candidate path never touches
+  a compound object (`Walk` locals 5 -> 0; the fast arm has none of either). The
+  op count had gone *down* (`insert_cand` beats `insertN`), so it was never work:
+  0dad9c8 127.3 fps against f36a6ef 1.22 fps, and 449.5 against 240.4 under
   `VSFEEL_BM3D_NOSEARCH=1` (3080, GRAYS 1080p, r=2, bm_range 9, ps_range 4,
-  block_step 8): the search alone went 5.6 -> 815 ms/frame. Scalarising the
-  coordinates drops the staged size-4 arrays back to the fast arm's two. The
-  7900XTX A/B is 937.9 against 921.8 fps (jpbd 1080p, 1000 frames, ABBA, n=12),
-  which is only the no-regression check: ACO promotes the arrays there, so the
-  fix's own validation has to come from the affected cards.
+  block_step 8): the search alone went 5.6 -> 815 ms/frame. Dead end first tried:
+  scalarising only the `c[4]`/`r[4]` arrays left the structs, and the explicit
+  4-wide call sites multiplied the inlined `Walk` copies 5 -> 11, taking the 4070
+  from 688 to 893 ms. The 7900XTX A/B is 969.2 against 951.1 fps (jpbd 1080p,
+  1000 frames, ABBA, n=12), which is only the no-regression check: ACO promotes
+  these there, so the fix's own validation has to come from the affected cards.
 - **2026-10-08 — the references rule out our code, leaving the atomic opcode.**
   bm3vk does not use hardware float atomics at all (it CASes a plain `uint`
   block, no `coherent`), and vszipcu's accumulate is our pattern through CUDA's

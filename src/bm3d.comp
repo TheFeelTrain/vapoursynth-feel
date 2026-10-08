@@ -869,23 +869,13 @@ Window make_window(int sx, int sy, int range, int maxx, int maxy) {
 
 // Walk this lane's share of a window's origins, row-major. `row`/`col` are
 // carried as state so the walk costs one add per step instead of a division.
-struct Walk {
-    int row;
-    int col;
-};
-
-Walk walk_start(const Window w, int sl) {
-    Walk k;
-    k.row = w.top + sl / w.rw;
-    k.col = w.left + sl % w.rw;
-    return k;
-}
-
-void walk_step(inout Walk k, const Window w) {
-    k.col += 8;
-    while (k.col > w.right) {
-        k.col -= w.rw;
-        k.row += 1;
+// All-scalar parameters on purpose: this runs once per candidate, and a struct
+// or array crossing the call is staged in scratch in the innermost loop.
+void walk_step(int rw, int right, inout int col, inout int row) {
+    col += 8;
+    while (col > right) {
+        col -= rw;
+        row += 1;
     }
 }
 
@@ -970,34 +960,36 @@ void main() {
         }
         if (is_active && searching) {
             const Window w = make_window(x, y, BM_RANGE, WIDTH - 8, HEIGHT - 8);
-            Walk k = walk_start(w, sl);
-            for (int s = sl; s < w.total; s += 32) {
-                // Scalars, not an int[4] staging array: an array here is
-                // dynamically indexed (the walk's wrap loop keeps the compiler
-                // from unrolling this), so every candidate's coordinates would
-                // round-trip through scratch in the hottest loop in the kernel.
-                const int c0 = k.col;
-                const int r0 = k.row;
-                walk_step(k, w);
-                const int c1 = k.col;
-                const int r1 = k.row;
-                walk_step(k, w);
-                const int c2 = k.col;
-                const int r2 = k.row;
-                walk_step(k, w);
-                const int c3 = k.col;
-                const int r3 = k.row;
-                walk_step(k, w);
-                if (s + 0 < w.total) {
+            // Hoisted into scalars: the walk runs once per candidate, so reading
+            // a struct field there would stage the whole struct in scratch.
+            const int right = w.right;
+            const int rw = w.rw;
+            const int total = w.total;
+            int col = w.left + sl % w.rw;
+            int row = w.top + sl / w.rw;
+            for (int s = sl; s < total; s += 32) {
+                const int c0 = col;
+                const int r0 = row;
+                walk_step(rw, right, col, row);
+                const int c1 = col;
+                const int r1 = row;
+                walk_step(rw, right, col, row);
+                const int c2 = col;
+                const int r2 = row;
+                walk_step(rw, right, col, row);
+                const int c3 = col;
+                const int r3 = row;
+                walk_step(rw, right, col, row);
+                if (s + 0 < total) {
                     scan_cand(pe, pxy, cur, anchor_pc, c0, r0, true, x, y);
                 }
-                if (s + 8 < w.total) {
+                if (s + 8 < total) {
                     scan_cand(pe, pxy, cur, anchor_pc, c1, r1, true, x, y);
                 }
-                if (s + 16 < w.total) {
+                if (s + 16 < total) {
                     scan_cand(pe, pxy, cur, anchor_pc, c2, r2, true, x, y);
                 }
-                if (s + 24 < w.total) {
+                if (s + 24 < total) {
                     scan_cand(pe, pxy, cur, anchor_pc, c3, r3, true, x, y);
                 }
             }
@@ -1080,35 +1072,38 @@ void main() {
                     const int sy = s_y[group][i];
                     const Window w = make_window(sx, sy, PS_RANGE, WIDTH - 8,
                                                  HEIGHT - 8);
-                    Walk k = walk_start(w, sl);
-                    for (int s = sl; s < w.total; s += 32) {
-                        // Scalars, not an int[4] staging array (see the spatial
-                        // walk above).
-                        const int c0 = k.col;
-                        const int r0 = k.row;
-                        walk_step(k, w);
-                        const int c1 = k.col;
-                        const int r1 = k.row;
-                        walk_step(k, w);
-                        const int c2 = k.col;
-                        const int r2 = k.row;
-                        walk_step(k, w);
-                        const int c3 = k.col;
-                        const int r3 = k.row;
-                        walk_step(k, w);
-                        if (s + 0 < w.total &&
+                    // Hoisted into scalars (see the spatial walk above).
+                    const int right = w.right;
+                    const int rw = w.rw;
+                    const int total = w.total;
+                    int col = w.left + sl % w.rw;
+                    int row = w.top + sl / w.rw;
+                    for (int s = sl; s < total; s += 32) {
+                        const int c0 = col;
+                        const int r0 = row;
+                        walk_step(rw, right, col, row);
+                        const int c1 = col;
+                        const int r1 = row;
+                        walk_step(rw, right, col, row);
+                        const int c2 = col;
+                        const int r2 = row;
+                        walk_step(rw, right, col, row);
+                        const int c3 = col;
+                        const int r3 = row;
+                        walk_step(rw, right, col, row);
+                        if (s + 0 < total &&
                             is_first_owner(group, c0, r0, i, px0, py0)) {
                             scan_cand(pe, pxy, cur, spc, c0, r0, false, 0, 0);
                         }
-                        if (s + 8 < w.total &&
+                        if (s + 8 < total &&
                             is_first_owner(group, c1, r1, i, px0, py0)) {
                             scan_cand(pe, pxy, cur, spc, c1, r1, false, 0, 0);
                         }
-                        if (s + 16 < w.total &&
+                        if (s + 16 < total &&
                             is_first_owner(group, c2, r2, i, px0, py0)) {
                             scan_cand(pe, pxy, cur, spc, c2, r2, false, 0, 0);
                         }
-                        if (s + 24 < w.total &&
+                        if (s + 24 < total &&
                             is_first_owner(group, c3, r3, i, px0, py0)) {
                             scan_cand(pe, pxy, cur, spc, c3, r3, false, 0, 0);
                         }
