@@ -807,8 +807,18 @@ inline std::variant<VkPipeline, std::string> gpu_create_pipeline(
         // vkCreateComputePipelines requires the host to serialize access to the
         // shared cache.
         std::lock_guard lock(*g.pipeline_cache_lock);
+        // Timed so a cold-start report can tell compilation apart from a slow
+        // frame: the first run compiles every kernel serially here.
+        const auto t0 = std::chrono::steady_clock::now();
         result = g.vk->vkCreateComputePipelines(g.device, g.pipeline_cache, 1,
                                                 &info, nullptr, &pipeline);
+        if (vsfeel_debug_enabled()) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0)
+                                  .count();
+            fprintf(stderr, "[vsfeel] pipeline %s created in %.1f ms\n", tag,
+                    ms);
+        }
     }
     if (result != VK_SUCCESS) {
         return "vkCreateComputePipelines failed: "s + vk_result_string(result);

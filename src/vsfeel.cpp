@@ -517,11 +517,12 @@ get_gpu_device(VSCore * core, const VSAPI * vsapi) {
     // The aggregation kernel calls atomicAdd on a float storage buffer, which
     // is shaderBufferFloat32AtomicAdd alone: shaderBufferFloat32Atomics (load,
     // store, exchange) is a separate feature and a device may report it
-    // without the add. The core enables the atomic-float extension pair only
-    // when the device offers both, with the bits it reports, so the extension
-    // pair presence plus that bit is what the created device actually has.
+    // without the add. The core enables float whenever any of its bits is set
+    // (float2 only additionally), so presence plus that bit is what the created
+    // device actually has; requiring float2 would force the CAS fallback on
+    // devices that offer only the base extension.
     dev->feat_atomic_float32_add =
-        has_atomic_float2 && atomic_float.shaderBufferFloat32AtomicAdd;
+        has_atomic_float && atomic_float.shaderBufferFloat32AtomicAdd;
 
     load_gpu_pipeline_cache(*dev, props.properties);
 
@@ -565,8 +566,13 @@ get_gpu_device(VSCore * core, const VSAPI * vsapi) {
             dev->max_push_descriptors);
         fprintf(stderr, "[vsfeel] transfer queue family %u index %u\n",
                 handles.transferQueueFamily, handles.transferQueueIndex);
-        fprintf(stderr, "[vsfeel] optional features: float32AtomicAdd=%d\n",
-                dev->feat_atomic_float32_add);
+        fprintf(stderr,
+                "[vsfeel] optional features: float32AtomicAdd=%d (float=%d "
+                "float2=%d add=%d atomics=%d)\n",
+                dev->feat_atomic_float32_add, has_atomic_float,
+                has_atomic_float2,
+                atomic_float.shaderBufferFloat32AtomicAdd == VK_TRUE,
+                atomic_float.shaderBufferFloat32Atomics == VK_TRUE);
     }
 
     // insert_or_assign, not emplace: the lookup above falls through on an
