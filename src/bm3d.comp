@@ -1095,15 +1095,26 @@ void main() {
     // is the single-plane kernel it has always been. The group (gxy, gz) is
     // luma's in every case: a joint chroma entry filters each plane with the
     // groups block matching found on plane 0, as the reference does.
+#ifdef ONE_PLANE
+    // A one-trip loop over a spec constant still costs Nvidia about 2x: it
+    // keeps the whole body inside a loop and spills (128 registers, 215808
+    // bytes, against 168 and 128256 straight-line). This build is only used for
+    // a one-plane entry, so `plane` is a constant and the body is straight-line.
+    const int plane = 0;
+    {
+#else
     for (int plane = 0; plane < NPLANES; ++plane) {
+#endif
         const float sigma = (plane == 0) ? SIGMA_Y : ((plane == 1) ? SIGMA_U : SIGMA_V);
 
+#ifndef ONE_PLANE
         // Joint entry: a plane below the threshold is not denoised (the
         // reference's `if (sigma < FLT_EPS_) continue`); the host copies it
         // through from the source clip instead.
         if (NPLANES > 1 && sigma < FLT_EPS_) {
             continue;
         }
+#endif
 
         const int rplane = pc.res_off + plane * RES_PLANE_STRIDE;
 

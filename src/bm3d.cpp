@@ -2411,9 +2411,18 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         auto & g = d->groups[gi];
         const auto & first = d->planes[g.planes[0]];
         {
-            const uint32_t * code = d->cas_atomics ? bm3d_cas_spv : bm3d_spv;
+            // A one-plane entry gets the loop-free build: a one-trip loop over
+            // the NPLANES spec constant still costs Nvidia about 2x, because it
+            // keeps the whole body inside a loop and spills (see src/bm3d.comp).
+            const bool one_plane = g.n_planes == 1;
+            const uint32_t * code =
+                d->cas_atomics
+                    ? (one_plane ? bm3d_cas_1plane_spv : bm3d_cas_spv)
+                    : (one_plane ? bm3d_1plane_spv : bm3d_spv);
             const size_t code_size =
-                d->cas_atomics ? bm3d_cas_spv_size : bm3d_spv_size;
+                d->cas_atomics
+                    ? (one_plane ? bm3d_cas_1plane_spv_size : bm3d_cas_spv_size)
+                    : (one_plane ? bm3d_1plane_spv_size : bm3d_spv_size);
             const auto result = create_bm3d_pipeline(
                 *d->gpu, *d, g, code, code_size, d->pipeline_layout);
             if (std::holds_alternative<std::string>(result)) {

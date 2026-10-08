@@ -196,7 +196,9 @@ endforeach()
 # without buffer float atomics; see src/bm3d.comp.
 set(VK_BM3D_VARIANTS
     "bm3d|bm3d.comp|"
+    "bm3d_1plane|bm3d.comp|-DONE_PLANE"
     "bm3d_cas|bm3d.comp|-DNO_FLOAT_ATOMICS"
+    "bm3d_cas_1plane|bm3d.comp|-DNO_FLOAT_ATOMICS -DONE_PLANE"
     "bm3d_agg_32|bm3d_agg.comp|-DBITS=32"
     "bm3d_agg_16|bm3d_agg.comp|-DBITS=16"
     "bm3d_copy16|bm3d_copy.comp|")
