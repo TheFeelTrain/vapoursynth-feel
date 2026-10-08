@@ -553,32 +553,36 @@ float reduce_group8(float x) {
 // one left-to-right scalar fold. Near-ties and threshold boundaries are
 // decided by this order, so matching it keeps the two matchers' discrete
 // decisions together.
-float ssd_err(const float cur[64], const int base_idx, int cx, int cy) {
-    float a0 = 0.0f;
-    float a1 = 0.0f;
-    float a2 = 0.0f;
-    float a3 = 0.0f;
-    for (int i = 0; i < 8; ++i) {
-        const int row = base_idx + (cy + i) * STRIDE + cx;
-        const float d0 = cur[0 * 8 + i] - src[row + 0];
-        const float d1 = cur[1 * 8 + i] - src[row + 1];
-        const float d2 = cur[2 * 8 + i] - src[row + 2];
-        const float d3 = cur[3 * 8 + i] - src[row + 3];
-        const float d4 = cur[4 * 8 + i] - src[row + 4];
-        const float d5 = cur[5 * 8 + i] - src[row + 5];
-        const float d6 = cur[6 * 8 + i] - src[row + 6];
-        const float d7 = cur[7 * 8 + i] - src[row + 7];
-        a0 = a0 + d0 * d0;
-        a1 = a1 + d1 * d1;
-        a2 = a2 + d2 * d2;
-        a3 = a3 + d3 * d3;
-        a0 = a0 + d4 * d4;
-        a1 = a1 + d5 * d5;
-        a2 = a2 + d6 * d6;
-        a3 = a3 + d7 * d7;
-    }
-    return ((a0 + a1) + a2) + a3;
-}
+// The reference block's SSD at one origin, expanded at each use site instead of
+// called: passing `cur` to a function makes the 64-float patch cross a call
+// boundary, and keeping it in registers is the whole point.
+#define SSD_AT(BASE, CX, CY, OUT)                                          \
+    do {                                                                   \
+        float a0 = 0.0f;                                                   \
+        float a1 = 0.0f;                                                   \
+        float a2 = 0.0f;                                                   \
+        float a3 = 0.0f;                                                   \
+        for (int i = 0; i < 8; ++i) {                                      \
+            const int row = (BASE) + (CY + i) * STRIDE + (CX);             \
+            const float d0 = cur[0 * 8 + i] - src[row + 0];                \
+            const float d1 = cur[1 * 8 + i] - src[row + 1];                \
+            const float d2 = cur[2 * 8 + i] - src[row + 2];                \
+            const float d3 = cur[3 * 8 + i] - src[row + 3];                \
+            const float d4 = cur[4 * 8 + i] - src[row + 4];                \
+            const float d5 = cur[5 * 8 + i] - src[row + 5];                \
+            const float d6 = cur[6 * 8 + i] - src[row + 6];                \
+            const float d7 = cur[7 * 8 + i] - src[row + 7];                \
+            a0 = a0 + d0 * d0;                                             \
+            a1 = a1 + d1 * d1;                                             \
+            a2 = a2 + d2 * d2;                                             \
+            a3 = a3 + d3 * d3;                                             \
+            a0 = a0 + d4 * d4;                                             \
+            a1 = a1 + d5 * d5;                                             \
+            a2 = a2 + d6 * d6;                                             \
+            a3 = a3 + d7 * d7;                                             \
+        }                                                                  \
+        (OUT) = ((a0 + a1) + a2) + a3;                                     \
+    } while (false)
 
 // The candidate's (x, y) pair travels packed in one word: the insert shifts one
 // array per position, and folding x and y into a single word makes that two
@@ -928,13 +932,15 @@ void main() {
             int col_i = left + sl % rw;
             int row_i = top + sl / rw;
             for (int s = sl; s < total; s += 8) {
-                // The reference block is never matched against itself.
-                if (col_i != x || row_i != y) {
-                    const float err = ssd_err(cur, anchor_pc, col_i, row_i);
-                    if (err <= TH_SSE) {
-                        insert_cand(pe, pxy, err, pack_xy(col_i, row_i));
-                    }
-                }
+                float err;
+                SSD_AT(anchor_pc, col_i, row_i, err);
+                // Predicated, never branched: the threshold and the
+                // reference-block exclusion both ride `keep`, and a rejected
+                // candidate becomes a sentinel pair insert_cand drops without
+                // an `if`, so the warp cannot diverge here.
+                const bool keep = err <= TH_SSE && (col_i != x || row_i != y);
+                insert_cand(pe, pxy, keep ? err : FLT_MAX_,
+                            keep ? pack_xy(col_i, row_i) : INT_MAX_);
                 col_i += 8;
                 while (col_i > right) {
                     col_i -= rw;
@@ -1030,10 +1036,13 @@ void main() {
                         // Union of the clipped predictive windows, every origin
                         // evaluated once (see is_first_owner).
                         if (is_first_owner(group, col_i, row_i, i, px0, py0)) {
-                            const float err = ssd_err(cur, spc, col_i, row_i);
-                            if (err <= TH_SSE) {
-                                insert_cand(pe, pxy, err, pack_xy(col_i, row_i));
-                            }
+                            float err;
+                            SSD_AT(spc, col_i, row_i, err);
+                            // Predicated threshold (see the spatial walk).
+                            const bool keep = err <= TH_SSE;
+                            insert_cand(pe, pxy, keep ? err : FLT_MAX_,
+                                        keep ? pack_xy(col_i, row_i)
+                                             : INT_MAX_);
                         }
                         col_i += 8;
                         while (col_i > right) {
