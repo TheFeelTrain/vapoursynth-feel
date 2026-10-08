@@ -2040,16 +2040,11 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     d->gpu_trace = d->gpu_trace && vsfeel_probe_timestamps(*d->gpu, "BM3D");
 
     // The estimation kernel accumulates into float SSBOs with atomicAdd, which
-    // needs shaderBufferFloat32AtomicAdd. The bit is not the whole story: the
-    // SPIR-V is already minimal (device scope, relaxed, like the fast CUDA
-    // reference), yet Nvidia's Vulkan lowering serializes under millions of
-    // concurrent adds (1.3 fps vs 300 fps for CAS on a 3080), so only AMD
-    // keeps the hardware arm. VSFEEL_BM3D_FLOAT_ATOMICS=1 forces it elsewhere
-    // (a fixed driver or a new vendor); VSFEEL_BM3D_CAS=1 forces CAS.
-    const bool hw_atomics =
-        d->gpu->feat_atomic_float32_add &&
-        (d->gpu->vendor_id == 0x1002u || env_flag("VSFEEL_BM3D_FLOAT_ATOMICS"));
-    d->cas_atomics = env_flag("VSFEEL_BM3D_CAS") || !hw_atomics;
+    // needs shaderBufferFloat32AtomicAdd (the base extension's load/store/
+    // exchange bit alone is not enough); anything else runs the reference's
+    // atom_add_f CAS loop. VSFEEL_BM3D_CAS forces the CAS build.
+    d->cas_atomics =
+        env_flag("VSFEEL_BM3D_CAS") || !d->gpu->feat_atomic_float32_add;
     // Nvidia is register-bound here (128 registers and a 215808-byte binary with
     // the patch in registers, against 168 and 128256 without it), AMD is not and
     // pays about 10% for the LDS traffic. VSFEEL_BM3D_PATCH_LDS overrides.
