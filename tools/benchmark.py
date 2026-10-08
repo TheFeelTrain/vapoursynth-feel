@@ -13,9 +13,12 @@ Usage:
     uv run tools/benchmark.py                                   # all filters
     uv run tools/benchmark.py --filter gaussblur                # one filter
     uv run tools/benchmark.py --filter gaussblur vsfeel vszipcl # subset of plugins
-    uv run tools/benchmark.py --filter gaussblur --gauss-sigma 5.0
+    uv run tools/benchmark.py --filter gaussblur --gaussblur-args "sigma=5.0"
+    uv run tools/benchmark.py --filter bm3dv2 --bm3dv2-args "sigma=0.7, radius=2, th_mse=None"
     uv run tools/benchmark.py --filter gaussblur --repeat 5      # median of 5, alternating order
-    uv run tools/benchmark.py --filter dfttest --pair vszipcl    # same-session pair + ratio
+    uv run tools/benchmark.py --filter bm3dv2 --ab-so build/libvsfeel.so old/libvsfeel.so --ab-names new,old
+    uv run tools/benchmark.py --filter bm3dv2 --ab-b-env VSFEEL_BM3D_DERIVE=1 --ab-names legacy,derived
+    uv run tools/benchmark.py --filter bm3dv2 --ab-so a.so b.so --ab-rounds 3 --ab-order abba
     uv run tools/benchmark.py --frames 500 --clip /path/to/input.mkv
     uv run tools/benchmark.py --no-cache          # live decode: full chain incl. BestSource
     uv run tools/benchmark.py --filter gaussblur --gpu-cache --no-download
@@ -27,6 +30,11 @@ drift hits both arms of a comparison equally. Each vspipe run gets the
 environment from ``vspipe_env()`` -- MANGOHUD off, and RADV's transfer-only
 SDMA queue opted into -- and is killed after --timeout seconds.
 
+Each filter takes its params as one ``--<filter>-args`` key=value string
+(``--help`` lists each filter's keys and defaults; the literal ``None`` means
+unset, commas inside ``[...]`` do not split so ``planes=[0,1]`` works). Unknown
+keys and bad values abort instead of silently benchmarking defaults.
+
 By default the first --cache-frames frames of the real clip are decoded and
 held in RAM while vspipe is still evaluating the script (its fps figure only
 covers the output loop), so timing reflects real-content filter throughput
@@ -37,13 +45,23 @@ BlankClip; --no-cache restores live decoding.
 download leaves the fps and a filter the copy was hiding shows its own speed
 (GaussBlur 2282 -> 4461 fps with --gpu-cache). The filter still runs its
 full-frame kernels; notes/METHOD.md has what the mode's residual costs.
+
+A/B mode (--ab-so and/or --ab-a-env/--ab-b-env) compares two builds or two env
+configs in one session instead of a scratch script: each round measures arm A
+then arm B (alternating the first arm per round, or ABBA with --ab-order abba),
+every --ab-so copy is verified by sha, and the previously installed .so is
+restored afterwards even on failure. Without explicit plugins only vsfeel runs:
+a reference would measure the same binary in both arms. The final ``ab:`` line
+reports the median ratio B-vs-A with the delta.
 """
 
 import argparse
+import contextlib
 import hashlib
 import importlib.util
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -424,16 +442,16 @@ def resolve_plugins(requested: list[str], calls: dict[str, str], title: str) -> 
 
 @dataclass
 class Arg:
-    """One filter parameter exposed as a CLI flag.
+    """One filter parameter in the ``--<filter>-args`` key=value string.
 
-    ``key`` is the parameter name used inside the vpy call (and in the printed
-    description); ``flag``/``dest`` are the CLI spelling and its namespace
-    attribute (prefixed so different filters never collide when run together).
-    ``type`` is the argparse value parser; bool Args use _str_to_bool.
+    ``key`` is the parameter name used in the string, inside the vpy call and
+    in the printed description; ``dest`` is the namespace attribute carrying
+    the resolved value (prefixed so different filters never collide when run
+    together). ``type`` converts the string value (bool Args use _str_to_bool);
+    the literal ``None`` always means None.
     """
 
     key: str
-    flag: str
     dest: str
     type: type
     default: Any
@@ -548,7 +566,7 @@ def _eedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[st
     (2x Point-upscaled luma), `sclip` (= clip) and `mclip` (2x upscaled vsaa
     edge mask). vsfeel and eedi3vk2 take both sclip and mclip (based_aa passes
     mclip when the backend supports it); vszipcl/vszipcu support sclip only.
-    --eedi3-mclip 0 drops the mclip from the vsfeel/eedi3vk2 calls.
+    mclip=0 drops the mclip from the vsfeel/eedi3vk2 calls.
 
     """
     use_mclip = getattr(ns, "eedi3_mclip", True)
@@ -638,7 +656,7 @@ def _eedi3aa_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
     transpose -> EEDI3 -> transpose), ``supports_mclip`` (forwarded to both
     the native and the fallback path) and the double-rate
     ``Interleave([s, s])`` sclip, and derives the plugin's ``field`` from
-    ``(tff, double_rate)``. ``--eedi3-field`` is mapped back onto that pair
+    ``(tff, double_rate)``. ``field`` is mapped back onto that pair
     (based_aa's field is ``tff + double_rate*2``).
 
     ``clip`` is the 2x supersampled luma (based_aa's ``ss``), ``mclip`` the
@@ -655,7 +673,7 @@ def _eedi3aa_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
         # merges); a single-rate field has no fused form to grade.
         raise SystemExit(
             "the eedi3aa benchmark grades the double-rate chain only "
-            f"(field 2 or 3), got --eedi3-field {field}"
+            f"(field 2 or 3), got field={field} in --eedi3aa-args"
         )
     # vsfeel's plugin takes the three thresholds separately; the vsaa
     # antialiaser carries based_aa's `vthresh=(v0, v1, v2)` object field and
@@ -731,14 +749,13 @@ FILTERS: dict[str, FilterSpec] = {
         title="BM3Dv2",
         default_frames=1000,
         args=[
-            Arg("sigma", "--bm3d-sigma", "bm3d_sigma", float, 0.7),
-            Arg("radius", "--bm3d-radius", "bm3d_radius", int, 2),
-            Arg("bm_range", "--bm3d-bm-range", "bm3d_bm_range", int, 9),
-            Arg("ps_range", "--bm3d-ps-range", "bm3d_ps_range", int, 4),
-            Arg("block_step", "--bm3d-block-step", "bm3d_block_step", int, 8),
+            Arg("sigma", "bm3d_sigma", float, 0.7),
+            Arg("radius", "bm3d_radius", int, 2),
+            Arg("bm_range", "bm3d_bm_range", int, 9),
+            Arg("ps_range", "bm3d_ps_range", int, 4),
+            Arg("block_step", "bm3d_block_step", int, 8),
             Arg(
                 "th_mse",
-                "--bm3d-th-mse",
                 "bm3d_th_mse",
                 float,
                 None,
@@ -757,10 +774,8 @@ FILTERS: dict[str, FilterSpec] = {
         title="Bilateral",
         default_frames=5000,
         args=[
-            Arg(
-                "sigma_spatial", "--bilateral-sigma-spatial", "bilateral_sigma_spatial", float, 3.0
-            ),
-            Arg("sigma_color", "--bilateral-sigma-color", "bilateral_sigma_color", float, 0.02),
+            Arg("sigma_spatial", "bilateral_sigma_spatial", float, 3.0),
+            Arg("sigma_color", "bilateral_sigma_color", float, 0.02),
         ],
         build=_bilateral_build,
         # vsfeel's Bilateral runs on the R80 GPU API (vnode:gpu in/out); the
@@ -771,7 +786,7 @@ FILTERS: dict[str, FilterSpec] = {
         title="GaussBlur",
         default_frames=5000,
         args=[
-            Arg("sigma", "--gauss-sigma", "gauss_sigma", float, 16.0),
+            Arg("sigma", "gauss_sigma", float, 16.0),
         ],
         build=_gauss_build,
         # vsfeel's GaussBlur is vnode:gpu under the R80 GPU API; the
@@ -782,19 +797,19 @@ FILTERS: dict[str, FilterSpec] = {
         title="DFTTest",
         default_frames=3000,
         args=[
-            Arg("ftype", "--dfttest-ftype", "dfttest_ftype", int, 0),
-            Arg("sigma", "--dfttest-sigma", "dfttest_sigma", float, 8.0),
-            Arg("sigma2", "--dfttest-sigma2", "dfttest_sigma2", float, 8.0),
-            Arg("pmin", "--dfttest-pmin", "dfttest_pmin", float, 0.0),
-            Arg("pmax", "--dfttest-pmax", "dfttest_pmax", float, 500.0),
-            Arg("sosize", "--dfttest-sosize", "dfttest_sosize", int, 12),
-            Arg("tbsize", "--dfttest-tbsize", "dfttest_tbsize", int, 3),
-            Arg("swin", "--dfttest-swin", "dfttest_swin", int, 0),
-            Arg("twin", "--dfttest-twin", "dfttest_twin", int, 7),
-            Arg("sbeta", "--dfttest-sbeta", "dfttest_sbeta", float, 2.5),
-            Arg("tbeta", "--dfttest-tbeta", "dfttest_tbeta", float, 2.5),
-            Arg("zmean", "--dfttest-zmean", "dfttest_zmean", int, 1),
-            Arg("f0beta", "--dfttest-f0beta", "dfttest_f0beta", float, 1.0),
+            Arg("ftype", "dfttest_ftype", int, 0),
+            Arg("sigma", "dfttest_sigma", float, 8.0),
+            Arg("sigma2", "dfttest_sigma2", float, 8.0),
+            Arg("pmin", "dfttest_pmin", float, 0.0),
+            Arg("pmax", "dfttest_pmax", float, 500.0),
+            Arg("sosize", "dfttest_sosize", int, 12),
+            Arg("tbsize", "dfttest_tbsize", int, 3),
+            Arg("swin", "dfttest_swin", int, 0),
+            Arg("twin", "dfttest_twin", int, 7),
+            Arg("sbeta", "dfttest_sbeta", float, 2.5),
+            Arg("tbeta", "dfttest_tbeta", float, 2.5),
+            Arg("zmean", "dfttest_zmean", int, 1),
+            Arg("f0beta", "dfttest_f0beta", float, 1.0),
         ],
         build=_dfttest_build,
         input="depth(get_y(clip), 16)",
@@ -806,12 +821,12 @@ FILTERS: dict[str, FilterSpec] = {
         title="NLMeans",
         default_frames=3000,
         args=[
-            Arg("d", "--nlmeans-d", "nlmeans_d", int, 2),
-            Arg("a", "--nlmeans-a", "nlmeans_a", int, 2),
-            Arg("s", "--nlmeans-s", "nlmeans_s", int, 4),
-            Arg("h", "--nlmeans-h", "nlmeans_h", float, 0.2),
-            Arg("wmode", "--nlmeans-wmode", "nlmeans_wmode", int, 0),
-            Arg("wref", "--nlmeans-wref", "nlmeans_wref", float, 1.0),
+            Arg("d", "nlmeans_d", int, 2),
+            Arg("a", "nlmeans_a", int, 2),
+            Arg("s", "nlmeans_s", int, 4),
+            Arg("h", "nlmeans_h", float, 0.2),
+            Arg("wmode", "nlmeans_wmode", int, 0),
+            Arg("wref", "nlmeans_wref", float, 1.0),
         ],
         build=_nlmeans_build,
         # chroma denoising on the subsampled planes is NLMeans' main use case
@@ -830,19 +845,18 @@ FILTERS: dict[str, FilterSpec] = {
             # which based_aa folds back with std.Merge(clip[::2], clip[1::2]).
             # The merge is not EEDI3 work, so the benchmark times field=3 alone
             # (the exact double-rate call based_aa makes) and skips the merge.
-            Arg("field", "--eedi3-field", "eedi3_field", int, 3),
-            Arg("mdis", "--eedi3-mdis", "eedi3_mdis", int, 20),
-            Arg("nrad", "--eedi3-nrad", "eedi3_nrad", int, 2),
-            Arg("alpha", "--eedi3-alpha", "eedi3_alpha", float, 0.125),
-            Arg("beta", "--eedi3-beta", "eedi3_beta", float, 0.25),
-            Arg("gamma", "--eedi3-gamma", "eedi3_gamma", float, 40.0),
-            Arg("vcheck", "--eedi3-vcheck", "eedi3_vcheck", int, 2),
-            Arg("vthresh0", "--eedi3-vthresh0", "eedi3_vthresh0", float, 12.0),
-            Arg("vthresh1", "--eedi3-vthresh1", "eedi3_vthresh1", float, 24.0),
-            Arg("vthresh2", "--eedi3-vthresh2", "eedi3_vthresh2", float, 4.0),
+            Arg("field", "eedi3_field", int, 3),
+            Arg("mdis", "eedi3_mdis", int, 20),
+            Arg("nrad", "eedi3_nrad", int, 2),
+            Arg("alpha", "eedi3_alpha", float, 0.125),
+            Arg("beta", "eedi3_beta", float, 0.25),
+            Arg("gamma", "eedi3_gamma", float, 40.0),
+            Arg("vcheck", "eedi3_vcheck", int, 2),
+            Arg("vthresh0", "eedi3_vthresh0", float, 12.0),
+            Arg("vthresh1", "eedi3_vthresh1", float, 24.0),
+            Arg("vthresh2", "eedi3_vthresh2", float, 4.0),
             Arg(
                 "mclip",
-                "--eedi3-mclip",
                 "eedi3_mclip",
                 _str_to_bool,
                 True,  # pyright: ignore[reportArgumentType]
@@ -850,7 +864,6 @@ FILTERS: dict[str, FilterSpec] = {
             ),
             Arg(
                 "hp",
-                "--eedi3-hp",
                 "eedi3_hp",
                 _str_to_bool,
                 False,  # pyright: ignore[reportArgumentType]
@@ -871,19 +884,18 @@ FILTERS: dict[str, FilterSpec] = {
         default_frames=2000,
         args=[
             # Same surface as the eedi3 entry; EEDI3H interpolates columns.
-            Arg("field", "--eedi3-field", "eedi3_field", int, 3),
-            Arg("mdis", "--eedi3-mdis", "eedi3_mdis", int, 20),
-            Arg("nrad", "--eedi3-nrad", "eedi3_nrad", int, 2),
-            Arg("alpha", "--eedi3-alpha", "eedi3_alpha", float, 0.125),
-            Arg("beta", "--eedi3-beta", "eedi3_beta", float, 0.25),
-            Arg("gamma", "--eedi3-gamma", "eedi3_gamma", float, 40.0),
-            Arg("vcheck", "--eedi3-vcheck", "eedi3_vcheck", int, 2),
-            Arg("vthresh0", "--eedi3-vthresh0", "eedi3_vthresh0", float, 12.0),
-            Arg("vthresh1", "--eedi3-vthresh1", "eedi3_vthresh1", float, 24.0),
-            Arg("vthresh2", "--eedi3-vthresh2", "eedi3_vthresh2", float, 4.0),
+            Arg("field", "eedi3_field", int, 3),
+            Arg("mdis", "eedi3_mdis", int, 20),
+            Arg("nrad", "eedi3_nrad", int, 2),
+            Arg("alpha", "eedi3_alpha", float, 0.125),
+            Arg("beta", "eedi3_beta", float, 0.25),
+            Arg("gamma", "eedi3_gamma", float, 40.0),
+            Arg("vcheck", "eedi3_vcheck", int, 2),
+            Arg("vthresh0", "eedi3_vthresh0", float, 12.0),
+            Arg("vthresh1", "eedi3_vthresh1", float, 24.0),
+            Arg("vthresh2", "eedi3_vthresh2", float, 4.0),
             Arg(
                 "mclip",
-                "--eedi3-mclip",
                 "eedi3_mclip",
                 _str_to_bool,
                 True,  # pyright: ignore[reportArgumentType]
@@ -891,7 +903,6 @@ FILTERS: dict[str, FilterSpec] = {
             ),
             Arg(
                 "hp",
-                "--eedi3-hp",
                 "eedi3_hp",
                 _str_to_bool,
                 False,  # pyright: ignore[reportArgumentType]
@@ -910,19 +921,18 @@ FILTERS: dict[str, FilterSpec] = {
         args=[
             # Same surface as the eedi3 entry: based_aa's default antialiaser
             # in double-rate mode (field = tff + double_rate*2 = 3).
-            Arg("field", "--eedi3-field", "eedi3_field", int, 3),
-            Arg("mdis", "--eedi3-mdis", "eedi3_mdis", int, 20),
-            Arg("nrad", "--eedi3-nrad", "eedi3_nrad", int, 2),
-            Arg("alpha", "--eedi3-alpha", "eedi3_alpha", float, 0.125),
-            Arg("beta", "--eedi3-beta", "eedi3_beta", float, 0.25),
-            Arg("gamma", "--eedi3-gamma", "eedi3_gamma", float, 40.0),
-            Arg("vcheck", "--eedi3-vcheck", "eedi3_vcheck", int, 2),
-            Arg("vthresh0", "--eedi3-vthresh0", "eedi3_vthresh0", float, 12.0),
-            Arg("vthresh1", "--eedi3-vthresh1", "eedi3_vthresh1", float, 24.0),
-            Arg("vthresh2", "--eedi3-vthresh2", "eedi3_vthresh2", float, 4.0),
+            Arg("field", "eedi3_field", int, 3),
+            Arg("mdis", "eedi3_mdis", int, 20),
+            Arg("nrad", "eedi3_nrad", int, 2),
+            Arg("alpha", "eedi3_alpha", float, 0.125),
+            Arg("beta", "eedi3_beta", float, 0.25),
+            Arg("gamma", "eedi3_gamma", float, 40.0),
+            Arg("vcheck", "eedi3_vcheck", int, 2),
+            Arg("vthresh0", "eedi3_vthresh0", float, 12.0),
+            Arg("vthresh1", "eedi3_vthresh1", float, 24.0),
+            Arg("vthresh2", "eedi3_vthresh2", float, 4.0),
             Arg(
                 "mclip",
-                "--eedi3-mclip",
                 "eedi3_mclip",
                 _str_to_bool,
                 True,  # pyright: ignore[reportArgumentType]
@@ -942,14 +952,14 @@ FILTERS: dict[str, FilterSpec] = {
         title="NNEDI3",
         default_frames=5000,
         args=[
-            Arg("field", "--nnedi3-field", "nnedi3_field", int, 3),
-            Arg("dh", "--nnedi3-dh", "nnedi3_dh", int, 0),
-            Arg("planes", "--nnedi3-planes", "nnedi3_planes", str, None),
-            Arg("nsize", "--nnedi3-nsize", "nnedi3_nsize", int, 0),
-            Arg("nns", "--nnedi3-nns", "nnedi3_nns", int, 4),
-            Arg("qual", "--nnedi3-qual", "nnedi3_qual", int, 2),
-            Arg("etype", "--nnedi3-etype", "nnedi3_etype", int, 0),
-            Arg("pscrn", "--nnedi3-pscrn", "nnedi3_pscrn", int, 4),
+            Arg("field", "nnedi3_field", int, 3),
+            Arg("dh", "nnedi3_dh", int, 0),
+            Arg("planes", "nnedi3_planes", str, None),
+            Arg("nsize", "nnedi3_nsize", int, 0),
+            Arg("nns", "nnedi3_nns", int, 4),
+            Arg("qual", "nnedi3_qual", int, 2),
+            Arg("etype", "nnedi3_etype", int, 0),
+            Arg("pscrn", "nnedi3_pscrn", int, 4),
         ],
         build=_nnedi3_build,
         # vsfeel's NNEDI3 is vnode:gpu under the R80 GPU API; the references
@@ -1117,7 +1127,7 @@ def _stats(values: list[float]) -> tuple[float, float, float]:
 
 def _fmt_stats(values: list[float]) -> str:
     if len(values) == 1:
-        return f"{values[0]:9.2f} fps  [n=1 (--repeat 1 has no spread)]"
+        return f"{values[0]:9.2f} fps"
     median, lo, hi = _stats(values)
     spread = 100.0 * (hi - lo) / median if median else 0.0
     return f"{median:9.2f} fps  [min {lo:8.2f} max {hi:8.2f} spread {spread:4.1f}%] n={len(values)}"
@@ -1126,6 +1136,79 @@ def _fmt_stats(values: list[float]) -> str:
 def args_desc(spec: FilterSpec, ns: argparse.Namespace) -> str:
     pairs = [f"{a.key}={getattr(ns, a.dest)}" for a in spec.args]
     return ", ".join(pairs)
+
+
+def _split_arg_pairs(raw: str, flag: str) -> list[str]:
+    """Split a ``--<filter>-args`` string on top-level commas.
+
+    Commas inside ``[...]`` do not split, so a list param is written
+    ``planes=[0,1]``. Unbalanced brackets are a hard error, never a silent
+    truncation.
+    """
+    parts: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    for ch in raw:
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth < 0:
+                sys.exit(f"{flag}: unbalanced ']' in {raw!r}")
+        if ch == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if depth != 0:
+        sys.exit(f"{flag}: unbalanced '[' in {raw!r}")
+    return [p.strip() for p in parts + ["".join(cur)] if p.strip()]
+
+
+def _convert_arg_value(flag: str, arg: Arg, value: str) -> Any:
+    """Convert one raw ``key=value`` string to the param's declared type."""
+    if value == "None":
+        return None
+    if arg.type is str:
+        # The list syntax planes=[0,1]: the build wraps the inner text in
+        # [...] itself, so the brackets come off here.
+        if value.startswith("[") and value.endswith("]"):
+            return value[1:-1].strip()
+        return value
+    try:
+        return arg.type(value)
+    except (ValueError, argparse.ArgumentTypeError) as exc:
+        sys.exit(f"{flag}: {arg.key}={value!r}: {exc}")
+
+
+def _parse_filter_args(ns: argparse.Namespace, fname: str, spec: FilterSpec, raw: str) -> None:
+    """Apply a ``--<filter>-args`` string onto the namespace (loud on misuse).
+
+    Unknown keys, missing ``=`` and unconvertible values all abort: silently
+    benchmarking defaults after a typo is the failure this replaces.
+    """
+    flag = f"--{fname}-args"
+    by_key = {a.key: a for a in spec.args}
+    for pair in _split_arg_pairs(raw, flag):
+        if "=" not in pair:
+            sys.exit(f"{flag}: {pair!r} is not key=value")
+        key, value = (s.strip() for s in pair.split("=", 1))
+        if key not in by_key:
+            sys.exit(f"{flag}: unknown param {key!r} (keys: {', '.join(by_key)})")
+        setattr(ns, by_key[key].dest, _convert_arg_value(flag, by_key[key], value))
+
+
+def _apply_filter_args(ns: argparse.Namespace, fname: str, spec: FilterSpec) -> None:
+    """Establish a filter's param defaults, then overlay its ``--args`` string.
+
+    Defaults are (re-)established on every call so shared dests (the eedi3
+    family) never leak one filter's overrides into the next run.
+    """
+    for a in spec.args:
+        setattr(ns, a.dest, a.default)
+    raw = getattr(ns, f"{fname}_args", None)
+    if raw:
+        _parse_filter_args(ns, fname, spec, raw)
 
 
 def _format_for_bits(fmt: str, bits: int) -> str:
@@ -1166,8 +1249,8 @@ def _cache_desc(
     if cache_frames is None:
         return "cache: N/A"
     if spec.aa:
-        return f"cache: 2x luma+mclip{ns.aa_cache_mb} MiB byte budget"
-    return f"cache: first {cache_frames} frames"
+        return f"cache: {ns.aa_cache_mb} MiB"
+    return f"cache: {cache_frames} frames"
 
 
 def _mode_desc(ns: argparse.Namespace) -> str:
@@ -1231,26 +1314,28 @@ def _run_once(
     )
 
 
-def _resolve_pair(
-    ns: argparse.Namespace, calls: dict[str, str], plugins: list[str], title: str
-) -> list[str]:
-    """``--pair``: keep only the vsfeel arm and one reference."""
-    if ns.pair is None:
-        return plugins
-    if "vsfeel" not in calls:
-        sys.exit(f"--pair: {title} has no vsfeel arm")
-    if ns.pair == "auto":
-        ref = next((p for p in plugins if p != "vsfeel"), None)
-        if ref is None:
-            sys.exit(f"--pair: no reference plugin available for {title}")
-    else:
-        ref = ns.pair
-    if ref not in calls:
-        sys.exit(f"--pair: {ref!r} does not provide {title}")
-    return ["vsfeel", ref]
+@dataclass
+class FilterPlan:
+    """Everything bench_filter computes before its timing loop (shared with A/B)."""
+
+    input_expr: str
+    frames: int
+    synth: str | None
+    cache_frames: int | None
+    cache_conv: str | None
+    clip_desc: str
+    bits_desc: str
+    calls: dict[str, str]
+    gpu_arms: list[str]
+    download_arms: list[str]
+    plugins: list[str]
 
 
-def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
+def _prepare_filter(
+    fname: str, ns: argparse.Namespace, requested: list[str] | None = None
+) -> FilterPlan:
+    spec = FILTERS[fname]
+    _apply_filter_args(ns, fname, spec)
     # --bits overrides the filter's input expression (depth(X,16) -> depth(X,32))
     # for BOTH the chain and the cached frames: the chain must consume the same
     # format the cache holds, or the timed region re-converts behind the filter
@@ -1303,56 +1388,306 @@ def bench_filter(spec: FilterSpec, ns: argparse.Namespace) -> None:
             )
             for p in calls:
                 calls[p] = gpu_calls[p] if p in spec.gpu_plugins else dl_calls[p]
-    plugins = resolve_plugins(ns.plugins or list(calls), calls, spec.title)
-    plugins = _resolve_pair(ns, calls, plugins, spec.title)
+    if requested is None:
+        requested = ns.plugins or list(calls)
+    plugins = resolve_plugins(requested, calls, spec.title)
     if not plugins:
-        sys.exit(f"no valid plugins requested for --filter {ns.filter}")
-    print(f"{spec.title} benchmark | {frames} frames | clip: {clip_desc}{bits_desc}")
+        sys.exit(f"no valid plugins requested for --filter {fname}")
+    return FilterPlan(
+        input_expr=input_expr,
+        frames=frames,
+        synth=synth,
+        cache_frames=cache_frames,
+        cache_conv=cache_conv,
+        clip_desc=clip_desc,
+        bits_desc=bits_desc,
+        calls=calls,
+        gpu_arms=gpu_arms,
+        download_arms=download_arms,
+        plugins=plugins,
+    )
+
+
+def _run_plan_once(
+    spec: FilterSpec, ns: argparse.Namespace, plan: FilterPlan, plugin: str
+) -> float | None:
+    """One timed vspipe run of one plugin (the repeat/interleave unit)."""
+    return _run_once(
+        spec,
+        ns,
+        plugin,
+        plan.calls[plugin],
+        plan.frames,
+        plan.synth,
+        plan.cache_frames,
+        plan.cache_conv,
+        gpu_cache=plugin in plan.gpu_arms,
+        download_inputs=plugin in plan.download_arms,
+    )
+
+
+def bench_filter(fname: str, ns: argparse.Namespace) -> None:
+    spec = FILTERS[fname]
+    plan = _prepare_filter(fname, ns)
+    print(f"{spec.title} benchmark | {plan.frames} frames | clip: {plan.clip_desc}{plan.bits_desc}")
     print(f"args: {args_desc(spec, ns)}")
     print(
-        f"{_cache_desc(spec, ns, synth, cache_frames)}{_mode_desc(ns)} | "
+        f"{_cache_desc(spec, ns, plan.synth, plan.cache_frames)}{_mode_desc(ns)} | "
         f"repeat: {ns.repeat} | timeout: {ns.timeout:g}s\n"
     )
 
-    runs: dict[str, list[float]] = {p: [] for p in plugins}
+    runs: dict[str, list[float]] = {p: [] for p in plan.plugins}
     for r in range(ns.repeat):
         # Alternate the plugin order between repeats so clock/thermal drift
         # is shared between the arms instead of favouring the first one.
         reverse = ns.interleave and r % 2 == 1
-        for plugin in list(reversed(plugins)) if reverse else plugins:
-            fps = _run_once(
-                spec,
-                ns,
-                plugin,
-                calls[plugin],
-                frames,
-                synth,
-                cache_frames,
-                cache_conv,
-                gpu_cache=plugin in gpu_arms,
-                download_inputs=plugin in download_arms,
-            )
+        order = list(reversed(plan.plugins)) if reverse else plan.plugins
+        for plugin in order:
+            fps = _run_plan_once(spec, ns, plan, plugin)
             if fps is not None:
                 runs[plugin].append(fps)
-    for plugin in plugins:
+    for plugin in plan.plugins:
         if runs[plugin]:
             print(f"  {plugin:10s}  {_fmt_stats(runs[plugin])}")
         else:
             print(f"  {plugin:10s}  unavailable / failed")
     print()
 
-    if ns.pair and len(plugins) == 2 and runs[plugins[0]] and runs[plugins[1]]:
-        a, b = plugins
-        ma, mb = statistics.median(runs[a]), statistics.median(runs[b])
-        print(f"  pair: {a} {ma:9.2f} fps vs {b} {mb:9.2f} fps -> {ma / mb:.3f}x\n")
-
     valid = sorted(
         ((p, statistics.median(v)) for p, v in runs.items() if v), key=lambda x: x[1], reverse=True
     )
     if len(valid) > 1:
+        # The grading question is vsfeel against the fastest reference, so the
+        # ratio lives on vsfeel's own line, direction named (1.530x ahead reads
+        # the same way as 0.920x behind). Without vsfeel in the run there is
+        # nothing to grade: fall back to ratios against the fastest.
+        if "vsfeel" in dict(valid):
+            ref, rfps = next((p, f) for p, f in valid if p != "vsfeel")
+            targets = {"vsfeel": (rfps, ref)}
+        else:
+            fastest, best = valid[0]
+            targets = {p: (best, fastest) for p, _ in valid if p != fastest}
         for rank, (plugin, fps) in enumerate(valid, 1):
-            print(f"  {rank}. {plugin:10s} {fps:9.2f} fps")
+            ratio = ""
+            if plugin in targets:
+                base, base_name = targets[plugin]
+                ratio = f"  ({fps / base:.3f}x vs {base_name})"
+            print(f"  {rank}. {plugin:10s} {fps:9.2f} fps{ratio}")
         print()
+
+
+# ---------------------------------------------------------------------------
+# A/B mode: same-session comparison of two builds or two env configs
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AbArm:
+    """One side of an A/B: a display name, an optional .so, env overrides.
+
+    ``env`` maps names to values; a None value unsets the variable (the
+    scratch scripts toggled knobs with export/unset, and presence alone can
+    gate a code path, so empty-string is not the same as unset).
+    """
+
+    name: str
+    so: Path | None
+    env: list[tuple[str, str | None]]
+
+
+_ENV_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _ab_active(ns: argparse.Namespace) -> bool:
+    """Whether any --ab-* flag turns the run into an A/B comparison."""
+    return (
+        ns.ab_so is not None
+        or bool(ns.ab_a_env or ns.ab_b_env)
+        or ns.ab_names is not None
+        or ns.ab_rounds is not None
+        or ns.ab_order is not None
+    )
+
+
+def _ab_rounds(ns: argparse.Namespace) -> int:
+    rounds = 2 if ns.ab_rounds is None else ns.ab_rounds
+    if rounds < 1:
+        sys.exit(f"--ab-rounds must be >= 1, got {ns.ab_rounds}")
+    return rounds
+
+
+def _ab_names(ns: argparse.Namespace) -> tuple[str, str]:
+    if ns.ab_names is None:
+        return ("a", "b")
+    parts = [p.strip() for p in ns.ab_names.split(",")]
+    if len(parts) != 2 or not all(parts) or parts[0] == parts[1]:
+        sys.exit("--ab-names takes two distinct non-empty names: --ab-names new,old")
+    return (parts[0], parts[1])
+
+
+def _parse_ab_env(spec: str, flag: str) -> list[tuple[str, str | None]]:
+    """Parse ``--ab-a-env``/``--ab-b-env``: ``NAME=value`` sets, ``-NAME`` unsets."""
+    parsed: list[tuple[str, str | None]] = []
+    for raw in spec.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        if item.startswith("-"):
+            name = item[1:].strip()
+            value = None
+        elif "=" in item:
+            name, value = (part.strip() for part in item.split("=", 1))
+        else:
+            sys.exit(f"{flag}: {item!r} is neither NAME=value nor -NAME")
+        if not _ENV_RE.fullmatch(name):
+            sys.exit(f"{flag}: invalid variable name {name!r}")
+        parsed.append((name, value))
+    return parsed
+
+
+@contextlib.contextmanager
+def _ab_env(items: list[tuple[str, str | None]]):
+    """Apply an arm's env overrides, restoring the previous environment after."""
+    missing = object()
+    saved = {name: os.environ.get(name, missing) for name, _ in items}
+    try:
+        for name, value in items:
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        yield
+    finally:
+        for name, old in saved.items():
+            if old is missing:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old
+
+
+def _ab_round_order(round_idx: int, order: str) -> list[int]:
+    """Arm indices in measurement order for one (1-based) round.
+
+    Straight alternation starts arm A first on odd rounds; ABBA measures
+    A B B A every round, so a linear clock/thermal drift within the round
+    hits both arms equally.
+    """
+    if order == "abba":
+        return [0, 1, 1, 0]
+    return [0, 1] if round_idx % 2 == 1 else [1, 0]
+
+
+def _install_ab_so(src: Path, dst: Path) -> None:
+    """Copy an arm's .so over the installed plugin, verifying the copy by sha.
+
+    A half-copied binary must abort the run, never benchmark the wrong build.
+    """
+    shutil.copyfile(src, dst)
+    if _sha256(src) != _sha256(dst):
+        sys.exit(f"ab: copy of {src} to {dst} failed verification (sha mismatch)")
+
+
+def bench_filter_ab(fname: str, ns: argparse.Namespace) -> None:
+    """Interleaved A/B of two builds and/or two env configs (replaces ab_*.sh).
+
+    Each round measures arm A then arm B (or the reverse / ABBA), swapping the
+    installed .so and applying the arm's env overrides around every cell, and
+    the original .so is restored afterwards even on failure. All filter flags
+    compose: the cells run the same _run_plan_once path as a normal benchmark.
+    """
+    spec = FILTERS[fname]
+    rounds = _ab_rounds(ns)
+    order = ns.ab_order or "alternate"
+    names = _ab_names(ns)
+    arms = [
+        AbArm(names[0], None, _parse_ab_env(ns.ab_a_env or "", "--ab-a-env")),
+        AbArm(names[1], None, _parse_ab_env(ns.ab_b_env or "", "--ab-b-env")),
+    ]
+    install: Path | None = None
+    if ns.ab_so is not None:
+        arm_sos = [Path(p).expanduser().resolve() for p in ns.ab_so]
+        for p in arm_sos:
+            if not p.is_file():
+                sys.exit(f"--ab-so not found: {p}")
+        install = ns.vsfeel_so or _default_plugin_so()
+        if install is None or not install.exists():
+            sys.exit(f"--ab-so: installed plugin not found: {install}")
+        arms[0].so, arms[1].so = arm_sos
+
+    # Swapping .so files only changes vsfeel: default to it unless the caller
+    # names plugins explicitly (a reference would measure the same binary in
+    # both arms, i.e. pure noise at double the cost).
+    plan = _prepare_filter(spec, ns, requested=ns.plugins or ["vsfeel"])
+    print(f"{spec.title} A/B | {plan.frames} frames | clip: {plan.clip_desc}{plan.bits_desc}")
+    print(f"args: {args_desc(spec, ns)}")
+    print(
+        f"{_cache_desc(spec, ns, plan.synth, plan.cache_frames)}{_mode_desc(ns)} | "
+        f"repeat: {ns.repeat} | rounds: {rounds} | order: {order} | "
+        f"timeout: {ns.timeout:g}s"
+    )
+    for arm in arms:
+        detail = []
+        if arm.so is not None:
+            detail.append(f"so={arm.so} (sha {_sha256(arm.so)[:12]})")
+        if arm.env:
+            detail.append(
+                "env=" + ",".join(f"-{n}" if v is None else f"{n}={v}" for n, v in arm.env)
+            )
+        else:
+            detail.append("env=(inherited)")
+        print(f"  arm {arm.name}: " + ", ".join(detail))
+    print()
+
+    samples: dict[str, dict[str, list[float]]] = {
+        arm.name: {p: [] for p in plan.plugins} for arm in arms
+    }
+    original = install.read_bytes() if install is not None else None
+    installed: Path | None = None
+    try:
+        for r in range(1, rounds + 1):
+            for idx in _ab_round_order(r, order):
+                arm = arms[idx]
+                # install is set whenever any arm has an .so (else --ab-so was
+                # absent and both arms are env-only).
+                if arm.so is not None and install is not None and arm.so != installed:
+                    _install_ab_so(arm.so, install)
+                    installed = arm.so
+                with _ab_env(arm.env):
+                    for plugin in plan.plugins:
+                        cell: list[float] = []
+                        for _ in range(ns.repeat):
+                            fps = _run_plan_once(spec, ns, plan, plugin)
+                            if fps is not None:
+                                cell.append(fps)
+                                samples[arm.name][plugin].append(fps)
+                        tag = f"[ab r={r}/{rounds} {arm.name}]"
+                        if cell:
+                            print(f"  {tag} {plugin:10s}  {_fmt_stats(cell)}")
+                        else:
+                            print(f"  {tag} {plugin:10s}  unavailable / failed")
+    finally:
+        if install is not None and original is not None:
+            install.write_bytes(original)
+            want = hashlib.sha256(original).hexdigest()
+            if _sha256(install) != want:
+                sys.exit(f"ab: failed to restore {install}; reinstall the plugin")
+            print(f"\nab: restored {install} (sha {want[:12]})")
+    print()
+
+    a, b = arms[0].name, arms[1].name
+    for plugin in plan.plugins:
+        va, vb = samples[a][plugin], samples[b][plugin]
+        for arm_name, v in ((a, va), (b, vb)):
+            if v:
+                print(f"  {plugin:10s} {arm_name:10s}  {_fmt_stats(v)}")
+            else:
+                print(f"  {plugin:10s} {arm_name:10s}  unavailable / failed")
+        if va and vb:
+            ma, mb = statistics.median(va), statistics.median(vb)
+            print(
+                f"  ab: {a} {ma:9.2f} fps vs {b} {mb:9.2f} fps "
+                f"-> {b}/{a} {mb / ma:.3f}x ({(mb / ma - 1) * 100:+.2f}%)\n"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1517,14 +1852,46 @@ def parse_args() -> argparse.Namespace:
         help=f"kill a vspipe run after this many seconds (default: {DEFAULT_TIMEOUT:g})",
     )
     parser.add_argument(
-        "--pair",
-        nargs="?",
-        const="auto",
+        "--ab-so",
+        nargs=2,
+        metavar=("A", "B"),
+        type=Path,
         default=None,
-        metavar="PLUGIN",
-        help="same-session pairing: run only vsfeel and one "
-        "reference (default: the first requested reference) "
-        "back-to-back and print the fps ratio",
+        help="A/B the two plugin binaries: install A then B into the plugin "
+        "directory between runs (each copy verified by sha, the original "
+        "restored afterwards), interleaving the arms",
+    )
+    parser.add_argument(
+        "--ab-a-env",
+        default=None,
+        metavar="SPEC",
+        help="comma-separated env overrides for arm A (NAME=value sets, "
+        "-NAME unsets; empty/missing means inherit)",
+    )
+    parser.add_argument(
+        "--ab-b-env",
+        default=None,
+        metavar="SPEC",
+        help="comma-separated env overrides for arm B (same syntax as --ab-a-env)",
+    )
+    parser.add_argument(
+        "--ab-names",
+        default=None,
+        metavar="A,B",
+        help="display names for the two arms (default: a,b)",
+    )
+    parser.add_argument(
+        "--ab-rounds",
+        type=int,
+        default=None,
+        help="outer A/B rounds; each round measures every arm with --repeat runs (default: 2)",
+    )
+    parser.add_argument(
+        "--ab-order",
+        choices=("alternate", "abba"),
+        default=None,
+        help="arm order: alternate the first arm each round, or ABBA every "
+        "round so a linear drift hits both arms equally (default: alternate)",
     )
     parser.add_argument(
         "--aa-cache-mb",
@@ -1553,17 +1920,18 @@ def parse_args() -> argparse.Namespace:
         help="path to build/libvsfeel.so (default: build/<installed name>)",
     )
 
-    # Filters may share CLI flags (eedi3 and eedi3aa expose the same EEDI3
-    # surface); register each flag once.
-    seen_flags: set[str] = set()
-    for spec in FILTERS.values():
-        for arg in spec.args:
-            if arg.flag in seen_flags:
-                continue
-            seen_flags.add(arg.flag)
-            parser.add_argument(
-                arg.flag, dest=arg.dest, type=arg.type, default=arg.default, help=arg.help
-            )
+    # One key=value string per filter (eedi3/eedi3h/eedi3aa share a surface but
+    # keep their own flag: each run applies only its own filter's string).
+    for fname, spec in FILTERS.items():
+        defaults = ", ".join(f"{a.key}={a.default}" for a in spec.args)
+        parser.add_argument(
+            f"--{fname}-args",
+            dest=f"{fname}_args",
+            default=None,
+            metavar="K=V,...",
+            help=f"{spec.title} params as key=value,... (keys: "
+            f"{', '.join(a.key for a in spec.args)}; defaults: {defaults})",
+        )
 
     return parser.parse_args()
 
@@ -1590,9 +1958,16 @@ def main() -> None:
     print(f"vspipe: {vspipe_binary()}", file=sys.stderr)
     if ns.check_fresh:
         check_fresh(ns.vsfeel_so or _default_plugin_so(), ns.build_so)
+    ab = _ab_active(ns)
     filters = list(FILTERS) if ns.filter == "all" else [ns.filter]
+    for fname in FILTERS:
+        if getattr(ns, f"{fname}_args", None) and fname not in filters:
+            sys.exit(f"--{fname}-args given but --filter {ns.filter} does not run {fname}")
     for fname in filters:
-        bench_filter(FILTERS[fname], ns)
+        if ab:
+            bench_filter_ab(fname, ns)
+        else:
+            bench_filter(fname, ns)
 
 
 if __name__ == "__main__":

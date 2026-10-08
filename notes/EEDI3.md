@@ -26,7 +26,7 @@ An order-reversed same-session pair against the pre-optimization build measures
 u16 470.4 → 469.6 fps (+0.0%): the vertical path is transfer bound, so its kernel
 work does not show up here.
 
-The hp row is a 600 f same-session pair of the same workload (`--eedi3-hp 1`);
+The hp row is a 600 f same-session pair of the same workload (`--eedi3-args "hp=1"`);
 there hp costs vsfeel **2.3x** (451 → 198 fps against eedi3vk2's 141 → 80 and
 vszipcl's 62 → 48) because the direction set doubles (TPITCH 41 → 81, K 2 → 3),
 the relax widens to ±2 and the `pbt` column grows 16 → 81 bytes (320 MiB at
@@ -58,7 +58,7 @@ the relax widens to ±2 and the `pbt` column grows 16 → 81 bytes (320 MiB at
 
 Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter eedi3 vsfeel
 vszipcl` (and `--filter eedi3aa`, `--filter eedi3h` where registered;
-`--eedi3-hp 1` for the half-pel search).
+`--eedi3-args "hp=1"` for the half-pel search).
 
 Two GPU passes per plane: `ENTRY_PAD` expands eedi3m's mirrors in VRAM from the
 tight kept-row upload; `ENTRY_ROW` does the DP + backtrack; `ENTRY_VCHECK`

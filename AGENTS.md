@@ -179,6 +179,18 @@ This prints fps for each plugin and ranks them. Compare vsfeel's fps against
 the fastest reference. Judge optimizations on multiple runs over hundreds of
 frames.
 
+To compare two vsfeel builds or two env configs against each other, use the
+benchmark's A/B mode instead of writing a scratch script:
+
+```bash
+uv run tools/benchmark.py --filter bm3dv2 --ab-so build/libvsfeel.so old/libvsfeel.so --ab-names new,old
+uv run tools/benchmark.py --filter bm3dv2 --ab-b-env VSFEEL_BM3D_DERIVE=1 --ab-names legacy,derived
+```
+
+Each round measures both arms interleaved (alternating order, or ABBA with
+`--ab-order abba`); `.so` copies are sha-verified and the original installed
+binary is restored afterwards. Without explicit plugins only vsfeel runs.
+
 Two-tier measurement keeps the iteration loop tight: screen candidates with a
 fast custom `.vpy` + `vspipe`, and grade only on full `benchmark.py` same-session
 pairs over 1000+ frames, as medians rather than single short bursts. The

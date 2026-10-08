@@ -18,7 +18,8 @@ The order to work in; the two sections below are the detail behind it.
    an ablation ladder (remove-all / remove-half) to find which side is actually
    the limiter. Do not assume it is the kernels.
 5. Optimize / port, keeping each candidate behind an env opt-out so it can be
-   A/B'd in situ; rebuild, install and re-measure after each candidate.
+   A/B'd in situ (`--ab-b-env VAR=1` for knobs, `--ab-so new.so old.so` for
+   binaries); rebuild, install and re-measure after each candidate.
 6. Re-benchmark and re-test; keep going until vsfeel is faster than the
    references while still passing all tests.
 

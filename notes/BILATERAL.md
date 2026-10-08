@@ -114,8 +114,8 @@ pre-R80/R80 pairs through `tools/benchmark.py`, `--repeat 2`:
   old filter had to `GPUDownload` it first, the new one reads VRAM in place.
 
 Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter bilateral
-[vsfeel vszipcl] [--gpu-cache] [--bits 32] [--bilateral-sigma-spatial X
---bilateral-sigma-color Y]`.
+[vsfeel vszipcl] [--gpu-cache] [--bits 32] [--bilateral-args "sigma_spatial=X,
+sigma_color=Y"]`.
 
 ## Historical
 

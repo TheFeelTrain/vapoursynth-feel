@@ -46,7 +46,7 @@ medians:
   record 10.0 / submit 84.5 / total 115.8 µs per frame — nowhere near the
   425 µs frame.
 - Bench: `MANGOHUD=0 uv run tools/benchmark.py --filter gaussblur
-  [--gauss-sigma X] [--gpu-cache] [--frames N] vsfeel vszipcl vszipcu`.
+  [--gaussblur-args "sigma=X"] [--gpu-cache] [--frames N] vsfeel vszipcl vszipcu`.
 
 ## Implementation
 
