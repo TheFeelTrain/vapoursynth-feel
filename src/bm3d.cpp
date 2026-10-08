@@ -454,9 +454,11 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
                std::to_string(gpu.subgroup_size) + " and cannot be changed"s;
     }
     // LDS: s_x/s_y/s0_x/s0_y hold the prediction seeds of each 8-lane group
-    // (four arrays of 8 entries per group). The per-lane candidate lists live in
-    // registers now, so nothing else is shared.
-    const GpuWorkgroup workgroup { .x = 32, .shared_bytes = 4 * 8 * 4 * 4 };
+    // (four arrays of 8 entries per group), plus one reference patch per group
+    // (4 x 65 floats; the odd stride keeps the four groups in different banks).
+    // The per-lane candidate lists live in registers, so nothing else is shared.
+    const GpuWorkgroup workgroup { .x = 32,
+                                   .shared_bytes = 4 * 8 * 4 * 4 + 4 * 65 * 4 };
     return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(),
                                &spec, static_cast<uint32_t>(entries.size()),
                                sizeof(spec), "bm3d", subgroup_size, workgroup);

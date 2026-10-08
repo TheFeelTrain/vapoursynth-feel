@@ -189,6 +189,9 @@ shared int s_y[4][8];
 // same list.
 shared int s0_x[4][8];
 shared int s0_y[4][8];
+// One reference patch per group: it depends on the group's block origin and not
+// on `sl`, so the eight lanes of a group share it. See the load in main().
+shared float cur_s[4][65];
 
 
 void dct_fwd(inout float v[8]) {
@@ -564,14 +567,14 @@ float reduce_group8(float x) {
         float a3 = 0.0f;                                                   \
         for (int i = 0; i < 8; ++i) {                                      \
             const int row = (BASE) + (CY + i) * STRIDE + (CX);             \
-            const float d0 = cur[0 * 8 + i] - src[row + 0];                \
-            const float d1 = cur[1 * 8 + i] - src[row + 1];                \
-            const float d2 = cur[2 * 8 + i] - src[row + 2];                \
-            const float d3 = cur[3 * 8 + i] - src[row + 3];                \
-            const float d4 = cur[4 * 8 + i] - src[row + 4];                \
-            const float d5 = cur[5 * 8 + i] - src[row + 5];                \
-            const float d6 = cur[6 * 8 + i] - src[row + 6];                \
-            const float d7 = cur[7 * 8 + i] - src[row + 7];                \
+            const float d0 = cur_s[group][0 * 8 + i] - src[row + 0];       \
+            const float d1 = cur_s[group][1 * 8 + i] - src[row + 1];       \
+            const float d2 = cur_s[group][2 * 8 + i] - src[row + 2];       \
+            const float d3 = cur_s[group][3 * 8 + i] - src[row + 3];       \
+            const float d4 = cur_s[group][4 * 8 + i] - src[row + 4];       \
+            const float d5 = cur_s[group][5 * 8 + i] - src[row + 5];       \
+            const float d6 = cur_s[group][6 * 8 + i] - src[row + 6];       \
+            const float d7 = cur_s[group][7 * 8 + i] - src[row + 7];       \
             a0 = a0 + d0 * d0;                                             \
             a1 = a1 + d1 * d1;                                             \
             a2 = a2 + d2 * d2;                                             \
@@ -891,12 +894,15 @@ void main() {
     y = min(y, HEIGHT - 8);
 
     const int anchor_pc = src_search(KRADIUS, 0);
-    float cur[64];
-    for (int c = 0; c < 8; ++c) {
-        for (int i = 0; i < 8; ++i) {
-            cur[c * 8 + i] = src[anchor_pc + (y + i) * STRIDE + (x + c)];
-        }
+    // The reference patch depends on the group's block origin, not on `sl`, so
+    // all eight lanes of a group share one copy. In shared memory it costs 65
+    // floats per group instead of 64 registers per lane; the stride is 65 so
+    // the four groups' reads land in different banks.
+    for (int k = sl; k < 64; k += 8) {
+        cur_s[group][k] =
+            src[anchor_pc + (y + (k & 7)) * STRIDE + (x + (k >> 3))];
     }
+    barrier();
     // The reference block is the group's first member and is never matched
     // again: the current-frame scan excludes it by origin. A zero threshold
     // stops the search here, which is the CPU's `thMSE <= 0` reference-only
