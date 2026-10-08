@@ -298,16 +298,14 @@ under-reported every stage 10x).
   width-independent form (previous row in registers via subgroup shuffles, or a
   tiled LDS window) — pure constant-factor, identical output, safe to land. Even
   a 2x vcheck is ~1.2x end-to-end; 1.5x needs it *plus* the row kernel.
-- **Row kernel / `pbt`**: both named levers are measured dead (above). The row
-  kernel is 39% of the graded frame, and its own attribution (`notes/EEDI3.md`,
-  Performance) leaves exactly one large item: the ring shift register (PROBE=15,
-  12.0% of the kernel). Reaching it needs the column loop unrolled by RN with a
-  compile-time ring base, which is a hand unroll and a rotation of the `roll_seed`
-  write indices.
-- **Batch knee, re-measured under the harness's RADV env** (the transfer queue is
-  what sets it): EEDI3AA 2x2160p B=3 189 / **B=4 198** / B=5 197 / B=6 175 fps.
-  The auto rule's 512 MiB scratch target landed on 3, so it is 768 MiB now and the
-  budget cap is `budget/12`; both are tuned constants, not invariants.
+- Row kernel is 39% of the graded frame; its one large item (ring shift
+  register) is tracked in `notes/EEDI3.md`.
+
+### Do not retry
+
+- **Row-kernel / `pbt` levers on the AA workload** (SGSIZE 64 / K=1, `pbt`
+  packing): measured dead. Attribution and the live item are in
+  `notes/EEDI3.md` (Performance / Open work).
 
 ## Debug env vars
 

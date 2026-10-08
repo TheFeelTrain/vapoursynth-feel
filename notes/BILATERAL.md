@@ -116,6 +116,9 @@ pre-R80/R80 pairs through `tools/benchmark.py`, `--repeat 2`:
 Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter bilateral
 [vsfeel vszipcl] [--gpu-cache] [--bits 32] [--bilateral-args "sigma_spatial=X,
 sigma_color=Y"]`.
+- Judge throughput on a GPU-resident chain (`--gpu-cache`): transfers overlapped,
+  the frame is the kernel (84% at R=9), so a CPU-sink number prices the chain,
+  not the filter.
 
 ## Historical
 
@@ -231,25 +234,20 @@ SDMA and the port reaches parity without any core change.
 
 ## Open work
 
-- **Nothing is open on the transfer path.** The pre-port gap was the missing
-  `RADV_EXPERIMENTAL=transfer_queue` opt-in, not a core or filter defect, and it
-  is closed. Measure a GPU-resident chain (`--gpu-cache`) before concluding
-  anything about the filter's own throughput.
 - The only remaining lever is the kernel itself: at R=9 it is 84% of the frame
   and is ALU/`exp2`-bound, and the block-shape, wave32, unroll and vec4 sweeps
   below already came back empty — a kernel project, not a scheduling one.
-- **EEDI3-style batching is a measured dead end here; do not implement it.**
-  EEDI3 batched because one row dispatch (1080 small workgroups of a
-  latency-bound scan) left the GPU under-occupied. Bilateral's R=9 dispatch is
-  60×135 = 8100 workgroups of 256 threads and the GPU is already **93–97% busy
-  with a single node** (BlankClip GRAY16 1080p, polled `gpu_busy_percent`), so
-  there is no idle to fill: chaining k nodes scales the frame linearly
-  (0.606 / 1.031 / 1.906 ms for k=1/2/4) and the filter's whole host side is
-  23 µs/frame.
+
+### Do not retry
+
+- **EEDI3-style batching.** EEDI3 batched because one small latency-bound
+  dispatch left the GPU under-occupied; Bilateral's R=9 dispatch is 60×135 =
+  8100 workgroups of 256 threads at 93–97% busy with a single node, so there
+  is no idle to fill (chained nodes scale linearly).
 - Do not re-introduce a host transfer path to "win back" the CPU sink: the old
   one is exactly what the port deleted, and it lost the resident-chain case.
-- Do not retry the LDS/register tradeoffs or the second-compute-queue attempt
-  listed under Historical.
+- The LDS/register tradeoffs and the second-compute-queue attempt under
+  Historical.
 
 ## Debug env vars
 

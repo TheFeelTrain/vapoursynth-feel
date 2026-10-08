@@ -169,13 +169,13 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
   the port did not touch the kernels or their `16x8` launch, so it still
   applies (sweep block candidates × configs per `notes/METHOD.md`).
 - If a kernel-vs-copy split is ever needed again, build the warm
-  in-command-buffer timestamp probe in the dfttest/nlmeans form;
-  `VSFEEL_GAUSS_GPU_BENCH` (it idled the device from a frame callback without
+  in-command-buffer timestamp probe in the dfttest/nlmeans form.
+
+### Do not retry
+
+- `VSFEEL_GAUSS_GPU_BENCH` (it idled the device from a frame callback without
   the other streams' queue locks) was deleted — do not resurrect it.
-- The remaining CPU-sink gap to vszipcu is transfer arrangement plus its HIP
-  kernels: kernel-direct download cannot exist under the API (the output plane
-  is core-owned VRAM), so judge the filter on `--gpu-cache` too, where it is
-  #1. Do not re-introduce a host transfer path to win the CPU-sink row — that
+- Do not re-introduce a host transfer path to win the CPU-sink row — that
   is exactly what the port deletes, and it is what loses the resident chain
   (pre-R80: 1408 resident fps vs 2239).
 

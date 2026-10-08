@@ -191,6 +191,9 @@ So it is **ALU-issue bound (~1 IPC), not load bound**: f32 io, which drops every
 u16→f32 convert but doubles the pad bytes, makes it 27% *slower*. The ring shift
 register is the largest addressable item; the three-window redundancy is worth
 8.2% but needs a 2|u|-deep delay line (~90 registers).
+- `eedi3h_vszipcl_loose` is a family-gap sanity bound, not a tolerance: 0.06 /
+  16384 on this clip (3.9-4.0% differ, p99.9 ≤ 294 LSB). Only gross errors
+  (wrong axis, broken composition) blow the fraction toward ~1.0.
 
 ## Historical
 
@@ -549,10 +552,6 @@ passes). All bit-identical to the previous build unless stated.
 
 ## Open work
 
-- **`eedi3h_vszipcl_loose` is a family-gap sanity bound, not a tolerance**: 0.06 /
-  16384 on this clip (3.9-4.0% of pixels differ, p99.9 ≤ 294 LSB, max 4297). Only
-  gross errors (wrong axis, broken composition) blow the fraction up to ~1.0.
-
 - **Row kernel register pressure**: `RING_CAP` is not it. Trimming the fixed
   bound to `2*NRAD+1` leaves the compiled row kernel **byte-identical** at
   nrad=1/2/3 (VGPR 96/96/120, 16/16/12 subgroups/SIMD, no spills): the
@@ -561,7 +560,6 @@ passes). All bit-identical to the previous build unless stated.
   the lever is the `K=2` direction state. (Spec constants *can* size arrays here —
   `notes/NLMEANS.md` ships it.) ACO raises VGPRs for load ILP deliberately: a
   lower count with new spills or schedule damage is a regression.
-- **SGSIZE 64 / K=1** — +2% on EEDI3AA only; not shipped (round 29).
 - **hp's row cost**: three structural items ride on the doubled window work —
   the pbt column is 81 bytes at full TPITCH (hp's ±2 deltas would fit 3 bits),
   K = 3 keeps 69 ring registers live per lane, and hpfill is its own phase.
@@ -589,15 +587,14 @@ passes). All bit-identical to the previous build unless stated.
   the case where the two planes differ. Measured cost of the whole sclip leg
   (`vcheck=0`, which also drops the vcheck kernel): 469 → 545 fps, so the ceiling is
   ~16% and the fallback path is what makes it expensive.
-- **Accuracy-for-speed items are void on mechanism**: fp16 pad/cost storage has no
-  traffic to remove (pad is native u16, DP costs live in registers) and adaptive
-  `nrad`/`mdis` trades accuracy for ~0. Any accuracy relaxation still requires
-  measuring the drift on the noise clip and updating `tests/test_eedi3.py` in the
-  same change.
 
 ### Do not retry
 
 *(stale)*: verdict from the degenerate pre-round-14 config; mechanism kept.
+
+- **SGSIZE 64 / K=1.** +2% on EEDI3AA only, neutral on EEDI3; not shipped (a
+  second row module plus device-limit handling for ~2% on one workload), and
+  the kernel is issue-bound anyway (round 29).
 
 - **Breaking the walk's serial load chain** by lookahead, ±1 candidate windows, or a
   layout making the address f-independent: 453.9 / 451.4 / 457.0 fps — identical —
@@ -670,6 +667,10 @@ passes). All bit-identical to the previous build unless stated.
 - **A skip justified by what a region *reads* must also be checked for what it
   *writes*** (the structured-mclip bug). Regression test
   `test_eedi3_mclip_long_mask_off_prefix`, mutation-verified.
+- **An accuracy relaxation still needs a noise-clip drift measurement and a
+  `tests/test_eedi3.py` update in the same change.** fp16 pad/cost storage and
+  adaptive `nrad`/`mdis` are void on mechanism (no removable traffic, ~0 gain
+  for accuracy).
 
 ## Debug env vars
 

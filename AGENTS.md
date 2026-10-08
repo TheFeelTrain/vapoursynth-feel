@@ -28,6 +28,14 @@ implementations (e.g. `vapoursynth-zipcl`, `vapoursynth-zipcu`,
   within a ulp / small tolerance of float rounding differences between
   backends).
 
+The R80 GPU API the plugin builds on is documented in the same checkout
+(`reference/vapoursynth`, also read-only): the contract is
+`include/VSVulkan4.h` with prose in `doc/gpufilters.rst` and
+`doc/api/vsvulkan4.h.rst`, and the core's side (device creation, exec pool
+protocol, allocator) is `src/core/vsvulkan.cpp`,
+`src/core/vsvulkanexec_protocol.md` and the neighbouring `vsvulkan*.{h,cpp}`.
+Read the header first; the `.cpp` settles what the core actually enables.
+
 ## The goal
 
 Make every vsfeel filter **faster than the reference implementations**. 
@@ -39,9 +47,58 @@ filter wholesale if it makes it meaningfully faster, as long as it stays
 correct and passes all tests.
 
 When tuning, use the benchmark (below) to measure before/after, and treat the
-GPUs documented here as the target. `MANGOHUD=0` should be set for every
-benchmark run. It does not change results, it just suppresses extra messages
-in the output.
+GPUs documented here as the target.
+
+## Porting and tuning method
+
+`notes/METHOD.md` holds the cross-cutting method, and is binding. Start at its
+`## Typical workflow`; the rest is the detail: comparing a vsfeel kernel against
+the reference kernels (profiling, ACO ISA and instruction-count diffs,
+specialization constants) and the porting discipline (MVP first, bit-exact
+oracles, ablation ladders, benchmark hygiene, keeping `notes/<filter>.md`
+current).
+
+## Shared plumbing (src/vsfeel.h)
+
+All filters share an inline (zero-overhead, C++20) plumbing layer in
+`src/vsfeel.h`. New filters must build on it — do not re-invent this wheel:
+
+- **Record through the exec pool**: one command buffer per output frame from
+  `gpuExecAcquire` / `gpuExecCommandBuffer`, declare inputs with
+  `gpuExecReadsFrame` and outputs with `gpuExecWritesPlane`, then
+  `gpuExecSubmit`; `gpuExecAbandon` on every error path before submit. The pool
+  owns the ring, the timeline and the scratch lifetime and turns producer pairs
+  into device-side waits, so the host never waits per frame. Copy the pattern
+  from gaussblur/bilateral/nnedi3 (stateless) or bm3d/dfttest (cached/temporal).
+- **Cross-frame caches stay possible without owning a submission**: the slot's
+  ready flag is *submitted*, not a timeline value, and a full
+  `vkCmdPipelineBarrier` at the start of the reader's first command buffer
+  supplies the dependency. Never signal or hand-roll the pool's timeline; the
+  worked mechanism is `src/bm3d.cpp`'s cross-frame ordering comment.
+- **Debug flags** go through `vsfeel_debug_flag` / `vsfeel_debug_trace` /
+  `vsfeel_debug_probe`, never `env_flag` directly, with one env name per filter.
+  The levels, what each helper prints and what `VSFEEL_DEBUG=1|2` turns on are in
+  the `Debug switches` block of `src/vsfeel.h`; a level-2 run is instrumented, so
+  never benchmark it.
+- **Gate a GPU-timing probe on `GPUDevice::timestamp_valid_bits`** (via
+  `vsfeel_probe_timestamps`): a timestamp write on a queue family reporting 0 is
+  invalid usage, and a driver that takes one anyway can hang the engine (a
+  machine-wide freeze, not a lost device). Gate the *flag*, not only the pool.
+- **Errors and the frame trail**: every `set_error` lambda calls
+  `vsfeel_trace_error(filter, frame, message, d->gpu.get())` first (a null device
+  is fine), and the frame path opens with `vsfeel_trace_frame_begin()` plus a
+  `vsfeel_trace_mark(stage)` before each step, so the first error names the step
+  that failed. Reporting through `vsapi->mapSetError` directly bypasses both.
+
+**ODR rule (learned the hard way):** a filter-local struct used to instantiate
+a shared template needs a **unique name per filter** (`Bm3dStream`, never
+`VK_Resource`): the same mangled name with a different `sizeof` across TUs lets
+the linker COMDAT-fold one instantiation over the others and corrupt in-flight
+resources. It stands for any shared template a filter instantiates.
+
+**What stays per-filter:** frame caches (DFTTEST slots, NLMeans tiles, BM3D
+estimate/source rings), shaders + launch config, sync choreography and cache
+sizing. Never a command pool, timeline or fence of your own.
 
 ## Comments and docstrings
 
@@ -162,6 +219,8 @@ runs it. Plugins are described separately in `PLUGINS`.
     vspipe's implicit output download out of the fps. Both together time a GPU
     filter's own compute; `notes/METHOD.md` has what the mode's residual costs.
 - The default clip is `/home/encode/test/jpbd.mkv` (1920x1080, YUV420P8).
+- Set `MANGOHUD=0` for every benchmark run. It does not change results, it just
+  suppresses extra messages in the output.
 - By default the run **caches real frames in RAM**: the first `--cache-frames`
   (default 1000) frames are decoded while vspipe evaluates the script, and its
   fps figure only covers the output loop, so timing measures filter throughput
@@ -184,7 +243,7 @@ benchmark's A/B mode instead of writing a scratch script:
 
 ```bash
 uv run tools/benchmark.py --filter bm3dv2 --ab-so build/libvsfeel.so old/libvsfeel.so --ab-names new,old
-uv run tools/benchmark.py --filter bm3dv2 --ab-b-env VSFEEL_BM3D_DERIVE=1 --ab-names legacy,derived
+uv run tools/benchmark.py --filter bm3dv2 --ab-b-env VSFEEL_BM3D_SPLIT=0 --ab-names single,split
 ```
 
 Each round measures both arms interleaved (alternating order, or ABBA with
@@ -195,57 +254,6 @@ Two-tier measurement keeps the iteration loop tight: screen candidates with a
 fast custom `.vpy` + `vspipe`, and grade only on full `benchmark.py` same-session
 pairs over 1000+ frames, as medians rather than single short bursts. The
 measurement rules behind that are in `notes/METHOD.md`.
-
-## Porting and tuning method
-
-`notes/METHOD.md` holds the cross-cutting method, and is binding. Start at its
-`## Typical workflow`; the rest is the detail: comparing a vsfeel kernel against
-the reference kernels (profiling, ACO ISA and instruction-count diffs,
-specialization constants) and the porting discipline (MVP first, bit-exact
-oracles, ablation ladders, benchmark hygiene, keeping `notes/<filter>.md`
-current).
-
-## Shared plumbing (src/vsfeel.h)
-
-All filters share an inline (zero-overhead, C++20) plumbing layer in
-`src/vsfeel.h`. New filters must build on it — do not re-invent this wheel:
-
-- **Record through the exec pool**: one command buffer per output frame from
-  `gpuExecAcquire` / `gpuExecCommandBuffer`, declare inputs with
-  `gpuExecReadsFrame` and outputs with `gpuExecWritesPlane`, then
-  `gpuExecSubmit`; `gpuExecAbandon` on every error path before submit. The pool
-  owns the ring, the timeline and the scratch lifetime and turns producer pairs
-  into device-side waits, so the host never waits per frame. Copy the pattern
-  from gaussblur/bilateral/nnedi3 (stateless) or bm3d/dfttest (cached/temporal).
-- **Cross-frame caches stay possible without owning a submission**: the slot's
-  ready flag is *submitted*, not a timeline value, and a full
-  `vkCmdPipelineBarrier` at the start of the reader's first command buffer
-  supplies the dependency. Never signal or hand-roll the pool's timeline; the
-  worked mechanism is `src/bm3d.cpp`'s cross-frame ordering comment.
-- **Debug flags** go through `vsfeel_debug_flag` / `vsfeel_debug_trace` /
-  `vsfeel_debug_probe`, never `env_flag` directly, with one env name per filter.
-  The levels, what each helper prints and what `VSFEEL_DEBUG=1|2` turns on are in
-  the `Debug switches` block of `src/vsfeel.h`; a level-2 run is instrumented, so
-  never benchmark it.
-- **Gate a GPU-timing probe on `GPUDevice::timestamp_valid_bits`** (via
-  `vsfeel_probe_timestamps`): a timestamp write on a queue family reporting 0 is
-  invalid usage, and a driver that takes one anyway can hang the engine (a
-  machine-wide freeze, not a lost device). Gate the *flag*, not only the pool.
-- **Errors and the frame trail**: every `set_error` lambda calls
-  `vsfeel_trace_error(filter, frame, message, d->gpu.get())` first (a null device
-  is fine), and the frame path opens with `vsfeel_trace_frame_begin()` plus a
-  `vsfeel_trace_mark(stage)` before each step, so the first error names the step
-  that failed. Reporting through `vsapi->mapSetError` directly bypasses both.
-
-**ODR rule (learned the hard way):** a filter-local struct used to instantiate
-a shared template needs a **unique name per filter** (`Bm3dStream`, never
-`VK_Resource`): the same mangled name with a different `sizeof` across TUs lets
-the linker COMDAT-fold one instantiation over the others and corrupt in-flight
-resources. It stands for any shared template a filter instantiates.
-
-**What stays per-filter:** frame caches (DFTTEST slots, NLMeans tiles, BM3D
-estimate/source rings), shaders + launch config, sync choreography and cache
-sizing. Never a command pool, timeline or fence of your own.
 
 ## Building and installing
 

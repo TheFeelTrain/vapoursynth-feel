@@ -84,7 +84,8 @@ qual=2 etype=0 pscrn=4`), interleaved pre-R80/R80 rounds through
   prescreen → compute→(compute|indirect) barrier → indirect predict →
   declare reads/writes → submit → props (`_FieldBased=0`, `_Field` deleted,
   `field>1` halves duration). Plane regions are disjoint, so nothing else is
-  ordered.
+  ordered. Under `dh`, a planes subset zeroes interp lines on skipped planes
+  (deliberate; the reference leaves them uninitialized).
 - Grids: prescreen `ceil(rows*ceil(width/P)/128)` (P=1 at pscrn=1 else 4 —
   grouping is per ROW, so this exact form is what covers non-divisible row
   tails); predict indirect off the prescreen count (prescreen keeps `groupsX`
@@ -298,17 +299,9 @@ upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
 
 ## Open work
 
-- **CPU-sink row trails nnedi3vk (0.91x)** — structural: the references write
-  CPU-native output with their own overlapped transfers while the API mandates
-  a core `GPUDownload` for a CPU consumer. Same trade already shipped for
-  GaussBlur (−6.1 %), BM3D (−4 %) and Bilateral (−0.1 %); the resident row is
-  where this port wins (1.35x). Nothing left to optimize inside the filter.
 - **Prescreen vs reference ~2.8x claim is pre-port** (40 µs gap on old
   stamps): re-measure against nnedi3vk's kernels on the current binary before
   quoting it.
-- **MVP limit**: `dh` + a planes subset zeroes interp lines on skipped planes
-  (the reference leaves them uninitialized) — kept deliberately, tests rely on
-  vsfeel's defined behavior.
 
 ## Debug env vars
 

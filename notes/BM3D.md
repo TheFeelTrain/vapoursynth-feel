@@ -100,6 +100,8 @@ which is where the visible speedup is (see Performance).
   shared memory: every lane of a group reads all of them, and a register array
   indexed by a runtime count would spill to scratch. The seeds of the earlier
   predictive windows are read into registers once per window, not per candidate.
+  Eight is the floor: a neighbour's third through eighth candidates join the
+  final group.
 - Each walk evaluates one candidate per iteration through the shared
   `scan_cand` helper (skip the reference origin, SSD, threshold, insert).
   Unrolling the walk to two or four candidates per iteration was tried and
@@ -132,7 +134,9 @@ which is where the visible speedup is (see Performance).
   (`VK_EXT_shader_atomic_float` plus `shaderBufferFloat32AtomicAdd`; the plain
   load/store/exchange bit is not enough), else the same kernel's
   `-DNO_FLOAT_ATOMICS` build runs the reference's `atom_add_f` CAS loop
-  (`VSFEEL_BM3D_CAS=1` forces it).
+  (`VSFEEL_BM3D_CAS=1` forces it). Only the base extension is required, not
+  float2. No cheaper fallback exists: pre-GFX11 AMD has no buffer f32 add, and
+  shared-memory atomics cannot help (a group's patches land anywhere).
 - Radius accepts up to 16, but the estimate cache binds first (it grows as
   `(2+2r)(2r+1)` plane pairs): 1080p runs 7 and refuses 8, 640x360 reaches 16.
   The rings hold the pipeline depth the core's pool can overlap (four frames,
@@ -181,6 +185,11 @@ which is where the visible speedup is (see Performance).
   (which also removed the barriers around them); the walks share one
   `scan_cand` helper; `group_add` stops at the first entry that cannot beat an
   overflowed group's worst.
+- The SSD's 1-ulp divergence is deliberate: `precise` costs ~8 ALU ops per row
+  to buy back ~10% of the tie floor.
+- The estimate phase's 0.40 ms is transform plus two `atomicAdd`s; the CAS
+  arm's +0.66 ms/frame bounds the atomics as most of it.
+- Timestamp figures before 2026-09-21 read 1000x low; do not quote them.
 - **The run-to-run swing was pipeline depth, not the kernels (+5%; spread 8.7%
   -> 2.8%).** The rings were sized for two in-flight frames, and the source
   ring's reuse distance makes that a hard serialization (a third frame blocks in
@@ -243,6 +252,9 @@ which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-10-08 — the RX 580 TDR watch is closed.** The card has no Vulkan 1.4
+  on Windows, so nothing after the R80 port runs on it to verify against; the
+  per-position estimation submissions stay as the bound.
 - **2026-10-05 — the match trace's record and its recording.** `kTraceWords`
   counted five header words for the marker plus the five counts and allocated
   101, but the kernel writes index 5 and, at radius 16, its last temporal word is
@@ -417,36 +429,18 @@ Chronological; each entry keeps the mechanism, not the story.
 
 ## Open work
 
-- **Emulating libstdc++'s `partial_sort` is not worth its price.** The survivors
-  among tied candidates are heap positions, not a positional rule (neither
-  first- nor last-in-scan matches, and dropping the large-key candidates the
-  heap evicts early changes 2113 of 32400 outcomes), so exactness needs the
-  whole candidate sequence replayed through a 7-element heap: ~940 keys per
-  block in LDS plus a serial pass, ~+25% on a kernel whose search is already the
-  whole filter, and correctness tied to one STL's heap.
-- **The 1-ulp SSD divergence is a deliberate trade**: `precise` on the
-  accumulators costs ~8 ALU ops per row (the fused multiply-add is the search's
-  throughput) to buy back ~10% of the tie floor.
 - **The search is the remaining kernel cost**, and the only one: the
   sigma-scaled threshold rejects most candidates on real content, so the filter
   cost behind it is small. The union's ownership test is 4 int ops per candidate
   per earlier window; a merged-row-interval enumeration has not been measured
   against it.
-- **The per-lane depth cannot drop again**: a neighbouring frame's third through
-  eighth candidates are members of the final group.
-- **RX 580/Windows: the long-submission TDR is bounded, awaiting a field run.**
-  `bm_range=4` and `NOSEARCH=1` both make it disappear, so it tracks the search's
-  duration in one submission; the estimation now submits per position.
-- **No cheaper atomics exist on the devices that need the fallback.** GFX8-10
-  have no `buffer_atomic_add_f32`, so CAS is the floor;
-  `shaderSharedFloat32AtomicAdd` cannot help because a group's eight matched
-  patches land anywhere in the plane.
-- **The estimate phase's 0.40 ms is not decomposed** into transform vs atomics.
-  The CAS build bounds it: its +0.66 ms/frame for a read-modify-write loop means
-  the two `atomicAdd`s are most of it.
 
 ### Do not retry
 
+- **Emulating libstdc++'s `partial_sort` tie order.** Survivors are heap
+  positions, not a positional rule; exactness needs the whole candidate sequence
+  replayed through a 7-element heap (~940 keys/block in LDS plus a serial pass,
+  ~+25% on a search-bound kernel) while staying tied to one STL's heap.
 - **Interleaving the estimate stack's `num`/`den` arrays.** Three layouts, all
   neutral or worse (1080p r=2, 5000 frames x3, same-binary interleaved A/B):
   `den` read from an adjacent address (same bytes, one stream) -4%; a
@@ -462,33 +456,6 @@ Chronological; each entry keeps the mechanism, not the story.
 - A different SSD accumulation order (a running window sum, say): it decides
   which blocks match.
 - An uncapped queue: uncapped is best or tied.
-
-### Method rules
-
-- **Put both kernels in one binary and alternate runs seconds apart.** A
-  build-per-arm ABBA is not enough: the box drifts 5-10% over tens of minutes,
-  nonlinearly, so arms that are minutes apart are not comparable (the same
-  A/B read +7.3% one session, +0.7% the next, and -3% under the real harness).
-  Two variants in one `.so`, selected by an env var at creation, alternate in
-  ~4 s; the drift then cancels and 8 samples per arm separate a 2% effect.
-  Remove the scaffolding before finishing.
-- `git show HEAD:<file>` is the *committed* file: after the work is committed it
-  silently returns the new code, and an A/B "against the original" becomes a
-  comparison of the kernel with itself. Keep the original under `.scratch/`.
-- Grade with `tools/benchmark.py` (median of 3 x 1000 frames) for the number
-  that matters, and with a fine-interleaved A/B for the decision. The screen's
-  numbers track the harness's within its spread, once the vpy matches (same
-  `cache_frames`/`cache_conv`, no `--gpu-cache`).
-- A single `gpu_busy_percent` sample is meaningless: during a timed run the GPU
-  is at 100%, but a poll taken a second late sees the harness's cache preload
-  (10%). Sample in a loop and keep the maximum.
-- Interleave ABBA within a round before reading any difference under ~3%: this
-  harness swings ±5-10% per invocation even for one binary.
-- Radius limits are geometry-dependent: check 1080p before quoting a cap (7
-  there, not the 10 the int32 guard alone implies).
-- Every GPU timestamp figure printed before 2026-09-21 is 1000x off (the
-  accumulator truncated and printed ms as ns). Do not quote them.
-- Never chain build -> install -> test; use `tools/install.sh` (hash-verified).
 
 ## Debug env vars
 

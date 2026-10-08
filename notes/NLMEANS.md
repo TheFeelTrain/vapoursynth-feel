@@ -67,6 +67,9 @@ the element width doubled (128 MiB budget).
   layer)`. The `PAD` margin is the reference's zero border, so the sweep needs
   no bounds checks. The compose writes the whole tile (margins zeroed) and the
   interior is a straight copy of the core's plane at its own row stride.
+- The per-frame window has no explicit cap (the old 512 MiB slot budget is
+  gone); an over-large window surfaces as a core allocation failure, not a
+  creation-time rejection.
 - `num_streams`/`device_id` stay registered so existing scripts load; both are
   never read (see the banner).
 
@@ -97,6 +100,16 @@ the element width doubled (128 MiB budget).
   ≤4.4e-6 for −7.2%: the ring carries 2x the bytes at the same pack, which the
   measured optimum wants at 128 MiB rather than 64 (halving pack costs more in
   rounds than the wider ring costs in DRAM traffic).
+- **`wref=0` has no usable oracle on real content.** The reference degenerates
+  there (0 total weight: 53983 non-finite samples on frame 0 at `h=1.2`, finite
+  ones dividing by a denormal sum up to 0.8 off; knlmvk's same fallback is 0.14
+  off). Pinned instead: finiteness, and the exact source bit-for-bit fallback
+  at `h <= 0.1` / `wmode` 1-3.
+- **knlmvk is a spatial-only second oracle**: bit-for-bit f32, ≤1 LSB u16 at
+  `d=0`; its temporal pairing differs (3.7e-2 at `d=2`), as it does from vszipcl.
+- **`d=16` with `a=64` stays out of the comparison sweep**: it hard-recovers a
+  shared GPU (see Do not retry); the neighbouring `a=64` entries are all within
+  4.4e-6 on the fp32 ring.
 - **The compose pass exists for codegen, not correctness.** Reaching each
   `(channel, layer)` plane directly with buffer references cost 64-bit address
   arithmetic on every guide load: the UV weight kernel compiled to 1515 ACO
@@ -175,34 +188,12 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
 ## Open work
 
-- **`wref=0` has no usable oracle on real content.** With the fp32 ring the
-  comparison surface is ≤1 LSB / ≤4.4e-6 everywhere except this family, where
-  the reference's own weighted average is degenerate: at `d=0, wref=0, h=1.2`
-  vszipcl has 53983 non-finite samples on frame 0 (and 1533 at `h=3.0`; nlm_hip
-  agrees) because its total weight is 0, and where it is finite it divides by a
-  denormal sum, landing up to 0.8 from both vsfeel and knlmvk. knlmvk is finite
-  there (same centre-sample fallback as vsfeel) but 0.14 away from it, so it is
-  not an oracle either. What is pinned instead: vsfeel's finiteness, and the
-  exact fallback (`wref=0` with `h <= 0.1` or `wmode 1-3` returns the source
-  bit-for-bit at both depths, both of which the reference cannot do).
-- **knlmvk is a second spatial oracle only.** It agrees with vsfeel
-  bit-for-bit at f32 and within 1 LSB at u16 on `d=0` configs (measured across
-  the sweep), which is worth keeping as an independent cross-check, but its
-  temporal pairing differs: 3.7e-2 at `d=2` and 1.4e-1 at
-  `d=1 a=3 s=3 h=3.0 wref=0.4`, and it is that far from vszipcl too.
-- **`d=16` with `a=64`**: still omitted from the positive-maxima lists (it
-  hard-recovers the GPU when the device is shared); with the fp32 ring the
-  `a=64` entries next to it are all within 4.4e-6, so the in-session drift
-  recorded earlier was the fp16 ring being measured under contention.
 - **Subgroup-shuffle box sums** to cut LDS phases (complex).
 - **fp16 `dist`/`hsum` LDS arrays** with range scaling — numerics risk (the
   weight ring's own fp16 experiment failed this way; see Performance).
 - **Incremental window cache**: copy only newly-entered layers instead of
   rebuilding the whole window, if a large-`d` workload ever makes the copy
   matter.
-- Extreme configs: the per-frame window has no explicit cap (the old 512 MiB
-  slot budget is gone); an over-large window now surfaces as an allocation
-  failure from the core rather than a creation-time rejection.
 - Residual kernel gap vs vszipcl: cooperative-matrix (WMMA) box sums and launch
   structure.
 

@@ -112,6 +112,8 @@ force-pad / fail-pad probes: 2854 lines of C++ became 1565.
 - The 1080p GRAY16 round trip costs ~276 µs with the copy on the graphics
   engine (`GPUUpload→GPUDownload` 404 µs against a 126 µs BlankClip baseline,
   ~14 GB/s each way) and is free with SDMA.
+- **Fused codegen residue is deliberately left**: remaining IM2COL/window ALU
+  and pointer-walk strength reduction; col2im already runs ~2x the references.
 
 ## Historical
 
@@ -192,14 +194,6 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
 ## Open work
 
-- Do not re-derive: every in-filter alternative to the download was measured
-  and rejected — a second *compute-family* queue for the copy (neutral: same
-  engine), the core's host-visible direct-read path with streaming loads (fast
-  at 1080p, collapses past ~8 MB), host-cached plane memory (much worse), and
-  gating the streaming path by size (helps DFTTest, does not generalize).
-  The fix was the driver opt-in, not filter code.
-- **Fused codegen residue**: remaining IM2COL/window ALU and pointer-walk
-  strength reduction. col2im is already ~2x the references; leave it.
 - `pad`/`col2im` are 32x8 (256 invocations, the plugin's largest workgroup):
   a device at the Vulkan minimum of 128 cannot run DFTTest at all and now says
   so at creation (`tests/test_device_limits.py`). The local size is a literal in
@@ -207,6 +201,14 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   plus the matching grid math in `DftCreate` — worth doing only if such a device
   turns up. NLMeans, EEDI3's copy kernels, NNEDI3's keep/pad and BM3D's
   aggregation are in the same position.
+
+### Do not retry
+
+- **In-filter download alternatives.** A second *compute-family* queue for the
+  copy (neutral: same engine), the core's host-visible direct-read path with
+  streaming loads (fast at 1080p, collapses past ~8 MB), host-cached plane
+  memory (much worse), and size-gated streaming (helps DFTTest, does not
+  generalize) — all measured and rejected. The fix was the SDMA opt-in.
 
 ## Debug env vars
 
