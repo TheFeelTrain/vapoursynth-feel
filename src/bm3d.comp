@@ -616,16 +616,6 @@ void insert_cand(inout float e[8], inout int xy[8], float err_, int xy_) {
 // function so a walk body can evaluate several candidates per iteration: their
 // SSDs are independent, which gives the scheduler more than one chain of loads
 // to keep in flight.
-void scan_cand(inout float e[8], inout int xy[8], const float cur[64],
-               int base_idx, int cx, int cy, bool skip_ref, int rx, int ry) {
-    if (skip_ref && cx == rx && cy == ry) {
-        return;
-    }
-    const float err = ssd_err(cur, base_idx, cx, cy);
-    if (err <= TH_SSE) {
-        insert_cand(e, xy, err, pack_xy(cx, cy));
-    }
-}
 
 // 8-way merge of the per-lane lists into the group's best `n` entries, in the
 // same (error, y, x) order. Every lane walks the same tournament -- three
@@ -753,15 +743,15 @@ float hard_thresholding_s(inout float data[64], float sigma, int n) {
     const float scale = 1.0f / (512.0f * float(n));
 
     for (int i = 0; i < 8; ++i) {
-        if (i >= n) {
-            continue;
-        }
+        // Predicated, not branched: an out-of-group member contributes nothing
+        // but the loop still runs, so the warp never serialises over `n`.
+        const float m = i < n ? 1.0f : 0.0f;
         for (int j = 0; j < 8; ++j) {
             const int idx = i * 8 + j;
             const float val = data[idx];
             const bool keep = abs(val) > sigma;
-            ks[j % 4] += keep ? 1.0f : 0.0f;
-            data[idx] = keep ? (val * scale) : 0.0f;
+            ks[j % 4] += m * (keep ? 1.0f : 0.0f);
+            data[idx] = m > 0.0f ? (keep ? (val * scale) : 0.0f) : val;
         }
     }
 
@@ -799,17 +789,16 @@ float wiener_filtering_s(inout float data[64], inout float ref[64], float sigma,
     const float scale = 1.0f / (512.0f * float(n));
     const float sgmsqr = sigma * sigma;
     for (int i = 0; i < 8; ++i) {
-        if (i >= n) {
-            continue;
-        }
+        // Predicated, not branched (see hard_thresholding_s).
+        const float m = i < n ? 1.0f : 0.0f;
         for (int j = 0; j < 8; ++j) {
             const int idx = i * 8 + j;
             const float val = data[idx];
             const float ref_sqr = ref[idx] * ref[idx];
             const float den = ref_sqr + sgmsqr;
             const float coeff = den > 0.0f ? ref_sqr / den : 1.0f;
-            ks[j % 4] += coeff * coeff;
-            data[idx] = val * coeff * scale;
+            ks[j % 4] += m * coeff * coeff;
+            data[idx] = m > 0.0f ? val * coeff * scale : val;
         }
     }
     float k = (ks[0] + ks[1]) + (ks[2] + ks[3]);
@@ -844,40 +833,11 @@ void collaborative_wiener(inout float denoising_patch[64], inout float ref_patch
 
 // The clipped predictive window of one seed, as the CPU's _SearchBoundary
 // builds it at search_step = 1: [max(seed - range, 0), min(seed + range, dim - 8)].
-// Membership in such a window is what the union's first-window ownership test
-// needs, and a candidate enumerated inside one window is always in the image,
-// so the clipped and unclipped tests agree for it.
-struct Window {
-    int left;
-    int right;
-    int top;
-    int bottom;
-    int rw;
-    int total;
-};
-
-Window make_window(int sx, int sy, int range, int maxx, int maxy) {
-    Window w;
-    w.left = max(sx - range, 0);
-    w.right = min(sx + range, maxx);
-    w.top = max(sy - range, 0);
-    w.bottom = min(sy + range, maxy);
-    w.rw = w.right - w.left + 1;
-    w.total = (w.bottom - w.top + 1) * w.rw;
-    return w;
-}
-
-// Walk this lane's share of a window's origins, row-major. `row`/`col` are
-// carried as state so the walk costs one add per step instead of a division.
-// All-scalar parameters on purpose: this runs once per candidate, and a struct
-// or array crossing the call is staged in scratch in the innermost loop.
-void walk_step(int rw, int right, inout int col, inout int row) {
-    col += 8;
-    while (col > right) {
-        col -= rw;
-        row += 1;
-    }
-}
+// A candidate enumerated inside one window is always in the image, so the
+// clipped and unclipped membership tests agree for it. Every use site builds it
+// from scalars and walks it with scalars: a Window/Walk struct, or a wrapper
+// taking the candidate list and the reference patch, is staged in scratch, and
+// all of this runs once per candidate.
 
 // True when no earlier window in the union covers this origin, so this is the
 // window that scans it. Scalars only: passed an array, the caller's coordinates
@@ -959,38 +919,26 @@ void main() {
             pxy[k] = INT_MAX_;
         }
         if (is_active && searching) {
-            const Window w = make_window(x, y, BM_RANGE, WIDTH - 8, HEIGHT - 8);
-            // Hoisted into scalars: the walk runs once per candidate, so reading
-            // a struct field there would stage the whole struct in scratch.
-            const int right = w.right;
-            const int rw = w.rw;
-            const int total = w.total;
-            int col = w.left + sl % w.rw;
-            int row = w.top + sl / w.rw;
-            for (int s = sl; s < total; s += 32) {
-                const int c0 = col;
-                const int r0 = row;
-                walk_step(rw, right, col, row);
-                const int c1 = col;
-                const int r1 = row;
-                walk_step(rw, right, col, row);
-                const int c2 = col;
-                const int r2 = row;
-                walk_step(rw, right, col, row);
-                const int c3 = col;
-                const int r3 = row;
-                walk_step(rw, right, col, row);
-                if (s + 0 < total) {
-                    scan_cand(pe, pxy, cur, anchor_pc, c0, r0, true, x, y);
+            const int left = max(x - BM_RANGE, 0);
+            const int right = min(x + BM_RANGE, WIDTH - 8);
+            const int top = max(y - BM_RANGE, 0);
+            const int bottom = min(y + BM_RANGE, HEIGHT - 8);
+            const int rw = right - left + 1;
+            const int total = (bottom - top + 1) * rw;
+            int col_i = left + sl % rw;
+            int row_i = top + sl / rw;
+            for (int s = sl; s < total; s += 8) {
+                // The reference block is never matched against itself.
+                if (col_i != x || row_i != y) {
+                    const float err = ssd_err(cur, anchor_pc, col_i, row_i);
+                    if (err <= TH_SSE) {
+                        insert_cand(pe, pxy, err, pack_xy(col_i, row_i));
+                    }
                 }
-                if (s + 8 < total) {
-                    scan_cand(pe, pxy, cur, anchor_pc, c1, r1, true, x, y);
-                }
-                if (s + 16 < total) {
-                    scan_cand(pe, pxy, cur, anchor_pc, c2, r2, true, x, y);
-                }
-                if (s + 24 < total) {
-                    scan_cand(pe, pxy, cur, anchor_pc, c3, r3, true, x, y);
+                col_i += 8;
+                while (col_i > right) {
+                    col_i -= rw;
+                    row_i += 1;
                 }
             }
         }
@@ -1070,42 +1018,27 @@ void main() {
                 for (int i = 0; i < ns; ++i) {
                     const int sx = s_x[group][i];
                     const int sy = s_y[group][i];
-                    const Window w = make_window(sx, sy, PS_RANGE, WIDTH - 8,
-                                                 HEIGHT - 8);
-                    // Hoisted into scalars (see the spatial walk above).
-                    const int right = w.right;
-                    const int rw = w.rw;
-                    const int total = w.total;
-                    int col = w.left + sl % w.rw;
-                    int row = w.top + sl / w.rw;
-                    for (int s = sl; s < total; s += 32) {
-                        const int c0 = col;
-                        const int r0 = row;
-                        walk_step(rw, right, col, row);
-                        const int c1 = col;
-                        const int r1 = row;
-                        walk_step(rw, right, col, row);
-                        const int c2 = col;
-                        const int r2 = row;
-                        walk_step(rw, right, col, row);
-                        const int c3 = col;
-                        const int r3 = row;
-                        walk_step(rw, right, col, row);
-                        if (s + 0 < total &&
-                            is_first_owner(group, c0, r0, i, px0, py0)) {
-                            scan_cand(pe, pxy, cur, spc, c0, r0, false, 0, 0);
+                    const int left = max(sx - PS_RANGE, 0);
+                    const int right = min(sx + PS_RANGE, WIDTH - 8);
+                    const int top = max(sy - PS_RANGE, 0);
+                    const int bottom = min(sy + PS_RANGE, HEIGHT - 8);
+                    const int rw = right - left + 1;
+                    const int total = (bottom - top + 1) * rw;
+                    int col_i = left + sl % rw;
+                    int row_i = top + sl / rw;
+                    for (int s = sl; s < total; s += 8) {
+                        // Union of the clipped predictive windows, every origin
+                        // evaluated once (see is_first_owner).
+                        if (is_first_owner(group, col_i, row_i, i, px0, py0)) {
+                            const float err = ssd_err(cur, spc, col_i, row_i);
+                            if (err <= TH_SSE) {
+                                insert_cand(pe, pxy, err, pack_xy(col_i, row_i));
+                            }
                         }
-                        if (s + 8 < total &&
-                            is_first_owner(group, c1, r1, i, px0, py0)) {
-                            scan_cand(pe, pxy, cur, spc, c1, r1, false, 0, 0);
-                        }
-                        if (s + 16 < total &&
-                            is_first_owner(group, c2, r2, i, px0, py0)) {
-                            scan_cand(pe, pxy, cur, spc, c2, r2, false, 0, 0);
-                        }
-                        if (s + 24 < total &&
-                            is_first_owner(group, c3, r3, i, px0, py0)) {
-                            scan_cand(pe, pxy, cur, spc, c3, r3, false, 0, 0);
+                        col_i += 8;
+                        while (col_i > right) {
+                            col_i -= rw;
+                            row_i += 1;
                         }
                     }
                 }
@@ -1170,25 +1103,22 @@ void main() {
 
         float adaptive_weight;
         {
+            // Every member is loaded and masked, never gated: a per-lane
+            // `if (i < n)` is what ACO if-converts for free and Nvidia instead
+            // branches on, serialising the warp over all eight members and
+            // spilling the patch. An out-of-group member reads the clamped
+            // reference block and is multiplied by zero.
             for (int i = 0; i < 8; ++i) {
-                // A block outside the group is padding: it is zeroed instead of
-                // loaded, so no address is ever built from an unused match.
-                if (i < n) {
-                    const int mx = gxy[i] & 0xFFFF;
-                    const int my = gxy[i] >> XY_SHIFT;
-                    const int mz = gz[i];
-                    const int refp = src_search(mz, plane) + my * STRIDE + mx + sl;
-                    const int srcp = src_input(mz, plane) + my * STRIDE + mx + sl;
-                    for (int j = 0; j < 8; ++j) {
-                        denoising_patch[i * 8 + j] = src[srcp + j * STRIDE];
-                        if (FINAL != 0) {
-                            ref_patch[i * 8 + j] = src[refp + j * STRIDE];
-                        }
-                    }
-                } else {
-                    for (int j = 0; j < 8; ++j) {
-                        denoising_patch[i * 8 + j] = 0.0f;
-                        ref_patch[i * 8 + j] = 0.0f;
+                const float m = i < n ? 1.0f : 0.0f;
+                const int mx = min(max(gxy[i] & 0xFFFF, 0), WIDTH - 8);
+                const int my = min(max(gxy[i] >> XY_SHIFT, 0), HEIGHT - 8);
+                const int mz = clamp(gz[i], 0, KRADIUS * 2);
+                const int refp = src_search(mz, plane) + my * STRIDE + mx + sl;
+                const int srcp = src_input(mz, plane) + my * STRIDE + mx + sl;
+                for (int j = 0; j < 8; ++j) {
+                    denoising_patch[i * 8 + j] = m * src[srcp + j * STRIDE];
+                    if (FINAL != 0) {
+                        ref_patch[i * 8 + j] = m * src[refp + j * STRIDE];
                     }
                 }
             }
@@ -1204,17 +1134,17 @@ void main() {
             const int weightpc = rplane + TEMPORAL_STRIDE + sl;
 
             for (int i = 0; i < 8; ++i) {
-                if (i >= n) {
-                    continue;
-                }
-                const int mx = gxy[i] & 0xFFFF;
-                const int my = gxy[i] >> XY_SHIFT;
-                const int mz = gz[i];
+                // Predicated, not branched (see the load above). The address is
+                // clamped so an out-of-group member's zero add stays in bounds.
+                const float m = i < n ? 1.0f : 0.0f;
+                const int mx = min(max(gxy[i] & 0xFFFF, 0), WIDTH - 8);
+                const int my = min(max(gxy[i] >> XY_SHIFT, 0), HEIGHT - 8);
+                const int mz = clamp(gz[i], 0, KRADIUS * 2);
                 const int offset = mz * 2 * TEMPORAL_STRIDE + my * STRIDE + mx;
 
                 for (int j = 0; j < 8; ++j) {
-                    float wdst_val = adaptive_weight * denoising_patch[i * 8 + j];
-                    float weight_val = adaptive_weight;
+                    float wdst_val = m * adaptive_weight * denoising_patch[i * 8 + j];
+                    float weight_val = m * adaptive_weight;
 
                     // extractor_exp pre-rounding: makes the float atomic sums
                     // order-independent. `precise` is load-bearing — without
