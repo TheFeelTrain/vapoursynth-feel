@@ -255,6 +255,19 @@ which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-10-08 — the Nvidia slowdown was the search's 4-wide walk staging.** The
+  V-BM3D matcher parked four candidate coordinates per step in `int c[4]` /
+  `int r[4]`; `walk_step`'s wrap loop keeps the compiler from unrolling the
+  staging loop, so on Nvidia those live in scratch and every `ssd_err` address
+  waits on a scratch round trip the compiler cannot reorder. The op count had
+  gone *down* (`insert_cand` beats `insertN`), so it was never work: 0dad9c8
+  127.3 fps against f36a6ef 1.22 fps, and 449.5 against 240.4 under
+  `VSFEEL_BM3D_NOSEARCH=1` (3080, GRAYS 1080p, r=2, bm_range 9, ps_range 4,
+  block_step 8): the search alone went 5.6 -> 815 ms/frame. Scalarising the
+  coordinates drops the staged size-4 arrays back to the fast arm's two. The
+  7900XTX A/B is 937.9 against 921.8 fps (jpbd 1080p, 1000 frames, ABBA, n=12),
+  which is only the no-regression check: ACO promotes the arrays there, so the
+  fix's own validation has to come from the affected cards.
 - **2026-10-08 — the references rule out our code, leaving the atomic opcode.**
   bm3vk does not use hardware float atomics at all (it CASes a plain `uint`
   block, no `coherent`), and vszipcu's accumulate is our pattern through CUDA's

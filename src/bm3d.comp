@@ -889,6 +889,22 @@ void walk_step(inout Walk k, const Window w) {
     }
 }
 
+// True when no earlier window in the union covers this origin, so this is the
+// window that scans it. Scalars only: passed an array, the caller's coordinates
+// would be read out of scratch once per candidate instead of a register.
+bool is_first_owner(int grp, int cc, int rr, int i, int px0, int py0) {
+    for (int j = 0; j < PS_NUM; ++j) {
+        if (j < i) {
+            const int px = j == 0 ? px0 : s_x[grp][j];
+            const int py = j == 0 ? py0 : s_y[grp][j];
+            if (abs(cc - px) <= PS_RANGE && abs(rr - py) <= PS_RANGE) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 void main() {
     const int m = pc.nmod;
     // Real temporal extent of this centre's window: only frames that exist are
@@ -956,17 +972,33 @@ void main() {
             const Window w = make_window(x, y, BM_RANGE, WIDTH - 8, HEIGHT - 8);
             Walk k = walk_start(w, sl);
             for (int s = sl; s < w.total; s += 32) {
-                int c[4];
-                int r[4];
-                for (int q = 0; q < 4; ++q) {
-                    c[q] = k.col;
-                    r[q] = k.row;
-                    walk_step(k, w);
+                // Scalars, not an int[4] staging array: an array here is
+                // dynamically indexed (the walk's wrap loop keeps the compiler
+                // from unrolling this), so every candidate's coordinates would
+                // round-trip through scratch in the hottest loop in the kernel.
+                const int c0 = k.col;
+                const int r0 = k.row;
+                walk_step(k, w);
+                const int c1 = k.col;
+                const int r1 = k.row;
+                walk_step(k, w);
+                const int c2 = k.col;
+                const int r2 = k.row;
+                walk_step(k, w);
+                const int c3 = k.col;
+                const int r3 = k.row;
+                walk_step(k, w);
+                if (s + 0 < w.total) {
+                    scan_cand(pe, pxy, cur, anchor_pc, c0, r0, true, x, y);
                 }
-                for (int q = 0; q < 4; ++q) {
-                    if (s + 8 * q < w.total) {
-                        scan_cand(pe, pxy, cur, anchor_pc, c[q], r[q], true, x, y);
-                    }
+                if (s + 8 < w.total) {
+                    scan_cand(pe, pxy, cur, anchor_pc, c1, r1, true, x, y);
+                }
+                if (s + 16 < w.total) {
+                    scan_cand(pe, pxy, cur, anchor_pc, c2, r2, true, x, y);
+                }
+                if (s + 24 < w.total) {
+                    scan_cand(pe, pxy, cur, anchor_pc, c3, r3, true, x, y);
                 }
             }
         }
@@ -1050,26 +1082,35 @@ void main() {
                                                  HEIGHT - 8);
                     Walk k = walk_start(w, sl);
                     for (int s = sl; s < w.total; s += 32) {
-                        int c[4];
-                        int r[4];
-                        for (int q = 0; q < 4; ++q) {
-                            c[q] = k.col;
-                            r[q] = k.row;
-                            walk_step(k, w);
+                        // Scalars, not an int[4] staging array (see the spatial
+                        // walk above).
+                        const int c0 = k.col;
+                        const int r0 = k.row;
+                        walk_step(k, w);
+                        const int c1 = k.col;
+                        const int r1 = k.row;
+                        walk_step(k, w);
+                        const int c2 = k.col;
+                        const int r2 = k.row;
+                        walk_step(k, w);
+                        const int c3 = k.col;
+                        const int r3 = k.row;
+                        walk_step(k, w);
+                        if (s + 0 < w.total &&
+                            is_first_owner(group, c0, r0, i, px0, py0)) {
+                            scan_cand(pe, pxy, cur, spc, c0, r0, false, 0, 0);
                         }
-                        for (int q = 0; q < 4; ++q) {
-                            bool owned = true;
-                            for (int j = 0; j < PS_NUM; ++j) {
-                                if (j < i) {
-                                    const int px = j == 0 ? px0 : s_x[group][j];
-                                    const int py = j == 0 ? py0 : s_y[group][j];
-                                    owned = owned && !(abs(c[q] - px) <= PS_RANGE &&
-                                                       abs(r[q] - py) <= PS_RANGE);
-                                }
-                            }
-                            if (owned && s + 8 * q < w.total) {
-                                scan_cand(pe, pxy, cur, spc, c[q], r[q], false, 0, 0);
-                            }
+                        if (s + 8 < w.total &&
+                            is_first_owner(group, c1, r1, i, px0, py0)) {
+                            scan_cand(pe, pxy, cur, spc, c1, r1, false, 0, 0);
+                        }
+                        if (s + 16 < w.total &&
+                            is_first_owner(group, c2, r2, i, px0, py0)) {
+                            scan_cand(pe, pxy, cur, spc, c2, r2, false, 0, 0);
+                        }
+                        if (s + 24 < w.total &&
+                            is_first_owner(group, c3, r3, i, px0, py0)) {
+                            scan_cand(pe, pxy, cur, spc, c3, r3, false, 0, 0);
                         }
                     }
                 }

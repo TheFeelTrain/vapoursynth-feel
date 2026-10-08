@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- BM3Dv2 no longer runs about 100x slow on Nvidia GPUs
 - BM3Dv2 uses the compare-and-swap accumulation on Nvidia GPUs
 
 ## [1.1.1] - 2026-10-05
