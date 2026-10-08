@@ -81,11 +81,12 @@ const float FLT_MAX_ = 3.402823466e+38f;
 const float FLT_EPS_ = 1.192092896e-07f;
 const int INT_MAX_ = 0x7fffffff;
 
+// `coherent` on both arms: the accumulation target is written by atomics that
+// every invocation must see, and the qualifier is the one structural difference
+// between the two arms' buffer declarations (see notes/BM3D.md on Nvidia).
 #ifndef NO_FLOAT_ATOMICS
-layout(std430, binding = 0) buffer ResBuf { float res[]; };
+layout(std430, binding = 0) coherent buffer ResBuf { float res[]; };
 #else
-// `coherent`: this buffer is written by atomics from other invocations, so a
-// plain load of it is a data race the compiler may treat as invariant.
 layout(std430, binding = 0) coherent buffer ResBuf { uint res_u[]; };
 #endif
 layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };

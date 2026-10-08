@@ -132,12 +132,14 @@ which is where the visible speedup is (see Performance).
   index and can hold different frames in the same slot.
 - Estimation accumulates with hardware buffer float atomics on AMD where
   available (`VK_EXT_shader_atomic_float` plus `shaderBufferFloat32AtomicAdd`;
-  the plain load/store/exchange bit is not enough), and with the reference's
-  `atom_add_f` CAS loop (`-DNO_FLOAT_ATOMICS` build) everywhere else, including
-  all of Nvidia: its global FP32 add serializes under millions of concurrent
-  adds there. (`VSFEEL_BM3D_CAS=1` forces CAS.) No cheaper fallback exists:
-  pre-GFX11 AMD has no buffer f32 add, and shared-memory atomics cannot help
-  (a group's patches land anywhere).
+  the plain load/store/exchange bit is not enough) and with the reference's
+  `atom_add_f` CAS loop (`-DNO_FLOAT_ATOMICS` build) on every other vendor:
+  Nvidia's Vulkan lowering of `OpAtomicFAddEXT` costs ~250x what its own
+  CompSwap costs on the same addresses. Both arms declare the accumulation
+  buffer `coherent`. `VSFEEL_BM3D_CAS=1` forces CAS, `VSFEEL_BM3D_FLOAT_ATOMICS=1`
+  forces the hardware arm. No cheaper fallback exists: pre-GFX11 AMD has no
+  buffer f32 add, and shared-memory atomics cannot help (a group's patches land
+  anywhere).
 - Radius accepts up to 16, but the estimate cache binds first (it grows as
   `(2+2r)(2r+1)` plane pairs): 1080p runs 7 and refuses 8, 640x360 reaches 16.
   The rings hold the pipeline depth the core's pool can overlap (four frames,
@@ -253,6 +255,16 @@ which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-10-08 — the references rule out our code, leaving the atomic opcode.**
+  bm3vk does not use hardware float atomics at all (it CASes a plain `uint`
+  block, no `coherent`), and vszipcu's accumulate is our pattern through CUDA's
+  native `atom.add.f32`, which a Vulkan shader cannot emit. Diffing the two arms'
+  SPIR-V leaves exactly three differences: the opcode, the `Coherent`
+  decoration, and the element type. That decoration was an accident of the CAS
+  arm needing it for its atomic loads; both arms declare it now, neutral on the
+  7900XTX (846 vs 833 fps, jpbd 1080p, r=2). The CAS arm being fast with no
+  `volatile` and no stronger semantics also rules out a memory-ordering cause,
+  so the opcode is the remaining variable and `atomicAdd` stays AMD-only.
 - **2026-10-08 — hardware float atomics are AMD-only.** Gating the add on the
   base extension alone (no float2) put Nvidia on the `atomicAdd` arm, whose
   global FP32 adds serialize under this workload: 1.3 fps against 300 fps for
