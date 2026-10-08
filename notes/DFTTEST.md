@@ -4,17 +4,14 @@ Status: **shipped on the R80 GPU API.** Verified against `src/dfttest.{cpp,comp}
 Target GPU: RX 7900 XTX (RDNA3, gfx1100), Mesa 26.2 RADV.
 
 - `clip:vnode:gpu` in, `ffGPUOutput` out: the core owns every transfer and the
-  filter records one submission per output frame into one exec pool. No staging
-  buffers, ReBAR upload, slot frame cache, per-slot timelines, fences or
-  filter-owned descriptor sets.
+  filter records one submission per output frame into one exec pool (no
+  filter-owned staging, timelines, fences or descriptor sets).
 - Per output frame and processed plane: `pad` (one dispatch per temporal slice,
   reading that slice's own source plane) → barrier → `fused` → barrier →
   `col2im` straight into the output plane. Scratch is two `createGPUBuffer`
   allocations per frame, handed to the context.
-- **Runs need `RADV_EXPERIMENTAL=transfer_queue`**, which `tools/benchmark.py`
-  now forces: RADV gates its SDMA transfer family behind that opt-in, and
-  without it every GPU filter's `GPUDownload` runs on the graphics engine and
-  costs 10–31%. Mechanism in `notes/BILATERAL.md`.
+- **Runs need `RADV_EXPERIMENTAL=transfer_queue`** (mechanism:
+  `notes/BILATERAL.md`), which `tools/benchmark.py` forces.
 
 Scoreboard — jpbd 1080p GRAY16, 3000 frames, `tools/benchmark.py --filter
 dfttest vsfeel`, interleaved pre-port/R80 pairs, `--repeat 2`:
@@ -93,25 +90,12 @@ force-pad / fail-pad probes: 2854 lines of C++ became 1565.
 
 ## Performance
 
-- **The pre-port gap was the core's `GPUDownload`, not the filter.** A frame was
-  ~835 µs = ~660 µs of GPU work plus ~175 µs of exposed transfer, and the
-  transfer was a copy running on the graphics engine. With the SDMA family
-  opted in it is free and the default run lands within a few percent of pre-R80.
-- **CPU in / CPU out** (benchmark default): core-inserted `GPUUpload` +
-  `GPUDownload`. The upload is free — a host memcpy into ReBAR-mapped planes
-  that runs ahead — and on SDMA so is the download. The R80 column is therefore
-  the same in both input rows (1361 vs 1350 fps), while the pre-R80 column
-  drops from 1376 to 1182 because that build took the GPU clip through
-  `GPUDownload` before its CPU filter could run.
-- **GPU in / CPU out** (`--gpu-cache`): +14% for the port, which reads the
-  core's planes in place instead of downloading the clip and re-uploading its
-  own padded slices.
-- **GPU in / GPU out** (chained instances): parity, +4%. The residual is the two
-  extra pad dispatches per frame — the pre-R80 build padded each source frame
-  once into a slot and reused it across the temporal window.
-- The 1080p GRAY16 round trip costs ~276 µs with the copy on the graphics
-  engine (`GPUUpload→GPUDownload` 404 µs against a 126 µs BlankClip baseline,
-  ~14 GB/s each way) and is free with SDMA.
+- **The pre-port gap was the exposed download, closed by the SDMA opt-in**
+  (mechanism: `notes/BILATERAL.md`). The default run lands within a few percent
+  of pre-R80.
+- **CPU in / CPU out** is core-inserted upload+download (both free: ReBAR memcpy
+  ahead, SDMA download). `--gpu-cache` is +14% (core planes read in place) and
+  chained instances +4%, the two extra pad dispatches per frame the residual.
 - **Fused codegen residue is deliberately left**: remaining IM2COL/window ALU
   and pointer-walk strength reduction; col2im already runs ~2x the references.
 

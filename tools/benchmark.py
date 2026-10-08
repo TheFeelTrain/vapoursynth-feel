@@ -1617,7 +1617,7 @@ def bench_filter_ab(fname: str, ns: argparse.Namespace) -> None:
     # Swapping .so files only changes vsfeel: default to it unless the caller
     # names plugins explicitly (a reference would measure the same binary in
     # both arms, i.e. pure noise at double the cost).
-    plan = _prepare_filter(spec, ns, requested=ns.plugins or ["vsfeel"])
+    plan = _prepare_filter(fname, ns, requested=ns.plugins or ["vsfeel"])
     print(f"{spec.title} A/B | {plan.frames} frames | clip: {plan.clip_desc}{plan.bits_desc}")
     print(f"args: {args_desc(spec, ns)}")
     print(

@@ -397,6 +397,7 @@ get_gpu_device(VSCore * core, const VSAPI * vsapi) {
     vk->vkGetPhysicalDeviceProperties2(handles.physicalDevice, &props);
     dev->limits = props.properties.limits;
     dev->api_version = props.properties.apiVersion;
+    dev->vendor_id = props.properties.vendorID;
     dev->subgroup_size = subgroup.subgroupSize;
     dev->min_subgroup_size = size_control.minSubgroupSize;
     dev->max_subgroup_size = size_control.maxSubgroupSize;
@@ -517,10 +518,8 @@ get_gpu_device(VSCore * core, const VSAPI * vsapi) {
     // The aggregation kernel calls atomicAdd on a float storage buffer, which
     // is shaderBufferFloat32AtomicAdd alone: shaderBufferFloat32Atomics (load,
     // store, exchange) is a separate feature and a device may report it
-    // without the add. The core enables float whenever any of its bits is set
-    // (float2 only additionally), so presence plus that bit is what the created
-    // device actually has; requiring float2 would force the CAS fallback on
-    // devices that offer only the base extension.
+    // without the add. This flag is pure capability; whether the add is also
+    // fast is workload-specific and decided where it is used.
     dev->feat_atomic_float32_add =
         has_atomic_float && atomic_float.shaderBufferFloat32AtomicAdd;
 

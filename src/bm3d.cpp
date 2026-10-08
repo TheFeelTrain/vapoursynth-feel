@@ -2031,21 +2031,21 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // (a machine-wide freeze, not just a lost device): keep it off there.
     d->gpu_trace = d->gpu_trace && vsfeel_probe_timestamps(*d->gpu, "BM3D");
 
-    // The BM3D kernels accumulate into float SSBOs with atomicAdd, which needs
-    // shaderBufferFloat32AtomicAdd: VK_EXT_shader_atomic_float reports the
-    // load/store/exchange atomics separately, so that bit alone must not select
-    // this path. No pre-RDNA3 AMD driver reports the add at all (RADV: GFX11+;
-    // the Windows driver does not expose it on Polaris either); on anything
-    // older the accumulation falls back to the CAS loop the OpenCL reference
-    // itself uses (atom_add_f), so the filter runs everywhere instead of
-    // failing at creation.
-    d->cas_atomics =
-        env_flag("VSFEEL_BM3D_CAS") || !d->gpu->feat_atomic_float32_add;
+    // The estimation kernel accumulates into float SSBOs with atomicAdd, which
+    // needs shaderBufferFloat32AtomicAdd. The bit is not the whole story: the
+    // SPIR-V is already minimal (device scope, relaxed, like the fast CUDA
+    // reference), yet Nvidia's Vulkan lowering serializes under millions of
+    // concurrent adds (1.3 fps vs 300 fps for CAS on a 3080), so only AMD
+    // keeps the hardware arm. VSFEEL_BM3D_FLOAT_ATOMICS=1 forces it elsewhere
+    // (a fixed driver or a new vendor); VSFEEL_BM3D_CAS=1 forces CAS.
+    const bool hw_atomics =
+        d->gpu->feat_atomic_float32_add &&
+        (d->gpu->vendor_id == 0x1002u || env_flag("VSFEEL_BM3D_FLOAT_ATOMICS"));
+    d->cas_atomics = env_flag("VSFEEL_BM3D_CAS") || !hw_atomics;
     if (vsfeel_device_info_enabled()) {
         fprintf(stderr, "[bm3d] aggregation: %s\n",
-                d->cas_atomics
-                    ? "CAS loop (no buffer float32 add atomics available)"
-                    : "hardware buffer float atomics");
+                d->cas_atomics ? "CAS loop (atom_add_f fallback)"
+                               : "hardware buffer float atomics");
     }
     // The 8x8 group transposes and the group-8 reduction are subgroup shuffles,
     // and the kernel's per-lane layout puts each 8-lane group inside one

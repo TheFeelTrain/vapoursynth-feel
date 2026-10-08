@@ -24,11 +24,9 @@ Design (current):
   every plane is unprocessed.
 - `num_streams` and `device_id` are registered no-ops (never read): depth is
   the core's call and device choice is `core.set_vulkan_device`.
-- **`RADV_EXPERIMENTAL=transfer_queue` is required for the numbers below**, and
-  `tools/benchmark.py` now forces it. Without it RADV exposes no transfer-only
-  queue family, so the core's `GPUDownload` is a copy on the graphics engine
-  that competes with the kernel; with it the copy moves to SDMA and costs
-  nothing. Every −16% figure in this file's history predates that and is void.
+- **`RADV_EXPERIMENTAL=transfer_queue` is required for the numbers below**
+  (mechanism in Performance), and `tools/benchmark.py` now forces it. Every
+  −16% figure in this file's history predates that and is void.
 
 Performance — 1080p GRAY16 jpbd, 5000 frames, sigma 3.0/0.02 (R=9), interleaved
 pre-R80/R80 pairs through `tools/benchmark.py`, `--repeat 2`:
@@ -112,13 +110,12 @@ pre-R80/R80 pairs through `tools/benchmark.py`, `--repeat 2`:
   pre-port gap had to be the core's download.
 - The port wins exactly where a resident chain is involved: fed a GPU clip the
   old filter had to `GPUDownload` it first, the new one reads VRAM in place.
+  Judge throughput there (`--gpu-cache`): the frame is the kernel (84% at R=9),
+  so a CPU-sink number prices the chain, not the filter.
 
 Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter bilateral
 [vsfeel vszipcl] [--gpu-cache] [--bits 32] [--bilateral-args "sigma_spatial=X,
 sigma_color=Y"]`.
-- Judge throughput on a GPU-resident chain (`--gpu-cache`): transfers overlapped,
-  the frame is the kernel (84% at R=9), so a CPU-sink number prices the chain,
-  not the filter.
 
 ## Historical
 

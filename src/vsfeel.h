@@ -304,6 +304,10 @@ struct GPUDevice {
 
     VkPhysicalDeviceLimits limits {};
     uint32_t api_version {};
+    // PCI vendor of the physical device (0x1002 AMD, 0x10DE Nvidia): some
+    // workarounds key off it because an advertised feature's speed varies by
+    // vendor while its presence does not.
+    uint32_t vendor_id {};
     uint32_t queue_family {};
     // VkQueueFamilyProperties::timestampValidBits for the core's compute queue
     // family. Zero means a vkCmdWriteTimestamp2 there is invalid usage, so the

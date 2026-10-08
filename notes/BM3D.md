@@ -130,13 +130,14 @@ which is where the visible speedup is (see Performance).
   range unwitnessed rather than a clamped endpoint copy.
 - The witness (`tags`) has one region per entry, since entries key slots by frame
   index and can hold different frames in the same slot.
-- Estimation accumulates with hardware buffer float atomics where available
-  (`VK_EXT_shader_atomic_float` plus `shaderBufferFloat32AtomicAdd`; the plain
-  load/store/exchange bit is not enough), else the same kernel's
-  `-DNO_FLOAT_ATOMICS` build runs the reference's `atom_add_f` CAS loop
-  (`VSFEEL_BM3D_CAS=1` forces it). Only the base extension is required, not
-  float2. No cheaper fallback exists: pre-GFX11 AMD has no buffer f32 add, and
-  shared-memory atomics cannot help (a group's patches land anywhere).
+- Estimation accumulates with hardware buffer float atomics on AMD where
+  available (`VK_EXT_shader_atomic_float` plus `shaderBufferFloat32AtomicAdd`;
+  the plain load/store/exchange bit is not enough), and with the reference's
+  `atom_add_f` CAS loop (`-DNO_FLOAT_ATOMICS` build) everywhere else, including
+  all of Nvidia: its global FP32 add serializes under millions of concurrent
+  adds there. (`VSFEEL_BM3D_CAS=1` forces CAS.) No cheaper fallback exists:
+  pre-GFX11 AMD has no buffer f32 add, and shared-memory atomics cannot help
+  (a group's patches land anywhere).
 - Radius accepts up to 16, but the estimate cache binds first (it grows as
   `(2+2r)(2r+1)` plane pairs): 1080p runs 7 and refuses 8, 640x360 reaches 16.
   The rings hold the pipeline depth the core's pool can overlap (four frames,
@@ -252,6 +253,17 @@ which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-10-08 — hardware float atomics are AMD-only.** Gating the add on the
+  base extension alone (no float2) put Nvidia on the `atomicAdd` arm, whose
+  global FP32 adds serialize under this workload: 1.3 fps against 300 fps for
+  the CAS arm on a 3080 (GrayS 1080p, radius 2, reporter run). It is the
+  driver's lowering, not the shader: the CUDA reference accumulates with the
+  same relaxed device-scope global adds and is fast, and both SPIR-V variants
+  already emit scope Device with no availability semantics. The vendor now
+  selects the arm (AMD keeps hardware, the rest keep CAS unless
+  `VSFEEL_BM3D_FLOAT_ATOMICS=1`); the 4070 report (2.1 fps on the old build,
+  no probe output yet) is consistent with newer Nvidia drivers exposing
+  float2 and taking the same slow arm.
 - **2026-10-08 — the RX 580 TDR watch is closed.** The card has no Vulkan 1.4
   on Windows, so nothing after the R80 port runs on it to verify against; the
   per-position estimation submissions stay as the bound.
@@ -474,6 +486,8 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
   lower it to trade pipeline depth for VRAM).
 - `VSFEEL_BM3D_CAS=1` — force the CAS aggregation build on a device that has
   buffer float atomics (A/B only).
+- `VSFEEL_BM3D_FLOAT_ATOMICS=1` — force the hardware aggregation build where
+  the vendor rule selects CAS (a fixed driver or a new vendor).
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs.
   `NOSEARCH` is the matcher's reference-only path, the same thing `th_mse=0`
   selects, so it cannot price the search.

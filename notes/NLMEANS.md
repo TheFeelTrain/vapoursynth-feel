@@ -121,12 +121,8 @@ the element width doubled (128 MiB budget).
   shrinks relative to the sweep as `d` grows. GRAY16 hid the same instruction
   increase behind its transfer cost, which is why the first A/B looked
   plane-count dependent.
-- **Transfers.** `RADV_EXPERIMENTAL=transfer_queue` is required and
-  `tools/benchmark.py` forces it: without the SDMA family the core's
-  `GPUDownload` runs on the graphics engine. With it, the CPU-in default is at
-  parity and the GPU-in default is slightly ahead.
-- **GPU in / CPU out** (`--gpu-cache`): +1.6% for the port, which reads the
-  core's planes in place instead of downloading the clip for its CPU filter.
+- **Transfers** (mechanism: `notes/BILATERAL.md`): with the SDMA opt-in the
+  CPU-in default is at parity and `--gpu-cache` is +1.6% (core planes in place).
 - **The window is rebuilt every frame.** A persistent GPU slot cache copying
   only the layers that newly entered the window would cut the compose cost, but
   at the shipped `d=2` it is ~2% and not worth the holder/lifetime machinery the

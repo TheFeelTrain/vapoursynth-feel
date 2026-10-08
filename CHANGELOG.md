@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- BM3Dv2 uses hardware float atomics on devices that only report the base float atomics extension
+- BM3Dv2 uses the compare-and-swap accumulation on Nvidia GPUs
 
 ## [1.1.1] - 2026-10-05
 
