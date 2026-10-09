@@ -460,10 +460,11 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
     }
     // LDS: s_x/s_y/s0_x/s0_y hold the prediction seeds of each 8-lane group
     // (four arrays of 8 entries per group), plus the group's reference patch
-    // when it is staged there (4 x 65 floats; the odd stride keeps the four
-    // groups in different banks). The per-lane candidate lists live in
-    // registers, so nothing else is shared.
-    const uint32_t patch_bytes = d.patch_lds ? 4 * 65 * 4 : 0;
+    // when it is staged there (4 x 72 floats; the stride is a multiple of 16
+    // bytes so a patch row reads as vector loads, and it keeps the four groups
+    // in different banks). The per-lane candidate lists live in registers, so
+    // nothing else is shared.
+    const uint32_t patch_bytes = d.patch_lds ? 4 * 72 * 4 : 0;
     const GpuWorkgroup workgroup { .x = 32,
                                    .shared_bytes =
                                        4 * 8 * 4 * 4 + patch_bytes };
@@ -2048,13 +2049,14 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     d->cas_atomics =
         env_flag("VSFEEL_BM3D_CAS") || !d->gpu->feat_atomic_float32_add;
     // Where the group's reference patch lives is a codegen decision, not a
-    // register-file or cache one: the patch is a statically indexed 64-float
-    // private array, so a backend that promotes it keeps all 64 in registers
-    // (RADV/ACO: 168 VGPRs, zero scratch) and one that does not reads it out of
-    // scratch 64 times per candidate. Shared memory is the arm that is merely
-    // ~3.5% worse when the patch would have been promoted, and ~3x better when
-    // it would not, so every compiler except the one measured to promote it
-    // gets shared memory. VSFEEL_BM3D_PATCH_LDS=0/1 overrides either way.
+    // register-file or cache one: the 64 values are sixteen vec4 locals (a
+    // private array is what a backend that will not promote it stages in
+    // scratch, and then every SSD read per candidate is a memory access). A
+    // backend that keeps them in registers (RADV/ACO: 168 VGPRs, zero scratch,
+    // the same count the vectors get) pays nothing, and shared memory is 8-10%
+    // worse there; a backend that does not loses ~3x without it. Every compiler
+    // except the one measured to keep them gets shared memory.
+    // VSFEEL_BM3D_PATCH_LDS=0/1 overrides either way.
     const char * patch_lds_env = std::getenv("VSFEEL_BM3D_PATCH_LDS");
     d->patch_lds = patch_lds_env && *patch_lds_env
                        ? env_flag("VSFEEL_BM3D_PATCH_LDS")

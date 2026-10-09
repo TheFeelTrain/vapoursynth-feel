@@ -103,13 +103,18 @@ which is where the visible speedup is (see Performance).
   Eight is the floor: a neighbour's third through eighth candidates join the
   final group.
 - The group's reference patch (the 64 floats the SSD subtracts from) is either
-  64 registers per lane or one 65-float row per group in shared memory, and the
-  choice keys off the **driver**, not the vendor. It is 64 registers only if the
-  backend promotes a statically indexed private array (RADV/ACO does: 168 VGPRs,
-  zero scratch) and costs a scratch read 64 times per candidate if it does not,
-  so shared memory is the default everywhere except `VK_DRIVER_ID_MESA_RADV`,
-  where that same arm measures ~3.5% worse. The 65th float puts the four groups'
-  reads in different banks.
+  sixteen `vec4` locals per lane or one row-major copy per group in shared
+  memory, and the choice keys off the **driver**, not the vendor. Registers are
+  only right if the backend keeps the values in registers: a private array is
+  what a backend that will not promote it stages in scratch, and then every one
+  of the SSD's 64 reads per candidate is a memory access (RADV/ACO promotes even
+  the array: 168 VGPRs, zero scratch, the same count the vectors get). Shared
+  memory is the default everywhere except `VK_DRIVER_ID_MESA_RADV`, where that
+  arm measures 8-10% worse. The shared copy is row-major with a 72-float group
+  stride, so a patch row is 16-byte aligned and the SSD's eight loads per row
+  merge into two 64-bit ones (ISA-verified) while the four groups sit on banks
+  0/8/16/24. The vectors are the arm to re-test on Nvidia: the register patch is
+  what vszipcu's 350 fps does there.
 - Each walk evaluates one candidate per iteration in place (skip the reference
   origin, SSD, threshold, insert) with scalar coordinates; the row wrap is a
   `while` because the 8-lane step can overshoot a window narrower than 8.
@@ -247,7 +252,8 @@ which is where the visible speedup is (see Performance).
   memory each raised VGPRs 216 -> 240 and dropped occupancy 7 -> 6 waves/SIMD,
   losing 5-90%: the cost is dynamic LDS addressing, not traffic. The wins came
   from reducing the data instead. Two more attempts confirmed it: the reference
-  patch (64 registers per lane) in `l_cur` cost 3.5%, and the group arrays
+  patch (64 registers per lane) in shared memory cost 8-10% (ABBA, 1000 frames
+  x3, n=12: 952.8 against 879.1 fps at the current shape), and the group arrays
   (`g_e`/`g_xy`/`g_z`, 24 registers) in shared memory cost 5.8% even though they
   cut VGPRs 192 -> 144 (8 -> 10 waves) and code size 118 -> 80 KB: the group
   assembly is a serial chain of dynamic-index accesses, and LDS latency in that
@@ -261,13 +267,25 @@ which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-10-09 — the shared patch got vector reads and the register arm stopped
+  being an array.** The shared copy is row-major now, so a patch row is 16-byte
+  aligned and the SSD's eight loads per row become two `ds_load_b64` instead of
+  eight `ds_load_b32` (ISA-verified; the source loads are already
+  `buffer_load_b128` on ACO either way). The register arm holds the patch in
+  sixteen `vec4` locals instead of `float cur[64]`, which is the same 64 values
+  with no private array left for a backend to stage: ACO's stats are unchanged
+  (168 VGPRs, 0 scratch), the full suite passes against the CPU, and the 7900XTX
+  A/B is 952.8 against 879.1 fps (ABBA, 1000 frames x3, n=12), i.e. the shared
+  arm's cost is 8-10%, not the 3.5% once recorded. The vectors are the arm to
+  re-test on Nvidia: they read the patch from registers, which is what vszipcu's
+  350 fps does there.
 - **2026-10-08 — the reference patch moved to shared memory where the backend
   will not promote it (60 -> 200 fps).** With the patch in registers the 3080 ran
-  the estimation kernel at 60 fps; one 65-float row per group in shared memory
-  took it to 200 (GRAYS 1080p, r=2, bm_range 9, ps_range 4, block_step 8). The
-  mechanism is codegen, not memory: the patch is a statically indexed private
-  array, so the arm that keeps it in registers is only available on a backend
-  that promotes it, and the gate is the driver id rather than the vendor.
+  the estimation kernel at 60 fps; one shared row per group took it to 200 (GRAYS
+  1080p, r=2, bm_range 9, ps_range 4, block_step 8). The mechanism is codegen,
+  not memory: the patch is a statically indexed private array, so the arm that
+  keeps it in registers is only available on a backend that promotes it, and the
+  gate is the driver id rather than the vendor.
 - **2026-10-08 — the Nvidia slowdown was struct staging in the search walk.** The
   V-BM3D matcher's two walk loops stage state that Nvidia's backend will not
   promote: the four candidate coordinates (`int c[4]` / `int r[4]`) and, worse,

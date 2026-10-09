@@ -191,8 +191,13 @@ shared int s0_x[4][8];
 shared int s0_y[4][8];
 #ifdef PATCH_LDS
 // One reference patch per group: it depends on the group's block origin and not
-// on `sl`, so the eight lanes of a group share it. See the load in main().
-shared float cur_s[4][65];
+// on `sl`, so the eight lanes of a group share it. Rows, not columns, are the
+// contiguous axis (`CUR_AT` below), because the SSD consumes one patch row at a
+// time and a row of 8 then reads as two 16-byte loads instead of eight 4-byte
+// ones. The 72-float group stride keeps every row 16-byte aligned and puts the
+// four groups on banks 0/8/16/24 for both the fill and the reads. See the load
+// in main().
+shared float cur_s[4][72];
 #endif
 
 
@@ -561,44 +566,106 @@ float reduce_group8(float x) {
 // The reference block's SSD at one origin, expanded at each use site instead of
 // called: passing the patch to a function makes the 64 floats cross a call
 // boundary, and keeping them addressable without a call is the whole point.
-// Where the patch lives is a codegen decision, not a memory-budget one: a
-// backend that promotes the statically indexed array keeps all 64 in registers
-// (ACO: 168 VGPRs, zero scratch) and then shared memory only adds LDS traffic,
-// while one that leaves it in scratch pays that read 64 times per candidate.
-// BM3DCreate picks the arm by driver; the rule is there.
-#ifdef PATCH_LDS
-#define CUR_AT(K, I) cur_s[group][(K) * 8 + (I)]
-#else
-#define CUR_AT(K, I) cur[(K) * 8 + (I)]
-#endif
+// Where the patch lives is a codegen decision, not a memory-budget one. A
+// backend that promotes the values keeps all 64 in registers (ACO: 168 VGPRs,
+// zero scratch) and then shared memory only adds LDS traffic; one that does not
+// pays a memory read per value per candidate, which is most of the kernel. The
+// register arm therefore holds the patch in sixteen vec4 locals -- a vector with
+// constant components is an SSA value, so there is no private array left for a
+// backend to stage in scratch, and one that runs short spills single vectors
+// instead of the whole patch -- and the shared arm holds one row-major copy per
+// group (see the fill in main()). BM3DCreate picks between them by driver; the
+// rule is there.
 
+// One reference-patch row of the SSD. The row's eight values arrive as arguments
+// so the accumulation can be written once over either storage. Four
+// accumulators, each taking column k and column k + 4 of one row before the next
+// row, is the CPU's BlockSSD order: near-ties and threshold boundaries are
+// decided by it, so matching it keeps the two matchers' discrete decisions
+// together.
+#define SSD_ROW(BASE, ROWOFF, CX, C0, C1, C2, C3, C4, C5, C6, C7)          \
+    do {                                                                   \
+        const int row = (BASE) + (ROWOFF) + (CX);                          \
+        const float d0 = (C0) - src[row + 0];                              \
+        const float d1 = (C1) - src[row + 1];                              \
+        const float d2 = (C2) - src[row + 2];                              \
+        const float d3 = (C3) - src[row + 3];                              \
+        const float d4 = (C4) - src[row + 4];                              \
+        const float d5 = (C5) - src[row + 5];                              \
+        const float d6 = (C6) - src[row + 6];                              \
+        const float d7 = (C7) - src[row + 7];                              \
+        a0 = a0 + d0 * d0;                                                 \
+        a1 = a1 + d1 * d1;                                                 \
+        a2 = a2 + d2 * d2;                                                 \
+        a3 = a3 + d3 * d3;                                                 \
+        a0 = a0 + d4 * d4;                                                 \
+        a1 = a1 + d5 * d5;                                                 \
+        a2 = a2 + d6 * d6;                                                 \
+        a3 = a3 + d7 * d7;                                                 \
+    } while (false)
+
+#ifdef PATCH_LDS
+#define CUR(K, I) cur_s[group][(I) * 8 + (K)]
 #define SSD_AT(BASE, CX, CY, OUT)                                          \
     do {                                                                   \
         float a0 = 0.0f;                                                   \
         float a1 = 0.0f;                                                   \
         float a2 = 0.0f;                                                   \
         float a3 = 0.0f;                                                   \
-        for (int i = 0; i < 8; ++i) {                                      \
-            const int row = (BASE) + (CY + i) * STRIDE + (CX);             \
-            const float d0 = CUR_AT(0, i) - src[row + 0];                  \
-            const float d1 = CUR_AT(1, i) - src[row + 1];                  \
-            const float d2 = CUR_AT(2, i) - src[row + 2];                  \
-            const float d3 = CUR_AT(3, i) - src[row + 3];                  \
-            const float d4 = CUR_AT(4, i) - src[row + 4];                  \
-            const float d5 = CUR_AT(5, i) - src[row + 5];                  \
-            const float d6 = CUR_AT(6, i) - src[row + 6];                  \
-            const float d7 = CUR_AT(7, i) - src[row + 7];                  \
-            a0 = a0 + d0 * d0;                                             \
-            a1 = a1 + d1 * d1;                                             \
-            a2 = a2 + d2 * d2;                                             \
-            a3 = a3 + d3 * d3;                                             \
-            a0 = a0 + d4 * d4;                                             \
-            a1 = a1 + d5 * d5;                                             \
-            a2 = a2 + d6 * d6;                                             \
-            a3 = a3 + d7 * d7;                                             \
-        }                                                                  \
+        SSD_ROW(BASE, (CY + 0) * STRIDE, CX, CUR(0, 0), CUR(1, 0),         \
+                CUR(2, 0), CUR(3, 0), CUR(4, 0), CUR(5, 0), CUR(6, 0),     \
+                CUR(7, 0));                                                \
+        SSD_ROW(BASE, (CY + 1) * STRIDE, CX, CUR(0, 1), CUR(1, 1),         \
+                CUR(2, 1), CUR(3, 1), CUR(4, 1), CUR(5, 1), CUR(6, 1),     \
+                CUR(7, 1));                                                \
+        SSD_ROW(BASE, (CY + 2) * STRIDE, CX, CUR(0, 2), CUR(1, 2),         \
+                CUR(2, 2), CUR(3, 2), CUR(4, 2), CUR(5, 2), CUR(6, 2),     \
+                CUR(7, 2));                                                \
+        SSD_ROW(BASE, (CY + 3) * STRIDE, CX, CUR(0, 3), CUR(1, 3),         \
+                CUR(2, 3), CUR(3, 3), CUR(4, 3), CUR(5, 3), CUR(6, 3),     \
+                CUR(7, 3));                                                \
+        SSD_ROW(BASE, (CY + 4) * STRIDE, CX, CUR(0, 4), CUR(1, 4),         \
+                CUR(2, 4), CUR(3, 4), CUR(4, 4), CUR(5, 4), CUR(6, 4),     \
+                CUR(7, 4));                                                \
+        SSD_ROW(BASE, (CY + 5) * STRIDE, CX, CUR(0, 5), CUR(1, 5),         \
+                CUR(2, 5), CUR(3, 5), CUR(4, 5), CUR(5, 5), CUR(6, 5),     \
+                CUR(7, 5));                                                \
+        SSD_ROW(BASE, (CY + 6) * STRIDE, CX, CUR(0, 6), CUR(1, 6),         \
+                CUR(2, 6), CUR(3, 6), CUR(4, 6), CUR(5, 6), CUR(6, 6),     \
+                CUR(7, 6));                                                \
+        SSD_ROW(BASE, (CY + 7) * STRIDE, CX, CUR(0, 7), CUR(1, 7),         \
+                CUR(2, 7), CUR(3, 7), CUR(4, 7), CUR(5, 7), CUR(6, 7),     \
+                CUR(7, 7));                                                \
         (OUT) = ((a0 + a1) + a2) + a3;                                     \
     } while (false)
+#else
+// Two vectors per patch row: p0/p1 are row 0's columns 0-3 and 4-7, p2/p3 row
+// 1's, and so on. See the declaration in main().
+#define SSD_AT(BASE, CX, CY, OUT)                                          \
+    do {                                                                   \
+        float a0 = 0.0f;                                                   \
+        float a1 = 0.0f;                                                   \
+        float a2 = 0.0f;                                                   \
+        float a3 = 0.0f;                                                   \
+        SSD_ROW(BASE, (CY + 0) * STRIDE, CX, p0.x, p0.y, p0.z, p0.w,       \
+                p1.x, p1.y, p1.z, p1.w);                                   \
+        SSD_ROW(BASE, (CY + 1) * STRIDE, CX, p2.x, p2.y, p2.z, p2.w,       \
+                p3.x, p3.y, p3.z, p3.w);                                   \
+        SSD_ROW(BASE, (CY + 2) * STRIDE, CX, p4.x, p4.y, p4.z, p4.w,       \
+                p5.x, p5.y, p5.z, p5.w);                                   \
+        SSD_ROW(BASE, (CY + 3) * STRIDE, CX, p6.x, p6.y, p6.z, p6.w,       \
+                p7.x, p7.y, p7.z, p7.w);                                   \
+        SSD_ROW(BASE, (CY + 4) * STRIDE, CX, p8.x, p8.y, p8.z, p8.w,       \
+                p9.x, p9.y, p9.z, p9.w);                                   \
+        SSD_ROW(BASE, (CY + 5) * STRIDE, CX, p10.x, p10.y, p10.z, p10.w,   \
+                p11.x, p11.y, p11.z, p11.w);                               \
+        SSD_ROW(BASE, (CY + 6) * STRIDE, CX, p12.x, p12.y, p12.z, p12.w,   \
+                p13.x, p13.y, p13.z, p13.w);                               \
+        SSD_ROW(BASE, (CY + 7) * STRIDE, CX, p14.x, p14.y, p14.z, p14.w,   \
+                p15.x, p15.y, p15.z, p15.w);                               \
+        (OUT) = ((a0 + a1) + a2) + a3;                                     \
+    } while (false)
+#endif
 
 // The candidate's (x, y) pair travels packed in one word: the insert shifts one
 // array per position, and folding x and y into a single word makes that two
@@ -904,20 +971,53 @@ void main() {
     const int anchor_pc = src_search(KRADIUS, 0);
 #ifdef PATCH_LDS
     // The reference patch depends on the group's block origin, not on `sl`, so
-    // all eight lanes of a group share one copy. In shared memory it costs 65
-    // floats per group instead of 64 registers per lane; the stride is 65 so
-    // the four groups' reads land in different banks.
+    // all eight lanes of a group share one copy. In shared memory it costs 72
+    // floats per group instead of 64 registers per lane. `k` is the row-major
+    // index, so lane `sl` fills column `sl` of every row, and each group's eight
+    // lanes read one coalesced 32-byte run of a source row per step.
     for (int k = sl; k < 64; k += 8) {
         cur_s[group][k] =
-            src[anchor_pc + (y + (k & 7)) * STRIDE + (x + (k >> 3))];
+            src[anchor_pc + (y + (k >> 3)) * STRIDE + (x + (k & 7))];
     }
     barrier();
 #else
-    float cur[64];
-    for (int c = 0; c < 8; ++c) {
-        for (int i = 0; i < 8; ++i) {
-            cur[c * 8 + i] = src[anchor_pc + (y + i) * STRIDE + (x + c)];
-        }
+    // Sixteen vectors rather than a `float cur[64]`: a private array is what a
+    // backend that will not promote it stages in scratch, and then every one of
+    // the SSD's 64 reads per candidate is a memory access.
+    vec4 p0, p1, p2, p3, p4, p5, p6, p7;
+    vec4 p8, p9, p10, p11, p12, p13, p14, p15;
+    {
+        const int pb = anchor_pc + y * STRIDE + x;
+        p0 = vec4(src[pb + 0], src[pb + 1], src[pb + 2], src[pb + 3]);
+        p1 = vec4(src[pb + 4], src[pb + 5], src[pb + 6], src[pb + 7]);
+        p2 = vec4(src[pb + STRIDE + 0], src[pb + STRIDE + 1],
+                  src[pb + STRIDE + 2], src[pb + STRIDE + 3]);
+        p3 = vec4(src[pb + STRIDE + 4], src[pb + STRIDE + 5],
+                  src[pb + STRIDE + 6], src[pb + STRIDE + 7]);
+        p4 = vec4(src[pb + 2 * STRIDE + 0], src[pb + 2 * STRIDE + 1],
+                  src[pb + 2 * STRIDE + 2], src[pb + 2 * STRIDE + 3]);
+        p5 = vec4(src[pb + 2 * STRIDE + 4], src[pb + 2 * STRIDE + 5],
+                  src[pb + 2 * STRIDE + 6], src[pb + 2 * STRIDE + 7]);
+        p6 = vec4(src[pb + 3 * STRIDE + 0], src[pb + 3 * STRIDE + 1],
+                  src[pb + 3 * STRIDE + 2], src[pb + 3 * STRIDE + 3]);
+        p7 = vec4(src[pb + 3 * STRIDE + 4], src[pb + 3 * STRIDE + 5],
+                  src[pb + 3 * STRIDE + 6], src[pb + 3 * STRIDE + 7]);
+        p8 = vec4(src[pb + 4 * STRIDE + 0], src[pb + 4 * STRIDE + 1],
+                  src[pb + 4 * STRIDE + 2], src[pb + 4 * STRIDE + 3]);
+        p9 = vec4(src[pb + 4 * STRIDE + 4], src[pb + 4 * STRIDE + 5],
+                  src[pb + 4 * STRIDE + 6], src[pb + 4 * STRIDE + 7]);
+        p10 = vec4(src[pb + 5 * STRIDE + 0], src[pb + 5 * STRIDE + 1],
+                   src[pb + 5 * STRIDE + 2], src[pb + 5 * STRIDE + 3]);
+        p11 = vec4(src[pb + 5 * STRIDE + 4], src[pb + 5 * STRIDE + 5],
+                   src[pb + 5 * STRIDE + 6], src[pb + 5 * STRIDE + 7]);
+        p12 = vec4(src[pb + 6 * STRIDE + 0], src[pb + 6 * STRIDE + 1],
+                   src[pb + 6 * STRIDE + 2], src[pb + 6 * STRIDE + 3]);
+        p13 = vec4(src[pb + 6 * STRIDE + 4], src[pb + 6 * STRIDE + 5],
+                   src[pb + 6 * STRIDE + 6], src[pb + 6 * STRIDE + 7]);
+        p14 = vec4(src[pb + 7 * STRIDE + 0], src[pb + 7 * STRIDE + 1],
+                   src[pb + 7 * STRIDE + 2], src[pb + 7 * STRIDE + 3]);
+        p15 = vec4(src[pb + 7 * STRIDE + 4], src[pb + 7 * STRIDE + 5],
+                   src[pb + 7 * STRIDE + 6], src[pb + 7 * STRIDE + 7]);
     }
 #endif
     // The reference block is the group's first member and is never matched
