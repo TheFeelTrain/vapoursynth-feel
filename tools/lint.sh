@@ -27,6 +27,14 @@
 #
 # A gate whose tool is missing reports SKIP rather than passing quietly; a gate
 # whose build directory is missing is an error, because then it did not run.
+#
+# tidy and cppcheck are the two slow gates, and both are per-TU work: serial,
+# they are most of a lint run's five minutes. clang-tidy has no -j of its own,
+# so run-clang-tidy.py -- the console script the pinned clang-tidy wheel installs
+# -- drives it; cppcheck takes -j itself. The TUs are independent, so the fan-out
+# changes nothing about the findings. VSFEEL_LINT_JOBS sets the worker count; the
+# default is the CPU count capped at 8, because each analyser takes a few hundred
+# MB and an unbounded fan-out on a big box is how a lint run gets OOM-killed.
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -67,6 +75,7 @@ usage() {
 usage: tools/lint.sh [--fix] [gate ...]
   gates: format shaders tidy cppcheck ruff notes   (default: all of them)
   --fix  apply clang-format -i, clang-tidy --fix and ruff's fixes first
+  VSFEEL_LINT_JOBS sets the tidy/cppcheck worker count (default: CPUs, max 8)
 EOF
 }
 
@@ -92,6 +101,19 @@ need_build() {
         printf '    run tools/install.sh (or configure with -D CMAKE_EXPORT_COMPILE_COMMANDS=ON)\n' >&2
         return 1
     fi
+}
+
+# Worker count for the two analysis gates (see the header comment).
+lint_jobs() {
+    local n=${VSFEEL_LINT_JOBS:-}
+    if [ -z "$n" ]; then
+        # nproc on Linux, sysctl on macOS; 1 keeps the gate working anywhere else.
+        n=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || printf 1)
+    fi
+    if [ "$n" -gt 8 ]; then
+        n=8
+    fi
+    printf '%s' "$n"
 }
 
 gate_format() {
@@ -131,12 +153,23 @@ gate_tidy() {
     have "$clang_tidy" || { skip "$clang_tidy"; return 2; }
     need_build || return 1
     local files=("$root_dir"/src/*.cpp)
+    local -a tidy
+    # run-clang-tidy.py ships with the pinned clang-tidy wheel; -clang-tidy-binary
+    # pins it to the same binary the version banner named, instead of letting the
+    # driver resolve its own from PATH.
+    if have run-clang-tidy.py; then
+        tidy=(run-clang-tidy.py -clang-tidy-binary "$(command -v "$clang_tidy")" \
+            -p "$build_dir" -quiet -j "$(lint_jobs)")
+    else
+        tidy=("$clang_tidy" -p "$build_dir" --quiet)
+    fi
     if [ "$fix" -eq 1 ]; then
         # Fix what is fixable, then check: the gate must report the tree's real
-        # state, not the pre-fix one.
-        "$clang_tidy" -p "$build_dir" --fix --quiet "${files[@]}" || true
+        # state, not the pre-fix one. run-clang-tidy.py only applies the fixes
+        # here; the plain pass below is what reports whatever is left.
+        "${tidy[@]}" -fix "${files[@]}" || true
     fi
-    "$clang_tidy" -p "$build_dir" --quiet "${files[@]}" || return 1
+    "${tidy[@]}" "${files[@]}" || return 1
 }
 
 gate_cppcheck() {
@@ -144,7 +177,8 @@ gate_cppcheck() {
     need_build || return 1
     # *:*/vapoursynth/include/* drops findings in VSVulkan4.h. The plugin's own
     # path contains "vapoursynth-feel", which that glob deliberately misses.
-    "$cppcheck" --project="$build_dir/compile_commands.json" \
+    # -j is per-file here, the same set --file-filter keeps.
+    "$cppcheck" -j "$(lint_jobs)" --project="$build_dir/compile_commands.json" \
         --file-filter='*/src/*' \
         --enable=warning,performance,portability \
         --inline-suppr --quiet --error-exitcode=1 \
