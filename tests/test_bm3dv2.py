@@ -188,6 +188,26 @@ def test_bm3dv2_cas_fallback_holds_at_small_block_step(clip_gray, monkeypatch):
         )
 
 
+def test_bm3dv2_shared_reference_patch_matches_registers(clip_gray, monkeypatch):
+    """The reference-patch arm a non-RADV driver gets must match the other.
+
+    `VSFEEL_BM3D_PATCH_LDS` moves the group's reference patch between 64
+    registers per lane and one shared row per group. Only the storage differs,
+    so both arms subtract the same values in the same order; the comparison
+    floor is the aggregation's atomic order, the same one the determinism test
+    bounds (measured 2.98e-7 at frames 0/11/23, |max| ~ 1).
+    """
+    monkeypatch.setenv("VSFEEL_BM3D_PATCH_LDS", "0")
+    registers = _run(clip_gray, radius=2)
+    monkeypatch.setenv("VSFEEL_BM3D_PATCH_LDS", "1")
+    lds = _run(clip_gray, radius=2)
+    for n in (0, 11, 23):
+        a = frame_to_ndarray(registers.get_frame(n))
+        b = frame_to_ndarray(lds.get_frame(n))
+        assert np.isfinite(b).all(), f"non-finite shared-patch output at frame {n}"
+        assert np.abs(a - b).max() < 1e-5, f"shared patch vs registers at frame {n}"
+
+
 def test_bm3dv2_disjoint_first_estimates_keep_slice_witnesses(clip_gray):
     """Concurrent opposite-end windows must not clear each other's tags."""
     import threading

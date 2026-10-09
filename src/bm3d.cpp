@@ -177,8 +177,9 @@ struct BM3DData {
     bool
         cas_atomics {}; // aggregate with the CAS kernel (no float32 add atomics)
     // Stage the group's reference patch in shared memory instead of 64 registers
-    // per lane: Nvidia cannot afford the registers, AMD cannot afford the LDS
-    // traffic. See create_bm3d_pipeline and src/bm3d.comp.
+    // per lane: a backend that promotes the array cannot afford the LDS traffic,
+    // one that leaves it in scratch cannot afford the reads. See the driver rule
+    // in BM3DCreate and src/bm3d.comp.
     bool patch_lds {};
     // chroma=True: one joint entry over the clip's three 4:4:4 planes, whose
     // groups come from luma (the references' "chroma" mode).
@@ -464,7 +465,8 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
     // registers, so nothing else is shared.
     const uint32_t patch_bytes = d.patch_lds ? 4 * 65 * 4 : 0;
     const GpuWorkgroup workgroup { .x = 32,
-                                   .shared_bytes = 4 * 8 * 4 * 4 + patch_bytes };
+                                   .shared_bytes =
+                                       4 * 8 * 4 * 4 + patch_bytes };
     return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(),
                                &spec, static_cast<uint32_t>(entries.size()),
                                sizeof(spec), "bm3d", subgroup_size, workgroup);
@@ -2045,17 +2047,25 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // atom_add_f CAS loop. VSFEEL_BM3D_CAS forces the CAS build.
     d->cas_atomics =
         env_flag("VSFEEL_BM3D_CAS") || !d->gpu->feat_atomic_float32_add;
-    // Nvidia is register-bound here (128 registers and a 215808-byte binary with
-    // the patch in registers, against 168 and 128256 without it), AMD is not and
-    // pays about 10% for the LDS traffic. VSFEEL_BM3D_PATCH_LDS overrides.
-    d->patch_lds =
-        d->gpu->vendor_id == 0x10DEu || env_flag("VSFEEL_BM3D_PATCH_LDS");
+    // Where the group's reference patch lives is a codegen decision, not a
+    // register-file or cache one: the patch is a statically indexed 64-float
+    // private array, so a backend that promotes it keeps all 64 in registers
+    // (RADV/ACO: 168 VGPRs, zero scratch) and one that does not reads it out of
+    // scratch 64 times per candidate. Shared memory is the arm that is merely
+    // ~3.5% worse when the patch would have been promoted, and ~3x better when
+    // it would not, so every compiler except the one measured to promote it
+    // gets shared memory. VSFEEL_BM3D_PATCH_LDS=0/1 overrides either way.
+    const char * patch_lds_env = std::getenv("VSFEEL_BM3D_PATCH_LDS");
+    d->patch_lds = patch_lds_env && *patch_lds_env
+                       ? env_flag("VSFEEL_BM3D_PATCH_LDS")
+                       : d->gpu->driver_id != VK_DRIVER_ID_MESA_RADV;
     if (vsfeel_device_info_enabled()) {
         fprintf(stderr, "[bm3d] aggregation: %s\n",
                 d->cas_atomics ? "CAS loop (atom_add_f fallback)"
                                : "hardware buffer float atomics");
-        fprintf(stderr, "[bm3d] reference patch: %s\n",
-                d->patch_lds ? "shared memory" : "per-lane registers");
+        fprintf(stderr, "[bm3d] reference patch: %s (driver %u)\n",
+                d->patch_lds ? "shared memory" : "per-lane registers",
+                d->gpu->driver_id);
     }
     // The 8x8 group transposes and the group-8 reduction are subgroup shuffles,
     // and the kernel's per-lane layout puts each 8-lane group inside one
@@ -2422,9 +2432,9 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         const auto & first = d->planes[g.planes[0]];
         {
             // A one-plane entry gets the loop-free build (a one-trip loop over
-            // the NPLANES spec constant still costs Nvidia about 2x, because it
-            // keeps the whole body inside a loop and spills), and Nvidia gets
-            // the build that stages the reference patch in shared memory. See
+            // the NPLANES spec constant still costs a backend that will not
+            // hoist the body out of it about 2x), and the arm the driver rule
+            // picked decides whether the reference patch is staged. See
             // src/bm3d.comp for both.
             const bool one_plane = g.n_planes == 1;
             const uint32_t * code = nullptr;
@@ -2434,21 +2444,19 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
                            ? (one_plane ? bm3d_cas_lds_1plane_spv
                                         : bm3d_cas_lds_spv)
                            : (one_plane ? bm3d_cas_1plane_spv : bm3d_cas_spv);
-                code_size =
-                    d->patch_lds
-                        ? (one_plane ? bm3d_cas_lds_1plane_spv_size
-                                     : bm3d_cas_lds_spv_size)
-                        : (one_plane ? bm3d_cas_1plane_spv_size
-                                     : bm3d_cas_spv_size);
+                code_size = d->patch_lds
+                                ? (one_plane ? bm3d_cas_lds_1plane_spv_size
+                                             : bm3d_cas_lds_spv_size)
+                                : (one_plane ? bm3d_cas_1plane_spv_size
+                                             : bm3d_cas_spv_size);
             } else {
                 code = d->patch_lds
                            ? (one_plane ? bm3d_lds_1plane_spv : bm3d_lds_spv)
                            : (one_plane ? bm3d_1plane_spv : bm3d_spv);
-                code_size =
-                    d->patch_lds
-                        ? (one_plane ? bm3d_lds_1plane_spv_size
-                                     : bm3d_lds_spv_size)
-                        : (one_plane ? bm3d_1plane_spv_size : bm3d_spv_size);
+                code_size = d->patch_lds ? (one_plane ? bm3d_lds_1plane_spv_size
+                                                      : bm3d_lds_spv_size)
+                                         : (one_plane ? bm3d_1plane_spv_size
+                                                      : bm3d_spv_size);
             }
             const auto result = create_bm3d_pipeline(
                 *d->gpu, *d, g, code, code_size, d->pipeline_layout);

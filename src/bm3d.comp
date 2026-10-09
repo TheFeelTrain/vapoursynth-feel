@@ -561,9 +561,11 @@ float reduce_group8(float x) {
 // The reference block's SSD at one origin, expanded at each use site instead of
 // called: passing the patch to a function makes the 64 floats cross a call
 // boundary, and keeping them addressable without a call is the whole point.
-// Where the patch lives is the one vendor split here: shared memory costs AMD
-// about 10% in LDS traffic, but takes Nvidia's local footprint from 2632 to 1944
-// elements, which is the arm that is fast there.
+// Where the patch lives is a codegen decision, not a memory-budget one: a
+// backend that promotes the statically indexed array keeps all 64 in registers
+// (ACO: 168 VGPRs, zero scratch) and then shared memory only adds LDS traffic,
+// while one that leaves it in scratch pays that read 64 times per candidate.
+// BM3DCreate picks the arm by driver; the rule is there.
 #ifdef PATCH_LDS
 #define CUR_AT(K, I) cur_s[group][(K) * 8 + (I)]
 #else
@@ -629,11 +631,6 @@ void insert_cand(inout float e[8], inout int xy[8], float err_, int xy_) {
         vxy = take ? tx : vxy;
     }
 }
-
-// Evaluate one candidate of a scan and keep it if it qualifies. Written as a
-// function so a walk body can evaluate several candidates per iteration: their
-// SSDs are independent, which gives the scheduler more than one chain of loads
-// to keep in flight.
 
 // 8-way merge of the per-lane lists into the group's best `n` entries, in the
 // same (error, y, x) order. Every lane walks the same tournament -- three

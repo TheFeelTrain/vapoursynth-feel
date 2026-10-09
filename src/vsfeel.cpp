@@ -379,6 +379,10 @@ get_gpu_device(VSCore * core, const VSAPI * vsapi) {
         }
     }
 
+    // driverID lives in VkPhysicalDeviceDriverProperties (core in 1.2, and the
+    // core refuses any device below 1.4), so it chains in unconditionally.
+    VkPhysicalDeviceDriverProperties driver {};
+    driver.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
     VkPhysicalDevicePushDescriptorProperties push_desc {};
     push_desc.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES;
@@ -393,11 +397,12 @@ get_gpu_device(VSCore * core, const VSAPI * vsapi) {
     subgroup.pNext = &size_control;
     VkPhysicalDeviceProperties2 props {};
     props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-    props.pNext = &subgroup;
+    props.pNext = &driver;
+    driver.pNext = &subgroup;
     vk->vkGetPhysicalDeviceProperties2(handles.physicalDevice, &props);
     dev->limits = props.properties.limits;
     dev->api_version = props.properties.apiVersion;
-    dev->vendor_id = props.properties.vendorID;
+    dev->driver_id = driver.driverID;
     dev->subgroup_size = subgroup.subgroupSize;
     dev->min_subgroup_size = size_control.minSubgroupSize;
     dev->max_subgroup_size = size_control.maxSubgroupSize;

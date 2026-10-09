@@ -102,8 +102,17 @@ which is where the visible speedup is (see Performance).
   predictive windows are read into registers once per window, not per candidate.
   Eight is the floor: a neighbour's third through eighth candidates join the
   final group.
-- Each walk evaluates one candidate per iteration through the shared
-  `scan_cand` helper (skip the reference origin, SSD, threshold, insert).
+- The group's reference patch (the 64 floats the SSD subtracts from) is either
+  64 registers per lane or one 65-float row per group in shared memory, and the
+  choice keys off the **driver**, not the vendor. It is 64 registers only if the
+  backend promotes a statically indexed private array (RADV/ACO does: 168 VGPRs,
+  zero scratch) and costs a scratch read 64 times per candidate if it does not,
+  so shared memory is the default everywhere except `VK_DRIVER_ID_MESA_RADV`,
+  where that same arm measures ~3.5% worse. The 65th float puts the four groups'
+  reads in different banks.
+- Each walk evaluates one candidate per iteration in place (skip the reference
+  origin, SSD, threshold, insert) with scalar coordinates; the row wrap is a
+  `while` because the 8-lane step can overshoot a window narrower than 8.
   Unrolling the walk to two or four candidates per iteration was tried and
   lost: it buys load-level parallelism but costs a wave of occupancy, and the
   loop is latency-bound, not issue-bound (see Performance).
@@ -252,6 +261,13 @@ which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-10-08 — the reference patch moved to shared memory where the backend
+  will not promote it (60 -> 200 fps).** With the patch in registers the 3080 ran
+  the estimation kernel at 60 fps; one 65-float row per group in shared memory
+  took it to 200 (GRAYS 1080p, r=2, bm_range 9, ps_range 4, block_step 8). The
+  mechanism is codegen, not memory: the patch is a statically indexed private
+  array, so the arm that keeps it in registers is only available on a backend
+  that promotes it, and the gate is the driver id rather than the vendor.
 - **2026-10-08 — the Nvidia slowdown was struct staging in the search walk.** The
   V-BM3D matcher's two walk loops stage state that Nvidia's backend will not
   promote: the four candidate coordinates (`int c[4]` / `int r[4]`) and, worse,
@@ -490,8 +506,8 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
   lower it to trade pipeline depth for VRAM).
 - `VSFEEL_BM3D_CAS=1` — force the CAS aggregation build on a device that has
   buffer float atomics (A/B only).
-- `VSFEEL_BM3D_PATCH_LDS=1` — force the shared-memory reference patch on a
-  vendor the rule does not select it for (Nvidia does by default).
+- `VSFEEL_BM3D_PATCH_LDS=0/1` — force either reference-patch arm; unset follows
+  the driver rule (shared memory everywhere except RADV).
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs.
   `NOSEARCH` is the matcher's reference-only path, the same thing `th_mse=0`
   selects, so it cannot price the search.
