@@ -109,11 +109,8 @@ which is where the visible speedup is (see Performance).
   with it). ACO promotes them either way; a backend that will not has no choice.
 - The combined group list (`ge`/`gxy`/`gz`) is the one private array left whose
   index is not a compile-time constant (the tail sort's `b` and the insert's
-  `pos`), and a backend that will not promote it stages it in local memory: on
-  Ada `ptxas` reports a 96 B stack with an `LDL`/`STL` per lane and touch, and
-  the eight lanes of a group sit at different local addresses. All eight lanes
-  hold the same list, so the shared arm is one broadcast access per group
-  instead; it rides the patch's driver gate.
+  `pos`). It stays per-lane: a shared-memory copy of it measured 2.6x slower on
+  Ada (see Historical).
 - The group's reference patch (the 64 floats the SSD subtracts from) is either
   sixteen `vec4` locals per lane or one row-major copy per group in shared
   memory, and the choice keys off the **driver**, not the vendor. Registers are
@@ -271,11 +268,8 @@ which is where the visible speedup is (see Performance).
   (`g_e`/`g_xy`/`g_z`, 24 registers) in shared memory cost 5.8% even though they
   cut VGPRs 192 -> 144 (8 -> 10 waves) and code size 118 -> 80 KB: the group
   assembly is a serial chain of dynamic-index accesses, and LDS latency in that
-  chain costs more than the occupancy buys. That verdict is ACO's, and holds
-  only where the compiler promotes the private arrays: on Ada `ptxas` stages the
-  group list in local memory, so the same move trades an uncoalesced per-lane
-  local access for one broadcast LDS access and is enabled there (see
-  Implementation).
+  chain costs more than the occupancy buys. On Ada the same move is worse still:
+  sharing the group list costs the whole filter 2.6x (see Historical).
 - Color costs the planes: 4:2:0 is 1.5x the luma-only estimate/source footprint
   and 4:4:4/RGB 3x, all inside the same `maxStorageBufferRange` budget.
 - The multi-plane round did not move the luma path (NPLANES == 1: 6131 vs 6133
@@ -289,30 +283,24 @@ Chronological; each entry keeps the mechanism, not the story.
   the patches.** `[[unroll]]` on the transform, threshold, estimate and
   bookkeeping loops takes the shipped SPIR-V from 132 loops and 25
   dynamically-indexed `float[64]` locals to 36 loops and none; the group list's
-  runtime `b`/`pos` are the only variable indices left, and GROUP_LDS covers
-  them. Costs: module 135 KB -> 576 KB, ACO ISA 107.7 KB -> 136.8 KB,
+  runtime `b`/`pos` are the only variable indices left, and they stay per-lane. Costs: module 135 KB -> 576 KB, ACO ISA 107.7 KB -> 136.8 KB,
   `libvsfeel.so` 21.5 -> 24.9 MB; VGPRs, scratch, LDS and cold creation are
   unchanged (0.20 -> 0.21 s). RADV ABBA A/B (800 frames x3, n=12) is 898.5
   against 896.5 fps, -0.2%: neutral where ACO already unrolled. Output is
   unchanged within the filter's own atomic-order floor (same-binary reruns differ
   by up to 3.6e-7 over 12% of pixels, the cross-build pair by 3.0e-7). Whether it
   stays is an Nvidia measurement.
-- **2026-10-09 — the group list, not the patch, is the array Nvidia stages, and
-  it now rides the shared arm.** A `spirv-dis` pass over the production variants
-  finds `ge`/`gxy`/`gz` as the only private arrays indexed by a non-constant
-  (the tail sort's `b`, the insert's `pos`); every other one,
-  `denoising_patch[64]` and the transforms included, is unrolled to constants. An
-  `nvcc -arch=sm_89 -Xptxas -v` model of `group_add` stages them in local memory
-  (96 B stack, an `LDL`/`STL` per lane and touch) where the constant-indexed
-  `insert_cand` gets 0 stack. All eight lanes of a group hold the same list, so
-  the arm makes each touch one broadcast per group; it is gated on the patch
-  rule, so RADV keeps its register arm (500-frame medians: default unchanged at
-  936, `PATCH_LDS=1` 861 against 854 before, i.e. the group list itself is
-  neutral on ACO) and the full suite passes on both arms. The 4070 number is
-  pending; the mechanism puts `VSFEEL_BM3D_PATCH_LDS=1` (that card's default) as
-  the arm to measure. The same report shows the `vec4` register arm is a 16%
-  regression on Ada against the `float cur[64]` it replaced (193 against 229.7),
-  which is latent while the shared arm is the Nvidia default.
+- **2026-10-09 — the group list in shared memory is a 2.6x regression on Ada;
+  reverted.** The list's indices are the only runtime ones left, and the ptxas
+  model above stages the per-lane arrays in local memory, so the shared arm
+  looked free. It is not: on the 4070, with the patch already shared, moving the
+  group list to LDS takes that card's default arm from 232.9 to 90.4 fps. RADV is
+  indifferent to the group list itself (861 against 854 at `PATCH_LDS=1`), so the
+  cost is that backend's, not the access pattern's. A private array in local
+  memory is not by itself a reason to move a datum to shared memory; the model
+  proposed and the in-situ A/B disposed. The same report shows the `vec4`
+  register arm is a 16% regression on Ada against the `float cur[64]` it replaced
+  (193 against 229.7), which is latent while the shared arm is the Nvidia default.
 - **2026-10-09 — the shared patch got vector reads and the register arm stopped
   being an array.** The shared copy is row-major now, so a patch row is 16-byte
   aligned and the SSD's eight loads per row become two `ds_load_b64` instead of
@@ -570,9 +558,8 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
   lower it to trade pipeline depth for VRAM).
 - `VSFEEL_BM3D_CAS=1` — force the CAS aggregation build on a device that has
   buffer float atomics (A/B only).
-- `VSFEEL_BM3D_PATCH_LDS=0/1` — force either shared-staging arm (reference patch
-  and group list together); unset follows the driver rule (shared memory
-  everywhere except RADV).
+- `VSFEEL_BM3D_PATCH_LDS=0/1` — force either reference-patch arm; unset follows
+  the driver rule (shared memory everywhere except RADV).
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs.
   `NOSEARCH` is the matcher's reference-only path, the same thing `th_mse=0`
   selects, so it cannot price the search.

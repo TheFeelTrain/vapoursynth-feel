@@ -460,17 +460,14 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
     }
     // LDS: s_x/s_y/s0_x/s0_y hold the prediction seeds of each 8-lane group
     // (four arrays of 8 entries per group), plus the group's reference patch
-    // and group list when those ride the shared arm (4 x 72 floats and
-    // 4 x 8 x 3 words; the patch stride is a multiple of 16 bytes so a patch row
-    // reads as vector loads, and it keeps the four groups in different banks).
-    // The per-lane candidate lists live in registers, so nothing else is shared.
+    // when it is staged there (4 x 72 floats; the stride is a multiple of 16
+    // bytes so a patch row reads as vector loads, and it keeps the four groups
+    // in different banks). The per-lane candidate lists live in registers, so
+    // nothing else is shared.
     const uint32_t patch_bytes = d.patch_lds ? 4 * 72 * 4 : 0;
-    // GROUP_LDS rides PATCH_LDS: grp_e/grp_xy/grp_z, one float + two int words
-    // per entry. See src/bm3d.comp.
-    const uint32_t group_bytes = d.patch_lds ? 4 * 8 * 3 * 4 : 0;
-    const GpuWorkgroup workgroup {
-        .x = 32, .shared_bytes = 4 * 8 * 4 * 4 + patch_bytes + group_bytes
-    };
+    const GpuWorkgroup workgroup { .x = 32,
+                                   .shared_bytes =
+                                       4 * 8 * 4 * 4 + patch_bytes };
     return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(),
                                &spec, static_cast<uint32_t>(entries.size()),
                                sizeof(spec), "bm3d", subgroup_size, workgroup);
