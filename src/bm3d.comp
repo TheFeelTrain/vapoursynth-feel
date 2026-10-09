@@ -199,6 +199,38 @@ shared int s0_y[4][8];
 // in main().
 shared float cur_s[4][72];
 #endif
+// GROUP_LDS rides the patch arm's driver rule: the reference patch and the group
+// list are the two kernel-live structures a backend either promotes to registers
+// or stages. See the group list's declaration below for why.
+#ifdef PATCH_LDS
+#define GROUP_LDS
+#endif
+// The accumulated group list of one 8-lane group (the reference plus its
+// retained members). Every lane of a group holds the same list -- the merge
+// broadcasts it -- so the eight lanes always touch the same entry. The insertion
+// sort below indexes it with `b`/`pos`, which are the only dynamic indices left
+// in the kernel (every other private array, the 64-float patches included, is
+// indexed by unrolled constants). A backend that will not promote a dynamically
+// indexed private array stages it in local memory (Nvidia does), where each of
+// those touches is one uncoalesced access per lane; in shared memory the same
+// touch is one broadcast per group. Where the compiler does promote the arrays
+// (RADV) shared memory measured 5.8% slower, so this rides the same gate as the
+// patch rather than being unconditional.
+#ifdef GROUP_LDS
+shared float grp_e[4][8];
+shared int grp_xy[4][8];
+shared int grp_z[4][8];
+#define GE(g, k) grp_e[g][k]
+#define GXY(g, k) grp_xy[g][k]
+#define GZ(g, k) grp_z[g][k]
+#define GROUP_ADD(E, X, Z) group_add(group, gcount, goverflow, (E), (X), (Z))
+#else
+#define GE(g, k) ge[k]
+#define GXY(g, k) gxy[k]
+#define GZ(g, k) gz[k]
+#define GROUP_ADD(E, X, Z) \
+    group_add(ge, gxy, gz, gcount, goverflow, (E), (X), (Z))
+#endif
 
 
 void dct_fwd(inout float v[8]) {
@@ -756,13 +788,18 @@ void merge_group(int n, bool seeds, out int count, out float me[8], out int mxy[
 // CPU only sorts when it has to drop something -- and once the ninth entry
 // arrives the tail becomes the best seven, ordered by error with arrival order
 // breaking ties. The reference stays at index 0 throughout.
-void group_add(inout float ge[8], inout int gxy[8], inout int gz[8],
-               inout int gcount, inout bool overflow,
-               float err_, int xy_, int z_) {
+void group_add(
+#ifdef GROUP_LDS
+    int grp,
+#else
+    inout float ge[8], inout int gxy[8], inout int gz[8],
+#endif
+    inout int gcount, inout bool overflow,
+    float err_, int xy_, int z_) {
     if (gcount < 8) {
-        ge[gcount] = err_;
-        gxy[gcount] = xy_;
-        gz[gcount] = z_;
+        GE(grp, gcount) = err_;
+        GXY(grp, gcount) = xy_;
+        GZ(grp, gcount) = z_;
         gcount += 1;
         return;
     }
@@ -771,38 +808,38 @@ void group_add(inout float ge[8], inout int gxy[8], inout int gz[8],
         // Stable insertion sort of the tail (indices 1..7) by error; equal
         // errors keep their concatenation order.
         for (int a = 2; a < 8; ++a) {
-            const float ke = ge[a];
-            const int kx = gxy[a];
-            const int kz = gz[a];
+            const float ke = GE(grp, a);
+            const int kx = GXY(grp, a);
+            const int kz = GZ(grp, a);
             int b = a;
             for (int s = 1; s < 7; ++s) {
-                if (b > 1 && ge[b - 1] > ke) {
-                    ge[b] = ge[b - 1];
-                    gxy[b] = gxy[b - 1];
-                    gz[b] = gz[b - 1];
+                if (b > 1 && GE(grp, b - 1) > ke) {
+                    GE(grp, b) = GE(grp, b - 1);
+                    GXY(grp, b) = GXY(grp, b - 1);
+                    GZ(grp, b) = GZ(grp, b - 1);
                     --b;
                 }
             }
-            ge[b] = ke;
-            gxy[b] = kx;
-            gz[b] = kz;
+            GE(grp, b) = ke;
+            GXY(grp, b) = kx;
+            GZ(grp, b) = kz;
         }
     }
     int pos = 8;
     for (int k = 7; k >= 1; --k) {
-        pos = (err_ < ge[k]) ? k : pos;
+        pos = (err_ < GE(grp, k)) ? k : pos;
     }
     if (pos > 7) {
         return;
     }
     for (int k = 7; k > pos; --k) {
-        ge[k] = ge[k - 1];
-        gxy[k] = gxy[k - 1];
-        gz[k] = gz[k - 1];
+        GE(grp, k) = GE(grp, k - 1);
+        GXY(grp, k) = GXY(grp, k - 1);
+        GZ(grp, k) = GZ(grp, k - 1);
     }
-    ge[pos] = err_;
-    gxy[pos] = xy_;
-    gz[pos] = z_;
+    GE(grp, pos) = err_;
+    GXY(grp, pos) = xy_;
+    GZ(grp, pos) = z_;
 }
 
 // The group-axis noise standard deviation scales with the square root of the
@@ -1026,13 +1063,15 @@ void main() {
     // group.
     const bool searching = TH_SSE > 0.0f && NOSEARCH == 0;
 
+#ifndef GROUP_LDS
     float ge[8];
     int gxy[8];
     int gz[8];
+#endif
     for (int k = 0; k < 8; ++k) {
-        ge[k] = 0.0f;
-        gxy[k] = pack_xy(x, y);
-        gz[k] = KRADIUS;
+        GE(group, k) = 0.0f;
+        GXY(group, k) = pack_xy(x, y);
+        GZ(group, k) = KRADIUS;
     }
     int gcount = 1;
     bool goverflow = false;
@@ -1082,11 +1121,11 @@ void main() {
             // ce is ascending by (error, xy) and an overflowed group keeps its
             // tail sorted, so once one entry cannot beat the tail's worst none
             // of the rest can: group_add would drop them all anyway.
-            if (goverflow && k < cc && k < 7 && ce[k] >= ge[7]) {
+            if (goverflow && k < cc && k < 7 && ce[k] >= GE(group, 7)) {
                 break;
             }
             if (k < cc && k < 7) {
-                group_add(ge, gxy, gz, gcount, goverflow, ce[k], cxy[k], KRADIUS);
+                GROUP_ADD(ce[k], cxy[k], KRADIUS);
             }
         }
     }
@@ -1097,10 +1136,10 @@ void main() {
     // backward chain cannot overwrite.
     if (sl == 0) {
         for (int k = 0; k < 8; ++k) {
-            s0_x[group][k] = gxy[k] & 0xFFFF;
-            s0_y[group][k] = gxy[k] >> XY_SHIFT;
-            s_x[group][k] = gxy[k] & 0xFFFF;
-            s_y[group][k] = gxy[k] >> XY_SHIFT;
+            s0_x[group][k] = GXY(group, k) & 0xFFFF;
+            s0_y[group][k] = GXY(group, k) >> XY_SHIFT;
+            s_x[group][k] = GXY(group, k) & 0xFFFF;
+            s_y[group][k] = GXY(group, k) >> XY_SHIFT;
         }
     }
     barrier();
@@ -1180,14 +1219,14 @@ void main() {
             int fc;
             merge_group(8, true, fc, fe, fxy, pe, pxy);
             for (int k = 0; k < 8; ++k) {
-                if (goverflow && k < fc && fe[k] >= ge[7]) {
+                if (goverflow && k < fc && fe[k] >= GE(group, 7)) {
                     break;
                 }
                 if (k < fc) {
-                    group_add(ge, gxy, gz, gcount, goverflow, fe[k], fxy[k], z);
+                    GROUP_ADD(fe[k], fxy[k], z);
                 }
             }
-            if (TRACE != 0 && is_active && sl == 0 && gxy[0] == pc.trace_xy) {
+            if (TRACE != 0 && is_active && sl == 0 && GXY(group, 0) == pc.trace_xy) {
                 const int base = 38 + ((direction < 0 ? 0 : KRADIUS) + t - 1) * 2;
                 trace[base] = uint(fc);
                 trace[base + 1] = uint(min(PS_NUM, fc));
@@ -1198,7 +1237,7 @@ void main() {
 
     const int n = min(gcount, 8);
 
-    if (TRACE != 0 && is_active && sl == 0 && gxy[0] == pc.trace_xy) {
+    if (TRACE != 0 && is_active && sl == 0 && GXY(group, 0) == pc.trace_xy) {
         trace[0] = 0x0B3D0001u;
         trace[1] = uint(n);
         trace[2] = uint(gcount);
@@ -1206,10 +1245,10 @@ void main() {
         trace[4] = uint(current_count);
         trace[5] = uint(seed_count);
         for (int k = 0; k < 8; ++k) {
-            trace[6 + 4 * k + 0] = uint(gxy[k] & 0xFFFF);
-            trace[6 + 4 * k + 1] = uint(gxy[k] >> XY_SHIFT);
-            trace[6 + 4 * k + 2] = uint(gz[k]);
-            trace[6 + 4 * k + 3] = floatBitsToUint(ge[k]);
+            trace[6 + 4 * k + 0] = uint(GXY(group, k) & 0xFFFF);
+            trace[6 + 4 * k + 1] = uint(GXY(group, k) >> XY_SHIFT);
+            trace[6 + 4 * k + 2] = uint(GZ(group, k));
+            trace[6 + 4 * k + 3] = floatBitsToUint(GE(group, k));
         }
     }
 
@@ -1253,9 +1292,9 @@ void main() {
             // reference block and is multiplied by zero.
             for (int i = 0; i < 8; ++i) {
                 const float m = i < n ? 1.0f : 0.0f;
-                const int mx = min(max(gxy[i] & 0xFFFF, 0), WIDTH - 8);
-                const int my = min(max(gxy[i] >> XY_SHIFT, 0), HEIGHT - 8);
-                const int mz = clamp(gz[i], 0, KRADIUS * 2);
+                const int mx = min(max(GXY(group, i) & 0xFFFF, 0), WIDTH - 8);
+                const int my = min(max(GXY(group, i) >> XY_SHIFT, 0), HEIGHT - 8);
+                const int mz = clamp(GZ(group, i), 0, KRADIUS * 2);
                 const int refp = src_search(mz, plane) + my * STRIDE + mx + sl;
                 const int srcp = src_input(mz, plane) + my * STRIDE + mx + sl;
                 for (int j = 0; j < 8; ++j) {
@@ -1280,9 +1319,9 @@ void main() {
                 // Predicated, not branched (see the load above). The address is
                 // clamped so an out-of-group member's zero add stays in bounds.
                 const float m = i < n ? 1.0f : 0.0f;
-                const int mx = min(max(gxy[i] & 0xFFFF, 0), WIDTH - 8);
-                const int my = min(max(gxy[i] >> XY_SHIFT, 0), HEIGHT - 8);
-                const int mz = clamp(gz[i], 0, KRADIUS * 2);
+                const int mx = min(max(GXY(group, i) & 0xFFFF, 0), WIDTH - 8);
+                const int my = min(max(GXY(group, i) >> XY_SHIFT, 0), HEIGHT - 8);
+                const int mz = clamp(GZ(group, i), 0, KRADIUS * 2);
                 const int offset = mz * 2 * TEMPORAL_STRIDE + my * STRIDE + mx;
 
                 for (int j = 0; j < 8; ++j) {

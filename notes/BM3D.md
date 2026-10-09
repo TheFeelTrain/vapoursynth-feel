@@ -102,6 +102,13 @@ which is where the visible speedup is (see Performance).
   predictive windows are read into registers once per window, not per candidate.
   Eight is the floor: a neighbour's third through eighth candidates join the
   final group.
+- The combined group list (`ge`/`gxy`/`gz`) is the one private array left whose
+  index is not a compile-time constant (the tail sort's `b` and the insert's
+  `pos`), and a backend that will not promote it stages it in local memory: on
+  Ada `ptxas` reports a 96 B stack with an `LDL`/`STL` per lane and touch, and
+  the eight lanes of a group sit at different local addresses. All eight lanes
+  hold the same list, so the shared arm is one broadcast access per group
+  instead; it rides the patch's driver gate.
 - The group's reference patch (the 64 floats the SSD subtracts from) is either
   sixteen `vec4` locals per lane or one row-major copy per group in shared
   memory, and the choice keys off the **driver**, not the vendor. Registers are
@@ -113,8 +120,10 @@ which is where the visible speedup is (see Performance).
   arm measures 8-10% worse. The shared copy is row-major with a 72-float group
   stride, so a patch row is 16-byte aligned and the SSD's eight loads per row
   merge into two 64-bit ones (ISA-verified) while the four groups sit on banks
-  0/8/16/24. The vectors are the arm to re-test on Nvidia: the register patch is
-  what vszipcu's 350 fps does there.
+  0/8/16/24. The register arm is the one to re-test on Nvidia, but on the 4070
+  it is *not* what vszipcu's 350 fps suggests: the `vec4` arm measures 193 fps
+  against the shared arm's 233, and the pre-`vec4` private array measured 229.7,
+  so Ada promotes the array and the patch's storage is worth ~1% there.
 - Each walk evaluates one candidate per iteration in place (skip the reference
   origin, SSD, threshold, insert) with scalar coordinates; the row wrap is a
   `while` because the 8-lane step can overshoot a window narrower than 8.
@@ -257,7 +266,11 @@ which is where the visible speedup is (see Performance).
   (`g_e`/`g_xy`/`g_z`, 24 registers) in shared memory cost 5.8% even though they
   cut VGPRs 192 -> 144 (8 -> 10 waves) and code size 118 -> 80 KB: the group
   assembly is a serial chain of dynamic-index accesses, and LDS latency in that
-  chain costs more than the occupancy buys.
+  chain costs more than the occupancy buys. That verdict is ACO's, and holds
+  only where the compiler promotes the private arrays: on Ada `ptxas` stages the
+  group list in local memory, so the same move trades an uncoalesced per-lane
+  local access for one broadcast LDS access and is enabled there (see
+  Implementation).
 - Color costs the planes: 4:2:0 is 1.5x the luma-only estimate/source footprint
   and 4:4:4/RGB 3x, all inside the same `maxStorageBufferRange` budget.
 - The multi-plane round did not move the luma path (NPLANES == 1: 6131 vs 6133
@@ -267,6 +280,22 @@ which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-10-09 — the group list, not the patch, is the array Nvidia stages, and
+  it now rides the shared arm.** A `spirv-dis` pass over the production variants
+  finds `ge`/`gxy`/`gz` as the only private arrays indexed by a non-constant
+  (the tail sort's `b`, the insert's `pos`); every other one,
+  `denoising_patch[64]` and the transforms included, is unrolled to constants. An
+  `nvcc -arch=sm_89 -Xptxas -v` model of `group_add` stages them in local memory
+  (96 B stack, an `LDL`/`STL` per lane and touch) where the constant-indexed
+  `insert_cand` gets 0 stack. All eight lanes of a group hold the same list, so
+  the arm makes each touch one broadcast per group; it is gated on the patch
+  rule, so RADV keeps its register arm (500-frame medians: default unchanged at
+  936, `PATCH_LDS=1` 861 against 854 before, i.e. the group list itself is
+  neutral on ACO) and the full suite passes on both arms. The 4070 number is
+  pending; the mechanism puts `VSFEEL_BM3D_PATCH_LDS=1` (that card's default) as
+  the arm to measure. The same report shows the `vec4` register arm is a 16%
+  regression on Ada against the `float cur[64]` it replaced (193 against 229.7),
+  which is latent while the shared arm is the Nvidia default.
 - **2026-10-09 — the shared patch got vector reads and the register arm stopped
   being an array.** The shared copy is row-major now, so a patch row is 16-byte
   aligned and the SSD's eight loads per row become two `ds_load_b64` instead of
@@ -524,8 +553,9 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
   lower it to trade pipeline depth for VRAM).
 - `VSFEEL_BM3D_CAS=1` — force the CAS aggregation build on a device that has
   buffer float atomics (A/B only).
-- `VSFEEL_BM3D_PATCH_LDS=0/1` — force either reference-patch arm; unset follows
-  the driver rule (shared memory everywhere except RADV).
+- `VSFEEL_BM3D_PATCH_LDS=0/1` — force either shared-staging arm (reference patch
+  and group list together); unset follows the driver rule (shared memory
+  everywhere except RADV).
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs.
   `NOSEARCH` is the matcher's reference-only path, the same thing `th_mse=0`
   selects, so it cannot price the search.
