@@ -1,4 +1,11 @@
 #version 450
+// [[unroll]] on the fixed-trip loops below is not cosmetic. The frontend leaves
+// a `for i<8 { for j<8 }` body rolled, which indexes the 64-float patches with a
+// runtime `i*8+j`; ACO unrolls and promotes them anyway (168 VGPRs, 0 scratch),
+// but a backend that will not promote a dynamically indexed private array stages
+// it in scratch. Forcing the frontend to unroll removes the dynamic index from
+// the SPIR-V, so no backend has that choice. See notes/BM3D.md.
+#extension GL_EXT_control_flow_attributes : require
 // Buffer float atomics are an extension no pre-RDNA3 AMD driver reports: RADV
 // gates shaderBufferFloat32AtomicAdd at GFX11 and the Windows driver has no
 // hardware fadd to expose on Polaris/Vega/RDNA1-2 either. -DNO_FLOAT_ATOMICS
@@ -327,39 +334,39 @@ void dct_inv(inout float v[8]) {
 
 void transform_pack8(inout float data[64]) {
     // transform 8 groups of 8 consecutive elements, groups stepped by 8
-    for (int it = 0; it < 8; ++it) {
+    [[unroll]] for (int it = 0; it < 8; ++it) {
         float v[8];
-        for (int i = 0; i < 8; ++i) v[i] = data[it * 8 + i];
+        [[unroll]] for (int i = 0; i < 8; ++i) v[i] = data[it * 8 + i];
         dct_fwd(v);
-        for (int i = 0; i < 8; ++i) data[it * 8 + i] = v[i];
+        [[unroll]] for (int i = 0; i < 8; ++i) data[it * 8 + i] = v[i];
     }
 }
 
 void transform_pack8_inv(inout float data[64]) {
-    for (int it = 0; it < 8; ++it) {
+    [[unroll]] for (int it = 0; it < 8; ++it) {
         float v[8];
-        for (int i = 0; i < 8; ++i) v[i] = data[it * 8 + i];
+        [[unroll]] for (int i = 0; i < 8; ++i) v[i] = data[it * 8 + i];
         dct_inv(v);
-        for (int i = 0; i < 8; ++i) data[it * 8 + i] = v[i];
+        [[unroll]] for (int i = 0; i < 8; ++i) data[it * 8 + i] = v[i];
     }
 }
 
 void transform_pack8_1d(inout float data[64]) {
     // stride 8 groups: the 8 members at a fixed position
-    for (int it = 0; it < 8; ++it) {
+    [[unroll]] for (int it = 0; it < 8; ++it) {
         float v[8];
-        for (int i = 0; i < 8; ++i) v[i] = data[it + i * 8];
+        [[unroll]] for (int i = 0; i < 8; ++i) v[i] = data[it + i * 8];
         dct_fwd(v);
-        for (int i = 0; i < 8; ++i) data[it + i * 8] = v[i];
+        [[unroll]] for (int i = 0; i < 8; ++i) data[it + i * 8] = v[i];
     }
 }
 
 void transform_pack8_1d_inv(inout float data[64]) {
-    for (int it = 0; it < 8; ++it) {
+    [[unroll]] for (int it = 0; it < 8; ++it) {
         float v[8];
-        for (int i = 0; i < 8; ++i) v[i] = data[it + i * 8];
+        [[unroll]] for (int i = 0; i < 8; ++i) v[i] = data[it + i * 8];
         dct_inv(v);
-        for (int i = 0; i < 8; ++i) data[it + i * 8] = v[i];
+        [[unroll]] for (int i = 0; i < 8; ++i) data[it + i * 8] = v[i];
     }
 }
 
@@ -534,11 +541,11 @@ void transform_group_fwd(inout float data[64], int n) {
         transform_pack8_1d(data);
         return;
     }
-    for (int it = 0; it < 8; ++it) {
+    [[unroll]] for (int it = 0; it < 8; ++it) {
         float v[8];
-        for (int i = 0; i < 8; ++i) v[i] = data[it + i * 8];
+        [[unroll]] for (int i = 0; i < 8; ++i) v[i] = data[it + i * 8];
         group_dct_fwd_n(v, n);
-        for (int i = 0; i < 8; ++i) data[it + i * 8] = v[i];
+        [[unroll]] for (int i = 0; i < 8; ++i) data[it + i * 8] = v[i];
     }
 }
 
@@ -547,11 +554,11 @@ void transform_group_inv(inout float data[64], int n) {
         transform_pack8_1d_inv(data);
         return;
     }
-    for (int it = 0; it < 8; ++it) {
+    [[unroll]] for (int it = 0; it < 8; ++it) {
         float v[8];
-        for (int i = 0; i < 8; ++i) v[i] = data[it + i * 8];
+        [[unroll]] for (int i = 0; i < 8; ++i) v[i] = data[it + i * 8];
         group_dct_inv_n(v, n);
-        for (int i = 0; i < 8; ++i) data[it + i * 8] = v[i];
+        [[unroll]] for (int i = 0; i < 8; ++i) data[it + i * 8] = v[i];
     }
 }
 
@@ -563,14 +570,14 @@ void transform_group_inv(inout float data[64], int n) {
 // is (lane & ~7) .. (lane & ~7) + 7.
 void transpose_pack8(inout float data[64]) {
     const int lane = int(gl_LocalInvocationID.x);
-    for (int it = 0; it < 8; ++it) {
-        for (int b = 0; b < 3; ++b) {
+    [[unroll]] for (int it = 0; it < 8; ++it) {
+        [[unroll]] for (int b = 0; b < 3; ++b) {
             const int mask = 1 << b;
             float t[8];
-            for (int j = 0; j < 8; ++j) {
+            [[unroll]] for (int j = 0; j < 8; ++j) {
                 t[j] = subgroupShuffleXor(data[it * 8 + (j ^ mask)], mask);
             }
-            for (int j = 0; j < 8; ++j) {
+            [[unroll]] for (int j = 0; j < 8; ++j) {
                 if (((j >> b) & 1) != ((lane >> b) & 1)) {
                     data[it * 8 + j] = t[j];
                 }
@@ -720,7 +727,7 @@ void insert_cand(inout float e[8], inout int xy[8], float err_, int xy_) {
     // scan-and-shift form.
     float v = err_;
     int vxy = xy_;
-    for (int k = 0; k < 8; ++k) {
+    [[unroll]] for (int k = 0; k < 8; ++k) {
         const float te = e[k];
         const int tx = xy[k];
         const bool take = v < te || (v == te && vxy < tx);
@@ -745,16 +752,16 @@ void merge_group(int n, bool seeds, out int count, out float me[8], out int mxy[
     const int sl = lid & 7;
     float ke[8];
     int kx[8];
-    for (int i = 0; i < 8; ++i) {
+    [[unroll]] for (int i = 0; i < 8; ++i) {
         ke[i] = i < n ? e[i] : FLT_MAX_;
         kx[i] = i < n ? xy[i] : INT_MAX_;
     }
     count = 0;
-    for (int out_k = 0; out_k < 8; ++out_k) {
+    [[unroll]] for (int out_k = 0; out_k < 8; ++out_k) {
         float be = ke[0];
         int bx = kx[0];
         int winner = sl;
-        for (int d = 1; d < 8; d <<= 1) {
+        [[unroll]] for (int d = 1; d < 8; d <<= 1) {
             const float oe = subgroupShuffleXor(be, d);
             const int ox = subgroupShuffleXor(bx, d);
             const int ol = subgroupShuffleXor(winner, d);
@@ -773,7 +780,7 @@ void merge_group(int n, bool seeds, out int count, out float me[8], out int mxy[
             s_y[group][out_k] = bx >> XY_SHIFT;
         }
         if (sl == winner) {
-            for (int i = 0; i < 7; ++i) {
+            [[unroll]] for (int i = 0; i < 7; ++i) {
                 ke[i] = ke[i + 1];
                 kx[i] = kx[i + 1];
             }
@@ -807,12 +814,12 @@ void group_add(
         overflow = true;
         // Stable insertion sort of the tail (indices 1..7) by error; equal
         // errors keep their concatenation order.
-        for (int a = 2; a < 8; ++a) {
+        [[unroll]] for (int a = 2; a < 8; ++a) {
             const float ke = GE(grp, a);
             const int kx = GXY(grp, a);
             const int kz = GZ(grp, a);
             int b = a;
-            for (int s = 1; s < 7; ++s) {
+            [[unroll]] for (int s = 1; s < 7; ++s) {
                 if (b > 1 && GE(grp, b - 1) > ke) {
                     GE(grp, b) = GE(grp, b - 1);
                     GXY(grp, b) = GXY(grp, b - 1);
@@ -826,7 +833,7 @@ void group_add(
         }
     }
     int pos = 8;
-    for (int k = 7; k >= 1; --k) {
+    [[unroll]] for (int k = 7; k >= 1; --k) {
         pos = (err_ < GE(grp, k)) ? k : pos;
     }
     if (pos > 7) {
@@ -861,11 +868,11 @@ float hard_thresholding_s(inout float data[64], float sigma, int n) {
     float ks[4] = float[4](0.0f, 0.0f, 0.0f, 0.0f);
     const float scale = 1.0f / (512.0f * float(n));
 
-    for (int i = 0; i < 8; ++i) {
+    [[unroll]] for (int i = 0; i < 8; ++i) {
         // Predicated, not branched: an out-of-group member contributes nothing
         // but the loop still runs, so the warp never serialises over `n`.
         const float m = i < n ? 1.0f : 0.0f;
-        for (int j = 0; j < 8; ++j) {
+        [[unroll]] for (int j = 0; j < 8; ++j) {
             const int idx = i * 8 + j;
             const float val = data[idx];
             const bool keep = abs(val) > sigma;
@@ -884,7 +891,7 @@ float hard_thresholding_s(inout float data[64], float sigma, int n) {
 
 void collaborative_hard(inout float denoising_patch[64], float sigma, int n,
                         out float adaptive_weight) {
-    for (int ndim = 0; ndim < 2; ++ndim) {
+    [[unroll]] for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8(denoising_patch);
         transpose_pack8(denoising_patch);
     }
@@ -892,7 +899,7 @@ void collaborative_hard(inout float denoising_patch[64], float sigma, int n,
 
     adaptive_weight = hard_thresholding_s(denoising_patch, sigma_for_n(sigma, n), n);
 
-    for (int ndim = 0; ndim < 2; ++ndim) {
+    [[unroll]] for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8_inv(denoising_patch);
         transpose_pack8(denoising_patch);
     }
@@ -907,10 +914,10 @@ float wiener_filtering_s(inout float data[64], inout float ref[64], float sigma,
     float ks[4] = float[4](0.0f, 0.0f, 0.0f, 0.0f);
     const float scale = 1.0f / (512.0f * float(n));
     const float sgmsqr = sigma * sigma;
-    for (int i = 0; i < 8; ++i) {
+    [[unroll]] for (int i = 0; i < 8; ++i) {
         // Predicated, not branched (see hard_thresholding_s).
         const float m = i < n ? 1.0f : 0.0f;
-        for (int j = 0; j < 8; ++j) {
+        [[unroll]] for (int j = 0; j < 8; ++j) {
             const int idx = i * 8 + j;
             const float val = data[idx];
             const float ref_sqr = ref[idx] * ref[idx];
@@ -928,13 +935,13 @@ float wiener_filtering_s(inout float data[64], inout float ref[64], float sigma,
 
 void collaborative_wiener(inout float denoising_patch[64], inout float ref_patch[64],
                           float sigma, int n, out float adaptive_weight) {
-    for (int ndim = 0; ndim < 2; ++ndim) {
+    [[unroll]] for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8(denoising_patch);
         transpose_pack8(denoising_patch);
     }
     transform_group_fwd(denoising_patch, n);
 
-    for (int ndim = 0; ndim < 2; ++ndim) {
+    [[unroll]] for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8(ref_patch);
         transpose_pack8(ref_patch);
     }
@@ -943,7 +950,7 @@ void collaborative_wiener(inout float denoising_patch[64], inout float ref_patch
     adaptive_weight = wiener_filtering_s(denoising_patch, ref_patch,
                                          sigma_for_n(sigma, n), n);
 
-    for (int ndim = 0; ndim < 2; ++ndim) {
+    [[unroll]] for (int ndim = 0; ndim < 2; ++ndim) {
         transform_pack8_inv(denoising_patch);
         transpose_pack8(denoising_patch);
     }
@@ -962,7 +969,7 @@ void collaborative_wiener(inout float denoising_patch[64], inout float ref_patch
 // window that scans it. Scalars only: passed an array, the caller's coordinates
 // would be read out of scratch once per candidate instead of a register.
 bool is_first_owner(int grp, int cc, int rr, int i, int px0, int py0) {
-    for (int j = 0; j < PS_NUM; ++j) {
+    [[unroll]] for (int j = 0; j < PS_NUM; ++j) {
         if (j < i) {
             const int px = j == 0 ? px0 : s_x[grp][j];
             const int py = j == 0 ? py0 : s_y[grp][j];
@@ -1012,7 +1019,7 @@ void main() {
     // floats per group instead of 64 registers per lane. `k` is the row-major
     // index, so lane `sl` fills column `sl` of every row, and each group's eight
     // lanes read one coalesced 32-byte run of a source row per step.
-    for (int k = sl; k < 64; k += 8) {
+    [[unroll]] for (int k = sl; k < 64; k += 8) {
         cur_s[group][k] =
             src[anchor_pc + (y + (k >> 3)) * STRIDE + (x + (k & 7))];
     }
@@ -1068,7 +1075,7 @@ void main() {
     int gxy[8];
     int gz[8];
 #endif
-    for (int k = 0; k < 8; ++k) {
+    [[unroll]] for (int k = 0; k < 8; ++k) {
         GE(group, k) = 0.0f;
         GXY(group, k) = pack_xy(x, y);
         GZ(group, k) = KRADIUS;
@@ -1080,7 +1087,7 @@ void main() {
     {
         float pe[8];
         int pxy[8];
-        for (int k = 0; k < 8; ++k) {
+        [[unroll]] for (int k = 0; k < 8; ++k) {
             pe[k] = FLT_MAX_;
             pxy[k] = INT_MAX_;
         }
@@ -1117,7 +1124,7 @@ void main() {
         // At most seven non-reference entries, so the combined list cannot
         // overflow here and the CPU's stable_sort of a short list is exactly
         // this concatenation order.
-        for (int k = 0; k < 8; ++k) {
+        [[unroll]] for (int k = 0; k < 8; ++k) {
             // ce is ascending by (error, xy) and an overflowed group keeps its
             // tail sorted, so once one entry cannot beat the tail's worst none
             // of the rest can: group_add would drop them all anyway.
@@ -1135,7 +1142,7 @@ void main() {
     // Both temporal directions restart from this list, so keep a copy that the
     // backward chain cannot overwrite.
     if (sl == 0) {
-        for (int k = 0; k < 8; ++k) {
+        [[unroll]] for (int k = 0; k < 8; ++k) {
             s0_x[group][k] = GXY(group, k) & 0xFFFF;
             s0_y[group][k] = GXY(group, k) >> XY_SHIFT;
             s_x[group][k] = GXY(group, k) & 0xFFFF;
@@ -1144,12 +1151,12 @@ void main() {
     }
     barrier();
 
-    for (int direction = -1; direction <= 1; direction += 2) {
+    [[unroll]] for (int direction = -1; direction <= 1; direction += 2) {
         // Everyone is done reading the seeds of the previous direction before
         // the forward chain rewrites them.
         barrier();
         if (direction > 0 && sl == 0) {
-            for (int k = 0; k < 8; ++k) {
+            [[unroll]] for (int k = 0; k < 8; ++k) {
                 s_x[group][k] = s0_x[group][k];
                 s_y[group][k] = s0_y[group][k];
             }
@@ -1165,7 +1172,7 @@ void main() {
             barrier();
             float pe[8];
             int pxy[8];
-            for (int k = 0; k < 8; ++k) {
+            [[unroll]] for (int k = 0; k < 8; ++k) {
                 pe[k] = FLT_MAX_;
                 pxy[k] = INT_MAX_;
             }
@@ -1218,7 +1225,7 @@ void main() {
             int fxy[8];
             int fc;
             merge_group(8, true, fc, fe, fxy, pe, pxy);
-            for (int k = 0; k < 8; ++k) {
+            [[unroll]] for (int k = 0; k < 8; ++k) {
                 if (goverflow && k < fc && fe[k] >= GE(group, 7)) {
                     break;
                 }
@@ -1244,7 +1251,7 @@ void main() {
         trace[3] = goverflow ? 1u : 0u;
         trace[4] = uint(current_count);
         trace[5] = uint(seed_count);
-        for (int k = 0; k < 8; ++k) {
+        [[unroll]] for (int k = 0; k < 8; ++k) {
             trace[6 + 4 * k + 0] = uint(GXY(group, k) & 0xFFFF);
             trace[6 + 4 * k + 1] = uint(GXY(group, k) >> XY_SHIFT);
             trace[6 + 4 * k + 2] = uint(GZ(group, k));
@@ -1290,14 +1297,14 @@ void main() {
             // branches on, serialising the warp over all eight members and
             // spilling the patch. An out-of-group member reads the clamped
             // reference block and is multiplied by zero.
-            for (int i = 0; i < 8; ++i) {
+            [[unroll]] for (int i = 0; i < 8; ++i) {
                 const float m = i < n ? 1.0f : 0.0f;
                 const int mx = min(max(GXY(group, i) & 0xFFFF, 0), WIDTH - 8);
                 const int my = min(max(GXY(group, i) >> XY_SHIFT, 0), HEIGHT - 8);
                 const int mz = clamp(GZ(group, i), 0, KRADIUS * 2);
                 const int refp = src_search(mz, plane) + my * STRIDE + mx + sl;
                 const int srcp = src_input(mz, plane) + my * STRIDE + mx + sl;
-                for (int j = 0; j < 8; ++j) {
+                [[unroll]] for (int j = 0; j < 8; ++j) {
                     denoising_patch[i * 8 + j] = m * src[srcp + j * STRIDE];
                     if (FINAL != 0) {
                         ref_patch[i * 8 + j] = m * src[refp + j * STRIDE];
@@ -1315,7 +1322,7 @@ void main() {
             const int wdstpc = rplane + sl;
             const int weightpc = rplane + TEMPORAL_STRIDE + sl;
 
-            for (int i = 0; i < 8; ++i) {
+            [[unroll]] for (int i = 0; i < 8; ++i) {
                 // Predicated, not branched (see the load above). The address is
                 // clamped so an out-of-group member's zero add stays in bounds.
                 const float m = i < n ? 1.0f : 0.0f;
@@ -1324,7 +1331,7 @@ void main() {
                 const int mz = clamp(GZ(group, i), 0, KRADIUS * 2);
                 const int offset = mz * 2 * TEMPORAL_STRIDE + my * STRIDE + mx;
 
-                for (int j = 0; j < 8; ++j) {
+                [[unroll]] for (int j = 0; j < 8; ++j) {
                     float wdst_val = m * adaptive_weight * denoising_patch[i * 8 + j];
                     float weight_val = m * adaptive_weight;
 

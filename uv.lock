@@ -1,6 +1,9 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
+
+[manifest]
+overrides = [{ name = "vapoursynth", specifier = "==81rc1" }]
 
 [[package]]
 name = "clang-format"
@@ -437,6 +440,24 @@ wheels = [
 ]
 
 [[package]]
+name = "vapoursynth-bm3dvk2"
+version = "1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "vapoursynth" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5a/5c/ea529ac7af86b60915a59f25024e070a143ff563ad5f85a5c57544a6616f/vapoursynth_bm3dvk2-1.0.tar.gz", hash = "sha256:056f61ef24ebbf64b95b379405da9dddc91498c8d5c9be32bcf9c76832bca015", size = 180930, upload-time = "2026-10-09T14:32:02.005Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/d7/d0a4a13c834d2818f0b6d02f4fd01fc532ae21ce16ad743ec76cfa4c6072/vapoursynth_bm3dvk2-1.0-py3-none-macosx_10_15_x86_64.whl", hash = "sha256:96a5a64c8da11e03b8dfdc67057bcf3e513280206ea6266c82729fe198905d2b", size = 198785, upload-time = "2026-10-09T14:31:52.224Z" },
+    { url = "https://files.pythonhosted.org/packages/50/5b/0990f123f222dc49e892299dea2bf8f740cdafc24255cb61fabebaf9610b/vapoursynth_bm3dvk2-1.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:c1248099bdaee98c69f6ad31e502513c6cbdc41ec41c5ed963441fa6e6c9f468", size = 203441, upload-time = "2026-10-09T14:31:53.816Z" },
+    { url = "https://files.pythonhosted.org/packages/12/f3/4824fc4bd21f2408a8b4d3b6bec82b20a5b98ed3cb0134857297ae0ac67e/vapoursynth_bm3dvk2-1.0-py3-none-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:92ab938708c30ede22330d5f1160d0961b451655a4c0740506fdf66b57ad655e", size = 211622, upload-time = "2026-10-09T14:31:55.154Z" },
+    { url = "https://files.pythonhosted.org/packages/39/3c/d14095913709a98b707d91277f31bed1d9dff4742e3e7ce12d7a264dc8d5/vapoursynth_bm3dvk2-1.0-py3-none-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0ee0caaa18c12795eb8ddbb8190e8770c7e9d0a0f2bb9ab1461216f976eb03f4", size = 216382, upload-time = "2026-10-09T14:31:56.585Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/32/c489f04bc67c03cab3984545f5527c042f9644fa12dda58b23777a2423b3/vapoursynth_bm3dvk2-1.0-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:a67c608ae20fe10836b6a91c69035325d7b667c51baf55e87d1046f3dcdb5d37", size = 1195976, upload-time = "2026-10-09T14:31:57.914Z" },
+    { url = "https://files.pythonhosted.org/packages/ca/40/d2d276c909423edc227fa29f86aa08b0dd8414e8192f9d74c37c90274d6e/vapoursynth_bm3dvk2-1.0-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:43d970b244105f0386375a88ba5d31ad984e34cb50243d90dd7ecd7738d83ff8", size = 1248231, upload-time = "2026-10-09T14:31:59.355Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/77/779faa420ac3b69d706a45fcc1dc5862f9ee8023dca9affc3772ad880b4e/vapoursynth_bm3dvk2-1.0-py3-none-win_amd64.whl", hash = "sha256:d213fe02022d62b77fab412f90e48028bbbb2045066ae2438507498902a8c633", size = 319472, upload-time = "2026-10-09T14:32:00.796Z" },
+]
+
+[[package]]
 name = "vapoursynth-descale"
 version = "12"
 source = { registry = "https://pypi.org/simple" }
@@ -513,6 +534,7 @@ dev = [
     { name = "vapoursynth-bestsource" },
     { name = "vapoursynth-bm3d" },
     { name = "vapoursynth-bm3dvk" },
+    { name = "vapoursynth-bm3dvk2" },
     { name = "vapoursynth-descale" },
     { name = "vapoursynth-edgemasks" },
     { name = "vapoursynth-eedi3vk2" },
@@ -556,6 +578,7 @@ dev = [
     { name = "vapoursynth-bestsource", specifier = ">=22" },
     { name = "vapoursynth-bm3d", git = "https://github.com/HomeOfVapourSynthEvolution/VapourSynth-BM3D?rev=cd89118e33ba6cbfd7b447115425dcb98905e0e6" },
     { name = "vapoursynth-bm3dvk", specifier = ">=1.0" },
+    { name = "vapoursynth-bm3dvk2", specifier = ">=1.0" },
     { name = "vapoursynth-descale", specifier = ">=12" },
     { name = "vapoursynth-edgemasks", specifier = ">=4.1" },
     { name = "vapoursynth-eedi3vk2", specifier = ">=1.0" },

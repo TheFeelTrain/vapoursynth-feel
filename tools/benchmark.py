@@ -14,11 +14,11 @@ Usage:
     uv run tools/benchmark.py --filter gaussblur                # one filter
     uv run tools/benchmark.py --filter gaussblur vsfeel vszipcl # subset of plugins
     uv run tools/benchmark.py --filter gaussblur --gaussblur-args "sigma=5.0"
-    uv run tools/benchmark.py --filter bm3dv2 --bm3dv2-args "sigma=0.7, radius=2, th_mse=None"
+    uv run tools/benchmark.py --filter bm3d --bm3d-args "sigma=0.7, radius=2, th_mse=None"
     uv run tools/benchmark.py --filter gaussblur --repeat 5      # median of 5, alternating order
-    uv run tools/benchmark.py --filter bm3dv2 --ab-so build/libvsfeel.so old/libvsfeel.so --ab-names new,old
-    uv run tools/benchmark.py --filter bm3dv2 --ab-b-env VSFEEL_BM3D_DERIVE=1 --ab-names legacy,derived
-    uv run tools/benchmark.py --filter bm3dv2 --ab-so a.so b.so --ab-rounds 3 --ab-order abba
+    uv run tools/benchmark.py --filter bm3d --ab-so build/libvsfeel.so old/libvsfeel.so --ab-names new,old
+    uv run tools/benchmark.py --filter bm3d --ab-b-env VSFEEL_BM3D_DERIVE=1 --ab-names legacy,derived
+    uv run tools/benchmark.py --filter bm3d --ab-so a.so b.so --ab-rounds 3 --ab-order abba
     uv run tools/benchmark.py --frames 500 --clip /path/to/input.mkv
     uv run tools/benchmark.py --no-cache          # live decode: full chain incl. BestSource
     uv run tools/benchmark.py --filter gaussblur --gpu-cache --no-download
@@ -390,6 +390,7 @@ PLUGINS = {
     "bm3dhip": Plugin("bm3dhip"),
     "nlm_hip": Plugin("nlm_hip"),
     "bm3dvk": Plugin("bm3dvk"),
+    "bm3dvk2": Plugin("bm3dvk2"),
     "knlmvk": Plugin("knlmvk"),
 }
 
@@ -505,6 +506,13 @@ def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
         "vsfeel": f"core.vsfeel.BM3Dv2({clip}, {feel})",
         "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {common})",
         "bm3dvk": f"core.bm3dvk.BM3Dv2({clip}, {common})",
+        # bm3dvk2 derives a color matrix from the resolution when none is given
+        # while vsfeel hardcodes the BT.709 luma-row norm its sigma and th_mse
+        # are scaled by, so an SD --clip would silently denoise at a different
+        # strength. Pinning BT.709 keeps the two arms on equal work (its other
+        # defaults, 8x8 blocks, 8-wide groups, bm/ps step 1, hard_thr 2.7 and
+        # th_mse = sigma[0]*80 + 400, already equal vsfeel's).
+        "bm3dvk2": f"core.bm3dvk2.BM3D({clip}, {common}, matrix=1)",
     }
 
 
@@ -745,8 +753,8 @@ def _nnedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[s
 
 
 FILTERS: dict[str, FilterSpec] = {
-    "bm3dv2": FilterSpec(
-        title="BM3Dv2",
+    "bm3d": FilterSpec(
+        title="BM3D",
         default_frames=1000,
         args=[
             Arg("sigma", "bm3d_sigma", float, 0.7),
@@ -766,9 +774,7 @@ FILTERS: dict[str, FilterSpec] = {
         build=_bm3d_build,
         input="depth(get_y(clip), 32)",
         synth_format="vs.GRAYS",
-        # vsfeel's BM3Dv2 runs on the R80 GPU API (vnode:gpu in/out); so does
-        # bm3dvk's. vszipcl stays on the CPU cache.
-        gpu_plugins=frozenset({"vsfeel", "bm3dvk"}),
+        gpu_plugins=frozenset({"vsfeel", "bm3dvk", "bm3dvk2"}),
     ),
     "bilateral": FilterSpec(
         title="Bilateral",

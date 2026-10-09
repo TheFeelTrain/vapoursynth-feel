@@ -102,6 +102,11 @@ which is where the visible speedup is (see Performance).
   predictive windows are read into registers once per window, not per candidate.
   Eight is the floor: a neighbour's third through eighth candidates join the
   final group.
+- Every fixed-trip loop carries `[[unroll]]` (`GL_EXT_control_flow_attributes`):
+  `#pragma unroll` is a no-op, `[[unroll]]` removes the `OpLoopMerge`, and
+  without it the frontend ships the `for i<8 { for j<8 }` bodies rolled, so all 25
+  64-float patch locals are runtime-indexed in the SPIR-V (132 loops; 36 and SSA
+  with it). ACO promotes them either way; a backend that will not has no choice.
 - The combined group list (`ge`/`gxy`/`gz`) is the one private array left whose
   index is not a compile-time constant (the tail sort's `b` and the insert's
   `pos`), and a backend that will not promote it stages it in local memory: on
@@ -280,6 +285,18 @@ which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-10-09 — the fixed-trip loops are force-unrolled so no backend can stage
+  the patches.** `[[unroll]]` on the transform, threshold, estimate and
+  bookkeeping loops takes the shipped SPIR-V from 132 loops and 25
+  dynamically-indexed `float[64]` locals to 36 loops and none; the group list's
+  runtime `b`/`pos` are the only variable indices left, and GROUP_LDS covers
+  them. Costs: module 135 KB -> 576 KB, ACO ISA 107.7 KB -> 136.8 KB,
+  `libvsfeel.so` 21.5 -> 24.9 MB; VGPRs, scratch, LDS and cold creation are
+  unchanged (0.20 -> 0.21 s). RADV ABBA A/B (800 frames x3, n=12) is 898.5
+  against 896.5 fps, -0.2%: neutral where ACO already unrolled. Output is
+  unchanged within the filter's own atomic-order floor (same-binary reruns differ
+  by up to 3.6e-7 over 12% of pixels, the cross-build pair by 3.0e-7). Whether it
+  stays is an Nvidia measurement.
 - **2026-10-09 — the group list, not the patch, is the array Nvidia stages, and
   it now rides the shared arm.** A `spirv-dis` pass over the production variants
   finds `ge`/`gxy`/`gz` as the only private arrays indexed by a non-constant

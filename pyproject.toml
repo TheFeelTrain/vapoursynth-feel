@@ -54,6 +54,7 @@ dev = [
     "vapoursynth-eedi3vk2>=1.0",
     "vapoursynth-nnedi3vk>=1.0",
     "vapoursynth-bm3dvk>=1.0",
+    "vapoursynth-bm3dvk2>=1.0",
     "vapoursynth-nlm-hip>=4",
     "vapoursynth-knlmeansvk>=2.0",
     "vapoursynth-zsmooth>=0.20",
@@ -101,6 +102,11 @@ path = "hatch_build.py"
 [tool.uv]
 package = false
 python-preference = "only-managed"
+# bm3dvk2's wheel metadata says VapourSynth>=81, which no release candidate can
+# satisfy: the dev group pins the 81rc1 pre-release the benchmark is measured
+# on. The R81 API it needs (VSVulkan4.h, ffGPUOutput) is already in the rc, so
+# the resolver is told to ignore the floor rather than the plugin.
+override-dependencies = ["vapoursynth==81rc1"]
 
 [[tool.uv.index]]
 name = "vs-wheels"

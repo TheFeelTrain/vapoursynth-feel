@@ -144,13 +144,16 @@ the `dev` group (the R81 changes move the benchmark; the published requirement
 stays `vapoursynth>=80`). The `dev` group also supplies pytest/xdist, numpy,
 vsjetpack and the reference plugins the suite and the benchmark compare against
 (`vszipcl` from git plus `fmtconv` from JET's vs-wheels index, `eedi3vk2`, 
-`nnedi3vk`, `bm3dvk`, `nlm_hip`, `knlmmeansvk`, `zsmooth`, `bestsource`, 
+`nnedi3vk`, `bm3dvk`, `bm3dvk2`, `nlm_hip`, `knlmmeansvk`, `zsmooth`, `bestsource`, 
 `edgemasks`, `resize2`, `descale`). `vapoursynth-bm3d` is pinned to the git
 commit `reference/VapourSynth-BM3D` is checked out at, not the PyPI wheel: the
 wheel is an older tree (its September commits were force-pushed away upstream),
 and BM3Dv2 is graded against the reference source. That commit is a dangling
 object on GitHub, so re-resolving needs it to still be fetchable; the local
-checkout under `reference/` is the fallback. `uv sync --group lint` adds the
+checkout under `reference/` is the fallback. `bm3dvk2`'s wheel metadata demands
+`VapourSynth>=81`, which no pre-release satisfies, so `[tool.uv]` overrides the
+resolver's view of `vapoursynth` to the pinned 81rc1; the R81 GPU API it needs
+is already in the rc. `uv sync --group lint` adds the
 pinned clang-format/clang-tidy/ruff. Never `pip install` into this tree, and never rely 
 on a system plugin being visible. `tools/*.sh` and `uv run` pick the venv up on 
 their own. One-time per venv, run `.venv/bin/vapoursynth config`: the wheel's 
