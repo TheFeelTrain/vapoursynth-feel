@@ -17,7 +17,7 @@ order-independent, as the stream matrix does.
 
 Measured on the RX 7900XTX, 200 cycles at the shipped state: per-process GPU
 memory is byte-flat (0.0 MB rise at 4 KiB quantisation) for every filter; RSS
-drift stays within a few MB (worst BM3Dv2 ~5 MB, and that decelerates — 1000
+drift stays within a few MB (worst BM3D ~5 MB, and that decelerates — 1000
 cycles add ~5 MB more, allocator warmup rather than a per-cycle leak).  The
 limits below sit above that floor and still trip on a per-process leak of
 roughly 30 KiB per cycle.
@@ -41,7 +41,7 @@ FILTERS = [
     "GaussBlur",
     "DFTTest",
     "NLMeans",
-    "BM3Dv2",
+    "BM3D",
     "EEDI3",
     "EEDI3H",
     "EEDI3AA",
@@ -74,7 +74,7 @@ CLIP_PATH = __NOISE_MKV__
 CORE = vs.core
 CORE.max_cache_size = 64
 
-NAMES = ["Bilateral", "GaussBlur", "DFTTest", "NLMeans", "BM3Dv2",
+NAMES = ["Bilateral", "GaussBlur", "DFTTest", "NLMeans", "BM3D",
          "EEDI3", "EEDI3H", "EEDI3AA", "NNEDI3"]
 
 # g16-input predictors; the rest take g32
@@ -86,8 +86,8 @@ _KWARGS = {
     "GaussBlur": {"sigma": 2.0},
     "DFTTest": {"tbsize": 3},
     "NLMeans": {"d": 2},
-    "BM3Dv2": {"sigma": 0.7, "radius": 2, "bm_range": 16, "ps_range": 7,
-               "block_step": 4, "extractor_exp": 8},
+    "BM3D": {"sigma": 0.7, "radius": 2, "bm_range": 16, "ps_range": 7,
+             "block_step": 4, "extractor_exp": 8},
     "EEDI3": {"field": 1},
     "EEDI3H": {"field": 1},
     "EEDI3AA": {"field": 3},

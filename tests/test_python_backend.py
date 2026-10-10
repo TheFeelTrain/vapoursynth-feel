@@ -320,7 +320,7 @@ def test_eedi3_wrapper_forwards_hp(clip_16bit):
 
 
 class _StubBM3D:
-    """A ``core.vsfeel.BM3Dv2`` stand-in with an explicit signature.
+    """A ``core.vsfeel.BM3D`` stand-in with an explicit signature.
 
     ``_drop_unsupported`` and the wrapper read ``__signature__``, which a plain
     Python callable does not set, so the stub provides one like the plugin does.
@@ -344,7 +344,7 @@ class _StubBM3D:
 
 
 def test_bm3d_wrapper_keeps_chroma_off_an_older_plugin():
-    """A build whose BM3Dv2 has no ``chroma`` argument must not be sent one.
+    """A build whose BM3D has no ``chroma`` argument must not be sent one.
 
     The wrapper advertises ``chroma`` so vsdenoise still sees the reference's
     surface, but the *native* signature decides what is forwarded: the older
@@ -425,7 +425,7 @@ def test_bm3d_backend_survives_an_environment_reload():
 
     vsview's reload destroys the VapourSynth environment while keeping imported
     modules cached. ``Backend.plugin`` used to cache the resolved
-    ``core.vsfeel.BM3Dv2`` Function, which kept the destroyed core alive, so the
+    ``core.vsfeel.BM3D`` Function, which kept the destroyed core alive, so the
     next ``bm3d(...)`` through the wrapper raised "Use of invalidated Core (the
     environment has been destroyed)". ``vsdenoise`` reaches the function through
     ``backend.plugin.BM3Dv2`` on every call, so this has to resolve against the
@@ -551,7 +551,7 @@ def test_backend_context_routes_singletons(clip_gray):
 def test_bm3d_wrapper_forwards_chroma(clip_gray):
     """vsdenoise forces chroma=True on YUV444; the wrapper must forward it.
 
-    The plugin's BM3Dv2 implements the reference's joint 4:4:4 entry, so a
+    The plugin's BM3D implements the reference's joint 4:4:4 entry, so a
     chroma=True request runs it instead of being rejected (the wrapper used to
     raise while the plugin denoised luma only). The clip is a real 4:4:4
     conversion of the noise source: a Gray clip resized to 4:4:4 has constant

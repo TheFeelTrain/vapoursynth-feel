@@ -503,7 +503,7 @@ def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
     if ns.bm3d_th_mse is not None:
         feel = f"{common}, th_mse={ns.bm3d_th_mse}"
     return {
-        "vsfeel": f"core.vsfeel.BM3Dv2({clip}, {feel})",
+        "vsfeel": f"core.vsfeel.BM3D({clip}, {feel})",
         "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {common})",
         "bm3dvk": f"core.bm3dvk.BM3Dv2({clip}, {common})",
         # bm3dvk2 derives a color matrix from the resolution when none is given

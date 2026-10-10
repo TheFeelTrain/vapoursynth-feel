@@ -1,4 +1,4 @@
-"""BM3Dv2's block matcher against an independent scalar model of mawen's CPU
+"""BM3D's block matcher against an independent scalar model of mawen's CPU
 matcher (``tests/bm3d_oracle.py``).
 
 The GPU kernel's selected group is observed through ``VSFEEL_BM3D_MATCHTRACE``,
@@ -60,7 +60,7 @@ clip = core.std.ModifyFrame(src, src, setter)
 for job in jobs:
     os.environ["VSFEEL_BM3D_MATCHTRACE"] = "%d,%d,%d" % (
         job["frame"], job["x"], job["y"])
-    node = core.vsfeel.BM3Dv2(clip, **job["kwargs"])
+    node = core.vsfeel.BM3D(clip, **job["kwargs"])
     node = core.std.GPUDownload(clip=node) if node.gpu_resident else node
     if job.get("sequence"):
         for f in range(job["frame"] + 1):
@@ -242,7 +242,7 @@ def traces(tmp_path_factory):
 
 
 @pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
-def test_bm3dv2_matcher_matches_oracle(traces, case):
+def test_bm3d_matcher_matches_oracle(traces, case):
     """The selected group, its order, every frame's retained/seed counts, the
     reserved reference and the reference-only threshold case must all agree with
     the scalar model of the CPU matcher."""
@@ -285,7 +285,7 @@ def test_bm3dv2_matcher_matches_oracle(traces, case):
     assert sorted(got_frames) == sorted(want_frames)
 
 
-def test_bm3dv2_group_shrinks_below_eight(traces):
+def test_bm3d_group_shrinks_below_eight(traces):
     """A rejecting threshold must produce real groups smaller than eight, and
     the exercised configurations must include several of them."""
     shrink = ("grad1", "grad3", "grad5", "grad8", "gradover")
@@ -302,7 +302,7 @@ def test_bm3dv2_group_shrinks_below_eight(traces):
         assert len(set(members)) == len(members), "no origin may repeat in a group"
 
 
-def test_bm3dv2_threshold_zero_is_reference_only(traces):
+def test_bm3d_threshold_zero_is_reference_only(traces):
     """th_mse = 0 keeps the CPU's reference-only group, with no search at all."""
     got = traces["th0"]
     assert got["n"] == 1
@@ -311,7 +311,7 @@ def test_bm3dv2_threshold_zero_is_reference_only(traces):
     assert got["frames"] == []
 
 
-def test_bm3dv2_matcher_trace_survives_the_estimate_cache(tmp_path):
+def test_bm3d_matcher_trace_survives_the_estimate_cache(tmp_path):
     """An earlier request may compute the traced centre; the trace must follow.
 
     A sequential load (0..frame, what vspipe produces) has frame - radius
@@ -338,7 +338,7 @@ def test_bm3dv2_matcher_trace_survives_the_estimate_cache(tmp_path):
 
 
 @pytest.mark.parametrize("sequence", [False, True], ids=["single", "sequential"])
-def test_bm3dv2_radius16_trace_reaches_its_last_temporal_word(tmp_path, sequence):
+def test_bm3d_radius16_trace_reaches_its_last_temporal_word(tmp_path, sequence):
     """radius 16 makes the record 102 words (the last counter is index 101).
 
     The buffer used to be one word short, so the kernel's last temporal write
@@ -371,7 +371,7 @@ def test_bm3dv2_radius16_trace_reaches_its_last_temporal_word(tmp_path, sequence
     assert sorted((f, r, s) for (_, f, r, s) in got["frames"]) == sorted(want)
 
 
-def test_bm3dv2_trace_rejects_a_non_origin(tmp_path):
+def test_bm3d_trace_rejects_a_non_origin(tmp_path):
     """A reference position the matcher never visits is an error: silently
     tracing the nearest grid origin would report a different block's group."""
     path = tmp_path / "clip.npy"

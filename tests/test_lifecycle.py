@@ -68,7 +68,7 @@ _LIFECYCLE_SCRIPT = textwrap.dedent(f"""\
                                         sigma_color=[0.05])
             tmp.get_frame(1)
             del tmp
-            tmp = core.vsfeel.BM3Dv2(clip, sigma=[0.7], radius=1)
+            tmp = core.vsfeel.BM3D(clip, sigma=[0.7], radius=1)
             tmp.get_frame(1)
             del tmp
             core.clear_cache()

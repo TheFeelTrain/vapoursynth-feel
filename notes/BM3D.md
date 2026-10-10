@@ -1,9 +1,9 @@
-# BM3Dv2 — notes
+# BM3D — notes
 
 **shipped.** Vulkan port of BM3D whose block matcher and collaborative filtering
 are mawen's CPU V-BM3D (`reference/VapourSynth-BM3D`), so output differs from any
 CUDA-matcher build. The CPU plugin is the only oracle, driven from
-`tests/test_bm3dv2.py` (`bm3d.Basic`, `VBasic`/`VFinal` + `VAggregate`).
+`tests/test_bm3d.py` (`bm3d.Basic`, `VBasic`/`VFinal` + `VAggregate`).
 
 - **Agreement: exact except the CPU's tie order.** Reference-only groups
   (`th_mse=0`) agree to 2.4e-7. Over all 32400 reference blocks of frame 28885

@@ -73,7 +73,7 @@ pre-R80/R80 pairs through `tools/benchmark.py`, `--repeat 2`:
   core's existing code points `transferPtr`/`downloadPtr` at it
   (`vsvulkan.cpp:882-895`), and the copy leaves the graphics engine: Bilateral
   **1590 → 2079 fps (+31%)** on interleaved pairs, DFTTest +22%, EEDI3 +16%,
-  EEDI3AA +13%, BM3Dv2 +10% — each at 97–100% of its "download node deleted"
+  EEDI3AA +13%, BM3D +10% — each at 97–100% of its "download node deleted"
   ceiling, output byte-identical.
 - **`GPUDownload` is the only asymmetric leg.** On ReBAR the upload is a plain
   memcpy into the mapped plane with no submission at all

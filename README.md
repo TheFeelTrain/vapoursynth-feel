@@ -15,7 +15,7 @@ pip install vapoursynth-feel
 | Filter     | vsfeel u16 | vszipcl u16 | vulkan u16 | vsfeel fp32 | vszipcl fp32 | vulkan fp32 | Speedup |
 |------------|-----------:|------------:|-----------:|------------:|-------------:|------------:|--------:|
 | Bilateral  | 2170       | 580         | -          | 1142        | 387          | -           | 3.43x   |
-| BM3Dv2     | 985        | -           | -          | 966         | 119          | 280         | 3.48x   |
+| BM3D       | 985        | -           | -          | 966         | 119          | 280         | 3.48x   |
 | DFTTest    | 1431       | 833         | -          | 1134        | 488          | -           | 1.94x   |
 | EEDI3 (AA) | 198        | 25          | 37         | 127         | 25           | 29          | 4.92x   |
 | GaussBlur  | 2325       | 1298        | -          | 1145        | 797          | -           | 1.66x   |
@@ -42,12 +42,12 @@ core.vsfeel.Bilateral(clip clip[,
     clip    ref])                   # guide clip: weights from ref, values from clip
 ```
 
-### BM3Dv2
+### BM3D
 
 [BM3D](https://en.wikipedia.org/wiki/Block-matching_and_3D_filtering) is a block-matching and 3D collaborative filtering denoiser. Groups of similar blocks (across space and time) are stacked into 3D arrays, denoised together with a hard-thresholded 3D transform, and the overlapping estimates are aggregated into the output.
 
 ```python
-core.vsfeel.BM3Dv2(clip clip[,
+core.vsfeel.BM3D(clip clip[,
     clip    ref,                    # basic-estimate clip for the Wiener (final) pass
     float[] sigma=3.0,              # denoising strength per-plane; below FLT_EPSILON skips the plane
     int[]   block_step=8,           # per-plane block grid spacing, 1..8; smaller = fewer artifacts, slower
@@ -58,7 +58,7 @@ core.vsfeel.BM3Dv2(clip clip[,
     bool    chroma=False,           # True = one joint 4:4:4 entry, whose groups come from luma
     int     extractor_exp=0])       # aggregation weight bias, 0..127; 0 = off, >= 3 = reproducible output
 ```
-`chroma=True` requires YUV444.
+`chroma=True` requires YUV444. `BM3Dv2` stays registered as an alias for scripts written against the old name.
 
 ### DFTTest
 

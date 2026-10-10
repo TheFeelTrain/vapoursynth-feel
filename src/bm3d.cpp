@@ -1840,7 +1840,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // Per-plane sigma, exactly as the reference's perPlane: a missing entry
     // repeats the previous one, the first defaults to 3. A plane whose sigma is
     // below FLT_EPSILON is a bit-exact source copy (the reference's PROC_MASK,
-    // and its kernel's epsilon test). With every plane below it BM3Dv2 is the
+    // and its kernel's epsilon test). With every plane below it BM3D is the
     // source clip itself, which is the all-zero shortcut both references take.
     std::array<float, 3> sigma {};
     for (int i = 0; i < std::ssize(sigma); ++i) {
@@ -2570,20 +2570,30 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
 // Registration
 // ---------------------------------------------------------------------------
 
-void vsfeel_register_bm3dv2(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
-    vspapi->registerFunction("BM3Dv2",
-                             "clip:vnode:gpu;"
-                             "ref:vnode:gpu:opt;"
-                             "sigma:float[]:opt;"
-                             "block_step:int[]:opt;"
-                             "bm_range:int[]:opt;"
-                             "radius:int:opt;"
-                             "ps_num:int[]:opt;"
-                             "ps_range:int[]:opt;"
-                             "th_mse:float:opt;"
-                             "chroma:int:opt;"
-                             "num_streams:int:opt;"
-                             "extractor_exp:int:opt;"
-                             "device_id:int:opt;",
-                             "clip:vnode:gpu;", BM3DCreate, nullptr, plugin);
+// The filter has always been BM3D (see createVideoFilterEx2 above); only the
+// plugin entry point carried the v2, so BM3Dv2 stays registered as a bare
+// proxy for scripts written against the old name.
+static void VS_CC BM3Dv2Create(const VSMap * in, VSMap * out, void * userData,
+                               VSCore * core, const VSAPI * vsapi) {
+    BM3DCreate(in, out, userData, core, vsapi);
+}
+
+void vsfeel_register_bm3d(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
+    static constexpr const char * argspec = "clip:vnode:gpu;"
+                                            "ref:vnode:gpu:opt;"
+                                            "sigma:float[]:opt;"
+                                            "block_step:int[]:opt;"
+                                            "bm_range:int[]:opt;"
+                                            "radius:int:opt;"
+                                            "ps_num:int[]:opt;"
+                                            "ps_range:int[]:opt;"
+                                            "th_mse:float:opt;"
+                                            "chroma:int:opt;"
+                                            "num_streams:int:opt;"
+                                            "extractor_exp:int:opt;"
+                                            "device_id:int:opt;";
+    vspapi->registerFunction("BM3D", argspec, "clip:vnode:gpu;", BM3DCreate,
+                             nullptr, plugin);
+    vspapi->registerFunction("BM3Dv2", argspec, "clip:vnode:gpu;", BM3Dv2Create,
+                             nullptr, plugin);
 }

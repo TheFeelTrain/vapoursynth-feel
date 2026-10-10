@@ -106,7 +106,7 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
                                     format=main.format)
 
     NAMES = {{"dfttest": "DFTTest", "gaussblur": "GaussBlur",
-              "bilateral": "Bilateral", "bm3d": "BM3Dv2",
+              "bilateral": "Bilateral", "bm3d": "BM3D",
               "nnedi3": "NNEDI3", "nlmeans": "NLMeans",
               "eedi3": "EEDI3", "eedi3h": "EEDI3H", "eedi3aa": "EEDI3AA"}}
     # EEDI3H / EEDI3AA have no exact external reference on the shared surface;

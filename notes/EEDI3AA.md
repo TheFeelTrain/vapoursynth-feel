@@ -223,9 +223,9 @@ under-reported every stage 10x).
   in `get_deint_args`), and vsfeel registers `hp` as the half-pel search, so the
   2026-09-29 note's "accepted no-op" reading no longer holds for it: the
   signature filter forwards it, and the chain and the fused path match the
-  plugin call bit-exactly with `hp` set. The same round, the BM3Dv2 wrapper
+  plugin call bit-exactly with `hp` set. The same round, the BM3D wrapper
   decided what to forward from its own *advertised* signature (which always
-  appends `chroma`), so a build whose BM3Dv2 has no `chroma` still received
+  appends `chroma`), so a build whose BM3D has no `chroma` still received
   `chroma=0` and failed; the native signature decides now. No perf change.
 
 - **2026-10-03 — the batch knee moves to 4 and the row kernel is priced.** Re-swept

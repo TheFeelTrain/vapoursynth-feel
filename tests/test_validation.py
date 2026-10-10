@@ -33,10 +33,10 @@ FILTERS = [
     "GaussBlurLarge",
     "DFTTest",
     "NLMeans",
-    "BM3Dv2",
-    "BM3Dv2_16",
-    "BM3Dv2Color",
-    "BM3Dv2Joint",
+    "BM3D",
+    "BM3D_16",
+    "BM3DColor",
+    "BM3DJoint",
     "EEDI3",
     "EEDI3H",
     "EEDI3AA",
@@ -77,26 +77,26 @@ _SCRIPT = textwrap.dedent(f"""\
         node = core.vsfeel.DFTTest(g32, tbsize=3)
     elif name == "NLMeans":
         node = core.vsfeel.NLMeans(g32, d=2)
-    elif name == "BM3Dv2":
-        node = core.vsfeel.BM3Dv2(g32, sigma=0.7, radius=2, bm_range=16,
-                                  ps_range=7, block_step=4)
-    elif name == "BM3Dv2_16":
+    elif name == "BM3D":
+        node = core.vsfeel.BM3D(g32, sigma=0.7, radius=2, bm_range=16,
+                                ps_range=7, block_step=4)
+    elif name == "BM3D_16":
         # The integer input path: the copy-and-widen kernel rides the
         # estimation kernel's descriptor set and push-constant block, and the
         # aggregation writes native samples into the output plane.
-        node = core.vsfeel.BM3Dv2(g16, sigma=0.7, radius=2, bm_range=16,
+        node = core.vsfeel.BM3D(g16, sigma=0.7, radius=2, bm_range=16,
                                   ps_range=7, block_step=4)
-    elif name == "BM3Dv2Color":
+    elif name == "BM3DColor":
         # Three per-plane entries live at once: separate source rings, estimate
         # stacks and witness regions, one aggregation dispatch per plane.
         yuv = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
-        node = core.vsfeel.BM3Dv2(yuv, sigma=[0.7, 0.5, 0.5], radius=2,
-                                  bm_range=2, ps_range=1, block_step=4)
-    elif name == "BM3Dv2Joint":
+        node = core.vsfeel.BM3D(yuv, sigma=[0.7, 0.5, 0.5], radius=2,
+                                bm_range=2, ps_range=1, block_step=4)
+    elif name == "BM3DJoint":
         # The joint 4:4:4 entry: one packed stack holding all three planes.
         yuv444 = core.resize.Bicubic(src, format=vs.YUV444PS)
-        node = core.vsfeel.BM3Dv2(yuv444, sigma=[0.7, 0.7, 0.7], radius=2,
-                                  bm_range=2, ps_range=1, block_step=4, chroma=1)
+        node = core.vsfeel.BM3D(yuv444, sigma=[0.7, 0.7, 0.7], radius=2,
+                                bm_range=2, ps_range=1, block_step=4, chroma=1)
     elif name == "EEDI3":
         node = core.vsfeel.EEDI3(g16, field=1)
     elif name == "EEDI3H":

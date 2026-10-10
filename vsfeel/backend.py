@@ -41,15 +41,17 @@ def _drop_unsupported(func: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
 class _FeelBM3DPlugin:
     """Stand-in for the ``core.vsfeel`` plugin surface.
 
-    Exposes ``BM3Dv2`` with a signature extended by the parameters other
-    BM3Dv2 plugins accept (``chroma``, ...). vsfeel's BM3Dv2 takes ``chroma``
-    itself now (the reference's joint 4:4:4 entry), so the wrapper forwards it
-    and only drops what the plugin does not declare.
+    Exposes the entry point under vs-jetpack's spelling, ``BM3Dv2``, while the
+    filter itself is ``core.vsfeel.BM3D`` (the plugin keeps ``BM3Dv2``
+    registered as a legacy alias). The signature is extended by the parameters
+    other BM3D plugins accept (``chroma``, ...). vsfeel takes ``chroma`` itself
+    now (the reference's joint 4:4:4 entry), so the wrapper forwards it and only
+    drops what the plugin does not declare.
     """
 
     def __init__(self, func: Any = None) -> None:
         # Injectable so the forwarding can be tested against a build whose
-        # BM3Dv2 does not declare `chroma` (see tests/test_python_backend.py).
+        # BM3D does not declare `chroma` (see tests/test_python_backend.py).
         self._func = func
 
     def _target(self) -> Any:
@@ -60,11 +62,14 @@ class _FeelBM3DPlugin:
 
         # Resolved against the core that is live *now*, never captured: see
         # the `BM3Dv2` docstring.
-        return vs.core.vsfeel.BM3Dv2
+        return vs.core.vsfeel.BM3D
 
     @property
     def BM3Dv2(self) -> Any:
-        """The ``BM3Dv2`` entry point, built against the live core.
+        """vs-jetpack's name for ``core.vsfeel.BM3D``, built against the live core.
+
+        The property keeps vs-jetpack's lookup (``backend.plugin.BM3Dv2``);
+        the plugin itself registers both ``BM3D`` and the legacy ``BM3Dv2``.
 
         A fresh wrapper per access, because the ``Backend`` singleton outlives
         the VapourSynth environment: vsview's reload destroys the environment
@@ -84,7 +89,7 @@ class _FeelBM3DPlugin:
         sig = native
         if not declares_chroma:
             # Advertising it keeps the wrapper's surface identical to the other
-            # BM3Dv2 plugins.
+            # BM3D plugins.
             chroma = inspect.Parameter("chroma", inspect.Parameter.KEYWORD_ONLY, default=False)
             sig = native.replace(parameters=[*native.parameters.values(), chroma])
 

@@ -1,9 +1,9 @@
 """Scalar model of mawen's V-BM3D block matcher.
 
-This is the independent oracle for BM3Dv2's matcher: it follows the pinned CPU
+This is the independent oracle for BM3D's matcher: it follows the pinned CPU
 source (``reference/VapourSynth-BM3D``: ``VBM3D_Base.cpp``'s ``BlockMatching``
 and ``Block.h``'s ``BlockMatchingMulti`` / ``GenSearchPos``) at search steps 1,
-which is the sampling BM3Dv2 fixes. It is written from the reference, not from
+which is the sampling BM3D fixes. It is written from the reference, not from
 the shader, so a shared implementation mistake is unlikely; the SSD reduction
 does reproduce the shader's float32 accumulation order, because a different
 summation order can flip a near-tie.

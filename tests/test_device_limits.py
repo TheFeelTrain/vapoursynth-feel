@@ -59,7 +59,7 @@ def build(name, params):
         # plane geometry and therefore their own folded grids.
         return core.vsfeel.EEDI3AA(clip, field=2, **params)
     if name == "bm3d":
-        return core.vsfeel.BM3Dv2(clip, **params)
+        return core.vsfeel.BM3D(clip, **params)
     if name == "dfttest":
         return core.vsfeel.DFTTest(clip, **params)
     if name == "nlmeans":

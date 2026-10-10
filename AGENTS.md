@@ -117,9 +117,9 @@ release time. One bullet per user-visible change, under `Added`, `Changed`,
 component first. Entries read like this:
 
 ```markdown
-- BM3Dv2 accepts up to `radius=16` instead of 4, matching vszipcl
-- A BM3Dv2 cache slot could be overwritten by a stale writer
-- Upload fixes for EEDI3 and BM3Dv2 on devices without a ReBAR heap
+- BM3D accepts up to `radius=16` instead of 4, matching vszipcl
+- A BM3D cache slot could be overwritten by a stale writer
+- Upload fixes for EEDI3 and BM3D on devices without a ReBAR heap
 ```
 
 - **Short and high level.** What a user notices, not how it works: no kernel or
@@ -148,7 +148,7 @@ vsjetpack and the reference plugins the suite and the benchmark compare against
 `edgemasks`, `resize2`, `descale`). `vapoursynth-bm3d` is pinned to the git
 commit `reference/VapourSynth-BM3D` is checked out at, not the PyPI wheel: the
 wheel is an older tree (its September commits were force-pushed away upstream),
-and BM3Dv2 is graded against the reference source. That commit is a dangling
+and BM3D is graded against the reference source. That commit is a dangling
 object on GitHub, so re-resolving needs it to still be fetchable; the local
 checkout under `reference/` is the fallback. `bm3dvk2`'s wheel metadata demands
 `VapourSynth>=81`, which no pre-release satisfies, so `[tool.uv]` overrides the
@@ -359,7 +359,7 @@ flushed to a file:
 - the write is **skipped when the blob is the size it was loaded at**, so a
   process that compiled nothing new leaves the file alone. Without that check
   every short-lived process rewrote it at exit: 25.8 GB of device writes for
-  `tests/test_bm3dv2.py` alone, 0.2 GB after it.
+  `tests/test_bm3d.py` alone, 0.2 GB after it.
 
 Measured on the full suite: **~7.5 min cold → ~3.5 min for
 the run that builds the cache → 142 s warm** (904 tests, 323 s before the write
