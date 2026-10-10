@@ -25,7 +25,7 @@ CUDA-matcher build. The CPU plugin is the only oracle, driven from
 - `th_mse` (8-bit MSE, inclusive, 0 = reference only) defaults to
   `sigma[0]*80 + 400` basic and `sigma[0]*10 + 200` final.
 
-Scoreboard — 1080p jpbd, `tools/benchmark.py -f bm3dv2`, harness defaults
+Scoreboard — 1080p jpbd, `tools/benchmark.py -f bm3d`, harness defaults
 (sigma 0.7, radius 2, bm_range 9, ps_range 4, block_step 8), 1000 frames x3:
 
 | | fps | |
@@ -102,11 +102,6 @@ which is where the visible speedup is (see Performance).
   predictive windows are read into registers once per window, not per candidate.
   Eight is the floor: a neighbour's third through eighth candidates join the
   final group.
-- Every fixed-trip loop carries `[[unroll]]` (`GL_EXT_control_flow_attributes`):
-  `#pragma unroll` is a no-op, `[[unroll]]` removes the `OpLoopMerge`, and
-  without it the frontend ships the `for i<8 { for j<8 }` bodies rolled, so all 25
-  64-float patch locals are runtime-indexed in the SPIR-V (132 loops; 36 and SSA
-  with it). ACO promotes them either way; a backend that will not has no choice.
 - The combined group list (`ge`/`gxy`/`gz`) is the one private array left whose
   index is not a compile-time constant (the tail sort's `b` and the insert's
   `pos`). It stays per-lane: a shared-memory copy of it measured 2.6x slower on
@@ -244,7 +239,7 @@ which is where the visible speedup is (see Performance).
   -> 644 fps. Widening in the copy kernel instead
   pays it on 2.07M samples per frame rather than on every candidate read, and
   turns the halved io into a win: 970 fps against fp32's 932 (`tools/benchmark.py
-  -f bm3dv2 --bits 16`, 1000 frames x3, same session, interleaved). A real 16 bit
+  -f bm3d --bits 16`, 1000 frames x3, same session, interleaved). A real 16 bit
   chain -- cached 16 bit source, no `depth()` node, half the upload -- is 846 vs
   634 fps in a same-harness A/B (1080p jpbd, r=2, 600 frames x3, screen; the fp32
   arm pays its conversion inside the timed region, the u16 arm does not).
@@ -279,17 +274,18 @@ which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
-- **2026-10-09 — the fixed-trip loops are force-unrolled so no backend can stage
-  the patches.** `[[unroll]]` on the transform, threshold, estimate and
-  bookkeeping loops takes the shipped SPIR-V from 132 loops and 25
-  dynamically-indexed `float[64]` locals to 36 loops and none; the group list's
-  runtime `b`/`pos` are the only variable indices left, and they stay per-lane. Costs: module 135 KB -> 576 KB, ACO ISA 107.7 KB -> 136.8 KB,
-  `libvsfeel.so` 21.5 -> 24.9 MB; VGPRs, scratch, LDS and cold creation are
-  unchanged (0.20 -> 0.21 s). RADV ABBA A/B (800 frames x3, n=12) is 898.5
-  against 896.5 fps, -0.2%: neutral where ACO already unrolled. Output is
-  unchanged within the filter's own atomic-order floor (same-binary reruns differ
-  by up to 3.6e-7 over 12% of pixels, the cross-build pair by 3.0e-7). Whether it
-  stays is an Nvidia measurement.
+- **2026-10-09 — force-unrolling the fixed-trip loops is a dead end; reverted.**
+  `[[unroll]]` does work, unlike `#pragma unroll`: it removes the `OpLoopMerge`,
+  and it takes the shipped SPIR-V from 132 loops and 25 runtime-indexed
+  `float[64]` locals to 36 loops and none, which is the codegen hazard it was
+  after. It buys nothing for that: RADV is 898.5 against 896.5 fps (ABBA, 800
+  frames x3, n=12, -0.2%, where ACO already unrolled) and a 3080 is 205-240
+  against its ~265, inside that card's spread. What it costs is build time: the
+  module grows 135 -> 576 KB per variant, the ACO ISA 107.7 -> 136.8 KB and
+  `libvsfeel.so` 21.5 -> 24.9 MB, and `glslc -O` over 4.3x the SPIR-V pushed the
+  wheel builds past their timeouts (that round also carried build serialization
+  and dropped `-O` on the bm3d variants, reverted with it). A private array a
+  backend will not promote is not enough reason to force the frontend to unroll.
 - **2026-10-09 — the group list in shared memory is a 2.6x regression on Ada;
   reverted.** The list's indices are the only runtime ones left, and the ptxas
   model above stages the per-lane arrays in local memory, so the shared arm
@@ -536,7 +532,9 @@ Chronological; each entry keeps the mechanism, not the story.
   pattern; only accumulating into output-frame accumulators would shrink it.
 - Any LDS restructure here — see the mechanism under Performance.
 - `#pragma unroll`: glslc ignores it in GLSL and ACO already unrolls fixed-trip
-  loops; the remaining variable-trip scans are unrolled by hand.
+  loops; the remaining variable-trip scans are unrolled by hand. `[[unroll]]`
+  does force the frontend to unroll, and it is not worth the build cost either
+  (see Historical).
 - A different SSD accumulation order (a running window sum, say): it decides
   which blocks match.
 - An uncapped queue: uncapped is best or tied.

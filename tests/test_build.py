@@ -246,10 +246,10 @@ def test_benchmark_args_string_overrides_defaults(monkeypatch):
     """A --<filter>-args string lands on the namespace; the rest keep defaults."""
     bench = _load_module("benchmark", BENCHMARK)
     monkeypatch.setattr(
-        sys, "argv", ["benchmark.py", "--bm3dv2-args", "sigma=0.7, radius=2, th_mse=None"]
+        sys, "argv", ["benchmark.py", "--bm3d-args", "sigma=0.7, radius=2, th_mse=None"]
     )
     ns = bench.parse_args()
-    bench._apply_filter_args(ns, "bm3dv2", bench.FILTERS["bm3dv2"])
+    bench._apply_filter_args(ns, "bm3d", bench.FILTERS["bm3d"])
     assert ns.bm3d_sigma == 0.7
     assert ns.bm3d_radius == 2
     assert ns.bm3d_th_mse is None
@@ -291,15 +291,15 @@ def test_benchmark_args_string_rejects_misuse(monkeypatch):
     bench = _load_module("benchmark", BENCHMARK)
     monkeypatch.setattr(sys, "argv", ["benchmark.py"])
     ns = bench.parse_args()
-    spec = bench.FILTERS["bm3dv2"]
+    spec = bench.FILTERS["bm3d"]
     for bad in ("sig ma=1", "sigma", "radius=two", "radius=", "sigma=1, sigma"):
         with pytest.raises(SystemExit):
-            bench._parse_filter_args(ns, "bm3dv2", spec, bad)
+            bench._parse_filter_args(ns, "bm3d", spec, bad)
     with pytest.raises(SystemExit):
-        bench._parse_filter_args(ns, "bm3dv2", spec, "planes=[0,1")
+        bench._parse_filter_args(ns, "bm3d", spec, "planes=[0,1")
     # The --<filter>-args dests default to None (main() reads them to reject a
     # string given for a filter that is not run).
-    assert ns.bm3dv2_args is None
+    assert ns.bm3d_args is None
 
 
 def test_ab_env_spec_sets_and_unsets():

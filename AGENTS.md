@@ -245,8 +245,8 @@ To compare two vsfeel builds or two env configs against each other, use the
 benchmark's A/B mode instead of writing a scratch script:
 
 ```bash
-uv run tools/benchmark.py --filter bm3dv2 --ab-so build/libvsfeel.so old/libvsfeel.so --ab-names new,old
-uv run tools/benchmark.py --filter bm3dv2 --ab-b-env VSFEEL_BM3D_SPLIT=0 --ab-names single,split
+uv run tools/benchmark.py --filter bm3d --ab-so build/libvsfeel.so old/libvsfeel.so --ab-names new,old
+uv run tools/benchmark.py --filter bm3d --ab-b-env VSFEEL_BM3D_SPLIT=0 --ab-names single,split
 ```
 
 Each round measures both arms interleaved (alternating order, or ABBA with
