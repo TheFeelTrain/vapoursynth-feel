@@ -267,14 +267,14 @@ which is where the visible speedup is (see Performance).
   sharing the group list costs the whole filter 2.6x (see Historical).
 - Color costs the planes: 4:2:0 is 1.5x the luma-only estimate/source footprint
   and 4:4:4/RGB 3x, all inside the same `maxStorageBufferRange` budget.
-- **Item-based row reuse in the search walk is small on RADV and Nvidia-weighted
-  by construction.** `-DITEM_ROWS=2|4` (`VSFEEL_BM3D_ITEM_ROWS`) gives a lane a
-  column of 2 or 4 adjacent candidates and loads each source row once for all of
-  them (64 -> 36 -> 22 loads per candidate), the accumulation unchanged. ACO
-  already merges the per-row loads, so RADV gains 1.0% at 4 and loses 0.8% at 2
-  (ABBA, 800 frames x3, n=12: 892.1 against 901.4 fps, shared patch both arms);
-  the builds force the shared patch, which is 5-8% behind the register arm on
-  RADV, so the arm is for Nvidia, where those loads stay scalar.
+- **Item-based row reuse: +1.8% at two rows on Nvidia, -2.8% at four; RADV is the
+  other way round and small either way.** `-DITEM_ROWS=2|4` gives a lane a column
+  of 2 or 4 adjacent candidates and loads each source row once for all of them
+  (64 -> 36 -> 22 loads per candidate), the accumulation unchanged. Nvidia screen
+  against a 285 default: 290 at 2, 277 at 4, four rows' accumulators costing more
+  occupancy than the loads they save. RADV (ABBA, 800 frames x3, n=12, shared
+  patch both arms): +1.0% at 4, -0.8% at 2. The builds force that patch, 5-8%
+  behind RADV's register arm, so the arm is Nvidia's and 2 is its row count.
 - The multi-plane round did not move the luma path (NPLANES == 1: 6131 vs 6133
   instructions, 192/108/4096 B, 8 waves/SIMD; 12 ABBA pairs at 935 vs 924 fps).
 
@@ -290,7 +290,9 @@ Chronological; each entry keeps the mechanism, not the story.
   reads the patch by a runtime row, so it needs `PATCH_LDS` (`#error` otherwise),
   and it is spatial-only: the temporal walk's origins overlap across windows, so
   items there would re-test candidates an earlier window already owned. RADV:
-  +1.0% at 4, -0.8% at 2 (ABBA, 800 frames x3, n=12, shared patch both arms).
+  +1.0% at 4, -0.8% at 2 (ABBA, 800 frames x3, n=12, shared patch both arms);
+  Nvidia, standalone: 290 at 2 and 277 at 4 against a 285 default, so the row
+  count is vendor-opposite and 4 is not worth carrying for its RADV 1%.
   The round's real result is a correctness one. At 4 the build produced a 1-ulp
   different SSD on one retained candidate of a 33x33 window, which flipped a
   near-tie: two candidates at the same origin in different frames with
@@ -305,7 +307,9 @@ Chronological; each entry keeps the mechanism, not the story.
   untouched, byte-identical SPIR-V included, so they keep whatever contraction
   the backend picks. CAS item variants exist so both accumulation arms run the
   same walk, which is what makes the CAS/hardware comparison measure the
-  accumulation rather than the walk.
+  accumulation rather than the walk. It also composes with the split: the item
+  walk *is* the match half's walk, so `SPLIT_KERNEL=1` takes
+  `bm3d_match_lds_item2|4` instead of pinning `ITEM_ROWS` back to 1.
 - **2026-10-10 — the matcher/filter split is an opt-in candidate and a loss on
   RADV.** `-DSPLIT_MATCH`/`-DSPLIT_FILTER` (`VSFEEL_BM3D_SPLIT_KERNEL=1`) run the
   search and the estimate as two dispatches with the group handed over through a
@@ -317,8 +321,11 @@ Chronological; each entry keeps the mechanism, not the story.
   no-op the split is *still* 3.3% slower (1057 against 1023), so the matcher
   gains nothing from the four extra waves: at 12 waves/SIMD it is not
   occupancy-bound. The rest of the loss is the estimate re-reading the group the
-  fused kernel still had in registers. Kept default-off for an Nvidia
-  measurement; the full suite passes on both paths.
+  fused kernel still had in registers. **It inverts on Ada**: an Nvidia screen
+  reads 285 default against ~310 split (+8.8%), which clears the 300 fps target,
+  so the extra waves pay exactly where the notes predicted they would and the
+  split is an Nvidia option rather than a general one. Still default-off; the
+  full suite passes on both paths.
 - **2026-10-09 — force-unrolling the fixed-trip loops is a dead end; reverted.**
   `[[unroll]]` does work, unlike `#pragma unroll`: it removes the `OpLoopMerge`,
   and it takes the shipped SPIR-V from 132 loops and 25 runtime-indexed
@@ -604,8 +611,8 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
 - `VSFEEL_BM3D_PATCH_LDS=0/1` — force either reference-patch arm; unset follows
   the driver rule (shared memory everywhere except RADV).
 - `VSFEEL_BM3D_SPLIT_KERNEL=1` — the opt-in match/filter split (see Historical).
-- `VSFEEL_BM3D_ITEM_ROWS=2/4` — item-based row reuse in the spatial search walk;
-  needs the shared patch, so it forces that arm (see Historical).
+- `VSFEEL_BM3D_ITEM_ROWS=2/4` — item-based row reuse in the search walk; needs the
+  shared patch, so it forces that arm, and it composes with `SPLIT_KERNEL`.
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs.
   `NOSEARCH` is the matcher's reference-only path, the same thing `th_mse=0`
   selects, so it cannot price the search.

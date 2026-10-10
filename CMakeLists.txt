@@ -223,6 +223,8 @@ set(VK_BM3D_VARIANTS
     # costs six variants rather than sixteen.
     "bm3d_match|bm3d.comp|-DSPLIT_MATCH"
     "bm3d_match_lds|bm3d.comp|-DSPLIT_MATCH -DPATCH_LDS"
+    "bm3d_match_lds_item2|bm3d.comp|-DSPLIT_MATCH -DPATCH_LDS -DITEM_ROWS=2"
+    "bm3d_match_lds_item4|bm3d.comp|-DSPLIT_MATCH -DPATCH_LDS -DITEM_ROWS=4"
     "bm3d_filter|bm3d.comp|-DSPLIT_FILTER"
     "bm3d_filter_1plane|bm3d.comp|-DSPLIT_FILTER -DONE_PLANE"
     "bm3d_filter_cas|bm3d.comp|-DSPLIT_FILTER -DNO_FLOAT_ATOMICS"

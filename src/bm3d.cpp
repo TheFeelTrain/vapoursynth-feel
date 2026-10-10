@@ -2122,11 +2122,6 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     if (d->item_rows != 2 && d->item_rows != 4) {
         d->item_rows = 1;
     }
-    if (d->split_kernel) {
-        // The split owns the search walk in its match half, which is built
-        // without an item variant.
-        d->item_rows = 1;
-    }
     if (d->item_rows > 1) {
         d->patch_lds = true;
     }
@@ -2545,11 +2540,18 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             if (d->split_kernel) {
                 // The search half stages the patch but has no estimate stack;
                 // the filter half is the other way round. That asymmetry is the
-                // point, so the two are built from different arms.
+                // point, so the two are built from different arms. The item walk
+                // belongs to the search half, so it composes with the split.
                 const uint32_t * mcode =
-                    d->patch_lds ? bm3d_match_lds_spv : bm3d_match_spv;
-                const size_t msize = d->patch_lds ? bm3d_match_lds_spv_size
-                                                  : bm3d_match_spv_size;
+                    d->item_rows == 4   ? bm3d_match_lds_item4_spv
+                    : d->item_rows == 2 ? bm3d_match_lds_item2_spv
+                    : d->patch_lds      ? bm3d_match_lds_spv
+                                        : bm3d_match_spv;
+                const size_t msize =
+                    d->item_rows == 4   ? bm3d_match_lds_item4_spv_size
+                    : d->item_rows == 2 ? bm3d_match_lds_item2_spv_size
+                    : d->patch_lds      ? bm3d_match_lds_spv_size
+                                        : bm3d_match_spv_size;
                 const auto mres = create_bm3d_pipeline(
                     *d->gpu, *d, g, mcode, msize, d->pipeline_layout,
                     d->patch_lds, true);
