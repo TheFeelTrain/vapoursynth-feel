@@ -77,6 +77,22 @@ const int CLIP_STRIDE = NPLANES * TEMPORAL_STRIDE;
 const int SLOT_STRIDE = (FINAL != 0 ? 2 : 1) * CLIP_STRIDE;
 const int RES_PLANE_STRIDE = TW * 2 * TEMPORAL_STRIDE;
 
+// Reference blocks the split's buffer covers, and the word offset of the member
+// runs. Both are constant over the plane geometry, so the two halves index it
+// identically without a push constant. The index is the dispatch's own
+// (workgroup, group) pair rather than the block origin: a clipped last row
+// clamps its origin off the step grid, which two rows could share.
+const uint MATCH_GRID_X =
+    (uint(WIDTH) + 4u * uint(BLOCK_STEP) - 1u) / (4u * uint(BLOCK_STEP));
+const uint MATCH_GRID_Y =
+    (uint(HEIGHT) + uint(BLOCK_STEP) - 1u) / uint(BLOCK_STEP);
+const uint MATCH_BLOCKS = MATCH_GRID_X * MATCH_GRID_Y * 4u;
+const uint MATCH_MEM_OFF = (MATCH_BLOCKS + 1u) & ~1u;
+
+uint block_index(int gid, int wgy, int grp) {
+    return (uint(wgy) * MATCH_GRID_X + uint(gid)) * 4u + uint(grp);
+}
+
 const float FLT_MAX_ = 3.402823466e+38f;
 const float FLT_EPS_ = 1.192092896e-07f;
 const int INT_MAX_ = 0x7fffffff;
@@ -99,6 +115,15 @@ layout(std430, binding = 2) buffer TraceBuf { uint trace[]; };
 // impossible to aggregate another frame's data -- the intermittent contaminant
 // band -- no matter what the slot bookkeeping or the host-side timing does.
 layout(std430, binding = 3) buffer TagBuf { uint tags[]; };
+// The split's handoff (VSFEEL_BM3D_SPLIT_KERNEL): one group per reference block,
+// written by the match build and read by the filter build. One flat word array,
+// [counts: one word per block][members: 8 x (xy, z)], so a block's member run
+// needs no uvec2 alignment. The fused build declares neither binding.
+#ifdef SPLIT_MATCH
+layout(std430, binding = 4) writeonly buffer MatchBuf { uint match_words[]; };
+#elif defined(SPLIT_FILTER)
+layout(std430, binding = 4) readonly buffer MatchBuf { uint match_words[]; };
+#endif
 
 // Adds val to the float at res[idx]. The no-extension form is the reference's
 // atom_add_f: a CAS loop over the uint bits, one fadd per round like the
@@ -937,6 +962,110 @@ bool is_first_owner(int grp, int cc, int rr, int i, int px0, int py0) {
     return true;
 }
 
+// The estimate half, shared by the fused build and the split filter build. It
+// reads only the group's origins and its size, so the split reaches it with no
+// search state in scope: that is where the matcher's occupancy comes from.
+void estimate_patch(bool is_active, int sl, int n,
+                    const int gxy[8], const int gz[8]) {
+    if (NOESTIMATE != 0) {
+        return;
+    }
+    // One entry covers NPLANES planes; at NPLANES == 1 the bounds fold and this
+    // is the single-plane kernel it has always been. The group (gxy, gz) is
+    // luma's in every case: a joint chroma entry filters each plane with the
+    // groups block matching found on plane 0, as the reference does.
+#ifdef ONE_PLANE
+    // A one-trip loop over a spec constant still costs Nvidia about 2x: it
+    // keeps the whole body inside a loop and spills (128 registers, 215808
+    // bytes, against 168 and 128256 straight-line). This build is only used for
+    // a one-plane entry, so `plane` is a constant and the body is straight-line.
+    const int plane = 0;
+    {
+#else
+    for (int plane = 0; plane < NPLANES; ++plane) {
+#endif
+        const float sigma = (plane == 0) ? SIGMA_Y : ((plane == 1) ? SIGMA_U : SIGMA_V);
+
+#ifndef ONE_PLANE
+        // Joint entry: a plane below the threshold is not denoised (the
+        // reference's `if (sigma < FLT_EPS_) continue`); the host copies it
+        // through from the source clip instead.
+        if (NPLANES > 1 && sigma < FLT_EPS_) {
+            continue;
+        }
+#endif
+
+        const int rplane = pc.res_off + plane * RES_PLANE_STRIDE;
+
+        float denoising_patch[64];
+        float ref_patch[64];
+
+        float adaptive_weight;
+        {
+            // Every member is loaded and masked, never gated: a per-lane
+            // `if (i < n)` is what ACO if-converts for free and Nvidia instead
+            // branches on, serialising the warp over all eight members and
+            // spilling the patch. An out-of-group member reads the clamped
+            // reference block and is multiplied by zero.
+            for (int i = 0; i < 8; ++i) {
+                const float m = i < n ? 1.0f : 0.0f;
+                const int mx = min(max(gxy[i] & 0xFFFF, 0), WIDTH - 8);
+                const int my = min(max(gxy[i] >> XY_SHIFT, 0), HEIGHT - 8);
+                const int mz = clamp(gz[i], 0, KRADIUS * 2);
+                const int refp = src_search(mz, plane) + my * STRIDE + mx + sl;
+                const int srcp = src_input(mz, plane) + my * STRIDE + mx + sl;
+                for (int j = 0; j < 8; ++j) {
+                    denoising_patch[i * 8 + j] = m * src[srcp + j * STRIDE];
+                    if (FINAL != 0) {
+                        ref_patch[i * 8 + j] = m * src[refp + j * STRIDE];
+                    }
+                }
+            }
+            if (FINAL != 0) {
+                collaborative_wiener(denoising_patch, ref_patch, sigma, n, adaptive_weight);
+            } else {
+                collaborative_hard(denoising_patch, sigma, n, adaptive_weight);
+            }
+        }
+
+        if (is_active) {
+            const int wdstpc = rplane + sl;
+            const int weightpc = rplane + TEMPORAL_STRIDE + sl;
+
+            for (int i = 0; i < 8; ++i) {
+                // Predicated, not branched (see the load above). The address is
+                // clamped so an out-of-group member's zero add stays in bounds.
+                const float m = i < n ? 1.0f : 0.0f;
+                const int mx = min(max(gxy[i] & 0xFFFF, 0), WIDTH - 8);
+                const int my = min(max(gxy[i] >> XY_SHIFT, 0), HEIGHT - 8);
+                const int mz = clamp(gz[i], 0, KRADIUS * 2);
+                const int offset = mz * 2 * TEMPORAL_STRIDE + my * STRIDE + mx;
+
+                for (int j = 0; j < 8; ++j) {
+                    float wdst_val = m * adaptive_weight * denoising_patch[i * 8 + j];
+                    float weight_val = m * adaptive_weight;
+
+                    // extractor_exp pre-rounding: makes the float atomic sums
+                    // order-independent. `precise` is load-bearing — without
+                    // it the compiler folds `(x + E) - E` back to x once the
+                    // spec constant is known and the parameter becomes a
+                    // no-op. The `if` folds at pipeline creation, so E == 0
+                    // keeps the original code.
+                    if (EXTRACTOR != 0.0) {
+                        precise float wdst_rounded = (wdst_val + EXTRACTOR) - EXTRACTOR;
+                        precise float weight_rounded = (weight_val + EXTRACTOR) - EXTRACTOR;
+                        wdst_val = wdst_rounded;
+                        weight_val = weight_rounded;
+                    }
+
+                    res_add(wdstpc + offset + j * STRIDE, wdst_val);
+                    res_add(weightpc + offset + j * STRIDE, weight_val);
+                }
+            }
+        }
+    }
+}
+
 void main() {
     const int m = pc.nmod;
     // Real temporal extent of this centre's window: only frames that exist are
@@ -947,20 +1076,24 @@ void main() {
     // Witness what this dispatch writes: one tag per real window slice, holding
     // the frame it is the contribution of. Slices outside [zlo, zhi] keep the
     // zero fill, so the aggregation skips them instead of reading a clamped
-    // copy of an endpoint frame.
+    // copy of an endpoint frame. The match half writes no estimate stack, so it
+    // does not witness one.
+#ifndef SPLIT_MATCH
     if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u) {
         for (int z = zlo; z <= zhi; ++z) {
             tags[pc.tag_base + z] = uint(src_frame(z) + 1);
         }
     }
+#endif
 
     const int lid = int(gl_LocalInvocationID.x);
     const int group = lid >> 3;
     const int sl = lid & 7;
     const int gid = int(gl_WorkGroupID.x);
+    const int wgy = int(gl_WorkGroupID.y);
 
     const int x0 = (4 * gid + group) * BLOCK_STEP;
-    int y = BLOCK_STEP * int(gl_WorkGroupID.y);
+    int y = BLOCK_STEP * wgy;
     if (y >= HEIGHT - 8 + BLOCK_STEP) {
         return;
     }
@@ -968,6 +1101,29 @@ void main() {
     const int x = min(is_active ? x0 : 0, WIDTH - 8);
     y = min(y, HEIGHT - 8);
 
+#ifdef SPLIT_FILTER
+    // The filter half carries no search state at all: no reference patch, no
+    // candidate lists, no seeds, no walk. It reads the group the match half
+    // selected and runs the estimate, which is what lets the search run at its
+    // own register count rather than the fused kernel's.
+    int gxy[8];
+    int gz[8];
+    int n = 0;
+    for (int k = 0; k < 8; ++k) {
+        gxy[k] = 0;
+        gz[k] = 0;
+    }
+    if (is_active) {
+        const uint bid = block_index(gid, wgy, group);
+        const uint base = MATCH_MEM_OFF + bid * 16u;
+        n = min(int(match_words[bid]), 8);
+        for (int k = 0; k < 8; ++k) {
+            gxy[k] = int(match_words[base + uint(k) * 2u]);
+            gz[k] = int(match_words[base + uint(k) * 2u + 1u]);
+        }
+    }
+    estimate_patch(is_active, sl, n, gxy, gz);
+#else
     const int anchor_pc = src_search(KRADIUS, 0);
 #ifdef PATCH_LDS
     // The reference patch depends on the group's block origin, not on `sl`, so
@@ -1213,100 +1369,22 @@ void main() {
         }
     }
 
-    if (NOESTIMATE == 0) {
-    // One entry covers NPLANES planes; at NPLANES == 1 the bounds fold and this
-    // is the single-plane kernel it has always been. The group (gxy, gz) is
-    // luma's in every case: a joint chroma entry filters each plane with the
-    // groups block matching found on plane 0, as the reference does.
-#ifdef ONE_PLANE
-    // A one-trip loop over a spec constant still costs Nvidia about 2x: it
-    // keeps the whole body inside a loop and spills (128 registers, 215808
-    // bytes, against 168 and 128256 straight-line). This build is only used for
-    // a one-plane entry, so `plane` is a constant and the body is straight-line.
-    const int plane = 0;
-    {
+#ifdef SPLIT_MATCH
+    // Publish the group for the filter half. Lane 0 owns both writes and every
+    // index is a compile-time constant, so the group list stays out of memory.
+    if (is_active && sl == 0) {
+        const uint bid = block_index(gid, wgy, group);
+        const uint base = MATCH_MEM_OFF + bid * 16u;
+        match_words[bid] = uint(n);
+        for (int k = 0; k < 8; ++k) {
+            if (k < n) {
+                match_words[base + uint(k) * 2u] = uint(gxy[k]);
+                match_words[base + uint(k) * 2u + 1u] = uint(gz[k]);
+            }
+        }
+    }
 #else
-    for (int plane = 0; plane < NPLANES; ++plane) {
+    estimate_patch(is_active, sl, n, gxy, gz);
 #endif
-        const float sigma = (plane == 0) ? SIGMA_Y : ((plane == 1) ? SIGMA_U : SIGMA_V);
-
-#ifndef ONE_PLANE
-        // Joint entry: a plane below the threshold is not denoised (the
-        // reference's `if (sigma < FLT_EPS_) continue`); the host copies it
-        // through from the source clip instead.
-        if (NPLANES > 1 && sigma < FLT_EPS_) {
-            continue;
-        }
 #endif
-
-        const int rplane = pc.res_off + plane * RES_PLANE_STRIDE;
-
-        float denoising_patch[64];
-        float ref_patch[64];
-
-        float adaptive_weight;
-        {
-            // Every member is loaded and masked, never gated: a per-lane
-            // `if (i < n)` is what ACO if-converts for free and Nvidia instead
-            // branches on, serialising the warp over all eight members and
-            // spilling the patch. An out-of-group member reads the clamped
-            // reference block and is multiplied by zero.
-            for (int i = 0; i < 8; ++i) {
-                const float m = i < n ? 1.0f : 0.0f;
-                const int mx = min(max(gxy[i] & 0xFFFF, 0), WIDTH - 8);
-                const int my = min(max(gxy[i] >> XY_SHIFT, 0), HEIGHT - 8);
-                const int mz = clamp(gz[i], 0, KRADIUS * 2);
-                const int refp = src_search(mz, plane) + my * STRIDE + mx + sl;
-                const int srcp = src_input(mz, plane) + my * STRIDE + mx + sl;
-                for (int j = 0; j < 8; ++j) {
-                    denoising_patch[i * 8 + j] = m * src[srcp + j * STRIDE];
-                    if (FINAL != 0) {
-                        ref_patch[i * 8 + j] = m * src[refp + j * STRIDE];
-                    }
-                }
-            }
-            if (FINAL != 0) {
-                collaborative_wiener(denoising_patch, ref_patch, sigma, n, adaptive_weight);
-            } else {
-                collaborative_hard(denoising_patch, sigma, n, adaptive_weight);
-            }
-        }
-
-        if (is_active) {
-            const int wdstpc = rplane + sl;
-            const int weightpc = rplane + TEMPORAL_STRIDE + sl;
-
-            for (int i = 0; i < 8; ++i) {
-                // Predicated, not branched (see the load above). The address is
-                // clamped so an out-of-group member's zero add stays in bounds.
-                const float m = i < n ? 1.0f : 0.0f;
-                const int mx = min(max(gxy[i] & 0xFFFF, 0), WIDTH - 8);
-                const int my = min(max(gxy[i] >> XY_SHIFT, 0), HEIGHT - 8);
-                const int mz = clamp(gz[i], 0, KRADIUS * 2);
-                const int offset = mz * 2 * TEMPORAL_STRIDE + my * STRIDE + mx;
-
-                for (int j = 0; j < 8; ++j) {
-                    float wdst_val = m * adaptive_weight * denoising_patch[i * 8 + j];
-                    float weight_val = m * adaptive_weight;
-
-                    // extractor_exp pre-rounding: makes the float atomic sums
-                    // order-independent. `precise` is load-bearing — without
-                    // it the compiler folds `(x + E) - E` back to x once the
-                    // spec constant is known and the parameter becomes a
-                    // no-op. The `if` folds at pipeline creation, so E == 0
-                    // keeps the original code.
-                    if (EXTRACTOR != 0.0) {
-                        precise float wdst_rounded = (wdst_val + EXTRACTOR) - EXTRACTOR;
-                        precise float weight_rounded = (weight_val + EXTRACTOR) - EXTRACTOR;
-                        wdst_val = wdst_rounded;
-                        weight_val = weight_rounded;
-                    }
-
-                    res_add(wdstpc + offset + j * STRIDE, wdst_val);
-                    res_add(weightpc + offset + j * STRIDE, weight_val);
-                }
-            }
-        }
-    }
-    }
 }

@@ -274,6 +274,19 @@ which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-10-10 — the matcher/filter split is an opt-in candidate and a loss on
+  RADV.** `-DSPLIT_MATCH`/`-DSPLIT_FILTER` (`VSFEEL_BM3D_SPLIT_KERNEL=1`) run the
+  search and the estimate as two dispatches with the group handed over through a
+  buffer. The premise was measured first: with the patch staged, the matcher
+  alone is 96 VGPRs and 16 waves/SIMD against the fused kernel's 120 and 12, and
+  42 KB of ISA against 109 KB. It does not pay. RADV ABBA A/B (800 frames x3,
+  n=12): 950.5 fused against 824.9 split, -13.2%; narrowing the handoff barrier
+  from ALL_COMMANDS to compute->compute changes nothing. With the estimate made a
+  no-op the split is *still* 3.3% slower (1057 against 1023), so the matcher
+  gains nothing from the four extra waves: at 12 waves/SIMD it is not
+  occupancy-bound. The rest of the loss is the estimate re-reading the group the
+  fused kernel still had in registers. Kept default-off for an Nvidia
+  measurement; the full suite passes on both paths.
 - **2026-10-09 — force-unrolling the fixed-trip loops is a dead end; reverted.**
   `[[unroll]]` does work, unlike `#pragma unroll`: it removes the `OpLoopMerge`,
   and it takes the shipped SPIR-V from 132 loops and 25 runtime-indexed
@@ -558,6 +571,7 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
   buffer float atomics (A/B only).
 - `VSFEEL_BM3D_PATCH_LDS=0/1` — force either reference-patch arm; unset follows
   the driver rule (shared memory everywhere except RADV).
+- `VSFEEL_BM3D_SPLIT_KERNEL=1` — the opt-in match/filter split (see Historical).
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs.
   `NOSEARCH` is the matcher's reference-only path, the same thing `th_mse=0`
   selects, so it cannot price the search.

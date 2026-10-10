@@ -203,6 +203,17 @@ set(VK_BM3D_VARIANTS
     "bm3d_cas_1plane|bm3d.comp|-DNO_FLOAT_ATOMICS -DONE_PLANE"
     "bm3d_cas_lds|bm3d.comp|-DNO_FLOAT_ATOMICS -DPATCH_LDS"
     "bm3d_cas_lds_1plane|bm3d.comp|-DNO_FLOAT_ATOMICS -DPATCH_LDS -DONE_PLANE"
+    # The match/filter split (VSFEEL_BM3D_SPLIT_KERNEL): the search half writes
+    # each group to a buffer and the filter half reads it. The matcher needs
+    # neither ONE_PLANE nor the atomics arm (it touches no estimate stack) and
+    # the filter needs no PATCH_LDS (it reads no reference patch), so the pair
+    # costs six variants rather than sixteen.
+    "bm3d_match|bm3d.comp|-DSPLIT_MATCH"
+    "bm3d_match_lds|bm3d.comp|-DSPLIT_MATCH -DPATCH_LDS"
+    "bm3d_filter|bm3d.comp|-DSPLIT_FILTER"
+    "bm3d_filter_1plane|bm3d.comp|-DSPLIT_FILTER -DONE_PLANE"
+    "bm3d_filter_cas|bm3d.comp|-DSPLIT_FILTER -DNO_FLOAT_ATOMICS"
+    "bm3d_filter_cas_1plane|bm3d.comp|-DSPLIT_FILTER -DNO_FLOAT_ATOMICS -DONE_PLANE"
     "bm3d_agg_32|bm3d_agg.comp|-DBITS=32"
     "bm3d_agg_16|bm3d_agg.comp|-DBITS=16"
     "bm3d_copy16|bm3d_copy.comp|")

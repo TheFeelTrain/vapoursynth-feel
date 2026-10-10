@@ -73,6 +73,9 @@ struct Bm3dGroup {
     std::array<int, 3> planes {}; // absolute plane indices, in packing order
     VkDeviceSize pe {};           // per-plane extent in floats
     VkPipeline bm3d_pipeline {};
+    // The split's two halves (VSFEEL_BM3D_SPLIT_KERNEL); unused when fused.
+    VkPipeline bm3d_match_pipeline {};
+    VkPipeline bm3d_filter_pipeline {};
     uint32_t bm3d_grid_x {};
     uint32_t bm3d_grid_y {};
     // The copy-and-widen dispatch for this entry's plane extent, folded into X
@@ -225,6 +228,11 @@ struct BM3DData {
     int trace_y {};
     GpuBuffer match_trace {};
     volatile uint32_t * match_trace_mapped {};
+    // Match/filter split: the group handoff (one count word per reference block
+    // plus 16 words of members per block) and the flag that selects it.
+    bool split_kernel {};
+    GpuBuffer matches {};
+    uint32_t match_words {};
     VkDeviceSize tags_size {}; // uints
     int nframes {};
 
@@ -355,6 +363,7 @@ struct BM3DData {
         gpu_destroy_buffer(*gpu, skipped);
         gpu_destroy_buffer(*gpu, refusal);
         gpu_destroy_buffer(*gpu, match_trace);
+        gpu_destroy_buffer(*gpu, matches);
         if (pipeline_layout) {
             gpu->vk->vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
         }
@@ -373,7 +382,8 @@ struct BM3DData {
 static std::variant<VkPipeline, std::string>
 create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
                      const Bm3dGroup & group, const uint32_t * code,
-                     size_t code_size, VkPipelineLayout layout) {
+                     size_t code_size, VkPipelineLayout layout, bool patch_lds,
+                     bool seeds) {
 
     // One entry's planes share their geometry, and the search parameters are
     // the first plane's (the reference's joint entry does the same); only the
@@ -463,11 +473,12 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
     // when it is staged there (4 x 72 floats; the stride is a multiple of 16
     // bytes so a patch row reads as vector loads, and it keeps the four groups
     // in different banks). The per-lane candidate lists live in registers, so
-    // nothing else is shared.
-    const uint32_t patch_bytes = d.patch_lds ? 4 * 72 * 4 : 0;
+    // nothing else is shared. The split's filter half uses neither, and
+    // declaring LDS it does not use would cost workgroups per SM.
+    const uint32_t patch_bytes = patch_lds ? 4 * 72 * 4 : 0;
+    const uint32_t seed_bytes = seeds ? 4 * 8 * 4 * 4 : 0;
     const GpuWorkgroup workgroup { .x = 32,
-                                   .shared_bytes =
-                                       4 * 8 * 4 * 4 + patch_bytes };
+                                   .shared_bytes = seed_bytes + patch_bytes };
     return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(),
                                &spec, static_cast<uint32_t>(entries.size()),
                                sizeof(spec), "bm3d", subgroup_size, workgroup);
@@ -952,6 +963,23 @@ static void bm3d_full_barrier(const GPUDevice & gpu, VkCommandBuffer cmd) {
     gpu.vk->vkCmdPipelineBarrier2(cmd, &dep);
 }
 
+// Compute-to-compute handoff for the split: the search half's group writes must
+// be visible to the filter half's reads. The fused path's ALL_COMMANDS barrier
+// orders far more than this dependency needs.
+static void bm3d_compute_barrier(const GPUDevice & gpu, VkCommandBuffer cmd) {
+    VkMemoryBarrier2 mb {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    mb.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    mb.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+    VkDependencyInfo dep {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &mb;
+    gpu.vk->vkCmdPipelineBarrier2(cmd, &dep);
+}
+
 // Zero-fill one entry's result slot and dispatch its estimation kernel. Separate
 // so each recomputed position can be recorded into its own command buffer: a
 // frame's estimation is the search run over every window position it is missing,
@@ -1007,12 +1035,18 @@ static void record_est_position(BM3DData * d, const Bm3dFrame & fr,
     }
     const VkBuffer dst_bind = trace_xy >= 0 ? d->match_trace.buffer : dst_plane;
 
+    // With the split, the same bindings and push constants serve both halves:
+    // the match buffer rides the skipped slot, which neither half reads, and
+    // only the pipeline changes between the two dispatches.
+    const VkBuffer aux_bind =
+        d->split_kernel ? d->matches.buffer : d->skipped.buffer;
     d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                  g.bm3d_pipeline);
+                                  d->split_kernel ? g.bm3d_match_pipeline
+                                                  : g.bm3d_pipeline);
     // The estimation kernel reads only the estimate stacks and the source ring;
     // the destination binding carries the output plane and is unused here.
     bm3d_bind(*d->gpu, cmd, d->pipeline_layout, g.src.buffer, g.res.buffer,
-              dst_bind, d->tags.buffer, d->skipped.buffer, d->refusal.buffer);
+              dst_bind, d->tags.buffer, aux_bind, d->refusal.buffer);
     {
         const int32_t slot0_push =
             static_cast<int32_t>((r == 0) ? fr.slot0[gi] : 0);
@@ -1029,6 +1063,14 @@ static void record_est_position(BM3DData * d, const Bm3dFrame & fr,
                            sizeof(pushes));
     }
     d->gpu->vk->vkCmdDispatch(cmd, g.bm3d_grid_x, g.bm3d_grid_y, 1);
+    if (d->split_kernel) {
+        // The groups the search half wrote must be visible to the filter half:
+        // the barrier is the whole handoff.
+        bm3d_compute_barrier(*d->gpu, cmd);
+        d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                      g.bm3d_filter_pipeline);
+        d->gpu->vk->vkCmdDispatch(cmd, g.bm3d_grid_x, g.bm3d_grid_y, 1);
+    }
 }
 
 // The input planes one source frame contributes to the ring copy: the frame
@@ -2061,10 +2103,18 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     d->patch_lds = patch_lds_env && *patch_lds_env
                        ? env_flag("VSFEEL_BM3D_PATCH_LDS")
                        : d->gpu->driver_id != VK_DRIVER_ID_MESA_RADV;
+    // The split runs the search and the estimate as two dispatches, with the
+    // group handed over through a buffer. The search then carries no estimate
+    // stack and the filter no search state, which is where the search's
+    // occupancy comes from. See src/bm3d.comp.
+    d->split_kernel = env_flag("VSFEEL_BM3D_SPLIT_KERNEL");
     if (vsfeel_device_info_enabled()) {
         fprintf(stderr, "[bm3d] aggregation: %s\n",
                 d->cas_atomics ? "CAS loop (atom_add_f fallback)"
                                : "hardware buffer float atomics");
+        fprintf(stderr, "[bm3d] estimation: %s\n",
+                d->split_kernel ? "match + filter split"
+                                : "fused match/estimate");
         fprintf(stderr, "[bm3d] reference patch: %s (driver %u)\n",
                 d->patch_lds ? "shared memory" : "per-lane registers",
                 d->gpu->driver_id);
@@ -2307,6 +2357,35 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             }
         }
         {
+            // The split's handoff, sized for the largest entry's grid: one
+            // count word per reference block plus 16 member words each.
+            uint64_t blocks = 0;
+            for (int gi = 0; gi < d->n_groups; ++gi) {
+                const auto & p = d->planes[d->groups[gi].planes[0]];
+                const uint64_t gx =
+                    (static_cast<uint64_t>(p.width) +
+                     4 * static_cast<uint64_t>(p.block_step) - 1) /
+                    (4 * static_cast<uint64_t>(p.block_step));
+                const uint64_t gy =
+                    (static_cast<uint64_t>(p.height) + p.block_step - 1) /
+                    p.block_step;
+                blocks = std::max(blocks, gx * gy * 4);
+            }
+            d->match_words = static_cast<uint32_t>(
+                ((blocks + 1) & ~uint64_t(1)) + blocks * 16);
+            if (d->split_kernel) {
+                std::string err = gpu_make_buffer(
+                    *d->gpu, core,
+                    static_cast<VkDeviceSize>(d->match_words) * 4, d->matches,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                if (!err.empty()) {
+                    return set_error("the match handoff could not be "
+                                     "allocated: " +
+                                     err);
+                }
+            }
+        }
+        {
             std::string err =
                 gpu_make_buffer(*d->gpu, core, 4 * sizeof(uint32_t), d->skipped,
                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -2439,33 +2518,74 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             // picked decides whether the reference patch is staged. See
             // src/bm3d.comp for both.
             const bool one_plane = g.n_planes == 1;
-            const uint32_t * code = nullptr;
-            size_t code_size = 0;
-            if (d->cas_atomics) {
-                code = d->patch_lds
-                           ? (one_plane ? bm3d_cas_lds_1plane_spv
-                                        : bm3d_cas_lds_spv)
-                           : (one_plane ? bm3d_cas_1plane_spv : bm3d_cas_spv);
-                code_size = d->patch_lds
-                                ? (one_plane ? bm3d_cas_lds_1plane_spv_size
-                                             : bm3d_cas_lds_spv_size)
-                                : (one_plane ? bm3d_cas_1plane_spv_size
-                                             : bm3d_cas_spv_size);
+            if (d->split_kernel) {
+                // The search half stages the patch but has no estimate stack;
+                // the filter half is the other way round. That asymmetry is the
+                // point, so the two are built from different arms.
+                const uint32_t * mcode =
+                    d->patch_lds ? bm3d_match_lds_spv : bm3d_match_spv;
+                const size_t msize = d->patch_lds ? bm3d_match_lds_spv_size
+                                                  : bm3d_match_spv_size;
+                const auto mres = create_bm3d_pipeline(
+                    *d->gpu, *d, g, mcode, msize, d->pipeline_layout,
+                    d->patch_lds, true);
+                if (std::holds_alternative<std::string>(mres)) {
+                    return set_error(std::get<std::string>(mres));
+                }
+                g.bm3d_match_pipeline = std::get<VkPipeline>(mres);
+
+                const uint32_t * fcode = nullptr;
+                size_t fsize = 0;
+                if (d->cas_atomics) {
+                    fcode = one_plane ? bm3d_filter_cas_1plane_spv
+                                      : bm3d_filter_cas_spv;
+                    fsize = one_plane ? bm3d_filter_cas_1plane_spv_size
+                                      : bm3d_filter_cas_spv_size;
+                } else {
+                    fcode =
+                        one_plane ? bm3d_filter_1plane_spv : bm3d_filter_spv;
+                    fsize = one_plane ? bm3d_filter_1plane_spv_size
+                                      : bm3d_filter_spv_size;
+                }
+                const auto fres =
+                    create_bm3d_pipeline(*d->gpu, *d, g, fcode, fsize,
+                                         d->pipeline_layout, false, false);
+                if (std::holds_alternative<std::string>(fres)) {
+                    return set_error(std::get<std::string>(fres));
+                }
+                g.bm3d_filter_pipeline = std::get<VkPipeline>(fres);
             } else {
-                code = d->patch_lds
-                           ? (one_plane ? bm3d_lds_1plane_spv : bm3d_lds_spv)
-                           : (one_plane ? bm3d_1plane_spv : bm3d_spv);
-                code_size = d->patch_lds ? (one_plane ? bm3d_lds_1plane_spv_size
-                                                      : bm3d_lds_spv_size)
-                                         : (one_plane ? bm3d_1plane_spv_size
-                                                      : bm3d_spv_size);
+                const uint32_t * code = nullptr;
+                size_t code_size = 0;
+                if (d->cas_atomics) {
+                    code = d->patch_lds ? (one_plane ? bm3d_cas_lds_1plane_spv
+                                                     : bm3d_cas_lds_spv)
+                                        : (one_plane ? bm3d_cas_1plane_spv
+                                                     : bm3d_cas_spv);
+                    code_size = d->patch_lds
+                                    ? (one_plane ? bm3d_cas_lds_1plane_spv_size
+                                                 : bm3d_cas_lds_spv_size)
+                                    : (one_plane ? bm3d_cas_1plane_spv_size
+                                                 : bm3d_cas_spv_size);
+                } else {
+                    code =
+                        d->patch_lds
+                            ? (one_plane ? bm3d_lds_1plane_spv : bm3d_lds_spv)
+                            : (one_plane ? bm3d_1plane_spv : bm3d_spv);
+                    code_size = d->patch_lds
+                                    ? (one_plane ? bm3d_lds_1plane_spv_size
+                                                 : bm3d_lds_spv_size)
+                                    : (one_plane ? bm3d_1plane_spv_size
+                                                 : bm3d_spv_size);
+                }
+                const auto result = create_bm3d_pipeline(
+                    *d->gpu, *d, g, code, code_size, d->pipeline_layout,
+                    d->patch_lds, true);
+                if (std::holds_alternative<std::string>(result)) {
+                    return set_error(std::get<std::string>(result));
+                }
+                g.bm3d_pipeline = std::get<VkPipeline>(result);
             }
-            const auto result = create_bm3d_pipeline(
-                *d->gpu, *d, g, code, code_size, d->pipeline_layout);
-            if (std::holds_alternative<std::string>(result)) {
-                return set_error(std::get<std::string>(result));
-            }
-            g.bm3d_pipeline = std::get<VkPipeline>(result);
         }
         g.bm3d_grid_x = static_cast<uint32_t>(
             (first.width + 4 * first.block_step - 1) / (4 * first.block_step));
