@@ -43,7 +43,7 @@ test = [
 
 dev = [
     { include-group = "test" },
-    "vapoursynth==81rc1",
+    "vapoursynth>=81",
     "vsjetpack>=2.2.6",
     "vapoursynth-bestsource>=22",
     "vapoursynth-edgemasks>=4.1",
@@ -58,7 +58,7 @@ dev = [
     "vapoursynth-nlm-hip>=4",
     "vapoursynth-knlmeansvk>=2.0",
     "vapoursynth-zsmooth>=0.20",
-    "vapoursynth-bm3d",
+    "vapoursynth-bm3d>=11",
 ]
 
 lint = [
@@ -102,11 +102,6 @@ path = "hatch_build.py"
 [tool.uv]
 package = false
 python-preference = "only-managed"
-# bm3dvk2's wheel metadata says VapourSynth>=81, which no release candidate can
-# satisfy: the dev group pins the 81rc1 pre-release the benchmark is measured
-# on. The R81 API it needs (VSVulkan4.h, ffGPUOutput) is already in the rc, so
-# the resolver is told to ignore the floor rather than the plugin.
-override-dependencies = ["vapoursynth==81rc1"]
 
 [[tool.uv.index]]
 name = "vs-wheels"
@@ -115,7 +110,6 @@ url = "https://jaded-encoding-thaumaturgy.github.io/vs-wheels/simple"
 [tool.uv.sources]
 vapoursynth-fmtconv = { index = "vs-wheels" }
 vapoursynth-vszipcl = { git = "https://github.com/dnjulek/vapoursynth-zipcl", rev = "2c1b97742bf4f086f0bd31d26ba630e834c661ed" }
-vapoursynth-bm3d = { git = "https://github.com/HomeOfVapourSynthEvolution/VapourSynth-BM3D", rev = "cd89118e33ba6cbfd7b447115425dcb98905e0e6" }
 
 [tool.pytest.ini_options]
 addopts = "-p no:vsengine"
