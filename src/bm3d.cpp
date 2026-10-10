@@ -162,6 +162,9 @@ struct Bm3dProbe {
 };
 
 
+// One instance per filter node, never an array, so the fields stay grouped the
+// way the comments read rather than packed for a padding win that cannot pay.
+// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 struct BM3DData {
     VSNode * node {};
     VSNode * ref_node {}; // optional basic-estimate clip (final/Wiener pass)
@@ -184,6 +187,10 @@ struct BM3DData {
     // one that leaves it in scratch cannot afford the reads. See the driver rule
     // in BM3DCreate and src/bm3d.comp.
     bool patch_lds {};
+    // Item-based row reuse in the spatial search walk: ITEM_ROWS vertically
+    // adjacent candidates per lane, a source row loaded once for all of them.
+    // 1 is the per-candidate walk. Requires patch_lds. See src/bm3d.comp.
+    int item_rows { 1 };
     // chroma=True: one joint entry over the clip's three 4:4:4 planes, whose
     // groups come from luma (the references' "chroma" mode).
     bool joint {};
@@ -2108,6 +2115,21 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // stack and the filter no search state, which is where the search's
     // occupancy comes from. See src/bm3d.comp.
     d->split_kernel = env_flag("VSFEEL_BM3D_SPLIT_KERNEL");
+    // Item-based row reuse in the spatial search walk (see src/bm3d.comp). The
+    // item walk reads the reference patch by a runtime row, which only the
+    // shared-memory patch can express, so asking for it forces that arm.
+    d->item_rows = env_int("VSFEEL_BM3D_ITEM_ROWS", 1);
+    if (d->item_rows != 2 && d->item_rows != 4) {
+        d->item_rows = 1;
+    }
+    if (d->split_kernel) {
+        // The split owns the search walk in its match half, which is built
+        // without an item variant.
+        d->item_rows = 1;
+    }
+    if (d->item_rows > 1) {
+        d->patch_lds = true;
+    }
     if (vsfeel_device_info_enabled()) {
         fprintf(stderr, "[bm3d] aggregation: %s\n",
                 d->cas_atomics ? "CAS loop (atom_add_f fallback)"
@@ -2118,6 +2140,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         fprintf(stderr, "[bm3d] reference patch: %s (driver %u)\n",
                 d->patch_lds ? "shared memory" : "per-lane registers",
                 d->gpu->driver_id);
+        fprintf(stderr, "[bm3d] search items: %d candidate row%s per lane\n",
+                d->item_rows, d->item_rows == 1 ? "" : "s");
     }
     // The 8x8 group transposes and the group-8 reduction are subgroup shuffles,
     // and the kernel's per-lane layout puts each 8-lane group inside one
@@ -2557,7 +2581,23 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             } else {
                 const uint32_t * code = nullptr;
                 size_t code_size = 0;
-                if (d->cas_atomics) {
+                if (d->cas_atomics && d->item_rows > 1) {
+                    // Item-based row reuse on the CAS accumulation. Both arms
+                    // of the CAS/hardware comparison have to run the same walk,
+                    // or the check measures the walk's rounding, not the
+                    // accumulation's.
+                    code = d->item_rows == 4
+                               ? (one_plane ? bm3d_cas_lds_item4_1plane_spv
+                                            : bm3d_cas_lds_item4_spv)
+                               : (one_plane ? bm3d_cas_lds_item2_1plane_spv
+                                            : bm3d_cas_lds_item2_spv);
+                    code_size =
+                        d->item_rows == 4
+                            ? (one_plane ? bm3d_cas_lds_item4_1plane_spv_size
+                                         : bm3d_cas_lds_item4_spv_size)
+                            : (one_plane ? bm3d_cas_lds_item2_1plane_spv_size
+                                         : bm3d_cas_lds_item2_spv_size);
+                } else if (d->cas_atomics) {
                     code = d->patch_lds ? (one_plane ? bm3d_cas_lds_1plane_spv
                                                      : bm3d_cas_lds_spv)
                                         : (one_plane ? bm3d_cas_1plane_spv
@@ -2567,6 +2607,20 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
                                                  : bm3d_cas_lds_spv_size)
                                     : (one_plane ? bm3d_cas_1plane_spv_size
                                                  : bm3d_cas_spv_size);
+                } else if (d->item_rows > 1) {
+                    // Item-based row reuse. Built only with the shared patch,
+                    // the arm the item walk needs.
+                    code = d->item_rows == 4
+                               ? (one_plane ? bm3d_lds_item4_1plane_spv
+                                            : bm3d_lds_item4_spv)
+                               : (one_plane ? bm3d_lds_item2_1plane_spv
+                                            : bm3d_lds_item2_spv);
+                    code_size =
+                        d->item_rows == 4
+                            ? (one_plane ? bm3d_lds_item4_1plane_spv_size
+                                         : bm3d_lds_item4_spv_size)
+                            : (one_plane ? bm3d_lds_item2_1plane_spv_size
+                                         : bm3d_lds_item2_spv_size);
                 } else {
                     code =
                         d->patch_lds

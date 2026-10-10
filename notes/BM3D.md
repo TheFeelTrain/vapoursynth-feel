@@ -267,6 +267,14 @@ which is where the visible speedup is (see Performance).
   sharing the group list costs the whole filter 2.6x (see Historical).
 - Color costs the planes: 4:2:0 is 1.5x the luma-only estimate/source footprint
   and 4:4:4/RGB 3x, all inside the same `maxStorageBufferRange` budget.
+- **Item-based row reuse in the search walk is small on RADV and Nvidia-weighted
+  by construction.** `-DITEM_ROWS=2|4` (`VSFEEL_BM3D_ITEM_ROWS`) gives a lane a
+  column of 2 or 4 adjacent candidates and loads each source row once for all of
+  them (64 -> 36 -> 22 loads per candidate), the accumulation unchanged. ACO
+  already merges the per-row loads, so RADV gains 1.0% at 4 and loses 0.8% at 2
+  (ABBA, 800 frames x3, n=12: 892.1 against 901.4 fps, shared patch both arms);
+  the builds force the shared patch, which is 5-8% behind the register arm on
+  RADV, so the arm is for Nvidia, where those loads stay scalar.
 - The multi-plane round did not move the luma path (NPLANES == 1: 6131 vs 6133
   instructions, 192/108/4096 B, 8 waves/SIMD; 12 ABBA pairs at 935 vs 924 fps).
 
@@ -274,6 +282,30 @@ which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-10-10 — item-based row reuse: the matcher's rounding has to be pinned,
+  not inherited.** `-DITEM_ROWS=2|4` gives a lane a column of 2 or 4 adjacent
+  candidates and loads each source row once for all of them (64 -> 36 -> 22 loads
+  per candidate), which is bm3dvk2's `ADD_ROW`/`DEFINE_DISTANCES` mechanism
+  re-expressed; the accumulation stays per candidate in the CPU's order. The walk
+  reads the patch by a runtime row, so it needs `PATCH_LDS` (`#error` otherwise),
+  and it is spatial-only: the temporal walk's origins overlap across windows, so
+  items there would re-test candidates an earlier window already owned. RADV:
+  +1.0% at 4, -0.8% at 2 (ABBA, 800 frames x3, n=12, shared patch both arms).
+  The round's real result is a correctness one. At 4 the build produced a 1-ulp
+  different SSD on one retained candidate of a 33x33 window, which flipped a
+  near-tie: two candidates at the same origin in different frames with
+  bit-identical errors swapped places in the group, and the CAS/hardware checks
+  went 26 codes apart. Cause: ACO contracts `a + d * d` into an FMA per site as
+  register pressure allows, so the same walk written twice can round one term
+  differently. `tests/bm3d_oracle.py` models the CPU's two roundings, and an
+  explicit `fma()` is the wrong direction (the shipped per-candidate walk is
+  *inconsistently* contracted, some terms fused and some not, so nothing matches
+  it), so the item accumulators are declared `precise`: the item build now
+  reproduces the oracle's arithmetic exactly. The per-candidate arms are
+  untouched, byte-identical SPIR-V included, so they keep whatever contraction
+  the backend picks. CAS item variants exist so both accumulation arms run the
+  same walk, which is what makes the CAS/hardware comparison measure the
+  accumulation rather than the walk.
 - **2026-10-10 — the matcher/filter split is an opt-in candidate and a loss on
   RADV.** `-DSPLIT_MATCH`/`-DSPLIT_FILTER` (`VSFEEL_BM3D_SPLIT_KERNEL=1`) run the
   search and the estimate as two dispatches with the group handed over through a
@@ -572,6 +604,8 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
 - `VSFEEL_BM3D_PATCH_LDS=0/1` — force either reference-patch arm; unset follows
   the driver rule (shared memory everywhere except RADV).
 - `VSFEEL_BM3D_SPLIT_KERNEL=1` — the opt-in match/filter split (see Historical).
+- `VSFEEL_BM3D_ITEM_ROWS=2/4` — item-based row reuse in the spatial search walk;
+  needs the shared patch, so it forces that arm (see Historical).
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs.
   `NOSEARCH` is the matcher's reference-only path, the same thing `th_mse=0`
   selects, so it cannot price the search.

@@ -10,6 +10,23 @@
 #endif
 #extension GL_KHR_shader_subgroup_shuffle : enable
 
+// Item-based row reuse in the spatial search walk: instead of one candidate per
+// lane, a lane owns ITEM_ROWS vertically adjacent candidates in one column, so
+// a source row is loaded once and used by every candidate whose block covers
+// it. 1 is the historical one-candidate walk; 2 and 4 are the reuse variants
+// (SSD_ITEM below). Only the spatial walk uses it -- the temporal walk's
+// origins overlap across windows, so items there would re-test candidates an
+// earlier window already owned.
+#ifndef ITEM_ROWS
+#define ITEM_ROWS 1
+#endif
+#if ITEM_ROWS > 1
+#extension GL_EXT_control_flow_attributes : require
+#ifndef PATCH_LDS
+#error "ITEM_ROWS > 1 needs PATCH_LDS: it reads the patch by a runtime row"
+#endif
+#endif
+
 /*
  * BM3D collaborative-filtering kernel. One workgroup = one warp of 32 lanes;
  * 4 groups of 8 lanes each process one 8x8 reference block. The per-lane layout
@@ -607,7 +624,11 @@ float reduce_group8(float x) {
 // accumulators, each taking column k and column k + 4 of one row before the next
 // row, is the CPU's BlockSSD order: near-ties and threshold boundaries are
 // decided by it, so matching it keeps the two matchers' discrete decisions
-// together.
+// together. The update is spelled `precise` and not left to contraction: the
+// backend fuses `a + d * d` when it suits the register allocator, so the same
+// walk written twice can round one term differently and flip a near-tie
+// (measured at ITEM_ROWS=4, one candidate in a 33x33 window). `precise` pins the
+// two roundings the CPU reference makes, which is what SSD_AT already gets here.
 #define SSD_ROW(BASE, ROWOFF, CX, C0, C1, C2, C3, C4, C5, C6, C7)          \
     do {                                                                   \
         const int row = (BASE) + (ROWOFF) + (CX);                          \
@@ -689,6 +710,64 @@ float reduce_group8(float x) {
         SSD_ROW(BASE, (CY + 7) * STRIDE, CX, p14.x, p14.y, p14.z, p14.w,   \
                 p15.x, p15.y, p15.z, p15.w);                               \
         (OUT) = ((a0 + a1) + a2) + a3;                                     \
+    } while (false)
+#endif
+
+#if ITEM_ROWS > 1
+#define CUR_ITEM(K, I) cur_s[group][(I) * 8 + (K)]
+// ITEM_ROWS candidates in one column, accumulated together. Source row `rr` is
+// patch row `rr - k` of candidate k, so one loaded row feeds every candidate
+// that covers it and the per-candidate load count falls from 64 to
+// (ITEM_ROWS + 7) * 8 / ITEM_ROWS -- about 22 at 4. Each candidate still sums
+// its own rows in SSD_ROW's order into its own four accumulators, so the
+// rounding and the tie policy are unchanged. Rows past the bottom edge are
+// clamped the way the CPU clamps them, and the caller drops candidates below
+// `bottom`, so the overshoot only wastes the load.
+#define SSD_ITEM(BASE, CX, ROW0, BOTTOM, ERRP)                             \
+    do {                                                                   \
+        precise float a[ITEM_ROWS][4];                                     \
+        [[unroll]] for (int k = 0; k < ITEM_ROWS; ++k) {                   \
+            a[k][0] = 0.0f;                                                \
+            a[k][1] = 0.0f;                                                \
+            a[k][2] = 0.0f;                                                \
+            a[k][3] = 0.0f;                                                \
+        }                                                                  \
+        for (int rr = 0; rr < ITEM_ROWS + 7; ++rr) {                       \
+            const int row = (BASE) +                                      \
+                            min((ROW0) + rr, HEIGHT - 1) * STRIDE + (CX);  \
+            const float v0 = src[row + 0];                                 \
+            const float v1 = src[row + 1];                                 \
+            const float v2 = src[row + 2];                                 \
+            const float v3 = src[row + 3];                                 \
+            const float v4 = src[row + 4];                                 \
+            const float v5 = src[row + 5];                                 \
+            const float v6 = src[row + 6];                                 \
+            const float v7 = src[row + 7];                                 \
+            [[unroll]] for (int k = 0; k < ITEM_ROWS; ++k) {               \
+                const int y = rr - k;                                      \
+                if (y >= 0 && y < 8 && (ROW0) + k <= (BOTTOM)) {           \
+                    const float d0 = CUR_ITEM(0, y) - v0;                  \
+                    const float d1 = CUR_ITEM(1, y) - v1;                  \
+                    const float d2 = CUR_ITEM(2, y) - v2;                  \
+                    const float d3 = CUR_ITEM(3, y) - v3;                  \
+                    const float d4 = CUR_ITEM(4, y) - v4;                  \
+                    const float d5 = CUR_ITEM(5, y) - v5;                  \
+                    const float d6 = CUR_ITEM(6, y) - v6;                  \
+                    const float d7 = CUR_ITEM(7, y) - v7;                  \
+                    a[k][0] = a[k][0] + d0 * d0;                           \
+                    a[k][1] = a[k][1] + d1 * d1;                           \
+                    a[k][2] = a[k][2] + d2 * d2;                           \
+                    a[k][3] = a[k][3] + d3 * d3;                           \
+                    a[k][0] = a[k][0] + d4 * d4;                           \
+                    a[k][1] = a[k][1] + d5 * d5;                           \
+                    a[k][2] = a[k][2] + d6 * d6;                           \
+                    a[k][3] = a[k][3] + d7 * d7;                           \
+                }                                                          \
+            }                                                              \
+        }                                                                  \
+        [[unroll]] for (int k = 0; k < ITEM_ROWS; ++k) {                   \
+            (ERRP)[k] = ((a[k][0] + a[k][1]) + a[k][2]) + a[k][3];         \
+        }                                                                  \
     } while (false)
 #endif
 
@@ -1207,6 +1286,33 @@ void main() {
             const int top = max(y - BM_RANGE, 0);
             const int bottom = min(y + BM_RANGE, HEIGHT - 8);
             const int rw = right - left + 1;
+#if ITEM_ROWS > 1
+            // Items tile the same rectangle, so every origin is still tested
+            // exactly once -- only the lane that owns it changes, and the
+            // per-lane top-8 plus the (error, xy) merge make the result
+            // independent of which lane that is.
+            const int row_items = (bottom - top + ITEM_ROWS) / ITEM_ROWS;
+            const int total = row_items * rw;
+            int col_i = left + sl % rw;
+            int row0 = top + (sl / rw) * ITEM_ROWS;
+            for (int s = sl; s < total; s += 8) {
+                float err[ITEM_ROWS];
+                SSD_ITEM(anchor_pc, col_i, row0, bottom, err);
+                // Predicated, never branched, exactly as below.
+                [[unroll]] for (int k = 0; k < ITEM_ROWS; ++k) {
+                    const bool keep = row0 + k <= bottom &&
+                                      err[k] <= TH_SSE &&
+                                      (col_i != x || row0 + k != y);
+                    insert_cand(pe, pxy, keep ? err[k] : FLT_MAX_,
+                                keep ? pack_xy(col_i, row0 + k) : INT_MAX_);
+                }
+                col_i += 8;
+                while (col_i > right) {
+                    col_i -= rw;
+                    row0 += ITEM_ROWS;
+                }
+            }
+#else
             const int total = (bottom - top + 1) * rw;
             int col_i = left + sl % rw;
             int row_i = top + sl / rw;
@@ -1226,6 +1332,7 @@ void main() {
                     row_i += 1;
                 }
             }
+#endif
         }
         float ce[8];
         int cxy[8];
