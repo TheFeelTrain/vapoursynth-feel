@@ -139,7 +139,8 @@ The notes files carry the mechanism; the changelog carries the result.
 The dev environment is the project venv, not the system Python or the system
 VapourSynth: `uv sync` builds `.venv` from `uv.lock` and `.python-version` (a
 uv-managed CPython), and `tools/install.sh` installs the plugin into that venv's
-plugin directory. The `dev` group requires `vapoursynth>=81` and
+plugin directory. The `dev` group requires `vapoursynth>=81` (built from the
+upstream commit pinned in `[tool.uv.sources]`, not the PyPI wheel) and
 `vapoursynth-bm3d>=11` (the published requirement stays `vapoursynth>=80`), and
 supplies pytest/xdist, numpy, vsjetpack and the reference plugins the suite and
 the benchmark compare against (`vszipcl` from git plus `fmtconv` from JET's
@@ -147,8 +148,8 @@ vs-wheels index, `eedi3vk2`, `nnedi3vk`, `bm3dvk`, `bm3dvk2`, `nlm_hip`,
 `knlmmeansvk`, `zsmooth`, `bestsource`, `edgemasks`, `resize2`, `descale`).
 `uv sync --group lint` adds the pinned clang-format/clang-tidy/ruff. Never `pip install` into this tree, and never rely 
 on a system plugin being visible. `tools/*.sh` and `uv run` pick the venv up on 
-their own. One-time per venv, run `.venv/bin/vapoursynth config`: the wheel's 
-`vspipe` embeds CPython through VSScript, whose autodetection cannot find a 
+their own. One-time per venv, run `.venv/bin/vapoursynth config`: `vspipe`
+embeds CPython through VSScript, whose autodetection cannot find a 
 `libpython` for uv's statically linked CPython, and the registration is what 
 makes the benchmark and the vspipe hang tests work.
 
@@ -209,9 +210,10 @@ runs it. Plugins are described separately in `PLUGINS`.
   - `--frames N`, `--clip PATH` to control the run
   - `--gpu-cache` hands every arm device-resident frames, the chain a GPU
     filter actually runs in (a CPU filter pays the download it would pay
-    there); `--no-download` crops each arm's output to 8x8, which takes
-    vspipe's implicit output download out of the fps. Both together time a GPU
-    filter's own compute; `notes/METHOD.md` has what the mode's residual costs.
+    there); `--no-download` runs vspipe with its `--` no-output target, which
+    leaves a GPU resident output resident instead of downloading it. Both
+    together time a GPU filter's own compute; `notes/METHOD.md` has what the
+    mode's residual costs.
 - The default clip is `/home/encode/test/jpbd.mkv` (1920x1080, YUV420P8).
 - Set `MANGOHUD=0` for every benchmark run. It does not change results, it just
   suppresses extra messages in the output.

@@ -136,46 +136,40 @@ def test_benchmark_synthetic_scripts_compile_and_eval(monkeypatch):
             exec(chain, env)
 
 
-def test_benchmark_no_download_is_a_chain_suffix(monkeypatch):
-    """``--no-download`` must stay a suffix of every chain it is applied to.
+def test_benchmark_no_download_selects_vspipe_no_output(monkeypatch):
+    """``--no-download`` is a vspipe target now, not a chain rewrite.
 
-    The eedi3aa reference arms begin with a ``from vsaa import`` line, so a
-    crop that enclosed the chain instead of following it would be a SyntaxError
-    for exactly those arms.
+    vspipe consumes a GPU resident output with sgfAllowGPUResident only when it
+    writes no output, so the flag swaps the outfile to ``--`` and leaves every
+    script exactly the shape the default run builds.
     """
     bench = _load_module("benchmark", BENCHMARK)
     monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic", "--no-download"])
     ns = bench.parse_args()
     assert ns.no_download
-    assert "8x8" in bench._mode_desc(ns)
+    assert "vspipe --" in bench._mode_desc(ns)
+    assert "8x8" not in bench._mode_desc(ns)
     for name, spec in bench.FILTERS.items():
         bench._apply_filter_args(ns, name, spec)
-        for plugin, chain in spec.build(ns, spec.input, spec).items():
-            cropped = bench.no_download_chain(chain)
-            assert cropped.endswith(
-                f".std.CropAbs(width={bench.NO_DOWNLOAD_WINDOW}, height={bench.NO_DOWNLOAD_WINDOW})"
-            ), name
-            vpy = bench.make_vpy(
-                clip=spec.input,
-                extra=bench._plugin_loader(plugin),
-                chain=cropped,
-                frames=1,
-                synth_format=spec.synth_format,
-            )
-            compile(vpy, f"<{name}/{plugin}>", "exec")
-            if chain.startswith("from "):
-                continue  # reference arms import vsaa, which may be absent
-            env = {
-                "core": MagicMock(),
-                "clip": object(),
-                "depth": MagicMock(),
-                "get_y": MagicMock(),
-            }
-            exec(cropped, env)
+        for chain in spec.build(ns, spec.input, spec).values():
+            assert "CropAbs" not in chain, name
+
+    seen = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append(cmd[-1])
+        return subprocess.CompletedProcess(
+            cmd, 0, "", "Output 1 frames in 1.00 seconds (1.00 fps)\n"
+        )
+
+    monkeypatch.setattr(bench.subprocess, "run", fake_run)
+    assert bench.run_vspipe(Path("chain.vpy"), 1) == 1.0
+    assert bench.run_vspipe(Path("chain.vpy"), 1, no_download=True) == 1.0
+    assert seen == ["/dev/null", "--"]
 
 
-def test_benchmark_default_mode_does_not_crop(monkeypatch):
-    """The crop is opt-in: a default run's header must not claim the mode."""
+def test_benchmark_mode_field_is_opt_in(monkeypatch):
+    """A default run's header must not claim the --no-download mode."""
     bench = _load_module("benchmark", BENCHMARK)
     monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic"])
     ns = bench.parse_args()

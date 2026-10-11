@@ -41,10 +41,12 @@ covers the output loop), so timing reflects real-content filter throughput
 without the BestSource decode bottleneck. --synthetic swaps real content for a
 BlankClip; --no-cache restores live decoding.
 
---no-download crops every chain's output to 8x8, so vspipe's implicit output
-download leaves the fps and a filter the copy was hiding shows its own speed
-(GaussBlur 2282 -> 4461 fps with --gpu-cache). The filter still runs its
-full-frame kernels; notes/METHOD.md has what the mode's residual costs.
+--no-download hands vspipe its ``--`` no-output target, which leaves a GPU
+resident output resident: nothing reads the pixels, so the implicit download is
+not inserted and the fps is the script's own cost. Without it that download can
+dominate a fast filter (GaussBlur 2179 -> 3760 fps with --gpu-cache). The filter
+still runs its full-frame kernels; notes/METHOD.md has what the mode's residual
+costs.
 
 A/B mode (--ab-so and/or --ab-a-env/--ab-b-env) compares two builds or two env
 configs in one session instead of a scratch script: each round measures arm A
@@ -77,10 +79,6 @@ DEFAULT_TIMEOUT = 900  # seconds per vspipe run (H1: a hang must not hang the ha
 # frames (H8). The budget is exclusive of VapourSynth's own 48 GB frame cache,
 # which is additive: 6 GiB keeps the pair well under the incident point.
 AA_CACHE_MB = 6144
-# Output side of --no-download: what vspipe's implicit GPUDownload copies
-# instead of the whole frame. Size is not a knob (2x2..64x64 measured within
-# 1.6%); 8x8 just leaves chroma margin on subsampled formats.
-NO_DOWNLOAD_WINDOW = 8
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -393,16 +391,6 @@ PLUGINS = {
     "bm3dvk2": Plugin("bm3dvk2"),
     "knlmvk": Plugin("knlmvk"),
 }
-
-
-def no_download_chain(chain: str) -> str:
-    """Append the --no-download tail crop to a chain expression.
-
-    Must be a suffix, not a wrapper: the eedi3aa reference arms begin with a
-    ``from vsaa import`` line, which no enclosing expression survives. CropAbs,
-    because an absolute window makes the chain's geometry irrelevant.
-    """
-    return f"{chain}.std.CropAbs(width={NO_DOWNLOAD_WINDOW}, height={NO_DOWNLOAD_WINDOW})"
 
 
 def _plugin_loader(plugin: str) -> str:
@@ -1021,15 +1009,23 @@ def vspipe_binary() -> str:
     return str(sibling) if sibling.is_file() else "vspipe"
 
 
-def run_vspipe(vpy_path: Path, frames: int, timeout: float = DEFAULT_TIMEOUT) -> float | None:
+def run_vspipe(
+    vpy_path: Path, frames: int, timeout: float = DEFAULT_TIMEOUT, no_download: bool = False
+) -> float | None:
     """Time one vspipe run; return its fps, or None if the run failed.
 
     A run is failed (never silently accepted) when vspipe exits non-zero, is
     killed by ``--timeout``, prints no timing line, or reports a frame count
     other than the one requested — timing a different amount of work than the
     header advertises is not a measurement.
+
+    ``no_download`` uses vspipe's ``--`` no-output target: the frames are still
+    requested, but a GPU resident output is consumed as-is instead of through an
+    implicit GPUDownload (vspipe's Ex output query passes sgfAllowGPUResident
+    exactly when it writes no output).
     """
-    cmd = [vspipe_binary(), "--start", "0", "--end", str(frames - 1), str(vpy_path), "/dev/null"]
+    outfile = "--" if no_download else "/dev/null"
+    cmd = [vspipe_binary(), "--start", "0", "--end", str(frames - 1), str(vpy_path), outfile]
     env = vspipe_env()
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
@@ -1076,6 +1072,7 @@ def bench(
     timeout: float = DEFAULT_TIMEOUT,
     gpu_cache: bool = False,
     gpu_cache_mb: int | None = None,
+    no_download: bool = False,
 ) -> float | None:
     vpy = make_vpy(
         clip=clip,
@@ -1091,7 +1088,7 @@ def bench(
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"bench_{plugin}.vpy"
         path.write_text(vpy)
-        return run_vspipe(path, frames, timeout)
+        return run_vspipe(path, frames, timeout, no_download)
 
 
 def bench_aa(
@@ -1106,6 +1103,7 @@ def bench_aa(
     timeout: float = DEFAULT_TIMEOUT,
     gpu_cache: bool = False,
     download_inputs: bool = False,
+    no_download: bool = False,
 ) -> float | None:
     """Run an EEDI3 anti-aliasing style benchmark (see make_aa_vpy)."""
     vpy = make_aa_vpy(
@@ -1123,7 +1121,7 @@ def bench_aa(
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"bench_{plugin}.vpy"
         path.write_text(vpy)
-        return run_vspipe(path, frames, timeout)
+        return run_vspipe(path, frames, timeout, no_download)
 
 
 def _stats(values: list[float]) -> tuple[float, float, float]:
@@ -1260,13 +1258,10 @@ def _cache_desc(
 
 
 def _mode_desc(ns: argparse.Namespace) -> str:
-    """The run header's mode field: a --no-download number means something else."""
+    """The run header's mode field, empty unless --no-download is set."""
     if not ns.no_download:
         return ""
-    return (
-        f" | mode: --no-download (output cropped to "
-        f"{NO_DOWNLOAD_WINDOW}x{NO_DOWNLOAD_WINDOW}, download out of the fps)"
-    )
+    return " | mode: --no-download (vspipe --, output not downloaded)"
 
 
 def _run_once(
@@ -1288,9 +1283,6 @@ def _run_once(
     does not accept them and so has to pay std.GPUDownload for them, which is
     what a real chain would make it pay.
     """
-    if ns.no_download:
-        # Every arm's chain passes through here, so the crop lands exactly once.
-        chain = no_download_chain(chain)
     if spec.aa and synth is None:
         budget = ns.aa_cache_mb * 1024 * 1024 if ns.aa_cache_mb else None
         return bench_aa(
@@ -1305,6 +1297,7 @@ def _run_once(
             ns.timeout,
             gpu_cache=gpu_cache,
             download_inputs=download_inputs,
+            no_download=ns.no_download,
         )
     return bench(
         plugin,
@@ -1317,6 +1310,7 @@ def _run_once(
         ns.timeout,
         gpu_cache=gpu_cache,
         gpu_cache_mb=ns.gpu_cache_mb,
+        no_download=ns.no_download,
     )
 
 
@@ -1829,11 +1823,10 @@ def parse_args() -> argparse.Namespace:
         "--no-download",
         dest="no_download",
         action="store_true",
-        help="crop each arm's output to "
-        f"{NO_DOWNLOAD_WINDOW}x{NO_DOWNLOAD_WINDOW}, so vspipe's implicit "
-        "GPUDownload copies the crop instead of the whole frame and stops "
-        "dominating a GPU filter's fps. The filter still runs its full-frame "
-        "kernels; add --gpu-cache to drop the input side too",
+        help="run vspipe with its -- no-output target, so a GPU resident output "
+        "is not downloaded: the implicit GPUDownload leaves the fps and a "
+        "filter it was hiding shows its own speed. The filter still runs its "
+        "full-frame kernels; add --gpu-cache to drop the input side too",
     )
     parser.add_argument(
         "--repeat",

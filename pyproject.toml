@@ -108,6 +108,7 @@ name = "vs-wheels"
 url = "https://jaded-encoding-thaumaturgy.github.io/vs-wheels/simple"
 
 [tool.uv.sources]
+vapoursynth = { git = "https://github.com/vapoursynth/vapoursynth", rev = "9a34851b1c48b63df8bc29ee7b79612cf3437281" }
 vapoursynth-fmtconv = { index = "vs-wheels" }
 vapoursynth-vszipcl = { git = "https://github.com/dnjulek/vapoursynth-zipcl", rev = "2c1b97742bf4f086f0bd31d26ba630e834c661ed" }
 
