@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- BM3D is about 9% faster on Nvidia drivers, and unchanged on Radeon
 - BM3D is registered under its own name, with `BM3Dv2` kept as an alias for existing scripts
 
 ### Fixed

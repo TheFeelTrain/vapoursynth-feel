@@ -267,14 +267,6 @@ which is where the visible speedup is (see Performance).
   sharing the group list costs the whole filter 2.6x (see Historical).
 - Color costs the planes: 4:2:0 is 1.5x the luma-only estimate/source footprint
   and 4:4:4/RGB 3x, all inside the same `maxStorageBufferRange` budget.
-- **Item-based row reuse: +1.8% at two rows on Nvidia, -2.8% at four; RADV is the
-  other way round and small either way.** `-DITEM_ROWS=2|4` gives a lane a column
-  of 2 or 4 adjacent candidates and loads each source row once for all of them
-  (64 -> 36 -> 22 loads per candidate), the accumulation unchanged. Nvidia screen
-  against a 285 default: 290 at 2, 277 at 4, four rows' accumulators costing more
-  occupancy than the loads they save. RADV (ABBA, 800 frames x3, n=12, shared
-  patch both arms): +1.0% at 4, -0.8% at 2. The builds force that patch, 5-8%
-  behind RADV's register arm, so the arm is Nvidia's and 2 is its row count.
 - The multi-plane round did not move the luma path (NPLANES == 1: 6131 vs 6133
   instructions, 192/108/4096 B, 8 waves/SIMD; 12 ABBA pairs at 935 vs 924 fps).
 
@@ -282,50 +274,35 @@ which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
-- **2026-10-10 — item-based row reuse: the matcher's rounding has to be pinned,
-  not inherited.** `-DITEM_ROWS=2|4` gives a lane a column of 2 or 4 adjacent
-  candidates and loads each source row once for all of them (64 -> 36 -> 22 loads
-  per candidate), which is bm3dvk2's `ADD_ROW`/`DEFINE_DISTANCES` mechanism
-  re-expressed; the accumulation stays per candidate in the CPU's order. The walk
-  reads the patch by a runtime row, so it needs `PATCH_LDS` (`#error` otherwise),
-  and it is spatial-only: the temporal walk's origins overlap across windows, so
-  items there would re-test candidates an earlier window already owned. RADV:
-  +1.0% at 4, -0.8% at 2 (ABBA, 800 frames x3, n=12, shared patch both arms);
-  Nvidia, standalone: 290 at 2 and 277 at 4 against a 285 default, so the row
-  count is vendor-opposite and 4 is not worth carrying for its RADV 1%.
-  The round's real result is a correctness one. At 4 the build produced a 1-ulp
-  different SSD on one retained candidate of a 33x33 window, which flipped a
-  near-tie: two candidates at the same origin in different frames with
-  bit-identical errors swapped places in the group, and the CAS/hardware checks
-  went 26 codes apart. Cause: ACO contracts `a + d * d` into an FMA per site as
-  register pressure allows, so the same walk written twice can round one term
-  differently. `tests/bm3d_oracle.py` models the CPU's two roundings, and an
-  explicit `fma()` is the wrong direction (the shipped per-candidate walk is
-  *inconsistently* contracted, some terms fused and some not, so nothing matches
-  it), so the item accumulators are declared `precise`: the item build now
-  reproduces the oracle's arithmetic exactly. The per-candidate arms are
-  untouched, byte-identical SPIR-V included, so they keep whatever contraction
-  the backend picks. CAS item variants exist so both accumulation arms run the
-  same walk, which is what makes the CAS/hardware comparison measure the
-  accumulation rather than the walk. It also composes with the split: the item
-  walk *is* the match half's walk, so `SPLIT_KERNEL=1` takes
-  `bm3d_match_lds_item2|4` instead of pinning `ITEM_ROWS` back to 1.
-- **2026-10-10 — the matcher/filter split is an opt-in candidate and a loss on
-  RADV.** `-DSPLIT_MATCH`/`-DSPLIT_FILTER` (`VSFEEL_BM3D_SPLIT_KERNEL=1`) run the
-  search and the estimate as two dispatches with the group handed over through a
-  buffer. The premise was measured first: with the patch staged, the matcher
-  alone is 96 VGPRs and 16 waves/SIMD against the fused kernel's 120 and 12, and
-  42 KB of ISA against 109 KB. It does not pay. RADV ABBA A/B (800 frames x3,
-  n=12): 950.5 fused against 824.9 split, -13.2%; narrowing the handoff barrier
-  from ALL_COMMANDS to compute->compute changes nothing. With the estimate made a
-  no-op the split is *still* 3.3% slower (1057 against 1023), so the matcher
-  gains nothing from the four extra waves: at 12 waves/SIMD it is not
-  occupancy-bound. The rest of the loss is the estimate re-reading the group the
-  fused kernel still had in registers. **It inverts on Ada**: an Nvidia screen
-  reads 285 default against ~310 split (+8.8%), which clears the 300 fps target,
-  so the extra waves pay exactly where the notes predicted they would and the
-  split is an Nvidia option rather than a general one. Still default-off; the
-  full suite passes on both paths.
+- **2026-10-10 — item-based row reuse in the search walk; removed.** One lane
+  owned 2 or 4 vertically adjacent candidates in a column, so a source row was
+  loaded once for all of them (64 -> 36 -> 22 loads per candidate, bm3dvk2's
+  `ADD_ROW`/`DEFINE_DISTANCES` re-expressed). It needed the shared patch, since
+  the walk reads the patch by a runtime row, and it composed with the split.
+  Nvidia screens against a 285 default: 290 at 2 rows, 277 at 4, and about the
+  same or a little slower stacked on the split, so the loads it saves are not
+  Ada's limiter. RADV is the other way round and equally small (+1.0% at 4,
+  -0.8% at 2; ABBA, 800 frames x3, n=12). Keep the codegen finding: at 4 rows one
+  SSD term rounded differently from the per-candidate walk and flipped a near-tie
+  (two same-origin candidates in different frames with identical errors swapped
+  in the group, 26 output codes apart), because ACO contracts `a + d * d` into an
+  FMA per site as register pressure allows. `tests/bm3d_oracle.py` models the
+  CPU's two roundings, so `precise` is the fix and `fma()` is not, and a future
+  walk over the SSD has to pin its rounding rather than match the shipped arms.
+- **2026-10-10 — the matcher/filter split is the default off RADV, -13% on it.**
+  `-DSPLIT_MATCH`/`-DSPLIT_FILTER` run the search and the estimate as two
+  dispatches with the group handed over through a buffer. The premise was measured
+  first: with the patch staged, the matcher alone is 96 VGPRs and 16 waves/SIMD
+  against the fused kernel's 120 and 12, and 42 KB of ISA against 109 KB. **The
+  two vendors split**: an Nvidia screen reads 285 default against ~310 split
+  (+8.8%, which is the 300 fps target met), and RADV ABBA A/B (800 frames x3,
+  n=12) is 950.5 fused against 824.9 split, -13.2%. RADV is not occupancy-bound
+  there and the extra waves buy nothing: with the estimate made a no-op the split
+  is *still* 3.3% slower (1057 against 1023), and the rest of the loss is the
+  estimate re-reading the group the fused kernel still had in registers.
+  Narrowing the handoff barrier from ALL_COMMANDS to compute->compute changes
+  nothing. It now follows the same driver rule as the reference patch
+  (`VSFEEL_BM3D_SPLIT_KERNEL=0/1` overrides); the full suite passes on both paths.
 - **2026-10-09 — force-unrolling the fixed-trip loops is a dead end; reverted.**
   `[[unroll]]` does work, unlike `#pragma unroll`: it removes the `OpLoopMerge`,
   and it takes the shipped SPIR-V from 132 loops and 25 runtime-indexed
@@ -610,9 +587,8 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
   buffer float atomics (A/B only).
 - `VSFEEL_BM3D_PATCH_LDS=0/1` — force either reference-patch arm; unset follows
   the driver rule (shared memory everywhere except RADV).
-- `VSFEEL_BM3D_SPLIT_KERNEL=1` — the opt-in match/filter split (see Historical).
-- `VSFEEL_BM3D_ITEM_ROWS=2/4` — item-based row reuse in the search walk; needs the
-  shared patch, so it forces that arm, and it composes with `SPLIT_KERNEL`.
+- `VSFEEL_BM3D_SPLIT_KERNEL=0/1` — force either estimation path; unset follows
+  the driver rule (split everywhere except RADV).
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs.
   `NOSEARCH` is the matcher's reference-only path, the same thing `th_mse=0`
   selects, so it cannot price the search.

@@ -203,19 +203,6 @@ set(VK_BM3D_VARIANTS
     "bm3d_cas_1plane|bm3d.comp|-DNO_FLOAT_ATOMICS -DONE_PLANE"
     "bm3d_cas_lds|bm3d.comp|-DNO_FLOAT_ATOMICS -DPATCH_LDS"
     "bm3d_cas_lds_1plane|bm3d.comp|-DNO_FLOAT_ATOMICS -DPATCH_LDS -DONE_PLANE"
-    # Item-based row reuse in the spatial search walk (VSFEEL_BM3D_ITEM_ROWS):
-    # ITEM_ROWS vertically adjacent candidates per lane, so a source row is
-    # loaded once for every candidate that covers it. The walk reads the patch
-    # by a runtime row, so the item builds always take PATCH_LDS and there is no
-    # register-arm pair.
-    "bm3d_lds_item2|bm3d.comp|-DPATCH_LDS -DITEM_ROWS=2"
-    "bm3d_lds_item2_1plane|bm3d.comp|-DPATCH_LDS -DITEM_ROWS=2 -DONE_PLANE"
-    "bm3d_lds_item4|bm3d.comp|-DPATCH_LDS -DITEM_ROWS=4"
-    "bm3d_lds_item4_1plane|bm3d.comp|-DPATCH_LDS -DITEM_ROWS=4 -DONE_PLANE"
-    "bm3d_cas_lds_item2|bm3d.comp|-DNO_FLOAT_ATOMICS -DPATCH_LDS -DITEM_ROWS=2"
-    "bm3d_cas_lds_item2_1plane|bm3d.comp|-DNO_FLOAT_ATOMICS -DPATCH_LDS -DITEM_ROWS=2 -DONE_PLANE"
-    "bm3d_cas_lds_item4|bm3d.comp|-DNO_FLOAT_ATOMICS -DPATCH_LDS -DITEM_ROWS=4"
-    "bm3d_cas_lds_item4_1plane|bm3d.comp|-DNO_FLOAT_ATOMICS -DPATCH_LDS -DITEM_ROWS=4 -DONE_PLANE"
     # The match/filter split (VSFEEL_BM3D_SPLIT_KERNEL): the search half writes
     # each group to a buffer and the filter half reads it. The matcher needs
     # neither ONE_PLANE nor the atomics arm (it touches no estimate stack) and
@@ -223,8 +210,6 @@ set(VK_BM3D_VARIANTS
     # costs six variants rather than sixteen.
     "bm3d_match|bm3d.comp|-DSPLIT_MATCH"
     "bm3d_match_lds|bm3d.comp|-DSPLIT_MATCH -DPATCH_LDS"
-    "bm3d_match_lds_item2|bm3d.comp|-DSPLIT_MATCH -DPATCH_LDS -DITEM_ROWS=2"
-    "bm3d_match_lds_item4|bm3d.comp|-DSPLIT_MATCH -DPATCH_LDS -DITEM_ROWS=4"
     "bm3d_filter|bm3d.comp|-DSPLIT_FILTER"
     "bm3d_filter_1plane|bm3d.comp|-DSPLIT_FILTER -DONE_PLANE"
     "bm3d_filter_cas|bm3d.comp|-DSPLIT_FILTER -DNO_FLOAT_ATOMICS"
