@@ -50,7 +50,7 @@ the clock ramp and run-to-run swing, not the filter.
 --no-download hands vspipe its ``--`` no-output target, which leaves a GPU
 resident output resident: nothing reads the pixels, so the implicit download is
 not inserted and the fps is the script's own cost. Without it that download can
-dominate a fast filter (GaussBlur 2179 -> 3760 fps with --gpu-cache). The filter
+dominate a fast filter. The filter
 still runs its full-frame kernels; notes/METHOD.md has what the mode's residual
 costs.
 
@@ -101,7 +101,32 @@ def make_vpy(
     cache_conv: str | None = None,
     gpu_cache: bool = False,
     gpu_cache_mb: int | None = None,
+    scale: float = 1.0,
 ) -> str:
+    # --scale N grades the filter at N times the source resolution (2 = 1080p ->
+    # 4K). The upscale is a Point resize folded into the *cached* frames (and
+    # their GPU copies), so it runs while the script is evaluated and the timed
+    # region is the filter's own work at that size -- the way to make a fixed
+    # workload bigger without touching the filter's parameters.
+    # The filter's own parameters (e.g. gaussblur's sigma) are NOT scaled: pass
+    # sigma=N*sigma to keep the same effective blur.
+    def scaled(expr: str) -> str:
+        if scale == 1:
+            return expr
+        # round(): resize takes integer dimensions, and a fractional scale
+        # (1.5 = 1080p -> 1620p, close to 1080p's cache behaviour without the
+        # 4x working set of 2x) must land on whole pixels.
+        return (
+            f"core.resize.Point({expr}, round(clip.width * {scale}), round(clip.height * {scale}))"
+        )
+
+    scale_lines = ""
+    if scale > 1 and cache_frames is None:
+        # no preload to fold the resize into; it stays in the timed region
+        scale_lines = (
+            f"clip = core.resize.Point(clip, round(clip.width * {scale}), "
+            f"round(clip.height * {scale}))\n"
+        )
     # With --gpu-cache the script also defines `clip_gpu`: the same frames,
     # already resident on the device. The upload happens while the script is
     # evaluated (before vspipe starts timing), exactly like the CPU preload, so a
@@ -115,19 +140,20 @@ def make_vpy(
     # Two traps when measuring transfers against this:
     #  - `std.GPUDownload(<CPU clip>)` is a silent no-op. gpuTransferCreate
     #    returns its input unchanged whenever the residency already matches, so
-    #    a "download" arm built on a CPU clip does no GPU work at all (measured
-    #    3746 fps) and makes an upload arm look expensive next to nothing. Only
+    #    a "download" arm built on a CPU clip does no GPU work at all and makes
+    #    an upload arm look expensive next to nothing. Only
     #    `GPUDownload(GPUUpload(clip))` exercises a real transfer.
     #  - Serving the cached GPU frames through a Python ModifyFrame costs more
     #    than the upload it removes: that node is fmParallelRequests, so its
-    #    callback serializes the whole front of the chain (509 vs 533 fps at
-    #    radius 0). clip_gpu is therefore a plain node and the GPU frames are
-    #    warmed into the core's own frame cache instead.
+    #    callback serializes the whole front of the chain. clip_gpu is therefore
+    #    a plain node and the GPU frames are served from its pinned cache.
     gpu_lines = ""
     if synth_format:
         # synthetic clip: measure pure filter throughput, no decode bottleneck
         clip_expr = (
-            f"core.std.BlankClip(width=1920, height=1080, format={synth_format}, length={frames})"
+            f"core.std.BlankClip(width={round(1920 * scale)}, "
+            f"height={round(1080 * scale)}, format={synth_format}, "
+            f"length={frames})"
         )
         cache_setup = ""
         gpu_lines = "clip_gpu = core.std.GPUUpload(clip=clip)\n" if gpu_cache else ""
@@ -135,13 +161,12 @@ def make_vpy(
         # real clip, but decode + convert + hold the first N frames in Python
         # while the script is being evaluated (before vspipe starts timing),
         # then serve them through a ModifyFrame shim and loop to reach the
-        # requested frame count. std.Cache() is an explicit no-op on current
-        # VapourSynth. `cache_conv` is the cache expression (e.g.
+        # requested frame count. `cache_conv` is the cache expression (e.g.
         # "depth(get_y(clip),16)" or a 2x Point upscale), so the timed region
         # measures only filter throughput on the correct input format — the
         # chain's own input expression then reduces to an identity.
         clip_expr = f"BestSource(cachepath=None).source({clip!r}, 32)"
-        conv = f"clip = {cache_conv}\n" if cache_conv else ""
+        conv = f"clip = {scaled(cache_conv)}\n" if cache_conv else ""
         # The GPU copy of the cache is whole frames in VRAM, so it gets a byte
         # budget of its own; both caches then serve the same span.
         size_lines = (
@@ -165,20 +190,34 @@ def make_vpy(
             "_src_frames = [clip.get_frame(n) for n in range(m)]\n"
             "def _serve_cached(n, f):\n"
             "    return _src_frames[n % m]\n"
-            "_blank = clip.std.BlankClip()\n"
+            # The served frames must have only m distinct indices, and the
+            # serving node must have its cache pinned (see _pin_cache), or the
+            # per-frame work is redone for every output frame: ModifyFrame asks
+            # its input for frame n each time, so a distinct-index BlankClip
+            # regenerated a full-size frame per request (measured 129us at
+            # 1080p GRAY16, 284us at 1620p) and the upload was repeated too.
+            # That was the whole harness residual: a bare BlankClip->-- graph
+            # ran at 7775 fps at 1080p, so every fast filter was measured
+            # against the harness. Loop over m frames with a pinned cache and
+            # the same graph runs at 694k fps (1.4us/frame).
+            f"_blank = clip.std.BlankClip(length=1) * m\n"
             "_served = _blank.std.ModifyFrame(_blank, _serve_cached)\n"
+            "_served = _pin_cache(_served, m)\n"
             f"clip = (_served * -(-{frames} // m)).std.Trim(0, {frames - 1})\n"
         )
         if gpu_cache:
             # clip_gpu stays a plain native node: the uploads are warmed into the
             # core's own frame cache here (outside the timed region) and the
-            # cached frames are then served straight from it. Serving them
-            # through a Python ModifyFrame instead costs more than the upload it
-            # removes -- that node is fmParallelRequests, so its callback
-            # serializes the whole front of the chain (measured 509 vs 533 fps at
-            # radius 0, i.e. the "no upload" arm was the slower one).
+            # cached frames are then served straight from it -- which only works
+            # because the cache is pinned, since the node's single consumer
+            # requests strict-spatial frames and the core disables caching for
+            # those (VSNode::updateCacheState). Serving the frames through a
+            # Python ModifyFrame instead costs more than the upload it removes:
+            # that node is fmParallelRequests, so its callback serializes the
+            # whole front of the chain, so the upload it removes is not worth it.
             gpu_lines = (
                 "_gpu_src = core.std.GPUUpload(clip=_served)\n"
+                "_gpu_src = _pin_cache(_gpu_src, m)\n"
                 "_gpu_warm = [_gpu_src.get_frame(n) for n in range(m)]\n"
                 f"clip_gpu = (_gpu_src * -(-{frames} // m)).std.Trim(0, {frames - 1})\n"
             )
@@ -188,12 +227,23 @@ def make_vpy(
         # --gpu-cache uploads the *converted* clip (the cache path does the same
         # before its upload): `clip_gpu` has to be the frames the chain would
         # otherwise read, format and depth included, not the raw source.
-        conv = f"clip = {cache_conv}\n" if (gpu_cache and cache_conv) else ""
-        gpu_lines = conv + "clip_gpu = core.std.GPUUpload(clip=clip)\n" if gpu_cache else ""
+        conv = f"clip = {scaled(cache_conv)}\n" if (gpu_cache and cache_conv) else ""
+        gpu_lines = scale_lines + (
+            conv + "clip_gpu = core.std.GPUUpload(clip=clip)\n" if gpu_cache else ""
+        )
     return f"""\
 from vssource import BestSource
 from vstools import core, depth, get_y
 import vapoursynth as vs
+
+def _pin_cache(node, budget):
+    # Pin a fixed-size frame cache on the node that serves the pre-decoded
+    # frames. A node whose only consumer requests strict-spatial or no-reuse
+    # frames has caching disabled outright (VSNode::updateCacheState), so
+    # without this the frame generation and the GPU upload happen again for
+    # every timed frame; that was the harness's whole per-frame residual.
+    core.std.SetVideoCache(node, mode=1, fixedsize=1, maxsize=budget)
+    return node
 
 # Big enough that the timed region never re-runs the decode/mask chain (a
 # small value here collapses every plugin: measured 61 fps vs 220 for vsfeel
@@ -285,7 +335,9 @@ def make_aa_vpy(
                 names = "clip = clip_gpu\nmclip = mclip_gpu\nsclip = sclip_gpu\n"
             cache_build = (
                 "_gpu_ss = core.std.GPUUpload(clip=_ss_served)\n"
+                "_gpu_ss = _pin_cache(_gpu_ss, m)\n"
                 "_gpu_msk = core.std.GPUUpload(clip=_msk_served)\n"
+                "_gpu_msk = _pin_cache(_gpu_msk, m)\n"
                 "_gpu_warm = [_gpu_ss.get_frame(n) for n in range(m)]\n"
                 "_gpu_mwarm = [_gpu_msk.get_frame(n) for n in range(m)]\n"
                 f"clip_gpu = (_gpu_ss * -(-{frames} // m)).std.Trim(0, {frames} - 1)\n"
@@ -308,10 +360,13 @@ def _serve_ss(n, f):
     return _ss_frames[n % m]
 def _serve_msk(n, f):
     return _msk_frames[n % m]
-_blank = ss.std.BlankClip()
+# m-frame looped inputs with pinned caches: see the _blank comment in make_vpy
+_blank = ss.std.BlankClip(length=1) * m
 _ss_served = _blank.std.ModifyFrame(_blank, _serve_ss)
-_blankm = mclip.std.BlankClip()
+_ss_served = _pin_cache(_ss_served, m)
+_blankm = mclip.std.BlankClip(length=1) * m
 _msk_served = _blankm.std.ModifyFrame(_blankm, _serve_msk)
+_msk_served = _pin_cache(_msk_served, m)
 {cache_build}
 sclip = {"core.std.Interleave([clip, clip])" if eedi3_field > 1 else "clip"}
 """
@@ -346,6 +401,11 @@ from vsmasktools import EdgeDetect, Morpho, Prewitt
 from vsrgtools import box_blur
 from vstools import scale_mask
 import vapoursynth as vs
+
+def _pin_cache(node, budget):
+    # See the _pin_cache comment in make_vpy.
+    core.std.SetVideoCache(node, mode=1, fixedsize=1, maxsize=budget)
+    return node
 
 # Big enough that the timed region never re-runs the decode/mask chain (a
 # small value here collapses every plugin: measured 61 fps vs 220 for vsfeel
@@ -1082,6 +1142,7 @@ def bench(
     gpu_cache: bool = False,
     gpu_cache_mb: int | None = None,
     no_download: bool = False,
+    scale: float = 1.0,
 ) -> float | None:
     vpy = make_vpy(
         clip=clip,
@@ -1093,6 +1154,7 @@ def bench(
         cache_conv=cache_conv,
         gpu_cache=gpu_cache,
         gpu_cache_mb=gpu_cache_mb,
+        scale=scale,
     )
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"bench_{plugin}.vpy"
@@ -1320,6 +1382,7 @@ def _run_once(
         gpu_cache=gpu_cache,
         gpu_cache_mb=ns.gpu_cache_mb,
         no_download=ns.no_download,
+        scale=ns.scale,
     )
 
 
@@ -1361,12 +1424,16 @@ def _prepare_filter(
     # --gpu-cache needs it even without a preload: the device frames have to be
     # uploaded in the filter's input format, not the raw source's.
     cache_conv = input_expr if (cache_frames or getattr(ns, "gpu_cache", False)) else None
+    scale_desc = f" -> {ns.scale:g}x Point" if ns.scale > 1 else ""
     if synth:
-        clip_desc = f"BlankClip 1920x1080 {synth.removeprefix('vs.')}"
+        clip_desc = (
+            f"BlankClip {round(1920 * ns.scale)}x{round(1080 * ns.scale)} "
+            f"{synth.removeprefix('vs.')}"
+        )
     elif spec.aa:
         clip_desc = f"{str(ns.clip)} -> 2x Point"
     else:
-        clip_desc = str(ns.clip)
+        clip_desc = f"{str(ns.clip)}{scale_desc}"
     bits_desc = f" | bits: {ns.bits}" if ns.bits else ""
 
     calls = spec.build(ns, input_expr, spec)
@@ -1834,6 +1901,15 @@ def parse_args() -> argparse.Namespace:
         "to what fits, for both caches (default: 6144)",
     )
     parser.add_argument(
+        "--scale",
+        type=float,
+        default=1.0,
+        help="grade the filter at N times the source resolution (2 = 1080p -> "
+        "4K, 1.5 = 1620p): the Point upscale is folded into the cached frames, so the "
+        "timed region is the filter's own work at that size. Filter parameters "
+        "are not scaled, so pass e.g. sigma=N*sigma to keep the same blur",
+    )
+    parser.add_argument(
         "--no-download",
         dest="no_download",
         action="store_true",
@@ -1974,6 +2050,8 @@ def main() -> None:
         )
     if ns.aa_cache_mb < 0:
         sys.exit(f"--aa-cache-mb must be >= 0, got {ns.aa_cache_mb}")
+    if ns.scale < 1:
+        sys.exit(f"--scale must be >= 1, got {ns.scale:g}")
     # Named once: which VapourSynth the numbers came from is part of the result.
     print(f"vspipe: {vspipe_binary()}", file=sys.stderr)
     if ns.check_fresh:

@@ -172,24 +172,28 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   clock-ramp-sensitive).
 - **A GPU filter's fps carries the chain's transfers until `--no-download`
   takes the output side out of it.** vspipe's output node is a CPU node, so by
-  default the core downloads a GPU-resident output; at 1080p that copy alone
-  bounds a bare cached-GPU chain at ~2.2k fps (0.45 ms/frame), and any filter
-  faster than it. `--no-download` instead runs vspipe with its `--` no-output
+  default the core downloads a GPU-resident output; at 1080p GRAY16 that copy
+  alone costs ~160 µs/frame (~25 GB/s, measured as the `--` vs `/dev/null`
+  difference, and it scales with the frame size), and any filter faster than it
+  loses to it. `--no-download` instead runs vspipe with its `--` no-output
   target, which consumes the output with `sgfAllowGPUResident`: nothing reads the
   pixels, so no download is inserted, the graph stays exactly as the script built
-  it, and only the filter's own compute is measured. Same-session pairs
-  (`--gpu-cache`, jpbd 1080p, harness defaults, 1000 frames, 3 interleaved
-  repeats, medians): GaussBlur 2179 → **3760** fps (+73%, it was copy-bound),
-  Bilateral 2102 → 2271 (+8%), DFTTest 1470 → 1466 and NLMeans 1009 → 1023
-  (flat: both were already compute-bound). So the flag is also the test for
-  *which* side a filter is on.
-  **Read the residual before the number**: with the download gone what survives
-  is vspipe's per-frame request/submit/host-wait path, and a bare cached-GPU
-  chain measures ~3.7k fps (0.27 ms/frame) under `--`. A filtered chain can land
-  right on that ceiling (GaussBlur's 3760), so a figure in the 3.7k range is the
-  mode's own cost, not the filter's. A filter whose compute is genuinely below
-  ~0.25 ms/frame cannot be resolved this way at all: use in-command-buffer GPU
-  timestamps instead (the per-filter probes in the notes).
+  it, and only the filter's own compute is measured. So the flag is also the test
+  for *which* side a filter is on.
+  **Read the residual before the number.** With the download gone what survives
+  is the harness's own per-frame cost, and the cached frames must be served from
+  an `m`-frame node whose cache is pinned
+  (`std.SetVideoCache(node, mode=1, fixedsize=1, maxsize=m)`): a node whose only
+  consumer requests strict-spatial frames has caching disabled
+  (`VSNode::updateCacheState`), so without the pin every timed frame redoes the
+  upstream work instead — a full-size BlankClip frame generation (~130 µs at
+  1080p GRAY16) and a fresh `GPUUpload`. Pinned, the residual is ~1–6 µs/frame
+  and independent of the frame size, which is what `tools/benchmark.py` does. A
+  filter whose compute is smaller still can be read with in-command-buffer GPU
+  timestamps (the per-filter probes in the notes).
+- **`--scale N` grades a filter at N times the source resolution.** The Point
+  upscale is folded into the cached frames, so it stays out of the timed region
+  and the filter's compute at that size is what the fps shows.
 - **Prove the host/GPU split before optimizing anything.** Add a small
   env-gated chrono probe around the frame path (acquire / record / submit)
   and read it on real content first — kernel
