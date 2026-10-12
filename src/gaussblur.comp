@@ -42,10 +42,23 @@
 #define PEAK    1.0f
 #endif
 
-const int BLK_X = 16;
-const int BLK_Y = 8;
 const int VRT = 3;
-const int R = 8;
+// Workgroup shape and outputs per thread, set per entry by the VK_GAUSS_VARIANTS
+// table in CMakeLists.txt (defaults here are for a standalone glslc). The passes
+// want different ones: the vertical pass reads one column per thread, so a warp
+// spanning two rows splits every load across two cache lines and wants 32 lanes
+// on one row plus more outputs to amortize its strided loads; the horizontal pass
+// reads along the row it writes, so there a 16x8 warp and a narrower per-thread
+// stride keep the warp's loads in fewer lines. Notes: notes/GAUSSBLUR.md.
+#ifndef BLK_X
+#define BLK_X 16
+#endif
+#ifndef BLK_Y
+#define BLK_Y 8
+#endif
+#ifndef R
+#define R 8
+#endif
 
 layout(constant_id = 0) const int WIDTH = 1920;
 layout(constant_id = 1) const int HEIGHT = 1080;
@@ -147,7 +160,7 @@ float accum(float v, float w, float s) {
 // +-RAD halo of columns so the horizontal pass never leaves shared memory
 shared float vblur[VRT * BLK_Y][BLK_X + 2 * RAD];
 
-layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = BLK_X, local_size_y = BLK_Y, local_size_z = 1) in;
 void main() {
     const int lx = int(gl_LocalInvocationID.x);
     const int ly = int(gl_LocalInvocationID.y);
@@ -204,7 +217,7 @@ void main() {
 //   with incrementing row addresses; only edge threads take the mirror path
 // - two tap rows are in flight at once (even/odd k), so the VMEM engine
 //   overlaps loads instead of stalling on every tap
-layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = BLK_X, local_size_y = BLK_Y, local_size_z = 1) in;
 void main() {
     const int x = int(gl_GlobalInvocationID.x);
     const int y0 = int(gl_GlobalInvocationID.y) * R;     // first output row
@@ -268,7 +281,7 @@ void main() {
 // vertical pass (interior fast path + two taps in flight), plus the output
 // is written as packed dword pairs — R/2 32-bit stores instead of R 16-bit
 // stores (thread ownership of whole dwords is guaranteed: x0 is even).
-layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = BLK_X, local_size_y = BLK_Y, local_size_z = 1) in;
 void main() {
     const int x0 = int(gl_GlobalInvocationID.x) * R;     // first output column
     const int y = int(gl_GlobalInvocationID.y);

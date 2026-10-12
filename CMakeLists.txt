@@ -219,9 +219,16 @@ set(VK_BM3D_VARIANTS
     "bm3d_copy16|bm3d_copy.comp|")
 
 # GaussBlur: one kernel with three entry points (fused small path + the two
-# large-path passes), per io variant (16 int, 32 float).
+# large-path passes), per io variant (16 int, 32 float). Each pass carries its
+# own workgroup shape and outputs per thread, so those are per-entry defines
+# here rather than one set for all three; the numbers behind them are in
+# notes/GAUSSBLUR.md, and tools/shader_limits.py --check compares the compiled
+# local size against the host launch in src/gaussblur.cpp.
 set(VK_GAUSS_ENTRIES gauss vert horiz)
-set(VK_GAUSS_ENTRY_DEFS -DENTRY_GAUSS -DENTRY_VERT -DENTRY_HORIZ)
+set(VK_GAUSS_ENTRY_DEFS
+    "-DENTRY_GAUSS -DBLK_X=16 -DBLK_Y=8 -DR=8"
+    "-DENTRY_VERT -DBLK_X=32 -DBLK_Y=4 -DR=16"
+    "-DENTRY_HORIZ -DBLK_X=16 -DBLK_Y=8 -DR=8")
 set(VK_GAUSS_VARIANTS)
 foreach(bits IN LISTS VK_BITS)
     foreach(entry_i RANGE 0 2)

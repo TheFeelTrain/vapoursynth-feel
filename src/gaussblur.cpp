@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <numbers>
 #include <optional>
 #include <string>
@@ -34,13 +35,32 @@ using namespace std::string_literals;
 // owns is its pipelines, the constant kernel-weights buffer and one exec pool
 // -- no staging buffers, no per-stream resources, no fences, no queue cap.
 
-// Work-group / code-path constants matching the reference implementations
-// (vszipcl gaussglur.zig and vszipcu gaussblur.zig).
+// Work-group / code-path constants. The fused small path and the two large-path
+// passes each get their own block shape: a warp must stay within one source row
+// in the vertical pass (32x4) and within as few cache lines as possible in the
+// horizontal pass (16x8). The two-pass outputs-per-thread are separate for the
+// same reason. Mechanisms are in notes/GAUSSBLUR.md.
 constexpr int BLK_X = 16;
 constexpr int BLK_Y = 8;
+constexpr int V_BLK_X = 32;
+constexpr int V_BLK_Y = 4;
+constexpr int H_BLK_X = 16;
+constexpr int H_BLK_Y = 8;
 constexpr int VRT = 3;              // output rows per thread, small path
-constexpr int LARGE_R = 8;          // outputs per thread, large path
+constexpr int LARGE_R_V = 16;       // vertical outputs per thread
+constexpr int LARGE_R_H = 8;        // horizontal outputs per thread
 constexpr int LARGE_THRESHOLD = 32; // radius <= 32 => fused small path
+
+// VSFEEL_GAUSS_GPUTRACE=<first frame> (default 100) with
+// VSFEEL_GAUSS_GPUTRACE_RANGE=<count> (default 40): each traced frame's
+// dispatches are stamped inside its command buffer and the stage times are
+// reported as p25/median/p75 at destruction. It is the attribution the
+// end-to-end number cannot give (which pass, and how the time splits between
+// them), and the only reading available to a filter whose own compute is
+// smaller than the shortest useful run.
+constexpr uint32_t GAUSS_TS_MAX = 16;
+constexpr uint32_t GAUSS_TS_RESERVED = 1;
+constexpr int GAUSS_TS_SLOTS = 6; // 3 planes x 2 passes
 
 struct GaussPlaneConfig {
     int width {}; // visible pixels
@@ -86,7 +106,51 @@ struct GaussData {
     std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
         ht_total_ns {}, ht_n {};
 
+    // VSFEEL_GAUSS_GPUTRACE=<first frame>/<range>: per-dispatch GPU timestamps
+    // accumulated over the traced frames and printed at destruction. Gated on
+    // the queue family's timestamp bits.
+    bool gputrace { false };
+    uint32_t gputrace_first { 100 };
+    uint32_t gputrace_range { 40 };
+    VkQueryPool ts_query {};
+    GpuBuffer ts_buf {};
+    uint64_t * ts_map {};
+    // One query pool and one readback buffer are shared by every traced frame,
+    // and VapourSynth records frames concurrently: without this lock a later
+    // frame's copy overwrites an earlier frame's results mid-read (measured as
+    // impossible sub-microsecond stage times). A traced frame holds it from its
+    // first stamp until its stamps have been read, which also serializes the
+    // submissions the numbers are supposed to describe.
+    std::mutex ts_lock;
+    std::array<std::vector<double>, GAUSS_TS_SLOTS> ts_stage_us;
+    std::vector<double> ts_cb_us;
+
     ~GaussData() {
+        if (!ts_cb_us.empty()) {
+            const auto print = [](const char * what, std::vector<double> v) {
+                std::sort(v.begin(), v.end());
+                // A per-dispatch timestamp pair occasionally reads back as an
+                // impossible sub-microsecond delta (1-2 samples in ~30, RADV),
+                // so the median, not the minimum, is the estimate to quote.
+                fprintf(
+                    stderr,
+                    "[gauss-gpu] %-8s p25=%7.1f med=%7.1f p75=%7.1f n=%zu\n",
+                    what, v[v.size() / 4], v[v.size() / 2], v[v.size() * 3 / 4],
+                    v.size());
+            };
+            static const char * pass_name[2] { "k0", "k1" };
+            for (int slot = 0; slot < GAUSS_TS_SLOTS; ++slot) {
+                if (ts_stage_us[slot].empty()) {
+                    continue;
+                }
+                char what[16];
+                std::snprintf(what, sizeof(what), "p%d %s", slot / 2,
+                              pass_name[slot % 2]);
+                print(what, ts_stage_us[slot]);
+            }
+            print("cb", ts_cb_us);
+        }
+
         if (host_timing && ht_n.load()) {
             const double n = static_cast<double>(ht_n.load());
             fprintf(stderr,
@@ -106,6 +170,10 @@ struct GaussData {
             gpu->api->freeGPUExecPool(pool);
             pool = nullptr;
         }
+        if (ts_query) {
+            gpu->vk->vkDestroyQueryPool(gpu->device, ts_query, nullptr);
+        }
+        gpu_destroy_buffer(*gpu, ts_buf);
         VkDevice dev = gpu->device;
         VkPipeline destroyed[9] {};
         int num_destroyed = 0;
@@ -213,13 +281,15 @@ static constexpr std::array<VkSpecializationMapEntry, 5> spec_entries { {
 static std::variant<VkPipeline, std::string>
 create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
                 const uint32_t * code, size_t code_size,
-                const GaussSpecData & spec, size_t tile_bytes) {
+                const GaussSpecData & spec, int blk_x, int blk_y,
+                size_t tile_bytes) {
 
-    // All three kernels launch 16x8; only the fused small path declares the
-    // `vblur` tile, whose bytes the caller computed for this config.
-    const GpuWorkgroup workgroup {
-        .x = 16, .y = 8, .shared_bytes = static_cast<uint32_t>(tile_bytes)
-    };
+    // Only the fused small path declares the `vblur` tile, whose bytes the
+    // caller computed for this config; the two large-path passes declare none.
+    const GpuWorkgroup workgroup { .x = static_cast<uint32_t>(blk_x),
+                                   .y = static_cast<uint32_t>(blk_y),
+                                   .shared_bytes =
+                                       static_cast<uint32_t>(tile_bytes) };
     return gpu_create_pipeline(gpu, code, code_size, layout,
                                spec_entries.data(), &spec,
                                static_cast<uint32_t>(spec_entries.size()),
@@ -305,6 +375,37 @@ static const VSFrame * gauss_gpu_frame(GaussData * d, int n,
     vsfeel_trace_mark("record");
     VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
 
+    // Traced frames stamp their dispatches inside this command buffer and are
+    // drained before the stamps are read; the lock also keeps a concurrent
+    // frame off the shared query pool and readback buffer, without which a
+    // later frame's copy lands mid-read. A deep pipeline still interleaves the
+    // other in-flight frames into a traced frame's span, so treat the stage
+    // times as attribution and the benchmark as the verdict.
+    const bool gputrace =
+        d->gputrace && n >= static_cast<int>(d->gputrace_first) &&
+        n < static_cast<int>(d->gputrace_first + d->gputrace_range);
+    uint32_t ts_used = 0;
+    int ts_plane[GAUSS_TS_MAX] {};
+    int ts_pass[GAUSS_TS_MAX] {};
+    std::unique_lock<std::mutex> ts_guard;
+    if (gputrace) {
+        ts_guard = std::unique_lock<std::mutex>(d->ts_lock);
+        d->gpu->vk->vkCmdResetQueryPool(cmd, d->ts_query, 0, GAUSS_TS_MAX);
+        d->gpu->vk->vkCmdWriteTimestamp2(
+            cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, d->ts_query, 0);
+        ts_used = GAUSS_TS_RESERVED;
+    }
+    const auto stamp = [&](int plane, int pass) {
+        if (!gputrace || ts_used >= GAUSS_TS_MAX) {
+            return;
+        }
+        ts_plane[ts_used] = plane;
+        ts_pass[ts_used] = pass;
+        d->gpu->vk->vkCmdWriteTimestamp2(
+            cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, d->ts_query, ts_used);
+        ++ts_used;
+    };
+
     // The plane dispatches touch disjoint buffers (and disjoint scratch
     // regions), so no barrier is needed between them; only the two passes of
     // one plane's large path are ordered.
@@ -342,21 +443,32 @@ static const VSFrame * gauss_gpu_frame(GaussData * d, int n,
                            sizeof(push));
 
         if (cfg.small) {
+            stamp(p, 0);
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           cfg.pipeline);
             d->gpu->vk->vkCmdDispatch(cmd, cfg.grid_x, cfg.grid_y, 1);
+            stamp(p, 0);
         } else {
+            stamp(p, 0);
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           cfg.v_pipeline);
             d->gpu->vk->vkCmdDispatch(cmd, cfg.v_grid_x, cfg.v_grid_y, 1);
+            stamp(p, 0);
 
             // the horizontal pass reads the vertical pass' writes
             gpu_barrier(*d->gpu, cmd);
 
+            stamp(p, 1);
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           cfg.h_pipeline);
             d->gpu->vk->vkCmdDispatch(cmd, cfg.h_grid_x, cfg.h_grid_y, 1);
+            stamp(p, 1);
         }
+    }
+    if (gputrace) {
+        d->gpu->vk->vkCmdCopyQueryPoolResults(
+            cmd, d->ts_query, 0, ts_used, d->ts_buf.buffer, 0, sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     }
     auto t2 = d->host_timing ? std::chrono::steady_clock::now()
                              : std::chrono::steady_clock::time_point {};
@@ -390,6 +502,27 @@ static const VSFrame * gauss_gpu_frame(GaussData * d, int n,
         d->ht_submit_ns += ns(t2, t3);
         d->ht_total_ns += ns(t0, t3);
         d->ht_n.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (gputrace) {
+        char perr[256] {};
+        if (d->gpu->api->gpuExecWaitValue(d->pool, signaled, perr,
+                                          sizeof(perr)) == gdDrained) {
+            const double period = d->gpu->limits.timestampPeriod;
+            const auto us = [period](uint64_t a, uint64_t b) {
+                return static_cast<double>(b - a) * period / 1000.0;
+            };
+            const uint64_t * ts = d->ts_map;
+            for (uint32_t s = GAUSS_TS_RESERVED; s + 1 < ts_used; s += 2) {
+                const int slot = ts_plane[s] * 2 + ts_pass[s];
+                if (slot >= 0 && slot < GAUSS_TS_SLOTS) {
+                    d->ts_stage_us[slot].push_back(us(ts[s], ts[s + 1]));
+                }
+            }
+            d->ts_cb_us.push_back(us(ts[0], ts[ts_used - 1]));
+        } else {
+            fprintf(stderr, "[gauss-gpu] probe wait failed: %s\n", perr);
+        }
     }
 
     vsapi->freeFrame(src);
@@ -766,10 +899,12 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
         const int64_t h = cfg.height;
         const int64_t small_x = (w + BLK_X - 1) / BLK_X;
         const int64_t small_y = (h + VRT * BLK_Y - 1) / (VRT * BLK_Y);
-        const int64_t v_x = (w + BLK_X - 1) / BLK_X;
-        const int64_t v_y = ((h + LARGE_R - 1) / LARGE_R + BLK_Y - 1) / BLK_Y;
-        const int64_t h_x = ((w + LARGE_R - 1) / LARGE_R + BLK_X - 1) / BLK_X;
-        const int64_t h_y = (h + BLK_Y - 1) / BLK_Y;
+        const int64_t v_x = (w + V_BLK_X - 1) / V_BLK_X;
+        const int64_t v_y =
+            ((h + LARGE_R_V - 1) / LARGE_R_V + V_BLK_Y - 1) / V_BLK_Y;
+        const int64_t h_x =
+            ((w + LARGE_R_H - 1) / LARGE_R_H + H_BLK_X - 1) / H_BLK_X;
+        const int64_t h_y = (h + H_BLK_Y - 1) / H_BLK_Y;
         // A 2D grid cannot fold an over-wide plane into Y the way the 1D
         // kernels do: refuse it instead of dispatching a clamped grid that
         // leaves everything past the limit unwritten. Only the chosen path's
@@ -819,15 +954,16 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
                                       (BLK_X + 2 * radius) * sizeof(float);
             const auto result =
                 create_pipeline(*d->gpu, d->pipeline_layout, gauss_code,
-                                gauss_size, spec, tile_bytes);
+                                gauss_size, spec, BLK_X, BLK_Y, tile_bytes);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
             cfg.pipeline = std::get<VkPipeline>(result);
         } else {
             {
-                const auto result = create_pipeline(
-                    *d->gpu, d->pipeline_layout, vert_code, vert_size, spec, 0);
+                const auto result =
+                    create_pipeline(*d->gpu, d->pipeline_layout, vert_code,
+                                    vert_size, spec, V_BLK_X, V_BLK_Y, 0);
                 if (std::holds_alternative<std::string>(result)) {
                     return set_error(std::get<std::string>(result));
                 }
@@ -836,7 +972,7 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
             {
                 const auto result =
                     create_pipeline(*d->gpu, d->pipeline_layout, horiz_code,
-                                    horiz_size, spec, 0);
+                                    horiz_size, spec, H_BLK_X, H_BLK_Y, 0);
                 if (std::holds_alternative<std::string>(result)) {
                     return set_error(std::get<std::string>(result));
                 }
@@ -852,6 +988,38 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
             d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
         if (d->pool == nullptr) {
             return set_error("createGPUExecPool failed: "s + err);
+        }
+    }
+
+    d->gputrace = vsfeel_debug_probe("VSFEEL_GAUSS_GPUTRACE") &&
+                  vsfeel_probe_timestamps(*d->gpu, "GaussBlur");
+    if (d->gputrace) {
+        d->gputrace_first =
+            static_cast<uint32_t>(env_int("VSFEEL_GAUSS_GPUTRACE", 100));
+        d->gputrace_range = static_cast<uint32_t>(
+            std::max(1, env_int("VSFEEL_GAUSS_GPUTRACE_RANGE", 40)));
+        const VkQueryPoolCreateInfo qp_info {
+            .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .flags = 0,
+            .queryType = VK_QUERY_TYPE_TIMESTAMP,
+            .queryCount = GAUSS_TS_MAX
+        };
+        if (d->gpu->vk->vkCreateQueryPool(d->gpu->device, &qp_info, nullptr,
+                                          &d->ts_query) != VK_SUCCESS) {
+            d->ts_query = VK_NULL_HANDLE;
+            d->gputrace = false;
+        }
+    }
+    if (d->gputrace) {
+        auto e = gpu_make_buffer(*d->gpu, core, GAUSS_TS_MAX * sizeof(uint64_t),
+                                 d->ts_buf,
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                 0, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (!e.empty() || d->ts_buf.mapped == nullptr) {
+            d->gputrace = false;
+        } else {
+            d->ts_map = static_cast<uint64_t *>(d->ts_buf.mapped);
         }
     }
 
