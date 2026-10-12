@@ -546,6 +546,14 @@ Chronological; each entry keeps the mechanism, not the story.
 
 ### Do not retry
 
+- **A half-precision or otherwise narrowed processing mode.** The filter is not
+  bandwidth-bound (1080p r=2: `gpu_busy_percent` 100, `mem_busy_percent` ~35)
+  and its compute is depth-independent: u16 is 979.4 against fp32's 956.5 fps
+  (1000 frames) and 977.5 against 968.5 with the io removed. The float estimate
+  stack (83 MB/frame at r=2) is the only large narrowable traffic and cannot
+  narrow anyway (no `shaderBufferFloat16AtomicAdd`; no 16-bit integer atomics in
+  core Vulkan). bm3dvk2's own fp16 mode is 16% slower here (133.4 against 159.1
+  fps, 500 frames, `--no-download`) while reading half the source bytes.
 - **Emulating libstdc++'s `partial_sort` tie order.** Survivors are heap
   positions, not a positional rule; exactness needs the whole candidate sequence
   replayed through a 7-element heap (~940 keys/block in LDS plus a serial pass,

@@ -146,7 +146,12 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
 - **Only noise-clip comparisons against the reference prove correctness.**
   Constant/BlankClip input hides bugs (the references themselves deviate at
   borders on such input).
-- **Trust only end-to-end benchmark fps medians over hundreds of frames.**
+- **Trust only end-to-end benchmark fps medians over at least 1000 frames.**
+  That is the floor for a speed test (`MIN_BENCH_FRAMES` in the harness), and
+  the filter's own benchmark default (1000–5000) is better still: the run has to
+  outlast the clock ramp and last a couple of seconds, so a ~2000 fps filter
+  wants 4000+ frames. Never shrink `--frames` to iterate faster — a few hundred
+  frames is noise, not a result.
   Microsecond GPU traces swing ±10–20% run-to-run (clock variance); a change
   that does not move the fps median did not happen. Concurrent submissions
   share the compute queue, so per-kernel timings taken from a deep pipeline

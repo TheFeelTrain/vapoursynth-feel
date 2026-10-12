@@ -19,7 +19,7 @@ Usage:
     uv run tools/benchmark.py --filter bm3d --ab-so build/libvsfeel.so old/libvsfeel.so --ab-names new,old
     uv run tools/benchmark.py --filter bm3d --ab-b-env VSFEEL_BM3D_DERIVE=1 --ab-names legacy,derived
     uv run tools/benchmark.py --filter bm3d --ab-so a.so b.so --ab-rounds 3 --ab-order abba
-    uv run tools/benchmark.py --frames 500 --clip /path/to/input.mkv
+    uv run tools/benchmark.py --frames 2000 --clip /path/to/input.mkv
     uv run tools/benchmark.py --no-cache          # live decode: full chain incl. BestSource
     uv run tools/benchmark.py --filter gaussblur --gpu-cache --no-download
     uv run tools/benchmark.py --check-fresh       # refuse to run against a stale .so
@@ -40,6 +40,12 @@ held in RAM while vspipe is still evaluating the script (its fps figure only
 covers the output loop), so timing reflects real-content filter throughput
 without the BestSource decode bottleneck. --synthetic swaps real content for a
 BlankClip; --no-cache restores live decoding.
+
+Frame count is a floor, not a knob to shrink: a speed test runs at least 1000
+frames (MIN_BENCH_FRAMES), and ideally the filter's own default (1000-5000, see
+FILTERS) instead of an explicit --frames. The run should last a couple of
+seconds, so a ~2000 fps filter wants 4000+ frames; a few hundred frames measures
+the clock ramp and run-to-run swing, not the filter.
 
 --no-download hands vspipe its ``--`` no-output target, which leaves a GPU
 resident output resident: nothing reads the pixels, so the implicit download is
@@ -75,6 +81,9 @@ from typing import Any, Callable
 
 DEFAULT_CLIP = "/home/encode/test/jpbd.mkv"
 DEFAULT_TIMEOUT = 900  # seconds per vspipe run (H1: a hang must not hang the harness)
+# A speed test has to outlast the clock ramp and average out run-to-run swing;
+# below this the fps is noise. Shrinking --frames is not a way to iterate faster.
+MIN_BENCH_FRAMES = 1000
 # AA real-clip runs cache the 2x luma AND the 2x mask; cap them by bytes, not
 # frames (H8). The budget is exclusive of VapourSynth's own 48 GB frame cache,
 # which is additive: 6 GiB keeps the pair well under the incident point.
@@ -1762,7 +1771,12 @@ def parse_args() -> argparse.Namespace:
         help="filter to benchmark (default: all)",
     )
     parser.add_argument(
-        "--frames", type=int, default=None, help="frames to time (default: per-filter, see FILTERS)"
+        "--frames",
+        type=int,
+        default=None,
+        help=f"frames to time; a speed test runs at least {MIN_BENCH_FRAMES} "
+        "frames and ideally the filter's own default, so prefer "
+        "omitting this (default: per-filter, see FILTERS)",
     )
     parser.add_argument("--clip", default=DEFAULT_CLIP, help="input clip path")
     parser.add_argument(
@@ -1951,6 +1965,13 @@ def main() -> None:
         sys.exit(f"--clip not found: {ns.clip}")
     if ns.repeat < 1:
         sys.exit(f"--repeat must be >= 1, got {ns.repeat}")
+    if ns.frames is not None and ns.frames < MIN_BENCH_FRAMES:
+        print(
+            f"warning: --frames {ns.frames} is below the {MIN_BENCH_FRAMES}-frame floor, "
+            f"so the fps is clock-ramp noise, not a measurement. Omit --frames to use "
+            f"the filter's default, or pick a count that runs for a couple of seconds.",
+            file=sys.stderr,
+        )
     if ns.aa_cache_mb < 0:
         sys.exit(f"--aa-cache-mb must be >= 0, got {ns.aa_cache_mb}")
     # Named once: which VapourSynth the numbers came from is part of the result.

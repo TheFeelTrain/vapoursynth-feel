@@ -207,7 +207,8 @@ runs it. Plugins are described separately in `PLUGINS`.
   - `uv run tools/benchmark.py --filter <name>` — one filter
   - `uv run tools/benchmark.py --filter <name> vsfeel vszipcl` — a subset of
     plugins, to compare against references
-  - `--frames N`, `--clip PATH` to control the run
+  - `--frames N`, `--clip PATH` to control the run; prefer omitting `--frames`
+    (see the frame floor below)
   - `--gpu-cache` hands every arm device-resident frames, the chain a GPU
     filter actually runs in (a CPU filter pays the download it would pay
     there); `--no-download` runs vspipe with its `--` no-output target, which
@@ -223,6 +224,12 @@ runs it. Plugins are described separately in `PLUGINS`.
   on real content without the BestSource decode bottleneck (~630 fps). Frames
   loop when `--frames` exceeds the cached span, so temporal filters see a seam
   every N frames — fine for throughput, not for output inspection.
+- **A speed test runs at least 1000 frames** (`MIN_BENCH_FRAMES` in
+  `tools/benchmark.py`), and ideally the filter's own default (`default_frames`
+  in `FILTERS`, 1000–5000) instead of an explicit `--frames`. The run should
+  last a couple of seconds, so a ~2000 fps filter wants 4000+ frames. A few
+  hundred frames measures the clock ramp and run-to-run swing, not the filter;
+  never shrink `--frames` to iterate faster. The harness warns below the floor.
 
 To benchmark a single filter against the references:
 
@@ -231,8 +238,8 @@ uv run tools/benchmark.py --filter dfttest vsfeel vszipcl
 ```
 
 This prints fps for each plugin and ranks them. Compare vsfeel's fps against
-the fastest reference. Judge optimizations on multiple runs over hundreds of
-frames.
+the fastest reference. Judge optimizations on medians over 1000+ frames
+(`--repeat`), never on a single short burst.
 
 To compare two vsfeel builds or two env configs against each other, use the
 benchmark's A/B mode instead of writing a scratch script:
