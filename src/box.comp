@@ -1,0 +1,136 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+/*
+ * Box — separable box downscale (vskernels' `Box`, i.e. resize2's
+ * `resize2.Custom` with the box kernel). Exactly one of ENTRY_VERT /
+ * ENTRY_HORIZ is defined at compile time:
+ *
+ *   ENTRY_VERT  — first pass: average the source rows whose centres fall in
+ *                 the output row's box, into the `mid` scratch buffer.
+ *   ENTRY_HORIZ — second pass: the same over columns, `mid` -> dst.
+ *
+ * The passes are separate with a rounded intermediate on purpose: resize2
+ * quantises the vertical result to the frame's sample type before the
+ * horizontal pass, and a single-pass float accumulate differs from it by 1
+ * code on ~0.2% of pixels. With the rounded intermediate this reproduces
+ * resize2 bit-for-bit wherever its own weights are exact.
+ *
+ * The tap window is not a formula here. zimg's filter for a box kernel is
+ * *not* an area average: at a fractional ratio some output pixels average one
+ * source pixel and their neighbours average two, and the phase of that pattern
+ * is what makes it match. It is precomputed in double on the host into a
+ * `(first tap, tap count)` table, so the shader's window is exact integer
+ * arithmetic and no float32 tie can move a tap. See notes/BOX.md.
+ *
+ * Buffers: src/dst are the core's own GPU frame planes (vnode: in/out), `mid`
+ * is a transient per-frame scratch buffer, `taps` the constant table above.
+ * Compile-time variants: -DBITS=16|32.
+ */
+
+#if !defined(BITS)
+#define BITS 16
+#endif
+
+#if BITS == 16
+#define IO_TYPE uint16_t
+#define PEAK    65535.0f
+#else
+#define IO_TYPE float
+#define PEAK    1.0f
+#endif
+
+// Full source width and height, the destination dimensions, and the row
+// pitches of the source/destination planes and of the `mid` scratch (which is
+// SRC_W wide, so SRC_STRIDE pitches it).
+layout(constant_id = 0) const int SRC_W = 1920;
+layout(constant_id = 1) const int SRC_H = 1080;
+layout(constant_id = 2) const int DST_W = 960;
+layout(constant_id = 3) const int DST_H = 540;
+layout(constant_id = 4) const int SRC_STRIDE = 1920;
+layout(constant_id = 5) const int DST_STRIDE = 960;
+
+layout(std430, binding = 0) readonly buffer SrcBuf { IO_TYPE src[]; };
+layout(std430, binding = 1) writeonly buffer DstBuf { IO_TYPE dst[]; };
+layout(std430, binding = 2) buffer MidBuf { IO_TYPE mid[]; };
+// (first source tap, tap count) per output position, in elements
+layout(std430, binding = 3) readonly buffer TapBuf { ivec2 taps[]; };
+
+layout(push_constant) uniform PushConstants {
+    int src_base;
+    int dst_base;
+    int mid_base;
+    int tap_base;
+} pc;
+
+float load_src(int idx) {
+#if BITS == 32
+    return src[idx];
+#else
+    // direct uint16_t->float conversion chokes glslc; int() widens cleanly
+    return float(int(src[idx]));
+#endif
+}
+
+float load_mid(int idx) {
+#if BITS == 32
+    return mid[idx];
+#else
+    return float(int(mid[idx]));
+#endif
+}
+
+// Round half away from zero, then saturate. resize2's integer output rounds
+// the same way, which is not the round-to-nearest-even the other filters use.
+void store_mid(int idx, float v) {
+#if BITS == 32
+    mid[idx] = v;
+#else
+    mid[idx] = uint16_t(uint(clamp(floor(v + 0.5), 0.0f, PEAK)) & 0xFFFFu);
+#endif
+}
+
+void store_dst(int idx, float v) {
+#if BITS == 32
+    dst[idx] = v;
+#else
+    dst[idx] = uint16_t(uint(clamp(floor(v + 0.5), 0.0f, PEAK)) & 0xFFFFu);
+#endif
+}
+
+#if defined(ENTRY_VERT)
+
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    const int x = int(gl_GlobalInvocationID.x);
+    const int oy = int(gl_GlobalInvocationID.y);
+    if (x >= SRC_W || oy >= DST_H) {
+        return;
+    }
+    const ivec2 t = taps[pc.tap_base + oy];
+    float acc = 0.0f;
+    for (int i = 0; i < t.y; ++i) {
+        acc += load_src(pc.src_base + (t.x + i) * SRC_STRIDE + x);
+    }
+    store_mid(pc.mid_base + oy * SRC_STRIDE + x, acc / float(t.y));
+}
+
+#elif defined(ENTRY_HORIZ)
+
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    const int ox = int(gl_GlobalInvocationID.x);
+    const int oy = int(gl_GlobalInvocationID.y);
+    if (ox >= DST_W || oy >= DST_H) {
+        return;
+    }
+    const ivec2 t = taps[pc.tap_base + ox];
+    const int row = pc.mid_base + oy * SRC_STRIDE + t.x;
+    float acc = 0.0f;
+    for (int i = 0; i < t.y; ++i) {
+        acc += load_mid(row + i);
+    }
+    store_dst(pc.dst_base + oy * DST_STRIDE + ox, acc / float(t.y));
+}
+
+#endif

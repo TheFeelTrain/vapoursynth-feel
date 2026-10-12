@@ -239,6 +239,22 @@ foreach(bits IN LISTS VK_BITS)
     endforeach()
 endforeach()
 
+# Box: one variant per pass per io depth. The tap window is a host-computed
+# table (resize2's box filter is not an area average at fractional ratios), so
+# nothing else varies; the workgroup shape lives in the shader and is compared
+# against the host launch by tools/shader_limits.py --check.
+set(VK_BOX_ENTRIES vert horiz)
+set(VK_BOX_ENTRY_DEFS -DENTRY_VERT -DENTRY_HORIZ)
+set(VK_BOX_VARIANTS)
+foreach(bits IN LISTS VK_BITS)
+    foreach(entry_i RANGE 0 1)
+        list(GET VK_BOX_ENTRIES ${entry_i} entry)
+        list(GET VK_BOX_ENTRY_DEFS ${entry_i} entry_def)
+        list(APPEND VK_BOX_VARIANTS
+            "box_${bits}_${entry}|box.comp|-DBITS=${bits} ${entry_def}")
+    endforeach()
+endforeach()
+
 # DFTTest: pad + fused + col2im kernels per io variant (16 int, 32
 # float); the fused kernel is additionally compiled per temporal radius
 # (0..3, i.e. tbsize 1/3/5/7) so its loops unroll and the working array
@@ -347,6 +363,7 @@ endforeach()
 set(VK_VARIANTS
     ${VK_BILATERAL_VARIANTS}
     ${VK_BM3D_VARIANTS}
+    ${VK_BOX_VARIANTS}
     ${VK_GAUSS_VARIANTS}
     ${VK_DFT_VARIANTS}
     ${VK_NLM_VARIANTS}
@@ -503,6 +520,7 @@ add_library(vsfeel SHARED
     src/vsfeel.cpp
     src/bilateral.cpp
     src/bm3d.cpp
+    src/box.cpp
     src/gaussblur.cpp
     src/dfttest.cpp
     src/nlmeans.cpp

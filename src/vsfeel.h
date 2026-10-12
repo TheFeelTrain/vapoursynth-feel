@@ -837,6 +837,7 @@ inline std::variant<VkPipeline, std::string> gpu_create_pipeline(
 
 void vsfeel_register_bilateral(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
 void vsfeel_register_bm3d(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
+void vsfeel_register_box(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
 void vsfeel_register_gaussblur(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
 void vsfeel_register_dfttest(const VSPLUGINAPI * vspapi, VSPlugin * plugin);
 void vsfeel_register_nlmeans(const VSPLUGINAPI * vspapi, VSPlugin * plugin);

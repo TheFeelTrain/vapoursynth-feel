@@ -60,6 +60,18 @@ core.vsfeel.BM3D(clip clip[,
 ```
 `chroma=True` requires YUV444. `BM3Dv2` stays registered as an alias for scripts written against the old name.
 
+### Box
+
+The [box filter](https://en.wikipedia.org/wiki/Box_blur) averages the source pixels around each output pixel with equal weight. Downscaling with it gives a clean, smooth result, without the ringing or added sharpness a cubic kernel can introduce.
+
+```python
+core.vsfeel.Box(clip clip[,
+    int width,                      # output width; defaults to the input width
+    int height])                    # output height; defaults to the input height
+```
+
+Any downscale ratio is supported. Omitting one dimension leaves that axis unchanged.
+
 ### DFTTest
 
 DFTTest is a 3D block-wise frequency-domain denoiser. Each 16x16 spatial block is stacked with temporally neighboring frames, transformed to the frequency domain, filtered, and transformed back with overlap-add. It reduces noise while preserving detail, with configurable spatial and temporal windowing and a choice of frequency-domain filter variants.

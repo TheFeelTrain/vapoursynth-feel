@@ -4,10 +4,10 @@
 automatically whenever you read or edit anything under `notes/`. The fixed
 shape, the budget and the rules that do not bend are requirements.
 
-One file per filter (`BILATERAL.md`, `BM3D.md`, `DFTTEST.md`, `EEDI3.md`,
-`EEDI3AA.md`, `GAUSSBLUR.md`, `NLMEANS.md`, `NNEDI3.md`), plus one cross-cutting
-file (`METHOD.md`). They are **tracked** in git: the durable design record, not
-scratch memory.
+One file per filter (`BILATERAL.md`, `BM3D.md`, `BOX.md`, `DFTTEST.md`,
+`EEDI3.md`, `EEDI3AA.md`, `GAUSSBLUR.md`, `NLMEANS.md`, `NNEDI3.md`), plus
+one cross-cutting file (`METHOD.md`). They are **tracked** in git: the durable
+design record, not scratch memory.
 
 These files are read by people deciding what to try next. Length is not a
 virtue and the history is not the point — the *current design*, the *measured

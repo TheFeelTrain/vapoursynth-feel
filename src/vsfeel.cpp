@@ -615,6 +615,7 @@ VapourSynthPluginInit2(VSPlugin * plugin, const VSPLUGINAPI * vspapi) {
 
     vsfeel_register_bilateral(vspapi, plugin);
     vsfeel_register_bm3d(vspapi, plugin);
+    vsfeel_register_box(vspapi, plugin);
     vsfeel_register_gaussblur(vspapi, plugin);
     vsfeel_register_dfttest(vspapi, plugin);
     vsfeel_register_nlmeans(vspapi, plugin);
