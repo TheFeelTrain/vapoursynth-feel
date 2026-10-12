@@ -13,22 +13,22 @@ Target GPU: RX 7900 XTX (RDNA3, gfx1100), Mesa 26.2 RADV.
 - **Runs need `RADV_EXPERIMENTAL=transfer_queue`** (mechanism:
   `notes/BILATERAL.md`), which `tools/benchmark.py` forces.
 
-Scoreboard — jpbd 1080p GRAY16, 3000 frames, `tools/benchmark.py --filter
-dfttest vsfeel`, interleaved pre-port/R80 pairs, `--repeat 2`:
+Scoreboard — jpbd 1080p GRAY16, 3000 frames, medians of 3 through
+`tools/benchmark.py --filter dfttest`:
 
-| input to vsfeel | pre-R80 | R80 port | delta |
+| mode | vsfeel | vszipcl | ratio |
 |---|---|---|---|
-| CPU cache (benchmark default) | 1452.6 / 1376.0 | 1361.3 / 1360.3 | **−6% … −1%** |
-| `--gpu-cache` (GPU clip consumed) | 1182.3 | 1350.3 | **+14%** |
-| `--synthetic` BlankClip | 1376.2 | 1364.7 | −1% |
+| CPU cache (benchmark default) | 1456.9 | 805.5 | 1.81x |
+| `--gpu-cache` | 1512.9 | 879.4 | 1.72x |
+| `--synthetic` BlankClip | 1500.6 | 900.1 | 1.67x |
 
-- vs `vszipcl` in a separate same-session pair (3000 frames, `--repeat 2`):
-  1254 vs 801 fps, i.e. the port is **1.57x** the reference.
-- The transfer was the whole pre-port gap: the default run measured −18.9%
-  before the opt-in, and chained instances (middle frames stay in VRAM, so only
-  the ends transfer) measured 640 µs pre-port vs 666 µs per instance. The ~26 µs
-  is the two extra pad dispatches the port does by re-padding all `tw` slices
-  instead of reusing a slot.
+- The three modes agree within 4%: the frame is the kernels, and with the
+  transfer queue the transfers ride along instead of adding a stage.
+- The pre-port gap's mechanism was the transfer (the default run measured
+  −18.9% before the opt-in, and chained instances, where only the ends
+  transfer, measured 640 vs 666 µs per instance — the ~26 µs being the two
+  extra pad dispatches). Those numbers are void with the rest of the port's
+  scoreboard (Historical).
 
 ## Implementation
 
@@ -102,6 +102,12 @@ force-pad / fail-pad probes: 2854 lines of C++ became 1565.
 ## Historical
 
 The pre-R80 design and every round that shaped it, kept for the mechanisms:
+
+- **The R80 port's scoreboard is void.** It read 1452.6/1376.0 → 1361.3/1360.3
+  (CPU cache), 1182.3 → 1350.3 (`--gpu-cache`) and 1376.2 → 1364.7
+  (`--synthetic`) fps, and "1.57x vs vszipcl", all against the pre-fix
+  benchmark harness (`notes/METHOD.md`). The banner's table replaces them; the
+  mechanism it recorded (the port's gap was the transfer) still holds.
 
 - **Creation-failure leak** (correctness-only, no perf change).
   `createVideoFilterEx2` returns `nullptr` without running the free callback when

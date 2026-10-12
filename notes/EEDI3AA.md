@@ -10,19 +10,20 @@ f32. Specialised `dh=false`, `field>1`, single-rate. The `vsfeel/vsaa.py`
 wrapper, the `eedi3aa` benchmark entry (1000 f, ns=8) and `tests/test_eedi3aa.py`
 ship.
 
-Scoreboard, real based_aa clip (jpbd 2x Point → 3840x2160 GRAY16, 600 f, ns=8):
+Scoreboard — real based_aa clip (jpbd 2x Point → 3840x2160, 1000 f,
+`tools/benchmark.py --filter eedi3aa --gpu-cache --no-download --bits <16|32>`,
+medians of 3):
 
-| arm | fps |
-|---|---|
-| vsfeel `EEDI3AA` (fused, pre-port build) | 96.3 |
-| vsfeel `EEDI3AA` (R80 port, interleaved A/B) | 159.2 vs 153.2 (**+4%**) |
-| vsfeel two-call chain (order-reversed A/B, 6×600 f) | 98.9 (fused 100.2 → **1.01–1.07x**) |
-| vsfeel `EEDI3AA` (batch knee re-swept, 4×1000 f order-reversed) | 183.1 → **198.7 (+8.5%)** |
-| vszipcl chain (best reference) | 45.3 |
-| vszipcu / eedi3vk2 chain | 25.8 / 28.1 |
+| bit depth | vsfeel | vszipcl chain | eedi3vk2 chain |
+|---|---|---|---|
+| u16 | 174 | 26 | 37 |
+| fp32 | 128 | 24 | 32 |
 
-**≈2.1x the best reference chain.** The brief's 1.6–1.8x projection did not
-materialise (Historical).
+- **4.7x the faster reference chain on u16, 4.0x on fp32.**
+- Same-session A/Bs, still valid as relative results: the R80 port's
+  interleaved pair (+4%) and the fused call against the two-call chain
+  (1.01–1.07x, 6x600 f order-reversed). The absolute fps they were recorded
+  next to, and the batch-knee sweep, are void (Historical).
 
 ## Implementation
 
@@ -127,16 +128,22 @@ batch 4, per batch of ~3 frames:
 upload's producer pairs, which is PCIe time, not compute. The real prep is ~291
 us per sub-pass.
 
-So the **row kernel is 77% of the GPU time**, prep 18%, vcheck 3%, tail 2.4%; the
-GPU is ~88% busy and the frame is GPU bound (removing the input uploads with
-`--gpu-cache` does not help). Ablating the row kernel end to end takes the graded
-run 172 -> 281 fps, i.e. **the row kernel is 39% of the frame**, which is where
-the batch and row-kernel work below pays off. The kernel itself is attributed in
-`notes/EEDI3.md`'s Performance section; the short version is that it is
-ALU-issue bound at ~1 IPC, not load bound.
+So the **row kernel is 77% of the GPU time**, prep 18%, vcheck 3%, tail 2.4%.
+That GPU time is hidden, not the frame: ablating the row kernel end to end
+changes the graded run by −0.4% (176.1 → 175.5 fps, interleaved 6×2-repeat A/B,
+`--gpu-cache --no-download`), because the per-output-frame transfer bill is the
+frame (`notes/EEDI3.md`). The kernel itself is attributed in `notes/EEDI3.md`'s
+Performance section; the short version is that it is ALU-issue bound at ~1 IPC,
+not load bound.
 
 ## Historical
 
+- **2026-10-12 — banner re-measured; the previous table is void.** Its absolute
+  fps (96.3 pre-port, the 159.2/153.2 port pair, the 45.3/25.8/28.1 reference
+  chains) and the batch-knee sweep (183.1 → 198.7) were taken against the
+  pre-fix benchmark harness (`notes/METHOD.md`). The two same-session A/B
+  *results* are kept in the banner; the 1.6–1.8x projection the old banner
+  closed on is superseded by the current 4.7x/4.0x.
 - **2026-10-02 — the `oracle_32bit[case4-*]` failures were the EEDI3 core, not
   the AA chain.** They measured 0.002 against the 1e-6 oracle because the fused
   chain's f32 EEDI3 sub-passes lost DP argmins to missing `precise` qualifiers

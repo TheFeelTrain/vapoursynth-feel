@@ -26,17 +26,18 @@ Status: **shipped on the R80 GPU API.** Verified against
   the core's exec ring, device choice is `core.set_vulkan_device`.
 
 Scoreboard — jpbd 1080p YUV420P16, `d=2 a=2 s=4 h=0.2 wmode=0 wref=1
-channels=UV`, 3000 frames, `tools/benchmark.py --filter nlmeans vsfeel`,
-interleaved pre-port/R80 pairs, `--repeat 3` (vszipcl control flat at
-~755 fps throughout):
+channels=UV`, 3000 frames, medians of 3 through `tools/benchmark.py`:
 
-| input to vsfeel | pre-R80 | R80 port | delta |
-|---|---|---|---|
-| CPU cache (benchmark default) | 1082.9 | 1080.3 | **−0.2%** |
-| `--gpu-cache` (GPU clip consumed) | 1065.9 | 1083.4 | **+1.6%** |
+| mode | vsfeel | vszipcl | knlmvk | ratio |
+|---|---|---|---|---|
+| CPU cache (benchmark default) | 1020.9 | 550.9 | 622.0 | 1.64x |
+| `--gpu-cache` | 1026.7 | 460.0 | 625.5 | 1.64x |
 
-GRAY16 (all planes processed) is at parity in a manual same-session pair
-(281 vs 279 fps, ~0.7%).
+- The two modes agree within 1%: the frame is the interleaved sweep rounds, and
+  the transfers ride along on the transfer queue.
+- GRAY16 (all planes processed) was at parity in a manual same-session pair
+  (281 vs 279 fps, ~0.7%); its absolute fps are void with the rest of the
+  pre-fix numbers, but the parity it showed is a relative result.
 
 The fp32 weight ring (2026-10-02) replaces the fp16 one and costs **−7.2%** on
 the same config: same-session pair, 1080.2 → 1002.4 fps (vszipcl control flat at
@@ -133,6 +134,10 @@ the element width doubled (128 MiB budget).
 
 The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
+- **The R80 port's scoreboard is void.** It read 1082.9 → 1080.3 (CPU cache) and
+  1065.9 → 1083.4 (`--gpu-cache`) fps against the pre-fix benchmark harness
+  (`notes/METHOD.md`); the same-session deltas it carried (−0.2%, +1.6%) stand.
+  The banner's table replaces the absolute numbers.
 - **R80 port** (`src/nlmeans.cpp` 1818 → ~1090 lines). Deleted: the slot pool
   (`CacheSlot`, `res_token` holders, `writer_token`/`writer_count`,
   `cache_cv`, the all-or-nothing acquire), host compose into per-stream staging,

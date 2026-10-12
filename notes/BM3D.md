@@ -26,25 +26,25 @@ CUDA-matcher build. The CPU plugin is the only oracle, driven from
   `sigma[0]*80 + 400` basic and `sigma[0]*10 + 200` final.
 
 Scoreboard — 1080p jpbd, `tools/benchmark.py -f bm3d`, harness defaults
-(sigma 0.7, radius 2, bm_range 9, ps_range 4, block_step 8), 1000 frames x3:
+(sigma 0.7, radius 2, bm_range 9, ps_range 4, block_step 8), 1000 frames x3,
+`--gpu-cache --no-download`:
 
-| | fps | |
+| arm | fps | |
 |---|---|---|
-| vsfeel | **982** | mawen matcher and filtering |
-| vsfeel, 16 bit in | **1004** | same kernels, half the io bytes |
-| bm3dvk | 295 | fixed 8-member groups |
-| vszipcl | 136 | |
+| vsfeel | **953** | mawen matcher and filtering |
+| vsfeel, 16 bit in | **980** | same kernels, half the io bytes |
+| bm3dvk | 293 | fixed 8-member groups |
+| bm3dvk2 | 146 | |
+| vszipcl | 126 | |
 
-vsfeel's medians here are 5000-frame x3 runs after the in-flight-depth fix below
-(the same session measured 869-947 before it, which is the swing that round
-removed); the reference columns are one
-run from the same session and swing with the box like everything else here
-(bm3dvk measured 237 in an earlier one). 3.2x the faster reference, but not on
-equal work: they always group eight while the default threshold accepts ~80% of
-candidates here and the top-eight selection does the filtering. vsfeel was 845
-fps before the bookkeeping round below. The 16 bit row is a same-session pair
-against fp32 (970 vs 932 fps, `--bits 16` against `--bits 32`, 1000 frames x3
-each, interleaved).
+- **3.3x the faster reference**, but not on equal work: they always group eight
+  while the default threshold accepts ~80% of candidates here and the top-eight
+  selection does the filtering.
+- The default (CPU cache) mode agrees within 2% (vsfeel 947.8/971.3, bm3dvk
+  292.1, bm3dvk2 161.6, vszipcl 132.9): the frame is the filter's own GPU work.
+  bm3dvk2 is listed because it was the other candidate for the vulkan column,
+  and it is slower than bm3dvk in both modes.
+- The 16 bit row is a separate run at the same settings, not a second filter.
 
 16 bit input is the same filter, not a second one: the ring, the estimate
 stacks and every kernel's arithmetic are float at both depths, an integer

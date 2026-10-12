@@ -24,32 +24,35 @@ Status: **shipped on the R80 GPU API.** Design (current):
   exec ring; src/output frames are core-owned.
 - Runs need `RADV_EXPERIMENTAL=transfer_queue`, which `tools/benchmark.py`
   forces (mechanism: `notes/BILATERAL.md`).
-- The filter sits at the API's transfer ceiling: a bare core
-  `GPUUpload→GPUDownload` graph (same cached real-clip vpy, no filter, 5000
-  frames) runs 2316 fps.
 
 Scoreboard — jpbd 1080p GRAY16, bench defaults (`field=3 dh=0 nsize=0 nns=4
-qual=2 etype=0 pscrn=4`), interleaved pre-R80/R80 rounds through
-`tools/benchmark.py`, arm order alternated, medians:
+qual=2 etype=0 pscrn=4`), 5000 frames, medians of 3 through
+`tools/benchmark.py`:
 
-| input to vsfeel | pre-R80 | R80 port | delta |
+| mode | vsfeel | nnedi3vk | ratio |
 |---|---|---|---|
-| CPU cache (benchmark default), 5000 f ×3, 4 rounds | 3034 | 2695 | **−11.2%** |
-| `--gpu-cache` (resident GPU clip), 3000 f ×2, 3 rounds | 2156 | 2739 | **+27.0%** |
+| CPU cache (benchmark default) | 3124.0 | 2793.0 | 1.12x |
+| `--gpu-cache` (resident GPU clip) | 3432.4 | 2271.5 | 1.51x |
+| `--gpu-cache --no-download` (u16 / fp32) | 4666 / 3967 | 2218 / 1207 | 2.52x |
 
-- References, same-session pairs: CPU cache (5000 f ×3) — vsfeel **2652**,
-  nnedi3vk 2908 → **0.91x**; `--gpu-cache` (3000 f ×2) — vsfeel **2740**,
-  nnedi3vk 2031 → **1.35x (#1)**. The port wins exactly where a resident chain
-  is involved; the CPU-sink row keeps the pre-port reference shape inverted for
-  the mechanism below.
-- Mechanism of the CPU-sink delta (same as `notes/GAUSSBLUR.md` and
+- The resident rows win by more than the CPU-sink row because the reference
+  pays a real download there while vsfeel consumes the core's plane.
+- **The output download is the last transfer in the chain.** Removing it takes
+  vsfeel 3432 → 4666 fps (291 → 214 µs/frame): the filter's own compute is
+  214 µs, and the download adds ~77 µs on top of it. A bare core
+  `GPUUpload→GPUDownload` graph of one 1080p GRAY16 plane (same cached
+  real-clip vpy, no filter, pinned caches, 3000 frames) runs 3786 fps with the
+  download and 710712 fps without, i.e. that transfer alone is 264 µs — the
+  filter hides most of it, and the `vnode:gpu` contract leaves the rest in the
+  chain. Nothing in-filter can remove it; do not chase it here.
+- Mechanism of the pre-port CPU-sink delta (same as `notes/GAUSSBLUR.md` and
   `notes/BM3D.md`): the pre-R80 kernel stores *were* the download (D2H of the
   interpolated half only) and the NT ReBAR pack *was* the upload, so the old
   build moved one full-frame DMA less than the core's round trip and never ran
   `GPUDownload` at all. Forcing **one** core download into the old build's own
-  chain (`--gpu-cache` row above) drops it 3034 → 2156 fps (−29%): the delta
-  is the deleted transfer path, not the filter. Nothing in-filter can remove it
-  under the `vnode:gpu` contract — do not chase it here.
+  chain dropped it 3034 → 2156 fps (−29%): the delta was the deleted transfer
+  path, not the filter. The relative result stands; its absolute numbers are
+  void (Historical).
 - Kernels at parity: `VSFEEL_NNEDI3_TSTAMP=100` (GRAY16, warm frame) gives
   pre 76 / pred 192 / total 268 µs — pred against the pre-port uncontended
   195–200, and the pre-port segment includes keep + indirect fills where the
@@ -118,6 +121,12 @@ qual=2 etype=0 pscrn=4`), interleaved pre-R80/R80 rounds through
 
 ## Historical
 
+- **2026-10-12 — the R80 port's scoreboard is void.** It read 3034 → 2695
+  (CPU cache, −11.2%) and 2156 → 2739 (`--gpu-cache`, +27.0%) fps against the
+  pre-fix benchmark harness (`notes/METHOD.md`), and its reference pairs
+  (2652/2908, 2740/2031) with it. The same-session *deltas* stand — the port
+  lost on the CPU sink and won on the resident chain — and the banner's table
+  replaces the absolute numbers.
 - **2026-10-02 — `field_gt1_matches_reference` was a harness bug.** The
   comparison subprocess built the untrimmed 300-frame source, so `field>1`
   produced 600 frames where the test expects 48; the shared reference script now

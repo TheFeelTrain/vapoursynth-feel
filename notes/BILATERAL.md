@@ -28,17 +28,18 @@ Design (current):
   (mechanism in Performance), and `tools/benchmark.py` now forces it. Every
   −16% figure in this file's history predates that and is void.
 
-Performance — 1080p GRAY16 jpbd, 5000 frames, sigma 3.0/0.02 (R=9), interleaved
-pre-R80/R80 pairs through `tools/benchmark.py`, `--repeat 2`:
+Scoreboard — 1080p GRAY16 jpbd, 5000 frames, sigma 3.0/0.02 (R=9), medians of 3
+through `tools/benchmark.py`:
 
-| input to vsfeel | pre-R80 | R80 port | delta |
+| mode | vsfeel | vszipcl | ratio |
 |---|---|---|---|
-| CPU cache (benchmark default) | 1982.1 | 1980.5 | **−0.1%** |
-| `--gpu-cache` (pre-uploaded GPU clip) | 1975.3 | 1974.0 | **−0.1%** |
+| CPU cache (benchmark default) | 2306.6 | 576.1 | 4.00x |
+| `--gpu-cache` | 2305.6 | 708.0 | 3.26x |
+| `--gpu-cache --no-download` (u16 / fp32) | 2317 / 2296 | 732 / 457 | 3.88x |
 
-- The R80 figure is the same in both rows: the timed unit is a CPU sink, so the
-  upload is free, and with the transfer queue the download is free too.
-- vs `vszipcl` in a separate same-session pair: 2009 vs 1329 fps (**+51%**).
+- The three modes are within 1% of each other: with the transfer queue the plane
+  transfers overlap the kernels, so the filter's own compute is the frame in
+  every mode and the output download is not on the critical path.
 
 ## Implementation
 
@@ -90,28 +91,23 @@ pre-R80/R80 pairs through `tools/benchmark.py`, `--repeat 2`:
   VGPR / 0 spill; pre-R80 3102 / 14708 / 192 / 0. `glslc -O` output is 315 vs 321
   SPIR-V lines. The shader rewrite (three whole-buffer bindings, no push
   constants) did not move the machine code.
-- **The frame is kernel-dominated.** A timestamp probe around the dispatches
-  (BlankClip GRAY16 1080p, `-r 1`, serialized for a clean read): R=3 0.080 ms,
-  R=9 0.507, R=12 0.678, R=24 2.442. At R=9 the 0.507 ms was exactly the pre-R80
-  frame time (1972 fps) and 84% of the pre-opt-in post-port frame (0.606 ms), so
-  the pre-port filter was already at the kernel floor with its host copies fully
-  overlapped. This is also why the pre-opt-in delta tracked the kernel: R=3
-  −9.3%, R=9 −16.4%, R=24 −8.8% (a 2.44 ms kernel hides most of the transfer).
-- Transfer decomposition on a BlankClip GRAY16 1080p graph: an upload+download
-  round trip with no filter is 2414 fps (0.414 ms/frame) at the benchmark's
-  default request depth; adding Bilateral is 1668 fps (0.599 ms). Only ~0.10 of
-  that 0.414 ms was exposed — the rest already overlapped the kernel.
-- The filter is not the limiter: `vspipe --filter-time` on the same graph
-  (3000 frames, `-r 8`) puts Bilateral at **3.97 % / 0.07 s** of summed thread
-  time (23 µs/frame) against `GPUDownload` 735.62 % / 13.24 s and `GPUUpload`
-  32.72 % / 0.59 s.
+- **The frame is kernel-dominated.** A serialized timestamp probe around the
+  dispatches (BlankClip GRAY16 1080p, `-r 1`) gave R=3 0.080 ms, R=9 0.507,
+  R=12 0.678, R=24 2.442. Read that for shape, not absolute: a serialized probe
+  inflates (the current R=9 frame is 0.433 ms, below the 0.507 it reported).
+  The pre-opt-in delta tracked the kernel (R=3 −9.3%, R=9 −16.4%, R=24 −8.8%):
+  a 2.44 ms kernel hides most of the transfer.
+- **The filter, not the transfer, is the frame.** A bare
+  `GPUUpload→GPUDownload` round trip of one 1080p GRAY16 plane measures 264 µs
+  (3786 fps) against Bilateral's 433 µs (2306.6 fps), and the three benchmark
+  modes agree within 1%: the transfers overlap the kernel and the output
+  download is not on the critical path. The earlier reading (a 0.414 ms round
+  trip with "only ~0.10 ms exposed") was measuring the harness's own per-frame
+  cost (`notes/METHOD.md`), not the core's.
 - Host split (`VSFEEL_BILAT_TIMING=1`, 3000 frames): acquire 19.1 / record 5.8 /
-  submit 59.0 µs per frame — the host is nowhere near the wall, which is why the
-  pre-port gap had to be the core's download.
+  submit 59.0 µs per frame — the host is nowhere near the wall.
 - The port wins exactly where a resident chain is involved: fed a GPU clip the
   old filter had to `GPUDownload` it first, the new one reads VRAM in place.
-  Judge throughput there (`--gpu-cache`): the frame is the kernel (84% at R=9),
-  so a CPU-sink number prices the chain, not the filter.
 
 Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter bilateral
 [vsfeel vszipcl] [--gpu-cache] [--bits 32] [--bilateral-args "sigma_spatial=X,
@@ -119,12 +115,16 @@ sigma_color=Y"]`.
 
 ## Historical
 
-### 2026-09-30 — 16-bit SSBOs need the StorageBuffer class
-
-`bilateral_shared_16`/`bilateral_plain_16` carried the same invalid SPIR-V 1.0
-Uniform+BufferBlock 16-bit buffer access as GaussBlur (mechanism and feature
-names in `notes/GAUSSBLUR.md`); both now build with `--target-env=vulkan1.1`.
-Bit-exact vs vszipcl, 32-bit SPIR-V unchanged.
+- **2026-10-12 — the R80 port's scoreboard is void.** It read 1982.1 → 1980.5
+  (CPU cache) and 1975.3 → 1974.0 (`--gpu-cache`) fps, measured against the
+  pre-fix benchmark harness (`notes/METHOD.md`); the same-session result it
+  carried (the port changed nothing, **−0.1%**) stands. The banner's table
+  replaces the absolute numbers.
+- **2026-09-30 — 16-bit SSBOs need the StorageBuffer class.**
+  `bilateral_shared_16`/`bilateral_plain_16` carried the same invalid SPIR-V 1.0
+  Uniform+BufferBlock 16-bit buffer access as GaussBlur (mechanism and feature
+  names in `notes/GAUSSBLUR.md`); both now build with `--target-env=vulkan1.1`.
+  Bit-exact vs vszipcl, 32-bit SPIR-V unchanged.
 
 ### 2026-09-30 — creation-failure leak
 

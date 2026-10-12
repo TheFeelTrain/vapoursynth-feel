@@ -11,33 +11,27 @@ geometry and pipeline. Runs on the **R80 GPU API**: `clip/sclip/mclip:vnode:gpu`
 machinery at all. The parallel vcheck is the default.
 
 Benchmark defaults: 2000 f, real based_aa clip, 2x2160p, field=3, mdis=20,
-vcheck=2. `MANGOHUD=0 uv run tools/benchmark.py --filter eedi3 vsfeel vszipcl`.
+vcheck=2. `MANGOHUD=0 uv run tools/benchmark.py --filter eedi3 --gpu-cache
+--no-download --bits <16|32>`:
 
-| clip | vsfeel | vszipcl | speedup |
+| clip | vsfeel | vszipcl | eedi3vk2 |
 |---|---|---|---|
-| u16 | 472 | 56 | 8.4x |
-| u16 (EEDI3H, same call surface) | 471 | 52 | 9.0x |
-| u16 hp | 198 | 48 | 2.5x |
+| u16 | 621 | 54 | 139 |
+| u16 (EEDI3H, same call surface) | 749 | 51 | - |
+| u16 hp | 237 | 45 | 80 |
+| fp32 | 486 | 54 | 129 |
 
-(The hp row and the fp32/eedi3vk2 arms are the pre-optimization figures; the u16
-rows are `tools/benchmark.py --repeat 3`, 2000 f.)
-
-An order-reversed same-session pair against the pre-optimization build measures
-u16 470.4 → 469.6 fps (+0.0%): the vertical path is transfer bound, so its kernel
-work does not show up here.
-
-The hp row is a 600 f same-session pair of the same workload (`--eedi3-args "hp=1"`);
-there hp costs vsfeel **2.3x** (451 → 198 fps against eedi3vk2's 141 → 80 and
-vszipcl's 62 → 48) because the direction set doubles (TPITCH 41 → 81, K 2 → 3),
-the relax widens to ±2 and the `pbt` column grows 16 → 81 bytes (320 MiB at
-4K).
+The hp row costs vsfeel **2.6x** (621 → 237): the direction set doubles (TPITCH
+41 → 81, K 2 → 3), the relax widens to ±2 and `pbt` grows 16 → 81 bytes.
 
 - **The graded vertical EEDI3 is HOST<->DEVICE TRANSFER bound, not kernel
-  bound.** Ablating every EEDI3 kernel from the recording (`VSFEEL_EEDI3_SKIP`)
-  moves the graded 2x2160p run 2.35 → 2.15 ms/frame (+8.9%); the row kernel alone
-  is +9.1%. A bare `GPUUpload → GPUDownload` of one 4K16 plane measures 1.89 ms,
-  so the per-output-frame transfer bill (~50 MB: sclip every frame, clip+mclip
-  every other, the output download) *is* the frame; the filter owns ~9%.
+  bound.** Ablating every EEDI3 kernel from the recording
+  (`VSFEEL_EEDI3_SKIP=1`, interleaved 6×2-repeat A/B) moves the graded 2x2160p
+  run by **+0.4%** (617.5 → 620.2 fps, `--gpu-cache --no-download`) and +0.5%
+  in the CPU-cache mode (555.7 → 558.6): the kernels are *fully hidden* behind
+  the per-output-frame transfer bill (~50 MB: sclip every frame, clip+mclip
+  every other, the output download), which is the frame. A bare
+  `GPUUpload → GPUDownload` of one 4K16 plane measures 2.82 ms.
 - **Batch size (`VSFEEL_EEDI3_BATCH`, default from a scratch target — 256 MiB,
   512 for EEDI3AA).** The knee is where the submit path stops being amortised by
   the GPU fill, and **it moves with the harness's environment**: with RADV's
@@ -197,6 +191,12 @@ register is the largest addressable item; the three-window redundancy is worth
 
 ## Historical
 
+- **2026-10-12 — the banner's table is re-measured; the old numbers are void.**
+  u16 472/56, EEDI3H 471/52, hp 198/48 and the "470.4 → 469.6 fps (+0.0%)"
+  pre-optimization pair were taken against the pre-fix benchmark harness
+  (`notes/METHOD.md`). The same-session result that pair carried (the
+  optimization changed nothing because the frame is transfer bound) is what the
+  banner's ablation now measures directly.
 - **2026-10-03 — hp (half-pel search), bit-exact against eedi3vk2.** `hp` was
   an accepted no-op (eedi3m registers it that way: "only full pel is
   implemented"); eedi3vk2, vszip and vszipcl implement it, so vsfeel does too.
