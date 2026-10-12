@@ -6,15 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `vsfeel.feel_aa`, a copy of `vsaa.based_aa` that keeps its processing entirely on the GPU
+- `core.vsfeel.Box`, a Vulkan implementation of a box downscale
+
 ### Changed
 
-- GaussBlur is about 9% faster
-- BM3D is about 9% faster on Nvidia drivers, and unchanged on Radeon
-- BM3D is registered under its own name, with `BM3Dv2` kept as an alias for existing scripts
+- GaussBlur is 9-10% faster
+- BM3D is now registered as `core.vsfeel.BM3D` instead of `core.vsfeel.BM3Dv2`
 
 ### Fixed
 
-- BM3D no longer runs about 100x slow on Nvidia GPUs
+- BM3D no longer runs at 1 fps on Nvidia GPUs
 
 ## [1.1.1] - 2026-10-05
 
@@ -47,15 +51,12 @@ All filters now have full feature parity with other implementations and are more
 
 ## [1.0.0] - 2026-10-01
 
-The plugin has moved to the VapourSynth R80 GPU API. The core now owns the device, the queues and the transfers, and frames stay on the GPU from input to output
+The plugin has moved to the VapourSynth R80 GPU API. The core now owns the device, the queues, and the transfers.
 
 ### Added
 
 - macOS and arm64 wheels
 - Capability checks at filter creation, so an unsupported device or argument is reported instead of failing later
-- A shader limits check, which compares every compiled kernel against the workgroup and shared memory sizes the host declares for it
-- Linting and code quality gates for the C++ host code, the GLSL kernels and the Python tooling, plus a CI job for the tests that need no GPU
-- A `uv` development environment with a lockfile
 
 ### Changed
 
@@ -99,10 +100,6 @@ The plugin has moved to the VapourSynth R80 GPU API. The core now owns the devic
 - BM3D now works on GPUs without buffer float atomics, using a compare and swap aggregation path
 
 ## [0.2.0] - 2026-09-20
-
-### Added
-
-- Tests for temporal frame order, cropped geometry, stream counts and resource boundedness. The suite now runs in parallel
 
 ### Changed
 

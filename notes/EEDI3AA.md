@@ -89,6 +89,65 @@ Measured, not assumed — do not re-derive from intuition.
   all come from vsaa, so they cannot drift); the fused arm calls
   `core.vsfeel.EEDI3AA` directly.
 
+### `feel_aa` — the whole chain resident (`vsfeel/vsaa.py`)
+
+`feel_aa(clip, ...)` is `vsaa.based_aa` with the chain on the device: the input is
+uploaded once and the mask, EEDI3AA, downscale and postfilter all run on it, so
+nothing 4K crosses the bus.
+
+Its defaults follow `based_aa` (`ArtCNN` supersamples; the downscale keeps
+`based_aa`'s rule, `Box` at an exact integer ratio and `Catrom` otherwise) with
+the antialiaser and postfilter pinned to vsfeel's own. The **measurement** below
+is the `NNEDI3` supersampler, which is the configuration to quote: `ArtCNN` is a
+learned model whose cost is its own, so it is not a config this repository grades.
+
+At `rfactor=2, supersampler=vsfeel.NNEDI3(), use_mclip=True` the reference graph
+inserts 7 transfers and runs 126.2/123.7 fps (1080p jpbd YUV420P16, 600 f,
+downloaded output, two same-session pairs of interleaved medians-of-3);
+`feel_aa` inserts none and runs 143.0/139.4, **+13.3% and +12.7%**.
+
+**A scaler with no device path is allowed, not refused, and costs about 3%.** The
+fallback is measured with Lanczos forced through the host rather than ArtCNN
+(identical graph, only the residency differs): 149.69 -> 145.20 fps at 1200 f,
+medians of 3, 1080p jpbd YUV420P16 downloaded output.
+
+The host frame is read by EEDI3AA's `clip` and `sclip` and again by the pscale
+blend, so the core was inserting four transfers -- the scaler's own 1080p
+download plus three 4K uploads. `_ensure_resident` uploads it once instead,
+taking the auto-inserted count to one. That is the right structure, but on this
+box it is **not** where the 3% is: the same pair measured 149.27/144.79 before
+the change, so collapsing the redundant copies moved it ~0.3%, inside noise. The
+cost is the scaler's own round trip and its host-side work, which on an
+EEDI3AA-bound chain (~5.7 of 6.7 ms) and a ReBAR box mostly overlaps. The floor
+is still the transfer time, ~1.4 ms/frame, so it grows with the supersample and
+would be exposed on a lighter chain or a device without a ReBAR heap.
+
+Four library steps had to be replaced, each a wrapper around a CPU-only plugin:
+
+- `core.std.Prewitt`/`Sobel` instead of vsmasktools' routing, which sends every
+  integer clip to the `edgemasks` plugin (see Performance: that operator is the
+  incorrect one at the border);
+- `core.std.BoxBlur` instead of vszip's (`box_blur`), identical on float and
+  1 LSB apart on integers;
+- `core.std.Expr` for `pscale_blend` and `MeanMode.MEDIAN`, whose vsexprtools
+  path goes through the CPU-only `akarin` plugin;
+- the scalers themselves. vskernels' `scale` cannot be used on a resident clip
+  at all -- vstools' function proxy downloads the frame before every call it
+  wraps, even for `Point` -- so the kernel name and parameters go to
+  `core.resize` directly, and `vsfeel.NNEDI3` overrides its closing
+  `ComplexScaler` with a resident one.
+
+`Box` is `resize2.Custom` (CPU-only), so the chain calls `core.vsfeel.Box`
+instead; see `notes/BOX.md` for what it reproduces and how closely.
+
+`ArtCNN()` needs `platformdirs` for its ONNX model cache, so the `jetpack` and
+`dev` dependencies pull `vsjetpack[scale]`, the smallest extra that has it.
+`[full]` adds a dozen plugins the suite never touches, among them
+`vapoursynth-bm3dcpu`, which is built against API 3 and prints a deprecation on
+every VapourSynth process. `amd` is unusable: `mlrt-migx` registers an LLVM
+analysis a second time and aborts the process at plugin autoload, before any
+filter runs.
+
 ### Tests
 
 `tests/test_eedi3aa.py` — **133 tests**: u16 exact oracle over field 2/3, mdis
@@ -135,6 +194,21 @@ changes the graded run by −0.4% (176.1 → 175.5 fps, interleaved 6×2-repeat 
 frame (`notes/EEDI3.md`). The kernel itself is attributed in `notes/EEDI3.md`'s
 Performance section; the short version is that it is ALU-issue bound at ~1 IPC,
 not load bound.
+
+**Where `feel_aa` still differs from `based_aa`**, measured on 1080p against the
+reference chain:
+
+- 16-bit integer: only the mask. `vsaa` builds it through `edgemasks`, whose
+  Prewitt is wrong on the 1-pixel border ring (up to 41228, quantised to 8-bit
+  steps) where `core.std.Prewitt` matches the reference formula exactly; the
+  rest of the chain is bit-exact.
+- 32-bit float: the same operators on different devices. The core's CPU and GPU
+  paths round differently (`std.Prewitt` by ~5e-7 on this clip), and where that
+  straddles the mask's binarize threshold a few pixels move by up to ~1.5e-2 —
+  `mask=False` drops the bound to 1e-5, which is how the flip was isolated.
+- a `Point` supersample at a fractional `rfactor` cannot match: the core's GPU
+  Point resize samples a fractional ratio with a different phase than its CPU
+  path (0.78 apart on a bare 1.5x upscale). Integer ratios are unaffected.
 
 ## Historical
 
