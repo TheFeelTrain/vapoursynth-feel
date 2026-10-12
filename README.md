@@ -62,7 +62,7 @@ core.vsfeel.BM3D(clip clip[,
 
 ### Box
 
-The [box filter](https://en.wikipedia.org/wiki/Box_blur) averages the source pixels around each output pixel with equal weight. Downscaling with it gives a clean, smooth result, without the ringing or added sharpness a cubic kernel can introduce.
+[Box sampling](https://en.wikipedia.org/wiki/Image_scaling#Box_sampling) treats each output pixel as a box over the source image and averages the source pixels inside it with equal weight, so every input pixel contributes. Downscaling with it gives a clean, smooth result, without the ringing or added sharpness a cubic kernel can introduce.
 
 ```python
 core.vsfeel.Box(clip clip[,
@@ -109,7 +109,7 @@ core.vsfeel.DFTTest(clip clip[,
 
 ### EEDI3
 
-EEDI3 is an edge-directed interpolator for deinterlacing and upscaling. For each missing pixel it searches candidate connection angles between the neighboring lines, picks the one minimizing a cost functional over local neighborhoods, and interpolates along that direction so edges stay sharp instead of stair-stepping.
+EEDI3 is an [edge-directed interpolator](https://en.wikipedia.org/wiki/Image_scaling#Edge-directed_interpolation) for deinterlacing, upscaling, and antialiasing. For each missing pixel it searches candidate connection angles between the neighboring lines, picks the one minimizing a cost functional over local neighborhoods, and interpolates along that direction so edges stay sharp instead of stair-stepping.
 
 ```python
 core.vsfeel.EEDI3(clip clip, int field[,   # and EEDI3H, same args, horizontal
@@ -171,7 +171,7 @@ zero; the kernel then falls back to the centre sample rather than evaluating
 
 ### NNEDI3
 
-NNEDI3 is a neural-network edge-directed interpolator for deinterlacing and upscaling. A small neural network predicts each missing pixel from its local neighborhood, while a prescreener network skips pixels that simple cubic interpolation already handles.
+NNEDI3 is a neural-network [edge-directed interpolator](https://en.wikipedia.org/wiki/Image_scaling#Edge-directed_interpolation) for deinterlacing and upscaling. A small neural network predicts each missing pixel from its local neighborhood, while a prescreener network skips pixels that simple cubic interpolation already handles.
 
 ```python
 core.vsfeel.NNEDI3(clip clip, int field[,
