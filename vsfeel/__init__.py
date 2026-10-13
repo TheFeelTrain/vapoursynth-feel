@@ -31,11 +31,11 @@ is the same idea for the supersampler, running ``core.vsfeel.NNEDI3``:
 
 from .backend import Backend, FeelBackend
 
-__all__ = ["Backend", "FeelBackend", "EEDI3", "NNEDI3"]
+__all__ = ["Backend", "FeelBackend", "EEDI3", "NNEDI3", "feel_aa"]
 
 
 def __getattr__(name: str):  # pragma: no cover - thin lazy re-export
-    if name in ("EEDI3", "NNEDI3"):
+    if name in ("EEDI3", "NNEDI3", "feel_aa"):
         from . import vsaa
 
         return getattr(vsaa, name)

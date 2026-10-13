@@ -145,7 +145,7 @@ def test_eedi3aa_subclass_is_a_vsaa_eedi3():
     assert vsfeel.EEDI3().backend is vsfeel.Backend
     assert vsfeel.EEDI3(backend=EEDI3.Backend.CPU).backend is EEDI3.Backend.CPU
     # `import vsfeel` must not require vsaa: the subclass is built on access.
-    assert vsfeel.__all__ == ["Backend", "FeelBackend", "EEDI3", "NNEDI3"]
+    assert vsfeel.__all__ == ["Backend", "FeelBackend", "EEDI3", "NNEDI3", "feel_aa"]
 
 
 def test_nnedi3_subclass_is_a_vsaa_nnedi3():
