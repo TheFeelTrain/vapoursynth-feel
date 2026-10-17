@@ -84,6 +84,9 @@ struct GaussData {
     const VSVideoInfo * vi {};
 
     int bits {}, elem_bytes {};
+    // half input: the plane elements are 2 bytes (the two-pass scratch stays
+    // f32, as the references' internal buffer is)
+    int half {};
     bool process[3] { true, true, true };
 
     std::shared_ptr<GPUDevice> gpu;
@@ -583,17 +586,19 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
 
     const auto & fmt = d->vi->format;
     const int bits = fmt.bitsPerSample;
-    const bool depth_ok = (fmt.sampleType == stFloat && bits == 32) ||
-                          (fmt.sampleType == stInteger && bits == 16);
+    const bool depth_ok =
+        (fmt.sampleType == stFloat && (bits == 32 || bits == 16)) ||
+        (fmt.sampleType == stInteger && bits == 16);
     if (!vsh::isConstantVideoFormat(d->vi) || !depth_ok || d->vi->width <= 0 ||
         d->vi->height <= 0 ||
         (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV &&
          fmt.colorFamily != cfRGB)) {
         return set_error(
-            "input bitdepth must be u16 (16-bit integer) or f32 (32-bit float), Gray/YUV/RGB.");
+            "input bitdepth must be u16 (16-bit integer), f16 or f32 (16/32-bit float), Gray/YUV/RGB.");
     }
 
     d->bits = bits;
+    d->half = fmt.sampleType == stFloat && bits == 16;
     d->elem_bytes = bits / 8;
 
     // device_id and num_streams are registered but never read: the core owns
@@ -813,12 +818,21 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
     size_t horiz_size = 0;
     switch (d->bits) {
     case 16:
-        gauss_code = gaussblur_u16_gauss_spv;
-        gauss_size = gaussblur_u16_gauss_spv_size;
-        vert_code = gaussblur_u16_vert_spv;
-        vert_size = gaussblur_u16_vert_spv_size;
-        horiz_code = gaussblur_u16_horiz_spv;
-        horiz_size = gaussblur_u16_horiz_spv_size;
+        if (d->half) {
+            gauss_code = gaussblur_f16_gauss_spv;
+            gauss_size = gaussblur_f16_gauss_spv_size;
+            vert_code = gaussblur_f16_vert_spv;
+            vert_size = gaussblur_f16_vert_spv_size;
+            horiz_code = gaussblur_f16_horiz_spv;
+            horiz_size = gaussblur_f16_horiz_spv_size;
+        } else {
+            gauss_code = gaussblur_u16_gauss_spv;
+            gauss_size = gaussblur_u16_gauss_spv_size;
+            vert_code = gaussblur_u16_vert_spv;
+            vert_size = gaussblur_u16_vert_spv_size;
+            horiz_code = gaussblur_u16_horiz_spv;
+            horiz_size = gaussblur_u16_horiz_spv_size;
+        }
         break;
     default:
         gauss_code = gaussblur_f32_gauss_spv;

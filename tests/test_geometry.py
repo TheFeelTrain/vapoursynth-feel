@@ -10,7 +10,8 @@ grouping did not divide the width.
 The tests crop a 640-wide Gray clip to 630/638 px (the yuv420 variants also
 give half-width chroma rows) and compare the affected filters against the
 matching reference (vszipcl, eedi3vk2, nnedi3vk).  They also cover a
-top/bottom crop.  EEDI3H and
+top/bottom crop.  The half-float GaussBlur case adds the second 2-byte sample
+type to the odd-pitch geometry.  EEDI3H and
 EEDI3AA have no exact external reference, so their oracle is the same plugin's
 composition (Transpose -> EEDI3 -> Transpose, and Merge(EEDI3H(Merge(EEDI3)))).
 
@@ -36,6 +37,7 @@ CROP_FROM = 640
 #   dfttest    f32 630/638 yuv420: 5.96e-8 -> ulp-level, 1e-6
 #   dfttest    u16 630/638 (both): 0 codes -> bit-exact, <= 1 LSB bound
 #   gaussblur  f32/u16 630/638:    0.0      -> bit-exact
+#   gaussblur  f16 630/638 (gray and yuv420): 0.0 -> bit-exact
 #   bilateral  f32 630/638 gray:   4.7e-9..5.6e-9 (with and without guide)
 #   bilateral  f32 630/638 yuv420: 2.38e-7  -> 1e-6
 #   bilateral  u16 630/638 (both): 1 code   -> <= 1 LSB
@@ -72,6 +74,7 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     bottom = spec.get("bottom", 0)
     guide_on = spec.get("guide", 0)
     color = spec.get("color", "gray")
+    half = spec.get("half", 0)
     params = spec.get("params", {{}})
     frames = spec.get("frames", [0, 1, 2])
     filter_ = spec["filter"]
@@ -91,12 +94,16 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
         # subsampled chroma: the chroma planes are half width, so their rows
         # are a different (and typically less aligned) length than luma's
         main = core.fmtc.bitdepth(src, bits=bits, fulls=True, fulld=True)
+        if half:
+            main = core.resize.Point(main, format=vs.YUV420PH)
     else:
         gray = core.std.ShufflePlanes(src, 0, vs.GRAY)
         main = core.fmtc.bitdepth(gray, bits=bits, fulls=True, fulld=True)
+        if half:
+            main = core.resize.Point(main, format=vs.GRAYH)
     main = core.std.Crop(main, right=({CROP_FROM} - width),
                          top=top, bottom=bottom)
-    dtype = np.float32 if bits == 32 else np.uint16
+    dtype = np.float16 if half else (np.float32 if bits == 32 else np.uint16)
     planes = list(range(main.format.num_planes))
 
     # Guide/reference clip from a different chain (distinct frame allocations).
@@ -232,19 +239,20 @@ _CROP_BOTTOM = 3
 CASES = []
 
 
-def _add(filter_, bits, width, guide, params, tol, color="gray", top=0, bottom=0):
+def _add(filter_, bits, width, guide, params, tol, color="gray", top=0, bottom=0, half=0):
     spec = {
         "filter": filter_,
         "bits": bits,
         "width": width,
         "guide": guide,
         "color": color,
+        "half": half,
         "params": params,
         "frames": FRAMES,
         "top": top,
         "bottom": bottom,
     }
-    cid = "%s-%s-w%d" % (filter_, "f32" if bits == 32 else "u16", width)
+    cid = "%s-%s-w%d" % (filter_, "f16" if half else ("f32" if bits == 32 else "u16"), width)
     if guide:
         cid += "-guide"
     if color == "yuv420":
@@ -259,6 +267,9 @@ for _w in WIDTHS:
     _add("dfttest", 16, _w, 0, _DFTTEST_PARAMS, TOL_U16_LSB)
     _add("gaussblur", 32, _w, 0, _GAUSS_PARAMS, 0.0)
     _add("gaussblur", 16, _w, 0, _GAUSS_PARAMS, 0.0)
+    # The half path adds a second 2-byte element type: 630 half samples are
+    # 1260 bytes per row, so a cropped half plane has its own pitch alignment.
+    _add("gaussblur", 16, _w, 0, _GAUSS_PARAMS, 0.0, half=1)
     _add("bilateral", 32, _w, 0, _BILATERAL_PARAMS, TOL_F32_ULP)
     _add("bilateral", 32, _w, 1, _BILATERAL_PARAMS, TOL_F32_ULP)
     _add("bilateral", 16, _w, 0, _BILATERAL_PARAMS, TOL_U16_LSB)
@@ -291,6 +302,7 @@ for _w in WIDTHS:
     _add("dfttest", 16, _w, 0, _DFTTEST_PARAMS, TOL_U16_LSB, "yuv420")
     _add("gaussblur", 32, _w, 0, _GAUSS_PARAMS, 0.0, "yuv420")
     _add("gaussblur", 16, _w, 0, _GAUSS_PARAMS, 0.0, "yuv420")
+    _add("gaussblur", 16, _w, 0, _GAUSS_PARAMS, 0.0, "yuv420", half=1)
     _add("bilateral", 32, _w, 0, _BILATERAL_PARAMS, TOL_F32_ULP, "yuv420")
     _add("bilateral", 16, _w, 0, _BILATERAL_PARAMS, TOL_U16_LSB, "yuv420")
     # BM3D denoises every plane, so the half-width chroma rows are part of the
@@ -301,6 +313,7 @@ for _w in WIDTHS:
 # staging / pad-origin path that the right-only crop leaves at row 0.
 _add("dfttest", 32, 630, 0, _DFTTEST_PARAMS, TOL_F32_ULP, top=_CROP_TOP, bottom=_CROP_BOTTOM)
 _add("bilateral", 32, 630, 0, _BILATERAL_PARAMS, TOL_F32_ULP, top=_CROP_TOP, bottom=_CROP_BOTTOM)
+_add("gaussblur", 16, 630, 0, _GAUSS_PARAMS, 0.0, half=1, top=_CROP_TOP, bottom=_CROP_BOTTOM)
 _add("nnedi3", 16, 630, 0, _NNEDI3_PARAMS, TOL_U16_LSB, top=_CROP_TOP, bottom=_CROP_BOTTOM)
 _add("eedi3", 16, 630, 0, _EEDI3_PARAMS, TOL_EEDI3_U16, top=_CROP_TOP, bottom=_CROP_BOTTOM)
 _add("eedi3h", 16, 630, 0, _EEDI3H_PARAMS, TOL_ORACLE_EXACT, top=_CROP_TOP, bottom=_CROP_BOTTOM)

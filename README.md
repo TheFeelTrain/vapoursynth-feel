@@ -24,7 +24,7 @@ pip install vapoursynth-feel
 
 <sub>Output of `tools/benchmark.py --gpu-cache --no-download --filter <filter> --format <u16|f16|f32>` on an RX 7900 XTX with 1080p input.</sub> 
 
-Note that filters that do not use the VapourSynth's GPU API include frame transfer time in their measurements.
+Filters that do not use VapourSynth's GPU API include frame transfer time in their measurements.
 
 vulkan column: bm3dvk, eedi3vk2, knlmvk, nnedi3vk
 

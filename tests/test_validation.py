@@ -31,6 +31,8 @@ FILTERS = [
     "Bilateral_u16",
     "GaussBlur",
     "GaussBlurLarge",
+    "GaussBlur_f16",
+    "GaussBlurLarge_f16",
     "DFTTest",
     "NLMeans",
     "BM3D",
@@ -57,6 +59,7 @@ _SCRIPT = textwrap.dedent(f"""\
                              bits=32, fulls=True, fulld=True)
     g16 = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                              bits=16, fulls=True, fulld=True)
+    gh = core.resize.Point(gs, format=vs.GRAYH)
 
     if name == "Bilateral":
         node = core.vsfeel.Bilateral(gs, sigma_spatial=3.0, sigma_color=0.05)
@@ -73,6 +76,16 @@ _SCRIPT = textwrap.dedent(f"""\
         # set, the barrier, and the u16 packed store through the aliased
         # binding 4 that only ENTRY_HORIZ && IO_U16 declares.
         node = core.vsfeel.GaussBlur(g16, sigma=20.0)
+    elif name == "GaussBlur_f16":
+        # The half variants stage float16_t SSBO elements, the same
+        # StorageBuffer-class codegen the u16 case above covers, and the store
+        # narrowing is an OpFConvert that must not declare a Float16 capability
+        # the logical device has not enabled. The fused path.
+        node = core.vsfeel.GaussBlur(gh, sigma=2.0)
+    elif name == "GaussBlurLarge_f16":
+        # The same half storage on the two-pass path (a separate buffer view of
+        # the f32 scratch, and one store per output sample).
+        node = core.vsfeel.GaussBlur(gh, sigma=20.0)
     elif name == "DFTTest":
         node = core.vsfeel.DFTTest(gs, tbsize=3)
     elif name == "NLMeans":

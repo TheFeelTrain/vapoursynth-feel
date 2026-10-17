@@ -181,7 +181,9 @@ endif()
 # The io variants every kernel is built for. Each name is the storage type the
 # kernel stages through (u16 = 16-bit integer, f32 = 32-bit float) and becomes
 # the -DIO_<NAME> the shader selects its IO_TYPE on, so an f16 variant is one
-# more entry here plus its shader branch.
+# more entry plus its shader branch. A filter that grows one adds it to a local
+# list (VK_GAUSS_IO_TYPES) rather than here, because every other filter's
+# kernels would silently build the u16 branch under an -DIO_F16 name.
 set(VK_IO_TYPES "u16" "f32")
 
 # Bilateral: one entry point per file, per io variant.
@@ -224,7 +226,7 @@ set(VK_BM3D_VARIANTS
     "bm3d_copy_u16|bm3d_copy.comp|")
 
 # GaussBlur: one kernel with three entry points (fused small path + the two
-# large-path passes), per io variant (u16, f32). Each pass carries its
+# large-path passes), per io variant (u16, f16, f32). Each pass carries its
 # own workgroup shape and outputs per thread, so those are per-entry defines
 # here rather than one set for all three; the numbers behind them are in
 # notes/GAUSSBLUR.md, and tools/shader_limits.py --check compares the compiled
@@ -234,8 +236,12 @@ set(VK_GAUSS_ENTRY_DEFS
     "-DENTRY_GAUSS -DBLK_X=16 -DBLK_Y=8 -DR=8"
     "-DENTRY_VERT -DBLK_X=32 -DBLK_Y=4 -DR=16"
     "-DENTRY_HORIZ -DBLK_X=16 -DBLK_Y=8 -DR=8")
+# GaussBlur is the first filter with an f16 kernel, so its io list is local: a
+# half clip is staged as its real sample type, i.e. half the bytes per load and
+# store. The other filters keep VK_IO_TYPES until they grow an f16 branch.
+set(VK_GAUSS_IO_TYPES "u16" "f16" "f32")
 set(VK_GAUSS_VARIANTS)
-foreach(io IN LISTS VK_IO_TYPES)
+foreach(io IN LISTS VK_GAUSS_IO_TYPES)
     string(TOUPPER "${io}" io_define)
     foreach(entry_i RANGE 0 2)
         list(GET VK_GAUSS_ENTRIES ${entry_i} entry)

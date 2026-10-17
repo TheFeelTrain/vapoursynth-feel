@@ -8,6 +8,10 @@ Design (current):
   (`std.GPUUpload`/`GPUDownload`); the filter owns its pipelines, one constant
   weights buffer and one exec pool — no staging, per-stream resources, fences,
   queues or queue cap.
+- Three io variants — u16, f16, f32 — selected by the input format (half is
+  `stFloat` + 16 bits). Half is a storage width, not a precision: the f16 path
+  runs the f32 arithmetic, is bit-exact with vszipcl's f16 output and sits
+  within one half ulp of the f32 one.
 - Two code paths, three kernels: fused small (radius ≤ 32) and two-pass
   vertical/horizontal (larger). Each pass carries its own workgroup shape and
   outputs per thread, because the two want opposite ones: the vertical pass is
@@ -35,13 +39,26 @@ Scoreboard — jpbd 1080p GRAY16, sigma=16 (95 taps, two-pass), 5000 frames,
 | `--gpu-cache` (resident GPU input) | 3986.7 | 1614.7 | 2.47x |
 | `--gpu-cache --no-download` (compute only) | 9877.9 | 1589.8 | 6.21x |
 
-- The first two rows carry transfers: row 1 uploads the CPU cache per frame and
-  downloads the output, row 2 removes the input upload and still downloads; the
-  filter runs at 101 µs/frame in all three. Repeat sessions land within ~2–4%.
+The first two rows carry transfers: row 1 uploads the CPU cache per frame and
+downloads the output, row 2 removes the input upload and still downloads; the
+filter runs at 101 µs/frame in all three. Repeat sessions land within ~2–4%.
+
+Half input against its f32 twin (`--format f16` vs `--format f32`), same clip,
+sigma, frames and repeats (3-repeat medians, one session):
+
+| mode | vsfeel f16 | vsfeel f32 | vszipcl f16 | ratio |
+|---|---|---|---|---|
+| CPU cache (benchmark default) | 2979.5 | 1507 | 1568.2 | 1.90x |
+| `--gpu-cache` (resident GPU input) | 3866.2 | 1926 | 1621.3 | 2.39x |
+| `--gpu-cache --no-download` (compute only) | 10079.1 | 9472 | 1602.1 | 6.29x |
+
+- The f16 chain rows are ~2x their f32 twins because those modes move the
+  frames; compute-only the gap is +6%, since the kernels are load-issue bound
+  (mechanism under Performance).
 - vszipcu is not installed in this checkout, so vszipcl is the reference here.
 - Bench: `MANGOHUD=0 uv run tools/benchmark.py --filter gaussblur
-  [--gaussblur-args "sigma=X"] [--gpu-cache] [--no-download] [--scale N] vsfeel
-  vszipcl`.
+  [--gaussblur-args "sigma=X"] [--format u16|f16|f32] [--gpu-cache]
+  [--no-download] [--scale N] vsfeel vszipcl`.
 
 ## Implementation
 
@@ -74,8 +91,11 @@ Scoreboard — jpbd 1080p GRAY16, sigma=16 (95 taps, two-pass), 5000 frames,
   shared memory.
 - int32 guards on the plane's last element and the scratch end (same 32-bit
   addressing bound as Bilateral).
-- 6 SPIR-V variants (gauss/vert/horiz × 2 depths), selected by bit depth; the
-  entry point selects the path.
+- 9 SPIR-V variants (gauss/vert/horiz × u16/f16/f32), selected by the input
+  format. The half variants declare `float16_t` storage, which needs only
+  `storageBuffer16BitAccess` (the core's baseline): the widening/narrowing is an
+  `OpFConvert`, so no `shaderFloat16` query and no arithmetic capability. `tmp`
+  and the weights stay f32 at every depth.
 - What the port deleted: `GaussBlurResource`/`FramePool`, per-stream staging +
   VRAM src/dst buffers, the pre-recorded command buffer and its H2D/D2H
   copies, descriptor pool/sets, per-stream command pools/fences/queues,
@@ -88,6 +108,9 @@ Scoreboard — jpbd 1080p GRAY16, sigma=16 (95 taps, two-pass), 5000 frames,
 - **vszipcu:** device-local `d_src`/`d_dst` + float `d_tmp`; per plane async
   `memcpyHtoD` (copy stream) → kernels → async `memcpyDtoH`, then sync both.
 - **vszipcl:** same shape with OpenCL pinned staging + `clFinish` per frame.
+  Its f16 io is `vload_half`/`vstore_half_rte` around the same f32 math (its
+  `tests/test_f16_parity.py` grades that at ~2 half ulps of its f32 path);
+  vsfeel's half variant takes the same split and is bit-exact against it.
 - `rocprofv3` profile of vszipcu (BlankClip gray16 1080p, sigma=16, ns=1, 200
   frames): vertical 118 µs, horizontal 177 µs, H2D 153 µs, D2H 152 µs.
 
@@ -99,6 +122,17 @@ Scoreboard — jpbd 1080p GRAY16, sigma=16 (95 taps, two-pass), 5000 frames,
   load touches two cache lines half-used, and the horizontal pass re-reads an
   8.3 MB float intermediate. That is what the shape and width changes below
   attack, and why a 2x cut in FMA would buy nothing.
+- **Half storage pays only where a lane issues a half-width load.** 1080p
+  sigma=16, trace probe: the vertical pass drops 67.5 → 57.9 µs, because its
+  strided row loads return 2 bytes per lane instead of 4 for the same 32
+  lines; the horizontal pass is unchanged at 48.7 µs and the fused path is a
+  tie at sigma=2 (18.6k fps), since their loads and stores already fill a
+  sector. Compute-only benchmark, real clip, 5000 frames: f32 9472 → f16 10079
+  fps. Staging `tmp` in half follows the same rule and lost 25% end to end
+  (compute-only: 10079 → 7577 fps, below even the f32 path): a scalar half load
+  still costs a load slot and 2 bytes of a sector, and every access adds an
+  `OpFConvert` (horizontal pass 48.8 → 67.6 µs in the probe). With the f32
+  scratch the path is also bit-exact, so the extra ulp buys nothing.
 - **Per-pass block shape and outputs per thread**, worth +9.4% to +9.7% across
   three same-session A/Bs (shipped build 8949.8 → 9808.0 fps; 1080p sigma=16,
   5000 frames, `--gpu-cache --no-download`, 6 interleaved 2-repeat runs per arm,
@@ -195,10 +229,18 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
 
 ## Open work
 
+- **A packed dword load is the remaining f16 compute win.** A half load returns
+  2 bytes per lane for a full load slot, so two halves per instruction would
+  halve both the issue count and the L1 traffic. The horizontal pass' rolling
+  window reads consecutive elements and packs cleanly once the window start's
+  parity is known (start = `tmp_base + y*STRIDE + x0 - RAD`, and `RAD` is a spec
+  constant, so an odd start needs one scalar tap first). The vertical pass would
+  need two output columns per thread and an even `STRIDE`.
 - **Sweep the shipped shapes across sigma ∈ {4, 40, 80}** — the block and width
   choice was swept at radius 47 only. The fused path (radius ≤ 32) carries
   `VRT`/`BLK` that have never been swept at all, and the two-pass shapes might
-  have a different winner at radius 120/240.
+  have a different winner at radius 120/240. The f16 variants inherit those
+  shapes unexamined.
 - The two-pass path still re-reads its 8.3 MB float intermediate ~13x. Staging
   the horizontal pass' taps in shared memory is the untried structural cut
   (radius-sized tiles, so it needs a bounded variant plus a fallback); the
@@ -208,6 +250,8 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
 
 ### Do not retry
 
+- **A half `tmp`** (25% slower end to end, mechanism under Performance) — the
+  f32 scratch is both faster and bit-exact.
 - `VSFEEL_GAUSS_GPU_BENCH` (it idled the device from a frame callback without
   the other streams' queue locks) was deleted — do not resurrect it.
 - Do not re-introduce a host transfer path to win the CPU-sink row — that

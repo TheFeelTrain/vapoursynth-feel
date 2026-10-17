@@ -24,10 +24,18 @@
  * Buffers: src/dst are the core's own GPU frame planes (vnode: in/out),
  * `tmp` is a transient per-frame scratch buffer for the two-pass path, `wt`
  * is the constant weights buffer. Compile-time variants:
- * -DIO_U16 / -DIO_F32. The u16 path uses native uint16_t SSBO elements (the
- * device enables storageBuffer16BitAccess), so loads and stores are plain
- * coalesced element accesses — no shift/mask unpacking, no dword packing,
- * no atomics.
+ * -DIO_U16 / -DIO_F16 / -DIO_F32. The u16 and f16 paths use native uint16_t /
+ * float16_t SSBO elements (the device enables storageBuffer16BitAccess), so
+ * loads and stores are plain coalesced element accesses — no shift/mask
+ * unpacking, no dword packing, no atomics; a half element widens and narrows
+ * with an OpFConvert, which needs no shaderFloat16 feature.
+ *
+ * Accumulation is f32 in every variant and `tmp` stays f32 (as the references'
+ * internal buffer is): a half element is a storage width, not a precision, so
+ * the half path is bit-identical to the f32 one, and to vszipcl's half path,
+ * apart from the single rounding its stores do. The half scratch that would
+ * halve the large path's intermediate traffic was measured slower than the f32
+ * one (mechanism in notes/GAUSSBLUR.md), so it is not worth the extra ulp.
  */
 
 #if !defined(IO_U16) && !defined(IO_F32) && !defined(IO_F16)
@@ -37,6 +45,9 @@
 #if defined(IO_U16)
 #define IO_TYPE uint16_t
 #define PEAK    65535.0f
+#elif defined(IO_F16)
+#define IO_TYPE float16_t
+#define PEAK    1.0f
 #else
 #define IO_TYPE float
 #define PEAK    1.0f
@@ -83,6 +94,8 @@ layout(push_constant) uniform PushConstants {
 float load_value(int idx) {
 #if defined(IO_F32)
     return src[pc.src_base + idx];
+#elif defined(IO_F16)
+    return float(src[pc.src_base + idx]);   // half -> float is exact
 #else
     // direct uint16_t->float conversion chokes glslc; int() widens cleanly
     return float(int(src[pc.src_base + idx]));
@@ -93,6 +106,8 @@ float load_value(int idx) {
 float load_value_raw(int idx) {
 #if defined(IO_F32)
     return src[idx];
+#elif defined(IO_F16)
+    return float(src[idx]);
 #else
     return float(int(src[idx]));
 #endif
@@ -101,6 +116,10 @@ float load_value_raw(int idx) {
 void store_value(int idx, float v) {
 #if defined(IO_F32)
     dst[pc.dst_base + idx] = v;
+#elif defined(IO_F16)
+    // OpFConvert narrows with the SPIR-V default round-to-nearest-even and no
+    // saturation, i.e. the reference's vstore_half_rte
+    dst[pc.dst_base + idx] = float16_t(v);
 #else
     // glslc -O chokes on a direct float->uint16_t convert (OpUConvert); go
     // through uint with an explicit mask (same workaround as nlmeans/dfttest)
@@ -126,11 +145,11 @@ void store_row_packed(int row, int x0, float vals[R]) {
     }
 }
 #elif defined(ENTRY_HORIZ)
-// float path: no packing needed, plain stores
+// f32/f16 path: no packing needed, plain element stores
 void store_row_packed(int row, int x0, float vals[R]) {
     #pragma unroll
     for (int j = 0; j < R; ++j) {
-        dst[pc.dst_base + row + x0 + j] = vals[j];
+        store_value(row + x0 + j, vals[j]);
     }
 }
 #endif

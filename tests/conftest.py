@@ -56,8 +56,14 @@ def _plane_size(frame, plane):
 
 
 def format_dtype(fmt):
-    """Numpy dtype for one sample of a VapourSynth format."""
-    return np.float32 if fmt.sample_type == vs.FLOAT else np.uint16
+    """Numpy dtype for one sample of a VapourSynth format.
+
+    A float format is half when its bit depth is 16 (GRAYH/YUV420PH/RGBH), so
+    reading a half plane as float32 would reinterpret its 2-byte samples.
+    """
+    if fmt.sample_type == vs.FLOAT:
+        return np.float16 if fmt.bits_per_sample == 16 else np.float32
+    return np.uint16
 
 
 def dtype_for_bits(bits):
@@ -466,10 +472,21 @@ def build_clip(spec):
         clip = core.fmtc.bitdepth(gray(), bits=16, fulls=True, fulld=True)
     elif kind == "grays":
         clip = core.fmtc.bitdepth(gray(), bits=32, fulls=True, fulld=True)
+    elif kind == "grayh":
+        # a half clip built from the one the f32 tests use, so the two rows of a
+        # comparison carry the same content
+        clip = core.fmtc.bitdepth(gray(), bits=32, fulls=True, fulld=True)
+        clip = core.resize.Point(clip, format=vs.GRAYH)
     elif kind == "yuv420p16_fmtc":
         clip = core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
     elif kind == "yuv420ps":
         clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
+    elif kind == "yuv420ph":
+        clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
+        clip = core.resize.Point(clip, format=vs.YUV420PH)
+    elif kind == "yuv444ph":
+        clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
+        clip = core.resize.Point(clip, format=vs.YUV444PH)
     elif kind == "yuv420p16":
         clip = core.resize.Bicubic(src, format=vs.YUV420P16)
     elif kind == "yuv444p16":
@@ -506,7 +523,10 @@ spec = json.loads(sys.argv[1])
 clip = build_clip(spec)
 guide = build_guide(clip, spec.get("guide"))
 frames = spec.get("frames", [0, 11, 23])
-dt = np.float32 if clip.format.sample_type == vs.FLOAT else np.uint16
+if clip.format.sample_type == vs.FLOAT:
+    dt = np.float16 if clip.format.bits_per_sample == 16 else np.float32
+else:
+    dt = np.uint16
 planes = spec.get("planes") or list(range(clip.format.num_planes))
 kwargs = dict(spec.get("kwargs") or {})
 if guide is not None:
@@ -884,6 +904,19 @@ def clip_gray16():
     return vs.core.fmtc.bitdepth(y, bits=16, fulls=True, fulld=True)
 
 
+@pytest.fixture(scope="session")
+def clip_grayh(clip_gray16):
+    """GRAYH (half) clip carrying the GRAY16 fixture's content.
+
+    Built by widening the u16 fixture to f32 and rounding to half (a Point
+    resize, so the samples are the exact values the f16 path should see), not
+    by an independent depth conversion: an f16 test and its f32/u16 sibling
+    then run on the same content.
+    """
+    f32 = vs.core.fmtc.bitdepth(clip_gray16, bits=32, fulls=True, fulld=True)
+    return vs.core.resize.Point(f32, format=vs.GRAYH)
+
+
 def _resized(fmt, **kwargs):
     return vs.core.resize.Bicubic(_source(CLIP_PATH), format=fmt, **kwargs)
 
@@ -905,6 +938,18 @@ def clip_yuv420p16():
 def clip_yuv444p16():
     """YUV444P16 version (for joint 'YUV' processing)."""
     return _resized(vs.YUV444P16)
+
+
+@pytest.fixture(scope="session")
+def clip_yuv420ph():
+    """YUV420PH (half) version of the clip (subsampled chroma, half samples)."""
+    return vs.core.resize.Point(_resized(vs.YUV420PS), format=vs.YUV420PH)
+
+
+@pytest.fixture(scope="session")
+def clip_yuv444ph():
+    """YUV444PH (half) version (full chroma, half samples)."""
+    return vs.core.resize.Point(_resized(vs.YUV444PS), format=vs.YUV444PH)
 
 
 @pytest.fixture(scope="session")
