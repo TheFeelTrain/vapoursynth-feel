@@ -11,7 +11,7 @@ rounding order may differ by an ulp between the backends).
 Tolerance policy (measured): float32 reference comparisons sit at a few ulp
 (~1e-8) and use REF_TOL = 1e-6, except hard-threshold ftype=1 configs where
 a pixel within an ulp of sigma can flip to/from zero — those keep a looser
-bound. 16-bit integer output is compared as whole output codes (<= 1 LSB).
+bound. u16 output is compared as whole output codes (<= 1 LSB).
 Self-consistency checks remain exact.
 
 Run from the repository root:  uv run python -m pytest tests/test_dfttest.py
@@ -49,7 +49,7 @@ from conftest import (
     source_clip,
 )
 
-pytestmark = pytest.mark.usefixtures("clip_gray")
+pytestmark = pytest.mark.usefixtures("clip_grays")
 
 
 def _run(clip, tbsize=3, **kwargs):
@@ -76,48 +76,48 @@ def _ref_compare(fmt, params, frames=(0, 11, 23), planes=None):
 # ---------------------------------------------------------------------------
 
 
-def test_dfttest_deterministic_32bit(clip_gray):
-    a = _run(clip_gray)
-    b = _run(clip_gray)
+def test_dfttest_deterministic_f32(clip_grays):
+    a = _run(clip_grays)
+    b = _run(clip_grays)
     for n in (0, 11, 23):
         d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
         assert np.abs(d).max() < 1e-6, f"nondeterministic output at frame {n}"
 
 
-def test_dfttest_preserves_frame_props(clip_gray):
+def test_dfttest_preserves_frame_props(clip_grays):
     """The temporal cache must republish the source frame's properties."""
-    assert_preserves_frame_props(_run, clip_gray, tbsize=3)
+    assert_preserves_frame_props(_run, clip_grays, tbsize=3)
 
 
-def test_dfttest_parallel_load_consistent_32bit(clip_gray):
+def test_dfttest_parallel_load_consistent_f32(clip_grays):
     """Two parallel runs must match the serial path, and each
     other — the request pattern that exposes stale descriptor bindings,
     fence misuse and command-pool reuse violations under load."""
-    a = eval_parallel(_run, clip_gray)
-    b = eval_parallel(_run, clip_gray)
-    ref = _run(clip_gray)
-    for n in range(clip_gray.num_frames):
+    a = eval_parallel(_run, clip_grays)
+    b = eval_parallel(_run, clip_grays)
+    ref = _run(clip_grays)
+    for n in range(clip_grays.num_frames):
         r = frame_to_ndarray(ref.get_frame(n))
         assert np.abs(a[n] - r).max() < 1e-6, f"parallel 1/serial mismatch at frame {n}"
         assert np.abs(b[n] - r).max() < 1e-6, f"parallel 2/serial mismatch at frame {n}"
         assert np.abs(a[n] - b[n]).max() < 1e-6, f"nondeterministic output at frame {n}"
 
 
-def test_dfttest_deterministic_16bit(clip_16bit):
-    a = _run(clip_16bit)
-    b = _run(clip_16bit)
+def test_dfttest_deterministic_u16(clip_gray16):
+    a = _run(clip_gray16)
+    b = _run(clip_gray16)
     for n in (0, 11, 23):
         fa = _plane(a.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         fb = _plane(b.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         assert np.array_equal(fa, fb), f"nondeterministic output at frame {n}"
 
 
-def test_dfttest_parallel_load_consistent_16bit(clip_16bit):
-    """16-bit mirror of test_dfttest_parallel_load_consistent."""
-    a = eval_parallel(_run, clip_16bit, dtype=np.uint16)
-    b = eval_parallel(_run, clip_16bit, dtype=np.uint16)
-    ref = _run(clip_16bit)
-    for n in range(clip_16bit.num_frames):
+def test_dfttest_parallel_load_consistent_u16(clip_gray16):
+    """u16 mirror of test_dfttest_parallel_load_consistent."""
+    a = eval_parallel(_run, clip_gray16, dtype=np.uint16)
+    b = eval_parallel(_run, clip_gray16, dtype=np.uint16)
+    ref = _run(clip_gray16)
+    for n in range(clip_gray16.num_frames):
         r = _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         assert np.array_equal(a[n], r), f"parallel 1/serial mismatch at frame {n}"
         assert np.array_equal(b[n], r), f"parallel 2/serial mismatch at frame {n}"
@@ -129,7 +129,7 @@ def test_dfttest_parallel_load_consistent_16bit(clip_16bit):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bits", [None, 16], ids=["32bit", "16bit"])
+@pytest.mark.parametrize("bits", [None, 16], ids=["f32", "u16"])
 def test_dfttest_vspipe_pipelined_no_hang(bits):
     """vspipe's pipelined reader plus VapourSynth's prefetch activate frames
     11+ ahead of the in-flight frames, the request pattern that used to stall
@@ -175,7 +175,7 @@ def test_dfttest_vspipe_pipelined_no_hang(bits):
 
 
 @pytest.mark.parametrize("chained", [3])
-def test_dfttest_vspipe_pipelined_chained_no_hang_16bit(chained, tmp_path):
+def test_dfttest_vspipe_pipelined_chained_no_hang_u16(chained, tmp_path):
     """Chained DFTTest instances streamed through vspipe must not deadlock.
 
     User-reported bug: chaining DFTTest instances deadlocks at 3+ ("1 or 2
@@ -258,20 +258,20 @@ def test_dfttest_short_clip_temporal_window(nframes):
 
 
 @pytest.mark.parametrize("tbsize", [1, 3, 5, 7])
-def test_dfttest_no_nan_all_frames_32bit(clip_gray, tbsize):
-    check_all_frames_finite(_run, clip_gray, tbsize=tbsize)
+def test_dfttest_no_nan_all_frames_f32(clip_grays, tbsize):
+    check_all_frames_finite(_run, clip_grays, tbsize=tbsize)
 
 
 @pytest.mark.parametrize("tbsize", [1, 3, 5, 7])
-def test_dfttest_no_nan_all_frames_16bit(clip_16bit, tbsize):
-    """16-bit mirror of test_dfttest_no_nan_all_frames_32bit (temporal
+def test_dfttest_no_nan_all_frames_u16(clip_gray16, tbsize):
+    """u16 mirror of test_dfttest_no_nan_all_frames_f32 (temporal
     boundary handling on the integer path).
 
     ``isfinite(uint16)`` cannot fail, so the meaningful assertion is that the
     filter actually altered the noise input.
     """
-    out = _run(clip_16bit, tbsize=tbsize)
-    assert_changes_on_clip(out, clip_16bit, what="DFTTest")
+    out = _run(clip_gray16, tbsize=tbsize)
+    assert_changes_on_clip(out, clip_gray16, what="DFTTest")
 
 
 # ---------------------------------------------------------------------------
@@ -324,13 +324,13 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     planes = json.loads(sys.argv[3])
 
     src = core.bs.VideoSource({CLIP_PATH!r})
-    if clip_kind == "gray32":
+    if clip_kind == "grays":
         clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
     elif clip_kind == "gray16":
         clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=16, fulls=True, fulld=True)
-    elif clip_kind == "yuv32":
+    elif clip_kind == "yuv420ps":
         clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
-    elif clip_kind == "yuv420_16":
+    elif clip_kind == "yuv420p16":
         clip = core.resize.Bicubic(src, format=vs.YUV420P16)
     else:
         raise SystemExit("bad clip kind %r" % clip_kind)
@@ -378,7 +378,7 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 """)
 
 
-def _reference_max_diffs(clip_kind="gray32", cases=None, planes=(0,)) -> list[float]:
+def _reference_max_diffs(clip_kind="grays", cases=None, planes=(0,)) -> list[float]:
     """Run every config in a single subprocess.
 
     A missing/crashing reference skips (via compare_or_skip); a vsfeel crash,
@@ -393,7 +393,7 @@ def _reference_max_diffs(clip_kind="gray32", cases=None, planes=(0,)) -> list[fl
     )
 
 
-def test_dfttest_matches_reference_32bit(clip_gray):
+def test_dfttest_matches_reference_f32(clip_grays):
     """vsfeel must closely match vszipcl across the parameter surface.
 
     The implementations are ported exactly, so only float32 rounding order
@@ -406,16 +406,16 @@ def test_dfttest_matches_reference_32bit(clip_gray):
         assert maxdiff < tol, f"max diff {maxdiff} vs vszipcl for {kwargs}"
 
 
-# The 16-bit sweep mirrors the 32-bit REFERENCE_CASES list one-for-one.
+# The u16 sweep mirrors the f32 REFERENCE_CASES list one-for-one.
 # Measured on the noise clip: every config (incl. the hard-threshold
 # ftype=1 cases) lands within one output code, so a flat <= 1 LSB bound
-# covers the whole 16-bit surface.
+# covers the whole u16 surface.
 GRAY16_CASES = [kwargs for kwargs, _ in REFERENCE_CASES]
 
 
 @pytest.mark.parametrize("kwargs", GRAY16_CASES, ids=lambda kw: str(kw) or "defaults")
-def test_dfttest_matches_reference_16bit(clip_16bit, kwargs):
-    """16-bit integer path: at most one code level of rounding difference."""
+def test_dfttest_matches_reference_u16(clip_gray16, kwargs):
+    """u16 path: at most one code level of rounding difference."""
     worst = _ref_compare("gray16", kwargs)
     assert worst <= 1, f"gray16 max diff {worst} ({kwargs})"
 
@@ -425,7 +425,7 @@ def test_dfttest_matches_reference_16bit(clip_16bit, kwargs):
 # 2/3/4 with a non-default sigma, the per-axis ssystem=0 product, a Kaiser
 # temporal window that actually reads tbeta, and sigma2 on the ftype=3 gain
 # (the default ftype=0 never reads it). Batched per depth: one process per
-# config would take minutes. Measured worst 3e-8 (fp32), 0 in 16-bit.
+# config would take minutes. Measured worst 3e-8 (f32), 0 in u16.
 DFTEST_PARAM_SWEEP = (
     [{"swin": v} for v in range(12)]
     + [{"twin": v} for v in range(12)]
@@ -448,30 +448,30 @@ DFTEST_PARAM_SWEEP = (
 )
 
 
-def test_dfttest_parameter_sweep_matches_reference_32bit(clip_gray):
+def test_dfttest_parameter_sweep_matches_reference_f32(clip_grays):
     """Window/sigma/sosize/f0beta/ftype holes must match vszipcl."""
     reference_or_skip("vszipcl", "DFTTest")
-    maxdiffs = _reference_max_diffs("gray32", DFTEST_PARAM_SWEEP, (0,))
+    maxdiffs = _reference_max_diffs("grays", DFTEST_PARAM_SWEEP, (0,))
     assert len(maxdiffs) == len(DFTEST_PARAM_SWEEP)
     for kwargs, maxdiff in zip(DFTEST_PARAM_SWEEP, maxdiffs):
         assert maxdiff < REF_TOL, f"max diff {maxdiff} vs vszipcl for {kwargs}"
 
 
-def test_dfttest_parameter_sweep_matches_reference_16bit(clip_16bit):
-    """16-bit mirror of the new parameter sweep (whole output codes)."""
+def test_dfttest_parameter_sweep_matches_reference_u16(clip_gray16):
+    """u16 mirror of the new parameter sweep (whole output codes)."""
     reference_or_skip("vszipcl", "DFTTest")
     maxdiffs = _reference_max_diffs("gray16", DFTEST_PARAM_SWEEP, (0,))
     for kwargs, maxdiff in zip(DFTEST_PARAM_SWEEP, maxdiffs):
         assert maxdiff <= 1, f"gray16 max diff {maxdiff} for {kwargs}"
 
 
-def test_dfttest_rejects_8bit(clip_8bit):
-    """8-bit integer input is not supported (only 16-bit int and fp32)."""
+def test_dfttest_rejects_8bit(clip_gray8):
+    """8-bit integer input is not supported (only u16 int and f32)."""
     with pytest.raises(vs.Error):
-        vs.core.vsfeel.DFTTest(clip_8bit)
+        vs.core.vsfeel.DFTTest(clip_gray8)
 
 
-def test_dfttest_rejects_unsupported_subgroup_size(clip_gray, monkeypatch):
+def test_dfttest_rejects_unsupported_subgroup_size(clip_grays, monkeypatch):
     """A subgroup size the device cannot provide must fail at creation.
 
     The fused kernel's 16-lane tiles exchange shared memory across a subgroup
@@ -482,10 +482,10 @@ def test_dfttest_rejects_unsupported_subgroup_size(clip_gray, monkeypatch):
     """
     monkeypatch.setenv("VSFEEL_DFTTEST_SGSIZE_INVALID", "1")
     with pytest.raises(vs.Error):
-        vs.core.vsfeel.DFTTest(clip_gray)
+        vs.core.vsfeel.DFTTest(clip_grays)
 
 
-def test_dfttest_env_flag_false_is_disabled(clip_gray, monkeypatch):
+def test_dfttest_env_flag_false_is_disabled(clip_grays, monkeypatch):
     """`VAR=false` must disable a flag, not enable it.
 
     env_flag rejected only "0", so `VSFEEL_DFTTEST_SGSIZE_INVALID=false` still
@@ -493,9 +493,9 @@ def test_dfttest_env_flag_false_is_disabled(clip_gray, monkeypatch):
     exactly like the default, while "1" still forces the probe.
     """
     monkeypatch.delenv("VSFEEL_DFTTEST_SGSIZE_INVALID", raising=False)
-    default = _run(clip_gray)
+    default = _run(clip_grays)
     monkeypatch.setenv("VSFEEL_DFTTEST_SGSIZE_INVALID", "false")
-    disabled = _run(clip_gray)
+    disabled = _run(clip_grays)
     for n in (0, 11):
         a = frame_to_ndarray(default.get_frame(n))
         b = frame_to_ndarray(disabled.get_frame(n))
@@ -503,7 +503,7 @@ def test_dfttest_env_flag_false_is_disabled(clip_gray, monkeypatch):
 
     monkeypatch.setenv("VSFEEL_DFTTEST_SGSIZE_INVALID", "1")
     with pytest.raises(vs.Error):
-        vs.core.vsfeel.DFTTest(clip_gray)
+        vs.core.vsfeel.DFTTest(clip_grays)
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +511,7 @@ def test_dfttest_env_flag_false_is_disabled(clip_gray, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_dfttest_yuv_passthrough_32bit(clip_gray):
+def test_dfttest_yuv_passthrough_f32(clip_grays):
     """A full YUV clip is accepted; with planes=[0] the chroma planes must be
     copied through bit-identically and the luma must match the Gray output."""
     core = vs.core
@@ -520,7 +520,7 @@ def test_dfttest_yuv_passthrough_32bit(clip_gray):
     assert yuv.format.color_family == vs.YUV
 
     out = _run(yuv, planes=[0])
-    ref = _run(clip_gray)
+    ref = _run(clip_grays)
     for n in (0, 11, 23):
         f = out.get_frame(n)
         d = frame_to_ndarray(f) - frame_to_ndarray(ref.get_frame(n))
@@ -534,15 +534,15 @@ def test_dfttest_yuv_passthrough_32bit(clip_gray):
             assert np.array_equal(a, b), f"chroma{plane} changed at frame {n}"
 
 
-def test_dfttest_yuv_all_planes_matches_reference_32bit():
+def test_dfttest_yuv_all_planes_matches_reference_f32():
     """YUV420 float32 with all planes processed must track vszipcl on every
     plane (incl. subsampled chroma)."""
-    worst = _ref_compare("yuv32", {"tbsize": 1}, planes=(0, 1, 2))
+    worst = _ref_compare("yuv420ps", {"tbsize": 1}, planes=(0, 1, 2))
     assert worst < REF_TOL, f"max diff {worst}"
 
 
-def test_dfttest_yuv_passthrough_16bit(clip_16bit):
-    """16-bit mirror of test_dfttest_yuv_passthrough: chroma copied through
+def test_dfttest_yuv_passthrough_u16(clip_gray16):
+    """u16 mirror of test_dfttest_yuv_passthrough: chroma copied through
     bit-identically, luma matches the gray16 output."""
     core = vs.core
     src = source_clip()
@@ -550,7 +550,7 @@ def test_dfttest_yuv_passthrough_16bit(clip_16bit):
     assert yuv.format.color_family == vs.YUV
 
     out = _run(yuv, planes=[0])
-    ref = _run(clip_16bit)
+    ref = _run(clip_gray16)
 
     for n in (0, 11, 23):
         d = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64) - _plane(
@@ -566,27 +566,27 @@ def test_dfttest_yuv_passthrough_16bit(clip_16bit):
             assert np.array_equal(a, b), f"chroma{plane} changed at frame {n}"
 
 
-def test_dfttest_yuv_all_planes_matches_reference_16bit():
-    """16-bit mirror of test_dfttest_yuv_all_planes_matches_reference
+def test_dfttest_yuv_all_planes_matches_reference_u16():
+    """u16 mirror of test_dfttest_yuv_all_planes_matches_reference
     (YUV420P16, whole-code comparison; measured <= 1 LSB)."""
-    worst = _ref_compare("yuv420_16", {"tbsize": 1}, planes=(0, 1, 2))
+    worst = _ref_compare("yuv420p16", {"tbsize": 1}, planes=(0, 1, 2))
     assert worst <= 1.0, f"max diff {worst}"
 
 
-def test_dfttest_planes_chroma_only_32bit():
+def test_dfttest_planes_chroma_only_f32():
     """planes=[1,2] on YUV420 float32: the two subsampled chroma planes must
     match vszipcl (the luma is passed through untouched, pinned below)."""
-    worst = _ref_compare("yuv32", {"tbsize": 1, "planes": [1, 2]}, planes=(1, 2))
+    worst = _ref_compare("yuv420ps", {"tbsize": 1, "planes": [1, 2]}, planes=(1, 2))
     assert worst < REF_TOL, f"max diff {worst}"
 
 
-def test_dfttest_planes_chroma_only_16bit():
-    """16-bit mirror of test_dfttest_planes_chroma_only (whole codes)."""
-    worst = _ref_compare("yuv420_16", {"tbsize": 1, "planes": [1, 2]}, planes=(1, 2))
+def test_dfttest_planes_chroma_only_u16():
+    """u16 mirror of test_dfttest_planes_chroma_only (whole codes)."""
+    worst = _ref_compare("yuv420p16", {"tbsize": 1, "planes": [1, 2]}, planes=(1, 2))
     assert worst <= 1.0, f"max diff {worst}"
 
 
-def test_dfttest_planes_chroma_leaves_luma_untouched(clip_gray):
+def test_dfttest_planes_chroma_leaves_luma_untouched(clip_grays):
     """With planes=[1,2] the unprocessed luma must be copied through
     bit-identically while both chroma planes change."""
     core = vs.core
@@ -610,64 +610,64 @@ def test_dfttest_planes_chroma_leaves_luma_untouched(clip_gray):
 # ---------------------------------------------------------------------------
 
 
-def test_dfttest_rejects_bad_ftype(clip_gray):
+def test_dfttest_rejects_bad_ftype(clip_grays):
     with pytest.raises(vs.Error):
-        _run(clip_gray, ftype=5)
+        _run(clip_grays, ftype=5)
     with pytest.raises(vs.Error):
-        _run(clip_gray, ftype=-1)
+        _run(clip_grays, ftype=-1)
 
 
-def test_dfttest_rejects_bad_sbsize(clip_gray):
+def test_dfttest_rejects_bad_sbsize(clip_grays):
     with pytest.raises(vs.Error):
-        _run(clip_gray, sbsize=8)
+        _run(clip_grays, sbsize=8)
 
 
-def test_dfttest_rejects_bad_sosize(clip_gray):
+def test_dfttest_rejects_bad_sosize(clip_grays):
     with pytest.raises(vs.Error):
-        _run(clip_gray, sosize=-1)
+        _run(clip_grays, sosize=-1)
     with pytest.raises(vs.Error):
-        _run(clip_gray, sosize=16)
+        _run(clip_grays, sosize=16)
     # > 50% overlap requires sbsize-sosize to divide sbsize
     with pytest.raises(vs.Error):
-        _run(clip_gray, sosize=10)
+        _run(clip_grays, sosize=10)
 
 
-def test_dfttest_rejects_even_tbsize(clip_gray):
+def test_dfttest_rejects_even_tbsize(clip_grays):
     with pytest.raises(vs.Error):
-        _run(clip_gray, tbsize=2)
+        _run(clip_grays, tbsize=2)
 
 
-def test_dfttest_rejects_bad_tbsize(clip_gray):
+def test_dfttest_rejects_bad_tbsize(clip_grays):
     with pytest.raises(vs.Error):
-        _run(clip_gray, tbsize=0)
+        _run(clip_grays, tbsize=0)
     with pytest.raises(vs.Error):
-        _run(clip_gray, tbsize=9)
+        _run(clip_grays, tbsize=9)
 
 
-def test_dfttest_rejects_bad_windows(clip_gray):
+def test_dfttest_rejects_bad_windows(clip_grays):
     with pytest.raises(vs.Error):
-        _run(clip_gray, swin=12)
+        _run(clip_grays, swin=12)
     with pytest.raises(vs.Error):
-        _run(clip_gray, twin=-1)
+        _run(clip_grays, twin=-1)
 
 
-def test_dfttest_rejects_bad_ssystem(clip_gray):
+def test_dfttest_rejects_bad_ssystem(clip_grays):
     with pytest.raises(vs.Error):
-        _run(clip_gray, ssystem=2)
+        _run(clip_grays, ssystem=2)
 
 
-def test_dfttest_rejects_nonfinite_sigma(clip_gray):
+def test_dfttest_rejects_nonfinite_sigma(clip_grays):
     with pytest.raises(vs.Error):
-        _run(clip_gray, sigma=float("nan"))
+        _run(clip_grays, sigma=float("nan"))
     with pytest.raises(vs.Error):
-        _run(clip_gray, sigma2=float("inf"))
+        _run(clip_grays, sigma2=float("inf"))
 
 
-def test_dfttest_rejects_nonfinite_beta(clip_gray):
+def test_dfttest_rejects_nonfinite_beta(clip_grays):
     with pytest.raises(vs.Error):
-        _run(clip_gray, sbeta=float("nan"))
+        _run(clip_grays, sbeta=float("nan"))
     with pytest.raises(vs.Error):
-        _run(clip_gray, tbeta=float("inf"))
+        _run(clip_grays, tbeta=float("inf"))
 
 
 @pytest.mark.parametrize(
@@ -675,34 +675,34 @@ def test_dfttest_rejects_nonfinite_beta(clip_gray):
     [{"swin": 4, "sbeta": 1e15}, {"twin": 4, "tbeta": 1e15}],
     ids=["sbeta", "tbeta"],
 )
-def test_dfttest_rejects_overflowing_bessel_window(clip_gray, kwargs):
+def test_dfttest_rejects_overflowing_bessel_window(clip_grays, kwargs):
     # A finite beta can still overflow the Kaiser series and produce a NaN
     # window; that used to reach fsum, whose expansion then ran off its array.
     with pytest.raises(vs.Error):
-        _run(clip_gray, **kwargs)
+        _run(clip_grays, **kwargs)
 
 
-def test_dfttest_rejects_odd_sigma_arrays(clip_gray):
+def test_dfttest_rejects_odd_sigma_arrays(clip_grays):
     with pytest.raises(vs.Error):
-        _run(clip_gray, slocation=[0.0, 1.0, 2.0])
+        _run(clip_grays, slocation=[0.0, 1.0, 2.0])
     with pytest.raises(vs.Error):
-        _run(clip_gray, ssx=[0.0])
+        _run(clip_grays, ssx=[0.0])
 
 
-def test_dfttest_rejects_bad_planes(clip_gray):
+def test_dfttest_rejects_bad_planes(clip_grays):
     with pytest.raises(vs.Error):
-        _run(clip_gray, planes=[0, 0])
+        _run(clip_grays, planes=[0, 0])
     with pytest.raises(vs.Error):
-        _run(clip_gray, planes=[5])
+        _run(clip_grays, planes=[5])
 
 
-def test_dfttest_rejects_10bit(clip_8bit):
-    clip = vs.core.fmtc.bitdepth(clip_8bit, bits=10)
+def test_dfttest_rejects_10bit(clip_gray8):
+    clip = vs.core.fmtc.bitdepth(clip_gray8, bits=10)
     with pytest.raises(vs.Error):
         _run(clip)
 
 
-def test_dfttest_rejects_sigma_range_not_covered(clip_gray):
+def test_dfttest_rejects_sigma_range_not_covered(clip_grays):
     """slocation that does not span [0, 1] must be rejected."""
     with pytest.raises(vs.Error):
-        _run(clip_gray, slocation=[0.5, 2.0, 0.6, 3.0])
+        _run(clip_grays, slocation=[0.5, 2.0, 0.6, 3.0])

@@ -46,54 +46,54 @@ def test_backend_resolves():
     assert vsfeel.Backend.resolve() is vsfeel.Backend
 
 
-def test_bilateral_runs_via_jetpack(clip_gray):
-    out = cpu_node(bilateral(clip_gray, sigmaS=3.0, sigmaR=0.02, backend=_backend()))
+def test_bilateral_runs_via_jetpack(clip_grays):
+    out = cpu_node(bilateral(clip_grays, sigmaS=3.0, sigmaR=0.02, backend=_backend()))
     assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
 
 
-def test_nl_means_runs_via_jetpack(clip_gray):
-    out = cpu_node(nl_means(clip_gray, h=1.2, tr=1, a=2, s=4, backend=_backend()))
+def test_nl_means_runs_via_jetpack(clip_grays):
+    out = cpu_node(nl_means(clip_grays, h=1.2, tr=1, a=2, s=4, backend=_backend()))
     assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
 
 
-def test_gauss_blur_runs_via_jetpack(clip_gray):
-    out = cpu_node(gauss_blur(clip_gray, 1.5, backend=_backend()))
+def test_gauss_blur_runs_via_jetpack(clip_grays):
+    out = cpu_node(gauss_blur(clip_grays, 1.5, backend=_backend()))
     assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
 
 
-def test_bm3d_runs_via_jetpack(clip_gray):
-    out = cpu_node(bm3d(clip_gray, 0.7, tr=2, profile=bm3d.Profile.FAST, backend=_backend()))
+def test_bm3d_runs_via_jetpack(clip_grays):
+    out = cpu_node(bm3d(clip_grays, 0.7, tr=2, profile=bm3d.Profile.FAST, backend=_backend()))
     assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
 
 
-def test_dfttest_runs_via_jetpack(clip_gray):
-    dft = DFTTest(clip_gray, backend=_backend())
+def test_dfttest_runs_via_jetpack(clip_grays):
+    dft = DFTTest(clip_grays, backend=_backend())
     out = dft.denoise({0.0: 16.0, 0.5: 8.0, 1.0: 0.0}, tr=1)
     assert np.isfinite(frame_to_ndarray(cpu_node(out).get_frame(0))).all()
 
 
-def test_eedi3_runs_via_vsaa(clip_gray):
-    out = cpu_node(EEDI3(backend=_backend()).antialias(clip_gray))
+def test_eedi3_runs_via_vsaa(clip_grays):
+    out = cpu_node(EEDI3(backend=_backend()).antialias(clip_grays))
     assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
 
 
-def test_eedi3h_fallback_matches_native(clip_gray):
+def test_eedi3h_fallback_matches_native(clip_grays):
     native = cpu_node(
-        EEDI3(backend=_backend()).antialias(clip_gray, direction=EEDI3.AADirection.HORIZONTAL)
+        EEDI3(backend=_backend()).antialias(clip_grays, direction=EEDI3.AADirection.HORIZONTAL)
     )
 
     class _NoH(vsfeel.FeelBackend):
         supports_h = False
 
     fallback = cpu_node(
-        EEDI3(backend=_NoH()).antialias(clip_gray, direction=EEDI3.AADirection.HORIZONTAL)
+        EEDI3(backend=_NoH()).antialias(clip_grays, direction=EEDI3.AADirection.HORIZONTAL)
     )
     assert np.array_equal(
         frame_to_ndarray(native.get_frame(0)), frame_to_ndarray(fallback.get_frame(0))
     )
 
 
-def test_eedi3h_fallback_transposes_aux_clips(clip_16bit):
+def test_eedi3h_fallback_transposes_aux_clips(clip_gray16):
     """The no-H fallback transposes sclip and mclip, not just the source.
 
     Compares the fallback against the native transpose-oracle chain with a
@@ -101,7 +101,7 @@ def test_eedi3h_fallback_transposes_aux_clips(clip_16bit):
     """
     from conftest import half_mask
 
-    clip = clip_16bit
+    clip = clip_gray16
     # Single-direction interpolation keeps N frames, so the sclip is N-frame
     # here (the 2N form only exists for the fused double-rate path).
     sclip = clip.std.Invert()
@@ -169,12 +169,14 @@ def test_nnedi3_subclass_is_a_vsaa_nnedi3():
         {"nsize": 5, "nns": 0, "pscrn": 3},
     ],
 )
-def test_nnedi3_via_vsaa_matches_direct_call(clip_16bit, kwargs):
+def test_nnedi3_via_vsaa_matches_direct_call(clip_gray16, kwargs):
     """The wrapper adds only field/dh mapping over core.vsfeel.NNEDI3."""
-    wrapped = cpu_node(vsfeel.NNEDI3(**kwargs).deinterlace(clip_16bit, tff=True, double_rate=False))
+    wrapped = cpu_node(
+        vsfeel.NNEDI3(**kwargs).deinterlace(clip_gray16, tff=True, double_rate=False)
+    )
     direct = cpu_node(
         vs.core.vsfeel.NNEDI3(
-            clip_16bit,
+            clip_gray16,
             field=1,
             nsize=kwargs.get("nsize", 0),
             nns=kwargs.get("nns", 4),
@@ -190,37 +192,39 @@ def test_nnedi3_via_vsaa_matches_direct_call(clip_16bit, kwargs):
         )
 
 
-def test_nnedi3_supersample_doubles_dims(clip_16bit):
-    out = cpu_node(vsfeel.NNEDI3().scale(clip_16bit, 2 * clip_16bit.width, 2 * clip_16bit.height))
-    assert (out.width, out.height) == (2 * clip_16bit.width, 2 * clip_16bit.height)
+def test_nnedi3_supersample_doubles_dims(clip_gray16):
+    out = cpu_node(
+        vsfeel.NNEDI3().scale(clip_gray16, 2 * clip_gray16.width, 2 * clip_gray16.height)
+    )
+    assert (out.width, out.height) == (2 * clip_gray16.width, 2 * clip_gray16.height)
     assert np.isfinite(frame_to_ndarray(out.get_frame(0), dtype=np.uint16)).all()
 
 
-def test_based_aa_with_vsfeel_supersampler_and_antialiaser(clip_gray):
+def test_based_aa_with_vsfeel_supersampler_and_antialiaser(clip_grays):
     """The documented drop-in combo runs end to end."""
     out = cpu_node(
         based_aa(
-            clip_gray, supersampler=vsfeel.NNEDI3(), antialiaser=vsfeel.EEDI3(), postfilter=False
+            clip_grays, supersampler=vsfeel.NNEDI3(), antialiaser=vsfeel.EEDI3(), postfilter=False
         )
     )
-    assert (out.width, out.height) == (clip_gray.width, clip_gray.height)
+    assert (out.width, out.height) == (clip_grays.width, clip_grays.height)
     assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
 
 
-def test_eedi3aa_matches_the_two_call_chain(clip_16bit):
+def test_eedi3aa_matches_the_two_call_chain(clip_gray16):
     """The fused antialiaser reproduces the base class's chain bit-exactly."""
     fused = cpu_node(
-        vsfeel.EEDI3(backend=_backend(), mdis=5, nrad=1, **AA_PARAMS).antialias(clip_16bit)
+        vsfeel.EEDI3(backend=_backend(), mdis=5, nrad=1, **AA_PARAMS).antialias(clip_gray16)
     )
-    chain = cpu_node(EEDI3(backend=_backend(), mdis=5, nrad=1, **AA_PARAMS).antialias(clip_16bit))
-    assert fused.num_frames == chain.num_frames == clip_16bit.num_frames
+    chain = cpu_node(EEDI3(backend=_backend(), mdis=5, nrad=1, **AA_PARAMS).antialias(clip_gray16))
+    assert fused.num_frames == chain.num_frames == clip_gray16.num_frames
     for n in (0, 5, 23):
         a = frame_to_ndarray(fused.get_frame(n), dtype=np.uint16)
         b = frame_to_ndarray(chain.get_frame(n), dtype=np.uint16)
         assert np.array_equal(a, b), f"fused chain mismatch at frame {n}"
 
 
-def test_eedi3aa_sclip_subframes_are_distinct(clip_16bit):
+def test_eedi3aa_sclip_subframes_are_distinct(clip_gray16):
     """The fused 2N-frame sclip interleave keeps distinct sub-frames distinct.
 
     Feeds an N-frame sclip whose content differs from the source (inverted
@@ -228,7 +232,7 @@ def test_eedi3aa_sclip_subframes_are_distinct(clip_16bit):
     carry that content into both fused sub-frames, exactly like the base
     class's chain. A wrong doubling (dropped or reordered) fails bit-exactly.
     """
-    clip = clip_16bit
+    clip = clip_gray16
     inv = clip.std.Invert()
     kw = dict(mdis=5, nrad=1, **AA_PARAMS)
     fused = cpu_node(vsfeel.EEDI3(backend=_backend(), sclip=inv, **kw).antialias(clip))
@@ -251,7 +255,7 @@ def test_eedi3aa_sclip_subframes_are_distinct(clip_16bit):
     assert changed, "distinct sclip did not affect the output (test is vacuous)"
 
 
-def test_wrapper_drops_params_the_plugin_rejects(clip_16bit, monkeypatch):
+def test_wrapper_drops_params_the_plugin_rejects(clip_gray16, monkeypatch):
     """A parameter vsfeel's entry points never declare is filtered, not fatal.
 
     VapourSynth rejects an unknown keyword before dispatch, so the fused and
@@ -268,14 +272,14 @@ def test_wrapper_drops_params_the_plugin_rejects(clip_16bit, monkeypatch):
 
     monkeypatch.setattr(_deinterlacers.EEDI3, "get_deint_args", with_bogus)
 
-    fused = cpu_node(vsfeel.EEDI3(**AA_PARAMS).antialias(clip_16bit))
-    chain = cpu_node(EEDI3(backend=_backend(), **AA_PARAMS).antialias(clip_16bit))
+    fused = cpu_node(vsfeel.EEDI3(**AA_PARAMS).antialias(clip_gray16))
+    chain = cpu_node(EEDI3(backend=_backend(), **AA_PARAMS).antialias(clip_gray16))
 
     for out in (fused, chain):
         assert np.isfinite(frame_to_ndarray(out.get_frame(0), dtype=np.uint16)).all()
 
 
-def test_eedi3_wrapper_forwards_hp(clip_16bit):
+def test_eedi3_wrapper_forwards_hp(clip_gray16):
     """vs-jetpack sends EEDI3's ``hp``; every vsfeel entry point declares it.
 
     The wrapper filtered ``hp`` out while the plugin did not declare it, so
@@ -285,7 +289,7 @@ def test_eedi3_wrapper_forwards_hp(clip_16bit):
     path against ``EEDI3AA``. ``hp=False`` must differ from ``hp=True`` or the
     comparison would be vacuous.
     """
-    clip = clip_16bit
+    clip = clip_gray16
     # (alpha, beta, gamma, nrad, mdis) and the two vthresh defaults in play:
     # a bare vsaa EEDI3 carries (32, 64, 4), vsfeel's fused wrapper (12, 24, 4).
     bare = dict(alpha=0.125, beta=0.25, gamma=40.0, nrad=1, mdis=5)
@@ -444,16 +448,16 @@ def test_bm3d_backend_survives_an_environment_reload():
     assert "RELOAD-OK" in proc.stdout
 
 
-def test_eedi3aa_falls_back_for_non_both(clip_16bit):
+def test_eedi3aa_falls_back_for_non_both(clip_gray16):
     """direction != BOTH keeps the base class's single-direction path."""
     fused = cpu_node(
         vsfeel.EEDI3(backend=_backend(), **AA_PARAMS).antialias(
-            clip_16bit, direction=EEDI3.AADirection.HORIZONTAL
+            clip_gray16, direction=EEDI3.AADirection.HORIZONTAL
         )
     )
     chain = cpu_node(
         EEDI3(backend=_backend(), **AA_PARAMS).antialias(
-            clip_16bit, direction=EEDI3.AADirection.HORIZONTAL
+            clip_gray16, direction=EEDI3.AADirection.HORIZONTAL
         )
     )
     for n in (0, 11):
@@ -463,7 +467,7 @@ def test_eedi3aa_falls_back_for_non_both(clip_16bit):
         )
 
 
-def test_eedi3aa_no_arg_defaults_match_based_aa(clip_gray, monkeypatch):
+def test_eedi3aa_no_arg_defaults_match_based_aa(clip_grays, monkeypatch):
     """`vsfeel.EEDI3()` must be the antialiaser ``based_aa`` builds for itself.
 
     ``based_aa`` only builds its own EEDI3 when the caller passes none, so
@@ -482,7 +486,7 @@ def test_eedi3aa_no_arg_defaults_match_based_aa(clip_gray, monkeypatch):
             super().__init__(**kwargs)
 
     monkeypatch.setattr(_funcs, "EEDI3", _Spy)
-    based_aa(clip_gray, supersampler=False, backend=_backend())
+    based_aa(clip_grays, supersampler=False, backend=_backend())
     assert captured, "based_aa did not build its default EEDI3"
 
     wrapper = vsfeel.EEDI3()
@@ -490,7 +494,7 @@ def test_eedi3aa_no_arg_defaults_match_based_aa(clip_gray, monkeypatch):
         assert getattr(wrapper, field) == value, field
 
 
-def test_eedi3aa_falls_back_for_odd_geometry(clip_16bit, monkeypatch):
+def test_eedi3aa_falls_back_for_odd_geometry(clip_gray16, monkeypatch):
     """EEDI3AA needs both plane axes even, so odd geometry keeps the chain."""
     import vsaa.deinterlacers as _deinterlacers
 
@@ -501,14 +505,14 @@ def test_eedi3aa_falls_back_for_odd_geometry(clip_16bit, monkeypatch):
         return clip
 
     monkeypatch.setattr(_deinterlacers.EEDI3, "antialias", spy)
-    odd = vs.core.std.Crop(clip_16bit, right=1)
+    odd = vs.core.std.Crop(clip_gray16, right=1)
     assert odd.width % 2 == 1
     out = vsfeel.EEDI3(backend=_backend()).antialias(odd)
     assert calls == [odd.width], "odd width must not take the fused path"
     assert out is odd
 
 
-def test_eedi3aa_fused_path_requires_a_vsfeel_backend(clip_gray, monkeypatch):
+def test_eedi3aa_fused_path_requires_a_vsfeel_backend(clip_grays, monkeypatch):
     """An explicit CPU or reference backend keeps the base class's chain.
 
     EEDI3AA is vsfeel's fused implementation, so taking it when the caller
@@ -524,31 +528,31 @@ def test_eedi3aa_fused_path_requires_a_vsfeel_backend(clip_gray, monkeypatch):
 
     monkeypatch.setattr(_deinterlacers.EEDI3, "antialias", spy)
 
-    out = vsfeel.EEDI3(backend=EEDI3.Backend.CPU).antialias(clip_gray)
-    assert calls and out is clip_gray, "CPU backend must not take the fused path"
+    out = vsfeel.EEDI3(backend=EEDI3.Backend.CPU).antialias(clip_grays)
+    assert calls and out is clip_grays, "CPU backend must not take the fused path"
 
     calls.clear()
-    vsfeel.EEDI3(backend=_backend()).antialias(clip_gray)
+    vsfeel.EEDI3(backend=_backend()).antialias(clip_grays)
     assert not calls, "vsfeel backend must take the fused path"
 
 
-def test_backend_context_routes_singletons(clip_gray):
+def test_backend_context_routes_singletons(clip_grays):
     old_bilateral, old_gauss = bilateral.backend, gauss_blur.backend
     with _backend()():
         assert bilateral.backend is _backend()
         assert gauss_blur.backend is _backend()
         # implicit backend= (AUTO -> singleton) now routes through vsfeel
         assert np.isfinite(
-            frame_to_ndarray(cpu_node(bilateral(clip_gray, sigmaS=3.0, sigmaR=0.02)).get_frame(0))
+            frame_to_ndarray(cpu_node(bilateral(clip_grays, sigmaS=3.0, sigmaR=0.02)).get_frame(0))
         ).all()
         assert np.isfinite(
-            frame_to_ndarray(cpu_node(gauss_blur(clip_gray, 1.5)).get_frame(0))
+            frame_to_ndarray(cpu_node(gauss_blur(clip_grays, 1.5)).get_frame(0))
         ).all()
     assert bilateral.backend == old_bilateral
     assert gauss_blur.backend == old_gauss
 
 
-def test_bm3d_wrapper_forwards_chroma(clip_gray):
+def test_bm3d_wrapper_forwards_chroma(clip_grays):
     """vsdenoise forces chroma=True on YUV444; the wrapper must forward it.
 
     The plugin's BM3D implements the reference's joint 4:4:4 entry, so a
@@ -569,7 +573,7 @@ def test_bm3d_wrapper_forwards_chroma(clip_gray):
     # An explicit chroma=False is a vsdenoise-level duplicate (it forces its
     # own geometry-derived value too), so cover the pass-through at the
     # wrapper entry point instead: Gray keeps the default path running.
-    gray_out = _bm3d(clip_gray, 0.7, tr=2, profile=_bm3d.Profile.FAST, backend=_backend())
+    gray_out = _bm3d(clip_grays, 0.7, tr=2, profile=_bm3d.Profile.FAST, backend=_backend())
     assert np.isfinite(frame_to_ndarray(cpu_node(gray_out).get_frame(0))).all()
 
 

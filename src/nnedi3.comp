@@ -40,14 +40,14 @@
  * the references bake in), so the shared window tile is normalized by m2 and
  * the window mean is re-added only in the final wae5 blend.
  *
- * Compile-time variants: -DBITS=16|32 (uint16_t / float IO).
+ * Compile-time variants: -DIO_U16 / -DIO_F32 (uint16_t / float IO).
  */
 
-#if !defined(BITS)
-#define BITS 16
+#if !defined(IO_U16) && !defined(IO_F32) && !defined(IO_F16)
+#define IO_U16 1
 #endif
 
-#if BITS == 16
+#if defined(IO_U16)
 #define IO_TYPE uint16_t
 #else
 #define IO_TYPE float
@@ -115,7 +115,7 @@ float loadPad(int row, int col) {
     const int c = clamp(col - MARGIN_H, 0, WIDTH - 1);
     const int sy = (DH != 0) ? f : (2 * f + pc.parity);
     const int idx = sy * pc.src_stride + c;
-#if BITS == 32
+#if defined(IO_F32)
     return fieldBuf[idx];
 #else
     return float(int(fieldBuf[idx]));
@@ -125,7 +125,7 @@ float loadPad(int row, int col) {
 // Interpolated field row r lands on output row 2r + fp at the output pitch.
 void storeDst(int r, int x, float v) {
     const int idx = (2 * r + (1 - pc.parity)) * pc.dst_stride + x;
-#if BITS == 32
+#if defined(IO_F32)
     dstBuf[idx] = v;
 #else
     // glslc -O chokes on direct float->uint16_t (OpUConvert); go through

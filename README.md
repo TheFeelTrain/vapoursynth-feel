@@ -12,7 +12,7 @@ pip install vapoursynth-feel
 
 ## Performance
 
-| Filter     | vsfeel u16 | vszipcl u16 | vulkan u16 | vsfeel fp32 | vszipcl fp32 | vulkan fp32 | Speedup |
+| Filter     | vsfeel u16 | vszipcl u16 | vulkan u16 | vsfeel f32  | vszipcl f32  | vulkan f32  | Speedup |
 |------------|-----------:|------------:|-----------:|------------:|-------------:|------------:|--------:|
 | Bilateral  | 2317       | 732         | -          | 2296        | 457          | -           | 3.88x   |
 | BM3D       | 980        | -           | -          | 953         | 126          | 293         | 3.25x   |
@@ -161,13 +161,6 @@ core.vsfeel.NLMeans(clip clip[,
     clip    rclip])                 # weights computed from rclip, values from clip
 ```
 `channels="YUV"` requires 4:4:4 so on subsampled clips run a `"Y"` pass and a `"UV"` pass instead.
-
-**Accuracy caveat.** The weight accumulator is fp16. At small `h` with `wref=0`
-the `exp()` weights fall into fp16 subnormals and the whole ring can flush to
-zero; the kernel then falls back to the centre sample rather than evaluating
-`0/0`, so the output can differ from the reference by thousands of codes
-(measured ~4600 LSB at `h=1.2, wref=0` on the 16-bit test clip; back to 1 LSB at
-`h=3.0`). Raise `h` or `wref` if that matters.
 
 ### NNEDI3
 

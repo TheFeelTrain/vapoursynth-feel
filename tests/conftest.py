@@ -208,9 +208,9 @@ def eval_parallel(filter_func, clip, plane=0, dtype=None, timeout=180.0, **kwarg
 
 
 def check_all_frames_finite(filter_func, clip, **kwargs):
-    """Run a filter and assert every frame is finite Gray32 output."""
+    """Run a filter and assert every frame is finite GRAYS output."""
     out = filter_func(clip, **kwargs)
-    assert_gray32(out)
+    assert_grays(out)
     assert_all_frames_finite(out)
     return out
 
@@ -464,19 +464,19 @@ def build_clip(spec):
         clip = gray()
     elif kind == "gray16":
         clip = core.fmtc.bitdepth(gray(), bits=16, fulls=True, fulld=True)
-    elif kind == "gray32":
+    elif kind == "grays":
         clip = core.fmtc.bitdepth(gray(), bits=32, fulls=True, fulld=True)
-    elif kind == "yuv16":
+    elif kind == "yuv420p16_fmtc":
         clip = core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
-    elif kind == "yuv32":
+    elif kind == "yuv420ps":
         clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
-    elif kind == "yuv420_16":
+    elif kind == "yuv420p16":
         clip = core.resize.Bicubic(src, format=vs.YUV420P16)
-    elif kind == "yuv444_16":
+    elif kind == "yuv444p16":
         clip = core.resize.Bicubic(src, format=vs.YUV444P16)
-    elif kind == "rgb32":
+    elif kind == "rgbs":
         clip = core.resize.Bicubic(src, format=vs.RGBS, matrix_in_s="709")
-    elif kind == "rgb16":
+    elif kind == "rgb48":
         clip = core.resize.Bicubic(src, format=vs.RGB48, matrix_in_s="709")
     else:
         raise SystemExit("bad clip kind %r" % kind)
@@ -587,7 +587,7 @@ def reference_spec(
 ):
     """Build the JSON spec consumed by :data:`REFERENCE_SCRIPT`.
 
-    ``clip`` names the input format ("gray32", "gray16", "yuv420_16", ...);
+    ``clip`` names the input format ("grays", "gray16", "yuv420p16", ...);
     ``guide`` is a JSONable description of the joint-filter clip, if any;
     ``source`` overrides the input file (default: the committed noise clip).
     """
@@ -652,18 +652,18 @@ core = vs.core
 core.max_cache_size = spec.get("max_cache_size", 256)
 
 src = core.bs.VideoSource(spec["source"])
-# ``clip`` names the input the filter is graded on; the default is the Gray32
+# ``clip`` names the input the filter is graded on; the default is the GRAYS
 # clip every single-plane filter uses. A filter that processes chroma is graded
 # on a color clip instead, so its per-plane caches see the real thing.
-kind = spec.get("clip", "gray32")
-if kind == "gray32":
+kind = spec.get("clip", "grays")
+if kind == "grays":
     clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                               bits=32, fulls=True, fulld=True)
-elif kind == "yuv420_32":
+elif kind == "yuv420ps":
     clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
-elif kind == "yuv444_32":
+elif kind == "yuv444ps":
     clip = core.resize.Bicubic(src, format=vs.YUV444PS)
-elif kind == "rgb32":
+elif kind == "rgbs":
     clip = core.resize.Bicubic(src, format=vs.RGBS, matrix_in_s="709")
 else:
     raise SystemExit("bad clip kind %r" % kind)
@@ -734,7 +734,7 @@ print("RESULT " + json.dumps({"orders": worst, "num_frames": nf}), flush=True)
 )
 
 
-def temporal_order_diff(filter_name, params, nframes=None, plane=0, clip="gray32", timeout=600.0):
+def temporal_order_diff(filter_name, params, nframes=None, plane=0, clip="grays", timeout=600.0):
     """Worst pixel diff per frame-request ordering, against the serial run.
 
     ``filter_name`` is the ``core.vsfeel`` function; ``params`` its keyword
@@ -766,7 +766,7 @@ def temporal_order_diff(filter_name, params, nframes=None, plane=0, clip="gray32
 
 
 def assert_temporal_order_consistent(
-    filter_name, params, tol=1e-5, nframes=None, plane=0, clip="gray32", timeout=600.0
+    filter_name, params, tol=1e-5, nframes=None, plane=0, clip="grays", timeout=600.0
 ):
     """Every request order must reproduce the serial result within ``tol``."""
     worst = temporal_order_diff(
@@ -862,7 +862,7 @@ def assert_preserves_frame_props(
 
 
 @pytest.fixture(scope="session")
-def clip_gray():
+def clip_grays():
     """GrayS float32 clip of the test clip."""
     src = _source(CLIP_PATH)
     y = vs.core.std.ShufflePlanes(src, 0, vs.GRAY)
@@ -870,14 +870,14 @@ def clip_gray():
 
 
 @pytest.fixture(scope="session")
-def clip_8bit():
+def clip_gray8():
     """GRAY8 clip of the same video (for input-validation tests)."""
     src = _source(CLIP_PATH)
     return vs.core.std.ShufflePlanes(src, 0, vs.GRAY)
 
 
 @pytest.fixture(scope="session")
-def clip_16bit():
+def clip_gray16():
     """GRAY16 clip of the same video (integer reference comparison)."""
     src = _source(CLIP_PATH)
     y = vs.core.std.ShufflePlanes(src, 0, vs.GRAY)
@@ -889,37 +889,37 @@ def _resized(fmt, **kwargs):
 
 
 @pytest.fixture(scope="session")
-def clip_yuv32():
+def clip_yuv420ps():
     """YUV420PS (float32) version of the clip (chroma is subsampled)."""
     return vs.core.fmtc.bitdepth(_source(CLIP_PATH), bits=32, fulls=True, fulld=True)
 
 
 @pytest.fixture(scope="session")
-def clip_yuv420_16():
-    """YUV420P16 version (subsampled chroma lattice, for the 16-bit 'UV'
+def clip_yuv420p16():
+    """YUV420P16 version (subsampled chroma lattice, for the u16 'UV'
     sweep)."""
     return _resized(vs.YUV420P16)
 
 
 @pytest.fixture(scope="session")
-def clip_yuv444_16():
+def clip_yuv444p16():
     """YUV444P16 version (for joint 'YUV' processing)."""
     return _resized(vs.YUV444P16)
 
 
 @pytest.fixture(scope="session")
-def clip_rgb32():
+def clip_rgbs():
     """RGBS version of the clip."""
     return _resized(vs.RGBS, matrix_in_s="709")
 
 
 @pytest.fixture(scope="session")
-def clip_rgb16():
-    """RGB48 (16-bit integer) version of the clip."""
+def clip_rgb48():
+    """RGB48 (u16) version of the clip."""
     return _resized(vs.RGB48, matrix_in_s="709")
 
 
-def assert_gray32(clip):
+def assert_grays(clip):
     fmt = clip.format
     assert fmt.color_family == vs.GRAY
     assert fmt.sample_type == vs.FLOAT

@@ -80,19 +80,19 @@ def test_shader_limits_stem_survives_windows_globs():
 
     glob echoes the pattern's separators and joins the matched tail with the
     platform's own, so a forward-slash pattern on Windows yields
-    ``build/vk_spv\\eedi3_32_row.spv``. Splitting on ``/`` alone then leaves the
+    ``build/vk_spv\\eedi3_f32_row.spv``. Splitting on ``/`` alone then leaves the
     directory in the stem, which matches no host declaration: every module is
     reported unchecked and ``--check`` passes without comparing anything.
     """
     limits = _load_module("shader_limits", SHADER_LIMITS)
     for path in (
-        "build/vk_spv/eedi3_32_row.spv",
-        "build/vk_spv\\eedi3_32_row.spv",
-        "build\\vk_spv\\eedi3_32_row.spv",
-        "eedi3_32_row.spv",
+        "build/vk_spv/eedi3_f32_row.spv",
+        "build/vk_spv\\eedi3_f32_row.spv",
+        "build\\vk_spv\\eedi3_f32_row.spv",
+        "eedi3_f32_row.spv",
     ):
-        assert limits.path_basename(path) == "eedi3_32_row.spv", path
-        assert limits.variant_stem(path) == "eedi3_32_row", path
+        assert limits.path_basename(path) == "eedi3_f32_row.spv", path
+        assert limits.variant_stem(path) == "eedi3_f32_row", path
     # A non-.spv match keeps its whole name (the pattern is user-supplied).
     assert limits.variant_stem("build\\vk_spv\\notes.txt") == "notes.txt"
 

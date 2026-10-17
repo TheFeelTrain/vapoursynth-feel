@@ -35,7 +35,7 @@ through `tools/benchmark.py`:
 |---|---|---|---|
 | CPU cache (benchmark default) | 2306.6 | 576.1 | 4.00x |
 | `--gpu-cache` | 2305.6 | 708.0 | 3.26x |
-| `--gpu-cache --no-download` (u16 / fp32) | 2317 / 2296 | 732 / 457 | 3.88x |
+| `--gpu-cache --no-download` (u16 / f32) | 2317 / 2296 | 732 / 457 | 3.88x |
 
 - The three modes are within 1% of each other: with the transfer queue the plane
   transfers overlap the kernels, so the filter's own compute is the frame in
@@ -59,7 +59,7 @@ through `tools/benchmark.py`:
   `(h-1)*stride + w - 1` would not fit an int.
 - `round(sigma_spatial*3)` is clamped to 1e6 before the float→int cast (the
   reference clamps identically); `sigma_spatial`/`sigma_color` reject NaN/inf.
-- 16-bit rounding is `uint(v*PEAK + 0.5) & 0xFFFF`, matching the reference's
+- u16 rounding is `uint(v*PEAK + 0.5) & 0xFFFF`, matching the reference's
   round-half-away inside the 1-LSB test tolerance.
 
 ## Performance
@@ -87,7 +87,7 @@ through `tools/benchmark.py`:
   slot memory at `vsvulkanframe.cpp:185-193`). At 1080p u16 that copy is 4.1 MB
   ≈ 0.10–0.16 ms: the measured pre-opt-in gap was 0.606 vs 0.507 ms.
 - **The kernel is not the regression — it is ISA-identical.** `RADV_DEBUG=shaderstats`
-  (R=9, BITS=16, pipeline cache off): new 3101 instructions / 14700 B code / 192
+  (R=9, u16, pipeline cache off): new 3101 instructions / 14700 B code / 192
   VGPR / 0 spill; pre-R80 3102 / 14708 / 192 / 0. `glslc -O` output is 315 vs 321
   SPIR-V lines. The shader rewrite (three whole-buffer bindings, no push
   constants) did not move the machine code.
@@ -120,11 +120,11 @@ sigma_color=Y"]`.
   pre-fix benchmark harness (`notes/METHOD.md`); the same-session result it
   carried (the port changed nothing, **−0.1%**) stands. The banner's table
   replaces the absolute numbers.
-- **2026-09-30 — 16-bit SSBOs need the StorageBuffer class.**
+- **2026-09-30 — u16 SSBOs need the StorageBuffer class.**
   `bilateral_shared_16`/`bilateral_plain_16` carried the same invalid SPIR-V 1.0
   Uniform+BufferBlock 16-bit buffer access as GaussBlur (mechanism and feature
   names in `notes/GAUSSBLUR.md`); both now build with `--target-env=vulkan1.1`.
-  Bit-exact vs vszipcl, 32-bit SPIR-V unchanged.
+  Bit-exact vs vszipcl, f32 SPIR-V unchanged.
 
 ### 2026-09-30 — creation-failure leak
 
@@ -221,7 +221,7 @@ SDMA and the port reaches parity without any core change.
     not the limiter).
 - **Test bounds tightened to the measured agreement, gate covered** (test-only,
   no perf change). The wide-sigma cases were bounded by a `BORDER_TOL`
-  (655 codes 16-bit) whose comment described a staging-tile/border mechanism
+  (655 codes of u16) whose comment described a staging-tile/border mechanism
   that is not on the shipped path; the shared kernel agrees with the reference
   to 1 code / ≤5.6e-9 at every sigma, so the bound is now REF_TOL and 2 codes.
   Added coverage for the automatic LDS gate (a forced 12288-byte device must

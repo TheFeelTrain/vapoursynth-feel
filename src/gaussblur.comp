@@ -24,17 +24,17 @@
  * Buffers: src/dst are the core's own GPU frame planes (vnode: in/out),
  * `tmp` is a transient per-frame scratch buffer for the two-pass path, `wt`
  * is the constant weights buffer. Compile-time variants:
- * -DBITS=16|32. The 16-bit path uses native uint16_t SSBO elements (the
+ * -DIO_U16 / -DIO_F32. The u16 path uses native uint16_t SSBO elements (the
  * device enables storageBuffer16BitAccess), so loads and stores are plain
  * coalesced element accesses — no shift/mask unpacking, no dword packing,
  * no atomics.
  */
 
-#if !defined(BITS)
-#define BITS 16
+#if !defined(IO_U16) && !defined(IO_F32) && !defined(IO_F16)
+#define IO_U16 1
 #endif
 
-#if BITS == 16
+#if defined(IO_U16)
 #define IO_TYPE uint16_t
 #define PEAK    65535.0f
 #else
@@ -81,7 +81,7 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 float load_value(int idx) {
-#if BITS == 32
+#if defined(IO_F32)
     return src[pc.src_base + idx];
 #else
     // direct uint16_t->float conversion chokes glslc; int() widens cleanly
@@ -91,7 +91,7 @@ float load_value(int idx) {
 
 // load from an absolute element index (the caller precomputes src_base itself)
 float load_value_raw(int idx) {
-#if BITS == 32
+#if defined(IO_F32)
     return src[idx];
 #else
     return float(int(src[idx]));
@@ -99,7 +99,7 @@ float load_value_raw(int idx) {
 }
 
 void store_value(int idx, float v) {
-#if BITS == 32
+#if defined(IO_F32)
     dst[pc.dst_base + idx] = v;
 #else
     // glslc -O chokes on a direct float->uint16_t convert (OpUConvert); go
@@ -108,8 +108,8 @@ void store_value(int idx, float v) {
 #endif
 }
 
-#if defined(ENTRY_HORIZ) && (BITS == 16)
-// raw dword view of the 16-bit output buffer (even element = low halfword),
+#if defined(ENTRY_HORIZ) && (defined(IO_U16))
+// raw dword view of the u16 output buffer (even element = low halfword),
 // used by the packed pair stores of the horizontal pass
 layout(std430, binding = 4) writeonly buffer DstU32 { uint dst32[]; };
 

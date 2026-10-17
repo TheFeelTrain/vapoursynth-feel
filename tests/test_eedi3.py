@@ -14,7 +14,7 @@ Agreement measured on the real-content clip (640x360, interp rows only):
   alpha/beta/gamma/vthresh, and the full sclip / mclip surface. sclip
   describes the OUTPUT clip: 2N frames under field>1 (based_aa's
   Interleave([s, s])), 2x height under dh. mclip stays at the source N frames
-  (Gray8/Gray16/Gray32 masks; vsfeel converts the mask to Gray8 internally,
+  (Gray8/Gray16/GRAYS masks; vsfeel converts the mask to Gray8 internally,
   eedi3vk2 needs the clip's format - both then agree bit-exactly).
 * f32 (GRAYS): the same surface is bit-exact too. The window sums are
   re-summed in the reference's k order and the cost/relax/vcheck/cubic float
@@ -74,7 +74,7 @@ from conftest import (
     right_half_mask,
 )
 
-pytestmark = pytest.mark.usefixtures("clip_gray")
+pytestmark = pytest.mark.usefixtures("clip_grays")
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -269,9 +269,9 @@ def _mc_compare(bits, frames, kwargs, mclip=False, sclip=None, mask="right"):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bits,field", [(16, 1), (32, 1)], ids=["16bit", "32bit"])
-def test_eedi3_deterministic(clip_gray, clip_16bit, bits, field):
-    clip = clip_16bit if bits == 16 else clip_gray
+@pytest.mark.parametrize("bits,field", [(16, 1), (32, 1)], ids=["u16", "f32"])
+def test_eedi3_deterministic(clip_grays, clip_gray16, bits, field):
+    clip = clip_gray16 if bits == 16 else clip_grays
     a = _run(clip, field=field)
     b = _run(clip, field=field)
     dtype = _dtype(bits)
@@ -284,12 +284,12 @@ def test_eedi3_deterministic(clip_gray, clip_16bit, bits, field):
             assert np.abs(fa - fb).max() < 1e-6, f"nondeterministic output at frame {n}"
 
 
-@pytest.mark.parametrize("bits", [16, 32], ids=["16bit", "32bit"])
-def test_eedi3_parallel_load_consistent(clip_gray, clip_16bit, bits):
+@pytest.mark.parametrize("bits", [16, 32], ids=["u16", "f32"])
+def test_eedi3_parallel_load_consistent(clip_grays, clip_gray16, bits):
     """Two parallel runs must match the serial path, and each
     other — the request pattern that exposes stale descriptor bindings, fence
     misuse and command-pool reuse violations under load."""
-    clip = clip_16bit if bits == 16 else clip_gray
+    clip = clip_gray16 if bits == 16 else clip_grays
     a = eval_parallel(_run, clip)
     b = eval_parallel(_run, clip)
     ref = _run(clip)
@@ -306,26 +306,26 @@ def test_eedi3_parallel_load_consistent(clip_gray, clip_16bit, bits):
             assert np.abs(a[n] - b[n]).max() < 1e-6, f"nondeterministic output at frame {n}"
 
 
-def test_eedi3_parallel_vcheck_matches_serial(clip_16bit, monkeypatch):
+def test_eedi3_parallel_vcheck_matches_serial(clip_gray16, monkeypatch):
     """The shipped parallel vcheck and the serial walk (VSFEEL_EEDI3_VPARA=0,
     the A/B control) must agree exactly on the noise clip."""
     monkeypatch.setenv("VSFEEL_EEDI3_VPARA", "0")
-    serial = _run(clip_16bit, field=1)
+    serial = _run(clip_gray16, field=1)
     monkeypatch.delenv("VSFEEL_EEDI3_VPARA")
-    parallel = _run(clip_16bit, field=1)
+    parallel = _run(clip_gray16, field=1)
     for n in (0, 11, 23):
         a = _plane(serial.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         b = _plane(parallel.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
         assert np.array_equal(a, b), f"serial/parallel vcheck mismatch at frame {n}"
 
 
-def test_eedi3_preserves_frame_props(clip_gray):
+def test_eedi3_preserves_frame_props(clip_grays):
     """field=1 (no frame doubling) must keep every source property.
 
     ``_FieldBased`` is set to progressive by the filter; the tagged duration
     and custom metadata must survive unchanged.
     """
-    assert_preserves_frame_props(_run, clip_gray, field=1)
+    assert_preserves_frame_props(_run, clip_grays, field=1)
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +333,7 @@ def test_eedi3_preserves_frame_props(clip_gray):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bits", [None, 16], ids=["32bit", "16bit"])
+@pytest.mark.parametrize("bits", [None, 16], ids=["f32", "u16"])
 def test_eedi3_vspipe_pipelined_no_hang(bits):
     """vspipe's pipelined reader plus VapourSynth's prefetch drive frame
     requests far ahead of the in-flight frames; a queue stall or a
@@ -377,23 +377,23 @@ def test_eedi3_vspipe_pipelined_no_hang(bits):
 # ---------------------------------------------------------------------------
 
 
-def test_eedi3_no_nan_all_frames_32bit(clip_gray):
-    out = _run(clip_gray)
+def test_eedi3_no_nan_all_frames_f32(clip_grays):
+    out = _run(clip_grays)
     for n in range(out.num_frames):
         a = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.float32)
         assert np.isfinite(a).all(), f"non-finite output at frame {n}"
 
 
-def test_eedi3_in_range_all_frames_16bit(clip_16bit):
+def test_eedi3_in_range_all_frames_u16(clip_gray16):
     """The uint16 path must keep the input format and actually filter it.
 
     ``max <= 65535`` on a uint16 array cannot fail, so the meaningful checks
     are format-id equality (no silent depth/format change) and an anti-vacuity
     assertion that the noise was altered.
     """
-    out = _run(clip_16bit)
-    assert out.format.id == clip_16bit.format.id
-    assert_changes_on_clip(out, clip_16bit, what="EEDI3")
+    out = _run(clip_gray16)
+    assert out.format.id == clip_gray16.format.id
+    assert_changes_on_clip(out, clip_gray16, what="EEDI3")
 
 
 # ---------------------------------------------------------------------------
@@ -401,8 +401,8 @@ def test_eedi3_in_range_all_frames_16bit(clip_16bit):
 # ---------------------------------------------------------------------------
 
 # (kwargs, tolerance). Both depths are bit-exact against eedi3vk2 -> 0; the one
-# f32 exception is the flat-weight alpha=beta=0.5 corner (see REFERENCE_CASES_32).
-REFERENCE_CASES_16 = [
+# f32 exception is the flat-weight alpha=beta=0.5 corner (see REFERENCE_CASES_F32).
+REFERENCE_CASES_U16 = [
     ({"field": 1}, 0),  # defaults
     ({"field": 1, "mdis": 5, "nrad": 1, "vcheck": 0}, 0),
     ({"field": 1, "mdis": 3, "nrad": 3, "vcheck": 1}, 0),
@@ -454,7 +454,7 @@ REFERENCE_CASES_16 = [
     ),
 ]
 
-REFERENCE_CASES_32 = [
+REFERENCE_CASES_F32 = [
     # The rolling window sums are re-summed in the reference's k order and the
     # cost/relax/vcheck/cubic expressions carry the reference's `precise`
     # qualifiers, so f32 is bit-exact too (measured 0 on every case below).
@@ -596,16 +596,16 @@ def _reference_max_diffs(bits, cases):
 @pytest.mark.parametrize(
     "bits,cases",
     [
-        (16, REFERENCE_CASES_16),
-        (32, REFERENCE_CASES_32),
+        (16, REFERENCE_CASES_U16),
+        (32, REFERENCE_CASES_F32),
     ],
-    ids=["16bit", "32bit"],
+    ids=["u16", "f32"],
 )
 def test_eedi3_matches_vk2_reference(bits, cases):
     """vsfeel must closely match eedi3vk2 across the shared parameter surface.
 
     u16 is bit-exact (tolerance 0). f32 sits at ~1 ulp except a few corners
-    (documented in REFERENCE_CASES_32) where a rounding-order difference
+    (documented in REFERENCE_CASES_F32) where a rounding-order difference
     flips a DP argmin; those use a looser bound.
     """
     reference_or_skip("eedi3vk2", "EEDI3")
@@ -621,8 +621,8 @@ def test_eedi3_matches_vk2_reference(bits, cases):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bits", [16, 32], ids=["16bit", "32bit"])
-def test_eedi3_mclip_gray8_matches_vk2_same_format(clip_gray, clip_16bit, bits):
+@pytest.mark.parametrize("bits", [16, 32], ids=["u16", "f32"])
+def test_eedi3_mclip_gray8_matches_vk2_same_format(clip_grays, clip_gray16, bits):
     """vsfeel's Gray8 mask must equal eedi3vk2's same-format mask exactly on
     the shared surface (vk2 requires the clip's own format)."""
     kw = dict(field=1, mdis=5, nrad=1, vcheck=2)
@@ -633,16 +633,16 @@ def test_eedi3_mclip_gray8_matches_vk2_same_format(clip_gray, clip_16bit, bits):
         assert payload["maxdiff"] < 1e-6, "mclip mismatch"
 
 
-def test_eedi3_mclip_auto_converts_gray16_gray32(clip_gray, clip_16bit):
-    """Mask Gray16 and Gray32 are auto-converted to Gray8 internally and must
+def test_eedi3_mclip_auto_converts_gray16_grays(clip_grays, clip_gray16):
+    """Mask Gray16 and GRAYS are auto-converted to Gray8 internally and must
     give the same result as an explicit Gray8 mask."""
-    clip = clip_16bit
+    clip = clip_gray16
     kw = dict(field=1, mdis=20, nrad=3, vcheck=2)
     m8 = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 8)
     m16 = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
-    m32 = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 32)
+    ms = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 32)
     base = _run(clip, mclip=m8, **kw)
-    for m in (m16, m32):
+    for m in (m16, ms):
         o = _run(clip, mclip=m, **kw)
         for n in (0, 11):
             a = _plane(base.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
@@ -671,7 +671,7 @@ def _mask_boundary_values(width):
 
 
 def _float_mask_clip(arr, length):
-    """A GrayS (32-bit float) mask clip carrying ``arr`` (h, w)."""
+    """A GrayS (f32) mask clip carrying ``arr`` (h, w)."""
     h, w = arr.shape
     base = vs.core.std.BlankClip(format=vs.GRAYS, width=w, height=h, length=length, color=[0.0])
 
@@ -686,7 +686,7 @@ def _float_mask_clip(arr, length):
 
 @pytest.mark.parametrize("kind", ["ramp", "checker"])
 @pytest.mark.parametrize("mdis,nrad", [(5, 1), (20, 3)])
-def test_eedi3_mclip_float_native_matches_reference_conversion(clip_16bit, kind, mdis, nrad):
+def test_eedi3_mclip_float_native_matches_reference_conversion(clip_gray16, kind, mdis, nrad):
     """A GrayS float mask is now handled natively (no SetFrameProps ->
     resize.Point -> Gray8 node). It must produce exactly what the deleted
     reference conversion produced, including at the predicate boundary.
@@ -698,7 +698,7 @@ def test_eedi3_mclip_float_native_matches_reference_conversion(clip_16bit, kind,
     above it), which is the ONLY input class that can see the strict-vs-
     non-strict comparison (verified by mutating ">" to ">=": the ramp and
     checker cases both fail)."""
-    clip = clip_16bit
+    clip = clip_gray16
     kw = dict(field=1, mdis=mdis, nrad=nrad, vcheck=0)
     mid = np.float32(0.5) / np.float32(255.0)
     above = np.nextafter(mid, np.float32(2.0), dtype=np.float32)
@@ -727,7 +727,7 @@ def test_eedi3_mclip_float_native_matches_reference_conversion(clip_16bit, kind,
 
 
 @pytest.mark.parametrize("mdis,nrad", [(5, 1), (20, 3)])
-def test_eedi3_mclip_long_mask_off_prefix(clip_16bit, mdis, nrad):
+def test_eedi3_mclip_long_mask_off_prefix(clip_gray16, mdis, nrad):
     """A mask that is OFF for a long left prefix puts the first DP column far
     to the right. Every column left of it must still be written (the vertical
     cubic). The backtrack used to `break` out of its tile loop once a whole
@@ -736,7 +736,7 @@ def test_eedi3_mclip_long_mask_off_prefix(clip_16bit, mdis, nrad):
     (This is the structured-mclip nondeterminism tracked from round 14; the
     existing tests missed it because their half/half mask puts the mask ON on
     the left, i.e. first DP column 0.)"""
-    clip = clip_16bit
+    clip = clip_gray16
     kw = dict(field=1, mdis=mdis, nrad=nrad, vcheck=0)
     half = WIDTH // 2
     black = vs.core.std.BlankClip(
@@ -770,17 +770,17 @@ def test_eedi3_mclip_long_mask_off_prefix(clip_16bit, mdis, nrad):
         )
 
 
-def test_eedi3_mclip_masked_region_is_vertical_cubic(clip_16bit):
+def test_eedi3_mclip_masked_region_is_vertical_cubic(clip_gray16):
     """Inside a masked (black) region the interpolated pixel is the vertical
     cubic of the two kept rows; verify on mid-frame interp rows where all four
     taps are interior. The cubic is the reference's integer form,
     ``(9*(p1+n1) - (p3+n3) + 8) >> 4``, and the masked region reproduces it
     exactly (the pre-fix expectation read p3/n3 as the same row)."""
-    clip = clip_16bit
+    clip = clip_gray16
     kw = dict(field=1, mdis=5, nrad=1, vcheck=0)
     m16 = right_half_mask(WIDTH, HEIGHT, clip.num_frames, 16)
     out = _run(clip, mclip=m16, **kw)
-    src = clip_16bit
+    src = clip_gray16
     for n in (0,):
         f = out.get_frame(n)
         s = src.get_frame(n)
@@ -805,17 +805,17 @@ def test_eedi3_mclip_masked_region_is_vertical_cubic(clip_16bit):
 
 
 @pytest.mark.parametrize("field", [2, 3], ids=["field2", "field3"])
-def test_eedi3_mclip_field_gt1_matches_vk2(clip_16bit, field):
+def test_eedi3_mclip_field_gt1_matches_vk2(clip_gray16, field):
     """mclip combined with frame doubling: the mask (N frames, one per source
     frame) must drive both output parities exactly like eedi3vk2."""
-    n_src = clip_16bit.num_frames
+    n_src = clip_gray16.num_frames
     kw = dict(field=field, mdis=5, nrad=1, vcheck=2)
     payload = _mc_compare(16, (0, 5, n_src, 2 * n_src - 1), kw, mclip=True)
     assert payload["num_frames"] == 2 * n_src
     assert payload["maxdiff"] == 0, f"mclip field={field} mismatch"
 
 
-def test_eedi3_mclip_dh_matches_vk2(clip_16bit):
+def test_eedi3_mclip_dh_matches_vk2(clip_gray16):
     """mclip combined with dh (doubled height)."""
     kw = dict(field=1, dh=1, mdis=5, nrad=1, vcheck=2)
     payload = _mc_compare(16, (0, 11, 23), kw, mclip=True)
@@ -829,7 +829,7 @@ def test_eedi3_mclip_dh_matches_vk2(clip_16bit):
 
 
 @pytest.mark.parametrize("mask", ["right", "left", "all"])
-@pytest.mark.parametrize("bits", [16, 32], ids=["16bit", "32bit"])
+@pytest.mark.parametrize("bits", [16, 32], ids=["u16", "f32"])
 def test_eedi3_hp_mclip_matches_vk2(bits, mask):
     """hp + mclip on the three mask shapes that select different mask paths:
     right = the DP starts at column 0, left = a long masked left tail (the row
@@ -843,7 +843,7 @@ def test_eedi3_hp_mclip_matches_vk2(bits, mask):
         assert payload["maxdiff"] < 1e-6, f"hp mclip({mask}) mismatch"
 
 
-def test_eedi3_hp_mclip_long_prefix_matches_vk2(clip_16bit):
+def test_eedi3_hp_mclip_long_prefix_matches_vk2(clip_gray16):
     """The masked left tail (xmin far right) at a larger mdis, where the hp
     fixup lanes and the tail's ramp geometry differ most from full-pel."""
     kw = dict(field=1, hp=1, mdis=20, nrad=3, vcheck=2)
@@ -851,7 +851,7 @@ def test_eedi3_hp_mclip_long_prefix_matches_vk2(clip_16bit):
     assert payload["maxdiff"] == 0, "hp mclip long prefix mismatch"
 
 
-def test_eedi3_hp_mclip_dh_matches_vk2(clip_16bit):
+def test_eedi3_hp_mclip_dh_matches_vk2(clip_gray16):
     """hp + mclip + dh (a doubled, transposed-geometry pad with hp rows)."""
     kw = dict(field=1, hp=1, dh=1, mdis=5, nrad=1, vcheck=2)
     payload = _mc_compare(16, (0, 11), kw, mclip=True, mask="left")
@@ -859,16 +859,16 @@ def test_eedi3_hp_mclip_dh_matches_vk2(clip_16bit):
     assert payload["maxdiff"] == 0, "hp mclip dh mismatch"
 
 
-def test_eedi3_hp_mclip_field_gt1_matches_vk2(clip_16bit):
+def test_eedi3_hp_mclip_field_gt1_matches_vk2(clip_gray16):
     """hp + mclip with frame doubling (one mask frame driving both parities)."""
-    n_src = clip_16bit.num_frames
+    n_src = clip_gray16.num_frames
     kw = dict(field=3, hp=1, mdis=5, nrad=1, vcheck=2)
     payload = _mc_compare(16, (0, n_src, 2 * n_src - 1), kw, mclip=True)
     assert payload["num_frames"] == 2 * n_src
     assert payload["maxdiff"] == 0, "hp mclip field=3 mismatch"
 
 
-def test_eedi3_hp_sclip_matches_vk2(clip_16bit):
+def test_eedi3_hp_sclip_matches_vk2(clip_gray16):
     """hp + sclip: the vcheck's cint is replaced by the caller's clip, and the
     d2p term halves the direction (hp's a2 measures full-pel units)."""
     kw = dict(field=1, hp=1, mdis=20, nrad=2, vcheck=2)
@@ -881,7 +881,7 @@ def test_eedi3_hp_sclip_matches_vk2(clip_16bit):
 # ---------------------------------------------------------------------------
 
 
-def test_eedi3_yuv_passthrough_16bit(clip_16bit):
+def test_eedi3_yuv_passthrough_u16(clip_gray16):
     """A full YUV clip is accepted; with planes=[0] the chroma planes must be
     copied through bit-identically and the luma must match the Gray output."""
     core = vs.core
@@ -890,7 +890,7 @@ def test_eedi3_yuv_passthrough_16bit(clip_16bit):
     assert yuv.format.color_family == vs.YUV
 
     out = _run(yuv, planes=[0])
-    ref = _run(clip_16bit)
+    ref = _run(clip_gray16)
 
     for n in (0, 11, 23):
         d = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.int64) - _plane(
@@ -906,12 +906,12 @@ def test_eedi3_yuv_passthrough_16bit(clip_16bit):
             assert np.array_equal(a, b), f"chroma{plane} changed at frame {n}"
 
 
-def test_eedi3_yuv_passthrough_32bit(clip_gray):
+def test_eedi3_yuv_passthrough_f32(clip_grays):
     core = vs.core
     src = core.bs.VideoSource(CLIP_PATH)
     yuv = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
     out = _run(yuv, planes=[0])
-    ref = _run(clip_gray)
+    ref = _run(clip_grays)
     for n in (0, 11, 23):
         f = out.get_frame(n)
         d = frame_to_ndarray(f) - frame_to_ndarray(ref.get_frame(n))
@@ -927,7 +927,7 @@ def test_eedi3_yuv_passthrough_32bit(clip_gray):
 
 def test_eedi3_dh_doubles_height():
     """dh=True doubles the height and interp parity is the field."""
-    clip = noise_16bit_or_skip()
+    clip = noise_u16_or_skip()
     kw = dict(field=1, dh=1, mdis=5, nrad=1, vcheck=0)
     out = _run(clip, **kw)
     assert out.width == WIDTH
@@ -938,7 +938,7 @@ def test_eedi3_dh_doubles_height():
 def test_eedi3_field_gt1_doubles_frames():
     """field=3 (top field base + doubling) doubles the frame count and the
     output fps, with kept rows matching the source (progressive)."""
-    clip = noise_16bit_or_skip()
+    clip = noise_u16_or_skip()
     out = _run(clip, field=3, mdis=5, nrad=1, vcheck=0)
     assert out.num_frames == 2 * clip.num_frames
     assert out.fps_num == 2 * clip.fps_num
@@ -957,7 +957,7 @@ def test_eedi3_field_gt1_doubles_frames():
 def test_eedi3_output_props_progressive_and_duration():
     """Output frames are progressive (_FieldBased=0) and under field>1 the
     duration is halved (fps doubles) — the standard EEDI3 deinterlace props."""
-    clip = noise_16bit_or_skip()
+    clip = noise_u16_or_skip()
     s0 = clip.get_frame(0).props
     sn, sd = s0.get("_DurationNum"), s0.get("_DurationDen")
     for field, factor in ((1, 1), (3, 2)):
@@ -976,7 +976,7 @@ def test_eedi3_output_props_progressive_and_duration():
             )
 
 
-def noise_16bit_or_skip():
+def noise_u16_or_skip():
     # session fixture helper for tests that don't want the pytest fixture name
     from conftest import _source
 
@@ -990,29 +990,29 @@ def noise_16bit_or_skip():
 # ---------------------------------------------------------------------------
 
 
-def test_eedi3_rejects_8bit(clip_8bit):
+def test_eedi3_rejects_8bit(clip_gray8):
     with pytest.raises(vs.Error):
-        _run(clip_8bit)
+        _run(clip_gray8)
 
 
-def test_eedi3_rejects_10bit(clip_8bit):
-    clip = vs.core.fmtc.bitdepth(clip_8bit, bits=10)
+def test_eedi3_rejects_10bit(clip_gray8):
+    clip = vs.core.fmtc.bitdepth(clip_gray8, bits=10)
     with pytest.raises(vs.Error):
         _run(clip)
 
 
-def test_eedi3_rejects_bad_field(clip_16bit):
+def test_eedi3_rejects_bad_field(clip_gray16):
     for bad in (-1, 4):
         with pytest.raises(vs.Error):
-            _run(clip_16bit, field=bad)
+            _run(clip_gray16, field=bad)
 
 
-def test_eedi3_rejects_dh_with_field_gt1(clip_16bit):
+def test_eedi3_rejects_dh_with_field_gt1(clip_gray16):
     with pytest.raises(vs.Error):
-        _run(clip_16bit, field=2, dh=1)
+        _run(clip_gray16, field=2, dh=1)
 
 
-def test_eedi3_rejects_bad_alpha_beta(clip_16bit):
+def test_eedi3_rejects_bad_alpha_beta(clip_gray16):
     for kw in (
         {"alpha": -0.1},
         {"alpha": 1.5},
@@ -1021,48 +1021,48 @@ def test_eedi3_rejects_bad_alpha_beta(clip_16bit):
         {"beta": -0.1},
     ):
         with pytest.raises(vs.Error):
-            _run(clip_16bit, **kw)
+            _run(clip_gray16, **kw)
 
 
-def test_eedi3_rejects_bad_gamma(clip_16bit):
+def test_eedi3_rejects_bad_gamma(clip_gray16):
     with pytest.raises(vs.Error):
-        _run(clip_16bit, gamma=-1.0)
+        _run(clip_gray16, gamma=-1.0)
 
 
-def test_eedi3_rejects_bad_nrad(clip_16bit):
+def test_eedi3_rejects_bad_nrad(clip_gray16):
     for bad in (-1, 4):
         with pytest.raises(vs.Error):
-            _run(clip_16bit, nrad=bad)
+            _run(clip_gray16, nrad=bad)
 
 
-def test_eedi3_rejects_bad_mdis(clip_16bit):
+def test_eedi3_rejects_bad_mdis(clip_gray16):
     for bad in (0, 41):
         with pytest.raises(vs.Error):
-            _run(clip_16bit, mdis=bad)
+            _run(clip_gray16, mdis=bad)
 
 
-def test_eedi3_rejects_bad_vcheck(clip_16bit):
+def test_eedi3_rejects_bad_vcheck(clip_gray16):
     for bad in (-1, 4):
         with pytest.raises(vs.Error):
-            _run(clip_16bit, vcheck=bad)
+            _run(clip_gray16, vcheck=bad)
 
 
-def test_eedi3_rejects_bad_vthresh(clip_16bit):
+def test_eedi3_rejects_bad_vthresh(clip_gray16):
     for kw in ({"vthresh0": 0.0}, {"vthresh1": -5.0}, {"vthresh2": 0.0}):
         with pytest.raises(vs.Error):
-            _run(clip_16bit, vcheck=2, **kw)
+            _run(clip_gray16, vcheck=2, **kw)
     # vthresh ignored when vcheck == 0
-    _run(clip_16bit, vcheck=0, vthresh0=0.0)
+    _run(clip_gray16, vcheck=0, vthresh0=0.0)
 
 
-def test_eedi3_rejects_bad_planes(clip_16bit):
+def test_eedi3_rejects_bad_planes(clip_gray16):
     with pytest.raises(vs.Error):
-        _run(clip_16bit, planes=[0, 0])
+        _run(clip_gray16, planes=[0, 0])
     with pytest.raises(vs.Error):
-        _run(clip_16bit, planes=[5])
+        _run(clip_gray16, planes=[5])
 
 
-def _yuv16():
+def _yuv420p16():
     core = vs.core
     return core.fmtc.bitdepth(core.bs.VideoSource(CLIP_PATH), bits=16, fulls=True, fulld=True)
 
@@ -1075,7 +1075,7 @@ def test_eedi3_rejects_dh_with_a_planes_subset():
     frame on a plane that is not GPU resident. Both halves of the condition are
     checked so the guard is not just "dh is refused".
     """
-    yuv = _yuv16()
+    yuv = _yuv420p16()
     for planes in ([0], [1], [1, 2]):
         with pytest.raises(vs.Error):
             _run(yuv, field=1, dh=1, planes=planes)
@@ -1084,13 +1084,13 @@ def test_eedi3_rejects_dh_with_a_planes_subset():
 
 
 @pytest.mark.parametrize("name", ["alpha", "beta", "gamma", "vthresh0", "vthresh1", "vthresh2"])
-def test_eedi3_rejects_non_finite_params(clip_16bit, name):
+def test_eedi3_rejects_non_finite_params(clip_gray16, name):
     """NaN is false against every range comparison, so it used to reach the
     push constants; +/-inf is only caught by the one-sided gamma/vthresh2
     checks (alpha/beta reject +inf through their upper bound)."""
     for bad in (float("nan"), float("inf")):
         with pytest.raises(vs.Error):
-            _run(clip_16bit, **{name: bad})
+            _run(clip_gray16, **{name: bad})
 
 
 def test_eedi3_rejects_scratch_over_two_gib():
@@ -1103,46 +1103,46 @@ def test_eedi3_rejects_scratch_over_two_gib():
         vs.core.vsfeel.EEDI3(clip, field=1, mdis=40)
 
 
-def test_eedi3_rejects_mclip_not_gray(clip_16bit):
+def test_eedi3_rejects_mclip_not_gray(clip_gray16):
     src = vs.core.bs.VideoSource(CLIP_PATH)
     yuv = vs.core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
     with pytest.raises(vs.Error):
-        _run(clip_16bit, mclip=yuv)
+        _run(clip_gray16, mclip=yuv)
 
 
-def test_eedi3_rejects_mclip_wrong_dims(clip_16bit):
+def test_eedi3_rejects_mclip_wrong_dims(clip_gray16):
     core = vs.core
     small = core.std.BlankClip(
-        format=vs.GRAY8, width=100, height=100, length=clip_16bit.num_frames, color=[128]
+        format=vs.GRAY8, width=100, height=100, length=clip_gray16.num_frames, color=[128]
     )
     with pytest.raises(vs.Error):
-        _run(clip_16bit, mclip=small)
+        _run(clip_gray16, mclip=small)
 
 
-def test_eedi3_rejects_mclip_wrong_frames(clip_16bit):
+def test_eedi3_rejects_mclip_wrong_frames(clip_gray16):
     core = vs.core
     short = core.std.BlankClip(format=vs.GRAY8, width=WIDTH, height=HEIGHT, length=1, color=[128])
     with pytest.raises(vs.Error):
-        _run(clip_16bit, mclip=short)
+        _run(clip_gray16, mclip=short)
 
 
-def test_eedi3_rejects_sclip_wrong_dims_when_vcheck(clip_16bit):
+def test_eedi3_rejects_sclip_wrong_dims_when_vcheck(clip_gray16):
     """sclip is validated only when vcheck > 0 (eedi3m semantics)."""
     core = vs.core
     small = core.std.BlankClip(
-        format=vs.GRAY16, width=100, height=100, length=clip_16bit.num_frames
+        format=vs.GRAY16, width=100, height=100, length=clip_gray16.num_frames
     )
     with pytest.raises(vs.Error):
-        _run(clip_16bit, vcheck=2, sclip=small)
+        _run(clip_gray16, vcheck=2, sclip=small)
     # ignored (not validated) when vcheck == 0
-    _run(clip_16bit, vcheck=0, sclip=small)
+    _run(clip_gray16, vcheck=0, sclip=small)
 
 
-def test_eedi3_sclip_requires_2n_frames_under_field_gt1(clip_16bit):
+def test_eedi3_sclip_requires_2n_frames_under_field_gt1(clip_gray16):
     """sclip describes the OUTPUT: under field>1 the sclip must have 2N frames
     (one per output frame, like based_aa's Interleave([s, s])). N-frame sclips
     are rejected; the 2N one is accepted and bit-exact vs eedi3vk2."""
-    clip = clip_16bit
+    clip = clip_gray16
     N = clip.num_frames
     base = dict(field=3, mdis=5, nrad=1, vcheck=2)
     with pytest.raises(vs.Error):
@@ -1153,9 +1153,9 @@ def test_eedi3_sclip_requires_2n_frames_under_field_gt1(clip_16bit):
     assert payload["maxdiff"] == 0, "field=3 sclip mismatch"
 
 
-def test_eedi3_sclip_dh_requires_doubled_height(clip_16bit):
+def test_eedi3_sclip_dh_requires_doubled_height(clip_gray16):
     """Under dh the output doubles in height, so sclip must be 2x tall too."""
-    clip = clip_16bit
+    clip = clip_gray16
     base = dict(field=1, dh=1, mdis=5, nrad=1, vcheck=2)
     with pytest.raises(vs.Error):
         _run(clip, sclip=clip, **base)  # 1x height: wrong
@@ -1164,7 +1164,7 @@ def test_eedi3_sclip_dh_requires_doubled_height(clip_16bit):
     assert payload["maxdiff"] == 0, "dh sclip mismatch"
 
 
-def test_eedi3_compat_args_are_accepted_noops(clip_16bit):
+def test_eedi3_compat_args_are_accepted_noops(clip_gray16):
     """eedi3m/vsaa compat args are registered and byte-identical.
 
     ``opt`` (eedi3m SIMD level) and ``ucubic``/``cost3`` (deprecated vsaa) all
@@ -1176,7 +1176,7 @@ def test_eedi3_compat_args_are_accepted_noops(clip_16bit):
     """
     base = dict(field=1, mdis=5, nrad=1, vcheck=2)
     ref = [
-        _plane(_run(clip_16bit, **base).get_frame(n), 0, WIDTH, HEIGHT, np.uint16) for n in (0, 11)
+        _plane(_run(clip_gray16, **base).get_frame(n), 0, WIDTH, HEIGHT, np.uint16) for n in (0, 11)
     ]
     for kw in (
         {"opt": 0},
@@ -1186,18 +1186,18 @@ def test_eedi3_compat_args_are_accepted_noops(clip_16bit):
         {"cost3": 0},
         {"cost3": 1},
     ):
-        out = _run(clip_16bit, **base, **kw)
+        out = _run(clip_gray16, **base, **kw)
         for n, want in zip((0, 11), ref):
             got = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16)
             assert np.array_equal(got, want), f"{kw} changed frame {n}"
 
 
-@pytest.mark.parametrize("bits", [16, 32], ids=["16bit", "32bit"])
-def test_eedi3_hp_differs_from_fullpel(clip_gray, clip_16bit, bits):
+@pytest.mark.parametrize("bits", [16, 32], ids=["u16", "f32"])
+def test_eedi3_hp_differs_from_fullpel(clip_grays, clip_gray16, bits):
     """``hp`` is live: the half-pel search must change the interpolated rows
     (an inert parameter would make the whole hp surface vacuous) and must be as
     deterministic as every other mode."""
-    clip = clip_16bit if bits == 16 else clip_gray
+    clip = clip_gray16 if bits == 16 else clip_grays
     dtype = _dtype(bits)
     base = dict(field=1, mdis=5, nrad=1, vcheck=2)
     full = _run(clip, **base)
@@ -1217,11 +1217,11 @@ def test_eedi3_hp_differs_from_fullpel(clip_gray, clip_16bit, bits):
     assert changed > 0, "hp=True produced the full-pel output (parameter is inert)"
 
 
-def test_eedi3_sclip_content_matches_vk2(clip_16bit):
+def test_eedi3_sclip_content_matches_vk2(clip_gray16):
     """sclip is the vcheck reference: with vcheck > 0 the output must use the
     sclip content (shifted noise, never equal to the vertical cubic) exactly
     like eedi3vk2 does. Guards the sclip row staging / Interleave parity."""
-    clip = clip_16bit
+    clip = clip_gray16
     base = dict(field=1, mdis=5, nrad=1, vcheck=2)
     payload = _mc_compare(16, (0, 11, 23), base, sclip="shift")
     assert payload["maxdiff"] == 0, "sclip mismatch"

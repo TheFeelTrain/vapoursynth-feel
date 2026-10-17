@@ -336,7 +336,7 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV &&
          fmt.colorFamily != cfRGB)) {
         return set_error(
-            "input bitdepth must be 16 (integer) or 32 (float), Gray/YUV/RGB.");
+            "input bitdepth must be u16 (16-bit integer) or f32 (32-bit float), Gray/YUV/RGB.");
     }
 
     d->bits = bits;
@@ -461,15 +461,15 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
     const uint32_t * horiz_code = nullptr;
     size_t horiz_size = 0;
     if (d->bits == 16) {
-        vert_code = box_16_vert_spv;
-        vert_size = box_16_vert_spv_size;
-        horiz_code = box_16_horiz_spv;
-        horiz_size = box_16_horiz_spv_size;
+        vert_code = box_u16_vert_spv;
+        vert_size = box_u16_vert_spv_size;
+        horiz_code = box_u16_horiz_spv;
+        horiz_size = box_u16_horiz_spv_size;
     } else {
-        vert_code = box_32_vert_spv;
-        vert_size = box_32_vert_spv_size;
-        horiz_code = box_32_horiz_spv;
-        horiz_size = box_32_horiz_spv_size;
+        vert_code = box_f32_vert_spv;
+        vert_size = box_f32_vert_spv_size;
+        horiz_code = box_f32_horiz_spv;
+        horiz_size = box_f32_horiz_spv_size;
     }
 
     const uint32_t max_grid_x = d->gpu->limits.maxComputeWorkGroupCount[0];

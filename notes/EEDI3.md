@@ -1,7 +1,7 @@
 # EEDI3 — notes
 
 Status: **shipped** — family-A semantics (eedi3m/eedi3vk2). Both depths are
-bit-exact against eedi3vk2: the fp32 rolling sums are re-summed in the
+bit-exact against eedi3vk2: the f32 rolling sums are re-summed in the
 reference's k order and the cost/relax/vcheck/cubic float expressions carry its
 `precise` qualifiers. `hp` (which eedi3m only registers; eedi3vk2, vszip and
 vszipcl implement it) is live and bit-exact too. EEDI3, EEDI3H (native
@@ -19,7 +19,7 @@ vcheck=2. `MANGOHUD=0 uv run tools/benchmark.py --filter eedi3 --gpu-cache
 | u16 | 621 | 54 | 139 |
 | u16 (EEDI3H, same call surface) | 749 | 51 | - |
 | u16 hp | 237 | 45 | 80 |
-| fp32 | 486 | 54 | 129 |
+| f32 | 486 | 54 | 129 |
 
 The hp row costs vsfeel **2.6x** (621 → 237): the direction set doubles (TPITCH
 41 → 81, K 2 → 3), the relax widens to ±2 and `pbt` grows 16 → 81 bytes.
@@ -283,16 +283,16 @@ What survives, by mechanism:
   to O(log mdis) whole-array 64-bit shift-OR passes. Gotchas: the accumulator must
   span `width+mdis` bits or the right edge loses coverage; clear bits past `width`;
   the shift form equals the scalar only when `width >= 2*mdis`.
-- **The in-graph mask conversion was a whole extra pass** (round 11). Native 16-bit
+- **The in-graph mask conversion was a whole extra pass** (round 11). Native u16
   masks read directly: zimg's full-range 16→8 is monotonic `round(v*255/65535)`, so
   `converted != 0` is exactly `v >= 129` (verified over all 65536 values), packed via
   `bmask_bits16` (xor 0x8000 → signed `cmpgt` → `movemask`). **`cmpgt` is strict, so
   the constant is `128 - 32768`, not `-32639`** — the off-by-one silently tests
   `v >= 130` and only a near-threshold input exposes it. Float and 10/12/14-bit masks
   keep the reference conversion.
-- **Harness memory** (round 12): a bimodal fp32 result was `make_aa_vpy`'s 48 GB
+- **Harness memory** (round 12): a bimodal f32 result was `make_aa_vpy`'s 48 GB
   `max_cache_size` plus the benchmark's decoded-frame list being **additive**, past
-  62 GB. Lower the fp32 Python cap, **never** `max_cache_size`.
+  62 GB. Lower the f32 Python cap, **never** `max_cache_size`.
 
 ### Rounds 5–13 — pre-port host path (deleted by the R80 port)
 
@@ -340,7 +340,7 @@ Mechanism only; none of this code ships, and none of it is a "current shape".
   staging pulled ~41x the needed data through the store→load dependency. Rolling
   window under mclip **+76%**. A two-dispatch DP/backtrack split was **NEUTRAL**
   (the phase boundary costs exactly what removing the same-WG store→load hazard
-  saved). The u16 (+77%) vs fp32 (+21%) asymmetry is Amdahl: **the fp32 row kernel
+  saved). The u16 (+77%) vs f32 (+21%) asymmetry is Amdahl: **the f32 row kernel
   is entirely hidden**.
 - **Round 16 — native float mask** (`mclip_native32`): based_aa passes the mask in
   the clip's format. The reference conversion's nonzero boundary is
@@ -466,7 +466,7 @@ passes). All bit-identical to the previous build unless stated.
   `if (f2 == pc.pbt_base) dmap[rempty_base + r] = 0`, but `pbt_base` is a byte offset
   while `f2` is a sum of byte-valued steps, so firing cleared the per-row empty flag
   the vcheck reads — changing the vcheck's branch mix and the output. Replaced by a
-  read-only sink into `rowXmin`: PROBE=7 row SPIR-V 43744 → **44432 B** (BITS=16), so
+  read-only sink into `rowXmin`: PROBE=7 row SPIR-V 43744 → **44432 B** (IO_U16), so
   the walk is still compiled in, and the output is byte-identical to PROBE=0 (sha256
   `283717477cead12f`). Warning baseline: `-Wall -Wextra -Wshadow` gave 191 hits, all
   but 2 being `-Wmissing-field-initializers` on the Vulkan designated-initializer

@@ -33,7 +33,7 @@ qual=2 etype=0 pscrn=4`), 5000 frames, medians of 3 through
 |---|---|---|---|
 | CPU cache (benchmark default) | 3124.0 | 2793.0 | 1.12x |
 | `--gpu-cache` (resident GPU clip) | 3432.4 | 2271.5 | 1.51x |
-| `--gpu-cache --no-download` (u16 / fp32) | 4666 / 3967 | 2218 / 1207 | 2.52x |
+| `--gpu-cache --no-download` (u16 / f32) | 4666 / 3967 | 2218 / 1207 | 2.52x |
 
 - The resident rows win by more than the CPU-sink row because the reference
   pays a real download there while vsfeel consumes the core's plane.
@@ -64,7 +64,7 @@ qual=2 etype=0 pscrn=4`), 5000 frames, medians of 3 through
   planes, noise_24f → YUV420P8 field=1); vs CPU znedi3 maxdiff 5, ~1 % px
   (CPU float ordering) — **nnedi3vk is ground truth**.
 - Accuracy (unchanged by the port, `tests/test_nnedi3.py` green under
-  `cpu_node`): 16-bit within **1 LSB** (isolated 1-code flips from
+  `cpu_node`): u16 within **1 LSB** (isolated 1-code flips from
   serial-vs-butterfly reduction order), GRAYS within **~3e-8** (bound 1e-6).
   Sweeps field 0/1/2/3, dh, planes subsets, nsize 0..6, nns 0..4, qual 1/2,
   etype 0/1, pscrn 0..4 across GRAY16/YUV420P16/GRAYS, plus determinism,
@@ -111,7 +111,7 @@ qual=2 etype=0 pscrn=4`), 5000 frames, medians of 3 through
   mean-subtraction projected out), packed into three vec4/vec2-layout blobs
   and written through persistently mapped host-visible buffers + `_mm_sfence`.
 - `field` is registered **required** (the `:opt` + null-error-pointer history
-  killed the process); 16-bit integer and 32-bit float input only; `field>1`
+  killed the process); u16 and f32 input only; `field>1`
   doubles `vi_out` with the unknown-length (`numFrames == -1`) guard.
 - `vsfeel/vsaa.py`: `NNEDI3(vsaa.deinterlacers.NNEDI3)` overrides only
   `_deinterlacer_function` to return `core.vsfeel.NNEDI3` (field/dh and the

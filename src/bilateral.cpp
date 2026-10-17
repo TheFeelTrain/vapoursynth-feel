@@ -430,7 +430,8 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         !vsh::isConstantVideoFormat(d->vi) ||
         (sample == stInteger && bps != 16) ||
         (sample == stFloat && bps != 32)) {
-        return set_error("input bitdepth must be 16 (integer) or 32 (float).");
+        return set_error(
+            "input bitdepth must be u16 (16-bit integer) or f32 (32-bit float).");
     }
 
     d->bits = d->vi->format.bitsPerSample;
@@ -750,19 +751,19 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
     size_t plain_size = 0;
     switch (d->bits) {
     case 16:
-        shared_code = bilateral_shared_16_spv;
-        shared_size = bilateral_shared_16_spv_size;
-        plain_code = bilateral_plain_16_spv;
-        plain_size = bilateral_plain_16_spv_size;
+        shared_code = bilateral_shared_u16_spv;
+        shared_size = bilateral_shared_u16_spv_size;
+        plain_code = bilateral_plain_u16_spv;
+        plain_size = bilateral_plain_u16_spv_size;
         break;
     case 32:
-        shared_code = bilateral_shared_32_spv;
-        shared_size = bilateral_shared_32_spv_size;
-        plain_code = bilateral_plain_32_spv;
-        plain_size = bilateral_plain_32_spv_size;
+        shared_code = bilateral_shared_f32_spv;
+        shared_size = bilateral_shared_f32_spv_size;
+        plain_code = bilateral_plain_f32_spv;
+        plain_size = bilateral_plain_f32_spv_size;
         break;
     default:
-        return set_error("unsupported bit depth");
+        return set_error("unsupported io type");
     }
 
     for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {

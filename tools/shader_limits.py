@@ -244,7 +244,7 @@ ASSIGN_LHS = re.compile(
     r"(?:\s*\[[^\]]*\])?\s*$"
 )
 # Braces are allowed: the variant tables are braced initializer lists
-# (`d->vcheck_para_code = { eedi3_16_vcheck_para_spv, ... };`).
+# (`d->vcheck_para_code = { eedi3_u16_vcheck_para_spv, ... };`).
 ASSIGN_RHS = re.compile(r"\s*([^;]{0,900});")
 # An identifier holds a module only when it is assigned one (or a list/ternary
 # of them). `result = create_agg_pipeline(..., bm3d_agg_spv, ...)` must not make
@@ -383,8 +383,8 @@ def assignments(text):
 def ident_stems(text):
     """`ident -> {stem}` for every `ident = <stem>_spv` (and through other idents).
 
-    Covers the variant switches (`d->row_code = eedi3_16_row_spv;`,
-    `fused_code[0] = dfttest_16_fused_r0_spv;`) and the one level of locals the
+    Covers the variant switches (`d->row_code = eedi3_u16_row_spv;`,
+    `fused_code[0] = dfttest_u16_fused_r0_spv;`) and the one level of locals the
     call sites use (`mod`, `vc_code`, `pre_code`).
     """
     direct, via = {}, []

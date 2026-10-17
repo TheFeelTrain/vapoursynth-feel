@@ -87,10 +87,10 @@ _LIFECYCLE_SCRIPT = textwrap.dedent(f"""\
 """)
 
 
-def test_concurrent_create_destroy_with_active_graph(clip_gray):
+def test_concurrent_create_destroy_with_active_graph(clip_grays):
     """Creating/destroying nodes must not disturb a concurrently running graph.
 
-    ``clip_gray`` is requested only so this test depends on the usual source
+    ``clip_grays`` is requested only so this test depends on the usual source
     setup; the subprocess builds its own graph.
     """
     try:

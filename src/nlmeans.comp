@@ -12,7 +12,7 @@
  *   -DENTRY_ACC      nlmAccumulation +q/-q accumulation, applying the final
  *                                  weighted average on the last sweep (pc3)
  *
- * -DBITS=16|32 selects the io element type. Everything fixed per instance
+ * -DIO_U16 / -DIO_F32 selects the io element type. Everything fixed per instance
  * (dims, strides, pad, d/a/s, ref mode, channels, wmode, wref) arrives as
  * specialization constants so each pipeline compiles to its cheapest form.
  *
@@ -29,15 +29,15 @@
  * q-batched sweep order are part of the result (see reference nlmeans.cu).
  */
 
-#if !defined(BITS)
-#define BITS 16
+#if !defined(IO_U16) && !defined(IO_F32) && !defined(IO_F16)
+#define IO_U16 1
 #endif
 
-// the weight ring is fp32 regardless of the io depth (see WeightBuf below)
+// the weight ring is f32 regardless of the io depth (see WeightBuf below)
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_buffer_reference : require
 
-#if BITS == 16
+#if defined(IO_U16)
 #define PEAK       65535.0f
 #define SCALE      (1.0f / 65535.0f)
 #define VTYPE      uint16_t
@@ -87,10 +87,10 @@ layout(std430, binding = 3) writeonly buffer Dst1 { VTYPE d1[]; };
 layout(std430, binding = 4) writeonly buffer Dst2 { VTYPE d2[]; };
 layout(std430, binding = 5) readonly buffer WQBuf { int wq[]; };
 layout(std430, binding = 6) readonly buffer AQBuf { int aq[]; };
-// Weights are fp32 like the reference's u4a. An fp16 ring (x4096 to dodge the
+// Weights are f32 like the reference's u4a. An f16 ring (x4096 to dodge the
 // subnormal cliff) halves the sweep-ring traffic but quantises every weight to
 // 2^-11 relative, which on real content drifts the weighted average by up to
-// ~2e-3 fp32 / ~180 codes u16 at a=64: the fp32 ring holds the whole
+// ~2e-3 f32 / ~180 codes u16 at a=64: the f32 ring holds the whole
 // comparison surface at <=1 LSB for ~7% (measured, jpbd 1080p UV16 d=2).
 layout(std430, binding = 7) buffer WeightBuf { float u4a[]; };
 layout(std430, binding = 8) buffer AccBuf { float u2[]; };
@@ -104,7 +104,7 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 float load_u1(int idx) {
-#if BITS == 32
+#if defined(IO_F32)
     return u1[idx];
 #else
     return float(int(u1[idx])) * SCALE;
@@ -112,7 +112,7 @@ float load_u1(int idx) {
 }
 
 VTYPE to_vtype(float v) {
-#if BITS == 32
+#if defined(IO_F32)
     return v;
 #else
     // glslc -O chokes on a direct float->uint16_t convert (OpUConvert);

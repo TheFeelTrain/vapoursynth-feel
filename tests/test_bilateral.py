@@ -7,9 +7,9 @@ structure, edges and flat regions.
 Reference comparisons run against core.vszipcl.Bilateral when that plugin is
 installed: REF_TOL (1e-6 on the normalized [0, 1] scale) for float32, where
 both sides compute the same math and measured diffs are float32 noise (~1e-8,
-including the wide-sigma configs measured at 5.6e-9). 16-bit integer output is
+including the wide-sigma configs measured at 5.6e-9). u16 output is
 compared in whole output codes (<= 1 LSB, 2 for the widest sigma), since both
-sides round nearly identical fp32 results once. Self-consistency checks
+sides round nearly identical f32 results once. Self-consistency checks
 (determinism) remain exact.
 
 Every reference comparison runs in a subprocess (``reference_compare``) so a
@@ -24,7 +24,7 @@ import vapoursynth as vs
 
 from conftest import (
     assert_changes_on_clip,
-    assert_gray32,
+    assert_grays,
     assert_preserves_frame_props,
     cpu_node,
     frame_to_ndarray,
@@ -34,7 +34,7 @@ from conftest import (
     reference_spec,
 )
 
-pytestmark = pytest.mark.usefixtures("clip_gray")
+pytestmark = pytest.mark.usefixtures("clip_grays")
 
 SIGMA_SPATIAL = 3.0
 SIGMA_COLOR = 0.05
@@ -53,13 +53,13 @@ def _compare(fmt, frames, params, guide=None):
     return reference_compare(spec)["maxdiff"]
 
 
-def test_bilateral_output_finite_32bit(clip_gray):
+def test_bilateral_output_finite_f32(clip_grays):
     out = _run(
-        clip_gray,
+        clip_grays,
         sigma_spatial=SIGMA_SPATIAL,
         sigma_color=SIGMA_COLOR,
     )
-    assert_gray32(out)
+    assert_grays(out)
     for n in (0, 10, 23):
         frame = out.get_frame(n)
         a = frame_to_ndarray(frame)
@@ -67,37 +67,37 @@ def test_bilateral_output_finite_32bit(clip_gray):
         assert a.min() >= 0.0 and a.max() <= 1.0
 
 
-def test_bilateral_defaults_run_32bit(clip_gray):
-    out = _run(clip_gray)
-    assert_gray32(out)
+def test_bilateral_defaults_run_f32(clip_grays):
+    out = _run(clip_grays)
+    assert_grays(out)
     assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
 
 
-def test_bilateral_deterministic_32bit(clip_gray):
-    a = _run(clip_gray, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
-    b = _run(clip_gray, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
+def test_bilateral_deterministic_f32(clip_grays):
+    a = _run(clip_grays, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
+    b = _run(clip_grays, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
     for n in (0, 23):
         da = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
         assert np.abs(da).max() == 0.0
 
 
-def test_bilateral_rejects_8bit(clip_8bit):
-    """Only 16-bit integer and 32-bit float input is supported."""
+def test_bilateral_rejects_8bit(clip_gray8):
+    """Only u16 and f32 input is supported."""
     with pytest.raises(vs.Error):
-        _run(clip_8bit)
+        _run(clip_gray8)
 
 
-def test_bilateral_rejects_10bit(clip_8bit):
-    """Formats other than 16-bit int and 32-bit float must be rejected."""
-    clip10 = vs.core.fmtc.bitdepth(clip_8bit, bits=10)
+def test_bilateral_rejects_10bit(clip_gray8):
+    """Formats other than u16 int and f32 must be rejected."""
+    clip10 = vs.core.fmtc.bitdepth(clip_gray8, bits=10)
     with pytest.raises(vs.Error):
         _run(clip10)
 
 
-def test_bilateral_matches_reference_32bit(clip_gray):
+def test_bilateral_matches_reference_f32(clip_grays):
     """Default parameters stay close to the reference implementation."""
     params = dict(sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
-    worst = _compare("gray32", (0, 11, 23), params)
+    worst = _compare("grays", (0, 11, 23), params)
     assert worst < REF_TOL, f"max diff {worst}"
 
 
@@ -106,14 +106,14 @@ def test_bilateral_matches_reference_32bit(clip_gray):
 # ---------------------------------------------------------------------------
 
 
-def test_bilateral_matches_reference_16bit(clip_16bit):
-    """16-bit integer input: within one output-code rounding step."""
+def test_bilateral_matches_reference_u16(clip_gray16):
+    """u16 input: within one output-code rounding step."""
     params = dict(sigma_spatial=2.0, sigma_color=0.05)
     worst = _compare("gray16", (0, 7, 23), params)
-    assert worst <= 1.0, f"int16 max diff {worst} LSB"
+    assert worst <= 1.0, f"u16 max diff {worst} LSB"
 
 
-# The 32-bit sweeps above are mirrored at 16-bit (whole-code comparison).
+# The f32 sweeps above are mirrored at u16 (whole-code comparison).
 # Measured on the noise clip: every config lands within one output code; the
 # widest sigma gets 2 for rounding headroom.
 WIDE_SIGMA_TOL_CODES = 2.0
@@ -128,22 +128,22 @@ WIDE_SIGMA_TOL_CODES = 2.0
     ],
     ids=["small-sigma", "default-like", "wide-sigma"],
 )
-def test_bilateral_sigma_sweep_matches_reference_16bit(clip_16bit, sigma_spatial, sigma_color, tol):
-    """16-bit mirror of test_bilateral_sigma_sweep_matches_reference."""
+def test_bilateral_sigma_sweep_matches_reference_u16(clip_gray16, sigma_spatial, sigma_color, tol):
+    """u16 mirror of test_bilateral_sigma_sweep_matches_reference."""
     worst = _compare("gray16", (3, 17), dict(sigma_spatial=sigma_spatial, sigma_color=sigma_color))
     assert worst <= tol, f"max diff {worst} LSB (tol {tol})"
 
 
 @pytest.mark.parametrize("radius", [1, 5])
-def test_bilateral_radius_sweep_matches_reference_16bit(clip_16bit, radius):
-    """16-bit mirror of test_bilateral_radius_sweep_matches_reference."""
+def test_bilateral_radius_sweep_matches_reference_u16(clip_gray16, radius):
+    """u16 mirror of test_bilateral_radius_sweep_matches_reference."""
     worst = _compare("gray16", (3, 17), dict(sigma_spatial=2.0, sigma_color=0.05, radius=radius))
     assert worst <= 1.0, f"max diff {worst} LSB"
 
 
 @pytest.mark.parametrize("use_shared_memory", [True, False], ids=["shared", "plain"])
-def test_bilateral_shader_variants_match_vszipcl_16bit(clip_16bit, use_shared_memory):
-    """16-bit mirror of test_bilateral_shader_variants_match_vszipcl."""
+def test_bilateral_shader_variants_match_vszipcl_u16(clip_gray16, use_shared_memory):
+    """u16 mirror of test_bilateral_shader_variants_match_vszipcl."""
     worst = _compare(
         "gray16",
         (0, 23),
@@ -153,14 +153,14 @@ def test_bilateral_shader_variants_match_vszipcl_16bit(clip_16bit, use_shared_me
 
 
 @pytest.mark.parametrize("use_shared_memory", [True, False], ids=["shared", "plain"])
-def test_bilateral_yuv_matches_reference_16bit(clip_gray, use_shared_memory):
-    """16-bit YUV420: all planes must track the reference in both shader
-    variants (mirror of the 32-bit YUV test)."""
+def test_bilateral_yuv_matches_reference_u16(clip_grays, use_shared_memory):
+    """u16 YUV420: all planes must track the reference in both shader
+    variants (mirror of the f32 YUV test)."""
     reference_or_skip("vszipcl", "Bilateral")
     spec = reference_spec(
         "vszipcl",
         "Bilateral",
-        "yuv420_16",
+        "yuv420p16",
         frames=(0, 11),
         kwargs=dict(use_shared_memory=use_shared_memory),
     )
@@ -177,25 +177,25 @@ def test_bilateral_yuv_matches_reference_16bit(clip_gray, use_shared_memory):
     ],
     ids=["small-sigma", "default-like", "wide-sigma"],
 )
-def test_bilateral_sigma_sweep_matches_reference_32bit(clip_gray, sigma_spatial, sigma_color, tol):
+def test_bilateral_sigma_sweep_matches_reference_f32(clip_grays, sigma_spatial, sigma_color, tol):
     """Sigma grid on float input; radius is auto-derived from sigma_spatial."""
-    worst = _compare("gray32", (3, 17), dict(sigma_spatial=sigma_spatial, sigma_color=sigma_color))
+    worst = _compare("grays", (3, 17), dict(sigma_spatial=sigma_spatial, sigma_color=sigma_color))
     assert worst < tol, f"max diff {worst} (tol {tol})"
 
 
 @pytest.mark.parametrize("radius", [1, 5])
-def test_bilateral_radius_sweep_matches_reference_32bit(clip_gray, radius):
+def test_bilateral_radius_sweep_matches_reference_f32(clip_grays, radius):
     """Explicit small and large radii override the auto-derived window."""
-    worst = _compare("gray32", (3, 17), dict(sigma_spatial=2.0, sigma_color=0.05, radius=radius))
+    worst = _compare("grays", (3, 17), dict(sigma_spatial=2.0, sigma_color=0.05, radius=radius))
     assert worst < REF_TOL, f"max diff {worst}"
 
 
 @pytest.mark.parametrize("use_shared_memory", [True, False], ids=["shared", "plain"])
-def test_bilateral_shader_variants_match_vszipcl_32bit(clip_gray, use_shared_memory):
+def test_bilateral_shader_variants_match_vszipcl_f32(clip_grays, use_shared_memory):
     """Both shader variants (shared LDS tile and plain gather) track the
-    reference to fp32 noise."""
+    reference to f32 noise."""
     worst = _compare(
-        "gray32",
+        "grays",
         (0, 23),
         dict(sigma_spatial=2.0, sigma_color=0.05, use_shared_memory=use_shared_memory),
     )
@@ -203,14 +203,14 @@ def test_bilateral_shader_variants_match_vszipcl_32bit(clip_gray, use_shared_mem
 
 
 @pytest.mark.parametrize("use_shared_memory", [True, False], ids=["shared", "plain"])
-def test_bilateral_yuv_matches_reference_32bit(clip_gray, use_shared_memory):
+def test_bilateral_yuv_matches_reference_f32(clip_grays, use_shared_memory):
     """YUV float32: all planes (incl. subsampled chroma with scaled default
     sigmas) must match the reference, in both shader variants."""
     reference_or_skip("vszipcl", "Bilateral")
     spec = reference_spec(
         "vszipcl",
         "Bilateral",
-        "yuv32",
+        "yuv420ps",
         frames=(0, 11),
         kwargs=dict(use_shared_memory=use_shared_memory),
     )
@@ -218,50 +218,50 @@ def test_bilateral_yuv_matches_reference_32bit(clip_gray, use_shared_memory):
     assert worst < REF_TOL, f"max diff {worst}"
 
 
-def test_bilateral_ref_clip_matches_reference_32bit(clip_gray):
+def test_bilateral_ref_clip_matches_reference_f32(clip_grays):
     """Joint filtering through a guide clip matches the reference."""
     kwargs = dict(sigma_spatial=2.0, sigma_color=0.05)
-    out = _run(clip_gray, ref=clip_gray.std.FlipVertical(), **kwargs)
-    assert_gray32(out)
-    worst = _compare("gray32", (0, 11, 23), kwargs, guide={"kind": "flipvertical"})
+    out = _run(clip_grays, ref=clip_grays.std.FlipVertical(), **kwargs)
+    assert_grays(out)
+    worst = _compare("grays", (0, 11, 23), kwargs, guide={"kind": "flipvertical"})
     assert worst < REF_TOL, f"max diff {worst}"
 
 
-def test_bilateral_output_finite_16bit(clip_16bit):
-    """The 16-bit output must be finite AND actually filtered: an identity
+def test_bilateral_output_finite_u16(clip_gray16):
+    """The u16 output must be finite AND actually filtered: an identity
     implementation used to pass the uint16 finiteness/range check."""
     out = _run(
-        clip_16bit,
+        clip_gray16,
         sigma_spatial=SIGMA_SPATIAL,
         sigma_color=SIGMA_COLOR,
     )
-    assert out.format.id == clip_16bit.format.id
-    assert_changes_on_clip(out, clip_16bit, frames=(10,), what="bilateral")
+    assert out.format.id == clip_gray16.format.id
+    assert_changes_on_clip(out, clip_gray16, frames=(10,), what="bilateral")
 
 
-def test_bilateral_defaults_run_16bit(clip_16bit):
-    out = _run(clip_16bit)
-    assert out.format.id == clip_16bit.format.id
-    assert_changes_on_clip(out, clip_16bit, frames=(0,), what="bilateral")
+def test_bilateral_defaults_run_u16(clip_gray16):
+    out = _run(clip_gray16)
+    assert out.format.id == clip_gray16.format.id
+    assert_changes_on_clip(out, clip_gray16, frames=(0,), what="bilateral")
 
 
-def test_bilateral_preserves_frame_props(clip_gray):
+def test_bilateral_preserves_frame_props(clip_grays):
     """Bilateral must republish the source frame's properties."""
     assert_preserves_frame_props(
-        _run, clip_gray, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR
+        _run, clip_grays, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR
     )
 
 
-def test_bilateral_deterministic_16bit(clip_16bit):
-    a = _run(clip_16bit, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
-    b = _run(clip_16bit, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
+def test_bilateral_deterministic_u16(clip_gray16):
+    a = _run(clip_gray16, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
+    b = _run(clip_gray16, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
     for n in (0, 23):
         da = _plane(a.get_frame(n), 0) - _plane(b.get_frame(n), 0)
         assert np.abs(da).max() == 0.0
 
 
-def test_bilateral_ref_clip_matches_reference_16bit(clip_16bit):
-    """16-bit mirror of test_bilateral_ref_clip_matches_reference."""
+def test_bilateral_ref_clip_matches_reference_u16(clip_gray16):
+    """u16 mirror of test_bilateral_ref_clip_matches_reference."""
     worst = _compare(
         "gray16",
         (0, 11, 23),
@@ -284,10 +284,10 @@ BLOCK_SHAPES = [(16, 16), (8, 32), (32, 8), (64, 1), (1, 64), (16, 8), (4, 4)]
 
 
 @pytest.mark.parametrize("block_x,block_y", BLOCK_SHAPES, ids=[f"{x}x{y}" for x, y in BLOCK_SHAPES])
-def test_bilateral_block_shape_does_not_change_output_32bit(clip_gray, block_x, block_y):
+def test_bilateral_block_shape_does_not_change_output_f32(clip_grays, block_x, block_y):
     kwargs = dict(sigma_spatial=3.0, sigma_color=0.05)
-    default = _run(clip_gray, **kwargs)
-    shaped = _run(clip_gray, block_x=block_x, block_y=block_y, **kwargs)
+    default = _run(clip_grays, **kwargs)
+    shaped = _run(clip_grays, block_x=block_x, block_y=block_y, **kwargs)
     for n in (0, 11, 23):
         a = frame_to_ndarray(default.get_frame(n))
         b = frame_to_ndarray(shaped.get_frame(n))
@@ -295,24 +295,24 @@ def test_bilateral_block_shape_does_not_change_output_32bit(clip_gray, block_x, 
 
 
 @pytest.mark.parametrize("block_x,block_y", BLOCK_SHAPES, ids=[f"{x}x{y}" for x, y in BLOCK_SHAPES])
-def test_bilateral_block_shape_does_not_change_output_16bit(clip_16bit, block_x, block_y):
+def test_bilateral_block_shape_does_not_change_output_u16(clip_gray16, block_x, block_y):
     kwargs = dict(sigma_spatial=3.0, sigma_color=0.05)
-    default = _run(clip_16bit, **kwargs)
-    shaped = _run(clip_16bit, block_x=block_x, block_y=block_y, **kwargs)
+    default = _run(clip_gray16, **kwargs)
+    shaped = _run(clip_gray16, block_x=block_x, block_y=block_y, **kwargs)
     for n in (0, 11, 23):
         a = _plane(default.get_frame(n), 0)
         b = _plane(shaped.get_frame(n), 0)
         assert np.array_equal(a, b), f"block {block_x}x{block_y} changed frame {n}"
 
 
-def test_bilateral_rejects_zero_block(clip_gray):
+def test_bilateral_rejects_zero_block(clip_grays):
     """A zero workgroup dimension cannot be launched and must be rejected."""
     for bx, by in [(0, 8), (8, 0), (0, 0)]:
         with pytest.raises(vs.Error):
-            _run(clip_gray, sigma_spatial=3.0, sigma_color=0.05, block_x=bx, block_y=by)
+            _run(clip_grays, sigma_spatial=3.0, sigma_color=0.05, block_x=bx, block_y=by)
 
 
-def test_bilateral_negative_block_is_clamped_not_rejected(clip_gray):
+def test_bilateral_negative_block_is_clamped_not_rejected(clip_grays):
     """Pins current behaviour: a negative block dimension is silently clamped
     to the device default, not rejected.
 
@@ -322,9 +322,9 @@ def test_bilateral_negative_block_is_clamped_not_rejected(clip_gray):
     validation is just inconsistent with ``block_x=0``, which errors.
     """
     kwargs = dict(sigma_spatial=3.0, sigma_color=0.05)
-    default = _run(clip_gray, **kwargs)
+    default = _run(clip_grays, **kwargs)
     for bx, by in [(-1, 8), (8, -1), (-1, -1)]:
-        shaped = _run(clip_gray, block_x=bx, block_y=by, **kwargs)
+        shaped = _run(clip_grays, block_x=bx, block_y=by, **kwargs)
         for n in (0, 11):
             a = frame_to_ndarray(default.get_frame(n))
             b = frame_to_ndarray(shaped.get_frame(n))
@@ -350,10 +350,10 @@ def test_bilateral_negative_block_is_clamped_not_rejected(clip_gray):
     ],
     ids=["chroma-rule", "spatial+color", "all-three", "radius-1"],
 )
-def test_bilateral_per_plane_arrays_match_reference_32bit(clip_gray, kwargs):
+def test_bilateral_per_plane_arrays_match_reference_f32(clip_grays, kwargs):
     """YUV420 float32 with explicit per-plane arrays must track vszipcl on
     all three planes (incl. the subsampled chroma lattice)."""
-    worst = _compare("yuv32", (0, 11, 23), kwargs)
+    worst = _compare("yuv420ps", (0, 11, 23), kwargs)
     assert worst < REF_TOL, f"max diff {worst} ({kwargs})"
 
 
@@ -366,23 +366,23 @@ def test_bilateral_per_plane_arrays_match_reference_32bit(clip_gray, kwargs):
     ],
     ids=["chroma-rule", "spatial+color", "spatial+radius"],
 )
-def test_bilateral_per_plane_arrays_match_reference_16bit(clip_16bit, kwargs):
-    """16-bit mirror of the per-plane array sweep (whole output codes)."""
-    worst = _compare("yuv420_16", (0, 11, 23), kwargs)
+def test_bilateral_per_plane_arrays_match_reference_u16(clip_gray16, kwargs):
+    """u16 mirror of the per-plane array sweep (whole output codes)."""
+    worst = _compare("yuv420p16", (0, 11, 23), kwargs)
     assert worst <= 1.0, f"max diff {worst} LSB ({kwargs})"
 
 
-def test_bilateral_per_plane_arrays_gray_32bit(clip_gray):
+def test_bilateral_per_plane_arrays_gray_f32(clip_grays):
     """A three-element array on a single-plane clip: only element 0 is used,
     and the result must equal the scalar-parameter run exactly."""
-    scalar = _run(clip_gray, sigma_spatial=2.0, sigma_color=0.05)
-    array = _run(clip_gray, sigma_spatial=[2.0, 1.5, 1.0], sigma_color=[0.05, 0.03, 0.02])
+    scalar = _run(clip_grays, sigma_spatial=2.0, sigma_color=0.05)
+    array = _run(clip_grays, sigma_spatial=[2.0, 1.5, 1.0], sigma_color=[0.05, 0.03, 0.02])
     for n in (0, 11):
         a = frame_to_ndarray(scalar.get_frame(n))
         b = frame_to_ndarray(array.get_frame(n))
         assert np.array_equal(a, b), f"extra array elements changed frame {n}"
     worst = _compare(
-        "gray32", (0, 11, 23), dict(sigma_spatial=[2.0, 1.5, 1.0], sigma_color=[0.05, 0.03, 0.02])
+        "grays", (0, 11, 23), dict(sigma_spatial=[2.0, 1.5, 1.0], sigma_color=[0.05, 0.03, 0.02])
     )
     assert worst < REF_TOL, f"max diff {worst}"
 
@@ -397,8 +397,8 @@ def test_bilateral_per_plane_arrays_gray_32bit(clip_gray):
 # still filtered. No other test reaches that share path.
 
 
-def test_bilateral_zero_chroma_sigma_shares_chroma_32bit(clip_yuv32):
-    src = clip_yuv32
+def test_bilateral_zero_chroma_sigma_shares_chroma_f32(clip_yuv420ps):
+    src = clip_yuv420ps
     out = _run(src, sigma_spatial=[2.0, 0.0, 0.0])
     assert out.format.id == src.format.id
     for n in (0, 11, 23):
@@ -414,9 +414,9 @@ def test_bilateral_zero_chroma_sigma_shares_chroma_32bit(clip_yuv32):
             )
 
 
-def test_bilateral_zero_chroma_sigma_shares_chroma_16bit(clip_yuv420_16):
-    """16-bit mirror of the share-path test (whole codes)."""
-    src = clip_yuv420_16
+def test_bilateral_zero_chroma_sigma_shares_chroma_u16(clip_yuv420p16):
+    """u16 mirror of the share-path test (whole codes)."""
+    src = clip_yuv420p16
     out = _run(src, sigma_spatial=[2.0, 0.0, 0.0])
     assert out.format.id == src.format.id
     for n in (0, 11, 23):
@@ -438,31 +438,31 @@ def test_bilateral_zero_chroma_sigma_shares_chroma_16bit(clip_yuv420_16):
 # ---------------------------------------------------------------------------
 
 
-def test_bilateral_rejects_negative_sigma(clip_gray):
+def test_bilateral_rejects_negative_sigma(clip_grays):
     with pytest.raises(vs.Error):
-        _run(clip_gray, sigma_spatial=-1.0)
+        _run(clip_grays, sigma_spatial=-1.0)
     with pytest.raises(vs.Error):
-        _run(clip_gray, sigma_color=-1.0)
+        _run(clip_grays, sigma_color=-1.0)
 
 
-def test_bilateral_rejects_nonpositive_radius(clip_gray):
+def test_bilateral_rejects_nonpositive_radius(clip_grays):
     for bad in (0, -1):
         with pytest.raises(vs.Error):
-            _run(clip_gray, radius=bad)
+            _run(clip_grays, radius=bad)
 
 
 @pytest.mark.parametrize("bad", [32768, 46341, 2**31 - 1])
-def test_bilateral_rejects_oversized_radius(clip_gray, bad):
+def test_bilateral_rejects_oversized_radius(clip_grays, bad):
     """A radius past 32767 wraps the signed-32-bit tile and distance math; it
     must be refused at creation. Only construction happens here, so a missing
     check fails instead of dispatching a kernel that never finishes.
     """
     with pytest.raises(vs.Error):
-        vs.core.vsfeel.Bilateral(clip_gray, sigma_spatial=3.0, sigma_color=0.05, radius=bad)
+        vs.core.vsfeel.Bilateral(clip_grays, sigma_spatial=3.0, sigma_color=0.05, radius=bad)
 
 
-def test_bilateral_rejects_sigma_spatial_that_derives_oversized_radius(clip_gray):
+def test_bilateral_rejects_sigma_spatial_that_derives_oversized_radius(clip_grays):
     """The auto-derived radius (``round(3*sigma_spatial)``, capped at 1e6) must
     hit the same bound as an explicit one."""
     with pytest.raises(vs.Error):
-        vs.core.vsfeel.Bilateral(clip_gray, sigma_spatial=1e6, sigma_color=0.05)
+        vs.core.vsfeel.Bilateral(clip_grays, sigma_spatial=1e6, sigma_color=0.05)

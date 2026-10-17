@@ -25,14 +25,14 @@
  *
  * Buffers: src/dst are the core's own GPU frame planes (vnode: in/out), `mid`
  * is a transient per-frame scratch buffer, `taps` the constant table above.
- * Compile-time variants: -DBITS=16|32.
+ * Compile-time variants: -DIO_U16 / -DIO_F32.
  */
 
-#if !defined(BITS)
-#define BITS 16
+#if !defined(IO_U16) && !defined(IO_F32) && !defined(IO_F16)
+#define IO_U16 1
 #endif
 
-#if BITS == 16
+#if defined(IO_U16)
 #define IO_TYPE uint16_t
 #define PEAK    65535.0f
 #else
@@ -64,7 +64,7 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 float load_src(int idx) {
-#if BITS == 32
+#if defined(IO_F32)
     return src[idx];
 #else
     // direct uint16_t->float conversion chokes glslc; int() widens cleanly
@@ -73,7 +73,7 @@ float load_src(int idx) {
 }
 
 float load_mid(int idx) {
-#if BITS == 32
+#if defined(IO_F32)
     return mid[idx];
 #else
     return float(int(mid[idx]));
@@ -83,7 +83,7 @@ float load_mid(int idx) {
 // Round half away from zero, then saturate. resize2's integer output rounds
 // the same way, which is not the round-to-nearest-even the other filters use.
 void store_mid(int idx, float v) {
-#if BITS == 32
+#if defined(IO_F32)
     mid[idx] = v;
 #else
     mid[idx] = uint16_t(uint(clamp(floor(v + 0.5), 0.0f, PEAK)) & 0xFFFFu);
@@ -91,7 +91,7 @@ void store_mid(int idx, float v) {
 }
 
 void store_dst(int idx, float v) {
-#if BITS == 32
+#if defined(IO_F32)
     dst[idx] = v;
 #else
     dst[idx] = uint16_t(uint(clamp(floor(v + 0.5), 0.0f, PEAK)) & 0xFFFFu);

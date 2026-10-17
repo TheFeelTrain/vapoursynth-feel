@@ -45,19 +45,19 @@ CROP_FROM = 640
 #   eedi3h     u16/f32: 0.0 vs the same-plugin transpose oracle
 #   eedi3aa    u16: 0.0; f32: a few ulp of the fused chain (~6e-8 measured)
 #   nlmeans    u16: <= 1 code; f32: <= 7.2e-7 (1e-5 bound here, the same
-#                     fp32-accumulation-order band as test_nlmeans.py)
+#                     f32-accumulation-order band as test_nlmeans.py)
 # The yuv420 cases exercise half-width chroma: at 630 luma px the chroma rows
 # are 315 samples, i.e. 630 bytes for u16 (22 mod 32) — the alignment that made
 # the old DFTTest download helper fault.
 TOL_F32_ULP = 1e-6
 TOL_U16_LSB = 1.0
 TOL_BM3D = 0.02
-TOL_EEDI3_16 = 0.0
-TOL_EEDI3_32 = 1e-6
+TOL_EEDI3_U16 = 0.0
+TOL_EEDI3_F32 = 1e-6
 TOL_ORACLE_EXACT = 0.0
-TOL_EEDI3AA_32 = 1e-6
-TOL_NLMEANS_16 = 1.0
-TOL_NLMEANS_32 = 1e-5
+TOL_EEDI3AA_F32 = 1e-6
+TOL_NLMEANS_U16 = 1.0
+TOL_NLMEANS_F32 = 1e-5
 
 _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     import json
@@ -77,8 +77,8 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     filter_ = spec["filter"]
 
     if filter_ == "nnedi3":
-        # nnedi3vk only accepts 16-bit integer input; vsfeel is the same
-        # GRAY16 clip, so the case is registered as 16-bit.
+        # nnedi3vk only accepts u16 input; vsfeel is the same
+        # GRAY16 clip, so the case is registered as u16.
         assert bits == 16 and color == "gray", (bits, color)
 
     core.max_cache_size = 512
@@ -271,16 +271,16 @@ for _w in WIDTHS:
     # The EEDI3 family and NLMeans on the same cropped-width geometry.
     # EEDI3H is horizontal (the transpose composition), EEDI3AA the fused
     # based_aa chain, NLMeans the tiled spatial filter.
-    _add("eedi3", 16, _w, 0, _EEDI3_PARAMS, TOL_EEDI3_16)
-    _add("eedi3", 32, _w, 0, _EEDI3_PARAMS, TOL_EEDI3_32)
+    _add("eedi3", 16, _w, 0, _EEDI3_PARAMS, TOL_EEDI3_U16)
+    _add("eedi3", 32, _w, 0, _EEDI3_PARAMS, TOL_EEDI3_F32)
     _add("eedi3h", 16, _w, 0, _EEDI3H_PARAMS, TOL_ORACLE_EXACT)
     _add("eedi3h", 32, _w, 0, _EEDI3H_PARAMS, TOL_ORACLE_EXACT)
     _add("eedi3aa", 16, _w, 0, _EEDI3AA_PARAMS, TOL_ORACLE_EXACT)
-    _add("eedi3aa", 32, _w, 0, _EEDI3AA_PARAMS, TOL_EEDI3AA_32)
-    _add("eedi3", 16, _w, 0, _EEDI3_HP_PARAMS, TOL_EEDI3_16)
+    _add("eedi3aa", 32, _w, 0, _EEDI3AA_PARAMS, TOL_EEDI3AA_F32)
+    _add("eedi3", 16, _w, 0, _EEDI3_HP_PARAMS, TOL_EEDI3_U16)
     _add("eedi3aa", 16, _w, 0, _EEDI3AA_HP_PARAMS, TOL_ORACLE_EXACT)
-    _add("nlmeans", 16, _w, 0, _NLMEANS_PARAMS, TOL_NLMEANS_16)
-    _add("nlmeans", 32, _w, 0, _NLMEANS_PARAMS, TOL_NLMEANS_32)
+    _add("nlmeans", 16, _w, 0, _NLMEANS_PARAMS, TOL_NLMEANS_U16)
+    _add("nlmeans", 32, _w, 0, _NLMEANS_PARAMS, TOL_NLMEANS_F32)
 
 # Subsampled chroma (R1/R2): the chroma planes are half the luma width, so
 # their visible rows are 315 * itemsize bytes at 630 px — a different pitch and
@@ -302,10 +302,10 @@ for _w in WIDTHS:
 _add("dfttest", 32, 630, 0, _DFTTEST_PARAMS, TOL_F32_ULP, top=_CROP_TOP, bottom=_CROP_BOTTOM)
 _add("bilateral", 32, 630, 0, _BILATERAL_PARAMS, TOL_F32_ULP, top=_CROP_TOP, bottom=_CROP_BOTTOM)
 _add("nnedi3", 16, 630, 0, _NNEDI3_PARAMS, TOL_U16_LSB, top=_CROP_TOP, bottom=_CROP_BOTTOM)
-_add("eedi3", 16, 630, 0, _EEDI3_PARAMS, TOL_EEDI3_16, top=_CROP_TOP, bottom=_CROP_BOTTOM)
+_add("eedi3", 16, 630, 0, _EEDI3_PARAMS, TOL_EEDI3_U16, top=_CROP_TOP, bottom=_CROP_BOTTOM)
 _add("eedi3h", 16, 630, 0, _EEDI3H_PARAMS, TOL_ORACLE_EXACT, top=_CROP_TOP, bottom=_CROP_BOTTOM)
 _add("eedi3aa", 16, 630, 0, _EEDI3AA_PARAMS, TOL_ORACLE_EXACT, top=_CROP_TOP, bottom=_CROP_BOTTOM)
-_add("nlmeans", 32, 630, 0, _NLMEANS_PARAMS, TOL_NLMEANS_32, top=_CROP_TOP, bottom=_CROP_BOTTOM)
+_add("nlmeans", 32, 630, 0, _NLMEANS_PARAMS, TOL_NLMEANS_F32, top=_CROP_TOP, bottom=_CROP_BOTTOM)
 
 
 @pytest.mark.parametrize("spec,tol", CASES)

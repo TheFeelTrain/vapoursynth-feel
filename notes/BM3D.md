@@ -46,7 +46,7 @@ Scoreboard — 1080p jpbd, `tools/benchmark.py -f bm3d`, harness defaults
   and it is slower than bm3dvk in both modes.
 - The 16 bit row is a separate run at the same settings, not a second filter.
 
-16 bit input is the same filter, not a second one: the ring, the estimate
+u16 input is the same filter, not a second one: the ring, the estimate
 stacks and every kernel's arithmetic are float at both depths, an integer
 clip's samples are widened once when they are copied into the ring, and the
 aggregation rounds its result back to native samples. A 16 bit chain therefore
@@ -60,10 +60,10 @@ which is where the visible speedup is (see Performance).
   TW = 2r+1 stack slices) and `bm3d_copy.comp`, which widens an integer clip's
   planes into the ring as it copies them (gain 1/65535, less the 32768 neutral
   on YUV chroma, the reference's `Int2Float`). Only the store is depth-specific
-  (`-DBITS`), rounding like the reference's `Float2Int`: `clamp(v * 65535 + bias
+  (`-DIO_U16`/`-DIO_F32`), rounding like the reference's `Float2Int`: `clamp(v * 65535 + bias
   + 0.5, 0, 65535)`, bias 32768 on chroma, then truncate. The clamp is
   load-bearing; a bare mask would wrap a weight sum past 1.0 to 0.
-- A 16 bit clip is **full range**, like the fp32 path and every other vsfeel
+- A u16 clip is **full range**, like the f32 path and every other vsfeel
   filter. The CPU reference instead scales an *integer* clip by the frame's
   `_Range` property, limited range mapping `[16<<(b-8), 235<<(b-8)]` to `[0, 1]`
   and clipping the output back, so the two sides only meet in one domain on a
@@ -238,10 +238,10 @@ which is where the visible speedup is (see Performance).
   (1080p jpbd, r=2, 800 frames x3): estimation kernel 0.95 -> 1.27 ms, filter 747
   -> 644 fps. Widening in the copy kernel instead
   pays it on 2.07M samples per frame rather than on every candidate read, and
-  turns the halved io into a win: 970 fps against fp32's 932 (`tools/benchmark.py
+  turns the halved io into a win: 970 fps against f32's 932 (`tools/benchmark.py
   -f bm3d --bits 16`, 1000 frames x3, same session, interleaved). A real 16 bit
   chain -- cached 16 bit source, no `depth()` node, half the upload -- is 846 vs
-  634 fps in a same-harness A/B (1080p jpbd, r=2, 600 frames x3, screen; the fp32
+  634 fps in a same-harness A/B (1080p jpbd, r=2, 600 frames x3, screen; the f32
   arm pays its conversion inside the timed region, the u16 arm does not).
 - Other denoisers gain more from u16 and for the same reason: their kernels
   stream each byte once or twice with a handful of ALU ops per tap, so halving
@@ -378,7 +378,7 @@ Chronological; each entry keeps the mechanism, not the story.
 - **2026-10-05 — integer chroma: the neutral code and a null binding.** A YUV
   chroma plane is centred on zero in the reference's float domain, so the copy
   now subtracts 32768 and the store adds it back; the u16 arm had been filtering
-  a plane offset by 0.5, which showed as up to 30 codes against the fp32 arm on
+  a plane offset by 0.5, which showed as up to 30 codes against the f32 arm on
   360p YUV444P16 (now <= 1, the store's jitter; r=2, frames 0/11/23).
   Chroma-only `sigma` also left plane 0 unprocessed, so the estimation kernel's
   unused destination binding was null, invalid without `nullDescriptor`; it now
@@ -387,12 +387,12 @@ Chronological; each entry keeps the mechanism, not the story.
   65536 workgroups, past the X limit Vulkan only guarantees; `bm3d_copy.comp`
   now indexes `ID.y * NumWorkGroups.x + ID.x` and the host folds with
   `vsfeel_fold_grid`, per entry. No perf change on this GPU (X is unconstrained).
-- **2026-10-03 — 16 bit input ships as a fp32 ring widened at copy time.** The
+- **2026-10-03 — u16 input ships as a f32 ring widened at copy time.** The
   u16-ring build and the mechanism behind its 15% loss are under Performance.
-  Three kernels now (`bm3d_copy.comp` is new), `-DBITS` only on the
+  Three kernels now (`bm3d_copy.comp` is new), `-DIO_U16`/`-DIO_F32` only on the
   aggregation's store, and the reference's 16 bit output is the oracle
   (`VAggregate(sample=INTEGER)`, `Basic` at radius 0). The u16 tests pin that
-  output to the fp32 one rounded, within the aggregation's one-code jitter, over
+  output to the f32 one rounded, within the aggregation's one-code jitter, over
   five configurations.
 - **2026-10-03 — the search's bookkeeping was the whole cost (+12%).** The
   matcher's per-candidate work is dominated by code that if-converts, so the
@@ -548,10 +548,10 @@ Chronological; each entry keeps the mechanism, not the story.
 
 - **A half-precision or otherwise narrowed processing mode.** The filter is not
   bandwidth-bound (1080p r=2: `gpu_busy_percent` 100, `mem_busy_percent` ~35)
-  and its compute is depth-independent: u16 is 979.4 against fp32's 956.5 fps
+  and its compute is depth-independent: u16 is 979.4 against f32's 956.5 fps
   (1000 frames) and 977.5 against 968.5 with the io removed. The float estimate
   stack (83 MB/frame at r=2) is the only large narrowable traffic and cannot
-  narrow anyway (no `shaderBufferFloat16AtomicAdd`; no 16-bit integer atomics in
+  narrow anyway (no `shaderBufferFloat16AtomicAdd`; no u16 atomics in
   core Vulkan). bm3dvk2's own fp16 mode is 16% slower here (133.4 against 159.1
   fps, 500 frames, `--no-download`) while reading half the source bytes.
 - **Emulating libstdc++'s `partial_sort` tie order.** Survivors are heap

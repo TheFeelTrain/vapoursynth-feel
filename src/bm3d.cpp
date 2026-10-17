@@ -1089,9 +1089,9 @@ struct Bm3dWindowCopy {
 // the slot stride spans the entry's planes.
 //
 // The ring is float at both input depths: an integer clip's samples are widened
-// once, here, by bm3d_copy16 rather than on every load in the matcher (see that
-// shader). Offsets are in elements, so the destination stride stays the source
-// plane's element stride and the copy is one linear range either way.
+// once, here, by bm3d_copy_u16 rather than on every load in the matcher (see
+// that shader). Offsets are in elements, so the destination stride stays the
+// source plane's element stride and the copy is one linear range either way.
 static void record_src_copies(BM3DData * d, const Bm3dFrame & fr,
                               VkCommandBuffer cmd,
                               const std::vector<Bm3dWindowCopy> & window) {
@@ -1848,8 +1848,9 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
            d->vi->format.bitsPerSample == 32) ||
           (d->vi->format.sampleType == stInteger &&
            d->vi->format.bitsPerSample == 16))) {
-        return set_error("only constant format 16 bit integer or 32 bit float "
-                         "input supported");
+        return set_error(
+            "only constant format 16-bit integer (u16) or 32-bit float (f32) "
+            "input supported");
     }
     d->bits = d->vi->format.bitsPerSample;
     d->elem_bytes = d->bits / 8;
@@ -2509,8 +2510,9 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // geometry and the search parameters, only the sigmas differ) and one
     // aggregation pipeline per processed plane.
     if (d->bits == 16) {
-        const auto result = create_copy_pipeline(
-            *d->gpu, d->pipeline_layout, bm3d_copy16_spv, bm3d_copy16_spv_size);
+        const auto result =
+            create_copy_pipeline(*d->gpu, d->pipeline_layout, bm3d_copy_u16_spv,
+                                 bm3d_copy_u16_spv_size);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -2607,11 +2609,11 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             }
             const auto result =
                 d->bits == 16
-                    ? create_agg_pipeline(*d->gpu, p, g, *d, bm3d_agg_16_spv,
-                                          bm3d_agg_16_spv_size,
+                    ? create_agg_pipeline(*d->gpu, p, g, *d, bm3d_agg_u16_spv,
+                                          bm3d_agg_u16_spv_size,
                                           d->pipeline_layout)
-                    : create_agg_pipeline(*d->gpu, p, g, *d, bm3d_agg_32_spv,
-                                          bm3d_agg_32_spv_size,
+                    : create_agg_pipeline(*d->gpu, p, g, *d, bm3d_agg_f32_spv,
+                                          bm3d_agg_f32_spv_size,
                                           d->pipeline_layout);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));

@@ -39,7 +39,7 @@ from conftest import (
     reference_spec,
 )
 
-pytestmark = pytest.mark.usefixtures("clip_gray")
+pytestmark = pytest.mark.usefixtures("clip_grays")
 
 
 def _run(clip, field=1, **kwargs):
@@ -75,7 +75,7 @@ def _ref_compare(fmt, frames, params, planes=None):
 # Reference agreement, GRAY16
 # ---------------------------------------------------------------------------
 
-REFERENCE_CASES_16 = [
+REFERENCE_CASES_U16 = [
     {},
     {"pscrn": 1},
     {"pscrn": 3},
@@ -100,28 +100,28 @@ REFERENCE_CASES_16 = [
 
 
 @pytest.mark.parametrize(
-    "kwargs", REFERENCE_CASES_16, ids=[str(sorted(k.items())) for k in REFERENCE_CASES_16]
+    "kwargs", REFERENCE_CASES_U16, ids=[str(sorted(k.items())) for k in REFERENCE_CASES_U16]
 )
-def test_nnedi3_matches_reference_16bit(clip_16bit, kwargs):
+def test_nnedi3_matches_reference_u16(clip_gray16, kwargs):
     payload = _ref_compare("gray16", (0, 11, 23), kwargs)
     assert payload["maxdiff"] <= 1, kwargs
 
 
-def test_nnedi3_pscrn0_within_1lsb(clip_16bit):
+def test_nnedi3_pscrn0_within_1lsb(clip_gray16):
     """pscrn=0 forces every pixel through the predictor (serial accumulation
     vs the reference's subgroup reductions): allow 1 LSB."""
     payload = _ref_compare("gray16", (0, 11), {"pscrn": 0})
     assert payload["maxdiff"] <= 1
 
 
-def test_nnedi3_field_gt1_matches_reference(clip_16bit):
+def test_nnedi3_field_gt1_matches_reference(clip_gray16):
     for field in (2, 3):
         payload = _ref_compare("gray16", (0, 1, 24, 47), {"field": field})
         assert payload["num_frames"] == 48
         assert payload["maxdiff"] <= 1
 
 
-def test_nnedi3_dh_matches_reference(clip_16bit):
+def test_nnedi3_dh_matches_reference(clip_gray16):
     payload = _ref_compare("gray16", (0, 11, 23), {"dh": True})
     assert payload["height"] == 2 * HEIGHT
     assert payload["maxdiff"] <= 1
@@ -142,7 +142,7 @@ def test_nnedi3_yuv_matches_reference():
     # dh doubles the luma height; the chroma writers have to cover the whole
     # (2*h) >> subSamplingH plane, last row included.
     for kwargs in ({}, {"planes": [0]}, {"planes": [1, 2]}, {"nsize": 0}, {"dh": True}):
-        payload = _ref_compare("yuv420_16", (0, 11), kwargs)
+        payload = _ref_compare("yuv420p16", (0, 11), kwargs)
         assert payload["maxdiff"] <= 1, kwargs
 
 
@@ -150,7 +150,7 @@ def test_nnedi3_yuv_matches_reference():
 # Reference agreement, float32 (bit-exact floats on configs tried)
 # ---------------------------------------------------------------------------
 
-REFERENCE_CASES_32 = [
+REFERENCE_CASES_F32 = [
     {},
     {"pscrn": 0},
     {"pscrn": 1},
@@ -159,7 +159,7 @@ REFERENCE_CASES_32 = [
     {"nsize": 0},
     {"nns": 4},
     {"field": 0},
-    # float-path gaps: field 2/3 and dh (16-bit only before)
+    # float-path gaps: field 2/3 and dh (u16 only before)
     {"field": 2},
     {"field": 3},
     {"dh": True},
@@ -167,10 +167,10 @@ REFERENCE_CASES_32 = [
 
 
 @pytest.mark.parametrize(
-    "kwargs", REFERENCE_CASES_32, ids=[str(sorted(k.items())) for k in REFERENCE_CASES_32]
+    "kwargs", REFERENCE_CASES_F32, ids=[str(sorted(k.items())) for k in REFERENCE_CASES_F32]
 )
-def test_nnedi3_matches_reference_32bit(clip_gray, kwargs):
-    payload = _ref_compare("gray32", (0, 11), kwargs)
+def test_nnedi3_matches_reference_f32(clip_grays, kwargs):
+    payload = _ref_compare("grays", (0, 11), kwargs)
     assert payload["maxdiff"] <= 1e-6, kwargs
 
 
@@ -180,8 +180,8 @@ def test_nnedi3_matches_reference_32bit(clip_gray, kwargs):
 
 
 @pytest.mark.parametrize("bits", [16, 32])
-def test_nnedi3_deterministic(clip_gray, clip_16bit, bits):
-    clip = clip_16bit if bits == 16 else clip_gray
+def test_nnedi3_deterministic(clip_grays, clip_gray16, bits):
+    clip = clip_gray16 if bits == 16 else clip_grays
     a = _run(clip, nsize=0)
     b = _run(clip, nsize=0)
     for n in (0, 11, 23):
@@ -195,9 +195,9 @@ def test_nnedi3_deterministic(clip_gray, clip_16bit, bits):
         assert np.abs(d).max() == 0, f"nondeterministic output at frame {n}"
 
 
-def test_nnedi3_parallel_load_consistent(clip_16bit):
-    expect = _plane(_run(clip_16bit).get_frame(5), 0)
-    got = eval_parallel(_run, clip_16bit)
+def test_nnedi3_parallel_load_consistent(clip_gray16):
+    expect = _plane(_run(clip_gray16).get_frame(5), 0)
+    got = eval_parallel(_run, clip_gray16)
     assert np.abs(got[5].astype(np.int32) - expect.astype(np.int32)).max() == 0
 
 
@@ -206,49 +206,49 @@ def test_nnedi3_parallel_load_consistent(clip_16bit):
 # ---------------------------------------------------------------------------
 
 
-def test_nnedi3_field_gt1_doubles_frames(clip_16bit):
-    out = _run(clip_16bit, field=3)
-    assert out.num_frames == 2 * clip_16bit.num_frames
-    assert out.fps_num * clip_16bit.fps_den == 2 * clip_16bit.fps_num * out.fps_den
+def test_nnedi3_field_gt1_doubles_frames(clip_gray16):
+    out = _run(clip_gray16, field=3)
+    assert out.num_frames == 2 * clip_gray16.num_frames
+    assert out.fps_num * clip_gray16.fps_den == 2 * clip_gray16.fps_num * out.fps_den
 
 
-def test_nnedi3_dh_doubles_height(clip_16bit):
-    out = _run(clip_16bit, dh=True)
-    assert out.height == 2 * clip_16bit.height
-    assert out.width == clip_16bit.width
+def test_nnedi3_dh_doubles_height(clip_gray16):
+    out = _run(clip_gray16, dh=True)
+    assert out.height == 2 * clip_gray16.height
+    assert out.width == clip_gray16.width
 
 
-def test_nnedi3_output_props_progressive(clip_16bit):
-    out = _run(clip_16bit, field=3)
+def test_nnedi3_output_props_progressive(clip_gray16):
+    out = _run(clip_gray16, field=3)
     props = out.get_frame(1).props
     assert props["_FieldBased"] == 0
     assert "_Field" not in props
 
 
-def test_nnedi3_kept_lines_copied(clip_16bit):
+def test_nnedi3_kept_lines_copied(clip_gray16):
     """Lines the filter keeps must equal the source field rows exactly.
     Progressive content with field=1 keeps parity 0 (even output lines)."""
-    out = _run(clip_16bit, field=1)
+    out = _run(clip_gray16, field=1)
     for n in (0, 7):
-        s = _plane(clip_16bit.get_frame(n), 0, WIDTH, HEIGHT)
+        s = _plane(clip_gray16.get_frame(n), 0, WIDTH, HEIGHT)
         o = _plane(out.get_frame(n), 0, WIDTH, HEIGHT)
         assert np.abs(o[0::2].astype(np.int32) - s[0::2].astype(np.int32)).max() == 0
 
 
-def test_nnedi3_changes_noise_16bit(clip_16bit):
+def test_nnedi3_changes_noise_u16(clip_gray16):
     """The interpolated rows must actually alter the noise input.
 
     ``isfinite(uint16)`` cannot fail and the reference comparison skips when
     nnedi3vk is absent, so this is the invariant that fails for an identity
     implementation.
     """
-    out = _run(clip_16bit, field=1)
-    assert_changes_on_clip(out, clip_16bit, what="NNEDI3")
+    out = _run(clip_gray16, field=1)
+    assert_changes_on_clip(out, clip_gray16, what="NNEDI3")
 
 
-def test_nnedi3_preserves_frame_props(clip_16bit):
+def test_nnedi3_preserves_frame_props(clip_gray16):
     """field=1 keeps the duration while tagging the output progressive."""
-    assert_preserves_frame_props(_run, clip_16bit, field=1)
+    assert_preserves_frame_props(_run, clip_gray16, field=1)
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +256,7 @@ def test_nnedi3_preserves_frame_props(clip_16bit):
 # ---------------------------------------------------------------------------
 
 
-def test_nnedi3_requires_field(clip_16bit):
+def test_nnedi3_requires_field(clip_gray16):
     """`field` is a required argument (EEDI3 does the same).
 
     It used to be registered as optional but read with a null error pointer,
@@ -265,58 +265,58 @@ def test_nnedi3_requires_field(clip_16bit):
     it. It must now raise a normal, catchable vs.Error.
     """
     with pytest.raises(vs.Error):
-        vs.core.vsfeel.NNEDI3(clip_16bit)
+        vs.core.vsfeel.NNEDI3(clip_gray16)
 
 
-def test_nnedi3_rejects_8bit(clip_8bit):
+def test_nnedi3_rejects_8bit(clip_gray8):
     with pytest.raises(vs.Error):
-        _run(clip_8bit).get_frame(0)
+        _run(clip_gray8).get_frame(0)
 
 
-def test_nnedi3_rejects_bad_field(clip_16bit):
+def test_nnedi3_rejects_bad_field(clip_gray16):
     with pytest.raises(vs.Error):
-        _run(clip_16bit, field=4)
+        _run(clip_gray16, field=4)
 
 
-def test_nnedi3_rejects_dh_with_field_gt1(clip_16bit):
+def test_nnedi3_rejects_dh_with_field_gt1(clip_gray16):
     with pytest.raises(vs.Error):
-        _run(clip_16bit, field=3, dh=True)
+        _run(clip_gray16, field=3, dh=True)
 
 
-def test_nnedi3_rejects_bad_nsize(clip_16bit):
+def test_nnedi3_rejects_bad_nsize(clip_gray16):
     with pytest.raises(vs.Error):
-        _run(clip_16bit, nsize=7)
+        _run(clip_gray16, nsize=7)
 
 
-def test_nnedi3_rejects_bad_nns(clip_16bit):
+def test_nnedi3_rejects_bad_nns(clip_gray16):
     with pytest.raises(vs.Error):
-        _run(clip_16bit, nns=5)
+        _run(clip_gray16, nns=5)
 
 
-def test_nnedi3_rejects_bad_qual(clip_16bit):
+def test_nnedi3_rejects_bad_qual(clip_gray16):
     with pytest.raises(vs.Error):
-        _run(clip_16bit, qual=3)
+        _run(clip_gray16, qual=3)
 
 
-def test_nnedi3_rejects_bad_etype(clip_16bit):
+def test_nnedi3_rejects_bad_etype(clip_gray16):
     with pytest.raises(vs.Error):
-        _run(clip_16bit, etype=2)
+        _run(clip_gray16, etype=2)
 
 
-def test_nnedi3_rejects_bad_pscrn(clip_16bit):
+def test_nnedi3_rejects_bad_pscrn(clip_gray16):
     with pytest.raises(vs.Error):
-        _run(clip_16bit, pscrn=5)
+        _run(clip_gray16, pscrn=5)
 
 
-def test_nnedi3_rejects_bad_planes(clip_16bit):
+def test_nnedi3_rejects_bad_planes(clip_gray16):
     with pytest.raises(vs.Error):
-        _run(clip_16bit, planes=[0, 0])
+        _run(clip_gray16, planes=[0, 0])
     with pytest.raises(vs.Error):
-        _run(clip_16bit, planes=[3])
+        _run(clip_gray16, planes=[3])
 
 
-def test_nnedi3_rejects_odd_height(clip_16bit):
-    odd = clip_16bit.std.Crop(bottom=1)
+def test_nnedi3_rejects_odd_height(clip_gray16):
+    odd = clip_gray16.std.Crop(bottom=1)
     with pytest.raises(vs.Error):
         _run(odd).get_frame(0)
 

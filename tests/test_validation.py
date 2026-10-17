@@ -28,13 +28,13 @@ _LAYER = "VK_LAYER_KHRONOS_validation"
 # (temporal / multi-pass filters get three frames).
 FILTERS = [
     "Bilateral",
-    "Bilateral16",
+    "Bilateral_u16",
     "GaussBlur",
     "GaussBlurLarge",
     "DFTTest",
     "NLMeans",
     "BM3D",
-    "BM3D_16",
+    "BM3D_u16",
     "BM3DColor",
     "BM3DJoint",
     "EEDI3",
@@ -53,34 +53,34 @@ _SCRIPT = textwrap.dedent(f"""\
         src = core.bs.VideoSource({CLIP_PATH!r})
     else:
         src = core.ffms2.Source({CLIP_PATH!r})
-    g32 = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
+    gs = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                              bits=32, fulls=True, fulld=True)
     g16 = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                              bits=16, fulls=True, fulld=True)
 
     if name == "Bilateral":
-        node = core.vsfeel.Bilateral(g32, sigma_spatial=3.0, sigma_color=0.05)
-    elif name == "Bilateral16":
-        # The 16-bit SSBOs take the StorageBuffer-class codegen that needs
+        node = core.vsfeel.Bilateral(gs, sigma_spatial=3.0, sigma_color=0.05)
+    elif name == "Bilateral_u16":
+        # The u16 SSBOs take the StorageBuffer-class codegen that needs
         # storageBuffer16BitAccess; the SPIR-V 1.0 Uniform+BufferBlock form
         # would need the feature the core does not enable.
         node = core.vsfeel.Bilateral(g16, sigma_spatial=3.0, sigma_color=0.05)
     elif name == "GaussBlur":
-        node = core.vsfeel.GaussBlur(g32, sigma=2.0)
+        node = core.vsfeel.GaussBlur(gs, sigma=2.0)
     elif name == "GaussBlurLarge":
         # sigma=20 derives radius 60 > LARGE_THRESHOLD, so this is the two-pass
         # path: separate horizontal/vertical dispatches, the push-descriptor
-        # set, the barrier, and the 16-bit packed store through the aliased
-        # binding 4 that only ENTRY_HORIZ && BITS == 16 declares.
+        # set, the barrier, and the u16 packed store through the aliased
+        # binding 4 that only ENTRY_HORIZ && IO_U16 declares.
         node = core.vsfeel.GaussBlur(g16, sigma=20.0)
     elif name == "DFTTest":
-        node = core.vsfeel.DFTTest(g32, tbsize=3)
+        node = core.vsfeel.DFTTest(gs, tbsize=3)
     elif name == "NLMeans":
-        node = core.vsfeel.NLMeans(g32, d=2)
+        node = core.vsfeel.NLMeans(gs, d=2)
     elif name == "BM3D":
-        node = core.vsfeel.BM3D(g32, sigma=0.7, radius=2, bm_range=16,
+        node = core.vsfeel.BM3D(gs, sigma=0.7, radius=2, bm_range=16,
                                 ps_range=7, block_step=4)
-    elif name == "BM3D_16":
+    elif name == "BM3D_u16":
         # The integer input path: the copy-and-widen kernel rides the
         # estimation kernel's descriptor set and push-constant block, and the
         # aggregation writes native samples into the output plane.

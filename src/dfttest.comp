@@ -1,6 +1,6 @@
 #version 450
 
-#if BITS == 16
+#if defined(IO_U16)
 #extension GL_EXT_shader_16bit_storage : require
 #endif
 #extension GL_KHR_shader_subgroup_basic : require
@@ -23,12 +23,13 @@
  * reference, the filter math (wiener / hard / multiply / bandpass / power /
  * sqrt variants) matches the generated filter() device code, and the zero-
  * mean path subtracts the window frequency response scaled by the DC gain.
- * The IO conversion follows the references: integer input is scaled by
- * SCALE (1/256 for 16-bit), float input by 255.0; integer output rounds with
+ * The IO conversion follows the references: u16 input is scaled by
+ * SCALE (1/256), f32 input by 255.0; integer output rounds with
  * +0.5 truncation (__float2int_rz) and clamps.
  *
- * Compile-time variants: -DBITS=16|32 and exactly one of -DENTRY_PAD /
- * -DENTRY_FUSED / -DENTRY_COL2IM defining the entry point. Everything else
+ * Compile-time variants: -DIO_U16 / -DIO_F32 and exactly one of
+ * -DENTRY_PAD / -DENTRY_FUSED / -DENTRY_COL2IM defining the entry point.
+ * Everything else
  * (radius, block_step, plane geometry, filter parameters, buffer offsets) is
  * passed per-dispatch through push constants so a single set of pipelines
  * serves every plane.
@@ -42,8 +43,8 @@
  *   4: dst        — the output frame plane col2im writes
  */
 
-#if !defined(BITS)
-#define BITS 16
+#if !defined(IO_U16) && !defined(IO_F32) && !defined(IO_F16)
+#define IO_U16 1
 #endif
 
 #if !defined(RADIUS)
@@ -52,7 +53,7 @@
 
 #define TW (2 * RADIUS + 1)
 
-#if BITS == 16
+#if defined(IO_U16)
 #define ELEM_BYTES 2
 #define ELEM_MASK  0xFFFFu
 #define PEAK       65535.0
@@ -88,7 +89,7 @@ layout(constant_id = 1) const int FILTER_TYPE = 0;
 layout(constant_id = 2) const int ZMEAN = 1;
 
 layout(std430, binding = 0) readonly buffer WtBuf { float wt[]; };
-#if BITS == 16
+#if defined(IO_U16)
 layout(std430, binding = 1) buffer PaddedBuf { uint16_t padded16[]; };
 layout(std430, binding = 3) readonly buffer SrcBuf { uint16_t src16[]; };
 layout(std430, binding = 4) buffer DstBuf { uint16_t dst16[]; };
@@ -1309,7 +1310,7 @@ void irdft16(inout float data[TD_SZ], int base) {
 // ---------------------------------------------------------------------------
 
 float to_float(uint raw) {
-#if BITS == 32
+#if defined(IO_F32)
     return uintBitsToFloat(raw) * SCALE;
 #else
     return float(raw) * SCALE;
@@ -1319,7 +1320,7 @@ float to_float(uint raw) {
 // the fused kernel reads the padded source planes: slice t of the window lives
 // at padded + t * pw * ph, padded_base is the per-plane buffer base (0).
 uint load_fused(int slice, int sample_idx, int pad_slice) {
-#if BITS == 16
+#if defined(IO_U16)
     return uint(padded16[(pc.padded_base >> 1) + slice * pad_slice + sample_idx]);
 #else
     int byte = pc.padded_base + (slice * pad_slice + sample_idx) * ELEM_BYTES;
@@ -1330,7 +1331,7 @@ uint load_fused(int slice, int sample_idx, int pad_slice) {
 
 // the pad kernel reads the core's source frame plane (row stride in elements)
 uint load_src(int sample_idx) {
-#if BITS == 16
+#if defined(IO_U16)
     return uint(src16[(pc.src_base >> 1) + sample_idx]);
 #else
     int byte = pc.src_base + sample_idx * ELEM_BYTES;
@@ -1341,7 +1342,7 @@ uint load_src(int sample_idx) {
 
 // col2im writes the output frame plane directly
 void store_sample(int sample_idx, float v) {
-#if BITS == 32
+#if defined(IO_F32)
     int byte = pc.dst_base + sample_idx * ELEM_BYTES;
     dst_raw[byte >> 2] = floatBitsToUint(v / SCALE);
 #else
@@ -1353,7 +1354,7 @@ void store_sample(int sample_idx, float v) {
 
 // the pad kernel writes the padded source into the device-local padded buffer
 void store_padded(int sample_idx, float v) {
-#if BITS == 32
+#if defined(IO_F32)
     int byte = pc.padded_base + sample_idx * ELEM_BYTES;
     padded_raw[byte >> 2] = floatBitsToUint(v / SCALE);
 #else

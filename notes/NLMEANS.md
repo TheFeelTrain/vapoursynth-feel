@@ -11,16 +11,16 @@ Status: **shipped on the R80 GPU API.** Verified against
   context, build a tiny address table of every `(clip, channel, layer)` plane
   address, **compose** those planes once into one zero-padded device-local
   window, barrier, then the interleaved weight/accumulation sweep rounds,
-  submit. Scratch (window, fp32 weight ring, u2, u5) is per-frame from
+  submit. Scratch (window, f32 weight ring, u2, u5) is per-frame from
   `createGPUBuffer`, retired by the submission.
 - The sweep kernels keep the pre-R80 padded-tile indexing (`(y+PAD)*PSTRIDE`,
   `layer*TILE_ELEMS`), i.e. 32-bit offsets into one storage buffer. Reading the
   core's per-layer planes directly through buffer references costs 64-bit
   addressing per load and ~10% on the chroma benchmark (see Performance).
 - Sweep tables (`wq`/`aq`, stride-8 rows, `qb` batches, variants by
-  `m=min(d,n)`), the fp32 weight ring, `first`-flag init and the finish in the
+  `m=min(d,n)`), the f32 weight ring, `first`-flag init and the finish in the
   last acc round are unchanged from the pre-R80 implementation.
-- Accuracy: ≤1 LSB 16-bit and ≤4.4e-6 fp32 against vszipcl across the whole
+- Accuracy: ≤1 LSB u16 and ≤4.4e-6 f32 against vszipcl across the whole
   parameter surface (spatial, temporal, joint, rclip, cropped, `a=64`, `d=16`).
 - `num_streams` and `device_id` are registered no-ops (never read): depth is
   the core's exec ring, device choice is `core.set_vulkan_device`.
@@ -39,7 +39,7 @@ channels=UV`, 3000 frames, medians of 3 through `tools/benchmark.py`:
   (281 vs 279 fps, ~0.7%); its absolute fps are void with the rest of the
   pre-fix numbers, but the parity it showed is a relative result.
 
-The fp32 weight ring (2026-10-02) replaces the fp16 one and costs **−7.2%** on
+The f32 weight ring (2026-10-02) replaces the fp16 one and costs **−7.2%** on
 the same config: same-session pair, 1080.2 → 1002.4 fps (vszipcl control flat at
 548.9/551.4, n=3 each). The rings are the same size (576 slots, pack 36); only
 the element width doubled (128 MiB budget).
@@ -86,18 +86,18 @@ the element width doubled (128 MiB budget).
   and the finish folded into the last round (`pc3`).
 - `VI_DIM`, `STRIDE`, `PSTRIDE`, `PH`, `PAD`, `NLM_S`, `NLM_D`, `NLM_REF`,
   `NLM_CHANNELS`, `WMODE`, `WREF`, `H2_INV_NORM` and `GUIDE_OFF` are
-  specialization constants; only the io type is a compile-time `-DBITS`.
+  specialization constants; only the io type is a compile-time `-DIO_U16`/`-DIO_F32`.
 - `--target-env=vulkan1.4` (SPIR-V 1.6): the compose pass names the core's
   planes through buffer references (`PhysicalStorageBuffer`).
 
 ## Performance
 
-- **The fp32 weight ring is an accuracy purchase, not a free one.** The fp16
+- **The f32 weight ring is an accuracy purchase, not a free one.** The fp16
   ring (×4096 to dodge the subnormal cliff) quantises every weight to 2^-11
   relative, which on real content drifts the weighted average by up to 2.1e-3
-  fp32 / ~180 codes u16 at `a=64` and ~6 codes on the cropped geometry - the
+  f32 / ~180 codes u16 at `a=64` and ~6 codes on the cropped geometry - the
   recorded 1 LSB band held only on the old near-black clip, where every weight
-  sat on exactly 4096. fp32 collapses the whole comparison surface to ≤1 LSB /
+  sat on exactly 4096. f32 collapses the whole comparison surface to ≤1 LSB /
   ≤4.4e-6 for −7.2%: the ring carries 2x the bytes at the same pack, which the
   measured optimum wants at 128 MiB rather than 64 (halving pack costs more in
   rounds than the wider ring costs in DRAM traffic).
@@ -110,7 +110,7 @@ the element width doubled (128 MiB budget).
   `d=0`; its temporal pairing differs (3.7e-2 at `d=2`), as it does from vszipcl.
 - **`d=16` with `a=64` stays out of the comparison sweep**: it hard-recovers a
   shared GPU (see Do not retry); the neighbouring `a=64` entries are all within
-  4.4e-6 on the fp32 ring.
+  4.4e-6 on the f32 ring.
 - **The compose pass exists for codegen, not correctness.** Reaching each
   `(channel, layer)` plane directly with buffer references cost 64-bit address
   arithmetic on every guide load: the UV weight kernel compiled to 1515 ACO
@@ -169,7 +169,7 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 - **fp16 weight ring ×4096**: unscaled weights <6e-5 lose mantissa bits
   exponentially, so `w*4096` on store and `1/4096` on load replaced them; drift
   measured ≤5 LSB / ~1e-4 on the old clip, up to ~180 LSB on real content at
-  `a=64` (superseded by the fp32 ring above). `finish_sample` returns the centre
+  `a=64` (superseded by the f32 ring above). `finish_sample` returns the centre
   sample on a zero total weight instead of 0/0; that fallback stays.
 - **Boundary/rclip fixes**: the guide half's slot table used the full-window
   stride when `n < d` and read past the vector (fixed key offset), and holder

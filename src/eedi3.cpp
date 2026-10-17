@@ -69,8 +69,8 @@ constexpr int BT_TILE = 32;
 #endif
 static constexpr int MAXW_LDS = EEDI3_MAXW_LDS;
 
-// Pad element size: native u16 for 16-bit input (halves the pad traffic vs
-// float), float for 32-bit. u16 values are exact in float so all downstream
+// Pad element size: native u16 for u16 input (halves the pad traffic vs
+// float), float for f32. u16 values are exact in float so all downstream
 // cost/interp math is bit-identical to a float pad.
 static int pad_elem_bytes(int bits) {
     return (bits == 16) ? 2 : 4;
@@ -1923,7 +1923,8 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         !vsh::isConstantVideoFormat(d->vi) ||
         (sample == stInteger && bps != 16) ||
         (sample == stFloat && bps != 32)) {
-        return set_error("input bitdepth must be 16 (integer) or 32 (float).");
+        return set_error(
+            "input bitdepth must be u16 (16-bit integer) or f32 (32-bit float).");
     }
 
     d->bits = d->vi->format.bitsPerSample;
@@ -2323,71 +2324,73 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     // Shader blobs for this io depth.
     switch (d->bits) {
     case 16:
-        d->row_code = eedi3_16_row_spv;
-        d->row_size = eedi3_16_row_spv_size;
-        d->vcheck_code = eedi3_16_vcheck_spv;
-        d->vcheck_size = eedi3_16_vcheck_spv_size;
-        d->vcheck_lds_code = eedi3_16_vcheck_lds_spv;
-        d->vcheck_lds_size = eedi3_16_vcheck_lds_spv_size;
+        d->row_code = eedi3_u16_row_spv;
+        d->row_size = eedi3_u16_row_spv_size;
+        d->vcheck_code = eedi3_u16_vcheck_spv;
+        d->vcheck_size = eedi3_u16_vcheck_spv_size;
+        d->vcheck_lds_code = eedi3_u16_vcheck_lds_spv;
+        d->vcheck_lds_size = eedi3_u16_vcheck_lds_spv_size;
         d->vcheck_para_code = {
-            eedi3_16_vcheck_para_spv,    eedi3_16_vcheck_para_j1_spv,
-            eedi3_16_vcheck_para_j2_spv, eedi3_16_vcheck_para_j3_spv,
-            eedi3_16_vcheck_para_j4_spv, eedi3_16_vcheck_para_j5_spv
+            eedi3_u16_vcheck_para_spv,    eedi3_u16_vcheck_para_j1_spv,
+            eedi3_u16_vcheck_para_j2_spv, eedi3_u16_vcheck_para_j3_spv,
+            eedi3_u16_vcheck_para_j4_spv, eedi3_u16_vcheck_para_j5_spv
         };
-        d->vcheck_para_size = {
-            eedi3_16_vcheck_para_spv_size,    eedi3_16_vcheck_para_j1_spv_size,
-            eedi3_16_vcheck_para_j2_spv_size, eedi3_16_vcheck_para_j3_spv_size,
-            eedi3_16_vcheck_para_j4_spv_size, eedi3_16_vcheck_para_j5_spv_size
-        };
-        d->pad_code = eedi3_16_pad_spv;
-        d->pad_size = eedi3_16_pad_spv_size;
-        d->vcopy_code = eedi3_16_vcopy_spv;
-        d->vcopy_size = eedi3_16_vcopy_spv_size;
-        d->blit_code = eedi3_16_blit_spv;
-        d->blit_size = eedi3_16_blit_spv_size;
-        d->xpose_code = eedi3_16_xpose_spv;
-        d->xpose_size = eedi3_16_xpose_spv_size;
-        d->compose_code = eedi3_16_compose_spv;
-        d->compose_size = eedi3_16_compose_spv_size;
-        d->assemble_code = eedi3_16_assemblev_spv;
-        d->assemble_size = eedi3_16_assemblev_spv_size;
-        d->hpfill_code = eedi3_16_hpfill_spv;
-        d->hpfill_size = eedi3_16_hpfill_spv_size;
+        d->vcheck_para_size = { eedi3_u16_vcheck_para_spv_size,
+                                eedi3_u16_vcheck_para_j1_spv_size,
+                                eedi3_u16_vcheck_para_j2_spv_size,
+                                eedi3_u16_vcheck_para_j3_spv_size,
+                                eedi3_u16_vcheck_para_j4_spv_size,
+                                eedi3_u16_vcheck_para_j5_spv_size };
+        d->pad_code = eedi3_u16_pad_spv;
+        d->pad_size = eedi3_u16_pad_spv_size;
+        d->vcopy_code = eedi3_u16_vcopy_spv;
+        d->vcopy_size = eedi3_u16_vcopy_spv_size;
+        d->blit_code = eedi3_u16_blit_spv;
+        d->blit_size = eedi3_u16_blit_spv_size;
+        d->xpose_code = eedi3_u16_xpose_spv;
+        d->xpose_size = eedi3_u16_xpose_spv_size;
+        d->compose_code = eedi3_u16_compose_spv;
+        d->compose_size = eedi3_u16_compose_spv_size;
+        d->assemble_code = eedi3_u16_assemblev_spv;
+        d->assemble_size = eedi3_u16_assemblev_spv_size;
+        d->hpfill_code = eedi3_u16_hpfill_spv;
+        d->hpfill_size = eedi3_u16_hpfill_spv_size;
         break;
     case 32:
-        d->row_code = eedi3_32_row_spv;
-        d->row_size = eedi3_32_row_spv_size;
-        d->vcheck_code = eedi3_32_vcheck_spv;
-        d->vcheck_size = eedi3_32_vcheck_spv_size;
-        d->vcheck_lds_code = eedi3_32_vcheck_lds_spv;
-        d->vcheck_lds_size = eedi3_32_vcheck_lds_spv_size;
+        d->row_code = eedi3_f32_row_spv;
+        d->row_size = eedi3_f32_row_spv_size;
+        d->vcheck_code = eedi3_f32_vcheck_spv;
+        d->vcheck_size = eedi3_f32_vcheck_spv_size;
+        d->vcheck_lds_code = eedi3_f32_vcheck_lds_spv;
+        d->vcheck_lds_size = eedi3_f32_vcheck_lds_spv_size;
         d->vcheck_para_code = {
-            eedi3_32_vcheck_para_spv,    eedi3_32_vcheck_para_j1_spv,
-            eedi3_32_vcheck_para_j2_spv, eedi3_32_vcheck_para_j3_spv,
-            eedi3_32_vcheck_para_j4_spv, eedi3_32_vcheck_para_j5_spv
+            eedi3_f32_vcheck_para_spv,    eedi3_f32_vcheck_para_j1_spv,
+            eedi3_f32_vcheck_para_j2_spv, eedi3_f32_vcheck_para_j3_spv,
+            eedi3_f32_vcheck_para_j4_spv, eedi3_f32_vcheck_para_j5_spv
         };
-        d->vcheck_para_size = {
-            eedi3_32_vcheck_para_spv_size,    eedi3_32_vcheck_para_j1_spv_size,
-            eedi3_32_vcheck_para_j2_spv_size, eedi3_32_vcheck_para_j3_spv_size,
-            eedi3_32_vcheck_para_j4_spv_size, eedi3_32_vcheck_para_j5_spv_size
-        };
-        d->pad_code = eedi3_32_pad_spv;
-        d->pad_size = eedi3_32_pad_spv_size;
-        d->vcopy_code = eedi3_32_vcopy_spv;
-        d->vcopy_size = eedi3_32_vcopy_spv_size;
-        d->blit_code = eedi3_32_blit_spv;
-        d->blit_size = eedi3_32_blit_spv_size;
-        d->xpose_code = eedi3_32_xpose_spv;
-        d->xpose_size = eedi3_32_xpose_spv_size;
-        d->compose_code = eedi3_32_compose_spv;
-        d->compose_size = eedi3_32_compose_spv_size;
-        d->assemble_code = eedi3_32_assemblev_spv;
-        d->assemble_size = eedi3_32_assemblev_spv_size;
-        d->hpfill_code = eedi3_32_hpfill_spv;
-        d->hpfill_size = eedi3_32_hpfill_spv_size;
+        d->vcheck_para_size = { eedi3_f32_vcheck_para_spv_size,
+                                eedi3_f32_vcheck_para_j1_spv_size,
+                                eedi3_f32_vcheck_para_j2_spv_size,
+                                eedi3_f32_vcheck_para_j3_spv_size,
+                                eedi3_f32_vcheck_para_j4_spv_size,
+                                eedi3_f32_vcheck_para_j5_spv_size };
+        d->pad_code = eedi3_f32_pad_spv;
+        d->pad_size = eedi3_f32_pad_spv_size;
+        d->vcopy_code = eedi3_f32_vcopy_spv;
+        d->vcopy_size = eedi3_f32_vcopy_spv_size;
+        d->blit_code = eedi3_f32_blit_spv;
+        d->blit_size = eedi3_f32_blit_spv_size;
+        d->xpose_code = eedi3_f32_xpose_spv;
+        d->xpose_size = eedi3_f32_xpose_spv_size;
+        d->compose_code = eedi3_f32_compose_spv;
+        d->compose_size = eedi3_f32_compose_spv_size;
+        d->assemble_code = eedi3_f32_assemblev_spv;
+        d->assemble_size = eedi3_f32_assemblev_spv_size;
+        d->hpfill_code = eedi3_f32_hpfill_spv;
+        d->hpfill_size = eedi3_f32_hpfill_spv_size;
         break;
     default:
-        return set_error("unsupported bit depth");
+        return set_error("unsupported io type");
     }
     d->maskpack_code = { eedi3_maskpack_8_spv, eedi3_maskpack_16_spv,
                          eedi3_maskpack_32_spv };

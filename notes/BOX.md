@@ -2,8 +2,8 @@
 
 **Shipped.** `core.vsfeel.Box(clip, width, height)` is a separable box downscale
 that runs on the device: each output pixel averages a group of source pixels with
-equal weight. It handles every plane of Gray/YUV/RGB, 16-bit integer or 32-bit
-float, any downscale ratio, and refuses upscales.
+equal weight. It handles every plane of Gray/YUV/RGB, u16 or f32, any downscale
+ratio, and refuses upscales.
 
 The reference is `vskernels.Box` (resize2's `Box` kernel), which `vsfeel.Box` is
 written to match. Measured on the 640x360 fixture, both depths, every plane:
@@ -69,8 +69,12 @@ no shared memory. Subtracting the no-filter control above, Box's own work is
 Everything else in the standalone row is the round trip: at 1080p a u16 upload or
 download is ~100 µs, so CPU frames on both sides cost ~200 µs more than the
 resize itself. With device frames on both sides there are no transfers at all,
-and that is the entire win — 1.5x the CPU resizer at 1080p and 1.4x at 4K, and
-+13% on the `feel_aa` chain that previously paid for a 4K round trip.
+and that is the entire win — 1.5x the CPU resizer at 1080p and 1.4x at 4K, plus
+the transfer saving it contributes to the `feel_aa` chain. That chain's headline
+is driver-dependent (see `notes/EEDI3AA.md`): the same saving that is +11.9%
+under the default RADV queue behaviour is +1.5% with
+`RADV_EXPERIMENTAL=transfer_queue`, because a real transfer queue hides the
+copies this filter removes.
 
 ## Historical
 
@@ -79,7 +83,8 @@ and that is the entire win — 1.5x the CPU resizer at 1080p and 1.4x at 4K, and
   one-pixel-shifted `Point` copy, bit-exact on u16 and within 1e-6 on f32, with
   no new filter to maintain. It lost on cost — 5–6 full-size passes per
   downscale, twice per `feel_aa` frame, leaving that chain at 135.0 fps against
-  143.0 for the native kernel.
+  143.0 for the native kernel (default driver; both arms measured under it, so
+  the +6% is the same-session result, the absolutes are not — see Performance).
 - **Fractional ratios were going to be refused.** The first design supported only
   integer tap counts, on the theory that a shader-side `ceil(i*s - 0.5)` at a
   fractional ratio is a float32 tie waiting to move a tap. Computing the window

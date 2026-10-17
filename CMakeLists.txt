@@ -158,13 +158,13 @@ else()
 endif()
 
 # SPIR-V: compile the GLSL kernels with glslc when available.
-# Each kernel is compiled for 16/32-bit staging formats.
+# Each kernel is compiled for the u16 and f32 staging formats.
 
 # --- shader variant table -----------------------------------------------------
 # One "|"-separated "<out>|<source>|<defs>" entry per .spv (pipes, not
 # semicolons: a ";" would split a quoted entry into three separate list
-# elements). The table is the only place a variant is declared: entry point, bit
-# depth, radius and every other -D live in the <defs> field, so adding a variant
+# elements). The table is the only place a variant is declared: entry point, io
+# type, radius and every other -D live in the <defs> field, so adding a variant
 # is one line and there is no entry-name -> -D ladder to extend in several
 # places. add_spv_variant() below turns an entry into the glslc rule.
 #
@@ -178,20 +178,25 @@ endif()
 # covers the subgroup ops (1.3+), buffer references and Vulkan memory model the
 # kernels rely on.
 
-set(VK_BITS "16" "32")
+# The io variants every kernel is built for. Each name is the storage type the
+# kernel stages through (u16 = 16-bit integer, f32 = 32-bit float) and becomes
+# the -DIO_<NAME> the shader selects its IO_TYPE on, so an f16 variant is one
+# more entry here plus its shader branch.
+set(VK_IO_TYPES "u16" "f32")
 
 # Bilateral: one entry point per file, per io variant.
 set(VK_BILATERAL_VARIANTS)
 foreach(component IN ITEMS shared plain)
-    foreach(bits IN LISTS VK_BITS)
+    foreach(io IN LISTS VK_IO_TYPES)
+        string(TOUPPER "${io}" io_define)
         list(APPEND VK_BILATERAL_VARIANTS
-            "bilateral_${component}_${bits}|bilateral_${component}.comp|-DBITS=${bits}")
+            "bilateral_${component}_${io}|bilateral_${component}.comp|-DIO_${io_define}")
     endforeach()
 endforeach()
 
 # BM3D: an estimation kernel (float ring and float estimate stacks at every
 # input depth, so no io variant), an aggregation kernel per destination sample
-# type (16 int, 32 float), a copy-and-widen kernel for integer input, and a
+# type (u16, f32), a copy-and-widen kernel for integer input, and a
 # _cas estimation variant with the accumulation on atomicCompSwap for devices
 # without buffer float atomics; see src/bm3d.comp.
 set(VK_BM3D_VARIANTS
@@ -214,12 +219,12 @@ set(VK_BM3D_VARIANTS
     "bm3d_filter_1plane|bm3d.comp|-DSPLIT_FILTER -DONE_PLANE"
     "bm3d_filter_cas|bm3d.comp|-DSPLIT_FILTER -DNO_FLOAT_ATOMICS"
     "bm3d_filter_cas_1plane|bm3d.comp|-DSPLIT_FILTER -DNO_FLOAT_ATOMICS -DONE_PLANE"
-    "bm3d_agg_32|bm3d_agg.comp|-DBITS=32"
-    "bm3d_agg_16|bm3d_agg.comp|-DBITS=16"
-    "bm3d_copy16|bm3d_copy.comp|")
+    "bm3d_agg_f32|bm3d_agg.comp|-DIO_F32"
+    "bm3d_agg_u16|bm3d_agg.comp|-DIO_U16"
+    "bm3d_copy_u16|bm3d_copy.comp|")
 
 # GaussBlur: one kernel with three entry points (fused small path + the two
-# large-path passes), per io variant (16 int, 32 float). Each pass carries its
+# large-path passes), per io variant (u16, f32). Each pass carries its
 # own workgroup shape and outputs per thread, so those are per-entry defines
 # here rather than one set for all three; the numbers behind them are in
 # notes/GAUSSBLUR.md, and tools/shader_limits.py --check compares the compiled
@@ -230,33 +235,35 @@ set(VK_GAUSS_ENTRY_DEFS
     "-DENTRY_VERT -DBLK_X=32 -DBLK_Y=4 -DR=16"
     "-DENTRY_HORIZ -DBLK_X=16 -DBLK_Y=8 -DR=8")
 set(VK_GAUSS_VARIANTS)
-foreach(bits IN LISTS VK_BITS)
+foreach(io IN LISTS VK_IO_TYPES)
+    string(TOUPPER "${io}" io_define)
     foreach(entry_i RANGE 0 2)
         list(GET VK_GAUSS_ENTRIES ${entry_i} entry)
         list(GET VK_GAUSS_ENTRY_DEFS ${entry_i} entry_def)
         list(APPEND VK_GAUSS_VARIANTS
-            "gaussblur_${bits}_${entry}|gaussblur.comp|-DBITS=${bits} ${entry_def}")
+            "gaussblur_${io}_${entry}|gaussblur.comp|-DIO_${io_define} ${entry_def}")
     endforeach()
 endforeach()
 
-# Box: one variant per pass per io depth. The tap window is a host-computed
+# Box: one variant per pass per io type. The tap window is a host-computed
 # table (resize2's box filter is not an area average at fractional ratios), so
 # nothing else varies; the workgroup shape lives in the shader and is compared
 # against the host launch by tools/shader_limits.py --check.
 set(VK_BOX_ENTRIES vert horiz)
 set(VK_BOX_ENTRY_DEFS -DENTRY_VERT -DENTRY_HORIZ)
 set(VK_BOX_VARIANTS)
-foreach(bits IN LISTS VK_BITS)
+foreach(io IN LISTS VK_IO_TYPES)
+    string(TOUPPER "${io}" io_define)
     foreach(entry_i RANGE 0 1)
         list(GET VK_BOX_ENTRIES ${entry_i} entry)
         list(GET VK_BOX_ENTRY_DEFS ${entry_i} entry_def)
         list(APPEND VK_BOX_VARIANTS
-            "box_${bits}_${entry}|box.comp|-DBITS=${bits} ${entry_def}")
+            "box_${io}_${entry}|box.comp|-DIO_${io_define} ${entry_def}")
     endforeach()
 endforeach()
 
-# DFTTest: pad + fused + col2im kernels per io variant (16 int, 32
-# float); the fused kernel is additionally compiled per temporal radius
+# DFTTest: pad + fused + col2im kernels per io variant (u16, f32); the fused
+# kernel is additionally compiled per temporal radius
 # (0..3, i.e. tbsize 1/3/5/7) so its loops unroll and the working array
 # stays in registers (the reference does the same via `#define RADIUS`).
 # The fused kernel uses subgroup barriers instead of workgroup barriers
@@ -266,38 +273,40 @@ endforeach()
 set(VK_DFT_ENTRIES pad col2im)
 set(VK_DFT_ENTRY_DEFS -DENTRY_PAD -DENTRY_COL2IM)
 set(VK_DFT_VARIANTS)
-foreach(bits IN LISTS VK_BITS)
+foreach(io IN LISTS VK_IO_TYPES)
+    string(TOUPPER "${io}" io_define)
     foreach(entry_i RANGE 0 1)
         list(GET VK_DFT_ENTRIES ${entry_i} entry)
         list(GET VK_DFT_ENTRY_DEFS ${entry_i} entry_def)
         list(APPEND VK_DFT_VARIANTS
-            "dfttest_${bits}_${entry}|dfttest.comp|-DBITS=${bits} ${entry_def}")
+            "dfttest_${io}_${entry}|dfttest.comp|-DIO_${io_define} ${entry_def}")
     endforeach()
     foreach(radius RANGE 0 3)
         list(APPEND VK_DFT_VARIANTS
-            "dfttest_${bits}_fused_r${radius}|dfttest.comp|-DBITS=${bits} -DENTRY_FUSED -DRADIUS=${radius}")
+            "dfttest_${io}_fused_r${radius}|dfttest.comp|-DIO_${io_define} -DENTRY_FUSED -DRADIUS=${radius}")
     endforeach()
 endforeach()
 
-# NLMeans: compose / weight / accumulation entry points per io variant (16-bit
-# int, 32-bit float); everything else is a specialization constant. The compose
+# NLMeans: compose / weight / accumulation entry points per io variant (u16,
+# f32); everything else is a specialization constant. The compose
 # pass names the core's GPU frame planes through buffer references
 # (PhysicalStorageBuffer).
 set(VK_NLM_ENTRIES compose weight acc)
 set(VK_NLM_ENTRY_DEFS -DENTRY_COMPOSE -DENTRY_WEIGHT -DENTRY_ACC)
 set(VK_NLM_VARIANTS)
-foreach(bits IN LISTS VK_BITS)
+foreach(io IN LISTS VK_IO_TYPES)
+    string(TOUPPER "${io}" io_define)
     foreach(entry_i RANGE 0 2)
         list(GET VK_NLM_ENTRIES ${entry_i} entry)
         list(GET VK_NLM_ENTRY_DEFS ${entry_i} entry_def)
         list(APPEND VK_NLM_VARIANTS
-            "nlmeans_${bits}_${entry}|nlmeans.comp|-DBITS=${bits} ${entry_def}")
+            "nlmeans_${io}_${entry}|nlmeans.comp|-DIO_${io_define} ${entry_def}")
     endforeach()
 endforeach()
 
 # EEDI3: row kernel (one 32-lane WG per interp row, subgroup-register DP
 # with shuffles) + vcheck kernel (single WG serial row walk), per io
-# variant (16 int, 32 float). The row kernel needs subgroup ops + the
+# variant (u16, f32). The row kernel needs subgroup ops + the
 # Vulkan memory model, so SPIR-V 1.3+ is required.
 # PROBE and MAXW are cache variables: PROBE is a diagnostics-only ablation
 # level, MAXW is the max plane width the vcheck LDS ping-pong can hold, kept in
@@ -306,28 +315,29 @@ endforeach()
 set(EEDI3_PROBE "0" CACHE STRING "EEDI3 diagnostics-only shader ablation level")
 set(EEDI3_MAXW "4096" CACHE STRING "EEDI3 vcheck LDS max plane width")
 set(VK_EEDI3_VARIANTS)
-foreach(bits IN LISTS VK_BITS)
+foreach(io IN LISTS VK_IO_TYPES)
+    string(TOUPPER "${io}" io_define)
     list(APPEND VK_EEDI3_VARIANTS
-        "eedi3_${bits}_row|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_ROW"
-        "eedi3_${bits}_vcheck|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK"
-        "eedi3_${bits}_vcheck_lds|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_LDS=1"
-        "eedi3_${bits}_vcheck_para|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=1"
-        "eedi3_${bits}_vcheck_para_j1|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=2"
-        "eedi3_${bits}_vcheck_para_j2|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=3"
-        "eedi3_${bits}_vcheck_para_j3|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=4"
-        "eedi3_${bits}_vcheck_para_j4|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=5"
-        "eedi3_${bits}_vcheck_para_j5|eedi3.comp|-DBITS=${bits} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=6"
+        "eedi3_${io}_row|eedi3.comp|-DIO_${io_define} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_ROW"
+        "eedi3_${io}_vcheck|eedi3.comp|-DIO_${io_define} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK"
+        "eedi3_${io}_vcheck_lds|eedi3.comp|-DIO_${io_define} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_LDS=1"
+        "eedi3_${io}_vcheck_para|eedi3.comp|-DIO_${io_define} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=1"
+        "eedi3_${io}_vcheck_para_j1|eedi3.comp|-DIO_${io_define} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=2"
+        "eedi3_${io}_vcheck_para_j2|eedi3.comp|-DIO_${io_define} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=3"
+        "eedi3_${io}_vcheck_para_j3|eedi3.comp|-DIO_${io_define} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=4"
+        "eedi3_${io}_vcheck_para_j4|eedi3.comp|-DIO_${io_define} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=5"
+        "eedi3_${io}_vcheck_para_j5|eedi3.comp|-DIO_${io_define} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=6"
         # upload kernels: mirror-pad builder + empty-row vcheck copy and the
         # upload kernels: mirror-pad builder + hp's half-pel precompute +
         # empty-row vcheck copy and the assemble/transpose passes (plain 1D
         # kernels, fixed local size, no subgroup ops).
-        "eedi3_${bits}_pad|eedi3.comp|-DBITS=${bits} -DENTRY_PAD"
-        "eedi3_${bits}_hpfill|eedi3.comp|-DBITS=${bits} -DENTRY_HPFILL"
-        "eedi3_${bits}_vcopy|eedi3.comp|-DBITS=${bits} -DENTRY_VCOPY"
-        "eedi3_${bits}_blit|eedi3.comp|-DBITS=${bits} -DENTRY_BLIT"
-        "eedi3_${bits}_xpose|eedi3.comp|-DBITS=${bits} -DENTRY_XPOSE"
-        "eedi3_${bits}_compose|eedi3.comp|-DBITS=${bits} -DENTRY_COMPOSE"
-        "eedi3_${bits}_assemblev|eedi3.comp|-DBITS=${bits} -DENTRY_ASSEMBLEV")
+        "eedi3_${io}_pad|eedi3.comp|-DIO_${io_define} -DENTRY_PAD"
+        "eedi3_${io}_hpfill|eedi3.comp|-DIO_${io_define} -DENTRY_HPFILL"
+        "eedi3_${io}_vcopy|eedi3.comp|-DIO_${io_define} -DENTRY_VCOPY"
+        "eedi3_${io}_blit|eedi3.comp|-DIO_${io_define} -DENTRY_BLIT"
+        "eedi3_${io}_xpose|eedi3.comp|-DIO_${io_define} -DENTRY_XPOSE"
+        "eedi3_${io}_compose|eedi3.comp|-DIO_${io_define} -DENTRY_COMPOSE"
+        "eedi3_${io}_assemblev|eedi3.comp|-DIO_${io_define} -DENTRY_ASSEMBLEV")
 endforeach()
 
 # EEDI3 mask preparation: one variant per mask element format (the mask plane is
@@ -347,17 +357,18 @@ endforeach()
 # small tile (4KB LDS instead of 16/18KB). SHSTRIDE is always a -D so the
 # array dimension and the addressing cannot disagree. dh / the dh zero-fill
 # are specialization constants, so the kept-row writer needs one variant per
-# io depth. The predictor needs subgroup ops + the Vulkan memory model, so
+# io type. The predictor needs subgroup ops + the Vulkan memory model, so
 # SPIR-V 1.3+.
 set(VK_NNEDI3_VARIANTS)
-foreach(bits IN LISTS VK_BITS)
+foreach(io IN LISTS VK_IO_TYPES)
+    string(TOUPPER "${io}" io_define)
     list(APPEND VK_NNEDI3_VARIANTS
-        "nnedi3_${bits}_prescreen|nnedi3.comp|-DBITS=${bits} -DENTRY_PRESCREEN"
-        "nnedi3_${bits}_predict|nnedi3.comp|-DBITS=${bits} -DENTRY_PREDICT -DSHSTRIDE=256u"
-        "nnedi3_${bits}_predict_n4|nnedi3.comp|-DBITS=${bits} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=288u"
-        "nnedi3_${bits}_predict_n4m|nnedi3.comp|-DBITS=${bits} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=192u"
-        "nnedi3_${bits}_predict_n4s|nnedi3.comp|-DBITS=${bits} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=64u"
-        "nnedi3_${bits}_keep|nnedi3.comp|-DBITS=${bits} -DENTRY_KEEP")
+        "nnedi3_${io}_prescreen|nnedi3.comp|-DIO_${io_define} -DENTRY_PRESCREEN"
+        "nnedi3_${io}_predict|nnedi3.comp|-DIO_${io_define} -DENTRY_PREDICT -DSHSTRIDE=256u"
+        "nnedi3_${io}_predict_n4|nnedi3.comp|-DIO_${io_define} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=288u"
+        "nnedi3_${io}_predict_n4m|nnedi3.comp|-DIO_${io_define} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=192u"
+        "nnedi3_${io}_predict_n4s|nnedi3.comp|-DIO_${io_define} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=64u"
+        "nnedi3_${io}_keep|nnedi3.comp|-DIO_${io_define} -DENTRY_KEEP")
 endforeach()
 
 set(VK_VARIANTS

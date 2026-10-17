@@ -77,7 +77,7 @@ CORE.max_cache_size = 64
 NAMES = ["Bilateral", "GaussBlur", "DFTTest", "NLMeans", "BM3D",
          "EEDI3", "EEDI3H", "EEDI3AA", "NNEDI3"]
 
-# g16-input predictors; the rest take g32
+# g16-input predictors; the rest take gs
 _WIDE = ("EEDI3", "EEDI3H", "EEDI3AA", "NNEDI3")
 _DTYPE = {n: (np.uint16 if n in _WIDE else np.float32) for n in NAMES}
 
@@ -98,13 +98,13 @@ _KWARGS = {
 def make_clips():
     src = CORE.bs.VideoSource(CLIP_PATH)
     g = CORE.std.ShufflePlanes(src, 0, vs.GRAY)
-    g32 = CORE.fmtc.bitdepth(g, bits=32, fulls=True, fulld=True)
+    gs = CORE.fmtc.bitdepth(g, bits=32, fulls=True, fulld=True)
     g16 = CORE.fmtc.bitdepth(g, bits=16, fulls=True, fulld=True)
-    return g32, g16
+    return gs, g16
 
 
-def build(name, g32, g16):
-    clip = g16 if name in _WIDE else g32
+def build(name, gs, g16):
+    clip = g16 if name in _WIDE else gs
     kwargs = dict(_KWARGS[name])
     return getattr(CORE.vsfeel, name)(clip, **kwargs)
 
@@ -185,8 +185,8 @@ _CYCLE_SCRIPT = (
     + r"""
 def main():
     name = sys.argv[1]
-    g32, g16 = make_clips()
-    tiny = CORE.std.Crop(g32, right=g32.width - 64, bottom=g32.height - 64)
+    gs, g16 = make_clips()
+    tiny = CORE.std.Crop(gs, right=gs.width - 64, bottom=gs.height - 64)
     # Pin the shared device: a live instance keeps it (and the DRM fd) alive, so
     # anything a cycle fails to free stays accounted to this process instead of
     # being reclaimed when the cycle's own device is destroyed.
@@ -196,7 +196,7 @@ def main():
     samples = []
     start = time.perf_counter()
     for _ in range(__CYCLES__):
-        node = build(name, g32, g16)
+        node = build(name, gs, g16)
         node.get_frame(0)
         del node
         CORE.clear_cache()
@@ -228,14 +228,14 @@ FRAMES = 4
 
 
 def main():
-    g32, g16 = make_clips()
-    c32 = CORE.std.Crop(g32, right=g32.width - SIZE, bottom=g32.height - SIZE)
+    gs, g16 = make_clips()
+    cs = CORE.std.Crop(gs, right=gs.width - SIZE, bottom=gs.height - SIZE)
     c16 = CORE.std.Crop(g16, right=g16.width - SIZE, bottom=g16.height - SIZE)
 
     # solo oracle first: one node at a time, nothing else resident
     solo = {}
     for name in NAMES:
-        node = cpu_node(build(name, c32, c16))
+        node = cpu_node(build(name, cs, c16))
         solo[name] = [read_plane(node.get_frame(n), 0, _DTYPE[name])
                       for n in range(FRAMES)]
         del node
@@ -243,7 +243,7 @@ def main():
 
     # every filter resident at once, each evaluated from its own thread and
     # released together by a barrier so the GPU work actually overlaps
-    nodes = {name: cpu_node(build(name, c32, c16)) for name in NAMES}
+    nodes = {name: cpu_node(build(name, cs, c16)) for name in NAMES}
     results = {}
     errors = []
     barrier = threading.Barrier(len(NAMES))

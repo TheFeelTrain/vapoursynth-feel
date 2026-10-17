@@ -1,5 +1,5 @@
 #version 450
-// Native 16-bit samples in the destination plane.
+// Native u16 samples in the destination plane.
 #extension GL_EXT_shader_16bit_storage : require
 
 /*
@@ -16,18 +16,18 @@
  * interleaved load streams rather than by bytes: the same bytes move in a
  * quarter of the instructions.
  *
- * -DBITS=16|32 selects the destination plane's element type. The estimate
- * stacks and the source ring are float either way: the stacks hold the
+ * -DIO_U16 / -DIO_F32 selects the destination plane's element type. The
+ * estimate stacks and the source ring are float either way: the stacks hold the
  * reference's weighted sums, and the ring is already widened at copy time (see
  * bm3d_copy.comp), which is what keeps the matcher's inner loop free of a
  * conversion per candidate sample.
  */
 
-#if !defined(BITS)
-#define BITS 32
+#if !defined(IO_U16) && !defined(IO_F32) && !defined(IO_F16)
+#define IO_F32 1
 #endif
 
-#if BITS == 16
+#if defined(IO_U16)
 #define PEAK 65535.0f
 #else
 #define PEAK 1.0f
@@ -56,9 +56,9 @@ layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
 layout(std430, binding = 3) readonly buffer TagBuf { uint tags[]; };
 layout(std430, binding = 4) buffer SkipBuf { uint skipped[]; };
 layout(std430, binding = 5) buffer RefuseBuf { uint refusal[]; };
-// The destination plane keeps its vec4 form at depth 32 (the store stays one
-// 16-byte access per thread); at depth 16 it is four native samples.
-#if BITS == 16
+// The destination plane keeps its vec4 form in the f32 build (the store stays
+// one 16-byte access per thread); in the u16 build it is four native samples.
+#if defined(IO_U16)
 layout(std430, binding = 2) buffer DstBuf { uint16_t dst16[]; };
 #else
 layout(std430, binding = 2) buffer DstBuf { vec4 dst4[]; };
@@ -92,7 +92,7 @@ int slot_of(int m) {
 // not optional -- the weight sums num/den can land an ulp above 1.0, and a bare
 // mask-and-truncate would wrap that to 0.
 void store_result(int x, int y, vec4 v) {
-#if BITS == 16
+#if defined(IO_U16)
     const int o = y * STRIDE + x;
     const float bias = (CHROMA != 0) ? 32768.0f : 0.0f;
     const vec4 s = clamp(v * PEAK + bias + 0.5f, vec4(0.0f), vec4(PEAK));

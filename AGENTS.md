@@ -321,7 +321,7 @@ new variants.
 ### How the shader pipeline fits together
 
 Each `src/*.comp` file holds several entry points selected by `-D` defines
-(e.g. `-DENTRY_FUSED -DRADIUS=1 -DBITS=16`); a CMake `foreach` loop compiles
+(e.g. `-DENTRY_FUSED -DRADIUS=1 -DIO_U16`); a CMake `foreach` loop compiles
 one `.spv` per variant-table entry into `build/vk_spv/`, and
 `gen_spirv_header.py` packs them all into `spirv_binaries.h` as `uint32_t`
 arrays. The C++ side picks the arrays it needs (usually per bit depth / radius

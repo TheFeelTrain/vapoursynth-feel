@@ -17,9 +17,9 @@ medians of 3):
 | bit depth | vsfeel | vszipcl chain | eedi3vk2 chain |
 |---|---|---|---|
 | u16 | 174 | 26 | 37 |
-| fp32 | 128 | 24 | 32 |
+| f32 | 128 | 24 | 32 |
 
-- **4.7x the faster reference chain on u16, 4.0x on fp32.**
+- **4.7x the faster reference chain on u16, 4.0x on f32.**
 - Same-session A/Bs, still valid as relative results: the R80 port's
   interleaved pair (+4%) and the fused call against the two-call chain
   (1.01–1.07x, 6x600 f order-reversed). The absolute fps they were recorded
@@ -102,14 +102,28 @@ is the `NNEDI3` supersampler, which is the configuration to quote: `ArtCNN` is a
 learned model whose cost is its own, so it is not a config this repository grades.
 
 At `rfactor=2, supersampler=vsfeel.NNEDI3(), use_mclip=True` the reference graph
-inserts 7 transfers and runs 126.2/123.7 fps (1080p jpbd YUV420P16, 600 f,
-downloaded output, two same-session pairs of interleaved medians-of-3);
-`feel_aa` inserts none and runs 143.0/139.4, **+13.3% and +12.7%**.
+inserts 7 transfers and `feel_aa` none, so the whole gain is those transfers --
+which makes it a property of the driver as much as of the filter. Medians of 3,
+2000 f of 1080p jpbd YUV420P16, `vspipe -e 1999 ... --`:
+
+| RADV | `based_aa` | `feel_aa` | |
+|---|---:|---:|---|
+| default | 128.6 | 143.9 | **+11.9%** |
+| `RADV_EXPERIMENTAL=transfer_queue` | 142.4 | 144.6 | **+1.5%** |
+
+The flag is visible in the banner the core prints: without it, "no transfer
+family so transfers use a second compute queue"; with it, that clause is gone.
+A real transfer family lets the copies run on the DMA queue and overlap, so
+`based_aa` gains **10.8%** from the flag alone and `feel_aa`, having no copies to
+accelerate, moves 0.5% (noise). **At 1080p with a transfer queue the two chains
+are the same speed** -- the +11.9% is a measurement of the default driver, not a
+property `feel_aa` can claim in general. Quote it with its driver state or quote
+both rows.
 
 **A scaler with no device path is allowed, not refused, and costs about 3%.** The
 fallback is measured with Lanczos forced through the host rather than ArtCNN
 (identical graph, only the residency differs): 149.69 -> 145.20 fps at 1200 f,
-medians of 3, 1080p jpbd YUV420P16 downloaded output.
+medians of 3, 1080p jpbd YUV420P16 downloaded output, default driver.
 
 The host frame is read by EEDI3AA's `clip` and `sclip` and again by the pscale
 blend, so the core was inserting four transfers -- the scaler's own 1080p
@@ -198,11 +212,11 @@ not load bound.
 **Where `feel_aa` still differs from `based_aa`**, measured on 1080p against the
 reference chain:
 
-- 16-bit integer: only the mask. `vsaa` builds it through `edgemasks`, whose
+- u16: only the mask. `vsaa` builds it through `edgemasks`, whose
   Prewitt is wrong on the 1-pixel border ring (up to 41228, quantised to 8-bit
   steps) where `core.std.Prewitt` matches the reference formula exactly; the
   rest of the chain is bit-exact.
-- 32-bit float: the same operators on different devices. The core's CPU and GPU
+- f32: the same operators on different devices. The core's CPU and GPU
   paths round differently (`std.Prewitt` by ~5e-7 on this clip), and where that
   straddles the mask's binarize threshold a few pixels move by up to ~1.5e-2 —
   `mask=False` drops the bound to 1e-5, which is how the flip was isolated.
@@ -218,7 +232,7 @@ reference chain:
   pre-fix benchmark harness (`notes/METHOD.md`). The two same-session A/B
   *results* are kept in the banner; the 1.6–1.8x projection the old banner
   closed on is superseded by the current 4.7x/4.0x.
-- **2026-10-02 — the `oracle_32bit[case4-*]` failures were the EEDI3 core, not
+- **2026-10-02 — the `oracle_f32[case4-*]` failures were the EEDI3 core, not
   the AA chain.** They measured 0.002 against the 1e-6 oracle because the fused
   chain's f32 EEDI3 sub-passes lost DP argmins to missing `precise` qualifiers
   and incremental window sums; both are fixed in `src/eedi3.comp` and the case
@@ -359,7 +373,7 @@ under-reported every stage 10x).
   once from `planes[0].o0_bytes`, so a `planes` subset omitting plane 0
   (`planes=[1]`) dispatched `comp_fuse=0` and wrote one unmerged horizontal
   sub-pass; each plane now reads its own `cfg.o0_bytes`. Measured 1229 codes off
-  the chain at 16-bit, `planes=[1]`, mdis=5, nrad=1, frame 0 of the noise clip,
+  the chain at u16, `planes=[1]`, mdis=5, nrad=1, frame 0 of the noise clip,
   before the fix. No perf change.
 - **2026-09-29 — the wrappers drop parameters the plugin does not declare.**
   vs-jetpack's EEDI3 dataclass forwards its own keys (`hp` at the time, which no

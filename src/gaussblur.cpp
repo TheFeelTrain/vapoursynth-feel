@@ -590,7 +590,7 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
         (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV &&
          fmt.colorFamily != cfRGB)) {
         return set_error(
-            "input bitdepth must be 16 (integer) or 32 (float), Gray/YUV/RGB.");
+            "input bitdepth must be u16 (16-bit integer) or f32 (32-bit float), Gray/YUV/RGB.");
     }
 
     d->bits = bits;
@@ -813,20 +813,20 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
     size_t horiz_size = 0;
     switch (d->bits) {
     case 16:
-        gauss_code = gaussblur_16_gauss_spv;
-        gauss_size = gaussblur_16_gauss_spv_size;
-        vert_code = gaussblur_16_vert_spv;
-        vert_size = gaussblur_16_vert_spv_size;
-        horiz_code = gaussblur_16_horiz_spv;
-        horiz_size = gaussblur_16_horiz_spv_size;
+        gauss_code = gaussblur_u16_gauss_spv;
+        gauss_size = gaussblur_u16_gauss_spv_size;
+        vert_code = gaussblur_u16_vert_spv;
+        vert_size = gaussblur_u16_vert_spv_size;
+        horiz_code = gaussblur_u16_horiz_spv;
+        horiz_size = gaussblur_u16_horiz_spv_size;
         break;
     default:
-        gauss_code = gaussblur_32_gauss_spv;
-        gauss_size = gaussblur_32_gauss_spv_size;
-        vert_code = gaussblur_32_vert_spv;
-        vert_size = gaussblur_32_vert_spv_size;
-        horiz_code = gaussblur_32_horiz_spv;
-        horiz_size = gaussblur_32_horiz_spv_size;
+        gauss_code = gaussblur_f32_gauss_spv;
+        gauss_size = gaussblur_f32_gauss_spv_size;
+        vert_code = gaussblur_f32_vert_spv;
+        vert_size = gaussblur_f32_vert_spv_size;
+        horiz_code = gaussblur_f32_horiz_spv;
+        horiz_size = gaussblur_f32_horiz_spv_size;
         break;
     }
 

@@ -900,7 +900,7 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV &&
          fmt.colorFamily != cfRGB)) {
         return set_error(
-            "only 16-bit integer and 32-bit float Gray/YUV/RGB input supported.");
+            "only 16-bit integer (u16) and 32-bit float (f32) Gray/YUV/RGB input supported.");
     }
 
     d->peak = fmt.sampleType == stInteger ? (1 << bits) - 1 : 0;
@@ -1215,31 +1215,31 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
     const uint32_t * keep_code = nullptr;
     size_t keep_size = 0;
     if (d->elem_bytes == 2) {
-        pre_code = nnedi3_16_prescreen_spv;
-        pre_size = nnedi3_16_prescreen_spv_size;
-        pred_code = nnedi3_16_predict_spv;
-        pred_size = nnedi3_16_predict_spv_size;
-        pred_n4_code = nnedi3_16_predict_n4_spv;
-        pred_n4_size = nnedi3_16_predict_n4_spv_size;
-        pred_n4m_code = nnedi3_16_predict_n4m_spv;
-        pred_n4m_size = nnedi3_16_predict_n4m_spv_size;
-        pred_n4s_code = nnedi3_16_predict_n4s_spv;
-        pred_n4s_size = nnedi3_16_predict_n4s_spv_size;
-        keep_code = nnedi3_16_keep_spv;
-        keep_size = nnedi3_16_keep_spv_size;
+        pre_code = nnedi3_u16_prescreen_spv;
+        pre_size = nnedi3_u16_prescreen_spv_size;
+        pred_code = nnedi3_u16_predict_spv;
+        pred_size = nnedi3_u16_predict_spv_size;
+        pred_n4_code = nnedi3_u16_predict_n4_spv;
+        pred_n4_size = nnedi3_u16_predict_n4_spv_size;
+        pred_n4m_code = nnedi3_u16_predict_n4m_spv;
+        pred_n4m_size = nnedi3_u16_predict_n4m_spv_size;
+        pred_n4s_code = nnedi3_u16_predict_n4s_spv;
+        pred_n4s_size = nnedi3_u16_predict_n4s_spv_size;
+        keep_code = nnedi3_u16_keep_spv;
+        keep_size = nnedi3_u16_keep_spv_size;
     } else {
-        pre_code = nnedi3_32_prescreen_spv;
-        pre_size = nnedi3_32_prescreen_spv_size;
-        pred_code = nnedi3_32_predict_spv;
-        pred_size = nnedi3_32_predict_spv_size;
-        pred_n4_code = nnedi3_32_predict_n4_spv;
-        pred_n4_size = nnedi3_32_predict_n4_spv_size;
-        pred_n4m_code = nnedi3_32_predict_n4m_spv;
-        pred_n4m_size = nnedi3_32_predict_n4m_spv_size;
-        pred_n4s_code = nnedi3_32_predict_n4s_spv;
-        pred_n4s_size = nnedi3_32_predict_n4s_spv_size;
-        keep_code = nnedi3_32_keep_spv;
-        keep_size = nnedi3_32_keep_spv_size;
+        pre_code = nnedi3_f32_prescreen_spv;
+        pre_size = nnedi3_f32_prescreen_spv_size;
+        pred_code = nnedi3_f32_predict_spv;
+        pred_size = nnedi3_f32_predict_spv_size;
+        pred_n4_code = nnedi3_f32_predict_n4_spv;
+        pred_n4_size = nnedi3_f32_predict_n4_spv_size;
+        pred_n4m_code = nnedi3_f32_predict_n4m_spv;
+        pred_n4m_size = nnedi3_f32_predict_n4m_spv_size;
+        pred_n4s_code = nnedi3_f32_predict_n4s_spv;
+        pred_n4s_size = nnedi3_f32_predict_n4s_spv_size;
+        keep_code = nnedi3_f32_keep_spv;
+        keep_size = nnedi3_f32_keep_spv_size;
     }
 
     // The cooperative predictor needs one 32-lane subgroup per 4 pixels, and it

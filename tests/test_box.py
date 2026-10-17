@@ -45,19 +45,19 @@ RATIOS = [
 # Subsampled formats need even chroma planes, so their fractional ratios are
 # limited to the ones that keep the lattice legal (resize2 rejects the rest).
 COLOR_CASES = [
-    ("yuv420_16", 2),
-    ("yuv420_16", 4),
-    ("yuv32", 2),
-    ("yuv32", 4),
-    ("yuv444_16", 2),
-    ("yuv444_16", 4),
-    ("yuv444_16", 1.5),
-    ("rgb16", 2),
-    ("rgb16", 4),
-    ("rgb16", 1.5),
-    ("rgb32", 2),
-    ("rgb32", 4),
-    ("rgb32", 1.5),
+    ("yuv420p16", 2),
+    ("yuv420p16", 4),
+    ("yuv420ps", 2),
+    ("yuv420ps", 4),
+    ("yuv444p16", 2),
+    ("yuv444p16", 4),
+    ("yuv444p16", 1.5),
+    ("rgb48", 2),
+    ("rgb48", 4),
+    ("rgb48", 1.5),
+    ("rgbs", 2),
+    ("rgbs", 4),
+    ("rgbs", 1.5),
 ]
 
 
@@ -110,23 +110,23 @@ def _transfers(build):
 
 
 # ---------------------------------------------------------------------------
-# Reference comparison: 16-bit integer and 32-bit float
+# Reference comparison: u16 and f32
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("ratio,abs_bound,rel_bound", RATIOS)
-def test_agrees_with_resize2_16bit(clip_16bit, ratio, abs_bound, rel_bound):
+def test_agrees_with_resize2_u16(clip_gray16, ratio, abs_bound, rel_bound):
     """The integer path reproduces resize2's Box within the measured bound."""
-    w, h = _target(clip_16bit, ratio)
-    abs_d, _ = _worst(clip_16bit, w, h, [0])
+    w, h = _target(clip_gray16, ratio)
+    abs_d, _ = _worst(clip_gray16, w, h, [0])
     assert abs_d <= abs_bound, f"{ratio}: max|d|={abs_d} > {abs_bound}"
 
 
 @pytest.mark.parametrize("ratio,abs_bound,rel_bound", RATIOS)
-def test_agrees_with_resize2_float(clip_gray, ratio, abs_bound, rel_bound):
+def test_agrees_with_resize2_float(clip_grays, ratio, abs_bound, rel_bound):
     """The float path reproduces resize2's Box to float32 rounding."""
-    w, h = _target(clip_gray, ratio)
-    _, rel_d = _worst(clip_gray, w, h, [0])
+    w, h = _target(clip_grays, ratio)
+    _, rel_d = _worst(clip_grays, w, h, [0])
     assert rel_d <= max(rel_bound, 1e-6), f"{ratio}: rel={rel_d} > {rel_bound}"
 
 
@@ -147,10 +147,10 @@ def test_agrees_with_resize2_color(request, fmt, ratio):
         assert rel_d <= 2.4e-7, f"rel={rel_d}"
 
 
-def test_chroma_planes_are_scaled(clip_yuv420_16):
+def test_chroma_planes_are_scaled(clip_yuv420p16):
     """A subsampled plane is averaged on its own lattice, not the luma's."""
-    w, h = clip_yuv420_16.width // 2, clip_yuv420_16.height // 2
-    out = cpu_node(_box(clip_yuv420_16, w, h))
+    w, h = clip_yuv420p16.width // 2, clip_yuv420p16.height // 2
+    out = cpu_node(_box(clip_yuv420p16, w, h))
     f = out.get_frame(0)
     assert (f.width, f.height) == (w, h)
     assert f.format.num_planes == 3
@@ -159,9 +159,9 @@ def test_chroma_planes_are_scaled(clip_yuv420_16):
     assert _px(out, p=2).shape == (90, 160)
 
 
-def test_gray_has_one_plane(clip_gray):
-    w, h = _target(clip_gray, 2)
-    assert _px(_box(clip_gray, w, h)).shape == (h, w)
+def test_gray_has_one_plane(clip_grays):
+    w, h = _target(clip_grays, 2)
+    assert _px(_box(clip_grays, w, h)).shape == (h, w)
 
 
 # ---------------------------------------------------------------------------
@@ -169,16 +169,16 @@ def test_gray_has_one_plane(clip_gray):
 # ---------------------------------------------------------------------------
 
 
-def test_is_resident(clip_16bit):
-    resident = vs.core.std.GPUUpload(clip=clip_16bit)
+def test_is_resident(clip_gray16):
+    resident = vs.core.std.GPUUpload(clip=clip_gray16)
     node, transfers = _transfers(lambda: _box(resident, resident.width // 2, resident.height // 2))
     assert node.gpu_resident
     assert transfers == []
 
 
-def test_reference_is_not_resident(clip_16bit):
+def test_reference_is_not_resident(clip_gray16):
     """The CPU-only oracle this replaces is exactly why the filter exists."""
-    resident = vs.core.std.GPUUpload(clip=clip_16bit)
+    resident = vs.core.std.GPUUpload(clip=clip_gray16)
     _, transfers = _transfers(
         lambda: Box().scale(resident, resident.width // 2, resident.height // 2, (0, 0))
     )
@@ -190,23 +190,26 @@ def test_reference_is_not_resident(clip_16bit):
 # ---------------------------------------------------------------------------
 
 
-def test_identity(clip_16bit):
+def test_identity(clip_gray16):
     """Omitting the size, or asking for the input size, copies the plane."""
-    nodes = [_box(clip_16bit, clip_16bit.width, clip_16bit.height), vs.core.vsfeel.Box(clip_16bit)]
+    nodes = [
+        _box(clip_gray16, clip_gray16.width, clip_gray16.height),
+        vs.core.vsfeel.Box(clip_gray16),
+    ]
     for node in nodes:
-        assert np.array_equal(_px(node), _px(clip_16bit))
+        assert np.array_equal(_px(node), _px(clip_gray16))
 
 
-def test_deterministic(clip_16bit):
-    w, h = _target(clip_16bit, 2)
-    a, b = _box(clip_16bit, w, h), _box(clip_16bit, w, h)
+def test_deterministic(clip_gray16):
+    w, h = _target(clip_gray16, 2)
+    a, b = _box(clip_gray16, w, h), _box(clip_gray16, w, h)
     for n in (0, 7, 23):
         assert np.array_equal(_px(a, n=n), _px(b, n=n))
 
 
-def test_preserves_frame_props(clip_16bit):
+def test_preserves_frame_props(clip_gray16):
     assert_preserves_frame_props(
-        lambda clip, **kw: _box(clip, clip.width // 2, clip.height // 2), clip_16bit
+        lambda clip, **kw: _box(clip, clip.width // 2, clip.height // 2), clip_gray16
     )
 
 
@@ -215,16 +218,16 @@ def test_preserves_frame_props(clip_16bit):
 # ---------------------------------------------------------------------------
 
 
-def test_rejects_upscale(clip_gray):
+def test_rejects_upscale(clip_grays):
     with pytest.raises(Exception, match="downscales"):
-        _box(clip_gray, clip_gray.width * 2, clip_gray.height)
+        _box(clip_grays, clip_grays.width * 2, clip_grays.height)
 
 
-def test_rejects_8bit(clip_8bit):
+def test_rejects_8bit(clip_gray8):
     with pytest.raises(Exception, match="bitdepth"):
-        _box(clip_8bit, clip_8bit.width // 2, clip_8bit.height)
+        _box(clip_gray8, clip_gray8.width // 2, clip_gray8.height)
 
 
-def test_rejects_non_positive(clip_gray):
+def test_rejects_non_positive(clip_grays):
     with pytest.raises(Exception, match="positive"):
-        _box(clip_gray, 0, clip_gray.height)
+        _box(clip_grays, 0, clip_grays.height)

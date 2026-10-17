@@ -417,7 +417,7 @@ luma = depth(get_y(src), {bits})
 
 # vsaa.based_aa mask chain (defaults: Prewitt, mask_thr=60). The threshold
 # must be scaled to 32 (not to `bits`): Morpho.binarize_mask re-scales its
-# midthr from the 32-bit float range to the clip's format, so passing an
+# midthr from the f32 range to the clip's format, so passing an
 # already-16-bit-scaled 15420 becomes 65535 and the mask comes out all zero
 # (which silently disables mclip and turns EEDI3 into a row copier).
 # vsaa/funcs.py:171 does exactly this with scale_mask(mask_thr, 8, 32).
@@ -1857,7 +1857,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         choices=(16, 32),
         default=None,
-        help="benchmark the 16-bit or 32-bit input path: with "
+        help="benchmark the u16 (16-bit) or f32 (32-bit) input path: with "
         "--synthetic this swaps the BlankClip format, otherwise "
         "it overrides the cached-frame conversion depth "
         "(default: each filter's configured depth)",

@@ -4,11 +4,11 @@
 /*
  * Bilateral filter compute shader, shared-memory (tiled) variant.
  *
- * Compile-time variants: -DBITS=16|32 selects the element type. Each plane is
- * bound whole into its own binding: src is the filtered source, ref the guide
- * (bound to src when HAS_REF is 0) and dst the output frame plane. All three
- * hold native elements, so loads and stores are plain coalesced accesses — no
- * shift/mask unpacking, no dword packing, no atomics.
+ * Compile-time variants: -DIO_U16 / -DIO_F32 select the element type. Each
+ * plane is bound whole into its own binding: src is the filtered source, ref
+ * the guide (bound to src when HAS_REF is 0) and dst the output frame plane.
+ * All three hold native elements, so loads and stores are plain coalesced
+ * accesses — no shift/mask unpacking, no dword packing, no atomics.
  *
  * WIDTH/HEIGHT/STRIDE/RADIUS/... are specialization constants so that the
  * compiler can fully unroll the tile-load loops and constant-fold all
@@ -16,11 +16,11 @@
  * [0, WIDTH) columns and [0, HEIGHT) rows are meaningful.
  */
 
-#if !defined(BITS)
-#define BITS 16
+#if !defined(IO_U16) && !defined(IO_F32) && !defined(IO_F16)
+#define IO_U16 1
 #endif
 
-#if BITS == 16
+#if defined(IO_U16)
 #define IO_TYPE uint16_t
 #define PEAK       65535.0f
 #define SCALE      (1.0f / 65535.0f)
@@ -50,7 +50,7 @@ layout(std430, binding = 2) readonly buffer RefBuf { IO_TYPE ref[]; };
 shared float buf[SHARED_FLOATS];
 
 float load_src(int idx) {
-#if BITS == 32
+#if defined(IO_F32)
     return src[idx];
 #else
     // direct uint16_t->float conversion chokes glslc; int() widens cleanly
@@ -59,7 +59,7 @@ float load_src(int idx) {
 }
 
 float load_ref(int idx) {
-#if BITS == 32
+#if defined(IO_F32)
     return ref[idx];
 #else
     return float(int(ref[idx])) * SCALE;
@@ -67,7 +67,7 @@ float load_ref(int idx) {
 }
 
 void store_value(int idx, float v) {
-#if BITS == 32
+#if defined(IO_F32)
     dst[idx] = v;
 #else
     // glslc -O chokes on a direct float->uint16_t convert (OpUConvert); go

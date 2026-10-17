@@ -105,7 +105,7 @@ struct NLMeansData {
     VSNode * ref_node {}; // optional guide clip
     const VSVideoInfo * vi {};
 
-    // u4a element width. fp32 keeps the weights bit-comparable with the
+    // u4a element width. f32 keeps the weights bit-comparable with the
     // reference; the shader's WeightBuf must match.
     static constexpr int64_t kWeightBytes = sizeof(float);
 
@@ -723,7 +723,8 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
     if (!vsh::isConstantVideoFormat(d->vi) ||
         (fmt.sampleType == stInteger && fmt.bitsPerSample != 16) ||
         (fmt.sampleType == stFloat && fmt.bitsPerSample != 32)) {
-        return set_error("input bitdepth must be 16 (integer) or 32 (float).");
+        return set_error(
+            "input bitdepth must be u16 (16-bit integer) or f32 (32-bit float).");
     }
     d->bits = fmt.bitsPerSample;
     d->elem_bytes = fmt.bytesPerSample;
@@ -894,11 +895,11 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
 
     // Pack as many sweep entries into one weight+accumulation round as the u4a
     // plane-ring budget allows: the kernels' arithmetic is cheap next to the
-    // fixed per-dispatch/barrier drain. The ring is fp32 (see the shader's
+    // fixed per-dispatch/barrier drain. The ring is f32 (see the shader's
     // WeightBuf) and budgeted at 128 MiB so `pack` stays at the measured
     // optimum of the older fp16 layout: halving it for the same bytes costs
     // more in extra rounds than the wider ring costs in DRAM traffic, and the
-    // reference's own u4a is fp32 too. The budget is capped by the core's
+    // reference's own u4a is f32 too. The budget is capped by the core's
     // VRAM allowance -- a device with a smaller allowance packs fewer entries
     // per round. One pack is the floor: the run groups have to fit, so a ring
     // smaller than that is not expressible and the core's allocator is what
@@ -1119,19 +1120,19 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         const uint32_t * acc_code = nullptr;
         size_t compose_size = 0, weight_size = 0, acc_size = 0;
         if (d->bits == 16) {
-            compose_code = nlmeans_16_compose_spv;
-            compose_size = nlmeans_16_compose_spv_size;
-            weight_code = nlmeans_16_weight_spv;
-            weight_size = nlmeans_16_weight_spv_size;
-            acc_code = nlmeans_16_acc_spv;
-            acc_size = nlmeans_16_acc_spv_size;
+            compose_code = nlmeans_u16_compose_spv;
+            compose_size = nlmeans_u16_compose_spv_size;
+            weight_code = nlmeans_u16_weight_spv;
+            weight_size = nlmeans_u16_weight_spv_size;
+            acc_code = nlmeans_u16_acc_spv;
+            acc_size = nlmeans_u16_acc_spv_size;
         } else {
-            compose_code = nlmeans_32_compose_spv;
-            compose_size = nlmeans_32_compose_spv_size;
-            weight_code = nlmeans_32_weight_spv;
-            weight_size = nlmeans_32_weight_spv_size;
-            acc_code = nlmeans_32_acc_spv;
-            acc_size = nlmeans_32_acc_spv_size;
+            compose_code = nlmeans_f32_compose_spv;
+            compose_size = nlmeans_f32_compose_spv_size;
+            weight_code = nlmeans_f32_weight_spv;
+            weight_size = nlmeans_f32_weight_spv_size;
+            acc_code = nlmeans_f32_acc_spv;
+            acc_size = nlmeans_f32_acc_spv_size;
         }
         {
             const auto result =

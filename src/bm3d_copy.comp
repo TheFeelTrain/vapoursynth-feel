@@ -17,7 +17,7 @@
  * matcher: the matcher reads each source sample once per candidate origin (a
  * few hundred times per 8x8 block), the whole search window is L1-resident, so
  * a load-time conversion buys no DRAM traffic back and costs a permanent
- * widening per candidate. Doing it at copy time replaces the fp32 path's
+ * widening per candidate. Doing it at copy time replaces the f32 path's
  * 8-byte-per-sample transfer with 2 bytes in and 4 bytes out.
  *
  * The ring is a flat per-plane copy: the host keeps the destination stride

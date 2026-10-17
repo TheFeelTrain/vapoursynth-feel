@@ -284,7 +284,7 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   buffer-binding table in minutes.
 - **A bimodal measurement is a bug to chase, and the harness's memory budget
   is part of the measurement.** One binary swung 143–260 fps on consecutive
-  fp32 runs while the GPU-bound reference stayed flat at ~190. The cause was
+  f32 runs while the GPU-bound reference stayed flat at ~190. The cause was
   the *harness*: the framework's `max_cache_size` and the harness's own
   decoded-frame cache are additive, and together they exceeded RAM. When you
   see the "one side swings, other stays flat" signature, add **harness memory**
