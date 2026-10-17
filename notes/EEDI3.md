@@ -12,7 +12,7 @@ machinery at all. The parallel vcheck is the default.
 
 Benchmark defaults: 2000 f, real based_aa clip, 2x2160p, field=3, mdis=20,
 vcheck=2. `MANGOHUD=0 uv run tools/benchmark.py --filter eedi3 --gpu-cache
---no-download --bits <16|32>`:
+--no-download --format <u16|f32>`:
 
 | clip | vsfeel | vszipcl | eedi3vk2 |
 |---|---|---|---|

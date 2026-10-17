@@ -129,8 +129,8 @@ def test_dfttest_parallel_load_consistent_u16(clip_gray16):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bits", [None, 16], ids=["f32", "u16"])
-def test_dfttest_vspipe_pipelined_no_hang(bits):
+@pytest.mark.parametrize("io_format", [None, "u16"], ids=["f32", "u16"])
+def test_dfttest_vspipe_pipelined_no_hang(io_format):
     """vspipe's pipelined reader plus VapourSynth's prefetch activate frames
     11+ ahead of the in-flight frames, the request pattern that used to stall
     the queue behind an unsignaled slot semaphore. Under the R80 GPU API every
@@ -140,7 +140,7 @@ def test_dfttest_vspipe_pipelined_no_hang(bits):
     Runs the real benchmark as a subprocess (synthetic BlankClip, the
     reproducer's workload) so that vspipe's reader, not a Python get_frame
     loop, drives the frame requests. Parametrized over both input depths
-    (float32 default and --bits 16 integer path).
+    (f32 default and --format u16 path).
     """
     bench = Path(__file__).resolve().parent.parent / "tools" / "benchmark.py"
     cmd = [
@@ -153,8 +153,8 @@ def test_dfttest_vspipe_pipelined_no_hang(bits):
         "dfttest",
         "vsfeel",
     ]
-    if bits:
-        cmd += ["--bits", str(bits)]
+    if io_format:
+        cmd += ["--format", io_format]
     try:
         result = subprocess.run(
             cmd,

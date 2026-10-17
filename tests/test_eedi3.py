@@ -333,8 +333,8 @@ def test_eedi3_preserves_frame_props(clip_grays):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bits", [None, 16], ids=["f32", "u16"])
-def test_eedi3_vspipe_pipelined_no_hang(bits):
+@pytest.mark.parametrize("io_format", [None, "u16"], ids=["f32", "u16"])
+def test_eedi3_vspipe_pipelined_no_hang(io_format):
     """vspipe's pipelined reader plus VapourSynth's prefetch drive frame
     requests far ahead of the in-flight frames; a queue stall or a
     resource-pool misuse deadlocks or crashes the whole run. Runs the real
@@ -351,8 +351,8 @@ def test_eedi3_vspipe_pipelined_no_hang(bits):
         "eedi3",
         "vsfeel",
     ]
-    if bits:
-        cmd += ["--bits", str(bits)]
+    if io_format:
+        cmd += ["--format", io_format]
     try:
         result = subprocess.run(
             cmd,

@@ -239,7 +239,7 @@ which is where the visible speedup is (see Performance).
   -> 644 fps. Widening in the copy kernel instead
   pays it on 2.07M samples per frame rather than on every candidate read, and
   turns the halved io into a win: 970 fps against f32's 932 (`tools/benchmark.py
-  -f bm3d --bits 16`, 1000 frames x3, same session, interleaved). A real 16 bit
+  -f bm3d --format u16`, 1000 frames x3, same session, interleaved). A real 16 bit
   chain -- cached 16 bit source, no `depth()` node, half the upload -- is 846 vs
   634 fps in a same-harness A/B (1080p jpbd, r=2, 600 frames x3, screen; the f32
   arm pays its conversion inside the timed region, the u16 arm does not).

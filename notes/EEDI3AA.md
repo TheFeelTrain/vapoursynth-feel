@@ -11,7 +11,7 @@ wrapper, the `eedi3aa` benchmark entry (1000 f, ns=8) and `tests/test_eedi3aa.py
 ship.
 
 Scoreboard — real based_aa clip (jpbd 2x Point → 3840x2160, 1000 f,
-`tools/benchmark.py --filter eedi3aa --gpu-cache --no-download --bits <16|32>`,
+`tools/benchmark.py --filter eedi3aa --gpu-cache --no-download --format <u16|f32>`,
 medians of 3):
 
 | bit depth | vsfeel | vszipcl chain | eedi3vk2 chain |

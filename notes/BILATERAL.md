@@ -110,7 +110,7 @@ through `tools/benchmark.py`:
   old filter had to `GPUDownload` it first, the new one reads VRAM in place.
 
 Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter bilateral
-[vsfeel vszipcl] [--gpu-cache] [--bits 32] [--bilateral-args "sigma_spatial=X,
+[vsfeel vszipcl] [--gpu-cache] [--format f32] [--bilateral-args "sigma_spatial=X,
 sigma_color=Y"]`.
 
 ## Historical

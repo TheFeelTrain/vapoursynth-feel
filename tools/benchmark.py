@@ -264,7 +264,23 @@ clip = {clip_expr}
 # AA-style vpy (EEDI3 anti-aliasing benchmark, mirrors vsaa.based_aa)
 # ---------------------------------------------------------------------------
 
-AA_MASK_BITS = 16  # mask/depth chain runs at 16-bit like the ss clip
+# The io variants a benchmark arm can select with --format. Each entry is the
+# VapourSynth bit depth, the vpy sample-type token, and the GRAY/YUV/RGB format
+# suffix: u16 is 16-bit integer, f16 is float16 (GRAYH/YUV420PH/RGBH) and f32
+# is float32 (GRAYS/YUV420PS/RGBS).
+FORMAT_TYPES = {
+    "u16": (16, "vs.INTEGER", "16", "P16", "48"),
+    "f16": (16, "vs.FLOAT", "H", "PH", "H"),
+    "f32": (32, "vs.FLOAT", "S", "PS", "S"),
+}
+
+AA_MASK_FORMAT = "u16"  # the AA mask/depth chain runs at u16 like the ss clip
+
+
+def _depth_expr(arg: str, io_format: str) -> str:
+    """The vpy ``depth(...)`` call converting ``arg`` to ``io_format``."""
+    bits, sample_type, *_ = FORMAT_TYPES[io_format]
+    return f"depth({arg}, {bits}, sample_type={sample_type})"
 
 
 def make_aa_vpy(
@@ -274,14 +290,14 @@ def make_aa_vpy(
     frames: int,
     cache_frames: int | None = 400,
     eedi3_field: int = 3,
-    bits: int = AA_MASK_BITS,
+    io_format: str = AA_MASK_FORMAT,
     cache_bytes: int | None = None,
     gpu_cache: bool = False,
     download_inputs: bool = False,
 ) -> str:
     """Real-clip vpy that mirrors vsaa.based_aa's EEDI3 usage:
 
-    - luma of the source at `bits` (16 or 32, like the ss clip)
+    - luma of the source at `io_format` (u16/f16/f32, like the ss clip)
     - edge mask: Prewitt -> binarize(mask_thr=60 scaled to depth) -> box_blur(Maximum)
     - both luma and mask are Point-upscaled 2x (the "supersampling"; the user
       chose a plain Point upscale over ArtCNN)
@@ -394,6 +410,7 @@ sclip = {"core.std.Interleave([clip, clip])" if eedi3_field > 1 else "clip"}
         else:
             sclip_expr = "core.std.Interleave([ss, ss])" if eedi3_field > 1 else "clip"
             cache_lines = f"clip = ss\nsclip = {sclip_expr}\n"
+    luma_expr = _depth_expr("get_y(src)", io_format)
     return f"""\
 from vssource import BestSource
 from vstools import core, depth, get_y
@@ -413,10 +430,10 @@ def _pin_cache(node, budget):
 core.max_cache_size = 1024 * 48
 
 src = BestSource(cachepath=None).source({clip!r}, 32)
-luma = depth(get_y(src), {bits})
+luma = {luma_expr}
 
 # vsaa.based_aa mask chain (defaults: Prewitt, mask_thr=60). The threshold
-# must be scaled to 32 (not to `bits`): Morpho.binarize_mask re-scales its
+# must be scaled to 32 (not to `io_format`): Morpho.binarize_mask re-scales its
 # midthr from the f32 range to the clip's format, so passing an
 # already-16-bit-scaled 15420 becomes 65535 and the mask comes out all zero
 # (which silently disables mclip and turns EEDI3 into a row copier).
@@ -1169,7 +1186,7 @@ def bench_aa(
     frames: int,
     cache_frames: int | None = None,
     eedi3_field: int = 3,
-    bits: int = AA_MASK_BITS,
+    io_format: str = AA_MASK_FORMAT,
     cache_bytes: int | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     gpu_cache: bool = False,
@@ -1184,7 +1201,7 @@ def bench_aa(
         frames=frames,
         cache_frames=cache_frames,
         eedi3_field=eedi3_field,
-        bits=bits,
+        io_format=io_format,
         cache_bytes=cache_bytes,
         gpu_cache=gpu_cache,
         download_inputs=download_inputs,
@@ -1286,23 +1303,28 @@ def _apply_filter_args(ns: argparse.Namespace, fname: str, spec: FilterSpec) -> 
         _parse_filter_args(ns, fname, spec, raw)
 
 
-def _format_for_bits(fmt: str, bits: int) -> str:
-    """Return the sibling of a ``vs.`` synthetic format name at the requested
-    bit depth (GRAYS <-> GRAY16, YUV420PS <-> YUV420P16, ...)."""
-    m = re.match(r"^(vs\.[A-Za-z0-9]+?)(S|16|PS|P16)$", fmt)
+def _synth_format_for(fmt: str, io_format: str) -> str:
+    """Return the sibling of a ``vs.`` synthetic format name in the requested
+    io format (GRAYS <-> GRAY16 <-> GRAYH, YUV420PS <-> YUV420P16 <-> YUV420PH,
+    RGBS <-> RGB48 <-> RGBH)."""
+    m = re.match(r"^(vs\.[A-Za-z0-9]+?)(S|16|H|48|PS|P16|PH)$", fmt)
     if not m:
-        raise SystemExit(f"--bits {bits}: cannot map synthetic format {fmt!r} to {bits}-bit")
+        raise SystemExit(f"--format {io_format}: cannot map synthetic format {fmt!r}")
     base = m.group(1)
-    suffix = "16" if bits == 16 else "S"
-    if not base.endswith("GRAY"):
-        suffix = "P16" if bits == 16 else "PS"
+    _, _, gray, yuv, rgb = FORMAT_TYPES[io_format]
+    if base.endswith("GRAY"):
+        suffix = gray
+    elif base.endswith("RGB"):
+        suffix = rgb
+    else:
+        suffix = yuv
     return f"{base}{suffix}"
 
 
-def _input_for_bits(expr: str, bits: int) -> str:
+def _input_for_format(expr: str, io_format: str) -> str:
     """Override the depth argument of the cache-conversion expression
-    (``depth(X, N)`` -> ``depth(X, bits)``)."""
-    return re.sub(r"depth\(([^,]+), \d+\)", lambda m: f"depth({m.group(1)}, {bits})", expr)
+    (``depth(X, N)`` -> ``depth(X, <bits>, sample_type=<type>)``)."""
+    return re.sub(r"depth\(([^,]+), \d+\)", lambda m: _depth_expr(m.group(1), io_format), expr)
 
 
 def _input_on(expr: str, clip: str) -> str:
@@ -1363,7 +1385,7 @@ def _run_once(
             frames,
             cache_frames,
             getattr(ns, "eedi3_field", 3),
-            ns.bits or AA_MASK_BITS,
+            ns.format or AA_MASK_FORMAT,
             budget,
             ns.timeout,
             gpu_cache=gpu_cache,
@@ -1396,7 +1418,7 @@ class FilterPlan:
     cache_frames: int | None
     cache_conv: str | None
     clip_desc: str
-    bits_desc: str
+    format_desc: str
     calls: dict[str, str]
     gpu_arms: list[str]
     download_arms: list[str]
@@ -1408,14 +1430,15 @@ def _prepare_filter(
 ) -> FilterPlan:
     spec = FILTERS[fname]
     _apply_filter_args(ns, fname, spec)
-    # --bits overrides the filter's input expression (depth(X,16) -> depth(X,32))
-    # for BOTH the chain and the cached frames: the chain must consume the same
-    # format the cache holds, or the timed region re-converts behind the filter
-    input_expr = _input_for_bits(spec.input, ns.bits) if ns.bits else spec.input
+    # --format overrides the filter's input expression (depth(X,16) -> the
+    # requested io type) for BOTH the chain and the cached frames: the chain
+    # must consume the same format the cache holds, or the timed region
+    # re-converts behind the filter
+    input_expr = _input_for_format(spec.input, ns.format) if ns.format else spec.input
     frames = ns.frames or spec.default_frames
     synth = spec.synth_format if ns.synthetic else None
-    if synth and ns.bits:
-        synth = _format_for_bits(synth, ns.bits)
+    if synth and ns.format:
+        synth = _synth_format_for(synth, ns.format)
     # --cache-frames 0 and --no-cache both mean "no preload" — including for the
     # AA filters, which used to fall back to a hardcoded 400-frame preload.
     cache_frames = ns.cache_frames if (ns.cached and synth is None and ns.cache_frames) else None
@@ -1434,7 +1457,7 @@ def _prepare_filter(
         clip_desc = f"{str(ns.clip)} -> 2x Point"
     else:
         clip_desc = f"{str(ns.clip)}{scale_desc}"
-    bits_desc = f" | bits: {ns.bits}" if ns.bits else ""
+    format_desc = f" | format: {ns.format}" if ns.format else ""
 
     calls = spec.build(ns, input_expr, spec)
     # --gpu-cache: every arm consumes the device-resident frames, so the
@@ -1476,7 +1499,7 @@ def _prepare_filter(
         cache_frames=cache_frames,
         cache_conv=cache_conv,
         clip_desc=clip_desc,
-        bits_desc=bits_desc,
+        format_desc=format_desc,
         calls=calls,
         gpu_arms=gpu_arms,
         download_arms=download_arms,
@@ -1505,7 +1528,9 @@ def _run_plan_once(
 def bench_filter(fname: str, ns: argparse.Namespace) -> None:
     spec = FILTERS[fname]
     plan = _prepare_filter(fname, ns)
-    print(f"{spec.title} benchmark | {plan.frames} frames | clip: {plan.clip_desc}{plan.bits_desc}")
+    print(
+        f"{spec.title} benchmark | {plan.frames} frames | clip: {plan.clip_desc}{plan.format_desc}"
+    )
     print(f"args: {args_desc(spec, ns)}")
     print(
         f"{_cache_desc(spec, ns, plan.synth, plan.cache_frames)}{_mode_desc(ns)} | "
@@ -1694,7 +1719,7 @@ def bench_filter_ab(fname: str, ns: argparse.Namespace) -> None:
     # names plugins explicitly (a reference would measure the same binary in
     # both arms, i.e. pure noise at double the cost).
     plan = _prepare_filter(fname, ns, requested=ns.plugins or ["vsfeel"])
-    print(f"{spec.title} A/B | {plan.frames} frames | clip: {plan.clip_desc}{plan.bits_desc}")
+    print(f"{spec.title} A/B | {plan.frames} frames | clip: {plan.clip_desc}{plan.format_desc}")
     print(f"args: {args_desc(spec, ns)}")
     print(
         f"{_cache_desc(spec, ns, plan.synth, plan.cache_frames)}{_mode_desc(ns)} | "
@@ -1853,14 +1878,13 @@ def parse_args() -> argparse.Namespace:
         "(decoder-independent, measures pure filter throughput)",
     )
     parser.add_argument(
-        "--bits",
-        type=int,
-        choices=(16, 32),
+        "--format",
+        choices=tuple(FORMAT_TYPES),
         default=None,
-        help="benchmark the u16 (16-bit) or f32 (32-bit) input path: with "
-        "--synthetic this swaps the BlankClip format, otherwise "
-        "it overrides the cached-frame conversion depth "
-        "(default: each filter's configured depth)",
+        help="benchmark the u16, f16 or f32 input path: with --synthetic "
+        "this swaps the BlankClip format, otherwise it overrides the "
+        "cached-frame conversion and sample type "
+        "(default: each filter's configured format)",
     )
     parser.add_argument(
         "--cache",
