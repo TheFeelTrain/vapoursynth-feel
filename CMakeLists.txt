@@ -307,13 +307,16 @@ foreach(io IN LISTS VK_DFT_IO_TYPES)
 endforeach()
 
 # NLMeans: compose / weight / accumulation entry points per io variant (u16,
-# f32); everything else is a specialization constant. The compose
+# f16, f32); everything else is a specialization constant. Its io list is local
+# like the others' half paths: a kernel without an f16 branch would fall through
+# to its u16 branch under an -DIO_F16 name. The compose
 # pass names the core's GPU frame planes through buffer references
 # (PhysicalStorageBuffer).
+set(VK_NLM_IO_TYPES "u16" "f16" "f32")
 set(VK_NLM_ENTRIES compose weight acc)
 set(VK_NLM_ENTRY_DEFS -DENTRY_COMPOSE -DENTRY_WEIGHT -DENTRY_ACC)
 set(VK_NLM_VARIANTS)
-foreach(io IN LISTS VK_IO_TYPES)
+foreach(io IN LISTS VK_NLM_IO_TYPES)
     string(TOUPPER "${io}" io_define)
     foreach(entry_i RANGE 0 2)
         list(GET VK_NLM_ENTRIES ${entry_i} entry)

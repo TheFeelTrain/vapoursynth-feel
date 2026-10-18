@@ -127,8 +127,9 @@ and gets one line here, not a section per note.
   last frame sees a different window than the fixture it is compared against,
   and a frame-doubling filter (EEDI3/NNEDI3 `field>1`) doubles 300 frames
   instead of 24.
-- `clip_grayh` / `clip_yuv420ph` / `clip_rgbh` and the `grayh` / `yuv420ph`
-  `build_clip` kinds — the half-float fixtures, built by widening the f32
+- `clip_grayh` / `clip_yuv420ph` / `clip_yuv444ph` / `clip_rgbh` and the
+  `grayh` / `yuv420ph` / `yuv444ph` / `rgbh` `build_clip` kinds — the half-float
+  fixtures, built by widening the f32
   fixture and rounding, so an f16 test runs on the same content as its f32
   sibling. `format_dtype` / the comparison subprocess's `dt` read a 16-bit float
   format as `np.float16`.

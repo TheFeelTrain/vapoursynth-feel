@@ -493,6 +493,10 @@ def build_clip(spec):
         clip = core.resize.Bicubic(src, format=vs.YUV444P16)
     elif kind == "rgbs":
         clip = core.resize.Bicubic(src, format=vs.RGBS, matrix_in_s="709")
+    elif kind == "rgbh":
+        # the half sibling of `rgbs`, built the way the fixture builds it
+        clip = core.resize.Bicubic(src, format=vs.RGBS, matrix_in_s="709")
+        clip = core.resize.Point(clip, format=vs.RGBH)
     elif kind == "rgb48":
         clip = core.resize.Bicubic(src, format=vs.RGB48, matrix_in_s="709")
     else:

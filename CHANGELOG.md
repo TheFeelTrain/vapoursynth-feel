@@ -10,17 +10,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `vsfeel.feel_aa`, a copy of `vsaa.based_aa` that keeps its processing entirely on the GPU
 - `core.vsfeel.Box`, a Vulkan implementation of a box downscale
-- Bilateral, BM3D, DFTTest, EEDI3, GaussBlur, and NNEDI3 support fp16 input and output
+- Bilateral, BM3D, DFTTest, EEDI3, GaussBlur, NLMeans, and NNEDI3 support fp16 input and output
 
 ### Changed
 
 - GaussBlur is over 2x faster
 - Bilateral is about 15% faster
-- BM3D is now registered as `core.vsfeel.BM3D` instead of `core.vsfeel.BM3Dv2`
+
+## [1.1.2] - 2026-10-18
 
 ### Fixed
 
 - BM3D no longer runs at 1 fps on Nvidia GPUs
+
+### Changed
+
+- BM3D is now registered as `core.vsfeel.BM3D` instead of `core.vsfeel.BM3Dv2`
 
 ## [1.1.1] - 2026-10-05
 
@@ -120,6 +125,7 @@ The plugin has moved to the VapourSynth R80 GPU API. The core now owns the devic
 - vs-jetpack backend integration, so the filters can be used through the vs-jetpack wrappers
 - Windows and Linux wheels, built and published by CI
 
+[1.1.2]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.1...1.1.2
 [1.1.1]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.0...1.1.1
 [1.1.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.0.0...1.1.0
 [1.0.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/0.2.2...1.0.0

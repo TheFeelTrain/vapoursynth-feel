@@ -39,6 +39,7 @@ FILTERS = [
     "DFTTest",
     "DFTTest_f16",
     "NLMeans",
+    "NLMeans_f16",
     "BM3D",
     "BM3D_u16",
     "BM3D_f16",
@@ -124,6 +125,12 @@ _SCRIPT = textwrap.dedent(f"""\
         node = core.vsfeel.DFTTest(gh, tbsize=3)
     elif name == "NLMeans":
         node = core.vsfeel.NLMeans(gs, d=2)
+    elif name == "NLMeans_f16":
+        # Half storage end to end: the compose pass names the core's planes
+        # through a float16_t PhysicalStorageBuffer reference (a capability
+        # class no other half variant reaches), the temporal window is half,
+        # and the finish store narrows.
+        node = core.vsfeel.NLMeans(gh, d=2)
     elif name == "BM3D":
         node = core.vsfeel.BM3D(gs, sigma=0.7, radius=2, bm_range=16,
                                 ps_range=7, block_step=4)

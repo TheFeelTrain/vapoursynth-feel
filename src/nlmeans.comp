@@ -12,7 +12,12 @@
  *   -DENTRY_ACC      nlmAccumulation +q/-q accumulation, applying the final
  *                                  weighted average on the last sweep (pc3)
  *
- * -DIO_U16 / -DIO_F32 selects the io element type. Everything fixed per instance
+ * -DIO_U16 / -DIO_F16 / -DIO_F32 selects the io element type. A half element is
+ * a storage width, not a precision: the window, weights, accumulators and LDS
+ * tiles stay the types the reference's own kernels use (f32 for everything but
+ * the window), a half widens exactly on load and narrows once on the finish
+ * store with OpFConvert's round-to-nearest-even, i.e. the reference's
+ * vstore_half_rte. Everything fixed per instance
  * (dims, strides, pad, d/a/s, ref mode, channels, wmode, wref) arrives as
  * specialization constants so each pipeline compiles to its cheapest form.
  *
@@ -41,6 +46,10 @@
 #define PEAK       65535.0f
 #define SCALE      (1.0f / 65535.0f)
 #define VTYPE      uint16_t
+#elif defined(IO_F16)
+#define PEAK       1.0f
+#define SCALE      1.0f
+#define VTYPE      float16_t
 #else
 #define PEAK       1.0f
 #define SCALE      1.0f
@@ -106,6 +115,8 @@ layout(push_constant) uniform PushConstants {
 float load_u1(int idx) {
 #if defined(IO_F32)
     return u1[idx];
+#elif defined(IO_F16)
+    return float(u1[idx]);   // half -> float is exact
 #else
     return float(int(u1[idx])) * SCALE;
 #endif
@@ -114,6 +125,10 @@ float load_u1(int idx) {
 VTYPE to_vtype(float v) {
 #if defined(IO_F32)
     return v;
+#elif defined(IO_F16)
+    // OpFConvert narrows with the SPIR-V default round-to-nearest-even and no
+    // saturation, i.e. the reference's vstore_half_rte
+    return float16_t(v);
 #else
     // glslc -O chokes on a direct float->uint16_t convert (OpUConvert);
     // go through uint with an explicit mask (same workaround as DFTTest)

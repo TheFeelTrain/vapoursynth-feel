@@ -20,8 +20,15 @@ Status: **shipped on the R80 GPU API.** Verified against
 - Sweep tables (`wq`/`aq`, stride-8 rows, `qb` batches, variants by
   `m=min(d,n)`), the f32 weight ring, `first`-flag init and the finish in the
   last acc round are unchanged from the pre-R80 implementation.
-- Accuracy: ≤1 LSB u16 and ≤4.4e-6 f32 against vszipcl across the whole
-  parameter surface (spatial, temporal, joint, rclip, cropped, `a=64`, `d=16`).
+- Three io variants — u16, f16, f32 — selected by the input format (half is
+  `stFloat` + 16 bits). A half element is a storage width, not a precision: the
+  temporal window holds the clip's own 2-byte samples, every weight,
+  accumulator and LDS tile stays f32 exactly as the reference's own u4a/u2/u5,
+  and the finish store narrows once with `OpFConvert`'s round-to-nearest-even
+  (vszipcl's `vstore_half_rte`).
+- Accuracy: ≤1 LSB u16, ≤4.4e-6 f32 and ≤1 half step f16 against vszipcl across
+  the whole parameter surface (spatial, temporal, joint, rclip, cropped, `a=64`,
+  `d=16`).
 - `num_streams` and `device_id` are registered no-ops (never read): depth is
   the core's exec ring, device choice is `core.set_vulkan_device`.
 
@@ -38,6 +45,18 @@ channels=UV`, 3000 frames, medians of 3 through `tools/benchmark.py`:
 - GRAY16 (all planes processed) was at parity in a manual same-session pair
   (281 vs 279 fps, ~0.7%); its absolute fps are void with the rest of the
   pre-fix numbers, but the parity it showed is a relative result.
+
+io depth (`--gpu-cache --no-download`, same config, medians of 3):
+
+| io | vsfeel | vs u16 | vszipcl |
+|---|---:|---:|---:|
+| u16 | 1033.1 | — | 443.2 |
+| f16 | 1069.4 | +3.5% | 457.1 |
+| f32 | 953.4 | −7.7% | 465.8 |
+
+- The half window is 2 bytes like u16's, and the sweep (not the transfers) is
+  the frame, so f16 lands +3.5% over u16 and +12.2% over f32. The io width is
+  the whole difference: the kernels are the same shape at every depth.
 
 The f32 weight ring (2026-10-02) replaces the fp16 one and costs **−7.2%** on
 the same config: same-session pair, 1080.2 → 1002.4 fps (vszipcl control flat at
@@ -86,9 +105,28 @@ the element width doubled (128 MiB budget).
   and the finish folded into the last round (`pc3`).
 - `VI_DIM`, `STRIDE`, `PSTRIDE`, `PH`, `PAD`, `NLM_S`, `NLM_D`, `NLM_REF`,
   `NLM_CHANNELS`, `WMODE`, `WREF`, `H2_INV_NORM` and `GUIDE_OFF` are
-  specialization constants; only the io type is a compile-time `-DIO_U16`/`-DIO_F32`.
+  specialization constants; the io type is a compile-time `-DIO_U16`/`-DIO_F16`/
+  `-DIO_F32` (three SPIR-V variants per entry point, selected from the input
+  format: half is `stFloat` + 16 bits). A half element widens exactly on load
+  and narrows once on the finish store; the window is the only buffer whose
+  element type follows the io depth.
 - `--target-env=vulkan1.4` (SPIR-V 1.6): the compose pass names the core's
-  planes through buffer references (`PhysicalStorageBuffer`).
+  planes through buffer references (`PhysicalStorageBuffer`). The half variant
+  makes those references `float16_t`, which SPIR-V 1.6 accepts under
+  `StorageBuffer16BitAccess` + `PhysicalStorageBufferAddresses` (validated; it
+  needs no `PhysicalStorageBuffer16BitAccess`); the half LDS tiles a full-fp16
+  build would need are the only thing that pulls in the explicit-arithmetic-types
+  extension, one more reason that path is not free (see Open work).
+
+### Tests
+
+`tests/test_nlmeans.py` runs the u16/f32 parameter surface at every depth and
+mirrors it for f16 (sweeps vs vszipcl and knlmvk, positive maxima, UV/joint/
+rclip/stride paths, determinism, parallel load, frame-request order, wref=0
+finiteness and the bit-exact centre fallback), plus the device-independent
+oracle that the half output is the f32 pipeline narrowed once. The half path is
+also in `tests/test_geometry.py`'s cropped-width matrix and in
+`tests/test_validation.py`'s validation-layer smoke (`NLMeans_f16`).
 
 ## Performance
 
@@ -101,6 +139,30 @@ the element width doubled (128 MiB budget).
   ≤4.4e-6 for −7.2%: the ring carries 2x the bytes at the same pack, which the
   measured optimum wants at 128 MiB rather than 64 (halving pack costs more in
   rounds than the wider ring costs in DRAM traffic).
+
+- **Full-fp16 internals are a measured dead end: +10.4%.** With the half io
+  window already shipped, a probe that also narrowed the weight ring, the
+  accumulators and the LDS tiles to half (no range management, output wrong by
+  design) measured 1053.7 → 1162.8 fps; narrowing only the ring measured
+  1056.2 → 1168.2 fps (f16 io, `--gpu-cache --no-download`, 3000 frames, medians
+  of 3). So the ring is the whole of it and the half LDS/accumulators are
+  slightly negative, the same mechanism as `notes/BILATERAL.md` and
+  `notes/GAUSSBLUR.md`: a scalar half access still takes a load slot and every
+  tap adds a widening convert, and ACO emits scalar `v_fma_f16`, never a packed
+  `v_pk_*`. The fp16 ring alone already fails the accuracy bar (2^-11 relative,
+  ~180 codes u16 at `a=64`), so f16 ships mixed precision.
+- **Where the half io win comes from.** The window halves to the clip's own
+  2-byte samples, so the f16 sweep reads half the bytes per guide/source load
+  that the f32 io arm does; weights, accumulators and LDS are identical at every
+  depth. Compute-only f16 is +3.5% over u16 (same 2-byte io, one 4-byte ring
+  load per entry unchanged) and +12.2% over f32 (the window loads halve).
+- **Half costs one store rounding, not a precision loss.** Over the 47-case f16
+  comparison surface (640x360 fixture, frames 0/11/23) the residual vs vszipcl is
+  one half step, 4.88e-4 at |v| in [0.5, 1), and against the same-input f32 run
+  narrowed once it is half a step, 2.44e-4. The RGB joint path measures one step
+  in the [1, 2) binade, 9.77e-4, because the RGB fixture's Bicubic matrix
+  conversion overshoots the unit peak (max 1.11) and doubles the ulp there; the
+  test bound is 2e-3 over the worst of the 47.
 - **`wref=0` has no usable oracle on real content.** The reference degenerates
   there (0 total weight: 53983 non-finite samples on frame 0 at `h=1.2`, finite
   ones dividing by a denormal sum up to 0.8 off; knlmvk's same fallback is 0.14
@@ -134,6 +196,13 @@ the element width doubled (128 MiB budget).
 
 The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
+- **2026-10-18 — f16 io shipped; full-fp16 internals rejected.** The half window
+  measured +3.5% over u16 and +12.2% over f32 (`--gpu-cache --no-download`, 3000
+  frames, medians of 3). The probe that also narrowed the ring, accumulators and
+  LDS tiles measured +10.4%, below the 30% bar that would have paid for its
+  accuracy loss, so weights/accumulators/LDS stay f32 and half is a storage
+  width. The plain fp16 ring's own accuracy failure is the banner's earlier
+  round.
 - **The R80 port's scoreboard is void.** It read 1082.9 → 1080.3 (CPU cache) and
   1065.9 → 1083.4 (`--gpu-cache`) fps against the pre-fix benchmark harness
   (`notes/METHOD.md`); the same-session deltas it carried (−0.2%, +1.6%) stand.
@@ -189,9 +258,19 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
 ## Open work
 
+- **A packed two-pixels-per-lane half2 sweep is the only untried f16 form.**
+  Every half variant tried so far narrows storage only and ACO emits scalar
+  `v_fma_f16` (see Performance), so the FMA rate never moves. Packing two output
+  pixels per lane in `half2` could reach `v_pk_*`, but the accumulator's range
+  (hundreds of thousands at `a=64, d=16`) and the weight ring both need scaling,
+  and the u2/u5 interleave has to be repacked. Estimated as a rewrite, not a
+  tweak.
+- **The ring's DRAM traffic is the one f16 lever that pays** (+10.6% alone), but
+  only the accuracy budget can unlock it: 2^-11 relative weight quantisation is
+  ~180 codes u16 at `a=64`. A scaled half ring that keeps more range (a shared
+  exponent per tile, or block floating point) is the untried route; the plain
+  fp16 ring is already rejected (see the banner's f32-ring round).
 - **Subgroup-shuffle box sums** to cut LDS phases (complex).
-- **fp16 `dist`/`hsum` LDS arrays** with range scaling — numerics risk (the
-  weight ring's own fp16 experiment failed this way; see Performance).
 - **Incremental window cache**: copy only newly-entered layers instead of
   rebuilding the whole window, if a large-`d` workload ever makes the copy
   matter.
@@ -200,6 +279,10 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
 ### Do not retry
 
+- **Full-half internals** (ring + LDS + accumulators): +10.4% vs the shipped
+  mixed path, and the ring alone is +10.6%, so the LDS/accumulator half reach is
+  slightly negative (mechanism in Performance). Do not retry without a shape ACO
+  packs into `v_pk_*`.
 - **Buffer-reference reads in the sweep kernels** — measured −10% on 1080p
   `channels='UV'` (mechanism above). The compose is cheaper.
 - **Compile-time `-DNLM_S=4`**: within noise of the spec-constant version.

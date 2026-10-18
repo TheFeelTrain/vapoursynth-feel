@@ -51,6 +51,8 @@ CROP_FROM = 640
 #   eedi3aa    u16: 0.0; f32: a few ulp of the fused chain (~6e-8 measured)
 #   nlmeans    u16: <= 1 code; f32: <= 7.2e-7 (1e-5 bound here, the same
 #                     f32-accumulation-order band as test_nlmeans.py)
+#   nlmeans    f16 630/638: one half step (4.88e-4) -> 1e-3, the same bound
+#                     tests/test_nlmeans.py uses for the half sweeps
 # The yuv420 cases exercise half-width chroma: at 630 luma px the chroma rows
 # are 315 samples, i.e. 630 bytes for u16 (22 mod 32) — the alignment that made
 # the old DFTTest download helper fault.
@@ -64,6 +66,7 @@ TOL_ORACLE_EXACT = 0.0
 TOL_EEDI3AA_F32 = 1e-6
 TOL_NLMEANS_U16 = 1.0
 TOL_NLMEANS_F32 = 1e-5
+TOL_NLMEANS_F16 = TOL_F16
 
 _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     import json
@@ -301,6 +304,9 @@ for _w in WIDTHS:
     _add("eedi3aa", 16, _w, 0, _EEDI3AA_HP_PARAMS, TOL_ORACLE_EXACT)
     _add("nlmeans", 16, _w, 0, _NLMEANS_PARAMS, TOL_NLMEANS_U16)
     _add("nlmeans", 32, _w, 0, _NLMEANS_PARAMS, TOL_NLMEANS_F32)
+    # The half path on the odd cropped pitch: 613 half samples per row (of the
+    # 640-wide source) is 1226 bytes, its own alignment for the 2-byte sample.
+    _add("nlmeans", 16, _w, 0, _NLMEANS_PARAMS, TOL_NLMEANS_F16, half=1)
 
 # Subsampled chroma (R1/R2): the chroma planes are half the luma width, so
 # their visible rows are 315 * itemsize bytes at 630 px — a different pitch and

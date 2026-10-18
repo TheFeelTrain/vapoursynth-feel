@@ -110,6 +110,9 @@ struct NLMeansData {
     static constexpr int64_t kWeightBytes = sizeof(float);
 
     int bits {}, elem_bytes {};
+    // half input: the elements are 2 bytes like u16 but they are a float
+    // format, so the storage type and the finish store's rounding differ
+    bool half {};
     bool has_ref {};
 
     int ref_mode {}; // 0 luma, 1 chroma, 2 yuv, 3 rgb
@@ -722,11 +725,13 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
     const auto & fmt = d->vi->format;
     if (!vsh::isConstantVideoFormat(d->vi) ||
         (fmt.sampleType == stInteger && fmt.bitsPerSample != 16) ||
-        (fmt.sampleType == stFloat && fmt.bitsPerSample != 32)) {
+        (fmt.sampleType == stFloat && fmt.bitsPerSample != 32 &&
+         fmt.bitsPerSample != 16)) {
         return set_error(
-            "input bitdepth must be u16 (16-bit integer) or f32 (32-bit float).");
+            "input bitdepth must be u16 (16-bit integer), f16 or f32 (16/32-bit float).");
     }
     d->bits = fmt.bitsPerSample;
+    d->half = fmt.sampleType == stFloat && d->bits == 16;
     d->elem_bytes = fmt.bytesPerSample;
 
     if (d->vi->width <= 0 || d->vi->height <= 0) {
@@ -1120,12 +1125,21 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         const uint32_t * acc_code = nullptr;
         size_t compose_size = 0, weight_size = 0, acc_size = 0;
         if (d->bits == 16) {
-            compose_code = nlmeans_u16_compose_spv;
-            compose_size = nlmeans_u16_compose_spv_size;
-            weight_code = nlmeans_u16_weight_spv;
-            weight_size = nlmeans_u16_weight_spv_size;
-            acc_code = nlmeans_u16_acc_spv;
-            acc_size = nlmeans_u16_acc_spv_size;
+            if (d->half) {
+                compose_code = nlmeans_f16_compose_spv;
+                compose_size = nlmeans_f16_compose_spv_size;
+                weight_code = nlmeans_f16_weight_spv;
+                weight_size = nlmeans_f16_weight_spv_size;
+                acc_code = nlmeans_f16_acc_spv;
+                acc_size = nlmeans_f16_acc_spv_size;
+            } else {
+                compose_code = nlmeans_u16_compose_spv;
+                compose_size = nlmeans_u16_compose_spv_size;
+                weight_code = nlmeans_u16_weight_spv;
+                weight_size = nlmeans_u16_weight_spv_size;
+                acc_code = nlmeans_u16_acc_spv;
+                acc_size = nlmeans_u16_acc_spv_size;
+            }
         } else {
             compose_code = nlmeans_f32_compose_spv;
             compose_size = nlmeans_f32_compose_spv_size;

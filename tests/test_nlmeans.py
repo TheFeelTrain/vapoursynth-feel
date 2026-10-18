@@ -5,6 +5,12 @@ baked-in grain) is used as the input. The noise content makes every parameter ax
 actually alter it, and any misindexing of the padded window or sweep tables
 shows up as a large diff against the reference implementation.
 
+Half is a storage width in the same f32 pipeline (the window samples are half,
+every weight, accumulator and LDS tile stays f32, and the finish store narrows
+once), so the f16 sweeps mirror the u16/f32 ones against vszipcl's half output
+with a measured half-step bound, and a device-independent oracle pins the half
+path to the f32 one on byte-identical input.
+
 Run from the repository root:  uv run python -m pytest tests/test_nlmeans.py
 """
 
@@ -124,6 +130,66 @@ def test_temporal_differs_from_spatial_f32(clip_grays):
     assert max_diff(spatial, temporal) > 0.0
 
 
+# --- f16 basic behaviour -----------------------------------------------------
+
+
+def test_output_format_and_frames_preserved_f16(clip_grayh):
+    """Half in, half out: the format is neither widened nor reinterpreted."""
+    out = _run(clip_grayh, d=0)
+    assert out.format.id == clip_grayh.format.id
+    assert out.format.sample_type == vs.FLOAT
+    assert out.format.bits_per_sample == 16
+    assert (out.width, out.height) == (clip_grayh.width, clip_grayh.height)
+    assert out.num_frames == clip_grayh.num_frames
+
+
+def test_nlmeans_preserves_frame_props_f16(clip_grayh):
+    """The half store narrows pixels, not frame props."""
+    assert_preserves_frame_props(_run, clip_grayh, d=0)
+
+
+def test_denoise_changes_output_f16(clip_grayh):
+    src = clip_grayh
+    out = _run(src, d=0)
+    d = _plane(out.get_frame(5), 0, dtype=np.float16).astype(np.float64) - _plane(
+        src.get_frame(5), 0, dtype=np.float16
+    ).astype(np.float64)
+    assert np.abs(d).max() > 0.0
+
+
+def test_higher_h_smooths_more_f16(clip_grayh):
+    src = clip_grayh
+    weak = _run(src, d=0, h=0.3)
+    strong = _run(src, d=0, h=4.0)
+    dw = np.abs(
+        _plane(weak.get_frame(5), 0, dtype=np.float16).astype(np.float64)
+        - _plane(src.get_frame(5), 0, dtype=np.float16).astype(np.float64)
+    ).max()
+    ds = np.abs(
+        _plane(strong.get_frame(5), 0, dtype=np.float16).astype(np.float64)
+        - _plane(src.get_frame(5), 0, dtype=np.float16).astype(np.float64)
+    ).max()
+    assert ds > dw
+
+
+@pytest.mark.parametrize(
+    "kwargs_a,kwargs_b",
+    [
+        ({"a": 1}, {"a": 4}),
+        ({"s": 1}, {"s": 3}),
+        ({"wmode": 0}, {"wmode": 3}),
+        ({"wref": 1.0}, {"wref": 0.0}),
+        ({"d": 0}, {"d": 2}),
+    ],
+    ids=["a", "s", "wmode", "wref", "d"],
+)
+def test_parameter_changes_output_f16(clip_grayh, kwargs_a, kwargs_b):
+    """Every scalar knob must be observable on the half path too."""
+    a = _run(clip_grayh, **{"d": 0, **kwargs_a})
+    b = _run(clip_grayh, **{"d": 0, **kwargs_b})
+    assert max_diff(a, b, frames=(5,)) > 0.0
+
+
 # --- correctness vs the reference --------------------------------------------
 
 # Parameter sweep vs vszipcl. Tolerance set from measurement: diffs come from
@@ -134,6 +200,18 @@ def test_temporal_differs_from_spatial_f32(clip_grays):
 # measurement while still catching real misindexing (O(0.1..1) errors) and a
 # return of the reduced-precision weight ring (which measured 2.1e-3 at a=64).
 NLMEANS_REF_TOL = 1e-5
+
+# Half vs vszipcl's half output: both sides run the same f32 weight/accumulator
+# math and narrow once at the finish store, so the residual is the f32
+# accumulation order (bounded by NLMEANS_REF_TOL) surfaced as discrete half
+# steps wherever a value lands on a rounding tie. Measured over the whole f16
+# surface (47 cases): one step everywhere, 4.88e-4 at |v| in [0.5, 1), except
+# the RGB joint case at 9.77e-4. That is still one step, in the [1, 2) binade:
+# the RGB fixture's Bicubic matrix conversion overshoots the unit peak (max
+# 1.11), so its half ulp doubles. The bound keeps 2x headroom over the worst
+# measurement, matching tests/test_bilateral.py's F16_TOL.
+F16_TOL = 2e-3
+F16_STEP = 4.8828125e-4
 
 REFERENCE_CASES = [
     {"d": 0},
@@ -178,6 +256,31 @@ def test_matches_reference_u16(clip_gray16, kwargs):
     assert worst <= 1.0, f"max LSB diff vs vszipcl {kwargs}: {worst}"
 
 
+# --- f16: half is a storage width in the same f32 pipeline -------------------
+#
+# The half variant stages the clip's own 2-byte samples (the temporal window is
+# half), while every weight, accumulator and LDS tile stays f32 exactly as the
+# reference's kernels keep them, and the finish store narrows once with
+# OpFConvert's round-to-nearest-even (the reference's vstore_half_rte). So the
+# f16 sweeps are the u16/f32 ones on the same content, compared against
+# vszipcl's half output within F16_TOL, plus a device-independent oracle that
+# pins the half path to the f32 one on byte-identical input.
+
+
+@pytest.mark.parametrize("kwargs", REFERENCE_CASES, ids=lambda kw: str(kw))
+def test_matches_reference_f16(clip_grayh, kwargs):
+    """Full parameter sweep on half input vs vszipcl's half output."""
+    worst = _ref_compare("grayh", (0, 11, 23), dict(**kwargs))
+    assert worst <= F16_TOL, f"max diff vs vszipcl {kwargs}: {worst}"
+
+
+@pytest.mark.parametrize("kwargs", GRAY16_CASES, ids=lambda kw: str(kw))
+def test_matches_reference_f16_u16_cases(clip_grayh, kwargs):
+    """The u16 sweep's configs on the half sibling of the same content."""
+    worst = _ref_compare("grayh", (0, 11, 23), dict(**kwargs))
+    assert worst <= F16_TOL, f"max diff vs vszipcl {kwargs}: {worst}"
+
+
 # Second, independent implementation (KNLMeansCL's Vulkan port) on the spatial
 # surface, where it agrees with vsfeel bit-for-bit at f32 and within 1 LSB at
 # u16: a cross-check that the vszipcl agreement is not a shared quirk. Only d=0
@@ -214,6 +317,13 @@ def test_spatial_matches_knlmvk_f32(clip_grays, kwargs):
 def test_spatial_matches_knlmvk_u16(clip_gray16, kwargs):
     worst = _knlmvk_compare("gray16", dict(**kwargs))
     assert worst <= 1.0, f"max LSB diff vs knlmvk {kwargs}: {worst}"
+
+
+@pytest.mark.parametrize("kwargs", KNLMVK_CASES, ids=lambda kw: str(kw))
+def test_spatial_matches_knlmvk_f16(clip_grayh, kwargs):
+    """knlmvk's half path is the third oracle on the spatial surface."""
+    worst = _knlmvk_compare("grayh", dict(**kwargs))
+    assert worst <= F16_TOL, f"max diff vs knlmvk {kwargs}: {worst}"
 
 
 # Positive maxima of the three radii (a=64, s=8, d=16): the m=0..2
@@ -266,6 +376,20 @@ def test_matches_reference_positive_maxima_u16(clip_gray16, kwargs, bound, measu
     )
 
 
+# f16 mirror of the positive maxima. The bound is F16_TOL, not a measured
+# per-entry number: the residual is the f32 accumulation order surfaced as half
+# steps, so a config that measured one step can land on a tie at two.
+POSITIVE_MAX_F16_CASES = [kwargs for kwargs, _, _ in POSITIVE_MAX_CASES]
+
+
+@pytest.mark.parametrize(
+    "kwargs", POSITIVE_MAX_F16_CASES, ids=[str(kw) for kw in POSITIVE_MAX_F16_CASES]
+)
+def test_matches_reference_positive_maxima_f16(clip_grayh, kwargs):
+    worst = _ref_compare("grayh", (0, 11, 23), dict(**kwargs))
+    assert worst <= F16_TOL, f"max diff vs vszipcl {kwargs}: {worst}"
+
+
 def test_yuv_default_denises_luma_copies_chroma_f32(clip_yuv420ps):
     src = clip_yuv420ps
     out = _run(src, d=0)
@@ -289,6 +413,20 @@ def test_yuv_default_denises_luma_copies_chroma_u16(clip_yuv420p16):
     assert worst <= 1.0
 
 
+def test_yuv_default_denises_luma_copies_chroma_f16(clip_yuv420ph):
+    """f16 mirror: the half path must pass the chroma planes through bit-exactly
+    when channels='Y' is the default."""
+    src = clip_yuv420ph
+    out = _run(src, d=0)
+    assert max_diff(out, src, planes=(0,), frames=(5,)) > 0.0
+    for p in (1, 2):
+        fa = _plane(out.get_frame(5), p)
+        fb = _plane(src.get_frame(5), p)
+        assert np.array_equal(fa, fb), f"chroma{p} changed"
+    worst = _ref_compare("yuv420ph", (5,), dict(d=0), planes=(0,))
+    assert worst <= F16_TOL
+
+
 def test_yuv_channels_uv_matches_reference_f32(clip_yuv420ps):
     """channels='UV' on a subsampled YUV clip: chroma denoised (subsampled
     lattice), luma passed through bit-exactly."""
@@ -303,11 +441,11 @@ def test_yuv_channels_uv_matches_reference_f32(clip_yuv420ps):
     assert worst < NLMEANS_REF_TOL
 
 
-# --- UV (chroma-only, 2-channel) sweep at both depths vs the reference ------
+# --- UV (chroma-only, 2-channel) sweep at every depth vs the reference -------
 #
 # The luma sweeps above only exercise 1 channel; the u16 'UV' path was once
 # broken while every other depth/channel-count combination stayed correct, so
-# the 2-channel sweep must run at BOTH depths. Parameter list mirrors
+# the 2-channel sweep must run at EVERY depth. Parameter list mirrors
 # REFERENCE_CASES. Tolerances measured on this clip with the f32 weight ring:
 #   - f32: worst 2.4e-7 across the sweep (f32 accumulation order), bound
 #     NLMEANS_REF_TOL as for the luma sweep.
@@ -364,6 +502,13 @@ def test_uv_matches_reference_u16(clip_yuv420p16, kwargs):
     assert worst <= UV_U16_REF_TOL, f"max LSB diff vs vszipcl {kwargs}: {worst}"
 
 
+@pytest.mark.parametrize("kwargs", UV_F32_CASES, ids=lambda kw: str(kw))
+def test_uv_matches_reference_f16(clip_yuv420ph, kwargs):
+    """Half mirror of the chroma-only sweep on the subsampled lattice."""
+    worst = _ref_compare("yuv420ph", (0, 11, 23), dict(channels="UV", **kwargs), planes=(1, 2))
+    assert worst <= F16_TOL, f"max diff vs vszipcl {kwargs}: {worst}"
+
+
 ENVELOPE_FRAMES = (0, 11, 23)
 
 
@@ -389,7 +534,18 @@ def test_wref0_low_h_is_finite_uv_f32(clip_yuv420ps):
             assert np.isfinite(_plane(out.get_frame(n), p)).all(), f"n={n} p={p}"
 
 
-def test_wref0_flushed_ring_returns_centre_sample(clip_grays, clip_gray16):
+def test_wref0_low_h_is_finite_f16(clip_grayh):
+    """Half mirror of the wref=0 envelope (a half store of a 0/0 would be NaN
+    exactly as an f32 one)."""
+    for h in (0.6, 1.0, 1.2):
+        for wmode in (0, 1, 2, 3):
+            out = _run(clip_grayh, d=0, h=h, wmode=wmode, wref=0.0)
+            for n in ENVELOPE_FRAMES:
+                got = _plane(out.get_frame(n), 0, dtype=np.float16)
+                assert np.isfinite(got).all(), f"h={h} wmode={wmode} n={n}"
+
+
+def test_wref0_flushed_ring_returns_centre_sample(clip_grays, clip_gray16, clip_grayh):
     """A fully flushed weight ring must return the centre sample exactly.
 
     wref=0 with a small h drives every tap's weight below the ring's range
@@ -400,7 +556,11 @@ def test_wref0_flushed_ring_returns_centre_sample(clip_grays, clip_gray16):
     frame 0 at h=3.0, 53983 at h=1.2), which is why the oracle here is the
     source clip.
     """
-    for clip, dt in ((clip_grays, np.float32), (clip_gray16, np.uint16)):
+    for clip, dt in (
+        (clip_grays, np.float32),
+        (clip_gray16, np.uint16),
+        (clip_grayh, np.float16),
+    ):
         for h in (1e-4, 1e-2, 0.1):
             for wmode in (0, 1, 2, 3):
                 out = _run(clip, d=0, h=h, wmode=wmode, wref=0.0)
@@ -423,6 +583,12 @@ def test_yuv444_joint_matches_reference_u16(clip_yuv444p16):
     assert worst <= 2.0
 
 
+def test_yuv444_joint_matches_reference_f16(clip_yuv444ph):
+    """Half mirror of the 3-channel joint YUV path."""
+    worst = _ref_compare("yuv444ph", (0, 11, 23), dict(d=0, channels="YUV", h=1.0))
+    assert worst <= F16_TOL
+
+
 def test_rgb_joint_matches_reference_f32(clip_rgbs):
     worst = _ref_compare("rgbs", (0, 11, 23), dict(d=1, h=1.0))
     assert worst < NLMEANS_REF_TOL
@@ -432,6 +598,12 @@ def test_rgb_joint_matches_reference_u16(clip_rgb48):
     """u16 mirror of test_rgb_joint_matches_reference (whole codes)."""
     worst = _ref_compare("rgb48", (0, 11, 23), dict(d=1, h=1.0))
     assert worst <= 1.0
+
+
+def test_rgb_joint_matches_reference_f16(clip_rgbh):
+    """Half mirror of the RGB joint path (the luma-weighted RGB distance)."""
+    worst = _ref_compare("rgbh", (0, 11, 23), dict(d=1, h=1.0))
+    assert worst <= F16_TOL
 
 
 def test_rclip_self_is_identity_f32(clip_grays):
@@ -444,6 +616,14 @@ def test_rclip_self_is_identity_f32(clip_grays):
 def test_rclip_self_is_identity_u16(clip_gray16):
     """u16 mirror of test_rclip_self_is_identity."""
     src = clip_gray16
+    plain = _run(src, d=0, h=1.5)
+    withref = _run(src, d=0, h=1.5, rclip=src)
+    assert max_diff(plain, withref, frames=(5,)) == 0.0
+
+
+def test_rclip_self_is_identity_f16(clip_grayh):
+    """Half mirror of test_rclip_self_is_identity."""
+    src = clip_grayh
     plain = _run(src, d=0, h=1.5)
     withref = _run(src, d=0, h=1.5, rclip=src)
     assert max_diff(plain, withref, frames=(5,)) == 0.0
@@ -495,6 +675,23 @@ def test_rclip_temporal_matches_reference_early_frames(clip_grays, d):
     assert worst < NLMEANS_REF_TOL, f"max diff vs vszipcl (d={d}): {worst}"
 
 
+def test_rclip_guide_matches_reference_f16(clip_grayh):
+    """Half mirror of the guide-clip path, on the short early window too."""
+    src = clip_grayh
+    guide = src.std.BoxBlur(hradius=5, vradius=5)
+    mine = _run(src, d=0, h=1.5, rclip=guide)
+    plain = _run(src, d=0, h=1.5)
+    assert max_diff(mine, plain, frames=(5,)) > 0.0
+    for d in (0, 1):
+        worst = _ref_compare(
+            "grayh",
+            (0, 1, 2, 3) if d else (0, 11, 23),
+            dict(d=d, h=1.5),
+            guide={"kind": "boxblur", "hradius": 5, "vradius": 5},
+        )
+        assert worst <= F16_TOL, f"max diff vs vszipcl (d={d}): {worst}"
+
+
 def test_stride_handling_matches_reference_f32(clip_grays):
     # a cropped frame keeps its parent's (wider) stride; the filter must
     # handle non-tight pitches identically to the reference
@@ -511,6 +708,13 @@ def test_stride_handling_matches_reference_u16(clip_gray16):
     assert worst <= 1.0
 
 
+def test_stride_handling_matches_reference_f16(clip_grayh):
+    """Half mirror: 613 half samples per cropped row is its own pitch."""
+    assert clip_grayh.std.Crop(left=27).width < clip_grayh.width
+    worst = _ref_compare("grayh", (0, 11, 23), dict(d=1), crop={"left": 27})
+    assert worst <= F16_TOL
+
+
 # --- determinism / streams ---------------------------------------------------
 
 
@@ -523,6 +727,12 @@ def test_deterministic_serial_f32(clip_grays):
 def test_deterministic_serial_u16(clip_gray16):
     a = _run(clip_gray16, d=2, h=1.5)
     b = _run(clip_gray16, d=2, h=1.5)
+    assert max_diff(a, b) == 0.0
+
+
+def test_deterministic_serial_f16(clip_grayh):
+    a = _run(clip_grayh, d=2, h=1.5)
+    b = _run(clip_grayh, d=2, h=1.5)
     assert max_diff(a, b) == 0.0
 
 
@@ -560,6 +770,23 @@ def test_parallel_load_deterministic_u16(clip_gray16):
         assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
 
 
+def test_parallel_load_matches_serial_f16(clip_grayh):
+    par = eval_parallel(_run, clip_grayh, d=2)
+    ref = _run(clip_grayh, d=2)
+    for n in range(clip_grayh.num_frames):
+        fb = _plane(ref.get_frame(n), 0, dtype=np.float16)
+        assert np.abs(par[n].astype(np.float64) - fb.astype(np.float64)).max() == 0.0, (
+            f"parallel/serial mismatch at frame {n}"
+        )
+
+
+def test_parallel_load_deterministic_f16(clip_grayh):
+    a = eval_parallel(_run, clip_grayh, d=2)
+    b = eval_parallel(_run, clip_grayh, d=2)
+    for n in range(clip_grayh.num_frames):
+        assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
+
+
 # --- frame-request order / short clips ---------------------------------------
 
 
@@ -574,10 +801,24 @@ def test_frame_request_order_matches_serial(d):
     assert_temporal_order_consistent("NLMeans", {"d": d}, tol=0.0, timeout=300)
 
 
+def test_frame_request_order_matches_serial_f16():
+    """Half mirror: the window's own element width must not change the cache
+    order invariant."""
+    assert_temporal_order_consistent("NLMeans", {"d": 2}, tol=0.0, clip="grayh", timeout=300)
+
+
 @pytest.mark.parametrize("nframes", [1, 2])
 def test_short_clip_temporal_window(nframes):
     """A clip shorter than the temporal window is order-independent too."""
     assert_temporal_order_consistent("NLMeans", {"d": 2}, tol=0.0, nframes=nframes, timeout=300)
+
+
+@pytest.mark.parametrize("nframes", [1, 2])
+def test_short_clip_temporal_window_f16(nframes):
+    """Half mirror of the short-clip window."""
+    assert_temporal_order_consistent(
+        "NLMeans", {"d": 2}, tol=0.0, nframes=nframes, clip="grayh", timeout=300
+    )
 
 
 @pytest.mark.parametrize("radius", [0, 1, 2])
@@ -598,6 +839,80 @@ def test_no_nan_all_frames_u16(clip_gray16, radius):
     out = _run(clip_gray16, d=radius)
     assert out.format.id == clip_gray16.format.id
     assert_changes_on_clip(out, clip_gray16, what="NLMeans")
+
+
+@pytest.mark.parametrize("radius", [0, 1, 2])
+def test_no_nan_all_frames_f16(clip_grayh, radius):
+    """Half output must stay finite and inside the [0, 1] sample range, and
+    must not be a pass-through (the same anti-vacuity check as u16)."""
+    out = _run(clip_grayh, d=radius)
+    assert out.format.id == clip_grayh.format.id
+    assert_changes_on_clip(out, clip_grayh, what="NLMeans f16")
+    for n in range(out.num_frames):
+        a = _plane(out.get_frame(n), 0, dtype=np.float16).astype(np.float64)
+        assert np.isfinite(a).all(), f"non-finite output at frame {n}"
+        assert (a >= 0.0).all() and (a <= 1.0).all(), f"out-of-range output at frame {n}"
+
+
+# --- f16 is the f32 pipeline narrowed once -----------------------------------
+#
+# These are device-independent oracles: the half clip widened to GRAYS carries
+# byte-identical sample values, so the half run and the f32 run differ only by
+# the one OpFConvert at the finish store. A half LDS tile, half weights or a
+# half accumulator (the "full fp16" experiment) would drift by many half steps
+# and fail here first, where the reference comparison could hide it behind
+# F16_TOL.
+
+
+def test_f16_is_f32_rounded(clip_grayh):
+    """Half output = the f32 pipeline's output narrowed once (<= 1/2 half step).
+
+    Measured: exactly 2.44e-4 (half a half step at |v| in [0.5, 1)) on the
+    biggest samples, i.e. the pure narrowing error.
+    """
+    widened = vs.core.resize.Point(clip_grayh, format=vs.GRAYS)
+    half = _run(clip_grayh, d=1, h=1.5)
+    full = _run(widened, d=1, h=1.5)
+    for n in (0, 11, 23):
+        a = _plane(half.get_frame(n), 0, dtype=np.float16).astype(np.float64)
+        b = _plane(full.get_frame(n), 0, dtype=np.float32).astype(np.float64)
+        assert np.isfinite(a).all() and np.isfinite(b).all()
+        worst = float(np.abs(a - b).max())
+        assert worst <= F16_STEP, f"f16 vs f32 max diff {worst} at frame {n}"
+
+
+def test_f16_is_f32_rounded_yuv(clip_yuv420ph):
+    """YUV420PH mirror: every plane, subsampled chroma included."""
+    widened = vs.core.resize.Point(clip_yuv420ph, format=vs.YUV420PS)
+    half = _run(clip_yuv420ph, d=1, h=1.5)
+    full = _run(widened, d=1, h=1.5)
+    for n in (0, 11, 23):
+        fa, fb = half.get_frame(n), full.get_frame(n)
+        for p in range(fa.format.num_planes):
+            a = _plane(fa, p, dtype=np.float16).astype(np.float64)
+            b = _plane(fb, p, dtype=np.float32).astype(np.float64)
+            worst = float(np.abs(a - b).max())
+            assert worst <= F16_STEP, f"plane {p}: f16 vs f32 max diff {worst} at frame {n}"
+
+
+def test_f16_is_f32_rounded_joint(clip_rgbh):
+    """RGB joint mirror: the three-channel distance accumulation is f32 too.
+
+    The bound is F16_TOL rather than F16_STEP because the RGB fixture
+    overshoots the unit peak (max 1.11), where even one narrowing is half a
+    step in the [1, 2) binade, 4.88e-4; a half-internal build would drift
+    hundreds of half steps here, not one.
+    """
+    widened = vs.core.resize.Point(clip_rgbh, format=vs.RGBS)
+    half = _run(clip_rgbh, d=1, h=1.0)
+    full = _run(widened, d=1, h=1.0)
+    for n in (0, 11, 23):
+        fa, fb = half.get_frame(n), full.get_frame(n)
+        for p in range(fa.format.num_planes):
+            a = _plane(fa, p, dtype=np.float16).astype(np.float64)
+            b = _plane(fb, p, dtype=np.float32).astype(np.float64)
+            worst = float(np.abs(a - b).max())
+            assert worst <= F16_TOL, f"plane {p}: f16 vs f32 max diff {worst} at frame {n}"
 
 
 # --- validation errors -------------------------------------------------------
@@ -631,6 +946,24 @@ def test_validation_errors_gray(clip_grays, args, msg):
 def test_rejects_8bit(clip_gray8):
     with pytest.raises(vs.Error, match=r"input bitdepth must be"):
         _run(clip_gray8)
+
+
+def test_rejects_half_and_integer_mismatch(clip_grayh, clip_gray16):
+    """A guide clip of a different depth is rejected on the half path too."""
+    with pytest.raises(vs.Error, match=r"'rclip' must match the source clip"):
+        _run(clip_grayh, d=0, rclip=clip_gray16)
+
+
+def test_accepts_f16(clip_grayh):
+    """A half clip is processed natively, not rejected as an unsupported depth.
+
+    The reference comparison is what anchors the storage type (a u16 kernel
+    fed half bit patterns produces a wild picture); this pins the format
+    contract and that creation succeeds.
+    """
+    out = _run(clip_grayh, d=0, h=1.2)
+    assert out.format.id == clip_grayh.format.id
+    assert out.get_frame(5) is not None
 
 
 def test_channels_yuv_requires_444(clip_yuv420ps):
@@ -692,3 +1025,13 @@ def test_cpu_and_gpu_input_match(clip_grays):
     cpu = _run(clip_grays, d=2)
     gpu = cpu_node(vs.core.vsfeel.NLMeans(vs.core.std.GPUUpload(clip=clip_grays), d=2))
     assert max_diff(cpu, gpu) == 0.0
+
+
+def test_cpu_and_gpu_input_match_f16(clip_grayh):
+    """Half mirror: a half clip auto-uploaded must match an explicit GPUUpload."""
+    cpu = _run(clip_grayh, d=2)
+    gpu = cpu_node(vs.core.vsfeel.NLMeans(vs.core.std.GPUUpload(clip=clip_grayh), d=2))
+    for n in (0, 11, 23):
+        a = _plane(cpu.get_frame(n), 0, dtype=np.float16)
+        b = _plane(gpu.get_frame(n), 0, dtype=np.float16)
+        assert np.array_equal(a, b), f"cpu/gpu mismatch at frame {n}"
