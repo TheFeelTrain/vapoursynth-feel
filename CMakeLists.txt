@@ -322,16 +322,18 @@ endforeach()
 
 # EEDI3: row kernel (one 32-lane WG per interp row, subgroup-register DP
 # with shuffles) + vcheck kernel (single WG serial row walk), per io
-# variant (u16, f32). The row kernel needs subgroup ops + the
+# variant (u16, f16, f32). The row kernel needs subgroup ops + the
 # Vulkan memory model, so SPIR-V 1.3+ is required.
 # PROBE and MAXW are cache variables: PROBE is a diagnostics-only ablation
 # level, MAXW is the max plane width the vcheck LDS ping-pong can hold, kept in
 # step with the host's fit check (EEDI3_MAXW_LDS) so the two cannot drift into a
-# pipeline whose static LDS exceeds the device.
+# pipeline whose static LDS exceeds the device. The io list is local because the
+# other filters' kernels would fall through to their u16 branch under -DIO_F16.
 set(EEDI3_PROBE "0" CACHE STRING "EEDI3 diagnostics-only shader ablation level")
 set(EEDI3_MAXW "4096" CACHE STRING "EEDI3 vcheck LDS max plane width")
+set(VK_EEDI3_IO_TYPES "u16" "f16" "f32")
 set(VK_EEDI3_VARIANTS)
-foreach(io IN LISTS VK_IO_TYPES)
+foreach(io IN LISTS VK_EEDI3_IO_TYPES)
     string(TOUPPER "${io}" io_define)
     list(APPEND VK_EEDI3_VARIANTS
         "eedi3_${io}_row|eedi3.comp|-DIO_${io_define} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_ROW"
@@ -366,6 +368,12 @@ foreach(mbits IN ITEMS 8 16 32)
         "eedi3_maskdilate_${mbits}_raw|eedi3.comp|-DENTRY_MASKDILATE -DMASK_BITS=${mbits} -DMASK_TRANS=0"
         "eedi3_maskdilate_${mbits}_tr|eedi3.comp|-DENTRY_MASKDILATE -DMASK_BITS=${mbits} -DMASK_TRANS=1")
 endforeach()
+# A half mask is a float mask: the same nonzero predicate as f32, read from a
+# native float16_t element so no conversion node is inserted.
+list(APPEND VK_EEDI3_VARIANTS
+    "eedi3_maskpack_f16|eedi3.comp|-DENTRY_MASKPACK -DMASK_HALF=1"
+    "eedi3_maskdilate_f16_raw|eedi3.comp|-DENTRY_MASKDILATE -DMASK_HALF=1 -DMASK_TRANS=0"
+    "eedi3_maskdilate_f16_tr|eedi3.comp|-DENTRY_MASKDILATE -DMASK_HALF=1 -DMASK_TRANS=1")
 
 # NNEDI3: prescreener + cooperative predictor + the kept-row writer. Three
 # predictor variants for the shipped PXP selection: PXP=8 needs a 256-vec4

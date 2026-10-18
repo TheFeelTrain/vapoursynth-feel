@@ -1,52 +1,51 @@
 # EEDI3 — notes
 
-Status: **shipped** — family-A semantics (eedi3m/eedi3vk2). Both depths are
+Status: **shipped** — family-A semantics (eedi3m/eedi3vk2). u16 and f32 are
 bit-exact against eedi3vk2: the f32 rolling sums are re-summed in the
 reference's k order and the cost/relax/vcheck/cubic float expressions carry its
-`precise` qualifiers. `hp` (which eedi3m only registers; eedi3vk2, vszip and
-vszipcl implement it) is live and bit-exact too. EEDI3, EEDI3H (native
-transposed-plane) and EEDI3AA (fused based_aa chain) share every kernel,
-geometry and pipeline. Runs on the **R80 GPU API**: `clip/sclip/mclip:vnode:gpu` in and
-`ffGPUOutput` out, one exec pool, and no host upload/download/gather/blit
-machinery at all. The parallel vcheck is the default.
+`precise` qualifiers. f16 is **storage-only** (native half pad/copies/AA
+intermediates, f32 arithmetic), i.e. the f32 result rounded once. `hp`
+(eedi3m only registers it; eedi3vk2/vszip/vszipcl implement it) is live and
+bit-exact too. EEDI3, EEDI3H (native transposed-plane) and EEDI3AA (fused
+based_aa chain) share every kernel, geometry and pipeline. Runs on the **R80
+GPU API**: `clip/sclip/mclip:vnode:gpu` in and `ffGPUOutput` out, one exec pool,
+and no host upload/download/gather/blit machinery at all. The parallel vcheck is
+the default.
 
 Benchmark defaults: 2000 f, real based_aa clip, 2x2160p, field=3, mdis=20,
 vcheck=2. `MANGOHUD=0 uv run tools/benchmark.py --filter eedi3 --gpu-cache
---no-download --format <u16|f32>`:
+--no-download --format <u16|f16|f32>`:
 
 | clip | vsfeel | vszipcl | eedi3vk2 |
 |---|---|---|---|
-| u16 | 621 | 54 | 139 |
-| u16 (EEDI3H, same call surface) | 749 | 51 | - |
+| u16 | 618 | 54 | 139 |
+| u16/f16 (EEDI3H, same call surface) | 748 / 719 | 51 | - |
 | u16 hp | 237 | 45 | 80 |
-| f32 | 486 | 54 | 129 |
+| f16 | **603** | - | 141 (its own full-half path) |
+| f32 | 489 | 54 | 129 |
 
-The hp row costs vsfeel **2.6x** (621 → 237): the direction set doubles (TPITCH
+The hp row costs vsfeel **2.6x** (618 → 237): the direction set doubles (TPITCH
 41 → 81, K 2 → 3), the relax widens to ±2 and `pbt` grows 16 → 81 bytes.
 
 - **The graded vertical EEDI3 is HOST<->DEVICE TRANSFER bound, not kernel
-  bound.** Ablating every EEDI3 kernel from the recording
-  (`VSFEEL_EEDI3_SKIP=1`, interleaved 6×2-repeat A/B) moves the graded 2x2160p
-  run by **+0.4%** (617.5 → 620.2 fps, `--gpu-cache --no-download`) and +0.5%
-  in the CPU-cache mode (555.7 → 558.6): the kernels are *fully hidden* behind
-  the per-output-frame transfer bill (~50 MB: sclip every frame, clip+mclip
-  every other, the output download), which is the frame. A bare
-  `GPUUpload → GPUDownload` of one 4K16 plane measures 2.82 ms.
+  bound.** `VSFEEL_EEDI3_SKIP=1` (interleaved 6×2-repeat A/B) moves the graded
+  2x2160p run by **+0.4%** (`--gpu-cache --no-download`), +0.5% CPU-cache: the
+  kernels are hidden behind the per-output-frame transfer bill (~50 MB: sclip
+  every frame, clip+mclip every other, the download). `GPUUpload → GPUDownload`
+  of one 4K16 plane is 2.82 ms.
 - **Batch size (`VSFEEL_EEDI3_BATCH`, default from a scratch target — 256 MiB,
   512 for EEDI3AA).** The knee is where the submit path stops being amortised by
-  the GPU fill, and **it moves with the harness's environment**: with RADV's
-  transfer queue on (what the benchmark sets) EEDI3 2x2160p wants B=2 (B=1 355 /
-  **B=2 470** / B=3 463 / B=4 453 / B=8 339, 2000 f), with it off B=3. Sweep
-  batches under the harness's own env.
+  the GPU fill, and it moves with the environment: with RADV's transfer queue on
+  (what the benchmark sets) 2x2160p wants **B=2** (B=1 355 / B=4 453 / B=8 339),
+  with it off B=3.
 - **`pbt` is 2-bit packed** when a lane owns exactly two directions (TPITCH
   33..64, i.e. mdis 17..31, which includes the default 20): each lane builds a
   nibble and only even lanes store, combining their odd neighbour's nibble
   through a `subgroupShuffleXor`, so no barrier and no write race. Column stride
-  41 → 16 bytes, and the whole per-frame scratch at 2x2160p 225 → 120 MiB (pbt
-  170 → 63). Bit-exact vs the pre-port build on the whole 16-config sweep
-  (mdis 5/20/40 cover the K=1/K=2/K=3 paths). Reusing the scratch instead of
-  allocating it per frame (`gpuExecRetain` free list) measured **neutral**, so the
-  allocator is not a cost. hp cannot pack: its deltas span ±2.
+  41 → 16 bytes, per-frame scratch at 2x2160p 225 → 120 MiB. Bit-exact on the
+  whole 16-config sweep (mdis 5/20/40 cover K=1/2/3). Reusing the scratch
+  (`gpuExecRetain` free list) instead of allocating per frame was **neutral**.
+  hp cannot pack: its deltas span ±2.
 
 ## Implementation
 
@@ -60,6 +59,22 @@ finalises each interp row. EEDI3H adds `ENTRY_XPOSE` (16x16 tiled transpose with
 LDS stage, clip → R', sclip → B') and `ENTRY_COMPOSE`; EEDI3AA adds `ENTRY_ASSEMBLEV`
 (vertical merge of the two sub-frames) and reuses `ENTRY_COMPOSE` with a
 `comp_fuse` push constant.
+
+### f16 (half io)
+
+A third io depth (`stFloat` + 16 bits). Only the **transport** is half: the pad,
+the xpose copies (R'/B'), EEDI3AA's intermediate `v`/O_0 and the mask predicate
+(`MASK_HALF`, no conversion node for a GrayH mclip). `dst`/`cint`/`vout`/`hp`
+stay f32, so the result is the f32 result rounded once at the io store; the
+variant keys on the sample type and the f32 scratch is `scratch_elem`/`hp_elem`.
+
+- **The AA merge spells out the chain's half rounding.** The chain merges half
+  V/H frames, so `ENTRY_ASSEMBLEV`/`merge_avg` narrow the sub-pass value *before*
+  `v1+(v2-v1)*0.5`. The compiler folds a `float16_t` round trip away when the
+  narrowed value only feeds f32 arithmetic (that cut drifted one half ulp, which
+  the horizontal DP amplifies to ~2% of pixels), so `half_rne` narrows with
+  integer math. With it EEDI3AA f16 is bit-exact against the chain; EEDI3/EEDI3H
+  f16 are the f32 path rounded to half.
 
 ### hp (half-pel search)
 
@@ -185,11 +200,34 @@ So it is **ALU-issue bound (~1 IPC), not load bound**: f32 io, which drops every
 u16→f32 convert but doubles the pad bytes, makes it 27% *slower*. The ring shift
 register is the largest addressable item; the three-window redundancy is worth
 8.2% but needs a 2|u|-deep delay line (~90 registers).
+
+- **f16 is +23%/+14%/+28% over f32 (EEDI3/EEDI3H/EEDI3AA)**: same-session
+  u16/f16/f32 medians 618/603/489, 748/719/630, 176/161/125 fps, from the halved
+  pad/copy/io bytes; it stays under u16 because the f32 scratch is 2x the u16
+  one. Full half arithmetic would only lose accuracy (vk2's own f16: 0.044, ~20%
+  of pixels vs its f32).
+
 - `eedi3h_vszipcl_loose` is a family-gap sanity bound, not a tolerance: 0.06 /
   16384 on this clip (3.9-4.0% differ, p99.9 ≤ 294 LSB). Only gross errors
   (wrong axis, broken composition) blow the fraction toward ~1.0.
 
 ## Historical
+
+- **2026-10-18 — f16 as a storage-only third io depth.** Pad, xpose copies, the
+  AA intermediate `v`/O_0 and the mask kernels gained native `float16_t`
+  variants; `dst`/`cint`/`vout`/`hp` stay f32, so f16 = the f32 path rounded
+  once (u16/f16/f32 medians 618/603/489, 748/719/630, 176/161/125 fps). The
+  first cut was not exact: the AA merge's `float16_t` narrowing was folded into
+  an f16 FMA by the compiler, so the operand was the unrounded vout and the
+  horizontal DP amplified one half ulp into ~2% of pixels; `half_rne` (integer
+  RNE) fixed it and EEDI3AA f16 is bit-exact against the two-call chain. A full
+  half arithmetic path was rejected on mechanism: the row kernel is ALU-issue
+  bound at ~1 IPC, where RDNA3 scalar f16 is no faster than f32 and the serial
+  DP does not pack (eedi3vk2's full-half f16 measures 0.044 / ~20% of pixels
+  off its own f32), and the arithmetic scratch it would narrow is ~90 MB per
+  2x2160p frame, under 1% of the 6.2 ms frame at ~2 TB/s, so it cannot reach the
+  30% bar that would justify the accuracy loss. vk2 f16 exists and is used only
+  as a loose sanity bound.
 
 - **2026-10-12 — the banner's table is re-measured; the old numbers are void.**
   u16 472/56, EEDI3H 471/52, hp 198/48 and the "470.4 → 469.6 fps (+0.0%)"
@@ -431,103 +469,74 @@ Mechanism only; none of this code ships, and none of it is a "current shape".
 One bullet each; no perf change in any of them (the README's rule for cross-cutting
 passes). All bit-identical to the previous build unless stated.
 
-- **22 validation hardening**: flush/invalidate through the shared `mapped_range`
-  helper (EEDI3's duplicated per-plane entries collapsed to one);
-  `VK_EXT_subgroup_size_control` enabled only when advertised; extensions enumerated
-  once; `apiVersion` checked; `vkCreateComputePipelines` takes
-  `pipeline_cache_lock`; `allocate_memory` refuses rather than relaxing a
-  `DEVICE_LOCAL|HOST_VISIBLE` request; `FramePool::emplace()` so a creation error is
-  torn down instead of leaking.
-- **23 NT-store alignment**: `deint_row_u16/f32` gated the streaming store on the
-  **element index**, not the pointer, so any destination row whose cell length was
-  not a multiple of 32 bytes (EEDI3H's transposed kept-row cells: 1260 B u16 /
-  2520 B f32 at a 630-px source) silently became a cached store into the uncached
-  VRAM window. Predicate dropped; `nt` alone selects `_mm256_stream_*`.
-  **Perf-neutral in practice** (AA geometry, 630-px luma, EEDI3H field=3, mclip,
-  800 f, ns=8, interleaved: +0.4%/+0.6%) — full-width AVX stores coalesce in the WC
-  buffer, unlike the narrow scalar stores behind the old "27.6 fps" reading.
-  Bit-identical output at 630/638/640 px.
-- **24 four latent defects**: `VkPipeline destroyed[8*3]` had zero headroom
-  (EEDI3AA's worst case is exactly 24) → `std::vector` + `std::find` dedup;
-  `import_plane_host_memory` bound at `addr & (align-1)` without querying the
-  imported buffer's `VkMemoryRequirements` → now queries and falls back to the CPU
-  blit on a short region or bad `memoryTypeBits`; `field > 1` doubled `numFrames`
-  unconditionally, turning a `-1` unknown-length source into `-2` → `if (numFrames >
-  0)` (also in NNEDI3); `RAWSTAGE=1` alone was garbage (needed `NOREBAR=1`) and
-  `NOBLIT` was a silent no-op on EEDI3AA → now a create-time error.
-- **25 probe cleanup**: GBENCH indexed slots by `tag_id & 1`, so EEDI3, EEDI3H and
-  EEDI3AA's vertical pass all accumulated into slot 0 and "stage N" meant different
-  work per graph → four slots and an explicit slot argument. `MAXW` had two unlinked
-  copies (the host's `MAXW_LDS` claimed CMake passed `-DMAXW` but the rule did not),
-  so the LDS-fit check and `tfloat tlineSh[2][MAXW]` could drift → `EEDI3_MAXW` is
-  now the single source, default 4096. Per-frame flush vectors became a reusable
-  `Eedi3Resource::mapped_ranges`. Bit-identical to `8e65f1f` across 14 configs.
-- **26 probe corruption**: the PROBE 7/8/10 "fake store" kept `f2` alive with
-  `if (f2 == pc.pbt_base) dmap[rempty_base + r] = 0`, but `pbt_base` is a byte offset
-  while `f2` is a sum of byte-valued steps, so firing cleared the per-row empty flag
-  the vcheck reads — changing the vcheck's branch mix and the output. Replaced by a
-  read-only sink into `rowXmin`: PROBE=7 row SPIR-V 43744 → **44432 B** (IO_U16), so
-  the walk is still compiled in, and the output is byte-identical to PROBE=0 (sha256
-  `283717477cead12f`). Warning baseline: `-Wall -Wextra -Wshadow` gave 191 hits, all
-  but 2 being `-Wmissing-field-initializers` on the Vulkan designated-initializer
-  convention; that one is silenced for the plugin and the baseline enforced in
-  CMakeLists.
+- **22 validation hardening**: shared `mapped_range` flush/invalidate; subgroup
+  size control enabled only when advertised; extensions enumerated once;
+  `apiVersion` checked; `vkCreateComputePipelines` takes `pipeline_cache_lock`;
+  `allocate_memory` refuses rather than relaxing a `DEVICE_LOCAL|HOST_VISIBLE`
+  request; `FramePool::emplace()` tears a failed creation down instead of leaking.
+- **23 NT-store alignment**: the streaming store was gated on the element index,
+  not the pointer, so any destination row whose cell was not a 32-byte multiple
+  (EEDI3H's 1260 B u16 / 2520 B f32 transposed cells at 630 px) became a cached
+  store into uncached VRAM. Predicate dropped; `nt` alone selects
+  `_mm256_stream_*`. **Perf-neutral** (full-width AVX stores coalesce in the WC
+  buffer, unlike the narrow scalar stores behind the old "27.6 fps"); bit-identical
+  at 630/638/640 px.
+- **24 four latent defects**: the `VkPipeline destroyed[8*3]` array had zero
+  headroom (AA's worst case is exactly 24) → vector + dedup; host-memory import
+  bound at `addr & (align-1)` without querying the buffer's `VkMemoryRequirements`
+  → query and fall back; `field > 1` doubled an unknown (`-1`) `numFrames` → `if
+  (numFrames > 0)`; `RAWSTAGE=1` alone was garbage and `NOBLIT` a silent no-op on
+  AA → create-time errors.
+- **25 probe cleanup**: GBENCH's `tag_id & 1` slot index merged every graph into
+  slot 0 → four explicit slots; `MAXW` had two unlinked copies (host `MAXW_LDS` vs
+  the shader rule, so the LDS-fit check could drift) → `EEDI3_MAXW` is the single
+  source, default 4096; per-frame flush vectors became a reusable `mapped_ranges`.
+  Bit-identical to `8e65f1f`, 14 configs.
+- **26 probe corruption**: PROBE 7/8/10's "fake store" cleared the per-row empty
+  flag (`pbt_base` is a byte offset, `f2` a sum of bytes), changing the vcheck's
+  branch mix → replaced by a read-only `rowXmin` sink (PROBE=7 row SPIR-V 43744 →
+  **44432 B**, output byte-identical to PROBE=0). `-Wall -Wextra -Wshadow`'s 191
+  hits were all but 2 `-Wmissing-field-initializers`; silenced, baseline enforced.
 - **Batch-cache races returned `nullptr` with no error**: `getFrame` checked the
-  cache and then took the frame under two separate locks, so a sibling batch could
-  evict it in the gap, and the producer took its own frame after publishing, where a
-  concurrent publish's eviction could win it. The claim and take are one
-  `eedi3_take_or_claim` now and `eedi3_publish` hands `first` back under the same
-  lock. No perf change.
+  cache and took the frame under two locks, so a sibling batch could evict it in
+  the gap (and a producer could lose its own frame after publishing). Claim and
+  take are one `eedi3_take_or_claim` now. No perf change.
 
 ### Rounds 27-30 — the parallel vcheck, the fused AA submit, and hardening
 
-- **27 — the serial row walk is gone from the shipped path; the vcheck is parallel
-  by default.** Row r takes `d2p` from the *un-vchecked* dst row r-1, so no vcheck
-  write feeds another row: the pass runs one workgroup per interp row
-  (`grid (1, rows, 1)`) and needs no vcopy. Same-session A/B, 5 order-reversed
-  2000-frame pairs (ns=8): EEDI3 **497.96 → 628.68 fps, +26%**; EEDI3AA (1000-frame
-  reps) **108.3 → 160.2 fps, +48%**. The drift is a blend decision flip that decays
-  geometrically: u16 max (of 65535) is 4157 on 0.072% of pixels at level 1, 580 on
-  0.018% at level 3, 36 on 0.003% at level 5, 5 on 0.0007% at level 6. **Default is
-  level 6**, the lowest bit-exact on the whole tested surface (level 3 is the first
-  that is not); `VSFEEL_EEDI3_VPARA=0` restores the serial walk as the A/B control,
-  1..6 pin a level, and `test_eedi3_parallel_vcheck_matches_serial` pins the two
-  arms together. The ladder costs no extra dispatches: one shared `vc_blend` and a
-  macro-generated driver per d2p source.
-- **28 — EEDI3AA's two horizontal submissions fused into one.** Both AA horizontal
-  sub-passes read only the merged frame, which the first fence has finished, so they
-  need neither the host nor a second fence between them: one CB, one
-  `submit_with_fence`, one wait; both parities are pre-gathered with the
-  `gather_columns_pair` form, and the parity-independent mask bits lose their
-  duplicate build. ns=1 same frame **21.63 → 19.47 ms**; the hWait drop was only
-  ~0.9 ms, not the 6 ms the model predicted — most of it is compute the GPU still has
-  to do. ns=8 interleaved 2000 f: 141.3 → 144.8 and 132.4 → 144.5; fused won or tied
-  every pair. A few percent, not 10%. Bit-exact vs the two-submission control (still
-  in-tree as `VSFEEL_EEDI3AA_HFUSE`): 15 GRAY geometries x u16/f32 + 7 multi-plane
-  cases, 0 mismatches. Bounded out: pre-recording the CBs (≤0.07%) and the pair
-  gather alone (neutral).
-- **29 — row-kernel levers.** **SGSIZE 64 / K=1 is +2% on EEDI3AA, neutral on
-  EEDI3, not shipped** (a `-D`, a second row module and its device-limit handling for
-  ~2% on one workload). The four 1D dispatches folded into Y
+- **27 — the vcheck is parallel by default; the serial row walk is gone.** Row r
+  takes `d2p` from the *un-vchecked* dst row r-1, so no vcheck write feeds another
+  row: one workgroup per interp row, no vcopy. 5 order-reversed 2000-frame pairs
+  (ns=8): EEDI3 **497.96 → 628.68 fps (+26%)**, EEDI3AA **108.3 → 160.2 (+48%)**.
+  The drift is a blend-decision flip that decays geometrically (u16 max 4157 on
+  0.072% of pixels at level 1 → 5 on 0.0007% at level 6). **Default level 6**, the
+  lowest bit-exact on the tested surface; `VPARA=0` restores the serial A/B
+  control, 1..6 pin a level.
+- **28 — EEDI3AA's two horizontal submissions fused into one.** Both read only the
+  merged frame the first fence finished, so one CB/fence/wait suffices; both
+  parities use `gather_columns_pair` and the shared mask bits are built once. ns=1
+  21.63 → 19.47 ms (the hWait drop was ~0.9 ms, not the modeled 6 — most of it is
+  GPU compute); ns=8 interleaved 141.3 → 144.8 / 132.4 → 144.5, fused winning or
+  tying every pair — a few percent, not 10%. Bit-exact vs the
+  `VSFEEL_EEDI3AA_HFUSE` control (15 GRAY geometries × u16/f32 + 7 multi-plane, 0
+  mismatches); pre-recording the CBs (≤0.07%) and the pair gather alone (neutral)
+  were bounded out.
+- **29 — row-kernel levers.** **SGSIZE 64 / K=1: +2% on EEDI3AA, neutral on
+  EEDI3, not shipped.** The four 1D dispatches fold into Y
   (`ID.y * NumWorkGroups.x + ID.x`) because they reach ~130k workgroups at 8K, over
-  the 65535-per-dimension limit; verified bit-identical with `VSFEEL_LIMIT_GRID_X=4`.
-  Shaderstats: 96 VGPRs, 0 spills. The later `PROBE` attribution (Performance)
-  supersedes this round's "latency has nothing to hide behind" reading: the kernel
-  runs at ~1 IPC, i.e. it is issue bound, which is also why the K=1 shape bought
+  the 65535-per-dimension limit (bit-identical with `VSFEEL_LIMIT_GRID_X=4`).
+  Shaderstats: 96 VGPRs, 0 spills. The `PROBE` attribution supersedes this round's
+  latency reading: the kernel is issue bound (~1 IPC), which is why K=1 bought
   nothing.
 - **30 — creation-time hardening and variant-gated pipelines.** `dh` now requires
-  every plane — a `planes` subset made a CPU output frame that failed per frame;
-  scratch over 2 GiB (int32 region bases) and non-finite `alpha`/`beta`/`gamma`/
-  `vthresh*` (NaN is false against every range check) are rejected at creation.
-  Partial pipeline sets are owned from the first create: a failed later kernel
-  abandoned a stack struct with no destructor, so a 128-invocation device leaked 2
-  `VkPipeline`s that validation named at `vkDestroyDevice`. Pipelines are created per
-  key's `horiz`, not `d->horiz` — a vertical EEDI3 built xpose/compose/assemble,
-  EEDI3H built blit, and every key built both mask dilation forms, for kernels the
-  invocation cannot dispatch. Dead code removed: the host `alloc` stage's structurally
-  zero sample, `src_h`, `mclip_native16/32`, and the row kernel's unreachable
-  `xd == 1` masked arm (`bmask` is a ±MDIS dilation, so `bmask[0] | bmask[1]` set
-  implies `bmask[1]`).
+  every plane; scratch over 2 GiB (int32 bases) and non-finite
+  `alpha`/`beta`/`gamma`/`vthresh*` (NaN is false against every range check) are
+  rejected at creation. Partial pipeline sets are owned from the first create (a
+  failed later kernel leaked 2 `VkPipeline`s named at `vkDestroyDevice`). Pipelines
+  are created per key's `horiz`, not `d->horiz` (a vertical EEDI3 built
+  xpose/compose, EEDI3H built blit, every key built both mask forms). Dead code
+  removed: the zero `alloc` sample, `src_h`, `mclip_native16/32`, and the
+  unreachable `xd == 1` masked arm.
 
 - **2026-10-03 — EEDI3/EEDI3AA cost model and the transfer wall.** Added
   `VSFEEL_EEDI3_GPUTIME` (in-CB phase timestamps) and `VSFEEL_EEDI3_SKIP` and
@@ -563,30 +572,25 @@ passes). All bit-identical to the previous build unless stated.
 - **hp's row cost**: three structural items ride on the doubled window work —
   the pbt column is 81 bytes at full TPITCH (hp's ±2 deltas would fit 3 bits),
   K = 3 keeps 69 ring registers live per lane, and hpfill is its own phase.
-- **Kill the ring shift register** — the one large row-kernel item left (PROBE=15:
-  12.0% of the kernel, ~8% of EEDI3AA). Shape: a circular ring of `RING_CAP` slots
-  whose window is read from a rotating base, which needs the column loop unrolled by
-  RN with the base compile-time per copy (any runtime index spills the ring to
-  scratch). The base must then advance on EVERY column, masked ones included, so
-  `roll_seed` has to write all RN slots at the current phase — it already writes all
-  of them, so that is a rotation of the write indices, not a new invariant.
-- **The three-window redundancy** (PROBE=14: 8.2%) is real but needs a 2|u|-deep
-  delay line per direction: ~45 registers at mdis=20 for the worst lane, i.e. ~90 for
-  K=2 against the 96 the kernel uses today. Only reachable if something else gives up
-  its registers first.
-- `ENTRY_PAD` div/mod by `pad_stride`, `ENTRY_VCOPY`/`ENTRY_BLIT` div by `WIDTH`: a
-  2D dispatch removes them. Per-plane passes, not the row kernel.
+- **Kill the ring shift register** (PROBE=15: 12.0% of the kernel, ~8% of
+  EEDI3AA). Needs a circular ring read from a rotating base, so the column loop
+  must be unrolled by RN with the base compile-time per copy (a runtime index
+  spills). The base then advances on every column, so `roll_seed` must write all
+  RN slots at the current phase — a rotation of its write indices.
+- **The three-window redundancy** (PROBE=14: 8.2%) needs a 2|u|-deep delay line
+  per direction: ~90 registers at K=2 vs the 96 in use today, so only reachable if
+  something else gives up registers first.
+- `ENTRY_PAD`/`VCOPY`/`BLIT` div/mod by `pad_stride`/`WIDTH`: a 2D dispatch
+  removes them (per-plane passes, not the row kernel).
+- **f16's remaining levers**: half `dst`/`cint`/`vout` (loses f32 parity) and
+  packed `f16vec2` cost windows (loses argmins) — both the non-limiter side.
 - **Fuse the vcheck across planes** (one launch, `gl_WorkGroupID.y = plane`, as
   vszipcl does) — YUV-only, cannot move the Gray flagship, real for color AA.
-- **The graded vertical number is a transfer budget, not a kernel budget.** ~50 MB
-  per output frame crosses PCIe (sclip every frame, clip+mclip every other, the
-  output download); the filter's kernels are 8.9% of it. The one lever inside the
-  filter is that `sclip` is `Interleave([sclip, sclip])` of the same image as `clip`
-  in every based_aa chain, so its upload is redundant — but skipping it needs
-  `sclip:vnode:all`, a host-pointer/test comparison, and a real fallback upload for
-  the case where the two planes differ. Measured cost of the whole sclip leg
-  (`vcheck=0`, which also drops the vcheck kernel): 469 → 545 fps, so the ceiling is
-  ~16% and the fallback path is what makes it expensive.
+- **The graded vertical number is a transfer budget** (~50 MB/frame across PCIe;
+  the kernels are 8.9% of it). The one internal lever is the redundant sclip
+  upload (`sclip` is `Interleave([s,s])` of the same image as `clip` in based_aa),
+  but skipping it needs `sclip:vnode:all` and a fallback. Whole sclip leg
+  (`vcheck=0`): 469 → 545 fps, ceiling ~16%.
 
 ### Do not retry
 
@@ -596,46 +600,40 @@ passes). All bit-identical to the previous build unless stated.
   second row module plus device-limit handling for ~2% on one workload), and
   the kernel is issue-bound anyway (round 29).
 
-- **Breaking the walk's serial load chain** by lookahead, ±1 candidate windows, or a
-  layout making the address f-independent: 453.9 / 451.4 / 457.0 fps — identical —
-  and PROBE=6 is a dead tie with real (532.6 vs 530.6). **4x-unrolling the walk with
-  merged `tileF` stores** is a wash too (8 order-reversed 2000-frame pairs, median
-  ratio 0.99). The walk is issue bound, not latency bound.
-- **Ablating the row kernel with `PROBE=2`/`5`/`4`/`6`**: 2 and 5 return with `dmap`
-  stale (the vcheck takes its `dirc == 0` fast branch, overstating the row kernel by
-  ~9 points on EEDI3AA — use `PROBE=12`), and the old round-15 4/5/6 numbers are void
-  because a `>=` guard compiled them to an empty kernel (1656 B vs 43720 B).
+- **Breaking the walk's serial load chain** (lookahead, ±1 windows, an
+  f-independent address): 453.9 / 451.4 / 457.0 fps — identical — and PROBE=6 ties
+  real (532.6 vs 530.6); 4x-unrolling with merged `tileF` stores is a wash (8
+  order-reversed pairs, ratio 0.99). Issue bound, not latency bound.
+- **Ablating the row kernel with `PROBE=2`/`5`/`4`/`6`**: 2 and 5 leave `dmap`
+  stale (the vcheck takes its `dirc == 0` branch, overstating the row kernel by ~9
+  points on EEDI3AA — use `PROBE=12`); round-15's 4/5/6 numbers are void (a `>=`
+  guard compiled an empty kernel, 1656 B vs 43720 B).
 - **`pbt` store traffic**: DP+store is 4.8% of the vertical frame and the 170 MB store
   runs at ~1.9 TB/s (L2/port, not DRAM). PROBE=9 proves bytes are not the cost —
   1/40th the traffic on one dirty line is *slower*. Packing also adds ballots to an
   issue-bound kernel.
-- **Splitting DP and backtrack into two dispatches** (round 15): neutral (vc0 322 vs
-  326, vc2 295 vs 295) — the boundary costs exactly what removing the same-WG
-  store→load dependency saved. **Splitting the walk out to parallelise it (one lane
-  per ROW) lost too**: 189.8 vs 194.1 fps on the 2x2160p AA workload (same-session
-  interleaved medians, reverted). The old form already ran hundreds of 32-lane
-  workgroups concurrently, so "31 of 32 lanes idle" was never the limiter; the split
-  only added a dispatch, a barrier and a global `dmap` round-trip.
-- **Per-frame `VK_EXT_external_memory_host` imports** (default off): the import is
-  GPU work on RADV (VM map/unmap + TLB sync per 16.6 MB BO). Arms: staged 608 |
-  `vout` in dev_buf 588 | import the GPU never touches 487 | import+blit 390. Re-test
-  only if RADV's import path gets cheaper.
-- **Multi-region `vkCmdCopyBuffer` for strided row copies** (~13 us *per region* in
-  situ), and **`vout` in dev_buf + SDMA D2H** (`VSFEEL_EEDI3_VOUTDEV=1`, still a
-  loss: 289 vs 313-323; 327 vs 375 with vcheck off). **Lazy `cint`/`sclip` load in
-  vcheck** is void by inspection: `cint_s` is both the `dirc == 0` result and the
-  `dirc != 0` blend operand, so every `do_row` pixel reads it.
-- **`LDS ping-pong tlineSh`**: the verdict has flipped twice (round 14 +3%, round 21
-  +11% the other way) and both are real — it is workload-dependent on row-mask
-  density, so re-measure rather than inheriting either.
-- **(stale) batch**: a single contiguous blit instead of per-row strided copies (525
-  vs 555); plain `memcpy` instead of the NT load/store pair anywhere in the frame path
-  (blit 6.1 → 10.4 ms/frame; vc0 481 → 401); skipping the pbt global stores
-  (`PROBE=1`); a 2-subgroup x 2-row 64-lane workgroup for `ENTRY_ROW` (regressed in
-  every config; NOT the untried one-subgroup 64-lane / K=1 shape); `subgroupcoherent`
-  on pbt (259 → 229); `restrict` on pbt (214 → 201); `[[unroll]]` on the K-direction
-  loops (227 → 196); dropping `HOST_CACHED` from staging (collapsed to 43 fps — NT
-  loads need WB/WC memory).
+- **Splitting DP and backtrack into two dispatches** (round 15): neutral (vc0 322
+  vs 326) — the boundary costs what removing the same-WG store→load hazard saved.
+  **Parallelising the walk (one lane per ROW) lost too** (189.8 vs 194.1 fps,
+  2x2160p AA): hundreds of 32-lane workgroups already ran concurrently, so "31 of
+  32 lanes idle" was never the limiter; the split only added a dispatch, a barrier
+  and a `dmap` round-trip.
+- **Per-frame `VK_EXT_external_memory_host` imports** (default off): the import
+  itself is GPU work on RADV (VM map/unmap + TLB sync per BO). Arms: staged 608 |
+  `vout` in dev_buf 588 | untouched import 487 | import+blit 390. Re-test only if
+  RADV's import path gets cheaper.
+- **Multi-region `vkCmdCopyBuffer` for strided row copies** (~13 us *per region*
+  in situ) and **`vout` in dev_buf + SDMA D2H** (`VOUTDEV=1`: 289 vs 313-323; 327
+  vs 375 with vcheck off). **Lazy `cint`/`sclip` load in vcheck** is void: `cint_s`
+  is both the `dirc == 0` result and the blend operand.
+- **`LDS ping-pong tlineSh`**: the verdict flipped twice (round 14 +3%, round 21
+  +11% the other way), both real — workload-dependent on row-mask density.
+- **(stale) batch**: one contiguous blit vs per-row strided copies (525 vs 555);
+  plain `memcpy` instead of the NT pair anywhere (blit 6.1 → 10.4 ms/frame, vc0 481
+  → 401); skipping the pbt stores (`PROBE=1`); a 2-subgroup × 2-row 64-lane
+  `ENTRY_ROW` (regressed; NOT the untried 1-subgroup 64-lane/K=1); `subgroupcoherent`
+  (259 → 229) or `restrict` (214 → 201) on pbt; `[[unroll]]` on the K loops (227 →
+  196); dropping `HOST_CACHED` from staging (43 fps — NT loads need WB/WC).
 - **`core.max_cache_size` in the benchmark harness**: lowering it collapses *every*
   plugin (vsfeel 61 vs 220, vszipcl 39 vs 200) by re-running the decode/mask chain.
 
@@ -650,9 +648,9 @@ passes). All bit-identical to the previous build unless stated.
   session, and in the same *environment*: the EEDI3 batch knee is at 2 with RADV's
   transfer queue and at 3 without it, and a sweep run in the wrong env answers the
   wrong question.
-- **Check `CMAKE_HOME_DIRECTORY` in a second build tree before trusting an A/B against
-  it**: a copied/worktree `CMakeCache.txt` can still point at the main checkout, so
-  `tools/install.sh` silently rebuilds the main tree and both arms are the same binary.
+- **Check `CMAKE_HOME_DIRECTORY` before trusting an A/B against a second build
+  tree**: a copied `CMakeCache.txt` can point at the main checkout, so both arms
+  become the same binary.
 - **An isolated microbenchmark proposes; only an in-situ same-session A/B decides.**
 - **Prove the stage split with the ablation ladder, not theory**, and make each rung
   reproduce what the consumer reads (PROBE=2/5 leave `dmap` stale → cheaper vcheck →

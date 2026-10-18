@@ -470,3 +470,125 @@ def test_eedi3aa_is_pure_plugin_extension(clip_gray16):
     clip = clip_gray16
     v = vs.core.vsfeel.EEDI3(clip, field=3, vcheck=2, mdis=5, nrad=1)
     assert v.num_frames == 2 * clip.num_frames  # EEDI3 still doubles the rate
+
+
+# ---------------------------------------------------------------------------
+# f16 (half)
+# ---------------------------------------------------------------------------
+#
+# EEDI3AA's oracle is the two-call chain itself, and the half path reproduces
+# the chain bit-exactly: the vertical sub-pass outputs are rounded to half
+# where the chain's EEDI3 frames are, the horizontal sub-passes merge with the
+# chain's per-half-frame rounding (see the half_rne comment in
+# src/eedi3.comp), and the intermediate v is a native half plane. The f32
+# oracle tolerance therefore becomes an exact assertion at f16, and the half
+# mask/sclip forms are read natively.
+
+ORACLE_CASES_F16 = ORACLE_CASES_F32
+
+
+def _mask_h(clip):
+    """A GrayH right-half mask (the half counterpart of _mask(clip, 32))."""
+    return vs.core.resize.Point(_mask(clip, 32), format=vs.GRAYH)
+
+
+@pytest.mark.parametrize(
+    "sc", ["none", "alias", "distinct"], ids=["sclip0", "sclip-alias", "sclip-distinct"]
+)
+@pytest.mark.parametrize("mc", ["none", "gray8", "grayh"], ids=["mclip0", "mclip8", "mclip_h"])
+@pytest.mark.parametrize(
+    "kw", ORACLE_CASES_F16, ids=[f"case{i}" for i in range(len(ORACLE_CASES_F16))]
+)
+def test_eedi3aa_oracle_f16(clip_grayh, kw, mc, sc):
+    """f16 EEDI3AA == the two-call based_aa chain, bit-exactly."""
+    clip = clip_grayh
+    mclip = None
+    if mc == "gray8":
+        mclip = _mask(clip, 8)
+    elif mc == "grayh":
+        mclip = _mask_h(clip)
+    sclip = {"none": None, "alias": _interleave2(clip), "distinct": _interleave_distinct(clip)}[sc]
+    _assert_oracle(clip, np.float16, [0, 11, clip.num_frames - 1], mclip=mclip, sclip=sclip, **kw)
+
+
+def test_eedi3aa_f16_mclip_half_native(clip_grayh):
+    """A GrayH mclip is read natively: the fused half chain with the half mask
+    must equal the same chain with the mask pushed through the reference
+    SetFrameProps(_Range=1) -> Point -> Gray8 conversion, bit for bit."""
+    clip = clip_grayh
+    kw = dict(field=3, vcheck=2, mdis=5, nrad=1)
+    mh = _mask_h(clip)
+    mconv = vs.core.resize.Point(vs.core.std.SetFrameProps(mh, _Range=1), format=vs.GRAY8)
+    a = _aa(clip, mclip=mh, sclip=_interleave2(clip), **kw)
+    b = _aa(clip, mclip=mconv, sclip=_interleave2(clip), **kw)
+    for n in (0, 11):
+        fa = _plane(a.get_frame(n), 0, dtype=np.float16)
+        fb = _plane(b.get_frame(n), 0, dtype=np.float16)
+        assert np.array_equal(fa, fb), f"native half mask != reference conversion at frame {n}"
+
+
+def test_eedi3aa_f16_yuv_all_planes():
+    """Every plane of a YUV420PH clip, subsampled half chroma included."""
+    core = vs.core
+    src = core.bs.VideoSource(CLIP_PATH)
+    clip = core.resize.Point(
+        core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True), format=vs.YUV420PH
+    )
+    sclip = _interleave2(clip)
+    mclip = core.resize.Point(_mask(clip, 32), format=vs.GRAYH)
+    mine = _aa(clip, sclip=sclip, mclip=mclip, vcheck=2, mdis=5, nrad=1)
+    ref = _oracle(clip, sclip=sclip, mclip=mclip, vcheck=2, mdis=5, nrad=1)
+    for n in (0, 5, 23):
+        fm, fr = mine.get_frame(n), ref.get_frame(n)
+        for p in range(3):
+            a = _plane(fm, p, dtype=np.float16)
+            b = _plane(fr, p, dtype=np.float16)
+            assert np.array_equal(a, b), f"plane {p} frame {n} differs"
+
+
+def test_eedi3aa_f16_deterministic(clip_grayh):
+    clip = clip_grayh
+    kw = dict(sclip=_interleave2(clip), mclip=_mask_h(clip), vcheck=2, mdis=5, nrad=1)
+    a = _aa(clip, **kw)
+    b = _aa(clip, **kw)
+    for n in (0, 11, 23):
+        fa = _plane(a.get_frame(n), 0, dtype=np.float16)
+        fb = _plane(b.get_frame(n), 0, dtype=np.float16)
+        assert np.array_equal(fa, fb), f"nondeterministic output at frame {n}"
+
+
+def test_eedi3aa_f16_parallel_load_consistent(clip_grayh):
+    """Two parallel runs must match the serial path and each other exactly."""
+    clip = clip_grayh
+    kw = dict(sclip=_interleave2(clip), mclip=_mask_h(clip), vcheck=2, mdis=5, nrad=1)
+    a = eval_parallel(_aa, clip, dtype=np.float16, **kw)
+    b = eval_parallel(_aa, clip, dtype=np.float16, **kw)
+    ref = _aa(clip, **kw)
+    for n in range(clip.num_frames):
+        r = _plane(ref.get_frame(n), 0, dtype=np.float16)
+        assert np.array_equal(a[n], r), f"parallel 1/serial mismatch at frame {n}"
+        assert np.array_equal(b[n], r), f"parallel 2/serial mismatch at frame {n}"
+        assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
+
+
+@pytest.mark.parametrize("fb", [0, 1, 2], ids=["prog", "tff", "bff"])
+def test_eedi3aa_f16_field_based_input(clip_grayh, fb):
+    """The vertical pass honours _FieldBased on a half clip too."""
+    clip = vs.core.std.SetFrameProps(clip_grayh, _FieldBased=fb)
+    _assert_oracle(
+        clip,
+        np.float16,
+        [0, 7, 23],
+        mclip=_mask_h(clip_grayh),
+        sclip=_interleave2(clip_grayh),
+        vcheck=2,
+        mdis=5,
+        nrad=1,
+    )
+
+
+def test_eedi3aa_f16_preserves_frame_props(clip_grayh):
+    """field=3 keeps every other tag on a half clip."""
+    assert_preserves_frame_props(
+        _aa, clip_grayh, field=3, duration_factor=2, sclip=_interleave2(clip_grayh)
+    )

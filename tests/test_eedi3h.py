@@ -481,3 +481,80 @@ def test_eedi3h_sclip_dh_requires_doubled_width(clip_gray16):
     out = _runh(clip, sclip=wide, **base)  # 2x width: accepted
     assert (out.width, out.height) == (2 * WIDTH, HEIGHT)
     out.get_frame(0)
+
+
+# ---------------------------------------------------------------------------
+# f16 (half)
+# ---------------------------------------------------------------------------
+#
+# EEDI3H's composition oracle holds at any depth (the transposes only permute
+# values), and the half path is the f32 path rounded once, so the half-specific
+# property to pin is the same one test_eedi3.py pins: the f16 result is the
+# widened-f32 result rounded to half, bit for bit.
+
+
+def _widen_half(clip):
+    return vs.core.resize.Point(clip, format=vs.GRAYS)
+
+
+@pytest.mark.parametrize(
+    "kw", ORACLE_CASES_F32, ids=[f"case{i}" for i in range(len(ORACLE_CASES_F32))]
+)
+def test_eedi3h_transpose_oracle_f16(clip_grayh, kw):
+    """f16 EEDI3H == Transpose(EEDI3(Transpose)) bit-exactly."""
+    field = kw.get("field", 1)
+    out_w = _dh_out_w(kw)
+    frames = [0, 11] if field <= 1 else [0, 5, 2 * clip_grayh.num_frames - 1]
+    _assert_oracle_exact(clip_grayh, np.float16, out_w, HEIGHT, frames, **kw)
+
+
+def test_eedi3h_f16_is_f32_rounded(clip_grayh):
+    """The half output is the widened f32 output rounded to half, bit for bit,
+    over the f32 oracle cases plus the hslp/dh corners."""
+    for kw in ORACLE_CASES_F32:
+        field = kw.get("field", 1)
+        frames = (0, 11) if field <= 1 else (0, 5, 2 * clip_grayh.num_frames - 1)
+        a = _runh(clip_grayh, **kw)
+        b = _runh(_widen_half(clip_grayh), **kw)
+        for n in frames:
+            fa = _plane(a.get_frame(n), 0, dtype=np.float16)
+            fb = _plane(b.get_frame(n), 0, dtype=np.float32).astype(np.float16)
+            assert np.array_equal(fa, fb), f"f16 != f32 rounded for {kw} frame {n}"
+
+
+def test_eedi3h_transpose_oracle_f16_mclip_sclip(clip_grayh):
+    """mclip + sclip in half flow through the composition transposed (exact)."""
+    clip = clip_grayh
+    kw = dict(field=1, mdis=20, nrad=2, vcheck=2)
+    m = vs.core.resize.Point(right_half_mask(WIDTH, HEIGHT, clip.num_frames, 8), format=vs.GRAYH)
+    s = clip
+    _assert_oracle_exact(clip, np.float16, WIDTH, HEIGHT, [0, 11], mclip=m, sclip=s, **kw)
+
+
+def test_eedi3h_f16_determinism(clip_grayh):
+    kw = dict(field=1, mdis=5, nrad=1, vcheck=2)
+    a = _plane(_runh(clip_grayh, **kw).get_frame(3), 0, dtype=np.float16)
+    b = _plane(_runh(clip_grayh, **kw).get_frame(3), 0, dtype=np.float16)
+    assert np.array_equal(a, b)
+
+
+def test_eedi3h_f16_yuv_planes():
+    """YUV420PH: unprocessed chroma passes through bit-identically."""
+    core = vs.core
+    src = core.bs.VideoSource(CLIP_PATH)
+    half = core.resize.Point(
+        core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True), format=vs.YUV420PH
+    )
+    ref = core.std.ShufflePlanes(half, 0, vs.GRAY)
+    kw = dict(field=1, mdis=5, nrad=1, vcheck=0, planes=[0])
+    my = _runh(half, **kw)
+    oracle = _runh(ref, **kw)
+    for n in (0, 5):
+        a = _plane(my.get_frame(n), 0, dtype=np.float16)
+        b = _plane(oracle.get_frame(n), 0, dtype=np.float16)
+        assert np.array_equal(a, b), f"luma differs at frame {n}"
+        s = half.get_frame(n)
+        for plane in (1, 2):
+            ca = _plane(my.get_frame(n), plane, dtype=np.float16)
+            cb = _plane(s, plane, dtype=np.float16)
+            assert np.array_equal(ca, cb), f"chroma{plane} changed at frame {n}"

@@ -48,6 +48,11 @@ FILTERS = [
     "EEDI3",
     "EEDI3H",
     "EEDI3AA",
+    "EEDI3_f16",
+    "EEDI3H_f16",
+    "EEDI3AA_f16",
+    "EEDI3_f16_mask",
+    "EEDI3H_f16_mask",
     "NNEDI3",
     "NNEDI3_f16",
     "NNEDI3_f16_storage",
@@ -161,6 +166,32 @@ _SCRIPT = textwrap.dedent(f"""\
         node = core.vsfeel.EEDI3H(g16, field=1)
     elif name == "EEDI3AA":
         node = core.vsfeel.EEDI3AA(g16, field=3)
+    elif name == "EEDI3_f16":
+        # The half io set: native float16_t pad/transposed copies plus f32
+        # arithmetic buffers and an OpFConvert store, without the Float16
+        # capability (the sample is only ever a storage type here).
+        node = core.vsfeel.EEDI3(gh, field=1)
+    elif name == "EEDI3H_f16":
+        # The same half pair on the horizontal kernels (xpose/compose), which
+        # is a different set of modules from the vertical ones.
+        node = core.vsfeel.EEDI3H(gh, field=1)
+    elif name == "EEDI3AA_f16":
+        # The fused chain's four sub-passes on half planes, including the
+        # assemblev merge and the compose fuse.
+        node = core.vsfeel.EEDI3AA(gh, field=3)
+    elif name == "EEDI3_f16_mask":
+        # A native GrayH mclip: the half maskpack/maskdilate modules read a
+        # float16_t predicate directly (no conversion node).
+        msk = core.resize.Point(core.std.BlankClip(
+            format=vs.GRAY8, width=gh.width, height=gh.height,
+            length=gh.num_frames), format=vs.GRAYH)
+        node = core.vsfeel.EEDI3(gh, field=1, mclip=msk)
+    elif name == "EEDI3H_f16_mask":
+        # The horizontal half mask pair (maskpack + maskdilate_tr).
+        msk = core.resize.Point(core.std.BlankClip(
+            format=vs.GRAY8, width=gh.width, height=gh.height,
+            length=gh.num_frames), format=vs.GRAYH)
+        node = core.vsfeel.EEDI3H(gh, field=1, mclip=msk)
     elif name == "NNEDI3":
         node = core.vsfeel.NNEDI3(g16, field=1)
     elif name == "NNEDI3_f16":

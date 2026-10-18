@@ -22,11 +22,14 @@
  *     previous interp row is carried in a shared ping-pong buffer quantized to
  *     the io type, exactly like eedi3vk2's vcheck kernel.
  *
- * The host uploads eedi3m's exact padded plane (copyPad) in the NATIVE io
- * type (u16 stays u16, f32 stays f32): u16 values are exact integers < 2^24,
+ * The pad carries the NATIVE io type (u16 stays u16, f16 a native half, f32
+ * stays f32): u16 values are exact integers < 2^24 and a half widens exactly,
  * so float arithmetic on them reproduces the integer cost/interp math
  * bit-exactly (u16 io is only (re)quantized at stores and for vcheck's pixel
  * reads, where eedi3m does the same). f32 io passes through the pad unchanged.
+ * f16 keeps dst/cint/vout and the half-pel rows in f32 so the arithmetic is
+ * bit-identical to the f32 path and only the io store rounds; its pad,
+ * transposed copies and EEDI3AA intermediate planes stay native half.
  *
  * ENTRY_ROW runs the DP in per-lane REGISTERS with subgroup shuffles (see the
  * comment at the kernel): one 32-lane workgroup per interpolated row, each
@@ -37,17 +40,17 @@
  * Buffers (one subrange per plane per binding; the base element offsets of
  * each plane region are push constants because each binding's descriptor
  * range spans the whole buffer):
- *   b0 pad    float, padded plane (padStride x padHeight), MARGIN offsets
- *   b1 dst    io type, rows x WIDTH (tight) interpolated rows
+ *   b0 pad    PAD_T, padded plane (padStride x padHeight), MARGIN offsets
+ *   b1 dst    SCRATCH_T, rows x WIDTH (tight) interpolated rows
  *   b2 pbt    int8, rows x WIDTH x TPITCH RELATIVE predecessor delta per
  *             (col,u) (idx - u; backtracking accumulates)
  *   b3 dmap   int8, rows x WIDTH direction per pixel (only VCHECK > 0)
  *   b4 bmask  uint8, rows x WIDTH dilated mclip mask (optional)
- *   b5 sclip  io type, rows x WIDTH (only VCHECK > 0 && HAS_SCLIP)
- *   b6 cint   io type, rows x WIDTH vertical cubic per pixel (only when
+ *   b5 sclip  IO_TYPE, rows x WIDTH (only VCHECK > 0 && HAS_SCLIP)
+ *   b6 cint   SCRATCH_T, rows x WIDTH vertical cubic per pixel (only when
  *             VCHECK > 0 && !HAS_SCLIP)
- *   b7 vout   io type, rows x WIDTH vcheck output rows
- *   b8 hp     io type, padHeight x WIDTH half-pel rows (only HPF > 1)
+ *   b7 vout   SCRATCH_T, rows x WIDTH vcheck output rows
+ *   b8 hp     HP_T, padHeight x WIDTH half-pel rows (only HPF > 1)
  *
  * ENTRY_HPFILL grid (rows + 3): one workgroup per written pad row (hp only).
  * ENTRY_ROW grid (1, rows): one workgroup per interpolated row.
@@ -70,12 +73,82 @@
 #define IO_U16 1
 #endif
 
+// Element types. u16 and f32 use one type for every buffer; f16 (a 2-byte
+// transport like u16, but a float sample) keeps every arithmetic buffer in
+// float so the work is bit-identical to the f32 path and only the final io
+// store rounds. Its pad, transposed copies and EEDI3AA intermediate planes
+// stay native half, which is where the bytes are.
 #if defined(IO_U16)
 #define IO_TYPE uint16_t
+#define PAD_T uint16_t
+#define SCRATCH_T uint16_t
+#define HP_T uint16_t
+#define RT_T uint16_t
+#define O0_T uint16_t
 #define PEAK 65535.0f
+#elif defined(IO_F16)
+#define IO_TYPE float16_t
+#define PAD_T float16_t
+#define SCRATCH_T float
+#define HP_T float
+#define RT_T float16_t
+#define O0_T float16_t
+#define PEAK 1.0f
 #else
 #define IO_TYPE float
+#define PAD_T float
+#define SCRATCH_T float
+#define HP_T float
+#define RT_T float
+#define O0_T float
 #define PEAK 1.0f
+#endif
+
+#if defined(IO_F16)
+// The exact f32 value of x rounded to IEEE half (round to nearest even).
+// EEDI3AA's merge combines values the two-call chain read back from half
+// frames, but the compiler folds a float16_t round trip away when the narrowed
+// value only feeds f32 arithmetic, so the narrowing is spelled out here.
+float half_rne(float x) {
+    const uint b = floatBitsToUint(x);
+    const uint sign = b & 0x80000000u;
+    const uint absx = b & 0x7fffffffu;
+    if (absx >= 0x7f800000u) {
+        return x;  // inf/nan
+    }
+    uint h, f32bits;
+    if (absx >= 0x477ff000u) {
+        f32bits = 0x7f800000u;  // overflows to half inf
+    } else if (absx < 0x38800000u) {
+        if (absx < 0x33000001u) {
+            f32bits = 0u;  // rounds to zero
+        } else {
+            const int shift = 125 - int(absx >> 23);
+            const uint mant = (absx & 0x7fffffu) | 0x800000u;
+            h = mant >> uint(shift + 1);
+            const uint rem = mant & ((2u << uint(shift)) - 1u);
+            const uint halfway = 1u << uint(shift);
+            if (rem > halfway || (rem == halfway && (h & 1u) != 0u)) h++;
+            if (h >= 0x7c00u) {
+                f32bits = 0x7f800000u;
+            } else if (h >= 0x400u) {
+                f32bits = (((h >> 10) + 112u) << 23) | ((h & 0x3ffu) << 13);
+            } else {
+                f32bits = floatBitsToUint(float(h) * 5.9604644775390625e-08);
+            }
+        }
+    } else {
+        h = ((absx >> 13) & 0x3ffu) | ((((absx >> 23) - 112u) & 0x1fu) << 10);
+        const uint rem = absx & 0x1fffu;
+        if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h++;
+        if (h >= 0x7c00u) {
+            f32bits = 0x7f800000u;
+        } else {
+            f32bits = (((h >> 10) + 112u) << 23) | ((h & 0x3ffu) << 13);
+        }
+    }
+    return uintBitsToFloat(sign | f32bits);
+}
 #endif
 
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
@@ -215,20 +288,8 @@ uint flat_index(uint local_x) {
 // (`rows` rows of WIDTH elements, binding 1): R'[k][y] = src[y][first+step*k].
 // Each 16x16 tile goes through LDS so both the global load and the global store
 // stay coalesced; the interior of the pad kernel's own layout is unchanged.
-layout(std430, binding = 0) readonly buffer XposeSrc {
-#if defined(IO_U16)
-    uint16_t xsrc[];
-#else
-    float xsrc[];
-#endif
-};
-layout(std430, binding = 1) writeonly buffer XposeDst {
-#if defined(IO_U16)
-    uint16_t xdst[];
-#else
-    float xdst[];
-#endif
-};
+layout(std430, binding = 0) readonly buffer XposeSrc { IO_TYPE xsrc[]; };
+layout(std430, binding = 1) writeonly buffer XposeDst { RT_T xdst[]; };
 #elif defined(ENTRY_COMPOSE)
 // Horizontal output assembly: reassemble the frame-order output plane (written
 // through binding 2, an output frame plane with `dst_stride`) from the
@@ -236,87 +297,41 @@ layout(std430, binding = 1) writeonly buffer XposeDst {
 // vout, or the row kernel's dst when there is no vcheck; VCHECK_MODE selects).
 // In the EEDI3AA fused path (comp_fuse) binding 3 is the device-local home of
 // the first sub-pass's O_0 plane that the second sub-pass merges against.
-layout(std430, binding = 0) readonly buffer CompRt {
-#if defined(IO_U16)
-    uint16_t crt[];
-#else
-    float crt[];
-#endif
-};
-layout(std430, binding = 1) readonly buffer CompIn {
-#if defined(IO_U16)
-    uint16_t cout[];
-#else
-    float cout[];
-#endif
-};
-layout(std430, binding = 2) writeonly buffer CompOut {
-#if defined(IO_U16)
-    uint16_t cout2[];
-#else
-    float cout2[];
-#endif
-};
-layout(std430, binding = 3) buffer CompO0 {
-#if defined(IO_U16)
-    uint16_t cdst[];
-#else
-    float cdst[];
-#endif
-};
+layout(std430, binding = 0) readonly buffer CompRt { RT_T crt[]; };
+layout(std430, binding = 1) readonly buffer CompIn { SCRATCH_T cout[]; };
+layout(std430, binding = 2) writeonly buffer CompOut { IO_TYPE cout2[]; };
+layout(std430, binding = 3) buffer CompO0 { O0_T cdst[]; };
 #elif defined(ENTRY_ASSEMBLEV)
 // EEDI3AA vertical merge: v[y] = (src[y] + vout_{y&1}[y>>1] + 1) >> 1 for u16
 // (f32 averages 0.5*a + 0.5*b, which is std.Merge bitwise). The source row is
 // read from the input frame plane directly (binding 0, pitch `src_stride`);
 // binding 1/2 are the two sub-passes' vout rows and binding 3 the merged frame.
 layout(std430, binding = 0) readonly buffer AsmSrc { IO_TYPE asm_src[]; };
-layout(std430, binding = 1) readonly buffer AsmVout { IO_TYPE asm_vout[]; };
-layout(std430, binding = 2) readonly buffer AsmVout2 { IO_TYPE asm_vout2[]; };
+layout(std430, binding = 1) readonly buffer AsmVout { SCRATCH_T asm_vout[]; };
+layout(std430, binding = 2) readonly buffer AsmVout2 { SCRATCH_T asm_vout2[]; };
 layout(std430, binding = 3) writeonly buffer AsmOut { IO_TYPE asm_out[]; };
 #elif defined(ENTRY_HPFILL)
 // Half-pel precompute (hp only): binding 0 is the built pad (read like
 // ENTRY_PAD's output, `pad_stride` per row), binding 8 the half-pel rows the
 // row kernel reads (WIDTH elements per pad row, native io type).
-layout(std430, binding = 0) readonly buffer HpPad {
-#if defined(IO_U16)
-    uint16_t hppad[];
-#else
-    float hppad[];
-#endif
-};
-layout(std430, binding = 8) writeonly buffer HpOut {
-#if defined(IO_U16)
-    uint16_t hpout[];
-#else
-    float hpout[];
-#endif
-};
+layout(std430, binding = 0) readonly buffer HpPad { PAD_T hppad[]; };
+layout(std430, binding = 8) writeonly buffer HpOut { HP_T hpout[]; };
 #elif defined(ENTRY_PAD)
 // ENTRY_PAD expands the mirror margins into the built pad (binding 1). Its
 // source (binding 0) is either the input frame plane read in frame order with
 // `src_stride` (vertical) or the packed R' ENTRY_XPOSE produced (horizontal);
 // PAD_SRC_PITCHED selects, so the mirror logic itself never changes.
-layout(std430, binding = 0) readonly buffer PadSrc {
-#if defined(IO_U16)
-    uint16_t pdsrc[];
-#else
-    float pdsrc[];
-#endif
-};
-layout(std430, binding = 1) writeonly buffer PadOutBuf {
-#if defined(IO_U16)
-    uint16_t padOut[];
-#else
-    float padOut[];
-#endif
-};
+layout(std430, binding = 0) readonly buffer PadSrc { PAD_T pdsrc[]; };
+layout(std430, binding = 1) writeonly buffer PadOutBuf { PAD_T padOut[]; };
 #elif defined(ENTRY_MASKPACK)
 // Horizontal mask preparation: transpose the mask plane's predicate bits.
 // binding 0 is the mask plane in frame order (element type per MASK_BITS, row
 // pitch `src_stride`); binding 1 is the packed transposed bit matrix (one u32
 // per 32 source rows per output row). ENTRY_MASKDILATE then dilates each row.
 layout(std430, binding = 0) readonly buffer MaskSrc {
-#if MASK_BITS == 8
+#if MASK_HALF
+    float16_t mskf[];
+#elif MASK_BITS == 8
     uint8_t msk8[];
 #elif MASK_BITS == 16
     uint16_t msk16[];
@@ -335,7 +350,9 @@ layout(std430, binding = 0) readonly buffer DilSrc {
 #if MASK_TRANS == 1
     uint dilsrc_bits[];
 #else
-#if MASK_BITS == 8
+#if MASK_HALF
+    float16_t dilsrcf[];
+#elif MASK_BITS == 8
     uint8_t dilsrc8[];
 #elif MASK_BITS == 16
     uint16_t dilsrc16[];
@@ -351,21 +368,15 @@ layout(std430, binding = 1) writeonly buffer DilOut { uint dilout[]; };
 // kernel's dst when there is no vcheck) or a kept source row (binding 1, the
 // input frame plane with `src_stride`). Writing kept rows here instead of
 // copying the source plane keeps the whole output in one dispatch.
-layout(std430, binding = 0) readonly buffer BlitIn { IO_TYPE blit_in[]; };
+layout(std430, binding = 0) readonly buffer BlitIn { SCRATCH_T blit_in[]; };
 layout(std430, binding = 1) readonly buffer BlitSrc { IO_TYPE blit_src[]; };
 layout(std430, binding = 2) writeonly buffer BlitOut { IO_TYPE blit_out[]; };
 #else
-layout(std430, binding = 0) readonly buffer PadBuf {
-#if defined(IO_U16)
-    // Native u16 pad (built by ENTRY_PAD from the source plane). Every value is
-    // < 2^16 so float() is exact and all downstream cost/interp math is
-    // bit-identical to the host-built float pad.
-    uint16_t pad[];
-#else
-    float pad[];
-#endif
-};
-layout(std430, binding = 1) buffer DstBuf { IO_TYPE dst[]; };
+// Native pad element (built by ENTRY_PAD from the source plane). u16 values are
+// < 2^16 and a half widens exactly, so all downstream cost/interp math is
+// bit-identical to the f32 pad.
+layout(std430, binding = 0) readonly buffer PadBuf { PAD_T pad[]; };
+layout(std430, binding = 1) buffer DstBuf { SCRATCH_T dst[]; };
 layout(std430, binding = 2) buffer PbtBuf { int8_t pbt[]; };
 layout(std430, binding = 3) buffer DmapBuf { int8_t dmap[]; };
 // Packed dilated mask row (one u32 per 32 columns), built by ENTRY_MASKDILATE.
@@ -374,10 +385,10 @@ layout(std430, binding = 4) readonly buffer BmaskBuf { uint bmask[]; };
 // `sclip_stride` (vertical) or the packed transposed B' (horizontal; HORIZ
 // selects, and the base is then r*WIDTH+x).
 layout(std430, binding = 5) readonly buffer SclipBuf { IO_TYPE sclip[]; };
-layout(std430, binding = 6) buffer CintBuf { IO_TYPE cint[]; };
-layout(std430, binding = 7) buffer VoutBuf { IO_TYPE vout[]; };
+layout(std430, binding = 6) buffer CintBuf { SCRATCH_T cint[]; };
+layout(std430, binding = 7) buffer VoutBuf { SCRATCH_T vout[]; };
 // Half-pel rows (hp only), built by ENTRY_HPFILL; WIDTH elements per pad row.
-layout(std430, binding = 8) readonly buffer HpBuf { IO_TYPE hp[]; };
+layout(std430, binding = 8) readonly buffer HpBuf { HP_T hp[]; };
 #endif
 
 layout(push_constant) uniform PC {
@@ -449,6 +460,9 @@ float pad_get(int dst_row, int col) {
     // Widen via int (int(uint16) already compiles under the 16-bit storage
     // extension; a direct float(uint16) would need int16 arithmetic); exact.
     return float(int(pad[pc.pad_base + (MARGIN_V + dst_row) * PAD_STRIDE + MARGIN_H + col]));
+#elif defined(IO_F16)
+    // half -> float is exact, so the f32 work sees the clip's own values.
+    return float(pad[pc.pad_base + (MARGIN_V + dst_row) * PAD_STRIDE + MARGIN_H + col]);
 #else
     return pad[pc.pad_base + (MARGIN_V + dst_row) * PAD_STRIDE + MARGIN_H + col];
 #endif
@@ -471,6 +485,8 @@ float load_sclip_val(int r, int x) {
         : (pc.sclip_base + (pc.field + 2 * r) * pc.sclip_stride + x);
 #if defined(IO_U16)
     return float(int(sclip[i]));
+#elif defined(IO_F16)
+    return float(sclip[i]);
 #else
     return sclip[i];
 #endif
@@ -2009,8 +2025,8 @@ void main() {
         const float a = float(int(hppad[in_base + i]));
         const float b = float(int(hppad[in_base + i + 1]));
 #else
-        const float a = hppad[in_base + i];
-        const float b = hppad[in_base + i + 1];
+        const float a = float(hppad[in_base + i]);
+        const float b = float(hppad[in_base + i + 1]);
 #endif
         float o;
         if (i == 0 || i == WIDTH - 2) {
@@ -2020,8 +2036,8 @@ void main() {
             const float l = float(int(hppad[in_base + i - 1]));
             const float r = float(int(hppad[in_base + i + 2]));
 #else
-            const float l = hppad[in_base + i - 1];
-            const float r = hppad[in_base + i + 2];
+            const float l = float(hppad[in_base + i - 1]);
+            const float r = float(hppad[in_base + i + 2]);
 #endif
             precise float t = 0.5625f * (a + b) - 0.0625f * (l + r);
             o = t;
@@ -2071,7 +2087,9 @@ void main() {
         uint bit = 0u;
         if (x < mask_w && y < WIDTH) {
             const int i = y * pc.src_stride + x;
-#if MASK_BITS == 8
+#if MASK_HALF
+            bit = (float(mskf[i]) > (0.5f / 255.0f)) ? 1u : 0u;
+#elif MASK_BITS == 8
             bit = (msk8[i] != 0) ? 1u : 0u;
 #elif MASK_BITS == 16
             bit = (int(msk16[i]) >= 129) ? 1u : 0u;
@@ -2126,7 +2144,9 @@ uint row_word(int r, int i) {
     for (int b = 0; b < 32; ++b) {
         const int x = i * 32 + b;
         if (x >= WIDTH) break;
-#if MASK_BITS == 8
+#if MASK_HALF
+        if (float(dilsrcf[base + b]) > (0.5f / 255.0f)) w |= (1u << b);
+#elif MASK_BITS == 8
         if (dilsrc8[base + b] != 0) w |= (1u << b);
 #elif MASK_BITS == 16
         if (int(dilsrc16[base + b]) >= 129) w |= (1u << b);
@@ -2200,15 +2220,18 @@ void main() {
         // A GLSL `if` on a specialization constant folds at pipeline creation;
         // `#if` would evaluate the identifier as 0 instead.
         if (VCHECK_MODE > 0) {
-            blit_out[y * pc.dst_stride + x] = blit_in[pc.vout_base + r * WIDTH + x];
+            blit_out[y * pc.dst_stride + x] =
+                IO_TYPE(blit_in[pc.vout_base + r * WIDTH + x]);
         } else {
-            blit_out[y * pc.dst_stride + x] = blit_in[pc.dst_base + r * WIDTH + x];
+            blit_out[y * pc.dst_stride + x] =
+                IO_TYPE(blit_in[pc.dst_base + r * WIDTH + x]);
         }
     } else {
         // Kept output row y holds source row y (dh=0, where the kept parity is
         // 1:1) or source row (y-off)/2 (dh=1, kept and interp rows interleave).
         const int sy = (pc.src_step == 1) ? ((y - off) >> 1) : y;
-        blit_out[y * pc.dst_stride + x] = blit_src[pc.raw_base + sy * pc.src_stride + x];
+        blit_out[y * pc.dst_stride + x] =
+            IO_TYPE(blit_src[pc.raw_base + sy * pc.src_stride + x]);
     }
 }
 
@@ -2249,7 +2272,7 @@ void main() {
         const int k = bx + ty;
         const int y = by + tx;
         if (k < pc.rows && y < WIDTH) {
-            xdst[pc.pad_base + k * WIDTH + y] = IO_TYPE(xposeTile[tx][ty]);
+            xdst[pc.pad_base + k * WIDTH + y] = RT_T(xposeTile[tx][ty]);
         }
     }
 }
@@ -2272,11 +2295,16 @@ layout(local_size_x = 16, local_size_y = 16) in;
 shared SHARED_T compV[16][17];
 shared SHARED_T compR[16][17];
 
-// std.Merge's default 50/50: u16 is (a+b+1)>>1 (== _mm256_avg_epu16), f32 is
-// 0.5f*a + 0.5f*b in the same association order the CPU merge used.
+// std.Merge's default 50/50. u16 is (a+b+1)>>1 (== _mm256_avg_epu16), f32 is
+// 0.5f*a + 0.5f*b in the same association order the CPU merge used. f16's
+// chain merges two *half* frames, so the new sub-pass's value is rounded to
+// half first and the reference's v1 + (v2 - v1) * 0.5 then rounds once more.
 SHARED_T merge_avg(const SHARED_T a, const SHARED_T b) {
 #if defined(IO_U16)
     return (a + b + 1u) >> 1;
+#elif defined(IO_F16)
+    const SHARED_T bh = SHARED_T(half_rne(b));
+    return half_rne(a + (bh - a) * 0.5f);
 #else
     return 0.5f * a + 0.5f * b;
 #endif
@@ -2294,9 +2322,12 @@ void main() {
         const int y = by + tx;
         SHARED_T vv = SHARED_T(0), vr = SHARED_T(0);
         if (k < pc.rows && y < WIDTH) {
+            // Without a vcheck the row kernel's dst is the interp value; it
+            // lives in the same scratch buffer, so read it through the
+            // arithmetic-typed binding (cdst is the io-typed O_0 plane).
             vv = (VCHECK_MODE > 0)
                 ? SHARED_T(cout[pc.vout_base + k * WIDTH + y])
-                : SHARED_T(cdst[pc.dst_base + k * WIDTH + y]);
+                : SHARED_T(cout[pc.dst_base + k * WIDTH + y]);
             vr = SHARED_T(crt[pc.pad_base + k * WIDTH + y]);
         }
         compV[ty][tx] = vv;
@@ -2316,8 +2347,8 @@ void main() {
                 // First AA horizontal sub-pass: park the assembled plane in the
                 // device-local binding so the second sub-pass can merge against
                 // it without a round trip.
-                cdst[pc.out_base + o0 + pc.field] = IO_TYPE(compV[tx][ty]);
-                cdst[pc.out_base + o0 + (1 - pc.field)] = IO_TYPE(compR[tx][ty]);
+                cdst[pc.out_base + o0 + pc.field] = O0_T(compV[tx][ty]);
+                cdst[pc.out_base + o0 + (1 - pc.field)] = O0_T(compR[tx][ty]);
             } else if (pc.comp_fuse == 2) {
                 // Second AA horizontal sub-pass: O_1 is assembled here and
                 // averaged 50/50 with O_0 (in cdst) exactly like std.Merge's
@@ -2363,6 +2394,16 @@ void main() {
 #if defined(IO_U16)
     asm_out[pc.out_base + int(idx)] =
         IO_TYPE((int(asm_src[i]) + int(asm_vout[j]) + 1) >> 1);
+#elif defined(IO_F16)
+    // The chain merges two *half* frames, so the sub-pass value is rounded to
+    // half before the reference's v1 + (v2 - v1) * 0.5. The row's other
+    // sub-pass is a kept row (the source), and which operand comes first
+    // follows the chain's Merge(V0, V1) order.
+    const float s = float(asm_src[i]);
+    const float v = half_rne(asm_vout[j]);
+    const float res =
+        (p == pc.field) ? v + (s - v) * 0.5f : s + (v - s) * 0.5f;
+    asm_out[pc.out_base + int(idx)] = IO_TYPE(half_rne(res));
 #else
     asm_out[pc.out_base + int(idx)] = 0.5f * asm_src[i] + 0.5f * asm_vout[j];
 #endif

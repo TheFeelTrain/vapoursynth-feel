@@ -263,34 +263,46 @@ struct Eedi3Data {
     VSNode * mclip_node {};
     const VSVideoInfo * vi {};
 
-    int bits {}, elem_bytes {};
-    bool process[MAX_PLANES] { true, true, true };
+    VSCore * core {};
+    VkDescriptorSetLayout set_layout {};
+    VkPipelineLayout pipeline_layout {};
+    VSGPUExecPool * pool {};
 
-    int field {}, nrad { 2 }, mdis { 20 }, vcheck { 2 };
-    bool dh {};
-    // hp: eedi3vk2's half-pel search (the DP walks half-pel directions, TPITCH
-    // doubles and the s0 cost comes from the hpfill precompute).
-    bool hp {};
-    bool horiz { false }; // run the whole pipeline on the transposed plane
-    bool aa { false };    // fused based_aa vertical-then-horizontal chain
-    std::array<Eedi3PlaneConfig, MAX_PLANES> aplanes {};
+    // shader blobs for this bit depth
+    const uint32_t * row_code {};
+    size_t row_size {};
+    const uint32_t * vcheck_code {};
+    size_t vcheck_size {};
+    const uint32_t * vcheck_lds_code {};
+    size_t vcheck_lds_size {};
+    const uint32_t * pad_code {};
+    size_t pad_size {};
+    const uint32_t * vcopy_code {};
+    size_t vcopy_size {};
+    const uint32_t * blit_code {};
+    size_t blit_size {};
+    const uint32_t * xpose_code {};
+    size_t xpose_size {};
+    const uint32_t * compose_code {};
+    size_t compose_size {};
+    const uint32_t * assemble_code {};
+    size_t assemble_size {};
+    const uint32_t * hpfill_code {};
+    size_t hpfill_size {};
 
-    // vcheck d2p source. Levels trade accuracy for work: 1 = the un-vchecked
-    // dst row, 2..6 = +an increasing number of Jacobi steps. The shipped
-    // default reproduces the serial walk exactly on the whole tested surface;
-    // VSFEEL_EEDI3_VPARA=0 restores the serial walk; VSFEEL_EEDI3_VCLDS=1
-    // selects the shared-memory ping-pong walk instead.
-    static constexpr int VCHECK_PARA_LEVELS = 6;
-    int vcheck_para { VCHECK_PARA_LEVELS };
+    VkDeviceSize scratch_bytes { 1 };
 
-    // Native mask handling: Gray16 integer and Gray32 float masks are read
-    // straight from the GPU plane (no conversion node); other depths keep the
-    // reference SetFrameProps(_Range=1) + resize.Point -> Gray8 path.
-    int mclip_bits { 8 };
-
-    float alpha { 0.2f }, beta { 0.25f }, gamma { 20.0f };
-    float vthresh2 { 4.0f };
-    float rw {}, rcp_vth0 {}, rcp_vth1 {}, rcp_vth2 {};
+    // VSFEEL_EEDI3_TIMING=1: per-frame host stage split. The prerequisite for
+    // any transfer/allocation change -- kernel time alone says nothing about
+    // whether the frame is GPU- or host-bound. Every stage is clocked after the
+    // previous blocking call so a wait never leaks into the next stage.
+    std::atomic<uint64_t> ht_acquire_ns {}, ht_alloc_ns {}, ht_record_ns {},
+        ht_submit_ns {}, ht_total_ns {}, ht_n {}, ht_fence_ns {};
+    // VSFEEL_EEDI3_GPUTIME=1: timestamp the phases of one submission at a time
+    // (the readback waits that submission out, so the probe serializes the
+    // pipeline by design -- never benchmark with it on).
+    VkQueryPool qt_pool {};
+    std::atomic<uint64_t> qt_n {};
 
     // one pipeline set per distinct plane geometry (like eedi3vk2); pipelines
     // for the same geometry are shared by all planes. HORIZ is a spec constant
@@ -306,54 +318,79 @@ struct Eedi3Data {
     };
 
     std::shared_ptr<GPUDevice> gpu;
-    VSCore * core {};
-    VkDescriptorSetLayout set_layout {};
-    VkPipelineLayout pipeline_layout {};
-    VSGPUExecPool * pool {};
-
-    // shader blobs for this bit depth
-    const uint32_t * row_code {};
-    size_t row_size {};
-    const uint32_t * vcheck_code {};
-    size_t vcheck_size {};
-    const uint32_t * vcheck_lds_code {};
-    size_t vcheck_lds_size {};
-    std::array<const uint32_t *, VCHECK_PARA_LEVELS> vcheck_para_code {};
-    std::array<size_t, VCHECK_PARA_LEVELS> vcheck_para_size {};
-    const uint32_t * pad_code {};
-    size_t pad_size {};
-    const uint32_t * vcopy_code {};
-    size_t vcopy_size {};
-    const uint32_t * blit_code {};
-    size_t blit_size {};
-    const uint32_t * xpose_code {};
-    size_t xpose_size {};
-    const uint32_t * compose_code {};
-    size_t compose_size {};
-    const uint32_t * assemble_code {};
-    size_t assemble_size {};
-    const uint32_t * hpfill_code {};
-    size_t hpfill_size {};
-    // mask kernels, indexed by mask format (0 = 8 bit, 1 = 16, 2 = 32)
-    std::array<const uint32_t *, 3> maskpack_code {};
-    std::array<size_t, 3> maskpack_size {};
-    std::array<const uint32_t *, 3> maskdilate_raw_code {};
-    std::array<size_t, 3> maskdilate_raw_size {};
-    std::array<const uint32_t *, 3> maskdilate_tr_code {};
-    std::array<size_t, 3> maskdilate_tr_size {};
-    bool have_lds {};
-
-    VkDeviceSize scratch_bytes { 1 };
-    std::array<Eedi3PlaneConfig, MAX_PLANES> planes {};
     std::vector<std::pair<WidthKey, Eedi3Pipelines>> width_pipes {};
 
+    std::vector<std::pair<int, VSFrame *>>
+        cache; // computed frames awaiting a caller
+    std::vector<std::pair<int, int>> claims; // ranges being recorded
+    // Scratch reuse (VSFEEL_EEDI3_SCRATCH_REUSE=1): a per-instance free list
+    // of scratch buffers the exec pool hands back through gpuExecRetain when
+    // the submission using them retires. A steady-state graph then reuses one
+    // buffer per frame in flight instead of allocating and destroying the
+    // whole (100+ MiB) region set on every frame.
+    std::vector<GpuBuffer> scratch_free;
+
+    // mask kernels, indexed by mask format (0 = 8 bit, 1 = 16, 2 = 32, 3 = f16)
+    std::array<const uint32_t *, 4> maskpack_code {};
+    std::array<size_t, 4> maskpack_size {};
+    std::array<const uint32_t *, 4> maskdilate_raw_code {};
+    std::array<size_t, 4> maskdilate_raw_size {};
+    std::array<const uint32_t *, 4> maskdilate_tr_code {};
+    std::array<size_t, 4> maskdilate_tr_size {};
+
+    std::mutex cache_lock;
+    std::mutex qt_lock;
+    std::mutex scratch_lock;
+    // vcheck d2p source. Levels trade accuracy for work: 1 = the un-vchecked
+    // dst row, 2..6 = +an increasing number of Jacobi steps. The shipped
+    // default reproduces the serial walk exactly on the whole tested surface;
+    // VSFEEL_EEDI3_VPARA=0 restores the serial walk; VSFEEL_EEDI3_VCLDS=1
+    // selects the shared-memory ping-pong walk instead.
+    static constexpr int VCHECK_PARA_LEVELS = 6;
+    std::array<const uint32_t *, VCHECK_PARA_LEVELS> vcheck_para_code {};
+    std::array<size_t, VCHECK_PARA_LEVELS> vcheck_para_size {};
+    std::condition_variable cache_cv;
+    static constexpr int QT_STAMPS = 17;
+    std::atomic<uint64_t> qt_ns[QT_STAMPS] {};
+
+    std::array<Eedi3PlaneConfig, MAX_PLANES> aplanes {};
+    std::array<Eedi3PlaneConfig, MAX_PLANES> planes {};
+
+    int bits {}, elem_bytes {};
+    // Element size of the arithmetic scratch (dst/cint/vout) and of the
+    // half-pel rows: u16 keeps its native 2 bytes, f16/f32 use 4.
+    int scratch_elem {}, hp_elem {};
+    int field {}, nrad { 2 }, mdis { 20 }, vcheck { 2 };
+    int vcheck_para { VCHECK_PARA_LEVELS };
+    // Native mask handling: Gray16 integer and Gray32 float masks are read
+    // straight from the GPU plane (no conversion node); other depths keep the
+    // reference SetFrameProps(_Range=1) + resize.Point -> Gray8 path.
+    int mclip_bits { 8 };
+
+    float alpha { 0.2f }, beta { 0.25f }, gamma { 20.0f };
+    float vthresh2 { 4.0f };
+    float rw {}, rcp_vth0 {}, rcp_vth1 {}, rcp_vth2 {};
+
+    // Output-frame batching (see the batching section above).
+    int batch_size { 4 };
+    int max_out { -1 }; // last valid output frame index, -1 if unknown
+    int scratch_cap { 8 };
+
+    // f16: a 2-byte io element like u16, but the sample is a float. The pad,
+    // the transposed copies and EEDI3AA's intermediate planes stay native half
+    // (halving those bytes); dst/cint/vout stay float so the arithmetic is
+    // bit-identical to the f32 path and only the final io store rounds.
+    bool half {};
+    bool dh {};
+    // hp: eedi3vk2's half-pel search (the DP walks half-pel directions, TPITCH
+    // doubles and the s0 cost comes from the hpfill precompute).
+    bool hp {};
+    bool horiz { false }; // run the whole pipeline on the transposed plane
+    bool aa { false };    // fused based_aa vertical-then-horizontal chain
+    bool mclip_half { false };
+    bool have_lds {};
     // VSFEEL_EEDI3_TRACE only.
     bool trace { false };
-
-    // VSFEEL_EEDI3_TIMING=1: per-frame host stage split. The prerequisite for
-    // any transfer/allocation change -- kernel time alone says nothing about
-    // whether the frame is GPU- or host-bound. Every stage is clocked after the
-    // previous blocking call so a wait never leaks into the next stage.
     bool host_timing { false };
     // VSFEEL_EEDI3_SKIP diagnostics: omit a kernel from the recording so its
     // GPU cost can be read off an end-to-end A/B.
@@ -362,37 +399,9 @@ struct Eedi3Data {
     // VSFEEL_EEDI3_SYNC=1: wait the submission out and report its wall time. It
     // serializes the pipeline, so it measures one frame's GPU time alone.
     bool sync_wait { false };
-    std::atomic<uint64_t> ht_acquire_ns {}, ht_alloc_ns {}, ht_record_ns {},
-        ht_submit_ns {}, ht_total_ns {}, ht_n {}, ht_fence_ns {};
-
-    // Output-frame batching (see the batching section above).
-    int batch_size { 4 };
-    int max_out { -1 }; // last valid output frame index, -1 if unknown
-    std::mutex cache_lock;
-    std::condition_variable cache_cv;
-    std::vector<std::pair<int, VSFrame *>>
-        cache; // computed frames awaiting a caller
-    std::vector<std::pair<int, int>> claims; // ranges being recorded
-
-    // Scratch reuse (VSFEEL_EEDI3_SCRATCH_REUSE=1): a per-instance free list
-    // of scratch buffers the exec pool hands back through gpuExecRetain when
-    // the submission using them retires. A steady-state graph then reuses one
-    // buffer per frame in flight instead of allocating and destroying the
-    // whole (100+ MiB) region set on every frame.
-    // VSFEEL_EEDI3_GPUTIME=1: timestamp the phases of one submission at a time
-    // (the readback waits that submission out, so the probe serializes the
-    // pipeline by design -- never benchmark with it on).
     bool gpu_time { false };
-    VkQueryPool qt_pool {};
-    std::mutex qt_lock;
-    static constexpr int QT_STAMPS = 17;
-    std::atomic<uint64_t> qt_ns[QT_STAMPS] {};
-    std::atomic<uint64_t> qt_n {};
-
     bool scratch_reuse { false };
-    int scratch_cap { 8 };
-    std::mutex scratch_lock;
-    std::vector<GpuBuffer> scratch_free;
+    bool process[MAX_PLANES] { true, true, true };
 
     ~Eedi3Data();
 };
@@ -606,6 +615,10 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
 
     const int32_t elem = d.elem_bytes;
     const int32_t pad_elem = pad_elem_bytes(d.bits);
+    // The arithmetic scratch (dst/cint/vout) and the half-pel rows keep f32 for
+    // half input; only the pad/transposed copies/intermediate planes are half.
+    const int32_t scratch = d.scratch_elem;
+    const int32_t hp_elem = d.hp_elem;
     const int numPlanes = d.vi->format.numPlanes;
 
     for (int job = 0; job < njobs; ++job) {
@@ -754,18 +767,18 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
         auto row_pc = [&](const Eedi3PlaneConfig & cfg, const int plane) {
             Eedi3PushConstants pc {};
             pc.pad_base = static_cast<int32_t>(cfg.pad_off / pad_elem);
-            pc.hp_base = static_cast<int32_t>(cfg.hp_off / elem);
+            pc.hp_base = static_cast<int32_t>(cfg.hp_off / hp_elem);
             pc.dst_base = static_cast<int32_t>(
-                (second ? cfg.dst2_off : cfg.dst_off) / elem);
+                (second ? cfg.dst2_off : cfg.dst_off) / scratch);
             pc.pbt_base = static_cast<int32_t>(cfg.pbt_off);
             pc.dmap_base = static_cast<int32_t>(cfg.dmap_off);
             pc.bmask_base = static_cast<int32_t>(cfg.bits_off / 4);
             pc.sclip_base =
                 horiz ? static_cast<int32_t>(cfg.rtS_off / elem) : 0;
             pc.sclip_stride = horiz ? 0 : in.sclip_stride[plane];
-            pc.cint_base = static_cast<int32_t>(cfg.cint_off / elem);
+            pc.cint_base = static_cast<int32_t>(cfg.cint_off / scratch);
             pc.vout_base = static_cast<int32_t>(
-                (second ? cfg.vout2_off : cfg.vout_off) / elem);
+                (second ? cfg.vout2_off : cfg.vout_off) / scratch);
             pc.pad_stride = cfg.pad_stride;
             pc.pad_height = cfg.pad_height;
             pc.field = field;
@@ -799,7 +812,7 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                 pc.pad_stride = cfg.pad_stride;
                 pc.field = field;
                 pc.rows = cfg.rows;
-                pc.hp_base = static_cast<int32_t>(cfg.hp_off / elem);
+                pc.hp_base = static_cast<int32_t>(cfg.hp_off / hp_elem);
                 bind_pipe(d, cmd, cfg.pipes.hpfill);
                 // b0 is the pad, b8 the half-pel rows; the rest of the layout
                 // is unread by this kernel.
@@ -884,8 +897,8 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                 Eedi3PushConstants pc {};
                 pc.raw_base = in.src_base[plane];
                 pc.src_stride = in.src_stride[plane];
-                pc.vout_base = static_cast<int32_t>(cfg.vout_off / elem);
-                pc.vout2_base = static_cast<int32_t>(cfg.vout2_off / elem);
+                pc.vout_base = static_cast<int32_t>(cfg.vout_off / scratch);
+                pc.vout2_base = static_cast<int32_t>(cfg.vout2_off / scratch);
                 pc.out_base = static_cast<int32_t>(cfg.v_off / elem);
                 pc.field = first_field;
                 pc.rows = cfg.rows;
@@ -917,9 +930,9 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                 Eedi3PushConstants pc {};
                 pc.pad_base = static_cast<int32_t>(cfg.rt_off / elem);
                 pc.vout_base = static_cast<int32_t>(
-                    (second ? cfg.vout2_off : cfg.vout_off) / elem);
+                    (second ? cfg.vout2_off : cfg.vout_off) / scratch);
                 pc.dst_base = static_cast<int32_t>(
-                    (second ? cfg.dst2_off : cfg.dst_off) / elem);
+                    (second ? cfg.dst2_off : cfg.dst_off) / scratch);
                 pc.out_base =
                     pfuse ? static_cast<int32_t>(cfg.o0_off / elem) : 0;
                 pc.dst_stride = in.out_stride[plane];
@@ -943,8 +956,8 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
             }
             const auto & cfg = planes[plane];
             Eedi3PushConstants pc {};
-            pc.vout_base = static_cast<int32_t>(cfg.vout_off / elem);
-            pc.dst_base = static_cast<int32_t>(cfg.dst_off / elem);
+            pc.vout_base = static_cast<int32_t>(cfg.vout_off / scratch);
+            pc.dst_base = static_cast<int32_t>(cfg.dst_off / scratch);
             pc.raw_base = in.src_base[plane];
             pc.src_stride = in.src_stride[plane];
             pc.dst_stride = in.out_stride[plane];
@@ -1922,13 +1935,16 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
             std::pair { d->vi->format.bitsPerSample, d->vi->format.sampleType };
         !vsh::isConstantVideoFormat(d->vi) ||
         (sample == stInteger && bps != 16) ||
-        (sample == stFloat && bps != 32)) {
-        return set_error(
-            "input bitdepth must be u16 (16-bit integer) or f32 (32-bit float).");
+        (sample == stFloat && bps != 16 && bps != 32)) {
+        return set_error("input bitdepth must be u16 (16-bit integer), f16 or "
+                         "f32 (16/32-bit float).");
     }
 
     d->bits = d->vi->format.bitsPerSample;
+    d->half = d->vi->format.sampleType == stFloat && d->bits == 16;
     d->elem_bytes = d->bits / 8;
+    d->scratch_elem = d->half ? 4 : d->elem_bytes;
+    d->hp_elem = d->half ? 4 : d->elem_bytes;
 
     d->field =
         vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "field", 0, nullptr));
@@ -2087,6 +2103,11 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         } else if (mvi->format.bitsPerSample == 32 &&
                    mvi->format.sampleType == stFloat) {
             d->mclip_bits = 32;
+        } else if (mvi->format.bitsPerSample == 16 &&
+                   mvi->format.sampleType == stFloat) {
+            // A half mask is a float mask: the same nonzero predicate as f32.
+            d->mclip_bits = 16;
+            d->mclip_half = true;
         } else if (mvi->format.bitsPerSample != 8 ||
                    mvi->format.sampleType != stInteger) {
             VSMap * args = vsapi->createMap();
@@ -2321,8 +2342,9 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
             "subgroups, natively or via subgroup size control)");
     }
 
-    // Shader blobs for this io depth.
-    switch (d->bits) {
+    // Shader blobs for this io depth. f16 is 16 bits too, so the half set is
+    // selected by the sample type, not by `bits`.
+    switch (d->half ? 0 : d->bits) {
     case 16:
         d->row_code = eedi3_u16_row_spv;
         d->row_size = eedi3_u16_row_spv_size;
@@ -2389,25 +2411,63 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         d->hpfill_code = eedi3_f32_hpfill_spv;
         d->hpfill_size = eedi3_f32_hpfill_spv_size;
         break;
+    case 0: // half: stFloat + 16 bits
+        d->row_code = eedi3_f16_row_spv;
+        d->row_size = eedi3_f16_row_spv_size;
+        d->vcheck_code = eedi3_f16_vcheck_spv;
+        d->vcheck_size = eedi3_f16_vcheck_spv_size;
+        d->vcheck_lds_code = eedi3_f16_vcheck_lds_spv;
+        d->vcheck_lds_size = eedi3_f16_vcheck_lds_spv_size;
+        d->vcheck_para_code = {
+            eedi3_f16_vcheck_para_spv,    eedi3_f16_vcheck_para_j1_spv,
+            eedi3_f16_vcheck_para_j2_spv, eedi3_f16_vcheck_para_j3_spv,
+            eedi3_f16_vcheck_para_j4_spv, eedi3_f16_vcheck_para_j5_spv
+        };
+        d->vcheck_para_size = { eedi3_f16_vcheck_para_spv_size,
+                                eedi3_f16_vcheck_para_j1_spv_size,
+                                eedi3_f16_vcheck_para_j2_spv_size,
+                                eedi3_f16_vcheck_para_j3_spv_size,
+                                eedi3_f16_vcheck_para_j4_spv_size,
+                                eedi3_f16_vcheck_para_j5_spv_size };
+        d->pad_code = eedi3_f16_pad_spv;
+        d->pad_size = eedi3_f16_pad_spv_size;
+        d->vcopy_code = eedi3_f16_vcopy_spv;
+        d->vcopy_size = eedi3_f16_vcopy_spv_size;
+        d->blit_code = eedi3_f16_blit_spv;
+        d->blit_size = eedi3_f16_blit_spv_size;
+        d->xpose_code = eedi3_f16_xpose_spv;
+        d->xpose_size = eedi3_f16_xpose_spv_size;
+        d->compose_code = eedi3_f16_compose_spv;
+        d->compose_size = eedi3_f16_compose_spv_size;
+        d->assemble_code = eedi3_f16_assemblev_spv;
+        d->assemble_size = eedi3_f16_assemblev_spv_size;
+        d->hpfill_code = eedi3_f16_hpfill_spv;
+        d->hpfill_size = eedi3_f16_hpfill_spv_size;
+        break;
     default:
         return set_error("unsupported io type");
     }
     d->maskpack_code = { eedi3_maskpack_8_spv, eedi3_maskpack_16_spv,
-                         eedi3_maskpack_32_spv };
+                         eedi3_maskpack_32_spv, eedi3_maskpack_f16_spv };
     d->maskpack_size = { eedi3_maskpack_8_spv_size, eedi3_maskpack_16_spv_size,
-                         eedi3_maskpack_32_spv_size };
+                         eedi3_maskpack_32_spv_size,
+                         eedi3_maskpack_f16_spv_size };
     d->maskdilate_raw_code = { eedi3_maskdilate_8_raw_spv,
                                eedi3_maskdilate_16_raw_spv,
-                               eedi3_maskdilate_32_raw_spv };
+                               eedi3_maskdilate_32_raw_spv,
+                               eedi3_maskdilate_f16_raw_spv };
     d->maskdilate_raw_size = { eedi3_maskdilate_8_raw_spv_size,
                                eedi3_maskdilate_16_raw_spv_size,
-                               eedi3_maskdilate_32_raw_spv_size };
+                               eedi3_maskdilate_32_raw_spv_size,
+                               eedi3_maskdilate_f16_raw_spv_size };
     d->maskdilate_tr_code = { eedi3_maskdilate_8_tr_spv,
                               eedi3_maskdilate_16_tr_spv,
-                              eedi3_maskdilate_32_tr_spv };
+                              eedi3_maskdilate_32_tr_spv,
+                              eedi3_maskdilate_f16_tr_spv };
     d->maskdilate_tr_size = { eedi3_maskdilate_8_tr_spv_size,
                               eedi3_maskdilate_16_tr_spv_size,
-                              eedi3_maskdilate_32_tr_spv_size };
+                              eedi3_maskdilate_32_tr_spv_size,
+                              eedi3_maskdilate_f16_tr_spv_size };
     d->have_lds = d->vcheck > 0 && d->vcheck_lds_code &&
                   d->gpu->limits.maxComputeSharedMemorySize >=
                       2 * MAXW_LDS * sizeof(float);
@@ -2446,6 +2506,7 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     const int tpitch = 2 * d->mdis * (d->hp ? 2 : 1) + 1;
     const int pad_elem = pad_elem_bytes(d->bits);
     const int elem = d->elem_bytes;
+    const int scratch_elem = d->scratch_elem;
 
     // EEDI3AA's horizontal geometry (the transpose of the vertical one) is
     // computed up front so the shared regions can be sized for the larger.
@@ -2507,6 +2568,10 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     auto sz_io = [&](const Eedi3PlaneConfig & c) {
         return static_cast<VkDeviceSize>(c.rows) * c.width * elem;
     };
+    // dst/cint/vout: f32 for half input, native u16/f32 otherwise.
+    auto sz_scratch = [&](const Eedi3PlaneConfig & c) {
+        return static_cast<VkDeviceSize>(c.rows) * c.width * scratch_elem;
+    };
     auto sz_pbt = [&](const Eedi3PlaneConfig & c) {
         // Must match the shader's pbt layout: with two directions per lane
         // (tpitch 33..64) the deltas pack to a nibble each, one byte per lane
@@ -2522,9 +2587,10 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
                pad_elem;
     };
     auto sz_hp = [&](const Eedi3PlaneConfig & c) {
-        // One half-pel element per padded row and column (WIDTH per row), in
-        // the native io type like the reference's hp scratch.
-        return d->hp ? static_cast<VkDeviceSize>(c.width) * c.pad_height * elem
+        // One half-pel element per padded row and column (WIDTH per row). u16
+        // keeps the native type; f16/f32 keep float so hp stays exact.
+        return d->hp ? static_cast<VkDeviceSize>(c.width) * c.pad_height *
+                           d->hp_elem
                      : 0;
     };
     auto sz_bits = [&](const Eedi3PlaneConfig & c) {
@@ -2554,9 +2620,9 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         shared(sz_pad(V), sz_pad(H), V.pad_off, V.pad_bytes, H.pad_off,
                H.pad_bytes);
         shared(sz_hp(V), sz_hp(H), V.hp_off, V.hp_bytes, H.hp_off, H.hp_bytes);
-        shared(sz_io(V), sz_io(H), V.dst_off, V.dst_bytes, H.dst_off,
+        shared(sz_scratch(V), sz_scratch(H), V.dst_off, V.dst_bytes, H.dst_off,
                H.dst_bytes);
-        shared(d->aa ? sz_io(V) : 0, d->aa ? sz_io(H) : 0, V.dst2_off,
+        shared(d->aa ? sz_scratch(V) : 0, d->aa ? sz_scratch(H) : 0, V.dst2_off,
                V.dst2_bytes, H.dst2_off, H.dst2_bytes);
         shared(sz_pbt(V), sz_pbt(H), V.pbt_off, V.pbt_bytes, H.pbt_off,
                H.pbt_bytes);
@@ -2564,14 +2630,14 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         // needed even when vcheck == 0 (the interpolate reads it either way).
         shared(sz_io(V), sz_io(H), V.dmap_off, V.dmap_bytes, H.dmap_off,
                H.dmap_bytes);
-        shared((d->vcheck > 0 && !d->sclip_node) ? sz_io(V) : 0,
-               (d->vcheck > 0 && !d->sclip_node) ? sz_io(H) : 0, V.cint_off,
-               V.cint_bytes, H.cint_off, H.cint_bytes);
-        shared((d->vcheck > 0 || d->aa) ? sz_io(V) : 0,
-               (d->vcheck > 0 || d->aa) ? sz_io(H) : 0, V.vout_off,
+        shared((d->vcheck > 0 && !d->sclip_node) ? sz_scratch(V) : 0,
+               (d->vcheck > 0 && !d->sclip_node) ? sz_scratch(H) : 0,
+               V.cint_off, V.cint_bytes, H.cint_off, H.cint_bytes);
+        shared((d->vcheck > 0 || d->aa) ? sz_scratch(V) : 0,
+               (d->vcheck > 0 || d->aa) ? sz_scratch(H) : 0, V.vout_off,
                V.vout_bytes, H.vout_off, H.vout_bytes);
-        shared(d->aa ? sz_io(V) : 0, d->aa ? sz_io(H) : 0, V.vout2_off,
-               V.vout2_bytes, H.vout2_off, H.vout2_bytes);
+        shared(d->aa ? sz_scratch(V) : 0, d->aa ? sz_scratch(H) : 0,
+               V.vout2_off, V.vout2_bytes, H.vout2_off, H.vout2_bytes);
         shared(static_cast<VkDeviceSize>(V.rows),
                static_cast<VkDeviceSize>(H.rows), V.rempty_off, V.rempty_bytes,
                H.rempty_off, H.rempty_bytes);
@@ -2696,7 +2762,12 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     // Pipelines, one set per distinct geometry.
     const bool mclip_on = d->mclip_node != nullptr;
     const bool sclip_on = d->vcheck > 0 && d->sclip_node != nullptr;
-    const int fmt = (d->mclip_bits == 16) ? 1 : (d->mclip_bits == 32 ? 2 : 0);
+    // Mask kernel index: 0 = 8-bit, 1 = 16-bit integer, 2 = f32, 3 = f16. A
+    // half mask is 16 bits like u16 but selects the half blob.
+    const int fmt =
+        d->mclip_half
+            ? 3
+            : ((d->mclip_bits == 16) ? 1 : (d->mclip_bits == 32 ? 2 : 0));
     const bool para_ok = d->vcheck > 0 && d->vcheck_para >= 1 &&
                          d->vcheck_para <= Eedi3Data::VCHECK_PARA_LEVELS &&
                          d->vcheck_para_code[d->vcheck_para - 1] != nullptr;

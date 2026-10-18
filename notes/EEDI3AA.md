@@ -5,21 +5,25 @@ Status: **shipped** — `core.vsfeel.EEDI3AA` (`Eedi3AaCreate`, `src/eedi3.cpp`)
 `Merge(H(Merge(V(x))))` in **one plugin call, one submit**, both 50/50 merges
 folded into the kernels. Runs on the R80 GPU API (`vnode:gpu` in/out, one exec
 pool) and batches output frames per submission like `EEDI3` (see
-`notes/EEDI3.md`); `field`, `mdis`, `nrad` and `vcheck` are unchanged. Bit-exact vs the two-call chain for u16, a few ulp for
+`notes/EEDI3.md`); `field`, `mdis`, `nrad` and `vcheck` are unchanged. Bit-exact vs the two-call chain for u16 and f16, a few ulp for
 f32. Specialised `dh=false`, `field>1`, single-rate. The `vsfeel/vsaa.py`
 wrapper, the `eedi3aa` benchmark entry (1000 f, ns=8) and `tests/test_eedi3aa.py`
 ship.
 
 Scoreboard — real based_aa clip (jpbd 2x Point → 3840x2160, 1000 f,
-`tools/benchmark.py --filter eedi3aa --gpu-cache --no-download --format <u16|f32>`,
+`tools/benchmark.py --filter eedi3aa --gpu-cache --no-download --format <u16|f16|f32>`,
 medians of 3):
 
 | bit depth | vsfeel | vszipcl chain | eedi3vk2 chain |
 |---|---|---|---|
-| u16 | 174 | 26 | 37 |
-| f32 | 128 | 24 | 32 |
+| u16 | 176 | 26 | 37 |
+| f16 | 161 | - | - |
+| f32 | 125 | 24 | 32 |
 
-- **4.7x the faster reference chain on u16, 4.0x on f32.**
+- **4.7x the faster reference chain on u16, 4.0x on f32, +28% over f32 on f16.**
+  f16 keeps the intermediate `v`/O_0 half (the chain's frames are half) and the
+  rest f32; the merge's narrowing is spelled out (see `notes/EEDI3.md`'s f16
+  section), which is what makes the half chain bit-exact.
 - Same-session A/Bs, still valid as relative results: the R80 port's
   interleaved pair (+4%) and the fused call against the two-call chain
   (1.01–1.07x, 6x600 f order-reversed). The absolute fps they were recorded
@@ -164,18 +168,21 @@ filter runs.
 
 ### Tests
 
-`tests/test_eedi3aa.py` — **133 tests**: u16 exact oracle over field 2/3, mdis
+`tests/test_eedi3aa.py` — **u16 exact oracle** over field 2/3, mdis
 3/20/40, nrad 0..3, vcheck 0..3, alpha/beta/gamma corners, Gray8/16/32 mclip
 present/absent, aliased and distinct sclip; the same for f32 under a 1e-6 bound
-(measured max 5.96e-8); `_FieldBased` progressive/TFF/BFF input; YUV420 all
-planes, `planes=[0]` (chroma passthrough) and `planes=[1]` (chroma-only must take
-the fused merge vs the chain); odd processed-plane width and odd subsampled
-chroma width rejected; determinism, multi-stream and parallel load; props
-(N frames, input fps, `_FieldBased` progressive) vs the chain; input validation.
+(measured max 5.96e-8) and for **f16, where the chain oracle is exact** over the
+f32 case list with Gray8/GrayH/none mclip and the three sclip forms (the fused
+half chain reproduces the chain's per-frame half rounding); `_FieldBased`
+progressive/TFF/BFF input (u16 and f16); YUV420 all
+planes (u16/f32) and YUV420PH (f16), `planes=[0]` (chroma passthrough) and
+`planes=[1]` (chroma-only must take the fused merge vs the chain); odd
+processed-plane width and odd subsampled chroma width rejected; determinism,
+multi-stream and parallel load; props (N frames, input fps, `_FieldBased`
+progressive) vs the chain; input validation.
 `tests/test_python_backend.py` adds the wrapper cases (fused == chain, the
 `direction != BOTH` fallback, backend selection, odd-geometry fallback,
-forwarded parameters the plugin does not declare). Whole
-suite **803 passed** via `tools/test.sh`.
+forwarded parameters the plugin does not declare).
 
 ## Performance
 
@@ -225,6 +232,14 @@ reference chain:
   path (0.78 apart on a bare 1.5x upscale). Integer ratios are unaffected.
 
 ## Historical
+
+- **2026-10-18 — f16 ships as a third depth and is bit-exact against the chain.**
+  The intermediate `v`/parked O_0 and the io frames are half, everything else
+  f32; 161 fps against f32's 125 (+28%) at the scoreboard config. The first cut
+  was not exact because the compiler folded the merge's per-frame half rounding
+  into an f16 FMA (one half ulp, amplified to ~2% of pixels by the horizontal
+  DP); `half_rne` in `src/eedi3.comp` fixed it. See `notes/EEDI3.md`'s f16
+  section and its Historical entry.
 
 - **2026-10-12 — banner re-measured; the previous table is void.** Its absolute
   fps (96.3 pre-port, the 159.2/153.2 port pair, the 45.3/25.8/28.1 reference

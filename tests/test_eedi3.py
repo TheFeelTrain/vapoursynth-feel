@@ -333,7 +333,7 @@ def test_eedi3_preserves_frame_props(clip_grays):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("io_format", [None, "u16"], ids=["f32", "u16"])
+@pytest.mark.parametrize("io_format", [None, "u16", "f16"], ids=["f32", "u16", "f16"])
 def test_eedi3_vspipe_pipelined_no_hang(io_format):
     """vspipe's pipelined reader plus VapourSynth's prefetch drive frame
     requests far ahead of the in-flight frames; a queue stall or a
@@ -1369,3 +1369,354 @@ def test_eedi3_creates_the_hpfill_pipeline_only_for_hp():
     for name in ("EEDI3", "EEDI3H", "EEDI3AA"):
         assert "eedi3-hpfill" not in _eedi3_pipeline_tags(name, False)
         assert "eedi3-hpfill" in _eedi3_pipeline_tags(name, False, hp=True)
+
+
+# ---------------------------------------------------------------------------
+# f16 (half): a storage width, not a precision
+# ---------------------------------------------------------------------------
+#
+# The half path keeps only the io frames, the pad, the transposed copies and
+# EEDI3AA's intermediate planes natively half; every arithmetic buffer stays
+# f32 and a half -> float widen is exact, so the f16 result is the f32 result
+# rounded once to half. The oracle is therefore the same call on the widened
+# clip (a half -> float Point resize is an exact container change). Measured
+# exactly 0 on the whole surface below: every sample is the f32 output rounded
+# to half, so these are bit-equality assertions, not tolerances.
+#
+# The AA merge is the one place that needs the chain's per-frame half rounding
+# explicitly (see the half_rne comment in src/eedi3.comp); EEDI3/EEDI3H do not.
+
+F16_TOL = 1e-3  # one half step at the unit peak
+
+
+def _widen_half(clip):
+    """The f32 clip carrying ``clip``'s half samples (an exact container
+    change, not an independent depth conversion)."""
+    return vs.core.resize.Point(clip, format=vs.GRAYS)
+
+
+def _half_parity(clip, kwargs, frames=(0, 11, 23)):
+    """(worst abs diff, fraction bit-identical) of f16 vs the widened f32 run.
+
+    Both sides are read in their native dtype, so the f32 result is rounded to
+    half exactly once and compared by value.
+    """
+    a = _run(clip, **kwargs)
+    b = _run(_widen_half(clip), **kwargs)
+    worst = 0.0
+    exact = 0
+    total = 0
+    for n in frames:
+        fa = _plane(a.get_frame(n), 0, dtype=np.float16)
+        fb = _plane(b.get_frame(n), 0, dtype=np.float32)
+        assert np.isfinite(fa.astype(np.float64)).all(), f"non-finite f16 at {n}"
+        assert np.isfinite(fb).all(), f"non-finite f32 at {n}"
+        q = fb.astype(np.float16)
+        worst = max(worst, float(np.abs(fa.astype(np.float64) - q.astype(np.float64)).max()))
+        exact += int((fa == q).sum())
+        total += fa.size
+    return worst, exact / total
+
+
+REFERENCE_CASES_F16 = [kw for kw, _ in REFERENCE_CASES_F32]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    REFERENCE_CASES_F16,
+    ids=[f"case{i}" for i in range(len(REFERENCE_CASES_F16))],
+)
+def test_eedi3_f16_is_f32_rounded(clip_grayh, kwargs):
+    """The half output is the f32 output rounded to half, bit for bit.
+
+    Covers the whole u16/f32 reference surface (field 0..3, dh, mdis 1..40,
+    nrad 0..3, vcheck 0..3, alpha/beta/gamma corners, hp) on the half fixture,
+    which is the same content as the f32 fixture widened.
+    """
+    field = kwargs.get("field", 1)
+    frames = (0, 11) if field <= 1 else (0, 5, 2 * clip_grayh.num_frames - 1)
+    worst, exact = _half_parity(clip_grayh, dict(kwargs), frames)
+    assert exact == 1.0, f"only {exact:.6f} of samples are the rounded f32 value for {kwargs}"
+    assert worst <= F16_TOL, f"f16 vs f32 diff {worst} for {kwargs}"
+
+
+def test_eedi3_f16_deterministic(clip_grayh):
+    """The half path is bit-identical across runs, like the other depths."""
+    a = _run(clip_grayh)
+    b = _run(clip_grayh)
+    for n in (0, 11, 23):
+        fa = _plane(a.get_frame(n), 0, dtype=np.float16)
+        fb = _plane(b.get_frame(n), 0, dtype=np.float16)
+        assert np.array_equal(fa, fb), f"nondeterministic output at frame {n}"
+
+
+def test_eedi3_f16_parallel_load_consistent(clip_grayh):
+    """f16 mirror of the parallel-load oracle: two parallel runs must match the
+    serial path and each other exactly (a half plane is still 2 bytes, so the
+    descriptor/buffer reuse is what the request pattern stresses)."""
+    a = eval_parallel(_run, clip_grayh, dtype=np.float16)
+    b = eval_parallel(_run, clip_grayh, dtype=np.float16)
+    ref = _run(clip_grayh)
+    for n in range(clip_grayh.num_frames):
+        r = _plane(ref.get_frame(n), 0, dtype=np.float16)
+        assert np.array_equal(a[n], r), f"parallel 1/serial mismatch at frame {n}"
+        assert np.array_equal(b[n], r), f"parallel 2/serial mismatch at frame {n}"
+        assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
+
+
+def test_eedi3_f16_parallel_vcheck_matches_serial(clip_grayh, monkeypatch):
+    """VPARA=0 (the A/B control) and the shipped parallel vcheck agree on the
+    half clip: both arithmetic buffers are f32, so the only rounding is the io
+    store, exactly like the f32 path."""
+    monkeypatch.setenv("VSFEEL_EEDI3_VPARA", "0")
+    serial = _run(clip_grayh, field=1)
+    monkeypatch.delenv("VSFEEL_EEDI3_VPARA")
+    parallel = _run(clip_grayh, field=1)
+    for n in (0, 11, 23):
+        a = _plane(serial.get_frame(n), 0, dtype=np.float16)
+        b = _plane(parallel.get_frame(n), 0, dtype=np.float16)
+        assert np.array_equal(a, b), f"serial/parallel vcheck mismatch at frame {n}"
+
+
+def test_eedi3_f16_no_nan_all_frames(clip_grayh):
+    """Every frame finite, and the filter actually changed the noise (a half
+    isfinite is meaningful: a half can be inf/nan)."""
+    out = _run(clip_grayh)
+    assert out.format.id == clip_grayh.format.id
+    for n in range(out.num_frames):
+        a = _plane(out.get_frame(n), 0, dtype=np.float16)
+        assert np.isfinite(a.astype(np.float64)).all(), f"non-finite output at frame {n}"
+    assert_changes_on_clip(out, clip_grayh, what="EEDI3 f16")
+
+
+def test_eedi3_f16_preserves_frame_props(clip_grayh):
+    """The half path republishes the source frame's properties."""
+    assert_preserves_frame_props(_run, clip_grayh, field=1)
+
+
+def test_eedi3_f16_yuv_passthrough():
+    """A YUV420PH clip: chroma is copied through bit-identically and luma
+    matches the GRAYH run exactly, like the u16/f32 mirrors."""
+    core = vs.core
+    src = core.bs.VideoSource(CLIP_PATH)
+    yuv = core.resize.Point(
+        core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True), format=vs.YUV420PH
+    )
+    out = _run(yuv, planes=[0])
+    ref = _run(core.std.ShufflePlanes(yuv, 0, vs.GRAY))
+    for n in (0, 11, 23):
+        a = _plane(out.get_frame(n), 0, dtype=np.float16)
+        b = _plane(ref.get_frame(n), 0, dtype=np.float16)
+        assert np.array_equal(a, b), f"luma mismatch at frame {n}"
+        s = yuv.get_frame(n)
+        for plane in (1, 2):
+            ca = _plane(out.get_frame(n), plane, dtype=np.float16)
+            cb = _plane(s, plane, dtype=np.float16)
+            assert np.array_equal(ca, cb), f"chroma{plane} changed at frame {n}"
+
+
+def _half_mask_clip(arr, length):
+    """A GrayH mask clip carrying ``arr`` (h, w) of half values."""
+    h, w = arr.shape
+    base = vs.core.std.BlankClip(format=vs.GRAYH, width=w, height=h, length=length, color=[0.0])
+
+    def mk(n, f):
+        out = f.copy()
+        p = np.asarray(out[0])[:, : w * 2].view(np.float16)
+        p[:h, :w] = arr
+        return out
+
+    return base.std.ModifyFrame(base, mk)
+
+
+def _half_right_mask(clip):
+    xs = np.arange(clip.width)
+    arr = np.where((xs < clip.width // 2)[None, :], np.float16(1.0), np.float16(0.0))
+    arr = np.repeat(arr, clip.height, axis=0).astype(np.float16)
+    return _half_mask_clip(arr, clip.num_frames)
+
+
+def test_eedi3_mclip_half_native_matches_reference_conversion(clip_grayh):
+    """A GrayH mask is read natively (no SetFrameProps -> Point -> Gray8 node).
+
+    The oracle is built in-graph: the same half mask through the reference
+    conversion, passed as an explicit Gray8 mask, must give a bit-identical
+    result. Only values at the predicate boundary (0.5/255) can distinguish the
+    strict comparison, so the mask is a ramp of half values straddling it
+    (binary or uniformly random masks cannot see an off-by-one predicate).
+    """
+    clip = clip_grayh
+    mid = 0.5 / 255.0
+    ramp = np.linspace(mid * 0.998, mid * 1.002, WIDTH, dtype=np.float16)
+    arr = np.repeat(ramp[None, :], HEIGHT, axis=0).astype(np.float16)
+    mf = _half_mask_clip(arr, clip.num_frames)
+    kw = dict(field=1, mdis=5, nrad=1, vcheck=0)
+    mconv = vs.core.resize.Point(vs.core.std.SetFrameProps(mf, _Range=1), format=vs.GRAY8)
+    native = _run(clip, mclip=mf, **kw)
+    converted = _run(clip, mclip=mconv, **kw)
+    for n in (0, 11):
+        a = _plane(native.get_frame(n), 0, dtype=np.float16)
+        b = _plane(converted.get_frame(n), 0, dtype=np.float16)
+        assert np.array_equal(a, b), f"native half mask != reference conversion at frame {n}"
+
+
+@pytest.mark.parametrize("mdis,nrad", [(5, 1), (20, 3)])
+def test_eedi3_mclip_half_matches_f32(clip_grayh, mdis, nrad):
+    """The native half mask drives exactly the same pixels as the same mask
+    widened to f32 (the predicate is the same value test)."""
+    clip = clip_grayh
+    mh = _half_right_mask(clip)
+    mw = vs.core.resize.Point(mh, format=vs.GRAYS)
+    kw = dict(field=1, mdis=mdis, nrad=nrad, vcheck=0)
+    a = _run(clip, mclip=mh, **kw)
+    b = _run(_widen_half(clip), mclip=mw, **kw)
+    for n in (0, 11):
+        fa = _plane(a.get_frame(n), 0, dtype=np.float16)
+        fb = _plane(b.get_frame(n), 0, dtype=np.float32).astype(np.float16)
+        assert np.array_equal(fa, fb), f"half mask parity mismatch at frame {n}"
+
+
+def test_eedi3_sclip_half(clip_grayh):
+    """A half sclip is read natively and the f16 result is the f32 result on
+    the widened clip, rounded once."""
+    clip = clip_grayh
+    sh = core_shift_half(clip)
+    sw = vs.core.resize.Point(sh, format=vs.GRAYS)
+    kw = dict(field=1, mdis=20, nrad=2, vcheck=2)
+    a = _run(clip, sclip=sh, **kw)
+    b = _run(_widen_half(clip), sclip=sw, **kw)
+    for n in (0, 11, 23):
+        fa = _plane(a.get_frame(n), 0, dtype=np.float16)
+        fb = _plane(b.get_frame(n), 0, dtype=np.float32).astype(np.float16)
+        assert np.array_equal(fa, fb), f"half sclip parity mismatch at frame {n}"
+
+
+def core_shift_half(clip):
+    """A GrayH sclip that is not the vertical cubic (adds 0.25 in half)."""
+    return vs.core.std.Expr(clip, "x 0.25 +")
+
+
+def test_eedi3_vk2_f16_loose(clip_grayh):
+    """Rough agreement with eedi3vk2's own f16 path (a different numeric
+    domain, not an oracle).
+
+    eedi3vk2 computes the f16 path entirely in half (pix_t/calc_t are
+    float16_t), so its own f16-vs-f32 gap is ~0.044 on this clip. vsfeel's f16
+    is the f32 result rounded once (one half ulp), so the two differ by the
+    reference's half-arithmetic loss. This bound only catches gross errors
+    (wrong plane, broken half store, a full-fp16 arithmetic path sneaking in).
+    Runs in a subprocess so a reference crash cannot take the suite down.
+    """
+    reference_or_skip("eedi3vk2", "EEDI3")
+    spec = {
+        "source": CLIP_PATH,
+        "nframes": CLIP_FRAMES,
+        "bits": 16,
+        "half": True,
+        "frames": [0, 11],
+        "kwargs": dict(field=1, mdis=5, nrad=1, vcheck=2),
+        "mclip": False,
+        "sclip": None,
+        "mask": "right",
+    }
+    payload = compare_or_skip(_F16_VK2_SCRIPT, [json.dumps(spec)], timeout=600)
+    assert payload["maxdiff"] < 0.08, f"vs eedi3vk2 f16 max diff {payload['maxdiff']}"
+    assert payload["frac"] < 0.05, f"{payload['frac']:.4f} of pixels differ by > 0.002"
+
+
+_F16_VK2_SCRIPT = (
+    COMPARE_PRELUDE
+    + r"""
+import json
+import sys
+import vapoursynth as vs
+
+core = vs.core
+spec = json.loads(sys.argv[1])
+src = core.bs.VideoSource(spec["source"])
+if src.num_frames > spec["nframes"]:
+    src = core.std.Trim(src, first=0, length=spec["nframes"])
+g32 = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
+                         bits=32, fulls=True, fulld=True)
+clip = core.resize.Point(g32, format=vs.GRAYH)
+frames = spec["frames"]
+kwargs = spec["kwargs"]
+try:
+    ref_node = core.eedi3vk2.EEDI3(clip, **kwargs)
+    ref = [read_plane(ref_node.get_frame(n), 0, np.float16) for n in frames]
+except Exception as exc:
+    print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
+    raise SystemExit(2)
+print("REF ok", flush=True)
+try:
+    my = core.vsfeel.EEDI3(clip, **kwargs)
+    my = core.std.GPUDownload(clip=my)
+    worst = 0.0
+    frac = 0
+    total = 0
+    for n, b in zip(frames, ref):
+        a = read_plane(my.get_frame(n), 0, np.float16)
+        d = np.abs(a.astype(np.float64) - b.astype(np.float64))
+        worst = max(worst, float(d.max()))
+        frac += int((d > 0.002).sum())
+        total += d.size
+except Exception as exc:
+    print("VSFEEL fail: %s: %s" % (type(exc).__name__, exc), flush=True)
+    raise SystemExit(3)
+print("RESULT " + json.dumps({"maxdiff": worst, "frac": frac / total}), flush=True)
+"""
+)
+
+
+_F16_REGION_SCRIPT = textwrap.dedent("""\
+    import sys
+    import vapoursynth as vs
+
+    core = vs.core
+    src = core.bs.VideoSource(sys.argv[1])
+    g = core.std.ShufflePlanes(src, 0, vs.GRAY)
+    fmt = sys.argv[2]
+    if fmt == "u16":
+        clip = core.fmtc.bitdepth(g, bits=16, fulls=True, fulld=True)
+    elif fmt == "f32":
+        clip = core.fmtc.bitdepth(g, bits=32, fulls=True, fulld=True)
+    else:
+        clip = core.resize.Point(
+            core.fmtc.bitdepth(g, bits=32, fulls=True, fulld=True),
+            format=vs.GRAYH)
+    core.vsfeel.EEDI3(clip, field=1, mdis=5, nrad=1)
+""")
+
+
+def _eedi3_region_mib(fmt):
+    """(scratch, pad) MiB from the TRACE banner for one io format."""
+    env = {**os.environ, "MANGOHUD": "0", "VSFEEL_EEDI3_TRACE": "1"}
+    proc = subprocess.run(
+        [sys.executable, "-c", _F16_REGION_SCRIPT, str(CLIP_PATH), fmt],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    m = re.search(
+        r"\[eedi3\] plane \d+ w=\d+ rows=\d+ scratch=([\d.]+) MiB pbt=[\d.]+ MiB pad=([\d.]+) MiB",
+        proc.stderr,
+    )
+    assert m, proc.stderr[-2000:]
+    return float(m.group(1)), float(m.group(2))
+
+
+def test_eedi3_f16_uses_the_half_pad_and_f32_scratch():
+    """The f16 storage variant is invisible in the pixels, so pin it from the
+    creation banner's own region sizes: the pad is the native half one (equal to
+    u16's, narrower than f32's) while the arithmetic scratch stays the f32 one
+    (wider than u16's), i.e. the half path did not silently build the f32 blobs.
+    """
+    s16, p16 = _eedi3_region_mib("u16")
+    sf16, pf16 = _eedi3_region_mib("f16")
+    s32, p32 = _eedi3_region_mib("f32")
+    assert pf16 == p16, "f16 pad is not the native half pad"
+    assert pf16 < p32, "f16 pad is not narrower than the f32 pad"
+    assert sf16 > s16, "f16 arithmetic scratch is not the f32 one"
+    assert sf16 < s32, "f16 scratch is not narrower than the f32 scratch"
