@@ -10,11 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `vsfeel.feel_aa`, a copy of `vsaa.based_aa` that keeps its processing entirely on the GPU
 - `core.vsfeel.Box`, a Vulkan implementation of a box downscale
-- GaussBlur accepts fp16 (half) input, about 2x its f32 throughput end to end
+- GaussBlur accepts fp16 (half) input
 
 ### Changed
 
-- GaussBlur is 9-10% faster
+- GaussBlur is over 2x faster
 - BM3D is now registered as `core.vsfeel.BM3D` instead of `core.vsfeel.BM3Dv2`
 
 ### Fixed

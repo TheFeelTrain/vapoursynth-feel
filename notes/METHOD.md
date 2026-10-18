@@ -56,8 +56,11 @@ RX 7900XTX, so a fair comparison is possible. Method that worked for DFTTest:
    and tie on hardware). Always report Subgroups-per-SIMD, LDS, and
    spill/scratch bytes next to the count: a lower count with halved occupancy
    or new spills is a regression. Count the FP-op
-   distribution (v_fma, v_rcp, v_mov, s_mov, v_dual_*). A 3x instruction-count
-   gap means ~2.5x time. When diffing your own change before/after, watch for
+   distribution (v_fma, v_rcp, v_mov, s_mov, v_dual_*) and the guard population
+   separately (`v_cmp*`, `v_cndmask*`, predicated/address ops): guards can
+   outnumber the FMAs, so a lower total says nothing until you know which
+   population shrank, and a 3x instruction-count gap means ~2.5x time. When
+   diffing your own change before/after, watch for
    schedule-damage signatures, not just the total: doubled `buffer_load_*` =
    a branch if-converted into loads issued on both sides; an `s_load_b128`
    spike = push-constant pressure (budget the guaranteed 128 B — growing the
@@ -99,7 +102,12 @@ RX 7900XTX, so a fair comparison is possible. Method that worked for DFTTest:
 
 General lesson: make every branch that is fixed per invocation (filter type,
 bit depth, window shape) a specialization constant or `#if` so the shader
-compiles to its cheapest form. For branches that vary per frame (cache hit
+compiles to its cheapest form. A guard that varies per *element* but is a
+function of the loop indices is the same target one level down: split or peel
+the iteration space so the region where the predicate is statically true or
+false carries no test at all. Keep the split's bounds compile-time — one that
+depends on a runtime or spec-constant value stops the unroll and gives the gain
+back. For branches that vary per frame (cache hit
 vs fallback path), ship two pipelines — a branchless fast variant plus a
 mixed fallback — and let the host pick per dispatch: a uniform `if` in a hot
 loop if-converts into loads issued on both sides plus de-dualized ALU and
@@ -117,7 +125,11 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   Exactness (not just tolerance) is what makes aggressive structural changes
   verifiable in minutes — loose bounds cannot catch a one-column indexing
   slip. Pair small targeted tests with real-content checks; they catch
-  disjoint bug classes.
+  disjoint bug classes. When grading two builds against it, read the whole
+  failure inventory, not a sample: which cases moved, and by how much, says
+  which code path changed. If a bound is unavoidable, scope it to the path that
+  measured it and leave the strict assertions everywhere else, saying why in the
+  test.
 - **A recorded dead end decays: re-test it against the CURRENT code, and
   record the mechanism, not the verdict.** "Host-visible VRAM is poison (27.6
   fps)" and "reading staging directly collapses to 178 fps" were both true for
@@ -139,37 +151,31 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   new code. Comparing both against a reference is weaker: the reference may
   itself be permissive.
 - **Compose variants from shipped filters before writing new code.** A filter
-  that is a geometric or parametric transform of an existing one can often be
-  a few invokes with zero new state — correct by construction, with a free
-  self-consistency oracle, and near-zero maintenance. New kernels are for
-  what composition cannot express.
+  that is a geometric or parametric transform of an existing one is often a
+  few invokes with zero new state — correct by construction, with a free
+  self-consistency oracle and near-zero maintenance; new kernels are for what
+  composition cannot express.
 - **Only noise-clip comparisons against the reference prove correctness.**
   Constant/BlankClip input hides bugs (the references themselves deviate at
   borders on such input).
 - **Trust only end-to-end benchmark fps medians over at least 1000 frames.**
-  That is the floor for a speed test (`MIN_BENCH_FRAMES` in the harness), and
-  the filter's own benchmark default (1000–5000) is better still: the run has to
-  outlast the clock ramp and last a couple of seconds, so a ~2000 fps filter
-  wants 4000+ frames. Never shrink `--frames` to iterate faster — a few hundred
-  frames is noise, not a result.
-  Microsecond GPU traces swing ±10–20% run-to-run (clock variance); a change
-  that does not move the fps median did not happen. Concurrent submissions
-  share the compute queue, so per-kernel timings taken from a deep pipeline
-  include the other frames' interleaved work — attribute kernels only in
-  serialized traces.
-  Identical binaries swing between invocations too, so compare same-session
-  pairs or medians over 1000+ frames, never single short bursts. A
-  comments-only rebuild that moves a one-shot trace is clock variance, not a
-  regression — check `pp_dpm_sclk` and repeat 3x before debugging.
-  When one plugin swings ±15–40% between invocations while the other stays
-  flat, triage in order: 5x same-command repeats, then alone-vs-pair
-  interleaving, then `pp_dpm_sclk` / `gpu_busy_percent` polled in a loop
-  *during* the run (a single read after a 2–3 s run only ever sees idle),
-  then thermals and host load, then **harness memory** (see the bimodal rule
-  below — additive frame caches overflowing RAM produce exactly this
-  signature). Same-session pairs stay fair through all of it — grade on those,
-  and lengthen the run before trusting any absolute number (short runs are
-  clock-ramp-sensitive).
+  That is the harness floor (`MIN_BENCH_FRAMES`) and the filter's own default
+  (1000–5000) is better: the run must outlast the clock ramp and last a couple
+  of seconds, so never shrink `--frames` to iterate faster.
+  Microsecond GPU traces swing ±10–20% run-to-run (clock variance), and
+  concurrent submissions share the compute queue, so per-kernel timings from a
+  deep pipeline include other frames' work — attribute kernels only in
+  serialized traces. A change that does not move the fps median did not happen.
+  Identical binaries swing between invocations too: compare same-session pairs
+  or medians over 1000+ frames, never single short bursts, and check
+  `pp_dpm_sclk` and repeat 3x before debugging a one-shot trace that moved.
+  When one plugin swings ±15–40% while the other stays flat, triage in order:
+  5x same-command repeats, alone-vs-pair interleaving, `pp_dpm_sclk` /
+  `gpu_busy_percent` polled in a loop *during* the run (a single read after a
+  2–3 s run only sees idle), thermals and host load, then **harness memory**
+  (see the bimodal rule below — additive frame caches overflowing RAM produce
+  exactly this signature). Same-session pairs stay fair through all of it;
+  grade on those, and lengthen the run before trusting an absolute number.
 - **A GPU filter's fps carries the chain's transfers until `--no-download`
   takes the output side out of it.** vspipe's output node is a CPU node, so by
   default the core downloads a GPU-resident output; at 1080p GRAY16 that copy
@@ -213,10 +219,10 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   ladder as remove-all → remove-half → remove-one so the answer is unambiguous.
 - **An isolated microbenchmark proposes; only an in-situ same-session A/B
   decides.** A standalone C program said plain `memcpy` beat the NT-store path
-  3.7× (0.14 vs 0.51 ms/frame); in the real filter that same change *lost*
-  (blit 6.1 → 10.4 ms/frame, 481 → 401 fps), because the isolated test has no
-  competing streams, no other cache pressure, and no write-combining
-  contention. Prefer a **runtime knob plus a same-session sweep of the real
+  3.7×; in the real filter that same change *lost* (blit 6.1 → 10.4 ms/frame,
+  481 → 401 fps), because the isolated test has no competing streams, no other
+  cache pressure and no write-combining contention. Prefer a **runtime knob
+  plus a same-session sweep of the real
   binary** — ten lines, and both arms are measured under identical conditions.
   Reach for the scratch C program only to rule a mechanism *out*, never to
   pick a winner.
@@ -224,16 +230,15 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   byte, not just copies.** Transfer buffers in the narrowest
   exactly-representable type and widen on load (native u16 pad instead of f32
   halved EEDI3's pad-build and pad-read traffic at once). Then audit the
-  frame for any buffer whose *same source bytes* are read by two different
-  loops: merging a second pass into the first while the row is still cache-hot
-  is nearly free and was worth +3.5% on EEDI3 while deleting 8.3 MB/frame of
-  pure DRAM re-reads.
+  frame for a buffer whose *same source bytes* two different loops read:
+  merging the second pass into the first while the row is still cache-hot is
+  nearly free (+3.5% on EEDI3, deleting 8.3 MB/frame of pure DRAM re-reads).
 - **Do not invoke a graph node to normalize an input your kernel only reads as
   a predicate.** EEDI3 forced every mask through `SetFrameProps(_Range=1) ->
   resize.Point -> Gray8` so the kernel could test `byte != 0` — a whole extra
-  full-frame pass in the graph, every frame. Because the reduction is
-  monotonic, that predicate is exactly `v >= 129` on the native u16 input, so
-  the node was deleted for an instant +8%. Whenever a filter adds a
+  full-frame pass, every frame. The reduction is monotonic, so that predicate is
+  exactly `v >= 129` on the native u16 input: the node was deleted for an
+  instant +8%. Whenever a filter adds a
   std/resize/format node at create time, ask what the consumer actually needs
   from it; a monotone transform or a threshold can usually be folded into the
   native data. Verify equivalence exhaustively when the domain is small
@@ -249,15 +254,19 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   args unset — the `mapGetInt` error flag distinguishes explicit from
   default, and explicit args are always respected). Never inherit shapes
   across redesigns: a spill-free shape at one radius can spill at another,
-  so check `shaderstats` (VGPR spill/scratch) per matrix cell.
+  so check `shaderstats` (VGPR spill/scratch) per matrix cell. Re-run the
+  sweep after every structural change: when the gain shrinks as a workload
+  parameter grows, the remaining cost is in a sibling path whose share grows
+  with it (boundary rows/columns, tail iterations, the small/fallback case),
+  and the same mechanism usually applies there too.
 - **Spec constants cannot size arrays in GLSL.** If an array dimension must
   vary, gate it with a compile-time `-D` define instead.
 - **Respect the compiler's register tradeoffs.** ACO raises VGPRs deliberately
   for load ILP at an occupancy cost; forcing registers down often regresses.
   Read `RADV_DEBUG=shaderstats` before assuming more waves would help.
   **LDS is not a way out.** Three attempts to move kernel-live data into shared
-  memory to free registers (a resolved match group, per-lane sorted lists in a
-  bank-conflict-free layout, and loop-invariant centres) each *raised* VGPRs
+  memory to free registers (a resolved match group, per-lane sorted lists,
+  loop-invariant centres) each *raised* VGPRs
   216 → 240 and dropped occupancy 7 → 6 waves/SIMD; two of them lost 5–90%.
   The mechanism is data-dependent addressing — extra address registers and
   longer live ranges — so spilling to shared only helps when the index is a
@@ -267,8 +276,7 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   The same applies to `requiredSubgroupSize`: forcing wave32 halves
   Subgroups-per-SIMD and only pays off for kernels with subgroup ops or
   extreme register pressure — otherwise it regresses. Sweep it per filter
-  like any other launch param; a win on one filter never implies a win on
-  the next.
+  like any other launch param.
 - **Reduced-precision storage needs explicit range management** (fp16 hit a
   subnormal cliff; scaling values up on store and down on load fixed it).
   Measure the actual drift against the reference and agree on the accuracy
@@ -286,18 +294,16 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   is part of the measurement.** One binary swung 143–260 fps on consecutive
   f32 runs while the GPU-bound reference stayed flat at ~190. The cause was
   the *harness*: the framework's `max_cache_size` and the harness's own
-  decoded-frame cache are additive, and together they exceeded RAM. When you
-  see the "one side swings, other stays flat" signature, add **harness memory**
-  to the triage list (clocks, thermals, queue count, host load). And when
+  decoded-frame cache are additive, and together they exceeded RAM. When
   fixing it, shrink the *test-specific* cache, not the shared framework one:
   lowering `max_cache_size` instead made the timed region re-run the upstream
   chain and collapsed *every* plugin by 3–4× — a much more confusing failure
   than the original noise.
 - **A comparison subprocess that aborts with `free(): invalid pointer` after
   printing `RESULT` is MangoHud, not the filter.** Its overlay is an implicit
-  Vulkan layer, and its own teardown thread aborts under high subprocess
-  concurrency (measured 4/128 on the unmodified tree, 0/48 with `MANGOHUD=0`,
-  backtrace inside `libMangoHud.so`); `tools/test.sh` now forces `MANGOHUD=0`.
+  Vulkan layer whose teardown thread aborts under high subprocess concurrency
+  (measured 4/128 on the unmodified tree vs 0/48 with `MANGOHUD=0`, backtrace
+  inside `libMangoHud.so`); `tools/test.sh` now forces `MANGOHUD=0`.
 - **Decompose kernel cost with short-lived probes**, not theory: kill the
   theory with arithmetic before coding anything — bandwidth math (taps ×
   bytes × pixels vs bus), value-range math (min/max exponent vs subnormal),
@@ -309,10 +315,15 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   expensive memory-access pattern measured neutral because it was L2-resident.
   When the model names a cost, delete it in a scratch build and measure: a
   probe that disagrees with a confident model (barriers modeled 10x over real
-  cost here) is always right. Where device profilers are unavailable, bound
-  cost centers with workload-shape variants instead — inputs that isolate
-  each stage (all-skip, full-work, no auxiliary data) read ceilings directly
-  off end-to-end fps.
+  cost here) is always right. **Start with the guards**: a per-element mask,
+  select, clamp, skip test or bounds check costs issue slots whether or not it
+  fires, often more than the arithmetic it protects. Delete it in a scratch
+  build (wrong output is the point), revert, and read its speed as a price tag,
+  never a result; if an ablation built for one hypothesis moves the frame
+  beyond what that hypothesis explains, drop it. Where device profilers are
+  unavailable, bound cost centers with workload-shape variants instead: inputs
+  that isolate each stage (all-skip, full-work, no auxiliary data) read ceilings
+  straight off end-to-end fps.
   **An ablation that changes the data is not an ablation.** BM3D's
   `NOSEARCH=1` kill-switch also made every candidate tie, which suppressed the
   temporal search's insert branch, so its 0.741 ms could not be read as "the
@@ -327,11 +338,10 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   rather than only in a code comment. **Read `notes/AGENTS.md` first and follow
   it** — it is the authority on the notes (section shape, style, and the line
   budgets, which `tools/notes_check.py` enforces on every lint run), so nothing
-  about how to write them is repeated here. (It is also injected automatically
-  once you touch a file in `notes/`, but only after that tool call, so read it
-  before writing a new note file.) Keep entries short regardless: conclusion
-  first, a number only with its config, one line for a correctness-only change,
-  mechanism not story.
+  about how to write them is repeated here, and it is injected only after the
+  first tool call that touches `notes/`. Keep entries short regardless:
+  conclusion first, a number only with its config, one line for a
+  correctness-only change, mechanism not story.
   **Worked examples of most rules above live in `notes/EEDI3.md`
   rounds 10–12** (host-bounded frames, the SIMD dilation rewrite, the ReBAR
   upload, the boundary-input oracle bug, the harness-memory bimodality, and a

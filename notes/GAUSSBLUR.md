@@ -35,26 +35,26 @@ Scoreboard — jpbd 1080p GRAY16, sigma=16 (95 taps, two-pass), 5000 frames,
 
 | mode | vsfeel | vszipcl | ratio |
 |---|---|---|---|
-| CPU cache (benchmark default) | 2949.9 | 1608.0 | 1.83x |
-| `--gpu-cache` (resident GPU input) | 3986.7 | 1614.7 | 2.47x |
-| `--gpu-cache --no-download` (compute only) | 9877.9 | 1589.8 | 6.21x |
+| CPU cache (benchmark default) | 2973.4 | 1579.7 | 1.88x |
+| `--gpu-cache` (resident GPU input) | 3978.4 | 1647.5 | 2.42x |
+| `--gpu-cache --no-download` (compute only) | 19990.7 | 1613.6 | 12.39x |
 
 The first two rows carry transfers: row 1 uploads the CPU cache per frame and
 downloads the output, row 2 removes the input upload and still downloads; the
-filter runs at 101 µs/frame in all three. Repeat sessions land within ~2–4%.
+filter runs at ~50 µs/frame in all three. Repeat sessions land within ~2–4%.
 
 Half input against its f32 twin (`--format f16` vs `--format f32`), same clip,
 sigma, frames and repeats (3-repeat medians, one session):
 
 | mode | vsfeel f16 | vsfeel f32 | vszipcl f16 | ratio |
 |---|---|---|---|---|
-| CPU cache (benchmark default) | 2979.5 | 1507 | 1568.2 | 1.90x |
-| `--gpu-cache` (resident GPU input) | 3866.2 | 1926 | 1621.3 | 2.39x |
-| `--gpu-cache --no-download` (compute only) | 10079.1 | 9472 | 1602.1 | 6.29x |
+| CPU cache (benchmark default) | 3001.7 | 1517.9 | 1587.8 | 1.89x |
+| `--gpu-cache` (resident GPU input) | 3978.8 | 1962.1 | 1640.9 | 2.43x |
+| `--gpu-cache --no-download` (compute only) | 19497.3 | 17535.2 | 1630.5 | 11.96x |
 
 - The f16 chain rows are ~2x their f32 twins because those modes move the
-  frames; compute-only the gap is +6%, since the kernels are load-issue bound
-  (mechanism under Performance).
+  frames; compute-only the gap is +11%, the half-width loads of the two-pass
+  kernels (mechanism under Performance).
 - vszipcu is not installed in this checkout, so vszipcl is the reference here.
 - Bench: `MANGOHUD=0 uv run tools/benchmark.py --filter gaussblur
   [--gaussblur-args "sigma=X"] [--format u16|f16|f32] [--gpu-cache]
@@ -91,6 +91,13 @@ sigma, frames and repeats (3-repeat medians, one session):
   shared memory.
 - int32 guards on the plane's last element and the scratch end (same 32-bit
   addressing bound as Bilateral).
+- The two-pass rolling window runs in three phases per output — ramp-up
+  (`j <= k` live), steady (all R live), ramp-down (`j > t` live) — each a
+  fixed-bound unrolled loop, so the zero-weight padding taps are never emitted
+  and no tap carries a select; `accum()` remains only for a window shorter than
+  R (the LDS-limited fallback that can route a small radius to the two-pass
+  path). Both the interior and the mirror loop use it. Numbers under
+  Performance.
 - 9 SPIR-V variants (gauss/vert/horiz × u16/f16/f32), selected by the input
   format. The half variants declare `float16_t` storage, which needs only
   `storageBuffer16BitAccess` (the core's baseline): the widening/narrowing is an
@@ -116,23 +123,57 @@ sigma, frames and repeats (3-repeat medians, one session):
 
 ## Performance
 
-- **Both passes are load-bound, not FMA-bound.** 95 taps over two passes is
-  ~394 M FMAs per 1080p frame (~14 µs at peak), while the passes spend their
-  time in loads: the vertical pass' taps are rows a stride apart, so a warp
-  load touches two cache lines half-used, and the horizontal pass re-reads an
-  8.3 MB float intermediate. That is what the shape and width changes below
-  attack, and why a 2x cut in FMA would buy nothing.
-- **Half storage pays only where a lane issues a half-width load.** 1080p
-  sigma=16, trace probe: the vertical pass drops 67.5 → 57.9 µs, because its
-  strided row loads return 2 bytes per lane instead of 4 for the same 32
-  lines; the horizontal pass is unchanged at 48.7 µs and the fused path is a
-  tie at sigma=2 (18.6k fps), since their loads and stores already fill a
-  sector. Compute-only benchmark, real clip, 5000 frames: f32 9472 → f16 10079
-  fps. Staging `tmp` in half follows the same rule and lost 25% end to end
-  (compute-only: 10079 → 7577 fps, below even the f32 path): a scalar half load
-  still costs a load slot and 2 bytes of a sector, and every access adds an
-  `OpFConvert` (horizontal pass 48.8 → 67.6 µs in the probe). With the f32
-  scratch the path is also bit-exact, so the extra ulp buys nothing.
+- **The two-pass passes are issue-bound, not byte-bound.** 95 taps over two
+  passes is ~394 M FMAs per 1080p frame (~14 µs at peak), so FMA *rate* is not
+  the limit and neither is DRAM: what is, is the number of instructions each tap
+  issues (a load, a weight insert, the window shift, the fma, and — before this
+  round — a compare plus a select). Deleting two of those per tap doubled the
+  kernel (next bullets) while halving the element size never did. The vertical
+  pass' strided row loads are still the reason its block is 32x4: a warp load
+  spans two half-used cache lines.
+- **The rolling window's zero-weight skip was the kernel's real cost.**
+  `accum()` guarded the padding taps (a weight index outside [0, KLEN)) with a
+  compare + select per tap; in the vertical pass' 32x4 body the selects
+  outnumber the fmas (105 vs 48 in the ACO dump). The shipped form keeps the
+  exact skip but emits it *structurally*: the window is split into a ramp-up
+  (`j <= k` live), a steady phase (every j live, one fma per tap) and a
+  ramp-down (`j > t` live), each a fixed-bound unrolled loop, so the padding
+  taps are never emitted and no tap carries a test. `accum()` survives only
+  where the window is shorter than R. The three phases must be written as
+  fixed-bound loops: a variable-bound `for (j = 0; j <= k; ++j)` measured
+  10.5k fps against 13.4k for the same arithmetic (the compiler will not unroll
+  it).
+- **The mirror path mattered more than the interior one.** At radius 47 the
+  border rows are ~10% of the work, but they took the per-tap mirror *and* the
+  select; giving them the same three-phase window is what turned the interior's
+  +33% into +94%. Same-session ABBA A/B against the previous build, jpbd 1080p
+  sigma=16, 5000 frames, `--gpu-cache --no-download`, 3 rounds of 3 repeats per
+  arm: u16 9829 → 20039 fps, f32 9479 → 17569, f16 10048 → 19477 (2.04x, 1.85x,
+  1.94x). Probe, f16: vertical 57.9 → 25.6 µs, horizontal 48.8 → 25.0 µs. The
+  fused path (radius ≤ 32, no rolling window, so no padding taps) is unchanged
+  at 18.7k fps, and larger radii gain less as the mirror region grows (radius
+  119 leaves 122 of 360 rows interior): f16 sigma=40 2674 → 3646, sigma=80 1296
+  → 1799 fps.
+- **Half storage pays only where a lane issues a half-width load.** The f16
+  path is +11% over f32 compute-only (banner), which is the vertical pass'
+  strided rows returning 2 bytes per lane instead of 4 for the same 32 lines;
+  the horizontal pass reads full sectors either way and the fused path is a tie
+  at sigma=2 (18.7k fps). Staging `tmp` in half applies the same rule to the
+  intermediate and lost 25% end to end when it was measured (pre-three-phase
+  kernel; the mechanism is structural): a scalar half load still costs a load
+  slot and returns 2 bytes of a sector, and every access adds an `OpFConvert`.
+- **Half arithmetic is not the win it looks like.** A prototype that did the
+  accumulation, the weights and the scratch in half (packed f16x2 would be the
+  point) measured *slower* than the storage-only path and 1-10 half ulps off the
+  f32 result; ACO lowers this code shape to scalar `v_fma_f16`, never
+  `v_pk_fma_f16`, so the FMA rate does not move while the half loads cost more
+  than they save. Do not retry without a code shape that actually packs.
+- **The f16 path sits within one half ulp of vszipcl, not on it.** The half ->
+  float widening contracts into a mixed-precision fma, so an f16 kernel's f32
+  sums can differ from the reference's in the last bits and the half store
+  surfaces that as one ulp: measured 9 of the 69 f16 reference cases, each at
+  exactly 4.88e-4 and none larger. The f32 and u16 paths stay bit-exact, and the
+  non-finite footprint stays exact at every depth.
 - **Per-pass block shape and outputs per thread**, worth +9.4% to +9.7% across
   three same-session A/Bs (shipped build 8949.8 → 9808.0 fps; 1080p sigma=16,
   5000 frames, `--gpu-cache --no-download`, 6 interleaved 2-repeat runs per arm,
@@ -252,6 +293,14 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
 
 - **A half `tmp`** (25% slower end to end, mechanism under Performance) — the
   f32 scratch is both faster and bit-exact.
+- **Half arithmetic** (mechanism under Performance): ACO emits scalar
+  `v_fma_f16` for this code shape and the tighter storage costs more than the
+  arithmetic saves, for 1-10 ulps of accuracy.
+- **A branch inside the rolling loop** for the padding taps. Guarding the two
+  FMA batches with `if (k >= R - 1 && k < KLEN)` instead of splitting the loop
+  measured 6671 fps against 19477 for the three-phase form (f16, 1080p
+  sigma=16, compute only): the conditional blocks keep the scheduler from
+  pipelining the loads.
 - `VSFEEL_GAUSS_GPU_BENCH` (it idled the device from a frame callback without
   the other streams' queue locks) was deleted — do not resurrect it.
 - Do not re-introduce a host transfer path to win the CPU-sink row — that

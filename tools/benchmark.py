@@ -1354,7 +1354,7 @@ def _mode_desc(ns: argparse.Namespace) -> str:
     """The run header's mode field, empty unless --no-download is set."""
     if not ns.no_download:
         return ""
-    return " | mode: --no-download (vspipe --, output not downloaded)"
+    return " | mode: --no-download"
 
 
 def _run_once(

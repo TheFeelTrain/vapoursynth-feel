@@ -252,26 +252,97 @@ void main() {
     const int taps_v = KLEN + (R - 1);
     const bool interior = y0 - radius >= 0 && y0 + taps_v - 1 - radius < HEIGHT;
 
-    if (interior) {
+    if (interior && KLEN > R) {
+        // The rolling window's padding taps (a weight index outside [0, KLEN))
+        // are skipped by *structure* here, not by a per-tap test: the three
+        // phases unroll to exactly the live taps, so the bulk of the loop is
+        // one fma per tap instead of compare + select + fma (measured 44% on
+        // the two-pass path), and the padding taps are never emitted, so a
+        // non-finite sample cannot spread through them either — which is what
+        // accum() guards against. The per-pixel fma sequence is unchanged.
+        // KLEN > R (always true on the two-pass path, which only runs for
+        // radius > 32) is what lets the phases meet without overlap.
         const int idx0 = pc.src_base + (y0 - radius) * STRIDE + x;
-        const int taps = KLEN + (R - 1);
-        for (int k = 0; k < taps; k += 2) {
+        #pragma unroll
+        for (int k = 0; k < R - 1; ++k) {            // ramp-up: j <= k live
             #pragma unroll
             for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
-            wreg[0] = (k < KLEN) ? wt[pc.wt_base + k] : 0.0f;
+            wreg[0] = wt[pc.wt_base + k];
+            const float v = load_value_raw(idx0 + k * STRIDE);
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                if (j <= k) sum[j] = fma(v, wreg[j], sum[j]);
+        }
+        for (int k = R - 1; k < KLEN; k += 2) {      // steady: every j live
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+            wreg[0] = wt[pc.wt_base + k];
             // both tap rows are issued before either FMA batch, so the VMEM
             // engine has two loads in flight instead of stalling per tap
             const float v0 = load_value_raw(idx0 + k * STRIDE);
             const float v1 = load_value_raw(idx0 + (k + 1) * STRIDE);
             #pragma unroll
             for (int j = 0; j < R; ++j)
-                sum[j] = accum(v0, wreg[j], sum[j]);
+                sum[j] = fma(v0, wreg[j], sum[j]);
             #pragma unroll
             for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
-            wreg[0] = (k + 1 < KLEN) ? wt[pc.wt_base + k + 1] : 0.0f;
+            wreg[0] = wt[pc.wt_base + k + 1];
             #pragma unroll
             for (int j = 0; j < R; ++j)
-                sum[j] = accum(v1, wreg[j], sum[j]);
+                sum[j] = fma(v1, wreg[j], sum[j]);
+        }
+        #pragma unroll
+        for (int t = 0; t < R - 1; ++t) {            // ramp-down: j > t live
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+            wreg[0] = 0.0f;                          // this slot is padding
+            const float v = load_value_raw(idx0 + (KLEN + t) * STRIDE);
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                if (j > t) sum[j] = fma(v, wreg[j], sum[j]);
+        }
+    } else if (KLEN > R) {
+        // The mirror path carries the border rows, which at the largest radii
+        // are most of the frame (radius 119 leaves 122 of 360 rows interior),
+        // so it gets the same three-phase, select-free window; only the load
+        // differs (a per-tap mirror instead of a linear address).
+        #pragma unroll
+        for (int k = 0; k < R - 1; ++k) {
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+            wreg[0] = wt[pc.wt_base + k];
+            int sy = y0 + k - radius;
+            sy = mirror(sy, HEIGHT);
+            sy = min(max(sy, 0), HEIGHT - 1);
+            const float v = load_value(sy * STRIDE + x);
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                if (j <= k) sum[j] = fma(v, wreg[j], sum[j]);
+        }
+        for (int k = R - 1; k < KLEN; ++k) {
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+            wreg[0] = wt[pc.wt_base + k];
+            int sy = y0 + k - radius;
+            sy = mirror(sy, HEIGHT);
+            sy = min(max(sy, 0), HEIGHT - 1);
+            const float v = load_value(sy * STRIDE + x);
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                sum[j] = fma(v, wreg[j], sum[j]);
+        }
+        #pragma unroll
+        for (int t = 0; t < R - 1; ++t) {
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+            wreg[0] = 0.0f;
+            int sy = y0 + KLEN + t - radius;
+            sy = mirror(sy, HEIGHT);
+            sy = min(max(sy, 0), HEIGHT - 1);
+            const float v = load_value(sy * STRIDE + x);
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                if (j > t) sum[j] = fma(v, wreg[j], sum[j]);
         }
     } else {
         for (int k = 0; k < KLEN + (R - 1); ++k) {
@@ -317,26 +388,92 @@ void main() {
     const int taps_h = KLEN + (R - 1);
     const bool interior = x0 - radius >= 0 && x0 + taps_h - 1 - radius < WIDTH;
 
-    if (interior) {
+    if (interior && KLEN > R) {
+        // Same three-phase, select-free window as the vertical pass: the
+        // steady phase is one fma per tap and the ramp phases unroll to the
+        // live taps only. See the vertical entry for the mechanism.
         const int base = pc.tmp_base + row + x0 - radius;
-        const int taps = KLEN + (R - 1);
-        for (int k = 0; k < taps; k += 2) {
+        #pragma unroll
+        for (int k = 0; k < R - 1; ++k) {            // ramp-up: j <= k live
             #pragma unroll
             for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
-            wreg[0] = (k < KLEN) ? wt[pc.wt_base + k] : 0.0f;
+            wreg[0] = wt[pc.wt_base + k];
+            const float v = tmp[base + k];
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                if (j <= k) sum[j] = fma(v, wreg[j], sum[j]);
+        }
+        for (int k = R - 1; k < KLEN; k += 2) {      // steady: every j live
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+            wreg[0] = wt[pc.wt_base + k];
             const float v0 = tmp[base + k];
             const float v1 = tmp[base + k + 1];
             #pragma unroll
             for (int j = 0; j < R; ++j)
-                sum[j] = accum(v0, wreg[j], sum[j]);
+                sum[j] = fma(v0, wreg[j], sum[j]);
             #pragma unroll
             for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
-            wreg[0] = (k + 1 < KLEN) ? wt[pc.wt_base + k + 1] : 0.0f;
+            wreg[0] = wt[pc.wt_base + k + 1];
             #pragma unroll
             for (int j = 0; j < R; ++j)
-                sum[j] = accum(v1, wreg[j], sum[j]);
+                sum[j] = fma(v1, wreg[j], sum[j]);
+        }
+        #pragma unroll
+        for (int t = 0; t < R - 1; ++t) {            // ramp-down: j > t live
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+            wreg[0] = 0.0f;                          // this slot is padding
+            const float v = tmp[base + KLEN + t];
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                if (j > t) sum[j] = fma(v, wreg[j], sum[j]);
         }
         store_row_packed(row, x0, sum);
+    } else if (KLEN > R) {
+        // same three-phase window as the vertical mirror path
+        #pragma unroll
+        for (int k = 0; k < R - 1; ++k) {
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+            wreg[0] = wt[pc.wt_base + k];
+            int sx = x0 + k - radius;
+            sx = mirror(sx, WIDTH);
+            sx = min(max(sx, 0), WIDTH - 1);
+            const float v = tmp[pc.tmp_base + row + sx];
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                if (j <= k) sum[j] = fma(v, wreg[j], sum[j]);
+        }
+        for (int k = R - 1; k < KLEN; ++k) {
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+            wreg[0] = wt[pc.wt_base + k];
+            int sx = x0 + k - radius;
+            sx = mirror(sx, WIDTH);
+            sx = min(max(sx, 0), WIDTH - 1);
+            const float v = tmp[pc.tmp_base + row + sx];
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                sum[j] = fma(v, wreg[j], sum[j]);
+        }
+        #pragma unroll
+        for (int t = 0; t < R - 1; ++t) {
+            #pragma unroll
+            for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+            wreg[0] = 0.0f;
+            int sx = x0 + KLEN + t - radius;
+            sx = mirror(sx, WIDTH);
+            sx = min(max(sx, 0), WIDTH - 1);
+            const float v = tmp[pc.tmp_base + row + sx];
+            #pragma unroll
+            for (int j = 0; j < R; ++j)
+                if (j > t) sum[j] = fma(v, wreg[j], sum[j]);
+        }
+        #pragma unroll
+        for (int j = 0; j < R; ++j) {
+            if (x0 + j < WIDTH) store_value(row + x0 + j, sum[j]);
+        }
     } else {
         for (int k = 0; k < KLEN + (R - 1); ++k) {
             #pragma unroll
