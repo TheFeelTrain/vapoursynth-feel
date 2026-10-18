@@ -22,11 +22,20 @@ jobs:
     steps:
     - uses: actions/checkout@v7
 
-    - name: System tools (glslc, spirv-val, cppcheck)
+    - name: System tools (glslc, spirv-val)
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
-          glslc spirv-tools cppcheck
+          glslc spirv-tools
+
+    # cppcheck comes from Homebrew rather than apt: the image's 2.19 mis-parses a
+    # parenthesised ternary inside a braced initializer and reports valid code
+    # with internalAstError, so its findings are not a contributor's. Homebrew
+    # carries upstream's current release, which is what a local rolling distro
+    # has, so the gate and the developer stay on the same version; tools/lint.sh
+    # prints it either way.
+    - name: cppcheck (Homebrew, current release)
+      run: brew install cppcheck
 
     # The interpreter, VapourSynth and the pinned clang-format/clang-tidy/ruff
     # all come from uv.lock, so this job runs the environment a developer gets

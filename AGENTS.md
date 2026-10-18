@@ -372,10 +372,12 @@ design.
 (`.github/workflows/lint.yml`). The pinned clang-format/clang-tidy/ruff come
 from the `lint` dependency group (`uv sync --group lint`), and the script puts
 `.venv/bin` first on `PATH`, so a local run and CI use the same versions --
-except `cppcheck`, which is a system package (apt on CI, the distro locally) and
-whose findings do drift between releases. `lint.sh` prints each gate's version
-so that difference is visible in the log; a finding that reproduces on neither
-box is a version difference, not a defect. Six gates:
+except `cppcheck`, which is installed from Homebrew on CI and from the distro
+locally. Both follow upstream's current release (the apt package lags and has
+shipped parser regressions), but they are not pinned, so a version step can
+still differ. `lint.sh` prints each gate's version so that difference is visible
+in the log; a finding that reproduces on neither box is a version difference,
+not a defect. Six gates:
 
 - **format** — `clang-format --dry-run --Werror` over `src/*.cpp` and `src/*.h`
   (`.clang-format`); `tools/lint.sh --fix` rewrites in place.

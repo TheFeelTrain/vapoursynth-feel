@@ -222,9 +222,9 @@ gate_notes() {
 status=()
 failed=0
 # The tool's own version next to the gate. clang-format/clang-tidy/ruff come from
-# the pinned lint group, cppcheck from the system (apt on CI, the distro here),
-# so a finding that reproduces on neither box is a version difference, and the
-# log has to show which one ran.
+# the pinned lint group, cppcheck from Homebrew on CI and the distro here, so a
+# finding that reproduces on neither box is a version difference, and the log has
+# to show which one ran.
 gate_version() {
     # clang-tidy prints a banner first, so take the first line naming a version.
     # A tool the gate will skip must not abort the run here: this probes before
