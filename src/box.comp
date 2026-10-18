@@ -25,7 +25,10 @@
  *
  * Buffers: src/dst are the core's own GPU frame planes (vnode: in/out), `mid`
  * is a transient per-frame scratch buffer, `taps` the constant table above.
- * Compile-time variants: -DIO_U16 / -DIO_F32.
+ * Compile-time variants: -DIO_U16 / -DIO_F16 / -DIO_F32. A half element is a
+ * 2-byte storage type like u16 but the sample is a float: it widens exactly on
+ * load and the accumulator stays f32, so `mid` is the sample type at every
+ * depth and only the stores round.
  */
 
 #if !defined(IO_U16) && !defined(IO_F32) && !defined(IO_F16)
@@ -35,6 +38,9 @@
 #if defined(IO_U16)
 #define IO_TYPE uint16_t
 #define PEAK    65535.0f
+#elif defined(IO_F16)
+#define IO_TYPE float16_t
+#define PEAK    1.0f
 #else
 #define IO_TYPE float
 #define PEAK    1.0f
@@ -66,6 +72,8 @@ layout(push_constant) uniform PushConstants {
 float load_src(int idx) {
 #if defined(IO_F32)
     return src[idx];
+#elif defined(IO_F16)
+    return float(src[idx]); // half -> float is exact
 #else
     // direct uint16_t->float conversion chokes glslc; int() widens cleanly
     return float(int(src[idx]));
@@ -75,6 +83,8 @@ float load_src(int idx) {
 float load_mid(int idx) {
 #if defined(IO_F32)
     return mid[idx];
+#elif defined(IO_F16)
+    return float(mid[idx]);
 #else
     return float(int(mid[idx]));
 #endif
@@ -82,9 +92,13 @@ float load_mid(int idx) {
 
 // Round half away from zero, then saturate. resize2's integer output rounds
 // the same way, which is not the round-to-nearest-even the other filters use.
+// A half intermediate keeps the reference's own storage rounding: OpFConvert
+// narrows with round-to-nearest-even and no saturation, like vstore_half_rte.
 void store_mid(int idx, float v) {
 #if defined(IO_F32)
     mid[idx] = v;
+#elif defined(IO_F16)
+    mid[idx] = float16_t(v);
 #else
     mid[idx] = uint16_t(uint(clamp(floor(v + 0.5), 0.0f, PEAK)) & 0xFFFFu);
 #endif
@@ -93,6 +107,8 @@ void store_mid(int idx, float v) {
 void store_dst(int idx, float v) {
 #if defined(IO_F32)
     dst[idx] = v;
+#elif defined(IO_F16)
+    dst[idx] = float16_t(v);
 #else
     dst[idx] = uint16_t(uint(clamp(floor(v + 0.5), 0.0f, PEAK)) & 0xFFFFu);
 #endif

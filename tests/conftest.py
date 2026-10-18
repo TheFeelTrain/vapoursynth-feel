@@ -977,6 +977,12 @@ def clip_rgb48():
     return _resized(vs.RGB48, matrix_in_s="709")
 
 
+@pytest.fixture(scope="session")
+def clip_rgbh():
+    """RGBH (half) version of the clip, the same content as the RGBS one."""
+    return vs.core.resize.Point(_resized(vs.RGBS, matrix_in_s="709"), format=vs.RGBH)
+
+
 def assert_grays(clip):
     fmt = clip.format
     assert fmt.color_family == vs.GRAY

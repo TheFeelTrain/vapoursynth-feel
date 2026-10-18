@@ -2,18 +2,25 @@
 
 **Shipped.** `core.vsfeel.Box(clip, width, height)` is a separable box downscale
 that runs on the device: each output pixel averages a group of source pixels with
-equal weight. It handles every plane of Gray/YUV/RGB, u16 or f32, any downscale
-ratio, and refuses upscales.
+equal weight. It handles every plane of Gray/YUV/RGB, u16, f16 or f32, any
+downscale ratio, and refuses upscales.
 
 The reference is `vskernels.Box` (resize2's `Box` kernel), which `vsfeel.Box` is
-written to match. Measured on the 640x360 fixture, both depths, every plane:
+written to match. Measured on the 640x360 fixture, every depth, every plane:
 
 - bit-exact on u16 at every ratio whose tap counts are all powers of two and at
   the fractional ratios that pair only one or two source pixels (2, 4, 8, 1.5,
   1.25, 1.75, 1.1, 4/3 all measure 0);
 - ≤ 2 codes of 65535 on u16 where resize2's own float32 `1/count` is inexact,
   i.e. the tap counts 3, 5, 6, 7 (ratios 3, 2.5, 3.5, 5, 6);
-- ≤ 2.4e-7 of the peak on f32 everywhere, and exactly 0 at most ratios.
+- ≤ 2.4e-7 of the peak on f32 everywhere, and exactly 0 at most ratios;
+- bit-exact on f16 at the power-of-two and one/two-pixel fractional ratios other
+  than 8 (2, 4, 1.5, 1.25, 1.75, 1.1, 4/3), and one half step (4.88e-4 at the
+  unit peak) otherwise. Two mechanisms: our f32 divide is allowed 2.5 ULP on the
+  device, so a sum landing exactly on a half tie can narrow to the wrong
+  neighbour (3, 2.5, 3.5, 5); and resize2's own AVX2 f16 vertical pass splits its
+  window into two 8-tap blocks and round-trips the accumulator through half
+  between them (6, 8).
 
 | 1080p GRAY16 source → half size, 1000 f, medians of 3 | 1080p→540p | 4K→1080p |
 |---|---:|---:|
@@ -38,8 +45,12 @@ stride, so the horizontal pass reads contiguous taps.
 The *rounded* intermediate is not an optimisation choice. resize2 quantises the
 vertical result to the sample type before the horizontal pass; a single-pass
 float accumulate differs from it by 1 code on ~0.2% of pixels. `store_mid`
-therefore rounds half away from zero, which is what resize2's integer output
-does rather than the `roundEven` the other filters use.
+therefore rounds half away from zero for u16, which is what resize2's integer
+output does rather than the `roundEven` the other filters use, and narrows a
+half with `OpFConvert`'s round-to-nearest-even for f16. The scratch is the
+frame's own sample type at every depth: the f16 path loads half, keeps every
+accumulator f32, and narrows once per pass, so it is the f32 arithmetic with the
+reference's own storage rounding.
 
 **The tap window is a host-computed table, not a formula.** resize2's box is not
 an area average: it averages the source pixels whose *centres* fall inside the
@@ -52,11 +63,13 @@ frame: chroma is the same lattice shifted, so it reads a prefix of the luma tabl
 Smaller things worth knowing: `skip_vert` drops the first dispatch when an axis is
 unscaled; both strides are read off scratch frames at creation, because a GPU
 frame's stride is the CPU frame's; the two tables are concatenated into one host
-visible buffer like GaussBlur's weights.
+visible buffer like GaussBlur's weights; the io variant (u16/f16/f32) is one
+compile-time `-D` selected from the input format (half is `stFloat` + 16 bits),
+so Box ships six SPIR-V variants, two passes times three depths.
 
 ### Tests
 `tests/test_box.py` — reference comparison per ratio × depth and per color family
-at both depths, chroma geometry, residency, identity, determinism, frame
+at every depth, chroma geometry, residency, identity, determinism, frame
 properties, validation. `tests/test_vsaa.py` covers the chain that uses it.
 
 ## Performance
@@ -93,6 +106,13 @@ copies this filter removes.
 - **A `std.Convolution` composition was rejected**: the core refuses even kernels
   ("matrix must contain exactly 9, 25, 49…"), and this build's `std.Expr` has no
   relative pixel access.
+- **2026-10-18 — f16 shipped without full f32.** The scratch stays the frame's
+  sample type, so a half clip rounds the intermediate to half like resize2; the
+  residuals are under the banner's f16 bullet. A host-computed reciprocal was
+  tried to remove the fdiv ties: ACO contracts the multiply into the half store's
+  `v_fma_mixlo_f16` and re-rounds the tie once, with or without a `precise`
+  qualifier (`NoContraction` survives into the SPIR-V and is ignored), so it
+  changed nothing and was reverted.
 
 ## Open work
 
@@ -102,6 +122,9 @@ copies this filter removes.
   no LDS the shape looks unlikely to be the lever, but that is unmeasured.
 - Do not re-introduce the Merge composition "because it needs no new filter": it
   is bit-exact and ~8 fps slower on the chain that uses this one.
+- Do not chase the f16 half-step residue at ratios 3/2.5/3.5/5 with a host
+  reciprocal: mechanism under Historical. Ratios 6 and 8 are resize2's own f16
+  tap blocking and are not ours to match.
 
 ## Debug env vars
 

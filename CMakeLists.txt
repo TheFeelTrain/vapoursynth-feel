@@ -262,11 +262,14 @@ endforeach()
 # Box: one variant per pass per io type. The tap window is a host-computed
 # table (resize2's box filter is not an area average at fractional ratios), so
 # nothing else varies; the workgroup shape lives in the shader and is compared
-# against the host launch by tools/shader_limits.py --check.
+# against the host launch by tools/shader_limits.py --check. Its io list is
+# local like GaussBlur's: the other filters' kernels would fall through to
+# their u16 branch under an -DIO_F16 name.
+set(VK_BOX_IO_TYPES "u16" "f16" "f32")
 set(VK_BOX_ENTRIES vert horiz)
 set(VK_BOX_ENTRY_DEFS -DENTRY_VERT -DENTRY_HORIZ)
 set(VK_BOX_VARIANTS)
-foreach(io IN LISTS VK_IO_TYPES)
+foreach(io IN LISTS VK_BOX_IO_TYPES)
     string(TOUPPER "${io}" io_define)
     foreach(entry_i RANGE 0 1)
         list(GET VK_BOX_ENTRIES ${entry_i} entry)

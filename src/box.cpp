@@ -54,6 +54,7 @@ struct BoxData {
     VSVideoInfo out_vi {};     // output geometry (same format)
 
     int bits {}, elem_bytes {};
+    bool half {}; // stFloat + 16 bits: a 2-byte element whose sample is a float
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
     VkPipelineLayout pipeline_layout {};
@@ -329,18 +330,20 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
 
     const auto & fmt = d->vi->format;
     const int bits = fmt.bitsPerSample;
-    const bool depth_ok = (fmt.sampleType == stFloat && bits == 32) ||
-                          (fmt.sampleType == stInteger && bits == 16);
+    const bool depth_ok =
+        (fmt.sampleType == stFloat && (bits == 16 || bits == 32)) ||
+        (fmt.sampleType == stInteger && bits == 16);
     if (!vsh::isConstantVideoFormat(d->vi) || !depth_ok || d->vi->width <= 0 ||
         d->vi->height <= 0 ||
         (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV &&
          fmt.colorFamily != cfRGB)) {
         return set_error(
-            "input bitdepth must be u16 (16-bit integer) or f32 (32-bit float), Gray/YUV/RGB.");
+            "input bitdepth must be u16 (16-bit integer), f16 or f32 (16/32-bit float), Gray/YUV/RGB.");
     }
 
     d->bits = bits;
     d->elem_bytes = bits / 8;
+    d->half = fmt.sampleType == stFloat && bits == 16;
 
     const int dst_w = vsapi->mapGetIntSaturated(in, "width", 0, &error);
     const int dst_w_set = !error;
@@ -460,7 +463,12 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
     size_t vert_size = 0;
     const uint32_t * horiz_code = nullptr;
     size_t horiz_size = 0;
-    if (d->bits == 16) {
+    if (d->half) {
+        vert_code = box_f16_vert_spv;
+        vert_size = box_f16_vert_spv_size;
+        horiz_code = box_f16_horiz_spv;
+        horiz_size = box_f16_horiz_spv_size;
+    } else if (d->bits == 16) {
         vert_code = box_u16_vert_spv;
         vert_size = box_u16_vert_spv_size;
         horiz_code = box_u16_horiz_spv;

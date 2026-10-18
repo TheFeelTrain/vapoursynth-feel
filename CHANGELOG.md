@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `vsfeel.feel_aa`, a copy of `vsaa.based_aa` that keeps its processing entirely on the GPU
 - `core.vsfeel.Box`, a Vulkan implementation of a box downscale
-- Bilateral, BM3D, DFTTest, EEDI3, EEDI3H, EEDI3AA, GaussBlur, and NNEDI3 support fp16 input and output
+- Bilateral, BM3D, DFTTest, EEDI3, GaussBlur, and NNEDI3 support fp16 input and output
 
 ### Changed
 
