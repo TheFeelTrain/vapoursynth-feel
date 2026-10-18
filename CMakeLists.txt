@@ -186,10 +186,13 @@ endif()
 # kernels would silently build the u16 branch under an -DIO_F16 name.
 set(VK_IO_TYPES "u16" "f32")
 
-# Bilateral: one entry point per file, per io variant.
+# Bilateral: one entry point per file, per io variant (u16, f16, f32). Its io
+# list is local for the same reason GaussBlur's is: the other filters' kernels
+# would fall through to their u16 branch under an -DIO_F16 name.
+set(VK_BILATERAL_IO_TYPES "u16" "f16" "f32")
 set(VK_BILATERAL_VARIANTS)
 foreach(component IN ITEMS shared plain)
-    foreach(io IN LISTS VK_IO_TYPES)
+    foreach(io IN LISTS VK_BILATERAL_IO_TYPES)
         string(TOUPPER "${io}" io_define)
         list(APPEND VK_BILATERAL_VARIANTS
             "bilateral_${component}_${io}|bilateral_${component}.comp|-DIO_${io_define}")

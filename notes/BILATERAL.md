@@ -10,10 +10,15 @@ src/dst buffers, queue cap and fence are gone.
 Design (current):
 - Two kernels, chosen per plane at creation: `bilateral_shared.comp` (LDS-tiled
   gather, ~3.2–3.8x faster where the tile fits) and `bilateral_plain.comp`.
+- Three io variants — u16, f16, f32 — selected by the input format (half is
+  `stFloat` + 16 bits). A half element is a storage width, not a precision: the
+  f16 path runs the f32 tile and arithmetic, widens exactly on load and narrows
+  once on store (OpFConvert, round to nearest even), so its output is the f32
+  output rounded once and sits within one half step of vszipcl's f16 output.
 - Three whole-buffer bindings per dispatch (src, dst, guide); without a guide the
   source stands in on binding 2 and `HAS_REF=0` means the shader never reads it.
-- Native `uint16_t`/`float` SSBOs at `#version 450`, no push constants; every
-  geometry/weight parameter is a specialization constant
+- Native `uint16_t`/`float16_t`/`float` SSBOs at `#version 450`, no push
+  constants; every geometry/weight parameter is a specialization constant
   (`WIDTH/HEIGHT/STRIDE/RADIUS/SIGMA_*/HAS_REF/TILE_*/BLOCK_*`).
 - `STRIDE` is the core's plane pitch in elements, read off a scratch frame at
   creation (a GPU frame uses the identical stride math).
@@ -37,9 +42,24 @@ through `tools/benchmark.py`:
 | `--gpu-cache` | 2305.6 | 708.0 | 3.26x |
 | `--gpu-cache --no-download` (u16 / f32) | 2317 / 2296 | 732 / 457 | 3.88x |
 
-- The three modes are within 1% of each other: with the transfer queue the plane
-  transfers overlap the kernels, so the filter's own compute is the frame in
-  every mode and the output download is not on the critical path.
+Half input against its f32 twin (`--format f16` vs `--format f32`), same clip,
+sigma, frames and 3 repeats, one session:
+
+| mode | vsfeel f16 | vsfeel f32 | vszipcl f16 | vszipcl f32 |
+|---|---|---|---|---|
+| CPU cache (benchmark default) | 2319.8 | 1487.4 | 571.7 | 412.3 |
+| `--gpu-cache` | 2317.1 | 1983.6 | 744.5 | 464.6 |
+| `--gpu-cache --no-download` | 2346.4 | 2325.6 | 744.2 | 454.1 |
+
+- Compute-only the two depths tie (+0.9%, inside the run-to-run spread): the
+  frame is ALU/`exp2`-bound and the tile/arithmetic stay f32, so half storage
+  buys nothing there. It does show where the output is downloaded: f32 CPU cache
+  1487 vs f16 2320, `--gpu-cache` 1984 vs 2317 (the download is half the bytes).
+- For u16/f16 the three modes are within 1% of each other: with the transfer
+  queue the plane transfers overlap the kernels, so the filter's own compute is
+  the frame in every mode and the output download is not on the critical path.
+  At f32 the download is twice the bytes and that stops holding (2326
+  compute-only against 1487 through the CPU sink).
 
 ## Implementation
 
@@ -47,6 +67,10 @@ through `tools/benchmark.py`:
 
 - Per plane at creation: `BilateralPlaneConfig{width, height, stride, pipeline,
   grid_x, grid_y}`; identical plane configs share one `VkPipeline`.
+- The input format's `bits`/`half` select the SPIR-V pair: u16 →
+  `bilateral_{shared,plain}_u16`, f16 → `..._f16`, f32 → `..._f32`. The LDS
+  tile and the tap arithmetic are f32 at every depth; only the element type and
+  the load/store conversions change.
 - Frame path: `getGPUPlane` on src/guide/dst, bind pipeline, `gpu_push_buffers`
   (3 storage buffers via push descriptors, `VK_WHOLE_SIZE`), `vkCmdDispatch`,
   then `gpuExecReadsFrame`/`gpuExecWritesPlane`/`gpuExecSubmit`. No barrier is
@@ -60,7 +84,10 @@ through `tools/benchmark.py`:
 - `round(sigma_spatial*3)` is clamped to 1e6 before the float→int cast (the
   reference clamps identically); `sigma_spatial`/`sigma_color` reject NaN/inf.
 - u16 rounding is `uint(v*PEAK + 0.5) & 0xFFFF`, matching the reference's
-  round-half-away inside the 1-LSB test tolerance.
+  round-half-away inside the 1-LSB test tolerance. f16 rounding is
+  `float16_t(v)` — an OpFConvert, round to nearest even with no saturation, the
+  reference's `vstore_half_rte` — and half->float widening is exact, so the
+  f16 path adds no arithmetic precision loss of its own.
 
 ## Performance
 
@@ -109,9 +136,30 @@ through `tools/benchmark.py`:
 - The port wins exactly where a resident chain is involved: fed a GPU clip the
   old filter had to `GPUDownload` it first, the new one reads VRAM in place.
 
+- **Half storage costs nothing on compute and one step on accuracy.** The f16
+  kernel is the f32 one plus an `OpFConvert` on every tile load and on the store
+  (`RADV_DEBUG=asm`: both variants emit 360 `v_exp_f32` and ~1800 f32 ALU over
+  the unrolled 361-tap sweep), so compute-only is a tie: 2346 fps f16 vs 2326
+  f32 (1080p, sigma 3.0/0.02, 5000 frames, 3-repeat medians). Every f16
+  reference config measures exactly 4.88e-4 (one half step at |v| ∈ [0.5, 1)) on
+  a few tens of samples per frame, and 125 of 2.07M samples differ from the
+  *same-input* f32 run: the extra `OpFConvert` shifts ACO's contraction by one
+  instruction, so the two variants' f32 sums differ in the last bits and the
+  store rounds that to a step. That is the storage width's price, not the
+  arithmetic's.
+- **Both full-half prototypes lost, for the GAUSSBLUR mechanism.** A half LDS
+  tile measured 2250 fps (−3.6%): a scalar half load still takes a load slot and
+  every tap adds a widening convert, so halving the bytes saves nothing. Half
+  tile *and* half tap arithmetic (`float16_t` LDS, weights and accumulator)
+  measured 2270 fps (−2.6%) while drifting up to 9.3e-3 (~19 half steps) off the
+  f32 result. ACO emits scalar `v_fma_f16`/`v_exp_f16` for this shape, never a
+  packed `v_pk_*`, so the FMA rate does not move and the converts cost more than
+  the width saves (`notes/GAUSSBLUR.md` records the same result for its own
+  shape).
+
 Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter bilateral
-[vsfeel vszipcl] [--gpu-cache] [--format f32] [--bilateral-args "sigma_spatial=X,
-sigma_color=Y"]`.
+[vsfeel vszipcl] [--gpu-cache] [--format u16|f16|f32] [--bilateral-args
+"sigma_spatial=X, sigma_color=Y"]`.
 
 ## Historical
 
@@ -234,9 +282,17 @@ SDMA and the port reaches parity without any core change.
 - The only remaining lever is the kernel itself: at R=9 it is 84% of the frame
   and is ALU/`exp2`-bound, and the block-shape, wave32, unroll and vec4 sweeps
   below already came back empty — a kernel project, not a scheduling one.
+- A packed two-pixels-per-lane f16 kernel is the only untried f16 form. It would
+  halve the per-tap ALU, but `exp2` is emitted per tap (`v_exp_f32`, a
+  quarter-rate SFU op) and cannot be packed, so it cannot halve the frame and is
+  unlikely to clear the 30% bar that would justify the accuracy loss.
 
 ### Do not retry
 
+- **Half LDS, and half LDS with half tap arithmetic** (measured, mechanism under
+  Performance): −3.6% and −2.6% against the f32 tile, the second for up to 19
+  half steps of error. Do not retry without a code shape ACO actually packs into
+  `v_pk_*`.
 - **EEDI3-style batching.** EEDI3 batched because one small latency-bound
   dispatch left the GPU under-occupied; Bilateral's R=9 dispatch is 60×135 =
   8100 workgroups of 256 threads at 93–97% busy with a single node, so there

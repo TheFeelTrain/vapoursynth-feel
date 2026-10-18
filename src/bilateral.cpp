@@ -51,6 +51,9 @@ struct BilateralData {
     const VSVideoInfo * vi {};
 
     int bits {}, elem_bytes {};
+    // half input: the elements are 2 bytes like u16 but they are a float
+    // format, so the storage type and the store rounding differ
+    bool half {};
     bool process[3] { true, true, true };
 
     std::shared_ptr<GPUDevice> gpu;
@@ -429,12 +432,13 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
             std::pair { d->vi->format.bitsPerSample, d->vi->format.sampleType };
         !vsh::isConstantVideoFormat(d->vi) ||
         (sample == stInteger && bps != 16) ||
-        (sample == stFloat && bps != 32)) {
+        (sample == stFloat && bps != 32 && bps != 16)) {
         return set_error(
-            "input bitdepth must be u16 (16-bit integer) or f32 (32-bit float).");
+            "input bitdepth must be u16 (16-bit integer), f16 or f32 (16/32-bit float).");
     }
 
     d->bits = d->vi->format.bitsPerSample;
+    d->half = d->vi->format.sampleType == stFloat && d->bits == 16;
     d->elem_bytes = d->bits / 8;
 
     if (has_ref) {
@@ -734,7 +738,8 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         const int tile_x = 2 * key.radius + block_x;
         const int tile_y = 2 * key.radius + block_y;
         // the shared kernel keeps the source tile plus the guide tile (if any);
-        // the output goes straight to dst[] — there is no output tile
+        // the output goes straight to dst[] — there is no output tile. The tile
+        // is f32 at every io depth.
         const size_t shared_bytes =
             static_cast<size_t>(1 + has_ref) * tile_x * tile_y * sizeof(float);
 
@@ -751,10 +756,17 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
     size_t plain_size = 0;
     switch (d->bits) {
     case 16:
-        shared_code = bilateral_shared_u16_spv;
-        shared_size = bilateral_shared_u16_spv_size;
-        plain_code = bilateral_plain_u16_spv;
-        plain_size = bilateral_plain_u16_spv_size;
+        if (d->half) {
+            shared_code = bilateral_shared_f16_spv;
+            shared_size = bilateral_shared_f16_spv_size;
+            plain_code = bilateral_plain_f16_spv;
+            plain_size = bilateral_plain_f16_spv_size;
+        } else {
+            shared_code = bilateral_shared_u16_spv;
+            shared_size = bilateral_shared_u16_spv_size;
+            plain_code = bilateral_plain_u16_spv;
+            plain_size = bilateral_plain_u16_spv_size;
+        }
         break;
     case 32:
         shared_code = bilateral_shared_f32_spv;

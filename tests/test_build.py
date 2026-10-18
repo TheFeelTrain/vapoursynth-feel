@@ -147,7 +147,9 @@ def test_benchmark_no_download_selects_vspipe_no_output(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic", "--no-download"])
     ns = bench.parse_args()
     assert ns.no_download
-    assert "vspipe --" in bench._mode_desc(ns)
+    # The header labels the mode; what it must not do is still describe the
+    # retired chain rewrite (the outfile swap itself is asserted below).
+    assert "--no-download" in bench._mode_desc(ns)
     assert "8x8" not in bench._mode_desc(ns)
     for name, spec in bench.FILTERS.items():
         bench._apply_filter_args(ns, name, spec)

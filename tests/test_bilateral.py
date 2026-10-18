@@ -9,8 +9,10 @@ installed: REF_TOL (1e-6 on the normalized [0, 1] scale) for float32, where
 both sides compute the same math and measured diffs are float32 noise (~1e-8,
 including the wide-sigma configs measured at 5.6e-9). u16 output is
 compared in whole output codes (<= 1 LSB, 2 for the widest sigma), since both
-sides round nearly identical f32 results once. Self-consistency checks
-(determinism) remain exact.
+sides round nearly identical f32 results once. Half input/output is a storage
+width in the same f32 pipeline, so its agreement is bounded by one half ulp
+(F16_TOL, measured 4.88e-4; see the note on the constant). Self-consistency
+checks (determinism) remain exact at every depth.
 
 Every reference comparison runs in a subprocess (``reference_compare``) so a
 reference crash cannot take the pytest process down with it.
@@ -39,6 +41,15 @@ pytestmark = pytest.mark.usefixtures("clip_grays")
 SIGMA_SPATIAL = 3.0
 SIGMA_COLOR = 0.05
 REF_TOL = 1e-6
+
+# Half is a storage width, not a precision: the f16 variant runs the f32
+# arithmetic and narrows once at its store (round to nearest even, the
+# reference's vstore_half_rte). Measured on the noise clip, every f16 config
+# below lands at exactly 4.88e-4 (one half step at |v| in [0.5, 1)) on a few
+# tens of samples per frame; the two runs' f32 sums differ in their last bits,
+# and the half store surfaces that as one step. 1e-3 leaves headroom for a
+# second step on another driver's conversion.
+F16_TOL = 1e-3
 
 
 def _run(clip, **kwargs):
@@ -99,6 +110,55 @@ def test_bilateral_matches_reference_f32(clip_grays):
     params = dict(sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
     worst = _compare("grays", (0, 11, 23), params)
     assert worst < REF_TOL, f"max diff {worst}"
+
+
+# ---------------------------------------------------------------------------
+# f16 mirrors (half is a storage width in the same f32 pipeline)
+# ---------------------------------------------------------------------------
+
+
+def test_bilateral_matches_reference_f16(clip_grayh):
+    """Half input: within one half step of the reference's f16 output."""
+    params = dict(sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
+    worst = _compare("grayh", (0, 11, 23), params)
+    assert worst <= F16_TOL, f"max diff {worst}"
+
+
+def test_bilateral_output_finite_f16(clip_grayh):
+    """The half output must be finite and inside the [0, 1] sample range."""
+    out = _run(clip_grayh, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
+    for n in (0, 10, 23):
+        a = _plane(out.get_frame(n), 0, dtype=np.float16).astype(np.float64)
+        assert np.isfinite(a).all(), f"non-finite output at frame {n}"
+        assert a.min() >= 0.0 and a.max() <= 1.0
+
+
+def test_bilateral_defaults_run_f16(clip_grayh):
+    out = _run(clip_grayh)
+    assert_changes_on_clip(out, clip_grayh, frames=(0,), what="bilateral f16")
+
+
+def test_bilateral_deterministic_f16(clip_grayh):
+    a = _run(clip_grayh, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
+    b = _run(clip_grayh, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
+    for n in (0, 23):
+        da = _plane(a.get_frame(n), 0, dtype=np.float16) - _plane(
+            b.get_frame(n), 0, dtype=np.float16
+        )
+        assert np.abs(da).max() == 0.0
+
+
+def test_bilateral_accepts_f16(clip_grayh):
+    """A half clip is processed with its own format, not rejected as an
+    unsupported depth or silently routed through the u16 kernel.
+
+    A u16 kernel fed half samples would reinterpret the bit patterns and
+    produce a wildly different picture, so the reference comparison above is
+    what actually anchors the storage type; this pins the format contract.
+    """
+    out = _run(clip_grayh, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
+    assert out.format.id == clip_grayh.format.id
+    assert_changes_on_clip(out, clip_grayh, frames=(10,), what="bilateral f16")
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +312,14 @@ def test_bilateral_preserves_frame_props(clip_grays):
     )
 
 
+def test_bilateral_preserves_frame_props_f16(clip_grayh):
+    """The half path must republish props too (the store narrows pixels, not
+    frame props)."""
+    assert_preserves_frame_props(
+        _run, clip_grayh, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR
+    )
+
+
 def test_bilateral_deterministic_u16(clip_gray16):
     a = _run(clip_gray16, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
     b = _run(clip_gray16, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
@@ -269,6 +337,111 @@ def test_bilateral_ref_clip_matches_reference_u16(clip_gray16):
         guide={"kind": "flipvertical"},
     )
     assert worst <= 1.0, f"max diff {worst} LSB"
+
+
+# --- f16 sweeps, mirroring the u16 and f32 sets above -----------------------
+#
+# Same parameter grid, same shader variants, same joint-filter and YUV cases as
+# the u16 set, against vszipcl's f16 output. The bound is one half step plus
+# headroom (see F16_TOL).
+
+
+@pytest.mark.parametrize(
+    "sigma_spatial,sigma_color",
+    [
+        (1.0, 0.02),
+        (4.0, 0.05),
+        (8.0, 0.15),
+    ],
+    ids=["small-sigma", "default-like", "wide-sigma"],
+)
+def test_bilateral_sigma_sweep_matches_reference_f16(clip_grayh, sigma_spatial, sigma_color):
+    """Sigma grid on half input; radius is auto-derived from sigma_spatial."""
+    worst = _compare("grayh", (3, 17), dict(sigma_spatial=sigma_spatial, sigma_color=sigma_color))
+    assert worst <= F16_TOL, f"max diff {worst}"
+
+
+@pytest.mark.parametrize("radius", [1, 5])
+def test_bilateral_radius_sweep_matches_reference_f16(clip_grayh, radius):
+    """Explicit small and large radii on half input."""
+    worst = _compare("grayh", (3, 17), dict(sigma_spatial=2.0, sigma_color=0.05, radius=radius))
+    assert worst <= F16_TOL, f"max diff {worst}"
+
+
+@pytest.mark.parametrize("use_shared_memory", [True, False], ids=["shared", "plain"])
+def test_bilateral_shader_variants_match_vszipcl_f16(clip_grayh, use_shared_memory):
+    """Both half shader variants (shared LDS tile and plain gather) track the
+    reference; the plain run passes the same flag to vszipcl, so this is the
+    plain-vs-plain comparison (the two kernels' border semantics differ)."""
+    worst = _compare(
+        "grayh",
+        (0, 23),
+        dict(sigma_spatial=2.0, sigma_color=0.05, use_shared_memory=use_shared_memory),
+    )
+    assert worst <= F16_TOL, f"max diff {worst}"
+
+
+@pytest.mark.parametrize("use_shared_memory", [True, False], ids=["shared", "plain"])
+def test_bilateral_yuv_matches_reference_f16(clip_grayh, use_shared_memory):
+    """YUV420PH: all planes (incl. subsampled chroma with scaled default
+    sigmas) must track the reference, in both shader variants."""
+    reference_or_skip("vszipcl", "Bilateral")
+    spec = reference_spec(
+        "vszipcl",
+        "Bilateral",
+        "yuv420ph",
+        frames=(0, 11),
+        kwargs=dict(use_shared_memory=use_shared_memory),
+    )
+    worst = reference_compare(spec)["maxdiff"]
+    assert worst <= F16_TOL, f"max diff {worst}"
+
+
+def test_bilateral_ref_clip_matches_reference_f16(clip_grayh):
+    """Joint filtering through a guide clip, half variant."""
+    kwargs = dict(sigma_spatial=2.0, sigma_color=0.05)
+    out = _run(clip_grayh, ref=clip_grayh.std.FlipVertical(), **kwargs)
+    assert out.format.id == clip_grayh.format.id
+    worst = _compare("grayh", (0, 11, 23), kwargs, guide={"kind": "flipvertical"})
+    assert worst <= F16_TOL, f"max diff {worst}"
+
+
+def test_bilateral_f16_is_f32_rounded(clip_grayh):
+    """The half path is the f32 pipeline plus one store rounding.
+
+    ``gh`` widened to GRAYS is a container change (half -> float is exact), so
+    the two runs carry byte-identical input. Measured: one half step on 125 of
+    2.07M samples (the half variant's extra OpFConvert shifts the driver's
+    contraction, and the store rounds that last-bit difference), so the bound is
+    the f16 constant rather than 0. This oracle is device-independent and fails
+    first if the half variant ever grows arithmetic of its own — e.g. a half LDS
+    tile or a half accumulator, which the reference comparison could hide
+    behind its tolerance.
+    """
+    widened = vs.core.resize.Point(clip_grayh, format=vs.GRAYS)
+    half = _run(clip_grayh, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
+    full = _run(widened, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
+    for n in (3, 11, 23):
+        a = _plane(half.get_frame(n), 0, dtype=np.float16).astype(np.float64)
+        b = _plane(full.get_frame(n), 0, dtype=np.float32).astype(np.float64)
+        assert np.isfinite(a).all() and np.isfinite(b).all(), f"non-finite at frame {n}"
+        worst = float(np.abs(a - b).max())
+        assert worst <= F16_TOL, f"f16 vs f32 max diff {worst} at frame {n}"
+
+
+def test_bilateral_f16_is_f32_rounded_yuv(clip_yuv420ph):
+    """YUV420PH mirror of the rounded-once oracle: every plane, subsampled
+    chroma included."""
+    widened = vs.core.resize.Point(clip_yuv420ph, format=vs.YUV420PS)
+    half = _run(clip_yuv420ph, sigma_spatial=2.0, sigma_color=0.05)
+    full = _run(widened, sigma_spatial=2.0, sigma_color=0.05)
+    for n in (3, 11, 23):
+        fa, fb = half.get_frame(n), full.get_frame(n)
+        for p in range(fa.format.num_planes):
+            a = _plane(fa, p, dtype=np.float16).astype(np.float64)
+            b = _plane(fb, p, dtype=np.float32).astype(np.float64)
+            worst = float(np.abs(a - b).max())
+            assert worst <= F16_TOL, f"plane {p}: f16 vs f32 max diff {worst} at frame {n}"
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +475,17 @@ def test_bilateral_block_shape_does_not_change_output_u16(clip_gray16, block_x, 
     for n in (0, 11, 23):
         a = _plane(default.get_frame(n), 0)
         b = _plane(shaped.get_frame(n), 0)
+        assert np.array_equal(a, b), f"block {block_x}x{block_y} changed frame {n}"
+
+
+@pytest.mark.parametrize("block_x,block_y", BLOCK_SHAPES, ids=[f"{x}x{y}" for x, y in BLOCK_SHAPES])
+def test_bilateral_block_shape_does_not_change_output_f16(clip_grayh, block_x, block_y):
+    kwargs = dict(sigma_spatial=3.0, sigma_color=0.05)
+    default = _run(clip_grayh, **kwargs)
+    shaped = _run(clip_grayh, block_x=block_x, block_y=block_y, **kwargs)
+    for n in (0, 11, 23):
+        a = _plane(default.get_frame(n), 0, dtype=np.float16)
+        b = _plane(shaped.get_frame(n), 0, dtype=np.float16)
         assert np.array_equal(a, b), f"block {block_x}x{block_y} changed frame {n}"
 
 
@@ -387,6 +571,38 @@ def test_bilateral_per_plane_arrays_gray_f32(clip_grays):
     assert worst < REF_TOL, f"max diff {worst}"
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"sigma_spatial": [2.0, 1.0, 1.0]},  # the chroma rule
+        {"sigma_spatial": [2.0, 1.5, 1.5], "sigma_color": [0.05, 0.02, 0.02]},
+        {"sigma_spatial": [2.0, 1.0, 3.0], "sigma_color": [0.05, 0.02, 0.1], "radius": [2, 1, 3]},
+        {"sigma_spatial": [1.0, 0.5, 0.5], "radius": [1, 1, 1]},
+    ],
+    ids=["chroma-rule", "spatial+color", "all-three", "radius-1"],
+)
+def test_bilateral_per_plane_arrays_match_reference_f16(clip_grayh, kwargs):
+    """YUV420PH with explicit per-plane arrays must track vszipcl on all three
+    planes (incl. the subsampled chroma lattice)."""
+    worst = _compare("yuv420ph", (0, 11, 23), kwargs)
+    assert worst <= F16_TOL, f"max diff {worst} ({kwargs})"
+
+
+def test_bilateral_per_plane_arrays_gray_f16(clip_grayh):
+    """f16 mirror: on a single-plane clip only element 0 is used and extra
+    elements must not change the result."""
+    scalar = _run(clip_grayh, sigma_spatial=2.0, sigma_color=0.05)
+    array = _run(clip_grayh, sigma_spatial=[2.0, 1.5, 1.0], sigma_color=[0.05, 0.03, 0.02])
+    for n in (0, 11):
+        a = _plane(scalar.get_frame(n), 0, dtype=np.float16)
+        b = _plane(array.get_frame(n), 0, dtype=np.float16)
+        assert np.array_equal(a, b), f"extra array elements changed frame {n}"
+    worst = _compare(
+        "grayh", (0, 11, 23), dict(sigma_spatial=[2.0, 1.5, 1.0], sigma_color=[0.05, 0.03, 0.02])
+    )
+    assert worst <= F16_TOL, f"max diff {worst}"
+
+
 # ---------------------------------------------------------------------------
 # Per-plane processing mask (unprocessed planes share from the source)
 # ---------------------------------------------------------------------------
@@ -429,6 +645,24 @@ def test_bilateral_zero_chroma_sigma_shares_chroma_u16(clip_yuv420p16):
         for p in (1, 2):
             w, h = src.width >> 1, src.height >> 1
             assert np.array_equal(_plane(f, p, w, h, np.uint16), _plane(s, p, w, h, np.uint16)), (
+                f"chroma{p} changed at frame {n}"
+            )
+
+
+def test_bilateral_zero_chroma_sigma_shares_chroma_f16(clip_yuv420ph):
+    """f16 mirror of the share path: half chroma must pass through
+    bit-identically (not narrowed through f32 and back)."""
+    src = clip_yuv420ph
+    out = _run(src, sigma_spatial=[2.0, 0.0, 0.0])
+    assert out.format.id == src.format.id
+    for n in (0, 11, 23):
+        f = out.get_frame(n)
+        s = src.get_frame(n)
+        assert not np.array_equal(_plane(f, 0, dtype=np.float16), _plane(s, 0, dtype=np.float16)), (
+            f"luma was not filtered at frame {n}"
+        )
+        for p in (1, 2):
+            assert np.array_equal(_plane(f, p, dtype=np.float16), _plane(s, p, dtype=np.float16)), (
                 f"chroma{p} changed at frame {n}"
             )
 

@@ -29,6 +29,8 @@ _LAYER = "VK_LAYER_KHRONOS_validation"
 FILTERS = [
     "Bilateral",
     "Bilateral_u16",
+    "Bilateral_f16",
+    "Bilateral_f16_plain",
     "GaussBlur",
     "GaussBlurLarge",
     "GaussBlur_f16",
@@ -68,6 +70,15 @@ _SCRIPT = textwrap.dedent(f"""\
         # storageBuffer16BitAccess; the SPIR-V 1.0 Uniform+BufferBlock form
         # would need the feature the core does not enable.
         node = core.vsfeel.Bilateral(g16, sigma_spatial=3.0, sigma_color=0.05)
+    elif name == "Bilateral_f16":
+        # Same StorageBuffer-class codegen for a float16_t element, plus the
+        # narrowing store: an OpFConvert that must not declare a Float16
+        # capability the logical device has not enabled.
+        node = core.vsfeel.Bilateral(gh, sigma_spatial=3.0, sigma_color=0.05)
+    elif name == "Bilateral_f16_plain":
+        # The plain (non-LDS) half kernel, a separate SPIR-V module.
+        node = core.vsfeel.Bilateral(gh, sigma_spatial=3.0, sigma_color=0.05,
+                                     use_shared_memory=0)
     elif name == "GaussBlur":
         node = core.vsfeel.GaussBlur(gs, sigma=2.0)
     elif name == "GaussBlurLarge":

@@ -4,11 +4,17 @@
 /*
  * Bilateral filter compute shader, shared-memory (tiled) variant.
  *
- * Compile-time variants: -DIO_U16 / -DIO_F32 select the element type. Each
- * plane is bound whole into its own binding: src is the filtered source, ref
- * the guide (bound to src when HAS_REF is 0) and dst the output frame plane.
- * All three hold native elements, so loads and stores are plain coalesced
- * accesses — no shift/mask unpacking, no dword packing, no atomics.
+ * Compile-time variants: -DIO_U16 / -DIO_F16 / -DIO_F32 select the element
+ * type. Each plane is bound whole into its own binding: src is the filtered
+ * source, ref the guide (bound to src when HAS_REF is 0) and dst the output
+ * frame plane. All three hold native elements, so loads and stores are plain
+ * coalesced accesses — no shift/mask unpacking, no dword packing, no atomics.
+ *
+ * A half element is a storage width, not a precision: it widens exactly on
+ * load and narrows once on store (OpFConvert, the SPIR-V default round to
+ * nearest even, i.e. vszipcl's vstore_half_rte), while the LDS tile and the
+ * tap arithmetic stay f32. Half LDS, half arithmetic and a half accumulator
+ * were all measured slower on this code shape (`notes/BILATERAL.md`).
  *
  * WIDTH/HEIGHT/STRIDE/RADIUS/... are specialization constants so that the
  * compiler can fully unroll the tile-load loops and constant-fold all
@@ -24,6 +30,10 @@
 #define IO_TYPE uint16_t
 #define PEAK       65535.0f
 #define SCALE      (1.0f / 65535.0f)
+#elif defined(IO_F16)
+#define IO_TYPE float16_t
+#define PEAK       1.0f
+#define SCALE      1.0f
 #else
 #define IO_TYPE float
 #define PEAK       1.0f
@@ -52,6 +62,8 @@ shared float buf[SHARED_FLOATS];
 float load_src(int idx) {
 #if defined(IO_F32)
     return src[idx];
+#elif defined(IO_F16)
+    return float(src[idx]);   // half -> float is exact
 #else
     // direct uint16_t->float conversion chokes glslc; int() widens cleanly
     return float(int(src[idx])) * SCALE;
@@ -61,6 +73,8 @@ float load_src(int idx) {
 float load_ref(int idx) {
 #if defined(IO_F32)
     return ref[idx];
+#elif defined(IO_F16)
+    return float(ref[idx]);
 #else
     return float(int(ref[idx])) * SCALE;
 #endif
@@ -69,6 +83,10 @@ float load_ref(int idx) {
 void store_value(int idx, float v) {
 #if defined(IO_F32)
     dst[idx] = v;
+#elif defined(IO_F16)
+    // OpFConvert narrows with the SPIR-V default round-to-nearest-even and no
+    // saturation, i.e. the reference's vstore_half_rte
+    dst[idx] = float16_t(v);
 #else
     // glslc -O chokes on a direct float->uint16_t convert (OpUConvert); go
     // through uint with an explicit mask (same workaround as nlmeans/dfttest)

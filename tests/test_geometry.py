@@ -41,6 +41,9 @@ CROP_FROM = 640
 #   bilateral  f32 630/638 gray:   4.7e-9..5.6e-9 (with and without guide)
 #   bilateral  f32 630/638 yuv420: 2.38e-7  -> 1e-6
 #   bilateral  u16 630/638 (both): 1 code   -> <= 1 LSB
+#   bilateral  f16 630/638 (gray, with guide, yuv420): one half step (4.88e-4)
+#                                     -> 1e-3, the same f16 bound as
+#                                     tests/test_bilateral.py
 #   bm3d       f32 630/638 (radius=1): 6.44e-3 -> block-match decision flips
 #                                     on rounding order; 0.02 bound
 #   eedi3      u16: bit-exact vs eedi3vk2 (shared surface); f32 ~1 ulp
@@ -53,6 +56,7 @@ CROP_FROM = 640
 # the old DFTTest download helper fault.
 TOL_F32_ULP = 1e-6
 TOL_U16_LSB = 1.0
+TOL_F16 = 1e-3
 TOL_BM3D = 0.02
 TOL_EEDI3_U16 = 0.0
 TOL_EEDI3_F32 = 1e-6
@@ -274,6 +278,11 @@ for _w in WIDTHS:
     _add("bilateral", 32, _w, 1, _BILATERAL_PARAMS, TOL_F32_ULP)
     _add("bilateral", 16, _w, 0, _BILATERAL_PARAMS, TOL_U16_LSB)
     _add("bilateral", 16, _w, 1, _BILATERAL_PARAMS, TOL_U16_LSB)
+    # The half path adds a second 2-byte element type to Bilateral's odd-pitch
+    # geometry: 630 half samples are 1260 bytes per row, and the guide clip is
+    # a second half plane through the same bindings.
+    _add("bilateral", 16, _w, 0, _BILATERAL_PARAMS, TOL_F16, half=1)
+    _add("bilateral", 16, _w, 1, _BILATERAL_PARAMS, TOL_F16, half=1)
     _add("bm3d", 32, _w, 0, _BM3D_PARAMS, TOL_BM3D)
     # R3: NNEDI3's prescreen dispatch grid must cover every row's tail
     # (P=4 does not divide 630/638).  GRAY16 only: nnedi3vk wants an integer
@@ -305,6 +314,9 @@ for _w in WIDTHS:
     _add("gaussblur", 16, _w, 0, _GAUSS_PARAMS, 0.0, "yuv420", half=1)
     _add("bilateral", 32, _w, 0, _BILATERAL_PARAMS, TOL_F32_ULP, "yuv420")
     _add("bilateral", 16, _w, 0, _BILATERAL_PARAMS, TOL_U16_LSB, "yuv420")
+    # Half chroma: the 315-sample chroma rows are 630 bytes, the second 2-byte
+    # plane width in this matrix.
+    _add("bilateral", 16, _w, 0, _BILATERAL_PARAMS, TOL_F16, "yuv420", half=1)
     # BM3D denoises every plane, so the half-width chroma rows are part of the
     # graded surface now (they were passed through before).
     _add("bm3d", 32, _w, 0, _BM3D_PARAMS, TOL_BM3D, "yuv420")
