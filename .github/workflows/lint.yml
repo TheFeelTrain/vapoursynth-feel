@@ -33,9 +33,16 @@ jobs:
     # with internalAstError, so its findings are not a contributor's. Homebrew
     # carries upstream's current release, which is what a local rolling distro
     # has, so the gate and the developer stay on the same version; tools/lint.sh
-    # prints it either way.
+    # prints it either way. The image ships Homebrew pre-installed at
+    # /home/linuxbrew but leaves it off PATH, and a step's PATH does not carry to
+    # the next, so the eval below and the GITHUB_PATH line are both required.
     - name: cppcheck (Homebrew, current release)
-      run: brew install cppcheck
+      env:
+        HOMEBREW_NO_AUTO_UPDATE: 1
+      run: |
+        eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+        brew install cppcheck
+        echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
 
     # The interpreter, VapourSynth and the pinned clang-format/clang-tidy/ruff
     # all come from uv.lock, so this job runs the environment a developer gets
