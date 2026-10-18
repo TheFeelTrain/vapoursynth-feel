@@ -676,19 +676,30 @@ core.max_cache_size = spec.get("max_cache_size", 256)
 src = core.bs.VideoSource(spec["source"])
 # ``clip`` names the input the filter is graded on; the default is the GRAYS
 # clip every single-plane filter uses. A filter that processes chroma is graded
-# on a color clip instead, so its per-plane caches see the real thing.
+# on a color clip instead, so its per-plane caches see the real thing. A
+# half-float case grades the same content as its f32 sibling (the fixtures
+# build GRAYH/YUV420PH by widening and rounding), and ``dt`` below has to be
+# half or the 2-byte samples are reinterpreted.
 kind = spec.get("clip", "grays")
 if kind == "grays":
     clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                               bits=32, fulls=True, fulld=True)
+elif kind == "grayh":
+    clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
+                              bits=32, fulls=True, fulld=True)
+    clip = core.resize.Point(clip, format=vs.GRAYH)
 elif kind == "yuv420ps":
     clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
+elif kind == "yuv420ph":
+    clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
+    clip = core.resize.Point(clip, format=vs.YUV420PH)
 elif kind == "yuv444ps":
     clip = core.resize.Bicubic(src, format=vs.YUV444PS)
 elif kind == "rgbs":
     clip = core.resize.Bicubic(src, format=vs.RGBS, matrix_in_s="709")
 else:
     raise SystemExit("bad clip kind %r" % kind)
+dt = np.float16 if kind.endswith("h") else np.float32
 if spec.get("nframes"):
     # Exactly that many frames. `std.Loop(times=N)` *multiplies* the clip's
     # length instead: with `nframes=12` on the 300-frame source it built a
@@ -725,7 +736,7 @@ def run(order):
     raw = getattr(core.vsfeel, spec["filter"])(clip, **kwargs)
     # Pixels are read directly, so a GPU-resident node gets downloaded first.
     node = core.std.GPUDownload(clip=raw) if raw.gpu_resident else raw
-    return {n: read_plane(node.get_frame(n), plane, np.float32).copy() for n in order}
+    return {n: read_plane(node.get_frame(n), plane, dt).copy() for n in order}
 
 
 try:

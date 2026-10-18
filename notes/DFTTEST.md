@@ -6,6 +6,9 @@ Target GPU: RX 7900 XTX (RDNA3, gfx1100), Mesa 26.2 RADV.
 - `clip:vnode:gpu` in, `ffGPUOutput` out: the core owns every transfer and the
   filter records one submission per output frame into one exec pool (no
   filter-owned staging, timelines, fences or descriptor sets).
+- u16 / f16 / f32 IO. The half path stages native `float16_t` in the padded
+  plane and widens for the f32 work; half is a storage width, not a precision
+  (Implementation).
 - Per output frame and processed plane: `pad` (one dispatch per temporal slice,
   reading that slice's own source plane) → barrier → `fused` → barrier →
   `col2im` straight into the output plane. Scratch is two `createGPUBuffer`
@@ -21,6 +24,18 @@ Scoreboard — jpbd 1080p GRAY16, 3000 frames, medians of 3 through
 | CPU cache (benchmark default) | 1456.9 | 805.5 | 1.81x |
 | `--gpu-cache` | 1512.9 | 879.4 | 1.72x |
 | `--synthetic` BlankClip | 1500.6 | 900.1 | 1.67x |
+
+IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
+(`--format u16|f16|f32`; the f16 clip carries the u16 clip's content):
+
+| io | vsfeel | vszipcl |
+|---|---|---|
+| u16 | 1486.9 | 797.8 |
+| f16 | 1524.1 | no f16 path |
+| f32 | 1385.7 | 558.3 |
+
+- Neither reference implements an f16 DFTTest, so the half path is graded
+  against the f32 path on the losslessly widened clip, not against vszipcl.
 
 - The three modes agree within 4%: the frame is the kernels, and with the
   transfer queue the transfers ride along instead of adding a stage.
@@ -76,9 +91,28 @@ Scoreboard — jpbd 1080p GRAY16, 3000 frames, medians of 3 through
 - FFTW codelets, window/sigma table math, filter formulas and the reflect-pad
   rule are unchanged from the ported reference; only the buffers the data comes
   from and goes to changed.
-- 12 SPIR-V blobs (`pad`/`col2im` × 2 depths, `fused_r0..3` × 2 depths), down
-  from 22: the `pad_slot`/`pad_direct` and `fused`/`fused_direct` variants
-  collapsed into one each.
+- 18 SPIR-V blobs (`pad`/`col2im` × 3 depths, `fused_r0..3` × 3 depths), up
+  from the pre-f16 12 and down from the port's 22: the `pad_slot`/`pad_direct`
+  and `fused`/`fused_direct` variants collapsed into one each.
+
+### f16 IO (`IO_F16`, `src/dfttest.comp`)
+
+- The pad plane stages native `float16_t` (2 bytes, half the padded bytes) and
+  the fused kernel widens it. Widening a half is exact and the `*255` domain
+  scale is exact in f32 too (an 11-bit mantissa shifted by 8), so the fused
+  values are the f32 path's on the widened clip; `spatial` stays f32, so the
+  only rounding the half path adds is the col2im store's round-to-nearest-even.
+- Graded against the f32 path on the losslessly widened clip (Point GRAYH →
+  GRAYS is a container change): worst 0.95 half ulp relative to the output
+  magnitude over the whole parameter surface, and ≥ 99.99% of samples
+  bit-identical to the f32 result rounded to half (`tests/test_dfttest.py`).
+  The last-bit f32 difference between the two SPIR-V modules comes from the
+  half → float widening being contracted into a mixed-precision fma, the same
+  residue `notes/GAUSSBLUR.md` documents.
+- The half path selects different blobs, so `DftCreate` keys the variant on
+  `half` rather than `bits` (both are 16). `tests/test_dfttest.py` also adds a
+  630-px cropped half case (1260-byte rows, 630-byte chroma rows) and
+  `tests/test_validation.py` a `DFTTest_f16` validation run.
 
 ### What the port deleted
 
@@ -90,6 +124,20 @@ force-pad / fail-pad probes: 2854 lines of C++ became 1565.
 
 ## Performance
 
+- **f16 is +10% over f32 and is a storage width, not a precision.** 1524.1 vs
+  1385.7 fps on the same content (jpbd 1080p, 3000-frame medians): half halves
+  the padded plane (26 → 13 MB at 1080p) and its pad stores, and the parity
+  oracle above holds. The f16 module's fused_r1 codegen is within a few
+  percent of the f32 module's (VGPR 120, 12 waves/SIMD; VALU 1710 vs 1777).
+- **Full-fp16 arithmetic is rejected: it measured 5.6% SLOWER, not 30%
+  faster.** A throwaway `-DF16_MATH` build made `td[]`/`trans` half and the
+  FFTW codelets compute in half: 1438.1 vs 1524.1 fps, and the parity oracle
+  collapsed (66% exact on the default config, worst 7.8e-3). Mechanism: a half
+  scalar op is not cheaper here (the f16 module's fused_r1 VALU 1710 → 2109,
+  the extra count the f32 window/filter terms' converts) and dual-issue packing
+  collapsed (VOPD 562 → 15); the LDS/scratch halving and 12 → 16 waves/SIMD at
+  radius 0 did not pay for it. Half only wins as a storage width, which is what
+  ships.
 - **The pre-port gap was the exposed download, closed by the SDMA opt-in**
   (mechanism: `notes/BILATERAL.md`). The default run lands within a few percent
   of pre-R80.
@@ -98,6 +146,28 @@ force-pad / fail-pad probes: 2854 lines of C++ became 1565.
   chained instances +4%, the two extra pad dispatches per frame the residual.
 - **Fused codegen residue is deliberately left**: remaining IM2COL/window ALU
   and pointer-walk strength reduction; col2im already runs ~2x the references.
+
+### Possible optimizations (not yet tried)
+
+- **Radius 2/3 spill.** fused_r2/r3 still spill 20 480 / 28 672 scratch bytes
+  per invocation (VGPR 192/8 waves and 256/5 waves; the f16 module's r2 is
+  VGPR 216/7 waves, one wave worse than the f32 module). Cutting the live
+  `td[]` set without half arithmetic — restructuring a codelet to keep fewer
+  temporaries, or splitting the temporal loop — is the path to removing the
+  spills, and radius 2/3 is where the frame time is.
+- **Window loads.** `IM2COL_SLICE` issues `tw*16` strided `wt[]` loads per
+  thread (48 at radius 1) and FILTER_BIN re-reads the 3D window_freq table; the
+  window is per-(slice,lane) and could be staged once in LDS or, where the
+  access is lane-uniform, folded into the register set.
+- **`spatial` is f32** (`num_blocks*256*4`, 136 MB at 1080p — the larger of the
+  two buffers). Staging it as half would halve that handoff at one extra
+  rounding before col2im; the parity oracle would have to be relaxed for it.
+- **One pad dispatch per temporal slice** (3 at radius 1, 7 at radius 3). A
+  single dispatch writing all slices would remove `tw-1` launches and the
+  per-slice descriptor churn.
+- **Workgroup/sub-block sweep for the f16 module.** The half codegen moved
+  radius-2 occupancy (VGPR 216 vs 192), so `SUB_BLOCKS` and the launch shape
+  deserve a re-sweep under `-DIO_F16` specifically.
 
 ## Historical
 
@@ -194,6 +264,8 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
 ### Do not retry
 
+- **Half arithmetic in the fused kernel.** 5.6% slower and less accurate, for
+  the VALU/VOPD mechanism in Performance; half pays only as a storage width.
 - **In-filter download alternatives.** A second *compute-family* queue for the
   copy (neutral: same engine), the core's host-visible direct-read path with
   streaming loads (fast at 1080p, collapses past ~8 MB), host-cached plane

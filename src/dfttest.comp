@@ -1,6 +1,6 @@
 #version 450
 
-#if defined(IO_U16)
+#if defined(IO_U16) || defined(IO_F16)
 #extension GL_EXT_shader_16bit_storage : require
 #endif
 #extension GL_KHR_shader_subgroup_basic : require
@@ -25,9 +25,14 @@
  * mean path subtracts the window frequency response scaled by the DC gain.
  * The IO conversion follows the references: u16 input is scaled by
  * SCALE (1/256), f32 input by 255.0; integer output rounds with
- * +0.5 truncation (__float2int_rz) and clamps.
+ * +0.5 truncation (__float2int_rz) and clamps. The f16 path carries the same
+ * 255.0 scale as f32 but stages native float16_t elements, and half is a
+ * *storage* width rather than a precision: widening a half is exact and
+ * multiplying it by 255 is exact in f32 (an 11-bit mantissa shifted by 8), so
+ * the fused kernel sees the same f32 values the f32 path would and only the
+ * final store rounds, with the same round-to-nearest-even a half clip wants.
  *
- * Compile-time variants: -DIO_U16 / -DIO_F32 and exactly one of
+ * Compile-time variants: -DIO_U16 / -DIO_F16 / -DIO_F32 and exactly one of
  * -DENTRY_PAD / -DENTRY_FUSED / -DENTRY_COL2IM defining the entry point.
  * Everything else
  * (radius, block_step, plane geometry, filter parameters, buffer offsets) is
@@ -58,6 +63,12 @@
 #define ELEM_MASK  0xFFFFu
 #define PEAK       65535.0
 #define SCALE      (1.0 / 256.0)
+#elif defined(IO_F16)
+// A half element is a 2-byte transport like u16 but the sample is a float;
+// the shader reads and writes native float16_t so no mask/shift applies.
+#define ELEM_BYTES 2
+#define PEAK       1.0
+#define SCALE      255.0
 #else
 #define ELEM_BYTES 4
 #define ELEM_MASK  0xFFFFFFFFu
@@ -93,6 +104,10 @@ layout(std430, binding = 0) readonly buffer WtBuf { float wt[]; };
 layout(std430, binding = 1) buffer PaddedBuf { uint16_t padded16[]; };
 layout(std430, binding = 3) readonly buffer SrcBuf { uint16_t src16[]; };
 layout(std430, binding = 4) buffer DstBuf { uint16_t dst16[]; };
+#elif defined(IO_F16)
+layout(std430, binding = 1) buffer PaddedBuf { float16_t padded16[]; };
+layout(std430, binding = 3) readonly buffer SrcBuf { float16_t src16[]; };
+layout(std430, binding = 4) buffer DstBuf { float16_t dst16[]; };
 #else
 layout(std430, binding = 1) buffer PaddedBuf { uint padded_raw[]; };
 layout(std430, binding = 3) readonly buffer SrcBuf { uint src_raw[]; };
@@ -1307,60 +1322,66 @@ void irdft16(inout float data[TD_SZ], int base) {
 
 // ---------------------------------------------------------------------------
 // IO helpers (pad / row data / frame planes)
+//
+// Every loader returns the internal f32 working value (the sample scaled by
+// SCALE), so the fused kernel is IO-type agnostic.
 // ---------------------------------------------------------------------------
-
-float to_float(uint raw) {
-#if defined(IO_F32)
-    return uintBitsToFloat(raw) * SCALE;
-#else
-    return float(raw) * SCALE;
-#endif
-}
 
 // the fused kernel reads the padded source planes: slice t of the window lives
 // at padded + t * pw * ph, padded_base is the per-plane buffer base (0).
-uint load_fused(int slice, int sample_idx, int pad_slice) {
+float load_fused(int slice, int sample_idx, int pad_slice) {
 #if defined(IO_U16)
-    return uint(padded16[(pc.padded_base >> 1) + slice * pad_slice + sample_idx]);
+    return float(int(padded16[(pc.padded_base >> 1) + slice * pad_slice + sample_idx])) * SCALE;
+#elif defined(IO_F16)
+    // half -> float is exact, and the *255 is exact in f32 as well
+    return float(padded16[(pc.padded_base >> 1) + slice * pad_slice + sample_idx]) * SCALE;
 #else
     int byte = pc.padded_base + (slice * pad_slice + sample_idx) * ELEM_BYTES;
     uint word = padded_raw[byte >> 2];
-    return (word >> (8 * (byte & 3))) & ELEM_MASK;
+    return uintBitsToFloat((word >> (8 * (byte & 3))) & ELEM_MASK) * SCALE;
 #endif
 }
 
 // the pad kernel reads the core's source frame plane (row stride in elements)
-uint load_src(int sample_idx) {
+float load_src(int sample_idx) {
 #if defined(IO_U16)
-    return uint(src16[(pc.src_base >> 1) + sample_idx]);
+    return float(int(src16[(pc.src_base >> 1) + sample_idx])) * SCALE;
+#elif defined(IO_F16)
+    return float(src16[(pc.src_base >> 1) + sample_idx]) * SCALE;
 #else
     int byte = pc.src_base + sample_idx * ELEM_BYTES;
     uint word = src_raw[byte >> 2];
-    return (word >> (8 * (byte & 3))) & ELEM_MASK;
+    return uintBitsToFloat((word >> (8 * (byte & 3))) & ELEM_MASK) * SCALE;
 #endif
 }
 
 // col2im writes the output frame plane directly
 void store_sample(int sample_idx, float v) {
-#if defined(IO_F32)
-    int byte = pc.dst_base + sample_idx * ELEM_BYTES;
-    dst_raw[byte >> 2] = floatBitsToUint(v / SCALE);
-#else
+#if defined(IO_U16)
     float x = v / SCALE;
     x = clamp(x + 0.5, 0.0, PEAK);
     dst16[(pc.dst_base >> 1) + sample_idx] = uint16_t(uint(x) & ELEM_MASK);
+#elif defined(IO_F16)
+    // OpFConvert narrows to half with round-to-nearest-even, the same rounding
+    // a half clip stores with; no clamp (half covers the whole range)
+    dst16[(pc.dst_base >> 1) + sample_idx] = float16_t(v / SCALE);
+#else
+    int byte = pc.dst_base + sample_idx * ELEM_BYTES;
+    dst_raw[byte >> 2] = floatBitsToUint(v / SCALE);
 #endif
 }
 
 // the pad kernel writes the padded source into the device-local padded buffer
 void store_padded(int sample_idx, float v) {
-#if defined(IO_F32)
-    int byte = pc.padded_base + sample_idx * ELEM_BYTES;
-    padded_raw[byte >> 2] = floatBitsToUint(v / SCALE);
-#else
+#if defined(IO_U16)
     float x = v / SCALE;
     x = clamp(x + 0.5, 0.0, PEAK);
     padded16[(pc.padded_base >> 1) + sample_idx] = uint16_t(uint(x) & ELEM_MASK);
+#elif defined(IO_F16)
+    padded16[(pc.padded_base >> 1) + sample_idx] = float16_t(v / SCALE);
+#else
+    int byte = pc.padded_base + sample_idx * ELEM_BYTES;
+    padded_raw[byte >> 2] = floatBitsToUint(v / SCALE);
 #endif
 }
 
@@ -1445,7 +1466,7 @@ void filter_value(inout float re, inout float im, int x, int y, int t) {
     const int row0 = (iy * pc.block_step) * pw + ix * pc.block_step + lane; \
     const int wrow0 = pc.wt_base + ((i) * 16) * 16 + lane; \
     for (int j = 0; j < 16; ++j) { \
-        d[(i) * 32 + j] = to_float(load_fused(i, row0 + j * pw, pw * ph)) * wt[wrow0 + j * 16]; \
+        d[(i) * 32 + j] = load_fused(i, row0 + j * pw, pw * ph) * wt[wrow0 + j * 16]; \
     } \
 }
 #define SPATIAL_SLICE(d, i) { \
@@ -1542,8 +1563,8 @@ void main() {
             int sy = y - pad_y;
             sx = sx < 0 ? -sx : (sx >= pc.width ? 2 * (pc.width - 1) - sx : sx);
             sy = sy < 0 ? -sy : (sy >= pc.height ? 2 * (pc.height - 1) - sy : sy);
-            const uint raw = load_src(sy * pc.src_stride + sx);
-            store_padded(pc.pad_t0 * pad_slice + y * pw + x, to_float(raw));
+            const float v = load_src(sy * pc.src_stride + sx);
+            store_padded(pc.pad_t0 * pad_slice + y * pw + x, v);
         }
     }
 }

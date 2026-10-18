@@ -477,6 +477,11 @@ struct DftData {
     const VSVideoInfo * vi {};
 
     int bits {}, elem_bytes {};
+    // half input: a 2-byte element like u16, but the sample is a float. The
+    // padded plane stages native half and the wideners are exact, so the f32
+    // working path is fed the same values the f32 input path would carry and
+    // only the final store rounds.
+    bool half {};
     bool process[3] { false, false, false };
 
     int radius {}, block_step {}, filter_type {}, tw {};
@@ -1047,16 +1052,18 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
 
     const auto & fmt = d->vi->format;
     const int bits = fmt.bitsPerSample;
-    const bool depth_ok = (fmt.sampleType == stFloat && bits == 32) ||
-                          (fmt.sampleType == stInteger && bits == 16);
+    const bool depth_ok =
+        (fmt.sampleType == stFloat && (bits == 32 || bits == 16)) ||
+        (fmt.sampleType == stInteger && bits == 16);
     if (!depth_ok || d->vi->width <= 0 || d->vi->height <= 0 ||
         (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV &&
          fmt.colorFamily != cfRGB)) {
         return set_error(
-            "input must be 16-bit integer (u16) or 32-bit float (f32), Gray/YUV/RGB, constant format.");
+            "input bitdepth must be u16 (16-bit integer), f16 or f32 (16/32-bit float), Gray/YUV/RGB, constant format.");
     }
     d->bits = bits;
     d->elem_bytes = bits / 8;
+    d->half = fmt.sampleType == stFloat && bits == 16;
 
     int ftype = vsh::int64ToIntS(vsapi->mapGetInt(in, "ftype", 0, &error));
     if (error) {
@@ -1489,7 +1496,8 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         size_t col2im_size = 0;
         const uint32_t * fused_code[4] {};
         size_t fused_size[4] {};
-        switch (d->bits) {
+        // Selects the half blobs, which `bits` alone cannot: f16 is 16 bits too.
+        switch (d->half ? 0 : d->bits) {
         case 16:
             pad_code = dfttest_u16_pad_spv;
             pad_size = dfttest_u16_pad_spv_size;
@@ -1517,6 +1525,20 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             fused_size[2] = dfttest_f32_fused_r2_spv_size;
             fused_code[3] = dfttest_f32_fused_r3_spv;
             fused_size[3] = dfttest_f32_fused_r3_spv_size;
+            break;
+        case 0: // half: stFloat + 16 bits
+            pad_code = dfttest_f16_pad_spv;
+            pad_size = dfttest_f16_pad_spv_size;
+            col2im_code = dfttest_f16_col2im_spv;
+            col2im_size = dfttest_f16_col2im_spv_size;
+            fused_code[0] = dfttest_f16_fused_r0_spv;
+            fused_size[0] = dfttest_f16_fused_r0_spv_size;
+            fused_code[1] = dfttest_f16_fused_r1_spv;
+            fused_size[1] = dfttest_f16_fused_r1_spv_size;
+            fused_code[2] = dfttest_f16_fused_r2_spv;
+            fused_size[2] = dfttest_f16_fused_r2_spv_size;
+            fused_code[3] = dfttest_f16_fused_r3_spv;
+            fused_size[3] = dfttest_f16_fused_r3_spv_size;
             break;
         default:
             return set_error("unsupported io type");

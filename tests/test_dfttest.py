@@ -11,8 +11,11 @@ rounding order may differ by an ulp between the backends).
 Tolerance policy (measured): float32 reference comparisons sit at a few ulp
 (~1e-8) and use REF_TOL = 1e-6, except hard-threshold ftype=1 configs where
 a pixel within an ulp of sigma can flip to/from zero — those keep a looser
-bound. u16 output is compared as whole output codes (<= 1 LSB).
-Self-consistency checks remain exact.
+bound. u16 output is compared as whole output codes (<= 1 LSB). There is no
+f16 reference (vszipcl's DFTTest accepts u16/f32 only), so the half path is
+graded against the f32 path on the losslessly widened clip within the half
+ulp its store rounding adds (F16_TOL below). Self-consistency checks remain
+exact at every depth.
 
 Run from the repository root:  uv run python -m pytest tests/test_dfttest.py
 """
@@ -34,6 +37,7 @@ from conftest import (
     HEIGHT,
     CLIP_PATH,
     COMPARE_PRELUDE,
+    assert_all_frames_finite,
     assert_changes_on_clip,
     assert_preserves_frame_props,
     assert_temporal_order_consistent,
@@ -124,12 +128,39 @@ def test_dfttest_parallel_load_consistent_u16(clip_gray16):
         assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
 
 
+def test_dfttest_deterministic_f16(clip_grayh):
+    """The half path must be bit-identical across runs, like the other depths."""
+    a = _run(clip_grayh)
+    b = _run(clip_grayh)
+    for n in (0, 11, 23):
+        fa = _plane(a.get_frame(n), 0, dtype=np.float16)
+        fb = _plane(b.get_frame(n), 0, dtype=np.float16)
+        assert np.array_equal(fa, fb), f"nondeterministic output at frame {n}"
+
+
+def test_dfttest_parallel_load_consistent_f16(clip_grayh):
+    """f16 mirror of test_dfttest_parallel_load_consistent.
+
+    Two parallel runs must match each other and the serial path exactly: a half
+    plane is still 2 bytes and the pipeline's descriptor/buffer reuse is what
+    the request pattern stresses, not the sample type.
+    """
+    a = eval_parallel(_run, clip_grayh, dtype=np.float16)
+    b = eval_parallel(_run, clip_grayh, dtype=np.float16)
+    ref = _run(clip_grayh)
+    for n in range(clip_grayh.num_frames):
+        r = _plane(ref.get_frame(n), 0, dtype=np.float16)
+        assert np.array_equal(a[n], r), f"parallel 1/serial mismatch at frame {n}"
+        assert np.array_equal(b[n], r), f"parallel 2/serial mismatch at frame {n}"
+        assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
+
+
 # ---------------------------------------------------------------------------
 # Pipelined-reader stress (regression)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("io_format", [None, "u16"], ids=["f32", "u16"])
+@pytest.mark.parametrize("io_format", [None, "u16", "f16"], ids=["f32", "u16", "f16"])
 def test_dfttest_vspipe_pipelined_no_hang(io_format):
     """vspipe's pipelined reader plus VapourSynth's prefetch activate frames
     11+ ahead of the in-flight frames, the request pattern that used to stall
@@ -139,8 +170,8 @@ def test_dfttest_vspipe_pipelined_no_hang(io_format):
 
     Runs the real benchmark as a subprocess (synthetic BlankClip, the
     reproducer's workload) so that vspipe's reader, not a Python get_frame
-    loop, drives the frame requests. Parametrized over both input depths
-    (f32 default and --format u16 path).
+    loop, drives the frame requests. Parametrized over the input depths
+    (f32 default, --format u16 and --format f16).
     """
     bench = Path(__file__).resolve().parent.parent / "tools" / "benchmark.py"
     cmd = [
@@ -244,11 +275,24 @@ def test_dfttest_frame_request_order_matches_serial():
     assert_temporal_order_consistent("DFTTest", {"tbsize": 3}, tol=0.0, timeout=300)
 
 
+def test_dfttest_frame_request_order_matches_serial_f16():
+    """f16 mirror of the request-order oracle, on the half clip."""
+    assert_temporal_order_consistent("DFTTest", {"tbsize": 3}, tol=0.0, clip="grayh", timeout=300)
+
+
 @pytest.mark.parametrize("nframes", [1, 2])
 def test_dfttest_short_clip_temporal_window(nframes):
     """A clip shorter than tbsize must still be order-independent."""
     assert_temporal_order_consistent(
         "DFTTest", {"tbsize": 3}, tol=0.0, nframes=nframes, timeout=300
+    )
+
+
+@pytest.mark.parametrize("nframes", [1, 2])
+def test_dfttest_short_clip_temporal_window_f16(nframes):
+    """f16 mirror of the short-clip temporal-window oracle."""
+    assert_temporal_order_consistent(
+        "DFTTest", {"tbsize": 3}, tol=0.0, nframes=nframes, clip="grayh", timeout=300
     )
 
 
@@ -272,6 +316,18 @@ def test_dfttest_no_nan_all_frames_u16(clip_gray16, tbsize):
     """
     out = _run(clip_gray16, tbsize=tbsize)
     assert_changes_on_clip(out, clip_gray16, what="DFTTest")
+
+
+@pytest.mark.parametrize("tbsize", [1, 3, 5, 7])
+def test_dfttest_no_nan_all_frames_f16(clip_grayh, tbsize):
+    """f16 mirror of test_dfttest_no_nan_all_frames_f32.
+
+    ``isfinite`` is meaningful on a half plane (a half can be inf/nan), and the
+    anti-vacuity check keeps an identity/blank fallback from passing.
+    """
+    out = _run(clip_grayh, tbsize=tbsize)
+    assert_all_frames_finite(out)
+    assert_changes_on_clip(out, clip_grayh, what="DFTTest f16")
 
 
 # ---------------------------------------------------------------------------
@@ -465,8 +521,124 @@ def test_dfttest_parameter_sweep_matches_reference_u16(clip_gray16):
         assert maxdiff <= 1, f"gray16 max diff {maxdiff} for {kwargs}"
 
 
+# ---------------------------------------------------------------------------
+# f16 is a storage width, not a precision
+# ---------------------------------------------------------------------------
+#
+# Neither reference has an f16 DFTTest (vszipcl's depth_ok is integer 8..16 or
+# float32), so the half path's oracle is the f32 path on the losslessly widened
+# clip: a Point resize between GRAYH and GRAYS is a container change (half ->
+# float is exact), so the two runs see byte-identical content and any output
+# difference is what the half path added. It stages native float16_t planes and
+# widens them for the f32 work, and every widening (half -> float) and the
+# *255 domain scale are exact, so the only arithmetic it can add is the store's
+# round-to-nearest-even plus the last-bit f32 divergence between the two
+# SPIR-V modules (a half -> float widening contracted into a mixed-precision
+# fma), which the half store then surfaces. This is what fails first if the
+# half path ever grows half arithmetic of its own.
+#
+# Bound (measured on the committed noise clip, frames 0/11/23, over the whole
+# REFERENCE_CASES and DFTEST_PARAM_SWEEP surface): the difference is at most
+# 0.95 half ulp *relative to the f32 output's magnitude*, i.e. worst 4.64e-4 of
+# max(1, peak) -- the bound below is 1e-3, about 2 half ulp. The bandpass
+# filter (ftype=3) flips its multiplier between sigma and sigma2 when a
+# last-bit psd lands on pmin/pmax and ftype=2's gain reaches ~5.4, so the bound
+# is scaled by the output peak rather than flat. A half-arithmetic path loses
+# both checks at once (measured 0.66 exact on the default config and a 1.4e-3
+# ratio on ftype=2), so the exact fraction is checked too: at least F16_EXACT
+# of samples are bit-identical to the f32 result rounded to half (measured
+# worst 0.99991).
+F16_TOL = 1e-3
+F16_EXACT = 0.99
+
+
+# A half clip and the f32 clip that carries the same samples (half -> float is
+# exact, so a Point resize between them is a container change).
+_HALF_TO_FULL = {
+    vs.GRAYH: vs.GRAYS,
+    vs.YUV420PH: vs.YUV420PS,
+    vs.YUV444PH: vs.YUV444PS,
+    vs.RGBH: vs.RGBS,
+}
+
+
+def _widened(clip):
+    return vs.core.resize.Point(clip, format=_HALF_TO_FULL[clip.format.id])
+
+
+def _f16_parity(half_clip, kwargs=None, frames=(0, 11, 23)):
+    """(worst relative diff, fraction of samples bit-identical to half(f32)).
+
+    The f16 run must reproduce the f32 run's values, rounded once to half: the
+    relative difference stays inside a half ulp of the f32 result's magnitude
+    and almost every sample is the rounded f32 value exactly. Both sides are
+    read in their native dtype, so a half sample is compared by value.
+    """
+    kwargs = kwargs or {}
+    a = _run(half_clip, **kwargs)
+    b = _run(_widened(half_clip), **kwargs)
+    worst = 0.0
+    peak = 0.0
+    exact = 0
+    total = 0
+    for n in frames:
+        fa, fb = a.get_frame(n), b.get_frame(n)
+        for p in range(fa.format.num_planes):
+            ah = _plane(fa, p, dtype=np.float16)
+            bf = _plane(fb, p, dtype=np.float32)
+            assert np.isfinite(ah.astype(np.float64)).all() and np.isfinite(bf).all(), (
+                f"non-finite at frame {n} plane {p}"
+            )
+            worst = max(worst, float(np.abs(ah.astype(np.float64) - bf.astype(np.float64)).max()))
+            peak = max(peak, float(np.abs(bf).max()))
+            exact += int((ah == bf.astype(np.float16)).sum())
+            total += ah.size
+    return worst / max(1.0, peak), exact / total
+
+
+def test_dfttest_f16_is_f32_rounded(clip_grayh):
+    """The half output is the f32 output rounded to half over REFERENCE_CASES."""
+    for kwargs, _ in REFERENCE_CASES:
+        ratio, exact = _f16_parity(clip_grayh, kwargs)
+        assert ratio <= F16_TOL, f"f16 vs f32 relative diff {ratio} for {kwargs}"
+        assert exact >= F16_EXACT, f"only {exact:.5f} of samples exact for {kwargs}"
+
+
+def test_dfttest_parameter_sweep_f16_is_f32_rounded(clip_grayh):
+    """f16 mirror of the parameter sweep (window/sigma/sosize/f0beta/ftype)."""
+    for kwargs in DFTEST_PARAM_SWEEP:
+        ratio, exact = _f16_parity(clip_grayh, kwargs)
+        assert ratio <= F16_TOL, f"f16 vs f32 relative diff {ratio} for {kwargs}"
+        assert exact >= F16_EXACT, f"only {exact:.5f} of samples exact for {kwargs}"
+
+
+def test_dfttest_f16_yuv_is_f32_rounded(clip_yuv420ph):
+    """Every plane of the half YUV output, subsampled chroma included."""
+    ratio, exact = _f16_parity(clip_yuv420ph, {"tbsize": 1})
+    assert ratio <= F16_TOL, f"YUV f16 vs f32 relative diff {ratio}"
+    assert exact >= F16_EXACT, f"only {exact:.5f} of YUV samples exact"
+
+
+def test_dfttest_cropped_width_f16(clip_grayh):
+    """A 630-px half plane (1260-byte rows at 640 px, a different pitch and
+    alignment from the fixture) must track the widened f32 path."""
+    half = vs.core.std.Crop(clip_grayh, right=WIDTH - 630)
+    ratio, exact = _f16_parity(half)
+    assert ratio <= F16_TOL, f"cropped f16 vs f32 relative diff {ratio}"
+    assert exact >= F16_EXACT, f"only {exact:.5f} of cropped samples exact"
+
+
+def test_dfttest_cropped_width_yuv_f16(clip_yuv420ph):
+    """Cropped half YUV: 315-sample chroma rows are 630 bytes, the odd-pitch
+    2-byte case the u16 geometry tests cover."""
+    half = vs.core.std.Crop(clip_yuv420ph, right=WIDTH - 630)
+    ratio, exact = _f16_parity(half)
+    assert ratio <= F16_TOL, f"cropped half YUV f16 vs f32 relative diff {ratio}"
+    assert exact >= F16_EXACT, f"only {exact:.5f} of cropped YUV samples exact"
+
+
 def test_dfttest_rejects_8bit(clip_gray8):
-    """8-bit integer input is not supported (only u16 int and f32)."""
+    """8-bit integer input is not supported (only u16 int, f16 and f32 float)."""
     with pytest.raises(vs.Error):
         vs.core.vsfeel.DFTTest(clip_gray8)
 
@@ -573,6 +745,42 @@ def test_dfttest_yuv_all_planes_matches_reference_u16():
     assert worst <= 1.0, f"max diff {worst}"
 
 
+def test_dfttest_yuv_passthrough_f16(clip_grayh):
+    """f16 mirror of test_dfttest_yuv_passthrough: chroma copied through
+    bit-identically, luma matches the grayh output exactly.
+
+    A half sample is a container value here, so a luma difference is a real
+    discrepancy and the comparison is exact rather than a tolerance.
+    """
+    core = vs.core
+    src = source_clip()
+    yuv = core.resize.Point(
+        core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True), format=vs.YUV420PH
+    )
+    assert yuv.format.color_family == vs.YUV
+
+    out = _run(yuv, planes=[0])
+    ref = _run(clip_grayh)
+
+    for n in (0, 11, 23):
+        a = _plane(out.get_frame(n), 0, dtype=np.float16)
+        b = _plane(ref.get_frame(n), 0, dtype=np.float16)
+        assert np.array_equal(a, b), f"luma mismatch at frame {n}"
+        s = yuv.get_frame(n)
+        for plane in (1, 2):
+            sh = s.height >> 1
+            sw = s.width >> 1
+            ca = _plane(out.get_frame(n), plane, dtype=np.float16)
+            cb = _plane(s, plane, sw, sh, np.float16)
+            assert np.array_equal(ca, cb), f"chroma{plane} changed at frame {n}"
+
+
+def test_dfttest_f16_preserves_frame_props(clip_grayh):
+    """The half path must republish the source frame's properties, like the
+    other depths."""
+    assert_preserves_frame_props(_run, clip_grayh, tbsize=3)
+
+
 def test_dfttest_planes_chroma_only_f32():
     """planes=[1,2] on YUV420 float32: the two subsampled chroma planes must
     match vszipcl (the luma is passed through untouched, pinned below)."""
@@ -584,6 +792,18 @@ def test_dfttest_planes_chroma_only_u16():
     """u16 mirror of test_dfttest_planes_chroma_only (whole codes)."""
     worst = _ref_compare("yuv420p16", {"tbsize": 1, "planes": [1, 2]}, planes=(1, 2))
     assert worst <= 1.0, f"max diff {worst}"
+
+
+def test_dfttest_planes_chroma_only_f16(clip_yuv420ph):
+    """f16 mirror of test_dfttest_planes_chroma_only.
+
+    No f16 reference exists, so the oracle is the f32 path on the widened
+    clip; the unprocessed luma is a passthrough of identical samples, so the
+    whole frame is inside the same half-ulp bound.
+    """
+    ratio, exact = _f16_parity(clip_yuv420ph, {"tbsize": 1, "planes": [1, 2]})
+    assert ratio <= F16_TOL, f"chroma-only f16 vs f32 relative diff {ratio}"
+    assert exact >= F16_EXACT, f"only {exact:.5f} of chroma-only samples exact"
 
 
 def test_dfttest_planes_chroma_leaves_luma_untouched(clip_grays):
@@ -603,6 +823,26 @@ def test_dfttest_planes_chroma_leaves_luma_untouched(clip_grays):
             assert not np.array_equal(_plane(f, p, w, h), _plane(s, p, w, h)), (
                 f"chroma{p} was not filtered at frame {n}"
             )
+
+
+def test_dfttest_planes_chroma_leaves_luma_untouched_f16():
+    """f16 mirror of the planes=[1,2] passthrough: a half luma plane must be
+    copied through bit-identically while both half chroma planes change."""
+    core = vs.core
+    src = source_clip()
+    f32 = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
+    half = core.resize.Point(f32, format=vs.YUV420PH)
+    out = _run(half, planes=[1, 2])
+    for n in (0, 11, 23):
+        f = out.get_frame(n)
+        s = half.get_frame(n)
+        assert np.array_equal(_plane(f, 0, dtype=np.float16), _plane(s, 0, dtype=np.float16)), (
+            f"luma changed at frame {n}"
+        )
+        for p in (1, 2):
+            assert not np.array_equal(
+                _plane(f, p, dtype=np.float16), _plane(s, p, dtype=np.float16)
+            ), f"chroma{p} was not filtered at frame {n}"
 
 
 # ---------------------------------------------------------------------------

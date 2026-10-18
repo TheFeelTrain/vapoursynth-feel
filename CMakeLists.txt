@@ -276,18 +276,20 @@ foreach(io IN LISTS VK_IO_TYPES)
     endforeach()
 endforeach()
 
-# DFTTest: pad + fused + col2im kernels per io variant (u16, f32); the fused
-# kernel is additionally compiled per temporal radius
+# DFTTest: pad + fused + col2im kernels per io variant (u16, f16, f32); the
+# fused kernel is additionally compiled per temporal radius
 # (0..3, i.e. tbsize 1/3/5/7) so its loops unroll and the working array
 # stays in registers (the reference does the same via `#define RADIUS`).
 # The fused kernel uses subgroup barriers instead of workgroup barriers
 # (each 16-lane block lives entirely in one subgroup, which the host enforces by
 # requiring a subgroup size that is a multiple of 16), so SPIR-V 1.3+ is
-# required.
+# required. The io list is local because the other filters' kernels would fall
+# through to their u16 branch under an -DIO_F16 name.
+set(VK_DFT_IO_TYPES "u16" "f16" "f32")
 set(VK_DFT_ENTRIES pad col2im)
 set(VK_DFT_ENTRY_DEFS -DENTRY_PAD -DENTRY_COL2IM)
 set(VK_DFT_VARIANTS)
-foreach(io IN LISTS VK_IO_TYPES)
+foreach(io IN LISTS VK_DFT_IO_TYPES)
     string(TOUPPER "${io}" io_define)
     foreach(entry_i RANGE 0 1)
         list(GET VK_DFT_ENTRIES ${entry_i} entry)

@@ -37,6 +37,7 @@ FILTERS = [
     "GaussBlur_f16",
     "GaussBlurLarge_f16",
     "DFTTest",
+    "DFTTest_f16",
     "NLMeans",
     "BM3D",
     "BM3D_u16",
@@ -111,6 +112,11 @@ _SCRIPT = textwrap.dedent(f"""\
         node = core.vsfeel.GaussBlur(gh, sigma=20.0)
     elif name == "DFTTest":
         node = core.vsfeel.DFTTest(gs, tbsize=3)
+    elif name == "DFTTest_f16":
+        # The half variants stage float16_t slices in the padded plane and
+        # narrow the col2im store: separate SPIR-V modules from the u16 pair,
+        # with the same StorageBuffer-class codegen GaussBlur_f16 covers.
+        node = core.vsfeel.DFTTest(gh, tbsize=3)
     elif name == "NLMeans":
         node = core.vsfeel.NLMeans(gs, d=2)
     elif name == "BM3D":
