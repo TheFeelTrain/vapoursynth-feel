@@ -1234,6 +1234,11 @@ stage = spec["stage"]
 # CPU's VAggregate(sample=INTEGER) / Basic -- so every plane is read back as
 # samples scaled into [0, 1] and one bound covers both input depths.
 u16_sample = spec.get("sample") == "u16"
+# "f16": vsfeel runs the half clip; the CPU refuses one (its own format check
+# takes only 32-bit float or <=16-bit integer), so the reference runs the
+# widened copy of it. Half -> float is exact, so both sides see the same sample
+# values and the transport can only add the store's one half step.
+f16_sample = spec.get("sample") == "f16"
 planes = None
 
 source = core.bs.VideoSource(spec["source"])
@@ -1260,15 +1265,26 @@ if u16_sample:
     # other vsfeel filter, so the two sides only meet in the same domain on a
     # full-range clip.
     clip = core.std.SetFrameProp(clip, prop="_Range", intval=1)
-planes = list(range(clip.format.num_planes))
+if f16_sample:
+    full_fmt = vs.GRAYS if clip.format.color_family == vs.GRAY else vs.YUV444PS
+    half_fmt = vs.GRAYH if clip.format.color_family == vs.GRAY else vs.YUV444PH
+    clip = core.resize.Point(clip, format=half_fmt)
+    cpu_clip = core.resize.Point(clip, format=full_fmt)
+else:
+    cpu_clip = clip
+feel_clip = clip
+planes = list(range(feel_clip.format.num_planes))
 
 
 def read_all(node, n):
     frame = node.get_frame(n)
-    if frame.format.sample_type == vs.INTEGER:
-        return [read_plane(frame, p, np.uint16).astype(np.float64) / 65535.0
-                for p in planes]
-    return [read_plane(frame, p, np.float32) for p in planes]
+    if frame.format.sample_type == vs.FLOAT:
+        if frame.format.bits_per_sample == 16:
+            return [read_plane(frame, p, np.float16).astype(np.float64)
+                    for p in planes]
+        return [read_plane(frame, p, np.float32) for p in planes]
+    return [read_plane(frame, p, np.uint16).astype(np.float64) / 65535.0
+            for p in planes]
 
 
 def vsfeel(clip, **kw):
@@ -1310,12 +1326,16 @@ else:
 # The final stage runs both sides on the *same* guide (vsfeel's basic estimate),
 # so the comparison isolates the Wiener pass.
 guide = None
+cpu_guide = None
 if stage == "final":
     try:
-        guide = vsfeel(clip, sigma=list(sigma), radius=radius,
+        guide = vsfeel(feel_clip, sigma=list(sigma), radius=radius,
                        block_step=feel["block_step"], bm_range=feel["bm_range"],
                        ps_num=feel["ps_num"], ps_range=feel["ps_range"])
         _ = [read_all(guide, n) for n in frames]
+        # The CPU's VFinal takes only the clip's own format, so the half arm
+        # hands it the widened guide -- the same numbers vsfeel's half ref holds.
+        cpu_guide = core.resize.Point(guide, format=full_fmt) if f16_sample else guide
     except Exception as exc:
         print("VSFEEL fail: basic estimate: %s: %s" % (type(exc).__name__, exc), flush=True)
         raise SystemExit(3)
@@ -1323,11 +1343,11 @@ if stage == "final":
 try:
     sample = vs.INTEGER if u16_sample else vs.FLOAT
     if stage == "image":
-        ref_node = core.bm3d.Basic(clip, **cpu)
+        ref_node = core.bm3d.Basic(cpu_clip, **cpu)
     else:
-        basic = core.bm3d.VBasic(clip, **cpu)
+        basic = core.bm3d.VBasic(cpu_clip, **cpu)
         if stage == "final":
-            final = core.bm3d.VFinal(clip, ref=guide, **cpu)
+            final = core.bm3d.VFinal(cpu_clip, ref=cpu_guide, **cpu)
             ref_node = core.bm3d.VAggregate(final, radius=radius, sample=sample)
         else:
             ref_node = core.bm3d.VAggregate(basic, radius=radius, sample=sample)
@@ -1337,7 +1357,7 @@ except Exception as exc:
     raise SystemExit(2)
 print("REF ok", flush=True)
 
-my_node = vsfeel(clip, **dict(feel, **({"ref": guide} if stage == "final" else {})))
+my_node = vsfeel(feel_clip, **dict(feel, **({"ref": guide} if stage == "final" else {})))
 worst = 0.0
 per_plane = [0.0] * len(planes)
 for n, ref_planes in zip(frames, ref_frames):
@@ -1820,6 +1840,250 @@ def test_bm3d_u16_zero_sigma_returns_the_source(clip_gray16):
     assert out.format.id == clip_gray16.format.id
     a = plane_to_ndarray(out.get_frame(3), 0, np.uint16)
     b = plane_to_ndarray(cpu_node(clip_gray16).get_frame(3), 0, np.uint16)
+    assert np.array_equal(a, b)
+
+
+# ---------------------------------------------------------------------------
+# f16 input
+# ---------------------------------------------------------------------------
+#
+# A half clip is the u16 path's transport with an exact conversion: the ring and
+# the estimate stacks stay float, an integer sample is widened by gain 1/65535
+# (plus the chroma neutral) while a half sample is already in the float domain
+# and only needs an OpFConvert, and the aggregation narrows its result back to
+# half with the SPIR-V default round-to-nearest-even. Nothing about the
+# algorithm changes, which is why it is graded against the f32 comparisons' own
+# bounds, plus at most one half store step.
+#
+# The CPU oracle cannot take a half clip (its own format check accepts only
+# 32-bit float or <=16-bit integer), so it runs the widened copy of the half
+# clip: half -> float is exact, so both sides see the same sample values and the
+# comparison isolates the store.
+
+
+def _run_f16(clip, **kwargs):
+    """BM3D at the standard test arguments on a half clip.
+
+    The same call as the integer arm: the input depth is a property of the clip,
+    not of the arguments.
+    """
+    return _run_u16(clip, **kwargs)
+
+
+def _f16_compare(kwargs, stage="basic", clip="grays", frames=(0, 11, 23)):
+    return _cpu_compare(
+        dict(U16_BASE, **kwargs), stage=stage, clip=clip, frames=frames, sample="f16"
+    )
+
+
+# Measured like the u16 table above, on the same content, with the half arm in
+# place of the integer one: the residual is the f32 comparison's own (the CPU's
+# tie order plus one SSD ulp) with at most one half store step (4.88e-4 at 1.0)
+# on top, which is why the bounds are the u16 ones.
+F16_CASES = [
+    # (radius, stage, bound, measured)
+    (0, "image", 4e-3, 0.00064),
+    (1, "basic", 4e-3, 0.00115),
+    (2, "basic", 4e-3, 0.00104),
+    (4, "basic", 4e-3, 0.00119),
+]
+
+
+@pytest.mark.parametrize(
+    "radius,stage,bound,measured", F16_CASES, ids=[f"r{c[0]}" for c in F16_CASES]
+)
+def test_bm3d_f16_matches_cpu(clip_grayh, radius, stage, bound, measured):
+    """Every supported radius must track the CPU's result on a half clip."""
+    payload = _f16_compare(dict(radius=radius), stage=stage)
+    assert payload["maxdiff"] < bound, f"f16 radius {radius} vs CPU: {payload} (was {measured})"
+
+
+F16_SWEEP = [
+    # (kwargs, bound, measured)
+    ({}, 3e-3, 0.00104),
+    ({"sigma": 1.5}, 6e-3, 0.00199),
+    ({"sigma": 0.3}, 2e-3, 0.00042),
+    ({"block_step": 1}, 1.5e-3, 0.00037),
+    ({"block_step": 8}, 8e-3, 0.00306),
+    ({"bm_range": 4}, 3e-3, 0.00096),
+    ({"ps_range": 9}, 3e-3, 0.00104),
+    ({"ps_num": 5}, 3e-3, 0.00093),
+    ({"th_mse": 1200.0}, 3e-3, 0.00104),
+]
+
+
+@pytest.mark.parametrize(
+    "cfg,bound,measured", F16_SWEEP, ids=[_sweep_id(c) for c, _, _ in F16_SWEEP]
+)
+def test_bm3d_f16_parameter_sweep_matches_cpu(clip_grayh, cfg, bound, measured):
+    """The parameter grid around the defaults, on a half clip."""
+    payload = _f16_compare(cfg)
+    assert payload["maxdiff"] < bound, f"f16 max diff vs CPU ({cfg}): {payload} (was {measured})"
+
+
+def test_bm3d_f16_final_stage_matches_cpu(clip_grayh):
+    """The Wiener pass on a half clip, both sides driven by the same guide.
+
+    The guide is vsfeel's own half basic estimate and the reference's is the
+    widened copy of it, so this isolates the final stage's matching and
+    shrinkage -- and it also exercises the second ring section (the `ref` clip
+    is widened by the same copy kernel as the source)."""
+    payload = _f16_compare({}, stage="final")
+    assert payload["maxdiff"] < 1e-3, f"f16 final pass vs CPU: {payload} (was 0.00029)"
+
+
+def test_bm3d_f16_color_matches_cpu():
+    """All three planes of a half 4:4:4 clip, chroma included.
+
+    Same close-but-not-exact chroma domain as the f32 color test: the CPU scales
+    each plane's sigma by that plane's matrix norm, vsfeel carries normY for all
+    three."""
+    payload = _f16_compare({"sigma": [0.7, 0.7, 0.7]}, clip="yuv444ps")
+    assert payload["maxdiff"] < 1.5e-2, f"f16 color vs CPU: {payload} (was 0.00676)"
+
+
+# One half store step is 2.44e-4 at 0.5 and 4.88e-4 at 1.0. Measured worst over
+# this sweep: 2.85e-4 (gray, radius 2). The aggregation's ~3e-8 ordering jitter
+# can flip a value that sits on a half tie, so this is a bound, not an equality:
+# a half path that ever grew half arithmetic of its own would blow past it.
+F16_STORE_TOL = 1e-3
+
+
+def _widened_f32(clip_h):
+    """The half clip in f32: a Point resize is a container change, exact."""
+    fmt = vs.GRAYS if clip_h.format.color_family == vs.GRAY else vs.YUV444PS
+    return vs.core.resize.Point(clip_h, format=fmt)
+
+
+def _f16_path_is_the_f32_path(clip_h, **kwargs):
+    """Worst |half output - f32 output| over the widened input's planes."""
+    f32_in = _widened_f32(clip_h)
+    out16 = _run_f16(clip_h, **kwargs)
+    out32 = BM3D(f32_in, **_std_args(**kwargs))
+    worst = 0.0
+    for n in (0, 11, 23):
+        fa, fb = out16.get_frame(n), out32.get_frame(n)
+        for p in range(fa.format.num_planes):
+            a = plane_to_ndarray(fa, p, np.float16).astype(np.float64)
+            b = plane_to_ndarray(fb, p, np.float32).astype(np.float64)
+            worst = max(worst, float(np.abs(a - b).max()))
+    return worst
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"sigma": 1.5}, {"radius": 0}, {"block_step": 1}, {"extractor_exp": 1}],
+    ids=["default", "sigma1.5", "radius0", "block_step1", "extractor"],
+)
+def test_bm3d_f16_is_the_f32_path_with_a_narrowed_store(clip_grayh, kwargs):
+    """The half output must be the f32 result to within its one store rounding.
+
+    Both arms run the same estimation kernel over bit-identical floats (a
+    GRAYH -> GRAYS Point resize is exact, so the f32 arm is fed exactly what the
+    copy kernel widens the half clip to), so the only admissible difference is
+    the store's rounding plus the aggregation's accumulation order -- and the
+    latter is already known to jitter the f32 result by ~3e-8 between runs. A
+    wrong conversion, gain, chroma neutral or element width would show up orders
+    of magnitude above the half step."""
+    worst = _f16_path_is_the_f32_path(clip_grayh, **kwargs)
+    assert worst <= F16_STORE_TOL, f"f16 output is not the f32 result rounded ({kwargs}): {worst}"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"sigma": [0.0, 0.7, 0.7]}, {"sigma": [0.0, 0.7, 0.7], "chroma": 1}],
+    ids=["all-planes", "chroma-only", "chroma-only-joint"],
+)
+def test_bm3d_f16_color_is_the_f32_path_with_a_narrowed_store(kwargs):
+    """Chrominance crosses depths like luma, with no neutral to remove.
+
+    In the f32 domain a YUV chroma plane is a plain float plane; the integer arm
+    has to remove its 32768 neutral and put it back, the half arm has nothing to
+    undo. Feeding the f32 arm the exact widened values is what makes this an
+    equality in half steps rather than a tolerance. The chroma-only cases also
+    cover plane 0 being unprocessed, which leaves the estimation kernel's unused
+    destination binding without a plane-0 buffer."""
+    clip_h = vs.core.resize.Point(source_clip(), format=vs.YUV444PH)
+    worst = _f16_path_is_the_f32_path(clip_h, **kwargs)
+    assert worst <= F16_STORE_TOL, (
+        f"f16 color output is not the f32 result rounded ({kwargs}): {worst}"
+    )
+
+
+@pytest.mark.parametrize("right", [10, 15], ids=["w630", "w625"])
+def test_bm3d_f16_cropped_pitch_is_the_f32_path(clip_grayh, right):
+    """A cropped half plane must cross depths like the rest of the frame.
+
+    The copy and the store index the plane by element, trusting the core's own
+    stride, so a cropped plane (whose pitch the allocator pads per format) is
+    where a hard-coded row width or a 4-byte-aligned index would show; the
+    widened f32 arm has its own pitch, so agreement rules one out."""
+    cropped = vs.core.std.Crop(clip_grayh, right=right)
+    worst = _f16_path_is_the_f32_path(cropped)
+    assert worst <= F16_STORE_TOL, f"f16 cropped pitch (right={right}): {worst}"
+
+
+def test_bm3d_f16_output_is_half_and_keeps_props(clip_grayh):
+    """A half clip stays half, keeps its frame properties, and changes."""
+    out = _run_f16(clip_grayh)
+    fmt = out.format
+    assert fmt.sample_type == vs.FLOAT and fmt.bits_per_sample == 16
+    assert_all_frames_finite(out)
+    src = plane_to_ndarray(clip_grayh.get_frame(11), 0, np.float16)
+    got = plane_to_ndarray(out.get_frame(11), 0, np.float16)
+    assert np.abs(got.astype(np.float64) - src.astype(np.float64)).max() > 1e-3, (
+        "the f16 path did not denoise"
+    )
+    assert_preserves_frame_props(_run_f16, clip_grayh, radius=2)
+
+
+def test_bm3d_f16_parallel_load_matches_serial(clip_grayh):
+    """The parallel request load must agree with the serial one."""
+    par = eval_parallel(_run_f16, clip_grayh, radius=2, dtype=np.float16)
+    ref = _run_f16(clip_grayh, radius=2)
+    for n in range(clip_grayh.num_frames):
+        a = par[n].astype(np.float64)
+        b = plane_to_ndarray(ref.get_frame(n), 0, np.float16).astype(np.float64)
+        assert np.abs(a - b).max() <= F16_STORE_TOL, f"f16 parallel/serial mismatch at frame {n}"
+
+
+def test_bm3d_f16_deterministic(clip_grayh):
+    """Two runs must agree within the aggregation's one-half-step jitter."""
+    a = eval_parallel(_run_f16, clip_grayh, radius=2, dtype=np.float16)
+    b = eval_parallel(_run_f16, clip_grayh, radius=2, dtype=np.float16)
+    for n in range(clip_grayh.num_frames):
+        d = np.abs(a[n].astype(np.float64) - b[n].astype(np.float64))
+        assert d.max() <= F16_STORE_TOL, f"f16 nondeterministic output at frame {n}"
+
+
+def test_bm3d_f16_cas_fallback_matches_hardware_atomics(clip_grayh, monkeypatch):
+    """The no-float-atomics accumulation must agree on a half clip too."""
+    monkeypatch.setenv("VSFEEL_BM3D_CAS", "1")
+    a = _run_f16(clip_grayh, radius=2)
+    monkeypatch.delenv("VSFEEL_BM3D_CAS")
+    b = _run_f16(clip_grayh, radius=2)
+    for n in (0, 11, 23):
+        d = np.abs(
+            plane_to_ndarray(a.get_frame(n), 0, np.float16).astype(np.float64)
+            - plane_to_ndarray(b.get_frame(n), 0, np.float16).astype(np.float64)
+        )
+        assert d.max() <= F16_STORE_TOL, f"f16 CAS vs hardware atomics at frame {n}"
+
+
+def test_bm3d_f16_rejects_a_float_ref(clip_grayh, clip_gray16, clip_grays):
+    """A \"ref\" of another depth must be rejected up front."""
+    with pytest.raises(vs.Error):
+        _run_f16(clip_grayh, ref=_run(clip_grays, radius=2))
+    with pytest.raises(vs.Error):
+        _run_f16(clip_grayh, ref=_run(clip_gray16, radius=2))
+
+
+def test_bm3d_f16_zero_sigma_returns_the_source(clip_grayh):
+    """All planes below epsilon hand the half clip straight back."""
+    out = cpu_node(vs.core.vsfeel.BM3D(clip_grayh, sigma=0.0))
+    assert out.format.id == clip_grayh.format.id
+    a = plane_to_ndarray(out.get_frame(3), 0, np.float16)
+    b = plane_to_ndarray(cpu_node(clip_grayh).get_frame(3), 0, np.float16)
     assert np.array_equal(a, b)
 
 

@@ -2,23 +2,25 @@
 #extension GL_EXT_shader_16bit_storage : require
 
 /*
- * The source ring's copy kernel for an integer input clip: widens the plane's
+ * The source ring's copy kernel for a 2-byte input clip: widens the plane's
  * native samples into the ring's float working domain while copying it.
  *
- * The widening is the reference's Int2Float (gain 1/65535, plus the chroma
+ * -DIO_U16 / -DIO_F16 select the source element type. The integer arm's
+ * widening is the reference's Int2Float (gain 1/65535, plus the chroma
  * neutral), so an integer clip reaches the estimator as exactly the numbers a
- * float clip of the same content would, and the two depths share one
- * estimation kernel. A YUV chroma plane is centred on 32768, which the
- * reference's float chroma domain puts at zero, so pc.center carries that
- * neutral code there and 0 on luma and RGB; without it a constant 0.5 rides
- * into the thresholded/scaled DC term.
+ * float clip of the same content would, and every depth shares one estimation
+ * kernel. A YUV chroma plane is centred on 32768, which the reference's float
+ * chroma domain puts at zero, so pc.center carries that neutral code there and
+ * 0 on luma and RGB; without it a constant 0.5 rides into the
+ * thresholded/scaled DC term. A half plane is already in the float domain, so
+ * its widening is an exact OpFConvert and pc.center goes unused.
  *
  * It has to happen here, once per source sample, rather than on load in the
  * matcher: the matcher reads each source sample once per candidate origin (a
  * few hundred times per 8x8 block), the whole search window is L1-resident, so
  * a load-time conversion buys no DRAM traffic back and costs a permanent
  * widening per candidate. Doing it at copy time replaces the f32 path's
- * 8-byte-per-sample transfer with 2 bytes in and 4 bytes out.
+ * 4-byte-per-sample transfer with 2 bytes in and 4 bytes out.
  *
  * The ring is a flat per-plane copy: the host keeps the destination stride
  * equal to the source's element stride (see record_src_copies), so the copy is
@@ -26,9 +28,17 @@
  * float path uses.
  */
 
+#if !defined(IO_U16) && !defined(IO_F16)
+#define IO_U16 1
+#endif
+
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+#if defined(IO_F16)
+layout(std430, binding = 0) readonly buffer SrcBuf { float16_t src[]; };
+#else
 layout(std430, binding = 0) readonly buffer SrcBuf { uint16_t src[]; };
+#endif
 layout(std430, binding = 1) writeonly buffer DstBuf { float dst[]; };
 
 layout(push_constant) uniform PushConstants {
@@ -49,6 +59,10 @@ void main() {
     if (i >= pc.count) {
         return;
     }
+#if defined(IO_F16)
+    dst[pc.dst_off + i] = float(src[i]); // half -> float is exact
+#else
     dst[pc.dst_off + i] =
         (float(int(src[i])) - float(pc.center)) * (1.0f / 65535.0f);
+#endif
 }

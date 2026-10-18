@@ -40,7 +40,9 @@ FILTERS = [
     "NLMeans",
     "BM3D",
     "BM3D_u16",
+    "BM3D_f16",
     "BM3DColor",
+    "BM3DColor_f16",
     "BM3DJoint",
     "EEDI3",
     "EEDI3H",
@@ -120,11 +122,27 @@ _SCRIPT = textwrap.dedent(f"""\
         # aggregation writes native samples into the output plane.
         node = core.vsfeel.BM3D(g16, sigma=0.7, radius=2, bm_range=16,
                                   ps_range=7, block_step=4)
+    elif name == "BM3D_f16":
+        # The half input path: the copy kernel widens float16_t on binding 0
+        # with no gain or chroma neutral, and the aggregation narrows back to
+        # float16_t on its own binding. Both are separate SPIR-V modules from
+        # the u16 pair, and the narrowing store must not declare a Float16
+        # capability the logical device has not enabled.
+        node = core.vsfeel.BM3D(gh, sigma=0.7, radius=2, bm_range=16,
+                                  ps_range=7, block_step=4)
     elif name == "BM3DColor":
         # Three per-plane entries live at once: separate source rings, estimate
         # stacks and witness regions, one aggregation dispatch per plane.
         yuv = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
         node = core.vsfeel.BM3D(yuv, sigma=[0.7, 0.5, 0.5], radius=2,
+                                bm_range=2, ps_range=1, block_step=4)
+    elif name == "BM3DColor_f16":
+        # The same three entries on half samples: the 2-byte copy and store
+        # paths run for the subsampled chroma planes too.
+        yuvh = core.resize.Point(core.fmtc.bitdepth(src, bits=32, fulls=True,
+                                                    fulld=True),
+                                 format=vs.YUV420PH)
+        node = core.vsfeel.BM3D(yuvh, sigma=[0.7, 0.5, 0.5], radius=2,
                                 bm_range=2, ps_range=1, block_step=4)
     elif name == "BM3DJoint":
         # The joint 4:4:4 entry: one packed stack holding all three planes.

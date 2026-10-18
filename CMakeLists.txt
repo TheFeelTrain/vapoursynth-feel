@@ -204,7 +204,7 @@ endforeach()
 
 # BM3D: an estimation kernel (float ring and float estimate stacks at every
 # input depth, so no io variant), an aggregation kernel per destination sample
-# type (u16, f32), a copy-and-widen kernel for integer input, and a
+# type (u16, f16, f32), a copy-and-widen kernel per 2-byte input type, and a
 # _cas estimation variant with the accumulation on atomicCompSwap for devices
 # without buffer float atomics; see src/bm3d.comp.
 set(VK_BM3D_VARIANTS
@@ -229,7 +229,9 @@ set(VK_BM3D_VARIANTS
     "bm3d_filter_cas_1plane|bm3d.comp|-DSPLIT_FILTER -DNO_FLOAT_ATOMICS -DONE_PLANE"
     "bm3d_agg_f32|bm3d_agg.comp|-DIO_F32"
     "bm3d_agg_u16|bm3d_agg.comp|-DIO_U16"
-    "bm3d_copy_u16|bm3d_copy.comp|")
+    "bm3d_agg_f16|bm3d_agg.comp|-DIO_F16"
+    "bm3d_copy_u16|bm3d_copy.comp|-DIO_U16"
+    "bm3d_copy_f16|bm3d_copy.comp|-DIO_F16")
 
 # GaussBlur: one kernel with three entry points (fused small path + the two
 # large-path passes), per io variant (u16, f16, f32). Each pass carries its
@@ -386,7 +388,8 @@ foreach(io IN LISTS VK_NNEDI3_IO_TYPES)
 endforeach()
 # The packed half predictor (needs shaderFloat16, chosen at creation when the
 # device reports it): one predict module at PXP=4 and the matching prescreen,
-# whose indirect group size is the predictor's 4 pixels per subgroup.
+# whose indirect group size is the predictor's 4 pixels per subgroup. Its
+# f16vec4 tile is 4 x 288 x 8 B = 9 KiB, which covers every network.
 list(APPEND VK_NNEDI3_VARIANTS
     "nnedi3_f16_prescreen16|nnedi3.comp|-DIO_F16 -DPRED16=1 -DENTRY_PRESCREEN"
     "nnedi3_f16_predict16|nnedi3.comp|-DIO_F16 -DPRED16=1 -DENTRY_PREDICT -DSHSTRIDE=288u")

@@ -16,11 +16,15 @@
  * interleaved load streams rather than by bytes: the same bytes move in a
  * quarter of the instructions.
  *
- * -DIO_U16 / -DIO_F32 selects the destination plane's element type. The
- * estimate stacks and the source ring are float either way: the stacks hold the
- * reference's weighted sums, and the ring is already widened at copy time (see
- * bm3d_copy.comp), which is what keeps the matcher's inner loop free of a
+ * -DIO_U16 / -DIO_F16 / -DIO_F32 selects the destination plane's element type.
+ * The estimate stacks and the source ring are float either way: the stacks hold
+ * the reference's weighted sums, and the ring is already widened at copy time
+ * (see bm3d_copy.comp), which is what keeps the matcher's inner loop free of a
  * conversion per candidate sample.
+ *
+ * A float destination stores the accumulated result as it is (a half element
+ * narrows with an exact OpFConvert); the integer one rounds through the
+ * reference's Float2Int and re-adds the chroma neutral the copy removed.
  */
 
 #if !defined(IO_U16) && !defined(IO_F32) && !defined(IO_F16)
@@ -57,9 +61,11 @@ layout(std430, binding = 3) readonly buffer TagBuf { uint tags[]; };
 layout(std430, binding = 4) buffer SkipBuf { uint skipped[]; };
 layout(std430, binding = 5) buffer RefuseBuf { uint refusal[]; };
 // The destination plane keeps its vec4 form in the f32 build (the store stays
-// one 16-byte access per thread); in the u16 build it is four native samples.
+// one 16-byte access per thread); the 2-byte builds address four native samples.
 #if defined(IO_U16)
 layout(std430, binding = 2) buffer DstBuf { uint16_t dst16[]; };
+#elif defined(IO_F16)
+layout(std430, binding = 2) buffer DstBuf { float16_t dst16[]; };
 #else
 layout(std430, binding = 2) buffer DstBuf { vec4 dst4[]; };
 #endif
@@ -86,20 +92,29 @@ int slot_of(int m) {
 }
 
 // One accumulated result to a native output sample, or to a float if the clip
-// is float: the reference's Float2Int scales by 65535, adds 0.5, clips to the
-// format's [0, 65535] and truncates, `Clip(v * gain + 0.5, floor, ceil)`. A
-// chroma plane carries the 32768 neutral the copy kernel removed. The clip is
-// not optional -- the weight sums num/den can land an ulp above 1.0, and a bare
-// mask-and-truncate would wrap that to 0.
+// is float. The integer arm is the reference's Float2Int: it scales by 65535,
+// adds 0.5, clips to the format's [0, 65535] and truncates, `Clip(v * gain +
+// 0.5, floor, ceil)`, with a chroma plane carrying the 32768 neutral the copy
+// kernel removed. That clip is not optional -- the weight sums num/den can land
+// an ulp above 1.0, and a bare mask-and-truncate would wrap that to 0. The
+// float arms store the value as-is (a half element narrows with the SPIR-V
+// default round-to-nearest-even and no saturation, i.e. vstore_half_rte).
 void store_result(int x, int y, vec4 v) {
-#if defined(IO_U16)
+#if defined(IO_U16) || defined(IO_F16)
     const int o = y * STRIDE + x;
+#endif
+#if defined(IO_U16)
     const float bias = (CHROMA != 0) ? 32768.0f : 0.0f;
     const vec4 s = clamp(v * PEAK + bias + 0.5f, vec4(0.0f), vec4(PEAK));
     dst16[o + 0] = uint16_t(uint(s.x));
     dst16[o + 1] = uint16_t(uint(s.y));
     dst16[o + 2] = uint16_t(uint(s.z));
     dst16[o + 3] = uint16_t(uint(s.w));
+#elif defined(IO_F16)
+    dst16[o + 0] = float16_t(v.x);
+    dst16[o + 1] = float16_t(v.y);
+    dst16[o + 2] = float16_t(v.z);
+    dst16[o + 3] = float16_t(v.w);
 #else
     dst4[(y * STRIDE + x) >> 2] = v;
 #endif

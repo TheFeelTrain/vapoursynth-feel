@@ -68,9 +68,11 @@ constexpr uint32_t kPredictLdsPxp8 = 4 * 256 * 16; // 16 KiB
 constexpr uint32_t kPredictLdsN4 = 4 * 288 * 16;   // 18 KiB
 constexpr uint32_t kPredictLdsN4m = 4 * 192 * 16;  // 12 KiB
 constexpr uint32_t kPredictLdsN4s = 4 * 64 * 16;   // 4 KiB
-// The packed half predictor's tile is f16vec4 rows (two window elements each):
-// 4 subgroups x SHSTRIDE=288 rows x 8 B = 9 KiB, which covers every network.
+// The packed half predictor's tile is f16vec4 rows (two window elements
+// each), FS rows per subgroup: 4 subgroups x SHSTRIDE=288 rows x 8 B = 9 KiB,
+// which covers every network (the Vulkan shared-memory floor is 16 KiB).
 constexpr uint32_t kPredictLdsF16 = 4 * 288 * 8;
+constexpr uint32_t kPackedPxp = 4;
 
 // Weight blob linked into the binary (see CMakeLists.txt): the assembler's
 // .incbin everywhere except Windows, which embeds the same bytes as an RCDATA
@@ -1394,7 +1396,7 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
     // counts active lanes with the subgroup arithmetic intrinsics -- which
     // Vulkan does not mandate (only BASIC is). The prescreen ballots on top of
     // that; the kept-row writer uses no subgroup op at all.
-    constexpr uint32_t kCoopInvocations = 128; // local_size_x of both kernels
+    constexpr uint32_t kCoopInvocations = 128; // local_size_x of every kernel
     if (!d->gpu->has_subgroup_ops(VK_SUBGROUP_FEATURE_ARITHMETIC_BIT)) {
         return set_error(
             "device cannot run the NNEDI3 predictor kernel (it needs "
@@ -1492,7 +1494,8 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
             // cooperative direct grid (pscrn==0): 4 subgroups x PXP pixels
             // per 128-thread workgroup. The packed half predictor is PXP=4.
             const int host_pxp =
-                (d->pred16 || !use_pxp8(d->nns, d->xdim * d->ydim)) ? 4 : 8;
+                d->pred16 ? static_cast<int>(kPackedPxp)
+                          : (use_pxp8(d->nns, d->xdim * d->ydim) ? 8 : 4);
             const uint32_t ppg = static_cast<uint32_t>(4 * host_pxp);
             if (auto e = fold_grid((static_cast<uint32_t>(cfg.width) *
                                         static_cast<uint32_t>(cfg.rows) +

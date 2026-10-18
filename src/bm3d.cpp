@@ -195,12 +195,17 @@ struct BM3DData {
     VkDescriptorSetLayout set_layout {};
     VkPipelineLayout pipeline_layout {};
     int num_planes {}; // planes of the clip's format
-    // Sample type of the clip's own planes: 16 for an integer clip. The ring,
-    // the estimate stacks and every kernel's arithmetic are float either way;
-    // only the copy into the ring and the aggregation's store differ.
+    // Sample type of the clip's own planes: 16 for an integer or half clip. The
+    // ring, the estimate stacks and every kernel's arithmetic are float either
+    // way; only the copy into the ring and the aggregation's store differ.
     int bits {};
     int elem_bytes {};
-    // Integer input only: widens each copied plane into the ring. Null otherwise.
+    // Half input: a 2-byte transport like the integer path, but the sample is
+    // already in the ring's float domain, so the copy is an exact widening with
+    // no gain or chroma neutral.
+    bool half {};
+    // Integer or half input only: widens each copied plane into the ring. Null
+    // otherwise.
     VkPipeline copy_pipeline {};
     std::array<Bm3dPlane, 3> planes {};
     // One entry per processed plane, or a single one covering all three under
@@ -1088,10 +1093,11 @@ struct Bm3dWindowCopy {
 // Every entry packs [clip][plane] per slot, so a plane is one `pe` hop away and
 // the slot stride spans the entry's planes.
 //
-// The ring is float at both input depths: an integer clip's samples are widened
-// once, here, by bm3d_copy_u16 rather than on every load in the matcher (see
-// that shader). Offsets are in elements, so the destination stride stays the
-// source plane's element stride and the copy is one linear range either way.
+// The ring is float at every input depth: a 2-byte clip's samples are widened
+// once, here, by bm3d_copy_u16 / bm3d_copy_f16 rather than on every load in the
+// matcher (see that shader). Offsets are in elements, so the destination stride
+// stays the source plane's element stride and the copy is one linear range
+// either way.
 static void record_src_copies(BM3DData * d, const Bm3dFrame & fr,
                               VkCommandBuffer cmd,
                               const std::vector<Bm3dWindowCopy> & window) {
@@ -1106,7 +1112,10 @@ static void record_src_copies(BM3DData * d, const Bm3dFrame & fr,
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           d->copy_pipeline);
             gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, bufs, 2);
-            const int32_t pushes[3] { off, count, chroma ? 32768 : 0 };
+            // A half plane is already in the ring's float domain, so only the
+            // integer arm carries the chroma neutral.
+            const int32_t pushes[3] { off, count,
+                                      (chroma && !d->half) ? 32768 : 0 };
             gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, pushes,
                                sizeof(pushes));
             // The grid is the entry's extent at creation, so it covers this
@@ -1845,14 +1854,16 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
 
     if (d->vi->width <= 0 || d->vi->height <= 0 ||
         !((d->vi->format.sampleType == stFloat &&
-           d->vi->format.bitsPerSample == 32) ||
+           (d->vi->format.bitsPerSample == 32 ||
+            d->vi->format.bitsPerSample == 16)) ||
           (d->vi->format.sampleType == stInteger &&
            d->vi->format.bitsPerSample == 16))) {
         return set_error(
-            "only constant format 16-bit integer (u16) or 32-bit float (f32) "
-            "input supported");
+            "only constant format 16-bit integer (u16), 16-bit float (f16) or "
+            "32-bit float (f32) input supported");
     }
     d->bits = d->vi->format.bitsPerSample;
+    d->half = d->vi->format.sampleType == stFloat && d->bits == 16;
     d->elem_bytes = d->bits / 8;
 
     if (d->vi->format.colorFamily != cfGray &&
@@ -2511,8 +2522,12 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // aggregation pipeline per processed plane.
     if (d->bits == 16) {
         const auto result =
-            create_copy_pipeline(*d->gpu, d->pipeline_layout, bm3d_copy_u16_spv,
-                                 bm3d_copy_u16_spv_size);
+            d->half ? create_copy_pipeline(*d->gpu, d->pipeline_layout,
+                                           bm3d_copy_f16_spv,
+                                           bm3d_copy_f16_spv_size)
+                    : create_copy_pipeline(*d->gpu, d->pipeline_layout,
+                                           bm3d_copy_u16_spv,
+                                           bm3d_copy_u16_spv_size);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -2607,14 +2622,22 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             if (!p.process) {
                 continue; // a joint entry's skipped plane is never dispatched
             }
+            // The code and its size stay inline at the call site: assigning
+            // them to locals first is what tools/shader_limits.py resolves, and
+            // an identifier carrying the io stems attaches them to every other
+            // helper it is passed through.
             const auto result =
-                d->bits == 16
-                    ? create_agg_pipeline(*d->gpu, p, g, *d, bm3d_agg_u16_spv,
-                                          bm3d_agg_u16_spv_size,
-                                          d->pipeline_layout)
-                    : create_agg_pipeline(*d->gpu, p, g, *d, bm3d_agg_f32_spv,
+                d->bits != 16
+                    ? create_agg_pipeline(*d->gpu, p, g, *d, bm3d_agg_f32_spv,
                                           bm3d_agg_f32_spv_size,
-                                          d->pipeline_layout);
+                                          d->pipeline_layout)
+                    : (d->half ? create_agg_pipeline(
+                                     *d->gpu, p, g, *d, bm3d_agg_f16_spv,
+                                     bm3d_agg_f16_spv_size, d->pipeline_layout)
+                               : create_agg_pipeline(*d->gpu, p, g, *d,
+                                                     bm3d_agg_u16_spv,
+                                                     bm3d_agg_u16_spv_size,
+                                                     d->pipeline_layout));
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
