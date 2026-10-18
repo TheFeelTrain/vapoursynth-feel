@@ -283,14 +283,15 @@ def test_nlmeans_pack_is_capped_by_the_grid_z_limit():
 
 
 def test_bilateral_auto_lds_gate_falls_back_to_the_plain_kernel():
-    """The automatic LDS gate must pick the plain kernel when the tile is over
-    budget, exactly as an explicit use_shared_memory=False does.
+    """The automatic LDS gate must drop to the plain kernel when even the
+    one-column tile is over budget, exactly as an explicit
+    use_shared_memory=False does.
 
-    Every bilateral test elsewhere passes use_shared_memory explicitly, so the
-    automatic branch never ran. sigma_spatial=8 derives radius 24 with the
-    auto-tuned 32x16 block, whose shared tile is (2*24+32)*(2*24+16)*4 =
-    20480 B: it fits the device's 64 KiB but not a forced 12288-byte limit.
-    Both runs below therefore use the plain kernel, and must agree bit-for-bit.
+    sigma_spatial=8 derives radius 24 with the auto-tuned 32x16 block: the
+    two-column tile is (2*24+2*32)*(2*24+16)*4 = 28672 B and the one-column
+    tile (2*24+32)*(2*24+16)*4 = 20480 B, so a forced 12288-byte limit admits
+    neither. Both runs below therefore use the plain kernel, and must agree
+    bit-for-bit.
     """
     params = {"sigma_spatial": 8.0, "sigma_color": 0.15}
     auto = _run_limits(
@@ -320,6 +321,54 @@ def test_bilateral_auto_lds_gate_falls_back_to_the_plain_kernel():
     assert shared["shared"].get("finite") is True, shared["shared"]
     assert shared["shared"]["sha1"] != plain["plain"]["sha1"], (
         "the forced LDS limit did not change the selected kernel"
+    )
+
+
+_BILATERAL_LDS_SCRIPT = r"""
+import vapoursynth as vs
+
+core = vs.core
+clip = core.std.BlankClip(width=640, height=360, format=vs.GRAYS, length=3)
+core.vsfeel.Bilateral(clip, sigma_spatial=8.0, sigma_color=0.15).get_frame(0)
+"""
+
+
+def _bilateral_lds(env=None):
+    """The `lds=` of every bilateral pipeline that creation created.
+
+    One pipeline per unique plane config, so the single number here names the
+    kernel the gate selected: the two-column shared tile, the one-column one,
+    or 0 for the plain gather.
+    """
+    run_env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1", **(env or {})}
+    proc = subprocess.run(
+        [sys.executable, "-c", _BILATERAL_LDS_SCRIPT],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=run_env,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return [int(m) for m in re.findall(r"pipeline bilateral .* lds=(\d+)", proc.stderr)]
+
+
+def test_bilateral_lds_gate_has_three_ordered_tiers():
+    """R=24 with the auto 32x16 block pins all three kernels.
+
+    The two-column shared tile is 28672 B and the one-column one 20480 B, so a
+    limit between them must fall back to one column rather than all the way to
+    the ~4x slower plain kernel. The banner's `lds=` is the only place the
+    choice is observable, and the two-column kernel is worth ~16% (measured), so
+    a silent regression to the fallback must fail here rather than only show up
+    in the benchmark.
+    """
+    assert _bilateral_lds() == [28672], "the two-column tile is not the default"
+    assert _bilateral_lds({"VSFEEL_LIMIT_SHARED_MEMORY": "24576"}) == [20480], (
+        "a limit over the one-column tile but under the two-column one must "
+        "select the one-column shared kernel"
+    )
+    assert _bilateral_lds({"VSFEEL_LIMIT_SHARED_MEMORY": "12288"}) == [0], (
+        "a limit under both shared tiles must select the plain kernel"
     )
 
 

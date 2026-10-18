@@ -406,6 +406,25 @@ def test_bilateral_ref_clip_matches_reference_f16(clip_grayh):
     assert worst <= F16_TOL, f"max diff {worst}"
 
 
+def test_bilateral_per_plane_lds_tiers_match_reference_f32(clip_grays, monkeypatch):
+    """Planes of one instance may take different shared kernels.
+
+    The shared kernel computes two output columns per thread when its wider
+    tile fits, and falls back to one column otherwise; the choice is per plane.
+    With radius 24 on luma and 3 on chroma at the auto 32x16 block, a 24576-byte
+    limit rejects luma's two-column tile (28672 B) but not its one-column one
+    (20480 B), while chroma's two-column tile (6160 B) still fits: the two tiers
+    run side by side in one filter. Both must track vszipcl.
+    """
+    monkeypatch.setenv("VSFEEL_LIMIT_SHARED_MEMORY", "24576")
+    worst = _compare(
+        "yuv420ps",
+        (0, 11, 23),
+        dict(sigma_spatial=[8.0, 1.0, 1.0], sigma_color=[0.15, 0.05, 0.05]),
+    )
+    assert worst < REF_TOL, f"max diff {worst}"
+
+
 def test_bilateral_f16_is_f32_rounded(clip_grayh):
     """The half path is the f32 pipeline plus one store rounding.
 

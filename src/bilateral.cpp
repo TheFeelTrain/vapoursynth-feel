@@ -553,7 +553,9 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         // ns=4 real-clip GRAY16 medians): tall blocks hide the exp-pipeline
         // latency of large windows (R=24: 16x16 = 343 fps vs 16x8 = 228),
         // while wide blocks are marginally better for small windows
-        // (R=9: 32x8 = 1742 vs 16x16 = 1705; R=3: 2449 vs 2412).
+        // (R=9: 32x8 = 1742 vs 16x16 = 1705; R=3: 2449 vs 2412). Re-swept with
+        // the two-column shared kernel at R=9: 32x8 still wins (16x16 ties
+        // within +0.7%, 16x8 -2.9%, 32x4 -4.7%).
         const int max_radius = std::max({ radius[0], radius[1], radius[2] });
         if (block_x_default) {
             block_x = 32;
@@ -704,6 +706,11 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
     const uint32_t max_grid_x = d->gpu->limits.maxComputeWorkGroupCount[0];
     const uint32_t max_grid_y = d->gpu->limits.maxComputeWorkGroupCount[1];
 
+    // Per plane: the two-column shared kernel when its wider tile fits, else the
+    // one-column shared kernel, else the plain gather. A column count of 2 means
+    // each thread runs two output columns off one tile read per tap.
+    std::array<int, 3> plane_cols {};
+
     for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
         if (!pipeline_valid[plane]) {
             continue;
@@ -716,10 +723,35 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         cfg.height = key.height;
         cfg.stride = key.stride;
 
+        // the shared kernel keeps the source tile plus the guide tile (if any);
+        // the output goes straight to dst[] — there is no output tile. The tile
+        // is f32 at every io depth.
+        const auto tile_bytes = [&](int cols) {
+            const int64_t tile_x = 2 * static_cast<int64_t>(key.radius) +
+                                   static_cast<int64_t>(block_x) * cols;
+            const int64_t tile_y =
+                2 * static_cast<int64_t>(key.radius) + block_y;
+            return static_cast<size_t>(1 + has_ref) *
+                   static_cast<size_t>(tile_x) * static_cast<size_t>(tile_y) *
+                   sizeof(float);
+        };
+        const bool shared2 =
+            use_shared_memory &&
+            tile_bytes(2) <= d->gpu->limits.maxComputeSharedMemorySize;
+        const bool shared1 =
+            use_shared_memory &&
+            tile_bytes(1) <= d->gpu->limits.maxComputeSharedMemorySize;
+        // 2 columns per thread only where the wider shared tile fits; the
+        // one-column kernel (shared or plain) covers one column per thread.
+        plane_cols[plane] = shared2 ? 2 : 1;
+        plane_shared[plane] = shared2 || shared1;
+
+        const int group_x = block_x * plane_cols[plane];
+
         // A 2D grid, so an over-wide plane cannot be folded into Y the way the
         // 1D kernels do: refuse it instead of dispatching a clamped grid that
         // would leave everything past the limit unwritten.
-        const int64_t grid_x = (cfg.width - 1) / block_x + 1;
+        const int64_t grid_x = (cfg.width - 1) / group_x + 1;
         const int64_t grid_y = (cfg.height - 1) / block_y + 1;
         if (grid_x > static_cast<int64_t>(max_grid_x) ||
             grid_y > static_cast<int64_t>(max_grid_y)) {
@@ -734,43 +766,37 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         }
         cfg.grid_x = static_cast<uint32_t>(grid_x);
         cfg.grid_y = static_cast<uint32_t>(grid_y);
-
-        const int tile_x = 2 * key.radius + block_x;
-        const int tile_y = 2 * key.radius + block_y;
-        // the shared kernel keeps the source tile plus the guide tile (if any);
-        // the output goes straight to dst[] — there is no output tile. The tile
-        // is f32 at every io depth.
-        const size_t shared_bytes =
-            static_cast<size_t>(1 + has_ref) * tile_x * tile_y * sizeof(float);
-
-        // gate on the device's real LDS limit: the old hardcoded 48 KiB cap sent
-        // wide radii that still fit to the ~4x slower plain kernel
-        plane_shared[plane] =
-            use_shared_memory &&
-            shared_bytes <= d->gpu->limits.maxComputeSharedMemorySize;
     }
 
-    const uint32_t * shared_code = nullptr;
-    size_t shared_size = 0;
+    const uint32_t * c2_code = nullptr;
+    size_t c2_size = 0;
+    const uint32_t * x1_code = nullptr;
+    size_t x1_size = 0;
     const uint32_t * plain_code = nullptr;
     size_t plain_size = 0;
     switch (d->bits) {
     case 16:
         if (d->half) {
-            shared_code = bilateral_shared_f16_spv;
-            shared_size = bilateral_shared_f16_spv_size;
+            c2_code = bilateral_shared_f16_spv;
+            c2_size = bilateral_shared_f16_spv_size;
+            x1_code = bilateral_shared_f16_x1_spv;
+            x1_size = bilateral_shared_f16_x1_spv_size;
             plain_code = bilateral_plain_f16_spv;
             plain_size = bilateral_plain_f16_spv_size;
         } else {
-            shared_code = bilateral_shared_u16_spv;
-            shared_size = bilateral_shared_u16_spv_size;
+            c2_code = bilateral_shared_u16_spv;
+            c2_size = bilateral_shared_u16_spv_size;
+            x1_code = bilateral_shared_u16_x1_spv;
+            x1_size = bilateral_shared_u16_x1_spv_size;
             plain_code = bilateral_plain_u16_spv;
             plain_size = bilateral_plain_u16_spv_size;
         }
         break;
     case 32:
-        shared_code = bilateral_shared_f32_spv;
-        shared_size = bilateral_shared_f32_spv_size;
+        c2_code = bilateral_shared_f32_spv;
+        c2_size = bilateral_shared_f32_spv_size;
+        x1_code = bilateral_shared_f32_x1_spv;
+        x1_size = bilateral_shared_f32_x1_spv_size;
         plain_code = bilateral_plain_f32_spv;
         plain_size = bilateral_plain_f32_spv_size;
         break;
@@ -799,7 +825,8 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
             continue;
         }
 
-        const int tile_x = 2 * key.radius + block_x;
+        const int group_x = block_x * plane_cols[plane];
+        const int tile_x = 2 * key.radius + group_x;
         const int tile_y = 2 * key.radius + block_y;
         const size_t shared_bytes =
             static_cast<size_t>(1 + has_ref) * tile_x * tile_y * sizeof(float);
@@ -818,10 +845,16 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
                                  .block_x = block_x,
                                  .block_y = block_y };
 
-        const auto result = create_pipeline(
-            *d->gpu, plane_shared[plane], spec,
-            plane_shared[plane] ? shared_code : plain_code,
-            plane_shared[plane] ? shared_size : plain_size, d->pipeline_layout);
+        const bool use_c2 = plane_shared[plane] && plane_cols[plane] == 2;
+        const uint32_t * code = plain_code;
+        size_t code_size = plain_size;
+        if (plane_shared[plane]) {
+            code = use_c2 ? c2_code : x1_code;
+            code_size = use_c2 ? c2_size : x1_size;
+        }
+        const auto result =
+            create_pipeline(*d->gpu, plane_shared[plane], spec, code, code_size,
+                            d->pipeline_layout);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }

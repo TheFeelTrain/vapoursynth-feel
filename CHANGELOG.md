@@ -10,12 +10,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `vsfeel.feel_aa`, a copy of `vsaa.based_aa` that keeps its processing entirely on the GPU
 - `core.vsfeel.Box`, a Vulkan implementation of a box downscale
-- Bilateral accepts fp16 (half) input
-- GaussBlur accepts fp16 (half) input
+- Bilateral and GaussBlur suppport fp16 input and output
 
 ### Changed
 
 - GaussBlur is over 2x faster
+- Bilateral is about 15% faster
 - BM3D is now registered as `core.vsfeel.BM3D` instead of `core.vsfeel.BM3Dv2`
 
 ### Fixed

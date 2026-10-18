@@ -8,8 +8,13 @@ write the output frame in place. The old per-stream staging buffers, VRAM
 src/dst buffers, queue cap and fence are gone.
 
 Design (current):
-- Two kernels, chosen per plane at creation: `bilateral_shared.comp` (LDS-tiled
-  gather, ~3.2–3.8x faster where the tile fits) and `bilateral_plain.comp`.
+- Three kernel tiers per plane, chosen at creation: the two-column
+  `bilateral_shared.comp` (`-DCOLS2`, the default), its one-column form
+  (`bilateral_shared_*_x1`) and `bilateral_plain.comp`. The two-column kernel
+  runs two adjacent output columns per thread off one tile read per tap: their
+  windows overlap in 2R of 2R+1 columns, so the LDS reads halve. It is worth
+  ~16% over the one-column shared kernel. A plane drops a tier when its tile
+  does not fit the device's LDS (28672 B vs 20480 B at R=24/32x16).
 - Three io variants — u16, f16, f32 — selected by the input format (half is
   `stFloat` + 16 bits). A half element is a storage width, not a precision: the
   f16 path runs the f32 tile and arithmetic, widens exactly on load and narrows
@@ -23,7 +28,9 @@ Design (current):
 - `STRIDE` is the core's plane pitch in elements, read off a scratch frame at
   creation (a GPU frame uses the identical stride math).
 - Auto block shape (`32x8` for max radius ≤ 12, `32x16` above); explicit
-  `block_x`/`block_y` are respected and clamped to the device limits.
+  `block_x`/`block_y` are respected and clamped to the device limits. The block
+  is the thread count, so with the two-column kernel a workgroup covers
+  `2*block_x` columns and the tile is `2R + 2*block_x` wide.
 - Unprocessed planes (`sigma < FLT_EPSILON`) ride along from the source through
   `newVideoFrame2`, keeping their own producer pairs; nothing is submitted when
   every plane is unprocessed.
@@ -33,33 +40,23 @@ Design (current):
   (mechanism in Performance), and `tools/benchmark.py` now forces it. Every
   −16% figure in this file's history predates that and is void.
 
-Scoreboard — 1080p GRAY16 jpbd, 5000 frames, sigma 3.0/0.02 (R=9), medians of 3
-through `tools/benchmark.py`:
+Scoreboard — 1080p jpbd, 5000 frames, sigma 3.0/0.02 (R=9), medians of 3
+through `tools/benchmark.py`. u16 input unless noted:
 
-| mode | vsfeel | vszipcl | ratio |
-|---|---|---|---|
-| CPU cache (benchmark default) | 2306.6 | 576.1 | 4.00x |
-| `--gpu-cache` | 2305.6 | 708.0 | 3.26x |
-| `--gpu-cache --no-download` (u16 / f32) | 2317 / 2296 | 732 / 457 | 3.88x |
+| mode | vsfeel u16 | vszipcl | ratio | vsfeel f16 | vsfeel f32 |
+|---|---|---|---|---|---|
+| CPU cache (benchmark default) | 2658.3 | 572.4 | 4.64x | 2660.5 | 1480.9 |
+| `--gpu-cache` | 2684.8 | 710.7 | 3.78x | 2677.2 | 1938.9 |
+| `--gpu-cache --no-download` | 2689.6 | 709.2 | 3.79x | 2692.7 | 2662.0 |
 
-Half input against its f32 twin (`--format f16` vs `--format f32`), same clip,
-sigma, frames and 3 repeats, one session:
-
-| mode | vsfeel f16 | vsfeel f32 | vszipcl f16 | vszipcl f32 |
-|---|---|---|---|---|
-| CPU cache (benchmark default) | 2319.8 | 1487.4 | 571.7 | 412.3 |
-| `--gpu-cache` | 2317.1 | 1983.6 | 744.5 | 464.6 |
-| `--gpu-cache --no-download` | 2346.4 | 2325.6 | 744.2 | 454.1 |
-
-- Compute-only the two depths tie (+0.9%, inside the run-to-run spread): the
-  frame is ALU/`exp2`-bound and the tile/arithmetic stay f32, so half storage
-  buys nothing there. It does show where the output is downloaded: f32 CPU cache
-  1487 vs f16 2320, `--gpu-cache` 1984 vs 2317 (the download is half the bytes).
-- For u16/f16 the three modes are within 1% of each other: with the transfer
-  queue the plane transfers overlap the kernels, so the filter's own compute is
-  the frame in every mode and the output download is not on the critical path.
-  At f32 the download is twice the bytes and that stops holding (2326
-  compute-only against 1487 through the CPU sink).
+- The two-column kernel lifted every compute-bound row by ~15–16% (u16 2343 →
+  2690, f16 2346 → 2693, f32 2326 → 2662, compute-only). The reference rows are
+  unchanged, so the ratios moved with it (u16 3.22x → 3.79x).
+- Compute-only the three depths tie: the kernel is `exp2`-bound and the tile and
+  arithmetic stay f32, so the io width buys nothing there. It shows only where
+  the output is downloaded (f32 CPU cache 1481 against f16 2661 — the download
+  is twice the bytes), and the transfer-carrying modes are within ~1% of
+  compute-only for u16/f16, i.e. the transfers overlap the kernel.
 
 ## Implementation
 
@@ -75,10 +72,19 @@ sigma, frames and 3 repeats, one session:
   (3 storage buffers via push descriptors, `VK_WHOLE_SIZE`), `vkCmdDispatch`,
   then `gpuExecReadsFrame`/`gpuExecWritesPlane`/`gpuExecSubmit`. No barrier is
   needed: the plane dispatches touch disjoint buffers.
-- `use_shared_memory=0`, or a tile that exceeds
-  `maxComputeSharedMemorySize`, selects the plain kernel. The gate counts
-  `(1 + has_ref) * (2R + block_x) * (2R + block_y) * 4` bytes, which is exactly
-  what `buf[SHARED_FLOATS]` reserves (the output goes straight to `dst[]`).
+- The kernel tier is per plane: the two-column shared kernel while
+  `(1 + has_ref) * (2R + 2*block_x) * (2R + block_y) * 4` fits
+  `maxComputeSharedMemorySize`, else the one-column shared kernel while
+  `(1 + has_ref) * (2R + block_x) * (2R + block_y) * 4` does, else the plain
+  gather. `use_shared_memory=0` forces the last. `SHARED_FLOATS` is exactly what
+  `buf[SHARED_FLOATS]` reserves (the output goes straight to `dst[]`), and the
+  grid follows the chosen column count.
+- The two-column kernel indexes the tile from the workgroup's first plane column
+  (`gx0 = group.x * 2*gl_WorkGroupSize.x`), so the load's `clamp` and the
+  accumulation share one base. Per row it walks the `2R+2` columns spanning both
+  windows once: the `k <= 2R` / `k >= 1` tests fold, so each tile value feeds
+  both outputs and carries no per-tap predicate. The last column of an odd-width
+  plane is skipped at the store only.
 - The 32-bit element-offset guard rejects a plane whose last element
   `(h-1)*stride + w - 1` would not fit an int.
 - `round(sigma_spatial*3)` is clamped to 1e6 before the float→int cast (the
@@ -91,6 +97,39 @@ sigma, frames and 3 repeats, one session:
 
 ## Performance
 
+- **Two output columns per thread: +16%, and the win was a predicate, not the
+  LDS.** Sharing each tile read between the windows of columns x and x+1 is
+  worth ~2.75% on its own. Putting the "is there a second column" test *inside*
+  the innermost loop as a select cost the other 13 points: ACO emitted two
+  `v_cndmask_b32` per tap (722 per thread) and, more importantly, could no
+  longer keep the body in registers (430 instructions, VGPR 48). Moving the test
+  to the store alone dropped the body to 381 instructions and measured
+  2319 → 2694 fps (u16/f32 compute-only, 5000 frames, 3-repeat medians; +16.0%
+  on an ABBA A/B, n=24 per arm). Same mechanism as
+  `notes/GAUSSBLUR.md`'s skipped padding taps: one select per tap in an unrolled
+  body is never free.
+- **The two-column kernel rolls the row loop, and that is what freed the
+  registers.** Full unrolling of 361 taps for two outputs does not fit: ACO
+  keeps the inner 2R+2-tap loop unrolled and rolls the 19 rows instead, so the
+  kernel runs at VGPR 48 / 28 subgroups per SIMD against the one-column
+  kernel's 192 / 8, with no spills. The cost is that `cy*cy` is no longer a
+  constant, so the spatial term is a per-row value rather than a literal; the
+  LDS and occupancy gains still dominate.
+- **The gain tracks the radius.** Same-session A/B against the previous build
+  (u16, compute-only): R=3 +9.7%, R=9 +17.1%, R=12 +3.8%, R=24 +1.1%, R=36
+  +8.6%. The tier choice stays right where the gain shrinks — at R=24 the
+  two-column kernel is still +1.2% over the one-column one — but the auto block
+  rule (`32x8` R≤12, `32x16` above) was tuned on the one-column kernel, so the
+  R=12 dip is most likely a shape artifact rather than the kernel.
+- **The one-column kernel is `exp2`-bound, and `exp2` is 44% of its frame.** An
+  ablation ladder on the old kernel (f32, R=9, compute-only): deleting `exp2`
+  alone 2324 → 4174 fps, deleting the whole exponent term (three ALU ops: the
+  difference, its `sc` multiply and the fused `space*ss + range*sc`) 2324 →
+  7855. So `exp2` ≈ 190 µs, the exponent math ≈ 113 µs, LDS + accumulate ≈
+  127 µs of the 432 µs frame. `exp2` is one SFU op per tap (~6 cycles per
+  wave32 instruction, near the SFU's throughput) and 361 calls/pixel is the
+  algorithm's floor at R=9, so the remaining headroom is in hiding the rest
+  behind it, not in the weight math.
 - **The exposed download was a copy on the graphics engine; the fix is a driver
   opt-in, not a core change.** RADV gates its dedicated transfer-only SDMA
   family behind one (`radv_transfer_queue_enabled` in
@@ -118,19 +157,15 @@ sigma, frames and 3 repeats, one session:
   VGPR / 0 spill; pre-R80 3102 / 14708 / 192 / 0. `glslc -O` output is 315 vs 321
   SPIR-V lines. The shader rewrite (three whole-buffer bindings, no push
   constants) did not move the machine code.
-- **The frame is kernel-dominated.** A serialized timestamp probe around the
-  dispatches (BlankClip GRAY16 1080p, `-r 1`) gave R=3 0.080 ms, R=9 0.507,
-  R=12 0.678, R=24 2.442. Read that for shape, not absolute: a serialized probe
-  inflates (the current R=9 frame is 0.433 ms, below the 0.507 it reported).
-  The pre-opt-in delta tracked the kernel (R=3 −9.3%, R=9 −16.4%, R=24 −8.8%):
-  a 2.44 ms kernel hides most of the transfer.
 - **The filter, not the transfer, is the frame.** A bare
-  `GPUUpload→GPUDownload` round trip of one 1080p GRAY16 plane measures 264 µs
-  (3786 fps) against Bilateral's 433 µs (2306.6 fps), and the three benchmark
-  modes agree within 1%: the transfers overlap the kernel and the output
-  download is not on the critical path. The earlier reading (a 0.414 ms round
-  trip with "only ~0.10 ms exposed") was measuring the harness's own per-frame
-  cost (`notes/METHOD.md`), not the core's.
+  `GPUUpload→GPUDownload` round trip of one 1080p plane measures 264 µs
+  (3786 fps) against Bilateral's 372 µs (2690 fps) and the transfer-carrying
+  modes land within ~1% of compute-only for u16/f16: the transfers overlap the
+  kernel and the output download is not on the critical path for a 2-byte
+  sample. At f32 the download is twice the bytes and stops overlapping
+  (CPU cache 1481 against 2662 compute-only). The earlier reading (a 414 µs
+  round trip with "only ~0.10 ms exposed") was measuring the harness's own
+  per-frame cost (`notes/METHOD.md`), not the core's.
 - Host split (`VSFEEL_BILAT_TIMING=1`, 3000 frames): acquire 19.1 / record 5.8 /
   submit 59.0 µs per frame — the host is nowhere near the wall.
 - The port wins exactly where a resident chain is involved: fed a GPU clip the
@@ -138,24 +173,23 @@ sigma, frames and 3 repeats, one session:
 
 - **Half storage costs nothing on compute and one step on accuracy.** The f16
   kernel is the f32 one plus an `OpFConvert` on every tile load and on the store
-  (`RADV_DEBUG=asm`: both variants emit 360 `v_exp_f32` and ~1800 f32 ALU over
-  the unrolled 361-tap sweep), so compute-only is a tie: 2346 fps f16 vs 2326
-  f32 (1080p, sigma 3.0/0.02, 5000 frames, 3-repeat medians). Every f16
-  reference config measures exactly 4.88e-4 (one half step at |v| ∈ [0.5, 1)) on
-  a few tens of samples per frame, and 125 of 2.07M samples differ from the
-  *same-input* f32 run: the extra `OpFConvert` shifts ACO's contraction by one
-  instruction, so the two variants' f32 sums differ in the last bits and the
-  store rounds that to a step. That is the storage width's price, not the
-  arithmetic's.
-- **Both full-half prototypes lost, for the GAUSSBLUR mechanism.** A half LDS
-  tile measured 2250 fps (−3.6%): a scalar half load still takes a load slot and
-  every tap adds a widening convert, so halving the bytes saves nothing. Half
-  tile *and* half tap arithmetic (`float16_t` LDS, weights and accumulator)
-  measured 2270 fps (−2.6%) while drifting up to 9.3e-3 (~19 half steps) off the
-  f32 result. ACO emits scalar `v_fma_f16`/`v_exp_f16` for this shape, never a
-  packed `v_pk_*`, so the FMA rate does not move and the converts cost more than
-  the width saves (`notes/GAUSSBLUR.md` records the same result for its own
-  shape).
+  (the 361-tap sweep is the same shape at both depths), so compute-only is a
+  tie: 2693 fps f16 vs 2662 f32 (1080p, sigma 3.0/0.02, 5000 frames, 3-repeat
+  medians). Every f16 reference config measures exactly 4.88e-4 (one half step
+  at |v| ∈ [0.5, 1)) on a few tens of samples per frame, and 125 of 2.07M
+  samples differ from the *same-input* f32 run: the extra `OpFConvert` shifts
+  ACO's contraction by one instruction, so the two variants' f32 sums differ in
+  the last bits and the store rounds that to a step. That is the storage width's
+  price, not the arithmetic's.
+- **Both full-half prototypes lost, for the GAUSSBLUR mechanism.** Measured
+  against the then-shipped one-column kernel: a half LDS tile measured 2250 fps
+  (−3.6%): a scalar half load still takes a load slot and every tap adds a
+  widening convert, so halving the bytes saves nothing. Half tile *and* half tap
+  arithmetic (`float16_t` LDS, weights and accumulator) measured 2270 fps
+  (−2.6%) while drifting up to 9.3e-3 (~19 half steps) off the f32 result. ACO
+  emits scalar `v_fma_f16`/`v_exp_f16` for this shape, never a packed `v_pk_*`,
+  so the FMA rate does not move and the converts cost more than the width saves
+  (`notes/GAUSSBLUR.md` records the same result for its own shape).
 
 Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter bilateral
 [vsfeel vszipcl] [--gpu-cache] [--format u16|f16|f32] [--bilateral-args
@@ -273,15 +307,23 @@ SDMA and the port reaches parity without any core change.
   that is not on the shipped path; the shared kernel agrees with the reference
   to 1 code / ≤5.6e-9 at every sigma, so the bound is now REF_TOL and 2 codes.
   Added coverage for the automatic LDS gate (a forced 12288-byte device must
-  pick the plain kernel — radius 24's 20 480 B tile no longer fits — and match
-  the explicit plain run bit-for-bit) and for the per-plane share path
-  (`sigma_spatial=[2.0, 0, 0]` must copy chroma through bit-identically).
+  pick the plain kernel — radius 24's 20 480 B one-column tile no longer fits —
+  and match the explicit plain run bit-for-bit) and for the per-plane share path
+  (`sigma_spatial=[2.0, 0, 0]` must copy chroma through bit-identically). With
+  three kernels, `test_device_limits.py` pins all three tiers from the creation
+  banner's `lds=` (28672 / 20480 / 0) and the mixed per-plane case.
 
 ## Open work
 
-- The only remaining lever is the kernel itself: at R=9 it is 84% of the frame
-  and is ALU/`exp2`-bound, and the block-shape, wave32, unroll and vec4 sweeps
-  below already came back empty — a kernel project, not a scheduling one.
+- The kernel is at ~372 µs/frame against a ~211 µs `exp2` floor, so the lever
+  left is hiding the ALU/LDS behind the SFU, not shortening the weight math. The
+  two-column kernel's shape was swept at R=9 only (32x8 still wins there); the
+  wide-radius auto rule (`32x16` above radius 12) was tuned for the one-column
+  kernel and has not been re-swept for the two-column one.
+- **The exponent math is provably minimal at three ALU ops.** `sc*d² + lit` needs
+  the difference, a square (or an `sc`-scaled product) and the fused `+ lit`;
+  `v_fmaak` only folds a *linear* literal term, so there is no two-op form that
+  keeps the subtraction's cancellation.
 - A packed two-pixels-per-lane f16 kernel is the only untried f16 form. It would
   halve the per-tap ALU, but `exp2` is emitted per tap (`v_exp_f32`, a
   quarter-rate SFU op) and cannot be packed, so it cannot halve the frame and is
@@ -289,6 +331,19 @@ SDMA and the port reaches parity without any core change.
 
 ### Do not retry
 
+- **Pre-scaling the tile to fold the exponent to two ops.** Scaling the tile by
+  `k = sqrt(-SIGMA_COLOR_SCALED)` at load time makes the exponent
+  `fma(-d, d, lit)` (two ops instead of three) and measured **+6.8%** — but it
+  scales *before* the subtraction, so `fl(v*k) - fl(c*k)` loses the
+  cancellation that makes `v - c` accurate when `v ≈ c`, i.e. exactly the taps
+  whose range weight is near 1. Measured 1.7e-6 (default sigma) and 3.8e-6
+  (sigma_color 0.15) against the reference where f32 asserts < 1e-6. The same
+  mechanism rules out any pre-scaled tile, power-of-two scale included (the
+  residual `sc/4^m` still needs its own multiply, which puts the op count back).
+- **A predicate inside the tap loop.** The two-column kernel's `second` test
+  cost 13 of its 16 points as two `v_cndmask_b32` per tap; moving it to the
+  store is what the win actually was. Any per-tap select in an unrolled body
+  needs its price measured before it ships.
 - **Half LDS, and half LDS with half tap arithmetic** (measured, mechanism under
   Performance): −3.6% and −2.6% against the f32 tile, the second for up to 19
   half steps of error. Do not retry without a code shape ACO actually packs into

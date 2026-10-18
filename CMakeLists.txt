@@ -188,15 +188,18 @@ set(VK_IO_TYPES "u16" "f32")
 
 # Bilateral: one entry point per file, per io variant (u16, f16, f32). Its io
 # list is local for the same reason GaussBlur's is: the other filters' kernels
-# would fall through to their u16 branch under an -DIO_F16 name.
+# would fall through to their u16 branch under an -DIO_F16 name. The shared
+# kernel is built twice: the default one computes two output columns per thread
+# (-DCOLS2, the two windows share each tile read) and the _x1 one is the
+# fallback for a plane whose two-column tile is too wide.
 set(VK_BILATERAL_IO_TYPES "u16" "f16" "f32")
 set(VK_BILATERAL_VARIANTS)
-foreach(component IN ITEMS shared plain)
-    foreach(io IN LISTS VK_BILATERAL_IO_TYPES)
-        string(TOUPPER "${io}" io_define)
-        list(APPEND VK_BILATERAL_VARIANTS
-            "bilateral_${component}_${io}|bilateral_${component}.comp|-DIO_${io_define}")
-    endforeach()
+foreach(io IN LISTS VK_BILATERAL_IO_TYPES)
+    string(TOUPPER "${io}" io_define)
+    list(APPEND VK_BILATERAL_VARIANTS
+        "bilateral_shared_${io}|bilateral_shared.comp|-DIO_${io_define} -DCOLS2"
+        "bilateral_shared_${io}_x1|bilateral_shared.comp|-DIO_${io_define}"
+        "bilateral_plain_${io}|bilateral_plain.comp|-DIO_${io_define}")
 endforeach()
 
 # BM3D: an estimation kernel (float ring and float estimate stacks at every

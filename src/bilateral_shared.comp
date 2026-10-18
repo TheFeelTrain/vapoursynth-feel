@@ -10,6 +10,15 @@
  * frame plane. All three hold native elements, so loads and stores are plain
  * coalesced accesses — no shift/mask unpacking, no dword packing, no atomics.
  *
+ * -DCOLS2 additionally gives each thread two adjacent output columns. Their
+ * windows overlap in 2R of 2R+1 columns, so a row is read once for both
+ * accumulations (2R+2 tile reads instead of 2*(2R+1)). The host pairs it with
+ * twice the tile width and half the grid, and falls back to the one-column
+ * form (this file without -DCOLS2) where the wider tile does not fit. The
+ * per-tap predicate that skips the second column is kept at the store, never
+ * in the loop: as a per-tap select it cost 13 of the kernel's 16 points
+ * (`notes/BILATERAL.md`).
+ *
  * A half element is a storage width, not a precision: it widens exactly on
  * load and narrows once on store (OpFConvert, the SPIR-V default round to
  * nearest even, i.e. vszipcl's vstore_half_rte), while the LDS tile and the
@@ -95,19 +104,30 @@ void store_value(int idx, float v) {
 }
 
 void main() {
-    const int x = int(gl_GlobalInvocationID.x);
-    const int y = int(gl_GlobalInvocationID.y);
     const int tx = int(gl_LocalInvocationID.x);
     const int ty = int(gl_LocalInvocationID.y);
+#if defined(COLS2)
+    // Two adjacent output columns per thread. Their windows overlap in 2R of
+    // 2R+1 columns, so one tile read per (row, tap) feeds both accumulations:
+    // the LDS load count per output halves, and the scheduler gets two
+    // independent exp2/accumulate streams.
+    const int gx0 = int(gl_WorkGroupID.x) * (2 * int(gl_WorkGroupSize.x));
+    const int x = gx0 + 2 * tx;
+#else
+    const int x = int(gl_GlobalInvocationID.x);
+    const int gx0 = x - tx;
+#endif
+    const int y = int(gl_GlobalInvocationID.y);
 
     // the guide tile sits above the source tile; with no guide the source tile
     // is what both the weight and the value read
     const int ref_offset = HAS_REF * TILE_Y * TILE_X;
 
+    // tile column 0 covers plane column gx0 - RADIUS
     for (int cy = ty; cy < TILE_Y; cy += int(gl_WorkGroupSize.y)) {
         const int sy = clamp(cy - ty - RADIUS + y, 0, HEIGHT - 1);
         for (int cx = tx; cx < TILE_X; cx += int(gl_WorkGroupSize.x)) {
-            const int sx = clamp(cx - tx - RADIUS + x, 0, WIDTH - 1);
+            const int sx = clamp(gx0 - RADIUS + cx, 0, WIDTH - 1);
             buf[cy * TILE_X + cx] = load_src(sy * STRIDE + sx);
         }
     }
@@ -115,7 +135,7 @@ void main() {
         for (int cy = ty; cy < TILE_Y; cy += int(gl_WorkGroupSize.y)) {
             const int sy = clamp(cy - ty - RADIUS + y, 0, HEIGHT - 1);
             for (int cx = tx; cx < TILE_X; cx += int(gl_WorkGroupSize.x)) {
-                const int sx = clamp(cx - tx - RADIUS + x, 0, WIDTH - 1);
+                const int sx = clamp(gx0 - RADIUS + cx, 0, WIDTH - 1);
                 buf[ref_offset + cy * TILE_X + cx] = load_ref(sy * STRIDE + sx);
             }
         }
@@ -126,6 +146,50 @@ void main() {
         return;
     }
 
+#if defined(COLS2)
+    const int cx0 = RADIUS + 2 * tx;
+    const float center0 = buf[ref_offset + (RADIUS + ty) * TILE_X + cx0];
+    const float center1 = buf[ref_offset + (RADIUS + ty) * TILE_X + cx0 + 1];
+    const bool second = (x + 1) < WIDTH;
+
+    float num0 = 0.0f, den0 = 0.0f;
+    float num1 = 0.0f, den1 = 0.0f;
+
+    for (int cy = -RADIUS; cy <= RADIUS; ++cy) {
+        const int sy = cy + RADIUS + ty;
+        const int row = sy * TILE_X + cx0 - RADIUS;
+        // k indexes the 2R+2 columns spanning both windows; the k<=2R and k>=1
+        // tests fold, and each value is read once for the two outputs
+        for (int k = 0; k <= 2 * RADIUS + 1; ++k) {
+            const float gvalue = buf[ref_offset + row + k];
+            const float value = (HAS_REF == 1) ? buf[row + k] : gvalue;
+            if (k <= 2 * RADIUS) {
+                const int space0 = cy * cy + (k - RADIUS) * (k - RADIUS);
+                const float range0 = (gvalue - center0) * (gvalue - center0);
+                const float weight0 = exp2(
+                    float(space0) * SIGMA_SPATIAL_SCALED +
+                    range0 * SIGMA_COLOR_SCALED);
+                num0 += weight0 * value;
+                den0 += weight0;
+            }
+            if (k >= 1) {
+                const int d1 = k - 1 - RADIUS;
+                const int space1 = cy * cy + d1 * d1;
+                const float range1 = (gvalue - center1) * (gvalue - center1);
+                const float weight1 = exp2(
+                    float(space1) * SIGMA_SPATIAL_SCALED +
+                    range1 * SIGMA_COLOR_SCALED);
+                num1 += weight1 * value;
+                den1 += weight1;
+            }
+        }
+    }
+
+    store_value(y * STRIDE + x, num0 / den0);
+    if (second) {
+        store_value(y * STRIDE + x + 1, num1 / den1);
+    }
+#else
     const float center = buf[ref_offset + (RADIUS + ty) * TILE_X + RADIUS + tx];
 
     float num = 0.0f;
@@ -149,4 +213,5 @@ void main() {
     }
 
     store_value(y * STRIDE + x, num / den);
+#endif
 }

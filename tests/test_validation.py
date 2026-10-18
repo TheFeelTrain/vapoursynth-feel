@@ -31,6 +31,7 @@ FILTERS = [
     "Bilateral_u16",
     "Bilateral_f16",
     "Bilateral_f16_plain",
+    "Bilateral_x1",
     "GaussBlur",
     "GaussBlurLarge",
     "GaussBlur_f16",
@@ -48,6 +49,7 @@ FILTERS = [
 ]
 
 _SCRIPT = textwrap.dedent(f"""\
+    import os
     import sys
     import vapoursynth as vs
 
@@ -79,6 +81,12 @@ _SCRIPT = textwrap.dedent(f"""\
         # The plain (non-LDS) half kernel, a separate SPIR-V module.
         node = core.vsfeel.Bilateral(gh, sigma_spatial=3.0, sigma_color=0.05,
                                      use_shared_memory=0)
+    elif name == "Bilateral_x1":
+        # The one-column shared kernel, a separate module reached only when the
+        # two-column tile is rejected (same bindings, same descriptor set).
+        # The cap must be in place before the plugin creates its device.
+        os.environ["VSFEEL_LIMIT_SHARED_MEMORY"] = "24576"
+        node = core.vsfeel.Bilateral(gs, sigma_spatial=8.0, sigma_color=0.15)
     elif name == "GaussBlur":
         node = core.vsfeel.GaussBlur(gs, sigma=2.0)
     elif name == "GaussBlurLarge":
