@@ -392,10 +392,10 @@ def run_compare_subprocess(code, argv=(), timeout=600.0, env=None):
         ) from exc
 
 
-def compare_or_skip(code, argv=(), timeout=600.0):
+def compare_or_skip(code, argv=(), timeout=600.0, env=None):
     """Like :func:`run_compare_subprocess`, but skip on a bad reference."""
     try:
-        return run_compare_subprocess(code, argv, timeout)
+        return run_compare_subprocess(code, argv, timeout, env=env)
     except ReferenceUnavailable as exc:
         skip_or_fail_reference(f"reference unavailable: {exc}")
 
@@ -632,15 +632,17 @@ def reference_spec(
     return spec
 
 
-def reference_compare(spec, timeout=600.0):
+def reference_compare(spec, timeout=600.0, env=None):
     """Run one reference-vs-vsfeel comparison in a subprocess.
 
     Returns the RESULT payload: ``maxdiff``, ``ndiff_frac`` and the vsfeel
     output geometry.  A missing/crashing reference skips (or fails under
     ``--require-references``); a vsfeel crash, timeout or non-finite result
-    fails with the captured subprocess tail.
+    fails with the captured subprocess tail.  ``env`` adds overrides to the
+    subprocess environment, which is how a test pins a creation-time variant
+    (the plugin reads its knobs when the filter is built).
     """
-    return compare_or_skip(REFERENCE_SCRIPT, [json.dumps(spec)], timeout=timeout)
+    return compare_or_skip(REFERENCE_SCRIPT, [json.dumps(spec)], timeout=timeout, env=env)
 
 
 # ---------------------------------------------------------------------------

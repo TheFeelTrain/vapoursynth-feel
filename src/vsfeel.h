@@ -68,6 +68,12 @@ inline bool env_flag(const char * env) {
     return v && *v && std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0;
 }
 
+// The inverted default: on when unset, off only for `VAR=0`/`VAR=false`.
+inline bool env_flag_default_on(const char * env) {
+    const char * v = std::getenv(env);
+    return !v || !*v || env_flag(env);
+}
+
 inline int env_int(const char * env, int default_value) {
     const char * v = std::getenv(env);
     if (!v || !*v) {
@@ -339,6 +345,10 @@ struct GPUDevice {
     // shaderBufferFloat32AtomicAdd specifically -- atomic exchange support
     // alone does not let a kernel use atomicAdd on a float buffer.
     bool feat_atomic_float32_add { false };
+    // shaderFloat16: optional in every core version (see the core's feature
+    // table), so a kernel that computes in half rather than only storing it
+    // has to ask. Gates NNEDI3's packed half predictor.
+    bool feat_shader_float16 { false };
 
     // The shaders' other extensions are deliberately unchecked, because the
     // core's device baseline guarantees them on the logical device (see

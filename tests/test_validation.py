@@ -46,6 +46,8 @@ FILTERS = [
     "EEDI3H",
     "EEDI3AA",
     "NNEDI3",
+    "NNEDI3_f16",
+    "NNEDI3_f16_storage",
 ]
 
 _SCRIPT = textwrap.dedent(f"""\
@@ -137,6 +139,17 @@ _SCRIPT = textwrap.dedent(f"""\
         node = core.vsfeel.EEDI3AA(g16, field=3)
     elif name == "NNEDI3":
         node = core.vsfeel.NNEDI3(g16, field=1)
+    elif name == "NNEDI3_f16":
+        # The packed half predictor is a separate SPIR-V module that computes
+        # in f16 (Float16 capability, which the logical device must have
+        # enabled) with a 9 KiB f16vec4 shared tile: a different binding view
+        # and LDS footprint from the u16/f32 modules above.
+        node = core.vsfeel.NNEDI3(gh, field=1)
+    elif name == "NNEDI3_f16_storage":
+        # The opt-out keeps half as a storage width only, which must not
+        # declare the Float16 capability (the GaussBlur_f16 case above).
+        os.environ["VSFEEL_NNEDI3_PRED16"] = "0"
+        node = core.vsfeel.NNEDI3(gh, field=1)
     else:
         raise SystemExit("unknown filter %r" % name)
 

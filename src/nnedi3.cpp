@@ -68,6 +68,9 @@ constexpr uint32_t kPredictLdsPxp8 = 4 * 256 * 16; // 16 KiB
 constexpr uint32_t kPredictLdsN4 = 4 * 288 * 16;   // 18 KiB
 constexpr uint32_t kPredictLdsN4m = 4 * 192 * 16;  // 12 KiB
 constexpr uint32_t kPredictLdsN4s = 4 * 64 * 16;   // 4 KiB
+// The packed half predictor's tile is f16vec4 rows (two window elements each):
+// 4 subgroups x SHSTRIDE=288 rows x 8 B = 9 KiB, which covers every network.
+constexpr uint32_t kPredictLdsF16 = 4 * 288 * 8;
 
 // Weight blob linked into the binary (see CMakeLists.txt): the assembler's
 // .incbin everywhere except Windows, which embeds the same bytes as an RCDATA
@@ -171,6 +174,44 @@ static double vec_mean(const float * v, size_t n) {
         acc += v[i];
     }
     return acc / static_cast<double>(n);
+}
+
+// float -> IEEE half, round to nearest even (the same conversion nnedi3vk
+// uses to build its f16 weight matrix; SPIR-V's OpFConvert is the same
+// rounding, so the shader's loads and this host packing agree).
+static uint16_t float_to_half(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const uint32_t absx = x & 0x7fffffffu;
+    if (absx >= 0x7f800000u) { // inf/nan
+        return static_cast<uint16_t>(sign | 0x7c00u |
+                                     ((absx > 0x7f800000u) ? 0x200u : 0u));
+    }
+    if (absx >= 0x477ff000u) { // overflows to inf
+        return static_cast<uint16_t>(sign | 0x7c00u);
+    }
+    if (absx < 0x38800000u) { // subnormal or zero
+        if (absx < 0x33000001u) {
+            return static_cast<uint16_t>(sign);
+        }
+        const int shift = 125 - static_cast<int>(absx >> 23);
+        const uint32_t mant = (absx & 0x7fffffu) | 0x800000u;
+        uint32_t half = mant >> (shift + 1);
+        const uint32_t rem = mant & ((2u << shift) - 1);
+        const uint32_t halfway = 1u << shift;
+        if (rem > halfway || (rem == halfway && (half & 1u))) {
+            half++;
+        }
+        return static_cast<uint16_t>(sign | half);
+    }
+    uint32_t half =
+        ((absx >> 13) & 0x3ffu) | ((((absx >> 23) - 112u) & 0x1fu) << 10);
+    const uint32_t rem = absx & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (half & 1u))) {
+        half++;
+    }
+    return static_cast<uint16_t>(sign | half);
 }
 
 // Prescreener prep: subtract each layer-0 neuron's own mean and scale by
@@ -379,6 +420,10 @@ struct Nnedi3Data {
     int qual {}, pscrn {};
     bool use_list {}; // prescreen compacts a list (pscrn > 0)
     int peak {}, elem_bytes {};
+    bool half {}; // stFloat + 16 bits: a 2-byte element that is a float
+    // f16 input on a device with shaderFloat16: the predictor runs the packed
+    // half GEMV (see src/nnedi3.comp). VSFEEL_NNEDI3_PRED16=0 opts out.
+    bool pred16 {};
     int xdim {}, ydim {}, nns {};
     bool process[3] { true, true, true };
 
@@ -894,17 +939,20 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
 
     const auto & fmt = d->vi->format;
     const int bits = fmt.bitsPerSample;
-    const bool depth_ok = (fmt.sampleType == stInteger && bits == 16) ||
-                          (fmt.sampleType == stFloat && bits == 32);
+    const bool depth_ok =
+        (fmt.sampleType == stInteger && bits == 16) ||
+        (fmt.sampleType == stFloat && (bits == 32 || bits == 16));
     if (!depth_ok || d->vi->width <= 0 || d->vi->height <= 0 ||
         (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV &&
          fmt.colorFamily != cfRGB)) {
         return set_error(
-            "only 16-bit integer (u16) and 32-bit float (f32) Gray/YUV/RGB input supported.");
+            "only 16-bit integer (u16), 16-bit float (f16) and 32-bit float "
+            "(f32) Gray/YUV/RGB input supported.");
     }
 
     d->peak = fmt.sampleType == stInteger ? (1 << bits) - 1 : 0;
     d->elem_bytes = bits / 8;
+    d->half = fmt.sampleType == stFloat && bits == 16;
 
     d->field =
         vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "field", 0, nullptr));
@@ -1038,6 +1086,27 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
     }
 
+    // The packed half predictor computes in half, which needs the optional
+    // shaderFloat16 feature; a device without it keeps the storage-only f16
+    // kernels (f32 arithmetic, one half rounding on store).
+    d->pred16 = d->half && d->gpu->feat_shader_float16 &&
+                env_flag_default_on("VSFEEL_NNEDI3_PRED16");
+    if (vsfeel_device_info_enabled()) {
+        // One line per created filter naming the predictor that will run: a
+        // feature- or env-selected variant is invisible in the pixels, so this
+        // is what a test pins it by.
+        fprintf(stderr, "[nnedi3] io=%s predictor=%s\n",
+                d->half ? "f16" : (d->elem_bytes == 2 ? "u16" : "f32"),
+                d->pred16 ? "f16-packed" : (d->half ? "f16-storage" : "f32"));
+    }
+    if (d->half && !d->pred16 && vsfeel_device_info_enabled()) {
+        // The storage-only f16 kernels run this file's f32 arithmetic and are
+        // bit-exact with the f32 path; say why the packed one is not in use.
+        fprintf(stderr,
+                "[nnedi3] packed half predictor off (shaderFloat16=%d)\n",
+                d->gpu->feat_shader_float16);
+    }
+
     // Weights: parse the embedded blob, prep, and pack the GPU layouts.
     PsOldWeights ps_old {};
     PsNewWeights ps_new {};
@@ -1109,26 +1178,68 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         ps_blob.resize(4, 0.0f);
     }
 
-    // predictor weights: (softmax, elliott) pairs in [q][k][p] order
-    std::vector<float> pdw_blob(num_q * fs * nns * 2);
-    for (size_t q = 0; q < num_q; ++q) {
-        const std::vector<float> & sm = q == 0 ? model.sm1 : model.sm2;
-        const std::vector<float> & el = q == 0 ? model.el1 : model.el2;
-        for (size_t k = 0; k < fs; ++k) {
-            for (size_t p = 0; p < nns; ++p) {
-                pdw_blob[((q * fs + k) * nns + p) * 2 + 0] = sm[p * fs + k];
-                pdw_blob[((q * fs + k) * nns + p) * 2 + 1] = el[p * fs + k];
+    // predictor weights: (softmax, elliott) pairs in [q][k][p] order. The
+    // packed half variant stores (sm[2k], sm[2k+1], el[2k], el[2k+1]) per
+    // f16vec4 instead, i.e. two window elements per element of [q][k/2][p].
+    std::vector<float> pdw_blob;
+    std::vector<uint16_t> pdw16_blob;
+    if (d->pred16) {
+        pdw16_blob.resize(num_q * (fs / 2) * nns * 4);
+        for (size_t q = 0; q < num_q; ++q) {
+            const std::vector<float> & sm = q == 0 ? model.sm1 : model.sm2;
+            const std::vector<float> & el = q == 0 ? model.el1 : model.el2;
+            for (size_t k2 = 0; k2 < fs / 2; ++k2) {
+                for (size_t p = 0; p < nns; ++p) {
+                    const size_t base = ((q * (fs / 2) + k2) * nns + p) * 4;
+                    pdw16_blob[base + 0] =
+                        float_to_half(sm[p * fs + k2 * 2 + 0]);
+                    pdw16_blob[base + 1] =
+                        float_to_half(sm[p * fs + k2 * 2 + 1]);
+                    pdw16_blob[base + 2] =
+                        float_to_half(el[p * fs + k2 * 2 + 0]);
+                    pdw16_blob[base + 3] =
+                        float_to_half(el[p * fs + k2 * 2 + 1]);
+                }
+            }
+        }
+    } else {
+        pdw_blob.resize(num_q * fs * nns * 2);
+        for (size_t q = 0; q < num_q; ++q) {
+            const std::vector<float> & sm = q == 0 ? model.sm1 : model.sm2;
+            const std::vector<float> & el = q == 0 ? model.el1 : model.el2;
+            for (size_t k = 0; k < fs; ++k) {
+                for (size_t p = 0; p < nns; ++p) {
+                    pdw_blob[((q * fs + k) * nns + p) * 2 + 0] = sm[p * fs + k];
+                    pdw_blob[((q * fs + k) * nns + p) * 2 + 1] = el[p * fs + k];
+                }
             }
         }
     }
-    // predictor biases: (smB, elB) pairs in [q][p] order
-    std::vector<float> pdb_blob(num_q * nns * 2);
+    // predictor biases: (smB, elB) pairs in [q][p] order. The packed half
+    // variant appends the prepped f32 weight row sums per neuron, which the
+    // kernel needs to undo the window centering exactly ((x-mean)/std instead
+    // of x/std), and which are only approximately zero after the half
+    // rounding of the weights.
+    std::vector<float> pdb_blob(num_q * (d->pred16 ? 4 : 2) * nns);
     for (size_t q = 0; q < num_q; ++q) {
+        const std::vector<float> & sm = q == 0 ? model.sm1 : model.sm2;
+        const std::vector<float> & el = q == 0 ? model.el1 : model.el2;
         const std::vector<float> & sm_b = q == 0 ? model.sm_b1 : model.sm_b2;
         const std::vector<float> & el_b = q == 0 ? model.el_b1 : model.el_b2;
+        const size_t qbase = q * (d->pred16 ? 4 : 2) * nns;
         for (size_t p = 0; p < nns; ++p) {
-            pdb_blob[(q * nns + p) * 2 + 0] = sm_b[p];
-            pdb_blob[(q * nns + p) * 2 + 1] = el_b[p];
+            pdb_blob[qbase + p * 2 + 0] = sm_b[p];
+            pdb_blob[qbase + p * 2 + 1] = el_b[p];
+            if (!d->pred16) {
+                continue;
+            }
+            double sm_sum = 0.0, el_sum = 0.0;
+            for (size_t k = 0; k < fs; ++k) {
+                sm_sum += sm[p * fs + k];
+                el_sum += el[p * fs + k];
+            }
+            pdb_blob[qbase + (nns + p) * 2 + 0] = static_cast<float>(sm_sum);
+            pdb_blob[qbase + (nns + p) * 2 + 1] = static_cast<float>(el_sum);
         }
     }
 
@@ -1154,11 +1265,10 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
     // Weight buffers: host visible (creation fills them with three memcpys),
     // device-local preferred so on a ReBAR window they land in VRAM -- the
     // predictor streams the whole matrix per subgroup and thrashes L2.
-    auto make_weights = [&](GpuBuffer & buf, const std::vector<float> & values,
+    auto make_weights = [&](GpuBuffer & buf, const void * data, size_t bytes,
                             const char * what) -> std::string {
         std::string e = gpu_make_buffer(
-            *d->gpu, core,
-            std::max<VkDeviceSize>(values.size() * sizeof(float), 4), buf,
+            *d->gpu, core, std::max<VkDeviceSize>(bytes, 4), buf,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -1181,21 +1291,34 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
                     "subgroup\n",
                     what, static_cast<unsigned>(buf.memory_flags));
         }
-        std::memcpy(buf.mapped, values.data(), values.size() * sizeof(float));
+        std::memcpy(buf.mapped, data, bytes);
         // The mapping may be the host-visible VRAM BAR (write-combining): the
         // first dispatch must not read a tail the CPU store buffer missed.
         store_fence();
         return {};
     };
-    if (std::string e = make_weights(d->ps, ps_blob, "prescreener weights");
+    if (std::string e =
+            make_weights(d->ps, ps_blob.data(), ps_blob.size() * sizeof(float),
+                         "prescreener weights");
         !e.empty()) {
         return set_error(e);
     }
-    if (std::string e = make_weights(d->pdw, pdw_blob, "predictor weights");
-        !e.empty()) {
+    if (d->pred16) {
+        if (std::string e = make_weights(d->pdw, pdw16_blob.data(),
+                                         pdw16_blob.size() * sizeof(uint16_t),
+                                         "predictor weights");
+            !e.empty()) {
+            return set_error(e);
+        }
+    } else if (std::string e = make_weights(d->pdw, pdw_blob.data(),
+                                            pdw_blob.size() * sizeof(float),
+                                            "predictor weights");
+               !e.empty()) {
         return set_error(e);
     }
-    if (std::string e = make_weights(d->pdb, pdb_blob, "predictor biases");
+    if (std::string e =
+            make_weights(d->pdb, pdb_blob.data(),
+                         pdb_blob.size() * sizeof(float), "predictor biases");
         !e.empty()) {
         return set_error(e);
     }
@@ -1214,7 +1337,7 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
     size_t pred_n4s_size = 0;
     const uint32_t * keep_code = nullptr;
     size_t keep_size = 0;
-    if (d->elem_bytes == 2) {
+    if (d->elem_bytes == 2 && !d->half) {
         pre_code = nnedi3_u16_prescreen_spv;
         pre_size = nnedi3_u16_prescreen_spv_size;
         pred_code = nnedi3_u16_predict_spv;
@@ -1227,6 +1350,31 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         pred_n4s_size = nnedi3_u16_predict_n4s_spv_size;
         keep_code = nnedi3_u16_keep_spv;
         keep_size = nnedi3_u16_keep_spv_size;
+    } else if (d->half) {
+        // One packed module covers every network (its f16vec4 tile is 9 KiB at
+        // SHSTRIDE=288); the storage-only modules stay for a device without
+        // shaderFloat16, where the f32 modules' PXP/stride selection applies.
+        // Plain assignments (no ternary) keep tools/shader_limits.py able to
+        // resolve which module each call site passes.
+        if (d->pred16) {
+            pre_code = nnedi3_f16_prescreen16_spv;
+            pre_size = nnedi3_f16_prescreen16_spv_size;
+            pred_code = nnedi3_f16_predict16_spv;
+            pred_size = nnedi3_f16_predict16_spv_size;
+        } else {
+            pre_code = nnedi3_f16_prescreen_spv;
+            pre_size = nnedi3_f16_prescreen_spv_size;
+            pred_code = nnedi3_f16_predict_spv;
+            pred_size = nnedi3_f16_predict_spv_size;
+        }
+        pred_n4_code = nnedi3_f16_predict_n4_spv;
+        pred_n4_size = nnedi3_f16_predict_n4_spv_size;
+        pred_n4m_code = nnedi3_f16_predict_n4m_spv;
+        pred_n4m_size = nnedi3_f16_predict_n4m_spv_size;
+        pred_n4s_code = nnedi3_f16_predict_n4s_spv;
+        pred_n4s_size = nnedi3_f16_predict_n4s_spv_size;
+        keep_code = nnedi3_f16_keep_spv;
+        keep_size = nnedi3_f16_keep_spv_size;
     } else {
         pre_code = nnedi3_f32_prescreen_spv;
         pre_size = nnedi3_f32_prescreen_spv_size;
@@ -1342,8 +1490,9 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
                 }
             }
             // cooperative direct grid (pscrn==0): 4 subgroups x PXP pixels
-            // per 128-thread workgroup.
-            const int host_pxp = use_pxp8(d->nns, d->xdim * d->ydim) ? 8 : 4;
+            // per 128-thread workgroup. The packed half predictor is PXP=4.
+            const int host_pxp =
+                (d->pred16 || !use_pxp8(d->nns, d->xdim * d->ydim)) ? 4 : 8;
             const uint32_t ppg = static_cast<uint32_t>(4 * host_pxp);
             if (auto e = fold_grid((static_cast<uint32_t>(cfg.width) *
                                         static_cast<uint32_t>(cfg.rows) +
@@ -1422,7 +1571,10 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
                     uint32_t lds = kPredictLdsPxp8;
                     const uint32_t * mod = pred_code;
                     size_t mod_size = pred_size;
-                    if (!use_pxp8(d->nns, net_fs)) {
+                    if (d->pred16) {
+                        // One packed module, 4 pixels per subgroup, every window.
+                        lds = kPredictLdsF16;
+                    } else if (!use_pxp8(d->nns, net_fs)) {
                         if (net_fs <= 64) {
                             mod = pred_n4s_code;
                             mod_size = pred_n4s_size;

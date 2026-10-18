@@ -370,9 +370,11 @@ endforeach()
 # array dimension and the addressing cannot disagree. dh / the dh zero-fill
 # are specialization constants, so the kept-row writer needs one variant per
 # io type. The predictor needs subgroup ops + the Vulkan memory model, so
-# SPIR-V 1.3+.
+# SPIR-V 1.3+. The io list is local for the usual reason: the other filters'
+# kernels would build their u16 branch under an -DIO_F16 name.
+set(VK_NNEDI3_IO_TYPES "u16" "f16" "f32")
 set(VK_NNEDI3_VARIANTS)
-foreach(io IN LISTS VK_IO_TYPES)
+foreach(io IN LISTS VK_NNEDI3_IO_TYPES)
     string(TOUPPER "${io}" io_define)
     list(APPEND VK_NNEDI3_VARIANTS
         "nnedi3_${io}_prescreen|nnedi3.comp|-DIO_${io_define} -DENTRY_PRESCREEN"
@@ -382,6 +384,12 @@ foreach(io IN LISTS VK_IO_TYPES)
         "nnedi3_${io}_predict_n4s|nnedi3.comp|-DIO_${io_define} -DENTRY_PREDICT -DPXP=4 -DSHSTRIDE=64u"
         "nnedi3_${io}_keep|nnedi3.comp|-DIO_${io_define} -DENTRY_KEEP")
 endforeach()
+# The packed half predictor (needs shaderFloat16, chosen at creation when the
+# device reports it): one predict module at PXP=4 and the matching prescreen,
+# whose indirect group size is the predictor's 4 pixels per subgroup.
+list(APPEND VK_NNEDI3_VARIANTS
+    "nnedi3_f16_prescreen16|nnedi3.comp|-DIO_F16 -DPRED16=1 -DENTRY_PRESCREEN"
+    "nnedi3_f16_predict16|nnedi3.comp|-DIO_F16 -DPRED16=1 -DENTRY_PREDICT -DSHSTRIDE=288u")
 
 set(VK_VARIANTS
     ${VK_BILATERAL_VARIANTS}

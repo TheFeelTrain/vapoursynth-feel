@@ -1,5 +1,13 @@
 #version 450
 #extension GL_EXT_shader_16bit_storage : require
+// PRED16 packs the predictor GEMV: two window elements per f16vec4 weight and
+// a packed half accumulation, which needs real half arithmetic (Float16
+// capability), not just 16-bit storage. The host selects it only on a device
+// that reports shaderFloat16 and keeps the storage-only f16 variants for one
+// that does not.
+#if defined(PRED16)
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 
 /*
  * NNEDI3 — intra-field interpolator (vsfeel's own implementation of the
@@ -40,7 +48,20 @@
  * the references bake in), so the shared window tile is normalized by m2 and
  * the window mean is re-added only in the final wae5 blend.
  *
- * Compile-time variants: -DIO_U16 / -DIO_F32 (uint16_t / float IO).
+ * Compile-time variants: -DIO_U16 / -DIO_F16 / -DIO_F32 (uint16_t /
+ * float16_t / float IO). A half element is a storage width: it widens
+ * exactly on load and narrows once on store (OpFConvert, round-to-nearest
+ * even), so the storage-only f16 path runs this file's f32 arithmetic and
+ * lands within one half step of the f32 one.
+ *
+ * -DPRED16 (f16 only, needs shaderFloat16) additionally runs the predictor
+ * GEMV in packed half: the window tile and the weight matrix are f16, two
+ * window elements ride one f16vec4, and ACO lowers the accumulate to
+ * v_pk_fmac_f16. The window is centered before scaling ((x - mean)/std
+ * instead of x/std) so the half accumulation stays conditioned, and the
+ * exact difference, rowSum * mean/std, is added back in f32 from per-neuron
+ * weight row sums the host computes. Same projection as nnedi3vk's f16
+ * predict kernel.
  */
 
 #if !defined(IO_U16) && !defined(IO_F32) && !defined(IO_F16)
@@ -49,6 +70,8 @@
 
 #if defined(IO_U16)
 #define IO_TYPE uint16_t
+#elif defined(IO_F16)
+#define IO_TYPE float16_t
 #else
 #define IO_TYPE float
 #endif
@@ -89,8 +112,17 @@ layout(std430, binding = 6) buffer IndBuf { uint indBuf[]; };
 // neurons' weights for window element k), deeper layers at fixed indices.
 layout(std430, binding = 2) readonly restrict buffer PsWeights { vec4 psW[]; };
 // Predictor weights per qual pass: (softmax, elliott) pairs in [q][k][p]
-// order, biases (smB, elB) per [q][p].
+// order, biases (smB, elB) per [q][p]. PRED16 instead packs two window
+// elements and both activations of one neuron into one f16vec4:
+// (sm[2k], sm[2k+1], el[2k], el[2k+1]) at [q][k/2][p], and its bias buffer
+// carries the per-neuron f32 row sums after the biases (see ENTRY_PREDICT).
+#if defined(PRED16)
+layout(std430, binding = 3) readonly restrict buffer PdWeights {
+    f16vec4 pdW[];
+};
+#else
 layout(std430, binding = 3) readonly restrict buffer PdWeights { vec2 pdW[]; };
+#endif
 layout(std430, binding = 4) readonly restrict buffer PdBias { vec2 pdB[]; };
 
 // Per-dispatch values: the two frame-plane row pitches in IO_TYPE elements,
@@ -115,8 +147,8 @@ float loadPad(int row, int col) {
     const int c = clamp(col - MARGIN_H, 0, WIDTH - 1);
     const int sy = (DH != 0) ? f : (2 * f + pc.parity);
     const int idx = sy * pc.src_stride + c;
-#if defined(IO_F32)
-    return fieldBuf[idx];
+#if defined(IO_F32) || defined(IO_F16)
+    return float(fieldBuf[idx]); // half -> float is exact
 #else
     return float(int(fieldBuf[idx]));
 #endif
@@ -125,8 +157,10 @@ float loadPad(int row, int col) {
 // Interpolated field row r lands on output row 2r + fp at the output pitch.
 void storeDst(int r, int x, float v) {
     const int idx = (2 * r + (1 - pc.parity)) * pc.dst_stride + x;
-#if defined(IO_F32)
-    dstBuf[idx] = v;
+#if defined(IO_F32) || defined(IO_F16)
+    // OpFConvert narrows with the SPIR-V default round-to-nearest-even and no
+    // saturation (the reference's storePix for a float format is a plain cast)
+    dstBuf[idx] = IO_TYPE(v);
 #else
     // glslc -O chokes on direct float->uint16_t (OpUConvert); go through
     // uint with an explicit mask (same workaround as the other filters)
@@ -289,7 +323,12 @@ void main() {
     uint base = 0u;
     if (subgroupElect() && total > 0u) {
         base = atomicAdd(indBuf[pc.d_base + 3], total);
+#if defined(PRED16)
+        // The packed predictor is always 4 pixels per subgroup.
+        const uint ppg = 16u;
+#else
         const uint ppg = uint(4 * ((((NNS + 31) / 32) <= 2) && (FS <= 128) ? 8 : 4));
+#endif
         // X is capped at the device's per-dimension limit and the rest goes into
         // Y, which the predictor folds back in. Both counts only grow, so
         // atomicMax is enough; the host leaves Y at 1 for an empty plane.
@@ -331,7 +370,19 @@ const int PPL = (NNS + 31) / 32;
 #define SHSTRIDE 288u
 #endif
 
+#if defined(PRED16)
+// Packed f16 predictor: 4 pixels per subgroup, two window elements per
+// f16vec4. PX16/PAIRS16 mirror nnedi3vk's f16 kernel (its PX=4 was measured
+// the winner; the tile is FS f16vec4 per subgroup, so SHSTRIDE=288 covers
+// every network in 9 KiB).
+const int PX16 = 4;
+const int PAIRS16 = (FS / 2 + 31) / 32;
+shared f16vec4 shTile16[4 * SHSTRIDE];
+#else
 shared vec4 shTile[4 * SHSTRIDE];
+#endif
+
+#if !defined(PRED16)
 
 // ---- one work unit (PXP pixels at FIRST, NPX valid): window stats into
 // shared, vec4 GEMV, wae5 blend, store. Used by both the fast path and
@@ -471,6 +522,162 @@ void main() {
         return;
     PREDICT_UNIT(firstPix, min(uint(PXP), npix - firstPix))
 }
+
+#else // PRED16
+
+// Packed half predictor (nnedi3vk's f16 shape, adapted to the in-place plane
+// reads and the list/indirect plumbing this file already has). PX16 is fixed
+// at 4 (no -D overrides it), so the pixel loops below are literal:
+//  - the window is centered and scaled, (x - mean)/std, so the half
+//    accumulation never sees a large constant offset;
+//  - the GEMV accumulates in f16vec4 (two elements x two pixels per
+//    instruction group), with the weight matrix stored as f16vec4;
+//  - the exact difference, rowSum * mean/std, plus the bias is added in f32
+//    from the per-neuron row sums the host appends to the bias buffer.
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint warp = gl_SubgroupID;
+    const uint npix = (USE_LIST != 0) ? indBuf[pc.d_base + 3] : uint(WIDTH) * uint(ROWS);
+    uint idxs[4];
+    float mstd0[4], mstd1[4], mstd2[4], result[4];
+    // Even-pixel pairs wait here for their odd partner: a partial f16vec4
+    // shared store would be a read-modify-write.
+    f16vec2 pending[PAIRS16];
+
+    const uint wg = uint(gl_WorkGroupID.y) * uint(gl_NumWorkGroups.x) +
+        uint(gl_WorkGroupID.x);
+    const uint firstPix = (wg * 4u + warp) * uint(PX16);
+    if (firstPix >= npix)
+        return;
+    const int npx = int(min(uint(PX16), npix - firstPix));
+
+    [[unroll]] for (int px = 0; px < 4; px++) {
+        const uint li = min(firstPix + uint(px), npix - 1u);
+        const uint idx = (USE_LIST != 0) ? listBuf[pc.a_base + int(li)] : li;
+        idxs[px] = idx;
+        const int col0 = int(idx % uint(WIDTH)) - (XDIM / 2 - 1) + MARGIN_H;
+        const int row0 = int(idx / uint(WIDTH)) + ((YDIM == 6) ? 0 : 1);
+        float v0[PAIRS16], v1[PAIRS16];
+        float sum = 0.0;
+        [[unroll]] for (int t = 0; t < PAIRS16; t++) {
+            const int k2 = int(lane) + t * 32;
+            if ((FS / 2) % 32 != 0 && k2 >= FS / 2)
+                continue;
+            // XDIM is even, so an element pair never straddles a row: one
+            // row/column computation serves both taps.
+            const int e = k2 * 2;
+            const int lr = row0 + e / XDIM;
+            const int lc = col0 + e % XDIM;
+            v0[t] = loadPad(lr, lc);
+            v1[t] = loadPad(lr, lc + 1);
+            sum += v0[t] + v1[t];
+        }
+        const float mean = subgroupAdd(sum) / float(FS);
+        float s2 = 0.0;
+        [[unroll]] for (int t = 0; t < PAIRS16; t++) {
+            const int k2 = int(lane) + t * 32;
+            if ((FS / 2) % 32 != 0 && k2 >= FS / 2)
+                continue;
+            const float d0 = v0[t] - mean;
+            const float d1 = v1[t] - mean;
+            s2 += d0 * d0 + d1 * d1;
+        }
+        const float variance = subgroupAdd(s2) / float(FS);
+        float m0 = mean, m1, m2;
+        if (variance < 1.1920929e-7) {
+            m1 = 0.0;
+            m2 = 0.0;
+        } else {
+            m1 = sqrt(variance);
+            m2 = 1.0 / m1;
+        }
+        mstd0[px] = m0;
+        mstd1[px] = m1;
+        mstd2[px] = m2;
+        result[px] = 0.0;
+        const int shBase = int(warp) * int(SHSTRIDE) +
+                           (px / 2) * (FS / 2);
+        [[unroll]] for (int t = 0; t < PAIRS16; t++) {
+            const int k2 = int(lane) + t * 32;
+            if ((FS / 2) % 32 != 0 && k2 >= FS / 2)
+                continue;
+            const f16vec2 val = f16vec2((v0[t] - mean) * m2, (v1[t] - mean) * m2);
+            if (px % 2 == 0)
+                pending[t] = val;
+            else
+                shTile16[shBase + k2] = f16vec4(pending[t], val);
+        }
+    }
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+
+    [[unroll]] for (int q = 0; q < QUAL; q++) {
+        const int bBase = q * 2 * NNS;
+        const int wBase = q * (FS / 2) * NNS;
+        const uint shSub = warp * SHSTRIDE;
+        f16vec4 accS0[8], accS1[8], accE0[8], accE1[8];
+        [[unroll]] for (int t = 0; t < PPL; t++) {
+            accS0[t] = f16vec4(0.0);
+            accS1[t] = f16vec4(0.0);
+            accE0[t] = f16vec4(0.0);
+            accE1[t] = f16vec4(0.0);
+        }
+        for (int k2 = 0; k2 < FS / 2; k2++) {
+            const f16vec4 x0 = shTile16[shSub + uint(k2)];
+            const f16vec4 x1 = shTile16[shSub + uint(FS / 2) + uint(k2)];
+            [[unroll]] for (int t = 0; t < PPL; t++) {
+                const int pp = int(lane) + t * 32;
+                if (pp >= NNS)
+                    continue;
+                const f16vec4 w = pdW[wBase + k2 * NNS + pp];
+                accS0[t] = fma(w.xyxy, x0, accS0[t]);
+                accS1[t] = fma(w.xyxy, x1, accS1[t]);
+                accE0[t] = fma(w.zwzw, x0, accE0[t]);
+                accE1[t] = fma(w.zwzw, x1, accE1[t]);
+            }
+        }
+        [[unroll]] for (int px = 0; px < 4; px++) {
+            if (px >= npx)
+                break;
+            float vsum = 0.0, wsum = 0.0;
+            [[unroll]] for (int t = 0; t < PPL; t++) {
+                const int pp = int(lane) + t * 32;
+                if (pp >= NNS)
+                    continue;
+                const vec2 b = pdB[bBase + pp];
+                const f16vec4 bS = (px < 2) ? accS0[t] : accS1[t];
+                const f16vec4 bE = (px < 2) ? accE0[t] : accE1[t];
+                const f16vec2 aS = (px % 2 == 0) ? bS.xy : bS.zw;
+                const f16vec2 aE = (px % 2 == 0) ? bE.xy : bE.zw;
+                const vec2 rowSum = pdB[bBase + NNS + pp];
+                const float corr = mstd0[px] * mstd2[px];
+                const float aSf = float(aS.x) + float(aS.y) +
+                                  fma(rowSum.x, corr, b.x);
+                const float aEf = float(aE.x) + float(aE.y) +
+                                  fma(rowSum.y, corr, b.y);
+                const float e = exp(clamp(aSf, -80.0, 80.0));
+                vsum = fma(e, elliott(aEf), vsum);
+                wsum += e;
+            }
+            vsum = subgroupAdd(vsum);
+            wsum = subgroupAdd(wsum);
+            result[px] += (wsum > 1e-10)
+                ? fma((5.0 * vsum) / wsum, mstd1[px], mstd0[px])
+                : mstd0[px];
+        }
+    }
+    if (lane == 0u) {
+        [[unroll]] for (int px = 0; px < 4; px++) {
+            if (px >= npx)
+                break;
+            const uint si = idxs[px];
+            storeDst(int(si / uint(WIDTH)), int(si % uint(WIDTH)),
+                     result[px] / float(QUAL));
+        }
+    }
+}
+
+#endif // PRED16
 
 #elif defined(ENTRY_KEEP)
 

@@ -527,6 +527,10 @@ get_gpu_device(VSCore * core, const VSAPI * vsapi) {
     // fast is workload-specific and decided where it is used.
     dev->feat_atomic_float32_add =
         has_atomic_float && atomic_float.shaderBufferFloat32AtomicAdd;
+    // shaderFloat16 rides the 1.2 feature block: optional in every core
+    // version, enabled by the core when the device reports it, so a kernel
+    // that computes in half has to read the bit rather than assume it.
+    dev->feat_shader_float16 = f12.shaderFloat16 == VK_TRUE;
 
     load_gpu_pipeline_cache(*dev, props.properties);
 
@@ -572,11 +576,12 @@ get_gpu_device(VSCore * core, const VSAPI * vsapi) {
                 handles.transferQueueFamily, handles.transferQueueIndex);
         fprintf(stderr,
                 "[vsfeel] optional features: float32AtomicAdd=%d (float=%d "
-                "float2=%d add=%d atomics=%d)\n",
+                "float2=%d add=%d atomics=%d) shaderFloat16=%d\n",
                 dev->feat_atomic_float32_add, has_atomic_float,
                 has_atomic_float2,
                 atomic_float.shaderBufferFloat32AtomicAdd == VK_TRUE,
-                atomic_float.shaderBufferFloat32Atomics == VK_TRUE);
+                atomic_float.shaderBufferFloat32Atomics == VK_TRUE,
+                dev->feat_shader_float16);
     }
 
     // insert_or_assign, not emplace: the lookup above falls through on an

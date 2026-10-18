@@ -14,11 +14,22 @@ Agreement measured on the noise clip (see notes/NNEDI3.md):
   the serial-vs-subgroup reduction order — mechanism documented in
   notes/NNEDI3.md).
 * GRAYS: within ~3e-8 absolute (a few ulps); bound 1e-6.
+* GRAYH: BIT-EXACT with nnedi3vk's f16 output when the packed half predictor
+  runs (the default on a device with shaderFloat16), because both run the same
+  half GEMV. The storage-only fallback (VSFEEL_NNEDI3_PRED16=0, or a device
+  without the feature) instead runs the f32 arithmetic and lands within the
+  reference's own f16 error, ~2.3e-3.
 
 Self-consistency (determinism across runs, multi-stream == single) is exact.
 
 Run from the repository root:  uv run python -m pytest tests/test_nnedi3.py
 """
+
+import json
+import os
+import re
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -27,9 +38,12 @@ import vapoursynth as vs
 from conftest import (
     WIDTH,
     HEIGHT,
+    CLIP_FRAMES,
     CLIP_PATH,
+    COMPARE_PRELUDE,
     assert_changes_on_clip,
     assert_preserves_frame_props,
+    compare_or_skip,
     cpu_node,
     eval_parallel,
     frame_to_ndarray,
@@ -58,17 +72,19 @@ def _run(clip, field=1, **kwargs):
     )
 
 
-def _ref_compare(fmt, frames, params, planes=None):
+def _ref_compare(fmt, frames, params, planes=None, env=None):
     """Compare against nnedi3vk in a subprocess; skip if it is not installed.
 
     Returns the RESULT payload (``maxdiff`` plus the vsfeel output geometry).
-    ``field`` defaults to 1 (both plugins require it).
+    ``field`` defaults to 1 (both plugins require it). ``env`` pins a
+    creation-time variant (the plugin reads its knobs when the filter is built,
+    so an in-process node cannot be steered per test).
     """
     reference_or_skip("nnedi3vk", "NNEDI3")
     params = dict(params)
     params.setdefault("field", 1)
     spec = reference_spec("nnedi3vk", "NNEDI3", fmt, frames=frames, planes=planes, kwargs=params)
-    return reference_compare(spec)
+    return reference_compare(spec, env=env)
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +191,228 @@ def test_nnedi3_matches_reference_f32(clip_grays, kwargs):
 
 
 # ---------------------------------------------------------------------------
+# Reference agreement, float16
+# ---------------------------------------------------------------------------
+#
+# Half is an io width for most filters, but NNEDI3 computes in it: with the
+# optional shaderFloat16 feature the predictor GEMV runs packed half (the
+# arithmetic nnedi3vk's own f16 kernel uses), which makes vsfeel's f16 output
+# BIT-EXACT with nnedi3vk's f16 output while sitting ~2.3e-3 off this file's
+# f32 path — that gap is the reference's own f16 error, not an extra one of
+# ours. Without the feature, or with VSFEEL_NNEDI3_PRED16=0, the f16 kernels
+# keep the f32 arithmetic and land within one half step of the f32 path
+# (measured 0 on the committed clip).
+#
+# The default-mode bound therefore has to cover the reference's f16 error; the
+# two pinned modes are graded exactly, and the storage-only path is separately
+# held against the f32 path.
+
+F16_PACKED_MAX = 2.6e-3  # measured 2.51e-3 (nsize=3) on identical inputs
+F16_STORAGE_ULP = 4.8828125e-4  # one half step at |v| in [0.5, 1)
+
+REFERENCE_CASES_F16 = [
+    {},
+    {"pscrn": 0},
+    {"pscrn": 1},
+    {"pscrn": 3},
+    {"pscrn": 4},
+    {"qual": 2},
+    {"etype": 1},
+    {"qual": 2, "etype": 1},
+    {"nsize": 0},
+    {"nsize": 3},
+    {"nsize": 6},
+    {"nns": 0},
+    {"nns": 2},
+    {"nns": 4},
+    {"field": 0},
+    {"field": 2},
+    {"field": 3},
+    {"dh": True},
+]
+
+
+@pytest.mark.parametrize(
+    "kwargs", REFERENCE_CASES_F16, ids=[str(sorted(k.items())) for k in REFERENCE_CASES_F16]
+)
+def test_nnedi3_matches_reference_f16(clip_grayh, kwargs):
+    """Default f16 mode, whatever the device selects (packed or storage-only)."""
+    payload = _ref_compare("grayh", (0, 11, 23), kwargs)
+    assert payload["maxdiff"] <= F16_PACKED_MAX, kwargs
+
+
+F16_EXACT_CASES = [
+    {},
+    {"pscrn": 0},
+    {"pscrn": 1},
+    {"nsize": 3},
+    {"nns": 4},
+    {"field": 0},
+    {"field": 3},
+    {"dh": True},
+    {"qual": 2, "etype": 1},
+]
+
+
+@pytest.mark.parametrize(
+    "kwargs", F16_EXACT_CASES, ids=[str(sorted(k.items())) for k in F16_EXACT_CASES]
+)
+def test_nnedi3_f16_packed_bit_exact(clip_grayh, kwargs):
+    """The packed half predictor must reproduce nnedi3vk's f16 output exactly.
+
+    Both run the same half GEMV over the same rounded weights with the same
+    window centering and f32 row-sum correction, so any difference here is a
+    real indexing or layout bug (this is the bit-exact oracle for the path).
+    """
+    payload = _ref_compare("grayh", (0, 11), kwargs, env={"VSFEEL_NNEDI3_PRED16": "1"})
+    assert payload["maxdiff"] == 0.0, kwargs
+
+
+@pytest.mark.parametrize(
+    "kwargs", F16_EXACT_CASES, ids=[str(sorted(k.items())) for k in F16_EXACT_CASES]
+)
+def test_nnedi3_f16_storage_only_matches_reference(clip_grayh, kwargs):
+    """The storage-only f16 path is graded against the reference's own f16
+    arithmetic, so the bound is the reference's error, not ours."""
+    payload = _ref_compare("grayh", (0, 11), kwargs, env={"VSFEEL_NNEDI3_PRED16": "0"})
+    assert payload["maxdiff"] <= F16_PACKED_MAX, kwargs
+
+
+# The device-independent half of the oracle: f16 in/out against the f32 path
+# on *identical* input values. The half clip is built first and the f32 clip is
+# widened from it (exact), because a half clip rounded from an f32 one carries
+# different samples and the window normalization amplifies that by 1/std — the
+# comparison then measures the input rounding, not the arithmetic.
+_F16_VS_F32_SCRIPT = (
+    COMPARE_PRELUDE
+    + r"""
+import json
+import sys
+
+import vapoursynth as vs
+
+core = vs.core
+src = core.bs.VideoSource(sys.argv[1])
+src = core.std.Trim(src, first=0, length=int(sys.argv[3]))
+gray = core.std.ShufflePlanes(src, 0, vs.GRAY)
+g16 = core.fmtc.bitdepth(gray, bits=16, fulls=True, fulld=True)
+half = core.resize.Point(core.fmtc.bitdepth(g16, bits=32, fulls=True, fulld=True),
+                         format=vs.GRAYH)
+f32 = core.resize.Point(half, format=vs.GRAYS)
+params = json.loads(sys.argv[2])
+frames = (0, 11, 23)
+
+
+def run(clip):
+    node = cpu_node(core.vsfeel.NNEDI3(clip, **params))
+    dt = np.float16 if clip.format.bits_per_sample == 16 else np.float32
+    return {n: read_plane(node.get_frame(n), 0, dt).astype(np.float64) for n in frames}
+
+
+try:
+    ref = run(f32)
+except Exception as exc:
+    print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
+    raise SystemExit(2)
+print("REF ok", flush=True)
+
+try:
+    got = run(half)
+except Exception as exc:
+    print("VSFEEL fail: %s: %s" % (type(exc).__name__, exc), flush=True)
+    raise SystemExit(3)
+
+worst = max(float(np.abs(got[n] - ref[n]).max()) for n in frames)
+print("RESULT " + json.dumps({"maxdiff": worst}), flush=True)
+"""
+)
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{}, {"pscrn": 0}, {"nsize": 3}, {"dh": True}], ids=lambda k: str(sorted(k.items()))
+)
+def test_nnedi3_f16_storage_only_matches_f32_path(kwargs):
+    """f16 io with f32 arithmetic is the f32 path within one half step."""
+    payload = compare_or_skip(
+        _F16_VS_F32_SCRIPT,
+        [CLIP_PATH, json.dumps(dict(kwargs, field=1)), str(CLIP_FRAMES)],
+        env={"VSFEEL_NNEDI3_PRED16": "0"},
+    )
+    assert payload["maxdiff"] <= F16_STORAGE_ULP, kwargs
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{}, {"pscrn": 0}, {"nsize": 3}, {"dh": True}], ids=lambda k: str(sorted(k.items()))
+)
+def test_nnedi3_f16_matches_f32_path_within_reference(kwargs):
+    """The packed half arithmetic costs at most nnedi3vk's own f16 error.
+
+    Measured identical to it (2.03e-3 at the default config) because the packed
+    kernel *is* the reference's f16 arithmetic; a device without shaderFloat16
+    falls back to the storage-only path, which is tighter still.
+    """
+    payload = compare_or_skip(
+        _F16_VS_F32_SCRIPT,
+        [CLIP_PATH, json.dumps(dict(kwargs, field=1)), str(CLIP_FRAMES)],
+    )
+    assert payload["maxdiff"] <= F16_PACKED_MAX, kwargs
+
+
+def test_nnedi3_f16_field_gt1_matches_reference(clip_grayh):
+    for field in (2, 3):
+        payload = _ref_compare("grayh", (0, 1, 24, 47), {"field": field})
+        assert payload["num_frames"] == 48
+        assert payload["maxdiff"] <= F16_PACKED_MAX
+
+
+def test_nnedi3_f16_yuv_matches_reference(clip_yuv420ps):
+    yuv = vs.core.resize.Point(clip_yuv420ps, format=vs.YUV420PH)
+    assert yuv.format.id == vs.YUV420PH
+    # dh doubles the luma height; the chroma writers have to cover the whole
+    # (2*h) >> subSamplingH plane, last row included.
+    for kwargs in ({}, {"planes": [0]}, {"planes": [1, 2]}, {"nsize": 0}, {"dh": True}):
+        payload = _ref_compare("yuv420ph", (0, 11), kwargs)
+        assert payload["maxdiff"] <= F16_PACKED_MAX, kwargs
+
+
+def _creation_stderr(env=None):
+    """stderr of a GRAYH creation run, with the device banner on.
+
+    The predictor variant is chosen from a device feature and an env knob, so
+    it is invisible in the pixels; the creation banner is the only place a test
+    can pin it (notes/METHOD.md: a creation-time variant needs a test).
+    """
+    code = (
+        "import vapoursynth as vs\n"
+        "core = vs.core\n"
+        f"src = core.bs.VideoSource({CLIP_PATH!r})\n"
+        "gray = core.std.ShufflePlanes(src, 0, vs.GRAY)\n"
+        "f32 = core.fmtc.bitdepth(gray, bits=32, fulls=True, fulld=True)\n"
+        "half = core.resize.Point(f32, format=vs.GRAYH)\n"
+        "node = core.vsfeel.NNEDI3(half, field=1)\n"
+        "core.std.GPUDownload(clip=node).get_frame(0)\n"
+    )
+    run_env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1", **(env or {})}
+    proc = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=run_env, timeout=300
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return proc.stderr
+
+
+def test_nnedi3_f16_predictor_variant_pinned():
+    """The packed predictor runs by default where the device supports it, and
+    the opt-out selects the storage-only one."""
+    default = _creation_stderr()
+    feature = re.search(r"shaderFloat16=(\d)", default)
+    assert feature, default[-2000:]
+    if feature.group(1) == "1":
+        assert "predictor=f16-packed" in default, default[-2000:]
+    storage = _creation_stderr({"VSFEEL_NNEDI3_PRED16": "0"})
+    assert "predictor=f16-storage" in storage, storage[-2000:]
+
+
+# ---------------------------------------------------------------------------
 # Determinism / stream count
 # ---------------------------------------------------------------------------
 
@@ -199,6 +437,24 @@ def test_nnedi3_parallel_load_consistent(clip_gray16):
     expect = _plane(_run(clip_gray16).get_frame(5), 0)
     got = eval_parallel(_run, clip_gray16)
     assert np.abs(got[5].astype(np.int32) - expect.astype(np.int32)).max() == 0
+
+
+def test_nnedi3_f16_deterministic(clip_grayh):
+    a = _run(clip_grayh, nsize=0)
+    b = _run(clip_grayh, nsize=0)
+    for n in (0, 11, 23):
+        d = _plane(a.get_frame(n), 0).astype(np.float64) - _plane(b.get_frame(n), 0).astype(
+            np.float64
+        )
+        assert np.abs(d).max() == 0, f"nondeterministic f16 output at frame {n}"
+
+
+def test_nnedi3_f16_parallel_load_consistent(clip_grayh):
+    """The packed half kernel's shared tile and subgroup reductions must not
+    depend on how many frames are in flight."""
+    expect = _plane(_run(clip_grayh).get_frame(5), 0)
+    got = eval_parallel(_run, clip_grayh)
+    assert np.abs(got[5].astype(np.float64) - expect.astype(np.float64)).max() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +505,58 @@ def test_nnedi3_changes_noise_u16(clip_gray16):
 def test_nnedi3_preserves_frame_props(clip_gray16):
     """field=1 keeps the duration while tagging the output progressive."""
     assert_preserves_frame_props(_run, clip_gray16, field=1)
+
+
+# --- f16 geometry / properties, mirroring the u16 and f32 cases above -------
+
+
+def test_nnedi3_f16_field_gt1_doubles_frames(clip_grayh):
+    out = _run(clip_grayh, field=3)
+    assert out.num_frames == 2 * clip_grayh.num_frames
+    assert out.fps_num * clip_grayh.fps_den == 2 * clip_grayh.fps_num * out.fps_den
+
+
+def test_nnedi3_f16_dh_doubles_height(clip_grayh):
+    out = _run(clip_grayh, dh=True)
+    assert out.height == 2 * clip_grayh.height
+    assert out.width == clip_grayh.width
+
+
+def test_nnedi3_f16_output_props_progressive(clip_grayh):
+    out = _run(clip_grayh, field=3)
+    props = out.get_frame(1).props
+    assert props["_FieldBased"] == 0
+    assert "_Field" not in props
+
+
+def test_nnedi3_f16_kept_lines_copied(clip_grayh):
+    """Kept lines are raw plane copies in every io variant, so a half clip's
+    kept rows must come back bit-identical (the packed predictor never touches
+    them)."""
+    out = _run(clip_grayh, field=1)
+    for n in (0, 7):
+        s = _plane(clip_grayh.get_frame(n), 0)
+        o = _plane(out.get_frame(n), 0)
+        assert np.abs(o[0::2].astype(np.float64) - s[0::2].astype(np.float64)).max() == 0
+
+
+def test_nnedi3_f16_changes_noise(clip_grayh):
+    out = _run(clip_grayh, field=1)
+    assert_changes_on_clip(out, clip_grayh, what="NNEDI3 f16")
+
+
+def test_nnedi3_f16_preserves_frame_props(clip_grayh):
+    assert_preserves_frame_props(_run, clip_grayh, field=1)
+
+
+def test_nnedi3_f16_accepts_half(clip_grayh):
+    """A half clip keeps its own format: a u16 kernel fed half samples would
+    reinterpret the bit patterns (or an f32 kernel would read two samples per
+    element), so the format id is part of the contract."""
+    out = _run(clip_grayh, field=1)
+    assert out.format.id == clip_grayh.format.id
+    assert out.format.sample_type == vs.FLOAT
+    assert out.format.bits_per_sample == 16
 
 
 # ---------------------------------------------------------------------------

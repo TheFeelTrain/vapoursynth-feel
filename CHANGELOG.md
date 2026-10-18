@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `vsfeel.feel_aa`, a copy of `vsaa.based_aa` that keeps its processing entirely on the GPU
 - `core.vsfeel.Box`, a Vulkan implementation of a box downscale
 - Bilateral and GaussBlur suppport fp16 input and output
+- NNEDI3 accepts fp16 input and output
 
 ### Changed
 

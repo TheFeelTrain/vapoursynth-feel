@@ -22,24 +22,37 @@ Status: **shipped on the R80 GPU API.** Design (current):
   1.2 MB, host-visible, device-local preferred) plus pipelines; transient
   4.2 MB scratch per in-flight frame (1080p GRAY16 `field=3`), bounded by the
   exec ring; src/output frames are core-owned.
+- Three io variants — u16, f16, f32 — picked from the input format (half is
+  `stFloat` + 16 bits). f16 has two internal modes: with the optional
+  `shaderFloat16` feature the predictor GEMV runs **packed half** (nnedi3vk's
+  own f16 arithmetic, `v_pk_fmac_f16`), which makes the output **bit-exact
+  with nnedi3vk f16**; without the feature, or with
+  `VSFEEL_NNEDI3_PRED16=0`, the f16 kernels keep the f32 arithmetic and stay
+  within one half step of the f32 path. u16 and f32 are unchanged.
 - Runs need `RADV_EXPERIMENTAL=transfer_queue`, which `tools/benchmark.py`
   forces (mechanism: `notes/BILATERAL.md`).
 
-Scoreboard — jpbd 1080p GRAY16, bench defaults (`field=3 dh=0 nsize=0 nns=4
-qual=2 etype=0 pscrn=4`), 5000 frames, medians of 3 through
-`tools/benchmark.py`:
+Scoreboard — jpbd 1080p, bench defaults (`field=3 dh=0 nsize=0 nns=4 qual=2
+etype=0 pscrn=4`), 5000 frames, medians of 3 through `tools/benchmark.py`:
 
-| mode | vsfeel | nnedi3vk | ratio |
-|---|---|---|---|
-| CPU cache (benchmark default) | 3124.0 | 2793.0 | 1.12x |
-| `--gpu-cache` (resident GPU clip) | 3432.4 | 2271.5 | 1.51x |
-| `--gpu-cache --no-download` (u16 / f32) | 4666 / 3967 | 2218 / 1207 | 2.52x |
+| mode | vsfeel u16 | vsfeel f16 | vsfeel f32 | nnedi3vk |
+|---|---|---|---|---|
+| CPU cache (benchmark default) | 3117 | 3138 | 1666 | 2778 / 2757 / 1612 |
+| `--gpu-cache` (resident GPU clip) | 3340 | 3441 | - | 2276 / 2246 / - |
+| `--gpu-cache --no-download` | 4679 | 4839 | 3929 | - |
 
+- f16 is the fastest io type now, and the packed predictor is why: same-session
+  interleaved A/B, 5000 frames ×3, `--gpu-cache --no-download` **packed 4862 vs
+  mixed 3830 fps (+26.9%)**, CPU cache 3157 vs 2981 (**+5.9%**). At `pscrn=0`
+  (every pixel predicted, `VSFEEL_NNEDI3_TSTAMP=100`) predict is 3483 µs packed
+  vs 4887 mixed (**+40%**): the sparse `pscrn=4` list scatters the windows and
+  the gather's latency, which half storage does not remove, takes a bigger
+  share there.
 - The resident rows win by more than the CPU-sink row because the reference
   pays a real download there while vsfeel consumes the core's plane.
 - **The output download is the last transfer in the chain.** Removing it takes
-  vsfeel 3432 → 4666 fps (291 → 214 µs/frame): the filter's own compute is
-  214 µs, and the download adds ~77 µs on top of it. A bare core
+  vsfeel 3340 → 4679 fps (299 → 214 µs/frame): the filter's own compute is
+  214 µs, and the download adds ~85 µs on top of it. A bare core
   `GPUUpload→GPUDownload` graph of one 1080p GRAY16 plane (same cached
   real-clip vpy, no filter, pinned caches, 3000 frames) runs 3786 fps with the
   download and 710712 fps without, i.e. that transfer alone is 264 µs — the
@@ -71,6 +84,13 @@ qual=2 etype=0 pscrn=4`), 5000 frames, medians of 3 through
   1-vs-4 streams, parallel load, geometry tails and props. Full suite: 800
   green via `tools/test.sh` (one unrelated NLMeans `a=64,d=16` contention
   flake, passes serially — see `notes/NLMEANS.md`).
+- f16 accuracy (same noise clip, f32 clip widened from the half one so both
+  see identical input values): the packed predictor is **bit-exact with
+  nnedi3vk f16** (maxdiff 0) on every mode swept — field 0/1/2/3, dh, planes
+  subsets, nsize 0/3/6, nns 0/2/4, pscrn 0..4, qual/etype — and within
+  **2.5e-3** of vsfeel's f32 path, *identical* to nnedi3vk's own f16-vs-f32
+  gap (its f16 arithmetic is what we run). The storage-only path is within
+  **4.5e-4** (one half step) of the f32 path.
 - Weights `src/nnedi3_weights.bin`, 13,574,928 B, md5
   `5c97e25c4a7277d06d3e3851373f1065`.
 
@@ -99,19 +119,34 @@ qual=2 etype=0 pscrn=4`), 5000 frames, medians of 3 through
 - Pipelines deduplicated per `{width, rows, pscrn, xdim, ydim, nns, qual,
   zero}`; predict module by the shader's own rule (PXP=8 when
   `ceil(nns/32)<=2 && fs<=128`, PXP=4 small-tile `SHSTRIDE=64` when `fs<=64`,
-  PXP=4 otherwise). Prescreen/predict ask 32-lane full subgroups; the keep
-  writer takes the driver's default.
+  PXP=4 otherwise; the packed half module is always PX=4). Prescreen/predict
+  ask 32-lane full subgroups; the keep writer takes the driver's default.
 - The predict module's tile is `4 * SHSTRIDE` vec4 rows: 16 KiB for PXP=8
   (256), 18 KiB for `n4` (288, every PXP=4 window), 12 KiB for `n4m` (192) and
   4 KiB for `n4s` (64). `n4m` takes over from `n4` only where the device cannot
   hold 18 KiB and the window is at most 192 rows, so the measured module still
   runs wherever it fits. The FS=96 `n4m` arm is bit-identical to `n4`
-  (`tests/test_device_limits.py`, sha1 of the plane).
+  (`tests/test_device_limits.py`, sha1 of the plane). The packed half tile is
+  `4 * SHSTRIDE` **f16vec4** rows (9 KiB at 288) and covers every network, so
+  the packed path ships one predict module.
 - Weights: blob parsed at creation (prescreener mean/scale, model
   mean-subtraction projected out), packed into three vec4/vec2-layout blobs
   and written through persistently mapped host-visible buffers + `_mm_sfence`.
+- f16 io adds `-DIO_F16` variants of all three kernels plus `-DPRED16=1` for
+  the packed predictor **and its prescreen** (the compaction's `ppg = 4*PX`
+  must equal the predictor's pixels per subgroup, so the pair ships together).
+  `shaderFloat16` is read from the 1.2 feature block; without it the
+  storage-only f16 modules reuse the f32 PXP/stride table.
+- Packed half layout (nnedi3vk's f16 predict, adapted to the in-place reads):
+  weights are `f16vec4(sm[2k], sm[2k+1], el[2k], el[2k+1])` per `[q][k/2][p]`
+  (`float_to_half`, RNE), and the bias buffer carries a per-neuron f32 weight
+  row sum per qual after the biases. The kernel stages `(x - mean) * m2`
+  (centered, so the half accumulation never carries a large constant offset),
+  accumulates two elements x two pixels per f16vec4 FMA, and adds
+  `rowSum * mean*m2 + bias` back in f32. Every other stage (gather, window
+  moments, wae5 blend, store) is the f32 code.
 - `field` is registered **required** (the `:opt` + null-error-pointer history
-  killed the process); u16 and f32 input only; `field>1`
+  killed the process); u16, f16 and f32 input; `field>1`
   doubles `vi_out` with the unknown-length (`numFrames == -1`) guard.
 - `vsfeel/vsaa.py`: `NNEDI3(vsaa.deinterlacers.NNEDI3)` overrides only
   `_deinterlacer_function` to return `core.vsfeel.NNEDI3` (field/dh and the
@@ -121,6 +156,17 @@ qual=2 etype=0 pscrn=4`), 5000 frames, medians of 3 through
 
 ## Historical
 
+- **2026-10-17 — f16 io, predictor GEMV in packed half.** Half was a storage
+  width; the packed predictor now runs nnedi3vk's own f16 arithmetic
+  (f16vec4 weights, two elements x two pixels per FMA, centered window with
+  the f32 row-sum correction) and is bit-exact with it. Same-session
+  interleaved A/B, 5000 frames x3: `--gpu-cache --no-download` 4862 packed vs
+  3830 mixed fps (**+26.9%**), CPU cache 3157 vs 2981 (+5.9%), `pscrn=0`
+  predict 3483 vs 4887 µs (+40%). Under the 30% bar, but the packed output is
+  the fp16 reference's output, so the default trades nothing: the
+  storage-only path (f32 arithmetic, one half step from the f32 path) stays
+  behind `VSFEEL_NNEDI3_PRED16=0`. First f16 attempt measured the *input*
+  rounding (2.8e-2) instead of the arithmetic; see Open work.
 - **2026-10-12 — the R80 port's scoreboard is void.** It read 3034 → 2695
   (CPU cache, −11.2%) and 2156 → 2739 (`--gpu-cache`, +27.0%) fps against the
   pre-fix benchmark harness (`notes/METHOD.md`), and its reference pairs
@@ -311,6 +357,22 @@ upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
 - **Prescreen vs reference ~2.8x claim is pre-port** (40 µs gap on old
   stamps): re-measure against nnedi3vk's kernels on the current binary before
   quoting it.
+- **The packed predictor is not FMA-issue-bound.** Halving its FMA
+  instructions *and* weight bytes bought 25% on predict, and at pscrn=0 the
+  kernel runs at ~6% of FMA issue peak, so the remaining cost is the weight
+  stream plus the per-pixel gather/moments/blend. Next lever, untried:
+- **Packed PX=8** for `PPL<=2 && FS<=192` (4 banks, 12 KiB tile) halves the
+  weight bytes per pixel again. Not measured, and the bench default
+  (`nns=4` → PPL=8) cannot use it, so it would need its own config.
+- **Hand-unrolled k2 with hoisted weight loads** (METHOD's "unroll N wide"):
+  PPL=8 already gives 32 independent FMA chains, so ILP is high and this was
+  not tried.
+- **Prescreen in half** was rejected: its verdict is a threshold and the
+  reference keeps its prescreen f32 too.
+- **Comparing a half clip with an f32 one *rounded* to half is not an
+  accuracy test** — the input rounding is amplified by the window
+  normalization (~2.8e-2 on the noise clip, 10x the arithmetic's own error).
+  Widen the f32 clip from the half one instead (`tests/test_nnedi3.py`).
 
 ## Debug env vars
 
@@ -320,6 +382,7 @@ All in `src/nnedi3.cpp`.
 |---|---|
 | `VSFEEL_NNEDI3_TSTAMP=<frame>` | one-shot GPU stamps for that frame: top / prescreen done / predict done (default 100; gated on the queue family's `timestampValidBits`) |
 | `VSFEEL_NNEDI3_TIMING=1` | per-frame host stage averages (acquire/record/submit/total) printed at teardown |
+| `VSFEEL_NNEDI3_PRED16=0` | force the storage-only f16 kernels instead of the packed half predictor (default on where the device has `shaderFloat16`) |
 
 `BENCH`, `COUNT`, `SKIPIL` and `QUEUES` were deleted with the pre-R80
 machinery; `TSTAMP` became a one-shot probe and `BENCH` was renamed `TIMING`.
