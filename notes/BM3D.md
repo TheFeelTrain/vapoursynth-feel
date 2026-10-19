@@ -58,9 +58,10 @@ half the bytes, which is where the visible speedup is (see Performance).
 
 ## Implementation
 
-- Three kernels: `bm3d.comp` (match, group, transform; one warp of 32 lanes =
-  four 8-lane groups, one 8x8 block each), `bm3d_agg.comp` (aggregation over the
-  TW = 2r+1 stack slices) and `bm3d_copy.comp`, which widens a 2-byte clip's
+- Three kernels: `bm3d.comp` (match, group, transform; one workgroup of WG
+  threads = WG/8 independent 8-lane groups, one 8x8 block each), `bm3d_agg.comp`
+  (aggregation over the TW = 2r+1 stack slices) and `bm3d_copy.comp`, which
+  widens a 2-byte clip's
   planes into the ring as it copies them: an integer sample by gain 1/65535 less
   the 32768 neutral on YUV chroma (the reference's `Int2Float`), a half sample by
   an exact widening with neither. Only the store is depth-specific
@@ -207,36 +208,25 @@ half the bytes, which is where the visible speedup is (see Performance).
 - The estimate phase's 0.40 ms is transform plus two `atomicAdd`s; the CAS
   arm's +0.66 ms/frame bounds the atomics as most of it.
 - Timestamp figures before 2026-09-21 read 1000x low; do not quote them.
-- **The run-to-run swing was pipeline depth, not the kernels (+5%; spread 8.7%
-  -> 2.8%).** The rings were sized for two in-flight frames, and the source
-  ring's reuse distance makes that a hard serialization (a third frame blocks in
-  `acquire_cache`), which put the host recording path -- 1.5 ms of est plus
-  0.5 ms of agg per frame against a 1.04 ms GPU frame -- exactly at the GPU's
-  pace, so any release-to-acquire delay idled it. Six alternating 1000-frame
-  invocations: 871-947 fps (8.7%); sized for the four frames the pool can overlap
-  (`min(threads, 8)` contexts, two submissions per frame): 933-960 (2.8%). Depth
-  6-8 add <1% for 175 MiB.
+- **The run-to-run swing was pipeline depth, not the kernels (+5%).** The rings
+  were sized for two in-flight frames, whose source-ring reuse distance is a hard
+  serialization (a third frame blocks in `acquire_cache`), putting the host path
+  (1.5 ms est + 0.5 ms agg against a 1.04 ms GPU frame) at the GPU's pace. Six
+  1000-frame runs: 871-947 fps (8.7%); sized for the pool's four frames:
+  933-960 (2.8%). Depth 6-8 add <1% for 175 MiB.
 - **Do not unroll the walk.** The loop body is 309 instructions per candidate
   (SSD 45%, insert 27%, addressing 9%, waits 6%, scheduler `s_delay_alu` 14%),
   and several candidates per iteration only raise the register count: 1-wide is
   168 VGPRs / 9 waves/SIMD, 2-wide 192 / 8, 4-wide 192 / 8; fine-interleaved A/B
   puts 1-wide 1.6% ahead of 2-wide and 2.7% ahead of 4-wide. The earlier "the
   unroll helps" readings were against baselines that had drifted (Method rules).
-- **A u16 ring is a pessimisation; widen at copy time (+3%, and the u16 filter
-  would otherwise be 15% slower).** The first 16 bit build kept the ring in u16
-  and widened on load. That kernel's whole job is the SSD: each source sample is
-  re-read once per candidate origin (~500 per 8x8 block) out of an L1-resident
-  26x26 window, so halving the bytes saves no DRAM traffic while the load path
-  grows from 3 issue slots per sample (load, `v_dual_sub_f32`, `v_fmac`) to ~6
-  (a vectorized load plus `v_alignbyte`/`v_lshrrev`/`v_cvt_u32_u16` extraction,
-  then cvt, mul, sub, fma); ISA confirms it (same 241 VMEM, +636 VALU, +20%
-  inverse throughput) and a scratch A/B (1080p jpbd, r=2, 800 frames x3) reads
-  the estimation kernel 0.95 -> 1.27 ms, filter 747 -> 644 fps. Widening at copy
-  time instead pays 2.07M samples per frame rather than every candidate read and
-  turns the halved io into a win: 970 fps against f32's 932 (`--format u16`, 1000
-  frames x3, same session, interleaved). A real 16 bit chain -- cached source, no
-  `depth()` node -- is 846 vs 634 fps in a same-harness A/B (600 frames x3,
-  screen; the f32 arm pays its conversion inside the timed region).
+- **A u16 ring is a pessimisation; widen at copy time (+3%).** The SSD re-reads
+  each source sample once per candidate origin (~500 per block) out of an
+  L1-resident 26x26 window, so halving the bytes saves no DRAM traffic while the
+  load path grows from 3 issue slots per sample to ~6 (ISA: same 241 VMEM, +636
+  VALU); a scratch A/B reads the estimation kernel 0.95 -> 1.27 ms, filter
+  747 -> 644 fps. Widening at copy time pays 2.07M samples per frame instead:
+  970 against 932 fps (`--format u16`), and a real 16 bit chain 846 vs 634.
 - **f16 is the same io-only win, and at the benchmark config it sits inside the
   noise.** Same-session interleaved runs (1080p jpbd, r=2, harness config, 1000
   frames x3, `--gpu-cache --no-download`): f16 972.4-977.9, f32 959.7-972.8
@@ -251,6 +241,13 @@ half the bytes, which is where the visible speedup is (see Performance).
   alone and the 88% of its bytes that are not io cannot narrow.
 - Marginal cost per candidate per lane: 0.0032 ms (`bm_range`), 0.0030
   (`ps_range`), with a ~1.4-2.0 ms intercept at tiny windows.
+- **The estimation launch shape comes from the device, not a fixed warp.** It is
+  a specialization constant; `choose_workgroup` starts at two waves (64 threads
+  at subgroup 32) since a one-wave CTA can be capped by the CU's workgroup slots,
+  then clamps by invocations, subgroup budget and per-group LDS. Seeds and patch
+  use a subgroup barrier (no group reads another's). RDNA3 gains little (the
+  register file binds first): 64 against 32 threads +0.6% (805.2/800.7, ABBA,
+  jpbd, 1000x3), 64 against 128 +0.9%; `VSFEEL_BM3D_WORKGROUP` overrides.
 - **LDS is a trap here.** Three attempts to move kernel-live data into shared
   memory each raised VGPRs 216 -> 240 and dropped occupancy 7 -> 6 waves/SIMD,
   losing 5-90%: the cost is dynamic LDS addressing, not traffic, so the wins came

@@ -312,6 +312,14 @@ struct BM3DData {
     // chroma=True: one joint entry over the clip's three 4:4:4 planes, whose
     // groups come from luma (the references' "chroma" mode).
     bool joint {};
+    // Launch shape of the estimation kernels, and the group grid the split's
+    // handoff is indexed by: chosen from the device's occupancy limits, not
+    // fixed. `groups_per_wg` is the same number in 8-lane groups.
+    uint32_t workgroup {};
+    uint32_t groups_per_wg {};
+    // Pinned subgroup width (0 keeps the device default), chosen once so the
+    // occupancy calculation and every pipeline agree.
+    uint32_t subgroup_size {};
 
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
@@ -517,6 +525,65 @@ struct BM3DData {
 // Pipeline creation
 // ---------------------------------------------------------------------------
 
+// The subgroup width the kernels run at. The 8-lane groups need a width that is
+// a multiple of 8, and 32 is the measured best on the target GPU
+// (VSFEEL_BM3D_SUBGROUP=64 forces the wave64 path). A device that cannot be
+// asked for 32 keeps its own width when that already suits the groups, and is
+// otherwise asked for 16; only a width that both is not a multiple of 8 and
+// cannot be changed is refused.
+static std::variant<uint32_t, std::string>
+choose_subgroup(const GPUDevice & gpu) {
+    const int forced = env_int("VSFEEL_BM3D_SUBGROUP", 0);
+    if (forced > 0) {
+        return static_cast<uint32_t>(forced);
+    }
+    if (gpu.has_subgroup_size(32, 32)) {
+        return 32u;
+    }
+    if (gpu.subgroup_size % 8 == 0) {
+        return 0u;
+    }
+    if (gpu.has_subgroup_size(16, 32)) {
+        return 16u;
+    }
+    return "BM3D needs a subgroup size that is a multiple of 8 lanes "
+           "(its 8-lane groups share data with subgroup shuffles), and this "
+           "device's is " +
+           std::to_string(gpu.subgroup_size) + " and cannot be changed"s;
+}
+
+// The estimation kernels launch GROUPS independent 8-lane groups per
+// workgroup. Two waves is the floor: at one wave the CU's workgroup slots can
+// run out before the register file does, while the per-group shared arrays grow
+// with the launch, so a larger CTA does not add resident groups once the
+// shared-memory budget binds. The cap still comes from the device: its
+// invocations, its subgroup budget and the 256-thread ceiling the shader's
+// group table is sized for.
+static uint32_t choose_workgroup(const GPUDevice & gpu, uint32_t subgroup,
+                                 bool patch_lds) {
+    if (const int forced = env_int("VSFEEL_BM3D_WORKGROUP", 0); forced > 0) {
+        return static_cast<uint32_t>(forced);
+    }
+    const uint32_t sg = subgroup != 0 ? subgroup : gpu.subgroup_size;
+    // Four 8-int seed rows and, staging the patch, 72 floats per group.
+    const uint32_t per_group = 4u * 8u * 4u + (patch_lds ? 72u * 4u : 0u);
+    uint32_t cap = std::min<uint32_t>({
+        gpu.limits.maxComputeWorkGroupInvocations,
+        gpu.limits.maxComputeWorkGroupSize[0],
+        sg * std::max(gpu.max_compute_workgroup_subgroups, 1u),
+        256u,
+    });
+    cap = std::max(cap / sg * sg, sg);
+    uint32_t wg = std::min(std::max(64u, sg), cap);
+    // A small-shared-memory part shrinks a subgroup at a time rather than
+    // failing pipeline creation.
+    while (wg > sg &&
+           (wg / 8u) * per_group > gpu.limits.maxComputeSharedMemorySize) {
+        wg -= sg;
+    }
+    return wg;
+}
+
 static std::variant<VkPipeline, std::string>
 create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
                      const Bm3dGroup & group, const uint32_t * code,
@@ -543,6 +610,8 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
         int32_t nplanes;
         float th_sse;
         int32_t trace;
+        int32_t workgroup;
+        int32_t groups;
     } spec { first.width,
              first.height,
              first.stride,
@@ -561,8 +630,10 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
              group_sigma(2),
              group.n_planes,
              d.th_sse,
-             d.trace_frame >= 0 ? 1 : 0 };
-    const std::array<VkSpecializationMapEntry, 19> entries { {
+             d.trace_frame >= 0 ? 1 : 0,
+             static_cast<int32_t>(d.workgroup),
+             static_cast<int32_t>(d.groups_per_wg) };
+    const std::array<VkSpecializationMapEntry, 21> entries { {
         { 0, offsetof(Spec, width), sizeof(int32_t) },
         { 1, offsetof(Spec, height), sizeof(int32_t) },
         { 2, offsetof(Spec, stride), sizeof(int32_t) },
@@ -582,44 +653,27 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
         { 16, offsetof(Spec, nplanes), sizeof(int32_t) },
         { 17, offsetof(Spec, th_sse), sizeof(float) },
         { 18, offsetof(Spec, trace), sizeof(int32_t) },
+        { 19, offsetof(Spec, workgroup), sizeof(int32_t) },
+        { 20, offsetof(Spec, groups), sizeof(int32_t) },
     } };
-    // The kernel's 8-lane shuffles keep each aligned 8-lane group inside one
-    // subgroup, so any width that is a multiple of 8 runs it; 32 is the measured
-    // best on the target GPU (VSFEEL_BM3D_SUBGROUP=64 forces the wave64 path,
-    // and the request is validated when the pipeline is created). A device that
-    // cannot be asked for 32 keeps its own width when that already suits the
-    // groups, and is otherwise asked for 16; only a device whose width both is
-    // not a multiple of 8 and cannot be changed is refused.
-    const int forced_subgroup = env_int("VSFEEL_BM3D_SUBGROUP", 0);
-    uint32_t subgroup_size = 0;
-    if (forced_subgroup > 0) {
-        subgroup_size = static_cast<uint32_t>(forced_subgroup);
-    } else if (gpu.has_subgroup_size(32, 32)) {
-        subgroup_size = 32;
-    } else if (gpu.subgroup_size % 8 == 0) {
-        subgroup_size = 0;
-    } else if (gpu.has_subgroup_size(16, 32)) {
-        subgroup_size = 16;
-    } else {
-        return "BM3D needs a subgroup size that is a multiple of 8 lanes "
-               "(its 8-lane groups share data with subgroup shuffles), and this "
-               "device's is " +
-               std::to_string(gpu.subgroup_size) + " and cannot be changed"s;
-    }
+    // The subgroup width and the launch size are chosen once in BM3DCreate so
+    // the grid, the split's handoff and every pipeline agree on them.
+    const uint32_t groups = d.groups_per_wg;
     // LDS: s_x/s_y/s0_x/s0_y hold the prediction seeds of each 8-lane group
     // (four arrays of 8 entries per group), plus the group's reference patch
-    // when it is staged there (4 x 72 floats; the stride is a multiple of 16
-    // bytes so a patch row reads as vector loads, and it keeps the four groups
-    // in different banks). The per-lane candidate lists live in registers, so
+    // when it is staged there (72 floats; the stride is a multiple of 16 bytes
+    // so a patch row reads as vector loads, and it keeps the groups in
+    // different banks). The per-lane candidate lists live in registers, so
     // nothing else is shared. The split's filter half uses neither, and
     // declaring LDS it does not use would cost workgroups per SM.
-    const uint32_t patch_bytes = patch_lds ? 4 * 72 * 4 : 0;
-    const uint32_t seed_bytes = seeds ? 4 * 8 * 4 * 4 : 0;
-    const GpuWorkgroup workgroup { .x = 32,
+    const uint32_t patch_bytes = patch_lds ? groups * 72 * 4 : 0;
+    const uint32_t seed_bytes = seeds ? groups * 8 * 4 * 4 : 0;
+    const GpuWorkgroup workgroup { .x = d.workgroup,
                                    .shared_bytes = seed_bytes + patch_bytes };
     return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(),
                                &spec, static_cast<uint32_t>(entries.size()),
-                               sizeof(spec), "bm3d", subgroup_size, workgroup);
+                               sizeof(spec), "bm3d", d.subgroup_size,
+                               workgroup);
 }
 
 static std::variant<VkPipeline, std::string>
@@ -2277,6 +2331,18 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     d->split_kernel = split_env && *split_env
                           ? env_flag("VSFEEL_BM3D_SPLIT_KERNEL")
                           : d->gpu->driver_id != VK_DRIVER_ID_MESA_RADV;
+    // One launch shape for every pipeline of this instance: the split's
+    // handoff and the per-plane grid are indexed by it.
+    const auto subgroup = choose_subgroup(*d->gpu);
+    if (std::holds_alternative<std::string>(subgroup)) {
+        return set_error(std::get<std::string>(subgroup));
+    }
+    d->subgroup_size = std::get<uint32_t>(subgroup);
+    d->workgroup = choose_workgroup(*d->gpu, d->subgroup_size, d->patch_lds);
+    if (d->workgroup % 8 != 0) {
+        return set_error("VSFEEL_BM3D_WORKGROUP must be a multiple of 8");
+    }
+    d->groups_per_wg = d->workgroup / 8;
     if (vsfeel_device_info_enabled()) {
         fprintf(stderr, "[bm3d] aggregation: %s\n",
                 d->cas_atomics ? "CAS loop (atom_add_f fallback)"
@@ -2287,6 +2353,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         fprintf(stderr, "[bm3d] reference patch: %s (driver %u)\n",
                 d->patch_lds ? "shared memory" : "per-lane registers",
                 d->gpu->driver_id);
+        fprintf(stderr, "[bm3d] workgroup: %u threads, %u groups\n",
+                d->workgroup, d->groups_per_wg);
     }
     // The 8x8 group transposes and the group-8 reduction are subgroup shuffles,
     // and the kernel's per-lane layout puts each 8-lane group inside one
@@ -2529,16 +2597,17 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             // The split's handoff, sized for the largest entry's grid: one
             // count word per reference block plus 16 member words each.
             uint64_t blocks = 0;
+            const auto groups = static_cast<uint64_t>(d->groups_per_wg);
             for (int gi = 0; gi < d->n_groups; ++gi) {
                 const auto & p = d->planes[d->groups[gi].planes[0]];
                 const uint64_t gx =
                     (static_cast<uint64_t>(p.width) +
-                     4 * static_cast<uint64_t>(p.block_step) - 1) /
-                    (4 * static_cast<uint64_t>(p.block_step));
+                     groups * static_cast<uint64_t>(p.block_step) - 1) /
+                    (groups * static_cast<uint64_t>(p.block_step));
                 const uint64_t gy =
                     (static_cast<uint64_t>(p.height) + p.block_step - 1) /
                     p.block_step;
-                blocks = std::max(blocks, gx * gy * 4);
+                blocks = std::max(blocks, gx * gy * groups);
             }
             d->match_words = static_cast<uint32_t>(
                 ((blocks + 1) & ~uint64_t(1)) + blocks * 16);
@@ -2768,8 +2837,10 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
                 g.bm3d_pipeline = std::get<VkPipeline>(result);
             }
         }
+        const int groups = static_cast<int>(d->groups_per_wg);
         g.bm3d_grid_x = static_cast<uint32_t>(
-            (first.width + 4 * first.block_step - 1) / (4 * first.block_step));
+            (first.width + groups * first.block_step - 1) /
+            (groups * first.block_step));
         g.bm3d_grid_y = static_cast<uint32_t>(
             (first.height + first.block_step - 1) / first.block_step);
         for (int pi = 0; pi < g.n_planes; ++pi) {

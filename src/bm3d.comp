@@ -9,10 +9,14 @@
 #extension GL_EXT_shader_atomic_float : require
 #endif
 #extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_basic : enable
 
 /*
- * BM3D collaborative-filtering kernel. One workgroup = one warp of 32 lanes;
- * 4 groups of 8 lanes each process one 8x8 reference block. The per-lane layout
+ * BM3D collaborative-filtering kernel. A workgroup holds GROUPS independent
+ * groups of 8 lanes, each processing one 8x8 reference block; the launch size is
+ * derived from the device's occupancy (see choose_workgroup in bm3d.cpp) and is a
+ * specialization constant, so every group stays inside one subgroup and the
+ * per-group shared arrays are sized to the launch. The per-lane layout
  * is [member(8) x row(8)] with the block column provided by the lane id, so the
  * 2D transform uses shared memory transposes between the 8 lanes of a group.
  *
@@ -32,7 +36,7 @@
  * constants (WIDTH..TRACE) so the pipeline can be built once per configuration.
  */
 
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x_id = 19, local_size_y = 1, local_size_z = 1) in;
 
 layout(constant_id = 0) const int WIDTH = 1920;
 layout(constant_id = 1) const int HEIGHT = 1080;
@@ -65,6 +69,9 @@ layout(constant_id = 17) const float TH_SSE = 1.0;
 // into the buffer bound as the unused destination binding. Folded away when 0,
 // so the production kernel carries no trace code at all.
 layout(constant_id = 18) const int TRACE = 0;
+// 8-lane groups per workgroup. The launch size itself is constant_id 19, set by
+// the host from the same number; this one sizes the per-group shared arrays.
+layout(constant_id = 20) const int GROUPS = 8;
 
 const int KRADIUS = RADIUS;
 const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
@@ -83,14 +90,15 @@ const int RES_PLANE_STRIDE = TW * 2 * TEMPORAL_STRIDE;
 // (workgroup, group) pair rather than the block origin: a clipped last row
 // clamps its origin off the step grid, which two rows could share.
 const uint MATCH_GRID_X =
-    (uint(WIDTH) + 4u * uint(BLOCK_STEP) - 1u) / (4u * uint(BLOCK_STEP));
+    (uint(WIDTH) + uint(GROUPS) * uint(BLOCK_STEP) - 1u) /
+    (uint(GROUPS) * uint(BLOCK_STEP));
 const uint MATCH_GRID_Y =
     (uint(HEIGHT) + uint(BLOCK_STEP) - 1u) / uint(BLOCK_STEP);
-const uint MATCH_BLOCKS = MATCH_GRID_X * MATCH_GRID_Y * 4u;
+const uint MATCH_BLOCKS = MATCH_GRID_X * MATCH_GRID_Y * uint(GROUPS);
 const uint MATCH_MEM_OFF = (MATCH_BLOCKS + 1u) & ~1u;
 
 uint block_index(int gid, int wgy, int grp) {
-    return (uint(wgy) * MATCH_GRID_X + uint(gid)) * 4u + uint(grp);
+    return (uint(wgy) * MATCH_GRID_X + uint(gid)) * uint(GROUPS) + uint(grp);
 }
 
 const float FLT_MAX_ = 3.402823466e+38f;
@@ -208,12 +216,12 @@ int src_input(int z, int plane) {
 // Prediction seeds of the temporal chain, one row per 8-lane group. They live
 // in shared memory because every lane of the group reads all of them: a
 // register array indexed by a runtime seed count would spill to scratch.
-shared int s_x[4][8];
-shared int s_y[4][8];
+shared int s_x[GROUPS][8];
+shared int s_y[GROUPS][8];
 // The current frame's seeds, kept so both temporal directions start from the
 // same list.
-shared int s0_x[4][8];
-shared int s0_y[4][8];
+shared int s0_x[GROUPS][8];
+shared int s0_y[GROUPS][8];
 #ifdef PATCH_LDS
 // One reference patch per group: it depends on the group's block origin and not
 // on `sl`, so the eight lanes of a group share it. Rows, not columns, are the
@@ -222,8 +230,17 @@ shared int s0_y[4][8];
 // ones. The 72-float group stride keeps every row 16-byte aligned and puts the
 // four groups on banks 0/8/16/24 for both the fill and the reads. See the load
 // in main().
-shared float cur_s[4][72];
+shared float cur_s[GROUPS][72];
 #endif
+
+// The seeds and the patch are private to one 8-lane group, and every group
+// lives inside one subgroup, so a subgroup barrier orders them. A workgroup
+// barrier would also make the groups of other subgroups wait for no reason.
+void sync_groups()
+{
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+}
 
 
 void dct_fwd(inout float v[8]) {
@@ -1092,7 +1109,7 @@ void main() {
     const int gid = int(gl_WorkGroupID.x);
     const int wgy = int(gl_WorkGroupID.y);
 
-    const int x0 = (4 * gid + group) * BLOCK_STEP;
+    const int x0 = (GROUPS * gid + group) * BLOCK_STEP;
     int y = BLOCK_STEP * wgy;
     if (y >= HEIGHT - 8 + BLOCK_STEP) {
         return;
@@ -1135,7 +1152,7 @@ void main() {
         cur_s[group][k] =
             src[anchor_pc + (y + (k >> 3)) * STRIDE + (x + (k & 7))];
     }
-    barrier();
+    sync_groups();
 #else
     // Sixteen vectors rather than a `float cur[64]`: a private array is what a
     // backend that will not promote it stages in scratch, and then every one of
@@ -1259,12 +1276,12 @@ void main() {
             s_y[group][k] = gxy[k] >> XY_SHIFT;
         }
     }
-    barrier();
+    sync_groups();
 
     for (int direction = -1; direction <= 1; direction += 2) {
         // Everyone is done reading the seeds of the previous direction before
         // the forward chain rewrites them.
-        barrier();
+        sync_groups();
         if (direction > 0 && sl == 0) {
             for (int k = 0; k < 8; ++k) {
                 s_x[group][k] = s0_x[group][k];
@@ -1279,7 +1296,7 @@ void main() {
         for (int t = 1; t <= nt; ++t) {
             const int z = KRADIUS + direction * t;
             // Publishes the seeds the previous frame retained (or the restart).
-            barrier();
+            sync_groups();
             float pe[8];
             int pxy[8];
             for (int k = 0; k < 8; ++k) {
