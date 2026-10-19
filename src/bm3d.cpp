@@ -380,9 +380,6 @@ struct BM3DData {
     // Match/filter split: the group handoff (one count word per reference block
     // plus 16 words of members per block) and the flag that selects it.
     bool split_kernel {};
-    // Batched candidate selection: the Nvidia codegen path, where the insert's
-    // if-converted shift chain serialises. VSFEEL_BM3D_BATCH=0/1 overrides.
-    bool batch_select {};
     GpuBuffer matches {};
     uint32_t match_words {};
     VkDeviceSize tags_size {}; // uints
@@ -595,12 +592,12 @@ choose_subgroup(const GPUDevice & gpu) {
 }
 
 // The estimation kernels launch GROUPS independent 8-lane groups per
-// workgroup. One wave is the default: a 3080 reports it faster and RDNA3
-// measures the two within 0.6% (64 threads was ahead there). The per-group
-// shared arrays grow with the launch, so a larger CTA does not add resident
-// groups once the shared-memory budget binds. The cap still comes from the
-// device: its invocations, its subgroup budget and the 256-thread ceiling the
-// shader's group table is sized for.
+// workgroup. Two waves is the floor: at one wave the CU's workgroup slots can
+// run out before the register file does, while the per-group shared arrays grow
+// with the launch, so a larger CTA does not add resident groups once the
+// shared-memory budget binds. The cap still comes from the device: its
+// invocations, its subgroup budget and the 256-thread ceiling the shader's
+// group table is sized for.
 static uint32_t choose_workgroup(const GPUDevice & gpu, uint32_t subgroup,
                                  bool patch_lds) {
     if (const int forced = env_int("VSFEEL_BM3D_WORKGROUP", 0); forced > 0) {
@@ -655,7 +652,6 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
         int32_t workgroup;
         int32_t groups;
         int32_t res_cap;
-        int32_t batch;
     } spec { first.width,
              first.height,
              first.stride,
@@ -677,9 +673,8 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
              d.trace_frame >= 0 ? 1 : 0,
              static_cast<int32_t>(d.workgroup),
              static_cast<int32_t>(d.groups_per_wg),
-             static_cast<int32_t>(group.res_cap),
-             d.batch_select ? 1 : 0 };
-    const std::array<VkSpecializationMapEntry, 23> entries { {
+             static_cast<int32_t>(group.res_cap) };
+    const std::array<VkSpecializationMapEntry, 22> entries { {
         { 0, offsetof(Spec, width), sizeof(int32_t) },
         { 1, offsetof(Spec, height), sizeof(int32_t) },
         { 2, offsetof(Spec, stride), sizeof(int32_t) },
@@ -702,7 +697,6 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
         { 19, offsetof(Spec, workgroup), sizeof(int32_t) },
         { 20, offsetof(Spec, groups), sizeof(int32_t) },
         { 21, offsetof(Spec, res_cap), sizeof(int32_t) },
-        { 22, offsetof(Spec, batch), sizeof(int32_t) },
     } };
     // The subgroup width and the launch size are chosen once in BM3DCreate so
     // the grid, the split's handoff and every pipeline agree on them.
@@ -2848,14 +2842,6 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     d->split_kernel = split_env && *split_env
                           ? env_flag("VSFEEL_BM3D_SPLIT_KERNEL")
                           : d->gpu->driver_id != VK_DRIVER_ID_MESA_RADV;
-    // The batched candidate selection follows the insert's codegen, not the
-    // matcher split: only the NVIDIA driver is known to serialise the insert's
-    // shift chain badly enough for a network to pay. VSFEEL_BM3D_BATCH overrides.
-    const char * batch_env = std::getenv("VSFEEL_BM3D_BATCH");
-    d->batch_select =
-        batch_env && *batch_env
-            ? env_flag("VSFEEL_BM3D_BATCH")
-            : d->gpu->driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY;
     // One launch shape for every pipeline of this instance: the split's
     // handoff and the per-plane grid are indexed by it.
     const auto subgroup = choose_subgroup(*d->gpu);
@@ -2878,8 +2864,6 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         fprintf(stderr, "[bm3d] reference patch: %s (driver %u)\n",
                 d->patch_lds ? "shared memory" : "per-lane registers",
                 d->gpu->driver_id);
-        fprintf(stderr, "[bm3d] candidate selection: %s\n",
-                d->batch_select ? "batched" : "insert");
         fprintf(stderr, "[bm3d] workgroup: %u threads, %u groups\n",
                 d->workgroup, d->groups_per_wg);
     }
