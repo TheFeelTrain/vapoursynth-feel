@@ -601,6 +601,7 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
 
 - `VSFEEL_BM3D_TRACE=1` — acquire/submit/wait trace.
 - `VSFEEL_BM3D_TIMING=1` — per-frame host-stage split.
+- `VSFEEL_BM3D_PROFILE=1` — per-dispatch GPU kernel table at free, bm3dvk2's `BM3DVK_PROFILE` layout.
 - `VSFEEL_BM3D_VRAM=1` — creation-time VRAM budget.
 - `VSFEEL_BM3D_SPLIT=0` — one estimation submission per frame.
 - `VSFEEL_BM3D_RINGWAIT=1` — wait the ring copier's submission out host side

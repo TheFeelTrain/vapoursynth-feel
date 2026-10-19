@@ -9,10 +9,12 @@
 #include <cstring>
 #include <cstdlib>
 #include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -161,6 +163,126 @@ struct Bm3dProbe {
     bool enabled {};
 };
 
+// Per-dispatch GPU timing (VSFEEL_BM3D_PROFILE): two timestamps around every
+// dispatch, fill and copy, reported at free in bm3dvk2's BM3DVK_PROFILE layout
+// so the two plugins' kernel tables can be read side by side. Pairs are
+// allocated atomically because frames record concurrently; the report runs
+// after the exec pool has drained.
+struct Bm3dKernelProfile {
+    static constexpr uint32_t kQueryCapacity = 1u << 18;
+    static constexpr uint32_t kPairs = kQueryCapacity / 2;
+
+    VkDevice device {};
+    const VSVulkanFunctions * vk {};
+    VkQueryPool pool {};
+    std::atomic<uint32_t> next_pair { 0 };
+    std::vector<const char *> names;
+    double period {};
+    uint64_t mask {};
+
+    bool init(const GPUDevice & gpu, const VSAPI & vsapi, VSCore * core) {
+        device = gpu.device;
+        vk = gpu.vk;
+        VkQueryPoolCreateInfo info {
+            .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType = VK_QUERY_TYPE_TIMESTAMP,
+            .queryCount = kQueryCapacity
+        };
+        if (vk->vkCreateQueryPool(device, &info, nullptr, &pool) !=
+            VK_SUCCESS) {
+            pool = VK_NULL_HANDLE;
+            vsapi.logMessage(mtWarning,
+                             "BM3D: could not create the timestamp pool; "
+                             "VSFEEL_BM3D_PROFILE disabled",
+                             core);
+            return false;
+        }
+        vk->vkResetQueryPool(device, pool, 0, kQueryCapacity);
+        names.assign(kPairs, nullptr);
+        period = gpu.limits.timestampPeriod;
+        mask = gpu.timestamp_valid_bits >= 64
+                   ? ~static_cast<uint64_t>(0)
+                   : (uint64_t { 1 } << gpu.timestamp_valid_bits) - 1;
+        return true;
+    }
+
+    std::optional<uint32_t> begin(VkCommandBuffer cmd, const char * name) {
+        if (pool == VK_NULL_HANDLE) {
+            return std::nullopt;
+        }
+        const uint32_t pair = next_pair.fetch_add(1, std::memory_order_relaxed);
+        if (pair >= kPairs) {
+            return std::nullopt;
+        }
+        names[pair] = name;
+        vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                 pool, pair * 2);
+        return pair;
+    }
+
+    void end(VkCommandBuffer cmd, std::optional<uint32_t> pair) const {
+        if (pair) {
+            vk->vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                     pool, *pair * 2 + 1);
+        }
+    }
+
+    void report(const VSAPI & vsapi, VSCore * core) const {
+        if (pool == VK_NULL_HANDLE) {
+            return;
+        }
+        const uint32_t pairs =
+            std::min(next_pair.load(std::memory_order_relaxed), kPairs);
+        if (pairs == 0) {
+            vsapi.logMessage(mtInformation,
+                             "BM3D profile: no dispatch was timed", core);
+            return;
+        }
+        struct Result {
+            uint64_t value;
+            uint64_t available;
+        };
+        std::vector<Result> results(static_cast<size_t>(pairs) * 2);
+        if (vk->vkGetQueryPoolResults(
+                device, pool, 0, pairs * 2, results.size() * sizeof(Result),
+                results.data(), sizeof(Result),
+                VK_QUERY_RESULT_64_BIT |
+                    VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) != VK_SUCCESS) {
+            vsapi.logMessage(mtWarning,
+                             "BM3D profile: the timestamp queries could not "
+                             "be read",
+                             core);
+            return;
+        }
+        std::map<std::string_view, std::pair<double, int>> totals;
+        for (uint32_t pair = 0; pair < pairs; ++pair) {
+            const Result & first = results[static_cast<size_t>(pair) * 2];
+            const Result & second = results[static_cast<size_t>(pair) * 2 + 1];
+            if (first.available && second.available && names[pair]) {
+                auto & [ms, count] = totals[names[pair]];
+                ms += static_cast<double>((second.value - first.value) & mask) *
+                      period * 1e-6;
+                ++count;
+            }
+        }
+        std::string s = "BM3D profile:";
+        for (const auto & [name, total] : totals) {
+            s += "\n  " + std::string(name) + ": " +
+                 std::to_string(total.first / total.second) + " ms x " +
+                 std::to_string(total.second) + " = " +
+                 std::to_string(total.first) + " ms";
+        }
+        vsapi.logMessage(mtInformation, s.c_str(), core);
+    }
+
+    void destroy() {
+        if (pool != VK_NULL_HANDLE) {
+            vk->vkDestroyQueryPool(device, pool, nullptr);
+            pool = VK_NULL_HANDLE;
+        }
+    }
+};
+
 
 // One instance per filter node, never an array, so the fields stay grouped the
 // way the comments read rather than packed for a padding win that cannot pay.
@@ -267,6 +389,16 @@ struct BM3DData {
     std::mutex cache_lock;
     std::condition_variable cache_cv;
     Bm3dProbe probe {};
+    Bm3dKernelProfile profile {};
+
+    // Drain every submission this instance made; also called from BM3DFree so
+    // the profile can read its timestamp queries before the pool goes away.
+    void drain() {
+        if (gpu && exec) {
+            gpu->api->freeGPUExecPool(exec);
+            exec = nullptr;
+        }
+    }
 
     // Env-gated host-path probe (VSFEEL_BM3D_TIMING=1). The stage split is the
     // prerequisite for any transfer-path change: kernel time alone says nothing
@@ -325,13 +457,11 @@ struct BM3DData {
         // freeGPUExecPool drains every submission this instance made and runs
         // every retention it held -- source frames included -- before it
         // returns, so nothing below can still be in use.
-        if (exec) {
-            gpu->api->freeGPUExecPool(exec);
-            exec = nullptr;
-        }
+        drain();
         if (probe.query) {
             gpu->vk->vkDestroyQueryPool(dev, probe.query, nullptr);
         }
+        profile.destroy();
         if (copy_pipeline) {
             gpu->vk->vkDestroyPipeline(dev, copy_pipeline, nullptr);
         }
@@ -1012,15 +1142,19 @@ static void record_est_position(BM3DData * d, const Bm3dFrame & fr,
     const VkDeviceSize slot_elems =
         static_cast<VkDeviceSize>(g.n_planes) * d->tw * 2 * g.pe;
     const VkDeviceSize res_off = static_cast<VkDeviceSize>(slot) * slot_elems;
+    const auto zero_timer = d->profile.begin(cmd, "BM3D zero");
     d->gpu->vk->vkCmdFillBuffer(cmd, g.res.buffer, res_off * 4, slot_elems * 4,
                                 0);
+    d->profile.end(cmd, zero_timer);
     // Clear only this exclusively reserved slot's witnesses in the same
     // ordered submission; a filter-wide lazy clear races first frames. The
     // entry's own region starts at its tag base.
+    const auto tag_timer = d->profile.begin(cmd, "BM3D zero");
     d->gpu->vk->vkCmdFillBuffer(cmd, d->tags.buffer,
                                 static_cast<VkDeviceSize>(g.tag_base + slot) *
                                     d->tw * 4,
                                 static_cast<VkDeviceSize>(d->tw) * 4, 0);
+    d->profile.end(cmd, tag_timer);
 
     // Both the zero-fill and the tag clear precede the estimation dispatch.
     bm3d_full_barrier(*d->gpu, cmd);
@@ -1070,14 +1204,19 @@ static void record_est_position(BM3DData * d, const Bm3dFrame & fr,
         gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, pushes,
                            sizeof(pushes));
     }
+    const auto est_timer = d->profile.begin(
+        cmd, d->split_kernel ? "BM3D blockMatch" : "BM3D blockMatch+filter");
     d->gpu->vk->vkCmdDispatch(cmd, g.bm3d_grid_x, g.bm3d_grid_y, 1);
+    d->profile.end(cmd, est_timer);
     if (d->split_kernel) {
         // The groups the search half wrote must be visible to the filter half:
         // the barrier is the whole handoff.
         bm3d_compute_barrier(*d->gpu, cmd);
         d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                       g.bm3d_filter_pipeline);
+        const auto filter_timer = d->profile.begin(cmd, "BM3D filter");
         d->gpu->vk->vkCmdDispatch(cmd, g.bm3d_grid_x, g.bm3d_grid_y, 1);
+        d->profile.end(cmd, filter_timer);
     }
 }
 
@@ -1105,6 +1244,7 @@ static void record_src_copies(BM3DData * d, const Bm3dFrame & fr,
     const auto copy_plane = [&](VkBuffer src, VkBuffer dst, VkDeviceSize offset,
                                 VkDeviceSize bytes, const Bm3dGroup & g,
                                 bool chroma) {
+        const auto timer = d->profile.begin(cmd, "BM3D convert");
         if (d->bits == 16) {
             const int32_t count = static_cast<int32_t>(bytes);
             const int32_t off = static_cast<int32_t>(offset);
@@ -1121,6 +1261,7 @@ static void record_src_copies(BM3DData * d, const Bm3dFrame & fr,
             // The grid is the entry's extent at creation, so it covers this
             // plane's (never larger) count; past pc.count a thread returns.
             d->gpu->vk->vkCmdDispatch(cmd, g.copy_grid_x, g.copy_grid_y, 1);
+            d->profile.end(cmd, timer);
             return;
         }
         VkBufferCopy2 region {};
@@ -1135,6 +1276,7 @@ static void record_src_copies(BM3DData * d, const Bm3dFrame & fr,
         copy.regionCount = 1;
         copy.pRegions = &region;
         d->gpu->vk->vkCmdCopyBuffer2(cmd, &copy);
+        d->profile.end(cmd, timer);
     };
     for (int gi = 0; gi < d->n_groups; ++gi) {
         const auto & g = d->groups[gi];
@@ -1359,7 +1501,9 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame & fr,
                     cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, d->probe.query,
                     2);
             }
+            const auto agg_timer = d->profile.begin(cmd, "BM3D normalize");
             d->gpu->vk->vkCmdDispatch(cmd, p.agg_grid_x, p.agg_grid_y, 1);
+            d->profile.end(cmd, agg_timer);
             if (gputrace && --remaining == 0) {
                 d->gpu->vk->vkCmdWriteTimestamp2(
                     cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->probe.query,
@@ -1754,9 +1898,13 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
     return nullptr;
 }
 
-static void VS_CC BM3DFree(void * instanceData, [[maybe_unused]] VSCore * core,
+static void VS_CC BM3DFree(void * instanceData, VSCore * core,
                            const VSAPI * vsapi) {
     BM3DData * d = static_cast<BM3DData *>(instanceData);
+    // Drain first: the profile reads timestamp queries, which are only valid
+    // once every submission that wrote them has completed.
+    d->drain();
+    d->profile.report(*vsapi, core);
     vsapi->freeNode(d->node);
     if (d->ref_node) {
         vsapi->freeNode(d->ref_node);
@@ -2515,6 +2663,13 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         checkVK(d->gpu->vk->vkCreateQueryPool(dev, &qp_info, nullptr,
                                               &d->probe.query));
         d->probe.enabled = true;
+    }
+    // Per-dispatch kernel profile (VSFEEL_BM3D_PROFILE). Unlike GPUTRACE this
+    // does not serialize frames: every dispatch takes a timestamp pair and the
+    // whole table is read once, after the pool drains at free.
+    if (vsfeel_debug_probe("VSFEEL_BM3D_PROFILE") &&
+        vsfeel_probe_timestamps(*d->gpu, "BM3D")) {
+        d->profile.init(*d->gpu, *vsapi, core);
     }
 
     // pipelines: one estimation pipeline per entry (its planes share the
