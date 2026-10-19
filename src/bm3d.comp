@@ -10,6 +10,9 @@
 #endif
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_KHR_shader_subgroup_basic : enable
+// [[unroll]] on the candidate batch: it makes the batch array's indices
+// constant, so it stays in registers instead of being staged in scratch.
+#extension GL_EXT_control_flow_attributes : require
 
 /*
  * BM3D collaborative-filtering kernel. A workgroup holds GROUPS independent
@@ -74,6 +77,11 @@ layout(constant_id = 18) const int TRACE = 0;
 layout(constant_id = 20) const int GROUPS = 8;
 // Accumulator slots of the per-frame ring (radius 0: the private slot count).
 layout(constant_id = 21) const int RES_CAP = 6;
+// Batched candidate selection: the walk fills eight candidates per lane and
+// merges them into the running top-8 with a sorting network. The host selects
+// it on the NVIDIA driver, where the insert's if-converted shift chain
+// serialises; the insert remains the default elsewhere.
+layout(constant_id = 22) const int BATCH = 0;
 
 const int KRADIUS = RADIUS;
 const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
@@ -762,6 +770,99 @@ void insert_cand(inout float e[8], inout int xy[8], float err_, int xy_) {
     }
 }
 
+// Candidates one lane of a group takes per batch: a batch is the whole group's
+// 8 * 8 candidates, sorted and merged in one pass (see sort_batch/merge_batch).
+const int CAND_BATCH = 8;
+
+// The (error, y, x) ordering shared by the batched selection. Same strict weak
+// ordering as insert_cand's compare chain.
+bool key_less(float da, int ka, float db, int kb) {
+    return da < db || (da == db && ka < kb);
+}
+
+// Swaps two (error, xy) pairs.
+#define BM_SWAP(DA, KA, DB, KB)                                            \
+    do {                                                                   \
+        const float bm_td = (DA);                                          \
+        const int bm_tk = (KA);                                            \
+        (DA) = (DB);                                                       \
+        (KA) = (KB);                                                       \
+        (DB) = bm_td;                                                      \
+        (KB) = bm_tk;                                                      \
+    } while (false)
+
+// Compare-exchange of two (error, xy) pairs; the smaller stays at the first
+// argument. Both sides are captured before either is written.
+#define BM_KEY_CE(DA, KA, DB, KB)                                          \
+    do {                                                                   \
+        const float bm_da = (DA);                                          \
+        const float bm_db = (DB);                                          \
+        const int bm_ka = (KA);                                            \
+        const int bm_kb = (KB);                                            \
+        const bool bm_sw = key_less(bm_db, bm_kb, bm_da, bm_ka);           \
+        (DA) = bm_sw ? bm_db : bm_da;                                      \
+        (KA) = bm_sw ? bm_kb : bm_ka;                                      \
+        (DB) = bm_sw ? bm_da : bm_db;                                      \
+        (KB) = bm_sw ? bm_ka : bm_kb;                                      \
+    } while (false)
+
+// Sorts one lane's batch of eight candidates by (error, y, x): Batcher's
+// odd-even network, 19 compare-exchanges with constant indices, so the batch
+// stays in registers on both compiler families.
+void sort_batch(inout float d[8], inout int k[8]) {
+    BM_KEY_CE(d[0], k[0], d[1], k[1]);
+    BM_KEY_CE(d[2], k[2], d[3], k[3]);
+    BM_KEY_CE(d[4], k[4], d[5], k[5]);
+    BM_KEY_CE(d[6], k[6], d[7], k[7]);
+    BM_KEY_CE(d[0], k[0], d[2], k[2]);
+    BM_KEY_CE(d[1], k[1], d[3], k[3]);
+    BM_KEY_CE(d[4], k[4], d[6], k[6]);
+    BM_KEY_CE(d[5], k[5], d[7], k[7]);
+    BM_KEY_CE(d[1], k[1], d[2], k[2]);
+    BM_KEY_CE(d[5], k[5], d[6], k[6]);
+    BM_KEY_CE(d[0], k[0], d[4], k[4]);
+    BM_KEY_CE(d[1], k[1], d[5], k[5]);
+    BM_KEY_CE(d[2], k[2], d[6], k[6]);
+    BM_KEY_CE(d[3], k[3], d[7], k[7]);
+    BM_KEY_CE(d[2], k[2], d[4], k[4]);
+    BM_KEY_CE(d[3], k[3], d[5], k[5]);
+    BM_KEY_CE(d[1], k[1], d[2], k[2]);
+    BM_KEY_CE(d[3], k[3], d[4], k[4]);
+    BM_KEY_CE(d[5], k[5], d[6], k[6]);
+}
+
+// Merges one sorted batch into the lane's running top-8 and keeps the eight
+// smallest. The batch is reversed, so the running list followed by it is
+// bitonic; one cross stage leaves the eight smallest in the running list and
+// three bitonic stages sort them. Constant indices and no branch on which list
+// wins, so the groups cannot diverge.
+void merge_batch(inout float e[8], inout int key[8], inout float d[8], inout int k[8]) {
+    BM_SWAP(d[0], k[0], d[7], k[7]);
+    BM_SWAP(d[1], k[1], d[6], k[6]);
+    BM_SWAP(d[2], k[2], d[5], k[5]);
+    BM_SWAP(d[3], k[3], d[4], k[4]);
+    BM_KEY_CE(e[0], key[0], d[0], k[0]);
+    BM_KEY_CE(e[1], key[1], d[1], k[1]);
+    BM_KEY_CE(e[2], key[2], d[2], k[2]);
+    BM_KEY_CE(e[3], key[3], d[3], k[3]);
+    BM_KEY_CE(e[4], key[4], d[4], k[4]);
+    BM_KEY_CE(e[5], key[5], d[5], k[5]);
+    BM_KEY_CE(e[6], key[6], d[6], k[6]);
+    BM_KEY_CE(e[7], key[7], d[7], k[7]);
+    BM_KEY_CE(e[0], key[0], e[4], key[4]);
+    BM_KEY_CE(e[1], key[1], e[5], key[5]);
+    BM_KEY_CE(e[2], key[2], e[6], key[6]);
+    BM_KEY_CE(e[3], key[3], e[7], key[7]);
+    BM_KEY_CE(e[0], key[0], e[2], key[2]);
+    BM_KEY_CE(e[1], key[1], e[3], key[3]);
+    BM_KEY_CE(e[4], key[4], e[6], key[6]);
+    BM_KEY_CE(e[5], key[5], e[7], key[7]);
+    BM_KEY_CE(e[0], key[0], e[1], key[1]);
+    BM_KEY_CE(e[2], key[2], e[3], key[3]);
+    BM_KEY_CE(e[4], key[4], e[5], key[5]);
+    BM_KEY_CE(e[6], key[6], e[7], key[7]);
+}
+
 // 8-way merge of the per-lane lists into the group's best `n` entries, in the
 // same (error, y, x) order. Every lane walks the same tournament -- three
 // shuffle rounds pick the smallest head across the eight lists -- so all lanes
@@ -1261,20 +1362,55 @@ void main() {
             const int total = (bottom - top + 1) * rw;
             int col_i = left + sl % rw;
             int row_i = top + sl / rw;
-            for (int s = sl; s < total; s += 8) {
-                float err;
-                SSD_AT(anchor_pc, col_i, row_i, err);
-                // Predicated, never branched: the threshold and the
-                // reference-block exclusion both ride `keep`, and a rejected
-                // candidate becomes a sentinel pair insert_cand drops without
-                // an `if`, so the warp cannot diverge here.
-                const bool keep = err <= TH_SSE && (col_i != x || row_i != y);
-                insert_cand(pe, pxy, keep ? err : FLT_MAX_,
-                            keep ? pack_xy(col_i, row_i) : INT_MAX_);
-                col_i += 8;
-                while (col_i > right) {
-                    col_i -= rw;
-                    row_i += 1;
+            if (BATCH != 0) {
+                // Nvidia shape: fill a batch of eight candidates per lane,
+                // sort it, and merge it into the running list once, instead of
+                // paying the insert's if-converted shift chain per candidate.
+                for (int base = 0; base < total; base += 8 * CAND_BATCH) {
+                    float bd[8];
+                    int bk[8];
+                    [[unroll]] for (int j = 0; j < CAND_BATCH; ++j) {
+                        const int cs = base + sl + 8 * j;
+                        float err = FLT_MAX_;
+                        bool keep = false;
+                        if (cs < total) {
+                            SSD_AT(anchor_pc, col_i, row_i, err);
+                            keep = err <= TH_SSE && (col_i != x || row_i != y);
+                        }
+                        bd[j] = keep ? err : FLT_MAX_;
+                        bk[j] = keep ? pack_xy(col_i, row_i) : INT_MAX_;
+                        col_i += 8;
+                        while (col_i > right) {
+                            col_i -= rw;
+                            row_i += 1;
+                        }
+                    }
+                    bool any = false;
+                    [[unroll]] for (int j = 0; j < CAND_BATCH; ++j) {
+                        any = any || bd[j] < FLT_MAX_;
+                    }
+                    if (any) {
+                        sort_batch(bd, bk);
+                        merge_batch(pe, pxy, bd, bk);
+                    }
+                }
+            } else {
+                for (int s = sl; s < total; s += 8) {
+                    float err;
+                    SSD_AT(anchor_pc, col_i, row_i, err);
+                    // Predicated, never branched: the threshold and the
+                    // reference-block exclusion both ride `keep`, and a
+                    // rejected candidate becomes a sentinel pair insert_cand
+                    // drops without an `if`, so the warp cannot diverge here.
+                    const bool keep =
+                        err <= TH_SSE && (col_i != x || row_i != y);
+                    insert_cand(pe, pxy, keep ? err : FLT_MAX_,
+                                keep ? pack_xy(col_i, row_i) : INT_MAX_);
+                    col_i += 8;
+                    while (col_i > right) {
+                        col_i -= rw;
+                        row_i += 1;
+                    }
                 }
             }
         }
@@ -1362,22 +1498,54 @@ void main() {
                     const int total = (bottom - top + 1) * rw;
                     int col_i = left + sl % rw;
                     int row_i = top + sl / rw;
-                    for (int s = sl; s < total; s += 8) {
-                        // Union of the clipped predictive windows, every origin
-                        // evaluated once (see is_first_owner).
-                        if (is_first_owner(group, col_i, row_i, i, px0, py0)) {
-                            float err;
-                            SSD_AT(spc, col_i, row_i, err);
-                            // Predicated threshold (see the spatial walk).
-                            const bool keep = err <= TH_SSE;
-                            insert_cand(pe, pxy, keep ? err : FLT_MAX_,
-                                        keep ? pack_xy(col_i, row_i)
-                                             : INT_MAX_);
+                    if (BATCH != 0) {
+                        for (int base = 0; base < total; base += 8 * CAND_BATCH) {
+                            float bd[8];
+                            int bk[8];
+                            [[unroll]] for (int j = 0; j < CAND_BATCH; ++j) {
+                                const int cs = base + sl + 8 * j;
+                                float err = FLT_MAX_;
+                                bool keep = false;
+                                if (cs < total &&
+                                    is_first_owner(group, col_i, row_i, i, px0, py0)) {
+                                    SSD_AT(spc, col_i, row_i, err);
+                                    keep = err <= TH_SSE;
+                                }
+                                bd[j] = keep ? err : FLT_MAX_;
+                                bk[j] = keep ? pack_xy(col_i, row_i) : INT_MAX_;
+                                col_i += 8;
+                                while (col_i > right) {
+                                    col_i -= rw;
+                                    row_i += 1;
+                                }
+                            }
+                            bool any = false;
+                            [[unroll]] for (int j = 0; j < CAND_BATCH; ++j) {
+                                any = any || bd[j] < FLT_MAX_;
+                            }
+                            if (any) {
+                                sort_batch(bd, bk);
+                                merge_batch(pe, pxy, bd, bk);
+                            }
                         }
-                        col_i += 8;
-                        while (col_i > right) {
-                            col_i -= rw;
-                            row_i += 1;
+                    } else {
+                        for (int s = sl; s < total; s += 8) {
+                            // Union of the clipped predictive windows, every
+                            // origin evaluated once (see is_first_owner).
+                            if (is_first_owner(group, col_i, row_i, i, px0, py0)) {
+                                float err;
+                                SSD_AT(spc, col_i, row_i, err);
+                                // Predicated threshold (see the spatial walk).
+                                const bool keep = err <= TH_SSE;
+                                insert_cand(pe, pxy, keep ? err : FLT_MAX_,
+                                            keep ? pack_xy(col_i, row_i)
+                                                 : INT_MAX_);
+                            }
+                            col_i += 8;
+                            while (col_i > right) {
+                                col_i -= rw;
+                                row_i += 1;
+                            }
                         }
                     }
                 }

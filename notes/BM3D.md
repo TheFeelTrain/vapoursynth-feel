@@ -110,27 +110,26 @@ half the bytes, which is where the visible speedup is (see Performance).
 - The combined group list (`ge`/`gxy`/`gz`) is the one private array left whose
   index is not a compile-time constant (the tail sort's `b`, the insert's `pos`).
   It stays per-lane: a shared copy measured 2.6x slower on Ada (see Historical).
-- The group's reference patch (the 64 floats the SSD subtracts from) is either
-  sixteen `vec4` locals per lane or a row-major shared copy, and the choice keys
-  off the **driver**, not the vendor: registers are only right if the backend
-  promotes them, else every one of the SSD's 64 reads per candidate is a memory
-  access (RADV/ACO promotes the array: 168 VGPRs, zero scratch). Shared memory is
-  the default everywhere except `VK_DRIVER_ID_MESA_RADV`, where it measures 8-10%
-  worse, and it is what makes the kernel run at all on a backend that will not
-  promote the register arm (Ada; see Historical for the alignment and ISA detail).
-- Each walk evaluates one candidate per iteration in place (skip the reference
-  origin, SSD, threshold, insert) with scalar coordinates; the row wrap is a
+- The reference patch (the 64 SSD floats) is sixteen `vec4` locals per lane or
+  a row-major shared copy, keyed by **driver**: the register arm needs the
+  backend to promote the array (RADV/ACO: 168 VGPRs, zero scratch) and LDS is
+  the default everywhere except `VK_DRIVER_ID_MESA_RADV`, where it is 8-10%
+  worse. On a backend that will not promote it (Ada) LDS is what makes the
+  kernel run at all (see Historical).
+- Each walk evaluates candidates with scalar coordinates; the row wrap is a
   `while` because the 8-lane step can overshoot a window narrower than 8 (the
-  unroll's cost is under Performance).
-- The group keeps concatenation order until it overflows past eight, and only
-  then keeps the reference plus the best seven of the tail. Each frame's list is
-  consumed best-first and an overflowing group's tail is sorted, so the loop
-  stops at the first entry that cannot beat the tail's worst; the rest cannot
-  either.
-- The group-axis transform is a length-N scaled DCT-II (generated tables for
-  N = 1..7, the fast butterfly at N = 8) with `A^T A = 2N I`: threshold and
-  Wiener shrinkage use `sigma * sqrt(N/8)` and inverse gain `1/(512N)`, and count
-  only the 64N real coefficients. Unused members are zeroed, never addressed.
+  unroll's cost is under Performance). The insert path updates the per-lane list
+  in place; the NVIDIA path fills eight candidates per lane and merges them
+  (19-comparator sort, 20-comparator merge) because the insert's shift chain
+  if-converts there. `BATCH` (spec constant 22) compiles out the other path.
+- The group keeps concatenation order until it overflows past eight, then
+  keeps the reference plus the best seven of the tail. A frame's list is
+  consumed best-first, so the loop stops at the first entry that cannot beat
+  the tail's worst; the rest cannot either.
+- The group-axis transform is a length-N scaled DCT-II (tables for N = 1..7,
+  the fast butterfly at N = 8) with `A^T A = 2N I`: threshold and Wiener use
+  `sigma * sqrt(N/8)` and inverse gain `1/(512N)`, counting only the 64N real
+  coefficients; unused members are zeroed, never addressed.
 - Filtering follows the CPU: strict `|c| > thr`, no exempt coefficient, weight
   one when every coefficient was thresholded away, Wiener
   `ref^2/(ref^2 + sigma^2)` per coefficient with its `den > 0` fallback, and
@@ -223,10 +222,9 @@ half the bytes, which is where the visible speedup is (see Performance).
   group's worst.
 - The SSD's 1-ulp divergence is deliberate: `precise` costs ~8 ALU ops per row
   to buy back ~10% of the tie floor.
-- The estimate phase's 0.40 ms used to be transform plus two `atomicAdd`s; the
-  CAS arm's +0.66 ms/frame bounded the atomics as most of it. The denominator
-  round removed half of them (one weight add per block, not per pixel), which is
-  most of the +18%.
+- The estimate phase's 0.40 ms is transform plus two `atomicAdd`s; the CAS
+  arm's +0.66 ms/frame bounded the atomics as most of it. The denominator round
+  removed half of them (one weight add per block), most of the +18%.
 - Timestamp figures before 2026-09-21 read 1000x low; do not quote them.
 - **The run-to-run swing was pipeline depth, not the kernels (+5%).** Two
   in-flight frames serialized the source-ring reuse distance (a third blocked in
@@ -250,25 +248,22 @@ half the bytes, which is where the visible speedup is (see Performance).
 - Other denoisers gain more from u16 because they stream each byte once or twice
   with a few ALU ops per tap (GaussBlur 2284 vs 1093, DFTTest 1132 vs 911).
   BM3D's matcher is the opposite end, so only its io can narrow.
-- Marginal cost per candidate per lane: 0.0032 ms (`bm_range`), 0.0030
-  (`ps_range`), with a ~1.4-2.0 ms intercept at tiny windows.
 - **The estimation launch shape comes from the device, not a fixed warp.** It is
-  a specialization constant; `choose_workgroup` starts at two waves (64 threads
-  at subgroup 32) since a one-wave CTA can be capped by the CU's workgroup slots,
-  then clamps by invocations, subgroup budget and per-group LDS. Seeds and patch
-  use a subgroup barrier (no group reads another's). RDNA3 gains little (the
-  register file binds first): 64 against 32 threads +0.6% (805.2/800.7, ABBA,
-  jpbd, 1000x3), 64 against 128 +0.9%; `VSFEEL_BM3D_WORKGROUP` overrides.
-- **LDS is a trap here.** Three attempts to move kernel-live data into shared
-  memory each raised VGPRs 216 -> 240 and dropped occupancy 7 -> 6 waves/SIMD,
-  losing 5-90%: the cost is dynamic LDS addressing, not traffic, so the wins came
-  from reducing the data instead. Two later attempts confirmed it: the reference
-  patch in shared memory cost 8-10% (ABBA, 1000 frames x3, n=12: 952.8 against
-  879.1 fps), and the group arrays (`g_e`/`g_xy`/`g_z`, 24 registers) 5.8% even
-  though they cut VGPRs 192 -> 144 (8 -> 10 waves) and code 118 -> 80 KB: the
-  group assembly is a serial chain of dynamic-index accesses, where LDS latency
-  costs more than the occupancy buys. On Ada the same move is worse still (2.6x
-  for the group list; see Historical).
+  a specialization constant; `choose_workgroup` starts at one wave (32 threads
+  at subgroup 32), then clamps by invocations, subgroup budget and per-group
+  LDS. A 3080 user reports one wave faster; RDNA3 measures the two within 0.6%
+  (64 against 32: 805.2/800.7, ABBA, jpbd, 1000x3), and 128 is +0.9% again.
+  Seeds and patch use a subgroup barrier (no group reads another's);
+  `VSFEEL_BM3D_WORKGROUP` overrides.
+- **The batched selection is NVIDIA-only, on purpose.** On RADV it costs 24
+  VGPRs (168 -> 192, six waves/SIMD -> five) and 8.7% (1052.5 against 1144.1
+  fps, A/B, 1000 frames x3, jpbd 1080p f32, r2, bm_range 9, ps_range 4,
+  block_step 8, sigma 0.7, `--gpu-cache --no-download`, n=6), so RADV keeps
+  the insert; the batch runs on NVIDIA_PROPRIETARY, still unmeasured there.
+- **LDS is a trap here.** Three attempts cost 5-90%: dynamic LDS addressing,
+  not traffic, is the cost. The reference patch in LDS costs 8-10% (ABBA,
+  1000x3, n=12: 952.8 vs 879.1) and the group arrays 5.8% even at 192 -> 144
+  VGPRs and 8 -> 10 waves; on Ada the group list is 2.6x (see Historical).
 - Color costs the planes: 4:2:0 is 1.5x the luma-only estimate/source footprint
   and 4:4:4/RGB 3x, all inside the same `maxStorageBufferRange` budget.
 - The multi-plane round did not move the luma path (NPLANES == 1: 6131 vs 6133
@@ -277,6 +272,42 @@ half the bytes, which is where the visible speedup is (see Performance).
 ## Historical
 
 Chronological; each entry keeps the mechanism, not the story.
+
+- **2026-10-19 — batched selection reinstated behind the NVIDIA driver gate.**
+  The insert's shift chain is the measured Ada limiter, so the batch runs when
+  the driver is NVIDIA_PROPRIETARY and the insert stays everywhere else. One
+  spec constant compiles the unused path out: the gated default matches the old
+  kernel, 1150.2 against 1137.4 fps (A/B, 1000 frames x3, jpbd 1080p f32,
+  radius 2, bm_range 9, ps_range 4, block_step 8, sigma 0.7,
+  `--gpu-cache --no-download`, n=6, -1.1% inside the spread). Forced on RADV it
+  reproduces the loss, 1052.5 against 1144.1. Ada is still unmeasured; see Open
+  work.
+
+- **2026-10-19 — shared-buffer selection pass; removed.** The running top-8
+  moved to LDS and each chunk of 48 candidates (six per lane) was merged by
+  eight selection rounds: a round took the group's global minimum through a
+  three-shuffle tournament, the owning lane marked its slot INF and refilled a
+  two-entry cache when it ran out. VGPRs stayed at 168 and LDS rose to 5120 B,
+  so occupancy held, but the pass costs more than the insert it replaces: 803
+  against 1152 fps (A/B, 1000 frames x3, jpbd 1080p f32, radius 2, bm_range 9,
+  ps_range 4, block_step 8, sigma 0.7, `--no-download`, n=6; with `--gpu-cache`
+  769 against 1141, n=10). The four groups share a subgroup, so one group
+  wanting a pass makes all four run it, and the per-chunk LDS scans, barriers
+  and eight shuffle rounds are the cost. The per-candidate early-out insert
+  wins at this geometry; no change shipped.
+
+- **2026-10-19 — batched selection in the search walk; removed.** One lane
+  filled eight candidates per pass, sorted them with a 19-comparator odd-even
+  network and merged the batch into its running top-8 with a 20-comparator
+  bitonic merge, instead of inserting each candidate as it arrived. It removes
+  the if-converted insert chain, but the batch and the running list are live at
+  once: VGPRs 168 -> 192, six waves/SIMD -> five, and the harness reads 987
+  against 1071 fps (A/B, 1000 frames x5, jpbd 1080p f32, radius 2, bm_range 9,
+  ps_range 4, block_step 8, sigma 0.7, `--gpu-cache --no-download`, n=10). The
+  insert's early-out is already the cheap path once the list is full; the batch
+  only pays if the extra registers come from somewhere else (the group list in
+  LDS costs 5.8% on its own). RADV kept the insert; the next round reinstated
+  the batch behind the NVIDIA driver gate.
 
 - **2026-10-19 — per-frame accumulators replace the slice stack.** The estimate
   kernel scatters each group member into the frame it came from instead of into
@@ -568,6 +599,9 @@ Chronological; each entry keeps the mechanism, not the story.
 
 ## Open work
 
+- **The NVIDIA batched selection is unmeasured.** Only RADV has run it (gate
+  off there); a 3080/4070 A/B decides whether the gate stays.
+  `VSFEEL_BM3D_BATCH=1` forces it.
 - **The search is the remaining kernel cost**, and the only one: the
   sigma-scaled threshold rejects most candidates on real content, so the filter
   cost behind it is small. The union's ownership test is 4 int ops per candidate
@@ -628,6 +662,8 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
   the driver rule (shared memory everywhere except RADV).
 - `VSFEEL_BM3D_SPLIT_KERNEL=0/1` — force either estimation path; unset follows
   the driver rule (split everywhere except RADV).
+- `VSFEEL_BM3D_BATCH=0/1` — force either candidate selection; unset follows the
+  driver rule (batched on NVIDIA_PROPRIETARY, insert elsewhere).
 - `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs.
   `NOSEARCH` is the matcher's reference-only path, the same thing `th_mse=0`
   selects, so it cannot price the search.
