@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- BM3D is about 18% faster and supports radius 16 at 1080p
 - GaussBlur is over 2x faster
 - Bilateral is about 15% faster
 

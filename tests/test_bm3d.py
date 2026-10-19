@@ -543,20 +543,18 @@ def test_bm3d_accepts_exactly_8x8():
     assert np.isfinite(a).all()
 
 
-def test_bm3d_rejects_int32_res_overflow():
-    """A stack above 2^31 floats must be rejected at creation.
+def test_bm3d_rejects_oversized_ring():
+    """A working buffer past the device's storage range is rejected at creation.
 
-    The kernel addresses `res` through signed 32-bit offsets, so a 4K radius-4
-    stack wrapped negatively. 8K keeps the overflow true under both estimate
-    cache sizings (7.2e9 floats at the minimum working set, 1.25e10 with the
-    default slack), unlike the 4K/ns=4 config whose overflow depended on the
-    slack being allocated.
+    The accumulator ring is one window of 2r+1 frame slots, so the 8K radius-4
+    stack that used to overflow 2^31 floats now fits; at radius 16 the 35-slot
+    source ring is what the range check catches first.
     """
-    with pytest.raises(vs.Error, match="32-bit"):
+    with pytest.raises(vs.Error, match="maxStorageBufferRange"):
         BM3D(
             _blank(7680, 4320),
             sigma=SIGMA,
-            radius=4,
+            radius=16,
             bm_range=BM_RANGE,
             ps_range=PS_RANGE,
             block_step=BLOCK_STEP,

@@ -31,20 +31,19 @@ Scoreboard — 1080p jpbd, `tools/benchmark.py -f bm3d`, harness defaults
 
 | arm | fps | |
 |---|---|---|
-| vsfeel | **953** | mawen matcher and filtering |
-| vsfeel, 16 bit in | **980** | same kernels, half the io bytes |
-| vsfeel, f16 in | **976** | same kernels, half the io bytes |
-| bm3dvk | 293 | fixed 8-member groups |
-| bm3dvk2 | 146 | |
-| vszipcl | 126 | |
+| vsfeel | **1022** | mawen matcher, per-frame accumulators |
+| vsfeel, 16 bit in | **1070** | same kernels, half the io bytes |
+| vsfeel, f16 in | **1071** | same kernels, half the io bytes |
+| bm3dvk | 263 | fixed 8-member groups |
+| bm3dvk2 | 883 | |
+| vszipcl | 109 | |
 
-- **3.3x the faster reference**, but not on equal work: they always group eight
+- **1.16x the faster reference**, but not on equal work: they always group eight
   while the default threshold accepts ~80% of candidates here and the top-eight
   selection does the filtering.
-- The default (CPU cache) mode agrees within 2% (vsfeel 947.8/971.3, bm3dvk
-  292.1, bm3dvk2 161.6, vszipcl 132.9): the frame is the filter's own GPU work.
-  bm3dvk2 is the other candidate for the vulkan column; it is slower than bm3dvk
-  in both modes.
+- bm3dvk2 is the close one now: its per-frame accumulators (the design this
+  round copied) are what took it from 146 to ~880; its fixed eight-member groups
+  still do less filtering work than the thresholded groups here.
 - The 16 bit and f16 rows are separate runs at the same settings, not second
   filters.
 
@@ -60,30 +59,25 @@ half the bytes, which is where the visible speedup is (see Performance).
 
 - Three kernels: `bm3d.comp` (match, group, transform; one workgroup of WG
   threads = WG/8 independent 8-lane groups, one 8x8 block each), `bm3d_agg.comp`
-  (aggregation over the TW = 2r+1 stack slices) and `bm3d_copy.comp`, which
-  widens a 2-byte clip's
-  planes into the ring as it copies them: an integer sample by gain 1/65535 less
-  the 32768 neutral on YUV chroma (the reference's `Int2Float`), a half sample by
-  an exact widening with neither. Only the store is depth-specific
-  (`-DIO_U16`/`-DIO_F16`/`-DIO_F32`): the u16 arm is the reference's `Float2Int`,
-  `clamp(v * 65535 + bias + 0.5, 0, 65535)` with the 32768 chroma bias, then
-  truncate (the clamp is load-bearing; a bare mask wraps a weight sum past 1.0 to
-  0), the f16 arm narrows with the SPIR-V default round-to-nearest-even.
+  (normalize: the box-summed per-block denominator) and `bm3d_copy.comp`, which
+  widens a 2-byte clip's planes into the ring as it copies them: an integer
+  sample by gain 1/65535 less the 32768 neutral on YUV chroma (the reference's
+  `Int2Float`), a half sample by an exact widening with neither. Only the store
+  is depth-specific (`-DIO_U16`/`-DIO_F16`/`-DIO_F32`): the u16 arm is the
+  reference's `Float2Int` with the clamp that keeps a weight sum a hair over 1.0
+  from wrapping, the f16 arm narrows with the SPIR-V default round-to-nearest.
 - The f16 arm is bit-for-bit the f32 arm up to that store: on the losslessly
   widened clip the measured worst against the f32 path is 2.85e-4 (one half
   step), 99.99% of pixels rounding identically, the rest differing only where the
   aggregation's ~3e-8 jitter crosses a half tie. That equivalence plus the CPU
   reference run on the widened clip (it refuses a half input) is the oracle.
-- A u16 clip is **full range**, like the f32 path and every other vsfeel
-  filter; an f16 clip is already in the reference's float domain, so no range
-  policy applies to it. The CPU reference scales an *integer* clip by the frame's
-  `_Range` property, limited range mapping `[16<<(b-8), 235<<(b-8)]` to `[0, 1]`
-  and clipping the output back, so the two sides only meet in one domain on a
-  `_Range=1` clip and the comparison tests pin it.
+- A u16 clip is **full range**, like the f32 path; an f16 clip is already in the
+  reference's float domain. The CPU reference scales an *integer* clip by its
+  `_Range` property, so the two sides only meet on a `_Range=1` clip.
 - One entry per processed plane, or one over all three planes of a 4:4:4 clip
-  under `chroma=True`. An entry owns a source ring and an estimate stack laid out
-  `[slot][clip][plane][h][stride]` and `[slot][plane][tw][2][h][stride]`; an
-  entry's planes share one geometry, so the plane stride is a spec constant.
+  under `chroma=True`. An entry owns a source ring `[slot][clip][plane][h][stride]`
+  and an accumulator ring `[slot][plane][2][h][stride]` (numerator, denominator);
+  its planes share one geometry, so the plane stride is a spec constant.
   NPLANES folds to 1 in the per-plane mode.
 - Per-plane `sigma`, `block_step`, `bm_range`, `ps_num`, `ps_range` follow the
   references' inheritance rule; a joint entry takes plane 0's search parameters
@@ -146,22 +140,39 @@ half the bytes, which is where the visible speedup is (see Performance).
   domain the CPU's per-DC-axis threshold collapses to a uniform one (pinned by a
   test).
 - A centre frame searches only real frames (`zlo = max(0, r-m)`,
-  `zhi = min(2r, nframes-1-m+r)`); the aggregation reads the real centres
-  `[n-r, n+r]` once each at slice `z = n-m+r` and leaves a slice outside that
-  range unwitnessed rather than a clamped endpoint copy.
-- The witness (`tags`) has one region per entry: entries key slots by frame index
-  and can hold different frames in the same slot.
+  `zhi = min(2r, nframes-1-m+r)`). Each group member's filtered patch is
+  scattered into the frame it was taken from, so an output frame's accumulator
+  receives one contribution per centre whose group holds a block in it. The
+  accumulator is a numerator plane plus a denominator plane per entry plane;
+  the denominator is one weight per block, added at the block's top-left.
+- `bm3d_agg.comp` is now a normalize: for each pixel the sum of the block
+  weights in the `BLOCK x BLOCK` origins `[p-BLOCK+1, p]` is a separable box
+  sum from a shared tile, and the numerator is divided by it. This halves the
+  accumulation atomics (one numerator add per pixel, one denominator add per
+  block instead of two per pixel) and removes the per-centre 2r+1 slice stack.
+- Temporal order is a cursor: process the next centre, scatter it, then
+  normalize every frame whose last contributor (`f + r`) is in. The pipeline is
+  one command buffer per request, not one submission per centre. A request the
+  cursor cannot reach (a seek, or a frame it has passed) is computed in a
+  private one-window ring with `focus` set: only members from the requested
+  frame are scattered, so the main ring keeps its state and the cursor stays
+  monotonic. That is what keeps vspipe's out-of-order prefetch from paying a
+  window restart per jump.
+- The accumulator ring is `2r+1` slots (capped by the clip length), keyed by
+  frame index; a slot is zeroed when it is first assigned and reused only after
+  its frame retired. Radius 0 keeps its private per-frame slots.
 - Estimation accumulates with hardware buffer float atomics wherever the device
   reports `shaderBufferFloat32AtomicAdd` (`VK_EXT_shader_atomic_float`; the plain
   load/store/exchange bit is not enough), else the reference's `atom_add_f` CAS
   loop (`-DNO_FLOAT_ATOMICS`; `VSFEEL_BM3D_CAS=1` forces it). Both arms declare
   the accumulation buffer `coherent`. No cheaper fallback exists without the bit:
   shared-memory atomics cannot help, a group's patches land anywhere.
-- Radius accepts up to 16, but the estimate cache binds first (it grows as
-  `(2+2r)(2r+1)` plane pairs): 1080p runs 7 and refuses 8, 640x360 reaches 16.
-  The rings hold the pipeline depth the core's pool can overlap (four frames,
-  `VSFEEL_BM3D_INFLIGHT`), stepping back to two before a `maxStorageBufferRange`
-  costs a radius step; every refusal names the size.
+- Radius accepts up to 16. The accumulator ring is `2r+1` slots of two planes,
+  so 1080p at radius 16 costs ~550 MiB per entry instead of the old
+  `(2+2r)(2r+1)` plane pairs that refused radius 8. The source ring is
+  `2r+3` slots (one search window plus the frame the next centre adds), and the
+  isolated path gets its own copy of it. A device's `maxStorageBufferRange` is
+  still checked; every refusal names the size.
 - Degenerate paths: `sigma < FLT_EPSILON` copies a plane through, and with no
   plane above it the filter is not built (the clip is handed back). Validation
   runs before that shortcut: `extractor_exp` `[0, 127]` as bm3dvk does, `th_mse`
@@ -169,14 +180,16 @@ half the bytes, which is where the visible speedup is (see Performance).
   and raised to `FLT_TRUE_MIN` when a positive value underflows (spec constant
   17).
 - Everything records through the core's exec pool; the filter owns no command
-  pool, timeline or fence. One submission per recomputed window position (up to
-  2r+1 per frame; `VSFEEL_BM3D_SPLIT=0` reverts) keeps a submission off Windows'
-  TDR watchdog, then one aggregation submission whose planes the pool publishes.
-- Cross-frame handoff is a per-slot *submitted* ready flag: a reader waits host
-  side for its writers' estimations, then a full pipeline barrier at the start of
-  its first command buffer supplies the dependency (both access scopes cover both
-  directions, because the slots are written again). No recording context is held
-  while waiting, so the pool cannot deadlock.
+  pool, timeline or fence. The temporal path records one centre's scatter, its
+  normalizes and the source copies into one command buffer and submits once per
+  request; the pool overlaps that with the next request. Radius 0 still records
+  one submission per frame (`VSFEEL_BM3D_SPLIT=0` collapses its chunks).
+- Cross-frame handoff inside a request is a full pipeline barrier: the normalize
+  reads the atomics the scatter just wrote, and the next centre's ring copy runs
+  after the previous centre's reads. Across submissions the first barrier covers
+  everything already queued on the one compute queue. The old per-slot
+  submitted-ready handoff remains for radius 0; the temporal path no longer
+  waits host side.
 - R80 GPU API: `clip:vnode:gpu` in and out with `ffGPUOutput`; an unprocessed
   plane is shared from the centre frame and only planes the aggregation writes are
   published. `num_streams` and `device_id` are registered no-ops. The 8-lane
@@ -187,6 +200,14 @@ half the bytes, which is where the visible speedup is (see Performance).
 
 ## Performance
 
+- **Per-frame accumulators: 868 -> 1022 fps (+18%).** The old path stored a
+  `2r+1`-slice stack per centre and re-aggregated it with two atomics per pixel;
+  the new one scatters into the target frame, adds the weight once per block and
+  normalizes with a box sum. Harness A/B (`--gpu-cache --no-download`, 1000
+  frames x3): slice 867.7, accumulators 922.9 before the cursor was finished,
+  1022-1028 after the isolated ring removed the restarts (median of five, 2%).
+  Kernel table at 1022 fps: blockMatch+filter 0.86 ms, normalize 0.044, convert
+  0.018, zero 0.011, and 1000 estimation dispatches for 1000 frames.
 - **The candidate bookkeeping, not the SSD, was the cost.** A per-candidate
   ablation ladder on the estimation kernel (fps, 1080p jpbd, harness config)
   prices the pieces as: search ~29% of the frame, estimate/transform 8.7%,
@@ -195,25 +216,22 @@ half the bytes, which is where the visible speedup is (see Performance).
   instructions whenever *any* lane passes the gate, so per-lane gating buys
   nothing. `gpu_busy_percent` is 100% through a default-config run (~10% during
   the harness's cache preload, what a mistimed poll sees), so kernel work pays.
-- The bookkeeping round (1000 frames x3): **845 -> 952 fps** (median of five).
-  Each change was verified by a fine-interleaved same-binary A/B over 2000-frame
-  runs: the ownership test's LDS seeds became registers (its 8 LDS loads each
-  carried a full `lgkmcnt(0)` drain, per candidate); the merge became a shuffle
-  tournament; the per-lane candidate lists left shared memory for registers
-  (which also removed the barriers around them); the walks share one
-  `scan_cand` helper; `group_add` stops at the first entry that cannot beat an
-  overflowed group's worst.
+- The bookkeeping round (1000 frames x3): **845 -> 952 fps**. The ownership
+  seeds went to registers (8 LDS loads with a `lgkmcnt(0)` drain each), the
+  merge became a shuffle tournament, the candidate lists left LDS for registers,
+  and `group_add` stops at the first entry that cannot beat an overflowed
+  group's worst.
 - The SSD's 1-ulp divergence is deliberate: `precise` costs ~8 ALU ops per row
   to buy back ~10% of the tie floor.
-- The estimate phase's 0.40 ms is transform plus two `atomicAdd`s; the CAS
-  arm's +0.66 ms/frame bounds the atomics as most of it.
+- The estimate phase's 0.40 ms used to be transform plus two `atomicAdd`s; the
+  CAS arm's +0.66 ms/frame bounded the atomics as most of it. The denominator
+  round removed half of them (one weight add per block, not per pixel), which is
+  most of the +18%.
 - Timestamp figures before 2026-09-21 read 1000x low; do not quote them.
-- **The run-to-run swing was pipeline depth, not the kernels (+5%).** The rings
-  were sized for two in-flight frames, whose source-ring reuse distance is a hard
-  serialization (a third frame blocks in `acquire_cache`), putting the host path
-  (1.5 ms est + 0.5 ms agg against a 1.04 ms GPU frame) at the GPU's pace. Six
-  1000-frame runs: 871-947 fps (8.7%); sized for the pool's four frames:
-  933-960 (2.8%). Depth 6-8 add <1% for 175 MiB.
+- **The run-to-run swing was pipeline depth, not the kernels (+5%).** Two
+  in-flight frames serialized the source-ring reuse distance (a third blocked in
+  `acquire_cache`), putting the host at the GPU's pace: 871-947 fps (8.7%);
+  sizing for the pool's four frames gave 933-960 (2.8%). Depth 6-8 add <1%.
 - **Do not unroll the walk.** The loop body is 309 instructions per candidate
   (SSD 45%, insert 27%, addressing 9%, waits 6%, scheduler `s_delay_alu` 14%),
   and several candidates per iteration only raise the register count: 1-wide is
@@ -221,24 +239,17 @@ half the bytes, which is where the visible speedup is (see Performance).
   puts 1-wide 1.6% ahead of 2-wide and 2.7% ahead of 4-wide. The earlier "the
   unroll helps" readings were against baselines that had drifted (Method rules).
 - **A u16 ring is a pessimisation; widen at copy time (+3%).** The SSD re-reads
-  each source sample once per candidate origin (~500 per block) out of an
-  L1-resident 26x26 window, so halving the bytes saves no DRAM traffic while the
-  load path grows from 3 issue slots per sample to ~6 (ISA: same 241 VMEM, +636
-  VALU); a scratch A/B reads the estimation kernel 0.95 -> 1.27 ms, filter
-  747 -> 644 fps. Widening at copy time pays 2.07M samples per frame instead:
-  970 against 932 fps (`--format u16`), and a real 16 bit chain 846 vs 634.
-- **f16 is the same io-only win, and at the benchmark config it sits inside the
-  noise.** Same-session interleaved runs (1080p jpbd, r=2, harness config, 1000
-  frames x3, `--gpu-cache --no-download`): f16 972.4-977.9, f32 959.7-972.8
-  (medians +1.1%, inside f32's own 2.5% spread), u16 969.7-973.5. The ring and
-  the estimate stacks (88% of per-frame bytes) stay f32, so a half chain's real
-  win is dropping the caller's `depth()` node and halving its upload/download; a
-  half ring would repeat the u16 mistake above.
-- Other denoisers gain more from u16 and for the same reason: their kernels
-  stream each byte once or twice with a handful of ALU ops per tap, so halving
-  the bytes is nearly free (GaussBlur 2284 vs 1093, DFTTest 1132 vs 911, NLMeans
-  243 vs 221). BM3D's matcher is the opposite end, so its 2-byte win is the io
-  alone and the 88% of its bytes that are not io cannot narrow.
+  each source sample once per candidate origin out of an L1-resident window, so
+  halving the bytes saves no DRAM traffic while the load path doubles (0.95 ->
+  1.27 ms). Widening once at copy time: 970 against 932 fps (`--format u16`),
+  and a real 16 bit chain 846 vs 634.
+- **f16 is the same io-only win, inside the noise at the benchmark config.**
+  f16 972.4-977.9, f32 959.7-972.8, u16 969.7-973.5 (1000 frames x3). The ring
+  and the accumulators stay f32, so a half chain's win is dropping the caller's
+  `depth()` node and halving its upload/download.
+- Other denoisers gain more from u16 because they stream each byte once or twice
+  with a few ALU ops per tap (GaussBlur 2284 vs 1093, DFTTest 1132 vs 911).
+  BM3D's matcher is the opposite end, so only its io can narrow.
 - Marginal cost per candidate per lane: 0.0032 ms (`bm_range`), 0.0030
   (`ps_range`), with a ~1.4-2.0 ms intercept at tiny windows.
 - **The estimation launch shape comes from the device, not a fixed warp.** It is
@@ -266,6 +277,19 @@ half the bytes, which is where the visible speedup is (see Performance).
 ## Historical
 
 Chronological; each entry keeps the mechanism, not the story.
+
+- **2026-10-19 — per-frame accumulators replace the slice stack.** The estimate
+  kernel scatters each group member into the frame it came from instead of into
+  the centre's `2r+1`-slice stack: one numerator add per pixel and one weight
+  add per block at the block origin. `bm3d_agg.comp` became a normalize whose
+  denominator is a separable `BLOCK x BLOCK` box sum of those block weights.
+  The temporal order moved from a per-centre cache to a cursor (one command
+  buffer per request), with an isolated one-window ring (`focus`) for requests
+  the cursor cannot reach, so vspipe's prefetch jumps never move it backward.
+  Measured 867.7 -> 1022 fps on the harness graph; the accumulator ring is
+  `2r+1` slots instead of `(2+2r)(2r+1)` plane pairs, so 1080p radius 16 now
+  fits. The old radius-0 path keeps its private slots and its ready-flag
+  handoff; the temporal cache tables are no longer used.
 
 - **2026-10-18 — f16 io ships as the u16 transport with an exact widening.** A
   new `bm3d_copy_f16` variant widens `float16_t` planes into the f32 ring with
@@ -573,15 +597,9 @@ Chronological; each entry keeps the mechanism, not the story.
   positions, not a positional rule; exactness needs the whole candidate sequence
   replayed through a 7-element heap (~940 keys/block in LDS plus a serial pass,
   ~+25% on a search-bound kernel) while staying tied to one STL's heap.
-- **Interleaving the estimate stack's `num`/`den` arrays.** Three layouts, all
-  neutral or worse (1080p r=2, 5000 frames x3, same-binary interleaved A/B):
-  `den` read from an adjacent address (same bytes, one stream) -4%; a
-  row-interleaved slice `[y][num row][den row]` (same size and slot offsets, the
-  rows 7.7 KB apart instead of 8.3 MB) -3%..+1%; and an aggregation dispatch
-  that does *no* work is **25% slower** -- its reads consume the lines the
-  estimation just wrote, so skipping them moves that writeback into the next
-  frame. The cost is volume (83 MB/frame of reads and of slot fill at r=2), not
-  pattern; only accumulating into output-frame accumulators would shrink it.
+- **Interleaving the estimate stack's `num`/`den` arrays.** Moot now that the
+  numerator and the per-block denominator share one frame accumulator; the old
+  measurement (-3..-4% for all three layouts) priced volume, not pattern.
 - Any LDS restructure here — see the mechanism under Performance.
 - `#pragma unroll`: glslc ignores it in GLSL and ACO already unrolls fixed-trip
   loops; the remaining variable-trip scans are unrolled by hand. `[[unroll]]`
@@ -600,12 +618,11 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
 - `VSFEEL_BM3D_TIMING=1` — per-frame host-stage split.
 - `VSFEEL_BM3D_PROFILE=1` — per-dispatch GPU kernel table at free, bm3dvk2's `BM3DVK_PROFILE` layout.
 - `VSFEEL_BM3D_VRAM=1` — creation-time VRAM budget.
-- `VSFEEL_BM3D_SPLIT=0` — one estimation submission per frame.
-- `VSFEEL_BM3D_RINGWAIT=1` — wait the ring copier's submission out host side
-  instead of riding the handoff barrier (the `tags` witness cannot see a late
-  ring copy).
-- `VSFEEL_BM3D_CACHE=1` — add the seek margin back to the estimate cache.
-- `VSFEEL_BM3D_INFLIGHT=<1..8>` — frames the rings are sized for (default 4).
+- `VSFEEL_BM3D_SPLIT=0` — radius 0: one estimation submission per frame.
+- `VSFEEL_BM3D_RINGWAIT=1` — radius 0: wait the ring copier's submission out
+  host side instead of riding the handoff barrier.
+- `VSFEEL_BM3D_INFLIGHT=<1..8>` — radius 0: private slots for this many frames
+  (default 4). The temporal rings are one window deep plus the isolated copy.
 - `VSFEEL_BM3D_CAS=1` — force the CAS aggregation build (A/B only).
 - `VSFEEL_BM3D_PATCH_LDS=0/1` — force either reference-patch arm; unset follows
   the driver rule (shared memory everywhere except RADV).

@@ -72,17 +72,22 @@ layout(constant_id = 18) const int TRACE = 0;
 // 8-lane groups per workgroup. The launch size itself is constant_id 19, set by
 // the host from the same number; this one sizes the per-group shared arrays.
 layout(constant_id = 20) const int GROUPS = 8;
+// Accumulator slots of the per-frame ring (radius 0: the private slot count).
+layout(constant_id = 21) const int RES_CAP = 6;
 
 const int KRADIUS = RADIUS;
 const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
 const int TW = 2 * KRADIUS + 1;
 // One entry's packed buffers are [slot][clip][plane][HEIGHT][STRIDE] (src) and
-// [slot][plane][TW][2][HEIGHT][STRIDE] (res): all planes of one entry share
-// their geometry, so a plane is one TEMPORAL_STRIDE hop away and the res slice
-// offsets the aggregation takes are TW * 2 * TEMPORAL_STRIDE apart.
+// [slot][plane][2][HEIGHT][STRIDE] (acc): all planes of one entry share their
+// geometry, so a plane is one TEMPORAL_STRIDE hop away. An accumulator slot is
+// a numerator plane then a denominator plane; the denominator holds one weight
+// per reference block at the block's origin, which normalize box-sums.
 const int CLIP_STRIDE = NPLANES * TEMPORAL_STRIDE;
 const int SLOT_STRIDE = (FINAL != 0 ? 2 : 1) * CLIP_STRIDE;
-const int RES_PLANE_STRIDE = TW * 2 * TEMPORAL_STRIDE;
+const int ACC_PLANE_STRIDE = 2 * TEMPORAL_STRIDE;
+const int ACC_SLOT_STRIDE = NPLANES * ACC_PLANE_STRIDE;
+
 
 // Reference blocks the split's buffer covers, and the word offset of the member
 // runs. Both are constant over the plane geometry, so the two halves index it
@@ -182,6 +187,7 @@ layout(push_constant) uniform PushConstants {
     int src_slot;  // radius 0: the stream's private source slot
     int tag_base;  // first tag index of this slot (slot * TW)
     int trace_xy;  // TRACE: packed origin to record, else -1
+    int focus;     // isolated frame: scatter only this target, else -1
 } pc;
 
 // Absolute frame index of window position z. Only z in [zlo, zhi] is a real
@@ -197,7 +203,8 @@ int slot_base(int z) {
     if (RADIUS == 0) {
         return pc.src_slot;
     }
-    return src_frame(z) % SRC_RING;
+    const int rel = src_frame(z) - pc.tag_base;
+    return ((rel % SRC_RING) + SRC_RING) % SRC_RING;
 }
 
 // float offset of `plane`'s frame at window position z in the clip used for
@@ -211,6 +218,20 @@ int src_search(int z, int plane) {
 // source clip: clip 1 in final mode, the same as the search clip otherwise)
 int src_input(int z, int plane) {
     return src_search(z, plane) + (FINAL != 0 ? CLIP_STRIDE : 0);
+}
+
+// Accumulator slot of a target frame: a ring keyed by frame index at radius>0,
+// the frame's private slot at radius 0.
+int acc_slot(int frame) {
+    if (RADIUS == 0) {
+        return pc.src_slot;
+    }
+    const int rel = frame - pc.res_off;
+    return ((rel % RES_CAP) + RES_CAP) % RES_CAP;
+}
+
+int acc_base(int slot, int plane) {
+    return slot * ACC_SLOT_STRIDE + plane * ACC_PLANE_STRIDE;
 }
 
 // Prediction seeds of the temporal chain, one row per 8-lane group. They live
@@ -1012,8 +1033,6 @@ void estimate_patch(bool is_active, int sl, int n,
         }
 #endif
 
-        const int rplane = pc.res_off + plane * RES_PLANE_STRIDE;
-
         float denoising_patch[64];
         float ref_patch[64];
 
@@ -1046,9 +1065,6 @@ void estimate_patch(bool is_active, int sl, int n,
         }
 
         if (is_active) {
-            const int wdstpc = rplane + sl;
-            const int weightpc = rplane + TEMPORAL_STRIDE + sl;
-
             for (int i = 0; i < 8; ++i) {
                 // Predicated, not branched (see the load above). The address is
                 // clamped so an out-of-group member's zero add stays in bounds.
@@ -1056,11 +1072,32 @@ void estimate_patch(bool is_active, int sl, int n,
                 const int mx = min(max(gxy[i] & 0xFFFF, 0), WIDTH - 8);
                 const int my = min(max(gxy[i] >> XY_SHIFT, 0), HEIGHT - 8);
                 const int mz = clamp(gz[i], 0, KRADIUS * 2);
-                const int offset = mz * 2 * TEMPORAL_STRIDE + my * STRIDE + mx;
+                // The estimate scatters into the frame the member was taken
+                // from, not into the centre's own stack: that frame's
+                // accumulator receives one contribution per centre whose group
+                // holds a block in it. An isolated frame (focus) keeps only its
+                // own members, which is all a one-frame ring needs.
+                const int f = src_frame(mz);
+                if (pc.focus >= 0 && f != pc.focus) {
+                    continue;
+                }
+                const int base = acc_base(acc_slot(f), plane) + my * STRIDE + mx;
+
+                // The denominator is one weight per block, added by one lane at
+                // the block's origin; normalize spreads it over the block. The
+                // numerator is the usual per-pixel weighted estimate.
+                float weight_val = m * adaptive_weight;
+                if (EXTRACTOR != 0.0) {
+                    precise float weight_rounded = (weight_val + EXTRACTOR) - EXTRACTOR;
+                    weight_val = weight_rounded;
+                }
+                if (sl == 0 && m != 0.0f) {
+                    // The denominator plane follows the numerator in the slot.
+                    res_add(base + TEMPORAL_STRIDE, weight_val);
+                }
 
                 for (int j = 0; j < 8; ++j) {
                     float wdst_val = m * adaptive_weight * denoising_patch[i * 8 + j];
-                    float weight_val = m * adaptive_weight;
 
                     // extractor_exp pre-rounding: makes the float atomic sums
                     // order-independent. `precise` is load-bearing — without
@@ -1070,13 +1107,10 @@ void estimate_patch(bool is_active, int sl, int n,
                     // keeps the original code.
                     if (EXTRACTOR != 0.0) {
                         precise float wdst_rounded = (wdst_val + EXTRACTOR) - EXTRACTOR;
-                        precise float weight_rounded = (weight_val + EXTRACTOR) - EXTRACTOR;
                         wdst_val = wdst_rounded;
-                        weight_val = weight_rounded;
                     }
 
-                    res_add(wdstpc + offset + j * STRIDE, wdst_val);
-                    res_add(weightpc + offset + j * STRIDE, weight_val);
+                    res_add(base + sl + j * STRIDE, wdst_val);
                 }
             }
         }

@@ -3,28 +3,19 @@
 #extension GL_EXT_shader_16bit_storage : require
 
 /*
- * BM3D temporal aggregation kernel. For each output pixel, sums the
- * pre-aggregated estimates (wdst) and weights (weight) of the real estimate
- * stacks that saw this frame and divides. A stack centred on frame m holds its
- * contribution to frame n in slice z = n - m + R; every centre in
- * [n - R, n + R] that exists is accumulated exactly once, so an endpoint frame
- * is never counted several times through a clamped window position.
+ * BM3D normalize kernel. Each processed pixel is the accumulated numerator of
+ * its frame divided by the sum of the weights of every reference block that
+ * covers it.
  *
- * One thread covers four adjacent columns through vec4 accesses (the plane
- * pitch is already a multiple of four floats, so every slice base, row offset
- * and column is 16-byte aligned). Scalar loads left the kernel bound by its
- * interleaved load streams rather than by bytes: the same bytes move in a
- * quarter of the instructions.
+ * The estimation kernel scatters each group member's filtered patch into the
+ * frame it came from: one numerator add per pixel, and one denominator add per
+ * block at the block's origin. The denominator of a pixel is therefore the sum
+ * of the weights of the BLOCK x BLOCK block origins in [p - BLOCK + 1, p],
+ * computed here from a shared tile separably (rows, then columns). Origins off
+ * the block grid are zero, so the contiguous box is the right sum.
  *
  * -DIO_U16 / -DIO_F16 / -DIO_F32 selects the destination plane's element type.
- * The estimate stacks and the source ring are float either way: the stacks hold
- * the reference's weighted sums, and the ring is already widened at copy time
- * (see bm3d_copy.comp), which is what keeps the matcher's inner loop free of a
- * conversion per candidate sample.
- *
- * A float destination stores the accumulated result as it is (a half element
- * narrows with an exact OpFConvert); the integer one rounds through the
- * reference's Float2Int and re-adds the chroma neutral the copy removed.
+ * The accumulator and the source ring are float at every depth.
  */
 
 #if !defined(IO_U16) && !defined(IO_F32) && !defined(IO_F16)
@@ -37,59 +28,55 @@
 #define PEAK 1.0f
 #endif
 
-layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(constant_id = 0) const int HEIGHT = 1080;
 layout(constant_id = 1) const int STRIDE = 1920;
-layout(constant_id = 2) const int TW = 5;
+layout(constant_id = 2) const int TW = 5; // unused, kept for the shared spec map
 layout(constant_id = 3) const int RADIUS = 2;
 layout(constant_id = 4) const int RES_CAP = 6;
-// Planes packed into one estimate slot: 1 for the reference's per-plane entries,
-// 3 for a joint chroma entry ([slot][plane][TW][2][HEIGHT][STRIDE]).
 layout(constant_id = 5) const int NPLANES = 1;
-// First witness slot of this entry's own region of the shared tag buffer: each
-// entry keys its estimate slots by frame index, so entries that hold different
-// frames in the same slot index must not share witnesses.
-layout(constant_id = 6) const int TAG_BASE = 0;
-// YUV chroma plane: the ring holds it centred on zero (see bm3d_copy.comp), so
-// the integer store adds the neutral code back before rounding.
+layout(constant_id = 6) const int TAG_BASE = 0; // unused
 layout(constant_id = 7) const int CHROMA = 0;
 
-layout(std430, binding = 0) readonly buffer ResBuf { vec4 res4[]; };
+layout(std430, binding = 0) readonly buffer AccBuf { float acc[]; };
 layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
-layout(std430, binding = 3) readonly buffer TagBuf { uint tags[]; };
-layout(std430, binding = 4) buffer SkipBuf { uint skipped[]; };
-layout(std430, binding = 5) buffer RefuseBuf { uint refusal[]; };
-// The destination plane keeps its vec4 form in the f32 build (the store stays
-// one 16-byte access per thread); the 2-byte builds address four native samples.
 #if defined(IO_U16)
 layout(std430, binding = 2) buffer DstBuf { uint16_t dst16[]; };
 #elif defined(IO_F16)
 layout(std430, binding = 2) buffer DstBuf { float16_t dst16[]; };
 #else
-layout(std430, binding = 2) buffer DstBuf { vec4 dst4[]; };
+layout(std430, binding = 2) buffer DstBuf { float dst[]; };
 #endif
 
 layout(push_constant) uniform PushConstants {
-    int n;          // centre frame index
-    int nframes;    // total frame count (temporal bounds)
-    int slot0;      // radius 0: the frame's private estimate slot
-    int plane_off4; // this plane's result region, in vec4 elements
-    int src_base;   // element offset of this frame's source plane in the src ring
+    int n;         // output frame index
+    int acc_base;  // first frame of the accumulator ring this frame lives in
+    int slot0;     // radius 0: this frame's private accumulator slot
+    int plane_off; // this plane's (numerator, denominator) pair in the slot
+    int src_base;  // this frame's source plane in the src ring
 } pc;
 
-const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
+const int BLOCK = 8;
+const int TILE = 16;
+const int SPAN = TILE + BLOCK - 1;
+const int PE = HEIGHT * STRIDE;
+const int ACC_SLOT = NPLANES * 2 * PE;
 
-// Ring slot holding the estimate stack centred on frame m: the host keys a slot
-// by that centre frame. Radius 0's slots are private to one in-flight frame
-// rather than keyed by frame index, so the host hands its own slot over.
-// RES_CAP is a constant here, so the modulo is a multiply-shift.
-int slot_of(int m) {
+// The accumulator slot the output frame was scattered into.
+int slot_of(int frame) {
     if (RADIUS == 0) {
         return pc.slot0;
     }
-    return int(uint(m) % uint(RES_CAP));
+    const int rel = frame - pc.acc_base;
+    return ((rel % RES_CAP) + RES_CAP) % RES_CAP;
 }
+
+int num_at(int x, int y) {
+    return slot_of(pc.n) * ACC_SLOT + pc.plane_off + y * STRIDE + x;
+}
+
+float den_at(int x, int y) { return acc[num_at(x, y) + PE]; }
 
 // One accumulated result to a native output sample, or to a float if the clip
 // is float. The integer arm is the reference's Float2Int: it scales by 65535,
@@ -98,116 +85,63 @@ int slot_of(int m) {
 // kernel removed. That clip is not optional -- the weight sums num/den can land
 // an ulp above 1.0, and a bare mask-and-truncate would wrap that to 0. The
 // float arms store the value as-is (a half element narrows with the SPIR-V
-// default round-to-nearest-even and no saturation, i.e. vstore_half_rte).
-void store_result(int x, int y, vec4 v) {
-#if defined(IO_U16) || defined(IO_F16)
+// default round-to-nearest-even and no saturation).
+void store_result(int x, int y, float v) {
     const int o = y * STRIDE + x;
-#endif
 #if defined(IO_U16)
     const float bias = (CHROMA != 0) ? 32768.0f : 0.0f;
-    const vec4 s = clamp(v * PEAK + bias + 0.5f, vec4(0.0f), vec4(PEAK));
-    dst16[o + 0] = uint16_t(uint(s.x));
-    dst16[o + 1] = uint16_t(uint(s.y));
-    dst16[o + 2] = uint16_t(uint(s.z));
-    dst16[o + 3] = uint16_t(uint(s.w));
+    const float s = clamp(v * PEAK + bias + 0.5f, 0.0f, PEAK);
+    dst16[o] = uint16_t(uint(s));
 #elif defined(IO_F16)
-    dst16[o + 0] = float16_t(v.x);
-    dst16[o + 1] = float16_t(v.y);
-    dst16[o + 2] = float16_t(v.z);
-    dst16[o + 3] = float16_t(v.w);
+    dst16[o] = float16_t(v);
 #else
-    dst4[(y * STRIDE + x) >> 2] = v;
+    dst[o] = v;
 #endif
 }
 
+// The weight tile of the BLOCK-1 columns/rows before this workgroup's output
+// tile, so every pixel's box is a contiguous span of it.
+shared float blockWeights[SPAN][SPAN];
+shared float rowSums[SPAN][TILE];
+
 void main() {
-    const int x = 4 * int(gl_GlobalInvocationID.x);
-    const int y = int(gl_GlobalInvocationID.y);
-    // x may reach into the row padding (never read back), which keeps the
-    // store in bounds without a per-row tail path.
-    if (x >= STRIDE || y >= HEIGHT) {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 origin = ivec2(gl_WorkGroupID.xy) * TILE - ivec2(BLOCK - 1);
+    const int lx = int(gl_LocalInvocationID.x);
+    const int ly = int(gl_LocalInvocationID.y);
+
+    // Every invocation takes part in both barriers, including those covering
+    // the padding columns past STRIDE.
+    for (int i = int(gl_LocalInvocationIndex); i < SPAN * SPAN; i += TILE * TILE) {
+        const int c = i % SPAN;
+        const int r = i / SPAN;
+        const ivec2 q = origin + ivec2(c, r);
+        const bool inside = q.x >= 0 && q.y >= 0 && q.x < STRIDE && q.y < HEIGHT;
+        blockWeights[r][c] = inside ? den_at(q.x, q.y) : 0.0;
+    }
+    barrier();
+
+    // Row sums: rowSums[r][x] covers block weights x .. x + BLOCK - 1.
+    for (int r = ly; r < SPAN; r += TILE) {
+        float sum = 0.0;
+        for (int c = 0; c < BLOCK; ++c) {
+            sum += blockWeights[r][lx + c];
+        }
+        rowSums[r][lx] = sum;
+    }
+    barrier();
+
+    float den = 0.0;
+    for (int r = 0; r < BLOCK; ++r) {
+        den += rowSums[ly + r][lx];
+    }
+
+    if (p.x >= STRIDE || p.y >= HEIGHT) {
         return;
     }
-
-    // The res stacks are completed before this dispatch: the estimation kernels
-    // (and the slot zero-fill) that wrote them are separated from these reads by
-    // an ALL_COMMANDS memory barrier recording shader-write -> shader-read, and
-    // the cross-queue source dependencies are carried as device waits on the
-    // aggregation submit. A coherent (atomic) load is therefore unnecessary —
-    // atomicAdd(res[o], 0.0f) forced a device-scope read-modify-write per element
-    // just to read a value nobody was racing to modify; a plain load is cheaper
-    // with identical output.
-    const int o = (y * STRIDE + x) >> 2;
-    const int tstride4 = TEMPORAL_STRIDE >> 2;
-    // vec4 units throughout: with the host's addressing guard holding, every
-    // factor and product below stays inside int32 for any accepted config (see
-    // the estimate-cache guard in bm3d.cpp).
-    const int slot_stride4 = NPLANES * TW * 2 * tstride4;
-    const int slice_stride4 = 2 * tstride4;
-
-    // Only the centres that exist contribute; each of them writes exactly one
-    // slice for this output frame.
-    const int mlo = max(pc.n - RADIUS, 0);
-    const int mhi = min(pc.n + RADIUS, pc.nframes - 1);
-    const uint want = uint(pc.n + 1);
-
-    vec4 acc = vec4(0.0);
-    vec4 acw = vec4(0.0);
-    int used = 0;
-    for (int m = mlo; m <= mhi; ++m) {
-        const int z = pc.n - m + RADIUS;
-        const int slot = slot_of(m);
-        // Only slices the estimation kernel witnessed for this output frame may
-        // contribute: a slice left as the zero fill, one whose estimation never
-        // landed, or one still holding a recycled frame's stacks is skipped
-        // rather than averaged in.
-        if (tags[(TAG_BASE + slot) * TW + z] != want) {
-            continue;
-        }
-        const int b =
-            slot * slot_stride4 + pc.plane_off4 + z * slice_stride4 + o;
-        acc += res4[b];
-        acw += res4[b + tstride4];
-        used++;
-    }
-
-    // A slot whose estimation never landed (still the zero fill, or only partly
-    // accumulated) leaves acw at 0 or short, and acc/acw then divides by zero or
-    // averages a partial stack: that is the intermittent band -- black where the
-    // whole slot was lost, dimmed where part of it was, and carrying a previous
-    // frame's patch groups where the slot was recycled. Every pixel of a
-    // complete stack has a nonzero weight (its own block always contributes), so
-    // a zero weight here is proof the contribution is missing, and the honest
-    // output for it is the source frame's own pixel: undenoised, never corrupt.
-    // A centre only contributes to this output frame when its group matched a
-    // block in it, so a short stack is normal once the threshold rejects: only
-    // a stack with no contribution at all is the failure the source fallback
-    // exists for (the output would otherwise be the zero fill).
-    if (o == 0 && used == 0) {
-        // Count refusals, and record the first one: the witness value found
-        // against the one wanted tells the two causes apart -- 0 means the
-        // slice was never written, anything else means it holds another
-        // frame's stacks. refusal[0] is the one-shot claim.
-        atomicAdd(skipped[0], 1u);
-        if (atomicCompSwap(refusal[0], 0u, 1u) == 0u) {
-            for (int m = mlo; m <= mhi; ++m) {
-                const int z = pc.n - m + RADIUS;
-                const int at = (TAG_BASE + slot_of(m)) * TW + z;
-                if (tags[at] != want) {
-                    refusal[2] = uint(want);
-                    refusal[3] = tags[at];
-                    break;
-                }
-            }
-        }
-    }
-    if (used > 0 && acw.x > 0.0 && acw.y > 0.0 && acw.z > 0.0 && acw.w > 0.0) {
-        store_result(x, y, acc / acw);
-    } else {
-        // The fallback is the source frame's own pixel, to the same output
-        // scale as the rest of the frame.
-        const int so = pc.src_base + y * STRIDE + x;
-        store_result(x, y,
-                     vec4(src[so], src[so + 1], src[so + 2], src[so + 3]));
-    }
+    // A denominator of zero means no block covered the pixel, which only the
+    // padded columns can have; the honest output there is the source pixel.
+    const float v = den > 0.0 ? acc[num_at(p.x, p.y)] / den
+                              : src[pc.src_base + p.y * STRIDE + p.x];
+    store_result(p.x, p.y, v);
 }
