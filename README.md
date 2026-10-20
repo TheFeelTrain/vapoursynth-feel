@@ -12,21 +12,20 @@ pip install vapoursynth-feel
 
 ## Performance
 
-| Filter     | vsfeel u16 | vszipcl u16 | vulkan u16 | vsfeel f32  | vszipcl f32  | vulkan f32  | Speedup |
-|------------|-----------:|------------:|-----------:|------------:|-------------:|------------:|--------:|
-| Bilateral  | 2626       | 740         | -          | 2616        | 473          | -           | 4.32x   |
-| BM3D       | 980        | -           | -          | 953         | 126          | 293         | 3.25x   |
-| DFTTest    | 1489       | 869         | -          | 1411        | 589          | -           | 1.99x   |
-| EEDI3 (AA) | 174        | 26          | 37         | 128         | 24           | 32          | 4.38x   |
-| GaussBlur  | 20161      | 1546        | -          | 17597       | 948          | -           | 15.14x  |
-| NLMeans    | 1036       | 460         | 581        | 948         | 453          | 574         | 1.72x   |
-| NNEDI3     | 4666       | -           | 2218       | 3967        | -            | 1207        | 2.52x   |
+| Filter     | Reference | u16                   | f16                   | f32                  |
+|------------|-----------|----------------------:|----------------------:|---------------------:|
+| Bilateral  | vszipcl   | 2626 / 740 (3.55x)    | 2642 / 754 (3.50x)    | 2616 / 473 (5.53x)   |
+| BM3D       | bm3dvk2   | 1096 / -              | 1084 / 883 (1.23x)    | 1088 / 922 (1.18x)   |
+| DFTTest    | vszipcl   | 1489 / 869 (1.71x)    | 1431 / -              | 1411 / 589 (2.40x)   |
+| EEDI3      | eedi3vk2  | 2277 / 347 (6.55x)    | 2084 / 238 (8.76x)    | 1937 / 343 (5.64x)   |
+| EEDI3 (AA) | eedi3vk2  | 175 / 37 (4.77x)      | 155 / 21 (7.34x)      | 125 / 32 (3.90x)     |
+| GaussBlur  | vszipcl   | 20161 / 1546 (13.04x) | 18939 / 1599 (11.85x) | 17597 / 948 (18.56x) |
+| NLMeans    | knlmvk    | 1036 / 581 (1.78x)    | 1015 / 574 (1.77x)    | 948 / 574 (1.65x)    |
+| NNEDI3     | nnedi3vk  | 4666 / 2218 (2.10x)   | 4862 / 2269 (2.14x)   | 3967 / 1207 (3.29x)  |
 
-<sub>Output of `tools/benchmark.py --gpu-cache --no-download --filter <filter> --format <u16|f16|f32>` on an RX 7900 XTX with 1080p input.</sub> 
+<sub>Output of `tools/benchmark.py --gpu-cache --no-download --filter <filter> --format <u16|f16|f32>` on an RX 7900 XTX with 1080p input.</sub>
 
 Filters that do not use VapourSynth's GPU API include frame transfer time in their measurements.
-
-vulkan column: bm3dvk, eedi3vk2, knlmvk, nnedi3vk
 
 ## Filters
 

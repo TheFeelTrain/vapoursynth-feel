@@ -12,9 +12,9 @@ GPU API**: `clip/sclip/mclip:vnode:gpu` in and `ffGPUOutput` out, one exec pool,
 and no host upload/download/gather/blit machinery at all. The parallel vcheck is
 the default.
 
-Benchmark defaults: 2000 f, real based_aa clip, 2x2160p, field=3, mdis=20,
-vcheck=2. `MANGOHUD=0 uv run tools/benchmark.py --filter eedi3 --gpu-cache
---no-download --format <u16|f16|f32>`:
+Benchmark defaults (the 2x based_aa setup; current `--filter eedi3`/`eedi3h`
+run at 1080p with the mask, and `--filter eedi3aa` is the fused 2x chain):
+2000 f, real based_aa clip, 2x2160p, field=3, mdis=20, vcheck=2.
 
 | clip | vsfeel | vszipcl | eedi3vk2 |
 |---|---|---|---|
@@ -50,8 +50,8 @@ The hp row costs vsfeel **2.6x** (618 → 237): the direction set doubles (TPITC
 ## Implementation
 
 Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter eedi3 vsfeel
-vszipcl` (and `--filter eedi3aa`, `--filter eedi3h` where registered;
-`--eedi3-args "hp=1"` for the half-pel search).
+eedi3vk2` (1080p + mask; `--filter eedi3h` horizontal, `--filter eedi3aa` the
+2x based_aa chain; `--eedi3-args "hp=1"` for the half-pel search).
 
 Two GPU passes per plane: `ENTRY_PAD` expands eedi3m's mirrors in VRAM from the
 tight kept-row upload; `ENTRY_ROW` does the DP + backtrack; `ENTRY_VCHECK`

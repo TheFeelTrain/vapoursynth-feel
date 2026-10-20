@@ -294,6 +294,7 @@ def make_aa_vpy(
     cache_bytes: int | None = None,
     gpu_cache: bool = False,
     download_inputs: bool = False,
+    upscale: bool = True,
 ) -> str:
     """Real-clip vpy that mirrors vsaa.based_aa's EEDI3 usage:
 
@@ -316,6 +317,10 @@ def make_aa_vpy(
     `sclip` directly; the reference arms are the vsaa antialiaser, which takes
     the single-rate `clip` as its sclip and interleaves it itself, just as
     based_aa does.
+
+    ``upscale=False`` keeps the mask but skips the Point upscale: the plain
+    EEDI3/EEDI3H mclip benchmarks run at the source resolution, and their
+    chains use `clip`/`mclip` only (`sclip` stays defined but unused).
     """
     if cache_frames is not None:
         if cache_bytes:
@@ -361,7 +366,7 @@ def make_aa_vpy(
                 f"sclip_gpu = {{sclip_expr}}\n"
             ) + names
             gpu_sclip = (
-                "core.std.Interleave([clip_gpu, clip_gpu])" if eedi3_field > 1 else "clip_gpu"
+                "core.std.Interleave([clip_gpu, clip_gpu])" if upscale and eedi3_field > 1 else "clip_gpu"
             )
             cache_build = cache_build.replace("{sclip_expr}", gpu_sclip)
         else:
@@ -384,7 +389,7 @@ _blankm = mclip.std.BlankClip(length=1) * m
 _msk_served = _blankm.std.ModifyFrame(_blankm, _serve_msk)
 _msk_served = _pin_cache(_msk_served, m)
 {cache_build}
-sclip = {"core.std.Interleave([clip, clip])" if eedi3_field > 1 else "clip"}
+sclip = {"core.std.Interleave([clip, clip])" if upscale and eedi3_field > 1 else "clip"}
 """
     else:
         # --no-cache (or --cache-frames 0): no preload to move off the clock,
@@ -392,7 +397,7 @@ sclip = {"core.std.Interleave([clip, clip])" if eedi3_field > 1 else "clip"}
         # run is reported as GPU-fed while the graph holds no GPU node at all.
         if gpu_cache:
             gpu_sclip = (
-                "core.std.Interleave([clip_gpu, clip_gpu])" if eedi3_field > 1 else "clip_gpu"
+                "core.std.Interleave([clip_gpu, clip_gpu])" if upscale and eedi3_field > 1 else "clip_gpu"
             )
             if download_inputs:
                 names = (
@@ -408,9 +413,18 @@ sclip = {"core.std.Interleave([clip, clip])" if eedi3_field > 1 else "clip"}
                 f"sclip_gpu = {gpu_sclip}\n"
             ) + names
         else:
-            sclip_expr = "core.std.Interleave([ss, ss])" if eedi3_field > 1 else "clip"
+            sclip_expr = "core.std.Interleave([ss, ss])" if upscale and eedi3_field > 1 else "clip"
             cache_lines = f"clip = ss\nsclip = {sclip_expr}\n"
     luma_expr = _depth_expr("get_y(src)", io_format)
+    if upscale:
+        resize_lines = (
+            '# Point 2x upscale of input + mask (user: "double the size of the input frames\n'
+            '# in the cache ... a simple Point upscale is good enough")\n'
+            "ss = core.resize.Point(luma, luma.width * 2, luma.height * 2)\n"
+            "mclip = core.resize.Point(mask, mask.width * 2, mask.height * 2)\n"
+        )
+    else:
+        resize_lines = "ss = luma\nmclip = mask\n"
     return f"""\
 from vssource import BestSource
 from vstools import core, depth, get_y
@@ -442,11 +456,7 @@ mask = EdgeDetect.ensure_obj(Prewitt).edgemask(luma)
 mask = Morpho.binarize_mask(mask, scale_mask(60, 8, 32))
 mask = box_blur(mask.std.Maximum())
 
-# Point 2x upscale of input + mask (user: "double the size of the input frames
-# in the cache ... a simple Point upscale is good enough")
-ss = core.resize.Point(luma, luma.width * 2, luma.height * 2)
-mclip = core.resize.Point(mask, mask.width * 2, mask.height * 2)
-
+{resize_lines}
 {cache_lines}
 {extra}
 
@@ -553,10 +563,11 @@ class FilterSpec:
     build: Callable[[argparse.Namespace, str, "FilterSpec"], dict[str, str]]
     input: str = "depth(get_y(clip), 16)"  # clip expression the filter is applied to
     synth_format: str | None = "vs.GRAY16"  # BlankClip format for --synthetic (None disables)
-    # When set, the real-clip benchmark uses a custom vpy (see make_aa_vpy) that
-    # doubles the input with a Point upscale and feeds the filter auxiliary clips
-    # derived from it. Only sensible for EEDI3-style AA benchmarks.
+    # When set, the real-clip benchmark uses the custom mask vpy (see
+    # make_aa_vpy). aa_scale=2 mirrors based_aa's 2x supersampling; 1 runs the
+    # filter at the source resolution with the mask (plain EEDI3/EEDI3H mclip).
     aa: bool = False
+    aa_scale: int = 2
     # Plugins whose call for this filter takes a GPU-resident input, i.e. the
     # filter is declared vnode:gpu or vnode:all. Under --gpu-cache only these get
     # `clip_gpu` (no core GPUUpload stage); every other arm keeps the CPU cache,
@@ -642,14 +653,9 @@ def _nlmeans_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
 
 
 def _eedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
-    """EEDI3 anti-aliasing chain (mirrors vsaa.based_aa defaults).
+    """Plain 1x EEDI3 with the optional 1080p mask; based_aa is `eedi3aa`.
 
-    Real-clip runs (aa FilterSpec) use make_aa_vpy, which defines `clip`
-    (2x Point-upscaled luma), `sclip` (= clip) and `mclip` (2x upscaled vsaa
-    edge mask). vsfeel and eedi3vk2 take both sclip and mclip (based_aa passes
-    mclip when the backend supports it); vszipcl/vszipcu support sclip only.
-    mclip=0 drops the mclip from the vsfeel/eedi3vk2 calls.
-
+    vsfeel and eedi3vk2 take mclip; vszipcl has no such parameter.
     """
     use_mclip = getattr(ns, "eedi3_mclip", True)
     common = (
@@ -661,29 +667,25 @@ def _eedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[st
     if ns.eedi3_hp:
         common += ", hp=1"
     if getattr(ns, "synthetic", False):
+        # The synthetic vpy defines only `clip` (there is no mask).
         return {
             "vsfeel": f"core.vsfeel.EEDI3({clip}, {common})",
             "eedi3vk2": f"core.eedi3vk2.EEDI3({clip}, {common})",
             "vszipcl": f"core.vszipcl.EEDI3({clip}, {common})",
         }
-    if use_mclip:
-        mcap = "sclip=sclip, mclip=mclip"
-    else:
-        mcap = "sclip=sclip"
-    with_mclip = f"{common}, {mcap}"
-    with_sclip = f"{common}, sclip=sclip"
+    masked = f"{common}, mclip=mclip" if use_mclip else common
     return {
-        "vsfeel": f"core.vsfeel.EEDI3({clip}, {with_mclip})",
-        "eedi3vk2": f"core.eedi3vk2.EEDI3({clip}, {with_mclip})",
-        "vszipcl": f"core.vszipcl.EEDI3({clip}, {with_sclip})",
+        "vsfeel": f"core.vsfeel.EEDI3({clip}, {masked})",
+        "eedi3vk2": f"core.eedi3vk2.EEDI3({clip}, {masked})",
+        "vszipcl": f"core.vszipcl.EEDI3({clip}, {common})",
     }
 
 
 def _eedi3h_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
-    """The horizontal EEDI3: the same call surface as _eedi3_build, one name up.
+    """Plain 1x EEDI3H with the optional 1080p mask.
 
-    eedi3vk2 does not register an EEDI3H, so the references are vszipcl and
-    vszipcu (which do).
+    eedi3vk2 has no EEDI3H, and vszipcl/vszipcu have no mclip, so only the
+    vsfeel call can take the mask.
     """
     use_mclip = getattr(ns, "eedi3_mclip", True)
     common = (
@@ -695,19 +697,20 @@ def _eedi3h_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[s
     if ns.eedi3_hp:
         common += ", hp=1"
     if getattr(ns, "synthetic", False):
-        # The synthetic vpy defines only `clip` (no ss/mask): the same plain
-        # 1x call _eedi3_build emits, with no aux clips to reference.
+        # The synthetic vpy defines only `clip` (there is no mask).
         return {
             "vsfeel": f"core.vsfeel.EEDI3H({clip}, {common})",
             "vszipcl": f"core.vszipcl.EEDI3H({clip}, {common})",
             "vszipcu": f"core.vszipcu.EEDI3H({clip}, {common})",
         }
-    with_mclip = common + (", sclip=sclip, mclip=mclip" if use_mclip else ", sclip=sclip")
-    with_sclip = f"{common}, sclip=sclip"
+    if use_mclip:
+        vsfeel = f"core.vsfeel.EEDI3H({clip}, {common}, mclip=mclip)"
+    else:
+        vsfeel = f"core.vsfeel.EEDI3H({clip}, {common})"
     return {
-        "vsfeel": f"core.vsfeel.EEDI3H({clip}, {with_mclip})",
-        "vszipcl": f"core.vszipcl.EEDI3H({clip}, {with_sclip})",
-        "vszipcu": f"core.vszipcu.EEDI3H({clip}, {with_sclip})",
+        "vsfeel": vsfeel,
+        "vszipcl": f"core.vszipcl.EEDI3H({clip}, {common})",
+        "vszipcu": f"core.vszipcu.EEDI3H({clip}, {common})",
     }
 
 
@@ -919,12 +922,9 @@ FILTERS: dict[str, FilterSpec] = {
         title="EEDI3",
         default_frames=2000,
         args=[
-            # based_aa runs its default EEDI3 antialiaser in double-rate mode:
-            # field = tff + double_rate*2 = 3 (progressive input, tff=True), i.e.
-            # 2 output frames per input frame interpolating each field parity,
-            # which based_aa folds back with std.Merge(clip[::2], clip[1::2]).
-            # The merge is not EEDI3 work, so the benchmark times field=3 alone
-            # (the exact double-rate call based_aa makes) and skips the merge.
+            # Double-rate interpolation (field=3) at 1080p, with the optional
+            # vsaa edge mask. The 2x based_aa chain is the separate eedi3aa
+            # entry.
             Arg("field", "eedi3_field", int, 3),
             Arg("mdis", "eedi3_mdis", int, 20),
             Arg("nrad", "eedi3_nrad", int, 2),
@@ -940,7 +940,7 @@ FILTERS: dict[str, FilterSpec] = {
                 "eedi3_mclip",
                 _str_to_bool,
                 True,  # pyright: ignore[reportArgumentType]
-                "pass the vsaa edge mask as mclip to vsfeel/eedi3vk2 (default: true)",
+                "pass the 1080p edge mask as mclip (default: true)",
             ),
             Arg(
                 "hp",
@@ -951,11 +951,10 @@ FILTERS: dict[str, FilterSpec] = {
             ),
         ],
         build=_eedi3_build,
-        # Real runs mirror vsaa.based_aa: source at 16-bit, vsaa edge mask,
-        # both Point-upscaled 2x, then EEDI3 with sclip/mclip. --synthetic
-        # (used by the hang tests) falls back to a plain 1x GRAY16 call.
+        # 1x EEDI3 with the 1080p mask; the 2x based_aa chain is eedi3aa.
         input="depth(get_y(clip), 16)",
         aa=True,
+        aa_scale=1,
         # vsfeel's EEDI3 is vnode:gpu; the reference arms are not.
         gpu_plugins=frozenset({"vsfeel"}),
     ),
@@ -979,7 +978,7 @@ FILTERS: dict[str, FilterSpec] = {
                 "eedi3_mclip",
                 _str_to_bool,
                 True,  # pyright: ignore[reportArgumentType]
-                "pass the vsaa edge mask as mclip to vsfeel (default: true)",
+                "pass the 1080p edge mask as mclip (default: true)",
             ),
             Arg(
                 "hp",
@@ -990,8 +989,10 @@ FILTERS: dict[str, FilterSpec] = {
             ),
         ],
         build=_eedi3h_build,
+        # 1x EEDI3H with the 1080p mask.
         input="depth(get_y(clip), 16)",
         aa=True,
+        aa_scale=1,
         # vsfeel's EEDI3H is vnode:gpu; the reference arms are not.
         gpu_plugins=frozenset({"vsfeel"}),
     ),
@@ -999,8 +1000,8 @@ FILTERS: dict[str, FilterSpec] = {
         title="EEDI3AA (based_aa)",
         default_frames=1000,
         args=[
-            # Same surface as the eedi3 entry: based_aa's default antialiaser
-            # in double-rate mode (field = tff + double_rate*2 = 3).
+            # based_aa's default antialiaser in double-rate mode
+            # (field = tff + double_rate*2 = 3).
             Arg("field", "eedi3_field", int, 3),
             Arg("mdis", "eedi3_mdis", int, 20),
             Arg("nrad", "eedi3_nrad", int, 2),
@@ -1192,8 +1193,9 @@ def bench_aa(
     gpu_cache: bool = False,
     download_inputs: bool = False,
     no_download: bool = False,
+    upscale: bool = True,
 ) -> float | None:
-    """Run an EEDI3 anti-aliasing style benchmark (see make_aa_vpy)."""
+    """Run an EEDI3 mask benchmark (see make_aa_vpy)."""
     vpy = make_aa_vpy(
         clip=clip,
         extra=_plugin_loader(plugin),
@@ -1205,6 +1207,7 @@ def bench_aa(
         cache_bytes=cache_bytes,
         gpu_cache=gpu_cache,
         download_inputs=download_inputs,
+        upscale=upscale,
     )
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"bench_{plugin}.vpy"
@@ -1391,6 +1394,7 @@ def _run_once(
             gpu_cache=gpu_cache,
             download_inputs=download_inputs,
             no_download=ns.no_download,
+            upscale=spec.aa_scale == 2,
         )
     return bench(
         plugin,
@@ -1454,7 +1458,11 @@ def _prepare_filter(
             f"{synth.removeprefix('vs.')}"
         )
     elif spec.aa:
-        clip_desc = f"{str(ns.clip)} -> 2x Point"
+        clip_desc = (
+            f"{str(ns.clip)} -> 2x Point"
+            if spec.aa_scale == 2
+            else f"{str(ns.clip)} + mask"
+        )
     else:
         clip_desc = f"{str(ns.clip)}{scale_desc}"
     format_desc = f" | format: {ns.format}" if ns.format else ""
