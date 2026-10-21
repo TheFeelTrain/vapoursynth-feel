@@ -1984,6 +1984,17 @@ static const VSFrame * temporalFrame(BM3DData * d, int n,
                                      std::string(errbuf));
         }
         ctx = nullptr;
+        if (d->trace_frame >= 0 && n == d->trace_frame) {
+            // The trace rode on this request's estimation submission, or an
+            // earlier one the cache served, so waiting this submission out
+            // leaves it final. Debug only: this is the one blocking
+            // readback, and only for the traced frame.
+            char terr[256] {};
+            if (d->gpu->api->gpuExecWaitValue(d->exec, value, terr,
+                                              sizeof(terr)) == gdDrained) {
+                dump_match_trace(d, d->trace_x, d->trace_y);
+            }
+        }
     } catch (const std::exception & e) {
         if (ctx) {
             d->gpu->api->gpuExecAbandon(ctx);
@@ -2889,9 +2900,9 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         d->set_layout = std::get<VkDescriptorSetLayout>(result);
     }
     {
-        const auto result = // 6 ints; the aggregation kernel declares the
+        const auto result = // 7 ints; the aggregation kernel declares the
                             // first 5 of the same block
-            gpu_pipeline_layout(*d->gpu, d->set_layout, 6 * sizeof(int32_t));
+            gpu_pipeline_layout(*d->gpu, d->set_layout, 7 * sizeof(int32_t));
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }

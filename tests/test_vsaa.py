@@ -160,6 +160,16 @@ def test_feel_aa_matches_based_aa_yuv_float(clip_yuv420ps):
     assert d.max() <= 1.5e-2, f"max|d|={d.max()}"
 
 
+def test_feel_aa_matches_based_aa_half(clip_grayh):
+    """GRAYH half float: both chains round every step to half, so they agree
+    to ~1e-5 mean, ~1e-3 max (measured 1.1e-5/9.8e-4 on this fixture)."""
+    ref = _reference(clip_grayh, supersampler=Point(), downscaler=Catrom())
+    out = feel_aa(clip_grayh, supersampler=Point(), downscaler=Catrom())
+    d = np.abs(_plane(ref) - _plane(out))
+    assert d.mean() <= 5e-5, f"mean|d|={d.mean()}"
+    assert d.max() <= 5e-3, f"max|d|={d.max()}"
+
+
 def test_feel_aa_keeps_chroma(clip_yuv420ps):
     """feel_aa only processes luma, so both chroma planes are the source's."""
     out = feel_aa(clip_yuv420ps, supersampler=Point(), downscaler=Catrom())

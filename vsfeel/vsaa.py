@@ -68,7 +68,7 @@ def _fusable_format(clip: vs.VideoNode) -> bool:
     if fmt.sample_type == vs.INTEGER:
         return fmt.bits_per_sample == 16
     if fmt.sample_type == vs.FLOAT:
-        return fmt.bits_per_sample == 32
+        return fmt.bits_per_sample in (16, 32)
     return False
 
 
@@ -325,7 +325,7 @@ def feel_aa(
     ``Lanczos``, ``Spline16/36/64``) or is ``Box``. One that does not, such as
     the default ``ArtCNN``, runs wherever it can and its result is uploaded
     once, so everything after it stays resident. The input must be 16-bit
-    integer or 32-bit float, with even dimensions.
+    integer or 16/32-bit float, with even dimensions.
     """
     UnsupportedColorFamilyError.check(clip, (vs.YUV, vs.GRAY), feel_aa)
 

@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-21
+
 ### Added
 
 - `vsfeel.feel_aa`, a copy of `vsaa.based_aa` that keeps its processing entirely on the GPU
@@ -126,6 +128,7 @@ The plugin has moved to the VapourSynth R80 GPU API. The core now owns the devic
 - vs-jetpack backend integration, so the filters can be used through the vs-jetpack wrappers
 - Windows and Linux wheels, built and published by CI
 
+[1.2.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.2...1.2.0
 [1.1.2]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.1...1.1.2
 [1.1.1]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.0...1.1.1
 [1.1.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.0.0...1.1.0

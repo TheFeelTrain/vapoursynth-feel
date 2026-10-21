@@ -227,6 +227,9 @@ reference chain:
   paths round differently (`std.Prewitt` by ~5e-7 on this clip), and where that
   straddles the mask's binarize threshold a few pixels move by up to ~1.5e-2 —
   `mask=False` drops the bound to 1e-5, which is how the flip was isolated.
+- f16: both chains round every step to half, so they agree to ~1e-5 mean and
+  ~1e-3 max (measured 1.1e-5/9.8e-4, 360p GRAYH, Point/Catrom), with the same
+  mask-threshold flips as f32 underneath.
 - a `Point` supersample at a fractional `rfactor` cannot match: the core's GPU
   Point resize samples a fractional ratio with a different phase than its CPU
   path (0.78 apart on a bare 1.5x upscale). Integer ratios are unaffected.

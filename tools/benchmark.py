@@ -366,7 +366,9 @@ def make_aa_vpy(
                 f"sclip_gpu = {{sclip_expr}}\n"
             ) + names
             gpu_sclip = (
-                "core.std.Interleave([clip_gpu, clip_gpu])" if upscale and eedi3_field > 1 else "clip_gpu"
+                "core.std.Interleave([clip_gpu, clip_gpu])"
+                if upscale and eedi3_field > 1
+                else "clip_gpu"
             )
             cache_build = cache_build.replace("{sclip_expr}", gpu_sclip)
         else:
@@ -397,7 +399,9 @@ sclip = {"core.std.Interleave([clip, clip])" if upscale and eedi3_field > 1 else
         # run is reported as GPU-fed while the graph holds no GPU node at all.
         if gpu_cache:
             gpu_sclip = (
-                "core.std.Interleave([clip_gpu, clip_gpu])" if upscale and eedi3_field > 1 else "clip_gpu"
+                "core.std.Interleave([clip_gpu, clip_gpu])"
+                if upscale and eedi3_field > 1
+                else "clip_gpu"
             )
             if download_inputs:
                 names = (
@@ -1459,9 +1463,7 @@ def _prepare_filter(
         )
     elif spec.aa:
         clip_desc = (
-            f"{str(ns.clip)} -> 2x Point"
-            if spec.aa_scale == 2
-            else f"{str(ns.clip)} + mask"
+            f"{str(ns.clip)} -> 2x Point" if spec.aa_scale == 2 else f"{str(ns.clip)} + mask"
         )
     else:
         clip_desc = f"{str(ns.clip)}{scale_desc}"
