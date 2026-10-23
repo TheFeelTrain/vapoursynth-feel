@@ -421,10 +421,58 @@ struct DftPlaneConfig {
     int height {};
     int pw {}; // padded dims
     int ph {};
-    int num_blocks {};             // block grid
+    int hn {}; // block grid columns
+    int vn {}; // block grid rows
+    int num_blocks {};
+    int stripe_rows {};            // block rows fused/col2im process per pass
+    int spatial_rows {};           // block rows the spatial buffer allocates
+    int spatial_row_mask {};       // ring slot mask (power of two - 1)
     VkDeviceSize padded_bytes {};  // tw * pw * ph * bytes
-    VkDeviceSize spatial_bytes {}; // num_blocks * 256 floats
+    VkDeviceSize spatial_bytes {}; // spatial_rows * hn * 256 floats
 };
+
+// Block rows whose windows overlap a stripe's last output row, i.e. how far back
+// col2im reaches into blocks the previous stripe produced. col2im's floor((y -
+// 16 + step) / step) at y = row*step is row - (16-step)/step for step <= 16.
+static int dft_lookback(int block_step) {
+    return (BS - block_step) / block_step;
+}
+
+// The spatial handoff between fused and col2im is the filter's largest traffic:
+// a full-frame block buffer is num_blocks*256*4 bytes (136 MB at 1080p) written
+// and read once per frame, far past the 96 MB Infinity Cache, so it lands in
+// VRAM. Processing the frame in stripes of block rows and keeping the handoff
+// inside a ring of SPATIAL_ROW_BUDGET bytes keeps the write and the read in L2
+// (~+29% at 1080p, see notes/DFTTEST.md).
+constexpr VkDeviceSize kSpatialRowBudget = 64 * 1024 * 1024;
+
+static void dft_plan_spatial(DftPlaneConfig & cfg, int block_step) {
+    const int lookback = dft_lookback(block_step);
+    const VkDeviceSize bytes_per_row =
+        static_cast<VkDeviceSize>(cfg.hn) * 256 * sizeof(float);
+    const VkDeviceSize budget_rows =
+        std::max<VkDeviceSize>(1, kSpatialRowBudget / bytes_per_row);
+    // Largest power of two that fits the budget and the frame; the ring mask
+    // must cover the lookback plus at least one stripe row.
+    int ring = 1;
+    const int cap = static_cast<int>(
+        std::min<VkDeviceSize>(budget_rows, static_cast<VkDeviceSize>(cfg.vn)));
+    while (ring * 2 <= cap) {
+        ring *= 2;
+    }
+    // Must hold the lookback rows plus at least one stripe row; a ring wider
+    // than the frame makes the whole frame one stripe.
+    while (ring < lookback + 1) {
+        ring *= 2;
+    }
+    // A ring larger than the frame is wasted: with a fixed mask only vn rows are
+    // ever touched when the whole frame is one stripe.
+    cfg.spatial_row_mask = ring - 1;
+    cfg.spatial_rows = std::min(ring, cfg.vn);
+    cfg.stripe_rows = std::max(1, ring - lookback);
+    cfg.spatial_bytes = static_cast<VkDeviceSize>(cfg.spatial_rows) * cfg.hn *
+                        256 * sizeof(float);
+}
 
 // The push constants narrow every pitch to int32, and the creation-time
 // padded-plane bound does not cover (height-1)*stride, so the frame path bounds
@@ -439,11 +487,8 @@ static bool dft_offsets_fit(const DftPlaneConfig & cfg, int stride) {
 // separate allocations, so the bases are 0 and only the plane-internal offsets
 // (spatial float index, pad slice) carry real values.
 struct DftPushConstants {
-    int32_t padded_base;
     int32_t spatial_base;
     int32_t dst_base;
-    int32_t src_base;
-    int32_t pad_t0;
     int32_t wt_base;
     int32_t wf_base;
     int32_t sigma_base;
@@ -451,8 +496,16 @@ struct DftPushConstants {
     int32_t block_step;
     int32_t width;
     int32_t height;
-    int32_t src_stride;
+    int32_t wf2_base;      // vec2 element offset of window_freq[]
+    int32_t win4_base;     // vec4 element offset of the transposed window[]
+    int32_t src_stride[7]; // per temporal slice
     int32_t dst_stride;
+    int32_t pad_slice; // pw * ph, padded plane samples per slice
+    int32_t spatial_row_mask;
+    int32_t block_base;
+    int32_t block_end;
+    int32_t y_begin;
+    int32_t y_end;
     float sigma;
     float sigma2;
     float pmin;
@@ -496,7 +549,7 @@ struct DftData {
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
     VkPipelineLayout pipeline_layout {};
-    VkPipeline pad_pipeline {};
+    VkPipeline pad_pipeline[4] {};
     VkPipeline col2im_pipeline {};
     VkPipeline fused_pipeline[4] {};
 
@@ -504,6 +557,8 @@ struct DftData {
     GpuBuffer wt;
     int32_t wf_base {};    // float offset of window_freq (-1 if !zmean)
     int32_t sigma_base {}; // float offset of sigma array (-1 if scalar)
+    int32_t wf2_base {};   // the same table as vec2 elements
+    int32_t win4_base {};  // transposed window (vec4 elements) for im2col
 
     std::array<DftPlaneConfig, 3> planes {};
     VSGPUExecPool * pool {};
@@ -543,8 +598,10 @@ struct DftData {
             pool = nullptr;
         }
         VkDevice dev = gpu->device;
-        if (pad_pipeline) {
-            gpu->vk->vkDestroyPipeline(dev, pad_pipeline, nullptr);
+        for (auto & p : pad_pipeline) {
+            if (p) {
+                gpu->vk->vkDestroyPipeline(dev, p, nullptr);
+            }
         }
         if (col2im_pipeline) {
             gpu->vk->vkDestroyPipeline(dev, col2im_pipeline, nullptr);
@@ -576,14 +633,14 @@ struct DftData {
 // across subgroupBarrier() -- a barrier whose scope is one subgroup -- so every
 // aligned 16-lane tile has to live inside a single subgroup. That holds when the
 // subgroup size in use is a multiple of 16, and only then; 32 is what the target
-// GPU is tuned for. The pad/col2im kernels do not use subgroups but are given
-// the same required size, so the count the device limits, subgroups per
-// workgroup, is read off the largest of the three launches.
+// GPU is tuned for. col2im does not use subgroups but is given the same required
+// size, so the count the device limits, subgroups per workgroup, is read off the
+// largest of the two launches.
 constexpr GpuWorkgroup kFusedWorkgroup {
     .x = 8 * 16, // SUB_BLOCKS * 16
     .shared_bytes = (8 * 288 + 8) * 4
 }; // trans[SUB_BLOCKS*TR_SUB] + s_gf
-constexpr GpuWorkgroup kPadWorkgroup { .x = 32, .y = 8 };
+constexpr GpuWorkgroup kPlaneWorkgroup { .x = 32, .y = 8 };
 
 // The fused kernel's variant is baked in as specialization constants so the
 // dead filter branches (and their divisions) vanish, matching the reference's
@@ -611,7 +668,7 @@ create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
         subgroup_size = 17; // invalid on purpose, to test driver validation
     } else if (forced_sgsize > 0) {
         subgroup_size = static_cast<uint32_t>(forced_sgsize);
-    } else if (gpu.has_subgroup_size(32, kPadWorkgroup.invocations())) {
+    } else if (gpu.has_subgroup_size(32, kPlaneWorkgroup.invocations())) {
         subgroup_size = 32;
     } else if (gpu.subgroup_size % 16 != 0) {
         return std::string(
@@ -660,6 +717,8 @@ static DftPushConstants base_pc(const DftData & d) {
     DftPushConstants pc {};
     pc.wt_base = 0;
     pc.wf_base = d.wf_base;
+    pc.wf2_base = d.wf2_base;
+    pc.win4_base = d.win4_base;
     pc.sigma_base = d.sigma_base;
     pc.radius = d.radius;
     pc.block_step = d.block_step;
@@ -775,9 +834,10 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
         }
         const auto & cfg = d->planes[plane];
 
-        // Per-frame scratch: the padded source window and the float block
-        // buffer. Both are handed to the context, which recycles them once the
-        // submission completes (the pool's size buckets make this cheap).
+        // Per-frame scratch: the padded source window and the block-buffer
+        // ring between fused and col2im. Both are handed to the context, which
+        // recycles them once the submission completes (the pool's size buckets
+        // make this cheap).
         GpuBuffer padded {}, spatial {};
         if (auto e =
                 gpu_frame_buffer(*d->gpu, core, ctx, cfg.padded_bytes, padded);
@@ -803,7 +863,7 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
                         " overflows the kernel's 32-bit addressing");
         }
 
-        // pad and col2im both walk the padded plane, so they share a grid
+        // pad and col2im both walk the padded plane
         const uint32_t plane_gx = std::max(
             std::min<uint32_t>((static_cast<uint32_t>(cfg.pw) + 31u) / 32u,
                                lim.maxComputeWorkGroupCount[0]),
@@ -812,29 +872,28 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
             std::min<uint32_t>((static_cast<uint32_t>(cfg.ph) + 7u) / 8u,
                                lim.maxComputeWorkGroupCount[1]),
             1u);
-        const uint32_t blocks = static_cast<uint32_t>(cfg.num_blocks);
-        const uint32_t fused_gx =
-            std::max(std::min<uint32_t>((blocks + 7u) / 8u,
-                                        lim.maxComputeWorkGroupCount[0]),
-                     1u);
 
-        // pad: one dispatch per temporal slice, reading its own source frame
-        // plane (so the temporal offset lives in the buffer bound at binding 3,
-        // not in an address the kernel walks).
-        vsfeel_trace_mark("pad");
+        // fused + col2im, stripe by stripe over block rows: the spatial block
+        // buffer is a ring of cfg.spatial_rows rows, so the fused write and the
+        // col2im read of each stripe stay in L2 instead of streaming a
+        // full-frame block buffer through VRAM.
+        VSVulkanPlaneInfo cp {};
+        if (d->gpu->api->getGPUPlane(center, plane, &cp)) {
+            return fail("center plane " + std::to_string(plane) +
+                        " is not GPU resident");
+        }
+        // One source plane buffer per temporal slice, all read by fused: the
+        // descriptor array binding. Each slice keeps its own row stride.
+        std::array<VkBuffer, 7> src_buffers {};
+        DftPushConstants pc_base = base_pc(*d);
+        pc_base.pad_slice = cfg.pw * cfg.ph;
         for (int t = 0; t < tw; ++t) {
             VSVulkanPlaneInfo sp {};
             if (d->gpu->api->getGPUPlane(src[t], plane, &sp)) {
                 return fail("source plane " + std::to_string(plane) +
                             " is not GPU resident");
             }
-            const VkBuffer buffers[5] { d->wt.buffer, padded.buffer,
-                                        spatial.buffer, sp.buffer,
-                                        dst_plane.buffer };
-            DftPushConstants pc = base_pc(*d);
-            pc.pad_t0 = t;
-            pc.width = cfg.width;
-            pc.height = cfg.height;
+            src_buffers[t] = sp.buffer;
             const int src_stride = static_cast<int>(
                 vsapi->getStride(src[t], plane) / d->elem_bytes);
             if (!dft_offsets_fit(cfg, src_stride)) {
@@ -842,11 +901,30 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
                             " source pitch " + std::to_string(src_stride) +
                             " overflows the kernel's 32-bit addressing");
             }
-            pc.src_stride = src_stride;
+            pc_base.src_stride[t] = src_stride;
+        }
+        const int pad_y = (cfg.ph - cfg.height) / 2;
+        const int y_first = pad_y;
+        const int y_last = pad_y + cfg.height - 1;
+
+        // pad: one dispatch writes every temporal slice of the padded plane,
+        // reading the tw source frame planes through the descriptor array.
+        vsfeel_trace_mark("pad");
+        {
+            DftPushConstants pc = pc_base;
+            pc.width = cfg.width;
+            pc.height = cfg.height;
             pc.dst_stride = dst_stride;
+            const VkBuffer buffers[4] { d->wt.buffer, padded.buffer,
+                                        spatial.buffer, dst_plane.buffer };
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                          d->pad_pipeline);
-            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 5);
+                                          d->pad_pipeline[d->radius]);
+            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 4);
+            gpu_push_buffer_array(*d->gpu, cmd, d->pipeline_layout, 4,
+                                  src_buffers.data(),
+                                  static_cast<uint32_t>(tw));
+            const VkBuffer tables[2] { d->wt.buffer, d->wt.buffer };
+            gpu_push_buffers_at(*d->gpu, cmd, d->pipeline_layout, 5, tables, 2);
             gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc,
                                sizeof(pc));
             d->gpu->vk->vkCmdDispatch(cmd, plane_gx, plane_gy, 1);
@@ -857,59 +935,90 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
                 cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->probe.query, 1);
         }
 
-        // fused: im2col + spatial/temporal DFT + filter + inverse, writing the
-        // center temporal slice of each block into the spatial buffer.
-        vsfeel_trace_mark("fused");
-        {
-            VSVulkanPlaneInfo sp {};
-            if (d->gpu->api->getGPUPlane(center, plane, &sp)) {
-                return fail("center plane " + std::to_string(plane) +
-                            " is not GPU resident");
-            }
-            const VkBuffer buffers[5] { d->wt.buffer, padded.buffer,
-                                        spatial.buffer, sp.buffer,
-                                        dst_plane.buffer };
-            DftPushConstants pc = base_pc(*d);
-            pc.width = cfg.width;
-            pc.height = cfg.height;
-            pc.src_stride = static_cast<int32_t>(
-                vsapi->getStride(center, plane) / d->elem_bytes);
-            pc.dst_stride = dst_stride;
-            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                          d->fused_pipeline[d->radius]);
-            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 5);
-            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc,
-                               sizeof(pc));
-            d->gpu->vk->vkCmdDispatch(cmd, fused_gx, 1, 1);
-        }
-        gpu_barrier(*d->gpu, cmd);
-        if (gputrace && plane == probe_plane) {
-            d->gpu->vk->vkCmdWriteTimestamp2(
-                cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->probe.query, 2);
-        }
+        for (int row_base = 0; row_base < cfg.vn; row_base += cfg.stripe_rows) {
+            const int row_end = std::min(row_base + cfg.stripe_rows, cfg.vn);
 
-        // col2im: overlap-add the windowed blocks straight into the output plane
-        vsfeel_trace_mark("col2im");
-        {
-            const VkBuffer buffers[5] { d->wt.buffer, padded.buffer,
-                                        spatial.buffer, padded.buffer,
-                                        dst_plane.buffer };
-            DftPushConstants pc = base_pc(*d);
-            pc.width = cfg.width;
-            pc.height = cfg.height;
-            pc.src_stride = static_cast<int32_t>(
-                vsapi->getStride(center, plane) / d->elem_bytes);
-            pc.dst_stride = dst_stride;
-            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                          d->col2im_pipeline);
-            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 5);
-            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc,
-                               sizeof(pc));
-            d->gpu->vk->vkCmdDispatch(cmd, plane_gx, plane_gy, 1);
-        }
-        if (gputrace && plane == probe_plane) {
-            d->gpu->vk->vkCmdWriteTimestamp2(
-                cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->probe.query, 3);
+            // fused: im2col + spatial/temporal DFT + filter + inverse, writing
+            // the center temporal slice of the stripe's blocks into the ring.
+            vsfeel_trace_mark("fused");
+            {
+                DftPushConstants pc = pc_base;
+                pc.width = cfg.width;
+                pc.height = cfg.height;
+                pc.dst_stride = dst_stride;
+                pc.spatial_row_mask = cfg.spatial_row_mask;
+                pc.block_base = row_base * cfg.hn;
+                pc.block_end = row_end * cfg.hn;
+                const uint32_t stripe_blocks =
+                    static_cast<uint32_t>(pc.block_end - pc.block_base);
+                const uint32_t fused_gx = std::max(
+                    std::min<uint32_t>((stripe_blocks + 7u) / 8u,
+                                       lim.maxComputeWorkGroupCount[0]),
+                    1u);
+                // 0 wt, 1 padded, 2 spatial; 3 (dst) and 4 (the source
+                // array) are col2im's and pad's and stay unbound here
+                const VkBuffer buffers[3] { d->wt.buffer, padded.buffer,
+                                            spatial.buffer };
+                d->gpu->vk->vkCmdBindPipeline(cmd,
+                                              VK_PIPELINE_BIND_POINT_COMPUTE,
+                                              d->fused_pipeline[d->radius]);
+                gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 3);
+                const VkBuffer tables[2] { d->wt.buffer, d->wt.buffer };
+                gpu_push_buffers_at(*d->gpu, cmd, d->pipeline_layout, 5, tables,
+                                    2);
+                gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc,
+                                   sizeof(pc));
+                d->gpu->vk->vkCmdDispatch(cmd, fused_gx, 1, 1);
+            }
+            gpu_barrier(*d->gpu, cmd);
+            if (gputrace && plane == probe_plane && row_base == 0) {
+                d->gpu->vk->vkCmdWriteTimestamp2(
+                    cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->probe.query,
+                    2);
+            }
+
+            // col2im: overlap-add the stripe's completed output rows straight
+            // into the output plane. Only rows whose block support is complete
+            // (blocks up to row_end-1) are ready; the next stripe's rows need
+            // blocks the next stripe produces.
+            vsfeel_trace_mark("col2im");
+            {
+                const int y_begin = std::max(y_first, row_base * d->block_step);
+                const int y_end = std::min(y_last, row_end * d->block_step - 1);
+                if (y_end >= y_begin) {
+                    DftPushConstants pc = pc_base;
+                    pc.width = cfg.width;
+                    pc.height = cfg.height;
+                    pc.dst_stride = dst_stride;
+                    pc.spatial_row_mask = cfg.spatial_row_mask;
+                    pc.y_begin = y_begin;
+                    pc.y_end = y_end;
+                    const uint32_t col_gy = std::max(
+                        std::min<uint32_t>(
+                            (static_cast<uint32_t>(y_end - y_begin) + 1u + 7u) /
+                                8u,
+                            lim.maxComputeWorkGroupCount[1]),
+                        1u);
+                    const VkBuffer buffers[4] { d->wt.buffer, padded.buffer,
+                                                spatial.buffer,
+                                                dst_plane.buffer };
+                    d->gpu->vk->vkCmdBindPipeline(
+                        cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        d->col2im_pipeline);
+                    gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers,
+                                     4);
+                    gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc,
+                                       sizeof(pc));
+                    d->gpu->vk->vkCmdDispatch(cmd, plane_gx, col_gy, 1);
+                }
+            }
+            if (gputrace && plane == probe_plane && row_base == 0) {
+                d->gpu->vk->vkCmdWriteTimestamp2(
+                    cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->probe.query,
+                    3);
+            }
+            // the next stripe's fused overwrites the ring slots this col2im read
+            gpu_barrier(*d->gpu, cmd);
         }
     }
     if (gputrace) {
@@ -1259,8 +1368,9 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         cfg.height = (plane == 0) ? d->vi->height : d->vi->height >> subH;
         cfg.pw = calcPadSize(cfg.width, d->block_step);
         cfg.ph = calcPadSize(cfg.height, d->block_step);
-        cfg.num_blocks = calcPadNum(cfg.width, d->block_step) *
-                         calcPadNum(cfg.height, d->block_step);
+        cfg.hn = calcPadNum(cfg.width, d->block_step);
+        cfg.vn = calcPadNum(cfg.height, d->block_step);
+        cfg.num_blocks = cfg.hn * cfg.vn;
 
         // single-fold reflect_pad requires pad <= dim-1
         const int ox = (cfg.pw - cfg.width) / 2;
@@ -1277,7 +1387,7 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         const VkDeviceSize nblk = cfg.num_blocks;
         cfg.padded_bytes =
             static_cast<VkDeviceSize>(d->tw) * pad_elems * d->elem_bytes;
-        cfg.spatial_bytes = nblk * 256 * sizeof(float);
+        dft_plan_spatial(cfg, d->block_step);
 
         // Every region below is addressed by an int32 push constant, so bound
         // each per-plane region in the units the shader actually uses.
@@ -1426,7 +1536,14 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
     // recording rebinds its own view of the planes (binding 3 is a different
     // source frame per pad dispatch), so nothing is allocated from a pool.
     {
-        const auto result = gpu_push_set_layout(*d->gpu, 5);
+        // 0 wt, 1 padded, 2 spatial, 3 dst, 4 the tw temporal source planes as
+        // one descriptor array (only pad reads it, only with a constant index).
+        // 5/6 alias wt as vec2/vec4 views for the table loads. Binding 4 is
+        // sized for the widest temporal window any compiled variant declares
+        // (tbsize 7), not this instance's: the pipelines of every radius are
+        // created here and their SPIR-V array length must fit the layout.
+        const uint32_t counts[7] { 1, 1, 1, 1, 7, 1, 1 };
+        const auto result = gpu_push_set_layout(*d->gpu, counts, 7);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -1450,13 +1567,19 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             zmean ? static_cast<size_t>(d->tw) * 16 * 9 * 2 : 0;
         const size_t n_sigma =
             sigma_array.empty() ? 0 : static_cast<size_t>(d->tw) * 16 * 9;
+        // The transposed copy the fused kernel loads with vec4 (four j at a
+        // time). Every region above is a multiple of four floats, so it starts
+        // vec4-aligned.
+        const size_t n_window_t = n_window;
 
         VkDeviceSize wt_bytes = static_cast<VkDeviceSize>(
-            (n_window + n_freq + n_sigma) * sizeof(float));
+            (n_window + n_freq + n_sigma + n_window_t) * sizeof(float));
         wt_bytes = std::max<VkDeviceSize>(wt_bytes, 16);
         d->wf_base = zmean ? static_cast<int32_t>(n_window) : -1;
         d->sigma_base =
             !sigma_array.empty() ? static_cast<int32_t>(n_window + n_freq) : -1;
+        d->wf2_base = zmean ? static_cast<int32_t>(n_window / 2) : 0;
+        d->win4_base = static_cast<int32_t>((n_window + n_freq + n_sigma) / 4);
 
         // Host visible and coherent, so a plain memcpy lands and no flush is
         // needed; the table is tiny and read through L2 every frame.
@@ -1484,14 +1607,25 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
                 map[n_window + n_freq + i] = static_cast<float>(sigma_array[i]);
             }
         }
+        float * window_t = map + (n_window + n_freq + n_sigma);
+        for (size_t t = 0; t < static_cast<size_t>(d->tw); ++t) {
+            for (size_t j = 0; j < 16; ++j) {
+                for (size_t lane = 0; lane < 16; ++lane) {
+                    // [t][j][lane] -> [t][lane][j]; the window is symmetric in
+                    // (s1, s2) so this is the same value im2col multiplies by
+                    window_t[t * 256 + lane * 16 + j] =
+                        static_cast<float>(window[t * 256 + j * 16 + lane]);
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------
     // Pipelines
     // ------------------------------------------------------------------
     {
-        const uint32_t * pad_code = nullptr;
-        size_t pad_size = 0;
+        const uint32_t * pad_code[4] {};
+        size_t pad_size[4] {};
         const uint32_t * col2im_code = nullptr;
         size_t col2im_size = 0;
         const uint32_t * fused_code[4] {};
@@ -1499,8 +1633,14 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         // Selects the half blobs, which `bits` alone cannot: f16 is 16 bits too.
         switch (d->half ? 0 : d->bits) {
         case 16:
-            pad_code = dfttest_u16_pad_spv;
-            pad_size = dfttest_u16_pad_spv_size;
+            pad_code[0] = dfttest_u16_pad_r0_spv;
+            pad_size[0] = dfttest_u16_pad_r0_spv_size;
+            pad_code[1] = dfttest_u16_pad_r1_spv;
+            pad_size[1] = dfttest_u16_pad_r1_spv_size;
+            pad_code[2] = dfttest_u16_pad_r2_spv;
+            pad_size[2] = dfttest_u16_pad_r2_spv_size;
+            pad_code[3] = dfttest_u16_pad_r3_spv;
+            pad_size[3] = dfttest_u16_pad_r3_spv_size;
             col2im_code = dfttest_u16_col2im_spv;
             col2im_size = dfttest_u16_col2im_spv_size;
             fused_code[0] = dfttest_u16_fused_r0_spv;
@@ -1513,8 +1653,14 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             fused_size[3] = dfttest_u16_fused_r3_spv_size;
             break;
         case 32:
-            pad_code = dfttest_f32_pad_spv;
-            pad_size = dfttest_f32_pad_spv_size;
+            pad_code[0] = dfttest_f32_pad_r0_spv;
+            pad_size[0] = dfttest_f32_pad_r0_spv_size;
+            pad_code[1] = dfttest_f32_pad_r1_spv;
+            pad_size[1] = dfttest_f32_pad_r1_spv_size;
+            pad_code[2] = dfttest_f32_pad_r2_spv;
+            pad_size[2] = dfttest_f32_pad_r2_spv_size;
+            pad_code[3] = dfttest_f32_pad_r3_spv;
+            pad_size[3] = dfttest_f32_pad_r3_spv_size;
             col2im_code = dfttest_f32_col2im_spv;
             col2im_size = dfttest_f32_col2im_spv_size;
             fused_code[0] = dfttest_f32_fused_r0_spv;
@@ -1527,8 +1673,14 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             fused_size[3] = dfttest_f32_fused_r3_spv_size;
             break;
         case 0: // half: stFloat + 16 bits
-            pad_code = dfttest_f16_pad_spv;
-            pad_size = dfttest_f16_pad_spv_size;
+            pad_code[0] = dfttest_f16_pad_r0_spv;
+            pad_size[0] = dfttest_f16_pad_r0_spv_size;
+            pad_code[1] = dfttest_f16_pad_r1_spv;
+            pad_size[1] = dfttest_f16_pad_r1_spv_size;
+            pad_code[2] = dfttest_f16_pad_r2_spv;
+            pad_size[2] = dfttest_f16_pad_r2_spv_size;
+            pad_code[3] = dfttest_f16_pad_r3_spv;
+            pad_size[3] = dfttest_f16_pad_r3_spv_size;
             col2im_code = dfttest_f16_col2im_spv;
             col2im_size = dfttest_f16_col2im_spv_size;
             fused_code[0] = dfttest_f16_fused_r0_spv;
@@ -1544,13 +1696,14 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             return set_error("unsupported io type");
         }
 
-        {
-            const auto result = create_pipeline(
-                *d->gpu, d->pipeline_layout, pad_code, pad_size, kPadWorkgroup);
+        for (int r = 0; r < 4; ++r) {
+            const auto result =
+                create_pipeline(*d->gpu, d->pipeline_layout, pad_code[r],
+                                pad_size[r], kPlaneWorkgroup);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
-            d->pad_pipeline = std::get<VkPipeline>(result);
+            d->pad_pipeline[r] = std::get<VkPipeline>(result);
         }
         for (int r = 0; r < 4; ++r) {
             const auto result = create_pipeline(
@@ -1564,7 +1717,7 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         {
             const auto result =
                 create_pipeline(*d->gpu, d->pipeline_layout, col2im_code,
-                                col2im_size, kPadWorkgroup);
+                                col2im_size, kPlaneWorkgroup);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -1622,7 +1775,7 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         }
         fprintf(stderr,
                 "[dfttest] %.1f MiB per in-flight frame "
-                "(%d planes, tw=%d, %u bytes); tw is re-padded every frame\n",
+                "(%d planes, tw=%d, %u bytes): padded planes + block ring\n",
                 per_frame / (1024.0 * 1024.0), num_planes, d->tw,
                 static_cast<unsigned>(per_frame));
     }

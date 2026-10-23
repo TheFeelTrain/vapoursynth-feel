@@ -279,8 +279,9 @@ foreach(io IN LISTS VK_BOX_IO_TYPES)
     endforeach()
 endforeach()
 
-# DFTTest: pad + fused + col2im kernels per io variant (u16, f16, f32); the
-# fused kernel is additionally compiled per temporal radius
+# DFTTest: col2im plus pad and fused kernels per io variant (u16, f16, f32);
+# pad and fused are additionally compiled per temporal radius (pad writes every
+# slice in one dispatch, so its slice count is baked in like the fused loops)
 # (0..3, i.e. tbsize 1/3/5/7) so its loops unroll and the working array
 # stays in registers (the reference does the same via `#define RADIUS`).
 # The fused kernel uses subgroup barriers instead of workgroup barriers
@@ -289,19 +290,14 @@ endforeach()
 # required. The io list is local because the other filters' kernels would fall
 # through to their u16 branch under an -DIO_F16 name.
 set(VK_DFT_IO_TYPES "u16" "f16" "f32")
-set(VK_DFT_ENTRIES pad col2im)
-set(VK_DFT_ENTRY_DEFS -DENTRY_PAD -DENTRY_COL2IM)
 set(VK_DFT_VARIANTS)
 foreach(io IN LISTS VK_DFT_IO_TYPES)
     string(TOUPPER "${io}" io_define)
-    foreach(entry_i RANGE 0 1)
-        list(GET VK_DFT_ENTRIES ${entry_i} entry)
-        list(GET VK_DFT_ENTRY_DEFS ${entry_i} entry_def)
-        list(APPEND VK_DFT_VARIANTS
-            "dfttest_${io}_${entry}|dfttest.comp|-DIO_${io_define} ${entry_def}")
-    endforeach()
+    list(APPEND VK_DFT_VARIANTS
+        "dfttest_${io}_col2im|dfttest.comp|-DIO_${io_define} -DENTRY_COL2IM")
     foreach(radius RANGE 0 3)
         list(APPEND VK_DFT_VARIANTS
+            "dfttest_${io}_pad_r${radius}|dfttest.comp|-DIO_${io_define} -DENTRY_PAD -DRADIUS=${radius}"
             "dfttest_${io}_fused_r${radius}|dfttest.comp|-DIO_${io_define} -DENTRY_FUSED -DRADIUS=${radius}")
     endforeach()
 endforeach()

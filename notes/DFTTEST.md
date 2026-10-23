@@ -9,10 +9,11 @@ Target GPU: RX 7900 XTX (RDNA3, gfx1100), Mesa 26.2 RADV.
 - u16 / f16 / f32 IO. The half path stages native `float16_t` in the padded
   plane and widens for the f32 work; half is a storage width, not a precision
   (Implementation).
-- Per output frame and processed plane: `pad` (one dispatch per temporal slice,
-  reading that slice's own source plane) → barrier → `fused` → barrier →
-  `col2im` straight into the output plane. Scratch is two `createGPUBuffer`
-  allocations per frame, handed to the context.
+- Per output frame and processed plane: one `pad` dispatch writes every temporal
+  slice, then per stripe of block rows `fused` → barrier → `col2im` straight
+  into the output plane. The stripe ring keeps the block handoff in L2
+  (Performance). Scratch is two `createGPUBuffer` allocations per frame, handed
+  to the context.
 - **Runs need `RADV_EXPERIMENTAL=transfer_queue`** (mechanism:
   `notes/BILATERAL.md`), which `tools/benchmark.py` forces.
 
@@ -21,29 +22,27 @@ Scoreboard — jpbd 1080p GRAY16, 3000 frames, medians of 3 through
 
 | mode | vsfeel | vszipcl | ratio |
 |---|---|---|---|
-| CPU cache (benchmark default) | 1456.9 | 805.5 | 1.81x |
-| `--gpu-cache` | 1512.9 | 879.4 | 1.72x |
-| `--synthetic` BlankClip | 1500.6 | 900.1 | 1.67x |
+| CPU cache (benchmark default) | 1872.9 | 909.6 | 2.06x |
+| `--gpu-cache` | 1855.3 | 862.7 | 2.15x |
+| `--synthetic` BlankClip | 1865.0 | 901.5 | 2.07x |
 
 IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
 (`--format u16|f16|f32`; the f16 clip carries the u16 clip's content):
 
 | io | vsfeel | vszipcl |
 |---|---|---|
-| u16 | 1486.9 | 797.8 |
-| f16 | 1524.1 | no f16 path |
-| f32 | 1385.7 | 558.3 |
+| u16 | 1872.9 | 909.6 |
+| f16 | 1925.2 | no f16 path |
+| f32 | 1251.2 | 627.5 |
 
 - Neither reference implements an f16 DFTTest, so the half path is graded
   against the f32 path on the losslessly widened clip, not against vszipcl.
 
-- The three modes agree within 4%: the frame is the kernels, and with the
+- The three modes agree within 2%: the frame is the kernels, and with the
   transfer queue the transfers ride along instead of adding a stage.
-- The pre-port gap's mechanism was the transfer (the default run measured
-  −18.9% before the opt-in, and chained instances, where only the ends
-  transfer, measured 640 vs 666 µs per instance — the ~26 µs being the two
-  extra pad dispatches). Those numbers are void with the rest of the port's
-  scoreboard (Historical).
+- Temporal radius is where the frame time is not uniform: 1837 fps at tbsize 3,
+  219.7 at 5 and 135.5 at 7 (same session, medians of 3). Radius 2/3 are
+  register-spill bound (Performance, Open work).
 
 ## Implementation
 
@@ -53,36 +52,65 @@ IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
   them, makes the output frame (`newGPUVideoFrame` when every plane is
   processed, `newVideoFrame2` sharing the unprocessed planes from the centre
   frame otherwise) and acquires one exec context.
-- One recording per output frame, per processed plane: `pad` (one dispatch per
-  temporal slice, reading that slice's own source frame plane) → barrier →
-  `fused` → barrier → `col2im` (straight into the output frame plane). Then
-  `gpuExecReadsFrame` per distinct source, `gpuExecWritesPlane` per processed
-  plane, `gpuExecSubmit`.
+- One recording per output frame, per processed plane: `pad` (one dispatch,
+  every temporal slice, reading the tw source frame planes through a descriptor
+  array) → barrier → per stripe of block rows `fused` → barrier → `col2im`
+  (straight into the output frame plane) → barrier. Then `gpuExecReadsFrame`
+  per distinct source, `gpuExecWritesPlane` per processed plane,
+  `gpuExecSubmit`.
 - Per-frame scratch is two `createGPUBuffer` allocations per plane — the padded
-  window (`tw*pw*ph*bytes`) and the float block buffer (`num_blocks*256*4`) —
-  handed to the context with `gpuExecUsesBuffer`. Allocation is measurably free:
-  at 1080p GRAY16 that is 12.97 + 136.0 MB per in-flight frame (142.1 MiB,
-  `VSFEEL_DFTTEST_VRAM=1` banner), and aliasing the block buffer onto the padded
-  one changes the frame time by <1%. Depth is the core's exec ring (2..8
+  window (`tw*pw*ph*bytes`) and the block-buffer ring (`spatial_rows*hn*256*4`,
+  63 MB at 1080p) — handed to the context with `gpuExecUsesBuffer`.
+  Allocation is measurably free (aliasing the ring onto the padded window
+  changes the frame time by <1%). Depth is the core's exec ring (2..8
   contexts), not `num_streams`.
-- Push descriptors with five whole-buffer bindings (`wt`, `padded`, `spatial`,
-  `src` plane, `dst` plane). Binding 3 is a different source frame per pad
-  dispatch, which is why nothing is allocated from a descriptor pool.
+- Push descriptors with seven bindings: `wt` (scalar view), `padded`, `spatial`,
+  `dst`, the tw source planes as one descriptor array (binding 4, pad only), and
+  two vector views of `wt` (5 = vec2 for the window_freq pairs, 6 = vec4 for the
+  transposed window). Binding 4's descriptor count is the widest compiled
+  variant (7), not the instance's tw, because every radius's pipelines are
+  created against the one layout.
 - `num_streams` and `device_id` are registered no-ops (never read): depth is
   the core's call, device choice is `core.set_vulkan_device`.
 
+### The block-row ring (`dft_plan_spatial`)
+
+- A full-frame block buffer is `num_blocks*256*4` bytes, 136 MB at 1080p:
+  `fused` writes it and `col2im` reads it back every frame, and it does not fit
+  the 96 MB Infinity Cache, so it streams through VRAM. That traffic is the
+  filter's largest single cost (aliasing the buffer to 1 MB: +32%).
+- Block rows are processed in stripes and the handoff stays in a ring of
+  `spatial_rows` rows indexed by `block row & (spatial_rows-1)`: the largest
+  power of two whose bytes fit `kSpatialRowBudget` (64 MiB) and at least
+  `lookback+1`. `lookback = (16-block_step)/block_step` is how far back
+  `col2im`'s window reaches into the previous stripe; `stripe_rows =
+  spatial_rows - lookback` (61 rows = 3 stripes at 1080p).
+- Per stripe: `fused` writes rows `[row_base, row_end)`, `col2im` emits the
+  output rows whose block support is complete (padded `y < row_end*block_step`)
+  and the rows left over by the previous stripe are still in the ring, then the
+  trailing barrier protects the slots the next `fused` overwrites
+  (`spatial_rows` is exactly `stripe_rows + lookback`).
+- `vn <= spatial_rows` is one stripe and behaves like a full-frame layout, so
+  small frames pay neither the extra dispatches nor the barriers.
+
 ### Kernels (`src/dfttest.comp`)
 
-- `ENTRY_PAD` reads the core's source frame plane with its own row stride and
-  writes slice `pad_t0` of the padded buffer; `ENTRY_FUSED` is im2col + window +
-  3D DFT + frequency filter + inverse, writing the centre temporal slice of each
-  block into the float block buffer; `ENTRY_COL2IM` overlap-adds into the output
-  plane with its stride.
+- `ENTRY_PAD` writes every temporal slice of the padded plane in one dispatch:
+  each invocation folds its (x, y) once with `n-1 - abs(n-1 - abs(v))` and
+  issues tw loads/stores, slice t through `src_bufs[t]` with the compile-time
+  index the unroll produces.
+- `ENTRY_FUSED` is im2col + window + 3D DFT + frequency filter + inverse,
+  writing the centre temporal slice of each block into the ring; it loads the
+  window four j at a time from the transposed copy (`vec4`) and window_freq one
+  `(re, im)` pair at a time (`vec2`).
+- `ENTRY_COL2IM` overlap-adds into the output plane with its stride, reading the
+  window from the scalar table (its offsets are per pixel, so nothing
+  vectorizes there).
 - `RADIUS` (0..3) is a compile-time define so the temporal loops unroll and
   `td[]` stays in registers; `FILTER_TYPE` and `ZMEAN` are specialization
   constants (the dead filter branches and their divisions vanish); wave32 is
   requested. `SUB_BLOCKS=8` (128-thread workgroups) and the 288-float
-  bank-conflict-free transpose window (10 240 B LDS) are unchanged.
+  bank-conflict-free transpose window (10 240 B LDS) remain the sweep winners.
 - Each 16-lane tile exchanges `trans` across `subgroupBarrier()`, whose scope is
   **one subgroup**, so the size in use has to be a multiple of 16 — wave32 is
   requested when the device offers it, and when it does not, the driver's default
@@ -91,9 +119,9 @@ IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
 - FFTW codelets, window/sigma table math, filter formulas and the reflect-pad
   rule are unchanged from the ported reference; only the buffers the data comes
   from and goes to changed.
-- 18 SPIR-V blobs (`pad`/`col2im` × 3 depths, `fused_r0..3` × 3 depths), up
-  from the pre-f16 12 and down from the port's 22: the `pad_slot`/`pad_direct`
-  and `fused`/`fused_direct` variants collapsed into one each.
+- 27 SPIR-V blobs (`col2im` × 3 depths, `pad_r0..3` × 3, `fused_r0..3` × 3):
+  pad and fused are per radius because pad's slice count and fused's temporal
+  unroll are both compile-time.
 
 ### f16 IO (`IO_F16`, `src/dfttest.comp`)
 
@@ -120,15 +148,39 @@ IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
 ReBAR host-direct upload buffer, staging + download buffers, the `FramePool` of
 per-stream resources, per-resource fences, the pad command-buffer ring, the
 `pad_slot`/`pad_direct` split, the `FUSED_DIRECT` pair, and the dump-pad /
-force-pad / fail-pad probes: 2854 lines of C++ became 1565.
+force-pad / fail-pad probes.
 
 ## Performance
 
-- **f16 is +10% over f32 and is a storage width, not a precision.** 1524.1 vs
-  1385.7 fps on the same content (jpbd 1080p, 3000-frame medians): half halves
-  the padded plane (26 → 13 MB at 1080p) and its pad stores, and the parity
-  oracle above holds. The f16 module's fused_r1 codegen is within a few
-  percent of the f32 module's (VGPR 120, 12 waves/SIMD; VALU 1710 vs 1777).
+- **The L2-resident block handoff is the win: +24% at the default config**
+  (jpbd 1080p GRAY16, 3000 frames, medians of 3, one session: 1515.9 → 1875.2
+  fps). Ladder: aliasing the block buffer to a 1 MB footprint +32%, a 128-row
+  ring (63 MB) +27.6%, a 64-row ring (32 MB) +29%; shipped with the 63 MB ring
+  and 3 stripes (+18.5%), because the 5-stripe version's extra dispatches and
+  barriers ate 7 points of it.
+- **One pad dispatch instead of 3–7 (+3.35%)**: the tw source planes are one
+  descriptor array read with a compile-time slice index. Deleting the pad pass
+  entirely and folding branchless reflection into fused was 4% *slower* — the
+  reflection costs more than the pass it replaces — and the padded plane is a
+  lossless copy (u16/f16 round-trip exactly, f32 keeps its bits), so there was
+  nothing else to gain there.
+- **The table loads are not the cost: 0.73%.** Ablating the window weights and
+  window_freq reads measured 15.5% of the frame, but vectorizing them (144 → 60
+  loads per thread through a transposed window copy and vec2/vec4 views of the
+  table buffer) returned 0.7%: the cost is the per-bin arithmetic (window
+  multiply, the zero-mean shift's two subtracts and two adds), not the loads.
+- **Radius 2/3 are spill-bound, not traffic-bound.** 219.7 fps at tbsize 5 and
+  135.5 at 7 against 1837 at 3; the ring bought them +1.4% and +0.4% only.
+  Their fused kernel is VGPR 192/8 waves (r2) and 256/5 waves (r3) with
+  20/28 KB scratch, and the live set is 32*TW floats per lane (160/224) — the
+  filter runs *between* the three transforms, so the whole cube is live and
+  cannot shrink without changing the decomposition.
+- **Half-precision spatial staging is rejected on accuracy, not speed.** It
+  measured +4.6%, but it adds a half rounding before the overlap-add and breaks
+  the u16 ≤1 LSB and f16/f32 oracles. The ring captured the same DRAM mechanism
+  without it.
+- **`SUB_BLOCKS` re-swept after the ring: 8 still wins.** 4 is 1.65% worse (u16)
+  and 0.59% (f16), 16 is 1.15% and 0.55% worse.
 - **Full-fp16 arithmetic is rejected: it measured 5.6% SLOWER, not 30%
   faster.** A throwaway `-DF16_MATH` build made `td[]`/`trans` half and the
   FFTW codelets compute in half: 1438.1 vs 1524.1 fps, and the parity oracle
@@ -138,36 +190,17 @@ force-pad / fail-pad probes: 2854 lines of C++ became 1565.
   collapsed (VOPD 562 → 15); the LDS/scratch halving and 12 → 16 waves/SIMD at
   radius 0 did not pay for it. Half only wins as a storage width, which is what
   ships.
-- **The pre-port gap was the exposed download, closed by the SDMA opt-in**
-  (mechanism: `notes/BILATERAL.md`). The default run lands within a few percent
-  of pre-R80.
+- **f16 is +2.8% over u16 and is a storage width, not a precision.** 1925.2 vs
+  1872.9 fps on the same content (jpbd 1080p, 3000-frame medians): half halves
+  the padded plane (26 → 13 MB at 1080p) and its pad stores, and the parity
+  oracle holds. The f16 module's fused_r1 codegen is within a few percent of
+  the f32 module's (VGPR 120, 12 waves/SIMD; VALU 1710 vs 1777).
 - **CPU in / CPU out** is core-inserted upload+download (both free: ReBAR memcpy
-  ahead, SDMA download). `--gpu-cache` is +14% (core planes read in place) and
-  chained instances +4%, the two extra pad dispatches per frame the residual.
+  ahead, SDMA download). `--gpu-cache` is −1% (core planes read in place) and
+  chained instances +4%, the residual being the pad dispatch and the ring
+  barriers the chain still pays.
 - **Fused codegen residue is deliberately left**: remaining IM2COL/window ALU
   and pointer-walk strength reduction; col2im already runs ~2x the references.
-
-### Possible optimizations (not yet tried)
-
-- **Radius 2/3 spill.** fused_r2/r3 still spill 20 480 / 28 672 scratch bytes
-  per invocation (VGPR 192/8 waves and 256/5 waves; the f16 module's r2 is
-  VGPR 216/7 waves, one wave worse than the f32 module). Cutting the live
-  `td[]` set without half arithmetic — restructuring a codelet to keep fewer
-  temporaries, or splitting the temporal loop — is the path to removing the
-  spills, and radius 2/3 is where the frame time is.
-- **Window loads.** `IM2COL_SLICE` issues `tw*16` strided `wt[]` loads per
-  thread (48 at radius 1) and FILTER_BIN re-reads the 3D window_freq table; the
-  window is per-(slice,lane) and could be staged once in LDS or, where the
-  access is lane-uniform, folded into the register set.
-- **`spatial` is f32** (`num_blocks*256*4`, 136 MB at 1080p — the larger of the
-  two buffers). Staging it as half would halve that handoff at one extra
-  rounding before col2im; the parity oracle would have to be relaxed for it.
-- **One pad dispatch per temporal slice** (3 at radius 1, 7 at radius 3). A
-  single dispatch writing all slices would remove `tw-1` launches and the
-  per-slice descriptor churn.
-- **Workgroup/sub-block sweep for the f16 module.** The half codegen moved
-  radius-2 occupancy (VGPR 216 vs 192), so `SUB_BLOCKS` and the launch shape
-  deserve a re-sweep under `-DIO_F16` specifically.
 
 ## Historical
 
@@ -252,8 +285,31 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   frames, so frame 23 (the fixture's last) saw a different temporal window; both
   sides now come from `source_clip()`. No perf change.
 
+- **2026-10-22 — the block handoff goes through L2 (+24%).** Both passes
+  streamed a 136 MB block buffer through VRAM every frame (aliasing it to 1 MB
+  measured +32%). Block rows now run through a 63 MB ring in 3 stripes
+  (+18.5%), `pad` writes every slice in one dispatch (+3.35%) and the table
+  loads are vectorized (+0.73%): 1515.9 → 1875.2 fps (jpbd 1080p GRAY16, 3000
+  frames, medians of 3). Rejected after measuring: half-precision staging
+  (+4.6%, accuracy), removing the pad pass (−4%, reflection costs more),
+  `SUB_BLOCKS` 4/16 (both worse).
+
 ## Open work
 
+- **Radius 2/3 register pressure** (the biggest remaining gap: 135–220 fps
+  against 1837 at radius 1). `td[]` is 32*TW floats per lane because the filter
+  runs between the three transforms, so it is the floor for this decomposition;
+  half arithmetic, LDS staging and more waves all lose (Performance). A
+  temporal-first order — real TW-point temporal DFT, then complex spatial
+  codelets — would replace the 224-float live set with ~96, at ~1.2x the FLOPs
+  and a changed rounding order the u16/ f32 oracles would have to absorb.
+- **Sigma-array reads** (non-scalar `ssystem` paths only): `sigma[(t*16+y)*9+x]`
+  is read with stride 9, so a `[x][t][y]` transpose would make each thread's 144
+  reads contiguous and take the same vec4 treatment the window got. Not the
+  default path, hence not done with it.
+- **The stripe floor.** 6 dispatches and 6 barriers per plane stand between the
+  32 MB-ring ceiling (+29%) and the shipped +18.5%; a column-direction stripe
+  would fit 2 stripes at 1080p (72 MB ring) if the reindexing is worth ~2-3%.
 - `pad`/`col2im` are 32x8 (256 invocations, the plugin's largest workgroup):
   a device at the Vulkan minimum of 128 cannot run DFTTest at all and now says
   so at creation (`tests/test_device_limits.py`). The local size is a literal in
@@ -275,8 +331,8 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 ## Debug env vars
 
 - `VSFEEL_DFTTEST_GPUTRACE=<frame>` — one-shot warm GPU timings for that frame
-  (`pad`/`fused`/`col2im`/total); defaults to frame 100 and requires the queue
-  family to report timestamp bits.
+  (`pad`, then the *first stripe's* `fused`/`col2im`, then the whole frame);
+  defaults to frame 100 and requires the queue family to report timestamp bits.
 - `VSFEEL_DFTTEST_TIMING=1` — per-frame host stage averages
   (`acquire`/`record`/`submit`).
 - `VSFEEL_DFTTEST_TRACE=1` — one line per submitted frame.

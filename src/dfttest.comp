@@ -33,19 +33,21 @@
  * final store rounds, with the same round-to-nearest-even a half clip wants.
  *
  * Compile-time variants: -DIO_U16 / -DIO_F16 / -DIO_F32 and exactly one of
- * -DENTRY_PAD / -DENTRY_FUSED / -DENTRY_COL2IM defining the entry point.
+ * -DENTRY_FUSED / -DENTRY_COL2IM defining the entry point.
  * Everything else
  * (radius, block_step, plane geometry, filter parameters, buffer offsets) is
  * passed per-dispatch through push constants so a single set of pipelines
  * serves every plane.
  *
- * Bindings (R80 GPU frames: the pad reads the core's source frame plane and
+ * Bindings (R80 GPU frames: pad reads the core's source frame planes and
  * col2im writes the output frame plane directly — the filter moves no bytes):
- *   0: wt[]       — window weights, then window_freq, then the sigma array
- *   1: padded     — device-local padded source planes (pad writes, fused reads)
- *   2: spatial    — device-local float block buffer between fused/col2im
- *   3: src        — the source frame plane the pad reads (one dispatch per slice)
- *   4: dst        — the output frame plane col2im writes
+ *   0: wt[]       — window, then window_freq, then sigma, then the transposed
+ *                   window copy im2col loads with vec4
+ *   1: padded     — the tw padded temporal planes (pad writes, fused reads)
+ *   2: spatial    — block buffer between fused/col2im (a ring of block rows)
+ *   3: dst        — the output frame plane col2im writes
+ *   4: src[tw]    — the tw temporal source frame planes pad reads
+ *   5/6: wt2/wt4  — vec2 and vec4 views of binding 0
  */
 
 #if !defined(IO_U16) && !defined(IO_F32) && !defined(IO_F16)
@@ -100,27 +102,32 @@ layout(constant_id = 1) const int FILTER_TYPE = 0;
 layout(constant_id = 2) const int ZMEAN = 1;
 
 layout(std430, binding = 0) readonly buffer WtBuf { float wt[]; };
+// Two vector views of the same table buffer: window_freq is read one (re,im)
+// pair at a time and the transposed window one four-float row at a time, so a
+// wide load replaces 2 and 4 scalar ones per bin.
+layout(std430, binding = 5) readonly buffer Wt2Buf { vec2 wt2[]; };
+layout(std430, binding = 6) readonly buffer Wt4Buf { vec4 wt4[]; };
+layout(std430, binding = 2) buffer SpatialBuf { float spatial[]; };
+// The tw temporal source planes the pad kernel reads, as one descriptor array:
+// slice t is src_bufs[t], indexed only with the compile-time slice number the
+// pad kernel's slice unroll produces.
 #if defined(IO_U16)
 layout(std430, binding = 1) buffer PaddedBuf { uint16_t padded16[]; };
-layout(std430, binding = 3) readonly buffer SrcBuf { uint16_t src16[]; };
-layout(std430, binding = 4) buffer DstBuf { uint16_t dst16[]; };
+layout(std430, binding = 3) buffer DstBuf { uint16_t dst16[]; };
+layout(std430, binding = 4) readonly buffer SrcBuf { uint16_t src16[]; } src_bufs[TW];
 #elif defined(IO_F16)
 layout(std430, binding = 1) buffer PaddedBuf { float16_t padded16[]; };
-layout(std430, binding = 3) readonly buffer SrcBuf { float16_t src16[]; };
-layout(std430, binding = 4) buffer DstBuf { float16_t dst16[]; };
+layout(std430, binding = 3) buffer DstBuf { float16_t dst16[]; };
+layout(std430, binding = 4) readonly buffer SrcBuf { float16_t src16[]; } src_bufs[TW];
 #else
 layout(std430, binding = 1) buffer PaddedBuf { uint padded_raw[]; };
-layout(std430, binding = 3) readonly buffer SrcBuf { uint src_raw[]; };
-layout(std430, binding = 4) buffer DstBuf { uint dst_raw[]; };
+layout(std430, binding = 3) buffer DstBuf { uint dst_raw[]; };
+layout(std430, binding = 4) readonly buffer SrcBuf { uint src_raw[]; } src_bufs[TW];
 #endif
-layout(std430, binding = 2) buffer SpatialBuf { float spatial[]; };
 
 layout(push_constant) uniform PushConstants {
-    int padded_base;    // byte offset into the padded buffer (per-plane buffer: 0)
     int spatial_base;   // float element offset into the spatial buffer
     int dst_base;       // byte offset into the output frame plane (0)
-    int src_base;       // byte offset into the source frame plane (0)
-    int pad_t0;         // padded temporal slice the pad dispatch writes
     int wt_base;        // float element offset of window[] in wt
     int wf_base;        // float element offset of window_freq[] in wt (-1 if !zmean)
     int sigma_base;     // float element offset of sigma[] in wt (-1 if scalar)
@@ -128,8 +135,21 @@ layout(push_constant) uniform PushConstants {
     int block_step;
     int width;          // frame plane width
     int height;         // frame plane height
-    int src_stride;     // source frame plane row stride in elements
+    int wf2_base;       // vec2 element offset of window_freq[] in wt
+    int win4_base;      // vec4 element offset of the transposed window[]
+    int src_stride[7];  // per-slice source frame plane row stride in elements
     int dst_stride;     // output frame plane row stride in elements
+    int pad_slice;      // pw * ph, the padded plane's samples per slice
+    // Block rows are processed in stripes whose spatial results must stay in
+    // L2: the block buffer is a ring of spatial_row_mask+1 block rows, indexed
+    // by (block row & mask). block_base/block_end bound the stripe's blocks
+    // (fused) and y_begin/y_end the output rows whose support is complete
+    // (col2im).
+    int spatial_row_mask;
+    int block_base;
+    int block_end;
+    int y_begin;
+    int y_end;
     float sigma;        // scaled scalar sigma (used when sigma_base < 0)
     float sigma2;
     float pmin;
@@ -1321,37 +1341,49 @@ void irdft16(inout float data[TD_SZ], int base) {
 }
 
 // ---------------------------------------------------------------------------
-// IO helpers (pad / row data / frame planes)
+// IO helpers (source frame planes)
 //
 // Every loader returns the internal f32 working value (the sample scaled by
 // SCALE), so the fused kernel is IO-type agnostic.
 // ---------------------------------------------------------------------------
 
-// the fused kernel reads the padded source planes: slice t of the window lives
-// at padded + t * pw * ph, padded_base is the per-plane buffer base (0).
-float load_fused(int slice, int sample_idx, int pad_slice) {
+// Sample `sample_idx` of temporal slice `t`'s padded plane. The padded plane is
+// a lossless copy of the source (u16/f16 round-trip exactly, f32 keeps its
+// bits), so this is bit-identical to reading the source plane directly.
+float load_fused(int t, int sample_idx) {
 #if defined(IO_U16)
-    return float(int(padded16[(pc.padded_base >> 1) + slice * pad_slice + sample_idx])) * SCALE;
+    return float(int(padded16[t * pc.pad_slice + sample_idx])) * SCALE;
 #elif defined(IO_F16)
     // half -> float is exact, and the *255 is exact in f32 as well
-    return float(padded16[(pc.padded_base >> 1) + slice * pad_slice + sample_idx]) * SCALE;
+    return float(padded16[t * pc.pad_slice + sample_idx]) * SCALE;
 #else
-    int byte = pc.padded_base + (slice * pad_slice + sample_idx) * ELEM_BYTES;
-    uint word = padded_raw[byte >> 2];
-    return uintBitsToFloat((word >> (8 * (byte & 3))) & ELEM_MASK) * SCALE;
+    return uintBitsToFloat(padded_raw[t * pc.pad_slice + sample_idx]) * SCALE;
 #endif
 }
 
-// the pad kernel reads the core's source frame plane (row stride in elements)
-float load_src(int sample_idx) {
+// Sample `sample_idx` of temporal slice `t`'s source frame plane (row stride in
+// elements). t is always the compile-time slice number of the pad kernel's
+// unrolled slice loop, so the descriptor array index folds away.
+float load_src(int t, int sample_idx) {
 #if defined(IO_U16)
-    return float(int(src16[(pc.src_base >> 1) + sample_idx])) * SCALE;
+    return float(int(src_bufs[t].src16[sample_idx])) * SCALE;
 #elif defined(IO_F16)
-    return float(src16[(pc.src_base >> 1) + sample_idx]) * SCALE;
+    return float(src_bufs[t].src16[sample_idx]) * SCALE;
 #else
-    int byte = pc.src_base + sample_idx * ELEM_BYTES;
-    uint word = src_raw[byte >> 2];
-    return uintBitsToFloat((word >> (8 * (byte & 3))) & ELEM_MASK) * SCALE;
+    return uintBitsToFloat(src_bufs[t].src_raw[sample_idx]) * SCALE;
+#endif
+}
+
+// pad writes one sample of slice t into the padded plane
+void store_padded(int t, int sample_idx, float v) {
+#if defined(IO_U16)
+    float x = v / SCALE;
+    x = clamp(x + 0.5, 0.0, PEAK);
+    padded16[t * pc.pad_slice + sample_idx] = uint16_t(uint(x) & ELEM_MASK);
+#elif defined(IO_F16)
+    padded16[t * pc.pad_slice + sample_idx] = float16_t(v / SCALE);
+#else
+    padded_raw[t * pc.pad_slice + sample_idx] = floatBitsToUint(v / SCALE);
 #endif
 }
 
@@ -1371,19 +1403,6 @@ void store_sample(int sample_idx, float v) {
 #endif
 }
 
-// the pad kernel writes the padded source into the device-local padded buffer
-void store_padded(int sample_idx, float v) {
-#if defined(IO_U16)
-    float x = v / SCALE;
-    x = clamp(x + 0.5, 0.0, PEAK);
-    padded16[(pc.padded_base >> 1) + sample_idx] = uint16_t(uint(x) & ELEM_MASK);
-#elif defined(IO_F16)
-    padded16[(pc.padded_base >> 1) + sample_idx] = float16_t(v / SCALE);
-#else
-    int byte = pc.padded_base + sample_idx * ELEM_BYTES;
-    padded_raw[byte >> 2] = floatBitsToUint(v / SCALE);
-#endif
-}
 
 // ---------------------------------------------------------------------------
 // Frequency-domain filter (matches the reference generated filter())
@@ -1462,11 +1481,18 @@ void filter_value(inout float re, inout float im, int x, int y, int t) {
 #define TD_IDFT_ALL(d) TD_IDFT_7(d)
 #endif
 
+// The window is stored transposed ([t][lane][j], the j values this thread needs
+// contiguous) for the vec4 load; the values are the same ones col2im reads
+// from the scalar layout, since the window is separable and symmetric.
 #define IM2COL_SLICE(d, i) { \
     const int row0 = (iy * pc.block_step) * pw + ix * pc.block_step + lane; \
-    const int wrow0 = pc.wt_base + ((i) * 16) * 16 + lane; \
-    for (int j = 0; j < 16; ++j) { \
-        d[(i) * 32 + j] = load_fused(i, row0 + j * pw, pw * ph) * wt[wrow0 + j * 16]; \
+    const int w4 = pc.win4_base + (i) * 64 + lane * 4; \
+    for (int q = 0; q < 4; ++q) { \
+        const vec4 w = wt4[w4 + q]; \
+        d[(i) * 32 + 4 * q + 0] = load_fused((i), row0 + (4 * q + 0) * pw) * w.x; \
+        d[(i) * 32 + 4 * q + 1] = load_fused((i), row0 + (4 * q + 1) * pw) * w.y; \
+        d[(i) * 32 + 4 * q + 2] = load_fused((i), row0 + (4 * q + 2) * pw) * w.z; \
+        d[(i) * 32 + 4 * q + 3] = load_fused((i), row0 + (4 * q + 3) * pw) * w.w; \
     } \
 }
 #define SPATIAL_SLICE(d, i) { \
@@ -1517,8 +1543,9 @@ void filter_value(inout float re, inout float im, int x, int y, int t) {
     float RE = d[IDX]; float IM = d[IDX + 1]; \
     float V1 = 0.0; float V2 = 0.0; \
     if (ZMEAN != 0) { \
-        V1 = gf * wt[pc.wf_base + ((i * 16 + j) * 9 + lane) * 2 + 0]; \
-        V2 = gf * wt[pc.wf_base + ((i * 16 + j) * 9 + lane) * 2 + 1]; \
+        const vec2 wf = wt2[pc.wf2_base + ((i * 16 + j) * 9 + lane)]; \
+        V1 = gf * wf.x; \
+        V2 = gf * wf.y; \
         RE -= V1; IM -= V2; \
     } \
     filter_value(RE, IM, lane, j, i); \
@@ -1539,15 +1566,21 @@ void filter_value(inout float re, inout float im, int x, int y, int t) {
 #define FILTER_ALL(d) FILTER_ALL_7(d)
 #endif
 
+
 // ---------------------------------------------------------------------------
-// pad: reflection-pad one source frame plane (single-fold mirror, identical to
-// the reference's reflect_pad kernel and the previous host-side
-// reflection_padding_impl) into this frame's padded buffer slice `pad_t0`.
-// One dispatch per temporal slice: the source is a core GPU frame plane read
-// with its own row stride, so no host upload exists anywhere in the filter.
+// pad: reflection-pad every temporal source plane of this frame (single-fold
+// mirror, identical to the reference's reflect_pad kernel) into this frame's
+// padded buffer, in one dispatch: each invocation writes one padded pixel of
+// all tw slices, so the tw source planes are read as one descriptor array with
+// a compile-time slice index and the launches collapse to one.
 // ---------------------------------------------------------------------------
 
 #if defined(ENTRY_PAD)
+
+#define PAD_SLICE(t) { \
+    store_padded((t), y * pw + x, \
+                 load_src((t), sy * pc.src_stride[(t)] + sx)); \
+}
 
 layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
 void main() {
@@ -1555,19 +1588,38 @@ void main() {
     const int ph = calc_pad_size(pc.height, pc.block_step);
     const int pad_x = (pw - pc.width) / 2;
     const int pad_y = (ph - pc.height) / 2;
-    const int pad_slice = pw * ph;
 
     for (int y = int(gl_GlobalInvocationID.y); y < ph; y += int(gl_NumWorkGroups.y) * 8) {
         for (int x = int(gl_GlobalInvocationID.x); x < pw; x += int(gl_NumWorkGroups.x) * 32) {
-            int sx = x - pad_x;
-            int sy = y - pad_y;
-            sx = sx < 0 ? -sx : (sx >= pc.width ? 2 * (pc.width - 1) - sx : sx);
-            sy = sy < 0 ? -sy : (sy >= pc.height ? 2 * (pc.height - 1) - sy : sy);
-            const float v = load_src(sy * pc.src_stride + sx);
-            store_padded(pc.pad_t0 * pad_slice + y * pw + x, v);
+            // one fold per side, so abs() is the whole reflection
+            const int sx = pc.width - 1 - abs(pc.width - 1 - abs(x - pad_x));
+            const int sy = pc.height - 1 - abs(pc.height - 1 - abs(y - pad_y));
+#if TW > 0
+            PAD_SLICE(0)
+#endif
+#if TW > 1
+            PAD_SLICE(1)
+#endif
+#if TW > 2
+            PAD_SLICE(2)
+#endif
+#if TW > 3
+            PAD_SLICE(3)
+#endif
+#if TW > 4
+            PAD_SLICE(4)
+#endif
+#if TW > 5
+            PAD_SLICE(5)
+#endif
+#if TW > 6
+            PAD_SLICE(6)
+#endif
         }
     }
 }
+
+#undef PAD_SLICE
 
 #endif // ENTRY_PAD
 
@@ -1597,12 +1649,10 @@ void main() {
     const int pw = calc_pad_size(pc.width, pc.block_step);
     const int ph = calc_pad_size(pc.height, pc.block_step);
     const int hn = calc_pad_num(pc.width, pc.block_step);
-    const int vn = calc_pad_num(pc.height, pc.block_step);
-    const int num_blocks = hn * vn;
     const int tsub = sub * TR_SUB;
 
-    for (int block_id = int(gl_WorkGroupID.x) * SUB_BLOCKS + sub;
-         block_id < num_blocks;
+    for (int block_id = pc.block_base + int(gl_WorkGroupID.x) * SUB_BLOCKS + sub;
+         block_id < pc.block_end;
          block_id += int(gl_NumWorkGroups.x) * SUB_BLOCKS) {
         const int ix = block_id % hn;
         const int iy = block_id / hn;
@@ -1665,7 +1715,9 @@ void main() {
         }
         subgroupBarrier();
         // write the block's center slice into the spatial buffer
-        const int dst_base = pc.spatial_base + block_id * 256;
+        const int dst_base =
+            pc.spatial_base +
+            ((iy & pc.spatial_row_mask) * hn + ix) * 256;
         for (int j = 0; j < 16; ++j) {
             spatial[dst_base + j * 16 + lane] = trans[tsub + TR_ROW_1 * lane + j];
         }
@@ -1689,7 +1741,8 @@ void main() {
             const int pad_x = (pw - pc.width) / 2;
     const int pad_y = (ph - pc.height) / 2;
 
-    for (int y = int(gl_GlobalInvocationID.y); y < ph; y += int(gl_NumWorkGroups.y) * 8) {
+    for (int y = pc.y_begin + int(gl_GlobalInvocationID.y); y <= pc.y_end;
+         y += int(gl_NumWorkGroups.y) * 8) {
         for (int x = int(gl_GlobalInvocationID.x); x < pw; x += int(gl_NumWorkGroups.x) * 32) {
             if (y < pad_y || y >= pad_y + pc.height || x < pad_x || x >= pad_x + pc.width) {
                 continue;
@@ -1705,7 +1758,8 @@ void main() {
                 const int offset_y = y - i * pc.block_step;
                 for (int j = j1; j <= j2; ++j) {
                     const int offset_x = x - j * pc.block_step;
-                    const int src_offset = ((i * hn + j) * 16 + offset_y) * 16 + offset_x;
+                    const int src_offset =
+                        (((i & pc.spatial_row_mask) * hn + j) * 16 + offset_y) * 16 + offset_x;
                     const int window_offset = (pc.radius * 16 + offset_y) * 16 + offset_x;
                     sum += spatial[pc.spatial_base + src_offset] * wt[pc.wt_base + window_offset];
                 }

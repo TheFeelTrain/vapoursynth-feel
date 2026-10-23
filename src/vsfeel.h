@@ -575,15 +575,17 @@ inline void gpu_destroy_buffer(const GPUDevice & g, GpuBuffer & b) {
     }
 }
 
-// Bind `count` storage buffers to set 0, bindings 0..count-1 through the push
-// descriptor set the layout declares. Each dispatch rebinds its own view of the
-// planes, which is why nothing here is allocated from a descriptor pool.
-inline void gpu_push_buffers(const GPUDevice & g, VkCommandBuffer cmd,
-                             VkPipelineLayout layout, const VkBuffer * buffers,
-                             uint32_t count) {
+// Bind `count` storage buffers to set 0, bindings `first`..first+count-1
+// through the push descriptor set the layout declares. Each dispatch rebinds
+// its own view of the planes, which is why nothing here is allocated from a
+// descriptor pool.
+inline void gpu_push_buffers_at(const GPUDevice & g, VkCommandBuffer cmd,
+                                VkPipelineLayout layout, uint32_t first,
+                                const VkBuffer * buffers, uint32_t count) {
     // The arrays are fixed at GPU_MAX_BINDINGS; a call site that binds more would
     // write past them, so clamp rather than trust the caller.
-    count = std::min(count, GPU_MAX_BINDINGS);
+    count =
+        std::min(count, GPU_MAX_BINDINGS - std::min(first, GPU_MAX_BINDINGS));
     VkDescriptorBufferInfo infos[GPU_MAX_BINDINGS] {};
     VkWriteDescriptorSet writes[GPU_MAX_BINDINGS] {};
     for (uint32_t i = 0; i < count; ++i) {
@@ -591,13 +593,41 @@ inline void gpu_push_buffers(const GPUDevice & g, VkCommandBuffer cmd,
         infos[i].offset = 0;
         infos[i].range = VK_WHOLE_SIZE;
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstBinding = i;
+        writes[i].dstBinding = first + i;
         writes[i].descriptorCount = 1;
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &infos[i];
     }
     g.vk->vkCmdPushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0,
                                  count, writes);
+}
+
+inline void gpu_push_buffers(const GPUDevice & g, VkCommandBuffer cmd,
+                             VkPipelineLayout layout, const VkBuffer * buffers,
+                             uint32_t count) {
+    gpu_push_buffers_at(g, cmd, layout, 0, buffers, count);
+}
+
+// Bind one descriptor array (`count` consecutive storage buffers) to a single
+// binding, the form a shader's `buffer Buf {...} b[count];` declares.
+inline void gpu_push_buffer_array(const GPUDevice & g, VkCommandBuffer cmd,
+                                  VkPipelineLayout layout, uint32_t binding,
+                                  const VkBuffer * buffers, uint32_t count) {
+    count = std::min(count, GPU_MAX_BINDINGS);
+    VkDescriptorBufferInfo infos[GPU_MAX_BINDINGS] {};
+    for (uint32_t i = 0; i < count; ++i) {
+        infos[i].buffer = buffers[i];
+        infos[i].offset = 0;
+        infos[i].range = VK_WHOLE_SIZE;
+    }
+    VkWriteDescriptorSet write {};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstBinding = binding;
+    write.descriptorCount = count;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = infos;
+    g.vk->vkCmdPushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0,
+                                 1, &write);
 }
 
 inline void gpu_push_constants(const GPUDevice & g, VkCommandBuffer cmd,
@@ -639,9 +669,14 @@ inline void gpu_barrier(const GPUDevice & g, VkCommandBuffer cmd) {
 // so a conformant device always fits, but the count is checked rather than
 // assumed.
 inline std::variant<VkDescriptorSetLayout, std::string>
-gpu_push_set_layout(const GPUDevice & g, uint32_t bindings) {
-    if (bindings > g.max_push_descriptors || bindings > GPU_MAX_BINDINGS) {
-        return "a pipeline needs " + std::to_string(bindings) +
+gpu_push_set_layout(const GPUDevice & g, const uint32_t * counts,
+                    uint32_t bindings) {
+    uint64_t descriptors = 0;
+    for (uint32_t i = 0; i < bindings; ++i) {
+        descriptors += counts[i];
+    }
+    if (descriptors > g.max_push_descriptors || bindings > GPU_MAX_BINDINGS) {
+        return "a pipeline needs " + std::to_string(descriptors) +
                " push descriptors, more than the " +
                std::to_string(
                    std::min(g.max_push_descriptors, GPU_MAX_BINDINGS)) +
@@ -651,7 +686,7 @@ gpu_push_set_layout(const GPUDevice & g, uint32_t bindings) {
     for (uint32_t i = 0; i < bindings; ++i) {
         b[i].binding = i;
         b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        b[i].descriptorCount = 1;
+        b[i].descriptorCount = counts[i];
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo info {};
@@ -665,6 +700,15 @@ gpu_push_set_layout(const GPUDevice & g, uint32_t bindings) {
         return "vkCreateDescriptorSetLayout failed"s;
     }
     return layout;
+}
+
+inline std::variant<VkDescriptorSetLayout, std::string>
+gpu_push_set_layout(const GPUDevice & g, uint32_t bindings) {
+    uint32_t counts[GPU_MAX_BINDINGS] {};
+    for (uint32_t i = 0; i < std::min(bindings, GPU_MAX_BINDINGS); ++i) {
+        counts[i] = 1;
+    }
+    return gpu_push_set_layout(g, counts, bindings);
 }
 
 inline std::variant<VkPipelineLayout, std::string>
