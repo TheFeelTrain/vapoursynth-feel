@@ -640,6 +640,11 @@ if(WIN32 AND NOT MSVC)
     # libgcc_s_seh-1.dll and libwinpthread-1.dll is not loadable by a stock
     # VapourSynth install. -s drops the symbol table from the release DLL.
     target_link_options(vsfeel PRIVATE -static-libgcc -static-libstdc++ -static -s)
+    # fesetenv.o (libmingwex) now refers to __mingw_fe_dfl_env, which
+    # libmingw32's embedded CRT_fp10.o defines. GNU ld scans libmingw32 before
+    # libmingwex pulls fesetenv.o and never rescans it, so a shared library has
+    # to ask for the symbol up front.
+    target_link_options(vsfeel PRIVATE -Wl,--undefined=__mingw_fe_dfl_env)
 endif()
 target_link_libraries(vsfeel PRIVATE Vulkan::Headers)
 target_include_directories(vsfeel PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
