@@ -22,27 +22,28 @@ Scoreboard — jpbd 1080p GRAY16, 3000 frames, medians of 3 through
 
 | mode | vsfeel | vszipcl | ratio |
 |---|---|---|---|
-| CPU cache (benchmark default) | 1872.9 | 909.6 | 2.06x |
-| `--gpu-cache` | 1855.3 | 862.7 | 2.15x |
-| `--synthetic` BlankClip | 1865.0 | 901.5 | 2.07x |
+| CPU cache (benchmark default) | 1984.9 | 887.4 | 2.24x |
+| `--gpu-cache` | 2013.6 | 851.1 | 2.37x |
+| `--synthetic` BlankClip | 2001.8 | 895.0 | 2.24x |
 
 IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
 (`--format u16|f16|f32`; the f16 clip carries the u16 clip's content):
 
 | io | vsfeel | vszipcl |
 |---|---|---|
-| u16 | 1872.9 | 909.6 |
-| f16 | 1925.2 | no f16 path |
-| f32 | 1251.2 | 627.5 |
+| u16 | 1984.9 | 887.4 |
+| f16 | 1997.6 | no f16 path |
+| f32 | 1221.7 | 605.3 |
 
 - Neither reference implements an f16 DFTTest, so the half path is graded
   against the f32 path on the losslessly widened clip, not against vszipcl.
 
-- The three modes agree within 2%: the frame is the kernels, and with the
+- The three modes agree within 1.5%: the frame is the kernels, and with the
   transfer queue the transfers ride along instead of adding a stage.
-- Temporal radius is where the frame time is not uniform: 1837 fps at tbsize 3,
-  219.7 at 5 and 135.5 at 7 (same session, medians of 3). Radius 2/3 are
-  register-spill bound (Performance, Open work).
+- Temporal radius, same session and medians of 3: 2566.2 fps at tbsize 1,
+  1984.9 at 3, 1328.6 at 5, 910.6 at 7. That is 67% and 46% of the tbsize-3
+  number where vszipcl keeps 75% and 34% (Implementation has the cube layout
+  that bought it).
 
 ## Implementation
 
@@ -103,6 +104,14 @@ IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
   writing the centre temporal slice of each block into the ring; it loads the
   window four j at a time from the transposed copy (`vec4`) and window_freq one
   `(re, im)` pair at a time (`vec2`).
+- The transformed cube is 9 x-bins x 16 y-bins x tw slices, and every one of
+  the 16 lanes holds 9 of the 144 bins: lanes 0..8 keep their own x-bin's
+  y = 0..8 (`x = lane, y = k`), lanes 9..15 take one whole y-bin each
+  (`y = lane, x = k`), so a lane's cube is `18*tw` floats and the bin's table
+  slot is `y*9 + x` under a single select (no division). The y-bins the workers
+  do not keep are pooled through the transpose buffer once per slice, which
+  costs 2 LDS round trips per slice. See Performance for why 9 bins per lane
+  instead of 16 per 9 lanes.
 - `ENTRY_COL2IM` overlap-adds into the output plane with its stride, reading the
   window from the scalar table (its offsets are per pixel, so nothing
   vectorizes there).
@@ -169,12 +178,18 @@ force-pad / fail-pad probes.
   loads per thread through a transposed window copy and vec2/vec4 views of the
   table buffer) returned 0.7%: the cost is the per-bin arithmetic (window
   multiply, the zero-mean shift's two subtracts and two adds), not the loads.
-- **Radius 2/3 are spill-bound, not traffic-bound.** 219.7 fps at tbsize 5 and
-  135.5 at 7 against 1837 at 3; the ring bought them +1.4% and +0.4% only.
-  Their fused kernel is VGPR 192/8 waves (r2) and 256/5 waves (r3) with
-  20/28 KB scratch, and the live set is 32*TW floats per lane (160/224) — the
-  filter runs *between* the three transforms, so the whole cube is live and
-  cannot shrink without changing the decomposition.
+- **Radius 2/3: the cube did not fit, and spreading it over all 16 lanes fixed
+  it (6.2x at tbsize 5, 6.7x at 7, and +6.8% at 3).** The cube is live between the
+  three transforms, so at 32*TW floats per lane (160/224) it went past the
+  register budget: ACO gave the r2 module 216 VGPRs and spilled 640 B with 734
+  scratch ops (r3: 256 and 896 B / 1026), which cost 3–6x — the AMD OpenCL
+  reference compiles the same algorithm to 256 VGPRs with *no* private segment,
+  and it keeps 75%/34% of its tbsize-3 fps. Holding 9 bins per lane instead of
+  16 per 9 lanes (Implementation) drops the cube to 90/126 floats: r2/r3 now
+  compile to **191 VGPRs with zero scratch** (4788/6912 instructions, down from
+  6888/10215) and the whole frame lands at 1328.6/910.6 fps. The same change
+  also fills the 7 idle lanes during the temporal phase, which is where the
+  +6.8% at tbsize 3 comes from.
 - **Half-precision spatial staging is rejected on accuracy, not speed.** It
   measured +4.6%, but it adds a half rounding before the overlap-add and breaks
   the u16 ≤1 LSB and f16/f32 oracles. The ring captured the same DRAM mechanism
@@ -190,8 +205,8 @@ force-pad / fail-pad probes.
   collapsed (VOPD 562 → 15); the LDS/scratch halving and 12 → 16 waves/SIMD at
   radius 0 did not pay for it. Half only wins as a storage width, which is what
   ships.
-- **f16 is +2.8% over u16 and is a storage width, not a precision.** 1925.2 vs
-  1872.9 fps on the same content (jpbd 1080p, 3000-frame medians): half halves
+- **f16 is +0.6% over u16 and is a storage width, not a precision.** 1997.6 vs
+  1984.9 fps on the same content (jpbd 1080p, 3000-frame medians): half halves
   the padded plane (26 → 13 MB at 1080p) and its pad stores, and the parity
   oracle holds. The f16 module's fused_r1 codegen is within a few percent of
   the f32 module's (VGPR 120, 12 waves/SIMD; VALU 1710 vs 1777).
@@ -294,15 +309,25 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   (+4.6%, accuracy), removing the pad pass (−4%, reflection costs more),
   `SUB_BLOCKS` 4/16 (both worse).
 
+- **2026-10-23 — the cube spread over all 16 lanes (6.2x at tbsize 5).** The
+  transformed cube (9 x-bins x 16 y-bins x tw slices) lived as 32*tw floats per
+  lane in the 9 lanes that own an x-bin, which ACO could not keep in registers:
+  r2 spilled 640 B with 734 scratch ops and r3 896 B with 1026, for 208/131 fps
+  where the reference keeps 75%/34% of its tbsize-3 fps. Every lane now holds 9
+  bins (18*tw floats) and the surplus y-bins are pooled through the transpose
+  buffer once per slice; r2/r3 compile to 191 VGPRs with no scratch and land at
+  1328.6/910.6 fps (same-session A/B: 6.2x and 6.7x), plus +6.8% at tbsize 3
+  from the now-full 16 lanes (1984.9 fps; jpbd 1080p GRAY16, 3000 frames,
+  medians of 3).
+
 ## Open work
 
-- **Radius 2/3 register pressure** (the biggest remaining gap: 135–220 fps
-  against 1837 at radius 1). `td[]` is 32*TW floats per lane because the filter
-  runs between the three transforms, so it is the floor for this decomposition;
-  half arithmetic, LDS staging and more waves all lose (Performance). A
-  temporal-first order — real TW-point temporal DFT, then complex spatial
-  codelets — would replace the 224-float live set with ~96, at ~1.2x the FLOPs
-  and a changed rounding order the u16/ f32 oracles would have to absorb.
+- **Radius 2/3 retention** (46–67% of the tbsize-3 fps against vszipcl's
+  34–75%). The cube is now spill-free at 191 VGPRs, which is still 7 waves
+  against 10 at tbsize 3: the remaining gap is occupancy, and closing it needs
+  the cube spread over 32 lanes per block rather than 16 (18 bins per block
+  over 16 lanes is 2*18*tw floats; over 32 lanes it would be 9*tw). That is a
+  full lane-remapping rewrite of the transposes, not a tuning change.
 - **Sigma-array reads** (non-scalar `ssystem` paths only): `sigma[(t*16+y)*9+x]`
   is read with stride 9, so a `[x][t][y]` transpose would make each thread's 144
   reads contiguous and take the same vec4 treatment the window got. Not the

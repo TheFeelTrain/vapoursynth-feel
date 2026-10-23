@@ -8,7 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- DFTTest is about 24% faster
+- DFTTest is about 30% faster
+- DFTTest with larger temporal windows (tbsize 5 and 7) is up to 6.7x faster
 
 ## [1.2.0] - 2026-10-21
 
