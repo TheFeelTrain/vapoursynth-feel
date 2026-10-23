@@ -37,8 +37,8 @@ channels=UV`, 3000 frames, medians of 3 through `tools/benchmark.py`:
 
 | mode | vsfeel | vszipcl | knlmvk | ratio |
 |---|---|---|---|---|
-| CPU cache (benchmark default) | 1020.9 | 550.9 | 622.0 | 1.64x |
-| `--gpu-cache` | 1026.7 | 460.0 | 625.5 | 1.64x |
+| `--cpu-cache --download` (CPU cache) | 1020.9 | 550.9 | 622.0 | 1.64x |
+| `--download` (resident GPU input) | 1026.7 | 460.0 | 625.5 | 1.64x |
 
 - The two modes agree within 1%: the frame is the interleaved sweep rounds, and
   the transfers ride along on the transfer queue.
@@ -46,7 +46,7 @@ channels=UV`, 3000 frames, medians of 3 through `tools/benchmark.py`:
   (281 vs 279 fps, ~0.7%); its absolute fps are void with the rest of the
   pre-fix numbers, but the parity it showed is a relative result.
 
-io depth (`--gpu-cache --no-download`, same config, medians of 3):
+io depth (default: resident GPU input, no download, same config, medians of 3):
 
 | io | vsfeel | vs u16 | vszipcl |
 |---|---:|---:|---:|
@@ -144,13 +144,14 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
   window already shipped, a probe that also narrowed the weight ring, the
   accumulators and the LDS tiles to half (no range management, output wrong by
   design) measured 1053.7 → 1162.8 fps; narrowing only the ring measured
-  1056.2 → 1168.2 fps (f16 io, `--gpu-cache --no-download`, 3000 frames, medians
-  of 3). So the ring is the whole of it and the half LDS/accumulators are
-  slightly negative, the same mechanism as `notes/BILATERAL.md` and
-  `notes/GAUSSBLUR.md`: a scalar half access still takes a load slot and every
-  tap adds a widening convert, and ACO emits scalar `v_fma_f16`, never a packed
-  `v_pk_*`. The fp16 ring alone already fails the accuracy bar (2^-11 relative,
-  ~180 codes u16 at `a=64`), so f16 ships mixed precision.
+  1056.2 → 1168.2 fps (f16 io, default: resident GPU input, no download, 3000
+  frames, medians of 3). So the ring is the whole of it and the half
+  LDS/accumulators are slightly negative, the same mechanism as
+  `notes/BILATERAL.md` and `notes/GAUSSBLUR.md`: a scalar half access still
+  takes a load slot and every tap adds a widening convert, and ACO emits scalar
+  `v_fma_f16`, never a packed `v_pk_*`. The fp16 ring alone already fails the
+  accuracy bar (2^-11 relative, ~180 codes u16 at `a=64`), so f16 ships mixed
+  precision.
 - **Where the half io win comes from.** The window halves to the clip's own
   2-byte samples, so the f16 sweep reads half the bytes per guide/source load
   that the f32 io arm does; weights, accumulators and LDS are identical at every
@@ -185,7 +186,8 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
   increase behind its transfer cost, which is why the first A/B looked
   plane-count dependent.
 - **Transfers** (mechanism: `notes/BILATERAL.md`): with the SDMA opt-in the
-  CPU-in default is at parity and `--gpu-cache` is +1.6% (core planes in place).
+  CPU-fed chain (`--cpu-cache --download`) is at parity and `--download` is
+  +1.6% (core planes in place).
 - **The window is rebuilt every frame.** A persistent GPU slot cache copying
   only the layers that newly entered the window would cut the compose cost, but
   at the shipped `d=2` it is ~2% and not worth the holder/lifetime machinery the
@@ -197,14 +199,14 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
 The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
 - **2026-10-18 — f16 io shipped; full-fp16 internals rejected.** The half window
-  measured +3.5% over u16 and +12.2% over f32 (`--gpu-cache --no-download`, 3000
-  frames, medians of 3). The probe that also narrowed the ring, accumulators and
-  LDS tiles measured +10.4%, below the 30% bar that would have paid for its
-  accuracy loss, so weights/accumulators/LDS stay f32 and half is a storage
-  width. The plain fp16 ring's own accuracy failure is the banner's earlier
-  round.
+  measured +3.5% over u16 and +12.2% over f32 (default: resident GPU input, no
+  download, 3000 frames, medians of 3). The probe that also narrowed the ring,
+  accumulators and LDS tiles measured +10.4%, below the 30% bar that would have
+  paid for its accuracy loss, so weights/accumulators/LDS stay f32 and half is a
+  storage width. The plain fp16 ring's own accuracy failure is the banner's
+  earlier round.
 - **The R80 port's scoreboard is void.** It read 1082.9 → 1080.3 (CPU cache) and
-  1065.9 → 1083.4 (`--gpu-cache`) fps against the pre-fix benchmark harness
+  1065.9 → 1083.4 (`--download`) fps against the pre-fix benchmark harness
   (`notes/METHOD.md`); the same-session deltas it carried (−0.2%, +1.6%) stand.
   The banner's table replaces the absolute numbers.
 - **R80 port** (`src/nlmeans.cpp` 1818 → ~1090 lines). Deleted: the slot pool

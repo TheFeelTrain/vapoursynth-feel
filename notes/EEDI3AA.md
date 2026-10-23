@@ -11,8 +11,8 @@ wrapper, the `eedi3aa` benchmark entry (1000 f, ns=8) and `tests/test_eedi3aa.py
 ship.
 
 Scoreboard — real based_aa clip (jpbd 2x Point → 3840x2160, 1000 f,
-`tools/benchmark.py --filter eedi3aa --gpu-cache --no-download --format <u16|f16|f32>`,
-medians of 3):
+`tools/benchmark.py --filter eedi3aa --format <u16|f16|f32>` (the default
+device-resident, resident-output mode), medians of 3):
 
 | bit depth | vsfeel | vszipcl chain | eedi3vk2 chain |
 |---|---|---|---|
@@ -211,10 +211,10 @@ us per sub-pass.
 So the **row kernel is 77% of the GPU time**, prep 18%, vcheck 3%, tail 2.4%.
 That GPU time is hidden, not the frame: ablating the row kernel end to end
 changes the graded run by −0.4% (176.1 → 175.5 fps, interleaved 6×2-repeat A/B,
-`--gpu-cache --no-download`), because the per-output-frame transfer bill is the
-frame (`notes/EEDI3.md`). The kernel itself is attributed in `notes/EEDI3.md`'s
-Performance section; the short version is that it is ALU-issue bound at ~1 IPC,
-not load bound.
+default: resident GPU input, no download), because the per-output-frame
+transfer bill is the frame (`notes/EEDI3.md`). The kernel itself is attributed
+in `notes/EEDI3.md`'s Performance section; the short version is that it is
+ALU-issue bound at ~1 IPC, not load bound.
 
 **Where `feel_aa` still differs from `based_aa`**, measured on 1080p against the
 reference chain:

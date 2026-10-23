@@ -21,7 +21,7 @@ Usage:
     uv run tools/benchmark.py --filter bm3d --ab-so a.so b.so --ab-rounds 3 --ab-order abba
     uv run tools/benchmark.py --frames 2000 --clip /path/to/input.mkv
     uv run tools/benchmark.py --no-cache          # live decode: full chain incl. BestSource
-    uv run tools/benchmark.py --filter gaussblur --gpu-cache --no-download
+    uv run tools/benchmark.py --filter gaussblur --cpu-cache --download  # old default
     uv run tools/benchmark.py --check-fresh       # refuse to run against a stale .so
 
 Every plugin is timed --repeat times (default 3) and the median is reported with
@@ -47,12 +47,17 @@ FILTERS) instead of an explicit --frames. The run should last a couple of
 seconds, so a ~2000 fps filter wants 4000+ frames; a few hundred frames measures
 the clock ramp and run-to-run swing, not the filter.
 
---no-download hands vspipe its ``--`` no-output target, which leaves a GPU
-resident output resident: nothing reads the pixels, so the implicit download is
-not inserted and the fps is the script's own cost. Without it that download can
-dominate a fast filter. The filter
-still runs its full-frame kernels; notes/METHOD.md has what the mode's residual
-costs.
+The default path is the chain a GPU filter actually runs in. The cached frames
+are also uploaded to the device and handed to every arm, so a filter that takes
+vnode:gpu input consumes them directly and a CPU filter pays the
+std.GPUDownload it would pay mid-chain; and vspipe runs with its ``--``
+no-output target, which leaves a GPU resident output resident: nothing reads the
+pixels, so the implicit download is not inserted and the fps is the script's own
+cost. --cpu-cache keeps the cached frames in RAM instead (a GPU filter pays the
+upload), and --download writes to /dev/null so the output transfer is timed
+too. The two together measure the CPU-fed, downloaded chain that used to be the
+default. The filter still runs its full-frame kernels; notes/METHOD.md has what
+the mode's residual costs.
 
 A/B mode (--ab-so and/or --ab-a-env/--ab-b-env) compares two builds or two env
 configs in one session instead of a scratch script: each round measures arm A
@@ -99,7 +104,7 @@ def make_vpy(
     synth_format: str | None,
     cache_frames: int | None = None,
     cache_conv: str | None = None,
-    gpu_cache: bool = False,
+    gpu_cache: bool = True,
     gpu_cache_mb: int | None = None,
     scale: float = 1.0,
 ) -> str:
@@ -127,15 +132,15 @@ def make_vpy(
             f"clip = core.resize.Point(clip, round(clip.width * {scale}), "
             f"round(clip.height * {scale}))\n"
         )
-    # With --gpu-cache the script also defines `clip_gpu`: the same frames,
-    # already resident on the device. The upload happens while the script is
-    # evaluated (before vspipe starts timing), exactly like the CPU preload, so a
-    # GPU-capable filter can be timed without the GPUUpload stage in the graph.
-    # Every arm is given it: plugins that declare vnode:gpu/vnode:all consume it
-    # directly, and the rest are called on std.GPUDownload(clip_gpu) so they pay
-    # the transfer a real chain would charge them. Handing a legacy plugin the
-    # CPU cache instead is not a fair comparison -- its neighbour's input sits in
-    # VRAM and it would never see that cost.
+    # The default path also defines `clip_gpu`: the same frames, already resident
+    # on the device. The upload happens while the script is evaluated (before
+    # vspipe starts timing), exactly like the CPU preload, so a GPU-capable filter
+    # can be timed without the GPUUpload stage in the graph. Every arm is given
+    # it: plugins that declare vnode:gpu/vnode:all consume it directly, and the
+    # rest are called on std.GPUDownload(clip_gpu) so they pay the transfer a real
+    # chain would charge them. Handing a legacy plugin the CPU cache instead is
+    # not a fair comparison -- its neighbour's input sits in VRAM and it would
+    # never see that cost. --cpu-cache drops clip_gpu and keeps the CPU cache.
     #
     # Two traps when measuring transfers against this:
     #  - `std.GPUDownload(<CPU clip>)` is a silent no-op. gpuTransferCreate
@@ -179,8 +184,9 @@ def make_vpy(
             if (gpu_cache and gpu_cache_mb)
             else f"m = min({cache_frames}, clip.num_frames)\n"
         )
-        # The cap has to be measured on the cached format, so with --gpu-cache
-        # the conversion comes first; without it the order is unchanged.
+        # The cap has to be measured on the cached format, so on the default
+        # (device-resident) path the conversion comes first; with --cpu-cache
+        # the order is unchanged.
         if gpu_cache:
             head = conv + size_lines
         else:
@@ -224,9 +230,10 @@ def make_vpy(
     else:
         clip_expr = f"BestSource(cachepath=None).source({clip!r}, 32)"
         cache_setup = ""
-        # --gpu-cache uploads the *converted* clip (the cache path does the same
-        # before its upload): `clip_gpu` has to be the frames the chain would
-        # otherwise read, format and depth included, not the raw source.
+        # --cpu-cache leaves the cached clip in RAM; otherwise the cache path
+        # uploads the *converted* clip (as above): `clip_gpu` has to be the
+        # frames the chain would otherwise read, format and depth included, not
+        # the raw source.
         conv = f"clip = {scaled(cache_conv)}\n" if (gpu_cache and cache_conv) else ""
         gpu_lines = scale_lines + (
             conv + "clip_gpu = core.std.GPUUpload(clip=clip)\n" if gpu_cache else ""
@@ -292,7 +299,7 @@ def make_aa_vpy(
     eedi3_field: int = 3,
     io_format: str = AA_MASK_FORMAT,
     cache_bytes: int | None = None,
-    gpu_cache: bool = False,
+    gpu_cache: bool = True,
     download_inputs: bool = False,
     upscale: bool = True,
 ) -> str:
@@ -335,7 +342,7 @@ def make_aa_vpy(
         else:
             cap_lines = f"m = min({cache_frames}, ss.num_frames)\n"
         if gpu_cache:
-            # --gpu-cache: put the cached frames on the device, so the timed
+            # The default path puts the cached frames on the device, so the timed
             # region has no GPUUpload stage in the graph. Both device caches are
             # warmed into the core's own frame cache while the script is
             # evaluated (outside the timed region), exactly like make_vpy's
@@ -395,8 +402,9 @@ sclip = {"core.std.Interleave([clip, clip])" if upscale and eedi3_field > 1 else
 """
     else:
         # --no-cache (or --cache-frames 0): no preload to move off the clock,
-        # but --gpu-cache still has to put the live frames on the device or the
-        # run is reported as GPU-fed while the graph holds no GPU node at all.
+        # but the default path still has to put the live frames on the device or
+        # the run is reported as GPU-fed while the graph holds no GPU node at
+        # all. --cpu-cache builds the plain CPU chain instead.
         if gpu_cache:
             gpu_sclip = (
                 "core.std.Interleave([clip_gpu, clip_gpu])"
@@ -573,9 +581,9 @@ class FilterSpec:
     aa: bool = False
     aa_scale: int = 2
     # Plugins whose call for this filter takes a GPU-resident input, i.e. the
-    # filter is declared vnode:gpu or vnode:all. Under --gpu-cache only these get
-    # `clip_gpu` (no core GPUUpload stage); every other arm keeps the CPU cache,
-    # so one run still compares like with like.
+    # filter is declared vnode:gpu or vnode:all. Only these get `clip_gpu`
+    # directly; every other arm is handed the same frames through
+    # std.GPUDownload, so one run still compares like with like.
     gpu_plugins: frozenset[str] = frozenset()
 
 
@@ -866,7 +874,7 @@ FILTERS: dict[str, FilterSpec] = {
         ],
         build=_bilateral_build,
         # vsfeel's Bilateral runs on the R80 GPU API (vnode:gpu in/out); the
-        # references stay on the CPU cache.
+        # references take the downloaded frames.
         gpu_plugins=frozenset({"vsfeel"}),
     ),
     "gaussblur": FilterSpec(
@@ -877,7 +885,7 @@ FILTERS: dict[str, FilterSpec] = {
         ],
         build=_gauss_build,
         # vsfeel's GaussBlur is vnode:gpu under the R80 GPU API; the
-        # references stay on the CPU cache.
+        # references take the downloaded frames.
         gpu_plugins=frozenset({"vsfeel"}),
     ),
     "dfttest": FilterSpec(
@@ -1048,7 +1056,7 @@ FILTERS: dict[str, FilterSpec] = {
         ],
         build=_nnedi3_build,
         # vsfeel's NNEDI3 is vnode:gpu under the R80 GPU API; the references
-        # stay on the CPU cache.
+        # take the downloaded frames.
         gpu_plugins=frozenset({"vsfeel"}),
     ),
 }
@@ -1101,7 +1109,7 @@ def vspipe_binary() -> str:
 
 
 def run_vspipe(
-    vpy_path: Path, frames: int, timeout: float = DEFAULT_TIMEOUT, no_download: bool = False
+    vpy_path: Path, frames: int, timeout: float = DEFAULT_TIMEOUT, no_download: bool = True
 ) -> float | None:
     """Time one vspipe run; return its fps, or None if the run failed.
 
@@ -1110,10 +1118,11 @@ def run_vspipe(
     other than the one requested — timing a different amount of work than the
     header advertises is not a measurement.
 
-    ``no_download`` uses vspipe's ``--`` no-output target: the frames are still
-    requested, but a GPU resident output is consumed as-is instead of through an
-    implicit GPUDownload (vspipe's Ex output query passes sgfAllowGPUResident
-    exactly when it writes no output).
+    ``no_download`` (the default) uses vspipe's ``--`` no-output target: the
+    frames are still requested, but a GPU resident output is consumed as-is
+    instead of through an implicit GPUDownload (vspipe's Ex output query passes
+    sgfAllowGPUResident exactly when it writes no output). Pass False to write
+    /dev/null and time the download as part of the chain.
     """
     outfile = "--" if no_download else "/dev/null"
     cmd = [vspipe_binary(), "--start", "0", "--end", str(frames - 1), str(vpy_path), outfile]
@@ -1161,9 +1170,9 @@ def bench(
     cache_frames: int | None = None,
     cache_conv: str | None = None,
     timeout: float = DEFAULT_TIMEOUT,
-    gpu_cache: bool = False,
+    gpu_cache: bool = True,
     gpu_cache_mb: int | None = None,
-    no_download: bool = False,
+    no_download: bool = True,
     scale: float = 1.0,
 ) -> float | None:
     vpy = make_vpy(
@@ -1194,9 +1203,9 @@ def bench_aa(
     io_format: str = AA_MASK_FORMAT,
     cache_bytes: int | None = None,
     timeout: float = DEFAULT_TIMEOUT,
-    gpu_cache: bool = False,
+    gpu_cache: bool = True,
     download_inputs: bool = False,
-    no_download: bool = False,
+    no_download: bool = True,
     upscale: bool = True,
 ) -> float | None:
     """Run an EEDI3 mask benchmark (see make_aa_vpy)."""
@@ -1358,10 +1367,13 @@ def _cache_desc(
 
 
 def _mode_desc(ns: argparse.Namespace) -> str:
-    """The run header's mode field, empty unless --no-download is set."""
+    """The run header's mode field, naming any opt-out from the default path."""
+    modes = []
+    if not ns.gpu_cache:
+        modes.append("--cpu-cache")
     if not ns.no_download:
-        return ""
-    return " | mode: --no-download"
+        modes.append("--download")
+    return f" | mode: {' '.join(modes)}" if modes else ""
 
 
 def _run_once(
@@ -1373,15 +1385,15 @@ def _run_once(
     synth: str | None,
     cache_frames: int | None,
     cache_conv: str | None,
-    gpu_cache: bool = False,
+    gpu_cache: bool = True,
     download_inputs: bool = False,
 ) -> float | None:
     """One timed vspipe run of one plugin: the repeat/interleave unit.
 
-    `gpu_cache` says this arm's chain consumes device-resident frames, so the
-    script has to build the GPU cache. `download_inputs` says the arm's filter
-    does not accept them and so has to pay std.GPUDownload for them, which is
-    what a real chain would make it pay.
+    `gpu_cache` (the default) says this arm's chain consumes device-resident
+    frames, so the script has to build the GPU cache. `download_inputs` says the
+    arm's filter does not accept them and so has to pay std.GPUDownload for
+    them, which is what a real chain would make it pay.
     """
     if spec.aa and synth is None:
         budget = ns.aa_cache_mb * 1024 * 1024 if ns.aa_cache_mb else None
@@ -1452,9 +1464,10 @@ def _prepare_filter(
     cache_frames = ns.cache_frames if (ns.cached and synth is None and ns.cache_frames) else None
     # the cache holds frames in the filter's input format (e.g. depth(clip,16))
     # so the timed region measures only filter throughput, like --synthetic.
-    # --gpu-cache needs it even without a preload: the device frames have to be
-    # uploaded in the filter's input format, not the raw source's.
-    cache_conv = input_expr if (cache_frames or getattr(ns, "gpu_cache", False)) else None
+    # The default (device-resident) path needs it even without a preload: the
+    # device frames have to be uploaded in the filter's input format, not the
+    # raw source's.
+    cache_conv = input_expr if (cache_frames or ns.gpu_cache) else None
     scale_desc = f" -> {ns.scale:g}x Point" if ns.scale > 1 else ""
     if synth:
         clip_desc = (
@@ -1470,20 +1483,20 @@ def _prepare_filter(
     format_desc = f" | format: {ns.format}" if ns.format else ""
 
     calls = spec.build(ns, input_expr, spec)
-    # --gpu-cache: every arm consumes the device-resident frames, so the
-    # run matches a chain whose upstream node is a GPU filter. Arms whose
-    # filter declares vnode:gpu take them directly; a legacy CPU filter gets
-    # them through std.GPUDownload and pays that transfer, which is what the
-    # real chain would charge it. (An arm that would have been handed a CPU
-    # cache instead is not a fair comparison -- its neighbour's input is in
-    # VRAM and it would never see that.)
+    # The default path gives every arm the device-resident frames, so the run
+    # matches a chain whose upstream node is a GPU filter. Arms whose filter
+    # declares vnode:gpu take them directly; a legacy CPU filter gets them
+    # through std.GPUDownload and pays that transfer, which is what the real
+    # chain would charge it. (An arm that would have been handed a CPU cache
+    # instead is not a fair comparison -- its neighbour's input is in VRAM and it
+    # would never see that.) --cpu-cache skips this whole branch.
     #
     # The AA vpy is rebuilt per arm rather than substituting names: with
     # download_inputs it defines clip/mclip/sclip as downloads of the warmed
     # device frames, so the chain string stays as it is.
     gpu_arms: list[str] = []
     download_arms: list[str] = []
-    if getattr(ns, "gpu_cache", False):
+    if ns.gpu_cache:
         gpu_arms = list(calls)
         download_arms = [p for p in calls if p not in spec.gpu_plugins]
         if not spec.aa:
@@ -1919,20 +1932,21 @@ def parse_args() -> argparse.Namespace:
         help="number of leading frames to preload with --cache (default: 1000)",
     )
     parser.add_argument(
-        "--gpu-cache",
-        action="store_true",
-        help="preload the cached frames on the device and hand them to every "
-        "arm, so the run matches a chain whose upstream node is a GPU "
-        "filter. Filters taking vnode:gpu input consume them directly; "
-        "every other plugin gets them through std.GPUDownload and pays "
-        "that transfer, as it would mid-chain",
+        "--cpu-cache",
+        dest="gpu_cache",
+        action="store_false",
+        default=True,
+        help="keep the cached frames in RAM instead of uploading them to the "
+        "device: a GPU filter then pays the GPUUpload a CPU-fed chain would "
+        "charge it, and a CPU filter skips the std.GPUDownload. Measures the "
+        "chain that used to be the default",
     )
     parser.add_argument(
         "--gpu-cache-mb",
         type=int,
         default=6144,
-        help="VRAM budget for --gpu-cache frames; the cached span is capped "
-        "to what fits, for both caches (default: 6144)",
+        help="VRAM budget for the device-resident cached frames; the cached "
+        "span is capped to what fits, for both caches (default: 6144)",
     )
     parser.add_argument(
         "--scale",
@@ -1944,13 +1958,14 @@ def parse_args() -> argparse.Namespace:
         "are not scaled, so pass e.g. sigma=N*sigma to keep the same blur",
     )
     parser.add_argument(
-        "--no-download",
+        "--download",
         dest="no_download",
-        action="store_true",
-        help="run vspipe with its -- no-output target, so a GPU resident output "
-        "is not downloaded: the implicit GPUDownload leaves the fps and a "
-        "filter it was hiding shows its own speed. The filter still runs its "
-        "full-frame kernels; add --gpu-cache to drop the input side too",
+        action="store_false",
+        default=True,
+        help="write vspipe's output to /dev/null instead of its -- no-output "
+        "target, so a GPU resident output is downloaded and that transfer is "
+        "timed as part of the chain (the default leaves it resident). Pair "
+        "with --cpu-cache to measure the old default path",
     )
     parser.add_argument(
         "--repeat",

@@ -35,9 +35,9 @@ Scoreboard — jpbd 1080p GRAY16, sigma=16 (95 taps, two-pass), 5000 frames,
 
 | mode | vsfeel | vszipcl | ratio |
 |---|---|---|---|
-| CPU cache (benchmark default) | 2973.4 | 1579.7 | 1.88x |
-| `--gpu-cache` (resident GPU input) | 3978.4 | 1647.5 | 2.42x |
-| `--gpu-cache --no-download` (compute only) | 19990.7 | 1613.6 | 12.39x |
+| `--cpu-cache --download` (CPU cache) | 2973.4 | 1579.7 | 1.88x |
+| `--download` (resident GPU input) | 3978.4 | 1647.5 | 2.42x |
+| default (resident GPU input, no download) | 19990.7 | 1613.6 | 12.39x |
 
 The first two rows carry transfers: row 1 uploads the CPU cache per frame and
 downloads the output, row 2 removes the input upload and still downloads; the
@@ -48,17 +48,17 @@ sigma, frames and repeats (3-repeat medians, one session):
 
 | mode | vsfeel f16 | vsfeel f32 | vszipcl f16 | ratio |
 |---|---|---|---|---|
-| CPU cache (benchmark default) | 3001.7 | 1517.9 | 1587.8 | 1.89x |
-| `--gpu-cache` (resident GPU input) | 3978.8 | 1962.1 | 1640.9 | 2.43x |
-| `--gpu-cache --no-download` (compute only) | 19497.3 | 17535.2 | 1630.5 | 11.96x |
+| `--cpu-cache --download` (CPU cache) | 3001.7 | 1517.9 | 1587.8 | 1.89x |
+| `--download` (resident GPU input) | 3978.8 | 1962.1 | 1640.9 | 2.43x |
+| default (resident GPU input, no download) | 19497.3 | 17535.2 | 1630.5 | 11.96x |
 
 - The f16 chain rows are ~2x their f32 twins because those modes move the
   frames; compute-only the gap is +11%, the half-width loads of the two-pass
   kernels (mechanism under Performance).
 - vszipcu is not installed in this checkout, so vszipcl is the reference here.
 - Bench: `MANGOHUD=0 uv run tools/benchmark.py --filter gaussblur
-  [--gaussblur-args "sigma=X"] [--format u16|f16|f32] [--gpu-cache]
-  [--no-download] [--scale N] vsfeel vszipcl`.
+  [--gaussblur-args "sigma=X"] [--format u16|f16|f32] [--cpu-cache]
+  [--download] [--scale N] vsfeel vszipcl`.
 
 ## Implementation
 
@@ -147,13 +147,13 @@ sigma, frames and repeats (3-repeat medians, one session):
   border rows are ~10% of the work, but they took the per-tap mirror *and* the
   select; giving them the same three-phase window is what turned the interior's
   +33% into +94%. Same-session ABBA A/B against the previous build, jpbd 1080p
-  sigma=16, 5000 frames, `--gpu-cache --no-download`, 3 rounds of 3 repeats per
-  arm: u16 9829 → 20039 fps, f32 9479 → 17569, f16 10048 → 19477 (2.04x, 1.85x,
-  1.94x). Probe, f16: vertical 57.9 → 25.6 µs, horizontal 48.8 → 25.0 µs. The
-  fused path (radius ≤ 32, no rolling window, so no padding taps) is unchanged
-  at 18.7k fps, and larger radii gain less as the mirror region grows (radius
-  119 leaves 122 of 360 rows interior): f16 sigma=40 2674 → 3646, sigma=80 1296
-  → 1799 fps.
+  sigma=16, 5000 frames, default (resident GPU input, no download), 3 rounds of
+  3 repeats per arm: u16 9829 → 20039 fps, f32 9479 → 17569, f16 10048 → 19477
+  (2.04x, 1.85x, 1.94x). Probe, f16: vertical 57.9 → 25.6 µs, horizontal 48.8 →
+  25.0 µs. The fused path (radius ≤ 32, no rolling window, so no padding taps)
+  is unchanged at 18.7k fps, and larger radii gain less as the mirror region
+  grows (radius 119 leaves 122 of 360 rows interior): f16 sigma=40 2674 → 3646,
+  sigma=80 1296 → 1799 fps.
 - **Half storage pays only where a lane issues a half-width load.** The f16
   path is +11% over f32 compute-only (banner), which is the vertical pass'
   strided rows returning 2 bytes per lane instead of 4 for the same 32 lines;
@@ -176,8 +176,8 @@ sigma, frames and repeats (3-repeat medians, one session):
   non-finite footprint stays exact at every depth.
 - **Per-pass block shape and outputs per thread**, worth +9.4% to +9.7% across
   three same-session A/Bs (shipped build 8949.8 → 9808.0 fps; 1080p sigma=16,
-  5000 frames, `--gpu-cache --no-download`, 6 interleaved 2-repeat runs per arm,
-  spreads ≤ 2.7%). What lost, and why:
+  5000 frames, default (resident GPU input, no download), 6 interleaved
+  2-repeat runs per arm, spreads ≤ 2.7%). What lost, and why:
   - vertical pass at 16x8: a warp spans two rows, splitting every load across
     two half-used cache lines (~115 → 90 µs in the probe's stage split).
   - horizontal pass at 32x4 (83 → 106 µs) and at 16 outputs per thread
@@ -219,10 +219,10 @@ sigma, frames and repeats (3-repeat medians, one session):
 
 The vertical pass moved to 32x4 with 16 outputs per thread and the horizontal
 stayed 16x8 with 8, each pass now carrying its own block and width. Same-session
-A/B against the previous shape (banner config, `--gpu-cache --no-download`):
-8883.8 → 9716.7, 8951.1 → 9815.7 and 8949.8 → 9808.0 fps across three runs of
-the pair, 6 interleaved 2-repeat runs each, spreads ≤ 2.7%. Correctness
-unchanged: 72 tests, bit-exact against vszipcl.
+A/B against the previous shape (banner config, default: resident GPU input, no
+download): 8883.8 → 9716.7, 8951.1 → 9815.7 and 8949.8 → 9808.0 fps across
+three runs of the pair, 6 interleaved 2-repeat runs each, spreads ≤ 2.7%.
+Correctness unchanged: 72 tests, bit-exact against vszipcl.
 
 ### 2026-09-22 — R80 GPU API port
 

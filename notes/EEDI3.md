@@ -29,10 +29,10 @@ The hp row costs vsfeel **2.6x** (618 → 237): the direction set doubles (TPITC
 
 - **The graded vertical EEDI3 is HOST<->DEVICE TRANSFER bound, not kernel
   bound.** `VSFEEL_EEDI3_SKIP=1` (interleaved 6×2-repeat A/B) moves the graded
-  2x2160p run by **+0.4%** (`--gpu-cache --no-download`), +0.5% CPU-cache: the
-  kernels are hidden behind the per-output-frame transfer bill (~50 MB: sclip
-  every frame, clip+mclip every other, the download). `GPUUpload → GPUDownload`
-  of one 4K16 plane is 2.82 ms.
+  2x2160p run by **+0.4%** (default, resident GPU input, no download), +0.5%
+  `--cpu-cache --download`: the kernels are hidden behind the per-output-frame
+  transfer bill (~50 MB: sclip every frame, clip+mclip every other, the
+  download). `GPUUpload → GPUDownload` of one 4K16 plane is 2.82 ms.
 - **Batch size (`VSFEEL_EEDI3_BATCH`, default from a scratch target — 256 MiB,
   512 for EEDI3AA).** The knee is where the submit path stops being amortised by
   the GPU fill, and it moves with the environment: with RADV's transfer queue on

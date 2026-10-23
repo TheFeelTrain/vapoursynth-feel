@@ -37,17 +37,17 @@ etype=0 pscrn=4`), 5000 frames, medians of 3 through `tools/benchmark.py`:
 
 | mode | vsfeel u16 | vsfeel f16 | vsfeel f32 | nnedi3vk |
 |---|---|---|---|---|
-| CPU cache (benchmark default) | 3117 | 3138 | 1666 | 2778 / 2757 / 1612 |
-| `--gpu-cache` (resident GPU clip) | 3340 | 3441 | - | 2276 / 2246 / - |
-| `--gpu-cache --no-download` | 4679 | 4839 | 3929 | - |
+| `--cpu-cache --download` (CPU cache) | 3117 | 3138 | 1666 | 2778 / 2757 / 1612 |
+| `--download` (resident GPU clip) | 3340 | 3441 | - | 2276 / 2246 / - |
+| default (resident GPU clip, no download) | 4679 | 4839 | 3929 | - |
 
 - f16 is the fastest io type now, and the packed predictor is why: same-session
-  interleaved A/B, 5000 frames ×3, `--gpu-cache --no-download` **packed 4862 vs
-  mixed 3830 fps (+26.9%)**, CPU cache 3157 vs 2981 (**+5.9%**). At `pscrn=0`
-  (every pixel predicted, `VSFEEL_NNEDI3_TSTAMP=100`) predict is 3483 µs packed
-  vs 4887 mixed (**+40%**): the sparse `pscrn=4` list scatters the windows and
-  the gather's latency, which half storage does not remove, takes a bigger
-  share there.
+  interleaved A/B, 5000 frames ×3, default (resident GPU input, no download):
+  **packed 4862 vs mixed 3830 fps (+26.9%)**, CPU cache 3157 vs 2981
+  (**+5.9%**). At `pscrn=0` (every pixel predicted, `VSFEEL_NNEDI3_TSTAMP=100`)
+  predict is 3483 µs packed vs 4887 mixed (**+40%**): the sparse `pscrn=4` list
+  scatters the windows and the gather's latency, which half storage does not
+  remove, takes a bigger share there.
 - The resident rows win by more than the CPU-sink row because the reference
   pays a real download there while vsfeel consumes the core's plane.
 - **The output download is the last transfer in the chain.** Removing it takes
@@ -160,15 +160,15 @@ etype=0 pscrn=4`), 5000 frames, medians of 3 through `tools/benchmark.py`:
   width; the packed predictor now runs nnedi3vk's own f16 arithmetic
   (f16vec4 weights, two elements x two pixels per FMA, centered window with
   the f32 row-sum correction) and is bit-exact with it. Same-session
-  interleaved A/B, 5000 frames x3: `--gpu-cache --no-download` 4862 packed vs
-  3830 mixed fps (**+26.9%**), CPU cache 3157 vs 2981 (+5.9%), `pscrn=0`
-  predict 3483 vs 4887 µs (+40%). Under the 30% bar, but the packed output is
+  interleaved A/B, 5000 frames x3: default 4862 packed vs 3830 mixed fps
+  (**+26.9%**), CPU cache 3157 vs 2981 (+5.9%), `pscrn=0` predict 3483 vs
+  4887 µs (+40%). Under the 30% bar, but the packed output is
   the fp16 reference's output, so the default trades nothing: the
   storage-only path (f32 arithmetic, one half step from the f32 path) stays
   behind `VSFEEL_NNEDI3_PRED16=0`. First f16 attempt measured the *input*
   rounding (2.8e-2) instead of the arithmetic; see Open work.
 - **2026-10-12 — the R80 port's scoreboard is void.** It read 3034 → 2695
-  (CPU cache, −11.2%) and 2156 → 2739 (`--gpu-cache`, +27.0%) fps against the
+  (CPU cache, −11.2%) and 2156 → 2739 (`--download`, +27.0%) fps against the
   pre-fix benchmark harness (`notes/METHOD.md`), and its reference pairs
   (2652/2908, 2740/2031) with it. The same-session *deltas* stand — the port
   lost on the CPU sink and won on the resident chain — and the banner's table
@@ -224,7 +224,7 @@ figures are void as current-filter numbers (same marker as
   indexes the source plane directly (was: packed upload staging), `storeDst`
   writes the pitched output plane (was: packed device dst), `ENTRY_KEEP` added.
 - Method: MVP first (one frame per submission, 57/57 reference tests green on
-  the first build), then the interleaved A/B above; the `--gpu-cache` row and
+  the first build), then the interleaved A/B above; the `--download` row and
   the bare-transfer control are what localized the delta to the core's
   `GPUDownload` rather than the filter.
 - The port also deleted the legacy shared layer from `src/vsfeel.h`/

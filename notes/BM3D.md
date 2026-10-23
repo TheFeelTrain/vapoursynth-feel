@@ -27,7 +27,7 @@ CUDA-matcher build. The CPU plugin is the only oracle, driven from
 
 Scoreboard — 1080p jpbd, `tools/benchmark.py -f bm3d`, harness defaults
 (sigma 0.7, radius 2, bm_range 9, ps_range 4, block_step 8), 1000 frames x3,
-`--gpu-cache --no-download`:
+default (resident GPU input, no output download):
 
 | arm | fps | |
 |---|---|---|
@@ -203,8 +203,8 @@ half the bytes, which is where the visible speedup is (see Performance).
 - **Per-frame accumulators: 868 -> 1022 fps (+18%).** The old path stored a
   `2r+1`-slice stack per centre and re-aggregated it with two atomics per pixel;
   the new one scatters into the target frame, adds the weight once per block and
-  normalizes with a box sum. Harness A/B (`--gpu-cache --no-download`, 1000
-  frames x3): slice 867.7, accumulators 922.9 before the cursor was finished,
+  normalizes with a box sum. Harness A/B (default, 1000 frames x3): slice 867.7,
+  accumulators 922.9 before the cursor was finished,
   1022-1028 after the isolated ring removed the restarts (median of five, 2%).
   Kernel table at 1022 fps: blockMatch+filter 0.86 ms, normalize 0.044, convert
   0.018, zero 0.011, and 1000 estimation dispatches for 1000 frames.
@@ -283,13 +283,13 @@ Chronological; each entry keeps the mechanism, not the story.
   batch (eight candidates per lane, 19-comparator odd-even sort, 20-comparator
   bitonic merge) costs 24 VGPRs and one wave on RADV: 987 against 1071 fps (A/B,
   1000 frames x5, jpbd 1080p f32, radius 2, bm_range 9, ps_range 4, block_step
-  8, sigma 0.7, `--gpu-cache --no-download`, n=10). On a 3080 it runs at **5
+  8, sigma 0.7, default, n=10). On a 3080 it runs at **5
   fps** against the insert's ~240, the private-array staging that costs the
   patch and group-list arms their Ada runs: the batch's 16-element distance/key
   arrays are passed to `sort_batch`/`merge_batch` and the path adds 24 VGPRs. The shared-buffer variant (running top-8 in LDS, 48-candidate
   chunks, eight selection rounds, two-entry cache) holds 168 VGPRs but costs
-  803 against 1152 fps on RADV (A/B, 1000 frames x3, same config, `--no-download`,
-  n=6; 769 against 1141 with `--gpu-cache`), because the four 8-lane groups of a
+  803 against 1152 fps on RADV (A/B, 1000 frames x3, same config, `--cpu-cache`,
+  n=6; 769 against 1141 with `--download`), because the four 8-lane groups of a
   subgroup must enter every pass together and the per-chunk LDS scans, barriers
   and shuffle rounds dominate. The insert is the selection on both vendors; no
   change shipped.
@@ -607,7 +607,7 @@ Chronological; each entry keeps the mechanism, not the story.
   the only large narrowable traffic and cannot narrow anyway (no
   `shaderBufferFloat16AtomicAdd`; no u16 atomics in core Vulkan). bm3dvk2's own
   fp16 mode is 16% slower here (133.4 against 159.1 fps, 500 frames,
-  `--no-download`) while reading half the source bytes. Narrowing the *transport*
+  `--cpu-cache`) while reading half the source bytes. Narrowing the *transport*
   (u16, f16) is what ships; this prices narrowing the arithmetic or the ring.
 - **Emulating libstdc++'s `partial_sort` tie order.** Survivors are heap
   positions, not a positional rule; exactness needs the whole candidate sequence

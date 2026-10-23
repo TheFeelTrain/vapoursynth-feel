@@ -22,8 +22,8 @@ Scoreboard — jpbd 1080p GRAY16, 3000 frames, medians of 3 through
 
 | mode | vsfeel | vszipcl | ratio |
 |---|---|---|---|
-| CPU cache (benchmark default) | 1984.9 | 887.4 | 2.24x |
-| `--gpu-cache` | 2013.6 | 851.1 | 2.37x |
+| `--cpu-cache --download` (CPU cache) | 1984.9 | 887.4 | 2.24x |
+| `--download` (resident GPU input) | 2013.6 | 851.1 | 2.37x |
 | `--synthetic` BlankClip | 2001.8 | 895.0 | 2.24x |
 
 IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
@@ -211,7 +211,7 @@ force-pad / fail-pad probes.
   oracle holds. The f16 module's fused_r1 codegen is within a few percent of
   the f32 module's (VGPR 120, 12 waves/SIMD; VALU 1710 vs 1777).
 - **CPU in / CPU out** is core-inserted upload+download (both free: ReBAR memcpy
-  ahead, SDMA download). `--gpu-cache` is −1% (core planes read in place) and
+  ahead, SDMA download). `--download` is −1% (core planes read in place) and
   chained instances +4%, the residual being the pad dispatch and the ring
   barriers the chain still pays.
 - **Fused codegen residue is deliberately left**: remaining IM2COL/window ALU
@@ -222,7 +222,7 @@ force-pad / fail-pad probes.
 The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
 - **The R80 port's scoreboard is void.** It read 1452.6/1376.0 → 1361.3/1360.3
-  (CPU cache), 1182.3 → 1350.3 (`--gpu-cache`) and 1376.2 → 1364.7
+  (CPU cache), 1182.3 → 1350.3 (`--download`) and 1376.2 → 1364.7
   (`--synthetic`) fps, and "1.57x vs vszipcl", all against the pre-fix
   benchmark harness (`notes/METHOD.md`). The banner's table replaces them; the
   mechanism it recorded (the port's gap was the transfer) still holds.

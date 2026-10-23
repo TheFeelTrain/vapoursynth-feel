@@ -1018,9 +1018,9 @@ def test_window_larger_than_old_slot_pool_runs():
 def test_cpu_and_gpu_input_match(clip_grays):
     """The core's auto-upload of a CPU clip must match an explicit GPUUpload.
 
-    This is the filter-level mirror of the benchmark's ``--gpu-cache`` arm: the
-    same node fed a CPU clip (auto GPUUpload) and a resident GPU clip has to
-    produce identical pixels.
+    This is the filter-level mirror of the benchmark's default arm: the same
+    node fed a CPU clip (auto GPUUpload) and a resident GPU clip has to produce
+    identical pixels.
     """
     cpu = _run(clip_grays, d=2)
     gpu = cpu_node(vs.core.vsfeel.NLMeans(vs.core.std.GPUUpload(clip=clip_grays), d=2))

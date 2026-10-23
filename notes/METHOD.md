@@ -180,15 +180,15 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   then **harness memory** (the bimodal rule below). Same-session pairs stay fair
   through all of it; grade on those, and lengthen the run before trusting an
   absolute number.
-- **A GPU filter's fps carries the chain's transfers until `--no-download`
-  takes the output side out of it.** vspipe's output node is a CPU node, so by
-  default the core downloads a GPU-resident output — a per-frame transfer that
-  scales with the frame size and that any filter faster than it loses to.
-  `--no-download` instead runs vspipe with its `--` no-output target, which
-  consumes the output with `sgfAllowGPUResident`: nothing reads the pixels, so
-  no download is inserted, the graph stays exactly as the script built it, and
-  only the filter's own compute is measured. So the flag is also the test for
-  *which* side a filter is on.
+- **A GPU filter's fps carries the chain's transfers unless the output side is
+  dropped, which is the benchmark's default.** vspipe's output node is a CPU
+  node, so left alone the core downloads a GPU-resident output — a per-frame
+  transfer that scales with the frame size and that any filter faster than it
+  loses to. The benchmark instead runs vspipe with its `--` no-output target,
+  which consumes the output with `sgfAllowGPUResident`: nothing reads the
+  pixels, so no download is inserted, the graph stays as the script built it,
+  and only the filter's own compute is measured. `--download` puts the output
+  transfer back, so an A/B between the two says whether it is transfer-bound.
   **Read the residual before the number.** With the download gone what survives
   is the harness's own per-frame cost, and the cached frames must be served from
   an `m`-frame node whose cache is pinned

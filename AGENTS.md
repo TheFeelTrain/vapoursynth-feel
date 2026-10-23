@@ -209,12 +209,12 @@ runs it. Plugins are described separately in `PLUGINS`.
     plugins, to compare against references
   - `--frames N`, `--clip PATH` to control the run; prefer omitting `--frames`
     (see the frame floor below)
-  - `--gpu-cache` hands every arm device-resident frames, the chain a GPU
-    filter actually runs in (a CPU filter pays the download it would pay
-    there); `--no-download` runs vspipe with its `--` no-output target, which
-    leaves a GPU resident output resident instead of downloading it. Both
-    together time a GPU filter's own compute; `notes/METHOD.md` has what the
-    mode's residual costs.
+  - By default every arm gets device-resident frames, the chain a GPU filter
+    actually runs in (a CPU filter pays the download it would pay there), and
+    vspipe runs with its `--` no-output target, which leaves a GPU resident
+    output resident instead of downloading it. That times a GPU filter's own
+    compute; `--cpu-cache` and `--download` restore the CPU-fed, downloaded
+    chain. `notes/METHOD.md` has what the mode's residual costs.
 - The default clip is `/home/encode/test/jpbd.mkv` (1920x1080, YUV420P8).
 - Set `MANGOHUD=0` for every benchmark run. It does not change results, it just
   suppresses extra messages in the output.

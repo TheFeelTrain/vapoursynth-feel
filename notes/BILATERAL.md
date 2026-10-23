@@ -45,9 +45,9 @@ through `tools/benchmark.py`. u16 input unless noted:
 
 | mode | vsfeel u16 | vszipcl | ratio | vsfeel f16 | vsfeel f32 |
 |---|---|---|---|---|---|
-| CPU cache (benchmark default) | 2658.3 | 572.4 | 4.64x | 2660.5 | 1480.9 |
-| `--gpu-cache` | 2684.8 | 710.7 | 3.78x | 2677.2 | 1938.9 |
-| `--gpu-cache --no-download` | 2689.6 | 709.2 | 3.79x | 2692.7 | 2662.0 |
+| `--cpu-cache --download` (CPU cache) | 2658.3 | 572.4 | 4.64x | 2660.5 | 1480.9 |
+| `--download` (resident GPU input) | 2684.8 | 710.7 | 3.78x | 2677.2 | 1938.9 |
+| default (resident GPU input, no download) | 2689.6 | 709.2 | 3.79x | 2692.7 | 2662.0 |
 
 - The two-column kernel lifted every compute-bound row by ~15–16% (u16 2343 →
   2690, f16 2346 → 2693, f32 2326 → 2662, compute-only). The reference rows are
@@ -192,13 +192,13 @@ through `tools/benchmark.py`. u16 input unless noted:
   (`notes/GAUSSBLUR.md` records the same result for its own shape).
 
 Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter bilateral
-[vsfeel vszipcl] [--gpu-cache] [--format u16|f16|f32] [--bilateral-args
-"sigma_spatial=X, sigma_color=Y"]`.
+[vsfeel vszipcl] [--cpu-cache] [--download] [--format u16|f16|f32]
+[--bilateral-args "sigma_spatial=X, sigma_color=Y"]`.
 
 ## Historical
 
 - **2026-10-12 — the R80 port's scoreboard is void.** It read 1982.1 → 1980.5
-  (CPU cache) and 1975.3 → 1974.0 (`--gpu-cache`) fps, measured against the
+  (CPU cache) and 1975.3 → 1974.0 (`--download`) fps, measured against the
   pre-fix benchmark harness (`notes/METHOD.md`); the same-session result it
   carried (the port changed nothing, **−0.1%**) stands. The banner's table
   replaces the absolute numbers.

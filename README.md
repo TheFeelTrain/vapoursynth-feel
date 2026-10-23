@@ -23,7 +23,7 @@ pip install vapoursynth-feel
 | NLMeans    | knlmvk    | ` 1036 / 581   (1.78x)` | ` 1015 / 574   (1.77x)` | `  948 / 574  (1.65x)` |
 | NNEDI3     | nnedi3vk  | ` 4666 / 2218  (2.10x)` | ` 4862 / 2269  (2.14x)` | ` 3967 / 1207 (3.29x)` |
 
-<sub>Output of `tools/benchmark.py --gpu-cache --no-download --filter <filter> --format <u16|f16|f32>` on an RX 7900 XTX with 1080p input.</sub>
+<sub>Output of `tools/benchmark.py --filter <filter> --format <u16|f16|f32>` on an RX 7900 XTX with 1080p input.</sub>
 
 Filters that do not use VapourSynth's GPU API include frame transfer time in their measurements.
 

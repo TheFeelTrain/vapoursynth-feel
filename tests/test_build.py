@@ -136,20 +136,20 @@ def test_benchmark_synthetic_scripts_compile_and_eval(monkeypatch):
             exec(chain, env)
 
 
-def test_benchmark_no_download_selects_vspipe_no_output(monkeypatch):
-    """``--no-download`` is a vspipe target now, not a chain rewrite.
+def test_benchmark_download_selects_vspipe_output(monkeypatch):
+    """The default leaves the output resident; ``--download`` times the transfer.
 
     vspipe consumes a GPU resident output with sgfAllowGPUResident only when it
-    writes no output, so the flag swaps the outfile to ``--`` and leaves every
-    script exactly the shape the default run builds.
+    writes no output, so the default target is ``--`` and the opt-out swaps it
+    to /dev/null, leaving every script exactly the shape the default run builds.
     """
     bench = _load_module("benchmark", BENCHMARK)
-    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic", "--no-download"])
+    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic", "--download"])
     ns = bench.parse_args()
-    assert ns.no_download
-    # The header labels the mode; what it must not do is still describe the
-    # retired chain rewrite (the outfile swap itself is asserted below).
-    assert "--no-download" in bench._mode_desc(ns)
+    assert not ns.no_download
+    # The header labels the opt-out mode; what it must not do is still describe
+    # the retired chain rewrite (the outfile swap itself is asserted below).
+    assert "--download" in bench._mode_desc(ns)
     assert "8x8" not in bench._mode_desc(ns)
     for name, spec in bench.FILTERS.items():
         bench._apply_filter_args(ns, name, spec)
@@ -166,17 +166,29 @@ def test_benchmark_no_download_selects_vspipe_no_output(monkeypatch):
 
     monkeypatch.setattr(bench.subprocess, "run", fake_run)
     assert bench.run_vspipe(Path("chain.vpy"), 1) == 1.0
-    assert bench.run_vspipe(Path("chain.vpy"), 1, no_download=True) == 1.0
-    assert seen == ["/dev/null", "--"]
+    assert bench.run_vspipe(Path("chain.vpy"), 1, no_download=False) == 1.0
+    assert seen == ["--", "/dev/null"]
 
 
 def test_benchmark_mode_field_is_opt_in(monkeypatch):
-    """A default run's header must not claim the --no-download mode."""
+    """A default run uses the GPU-resident, resident-output path and says so."""
     bench = _load_module("benchmark", BENCHMARK)
     monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic"])
     ns = bench.parse_args()
-    assert not ns.no_download
+    assert ns.no_download
+    assert ns.gpu_cache
     assert bench._mode_desc(ns) == ""
+
+    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic", "--cpu-cache"])
+    ns = bench.parse_args()
+    assert not ns.gpu_cache
+    assert bench._mode_desc(ns) == " | mode: --cpu-cache"
+
+    monkeypatch.setattr(
+        sys, "argv", ["benchmark.py", "--synthetic", "--cpu-cache", "--download"]
+    )
+    ns = bench.parse_args()
+    assert bench._mode_desc(ns) == " | mode: --cpu-cache --download"
 
 
 def test_benchmark_ranking_annotates_vsfeel_ratio(monkeypatch, capsys):
