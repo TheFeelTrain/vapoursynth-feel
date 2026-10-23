@@ -141,14 +141,14 @@ def test_benchmark_download_selects_vspipe_output(monkeypatch):
 
     vspipe consumes a GPU resident output with sgfAllowGPUResident only when it
     writes no output, so the default target is ``--`` and the opt-out swaps it
-    to /dev/null, leaving every script exactly the shape the default run builds.
+    to /dev/null. Every run also enables progress, which is the timing window.
     """
     bench = _load_module("benchmark", BENCHMARK)
     monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic", "--download"])
     ns = bench.parse_args()
     assert not ns.no_download
     # The header labels the opt-out mode; what it must not do is still describe
-    # the retired chain rewrite (the outfile swap itself is asserted below).
+    # the retired chain rewrite.
     assert "--download" in bench._mode_desc(ns)
     assert "8x8" not in bench._mode_desc(ns)
     for name, spec in bench.FILTERS.items():
@@ -156,18 +156,25 @@ def test_benchmark_download_selects_vspipe_output(monkeypatch):
         for chain in spec.build(ns, spec.input, spec).values():
             assert "CropAbs" not in chain, name
 
-    seen = []
+    default = bench._vspipe_cmd(Path("chain.vpy"), no_download=True)
+    download = bench._vspipe_cmd(Path("chain.vpy"), no_download=False)
+    assert "--progress" in default
+    assert default[-1] == "--"
+    assert download[-1] == "/dev/null"
 
-    def fake_run(cmd, **kwargs):
-        seen.append(cmd[-1])
-        return subprocess.CompletedProcess(
-            cmd, 0, "", "Output 1 frames in 1.00 seconds (1.00 fps)\n"
-        )
 
-    monkeypatch.setattr(bench.subprocess, "run", fake_run)
-    assert bench.run_vspipe(Path("chain.vpy"), 1) == 1.0
-    assert bench.run_vspipe(Path("chain.vpy"), 1, no_download=False) == 1.0
-    assert seen == ["--", "/dev/null"]
+def test_benchmark_time_window_counts_frames(monkeypatch):
+    """The window is the first report span at least --seconds long."""
+    bench = _load_module("benchmark", BENCHMARK)
+    reports = [(0.0, 1), (0.5, 501), (1.0, 1001), (1.5, 1501)]
+    timing = bench._timing_from_reports(reports, 1.0)
+    assert timing is not None
+    assert timing.frames == 1000
+    assert timing.seconds == 1.0
+    assert timing.fps == 1000.0
+    # A single report or a window that never fills is not a measurement.
+    assert bench._timing_from_reports([(0.0, 1)], 1.0) is None
+    assert bench._timing_from_reports(reports, 5.0) is None
 
 
 def test_benchmark_mode_field_is_opt_in(monkeypatch):
@@ -184,11 +191,44 @@ def test_benchmark_mode_field_is_opt_in(monkeypatch):
     assert not ns.gpu_cache
     assert bench._mode_desc(ns) == " | mode: --cpu-cache"
 
-    monkeypatch.setattr(
-        sys, "argv", ["benchmark.py", "--synthetic", "--cpu-cache", "--download"]
-    )
+    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic", "--cpu-cache", "--download"])
     ns = bench.parse_args()
     assert bench._mode_desc(ns) == " | mode: --cpu-cache --download"
+
+
+def test_benchmark_unavailable_plugin_is_listed_not_run(monkeypatch, capsys):
+    """A plugin the core does not load is listed as unavailable, not run."""
+    bench = _load_module("benchmark", BENCHMARK)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark.py",
+            "--filter",
+            "gaussblur",
+            "--synthetic",
+            "--repeat",
+            "2",
+            "vsfeel",
+            "vszipcu",
+        ],
+    )
+    ns = bench.parse_args()
+    monkeypatch.setattr(bench, "_available_plugins", lambda: frozenset({"vsfeel"}))
+    plan = bench._prepare_filter("gaussblur", ns)
+    assert plan.unavailable == ["vszipcu"]
+
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args)
+        return bench.Timing(100.0, 200, 2.0)
+
+    monkeypatch.setattr(bench, "run_vspipe", fake_run)
+    bench.bench_filter("gaussblur", ns)
+    out = capsys.readouterr()
+    assert f"  {'vszipcu':10s}  {bench._UNAVAILABLE_TAG}" in out.out
+    assert len(calls) == 2  # two repeats of vsfeel, nothing for vszipcu
 
 
 def test_benchmark_ranking_annotates_vsfeel_ratio(monkeypatch, capsys):
@@ -202,8 +242,8 @@ def test_benchmark_ranking_annotates_vsfeel_ratio(monkeypatch, capsys):
             "--filter",
             "gaussblur",
             "--synthetic",
-            "--frames",
-            "10",
+            "--seconds",
+            "2",
             "--repeat",
             "1",
             "vsfeel",
@@ -211,8 +251,9 @@ def test_benchmark_ranking_annotates_vsfeel_ratio(monkeypatch, capsys):
         ],
     )
     ns = bench.parse_args()
+    monkeypatch.setattr(bench, "_available_plugins", lambda: frozenset(bench.PLUGINS))
     fps = iter([200.0, 100.0])
-    monkeypatch.setattr(bench, "run_vspipe", lambda *a, **k: next(fps))
+    monkeypatch.setattr(bench, "run_vspipe", lambda *a, **k: bench.Timing(next(fps), 1000, 2.0))
     bench.bench_filter("gaussblur", ns)
     out = capsys.readouterr().out
     assert "1. vsfeel" in out
@@ -232,8 +273,8 @@ def test_benchmark_ranking_without_vsfeel_falls_back(monkeypatch, capsys):
             "--filter",
             "gaussblur",
             "--synthetic",
-            "--frames",
-            "10",
+            "--seconds",
+            "2",
             "--repeat",
             "1",
             "vszipcl",
@@ -241,8 +282,9 @@ def test_benchmark_ranking_without_vsfeel_falls_back(monkeypatch, capsys):
         ],
     )
     ns = bench.parse_args()
+    monkeypatch.setattr(bench, "_available_plugins", lambda: frozenset(bench.PLUGINS))
     fps = iter([200.0, 100.0])
-    monkeypatch.setattr(bench, "run_vspipe", lambda *a, **k: next(fps))
+    monkeypatch.setattr(bench, "run_vspipe", lambda *a, **k: bench.Timing(next(fps), 1000, 2.0))
     bench.bench_filter("gaussblur", ns)
     out = capsys.readouterr().out
     assert "1. vszipcl" in out

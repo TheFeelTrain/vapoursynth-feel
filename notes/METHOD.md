@@ -163,16 +163,16 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
 - **Only noise-clip comparisons against the reference prove correctness.**
   Constant/BlankClip input hides bugs (the references themselves deviate at
   borders on such input).
-- **Trust only end-to-end benchmark fps medians over at least 1000 frames.**
-  That is the harness floor (`MIN_BENCH_FRAMES`) and the filter's own default
-  (1000–5000) is better: the run must outlast the clock ramp and last a couple
-  of seconds, so never shrink `--frames` to iterate faster.
+- **Trust only end-to-end benchmark fps medians over the default 5 s window.**
+  Each arm runs until vspipe's progress reports span `--seconds` (default 5),
+  so the run outlasts the clock ramp and a slow reference costs the same wall
+  time; never shrink `--seconds` to iterate faster.
   Microsecond GPU traces swing run-to-run (clock variance), and concurrent
   submissions share the compute queue, so per-kernel timings from a deep
   pipeline include other frames' work — attribute kernels only in serialized
   traces. A change that does not move the fps median did not happen. Identical
   binaries swing between invocations too: compare same-session pairs or medians
-  over 1000+ frames, never single short bursts, and check `pp_dpm_sclk` and
+  over the full window, never single short bursts, and check `pp_dpm_sclk` and
   repeat 3x before debugging a one-shot trace that moved. When one plugin swings
   while the other stays flat, triage in order: repeat the same command 5x,
   interleave alone-vs-pair, poll `pp_dpm_sclk` / `gpu_busy_percent` *during* the

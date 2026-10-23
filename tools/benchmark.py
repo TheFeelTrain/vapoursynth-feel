@@ -5,7 +5,9 @@ The benchmark is data-driven: every filter is described by one entry in the
 FILTERS registry below (its CLI args, the input clip expression, and a builder
 that maps each supported plugin to the vpy call that runs it). Plugins are
 described separately in PLUGINS. Adding a new filter = one new entry; adding a
-new reference plugin = one new entry.
+new reference plugin = one new entry. A registered plugin the core does not
+load (not installed) is listed as unavailable and never run, so it cannot
+flood the output with a traceback per repeat.
 
 Timing is done with vspipe so results stay comparable across plugins.
 
@@ -19,7 +21,7 @@ Usage:
     uv run tools/benchmark.py --filter bm3d --ab-so build/libvsfeel.so old/libvsfeel.so --ab-names new,old
     uv run tools/benchmark.py --filter bm3d --ab-b-env VSFEEL_BM3D_DERIVE=1 --ab-names legacy,derived
     uv run tools/benchmark.py --filter bm3d --ab-so a.so b.so --ab-rounds 3 --ab-order abba
-    uv run tools/benchmark.py --frames 2000 --clip /path/to/input.mkv
+    uv run tools/benchmark.py --seconds 10 --clip /path/to/input.mkv
     uv run tools/benchmark.py --no-cache          # live decode: full chain incl. BestSource
     uv run tools/benchmark.py --filter gaussblur --cpu-cache --download  # old default
     uv run tools/benchmark.py --check-fresh       # refuse to run against a stale .so
@@ -36,16 +38,16 @@ unset, commas inside ``[...]`` do not split so ``planes=[0,1]`` works). Unknown
 keys and bad values abort instead of silently benchmarking defaults.
 
 By default the first --cache-frames frames of the real clip are decoded and
-held in RAM while vspipe is still evaluating the script (its fps figure only
-covers the output loop), so timing reflects real-content filter throughput
-without the BestSource decode bottleneck. --synthetic swaps real content for a
-BlankClip; --no-cache restores live decoding.
+held in RAM while vspipe is still evaluating the script (the timed window
+starts at the first output frame), so timing reflects real-content filter
+throughput without the BestSource decode bottleneck. --synthetic swaps real
+content for a BlankClip; --no-cache restores live decoding.
 
-Frame count is a floor, not a knob to shrink: a speed test runs at least 1000
-frames (MIN_BENCH_FRAMES), and ideally the filter's own default (1000-5000, see
-FILTERS) instead of an explicit --frames. The run should last a couple of
-seconds, so a ~2000 fps filter wants 4000+ frames; a few hundred frames measures
-the clock ramp and run-to-run swing, not the filter.
+Every arm is timed by wall clock, not by frame count: --seconds (default 5)
+runs until vspipe's progress reports span that window, and fps is the frames it
+counted over the measured span. A slow reference therefore costs the same wall
+time as vsfeel, where a fixed frame count made it dominate the run. The clock
+ramp is inside the window, so do not shrink --seconds to iterate faster.
 
 The default path is the chain a GPU filter actually runs in. The cached frames
 are also uploaded to the device and handed to every arm, so a filter that takes
@@ -75,20 +77,27 @@ import importlib.util
 import os
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 DEFAULT_CLIP = "/home/encode/test/jpbd.mkv"
 DEFAULT_TIMEOUT = 900  # seconds per vspipe run (H1: a hang must not hang the harness)
-# A speed test has to outlast the clock ramp and average out run-to-run swing;
-# below this the fps is noise. Shrinking --frames is not a way to iterate faster.
-MIN_BENCH_FRAMES = 1000
+# Each arm is timed for this many seconds by default. The window is vspipe's
+# own progress reports, so a slow reference costs the same wall time as vsfeel.
+DEFAULT_SECONDS = 5.0
+# The generated script's clip length. vspipe stops when the clip runs out, and
+# the clip is a loop over the cached frames, so this is metadata only: it just
+# has to outlast the timed window at even a very high fps.
+TIME_RUN_FRAMES = 4_000_000
 # AA real-clip runs cache the 2x luma AND the 2x mask; cap them by bytes, not
 # frames (H8). The budget is exclusive of VapourSynth's own 48 GB frame cache,
 # which is additive: 6 GiB keeps the pair well under the incident point.
@@ -570,7 +579,6 @@ def _str_to_bool(v: str) -> bool:
 @dataclass
 class FilterSpec:
     title: str
-    default_frames: int
     args: list[Arg]
     build: Callable[[argparse.Namespace, str, "FilterSpec"], dict[str, str]]
     input: str = "depth(get_y(clip), 16)"  # clip expression the filter is applied to
@@ -844,7 +852,6 @@ def _nnedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[s
 FILTERS: dict[str, FilterSpec] = {
     "bm3d": FilterSpec(
         title="BM3D",
-        default_frames=1000,
         args=[
             Arg("sigma", "bm3d_sigma", float, 0.7),
             Arg("radius", "bm3d_radius", int, 2),
@@ -867,7 +874,6 @@ FILTERS: dict[str, FilterSpec] = {
     ),
     "bilateral": FilterSpec(
         title="Bilateral",
-        default_frames=5000,
         args=[
             Arg("sigma_spatial", "bilateral_sigma_spatial", float, 3.0),
             Arg("sigma_color", "bilateral_sigma_color", float, 0.02),
@@ -879,7 +885,6 @@ FILTERS: dict[str, FilterSpec] = {
     ),
     "gaussblur": FilterSpec(
         title="GaussBlur",
-        default_frames=5000,
         args=[
             Arg("sigma", "gauss_sigma", float, 16.0),
         ],
@@ -890,7 +895,6 @@ FILTERS: dict[str, FilterSpec] = {
     ),
     "dfttest": FilterSpec(
         title="DFTTest",
-        default_frames=3000,
         args=[
             Arg("ftype", "dfttest_ftype", int, 0),
             Arg("sigma", "dfttest_sigma", float, 8.0),
@@ -914,7 +918,6 @@ FILTERS: dict[str, FilterSpec] = {
     ),
     "nlmeans": FilterSpec(
         title="NLMeans",
-        default_frames=3000,
         args=[
             Arg("d", "nlmeans_d", int, 2),
             Arg("a", "nlmeans_a", int, 2),
@@ -932,7 +935,6 @@ FILTERS: dict[str, FilterSpec] = {
     ),
     "eedi3": FilterSpec(
         title="EEDI3",
-        default_frames=2000,
         args=[
             # Double-rate interpolation (field=3) at 1080p, with the optional
             # vsaa edge mask. The 2x based_aa chain is the separate eedi3aa
@@ -972,7 +974,6 @@ FILTERS: dict[str, FilterSpec] = {
     ),
     "eedi3h": FilterSpec(
         title="EEDI3H (horizontal)",
-        default_frames=2000,
         args=[
             # Same surface as the eedi3 entry; EEDI3H interpolates columns.
             Arg("field", "eedi3_field", int, 3),
@@ -1010,7 +1011,6 @@ FILTERS: dict[str, FilterSpec] = {
     ),
     "eedi3aa": FilterSpec(
         title="EEDI3AA (based_aa)",
-        default_frames=1000,
         args=[
             # based_aa's default antialiaser in double-rate mode
             # (field = tff + double_rate*2 = 3).
@@ -1043,7 +1043,6 @@ FILTERS: dict[str, FilterSpec] = {
     ),
     "nnedi3": FilterSpec(
         title="NNEDI3",
-        default_frames=5000,
         args=[
             Arg("field", "nnedi3_field", int, 3),
             Arg("dh", "nnedi3_dh", int, 0),
@@ -1066,7 +1065,17 @@ FILTERS: dict[str, FilterSpec] = {
 # vspipe timing
 # ---------------------------------------------------------------------------
 
-_FPS_RE = re.compile(r"Output\s+(\d+)\s+frames?\s+in\s+[\d.]+\s+seconds?\s+\(([\d.]+)\s*fps\)")
+_PROGRESS_RE = re.compile(rb"Frame:\s*(\d+)/")
+_FPS_RE = re.compile(r"Output\s+(\d+)\s+frames?\s+in\s+([\d.]+)\s+seconds?\s+\(([\d.]+)\s*fps\)")
+
+
+@dataclass
+class Timing:
+    """One measured run: fps over the frames counted in the timed window."""
+
+    fps: float
+    frames: int
+    seconds: float
 
 
 def _tail(text: str | bytes | None, lines: int = 15) -> str:
@@ -1108,15 +1117,133 @@ def vspipe_binary() -> str:
     return str(sibling) if sibling.is_file() else "vspipe"
 
 
-def run_vspipe(
-    vpy_path: Path, frames: int, timeout: float = DEFAULT_TIMEOUT, no_download: bool = True
-) -> float | None:
-    """Time one vspipe run; return its fps, or None if the run failed.
+_AVAILABLE_PLUGINS: frozenset[str] | None = None
 
-    A run is failed (never silently accepted) when vspipe exits non-zero, is
-    killed by ``--timeout``, prints no timing line, or reports a frame count
-    other than the one requested — timing a different amount of work than the
-    header advertises is not a measurement.
+
+def _available_plugins() -> frozenset[str]:
+    """The registered plugin namespaces the benchmark's core actually loads.
+
+    Probed with one ``vspipe --info`` run rather than an in-process import, so
+    it sees the same core and plugin directory as the timed runs (VSPIPE may
+    point at another install). Cached: the set cannot change mid-invocation.
+    """
+    global _AVAILABLE_PLUGINS
+    if _AVAILABLE_PLUGINS is not None:
+        return _AVAILABLE_PLUGINS
+    names = sorted(PLUGINS)
+    with tempfile.TemporaryDirectory() as tmp:
+        found_path = Path(tmp) / "plugins.txt"
+        probe = Path(tmp) / "plugins.py"
+        probe.write_text(
+            "import vapoursynth as vs\n"
+            "core = vs.core\n"
+            f"found = [n for n in {names!r} if hasattr(core, n)]\n"
+            f"with open({str(found_path)!r}, 'w') as fh:\n"
+            "    fh.write('\\n'.join(found))\n"
+            "core.std.BlankClip(format=vs.GRAY8, length=1).set_output()\n"
+        )
+        try:
+            result = subprocess.run(
+                [vspipe_binary(), "--info", str(probe), "-"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=vspipe_env(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(
+                f"  [plugin check failed ({exc}); assuming every plugin is installed]",
+                file=sys.stderr,
+            )
+            _AVAILABLE_PLUGINS = frozenset(names)
+            return _AVAILABLE_PLUGINS
+        if result.returncode != 0 or not found_path.exists():
+            print(
+                "  [plugin check failed; assuming every plugin is installed]",
+                file=sys.stderr,
+            )
+            tail = _tail(result.stderr, 8)
+            if tail:
+                print(textwrap.indent(tail, "    "), file=sys.stderr)
+            _AVAILABLE_PLUGINS = frozenset(names)
+            return _AVAILABLE_PLUGINS
+        _AVAILABLE_PLUGINS = frozenset(found_path.read_text().split())
+    return _AVAILABLE_PLUGINS
+
+
+def _vspipe_cmd(vpy_path: Path, no_download: bool) -> list[str]:
+    """The vspipe command line; ``--progress`` supplies the timing window."""
+    outfile = "--" if no_download else "/dev/null"
+    return [vspipe_binary(), "--progress", str(vpy_path), outfile]
+
+
+def _timing_from_reports(reports: list[tuple[float, int]], seconds: float) -> Timing | None:
+    """fps over the first report span that reaches ``seconds``, or None."""
+    if len(reports) < 2:
+        return None
+    t0, n0 = reports[0]
+    for t, n in reports[1:]:
+        elapsed = t - t0
+        if elapsed >= seconds:
+            frames = n - n0
+            if frames > 0:
+                return Timing(frames / elapsed, frames, elapsed)
+            return None
+    return None
+
+
+def _report_tail(raw: bytearray, lines: int = 15) -> None:
+    tail = _tail(raw.decode(errors="replace"), lines)
+    if tail:
+        print(textwrap.indent(tail, "    "), file=sys.stderr)
+
+
+def _start_vspipe(cmd: list[str]) -> subprocess.Popen:
+    """Start vspipe in its own process group, so the whole tree can be stopped.
+
+    The venv's ``vspipe`` is a Python wrapper that runs the real binary in a
+    child process; killing only the direct child would leave the timed run
+    alive and reading the progress pipe.
+    """
+    kwargs = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.PIPE,
+        "env": vspipe_env(),
+    }
+    if os.name == "nt":
+        return subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, **kwargs)
+    return subprocess.Popen(cmd, start_new_session=True, **kwargs)
+
+
+def _stop_vspipe(proc: subprocess.Popen, force: bool = False) -> None:
+    """Stop vspipe and the binary its wrapper spawned."""
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def run_vspipe(
+    vpy_path: Path, seconds: float, timeout: float = DEFAULT_TIMEOUT, no_download: bool = True
+) -> Timing | None:
+    """Time one vspipe run for ``seconds`` of output and return its throughput.
+
+    The window is vspipe's own progress reports: the first report and the first
+    one at least ``seconds`` later give the frames completed in that span, and
+    fps is frames / elapsed. Script evaluation and the cache preload happen
+    before the first report and are not counted; the process is stopped once
+    the window is reached, so slow and fast arms cost the same wall time.
+
+    A run is failed (never silently accepted) when vspipe exits before the
+    window fills, is killed by ``--timeout``, or prints no usable progress.
 
     ``no_download`` (the default) uses vspipe's ``--`` no-output target: the
     frames are still requested, but a GPU resident output is consumed as-is
@@ -1124,41 +1251,97 @@ def run_vspipe(
     sgfAllowGPUResident exactly when it writes no output). Pass False to write
     /dev/null and time the download as part of the chain.
     """
-    outfile = "--" if no_download else "/dev/null"
-    cmd = [vspipe_binary(), "--start", "0", "--end", str(frames - 1), str(vpy_path), outfile]
-    env = vspipe_env()
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
-    except subprocess.TimeoutExpired as exc:
+        proc = _start_vspipe(_vspipe_cmd(vpy_path, no_download))
+    except OSError as exc:
+        print(f"  [vspipe failed to start: {exc}] {vpy_path.name}", file=sys.stderr)
+        return None
+    assert proc.stderr is not None
+    fd = proc.stderr.fileno()
+    reports: list[tuple[float, int]] = []
+    raw = bytearray()
+    rest = b""
+
+    def read_progress() -> None:
+        nonlocal rest
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            now = time.monotonic()
+            raw.extend(chunk)
+            del raw[:-16384]  # keep only the tail for error reporting
+            rest += chunk
+            *lines, rest = re.split(rb"[\r\n]", rest)
+            for line in lines:
+                match = _PROGRESS_RE.match(line)
+                if match:
+                    reports.append((now, int(match.group(1))))
+
+    # A thread rather than select(): a pipe is not selectable on Windows.
+    reader = threading.Thread(target=read_progress, daemon=True)
+    reader.start()
+    spawned = time.monotonic()
+    timed_out = False
+    while True:
+        if time.monotonic() - spawned > timeout:
+            timed_out = True
+            _stop_vspipe(proc, force=True)
+            break
+        if reports and reports[-1][0] - reports[0][0] >= seconds:
+            break
+        if proc.poll() is not None and not reader.is_alive():
+            break
+        time.sleep(0.01)
+    if proc.poll() is None or reader.is_alive():
+        _stop_vspipe(proc)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        _stop_vspipe(proc, force=True)
+        proc.wait()
+    reader.join(timeout=10)
+    proc.stderr.close()
+
+    if timed_out:
         print(f"  [vspipe timed out after {timeout:g}s] {vpy_path.name}", file=sys.stderr)
-        tail = _tail(exc.stderr)
-        if tail:
-            print(textwrap.indent(tail, "    "), file=sys.stderr)
+        _report_tail(raw)
         return None
-    if result.returncode != 0:
-        # A failed run must not read as an unavailable plugin: surface the tail
-        # of vspipe's stderr so the cause (bad argument, crash, missing plugin)
-        # is visible instead of being silently swallowed.
-        print(f"  [vspipe failed: exit {result.returncode}] {vpy_path.name}", file=sys.stderr)
-        tail = _tail(result.stderr)
-        if tail:
-            print(textwrap.indent(tail, "    "), file=sys.stderr)
-        return None
-    match = _FPS_RE.search(result.stderr or "")
-    if match is None:
-        # exited 0 but printed no timing line: report that too
-        print(f"  [vspipe produced no fps line: {vpy_path.name}]", file=sys.stderr)
-        tail = _tail(result.stderr, 10)
-        if tail:
-            print(textwrap.indent(tail, "    "), file=sys.stderr)
-        return None
-    got, fps = int(match.group(1)), float(match.group(2))
-    if got != frames:
+
+    timing = _timing_from_reports(reports, seconds)
+    if timing is not None:
+        return timing
+
+    # The clip ran out before the window filled. vspipe's own final line still
+    # has an exact fps, but only a run that lasted the window is a measurement.
+    text = raw.decode(errors="replace")
+    match = _FPS_RE.search(text)
+    if match is not None:
+        frames, elapsed, fps = int(match.group(1)), float(match.group(2)), float(match.group(3))
+        if elapsed >= seconds:
+            return Timing(fps, frames, elapsed)
         print(
-            f"  [vspipe reported {got} frames, expected {frames}] {vpy_path.name}", file=sys.stderr
+            f"  [clip ended after {elapsed:.2f}s, before the {seconds:g}s window] {vpy_path.name}",
+            file=sys.stderr,
         )
+        _report_tail(raw, 10)
         return None
-    return fps
+    rc = proc.returncode
+    if rc not in (None, 0):
+        print(f"  [vspipe failed: exit {rc}] {vpy_path.name}", file=sys.stderr)
+    elif reports:
+        print(
+            f"  [vspipe produced {len(reports)} progress report(s), "
+            f"not a {seconds:g}s window] {vpy_path.name}",
+            file=sys.stderr,
+        )
+    else:
+        print(f"  [vspipe produced no progress] {vpy_path.name}", file=sys.stderr)
+    _report_tail(raw, 10)
+    return None
 
 
 def bench(
@@ -1174,7 +1357,8 @@ def bench(
     gpu_cache_mb: int | None = None,
     no_download: bool = True,
     scale: float = 1.0,
-) -> float | None:
+    seconds: float = DEFAULT_SECONDS,
+) -> Timing | None:
     vpy = make_vpy(
         clip=clip,
         extra=_plugin_loader(plugin),
@@ -1190,7 +1374,7 @@ def bench(
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"bench_{plugin}.vpy"
         path.write_text(vpy)
-        return run_vspipe(path, frames, timeout, no_download)
+        return run_vspipe(path, seconds, timeout, no_download)
 
 
 def bench_aa(
@@ -1207,7 +1391,8 @@ def bench_aa(
     download_inputs: bool = False,
     no_download: bool = True,
     upscale: bool = True,
-) -> float | None:
+    seconds: float = DEFAULT_SECONDS,
+) -> Timing | None:
     """Run an EEDI3 mask benchmark (see make_aa_vpy)."""
     vpy = make_aa_vpy(
         clip=clip,
@@ -1225,20 +1410,34 @@ def bench_aa(
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"bench_{plugin}.vpy"
         path.write_text(vpy)
-        return run_vspipe(path, frames, timeout, no_download)
+        return run_vspipe(path, seconds, timeout, no_download)
 
 
-def _stats(values: list[float]) -> tuple[float, float, float]:
-    """(median, min, max) of the successful repeats."""
-    return statistics.median(values), min(values), max(values)
+def _stats(values: list[Timing]) -> tuple[float, float, float]:
+    """(median, min, max) of the successful repeats' fps."""
+    fps = [v.fps for v in values]
+    return statistics.median(fps), min(fps), max(fps)
 
 
-def _fmt_stats(values: list[float]) -> str:
+def _fmt_stats(values: list[Timing]) -> str:
     if len(values) == 1:
-        return f"{values[0]:9.2f} fps"
+        return f"{values[0].fps:9.2f} fps"
     median, lo, hi = _stats(values)
     spread = 100.0 * (hi - lo) / median if median else 0.0
     return f"{median:9.2f} fps  [min {lo:8.2f} max {hi:8.2f} spread {spread:4.1f}%] n={len(values)}"
+
+
+def _window_desc(values: list[Timing]) -> str:
+    """The measured window behind the fps: frames counted and elapsed time."""
+    frames = statistics.median(v.frames for v in values)
+    seconds = statistics.median(v.seconds for v in values)
+    return f"{frames:.0f} frames / {seconds:.2f}s"
+
+
+# "unavailable" is wider than the nine-column fps field, so right-align it to
+# the column a three-digit fps value starts in; otherwise it sits left of every
+# number in the table.
+_UNAVAILABLE_TAG = f"{'unavailable':>14}"
 
 
 def args_desc(spec: FilterSpec, ns: argparse.Namespace) -> str:
@@ -1387,7 +1586,7 @@ def _run_once(
     cache_conv: str | None,
     gpu_cache: bool = True,
     download_inputs: bool = False,
-) -> float | None:
+) -> Timing | None:
     """One timed vspipe run of one plugin: the repeat/interleave unit.
 
     `gpu_cache` (the default) says this arm's chain consumes device-resident
@@ -1411,6 +1610,7 @@ def _run_once(
             download_inputs=download_inputs,
             no_download=ns.no_download,
             upscale=spec.aa_scale == 2,
+            seconds=ns.seconds,
         )
     return bench(
         plugin,
@@ -1425,6 +1625,7 @@ def _run_once(
         gpu_cache_mb=ns.gpu_cache_mb,
         no_download=ns.no_download,
         scale=ns.scale,
+        seconds=ns.seconds,
     )
 
 
@@ -1443,6 +1644,7 @@ class FilterPlan:
     gpu_arms: list[str]
     download_arms: list[str]
     plugins: list[str]
+    unavailable: list[str]
 
 
 def _prepare_filter(
@@ -1455,7 +1657,9 @@ def _prepare_filter(
     # must consume the same format the cache holds, or the timed region
     # re-converts behind the filter
     input_expr = _input_for_format(spec.input, ns.format) if ns.format else spec.input
-    frames = ns.frames or spec.default_frames
+    # The run is bounded by --seconds, so the script only has to be long enough
+    # for vspipe not to run out of frames inside the window.
+    frames = TIME_RUN_FRAMES
     synth = spec.synth_format if ns.synthetic else None
     if synth and ns.format:
         synth = _synth_format_for(synth, ns.format)
@@ -1513,6 +1717,10 @@ def _prepare_filter(
     if requested is None:
         requested = ns.plugins or list(calls)
     plugins = resolve_plugins(requested, calls, spec.title)
+    installed = _available_plugins()
+    # Keep a plugin the core does not load in the list, so the result table can
+    # show it, but never run it: one traceback per repeat is noise, not data.
+    unavailable = [p for p in plugins if p not in installed]
     if not plugins:
         sys.exit(f"no valid plugins requested for --filter {fname}")
     return FilterPlan(
@@ -1527,13 +1735,16 @@ def _prepare_filter(
         gpu_arms=gpu_arms,
         download_arms=download_arms,
         plugins=plugins,
+        unavailable=unavailable,
     )
 
 
 def _run_plan_once(
     spec: FilterSpec, ns: argparse.Namespace, plan: FilterPlan, plugin: str
-) -> float | None:
+) -> Timing | None:
     """One timed vspipe run of one plugin (the repeat/interleave unit)."""
+    if plugin in plan.unavailable:
+        return None
     return _run_once(
         spec,
         ns,
@@ -1552,7 +1763,8 @@ def bench_filter(fname: str, ns: argparse.Namespace) -> None:
     spec = FILTERS[fname]
     plan = _prepare_filter(fname, ns)
     print(
-        f"{spec.title} benchmark | {plan.frames} frames | clip: {plan.clip_desc}{plan.format_desc}"
+        f"{spec.title} benchmark | {ns.seconds:g}s per run | "
+        f"clip: {plan.clip_desc}{plan.format_desc}"
     )
     print(f"args: {args_desc(spec, ns)}")
     print(
@@ -1560,25 +1772,29 @@ def bench_filter(fname: str, ns: argparse.Namespace) -> None:
         f"repeat: {ns.repeat} | timeout: {ns.timeout:g}s\n"
     )
 
-    runs: dict[str, list[float]] = {p: [] for p in plan.plugins}
+    runs: dict[str, list[Timing]] = {p: [] for p in plan.plugins}
     for r in range(ns.repeat):
         # Alternate the plugin order between repeats so clock/thermal drift
         # is shared between the arms instead of favouring the first one.
         reverse = ns.interleave and r % 2 == 1
         order = list(reversed(plan.plugins)) if reverse else plan.plugins
         for plugin in order:
-            fps = _run_plan_once(spec, ns, plan, plugin)
-            if fps is not None:
-                runs[plugin].append(fps)
+            timing = _run_plan_once(spec, ns, plan, plugin)
+            if timing is not None:
+                runs[plugin].append(timing)
     for plugin in plan.plugins:
-        if runs[plugin]:
-            print(f"  {plugin:10s}  {_fmt_stats(runs[plugin])}")
+        if plugin in plan.unavailable:
+            print(f"  {plugin:10s}  {_UNAVAILABLE_TAG}")
+        elif runs[plugin]:
+            print(f"  {plugin:10s}  {_fmt_stats(runs[plugin])}  ({_window_desc(runs[plugin])})")
         else:
             print(f"  {plugin:10s}  unavailable / failed")
     print()
 
     valid = sorted(
-        ((p, statistics.median(v)) for p, v in runs.items() if v), key=lambda x: x[1], reverse=True
+        ((p, statistics.median(x.fps for x in v)) for p, v in runs.items() if v),
+        key=lambda x: x[1],
+        reverse=True,
     )
     if len(valid) > 1:
         # The grading question is vsfeel against the fastest reference, so the
@@ -1742,7 +1958,7 @@ def bench_filter_ab(fname: str, ns: argparse.Namespace) -> None:
     # names plugins explicitly (a reference would measure the same binary in
     # both arms, i.e. pure noise at double the cost).
     plan = _prepare_filter(fname, ns, requested=ns.plugins or ["vsfeel"])
-    print(f"{spec.title} A/B | {plan.frames} frames | clip: {plan.clip_desc}{plan.format_desc}")
+    print(f"{spec.title} A/B | {ns.seconds:g}s per run | clip: {plan.clip_desc}{plan.format_desc}")
     print(f"args: {args_desc(spec, ns)}")
     print(
         f"{_cache_desc(spec, ns, plan.synth, plan.cache_frames)}{_mode_desc(ns)} | "
@@ -1762,7 +1978,7 @@ def bench_filter_ab(fname: str, ns: argparse.Namespace) -> None:
         print(f"  arm {arm.name}: " + ", ".join(detail))
     print()
 
-    samples: dict[str, dict[str, list[float]]] = {
+    samples: dict[str, dict[str, list[Timing]]] = {
         arm.name: {p: [] for p in plan.plugins} for arm in arms
     }
     original = install.read_bytes() if install is not None else None
@@ -1778,12 +1994,14 @@ def bench_filter_ab(fname: str, ns: argparse.Namespace) -> None:
                     installed = arm.so
                 with _ab_env(arm.env):
                     for plugin in plan.plugins:
-                        cell: list[float] = []
+                        if plugin in plan.unavailable:
+                            continue
+                        cell: list[Timing] = []
                         for _ in range(ns.repeat):
-                            fps = _run_plan_once(spec, ns, plan, plugin)
-                            if fps is not None:
-                                cell.append(fps)
-                                samples[arm.name][plugin].append(fps)
+                            timing = _run_plan_once(spec, ns, plan, plugin)
+                            if timing is not None:
+                                cell.append(timing)
+                                samples[arm.name][plugin].append(timing)
                         tag = f"[ab r={r}/{rounds} {arm.name}]"
                         if cell:
                             print(f"  {tag} {plugin:10s}  {_fmt_stats(cell)}")
@@ -1802,12 +2020,15 @@ def bench_filter_ab(fname: str, ns: argparse.Namespace) -> None:
     for plugin in plan.plugins:
         va, vb = samples[a][plugin], samples[b][plugin]
         for arm_name, v in ((a, va), (b, vb)):
-            if v:
+            if plugin in plan.unavailable:
+                print(f"  {plugin:10s} {arm_name:10s}  {_UNAVAILABLE_TAG}")
+            elif v:
                 print(f"  {plugin:10s} {arm_name:10s}  {_fmt_stats(v)}")
             else:
                 print(f"  {plugin:10s} {arm_name:10s}  unavailable / failed")
         if va and vb:
-            ma, mb = statistics.median(va), statistics.median(vb)
+            ma = statistics.median(x.fps for x in va)
+            mb = statistics.median(x.fps for x in vb)
             print(
                 f"  ab: {a} {ma:9.2f} fps vs {b} {mb:9.2f} fps "
                 f"-> {b}/{a} {mb / ma:.3f}x ({(mb / ma - 1) * 100:+.2f}%)\n"
@@ -1886,12 +2107,13 @@ def parse_args() -> argparse.Namespace:
         help="filter to benchmark (default: all)",
     )
     parser.add_argument(
-        "--frames",
-        type=int,
-        default=None,
-        help=f"frames to time; a speed test runs at least {MIN_BENCH_FRAMES} "
-        "frames and ideally the filter's own default, so prefer "
-        "omitting this (default: per-filter, see FILTERS)",
+        "--seconds",
+        type=float,
+        default=DEFAULT_SECONDS,
+        help="time each run's output loop for this many seconds: vspipe is "
+        "stopped once its progress reports span the window, and fps is the "
+        "frames counted over that span, so slow references cost the same "
+        f"wall time (default: {DEFAULT_SECONDS:g})",
     )
     parser.add_argument("--clip", default=DEFAULT_CLIP, help="input clip path")
     parser.add_argument(
@@ -1916,7 +2138,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="default mode: decode the first --cache-frames frames of the real clip "
         "into RAM before vspipe starts timing (removes the BestSource bottleneck "
-        "while keeping real content; frames loop to reach --frames)",
+        "while keeping real content; frames loop for as long as the run needs)",
     )
     parser.add_argument(
         "--no-cache",
@@ -2090,11 +2312,17 @@ def main() -> None:
         sys.exit(f"--clip not found: {ns.clip}")
     if ns.repeat < 1:
         sys.exit(f"--repeat must be >= 1, got {ns.repeat}")
-    if ns.frames is not None and ns.frames < MIN_BENCH_FRAMES:
+    if ns.seconds <= 0:
+        sys.exit(f"--seconds must be > 0, got {ns.seconds:g}")
+    if ns.timeout <= ns.seconds:
+        sys.exit(
+            f"--timeout ({ns.timeout:g}) must exceed --seconds ({ns.seconds:g}), "
+            f"or a run cannot fill the window"
+        )
+    if ns.seconds < 2:
         print(
-            f"warning: --frames {ns.frames} is below the {MIN_BENCH_FRAMES}-frame floor, "
-            f"so the fps is clock-ramp noise, not a measurement. Omit --frames to use "
-            f"the filter's default, or pick a count that runs for a couple of seconds.",
+            f"warning: --seconds {ns.seconds:g} is short enough that the clock ramp and "
+            f"run-to-run swing dominate the fps; the default is {DEFAULT_SECONDS:g}.",
             file=sys.stderr,
         )
     if ns.aa_cache_mb < 0:
