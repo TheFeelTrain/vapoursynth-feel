@@ -10,11 +10,11 @@ the fused kernel.
 
 | config (jpbd 1080p, `sigma=3`, 5 s medians) | vsfeel | vszip |
 |---|---|---|
-| chroma U/V, `radius=1` (the benchmark default) | **839 fps** | 207 fps |
+| chroma U/V, `radius=1` (the benchmark default) | **984 fps** | 207 fps |
 | chroma U/V, radius=0 | **1615 fps** | 408 fps |
 | luma, radius=0 | **1291 fps** | 204 fps |
 
-The radius=1 row is 4.1x vszip and the temporal matcher is ~57% of it; the same
+The radius=1 row is 4.8x vszip and the temporal matcher is ~60% of it; the same
 content at radius=0 is 3x faster (see Open work for what is left).
 
 Accuracy, against vszip and against an independent f64 exact-SVD oracle
@@ -128,23 +128,35 @@ order, frame props, GPU chaining), creation variants and every error path.
 
 ## Performance
 
-- The temporal frame at the benchmark default is ~1.19 ms for two chroma
-  planes. Per plane the GPU probe (`VSFEEL_WNNM_GPUTRACE`) sums **0.60 ms**
-  (match 0.36, gram 0.16, solve 0.01, apply 0.07, finish 0.00), which is the
-  whole plane: the GPU is saturated and the wall time is its own work. An extra
-  fold costs ~0.15 ms per plane, and the frame divides roughly 57% matcher,
-  25% Gram, 12% apply by ablation (an isolated kernel's ablation understates its
-  share because the phases overlap).
+- The temporal frame at the benchmark default is ~1.02 ms for two chroma
+  planes. The probe's phase totals (`VSFEEL_WNNM_GPUTRACE`) are match 0.59 ms,
+  Gram 0.07, eigen step 0.20, scatter 0.12, normalize 0.01, and the ablation
+  ladder (removing one dispatch at a time) prices the same shares: the matcher
+  is 60% of the frame, the eigen step 20%, the scatter 12%, the Gram 7%.
+- **The matcher's LDS footprint was the occupancy limiter (839 -> 917 fps).**
+  Its per-group arrays were sized for the fused path (`top_*` 64 entries,
+  `refblk` 256 floats), 3 KB of the 32 KB LDS a CU has; the split temporal
+  variant only needs the top list at `GS` and a `BS*BS` reference block, which
+  took it to 2 KB and the shader from 11 to 16 subgroups/SIMD. The matcher is
+  latency-bound, so occupancy is worth more than any single kernel change.
+- **The planes' estimate dispatches overlap (917 -> 984 fps).** Every per-plane
+  region (accumulator, patch scratch, ring slots, address table) is disjoint,
+  but the frame recorded one plane's match, Gram, solve, scatter and normalize
+  before the next plane's, with a barrier after each. Recording phase-major
+  (both planes' matchers, then both Grams, and so on) lets the GPU fill the
+  eigen step's idle CUs with the other plane's work; it is one thread per group,
+  so a single plane's dispatch leaves most of the CU empty.
 - The per-centre cache took the temporal default from 270 to 430 fps by
   searching one centre per frame instead of three; making the tags
   order-independent (no cursor invalidation) recovered the out-of-order requests
-  to 473, fixing the record-count read took it to 505, and spanning the core's
-  request depth took it to **839**. Request order is not sequential: 38% of
-  vspipe's frames arrived out of order when the cache trusted a cursor.
+  to 473, fixing the record-count read took it to 505, spanning the core's
+  request depth took it to 839, and the occupancy and phase-major rounds took it
+  to **984**. Request order is not sequential: 38% of vspipe's frames arrived
+  out of order when the cache trusted a cursor.
 - The spatial frame is 0.62 ms: **match ~0.25 ms, estimate 0.37 ms** (the
   staging had taken the match phase from 0.50 ms).
 - The benchmark chain (device-resident frames, no decode) and the live-decode
-  screen now differ only by the decoder: 839 fps for the filter's own work, and
+  screen now differ only by the decoder: 984 fps for the filter's own work, and
   a live 1080p source is decode-bound at about 560-630 fps. The screen that read
   ~630 while the benchmark read 505 was not a harness residual or the decoder:
   the small ring made the filter re-search every fold once enough frames were
@@ -178,6 +190,17 @@ order, frame props, GPU chaining), creation variants and every error path.
 
 ## Historical
 
+- **2026-10-24 - the matcher's occupancy and the planes' overlap (839 -> 984
+  fps).** Two changes, each graded A/B on the default arm. The temporal
+  matcher's per-group LDS was 3 KB, sized for the fused path; cutting it to the
+  split path's real needs (2 KB) took the shader from 11 to 16
+  subgroups/SIMD: 839 -> 917. Then the frame was recorded plane-major with a
+  barrier between every dispatch; recording phase-major over both planes (their
+  buffers are disjoint) lets the eigen step's idle CUs run the other plane's
+  work: 917 -> 984. Rejected: reordering the Jacobi sweep to the round-robin
+  schedule for ILP (no measurable change, so the arithmetic stayed as it was),
+  and moving the cross-frame queue barrier after the matcher (+0.5%, and only
+  safe while the ring spans the in-flight window).
 - **2026-10-24 - the cache ring spans the request depth (505 -> 839 fps).** The
   ring held two folds' worth of slots (8), but the core keeps one request per
   thread in flight (32 here), so a centre's tag was evicted before the
@@ -264,20 +287,21 @@ order, frame props, GPU chaining), creation variants and every error path.
 
 ## Open work
 
-- **The GPU is no longer idle: the dispatches sum to the graded frame.** The
-  1.98 ms frame that used to look submission-bound was the ring thrash; with the
-  depth-sized ring the probe's 1.18 ms of dispatches match the 1.19 ms wall, so
-  the remaining headroom is kernel work, not submission. The probe's
-  `BOTTOM_OF_PIPE` pairs are reliable for the total and not for the short spans,
-  so measure whole-frame totals.
-- **The temporal matcher is 57% of the frame at 7-10 warps per CU.** Its 32
-  threads are right for the tile and the barriers, but the SSD chains are
-  latency-bound and the CU is nearly empty. A 128-thread workgroup with a
-  128-candidate tile is *worse* (the rank is quadratic in the tile). The
-  candidates are four groups per workgroup with subgroup barriers (four warps,
-  each running its own group) or one warp per reference block with the top-K by
-  shuffle argmin (nssfactory `match.cu`) - both need the candidate loop to stop
-  using workgroup barriers.
+- **The eigen step is the next latency-bound dispatch (0.20 ms).** It is one
+  thread per group, so the whole dispatch is ~2 waves/SIMD however many groups
+  there are: at 360p it still costs 0.17 ms against 0.24 at 1080p, i.e. mostly
+  per-thread dependency chain (560 rotations of two transcendentals each), not
+  work. Making the four disjoint rotations of a round run on four lanes (the
+  fused path's round-robin Jacobi over LDS) trades ~10x the instructions for
+  full occupancy; unmeasured, and the round-robin's f32 order must be checked
+  against the current 20-sweep serial one before it ships.
+- **The temporal matcher is 60% of the frame at ~8 waves/SIMD.** Its 32 threads
+  are right for the tile and the barriers, but the SSD chains are latency-bound.
+  The remaining lever is more groups per workgroup (two groups of 32 threads
+  with subgroup barriers, which needs the per-group arrays indexed by
+  `gl_SubgroupID` and the per-group LDS under 1 KB), or one warp per reference
+  block with the top-K by shuffle argmin (nssfactory `match.cu`). Both need the
+  candidate loop to stop using workgroup barriers.
 - The estimate still runs over all `2r+1` slots even when the cache supplied
   their matches; caching `M` and the weight per centre as well would drop the
   Gram+solve to once per centre (~0.2 ms of the frame) for twice the ring
@@ -313,3 +337,5 @@ order, frame props, GPU chaining), creation variants and every error path.
   too (the `group_size > 8` code path).
 - `VSFEEL_WNNM_SKIPMATCH=1` / `VSFEEL_WNNM_SKIPGROUP=1` - ablations: skip the
   match phase or the estimate phase (output is garbage, timing only).
+- `VSFEEL_WNNM_NOGRAM=1` / `VSFEEL_WNNM_NOSOLVE=1` / `VSFEEL_WNNM_NOAPPLY=1` -
+  ablations: skip one estimate dispatch (output is garbage, timing only).

@@ -15,7 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - DFTTest is about 30% faster
 - DFTTest with larger temporal windows (tbsize 5 and 7) is up to 6.7x faster
 
-## [1.2.0] - 2026-10-21
+## [v1.2.0] - 2026-10-21
 
 ### Added
 
@@ -29,7 +29,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - BM3D is about 18% faster
 - Bilateral is about 15% faster
 
-## [1.1.2] - 2026-10-18
+## [v1.1.2] - 2026-10-18
 
 ### Fixed
 
@@ -39,13 +39,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - BM3D is now registered as `core.vsfeel.BM3D` instead of `core.vsfeel.BM3Dv2`
 
-## [1.1.1] - 2026-10-05
+## [v1.1.1] - 2026-10-05
 
 ### Fixed
 
 - BM3D through vs-jetpack's `backend=vsfeel.Backend` raised "Use of invalidated Core" after a vsview script reload
 
-## [1.1.0] - 2026-10-05
+## [v1.1.0] - 2026-10-05
 
 All filters now have full feature parity with other implementations and are more accurate.
 
@@ -68,7 +68,7 @@ All filters now have full feature parity with other implementations and are more
 - NLMeans more closely matches vszipcl in fp32 and u16
 - The pipeline cache is only rewritten when a process compiled something new
 
-## [1.0.0] - 2026-10-01
+## [v1.0.0] - 2026-10-01
 
 The plugin has moved to the VapourSynth R80 GPU API. The core now owns the device, the queues, and the transfers.
 
@@ -91,7 +91,7 @@ The plugin has moved to the VapourSynth R80 GPU API. The core now owns the devic
 - EEDI3AA's per plane merge, and its handling of odd plane geometry
 - Benchmark and test harness bugs that reported misleading results
 
-## [0.2.2] - 2026-09-21
+## [v0.2.2] - 2026-09-21
 
 ### Added
 
@@ -112,13 +112,13 @@ The plugin has moved to the VapourSynth R80 GPU API. The core now owns the devic
 - GPU timing probes are only armed when the queue family reports valid timestamps
 - Small fixes in DFTTest's fused transpose window and NNEDI3's download slots
 
-## [0.2.1] - 2026-09-20
+## [v0.2.1] - 2026-09-20
 
 ### Fixed
 
 - BM3D now works on GPUs without buffer float atomics, using a compare and swap aggregation path
 
-## [0.2.0] - 2026-09-20
+## [v0.2.0] - 2026-09-20
 
 ### Changed
 
@@ -128,7 +128,7 @@ The plugin has moved to the VapourSynth R80 GPU API. The core now owns the devic
 - EEDI3AA's two horizontal passes share one submission
 - Shader, pipeline and buffer helpers are shared by all filters in `vsfeel.h`
 
-## [0.1.0] - 2026-09-18
+## [v0.1.0] - 2026-09-18
 
 ### Added
 
@@ -137,12 +137,12 @@ The plugin has moved to the VapourSynth R80 GPU API. The core now owns the devic
 - vs-jetpack backend integration, so the filters can be used through the vs-jetpack wrappers
 - Windows and Linux wheels, built and published by CI
 
-[1.2.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.2...1.2.0
-[1.1.2]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.1...1.1.2
-[1.1.1]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.0...1.1.1
-[1.1.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.0.0...1.1.0
-[1.0.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/0.2.2...1.0.0
-[0.2.2]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/0.2.1...0.2.2
-[0.2.1]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/0.2.0...0.2.1
-[0.2.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/0.1.0...0.2.0
-[0.1.0]: https://github.com/TheFeelTrain/vapoursynth-feel/releases/tag/0.1.0
+[v1.2.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.2...v1.2.0
+[v1.1.2]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.1...1.1.2
+[v1.1.1]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.0...1.1.1
+[v1.1.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.0.0...1.1.0
+[v1.0.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/0.2.2...1.0.0
+[v0.2.2]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/0.2.1...0.2.2
+[v0.2.1]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/0.2.0...0.2.1
+[v0.2.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/0.1.0...0.2.0
+[v0.1.0]: https://github.com/TheFeelTrain/vapoursynth-feel/releases/tag/0.1.0

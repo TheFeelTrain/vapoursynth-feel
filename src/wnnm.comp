@@ -57,8 +57,9 @@
 #define SELCAP 32
 #endif
 #define KMAXL 64
-// The fused matcher's lists only need -DNOMATCH's top-K, which is the group size.
-#if defined(NOMATCH)
+// The final list is capped at the group size, so its storage only has to cover
+// GS; the fused matcher's running list (KMAXL) is wider than the top list.
+#if defined(NOMATCH) || defined(MATCH_ONLY)
 #define TOPCAP GS
 #else
 #define TOPCAP KMAXL
@@ -207,7 +208,7 @@ shared float win[WIN_MAX];
 // staging it turns one of the two global loads per term into a shared-memory
 // read (the temporal matcher's candidates are scattered positions, so there is
 // no window to stage around them).
-shared float refblk[256];
+shared float refblk[BS * BS];
 
 // SSD of the packed centre block against the block at (bx, by) of `rt`.
 float block_dist_ref(PlaneRef rt, int bx, int by) {

@@ -179,46 +179,52 @@ struct GPUWNNM {
 
     int bs { 8 }, step { 8 }, gs { 8 }, bm_range { 7 }, radius { 0 };
     int ps_num { 2 }, ps_range { 4 }, q {};
-    bool residual {}, adaptive {};
     int planes {};
     std::array<WnnmPlane, 3> plane;
 
     int patch_elems {}; // bs*bs
     int64_t acc_bytes {}, pmat_bytes {}, locs_bytes {};
     int64_t dist_bytes {}, match_bytes {};
-    // Block matching split into distance + selection kernels (radius 0 and a
-    // group that fits the selection kernel's register top-K).
-    bool split_match {};
     int folds { 1 };
     // Per-centre match cache: at radius > 0 one centre's search feeds 2r+1
     // output frames, so its selection and record are computed once and held in
     // a ring of RING slots keyed by centre frame. Off (one set of per-frame
     // slots per fold) when the ring would not fit the scratch budget.
-    bool cache {};
     int ring { 1 };
     GpuBuffer ring_buf;
     int64_t ring_bytes {};
     std::mutex cache_lock;
     std::vector<int> ring_tag; // centre frame each slot holds, or INT_MIN
     int dist_stride_max {};
-    bool skip_group {}; // ablation: record the match phase without the estimate
-    bool skip_match {}; // ablation: the estimate without the match phase
 
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
     VkPipelineLayout pipeline_layout {};
     VSGPUExecPool * pool {};
 
-    bool host_timing {};
     std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
         ht_n {};
     // VSFEEL_WNNM_DUMP=<frame>: dump {n, kept, weight, centre} per group.
     int dump_frame { -1 };
     int64_t trace_elems {};
-    // VSFEEL_WNNM_GPUTRACE=<frame>: per-kernel GPU timings.
-    bool gpu_trace {};
     int gpu_trace_frame { 100 };
     WnnmGpuProbe probe;
+
+    // Every flag is packed here, after the pointers and atomics, so the struct
+    // does not pay a padding run before each one.
+    bool residual {}, adaptive {};
+    // Block matching split into distance + selection kernels (radius 0 and a
+    // group that fits the selection kernel's register top-K).
+    bool split_match {};
+    // Per-centre match cache enabled (the ring fit the scratch budget).
+    bool cache {};
+    bool skip_group {}; // ablation: record the match phase without the estimate
+    bool skip_match {}; // ablation: the estimate without the match phase
+    bool skip_gram {};  // ablation: the estimate without its Gram dispatch
+    bool skip_solve {}; // ablation: the estimate without its eigen dispatch
+    bool skip_apply {}; // ablation: the estimate without its scatter
+    bool host_timing {};
+    bool gpu_trace {}; // VSFEEL_WNNM_GPUTRACE=<frame>
 
     ~GPUWNNM() {
         if (host_timing && ht_n.load()) {
@@ -631,53 +637,80 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     record_acc_clear(*d->gpu, cmd, acc_buf.buffer, d->acc_bytes);
 
     vsfeel_trace_mark("dispatch");
-    for (int p = 0; p < 3; ++p) {
-        WnnmPlane & pln = d->plane[p];
-        if (!pln.process) {
-            continue;
-        }
-        if (d->split_match && d->radius == 0 && !d->skip_match) {
-            // Block match(then selection) ahead of the estimate: every
-            // candidate's SSD, then one thread per group for the top-K.
-            const VkBuffer db[8] { addr_buf.buffer, dummy,     dummy,
-                                   dummy,           dummy,     dummy,
-                                   dist_buf.buffer, match_view };
-            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, db, 8);
+    // Phase-major rather than plane-major: every per-plane region (accumulator,
+    // patch scratch, ring slots, address table) is disjoint, so the planes'
+    // dispatches inside one phase are independent and the GPU can run them
+    // together. That is what the eigen step needs: it is one thread per group,
+    // so one plane's dispatch leaves most of the CU idle, and the other plane's
+    // work fills it without a barrier in between. A barrier is only needed
+    // between phases, where the next phase reads what the previous wrote.
+    const auto bind_match = [&] {
+        const VkBuffer buffers[8] { addr_buf.buffer,
+                                    dummy,
+                                    dummy,
+                                    dummy,
+                                    dummy,
+                                    dummy,
+                                    dist_buf.buffer ? dist_buf.buffer : dummy,
+                                    match_view };
+        gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 8);
+    };
+    const auto bind_estimate = [&](VkBuffer dst_buf) {
+        const VkBuffer buffers[8] { addr_buf.buffer,
+                                    acc_buf.buffer,
+                                    locs_buf.buffer ? locs_buf.buffer : dummy,
+                                    pmat_buf.buffer ? pmat_buf.buffer : dummy,
+                                    dst_buf,
+                                    tr_buf.buffer ? tr_buf.buffer : dummy,
+                                    dist_buf.buffer ? dist_buf.buffer : dummy,
+                                    match_view };
+        gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 8);
+    };
+    const bool spatial_match =
+        d->split_match && d->radius == 0 && !d->skip_match;
+
+    // Distance kernel (spatial split path): one dispatch per plane.
+    if (spatial_match) {
+        for (int p = 0; p < 3; ++p) {
+            WnnmPlane & pln = d->plane[p];
+            if (!pln.process) {
+                continue;
+            }
+            bind_match();
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           pln.dist_pipe);
             d->gpu->vk->vkCmdDispatch(cmd, pln.grid_x, pln.grid_y, 1);
-            gpu_barrier(*d->gpu, cmd);
+        }
+        gpu_barrier(*d->gpu, cmd);
+        // Selection kernel: one thread per group, reads the distances above.
+        for (int p = 0; p < 3; ++p) {
+            WnnmPlane & pln = d->plane[p];
+            if (!pln.process) {
+                continue;
+            }
+            bind_match();
             const uint32_t sel_groups =
                 (static_cast<uint32_t>(pln.ng) + kWorkgroup - 1) / kWorkgroup;
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           pln.select_pipe);
             d->gpu->vk->vkCmdDispatch(cmd, sel_groups, 1, 1);
-            gpu_barrier(*d->gpu, cmd);
-            probe_ts();
         }
-        if (d->skip_group) {
-            continue;
-        }
-        {
-            const VkBuffer buffers[8] {
-                addr_buf.buffer,
-                acc_buf.buffer,
-                locs_buf.buffer ? locs_buf.buffer : dummy,
-                pmat_buf.buffer,
-                dummy,
-                tr_buf.buffer ? tr_buf.buffer : dummy,
-                dist_buf.buffer ? dist_buf.buffer : dummy,
-                match_view
-            };
-            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 8);
-            const uint32_t ng =
-                static_cast<uint32_t>(pln.ng) * static_cast<uint32_t>(d->folds);
+        gpu_barrier(*d->gpu, cmd);
+    }
+    // Matcher: the temporal split's one dispatch per missing centre, or the
+    // fused kernel that also estimates and scatters.
+    if (!d->skip_group) {
+        for (int p = 0; p < 3; ++p) {
+            WnnmPlane & pln = d->plane[p];
+            if (!pln.process) {
+                continue;
+            }
+            bind_estimate(dst_plane[p]);
             if (d->split_match) {
                 if (d->radius > 0 && !d->skip_match) {
-                    // The temporal matcher (the predictive search is inherently
-                    // serial) publishes one selection per centre and leaves the
-                    // estimate to the kernels below. With the cache on, only
-                    // the folds whose centre is not in the ring run.
+                    // The predictive search is inherently serial and publishes
+                    // one selection per centre; with the cache on only the
+                    // folds whose centre is not in the ring run.
                     const int32_t pc_all[3] { n, d->vi->numFrames, 0 };
                     for (size_t t = 0; t < todo.size(); ++t) {
                         const int32_t one[3] { n, d->vi->numFrames, todo[t] };
@@ -701,26 +734,6 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                         gpu_barrier(*d->gpu, cmd);
                     }
                 }
-                probe_ts();
-                // Gram matrix, eigen step, weighted scatter, one kernel each
-                // (see the split-estimate entry points in src/wnnm.comp).
-                const int32_t pc[3] { n, d->vi->numFrames, 0 };
-                gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, pc,
-                                   sizeof(pc));
-                const uint32_t lanes = (ng + 15) / 16;
-                d->gpu->vk->vkCmdBindPipeline(
-                    cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pln.gram_pipe);
-                d->gpu->vk->vkCmdDispatch(cmd, lanes, 1, 1);
-                gpu_barrier(*d->gpu, cmd);
-                probe_ts();
-                d->gpu->vk->vkCmdBindPipeline(
-                    cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pln.solve_pipe);
-                d->gpu->vk->vkCmdDispatch(cmd, (ng + 255) / 256, 1, 1);
-                gpu_barrier(*d->gpu, cmd);
-                probe_ts();
-                d->gpu->vk->vkCmdBindPipeline(
-                    cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pln.apply_pipe);
-                d->gpu->vk->vkCmdDispatch(cmd, lanes, 1, 1);
             } else {
                 d->gpu->vk->vkCmdBindPipeline(
                     cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pln.group_pipe);
@@ -731,27 +744,83 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
             }
         }
         gpu_barrier(*d->gpu, cmd);
-        probe_ts();
-        {
-            const VkBuffer buffers[8] {
-                addr_buf.buffer,
-                acc_buf.buffer,
-                locs_buf.buffer ? locs_buf.buffer : dummy,
-                pmat_buf.buffer ? pmat_buf.buffer : dummy,
-                dst_plane[p],
-                tr_buf.buffer ? tr_buf.buffer : dummy,
-                dist_buf.buffer ? dist_buf.buffer : dummy,
-                match_view
-            };
-            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 8);
+    }
+    probe_ts();
+
+    // Gram matrix, eigen step and weighted scatter: one kernel each, over every
+    // (lattice point, fold) slot of the plane. Each phase is dispatched for all
+    // planes before the barrier, so the two planes' kernels overlap.
+    const bool estimate = d->split_match && !d->skip_group;
+    if (estimate) {
+        // The three estimate kernels key their slots by fold, so they need the
+        // output frame and the clip length; the matcher above left its own
+        // values behind.
+        const int32_t pc[3] { n, d->vi->numFrames, 0 };
+        gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, pc, sizeof(pc));
+    }
+    if (estimate && !d->skip_gram) {
+        for (int p = 0; p < 3; ++p) {
+            WnnmPlane & pln = d->plane[p];
+            if (!pln.process) {
+                continue;
+            }
+            bind_estimate(dst_plane[p]);
+            const uint32_t lanes =
+                (static_cast<uint32_t>(pln.ng) * uint32_t(d->folds) + 15) / 16;
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                          pln.finish_pipe);
-            d->gpu->vk->vkCmdDispatch(cmd, pln.finish_x,
-                                      static_cast<uint32_t>(pln.height), 1);
+                                          pln.gram_pipe);
+            d->gpu->vk->vkCmdDispatch(cmd, lanes, 1, 1);
         }
         gpu_barrier(*d->gpu, cmd);
-        probe_ts();
     }
+    probe_ts();
+    if (estimate && !d->skip_solve) {
+        for (int p = 0; p < 3; ++p) {
+            WnnmPlane & pln = d->plane[p];
+            if (!pln.process) {
+                continue;
+            }
+            bind_estimate(dst_plane[p]);
+            const uint32_t slots =
+                static_cast<uint32_t>(pln.ng) * uint32_t(d->folds);
+            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                          pln.solve_pipe);
+            d->gpu->vk->vkCmdDispatch(cmd, (slots + 255) / 256, 1, 1);
+        }
+        gpu_barrier(*d->gpu, cmd);
+    }
+    probe_ts();
+    if (estimate && !d->skip_apply) {
+        for (int p = 0; p < 3; ++p) {
+            WnnmPlane & pln = d->plane[p];
+            if (!pln.process) {
+                continue;
+            }
+            bind_estimate(dst_plane[p]);
+            const uint32_t lanes =
+                (static_cast<uint32_t>(pln.ng) * uint32_t(d->folds) + 15) / 16;
+            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                          pln.apply_pipe);
+            d->gpu->vk->vkCmdDispatch(cmd, lanes, 1, 1);
+        }
+        gpu_barrier(*d->gpu, cmd);
+    }
+    probe_ts();
+    // Normalize: the scatter's atomics have to be visible, so this phase starts
+    // behind the barrier above.
+    for (int p = 0; p < 3; ++p) {
+        WnnmPlane & pln = d->plane[p];
+        if (!pln.process) {
+            continue;
+        }
+        bind_estimate(dst_plane[p]);
+        d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                      pln.finish_pipe);
+        d->gpu->vk->vkCmdDispatch(cmd, pln.finish_x,
+                                  static_cast<uint32_t>(pln.height), 1);
+    }
+    gpu_barrier(*d->gpu, cmd);
+    probe_ts();
     if (gputrace) {
         gpu_barrier(*d->gpu, cmd);
         d->gpu->vk->vkCmdCopyQueryPoolResults(
@@ -818,30 +887,13 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                     n, us(ts[0], ts[probe_slot - 1]), period,
                     (unsigned long long)ts[0],
                     (unsigned long long)ts[probe_slot - 1]);
+            // One stamp pair per phase, so each line covers every plane the
+            // phase dispatched.
             const char * names[5] { "match", "gram", "solve", "apply",
                                     "finish" };
-            int at = 1;
-            for (int p = 0; p < 3; ++p) {
-                if (!d->plane[p].process) {
-                    continue;
-                }
-                double sum = 0.0;
-                for (int k = 0; k < 5; ++k) {
-                    if (at + k >= probe_slot) {
-                        break;
-                    }
-                    sum += us(ts[at + k - 1], ts[at + k]);
-                }
-                fprintf(stderr, "[wnnm-gpu]   p=%d", p);
-                for (int k = 0; k < 5; ++k) {
-                    if (at + k >= probe_slot) {
-                        break;
-                    }
-                    fprintf(stderr, " %s=%.1f", names[k],
-                            us(ts[at + k - 1], ts[at + k]));
-                }
-                fprintf(stderr, " sum=%.1fus\n", sum);
-                at += 5;
+            for (int k = 1; k < probe_slot; ++k) {
+                fprintf(stderr, "[wnnm-gpu]   %s=%.1fus\n",
+                        k <= 5 ? names[k - 1] : "phase", us(ts[k - 1], ts[k]));
             }
         } else {
             fprintf(stderr, "[wnnm-gpu] probe wait failed: %s\n", perr);
@@ -943,6 +995,9 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     d->host_timing = vsfeel_debug_probe("VSFEEL_WNNM_TIMING");
     d->skip_group = env_flag("VSFEEL_WNNM_SKIPGROUP");
     d->skip_match = env_flag("VSFEEL_WNNM_SKIPMATCH");
+    d->skip_gram = env_flag("VSFEEL_WNNM_NOGRAM");
+    d->skip_solve = env_flag("VSFEEL_WNNM_NOSOLVE");
+    d->skip_apply = env_flag("VSFEEL_WNNM_NOAPPLY");
     d->dump_frame = env_int("VSFEEL_WNNM_DUMP", -1);
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
