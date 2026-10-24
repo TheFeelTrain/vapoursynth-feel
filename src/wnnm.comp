@@ -141,6 +141,221 @@ shared float mm[QMAX * QMAX];
 shared float shr[QMAX];
 shared ET eig[QMAX];
 shared int seed_order[KMAXL];
+// Round-robin Jacobi: the (k+1)/2 rotations of the current round, and the
+// round that last rotated (the reference block_jacobi's cs/flag).
+shared ET jcs[QMAX + 2];
+shared int jflag;
+
+// Pair `pair` of round `round` in a round-robin schedule over K (even)
+// indices: every pair of indices meets exactly once per sweep and the indices
+// are back in place afterwards.
+void jacobi_schedule(int round, int pair, int k, out int p, out int q) {
+    const int K = k + (k & 1);
+    int a = round + pair;
+    if (a >= K - 1) {
+        a -= K - 1;
+    }
+    int b = round - pair;
+    if (b < 0) {
+        b += K - 1;
+    }
+    if (pair == 0) {
+        b = K - 1;
+    }
+    p = min(a, b);
+    q = max(a, b);
+}
+
+void jacobi_serial(int q) {
+    const int KQ = q + (q & 1);
+    if (q > 1) {
+        for (int sweep = 0; sweep < 30; ++sweep) {
+            ET gmax = ET(0);
+            for (int i = 0; i < q; ++i) {
+                gmax = max(gmax, gm[i * KQ + i]);
+            }
+            const ET floor_abs = ET(ETEPS) * gmax;
+            bool rotated = false;
+            for (int p = 0; p < q - 1; ++p) {
+                for (int j = p + 1; j < q; ++j) {
+                    const ET apq = gm[p * KQ + j];
+                    const ET app = gm[p * KQ + p];
+                    const ET ajj = gm[j * KQ + j];
+                    const ET thresh =
+                        max(ET(ETEPS) * sqrt(max(app, ET(0)) *
+                                             max(ajj, ET(0))),
+                            floor_abs);
+                    if (abs(apq) <= thresh) {
+                        continue;
+                    }
+                    rotated = true;
+                    const ET theta = (ajj - app) / (ET(2) * apq);
+                    ET t;
+                    if (abs(theta) > ET(ETBIG)) {
+                        t = ET(1) / (ET(2) * theta);
+                    } else {
+                        const ET at =
+                            abs(theta) + sqrt(theta * theta + ET(1));
+                        t = theta >= ET(0) ? ET(1) / at : -ET(1) / at;
+                    }
+                    const ET cs = ET(1) / sqrt(t * t + ET(1));
+                    const ET sn = t * cs;
+                    const ET h = t * apq;
+                    for (int i = 0; i < q; ++i) {
+                        const ET xp = gm[p * KQ + i];
+                        const ET yp = gm[j * KQ + i];
+                        gm[p * KQ + i] = cs * xp - sn * yp;
+                        gm[j * KQ + i] = sn * xp + cs * yp;
+                    }
+                    gm[p * KQ + p] = app - h;
+                    gm[j * KQ + j] = ajj + h;
+                    gm[p * KQ + j] = ET(0);
+                    gm[j * KQ + p] = ET(0);
+                    for (int i = 0; i < q; ++i) {
+                        gm[i * KQ + p] = gm[p * KQ + i];
+                        gm[i * KQ + j] = gm[j * KQ + i];
+                    }
+                    for (int i = 0; i < q; ++i) {
+                        const ET xp = vt[p * KQ + i];
+                        const ET yp = vt[j * KQ + i];
+                        vt[p * KQ + i] = cs * xp - sn * yp;
+                        vt[j * KQ + i] = sn * xp + cs * yp;
+                    }
+                }
+            }
+            if (!rotated) {
+                break;
+            }
+        }
+    }
+}
+
+// Parallel cyclic Jacobi: a round rotates a set of disjoint index pairs, so
+// the rotations commute and the whole warp applies them at once; the rotations
+// themselves run on the first half-warp. `gm` holds the symmetric matrix and
+// receives the rotations, `vt` the eigenvectors; on return gm is diagonal. All
+// threads of the workgroup must call this (it holds the barriers).
+void jacobi_parallel(int k, int tid) {
+    if (k < 2) {
+        return;
+    }
+    // The round-robin schedule needs an even index count; an odd k is padded
+    // with a zero row/column, which no rotation touches.
+    const int KQ = k + (k & 1);
+    ET trace = ET(0);
+    for (int i = 0; i < k; ++i) {
+        trace += abs(gm[i * KQ + i]);
+    }
+    const ET floor_abs = ET(ETEPS) * trace / ET(k);
+    const int hp = (k + (k & 1)) / 2;
+    for (int sweep = 0; sweep < 30; ++sweep) {
+        if (tid == 0) {
+            jflag = 0;
+        }
+        barrier();
+        for (int round = 0; round < k + (k & 1) - 1; ++round) {
+            if (tid < hp) {
+                int p, q;
+                jacobi_schedule(round, tid, k, p, q);
+                ET c = ET(1), sn = ET(0);
+                if (q < k) {
+                    const ET apq = gm[p * KQ + q];
+                    const ET app = gm[p * KQ + p];
+                    const ET ajj = gm[q * KQ + q];
+                    const ET thresh =
+                        max(ET(ETEPS) * sqrt(max(app, ET(0)) * max(ajj, ET(0))),
+                            floor_abs);
+                    if (abs(apq) > thresh) {
+                        const ET theta = (ajj - app) / (ET(2) * apq);
+                        ET t;
+                        if (abs(theta) > ET(ETBIG)) {
+                            t = ET(1) / (ET(2) * theta);
+                        } else {
+                            const ET at =
+                                abs(theta) + sqrt(theta * theta + ET(1));
+                            t = theta >= ET(0) ? ET(1) / at : -ET(1) / at;
+                        }
+                        c = ET(1) / sqrt(t * t + ET(1));
+                        sn = t * c;
+                        jflag = round + 1;
+                    }
+                }
+                jcs[2 * tid] = c;
+                jcs[2 * tid + 1] = sn;
+            }
+            barrier();
+            if (jflag != round + 1) {
+                // No pair of this round rotates: nothing to apply. The barrier
+                // stays, because the next round writes what this test reads.
+                barrier();
+                continue;
+            }
+            for (int item = tid; item < k * hp; item += WG) {
+                const int row = item / hp;
+                const int pair = item - row * hp;
+                const ET c = jcs[2 * pair];
+                const ET sn = jcs[2 * pair + 1];
+                int p, q;
+                jacobi_schedule(round, pair, k, p, q);
+                if (sn != ET(0)) {
+                    const ET vip = vt[row * k + p];
+                    const ET viq = vt[row * k + q];
+                    vt[row * k + p] = c * vip - sn * viq;
+                    vt[row * k + q] = sn * vip + c * viq;
+                }
+                if (row < hp) {
+                    const ET cr = jcs[2 * row];
+                    const ET sr = jcs[2 * row + 1];
+                    if (sn != ET(0) || sr != ET(0)) {
+                        int pr, qr;
+                        jacobi_schedule(round, row, k, pr, qr);
+                        const bool wide = q < k, tall = qr < k;
+                        ET a = gm[pr * KQ + p];
+                        ET b = wide ? gm[pr * KQ + q] : ET(0);
+                        ET d = tall ? gm[qr * KQ + p] : ET(0);
+                        ET e = (wide && tall) ? gm[qr * KQ + q] : ET(0);
+                        if (sn != ET(0)) {
+                            const ET ap = c * a - sn * b;
+                            const ET aq = sn * a + c * b;
+                            const ET dp = c * d - sn * e;
+                            const ET dq = sn * d + c * e;
+                            a = ap;
+                            b = aq;
+                            d = dp;
+                            e = dq;
+                        }
+                        if (sr != ET(0)) {
+                            const ET ap = cr * a - sr * d;
+                            const ET dp = sr * a + cr * d;
+                            const ET bp = cr * b - sr * e;
+                            const ET ep = sr * b + cr * e;
+                            a = ap;
+                            d = dp;
+                            b = bp;
+                            e = ep;
+                        }
+                        gm[pr * KQ + p] = a;
+                        if (wide) {
+                            gm[pr * KQ + q] = b;
+                        }
+                        if (tall) {
+                            gm[qr * KQ + p] = d;
+                        }
+                        if (wide && tall) {
+                            gm[qr * KQ + q] = e;
+                        }
+                    }
+                }
+            }
+            barrier();
+        }
+        const int rotated = jflag;
+        barrier();
+        if (rotated == 0) {
+            break;
+        }
+    }
+}
 
 uint pack_xy(int x, int y) {
     return uint(x) | (uint(y) << 16);
@@ -506,83 +721,50 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest) {
                     accd = fma(a, b, accd);
                 }
             }
-            gm[tid * q + j] = accd;
-            gm[j * q + tid] = accd;
+            gm[tid * (q + (q & 1)) + j] = accd;
+            gm[j * (q + (q & 1)) + tid] = accd;
         }
     }
     barrier();
 
-    if (tid == 0) {
-        // Jacobi eigen decomposition, the reference's rotation order.
-        for (int i = 0; i < q * q; ++i) {
-            vt[i] = ET(0);
-        }
-        for (int i = 0; i < q; ++i) {
-            vt[i * q + i] = ET(1);
-        }
-        if (q > 1) {
-            for (int sweep = 0; sweep < 30; ++sweep) {
-                ET gmax = ET(0);
-                for (int i = 0; i < q; ++i) {
-                    gmax = max(gmax, gm[i * q + i]);
-                }
-                const ET floor_abs = ET(ETEPS) * gmax;
-                bool rotated = false;
-                for (int p = 0; p < q - 1; ++p) {
-                    for (int j = p + 1; j < q; ++j) {
-                        const ET apq = gm[p * q + j];
-                        const ET app = gm[p * q + p];
-                        const ET ajj = gm[j * q + j];
-                        const ET thresh =
-                            max(ET(ETEPS) * sqrt(max(app, ET(0)) *
-                                                 max(ajj, ET(0))),
-                                floor_abs);
-                        if (abs(apq) <= thresh) {
-                            continue;
-                        }
-                        rotated = true;
-                        const ET theta = (ajj - app) / (ET(2) * apq);
-                        ET t;
-                        if (abs(theta) > ET(ETBIG)) {
-                            t = ET(1) / (ET(2) * theta);
-                        } else {
-                            const ET at =
-                                abs(theta) + sqrt(theta * theta + ET(1));
-                            t = theta >= ET(0) ? ET(1) / at : -ET(1) / at;
-                        }
-                        const ET cs = ET(1) / sqrt(t * t + ET(1));
-                        const ET sn = t * cs;
-                        const ET h = t * apq;
-                        for (int i = 0; i < q; ++i) {
-                            const ET xp = gm[p * q + i];
-                            const ET yp = gm[j * q + i];
-                            gm[p * q + i] = cs * xp - sn * yp;
-                            gm[j * q + i] = sn * xp + cs * yp;
-                        }
-                        gm[p * q + p] = app - h;
-                        gm[j * q + j] = ajj + h;
-                        gm[p * q + j] = ET(0);
-                        gm[j * q + p] = ET(0);
-                        for (int i = 0; i < q; ++i) {
-                            gm[i * q + p] = gm[p * q + i];
-                            gm[i * q + j] = gm[j * q + i];
-                        }
-                        for (int i = 0; i < q; ++i) {
-                            const ET xp = vt[p * q + i];
-                            const ET yp = vt[j * q + i];
-                            vt[p * q + i] = cs * xp - sn * yp;
-                            vt[j * q + i] = sn * xp + cs * yp;
-                        }
-                    }
-                }
-                if (!rotated) {
-                    break;
+    // Eigenvectors: identity, then the round-robin parallel Jacobi.
+    for (int i = tid; i < (q + (q & 1)) * (q + (q & 1)); i += WG) {
+        vt[i] = ET(0);
+    }
+    barrier();
+    for (int i = tid; i < q; i += WG) {
+        vt[i * (q + (q & 1)) + i] = ET(1);
+    }
+    barrier();
+    if ((q & 1) == 0) {
+        jacobi_parallel(q, tid);
+        // The round-robin rotations accumulate v <- v J, so the eigenvectors
+        // are its columns; the sort permutes rows and the reconstruction
+        // indexes rows, so transpose the q x q block once.
+        {
+            const int KQ = q;
+            for (int i = tid; i < q * q; i += WG) {
+                const int r = i / q;
+                const int c = i - r * q;
+                if (r < c) {
+                    const ET t = vt[r * KQ + c];
+                    vt[r * KQ + c] = vt[c * KQ + r];
+                    vt[c * KQ + r] = t;
                 }
             }
         }
+    } else if (tid == 0) {
+        // Odd group sizes still take the reference's serial rotation order: the
+        // round-robin's padded schedule does not converge for them (see the
+        // notes' Open work, where it is the next thing to fix).
+        jacobi_serial(q);
+    }
+    barrier();
+    if (tid == 0) {
         // Sorted eigenvalues, descending, with the eigenvector rows permuted.
+        const int KQ = q + (q & 1);
         for (int i = 0; i < q; ++i) {
-            eig[i] = max(gm[i * q + i], ET(0));
+            eig[i] = max(gm[i * KQ + i], ET(0));
         }
         for (int i = 0; i < q; ++i) {
             int best = i;
@@ -596,9 +778,9 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest) {
                 eig[i] = eig[best];
                 eig[best] = tmp;
                 for (int r2 = 0; r2 < q; ++r2) {
-                    const ET t2 = vt[i * q + r2];
-                    vt[i * q + r2] = vt[best * q + r2];
-                    vt[best * q + r2] = t2;
+                    const ET t2 = vt[i * KQ + r2];
+                    vt[i * KQ + r2] = vt[best * KQ + r2];
+                    vt[best * KQ + r2] = t2;
                 }
             }
         }
@@ -638,8 +820,9 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest) {
         const int a = idx / q;
         const int b = idx - a * q;
         float s = 0.0f;
+        const int KQ = q + (q & 1);
         for (int i = 0; i < kept; ++i) {
-            s += float(vt[i * q + a]) * shr[i] * float(vt[i * q + b]);
+            s += float(vt[i * KQ + a]) * shr[i] * float(vt[i * KQ + b]);
         }
         mm[idx] = s;
     }

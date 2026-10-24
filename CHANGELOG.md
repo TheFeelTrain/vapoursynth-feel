@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `core.vsfeel.WNNM`, a Vulkan implementation of the WNNM patch denoiser, matching vszip's CPU filter
+- WNNM is 3.8x faster than its first version, from a warp-parallel eigen decomposition
 
 ### Changed
 

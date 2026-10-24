@@ -239,7 +239,8 @@ static WnnmVariant pick_variant(int qmax, bool f64, bool hw_atomics) {
 
 // Static LDS of the group kernel, exactly as src/wnnm.comp declares it: eight
 // 256-entry arrays (candidate tile, final list, frame list, centre list, seed
-// order), the eigen workspace and six scalars. tools/shader_limits.py --check
+// order), the eigen workspace, the round-robin rotation cache and seven
+// scalars. tools/shader_limits.py --check
 // compares this against the built module.
 static uint32_t group_shared_bytes(int qmax, bool f64) {
     const uint32_t lists = 8u * 256u * 4u;
