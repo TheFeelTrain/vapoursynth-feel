@@ -374,7 +374,8 @@ def test_non_f32_format_rejected(fmt, msg):
         (dict(group_size=0), r'"group_size" must be in \[1, 256\]'),
         (dict(bm_range=-1), r'"bm_range" must be non-negative'),
         (dict(radius=16), r'"radius" must be in \[0, 15\]'),
-        (dict(ps_num=0), r'"ps_num" must be in \[1, 256\]'),
+        (dict(ps_num=0), r'"ps_num" must be in \[1, 64\]'),
+        (dict(ps_num=65), r'"ps_num" must be in \[1, 64\]'),
         (dict(ps_range=-1), r'"ps_range" must be non-negative'),
     ],
 )

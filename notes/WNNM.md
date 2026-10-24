@@ -9,13 +9,12 @@ kernels. `group_size > 8` still runs the fused kernel.
 
 | config (jpbd 1080p, `sigma=3`, 5 s medians) | vsfeel | vszip |
 |---|---|---|
-| chroma U/V, `radius=1` (the benchmark default) | 99.5 fps | 210.9 fps |
+| chroma U/V, `radius=1` (the benchmark default) | **270 fps** | 198 fps |
 | chroma U/V, radius=0 | **1615 fps** | 408 fps |
 | luma, radius=0 | **1291 fps** | 204 fps |
 
-The radius=1 row is what the matcher costs: the same content at radius=0 is 16x
-faster, and the difference is the fused predictive search's serial bookkeeping
-(see Open work).
+The radius=1 row is the temporal matcher; the same content at radius=0 is 6x
+faster (see Open work for what is left in it).
 
 Accuracy, against vszip and against an independent f64 exact-SVD oracle
 (320x240 / 640x360, `sigma=3`; max abs diff, "bad" = pixels over 1e-5):
@@ -43,8 +42,11 @@ The port is f32 end to end; there is no f64 path any more.
   forced into slot 0 when the selection dropped it.
 - **Temporal match** (`radius > 0`): the predictive search is inherently
   sequential (each layer seeds from the previous layer's selection) and stays in
-  the fused kernel, which now stops after the selection and publishes one match
-  record per fold with the *absolute* address-table layer of each patch.
+  the fused kernel, which stops after the selection and publishes one match
+  record per fold with the *absolute* address-table layer of each patch. Its
+  candidate selection is parallel (`fr_tile`): every candidate counts how many
+  rank below it, error first and then arrival order, which is the reference's
+  stable order, and the tile's list is merged into the running one.
 - **Estimate phase** (any radius, `group_size <= 8`), three kernels over
   `NG * (2*radius+1)` slots, so each phase runs at the width its work needs:
   - `ENTRY_GRAM`: 8 lanes per group, lane l takes column l of every patch row.
@@ -118,6 +120,12 @@ order, frame props, GPU chaining), creation variants and every error path.
   group kernel to 32 threads was another 553 -> 815.
 - Porting the split estimate to temporal took the chroma `radius=1` default from
   24.5 to 99.5 fps: the estimate was the fused kernel's f64 half there too.
+- The temporal matcher's cost was almost entirely its **serial top-k insert**:
+  ablating it gave 2353 fps, and replacing it with the parallel rank selection
+  gave 101 -> 178. Shrinking the selection tile from 256 to 32 candidates (the
+  rank is quadratic in the tile) took it to 190, and cutting the list arrays from
+  256 to 64 entries (they were the whole 64 KB LDS budget, i.e. occupancy) to
+  **270 fps**. `ps_num` now stops at 64, where those arrays do.
 - The scatter is *free*: replacing both atomics with a plain store gave 769 vs
   814 fps (noise). Do not spend effort on fixed-point accumulation or den
   box-summing.
@@ -188,13 +196,17 @@ order, frame props, GPU chaining), creation variants and every error path.
 
 ## Open work
 
-- **The temporal matcher is the whole gap on the default workload.** Chroma
-  `radius=1` is 99.5 fps against the same content's 1615 at radius=0; shrinking
-  the predictive search (`ps_range=1, ps_num=1`) gives 154 and `bm_range=1` 176,
-  so it is the search volume times the *serial* bookkeeping (one thread runs
-  `generate_locs` and the sorted-list insert for every candidate of every
-  layer). A rank-based parallel selection over the candidate tile would fix it
-  the same way the split matcher fixed the spatial case.
+- **The temporal path still searches each centre `2r+1` times.** Every output
+  frame recomputes the groups of centres `n-r .. n+r`, and each of those centres
+  is recomputed by its other `2r` consumers: the reference avoids this by
+  splitting into a raw pass per centre plus a VAggregate fold, so its `2r+1`
+  slabs are computed once (BM3D here does the same with an accumulator ring).
+  A per-centre cache of `{matches, M, weight}` would cut the temporal work by
+  `2r+1`; at radius 1 that is the difference between 270 fps and well over 500.
+- What is left in the temporal matcher itself is the SSD traffic: each candidate
+  reads its 64 pixels from global (the reference block is already staged). The
+  spatial pass could stage its window like `ENTRY_DIST` does, but `win` costs
+  4 KB of the LDS that the occupancy above depends on.
 - **The spatial matcher is still ~40% of its frame (~0.33 ms).** Its SSDs read both
   patches from LDS but the *reference* block is re-read for every candidate, and
   the 225 distances per group go out to a 52 MB array and come back. The shape

@@ -41,7 +41,10 @@ namespace {
 // and (temporal) the per-group search-location list.
 
 constexpr int kMaxRadius = 15;
-constexpr int kMaxList = 256; // group_size / ps_num cap
+constexpr int kMaxList = 256; // group_size cap
+// ps_num sizes the fused matcher's list arrays (KMAXL in src/wnnm.comp), so it
+// stops where they do; the reference allows 256.
+constexpr int kMaxPsNum = 64;
 constexpr int kWorkgroup = 128;
 // Threads in the split-matching group kernel: one reference block needs a
 // warp for its Gram rows and its round-robin Jacobi, so the other 96 idle.
@@ -164,6 +167,7 @@ struct GPUWNNM {
     int dist_stride_max {};
     bool skip_group {}; // ablation: record the match phase without the estimate
     bool skip_match {}; // ablation: the estimate without the match phase
+    bool skip_est {};   // ablation: the temporal match without the estimate
 
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
@@ -280,7 +284,9 @@ static WnnmVariant pick_variant(int qmax, bool hw_atomics, bool match_only) {
 static uint32_t group_shared_bytes(int qmax) {
     const uint32_t lists = 8u * 256u * 4u;
     const uint32_t q2 = uint32_t(qmax) * uint32_t(qmax);
-    return lists + 2u * q2 * 4u + q2 * 4u + uint32_t(qmax) * 8u + 24u;
+    // + the packed centre block (REFBLK_MAX) and the split matcher's window.
+    return lists + 2u * q2 * 4u + q2 * 4u + uint32_t(qmax) * 8u + 24u +
+           256u * 4u;
 }
 
 // ---------------------------------------------------------------------------
@@ -546,7 +552,7 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
             gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 8);
             const uint32_t ng =
                 static_cast<uint32_t>(pln.ng) * static_cast<uint32_t>(d->folds);
-            if (d->split_match) {
+            if (d->split_match && !d->skip_est) {
                 if (d->radius > 0) {
                     // The temporal matcher (the predictive search is inherently
                     // serial) publishes one selection per fold and leaves the
@@ -735,6 +741,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     d->host_timing = vsfeel_debug_probe("VSFEEL_WNNM_TIMING");
     d->skip_group = env_flag("VSFEEL_WNNM_SKIPGROUP");
     d->skip_match = env_flag("VSFEEL_WNNM_SKIPMATCH");
+    d->skip_est = env_flag("VSFEEL_WNNM_SKIPEST");
     d->dump_frame = env_int("VSFEEL_WNNM_DUMP", -1);
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
@@ -823,8 +830,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     if (error) {
         ps_num = 2;
     }
-    if (ps_num < 1 || ps_num > kMaxList) {
-        return set_error("\"ps_num\" must be in [1, 256]");
+    if (ps_num < 1 || ps_num > kMaxPsNum) {
+        return set_error("\"ps_num\" must be in [1, 64]");
     }
     d->ps_num = ps_num;
 

@@ -46,8 +46,8 @@
 // converge in 16 (2.4e-3 output error), 20 does, and 24/30 give the identical
 // answer.
 #define SWEEPS 20
-#define TFULL 256
-#define KMAXL 256
+#define TFULL 32
+#define KMAXL 64
 // The fused matcher's lists only need -DNOMATCH's top-K, which is the group size.
 #if defined(NOMATCH)
 #define TOPCAP GS
@@ -146,6 +146,16 @@ shared int top_n;
 
 #if !defined(NOMATCH)
 shared float cand[TFULL];
+// The tile's selected list and the merge scratch of the block below.
+#define SELCAP 32
+#define CHUNK 32
+shared float c1_e[8 * SELCAP];
+shared uint c1_xy[8 * SELCAP];
+shared float tile_e[SELCAP];
+shared uint tile_xy[SELCAP];
+shared int tile_n;
+shared float merg_e[SELCAP];
+shared uint merg_xy[SELCAP];
 // The frame currently being selected (vszip's b.temporal / b.selidx list).
 shared float fr_e[KMAXL];
 shared uint fr_xy[KMAXL];
@@ -178,6 +188,27 @@ shared int jflag;
 #define WIN_MAX 1024
 #define WIN_W (min(2 * BM_RANGE + BS, TEMP_C + BS))
 shared float win[WIN_MAX];
+
+// The group's reference block, packed once: every SSD compares against it, so
+// staging it turns one of the two global loads per term into a shared-memory
+// read (the temporal matcher's candidates are scattered positions, so there is
+// no window to stage around them).
+shared float refblk[256];
+
+// SSD of the packed centre block against the block at (bx, by) of `rt`.
+float block_dist_ref(PlaneRef rt, int bx, int by) {
+    float acc = 0.0;
+    for (int py = 0; py < BS; ++py) {
+        const int rr = py * BS;
+        const int rtrow = (by + py) * STRIDE + bx;
+        for (int px = 0; px < BS; ++px) {
+            precise float d = refblk[rr + px] - rt.v[rtrow + px];
+            precise float dd = d * d;
+            acc = acc + dd;
+        }
+    }
+    return acc;
+}
 
 // SSD of two blocks inside `win`, both given by their top-left LDS offset.
 float block_dist_win(int aw, int ax, int ay, int bx, int by) {
@@ -417,6 +448,65 @@ int unpack_y(uint v) {
 
 #if !defined(NOMATCH)
 // Stable insertion of (e, xy) into the sorted frame list.
+// One tile of candidates into the running group list, in parallel: every
+// candidate counts how many rank below it (error first, then arrival order,
+// which is exactly the reference's stable selection) and the ones under kk
+// write themselves into the tile's list, which is then merged into the running
+// one. The serial insert this replaces was measured at 96% of a temporal frame.
+void fr_tile(int span, int kk, bool spatial, int cx, int wleft, int wtop,
+             int loc_base, int base) {
+    const int tid = int(gl_LocalInvocationIndex);
+    const int cap = min(kk, SELCAP);
+    if (tid == 0) {
+        tile_n = min(span, cap);
+    }
+    barrier();
+    for (int i = tid; i < span; i += WG) {
+        const float e = cand[i];
+        int rank = 0;
+        for (int j = 0; j < span; ++j) {
+            const float o = cand[j];
+            rank += ((o < e) || (o == e && j < i)) ? 1 : 0;
+        }
+        if (rank < cap) {
+            const int idx = base + i;
+            tile_e[rank] = e;
+            tile_xy[rank] = spatial
+                                ? pack_xy(wleft + idx % cx, wtop + idx / cx)
+                                : locs[loc_base + idx];
+        }
+    }
+    barrier();
+    if (tid == 0) {
+        const int tn = tile_n;
+        int a = 0;
+        int b = 0;
+        int w = 0;
+        while (w < cap) {
+            if (a >= fr_n && b >= tn) {
+                break;
+            }
+            const bool take = b < tn && (a >= fr_n || tile_e[b] < fr_e[a]);
+            if (take) {
+                merg_e[w] = tile_e[b];
+                merg_xy[w] = tile_xy[b];
+                ++b;
+            } else {
+                merg_e[w] = fr_e[a];
+                merg_xy[w] = fr_xy[a];
+                ++a;
+            }
+            ++w;
+        }
+        fr_n = w;
+        for (int i = 0; i < w; ++i) {
+            fr_e[i] = merg_e[i];
+            fr_xy[i] = merg_xy[i];
+        }
+    }
+    barrier();
+}
+
 void fr_feed(float e, uint xy, int kk) {
     if (fr_n < kk) {
         int pos = fr_n;
@@ -622,6 +712,10 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
 
     PlaneRef refc = addr.img[ADDR_BASE + layer_base + RADIUS];
 
+    if (tid < M) {
+        const int rp = tid / BS;
+        refblk[tid] = refc.v[(y + rp) * STRIDE + x + (tid - rp * BS)];
+    }
     const int wtop = max(y - BM_RANGE, 0);
     const int wbottom = min(y + BM_RANGE, TEMP_R);
     const int wleft = max(x - BM_RANGE, 0);
@@ -657,17 +751,19 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
                 const int idx = base + i;
                 const int bx = wleft + idx % cx;
                 const int by = wtop + idx / cx;
-                cand[i] = block_dist(refc, refc, x, y, bx, by);
+                cand[i] = block_dist_ref(refc, bx, by);
             }
             barrier();
-            if (tid == 0) {
+            if (max(GS, PS_NUM) <= SELCAP) {
+                fr_tile(span, kk, true, cx, wleft, wtop, loc_base, base);
+            } else if (tid == 0) {
                 for (int i = 0; i < span; ++i) {
                     const int idx = base + i;
                     fr_feed(cand[i],
                             pack_xy(wleft + idx % cx, wtop + idx / cx), kk);
                 }
+                barrier();
             }
-            barrier();
         }
         if (tid == 0) {
             ctr_n = fr_n;
@@ -701,16 +797,19 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
                         const int span = min(TFULL, nl - base);
                         for (int c = tid; c < span; c += WG) {
                             const uint l = locs[loc_base + base + c];
-                            cand[c] = block_dist(refc, reft, x, y, unpack_x(l),
-                                                 unpack_y(l));
+                            cand[c] = block_dist_ref(reft, unpack_x(l),
+                                                      unpack_y(l));
                         }
                         barrier();
-                        if (tid == 0) {
+                        if (max(GS, PS_NUM) <= SELCAP) {
+                            fr_tile(span, kk, false, cx, wleft, wtop, loc_base,
+                                    base);
+                        } else if (tid == 0) {
                             for (int c = 0; c < span; ++c) {
                                 fr_feed(cand[c], locs[loc_base + base + c], kk);
                             }
+                            barrier();
                         }
-                        barrier();
                     }
                     if (tid == 0) {
                         top_merge(t_idx);
