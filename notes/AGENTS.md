@@ -5,7 +5,7 @@ automatically whenever you read or edit anything under `notes/`. The fixed
 shape, the budget and the rules that do not bend are requirements.
 
 One file per filter (`BILATERAL.md`, `BM3D.md`, `BOX.md`, `DFTTEST.md`,
-`EEDI3.md`, `EEDI3AA.md`, `GAUSSBLUR.md`, `NLMEANS.md`, `NNEDI3.md`), plus
+`EEDI3.md`, `EEDI3AA.md`, `GAUSSBLUR.md`, `NLMEANS.md`, `NNEDI3.md`, `WNNM.md`), plus
 one cross-cutting file (`METHOD.md`). They are **tracked** in git: the durable
 design record, not scratch memory.
 

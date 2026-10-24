@@ -22,6 +22,7 @@ pip install vapoursynth-feel
 | GaussBlur  | vszipcl   | `20161 / 1546 (13.04x)` | `18939 / 1599 (11.85x)` | `17597 / 948 (18.56x)` |
 | NLMeans    | knlmvk    | ` 1036 / 581   (1.78x)` | ` 1015 / 574   (1.77x)` | `  948 / 574  (1.65x)` |
 | NNEDI3     | nnedi3vk  | ` 4666 / 2218  (2.10x)` | ` 4862 / 2269  (2.14x)` | ` 3967 / 1207 (3.29x)` |
+| WNNM       | vszip     | `   --- / ---   (0.00x)` | `   --- / ---   (0.00x)` | `   12 / 208   (0.06x)` |
 
 <sub>Output of `tools/benchmark.py --filter <filter> --format <u16|f16|f32>` on an RX 7900 XTX with 1080p input.</sub>
 
@@ -181,6 +182,25 @@ core.vsfeel.NNEDI3(clip clip, int field[,
                                     #   left to cubic interpolation: slower, slightly better)
 ```
 `field` 2/3 are the double-rate variants (not allowed with `dh=True`).
+
+### WNNM
+
+WNNM (weighted nuclear norm minimization) is a non-local patch denoiser. Similar blocks of the clip are grouped (optionally across neighboring frames), the group's patch matrix is low-rank denoised by singular-value shrinkage, and the per-group estimates are aggregated. Ported from vszip's CPU filter; f32 input only, like the reference.
+
+```python
+core.vsfeel.WNNM(clip clip[,
+    float[] sigma=3.0,              # denoising strength per-plane, 0..255 scale; below FLT_EPSILON skips the plane
+    int     block_size=8,           # patch size, 1..64; min(block_size^2, group_size) must be <= 32
+    int     block_step,             # block lattice spacing, 1..block_size (default block_size)
+    int     group_size=8,           # patches per collaborative group, 1..256
+    int     bm_range=7,             # spatial search radius in pixels
+    int     radius=0,               # temporal search radius in frames, 0..15 (0 = spatial only)
+    int     ps_num=2,               # motion-predicted candidates seeding each temporal search, 1..256
+    int     ps_range=4,             # search radius around each predicted candidate, in pixels
+    int     residual=0,             # keep the group's mean patch (do not shrink the largest singular value)
+    int     adaptive_aggregation=1, # weight each group by 1/kept components
+    clip    rclip])                 # optional guide clip for block matching
+```
 
 ## vs-jetpack integration
 

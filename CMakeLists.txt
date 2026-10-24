@@ -406,7 +406,24 @@ list(APPEND VK_NNEDI3_VARIANTS
     "nnedi3_f16_prescreen16|nnedi3.comp|-DIO_F16 -DPRED16=1 -DENTRY_PRESCREEN"
     "nnedi3_f16_predict16|nnedi3.comp|-DIO_F16 -DPRED16=1 -DENTRY_PREDICT -DSHSTRIDE=288u")
 
+# WNNM: one group kernel per LDS eigen-workspace size (q = min(bs^2, gs) picks
+# 8/16/32) and per eigen precision (f64 as the reference, f32 for devices
+# without shaderFloat64), plus the flat num/den finish kernel. NO_FLOAT_ATOMICS
+# is a second arm of the group kernel for devices without buffer float atomics.
+set(VK_WNNM_QMAX 8 16 32)
+set(VK_WNNM_VARIANTS)
+foreach(qmax IN LISTS VK_WNNM_QMAX)
+    list(APPEND VK_WNNM_VARIANTS
+        "wnnm_group_q${qmax}_f64|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DEIG_DOUBLE"
+        "wnnm_group_q${qmax}|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax}"
+        "wnnm_group_q${qmax}_f64_cas|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DEIG_DOUBLE -DNO_FLOAT_ATOMICS"
+        "wnnm_group_q${qmax}_cas|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DNO_FLOAT_ATOMICS")
+endforeach()
+list(APPEND VK_WNNM_VARIANTS
+    "wnnm_finish|wnnm.comp|-DENTRY_FINISH")
+
 set(VK_VARIANTS
+    ${VK_WNNM_VARIANTS}
     ${VK_BILATERAL_VARIANTS}
     ${VK_BM3D_VARIANTS}
     ${VK_BOX_VARIANTS}
@@ -570,6 +587,7 @@ add_library(vsfeel SHARED
     src/gaussblur.cpp
     src/dfttest.cpp
     src/nlmeans.cpp
+    src/wnnm.cpp
     src/eedi3.cpp
     src/nnedi3.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"

@@ -1,0 +1,712 @@
+#version 450
+// Buffer float atomics: the accumulator is scattered by every group that
+// matched a position. -DNO_FLOAT_ATOMICS builds the same add on
+// atomicCompSwap (the reference's own atom_add_f) for devices without
+// shaderBufferFloat32AtomicAdd.
+#ifndef NO_FLOAT_ATOMICS
+#extension GL_EXT_shader_atomic_float : require
+#endif
+#extension GL_EXT_buffer_reference : require
+
+/*
+ * WNNM (weighted nuclear norm minimization) denoiser, ported from
+ * reference/vapoursynth-zip's CPU filter. One workgroup owns one reference
+ * block of the step lattice and does the whole pipeline for it: block match,
+ * WNNM shrinkage of the group's pmat matrix, weighted scatter.
+ *
+ * -DENTRY_GROUP is the per-block kernel, -DENTRY_FINISH the num/den divide.
+ * -DEIG_DOUBLE keeps the Gram matrix, the Jacobi rotations and the shrink
+ * factors in f64 like the reference (patchEstimate runs F=f64, and the f64 path
+ * matches it to 2e-7). The f32 fallback flips shrink decisions near the
+ * threshold (measured 2.2e-3 on 640x360), so f64 is the default wherever the
+ * device reports shaderFloat64.
+ * -DQMAX sizes the LDS eigen workspace (8/16/32); q = min(bs^2, group_size).
+ *
+ * Matching is the reference's selectTopIdx as a streaming top-k: candidates are
+ * fed in (y, x) scan order, which is what makes ties resolve the same way,
+ * including the all-equal-window case where the first k in scan order win.
+ */
+
+#if defined(EIG_DOUBLE)
+#define ET double
+#define ETEPS 2.220446049250313e-16
+#define ETBIG 3.351951982485649e153
+#else
+#define ET float
+#define ETEPS 1.1920928955078125e-7
+#define ETBIG 4.611686e18
+#endif
+
+#ifndef QMAX
+#define QMAX 8
+#endif
+
+#define WG 128
+#define TFULL 256
+#define KMAXL 256
+
+layout(local_size_x = WG) in;
+
+layout(constant_id = 0) const int W = 1920;
+layout(constant_id = 1) const int H = 1080;
+layout(constant_id = 2) const int STRIDE = 1920;
+layout(constant_id = 3) const int BS = 8;
+layout(constant_id = 4) const int STEP = 8;
+layout(constant_id = 5) const int GS = 8;
+layout(constant_id = 6) const int BM_RANGE = 7;
+layout(constant_id = 7) const int RADIUS = 0;
+layout(constant_id = 8) const int PS_NUM = 2;
+layout(constant_id = 9) const int PS_RANGE = 4;
+layout(constant_id = 10) const int GX = 1;
+layout(constant_id = 11) const int NG = 1;
+layout(constant_id = 12) const int RESIDUAL = 0;
+layout(constant_id = 13) const int ADAPTIVE = 1;
+layout(constant_id = 14) const int LOCS_CAP = 1;
+// Address-table base of this plane: plane * 2 * WL entries, refs then sources.
+layout(constant_id = 15) const int ADDR_BASE = 0;
+layout(constant_id = 16) const float SIGMA = 0.0;
+layout(constant_id = 17) const int ACC_BASE = 0;
+layout(constant_id = 18) const int PMAT_BASE = 0;
+// Diagnostic: TRACE != 0 writes one 28-word record per (group, centre) --
+// n, kept, weight, location count and the selected group's errors/positions/
+// temporal slots -- for the host to diff against the reference
+// (VSFEEL_WNNM_DUMP=<frame>).
+layout(constant_id = 19) const int TRACE = 0;
+layout(constant_id = 20) const int TRBASE = 0;
+// Floats of patch scratch per group: M*GS, plus M for the mean vector when
+// -DRESIDUAL strips it (added back in the scatter).
+layout(constant_id = 21) const int PMAT_STRIDE = 0;
+// Element offset of this plane's per-group search-location region.
+layout(constant_id = 22) const int LOCS_BASE = 0;
+
+#define M (BS * BS)
+#define TEMP_C (W - BS)
+#define TEMP_R (H - BS)
+#define WL (4 * RADIUS + 1)
+#define SRC_BASE WL
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer
+    PlaneRef {
+    float v[];
+};
+
+layout(std430, binding = 0) readonly buffer AddrBuf { PlaneRef img[]; } addr;
+// [0, W*H): weighted sums; [W*H, 2*W*H): weights.
+// The accumulator is written only by atomics; the no-hardware-atomic arm
+// aliases it as uint for the CAS loop, and the finish kernel always reads it
+// as float.
+#if defined(ENTRY_FINISH) || !defined(NO_FLOAT_ATOMICS)
+layout(std430, binding = 1) coherent buffer AccBuf { float acc[]; };
+#else
+layout(std430, binding = 1) coherent buffer AccBuf { uint acc_u[]; };
+#endif
+layout(std430, binding = 2) buffer LocsBuf { uint locs[]; };
+layout(std430, binding = 3) buffer PatchBuf { float pmat[]; };
+layout(std430, binding = 4) writeonly buffer DstBuf { float dst[]; };
+layout(std430, binding = 5) buffer TraceBuf { uint trace[]; };
+
+// Temporal mode only: the output frame and the clip length, for the reference's
+// VAggregate fold (its slab index is clamped at the clip boundaries, so the
+// fold reads some (frame, slab) pairs more than once).
+layout(push_constant) uniform Push {
+    int pn;
+    int frames;
+} pc;
+
+shared float cand[TFULL];
+
+// Final group, sorted by error. `top_t` is the temporal index in the centre
+// frame's window; spatial groups are all t = 0.
+shared float top_e[KMAXL];
+shared uint top_xy[KMAXL];
+shared int top_t[KMAXL];
+shared int top_n;
+
+// The frame currently being selected (vszip's b.temporal / b.selidx list).
+shared float fr_e[KMAXL];
+shared uint fr_xy[KMAXL];
+shared int fr_n;
+
+shared int loc_n;     // generated search-location count
+// The centre frame's spatial selection: each temporal direction restarts its
+// predictive search from this list (the reference's b.center).
+shared uint ctr_xy[KMAXL];
+shared int ctr_n;
+shared float weight;  // aggregation weight
+shared int kept;      // retained singular values
+
+shared ET gm[QMAX * QMAX];
+shared ET vt[QMAX * QMAX];
+shared float mm[QMAX * QMAX];
+shared float shr[QMAX];
+shared ET eig[QMAX];
+shared int seed_order[KMAXL];
+
+uint pack_xy(int x, int y) {
+    return uint(x) | (uint(y) << 16);
+}
+int unpack_x(uint v) {
+    return int(v & 0xffffu);
+}
+int unpack_y(uint v) {
+    return int(v >> 16);
+}
+
+// Stable insertion of (e, xy) into the sorted frame list.
+void fr_feed(float e, uint xy, int kk) {
+    if (fr_n < kk) {
+        int pos = fr_n;
+        while (pos > 0 && fr_e[pos - 1] > e) {
+            --pos;
+        }
+        for (int j = fr_n; j > pos; --j) {
+            fr_e[j] = fr_e[j - 1];
+            fr_xy[j] = fr_xy[j - 1];
+        }
+        fr_e[pos] = e;
+        fr_xy[pos] = xy;
+        ++fr_n;
+    } else if (e < fr_e[kk - 1]) {
+        int pos = kk - 1;
+        while (pos > 0 && fr_e[pos - 1] > e) {
+            --pos;
+        }
+        for (int j = kk - 1; j > pos; --j) {
+            fr_e[j] = fr_e[j - 1];
+            fr_xy[j] = fr_xy[j - 1];
+        }
+        fr_e[pos] = e;
+        fr_xy[pos] = xy;
+    }
+}
+
+// Merge the frame list into the final list, stable on ties, capped at GS.
+void top_merge(int t) {
+    int a = top_n;
+    int b = fr_n;
+    int nout = min(a + b, GS);
+    // Drop the largest from the tail first; ties drop the later list's entry,
+    // which is where a stable sort of the concatenation would put it.
+    for (int drop = a + b - nout; drop > 0; --drop) {
+        if (a == 0) {
+            --b;
+        } else if (b == 0) {
+            --a;
+        } else if (top_e[a - 1] > fr_e[b - 1]) {
+            --a;
+        } else {
+            --b;
+        }
+    }
+    // Fill from the back: the larger tail belongs in the higher slot, and on a
+    // tie the later list's entry goes later (stable).
+    for (int i = nout - 1; i >= 0; --i) {
+        if (b == 0 || (a > 0 && top_e[a - 1] > fr_e[b - 1])) {
+            top_e[i] = top_e[a - 1];
+            top_xy[i] = top_xy[a - 1];
+            top_t[i] = top_t[a - 1];
+            --a;
+        } else {
+            top_e[i] = fr_e[b - 1];
+            top_xy[i] = fr_xy[b - 1];
+            top_t[i] = t;
+            --b;
+        }
+    }
+    top_n = nout;
+}
+
+void top_from_fr(int t) {
+    int nout = min(fr_n, GS);
+    for (int i = 0; i < nout; ++i) {
+        top_e[i] = fr_e[i];
+        top_xy[i] = fr_xy[i];
+        top_t[i] = t;
+    }
+    top_n = nout;
+}
+
+// The reference always keeps the centre block in the group, overwriting the
+// best entry when the stable selection dropped it.
+void top_ensure_center(int x, int y, int t) {
+    bool has = false;
+    for (int i = 0; i < top_n; ++i) {
+        if (unpack_x(top_xy[i]) == x && unpack_y(top_xy[i]) == y &&
+            top_t[i] == t) {
+            has = true;
+            break;
+        }
+    }
+    if (!has) {
+        top_e[0] = 0.0;
+        top_xy[0] = pack_xy(x, y);
+        top_t[0] = t;
+    }
+}
+
+// Sequential f32 SSD, in the reference's p order (row-major pmat).
+float block_dist(PlaneRef rc, PlaneRef rt, int cx, int cy, int bx, int by) {
+    // `precise` keeps the multiply and the add separate: the reference
+    // accumulates d*d sequentially in f32 and contracts nothing, and an ulp
+    // here flips which of two near-equal blocks is selected.
+    precise float acc = 0.0;
+    for (int py = 0; py < BS; ++py) {
+        const int rcrow = (cy + py) * STRIDE + cx;
+        const int rtrow = (by + py) * STRIDE + bx;
+        for (int px = 0; px < BS; ++px) {
+            const float d = rc.v[rcrow + px] - rt.v[rtrow + px];
+            const float dd = d * d;
+            acc = acc + dd;
+        }
+    }
+    return acc;
+}
+
+// Union of the clipped (2*PS_RANGE+1)^2 windows around the first
+// min(PS_NUM, window area) seeds, enumerated in (y, x) order exactly like
+// generateSearchLocations. Thread 0 only; returns the point count.
+int generate_locs(int wg, int active_ps, int loc_base) {
+    const int ncent = min(active_ps, fr_n);
+    int y0 = H;
+    int y1 = -1;
+    for (int i = 0; i < ncent; ++i) {
+        const int by = unpack_y(fr_xy[i]);
+        y0 = min(y0, max(by - PS_RANGE, 0));
+        y1 = max(y1, min(by + PS_RANGE, TEMP_R));
+    }
+    if (y1 < y0) {
+        return 0;
+    }
+    // Sort the seed indices by their window's left edge once; a row's union is
+    // then a single sweep over that order.
+    for (int i = 0; i < ncent; ++i) {
+        const int L = max(unpack_x(fr_xy[i]) - PS_RANGE, 0);
+        int pos = i;
+        while (pos > 0 &&
+               max(unpack_x(fr_xy[seed_order[pos - 1]]) - PS_RANGE, 0) > L) {
+            seed_order[pos] = seed_order[pos - 1];
+            --pos;
+        }
+        seed_order[pos] = i;
+    }
+    int count = 0;
+    int cur_l = 0;
+    int cur_r = -1;
+    for (int yy = y0; yy <= y1; ++yy) {
+        cur_l = 0;
+        cur_r = -1;
+        for (int s = 0; s < ncent; ++s) {
+            const uint xy = fr_xy[seed_order[s]];
+            const int by = unpack_y(xy);
+            if (yy < max(by - PS_RANGE, 0) || yy > min(by + PS_RANGE, TEMP_R)) {
+                continue;
+            }
+            const int L = max(unpack_x(xy) - PS_RANGE, 0);
+            const int R = min(unpack_x(xy) + PS_RANGE, TEMP_C);
+            if (L > cur_r + 1) {
+                for (int xx = cur_l; xx <= cur_r && count < LOCS_CAP;
+                     ++xx) {
+                    locs[loc_base + count++] = pack_xy(xx, yy);
+                }
+                cur_l = L;
+                cur_r = R;
+            } else {
+                cur_r = max(cur_r, R);
+            }
+        }
+        for (int xx = cur_l; xx <= cur_r && count < LOCS_CAP; ++xx) {
+            locs[loc_base + count++] = pack_xy(xx, yy);
+        }
+    }
+    return count;
+}
+
+// A pixel can receive one add per selected match of every group whose window
+// reaches it: ((2*(BM_RANGE+BS))/STEP + 1)^2 groups times GS matches, so a few
+// thousand retries is a safe bound (the same argument as BM3D's res_add).
+void add_acc(int idx, float v) {
+#ifndef NO_FLOAT_ATOMICS
+    atomicAdd(acc[ACC_BASE + idx], v);
+#else
+    uint assumed = atomicCompSwap(acc_u[ACC_BASE + idx], 0u, 0u);
+    for (uint i = 0u; i < 4096u; ++i) {
+        const uint old = atomicCompSwap(
+            acc_u[ACC_BASE + idx], assumed,
+            floatBitsToUint(uintBitsToFloat(assumed) + v));
+        if (old == assumed) {
+            return;
+        }
+        assumed = old;
+    }
+    atomicCompSwap(acc_u[ACC_BASE + idx], assumed,
+                   floatBitsToUint(uintBitsToFloat(assumed) + v));
+#endif
+}
+
+// One reference block. layer_base selects the first frame of the centre frame's
+// window in the address table; t_dest is the local temporal index whose patches
+// go to this output frame.
+void run_group(uint wg, int x, int y, int layer_base, int t_dest) {
+    const int tid = int(gl_LocalInvocationIndex);
+    const uint group_base = uint(PMAT_BASE) + wg * uint(PMAT_STRIDE);
+    const int loc_base = LOCS_BASE + int(wg) * LOCS_CAP;
+
+    PlaneRef refc = addr.img[ADDR_BASE + layer_base + RADIUS];
+
+    const int wtop = max(y - BM_RANGE, 0);
+    const int wbottom = min(y + BM_RANGE, TEMP_R);
+    const int wleft = max(x - BM_RANGE, 0);
+    const int wright = min(x + BM_RANGE, TEMP_C);
+    const int cx = wright - wleft + 1;
+    const int area = (wbottom - wtop + 1) * cx;
+    const int kk = max(GS, PS_NUM);
+
+    if (tid == 0) {
+        fr_n = 0;
+    }
+    barrier();
+    for (int base = 0; base < area; base += TFULL) {
+        const int span = min(TFULL, area - base);
+        for (int i = tid; i < span; i += WG) {
+            const int idx = base + i;
+            const int bx = wleft + idx % cx;
+            const int by = wtop + idx / cx;
+            cand[i] = block_dist(refc, refc, x, y, bx, by);
+        }
+        barrier();
+        if (tid == 0) {
+            for (int i = 0; i < span; ++i) {
+                const int idx = base + i;
+                fr_feed(cand[i],
+                        pack_xy(wleft + idx % cx, wtop + idx / cx), kk);
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        ctr_n = fr_n;
+        for (int i = 0; i < fr_n; ++i) {
+            ctr_xy[i] = fr_xy[i];
+        }
+        top_from_fr(RADIUS);
+    }
+    barrier();
+
+    if (RADIUS > 0) {
+        const int active_ps = min(PS_NUM, area);
+        for (int dir = -1; dir <= 1; dir += 2) {
+            if (tid == 0) {
+                fr_n = ctr_n;
+                for (int i = 0; i < ctr_n; ++i) {
+                    fr_xy[i] = ctr_xy[i];
+                }
+            }
+            barrier();
+            for (int i = 1; i <= RADIUS; ++i) {
+                const int t_idx = RADIUS + dir * i;
+                PlaneRef reft = addr.img[ADDR_BASE + layer_base + t_idx];
+                if (tid == 0) {
+                    loc_n = generate_locs(int(wg), active_ps, loc_base);
+                    fr_n = 0;
+                }
+                barrier();
+                const int nl = loc_n;
+                for (int base = 0; base < nl; base += TFULL) {
+                    const int span = min(TFULL, nl - base);
+                    for (int c = tid; c < span; c += WG) {
+                        const uint l = locs[loc_base + base + c];
+                        cand[c] = block_dist(refc, reft, x, y, unpack_x(l),
+                                             unpack_y(l));
+                    }
+                    barrier();
+                    if (tid == 0) {
+                        for (int c = 0; c < span; ++c) {
+                            fr_feed(cand[c], locs[loc_base + base + c], kk);
+                        }
+                    }
+                    barrier();
+                }
+                if (tid == 0) {
+                    top_merge(t_idx);
+                }
+                barrier();
+            }
+        }
+    }
+    if (tid == 0) {
+        top_ensure_center(x, y, RADIUS);
+    }
+    barrier();
+
+    const int n = top_n;
+    if (TRACE != 0 && tid == 0) {
+        const int tb = TRBASE + (int(wg) * (2 * RADIUS + 1) + layer_base) * 28;
+        trace[tb + 0] = uint(n);
+        trace[tb + 3] = uint(loc_n);
+        for (int j = 0; j < 8; ++j) {
+            trace[tb + 4 + j * 3 + 0] =
+                j < n ? floatBitsToUint(top_e[j]) : 0u;
+            trace[tb + 4 + j * 3 + 1] = j < n ? top_xy[j] : 0u;
+            trace[tb + 4 + j * 3 + 2] = j < n ? uint(top_t[j]) : 0u;
+        }
+    }
+
+    // Patch matrix: column i is the source pmat of match i, column-major.
+    for (int i = 0; i < n; ++i) {
+        const uint xy = top_xy[i];
+        const int bx = unpack_x(xy);
+        const int by = unpack_y(xy);
+        PlaneRef s = addr.img[ADDR_BASE + SRC_BASE + layer_base + top_t[i]];
+        for (int p = tid; p < M; p += WG) {
+            const int py = p / BS;
+            const int px = p - py * BS;
+            pmat[group_base + uint(i) * uint(M) + uint(p)] =
+                s.v[(by + py) * STRIDE + bx + px];
+        }
+    }
+    barrier();
+    if (RESIDUAL != 0) {
+        // Sequential f32 sum over the group, then divide and subtract, in the
+        // reference's subtractMean order.
+        for (int p = tid; p < M; p += WG) {
+            float sum = 0.0;
+            for (int i = 0; i < n; ++i) {
+                sum += pmat[group_base + uint(i) * uint(M) + uint(p)];
+            }
+            const float mean = sum / float(n);
+            pmat[group_base + uint(M) * uint(GS) + uint(p)] = mean;
+            for (int i = 0; i < n; ++i) {
+                pmat[group_base + uint(i) * uint(M) + uint(p)] -= mean;
+            }
+        }
+        barrier();
+    }
+
+    // Gram matrix in f64 (fma), one thread per row, element order as the
+    // reference's gramAtA / gramAAt.
+    const bool tall = n <= M;
+    const int q = tall ? n : M;
+    if (tid < q) {
+        for (int j = tid; j < q; ++j) {
+            ET accd = ET(0);
+            if (tall) {
+                for (int p = 0; p < M; ++p) {
+                    const ET a =
+                        ET(pmat[group_base + uint(tid) * uint(M) + uint(p)]);
+                    const ET b =
+                        ET(pmat[group_base + uint(j) * uint(M) + uint(p)]);
+                    accd = fma(a, b, accd);
+                }
+            } else {
+                for (int i = 0; i < n; ++i) {
+                    const ET a =
+                        ET(pmat[group_base + uint(i) * uint(M) + uint(tid)]);
+                    const ET b =
+                        ET(pmat[group_base + uint(i) * uint(M) + uint(j)]);
+                    accd = fma(a, b, accd);
+                }
+            }
+            gm[tid * q + j] = accd;
+            gm[j * q + tid] = accd;
+        }
+    }
+    barrier();
+
+    if (tid == 0) {
+        // Jacobi eigen decomposition, the reference's rotation order.
+        for (int i = 0; i < q * q; ++i) {
+            vt[i] = ET(0);
+        }
+        for (int i = 0; i < q; ++i) {
+            vt[i * q + i] = ET(1);
+        }
+        if (q > 1) {
+            for (int sweep = 0; sweep < 30; ++sweep) {
+                ET gmax = ET(0);
+                for (int i = 0; i < q; ++i) {
+                    gmax = max(gmax, gm[i * q + i]);
+                }
+                const ET floor_abs = ET(ETEPS) * gmax;
+                bool rotated = false;
+                for (int p = 0; p < q - 1; ++p) {
+                    for (int j = p + 1; j < q; ++j) {
+                        const ET apq = gm[p * q + j];
+                        const ET app = gm[p * q + p];
+                        const ET ajj = gm[j * q + j];
+                        const ET thresh =
+                            max(ET(ETEPS) * sqrt(max(app, ET(0)) *
+                                                 max(ajj, ET(0))),
+                                floor_abs);
+                        if (abs(apq) <= thresh) {
+                            continue;
+                        }
+                        rotated = true;
+                        const ET theta = (ajj - app) / (ET(2) * apq);
+                        ET t;
+                        if (abs(theta) > ET(ETBIG)) {
+                            t = ET(1) / (ET(2) * theta);
+                        } else {
+                            const ET at =
+                                abs(theta) + sqrt(theta * theta + ET(1));
+                            t = theta >= ET(0) ? ET(1) / at : -ET(1) / at;
+                        }
+                        const ET cs = ET(1) / sqrt(t * t + ET(1));
+                        const ET sn = t * cs;
+                        const ET h = t * apq;
+                        for (int i = 0; i < q; ++i) {
+                            const ET xp = gm[p * q + i];
+                            const ET yp = gm[j * q + i];
+                            gm[p * q + i] = cs * xp - sn * yp;
+                            gm[j * q + i] = sn * xp + cs * yp;
+                        }
+                        gm[p * q + p] = app - h;
+                        gm[j * q + j] = ajj + h;
+                        gm[p * q + j] = ET(0);
+                        gm[j * q + p] = ET(0);
+                        for (int i = 0; i < q; ++i) {
+                            gm[i * q + p] = gm[p * q + i];
+                            gm[i * q + j] = gm[j * q + i];
+                        }
+                        for (int i = 0; i < q; ++i) {
+                            const ET xp = vt[p * q + i];
+                            const ET yp = vt[j * q + i];
+                            vt[p * q + i] = cs * xp - sn * yp;
+                            vt[j * q + i] = sn * xp + cs * yp;
+                        }
+                    }
+                }
+                if (!rotated) {
+                    break;
+                }
+            }
+        }
+        // Sorted eigenvalues, descending, with the eigenvector rows permuted.
+        for (int i = 0; i < q; ++i) {
+            eig[i] = max(gm[i * q + i], ET(0));
+        }
+        for (int i = 0; i < q; ++i) {
+            int best = i;
+            for (int j = i + 1; j < q; ++j) {
+                if (eig[j] > eig[best]) {
+                    best = j;
+                }
+            }
+            if (best != i) {
+                const ET tmp = eig[i];
+                eig[i] = eig[best];
+                eig[best] = tmp;
+                for (int r2 = 0; r2 < q; ++r2) {
+                    const ET t2 = vt[i * q + r2];
+                    vt[i * q + r2] = vt[best * q + r2];
+                    vt[best * q + r2] = t2;
+                }
+            }
+        }
+        // Shrink factors, c = ((8*sqrt(2n))*sigma)*sigma in f32 then widened.
+        const float c =
+            ((8.0f * sqrt(2.0f * float(n))) * SIGMA) * SIGMA;
+        const int k0 = RESIDUAL != 0 ? 0 : 1;
+        int i = min(k0, q);
+        for (int ii = 0; ii < i; ++ii) {
+            shr[ii] = 1.0f;
+        }
+        for (; i < q; ++i) {
+            const ET lam = eig[i];
+            const ET tmp = lam - ET(c);
+            if (!(tmp > ET(0))) {
+                break;
+            }
+            const ET s = sqrt(lam);
+            const ET sp = (s + sqrt(tmp)) * ET(0.5);
+            shr[i] = float(sp / s);
+        }
+        kept = i;
+        for (int ii = i; ii < q; ++ii) {
+            shr[ii] = 0.0f;
+        }
+        weight = (ADAPTIVE != 0 && kept > 0) ? 1.0f / float(kept) : 1.0f;
+        if (TRACE != 0) {
+            const int tb = TRBASE + (int(wg) * (2 * RADIUS + 1) + layer_base) * 28;
+            trace[tb + 1] = uint(kept);
+            trace[tb + 2] = floatBitsToUint(weight);
+        }
+    }
+    barrier();
+
+    // M = V diag(r) V^T in f32, applied to the pmat columns in the scatter.
+    for (int idx = tid; idx < q * q; idx += WG) {
+        const int a = idx / q;
+        const int b = idx - a * q;
+        float s = 0.0f;
+        for (int i = 0; i < kept; ++i) {
+            s += float(vt[i * q + a]) * shr[i] * float(vt[i * q + b]);
+        }
+        mm[idx] = s;
+    }
+    barrier();
+
+    const float wgt = weight;
+    for (int j = 0; j < n; ++j) {
+        if (RADIUS > 0 && top_t[j] != t_dest) {
+            continue;
+        }
+        const uint xy = top_xy[j];
+        const int bx = unpack_x(xy);
+        const int by = unpack_y(xy);
+        for (int p = tid; p < M; p += WG) {
+            float s = 0.0f;
+            if (tall) {
+                for (int k2 = 0; k2 < n; ++k2) {
+                    s += pmat[group_base + uint(k2) * uint(M) + uint(p)] *
+                         mm[k2 * q + j];
+                }
+            } else {
+                for (int pp = 0; pp < q; ++pp) {
+                    s += mm[p * q + pp] *
+                         pmat[group_base + uint(j) * uint(M) + uint(pp)];
+                }
+            }
+            if (RESIDUAL != 0) {
+                s += pmat[group_base + uint(M) * uint(GS) + uint(p)];
+            }
+            const int py = p / BS;
+            const int px = p - py * BS;
+            const int o = (by + py) * W + bx + px;
+            add_acc(o, s * wgt);
+            add_acc(W * H + o, wgt);
+        }
+    }
+    barrier();
+}
+
+void main() {
+#if defined(ENTRY_GROUP)
+    const uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    if (wg >= uint(NG)) {
+        return;
+    }
+    const int gx = int(wg) % GX;
+    const int gy = int(wg) / GX;
+    const int x = min(gx * STEP, TEMP_C);
+    const int y = min(gy * STEP, TEMP_R);
+    if (RADIUS == 0) {
+        run_group(wg, x, y, 0, 0);
+    } else {
+        for (int i = 0; i <= 2 * RADIUS; ++i) {
+            const int cm = clamp(pc.pn - RADIUS + i, 0, pc.frames - 1);
+            const int slab = clamp(2 * RADIUS - i,
+                                   pc.pn - pc.frames + 1 + RADIUS,
+                                   pc.pn + RADIUS);
+            run_group(wg, x, y, cm - pc.pn + RADIUS, slab);
+        }
+    }
+#elif defined(ENTRY_FINISH)
+    const int gx = int(gl_GlobalInvocationID.x);
+    const int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= W || gy >= H) {
+        return;
+    }
+    const int o = gy * W + gx;
+    dst[gy * STRIDE + gx] = acc[ACC_BASE + o] / acc[ACC_BASE + W * H + o];
+#endif
+}

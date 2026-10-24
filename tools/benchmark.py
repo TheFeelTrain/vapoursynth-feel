@@ -500,6 +500,7 @@ PLUGINS = {
     "vsfeel": Plugin("vsfeel"),
     "vszipcl": Plugin("vszipcl"),
     "vszipcu": Plugin("vszipcu"),
+    "vszip": Plugin("vszip"),
     "eedi3vk2": Plugin("eedi3vk2"),
     "nnedi3vk": Plugin("nnedi3vk"),
     "bm3dhip": Plugin("bm3dhip"),
@@ -652,6 +653,19 @@ def _dfttest_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
         "vsfeel": f"core.vsfeel.DFTTest({clip}, {args})",
         "vszipcl": f"core.vszipcl.DFTTest({clip}, {args})",
         "vszipcu": f"core.vszipcu.DFTTest({clip}, {args})",
+    }
+
+
+def _wnnm_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
+    args = (
+        f"sigma={ns.wnnm_sigma}, block_size={ns.wnnm_block_size}, "
+        f"block_step={ns.wnnm_block_step}, group_size={ns.wnnm_group_size}, "
+        f"bm_range={ns.wnnm_bm_range}, radius={ns.wnnm_radius}, "
+        f"ps_num={ns.wnnm_ps_num}, ps_range={ns.wnnm_ps_range}"
+    )
+    return {
+        "vsfeel": f"core.vsfeel.WNNM({clip}, {args})",
+        "vszip": f"core.vszip.WNNM({clip}, {args})",
     }
 
 
@@ -932,6 +946,24 @@ FILTERS: dict[str, FilterSpec] = {
         synth_format="vs.YUV420P16",
         # vsfeel's NLMeans is vnode:gpu under the R80 GPU API; knlmvk always was.
         gpu_plugins=frozenset({"vsfeel", "knlmvk"}),
+    ),
+    "wnnm": FilterSpec(
+        title="WNNM",
+        args=[
+            Arg("sigma", "wnnm_sigma", float, 3.0),
+            Arg("block_size", "wnnm_block_size", int, 8),
+            Arg("block_step", "wnnm_block_step", int, 8),
+            Arg("group_size", "wnnm_group_size", int, 8),
+            Arg("bm_range", "wnnm_bm_range", int, 7),
+            Arg("radius", "wnnm_radius", int, 0),
+            Arg("ps_num", "wnnm_ps_num", int, 2),
+            Arg("ps_range", "wnnm_ps_range", int, 4),
+        ],
+        build=_wnnm_build,
+        # WNNM is float-only in the reference: sigma is in the 0..1 domain.
+        input="depth(get_y(clip), 32)",
+        synth_format="vs.GRAYS",
+        gpu_plugins=frozenset({"vsfeel"}),
     ),
     "eedi3": FilterSpec(
         title="EEDI3",
