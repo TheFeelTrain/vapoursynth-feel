@@ -191,6 +191,29 @@ def test_benchmark_synthetic_scripts_compile_and_eval(monkeypatch):
             exec(chain, env)
 
 
+def test_benchmark_wnnm_sigma_takes_a_list(monkeypatch):
+    """WNNM's sigma is per plane: the CLI takes a list and defaults to [0, 3, 3]."""
+    bench = _load_module("benchmark", BENCHMARK)
+    spec = bench.FILTERS["wnnm"]
+
+    def call(argv):
+        monkeypatch.setattr(sys, "argv", ["benchmark.py", "--filter", "wnnm", *argv])
+        ns = bench.parse_args()
+        bench._apply_filter_args(ns, "wnnm", spec)
+        return spec.build(ns, spec.input, spec)["vsfeel"], bench.args_desc(spec, ns)
+
+    default, default_desc = call([])
+    assert "sigma=[0, 3, 3]" in default
+    assert "sigma=[0, 3, 3]" in default_desc
+    full, full_desc = call(["--wnnm-args", "sigma=[3, 3, 3], radius=0"])
+    assert "sigma=[3, 3, 3]" in full and "radius=0" in full
+    assert "sigma=[3, 3, 3]" in full_desc
+    # A bare number still covers every plane, through the plugin's
+    # missing-entry repeat rule.
+    single, _ = call(["--wnnm-args", "sigma=5"])
+    assert "sigma=[5]" in single
+
+
 def test_benchmark_download_selects_vspipe_output(monkeypatch):
     """The default leaves the output resident; ``--download`` times the transfer.
 

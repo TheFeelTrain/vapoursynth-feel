@@ -185,8 +185,15 @@ def make_vpy(
         # budget of its own; both caches then serve the same span.
         size_lines = (
             (
-                "_fbytes = (clip.width * clip.height * clip.format.bytes_per_sample\n"
-                "           * clip.format.num_planes)\n"
+                # Per-plane sizes: a 4:2:0 frame is 1.5 samples per pixel, not
+                # num_planes, so counting every plane at full size halved the
+                # span a subsampled arm pinned (258 frames of 1080p 4:2:0 for a
+                # 6 GiB budget instead of 495) and cut the loop period with it.
+                "_fbytes = sum(\n"
+                "    (clip.width >> (clip.format.subsampling_w if p else 0))\n"
+                "    * (clip.height >> (clip.format.subsampling_h if p else 0))\n"
+                "    for p in range(clip.format.num_planes)\n"
+                ") * clip.format.bytes_per_sample\n"
                 f"_cap = max(1, {gpu_cache_mb} * 1024 * 1024 // _fbytes)\n"
                 f"m = min({cache_frames}, _cap, clip.num_frames)\n"
             )
@@ -563,6 +570,17 @@ class Arg:
     type: type
     default: Any
     help: str = ""
+    # A list-valued param: the CLI form is ``[a,b]`` (see _split_arg_pairs),
+    # the value here is the bracket-less inner text, and the printed
+    # description puts the brackets back.
+    list_arg: bool = False
+
+
+def _render_arg(arg: Arg, value: Any) -> str:
+    """One param as the CLI spells it, list params bracketed."""
+    if arg.list_arg and value is not None:
+        return f"[{value}]"
+    return str(value)
 
 
 def _str_to_bool(v: str) -> bool:
@@ -657,11 +675,11 @@ def _dfttest_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
 
 
 def _wnnm_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
-    # Chroma only, like the NLMeans entry: sigma is per plane and 0 copies the
-    # plane through, which is how the reference skips luma.
+    # Per-plane sigma, like the reference: the default [0, 3, 3] is chroma only
+    # (0 copies the plane through, which is how vszip skips luma).
     args = (
-        f"sigma=[0, {ns.wnnm_sigma}, {ns.wnnm_sigma}], "
-        f"block_size={ns.wnnm_block_size}, "
+        (f"sigma=[{ns.wnnm_sigma}], " if ns.wnnm_sigma else "")
+        + f"block_size={ns.wnnm_block_size}, "
         f"block_step={ns.wnnm_block_step}, group_size={ns.wnnm_group_size}, "
         f"bm_range={ns.wnnm_bm_range}, radius={ns.wnnm_radius}, "
         f"ps_num={ns.wnnm_ps_num}, ps_range={ns.wnnm_ps_range}"
@@ -953,7 +971,15 @@ FILTERS: dict[str, FilterSpec] = {
     "wnnm": FilterSpec(
         title="WNNM",
         args=[
-            Arg("sigma", "wnnm_sigma", float, 3.0),
+            Arg(
+                "sigma",
+                "wnnm_sigma",
+                str,
+                "0, 3, 3",
+                "per-plane sigma as [y,u,v]; a missing entry repeats the previous "
+                "and 0 copies the plane through",
+                list_arg=True,
+            ),
             Arg("block_size", "wnnm_block_size", int, 8),
             Arg("block_step", "wnnm_block_step", int, 8),
             Arg("group_size", "wnnm_group_size", int, 8),
@@ -1477,7 +1503,7 @@ _UNAVAILABLE_TAG = f"{'unavailable':>14}"
 
 
 def args_desc(spec: FilterSpec, ns: argparse.Namespace) -> str:
-    pairs = [f"{a.key}={getattr(ns, a.dest)}" for a in spec.args]
+    pairs = [f"{a.key}={_render_arg(a, getattr(ns, a.dest))}" for a in spec.args]
     return ", ".join(pairs)
 
 
@@ -2319,7 +2345,7 @@ def parse_args() -> argparse.Namespace:
     # One key=value string per filter (eedi3/eedi3h/eedi3aa share a surface but
     # keep their own flag: each run applies only its own filter's string).
     for fname, spec in FILTERS.items():
-        defaults = ", ".join(f"{a.key}={a.default}" for a in spec.args)
+        defaults = ", ".join(f"{a.key}={_render_arg(a, a.default)}" for a in spec.args)
         parser.add_argument(
             f"--{fname}-args",
             dest=f"{fname}_args",
@@ -2366,7 +2392,7 @@ def main() -> None:
     if ns.scale < 1:
         sys.exit(f"--scale must be >= 1, got {ns.scale:g}")
     # Named once: which VapourSynth the numbers came from is part of the result.
-    print(f"vspipe: {vspipe_binary()}", file=sys.stderr)
+    #print(f"vspipe: {vspipe_binary()}", file=sys.stderr)
     if ns.check_fresh:
         check_fresh(ns.vsfeel_so or _default_plugin_so(), ns.build_so)
     ab = _ab_active(ns)

@@ -22,7 +22,7 @@ pip install vapoursynth-feel
 | GaussBlur  | vszipcl   | `20161 / 1546 (13.04x)` | `18939 / 1599 (11.85x)` | `17597 / 948 (18.56x)` |
 | NLMeans    | knlmvk    | ` 1036 / 581   (1.78x)` | ` 1015 / 574   (1.77x)` | `  948 / 574  (1.65x)` |
 | NNEDI3     | nnedi3vk  | ` 4666 / 2218  (2.10x)` | ` 4862 / 2269  (2.14x)` | ` 3967 / 1207 (3.29x)` |
-| WNNM       | vszip     | `  --- / ---   (0.00x)` | `  --- / ---   (0.00x)` | `  505 / 207  (2.44x)` |
+| WNNM       | vszip     | `  --- / ---   (0.00x)` | `  --- / ---   (0.00x)` | `  839 / 205  (4.09x)` |
 
 <sub>Output of `tools/benchmark.py --filter <filter> --format <u16|f16|f32>` on an RX 7900 XTX with 1080p input.</sub>
 

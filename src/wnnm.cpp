@@ -1107,12 +1107,27 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     d->folds = 2 * d->radius + 1;
 
     // Geometry and per-plane scratch. The kernel's group lattice is the
-    // reference's `min(_x, temp_c)` walk. The layout runs twice at most: the
-    // second pass drops the centre cache when its ring does not fit.
-    constexpr int64_t kCacheBudget = INT64_C(96) << 20;
+    // reference's `min(_x, temp_c)` walk. The layout runs again when the
+    // centre cache's ring has to shrink to its budget.
+    // The ring is persistent, not per-frame scratch, and spans the request
+    // depth rather than 2r+1 slots, so it gets a budget of its own: 160 MiB
+    // fits the depth-sized ring at 1080p luma and 4K chroma (the old 2r+1 ring
+    // held under 20 MiB there).
+    constexpr int64_t kCacheBudget = INT64_C(160) << 20;
     d->cache =
         d->split_match && d->radius > 0 && !env_flag("VSFEEL_WNNM_NOCACHE");
-    d->ring = d->cache ? std::min(32, round_up_pow2(2 * d->folds)) : d->folds;
+    // A centre's record is only published when its own frame is submitted, so
+    // the ring has to span the frames the core keeps in flight: a smaller ring
+    // evicts a tag before the neighbouring frame that would hit it reads it,
+    // and every frame re-searches all folds (0.95 of 3 cached instead of 2 at
+    // the default request depth of 32, ~3x the matcher's time).
+    int depth = 2 * d->folds;
+    {
+        VSCoreInfo info {};
+        vsapi->getCoreInfo(core, &info);
+        depth += std::max(0, info.numThreads);
+    }
+    d->ring = d->cache ? std::min(256, round_up_pow2(depth)) : d->folds;
     auto layout = [&] {
         int64_t acc_off = 0, pmat_off = 0, locs_off = 0, dist_off = 0,
                 match_off = 0;
@@ -1212,10 +1227,23 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         return set_error(e);
     }
     if (d->cache && d->ring_bytes > kCacheBudget) {
-        d->cache = false;
-        d->ring = d->folds;
-        if (auto e = layout(); !e.empty()) {
-            return set_error(e);
+        // Records over budget: halve the ring while it still spans more than
+        // one centre's folds. A smaller ring keeps the hits it can, which beats
+        // dropping to per-frame slots; below the fold count there is no reuse
+        // left to keep and the cache goes away entirely.
+        const int floor_ring = round_up_pow2(2 * d->folds);
+        while (d->ring > floor_ring && d->ring_bytes > kCacheBudget) {
+            d->ring /= 2;
+            if (auto e = layout(); !e.empty()) {
+                return set_error(e);
+            }
+        }
+        if (d->ring_bytes > kCacheBudget) {
+            d->cache = false;
+            d->ring = d->folds;
+            if (auto e = layout(); !e.empty()) {
+                return set_error(e);
+            }
         }
     }
     if (d->dump_frame >= 0) {

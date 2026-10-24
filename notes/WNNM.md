@@ -10,11 +10,11 @@ the fused kernel.
 
 | config (jpbd 1080p, `sigma=3`, 5 s medians) | vsfeel | vszip |
 |---|---|---|
-| chroma U/V, `radius=1` (the benchmark default) | **505 fps** | 207 fps |
+| chroma U/V, `radius=1` (the benchmark default) | **839 fps** | 207 fps |
 | chroma U/V, radius=0 | **1615 fps** | 408 fps |
 | luma, radius=0 | **1291 fps** | 204 fps |
 
-The radius=1 row is 2.4x vszip and the temporal matcher is ~57% of it; the same
+The radius=1 row is 4.1x vszip and the temporal matcher is ~57% of it; the same
 content at radius=0 is 3x faster (see Open work for what is left).
 
 Accuracy, against vszip and against an independent f64 exact-SVD oracle
@@ -53,20 +53,22 @@ The port is f32 end to end; there is no f64 path any more.
 - **Per-centre match cache** (`radius > 0`, `group_size <= 8`): a centre's
   selection is identical for every output that consumes it, and there are
   `2r+1` of those, so `CACHE`/`RING` spec constants key the match records by
-  centre frame in a persistent ring (`RING` = `2folds` rounded up to a power of
-  two, so a little request reordering still hits). The host keeps a tag per
-  slot (`centre frame or INT_MIN`) and dispatches the matcher only for the folds
-  whose centre is not in the ring, one dispatch per centre under a push-constant
-  fold index; the estimate still runs over every slot. Records store the
-  position *within the centre's own window*, and the consumer rebases it onto
-  its own address table (`layer_base_of`), which is what makes a record reusable
-  by a frame whose table starts elsewhere. Tags are published after the submit
-  and every cached frame starts with a whole-queue barrier, the same
+  centre frame in a persistent ring. `RING` spans the frames the core keeps in
+  flight (one request per thread), `numThreads + 2folds` rounded up to a power
+  of two; a smaller ring evicts a tag before the neighbouring frame that would
+  hit it runs, and every frame then re-searches all folds. The host keeps a tag
+  per slot (`centre frame or INT_MIN`) and dispatches the matcher only for the
+  folds whose centre is not in the ring, one dispatch per centre under a
+  push-constant fold index; the estimate still runs over every slot. Records
+  store the position *within the centre's own window*, and the consumer rebases
+  it onto its own address table (`layer_base_of`), which is what makes a record
+  reusable by a frame whose table starts elsewhere. Tags are published after
+  the submit and every cached frame starts with a whole-queue barrier, the same
   cross-submission handoff the BM3D ring uses; the record slot is the only state
   shared across frames, and holding one lock across record-to-submit keeps
-  record order equal to submission order. `VSFEEL_WNNM_NOCACHE` drops the ring
-  for per-frame slots (also the fallback when the ring would not fit the 96 MiB
-  budget).
+  record order equal to submission order. A 160 MiB budget halves the ring when
+  its records do not fit (a partial cache still hits), and `VSFEEL_WNNM_NOCACHE`
+  drops the ring for per-frame slots.
 - **Estimate phase** (any radius, `group_size <= 8`), three kernels over
   `NG * (2*radius+1)` slots, so each phase runs at the width its work needs:
   - `ENTRY_GRAM`: 8 lanes per group, lane l takes column l of every patch row.
@@ -126,21 +128,27 @@ order, frame props, GPU chaining), creation variants and every error path.
 
 ## Performance
 
-- The temporal frame at the benchmark default is ~1.98 ms for two chroma
-  planes. Per plane the GPU probe (`VSFEEL_WNNM_GPUTRACE`) says **match 0.35 ms,
-  gram 0.17, solve 0.01, apply 0.08, finish 0.01**, i.e. ~0.6 ms measured of a
-  ~1 ms plane: the rest is dispatch and queue overhead (see Open work). An extra
+- The temporal frame at the benchmark default is ~1.19 ms for two chroma
+  planes. Per plane the GPU probe (`VSFEEL_WNNM_GPUTRACE`) sums **0.60 ms**
+  (match 0.36, gram 0.16, solve 0.01, apply 0.07, finish 0.00), which is the
+  whole plane: the GPU is saturated and the wall time is its own work. An extra
   fold costs ~0.15 ms per plane, and the frame divides roughly 57% matcher,
   25% Gram, 12% apply by ablation (an isolated kernel's ablation understates its
   share because the phases overlap).
 - The per-centre cache took the temporal default from 270 to 430 fps by
   searching one centre per frame instead of three; making the tags
-  order-independent (no cursor invalidation, `RING` = two folds' worth of slots)
-  recovered the out-of-order requests to 473, and fixing the record-count read
-  took it to **505**. Request order is not sequential: 38% of vspipe's frames
-  arrived out of order when the cache trusted a cursor.
+  order-independent (no cursor invalidation) recovered the out-of-order requests
+  to 473, fixing the record-count read took it to 505, and spanning the core's
+  request depth took it to **839**. Request order is not sequential: 38% of
+  vspipe's frames arrived out of order when the cache trusted a cursor.
 - The spatial frame is 0.62 ms: **match ~0.25 ms, estimate 0.37 ms** (the
   staging had taken the match phase from 0.50 ms).
+- The benchmark chain (device-resident frames, no decode) and the live-decode
+  screen now differ only by the decoder: 839 fps for the filter's own work, and
+  a live 1080p source is decode-bound at about 560-630 fps. The screen that read
+  ~630 while the benchmark read 505 was not a harness residual or the decoder:
+  the small ring made the filter re-search every fold once enough frames were
+  queued (see Historical).
 - Staging the search window in LDS is worth 1.17x on the whole frame (ABBA,
   n=12: 1140 -> 1329 fps): the SSD's two global loads per term become two LDS
   loads out of a 2 KB window that the whole workgroup shares.
@@ -170,6 +178,18 @@ order, frame props, GPU chaining), creation variants and every error path.
 
 ## Historical
 
+- **2026-10-24 - the cache ring spans the request depth (505 -> 839 fps).** The
+  ring held two folds' worth of slots (8), but the core keeps one request per
+  thread in flight (32 here), so a centre's tag was evicted before the
+  neighbouring frame that would hit it ran: 0.95 of 3 centres hit and every
+  frame dispatched the matcher for all folds, roughly doubling its GPU time
+  (2.45 vs 1.18 ms). Sizing it from `numThreads + 2folds` (64 slots, 68 MiB at
+  1080p chroma) gives 1.99 of 3 and one matcher dispatch per frame; a 160 MiB
+  budget halves the ring when the records do not fit, which keeps a partial
+  cache instead of dropping to per-frame slots. The live-decode screen (631 fps)
+  had hidden this because the decoder limits how many frames are queued, so the
+  filter looked like it had submission-side headroom; `vspipe -r 8` reproduces
+  the fast arm exactly and `-r 32` the slow one.
 - **2026-10-24 - the temporal matcher looks a centre up once (270 -> 505 fps).**
   Three changes, each measured A/B on the default arm: 32 threads and a
   32-candidate tile for the temporal matcher (the fused matcher ran 128 threads
@@ -244,12 +264,12 @@ order, frame props, GPU chaining), creation variants and every error path.
 
 ## Open work
 
-- **~0.8 ms per temporal frame is outside every measured kernel**: 1.2 ms of
-  dispatch time against a 1.98 ms frame. Ten dispatches with a barrier between
-  each, a 8 MB accumulator fill and an 8-frame pipeline cannot account for that
-  by themselves, so the next measurement should be a per-dispatch timestamp
-  pair (the probe's `BOTTOM_OF_PIPE` stamps are reliable for totals but not for
-  short spans) before restructuring anything.
+- **The GPU is no longer idle: the dispatches sum to the graded frame.** The
+  1.98 ms frame that used to look submission-bound was the ring thrash; with the
+  depth-sized ring the probe's 1.18 ms of dispatches match the 1.19 ms wall, so
+  the remaining headroom is kernel work, not submission. The probe's
+  `BOTTOM_OF_PIPE` pairs are reliable for the total and not for the short spans,
+  so measure whole-frame totals.
 - **The temporal matcher is 57% of the frame at 7-10 warps per CU.** Its 32
   threads are right for the tile and the barriers, but the SSD chains are
   latency-bound and the CU is nearly empty. A 128-thread workgroup with a
