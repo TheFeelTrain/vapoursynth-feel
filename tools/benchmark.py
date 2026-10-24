@@ -657,8 +657,11 @@ def _dfttest_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
 
 
 def _wnnm_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
+    # Chroma only, like the NLMeans entry: sigma is per plane and 0 copies the
+    # plane through, which is how the reference skips luma.
     args = (
-        f"sigma={ns.wnnm_sigma}, block_size={ns.wnnm_block_size}, "
+        f"sigma=[0, {ns.wnnm_sigma}, {ns.wnnm_sigma}], "
+        f"block_size={ns.wnnm_block_size}, "
         f"block_step={ns.wnnm_block_step}, group_size={ns.wnnm_group_size}, "
         f"bm_range={ns.wnnm_bm_range}, radius={ns.wnnm_radius}, "
         f"ps_num={ns.wnnm_ps_num}, ps_range={ns.wnnm_ps_range}"
@@ -955,14 +958,15 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("block_step", "wnnm_block_step", int, 8),
             Arg("group_size", "wnnm_group_size", int, 8),
             Arg("bm_range", "wnnm_bm_range", int, 7),
-            Arg("radius", "wnnm_radius", int, 0),
+            Arg("radius", "wnnm_radius", int, 1),
             Arg("ps_num", "wnnm_ps_num", int, 2),
             Arg("ps_range", "wnnm_ps_range", int, 4),
         ],
         build=_wnnm_build,
-        # WNNM is float-only in the reference: sigma is in the 0..1 domain.
-        input="depth(get_y(clip), 32)",
-        synth_format="vs.GRAYS",
+        # Chroma denoising with a temporal search is the main use case; WNNM is
+        # float-only in the reference (sigma is in the 0..1 domain).
+        input="depth(clip, 32)",
+        synth_format="vs.YUV420PS",
         gpu_plugins=frozenset({"vsfeel"}),
     ),
     "eedi3": FilterSpec(

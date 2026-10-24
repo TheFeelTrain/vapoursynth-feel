@@ -7,6 +7,7 @@
 #extension GL_EXT_shader_atomic_float : require
 #endif
 #extension GL_EXT_buffer_reference : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 
 /*
  * WNNM (weighted nuclear norm minimization) denoiser, ported from
@@ -15,11 +16,10 @@
  * WNNM shrinkage of the group's pmat matrix, weighted scatter.
  *
  * -DENTRY_GROUP is the per-block kernel, -DENTRY_FINISH the num/den divide.
- * -DEIG_DOUBLE keeps the Gram matrix, the Jacobi rotations and the shrink
- * factors in f64 like the reference (patchEstimate runs F=f64, and the f64 path
- * matches it to 2e-7). The f32 fallback flips shrink decisions near the
- * threshold (measured 2.2e-3 on 640x360), so f64 is the default wherever the
- * device reports shaderFloat64.
+ * The Gram matrix, the Jacobi rotations and the shrink factors are float: f64
+ * tracks the reference's arithmetic to ulp level but costs 13.5x the whole
+ * frame here, and only moves the shrink decisions where an eigenvalue already
+ * sits within ~1e-5 of the threshold.
  * -DQMAX sizes the LDS eigen workspace (8/16/32); q = min(bs^2, group_size).
  *
  * Matching is the reference's selectTopIdx as a streaming top-k: candidates are
@@ -27,23 +27,33 @@
  * including the all-equal-window case where the first k in scan order win.
  */
 
-#if defined(EIG_DOUBLE)
-#define ET double
-#define ETEPS 2.220446049250313e-16
-#define ETBIG 3.351951982485649e153
-#else
-#define ET float
+// The eigen work is float throughout. f64 doubles the cost of every rotation on
+// this GPU (measured 13.5x on the whole frame) and only moves the shrink
+// decisions where they are already a coin flip; see notes/WNNM.md.
 #define ETEPS 1.1920928955078125e-7
 #define ETBIG 4.611686e18
-#endif
 
 #ifndef QMAX
 #define QMAX 8
 #endif
 
+// The group kernel owns one reference block per workgroup, so -DWG sizes it to
+// the threads that block actually uses; the match kernels keep 128.
+#ifndef WG
 #define WG 128
+#endif
+// Cyclic Jacobi sweeps for the split estimate's eigen step: f32 does not
+// converge in 16 (2.4e-3 output error), 20 does, and 24/30 give the identical
+// answer.
+#define SWEEPS 20
 #define TFULL 256
 #define KMAXL 256
+// The fused matcher's lists only need -DNOMATCH's top-K, which is the group size.
+#if defined(NOMATCH)
+#define TOPCAP GS
+#else
+#define TOPCAP KMAXL
+#endif
 
 layout(local_size_x = WG) in;
 
@@ -78,10 +88,16 @@ layout(constant_id = 20) const int TRBASE = 0;
 layout(constant_id = 21) const int PMAT_STRIDE = 0;
 // Element offset of this plane's per-group search-location region.
 layout(constant_id = 22) const int LOCS_BASE = 0;
+// Element offsets of this plane's regions in the distance and match buffers.
+layout(constant_id = 23) const int DIST_BASE = 0;
+layout(constant_id = 24) const int MATCH_BASE = 0;
 
 #define M (BS * BS)
 #define TEMP_C (W - BS)
 #define TEMP_R (H - BS)
+// Candidates per group of the largest window (the distance array's stride).
+#define DIST_STRIDE                                                           \
+    (min(2 * BM_RANGE + 1, TEMP_R + 1) * min(2 * BM_RANGE + 1, TEMP_C + 1))
 #define WL (4 * RADIUS + 1)
 #define SRC_BASE WL
 
@@ -104,6 +120,14 @@ layout(std430, binding = 2) buffer LocsBuf { uint locs[]; };
 layout(std430, binding = 3) buffer PatchBuf { float pmat[]; };
 layout(std430, binding = 4) writeonly buffer DstBuf { float dst[]; };
 layout(std430, binding = 5) buffer TraceBuf { uint trace[]; };
+// Block matching's two halves (radius 0, group_size <= 8): every candidate's
+// SSD per group, then the selected group per group.
+layout(std430, binding = 6) buffer DistBuf { float dists[]; };
+#if defined(ENTRY_SELECT) || defined(MATCH_ONLY)
+layout(std430, binding = 7) buffer MatchBuf { uint matches[]; };
+#else
+layout(std430, binding = 7) readonly buffer MatchBuf { uint matches[]; };
+#endif
 
 // Temporal mode only: the output frame and the clip length, for the reference's
 // VAggregate fold (its slab index is clamped at the clip boundaries, so the
@@ -113,38 +137,62 @@ layout(push_constant) uniform Push {
     int frames;
 } pc;
 
-shared float cand[TFULL];
-
 // Final group, sorted by error. `top_t` is the temporal index in the centre
 // frame's window; spatial groups are all t = 0.
-shared float top_e[KMAXL];
-shared uint top_xy[KMAXL];
-shared int top_t[KMAXL];
+shared float top_e[TOPCAP];
+shared uint top_xy[TOPCAP];
+shared int top_t[TOPCAP];
 shared int top_n;
 
+#if !defined(NOMATCH)
+shared float cand[TFULL];
 // The frame currently being selected (vszip's b.temporal / b.selidx list).
 shared float fr_e[KMAXL];
 shared uint fr_xy[KMAXL];
 shared int fr_n;
-
 shared int loc_n;     // generated search-location count
 // The centre frame's spatial selection: each temporal direction restarts its
 // predictive search from this list (the reference's b.center).
 shared uint ctr_xy[KMAXL];
 shared int ctr_n;
+#endif
 shared float weight;  // aggregation weight
 shared int kept;      // retained singular values
 
-shared ET gm[QMAX * QMAX];
-shared ET vt[QMAX * QMAX];
+shared float gm[QMAX * QMAX];
+shared float vt[QMAX * QMAX];
 shared float mm[QMAX * QMAX];
 shared float shr[QMAX];
-shared ET eig[QMAX];
+shared float eig[QMAX];
+#if !defined(NOMATCH)
 shared int seed_order[KMAXL];
+#endif
 // Round-robin Jacobi: the (k+1)/2 rotations of the current round, and the
 // round that last rotated (the reference block_jacobi's cs/flag).
-shared ET jcs[QMAX + 2];
+shared float jcs[QMAX + 2];
 shared int jflag;
+
+// The split matcher's search window, staged once per group. (2*bm_range + bs)^2
+// floats covers bm_range up to 12 at bs 8; a larger window keeps the global
+// loads, because the test folds at pipeline creation (both are spec constants).
+#define WIN_MAX 1024
+#define WIN_W (min(2 * BM_RANGE + BS, TEMP_C + BS))
+shared float win[WIN_MAX];
+
+// SSD of two blocks inside `win`, both given by their top-left LDS offset.
+float block_dist_win(int aw, int ax, int ay, int bx, int by) {
+    float acc = 0.0;
+    for (int py = 0; py < BS; ++py) {
+        const int ar = (ay + py) * aw + ax;
+        const int br = (by + py) * aw + bx;
+        for (int px = 0; px < BS; ++px) {
+            precise float d = win[ar + px] - win[br + px];
+            precise float dd = d * d;
+            acc = acc + dd;
+        }
+    }
+    return acc;
+}
 
 // Pair `pair` of round `round` in a round-robin schedule over K (even)
 // indices: every pair of indices meets exactly once per sweep and the indices
@@ -170,54 +218,54 @@ void jacobi_serial(int q) {
     const int KQ = q + (q & 1);
     if (q > 1) {
         for (int sweep = 0; sweep < 30; ++sweep) {
-            ET gmax = ET(0);
+            float gmax = float(0);
             for (int i = 0; i < q; ++i) {
                 gmax = max(gmax, gm[i * KQ + i]);
             }
-            const ET floor_abs = ET(ETEPS) * gmax;
+            const float floor_abs = float(ETEPS) * gmax;
             bool rotated = false;
             for (int p = 0; p < q - 1; ++p) {
                 for (int j = p + 1; j < q; ++j) {
-                    const ET apq = gm[p * KQ + j];
-                    const ET app = gm[p * KQ + p];
-                    const ET ajj = gm[j * KQ + j];
-                    const ET thresh =
-                        max(ET(ETEPS) * sqrt(max(app, ET(0)) *
-                                             max(ajj, ET(0))),
+                    const float apq = gm[p * KQ + j];
+                    const float app = gm[p * KQ + p];
+                    const float ajj = gm[j * KQ + j];
+                    const float thresh =
+                        max(float(ETEPS) * sqrt(max(app, float(0)) *
+                                             max(ajj, float(0))),
                             floor_abs);
                     if (abs(apq) <= thresh) {
                         continue;
                     }
                     rotated = true;
-                    const ET theta = (ajj - app) / (ET(2) * apq);
-                    ET t;
-                    if (abs(theta) > ET(ETBIG)) {
-                        t = ET(1) / (ET(2) * theta);
+                    const float theta = (ajj - app) / (float(2) * apq);
+                    float t;
+                    if (abs(theta) > float(ETBIG)) {
+                        t = float(1) / (float(2) * theta);
                     } else {
-                        const ET at =
-                            abs(theta) + sqrt(theta * theta + ET(1));
-                        t = theta >= ET(0) ? ET(1) / at : -ET(1) / at;
+                        const float at =
+                            abs(theta) + sqrt(theta * theta + float(1));
+                        t = theta >= float(0) ? float(1) / at : -float(1) / at;
                     }
-                    const ET cs = ET(1) / sqrt(t * t + ET(1));
-                    const ET sn = t * cs;
-                    const ET h = t * apq;
+                    const float cs = float(1) / sqrt(t * t + float(1));
+                    const float sn = t * cs;
+                    const float h = t * apq;
                     for (int i = 0; i < q; ++i) {
-                        const ET xp = gm[p * KQ + i];
-                        const ET yp = gm[j * KQ + i];
+                        const float xp = gm[p * KQ + i];
+                        const float yp = gm[j * KQ + i];
                         gm[p * KQ + i] = cs * xp - sn * yp;
                         gm[j * KQ + i] = sn * xp + cs * yp;
                     }
                     gm[p * KQ + p] = app - h;
                     gm[j * KQ + j] = ajj + h;
-                    gm[p * KQ + j] = ET(0);
-                    gm[j * KQ + p] = ET(0);
+                    gm[p * KQ + j] = float(0);
+                    gm[j * KQ + p] = float(0);
                     for (int i = 0; i < q; ++i) {
                         gm[i * KQ + p] = gm[p * KQ + i];
                         gm[i * KQ + j] = gm[j * KQ + i];
                     }
                     for (int i = 0; i < q; ++i) {
-                        const ET xp = vt[p * KQ + i];
-                        const ET yp = vt[j * KQ + i];
+                        const float xp = vt[p * KQ + i];
+                        const float yp = vt[j * KQ + i];
                         vt[p * KQ + i] = cs * xp - sn * yp;
                         vt[j * KQ + i] = sn * xp + cs * yp;
                     }
@@ -242,11 +290,11 @@ void jacobi_parallel(int k, int tid) {
     // The round-robin schedule needs an even index count; an odd k is padded
     // with a zero row/column, which no rotation touches.
     const int KQ = k + (k & 1);
-    ET trace = ET(0);
+    float trace = float(0);
     for (int i = 0; i < k; ++i) {
         trace += abs(gm[i * KQ + i]);
     }
-    const ET floor_abs = ET(ETEPS) * trace / ET(k);
+    const float floor_abs = float(ETEPS) * trace / float(k);
     const int hp = (k + (k & 1)) / 2;
     for (int sweep = 0; sweep < 30; ++sweep) {
         if (tid == 0) {
@@ -257,25 +305,25 @@ void jacobi_parallel(int k, int tid) {
             if (tid < hp) {
                 int p, q;
                 jacobi_schedule(round, tid, k, p, q);
-                ET c = ET(1), sn = ET(0);
+                float c = float(1), sn = float(0);
                 if (q < k) {
-                    const ET apq = gm[p * KQ + q];
-                    const ET app = gm[p * KQ + p];
-                    const ET ajj = gm[q * KQ + q];
-                    const ET thresh =
-                        max(ET(ETEPS) * sqrt(max(app, ET(0)) * max(ajj, ET(0))),
+                    const float apq = gm[p * KQ + q];
+                    const float app = gm[p * KQ + p];
+                    const float ajj = gm[q * KQ + q];
+                    const float thresh =
+                        max(float(ETEPS) * sqrt(max(app, float(0)) * max(ajj, float(0))),
                             floor_abs);
                     if (abs(apq) > thresh) {
-                        const ET theta = (ajj - app) / (ET(2) * apq);
-                        ET t;
-                        if (abs(theta) > ET(ETBIG)) {
-                            t = ET(1) / (ET(2) * theta);
+                        const float theta = (ajj - app) / (float(2) * apq);
+                        float t;
+                        if (abs(theta) > float(ETBIG)) {
+                            t = float(1) / (float(2) * theta);
                         } else {
-                            const ET at =
-                                abs(theta) + sqrt(theta * theta + ET(1));
-                            t = theta >= ET(0) ? ET(1) / at : -ET(1) / at;
+                            const float at =
+                                abs(theta) + sqrt(theta * theta + float(1));
+                            t = theta >= float(0) ? float(1) / at : -float(1) / at;
                         }
-                        c = ET(1) / sqrt(t * t + ET(1));
+                        c = float(1) / sqrt(t * t + float(1));
                         sn = t * c;
                         jflag = round + 1;
                     }
@@ -293,42 +341,42 @@ void jacobi_parallel(int k, int tid) {
             for (int item = tid; item < k * hp; item += WG) {
                 const int row = item / hp;
                 const int pair = item - row * hp;
-                const ET c = jcs[2 * pair];
-                const ET sn = jcs[2 * pair + 1];
+                const float c = jcs[2 * pair];
+                const float sn = jcs[2 * pair + 1];
                 int p, q;
                 jacobi_schedule(round, pair, k, p, q);
-                if (sn != ET(0)) {
-                    const ET vip = vt[row * k + p];
-                    const ET viq = vt[row * k + q];
+                if (sn != float(0)) {
+                    const float vip = vt[row * k + p];
+                    const float viq = vt[row * k + q];
                     vt[row * k + p] = c * vip - sn * viq;
                     vt[row * k + q] = sn * vip + c * viq;
                 }
                 if (row < hp) {
-                    const ET cr = jcs[2 * row];
-                    const ET sr = jcs[2 * row + 1];
-                    if (sn != ET(0) || sr != ET(0)) {
+                    const float cr = jcs[2 * row];
+                    const float sr = jcs[2 * row + 1];
+                    if (sn != float(0) || sr != float(0)) {
                         int pr, qr;
                         jacobi_schedule(round, row, k, pr, qr);
                         const bool wide = q < k, tall = qr < k;
-                        ET a = gm[pr * KQ + p];
-                        ET b = wide ? gm[pr * KQ + q] : ET(0);
-                        ET d = tall ? gm[qr * KQ + p] : ET(0);
-                        ET e = (wide && tall) ? gm[qr * KQ + q] : ET(0);
-                        if (sn != ET(0)) {
-                            const ET ap = c * a - sn * b;
-                            const ET aq = sn * a + c * b;
-                            const ET dp = c * d - sn * e;
-                            const ET dq = sn * d + c * e;
+                        float a = gm[pr * KQ + p];
+                        float b = wide ? gm[pr * KQ + q] : float(0);
+                        float d = tall ? gm[qr * KQ + p] : float(0);
+                        float e = (wide && tall) ? gm[qr * KQ + q] : float(0);
+                        if (sn != float(0)) {
+                            const float ap = c * a - sn * b;
+                            const float aq = sn * a + c * b;
+                            const float dp = c * d - sn * e;
+                            const float dq = sn * d + c * e;
                             a = ap;
                             b = aq;
                             d = dp;
                             e = dq;
                         }
-                        if (sr != ET(0)) {
-                            const ET ap = cr * a - sr * d;
-                            const ET dp = sr * a + cr * d;
-                            const ET bp = cr * b - sr * e;
-                            const ET ep = sr * b + cr * e;
+                        if (sr != float(0)) {
+                            const float ap = cr * a - sr * d;
+                            const float dp = sr * a + cr * d;
+                            const float bp = cr * b - sr * e;
+                            const float ep = sr * b + cr * e;
                             a = ap;
                             d = dp;
                             b = bp;
@@ -367,6 +415,7 @@ int unpack_y(uint v) {
     return int(v >> 16);
 }
 
+#if !defined(NOMATCH)
 // Stable insertion of (e, xy) into the sorted frame list.
 void fr_feed(float e, uint xy, int kk) {
     if (fr_n < kk) {
@@ -459,24 +508,26 @@ void top_ensure_center(int x, int y, int t) {
     }
 }
 
-// Sequential f32 SSD, in the reference's p order (row-major pmat).
+#endif
+// Sequential f32 SSD, in the reference's p order (row-major patch).
 float block_dist(PlaneRef rc, PlaneRef rt, int cx, int cy, int bx, int by) {
     // `precise` keeps the multiply and the add separate: the reference
     // accumulates d*d sequentially in f32 and contracts nothing, and an ulp
     // here flips which of two near-equal blocks is selected.
-    precise float acc = 0.0;
+    float acc = 0.0;
     for (int py = 0; py < BS; ++py) {
         const int rcrow = (cy + py) * STRIDE + cx;
         const int rtrow = (by + py) * STRIDE + bx;
         for (int px = 0; px < BS; ++px) {
-            const float d = rc.v[rcrow + px] - rt.v[rtrow + px];
-            const float dd = d * d;
+            precise float d = rc.v[rcrow + px] - rt.v[rtrow + px];
+            precise float dd = d * d;
             acc = acc + dd;
         }
     }
     return acc;
 }
 
+#if !defined(NOMATCH)
 // Union of the clipped (2*PS_RANGE+1)^2 windows around the first
 // min(PS_NUM, window area) seeds, enumerated in (y, x) order exactly like
 // generateSearchLocations. Thread 0 only; returns the point count.
@@ -539,6 +590,7 @@ int generate_locs(int wg, int active_ps, int loc_base) {
 // A pixel can receive one add per selected match of every group whose window
 // reaches it: ((2*(BM_RANGE+BS))/STEP + 1)^2 groups times GS matches, so a few
 // thousand retries is a safe bound (the same argument as BM3D's res_add).
+#endif
 void add_acc(int idx, float v) {
 #ifndef NO_FLOAT_ATOMICS
     atomicAdd(acc[ACC_BASE + idx], v);
@@ -560,8 +612,10 @@ void add_acc(int idx, float v) {
 
 // One reference block. layer_base selects the first frame of the centre frame's
 // window in the address table; t_dest is the local temporal index whose patches
-// go to this output frame.
-void run_group(uint wg, int x, int y, int layer_base, int t_dest) {
+// go to this output frame; fold is this centre's position in the fold (the
+// estimate slot offset, which can repeat when a clip boundary clamps two folds
+// onto the same centre, exactly as the reference's VAggregate does).
+void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
     const int tid = int(gl_LocalInvocationIndex);
     const uint group_base = uint(PMAT_BASE) + wg * uint(PMAT_STRIDE);
     const int loc_base = LOCS_BASE + int(wg) * LOCS_CAP;
@@ -576,75 +630,93 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest) {
     const int area = (wbottom - wtop + 1) * cx;
     const int kk = max(GS, PS_NUM);
 
-    if (tid == 0) {
-        fr_n = 0;
-    }
-    barrier();
-    for (int base = 0; base < area; base += TFULL) {
-        const int span = min(TFULL, area - base);
-        for (int i = tid; i < span; i += WG) {
-            const int idx = base + i;
-            const int bx = wleft + idx % cx;
-            const int by = wtop + idx / cx;
-            cand[i] = block_dist(refc, refc, x, y, bx, by);
-        }
-        barrier();
+#if defined(NOMATCH)
+    {
+        // The distance and selection kernels already ran (see ENTRY_DIST /
+        // ENTRY_SELECT): load this group's selected matches.
         if (tid == 0) {
-            for (int i = 0; i < span; ++i) {
-                const int idx = base + i;
-                fr_feed(cand[i],
-                        pack_xy(wleft + idx % cx, wtop + idx / cx), kk);
+            const uint base = uint(MATCH_BASE) + uint(wg) * uint(1 + 2 * GS);
+            const int cnt = int(matches[base]);
+            top_n = min(cnt, GS);
+            for (int i = 0; i < top_n; ++i) {
+                top_xy[i] = matches[base + uint(1 + 2 * i)];
+                top_t[i] = 0;
             }
         }
         barrier();
     }
-    if (tid == 0) {
-        ctr_n = fr_n;
-        for (int i = 0; i < fr_n; ++i) {
-            ctr_xy[i] = fr_xy[i];
+#else
+    {
+        if (tid == 0) {
+            fr_n = 0;
         }
-        top_from_fr(RADIUS);
-    }
-    barrier();
-
-    if (RADIUS > 0) {
-        const int active_ps = min(PS_NUM, area);
-        for (int dir = -1; dir <= 1; dir += 2) {
+        barrier();
+        for (int base = 0; base < area; base += TFULL) {
+            const int span = min(TFULL, area - base);
+            for (int i = tid; i < span; i += WG) {
+                const int idx = base + i;
+                const int bx = wleft + idx % cx;
+                const int by = wtop + idx / cx;
+                cand[i] = block_dist(refc, refc, x, y, bx, by);
+            }
+            barrier();
             if (tid == 0) {
-                fr_n = ctr_n;
-                for (int i = 0; i < ctr_n; ++i) {
-                    fr_xy[i] = ctr_xy[i];
+                for (int i = 0; i < span; ++i) {
+                    const int idx = base + i;
+                    fr_feed(cand[i],
+                            pack_xy(wleft + idx % cx, wtop + idx / cx), kk);
                 }
             }
             barrier();
-            for (int i = 1; i <= RADIUS; ++i) {
-                const int t_idx = RADIUS + dir * i;
-                PlaneRef reft = addr.img[ADDR_BASE + layer_base + t_idx];
+        }
+        if (tid == 0) {
+            ctr_n = fr_n;
+            for (int i = 0; i < fr_n; ++i) {
+                ctr_xy[i] = fr_xy[i];
+            }
+            top_from_fr(RADIUS);
+        }
+        barrier();
+    
+        if (RADIUS > 0) {
+            const int active_ps = min(PS_NUM, area);
+            for (int dir = -1; dir <= 1; dir += 2) {
                 if (tid == 0) {
-                    loc_n = generate_locs(int(wg), active_ps, loc_base);
-                    fr_n = 0;
+                    fr_n = ctr_n;
+                    for (int i = 0; i < ctr_n; ++i) {
+                        fr_xy[i] = ctr_xy[i];
+                    }
                 }
                 barrier();
-                const int nl = loc_n;
-                for (int base = 0; base < nl; base += TFULL) {
-                    const int span = min(TFULL, nl - base);
-                    for (int c = tid; c < span; c += WG) {
-                        const uint l = locs[loc_base + base + c];
-                        cand[c] = block_dist(refc, reft, x, y, unpack_x(l),
-                                             unpack_y(l));
-                    }
-                    barrier();
+                for (int i = 1; i <= RADIUS; ++i) {
+                    const int t_idx = RADIUS + dir * i;
+                    PlaneRef reft = addr.img[ADDR_BASE + layer_base + t_idx];
                     if (tid == 0) {
-                        for (int c = 0; c < span; ++c) {
-                            fr_feed(cand[c], locs[loc_base + base + c], kk);
+                        loc_n = generate_locs(int(wg), active_ps, loc_base);
+                        fr_n = 0;
+                    }
+                    barrier();
+                    const int nl = loc_n;
+                    for (int base = 0; base < nl; base += TFULL) {
+                        const int span = min(TFULL, nl - base);
+                        for (int c = tid; c < span; c += WG) {
+                            const uint l = locs[loc_base + base + c];
+                            cand[c] = block_dist(refc, reft, x, y, unpack_x(l),
+                                                 unpack_y(l));
                         }
+                        barrier();
+                        if (tid == 0) {
+                            for (int c = 0; c < span; ++c) {
+                                fr_feed(cand[c], locs[loc_base + base + c], kk);
+                            }
+                        }
+                        barrier();
+                    }
+                    if (tid == 0) {
+                        top_merge(t_idx);
                     }
                     barrier();
                 }
-                if (tid == 0) {
-                    top_merge(t_idx);
-                }
-                barrier();
             }
         }
     }
@@ -652,12 +724,32 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest) {
         top_ensure_center(x, y, RADIUS);
     }
     barrier();
-
+#endif
+#if defined(MATCH_ONLY)
+    // The estimate runs in the split kernels (ENTRY_GRAM/SOLVE/APPLY): publish
+    // this fold's selection, keyed by the estimate slot, with the *absolute*
+    // source layer so the estimate needs no temporal logic of its own.
+    if (tid == 0) {
+        const uint base =
+            uint(MATCH_BASE) +
+            (wg * uint(2 * RADIUS + 1) + uint(fold)) * uint(1 + 2 * GS);
+        matches[base] = uint(top_n);
+        for (int i = 0; i < top_n; ++i) {
+            matches[base + uint(1 + 2 * i)] = top_xy[i];
+            matches[base + uint(2 + 2 * i)] = uint(layer_base + top_t[i]);
+        }
+    }
+    return;
+#endif
     const int n = top_n;
     if (TRACE != 0 && tid == 0) {
         const int tb = TRBASE + (int(wg) * (2 * RADIUS + 1) + layer_base) * 28;
         trace[tb + 0] = uint(n);
+#if defined(NOMATCH)
+        trace[tb + 3] = 0u;
+#else
         trace[tb + 3] = uint(loc_n);
+#endif
         for (int j = 0; j < 8; ++j) {
             trace[tb + 4 + j * 3 + 0] =
                 j < n ? floatBitsToUint(top_e[j]) : 0u;
@@ -703,21 +795,21 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest) {
     const int q = tall ? n : M;
     if (tid < q) {
         for (int j = tid; j < q; ++j) {
-            ET accd = ET(0);
+            float accd = float(0);
             if (tall) {
                 for (int p = 0; p < M; ++p) {
-                    const ET a =
-                        ET(pmat[group_base + uint(tid) * uint(M) + uint(p)]);
-                    const ET b =
-                        ET(pmat[group_base + uint(j) * uint(M) + uint(p)]);
+                    const float a =
+                        float(pmat[group_base + uint(tid) * uint(M) + uint(p)]);
+                    const float b =
+                        float(pmat[group_base + uint(j) * uint(M) + uint(p)]);
                     accd = fma(a, b, accd);
                 }
             } else {
                 for (int i = 0; i < n; ++i) {
-                    const ET a =
-                        ET(pmat[group_base + uint(i) * uint(M) + uint(tid)]);
-                    const ET b =
-                        ET(pmat[group_base + uint(i) * uint(M) + uint(j)]);
+                    const float a =
+                        float(pmat[group_base + uint(i) * uint(M) + uint(tid)]);
+                    const float b =
+                        float(pmat[group_base + uint(i) * uint(M) + uint(j)]);
                     accd = fma(a, b, accd);
                 }
             }
@@ -729,11 +821,11 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest) {
 
     // Eigenvectors: identity, then the round-robin parallel Jacobi.
     for (int i = tid; i < (q + (q & 1)) * (q + (q & 1)); i += WG) {
-        vt[i] = ET(0);
+        vt[i] = float(0);
     }
     barrier();
     for (int i = tid; i < q; i += WG) {
-        vt[i * (q + (q & 1)) + i] = ET(1);
+        vt[i * (q + (q & 1)) + i] = float(1);
     }
     barrier();
     if ((q & 1) == 0) {
@@ -747,7 +839,7 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest) {
                 const int r = i / q;
                 const int c = i - r * q;
                 if (r < c) {
-                    const ET t = vt[r * KQ + c];
+                    const float t = vt[r * KQ + c];
                     vt[r * KQ + c] = vt[c * KQ + r];
                     vt[c * KQ + r] = t;
                 }
@@ -764,7 +856,7 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest) {
         // Sorted eigenvalues, descending, with the eigenvector rows permuted.
         const int KQ = q + (q & 1);
         for (int i = 0; i < q; ++i) {
-            eig[i] = max(gm[i * KQ + i], ET(0));
+            eig[i] = max(gm[i * KQ + i], float(0));
         }
         for (int i = 0; i < q; ++i) {
             int best = i;
@@ -774,11 +866,11 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest) {
                 }
             }
             if (best != i) {
-                const ET tmp = eig[i];
+                const float tmp = eig[i];
                 eig[i] = eig[best];
                 eig[best] = tmp;
                 for (int r2 = 0; r2 < q; ++r2) {
-                    const ET t2 = vt[i * KQ + r2];
+                    const float t2 = vt[i * KQ + r2];
                     vt[i * KQ + r2] = vt[best * KQ + r2];
                     vt[best * KQ + r2] = t2;
                 }
@@ -793,13 +885,13 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest) {
             shr[ii] = 1.0f;
         }
         for (; i < q; ++i) {
-            const ET lam = eig[i];
-            const ET tmp = lam - ET(c);
-            if (!(tmp > ET(0))) {
+            const float lam = eig[i];
+            const float tmp = lam - float(c);
+            if (!(tmp > float(0))) {
                 break;
             }
-            const ET s = sqrt(lam);
-            const ET sp = (s + sqrt(tmp)) * ET(0.5);
+            const float s = sqrt(lam);
+            const float sp = (s + sqrt(tmp)) * float(0.5);
             shr[i] = float(sp / s);
         }
         kept = i;
@@ -862,8 +954,633 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest) {
     barrier();
 }
 
+// ---------------------------------------------------------------------------
+// Split estimate (radius 0, group_size <= 8)
+// ---------------------------------------------------------------------------
+// Three kernels instead of one, so every phase runs at the width its work
+// needs: the Gram and the scatter are eight-lane per group and read the image
+// as consecutive words, and the eigen step is one thread per group with the
+// Gram matrix, the eigenvectors and every rotation index in registers.
+#if defined(ENTRY_GRAM) || defined(ENTRY_SOLVE) || defined(ENTRY_APPLY)
+// Per-group scratch: the Gram matrix at [0,64), the per-pixel mean at
+// [64,128) (residual only), the aggregation weight at [128).
+#define MAT_MEAN 64
+#define MAT_WEIGHT 128
+
+// Offset of the group's match `j` from its plane base. j >= n means the group
+// has fewer columns and this one contributes zero.
+int match_off(uint slot, int j, int n) {
+    if (j >= n) {
+        return 0;
+    }
+    const uint xy =
+        matches[uint(MATCH_BASE) + slot * uint(1 + 2 * GS) + uint(1 + 2 * j)];
+    return unpack_y(xy) * STRIDE + unpack_x(xy);
+}
+
+// The same match's offset in the packed accumulator, whose row stride is W.
+int match_out(uint slot, int j, int n) {
+    if (j >= n) {
+        return 0;
+    }
+    const uint xy =
+        matches[uint(MATCH_BASE) + slot * uint(1 + 2 * GS) + uint(1 + 2 * j)];
+    return unpack_y(xy) * W + unpack_x(xy);
+}
+
+// Source layer of match `j` in the address table: the temporal matcher stores
+// the absolute layer, the spatial selection kernel stores 0.
+int match_layer(uint slot, int j, int n) {
+    if (j >= n) {
+        return 0;
+    }
+    return int(matches[uint(MATCH_BASE) + slot * uint(1 + 2 * GS) +
+                       uint(2 + 2 * j)]);
+}
+
+// Estimate slots: one per (lattice point, temporal fold). RADIUS is a spec
+// constant, so this folds to NG for the spatial case.
+uint est_count() {
+    return uint(NG) * uint(2 * RADIUS + 1);
+}
+
+// The temporal fold a slot belongs to hands the output frame only the patches
+// of one slab (the reference's VAggregate fold); negated, = no filter, which is
+// the whole spatial case. Both indices are the same expressions the fused
+// kernel uses for its fold loop.
+int fold_dest(uint slot) {
+    if (RADIUS == 0) {
+        return -1;
+    }
+    const int i = int(slot) % (2 * RADIUS + 1);
+    const int cm = clamp(pc.pn - RADIUS + i, 0, pc.frames - 1);
+    const int layer_base = cm - pc.pn + RADIUS;
+    const int slab = clamp(2 * RADIUS - i, pc.pn - pc.frames + 1 + RADIUS,
+                           pc.pn + RADIUS);
+    return layer_base + slab;
+}
+#endif
+
+#if defined(ENTRY_GRAM)
+// One row of the lane's outer-product sum: element (I, J) is the product of
+// patch I and patch J at that pixel. I and J are literals so ga stays in
+// registers.
+#define GROW(I)                                                               \
+    ga[(I) * 8 + 0] = fma(v[(I)], v[0], ga[(I) * 8 + 0]);                     \
+    ga[(I) * 8 + 1] = fma(v[(I)], v[1], ga[(I) * 8 + 1]);                     \
+    ga[(I) * 8 + 2] = fma(v[(I)], v[2], ga[(I) * 8 + 2]);                     \
+    ga[(I) * 8 + 3] = fma(v[(I)], v[3], ga[(I) * 8 + 3]);                     \
+    ga[(I) * 8 + 4] = fma(v[(I)], v[4], ga[(I) * 8 + 4]);                     \
+    ga[(I) * 8 + 5] = fma(v[(I)], v[5], ga[(I) * 8 + 5]);                     \
+    ga[(I) * 8 + 6] = fma(v[(I)], v[6], ga[(I) * 8 + 6]);                     \
+    ga[(I) * 8 + 7] = fma(v[(I)], v[7], ga[(I) * 8 + 7]);
+#define GZ4(I)                                                                \
+    ga[(I) + 0] = 0.0;                                                        \
+    ga[(I) + 1] = 0.0;                                                        \
+    ga[(I) + 2] = 0.0;                                                        \
+    ga[(I) + 3] = 0.0;
+// Sum the eight lanes' partial matrices.
+#define GRED(E)                                                               \
+    ga[(E)] += subgroupShuffleXor(ga[(E)], 1);                                \
+    ga[(E)] += subgroupShuffleXor(ga[(E)], 2);                                \
+    ga[(E)] += subgroupShuffleXor(ga[(E)], 4);
+#define GST(E) pmat[gbase + uint(E)] = ga[(E)];
+#endif
+
+#if defined(ENTRY_APPLY)
+// Output column J of one pixel: the 8-term dot product with that column of M,
+// the mean back, and the weighted scatter of both the estimate and the weight.
+#define ADOT(J, O, U)                                                         \
+    if ((J) < an && (U)) {                                                           \
+        const float ad =                                                     \
+            fma(a7, am[56 + (J)], fma(a6, am[48 + (J)], fma(a5, am[40 + (J)],  \
+                fma(a4, am[32 + (J)], fma(a3, am[24 + (J)],                   \
+                    fma(a2, am[16 + (J)], fma(a1, am[8 + (J)],                 \
+                        fma(a0, am[0 + (J)], mu))))))));                      \
+        add_acc((O) + row, wgt * ad);                                         \
+        add_acc(W * H + (O) + row, wgt);                                      \
+    }
+#endif
+
+#if defined(ENTRY_SOLVE) || defined(ENTRY_APPLY)
+// Load/stash four elements of a private array at a constant offset. Every
+// index into g and v has to fold: one dynamic index puts the whole array in
+// local memory and the eigen step then waits on every element.
+#define LD4(D, B, I)                                                          \
+    D[(I) + 0] = pmat[(B) + uint(I) + 0u];                                    \
+    D[(I) + 1] = pmat[(B) + uint(I) + 1u];                                    \
+    D[(I) + 2] = pmat[(B) + uint(I) + 2u];                                    \
+    D[(I) + 3] = pmat[(B) + uint(I) + 3u];
+#define Z4(D, I)                                                              \
+    D[(I) + 0] = 0.0;                                                         \
+    D[(I) + 1] = 0.0;                                                         \
+    D[(I) + 2] = 0.0;                                                         \
+    D[(I) + 3] = 0.0;
+#endif
+
+#if defined(ENTRY_SOLVE)
+// Columns (P, J) of the symmetric matrix together with the eigenvector rows,
+// then the rows of the matrix. The column pass has to land first: the row pass
+// reads the values it wrote, which is what makes J^T A J come out symmetric.
+#define JCOL(C, P, J)                                                         \
+    {                                                                         \
+        const float ga = g[(P) * 8 + (C)];                                    \
+        const float gb = g[(J) * 8 + (C)];                                    \
+        g[(P) * 8 + (C)] = jc * ga - js * gb;                                 \
+        g[(J) * 8 + (C)] = js * ga + jc * gb;                                 \
+        const float va = v[(P) * 8 + (C)];                                    \
+        const float vb = v[(J) * 8 + (C)];                                    \
+        v[(P) * 8 + (C)] = jc * va - js * vb;                                 \
+        v[(J) * 8 + (C)] = js * va + jc * vb;                                 \
+    }
+#define JROW(C, P, J)                                                         \
+    {                                                                         \
+        const float ga = g[(C) * 8 + (P)];                                    \
+        const float gb = g[(C) * 8 + (J)];                                    \
+        g[(C) * 8 + (P)] = jc * ga - js * gb;                                 \
+        g[(C) * 8 + (J)] = js * ga + jc * gb;                                 \
+    }
+#define JCOLS(P, J)                                                           \
+    JCOL(0, P, J) JCOL(1, P, J) JCOL(2, P, J) JCOL(3, P, J) JCOL(4, P, J)      \
+        JCOL(5, P, J) JCOL(6, P, J) JCOL(7, P, J)
+#define JROWS(P, J)                                                           \
+    JROW(0, P, J) JROW(1, P, J) JROW(2, P, J) JROW(3, P, J) JROW(4, P, J)      \
+        JROW(5, P, J) JROW(6, P, J) JROW(7, P, J)
+// One rotation of the (P, J) plane. Branch-free: a zero off-diagonal still
+// yields a small rotation, which is an orthogonal similarity transformation
+// too, so the spectrum is untouched and the sweeps converge regardless.
+#define JROT(P, J)                                                            \
+    {                                                                         \
+        const float apq = g[(P) * 8 + (J)];                                   \
+        const float app = g[(P) * 8 + (P)];                                   \
+        const float ajj = g[(J) * 8 + (J)];                                   \
+        const bool turn = apq != 0.0;                                         \
+        const float theta = (ajj - app) / (2.0 * (turn ? apq : 1.0));          \
+        const float mag = abs(theta);                                         \
+        const float jt = (theta >= 0.0 ? 1.0 : -1.0) / (mag + sqrt(mag * mag + 1.0)); \
+        const float jc = turn ? inversesqrt(jt * jt + 1.0) : 1.0;              \
+        const float js = turn ? jt * jc : 0.0;                                 \
+        const float jh = jt * apq;                                             \
+        JCOLS(P, J) JROWS(P, J)                                               \
+        /* The four corner elements are overwritten rather than rotated: the   \
+           column pass already moved them once, and the reference sets them    \
+           from the closed form (gp[p] = app - h, and so on). */               \
+        g[(P) * 8 + (P)] = app - jh;                                          \
+        g[(J) * 8 + (J)] = ajj + jh;                                          \
+        g[(P) * 8 + (J)] = 0.0;                                               \
+        g[(J) * 8 + (P)] = 0.0;                                               \
+    }
+// One sweep: all 28 pairs, written out so that P and J are literals in every
+// index above.
+#define JSWEEP                                                                \
+    JROT(0, 1) JROT(0, 2) JROT(0, 3) JROT(0, 4) JROT(0, 5) JROT(0, 6)         \
+        JROT(0, 7) JROT(1, 2) JROT(1, 3) JROT(1, 4) JROT(1, 5) JROT(1, 6)     \
+            JROT(1, 7) JROT(2, 3) JROT(2, 4) JROT(2, 5) JROT(2, 6)            \
+                JROT(2, 7) JROT(3, 4) JROT(3, 5) JROT(3, 6) JROT(3, 7)        \
+                    JROT(4, 5) JROT(4, 6) JROT(4, 7) JROT(5, 6) JROT(5, 7)    \
+                        JROT(6, 7)
+
+// The shrink factor of singular value K. Only the largest one is protected
+// (start = 0 when residual strips the DC term) and the spectrum walks down
+// while s^2 - c > 0, so a value's place only matters for that first slot.
+#define GAIN(F, L, TOP)                                                       \
+    {                                                                         \
+        const float sv = sqrt(max(L, 0.0));                                   \
+        const float tmp = (L) - cc;                                           \
+        F = (TOP && RESIDUAL == 0)                                            \
+                ? 1.0                                                         \
+                : (tmp > 0.0 ? ((sv + sqrt(tmp)) * 0.5) / sv : 0.0);           \
+        kept += F > 0.0 ? 1.0 : 0.0;                                          \
+    }
+// Row I of M = V diag(gain) V^T: b_k = gain_k V[k][I], then M[I][j] = b . V[:, j].
+#define MROW(I, F0, F1, F2, F3, F4, F5, F6, F7)                               \
+    {                                                                         \
+        const float b0 = F0 * v[I];                                           \
+        const float b1 = F1 * v[8 + (I)];                                     \
+        const float b2 = F2 * v[16 + (I)];                                    \
+        const float b3 = F3 * v[24 + (I)];                                    \
+        const float b4 = F4 * v[32 + (I)];                                    \
+        const float b5 = F5 * v[40 + (I)];                                    \
+        const float b6 = F6 * v[48 + (I)];                                    \
+        const float b7 = F7 * v[56 + (I)];                                    \
+        pmat[gbase + uint((I) * 8 + 0)] =                                     \
+            fma(b0, v[0], fma(b1, v[8], fma(b2, v[16], fma(b3, v[24],         \
+                fma(b4, v[32], fma(b5, v[40], fma(b6, v[48], b7 * v[56]))))))); \
+        pmat[gbase + uint((I) * 8 + 1)] =                                     \
+            fma(b0, v[1], fma(b1, v[9], fma(b2, v[17], fma(b3, v[25],         \
+                fma(b4, v[33], fma(b5, v[41], fma(b6, v[49], b7 * v[57]))))))); \
+        pmat[gbase + uint((I) * 8 + 2)] =                                     \
+            fma(b0, v[2], fma(b1, v[10], fma(b2, v[18], fma(b3, v[26],        \
+                fma(b4, v[34], fma(b5, v[42], fma(b6, v[50], b7 * v[58]))))))); \
+        pmat[gbase + uint((I) * 8 + 3)] =                                     \
+            fma(b0, v[3], fma(b1, v[11], fma(b2, v[19], fma(b3, v[27],        \
+                fma(b4, v[35], fma(b5, v[43], fma(b6, v[51], b7 * v[59]))))))); \
+        pmat[gbase + uint((I) * 8 + 4)] =                                     \
+            fma(b0, v[4], fma(b1, v[12], fma(b2, v[20], fma(b3, v[28],        \
+                fma(b4, v[36], fma(b5, v[44], fma(b6, v[52], b7 * v[60]))))))); \
+        pmat[gbase + uint((I) * 8 + 5)] =                                     \
+            fma(b0, v[5], fma(b1, v[13], fma(b2, v[21], fma(b3, v[29],        \
+                fma(b4, v[37], fma(b5, v[45], fma(b6, v[53], b7 * v[61]))))))); \
+        pmat[gbase + uint((I) * 8 + 6)] =                                     \
+            fma(b0, v[6], fma(b1, v[14], fma(b2, v[22], fma(b3, v[30],        \
+                fma(b4, v[38], fma(b5, v[46], fma(b6, v[54], b7 * v[62]))))))); \
+        pmat[gbase + uint((I) * 8 + 7)] =                                     \
+            fma(b0, v[7], fma(b1, v[15], fma(b2, v[23], fma(b3, v[31],        \
+                fma(b4, v[39], fma(b5, v[47], fma(b6, v[55], b7 * v[63]))))))); \
+    }
+#endif
+
+// One SSD per (group, candidate), lane-per-candidate as in the fused kernel, so
+// the match phase runs without any of the group kernel's state.
 void main() {
-#if defined(ENTRY_GROUP)
+#if defined(ENTRY_DIST)
+    const uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    if (wg >= uint(NG)) {
+        return;
+    }
+    const int tid = int(gl_LocalInvocationIndex);
+    const int gx = int(wg) % GX;
+    const int gy = int(wg) / GX;
+    const int x = min(gx * STEP, TEMP_C);
+    const int y = min(gy * STEP, TEMP_R);
+    const int wtop = max(y - BM_RANGE, 0);
+    const int wbottom = min(y + BM_RANGE, TEMP_R);
+    const int wleft = max(x - BM_RANGE, 0);
+    const int wright = min(x + BM_RANGE, TEMP_C);
+    const int cx = wright - wleft + 1;
+    const int area = (wbottom - wtop + 1) * cx;
+    const uint base = uint(DIST_BASE) + wg * uint(DIST_STRIDE);
+    PlaneRef refc = addr.img[ADDR_BASE];
+    // Two candidates per thread, two independent accumulators: the reference's
+    // sequential per-candidate sum is a 64-long dependency chain, and the
+    // second candidate's chain fills it.
+    if (WIN_W * WIN_W <= WIN_MAX) {
+        // Stage the whole (clamped) window once: every SSD term then reads LDS
+        // instead of the same 2 KB through L1.
+        const int ww = wright - wleft + BS;
+        const int wh = wbottom - wtop + BS;
+        for (int i = tid; i < ww * wh; i += WG) {
+            const int ry = i / ww;
+            const int rx = i - ry * ww;
+            win[ry * WIN_W + rx] = refc.v[(wtop + ry) * STRIDE + wleft + rx];
+        }
+        barrier();
+        const int ax = x - wleft;
+        const int ay = y - wtop;
+        for (int i = tid; i < area; i += 2 * WG) {
+            const int bx0 = i % cx;
+            const int by0 = i / cx;
+            dists[base + uint(i)] = block_dist_win(WIN_W, ax, ay, bx0, by0);
+            const int j = i + WG;
+            if (j < area) {
+                const int bx1 = j % cx;
+                const int by1 = j / cx;
+                dists[base + uint(j)] =
+                    block_dist_win(WIN_W, ax, ay, bx1, by1);
+            }
+        }
+    } else {
+        for (int i = tid; i < area; i += 2 * WG) {
+            const int bx0 = wleft + i % cx;
+            const int by0 = wtop + i / cx;
+            dists[base + uint(i)] = block_dist(refc, refc, x, y, bx0, by0);
+            const int j = i + WG;
+            if (j < area) {
+                const int bx1 = wleft + j % cx;
+                const int by1 = wtop + j / cx;
+                dists[base + uint(j)] =
+                    block_dist(refc, refc, x, y, bx1, by1);
+            }
+        }
+    }
+#elif defined(ENTRY_SELECT)
+    // One thread per group, a register top-K in (error, scan index) order. A
+    // warp sorts 32 groups at once, so the selection no longer costs a serial
+    // pass per group.
+    const int g = int(gl_WorkGroupID.x) * WG + int(gl_LocalInvocationIndex);
+    if (g >= NG) {
+        return;
+    }
+    const int gx = g % GX;
+    const int gy = g / GX;
+    const int x = min(gx * STEP, TEMP_C);
+    const int y = min(gy * STEP, TEMP_R);
+    const int wtop = max(y - BM_RANGE, 0);
+    const int wbottom = min(y + BM_RANGE, TEMP_R);
+    const int wleft = max(x - BM_RANGE, 0);
+    const int wright = min(x + BM_RANGE, TEMP_C);
+    const uint base = uint(DIST_BASE) + uint(g) * uint(DIST_STRIDE);
+    float be[8];
+    uint bxy[8];
+    for (int i = 0; i < 8; ++i) {
+        be[i] = 3.402823466e38f;
+        bxy[i] = 0u;
+    }
+    int idx = 0;
+    for (int yy = wtop; yy <= wbottom; ++yy) {
+        for (int xx = wleft; xx <= wright; ++xx, ++idx) {
+            const float e = dists[base + uint(idx)];
+            if (e < be[7]) {
+                // Shift-insert: strictly-smaller entries move up, so an equal
+                // error keeps the earlier scan position ahead (the reference's
+                // stable selection).
+                float ce = e;
+                uint cx2 = pack_xy(xx, yy);
+                for (int s = 0; s < 8; ++s) {
+                    const bool up = ce < be[s];
+                    const float te = be[s];
+                    const uint tx = bxy[s];
+                    be[s] = up ? ce : be[s];
+                    bxy[s] = up ? cx2 : bxy[s];
+                    ce = up ? te : ce;
+                    cx2 = up ? tx : cx2;
+                }
+            }
+        }
+    }
+    const int kept_n = min(GS, (wbottom - wtop + 1) * (wright - wleft + 1));
+    const int slot = 1 + 2 * GS;
+    // The centre block is always in the group: overwrite the best entry when
+    // the stable selection dropped it.
+    bool has = false;
+    for (int i = 0; i < kept_n; ++i) {
+        has = has || (unpack_x(bxy[i]) == x && unpack_y(bxy[i]) == y);
+    }
+    if (!has) {
+        be[0] = 0.f;
+        bxy[0] = pack_xy(x, y);
+    }
+    matches[uint(MATCH_BASE) + uint(g) * uint(slot)] = uint(kept_n);
+    for (int i = 0; i < kept_n; ++i) {
+        matches[uint(MATCH_BASE) + uint(g) * uint(slot) + uint(1 + 2 * i)] =
+            bxy[i];
+        matches[uint(MATCH_BASE) + uint(g) * uint(slot) + uint(2 + 2 * i)] = 0u;
+    }
+#elif defined(ENTRY_GRAM)
+    // Eight lanes per group, lane l taking column l of every patch row. Each
+    // lane accumulates the whole 8x8 outer-product sum over the pixels it owns
+    // and a shuffle tree then adds the eight partial matrices, so the group's
+    // lanes all end with the same matrix; storing it row-major means the eight
+    // lanes of a group write the same words, which the coalescer merges.
+    const int lane = int(gl_LocalInvocationIndex) & 7;
+    const uint graw =
+        gl_WorkGroupID.x * (WG / 8) + (gl_LocalInvocationIndex >> 3);
+    const bool glive = graw < est_count();
+    const uint gslot = min(graw, est_count() - 1u);
+    const int gn = int(
+        min(matches[uint(MATCH_BASE) + gslot * uint(1 + 2 * GS)], uint(GS)));
+    const uint gbase = uint(PMAT_BASE) + gslot * uint(PMAT_STRIDE);
+    PlaneRef gs0 =
+        addr.img[ADDR_BASE + SRC_BASE + match_layer(gslot, 0, gn)];
+    PlaneRef gs1 =
+        addr.img[ADDR_BASE + SRC_BASE + match_layer(gslot, 1, gn)];
+    PlaneRef gs2 =
+        addr.img[ADDR_BASE + SRC_BASE + match_layer(gslot, 2, gn)];
+    PlaneRef gs3 =
+        addr.img[ADDR_BASE + SRC_BASE + match_layer(gslot, 3, gn)];
+    PlaneRef gs4 =
+        addr.img[ADDR_BASE + SRC_BASE + match_layer(gslot, 4, gn)];
+    PlaneRef gs5 =
+        addr.img[ADDR_BASE + SRC_BASE + match_layer(gslot, 5, gn)];
+    PlaneRef gs6 =
+        addr.img[ADDR_BASE + SRC_BASE + match_layer(gslot, 6, gn)];
+    PlaneRef gs7 =
+        addr.img[ADDR_BASE + SRC_BASE + match_layer(gslot, 7, gn)];
+    const int gi0 = match_off(gslot, 0, gn);
+    const int gi1 = match_off(gslot, 1, gn);
+    const int gi2 = match_off(gslot, 2, gn);
+    const int gi3 = match_off(gslot, 3, gn);
+    const int gi4 = match_off(gslot, 4, gn);
+    const int gi5 = match_off(gslot, 5, gn);
+    const int gi6 = match_off(gslot, 6, gn);
+    const int gi7 = match_off(gslot, 7, gn);
+    const float ginv = 1.0 / float(gn);
+    float ga[64];
+    GZ4(0)
+    GZ4(4)
+    GZ4(8)
+    GZ4(12)
+    GZ4(16)
+    GZ4(20)
+    GZ4(24)
+    GZ4(28)
+    GZ4(32)
+    GZ4(36)
+    GZ4(40)
+    GZ4(44)
+    GZ4(48)
+    GZ4(52)
+    GZ4(56)
+    GZ4(60)
+    for (int py = 0; py < BS; ++py) {
+        const int rp = py * STRIDE;
+        for (int px = lane; px < BS; px += 8) {
+            float v[8];
+            v[0] = (0 < gn) ? gs0.v[gi0 + rp + px] : 0.0;
+            v[1] = (1 < gn) ? gs1.v[gi1 + rp + px] : 0.0;
+            v[2] = (2 < gn) ? gs2.v[gi2 + rp + px] : 0.0;
+            v[3] = (3 < gn) ? gs3.v[gi3 + rp + px] : 0.0;
+            v[4] = (4 < gn) ? gs4.v[gi4 + rp + px] : 0.0;
+            v[5] = (5 < gn) ? gs5.v[gi5 + rp + px] : 0.0;
+            v[6] = (6 < gn) ? gs6.v[gi6 + rp + px] : 0.0;
+            v[7] = (7 < gn) ? gs7.v[gi7 + rp + px] : 0.0;
+            if (RESIDUAL != 0) {
+                // The reference's subtractMean: a sequential f32 sum, then the
+                // mean is removed from every column and added back after the
+                // reconstruction.
+                const float mu =
+                    (((((((v[0] + v[1]) + v[2]) + v[3]) + v[4]) + v[5]) + v[6]) +
+                     v[7]) *
+                    ginv;
+                pmat[gbase + uint(MAT_MEAN) + uint(py * BS + px)] = mu;
+                v[0] = (0 < gn) ? v[0] - mu : 0.0;
+                v[1] = (1 < gn) ? v[1] - mu : 0.0;
+                v[2] = (2 < gn) ? v[2] - mu : 0.0;
+                v[3] = (3 < gn) ? v[3] - mu : 0.0;
+                v[4] = (4 < gn) ? v[4] - mu : 0.0;
+                v[5] = (5 < gn) ? v[5] - mu : 0.0;
+                v[6] = (6 < gn) ? v[6] - mu : 0.0;
+                v[7] = (7 < gn) ? v[7] - mu : 0.0;
+            }
+            GROW(0) GROW(1) GROW(2) GROW(3) GROW(4) GROW(5) GROW(6) GROW(7)
+        }
+    }
+    GRED(0) GRED(1) GRED(2) GRED(3) GRED(4) GRED(5) GRED(6) GRED(7)
+    GRED(8) GRED(9) GRED(10) GRED(11) GRED(12) GRED(13) GRED(14) GRED(15)
+    GRED(16) GRED(17) GRED(18) GRED(19) GRED(20) GRED(21) GRED(22) GRED(23)
+    GRED(24) GRED(25) GRED(26) GRED(27) GRED(28) GRED(29) GRED(30) GRED(31)
+    GRED(32) GRED(33) GRED(34) GRED(35) GRED(36) GRED(37) GRED(38) GRED(39)
+    GRED(40) GRED(41) GRED(42) GRED(43) GRED(44) GRED(45) GRED(46) GRED(47)
+    GRED(48) GRED(49) GRED(50) GRED(51) GRED(52) GRED(53) GRED(54) GRED(55)
+    GRED(56) GRED(57) GRED(58) GRED(59) GRED(60) GRED(61) GRED(62) GRED(63)
+    if (glive) {
+        GST(0) GST(1) GST(2) GST(3) GST(4) GST(5) GST(6) GST(7)
+        GST(8) GST(9) GST(10) GST(11) GST(12) GST(13) GST(14) GST(15)
+        GST(16) GST(17) GST(18) GST(19) GST(20) GST(21) GST(22) GST(23)
+        GST(24) GST(25) GST(26) GST(27) GST(28) GST(29) GST(30) GST(31)
+        GST(32) GST(33) GST(34) GST(35) GST(36) GST(37) GST(38) GST(39)
+        GST(40) GST(41) GST(42) GST(43) GST(44) GST(45) GST(46) GST(47)
+        GST(48) GST(49) GST(50) GST(51) GST(52) GST(53) GST(54) GST(55)
+        GST(56) GST(57) GST(58) GST(59) GST(60) GST(61) GST(62) GST(63)
+    }
+#elif defined(ENTRY_SOLVE)
+    // One thread per group. The 8x8 Gram matrix, the eigenvectors and every
+    // rotation index live in registers, which is why the sweep is written out
+    // over its 28 pairs.
+    const uint sr = gl_WorkGroupID.x * WG + gl_LocalInvocationIndex;
+    if (sr >= est_count()) {
+        return;
+    }
+    const uint gbase = uint(PMAT_BASE) + sr * uint(PMAT_STRIDE);
+    const int sn = int(
+        min(matches[uint(MATCH_BASE) + sr * uint(1 + 2 * GS)], uint(GS)));
+    float g[64];
+    float v[64];
+    LD4(g, gbase, 0) LD4(g, gbase, 4) LD4(g, gbase, 8) LD4(g, gbase, 12)
+    LD4(g, gbase, 16) LD4(g, gbase, 20) LD4(g, gbase, 24) LD4(g, gbase, 28)
+    LD4(g, gbase, 32) LD4(g, gbase, 36) LD4(g, gbase, 40) LD4(g, gbase, 44)
+    LD4(g, gbase, 48) LD4(g, gbase, 52) LD4(g, gbase, 56) LD4(g, gbase, 60)
+    Z4(v, 0) Z4(v, 4) Z4(v, 8) Z4(v, 12)
+    Z4(v, 16) Z4(v, 20) Z4(v, 24) Z4(v, 28)
+    Z4(v, 32) Z4(v, 36) Z4(v, 40) Z4(v, 44)
+    Z4(v, 48) Z4(v, 52) Z4(v, 56) Z4(v, 60)
+    v[0] = 1.0;
+    v[9] = 1.0;
+    v[18] = 1.0;
+    v[27] = 1.0;
+    v[36] = 1.0;
+    v[45] = 1.0;
+    v[54] = 1.0;
+    v[63] = 1.0;
+    for (int sweep = 0; sweep < SWEEPS; ++sweep) {
+        JSWEEP
+    }
+    const float l0 = max(g[0], 0.0);
+    const float l1 = max(g[9], 0.0);
+    const float l2 = max(g[18], 0.0);
+    const float l3 = max(g[27], 0.0);
+    const float l4 = max(g[36], 0.0);
+    const float l5 = max(g[45], 0.0);
+    const float l6 = max(g[54], 0.0);
+    const float l7 = max(g[63], 0.0);
+    // Which value holds rank 0 of the descending order (equal values keep the
+    // earlier index ahead, as the reference's selection sort does). Only the
+    // first place matters: it is the one the shrink protects.
+    const bool top0 = (l0 >= l1) && (l0 >= l2) && (l0 >= l3) && (l0 >= l4) &&
+                      (l0 >= l5) && (l0 >= l6) && (l0 >= l7);
+    const bool top1 = (l1 > l0) && (l1 >= l2) && (l1 >= l3) && (l1 >= l4) &&
+                      (l1 >= l5) && (l1 >= l6) && (l1 >= l7);
+    const bool top2 = (l2 > l0) && (l2 > l1) && (l2 >= l3) && (l2 >= l4) &&
+                      (l2 >= l5) && (l2 >= l6) && (l2 >= l7);
+    const bool top3 = (l3 > l0) && (l3 > l1) && (l3 > l2) && (l3 >= l4) &&
+                      (l3 >= l5) && (l3 >= l6) && (l3 >= l7);
+    const bool top4 = (l4 > l0) && (l4 > l1) && (l4 > l2) && (l4 > l3) &&
+                      (l4 >= l5) && (l4 >= l6) && (l4 >= l7);
+    const bool top5 = (l5 > l0) && (l5 > l1) && (l5 > l2) && (l5 > l3) &&
+                      (l5 > l4) && (l5 >= l6) && (l5 >= l7);
+    const bool top6 = (l6 > l0) && (l6 > l1) && (l6 > l2) && (l6 > l3) &&
+                      (l6 > l4) && (l6 > l5) && (l6 >= l7);
+    const bool top7 = (l7 > l0) && (l7 > l1) && (l7 > l2) && (l7 > l3) &&
+                      (l7 > l4) && (l7 > l5) && (l7 > l6);
+    const float cc = (8.0 * sqrt(2.0 * float(sn)) * SIGMA) * SIGMA;
+    float kept = 0.0;
+    float f0, f1, f2, f3, f4, f5, f6, f7;
+    GAIN(f0, l0, top0) GAIN(f1, l1, top1) GAIN(f2, l2, top2) GAIN(f3, l3, top3)
+    GAIN(f4, l4, top4) GAIN(f5, l5, top5) GAIN(f6, l6, top6) GAIN(f7, l7, top7)
+    MROW(0, f0, f1, f2, f3, f4, f5, f6, f7)
+    MROW(1, f0, f1, f2, f3, f4, f5, f6, f7)
+    MROW(2, f0, f1, f2, f3, f4, f5, f6, f7)
+    MROW(3, f0, f1, f2, f3, f4, f5, f6, f7)
+    MROW(4, f0, f1, f2, f3, f4, f5, f6, f7)
+    MROW(5, f0, f1, f2, f3, f4, f5, f6, f7)
+    MROW(6, f0, f1, f2, f3, f4, f5, f6, f7)
+    MROW(7, f0, f1, f2, f3, f4, f5, f6, f7)
+    pmat[gbase + uint(MAT_WEIGHT)] =
+        (ADAPTIVE != 0 && kept > 0.0) ? 1.0 / kept : 1.0;
+#elif defined(ENTRY_APPLY)
+    // Eight lanes per group, lane l taking column l of every patch row: each
+    // pixel needs all eight patch values and produces all eight output
+    // columns, so both the loads and the atomics land on consecutive words.
+    const int lane = int(gl_LocalInvocationIndex) & 7;
+    const uint araw =
+        gl_WorkGroupID.x * (WG / 8) + (gl_LocalInvocationIndex >> 3);
+    if (araw >= est_count()) {
+        return;
+    }
+    const uint aslot = araw;
+    const int an = int(
+        min(matches[uint(MATCH_BASE) + aslot * uint(1 + 2 * GS)], uint(GS)));
+    const uint gbase = uint(PMAT_BASE) + aslot * uint(PMAT_STRIDE);
+    const float wgt = pmat[gbase + uint(MAT_WEIGHT)];
+    float am[64];
+    LD4(am, gbase, 0) LD4(am, gbase, 4) LD4(am, gbase, 8) LD4(am, gbase, 12)
+    LD4(am, gbase, 16) LD4(am, gbase, 20) LD4(am, gbase, 24) LD4(am, gbase, 28)
+    LD4(am, gbase, 32) LD4(am, gbase, 36) LD4(am, gbase, 40) LD4(am, gbase, 44)
+    LD4(am, gbase, 48) LD4(am, gbase, 52) LD4(am, gbase, 56) LD4(am, gbase, 60)
+    const int al0 = match_layer(aslot, 0, an);
+    PlaneRef as0 = addr.img[ADDR_BASE + SRC_BASE + al0];
+    const int al1 = match_layer(aslot, 1, an);
+    PlaneRef as1 = addr.img[ADDR_BASE + SRC_BASE + al1];
+    const int al2 = match_layer(aslot, 2, an);
+    PlaneRef as2 = addr.img[ADDR_BASE + SRC_BASE + al2];
+    const int al3 = match_layer(aslot, 3, an);
+    PlaneRef as3 = addr.img[ADDR_BASE + SRC_BASE + al3];
+    const int al4 = match_layer(aslot, 4, an);
+    PlaneRef as4 = addr.img[ADDR_BASE + SRC_BASE + al4];
+    const int al5 = match_layer(aslot, 5, an);
+    PlaneRef as5 = addr.img[ADDR_BASE + SRC_BASE + al5];
+    const int al6 = match_layer(aslot, 6, an);
+    PlaneRef as6 = addr.img[ADDR_BASE + SRC_BASE + al6];
+    const int al7 = match_layer(aslot, 7, an);
+    PlaneRef as7 = addr.img[ADDR_BASE + SRC_BASE + al7];
+    const int ai0 = match_off(aslot, 0, an);
+    const int ai1 = match_off(aslot, 1, an);
+    const int ai2 = match_off(aslot, 2, an);
+    const int ai3 = match_off(aslot, 3, an);
+    const int ai4 = match_off(aslot, 4, an);
+    const int ai5 = match_off(aslot, 5, an);
+    const int ai6 = match_off(aslot, 6, an);
+    const int ai7 = match_off(aslot, 7, an);
+    const int adest = fold_dest(aslot);
+    const bool use0 = adest < 0 || al0 == adest;
+    const bool use1 = adest < 0 || al1 == adest;
+    const bool use2 = adest < 0 || al2 == adest;
+    const bool use3 = adest < 0 || al3 == adest;
+    const bool use4 = adest < 0 || al4 == adest;
+    const bool use5 = adest < 0 || al5 == adest;
+    const bool use6 = adest < 0 || al6 == adest;
+    const bool use7 = adest < 0 || al7 == adest;
+    const int ao0 = match_out(aslot, 0, an);
+    const int ao1 = match_out(aslot, 1, an);
+    const int ao2 = match_out(aslot, 2, an);
+    const int ao3 = match_out(aslot, 3, an);
+    const int ao4 = match_out(aslot, 4, an);
+    const int ao5 = match_out(aslot, 5, an);
+    const int ao6 = match_out(aslot, 6, an);
+    const int ao7 = match_out(aslot, 7, an);
+    for (int py = 0; py < BS; ++py) {
+        const int rp = py * STRIDE;
+        const int orow = py * W;
+        for (int px = lane; px < BS; px += 8) {
+            const float mu = (RESIDUAL != 0)
+                                 ? pmat[gbase + uint(MAT_MEAN) +
+                                        uint(py * BS + px)]
+                                 : 0.0;
+            float a0 = (0 < an) ? as0.v[ai0 + rp + px] - mu : 0.0;
+            float a1 = (1 < an) ? as1.v[ai1 + rp + px] - mu : 0.0;
+            float a2 = (2 < an) ? as2.v[ai2 + rp + px] - mu : 0.0;
+            float a3 = (3 < an) ? as3.v[ai3 + rp + px] - mu : 0.0;
+            float a4 = (4 < an) ? as4.v[ai4 + rp + px] - mu : 0.0;
+            float a5 = (5 < an) ? as5.v[ai5 + rp + px] - mu : 0.0;
+            float a6 = (6 < an) ? as6.v[ai6 + rp + px] - mu : 0.0;
+            float a7 = (7 < an) ? as7.v[ai7 + rp + px] - mu : 0.0;
+            const int row = orow + px;
+            ADOT(0, ao0, use0) ADOT(1, ao1, use1) ADOT(2, ao2, use2)
+            ADOT(3, ao3, use3) ADOT(4, ao4, use4) ADOT(5, ao5, use5)
+            ADOT(6, ao6, use6) ADOT(7, ao7, use7)
+        }
+    }
+#elif defined(ENTRY_GROUP)
     const uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
     if (wg >= uint(NG)) {
         return;
@@ -873,14 +1590,14 @@ void main() {
     const int x = min(gx * STEP, TEMP_C);
     const int y = min(gy * STEP, TEMP_R);
     if (RADIUS == 0) {
-        run_group(wg, x, y, 0, 0);
+        run_group(wg, x, y, 0, 0, 0);
     } else {
         for (int i = 0; i <= 2 * RADIUS; ++i) {
             const int cm = clamp(pc.pn - RADIUS + i, 0, pc.frames - 1);
             const int slab = clamp(2 * RADIUS - i,
                                    pc.pn - pc.frames + 1 + RADIUS,
                                    pc.pn + RADIUS);
-            run_group(wg, x, y, cm - pc.pn + RADIUS, slab);
+            run_group(wg, x, y, cm - pc.pn + RADIUS, slab, i);
         }
     }
 #elif defined(ENTRY_FINISH)

@@ -1,158 +1,224 @@
 # WNNM — notes
 
-Status: **iterating**. The first GPU port ships and matches the reference; it is
-now 5.2x slower than vszip's CPU filter, and the block-match bookkeeping is the
-remaining cost. Port of `reference/vapoursynth-zip` (`src/filters/wnnm.zig`,
-`src/vapoursynth/wnnm.zig`), which is CPU-only (vszipcl/vszipcu have no WNNM);
-the parallel Jacobi layout is borrowed from `reference/vapoursynth-nssfactory`
-(`src/cuda/common/block_jacobi.cuh`), which is CUDA-only.
+Status: **shipped**. Port of `reference/vapoursynth-zip` (`src/filters/wnnm.zig`,
+`src/vapoursynth/wnnm.zig`); vszipcl/vszipcu never had a GPU WNNM. Everything is
+**f32**: the estimate is a three-kernel split (Gram, eigen step, scatter), the
+spatial match a distance kernel plus a one-thread-per-group register top-8, and
+temporal mode publishes the fused matcher's selection for the same three
+kernels. `group_size > 8` still runs the fused kernel.
 
-One workgroup per reference block on a `step` lattice: block match (`bm_range`
-window, optional temporal search), WNNM shrinkage of the group's patch matrix,
-weighted scatter. Gram matrix, Jacobi and shrink factors are f64 like the
-reference; the reconstruction is f32.
-
-| config | vsfeel | vszip |
+| config (jpbd 1080p, `sigma=3`, 5 s medians) | vsfeel | vszip |
 |---|---|---|
-| jpbd 1080p GRAYS f32, `sigma=3`, radius=0, 5 s medians | 40.83 fps | 210.91 fps |
+| chroma U/V, `radius=1` (the benchmark default) | 99.5 fps | 210.9 fps |
+| chroma U/V, radius=0 | **1615 fps** | 408 fps |
+| luma, radius=0 | **1291 fps** | 204 fps |
+
+The radius=1 row is what the matcher costs: the same content at radius=0 is 16x
+faster, and the difference is the fused predictive search's serial bookkeeping
+(see Open work).
+
+Accuracy, against vszip and against an independent f64 exact-SVD oracle
+(320x240 / 640x360, `sigma=3`; max abs diff, "bad" = pixels over 1e-5):
+
+| | vs vszip | vs f64 exact oracle |
+|---|---|---|
+| vsfeel (default) | 2.9e-3 (640x360) | 3.1e-5, 47 bad |
+| nssfactory CPU (`nss.WNNM`, built from `reference/vapoursynth-nssfactory`) | 4.7e-3, 889 bad | same |
+
+The port is f32 end to end; there is no f64 path any more.
 
 ## Implementation
 
-- `src/wnnm.cpp` (host) + `src/wnnm.comp` (one module, `-DENTRY_GROUP` /
-  `-DENTRY_FINISH`). f32 input only, like the reference.
-- One dispatch covers the whole plane: `gx*gy` workgroups, one per lattice point
-  `(min(k*step, W-bs), ...)`. Per-frame `gpu_frame_buffer` scratch: the weighted
-  accumulator (`num`/`den`), the group patch matrix, and (temporal) the
-  per-group search-location list; the source planes travel as a host-written
-  address table because a temporal window reaches `4*radius+1` buffers.
-- Matching is the reference's streaming top-k: candidates are scanned in
-  `(y, x)` order in tiles, one thread per candidate computing the sequential f32
-  SSD, thread 0 inserting into a sorted list with the reference's strict-`<`
-  stable rule. That reproduces `selectTopIdx`, including the all-equal-window
-  case where the first k in scan order win.
-- Group size `n` may be below `group_size` (small frames, `bm_range=0`); the same
-  path handles it, and the centre block is forced into slot 0 when the selection
-  dropped it, exactly like the reference.
-- Eigen path: Gram in f64 (fma, element order as `gramAtA`/`gramAAt`), then a
-  **round-robin parallel Jacobi** in f64: a round rotates a schedule of disjoint
-  index pairs, so its rotations commute and one warp applies all of them at
-  once, with the rotations themselves computed by the first half-warp (the
-  whole workgroup runs the barriers). `v <- v J` accumulates the eigenvectors as
-  its *columns*, so the q x q block is transposed once before the sort, which
-  still permutes rows; the eigenvalues are `max(diagonal, 0)` sorted descending.
-  Reconstruction folds `V diag(r) V^T` into one f32 matrix and scatters
-  `sum_kk A[p][kk] * M[kk][j]`.
-- Odd `q` still takes the reference's serial rotation order (one thread): the
-  round-robin does not converge when its schedule is padded to an even index
-  count. Even `q` is every default and every test case that is not `group_size`
-  3/5/7/9/..., where the serial path costs the old ~63 ms. The two paths share
-  the padded stride `q + (q & 1)`.
-- `residual` subtracts the group's per-pixel mean (sequential f32 sum, divide,
-  subtract), filters, and adds it back in the scatter.
-- Temporal (`radius>0`): the reference writes a tall raw frame per centre frame
-  and a second filter folds slabs; at 1080p that is hundreds of MB per frame.
-  This port recomputes a centre frame's group for each output frame that consumes
-  it, so `2*radius+1` times the spatial work and no cross-frame cache. The fold's
-  per-`i` `(frame, slab)` pairs are reproduced including the clipped boundaries,
-  where the reference reads one slab twice.
-- `q = min(bs^2, group_size)` picks a `-DQMAX` 8/16/32 shader variant; q > 32 is
-  rejected (the reference allows 64). f64 is used when the device reports
-  shaderFloat64, else the f32 variant (`VSFEEL_WNNM_NOF64=1` forces it).
-- Scratch is budgeted at creation against the core's VRAM allowance.
+- `src/wnnm.cpp` (host) + `src/wnnm.comp`: one shader module with
+  `-DENTRY_GRAD/…` variants selected by `-D`. f32 input only, like the
+  reference. One workgroup per reference block on a `step` lattice; the block
+  position is `min(k*step, W-bs)` on both axes, which is what the reference's
+  `while (_x < temp_c + step)` lattice does.
+- **Spatial match phase** (radius 0), two kernels:
+  `ENTRY_DIST` writes one SSD per (group, candidate) with 128 threads per group
+  and two candidates per thread, `ENTRY_SELECT` reads them back with one thread
+  per group into a register top-8 (a warp sorts 32 groups at once) and writes
+  `{count, xy, t}` groups. The strict-`<` shift-insert reproduces
+  `selectTopIdx`'s stable `(error, scan index)` order, and the centre block is
+  forced into slot 0 when the selection dropped it.
+- **Temporal match** (`radius > 0`): the predictive search is inherently
+  sequential (each layer seeds from the previous layer's selection) and stays in
+  the fused kernel, which now stops after the selection and publishes one match
+  record per fold with the *absolute* address-table layer of each patch.
+- **Estimate phase** (any radius, `group_size <= 8`), three kernels over
+  `NG * (2*radius+1)` slots, so each phase runs at the width its work needs:
+  - `ENTRY_GRAM`: 8 lanes per group, lane l takes column l of every patch row.
+    Each lane accumulates the whole 8x8 outer-product sum over its pixels and a
+    three-step `subgroupShuffleXor` tree adds the eight partial matrices, so all
+    eight lanes end with the same matrix and store it row-major.
+  - `ENTRY_SOLVE`: one thread per group. The Gram, the eigenvectors and every
+    rotation index are **registers**: the sweep is written out over its 28 pairs
+    (`JSWEEP`) because one dynamic index moves both 64-float arrays to local
+    memory. 20 sweeps, branch-free rotations, and the four corner elements set
+    from the closed form (`app - h`, `ajj + h`, zeros) rather than rotated. No
+    sorting: the shrink only needs to know which value holds rank 0 (`top0…`),
+    since `M = sum_k gain_k v_k v_k^T` is order-free, and a value's gain is
+    `1` for rank 0 or `(s + sqrt(s^2 - c)) / 2s` while `s^2 - c > 0`.
+  - `ENTRY_APPLY`: 8 lanes per group, lane l taking column l of every patch row
+    so both the patch loads and the atomics are consecutive words; all eight
+    output columns come from the 64-entry `M` in registers. A temporal fold
+    scatters only the patches whose source layer is its own destination slab
+    (`fold_dest`, recomputed from the fold index and the push constants), which
+    is how the reference's VAggregate hands each output one slab.
+  - Scratch: `kSplitStride` 136 floats per group (`[0,64)` Gram then M,
+    `[64,128)` the residual mean, `[128]` the aggregation weight), in the same
+    per-frame buffer the fused path uses for its patch matrix.
+- **Fused path** (`group_size > 8`), one workgroup per group:
+  streaming top-k match, Gram, the reference's round-robin parallel Jacobi in
+  f64 (from `reference/vapoursynth-nssfactory/src/cuda/common/block_jacobi.cuh`,
+  mechanism only), shrink, `V diag(r) V^T`, scatter. Odd `q` takes the
+  reference's serial rotation order: the padded round-robin does not converge.
+- `residual` subtracts each pixel's mean over the group (sequential f32 sum,
+  divide, subtract) and adds it back in the scatter.
+- Temporal (`radius > 0`) recomputes a centre frame's group per consuming output
+  (the reference stages tall raw frames instead), reproducing the VAggregate
+  fold's `(frame, slab)` pairs including the clipped boundaries, which read some
+  slabs twice.
+- `q = min(bs^2, group_size)` picks a `-DQMAX` 8/16/32 variant; q > 32 is
+  rejected (the reference allows 64). Scratch is budgeted against the core's VRAM
+  allowance at creation.
+
+### Numerics
+
+The f32 estimate reproduces vszip's f64 *decisions* except where an eigenvalue
+sits within ~1e-5 of the shrink threshold, which happens on ~0.2% of groups and
+moves the affected pixels by up to 1.4e-2 (typically ~3e-3). That is a deliberate
+trade for 13.5x on the whole frame, and the bound is documented in the tests
+(`REF_TOL`). The default-parameter error against an f64 exact-SVD oracle is
+3.1e-5 with 47 bad pixels at 640x360, i.e. 150x closer than the nssfactory CPU
+reference (4.7e-3, 889 bad); `REF_TOL` keeps both references' own spread visible.
 
 ### Tests
 
-`tests/test_wnnm.py`: reference parity against `vszip.WNNM` (spatial sweep,
-`rclip`, per-plane sigma, `residual`, `adaptive_aggregation`, starved and tiny
-frames, odd geometry, temporal with the boundary fold, all-planes temporal),
-self-consistency (determinism, parallel load, request order, frame props, GPU
-chaining), creation variants (QMAX, eigen precision) and every error path.
-Measured max abs diff vs the reference: 1.8e-7 (defaults) to 7.7e-7
-(`bs6/step3/gs16/residual`); the bound is 5e-6. The f32 eigen path differs by
-1.2e-5 on a 64x48 crop but 2.2e-3 on 640x360 (a shrink decision flips), so its
-test allows 5e-3.
+`tests/test_wnnm.py`: parity against `vszip.WNNM` (spatial sweep, `rclip`,
+per-plane sigma, `residual`, `adaptive_aggregation`, starved and tiny frames, odd
+geometry, temporal with the boundary fold), the f64 path at `EXACT_TOL` 5e-6
+(`VSFEEL_WNNM_NOSPLIT`), self-consistency (determinism, parallel load, request
+order, frame props, GPU chaining), creation variants and every error path.
 
 ## Performance
 
-- **The round-robin Jacobi is worth 3.77x** (ABBA, same session, n=6, benchmark
-  defaults): 11.04 -> 41.57 fps. It replaced a serial chain of ~28 dependent
-  f64 rotations per sweep (two divisions and two square roots each) that one
-  lane executed while the other 31 sat at the barriers.
-- Cost split before the round-robin (1080p GRAYS f32 `sigma=3`, scratch
-  ablations, 12-frame screens): Jacobi 63 ms of 86 ms, match bookkeeping
-  13.3 ms, SSD 4 ms, patch load + Gram + M 4.3 ms, scatter 1.4 ms. After it,
-  the frame is ~24 ms and the search bookkeeping (~13 ms) is ~half: the matcher
-  is the next target, not the estimate.
-- `bm_range` 3 vs 7 was flat even when the Jacobi dominated; `group_size=1` and
-  `bm_range=0` collapse to the trivial 1x1 estimate and were 5x faster, which is
-  what pointed at the estimate path in the first place.
-- The Jacobi's sweep count barely matters once parallel: 1/3/5/10/30 sweep caps
-  gave 33.6/14.8/11.9/11.6/10.8 fps on the old serial chain, i.e. the dependent
-  chain, not the number of sweeps, was the cost.
-- The remaining estimate cost is now small enough that the serial top-k insert
-  is the frame; a parallel selection (the reference's block top-k over a shared
-  chunk buffer, or an 8-lane private-list tournament like BM3D's) is the next
-  round.
+- Frame at 1080p defaults is 0.78 ms: **match ~0.33 ms, estimate 0.41 ms**
+  (same-session A/B against `VSFEEL_WNNM_SKIPGROUP=1`, after the staging took the
+  match phase from 0.50 ms).
+- Staging the search window in LDS is worth 1.17x on the whole frame (ABBA,
+  n=12: 1140 -> 1329 fps): the SSD's two global loads per term become two LDS
+  loads out of a 2 KB window that the whole workgroup shares.
+- The three-kernel split took the estimate from 0.74 ms (one 32-thread
+  workgroup per group, fused) to 0.41 ms, and 815 -> 1100 fps, because the eigen
+  step gets a whole thread per group with the matrices in registers instead of
+  one warp cooperating over LDS.
+- f32 is **13.5x** the f64 estimate (ABBA, n=8: 41.8 vs 553.5 fps when the frame
+  was 24 ms), which is why there is no f64 path at all now; sizing the fused
+  group kernel to 32 threads was another 553 -> 815.
+- Porting the split estimate to temporal took the chroma `radius=1` default from
+  24.5 to 99.5 fps: the estimate was the fused kernel's f64 half there too.
+- The scatter is *free*: replacing both atomics with a plain store gave 769 vs
+  814 fps (noise). Do not spend effort on fixed-point accumulation or den
+  box-summing.
+- Match cost is bounds-checked: `bm_range` 3 vs 7 was flat when the Jacobi
+  dominated, so the window size is not what makes the matcher slow; it is one
+  global load pair per SSD term.
+- `group_size=1` and `bm_range=0` collapse to a 1x1/1x1 estimate and are 5x
+  faster, which is what pointed at the estimate path in the first place.
 
 ## Historical
 
-- **2026-10-23 — round-robin Jacobi (+3.77x).** The nssfactory CUDA WNNM takes
-  its SVD through the Gram matrix with FP32 and a warp-cooperative rotation
-  schedule; this round kept the f64 arithmetic (an f32 eigen path is measurably
-  too far from the reference, below) and replaced only the rotation loop with
-  that schedule. Two porting traps: the schedule needs an even index count, so
-  odd `q` pads the stride and still takes the serial order; and the parallel
-  version accumulates `v <- v J` where the reference accumulates `J^T v`, so
-  the eigenvectors arrive as columns and need one transpose before the sort. A
-  missing barrier between "zero v" and "set its diagonal" corrupted the identity
-  as well. Reading the reference's precision note was worth it for the
-  mechanism, not the precedent: their f32 claim does not hold against *vszip*
-  (see the f32 experiment below).
-- **2026-10-23 — f32 eigen path is not accurate enough against vszip.** f32
-  Gram/Jacobi gives 1.1e-5 on a 64x48 crop but 2.2e-3 on 640x360, so the bound
-  for `VSFEEL_WNNM_NOF64` is 5e-3. Feeding the f32 *vectors* to f64 Rayleigh
-  quotients for the eigenvalues does not rescue it (2.17e-3): `kept` matched the
-  f64 path on all 300 groups of a 160x120 crop, but 30 of them had an M
-  difference > 1e-5 (worst 7.4e-5), because a near-degenerate pair straddling
-  the shrink threshold rotates its f32 basis enough to move the reconstruction.
-  The decision is not the only f32-sensitive quantity, so f64 stays.
-- **2026-10-23 — first port.** A numpy prototype of the planned GPU arithmetic
-  picked the numbers: f64 Gram+Jacobi with an f32 `V diag(r) V^T` reconstruction
-  is 1.8e-7 from vszip on 64x48, while an f32 Jacobi reaches 1.1e-5 there
-  (shrink decisions flip), so the eigen path stayed f64. The prototype also
-  fixed two reading errors: the VAggregate slab for output `n` in centre frame
-  `m` is `n-m+r` (not `m-n+r`), and the fold's clipped boundaries read some
-  `(frame, slab)` pairs twice, which a per-`(centre, output)` recompute must
-  reproduce. Three kernel bugs then showed up as 1e-3..1e-1 diffs: the temporal
-  seed list was not restored at each direction (`b.center` in the reference),
-  the stable merge filled from the wrong end, and the plane base offsets were
-  byte counts where the kernels index elements.
+- **2026-10-24 - f32 only, and the benchmark measures chroma + `radius=1`.** The
+  benchmark now mirrors the filter's real use (`sigma=[0, s, s]` on the f32 clip,
+  temporal search): 24.5 fps with the fused f64 estimate, 83 with the same kernel
+  in f32, 99.5 with the split estimate on all folds. Deleting f64 removed the
+  `EIG_DOUBLE` variants, `VSFEEL_WNNM_NOF64` and the `shaderFloat64` device flag.
+  Two traps: the temporal match record must be keyed by *fold index* (the
+  clamped centre can repeat), and the fold's destination slab has to filter the
+  scatter, or the three folds average instead of accumulating.
+- **2026-10-24 - LDS staging for the matcher (+17%).** The distance kernel read
+  both patch pixels through L1 for every term. Staging the clamped search window
+  (1024 floats = 4 KB, shared by the workgroup's 128 threads) took 1140 -> 1329
+  fps. Windows above 32x32 (bm_range > 12 at bs 8) keep the global path: the
+  test folds at pipeline creation because both sizes are spec constants.
+- **2026-10-24 - the split estimate and the f32 decision.** Three kernels
+  (Gram / solve / apply) plus a one-thread-per-group register Jacobi took the
+  estimate from 0.74 to 0.41 ms and 815 -> 1100 fps; the f32 solve was chosen
+  after measuring that f64 was 13.5x. Two bugs worth remembering: the lane
+  partials were per-lane *rows* of the Gram, which no shuffle can reduce (each
+  lane must own the whole outer-product sum), and a rotation must set the four
+  corner elements from the closed form after the column and row passes, because
+  both passes touch them. 16 sweeps is not converged in f32 (2.4e-3 output
+  error); 20 is, and 24/30 give the identical answer.
+- **2026-10-24 - the references are not identical, and vszip is the accurate
+  one.** Building the nssfactory CPU plugin (`.scratch/nss`,
+  `cmake -DNSS_BUILD_CPU=ON`) and diffing it against vszip showed 1.1e-6
+  agreement on small frames but 4.7e-3 / 889 pixels at 640x360, up to 2.0e-2
+  with `sigma=10`. An independent f64 exact-SVD implementation of the same
+  algorithm (`.scratch/nss/oracle2.py`, added as mode E of
+  `.scratch/wnnm/proto.py`) matches **vszip to 1.8e-7 and the f64 port to
+  1.8e-7, but nss by 4.7e-3**: where they disagree, nss's f32 SVD is the one
+  that is wrong. So matching vszip is matching the algorithm, and the f32
+  estimate's 3.1e-5 is still two orders closer than the "trusted" oracle.
+- **2026-10-23 - round-robin Jacobi (3.77x).** The nssfactory schedule replaced a
+  serial chain of ~28 dependent f64 rotations per sweep: 11.04 -> 41.57 fps
+  (ABBA, n=6). Two traps: the schedule needs an even index count, so odd `q`
+  pads the stride and keeps the serial order, and the parallel form accumulates
+  `v <- v J` where the reference accumulates `J^T v`, so the eigenvectors arrive
+  as columns and need one transpose before the sort.
+- **2026-10-23 - f32 was rejected on the old kernel, and that verdict is void for
+  the new one.** With the fused f64-era kernel, f32 Gram/Jacobi gave 1.1e-5 on
+  64x48 but 2.2e-3 on 640x360 against vszip, and feeding f32 vectors to f64
+  Rayleigh quotients did not rescue it (2.17e-3) because a near-degenerate pair
+  straddling the threshold rotates the f32 basis itself. The *mechanism* stands,
+  but the current f32 split reaches 3.1e-5 against the exact oracle, so the new
+  arithmetic is not the old arithmetic; the difference is the branch-free
+  20-sweep register Jacobi with the corner corrections.
+- **2026-10-23 - first port.** A numpy prototype picked the arithmetic and
+  fixed two reading errors of the temporal fold (the slab index is `n-m+r`, and
+  the clipped boundaries read some `(frame, slab)` pairs twice); three kernel
+  bugs then showed up as 1e-3..1e-1 diffs: the temporal seed list was not
+  restored per direction, the stable merge filled from the wrong end, and the
+  plane base offsets were byte counts where the kernels index elements.
+- **Void, do not quote.** All per-phase numbers taken on 12-frame vspipe
+  "screens" before this round are garbage: they said the match phase was 15 ms of
+  24 ms when the graded A/B said 0.5 ms. The screens swing 10-25% and one of
+  them misattributed the whole frame.
 
 ## Open work
 
-- **Parallelise the top-k.** The serial insert (thread 0 over up to 225
-  candidates) is now ~half the frame. Two proven shapes exist in the references:
-  a block-wide sort of a shared candidate chunk (nssfactory's `topk.cuh`, a
-  radix sort on CUDA, a bitonic here) and BM3D's 8-lane private top-8 with a
-  shuffle tournament. The tie order must stay `(error, scan index)`.
-- **Make odd `q` take the round-robin path.** Its padded schedule does not
-  converge there; the serial fallback keeps it correct at the old cost.
-- A separate solve kernel (one warp per group, `M`/Gram/match handoff through
-  scratch) would fit ~2-3x more Jacobi warps per CU than the fused kernel's
-  LDS-bound occupancy. The nssfactory layout is match+Gram / solve / apply.
-- Temporal recompute is `2r+1` times the work; a raw-frame scratch ring (the
-  reference's tall frames) or a merged multi-output dispatch is the fix.
-- The patch matrix lives in global scratch; a small-config LDS variant would cut
-  the Gram/reconstruction traffic.
+- **The temporal matcher is the whole gap on the default workload.** Chroma
+  `radius=1` is 99.5 fps against the same content's 1615 at radius=0; shrinking
+  the predictive search (`ps_range=1, ps_num=1`) gives 154 and `bm_range=1` 176,
+  so it is the search volume times the *serial* bookkeeping (one thread runs
+  `generate_locs` and the sorted-list insert for every candidate of every
+  layer). A rank-based parallel selection over the candidate tile would fix it
+  the same way the split matcher fixed the spatial case.
+- **The spatial matcher is still ~40% of its frame (~0.33 ms).** Its SSDs read both
+  patches from LDS but the *reference* block is re-read for every candidate, and
+  the 225 distances per group go out to a 52 MB array and come back. The shape
+  that removes both (nssfactory `match.cu`, `spatial_match_warp_kernel`) is one
+  warp per reference, the reference block in registers, the top-K by warp-wide
+  argmin and no distance array at all.
+- `group_size > 8` and `radius > 0` still take the fused f64 kernel, i.e. tens of
+  fps, not 1100. Porting the split estimate to `q = 16/32` needs a different
+  eigen step: 16x16 f32 no longer fits in registers (nssfactory switches to
+  16 lanes per group over equivalent LDS).
+- Temporal recompute is `2r+1` times the spatial work; a raw-frame scratch ring
+  or a merged multi-output dispatch is the fix.
+- The f64 path exists only as the fused kernel at ~82 fps. If exactness ever
+  needs to be fast, the f64 Rayleigh quotient over an f64 Gram in the split
+  solve costs ~0.17 ms (prototype mode D measured 1.04e-5 end to end).
 - q > 32 is rejected (LDS eigen workspace); the reference allows 64.
-- The serial top-k insert is one thread; a parallel selection would need the
-  same stable tie order.
 
 ## Debug env vars
 
-- `VSFEEL_WNNM=1` — creation banner (per-plane geometry, bases, qmax, eigen
-  precision) and the CAS-accumulator notice.
-- `VSFEEL_WNNM_TIMING=1` — per-frame host split (acquire/record/submit).
-- `VSFEEL_WNNM_DUMP=<frame>` — dump each centre's selected group (errors,
+- `VSFEEL_WNNM=1` - creation banner (per-plane geometry, scratch bases, qmax).
+- `VSFEEL_WNNM_TIMING=1` - per-frame host split (acquire/record/submit).
+- `VSFEEL_WNNM_DUMP=<frame>` - dump each centre's selected group (errors,
   positions, temporal slot, kept count, weight) to stderr.
-- `VSFEEL_WNNM_NOF64=1` — force the f32 eigen path.
+- `VSFEEL_WNNM_NOSPLIT=1` - take the fused kernel for the split path's configs
+  too (the `group_size > 8` code path).
+- `VSFEEL_WNNM_SKIPMATCH=1` / `VSFEEL_WNNM_SKIPGROUP=1` - ablations: skip the
+  match phase or the estimate phase (output is garbage, timing only).

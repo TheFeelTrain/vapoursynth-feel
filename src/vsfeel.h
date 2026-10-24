@@ -349,9 +349,6 @@ struct GPUDevice {
     // table), so a kernel that computes in half rather than only storing it
     // has to ask. Gates NNEDI3's packed half predictor.
     bool feat_shader_float16 { false };
-    // shaderFloat64: also optional, and what WNNM's eigen path runs on (the
-    // reference computes it in f64). A device without it takes the f32 variant.
-    bool feat_shader_float64 { false };
 
     // The shaders' other extensions are deliberately unchecked, because the
     // core's device baseline guarantees them on the logical device (see

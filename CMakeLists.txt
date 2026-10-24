@@ -414,13 +414,22 @@ set(VK_WNNM_QMAX 8 16 32)
 set(VK_WNNM_VARIANTS)
 foreach(qmax IN LISTS VK_WNNM_QMAX)
     list(APPEND VK_WNNM_VARIANTS
-        "wnnm_group_q${qmax}_f64|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DEIG_DOUBLE"
         "wnnm_group_q${qmax}|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax}"
-        "wnnm_group_q${qmax}_f64_cas|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DEIG_DOUBLE -DNO_FLOAT_ATOMICS"
         "wnnm_group_q${qmax}_cas|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DNO_FLOAT_ATOMICS")
 endforeach()
 list(APPEND VK_WNNM_VARIANTS
-    "wnnm_finish|wnnm.comp|-DENTRY_FINISH")
+    "wnnm_finish|wnnm.comp|-DENTRY_FINISH"
+    # The temporal matcher: the fused kernel up to the selection, which it
+    # publishes for the split estimate instead of estimating inline.
+    "wnnm_group_q8_mo|wnnm.comp|-DENTRY_GROUP -DQMAX=8 -DMATCH_ONLY"
+    # The split estimate (radius 0, group_size <= 8): Gram, eigen step, scatter.
+    "wnnm_gram|wnnm.comp|-DENTRY_GRAM -DQMAX=8 -DWG=128"
+    "wnnm_solve|wnnm.comp|-DENTRY_SOLVE -DQMAX=8 -DWG=256"
+    "wnnm_apply|wnnm.comp|-DENTRY_APPLY -DQMAX=8 -DWG=128"
+    "wnnm_apply_cas|wnnm.comp|-DENTRY_APPLY -DQMAX=8 -DWG=128 -DNO_FLOAT_ATOMICS"
+    # The split matching (radius 0): every candidate's SSD, then the selection.
+    "wnnm_dist|wnnm.comp|-DENTRY_DIST -DQMAX=8"
+    "wnnm_select|wnnm.comp|-DENTRY_SELECT -DQMAX=8")
 
 set(VK_VARIANTS
     ${VK_WNNM_VARIANTS}

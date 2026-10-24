@@ -43,6 +43,13 @@ namespace {
 constexpr int kMaxRadius = 15;
 constexpr int kMaxList = 256; // group_size / ps_num cap
 constexpr int kWorkgroup = 128;
+// Threads in the split-matching group kernel: one reference block needs a
+// warp for its Gram rows and its round-robin Jacobi, so the other 96 idle.
+constexpr int kGroupThreads = 32;
+// Floats of per-group scratch in the split estimate: the Gram matrix (64), the
+// per-pixel mean for residual (64) and the aggregation weight (1). Must match
+// MAT_MEAN/MAT_WEIGHT in src/wnnm.comp.
+constexpr int kSplitStride = 136;
 
 struct WnnmSpec {
     int32_t width;
@@ -68,9 +75,11 @@ struct WnnmSpec {
     int32_t tr_base;
     int32_t pmat_stride;
     int32_t locs_base;
+    int32_t dist_base;
+    int32_t match_base;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 23> spec_entries { {
+static constexpr std::array<VkSpecializationMapEntry, 25> spec_entries { {
     { 0, offsetof(WnnmSpec, width), sizeof(int32_t) },
     { 1, offsetof(WnnmSpec, height), sizeof(int32_t) },
     { 2, offsetof(WnnmSpec, stride), sizeof(int32_t) },
@@ -94,6 +103,8 @@ static constexpr std::array<VkSpecializationMapEntry, 23> spec_entries { {
     { 20, offsetof(WnnmSpec, tr_base), sizeof(int32_t) },
     { 21, offsetof(WnnmSpec, pmat_stride), sizeof(int32_t) },
     { 22, offsetof(WnnmSpec, locs_base), sizeof(int32_t) },
+    { 23, offsetof(WnnmSpec, dist_base), sizeof(int32_t) },
+    { 24, offsetof(WnnmSpec, match_base), sizeof(int32_t) },
 } };
 
 struct WnnmPlane {
@@ -108,15 +119,24 @@ struct WnnmPlane {
     float sigma {}; // split by 255, as the reference's sigma / 255.0f
 
     VkPipeline group_pipe {};
+    VkPipeline gram_pipe {};
+    VkPipeline solve_pipe {};
+    VkPipeline apply_pipe {};
     VkPipeline finish_pipe {};
+    VkPipeline dist_pipe {};
+    VkPipeline select_pipe {};
 
     int64_t acc_base {};
     int64_t pmat_base {};
     int64_t locs_base {};
     int64_t trace_base {};
+    int64_t dist_base {};
+    int64_t match_base {};
     int64_t acc_elems {};
     int64_t pmat_elems {};
     int64_t locs_elems {};
+    int64_t dist_elems {};
+    int64_t match_elems {};
 
     uint32_t grid_x {};
     uint32_t grid_y {};
@@ -136,6 +156,14 @@ struct GPUWNNM {
 
     int patch_elems {}; // bs*bs
     int64_t acc_bytes {}, pmat_bytes {}, locs_bytes {};
+    int64_t dist_bytes {}, match_bytes {};
+    // Block matching split into distance + selection kernels (radius 0 and a
+    // group that fits the selection kernel's register top-K).
+    bool split_match {};
+    int folds { 1 };
+    int dist_stride_max {};
+    bool skip_group {}; // ablation: record the match phase without the estimate
+    bool skip_match {}; // ablation: the estimate without the match phase
 
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
@@ -171,8 +199,23 @@ struct GPUWNNM {
             if (p.group_pipe) {
                 gpu->vk->vkDestroyPipeline(dev, p.group_pipe, nullptr);
             }
+            if (p.gram_pipe) {
+                gpu->vk->vkDestroyPipeline(dev, p.gram_pipe, nullptr);
+            }
+            if (p.solve_pipe) {
+                gpu->vk->vkDestroyPipeline(dev, p.solve_pipe, nullptr);
+            }
+            if (p.apply_pipe) {
+                gpu->vk->vkDestroyPipeline(dev, p.apply_pipe, nullptr);
+            }
             if (p.finish_pipe) {
                 gpu->vk->vkDestroyPipeline(dev, p.finish_pipe, nullptr);
+            }
+            if (p.dist_pipe) {
+                gpu->vk->vkDestroyPipeline(dev, p.dist_pipe, nullptr);
+            }
+            if (p.select_pipe) {
+                gpu->vk->vkDestroyPipeline(dev, p.select_pipe, nullptr);
             }
         }
         if (pipeline_layout) {
@@ -193,40 +236,32 @@ struct WnnmVariant {
     size_t group_size;
     const uint32_t * finish;
     size_t finish_size;
+    const uint32_t * dist;
+    size_t dist_size;
+    const uint32_t * select;
+    size_t select_size;
 };
 
-static WnnmVariant pick_variant(int qmax, bool f64, bool hw_atomics) {
-    WnnmVariant v { nullptr, 0, wnnm_finish_spv, sizeof(wnnm_finish_spv) };
-    if (qmax == 8 && f64 && hw_atomics) {
-        v.group = wnnm_group_q8_f64_spv;
-        v.group_size = sizeof(wnnm_group_q8_f64_spv);
-    } else if (qmax == 8 && f64) {
-        v.group = wnnm_group_q8_f64_cas_spv;
-        v.group_size = sizeof(wnnm_group_q8_f64_cas_spv);
+static WnnmVariant pick_variant(int qmax, bool hw_atomics, bool match_only) {
+    WnnmVariant v { nullptr,         0,
+                    wnnm_finish_spv, sizeof(wnnm_finish_spv),
+                    wnnm_dist_spv,   sizeof(wnnm_dist_spv),
+                    wnnm_select_spv, sizeof(wnnm_select_spv) };
+    if (match_only) {
+        v.group = wnnm_group_q8_mo_spv;
+        v.group_size = sizeof(wnnm_group_q8_mo_spv);
     } else if (qmax == 8 && hw_atomics) {
         v.group = wnnm_group_q8_spv;
         v.group_size = sizeof(wnnm_group_q8_spv);
     } else if (qmax == 8) {
         v.group = wnnm_group_q8_cas_spv;
         v.group_size = sizeof(wnnm_group_q8_cas_spv);
-    } else if (qmax == 16 && f64 && hw_atomics) {
-        v.group = wnnm_group_q16_f64_spv;
-        v.group_size = sizeof(wnnm_group_q16_f64_spv);
-    } else if (qmax == 16 && f64) {
-        v.group = wnnm_group_q16_f64_cas_spv;
-        v.group_size = sizeof(wnnm_group_q16_f64_cas_spv);
     } else if (qmax == 16 && hw_atomics) {
         v.group = wnnm_group_q16_spv;
         v.group_size = sizeof(wnnm_group_q16_spv);
     } else if (qmax == 16) {
         v.group = wnnm_group_q16_cas_spv;
         v.group_size = sizeof(wnnm_group_q16_cas_spv);
-    } else if (f64 && hw_atomics) {
-        v.group = wnnm_group_q32_f64_spv;
-        v.group_size = sizeof(wnnm_group_q32_f64_spv);
-    } else if (f64) {
-        v.group = wnnm_group_q32_f64_cas_spv;
-        v.group_size = sizeof(wnnm_group_q32_f64_cas_spv);
     } else if (hw_atomics) {
         v.group = wnnm_group_q32_spv;
         v.group_size = sizeof(wnnm_group_q32_spv);
@@ -242,12 +277,10 @@ static WnnmVariant pick_variant(int qmax, bool f64, bool hw_atomics) {
 // order), the eigen workspace, the round-robin rotation cache and seven
 // scalars. tools/shader_limits.py --check
 // compares this against the built module.
-static uint32_t group_shared_bytes(int qmax, bool f64) {
+static uint32_t group_shared_bytes(int qmax) {
     const uint32_t lists = 8u * 256u * 4u;
     const uint32_t q2 = uint32_t(qmax) * uint32_t(qmax);
-    const uint32_t ebytes = f64 ? 8u : 4u;
-    return lists + 2u * q2 * ebytes + q2 * 4u + uint32_t(qmax) * (ebytes + 4u) +
-           24u;
+    return lists + 2u * q2 * 4u + q2 * 4u + uint32_t(qmax) * 8u + 24u;
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +392,8 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     vsfeel_trace_mark("record");
     VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
 
-    GpuBuffer acc_buf {}, pmat_buf {}, locs_buf {}, addr_buf {}, tr_buf {};
+    GpuBuffer acc_buf {}, pmat_buf {}, locs_buf {}, addr_buf {}, tr_buf {},
+        dist_buf {}, match_buf {};
     // The dump pipelines carry TRACE=1 for every frame, so the trace buffer has
     // to be bound on every frame (dumping to a dummy would scribble on the
     // accumulator); only the selected frame's contents are printed.
@@ -384,6 +418,20 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                 gpu_frame_buffer(*d->gpu, core, ctx, d->locs_bytes, locs_buf);
             !e.empty()) {
             return fail("location scratch: " + e);
+        }
+    }
+    if (d->dist_bytes) {
+        if (auto e =
+                gpu_frame_buffer(*d->gpu, core, ctx, d->dist_bytes, dist_buf);
+            !e.empty()) {
+            return fail("distance scratch: " + e);
+        }
+    }
+    if (d->match_bytes) {
+        if (auto e =
+                gpu_frame_buffer(*d->gpu, core, ctx, d->match_bytes, match_buf);
+            !e.empty()) {
+            return fail("match scratch: " + e);
         }
     }
     // Address table: [plane][ref/src][layer], 64-bit device addresses.
@@ -463,34 +511,90 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
         if (!pln.process) {
             continue;
         }
+        if (d->split_match && d->radius == 0 && !d->skip_match) {
+            // Block match(then selection) ahead of the estimate: every
+            // candidate's SSD, then one thread per group for the top-K.
+            const VkBuffer db[8] { addr_buf.buffer, dummy,           dummy,
+                                   dummy,           dummy,           dummy,
+                                   dist_buf.buffer, match_buf.buffer };
+            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, db, 8);
+            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                          pln.dist_pipe);
+            d->gpu->vk->vkCmdDispatch(cmd, pln.grid_x, pln.grid_y, 1);
+            gpu_barrier(*d->gpu, cmd);
+            const uint32_t sel_groups =
+                (static_cast<uint32_t>(pln.ng) + kWorkgroup - 1) / kWorkgroup;
+            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                          pln.select_pipe);
+            d->gpu->vk->vkCmdDispatch(cmd, sel_groups, 1, 1);
+            gpu_barrier(*d->gpu, cmd);
+        }
+        if (d->skip_group) {
+            continue;
+        }
         {
-            const VkBuffer buffers[6] {
+            const VkBuffer buffers[8] {
                 addr_buf.buffer,
                 acc_buf.buffer,
                 locs_buf.buffer ? locs_buf.buffer : dummy,
                 pmat_buf.buffer,
                 dummy,
-                tr_buf.buffer ? tr_buf.buffer : dummy
+                tr_buf.buffer ? tr_buf.buffer : dummy,
+                dist_buf.buffer ? dist_buf.buffer : dummy,
+                match_buf.buffer ? match_buf.buffer : dummy
             };
-            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 6);
-            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                          pln.group_pipe);
-            const int32_t fold[2] { n, d->vi->numFrames };
-            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, fold,
-                               sizeof(fold));
-            d->gpu->vk->vkCmdDispatch(cmd, pln.grid_x, pln.grid_y, 1);
+            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 8);
+            const uint32_t ng =
+                static_cast<uint32_t>(pln.ng) * static_cast<uint32_t>(d->folds);
+            if (d->split_match) {
+                if (d->radius > 0) {
+                    // The temporal matcher (the predictive search is inherently
+                    // serial) publishes one selection per fold and leaves the
+                    // estimate to the kernels below.
+                    const int32_t fold[2] { n, d->vi->numFrames };
+                    gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, fold,
+                                       sizeof(fold));
+                    d->gpu->vk->vkCmdBindPipeline(
+                        cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pln.group_pipe);
+                    d->gpu->vk->vkCmdDispatch(cmd, pln.grid_x, pln.grid_y, 1);
+                    gpu_barrier(*d->gpu, cmd);
+                }
+                // Gram matrix, eigen step, weighted scatter, one kernel each
+                // (see the split-estimate entry points in src/wnnm.comp).
+                const uint32_t lanes = (ng + 15) / 16;
+                d->gpu->vk->vkCmdBindPipeline(
+                    cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pln.gram_pipe);
+                d->gpu->vk->vkCmdDispatch(cmd, lanes, 1, 1);
+                gpu_barrier(*d->gpu, cmd);
+                d->gpu->vk->vkCmdBindPipeline(
+                    cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pln.solve_pipe);
+                d->gpu->vk->vkCmdDispatch(cmd, (ng + 255) / 256, 1, 1);
+                gpu_barrier(*d->gpu, cmd);
+                d->gpu->vk->vkCmdBindPipeline(
+                    cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pln.apply_pipe);
+                d->gpu->vk->vkCmdDispatch(cmd, lanes, 1, 1);
+            } else {
+                d->gpu->vk->vkCmdBindPipeline(
+                    cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pln.group_pipe);
+                const int32_t fold[2] { n, d->vi->numFrames };
+                gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, fold,
+                                   sizeof(fold));
+                d->gpu->vk->vkCmdDispatch(cmd, pln.grid_x, pln.grid_y, 1);
+            }
         }
         gpu_barrier(*d->gpu, cmd);
         {
-            const VkBuffer buffers[6] {
+            const VkBuffer buffers[8] {
                 addr_buf.buffer,
                 acc_buf.buffer,
                 locs_buf.buffer ? locs_buf.buffer : dummy,
                 pmat_buf.buffer ? pmat_buf.buffer : dummy,
                 dst_plane[p],
-                tr_buf.buffer ? tr_buf.buffer : dummy
+                tr_buf.buffer ? tr_buf.buffer : dummy,
+                dist_buf.buffer ? dist_buf.buffer : dummy,
+                match_buf.buffer ? match_buf.buffer : dummy
             };
-            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 6);
+            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 8);
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           pln.finish_pipe);
             d->gpu->vk->vkCmdDispatch(cmd, pln.finish_x,
@@ -629,6 +733,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     auto d { std::make_unique<GPUWNNM>() };
 
     d->host_timing = vsfeel_debug_probe("VSFEEL_WNNM_TIMING");
+    d->skip_group = env_flag("VSFEEL_WNNM_SKIPGROUP");
+    d->skip_match = env_flag("VSFEEL_WNNM_SKIPMATCH");
     d->dump_frame = env_int("VSFEEL_WNNM_DUMP", -1);
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
@@ -786,20 +892,16 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     d->gpu = std::get<std::shared_ptr<GPUDevice>>(dev_result);
 
     const int qmax = d->q <= 8 ? 8 : (d->q <= 16 ? 16 : 32);
-    // The reference's Jacobi runs in f64; a device without shaderFloat64 gets
-    // the f32 path, which flips shrink decisions near the threshold (measured
-    // 1.2e-5 from the reference on a 64x48 crop, 2.2e-3 on 640x360).
-    bool eig_f64 =
-        d->gpu->feat_shader_float64 && !env_flag("VSFEEL_WNNM_NOF64");
-    if (!eig_f64 && !env_flag("VSFEEL_WNNM_NOF64") &&
-        vsfeel_debug_flag("VSFEEL_WNNM")) {
-        fprintf(stderr, "[wnnm] device has no shaderFloat64: using the f32 "
-                        "eigen path\n");
-    }
+    // The split estimate runs any radius; only a group too wide for its
+    // register-resistant kernels keeps the fused one.
+    d->split_match = d->gs <= 8 && !env_flag("VSFEEL_WNNM_NOSPLIT");
+    // One estimate slot per (lattice point, temporal fold).
+    d->folds = 2 * d->radius + 1;
 
     // Geometry and per-plane scratch. The kernel's group lattice is the
     // reference's `min(_x, temp_c)` walk.
-    int64_t acc_off = 0, pmat_off = 0, locs_off = 0;
+    int64_t acc_off = 0, pmat_off = 0, locs_off = 0, dist_off = 0,
+            match_off = 0;
     for (int p = 0; p < 3; ++p) {
         WnnmPlane & pl = d->plane[p];
         if (!pl.process) {
@@ -825,6 +927,11 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
 
         const int temp_c = pl.width - d->bs;
         const int temp_r = pl.height - d->bs;
+        {
+            const int stride = std::min(2 * d->bm_range + 1, temp_r + 1) *
+                               std::min(2 * d->bm_range + 1, temp_c + 1);
+            d->dist_stride_max = std::max(d->dist_stride_max, stride);
+        }
         pl.gx = temp_c / d->step + 1 + (temp_c % d->step != 0 ? 1 : 0);
         pl.gy = temp_r / d->step + 1 + (temp_r % d->step != 0 ? 1 : 0);
         pl.ng = pl.gx * pl.gy;
@@ -832,7 +939,9 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
 
         pl.acc_elems = int64_t(2) * pl.width * pl.height;
         pl.pmat_elems =
-            int64_t(pl.ng) * m * (int64_t(d->gs) + (d->residual ? 1 : 0));
+            d->split_match
+                ? int64_t(pl.ng) * d->folds * kSplitStride
+                : int64_t(pl.ng) * m * (int64_t(d->gs) + (d->residual ? 1 : 0));
         if (d->radius > 0) {
             const int area = std::min(2 * d->bm_range + 1, temp_r + 1) *
                              std::min(2 * d->bm_range + 1, temp_c + 1);
@@ -848,12 +957,19 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         }
         // Bases are element offsets (the kernels index float/uint arrays), kept
         // 32-byte aligned so every plane region starts on a cache-line boundary.
+        pl.dist_elems = int64_t(pl.ng) * d->dist_stride_max;
+        pl.match_elems =
+            int64_t(pl.ng) * (d->split_match ? d->folds : 1) * (1 + 2 * d->gs);
         pl.acc_base = acc_off;
         pl.pmat_base = pmat_off;
         pl.locs_base = locs_off;
+        pl.dist_base = dist_off;
+        pl.match_base = match_off;
         acc_off += (pl.acc_elems + 7) & ~int64_t(7);
         pmat_off += (pl.pmat_elems + 7) & ~int64_t(7);
         locs_off += (pl.locs_elems + 7) & ~int64_t(7);
+        dist_off += (pl.dist_elems + 7) & ~int64_t(7);
+        match_off += (pl.match_elems + 7) & ~int64_t(7);
     }
     if (d->dump_frame >= 0) {
         int64_t tr = 0;
@@ -868,6 +984,10 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     d->acc_bytes = acc_off * sizeof(float);
     d->pmat_bytes = pmat_off * sizeof(float);
     d->locs_bytes = locs_off * sizeof(uint32_t);
+    if (d->split_match) {
+        d->dist_bytes = dist_off * sizeof(float);
+        d->match_bytes = match_off * sizeof(uint32_t);
+    }
     // The kernels address these regions with signed 32-bit indices, so every
     // region (and its base) has to stay below 2^31 elements.
     constexpr int64_t kIndexMax = INT64_C(1) << 31;
@@ -879,7 +999,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
 
     // Per-frame scratch budget: the core's allowance has to hold the in-flight
     // frames' scratch as well as their pixels.
-    const int64_t per_frame = d->acc_bytes + d->pmat_bytes + d->locs_bytes;
+    const int64_t per_frame = d->acc_bytes + d->pmat_bytes + d->locs_bytes +
+                              d->dist_bytes + d->match_bytes;
     {
         const VkDeviceSize limit = vsfeel_vram_limit(*d->gpu, core);
         if (limit > 0 && per_frame > static_cast<int64_t>(limit / 8)) {
@@ -911,7 +1032,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     // Pipelines: one group + one finish per processed plane (the geometry is
     // baked into specialization constants).
     {
-        const auto result = gpu_push_set_layout(*d->gpu, 6);
+        const auto result = gpu_push_set_layout(*d->gpu, 8);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -931,7 +1052,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         fprintf(stderr, "[wnnm] no buffer float atomics: using the CAS "
                         "accumulator\n");
     }
-    const WnnmVariant variant = pick_variant(qmax, eig_f64, hw_atomics);
+    const WnnmVariant variant =
+        pick_variant(qmax, hw_atomics, d->split_match && d->radius > 0);
     for (int p = 0; p < 3; ++p) {
         WnnmPlane & pl = d->plane[p];
         if (!pl.process) {
@@ -960,9 +1082,14 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         spec.pmat_base = static_cast<int32_t>(pl.pmat_base);
         spec.trace = d->dump_frame >= 0 ? 1 : 0;
         spec.tr_base = static_cast<int32_t>(pl.trace_base);
-        spec.pmat_stride = static_cast<int32_t>(
-            int64_t(m) * (int64_t(d->gs) + (d->residual ? 1 : 0)));
+        spec.pmat_stride =
+            d->split_match
+                ? int32_t(kSplitStride)
+                : static_cast<int32_t>(
+                      int64_t(m) * (int64_t(d->gs) + (d->residual ? 1 : 0)));
         spec.locs_base = static_cast<int32_t>(pl.locs_base);
+        spec.dist_base = static_cast<int32_t>(pl.dist_base);
+        spec.match_base = static_cast<int32_t>(pl.match_base);
 
         if (vsfeel_debug_flag("VSFEEL_WNNM")) {
             fprintf(stderr,
@@ -974,21 +1101,55 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                     static_cast<long long>(spec.pmat_base), spec.addr_base,
                     static_cast<long long>(pl.locs_elems), spec.pmat_stride);
         }
-        const std::string tag = "wnnm group p" + std::to_string(p);
-        {
-            // The group kernel's LDS footprint is a function of qmax and the
-            // eigen width; gpu_create_pipeline checks it against the device.
-            const uint32_t lds = group_shared_bytes(qmax, eig_f64);
-            const GpuWorkgroup wg { .x = kWorkgroup, .shared_bytes = lds };
+        auto add = [&](const std::string & tag, const uint32_t * code,
+                       size_t bytes, const GpuWorkgroup & wg) -> VkPipeline {
             auto r = gpu_create_pipeline(
-                *d->gpu, variant.group, variant.group_size, d->pipeline_layout,
-                spec_entries.data(), &spec,
-                static_cast<uint32_t>(spec_entries.size()), sizeof(spec),
+                *d->gpu, code, bytes, d->pipeline_layout, spec_entries.data(),
+                &spec, static_cast<uint32_t>(spec_entries.size()), sizeof(spec),
                 tag.c_str(), 0, wg);
             if (std::holds_alternative<std::string>(r)) {
-                return set_error(std::get<std::string>(r));
+                set_error(std::get<std::string>(r));
+                return VK_NULL_HANDLE;
             }
-            pl.group_pipe = std::get<VkPipeline>(r);
+            return std::get<VkPipeline>(r);
+        };
+        const std::string tag = "wnnm group p" + std::to_string(p);
+        if (d->split_match) {
+            // The split estimate replaces the fused group kernel: the Gram and
+            // the scatter are eight-lane per group, the eigen step one thread
+            // per group (and needs no workgroup memory at all).
+            const GpuWorkgroup lanes { .x = 128, .shared_bytes = 0 };
+            const GpuWorkgroup one { .x = 256, .shared_bytes = 0 };
+            pl.gram_pipe =
+                add(tag + " gram", wnnm_gram_spv, sizeof(wnnm_gram_spv), lanes);
+            pl.solve_pipe = add(tag + " solve", wnnm_solve_spv,
+                                sizeof(wnnm_solve_spv), one);
+            pl.apply_pipe = hw_atomics ? add(tag + " apply", wnnm_apply_spv,
+                                             sizeof(wnnm_apply_spv), lanes)
+                                       : add(tag + " apply", wnnm_apply_cas_spv,
+                                             sizeof(wnnm_apply_cas_spv), lanes);
+            if (d->radius > 0) {
+                // The temporal matcher still runs the fused kernel, up to the
+                // point where it publishes its selection.
+                const GpuWorkgroup gwg { .x = uint32_t(kWorkgroup),
+                                         .shared_bytes =
+                                             group_shared_bytes(qmax) };
+                pl.group_pipe =
+                    add(tag, variant.group, variant.group_size, gwg);
+            }
+            if (!pl.gram_pipe || !pl.solve_pipe || !pl.apply_pipe ||
+                (d->radius > 0 && !pl.group_pipe)) {
+                return;
+            }
+        } else {
+            // The group kernel's LDS footprint is a function of qmax and the
+            // eigen width; gpu_create_pipeline checks it against the device.
+            const GpuWorkgroup wg { .x = uint32_t(kWorkgroup),
+                                    .shared_bytes = group_shared_bytes(qmax) };
+            pl.group_pipe = add(tag, variant.group, variant.group_size, wg);
+            if (!pl.group_pipe) {
+                return;
+            }
         }
         {
             const GpuWorkgroup wg { .x = kWorkgroup };
@@ -1001,6 +1162,29 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                 return set_error(std::get<std::string>(r));
             }
             pl.finish_pipe = std::get<VkPipeline>(r);
+        }
+        if (d->split_match && d->radius == 0 && !d->skip_match) {
+            // The distance kernel stages its search window: 1024 floats for
+            // any window up to 32x32 (see WIN_MAX in src/wnnm.comp).
+            const GpuWorkgroup wg { .x = kWorkgroup, .shared_bytes = 4096 };
+            auto r = gpu_create_pipeline(
+                *d->gpu, variant.dist, variant.dist_size, d->pipeline_layout,
+                spec_entries.data(), &spec,
+                static_cast<uint32_t>(spec_entries.size()), sizeof(spec),
+                ("wnnm dist p" + std::to_string(p)).c_str(), 0, wg);
+            if (std::holds_alternative<std::string>(r)) {
+                return set_error(std::get<std::string>(r));
+            }
+            pl.dist_pipe = std::get<VkPipeline>(r);
+            auto r2 = gpu_create_pipeline(
+                *d->gpu, variant.select, variant.select_size,
+                d->pipeline_layout, spec_entries.data(), &spec,
+                static_cast<uint32_t>(spec_entries.size()), sizeof(spec),
+                ("wnnm select p" + std::to_string(p)).c_str(), 0, wg);
+            if (std::holds_alternative<std::string>(r2)) {
+                return set_error(std::get<std::string>(r2));
+            }
+            pl.select_pipe = std::get<VkPipeline>(r2);
         }
     }
 
@@ -1015,11 +1199,10 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
 
     if (vsfeel_debug_flag("VSFEEL_WNNM")) {
         fprintf(stderr,
-                "[wnnm] bs=%d step=%d gs=%d bm=%d radius=%d ps=%d/%d eig=%s "
-                "qmax=%d; per frame acc=%.1f MiB pmat=%.1f MiB locs=%.1f MiB\n",
+                "[wnnm] bs=%d step=%d gs=%d bm=%d radius=%d ps=%d/%d qmax=%d; "
+                "per frame acc=%.1f MiB pmat=%.1f MiB locs=%.1f MiB\n",
                 d->bs, d->step, d->gs, d->bm_range, d->radius, d->ps_num,
-                d->ps_range, eig_f64 ? "f64" : "f32", qmax,
-                double(d->acc_bytes) / 1048576.0,
+                d->ps_range, qmax, double(d->acc_bytes) / 1048576.0,
                 double(d->pmat_bytes) / 1048576.0,
                 double(d->locs_bytes) / 1048576.0);
     }
