@@ -421,7 +421,7 @@ list(APPEND VK_WNNM_VARIANTS
     "wnnm_finish|wnnm.comp|-DENTRY_FINISH"
     # The temporal matcher: the fused kernel up to the selection, which it
     # publishes for the split estimate instead of estimating inline.
-    "wnnm_group_q8_mo|wnnm.comp|-DENTRY_GROUP -DQMAX=8 -DMATCH_ONLY"
+    "wnnm_group_q8_mo|wnnm.comp|-DENTRY_GROUP -DQMAX=8 -DMATCH_ONLY -DWG=32"
     # The split estimate (radius 0, group_size <= 8): Gram, eigen step, scatter.
     "wnnm_gram|wnnm.comp|-DENTRY_GRAM -DQMAX=8 -DWG=128"
     "wnnm_solve|wnnm.comp|-DENTRY_SOLVE -DQMAX=8 -DWG=256"

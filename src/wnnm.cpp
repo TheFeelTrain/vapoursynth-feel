@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <mutex>
 #include <bit>
 #include <chrono>
 #include <cfloat>
@@ -54,6 +55,14 @@ constexpr int kGroupThreads = 32;
 // MAT_MEAN/MAT_WEIGHT in src/wnnm.comp.
 constexpr int kSplitStride = 136;
 
+static int round_up_pow2(int v) {
+    int p = 1;
+    while (p < v) {
+        p <<= 1;
+    }
+    return p;
+}
+
 struct WnnmSpec {
     int32_t width;
     int32_t height;
@@ -80,9 +89,11 @@ struct WnnmSpec {
     int32_t locs_base;
     int32_t dist_base;
     int32_t match_base;
+    int32_t ring;
+    int32_t cache;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 25> spec_entries { {
+static constexpr std::array<VkSpecializationMapEntry, 27> spec_entries { {
     { 0, offsetof(WnnmSpec, width), sizeof(int32_t) },
     { 1, offsetof(WnnmSpec, height), sizeof(int32_t) },
     { 2, offsetof(WnnmSpec, stride), sizeof(int32_t) },
@@ -108,6 +119,8 @@ static constexpr std::array<VkSpecializationMapEntry, 25> spec_entries { {
     { 22, offsetof(WnnmSpec, locs_base), sizeof(int32_t) },
     { 23, offsetof(WnnmSpec, dist_base), sizeof(int32_t) },
     { 24, offsetof(WnnmSpec, match_base), sizeof(int32_t) },
+    { 25, offsetof(WnnmSpec, ring), sizeof(int32_t) },
+    { 26, offsetof(WnnmSpec, cache), sizeof(int32_t) },
 } };
 
 struct WnnmPlane {
@@ -146,6 +159,19 @@ struct WnnmPlane {
     uint32_t finish_x {};
 };
 
+// VSFEEL_WNNM_GPUTRACE=<frame>: one-shot per-kernel GPU timings on that frame.
+// Only created when the compute queue family can timestamp at all (writing one
+// where timestampValidBits is 0 can hang the engine).
+struct WnnmGpuProbe {
+    VkQueryPool query {};
+    GpuBuffer buf;
+    uint64_t * map {};
+    std::atomic<int> armed { 0 };
+};
+
+// The probe slots: one per dispatch, per plane, plus a start and an end.
+constexpr int kProbeSlots = 1 + 3 * 6 + 1;
+
 struct GPUWNNM {
     VSNode * node {};
     VSNode * ref_node {};
@@ -164,10 +190,19 @@ struct GPUWNNM {
     // group that fits the selection kernel's register top-K).
     bool split_match {};
     int folds { 1 };
+    // Per-centre match cache: at radius > 0 one centre's search feeds 2r+1
+    // output frames, so its selection and record are computed once and held in
+    // a ring of RING slots keyed by centre frame. Off (one set of per-frame
+    // slots per fold) when the ring would not fit the scratch budget.
+    bool cache {};
+    int ring { 1 };
+    GpuBuffer ring_buf;
+    int64_t ring_bytes {};
+    std::mutex cache_lock;
+    std::vector<int> ring_tag; // centre frame each slot holds, or INT_MIN
     int dist_stride_max {};
     bool skip_group {}; // ablation: record the match phase without the estimate
     bool skip_match {}; // ablation: the estimate without the match phase
-    bool skip_est {};   // ablation: the temporal match without the estimate
 
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
@@ -180,6 +215,10 @@ struct GPUWNNM {
     // VSFEEL_WNNM_DUMP=<frame>: dump {n, kept, weight, centre} per group.
     int dump_frame { -1 };
     int64_t trace_elems {};
+    // VSFEEL_WNNM_GPUTRACE=<frame>: per-kernel GPU timings.
+    bool gpu_trace {};
+    int gpu_trace_frame { 100 };
+    WnnmGpuProbe probe;
 
     ~GPUWNNM() {
         if (host_timing && ht_n.load()) {
@@ -199,6 +238,10 @@ struct GPUWNNM {
             pool = nullptr;
         }
         VkDevice dev = gpu->device;
+        gpu_destroy_buffer(*gpu, ring_buf);
+        if (probe.query) {
+            gpu->vk->vkDestroyQueryPool(dev, probe.query, nullptr);
+        }
         for (auto & p : plane) {
             if (p.group_pipe) {
                 gpu->vk->vkDestroyPipeline(dev, p.group_pipe, nullptr);
@@ -300,6 +343,25 @@ static VkDeviceAddress plane_address(const GPUDevice & gpu, VkBuffer buffer) {
     return gpu.vk->vkGetBufferDeviceAddress(gpu.device, &info);
 }
 
+// A whole-queue barrier: the cache's ring is written by earlier frames, so this
+// frame's dispatches start behind everything already submitted on the compute
+// queue (the same cross-submission handoff the BM3D ring relies on).
+static void record_queue_barrier(const GPUDevice & gpu, VkCommandBuffer cmd) {
+    VkMemoryBarrier2 mb {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    mb.srcAccessMask =
+        VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    mb.dstAccessMask =
+        VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
+    VkDependencyInfo dep {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &mb;
+    gpu.vk->vkCmdPipelineBarrier2(cmd, &dep);
+}
+
 // Zero the accumulator regions and make the writes visible to the dispatches.
 static void record_acc_clear(const GPUDevice & gpu, VkCommandBuffer cmd,
                              VkBuffer acc, VkDeviceSize bytes) {
@@ -397,9 +459,59 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
 
     vsfeel_trace_mark("record");
     VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
+    const bool gputrace = d->gpu_trace && n == d->gpu_trace_frame &&
+                          d->probe.armed.exchange(1) == 0;
+    int probe_slot = 0;
+    auto probe_ts = [&] {
+        if (gputrace) {
+            d->gpu->vk->vkCmdWriteTimestamp2(
+                cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->probe.query,
+                probe_slot++);
+        }
+    };
+    if (gputrace) {
+        d->gpu->vk->vkCmdResetQueryPool(cmd, d->probe.query, 0, kProbeSlots);
+        d->gpu->vk->vkCmdWriteTimestamp2(cmd,
+                                         VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                                         d->probe.query, probe_slot++);
+    }
 
     GpuBuffer acc_buf {}, pmat_buf {}, locs_buf {}, addr_buf {}, tr_buf {},
         dist_buf {}, match_buf {};
+    // The cache's ring is written by earlier frames' submissions and read here,
+    // so every frame on that path starts behind everything already queued (the
+    // BM3D ring uses the same handoff). Holding the lock from here to the
+    // submit is what makes record order the submission order the ring needs.
+    std::unique_lock<std::mutex> cache_guard(d->cache_lock, std::defer_lock);
+    if (d->cache) {
+        cache_guard.lock();
+    }
+    // Folds this frame has to search: a cached centre is one an earlier frame
+    // already computed, and a seek throws the whole ring away.
+    std::vector<int> todo;
+    if (d->cache) {
+        for (int i = 0; i < d->folds; ++i) {
+            const int cm = std::clamp(n - d->radius + i, 0, nf - 1);
+            if (d->ring_tag[cm & (d->ring - 1)] == cm) {
+                continue;
+            }
+            bool dup = false;
+            for (int t : todo) {
+                dup = dup || std::clamp(n - d->radius + t, 0, nf - 1) == cm;
+            }
+            if (!dup) {
+                todo.push_back(i);
+            }
+        }
+        if (vsfeel_debug_flag("VSFEEL_WNNM")) {
+            fprintf(stderr, "[wnnm] n=%d cached %d of %d folds, todo:", n,
+                    d->folds - static_cast<int>(todo.size()), d->folds);
+            for (int t : todo) {
+                fprintf(stderr, " %d", t);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
     // The dump pipelines carry TRACE=1 for every frame, so the trace buffer has
     // to be bound on every frame (dumping to a dummy would scribble on the
     // accumulator); only the selected frame's contents are printed.
@@ -509,6 +621,13 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     }
 
     VkBuffer dummy = acc_buf.buffer ? acc_buf.buffer : addr_buf.buffer;
+    // With the cache on, the match records live in the persistent ring.
+    const VkBuffer match_view =
+        d->cache ? d->ring_buf.buffer
+                 : (match_buf.buffer ? match_buf.buffer : dummy);
+    if (d->cache) {
+        record_queue_barrier(*d->gpu, cmd);
+    }
     record_acc_clear(*d->gpu, cmd, acc_buf.buffer, d->acc_bytes);
 
     vsfeel_trace_mark("dispatch");
@@ -520,9 +639,9 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
         if (d->split_match && d->radius == 0 && !d->skip_match) {
             // Block match(then selection) ahead of the estimate: every
             // candidate's SSD, then one thread per group for the top-K.
-            const VkBuffer db[8] { addr_buf.buffer, dummy,           dummy,
-                                   dummy,           dummy,           dummy,
-                                   dist_buf.buffer, match_buf.buffer };
+            const VkBuffer db[8] { addr_buf.buffer, dummy,     dummy,
+                                   dummy,           dummy,     dummy,
+                                   dist_buf.buffer, match_view };
             gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, db, 8);
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           pln.dist_pipe);
@@ -534,6 +653,7 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                                           pln.select_pipe);
             d->gpu->vk->vkCmdDispatch(cmd, sel_groups, 1, 1);
             gpu_barrier(*d->gpu, cmd);
+            probe_ts();
         }
         if (d->skip_group) {
             continue;
@@ -547,35 +667,57 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                 dummy,
                 tr_buf.buffer ? tr_buf.buffer : dummy,
                 dist_buf.buffer ? dist_buf.buffer : dummy,
-                match_buf.buffer ? match_buf.buffer : dummy
+                match_view
             };
             gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 8);
             const uint32_t ng =
                 static_cast<uint32_t>(pln.ng) * static_cast<uint32_t>(d->folds);
-            if (d->split_match && !d->skip_est) {
-                if (d->radius > 0) {
+            if (d->split_match) {
+                if (d->radius > 0 && !d->skip_match) {
                     // The temporal matcher (the predictive search is inherently
-                    // serial) publishes one selection per fold and leaves the
-                    // estimate to the kernels below.
-                    const int32_t fold[2] { n, d->vi->numFrames };
-                    gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, fold,
-                                       sizeof(fold));
-                    d->gpu->vk->vkCmdBindPipeline(
-                        cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pln.group_pipe);
-                    d->gpu->vk->vkCmdDispatch(cmd, pln.grid_x, pln.grid_y, 1);
-                    gpu_barrier(*d->gpu, cmd);
+                    // serial) publishes one selection per centre and leaves the
+                    // estimate to the kernels below. With the cache on, only
+                    // the folds whose centre is not in the ring run.
+                    const int32_t pc_all[3] { n, d->vi->numFrames, 0 };
+                    for (size_t t = 0; t < todo.size(); ++t) {
+                        const int32_t one[3] { n, d->vi->numFrames, todo[t] };
+                        gpu_push_constants(*d->gpu, cmd, d->pipeline_layout,
+                                           one, sizeof(one));
+                        d->gpu->vk->vkCmdBindPipeline(
+                            cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pln.group_pipe);
+                        d->gpu->vk->vkCmdDispatch(cmd, pln.grid_x, pln.grid_y,
+                                                  1);
+                        gpu_barrier(*d->gpu, cmd);
+                    }
+                    if (!d->cache) {
+                        gpu_push_constants(*d->gpu, cmd, d->pipeline_layout,
+                                           pc_all, sizeof(pc_all));
+                        d->gpu->vk->vkCmdBindPipeline(
+                            cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pln.group_pipe);
+                        d->gpu->vk->vkCmdDispatch(cmd, pln.grid_x, pln.grid_y,
+                                                  1);
+                        gpu_barrier(*d->gpu, cmd);
+                    }
                 }
+                probe_ts();
                 // Gram matrix, eigen step, weighted scatter, one kernel each
                 // (see the split-estimate entry points in src/wnnm.comp).
+                const int32_t pc[3] { n, d->vi->numFrames, 0 };
+                gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, pc,
+                                   sizeof(pc));
                 const uint32_t lanes = (ng + 15) / 16;
                 d->gpu->vk->vkCmdBindPipeline(
                     cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pln.gram_pipe);
                 d->gpu->vk->vkCmdDispatch(cmd, lanes, 1, 1);
                 gpu_barrier(*d->gpu, cmd);
+                probe_ts();
                 d->gpu->vk->vkCmdBindPipeline(
                     cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pln.solve_pipe);
                 d->gpu->vk->vkCmdDispatch(cmd, (ng + 255) / 256, 1, 1);
                 gpu_barrier(*d->gpu, cmd);
+                probe_ts();
                 d->gpu->vk->vkCmdBindPipeline(
                     cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pln.apply_pipe);
                 d->gpu->vk->vkCmdDispatch(cmd, lanes, 1, 1);
@@ -589,6 +731,7 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
             }
         }
         gpu_barrier(*d->gpu, cmd);
+        probe_ts();
         {
             const VkBuffer buffers[8] {
                 addr_buf.buffer,
@@ -598,7 +741,7 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                 dst_plane[p],
                 tr_buf.buffer ? tr_buf.buffer : dummy,
                 dist_buf.buffer ? dist_buf.buffer : dummy,
-                match_buf.buffer ? match_buf.buffer : dummy
+                match_view
             };
             gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 8);
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -607,6 +750,13 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                                       static_cast<uint32_t>(pln.height), 1);
         }
         gpu_barrier(*d->gpu, cmd);
+        probe_ts();
+    }
+    if (gputrace) {
+        gpu_barrier(*d->gpu, cmd);
+        d->gpu->vk->vkCmdCopyQueryPoolResults(
+            cmd, d->probe.query, 0, kProbeSlots, d->probe.buf.buffer, 0,
+            sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
     }
     const auto t2 = d->host_timing ? std::chrono::steady_clock::now()
                                    : std::chrono::steady_clock::time_point {};
@@ -643,8 +793,60 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     if (submit_error) {
         return fail("submit failed: "s + errbuf);
     }
+    // The centres this frame searched are now submitted, so a later frame that
+    // consumes them may record against the ring.
+    if (d->cache) {
+        for (int f : todo) {
+            const int cm = std::clamp(n - d->radius + f, 0, nf - 1);
+            d->ring_tag[cm & (d->ring - 1)] = cm;
+        }
+    }
     const auto t3 = d->host_timing ? std::chrono::steady_clock::now()
                                    : std::chrono::steady_clock::time_point {};
+
+    if (gputrace) {
+        char perr[256] {};
+        if (d->gpu->api->gpuExecWaitValue(d->pool, signaled, perr,
+                                          sizeof(perr)) == gdDrained) {
+            const double period = d->gpu->limits.timestampPeriod;
+            const uint64_t * ts = d->probe.map;
+            const auto us = [period](uint64_t a, uint64_t b) {
+                return static_cast<double>(b - a) * period / 1000.0;
+            };
+            fprintf(stderr,
+                    "[wnnm-gpu] n=%d total=%.1fus period=%.3f raw=%llu %llu\n",
+                    n, us(ts[0], ts[probe_slot - 1]), period,
+                    (unsigned long long)ts[0],
+                    (unsigned long long)ts[probe_slot - 1]);
+            const char * names[5] { "match", "gram", "solve", "apply",
+                                    "finish" };
+            int at = 1;
+            for (int p = 0; p < 3; ++p) {
+                if (!d->plane[p].process) {
+                    continue;
+                }
+                double sum = 0.0;
+                for (int k = 0; k < 5; ++k) {
+                    if (at + k >= probe_slot) {
+                        break;
+                    }
+                    sum += us(ts[at + k - 1], ts[at + k]);
+                }
+                fprintf(stderr, "[wnnm-gpu]   p=%d", p);
+                for (int k = 0; k < 5; ++k) {
+                    if (at + k >= probe_slot) {
+                        break;
+                    }
+                    fprintf(stderr, " %s=%.1f", names[k],
+                            us(ts[at + k - 1], ts[at + k]));
+                }
+                fprintf(stderr, " sum=%.1fus\n", sum);
+                at += 5;
+            }
+        } else {
+            fprintf(stderr, "[wnnm-gpu] probe wait failed: %s\n", perr);
+        }
+    }
 
     if (dumping) {
         char perr[256] {};
@@ -741,7 +943,6 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     d->host_timing = vsfeel_debug_probe("VSFEEL_WNNM_TIMING");
     d->skip_group = env_flag("VSFEEL_WNNM_SKIPGROUP");
     d->skip_match = env_flag("VSFEEL_WNNM_SKIPMATCH");
-    d->skip_est = env_flag("VSFEEL_WNNM_SKIPEST");
     d->dump_frame = env_int("VSFEEL_WNNM_DUMP", -1);
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
@@ -906,77 +1107,116 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     d->folds = 2 * d->radius + 1;
 
     // Geometry and per-plane scratch. The kernel's group lattice is the
-    // reference's `min(_x, temp_c)` walk.
-    int64_t acc_off = 0, pmat_off = 0, locs_off = 0, dist_off = 0,
-            match_off = 0;
-    for (int p = 0; p < 3; ++p) {
-        WnnmPlane & pl = d->plane[p];
-        if (!pl.process) {
-            continue;
-        }
-        const int ssw = p == 0 ? 0 : d->vi->format.subSamplingW;
-        const int ssh = p == 0 ? 0 : d->vi->format.subSamplingH;
-        pl.width = p == 0 ? d->vi->width : d->vi->width >> ssw;
-        pl.height = p == 0 ? d->vi->height : d->vi->height >> ssh;
-        if (d->bs > pl.width || d->bs > pl.height) {
-            return set_error("\"block_size\" must not exceed the dimensions of "
-                             "any processed plane");
-        }
-        VSFrame * probe = vsapi->newVideoFrame(&d->vi->format, d->vi->width,
-                                               d->vi->height, nullptr, core);
-        if (probe == nullptr) {
-            return set_error("could not allocate a probe frame");
-        }
-        pl.stride =
-            static_cast<int>(vsapi->getStride(probe, p) / sizeof(float));
-        vsapi->freeFrame(probe);
-        pl.npix = int64_t(pl.stride) * pl.height;
+    // reference's `min(_x, temp_c)` walk. The layout runs twice at most: the
+    // second pass drops the centre cache when its ring does not fit.
+    constexpr int64_t kCacheBudget = INT64_C(96) << 20;
+    d->cache =
+        d->split_match && d->radius > 0 && !env_flag("VSFEEL_WNNM_NOCACHE");
+    d->ring = d->cache ? std::min(32, round_up_pow2(2 * d->folds)) : d->folds;
+    auto layout = [&] {
+        int64_t acc_off = 0, pmat_off = 0, locs_off = 0, dist_off = 0,
+                match_off = 0;
+        for (int p = 0; p < 3; ++p) {
+            WnnmPlane & pl = d->plane[p];
+            if (!pl.process) {
+                continue;
+            }
+            const int ssw = p == 0 ? 0 : d->vi->format.subSamplingW;
+            const int ssh = p == 0 ? 0 : d->vi->format.subSamplingH;
+            pl.width = p == 0 ? d->vi->width : d->vi->width >> ssw;
+            pl.height = p == 0 ? d->vi->height : d->vi->height >> ssh;
+            if (d->bs > pl.width || d->bs > pl.height) {
+                return std::string(
+                    "\"block_size\" must not exceed the dimensions "
+                    "of any processed plane");
+            }
+            VSFrame * probe = vsapi->newVideoFrame(
+                &d->vi->format, d->vi->width, d->vi->height, nullptr, core);
+            if (probe == nullptr) {
+                return std::string("could not allocate a probe frame");
+            }
+            pl.stride =
+                static_cast<int>(vsapi->getStride(probe, p) / sizeof(float));
+            vsapi->freeFrame(probe);
+            pl.npix = int64_t(pl.stride) * pl.height;
 
-        const int temp_c = pl.width - d->bs;
-        const int temp_r = pl.height - d->bs;
-        {
-            const int stride = std::min(2 * d->bm_range + 1, temp_r + 1) *
-                               std::min(2 * d->bm_range + 1, temp_c + 1);
-            d->dist_stride_max = std::max(d->dist_stride_max, stride);
-        }
-        pl.gx = temp_c / d->step + 1 + (temp_c % d->step != 0 ? 1 : 0);
-        pl.gy = temp_r / d->step + 1 + (temp_r % d->step != 0 ? 1 : 0);
-        pl.ng = pl.gx * pl.gy;
-        pl.finish_x = uint32_t((pl.width + kWorkgroup - 1) / kWorkgroup);
+            const int temp_c = pl.width - d->bs;
+            const int temp_r = pl.height - d->bs;
+            {
+                const int stride = std::min(2 * d->bm_range + 1, temp_r + 1) *
+                                   std::min(2 * d->bm_range + 1, temp_c + 1);
+                d->dist_stride_max = std::max(d->dist_stride_max, stride);
+            }
+            pl.gx = temp_c / d->step + 1 + (temp_c % d->step != 0 ? 1 : 0);
+            pl.gy = temp_r / d->step + 1 + (temp_r % d->step != 0 ? 1 : 0);
+            pl.ng = pl.gx * pl.gy;
+            pl.finish_x = uint32_t((pl.width + kWorkgroup - 1) / kWorkgroup);
 
-        pl.acc_elems = int64_t(2) * pl.width * pl.height;
-        pl.pmat_elems =
-            d->split_match
-                ? int64_t(pl.ng) * d->folds * kSplitStride
-                : int64_t(pl.ng) * m * (int64_t(d->gs) + (d->residual ? 1 : 0));
-        if (d->radius > 0) {
-            const int area = std::min(2 * d->bm_range + 1, temp_r + 1) *
-                             std::min(2 * d->bm_range + 1, temp_c + 1);
-            const int centers = std::min(d->ps_num, area);
-            const int rect = std::min(2 * d->ps_range + 1, temp_c + 1) *
-                             std::min(2 * d->ps_range + 1, temp_r + 1);
-            pl.locs_elems =
-                int64_t(pl.ng) *
-                std::min<int64_t>(int64_t(centers) * rect,
-                                  int64_t(temp_c + 1) * (temp_r + 1));
-        } else {
-            pl.locs_elems = int64_t(pl.ng);
+            pl.acc_elems = int64_t(2) * pl.width * pl.height;
+            pl.pmat_elems = d->split_match
+                                ? int64_t(pl.ng) * d->folds * kSplitStride
+                                : int64_t(pl.ng) * m *
+                                      (int64_t(d->gs) + (d->residual ? 1 : 0));
+            if (d->radius > 0) {
+                const int area = std::min(2 * d->bm_range + 1, temp_r + 1) *
+                                 std::min(2 * d->bm_range + 1, temp_c + 1);
+                const int centers = std::min(d->ps_num, area);
+                const int rect = std::min(2 * d->ps_range + 1, temp_c + 1) *
+                                 std::min(2 * d->ps_range + 1, temp_r + 1);
+                pl.locs_elems =
+                    int64_t(pl.ng) *
+                    std::min<int64_t>(int64_t(centers) * rect,
+                                      int64_t(temp_c + 1) * (temp_r + 1));
+            } else {
+                pl.locs_elems = int64_t(pl.ng);
+            }
+            // Bases are element offsets (the kernels index float/uint arrays), kept
+            // 32-byte aligned so every plane region starts on a cache-line boundary.
+            pl.dist_elems = int64_t(pl.ng) * d->dist_stride_max;
+            pl.match_elems = int64_t(pl.ng) * (d->split_match ? d->ring : 1) *
+                             (1 + 2 * d->gs);
+            pl.acc_base = acc_off;
+            pl.pmat_base = pmat_off;
+            pl.locs_base = locs_off;
+            pl.dist_base = dist_off;
+            pl.match_base = match_off;
+            acc_off += (pl.acc_elems + 7) & ~int64_t(7);
+            pmat_off += (pl.pmat_elems + 7) & ~int64_t(7);
+            locs_off += (pl.locs_elems + 7) & ~int64_t(7);
+            dist_off += (pl.dist_elems + 7) & ~int64_t(7);
+            match_off += (pl.match_elems + 7) & ~int64_t(7);
         }
-        // Bases are element offsets (the kernels index float/uint arrays), kept
-        // 32-byte aligned so every plane region starts on a cache-line boundary.
-        pl.dist_elems = int64_t(pl.ng) * d->dist_stride_max;
-        pl.match_elems =
-            int64_t(pl.ng) * (d->split_match ? d->folds : 1) * (1 + 2 * d->gs);
-        pl.acc_base = acc_off;
-        pl.pmat_base = pmat_off;
-        pl.locs_base = locs_off;
-        pl.dist_base = dist_off;
-        pl.match_base = match_off;
-        acc_off += (pl.acc_elems + 7) & ~int64_t(7);
-        pmat_off += (pl.pmat_elems + 7) & ~int64_t(7);
-        locs_off += (pl.locs_elems + 7) & ~int64_t(7);
-        dist_off += (pl.dist_elems + 7) & ~int64_t(7);
-        match_off += (pl.match_elems + 7) & ~int64_t(7);
+        d->acc_bytes = acc_off * sizeof(float);
+        d->pmat_bytes = pmat_off * sizeof(float);
+        d->locs_bytes = locs_off * sizeof(uint32_t);
+        if (d->split_match) {
+            d->dist_bytes = dist_off * sizeof(float);
+            // A cached ring is persistent, not per-frame scratch.
+            d->ring_bytes =
+                d->cache ? match_off * int64_t(sizeof(uint32_t)) : 0;
+            d->match_bytes =
+                d->cache ? 0 : match_off * int64_t(sizeof(uint32_t));
+        }
+        // The kernels address these regions with signed 32-bit indices, so
+        // every region (and its base) has to stay below 2^31 elements.
+        constexpr int64_t kIndexMax = INT64_C(1) << 31;
+        if (acc_off >= kIndexMax || pmat_off >= kIndexMax ||
+            locs_off >= kIndexMax) {
+            return std::string("the scratch layout exceeds the 2^31-element "
+                               "index range; lower block_size/group_size or "
+                               "radius");
+        }
+        return std::string();
+    };
+    if (auto e = layout(); !e.empty()) {
+        return set_error(e);
+    }
+    if (d->cache && d->ring_bytes > kCacheBudget) {
+        d->cache = false;
+        d->ring = d->folds;
+        if (auto e = layout(); !e.empty()) {
+            return set_error(e);
+        }
     }
     if (d->dump_frame >= 0) {
         int64_t tr = 0;
@@ -987,21 +1227,11 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             }
         }
         d->trace_elems = tr;
-    }
-    d->acc_bytes = acc_off * sizeof(float);
-    d->pmat_bytes = pmat_off * sizeof(float);
-    d->locs_bytes = locs_off * sizeof(uint32_t);
-    if (d->split_match) {
-        d->dist_bytes = dist_off * sizeof(float);
-        d->match_bytes = match_off * sizeof(uint32_t);
-    }
-    // The kernels address these regions with signed 32-bit indices, so every
-    // region (and its base) has to stay below 2^31 elements.
-    constexpr int64_t kIndexMax = INT64_C(1) << 31;
-    if (acc_off >= kIndexMax || pmat_off >= kIndexMax ||
-        locs_off >= kIndexMax || d->trace_elems >= kIndexMax) {
-        return set_error("the scratch layout exceeds the 2^31-element index "
-                         "range; lower block_size/group_size or radius");
+        constexpr int64_t kIndexMax = INT64_C(1) << 31;
+        if (d->trace_elems >= kIndexMax) {
+            return set_error("the trace layout exceeds the 2^31-element index "
+                             "range; lower block_size/group_size or radius");
+        }
     }
 
     // Per-frame scratch budget: the core's allowance has to hold the in-flight
@@ -1047,7 +1277,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     }
     {
         const auto result =
-            gpu_pipeline_layout(*d->gpu, d->set_layout, 2 * sizeof(int32_t));
+            gpu_pipeline_layout(*d->gpu, d->set_layout, 3 * sizeof(int32_t));
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -1097,6 +1327,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         spec.locs_base = static_cast<int32_t>(pl.locs_base);
         spec.dist_base = static_cast<int32_t>(pl.dist_base);
         spec.match_base = static_cast<int32_t>(pl.match_base);
+        spec.ring = d->ring;
+        spec.cache = d->cache ? 1 : 0;
 
         if (vsfeel_debug_flag("VSFEEL_WNNM")) {
             fprintf(stderr,
@@ -1138,7 +1370,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             if (d->radius > 0) {
                 // The temporal matcher still runs the fused kernel, up to the
                 // point where it publishes its selection.
-                const GpuWorkgroup gwg { .x = uint32_t(kWorkgroup),
+                const GpuWorkgroup gwg { .x = 32u,
                                          .shared_bytes =
                                              group_shared_bytes(qmax) };
                 pl.group_pipe =
@@ -1204,14 +1436,62 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         }
     }
 
+    if (d->cache) {
+        if (auto e = gpu_make_buffer(*d->gpu, core, VkDeviceSize(d->ring_bytes),
+                                     d->ring_buf,
+                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            !e.empty()) {
+            // The ring is an optimization: no room for it means per-frame
+            // slots, which is also what the layout has to be rebuilt for.
+            d->cache = false;
+            d->ring = d->folds;
+            if (auto e2 = layout(); !e2.empty()) {
+                return set_error(e2);
+            }
+        } else {
+            d->ring_tag.assign(static_cast<size_t>(d->ring), INT_MIN);
+        }
+    }
+
+    d->gpu_trace_frame = env_int("VSFEEL_WNNM_GPUTRACE", 100);
+    d->gpu_trace = vsfeel_debug_probe("VSFEEL_WNNM_GPUTRACE") &&
+                   vsfeel_probe_timestamps(*d->gpu, "WNNM");
+    if (d->gpu_trace) {
+        VkQueryPoolCreateInfo qp_info {
+            .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType = VK_QUERY_TYPE_TIMESTAMP,
+            .queryCount = kProbeSlots
+        };
+        if (d->gpu->vk->vkCreateQueryPool(d->gpu->device, &qp_info, nullptr,
+                                          &d->probe.query) != VK_SUCCESS) {
+            d->probe.query = VK_NULL_HANDLE;
+            d->gpu_trace = false;
+        }
+    }
+    if (d->gpu_trace) {
+        auto e = gpu_make_buffer(*d->gpu, core,
+                                 VkDeviceSize(kProbeSlots) * sizeof(uint64_t),
+                                 d->probe.buf,
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                 0, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (!e.empty() || d->probe.buf.mapped == nullptr) {
+            d->gpu_trace = false;
+        } else {
+            d->probe.map = static_cast<uint64_t *>(d->probe.buf.mapped);
+        }
+    }
+
     if (vsfeel_debug_flag("VSFEEL_WNNM")) {
         fprintf(stderr,
                 "[wnnm] bs=%d step=%d gs=%d bm=%d radius=%d ps=%d/%d qmax=%d; "
-                "per frame acc=%.1f MiB pmat=%.1f MiB locs=%.1f MiB\n",
+                "per frame acc=%.1f MiB pmat=%.1f MiB locs=%.1f MiB; "
+                "cache=%d ring=%d ring=%.1f MiB\n",
                 d->bs, d->step, d->gs, d->bm_range, d->radius, d->ps_num,
                 d->ps_range, qmax, double(d->acc_bytes) / 1048576.0,
                 double(d->pmat_bytes) / 1048576.0,
-                double(d->locs_bytes) / 1048576.0);
+                double(d->locs_bytes) / 1048576.0, d->cache ? 1 : 0, d->ring,
+                double(d->ring_bytes) / 1048576.0);
     }
 
     GPUWNNM * data = d.release();

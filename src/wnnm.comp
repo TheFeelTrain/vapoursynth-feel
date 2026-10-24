@@ -46,7 +46,16 @@
 // converge in 16 (2.4e-3 output error), 20 does, and 24/30 give the identical
 // answer.
 #define SWEEPS 20
+// Candidates per selection tile, and the threads the matcher runs at. The tile
+// has to cover the group kernel's whole workgroup to use every lane: at 32
+// threads a 32-candidate tile leaves three quarters of the CU idle while the
+// SSDs of a tile are latency-bound.
+#ifndef TFULL
 #define TFULL 32
+#endif
+#ifndef SELCAP
+#define SELCAP 32
+#endif
 #define KMAXL 64
 // The fused matcher's lists only need -DNOMATCH's top-K, which is the group size.
 #if defined(NOMATCH)
@@ -91,6 +100,12 @@ layout(constant_id = 22) const int LOCS_BASE = 0;
 // Element offsets of this plane's regions in the distance and match buffers.
 layout(constant_id = 23) const int DIST_BASE = 0;
 layout(constant_id = 24) const int MATCH_BASE = 0;
+// Slots per group in the match buffer, and whether they are a per-centre cache
+// shared by the frames that consume that centre (temporal) or one set per
+// output frame. RING is the fold count either way, so the two layouts differ
+// only in which slot a fold reads.
+layout(constant_id = 25) const int RING = 1;
+layout(constant_id = 26) const int CACHE = 0;
 
 #define M (BS * BS)
 #define TEMP_C (W - BS)
@@ -131,10 +146,13 @@ layout(std430, binding = 7) readonly buffer MatchBuf { uint matches[]; };
 
 // Temporal mode only: the output frame and the clip length, for the reference's
 // VAggregate fold (its slab index is clamped at the clip boundaries, so the
-// fold reads some (frame, slab) pairs more than once).
+// fold reads some (frame, slab) pairs more than once). `fold` names the one
+// fold the match kernel is dispatched for, so a cached centre is searched once
+// instead of once per frame that consumes it.
 layout(push_constant) uniform Push {
     int pn;
     int frames;
+    int fold;
 } pc;
 
 // Final group, sorted by error. `top_t` is the temporal index in the centre
@@ -147,10 +165,6 @@ shared int top_n;
 #if !defined(NOMATCH)
 shared float cand[TFULL];
 // The tile's selected list and the merge scratch of the block below.
-#define SELCAP 32
-#define CHUNK 32
-shared float c1_e[8 * SELCAP];
-shared uint c1_xy[8 * SELCAP];
 shared float tile_e[SELCAP];
 shared uint tile_xy[SELCAP];
 shared int tile_n;
@@ -700,6 +714,22 @@ void add_acc(int idx, float v) {
 #endif
 }
 
+// Slots are fold-major: slot = fold * NG + group, so one fold is a contiguous
+// range and the match kernel can be dispatched for a single centre.
+int fold_of(uint slot) {
+    return int(slot) / NG;
+}
+
+int centre_of(int fold) {
+    return clamp(pc.pn - RADIUS + fold, 0, pc.frames - 1);
+}
+
+// Layer of the centre frame's first temporal position in this frame's address
+// table (which covers 4*RADIUS+1 frames, n-2r..n+2r, for any fold).
+int layer_base_of(int fold) {
+    return centre_of(fold) - pc.pn + RADIUS;
+}
+
 // One reference block. layer_base selects the first frame of the centre frame's
 // window in the address table; t_dest is the local temporal index whose patches
 // go to this output frame; fold is this centre's position in the fold (the
@@ -712,9 +742,11 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
 
     PlaneRef refc = addr.img[ADDR_BASE + layer_base + RADIUS];
 
-    if (tid < M) {
-        const int rp = tid / BS;
-        refblk[tid] = refc.v[(y + rp) * STRIDE + x + (tid - rp * BS)];
+    // The group kernel runs at WG threads per reference block, which is fewer
+    // than the block's pixels, so the centre block takes a loop.
+    for (int i = tid; i < M; i += WG) {
+        const int rp = i / BS;
+        refblk[i] = refc.v[(y + rp) * STRIDE + x + (i - rp * BS)];
     }
     const int wtop = max(y - BM_RANGE, 0);
     const int wbottom = min(y + BM_RANGE, TEMP_R);
@@ -826,16 +858,28 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
 #endif
 #if defined(MATCH_ONLY)
     // The estimate runs in the split kernels (ENTRY_GRAM/SOLVE/APPLY): publish
-    // this fold's selection, keyed by the estimate slot, with the *absolute*
-    // source layer so the estimate needs no temporal logic of its own.
+    // this fold's selection into the centre's record, storing the position in
+    // the centre's own window so the consumers can rebase it onto their own
+    // address tables.
     if (tid == 0) {
-        const uint base =
-            uint(MATCH_BASE) +
-            (wg * uint(2 * RADIUS + 1) + uint(fold)) * uint(1 + 2 * GS);
+        const uint ring = CACHE != 0 ? uint(centre_of(fold)) & uint(RING - 1)
+                                 : uint(fold);
+        const uint base = uint(MATCH_BASE) +
+                          (ring * uint(NG) + wg) * uint(1 + 2 * GS);
         matches[base] = uint(top_n);
         for (int i = 0; i < top_n; ++i) {
             matches[base + uint(1 + 2 * i)] = top_xy[i];
-            matches[base + uint(2 + 2 * i)] = uint(layer_base + top_t[i]);
+            matches[base + uint(2 + 2 * i)] = uint(top_t[i]);
+        }
+        if (TRACE != 0) {
+            const int tb = TRBASE + (int(wg) * (2 * RADIUS + 1) + fold) * 28;
+            trace[tb + 0] = uint(top_n);
+            for (int i = 0; i < 8; ++i) {
+                trace[tb + 4 + i * 3 + 0] =
+                    i < top_n ? floatBitsToUint(top_e[i]) : 0u;
+                trace[tb + 4 + i * 3 + 1] = i < top_n ? top_xy[i] : 0u;
+                trace[tb + 4 + i * 3 + 2] = i < top_n ? uint(top_t[i]) : 0u;
+            }
         }
     }
     return;
@@ -1066,14 +1110,30 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
 #define MAT_MEAN 64
 #define MAT_WEIGHT 128
 
+// The per-group match record of a slot. The cache keys records by centre frame,
+// so the frames that consume the same centre read the same record; without it
+// each fold owns a record for this output frame alone.
+uint match_rec(uint slot) {
+    const int fold = fold_of(slot);
+    const uint ring = CACHE != 0 ? uint(centre_of(fold)) & uint(RING - 1)
+                                 : uint(fold);
+    return uint(MATCH_BASE) +
+           (ring * uint(NG) + uint(int(slot) - fold * NG)) *
+               uint(1 + 2 * GS);
+}
+
+// Patch count of a slot's record.
+uint match_count(uint slot) {
+    return matches[match_rec(slot)];
+}
+
 // Offset of the group's match `j` from its plane base. j >= n means the group
 // has fewer columns and this one contributes zero.
 int match_off(uint slot, int j, int n) {
     if (j >= n) {
         return 0;
     }
-    const uint xy =
-        matches[uint(MATCH_BASE) + slot * uint(1 + 2 * GS) + uint(1 + 2 * j)];
+    const uint xy = matches[match_rec(slot) + uint(1 + 2 * j)];
     return unpack_y(xy) * STRIDE + unpack_x(xy);
 }
 
@@ -1082,19 +1142,19 @@ int match_out(uint slot, int j, int n) {
     if (j >= n) {
         return 0;
     }
-    const uint xy =
-        matches[uint(MATCH_BASE) + slot * uint(1 + 2 * GS) + uint(1 + 2 * j)];
+    const uint xy = matches[match_rec(slot) + uint(1 + 2 * j)];
     return unpack_y(xy) * W + unpack_x(xy);
 }
 
-// Source layer of match `j` in the address table: the temporal matcher stores
-// the absolute layer, the spatial selection kernel stores 0.
+// Source layer of match `j` in this frame's address table. The record stores
+// the position in the centre's own window, which is what lets a cached centre
+// serve a frame whose table starts elsewhere; the spatial select stores 0.
 int match_layer(uint slot, int j, int n) {
-    if (j >= n) {
+    if (j >= n || RADIUS == 0) {
         return 0;
     }
-    return int(matches[uint(MATCH_BASE) + slot * uint(1 + 2 * GS) +
-                       uint(2 + 2 * j)]);
+    return layer_base_of(fold_of(slot)) +
+           int(matches[match_rec(slot) + uint(2 + 2 * j)]);
 }
 
 // Estimate slots: one per (lattice point, temporal fold). RADIUS is a spec
@@ -1111,12 +1171,10 @@ int fold_dest(uint slot) {
     if (RADIUS == 0) {
         return -1;
     }
-    const int i = int(slot) % (2 * RADIUS + 1);
-    const int cm = clamp(pc.pn - RADIUS + i, 0, pc.frames - 1);
-    const int layer_base = cm - pc.pn + RADIUS;
+    const int i = fold_of(slot);
     const int slab = clamp(2 * RADIUS - i, pc.pn - pc.frames + 1 + RADIUS,
                            pc.pn + RADIUS);
-    return layer_base + slab;
+    return layer_base_of(i) + slab;
 }
 #endif
 
@@ -1426,8 +1484,7 @@ void main() {
         gl_WorkGroupID.x * (WG / 8) + (gl_LocalInvocationIndex >> 3);
     const bool glive = graw < est_count();
     const uint gslot = min(graw, est_count() - 1u);
-    const int gn = int(
-        min(matches[uint(MATCH_BASE) + gslot * uint(1 + 2 * GS)], uint(GS)));
+    const int gn = int(min(match_count(gslot), uint(GS)));
     const uint gbase = uint(PMAT_BASE) + gslot * uint(PMAT_STRIDE);
     PlaneRef gs0 =
         addr.img[ADDR_BASE + SRC_BASE + match_layer(gslot, 0, gn)];
@@ -1531,8 +1588,7 @@ void main() {
         return;
     }
     const uint gbase = uint(PMAT_BASE) + sr * uint(PMAT_STRIDE);
-    const int sn = int(
-        min(matches[uint(MATCH_BASE) + sr * uint(1 + 2 * GS)], uint(GS)));
+    const int sn = int(min(match_count(sr), uint(GS)));
     float g[64];
     float v[64];
     LD4(g, gbase, 0) LD4(g, gbase, 4) LD4(g, gbase, 8) LD4(g, gbase, 12)
@@ -1607,8 +1663,7 @@ void main() {
         return;
     }
     const uint aslot = araw;
-    const int an = int(
-        min(matches[uint(MATCH_BASE) + aslot * uint(1 + 2 * GS)], uint(GS)));
+    const int an = int(min(match_count(aslot), uint(GS)));
     const uint gbase = uint(PMAT_BASE) + aslot * uint(PMAT_STRIDE);
     const float wgt = pmat[gbase + uint(MAT_WEIGHT)];
     float am[64];
@@ -1690,6 +1745,14 @@ void main() {
     const int y = min(gy * STEP, TEMP_R);
     if (RADIUS == 0) {
         run_group(wg, x, y, 0, 0, 0);
+    } else if (CACHE != 0) {
+        // The cache computes one centre per dispatch, named by the push
+        // constant; every other fold of this frame reads a record an earlier
+        // frame already published.
+        const int i = pc.fold;
+        const int slab = clamp(2 * RADIUS - i, pc.pn - pc.frames + 1 + RADIUS,
+                               pc.pn + RADIUS);
+        run_group(wg, x, y, layer_base_of(i), slab, i);
     } else {
         for (int i = 0; i <= 2 * RADIUS; ++i) {
             const int cm = clamp(pc.pn - RADIUS + i, 0, pc.frames - 1);

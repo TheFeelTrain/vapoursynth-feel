@@ -4,17 +4,18 @@ Status: **shipped**. Port of `reference/vapoursynth-zip` (`src/filters/wnnm.zig`
 `src/vapoursynth/wnnm.zig`); vszipcl/vszipcu never had a GPU WNNM. Everything is
 **f32**: the estimate is a three-kernel split (Gram, eigen step, scatter), the
 spatial match a distance kernel plus a one-thread-per-group register top-8, and
-temporal mode publishes the fused matcher's selection for the same three
-kernels. `group_size > 8` still runs the fused kernel.
+temporal mode runs the fused matcher one centre at a time (32 threads) into a
+per-centre match cache, then the same three kernels. `group_size > 8` still runs
+the fused kernel.
 
 | config (jpbd 1080p, `sigma=3`, 5 s medians) | vsfeel | vszip |
 |---|---|---|
-| chroma U/V, `radius=1` (the benchmark default) | **270 fps** | 198 fps |
+| chroma U/V, `radius=1` (the benchmark default) | **505 fps** | 207 fps |
 | chroma U/V, radius=0 | **1615 fps** | 408 fps |
 | luma, radius=0 | **1291 fps** | 204 fps |
 
-The radius=1 row is the temporal matcher; the same content at radius=0 is 6x
-faster (see Open work for what is left in it).
+The radius=1 row is 2.4x vszip and the temporal matcher is ~57% of it; the same
+content at radius=0 is 3x faster (see Open work for what is left).
 
 Accuracy, against vszip and against an independent f64 exact-SVD oracle
 (320x240 / 640x360, `sigma=3`; max abs diff, "bad" = pixels over 1e-5):
@@ -43,10 +44,29 @@ The port is f32 end to end; there is no f64 path any more.
 - **Temporal match** (`radius > 0`): the predictive search is inherently
   sequential (each layer seeds from the previous layer's selection) and stays in
   the fused kernel, which stops after the selection and publishes one match
-  record per fold with the *absolute* address-table layer of each patch. Its
-  candidate selection is parallel (`fr_tile`): every candidate counts how many
-  rank below it, error first and then arrival order, which is the reference's
-  stable order, and the tile's list is merged into the running one.
+  record per *centre*. Its candidate selection is parallel (`fr_tile`): every
+  candidate counts how many rank below it, error first and then arrival order,
+  which is the reference's stable order, and the tile's list is merged into the
+  running one. The kernel runs at **32 threads per group** (`-DWG=32`): the
+  candidate tile is 32 wide, so a 128-thread workgroup left three quarters of it
+  idle while still paying four-warp barriers (1.6x at 32).
+- **Per-centre match cache** (`radius > 0`, `group_size <= 8`): a centre's
+  selection is identical for every output that consumes it, and there are
+  `2r+1` of those, so `CACHE`/`RING` spec constants key the match records by
+  centre frame in a persistent ring (`RING` = `2folds` rounded up to a power of
+  two, so a little request reordering still hits). The host keeps a tag per
+  slot (`centre frame or INT_MIN`) and dispatches the matcher only for the folds
+  whose centre is not in the ring, one dispatch per centre under a push-constant
+  fold index; the estimate still runs over every slot. Records store the
+  position *within the centre's own window*, and the consumer rebases it onto
+  its own address table (`layer_base_of`), which is what makes a record reusable
+  by a frame whose table starts elsewhere. Tags are published after the submit
+  and every cached frame starts with a whole-queue barrier, the same
+  cross-submission handoff the BM3D ring uses; the record slot is the only state
+  shared across frames, and holding one lock across record-to-submit keeps
+  record order equal to submission order. `VSFEEL_WNNM_NOCACHE` drops the ring
+  for per-frame slots (also the fallback when the ring would not fit the 96 MiB
+  budget).
 - **Estimate phase** (any radius, `group_size <= 8`), three kernels over
   `NG * (2*radius+1)` slots, so each phase runs at the width its work needs:
   - `ENTRY_GRAM`: 8 lanes per group, lane l takes column l of every patch row.
@@ -61,6 +81,9 @@ The port is f32 end to end; there is no f64 path any more.
     sorting: the shrink only needs to know which value holds rank 0 (`top0…`),
     since `M = sum_k gain_k v_k v_k^T` is order-free, and a value's gain is
     `1` for rank 0 or `(s + sqrt(s^2 - c)) / 2s` while `s^2 - c > 0`.
+  - One accessor, `match_rec(slot)`, is the record's address for *every* read
+    (count, positions, layers); reading the count from the linear slot instead
+    is invisible while the ring slot equals the fold and wrong everywhere else.
   - `ENTRY_APPLY`: 8 lanes per group, lane l taking column l of every patch row
     so both the patch loads and the atomics are consecutive words; all eight
     output columns come from the 64-entry `M` in registers. A temporal fold
@@ -77,10 +100,8 @@ The port is f32 end to end; there is no f64 path any more.
   reference's serial rotation order: the padded round-robin does not converge.
 - `residual` subtracts each pixel's mean over the group (sequential f32 sum,
   divide, subtract) and adds it back in the scatter.
-- Temporal (`radius > 0`) recomputes a centre frame's group per consuming output
-  (the reference stages tall raw frames instead), reproducing the VAggregate
-  fold's `(frame, slab)` pairs including the clipped boundaries, which read some
-  slabs twice.
+- Temporal (`radius > 0`) reproduces the VAggregate fold's `(frame, slab)` pairs
+  including the clipped boundaries, which read some slabs twice.
 - `q = min(bs^2, group_size)` picks a `-DQMAX` 8/16/32 variant; q > 32 is
   rejected (the reference allows 64). Scratch is budgeted against the core's VRAM
   allowance at creation.
@@ -105,9 +126,21 @@ order, frame props, GPU chaining), creation variants and every error path.
 
 ## Performance
 
-- Frame at 1080p defaults is 0.78 ms: **match ~0.33 ms, estimate 0.41 ms**
-  (same-session A/B against `VSFEEL_WNNM_SKIPGROUP=1`, after the staging took the
-  match phase from 0.50 ms).
+- The temporal frame at the benchmark default is ~1.98 ms for two chroma
+  planes. Per plane the GPU probe (`VSFEEL_WNNM_GPUTRACE`) says **match 0.35 ms,
+  gram 0.17, solve 0.01, apply 0.08, finish 0.01**, i.e. ~0.6 ms measured of a
+  ~1 ms plane: the rest is dispatch and queue overhead (see Open work). An extra
+  fold costs ~0.15 ms per plane, and the frame divides roughly 57% matcher,
+  25% Gram, 12% apply by ablation (an isolated kernel's ablation understates its
+  share because the phases overlap).
+- The per-centre cache took the temporal default from 270 to 430 fps by
+  searching one centre per frame instead of three; making the tags
+  order-independent (no cursor invalidation, `RING` = two folds' worth of slots)
+  recovered the out-of-order requests to 473, and fixing the record-count read
+  took it to **505**. Request order is not sequential: 38% of vspipe's frames
+  arrived out of order when the cache trusted a cursor.
+- The spatial frame is 0.62 ms: **match ~0.25 ms, estimate 0.37 ms** (the
+  staging had taken the match phase from 0.50 ms).
 - Staging the search window in LDS is worth 1.17x on the whole frame (ABBA,
   n=12: 1140 -> 1329 fps): the SSD's two global loads per term become two LDS
   loads out of a 2 KB window that the whole workgroup shares.
@@ -137,6 +170,21 @@ order, frame props, GPU chaining), creation variants and every error path.
 
 ## Historical
 
+- **2026-10-24 - the temporal matcher looks a centre up once (270 -> 505 fps).**
+  Three changes, each measured A/B on the default arm: 32 threads and a
+  32-candidate tile for the temporal matcher (the fused matcher ran 128 threads
+  for a 32-wide tile, so 96 lanes hit barriers and nothing else: 1.6x), the
+  per-centre match cache (one search per centre, tags and a ring instead of a
+  request-order cursor), and a one-line fix to the record count. Traps this
+  round: (1) the count read went through the *linear* slot while every other
+  field went through `match_rec`, which is invisible while the ring slot equals
+  the fold and drops a fold's whole contribution wherever a clip boundary clamps
+  the centre - the request-order test caught it on frame 0 only, at 5.2e-3,
+  while every other frame agreed to 3e-7; (2) wrapping the temporal path in a
+  cursor that invalidated the cache on any out-of-order frame made it useless,
+  because vspipe's requests are not in order; (3) a vspipe screen whose input is
+  CPU-resident measures the upload, not the filter, and made radius 0 and 1 look
+  identical - probe with `std.GPUUpload` or not at all.
 - **2026-10-24 - f32 only, and the benchmark measures chroma + `radius=1`.** The
   benchmark now mirrors the filter's real use (`sigma=[0, s, s]` on the f32 clip,
   temporal search): 24.5 fps with the fused f64 estimate, 83 with the same kernel
@@ -196,17 +244,28 @@ order, frame props, GPU chaining), creation variants and every error path.
 
 ## Open work
 
-- **The temporal path still searches each centre `2r+1` times.** Every output
-  frame recomputes the groups of centres `n-r .. n+r`, and each of those centres
-  is recomputed by its other `2r` consumers: the reference avoids this by
-  splitting into a raw pass per centre plus a VAggregate fold, so its `2r+1`
-  slabs are computed once (BM3D here does the same with an accumulator ring).
-  A per-centre cache of `{matches, M, weight}` would cut the temporal work by
-  `2r+1`; at radius 1 that is the difference between 270 fps and well over 500.
-- What is left in the temporal matcher itself is the SSD traffic: each candidate
-  reads its 64 pixels from global (the reference block is already staged). The
+- **~0.8 ms per temporal frame is outside every measured kernel**: 1.2 ms of
+  dispatch time against a 1.98 ms frame. Ten dispatches with a barrier between
+  each, a 8 MB accumulator fill and an 8-frame pipeline cannot account for that
+  by themselves, so the next measurement should be a per-dispatch timestamp
+  pair (the probe's `BOTTOM_OF_PIPE` stamps are reliable for totals but not for
+  short spans) before restructuring anything.
+- **The temporal matcher is 57% of the frame at 7-10 warps per CU.** Its 32
+  threads are right for the tile and the barriers, but the SSD chains are
+  latency-bound and the CU is nearly empty. A 128-thread workgroup with a
+  128-candidate tile is *worse* (the rank is quadratic in the tile). The
+  candidates are four groups per workgroup with subgroup barriers (four warps,
+  each running its own group) or one warp per reference block with the top-K by
+  shuffle argmin (nssfactory `match.cu`) - both need the candidate loop to stop
+  using workgroup barriers.
+- The estimate still runs over all `2r+1` slots even when the cache supplied
+  their matches; caching `M` and the weight per centre as well would drop the
+  Gram+solve to once per centre (~0.2 ms of the frame) for twice the ring
+  memory.
+- What is left in the matcher itself is the SSD traffic: each candidate reads
+  its 64 pixels from global (the reference block is already staged). The
   spatial pass could stage its window like `ENTRY_DIST` does, but `win` costs
-  4 KB of the LDS that the occupancy above depends on.
+  4 KB of the LDS that the occupancy depends on.
 - **The spatial matcher is still ~40% of its frame (~0.33 ms).** Its SSDs read both
   patches from LDS but the *reference* block is re-read for every candidate, and
   the 225 distances per group go out to a 52 MB array and come back. The shape
@@ -217,11 +276,6 @@ order, frame props, GPU chaining), creation variants and every error path.
   fps, not 1100. Porting the split estimate to `q = 16/32` needs a different
   eigen step: 16x16 f32 no longer fits in registers (nssfactory switches to
   16 lanes per group over equivalent LDS).
-- Temporal recompute is `2r+1` times the spatial work; a raw-frame scratch ring
-  or a merged multi-output dispatch is the fix.
-- The f64 path exists only as the fused kernel at ~82 fps. If exactness ever
-  needs to be fast, the f64 Rayleigh quotient over an f64 Gram in the split
-  solve costs ~0.17 ms (prototype mode D measured 1.04e-5 end to end).
 - q > 32 is rejected (LDS eigen workspace); the reference allows 64.
 
 ## Debug env vars
@@ -230,6 +284,11 @@ order, frame props, GPU chaining), creation variants and every error path.
 - `VSFEEL_WNNM_TIMING=1` - per-frame host split (acquire/record/submit).
 - `VSFEEL_WNNM_DUMP=<frame>` - dump each centre's selected group (errors,
   positions, temporal slot, kept count, weight) to stderr.
+- `VSFEEL_WNNM_NOCACHE=1` - no per-centre match cache: one record per fold per
+  frame (the fallback path, and the A/B arm for the cache).
+- `VSFEEL_WNNM_GPUTRACE=<frame>` - one-shot GPU timestamps around the match,
+  Gram, solve, apply and finish dispatches of that frame, printed to stderr.
+  Feed the filter device-resident frames or the number is the upload.
 - `VSFEEL_WNNM_NOSPLIT=1` - take the fused kernel for the split path's configs
   too (the `group_size > 8` code path).
 - `VSFEEL_WNNM_SKIPMATCH=1` / `VSFEEL_WNNM_SKIPGROUP=1` - ablations: skip the
