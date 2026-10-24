@@ -3,7 +3,9 @@ the shipped build tools (the shader-limits checker, benchmark script
 generation, wheel staging)."""
 
 import importlib.util
+import json
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 GENERATOR = ROOT / "src" / "gen_spirv_header.py"
 BENCHMARK = ROOT / "tools" / "benchmark.py"
 SHADER_LIMITS = ROOT / "tools" / "shader_limits.py"
+LINT_STUB = ROOT / "tools" / "lint_stub.py"
 HATCH_BUILD = ROOT / "hatch_build.py"
 
 # A minimal header-only SPIR-V module: magic, version, generator, bound,
@@ -59,6 +62,58 @@ def test_generator_rejects_a_truncated_module(tmp_path):
     assert proc.returncode != 0
     assert not out.exists()
     assert "multiple of 4" in proc.stderr
+
+
+def run_lint_stub(build):
+    return subprocess.run(
+        [sys.executable, str(LINT_STUB), "--build-dir", str(build)],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_lint_stub_collapses_arrays_and_shadows_the_build_include(tmp_path):
+    """The analysis view keeps every symbol but parses no array bodies."""
+    proc, made = run_generator(tmp_path, SPV_HEADER)
+    assert proc.returncode == 0, proc.stderr
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / "spirv_binaries.h").write_text(made.read_text())
+    (build / "compile_commands.json").write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(build),
+                    "file": "shader.cpp",
+                    "output": "shader.o",
+                    "command": f"c++ -I{build} -c shader.cpp",
+                }
+            ]
+        )
+    )
+
+    proc = run_lint_stub(build)
+    assert proc.returncode == 0, proc.stderr
+    stub = (build / "lint" / "spirv_binaries.h").read_text()
+    assert "static const uint32_t shader_spv[] = {0};" in stub
+    assert "static const size_t shader_spv_size = sizeof(shader_spv);" in stub
+    database = json.loads((build / "lint" / "compile_commands.json").read_text())
+    argv = shlex.split(database[0]["command"])
+    # The stub directory must come before the build directory, which holds the
+    # real generated header.
+    assert argv.index(f"-I{build / 'lint'}") < argv.index(f"-I{build}")
+
+
+def test_lint_stub_rejects_a_header_without_arrays(tmp_path):
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / "spirv_binaries.h").write_text("#pragma once\n")
+    (build / "compile_commands.json").write_text("[]")
+
+    proc = run_lint_stub(build)
+    assert proc.returncode != 0
+    assert "no SPIR-V arrays" in proc.stderr
+    assert not (build / "lint" / "spirv_binaries.h").exists()
 
 
 def test_generator_rejects_a_non_spirv_module(tmp_path):

@@ -15,9 +15,8 @@ jobs:
   lint:
     # 26.04, not latest: noble's glslc is 2023.8 and rejects --target-env=vulkan1.4.
     runs-on: ubuntu-26.04
-    # About five minutes normally, most of it clang-tidy and cppcheck. The cap is
-    # there so a stalled download fails instead of sitting on the six hour
-    # default.
+    # About half a minute normally. The cap is there so a stalled download fails
+    # instead of sitting on the six hour default.
     timeout-minutes: 10
     steps:
     - uses: actions/checkout@v7
@@ -128,8 +127,8 @@ jobs:
 
     - name: GPU-less tests
       # The version test needs the installed GPU plugin, so it stays local;
-      # these five never touch a device (header generator, benchmark vpy
-      # generation, wheel staging).
+      # the rest never touch a device (header generator, lint stub, benchmark
+      # vpy generation, wheel staging).
       run: |
         uv run --no-sync python -m pytest tests/test_build.py -q \
-          -k "generator or benchmark or hatch"
+          -k "generator or lint_stub or benchmark or hatch"

@@ -400,6 +400,14 @@ and `build/vk_spv/`, which `tools/install.sh` writes. A gate whose tool is
 missing reports `skipped`; a gate whose build directory is missing fails,
 because then it did not run.
 
+The gates run concurrently, so a full run costs about the slowest one. The
+analysers read a derived view in `build/lint/`: `tools/lint_stub.py` replaces the
+tens of MB of generated SPIR-V arrays in `build/spirv_binaries.h` with a stub
+that keeps every symbol, then rewrites the compile database to resolve it first.
+Parsing that data-only header once per translation unit was most of a lint run;
+neither gate reports on it, since both keep findings in `src/`.
+`VSFEEL_LINT_JOBS` caps the analyser workers (default: CPU count, max 16).
+
 After changing a shader or a `-D`, run `uv run python tools/shader_limits.py` for
 the workgroup/LDS table; `--check` compares that table against the `GpuWorkgroup`
 literals at each `gpu_create_pipeline` call site and fails on a mismatch. The lint
