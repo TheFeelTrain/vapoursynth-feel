@@ -431,18 +431,38 @@ static bool wnnm_full_range(const VSFrame * frame, const VSVideoFormat & format,
     return error ? false : range != 0;
 }
 
-// Static LDS of the group kernel, exactly as src/wnnm.comp declares it: eight
-// 256-entry arrays (candidate tile, final list, frame list, centre list, seed
-// order), the eigen workspace, the round-robin rotation cache and seven
-// scalars. tools/shader_limits.py --check
-// compares this against the built module.
-static uint32_t group_shared_bytes(int qmax) {
-    const uint32_t lists = 8u * 256u * 4u;
+// Static LDS of the group kernel. The fused variant carries the qmax eigen
+// workspace and KMAXL-wide matcher lists; the split temporal matcher
+// (MATCH_ONLY) returns before the estimate, so the compiler drops the eigen
+// arrays and the top lists shrink to GS. Both include the packed centre block
+// (BS*BS floats). Checked against the built modules at bs=8: q8/q16/q32 static
+// 3336/5736/15144 plus BS^2*4 (256), and q8 MATCH_ONLY 1780 plus 256.
+// tools/shader_limits.py cannot attribute these variants (their code pointer
+// comes from the runtime variant table), so that table reports them unchecked.
+static constexpr uint32_t group_shared_bytes(int qmax, int bs, int gs,
+                                             bool match_only) {
     const uint32_t q2 = uint32_t(qmax) * uint32_t(qmax);
-    // + the packed centre block (REFBLK_MAX) and the split matcher's window.
-    return lists + 2u * q2 * 4u + q2 * 4u + uint32_t(qmax) * 8u + 24u +
-           256u * 4u;
+    // top_{e,xy,t}[TOPCAP], top_n.
+    const uint32_t topcap = match_only ? uint32_t(gs) : 64u;
+    uint32_t bytes = topcap * 3u * 4u + 4u;
+    // cand[TFULL], tile_{e,xy}[SELCAP], tile_n, merg_{e,xy}[SELCAP].
+    bytes += 32u * 4u + 2u * 32u * 4u + 4u + 2u * 32u * 4u;
+    // fr_{e,xy}[KMAXL], fr_n, loc_n, ctr_xy[KMAXL], ctr_n, seed_order.
+    bytes += 2u * 64u * 4u + 2u * 4u + 64u * 4u + 4u + 64u * 4u;
+    if (!match_only) {
+        // weight, kept, gm/vt/mm[QMAX^2], shr/eig[QMAX], jcs[QMAX+2], jflag.
+        bytes += 8u + 3u * q2 * 4u + 2u * uint32_t(qmax) * 4u +
+                 (uint32_t(qmax) + 2u) * 4u + 4u;
+    }
+    // refblk[BS*BS].
+    return bytes + uint32_t(bs) * uint32_t(bs) * 4u;
 }
+
+// The built modules' numbers, for the formula above to stay honest.
+static_assert(group_shared_bytes(8, 8, 8, false) == 3592);
+static_assert(group_shared_bytes(8, 8, 8, true) == 2036);
+static_assert(group_shared_bytes(16, 8, 8, false) == 5992);
+static_assert(group_shared_bytes(32, 8, 8, false) == 15400);
 
 // ---------------------------------------------------------------------------
 // Frame processing
@@ -1765,8 +1785,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                 // The temporal matcher still runs the fused kernel, up to the
                 // point where it publishes its selection.
                 const GpuWorkgroup gwg { .x = 32u,
-                                         .shared_bytes =
-                                             group_shared_bytes(qmax) };
+                                         .shared_bytes = group_shared_bytes(
+                                             qmax, d->bs, d->gs, true) };
                 pl.group_pipe =
                     add(tag, variant.group, variant.group_size, gwg);
             }
@@ -1775,10 +1795,12 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                 return;
             }
         } else {
-            // The group kernel's LDS footprint is a function of qmax and the
-            // eigen width; gpu_create_pipeline checks it against the device.
+            // The group kernel's LDS footprint is a function of qmax, bs and
+            // the estimate path; gpu_create_pipeline checks it against the
+            // device.
             const GpuWorkgroup wg { .x = uint32_t(kWorkgroup),
-                                    .shared_bytes = group_shared_bytes(qmax) };
+                                    .shared_bytes = group_shared_bytes(
+                                        qmax, d->bs, d->gs, false) };
             pl.group_pipe = add(tag, variant.group, variant.group_size, wg);
             if (!pl.group_pipe) {
                 return;
