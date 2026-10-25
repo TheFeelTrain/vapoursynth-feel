@@ -6,14 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [v1.3.0] - 2026-10-25
+
 ### Added
 
-- `core.vsfeel.WNNM`, a Vulkan implementation of the WNNM patch denoiser, matching vszip's CPU filter
+- `core.vsfeel.WNNM`, a Vulkan implementation of the WNNM patch denoiser that matches vszip's CPU filter
+- WNNM accepts 16-bit integer and fp16 input and output natively
 
 ### Changed
 
 - DFTTest is about 30% faster
 - DFTTest with larger temporal windows (tbsize 5 and 7) is up to 6.7x faster
+
+### Fixed
+
+- Windows builds link against the current MinGW CRT
 
 ## [v1.2.0] - 2026-10-21
 
@@ -137,6 +144,7 @@ The plugin has moved to the VapourSynth R80 GPU API. The core now owns the devic
 - vs-jetpack backend integration, so the filters can be used through the vs-jetpack wrappers
 - Windows and Linux wheels, built and published by CI
 
+[v1.3.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.2.0...v1.3.0
 [v1.2.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.2...v1.2.0
 [v1.1.2]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.1...1.1.2
 [v1.1.1]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.0...1.1.1

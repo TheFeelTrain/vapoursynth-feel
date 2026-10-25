@@ -16,11 +16,11 @@ gain, then subtract the pre-scaled neutral, in that order) and reads the frame's
 
 | config (jpbd 1080p, `sigma=3`, 5 s medians) | vsfeel | vszip |
 |---|---|---|
-| chroma U/V, `radius=1` (the benchmark default) | **1267 fps** | 207 fps |
+| chroma U/V, `radius=1` (the benchmark default) | **1287 fps** | 207 fps |
 | chroma U/V, radius=0 | **1615 fps** | 408 fps |
 | luma, radius=0 | **1291 fps** | 204 fps |
 
-The radius=1 row is 6.1x vszip and the temporal matcher is ~62% of it; the same
+The radius=1 row is 6.2x vszip and the temporal matcher is ~62% of it; the same
 content at radius=0 is 3x faster (see Open work for what is left).
 
 Accuracy, against vszip and against an independent f64 exact-SVD oracle
@@ -386,10 +386,11 @@ and the request orders on both.
 - **The eigen step is the next latency-bound dispatch (~0.18 ms after the M
   cache, 0.26 before).** It is one thread per group, so the whole dispatch is ~2 waves/SIMD
   however many groups there are: mostly per-thread dependency chain (560
-  rotations of two transcendentals each), not work. Making the four disjoint rotations of a round run on four lanes (the
-  fused path's round-robin Jacobi over LDS) trades ~10x the instructions for
-  full occupancy; unmeasured, and the round-robin's f32 order must be checked
-  against the current 20-sweep serial one before it ships.
+  rotations of two transcendentals each), not work. A warp-per-group port of
+  the fused round-robin Jacobi over LDS was measured: solve 0.18 -> 0.26 ms and
+  the frame 1.16 -> 1.18 ms. A 32-lane workgroup per group wastes 28 lanes and
+  adds a barrier per round, so the serial register sweep stays; a
+  4-lane-per-group version (8 groups per warp) is the only remaining shape.
 - **The default frame is 62% match, 18% apply, 15% solve, 4% gram, 1%
   finish (GPUTRACE frame 5 after the M cache: 0.72/0.21/0.18/0.04/0.01 ms of
   1.16 ms).** The matcher is at ~8 waves/SIMD. Its 32 threads
