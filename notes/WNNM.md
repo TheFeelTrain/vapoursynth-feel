@@ -1,7 +1,8 @@
 # WNNM — notes
 
-Status: **shipped**. Port of `reference/vapoursynth-zip` (`src/filters/wnnm.zig`,
-`src/vapoursynth/wnnm.zig`); vszipcl/vszipcu never had a GPU WNNM. Everything is
+Status: **iterating** (2026-10-25 review). Port of `reference/vapoursynth-zip`
+(`src/filters/wnnm.zig`, `src/vapoursynth/wnnm.zig`); vszipcl/vszipcu never had a
+GPU WNNM. Everything is
 **f32**: the estimate is a three-kernel split (Gram, eigen step, scatter), the
 spatial match a distance kernel plus a one-thread-per-group register top-8, and
 temporal mode runs the fused matcher one centre at a time (32 threads) into a
@@ -32,11 +33,15 @@ Accuracy, against vszip and against an independent f64 exact-SVD oracle
 
 The port is f32 end to end; there is no f64 path any more.
 
+**Known blockers:** split `residual` with `block_size > 8`, narrow-plane `win`
+staging, and 16-bit ring ordering. Defaults are unaffected.
+
 ## Implementation
 
 - `src/wnnm.cpp` (host) + `src/wnnm.comp`: one shader module with
-  `-DENTRY_GRAD/…` variants selected by `-D`. f32 input only, like the
-  reference. One workgroup per reference block on a `step` lattice; the block
+  `-DENTRY_GROUP/…` variants selected by `-D`. f32 internally; the reference is
+  f32-only and a u16/f16 clip is widened at the edge (banner). One workgroup per
+  reference block on a `step` lattice; the block
   position is `min(k*step, W-bs)` on both axes, which is what the reference's
   `while (_x < temp_c + step)` lattice does.
 - **Spatial match phase** (radius 0), two kernels:
@@ -81,11 +86,13 @@ The port is f32 end to end; there is no f64 path any more.
   linear range and the kernels' `STRIDE` is samples at every depth. Only the
   planes the filter processes are converted (a sigma-0 plane is a bit-exact copy
   straight from the centre frame) and an `rclip` gets its own set of slots. The
-  slots are only tagged after the submit, like the match ring, and the
-  whole-queue barrier at the top of a frame covers their reuse. The ring is the
-  filter's own buffer: it must not go through `gpuExecUsesBuffer`, which
-  transfers ownership to the submission and frees it, and doing so here produced
-  a wrong frame 0 and a core-teardown crash. `wnnm_copy.comp`
+  slots are only tagged after the submit, like the match ring; the whole-queue
+  barrier that covers their reuse is only recorded on the match-cache path, so
+  the radius-0 and no-cache 16-bit paths rely on queue execution order alone.
+  The ring is the filter's own buffer: it must not go through
+  `gpuExecUsesBuffer`, which transfers ownership to the submission and frees it,
+  and doing so here produced a wrong frame 0 and a core-teardown crash.
+  `wnnm_copy.comp`
   has one arm per depth: the integer arm applies `(code * gain - neutral)`
   with the gain/neutral of that frame's `_Range` (full range is the whole code
   span, limited is 219/224 of it with luma's 4096 and chroma's 32768), and the
@@ -115,20 +122,24 @@ The port is f32 end to end; there is no f64 path any more.
     (`fold_dest`, recomputed from the fold index and the push constants), which
     is how the reference's VAggregate hands each output one slab.
   - Scratch: `kSplitStride` 136 floats per group (`[0,64)` Gram then M,
-    `[64,128)` the residual mean, `[128]` the aggregation weight), in the same
-    per-frame buffer the fused path uses for its patch matrix.
+    `[64,128)` the residual mean, `[128]` the aggregation weight), sized for
+    `bs=8`: a larger block with `residual` overruns it. It is the same per-frame
+    buffer the fused path uses for its patch matrix.
 - **Fused path** (`group_size > 8`), one workgroup per group:
   streaming top-k match, Gram, the reference's round-robin parallel Jacobi in
-  f64 (from `reference/vapoursynth-nssfactory/src/cuda/common/block_jacobi.cuh`,
-  mechanism only), shrink, `V diag(r) V^T`, scatter. Odd `q` takes the
-  reference's serial rotation order: the padded round-robin does not converge.
+  f32 (mechanism from
+  `reference/vapoursynth-nssfactory/src/cuda/common/block_jacobi.cuh`), shrink,
+  `V diag(r) V^T`, scatter. Odd `q` takes the reference's serial rotation order:
+  the padded round-robin does not converge.
 - `residual` subtracts each pixel's mean over the group (sequential f32 sum,
-  divide, subtract) and adds it back in the scatter.
+  then divide; the split path multiplies by `1/n` instead) and adds it back in
+  the scatter.
 - Temporal (`radius > 0`) reproduces the VAggregate fold's `(frame, slab)` pairs
   including the clipped boundaries, which read some slabs twice.
 - `q = min(bs^2, group_size)` picks a `-DQMAX` 8/16/32 variant; q > 32 is
-  rejected (the reference allows 64). Scratch is budgeted against the core's VRAM
-  allowance at creation.
+  rejected (the reference allows 64), but `group_size` itself is not capped at
+  the 64-entry lists. Scratch is budgeted against the core's VRAM allowance at
+  creation.
 
 ### Numerics
 
@@ -144,13 +155,13 @@ reference (4.7e-3, 889 bad); `REF_TOL` keeps both references' own spread visible
 
 `tests/test_wnnm.py`: parity against `vszip.WNNM` (spatial sweep, `rclip`,
 per-plane sigma, `residual`, `adaptive_aggregation`, starved and tiny frames, odd
-geometry, temporal with the boundary fold), the f64 path at `EXACT_TOL` 5e-6
-(`VSFEEL_WNNM_NOSPLIT`), self-consistency (determinism, parallel load, request
-order, frame props, GPU chaining), creation variants and every error path. The
-native depths are graded against the same filter on the manually widened clip:
-u16 (limited and full range, with and without `rclip`) to **1 code**, f16 to
-**half an ulp**, plus a sigma-0 plane staying a bit-exact copy and the request
-orders on both.
+geometry, temporal with the boundary fold), the fused f32 path
+(`VSFEEL_WNNM_NOSPLIT`; there is no f64 path), self-consistency (determinism,
+parallel load, request order, frame props, GPU chaining), creation variants and
+every error path. The native depths are graded against the same filter on the
+manually widened clip: u16 (limited and full range, with and without `rclip`) to
+**1 code**, f16 to **half an ulp**, plus a sigma-0 plane staying a bit-exact copy
+and the request orders on both.
 
 ## Performance
 
@@ -220,6 +231,11 @@ orders on both.
 
 ## Historical
 
+- **2026-10-25 - the serial merge's barrier was non-uniform.** Both `fr_feed`
+  fallbacks (`group_size` or `ps_num` above 32) called `barrier()` inside
+  `if (tid == 0)`, so the next tile overwrote `cand` under the feeding thread:
+  `group_size=33/64` was 1.5e-2/1.9e-2 wrong and once reset the device. Hoisted
+  out of the branch; now <= 2.1e-3 against vszip. No default-arm change.
 - **2026-10-24 - the matcher's occupancy and the planes' overlap (839 -> 984
   fps).** Two changes, each graded A/B on the default arm. The temporal
   matcher's per-group LDS was 3 KB, sized for the fused path; cutting it to the
@@ -346,25 +362,29 @@ orders on both.
   that removes both (nssfactory `match.cu`, `spatial_match_warp_kernel`) is one
   warp per reference, the reference block in registers, the top-K by warp-wide
   argmin and no distance array at all.
-- `group_size > 8` and `radius > 0` still take the fused f64 kernel, i.e. tens of
-  fps, not 1100. Porting the split estimate to `q = 16/32` needs a different
-  eigen step: 16x16 f32 no longer fits in registers (nssfactory switches to
-  16 lanes per group over equivalent LDS).
-- q > 32 is rejected (LDS eigen workspace); the reference allows 64.
+- `group_size > 8` (or `NOSPLIT`) takes the fused f32 kernel, which is correct
+  but slower than the split estimate. Porting the split estimate to `q = 16/32`
+  needs a different eigen step: 16x16 f32 no longer fits in registers
+  (nssfactory switches to 16 lanes per group over equivalent LDS).
+- q > 32 is rejected (LDS eigen workspace); the reference allows 64, and
+  `group_size > 64` is not rejected but overruns the 64-entry lists.
 
 ## Debug env vars
 
 - `VSFEEL_WNNM=1` - creation banner (per-plane geometry, scratch bases, qmax).
 - `VSFEEL_WNNM_TIMING=1` - per-frame host split (acquire/record/submit).
 - `VSFEEL_WNNM_DUMP=<frame>` - dump each centre's selected group (errors,
-  positions, temporal slot, kept count, weight) to stderr.
+  positions, temporal slot, kept count, weight) to stderr. Only the fused path
+  fills `kept`/weight, and cached centres are not re-traced.
 - `VSFEEL_WNNM_NOCACHE=1` - no per-centre match cache: one record per fold per
-  frame (the fallback path, and the A/B arm for the cache).
+  frame (the fallback path, and the A/B arm for the cache; the 16-bit ring then
+  has no barrier).
 - `VSFEEL_WNNM_GPUTRACE=<frame>` - one-shot GPU timestamps around the match,
   Gram, solve, apply and finish dispatches of that frame, printed to stderr.
   Feed the filter device-resident frames or the number is the upload.
 - `VSFEEL_WNNM_NOSPLIT=1` - take the fused kernel for the split path's configs
-  too (the `group_size > 8` code path).
+  too (the `group_size > 8` code path); it is the workaround for the split
+  `residual` and `win` paths.
 - `VSFEEL_WNNM_SKIPMATCH=1` / `VSFEEL_WNNM_SKIPGROUP=1` - ablations: skip the
   match phase or the estimate phase (output is garbage, timing only).
 - `VSFEEL_WNNM_NOGRAM=1` / `VSFEEL_WNNM_NOSOLVE=1` / `VSFEEL_WNNM_NOAPPLY=1` -

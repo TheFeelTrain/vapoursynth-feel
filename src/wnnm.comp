@@ -800,12 +800,16 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
             barrier();
             if (max(GS, PS_NUM) <= SELCAP) {
                 fr_tile(span, kk, true, cx, wleft, wtop, loc_base, base);
-            } else if (tid == 0) {
-                for (int i = 0; i < span; ++i) {
-                    const int idx = base + i;
-                    fr_feed(cand[i],
-                            pack_xy(wleft + idx % cx, wtop + idx / cx), kk);
+            } else {
+                if (tid == 0) {
+                    for (int i = 0; i < span; ++i) {
+                        const int idx = base + i;
+                        fr_feed(cand[i],
+                                pack_xy(wleft + idx % cx, wtop + idx / cx), kk);
+                    }
                 }
+                // The serial feed reads `cand`, which the next tile overwrites;
+                // every thread must reach this barrier, not just thread 0.
                 barrier();
             }
         }
@@ -848,10 +852,15 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
                         if (max(GS, PS_NUM) <= SELCAP) {
                             fr_tile(span, kk, false, cx, wleft, wtop, loc_base,
                                     base);
-                        } else if (tid == 0) {
-                            for (int c = 0; c < span; ++c) {
-                                fr_feed(cand[c], locs[loc_base + base + c], kk);
+                        } else {
+                            if (tid == 0) {
+                                for (int c = 0; c < span; ++c) {
+                                    fr_feed(cand[c], locs[loc_base + base + c],
+                                            kk);
+                                }
                             }
+                            // Same as the spatial pass: thread 0 reads `cand`
+                            // and the whole workgroup waits here.
                             barrier();
                         }
                     }

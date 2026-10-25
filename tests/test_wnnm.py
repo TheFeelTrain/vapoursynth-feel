@@ -53,6 +53,11 @@ pytestmark = pytest.mark.usefixtures("clip_grays")
 REF_TOL = 2e-2
 # float atomic ordering floor: measured <= 3.6e-7 between two runs.
 SELF_TOL = 1e-5
+# Above SELCAP=32 the matcher feeds the group serially. Measured after the
+# barrier was made uniform: <= 2.1e-3 max diff and <= 0.5% of samples over 1e-5
+# on the 512x264 crop (1.5e-2 / 1.9e-2 and 97% before it).
+SERIAL_TOL = 5e-3
+SERIAL_NDIFF = 0.02
 
 
 def WNNM(*args, **kwargs):
@@ -60,7 +65,9 @@ def WNNM(*args, **kwargs):
     return cpu_node(vs.core.vsfeel.WNNM(*args, **kwargs))
 
 
-def _ref_compare(fmt, frames, params, planes=None, guide=None, crop=None, nframes=None):
+def _ref_payload(
+    fmt, frames, params, planes=None, guide=None, crop=None, nframes=None, diff_tol=None
+):
     reference_or_skip("vszip", "WNNM")
     spec = reference_spec(
         "vszip",
@@ -72,10 +79,17 @@ def _ref_compare(fmt, frames, params, planes=None, guide=None, crop=None, nframe
         guide=guide,
         guide_kwarg="rclip",
         crop=crop,
+        diff_tol=diff_tol,
     )
     if nframes is not None:
         spec["nframes"] = int(nframes)
-    return reference_compare(spec)["maxdiff"]
+    return reference_compare(spec)
+
+
+def _ref_compare(fmt, frames, params, planes=None, guide=None, crop=None, nframes=None):
+    return _ref_payload(
+        fmt, frames, params, planes=planes, guide=guide, crop=crop, nframes=nframes
+    )["maxdiff"]
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +162,25 @@ def test_starved_tiny_frame_matches_vszip(clip_grays):
     assert worst <= REF_TOL, f"max abs diff {worst:.3e}"
 
 
+@pytest.mark.parametrize("group_size", [32, 33, 64])
+def test_serial_group_merge_matches_vszip(clip_grays, group_size):
+    """group_size above SELCAP=32 uses the serial merge; every thread must reach
+    its tile barrier, or the next tile overwrites `cand` under thread 0."""
+    payload = _ref_payload(
+        "grays",
+        (0, 11, 23),
+        dict(sigma=3, block_size=4, group_size=group_size),
+        crop={"left": 64, "top": 48, "right": 64, "bottom": 48},
+        diff_tol=1e-5,
+    )
+    assert payload["maxdiff"] <= SERIAL_TOL, (
+        f"max abs diff {payload['maxdiff']:.3e} (group_size {group_size})"
+    )
+    assert payload["ndiff_frac"] <= SERIAL_NDIFF, (
+        f"{payload['ndiff_frac']:.2%} of samples differ (group_size {group_size})"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reference parity: temporal
 # ---------------------------------------------------------------------------
@@ -185,6 +218,26 @@ def test_temporal_per_plane_matches_vszip():
         "yuv420ps", (1,), dict(sigma=[3, 2, 2], radius=1), nframes=3, crop={"left": 64, "top": 48}
     )
     assert worst <= REF_TOL, f"max abs diff {worst:.3e}"
+
+
+@pytest.mark.parametrize("ps_num", [33, 64])
+def test_temporal_large_ps_num_matches_vszip(clip_grays, ps_num):
+    """ps_num above SELCAP=32 uses the serial temporal merge, which shares the
+    same required-uniform barrier."""
+    payload = _ref_payload(
+        "grays",
+        (1,),
+        dict(sigma=3, radius=1, ps_num=ps_num),
+        nframes=3,
+        crop={"left": 64, "top": 48},
+        diff_tol=1e-5,
+    )
+    assert payload["maxdiff"] <= SERIAL_TOL, (
+        f"max abs diff {payload['maxdiff']:.3e} (ps_num {ps_num})"
+    )
+    assert payload["ndiff_frac"] <= SERIAL_NDIFF, (
+        f"{payload['ndiff_frac']:.2%} of samples differ (ps_num {ps_num})"
+    )
 
 
 # ---------------------------------------------------------------------------

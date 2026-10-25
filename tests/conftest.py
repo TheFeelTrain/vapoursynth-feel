@@ -532,6 +532,7 @@ if clip.format.sample_type == vs.FLOAT:
 else:
     dt = np.uint16
 planes = spec.get("planes") or list(range(clip.format.num_planes))
+diff_tol = float(spec.get("diff_tol", 0.0))
 kwargs = dict(spec.get("kwargs") or {})
 if guide is not None:
     kwargs[spec.get("guide_kwarg", "ref")] = guide
@@ -578,7 +579,7 @@ try:
                 raise SystemExit(3)
             d = np.abs(a.astype(np.float64) - b.astype(np.float64))
             maxdiff = max(maxdiff, float(d.max()))
-            ndiff += int((d > 0).sum())
+            ndiff += int((d > diff_tol).sum())
             total += int(d.size)
 except SystemExit:
     raise
@@ -608,12 +609,15 @@ def reference_spec(
     crop=None,
     vsfeel_filter=None,
     source=None,
+    diff_tol=None,
 ):
     """Build the JSON spec consumed by :data:`REFERENCE_SCRIPT`.
 
     ``clip`` names the input format ("grays", "gray16", "yuv420p16", ...);
     ``guide`` is a JSONable description of the joint-filter clip, if any;
-    ``source`` overrides the input file (default: the committed noise clip).
+    ``source`` overrides the input file (default: the committed noise clip);
+    ``diff_tol`` counts only differences above it in ``ndiff_frac`` (default:
+    any nonzero difference).
     """
     spec = {
         "source": source or CLIP_PATH,
@@ -633,6 +637,8 @@ def reference_spec(
         spec["guide_kwarg"] = guide_kwarg
     if vsfeel_filter is not None:
         spec["vsfeel_filter"] = vsfeel_filter
+    if diff_tol is not None:
+        spec["diff_tol"] = float(diff_tol)
     return spec
 
 
