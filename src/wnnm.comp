@@ -54,9 +54,7 @@
 #ifndef TFULL
 #define TFULL 32
 #endif
-#ifndef SELCAP
 #define SELCAP 32
-#endif
 #define KMAXL 64
 // The final list is capped at the group size, so its storage only has to cover
 // GS; the fused matcher's running list (KMAXL) is wider than the top list.
@@ -176,10 +174,11 @@ shared int top_n;
 
 #if !defined(NOMATCH)
 shared float cand[TFULL];
-// The tile's selected list and the merge scratch of the block below.
-shared float tile_e[SELCAP];
-shared uint tile_xy[SELCAP];
+// One tile of candidates (span <= TFULL) and its selected list.
+shared float tile_e[TFULL];
+shared uint tile_xy[TFULL];
 shared int tile_n;
+// Merge scratch for the normal (cap <= SELCAP) path.
 shared float merg_e[SELCAP];
 shared uint merg_xy[SELCAP];
 // The frame currently being selected (vszip's b.temporal / b.selidx list).
@@ -535,31 +534,65 @@ void fr_tile(int span, int kk, bool spatial, int cx, int wleft, int wtop,
     barrier();
 }
 
-void fr_feed(float e, uint xy, int kk) {
-    if (fr_n < kk) {
-        int pos = fr_n;
-        while (pos > 0 && fr_e[pos - 1] > e) {
-            --pos;
-        }
-        for (int j = fr_n; j > pos; --j) {
-            fr_e[j] = fr_e[j - 1];
-            fr_xy[j] = fr_xy[j - 1];
-        }
-        fr_e[pos] = e;
-        fr_xy[pos] = xy;
-        ++fr_n;
-    } else if (e < fr_e[kk - 1]) {
-        int pos = kk - 1;
-        while (pos > 0 && fr_e[pos - 1] > e) {
-            --pos;
-        }
-        for (int j = kk - 1; j > pos; --j) {
-            fr_e[j] = fr_e[j - 1];
-            fr_xy[j] = fr_xy[j - 1];
-        }
-        fr_e[pos] = e;
-        fr_xy[pos] = xy;
+// The same merge when max(GS, PS_NUM) exceeds SELCAP: the running list is
+// KMAXL wide, so drop the largest entries from the ends and merge backwards
+// into fr_* itself. No 64-entry merge scratch is needed.
+void fr_tile_wide(int span, int kk, bool spatial, int cx, int wleft, int wtop,
+                  int loc_base, int base) {
+    const int tid = int(gl_LocalInvocationIndex);
+    const int cap = min(kk, KMAXL);
+    if (tid == 0) {
+        tile_n = min(span, cap);
     }
+    barrier();
+    for (int i = tid; i < span; i += WG) {
+        const float e = cand[i];
+        int rank = 0;
+        for (int j = 0; j < span; ++j) {
+            const float o = cand[j];
+            rank += ((o < e) || (o == e && j < i)) ? 1 : 0;
+        }
+        if (rank < cap) {
+            const int idx = base + i;
+            tile_e[rank] = e;
+            tile_xy[rank] = spatial
+                                ? pack_xy(wleft + idx % cx, wtop + idx / cx)
+                                : locs[loc_base + idx];
+        }
+    }
+    barrier();
+    if (tid == 0) {
+        int a = fr_n;
+        int b = tile_n;
+        const int nout = min(a + b, cap);
+        // Drop the largest first; a tie drops the later tile entry.
+        for (int drop = a + b - nout; drop > 0; --drop) {
+            if (a == 0) {
+                --b;
+            } else if (b == 0) {
+                --a;
+            } else if (fr_e[a - 1] > tile_e[b - 1]) {
+                --a;
+            } else {
+                --b;
+            }
+        }
+        // b > 0 implies w > a - 1, so no unread fr entry is overwritten.
+        for (int w = nout; w > 0;) {
+            --w;
+            if (b == 0 || (a > 0 && fr_e[a - 1] > tile_e[b - 1])) {
+                fr_e[w] = fr_e[a - 1];
+                fr_xy[w] = fr_xy[a - 1];
+                --a;
+            } else {
+                fr_e[w] = tile_e[b - 1];
+                fr_xy[w] = tile_xy[b - 1];
+                --b;
+            }
+        }
+        fr_n = nout;
+    }
+    barrier();
 }
 
 // Merge the frame list into the final list, stable on ties, capped at GS.
@@ -811,16 +844,7 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
             if (max(GS, PS_NUM) <= SELCAP) {
                 fr_tile(span, kk, true, cx, wleft, wtop, loc_base, base);
             } else {
-                if (tid == 0) {
-                    for (int i = 0; i < span; ++i) {
-                        const int idx = base + i;
-                        fr_feed(cand[i],
-                                pack_xy(wleft + idx % cx, wtop + idx / cx), kk);
-                    }
-                }
-                // The serial feed reads `cand`, which the next tile overwrites;
-                // every thread must reach this barrier, not just thread 0.
-                barrier();
+                fr_tile_wide(span, kk, true, cx, wleft, wtop, loc_base, base);
             }
         }
         if (tid == 0) {
@@ -863,15 +887,8 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
                             fr_tile(span, kk, false, cx, wleft, wtop, loc_base,
                                     base);
                         } else {
-                            if (tid == 0) {
-                                for (int c = 0; c < span; ++c) {
-                                    fr_feed(cand[c], locs[loc_base + base + c],
-                                            kk);
-                                }
-                            }
-                            // Same as the spatial pass: thread 0 reads `cand`
-                            // and the whole workgroup waits here.
-                            barrier();
+                            fr_tile_wide(span, kk, false, cx, wleft, wtop,
+                                         loc_base, base);
                         }
                     }
                     if (tid == 0) {

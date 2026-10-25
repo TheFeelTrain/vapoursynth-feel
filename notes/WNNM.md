@@ -229,6 +229,13 @@ and the request orders on both.
 
 ## Historical
 
+- **2026-10-25 - ps_num 33..64 merges in parallel (+97%).** The running
+  list was capped at SELCAP=32, so those folds fell back to a serial
+  O(span*cap) insert on thread 0. `fr_tile_wide` keeps the KMAXL-wide
+  list, drops the largest entries from the ends and merges backwards in
+  place; `ps_num=33` temporal went 200.3 -> 317.7 fps and `ps_num=64`
+  85.5 -> 168.4 (1080p, 5 s ABBA, n=12), while the default stayed 1076.2 ->
+  1077.0. LDS is unchanged.
 - **2026-10-25 - the temporal matcher's dispatches overlap (+9.1%).**
   Every per-centre dispatch had a full barrier after it because all folds
   shared one `locs` region. Giving each fold its own region and recording

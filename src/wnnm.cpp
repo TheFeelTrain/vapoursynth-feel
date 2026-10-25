@@ -435,8 +435,8 @@ static bool wnnm_full_range(const VSFrame * frame, const VSVideoFormat & format,
 // workspace and KMAXL-wide matcher lists; the split temporal matcher
 // (MATCH_ONLY) returns before the estimate, so the compiler drops the eigen
 // arrays and the top lists shrink to GS. Both include the packed centre block
-// (BS*BS floats). Checked against the built modules at bs=8: q8/q16/q32 static
-// 3336/5736/15144 plus BS^2*4 (256), and q8 MATCH_ONLY 1780 plus 256.
+// (BS*BS floats). Checked against the built modules at bs=8: q8/q16/q32
+// static 3336/5736/15144 plus BS²*4 (256), and q8 MATCH_ONLY 1780 plus 256.
 // tools/shader_limits.py cannot attribute these variants (their code pointer
 // comes from the runtime variant table), so that table reports them unchecked.
 static constexpr uint32_t group_shared_bytes(int qmax, int bs, int gs,
@@ -445,8 +445,8 @@ static constexpr uint32_t group_shared_bytes(int qmax, int bs, int gs,
     // top_{e,xy,t}[TOPCAP], top_n.
     const uint32_t topcap = match_only ? uint32_t(gs) : 64u;
     uint32_t bytes = topcap * 3u * 4u + 4u;
-    // cand[TFULL], tile_{e,xy}[SELCAP], tile_n, merg_{e,xy}[SELCAP].
-    bytes += 32u * 4u + 2u * 32u * 4u + 4u + 2u * 32u * 4u;
+    // cand[TFULL], tile/merg_{e,xy}[SELCAP], tile_n.
+    bytes += 32u * 4u + 4u * 32u * 4u + 4u;
     // fr_{e,xy}[KMAXL], fr_n, loc_n, ctr_xy[KMAXL], ctr_n, seed_order.
     bytes += 2u * 64u * 4u + 2u * 4u + 64u * 4u + 4u + 64u * 4u;
     if (!match_only) {
