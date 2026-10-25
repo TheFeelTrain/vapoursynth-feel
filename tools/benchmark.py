@@ -693,17 +693,14 @@ def _wnnm_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
 def _nlmeans_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
     args = (
         f"d={ns.nlmeans_d}, a={ns.nlmeans_a}, s={ns.nlmeans_s}, h={ns.nlmeans_h}, "
-        f"wmode={ns.nlmeans_wmode}, wref={ns.nlmeans_wref}, channels='UV'"
+        f"wmode={ns.nlmeans_wmode}, wref={ns.nlmeans_wref}, "
+        f"channels='{ns.nlmeans_channels}'"
     )
     return {
         "vsfeel": f"core.vsfeel.NLMeans({clip}, {args})",
         "vszipcl": f"core.vszipcl.NLMeans({clip}, {args})",
         "vszipcu": f"core.vszipcu.NLMeans({clip}, {args})",
-        "knlmvk": (
-            f"core.knlmvk.KNLMeans({clip}, d={ns.nlmeans_d}, a={ns.nlmeans_a}, "
-            f"s={ns.nlmeans_s}, h={ns.nlmeans_h}, wmode={ns.nlmeans_wmode}, "
-            f"wref={ns.nlmeans_wref}, channels='UV')"
-        ),
+        "knlmvk": f"core.knlmvk.KNLMeans({clip}, {args})",
     }
 
 
@@ -960,6 +957,7 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("h", "nlmeans_h", float, 0.2),
             Arg("wmode", "nlmeans_wmode", int, 0),
             Arg("wref", "nlmeans_wref", float, 1.0),
+            Arg("channels", "nlmeans_channels", str, "UV"),
         ],
         build=_nlmeans_build,
         # chroma denoising on the subsampled planes is NLMeans' main use case
