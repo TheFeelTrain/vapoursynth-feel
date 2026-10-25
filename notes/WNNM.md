@@ -16,11 +16,11 @@ gain, then subtract the pre-scaled neutral, in that order) and reads the frame's
 
 | config (jpbd 1080p, `sigma=3`, 5 s medians) | vsfeel | vszip |
 |---|---|---|
-| chroma U/V, `radius=1` (the benchmark default) | **984 fps** | 207 fps |
+| chroma U/V, `radius=1` (the benchmark default) | **1076 fps** | 207 fps |
 | chroma U/V, radius=0 | **1615 fps** | 408 fps |
 | luma, radius=0 | **1291 fps** | 204 fps |
 
-The radius=1 row is 4.8x vszip and the temporal matcher is ~60% of it; the same
+The radius=1 row is 5.2x vszip and the temporal matcher is ~60% of it; the same
 content at radius=0 is 3x faster (see Open work for what is left).
 
 Accuracy, against vszip and against an independent f64 exact-SVD oracle
@@ -65,8 +65,9 @@ The port is f32 end to end; there is no f64 path any more.
   of two; a smaller ring evicts a tag before the neighbouring frame that would
   hit it runs, and every frame then re-searches all folds. The host keeps a tag
   per slot (`centre frame or INT_MIN`) and dispatches the matcher only for the
-  folds whose centre is not in the ring, one dispatch per centre under a
-  push-constant fold index; the estimate still runs over every slot. Records
+  folds whose centre is not in the ring, one dispatch per missing centre with a
+  push-constant fold index; each fold owns a `locs` region, so the dispatches
+  are recorded back-to-back with one barrier before the estimate. Records
   store the position *within the centre's own window*, and the consumer rebases
   it onto its own address table (`layer_base_of`), which is what makes a record
   reusable by a frame whose table starts elsewhere. Tags are published after
@@ -228,6 +229,12 @@ and the request orders on both.
 
 ## Historical
 
+- **2026-10-25 - the temporal matcher's dispatches overlap (+9.1%).**
+  Every per-centre dispatch had a full barrier after it because all folds
+  shared one `locs` region. Giving each fold its own region and recording
+  the planes'/folds' dispatch back-to-back before one barrier took the
+  default arm from 986 to 1076 fps (5 s ABBA, n=12). Costs 3x locs scratch
+  (10.6 -> 31.8 MB/frame at 1080p chroma).
 - **2026-10-25 - the temporal distance buffer was dead.** `dists` was laid
   out and allocated for every split configuration (~14.7 MB/frame at 1080p
   chroma) but only the spatial matcher reads it. Gated to `radius=0`; default

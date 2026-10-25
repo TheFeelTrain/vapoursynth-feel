@@ -922,7 +922,10 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                 if (d->radius > 0 && !d->skip_match) {
                     // The predictive search is inherently serial and publishes
                     // one selection per centre; with the cache on only the
-                    // folds whose centre is not in the ring run.
+                    // folds whose centre is not in the ring run. Each fold has
+                    // its own locs region and match slot, so the dispatches
+                    // are recorded back-to-back and the single barrier below
+                    // covers them all.
                     const WnnmPush pc_all { n, d->vi->numFrames, 0, 0, 0 };
                     for (size_t t = 0; t < todo.size(); ++t) {
                         const WnnmPush one { n, d->vi->numFrames, todo[t], 0.0f,
@@ -934,7 +937,6 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                             pln.group_pipe);
                         d->gpu->vk->vkCmdDispatch(cmd, pln.grid_x, pln.grid_y,
                                                   1);
-                        gpu_barrier(*d->gpu, cmd);
                     }
                     if (!d->cache) {
                         gpu_push_constants(*d->gpu, cmd, d->pipeline_layout,
@@ -944,7 +946,6 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                             pln.group_pipe);
                         d->gpu->vk->vkCmdDispatch(cmd, pln.grid_x, pln.grid_y,
                                                   1);
-                        gpu_barrier(*d->gpu, cmd);
                     }
                 }
             } else {
@@ -1439,6 +1440,10 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     // The split estimate's per-group stride: the mean vector is M floats once
     // residual strips it (the fused path's M*(gs+1) layout is unchanged).
     const int sstride = split_stride(m, d->residual);
+    // The split temporal matcher gives each fold its own location region so
+    // its per-centre dispatches can overlap; the fused kernel loops folds in
+    // one dispatch and keeps sharing the plane's region.
+    const int locs_folds = d->split_match ? d->folds : 1;
     auto layout = [&] {
         int64_t acc_off = 0, pmat_off = 0, locs_off = 0, dist_off = 0,
                 match_off = 0;
@@ -1493,7 +1498,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                 const int rect = std::min(2 * d->ps_range + 1, temp_c + 1) *
                                  std::min(2 * d->ps_range + 1, temp_r + 1);
                 pl.locs_elems =
-                    int64_t(pl.ng) *
+                    int64_t(pl.ng) * locs_folds *
                     std::min<int64_t>(int64_t(centers) * rect,
                                       int64_t(temp_c + 1) * (temp_r + 1));
             } else {
@@ -1731,8 +1736,10 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         spec.ng = pl.ng;
         spec.residual = d->residual ? 1 : 0;
         spec.adaptive = d->adaptive ? 1 : 0;
-        spec.locs_cap =
-            d->radius ? static_cast<int32_t>(pl.locs_elems / pl.ng) : 1;
+        spec.locs_cap = d->radius
+                            ? static_cast<int32_t>(
+                                  pl.locs_elems / (int64_t(pl.ng) * locs_folds))
+                            : 1;
         spec.addr_base = p * 2 * (d->radius == 0 ? 1 : 4 * d->radius + 1);
         spec.sigma = pl.sigma;
         spec.acc_base = static_cast<int32_t>(pl.acc_base);

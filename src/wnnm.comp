@@ -752,7 +752,15 @@ int layer_base_of(int fold) {
 void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
     const int tid = int(gl_LocalInvocationIndex);
     const uint group_base = uint(PMAT_BASE) + wg * uint(PMAT_STRIDE);
+#if defined(MATCH_ONLY)
+    // One location region per fold, so the host can record every per-centre
+    // matcher dispatch back-to-back and put a single barrier before the
+    // estimate. The fused group kernel loops its folds in one dispatch, so it
+    // keeps sharing the plane's region.
+    const int loc_base = LOCS_BASE + (fold * NG + int(wg)) * LOCS_CAP;
+#else
     const int loc_base = LOCS_BASE + int(wg) * LOCS_CAP;
+#endif
 
     PlaneRef refc = addr.img[ADDR_BASE + layer_base + RADIUS];
 
