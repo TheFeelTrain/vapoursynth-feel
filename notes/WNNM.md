@@ -229,6 +229,12 @@ and the request orders on both.
 
 ## Historical
 
+- **2026-10-25 - the cache budget respects maxStorageBufferRange.** The
+  ring budget was a fixed 160 MiB, so on a device with a smaller
+  storage range the ring passed the budget, failed allocation and the
+  cache was dropped whole. It is now `min(160 MiB, range)`; reproduced
+  at 70 MiB on the 1080p luma-only ring: cache off (ring=3) before,
+  cache on with 64 -> 32 slots (67.2 MiB) after. Default arm unchanged.
 - **2026-10-25 - ps_num 33..64 merges in parallel (+97%).** The running
   list was capped at SELCAP=32, so those folds fell back to a serial
   O(span*cap) insert on thread 0. `fr_tile_wide` keeps the KMAXL-wide

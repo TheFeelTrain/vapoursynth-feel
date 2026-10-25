@@ -1423,6 +1423,12 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     // fits the depth-sized ring at 1080p luma and 4K chroma (the old 2r+1 ring
     // held under 20 MiB there).
     constexpr int64_t kCacheBudget = INT64_C(160) << 20;
+    // A device's maxStorageBufferRange is also a hard cap on the ring buffer;
+    // the budget has to respect it or a ring that passes the check still fails
+    // allocation and the whole cache is dropped.
+    const int64_t cache_budget = std::min<int64_t>(
+        kCacheBudget,
+        static_cast<int64_t>(d->gpu->limits.maxStorageBufferRange));
     d->cache =
         d->split_match && d->radius > 0 && !env_flag("VSFEEL_WNNM_NOCACHE");
     // A centre's record is only published when its own frame is submitted, so
@@ -1551,19 +1557,19 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     if (auto e = layout(); !e.empty()) {
         return set_error(e);
     }
-    if (d->cache && d->ring_bytes > kCacheBudget) {
+    if (d->cache && d->ring_bytes > cache_budget) {
         // Records over budget: halve the ring while it still spans more than
         // one centre's folds. A smaller ring keeps the hits it can, which beats
         // dropping to per-frame slots; below the fold count there is no reuse
         // left to keep and the cache goes away entirely.
         const int floor_ring = round_up_pow2(2 * d->folds);
-        while (d->ring > floor_ring && d->ring_bytes > kCacheBudget) {
+        while (d->ring > floor_ring && d->ring_bytes > cache_budget) {
             d->ring /= 2;
             if (auto e = layout(); !e.empty()) {
                 return set_error(e);
             }
         }
-        if (d->ring_bytes > kCacheBudget) {
+        if (d->ring_bytes > cache_budget) {
             d->cache = false;
             d->ring = d->folds;
             if (auto e = layout(); !e.empty()) {

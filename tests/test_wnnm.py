@@ -689,6 +689,40 @@ def test_qmax_variant_pinned(kwargs, qmax):
     assert int(match.group(1)) == qmax, err[-2000:]
 
 
+_CACHE_LIMIT_SCRIPT = r"""
+import vapoursynth as vs
+
+core = vs.core
+clip = core.std.BlankClip(width=1920, height=1080, format=vs.YUV420PS, length=24)
+core.vsfeel.WNNM(clip, sigma=[3, 0], radius=1, ps_num=1, ps_range=0)
+"""
+
+
+def test_cache_budget_respects_storage_range():
+    """A ring above maxStorageBufferRange must halve, not drop the cache."""
+    cap = 70 << 20  # the luma-only 1080p ring is 134.5 MiB unbounded here
+    env = {
+        **os.environ,
+        "MANGOHUD": "0",
+        "VSFEEL_WNNM": "1",
+        "VSFEEL_LIMIT_STORAGE_RANGE": str(cap),
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", _CACHE_LIMIT_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    match = re.search(r"cache=(\d+) ring=(\d+) ring=([\d.]+) MiB", proc.stderr)
+    assert match, proc.stderr[-2000:]
+    cache, ring, mib = int(match.group(1)), int(match.group(2)), float(match.group(3))
+    assert cache == 1, proc.stderr[-2000:]
+    assert ring <= 32, proc.stderr[-2000:]
+    assert mib <= cap / (1 << 20), proc.stderr[-2000:]
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
