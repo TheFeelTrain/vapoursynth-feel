@@ -697,13 +697,23 @@ elif kind == "yuv420ps":
 elif kind == "yuv420ph":
     clip = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
     clip = core.resize.Point(clip, format=vs.YUV420PH)
+elif kind == "yuv420p16":
+    # Limited range, like a decoded source: the filter reads _Range and widens
+    # with the same mapping `depth` would.
+    clip = core.resize.Bicubic(src, format=vs.YUV420P16)
 elif kind == "yuv444ps":
     clip = core.resize.Bicubic(src, format=vs.YUV444PS)
 elif kind == "rgbs":
     clip = core.resize.Bicubic(src, format=vs.RGBS, matrix_in_s="709")
 else:
     raise SystemExit("bad clip kind %r" % kind)
-dt = np.float16 if kind.endswith("h") else np.float32
+dt = (
+    np.float16
+    if kind.endswith("h")
+    else np.uint16
+    if kind.endswith("16")
+    else np.float32
+)
 if spec.get("nframes"):
     # Exactly that many frames. `std.Loop(times=N)` *multiplies* the clip's
     # length instead: with `nframes=12` on the 300-frame source it built a

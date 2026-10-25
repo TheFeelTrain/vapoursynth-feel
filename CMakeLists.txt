@@ -429,7 +429,13 @@ list(APPEND VK_WNNM_VARIANTS
     "wnnm_apply_cas|wnnm.comp|-DENTRY_APPLY -DQMAX=8 -DWG=128 -DNO_FLOAT_ATOMICS"
     # The split matching (radius 0): every candidate's SSD, then the selection.
     "wnnm_dist|wnnm.comp|-DENTRY_DIST -DQMAX=8"
-    "wnnm_select|wnnm.comp|-DENTRY_SELECT -DQMAX=8")
+    "wnnm_select|wnnm.comp|-DENTRY_SELECT -DQMAX=8"
+    # Native 16-bit transport: the finish kernel stores the clip's sample type,
+    # and the copy kernel widens a 2-byte plane into the f32 conversion ring.
+    "wnnm_finish_u16|wnnm.comp|-DENTRY_FINISH -DIO_U16"
+    "wnnm_finish_f16|wnnm.comp|-DENTRY_FINISH -DIO_F16"
+    "wnnm_copy_u16|wnnm_copy.comp|-DIO_U16"
+    "wnnm_copy_f16|wnnm_copy.comp|-DIO_F16")
 
 set(VK_VARIANTS
     ${VK_WNNM_VARIANTS}

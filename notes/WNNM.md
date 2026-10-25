@@ -6,7 +6,12 @@ Status: **shipped**. Port of `reference/vapoursynth-zip` (`src/filters/wnnm.zig`
 spatial match a distance kernel plus a one-thread-per-group register top-8, and
 temporal mode runs the fused matcher one centre at a time (32 threads) into a
 per-centre match cache, then the same three kernels. `group_size > 8` still runs
-the fused kernel.
+the fused kernel. A **u16 or f16 clip** is accepted natively: a copy kernel
+widens each window plane into a persistent f32 conversion ring and the finish
+kernel narrows the result, so the kernels above never see a 2-byte sample. The
+widening reproduces VapourSynth's `depth` bit for bit (multiply by the range
+gain, then subtract the pre-scaled neutral, in that order) and reads the frame's
+`_Range`, so `WNNM(clip)` and `WNNM(depth(clip, 32))` agree to the last code.
 
 | config (jpbd 1080p, `sigma=3`, 5 s medians) | vsfeel | vszip |
 |---|---|---|
@@ -69,6 +74,23 @@ The port is f32 end to end; there is no f64 path any more.
   record order equal to submission order. A 160 MiB budget halves the ring when
   its records do not fit (a partial cache still hits), and `VSFEEL_WNNM_NOCACHE`
   drops the ring for per-frame slots.
+- **Native 16-bit transport**: a u16/f16 clip's processed planes are widened
+  into a persistent device-local ring of `4*radius+3` slots (one per window
+  frame plus one), keyed by frame number, and the address table points at the
+  slots; the source ring keeps the source's *sample* stride, so each copy is one
+  linear range and the kernels' `STRIDE` is samples at every depth. Only the
+  planes the filter processes are converted (a sigma-0 plane is a bit-exact copy
+  straight from the centre frame) and an `rclip` gets its own set of slots. The
+  slots are only tagged after the submit, like the match ring, and the
+  whole-queue barrier at the top of a frame covers their reuse. The ring is the
+  filter's own buffer: it must not go through `gpuExecUsesBuffer`, which
+  transfers ownership to the submission and frees it, and doing so here produced
+  a wrong frame 0 and a core-teardown crash. `wnnm_copy.comp`
+  has one arm per depth: the integer arm applies `(code * gain - neutral)`
+  with the gain/neutral of that frame's `_Range` (full range is the whole code
+  span, limited is 219/224 of it with luma's 4096 and chroma's 32768), and the
+  half arm is an exact widening. The finish kernel stores the inverse mapping,
+  `clamp(v * 1/gain + neutral + 0.5, 0, 65535)`, or narrows to half.
 - **Estimate phase** (any radius, `group_size <= 8`), three kernels over
   `NG * (2*radius+1)` slots, so each phase runs at the width its work needs:
   - `ENTRY_GRAM`: 8 lanes per group, lane l takes column l of every patch row.
@@ -124,7 +146,11 @@ reference (4.7e-3, 889 bad); `REF_TOL` keeps both references' own spread visible
 per-plane sigma, `residual`, `adaptive_aggregation`, starved and tiny frames, odd
 geometry, temporal with the boundary fold), the f64 path at `EXACT_TOL` 5e-6
 (`VSFEEL_WNNM_NOSPLIT`), self-consistency (determinism, parallel load, request
-order, frame props, GPU chaining), creation variants and every error path.
+order, frame props, GPU chaining), creation variants and every error path. The
+native depths are graded against the same filter on the manually widened clip:
+u16 (limited and full range, with and without `rclip`) to **1 code**, f16 to
+**half an ulp**, plus a sigma-0 plane staying a bit-exact copy and the request
+orders on both.
 
 ## Performance
 
@@ -155,6 +181,10 @@ order, frame props, GPU chaining), creation variants and every error path.
   out of order when the cache trusted a cursor.
 - The spatial frame is 0.62 ms: **match ~0.25 ms, estimate 0.37 ms** (the
   staging had taken the match phase from 0.50 ms).
+- **The 2-byte transport costs nothing measurable**: 987 fps (u16) and 989
+  (f16) against 984 (f32) on the harness default. The conversion copy is roughly
+  what the shorter source uploads save, so a caller no longer pays a `depth`
+  node in either direction.
 - The benchmark chain (device-resident frames, no decode) and the live-decode
   screen now differ only by the decoder: 984 fps for the filter's own work, and
   a live 1080p source is decode-bound at about 560-630 fps. The screen that read

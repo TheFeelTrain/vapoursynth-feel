@@ -8,6 +8,7 @@
 #endif
 #extension GL_EXT_buffer_reference : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_16bit_storage : require
 
 /*
  * WNNM (weighted nuclear norm minimization) denoiser, ported from
@@ -134,7 +135,13 @@ layout(std430, binding = 1) coherent buffer AccBuf { uint acc_u[]; };
 #endif
 layout(std430, binding = 2) buffer LocsBuf { uint locs[]; };
 layout(std430, binding = 3) buffer PatchBuf { float pmat[]; };
+#if defined(IO_U16)
+layout(std430, binding = 4) writeonly buffer DstBuf { uint16_t dst[]; };
+#elif defined(IO_F16)
+layout(std430, binding = 4) writeonly buffer DstBuf { float16_t dst[]; };
+#else
 layout(std430, binding = 4) writeonly buffer DstBuf { float dst[]; };
+#endif
 layout(std430, binding = 5) buffer TraceBuf { uint trace[]; };
 // Block matching's two halves (radius 0, group_size <= 8): every candidate's
 // SSD per group, then the selected group per group.
@@ -154,6 +161,10 @@ layout(push_constant) uniform Push {
     int pn;
     int frames;
     int fold;
+    // Finish kernel only: a native output code is clamp(v * out_scale +
+    // out_bias + 0.5, 0, PEAK), the inverse of the copy kernel's widening.
+    float out_scale;
+    float out_bias;
 } pc;
 
 // Final group, sorted by error. `top_t` is the temporal index in the centre
@@ -1770,6 +1781,17 @@ void main() {
         return;
     }
     const int o = gy * W + gx;
-    dst[gy * STRIDE + gx] = acc[ACC_BASE + o] / acc[ACC_BASE + W * H + o];
+    const float v = acc[ACC_BASE + o] / acc[ACC_BASE + W * H + o];
+#if defined(IO_U16)
+    // The inverse of the copy kernel's widening: a limited-range plane scales
+    // by 219/224 of 65535 and carries a 4096/32768 code offset, and the weight
+    // sums can land an ulp outside [0, 1], so clamp before truncating.
+    const float code = clamp(v * pc.out_scale + pc.out_bias + 0.5, 0.0, 65535.0);
+    dst[gy * STRIDE + gx] = uint16_t(uint(code));
+#elif defined(IO_F16)
+    dst[gy * STRIDE + gx] = float16_t(v);
+#else
+    dst[gy * STRIDE + gx] = v;
+#endif
 #endif
 }

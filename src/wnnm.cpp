@@ -196,6 +196,22 @@ struct GPUWNNM {
     std::mutex cache_lock;
     std::vector<int> ring_tag; // centre frame each slot holds, or INT_MIN
     int dist_stride_max {};
+    // Native 16-bit transport: a 2-byte clip's planes are widened into a
+    // persistent f32 ring by the copy kernel and every kernel reads the ring
+    // instead of the frame planes. `io` is 0 for f32, 1 for f16 and 2 for u16.
+    // The ring has one slot per frame of the temporal window plus one, keyed by
+    // frame number; the queue's execution order makes a slot reusable as soon
+    // as this frame's copies are recorded after the previous frame's reads.
+    int io {};
+    int elem_bytes { 4 };
+    GpuBuffer src_ring;
+    int64_t src_ring_bytes {};
+    int src_slots {};
+    int src_sets {};
+    VkDeviceSize src_off[2][3] {}; // element offset of (set, plane) slot 0
+    uint32_t src_grid_x[3] {}, src_grid_y[3] {};
+    std::vector<int> src_tag; // [set][plane][slot] -> frame, or INT_MIN
+    VkPipeline copy_pipe {};
 
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
@@ -245,6 +261,10 @@ struct GPUWNNM {
         }
         VkDevice dev = gpu->device;
         gpu_destroy_buffer(*gpu, ring_buf);
+        gpu_destroy_buffer(*gpu, src_ring);
+        if (copy_pipe) {
+            gpu->vk->vkDestroyPipeline(dev, copy_pipe, nullptr);
+        }
         if (probe.query) {
             gpu->vk->vkDestroyQueryPool(dev, probe.query, nullptr);
         }
@@ -293,13 +313,30 @@ struct WnnmVariant {
     size_t dist_size;
     const uint32_t * select;
     size_t select_size;
+    const uint32_t * copy;
+    size_t copy_size;
 };
 
-static WnnmVariant pick_variant(int qmax, bool hw_atomics, bool match_only) {
+static WnnmVariant pick_variant(int qmax, bool hw_atomics, bool match_only,
+                                int io) {
     WnnmVariant v { nullptr,         0,
                     wnnm_finish_spv, sizeof(wnnm_finish_spv),
                     wnnm_dist_spv,   sizeof(wnnm_dist_spv),
-                    wnnm_select_spv, sizeof(wnnm_select_spv) };
+                    wnnm_select_spv, sizeof(wnnm_select_spv),
+                    nullptr,         0 };
+    // The finish store and the conversion copy are the only depth-specific
+    // kernels: everything between them runs on f32.
+    if (io == 2) {
+        v.finish = wnnm_finish_u16_spv;
+        v.finish_size = sizeof(wnnm_finish_u16_spv);
+        v.copy = wnnm_copy_u16_spv;
+        v.copy_size = sizeof(wnnm_copy_u16_spv);
+    } else if (io == 1) {
+        v.finish = wnnm_finish_f16_spv;
+        v.finish_size = sizeof(wnnm_finish_f16_spv);
+        v.copy = wnnm_copy_f16_spv;
+        v.copy_size = sizeof(wnnm_copy_f16_spv);
+    }
     if (match_only) {
         v.group = wnnm_group_q8_mo_spv;
         v.group_size = sizeof(wnnm_group_q8_mo_spv);
@@ -323,6 +360,68 @@ static WnnmVariant pick_variant(int qmax, bool hw_atomics, bool match_only) {
         v.group_size = sizeof(wnnm_group_q32_cas_spv);
     }
     return v;
+}
+
+// Push constants every WNNM kernel shares: the temporal fold for the matcher
+// and the estimate, and the native output-code mapping for the finish.
+struct WnnmPush {
+    int32_t pn;
+    int32_t frames;
+    int32_t fold;
+    float out_scale;
+    float out_bias;
+};
+
+// One plane conversion the frame needs in its source ring: the native plane's
+// buffer, the ring slot, and the frame the slot will hold.
+struct WnnmCopy {
+    VkBuffer src {};
+    uint32_t dst_off {};
+    uint32_t count {};
+    uint32_t grid_x {};
+    uint32_t grid_y {};
+    float scale {};
+    float bias {};
+    int set {};
+    int plane {};
+    int slot {};
+    int frame {};
+};
+
+// A native code to f32 and back. The copy kernel widens with
+// `f = (code - offset) * gain`, which the finish kernel inverts as
+// `code = f / gain + offset`. Full range spans the whole code range; the
+// limited range is 219/224 of it, with luma's 4096 and chroma's 32768 offsets.
+// RGB is always full range. These are the numbers VapourSynth's `depth` uses,
+// so a native u16 clip and a float conversion of it carry the same values.
+struct WnnmRange {
+    float gain;
+    float offset;
+};
+
+static WnnmRange wnnm_range(const VSVideoFormat & format, int plane,
+                            bool full) {
+    if (format.colorFamily == cfRGB) {
+        return { 1.0f / 65535.0f, 0.0f };
+    }
+    const bool chroma = format.colorFamily == cfYUV && plane > 0;
+    if (chroma) {
+        return { full ? 1.0f / 65535.0f : 1.0f / 57344.0f, 32768.0f };
+    }
+    return { full ? 1.0f / 65535.0f : 1.0f / 56064.0f, full ? 0.0f : 4096.0f };
+}
+
+// The frame's _Range property: a missing one is limited on GRAY/YUV (zimg's
+// default), and RGB is always full.
+static bool wnnm_full_range(const VSFrame * frame, const VSVideoFormat & format,
+                            const VSAPI * vsapi) {
+    if (format.colorFamily == cfRGB) {
+        return true;
+    }
+    int error = 0;
+    const VSMap * props = vsapi->getFramePropertiesRO(frame);
+    const int64_t range = vsapi->mapGetInt(props, "_Range", 0, &error);
+    return error ? false : range != 0;
 }
 
 // Static LDS of the group kernel, exactly as src/wnnm.comp declares it: eight
@@ -583,6 +682,43 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     if (table == nullptr) {
         return fail("address table is not host visible");
     }
+    // Native 16-bit transport: the ring holds the widened window, and the
+    // copies are queued here (the tags only move after a successful submit).
+    std::vector<WnnmCopy> copies;
+    const int src_set = d->ref_node ? 1 : 0;
+    const VkDeviceAddress ring_base =
+        d->elem_bytes == 2 ? plane_address(*d->gpu, d->src_ring.buffer) : 0;
+    const auto queue_copy = [&](int set, int p, int f,
+                                const VSFrame * src_frame) {
+        const int slot = f % d->src_slots;
+        const size_t tag =
+            (size_t(set) * 3 + size_t(p)) * size_t(d->src_slots) + size_t(slot);
+        if (d->src_tag[tag] == f) {
+            return true;
+        }
+        VSVulkanPlaneInfo sp {};
+        if (d->gpu->api->getGPUPlane(src_frame, p, &sp)) {
+            return false;
+        }
+        const WnnmRange r = wnnm_range(
+            d->vi->format, p, wnnm_full_range(src_frame, d->vi->format, vsapi));
+        WnnmCopy c {};
+        c.src = sp.buffer;
+        c.dst_off = static_cast<uint32_t>(d->src_off[set][p] +
+                                          VkDeviceSize(slot) *
+                                              VkDeviceSize(d->plane[p].npix));
+        c.count = static_cast<uint32_t>(d->plane[p].npix);
+        c.grid_x = d->src_grid_x[p];
+        c.grid_y = d->src_grid_y[p];
+        c.scale = r.gain;
+        c.bias = r.offset * r.gain; // the copy subtracts the pre-scaled offset
+        c.set = set;
+        c.plane = p;
+        c.slot = slot;
+        c.frame = f;
+        copies.push_back(c);
+        return true;
+    };
     for (int p = 0; p < 3; ++p) {
         if (!d->plane[p].process) {
             // Never read by a kernel; keep the table fully written anyway.
@@ -593,6 +729,28 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
             continue;
         }
         for (int l = 0; l < layers; ++l) {
+            const int f = std::clamp(first + l, 0, nf - 1);
+            if (d->elem_bytes == 2) {
+                const VkDeviceSize slot = VkDeviceSize(f % d->src_slots) *
+                                          VkDeviceSize(d->plane[p].npix);
+                const VkDeviceAddress base =
+                    ring_base + (d->src_off[src_set][p] + slot) * 4;
+                table[p * 2 * layers + l] = base;
+                table[p * 2 * layers + layers + l] = base;
+                if (d->ref_node) {
+                    table[p * 2 * layers + l] =
+                        ring_base + (d->src_off[0][p] + slot) * 4;
+                    if (!queue_copy(0, p, f, rframes[l])) {
+                        return fail("reference plane " + std::to_string(p) +
+                                    " is not GPU resident");
+                    }
+                }
+                if (!queue_copy(src_set, p, f, frames[l])) {
+                    return fail("source plane " + std::to_string(p) +
+                                " is not GPU resident");
+                }
+                continue;
+            }
             VSVulkanPlaneInfo sp {};
             if (d->gpu->api->getGPUPlane(rframes[l], p, &sp)) {
                 return fail("reference plane " + std::to_string(p) +
@@ -635,6 +793,27 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
         record_queue_barrier(*d->gpu, cmd);
     }
     record_acc_clear(*d->gpu, cmd, acc_buf.buffer, d->acc_bytes);
+
+    // Widen the window's 2-byte planes into the ring. The matcher and the
+    // estimate read these slots, so they start behind the barrier below.
+    if (!copies.empty()) {
+        for (const WnnmCopy & c : copies) {
+            const VkBuffer bufs[2] { c.src, d->src_ring.buffer };
+            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, bufs, 2);
+            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                          d->copy_pipe);
+            struct {
+                uint32_t off;
+                uint32_t count;
+                float scale;
+                float bias;
+            } push { c.dst_off, c.count, c.scale, c.bias };
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &push,
+                               sizeof(push));
+            d->gpu->vk->vkCmdDispatch(cmd, c.grid_x, c.grid_y, 1);
+        }
+        gpu_barrier(*d->gpu, cmd);
+    }
 
     vsfeel_trace_mark("dispatch");
     // Phase-major rather than plane-major: every per-plane region (accumulator,
@@ -711,11 +890,12 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                     // The predictive search is inherently serial and publishes
                     // one selection per centre; with the cache on only the
                     // folds whose centre is not in the ring run.
-                    const int32_t pc_all[3] { n, d->vi->numFrames, 0 };
+                    const WnnmPush pc_all { n, d->vi->numFrames, 0, 0, 0 };
                     for (size_t t = 0; t < todo.size(); ++t) {
-                        const int32_t one[3] { n, d->vi->numFrames, todo[t] };
+                        const WnnmPush one { n, d->vi->numFrames, todo[t], 0.0f,
+                                             0.0f };
                         gpu_push_constants(*d->gpu, cmd, d->pipeline_layout,
-                                           one, sizeof(one));
+                                           &one, sizeof(one));
                         d->gpu->vk->vkCmdBindPipeline(
                             cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             pln.group_pipe);
@@ -725,7 +905,7 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                     }
                     if (!d->cache) {
                         gpu_push_constants(*d->gpu, cmd, d->pipeline_layout,
-                                           pc_all, sizeof(pc_all));
+                                           &pc_all, sizeof(pc_all));
                         d->gpu->vk->vkCmdBindPipeline(
                             cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             pln.group_pipe);
@@ -737,8 +917,8 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
             } else {
                 d->gpu->vk->vkCmdBindPipeline(
                     cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pln.group_pipe);
-                const int32_t fold[2] { n, d->vi->numFrames };
-                gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, fold,
+                const WnnmPush fold { n, d->vi->numFrames, 0, 0, 0 };
+                gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &fold,
                                    sizeof(fold));
                 d->gpu->vk->vkCmdDispatch(cmd, pln.grid_x, pln.grid_y, 1);
             }
@@ -755,8 +935,8 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
         // The three estimate kernels key their slots by fold, so they need the
         // output frame and the clip length; the matcher above left its own
         // values behind.
-        const int32_t pc[3] { n, d->vi->numFrames, 0 };
-        gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, pc, sizeof(pc));
+        const WnnmPush pc { n, d->vi->numFrames, 0, 0, 0 };
+        gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc, sizeof(pc));
     }
     if (estimate && !d->skip_gram) {
         for (int p = 0; p < 3; ++p) {
@@ -814,6 +994,14 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
             continue;
         }
         bind_estimate(dst_plane[p]);
+        // A native store inverts the copy's widening, per plane and per frame
+        // (the range is a frame property).
+        const WnnmRange range = wnnm_range(
+            d->vi->format, p, wnnm_full_range(center, d->vi->format, vsapi));
+        const WnnmPush out { n, d->vi->numFrames, 0,
+                             d->io == 2 ? 1.0f / range.gain : 0.0f,
+                             d->io == 2 ? range.offset : 0.0f };
+        gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &out, sizeof(out));
         d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                       pln.finish_pipe);
         d->gpu->vk->vkCmdDispatch(cmd, pln.finish_x,
@@ -869,6 +1057,11 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
             const int cm = std::clamp(n - d->radius + f, 0, nf - 1);
             d->ring_tag[cm & (d->ring - 1)] = cm;
         }
+    }
+    for (const WnnmCopy & c : copies) {
+        d->src_tag[(size_t(c.set) * 3 + size_t(c.plane)) *
+                       size_t(d->src_slots) +
+                   size_t(c.slot)] = c.frame;
     }
     const auto t3 = d->host_timing ? std::chrono::steady_clock::now()
                                    : std::chrono::steady_clock::time_point {};
@@ -1014,10 +1207,24 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         }
     };
 
-    if (!vsh::isConstantVideoFormat(d->vi) ||
-        d->vi->format.sampleType != stFloat ||
-        d->vi->format.bitsPerSample != 32) {
-        return set_error("only constant format 32 bit float input supported");
+    if (!vsh::isConstantVideoFormat(d->vi)) {
+        return set_error("only constant format clips are supported");
+    }
+    if (d->vi->format.sampleType == stFloat &&
+        d->vi->format.bitsPerSample == 32) {
+        d->io = 0;
+        d->elem_bytes = 4;
+    } else if (d->vi->format.sampleType == stFloat &&
+               d->vi->format.bitsPerSample == 16) {
+        d->io = 1;
+        d->elem_bytes = 2;
+    } else if (d->vi->format.sampleType == stInteger &&
+               d->vi->format.bitsPerSample == 16) {
+        d->io = 2;
+        d->elem_bytes = 2;
+    } else {
+        return set_error("only 16 bit integer (u16), 16 bit float (f16) or "
+                         "32 bit float (f32) input supported");
     }
     if (d->vi->width <= 0 || d->vi->height <= 0) {
         return set_error("clip must have constant dimensions");
@@ -1205,8 +1412,11 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             if (probe == nullptr) {
                 return std::string("could not allocate a probe frame");
             }
-            pl.stride =
-                static_cast<int>(vsapi->getStride(probe, p) / sizeof(float));
+            // Samples, not bytes: the kernels index an f32 plane, and the
+            // conversion ring keeps a 2-byte source's sample stride so its
+            // copy is linear.
+            pl.stride = static_cast<int>(vsapi->getStride(probe, p) /
+                                         size_t(d->elem_bytes));
             vsapi->freeFrame(probe);
             pl.npix = int64_t(pl.stride) * pl.height;
 
@@ -1336,6 +1546,61 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         }
     }
 
+    // Native 16-bit transport: widen the window's planes into a persistent f32
+    // ring, because the matcher and the estimate each read a source sample more
+    // than once and a typed load would put the conversion in their inner loops.
+    // One slot per frame of the window plus one, keyed by frame number; the
+    // queue preserves execution order, so a frame's copies are recorded before
+    // its kernels and a slot is reusable once those kernels are queued.
+    if (d->elem_bytes == 2) {
+        const int layers = d->radius == 0 ? 1 : 4 * d->radius + 1;
+        d->src_slots = layers + 1;
+        d->src_sets = d->ref_node ? 2 : 1;
+        VkDeviceSize elems = 0;
+        for (int st = 0; st < d->src_sets; ++st) {
+            for (int p = 0; p < 3; ++p) {
+                const WnnmPlane & pl = d->plane[p];
+                if (!pl.process) {
+                    continue;
+                }
+                d->src_off[st][p] = elems;
+                elems += VkDeviceSize(d->src_slots) * VkDeviceSize(pl.npix);
+            }
+        }
+        d->src_ring_bytes = int64_t(elems) * int64_t(sizeof(float));
+        const VkDeviceSize limit = vsfeel_vram_limit(*d->gpu, core);
+        if (limit > 0 && d->src_ring_bytes > int64_t(limit / 4)) {
+            return set_error(
+                "the 16 bit conversion ring (" +
+                std::to_string(d->src_ring_bytes >> 20) +
+                " MiB) exceeds a quarter of the VRAM allowance; use a float "
+                "clip or a smaller radius");
+        }
+        // The kernels read the ring through the address table, so the buffer
+        // needs a device address as well as storage use.
+        if (auto e = gpu_make_buffer(
+                *d->gpu, core, VkDeviceSize(d->src_ring_bytes), d->src_ring,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            !e.empty()) {
+            return set_error("conversion ring: " + e);
+        }
+        d->src_tag.assign(size_t(d->src_sets) * 3 * size_t(d->src_slots),
+                          INT_MIN);
+        for (int p = 0; p < 3; ++p) {
+            const WnnmPlane & pl = d->plane[p];
+            if (!pl.process) {
+                continue;
+            }
+            std::string err;
+            const uint64_t groups = (uint64_t(pl.npix) + 255) / 256;
+            if (!vsfeel_fold_grid(d->gpu->limits, groups, "WNNM conversion",
+                                  d->src_grid_x[p], d->src_grid_y[p], err)) {
+                return set_error(err);
+            }
+        }
+    }
+
     // Grid folds.
     for (int p = 0; p < 3; ++p) {
         WnnmPlane & pl = d->plane[p];
@@ -1360,11 +1625,28 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     }
     {
         const auto result =
-            gpu_pipeline_layout(*d->gpu, d->set_layout, 3 * sizeof(int32_t));
+            gpu_pipeline_layout(*d->gpu, d->set_layout, sizeof(WnnmPush));
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
         d->pipeline_layout = std::get<VkPipelineLayout>(result);
+    }
+
+    // The conversion copy is depth-specific and geometry-free: one pipeline
+    // serves every plane, with the range and the slot in its push constants.
+    if (d->elem_bytes == 2) {
+        const uint32_t * copy_code =
+            d->io == 2 ? wnnm_copy_u16_spv : wnnm_copy_f16_spv;
+        const size_t copy_size =
+            d->io == 2 ? sizeof(wnnm_copy_u16_spv) : sizeof(wnnm_copy_f16_spv);
+        const GpuWorkgroup wg { .x = 256, .shared_bytes = 0 };
+        auto r = gpu_create_pipeline(*d->gpu, copy_code, copy_size,
+                                     d->pipeline_layout, nullptr, nullptr, 0, 0,
+                                     "wnnm copy", 0, wg);
+        if (std::holds_alternative<std::string>(r)) {
+            return set_error(std::get<std::string>(r));
+        }
+        d->copy_pipe = std::get<VkPipeline>(r);
     }
 
     const bool hw_atomics = d->gpu->feat_atomic_float32_add;
@@ -1373,7 +1655,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                         "accumulator\n");
     }
     const WnnmVariant variant =
-        pick_variant(qmax, hw_atomics, d->split_match && d->radius > 0);
+        pick_variant(qmax, hw_atomics, d->split_match && d->radius > 0, d->io);
     for (int p = 0; p < 3; ++p) {
         WnnmPlane & pl = d->plane[p];
         if (!pl.process) {
@@ -1566,15 +1848,17 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     }
 
     if (vsfeel_debug_flag("VSFEEL_WNNM")) {
+        const char * io = d->io == 2 ? "u16" : (d->io == 1 ? "f16" : "f32");
         fprintf(stderr,
-                "[wnnm] bs=%d step=%d gs=%d bm=%d radius=%d ps=%d/%d qmax=%d; "
-                "per frame acc=%.1f MiB pmat=%.1f MiB locs=%.1f MiB; "
-                "cache=%d ring=%d ring=%.1f MiB\n",
-                d->bs, d->step, d->gs, d->bm_range, d->radius, d->ps_num,
+                "[wnnm] io=%s bs=%d step=%d gs=%d bm=%d radius=%d ps=%d/%d "
+                "qmax=%d; per frame acc=%.1f MiB pmat=%.1f MiB locs=%.1f MiB; "
+                "cache=%d ring=%d ring=%.1f MiB; src ring=%.1f MiB\n",
+                io, d->bs, d->step, d->gs, d->bm_range, d->radius, d->ps_num,
                 d->ps_range, qmax, double(d->acc_bytes) / 1048576.0,
                 double(d->pmat_bytes) / 1048576.0,
                 double(d->locs_bytes) / 1048576.0, d->cache ? 1 : 0, d->ring,
-                double(d->ring_bytes) / 1048576.0);
+                double(d->ring_bytes) / 1048576.0,
+                double(d->src_ring_bytes) / 1048576.0);
     }
 
     GPUWNNM * data = d.release();

@@ -1,0 +1,66 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+/*
+ * The conversion ring's widening kernel for a 2-byte input clip: copies one
+ * source plane into an f32 slot of the ring while widening it.
+ *
+ * -DIO_U16 / -DIO_F16 select the source element type. The integer arm is the
+ * exact mapping a float conversion of the same clip would carry (VapourSynth's
+ * `depth`): multiply the code by the range's gain, then subtract the neutral
+ * code times that gain. Full range is 1/65535 with a 0 (luma) or 32768 (chroma)
+ * neutral; the limited range is 219/224 of it with 4096 and 32768. Both halves
+ * of that are push constants, so a limited and a full range plane cost the same
+ * and the finish kernel inverts the same mapping.
+ *
+ * Widening happens here, once per source sample, rather than on load in the
+ * matcher: the matcher and the estimate read each source sample several times,
+ * so a load-time conversion would add instructions to every candidate's SSD.
+ * The ring keeps the source's element stride (see the host), so the copy is one
+ * linear range.
+ */
+
+#if !defined(IO_U16) && !defined(IO_F16)
+#define IO_U16 1
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#if defined(IO_F16)
+layout(std430, binding = 0) readonly buffer SrcBuf { float16_t src[]; };
+#else
+layout(std430, binding = 0) readonly buffer SrcBuf { uint16_t src[]; };
+#endif
+layout(std430, binding = 1) writeonly buffer DstBuf { float dst[]; };
+
+layout(push_constant) uniform Push {
+    uint dst_off; // first f32 element of this slot's plane
+    uint count;   // source elements to convert (stride * height)
+    float scale;  // 1/(range span in codes)
+    float offset; // the neutral code (4096 luma, 32768 chroma) times scale
+} pc;
+
+void main() {
+    // The grid folds into Y when the element count exceeds the device's X
+    // workgroup limit, so the element index is ID.y * NumWorkGroups.x + ID.x
+    // (the host sizes the grid the same way); ID.x alone would leave the fold
+    // unwritten. See vsfeel_fold_grid.
+    const uint i = (uint(gl_WorkGroupID.y) * uint(gl_NumWorkGroups.x) +
+                    uint(gl_WorkGroupID.x)) *
+                       256u +
+                   uint(gl_LocalInvocationIndex);
+    if (i >= pc.count) {
+        return;
+    }
+#if defined(IO_F16)
+    dst[pc.dst_off + i] = float(src[i]); // half -> float is exact
+#else
+    // Multiply then subtract, each rounded once: that is the order zimg's
+    // depth conversion uses, so the widened values are bit-identical to a
+    // float conversion of the same clip (`precise` keeps the compiler from
+    // contracting the pair into an fma).
+    precise float scaled = float(int(src[i])) * pc.scale;
+    precise float v = scaled - pc.offset;
+    dst[pc.dst_off + i] = v;
+#endif
+}

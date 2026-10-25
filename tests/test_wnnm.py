@@ -1,9 +1,11 @@
 """Unit tests for core.vsfeel.WNNM.
 
 The committed tests/bigbuckbunny_360p_grain.mp4 clip (real 360p content with
-baked-in grain) is the input. WNNM is float-only in the reference, so every
-case is f32; a reference comparison runs in a subprocess against the installed
-``vszip.WNNM`` (the only implementation: vszipcl/vszipcu have no WNNM).
+baked-in grain) is the input. The reference WNNM is float-only, so reference
+comparisons run on f32 clips in a subprocess against the installed
+``vszip.WNNM`` (the only implementation: vszipcl/vszipcu have no WNNM); the
+native u16/f16 transport is graded against the same filter on the widened f32
+clip, which is the chain a caller would otherwise write by hand.
 
 The port matched the reference to <= 7.7e-7 max abs over every case here
 (measured, 640x360 GRAYS and 64x48 crops, spatial and temporal); the tests use
@@ -209,6 +211,83 @@ def test_unprocessed_plane_is_an_exact_copy():
 
 
 # ---------------------------------------------------------------------------
+# Native 16-bit transport
+# ---------------------------------------------------------------------------
+#
+# A u16 or f16 clip is widened into the f32 working domain and narrowed on the
+# way out; the oracle is the same filter on the manually widened clip. The
+# widening reproduces VapourSynth's `depth` bit for bit (multiply, then
+# subtract the pre-scaled neutral, in f32), which is what makes the two chains
+# comparable at the code level instead of a handful of shrink decisions apart.
+
+
+def _code_diff(a_frame, b_frame, planes):
+    return max(
+        int(np.abs(plane(a_frame, p).astype(np.int64) - plane(b_frame, p).astype(np.int64)).max())
+        for p in planes
+    )
+
+
+@pytest.mark.parametrize("full", [False, True], ids=["limited", "full"])
+def test_u16_matches_the_float_chain(clip_yuv420p16, full):
+    """Native u16 is `depth(WNNM(depth(clip, 32)), 16)` to the last code."""
+    from vstools import depth
+
+    clip = clip_yuv420p16
+    if full:
+        clip = vs.core.std.SetFrameProp(clip, prop="_Range", intval=1)
+    manual = depth(WNNM(depth(clip, 32)), 16)
+    native = WNNM(clip)
+    for n in (0, 7, 23):
+        worst = _code_diff(native.get_frame(n), manual.get_frame(n), (0, 1, 2))
+        assert worst <= 1, f"frame {n}: {worst} codes apart (full={full})"
+
+
+def test_u16_unprocessed_plane_is_an_exact_copy(clip_yuv420p16):
+    """A sigma-0 plane rides through without a conversion round trip."""
+    out = WNNM(clip_yuv420p16, sigma=[3, 0, 5])
+    for n in (0, 7):
+        a, b = clip_yuv420p16.get_frame(n), out.get_frame(n)
+        assert np.array_equal(plane(a, 1), plane(b, 1)), f"plane 1 changed at frame {n}"
+
+
+def test_u16_rclip_matches_the_float_chain(clip_yuv420p16):
+    """The reference clip gets its own conversion slots."""
+    from vstools import depth
+
+    f32 = depth(clip_yuv420p16, 32)
+    manual = depth(WNNM(f32, rclip=f32), 16)
+    native = WNNM(clip_yuv420p16, rclip=clip_yuv420p16)
+    for n in (0, 7):
+        worst = _code_diff(native.get_frame(n), manual.get_frame(n), (1, 2))
+        assert worst <= 1, f"frame {n}: {worst} codes apart"
+
+
+def test_f16_matches_the_float_chain(clip_yuv420ph):
+    """The half output is the f32 result rounded to half, to one half ulp."""
+    from vstools import depth
+
+    manual = WNNM(depth(clip_yuv420ph, 32))
+    native = WNNM(clip_yuv420ph)
+    for n in (0, 7, 23):
+        a, b = native.get_frame(n), manual.get_frame(n)
+        for p in (0, 1, 2):
+            x = plane(a, p).astype(np.float32)
+            y = plane(b, p).astype(np.float16).astype(np.float32)
+            worst = float(np.abs(x - y).max())
+            assert worst <= 1e-3, f"frame {n} plane {p}: {worst:.3e} apart"
+
+
+@pytest.mark.parametrize(
+    ("kind", "tol"),
+    [("yuv420p16", 1.0), ("yuv420ph", 1e-3)],
+)
+def test_native_depth_request_order(kind, tol):
+    """The conversion ring must not care which frame asked for what first."""
+    assert_temporal_order_consistent("WNNM", dict(sigma=3, radius=1), tol=tol, nframes=6, clip=kind)
+
+
+# ---------------------------------------------------------------------------
 # Self-consistency
 # ---------------------------------------------------------------------------
 
@@ -339,14 +418,13 @@ def _blank():
 @pytest.mark.parametrize(
     ("fmt", "msg"),
     [
-        (vs.GRAY8, "only constant format 32 bit float"),
-        (vs.GRAY16, "only constant format 32 bit float"),
-        (vs.GRAYH, "only constant format 32 bit float"),
-        (vs.YUV420P16, "only constant format 32 bit float"),
+        (vs.GRAY8, "only 16 bit integer"),
+        (vs.YUV420P8, "only 16 bit integer"),
+        (vs.RGB24, "only 16 bit integer"),
     ],
     ids=lambda f: vs.PresetVideoFormat(f).name if isinstance(f, int) else None,
 )
-def test_non_f32_format_rejected(fmt, msg):
+def test_8bit_format_rejected(fmt, msg):
     src = vs.core.std.BlankClip(width=64, height=48, format=fmt, length=1)
     with pytest.raises(vs.Error, match=msg):
         vs.core.vsfeel.WNNM(src)
