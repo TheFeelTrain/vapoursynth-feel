@@ -1127,9 +1127,11 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
 // Gram matrix, the eigenvectors and every rotation index in registers.
 #if defined(ENTRY_GRAM) || defined(ENTRY_SOLVE) || defined(ENTRY_APPLY)
 // Per-group scratch: the Gram matrix at [0,64), the per-pixel mean at
-// [64,128) (residual only), the aggregation weight at [128).
+// [64,64+M) when residual strips it, then the aggregation weight (at 64+M, or
+// 128 with the reserved 64-float slot when it does not). The host sizes
+// PMAT_STRIDE from the same expression (split_stride in src/wnnm.cpp).
 #define MAT_MEAN 64
-#define MAT_WEIGHT 128
+#define MAT_WEIGHT (RESIDUAL != 0 ? (64 + M) : 128)
 
 // The per-group match record of a slot. The cache keys records by centre frame,
 // so the frames that consume the same centre read the same record; without it
@@ -1531,7 +1533,6 @@ void main() {
     const int gi5 = match_off(gslot, 5, gn);
     const int gi6 = match_off(gslot, 6, gn);
     const int gi7 = match_off(gslot, 7, gn);
-    const float ginv = 1.0 / float(gn);
     float ga[64];
     GZ4(0)
     GZ4(4)
@@ -1567,8 +1568,8 @@ void main() {
                 // reconstruction.
                 const float mu =
                     (((((((v[0] + v[1]) + v[2]) + v[3]) + v[4]) + v[5]) + v[6]) +
-                     v[7]) *
-                    ginv;
+                     v[7]) /
+                    float(gn);
                 pmat[gbase + uint(MAT_MEAN) + uint(py * BS + px)] = mu;
                 v[0] = (0 < gn) ? v[0] - mu : 0.0;
                 v[1] = (1 < gn) ? v[1] - mu : 0.0;

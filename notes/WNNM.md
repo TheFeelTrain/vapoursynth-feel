@@ -33,8 +33,8 @@ Accuracy, against vszip and against an independent f64 exact-SVD oracle
 
 The port is f32 end to end; there is no f64 path any more.
 
-**Known blockers:** split `residual` with `block_size > 8`, narrow-plane `win`
-staging, and 16-bit ring ordering. Defaults are unaffected.
+**Known blockers:** narrow-plane `win` staging and 16-bit ring ordering.
+Defaults are unaffected.
 
 ## Implementation
 
@@ -231,6 +231,12 @@ and the request orders on both.
 
 ## Historical
 
+- **2026-10-25 - the split residual mean overran its fixed slot.** The mean
+  vector was a 64-float region sized for `block_size=8`, so any larger block
+  wrote into the aggregation weight and the next group's Gram (1.04 output
+  error at `bs=9`). It is now `M` floats with a per-`M` stride, and the mean
+  divides instead of multiplying by a reciprocal, matching the reference. No
+  default-arm change.
 - **2026-10-25 - the serial merge's barrier was non-uniform.** Both `fr_feed`
   fallbacks (`group_size` or `ps_num` above 32) called `barrier()` inside
   `if (tid == 0)`, so the next tile overwrote `cand` under the feeding thread:

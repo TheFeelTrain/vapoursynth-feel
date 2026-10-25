@@ -50,10 +50,14 @@ constexpr int kWorkgroup = 128;
 // Threads in the split-matching group kernel: one reference block needs a
 // warp for its Gram rows and its round-robin Jacobi, so the other 96 idle.
 constexpr int kGroupThreads = 32;
-// Floats of per-group scratch in the split estimate: the Gram matrix (64), the
-// per-pixel mean for residual (64) and the aggregation weight (1). Must match
-// MAT_MEAN/MAT_WEIGHT in src/wnnm.comp.
-constexpr int kSplitStride = 136;
+// Floats of split-estimate scratch per group: the Gram matrix (64), the
+// per-pixel mean (M floats when residual strips it, otherwise the reserved
+// 64) and the aggregation weight (1), rounded to 8. Must match MAT_WEIGHT in
+// src/wnnm.comp.
+static int split_stride(int m, bool residual) {
+    const int mean = residual ? m : 64;
+    return (64 + mean + 1 + 7) & ~7;
+}
 
 static int round_up_pow2(int v) {
     int p = 1;
@@ -1390,6 +1394,9 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         depth += std::max(0, info.numThreads);
     }
     d->ring = d->cache ? std::min(256, round_up_pow2(depth)) : d->folds;
+    // The split estimate's per-group stride: the mean vector is M floats once
+    // residual strips it (the fused path's M*(gs+1) layout is unchanged).
+    const int sstride = split_stride(m, d->residual);
     auto layout = [&] {
         int64_t acc_off = 0, pmat_off = 0, locs_off = 0, dist_off = 0,
                 match_off = 0;
@@ -1434,7 +1441,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
 
             pl.acc_elems = int64_t(2) * pl.width * pl.height;
             pl.pmat_elems = d->split_match
-                                ? int64_t(pl.ng) * d->folds * kSplitStride
+                                ? int64_t(pl.ng) * d->folds * sstride
                                 : int64_t(pl.ng) * m *
                                       (int64_t(d->gs) + (d->residual ? 1 : 0));
             if (d->radius > 0) {
@@ -1686,7 +1693,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         spec.tr_base = static_cast<int32_t>(pl.trace_base);
         spec.pmat_stride =
             d->split_match
-                ? int32_t(kSplitStride)
+                ? int32_t(sstride)
                 : static_cast<int32_t>(
                       int64_t(m) * (int64_t(d->gs) + (d->residual ? 1 : 0)));
         spec.locs_base = static_cast<int32_t>(pl.locs_base);

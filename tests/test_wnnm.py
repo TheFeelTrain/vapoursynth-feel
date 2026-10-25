@@ -35,6 +35,7 @@ from conftest import (
     assert_temporal_order_consistent,
     cpu_node,
     eval_parallel,
+    max_diff,
     plane,
     reference_compare,
     reference_or_skip,
@@ -178,6 +179,39 @@ def test_serial_group_merge_matches_vszip(clip_grays, group_size):
     )
     assert payload["ndiff_frac"] <= SERIAL_NDIFF, (
         f"{payload['ndiff_frac']:.2%} of samples differ (group_size {group_size})"
+    )
+
+
+@pytest.mark.parametrize("block_size", [8, 9, 16, 32])
+def test_split_residual_matches_fused(clip_grays, monkeypatch, block_size):
+    """The split mean vector is M floats, not the fixed 64 that block_size=8
+    needs; writing into the next group's Gram used to corrupt the frame."""
+    params = dict(sigma=3, block_size=block_size, group_size=8, residual=True)
+    split = WNNM(clip_grays, **params)
+    monkeypatch.setenv("VSFEEL_WNNM_NOSPLIT", "1")
+    fused = WNNM(clip_grays, **params)
+    worst = max_diff(split, fused, frames=(0,))
+    # block_size=9's uneven eight-lane columns flip one f32 shrink decision
+    # (2.4e-3), the same split/fused spread the residual=0 path has.
+    tol = 5e-3 if block_size == 9 else 1e-5
+    assert worst <= tol, f"split vs fused {worst:.3e} (block_size {block_size})"
+
+
+@pytest.mark.parametrize("block_size", [8, 9, 16, 32])
+def test_residual_large_block_matches_vszip(block_size):
+    """residual with block_size above 8 must match the reference, not just the
+    fused path (the old split mean overran its 64-float slot)."""
+    payload = _ref_payload(
+        "grays",
+        (0, 11, 23),
+        dict(sigma=3, block_size=block_size, group_size=8, residual=True),
+        diff_tol=1e-5,
+    )
+    assert payload["maxdiff"] <= REF_TOL, (
+        f"max abs diff {payload['maxdiff']:.3e} (block_size {block_size})"
+    )
+    assert payload["ndiff_frac"] <= 0.02, (
+        f"{payload['ndiff_frac']:.2%} of samples differ (block_size {block_size})"
     )
 
 
