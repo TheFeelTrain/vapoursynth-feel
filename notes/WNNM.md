@@ -131,14 +131,13 @@ The port is f32 end to end; there is no f64 path any more.
   `V diag(r) V^T`, scatter. Odd `q` takes the reference's serial rotation order:
   the padded round-robin does not converge.
 - `residual` subtracts each pixel's mean over the group (sequential f32 sum,
-  then divide; the split path multiplies by `1/n` instead) and adds it back in
-  the scatter.
+  then divide) and adds it back in the scatter.
 - Temporal (`radius > 0`) reproduces the VAggregate fold's `(frame, slab)` pairs
   including the clipped boundaries, which read some slabs twice.
 - `q = min(bs^2, group_size)` picks a `-DQMAX` 8/16/32 variant; q > 32 is
-  rejected (the reference allows 64), but `group_size` itself is not capped at
-  the 64-entry lists. Scratch is budgeted against the core's VRAM allowance at
-  creation.
+  rejected (the reference allows 64), and `group_size`/`ps_num` stop at 64
+  (the shader's list width). Scratch is budgeted against the core's VRAM
+  allowance at creation.
 
 ### Numerics
 
@@ -230,6 +229,10 @@ and the request orders on both.
 
 ## Historical
 
+- **2026-10-25 - parameter bounds match the kernels.** `group_size` above 64
+  overran the shader's 64-entry lists and `bm_range`/`ps_range` at `INT_MAX`
+  overflowed the layout; they now stop at 64 and 4096. The README matches. No
+  pixel change below the caps.
 - **2026-10-25 - the split matcher overran `win[]` on narrow planes.** The
   guard was `WIN_W^2`, but the row stride is clamped by the plane width while
   the staged height follows its height: 32x200 at `bm_range=13` stages 32x34
@@ -376,8 +379,7 @@ and the request orders on both.
   but slower than the split estimate. Porting the split estimate to `q = 16/32`
   needs a different eigen step: 16x16 f32 no longer fits in registers
   (nssfactory switches to 16 lanes per group over equivalent LDS).
-- q > 32 is rejected (LDS eigen workspace); the reference allows 64, and
-  `group_size > 64` is not rejected but overruns the 64-entry lists.
+- q > 32 is rejected (LDS eigen workspace); the reference allows 64.
 
 ## Debug env vars
 

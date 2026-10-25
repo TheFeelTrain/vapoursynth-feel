@@ -192,11 +192,11 @@ core.vsfeel.WNNM(clip clip[,
     float[] sigma=3.0,              # denoising strength per-plane, 0..255 scale; below FLT_EPSILON skips the plane
     int     block_size=8,           # patch size, 1..64; min(block_size^2, group_size) must be <= 32
     int     block_step,             # block lattice spacing, 1..block_size (default block_size)
-    int     group_size=8,           # patches per collaborative group, 1..256
-    int     bm_range=7,             # spatial search radius in pixels
+    int     group_size=8,           # patches per collaborative group, 1..64
+    int     bm_range=7,             # spatial search radius in pixels, 0..4096
     int     radius=0,               # temporal search radius in frames, 0..15 (0 = spatial only)
-    int     ps_num=2,               # motion-predicted candidates seeding each temporal search, 1..256
-    int     ps_range=4,             # search radius around each predicted candidate, in pixels
+    int     ps_num=2,               # motion-predicted candidates seeding each temporal search, 1..64
+    int     ps_range=4,             # search radius around each predicted candidate, in pixels, 0..4096
     int     residual=0,             # keep the group's mean patch (do not shrink the largest singular value)
     int     adaptive_aggregation=1, # weight each group by 1/kept components
     clip    rclip])                 # optional guide clip for block matching

@@ -42,10 +42,13 @@ namespace {
 // and (temporal) the per-group search-location list.
 
 constexpr int kMaxRadius = 15;
-constexpr int kMaxList = 256; // group_size cap
+constexpr int kMaxList = 64; // group_size cap (KMAXL in src/wnnm.comp)
 // ps_num sizes the fused matcher's list arrays (KMAXL in src/wnnm.comp), so it
 // stops where they do; the reference allows 256.
 constexpr int kMaxPsNum = 64;
+// Search-radius cap: the window is clamped to the plane anyway, and this keeps
+// 2*range+1 and the search rectangle well inside int.
+constexpr int kMaxRange = 4096;
 constexpr int kWorkgroup = 128;
 // Threads in the split-matching group kernel: one reference block needs a
 // warp for its Gram rows and its round-robin Jacobi, so the other 96 idle.
@@ -1260,7 +1263,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         gs = 8;
     }
     if (gs < 1 || gs > kMaxList) {
-        return set_error("\"group_size\" must be in [1, 256]");
+        return set_error("\"group_size\" must be in [1, " +
+                         std::to_string(kMaxList) + "]");
     }
     const int m = bs * bs;
     if (std::min(m, gs) > 32) {
@@ -1279,8 +1283,9 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     if (error) {
         bm = 7;
     }
-    if (bm < 0) {
-        return set_error("\"bm_range\" must be non-negative");
+    if (bm < 0 || bm > kMaxRange) {
+        return set_error("\"bm_range\" must be in [0, " +
+                         std::to_string(kMaxRange) + "]");
     }
     d->bm_range = bm;
 
@@ -1307,8 +1312,9 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     if (error) {
         ps_range = 4;
     }
-    if (ps_range < 0) {
-        return set_error("\"ps_range\" must be non-negative");
+    if (ps_range < 0 || ps_range > kMaxRange) {
+        return set_error("\"ps_range\" must be in [0, " +
+                         std::to_string(kMaxRange) + "]");
     }
     d->ps_range = ps_range;
 

@@ -560,7 +560,7 @@ def test_8bit_format_rejected(fmt, msg):
             r'"block_size" must not exceed the dimensions of any processed plane',
         ),
         (
-            dict(block_size=16, group_size=128),
+            dict(block_size=16, group_size=64),
             r"min\(block_size\^2, group_size\) must be <= 32",
         ),
         (
@@ -569,17 +569,29 @@ def test_8bit_format_rejected(fmt, msg):
         ),
         (dict(block_step=0), r'"block_step" must be positive and no larger than'),
         (dict(sigma=-1), r'"sigma" must be finite and non-negative'),
-        (dict(group_size=0), r'"group_size" must be in \[1, 256\]'),
-        (dict(bm_range=-1), r'"bm_range" must be non-negative'),
+        (dict(group_size=0), r'"group_size" must be in \[1, 64\]'),
+        (dict(group_size=65), r'"group_size" must be in \[1, 64\]'),
+        (dict(group_size=256), r'"group_size" must be in \[1, 64\]'),
+        (dict(bm_range=-1), r'"bm_range" must be in \[0, 4096\]'),
+        (dict(bm_range=4097), r'"bm_range" must be in \[0, 4096\]'),
+        (dict(bm_range=2147483647), r'"bm_range" must be in \[0, 4096\]'),
         (dict(radius=16), r'"radius" must be in \[0, 15\]'),
         (dict(ps_num=0), r'"ps_num" must be in \[1, 64\]'),
         (dict(ps_num=65), r'"ps_num" must be in \[1, 64\]'),
-        (dict(ps_range=-1), r'"ps_range" must be non-negative'),
+        (dict(ps_range=-1), r'"ps_range" must be in \[0, 4096\]'),
+        (dict(ps_range=4097), r'"ps_range" must be in \[0, 4096\]'),
+        (dict(ps_range=2147483647), r'"ps_range" must be in \[0, 4096\]'),
     ],
 )
 def test_validation_errors(kwargs, msg):
     with pytest.raises(vs.Error, match=msg):
         vs.core.vsfeel.WNNM(_blank(), **kwargs)
+
+
+def test_parameter_caps_are_inclusive():
+    """The list caps (64) and the search-radius cap (4096) accept their edge."""
+    vs.core.vsfeel.WNNM(_blank(), block_size=4, group_size=64, ps_num=64)
+    vs.core.vsfeel.WNNM(_blank(), bm_range=4096, ps_range=4096)
 
 
 def test_block_size_checked_per_processed_plane():
