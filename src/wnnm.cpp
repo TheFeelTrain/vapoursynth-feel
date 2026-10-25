@@ -842,7 +842,7 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                                     dummy,
                                     dummy,
                                     dummy,
-                                    dummy,
+                                    tr_buf.buffer ? tr_buf.buffer : dummy,
                                     dist_buf.buffer ? dist_buf.buffer : dummy,
                                     match_view };
         gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 8);
@@ -1111,13 +1111,23 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
         if (d->gpu->api->gpuExecWaitValue(d->pool, signaled, perr,
                                           sizeof(perr)) == gdDrained) {
             const uint32_t * tr = static_cast<const uint32_t *>(tr_buf.mapped);
+            // Cached folds were not searched this frame: their trace record was
+            // never written, so print only the folds the matcher actually ran.
+            std::vector<int> dump_folds;
+            if (d->cache) {
+                dump_folds = todo;
+            } else {
+                for (int i = 0; i < d->folds; ++i) {
+                    dump_folds.push_back(i);
+                }
+            }
             for (int p = 0; p < 3; ++p) {
                 const WnnmPlane & dpl = d->plane[p];
                 if (!dpl.process) {
                     continue;
                 }
                 for (int gg = 0; gg < dpl.ng; ++gg) {
-                    for (int td = 0; td <= 2 * d->radius; ++td) {
+                    for (int td : dump_folds) {
                         const uint32_t * e =
                             tr + dpl.trace_base +
                             (int64_t(gg) * (2 * d->radius + 1) + td) * 28;

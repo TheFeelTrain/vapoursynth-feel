@@ -391,9 +391,9 @@ and the request orders on both.
 
 - `VSFEEL_WNNM=1` - creation banner (per-plane geometry, scratch bases, qmax).
 - `VSFEEL_WNNM_TIMING=1` - per-frame host split (acquire/record/submit).
-- `VSFEEL_WNNM_DUMP=<frame>` - dump each centre's selected group (errors,
-  positions, temporal slot, kept count, weight) to stderr. Only the fused path
-  fills `kept`/weight, and cached centres are not re-traced.
+- `VSFEEL_WNNM_DUMP=<frame>` - dump each searched centre's selected group
+  (errors, positions, temporal slot, kept count, weight) to stderr. Cached
+  centres are not re-traced, so they are omitted.
 - `VSFEEL_WNNM_NOCACHE=1` - no per-centre match cache: one record per fold per
   frame (the fallback path, and the A/B arm for the cache).
 - `VSFEEL_WNNM_GPUTRACE=<frame>` - one-shot GPU timestamps around the match,

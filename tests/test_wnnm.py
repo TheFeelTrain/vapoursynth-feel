@@ -526,6 +526,119 @@ def test_cropped_frame_stride(clip_grays):
 
 
 # ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+_DUMP_SCRIPT = r"""
+import json
+import sys
+
+import vapoursynth as vs
+
+core = vs.core
+src = core.bs.VideoSource(sys.argv[3])
+src = core.std.Crop(src, left=0, top=0, right=608, bottom=328)  # 32x32
+clip = core.std.ShufflePlanes(src, 0, vs.GRAY)
+clip = core.fmtc.bitdepth(clip, bits=32, fulls=True, fulld=True)
+clip = core.std.Trim(clip, length=3)
+node = core.vsfeel.WNNM(clip, **json.loads(sys.argv[1]))
+out = core.std.GPUDownload(clip=node)
+for n in range(int(sys.argv[2]) + 1):
+    out.get_frame(n)
+"""
+
+_DUMP_CLIP = os.path.join(os.path.dirname(__file__), "bigbuckbunny_360p_grain.mp4")
+
+
+def _dump_records(params, frame, env=None):
+    """Parse VSFEEL_WNNM_DUMP for one frame: (p, gx, gy, td) -> fields."""
+    run_env = {
+        **os.environ,
+        "MANGOHUD": "0",
+        "VSFEEL_DEBUG": "1",
+        "VSFEEL_WNNM_DUMP": str(frame),
+        **(env or {}),
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", _DUMP_SCRIPT, json.dumps(params), str(frame), _DUMP_CLIP],
+        capture_output=True,
+        text=True,
+        env=run_env,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    records = {}
+    current = None
+    for line in proc.stderr.splitlines():
+        head = re.match(
+            r"\[wnnm-dump\] p=(\d+) gx=(\d+) gy=(\d+) td=(\d+) n=(\d+) "
+            r"kept=(\d+) w=(\S+) nl=(\d+)$",
+            line,
+        )
+        if head:
+            key = tuple(int(x) for x in head.groups()[:4])
+            current = {
+                "n": int(head.group(5)),
+                "kept": int(head.group(6)),
+                "w": float(head.group(7)),
+                "nl": int(head.group(8)),
+                "top": [],
+            }
+            records[key] = current
+            continue
+        item = re.match(r"\[wnnm-dump\]\s+j=(\d+) err=(\S+) xy=0x([0-9a-f]+) t=(\d+)$", line)
+        if item and current is not None:
+            current["top"].append(
+                (float(item.group(2)), int(item.group(3), 16), int(item.group(4)))
+            )
+    return records
+
+
+def _check_dump_record(rec, block_size, group_size, size=32):
+    assert rec["n"] == len(rec["top"]), rec
+    assert 1 <= rec["n"] <= group_size, rec
+    assert rec["kept"] <= min(block_size * block_size, rec["n"]), rec
+    if rec["kept"]:
+        assert rec["w"] * rec["kept"] == pytest.approx(1.0), rec
+    else:
+        assert rec["w"] == 1.0, rec
+    errors = [entry[0] for entry in rec["top"]]
+    assert errors == sorted(errors), rec
+    for _, xy, _ in rec["top"]:
+        assert 0 <= (xy & 0xFFFF) < size and 0 <= (xy >> 16) < size, rec
+
+
+def test_dump_split_spatial_matches_fused():
+    """The split matcher's trace must carry the same selection as the fused
+    kernel, and the split solve's kept/weight must be filled."""
+    params = dict(sigma=3, block_size=4, block_step=4, group_size=4, bm_range=2)
+    split = _dump_records(params, 0)
+    fused = _dump_records(params, 0, {"VSFEEL_WNNM_NOSPLIT": "1"})
+    assert split
+    assert set(split) == set(fused)
+    assert {key[3] for key in split} == {0}
+    for key, rec in split.items():
+        _check_dump_record(rec, 4, 4)
+        assert rec["nl"] == 0
+        assert rec == fused[key], key
+
+
+def test_dump_temporal_cache_matches_nocache():
+    """A cached fold was not searched, so it is not dumped; the searched fold's
+    record must match the no-cache run."""
+    params = dict(sigma=3, radius=1, block_size=4, group_size=4, ps_num=2)
+    cached = _dump_records(params, 1)
+    all_folds = _dump_records(params, 1, {"VSFEEL_WNNM_NOCACHE": "1"})
+    assert cached
+    assert set(cached) < set(all_folds)
+    assert len({key[3] for key in cached}) < 3
+    for key, rec in cached.items():
+        _check_dump_record(rec, 4, 4)
+        assert rec["nl"] > 0
+        assert rec == all_folds[key], key
+
+
+# ---------------------------------------------------------------------------
 # Creation-time variants
 # ---------------------------------------------------------------------------
 

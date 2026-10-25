@@ -897,6 +897,7 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
         if (TRACE != 0) {
             const int tb = TRBASE + (int(wg) * (2 * RADIUS + 1) + fold) * 28;
             trace[tb + 0] = uint(top_n);
+            trace[tb + 3] = RADIUS != 0 ? uint(loc_n) : 0u;
             for (int i = 0; i < 8; ++i) {
                 trace[tb + 4 + i * 3 + 0] =
                     i < top_n ? floatBitsToUint(top_e[i]) : 0u;
@@ -909,12 +910,12 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
 #endif
     const int n = top_n;
     if (TRACE != 0 && tid == 0) {
-        const int tb = TRBASE + (int(wg) * (2 * RADIUS + 1) + layer_base) * 28;
+        const int tb = TRBASE + (int(wg) * (2 * RADIUS + 1) + fold) * 28;
         trace[tb + 0] = uint(n);
 #if defined(NOMATCH)
         trace[tb + 3] = 0u;
 #else
-        trace[tb + 3] = uint(loc_n);
+        trace[tb + 3] = RADIUS != 0 ? uint(loc_n) : 0u;
 #endif
         for (int j = 0; j < 8; ++j) {
             trace[tb + 4 + j * 3 + 0] =
@@ -1066,7 +1067,7 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
         }
         weight = (ADAPTIVE != 0 && kept > 0) ? 1.0f / float(kept) : 1.0f;
         if (TRACE != 0) {
-            const int tb = TRBASE + (int(wg) * (2 * RADIUS + 1) + layer_base) * 28;
+            const int tb = TRBASE + (int(wg) * (2 * RADIUS + 1) + fold) * 28;
             trace[tb + 1] = uint(kept);
             trace[tb + 2] = floatBitsToUint(weight);
         }
@@ -1499,6 +1500,17 @@ void main() {
             bxy[i];
         matches[uint(MATCH_BASE) + uint(g) * uint(slot) + uint(2 + 2 * i)] = 0u;
     }
+    if (TRACE != 0) {
+        const int tb = TRBASE + (int(g) * (2 * RADIUS + 1)) * 28;
+        trace[tb + 0] = uint(kept_n);
+        trace[tb + 3] = 0u;
+        for (int i = 0; i < 8; ++i) {
+            trace[tb + 4 + i * 3 + 0] =
+                i < kept_n ? floatBitsToUint(be[i]) : 0u;
+            trace[tb + 4 + i * 3 + 1] = i < kept_n ? bxy[i] : 0u;
+            trace[tb + 4 + i * 3 + 2] = 0u;
+        }
+    }
 #elif defined(ENTRY_GRAM)
     // Eight lanes per group, lane l taking column l of every patch row. Each
     // lane accumulates the whole 8x8 outer-product sum over the pixels it owns
@@ -1675,8 +1687,15 @@ void main() {
     MROW(5, f0, f1, f2, f3, f4, f5, f6, f7)
     MROW(6, f0, f1, f2, f3, f4, f5, f6, f7)
     MROW(7, f0, f1, f2, f3, f4, f5, f6, f7)
-    pmat[gbase + uint(MAT_WEIGHT)] =
-        (ADAPTIVE != 0 && kept > 0.0) ? 1.0 / kept : 1.0;
+    const float weight = (ADAPTIVE != 0 && kept > 0.0) ? 1.0 / kept : 1.0;
+    pmat[gbase + uint(MAT_WEIGHT)] = weight;
+    if (TRACE != 0) {
+        const int sfold = fold_of(sr);
+        const int sgroup = int(sr) - sfold * NG;
+        const int tb = TRBASE + (sgroup * (2 * RADIUS + 1) + sfold) * 28;
+        trace[tb + 1] = uint(kept);
+        trace[tb + 2] = floatBitsToUint(weight);
+    }
 #elif defined(ENTRY_APPLY)
     // Eight lanes per group, lane l taking column l of every patch row: each
     // pixel needs all eight patch values and produces all eight output
