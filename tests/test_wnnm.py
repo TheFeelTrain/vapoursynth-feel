@@ -7,10 +7,14 @@ comparisons run on f32 clips in a subprocess against the installed
 native u16/f16 transport is graded against the same filter on the widened f32
 clip, which is the chain a caller would otherwise write by hand.
 
-The port matched the reference to <= 7.7e-7 max abs over every case here
-(measured, 640x360 GRAYS and 64x48 crops, spatial and temporal); the tests use
-5e-6 to leave headroom for content and rounding-order variation while still
-catching a broken match or a flipped shrink decision.
+The f32 port matches vszip to 2.9e-3 max on the default 640x360 GRAYS case
+(0.09% of samples over 1e-5). A shrink decision that sits on the f32 rounding
+boundary can flip: `block_size=4, group_size=4` is the only case here that
+reaches 1.4e-2 (four samples over 1e-2), and every other case stays under
+6e-3. At most 0.8% of the samples in a case sit over 1e-5. The normal ceiling
+is therefore 8e-3, with a 1.5e-2 cap for that small-group flip and a 1% cap on
+the fraction over 1e-5. A broken path moves far more samples (the old
+group_size=33 barrier bug 97%, the win overrun 27%).
 
 Self-consistency is separate: the scatter accumulates through buffer atomics, so
 two runs differ by the float-atomic ordering floor (measured <= 3.6e-7); those
@@ -45,20 +49,21 @@ from conftest import (
 
 pytestmark = pytest.mark.usefixtures("clip_grays")
 
-# The default (f32) eigen step lands its shrink decisions on the same side as
-# vszip's f64 one except where an eigenvalue sits within ~1e-5 of the shrink
-# threshold; a flipped decision moves those pixels by up to 1.4e-2 (block_size 4,
-# typically ~3e-3). Against a f64 exact-SVD oracle ours is 2.2e-3 at worst and
-# the nssfactory CPU reference 4.7e-3 to 2.0e-2, so the fast path is closer to
-# the exact answer than the CPU reference the port was checked against.
-REF_TOL = 2e-2
+# The eigen step is f32, so a shrink decision flips where an eigenvalue sits
+# within ~1e-5 of the threshold. Only block_size=4/group_size=4 reaches 1.4e-2
+# (four samples); every other case stays under 6e-3. REF_TOL is the normal
+# ceiling, FLIP_TOL the small-group outlier, and REF_NDIFF catches a broken
+# path, which moves a much larger fraction of samples.
+REF_TOL = 8e-3
+FLIP_TOL = 1.5e-2
+REF_NDIFF = 0.01
 # float atomic ordering floor: measured <= 3.6e-7 between two runs.
 SELF_TOL = 1e-5
 # Above SELCAP=32 the matcher feeds the group serially. Measured after the
 # barrier was made uniform: <= 2.1e-3 max diff and <= 0.5% of samples over 1e-5
 # on the 512x264 crop (1.5e-2 / 1.9e-2 and 97% before it).
 SERIAL_TOL = 5e-3
-SERIAL_NDIFF = 0.02
+SERIAL_NDIFF = 0.01
 
 
 def WNNM(*args, **kwargs):
@@ -88,9 +93,20 @@ def _ref_payload(
 
 
 def _ref_compare(fmt, frames, params, planes=None, guide=None, crop=None, nframes=None):
-    return _ref_payload(
-        fmt, frames, params, planes=planes, guide=guide, crop=crop, nframes=nframes
-    )["maxdiff"]
+    payload = _ref_payload(
+        fmt,
+        frames,
+        params,
+        planes=planes,
+        guide=guide,
+        crop=crop,
+        nframes=nframes,
+        diff_tol=1e-5,
+    )
+    assert payload["ndiff_frac"] <= REF_NDIFF, (
+        f"{payload['ndiff_frac']:.2%} of samples differ (params {params})"
+    )
+    return payload["maxdiff"]
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +139,8 @@ SPATIAL_CASES = [
 )
 def test_spatial_matches_vszip(clip_grays, kwargs):
     worst = _ref_compare("grays", (0, 11, 23), kwargs)
-    assert worst <= REF_TOL, f"max abs diff {worst:.3e} (params {kwargs})"
+    tol = FLIP_TOL if kwargs.get("block_size") == 4 and kwargs.get("group_size") == 4 else REF_TOL
+    assert worst <= tol, f"max abs diff {worst:.3e} (params {kwargs})"
 
 
 @pytest.mark.parametrize(
@@ -155,10 +172,13 @@ def test_odd_geometry_matches_vszip(clip_grays):
 
 
 def test_starved_tiny_frame_matches_vszip(clip_grays):
-    """13x7 with 4x4 blocks: fewer candidates than group_size everywhere."""
-    crop = {"left": 13, "top": 7, "right": 640 - 200, "bottom": 360 - 200}
+    """13x7 with 4x4 blocks and one candidate per window: every group is starved."""
+    crop = {"left": 13, "top": 7, "right": 614, "bottom": 346}
     worst = _ref_compare(
-        "grays", (0, 11, 23), dict(sigma=3, block_size=4, block_step=4, group_size=8), crop=crop
+        "grays",
+        (0, 11, 23),
+        dict(sigma=3, block_size=4, block_step=4, group_size=8, bm_range=0),
+        crop=crop,
     )
     assert worst <= REF_TOL, f"max abs diff {worst:.3e}"
 
@@ -210,7 +230,7 @@ def test_residual_large_block_matches_vszip(block_size):
     assert payload["maxdiff"] <= REF_TOL, (
         f"max abs diff {payload['maxdiff']:.3e} (block_size {block_size})"
     )
-    assert payload["ndiff_frac"] <= 0.02, (
+    assert payload["ndiff_frac"] <= REF_NDIFF, (
         f"{payload['ndiff_frac']:.2%} of samples differ (block_size {block_size})"
     )
 
@@ -243,7 +263,7 @@ def test_narrow_plane_window_matches_vszip(bm_range):
     assert payload["maxdiff"] <= 1e-5, (
         f"max abs diff {payload['maxdiff']:.3e} (bm_range {bm_range})"
     )
-    assert payload["ndiff_frac"] <= 0.02, (
+    assert payload["ndiff_frac"] <= REF_NDIFF, (
         f"{payload['ndiff_frac']:.2%} of samples differ (bm_range {bm_range})"
     )
 
