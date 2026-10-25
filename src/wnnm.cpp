@@ -98,9 +98,10 @@ struct WnnmSpec {
     int32_t match_base;
     int32_t ring;
     int32_t cache;
+    int32_t est_base;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 27> spec_entries { {
+static constexpr std::array<VkSpecializationMapEntry, 28> spec_entries { {
     { 0, offsetof(WnnmSpec, width), sizeof(int32_t) },
     { 1, offsetof(WnnmSpec, height), sizeof(int32_t) },
     { 2, offsetof(WnnmSpec, stride), sizeof(int32_t) },
@@ -128,6 +129,7 @@ static constexpr std::array<VkSpecializationMapEntry, 27> spec_entries { {
     { 24, offsetof(WnnmSpec, match_base), sizeof(int32_t) },
     { 25, offsetof(WnnmSpec, ring), sizeof(int32_t) },
     { 26, offsetof(WnnmSpec, cache), sizeof(int32_t) },
+    { 27, offsetof(WnnmSpec, est_base), sizeof(int32_t) },
 } };
 
 struct WnnmPlane {
@@ -155,6 +157,7 @@ struct WnnmPlane {
     int64_t trace_base {};
     int64_t dist_base {};
     int64_t match_base {};
+    int64_t est_base {};
     int64_t acc_elems {};
     int64_t pmat_elems {};
     int64_t locs_elems {};
@@ -200,6 +203,11 @@ struct GPUWNNM {
     int ring { 1 };
     GpuBuffer ring_buf;
     int64_t ring_bytes {};
+    // Per-centre estimate cache: the solved 8x8 M and its aggregation weight,
+    // keyed by the same ring slot as the match record. Only the split,
+    // non-residual, cached path uses it.
+    GpuBuffer est_ring;
+    int64_t est_bytes {};
     std::mutex cache_lock;
     std::vector<int> ring_tag; // centre frame each slot holds, or INT_MIN
     int dist_stride_max {};
@@ -236,6 +244,7 @@ struct GPUWNNM {
     // Every flag is packed here, after the pointers and atomics, so the struct
     // does not pay a padding run before each one.
     bool residual {}, adaptive {};
+    bool est_cache {};
     // Block matching split into distance + selection kernels (radius 0 and a
     // group that fits the selection kernel's register top-K).
     bool split_match {};
@@ -268,6 +277,7 @@ struct GPUWNNM {
         }
         VkDevice dev = gpu->device;
         gpu_destroy_buffer(*gpu, ring_buf);
+        gpu_destroy_buffer(*gpu, est_ring);
         gpu_destroy_buffer(*gpu, src_ring);
         if (copy_pipe) {
             gpu->vk->vkDestroyPipeline(dev, copy_pipe, nullptr);
@@ -377,6 +387,9 @@ struct WnnmPush {
     int32_t fold;
     float out_scale;
     float out_bias;
+    // Bits of the folds whose M/weight are already in the estimate ring; Gram
+    // and Solve skip them and Apply reads the cached M.
+    uint32_t cached;
 };
 
 // One plane conversion the frame needs in its source ring: the native plane's
@@ -647,6 +660,17 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
             fprintf(stderr, "\n");
         }
     }
+    // Folds whose centre was published by an earlier frame carry their solved
+    // M in the estimate ring; Gram and Solve can skip them.
+    uint32_t cached_mask = 0;
+    if (d->cache && d->est_cache) {
+        for (int i = 0; i < d->folds; ++i) {
+            const int cm = std::clamp(n - d->radius + i, 0, nf - 1);
+            if (d->ring_tag[cm & (d->ring - 1)] == cm) {
+                cached_mask |= 1u << i;
+            }
+        }
+    }
     // The dump pipelines carry TRACE=1 for every frame, so the trace buffer has
     // to be bound on every frame (dumping to a dummy would scribble on the
     // accumulator); only the selected frame's contents are printed.
@@ -857,26 +881,30 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     // work fills it without a barrier in between. A barrier is only needed
     // between phases, where the next phase reads what the previous wrote.
     const auto bind_match = [&] {
-        const VkBuffer buffers[8] { addr_buf.buffer,
+        const VkBuffer buffers[9] { addr_buf.buffer,
                                     dummy,
                                     dummy,
                                     dummy,
                                     dummy,
                                     tr_buf.buffer ? tr_buf.buffer : dummy,
                                     dist_buf.buffer ? dist_buf.buffer : dummy,
-                                    match_view };
-        gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 8);
+                                    match_view,
+                                    d->est_ring.buffer ? d->est_ring.buffer
+                                                       : dummy };
+        gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 9);
     };
     const auto bind_estimate = [&](VkBuffer dst_buf) {
-        const VkBuffer buffers[8] { addr_buf.buffer,
+        const VkBuffer buffers[9] { addr_buf.buffer,
                                     acc_buf.buffer,
                                     locs_buf.buffer ? locs_buf.buffer : dummy,
                                     pmat_buf.buffer ? pmat_buf.buffer : dummy,
                                     dst_buf,
                                     tr_buf.buffer ? tr_buf.buffer : dummy,
                                     dist_buf.buffer ? dist_buf.buffer : dummy,
-                                    match_view };
-        gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 8);
+                                    match_view,
+                                    d->est_ring.buffer ? d->est_ring.buffer
+                                                       : dummy };
+        gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 9);
     };
     const bool spatial_match =
         d->split_match && d->radius == 0 && !d->skip_match;
@@ -969,7 +997,8 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
         // The three estimate kernels key their slots by fold, so they need the
         // output frame and the clip length; the matcher above left its own
         // values behind.
-        const WnnmPush pc { n, d->vi->numFrames, 0, 0, 0 };
+        WnnmPush pc { n, d->vi->numFrames, 0, 0, 0 };
+        pc.cached = cached_mask;
         gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc, sizeof(pc));
     }
     if (estimate && !d->skip_gram) {
@@ -1577,6 +1606,35 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             }
         }
     }
+    // Per-centre solved-M cache: the match ring already knows which centres
+    // are published, so the estimate cache uses the same slot and depth. It is
+    // a persistent buffer with its own budget; when it does not fit, Gram and
+    // Solve run for every fold exactly as before.
+    constexpr int64_t kEstimateBudget = INT64_C(320) << 20;
+    d->est_cache = d->cache && !d->residual;
+    d->est_bytes = 0;
+    if (d->est_cache) {
+        int64_t elems = 0;
+        for (auto & p : d->plane) {
+            if (!p.process) {
+                continue;
+            }
+            p.est_base = elems;
+            elems += int64_t(d->ring) * int64_t(p.ng) * 68;
+        }
+        if (elems > kEstimateBudget / 4) {
+            d->est_cache = false;
+        } else {
+            d->est_bytes = elems * 4;
+            if (auto e = gpu_make_buffer(
+                    *d->gpu, core, VkDeviceSize(d->est_bytes), d->est_ring,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                !e.empty()) {
+                d->est_cache = false;
+                d->est_bytes = 0;
+            }
+        }
+    }
     if (d->dump_frame >= 0) {
         int64_t tr = 0;
         for (auto & p : d->plane) {
@@ -1683,7 +1741,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     // Pipelines: one group + one finish per processed plane (the geometry is
     // baked into specialization constants).
     {
-        const auto result = gpu_push_set_layout(*d->gpu, 8);
+        const auto result = gpu_push_set_layout(*d->gpu, 9);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -1762,6 +1820,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         spec.match_base = static_cast<int32_t>(pl.match_base);
         spec.ring = d->ring;
         spec.cache = d->cache ? 1 : 0;
+        spec.est_base = d->est_cache ? static_cast<int32_t>(pl.est_base) : -1;
 
         if (vsfeel_debug_flag("VSFEEL_WNNM")) {
             fprintf(stderr,
@@ -1922,12 +1981,14 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         fprintf(stderr,
                 "[wnnm] io=%s bs=%d step=%d gs=%d bm=%d radius=%d ps=%d/%d "
                 "qmax=%d; per frame acc=%.1f MiB pmat=%.1f MiB locs=%.1f MiB; "
-                "cache=%d ring=%d ring=%.1f MiB; src ring=%.1f MiB\n",
+                "cache=%d ring=%d ring=%.1f MiB; est=%d est=%.1f MiB; "
+                "src ring=%.1f MiB\n",
                 io, d->bs, d->step, d->gs, d->bm_range, d->radius, d->ps_num,
                 d->ps_range, qmax, double(d->acc_bytes) / 1048576.0,
                 double(d->pmat_bytes) / 1048576.0,
                 double(d->locs_bytes) / 1048576.0, d->cache ? 1 : 0, d->ring,
-                double(d->ring_bytes) / 1048576.0,
+                double(d->ring_bytes) / 1048576.0, d->est_cache ? 1 : 0,
+                double(d->est_bytes) / 1048576.0,
                 double(d->src_ring_bytes) / 1048576.0);
     }
 

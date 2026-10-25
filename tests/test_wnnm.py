@@ -485,6 +485,15 @@ def test_native_depth_nocache_parallel_load(monkeypatch, clip_yuv420p16):
     assert worst <= 1.0, f"parallel/serial disagreement ({worst:.3e})"
 
 
+def test_estimate_cache_matches_nocache(clip_grays, monkeypatch):
+    """The cached solution M must equal the recomputed one on the same frame."""
+    cached = WNNM(clip_grays, sigma=3, radius=1)
+    monkeypatch.setenv("VSFEEL_WNNM_NOCACHE", "1")
+    plain = WNNM(clip_grays, sigma=3, radius=1)
+    worst = max_diff(cached, plain, frames=(0, 1, 2))
+    assert worst < SELF_TOL, f"cached vs recomputed {worst:.3e}"
+
+
 @pytest.mark.parametrize(
     "params",
     [dict(sigma=3), dict(sigma=3, radius=1)],

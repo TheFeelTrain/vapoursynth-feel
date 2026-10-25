@@ -16,11 +16,11 @@ gain, then subtract the pre-scaled neutral, in that order) and reads the frame's
 
 | config (jpbd 1080p, `sigma=3`, 5 s medians) | vsfeel | vszip |
 |---|---|---|
-| chroma U/V, `radius=1` (the benchmark default) | **1076 fps** | 207 fps |
+| chroma U/V, `radius=1` (the benchmark default) | **1267 fps** | 207 fps |
 | chroma U/V, radius=0 | **1615 fps** | 408 fps |
 | luma, radius=0 | **1291 fps** | 204 fps |
 
-The radius=1 row is 5.2x vszip and the temporal matcher is ~60% of it; the same
+The radius=1 row is 6.1x vszip and the temporal matcher is ~62% of it; the same
 content at radius=0 is 3x faster (see Open work for what is left).
 
 Accuracy, against vszip and against an independent f64 exact-SVD oracle
@@ -229,6 +229,12 @@ and the request orders on both.
 
 ## Historical
 
+- **2026-10-25 - solved M cache (+18.0%).** The split path keeps each centre's
+  8x8 M and weight in a persistent ring keyed by the match slot; Gram and Solve
+  skip folds already in the match ring and Apply reads the cached M. Default
+  1073.2 -> 1266.8 fps (5 s ABBA, n=12), 270.9 MiB at 1080p; disabled at 4K or
+  for residual when the 320 MiB estimate budget does not fit. Cached vs
+  no-cache pixels differ by 8.9e-8.
 - **2026-10-25 - the cache budget respects maxStorageBufferRange.** The
   ring budget was a fixed 160 MiB, so on a device with a smaller
   storage range the ring passed the budget, failed allocation and the
@@ -377,25 +383,28 @@ and the request orders on both.
 
 ## Open work
 
-- **The eigen step is the next latency-bound dispatch (0.20 ms).** It is one
-  thread per group, so the whole dispatch is ~2 waves/SIMD however many groups
-  there are: at 360p it still costs 0.17 ms against 0.24 at 1080p, i.e. mostly
-  per-thread dependency chain (560 rotations of two transcendentals each), not
-  work. Making the four disjoint rotations of a round run on four lanes (the
+- **The eigen step is the next latency-bound dispatch (~0.18 ms after the M
+  cache, 0.26 before).** It is one thread per group, so the whole dispatch is ~2 waves/SIMD
+  however many groups there are: mostly per-thread dependency chain (560
+  rotations of two transcendentals each), not work. Making the four disjoint rotations of a round run on four lanes (the
   fused path's round-robin Jacobi over LDS) trades ~10x the instructions for
   full occupancy; unmeasured, and the round-robin's f32 order must be checked
   against the current 20-sweep serial one before it ships.
-- **The temporal matcher is 60% of the frame at ~8 waves/SIMD.** Its 32 threads
+- **The default frame is 62% match, 18% apply, 15% solve, 4% gram, 1%
+  finish (GPUTRACE frame 5 after the M cache: 0.72/0.21/0.18/0.04/0.01 ms of
+  1.16 ms).** The matcher is at ~8 waves/SIMD. Its 32 threads
   are right for the tile and the barriers, but the SSD chains are latency-bound.
   The remaining lever is more groups per workgroup (two groups of 32 threads
   with subgroup barriers, which needs the per-group arrays indexed by
   `gl_SubgroupID` and the per-group LDS under 1 KB), or one warp per reference
   block with the top-K by shuffle argmin (nssfactory `match.cu`). Both need the
   candidate loop to stop using workgroup barriers.
-- The estimate still runs over all `2r+1` slots even when the cache supplied
-  their matches; caching `M` and the weight per centre as well would drop the
-  Gram+solve to once per centre (~0.2 ms of the frame) for twice the ring
-  memory.
+- The M cache removed the cached folds' Gram+Solve; Apply is now the second
+  cost (~0.21 ms) and re-reads the 64-float M from the estimate ring as scalar
+  loads while the pmat path uses sixteen `LD4`s. Vectorising the estimate
+  buffer is the cheap next step; caching the per-centre estimated patches
+  (64 floats per match, up to 8 matches) would skip Apply entirely but costs
+  far more memory.
 - What is left in the matcher itself is the SSD traffic: each candidate reads
   its 64 pixels from global (the reference block is already staged). The
   spatial pass could stage its window like `ENTRY_DIST` does, but `win` costs

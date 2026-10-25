@@ -106,6 +106,7 @@ layout(constant_id = 24) const int MATCH_BASE = 0;
 // only in which slot a fold reads.
 layout(constant_id = 25) const int RING = 1;
 layout(constant_id = 26) const int CACHE = 0;
+layout(constant_id = 27) const int EST_BASE = -1;
 
 #define M (BS * BS)
 #define TEMP_C (W - BS)
@@ -149,6 +150,9 @@ layout(std430, binding = 7) buffer MatchBuf { uint matches[]; };
 #else
 layout(std430, binding = 7) readonly buffer MatchBuf { uint matches[]; };
 #endif
+// Per-centre solved M (8x8) and weight for the split path's cached folds.
+// EST_BASE is -1 when the cache is disabled for this instance.
+layout(std430, binding = 8) buffer EstBuf { float est[]; };
 
 // Temporal mode only: the output frame and the clip length, for the reference's
 // VAggregate fold (its slab index is clamped at the clip boundaries, so the
@@ -163,6 +167,8 @@ layout(push_constant) uniform Push {
     // out_bias + 0.5, 0, PEAK), the inverse of the copy kernel's widening.
     float out_scale;
     float out_bias;
+    // Bit i is set when fold i's M/weight are already in the estimate ring.
+    uint cached;
 } pc;
 
 // Final group, sorted by error. `top_t` is the temporal index in the centre
@@ -1547,6 +1553,9 @@ void main() {
         gl_WorkGroupID.x * (WG / 8) + (gl_LocalInvocationIndex >> 3);
     const bool glive = graw < est_count();
     const uint gslot = min(graw, est_count() - 1u);
+    if ((pc.cached & (1u << fold_of(gslot))) != 0) {
+        return;
+    }
     const int gn = int(min(match_count(gslot), uint(GS)));
     const uint gbase = uint(PMAT_BASE) + gslot * uint(PMAT_STRIDE);
     PlaneRef gs0 =
@@ -1649,6 +1658,11 @@ void main() {
     if (sr >= est_count()) {
         return;
     }
+    const int sfold = fold_of(sr);
+    if ((pc.cached & (1u << sfold)) != 0) {
+        return;
+    }
+    const int sgroup = int(sr) - sfold * NG;
     const uint gbase = uint(PMAT_BASE) + sr * uint(PMAT_STRIDE);
     const int sn = int(min(match_count(sr), uint(GS)));
     float g[64];
@@ -1714,9 +1728,25 @@ void main() {
     MROW(7, f0, f1, f2, f3, f4, f5, f6, f7)
     const float weight = (ADAPTIVE != 0 && kept > 0.0) ? 1.0 / kept : 1.0;
     pmat[gbase + uint(MAT_WEIGHT)] = weight;
+    if (EST_BASE >= 0) {
+        // One record per centre; duplicate boundary folds must not race on it.
+        const int sc = centre_of(sfold);
+        bool primary = true;
+        for (int k = 0; k < sfold; ++k) {
+            primary = primary && (centre_of(k) != sc);
+        }
+        if (primary) {
+            const uint eb = uint(EST_BASE) +
+                            (uint(sc & (RING - 1)) * uint(NG) +
+                             uint(sgroup)) *
+                                68u;
+            for (int i = 0; i < 64; ++i) {
+                est[eb + uint(i)] = pmat[gbase + uint(i)];
+            }
+            est[eb + 64u] = weight;
+        }
+    }
     if (TRACE != 0) {
-        const int sfold = fold_of(sr);
-        const int sgroup = int(sr) - sfold * NG;
         const int tb = TRBASE + (sgroup * (2 * RADIUS + 1) + sfold) * 28;
         trace[tb + 1] = uint(kept);
         trace[tb + 2] = floatBitsToUint(weight);
@@ -1734,12 +1764,29 @@ void main() {
     const uint aslot = araw;
     const int an = int(min(match_count(aslot), uint(GS)));
     const uint gbase = uint(PMAT_BASE) + aslot * uint(PMAT_STRIDE);
-    const float wgt = pmat[gbase + uint(MAT_WEIGHT)];
+    const int afold = fold_of(aslot);
+    const bool acached =
+        EST_BASE >= 0 && (pc.cached & (1u << afold)) != 0;
+    float wgt;
     float am[64];
-    LD4(am, gbase, 0) LD4(am, gbase, 4) LD4(am, gbase, 8) LD4(am, gbase, 12)
-    LD4(am, gbase, 16) LD4(am, gbase, 20) LD4(am, gbase, 24) LD4(am, gbase, 28)
-    LD4(am, gbase, 32) LD4(am, gbase, 36) LD4(am, gbase, 40) LD4(am, gbase, 44)
-    LD4(am, gbase, 48) LD4(am, gbase, 52) LD4(am, gbase, 56) LD4(am, gbase, 60)
+    if (acached) {
+        const uint eb = uint(EST_BASE) +
+                        (uint(centre_of(afold) & (RING - 1)) * uint(NG) +
+                         uint(int(aslot) - afold * NG)) *
+                            68u;
+        for (int i = 0; i < 64; ++i) {
+            am[i] = est[eb + uint(i)];
+        }
+        wgt = est[eb + 64u];
+    } else {
+        wgt = pmat[gbase + uint(MAT_WEIGHT)];
+        LD4(am, gbase, 0) LD4(am, gbase, 4) LD4(am, gbase, 8)
+        LD4(am, gbase, 12) LD4(am, gbase, 16) LD4(am, gbase, 20)
+        LD4(am, gbase, 24) LD4(am, gbase, 28) LD4(am, gbase, 32)
+        LD4(am, gbase, 36) LD4(am, gbase, 40) LD4(am, gbase, 44)
+        LD4(am, gbase, 48) LD4(am, gbase, 52) LD4(am, gbase, 56)
+        LD4(am, gbase, 60)
+    }
     const int al0 = match_layer(aslot, 0, an);
     PlaneRef as0 = addr.img[ADDR_BASE + SRC_BASE + al0];
     const int al1 = match_layer(aslot, 1, an);
