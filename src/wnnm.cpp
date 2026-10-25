@@ -455,9 +455,10 @@ static VkDeviceAddress plane_address(const GPUDevice & gpu, VkBuffer buffer) {
     return gpu.vk->vkGetBufferDeviceAddress(gpu.device, &info);
 }
 
-// A whole-queue barrier: the cache's ring is written by earlier frames, so this
-// frame's dispatches start behind everything already submitted on the compute
-// queue (the same cross-submission handoff the BM3D ring relies on).
+// A whole-queue barrier: the cache ring and the 16-bit source ring are both
+// written by earlier frames, so this frame's copies and dispatches start behind
+// everything already submitted on the compute queue (the same cross-submission
+// handoff the BM3D ring relies on).
 static void record_queue_barrier(const GPUDevice & gpu, VkCommandBuffer cmd) {
     VkMemoryBarrier2 mb {};
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
@@ -590,13 +591,15 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
 
     GpuBuffer acc_buf {}, pmat_buf {}, locs_buf {}, addr_buf {}, tr_buf {},
         dist_buf {}, match_buf {};
-    // The cache's ring is written by earlier frames' submissions and read here,
-    // so every frame on that path starts behind everything already queued (the
-    // BM3D ring uses the same handoff). Holding the lock from here to the
-    // submit is what makes record order the submission order the ring needs.
-    std::unique_lock<std::mutex> cache_guard(d->cache_lock, std::defer_lock);
-    if (d->cache) {
-        cache_guard.lock();
+    // The cache's ring and the 16-bit source ring are written by earlier
+    // submissions and read here, so every frame on either path starts behind
+    // everything already queued (the BM3D ring uses the same handoff). Holding
+    // the lock from here to the submit is what makes record order the
+    // submission order the ring needs; without it a later frame can enqueue
+    // its copy before the frame whose slot it overwrites.
+    std::unique_lock<std::mutex> submit_guard(d->cache_lock, std::defer_lock);
+    if (d->cache || d->elem_bytes == 2) {
+        submit_guard.lock();
     }
     // Folds this frame has to search: a cached centre is one an earlier frame
     // already computed, and a seek throws the whole ring away.
@@ -796,7 +799,10 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     const VkBuffer match_view =
         d->cache ? d->ring_buf.buffer
                  : (match_buf.buffer ? match_buf.buffer : dummy);
-    if (d->cache) {
+    // The cache's records and a 2-byte source ring slot are both read across
+    // frames: a later frame may overwrite either while an earlier submission
+    // still reads it, so this frame starts behind everything already queued.
+    if (d->cache || d->elem_bytes == 2) {
         record_queue_barrier(*d->gpu, cmd);
     }
     record_acc_clear(*d->gpu, cmd, acc_buf.buffer, d->acc_bytes);
@@ -1562,9 +1568,9 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     // Native 16-bit transport: widen the window's planes into a persistent f32
     // ring, because the matcher and the estimate each read a source sample more
     // than once and a typed load would put the conversion in their inner loops.
-    // One slot per frame of the window plus one, keyed by frame number; the
-    // queue preserves execution order, so a frame's copies are recorded before
-    // its kernels and a slot is reusable once those kernels are queued.
+    // One slot per frame of the window plus one, keyed by frame number. A slot
+    // can be reused while an earlier frame's kernels still read it, which the
+    // per-frame queue barrier (WNNMGetFrame) orders.
     if (d->elem_bytes == 2) {
         const int layers = d->radius == 0 ? 1 : 4 * d->radius + 1;
         d->src_slots = layers + 1;

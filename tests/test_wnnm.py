@@ -435,6 +435,36 @@ def test_parallel_load_matches_serial(clip_grays):
     assert worst < SELF_TOL, f"parallel/serial disagreement ({worst:.3e})"
 
 
+def _parallel_vs_serial(clip, **kwargs):
+    serial = WNNM(clip, **kwargs)
+    expected = [plane(serial.get_frame(n), 0) for n in range(serial.num_frames)]
+    got = eval_parallel(lambda c, **kw: vs.core.vsfeel.WNNM(c, **kw), clip, **kwargs)
+    return max(
+        float(np.abs(a.astype(np.float64) - b.astype(np.float64)).max())
+        for a, b in zip(expected, got)
+    )
+
+
+@pytest.mark.parametrize(
+    ("fixture", "tol"),
+    [("clip_yuv420p16", 1.0), ("clip_yuv420ph", 1e-3)],
+)
+def test_native_depth_parallel_load_matches_serial(request, fixture, tol):
+    """A 16-bit ring slot can be overwritten by a later frame; requesting every
+    frame at once must still reproduce the serial run. One code / one half ulp
+    is the atomic-ordering floor; a stale slot is far larger."""
+    clip = request.getfixturevalue(fixture)
+    worst = _parallel_vs_serial(clip, sigma=3)
+    assert worst <= tol, f"parallel/serial disagreement ({worst:.3e})"
+
+
+def test_native_depth_nocache_parallel_load(monkeypatch, clip_yuv420p16):
+    """The temporal path without the match cache still needs the barrier."""
+    monkeypatch.setenv("VSFEEL_WNNM_NOCACHE", "1")
+    worst = _parallel_vs_serial(clip_yuv420p16, sigma=3, radius=1)
+    assert worst <= 1.0, f"parallel/serial disagreement ({worst:.3e})"
+
+
 @pytest.mark.parametrize(
     "params",
     [dict(sigma=3), dict(sigma=3, radius=1)],

@@ -33,8 +33,6 @@ Accuracy, against vszip and against an independent f64 exact-SVD oracle
 
 The port is f32 end to end; there is no f64 path any more.
 
-**Known blockers:** 16-bit ring ordering. Defaults are unaffected.
-
 ## Implementation
 
 - `src/wnnm.cpp` (host) + `src/wnnm.comp`: one shader module with
@@ -85,10 +83,11 @@ The port is f32 end to end; there is no f64 path any more.
   linear range and the kernels' `STRIDE` is samples at every depth. Only the
   planes the filter processes are converted (a sigma-0 plane is a bit-exact copy
   straight from the centre frame) and an `rclip` gets its own set of slots. The
-  slots are only tagged after the submit, like the match ring; the whole-queue
-  barrier that covers their reuse is only recorded on the match-cache path, so
-  the radius-0 and no-cache 16-bit paths rely on queue execution order alone.
-  The ring is the filter's own buffer: it must not go through
+  slots are only tagged after the submit, like the match ring; a 16-bit frame
+  holds the ring lock through its submit and starts its command buffer with a
+  whole-queue barrier, so a later copy cannot overwrite a slot an earlier
+  submission still reads. The ring is the filter's own buffer: it must not go
+  through
   `gpuExecUsesBuffer`, which transfers ownership to the submission and frees it,
   and doing so here produced a wrong frame 0 and a core-teardown crash.
   `wnnm_copy.comp`
@@ -229,6 +228,13 @@ and the request orders on both.
 
 ## Historical
 
+- **2026-10-25 - the 16-bit source ring could be overwritten in flight.** The
+  whole-queue barrier that orders slot reuse was recorded only on the
+  match-cache path, and the 16-bit path did not hold the cache lock, so a later
+  frame's copy could enqueue before the frame whose slot it reused (RADV's
+  in-order queue hid it). The ring path now takes the same lock through submit
+  and always records the barrier; native-u16 `radius=0` fps is 2179.8 ->
+  2174.5 (-0.24%).
 - **2026-10-25 - parameter bounds match the kernels.** `group_size` above 64
   overran the shader's 64-entry lists and `bm_range`/`ps_range` at `INT_MAX`
   overflowed the layout; they now stop at 64 and 4096. The README matches. No
@@ -389,8 +395,7 @@ and the request orders on both.
   positions, temporal slot, kept count, weight) to stderr. Only the fused path
   fills `kept`/weight, and cached centres are not re-traced.
 - `VSFEEL_WNNM_NOCACHE=1` - no per-centre match cache: one record per fold per
-  frame (the fallback path, and the A/B arm for the cache; the 16-bit ring then
-  has no barrier).
+  frame (the fallback path, and the A/B arm for the cache).
 - `VSFEEL_WNNM_GPUTRACE=<frame>` - one-shot GPU timestamps around the match,
   Gram, solve, apply and finish dispatches of that frame, printed to stderr.
   Feed the filter device-resident frames or the number is the upload.
