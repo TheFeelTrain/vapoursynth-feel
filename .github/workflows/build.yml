@@ -189,7 +189,11 @@ jobs:
 
   windows-wheel:
     runs-on: windows-latest
-    timeout-minutes: 10
+    # The Windows build is dominated by ~280 glslc process spawns under the
+    # runner's real-time scanner: the step takes about 8 minutes, and setup-msys2
+    # another two. The 10-minute cap used to cancel the artifact upload one second
+    # after the successful build finished. Leave room for the slowest runner.
+    timeout-minutes: 20
     env:
       FORCE_BUILD: ${{ github.event.inputs.force_build }}
     defaults:
