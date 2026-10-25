@@ -228,6 +228,11 @@ and the request orders on both.
 
 ## Historical
 
+- **2026-10-25 - the temporal distance buffer was dead.** `dists` was laid
+  out and allocated for every split configuration (~14.7 MB/frame at 1080p
+  chroma) but only the spatial matcher reads it. Gated to `radius=0`; default
+  fps 986.6 -> 986.9 (n=6, 5 s) and the per-frame scratch is smaller. No
+  output change.
 - **2026-10-25 - the 16-bit source ring could be overwritten in flight.** The
   whole-queue barrier that orders slot reuse was recorded only on the
   match-cache path, and the 16-bit path did not hold the cache lock, so a later

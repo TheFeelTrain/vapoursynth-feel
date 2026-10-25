@@ -1471,7 +1471,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
 
             const int temp_c = pl.width - d->bs;
             const int temp_r = pl.height - d->bs;
-            {
+            if (d->radius == 0) {
                 const int stride = std::min(2 * d->bm_range + 1, temp_r + 1) *
                                    std::min(2 * d->bm_range + 1, temp_c + 1);
                 d->dist_stride_max = std::max(d->dist_stride_max, stride);
@@ -1501,7 +1501,12 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             }
             // Bases are element offsets (the kernels index float/uint arrays), kept
             // 32-byte aligned so every plane region starts on a cache-line boundary.
-            pl.dist_elems = int64_t(pl.ng) * d->dist_stride_max;
+            // The distance array exists only for the spatial split matcher;
+            // the temporal matcher compares against the anchor block directly,
+            // so its 7 MB per plane would be allocated and never read.
+            pl.dist_elems = d->split_match && d->radius == 0
+                                ? int64_t(pl.ng) * d->dist_stride_max
+                                : 0;
             pl.match_elems = int64_t(pl.ng) * (d->split_match ? d->ring : 1) *
                              (1 + 2 * d->gs);
             pl.acc_base = acc_off;
@@ -1519,7 +1524,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         d->pmat_bytes = pmat_off * sizeof(float);
         d->locs_bytes = locs_off * sizeof(uint32_t);
         if (d->split_match) {
-            d->dist_bytes = dist_off * sizeof(float);
+            d->dist_bytes =
+                d->radius == 0 ? dist_off * sizeof(float) : int64_t(0);
             // A cached ring is persistent, not per-frame scratch.
             d->ring_bytes =
                 d->cache ? match_off * int64_t(sizeof(uint32_t)) : 0;
