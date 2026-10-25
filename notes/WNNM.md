@@ -33,8 +33,7 @@ Accuracy, against vszip and against an independent f64 exact-SVD oracle
 
 The port is f32 end to end; there is no f64 path any more.
 
-**Known blockers:** narrow-plane `win` staging and 16-bit ring ordering.
-Defaults are unaffected.
+**Known blockers:** 16-bit ring ordering. Defaults are unaffected.
 
 ## Implementation
 
@@ -231,6 +230,11 @@ and the request orders on both.
 
 ## Historical
 
+- **2026-10-25 - the split matcher overran `win[]` on narrow planes.** The
+  guard was `WIN_W^2`, but the row stride is clamped by the plane width while
+  the staged height follows its height: 32x200 at `bm_range=13` stages 32x34
+  floats and wrote past the 4 KB block (8.4e-4). The guard now tests
+  `WIN_W * WIN_H`. No default-arm change.
 - **2026-10-25 - the split residual mean overran its fixed slot.** The mean
   vector was a 64-float region sized for `block_size=8`, so any larger block
   wrote into the aggregation weight and the next group's Gram (1.04 output

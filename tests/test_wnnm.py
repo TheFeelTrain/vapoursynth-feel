@@ -215,6 +215,39 @@ def test_residual_large_block_matches_vszip(block_size):
     )
 
 
+@pytest.mark.parametrize("bm_range", [7, 12, 13, 20])
+def test_narrow_plane_window_matches_fused(clip_grays, monkeypatch, bm_range):
+    """On a narrow plane the window's row stride is clamped by the width but
+    its staged height by the height; bm_range 13+ needs more rows than
+    win[1024] and used to run past the LDS."""
+    crop = dict(left=100, top=50, right=508, bottom=110)  # 32x200
+    narrow = vs.core.std.Crop(clip_grays, **crop)
+    params = dict(sigma=3, block_size=8, group_size=8, bm_range=bm_range)
+    split = WNNM(narrow, **params)
+    monkeypatch.setenv("VSFEEL_WNNM_NOSPLIT", "1")
+    fused = WNNM(narrow, **params)
+    worst = max_diff(split, fused, frames=(0,))
+    assert worst <= 1e-5, f"split vs fused {worst:.3e} (bm_range {bm_range})"
+
+
+@pytest.mark.parametrize("bm_range", [12, 13, 20])
+def test_narrow_plane_window_matches_vszip(bm_range):
+    """bm_range=12 fills win[] exactly; 13 and 20 must take the global path."""
+    payload = _ref_payload(
+        "grays",
+        (0,),
+        dict(sigma=3, block_size=8, group_size=8, bm_range=bm_range),
+        crop={"left": 100, "top": 50, "right": 508, "bottom": 110},
+        diff_tol=1e-5,
+    )
+    assert payload["maxdiff"] <= 1e-5, (
+        f"max abs diff {payload['maxdiff']:.3e} (bm_range {bm_range})"
+    )
+    assert payload["ndiff_frac"] <= 0.02, (
+        f"{payload['ndiff_frac']:.2%} of samples differ (bm_range {bm_range})"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reference parity: temporal
 # ---------------------------------------------------------------------------

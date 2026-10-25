@@ -208,11 +208,13 @@ shared int seed_order[KMAXL];
 shared float jcs[QMAX + 2];
 shared int jflag;
 
-// The split matcher's search window, staged once per group. (2*bm_range + bs)^2
-// floats covers bm_range up to 12 at bs 8; a larger window keeps the global
-// loads, because the test folds at pipeline creation (both are spec constants).
+// The split matcher's search window, staged once per group. The row stride is
+// clamped by the plane width but the staged height by its height, so a narrow
+// plane can need more rows than WIN_W (32x200, bm 13 stages 32x34): guard the
+// real size, not WIN_W^2. Both expressions are spec constants, so this folds.
 #define WIN_MAX 1024
 #define WIN_W (min(2 * BM_RANGE + BS, TEMP_C + BS))
+#define WIN_H (min(2 * BM_RANGE + 1, TEMP_R + 1) + BS - 1)
 shared float win[WIN_MAX];
 
 // The group's reference block, packed once: every SSD compares against it, so
@@ -1394,9 +1396,10 @@ void main() {
     // Two candidates per thread, two independent accumulators: the reference's
     // sequential per-candidate sum is a 64-long dependency chain, and the
     // second candidate's chain fills it.
-    if (WIN_W * WIN_W <= WIN_MAX) {
+    if (WIN_W * WIN_H <= WIN_MAX) {
         // Stage the whole (clamped) window once: every SSD term then reads LDS
-        // instead of the same 2 KB through L1.
+        // instead of the same 2 KB through L1. ww never exceeds WIN_W, and
+        // WIN_H bounds the rows, so this is the exact staged size.
         const int ww = wright - wleft + BS;
         const int wh = wbottom - wtop + BS;
         for (int i = tid; i < ww * wh; i += WG) {
