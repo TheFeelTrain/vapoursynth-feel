@@ -7,7 +7,9 @@ GPU WNNM. Everything is
 spatial match a distance kernel plus a one-thread-per-group register top-8, and
 temporal mode runs the fused matcher one centre at a time (32 threads) into a
 per-centre match cache, then the same three kernels. `group_size > 8` still runs
-the fused kernel. A **u16 or f16 clip** is accepted natively: a copy kernel
+the fused kernel. `radius` is per plane like `sigma` (a short list repeats its
+last entry, the first defaults to 0), so one plane can search temporally while
+another stays spatial. A **u16 or f16 clip** is accepted natively: a copy kernel
 widens each window plane into a persistent f32 conversion ring and the finish
 kernel narrows the result, so the kernels above never see a 2-byte sample. The
 widening reproduces VapourSynth's `depth` bit for bit (multiply by the range
@@ -77,14 +79,24 @@ The port is f32 end to end; there is no f64 path any more.
   record order equal to submission order. A 160 MiB budget halves the ring when
   its records do not fit (a partial cache still hits), and `VSFEEL_WNNM_NOCACHE`
   drops the ring for per-frame slots.
+- **Per-plane radius**: each plane owns its window end to end. Its address table
+  holds `4r+1` entries for `n-2r..n+2r` (so the frame requests the widest
+  plane's window and maps a frame number onto it), its scratch and dispatch
+  widths use its own `2r+1` folds, and the estimate ring, the cached-fold mask
+  and the match tags are per plane (a tag published by one plane's search says
+  nothing about another's record). A plane with `radius=0` beside a temporal one
+  takes the distance/selection matcher and keeps its records in the per-frame
+  match buffer, while the temporal planes use the ring; every dispatch binds
+  that plane's buffer, so the two never share a record slot.
 - **Native 16-bit transport**: a u16/f16 clip's processed planes are widened
-  into a persistent device-local ring of `4*radius+3` slots (one per window
-  frame plus one), keyed by frame number, and the address table points at the
-  slots; the source ring keeps the source's *sample* stride, so each copy is one
-  linear range and the kernels' `STRIDE` is samples at every depth. Only the
-  planes the filter processes are converted (a sigma-0 plane is a bit-exact copy
-  straight from the centre frame) and an `rclip` gets its own set of slots. The
-  slots are only tagged after the submit, like the match ring; a 16-bit frame
+  into a persistent device-local ring of `4*Rmax+3` slots, one per frame of the
+  widest plane's window plus one; each plane copies only its own window, and the
+  address table points at those slots; the source ring keeps the source's
+  *sample* stride, so each copy is one linear range and the kernels' `STRIDE` is
+  samples at every depth. Only the planes the filter processes are converted (a
+  sigma-0 plane is a bit-exact copy of the centre frame) and an `rclip` gets its
+  own set of slots. The slots are only tagged after the submit, like the match
+  ring; a 16-bit frame
   holds the ring lock through its submit and starts its command buffer with a
   whole-queue barrier, so a later copy cannot overwrite a slot an earlier
   submission still reads. The ring is the filter's own buffer: it must not go
@@ -156,10 +168,14 @@ per-plane sigma, `residual`, `adaptive_aggregation`, starved and tiny frames, od
 geometry, temporal with the boundary fold), the fused f32 path
 (`VSFEEL_WNNM_NOSPLIT`; there is no f64 path), self-consistency (determinism,
 parallel load, request order, frame props, GPU chaining), creation variants and
-every error path. The native depths are graded against the same filter on the
-manually widened clip: u16 (limited and full range, with and without `rclip`) to
-**1 code**, f16 to **half an ulp**, plus a sigma-0 plane staying a bit-exact copy
-and the request orders on both.
+every error path. Per-plane radius has no reference to compare against, so each
+plane of a mixed configuration is graded against a single-plane run at that
+plane's radius (the atomic-ordering floor is the only difference), plus the
+short-list repeat rule, a mixed-radius request order with and without the cache,
+and the u16 chain on the mixed radii. The native depths are graded against the
+same filter on the manually widened clip: u16 (limited and full range, with and
+without `rclip`) to **1 code**, f16 to **half an ulp**, plus a sigma-0 plane
+staying a bit-exact copy and the request orders on both.
 
 ## Performance
 
@@ -229,6 +245,11 @@ and the request orders on both.
 
 ## Historical
 
+- **2026-10-25 - `radius` is per plane, like `sigma`.** Each plane's address
+  table, fold count and match/estimate records are its own, so a spatial plane
+  can sit beside a temporal one; the frame requests the widest plane's window.
+  Perf-neutral on the default arm (ABBA, n=12: 1275.0 vs 1275.3 fps), and the
+  mixed configurations are graded against single-plane runs.
 - **2026-10-25 - solved M cache (+18.0%).** The split path keeps each centre's
   8x8 M and weight in a persistent ring keyed by the match slot; Gram and Solve
   skip folds already in the match ring and Apply reads the cached M. Default

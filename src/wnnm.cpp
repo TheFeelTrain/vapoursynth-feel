@@ -141,6 +141,13 @@ struct WnnmPlane {
     int gx {};
     int gy {};
     int ng {};
+    // Per-plane temporal window, like sigma: `folds` centre frames and `wl`
+    // address-table entries (4*radius+1). A plane's kernels only ever see its
+    // own window, so a smaller radius simply means a shorter table.
+    int radius {};
+    int folds { 1 };
+    int wl { 1 };
+    int addr_base {};
     float sigma {}; // split by 255, as the reference's sigma / 255.0f
 
     VkPipeline group_pipe {};
@@ -163,6 +170,9 @@ struct WnnmPlane {
     int64_t locs_elems {};
     int64_t dist_elems {};
     int64_t match_elems {};
+    // The match records live in the persistent per-centre ring (temporal split
+    // path with the cache on) or in the frame's own match buffer.
+    bool match_ring {};
 
     uint32_t grid_x {};
     uint32_t grid_y {};
@@ -187,7 +197,11 @@ struct GPUWNNM {
     VSNode * ref_node {};
     const VSVideoInfo * vi {};
 
-    int bs { 8 }, step { 8 }, gs { 8 }, bm_range { 7 }, radius { 0 };
+    int bs { 8 }, step { 8 }, gs { 8 }, bm_range { 7 };
+    // Per-plane temporal radius (like sigma): the frame requests the widest
+    // plane's window, and `max_folds` is the most any plane has.
+    int max_radius {};
+    int max_folds { 1 };
     int ps_num { 2 }, ps_range { 4 }, q {};
     int planes {};
     std::array<WnnmPlane, 3> plane;
@@ -195,7 +209,7 @@ struct GPUWNNM {
     int patch_elems {}; // bs*bs
     int64_t acc_bytes {}, pmat_bytes {}, locs_bytes {};
     int64_t dist_bytes {}, match_bytes {};
-    int folds { 1 };
+    int addr_elems {}; // address-table entries over all planes
     // Per-centre match cache: at radius > 0 one centre's search feeds 2r+1
     // output frames, so its selection and record are computed once and held in
     // a ring of RING slots keyed by centre frame. Off (one set of per-frame
@@ -209,7 +223,8 @@ struct GPUWNNM {
     GpuBuffer est_ring;
     int64_t est_bytes {};
     std::mutex cache_lock;
-    std::vector<int> ring_tag; // centre frame each slot holds, or INT_MIN
+    // Per plane: the centre frame each ring slot holds, or INT_MIN.
+    std::array<std::vector<int>, 3> ring_tag;
     int dist_stride_max {};
     // Native 16-bit transport: a 2-byte clip's planes are widened into a
     // persistent f32 ring by the copy kernel and every kernel reads the ring
@@ -532,8 +547,8 @@ static void record_acc_clear(const GPUDevice & gpu, VkCommandBuffer cmd,
 static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                                   VSCore * core, const VSAPI * vsapi) {
 
-    const int layers = d->radius == 0 ? 1 : 4 * d->radius + 1;
-    const int first = d->radius == 0 ? n : n - 2 * d->radius;
+    const int layers = d->max_radius == 0 ? 1 : 4 * d->max_radius + 1;
+    const int first = d->max_radius == 0 ? n : n - 2 * d->max_radius;
     const int nf = d->vi->numFrames;
 
     std::vector<const VSFrame *> frames(layers);
@@ -634,40 +649,44 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     if (d->cache || d->elem_bytes == 2) {
         submit_guard.lock();
     }
-    // Folds this frame has to search: a cached centre is one an earlier frame
-    // already computed, and a seek throws the whole ring away.
-    std::vector<int> todo;
+    // Folds this frame has to search, per plane: a cached centre is one an
+    // earlier frame already computed, and a seek throws the whole ring away.
+    // The tags are per plane because each plane keeps its own record, and a
+    // plane with a smaller radius looks up only its own centres.
+    std::array<std::vector<int>, 3> todo;
+    std::array<uint32_t, 3> cached_mask {};
     if (d->cache) {
-        for (int i = 0; i < d->folds; ++i) {
-            const int cm = std::clamp(n - d->radius + i, 0, nf - 1);
-            if (d->ring_tag[cm & (d->ring - 1)] == cm) {
+        for (int p = 0; p < 3; ++p) {
+            const WnnmPlane & dpl = d->plane[p];
+            if (!dpl.process || dpl.radius == 0) {
                 continue;
             }
-            bool dup = false;
-            for (int t : todo) {
-                dup = dup || std::clamp(n - d->radius + t, 0, nf - 1) == cm;
+            for (int i = 0; i < dpl.folds; ++i) {
+                const int cm = std::clamp(n - dpl.radius + i, 0, nf - 1);
+                if (d->ring_tag[p][cm & (d->ring - 1)] == cm) {
+                    // Its record and solved M are published together.
+                    if (d->est_cache) {
+                        cached_mask[p] |= 1u << i;
+                    }
+                    continue;
+                }
+                bool dup = false;
+                for (int t : todo[p]) {
+                    dup =
+                        dup || std::clamp(n - dpl.radius + t, 0, nf - 1) == cm;
+                }
+                if (!dup) {
+                    todo[p].push_back(i);
+                }
             }
-            if (!dup) {
-                todo.push_back(i);
-            }
-        }
-        if (vsfeel_debug_flag("VSFEEL_WNNM")) {
-            fprintf(stderr, "[wnnm] n=%d cached %d of %d folds, todo:", n,
-                    d->folds - static_cast<int>(todo.size()), d->folds);
-            for (int t : todo) {
-                fprintf(stderr, " %d", t);
-            }
-            fprintf(stderr, "\n");
-        }
-    }
-    // Folds whose centre was published by an earlier frame carry their solved
-    // M in the estimate ring; Gram and Solve can skip them.
-    uint32_t cached_mask = 0;
-    if (d->cache && d->est_cache) {
-        for (int i = 0; i < d->folds; ++i) {
-            const int cm = std::clamp(n - d->radius + i, 0, nf - 1);
-            if (d->ring_tag[cm & (d->ring - 1)] == cm) {
-                cached_mask |= 1u << i;
+            if (vsfeel_debug_flag("VSFEEL_WNNM")) {
+                fprintf(
+                    stderr, "[wnnm] n=%d p=%d cached %d of %d folds, todo:", n,
+                    p, dpl.folds - static_cast<int>(todo[p].size()), dpl.folds);
+                for (int t : todo[p]) {
+                    fprintf(stderr, " %d", t);
+                }
+                fprintf(stderr, "\n");
             }
         }
     }
@@ -711,10 +730,11 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
             return fail("match scratch: " + e);
         }
     }
-    // Address table: [plane][ref/src][layer], 64-bit device addresses.
+    // Address table: [plane][ref/src][layer], 64-bit device addresses, each
+    // plane's own 4*radius+1-entry window.
     if (auto e = gpu_make_buffer(
             *d->gpu, core,
-            VkDeviceSize(3) * 2 * layers * sizeof(VkDeviceAddress), addr_buf,
+            VkDeviceSize(d->addr_elems) * sizeof(VkDeviceAddress), addr_buf,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         !e.empty()) {
@@ -774,50 +794,53 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
         return true;
     };
     for (int p = 0; p < 3; ++p) {
-        if (!d->plane[p].process) {
+        const WnnmPlane & dpl = d->plane[p];
+        const int base = dpl.addr_base;
+        if (!dpl.process) {
             // Never read by a kernel; keep the table fully written anyway.
-            for (int l = 0; l < layers; ++l) {
-                table[p * 2 * layers + l] = 0;
-                table[p * 2 * layers + layers + l] = 0;
+            for (int l = 0; l < 2 * dpl.wl; ++l) {
+                table[base + l] = 0;
             }
             continue;
         }
-        for (int l = 0; l < layers; ++l) {
-            const int f = std::clamp(first + l, 0, nf - 1);
+        // This plane's own window, n-2r..n+2r; the frame vector starts at the
+        // widest plane's window, and every frame this plane needs is in it.
+        const int pfirst = n - 2 * dpl.radius;
+        for (int l = 0; l < dpl.wl; ++l) {
+            const int f = std::clamp(pfirst + l, 0, nf - 1);
+            const int gi = f - first;
             if (d->elem_bytes == 2) {
-                const VkDeviceSize slot = VkDeviceSize(f % d->src_slots) *
-                                          VkDeviceSize(d->plane[p].npix);
-                const VkDeviceAddress base =
+                const VkDeviceSize slot =
+                    VkDeviceSize(f % d->src_slots) * VkDeviceSize(dpl.npix);
+                const VkDeviceAddress at =
                     ring_base + (d->src_off[src_set][p] + slot) * 4;
-                table[p * 2 * layers + l] = base;
-                table[p * 2 * layers + layers + l] = base;
+                table[base + l] = at;
+                table[base + dpl.wl + l] = at;
                 if (d->ref_node) {
-                    table[p * 2 * layers + l] =
-                        ring_base + (d->src_off[0][p] + slot) * 4;
-                    if (!queue_copy(0, p, f, rframes[l])) {
+                    table[base + l] = ring_base + (d->src_off[0][p] + slot) * 4;
+                    if (!queue_copy(0, p, f, rframes[gi])) {
                         return fail("reference plane " + std::to_string(p) +
                                     " is not GPU resident");
                     }
                 }
-                if (!queue_copy(src_set, p, f, frames[l])) {
+                if (!queue_copy(src_set, p, f, frames[gi])) {
                     return fail("source plane " + std::to_string(p) +
                                 " is not GPU resident");
                 }
                 continue;
             }
             VSVulkanPlaneInfo sp {};
-            if (d->gpu->api->getGPUPlane(rframes[l], p, &sp)) {
+            if (d->gpu->api->getGPUPlane(rframes[gi], p, &sp)) {
                 return fail("reference plane " + std::to_string(p) +
                             " is not GPU resident");
             }
             VSVulkanPlaneInfo pp {};
-            if (d->gpu->api->getGPUPlane(frames[l], p, &pp)) {
+            if (d->gpu->api->getGPUPlane(frames[gi], p, &pp)) {
                 return fail("source plane " + std::to_string(p) +
                             " is not GPU resident");
             }
-            table[p * 2 * layers + l] = plane_address(*d->gpu, sp.buffer);
-            table[p * 2 * layers + layers + l] =
-                plane_address(*d->gpu, pp.buffer);
+            table[base + l] = plane_address(*d->gpu, sp.buffer);
+            table[base + dpl.wl + l] = plane_address(*d->gpu, pp.buffer);
         }
     }
     // The table may land in the host-visible VRAM BAR, whose mapping is
@@ -839,10 +862,6 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     }
 
     VkBuffer dummy = acc_buf.buffer ? acc_buf.buffer : addr_buf.buffer;
-    // With the cache on, the match records live in the persistent ring.
-    const VkBuffer match_view =
-        d->cache ? d->ring_buf.buffer
-                 : (match_buf.buffer ? match_buf.buffer : dummy);
     // The cache's records and a 2-byte source ring slot are both read across
     // frames: a later frame may overwrite either while an earlier submission
     // still reads it, so this frame starts behind everything already queued.
@@ -880,7 +899,15 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     // so one plane's dispatch leaves most of the CU idle, and the other plane's
     // work fills it without a barrier in between. A barrier is only needed
     // between phases, where the next phase reads what the previous wrote.
-    const auto bind_match = [&] {
+    //
+    // A plane's records live either in the persistent ring (temporal, cached)
+    // or in this frame's match buffer, so every bind takes that plane's view.
+    const auto match_view = [&](const WnnmPlane & pln) {
+        const VkBuffer view =
+            pln.match_ring ? d->ring_buf.buffer : match_buf.buffer;
+        return view ? view : dummy;
+    };
+    const auto bind_match = [&](VkBuffer matches) {
         const VkBuffer buffers[9] { addr_buf.buffer,
                                     dummy,
                                     dummy,
@@ -888,12 +915,12 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                                     dummy,
                                     tr_buf.buffer ? tr_buf.buffer : dummy,
                                     dist_buf.buffer ? dist_buf.buffer : dummy,
-                                    match_view,
+                                    matches,
                                     d->est_ring.buffer ? d->est_ring.buffer
                                                        : dummy };
         gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 9);
     };
-    const auto bind_estimate = [&](VkBuffer dst_buf) {
+    const auto bind_estimate = [&](VkBuffer dst_buf, VkBuffer matches) {
         const VkBuffer buffers[9] { addr_buf.buffer,
                                     acc_buf.buffer,
                                     locs_buf.buffer ? locs_buf.buffer : dummy,
@@ -901,22 +928,21 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                                     dst_buf,
                                     tr_buf.buffer ? tr_buf.buffer : dummy,
                                     dist_buf.buffer ? dist_buf.buffer : dummy,
-                                    match_view,
+                                    matches,
                                     d->est_ring.buffer ? d->est_ring.buffer
                                                        : dummy };
         gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 9);
     };
-    const bool spatial_match =
-        d->split_match && d->radius == 0 && !d->skip_match;
+    const bool split_match = d->split_match && !d->skip_match;
 
-    // Distance kernel (spatial split path): one dispatch per plane.
-    if (spatial_match) {
+    // Distance kernel (spatial split path): one dispatch per spatial plane.
+    if (split_match) {
         for (int p = 0; p < 3; ++p) {
             WnnmPlane & pln = d->plane[p];
-            if (!pln.process) {
+            if (!pln.process || pln.radius > 0) {
                 continue;
             }
-            bind_match();
+            bind_match(match_view(pln));
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           pln.dist_pipe);
             d->gpu->vk->vkCmdDispatch(cmd, pln.grid_x, pln.grid_y, 1);
@@ -925,10 +951,10 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
         // Selection kernel: one thread per group, reads the distances above.
         for (int p = 0; p < 3; ++p) {
             WnnmPlane & pln = d->plane[p];
-            if (!pln.process) {
+            if (!pln.process || pln.radius > 0) {
                 continue;
             }
-            bind_match();
+            bind_match(match_view(pln));
             const uint32_t sel_groups =
                 (static_cast<uint32_t>(pln.ng) + kWorkgroup - 1) / kWorkgroup;
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -945,9 +971,9 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
             if (!pln.process) {
                 continue;
             }
-            bind_estimate(dst_plane[p]);
+            bind_estimate(dst_plane[p], match_view(pln));
             if (d->split_match) {
-                if (d->radius > 0 && !d->skip_match) {
+                if (pln.radius > 0 && !d->skip_match) {
                     // The predictive search is inherently serial and publishes
                     // one selection per centre; with the cache on only the
                     // folds whose centre is not in the ring run. Each fold has
@@ -955,8 +981,8 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                     // are recorded back-to-back and the single barrier below
                     // covers them all.
                     const WnnmPush pc_all { n, d->vi->numFrames, 0, 0, 0 };
-                    for (size_t t = 0; t < todo.size(); ++t) {
-                        const WnnmPush one { n, d->vi->numFrames, todo[t], 0.0f,
+                    for (int fold : todo[p]) {
+                        const WnnmPush one { n, d->vi->numFrames, fold, 0.0f,
                                              0.0f };
                         gpu_push_constants(*d->gpu, cmd, d->pipeline_layout,
                                            &one, sizeof(one));
@@ -993,23 +1019,21 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     // (lattice point, fold) slot of the plane. Each phase is dispatched for all
     // planes before the barrier, so the two planes' kernels overlap.
     const bool estimate = d->split_match && !d->skip_group;
-    if (estimate) {
-        // The three estimate kernels key their slots by fold, so they need the
-        // output frame and the clip length; the matcher above left its own
-        // values behind.
-        WnnmPush pc { n, d->vi->numFrames, 0, 0, 0 };
-        pc.cached = cached_mask;
-        gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc, sizeof(pc));
-    }
     if (estimate && !d->skip_gram) {
         for (int p = 0; p < 3; ++p) {
             WnnmPlane & pln = d->plane[p];
             if (!pln.process) {
                 continue;
             }
-            bind_estimate(dst_plane[p]);
+            // The three estimate kernels key their slots by fold, so they need
+            // the output frame, the clip length and this plane's cached folds;
+            // the matcher above left its own values behind.
+            const WnnmPush pc { n, d->vi->numFrames, 0, 0, 0, cached_mask[p] };
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc,
+                               sizeof(pc));
+            bind_estimate(dst_plane[p], match_view(pln));
             const uint32_t lanes =
-                (static_cast<uint32_t>(pln.ng) * uint32_t(d->folds) + 15) / 16;
+                (static_cast<uint32_t>(pln.ng) * uint32_t(pln.folds) + 15) / 16;
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           pln.gram_pipe);
             d->gpu->vk->vkCmdDispatch(cmd, lanes, 1, 1);
@@ -1023,9 +1047,12 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
             if (!pln.process) {
                 continue;
             }
-            bind_estimate(dst_plane[p]);
+            const WnnmPush pc { n, d->vi->numFrames, 0, 0, 0, cached_mask[p] };
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc,
+                               sizeof(pc));
+            bind_estimate(dst_plane[p], match_view(pln));
             const uint32_t slots =
-                static_cast<uint32_t>(pln.ng) * uint32_t(d->folds);
+                static_cast<uint32_t>(pln.ng) * uint32_t(pln.folds);
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           pln.solve_pipe);
             d->gpu->vk->vkCmdDispatch(cmd, (slots + 255) / 256, 1, 1);
@@ -1039,9 +1066,12 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
             if (!pln.process) {
                 continue;
             }
-            bind_estimate(dst_plane[p]);
+            const WnnmPush pc { n, d->vi->numFrames, 0, 0, 0, cached_mask[p] };
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &pc,
+                               sizeof(pc));
+            bind_estimate(dst_plane[p], match_view(pln));
             const uint32_t lanes =
-                (static_cast<uint32_t>(pln.ng) * uint32_t(d->folds) + 15) / 16;
+                (static_cast<uint32_t>(pln.ng) * uint32_t(pln.folds) + 15) / 16;
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           pln.apply_pipe);
             d->gpu->vk->vkCmdDispatch(cmd, lanes, 1, 1);
@@ -1056,7 +1086,7 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
         if (!pln.process) {
             continue;
         }
-        bind_estimate(dst_plane[p]);
+        bind_estimate(dst_plane[p], match_view(pln));
         // A native store inverts the copy's widening, per plane and per frame
         // (the range is a frame property).
         const WnnmRange range = wnnm_range(
@@ -1116,9 +1146,12 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     // The centres this frame searched are now submitted, so a later frame that
     // consumes them may record against the ring.
     if (d->cache) {
-        for (int f : todo) {
-            const int cm = std::clamp(n - d->radius + f, 0, nf - 1);
-            d->ring_tag[cm & (d->ring - 1)] = cm;
+        for (int p = 0; p < 3; ++p) {
+            for (int f : todo[p]) {
+                const int cm =
+                    std::clamp(n - d->plane[p].radius + f, 0, nf - 1);
+                d->ring_tag[p][cm & (d->ring - 1)] = cm;
+            }
         }
     }
     for (const WnnmCopy & c : copies) {
@@ -1161,26 +1194,26 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
         if (d->gpu->api->gpuExecWaitValue(d->pool, signaled, perr,
                                           sizeof(perr)) == gdDrained) {
             const uint32_t * tr = static_cast<const uint32_t *>(tr_buf.mapped);
-            // Cached folds were not searched this frame: their trace record was
-            // never written, so print only the folds the matcher actually ran.
-            std::vector<int> dump_folds;
-            if (d->cache) {
-                dump_folds = todo;
-            } else {
-                for (int i = 0; i < d->folds; ++i) {
-                    dump_folds.push_back(i);
-                }
-            }
             for (int p = 0; p < 3; ++p) {
                 const WnnmPlane & dpl = d->plane[p];
                 if (!dpl.process) {
                     continue;
                 }
+                // Cached folds were not searched this frame: their trace record
+                // was never written, so print only the folds the matcher ran.
+                std::vector<int> dump_folds;
+                if (d->cache && dpl.radius > 0) {
+                    dump_folds = todo[p];
+                } else {
+                    for (int i = 0; i < dpl.folds; ++i) {
+                        dump_folds.push_back(i);
+                    }
+                }
                 for (int gg = 0; gg < dpl.ng; ++gg) {
                     for (int td : dump_folds) {
                         const uint32_t * e =
                             tr + dpl.trace_base +
-                            (int64_t(gg) * (2 * d->radius + 1) + td) * 28;
+                            (int64_t(gg) * dpl.folds + td) * 28;
                         fprintf(stderr,
                                 "[wnnm-dump] p=%d gx=%d gy=%d td=%d n=%u "
                                 "kept=%u w=%.9g nl=%u\n",
@@ -1226,8 +1259,8 @@ static const VSFrame * VS_CC WNNMGetFrame(int n, int activationReason,
     GPUWNNM * d = static_cast<GPUWNNM *>(instanceData);
 
     if (activationReason == arInitial) {
-        const int layers = d->radius == 0 ? 1 : 4 * d->radius + 1;
-        const int first = d->radius == 0 ? n : n - 2 * d->radius;
+        const int layers = d->max_radius == 0 ? 1 : 4 * d->max_radius + 1;
+        const int first = d->max_radius == 0 ? n : n - 2 * d->max_radius;
         for (int l = 0; l < layers; ++l) {
             const int f = std::clamp(first + l, 0, d->vi->numFrames - 1);
             vsapi->requestFrameFilter(f, d->node, frameCtx);
@@ -1355,14 +1388,17 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     }
     d->bm_range = bm;
 
-    int radius = vsh::int64ToIntS(vsapi->mapGetInt(in, "radius", 0, &error));
-    if (error) {
-        radius = 0;
+    // Per-plane temporal radius, exactly like sigma: a missing entry repeats
+    // the previous one and the first defaults to 0 (spatial only).
+    std::array<int, 3> radius {};
+    for (int i = 0; i < 3; ++i) {
+        radius[i] = vsh::int64ToIntS(vsapi->mapGetInt(in, "radius", i, &error));
+        if (error) {
+            radius[i] = (i == 0) ? 0 : radius[i - 1];
+        } else if (radius[i] < 0 || radius[i] > kMaxRadius) {
+            return set_error("\"radius\" must be in [0, 15]");
+        }
     }
-    if (radius < 0 || radius > kMaxRadius) {
-        return set_error("\"radius\" must be in [0, 15]");
-    }
-    d->radius = radius;
 
     int ps_num = vsh::int64ToIntS(vsapi->mapGetInt(in, "ps_num", 0, &error));
     if (error) {
@@ -1421,7 +1457,17 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         d->plane[p].process = p < num_planes && sigma[p] >= FLT_EPSILON;
         any = any || d->plane[p].process;
         d->plane[p].sigma = sigma[p] / 255.0f;
+        // Every plane carries its radius, processed or not: the address table
+        // is written for all three. The frame's window is the widest processed
+        // plane's.
+        d->plane[p].radius = radius[p];
+        d->plane[p].folds = 2 * radius[p] + 1;
+        d->plane[p].wl = 4 * radius[p] + 1;
+        if (d->plane[p].process) {
+            d->max_radius = std::max(d->max_radius, radius[p]);
+        }
     }
+    d->max_folds = 2 * d->max_radius + 1;
     if (!any) {
         if (d->ref_node) {
             vsapi->freeNode(d->ref_node);
@@ -1441,8 +1487,6 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     // The split estimate runs any radius; only a group too wide for its
     // register-resistant kernels keeps the fused one.
     d->split_match = d->gs <= 8 && !env_flag("VSFEEL_WNNM_NOSPLIT");
-    // One estimate slot per (lattice point, temporal fold).
-    d->folds = 2 * d->radius + 1;
 
     // Geometry and per-plane scratch. The kernel's group lattice is the
     // reference's `min(_x, temp_c)` walk. The layout runs again when the
@@ -1459,31 +1503,34 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         kCacheBudget,
         static_cast<int64_t>(d->gpu->limits.maxStorageBufferRange));
     d->cache =
-        d->split_match && d->radius > 0 && !env_flag("VSFEEL_WNNM_NOCACHE");
+        d->split_match && d->max_radius > 0 && !env_flag("VSFEEL_WNNM_NOCACHE");
     // A centre's record is only published when its own frame is submitted, so
     // the ring has to span the frames the core keeps in flight: a smaller ring
     // evicts a tag before the neighbouring frame that would hit it reads it,
     // and every frame re-searches all folds (0.95 of 3 cached instead of 2 at
     // the default request depth of 32, ~3x the matcher's time).
-    int depth = 2 * d->folds;
+    int depth = 2 * d->max_folds;
     {
         VSCoreInfo info {};
         vsapi->getCoreInfo(core, &info);
         depth += std::max(0, info.numThreads);
     }
-    d->ring = d->cache ? std::min(256, round_up_pow2(depth)) : d->folds;
+    d->ring = d->cache ? std::min(256, round_up_pow2(depth)) : d->max_folds;
     // The split estimate's per-group stride: the mean vector is M floats once
     // residual strips it (the fused path's M*(gs+1) layout is unchanged).
     const int sstride = split_stride(m, d->residual);
-    // The split temporal matcher gives each fold its own location region so
-    // its per-centre dispatches can overlap; the fused kernel loops folds in
-    // one dispatch and keeps sharing the plane's region.
-    const int locs_folds = d->split_match ? d->folds : 1;
     auto layout = [&] {
-        int64_t acc_off = 0, pmat_off = 0, locs_off = 0, dist_off = 0,
-                match_off = 0;
+        int64_t acc_off = 0, pmat_off = 0, locs_off = 0, dist_off = 0;
+        // Match records are split by the buffer they live in: the persistent
+        // per-centre ring, or the frame's own buffer.
+        int64_t ring_match_off = 0, frame_match_off = 0, addr_off = 0;
         for (int p = 0; p < 3; ++p) {
             WnnmPlane & pl = d->plane[p];
+            // The address table is per plane: its own 4*radius+1-entry window,
+            // refs then sources. Unprocessed planes keep their entries too, so
+            // the table is fully written.
+            pl.addr_base = static_cast<int>(addr_off);
+            addr_off += 2 * pl.wl;
             if (!pl.process) {
                 continue;
             }
@@ -1511,7 +1558,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
 
             const int temp_c = pl.width - d->bs;
             const int temp_r = pl.height - d->bs;
-            if (d->radius == 0) {
+            if (pl.radius == 0) {
                 const int stride = std::min(2 * d->bm_range + 1, temp_r + 1) *
                                    std::min(2 * d->bm_range + 1, temp_c + 1);
                 d->dist_stride_max = std::max(d->dist_stride_max, stride);
@@ -1523,15 +1570,19 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
 
             pl.acc_elems = int64_t(2) * pl.width * pl.height;
             pl.pmat_elems = d->split_match
-                                ? int64_t(pl.ng) * d->folds * sstride
+                                ? int64_t(pl.ng) * pl.folds * sstride
                                 : int64_t(pl.ng) * m *
                                       (int64_t(d->gs) + (d->residual ? 1 : 0));
-            if (d->radius > 0) {
+            if (pl.radius > 0) {
                 const int area = std::min(2 * d->bm_range + 1, temp_r + 1) *
                                  std::min(2 * d->bm_range + 1, temp_c + 1);
                 const int centers = std::min(d->ps_num, area);
                 const int rect = std::min(2 * d->ps_range + 1, temp_c + 1) *
                                  std::min(2 * d->ps_range + 1, temp_r + 1);
+                // The split temporal matcher gives each fold its own location
+                // region so its per-centre dispatches can overlap; the fused
+                // kernel loops folds in one dispatch and shares the region.
+                const int locs_folds = d->split_match ? pl.folds : 1;
                 pl.locs_elems =
                     int64_t(pl.ng) * locs_folds *
                     std::min<int64_t>(int64_t(centers) * rect,
@@ -1544,33 +1595,44 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             // The distance array exists only for the spatial split matcher;
             // the temporal matcher compares against the anchor block directly,
             // so its 7 MB per plane would be allocated and never read.
-            pl.dist_elems = d->split_match && d->radius == 0
+            pl.dist_elems = d->split_match && pl.radius == 0
                                 ? int64_t(pl.ng) * d->dist_stride_max
                                 : 0;
-            pl.match_elems = int64_t(pl.ng) * (d->split_match ? d->ring : 1) *
-                             (1 + 2 * d->gs);
+            // A temporal plane with the cache on reads and writes the
+            // persistent ring; a spatial plane (or any plane when the cache is
+            // off) keeps its records in this frame's buffer.
+            pl.match_ring = d->cache && d->split_match && pl.radius > 0;
+            pl.match_elems =
+                int64_t(pl.ng) *
+                int64_t(pl.match_ring ? d->ring
+                                      : (d->split_match ? pl.folds : 1)) *
+                (1 + 2 * d->gs);
             pl.acc_base = acc_off;
             pl.pmat_base = pmat_off;
             pl.locs_base = locs_off;
             pl.dist_base = dist_off;
-            pl.match_base = match_off;
+            if (pl.match_ring) {
+                pl.match_base = ring_match_off;
+                ring_match_off += (pl.match_elems + 7) & ~int64_t(7);
+            } else {
+                pl.match_base = frame_match_off;
+                frame_match_off += (pl.match_elems + 7) & ~int64_t(7);
+            }
             acc_off += (pl.acc_elems + 7) & ~int64_t(7);
             pmat_off += (pl.pmat_elems + 7) & ~int64_t(7);
             locs_off += (pl.locs_elems + 7) & ~int64_t(7);
             dist_off += (pl.dist_elems + 7) & ~int64_t(7);
-            match_off += (pl.match_elems + 7) & ~int64_t(7);
         }
+        d->addr_elems = static_cast<int>(addr_off);
         d->acc_bytes = acc_off * sizeof(float);
         d->pmat_bytes = pmat_off * sizeof(float);
         d->locs_bytes = locs_off * sizeof(uint32_t);
         if (d->split_match) {
-            d->dist_bytes =
-                d->radius == 0 ? dist_off * sizeof(float) : int64_t(0);
+            d->dist_bytes = dist_off * sizeof(float);
             // A cached ring is persistent, not per-frame scratch.
             d->ring_bytes =
-                d->cache ? match_off * int64_t(sizeof(uint32_t)) : 0;
-            d->match_bytes =
-                d->cache ? 0 : match_off * int64_t(sizeof(uint32_t));
+                d->cache ? ring_match_off * int64_t(sizeof(uint32_t)) : 0;
+            d->match_bytes = frame_match_off * int64_t(sizeof(uint32_t));
         }
         // The kernels address these regions with signed 32-bit indices, so
         // every region (and its base) has to stay below 2^31 elements.
@@ -1591,7 +1653,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         // one centre's folds. A smaller ring keeps the hits it can, which beats
         // dropping to per-frame slots; below the fold count there is no reuse
         // left to keep and the cache goes away entirely.
-        const int floor_ring = round_up_pow2(2 * d->folds);
+        const int floor_ring = round_up_pow2(2 * d->max_folds);
         while (d->ring > floor_ring && d->ring_bytes > cache_budget) {
             d->ring /= 2;
             if (auto e = layout(); !e.empty()) {
@@ -1600,7 +1662,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         }
         if (d->ring_bytes > cache_budget) {
             d->cache = false;
-            d->ring = d->folds;
+            d->ring = d->max_folds;
             if (auto e = layout(); !e.empty()) {
                 return set_error(e);
             }
@@ -1616,7 +1678,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     if (d->est_cache) {
         int64_t elems = 0;
         for (auto & p : d->plane) {
-            if (!p.process) {
+            // A spatial plane has no centre to cache its M for.
+            if (!p.process || p.radius == 0) {
                 continue;
             }
             p.est_base = elems;
@@ -1640,7 +1703,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         for (auto & p : d->plane) {
             if (p.process) {
                 p.trace_base = tr;
-                tr += int64_t(p.ng) * (2 * d->radius + 1) * 28;
+                tr += int64_t(p.ng) * p.folds * 28;
             }
         }
         d->trace_elems = tr;
@@ -1677,7 +1740,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     // can be reused while an earlier frame's kernels still read it, which the
     // per-frame queue barrier (WNNMGetFrame) orders.
     if (d->elem_bytes == 2) {
-        const int layers = d->radius == 0 ? 1 : 4 * d->radius + 1;
+        const int layers = 4 * d->max_radius + 1;
         d->src_slots = layers + 1;
         d->src_sets = d->ref_node ? 2 : 1;
         VkDeviceSize elems = 0;
@@ -1778,13 +1841,15 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         fprintf(stderr, "[wnnm] no buffer float atomics: using the CAS "
                         "accumulator\n");
     }
-    const WnnmVariant variant =
-        pick_variant(qmax, hw_atomics, d->split_match && d->radius > 0, d->io);
     for (int p = 0; p < 3; ++p) {
         WnnmPlane & pl = d->plane[p];
         if (!pl.process) {
             continue;
         }
+        const bool temporal = pl.radius > 0;
+        const WnnmVariant variant =
+            pick_variant(qmax, hw_atomics, d->split_match && temporal, d->io);
+        const int locs_folds = d->split_match ? pl.folds : 1;
         WnnmSpec spec {};
         spec.width = pl.width;
         spec.height = pl.height;
@@ -1793,18 +1858,18 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         spec.step = d->step;
         spec.gs = d->gs;
         spec.bm_range = d->bm_range;
-        spec.radius = d->radius;
+        spec.radius = pl.radius;
         spec.ps_num = d->ps_num;
         spec.ps_range = d->ps_range;
         spec.gx = pl.gx;
         spec.ng = pl.ng;
         spec.residual = d->residual ? 1 : 0;
         spec.adaptive = d->adaptive ? 1 : 0;
-        spec.locs_cap = d->radius
+        spec.locs_cap = temporal
                             ? static_cast<int32_t>(
                                   pl.locs_elems / (int64_t(pl.ng) * locs_folds))
                             : 1;
-        spec.addr_base = p * 2 * (d->radius == 0 ? 1 : 4 * d->radius + 1);
+        spec.addr_base = pl.addr_base;
         spec.sigma = pl.sigma;
         spec.acc_base = static_cast<int32_t>(pl.acc_base);
         spec.pmat_base = static_cast<int32_t>(pl.pmat_base);
@@ -1818,9 +1883,12 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         spec.locs_base = static_cast<int32_t>(pl.locs_base);
         spec.dist_base = static_cast<int32_t>(pl.dist_base);
         spec.match_base = static_cast<int32_t>(pl.match_base);
-        spec.ring = d->ring;
-        spec.cache = d->cache ? 1 : 0;
-        spec.est_base = d->est_cache ? static_cast<int32_t>(pl.est_base) : -1;
+        // The record cache and its ring are a temporal plane's: a spatial
+        // plane's record is this frame's own.
+        spec.ring = d->cache ? d->ring : 1;
+        spec.cache = pl.match_ring ? 1 : 0;
+        spec.est_base =
+            d->est_cache && temporal ? static_cast<int32_t>(pl.est_base) : -1;
 
         if (vsfeel_debug_flag("VSFEEL_WNNM")) {
             fprintf(stderr,
@@ -1859,7 +1927,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                                              sizeof(wnnm_apply_spv), lanes)
                                        : add(tag + " apply", wnnm_apply_cas_spv,
                                              sizeof(wnnm_apply_cas_spv), lanes);
-            if (d->radius > 0) {
+            if (temporal) {
                 // The temporal matcher still runs the fused kernel, up to the
                 // point where it publishes its selection.
                 const GpuWorkgroup gwg { .x = 32u,
@@ -1869,7 +1937,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                     add(tag, variant.group, variant.group_size, gwg);
             }
             if (!pl.gram_pipe || !pl.solve_pipe || !pl.apply_pipe ||
-                (d->radius > 0 && !pl.group_pipe)) {
+                (temporal && !pl.group_pipe)) {
                 return;
             }
         } else {
@@ -1896,7 +1964,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             }
             pl.finish_pipe = std::get<VkPipeline>(r);
         }
-        if (d->split_match && d->radius == 0 && !d->skip_match) {
+        if (d->split_match && pl.radius == 0 && !d->skip_match) {
             // The distance kernel stages its search window: 1024 floats for
             // any window up to 32x32 (see WIN_MAX in src/wnnm.comp).
             const GpuWorkgroup wg { .x = kWorkgroup, .shared_bytes = 4096 };
@@ -1938,12 +2006,14 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             // The ring is an optimization: no room for it means per-frame
             // slots, which is also what the layout has to be rebuilt for.
             d->cache = false;
-            d->ring = d->folds;
+            d->ring = d->max_folds;
             if (auto e2 = layout(); !e2.empty()) {
                 return set_error(e2);
             }
         } else {
-            d->ring_tag.assign(static_cast<size_t>(d->ring), INT_MIN);
+            for (auto & tag : d->ring_tag) {
+                tag.assign(static_cast<size_t>(d->ring), INT_MIN);
+            }
         }
     }
 
@@ -1979,12 +2049,13 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     if (vsfeel_debug_flag("VSFEEL_WNNM")) {
         const char * io = d->io == 2 ? "u16" : (d->io == 1 ? "f16" : "f32");
         fprintf(stderr,
-                "[wnnm] io=%s bs=%d step=%d gs=%d bm=%d radius=%d ps=%d/%d "
-                "qmax=%d; per frame acc=%.1f MiB pmat=%.1f MiB locs=%.1f MiB; "
-                "cache=%d ring=%d ring=%.1f MiB; est=%d est=%.1f MiB; "
-                "src ring=%.1f MiB\n",
-                io, d->bs, d->step, d->gs, d->bm_range, d->radius, d->ps_num,
-                d->ps_range, qmax, double(d->acc_bytes) / 1048576.0,
+                "[wnnm] io=%s bs=%d step=%d gs=%d bm=%d radius=%d,%d,%d "
+                "ps=%d/%d qmax=%d; per frame acc=%.1f MiB pmat=%.1f MiB "
+                "locs=%.1f MiB; cache=%d ring=%d ring=%.1f MiB; est=%d "
+                "est=%.1f MiB; src ring=%.1f MiB\n",
+                io, d->bs, d->step, d->gs, d->bm_range, d->plane[0].radius,
+                d->plane[1].radius, d->plane[2].radius, d->ps_num, d->ps_range,
+                qmax, double(d->acc_bytes) / 1048576.0,
                 double(d->pmat_bytes) / 1048576.0,
                 double(d->locs_bytes) / 1048576.0, d->cache ? 1 : 0, d->ring,
                 double(d->ring_bytes) / 1048576.0, d->est_cache ? 1 : 0,
@@ -1994,7 +2065,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
 
     GPUWNNM * data = d.release();
     const VSRequestPattern policy =
-        data->radius > 0 ? rpGeneral : rpStrictSpatial;
+        data->max_radius > 0 ? rpGeneral : rpStrictSpatial;
     VSFilterDependency deps[2] = { { data->node, policy },
                                    { data->ref_node, policy } };
     VSNode * result = vsapi->createVideoFilterEx2(
@@ -2018,7 +2089,7 @@ void vsfeel_register_wnnm(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
                              "block_step:int:opt;"
                              "group_size:int:opt;"
                              "bm_range:int:opt;"
-                             "radius:int:opt;"
+                             "radius:int[]:opt;"
                              "ps_num:int:opt;"
                              "ps_range:int:opt;"
                              "residual:int:opt;"

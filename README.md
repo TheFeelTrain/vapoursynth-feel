@@ -194,7 +194,7 @@ core.vsfeel.WNNM(clip clip[,
     int     block_step,             # block lattice spacing, 1..block_size (default block_size)
     int     group_size=8,           # patches per collaborative group, 1..64
     int     bm_range=7,             # spatial search radius in pixels, 0..4096
-    int     radius=0,               # temporal search radius in frames, 0..15 (0 = spatial only)
+    int[]   radius=0,               # temporal search radius in frames per-plane, 0..15 (0 = spatial only)
     int     ps_num=2,               # motion-predicted candidates seeding each temporal search, 1..64
     int     ps_range=4,             # search radius around each predicted candidate, in pixels, 0..4096
     int     residual=0,             # keep the group's mean patch (do not shrink the largest singular value)

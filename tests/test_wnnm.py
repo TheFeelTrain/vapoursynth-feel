@@ -307,6 +307,91 @@ def test_temporal_per_plane_matches_vszip():
     assert worst <= REF_TOL, f"max abs diff {worst:.3e}"
 
 
+# ---------------------------------------------------------------------------
+# Per-plane radius
+# ---------------------------------------------------------------------------
+#
+# The reference's radius is one value, so the oracle is the filter itself run
+# one plane at a time: a plane's estimate depends only on its own pixels and
+# window, which is what per-plane radius relies on. The atomic-ordering floor
+# (SELF_TOL) is the only difference allowed between the two.
+
+PER_PLANE_RADIUS_CASES = [
+    pytest.param([3, 2, 3], [2, 0, 1], id="mixed-spatial-temporal"),
+    pytest.param([3, 3, 3], [0, 3, 2], id="luma-spatial"),
+    pytest.param([3, 2], [1, 2, 0], id="last-plane-spatial"),
+    pytest.param([3, 0, 5], [2, 3, 0], id="unprocessed-plane"),
+]
+
+
+@pytest.mark.parametrize(("sigma", "radius"), PER_PLANE_RADIUS_CASES)
+def test_per_plane_radius_matches_scalar_runs(clip_yuv420ps, sigma, radius):
+    """Each plane must equal a single-plane run at that plane's radius."""
+    src = vs.core.std.Crop(clip_yuv420ps, left=64, top=48)
+    out = WNNM(src, sigma=sigma, radius=radius)
+    for p in range(3):
+        # A short list repeats its last entry, as sigma does.
+        s = sigma[min(p, len(sigma) - 1)]
+        r = radius[min(p, len(radius) - 1)]
+        gray = vs.core.std.ShufflePlanes(src, p, vs.GRAY)
+        ref = WNNM(gray, sigma=s, radius=r)
+        for n in (0, 11, 23):
+            a, b = plane(out.get_frame(n), p), plane(ref.get_frame(n), 0)
+            worst = float(np.abs(a - b).max())
+            assert worst < SELF_TOL, f"plane {p} (radius {r}) at frame {n}: {worst:.3e}"
+
+
+def test_per_plane_radius_fused_matches_scalar_runs(clip_yuv420ps, monkeypatch):
+    """The fused kernel takes each plane's own radius as well."""
+    monkeypatch.setenv("VSFEEL_WNNM_NOSPLIT", "1")
+    src = vs.core.std.Crop(clip_yuv420ps, left=64, top=48)
+    sigma, radius = [3, 2, 2], [1, 0, 2]
+    out = WNNM(src, sigma=sigma, radius=radius)
+    for p in range(3):
+        gray = vs.core.std.ShufflePlanes(src, p, vs.GRAY)
+        ref = WNNM(gray, sigma=sigma[p], radius=radius[p])
+        for n in (0, 23):
+            a, b = plane(out.get_frame(n), p), plane(ref.get_frame(n), 0)
+            worst = float(np.abs(a - b).max())
+            assert worst < SELF_TOL, f"plane {p} at frame {n}: {worst:.3e}"
+
+
+def test_per_plane_radius_repeats_last_entry(clip_yuv420ps):
+    """A short radius list repeats its last entry, like sigma; a scalar still
+    sets the first slot and repeats from there."""
+    src = vs.core.std.Crop(clip_yuv420ps, left=64, top=48)
+    full = WNNM(src, sigma=[3, 2, 2], radius=[2, 2, 2])
+    for kwargs in (dict(radius=[2]), dict(radius=2)):
+        out = WNNM(src, sigma=[3, 2, 2], **kwargs)
+        worst = max_diff(out, full, frames=(0, 11, 23))
+        assert worst < SELF_TOL, f"{kwargs}: {worst:.3e}"
+
+
+@pytest.mark.parametrize("env", [None, {"VSFEEL_WNNM_NOCACHE": "1"}], ids=["cache", "nocache"])
+def test_per_plane_radius_request_order(env, monkeypatch):
+    """The per-plane match caches (and the per-frame slots without them) must
+    not depend on frame-request order."""
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+    assert_temporal_order_consistent(
+        "WNNM", dict(sigma=[3, 3, 3], radius=[1, 0, 2]), tol=SELF_TOL, nframes=6, clip="yuv420ps"
+    )
+
+
+def test_u16_per_plane_radius_matches_the_float_chain(clip_yuv420p16):
+    """The conversion ring stores each plane's own window; the mixed radii must
+    still match the same filter on the widened clip to a code."""
+    from vstools import depth
+
+    src = vs.core.std.Crop(clip_yuv420p16, left=64, top=48)
+    params = dict(sigma=[3, 2, 2], radius=[1, 0, 2])
+    manual = depth(WNNM(depth(src, 32), **params), 16)
+    native = WNNM(src, **params)
+    for n in (0, 7, 23):
+        worst = _code_diff(native.get_frame(n), manual.get_frame(n), (0, 1, 2))
+        assert worst <= 1, f"frame {n}: {worst} codes apart"
+
+
 @pytest.mark.parametrize("ps_num", [33, 64])
 def test_temporal_large_ps_num_matches_vszip(clip_grays, ps_num):
     """ps_num above SELCAP=32 uses the serial temporal merge, which shares the
@@ -782,6 +867,8 @@ def test_8bit_format_rejected(fmt, msg):
         (dict(bm_range=4097), r'"bm_range" must be in \[0, 4096\]'),
         (dict(bm_range=2147483647), r'"bm_range" must be in \[0, 4096\]'),
         (dict(radius=16), r'"radius" must be in \[0, 15\]'),
+        (dict(radius=-1), r'"radius" must be in \[0, 15\]'),
+        (dict(radius=[0, 16]), r'"radius" must be in \[0, 15\]'),
         (dict(ps_num=0), r'"ps_num" must be in \[1, 64\]'),
         (dict(ps_num=65), r'"ps_num" must be in \[1, 64\]'),
         (dict(ps_range=-1), r'"ps_range" must be in \[0, 4096\]'),
