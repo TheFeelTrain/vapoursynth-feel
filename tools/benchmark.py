@@ -677,17 +677,35 @@ def _dfttest_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
 def _wnnm_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
     # Per-plane sigma, like the reference: the default [0, 3, 3] is chroma only
     # (0 copies the plane through, which is how vszip skips luma).
-    args = (
+    common = (
         (f"sigma=[{ns.wnnm_sigma}], " if ns.wnnm_sigma else "")
         + f"block_size={ns.wnnm_block_size}, "
         f"block_step={ns.wnnm_block_step}, group_size={ns.wnnm_group_size}, "
-        f"bm_range={ns.wnnm_bm_range}, radius={ns.wnnm_radius}, "
-        f"ps_num={ns.wnnm_ps_num}, ps_range={ns.wnnm_ps_range}"
+        f"bm_range={ns.wnnm_bm_range}, "
     )
-    return {
-        "vsfeel": f"core.vsfeel.WNNM({clip}, {args})",
-        "vszip": f"core.vszip.WNNM({clip}, {args})",
+    tail = f"ps_num={ns.wnnm_ps_num}, ps_range={ns.wnnm_ps_range}"
+    # vsfeel's radius is per plane like its sigma; the reference's is one value
+    # for all planes, so only a uniform list has a vszip arm to compare against.
+    try:
+        radii = [int(v) for v in str(ns.wnnm_radius).split(",") if v.strip()]
+    except ValueError:
+        sys.exit(f"--wnnm-args radius=[{ns.wnnm_radius}]: expected integers, e.g. [1, 0, 2]")
+    if not radii:
+        sys.exit("--wnnm-args radius=[]: expected one value or [y,u,v]")
+    uniform = len(set(radii)) == 1
+    requested = getattr(ns, "plugins", None) or []
+    if not uniform and ("vszip" in requested or (not requested and not _ab_active(ns))):
+        sys.exit(
+            f"--wnnm-args radius=[{ns.wnnm_radius}]: vszip takes one radius for "
+            "all planes, so a per-plane radius has a vsfeel arm only; run it as "
+            "'--filter wnnm vsfeel' (or pass a uniform list)"
+        )
+    calls = {
+        "vsfeel": f"core.vsfeel.WNNM({clip}, {common}radius=[{ns.wnnm_radius}], {tail})",
     }
+    if uniform:
+        calls["vszip"] = f"core.vszip.WNNM({clip}, {common}radius={radii[0]}, {tail})"
+    return calls
 
 
 def _nlmeans_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
@@ -982,7 +1000,15 @@ FILTERS: dict[str, FilterSpec] = {
             Arg("block_step", "wnnm_block_step", int, 8),
             Arg("group_size", "wnnm_group_size", int, 8),
             Arg("bm_range", "wnnm_bm_range", int, 7),
-            Arg("radius", "wnnm_radius", int, 1),
+            Arg(
+                "radius",
+                "wnnm_radius",
+                str,
+                "1",
+                "per-plane temporal radius as [y,u,v]; a missing entry repeats the "
+                "previous and 0 searches spatially only",
+                list_arg=True,
+            ),
             Arg("ps_num", "wnnm_ps_num", int, 2),
             Arg("ps_range", "wnnm_ps_range", int, 4),
         ],

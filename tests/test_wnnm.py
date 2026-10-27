@@ -907,3 +907,13 @@ def test_rclip_mismatch_rejected():
         vs.core.vsfeel.WNNM(
             a, rclip=vs.core.std.BlankClip(width=64, height=48, format=vs.GRAY16, length=1)
         )
+
+
+def test_short_clip_with_max_radius_reads_only_existing_frames(clip_grays):
+    """radius=15 on a 3-frame clip must clamp every window, not read past the end."""
+    short = vs.core.std.Trim(clip_grays, length=3)
+    out = WNNM(short, sigma=[3.0], radius=15)
+    assert out.num_frames == 3
+    for n in range(3):
+        a = plane(out.get_frame(n), 0, dtype=np.float32)
+        assert np.isfinite(a).all(), f"non-finite frame {n}"

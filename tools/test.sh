@@ -18,6 +18,11 @@
 #        tools/test.sh tests/test_nlmeans.py -q
 #        VSFEEL_TEST_WORKERS=1 tools/test.sh   serial, no xdist
 #
+# A missing reference plugin fails the run by default (`--require-references`):
+# the reference comparisons skip when one is absent, which would silently delete
+# the correctness net. Set VSFEEL_ALLOW_MISSING_REFS=1 for a box that
+# intentionally lacks them.
+#
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -53,6 +58,12 @@ fi
 # asks for MANGOHUD=0 on every timed run), so the suite forces it off; run
 # pytest directly to keep the shell's setting.
 export MANGOHUD=0
+
+# Missing references are failures unless explicitly allowed (see header).
+refs_args=()
+if [[ ${VSFEEL_ALLOW_MISSING_REFS:-0} != 1 ]]; then
+    refs_args+=(--require-references)
+fi
 
 # One command: cap at 8 workers, never trust `-n auto` (32 on the dev box).
 workers=${VSFEEL_TEST_WORKERS:-$(nproc 2>/dev/null || echo 8)}
@@ -97,13 +108,13 @@ cd -- "$root_dir"
 ignore_reference=(--ignore=reference)
 
 if [ "$workers" -le 1 ]; then
-    exec "$py" -m pytest -q "${ignore_reference[@]}" "$@"
+    exec "$py" -m pytest -q "${ignore_reference[@]}" "${refs_args[@]}" "$@"
 fi
 
 if ! "$py" -c 'import xdist' >/dev/null 2>&1; then
     printf 'test.sh: pytest-xdist is not installed (dev dependency group); running serially\n' >&2
-    exec "$py" -m pytest -q "${ignore_reference[@]}" "$@"
+    exec "$py" -m pytest -q "${ignore_reference[@]}" "${refs_args[@]}" "$@"
 fi
 
 exec "$py" -m pytest -q -n "$workers" --dist loadfile \
-    "${ignore_reference[@]}" "$@"
+    "${ignore_reference[@]}" "${refs_args[@]}" "$@"

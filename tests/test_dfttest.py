@@ -946,3 +946,19 @@ def test_dfttest_rejects_sigma_range_not_covered(clip_grays):
     """slocation that does not span [0, 1] must be rejected."""
     with pytest.raises(vs.Error):
         _run(clip_grays, slocation=[0.5, 2.0, 0.6, 3.0])
+
+
+@pytest.mark.parametrize("sosize", [9, 10, 11, 13])
+def test_rejects_illegal_high_overlap_sosize(clip_grays, sosize):
+    """Overlap > 50% is only legal when sbsize-sosize divides sbsize."""
+    with pytest.raises(vs.Error, match="divisor"):
+        vs.core.vsfeel.DFTTest(clip_grays, tbsize=1, sosize=sosize)
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"ftype": 0, "f0beta": -0.5}, {"ftype": 4, "pmin": 0.0, "pmax": -1.0}]
+)
+def test_rejects_negative_f0beta_and_pmax(clip_grays, kwargs):
+    """These produced an all-NaN clip in vszipcl; refuse them at creation."""
+    with pytest.raises(vs.Error, match="non-negative"):
+        vs.core.vsfeel.DFTTest(clip_grays, tbsize=1, **kwargs)

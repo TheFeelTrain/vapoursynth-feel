@@ -6,14 +6,13 @@
  * native samples into the ring's float working domain while copying it.
  *
  * -DIO_U16 / -DIO_F16 select the source element type. The integer arm's
- * widening is the reference's Int2Float (gain 1/65535, plus the chroma
- * neutral), so an integer clip reaches the estimator as exactly the numbers a
- * float clip of the same content would, and every depth shares one estimation
- * kernel. A YUV chroma plane is centred on 32768, which the reference's float
- * chroma domain puts at zero, so pc.center carries that neutral code there and
- * 0 on luma and RGB; without it a constant 0.5 rides into the
- * thresholded/scaled DC term. A half plane is already in the float domain, so
- * its widening is an exact OpFConvert and pc.center goes unused.
+ * widening is the reference's Int2Float: the host passes the frame's _Range
+ * gain and neutral (1/65535 and 0 for full luma/RGB, 1/56064 and 4096 for
+ * limited luma, 1/57344 and 32768 for chroma), so an integer clip reaches the
+ * estimator as exactly the numbers a float conversion of the same content
+ * would, and every depth shares one estimation kernel. A half plane is already
+ * in the float domain, so its widening is an exact OpFConvert and the range
+ * words go unused.
  *
  * It has to happen here, once per source sample, rather than on load in the
  * matcher: the matcher reads each source sample once per candidate origin (a
@@ -42,9 +41,10 @@ layout(std430, binding = 0) readonly buffer SrcBuf { uint16_t src[]; };
 layout(std430, binding = 1) writeonly buffer DstBuf { float dst[]; };
 
 layout(push_constant) uniform PushConstants {
-    uint dst_off; // first destination element of this plane
-    uint count;   // elements to convert
-    int center;   // 32768 on a YUV chroma plane, 0 otherwise
+    uint dst_off;  // first destination element of this plane
+    uint count;    // elements to convert
+    float neutral; // 32768 on a YUV chroma plane, 4096 on limited luma, else 0
+    float gain;    // 1/65535 full, 1/56064 limited luma, 1/57344 chroma
 } pc;
 
 void main() {
@@ -62,7 +62,6 @@ void main() {
 #if defined(IO_F16)
     dst[pc.dst_off + i] = float(src[i]); // half -> float is exact
 #else
-    dst[pc.dst_off + i] =
-        (float(int(src[i])) - float(pc.center)) * (1.0f / 65535.0f);
+    dst[pc.dst_off + i] = (float(int(src[i])) - pc.neutral) * pc.gain;
 #endif
 }

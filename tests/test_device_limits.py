@@ -45,6 +45,8 @@ spec = json.loads(sys.argv[1])
 src = core.bs.VideoSource(spec["source"])
 clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                           bits=32, fulls=True, fulld=True)
+clip16 = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
+                            bits=16, fulls=True, fulld=True)
 
 
 def build(name, params):
@@ -70,6 +72,10 @@ def build(name, params):
         return core.vsfeel.Bilateral(clip, **kwargs)
     if name == "gaussblur":
         return core.vsfeel.GaussBlur(clip, sigma=2.0)
+    if name == "wnnm_u16":
+        return core.vsfeel.WNNM(clip16, sigma=3.0, radius=0)
+    if name == "box":
+        return core.vsfeel.Box(clip)
     raise SystemExit("unknown filter %r" % name)
 
 
@@ -78,7 +84,9 @@ for case in spec["cases"]:
     label = case["label"]
     try:
         node = cpu_node(build(case["filter"], case.get("params") or {}))
-        plane = read_plane(node.get_frame(spec.get("frame", 2)), 0, np.float32)
+        frame = node.get_frame(spec.get("frame", 2))
+        dtype = np.uint16 if frame.format.sample_type == vs.INTEGER else np.float32
+        plane = read_plane(frame, 0, dtype)
         out[label] = {"sha1": hashlib.sha1(plane.tobytes()).hexdigest(),
                       "finite": bool(np.isfinite(plane.astype(np.float64)).all())}
     except Exception as exc:
@@ -89,7 +97,7 @@ print("RESULT " + json.dumps(out), flush=True)
 )
 
 # name -> kwargs; the empty ones just take the filter's defaults.
-_256_KERNELS = ["dfttest", "nlmeans", "eedi3", "nnedi3", "bm3d"]
+_256_KERNELS = ["dfttest", "nlmeans", "eedi3", "nnedi3", "bm3d", "wnnm_u16"]
 
 
 def _run_limits(cases, env=None):
@@ -498,6 +506,7 @@ def test_two_dimensional_grid_overflow_is_reported():
     cases = [
         {"label": "bilateral", "filter": "bilateral"},
         {"label": "gaussblur", "filter": "gaussblur"},
+        {"label": "box", "filter": "box"},
     ]
     res = _run_limits(cases, {"VSFEEL_LIMIT_GRID_X": "4"})
     for case in cases:

@@ -71,6 +71,12 @@ _LIFECYCLE_SCRIPT = textwrap.dedent(f"""\
             tmp = core.vsfeel.BM3D(clip, sigma=[0.7], radius=1)
             tmp.get_frame(1)
             del tmp
+            tmp = core.vsfeel.WNNM(f32, sigma=[3.0], radius=1)
+            tmp.get_frame(1)
+            del tmp
+            tmp = core.vsfeel.Box(f32, width=320, height=180)
+            tmp.get_frame(1)
+            del tmp
             core.clear_cache()
     finally:
         stop.set()

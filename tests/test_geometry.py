@@ -108,7 +108,9 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
         main = core.fmtc.bitdepth(gray, bits=bits, fulls=True, fulld=True)
         if half:
             main = core.resize.Point(main, format=vs.GRAYH)
-    main = core.std.Crop(main, right=({CROP_FROM} - width),
+    left = spec.get("left", 0)
+    main = core.std.Crop(main, left=left,
+                         right=({CROP_FROM} - width - left),
                          top=top, bottom=bottom)
     dtype = np.float16 if half else (np.float32 if bits == 32 else np.uint16)
     planes = list(range(main.format.num_planes))
@@ -246,7 +248,7 @@ _CROP_BOTTOM = 3
 CASES = []
 
 
-def _add(filter_, bits, width, guide, params, tol, color="gray", top=0, bottom=0, half=0):
+def _add(filter_, bits, width, guide, params, tol, color="gray", top=0, bottom=0, half=0, left=0):
     spec = {
         "filter": filter_,
         "bits": bits,
@@ -258,6 +260,7 @@ def _add(filter_, bits, width, guide, params, tol, color="gray", top=0, bottom=0
         "frames": FRAMES,
         "top": top,
         "bottom": bottom,
+        "left": left,
     }
     cid = "%s-%s-w%d" % (filter_, "f16" if half else ("f32" if bits == 32 else "u16"), width)
     if guide:
@@ -266,6 +269,8 @@ def _add(filter_, bits, width, guide, params, tol, color="gray", top=0, bottom=0
         cid += "-yuv420"
     if top or bottom:
         cid += "-v%d_%d" % (top, bottom)
+    if left:
+        cid += "-l%d" % left
     CASES.append(pytest.param(spec, tol, id=cid))
 
 
@@ -337,6 +342,26 @@ _add("eedi3", 16, 630, 0, _EEDI3_PARAMS, TOL_EEDI3_U16, top=_CROP_TOP, bottom=_C
 _add("eedi3h", 16, 630, 0, _EEDI3H_PARAMS, TOL_ORACLE_EXACT, top=_CROP_TOP, bottom=_CROP_BOTTOM)
 _add("eedi3aa", 16, 630, 0, _EEDI3AA_PARAMS, TOL_ORACLE_EXACT, top=_CROP_TOP, bottom=_CROP_BOTTOM)
 _add("nlmeans", 32, 630, 0, _NLMEANS_PARAMS, TOL_NLMEANS_F32, top=_CROP_TOP, bottom=_CROP_BOTTOM)
+
+# Left crops move the plane origin as well as its pitch. The visible width is
+# still the requested one, so the output geometry check stays meaningful.
+_add("dfttest", 32, 613, 0, _DFTTEST_PARAMS, TOL_F32_ULP, left=27)
+_add("dfttest", 16, 613, 0, _DFTTEST_PARAMS, TOL_U16_LSB, left=27)
+_add("gaussblur", 32, 613, 0, _GAUSS_PARAMS, 0.0, left=27)
+_add("gaussblur", 16, 613, 0, _GAUSS_PARAMS, 0.0, left=27)
+_add("gaussblur", 16, 613, 0, _GAUSS_PARAMS, 0.0, left=27, half=1)
+_add("bilateral", 32, 613, 0, _BILATERAL_PARAMS, TOL_F32_ULP, left=27)
+_add("bilateral", 16, 613, 0, _BILATERAL_PARAMS, TOL_U16_LSB, left=27)
+_add("bilateral", 16, 613, 0, _BILATERAL_PARAMS, TOL_F16, left=27, half=1)
+_add("bm3d", 32, 613, 0, _BM3D_PARAMS, TOL_BM3D, left=27)
+_add("nlmeans", 32, 613, 0, _NLMEANS_PARAMS, TOL_NLMEANS_F32, left=27)
+_add("nlmeans", 16, 613, 0, _NLMEANS_PARAMS, TOL_NLMEANS_U16, left=27)
+_add("nnedi3", 16, 613, 0, _NNEDI3_PARAMS, TOL_U16_LSB, left=27)
+_add("eedi3", 16, 613, 0, _EEDI3_PARAMS, TOL_EEDI3_U16, left=27)
+_add("eedi3", 32, 613, 0, _EEDI3_PARAMS, TOL_EEDI3_F32, left=27)
+_add("eedi3h", 16, 614, 0, _EEDI3H_PARAMS, TOL_ORACLE_EXACT, left=26)
+_add("eedi3aa", 16, 614, 0, _EEDI3AA_PARAMS, TOL_ORACLE_EXACT, left=26)
+_add("eedi3aa", 32, 614, 0, _EEDI3AA_PARAMS, TOL_EEDI3AA_F32, left=26)
 
 
 @pytest.mark.parametrize("spec,tol", CASES)

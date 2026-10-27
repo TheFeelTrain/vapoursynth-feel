@@ -221,6 +221,11 @@ force-pad / fail-pad probes.
 
 The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
+- **Negative `f0beta`/`pmax` are rejected at creation** (correctness-only, no
+  perf change). vszipcl accepts both and produces an all-NaN clip: negative
+  `f0beta` is `pow(0, negative)` in the ftype=0 gain and negative `pmax` makes
+  the ftype=4 gain `sqrt(negative)`. The suite now pins the rejection.
+
 - **The R80 port's scoreboard is void.** It read 1452.6/1376.0 → 1361.3/1360.3
   (CPU cache), 1182.3 → 1350.3 (`--download`) and 1376.2 → 1364.7
   (`--synthetic`) fps, and "1.57x vs vszipcl", all against the pre-fix

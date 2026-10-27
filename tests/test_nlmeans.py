@@ -27,6 +27,7 @@ from conftest import (
     eval_parallel,
     max_diff,
     plane as _plane,
+    plane_to_ndarray,
     reference_compare,
     reference_or_skip,
     reference_spec,
@@ -214,6 +215,7 @@ F16_TOL = 2e-3
 F16_STEP = 4.8828125e-4
 
 REFERENCE_CASES = [
+    {},
     {"d": 0},
     {"d": 2},
     {"d": 1, "a": 3, "s": 3, "h": 3.0, "wref": 0.4},
@@ -1035,3 +1037,20 @@ def test_cpu_and_gpu_input_match_f16(clip_grayh):
         a = _plane(cpu.get_frame(n), 0, dtype=np.float16)
         b = _plane(gpu.get_frame(n), 0, dtype=np.float16)
         assert np.array_equal(a, b), f"cpu/gpu mismatch at frame {n}"
+
+
+def test_default_channels_auto_is_y_on_yuv(clip_yuv420ps):
+    """The default `channels=auto` processes plane 0 on a YUV clip."""
+    auto = _run(clip_yuv420ps, d=0, h=1.5)
+    y = _run(clip_yuv420ps, d=0, h=1.5, channels="Y")
+    for n in (0, 11):
+        a = plane_to_ndarray(auto.get_frame(n), 0, np.float32)
+        b = plane_to_ndarray(y.get_frame(n), 0, np.float32)
+        assert np.array_equal(a, b), f"channels=auto is not Y at frame {n}"
+
+
+def test_reject_rclip_shorter_than_the_requested_frame(clip_grays):
+    """An rclip must cover every frame the output can request."""
+    short = vs.core.std.Trim(clip_grays, length=2)
+    with pytest.raises(vs.Error, match="rclip"):
+        _run(clip_grays, d=0, h=1.5, rclip=short)

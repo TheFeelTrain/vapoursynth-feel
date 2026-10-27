@@ -1202,6 +1202,13 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         !std::isfinite(pmin) || !std::isfinite(pmax)) {
         return set_error("sigma/sigma2/pmin/pmax must be finite.");
     }
+    // A negative pmax makes the ftype=4 gain sqrt(negative) and poisons the
+    // whole frame; a negative f0beta is pow(0, negative) in the ftype=0 gain.
+    // Both are accepted by vszipcl but produce an all-NaN clip, so refuse them
+    // at creation like the non-finite values above.
+    if (pmax < 0.0) {
+        return set_error("pmax must be non-negative.");
+    }
 
     int sbsize = vsh::int64ToIntS(vsapi->mapGetInt(in, "sbsize", 0, &error));
     if (error) {
@@ -1264,6 +1271,9 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
     }
     if (!std::isfinite(f0beta)) {
         return set_error("f0beta must be finite.");
+    }
+    if (f0beta < 0.0) {
+        return set_error("f0beta must be non-negative.");
     }
     int ssystem = vsh::int64ToIntS(vsapi->mapGetInt(in, "ssystem", 0, &error));
     if (error) {

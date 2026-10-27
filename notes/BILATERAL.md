@@ -28,9 +28,10 @@ Design (current):
 - `STRIDE` is the core's plane pitch in elements, read off a scratch frame at
   creation (a GPU frame uses the identical stride math).
 - Auto block shape (`32x8` for max radius ≤ 12, `32x16` above); explicit
-  `block_x`/`block_y` are respected and clamped to the device limits. The block
-  is the thread count, so with the two-column kernel a workgroup covers
-  `2*block_x` columns and the tile is `2R + 2*block_x` wide.
+  `block_x`/`block_y` must be positive (a non-positive value is an error, not a
+  silent fallback) and is clamped to the device limits. The block is the thread
+  count, so with the two-column kernel a workgroup covers `2*block_x` columns
+  and the tile is `2R + 2*block_x` wide.
 - Unprocessed planes (`sigma < FLT_EPSILON`) ride along from the source through
   `newVideoFrame2`, keeping their own producer pairs; nothing is submitted when
   every plane is unprocessed.

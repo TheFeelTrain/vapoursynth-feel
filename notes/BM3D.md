@@ -71,9 +71,9 @@ half the bytes, which is where the visible speedup is (see Performance).
   step), 99.99% of pixels rounding identically, the rest differing only where the
   aggregation's ~3e-8 jitter crosses a half tie. That equivalence plus the CPU
   reference run on the widened clip (it refuses a half input) is the oracle.
-- A u16 clip is **full range**, like the f32 path; an f16 clip is already in the
-  reference's float domain. The CPU reference scales an *integer* clip by its
-  `_Range` property, so the two sides only meet on a `_Range=1` clip.
+- A u16 clip follows its frame's **`_Range`** like the CPU reference: full maps
+  the whole code range, limited 219/224 with 4096 luma and 32768 chroma offsets;
+  an f16 clip is already in the reference's float domain.
 - One entry per processed plane, or one over all three planes of a 4:4:4 clip
   under `chroma=True`. An entry owns a source ring `[slot][clip][plane][h][stride]`
   and an accumulator ring `[slot][plane][2][h][stride]` (numerator, denominator);

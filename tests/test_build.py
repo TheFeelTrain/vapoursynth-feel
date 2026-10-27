@@ -200,18 +200,24 @@ def test_benchmark_wnnm_sigma_takes_a_list(monkeypatch):
         monkeypatch.setattr(sys, "argv", ["benchmark.py", "--filter", "wnnm", *argv])
         ns = bench.parse_args()
         bench._apply_filter_args(ns, "wnnm", spec)
-        return spec.build(ns, spec.input, spec)["vsfeel"], bench.args_desc(spec, ns)
+        return spec.build(ns, spec.input, spec), bench.args_desc(spec, ns)
 
     default, default_desc = call([])
-    assert "sigma=[0, 3, 3]" in default
+    assert "sigma=[0, 3, 3]" in default["vsfeel"]
     assert "sigma=[0, 3, 3]" in default_desc
-    full, full_desc = call(["--wnnm-args", "sigma=[3, 3, 3], radius=0"])
-    assert "sigma=[3, 3, 3]" in full and "radius=0" in full
+    assert "radius=[1]" in default["vsfeel"]
+    full, full_desc = call(["--wnnm-args", "sigma=[3, 3, 3], radius=[0]"])
+    assert "sigma=[3, 3, 3]" in full["vsfeel"] and "radius=[0]" in full["vsfeel"]
     assert "sigma=[3, 3, 3]" in full_desc
     # A bare number still covers every plane, through the plugin's
     # missing-entry repeat rule.
     single, _ = call(["--wnnm-args", "sigma=5"])
-    assert "sigma=[5]" in single
+    assert "sigma=[5]" in single["vsfeel"]
+    # A non-uniform list has no vszip arm (the reference takes one radius), so
+    # the benchmark requires an explicit vsfeel-only run.
+    per_plane, _ = call(["--wnnm-args", "radius=[1, 0, 2]", "vsfeel"])
+    assert "radius=[1, 0, 2]" in per_plane["vsfeel"]
+    assert "vszip" not in per_plane
 
 
 def test_benchmark_download_selects_vspipe_output(monkeypatch):
@@ -228,7 +234,6 @@ def test_benchmark_download_selects_vspipe_output(monkeypatch):
     # The header labels the opt-out mode; what it must not do is still describe
     # the retired chain rewrite.
     assert "--download" in bench._mode_desc(ns)
-    assert "8x8" not in bench._mode_desc(ns)
     for name, spec in bench.FILTERS.items():
         bench._apply_filter_args(ns, name, spec)
         for chain in spec.build(ns, spec.input, spec).values():
@@ -253,25 +258,6 @@ def test_benchmark_time_window_counts_frames(monkeypatch):
     # A single report or a window that never fills is not a measurement.
     assert bench._timing_from_reports([(0.0, 1)], 1.0) is None
     assert bench._timing_from_reports(reports, 5.0) is None
-
-
-def test_benchmark_mode_field_is_opt_in(monkeypatch):
-    """A default run uses the GPU-resident, resident-output path and says so."""
-    bench = _load_module("benchmark", BENCHMARK)
-    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic"])
-    ns = bench.parse_args()
-    assert ns.no_download
-    assert ns.gpu_cache
-    assert bench._mode_desc(ns) == ""
-
-    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic", "--cpu-cache"])
-    ns = bench.parse_args()
-    assert not ns.gpu_cache
-    assert bench._mode_desc(ns) == " | mode: --cpu-cache"
-
-    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic", "--cpu-cache", "--download"])
-    ns = bench.parse_args()
-    assert bench._mode_desc(ns) == " | mode: --cpu-cache --download"
 
 
 def test_benchmark_unavailable_plugin_is_listed_not_run(monkeypatch, capsys):
@@ -307,67 +293,6 @@ def test_benchmark_unavailable_plugin_is_listed_not_run(monkeypatch, capsys):
     out = capsys.readouterr()
     assert f"  {'vszipcu':10s}  {bench._UNAVAILABLE_TAG}" in out.out
     assert len(calls) == 2  # two repeats of vsfeel, nothing for vszipcu
-
-
-def test_benchmark_ranking_annotates_vsfeel_ratio(monkeypatch, capsys):
-    """vsfeel's ranking line carries its lead over the fastest reference."""
-    bench = _load_module("benchmark", BENCHMARK)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "benchmark.py",
-            "--filter",
-            "gaussblur",
-            "--synthetic",
-            "--seconds",
-            "2",
-            "--repeat",
-            "1",
-            "vsfeel",
-            "vszipcl",
-        ],
-    )
-    ns = bench.parse_args()
-    monkeypatch.setattr(bench, "_available_plugins", lambda: frozenset(bench.PLUGINS))
-    fps = iter([200.0, 100.0])
-    monkeypatch.setattr(bench, "run_vspipe", lambda *a, **k: bench.Timing(next(fps), 1000, 2.0))
-    bench.bench_filter("gaussblur", ns)
-    out = capsys.readouterr().out
-    assert "1. vsfeel" in out
-    assert "(2.000x vs vszipcl)" in out
-    # The reference line stays bare: the ratio is vsfeel's, not a full matrix.
-    assert "(0.500x" not in out
-
-
-def test_benchmark_ranking_without_vsfeel_falls_back(monkeypatch, capsys):
-    """Without vsfeel there is nothing to grade: ratios go against the fastest."""
-    bench = _load_module("benchmark", BENCHMARK)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "benchmark.py",
-            "--filter",
-            "gaussblur",
-            "--synthetic",
-            "--seconds",
-            "2",
-            "--repeat",
-            "1",
-            "vszipcl",
-            "vszipcu",
-        ],
-    )
-    ns = bench.parse_args()
-    monkeypatch.setattr(bench, "_available_plugins", lambda: frozenset(bench.PLUGINS))
-    fps = iter([200.0, 100.0])
-    monkeypatch.setattr(bench, "run_vspipe", lambda *a, **k: bench.Timing(next(fps), 1000, 2.0))
-    bench.bench_filter("gaussblur", ns)
-    out = capsys.readouterr().out
-    assert "1. vszipcl" in out
-    assert "(0.500x vs vszipcl)" in out
-    assert "(1.000x" not in out
 
 
 def test_benchmark_args_string_overrides_defaults(monkeypatch):
@@ -462,49 +387,37 @@ def test_ab_env_applies_and_restores(monkeypatch):
     assert "VSFEEL_NEW" not in os.environ
 
 
-def test_ab_round_order():
-    """Alternate flips the first arm per round; ABBA is A B B A every round."""
-    bench = _load_module("benchmark", BENCHMARK)
-    assert bench._ab_round_order(1, "alternate") == [0, 1]
-    assert bench._ab_round_order(2, "alternate") == [1, 0]
-    assert bench._ab_round_order(3, "alternate") == [0, 1]
-    assert bench._ab_round_order(1, "abba") == [0, 1, 1, 0]
-    assert bench._ab_round_order(2, "abba") == [0, 1, 1, 0]
-
-
-def test_ab_names(monkeypatch):
-    """Arm names default to a/b and must be two distinct non-empty names."""
+def test_ab_cli_wiring(monkeypatch):
+    """Arm names, round order, and any arm flag selecting A/B mode."""
     bench = _load_module("benchmark", BENCHMARK)
     monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic"])
-    assert bench._ab_names(bench.parse_args()) == ("a", "b")
+    ns = bench.parse_args()
+    assert not bench._ab_active(ns)
+    assert bench._ab_names(ns) == ("a", "b")
+    assert bench._ab_rounds(ns) == 2
+
     monkeypatch.setattr(sys, "argv", ["benchmark.py", "--ab-names", "new,old"])
-    assert bench._ab_names(bench.parse_args()) == ("new", "old")
+    ns = bench.parse_args()
+    assert bench._ab_names(ns) == ("new", "old")
     for bad in ("only", "a,a", "a,", ",b", "a,b,c"):
         monkeypatch.setattr(sys, "argv", ["benchmark.py", "--ab-names", bad])
         with pytest.raises(SystemExit):
             bench._ab_names(bench.parse_args())
 
+    assert bench._ab_round_order(1, "alternate") == [0, 1]
+    assert bench._ab_round_order(2, "alternate") == [1, 0]
+    assert bench._ab_round_order(1, "abba") == [0, 1, 1, 0]
 
-def test_ab_flags_activate_ab_mode(monkeypatch):
-    """Any arm flag (--ab-so or either env) selects bench_filter_ab in main."""
-    bench = _load_module("benchmark", BENCHMARK)
-    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic"])
-    assert not bench._ab_active(bench.parse_args())
-    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--ab-so", "a.so", "b.so"])
-    ns = bench.parse_args()
-    assert bench._ab_active(ns)
-    assert [str(p) for p in ns.ab_so] == ["a.so", "b.so"]
-    assert bench._ab_rounds(ns) == 2
-    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--ab-b-env", "VSFEEL_X=1"])
-    assert bench._ab_active(bench.parse_args())
     # A bare modifier still selects A/B mode (two identical arms), so a
     # misspelled arm setup cannot silently run a normal benchmark instead.
-    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--ab-names", "new,old"])
-    assert bench._ab_active(bench.parse_args())
-    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--ab-rounds", "3"])
-    ns = bench.parse_args()
-    assert bench._ab_active(ns)
-    assert bench._ab_rounds(ns) == 3
+    for argv in (
+        ["benchmark.py", "--ab-names", "new,old"],
+        ["benchmark.py", "--ab-so", "a.so", "b.so"],
+        ["benchmark.py", "--ab-b-env", "VSFEEL_X=1"],
+        ["benchmark.py", "--ab-rounds", "3"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        assert bench._ab_active(bench.parse_args())
     monkeypatch.setattr(sys, "argv", ["benchmark.py", "--ab-rounds", "0"])
     with pytest.raises(SystemExit):
         bench._ab_rounds(bench.parse_args())

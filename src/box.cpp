@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -110,21 +111,75 @@ struct BoxData {
 // Tap table
 // ---------------------------------------------------------------------------
 
-// resize2's box filter is not an area average: an output position averages the
-// source pixels whose *centres* fall inside its box, so at a fractional ratio
-// the tap count alternates between floor(s) and ceil(s). Computed here in
-// double so the half-open boundary is exact and no float32 tie can move a tap.
-static std::vector<BoxTaps> box_taps(int src, int dst) {
+// resize2 is zimg's resizer with the box kernel. A box kernel is not an area
+// average: zimg samples the kernel at half-integer source positions around
+// `pos = (i + 0.5) / scale`, so at a fractional ratio the tap count alternates
+// and an output pixel can average one, two or three source pixels. The set of
+// samples that land inside the kernel is decided by zimg's own coordinate
+// arithmetic; reproducing that loop, expression for expression, is what makes
+// the boundary cases agree. A closed-form "pixel centres in the output cell"
+// formula disagrees with it whenever the cell edge lands exactly on a sample
+// centre (613 -> 306 and 613 -> 612 are the measured examples).
+//
+// Included taps all have weight 1 and are contiguous, so the table can stay the
+// shader's `(first, count)` pair. `ok` goes false if that ever stops being true
+// (for example a mirrored tap landing on an already-counted sample), which is a
+// creation error rather than a silently wrong average.
+static double round_halfup(double x) noexcept {
+    // zimg's rounding, including the epsilon that preserves
+    // round(x - 1) == round(x) - 1 on the pixel grid.
+    return x < 0.0 ? std::floor(x + 0.5) : std::floor(x + 0.49999999999999994);
+}
+
+static std::vector<BoxTaps> box_taps(int src, int dst, bool & ok) {
     std::vector<BoxTaps> out(static_cast<size_t>(dst));
-    const double s = static_cast<double>(src) / static_cast<double>(dst);
+    const double scale = static_cast<double>(dst) / static_cast<double>(src);
+    const double step = std::min(scale, 1.0);
+    const double support = 1.0 / step;
+    const unsigned filter_size =
+        std::max(static_cast<unsigned>(std::ceil(support)) * 2U, 1U);
+    const double last_pos = std::nextafter(
+        static_cast<double>(src), -std::numeric_limits<double>::infinity());
+
     for (int i = 0; i < dst; ++i) {
-        const double lo = static_cast<double>(i) * s;
-        const double hi = static_cast<double>(i + 1) * s;
-        int k0 = static_cast<int>(std::ceil(lo - 0.5));
-        int k1 = static_cast<int>(std::ceil(hi - 0.5)) - 1;
-        k0 = std::clamp(k0, 0, src - 1);
-        k1 = std::clamp(k1, k0, src - 1);
-        out[static_cast<size_t>(i)] = { k0, k1 - k0 + 1 };
+        const double pos = (static_cast<double>(i) + 0.5) / scale;
+        const double begin =
+            round_halfup(pos - static_cast<double>(filter_size) / 2.0) + 0.5;
+        int first = 0;
+        int count = 0;
+        for (unsigned j = 0; j < filter_size; ++j) {
+            const double xpos = begin + static_cast<double>(j);
+            const double w = (xpos - pos) * step;
+            if (w < -0.5 || w >= 0.5) {
+                continue; // outside the box kernel
+            }
+            // zimg mirrors a position that leaves the image and clamps the
+            // result; included taps are in bounds for a downscale, but mirror
+            // them the same way so the table cannot drift from the reference.
+            double real = xpos;
+            if (real < 0.0) {
+                real = -real;
+            } else if (real >= static_cast<double>(src)) {
+                real = 2.0 * static_cast<double>(src) - real;
+            }
+            real = std::clamp(real, 0.0, last_pos);
+            const int idx = static_cast<int>(std::floor(real));
+            if (count == 0) {
+                first = idx;
+                count = 1;
+            } else if (idx == first + count) {
+                ++count;
+            } else {
+                ok =
+                    false; // a gap or a duplicate: equal weights no longer hold
+            }
+        }
+        if (count == 0) {
+            ok = false;
+            first = std::clamp(static_cast<int>(std::floor(pos)), 0, src - 1);
+            count = 1;
+        }
+        out[static_cast<size_t>(i)] = { first, count };
     }
     return out;
 }
@@ -359,6 +414,23 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         return set_error(
             "Box only downscales: width/height must not exceed the input.");
     }
+    // A subsampled format's frame dimensions must be multiples of its
+    // subsampling factors. The output-stride probe frame below is allocated at
+    // this size, and VapourSynth treats an illegal size as a fatal error
+    // (printing and terminating the process), so the check has to happen here
+    // as a normal vs.Error.
+    const int subW = fmt.subSamplingW;
+    const int subH = fmt.subSamplingH;
+    if (subW > 0 && out_w % (1 << subW) != 0) {
+        return set_error("width must be a multiple of " +
+                         std::to_string(1 << subW) +
+                         " for this subsampled format");
+    }
+    if (subH > 0 && out_h % (1 << subH) != 0) {
+        return set_error("height must be a multiple of " +
+                         std::to_string(1 << subH) +
+                         " for this subsampled format");
+    }
 
     d->out_vi = *d->vi;
     d->out_vi.width = out_w;
@@ -404,13 +476,15 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         vsapi->freeFrame(probe);
     }
 
-    const int subW = fmt.subSamplingW;
-    const int subH = fmt.subSamplingH;
-
     // The tap tables depend only on the ratio, which every plane shares, so
     // the plane-0 tables serve the subsampled planes as prefixes.
-    const auto x_taps = box_taps(d->vi->width, out_w);
-    const auto y_taps = box_taps(d->vi->height, out_h);
+    bool taps_ok = true;
+    const auto x_taps = box_taps(d->vi->width, out_w, taps_ok);
+    const auto y_taps = box_taps(d->vi->height, out_h, taps_ok);
+    if (!taps_ok) {
+        return set_error(
+            "could not express the box tap window as one equal-weight run");
+    }
     d->y_tap_base = static_cast<uint32_t>(x_taps.size());
 
     // Push descriptor layout: one whole-buffer binding per shader buffer, so

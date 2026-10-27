@@ -55,6 +55,8 @@ layout(push_constant) uniform PushConstants {
     int slot0;     // radius 0: this frame's private accumulator slot
     int plane_off; // this plane's (numerator, denominator) pair in the slot
     int src_base;  // this frame's source plane in the src ring
+    float out_gain; // Float2Int scale for this frame's _Range
+    float out_bias; // neutral + 0.5, already including the rounding term
 } pc;
 
 const int BLOCK = 8;
@@ -89,8 +91,11 @@ float den_at(int x, int y) { return acc[num_at(x, y) + PE]; }
 void store_result(int x, int y, float v) {
     const int o = y * STRIDE + x;
 #if defined(IO_U16)
-    const float bias = (CHROMA != 0) ? 32768.0f : 0.0f;
-    const float s = clamp(v * PEAK + bias + 0.5f, 0.0f, PEAK);
+    // The inverse of the copy kernel's widening, with this frame's own _Range
+    // mapping: out_gain is 65535 full, 56064 limited luma, 57344 chroma, and
+    // out_bias is the neutral code plus the reference's 0.5 rounding term.
+    // Clip to the whole code range so limited output keeps its headroom.
+    const float s = clamp(v * pc.out_gain + pc.out_bias, 0.0f, PEAK);
     dst16[o] = uint16_t(uint(s));
 #elif defined(IO_F16)
     dst16[o] = float16_t(v);

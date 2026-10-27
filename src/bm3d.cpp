@@ -67,6 +67,43 @@ struct Bm3dPlane {
     uint32_t agg_grid_y {};
 };
 
+// A native u16 code to the f32 working domain, and the inverse the normalize
+// kernel applies. The CPU reference (mawen's VSProcess::Int2Float/Float2Int)
+// scales by the frame's _Range: full range spans the whole code range, limited
+// range spans 219/224 of it with luma's 4096 and chroma's 32768 offsets. RGB
+// untagged is full; a tagged RGB clip follows its tag. The gain matches the
+// reference's RangeConvert exactly, so a native clip and a float conversion of
+// the same content carry the same values.
+struct Bm3dRange {
+    float gain {};
+    float neutral {};
+};
+
+static Bm3dRange bm3d_range(const VSVideoFormat & format, int plane,
+                            bool full) {
+    if (format.colorFamily == cfRGB) {
+        return { 1.0f / 65535.0f, 0.0f };
+    }
+    const bool chroma = format.colorFamily == cfYUV && plane > 0;
+    if (chroma) {
+        return { full ? 1.0f / 65535.0f : 1.0f / 57344.0f, 32768.0f };
+    }
+    return { full ? 1.0f / 65535.0f : 1.0f / 56064.0f, full ? 0.0f : 4096.0f };
+}
+
+// The frame's _Range property. A missing one is full on RGB (mawen's
+// `full = rgb ? error || _Range != 0 : ...`) and limited on Gray/YUV.
+static bool bm3d_full_range(const VSFrame * frame, const VSVideoFormat & format,
+                            const VSAPI * vsapi) {
+    int error = 0;
+    const VSMap * props = vsapi->getFramePropertiesRO(frame);
+    const int64_t range = vsapi->mapGetInt(props, "_Range", 0, &error);
+    if (format.colorFamily == cfRGB) {
+        return error ? true : range != 0;
+    }
+    return !error && range != 0;
+}
+
 // One estimation entry: a source ring and an estimate stack that cover the
 // planes it filters. The reference's default mode builds one entry per
 // processed plane (each plane block-matches on its own content, at its own
@@ -1312,10 +1349,13 @@ static void record_est_position(BM3DData * d, const Bm3dFrame & fr,
 }
 
 // The input planes one source frame contributes to the ring copy: the frame
-// being denoised, plus the basic-estimate clip in final mode.
+// being denoised, plus the basic-estimate clip in final mode. The range is the
+// frame's own _Range, so each clip and each frame keeps its own code mapping.
 struct Bm3dWindowCopy {
     VkBuffer source[3] {};
     VkBuffer ref[3] {};
+    std::array<Bm3dRange, 3> src_range {};
+    std::array<Bm3dRange, 3> ref_range {};
 };
 
 // Copy the source window's planes (the union of all windows that this record's
@@ -1334,21 +1374,22 @@ static void record_src_copies(BM3DData * d, const Bm3dFrame & fr,
     const int clips = d->final ? 2 : 1;
     const auto copy_plane = [&](VkBuffer src, VkBuffer dst, VkDeviceSize offset,
                                 VkDeviceSize bytes, const Bm3dGroup & g,
-                                bool chroma) {
+                                const Bm3dRange & range) {
         const auto timer = d->profile.begin(cmd, "BM3D convert");
         if (d->bits == 16) {
-            const int32_t count = static_cast<int32_t>(bytes);
-            const int32_t off = static_cast<int32_t>(offset);
+            struct CopyPush {
+                uint32_t off;
+                uint32_t count;
+                float neutral;
+                float gain;
+            } push { static_cast<uint32_t>(offset),
+                     static_cast<uint32_t>(bytes), range.neutral, range.gain };
             const VkBuffer bufs[2] { src, dst };
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           d->copy_pipeline);
             gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, bufs, 2);
-            // A half plane is already in the ring's float domain, so only the
-            // integer arm carries the chroma neutral.
-            const int32_t pushes[3] { off, count,
-                                      (chroma && !d->half) ? 32768 : 0 };
-            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, pushes,
-                               sizeof(pushes));
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &push,
+                               sizeof(push));
             // The grid is the entry's extent at creation, so it covers this
             // plane's (never larger) count; past pc.count a thread returns.
             d->gpu->vk->vkCmdDispatch(cmd, g.copy_grid_x, g.copy_grid_y, 1);
@@ -1395,11 +1436,11 @@ static void record_src_copies(BM3DData * d, const Bm3dFrame & fr,
                                static_cast<VkDeviceSize>(clips - 1) *
                                    g.n_planes * g.pe +
                                static_cast<VkDeviceSize>(pi) * g.pe,
-                           g.pe, g, d->planes[plane].chroma);
+                           g.pe, g, w.src_range[plane]);
                 if (d->final) {
                     copy_plane(w.ref[plane], src_buf,
                                slot_base + static_cast<VkDeviceSize>(pi) * g.pe,
-                               g.pe, g, d->planes[plane].chroma);
+                               g.pe, g, w.ref_range[plane]);
                 }
             }
         }
@@ -1485,6 +1526,7 @@ static void record_est_chunk(BM3DData * d, VSGPUExecContext * ctx,
 static void record_bm3d_agg(BM3DData * d, const Bm3dFrame * fr,
                             VkCommandBuffer cmd, int n, int base, bool isolated,
                             const std::array<VkBuffer, 3> & dst_planes,
+                            const std::array<Bm3dRange, 3> & out_range,
                             bool gputrace) {
     const int r = d->radius;
     bool first_dispatch = true;
@@ -1546,10 +1588,27 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame * fr,
                 // alone on an initializer's continuation line as a discarded
                 // expression statement (constStatement), in some versions only.
                 const int32_t src_base_push = static_cast<int32_t>(src_base);
-                const int32_t pushes[5] { n, isolated ? n : base, slot0_push,
-                                          plane_off, src_base_push };
-                gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, pushes,
-                                   sizeof(pushes));
+                // The layout is five ints followed by the two floats the u16
+                // store inverts; 28 bytes is the pipeline layout's whole block.
+                struct AggPush {
+                    int32_t n;
+                    int32_t acc_base;
+                    int32_t slot0;
+                    int32_t plane_off;
+                    int32_t src_base;
+                    float gain;
+                    float bias;
+                } push { n,
+                         isolated ? n : base,
+                         slot0_push,
+                         plane_off,
+                         src_base_push,
+                         out_range[plane].gain != 0.0f
+                             ? 1.0f / out_range[plane].gain
+                             : 0.0f,
+                         out_range[plane].neutral + 0.5f };
+                gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &push,
+                                   sizeof(push));
             }
             // The estimation kernel's atomic accumulation (and the fill that
             // zeroed the slot) must be visible to the normalize reads; the
@@ -1600,6 +1659,7 @@ static void record_center_cmd(BM3DData * d, VkCommandBuffer cmd, int m,
                                      " could not be fetched");
         }
         holds.push_back(src);
+        auto & w = window[static_cast<size_t>(f - first)];
         for (int plane = 0; plane < d->num_planes; ++plane) {
             VSVulkanPlaneInfo info {};
             if (d->gpu->api->getGPUPlane(src, plane, &info)) {
@@ -1607,7 +1667,10 @@ static void record_center_cmd(BM3DData * d, VkCommandBuffer cmd, int m,
                                          " plane " + std::to_string(plane) +
                                          " is not GPU resident");
             }
-            window[static_cast<size_t>(f - first)].source[plane] = info.buffer;
+            w.source[plane] = info.buffer;
+            w.src_range[plane] =
+                bm3d_range(d->vi->format, plane,
+                           bm3d_full_range(src, d->vi->format, vsapi));
         }
         if (d->ref_node) {
             const VSFrame * rsrc =
@@ -1624,7 +1687,10 @@ static void record_center_cmd(BM3DData * d, VkCommandBuffer cmd, int m,
                                              " plane " + std::to_string(plane) +
                                              " is not GPU resident");
                 }
-                window[static_cast<size_t>(f - first)].ref[plane] = info.buffer;
+                w.ref[plane] = info.buffer;
+                w.ref_range[plane] =
+                    bm3d_range(d->vi->format, plane,
+                               bm3d_full_range(rsrc, d->vi->format, vsapi));
             }
         }
     }
@@ -1725,6 +1791,12 @@ static VSFrame * normalize_cmd(BM3DData * d, VkCommandBuffer cmd, int f,
         throw std::runtime_error("centre frame " + std::to_string(f) +
                                  " could not be fetched");
     }
+    // The output store inverts the centre frame's own _Range.
+    std::array<Bm3dRange, 3> out_range {};
+    for (int p = 0; p < d->num_planes; ++p) {
+        out_range[p] = bm3d_range(
+            d->vi->format, p, bm3d_full_range(center, d->vi->format, vsapi));
+    }
     bool all_process = true;
     for (int p = 0; p < d->num_planes; ++p) {
         all_process = all_process && d->planes[p].process;
@@ -1762,7 +1834,8 @@ static VSFrame * normalize_cmd(BM3DData * d, VkCommandBuffer cmd, int f,
     }
 
     bm3d_full_barrier(*d->gpu, cmd);
-    record_bm3d_agg(d, nullptr, cmd, f, base, isolated, dst_planes, false);
+    record_bm3d_agg(d, nullptr, cmd, f, base, isolated, dst_planes, out_range,
+                    false);
     return dst;
 }
 
@@ -2108,6 +2181,18 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
         // is processed on its own unless chroma=True packs the three of a
         // 4:4:4 clip into one entry.
         const VSFrame * center = vsapi->getFrameFilter(n, d->node, frameCtx);
+        if (!center) {
+            vsapi->setFilterError("BM3D: the centre frame could not be fetched",
+                                  frameCtx);
+            return nullptr;
+        }
+        // The output store inverts the centre frame's own _Range.
+        std::array<Bm3dRange, 3> out_range {};
+        for (int p = 0; p < d->num_planes; ++p) {
+            out_range[p] =
+                bm3d_range(d->vi->format, p,
+                           bm3d_full_range(center, d->vi->format, vsapi));
+        }
         bool all_process = true;
         for (int p = 0; p < d->num_planes; ++p) {
             all_process = all_process && d->planes[p].process;
@@ -2222,6 +2307,9 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
                                      " is not GPU resident");
                 }
                 window[k].source[plane] = plane_info.buffer;
+                window[k].src_range[plane] =
+                    bm3d_range(d->vi->format, plane,
+                               bm3d_full_range(src, d->vi->format, vsapi));
             }
             sources.push_back(src);
             if (d->final) {
@@ -2236,6 +2324,9 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
                                          " is not GPU resident");
                     }
                     window[k].ref[plane] = plane_info.buffer;
+                    window[k].ref_range[plane] =
+                        bm3d_range(d->vi->format, plane,
+                                   bm3d_full_range(rsrc, d->vi->format, vsapi));
                 }
                 sources.push_back(rsrc);
             }
@@ -2373,7 +2464,7 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
         }
         vsfeel_trace_mark("sub agg");
         record_bm3d_agg(d, &fr, d->gpu->api->gpuExecCommandBuffer(agg_ctx), n,
-                        0, false, dst_planes, gputrace);
+                        0, false, dst_planes, out_range, gputrace);
         uint64_t agg_value = 0;
         if (d->gpu->api->gpuExecSubmit(agg_ctx, &agg_value, aerr,
                                        sizeof(aerr))) {
@@ -2674,18 +2765,6 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         }
     }
 
-    if (!any_process) {
-        // Nothing to denoise: hand the source clip straight back, as the
-        // references' BM3Dv2 does. Before any GPU resource exists, so the
-        // instance is just the two node references.
-        if (d->ref_node) {
-            vsapi->freeNode(d->ref_node);
-            d->ref_node = nullptr;
-        }
-        vsapi->mapConsumeNode(out, "clip", d->node, maReplace);
-        return;
-    }
-
     // match the reference sigma scaling exactly (different factor for the
     // final Wiener pass); a skipped plane keeps exactly zero so the kernel's
     // epsilon test cannot disagree with the unscaled decision above
@@ -2764,6 +2843,20 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         (d->vi->format.colorFamily != cfYUV ||
          d->vi->format.subSamplingW != 0 || d->vi->format.subSamplingH != 0)) {
         return set_error("clip format must be YUV444 when \"chroma\" is true");
+    }
+
+    // Nothing to denoise: hand the source clip straight back, as the
+    // references' BM3Dv2 does. This is after every argument has been parsed and
+    // validated, so an invalid block_step/radius/chroma is still an error when
+    // all sigmas are zero; it is before any GPU resource exists, so the
+    // instance is just the node references.
+    if (!any_process) {
+        if (d->ref_node) {
+            vsapi->freeNode(d->ref_node);
+            d->ref_node = nullptr;
+        }
+        vsapi->mapConsumeNode(out, "clip", d->node, maReplace);
+        return;
     }
 
     // device_id and num_streams are registered but never read: the core owns

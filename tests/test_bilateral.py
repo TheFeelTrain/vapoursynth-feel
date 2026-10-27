@@ -29,7 +29,9 @@ from conftest import (
     assert_grays,
     assert_preserves_frame_props,
     cpu_node,
+    eval_parallel,
     frame_to_ndarray,
+    plane_to_ndarray,
     plane as _plane,
     reference_compare,
     reference_or_skip,
@@ -515,23 +517,16 @@ def test_bilateral_rejects_zero_block(clip_grays):
             _run(clip_grays, sigma_spatial=3.0, sigma_color=0.05, block_x=bx, block_y=by)
 
 
-def test_bilateral_negative_block_is_clamped_not_rejected(clip_grays):
-    """Pins current behaviour: a negative block dimension is silently clamped
-    to the device default, not rejected.
+def test_bilateral_rejects_negative_block_dimensions(clip_grays):
+    """A negative block dimension is an error, like block_x=0.
 
-    ``bilateral.cpp:726`` casts to ``uint32_t`` before the limit comparison,
-    so -1 wraps and takes the shrink branch before the ``block_x <= 0`` check
-    at :733. Output is still correct (the shape has no semantic effect); the
-    validation is just inconsistent with ``block_x=0``, which errors.
+    It used to wrap in the unsigned device-limit comparison and silently become
+    the 16x16 default, which made a typo a no-op.
     """
     kwargs = dict(sigma_spatial=3.0, sigma_color=0.05)
-    default = _run(clip_grays, **kwargs)
     for bx, by in [(-1, 8), (8, -1), (-1, -1)]:
-        shaped = _run(clip_grays, block_x=bx, block_y=by, **kwargs)
-        for n in (0, 11):
-            a = frame_to_ndarray(default.get_frame(n))
-            b = frame_to_ndarray(shaped.get_frame(n))
-            assert np.array_equal(a, b), f"negative block {bx}x{by} changed frame {n}"
+        with pytest.raises(vs.Error, match="must be positive"):
+            _run(clip_grays, block_x=bx, block_y=by, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -719,3 +714,13 @@ def test_bilateral_rejects_sigma_spatial_that_derives_oversized_radius(clip_gray
     hit the same bound as an explicit one."""
     with pytest.raises(vs.Error):
         vs.core.vsfeel.Bilateral(clip_grays, sigma_spatial=1e6, sigma_color=0.05)
+
+
+def test_bilateral_parallel_load_matches_serial(clip_grays):
+    """The pipelined multi-frame request path must match sequential requests."""
+    params = dict(sigma_spatial=3.0, sigma_color=0.05)
+    par = eval_parallel(_run, clip_grays, dtype=np.float32, **params)
+    ref = cpu_node(_run(clip_grays, **params))
+    for n in range(clip_grays.num_frames):
+        seq = plane_to_ndarray(ref.get_frame(n), 0, np.float32)
+        assert np.array_equal(par[n], seq), f"parallel/serial mismatch at frame {n}"

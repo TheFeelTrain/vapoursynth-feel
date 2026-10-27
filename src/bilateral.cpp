@@ -564,6 +564,13 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
             block_y = (max_radius > 12) ? 16 : 8;
         }
     }
+    // An explicit non-positive dimension cannot be launched. It used to fall
+    // through the unsigned limit comparison and silently become the default;
+    // reject it like block_x=0, so a typo is an error rather than a no-op.
+    if ((!block_x_default && block_x <= 0) ||
+        (!block_y_default && block_y <= 0)) {
+        return set_error("\"block_x\"/\"block_y\" must be positive");
+    }
 
     {
         const auto result = get_gpu_device(core, vsapi);
@@ -576,8 +583,7 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
     {
         const VkPhysicalDeviceLimits & limits = d->gpu->limits;
 
-        // A block over a limit (or a negative one, which the unsigned cast in
-        // the comparison turns into one) falls back to 16x16, as it always has.
+        // A block over a device limit falls back to 16x16.
         if (static_cast<uint32_t>(block_x) >
                 limits.maxComputeWorkGroupSize[0] ||
             static_cast<uint32_t>(block_y) >

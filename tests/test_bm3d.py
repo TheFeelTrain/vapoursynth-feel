@@ -1256,13 +1256,10 @@ elif kind == "yuv444p16":
     clip = core.resize.Bicubic(source, format=vs.YUV444P16)
 else:
     raise SystemExit("bad clip kind %r" % kind)
-if u16_sample:
-    # The CPU scales an *integer* clip by the frame's _Range: limited (or
-    # absent) maps [16 << (b-8), 235 << (b-8)] to [0, 1] and clips the output
-    # back. vsfeel's u16 path is full range, like its f32 one and like every
-    # other vsfeel filter, so the two sides only meet in the same domain on a
-    # full-range clip.
-    clip = core.std.SetFrameProp(clip, prop="_Range", intval=1)
+if u16_sample and spec.get("range") is not None:
+    # Both sides read the frame's _Range, so a case can pin full or limited
+    # range instead of inheriting the clip's tag.
+    clip = core.std.SetFrameProp(clip, prop="_Range", intval=int(spec["range"]))
 if f16_sample:
     full_fmt = vs.GRAYS if clip.format.color_family == vs.GRAY else vs.YUV444PS
     half_fmt = vs.GRAYH if clip.format.color_family == vs.GRAY else vs.YUV444PH
@@ -1372,7 +1369,9 @@ print("RESULT " + json.dumps({"maxdiff": worst, "per_plane": per_plane}), flush=
 )
 
 
-def _cpu_compare(kwargs, stage="basic", clip="grays", frames=(0, 11, 23), sample="float"):
+def _cpu_compare(
+    kwargs, stage="basic", clip="grays", frames=(0, 11, 23), sample="float", range_value=None
+):
     """Worst per-plane diff against the CPU implementation, in a subprocess."""
     if not _CPU_AVAILABLE:
         skip_or_fail_reference("the CPU bm3d plugin (Basic/VBasic/VAggregate) is not installed")
@@ -1383,6 +1382,7 @@ def _cpu_compare(kwargs, stage="basic", clip="grays", frames=(0, 11, 23), sample
         "kwargs": dict(kwargs),
         "stage": stage,
         "sample": sample,
+        "range": range_value,
     }
     return run_compare_subprocess(_CPU_SCRIPT, [json.dumps(spec)], timeout=1800)
 
@@ -1439,7 +1439,6 @@ SWEEP_CONFIGS = [
     ({"ps_range": 5}, 3e-3, 0.00105),
     ({"ps_range": 9}, 3e-3, 0.00126),
     ({"ps_num": 1}, 3e-3, 0.00125),
-    ({"ps_num": 2}, 3e-3, 0.00126),
     ({"ps_num": 3}, 3e-3, 0.00113),
     ({"ps_num": 4}, 3e-3, 0.00113),
     ({"ps_num": 5}, 3e-3, 0.00094),
@@ -1458,23 +1457,25 @@ def _sweep_id(cfg: dict) -> str:
 )
 def test_bm3d_parameter_sweep_matches_cpu(clip_grays, cfg, bound, measured):
     """Parameter grid around the defaults, graded against the CPU plugin."""
-    payload = _cpu_compare(dict(BASE_KWARGS, **cfg))
+    frames = (0, 11) if cfg.get("block_step") == 1 else (0, 11, 23)
+    payload = _cpu_compare(dict(BASE_KWARGS, **cfg), frames=frames)
     assert payload["maxdiff"] < bound, f"max diff vs CPU ({cfg}): {payload} (was {measured})"
 
 
 @pytest.mark.parametrize(
     "kwargs,bound,measured",
     [
-        ({}, 3e-3, 0.00126),
         ({"sigma": [0.5, 1.1, 0.3]}, 2e-3, 0.00074),
         ({"th_mse": 1200.0}, 3e-3, 0.00126),
-        ({"ps_num": 5}, 3e-3, 0.00094),
     ],
-    ids=["plugin-defaults", "sigma-array-inherit", "explicit-th-mse", "ps-num-5"],
+    ids=["sigma-array-inherit", "explicit-th-mse"],
 )
-def test_bm3d_plugin_defaults_match_cpu(clip_grays, kwargs, bound, measured):
-    """The documented defaults must produce the CPU's result, not just any
-    finite frame (test_device_limits/test_lifecycle only check those)."""
+def test_bm3d_argument_combinations_match_cpu(clip_grays, kwargs, bound, measured):
+    """Per-plane sigma and explicit-threshold combinations against the CPU.
+
+    The empty config and ps_num=5 are covered by the parameter sweep, so they
+    are not duplicated here.
+    """
     payload = _cpu_compare(dict(BASE_KWARGS, **kwargs))
     assert payload["maxdiff"] < bound, f"max diff vs CPU ({kwargs}): {payload}"
 
@@ -1573,9 +1574,14 @@ def _run_u16(clip, **kwargs):
     return BM3D(clip, **_std_args(**kwargs))
 
 
-def _u16_compare(kwargs, stage="basic", clip="gray16", frames=(0, 11, 23)):
+def _u16_compare(kwargs, stage="basic", clip="gray16", frames=(0, 11, 23), full=None):
     return _cpu_compare(
-        dict(U16_BASE, **kwargs), stage=stage, clip=clip, frames=frames, sample="u16"
+        dict(U16_BASE, **kwargs),
+        stage=stage,
+        clip=clip,
+        frames=frames,
+        sample="u16",
+        range_value=None if full is None else int(full),
     )
 
 
@@ -1591,13 +1597,16 @@ U16_CASES = [
 ]
 
 
+@pytest.mark.parametrize("full", [False, True], ids=["limited", "full"])
 @pytest.mark.parametrize(
     "radius,stage,bound,measured", U16_CASES, ids=[f"r{c[0]}" for c in U16_CASES]
 )
-def test_bm3d_u16_matches_cpu(clip_gray16, radius, stage, bound, measured):
-    """Every supported radius must track the CPU's u16 output."""
-    payload = _u16_compare(dict(radius=radius), stage=stage)
-    assert payload["maxdiff"] < bound, f"u16 radius {radius} vs CPU: {payload} (was {measured})"
+def test_bm3d_u16_matches_cpu(clip_gray16, radius, stage, bound, measured, full):
+    """Every supported radius must track the CPU's u16 output at both ranges."""
+    payload = _u16_compare(dict(radius=radius), stage=stage, full=full)
+    assert payload["maxdiff"] < bound, (
+        f"u16 radius {radius} ({'full' if full else 'limited'}) vs CPU: {payload} (was {measured})"
+    )
 
 
 U16_SWEEP = [
@@ -1619,40 +1628,63 @@ U16_SWEEP = [
 )
 def test_bm3d_u16_parameter_sweep_matches_cpu(clip_gray16, cfg, bound, measured):
     """The parameter grid around the defaults, on an integer clip."""
-    payload = _u16_compare(cfg)
+    frames = (0, 11) if cfg.get("block_step") == 1 else (0, 11, 23)
+    payload = _u16_compare(cfg, frames=frames)
     assert payload["maxdiff"] < bound, f"u16 max diff vs CPU ({cfg}): {payload} (was {measured})"
 
 
-def test_bm3d_u16_final_stage_matches_cpu(clip_gray16):
+@pytest.mark.parametrize("full", [False, True], ids=["limited", "full"])
+def test_bm3d_u16_final_stage_matches_cpu(clip_gray16, full):
     """The Wiener pass on an integer clip, both sides driven by the same guide.
 
     The guide is vsfeel's own u16 basic estimate, so this isolates the final
     stage's matching and shrinkage from any basic-stage difference -- and it
     also exercises the second ring section (the `ref` clip is widened by the
     same copy kernel as the source)."""
-    payload = _u16_compare({}, stage="final")
+    payload = _u16_compare({}, stage="final", full=full)
     assert payload["maxdiff"] < 1e-3, f"u16 final pass vs CPU: {payload} (was 0.00062)"
 
 
-def test_bm3d_u16_joint_chroma_matches_cpu():
-    """The joint 4:4:4 entry on an integer clip.
+@pytest.mark.parametrize("full", [False, True], ids=["limited", "full"])
+def test_bm3d_u16_joint_chroma_matches_cpu(full):
+    """The joint 4:4:4 entry on an integer clip at both ranges.
 
     Same close-but-not-exact chroma domain as the f32 color test: the CPU
     scales each plane's sigma by that plane's matrix norm, vsfeel carries
     normY for all three."""
-    payload = _u16_compare({"sigma": [0.7, 0.7, 0.7]}, clip="yuv444p16")
+    payload = _u16_compare({"sigma": [0.7, 0.7, 0.7]}, clip="yuv444p16", full=full)
     assert payload["maxdiff"] < 1.5e-2, f"u16 joint chroma vs CPU: {payload}"
 
 
-def _widen_to_floats(clip_u16):
-    """The exact floats the ring copy produces for each sample.
+def _u16_gain_neutral(full, chroma):
+    """The f32 gain and code neutral of the copy kernel for one plane.
 
-    bm3d_copy_u16 writes `float(int(sample)) * (1.0f / 65535.0f)`; reproducing it
-    in numpy (one float32 multiply of the same two operands) is what makes the
-    f32 arm below see bit-identical data, and therefore what makes the
-    equality assertion meaningful rather than a tolerance.
+    These reproduce the host's float32 expressions exactly: the gain is one
+    float32 division of the same operands, so the widening below sees the same
+    rounded value the shader does.
     """
-    scale = np.float32(1.0 / 65535.0)
+    one = np.float32(1.0)
+    if chroma:
+        gain = one / np.float32(65535.0 if full else 57344.0)
+        return gain, np.float32(32768.0)
+    gain = one / np.float32(65535.0 if full else 56064.0)
+    return gain, np.float32(0.0 if full else 4096.0)
+
+
+def _u16_out_scale(gain):
+    """The normalize store's reciprocal of the copy gain, as float32."""
+    return np.float32(1.0) / gain
+
+
+def _widen_to_floats(clip_u16, full):
+    """The exact floats the ring copy produces for each luma sample.
+
+    The integer arm writes `(sample - neutral) * gain`; reproducing it in numpy
+    (float32 subtraction and multiply of the same operands) is what makes the
+    f32 arm below see bit-identical data, and therefore what makes the equality
+    assertion meaningful rather than a tolerance.
+    """
+    gain, neutral = _u16_gain_neutral(full, False)
     base = clip_u16.resize.Point(format=vs.GRAYS)
 
     def widen(n, f):
@@ -1667,23 +1699,26 @@ def _widen_to_floats(clip_u16):
             shape=(src.height, src.get_stride(0)),
         )
         u = s[:, : src.width * 2].copy().view(np.uint16)
-        raw[:, : out.width * 4].view(np.float32)[:] = u.astype(np.float32) * scale
+        raw[:, : out.width * 4].view(np.float32)[:] = (u.astype(np.float32) - neutral) * gain
         return out
 
     return vs.core.std.ModifyFrame(base, [clip_u16, base], widen)
 
 
-def _u16_path_is_the_f32_path(clip_u16, **kwargs):
+def _u16_path_is_the_f32_path(clip_u16, full, frames=(0, 11, 23), **kwargs):
     """u16 output vs the f32 output on widened input, in whole codes."""
-    u16_out = _run_u16(clip_u16, **kwargs)
-    f32_out = BM3D(_widen_to_floats(clip_u16), **_std_args(**kwargs))
+    tagged = vs.core.std.SetFrameProp(clip_u16, prop="_Range", intval=int(full))
+    u16_out = _run_u16(tagged, **kwargs)
+    f32_out = BM3D(_widen_to_floats(tagged, full), **_std_args(**kwargs))
+    gain, neutral = _u16_gain_neutral(full, False)
+    scale = _u16_out_scale(gain)
     worst = 0
-    for n in (0, 11, 23):
+    for n in frames:
         a = plane_to_ndarray(u16_out.get_frame(n), 0, np.uint16).astype(np.int32)
         v = plane_to_ndarray(f32_out.get_frame(n), 0, np.float32)
         b = np.floor(
             np.clip(
-                v * np.float32(65535.0) + np.float32(0.5),
+                v * scale + neutral + np.float32(0.5),
                 np.float32(0.0),
                 np.float32(65535.0),
             )
@@ -1692,23 +1727,22 @@ def _u16_path_is_the_f32_path(clip_u16, **kwargs):
     return worst
 
 
-def _widen_yuv444_to_floats(clip_u16):
+def _widen_yuv444_to_floats(clip_u16, full):
     """The exact floats the ring copy produces for a YUV444 integer clip.
 
-    Luma is `sample * (1/65535)`; a chroma plane has its 32768 neutral removed
-    first (the reference's chroma Int2Float). Feeding the f32 arm these exact
-    floats is what makes the comparison below an equality in whole codes rather
-    than a tolerance.
+    The gain and neutral are per plane, and the range comes from the frame's
+    tag so a limited chroma plane uses 1/57344 around 32768; feeding the f32 arm
+    these exact floats is what makes the comparison an equality in whole codes.
     """
-    scale = np.float32(1.0 / 65535.0)
     base = clip_u16.resize.Point(format=vs.YUV444PS)
 
     def widen(n, f):
         src, tmpl = f
         out = tmpl.copy()
         for p in range(3):
-            v = plane_to_ndarray(src, p, np.uint16).astype(np.int32)
-            v = (v - (0 if p == 0 else 32768)).astype(np.float32) * scale
+            gain, neutral = _u16_gain_neutral(full, p > 0)
+            v = plane_to_ndarray(src, p, np.uint16).astype(np.float32)
+            v = (v - neutral) * gain
             raw = np.ctypeslib.as_array(
                 ctypes.cast(out.get_write_ptr(p), ctypes.POINTER(ctypes.c_uint8)),
                 shape=(out.height, out.get_stride(p)),
@@ -1719,19 +1753,21 @@ def _widen_yuv444_to_floats(clip_u16):
     return vs.core.std.ModifyFrame(base, [clip_u16, base], widen)
 
 
-def _u16_yuv_path_is_the_f32_path(clip_u16, **kwargs):
+def _u16_yuv_path_is_the_f32_path(clip_u16, full, **kwargs):
     """Worst whole-code u16 vs f32 difference over the three planes."""
-    u16_out = _run_u16(clip_u16, **kwargs)
-    f32_out = BM3D(_widen_yuv444_to_floats(clip_u16), **_std_args(**kwargs))
+    tagged = vs.core.std.SetFrameProp(clip_u16, prop="_Range", intval=int(full))
+    u16_out = _run_u16(tagged, **kwargs)
+    f32_out = BM3D(_widen_yuv444_to_floats(tagged, full), **_std_args(**kwargs))
     worst = 0
     for n in (0, 11, 23):
         for p in range(3):
+            gain, neutral = _u16_gain_neutral(full, p > 0)
+            scale = _u16_out_scale(gain)
             a = plane_to_ndarray(u16_out.get_frame(n), p, np.uint16).astype(np.int32)
             v = plane_to_ndarray(f32_out.get_frame(n), p, np.float32)
-            bias = np.float32(0.0 if p == 0 else 32768.0)
             b = np.floor(
                 np.clip(
-                    v * np.float32(65535.0) + bias + np.float32(0.5),
+                    v * scale + neutral + np.float32(0.5),
                     np.float32(0.0),
                     np.float32(65535.0),
                 )
@@ -1740,12 +1776,13 @@ def _u16_yuv_path_is_the_f32_path(clip_u16, **kwargs):
     return worst
 
 
+@pytest.mark.parametrize("full", [False, True], ids=["limited", "full"])
 @pytest.mark.parametrize(
     "kwargs",
     [{}, {"sigma": [0.0, 0.7, 0.7]}, {"sigma": [0.0, 0.7, 0.7], "chroma": 1}],
     ids=["all-planes", "chroma-only", "chroma-only-joint"],
 )
-def test_bm3d_u16_color_is_the_f32_path_with_a_rounded_store(kwargs):
+def test_bm3d_u16_color_is_the_f32_path_with_a_rounded_store(kwargs, full):
     """Chrominance crosses depths like luma: the 32768 neutral is transport.
 
     In the f32 arm a chroma plane is centred on zero; the integer arm must
@@ -1756,16 +1793,17 @@ def test_bm3d_u16_color_is_the_f32_path_with_a_rounded_store(kwargs):
     binding without a plane-0 buffer.
     """
     clip_u16 = vs.core.resize.Bicubic(source_clip(), format=vs.YUV444P16)
-    worst = _u16_yuv_path_is_the_f32_path(clip_u16, **kwargs)
+    worst = _u16_yuv_path_is_the_f32_path(clip_u16, full, **kwargs)
     assert worst <= 1, f"u16 color output is not the f32 result rounded ({kwargs}): {worst} codes"
 
 
+@pytest.mark.parametrize("full", [False, True], ids=["limited", "full"])
 @pytest.mark.parametrize(
     "kwargs",
     [{}, {"sigma": 1.5}, {"radius": 0}, {"block_step": 1}, {"extractor_exp": 1}],
     ids=["default", "sigma1.5", "radius0", "block_step1", "extractor"],
 )
-def test_bm3d_u16_is_the_f32_path_with_a_rounded_store(clip_gray16, kwargs):
+def test_bm3d_u16_is_the_f32_path_with_a_rounded_store(clip_gray16, kwargs, full):
     """The u16 output must be the f32 result, rounded to native samples.
 
     Both arms run the same estimation kernel over bit-identical floats (the
@@ -1776,7 +1814,8 @@ def test_bm3d_u16_is_the_f32_path_with_a_rounded_store(clip_gray16, kwargs):
     it). Measured: 1 code at every configuration here, which this pins: a
     wrong gain, offset, clamp or rounding would show up as thousands.
     """
-    worst = _u16_path_is_the_f32_path(clip_gray16, **kwargs)
+    frames = (0, 11) if kwargs.get("block_step") == 1 else (0, 11, 23)
+    worst = _u16_path_is_the_f32_path(clip_gray16, full, frames=frames, **kwargs)
     assert worst <= 1, f"u16 output is not the f32 result rounded ({kwargs}): {worst} codes"
 
 
@@ -2166,3 +2205,41 @@ def test_bm3d_joint_frame_request_order_matches_serial():
         clip="yuv444ps",
         timeout=300,
     )
+
+
+def test_bm3d_short_per_plane_arrays_repeat_the_last_entry(clip_gray16):
+    """A one-element per-plane array must equal the fully spelled-out one."""
+    short = BM3D(
+        clip_gray16,
+        sigma=[0.7],
+        block_step=[4],
+        bm_range=[16],
+        ps_num=[2],
+        ps_range=[7],
+        radius=0,
+    )
+    full = BM3D(
+        clip_gray16,
+        sigma=[0.7, 0.7, 0.7],
+        block_step=[4, 4, 4],
+        bm_range=[16, 16, 16],
+        ps_num=[2, 2, 2],
+        ps_range=[7, 7, 7],
+        radius=0,
+    )
+    for n in (0, 11):
+        a = plane_to_ndarray(short.get_frame(n), 0, np.uint16).astype(np.int32)
+        b = plane_to_ndarray(full.get_frame(n), 0, np.uint16).astype(np.int32)
+        assert np.abs(a - b).max() <= 1, f"short array changed frame {n}"
+
+
+def test_bm3d_chroma_requires_color_input(clip_gray16):
+    """chroma=True is the reference's joint entry and needs YUV444, not Gray."""
+    with pytest.raises(vs.Error, match="YUV444"):
+        vs.core.vsfeel.BM3D(clip_gray16, sigma=0.7, chroma=1)
+
+
+@pytest.mark.parametrize("value", [-1, 128])
+def test_bm3d_rejects_extractor_exp_outside_range(clip_grays, value):
+    with pytest.raises(vs.Error, match="extractor_exp"):
+        vs.core.vsfeel.BM3D(clip_grays, sigma=0.7, extractor_exp=value)

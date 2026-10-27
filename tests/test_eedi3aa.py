@@ -444,6 +444,14 @@ def test_eedi3aa_rejects_odd_width(clip_gray16):
         _aa(odd, field=3)
 
 
+def test_eedi3aa_rejects_odd_height(clip_gray16):
+    """The transposed vertical pass needs an even processed plane height."""
+    odd = vs.core.std.Crop(clip_gray16, bottom=1)
+    assert odd.height % 2 == 1
+    with pytest.raises(vs.Error, match="mod 2"):
+        _aa(odd, field=3)
+
+
 def test_eedi3aa_rejects_odd_chroma_width():
     """The odd axis is per processed plane: 630 luma -> 315 chroma rejects."""
     odd = vs.core.std.Crop(_yuv(16), right=10)

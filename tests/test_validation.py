@@ -57,6 +57,12 @@ FILTERS = [
     "NNEDI3",
     "NNEDI3_f16",
     "NNEDI3_f16_storage",
+    "Box",
+    "Box_f16",
+    "Box_f32",
+    "WNNM",
+    "WNNM_u16",
+    "WNNM_f16",
 ]
 
 _SCRIPT = textwrap.dedent(f"""\
@@ -199,6 +205,18 @@ _SCRIPT = textwrap.dedent(f"""\
             format=vs.GRAY8, width=gh.width, height=gh.height,
             length=gh.num_frames), format=vs.GRAYH)
         node = core.vsfeel.EEDI3H(gh, field=1, mclip=msk)
+    elif name == "Box":
+        node = core.vsfeel.Box(g16, width=630, height=354)
+    elif name == "Box_f16":
+        node = core.vsfeel.Box(gh, width=630, height=354)
+    elif name == "Box_f32":
+        node = core.vsfeel.Box(gs, width=630, height=354)
+    elif name == "WNNM":
+        node = core.vsfeel.WNNM(gs, sigma=3.0, radius=0)
+    elif name == "WNNM_u16":
+        node = core.vsfeel.WNNM(g16, sigma=3.0, radius=0)
+    elif name == "WNNM_f16":
+        node = core.vsfeel.WNNM(gh, sigma=3.0, radius=0)
     elif name == "NNEDI3":
         node = core.vsfeel.NNEDI3(g16, field=1)
     elif name == "NNEDI3_f16":

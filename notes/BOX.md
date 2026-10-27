@@ -55,10 +55,20 @@ reference's own storage rounding.
 **The tap window is a host-computed table, not a formula.** resize2's box is not
 an area average: it averages the source pixels whose *centres* fall inside the
 output pixel's box, so at a fractional ratio the tap count alternates and some
-output pixels decimate outright (120→80 is 1,2,1,2…). `box_taps()` computes
-`(first tap, count)` per output position in `double` and the shader runs an exact
-integer loop over it, so no float32 tie can move a tap. Two tables cover the whole
-frame: chroma is the same lattice shifted, so it reads a prefix of the luma table.
+output pixels decimate outright (120→80 is 1,2,1,2…). `box_taps()` reproduces
+zimg's `compute_filter` coordinate loop expression for expression (the same
+`pos = (i + 0.5) / scale`, `round_halfup`, half-integer sample positions and
+`(xpos - pos) * step` box test) and stores the resulting contiguous run as
+`(first tap, count)`; the shader runs an exact integer loop over it. A
+closed-form "cell boundaries" formula disagrees with zimg whenever a boundary
+lands exactly on a sample centre (measured: 613→306 and 613→612), which is why
+the loop is mirrored rather than simplified. Two tables cover the whole frame:
+chroma is the same lattice shifted, so it reads a prefix of the luma table.
+
+An output width/height that a subsampled format cannot store (odd width on
+4:2:0/4:2:2, odd height on 4:2:0) is rejected at creation. The output-stride
+probe frame is allocated at the requested size, and the core treats an illegal
+subsampled size as a fatal error, so this cannot be left to the probe.
 
 Smaller things worth knowing: `skip_vert` drops the first dispatch when an axis is
 unscaled; both strides are read off scratch frames at creation, because a GPU
@@ -69,8 +79,11 @@ so Box ships six SPIR-V variants, two passes times three depths.
 
 ### Tests
 `tests/test_box.py` — reference comparison per ratio × depth and per color family
-at every depth, chroma geometry, residency, identity, determinism, frame
-properties, validation. `tests/test_vsaa.py` covers the chain that uses it.
+at every depth, boundary ratios on cropped/odd sources (613→306, 613→612), the
+subsampled-dimension validation (a subprocess, because the pre-fix path aborted
+the interpreter), width-only/height-only, tiny legal targets, parallel load,
+residency, identity, determinism, frame properties, validation.
+`tests/test_vsaa.py` covers the chain that uses it.
 
 ## Performance
 

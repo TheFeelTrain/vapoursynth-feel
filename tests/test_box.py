@@ -8,11 +8,21 @@ bigbuckbunny_360p_grain.mp4 clip, whose grain exercises every tap window.
 Run from the repository root:  uv run python -m pytest tests/test_box.py
 """
 
+import os
+import subprocess
+import sys
+
 import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import assert_preserves_frame_props, cpu_node, plane as _plane
+from conftest import (
+    assert_preserves_frame_props,
+    cpu_node,
+    eval_parallel,
+    plane_to_ndarray,
+    plane as _plane,
+)
 
 pytest.importorskip("vskernels")
 from vskernels import Box
@@ -377,3 +387,125 @@ def test_rejects_8bit(clip_gray8):
 def test_rejects_non_positive(clip_grays):
     with pytest.raises(Exception, match="positive"):
         _box(clip_grays, 0, clip_grays.height)
+
+
+# ---------------------------------------------------------------------------
+# zimg boundary cases (odd / cropped source dimensions)
+# ---------------------------------------------------------------------------
+#
+# resize2's tap set is decided by zimg's coordinate loop, not by a cell formula;
+# at a boundary that lands exactly on a sample centre the two disagree. Odd
+# source dimensions make that common (measured: 613 -> 306 and 613 -> 612), and
+# the 640x360 fixtures used above never hit it.
+
+
+def test_odd_width_matches_resize2_u16(clip_gray16):
+    """613 -> {306,612} and 639 -> 319: one or two columns at the boundary."""
+    for right, width in ((27, 306), (27, 612), (1, 319)):
+        cropped = clip_gray16.std.Crop(right=right)
+        worst, _ = _worst(cropped, width, 180, [0])
+        # The copy's f32 divide is allowed 2.5 ULP, so a 3-tap boundary run can
+        # move a code; the old cell formula moved thousands.
+        assert worst <= 2, f"613->{width}: {worst} codes"
+
+
+def test_odd_width_matches_resize2_f32(clip_grays):
+    for right, width in ((27, 306), (27, 612), (1, 319)):
+        cropped = clip_grays.std.Crop(right=right)
+        _, worst = _worst(cropped, width, 180, [0])
+        assert worst <= 2.4e-7, f"613->{width}: {worst} of peak"
+
+
+def test_odd_width_matches_resize2_f16(clip_grayh):
+    for right, width in ((27, 306), (27, 612), (1, 319)):
+        cropped = clip_grayh.std.Crop(right=right)
+        worst = _worst_f16(cropped, width, 180, [0])
+        assert worst <= F16_STEP, f"613->{width}: {worst}"
+
+
+def test_odd_height_matches_resize2_f32(clip_grays):
+    """The vertical pass has the same boundary rule."""
+    cropped = clip_grays.std.Crop(bottom=7)  # 353 high
+    _, worst = _worst(cropped, 640, 176, [0])
+    assert worst <= 2.4e-7, f"353->176: {worst} of peak"
+
+
+def test_one_axis_omitted_matches_resize2(clip_gray16):
+    """Width-only and height-only requests exercise skip_vert in one pass."""
+    for kwargs, width, height in (
+        ({"width": 320}, 320, clip_gray16.height),
+        ({"height": 180}, clip_gray16.width, 180),
+    ):
+        out = cpu_node(vs.core.vsfeel.Box(clip_gray16, **kwargs))
+        ref = _ref(clip_gray16, width, height)
+        for p in (0,):
+            d = np.abs(_px(out, p) - _px(ref, p))
+            assert d.max() <= 1, f"{kwargs}: {d.max()} codes"
+
+
+def test_tiny_subsampled_target(clip_yuv420p16):
+    """A legal small target (chroma 2x2/1x1) must match resize2 on every plane."""
+    small = clip_yuv420p16.std.Crop(right=632, bottom=352)  # 8x8 luma
+    for width, height in ((4, 4), (2, 2)):
+        out = _box(small, width, height)
+        ref = _ref(small, width, height)
+        assert out.format.id == small.format.id
+        for p in range(3):
+            d = np.abs(_px(out, p) - _px(ref, p))
+            assert d.max() <= 1, f"{width}x{height} plane {p}: {d.max()} codes"
+
+
+_BAD_DIM_SCRIPT = """
+import sys
+import vapoursynth as vs
+
+core = vs.core
+fmt = getattr(vs, sys.argv[1])
+clip = core.std.BlankClip(width=8, height=8, format=fmt, length=2)
+try:
+    core.vsfeel.Box(clip, width=int(sys.argv[2]), height=int(sys.argv[3]))
+except vs.Error as exc:
+    print("rejected: %s" % exc)
+    raise SystemExit(0)
+print("accepted")
+raise SystemExit(1)
+"""
+
+
+def test_rejects_illegal_subsampled_output_dimensions():
+    """An output size the format cannot store must be a vs.Error, not a crash.
+
+    The output-stride probe frame is created at the requested size, and
+    VapourSynth treats an illegal subsampled size as a fatal error (printing
+    and terminating the process). This has to run in a subprocess because the
+    pre-fix behaviour aborts the interpreter.
+    """
+    cases = (
+        ("YUV420P16", 5, 4),
+        ("YUV420P16", 4, 3),
+        ("YUV422P16", 5, 4),
+        ("YUV420PH", 5, 4),
+    )
+    for fmt, width, height in cases:
+        proc = subprocess.run(
+            [sys.executable, "-c", _BAD_DIM_SCRIPT, fmt, str(width), str(height)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={**os.environ, "MANGOHUD": "0"},
+        )
+        assert proc.returncode == 0, (
+            f"{fmt} {width}x{height} did not return a normal error: "
+            f"exit {proc.returncode}\n{proc.stdout}\n{proc.stderr}"
+        )
+        assert "rejected:" in proc.stdout, proc.stdout
+        assert "multiple of" in proc.stdout, proc.stdout
+
+
+def test_box_parallel_load_matches_serial(clip_grays):
+    """The pipelined multi-frame request path must match sequential requests."""
+    par = eval_parallel(lambda c: _box(c, 320, 180), clip_grays, dtype=np.float32)
+    ref = cpu_node(_box(clip_grays, 320, 180))
+    for n in range(clip_grays.num_frames):
+        seq = plane_to_ndarray(ref.get_frame(n), 0, np.float32)
+        assert np.array_equal(par[n], seq), f"parallel/serial mismatch at frame {n}"

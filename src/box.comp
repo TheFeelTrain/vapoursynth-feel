@@ -18,10 +18,10 @@
  *
  * The tap window is not a formula here. zimg's filter for a box kernel is
  * *not* an area average: at a fractional ratio some output pixels average one
- * source pixel and their neighbours average two, and the phase of that pattern
- * is what makes it match. It is precomputed in double on the host into a
- * `(first tap, tap count)` table, so the shader's window is exact integer
- * arithmetic and no float32 tie can move a tap. See notes/BOX.md.
+ * source pixel and their neighbours average two or three, and the phase of that
+ * pattern is what makes it match. It is precomputed on the host by reproducing
+ * zimg's coordinate loop into a `(first tap, tap count)` table, so the shader's
+ * window is exact integer arithmetic. See notes/BOX.md.
  *
  * Buffers: src/dst are the core's own GPU frame planes (vnode: in/out), `mid`
  * is a transient per-frame scratch buffer, `taps` the constant table above.
