@@ -54,7 +54,7 @@ core.vsfeel.BM3D(clip clip[,
     float[] sigma=3.0,              # denoising strength per-plane; below FLT_EPSILON skips the plane
     int[]   block_step=8,           # per-plane block grid spacing, 1..8; smaller = fewer artifacts, slower
     int[]   bm_range=9,             # per-plane spatial search radius in pixels, 1..8192
-    int     radius=0,               # temporal search radius in frames, 0..16 (0 = spatial only)
+    int[]   radius=0,               # per-plane temporal search radius in frames, 0..16 (0 = spatial only)
     int[]   ps_num=2,               # motion-predicted candidates seeding each temporal search, 1..8
     int[]   ps_range=4,             # search radius around each predicted candidate, in pixels, 1..8192
     bool    chroma=False,           # True = one joint 4:4:4 entry, whose groups come from luma

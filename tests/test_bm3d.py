@@ -68,6 +68,19 @@ def _run(clip, radius=2, **kwargs):
     )
 
 
+def _run_with(clip, **kwargs):
+    """`_run` with a per-test override of any baseline parameter."""
+    params = dict(
+        sigma=SIGMA,
+        radius=2,
+        bm_range=BM_RANGE,
+        ps_range=PS_RANGE,
+        block_step=BLOCK_STEP,
+    )
+    params.update(kwargs)
+    return BM3D(clip, **params)
+
+
 def test_bm3d_legacy_bm3dv2_alias(clip_grays):
     """``BM3Dv2`` stays registered as the same filter as ``BM3D``.
 
@@ -462,6 +475,13 @@ def test_bm3d_rejects_radius17(clip_grays):
         _run(clip_grays, radius=17)
 
 
+@pytest.mark.parametrize("radius", [[-1], [0, 17], [0, -1, 2]])
+def test_bm3d_rejects_bad_per_plane_radius(clip_grays, radius):
+    """Every list entry is validated, even on a clip with fewer planes."""
+    with pytest.raises(vs.Error, match="radius"):
+        _run(clip_grays, radius=radius)
+
+
 @pytest.mark.parametrize("radius", [15, 16])
 def test_bm3d_accepts_reference_radius_cap(clip_grays, radius):
     """The radius cap must match the references' (vszipcl 16, bm3dvk 15).
@@ -712,6 +732,91 @@ def test_bm3d_per_plane_parameters_are_honoured():
                 assert d > 1e-4, f"plane 1 parameters were ignored at frame {n}"
             else:
                 assert d < 1e-5, f"plane {plane} changed with plane 1's parameters"
+
+
+def test_bm3d_per_plane_radius_matches_scalar_runs(clip_yuv420ps):
+    """Each plane must equal a single-plane run at that plane's radius.
+
+    The reference's radius is one value, so the oracle is the filter itself run
+    one plane at a time: a plane's estimate depends only on its own pixels and
+    window, which is what per-plane radius relies on. The atomic-ordering floor
+    (1e-5) is the only difference allowed between the two.
+    """
+    src = vs.core.std.Crop(clip_yuv420ps, left=64, top=48)
+    cases = [
+        ([SIGMA, SIGMA, SIGMA], [2, 0, 1]),
+        ([SIGMA, SIGMA, SIGMA], [4, 0, 2]),
+        ([SIGMA, SIGMA, SIGMA], [0, 3, 1]),
+        ([SIGMA, SIGMA], [1, 2, 0]),
+    ]
+    for sigma, radius in cases:
+        out = _run_with(src, sigma=sigma, radius=radius)
+        for p in range(3):
+            s = sigma[min(p, len(sigma) - 1)]
+            r = radius[min(p, len(radius) - 1)]
+            gray = vs.core.std.ShufflePlanes(src, p, vs.GRAY)
+            ref = _run_with(gray, sigma=s, radius=r)
+            for n in (0, 11, 23):
+                a = plane_to_ndarray(out.get_frame(n), p)
+                b = plane_to_ndarray(ref.get_frame(n), 0)
+                worst = float(np.abs(a - b).max())
+                assert worst < 1e-5, f"plane {p} (radius {r}) at frame {n}: {worst:.3e}"
+
+
+def test_bm3d_per_plane_radius_repeats_missing_entries(clip_yuv420ps):
+    """A short radius list repeats its last entry, like sigma."""
+    src = vs.core.std.Crop(clip_yuv420ps, left=64, top=48)
+    runs = [
+        _run(src, radius=2),
+        _run(src, radius=[2]),
+        _run(src, radius=[2, 2, 2]),
+    ]
+    for n in (0, 11, 23):
+        for p in range(3):
+            base = plane_to_ndarray(runs[0].get_frame(n), p)
+            for other in runs[1:]:
+                d = float(np.abs(base - plane_to_ndarray(other.get_frame(n), p)).max())
+                assert d < 1e-5, f"radius inheritance changed plane {p} at frame {n}"
+
+
+def test_bm3d_per_plane_radius_ignores_unprocessed_plane(clip_yuv420ps):
+    """An unprocessed plane's radius does not drive the shared window."""
+    src = vs.core.std.Crop(clip_yuv420ps, left=64, top=48)
+    narrow = _run_with(src, sigma=[SIGMA, 0.0, SIGMA], radius=[1, 0, 2])
+    wide = _run_with(src, sigma=[SIGMA, 0.0, SIGMA], radius=[1, 16, 2])
+    for n in (0, 11, 23):
+        for p in (0, 2):
+            d = float(
+                np.abs(
+                    plane_to_ndarray(narrow.get_frame(n), p)
+                    - plane_to_ndarray(wide.get_frame(n), p)
+                ).max()
+            )
+            assert d < 1e-5, f"unprocessed plane's radius changed plane {p}"
+
+
+def test_bm3d_joint_radius_uses_widest_plane(clip_grays):
+    """chroma=True shares one window, so it runs at the widest processed
+    plane's radius instead of narrowing any plane's request."""
+    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(CLIP_PATH), format=vs.YUV444PS)
+    kw = dict(
+        sigma=[SIGMA, SIGMA, SIGMA],
+        bm_range=BM_RANGE,
+        ps_range=PS_RANGE,
+        block_step=BLOCK_STEP,
+        chroma=1,
+    )
+    per_plane = _run_with(yuv444, radius=[0, 2, 1], **kw)
+    widest = _run_with(yuv444, radius=2, **kw)
+    for n in (0, 11, 23):
+        for p in range(3):
+            d = float(
+                np.abs(
+                    plane_to_ndarray(per_plane.get_frame(n), p)
+                    - plane_to_ndarray(widest.get_frame(n), p)
+                ).max()
+            )
+            assert d < 1e-5, f"joint plane {p} ignored the widest radius"
 
 
 def test_bm3d_chroma_requires_yuv444():
@@ -976,6 +1081,28 @@ def test_bm3d_frame_request_order_matches_serial():
             "block_step": BLOCK_STEP,
         },
         tol=1e-5,
+        timeout=300,
+    )
+
+
+def test_bm3d_per_plane_radius_frame_request_order_matches_serial():
+    """A spatial plane beside temporal ones must survive every request order.
+
+    The frame is normalized when the widest plane's window is in, so the
+    spatial plane's accumulator has to stay live for the whole window.
+    """
+    assert_temporal_order_consistent(
+        "BM3D",
+        {
+            "sigma": [SIGMA, SIGMA, SIGMA],
+            "radius": [2, 0, 1],
+            "bm_range": BM_RANGE,
+            "ps_range": PS_RANGE,
+            "block_step": BLOCK_STEP,
+        },
+        tol=1e-5,
+        nframes=12,
+        clip="yuv420ps",
         timeout=300,
     )
 

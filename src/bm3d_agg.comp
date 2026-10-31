@@ -38,6 +38,9 @@ layout(constant_id = 4) const int RES_CAP = 6;
 layout(constant_id = 5) const int NPLANES = 1;
 layout(constant_id = 6) const int TAG_BASE = 0; // unused
 layout(constant_id = 7) const int CHROMA = 0;
+// The host's temporal cursor is active, so the output frame lives in a ring
+// keyed by frame even when this plane's own radius is 0.
+layout(constant_id = 8) const int RINGED = 0;
 
 layout(std430, binding = 0) readonly buffer AccBuf { float acc[]; };
 layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
@@ -67,7 +70,7 @@ const int ACC_SLOT = NPLANES * 2 * PE;
 
 // The accumulator slot the output frame was scattered into.
 int slot_of(int frame) {
-    if (RADIUS == 0) {
+    if (RINGED == 0) {
         return pc.slot0;
     }
     const int rel = frame - pc.acc_base;

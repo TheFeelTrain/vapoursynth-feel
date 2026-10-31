@@ -44,8 +44,6 @@ default (resident GPU input, no output download):
 - bm3dvk2 is the close one now: its per-frame accumulators (the design this
   round copied) are what took it from 146 to ~880; its fixed eight-member groups
   still do less filtering work than the thresholded groups here.
-- The 16 bit and f16 rows are separate runs at the same settings, not second
-  filters.
 
 u16 and f16 input are the same filter, not two more: the ring, the estimate
 stacks and every kernel's arithmetic are float at every depth, a 2-byte clip's
@@ -77,11 +75,12 @@ half the bytes, which is where the visible speedup is (see Performance).
 - One entry per processed plane, or one over all three planes of a 4:4:4 clip
   under `chroma=True`. An entry owns a source ring `[slot][clip][plane][h][stride]`
   and an accumulator ring `[slot][plane][2][h][stride]` (numerator, denominator);
-  its planes share one geometry, so the plane stride is a spec constant.
-  NPLANES folds to 1 in the per-plane mode.
-- Per-plane `sigma`, `block_step`, `bm_range`, `ps_num`, `ps_range` follow the
-  references' inheritance rule; a joint entry takes plane 0's search parameters
-  and only the sigmas differ.
+  its planes share one geometry, so the plane stride is a spec constant
+  (NPLANES folds to 1 in the per-plane mode).
+- Per-plane `sigma`, `radius`, `block_step`, `bm_range`, `ps_num`, `ps_range`
+  inherit; each entry's kernel uses its own radius/window, the frame requests
+  the widest entry's and the shared rings are sized for it (joint mode uses the
+  widest processed plane's radius).
 - The reference block is group index 0, excluded from the current-frame scan by
   origin. A neighbouring frame is searched over the union of the clipped
   predictive windows around the surviving seeds, each origin once, by
@@ -158,9 +157,10 @@ half the bytes, which is where the visible speedup is (see Performance).
   frame are scattered, so the main ring keeps its state and the cursor stays
   monotonic. That is what keeps vspipe's out-of-order prefetch from paying a
   window restart per jump.
-- The accumulator ring is `2r+1` slots (capped by the clip length), keyed by
-  frame index; a slot is zeroed when it is first assigned and reused only after
-  its frame retired. Radius 0 keeps its private per-frame slots.
+- The accumulator ring is `2*max_radius+1` slots (capped by the clip length),
+  keyed by frame index; a slot is zeroed when first assigned and reused only
+  after its frame retired. Every entry uses that floor, so a spatial plane
+  stays live until the widest window completes; spatial mode keeps private slots.
 - Estimation accumulates with hardware buffer float atomics wherever the device
   reports `shaderBufferFloat32AtomicAdd` (`VK_EXT_shader_atomic_float`; the plain
   load/store/exchange bit is not enough), else the reference's `atom_add_f` CAS
@@ -278,6 +278,12 @@ half the bytes, which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-10-31 — `radius` is per plane, like `sigma`.** Each entry's kernel
+  already carried its own `RADIUS`; the host now drives it from the plane's
+  value, requests the widest entry's window and sizes the shared rings for it.
+  A ringed-mode constant keeps a radius-0 entry in the frame-keyed rings when
+  another plane is temporal; a joint entry uses the widest processed plane's.
+  No kernel change at the default radius.
 - **2026-10-19 — batched and shared-buffer candidate selection; removed.** Two
   selection passes were tried against the per-candidate insert. The register
   batch (eight candidates per lane, 19-comparator odd-even sort, 20-comparator

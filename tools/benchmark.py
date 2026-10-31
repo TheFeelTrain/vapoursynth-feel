@@ -616,28 +616,53 @@ class FilterSpec:
 
 def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
     common = (
-        f"sigma={ns.bm3d_sigma}, radius={ns.bm3d_radius}, "
+        f"sigma={ns.bm3d_sigma}, "
         f"bm_range={ns.bm3d_bm_range}, ps_range={ns.bm3d_ps_range}, "
         f"block_step={ns.bm3d_block_step}"
     )
+    # vsfeel's radius is per plane; the references take one value for all
+    # planes, so only a uniform list has a reference arm to compare against.
+    try:
+        radii = [int(v) for v in str(ns.bm3d_radius).split(",") if v.strip()]
+    except ValueError:
+        sys.exit(f"--bm3d-args radius=[{ns.bm3d_radius}]: expected integers, e.g. [1, 0, 2]")
+    if not radii:
+        sys.exit("--bm3d-args radius=[]: expected one value or [y,u,v]")
+    uniform = len(set(radii)) == 1
+    requested = getattr(ns, "plugins", None) or []
+    if not uniform and (
+        any(p in requested for p in ("vszipcl", "bm3dvk", "bm3dvk2"))
+        or (not requested and not _ab_active(ns))
+    ):
+        sys.exit(
+            f"--bm3d-args radius=[{ns.bm3d_radius}]: the references take one "
+            "radius for all planes, so a per-plane radius has a vsfeel arm "
+            "only; run it as '--filter bm3d vsfeel' (or pass a uniform list)"
+        )
     # th_mse only exists in vsfeel, and a value that accepts every candidate
     # makes its groups as large as the references' fixed eight: the only way to
     # compare the two matchers on the same amount of filtering work.
-    feel = common
+    feel = f"{common}, radius=[{ns.bm3d_radius}]"
     if ns.bm3d_th_mse is not None:
-        feel = f"{common}, th_mse={ns.bm3d_th_mse}"
-    return {
-        "vsfeel": f"core.vsfeel.BM3D({clip}, {feel})",
-        "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {common})",
-        "bm3dvk": f"core.bm3dvk.BM3Dv2({clip}, {common})",
-        # bm3dvk2 derives a color matrix from the resolution when none is given
-        # while vsfeel hardcodes the BT.709 luma-row norm its sigma and th_mse
-        # are scaled by, so an SD --clip would silently denoise at a different
-        # strength. Pinning BT.709 keeps the two arms on equal work (its other
-        # defaults, 8x8 blocks, 8-wide groups, bm/ps step 1, hard_thr 2.7 and
-        # th_mse = sigma[0]*80 + 400, already equal vsfeel's).
-        "bm3dvk2": f"core.bm3dvk2.BM3D({clip}, {common}, matrix=1)",
-    }
+        feel = f"{feel}, th_mse={ns.bm3d_th_mse}"
+    calls = {"vsfeel": f"core.vsfeel.BM3D({clip}, {feel})"}
+    if uniform:
+        same = f"{common}, radius={radii[0]}"
+        calls.update(
+            {
+                "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {same})",
+                "bm3dvk": f"core.bm3dvk.BM3Dv2({clip}, {same})",
+                # bm3dvk2 derives a color matrix from the resolution when none
+                # is given while vsfeel hardcodes the BT.709 luma-row norm its
+                # sigma and th_mse are scaled by, so an SD --clip would
+                # silently denoise at a different strength. Pinning BT.709
+                # keeps the two arms on equal work (its other defaults, 8x8
+                # blocks, 8-wide groups, bm/ps step 1, hard_thr 2.7 and
+                # th_mse = sigma[0]*80 + 400, already equal vsfeel's).
+                "bm3dvk2": f"core.bm3dvk2.BM3D({clip}, {same}, matrix=1)",
+            }
+        )
+    return calls
 
 
 def _bilateral_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
@@ -904,7 +929,15 @@ FILTERS: dict[str, FilterSpec] = {
         title="BM3D",
         args=[
             Arg("sigma", "bm3d_sigma", float, 0.7),
-            Arg("radius", "bm3d_radius", int, 2),
+            Arg(
+                "radius",
+                "bm3d_radius",
+                str,
+                "2",
+                "per-plane temporal radius as [y,u,v] in vsfeel; a missing "
+                "entry repeats the previous and 0 searches spatially only",
+                list_arg=True,
+            ),
             Arg("bm_range", "bm3d_bm_range", int, 9),
             Arg("ps_range", "bm3d_ps_range", int, 4),
             Arg("block_step", "bm3d_block_step", int, 8),

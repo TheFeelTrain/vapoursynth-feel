@@ -220,6 +220,37 @@ def test_benchmark_wnnm_sigma_takes_a_list(monkeypatch):
     assert "vszip" not in per_plane
 
 
+def test_benchmark_bm3d_radius_takes_a_list(monkeypatch):
+    """BM3D's radius is per plane in vsfeel; the references take one value."""
+    bench = _load_module("benchmark", BENCHMARK)
+    spec = bench.FILTERS["bm3d"]
+
+    def call(argv):
+        monkeypatch.setattr(sys, "argv", ["benchmark.py", "--filter", "bm3d", *argv])
+        ns = bench.parse_args()
+        bench._apply_filter_args(ns, "bm3d", spec)
+        return spec.build(ns, spec.input, spec), bench.args_desc(spec, ns)
+
+    default, default_desc = call([])
+    assert "radius=[2]" in default["vsfeel"]
+    assert "radius=[2]" in default_desc
+    assert "radius=2" in default["vszipcl"]
+    # A non-uniform list has no reference arm (they take one radius for all
+    # planes), so the benchmark requires an explicit vsfeel-only run.
+    with pytest.raises(SystemExit):
+        call(["--bm3d-args", "radius=[1, 0, 2]"])
+    for bad in ("radius=two", "radius=[]"):
+        with pytest.raises(SystemExit):
+            call(["--bm3d-args", bad, "vsfeel"])
+    per_plane, _ = call(["--bm3d-args", "radius=[1, 0, 2]", "vsfeel"])
+    assert "radius=[1, 0, 2]" in per_plane["vsfeel"]
+    assert set(per_plane) == {"vsfeel"}
+    # A uniform list still has every reference arm.
+    uniform, _ = call(["--bm3d-args", "radius=[2, 2, 2]"])
+    assert "radius=[2, 2, 2]" in uniform["vsfeel"]
+    assert "radius=2" in uniform["vszipcl"]
+
+
 def test_benchmark_download_selects_vspipe_output(monkeypatch):
     """The default leaves the output resident; ``--download`` times the transfer.
 
@@ -304,7 +335,7 @@ def test_benchmark_args_string_overrides_defaults(monkeypatch):
     ns = bench.parse_args()
     bench._apply_filter_args(ns, "bm3d", bench.FILTERS["bm3d"])
     assert ns.bm3d_sigma == 0.7
-    assert ns.bm3d_radius == 2
+    assert ns.bm3d_radius == "2"
     assert ns.bm3d_th_mse is None
     # Untouched params keep their defaults.
     assert ns.bm3d_bm_range == 9
@@ -345,7 +376,7 @@ def test_benchmark_args_string_rejects_misuse(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["benchmark.py"])
     ns = bench.parse_args()
     spec = bench.FILTERS["bm3d"]
-    for bad in ("sig ma=1", "sigma", "radius=two", "radius=", "sigma=1, sigma"):
+    for bad in ("sig ma=1", "sigma", "bm_range=two", "bm_range=", "sigma=1, sigma"):
         with pytest.raises(SystemExit):
             bench._parse_filter_args(ns, "bm3d", spec, bad)
     with pytest.raises(SystemExit):

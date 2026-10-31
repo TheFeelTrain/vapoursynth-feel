@@ -50,6 +50,10 @@ struct Bm3dPlane {
     int height {};
     int stride {};
     VkDeviceSize pe {}; // plane extent in floats (h * stride)
+    // Per-plane temporal radius, like sigma: a missing entry repeats the
+    // previous one and the first defaults to 0 (spatial only).
+    int radius {};
+    int tw { 1 }; // 2 * radius + 1
     // Scaled sigma, or exactly 0 when the plane is not processed (the
     // reference zeroes it so its kernel's epsilon test agrees with the
     // unscaled decision the host made).
@@ -113,6 +117,10 @@ struct Bm3dGroup {
     int n_planes {};
     std::array<int, 3> planes {}; // absolute plane indices, in packing order
     VkDeviceSize pe {};           // per-plane extent in floats
+    // The entry's temporal radius. Default mode is one plane per entry, so
+    // this is that plane's radius; a joint entry shares one window and runs at
+    // the widest of its processed planes.
+    int radius {};
     VkPipeline bm3d_pipeline {};
     // The split's two halves (VSFEEL_BM3D_SPLIT_KERNEL); unused when fused.
     VkPipeline bm3d_match_pipeline {};
@@ -340,8 +348,8 @@ struct BM3DData {
     VSNode * ref_node {}; // optional basic-estimate clip (final/Wiener pass)
     const VSVideoInfo * vi {};
 
-    int radius {};
-    int tw {};     // 2 * radius + 1
+    int max_radius {};
+    int max_tw {}; // 2 * max_radius + 1
     bool final {}; // true when a "ref" clip is given
     float extractor {};
     // Matching threshold in the shader's SSD domain: the user's 8-bit MSE
@@ -675,7 +683,8 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
     };
     // The block below is the shader's spec-constant ids in order: 0..13 are the
     // original single-plane block, 14..16 the joint-entry additions, 17 the
-    // matching threshold, 18 the match trace.
+    // matching threshold, 18 the match trace, and 22 selects the ringed
+    // temporal accumulator/source addressing.
     struct Spec {
         int32_t width, height, stride;
         float sigma_y;
@@ -689,13 +698,14 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
         int32_t workgroup;
         int32_t groups;
         int32_t res_cap;
+        int32_t ringed;
     } spec { first.width,
              first.height,
              first.stride,
              group_sigma(0),
              first.block_step,
              first.bm_range,
-             d.radius,
+             group.radius,
              first.ps_num,
              first.ps_range,
              d.extractor,
@@ -710,8 +720,9 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
              d.trace_frame >= 0 ? 1 : 0,
              static_cast<int32_t>(d.workgroup),
              static_cast<int32_t>(d.groups_per_wg),
-             static_cast<int32_t>(group.res_cap) };
-    const std::array<VkSpecializationMapEntry, 22> entries { {
+             static_cast<int32_t>(group.res_cap),
+             d.max_radius > 0 ? 1 : 0 };
+    const std::array<VkSpecializationMapEntry, 23> entries { {
         { 0, offsetof(Spec, width), sizeof(int32_t) },
         { 1, offsetof(Spec, height), sizeof(int32_t) },
         { 2, offsetof(Spec, stride), sizeof(int32_t) },
@@ -734,6 +745,7 @@ create_bm3d_pipeline(const GPUDevice & gpu, const BM3DData & d,
         { 19, offsetof(Spec, workgroup), sizeof(int32_t) },
         { 20, offsetof(Spec, groups), sizeof(int32_t) },
         { 21, offsetof(Spec, res_cap), sizeof(int32_t) },
+        { 22, offsetof(Spec, ringed), sizeof(int32_t) },
     } };
     // The subgroup width and the launch size are chosen once in BM3DCreate so
     // the grid, the split's handoff and every pipeline agree on them.
@@ -763,11 +775,11 @@ create_agg_pipeline(const GPUDevice & gpu, const Bm3dPlane & plane,
 
     struct Spec {
         int32_t height, stride, tw, radius, res_cap, nplanes, tag_base, chroma;
-    } spec {
-        plane.height,  plane.stride,   d.tw,           d.radius,
-        group.res_cap, group.n_planes, group.tag_base, plane.chroma ? 1 : 0
-    };
-    const std::array<VkSpecializationMapEntry, 8> entries { {
+        int32_t ringed;
+    } spec { plane.height,   plane.stride,         plane.tw,
+             plane.radius,   group.res_cap,        group.n_planes,
+             group.tag_base, plane.chroma ? 1 : 0, d.max_radius > 0 ? 1 : 0 };
+    const std::array<VkSpecializationMapEntry, 9> entries { {
         { 0, 0, sizeof(int32_t) },
         { 1, 4, sizeof(int32_t) },
         { 2, 8, sizeof(int32_t) },
@@ -776,6 +788,7 @@ create_agg_pipeline(const GPUDevice & gpu, const Bm3dPlane & plane,
         { 5, 20, sizeof(int32_t) },
         { 6, 24, sizeof(int32_t) },
         { 7, 28, sizeof(int32_t) },
+        { 8, 32, sizeof(int32_t) },
     } };
     // Normalize is a 16x16 tile kernel: it needs a shared tile of the block
     // weights around the output tile for the separable box sum.
@@ -830,7 +843,7 @@ static void give_r0_slot(BM3DData * d, Bm3dGroup & g, int slot) {
 // whose writer has not published yet (a cache hit does not check holders). One
 // atomic step keeps the wait graph on the acquisition order, which is acyclic.
 static void acquire_cache(BM3DData * d, Bm3dFrame & fr, int n) {
-    const int r = d->radius;
+    const int r = d->max_radius;
     const int nf = d->nframes;
     for (int gi = 0; gi < d->n_groups; ++gi) {
         auto & gf = fr.g[gi];
@@ -893,7 +906,7 @@ static void acquire_cache(BM3DData * d, Bm3dFrame & fr, int n) {
             // Phase 1: check-only, with no side effects. The failed passes must
             // not leave half-applied reservations behind, or a retry would treat
             // the abandoned slots as cached and never recompute them.
-            for (int i = 0; i < d->tw; ++i) {
+            for (int i = 0; i < d->max_tw; ++i) {
                 // Window positions outside the clip are not estimate centres at
                 // all: an output frame near the start has fewer than tw real
                 // centres, and the missing ones must not alias the endpoint.
@@ -937,7 +950,7 @@ static void acquire_cache(BM3DData * d, Bm3dFrame & fr, int n) {
         for (int gi = 0; gi < d->n_groups; ++gi) {
             auto & g = d->groups[gi];
             auto & gf = fr.g[gi];
-            for (int i = 0; i < d->tw; ++i) {
+            for (int i = 0; i < d->max_tw; ++i) {
                 if (!gf.win_valid[i]) {
                     continue;
                 }
@@ -972,14 +985,14 @@ static void acquire_cache(BM3DData * d, Bm3dFrame & fr, int n) {
 // record and submit: submission order on the one compute queue plus the
 // reader's leading barrier is the whole cross-frame handoff.
 static void publish_est_submitted(BM3DData * d, const Bm3dFrame & fr) {
-    if (d->radius == 0) {
+    if (d->max_radius == 0) {
         return; // radius 0 slots are private to one frame
     }
     std::lock_guard lock(d->cache_lock);
     for (int gi = 0; gi < d->n_groups; ++gi) {
         auto & g = d->groups[gi];
         const auto & gf = fr.g[gi];
-        for (int i = 0; i < d->tw; ++i) {
+        for (int i = 0; i < d->max_tw; ++i) {
             if (gf.win_valid[i] && gf.win_recompute[i]) {
                 g.res_ready[gf.win_slots[i]] = 1;
             }
@@ -1004,7 +1017,7 @@ static void publish_est_submitted(BM3DData * d, const Bm3dFrame & fr) {
 // honest again.
 static void fail_pending_frame(BM3DData * d, const Bm3dFrame & fr,
                                bool ring_copied) {
-    if (d->radius == 0) {
+    if (d->max_radius == 0) {
         return; // radius 0 slots are private to one frame
     }
     std::lock_guard lock(d->cache_lock);
@@ -1012,7 +1025,7 @@ static void fail_pending_frame(BM3DData * d, const Bm3dFrame & fr,
     for (int gi = 0; gi < d->n_groups; ++gi) {
         auto & g = d->groups[gi];
         const auto & gf = fr.g[gi];
-        for (int i = 0; i < d->tw; ++i) {
+        for (int i = 0; i < d->max_tw; ++i) {
             if (gf.win_valid[i] && gf.win_recompute[i]) {
                 g.res_ready[gf.win_slots[i]] = 1;
             }
@@ -1041,7 +1054,7 @@ static bool frame_failed(BM3DData * d) {
 // waited out on the device, which lifts the whole handoff off the barrier's
 // scopes (diagnostic: the witness cannot see a ring copy that lands late).
 static void wait_src_submitted(BM3DData * d, const Bm3dFrame & fr) {
-    if (d->radius == 0) {
+    if (d->max_radius == 0) {
         return;
     }
     std::vector<uint64_t> waits;
@@ -1091,7 +1104,7 @@ static void wait_src_submitted(BM3DData * d, const Bm3dFrame & fr) {
 
 // Same for the estimate stacks the aggregation reads.
 static void wait_res_submitted(BM3DData * d, const Bm3dFrame & fr) {
-    if (d->radius == 0) {
+    if (d->max_radius == 0) {
         return;
     }
     std::unique_lock lock(d->cache_lock);
@@ -1102,7 +1115,7 @@ static void wait_res_submitted(BM3DData * d, const Bm3dFrame & fr) {
         for (int gi = 0; gi < d->n_groups; ++gi) {
             const auto & g = d->groups[gi];
             const auto & gf = fr.g[gi];
-            for (int i = 0; i < d->tw; ++i) {
+            for (int i = 0; i < d->max_tw; ++i) {
                 if (gf.win_valid[i] && !gf.win_recompute[i] &&
                     !g.res_ready[gf.win_slots[i]]) {
                     return false;
@@ -1120,12 +1133,12 @@ static void release_cache(BM3DData * d, const Bm3dFrame & fr) {
     for (int gi = 0; gi < d->n_groups; ++gi) {
         auto & g = d->groups[gi];
         const auto & gf = fr.g[gi];
-        if (d->radius == 0) {
+        if (d->max_radius == 0) {
             give_r0_slot(d, g, fr.slot0[gi]);
             continue;
         }
         std::lock_guard lock(d->cache_lock);
-        for (int i = 0; i < d->tw; ++i) {
+        for (int i = 0; i < d->max_tw; ++i) {
             if (!gf.win_valid[i]) {
                 continue;
             }
@@ -1145,11 +1158,11 @@ static void release_cache(BM3DData * d, const Bm3dFrame & fr) {
 // deduplicated here; positions outside the clip compute nothing at all.
 static void collect_est_positions(BM3DData * d, Bm3dGroupFrame & gf) {
     gf.n_pos = 0;
-    if (d->radius == 0) {
+    if (d->max_radius == 0) {
         gf.est_pos[gf.n_pos++] = 0;
         return;
     }
-    for (int i = 0; i < d->tw; ++i) {
+    for (int i = 0; i < d->max_tw; ++i) {
         if (gf.win_valid[i] && gf.win_recompute[i]) {
             gf.est_pos[gf.n_pos++] = i;
         }
@@ -1204,12 +1217,12 @@ static void dump_match_trace(const BM3DData * d, int trace_x, int trace_y) {
         return;
     }
     for (int direction = -1; direction <= 1; direction += 2) {
-        const int nt = std::min(d->radius, direction < 0 ? d->trace_frame
-                                                         : d->nframes - 1 -
-                                                               d->trace_frame);
+        const int nt = std::min(
+            d->max_radius,
+            direction < 0 ? d->trace_frame : d->nframes - 1 - d->trace_frame);
         for (int step = 1; step <= nt; ++step) {
             const int base =
-                38 + ((direction < 0 ? 0 : d->radius) + step - 1) * 2;
+                38 + ((direction < 0 ? 0 : d->max_radius) + step - 1) * 2;
             fprintf(stderr,
                     "[bm3d-trace] %s step=%d frame=%d retained=%u seeds=%u\n",
                     direction < 0 ? "bwd" : "fwd", step,
@@ -1261,7 +1274,7 @@ static void bm3d_compute_barrier(const GPUDevice & gpu, VkCommandBuffer cmd) {
 static void record_est_position(BM3DData * d, const Bm3dFrame & fr,
                                 VkCommandBuffer cmd, int n, int gi, int c,
                                 VkBuffer dst_plane) {
-    const int r = d->radius;
+    const int r = d->max_radius;
     const int nf = d->nframes;
     const auto & g = d->groups[gi];
     const auto & gf = fr.g[gi];
@@ -1325,7 +1338,7 @@ static void record_est_position(BM3DData * d, const Bm3dFrame & fr,
             nf,
             slot0_push,
             static_cast<int32_t>(static_cast<VkDeviceSize>(g.tag_base + slot) *
-                                 d->tw),
+                                 d->max_tw),
             trace_xy,
             -1 // focus: radius 0 scatters every member
         };
@@ -1528,7 +1541,7 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame * fr,
                             const std::array<VkBuffer, 3> & dst_planes,
                             const std::array<Bm3dRange, 3> & out_range,
                             bool gputrace) {
-    const int r = d->radius;
+    const int r = d->max_radius;
     bool first_dispatch = true;
     int remaining = 0;
     for (int gi = 0; gi < d->n_groups; ++gi) {
@@ -1644,7 +1657,7 @@ static void record_center_cmd(BM3DData * d, VkCommandBuffer cmd, int m,
                               int acc_base, int focus, int & converted,
                               bool isolated,
                               std::vector<const VSFrame *> & holds) {
-    const int r = d->radius;
+    const int r = d->max_radius;
     const int last = d->nframes - 1;
     const int first = std::max(0, m - r);
     const int lastFrame = std::min(last, m + r);
@@ -1846,7 +1859,7 @@ static VSFrame * normalize_cmd(BM3DData * d, VkCommandBuffer cmd, int f,
 // frame far ahead and then returns to the frames in between.
 static VSFrame * record_isolated(BM3DData * d, int n, VSFrameContext * frameCtx,
                                  VSCore * core, const VSAPI * vsapi) {
-    const int r = d->radius;
+    const int r = d->max_radius;
     const int last = d->nframes - 1;
     const int first = std::max(0, n - r);
     const int top = std::min(last, n + r);
@@ -1941,7 +1954,7 @@ static const VSFrame * temporalFrame(BM3DData * d, int n,
     if (n < 0 || n >= d->nframes) {
         return nullptr;
     }
-    const int r = d->radius;
+    const int r = d->max_radius;
     int req_lo = std::max(0, n - 2 * r);
     if (const auto it = d->request_lo.find(n); it != d->request_lo.end()) {
         req_lo = it->second;
@@ -2133,7 +2146,7 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
     BM3DData * d = static_cast<BM3DData *>(instanceData);
 
     if (activationReason == arInitial) {
-        const int r = d->radius;
+        const int r = d->max_radius;
         int lo = std::clamp(n - 2 * r, 0, d->nframes - 1);
         const int hi = std::clamp(n + 2 * r, 0, d->nframes - 1);
         if (r > 0) {
@@ -2172,7 +2185,7 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
             }
         }
     } else if (activationReason == arAllFramesReady) {
-        if (d->radius > 0) {
+        if (d->max_radius > 0) {
             return temporalFrame(d, n, frameCtx, core, vsapi);
         }
         // The centre source frame is the property donor and, for a plane below
@@ -2375,13 +2388,13 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
                                 n, gi, gf.src_slot[k], gf.src_writer[k]);
                     }
                 }
-                for (int i = 0; i < d->tw; ++i) {
+                for (int i = 0; i < d->max_tw; ++i) {
                     if (gf.win_valid[i] && !gf.win_recompute[i]) {
                         fprintf(
                             stderr,
                             "[t] n=%d entry %d reads res slot %d for centre "
                             "%d (writer w=%d)\n",
-                            n, gi, gf.win_slots[i], n - d->radius + i,
+                            n, gi, gf.win_slots[i], n - d->max_radius + i,
                             gf.win_writer[i]);
                     }
                 }
@@ -2797,16 +2810,23 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         }
     }
 
-    int64_t radius_raw = vsapi->mapGetInt(in, "radius", 0, &error);
-    d->radius = vsh::int64ToIntS(radius_raw);
-    if (error) {
-        d->radius = 0;
+    // Per-plane temporal radius, exactly like sigma: a missing entry repeats
+    // the previous one and the first defaults to 0 (spatial only). The widest
+    // entry's window drives the frame requests and the shared cache sizing;
+    // each entry's own radius drives its kernel and scatter range.
+    std::array<int, 3> radius {};
+    for (int i = 0; i < std::ssize(radius); ++i) {
+        radius[i] = vsh::int64ToIntS(vsapi->mapGetInt(in, "radius", i, &error));
+        if (error) {
+            radius[i] = (i == 0) ? 0 : radius[i - 1];
+        } else if (radius[i] < 0 || radius[i] > MAX_RADIUS) {
+            return set_error("\"radius\" must be in range [0, "s +
+                             std::to_string(MAX_RADIUS) + "]");
+        }
     }
-    if (d->radius < 0 || d->radius > MAX_RADIUS) {
-        return set_error("\"radius\" must be in range [0, "s +
-                         std::to_string(MAX_RADIUS) + "]");
+    for (int i = 0; i < d->num_planes; ++i) {
+        d->planes[i].radius = radius[i];
     }
-    d->tw = 2 * d->radius + 1;
 
     std::array<int, 3> ps_num {};
     for (int i = 0; i < std::ssize(ps_num); ++i) {
@@ -2872,23 +2892,6 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // beyond that (e.g. seeking) blocks in the acquire instead of corrupting.
     int inflight =
         std::clamp(env_int("VSFEEL_BM3D_INFLIGHT", kInflightFrames), 1, 8);
-    // The temporal cursor copies each frame into the ring once as the centre
-    // advances, so the source ring only has to hold one search window plus the
-    // frame the next centre is about to add. Radius 0 keeps a private slot per
-    // in-flight frame.
-    const auto src_ring_of = [r = d->radius](int n) {
-        return (r == 0) ? n : 2 * r + 3;
-    };
-    // Accumulators are keyed by output frame: the ring holds the 2r+1 frames
-    // whose contributions are in flight. Radius 0's slots are private to one
-    // frame. The ring is exactly one window wide: a slot is reassigned only
-    // after the frame it held has been normalized by the previous request.
-    const auto res_cap_of = [r = d->radius, tw = d->tw,
-                             nf = d->vi->numFrames](int n) {
-        return (r == 0) ? n : std::min(tw, nf);
-    };
-    int src_ring = src_ring_of(inflight);
-    int res_cap = res_cap_of(inflight);
 
     const int extractor_exp =
         vsh::int64ToIntS(vsapi->mapGetInt(in, "extractor_exp", 0, &error));
@@ -3038,6 +3041,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         p.height = (plane == 0) ? d->vi->height : d->vi->height >> subH;
         p.stride = plane_stride_elems[plane];
         p.pe = static_cast<VkDeviceSize>(p.stride) * p.height;
+        p.tw = 2 * p.radius + 1;
         p.chroma = yuv && plane > 0 && plane < 3;
         if (p.stride < p.width) {
             return set_error("the core reported an unexpected plane stride");
@@ -3075,6 +3079,13 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             g.planes[i] = i;
         }
         g.pe = d->planes[0].pe;
+        // A joint entry shares one window, so run it at the widest processed
+        // plane rather than narrowing any plane's requested radius.
+        for (int i = 0; i < d->num_planes; ++i) {
+            if (d->planes[i].process) {
+                g.radius = std::max(g.radius, d->planes[i].radius);
+            }
+        }
     } else {
         for (int plane = 0; plane < d->num_planes; ++plane) {
             if (!d->planes[plane].process) {
@@ -3084,8 +3095,36 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             g.n_planes = 1;
             g.planes[0] = plane;
             g.pe = d->planes[plane].pe;
+            g.radius = d->planes[plane].radius;
         }
     }
+
+    // One window drives the frame requests, the shared floor for every
+    // entry's accumulator ring and the union source copy. An entry with a
+    // smaller radius still uses that floor so its output frame survives until
+    // every plane is ready to normalize; its own kernel only touches its own
+    // window.
+    for (int gi = 0; gi < d->n_groups; ++gi) {
+        d->max_radius = std::max(d->max_radius, d->groups[gi].radius);
+    }
+    d->max_tw = 2 * d->max_radius + 1;
+    // The temporal cursor copies each frame into the ring once as the centre
+    // advances, so the source ring only has to hold one search window plus the
+    // frame the next centre is about to add. Radius 0 keeps a private slot per
+    // in-flight frame.
+    const auto src_ring_of = [r = d->max_radius](int n) {
+        return (r == 0) ? n : 2 * r + 3;
+    };
+    // Accumulators are keyed by output frame: the ring holds the 2r+1 frames
+    // whose contributions are in flight. Radius 0's slots are private to one
+    // frame. The ring is exactly one window wide: a slot is reassigned only
+    // after the frame it held has been normalized by the previous request.
+    const auto res_cap_of = [r = d->max_radius, tw = d->max_tw,
+                             nf = d->vi->numFrames](int n) {
+        return (r == 0) ? n : std::min(tw, nf);
+    };
+    int src_ring = src_ring_of(inflight);
+    int res_cap = res_cap_of(inflight);
 
     // The ring copy's 1D grid, folded into X and Y: a 4096x4096 plane alone
     // needs 65536 workgroups, one past the X limit Vulkan only guarantees.
@@ -3151,7 +3190,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
                 "frame is too large: the estimate cache needs %llu floats per "
                 "entry (radius %d), which overflows the 32-bit kernel "
                 "addressing; reduce radius",
-                static_cast<unsigned long long>(g.res_size), d->radius);
+                static_cast<unsigned long long>(g.res_size), d->max_radius);
             return set_error(msg);
         }
         if (g.src_size > static_cast<VkDeviceSize>(INT32_MAX)) {
@@ -3160,7 +3199,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
                      "frame is too large: the source ring needs %llu samples "
                      "(radius %d), which overflows the 32-bit kernel "
                      "addressing; reduce radius",
-                     static_cast<unsigned long long>(g.src_size), d->radius);
+                     static_cast<unsigned long long>(g.src_size),
+                     d->max_radius);
             return set_error(msg);
         }
     }
@@ -3195,7 +3235,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     }
 
     // shared buffers
-    d->tags_size = static_cast<VkDeviceSize>(d->n_groups) * res_cap * d->tw;
+    d->tags_size = static_cast<VkDeviceSize>(d->n_groups) * res_cap * d->max_tw;
     {
         {
             std::string err =
@@ -3330,10 +3370,10 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
                          err.c_str(),
                          static_cast<double>(g.res_size) * 4.0 /
                              (1024.0 * 1024.0),
-                         d->radius);
+                         d->max_radius);
                 return set_error(msg);
             }
-            if (d->radius > 0) {
+            if (d->max_radius > 0) {
                 err = gpu_make_buffer(*d->gpu, core, g.src_size * 4,
                                       g.scratch_src,
                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
@@ -3537,7 +3577,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             "stride=%d bits=%d)\n",
             src_bytes / mib, res_bytes / mib,
             100.0 * static_cast<double>(res_total) / (total > 0 ? total : 1.0),
-            total / mib, d->num_planes, d->n_groups, d->radius, inflight,
+            total / mib, d->num_planes, d->n_groups, d->max_radius, inflight,
             res_cap, src_ring, d->planes[0].stride, d->bits);
     }
 
@@ -3564,7 +3604,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // A temporal filter requests frames outside n, which the strict-spatial
     // policy does not permit; only radius 0 is purely spatial.
     const VSRequestPattern policy =
-        data->radius > 0 ? rpGeneral : rpStrictSpatial;
+        data->max_radius > 0 ? rpGeneral : rpStrictSpatial;
     VSFilterDependency deps[2] = { { data->node, policy },
                                    { data->ref_node, policy } };
 
@@ -3576,7 +3616,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // is working on. Radius 0 has no cross-frame state and stays parallel.
     VSNode * result = vsapi->createVideoFilterEx2(
         "BM3D", data->vi, BM3DGetFrame, BM3DFree,
-        data->radius > 0 ? fmUnordered : fmParallel, ffGPUOutput, deps,
+        data->max_radius > 0 ? fmUnordered : fmParallel, ffGPUOutput, deps,
         data->ref_node ? 2 : 1, data, core);
     if (result == nullptr) {
         // The core returns nullptr without running the free callback when the
@@ -3606,7 +3646,7 @@ void vsfeel_register_bm3d(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
                                             "sigma:float[]:opt;"
                                             "block_step:int[]:opt;"
                                             "bm_range:int[]:opt;"
-                                            "radius:int:opt;"
+                                            "radius:int[]:opt;"
                                             "ps_num:int[]:opt;"
                                             "ps_range:int[]:opt;"
                                             "th_mse:float:opt;"

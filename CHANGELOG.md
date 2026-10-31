@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- BM3D's `radius` argument can be set per plane like `sigma`
+
 ## [v1.3.2] - 2026-10-31
 
 ### Changed

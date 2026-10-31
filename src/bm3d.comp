@@ -74,6 +74,11 @@ layout(constant_id = 18) const int TRACE = 0;
 layout(constant_id = 20) const int GROUPS = 8;
 // Accumulator slots of the per-frame ring (radius 0: the private slot count).
 layout(constant_id = 21) const int RES_CAP = 6;
+// The host's temporal cursor is active: source and accumulator addressing is
+// ring-keyed by frame even for an entry whose own radius is 0 (a spatial plane
+// beside a temporal one). Without it, radius 0 keeps its private per-frame
+// slots, which is the purely spatial mode.
+layout(constant_id = 22) const int RINGED = 0;
 
 const int KRADIUS = RADIUS;
 const int TEMPORAL_STRIDE = HEIGHT * STRIDE;
@@ -197,10 +202,11 @@ int src_frame(int z) {
     return pc.nmod - KRADIUS + z;
 }
 
-// ring slot holding the frame at window position z (at radius 0 the stream's
-// own slot, keyed by stream not frame index so out-of-order frames never clash)
+// ring slot holding the frame at window position z (without RINGED, the
+// stream's own slot, keyed by stream not frame index so out-of-order frames
+// never clash)
 int slot_base(int z) {
-    if (RADIUS == 0) {
+    if (RINGED == 0) {
         return pc.src_slot;
     }
     const int rel = src_frame(z) - pc.tag_base;
@@ -220,10 +226,10 @@ int src_input(int z, int plane) {
     return src_search(z, plane) + (FINAL != 0 ? CLIP_STRIDE : 0);
 }
 
-// Accumulator slot of a target frame: a ring keyed by frame index at radius>0,
-// the frame's private slot at radius 0.
+// Accumulator slot of a target frame: a ring keyed by frame index under the
+// temporal cursor, the frame's private slot without it.
 int acc_slot(int frame) {
-    if (RADIUS == 0) {
+    if (RINGED == 0) {
         return pc.src_slot;
     }
     const int rel = frame - pc.res_off;
