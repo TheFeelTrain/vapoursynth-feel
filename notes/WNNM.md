@@ -245,6 +245,12 @@ staying a bit-exact copy and the request orders on both.
 
 ## Historical
 
+- **2026-10-30 - a failed match-ring allocation left the pipelines on the
+  cached layout.** The ring was allocated after the pipelines were specialized,
+  so falling back to per-frame slots rebuilt the host layout but not their
+  `cache`/`ring`/`match_base` spec constants (1.08e-2 wrong under the forced
+  failure). The ring is now allocated before any pipeline is created, so the
+  fallback settles the layout first; no perf change.
 - **2026-10-30 - freeing a filter released neither input node.** `WNNMFree`
   deleted the state but never freed the `clip`/`rclip` references taken by
   `mapGetNode`, so a discarded graph kept its upstream nodes alive. They are
@@ -456,6 +462,8 @@ staying a bit-exact copy and the request orders on both.
   centres are not re-traced, so they are omitted.
 - `VSFEEL_WNNM_NOCACHE=1` - no per-centre match cache: one record per fold per
   frame (the fallback path, and the A/B arm for the cache).
+- `VSFEEL_WNNM_NORING=1` - forces the match-ring allocation to fail, so the
+  per-frame fallback runs through the same teardown as a real out-of-memory.
 - `VSFEEL_WNNM_GPUTRACE=<frame>` - one-shot GPU timestamps around the match,
   Gram, solve, apply and finish dispatches of that frame, printed to stderr.
   Feed the filter device-resident frames or the number is the upload.

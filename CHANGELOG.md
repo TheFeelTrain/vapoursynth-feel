@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - WNNM releases its input clips when a filter instance is destroyed
+- WNNM no longer corrupts frames when its match cache cannot be allocated
 
 ## [v1.3.1] - 2026-10-30
 

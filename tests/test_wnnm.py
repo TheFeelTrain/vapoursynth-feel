@@ -581,6 +581,22 @@ def test_estimate_cache_matches_nocache(clip_grays, monkeypatch):
     assert worst < SELF_TOL, f"cached vs recomputed {worst:.3e}"
 
 
+def test_ring_allocation_failure_matches_nocache(clip_grays, monkeypatch):
+    """A failed match-ring allocation must land on the uncached layout.
+
+    The ring is allocated before the pipelines are specialized, so the fallback
+    rebuilds the layout they compile against; a later fallback would leave them
+    indexing ring slots while the host binds per-frame storage.
+    """
+    monkeypatch.setenv("VSFEEL_WNNM_NOCACHE", "1")
+    plain = WNNM(clip_grays, sigma=3, radius=1)
+    monkeypatch.delenv("VSFEEL_WNNM_NOCACHE")
+    monkeypatch.setenv("VSFEEL_WNNM_NORING", "1")
+    forced = WNNM(clip_grays, sigma=3, radius=1)
+    worst = max_diff(plain, forced, frames=(0, 1, 2))
+    assert worst < SELF_TOL, f"forced ring fallback vs nocache {worst:.3e}"
+
+
 @pytest.mark.parametrize(
     "params",
     [dict(sigma=3), dict(sigma=3, radius=1)],

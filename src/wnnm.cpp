@@ -1674,6 +1674,33 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             }
         }
     }
+    if (d->cache) {
+        // Allocated before any pipeline is specialized: the ring size and the
+        // cached layout are baked into their spec constants, so a fallback to
+        // per-frame slots has to settle the layout first.
+        std::string e;
+        if (env_flag("VSFEEL_WNNM_NORING")) {
+            // Fault injection: exercise the allocation-failure fallback.
+            e = "a forced match-ring allocation failure";
+        } else {
+            e = gpu_make_buffer(*d->gpu, core, VkDeviceSize(d->ring_bytes),
+                                d->ring_buf,
+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        }
+        if (!e.empty()) {
+            // The ring is an optimization: no room for it means per-frame
+            // slots, which is also what the layout has to be rebuilt for.
+            d->cache = false;
+            d->ring = d->max_folds;
+            if (auto e2 = layout(); !e2.empty()) {
+                return set_error(e2);
+            }
+        } else {
+            for (auto & tag : d->ring_tag) {
+                tag.assign(static_cast<size_t>(d->ring), INT_MIN);
+            }
+        }
+    }
     // Per-centre solved-M cache: the match ring already knows which centres
     // are published, so the estimate cache uses the same slot and depth. It is
     // a persistent buffer with its own budget; when it does not fit, Gram and
@@ -2001,25 +2028,6 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
         if (d->pool == nullptr) {
             return set_error("createGPUExecPool failed: "s + err);
-        }
-    }
-
-    if (d->cache) {
-        if (auto e = gpu_make_buffer(*d->gpu, core, VkDeviceSize(d->ring_bytes),
-                                     d->ring_buf,
-                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            !e.empty()) {
-            // The ring is an optimization: no room for it means per-frame
-            // slots, which is also what the layout has to be rebuilt for.
-            d->cache = false;
-            d->ring = d->max_folds;
-            if (auto e2 = layout(); !e2.empty()) {
-                return set_error(e2);
-            }
-        } else {
-            for (auto & tag : d->ring_tag) {
-                tag.assign(static_cast<size_t>(d->ring), INT_MIN);
-            }
         }
     }
 
