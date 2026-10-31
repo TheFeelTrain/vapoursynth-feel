@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [v1.3.2] - 2026-10-31
+
 ### Changed
 
 - WNNM is about 16% faster when all three 1080p planes are processed
@@ -173,6 +175,7 @@ The plugin has moved to the VapourSynth R80 GPU API. The core now owns the devic
 - vs-jetpack backend integration, so the filters can be used through the vs-jetpack wrappers
 - Windows and Linux wheels, built and published by CI
 
+[v1.3.2]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.1...v1.3.2
 [v1.3.1]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.0...v1.3.1
 [v1.3.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.2.0...v1.3.0
 [v1.2.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.2...v1.2.0
