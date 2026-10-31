@@ -6,18 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [v1.3.1] - 2026-10-30
+
 ### Changed
 
 - WNNM's `radius` argument can be set per plane like `sigma`
-- BM3D follows a 16-bit clip's `_Range` like the reference instead of treating every integer clip as full range
 
 ### Fixed
 
+- Bilateral rejects non-positive `block_x`/`block_y` instead of silently using the default shape
+- BM3D follows a 16-bit clip's `_Range` like the reference instead of treating every integer clip as full range
+- BM3D validates its block/search arguments even when every sigma is zero
 - Box no longer terminates the host process when the output size is illegal for a subsampled format
 - Box matches resize2 at tap boundaries on cropped and odd-sized sources
-- BM3D validates its block/search arguments even when every sigma is zero
 - DFTTest rejects a negative `f0beta` or `pmax` instead of returning an all-NaN frame
-- Bilateral rejects non-positive `block_x`/`block_y` instead of silently using the default shape
 
 ## [v1.3.0] - 2026-10-25
 
@@ -157,6 +159,7 @@ The plugin has moved to the VapourSynth R80 GPU API. The core now owns the devic
 - vs-jetpack backend integration, so the filters can be used through the vs-jetpack wrappers
 - Windows and Linux wheels, built and published by CI
 
+[v1.3.1]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.0...v1.3.1
 [v1.3.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.2.0...v1.3.0
 [v1.2.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.2...v1.2.0
 [v1.1.2]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/1.1.1...1.1.2
