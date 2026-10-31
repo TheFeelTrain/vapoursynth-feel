@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- WNNM is about 16% faster when all three 1080p planes are processed
+
 ### Fixed
 
 - WNNM releases its input clips when a filter instance is destroyed

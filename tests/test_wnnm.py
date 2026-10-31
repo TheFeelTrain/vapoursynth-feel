@@ -913,6 +913,49 @@ def test_storage_range_is_per_scratch_buffer():
     assert re.search(r"cache=1 ring=\d+", proc.stderr), proc.stderr[-2000:]
 
 
+_EST_BUDGET_SCRIPT = r"""
+import vapoursynth as vs
+
+core = vs.core
+core.max_cache_size = 8
+clip = core.std.BlankClip(width=1920, height=1080, format=vs.YUV420PS, length=2)
+core.vsfeel.WNNM(clip, sigma=3, radius=1)
+"""
+
+
+@pytest.mark.parametrize(
+    ("vram_gib", "est"),
+    [(8, 1), (2, 0)],
+    ids=["allowance-covers-512", "floor-keeps-320"],
+)
+def test_estimate_cache_budget_follows_the_device_allowance(vram_gib, est):
+    """Three processed 1080p planes need ~404 MiB for the M cache.
+
+    The old fixed 320 MiB target dropped it (-16.1%); the budget now allows up
+    to 512 MiB when the core's allowance covers it (limit/8), and keeps the old
+    target as the floor on a small device.
+    """
+    env = {
+        **os.environ,
+        "MANGOHUD": "0",
+        "VSFEEL_WNNM": "1",
+        "VSFEEL_LIMIT_VRAM_BUDGET": str(vram_gib << 30),
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", _EST_BUDGET_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    match = re.search(r"est=(\d+) est=([\d.]+) MiB", proc.stderr)
+    assert match, proc.stderr[-2000:]
+    assert int(match.group(1)) == est, match.group(0)
+    if est:
+        assert float(match.group(2)) > 400, match.group(0)
+
+
 @pytest.mark.parametrize(
     "knob",
     [

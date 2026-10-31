@@ -184,6 +184,11 @@ staying a bit-exact copy and the request orders on both.
 
 ## Performance
 
+- **The solved-M cache is worth ~19.6% where it fits (1284 vs 1074 fps on the
+  chroma default) and its budget now scales with the device allowance (up to
+  512 MiB), so three-plane 1080p keeps it too.** The cache removes the cached
+  folds' Gram and Solve; shrinking the match ring to make room instead loses
+  more than it gains (see Historical).
 - The temporal frame at the benchmark default is ~1.02 ms for two chroma
   planes. The probe's phase totals (`VSFEEL_WNNM_GPUTRACE`) are match 0.59 ms,
   Gram 0.07, eigen step 0.20, scatter 0.12, normalize 0.01, and the ablation
@@ -250,6 +255,23 @@ staying a bit-exact copy and the request orders on both.
 
 ## Historical
 
+- **2026-10-30 - the estimate-cache budget now follows the device allowance.**
+  Three processed 1080p planes need ~404 MiB for the solved-M ring, so the old
+  fixed 320 MiB target dropped the cache and the all-plane arm paid for it: 333.4
+  -> 387.2 fps (+16.1%, 5 s ABBA, n=12). The budget is now
+  `min(512 MiB, max(320 MiB, limit/8))`, so a small device keeps the old target;
+  the chroma default already fit and is unchanged (1284.1 vs 1283.4 fps).
+- **2026-10-30 - shrinking the match ring to keep the M cache does not pay.**
+  1080p chroma default: ring 64 with the cache 1284 fps, without it 1074
+  (-19.6%); ring 32 with 1108, without 968; ring 16 with 815. At three planes
+  ring 32 with the cache was 332.6 against 334.6 without, so the lost match hits
+  cancel the estimate gain. The budget, not the ring, was the lever.
+- **2026-10-30 - compacting the temporal location scratch is not worth it.**
+  Inflating the per-frame locs allocation 2x/4x without touching its bytes left
+  the default arm at 1279.4/1277.2 fps against 1284.4, so only the allocation
+  size changes and nothing measurable depends on it. Each searched fold also
+  needs its own region for the matcher dispatches to overlap, which compacting
+  would serialize; not shipped.
 - **2026-10-30 - a failed pipeline creation freed the input nodes once per
   failure.** The split branch created gram, solve and apply before checking any
   of them, and every failing `add` called `set_error`, which frees `clip` and
@@ -500,6 +522,11 @@ staying a bit-exact copy and the request orders on both.
   frame (the fallback path, and the A/B arm for the cache).
 - `VSFEEL_WNNM_NORING=1` - forces the match-ring allocation to fail, so the
   per-frame fallback runs through the same teardown as a real out-of-memory.
+- `VSFEEL_WNNM_RING=<n>` - cap the match ring at the next power of two (below
+  one fold pair's slots the cache is dropped); the ring-size A/B knob.
+- `VSFEEL_WNNM_NOEST=1` - keep the match cache but recompute every fold's M;
+  the A/B arm for the solved-M cache.
+- `VSFEEL_WNNM_ESTBUDGET=<MiB>` - override the solved-M cache budget.
 - `VSFEEL_WNNM_GPUTRACE=<frame>` - one-shot GPU timestamps around the match,
   Gram, solve, apply and finish dispatches of that frame, printed to stderr.
   Feed the filter device-resident frames or the number is the upload.

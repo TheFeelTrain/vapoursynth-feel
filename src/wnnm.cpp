@@ -1551,6 +1551,18 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         depth += std::max(0, info.numThreads);
     }
     d->ring = d->cache ? std::min(256, round_up_pow2(depth)) : d->max_folds;
+    if (const int cap = env_int("VSFEEL_WNNM_RING", 0); cap > 0 && d->cache) {
+        // Debug knob: force the request-spanning ring smaller so the cache
+        // budget's trade-offs can be swept on this device.
+        const int floor_ring = round_up_pow2(2 * d->max_folds);
+        const int r = std::min(d->ring, round_up_pow2(std::min(cap, 256)));
+        if (r < floor_ring) {
+            d->cache = false;
+            d->ring = d->max_folds;
+        } else {
+            d->ring = r;
+        }
+    }
     // The split estimate's per-group stride: the mean vector is M floats once
     // residual strips it (the fused path's M*(gs+1) layout is unchanged).
     const int sstride = split_stride(m, d->residual);
@@ -1733,9 +1745,23 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     // Per-centre solved-M cache: the match ring already knows which centres
     // are published, so the estimate cache uses the same slot and depth. It is
     // a persistent buffer with its own budget; when it does not fit, Gram and
-    // Solve run for every fold exactly as before.
-    constexpr int64_t kEstimateBudget = INT64_C(320) << 20;
-    d->est_cache = d->cache && !d->residual;
+    // Solve run for every fold exactly as before. The old fixed 320 MiB target
+    // is a floor, and up to 512 MiB is allowed when the core's allowance covers
+    // it (limit/8, the fraction the per-frame scratch is held to): 1080p with
+    // three processed planes needs ~404 MiB, and dropping the cache there cost
+    // 16.1%.
+    constexpr int64_t kEstimateBudget = INT64_C(512) << 20;
+    constexpr int64_t kEstimateFloor = INT64_C(320) << 20;
+    const int64_t vram = static_cast<int64_t>(vsfeel_vram_limit(*d->gpu, core));
+    int64_t est_budget =
+        vram > 0 ? std::min(kEstimateBudget, std::max(kEstimateFloor, vram / 8))
+                 : kEstimateBudget;
+    if (const int cap = env_int("VSFEEL_WNNM_ESTBUDGET", 0); cap > 0) {
+        // Debug knob: the budget is what decides whether the M cache exists at
+        // all, so it has to be sweepable on this device.
+        est_budget = int64_t(cap) << 20;
+    }
+    d->est_cache = d->cache && !d->residual && !env_flag("VSFEEL_WNNM_NOEST");
     d->est_bytes = 0;
     if (d->est_cache) {
         int64_t elems = 0;
@@ -1747,7 +1773,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             p.est_base = elems;
             elems += int64_t(d->ring) * int64_t(p.ng) * 68;
         }
-        if (elems > kEstimateBudget / 4) {
+        if (elems > est_budget / 4) {
             d->est_cache = false;
         } else {
             d->est_bytes = elems * 4;
