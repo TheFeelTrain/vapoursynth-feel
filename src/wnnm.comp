@@ -389,7 +389,8 @@ void jacobi_parallel(int k, int tid) {
                         }
                         c = float(1) / sqrt(t * t + float(1));
                         sn = t * c;
-                        jflag = round + 1;
+                        // Every pair reports the round it rotated in.
+                        atomicMax(jflag, round + 1);
                     }
                 }
                 jcs[2 * tid] = c;
@@ -1546,8 +1547,8 @@ void main() {
     // Eight lanes per group, lane l taking column l of every patch row. Each
     // lane accumulates the whole 8x8 outer-product sum over the pixels it owns
     // and a shuffle tree then adds the eight partial matrices, so the group's
-    // lanes all end with the same matrix; storing it row-major means the eight
-    // lanes of a group write the same words, which the coalescer merges.
+    // lanes all end with the same matrix. Lane 0 stores it row-major: equal
+    // values from several lanes would still be a write race.
     const int lane = int(gl_LocalInvocationIndex) & 7;
     const uint graw =
         gl_WorkGroupID.x * (WG / 8) + (gl_LocalInvocationIndex >> 3);
@@ -1640,7 +1641,7 @@ void main() {
     GRED(40) GRED(41) GRED(42) GRED(43) GRED(44) GRED(45) GRED(46) GRED(47)
     GRED(48) GRED(49) GRED(50) GRED(51) GRED(52) GRED(53) GRED(54) GRED(55)
     GRED(56) GRED(57) GRED(58) GRED(59) GRED(60) GRED(61) GRED(62) GRED(63)
-    if (glive) {
+    if (glive && lane == 0) {
         GST(0) GST(1) GST(2) GST(3) GST(4) GST(5) GST(6) GST(7)
         GST(8) GST(9) GST(10) GST(11) GST(12) GST(13) GST(14) GST(15)
         GST(16) GST(17) GST(18) GST(19) GST(20) GST(21) GST(22) GST(23)

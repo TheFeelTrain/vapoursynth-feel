@@ -114,7 +114,8 @@ The port is f32 end to end; there is no f64 path any more.
   - `ENTRY_GRAM`: 8 lanes per group, lane l takes column l of every patch row.
     Each lane accumulates the whole 8x8 outer-product sum over its pixels and a
     three-step `subgroupShuffleXor` tree adds the eight partial matrices, so all
-    eight lanes end with the same matrix and store it row-major.
+    eight lanes end with the same matrix; lane 0 stores it row-major, one writer
+    per element.
   - `ENTRY_SOLVE`: one thread per group. The Gram, the eigenvectors and every
     rotation index are **registers**: the sweep is written out over its 28 pairs
     (`JSWEEP`) because one dynamic index moves both 64-float arrays to local
@@ -245,6 +246,12 @@ staying a bit-exact copy and the request orders on both.
 
 ## Historical
 
+- **2026-10-30 - the split Gram and the fused Jacobi wrote shared state from
+  several lanes.** All eight Gram lanes stored the same 64 words and every
+  rotating pair assigned the same `jflag`; equal values are still a write race
+  under Vulkan's memory model. Lane 0 now stores the Gram and `jflag` is an
+  `atomicMax`. Output matches the old build to the 3.6e-7 atomic floor; the
+  default and `group_size=10` A/Bs are flat (1276 vs 1271, 135.4 vs 135.6 fps).
 - **2026-10-30 - a failed match-ring allocation left the pipelines on the
   cached layout.** The ring was allocated after the pipelines were specialized,
   so falling back to per-frame slots rebuilt the host layout but not their
