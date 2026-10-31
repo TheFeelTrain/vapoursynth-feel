@@ -873,6 +873,27 @@ def test_storage_range_is_per_scratch_buffer():
     assert re.search(r"cache=1 ring=\d+", proc.stderr), proc.stderr[-2000:]
 
 
+@pytest.mark.parametrize(
+    "knob",
+    [
+        {"VSFEEL_LIMIT_SUBGROUP_OPS": "0"},
+        {"VSFEEL_LIMIT_SUBGROUP_SIZE": "4"},
+    ],
+    ids=["no-shuffle", "narrow-subgroup"],
+)
+def test_split_falls_back_without_eight_lane_shuffle(knob):
+    """The split Gram groups lanes by subgroup ID and XOR-reduces them.
+
+    Without shuffle, or with subgroups narrower than one eight-lane group, the
+    fused kernel must run instead of a reduction that crosses subgroup
+    boundaries. The banner's `split` field is the only place the choice shows.
+    """
+    assert "split=1" in _creation_stderr("dict(sigma=3)"), "split path not default"
+    err = _creation_stderr("dict(sigma=3)", knob)
+    assert "split=0" in err, err[-2000:]
+    assert "fused kernel" in err, err[-2000:]
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------

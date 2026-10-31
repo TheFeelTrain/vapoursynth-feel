@@ -7,6 +7,7 @@
 #extension GL_EXT_shader_atomic_float : require
 #endif
 #extension GL_EXT_buffer_reference : require
+#extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_shader_16bit_storage : require
 
@@ -1549,9 +1550,15 @@ void main() {
     // and a shuffle tree then adds the eight partial matrices, so the group's
     // lanes all end with the same matrix. Lane 0 stores it row-major: equal
     // values from several lanes would still be a write race.
-    const int lane = int(gl_LocalInvocationIndex) & 7;
-    const uint graw =
-        gl_WorkGroupID.x * (WG / 8) + (gl_LocalInvocationIndex >> 3);
+    //
+    // Groups are formed from subgroup IDs, not local invocation indices, which
+    // Vulkan does not promise agree: each 8-lane chunk of each subgroup is one
+    // group. Creation requires a subgroup of at least eight lanes, so a chunk is
+    // wholly inside one subgroup and the XOR tree never crosses it.
+    const uint sglane = gl_SubgroupInvocationID;
+    const int lane = int(sglane & 7u);
+    const uint graw = gl_WorkGroupID.x * (WG / 8) +
+                      gl_SubgroupID * (gl_SubgroupSize / 8u) + (sglane >> 3);
     const bool glive = graw < est_count();
     const uint gslot = min(graw, est_count() - 1u);
     if ((pc.cached & (1u << fold_of(gslot))) != 0) {

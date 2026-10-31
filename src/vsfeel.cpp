@@ -464,6 +464,17 @@ get_gpu_device(VSCore * core, const VSAPI * vsapi) {
         mask >= 0) {
         dev->subgroup_size_stages &= static_cast<VkShaderStageFlags>(mask);
     }
+    // The subgroup baseline is checked per kernel like the operation bits above,
+    // so a device that cannot shuffle or has subgroups narrower than a kernel's
+    // lane group can be exercised on hardware that does both. Both only clamp
+    // down.
+    if (const int mask = env_int("VSFEEL_LIMIT_SUBGROUP_OPS", -1); mask >= 0) {
+        dev->subgroup_ops &= static_cast<VkSubgroupFeatureFlags>(mask);
+    }
+    if (const int cap = env_int("VSFEEL_LIMIT_SUBGROUP_SIZE", 0);
+        cap > 0 && static_cast<uint32_t>(cap) < dev->subgroup_size) {
+        dev->subgroup_size = static_cast<uint32_t>(cap);
+    }
 
     uint32_t families = 0;
     vk->vkGetPhysicalDeviceQueueFamilyProperties2(handles.physicalDevice,

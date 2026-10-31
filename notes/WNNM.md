@@ -115,7 +115,9 @@ The port is f32 end to end; there is no f64 path any more.
     Each lane accumulates the whole 8x8 outer-product sum over its pixels and a
     three-step `subgroupShuffleXor` tree adds the eight partial matrices, so all
     eight lanes end with the same matrix; lane 0 stores it row-major, one writer
-    per element.
+    per element. Groups are formed from `gl_SubgroupID`/`gl_SubgroupSize`, not
+    local invocation index; a device without shuffle or 8-lane subgroups takes
+    the fused kernel instead.
   - `ENTRY_SOLVE`: one thread per group. The Gram, the eigenvectors and every
     rotation index are **registers**: the sweep is written out over its 28 pairs
     (`JSWEEP`) because one dynamic index moves both 64-float arrays to local
@@ -247,6 +249,13 @@ staying a bit-exact copy and the request orders on both.
 
 ## Historical
 
+- **2026-10-30 - the Gram reduction assumed local invocation indices were
+  subgroup lanes.** It grouped by `gl_LocalInvocationIndex` and XOR-reduced the
+  groups, but Vulkan does not promise that order matches `gl_SubgroupInvocationID`
+  on any driver. Groups now come from `gl_SubgroupID`/`gl_SubgroupSize`, and a
+  device without shuffle or 8-lane subgroups falls back to the fused kernel.
+  The default A/B is flat (1278.9 vs 1276.3 fps) and frames match to the 3.0e-7
+  atomic floor.
 - **2026-10-30 - the scratch limit measured the sum against a per-buffer cap.**
   `maxStorageBufferRange` caps one descriptor's range, and every per-frame
   scratch region is its own buffer, so a 70 MiB device rejected 1080p luma
@@ -468,7 +477,8 @@ staying a bit-exact copy and the request orders on both.
 
 ## Debug env vars
 
-- `VSFEEL_WNNM=1` - creation banner (per-plane geometry, scratch bases, qmax).
+- `VSFEEL_WNNM=1` - creation banner (per-plane geometry, scratch bases, qmax,
+  split or fused estimate).
 - `VSFEEL_WNNM_TIMING=1` - per-frame host split (acquire/record/submit).
 - `VSFEEL_WNNM_DUMP=<frame>` - dump each searched centre's selected group
   (errors, positions, temporal slot, kept count, weight) to stderr. Cached

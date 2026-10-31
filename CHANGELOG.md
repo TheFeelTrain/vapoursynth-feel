@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - WNNM no longer corrupts frames when its match cache cannot be allocated
 - WNNM output no longer depends on concurrent same-address GPU writes the Vulkan memory model does not guarantee
 - WNNM no longer rejects a configuration whose combined scratch exceeds the device's per-buffer storage range
+- WNNM's split Gram reduction no longer depends on the driver's subgroup lane layout, and a device that cannot run it falls back to the fused kernel
 
 ## [v1.3.1] - 2026-10-30
 

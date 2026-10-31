@@ -1493,6 +1493,19 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     // The split estimate runs any radius; only a group too wide for its
     // register-resistant kernels keeps the fused one.
     d->split_match = d->gs <= 8 && !env_flag("VSFEEL_WNNM_NOSPLIT");
+    // The split Gram groups its lanes by subgroup ID and reduces them with XOR
+    // shuffles, so it needs shuffle support and at least one group's worth of
+    // lanes in a subgroup. The fused kernel uses neither, so such a device
+    // takes it instead of a reduction that would cross subgroup boundaries.
+    if (d->split_match &&
+        (!d->gpu->has_subgroup_ops(VK_SUBGROUP_FEATURE_SHUFFLE_BIT) ||
+         d->gpu->subgroup_size < 8)) {
+        d->split_match = false;
+        if (vsfeel_debug_flag("VSFEEL_WNNM")) {
+            fprintf(stderr, "[wnnm] no 8-lane subgroup shuffle: using the "
+                            "fused kernel\n");
+        }
+    }
 
     // Geometry and per-plane scratch. The kernel's group lattice is the
     // reference's `min(_x, temp_c)` walk. The layout runs again when the
@@ -2071,12 +2084,12 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         const char * io = d->io == 2 ? "u16" : (d->io == 1 ? "f16" : "f32");
         fprintf(stderr,
                 "[wnnm] io=%s bs=%d step=%d gs=%d bm=%d radius=%d,%d,%d "
-                "ps=%d/%d qmax=%d; per frame acc=%.1f MiB pmat=%.1f MiB "
-                "locs=%.1f MiB; cache=%d ring=%d ring=%.1f MiB; est=%d "
+                "ps=%d/%d qmax=%d split=%d; per frame acc=%.1f MiB pmat=%.1f "
+                "MiB locs=%.1f MiB; cache=%d ring=%d ring=%.1f MiB; est=%d "
                 "est=%.1f MiB; src ring=%.1f MiB\n",
                 io, d->bs, d->step, d->gs, d->bm_range, d->plane[0].radius,
                 d->plane[1].radius, d->plane[2].radius, d->ps_num, d->ps_range,
-                qmax, double(d->acc_bytes) / 1048576.0,
+                qmax, d->split_match ? 1 : 0, double(d->acc_bytes) / 1048576.0,
                 double(d->pmat_bytes) / 1048576.0,
                 double(d->locs_bytes) / 1048576.0, d->cache ? 1 : 0, d->ring,
                 double(d->ring_bytes) / 1048576.0, d->est_cache ? 1 : 0,
