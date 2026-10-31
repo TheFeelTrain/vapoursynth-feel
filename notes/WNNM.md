@@ -245,6 +245,10 @@ staying a bit-exact copy and the request orders on both.
 
 ## Historical
 
+- **2026-10-30 - freeing a filter released neither input node.** `WNNMFree`
+  deleted the state but never freed the `clip`/`rclip` references taken by
+  `mapGetNode`, so a discarded graph kept its upstream nodes alive. They are
+  freed in teardown now; no perf change.
 - **2026-10-25 - `radius` is per plane, like `sigma`.** Each plane's address
   table, fold count and match/estimate records are its own, so a spatial plane
   can sit beside a temporal one; the frame requests the widest plane's window.

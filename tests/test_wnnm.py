@@ -23,11 +23,13 @@ assertions use 1e-5 like BM3D's.
 Run from the repository root:  uv run python -m pytest tests/test_wnnm.py
 """
 
+import gc
 import json
 import os
 import re
 import subprocess
 import sys
+import weakref
 
 import numpy as np
 import pytest
@@ -917,3 +919,35 @@ def test_short_clip_with_max_radius_reads_only_existing_frames(clip_grays):
     for n in range(3):
         a = plane(out.get_frame(n), 0, dtype=np.float32)
         assert np.isfinite(a).all(), f"non-finite frame {n}"
+
+
+def test_filter_releases_its_input_nodes():
+    """Freeing the filter must release the `clip` and `rclip` references.
+
+    Both upstreams are Python filters, so a leaked node reference keeps their
+    callables alive past the filter's destruction; that is what the weakrefs
+    observe.
+    """
+
+    class Marker:
+        def __call__(self, f, **kw):
+            return f
+
+    def wrap(clip):
+        marker = Marker()
+        node = vs.core.std.ModifyFrame(clip, [clip], marker)
+        return node, weakref.ref(marker)
+
+    clip, clip_ref = wrap(_blank())
+    rclip, rclip_ref = wrap(_blank())
+    out = vs.core.vsfeel.WNNM(clip, rclip=rclip)
+    out.get_frame(0)
+    del clip, rclip
+    gc.collect()
+    assert clip_ref() is not None and rclip_ref() is not None
+
+    del out
+    vs.core.clear_cache()
+    gc.collect()
+    assert clip_ref() is None, "WNNM retained its `clip` node"
+    assert rclip_ref() is None, "WNNM retained its `rclip` node"

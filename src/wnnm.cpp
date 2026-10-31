@@ -1277,8 +1277,14 @@ static const VSFrame * VS_CC WNNMGetFrame(int n, int activationReason,
 }
 
 static void VS_CC WNNMFree(void * instanceData, [[maybe_unused]] VSCore * core,
-                           [[maybe_unused]] const VSAPI * vsapi) {
-    delete static_cast<GPUWNNM *>(instanceData);
+                           const VSAPI * vsapi) {
+    GPUWNNM * d = static_cast<GPUWNNM *>(instanceData);
+    // Both were acquired by mapGetNode, which took a reference of its own.
+    vsapi->freeNode(d->node);
+    if (d->ref_node) {
+        vsapi->freeNode(d->ref_node);
+    }
+    delete d;
 }
 
 // ---------------------------------------------------------------------------
