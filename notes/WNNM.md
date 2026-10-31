@@ -250,6 +250,12 @@ staying a bit-exact copy and the request orders on both.
 
 ## Historical
 
+- **2026-10-30 - a failed pipeline creation freed the input nodes once per
+  failure.** The split branch created gram, solve and apply before checking any
+  of them, and every failing `add` called `set_error`, which frees `clip` and
+  `rclip`: with a 64-invocation cap three failures released the same nodes three
+  times (the reported error was apply's, not the first). Creation now returns
+  after each pipeline and `set_error` clears the freed pointers. No perf change.
 - **2026-10-30 - boundary windows queued duplicate conversions.** `queue_copy`
   only checked published tags, so every window position that clamped to the same
   frame queued another copy into its slot before any tag moved (61 per plane on a

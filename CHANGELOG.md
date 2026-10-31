@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - WNNM no longer rejects a configuration whose combined scratch exceeds the device's per-buffer storage range
 - WNNM's split Gram reduction no longer depends on the driver's subgroup lane layout, and a device that cannot run it falls back to the fused kernel
 - WNNM copies a 16-bit boundary frame into its conversion ring once per plane instead of once per clamped window position
+- WNNM no longer releases its input clips more than once when pipeline creation fails
 
 ## [v1.3.1] - 2026-10-30
 

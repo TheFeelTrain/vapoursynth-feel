@@ -1326,9 +1326,12 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     auto set_error = [&](const std::string & message) {
         vsfeel_trace_error("WNNM", -1, message, d->gpu.get());
         vsapi->mapSetError(out, ("WNNM: " + message).c_str());
+        // Clear the pointers so a later error path cannot free them again.
         vsapi->freeNode(d->node);
+        d->node = nullptr;
         if (d->ref_node) {
             vsapi->freeNode(d->ref_node);
+            d->ref_node = nullptr;
         }
     };
 
@@ -1987,12 +1990,21 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             const GpuWorkgroup one { .x = 256, .shared_bytes = 0 };
             pl.gram_pipe =
                 add(tag + " gram", wnnm_gram_spv, sizeof(wnnm_gram_spv), lanes);
+            if (!pl.gram_pipe) {
+                return;
+            }
             pl.solve_pipe = add(tag + " solve", wnnm_solve_spv,
                                 sizeof(wnnm_solve_spv), one);
+            if (!pl.solve_pipe) {
+                return;
+            }
             pl.apply_pipe = hw_atomics ? add(tag + " apply", wnnm_apply_spv,
                                              sizeof(wnnm_apply_spv), lanes)
                                        : add(tag + " apply", wnnm_apply_cas_spv,
                                              sizeof(wnnm_apply_cas_spv), lanes);
+            if (!pl.apply_pipe) {
+                return;
+            }
             if (temporal) {
                 // The temporal matcher still runs the fused kernel, up to the
                 // point where it publishes its selection.
@@ -2001,10 +2013,9 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                                              qmax, d->bs, d->gs, true) };
                 pl.group_pipe =
                     add(tag, variant.group, variant.group_size, gwg);
-            }
-            if (!pl.gram_pipe || !pl.solve_pipe || !pl.apply_pipe ||
-                (temporal && !pl.group_pipe)) {
-                return;
+                if (!pl.group_pipe) {
+                    return;
+                }
             }
         } else {
             // The group kernel's LDS footprint is a function of qmax, bs and

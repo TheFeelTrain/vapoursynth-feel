@@ -943,6 +943,44 @@ def _blank():
     return vs.core.std.BlankClip(width=64, height=48, format=vs.GRAYS, length=1)
 
 
+_FIRST_PIPELINE_FAILURE_SCRIPT = r"""
+import vapoursynth as vs
+
+core = vs.core
+clip = core.std.BlankClip(width=64, height=48, format=vs.GRAYS, length=2)
+try:
+    core.vsfeel.WNNM(clip, sigma=3)
+except vs.Error as e:
+    print("ERROR:", e, flush=True)
+"""
+
+
+def test_pipeline_failure_stops_creation_at_the_first_error():
+    """A failed pipeline must release the input nodes once and return.
+
+    The 64-invocation cap makes the 128-lane Gram fail before solve (256) and
+    apply (128); without an early return those failures call set_error again,
+    which frees the already-freed input nodes.
+    """
+    env = {
+        **os.environ,
+        "MANGOHUD": "0",
+        "VSFEEL_DEBUG": "1",
+        "VSFEEL_LIMIT_INVOCATIONS": "64",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", _FIRST_PIPELINE_FAILURE_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "ERROR:" in proc.stdout, proc.stderr[-2000:]
+    assert "gram" in proc.stdout, proc.stdout[-2000:]
+    assert "wnnm group p0 solve" not in proc.stderr, "creation continued past the first failure"
+
+
 @pytest.mark.parametrize(
     ("fmt", "msg"),
     [
