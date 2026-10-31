@@ -514,6 +514,46 @@ def test_native_depth_request_order(kind, tol):
     assert_temporal_order_consistent("WNNM", dict(sigma=3, radius=1), tol=tol, nframes=6, clip=kind)
 
 
+_COPY_COUNT_SCRIPT = r"""
+import vapoursynth as vs
+
+core = vs.core
+clip = core.std.BlankClip(width=64, height=48, format=vs.YUV420P16, length=1)
+node = core.vsfeel.WNNM(clip, sigma=3, radius=15)
+core.std.GPUDownload(node).get_frame(0)
+"""
+
+
+def test_u16_boundary_copies_are_deduplicated():
+    """A one-frame clip's whole radius-15 window clamps to frame 0.
+
+    Every processed plane must be converted once, not once per window position:
+    the duplicate copies would write one ring slot before any tag is published.
+    """
+    env = {**os.environ, "MANGOHUD": "0", "VSFEEL_WNNM": "1"}
+    proc = subprocess.run(
+        [sys.executable, "-c", _COPY_COUNT_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert re.search(r"n=0: 3 conversions", proc.stderr), proc.stderr[-2000:]
+
+
+def test_u16_max_radius_matches_the_float_chain(clip_yuv420p16):
+    """Every window position of a short clip clamps to an existing frame."""
+    from vstools import depth
+
+    short = vs.core.std.Trim(clip_yuv420p16, length=3)
+    manual = depth(WNNM(depth(short, 32), radius=15), 16)
+    native = WNNM(short, radius=15)
+    for n in range(3):
+        worst = _code_diff(native.get_frame(n), manual.get_frame(n), (0, 1, 2))
+        assert worst <= 1, f"frame {n}: {worst} codes apart"
+
+
 # ---------------------------------------------------------------------------
 # Self-consistency
 # ---------------------------------------------------------------------------

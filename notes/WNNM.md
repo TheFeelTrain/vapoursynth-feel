@@ -99,8 +99,9 @@ The port is f32 end to end; there is no f64 path any more.
   ring; a 16-bit frame
   holds the ring lock through its submit and starts its command buffer with a
   whole-queue barrier, so a later copy cannot overwrite a slot an earlier
-  submission still reads. The ring is the filter's own buffer: it must not go
-  through
+  submission still reads. The window's clamped positions collapse to one queued
+  copy per (set, plane, frame), so a boundary frame is written to its slot once.
+  The ring is the filter's own buffer: it must not go through
   `gpuExecUsesBuffer`, which transfers ownership to the submission and frees it,
   and doing so here produced a wrong frame 0 and a core-teardown crash.
   `wnnm_copy.comp`
@@ -249,6 +250,12 @@ staying a bit-exact copy and the request orders on both.
 
 ## Historical
 
+- **2026-10-30 - boundary windows queued duplicate conversions.** `queue_copy`
+  only checked published tags, so every window position that clamped to the same
+  frame queued another copy into its slot before any tag moved (61 per plane on a
+  one-frame `radius=15` clip), and the equal writes raced. Pending copies are
+  deduplicated by set, plane and frame: 183 -> 3 conversions on a three-plane
+  one-frame clip. Interior frames are unchanged.
 - **2026-10-30 - the Gram reduction assumed local invocation indices were
   subgroup lanes.** It grouped by `gl_LocalInvocationIndex` and XOR-reduced the
   groups, but Vulkan does not promise that order matches `gl_SubgroupInvocationID`
@@ -477,8 +484,8 @@ staying a bit-exact copy and the request orders on both.
 
 ## Debug env vars
 
-- `VSFEEL_WNNM=1` - creation banner (per-plane geometry, scratch bases, qmax,
-  split or fused estimate).
+- `VSFEEL_WNNM=1` - creation banner and per-frame lines (geometry, scratch
+  bases, qmax, estimate path, cached folds, conversions).
 - `VSFEEL_WNNM_TIMING=1` - per-frame host split (acquire/record/submit).
 - `VSFEEL_WNNM_DUMP=<frame>` - dump each searched centre's selected group
   (errors, positions, temporal slot, kept count, weight) to stderr. Cached

@@ -770,6 +770,14 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
         if (d->src_tag[tag] == f) {
             return true;
         }
+        // At a clip boundary several window positions clamp to the same frame,
+        // and the slot is keyed by frame: a second copy would be a duplicate
+        // write to the same ring slot before any tag is published.
+        for (const WnnmCopy & q : copies) {
+            if (q.set == set && q.plane == p && q.frame == f) {
+                return true;
+            }
+        }
         VSVulkanPlaneInfo sp {};
         if (d->gpu->api->getGPUPlane(src_frame, p, &sp)) {
             return false;
@@ -842,6 +850,11 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
             table[base + l] = plane_address(*d->gpu, sp.buffer);
             table[base + dpl.wl + l] = plane_address(*d->gpu, pp.buffer);
         }
+    }
+    // A 2-byte window's clamped positions collapse to one conversion each; the
+    // count is the dedup's only observable.
+    if (d->elem_bytes == 2 && vsfeel_debug_flag("VSFEEL_WNNM")) {
+        fprintf(stderr, "[wnnm] n=%d: %zu conversions\n", n, copies.size());
     }
     // The table may land in the host-visible VRAM BAR, whose mapping is
     // write-combined: the first submission must not read a tail that has not
