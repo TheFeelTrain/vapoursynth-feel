@@ -835,6 +835,44 @@ def test_cache_budget_respects_storage_range():
     assert mib <= cap / (1 << 20), proc.stderr[-2000:]
 
 
+_PER_BUFFER_LIMIT_SCRIPT = r"""
+import vapoursynth as vs
+
+core = vs.core
+clip = core.std.BlankClip(width=1920, height=1080, format=vs.GRAYS, length=24)
+core.vsfeel.WNNM(clip, sigma=3, radius=1)
+"""
+
+
+def test_storage_range_is_per_scratch_buffer():
+    """maxStorageBufferRange caps one buffer, not the per-frame scratch sum.
+
+    1080p luma, radius=1 at the defaults: the scratch sum is ~126 MiB but the
+    largest single buffer (locs) is ~60 MiB, so a 70 MiB range must be
+    accepted.
+    """
+    cap = 70 << 20
+    env = {
+        **os.environ,
+        "MANGOHUD": "0",
+        "VSFEEL_WNNM": "1",
+        "VSFEEL_LIMIT_STORAGE_RANGE": str(cap),
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", _PER_BUFFER_LIMIT_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    banner = re.search(r"acc=([\d.]+) MiB pmat=([\d.]+) MiB locs=([\d.]+) MiB", proc.stderr)
+    assert banner, proc.stderr[-2000:]
+    acc, pmat, locs = (float(v) for v in banner.groups())
+    assert max(acc, pmat, locs) < cap / (1 << 20) < acc + pmat + locs, banner.group(0)
+    assert re.search(r"cache=1 ring=\d+", proc.stderr), proc.stderr[-2000:]
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------

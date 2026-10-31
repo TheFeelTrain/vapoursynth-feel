@@ -1748,7 +1748,9 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     }
 
     // Per-frame scratch budget: the core's allowance has to hold the in-flight
-    // frames' scratch as well as their pixels.
+    // frames' scratch as well as their pixels. maxStorageBufferRange is a cap
+    // on one descriptor's range, and every scratch region is its own buffer,
+    // so only the largest one is measured against it.
     const int64_t per_frame = d->acc_bytes + d->pmat_bytes + d->locs_bytes +
                               d->dist_bytes + d->match_bytes;
     {
@@ -1759,9 +1761,14 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                 " bytes) exceeds one eighth of the VRAM allowance; "
                 "lower block_size/group_size or radius");
         }
-        if (per_frame >
+        const int64_t largest =
+            std::max({ d->acc_bytes, d->pmat_bytes, d->locs_bytes,
+                       d->dist_bytes, d->match_bytes });
+        if (largest >
             static_cast<int64_t>(d->gpu->limits.maxStorageBufferRange)) {
-            return set_error("per-frame scratch exceeds this device's "
+            return set_error("the largest per-frame scratch buffer (" +
+                             std::to_string(largest) +
+                             " bytes) exceeds this device's "
                              "maxStorageBufferRange");
         }
     }

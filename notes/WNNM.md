@@ -149,8 +149,9 @@ The port is f32 end to end; there is no f64 path any more.
   including the clipped boundaries, which read some slabs twice.
 - `q = min(bs^2, group_size)` picks a `-DQMAX` 8/16/32 variant; q > 32 is
   rejected (the reference allows 64), and `group_size`/`ps_num` stop at 64
-  (the shader's list width). Scratch is budgeted against the core's VRAM
-  allowance at creation.
+  (the shader's list width). The per-frame scratch is budgeted against the
+  core's VRAM allowance at creation, and each scratch buffer separately against
+  the device's `maxStorageBufferRange`.
 
 ### Numerics
 
@@ -246,6 +247,11 @@ staying a bit-exact copy and the request orders on both.
 
 ## Historical
 
+- **2026-10-30 - the scratch limit measured the sum against a per-buffer cap.**
+  `maxStorageBufferRange` caps one descriptor's range, and every per-frame
+  scratch region is its own buffer, so a 70 MiB device rejected 1080p luma
+  `radius=1` at the defaults (126 MiB sum, 60 MiB largest buffer). Each buffer
+  is checked now; the aggregate VRAM budget is unchanged. No perf change.
 - **2026-10-30 - the split Gram and the fused Jacobi wrote shared state from
   several lanes.** All eight Gram lanes stored the same 64 words and every
   rotating pair assigned the same `jflag`; equal values are still a write race

@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - WNNM releases its input clips when a filter instance is destroyed
 - WNNM no longer corrupts frames when its match cache cannot be allocated
 - WNNM output no longer depends on concurrent same-address GPU writes the Vulkan memory model does not guarantee
+- WNNM no longer rejects a configuration whose combined scratch exceeds the device's per-buffer storage range
 
 ## [v1.3.1] - 2026-10-30
 
