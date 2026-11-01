@@ -1,4 +1,4 @@
-"""Filter lifecycle under concurrency (R9).
+"""Filter lifecycle under concurrency.
 
 Each vsfeel filter used to call ``vkDeviceWaitIdle`` in its destructor without
 holding the shared queues' locks.  Destroying one node while another node was
@@ -18,7 +18,7 @@ import textwrap
 
 import pytest
 
-from conftest import CLIP_PATH
+from conftest import CLIP_FRAMES, CLIP_PATH
 
 _LIFECYCLE_SCRIPT = textwrap.dedent(f"""\
     import sys
@@ -29,6 +29,8 @@ _LIFECYCLE_SCRIPT = textwrap.dedent(f"""\
     core.max_cache_size = 512
 
     src = core.bs.VideoSource({CLIP_PATH!r})
+    if src.num_frames > {CLIP_FRAMES}:
+        src = core.std.Trim(src, first=0, length={CLIP_FRAMES})
     gray = core.std.ShufflePlanes(src, 0, vs.GRAY)
     f32 = core.fmtc.bitdepth(gray, bits=32, fulls=True, fulld=True)
     # a longer clip so the worker threads keep submitting frames throughout

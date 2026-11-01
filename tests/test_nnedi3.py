@@ -4,7 +4,7 @@ The committed tests/bigbuckbunny_360p_grain.mp4 clip (real 360p content with
 baked-in grain) is used as the input. The vsfeel implementation is a from-scratch Vulkan port of the
 NNEDI3 predictor/prescreener math; the reference oracle is nnedi3vk (Vulkan),
 which agrees BIT-EXACTLY with vszipcu's NNEDI3 (measured max diff 0 on the
-noise clip, all planes, frames 0/5/11 — so matching nnedi3vk matches both).
+noise clip, all planes, frames 0/11/23 — so matching nnedi3vk matches both).
 
 Agreement measured on the noise clip (see notes/NNEDI3.md):
 
@@ -22,7 +22,7 @@ Agreement measured on the noise clip (see notes/NNEDI3.md):
 
 Self-consistency (determinism across runs, multi-stream == single) is exact.
 
-Run from the repository root:  uv run python -m pytest tests/test_nnedi3.py
+Run from the repository root:  tools/test.sh tests/test_nnedi3.py -q
 """
 
 import json
@@ -41,6 +41,7 @@ from conftest import (
     CLIP_FRAMES,
     CLIP_PATH,
     COMPARE_PRELUDE,
+    F16_STEP,
     ReferenceUnavailable,
     assert_changes_on_clip,
     assert_preserves_frame_props,
@@ -52,6 +53,7 @@ from conftest import (
     reference_or_skip,
     reference_spec,
     run_compare_subprocess,
+    source_clip,
 )
 
 pytestmark = pytest.mark.usefixtures("clip_grays")
@@ -145,12 +147,7 @@ def test_nnedi3_dh_matches_reference(clip_gray16):
 
 
 def _yuv420p16():
-    core = vs.core
-    if hasattr(core, "bs"):
-        src = core.bs.VideoSource(CLIP_PATH)
-    else:
-        src = core.ffms2.Source(CLIP_PATH)
-    return src.resize.Point(format=vs.YUV420P16)
+    return source_clip().resize.Point(format=vs.YUV420P16)
 
 
 def test_nnedi3_yuv_matches_reference():
@@ -209,7 +206,6 @@ def test_nnedi3_matches_reference_f32(clip_grays, kwargs):
 # held against the f32 path.
 
 F16_PACKED_MAX = 2.6e-3  # measured 2.51e-3 (nsize=3) on identical inputs
-F16_STORAGE_ULP = 4.8828125e-4  # one half step at |v| in [0.5, 1)
 
 REFERENCE_CASES_F16 = [
     {},
@@ -236,10 +232,12 @@ REFERENCE_CASES_F16 = [
 @pytest.mark.parametrize(
     "kwargs", REFERENCE_CASES_F16, ids=[str(sorted(k.items())) for k in REFERENCE_CASES_F16]
 )
-def test_nnedi3_matches_reference_f16(clip_grayh, kwargs):
-    """Default f16 mode, whatever the device selects (packed or storage-only)."""
+def test_nnedi3_matches_reference_f16(clip_grayh, kwargs, f16_packed):
+    """Default f16 mode: bit-exact on the packed path, the reference's own f16
+    error on a device that has to fall back to storage-only."""
     payload = _ref_compare("grayh", (0, 11, 23), kwargs)
-    assert payload["maxdiff"] <= F16_PACKED_MAX, kwargs
+    bound = 0.0 if f16_packed else F16_PACKED_MAX
+    assert payload["maxdiff"] <= bound, kwargs
 
 
 F16_EXACT_CASES = [
@@ -353,7 +351,7 @@ def _f16_vs_f32(kwargs, env=None):
 def test_nnedi3_f16_storage_only_matches_f32_path(kwargs):
     """f16 io with f32 arithmetic is the f32 path within one half step."""
     payload = _f16_vs_f32(kwargs, env={"VSFEEL_NNEDI3_PRED16": "0"})
-    assert payload["maxdiff"] <= F16_STORAGE_ULP, kwargs
+    assert payload["maxdiff"] <= F16_STEP, kwargs
 
 
 @pytest.mark.parametrize(
@@ -370,21 +368,23 @@ def test_nnedi3_f16_matches_f32_path_within_reference(kwargs):
     assert payload["maxdiff"] <= F16_PACKED_MAX, kwargs
 
 
-def test_nnedi3_f16_field_gt1_matches_reference(clip_grayh):
+def test_nnedi3_f16_field_gt1_matches_reference(clip_grayh, f16_packed):
+    bound = 0.0 if f16_packed else F16_PACKED_MAX
     for field in (2, 3):
         payload = _ref_compare("grayh", (0, 1, 24, 47), {"field": field})
         assert payload["num_frames"] == 48
-        assert payload["maxdiff"] <= F16_PACKED_MAX
+        assert payload["maxdiff"] <= bound
 
 
-def test_nnedi3_f16_yuv_matches_reference(clip_yuv420ps):
+def test_nnedi3_f16_yuv_matches_reference(clip_yuv420ps, f16_packed):
     yuv = vs.core.resize.Point(clip_yuv420ps, format=vs.YUV420PH)
     assert yuv.format.id == vs.YUV420PH
     # dh doubles the luma height; the chroma writers have to cover the whole
     # (2*h) >> subSamplingH plane, last row included.
+    bound = 0.0 if f16_packed else F16_PACKED_MAX
     for kwargs in ({}, {"planes": [0]}, {"planes": [1, 2]}, {"nsize": 0}, {"dh": True}):
         payload = _ref_compare("yuv420ph", (0, 11), kwargs)
-        assert payload["maxdiff"] <= F16_PACKED_MAX, kwargs
+        assert payload["maxdiff"] <= bound, kwargs
 
 
 def _creation_stderr(env=None):
@@ -425,16 +425,24 @@ def test_nnedi3_f16_predictor_variant_pinned():
 
 
 @pytest.fixture(scope="module")
-def packed_f16_predictor():
+def f16_packed():
+    """Whether the forced packed half predictor actually runs on this device."""
+    err = _creation_stderr({"VSFEEL_NNEDI3_PRED16": "1"})
+    if "predictor=f16-packed" in err:
+        return True
+    assert "predictor=f16-storage" in err, err[-2000:]
+    return False
+
+
+@pytest.fixture(scope="module")
+def packed_f16_predictor(f16_packed):
     """Skip the bit-exact f16 oracle when the packed predictor cannot run.
 
     The exact test forces ``VSFEEL_NNEDI3_PRED16=1``; on a device without
     shaderFloat16 creation silently keeps the storage-only path, whose one
     rounding on store is expected to differ from nnedi3vk's f16 arithmetic.
     """
-    err = _creation_stderr({"VSFEEL_NNEDI3_PRED16": "1"})
-    if "predictor=f16-packed" not in err:
-        assert "predictor=f16-storage" in err, err[-2000:]
+    if not f16_packed:
         pytest.skip("the packed f16 predictor is not available")
     return True
 

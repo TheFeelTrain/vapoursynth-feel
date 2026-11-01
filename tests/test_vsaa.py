@@ -2,9 +2,14 @@
 
 The oracle is ``vsaa.based_aa`` driven by the same antialiaser and the same
 scalers, so the only steps that differ are the ones that cannot stay on the
-device. On float input they agree bit-exactly; on u16 the reference's
-mask operator is the incorrect one (see ``test_feel_aa_u16_*``).
+device: the core's GPU Point resize and Prewitt mask differ slightly from its
+host versions (measured bounds below). On u16 the reference's mask operator is
+the incorrect one (see ``test_feel_aa_u16_*``).
 """
+
+# The optional oracles are imported through require_optional, which must run
+# before the imports it guards.
+# ruff: noqa: E402
 
 import inspect
 
@@ -12,8 +17,10 @@ import numpy as np
 import pytest
 import vapoursynth as vs
 
-pytest.importorskip("vstools")
-pytest.importorskip("vsaa")
+from conftest import require_optional
+
+require_optional("vstools")
+require_optional("vsaa")
 
 from vsaa import based_aa
 from vskernels import Box, Catrom, CustomComplexKernel, Point

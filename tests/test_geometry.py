@@ -26,7 +26,7 @@ import textwrap
 
 import pytest
 
-from conftest import COMPARE_PRELUDE, HEIGHT, CLIP_FRAMES, CLIP_PATH, compare_or_skip
+from conftest import COMPARE_PRELUDE, F16_STEP, HEIGHT, CLIP_FRAMES, CLIP_PATH, compare_or_skip
 
 WIDTHS = (630, 638)
 FRAMES = [0, 1, 2]
@@ -42,24 +42,23 @@ CROP_FROM = 640
 #   bilateral  f32 630/638 yuv420: 2.38e-7  -> 1e-6
 #   bilateral  u16 630/638 (both): 1 code   -> <= 1 LSB
 #   bilateral  f16 630/638 (gray, with guide, yuv420): one half step (4.88e-4)
-#                                     -> 1e-3, the same f16 bound as
+#                                     -> F16_STEP, the same f16 bound as
 #                                     tests/test_bilateral.py
 #   bm3d       f32 630/638 (radius=1): 6.44e-3 -> block-match decision flips
-#                                     on rounding order; 0.02 bound
+#                                     on rounding order; 7e-3 bound
 #   eedi3      u16: bit-exact vs eedi3vk2 (shared surface); f32 ~1 ulp
 #   eedi3h     u16/f32: 0.0 vs the same-plugin transpose oracle
 #   eedi3aa    u16: 0.0; f32: a few ulp of the fused chain (~6e-8 measured)
 #   nlmeans    u16: <= 1 code; f32: <= 7.2e-7 (1e-5 bound here, the same
 #                     f32-accumulation-order band as test_nlmeans.py)
-#   nlmeans    f16 630/638: one half step (4.88e-4) -> 1e-3, the same bound
-#                     tests/test_nlmeans.py uses for the half sweeps
+#   nlmeans    f16 630/638: one half step (4.88e-4) -> F16_STEP
 # The yuv420 cases exercise half-width chroma: at 630 luma px the chroma rows
 # are 315 samples, i.e. 630 bytes for u16 (22 mod 32) — the alignment that made
 # the old DFTTest download helper fault.
 TOL_F32_ULP = 1e-6
 TOL_U16_LSB = 1.0
-TOL_F16 = 1e-3
-TOL_BM3D = 0.02
+TOL_F16 = F16_STEP
+TOL_BM3D = 7e-3
 TOL_EEDI3_U16 = 0.0
 TOL_EEDI3_F32 = 1e-6
 TOL_ORACLE_EXACT = 0.0
@@ -292,7 +291,7 @@ for _w in WIDTHS:
     _add("bilateral", 16, _w, 0, _BILATERAL_PARAMS, TOL_F16, half=1)
     _add("bilateral", 16, _w, 1, _BILATERAL_PARAMS, TOL_F16, half=1)
     _add("bm3d", 32, _w, 0, _BM3D_PARAMS, TOL_BM3D)
-    # R3: NNEDI3's prescreen dispatch grid must cover every row's tail
+    # NNEDI3's prescreen dispatch grid must cover every row's tail
     # (P=4 does not divide 630/638).  GRAY16 only: nnedi3vk wants an integer
     # clip, and vsfeel==nnedi3vk is bit-exact here (measured 0 codes).
     _add("nnedi3", 16, _w, 0, _NNEDI3_PARAMS, TOL_U16_LSB)
@@ -313,7 +312,7 @@ for _w in WIDTHS:
     # 640-wide source) is 1226 bytes, its own alignment for the 2-byte sample.
     _add("nlmeans", 16, _w, 0, _NLMEANS_PARAMS, TOL_NLMEANS_F16, half=1)
 
-# Subsampled chroma (R1/R2): the chroma planes are half the luma width, so
+# Subsampled chroma: the chroma planes are half the luma width, so
 # their visible rows are 315 * itemsize bytes at 630 px — a different pitch and
 # alignment from luma's. This is the case that crashed the old aligned stream
 # load in the DFTTest download helper (630-byte u16 rows are 22 mod 32).
@@ -379,7 +378,9 @@ def test_cropped_width_matches_reference(spec, tol):
     assert payload["height"] == HEIGHT - spec.get("top", 0) - spec.get("bottom", 0), (
         f"unexpected output height {payload['height']} for {spec}"
     )
-    assert payload["frames"] == spec["frames"]
+    assert payload["num_frames"] == CLIP_FRAMES, (
+        f"unexpected output length {payload['num_frames']} for {spec}"
+    )
     maxdiff = float(payload["maxdiff"])
     assert maxdiff <= tol, (
         f"{spec['filter']} bits={spec['bits']} width={spec['width']} "

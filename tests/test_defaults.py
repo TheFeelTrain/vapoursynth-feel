@@ -11,11 +11,11 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
-    CLIP_PATH,
     cpu_node,
     plane_to_ndarray,
     reference_compare,
     reference_spec,
+    source_clip,
 )
 
 CASES = [
@@ -47,7 +47,7 @@ def test_bm3d_plugin_defaults_are_the_documented_values():
     flips (measured up to 1e-2), so this pins the argument handling instead;
     the CPU parity of each default is covered by the explicit sweeps.
     """
-    src = vs.core.bs.VideoSource(CLIP_PATH)
+    src = source_clip()
     gray = vs.core.fmtc.bitdepth(
         vs.core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True
     )

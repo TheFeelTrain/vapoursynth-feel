@@ -11,7 +11,7 @@ once), so the f16 sweeps mirror the u16/f32 ones against vszipcl's half output
 with a measured half-step bound, and a device-independent oracle pins the half
 path to the f32 one on byte-identical input.
 
-Run from the repository root:  uv run python -m pytest tests/test_nlmeans.py
+Run from the repository root:  tools/test.sh tests/test_nlmeans.py -q
 """
 
 import numpy as np

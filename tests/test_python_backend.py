@@ -5,6 +5,10 @@ that the package imports and its duck-typed backend runs through the
 unmodified vs-jetpack wrappers.
 """
 
+# The optional oracles are imported through require_optional, which must run
+# before the imports it guards.
+# ruff: noqa: E402
+
 import dataclasses
 import inspect
 import os
@@ -16,10 +20,16 @@ import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import CLIP_PATH, cpu_node, frame_to_ndarray, plane_to_ndarray
+from conftest import (
+    cpu_node,
+    frame_to_ndarray,
+    plane_to_ndarray,
+    require_optional,
+    source_clip,
+)
 
-pytest.importorskip("vstools")
-pytest.importorskip("vsaa")
+require_optional("vstools")
+require_optional("vsaa")
 
 from vsaa import EEDI3, NNEDI3
 from vsaa import based_aa
@@ -563,7 +573,7 @@ def test_bm3d_wrapper_forwards_chroma(clip_grays):
     """
     from vsdenoise import bm3d as _bm3d
 
-    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(CLIP_PATH), format=vs.YUV444PS)
+    yuv444 = vs.core.resize.Bicubic(source_clip(), format=vs.YUV444PS)
     out = cpu_node(_bm3d(yuv444, 0.7, tr=2, profile=_bm3d.Profile.FAST, backend=_backend()))
     for plane in range(3):
         a = plane_to_ndarray(out.get_frame(0), plane)

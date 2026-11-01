@@ -17,7 +17,7 @@ graded against the f32 path on the losslessly widened clip within the half
 ulp its store rounding adds (F16_TOL below). Self-consistency checks remain
 exact at every depth.
 
-Run from the repository root:  uv run python -m pytest tests/test_dfttest.py
+Run from the repository root:  tools/test.sh tests/test_dfttest.py -q
 """
 
 import json
@@ -35,6 +35,7 @@ import vapoursynth as vs
 from conftest import (
     WIDTH,
     HEIGHT,
+    CLIP_FRAMES,
     CLIP_PATH,
     COMPARE_PRELUDE,
     assert_all_frames_finite,
@@ -81,11 +82,13 @@ def _ref_compare(fmt, params, frames=(0, 11, 23), planes=None):
 
 
 def test_dfttest_deterministic_f32(clip_grays):
+    """The f32 path has no atomics, so two runs are bit-identical."""
     a = _run(clip_grays)
     b = _run(clip_grays)
     for n in (0, 11, 23):
-        d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
-        assert np.abs(d).max() < 1e-6, f"nondeterministic output at frame {n}"
+        assert np.array_equal(frame_to_ndarray(a.get_frame(n)), frame_to_ndarray(b.get_frame(n))), (
+            f"nondeterministic output at frame {n}"
+        )
 
 
 def test_dfttest_preserves_frame_props(clip_grays):
@@ -94,17 +97,20 @@ def test_dfttest_preserves_frame_props(clip_grays):
 
 
 def test_dfttest_parallel_load_consistent_f32(clip_grays):
-    """Two parallel runs must match the serial path, and each
-    other — the request pattern that exposes stale descriptor bindings,
-    fence misuse and command-pool reuse violations under load."""
+    """Two parallel runs must match the serial path, and each other.
+
+    The request pattern that exposes stale descriptor bindings, fence misuse
+    and command-pool reuse violations under load; the f32 path is
+    deterministic, so the match is exact.
+    """
     a = eval_parallel(_run, clip_grays)
     b = eval_parallel(_run, clip_grays)
     ref = _run(clip_grays)
     for n in range(clip_grays.num_frames):
         r = frame_to_ndarray(ref.get_frame(n))
-        assert np.abs(a[n] - r).max() < 1e-6, f"parallel 1/serial mismatch at frame {n}"
-        assert np.abs(b[n] - r).max() < 1e-6, f"parallel 2/serial mismatch at frame {n}"
-        assert np.abs(a[n] - b[n]).max() < 1e-6, f"nondeterministic output at frame {n}"
+        assert np.array_equal(a[n], r), f"parallel 1/serial mismatch at frame {n}"
+        assert np.array_equal(b[n], r), f"parallel 2/serial mismatch at frame {n}"
+        assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
 
 
 def test_dfttest_deterministic_u16(clip_gray16):
@@ -241,7 +247,8 @@ def test_dfttest_vspipe_pipelined_chained_no_hang_u16(chained, tmp_path):
     """)
     )
     vspipe = shutil.which("vspipe")
-    assert vspipe, "vspipe not on PATH"
+    if not vspipe:
+        pytest.skip("vspipe not on PATH")
     try:
         result = subprocess.run(
             [vspipe, "-p", str(script), "/dev/null"],
@@ -380,6 +387,10 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     planes = json.loads(sys.argv[3])
 
     src = core.bs.VideoSource({CLIP_PATH!r})
+    if src.num_frames > {CLIP_FRAMES}:
+        # The fixtures expose CLIP_FRAMES: DFTTest's temporal window must clamp
+        # at the same last frame instead of seeing the full file's neighbours.
+        src = core.std.Trim(src, first=0, length={CLIP_FRAMES})
     if clip_kind == "grays":
         clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
     elif clip_kind == "gray16":
@@ -810,7 +821,7 @@ def test_dfttest_planes_chroma_leaves_luma_untouched(clip_grays):
     """With planes=[1,2] the unprocessed luma must be copied through
     bit-identically while both chroma planes change."""
     core = vs.core
-    src = core.fmtc.bitdepth(core.bs.VideoSource(CLIP_PATH), bits=32, fulls=True, fulld=True)
+    src = core.fmtc.bitdepth(source_clip(), bits=32, fulls=True, fulld=True)
     out = _run(src, planes=[1, 2])
     for n in (0, 11, 23):
         f = out.get_frame(n)

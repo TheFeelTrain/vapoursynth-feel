@@ -17,6 +17,12 @@ CLIP_FRAMES = 24
 WIDTH = 640
 HEIGHT = 360
 
+# One half step at |v| in [0.5, 1): the most a store that rounds an f32 result
+# once to half can move a sample. Shared so the same filter/depth is graded at
+# the same bound in every file (a value above the unit peak doubles it; a value
+# on a tie can flip one step when the f32 result jitters).
+F16_STEP = 4.8828125e-4
+
 
 def _source(path, frames=CLIP_FRAMES):
     core = vs.core
@@ -269,6 +275,18 @@ def skip_or_fail_reference(reason):
     if _REQUIRE_REFERENCES:
         pytest.fail(f"reference required but unavailable (--require-references): {reason}")
     pytest.skip(reason)
+
+
+def require_optional(module):
+    """Import an optional oracle, skipping only in a non-strict run.
+
+    ``pytest.importorskip`` would skip a missing oracle even when the run
+    demands every reference be present, which silently deletes its coverage.
+    """
+    try:
+        return __import__(module)
+    except ImportError:
+        skip_or_fail_reference(f"optional oracle {module} is not installed")
 
 
 def reference_or_skip(plugin, func=None):
@@ -890,23 +908,26 @@ def assert_preserves_frame_props(
     ``duration_factor`` divides the source duration, matching the reference
     convention for a filter that doubles its frame rate (``muldivRational(num,
     den, 1, factor)``); it defaults to 1 for filters that keep the frame rate.
+    The source always carries the base tags; only the expected output is
+    scaled, so a filter that fails to halve the duration is caught.
     """
-    tags = dict(PROP_TAGS)
+    source = dict(PROP_TAGS)
+    want = dict(source)
     if duration_factor != 1:
-        num, den = tags["_DurationNum"], tags["_DurationDen"] * duration_factor
+        num, den = want["_DurationNum"], want["_DurationDen"] * duration_factor
         g = math.gcd(num, den)
-        tags["_DurationNum"], tags["_DurationDen"] = num // g, den // g
-    tagged = vs.core.std.SetFrameProps(clip, **tags)
+        want["_DurationNum"], want["_DurationDen"] = num // g, den // g
+    tagged = vs.core.std.SetFrameProps(clip, **source)
     out = filter_func(tagged, **kwargs)
     for n in frames:
         props = out.get_frame(n).props
-        for key, want in tags.items():
+        for key, expected in want.items():
             got = props.get(key)
             assert got is not None, f"{key} lost at frame {n}"
             if key == "_Range":
-                assert int(got) == want, f"_Range changed at frame {n}: {got}"
+                assert int(got) == expected, f"_Range changed at frame {n}: {got}"
             else:
-                assert got == want, f"{key} changed at frame {n}: {got}"
+                assert got == expected, f"{key} changed at frame {n}: {got}"
 
 
 # ---------------------------------------------------------------------------

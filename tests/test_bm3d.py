@@ -6,7 +6,7 @@ temporal pipeline: frames 0..23 must all produce finite output with no NaN
 (regression: boundary frames intermittently produced NaN before the atomics
 were made visible to the aggregation kernel).
 
-Run from the repository root:  uv run python -m pytest tests/test_bm3d.py
+Run from the repository root:  tools/test.sh tests/test_bm3d.py -q
 """
 
 import ctypes
@@ -23,8 +23,10 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
+    CLIP_FRAMES,
     CLIP_PATH,
     COMPARE_PRELUDE,
+    F16_STEP,
     ReferenceUnavailable,
     assert_all_frames_finite,
     assert_preserves_frame_props,
@@ -532,7 +534,7 @@ def _blank(w, h):
 
 @pytest.mark.parametrize("w,h", [(1, 1), (4, 4), (7, 8), (8, 7)])
 def test_bm3d_rejects_dimensions_below_block(w, h):
-    """R7: dimensions smaller than the 8x8 block must be rejected at creation.
+    """Dimensions smaller than the 8x8 block must be rejected at creation.
 
     Before the fix a 4x4 clip was accepted and dispatched negative block
     coordinates into the patch loads.
@@ -632,7 +634,7 @@ def test_bm3d_device_id(clip_grays):
 
 
 def test_bm3d_preserves_gray_frame_props(clip_grays):
-    """R13: the grayscale path must keep the source frame's properties.
+    """The grayscale path must keep the source frame's properties.
 
     ``_ColorRange`` is deprecated in VapourSynth R79 and is remapped by
     ``SetFrameProps``; the surviving equivalent key ``_Range`` is tagged
@@ -674,7 +676,7 @@ def test_bm3d_chroma_planes_are_denoised(clip_grays):
 def test_bm3d_unprocessed_plane_is_source_copy(sigma):
     """A plane whose sigma is below FLT_EPSILON is a bit-exact source copy,
     while the others are still denoised (the reference's PROC_MASK)."""
-    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(CLIP_PATH), bits=32, fulls=True, fulld=True)
+    yuv = vs.core.fmtc.bitdepth(source_clip(), bits=32, fulls=True, fulld=True)
     out = BM3D(
         yuv, sigma=sigma, radius=2, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=BLOCK_STEP
     )
@@ -701,7 +703,7 @@ def test_bm3d_all_planes_below_epsilon_returns_source():
     ``vnode:gpu`` argument, so the node it hands back is GPU resident like any
     other BM3D output.
     """
-    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(CLIP_PATH), bits=32, fulls=True, fulld=True)
+    yuv = vs.core.fmtc.bitdepth(source_clip(), bits=32, fulls=True, fulld=True)
     out = vs.core.vsfeel.BM3D(yuv, sigma=[0.0], radius=2)
     assert out.gpu_resident, "BM3D output must stay GPU resident"
     node = cpu_node(out)
@@ -713,14 +715,25 @@ def test_bm3d_all_planes_below_epsilon_returns_source():
             )
 
 
-def test_bm3d_per_plane_parameters_are_honoured():
-    """Each plane runs with its own sigma/block_step/bm_range/ps_num/ps_range.
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"sigma": [0.7, 0.3, 0.7]},
+        {"block_step": [4, 8, 4]},
+        {"bm_range": [16, 4, 16]},
+        {"ps_range": [7, 2, 7]},
+        {"ps_num": [2, 5, 2]},
+    ],
+    ids=["sigma", "block_step", "bm_range", "ps_range", "ps_num"],
+)
+def test_bm3d_per_plane_parameters_are_honoured(changed):
+    """Each per-plane knob is read for its own plane.
 
-    Two runs that differ only in plane 1's parameters must differ on plane 1
-    and agree elsewhere: a filter that ignored the per-plane arrays would
-    produce identical frames.
+    Two runs that differ only in plane 1's value for one knob must differ on
+    plane 1 and agree elsewhere; changing several knobs together let a single
+    ignored knob pass.
     """
-    yuv = vs.core.fmtc.bitdepth(vs.core.bs.VideoSource(CLIP_PATH), bits=32, fulls=True, fulld=True)
+    yuv = vs.core.fmtc.bitdepth(source_clip(), bits=32, fulls=True, fulld=True)
     base = dict(
         sigma=[0.7, 0.7, 0.7],
         radius=2,
@@ -729,9 +742,7 @@ def test_bm3d_per_plane_parameters_are_honoured():
         block_step=[4, 4, 4],
         ps_num=[2, 2, 2],
     )
-    other = dict(
-        base, sigma=[0.7, 0.3, 0.7], block_step=[4, 8, 4], bm_range=[16, 4, 16], ps_range=[7, 2, 7]
-    )
+    other = dict(base, **changed)
     a = BM3D(yuv, **base)
     b = BM3D(yuv, **other)
     for n in (0, 11, 23):
@@ -743,9 +754,9 @@ def test_bm3d_per_plane_parameters_are_honoured():
                 ).max()
             )
             if plane == 1:
-                assert d > 1e-4, f"plane 1 parameters were ignored at frame {n}"
+                assert d > 1e-4, f"plane 1's {changed} was ignored at frame {n}"
             else:
-                assert d < 1e-5, f"plane {plane} changed with plane 1's parameters"
+                assert d < 1e-5, f"plane {plane} changed with plane 1's {changed}"
 
 
 def test_bm3d_per_plane_radius_matches_scalar_runs(clip_yuv420ps):
@@ -812,7 +823,7 @@ def test_bm3d_per_plane_radius_ignores_unprocessed_plane(clip_yuv420ps):
 def test_bm3d_joint_radius_uses_widest_plane(clip_grays):
     """chroma=True shares one window, so it runs at the widest processed
     plane's radius instead of narrowing any plane's request."""
-    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(CLIP_PATH), format=vs.YUV444PS)
+    yuv444 = vs.core.resize.Bicubic(source_clip(), format=vs.YUV444PS)
     kw = dict(
         sigma=[SIGMA, SIGMA, SIGMA],
         bm_range=BM_RANGE,
@@ -835,14 +846,10 @@ def test_bm3d_joint_radius_uses_widest_plane(clip_grays):
 
 def test_bm3d_chroma_requires_yuv444():
     """chroma=True is the reference's joint entry and needs 4:4:4 input."""
-    yuv420 = vs.core.fmtc.bitdepth(
-        vs.core.bs.VideoSource(CLIP_PATH), bits=32, fulls=True, fulld=True
-    )
+    yuv420 = vs.core.fmtc.bitdepth(source_clip(), bits=32, fulls=True, fulld=True)
     with pytest.raises(vs.Error, match="YUV444"):
         vs.core.vsfeel.BM3D(yuv420, sigma=0.7, chroma=1)
-    rgb = vs.core.resize.Bicubic(
-        vs.core.bs.VideoSource(CLIP_PATH), format=vs.RGBS, matrix_in_s="709"
-    )
+    rgb = vs.core.resize.Bicubic(source_clip(), format=vs.RGBS, matrix_in_s="709")
     with pytest.raises(vs.Error, match="YUV444"):
         vs.core.vsfeel.BM3D(rgb, sigma=0.7, chroma=1)
 
@@ -850,7 +857,7 @@ def test_bm3d_chroma_requires_yuv444():
 def test_bm3d_joint_chroma_denoises_every_plane():
     """chroma=True packs the three 4:4:4 planes into one entry; a sigma-zero
     plane of that entry is skipped and comes from the source."""
-    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(CLIP_PATH), format=vs.YUV444PS)
+    yuv444 = vs.core.resize.Bicubic(source_clip(), format=vs.YUV444PS)
     out = BM3D(
         yuv444,
         sigma=[0.7, 0.7, 0.7],
@@ -889,7 +896,7 @@ def test_bm3d_joint_chroma_denoises_every_plane():
 def test_bm3d_joint_chroma_shares_luma_groups():
     """Joint mode is not the per-plane mode: its chroma planes are filtered
     with the groups block matching found on luma, so the two differ."""
-    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(CLIP_PATH), format=vs.YUV444PS)
+    yuv444 = vs.core.resize.Bicubic(source_clip(), format=vs.YUV444PS)
     kw = dict(
         sigma=[0.7, 0.7, 0.7], radius=2, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=BLOCK_STEP
     )
@@ -914,9 +921,7 @@ def test_bm3d_joint_chroma_shares_luma_groups():
 
 def test_bm3d_rgb_is_denoised():
     """RGB input runs all three planes like the references do."""
-    rgb = vs.core.resize.Bicubic(
-        vs.core.bs.VideoSource(CLIP_PATH), format=vs.RGBS, matrix_in_s="709"
-    )
+    rgb = vs.core.resize.Bicubic(source_clip(), format=vs.RGBS, matrix_in_s="709")
     out = BM3D(
         rgb, sigma=0.7, radius=2, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=BLOCK_STEP
     )
@@ -936,9 +941,7 @@ def test_bm3d_rejects_subsampled_plane_below_block():
     The kernel clamps block origins to (dimension - 8), so an 8-row YUV420 clip
     (4-row chroma) would address before its plane's buffer.
     """
-    yuv420 = vs.core.fmtc.bitdepth(
-        vs.core.bs.VideoSource(CLIP_PATH), bits=32, fulls=True, fulld=True
-    )
+    yuv420 = vs.core.fmtc.bitdepth(source_clip(), bits=32, fulls=True, fulld=True)
     small = vs.core.std.CropAbs(yuv420, width=640, height=8)
     with pytest.raises(vs.Error, match="8x8"):
         vs.core.vsfeel.BM3D(small, sigma=0.7, radius=1)
@@ -956,7 +959,7 @@ def test_bm3d_rejects_subsampled_plane_below_block():
 )
 def test_bm3d_accepts_yuv444(kwargs):
     """The per-plane and joint entry points both accept 4:4:4 input."""
-    yuv444 = vs.core.resize.Bicubic(vs.core.bs.VideoSource(CLIP_PATH), format=vs.YUV444PS)
+    yuv444 = vs.core.resize.Bicubic(source_clip(), format=vs.YUV444PS)
     out = BM3D(yuv444, radius=1, bm_range=2, ps_range=1, block_step=4, **kwargs)
     for n in (0, 5):
         for plane in range(3):
@@ -996,7 +999,7 @@ def test_bm3d_sigma_below_epsilon_passes_through(clip_grays, sigma, use_ref):
 
 
 # ---------------------------------------------------------------------------
-# Seek schedule (R5)
+# Seek schedule
 # ---------------------------------------------------------------------------
 
 # The modulo-64 writer table used to let a seek schedule mix up which stream
@@ -1068,8 +1071,9 @@ _SEEK_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 
 
 def test_bm3d_seek_collision_self_consistent():
-    """R5: the 0/64/1/65/2 schedule on a 96-frame clip must not deadlock and
-    must match a serial run (measured max diff ~2e-8)."""
+    """The 0/64/1/65/2 schedule on a 1200-frame clip (the 300-frame source
+    looped four times) must not deadlock and must match a serial run
+    (measured max diff ~2e-8)."""
     try:
         worst = run_compare_subprocess(_SEEK_SCRIPT, [], timeout=300)
     except ReferenceUnavailable as exc:
@@ -1397,6 +1401,10 @@ f16_sample = spec.get("sample") == "f16"
 planes = None
 
 source = core.bs.VideoSource(spec["source"])
+if source.num_frames > spec["nframes"]:
+    # The fixtures expose CLIP_FRAMES: a temporal filter's last frame must see
+    # the same clamped window, not the full file's real neighbours.
+    source = core.std.Trim(source, first=0, length=spec["nframes"])
 if kind == "grays":
     clip = core.fmtc.bitdepth(core.std.ShufflePlanes(source, 0, vs.GRAY), bits=32,
                               fulls=True, fulld=True)
@@ -1534,6 +1542,7 @@ def _cpu_compare(
         skip_or_fail_reference("the CPU bm3d plugin (Basic/VBasic/VAggregate) is not installed")
     spec = {
         "source": CLIP_PATH,
+        "nframes": CLIP_FRAMES,
         "clip": clip,
         "frames": list(frames),
         "kwargs": dict(kwargs),
@@ -2136,11 +2145,12 @@ def test_bm3d_f16_color_matches_cpu():
     assert payload["maxdiff"] < 1.5e-2, f"f16 color vs CPU: {payload} (was 0.00676)"
 
 
-# One half store step is 2.44e-4 at 0.5 and 4.88e-4 at 1.0. Measured worst over
-# this sweep: 2.85e-4 (gray, radius 2). The aggregation's ~3e-8 ordering jitter
-# can flip a value that sits on a half tie, so this is a bound, not an equality:
-# a half path that ever grew half arithmetic of its own would blow past it.
-F16_STORE_TOL = 1e-3
+# One half store step is F16_STEP at the unit peak. Measured worst over this
+# sweep: 2.85e-4 (gray, radius 2). The aggregation's ~3e-8 ordering jitter can
+# flip a value that sits on a half tie, which moves it by one step, so this is
+# a bound, not an equality: a half path that ever grew half arithmetic of its
+# own would blow past it.
+F16_STORE_TOL = F16_STEP
 
 
 def _widened_f32(clip_h):

@@ -5,8 +5,12 @@ kernel), which is also what ``vsaa.based_aa`` uses for an integer ``rfactor``.
 Every depth (u16, f16, f32) and every color family are compared on the committed
 bigbuckbunny_360p_grain.mp4 clip, whose grain exercises every tap window.
 
-Run from the repository root:  uv run python -m pytest tests/test_box.py
+Run from the repository root:  tools/test.sh tests/test_box.py -q
 """
+
+# The optional oracles are imported through require_optional, which must run
+# before the imports it guards.
+# ruff: noqa: E402
 
 import os
 import subprocess
@@ -17,14 +21,16 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
+    F16_STEP,
     assert_preserves_frame_props,
     cpu_node,
     eval_parallel,
     plane_to_ndarray,
     plane as _plane,
+    require_optional,
 )
 
-pytest.importorskip("vskernels")
+require_optional("vskernels")
 from vskernels import Box
 
 # Measured agreement with resize2, per downscale ratio, on the 640x360 fixture:
@@ -52,9 +58,10 @@ RATIOS = [
     (6, 1, 1.8e-7),
 ]
 
-# The f32 bound for the ratios the color sweep uses, so a color case is graded
-# at its own measured ratio instead of the loosest sibling.
+# The per-ratio bounds for the ratios the color sweep uses, so a color case is
+# graded at its own measured ratio instead of the loosest sibling.
 RATIO_REL = {ratio: rel_bound for ratio, _, rel_bound in RATIOS}
+RATIO_ABS = {ratio: abs_bound for ratio, abs_bound, _ in RATIOS}
 
 # Subsampled formats need even chroma planes, so their fractional ratios are
 # limited to the ones that keep the lattice legal (resize2 rejects the rest).
@@ -78,11 +85,11 @@ COLOR_CASES = [
 # clip's own 2-byte samples, every accumulator is f32, and the two passes round
 # the intermediate and the output to half (OpFConvert, round-to-nearest-even,
 # the reference's vstore_half_rte). Measured against resize2 on the GRAYH
-# fixture, every plane, all 24 frames: bit-exact at 2, 4, 1.5, 1.25, 1.75, 1.1
+# fixture over all 24 frames: bit-exact at 2, 4, 1.5, 1.25, 1.75, 1.1
 # and 4/3, and one half step (4.88e-4 at the unit peak) at 3, 2.5, 3.5, 5 (our
 # f32 divide can flip a half tie) and at 6, 8 (resize2's own f16 tap window
-# straddles two 8-tap blocks).
-F16_STEP = 4.8828125e-4  # one half step at the unit peak
+# straddles two 8-tap blocks). The ratio sweeps read frame 0;
+# test_box_oracle_holds_on_every_frame re-checks every frame at ratio 2.
 
 # (ratio, worst absolute difference)
 F16_RATIOS = [
@@ -100,6 +107,9 @@ F16_RATIOS = [
     (5, F16_STEP),
     (6, F16_STEP),
 ]
+
+# The f16 bound for the ratios the half color sweep uses (all measured 0).
+RATIO_F16 = dict(F16_RATIOS)
 
 # Half mirrors of COLOR_CASES, on the fixtures built from their f32 siblings.
 COLOR_CASES_F16 = [
@@ -227,7 +237,8 @@ def test_agrees_with_resize2_color(request, fmt, ratio):
     planes = list(range(clip.format.num_planes))
     if clip.format.sample_type == vs.INTEGER:
         abs_d, _ = _worst(clip, w, h, planes)
-        assert abs_d <= 2, f"max|d|={abs_d}"
+        bound = RATIO_ABS[ratio]
+        assert abs_d <= bound, f"{ratio}: max|d|={abs_d} > {bound}"
     else:
         _, rel_d = _worst_f32(clip, w, h, planes)
         bound = RATIO_REL[ratio]
@@ -269,7 +280,29 @@ def test_agrees_with_resize2_color_f16(request, fmt, ratio):
     assert (out.width, out.height) == (w, h)
     planes = list(range(clip.format.num_planes))
     worst = _worst_f16(clip, w, h, planes)
-    assert worst <= F16_STEP, f"max|d|={worst}"
+    bound = RATIO_F16[ratio]
+    assert worst <= bound, f"{ratio}: max|d|={worst} > {bound}"
+
+
+def test_box_oracle_holds_on_every_frame(clip_gray16, clip_grays, clip_grayh):
+    """The oracle must hold on every frame, not only the frame-0 sweeps.
+
+    Ratio 2 is bit-exact for every depth, so all 24 frames are compared with
+    array equality; this is what backs the "all 24 frames" measurement in the
+    f16 comment above.
+    """
+    for clip, reader in (
+        (clip_gray16, _px),
+        (clip_grays, _pxf32),
+        (clip_grayh, _pxf),
+    ):
+        w, h = _target(clip, 2)
+        ref = _ref(clip, w, h)
+        out = _box(clip, w, h)
+        for n in range(clip.num_frames):
+            a = reader(ref, 0, n).astype(np.float64)
+            b = reader(out, 0, n).astype(np.float64)
+            assert np.array_equal(a, b), f"{clip.format.name} changed at frame {n}"
 
 
 def test_f16_keeps_the_half_format(clip_grayh):
@@ -462,9 +495,8 @@ def test_one_axis_omitted_matches_resize2(clip_gray16):
     ):
         out = cpu_node(vs.core.vsfeel.Box(clip_gray16, **kwargs))
         ref = _ref(clip_gray16, width, height)
-        for p in (0,):
-            d = np.abs(_px(out, p) - _px(ref, p))
-            assert d.max() <= 1, f"{kwargs}: {d.max()} codes"
+        d = np.abs(_px(out, 0) - _px(ref, 0))
+        assert d.max() <= 1, f"{kwargs}: {d.max()} codes"
 
 
 def test_tiny_subsampled_target(clip_yuv420p16):

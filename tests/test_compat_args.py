@@ -17,6 +17,8 @@ KWARGS = {
     "NLMeans": {"h": 1.5, "d": 0},
     "BM3D": {"sigma": 0.7, "radius": 0},
     "EEDI3": {"field": 1},
+    "EEDI3H": {"field": 1},
+    "EEDI3AA": {"field": 3},
     "NNEDI3": {"field": 1},
     "WNNM": {"sigma": [3.0], "radius": 0},
 }

@@ -38,28 +38,20 @@ def test_gpu_resident_guide_matches_cpu_guide(clip_grays, name, kwargs, guide_kw
         assert np.abs(pa - pb).max() <= 1e-5, f"{name}: guide residency changed the output"
 
 
-def test_bad_guide_geometry_and_length_are_rejected(clip_grays):
-    """A guide must match the source's format, dimensions and frame count."""
-    guide = vs.core.vsfeel.GaussBlur(clip_grays, sigma=1.5)
-    wrong_size = vs.core.std.Crop(guide, right=8)
-    short = vs.core.std.Trim(guide, length=2)
-    wrong_format = vs.core.resize.Point(guide, format=vs.GRAY16)
+@pytest.mark.parametrize("kind", ["format", "size", "length"])
+@pytest.mark.parametrize("name,kwargs,guide_kwarg", CASES, ids=[c[0] for c in CASES])
+def test_guide_mismatch_is_rejected(clip_grays, name, kwargs, guide_kwarg, kind):
+    """Every guide-taking filter rejects every kind of mismatch.
 
+    A guide must match the source's format, dimensions and frame count; each
+    filter used to cover only some of the three.
+    """
+    guide = vs.core.vsfeel.GaussBlur(clip_grays, sigma=1.5)
+    bad = {
+        "format": vs.core.resize.Point(guide, format=vs.GRAY16),
+        "size": vs.core.std.Crop(guide, right=8),
+        "length": vs.core.std.Trim(guide, length=2),
+    }[kind]
+    fn = getattr(vs.core.vsfeel, name)
     with pytest.raises(vs.Error):
-        vs.core.vsfeel.Bilateral(
-            clip_grays, sigma_spatial=3.0, sigma_color=0.05, ref=wrong_size
-        ).get_frame(0)
-    with pytest.raises(vs.Error):
-        vs.core.vsfeel.Bilateral(
-            clip_grays, sigma_spatial=3.0, sigma_color=0.05, ref=short
-        ).get_frame(11)
-    with pytest.raises(vs.Error):
-        vs.core.vsfeel.NLMeans(clip_grays, h=1.5, d=0, rclip=wrong_format).get_frame(0)
-    with pytest.raises(vs.Error):
-        vs.core.vsfeel.NLMeans(clip_grays, h=1.5, d=0, rclip=short).get_frame(11)
-    with pytest.raises(vs.Error):
-        vs.core.vsfeel.WNNM(clip_grays, sigma=[3.0], radius=0, rclip=wrong_format).get_frame(0)
-    with pytest.raises(vs.Error):
-        vs.core.vsfeel.BM3D(clip_grays, sigma=0.7, radius=0, ref=wrong_size).get_frame(0)
-    with pytest.raises(vs.Error):
-        vs.core.vsfeel.BM3D(clip_grays, sigma=0.7, radius=0, ref=short).get_frame(11)
+        fn(clip_grays, **kwargs, **{guide_kwarg: bad}).get_frame(11)

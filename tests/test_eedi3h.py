@@ -1,11 +1,11 @@
 """Unit tests for core.vsfeel.EEDI3H (horizontal EEDI3).
 
-EEDI3H is a pure composition (Transpose -> EEDI3 -> Transpose, wired with
-invokes in Eedi3HCreate): no kernels or host paths of its own. That gives a
-very strong oracle — EEDI3H(x) must equal Transpose(EEDI3(Transpose(x)))
-BIT-EXACTLY for every config (u16 and f32 alike: transposition only permutes
-values, and the identical kernels then run identical operation sequences on
-identical relative neighborhoods).
+EEDI3H runs the EEDI3 pipeline on the transposed plane (the horizontal flag
+in the shared host path, no std.Transpose nodes). That gives a very strong
+oracle — EEDI3H(x) must equal Transpose(EEDI3(Transpose(x))) BIT-EXACTLY for
+every config (u16 and f32 alike: transposition only permutes values, and the
+identical kernels then run identical operation sequences on identical
+relative neighborhoods).
 
 Agreement measured on this clip:
 * transpose oracle: max diff 0 on every config tested (field 0/1/2/3, dh,
@@ -16,7 +16,7 @@ Agreement measured on this clip:
   3.9-4.0% of pixels differ, p99.9 <= 294 LSB, single pixels up to 7756.
   Loose sanity bounds only.
 
-Run from the repository root:  uv run python -m pytest tests/test_eedi3h.py
+Run from the repository root:  tools/test.sh tests/test_eedi3h.py -q
 """
 
 import numpy as np
@@ -26,7 +26,6 @@ import vapoursynth as vs
 from conftest import (
     WIDTH,
     HEIGHT,
-    CLIP_PATH,
     assert_preserves_frame_props,
     cpu_node,
     plane as _plane,
@@ -34,6 +33,7 @@ from conftest import (
     reference_or_skip,
     reference_spec,
     right_half_mask,
+    source_clip,
 )
 
 pytestmark = pytest.mark.usefixtures("clip_grays")
@@ -239,14 +239,9 @@ def test_eedi3h_output_dims_and_props(clip_gray16):
     assert (dbl.width, dbl.height) == (WIDTH, HEIGHT)
     props = dbl.get_frame(0).props
     assert props["_FieldBased"] == 0  # progressive
-    # duration halved under field>1 (same rule as EEDI3)
-    dur_num = props.get("_DurationNum")
-    src_props = clip.get_frame(0).props
-    if dur_num is not None and src_props.get("_DurationNum") is not None:
-        assert (
-            dur_num * src_props["_DurationDen"] * 2
-            == src_props["_DurationNum"] * props["_DurationDen"]
-        )
+    # Duration halved under field>1 (same rule as EEDI3). The helper tags the
+    # source, so a dropped duration is a failure rather than a skipped check.
+    assert_preserves_frame_props(_runh, clip, frames=(0,), field=3, mdis=5, duration_factor=2)
 
 
 def test_eedi3h_preserves_frame_props(clip_grays):
@@ -409,7 +404,7 @@ def test_eedi3h_rejects_bad_planes(clip_gray16):
 
 def test_eedi3h_rejects_dh_with_a_planes_subset():
     """dh cannot leave a plane unprocessed (see test_eedi3.py)."""
-    src = vs.core.bs.VideoSource(CLIP_PATH)
+    src = source_clip()
     yuv = vs.core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
     with pytest.raises(vs.Error):
         _runh(yuv, field=1, dh=1, planes=[0])
@@ -426,7 +421,7 @@ def test_eedi3h_ignores_device_id_and_num_streams(clip_gray16):
 
 
 def test_eedi3h_rejects_mclip_not_gray(clip_gray16):
-    src = vs.core.bs.VideoSource(CLIP_PATH)
+    src = source_clip()
     yuv = vs.core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
     with pytest.raises(vs.Error):
         _runh(clip_gray16, field=1, mclip=yuv)
@@ -548,7 +543,7 @@ def test_eedi3h_f16_determinism(clip_grayh):
 def test_eedi3h_f16_yuv_planes():
     """YUV420PH: unprocessed chroma passes through bit-identically."""
     core = vs.core
-    src = core.bs.VideoSource(CLIP_PATH)
+    src = source_clip()
     half = core.resize.Point(
         core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True), format=vs.YUV420PH
     )

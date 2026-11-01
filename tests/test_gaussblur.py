@@ -15,7 +15,7 @@ The f16 path needs one caveat. Its stores round to half, and its f32 sums can
 differ from the f32 path's in the last bits when the compiler folds the half ->
 float widening into the fma (measured: a handful of pixels per frame shift by
 exactly one half ulp). The two-pass kernels therefore bound the f16 reference
-diff at F16_STORE_ULP instead of 0.0; the non-finite footprint stays exact, and
+diff at F16_STEP instead of 0.0; the non-finite footprint stays exact, and
 f16-vs-f32 parity on the widened clip is checked separately below.
 
 Half is a storage width here, not a precision: the f16 path runs the same f32
@@ -24,7 +24,7 @@ f32 result rounded once per sample. One test below checks exactly that against
 the f32 path on the losslessly widened clip -- the device-independent half of
 the oracle, which fails if the half path ever grows arithmetic of its own.
 
-Run from the repository root:  uv run python -m pytest tests/test_gaussblur.py
+Run from the repository root:  tools/test.sh tests/test_gaussblur.py -q
 """
 
 import json
@@ -40,6 +40,7 @@ from conftest import (
     HEIGHT,
     CLIP_PATH,
     COMPARE_PRELUDE,
+    F16_STEP,
     assert_changes_on_clip,
     assert_preserves_frame_props,
     compare_or_skip,
@@ -48,6 +49,7 @@ from conftest import (
     frame_to_ndarray,
     plane as _plane,
     reference_or_skip,
+    source_clip,
 )
 
 pytestmark = pytest.mark.usefixtures("clip_grays")
@@ -75,27 +77,29 @@ def _run(clip, sigma=2.0, **kwargs):
 
 
 def test_gaussblur_deterministic_f32(clip_grays):
+    """The f32 path is deterministic, so two runs are bit-identical."""
     a = _run(clip_grays, sigma=2.0)
     b = _run(clip_grays, sigma=2.0)
     for n in (0, 11, 23):
-        d = frame_to_ndarray(a.get_frame(n)) - frame_to_ndarray(b.get_frame(n))
-        assert np.abs(d).max() < 1e-6, f"nondeterministic output at frame {n}"
+        assert np.array_equal(frame_to_ndarray(a.get_frame(n)), frame_to_ndarray(b.get_frame(n))), (
+            f"nondeterministic output at frame {n}"
+        )
 
 
 def test_gaussblur_parallel_load_matches_serial_f32(clip_grays):
     par = eval_parallel(_run, clip_grays, sigma=10.0)
     ref = _run(clip_grays, sigma=10.0)
     for n in range(clip_grays.num_frames):
-        d = par[n] - frame_to_ndarray(ref.get_frame(n))
-        assert np.abs(d).max() < 1e-6, f"parallel/serial mismatch at frame {n}"
+        assert np.array_equal(par[n], frame_to_ndarray(ref.get_frame(n))), (
+            f"parallel/serial mismatch at frame {n}"
+        )
 
 
 def test_gaussblur_parallel_load_deterministic_f32(clip_grays):
     a = eval_parallel(_run, clip_grays, sigma=10.0)
     b = eval_parallel(_run, clip_grays, sigma=10.0)
     for n in range(clip_grays.num_frames):
-        d = a[n] - b[n]
-        assert np.abs(d).max() < 1e-6, f"nondeterministic output at frame {n}"
+        assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
 
 
 def test_gaussblur_deterministic_u16(clip_gray16):
@@ -218,15 +222,6 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 """)
 
 
-# One half ulp at 0.5..1.0 (2**-11): the f16 two-pass kernels' f32 sums can
-# differ from the reference's in the last bits (the half -> float widening is
-# contracted into a mixed-precision fma), and the half store then surfaces that
-# as one ulp on the few pixels sitting on a rounding boundary. Measured on the
-# committed clip: 9 of the 69 f16 reference cases move, each by exactly this,
-# zero pixels at a larger delta. The f32/u16 paths stay at 0.0.
-F16_STORE_ULP = 4.8828125e-4
-
-
 def _max_diff_vs_reference(fmt: str, sigma) -> float:
     """Run the comparison in a subprocess.
 
@@ -292,9 +287,13 @@ def test_gaussblur_matches_reference_yuv_u16(clip_grays, sigma):
 
 # --- f16: same sweeps as the f32/u16 sets above ----------------------------
 #
-# Half input, half stores, f32 accumulation and an f32 scratch: the arithmetic
-# is the f32 path's, so the reference comparison stays exact rather than
-# needing a tolerance (measured max diff == 0.0 across this sweep).
+# Half input, half stores, f32 accumulation and an f32 scratch. The fused
+# small path reproduces the reference bit-for-bit. The two-pass kernels' f32
+# sums can differ in the last bits (the half -> float widening is contracted
+# into a mixed-precision fma), and the half store surfaces that as one half
+# step on the few pixels sitting on a rounding boundary: measured on the
+# committed clip, 9 of the 69 f16 reference cases move by exactly one step
+# (F16_STEP) and none by more. Only that path needs a bound.
 
 
 @pytest.mark.parametrize("sigma", [0.5, 2.0, 5.0, 10.0])
@@ -303,7 +302,7 @@ def test_gaussblur_matches_reference_small_f16(clip_grayh, sigma):
     vszipcl's f16 output."""
     reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("grayh", sigma)
-    assert maxdiff <= F16_STORE_ULP, f"f16 small path max diff: {maxdiff}"
+    assert maxdiff == 0.0, f"f16 small path max diff: {maxdiff}"
 
 
 @pytest.mark.parametrize("sigma", [10.5, 11.0, 12.0])
@@ -312,7 +311,7 @@ def test_gaussblur_matches_reference_path_boundary_f16(clip_grayh, sigma):
     input, on both sides of the switch."""
     reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("grayh", sigma)
-    assert maxdiff <= F16_STORE_ULP, f"f16 path boundary max diff: {maxdiff}"
+    assert maxdiff <= F16_STEP, f"f16 path boundary max diff: {maxdiff}"
 
 
 @pytest.mark.parametrize("sigma", [20.0, 30.0, 40.0, 80.0])
@@ -320,7 +319,7 @@ def test_gaussblur_matches_reference_large_f16(clip_grayh, sigma):
     """Two-pass large path (radius > 32) on half input."""
     reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("grayh", sigma)
-    assert maxdiff <= F16_STORE_ULP, f"f16 large path max diff: {maxdiff}"
+    assert maxdiff <= F16_STEP, f"f16 large path max diff: {maxdiff}"
 
 
 @pytest.mark.parametrize("sigma", [0.5, 3.0, 20.0])
@@ -329,7 +328,7 @@ def test_gaussblur_matches_reference_yuv_f16(clip_grayh, sigma):
     match vszipcl's f16 output bit-for-bit on both code paths."""
     reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("yuv420ph", sigma)
-    assert maxdiff <= F16_STORE_ULP, f"yuv420ph max diff ({sigma}): {maxdiff}"
+    assert maxdiff <= F16_STEP, f"yuv420ph max diff ({sigma}): {maxdiff}"
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +359,7 @@ def test_gaussblur_sigma_small_vs_large_consistent_u16(clip_gray16):
 
 def test_gaussblur_sigma_zero_passthrough_yuv_u16(clip_grays):
     """u16 mirror of test_gaussblur_sigma_zero_passthrough_yuv."""
-    src = vs.core.bs.VideoSource(CLIP_PATH)
+    src = source_clip()
     yuv = vs.core.resize.Bicubic(src, format=vs.YUV420P16)
     out = _run(yuv, sigma=[0.0, 3.0])
     for n in (0, 11, 23):
@@ -381,7 +380,7 @@ def test_gaussblur_sigma_zero_passthrough_yuv_u16(clip_grays):
 
 def test_gaussblur_sigma_zero_passthrough_yuv_f32(clip_grays):
     """sigma=0 on luma copies that plane through while chroma is blurred."""
-    src = vs.core.bs.VideoSource(CLIP_PATH)
+    src = source_clip()
     yuv = vs.core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
     out = _run(yuv, sigma=[0.0, 3.0])
     for n in (0, 11, 23):
@@ -605,7 +604,7 @@ def test_gaussblur_per_plane_sigma_matches_reference_yuv_f16(clip_grayh, sigma):
     """f16 mirror of the f32 per-plane array sweep (bit-exact)."""
     reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("yuv420ph", sigma)
-    assert maxdiff <= F16_STORE_ULP, f"yuv420ph per-plane sigma max diff ({sigma}): {maxdiff}"
+    assert maxdiff <= F16_STEP, f"yuv420ph per-plane sigma max diff ({sigma}): {maxdiff}"
 
 
 @pytest.mark.parametrize(
@@ -619,7 +618,7 @@ def test_gaussblur_matches_reference_yuv444_f16(clip_grayh, sigma):
     two-pass switch."""
     reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("yuv444ph", sigma)
-    assert maxdiff <= F16_STORE_ULP, f"yuv444ph max diff ({sigma}): {maxdiff}"
+    assert maxdiff <= F16_STEP, f"yuv444ph max diff ({sigma}): {maxdiff}"
 
 
 def test_gaussblur_per_plane_sigma_gray_f16(clip_grayh):
@@ -631,7 +630,7 @@ def test_gaussblur_per_plane_sigma_gray_f16(clip_grayh):
         a = _plane(scalar.get_frame(n), 0, dtype=np.float16)
         b = _plane(array.get_frame(n), 0, dtype=np.float16)
         assert np.array_equal(a, b), f"extra sigma elements changed frame {n}"
-    assert _max_diff_vs_reference("grayh", [2.0, 99.0, 0.25]) <= F16_STORE_ULP
+    assert _max_diff_vs_reference("grayh", [2.0, 99.0, 0.25]) <= F16_STEP
 
 
 def test_gaussblur_per_plane_sigma_gray_f32(clip_grays):
@@ -859,6 +858,6 @@ def test_gaussblur_nonfinite_footprint_matches_reference_f16(kind, sigma):
     assert result["mismatch"] == 0, (
         f"f16 {kind} sigma={sigma}: {result['mismatch']} pixels disagree on finiteness vs vszipcl"
     )
-    assert result["maxdiff"] <= F16_STORE_ULP, (
+    assert result["maxdiff"] <= F16_STEP, (
         f"f16 {kind} sigma={sigma}: finite pixels differ from vszipcl by {result['maxdiff']}"
     )

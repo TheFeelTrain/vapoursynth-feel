@@ -20,7 +20,7 @@ Self-consistency is separate: the scatter accumulates through buffer atomics, so
 two runs differ by the float-atomic ordering floor (measured <= 3.6e-7); those
 assertions use 1e-5 like BM3D's.
 
-Run from the repository root:  uv run python -m pytest tests/test_wnnm.py
+Run from the repository root:  tools/test.sh tests/test_wnnm.py -q
 """
 
 import gc
@@ -36,6 +36,7 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
+    CLIP_PATH,
     assert_all_frames_finite,
     assert_preserves_frame_props,
     assert_temporal_order_consistent,
@@ -699,8 +700,6 @@ for n in range(int(sys.argv[2]) + 1):
     out.get_frame(n)
 """
 
-_DUMP_CLIP = os.path.join(os.path.dirname(__file__), "bigbuckbunny_360p_grain.mp4")
-
 
 def _dump_records(params, frame, env=None):
     """Parse VSFEEL_WNNM_DUMP for one frame: (p, gx, gy, td) -> fields."""
@@ -712,7 +711,7 @@ def _dump_records(params, frame, env=None):
         **(env or {}),
     }
     proc = subprocess.run(
-        [sys.executable, "-c", _DUMP_SCRIPT, json.dumps(params), str(frame), _DUMP_CLIP],
+        [sys.executable, "-c", _DUMP_SCRIPT, json.dumps(params), str(frame), CLIP_PATH],
         capture_output=True,
         text=True,
         env=run_env,

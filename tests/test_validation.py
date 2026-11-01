@@ -10,7 +10,7 @@ The layer reports to stdout on this loader; both streams are scanned.  A
 test cannot pass vacuously on a box without it (the loader silently ignores a
 missing ``VK_INSTANCE_LAYERS`` entry).
 
-Run from the repository root:  uv run python -m pytest tests/test_validation.py
+Run from the repository root:  tools/test.sh tests/test_validation.py -q
 """
 
 import os
@@ -25,8 +25,8 @@ from conftest import CLIP_PATH
 
 _LAYER = "VK_LAYER_KHRONOS_validation"
 
-# One frame per filter, exercising the creation path and the frame path
-# (temporal / multi-pass filters get three frames).
+# Three frames per filter (0/3/7), exercising the creation path and the frame
+# path (temporal / multi-pass filters see more than one window position).
 FILTERS = [
     "Bilateral",
     "Bilateral_u16",

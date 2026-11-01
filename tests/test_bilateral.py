@@ -17,7 +17,7 @@ checks (determinism) remain exact at every depth.
 Every reference comparison runs in a subprocess (``reference_compare``) so a
 reference crash cannot take the pytest process down with it.
 
-Run from the repository root:  uv run python -m pytest tests/test_bilateral.py
+Run from the repository root:  tools/test.sh tests/test_bilateral.py -q
 """
 
 import numpy as np
@@ -25,6 +25,7 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
+    F16_STEP,
     assert_changes_on_clip,
     assert_grays,
     assert_preserves_frame_props,
@@ -47,11 +48,10 @@ REF_TOL = 1e-6
 # Half is a storage width, not a precision: the f16 variant runs the f32
 # arithmetic and narrows once at its store (round to nearest even, the
 # reference's vstore_half_rte). Measured on the noise clip, every f16 config
-# below lands at exactly 4.88e-4 (one half step at |v| in [0.5, 1)) on a few
-# tens of samples per frame; the two runs' f32 sums differ in their last bits,
-# and the half store surfaces that as one step. 1e-3 leaves headroom for a
-# second step on another driver's conversion.
-F16_TOL = 1e-3
+# below lands at exactly one half step (F16_STEP) on a few tens of samples per
+# frame; the two runs' f32 sums differ in their last bits, and the half store
+# surfaces that as one step.
+F16_TOL = F16_STEP
 
 
 def _run(clip, **kwargs):

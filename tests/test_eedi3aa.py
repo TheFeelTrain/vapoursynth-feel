@@ -27,7 +27,7 @@ Self-consistency (determinism across runs, multi-stream == single stream,
 parallel load) is exact. The chain's props (N frames, input fps,
 ``_FieldBased=PROGRESSIVE``) are asserted against the two-call chain.
 
-Run from the repository root:  uv run python -m pytest tests/test_eedi3aa.py
+Run from the repository root:  tools/test.sh tests/test_eedi3aa.py -q
 """
 
 import numpy as np
@@ -37,13 +37,13 @@ import vapoursynth as vs
 from conftest import (
     WIDTH,
     HEIGHT,
-    CLIP_PATH,
     assert_preserves_frame_props,
     cpu_node,
     dtype_for_bits as _dtype,
     eval_parallel,
     half_mask as _mask,
     plane as _plane,
+    source_clip,
 )
 
 pytestmark = pytest.mark.usefixtures("clip_grays")
@@ -262,11 +262,7 @@ def test_eedi3aa_field_based_input(clip_grays, clip_gray16, bits, fb):
 
 
 def _yuv(bits):
-    src = (
-        vs.core.bs.VideoSource(CLIP_PATH)
-        if hasattr(vs.core, "bs")
-        else vs.core.ffms2.Source(CLIP_PATH)
-    )
+    src = source_clip()
     return vs.core.fmtc.bitdepth(src, bits=bits, fulls=True, fulld=True)
 
 
@@ -403,16 +399,14 @@ def test_eedi3aa_props_match_chain(clip_gray16):
     for n in (0, 5):
         pm = mine.get_frame(n).props
         pr = ref.get_frame(n).props
-        assert pm.get("_FieldBased") == pr.get("_FieldBased")
-        assert pm.get("_DurationNum") == pr.get("_DurationNum")
-        assert pm.get("_DurationDen") == pr.get("_DurationDen")
+        for key in ("_FieldBased", "_DurationNum", "_DurationDen"):
+            assert key in pm and key in pr, f"{key} missing at frame {n}"
+            assert pm[key] == pr[key], f"{key} differs at frame {n}"
 
 
 def test_eedi3aa_preserves_frame_props(clip_grays):
-    """field=3 halves the duration (fps doubles) but must keep every other tag."""
-    assert_preserves_frame_props(
-        _aa, clip_grays, field=3, duration_factor=2, sclip=_interleave2(clip_grays)
-    )
+    """field=3 is single-rate, so every tag (duration included) is preserved."""
+    assert_preserves_frame_props(_aa, clip_grays, field=3, sclip=_interleave2(clip_grays))
 
 
 # ---------------------------------------------------------------------------
@@ -473,11 +467,21 @@ def test_eedi3aa_sclip_needs_2n_frames(clip_gray16):
 
 
 def test_eedi3aa_is_pure_plugin_extension(clip_gray16):
-    """EEDI3/EEDI3H are untouched: their own output must still equal the
-    composed chain (the fused filter is additive)."""
+    """The fused filter is the EEDI3 + EEDI3H + Merge chain, not a new kernel.
+
+    The full sweep is ``test_eedi3aa_oracle_u16``; this pins the extension
+    contract on the default config without the auxiliary clips.
+    """
     clip = clip_gray16
-    v = vs.core.vsfeel.EEDI3(clip, field=3, vcheck=2, mdis=5, nrad=1)
-    assert v.num_frames == 2 * clip.num_frames  # EEDI3 still doubles the rate
+    _assert_oracle(
+        clip,
+        np.uint16,
+        [0, 11, clip.num_frames - 1],
+        field=3,
+        vcheck=2,
+        mdis=5,
+        nrad=1,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +542,7 @@ def test_eedi3aa_f16_mclip_half_native(clip_grayh):
 def test_eedi3aa_f16_yuv_all_planes():
     """Every plane of a YUV420PH clip, subsampled half chroma included."""
     core = vs.core
-    src = core.bs.VideoSource(CLIP_PATH)
+    src = source_clip()
     clip = core.resize.Point(
         core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True), format=vs.YUV420PH
     )
@@ -596,7 +600,5 @@ def test_eedi3aa_f16_field_based_input(clip_grayh, fb):
 
 
 def test_eedi3aa_f16_preserves_frame_props(clip_grayh):
-    """field=3 keeps every other tag on a half clip."""
-    assert_preserves_frame_props(
-        _aa, clip_grayh, field=3, duration_factor=2, sclip=_interleave2(clip_grayh)
-    )
+    """field=3 keeps every tag on a half clip (the fused filter is single-rate)."""
+    assert_preserves_frame_props(_aa, clip_grayh, field=3, sclip=_interleave2(clip_grayh))

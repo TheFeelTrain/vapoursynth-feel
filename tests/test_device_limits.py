@@ -17,7 +17,7 @@ VSFEEL_LIMIT_SHARED_MEMORY, VSFEEL_LIMIT_VRAM_BUDGET). Those are read once per
 process when the core's device is brought up, so each case runs in its own
 subprocess.
 
-Run from the repository root:  uv run python -m pytest tests/test_device_limits.py
+Run from the repository root:  tools/test.sh tests/test_device_limits.py -q
 """
 
 import json
@@ -97,7 +97,16 @@ print("RESULT " + json.dumps(out), flush=True)
 )
 
 # name -> kwargs; the empty ones just take the filter's defaults.
-_256_KERNELS = ["dfttest", "nlmeans", "eedi3", "nnedi3", "bm3d", "wnnm_u16"]
+_256_KERNELS = [
+    "dfttest",
+    "nlmeans",
+    "eedi3",
+    "eedi3h",
+    "eedi3aa",
+    "nnedi3",
+    "bm3d",
+    "wnnm_u16",
+]
 
 
 def _run_limits(cases, env=None):
@@ -428,6 +437,10 @@ def test_gaussblur_small_path_fits_the_guaranteed_workgroup_memory():
     lds = [v for sigma in (2.0, 5.0, 8.0, 11.0) for v in _gauss_lds(sigma, floor)]
     assert 7680 in lds, lds  # the largest tile the small path asks for
     assert max(lds) <= 16384, lds  # and it fits the floor
+    # The two-pass path creates two pipelines (vert + horiz) and uses no
+    # shared memory at all, so the numbers say which path a config took.
+    large = _gauss_lds(20.0, floor)
+    assert large == [0, 0], large
 
 
 # ---------------------------------------------------------------------------

@@ -33,15 +33,11 @@ Agreement measured on the real-content clip (640x360, interp rows only):
   flip sets (up to ~1500 px of 115200, max ~3276) that are IDENTICAL to the
   eedi3m-vs-eedi3vk2 flip sets: both GPU implementations share one float-DP
   ordering while eedi3m's differs. Hence eedi3m is only a loose oracle here.
-* vsfeel vs eedi3m (the installed CPU reference) diverges on tiny sparse
-  flip sets (up to ~1500 px of 115200, max ~3276) that are IDENTICAL to the
-  eedi3m-vs-eedi3vk2 flip sets: both GPU implementations share one float-DP
-  ordering while eedi3m's differs. Hence eedi3m is only a loose oracle here.
 
 Self-consistency (determinism across streams/runs, multi-stream == single,
 parallel load) is exact.
 
-Run from the repository root:  uv run python -m pytest tests/test_eedi3.py
+Run from the repository root:  tools/test.sh tests/test_eedi3.py -q
 """
 
 import json
@@ -72,6 +68,7 @@ from conftest import (
     plane as _plane,
     reference_or_skip,
     right_half_mask,
+    source_clip,
 )
 
 pytestmark = pytest.mark.usefixtures("clip_grays")
@@ -271,6 +268,7 @@ def _mc_compare(bits, frames, kwargs, mclip=False, sclip=None, mask="right"):
 
 @pytest.mark.parametrize("bits,field", [(16, 1), (32, 1)], ids=["u16", "f32"])
 def test_eedi3_deterministic(clip_grays, clip_gray16, bits, field):
+    """Both paths are deterministic, so repeated runs are bit-identical."""
     clip = clip_gray16 if bits == 16 else clip_grays
     a = _run(clip, field=field)
     b = _run(clip, field=field)
@@ -278,17 +276,17 @@ def test_eedi3_deterministic(clip_grays, clip_gray16, bits, field):
     for n in (0, 11, 23):
         fa = _plane(a.get_frame(n), 0, WIDTH, HEIGHT, dtype)
         fb = _plane(b.get_frame(n), 0, WIDTH, HEIGHT, dtype)
-        if bits == 16:
-            assert np.array_equal(fa, fb), f"nondeterministic output at frame {n}"
-        else:
-            assert np.abs(fa - fb).max() < 1e-6, f"nondeterministic output at frame {n}"
+        assert np.array_equal(fa, fb), f"nondeterministic output at frame {n}"
 
 
 @pytest.mark.parametrize("bits", [16, 32], ids=["u16", "f32"])
 def test_eedi3_parallel_load_consistent(clip_grays, clip_gray16, bits):
-    """Two parallel runs must match the serial path, and each
-    other — the request pattern that exposes stale descriptor bindings, fence
-    misuse and command-pool reuse violations under load."""
+    """Two parallel runs must match the serial path, and each other.
+
+    The request pattern that exposes stale descriptor bindings, fence misuse
+    and command-pool reuse violations under load; both paths are deterministic,
+    so the match is exact.
+    """
     clip = clip_gray16 if bits == 16 else clip_grays
     a = eval_parallel(_run, clip)
     b = eval_parallel(_run, clip)
@@ -296,14 +294,9 @@ def test_eedi3_parallel_load_consistent(clip_grays, clip_gray16, bits):
     dtype = _dtype(bits)
     for n in range(clip.num_frames):
         r = _plane(ref.get_frame(n), 0, WIDTH, HEIGHT, dtype)
-        if bits == 16:
-            assert np.array_equal(a[n], r), f"parallel 1/serial mismatch at frame {n}"
-            assert np.array_equal(b[n], r), f"parallel 2/serial mismatch at frame {n}"
-            assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
-        else:
-            assert np.abs(a[n] - r).max() < 1e-6, f"parallel 1/serial mismatch at frame {n}"
-            assert np.abs(b[n] - r).max() < 1e-6, f"parallel 2/serial mismatch at frame {n}"
-            assert np.abs(a[n] - b[n]).max() < 1e-6, f"nondeterministic output at frame {n}"
+        assert np.array_equal(a[n], r), f"parallel 1/serial mismatch at frame {n}"
+        assert np.array_equal(b[n], r), f"parallel 2/serial mismatch at frame {n}"
+        assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
 
 
 def test_eedi3_parallel_vcheck_matches_serial(clip_gray16, monkeypatch):
@@ -520,6 +513,8 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     cases = json.loads(sys.argv[1])
     core = vs.core
     src = core.bs.VideoSource({CLIP_PATH!r})
+    if src.num_frames > {CLIP_FRAMES}:
+        src = core.std.Trim(src, first=0, length={CLIP_FRAMES})
     clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                               bits=bits, fulls=True, fulld=True)
     dt = np.uint16 if bits == 16 else np.float32
@@ -733,7 +728,7 @@ def test_eedi3_mclip_long_mask_off_prefix(clip_gray16, mdis, nrad):
     cubic). The backtrack used to `break` out of its tile loop once a whole
     tile sat left of that column, leaving dst stale -- uninitialized on the
     first frame -- which made output nondeterministic and wrong in the prefix.
-    (This is the structured-mclip nondeterminism tracked from round 14; the
+    (This is the structured-mclip nondeterminism; the
     existing tests missed it because their half/half mask puts the mask ON on
     the left, i.e. first DP column 0.)"""
     clip = clip_gray16
@@ -885,7 +880,7 @@ def test_eedi3_yuv_passthrough_u16(clip_gray16):
     """A full YUV clip is accepted; with planes=[0] the chroma planes must be
     copied through bit-identically and the luma must match the Gray output."""
     core = vs.core
-    src = core.bs.VideoSource(CLIP_PATH)
+    src = source_clip()
     yuv = core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
     assert yuv.format.color_family == vs.YUV
 
@@ -908,7 +903,7 @@ def test_eedi3_yuv_passthrough_u16(clip_gray16):
 
 def test_eedi3_yuv_passthrough_f32(clip_grays):
     core = vs.core
-    src = core.bs.VideoSource(CLIP_PATH)
+    src = source_clip()
     yuv = core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True)
     out = _run(yuv, planes=[0])
     ref = _run(clip_grays)
@@ -927,7 +922,7 @@ def test_eedi3_yuv_passthrough_f32(clip_grays):
 
 def test_eedi3_dh_doubles_height():
     """dh=True doubles the height and interp parity is the field."""
-    clip = noise_u16_or_skip()
+    clip = noise_u16()
     kw = dict(field=1, dh=1, mdis=5, nrad=1, vcheck=0)
     out = _run(clip, **kw)
     assert out.width == WIDTH
@@ -938,7 +933,7 @@ def test_eedi3_dh_doubles_height():
 def test_eedi3_field_gt1_doubles_frames():
     """field=3 (top field base + doubling) doubles the frame count and the
     output fps, with kept rows matching the source (progressive)."""
-    clip = noise_u16_or_skip()
+    clip = noise_u16()
     out = _run(clip, field=3, mdis=5, nrad=1, vcheck=0)
     assert out.num_frames == 2 * clip.num_frames
     assert out.fps_num == 2 * clip.fps_num
@@ -957,7 +952,7 @@ def test_eedi3_field_gt1_doubles_frames():
 def test_eedi3_output_props_progressive_and_duration():
     """Output frames are progressive (_FieldBased=0) and under field>1 the
     duration is halved (fps doubles) — the standard EEDI3 deinterlace props."""
-    clip = noise_u16_or_skip()
+    clip = noise_u16()
     s0 = clip.get_frame(0).props
     sn, sd = s0.get("_DurationNum"), s0.get("_DurationDen")
     for field, factor in ((1, 1), (3, 2)):
@@ -976,11 +971,9 @@ def test_eedi3_output_props_progressive_and_duration():
             )
 
 
-def noise_u16_or_skip():
-    # session fixture helper for tests that don't want the pytest fixture name
-    from conftest import _source
-
-    src = _source(CLIP_PATH)
+def noise_u16():
+    """The committed clip as GRAY16, for tests that build their own instance."""
+    src = source_clip()
     y = vs.core.std.ShufflePlanes(src, 0, vs.GRAY)
     return vs.core.fmtc.bitdepth(y, bits=16, fulls=True, fulld=True)
 
@@ -1064,7 +1057,7 @@ def test_eedi3_rejects_bad_planes(clip_gray16):
 
 def _yuv420p16():
     core = vs.core
-    return core.fmtc.bitdepth(core.bs.VideoSource(CLIP_PATH), bits=16, fulls=True, fulld=True)
+    return core.fmtc.bitdepth(source_clip(), bits=16, fulls=True, fulld=True)
 
 
 def test_eedi3_rejects_dh_with_a_planes_subset():
@@ -1104,7 +1097,7 @@ def test_eedi3_rejects_scratch_over_two_gib():
 
 
 def test_eedi3_rejects_mclip_not_gray(clip_gray16):
-    src = vs.core.bs.VideoSource(CLIP_PATH)
+    src = source_clip()
     yuv = vs.core.fmtc.bitdepth(src, bits=16, fulls=True, fulld=True)
     with pytest.raises(vs.Error):
         _run(clip_gray16, mclip=yuv)
@@ -1498,7 +1491,7 @@ def test_eedi3_f16_yuv_passthrough():
     """A YUV420PH clip: chroma is copied through bit-identically and luma
     matches the GRAYH run exactly, like the u16/f32 mirrors."""
     core = vs.core
-    src = core.bs.VideoSource(CLIP_PATH)
+    src = source_clip()
     yuv = core.resize.Point(
         core.fmtc.bitdepth(src, bits=32, fulls=True, fulld=True), format=vs.YUV420PH
     )

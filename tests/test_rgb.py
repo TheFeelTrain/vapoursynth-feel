@@ -13,6 +13,7 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
+    F16_STEP,
     assert_preserves_frame_props,
     cpu_node,
     plane_to_ndarray,
@@ -37,7 +38,7 @@ CASES = [
         "Bilateral",
         "rgbh",
         {"sigma_spatial": 3.0, "sigma_color": 0.05},
-        4.9e-4,
+        F16_STEP,
     ),
     (
         "Bilateral_48",
@@ -114,11 +115,31 @@ def test_rgb_plane_subset_leaves_other_planes_untouched(
 @pytest.mark.parametrize(
     "name,builder",
     [
-        ("Box", lambda c: vs.core.vsfeel.Box(c, width=320, height=180)),
-        ("WNNM", lambda c: vs.core.vsfeel.WNNM(c, sigma=[3.0], radius=0)),
+        ("Bilateral", lambda c: vs.core.vsfeel.Bilateral(c, sigma_spatial=3.0, sigma_color=0.05)),
+        ("GaussBlur", lambda c: vs.core.vsfeel.GaussBlur(c, sigma=2.0)),
+        ("DFTTest", lambda c: vs.core.vsfeel.DFTTest(c, tbsize=1)),
+        ("NLMeans", lambda c: vs.core.vsfeel.NLMeans(c, h=1.5, d=0)),
         ("BM3D", lambda c: vs.core.vsfeel.BM3D(c, sigma=0.7, radius=0)),
+        ("EEDI3", lambda c: vs.core.vsfeel.EEDI3(c, field=1)),
+        ("EEDI3H", lambda c: vs.core.vsfeel.EEDI3H(c, field=1)),
+        ("EEDI3AA", lambda c: vs.core.vsfeel.EEDI3AA(c, field=3)),
+        ("NNEDI3", lambda c: vs.core.vsfeel.NNEDI3(c, field=1)),
+        ("WNNM", lambda c: vs.core.vsfeel.WNNM(c, sigma=[3.0], radius=0)),
+        ("Box", lambda c: vs.core.vsfeel.Box(c, width=320, height=180)),
     ],
-    ids=["Box", "WNNM", "BM3D"],
+    ids=[
+        "Bilateral",
+        "GaussBlur",
+        "DFTTest",
+        "NLMeans",
+        "BM3D",
+        "EEDI3",
+        "EEDI3H",
+        "EEDI3AA",
+        "NNEDI3",
+        "WNNM",
+        "Box",
+    ],
 )
 def test_rgb_preserves_frame_props(clip_rgbs, name, builder):
     assert_preserves_frame_props(lambda c: cpu_node(builder(c)), clip_rgbs, frames=(0, 11))

@@ -22,7 +22,7 @@ cycles add ~5 MB more, allocator warmup rather than a per-cycle leak).  The
 limits below sit above that floor and still trip on a per-process leak of
 roughly 30 KiB per cycle.
 
-Run from the repository root:  uv run python -m pytest tests/test_resources.py
+Run from the repository root:  tools/test.sh tests/test_resources.py -q
 """
 
 import json
@@ -434,13 +434,12 @@ def test_create_destroy_cycles_keep_memory_bounded(filter_name):
     # reported only: under the R80 GPU API the core owns the one device, so it
     # (and its frame cache) is still resident after the last instance is freed
     # and a nonzero figure says nothing about the filter's own resources.
-    _ = payload["teardown"]
 
 
 def test_mixed_filter_concurrency_matches_solo():
     """Every filter's output under mixed concurrent load must equal its solo run.
 
-    All nine instances share one device; each is driven from its own thread.
+    All eleven instances share one device; each is driven from its own thread.
     Cross-instance interference — a queue/stream mix-up, a shared cache slot
     handed out twice, a global flag flipped per resource — shows up as a
     pixel difference against the solo oracle, which nothing else in the suite
