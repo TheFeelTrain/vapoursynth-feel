@@ -1591,6 +1591,28 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                     "\"block_size\" must not exceed the dimensions "
                     "of any processed plane");
             }
+            const int temp_c = pl.width - d->bs;
+            const int temp_r = pl.height - d->bs;
+            pl.gx = temp_c / d->step + 1 + (temp_c % d->step != 0 ? 1 : 0);
+            pl.gy = temp_r / d->step + 1 + (temp_r % d->step != 0 ? 1 : 0);
+            // The group count is an int32 spec constant, so a lattice past it
+            // would wrap negative and size every region from that count.
+            const int64_t ng64 = int64_t(pl.gx) * int64_t(pl.gy);
+            if (ng64 > INT32_MAX) {
+                return std::string("plane ") + std::to_string(p) +
+                       "'s block lattice (" + std::to_string(pl.gx) + "x" +
+                       std::to_string(pl.gy) + " = " + std::to_string(ng64) +
+                       " blocks) exceeds the 32-bit kernel index range; "
+                       "increase block_step or reduce the frame size";
+            }
+            pl.ng = static_cast<int>(ng64);
+            if (pl.radius == 0) {
+                const int stride = std::min(2 * d->bm_range + 1, temp_r + 1) *
+                                   std::min(2 * d->bm_range + 1, temp_c + 1);
+                d->dist_stride_max = std::max(d->dist_stride_max, stride);
+            }
+            // The probe frame is only read for its strides, so it comes after
+            // the geometry checks that can reject the clip without it.
             VSFrame * probe = vsapi->newVideoFrame(
                 &d->vi->format, d->vi->width, d->vi->height, nullptr, core);
             if (probe == nullptr) {
@@ -1603,17 +1625,6 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                                          size_t(d->elem_bytes));
             vsapi->freeFrame(probe);
             pl.npix = int64_t(pl.stride) * pl.height;
-
-            const int temp_c = pl.width - d->bs;
-            const int temp_r = pl.height - d->bs;
-            if (pl.radius == 0) {
-                const int stride = std::min(2 * d->bm_range + 1, temp_r + 1) *
-                                   std::min(2 * d->bm_range + 1, temp_c + 1);
-                d->dist_stride_max = std::max(d->dist_stride_max, stride);
-            }
-            pl.gx = temp_c / d->step + 1 + (temp_c % d->step != 0 ? 1 : 0);
-            pl.gy = temp_r / d->step + 1 + (temp_r % d->step != 0 ? 1 : 0);
-            pl.ng = pl.gx * pl.gy;
             pl.finish_x = uint32_t((pl.width + kWorkgroup - 1) / kWorkgroup);
 
             pl.acc_elems = int64_t(2) * pl.width * pl.height;
@@ -1695,6 +1706,42 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     };
     if (auto e = layout(); !e.empty()) {
         return set_error(e);
+    }
+    // Native 16-bit transport: widen the window's planes into a persistent f32
+    // ring, because the matcher and the estimate each read a source sample more
+    // than once and a typed load would put the conversion in their inner loops.
+    // One slot per frame of the window plus one, keyed by frame number. A slot
+    // can be reused while an earlier frame's kernels still read it, which the
+    // per-frame queue barrier (WNNMGetFrame) orders. The ring is sized before
+    // anything is allocated so an addressing overflow costs no memory.
+    if (d->elem_bytes == 2) {
+        const int layers = 4 * d->max_radius + 1;
+        d->src_slots = layers + 1;
+        d->src_sets = d->ref_node ? 2 : 1;
+        VkDeviceSize elems = 0;
+        for (int st = 0; st < d->src_sets; ++st) {
+            for (int p = 0; p < 3; ++p) {
+                const WnnmPlane & pl = d->plane[p];
+                if (!pl.process) {
+                    continue;
+                }
+                d->src_off[st][p] = elems;
+                // The copy kernel takes a slot's first element as a 32-bit
+                // offset; its region runs to the next plane's first slot.
+                const VkDeviceSize end =
+                    elems + VkDeviceSize(d->src_slots) * VkDeviceSize(pl.npix);
+                if (end > VkDeviceSize(UINT32_MAX) + 1) {
+                    return set_error(
+                        "the 16 bit conversion ring's plane " +
+                        std::to_string(p) + " region ends at element " +
+                        std::to_string(end) +
+                        ", past the copy kernel's 32-bit addressing; use a "
+                        "float clip or a smaller radius");
+                }
+                elems += VkDeviceSize(d->src_slots) * VkDeviceSize(pl.npix);
+            }
+        }
+        d->src_ring_bytes = int64_t(elems) * int64_t(sizeof(float));
     }
     if (d->cache && d->ring_bytes > cache_budget) {
         // Records over budget: halve the ring while it still spans more than
@@ -1829,28 +1876,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         }
     }
 
-    // Native 16-bit transport: widen the window's planes into a persistent f32
-    // ring, because the matcher and the estimate each read a source sample more
-    // than once and a typed load would put the conversion in their inner loops.
-    // One slot per frame of the window plus one, keyed by frame number. A slot
-    // can be reused while an earlier frame's kernels still read it, which the
-    // per-frame queue barrier (WNNMGetFrame) orders.
+    // Allocate the 16-bit conversion ring sized above and fold its copy grids.
     if (d->elem_bytes == 2) {
-        const int layers = 4 * d->max_radius + 1;
-        d->src_slots = layers + 1;
-        d->src_sets = d->ref_node ? 2 : 1;
-        VkDeviceSize elems = 0;
-        for (int st = 0; st < d->src_sets; ++st) {
-            for (int p = 0; p < 3; ++p) {
-                const WnnmPlane & pl = d->plane[p];
-                if (!pl.process) {
-                    continue;
-                }
-                d->src_off[st][p] = elems;
-                elems += VkDeviceSize(d->src_slots) * VkDeviceSize(pl.npix);
-            }
-        }
-        d->src_ring_bytes = int64_t(elems) * int64_t(sizeof(float));
         const VkDeviceSize limit = vsfeel_vram_limit(*d->gpu, core);
         if (limit > 0 && d->src_ring_bytes > int64_t(limit / 4)) {
             return set_error(

@@ -581,6 +581,20 @@ def test_bm3d_rejects_oversized_ring():
         )
 
 
+def test_bm3d_rejects_oversized_split_handoff(monkeypatch):
+    """The split's handoff is one flat array indexed with 32-bit words.
+
+    A 16384x16384 plane at block_step 1 needs 4.56e9 words (one count plus 16
+    members per reference block). The word count used to be narrowed to
+    uint32, so the allocation could truncate and the matcher write past it;
+    the check runs before the probe frame, so the clip is never allocated.
+    """
+    monkeypatch.setenv("VSFEEL_BM3D_SPLIT_KERNEL", "1")
+    src = vs.core.std.BlankClip(width=16384, height=16384, format=vs.GRAY16, length=3)
+    with pytest.raises(vs.Error, match="split match handoff"):
+        BM3D(src, sigma=SIGMA, radius=0, block_step=1)
+
+
 def test_bm3d_accepts_radius4_within_addressing_limit():
     """The guard must not reject radius 4 when the stack stays addressable."""
     out = BM3D(

@@ -1079,6 +1079,31 @@ def test_validation_errors(kwargs, msg):
         vs.core.vsfeel.WNNM(_blank(), **kwargs)
 
 
+def test_rejects_a_lattice_past_the_32_bit_index_range():
+    """A 65535x65535 plane at block_step 1 is 65535^2 reference blocks.
+
+    The group count is an int32 spec constant; without the guard the lattice
+    wrapped negative and every region was sized from it. The check runs before
+    the probe frame, so this clip is never allocated.
+    """
+    src = vs.core.std.BlankClip(width=65535, height=65535, format=vs.GRAY16, length=1)
+    with pytest.raises(vs.Error, match="block lattice"):
+        vs.core.vsfeel.WNNM(src, block_size=1, block_step=1)
+
+
+def test_rejects_conversion_ring_offsets_past_32_bits():
+    """The copy kernel takes a slot's first element as a 32-bit offset.
+
+    An 8192x4320 u16 clip at radius 15 has 62 slots per set, and the rclip's
+    second set pushes the ring past 2^32 elements. Before the guard this only
+    hit the VRAM budget check, and a device with room wrapped the destination.
+    """
+    src = vs.core.std.BlankClip(width=8192, height=4320, format=vs.GRAY16, length=1)
+    ref = vs.core.std.BlankClip(width=8192, height=4320, format=vs.GRAY16, length=1)
+    with pytest.raises(vs.Error, match=r"conversion ring.*32-bit"):
+        vs.core.vsfeel.WNNM(src, rclip=ref, sigma=3.0, radius=15, block_size=64, block_step=64)
+
+
 def test_parameter_caps_are_inclusive():
     """The list caps (64) and the search-radius cap (4096) accept their edge."""
     vs.core.vsfeel.WNNM(_blank(), block_size=4, group_size=64, ps_num=64)

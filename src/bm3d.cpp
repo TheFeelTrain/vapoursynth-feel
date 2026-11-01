@@ -426,7 +426,7 @@ struct BM3DData {
     // plus 16 words of members per block) and the flag that selects it.
     bool split_kernel {};
     GpuBuffer matches {};
-    uint32_t match_words {};
+    uint64_t match_words {};
     VkDeviceSize tags_size {}; // uints
     int nframes {};
 
@@ -3009,6 +3009,96 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         d->pipeline_layout = std::get<VkPipelineLayout>(result);
     }
 
+    // Per-plane geometry: plane 0 at full size, the chroma planes subsampled by
+    // the format (no subsampling for 4:4:4 and RGB).
+    const int subW = d->vi->format.subSamplingW;
+    const int subH = d->vi->format.subSamplingH;
+    // YUV chroma (planes 1 and 2; a 4-plane clip's alpha is neither) is centred
+    // on zero in the reference's float domain, so the integer copy removes its
+    // 32768 neutral and the store adds it back. Luma and RGB keep the plain
+    // full-range normalisation, which is what a float clip of the same content
+    // already holds for them.
+    const bool yuv = d->vi->format.colorFamily == cfYUV;
+    for (int plane = 0; plane < d->num_planes; ++plane) {
+        auto & p = d->planes[plane];
+        p.width = (plane == 0) ? d->vi->width : d->vi->width >> subW;
+        p.height = (plane == 0) ? d->vi->height : d->vi->height >> subH;
+        p.tw = 2 * p.radius + 1;
+        p.chroma = yuv && plane > 0 && plane < 3;
+        // The kernel clamps block origins to (dimension - 8), so a smaller
+        // plane would address before its buffer. It only ever reads processed
+        // planes, and a joint entry's luma, which is processed in every joint
+        // configuration that gets this far (the all-skipped case returned the
+        // source clip above).
+        if (p.process && (p.width < 8 || p.height < 8)) {
+            char msg[200];
+            snprintf(msg, sizeof(msg),
+                     "every denoised plane must be at least 8x8; plane %d is "
+                     "%dx%d",
+                     plane, p.width, p.height);
+            return set_error(msg);
+        }
+    }
+
+    // The split's handoff is one flat word array that both halves index with
+    // 32-bit words, so its size is checked from the geometry alone before the
+    // probe frame below: a truncated word count would let the matcher write
+    // past the allocation.
+    if (d->split_kernel) {
+        const uint64_t groups = d->groups_per_wg;
+        const auto handoff_words = [&](int plane) {
+            const auto & p = d->planes[plane];
+            const uint64_t step = static_cast<uint64_t>(p.block_step);
+            const uint64_t gx =
+                (static_cast<uint64_t>(p.width) + groups * step - 1) /
+                (groups * step);
+            const uint64_t gy =
+                (static_cast<uint64_t>(p.height) + step - 1) / step;
+            const uint64_t blocks = gx * gy * groups;
+            return ((blocks + 1) & ~uint64_t(1)) + blocks * 16;
+        };
+        uint64_t words = 0;
+        int widest = -1;
+        const auto consider = [&](int plane) {
+            const uint64_t w = handoff_words(plane);
+            if (w > words) {
+                words = w;
+                widest = plane;
+            }
+        };
+        if (d->joint) {
+            // A joint entry's groups come from luma, processed or not.
+            consider(0);
+        } else {
+            for (int plane = 0; plane < d->num_planes; ++plane) {
+                if (d->planes[plane].process) {
+                    consider(plane);
+                }
+            }
+        }
+        // The shader's highest word is MATCH_MEM_OFF + bid * 16 + 15, which
+        // is the last word of the buffer.
+        if (words > uint64_t(UINT32_MAX) + 1) {
+            const auto & p = d->planes[widest];
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "the split match handoff needs %llu words for a %dx%d "
+                     "plane at block_step %d, past the kernel's 32-bit word "
+                     "indexing; increase block_step or lower the resolution",
+                     static_cast<unsigned long long>(words), p.width, p.height,
+                     p.block_step);
+            return set_error(msg);
+        }
+        if (words * 4 > d->gpu->limits.maxStorageBufferRange) {
+            return set_error(
+                "the split match handoff (" + std::to_string(words * 4) +
+                " bytes) exceeds this device's maxStorageBufferRange (" +
+                std::to_string(d->gpu->limits.maxStorageBufferRange) +
+                " bytes); increase block_step or lower the resolution");
+        }
+        d->match_words = words;
+    }
+
     // The plane layout has to be the one the core's GPU frames carry, because
     // a source frame's plane is copied into the ring with a single flat
     // buffer-to-buffer region. A GPU frame's stride is the CPU frame's stride
@@ -3028,40 +3118,12 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         }
         vsapi->freeFrame(probe);
     }
-
-    // Per-plane geometry: plane 0 at full size, the chroma planes subsampled by
-    // the format (no subsampling for 4:4:4 and RGB).
-    const int subW = d->vi->format.subSamplingW;
-    const int subH = d->vi->format.subSamplingH;
-    // YUV chroma (planes 1 and 2; a 4-plane clip's alpha is neither) is centred
-    // on zero in the reference's float domain, so the integer copy removes its
-    // 32768 neutral and the store adds it back. Luma and RGB keep the plain
-    // full-range normalisation, which is what a float clip of the same content
-    // already holds for them.
-    const bool yuv = d->vi->format.colorFamily == cfYUV;
     for (int plane = 0; plane < d->num_planes; ++plane) {
         auto & p = d->planes[plane];
-        p.width = (plane == 0) ? d->vi->width : d->vi->width >> subW;
-        p.height = (plane == 0) ? d->vi->height : d->vi->height >> subH;
         p.stride = plane_stride_elems[plane];
         p.pe = static_cast<VkDeviceSize>(p.stride) * p.height;
-        p.tw = 2 * p.radius + 1;
-        p.chroma = yuv && plane > 0 && plane < 3;
         if (p.stride < p.width) {
             return set_error("the core reported an unexpected plane stride");
-        }
-        // The kernel clamps block origins to (dimension - 8), so a smaller
-        // plane would address before its buffer. It only ever reads processed
-        // planes, and a joint entry's luma, which is processed in every joint
-        // configuration that gets this far (the all-skipped case returned the
-        // source clip above).
-        if (p.process && (p.width < 8 || p.height < 8)) {
-            char msg[200];
-            snprintf(msg, sizeof(msg),
-                     "every denoised plane must be at least 8x8; plane %d is "
-                     "%dx%d",
-                     plane, p.width, p.height);
-            return set_error(msg);
         }
     }
 
@@ -3253,23 +3315,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             }
         }
         {
-            // The split's handoff, sized for the largest entry's grid: one
-            // count word per reference block plus 16 member words each.
-            uint64_t blocks = 0;
-            const auto groups = static_cast<uint64_t>(d->groups_per_wg);
-            for (int gi = 0; gi < d->n_groups; ++gi) {
-                const auto & p = d->planes[d->groups[gi].planes[0]];
-                const uint64_t gx =
-                    (static_cast<uint64_t>(p.width) +
-                     groups * static_cast<uint64_t>(p.block_step) - 1) /
-                    (groups * static_cast<uint64_t>(p.block_step));
-                const uint64_t gy =
-                    (static_cast<uint64_t>(p.height) + p.block_step - 1) /
-                    p.block_step;
-                blocks = std::max(blocks, gx * gy * groups);
-            }
-            d->match_words = static_cast<uint32_t>(
-                ((blocks + 1) & ~uint64_t(1)) + blocks * 16);
+            // The split's handoff, sized and validated from the geometry above.
             if (d->split_kernel) {
                 std::string err = gpu_make_buffer(
                     *d->gpu, core,

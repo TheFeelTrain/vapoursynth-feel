@@ -18,6 +18,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - DFTTest, BM3D, and NNEDI3 reject variable-format clips at creation
 - DFTTest no longer reads a partially written filter table on ReBAR devices
 - WNNM's GPU-trace mode no longer leaks memory per instance
+- WNNM rejects frames whose block lattice or 16-bit conversion ring does not fit 32-bit addressing
+- BM3D rejects frames whose block-matching workspace does not fit 32-bit addressing
 - A failed Box, GaussBlur, EEDI3, NLMeans, NNEDI3, or WNNM creation no longer leaks its instance
 
 ## [v1.3.2] - 2026-10-31

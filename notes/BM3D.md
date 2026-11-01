@@ -278,6 +278,13 @@ half the bytes, which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-11-01 — the split handoff is sized and checked in 64 bits.** The
+  buffer is one flat word array the shader indexes with 32-bit words, and the
+  word count used to be narrowed to uint32: a large lattice (16384x16384 at
+  `block_step=1` is 4.56e9 words) truncated the allocation the matcher then
+  wrote past. The count stays uint64 and is rejected at creation when the last
+  word or `maxStorageBufferRange` does not fit, before the probe frame. No perf
+  change.
 - **2026-10-31 — `radius` is per plane, like `sigma`.** Each entry's kernel
   already carried its own `RADIUS`; the host now drives it from the plane's
   value, requests the widest entry's window and sizes the shared rings for it.
