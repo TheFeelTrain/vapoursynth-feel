@@ -232,10 +232,10 @@ static const VSFrame * bilateral_gpu_frame(BilateralData * d, int n,
             : vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height,
                                     fr, pl, src, core);
     if (!dst) {
-        vsfeel_trace_error("BilateralVK", n,
+        vsfeel_trace_error("Bilateral", n,
                            "failed to allocate the output frame", d->gpu.get());
-        vsapi->setFilterError(
-            "BilateralVK: failed to allocate the output frame", frameCtx);
+        vsapi->setFilterError("Bilateral: failed to allocate the output frame",
+                              frameCtx);
         if (ref) {
             vsapi->freeFrame(ref);
         }
@@ -266,8 +266,8 @@ static const VSFrame * bilateral_gpu_frame(BilateralData * d, int n,
             d->gpu->api->gpuExecAbandon(ctx);
             ctx = nullptr;
         }
-        vsfeel_trace_error("BilateralVK", n, message, d->gpu.get());
-        vsapi->setFilterError(("BilateralVK: " + message).c_str(), frameCtx);
+        vsfeel_trace_error("Bilateral", n, message, d->gpu.get());
+        vsapi->setFilterError(("Bilateral: " + message).c_str(), frameCtx);
         vsapi->freeFrame(dst);
         if (ref) {
             vsapi->freeFrame(ref);
@@ -420,8 +420,8 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
     const bool has_ref = d->ref_node != nullptr;
 
     auto set_error = [&](const std::string & error_message) {
-        vsfeel_trace_error("BilateralVK", -1, error_message, d->gpu.get());
-        vsapi->mapSetError(out, ("BilateralVK: " + error_message).c_str());
+        vsfeel_trace_error("Bilateral", -1, error_message, d->gpu.get());
+        vsapi->mapSetError(out, ("Bilateral: " + error_message).c_str());
         if (has_ref) {
             vsapi->freeNode(d->ref_node);
         }
@@ -893,7 +893,7 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         // The core returns nullptr without running the free callback when the
         // node constructor throws, so release the instance through it here.
         BilateralFree(data, core, vsapi);
-        vsapi->mapSetError(out, "BilateralVK: filter creation failed");
+        vsapi->mapSetError(out, "Bilateral: filter creation failed");
         return;
     }
     vsapi->mapConsumeNode(out, "clip", result, maAppend);

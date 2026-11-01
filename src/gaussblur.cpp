@@ -86,7 +86,7 @@ struct GaussData {
     int bits {}, elem_bytes {};
     // half input: the plane elements are 2 bytes (the two-pass scratch stays
     // f32, as the references' internal buffer is)
-    int half {};
+    bool half {};
     bool process[3] { true, true, true };
 
     std::shared_ptr<GPUDevice> gpu;

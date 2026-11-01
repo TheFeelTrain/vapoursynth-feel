@@ -1104,6 +1104,10 @@ struct Eedi3FrameGuard {
     int frame {};
 };
 
+static const char * eedi3_filter_name(const Eedi3Data & d) {
+    return d.aa ? "EEDI3AA" : (d.horiz ? "EEDI3H" : "EEDI3");
+}
+
 static const VSFrame * eedi3_error(Eedi3FrameGuard & guard,
                                    VSFrameContext * frameCtx,
                                    const VSAPI * vsapi, VSFrame * dst,
@@ -1112,7 +1116,7 @@ static const VSFrame * eedi3_error(Eedi3FrameGuard & guard,
     if (guard.ctx && !guard.submitted) {
         guard.d.gpu->api->gpuExecAbandon(guard.ctx);
     }
-    vsfeel_trace_error(guard.d.aa ? "EEDI3AA" : "EEDI3VK", guard.frame, message,
+    vsfeel_trace_error(eedi3_filter_name(guard.d), guard.frame, message,
                        guard.d.gpu.get());
     vsapi->setFilterError((std::string(what) + ": " + message).c_str(),
                           frameCtx);
@@ -1260,7 +1264,8 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
             vsapi->freeFrame(f);
         }
         eedi3_release_claim(d, n, last);
-        return eedi3_error(guard, frameCtx, vsapi, nullptr, "EEDI3VK", message);
+        return eedi3_error(guard, frameCtx, vsapi, nullptr,
+                           eedi3_filter_name(*d), message);
     };
     if (!ctx) {
         return fail("could not acquire a recording context: "s + errbuf);
@@ -1909,6 +1914,7 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     d->horiz = horiz;
     d->aa = aa;
     d->core = core;
+    const char * filter_name = eedi3_filter_name(*d);
 
     d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
@@ -1920,8 +1926,9 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     bool has_mclip = d->mclip_node != nullptr;
 
     auto set_error = [&](const std::string & error_message) {
-        vsfeel_trace_error("EEDI3VK", -1, error_message, d->gpu.get());
-        vsapi->mapSetError(out, ("EEDI3VK: " + error_message).c_str());
+        vsfeel_trace_error(filter_name, -1, error_message, d->gpu.get());
+        vsapi->mapSetError(
+            out, (std::string(filter_name) + ": " + error_message).c_str());
         vsapi->freeNode(d->node);
         if (has_sclip) {
             vsapi->freeNode(d->sclip_node);
@@ -2119,7 +2126,7 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
                 vsapi->invoke(vsapi->getPluginByID(VSH_STD_PLUGIN_ID, core),
                               "SetFrameProps", args);
             if (vsapi->mapGetError(ret)) {
-                vsfeel_trace_error("EEDI3VK", -1, vsapi->mapGetError(ret),
+                vsfeel_trace_error(filter_name, -1, vsapi->mapGetError(ret),
                                    d->gpu.get());
                 vsapi->mapSetError(out, vsapi->mapGetError(ret));
                 vsapi->freeMap(args);
@@ -2145,7 +2152,7 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
                               "Point", args);
             vsapi->freeMap(args);
             if (vsapi->mapGetError(ret)) {
-                vsfeel_trace_error("EEDI3VK", -1, vsapi->mapGetError(ret),
+                vsfeel_trace_error(filter_name, -1, vsapi->mapGetError(ret),
                                    d->gpu.get());
                 vsapi->mapSetError(out, vsapi->mapGetError(ret));
                 vsapi->freeMap(ret);
@@ -2954,7 +2961,6 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     // ffGPUOutput: the frames this filter returns live in VRAM and carry their
     // own producer pairs, so the core never downloads them for a consumer that
     // does not need host pixels.
-    const char * filter_name = aa ? "EEDI3AA" : (horiz ? "EEDI3H" : "EEDI3");
     VSNode * result = vsapi->createVideoFilterEx2(
         filter_name, &out_video, aa ? Eedi3AaGetFrame : Eedi3GetFrame,
         Eedi3Free, fmParallel, ffGPUOutput, deps.data(),

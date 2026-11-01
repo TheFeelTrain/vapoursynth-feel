@@ -38,7 +38,7 @@ Read the header first; the `.cpp` settles what the core actually enables.
 
 ## The goal
 
-Make every vsfeel filter **faster than the reference implementations**. 
+Make every vsfeel filter **faster than the reference implementations**.
 Concretely, the benchmark should show vsfeel beating the fastest
 reference (usually vszipcl) by a comfortable margin.
 
@@ -124,7 +124,7 @@ component first. Entries read like this:
 
 - **Short and high level.** What a user notices, not how it works: no kernel or
   function names, no buffer budgets, no rationale, and no "Added support for ..."
-  openers. A fix to the development tooling (`tools/`, the lint and notes gates, 
+  openers. A fix to the development tooling (`tools/`, the lint and notes gates,
   the benchmark harness) is not an entry either. Strictly user-facing changes.
 - **No em-dashes.** Use a comma, a full stop, or parentheses.
 - **Only what the last release did differently.** An entry is read by someone
@@ -146,20 +146,20 @@ supplies pytest/xdist, numpy, vsjetpack and the reference plugins the suite and
 the benchmark compare against (`vszipcl` from git plus `fmtconv` from JET's
 vs-wheels index, `eedi3vk2`, `nnedi3vk`, `bm3dvk`, `bm3dvk2`, `nlm_hip`,
 `knlmmeansvk`, `zsmooth`, `bestsource`, `edgemasks`, `resize2`, `descale`).
-`uv sync --group lint` adds the pinned clang-format/clang-tidy/ruff. Never `pip install` into this tree, and never rely 
-on a system plugin being visible. `tools/*.sh` and `uv run` pick the venv up on 
+`uv sync --group lint` adds the pinned clang-format/clang-tidy/ruff. Never `pip install` into this tree, and never rely
+on a system plugin being visible. `tools/*.sh` and `uv run` pick the venv up on
 their own. One-time per venv, run `.venv/bin/vapoursynth config`: `vspipe`
-embeds CPython through VSScript, whose autodetection cannot find a 
-`libpython` for uv's statically linked CPython, and the registration is what 
+embeds CPython through VSScript, whose autodetection cannot find a
+`libpython` for uv's statically linked CPython, and the registration is what
 makes the benchmark and the vspipe hang tests work.
 
 ## Testing
 
 Every filter needs **comprehensive unit tests** in `tests/`, run with pytest.
-The committed `tests/bigbuckbunny_360p_grain.mp4` clip is the standard test 
-input. The fixtures expose its first 24 frames (`CLIP_FRAMES`): the helpers 
-iterate every frame they are handed, so the whole file would make a full run 
-12x longer without covering anything new. A test that needs a longer run asks 
+The committed `tests/bigbuckbunny_360p_grain.mp4` clip is the standard test
+input. The fixtures expose its first 24 frames (`CLIP_FRAMES`): the helpers
+iterate every frame they are handed, so the whole file would make a full run
+12x longer without covering anything new. A test that needs a longer run asks
 for one explicitly.
 
 - Tests must verify **correctness against the reference behavior** and
@@ -395,18 +395,19 @@ not a defect. Six gates:
   file index, report IDs. It reads no build directory, so it also runs on a
   bare checkout.
 
-The middle three need a configured `build/` — they read `compile_commands.json`
-and `build/vk_spv/`, which `tools/install.sh` writes. A gate whose tool is
-missing reports `skipped`; a gate whose build directory is missing fails,
-because then it did not run.
+The shaders, tidy and cppcheck gates need a configured `build/` — they read
+`compile_commands.json` and `build/vk_spv/`, which `tools/install.sh` writes. A
+gate whose tool is missing reports `skipped`; a gate whose build directory is
+missing fails, because then it did not run.
 
-The gates run concurrently, so a full run costs about the slowest one. The
-analysers read a derived view in `build/lint/`: `tools/lint_stub.py` replaces the
-tens of MB of generated SPIR-V arrays in `build/spirv_binaries.h` with a stub
-that keeps every symbol, then rewrites the compile database to resolve it first.
-Parsing that data-only header once per translation unit was most of a lint run;
-neither gate reports on it, since both keep findings in `src/`.
-`VSFEEL_LINT_JOBS` caps the analyser workers (default: CPU count, max 16).
+After the shader gate, the remaining gates run concurrently, so a full run
+costs about the slowest one. The analysers read a derived view in
+`build/lint/`: `tools/lint_stub.py` replaces the tens of MB of generated SPIR-V
+arrays in `build/spirv_binaries.h` with a stub that keeps every symbol, then
+rewrites the compile database to resolve it first. Parsing that data-only
+header once per translation unit was most of a lint run; neither gate reports
+on it, since both keep findings in `src/`. `VSFEEL_LINT_JOBS` caps the
+analyser workers (default: CPU count, max 16).
 
 After changing a shader or a `-D`, run `uv run python tools/shader_limits.py` for
 the workgroup/LDS table; `--check` compares that table against the `GpuWorkgroup`
