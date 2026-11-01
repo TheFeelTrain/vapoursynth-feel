@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import inspect
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -329,8 +330,10 @@ def feel_aa(
     """
     UnsupportedColorFamilyError.check(clip, (vs.YUV, vs.GRAY), feel_aa)
 
-    if rfactor <= 0.0:
-        raise CustomValueError("rfactor must be greater than 0!", feel_aa, rfactor)
+    if not math.isfinite(rfactor) or rfactor <= 0.0:
+        raise CustomValueError("rfactor must be a finite value greater than 0!", feel_aa, rfactor)
+    if not math.isfinite(pscale):
+        raise CustomValueError("pscale must be finite!", feel_aa, pscale)
 
     # The one upload: the supersampled clip and every intermediate below exist
     # only in VRAM.
@@ -354,6 +357,12 @@ def feel_aa(
         rfactor = pscale = 1.0
 
     aaw, aah = [round(dimension * rfactor) for dimension in (clip.width, clip.height)]
+    if aaw < 1 or aah < 1:
+        raise CustomValueError(
+            "rfactor is too small: the supersampled size must be at least 1x1!",
+            feel_aa,
+            rfactor,
+        )
 
     if downscaler is None:
         # based_aa's own choice: Box for an exact integer ratio, Catrom
@@ -381,6 +390,9 @@ def feel_aa(
         ss_clip = get_y(core.std.GPUUpload(clip=prefilter))
     else:
         ss_clip = luma
+    # A callable prefilter can hand back a host clip; every reader below
+    # (the pscale blend and the postfilters) needs it resident.
+    ss_clip = _ensure_resident(ss_clip)
 
     # A supersampler with no device path (ArtCNN) lands the 4K frame on the
     # host; this is the one upload that puts it back for every reader below.

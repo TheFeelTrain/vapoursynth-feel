@@ -266,9 +266,31 @@ def test_feel_aa_box_other_ratio_is_resident(clip_grays):
     assert d.max() <= 8e-3, f"max|d|={d.max()}"
 
 
-def test_feel_aa_rfactor_is_validated(clip_grays):
+@pytest.mark.parametrize("rfactor", [0.0, -1.0, float("nan"), float("inf"), 1e-6])
+def test_feel_aa_rfactor_is_validated(clip_grays, rfactor):
+    """Non-finite, non-positive and sub-pixel ratios must fail at the call."""
     with pytest.raises(Exception, match="rfactor"):
-        feel_aa(clip_grays, rfactor=0.0)
+        feel_aa(clip_grays, rfactor=rfactor)
+
+
+@pytest.mark.parametrize("pscale", [float("nan"), float("inf"), float("-inf")])
+def test_feel_aa_pscale_is_finite(clip_grays, pscale):
+    """A non-finite blend weight would put NaN/inf into the std.Expr string."""
+    with pytest.raises(Exception, match="pscale"):
+        feel_aa(clip_grays, pscale=pscale)
+
+
+def test_feel_aa_cpu_prefilter_is_made_resident(clip_grays):
+    """A callable prefilter may return a host clip; every reader needs it resident."""
+
+    def cpu_prefilter(node):
+        return vs.core.std.GPUDownload(clip=node)
+
+    ref = _reference(clip_grays, supersampler=Point(), prefilter=cpu_prefilter)
+    out = feel_aa(clip_grays, supersampler=Point(), prefilter=cpu_prefilter)
+    assert out.gpu_resident
+    d = np.abs(_plane(ref) - _plane(out))
+    assert d.max() <= 8e-3, f"max|d|={d.max()}"
 
 
 def test_feel_aa_show_mask(clip_grays):
