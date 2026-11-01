@@ -177,6 +177,15 @@ jobs:
         vtool -show-build "$lib"
         vtool -show-build "$lib" | grep -Eq 'minos[[:space:]]+13\.0' ||
           { echo "::error::$lib does not target macOS 13.0"; exit 1; }
+    - name: Load the built wheel
+      if: steps.published.outputs.skip != 'true'
+      run: |
+        python -m venv smoke
+        smoke/bin/python -m pip install --upgrade pip
+        smoke/bin/python -m pip install vapoursynth
+        smoke/bin/python -m pip install --no-deps dist/*.whl
+        cd "$RUNNER_TEMP"
+        "$GITHUB_WORKSPACE/smoke/bin/python" "$GITHUB_WORKSPACE/.github/scripts/wheel_smoke.py"
     - name: Reuse the published wheel
       if: steps.published.outputs.skip == 'true'
       run: bash .github/scripts/pypi_dist.sh fetch "vapoursynth_feel-${GITHUB_REF_NAME#v}-py3-none-macosx_13_0_${{ matrix.arch }}.whl" dist
@@ -249,6 +258,13 @@ jobs:
         echo "--- tracked changes (must be empty) ---"
         git status --porcelain --untracked-files=no
         uv build --wheel --out-dir dist
+    - name: Load the built wheel
+      if: steps.published.outputs.skip != 'true'
+      run: |
+        uv venv smoke
+        uv pip install --python smoke/Scripts/python.exe vapoursynth
+        uv pip install --python smoke/Scripts/python.exe --no-deps dist/*.whl
+        smoke/Scripts/python.exe .github/scripts/wheel_smoke.py
     - name: Reuse the published wheel
       if: steps.published.outputs.skip == 'true'
       shell: bash
@@ -259,6 +275,38 @@ jobs:
         overwrite: true
         path: dist
         if-no-files-found: ignore
+
+  smoke:
+    # GPU-less: build the wheel, install it into a fresh venv with a current
+    # VapourSynth, and load the plugin. GitHub runners have no Vulkan device, so
+    # this stops at plugin load; it catches a wheel with a wrong or missing
+    # platform library, a bad manifest, or a plugin that no longer registers.
+    # ubuntu-26.04 for a glslc that accepts --target-env=vulkan1.4.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0   # hatch-vcs derives the version from git tags
+    - name: System tools (glslc, Vulkan loader)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends glslc libvulkan1
+    - uses: astral-sh/setup-uv@v10.3.2
+      with:
+        enable-cache: true
+        cache-python: true
+    - name: Build the wheel
+      run: uv build --wheel --out-dir dist
+    - name: Install the wheel with a current VapourSynth
+      run: |
+        uv venv smoke
+        uv pip install --python smoke/bin/python vapoursynth
+        uv pip install --python smoke/bin/python --no-deps dist/*.whl
+    - name: Load the wheel
+      run: |
+        cd "$RUNNER_TEMP"
+        "$GITHUB_WORKSPACE/smoke/bin/python" "$GITHUB_WORKSPACE/.github/scripts/wheel_smoke.py"
 
   publish:
     permissions:

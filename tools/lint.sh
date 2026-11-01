@@ -15,7 +15,7 @@
 #   tidy      clang-tidy over the compile database, per .clang-tidy
 #   cppcheck  cppcheck over the compile database
 #   ruff      ruff check + ruff format --check over vsfeel/ tools/
-#             hatch_build.py src/gen_spirv_header.py tests/
+#             .github/scripts hatch_build.py src/gen_spirv_header.py tests/
 #   notes     tools/notes_check.py over notes/*.md, per notes/AGENTS.md
 #
 # shaders/tidy/cppcheck need a configured build directory (they read the compile
@@ -239,8 +239,8 @@ gate_ruff() {
     # not new style to debate. Line breaking is not in that set: it is
     # ruff format's job, checked below against [tool.ruff] line-length, the
     # same way clang-format gates the C++ side.
-    local files=("$root_dir"/vsfeel "$root_dir"/tools "$root_dir"/hatch_build.py
-        "$root_dir"/src/gen_spirv_header.py "$root_dir"/tests)
+    local files=("$root_dir"/vsfeel "$root_dir"/tools "$root_dir"/.github/scripts
+        "$root_dir"/hatch_build.py "$root_dir"/src/gen_spirv_header.py "$root_dir"/tests)
     if [ "$fix" -eq 1 ]; then
         "$ruff" check --fix --quiet "${files[@]}" || true
         "$ruff" format --quiet "${files[@]}" || true

@@ -126,9 +126,10 @@ jobs:
       run: uv sync --locked --no-default-groups --group test
 
     - name: GPU-less tests
-      # The version test needs the installed GPU plugin, so it stays local;
-      # the rest never touch a device (header generator, lint stub, benchmark
-      # vpy generation, wheel staging).
+      # Everything in test_build.py except the version check, which needs the
+      # installed GPU plugin. The rest never touch a device: header generator,
+      # lint stub, shader-limit resolver, benchmark vpy generation and A/B
+      # helpers, wheel staging.
       run: |
         uv run --no-sync python -m pytest tests/test_build.py -q \
-          -k "generator or lint_stub or benchmark or hatch"
+          -k "not plugin_reports_a_real_version"
