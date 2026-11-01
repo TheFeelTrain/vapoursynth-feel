@@ -1191,6 +1191,22 @@ def test_bm3d_validates_th_mse_before_the_all_zero_shortcut():
         vs.core.vsfeel.BM3D(_blank(64, 64), sigma=[0.0], th_mse=-1.0)
 
 
+def test_bm3d_validates_extractor_exp_before_the_all_zero_shortcut():
+    """Every zero sigma returns the source clip, but still validates arguments.
+
+    extractor_exp used to be parsed after the shortcut, so an out-of-range value
+    was silently accepted; a valid one still takes the shortcut unchanged.
+    """
+    clip, _ = _structured_clip(3)
+    with pytest.raises(vs.Error, match="extractor_exp"):
+        vs.core.vsfeel.BM3D(clip, sigma=[0.0], extractor_exp=999)
+    out = cpu_node(vs.core.vsfeel.BM3D(clip, sigma=[0.0], extractor_exp=8))
+    for n in (0, 2):
+        assert np.array_equal(
+            frame_to_ndarray(out.get_frame(n)), frame_to_ndarray(clip.get_frame(n))
+        ), f"frame {n} changed"
+
+
 def test_bm3d_th_mse_selects_the_group():
     """A rejecting threshold must produce a different result from a permissive
     one, and zero must behave as the reference-only group."""

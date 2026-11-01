@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - WNNM's GPU-trace mode no longer leaks memory per instance
 - WNNM rejects frames whose block lattice or 16-bit conversion ring does not fit 32-bit addressing
 - BM3D rejects frames whose block-matching workspace does not fit 32-bit addressing
+- BM3D validates `extractor_exp` even when every sigma is zero
 - A failed Box, GaussBlur, EEDI3, NLMeans, NNEDI3, or WNNM creation no longer leaks its instance
 
 ## [v1.3.2] - 2026-10-31

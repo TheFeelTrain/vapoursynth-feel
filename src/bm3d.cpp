@@ -2782,6 +2782,21 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         }
     }
 
+    // extractor_exp: validated with the other scalars, before the all-zero
+    // shortcut. bm3dvk (the preferred reference where the two disagree)
+    // accepts [0, 127]: a negative exponent pre-rounds the addends below any
+    // representable value and 2^128 is already infinite, which turns the
+    // aggregation into NaN.
+    {
+        const int extractor_exp =
+            vsh::int64ToIntS(vsapi->mapGetInt(in, "extractor_exp", 0, &error));
+        if (extractor_exp < 0 || extractor_exp > 127) {
+            return set_error("\"extractor_exp\" must be in range [0, 127]");
+        }
+        d->extractor =
+            (extractor_exp != 0) ? std::ldexp(1.0f, extractor_exp) : 0.0f;
+    }
+
     // match the reference sigma scaling exactly (different factor for the
     // final Wiener pass); a skipped plane keeps exactly zero so the kernel's
     // epsilon test cannot disagree with the unscaled decision above
@@ -2896,17 +2911,6 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // beyond that (e.g. seeking) blocks in the acquire instead of corrupting.
     int inflight =
         std::clamp(env_int("VSFEEL_BM3D_INFLIGHT", kInflightFrames), 1, 8);
-
-    const int extractor_exp =
-        vsh::int64ToIntS(vsapi->mapGetInt(in, "extractor_exp", 0, &error));
-    // bm3dvk (the preferred reference where the two disagree) accepts [0, 127]:
-    // a negative exponent pre-rounds the addends below any representable value
-    // and 2^128 is already infinite, which turns the aggregation into NaN.
-    if (extractor_exp < 0 || extractor_exp > 127) {
-        return set_error("\"extractor_exp\" must be in range [0, 127]");
-    }
-    d->extractor =
-        (extractor_exp != 0) ? std::ldexp(1.0f, extractor_exp) : 0.0f;
 
     d->nframes = d->vi->numFrames;
 

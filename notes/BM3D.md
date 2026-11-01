@@ -278,6 +278,10 @@ half the bytes, which is where the visible speedup is (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-11-01 — `extractor_exp` is validated before the all-zero shortcut.**
+  The shortcut returned the source clip before the exponent was parsed, so
+  `sigma=0, extractor_exp=999` was silently accepted; the read and range check
+  now sit with the other scalars. No perf change.
 - **2026-11-01 — the split handoff is sized and checked in 64 bits.** The
   buffer is one flat word array the shader indexes with 32-bit words, and the
   word count used to be narrowed to uint32: a large lattice (16384x16384 at
