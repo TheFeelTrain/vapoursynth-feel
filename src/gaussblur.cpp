@@ -1050,6 +1050,11 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
         "GaussBlur", data->vi, GaussGetFrame, GaussFree, fmParallel,
         ffGPUOutput, deps, 1, data, core);
     if (result == nullptr) {
+        // The core returns nullptr without running the free callback when the
+        // node constructor throws, so release the instance through it here.
+        vsfeel_trace_error("GaussBlur", -1, "filter creation failed",
+                           data->gpu.get());
+        GaussFree(data, core, vsapi);
         vsapi->mapSetError(out, "GaussBlur: filter creation failed");
         return;
     }

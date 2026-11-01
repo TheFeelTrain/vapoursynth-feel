@@ -1686,6 +1686,11 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         "NNEDI3", &data->vi_out, Nnedi3GetFrame, Nnedi3Free, fmParallel,
         ffGPUOutput, deps, 1, data, core);
     if (result == nullptr) {
+        // The core returns nullptr without running the free callback when the
+        // node constructor throws, so release the instance through it here.
+        vsfeel_trace_error("NNEDI3", -1, "filter creation failed",
+                           data->gpu.get());
+        Nnedi3Free(data, core, vsapi);
         vsapi->mapSetError(out, "NNEDI3: filter creation failed");
         return;
     }

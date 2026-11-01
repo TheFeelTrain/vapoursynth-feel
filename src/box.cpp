@@ -692,6 +692,11 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         "Box", &data->out_vi, BoxGetFrame, BoxFree, fmParallel, ffGPUOutput,
         deps, 1, data, core);
     if (result == nullptr) {
+        // The core returns nullptr without running the free callback when the
+        // node constructor throws, so release the instance through it here.
+        vsfeel_trace_error("Box", -1, "filter creation failed",
+                           data->gpu.get());
+        BoxFree(data, core, vsapi);
         vsapi->mapSetError(out, "Box: filter creation failed");
         return;
     }

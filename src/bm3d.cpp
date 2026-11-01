@@ -3345,6 +3345,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
                 }
             }
         }
+        // The kernels read or atomically update these host-initialised words.
+        store_fence();
 
         // Both buffers come from the core's pool, so they count against the
         // VRAM budget the frame cache and the thread pool's admission control

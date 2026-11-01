@@ -1221,6 +1221,11 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         "NLMeans", data->vi, NLMeansGetFrame, NLMeansFree, fmParallel,
         ffGPUOutput, deps, data->has_ref ? 2 : 1, data, core);
     if (result == nullptr) {
+        // The core returns nullptr without running the free callback when the
+        // node constructor throws, so release the instance through it here.
+        vsfeel_trace_error("NLMeans", -1, "filter creation failed",
+                           data->gpu.get());
+        NLMeansFree(data, core, vsapi);
         vsapi->mapSetError(out, "NLMeans: filter creation failed");
         return;
     }

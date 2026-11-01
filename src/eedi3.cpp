@@ -2954,12 +2954,20 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     // ffGPUOutput: the frames this filter returns live in VRAM and carry their
     // own producer pairs, so the core never downloads them for a consumer that
     // does not need host pixels.
+    const char * filter_name = aa ? "EEDI3AA" : (horiz ? "EEDI3H" : "EEDI3");
     VSNode * result = vsapi->createVideoFilterEx2(
-        aa ? "EEDI3AA" : (horiz ? "EEDI3H" : "EEDI3"), &out_video,
-        aa ? Eedi3AaGetFrame : Eedi3GetFrame, Eedi3Free, fmParallel,
-        ffGPUOutput, deps.data(), static_cast<int>(deps.size()), data, core);
+        filter_name, &out_video, aa ? Eedi3AaGetFrame : Eedi3GetFrame,
+        Eedi3Free, fmParallel, ffGPUOutput, deps.data(),
+        static_cast<int>(deps.size()), data, core);
     if (result == nullptr) {
-        vsapi->mapSetError(out, "EEDI3: filter creation failed");
+        // The core returns nullptr without running the free callback when the
+        // node constructor throws, so release the instance through it here.
+        vsfeel_trace_error(filter_name, -1, "filter creation failed",
+                           data->gpu.get());
+        Eedi3Free(data, core, vsapi);
+        vsapi->mapSetError(
+            out,
+            (std::string(filter_name) + ": filter creation failed").c_str());
         return;
     }
     vsapi->mapConsumeNode(out, "clip", result, maAppend);

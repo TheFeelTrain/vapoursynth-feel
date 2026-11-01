@@ -1709,6 +1709,8 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
                 }
             }
         }
+        // The first submission reads these host stores through the BAR.
+        store_fence();
     }
 
     // ------------------------------------------------------------------

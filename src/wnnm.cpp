@@ -300,6 +300,7 @@ struct GPUWNNM {
         if (probe.query) {
             gpu->vk->vkDestroyQueryPool(dev, probe.query, nullptr);
         }
+        gpu_destroy_buffer(*gpu, probe.buf);
         for (auto & p : plane) {
             if (p.group_pipe) {
                 gpu->vk->vkDestroyPipeline(dev, p.group_pipe, nullptr);
@@ -2156,6 +2157,11 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         "WNNM", data->vi, WNNMGetFrame, WNNMFree, fmParallel, ffGPUOutput, deps,
         data->ref_node ? 2 : 1, data, core);
     if (result == nullptr) {
+        // The core returns nullptr without running the free callback when the
+        // node constructor throws, so release the instance through it here.
+        vsfeel_trace_error("WNNM", -1, "filter creation failed",
+                           data->gpu.get());
+        WNNMFree(data, core, vsapi);
         vsapi->mapSetError(out, "WNNM: filter creation failed");
         return;
     }

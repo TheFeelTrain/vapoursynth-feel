@@ -15,7 +15,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - DFTTest and NLMeans reject unknown-length clips at creation
 - DFTTest rejects a negative `pmin` and non-finite or negative sigma arrays
 - DFTTest rejects an output grid larger than the device instead of leaving part of the frame unwritten
-- DFTTest, BM3D and NNEDI3 reject variable-format clips at creation
+- DFTTest, BM3D, and NNEDI3 reject variable-format clips at creation
+- DFTTest no longer reads a partially written filter table on ReBAR devices
+- WNNM's GPU-trace mode no longer leaks memory per instance
+- A failed Box, GaussBlur, EEDI3, NLMeans, NNEDI3, or WNNM creation no longer leaks its instance
 
 ## [v1.3.2] - 2026-10-31
 
