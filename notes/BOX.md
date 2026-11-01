@@ -129,8 +129,9 @@ copies this filter removes.
 
 ## Open work
 
-- `width == src.width` and `height == src.height` still runs both dispatches.
-  A plane-unchanged path could copy instead; it is not on any current route.
+- `width == src.width` and `height == src.height` still runs the horizontal
+  dispatch; `skip_vert` drops only the vertical pass (`src/box.cpp:579`). A
+  no-op path could copy instead; it is not on any current route.
 - The workgroup shape (16x8) is inherited, not swept. With one load per tap and
   no LDS the shape looks unlikely to be the lever, but that is unmeasured.
 - Do not re-introduce the Merge composition "because it needs no new filter": it

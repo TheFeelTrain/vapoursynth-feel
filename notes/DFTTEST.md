@@ -12,8 +12,8 @@ Target GPU: RX 7900 XTX (RDNA3, gfx1100), Mesa 26.2 RADV.
 - Per output frame and processed plane: one `pad` dispatch writes every temporal
   slice, then per stripe of block rows `fused` → barrier → `col2im` straight
   into the output plane. The stripe ring keeps the block handoff in L2
-  (Performance). Scratch is two `createGPUBuffer` allocations per frame, handed
-  to the context.
+  (Performance). Scratch is two `createGPUBuffer` allocations per processed
+  plane, handed to the context.
 - **Runs need `RADV_EXPERIMENTAL=transfer_queue`** (mechanism:
   `notes/BILATERAL.md`), which `tools/benchmark.py` forces.
 
@@ -33,7 +33,7 @@ IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
 |---|---|---|
 | u16 | 1984.9 | 887.4 |
 | f16 | 1997.6 | no f16 path |
-| f32 | 1221.7 | 605.3 |
+| f32 | 1948.6 | 587.2 |
 
 - Neither reference implements an f16 DFTTest, so the half path is graded
   against the f32 path on the losslessly widened clip, not against vszipcl.
@@ -68,9 +68,8 @@ IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
 - Push descriptors with seven bindings: `wt` (scalar view), `padded`, `spatial`,
   `dst`, the tw source planes as one descriptor array (binding 4, pad only), and
   two vector views of `wt` (5 = vec2 for the window_freq pairs, 6 = vec4 for the
-  transposed window). Binding 4's descriptor count is the widest compiled
-  variant (7), not the instance's tw, because every radius's pipelines are
-  created against the one layout.
+  transposed window). The layout declares 7 descriptors; the pad update binds
+  `tw` of them, and every radius's pipelines share the one layout.
 - `num_streams` and `device_id` are registered no-ops (never read): depth is
   the core's call, device choice is `core.set_vulkan_device`.
 
@@ -85,7 +84,7 @@ IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
   power of two whose bytes fit `kSpatialRowBudget` (64 MiB) and at least
   `lookback+1`. `lookback = (16-block_step)/block_step` is how far back
   `col2im`'s window reaches into the previous stripe; `stripe_rows =
-  spatial_rows - lookback` (61 rows = 3 stripes at 1080p).
+  spatial_rows - lookback` (125 rows = 3 stripes at 1080p).
 - Per stripe: `fused` writes rows `[row_base, row_end)`, `col2im` emits the
   output rows whose block support is complete (padded `y < row_end*block_step`)
   and the rows left over by the previous stripe are still in the ring, then the
@@ -119,7 +118,7 @@ IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
   `td[]` stays in registers; `FILTER_TYPE` and `ZMEAN` are specialization
   constants (the dead filter branches and their divisions vanish); wave32 is
   requested. `SUB_BLOCKS=8` (128-thread workgroups) and the 288-float
-  bank-conflict-free transpose window (10 240 B LDS) remain the sweep winners.
+  bank-conflict-free transpose window (9 248 B LDS) remain the sweep winners.
 - Each 16-lane tile exchanges `trans` across `subgroupBarrier()`, whose scope is
   **one subgroup**, so the size in use has to be a multiple of 16 — wave32 is
   requested when the device offers it, and when it does not, the driver's default

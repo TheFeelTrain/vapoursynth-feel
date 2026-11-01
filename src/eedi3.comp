@@ -796,7 +796,7 @@ float conn_cost(int dy, int x, int u) {
 const int SGSIZE = 32;                         // == row workgroup size
 const int K = (TPITCH + SGSIZE - 1) / SGSIZE;  // directions per lane
 // pbt column layout. The relative predecessor delta is -1/0/+1, so when each
-// lane owns exactly two directions (MDIS 17..31, i.e. K == 2, which includes
+// lane owns exactly two directions (MDIS 16..31, i.e. K == 2, which includes
 // the mdis=20 default) the whole column packs into one nibble per lane -- 16
 // bytes instead of TPITCH=41. Even lanes combine their odd neighbour's nibble
 // through a shuffle and store one byte, so the packing adds no barrier. Other
@@ -908,7 +908,7 @@ float interp_dir(int dy, int x, int dir) {
 // tried and measured SLOWER on the mclip workload (see notes) — keep 1 row/WG.
 
 // pbt column layout. The relative predecessor delta is -1/0/+1, so when each
-// lane owns exactly two directions (MDIS 17..31, i.e. K == 2, which includes
+// lane owns exactly two directions (MDIS 16..31, i.e. K == 2, which includes
 // the mdis=20 default) the whole column packs into one nibble per lane -- 16
 // bytes instead of TPITCH=41, a 2.6x cut in the row kernel's store traffic
 // (measured worth ~10% of the frame ungated; PROBE=4). Even lanes combine their

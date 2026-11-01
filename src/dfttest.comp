@@ -84,7 +84,7 @@
 // = 18-float rows for the 9x16 ones (2 floats per element). Both strides keep
 // each phase's lane pattern bank-conflict-free, and 288 is the tight bound
 // (max offset 287): 2*16*17 = 544 floats per sub-block cost 18 432 B of LDS
-// per 128-thread workgroup, 288 costs 10 240 B.
+// per 128-thread workgroup, 288 costs 9 248 B.
 #define TR_ROW_1 17
 #define TR_ROW_2 18
 #define TR_SUB   288

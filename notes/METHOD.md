@@ -258,8 +258,8 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   parameter grows, the remaining cost is in a sibling path whose share grows
   with it (boundary rows/columns, tail iterations, the small/fallback case),
   and the same mechanism usually applies there too.
-- **Spec constants cannot size arrays in GLSL.** If an array dimension must
-  vary, gate it with a compile-time `-D` define instead.
+- **Spec constants can size arrays when the dimension is a spec-constant
+  expression** (NLMeans' `NLM_S` LDS tiles); `-D` is for a non-specialized literal.
 - **Respect the compiler's register tradeoffs.** ACO raises VGPRs deliberately
   for load ILP at an occupancy cost; forcing registers down often regresses.
   Read `RADV_DEBUG=shaderstats` before assuming more waves would help.

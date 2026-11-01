@@ -50,6 +50,9 @@ through `tools/benchmark.py`. u16 input unless noted:
 | `--download` (resident GPU input) | 2684.8 | 710.7 | 3.78x | 2677.2 | 1938.9 |
 | default (resident GPU input, no download) | 2689.6 | 709.2 | 3.79x | 2692.7 | 2662.0 |
 
+`README.md`'s table is a different session; the ~3% spread between the two is
+session noise, not a regression.
+
 - The two-column kernel lifted every compute-bound row by ~15–16% (u16 2343 →
   2690, f16 2346 → 2693, f32 2326 → 2662, compute-only). The reference rows are
   unchanged, so the ratios moved with it (u16 3.22x → 3.79x).
@@ -139,19 +142,19 @@ through `tools/benchmark.py`. u16 input unless noted:
   only `RADV_EXPERIMENTAL=transfer_queue` and silently ignores the old name.
   With it the device reports family 3 = `TRANSFER|SPARSE_BINDING` ×2, the
   core's existing code points `transferPtr`/`downloadPtr` at it
-  (`vsvulkan.cpp:882-895`), and the copy leaves the graphics engine: Bilateral
+  (`vsvulkan.cpp:893-901`), and the copy leaves the graphics engine: Bilateral
   **1590 → 2079 fps (+31%)** on interleaved pairs, DFTTest +22%, EEDI3 +16%,
   EEDI3AA +13%, BM3D +10% — each at 97–100% of its "download node deleted"
   ceiling, output byte-identical.
 - **`GPUDownload` is the only asymmetric leg.** On ReBAR the upload is a plain
   memcpy into the mapped plane with no submission at all
-  (`vsvulkanframe.cpp:259-276`), so it is free. The download cannot take its
+  (`vsvulkanframe.cpp:304-326`), so it is free. The download cannot take its
   direct path — that requires `HOST_CACHED` plane memory
-  (`vsvulkanframe.cpp:363-367`), and a discrete card's planes are
+  (`vsvulkanframe.cpp:401-416`), and a discrete card's planes are
   `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` but not cached (reading the BAR runs
   at 0.02 GB/s) — so it stages `stride*height` bytes VRAM → a cached host
-  readback slot by a GPU copy, then a host memcpy (4 slots, `vscore.cpp:1491`;
-  slot memory at `vsvulkanframe.cpp:185-193`). At 1080p u16 that copy is 4.1 MB
+  readback slot by a GPU copy, then a host memcpy (4 slots, `vscore.cpp:1870`;
+  slot memory at `vsvulkanframe.cpp:141-145`). At 1080p u16 that copy is 4.1 MB
   ≈ 0.10–0.16 ms: the measured pre-opt-in gap was 0.606 vs 0.507 ms.
 - **The kernel is not the regression — it is ISA-identical.** `RADV_DEBUG=shaderstats`
   (R=9, u16, pipeline cache off): new 3101 instructions / 14700 B code / 192
@@ -364,6 +367,3 @@ SDMA and the port reaches parity without any core change.
   (acquire/record/submit/total) at instance destruction.
 - `VSFEEL_DEBUG=1|2`, `VSFEEL_TRACE=1|2` — the shared error trace and trail
   (`acquire`/`record`/`submit` marks are recorded in the frame path).
-- Removed with the legacy path: `VSFEEL_BILAT_HD`, `VSFEEL_BILAT_KD`,
-  `VSFEEL_BILAT_QUEUES`, `VSFEEL_BILAT_NOCPU`, `VSFEEL_BILAT_NODL`,
-  `VSFEEL_BILAT_NODISPATCH`, `VSFEEL_BILAT_TRACE`.

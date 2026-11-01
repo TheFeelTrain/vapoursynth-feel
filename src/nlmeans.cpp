@@ -366,7 +366,7 @@ static const VSFrame * nlmeans_gpu_frame(NLMeansData * d, int n,
 
     // Per-frame scratch, handed to the context and recycled when the
     // submission retires. The weight ring dominates and is sized for the
-    // 64 MiB ring budget below.
+    // 128 MiB ring budget below.
     GpuBuffer u4a {}, u2 {}, u5 {};
     if (auto e = gpu_frame_buffer(*d->gpu, core, ctx,
                                   static_cast<VkDeviceSize>(d->npix) *

@@ -39,6 +39,9 @@ Scoreboard — jpbd 1080p GRAY16, sigma=16 (95 taps, two-pass), 5000 frames,
 | `--download` (resident GPU input) | 3978.4 | 1647.5 | 2.42x |
 | default (resident GPU input, no download) | 19990.7 | 1613.6 | 12.39x |
 
+`README.md`'s table is a different session; the ~5% spread between the two is
+session noise, not a regression.
+
 The first two rows carry transfers: row 1 uploads the CPU cache per frame and
 downloads the output, row 2 removes the input upload and still downloads; the
 filter runs at ~50 µs/frame in all three. Repeat sessions land within ~2–4%.
@@ -324,5 +327,3 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
   bits.
 - `VSFEEL_DEBUG=1|2`, `VSFEEL_TRACE=1|2` — the shared error trace and trail
   (`acquire`/`record`/`submit` marks are recorded in the frame path).
-- Removed with the legacy path: `VSFEEL_GAUSS_HD`, `VSFEEL_GAUSS_KD`,
-  `VSFEEL_GAUSS_QUEUES`, `VSFEEL_GAUSS_GPU_BENCH`.

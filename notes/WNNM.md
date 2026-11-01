@@ -23,7 +23,7 @@ gain, then subtract the pre-scaled neutral, in that order) and reads the frame's
 | luma, radius=0 | **1291 fps** | 204 fps |
 
 The radius=1 row is 6.2x vszip and the temporal matcher is ~62% of it; the same
-content at radius=0 is 3x faster (see Open work for what is left).
+content at radius=0 runs 1.26x faster (3.96x vszip's 408 fps; see Open work).
 
 Accuracy, against vszip and against an independent f64 exact-SVD oracle
 (320x240 / 640x360, `sigma=3`; max abs diff, "bad" = pixels over 1e-5):
@@ -136,10 +136,10 @@ The port is f32 end to end; there is no f64 path any more.
     scatters only the patches whose source layer is its own destination slab
     (`fold_dest`, recomputed from the fold index and the push constants), which
     is how the reference's VAggregate hands each output one slab.
-  - Scratch: `kSplitStride` 136 floats per group (`[0,64)` Gram then M,
-    `[64,128)` the residual mean, `[128]` the aggregation weight), sized for
-    `bs=8`: a larger block with `residual` overruns it. It is the same per-frame
-    buffer the fused path uses for its patch matrix.
+  - Scratch: `split_stride(m, residual)` floats per group (the Gram then M,
+    the residual mean when `residual`, and the aggregation weight), so a larger
+    block gets its own stride instead of overrunning a fixed one. It is the same
+    per-frame buffer the fused path uses for its patch matrix.
 - **Fused path** (`group_size > 8`), one workgroup per group:
   streaming top-k match, Gram, the reference's round-robin parallel Jacobi in
   f32 (mechanism from
@@ -189,8 +189,9 @@ staying a bit-exact copy and the request orders on both.
   512 MiB), so three-plane 1080p keeps it too.** The cache removes the cached
   folds' Gram and Solve; shrinking the match ring to make room instead loses
   more than it gains (see Historical).
-- The temporal frame at the benchmark default is ~1.02 ms for two chroma
-  planes. The probe's phase totals (`VSFEEL_WNNM_GPUTRACE`) are match 0.59 ms,
+- Before the M cache the temporal frame at the benchmark default was ~1.02 ms
+  for two chroma planes (the cached frame is the banner's 1287 fps). The
+  probe's phase totals (`VSFEEL_WNNM_GPUTRACE`) are match 0.59 ms,
   Gram 0.07, eigen step 0.20, scatter 0.12, normalize 0.01, and the ablation
   ladder (removing one dispatch at a time) prices the same shares: the matcher
   is 60% of the frame, the eigen step 20%, the scatter 12%, the Gram 7%.
@@ -216,10 +217,10 @@ staying a bit-exact copy and the request orders on both.
   out of order when the cache trusted a cursor.
 - The spatial frame is 0.62 ms: **match ~0.25 ms, estimate 0.37 ms** (the
   staging had taken the match phase from 0.50 ms).
-- **The 2-byte transport costs nothing measurable**: 987 fps (u16) and 989
-  (f16) against 984 (f32) on the harness default. The conversion copy is roughly
-  what the shorter source uploads save, so a caller no longer pays a `depth`
-  node in either direction.
+- **The 2-byte transport costs nothing measurable** (pre-cache): 987 fps (u16)
+  and 989 (f16) against 984 (f32) on the harness default. The conversion copy
+  is roughly what the shorter source uploads save, so a caller no longer pays
+  a `depth` node in either direction.
 - The benchmark chain (device-resident frames, no decode) and the live-decode
   screen now differ only by the decoder: 984 fps for the filter's own work, and
   a live 1080p source is decode-bound at about 560-630 fps. The screen that read
@@ -485,9 +486,10 @@ staying a bit-exact copy and the request orders on both.
   the frame 1.16 -> 1.18 ms. A 32-lane workgroup per group wastes 28 lanes and
   adds a barrier per round, so the serial register sweep stays; a
   4-lane-per-group version (8 groups per warp) is the only remaining shape.
-- **The default frame is 62% match, 18% apply, 15% solve, 4% gram, 1%
-  finish (GPUTRACE frame 5 after the M cache: 0.72/0.21/0.18/0.04/0.01 ms of
-  1.16 ms).** The matcher is at ~8 waves/SIMD. Its 32 threads
+- **The pre-cache default frame was 62% match, 18% apply, 15% solve, 4% gram,
+  1% finish (GPUTRACE frame 5: 0.72/0.21/0.18/0.04/0.01 ms of 1.16 ms; the
+  cached frame is the banner's 0.78 ms, so read the shares).** The matcher is
+  at ~8 waves/SIMD. Its 32 threads
   are right for the tile and the barriers, but the SSD chains are latency-bound.
   The remaining lever is more groups per workgroup (two groups of 32 threads
   with subgroup barriers, which needs the per-group arrays indexed by

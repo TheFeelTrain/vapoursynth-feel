@@ -26,32 +26,30 @@ CUDA-matcher build. The CPU plugin is the only oracle, driven from
   `sigma[0]*80 + 400` basic and `sigma[0]*10 + 200` final.
 
 Scoreboard — 1080p jpbd, `tools/benchmark.py -f bm3d`, harness defaults
-(sigma 0.7, radius 2, bm_range 9, ps_range 4, block_step 8), 1000 frames x3,
-default (resident GPU input, no output download):
+(sigma 0.7, radius 2, bm_range 9, ps_range 4, block_step 8), 5 s window,
+medians of 3, default (resident GPU input, no output download):
 
 | arm | fps | |
 |---|---|---|
-| vsfeel | **1022** | mawen matcher, per-frame accumulators |
-| vsfeel, 16 bit in | **1070** | same kernels, half the io bytes |
-| vsfeel, f16 in | **1071** | same kernels, half the io bytes |
-| bm3dvk | 263 | fixed 8-member groups |
-| bm3dvk2 | 883 | |
-| vszipcl | 109 | |
+| vsfeel | **1164** | mawen matcher, per-frame accumulators |
+| vsfeel, 16 bit in | **1170** | same kernels, half the io bytes |
+| vsfeel, f16 in | **1172** | same kernels, half the io bytes |
+| bm3dvk | 264 | fixed 8-member groups |
+| bm3dvk2 | 1005 | |
+| vszipcl | 124 | |
 
 - **1.16x the faster reference**, but not on equal work: they always group eight
-  while the default threshold accepts ~80% of candidates here and the top-eight
-  selection does the filtering.
-- bm3dvk2 is the close one now: its per-frame accumulators (the design this
-  round copied) are what took it from 146 to ~880; its fixed eight-member groups
-  still do less filtering work than the thresholded groups here.
+  while the default threshold accepts ~80% of candidates and the top-eight
+  selection does the filtering. A repeat measured 1.07x, so read 1.1–1.2x; the
+  note and README tables are different sessions.
+- bm3dvk2 is the close one: its per-frame accumulators (this round's design)
+  took it from 146 to ~1005; its fixed eight-member groups still filter less.
 
-u16 and f16 input are the same filter, not two more: the ring, the estimate
-stacks and every kernel's arithmetic are float at every depth, a 2-byte clip's
-samples are widened once when copied into the ring (an integer sample by the
-reference's `Int2Float` gain and chroma neutral, a half sample by an exact
-widening with neither), and the aggregation stores back to the native sample
-type. A 16 bit chain therefore drops the caller's `depth()` node and uploads
-half the bytes, which is where the visible speedup is (see Performance).
+u16 and f16 input are the same filter: the ring, estimate stacks and every
+kernel's arithmetic are float at every depth, a 2-byte sample is widened once
+when copied into the ring (integer by the reference's `Int2Float` gain and
+chroma neutral, half by an exact widening), and the aggregation stores back to
+the native type, dropping the caller's `depth()` node (see Performance).
 
 ## Implementation
 
@@ -534,33 +532,20 @@ Chronological; each entry keeps the mechanism, not the story.
   averaged short (dim band), a recycled one contributed another frame's groups.
   Each slice now carries a witness the aggregation checks, falling back to the
   source pixel when none survive. No perf change.
-- **Block matching reused shifted SSD columns incorrectly**, changing candidate
-  ranks at radius 0-2. All radii now use exact per-candidate SSD: 647 -> 766.5
-  fps on the benchmark config.
-- **Concurrent first-use tag clearing could erase witnesses** (a whole-buffer
-  clear could submit after another estimate wrote tags). Each estimate now clears
-  only its exclusively reserved slot in its own ordered command buffer.
-- **Radius-0 aggregation fallback used a frame-derived ring slot**; it uses the
-  reservation's slot now.
-- **A failed frame advertised ring copies that never landed**, so a later frame
-  block-matched against uninitialised VRAM (0.038 max diff at frame 1). The error
-  path clears the keys whose chunk-0 copy did not submit and releases blocked
-  readers instead of hanging them. `VSFEEL_BM3D_FAULT` pins it.
-- **The CAS fallback's retry bound counted the wrong contributors.** It is a
-  contention bound, `8 * (ceil((2*bm_range + 8)/block_step) + 1)^2` (968 at
-  bm_range=16/step 4, 13448 at step 1), not the `8 * ceil(8/block_step)^2` the
-  old comment derived; 32 was short at every step and left 16 of 4096 pixels
-  1e-5..6.1e-5 out against the hardware-atomic arm. `res_add` derives it now.
-- **Creation-failure leak**: `createVideoFilterEx2` returns nullptr without
-  running the free callback, so the instance released just before it leaked. Same
-  mechanism as `notes/DFTTEST.md`. No perf change.
-- **`VSFEEL_BM3D_NOCHUNKBAR` removed**: it dropped the leading barrier of every
-  chunk after 0, which is what orders them behind chunk 0's ring copies.
-- **Radius-0 trace false-alarmed and read the cache unlocked**; now gated on
-  radius and locked like every other table read.
-- **Shared plumbing hardening** (no observable behaviour): device registry
-  `insert_or_assign`, non-throwing cache load/save, per-save temp names, clamped
-  `max_push_descriptors`, dead members deleted.
+- **2026-09-24 — pre-port correctness fixes.** Block matching reused shifted SSD
+  columns, changing candidate ranks at radius 0-2 (all radii now use exact
+  per-candidate SSD: 647 → 766.5 fps). Concurrent first-use tag clearing could
+  erase witnesses; each estimate now clears only its exclusively reserved slot.
+  The radius-0 aggregation fallback used a frame-derived ring slot; a failed
+  frame advertised ring copies that never landed (0.038 max diff at frame 1; the
+  error path clears the keys and releases blocked readers, and `FAULT` pins it).
+  The CAS fallback's retry bound counted the wrong contributors: it is now the
+  contention bound (968 at bm_range=16/step 4, 13448 at step 1) that `res_add`
+  derives. A creation failure leaked the instance (`createVideoFilterEx2`
+  returns nullptr without the free callback, as in `notes/DFTTEST.md`);
+  `NOCHUNKBAR` was removed; the radius-0 trace false-alarmed and read the cache
+  unlocked; shared plumbing was hardened (registry, non-throwing cache
+  load/save, temp names, push-descriptor clamp, dead members).
 - **2026-09-23 — exec-pool port: +1%.** Per-stream pools, timelines and raw
   `gpu_submit` replaced by the core's exec pool. The pool allocates timeline
   values at submit, so the cache's pre-reservation pairs became per-slot
@@ -587,8 +572,8 @@ Chronological; each entry keeps the mechanism, not the story.
   GRAY32 r=2).
 - **2026-09-20 — the estimate cache sizes to its working set** (`ns + 2r`
   instead of `tw + ns + 2r`): -36..41% of total VRAM at no in-order cost, which
-  is what made radius 4 fit an 8 GiB card. `VSFEEL_BM3D_CACHE=1` restores the
-  seek margin.
+  is what made radius 4 fit an 8 GiB card. `VSFEEL_BM3D_INFLIGHT` and the
+  per-slot flags carry the seek margin now.
 - **2026-09-20 — the direct-upload path needs a real ReBAR heap, not just the
   memory type**: an RX 580/Windows reports a 256 MiB aperture heap whose type
   looks usable, and staging from it failed with `VK_ERROR_OUT_OF_DEVICE_MEMORY`
@@ -661,9 +646,11 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
   the driver rule (shared memory everywhere except RADV).
 - `VSFEEL_BM3D_SPLIT_KERNEL=0/1` — force either estimation path; unset follows
   the driver rule (split everywhere except RADV).
-- `VSFEEL_BM3D_NOSEARCH=1` / `VSFEEL_BM3D_NOESTIMATE=1` — ablation knobs.
-  `NOSEARCH` is the matcher's reference-only path, the same thing `th_mse=0`
-  selects, so it cannot price the search.
+- `VSFEEL_BM3D_SUBGROUP=64` — force wave64 instead of the driver's default.
+- `VSFEEL_BM3D_WORKGROUP=<n>` — launch width, a multiple of 8.
+- `VSFEEL_BM3D_NOSEARCH=1` / `NOESTIMATE=1` — ablation knobs; NOSEARCH is the
+  matcher's reference-only path (what `th_mse=0` selects), so it cannot price
+  the search.
 - `VSFEEL_BM3D_MATCHTRACE=<frame>,<x>,<y>` — record and print the group the
   matcher selects for one reference block (members with errors and window
   positions, list sizes and per-frame seed counts). `<x>,<y>` must be a

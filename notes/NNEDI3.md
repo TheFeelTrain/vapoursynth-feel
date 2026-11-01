@@ -16,8 +16,9 @@ Status: **shipped on the R80 GPU API.** Design (current):
   kept rows and, on a skipped plane under `dh`, zero-fills the interpolated
   rows. `DH`/`ZERO` are spec constants (ids 9/10; 11 spec entries total).
 - Per frame: one transient device-local scratch (`width*rows*4 B` list +
-  16 B indirect struct per plane) handed to the recording context; five push
-  words `{list_elem, src_stride, dst_stride, parity, ind_elem}`.
+  16 B indirect struct per plane) handed to the recording context; six push
+  words `{a_base, src_stride, dst_stride, parity, d_base, max_grid_x}` (the
+  keep pass fills five and a trailing zero).
 - Persistent VRAM: the three weight buffers (worst config qual2/nsize3/nns4 ≈
   1.2 MB, host-visible, device-local preferred) plus pipelines; transient
   4.2 MB scratch per in-flight frame (1080p GRAY16 `field=3`), bounded by the

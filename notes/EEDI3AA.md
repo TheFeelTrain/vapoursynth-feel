@@ -20,6 +20,8 @@ device-resident, resident-output mode), medians of 3):
 | f16 | 161 | - | - |
 | f32 | 125 | 24 | 32 |
 
+`README.md`'s f16 row (155) is a different session; this session measured 161.
+
 - **4.7x the faster reference chain on u16, 4.0x on f32, +28% over f32 on f16.**
   f16 keeps the intermediate `v`/O_0 half (the chain's frames are half) and the
   rest f32; the merge's narrowing is spelled out (see `notes/EEDI3.md`'s f16
@@ -404,15 +406,13 @@ under-reported every stage 10x).
 
 ## Open work
 
-- **A parallel vcheck is the only path past 1.33x** (47% of the frame), and it
-  changes the shared EEDI3 core, which would speed up EEDI3/EEDI3H by the same
-  factor and leave the ratio where it is. The walk is sequential because each
-  row's blend reads the *modified* previous row via `pr`; the untried fix is a
-  width-independent form (previous row in registers via subgroup shuffles, or a
-  tiled LDS window) — pure constant-factor, identical output, safe to land. Even
-  a 2x vcheck is ~1.2x end-to-end; 1.5x needs it *plus* the row kernel.
-- Row kernel is 39% of the graded frame; its one large item (ring shift
-  register) is tracked in `notes/EEDI3.md`.
+- **The row kernel is the remaining lever: 77% of GPU time and 39% of the
+  graded frame** (the rest is the transfer bill, `notes/EEDI3.md`). A win there
+  changes the shared EEDI3 core, which speeds EEDI3/EEDI3H by the same factor
+  and leaves the ratio where it is. Its measured items are the ring-shift
+  register (`PROBE=15`, ~12% of it) and the three-window redundancy
+  (`PROBE=14`, 8.2%, needs a 2|u|-deep delay line); the vcheck is 3% of GPU
+  time, so a parallel form cannot move the ratio.
 
 ### Do not retry
 
@@ -433,7 +433,8 @@ the shared core's knobs plus its own `..._NOCLEAR`/`..._POISON`.
   recording, to price a kernel end to end. Changes the output.
 - `..._VPARA=<n>` — vcheck form: 0 = serial row walk (A/B control), 1..6 =
   parallel with that many Jacobi steps (default 6).
-- `..._VCLDS=1` — force the LDS vcheck ping-pong back (global reads are default).
+- `..._VCLDS=1` — force the LDS vcheck ping-pong back; needs `..._VPARA=0` (the
+  two forms are mutually exclusive). Global reads are the default.
 - `..._NOCLEAR=1` — skip the per-submission scratch clear.
 - `..._POISON=<hex>[:<region>]` — fill the scratch, or one region (`pad`, `dst`,
   `dmap`, `rempty`, `vout`, `o0`, `v`, …), with a pattern, so two runs differ

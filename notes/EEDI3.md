@@ -12,34 +12,30 @@ GPU API**: `clip/sclip/mclip:vnode:gpu` in and `ffGPUOutput` out, one exec pool,
 and no host upload/download/gather/blit machinery at all. The parallel vcheck is
 the default.
 
-Benchmark defaults (the 2x based_aa setup; current `--filter eedi3`/`eedi3h`
-run at 1080p with the mask, and `--filter eedi3aa` is the fused 2x chain):
-2000 f, real based_aa clip, 2x2160p, field=3, mdis=20, vcheck=2.
+Benchmark (`--filter eedi3`, the README's config): 1080p jpbd, mask, default
+args (field=3, mdis=20, vcheck=2), 5 s medians of 3 (README differs):
 
-| clip | vsfeel | vszipcl | eedi3vk2 |
+| depth | vsfeel | eedi3vk2 | ratio |
 |---|---|---|---|
-| u16 | 618 | 54 | 139 |
-| u16/f16 (EEDI3H, same call surface) | 748 / 719 | 51 | - |
-| u16 hp | 237 | 45 | 80 |
-| f16 | **603** | - | 141 (its own full-half path) |
-| f32 | 489 | 54 | 129 |
+| u16 | 2348 | 353 | 6.65x |
+| f16 | 2167 | 242 | 8.96x |
+| f32 | 2019 | 345 | 5.86x |
 
-The hp row costs vsfeel **2.6x** (618 → 237): the direction set doubles (TPITCH
-41 → 81, K 2 → 3), the relax widens to ±2 and `pbt` grows 16 → 81 bytes.
+The hp direction set doubles the kernel's work (TPITCH 41 → 81, K 2 → 3),
+widens the relax to ±2 and grows `pbt` 16 → 81 bytes; it cannot 2-bit pack.
 
 - **The graded vertical EEDI3 is HOST<->DEVICE TRANSFER bound, not kernel
-  bound.** `VSFEEL_EEDI3_SKIP=1` (interleaved 6×2-repeat A/B) moves the graded
-  2x2160p run by **+0.4%** (default, resident GPU input, no download), +0.5%
-  `--cpu-cache --download`: the kernels are hidden behind the per-output-frame
-  transfer bill (~50 MB: sclip every frame, clip+mclip every other, the
-  download). `GPUUpload → GPUDownload` of one 4K16 plane is 2.82 ms.
+  bound.** The bill is ~50 MB per output frame (sclip every frame, clip+mclip
+  every other, the download); `GPUUpload → GPUDownload` of one 4K16 plane is
+  2.82 ms, which is the 2x2160p frame time. The legacy `SKIP=1` ablation was
+  void (the knob takes a kernel list); `VSFEEL_EEDI3_SKIP=mask,pad,row,vcheck,tail`
+  is the live ladder.
 - **Batch size (`VSFEEL_EEDI3_BATCH`, default from a scratch target — 256 MiB,
-  512 for EEDI3AA).** The knee is where the submit path stops being amortised by
-  the GPU fill, and it moves with the environment: with RADV's transfer queue on
-  (what the benchmark sets) 2x2160p wants **B=2** (B=1 355 / B=4 453 / B=8 339),
-  with it off B=3.
+  768 for EEDI3AA).** The knee is where the submit path stops being amortised by
+  the GPU fill: with RADV's transfer queue on (what the benchmark sets) 2x2160p
+  wants **B=2** (B=1 355 / B=4 453 / B=8 339); neither knee moves with it off.
 - **`pbt` is 2-bit packed** when a lane owns exactly two directions (TPITCH
-  33..64, i.e. mdis 17..31, which includes the default 20): each lane builds a
+  33..63, i.e. mdis 16..31, which includes the default 20): each lane builds a
   nibble and only even lanes store, combining their odd neighbour's nibble
   through a `subgroupShuffleXor`, so no barrier and no write race. Column stride
   41 → 16 bytes, per-frame scratch at 2x2160p 225 → 120 MiB. Bit-exact on the
@@ -116,10 +112,10 @@ Runs once per plane **after** all interp rows exist (masked rows = cubic). Pad r
 `y=MARGIN_V+field .. height-MARGIN_V` step 2 → dst row `dy=y-MARGIN_V` steps 2; the
 pad-row write gate ≡ `dy ∈ [2, dstH-3]`.
 
-Taps at column x for interp row dy: `dst2p` = dst dy-2 (**previous interp row,
-already vchecked**); `dst1p/dst1n` = dst dy∓1 (kept source rows, never vchecked);
-`dst3p/dst3n` = source kept rows dy∓3 (from pad); `dst2n` = dst dy+2 (next interp
-row, still plain); `dmap[x±width]` = neighbour interp rows' dmap.
+Taps at column x for interp row dy: `dst2p` = dst dy-2; `dst1p/dst1n` = dst dy∓1
+(kept source rows); `dst3p/dst3n` = source kept rows dy∓3 (from pad); `dst2n` =
+dst dy+2 (next interp row, still plain); `dmap[x±width]` = neighbour interp rows'
+dmap.
 
 `cint = sclip ? scpp[x] : cubic(dst1p,dst1n,dst3p,dst3n)`; u16 cubic
 `(9*(dst1p+dst1n)-(dst3p+dst3n)+8)/16` clamped [0,peak], floats unclamped.
@@ -132,12 +128,15 @@ row, still plain); `dmap[x±width]` = neighbour interp rows' dmap.
 `d1=|ib-dst1n[x]|`, `d2=|vt-vc|`, `d3=|vb-vc|`; mdiff0/1 combine per mode (mode 2
 int `(d+d+1)/2`, else float /2); `a=min(max(mdiff0*rcpVthresh0,
 mdiff1*rcpVthresh1, max((vthresh2-|dirc|)*rcpVthresh2, 0)), 1)`;
-`tline=(1-a)*dstp[x]+a*cint`; u16 store **truncates toward zero**, float
+`tline=(1-a)*dstp[x]+a*cint`; u16 stores round half-up into `vout`, floats
 unclamped; the row is then memcpy'd to dst.
 
-**Structural consequence (the implementation may rely on this):** the row
-dependency is **only** dy-2 (finalized) and dy+2 (still plain) → two separate
-passes, or one pass holding the previous row's final tline in shared.
+**Serial vs parallel.** The contract above is the serial walk
+(`VSFEEL_EEDI3_VPARA=0`): `dst2p` is the **already vchecked** previous interp row,
+so rows are ordered and one pass carries the previous row's tline in shared memory.
+The shipped default (`VPARA=6`) is parallel: each row's `d2p` term is the
+un-vchecked previous row (dst) refined by that many Jacobi steps, so rows have no
+ordering dependence and one workgroup owns each row; 6 is bit-exact on the tests.
 
 ### Reference structure (five backends, same GPU, READ-ONLY)
 
@@ -646,8 +645,8 @@ passes). All bit-identical to the previous build unless stated.
   then swung 20%.
 - **Never compare a number recorded in a different command** — interleave A/B in one
   session, and in the same *environment*: the EEDI3 batch knee is at 2 with RADV's
-  transfer queue and at 3 without it, and a sweep run in the wrong env answers the
-  wrong question.
+  transfer queue and does not move with it off, so a sweep run in the wrong env
+  answers the wrong question.
 - **Check `CMAKE_HOME_DIRECTORY` before trusting an A/B against a second build
   tree**: a copied `CMakeCache.txt` can point at the main checkout, so both arms
   become the same binary.
@@ -657,7 +656,7 @@ passes). All bit-identical to the previous build unless stated.
   overstated row kernel). Additive costs of similar size mean a shared memory path;
   one dominant item means a loop. `VSFEEL_EEDI3_SKIP` is the live ladder;
   `VSFEEL_EEDI3_GPUTIME` reads the per-phase GPU split directly.
-- **Before trusting any `PROBE` number, `stat -c %s build/vk_spv/eedi3_16_row.spv`**:
+- **Before trusting any `PROBE` number, `stat -c %s build/vk_spv/eedi3_u16_row.spv`**:
   a `>=` guard once compiled 4-7 to an empty kernel (1656 B).
 - **The benchmark's EEDI3 mask follows the clip's depth, like based_aa**; both depths
   take the same no-conversion path, with one deliberate documented divergence (floats
@@ -672,7 +671,8 @@ passes). All bit-identical to the previous build unless stated.
 
 ## Debug env vars
 
-- `VSFEEL_EEDI3_VCLDS` — `=1` forces the LDS vcheck ping-pong back (global is default).
+- `VSFEEL_EEDI3_VCLDS` — `=1` forces the LDS vcheck ping-pong back; needs
+  `VSFEEL_EEDI3_VPARA=0` (the two forms are mutually exclusive). Global is default.
 - `VSFEEL_EEDI3_GPUTIME` — `=1` stamps each phase inside the submission's command
   buffer and reports the split. It waits each submission out, so it serializes the
   pipeline: a diagnostic, never a benchmark config.
@@ -681,7 +681,7 @@ passes). All bit-identical to the previous build unless stated.
 - `VSFEEL_EEDI3_VPARA` — vcheck form: 0 = serial row walk (A/B control), 1..6 =
   parallel with that many Jacobi steps. Default 6 (bit-exact on the test surface).
 - `VSFEEL_EEDI3_BATCH` — output frames recorded per submission (default: a
-  ~256 MiB scratch target, 512 for EEDI3AA, capped by the core's VRAM allowance;
+  ~256 MiB scratch target, 768 for EEDI3AA, capped by the core's VRAM allowance;
   clamped 2..8, which lands on 2 at 2x2160p for EEDI3 and 4 for EEDI3AA, 8 at
   1080p; drops to 1 when the allowance cannot hold two frames). `=1` is the A/B
   control.
@@ -694,5 +694,5 @@ passes). All bit-identical to the previous build unless stated.
   scratch clear (0 fill).
 - `VSFEEL_EEDI3_POISON` — EEDI3AA only: `<hex>[:<region>]` overlays a pattern on
   the scratch, or one named region, before the passes. Changes output by design.
-- `EEDI3_PROBE` — CMake cache var: ablation level 0/1/2/3/4/5/6/7/8/9/10/12 (11, 13+ unused).
+- `EEDI3_PROBE` — CMake cache var: ablation level 0–10, 12–19, 22 (11 and 20–21 unused).
 - `EEDI3_MAXW` — CMake cache var: LDS vcheck max width -> `-DMAXW` + `-DEEDI3_MAXW_LDS` (default 4096).

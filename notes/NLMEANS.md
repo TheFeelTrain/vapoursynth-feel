@@ -56,7 +56,9 @@ io depth (default: resident GPU input, no download, same config, medians of 3):
 
 - The half window is 2 bytes like u16's, and the sweep (not the transfers) is
   the frame, so f16 lands +3.5% over u16 and +12.2% over f32. The io width is
-  the whole difference: the kernels are the same shape at every depth.
+  the whole difference: the kernels are the same shape at every depth. README's
+  f16 row is a different session and sits below its own u16, which the 2-byte
+  window and f32 weights rule out (a re-measure gave 1081 against 1033).
 
 The f32 weight ring (2026-10-02) replaces the fp16 one and costs **−7.2%** on
 the same config: same-session pair, 1080.2 → 1002.4 fps (vszipcl control flat at
@@ -304,7 +306,7 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 - **Round packing >1** (bigger W/A rings): pack=2 tied, 4/8 lost; rings >33 MB
   stream u4a through DRAM. Its 10-binding push-descriptor layout is bounded by
   `maxPushDescriptors` (checked at layout creation; the per-stage pool limits do
-  not apply to push descriptors), which RADV reports at the minimum of 32. The 64 MiB target is capped by the core's VRAM limit,
+  not apply to push descriptors), which RADV reports at the minimum of 32. The 128 MiB target is capped by the core's VRAM limit,
   so a device with a smaller allowance packs fewer entries per round instead of
   planning the optimum anyway.
 - **`a=64, d=16` hard-recovers the GPU when the device is shared** — a
@@ -319,6 +321,6 @@ Flags are `VSFEEL_NLMEANS_<FLAG>`.
 - `VSFEEL_NLMEANS_GPUTRACE=1[,frame]` — one-shot per-batch GPU timestamps.
 - `VSFEEL_NLMEANS_PACK=N` — entries per W/A round (clamped 1..16384, and so the
   weight dispatch's Z fits the device's group-count limit; default from the
-  64 MiB ring budget, itself capped by the core's VRAM limit).
+  128 MiB ring budget, itself capped by the core's VRAM limit).
 - `VSFEEL_NLMEANS_VRAM=1` — creation banner with ring/window/per-frame bytes.
 - `VSFEEL_DEBUG`/`VSFEEL_TRACE` and `RADV_DEBUG=asm|shaderstats` as elsewhere.
