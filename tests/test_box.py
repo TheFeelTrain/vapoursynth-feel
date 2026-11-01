@@ -52,6 +52,10 @@ RATIOS = [
     (6, 1, 1.8e-7),
 ]
 
+# The f32 bound for the ratios the color sweep uses, so a color case is graded
+# at its own measured ratio instead of the loosest sibling.
+RATIO_REL = {ratio: rel_bound for ratio, _, rel_bound in RATIOS}
+
 # Subsampled formats need even chroma planes, so their fractional ratios are
 # limited to the ones that keep the lattice legal (resize2 rejects the rest).
 COLOR_CASES = [
@@ -111,13 +115,19 @@ COLOR_CASES_F16 = [
 
 
 def _px(node, p=0, n=0):
-    """One plane of one frame as int64.
+    """One u16 plane of one frame as int64.
 
     Widened deliberately: the u16 operands are whole integer codes and
     subtracting two uint16 arrays wraps (``0 - 1 == 65535``), which would turn a
-    one-code difference into a full-scale one.
+    one-code difference into a full-scale one. The float paths use ``_pxf32``:
+    reading a [0,1] float as int64 truncates it to 0 (or 1 at exactly 1.0).
     """
     return _plane(cpu_node(node).get_frame(n), p).astype(np.int64)
+
+
+def _pxf32(node, p=0, n=0):
+    """One float plane of one frame as float64."""
+    return _plane(cpu_node(node).get_frame(n), p).astype(np.float64)
 
 
 def _box(clip, width, height):
@@ -129,10 +139,22 @@ def _ref(clip, width, height):
 
 
 def _worst(clip, width, height, planes):
-    """(worst absolute, worst peak-relative) difference over `planes`."""
+    """(worst absolute, worst peak-relative) u16 difference over `planes`."""
     worst_abs = worst_rel = 0.0
     for p in planes:
         ref, out = _px(_ref(clip, width, height), p), _px(_box(clip, width, height), p)
+        d = float(np.abs(ref - out).max())
+        worst_abs = max(worst_abs, d)
+        worst_rel = max(worst_rel, d / max(1.0, float(np.abs(ref).max())))
+    return worst_abs, worst_rel
+
+
+def _worst_f32(clip, width, height, planes):
+    """(worst absolute, worst peak-relative) f32 difference over `planes`."""
+    worst_abs = worst_rel = 0.0
+    for p in planes:
+        ref = _pxf32(_ref(clip, width, height), p)
+        out = _pxf32(_box(clip, width, height), p)
         d = float(np.abs(ref - out).max())
         worst_abs = max(worst_abs, d)
         worst_rel = max(worst_rel, d / max(1.0, float(np.abs(ref).max())))
@@ -190,8 +212,8 @@ def test_agrees_with_resize2_u16(clip_gray16, ratio, abs_bound, rel_bound):
 def test_agrees_with_resize2_float(clip_grays, ratio, abs_bound, rel_bound):
     """The float path reproduces resize2's Box to float32 rounding."""
     w, h = _target(clip_grays, ratio)
-    _, rel_d = _worst(clip_grays, w, h, [0])
-    assert rel_d <= max(rel_bound, 1e-6), f"{ratio}: rel={rel_d} > {rel_bound}"
+    _, rel_d = _worst_f32(clip_grays, w, h, [0])
+    assert rel_d <= rel_bound, f"{ratio}: rel={rel_d} > {rel_bound}"
 
 
 @pytest.mark.parametrize("fmt,ratio", COLOR_CASES)
@@ -207,8 +229,9 @@ def test_agrees_with_resize2_color(request, fmt, ratio):
         abs_d, _ = _worst(clip, w, h, planes)
         assert abs_d <= 2, f"max|d|={abs_d}"
     else:
-        _, rel_d = _worst(clip, w, h, planes)
-        assert rel_d <= 2.4e-7, f"rel={rel_d}"
+        _, rel_d = _worst_f32(clip, w, h, planes)
+        bound = RATIO_REL[ratio]
+        assert rel_d <= bound, f"{ratio}: rel={rel_d} > {bound}"
 
 
 def test_chroma_planes_are_scaled(clip_yuv420p16):
@@ -276,7 +299,7 @@ def test_gray_has_one_plane_f16(clip_grayh):
 
 def test_gray_has_one_plane(clip_grays):
     w, h = _target(clip_grays, 2)
-    assert _px(_box(clip_grays, w, h)).shape == (h, w)
+    assert _pxf32(_box(clip_grays, w, h)).shape == (h, w)
 
 
 # ---------------------------------------------------------------------------
@@ -412,8 +435,9 @@ def test_odd_width_matches_resize2_u16(clip_gray16):
 def test_odd_width_matches_resize2_f32(clip_grays):
     for right, width in ((27, 306), (27, 612), (1, 319)):
         cropped = clip_grays.std.Crop(right=right)
-        _, worst = _worst(cropped, width, 180, [0])
-        assert worst <= 2.4e-7, f"613->{width}: {worst} of peak"
+        _, worst = _worst_f32(cropped, width, 180, [0])
+        # one float32 ulp at the unit peak (measured 1.19e-7 at 306 and 319)
+        assert worst <= 1.2e-7, f"613->{width}: {worst} of peak"
 
 
 def test_odd_width_matches_resize2_f16(clip_grayh):
@@ -426,8 +450,8 @@ def test_odd_width_matches_resize2_f16(clip_grayh):
 def test_odd_height_matches_resize2_f32(clip_grays):
     """The vertical pass has the same boundary rule."""
     cropped = clip_grays.std.Crop(bottom=7)  # 353 high
-    _, worst = _worst(cropped, 640, 176, [0])
-    assert worst <= 2.4e-7, f"353->176: {worst} of peak"
+    _, worst = _worst_f32(cropped, 640, 176, [0])
+    assert worst <= 1.2e-7, f"353->176: {worst} of peak"
 
 
 def test_one_axis_omitted_matches_resize2(clip_gray16):

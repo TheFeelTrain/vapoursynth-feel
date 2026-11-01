@@ -455,9 +455,11 @@ def test_mixed_filter_concurrency_matches_solo():
     assert not missing, "no concurrent output for: %s" % ", ".join(missing)
 
     # WNNM and BM3D aggregate with atomics, so a value landing on a rounding
-    # tie can move by one code between runs; that is not cross-instance
-    # interference. Everything else must be bit-exact.
-    slack = {"WNNM": 1, "BM3D": 1}
+    # tie can move between runs; that is not cross-instance interference.
+    # WNNM's u16 transport is whole codes (one code); BM3D runs on the f32 clip,
+    # where one code is full scale, so its slack is the atomic-order floor.
+    # Everything else must be bit-exact.
+    slack = {"WNNM": 1, "BM3D": 1e-5}
     bad = {n: d for n, d in payload["diffs"].items() if d is not None and d > slack.get(n, 0)}
     assert not bad, (
         "concurrent output differs from the solo run (self-consistency must be "

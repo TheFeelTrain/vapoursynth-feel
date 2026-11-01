@@ -41,9 +41,9 @@ from conftest import (
     CLIP_FRAMES,
     CLIP_PATH,
     COMPARE_PRELUDE,
+    ReferenceUnavailable,
     assert_changes_on_clip,
     assert_preserves_frame_props,
-    compare_or_skip,
     cpu_node,
     eval_parallel,
     frame_to_ndarray,
@@ -51,6 +51,7 @@ from conftest import (
     reference_compare,
     reference_or_skip,
     reference_spec,
+    run_compare_subprocess,
 )
 
 pytestmark = pytest.mark.usefixtures("clip_grays")
@@ -257,12 +258,14 @@ F16_EXACT_CASES = [
 @pytest.mark.parametrize(
     "kwargs", F16_EXACT_CASES, ids=[str(sorted(k.items())) for k in F16_EXACT_CASES]
 )
-def test_nnedi3_f16_packed_bit_exact(clip_grayh, kwargs):
+def test_nnedi3_f16_packed_bit_exact(clip_grayh, kwargs, packed_f16_predictor):
     """The packed half predictor must reproduce nnedi3vk's f16 output exactly.
 
     Both run the same half GEMV over the same rounded weights with the same
     window centering and f32 row-sum correction, so any difference here is a
     real indexing or layout bug (this is the bit-exact oracle for the path).
+    Skipped where shaderFloat16 is missing: the forced packed request then
+    runs the storage-only fallback, which is not expected to be exact.
     """
     payload = _ref_compare("grayh", (0, 11), kwargs, env={"VSFEEL_NNEDI3_PRED16": "1"})
     assert payload["maxdiff"] == 0.0, kwargs
@@ -312,8 +315,8 @@ def run(clip):
 try:
     ref = run(f32)
 except Exception as exc:
-    print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
-    raise SystemExit(2)
+    print("VSFEEL fail: f32 side: %s: %s" % (type(exc).__name__, exc), flush=True)
+    raise SystemExit(3)
 print("REF ok", flush=True)
 
 try:
@@ -328,16 +331,28 @@ print("RESULT " + json.dumps({"maxdiff": worst}), flush=True)
 )
 
 
+def _f16_vs_f32(kwargs, env=None):
+    """Run the vsfeel-only f16-vs-f32 oracle.
+
+    Both sides are vsfeel, so a subprocess that cannot materialise the f32 side
+    is a failure here, not a missing external reference to skip.
+    """
+    try:
+        return run_compare_subprocess(
+            _F16_VS_F32_SCRIPT,
+            [CLIP_PATH, json.dumps(dict(kwargs, field=1)), str(CLIP_FRAMES)],
+            env=env,
+        )
+    except ReferenceUnavailable as exc:
+        raise AssertionError(f"the f32 side of the f16 oracle failed: {exc}") from exc
+
+
 @pytest.mark.parametrize(
     "kwargs", [{}, {"pscrn": 0}, {"nsize": 3}, {"dh": True}], ids=lambda k: str(sorted(k.items()))
 )
 def test_nnedi3_f16_storage_only_matches_f32_path(kwargs):
     """f16 io with f32 arithmetic is the f32 path within one half step."""
-    payload = compare_or_skip(
-        _F16_VS_F32_SCRIPT,
-        [CLIP_PATH, json.dumps(dict(kwargs, field=1)), str(CLIP_FRAMES)],
-        env={"VSFEEL_NNEDI3_PRED16": "0"},
-    )
+    payload = _f16_vs_f32(kwargs, env={"VSFEEL_NNEDI3_PRED16": "0"})
     assert payload["maxdiff"] <= F16_STORAGE_ULP, kwargs
 
 
@@ -351,10 +366,7 @@ def test_nnedi3_f16_matches_f32_path_within_reference(kwargs):
     kernel *is* the reference's f16 arithmetic; a device without shaderFloat16
     falls back to the storage-only path, which is tighter still.
     """
-    payload = compare_or_skip(
-        _F16_VS_F32_SCRIPT,
-        [CLIP_PATH, json.dumps(dict(kwargs, field=1)), str(CLIP_FRAMES)],
-    )
+    payload = _f16_vs_f32(kwargs)
     assert payload["maxdiff"] <= F16_PACKED_MAX, kwargs
 
 
@@ -410,6 +422,21 @@ def test_nnedi3_f16_predictor_variant_pinned():
         assert "predictor=f16-packed" in default, default[-2000:]
     storage = _creation_stderr({"VSFEEL_NNEDI3_PRED16": "0"})
     assert "predictor=f16-storage" in storage, storage[-2000:]
+
+
+@pytest.fixture(scope="module")
+def packed_f16_predictor():
+    """Skip the bit-exact f16 oracle when the packed predictor cannot run.
+
+    The exact test forces ``VSFEEL_NNEDI3_PRED16=1``; on a device without
+    shaderFloat16 creation silently keeps the storage-only path, whose one
+    rounding on store is expected to differ from nnedi3vk's f16 arithmetic.
+    """
+    err = _creation_stderr({"VSFEEL_NNEDI3_PRED16": "1"})
+    if "predictor=f16-packed" not in err:
+        assert "predictor=f16-storage" in err, err[-2000:]
+        pytest.skip("the packed f16 predictor is not available")
+    return True
 
 
 # ---------------------------------------------------------------------------

@@ -278,18 +278,25 @@ def test_eedi3h_masked_region_is_horizontal_cubic(clip_gray16):
     s = src.get_frame(0)
     d = _plane(f, 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
     a = _plane(s, 0, WIDTH, HEIGHT, np.uint16).astype(np.int64)
-    # mask = white LEFT half: use an interp column there. field=0 interpolates
-    # columns 0, 2, ...; column 10 is interp, taps at x-3, x-1, x+1, x+3 are
-    # interior kept columns.
-    col, row = 10, HEIGHT // 2
-    taps = (
-        9 * (int(a[row, col - 1]) + int(a[row, col + 1]))
-        - (int(a[row, col - 3]) + int(a[row, col + 3]))
-        + 8
+    # mask = white LEFT half, black RIGHT half. field=0 interpolates the even
+    # columns, so the right half's even columns are the masked (cubic) ones;
+    # the left half is edge-directed and is the anti-vacuity control.
+    for row in (31, 101, 201):
+        for col in (WIDTH * 3 // 4, WIDTH * 3 // 4 + 20, WIDTH - 40):
+            cubic = (
+                9 * (int(a[row, col - 1]) + int(a[row, col + 1]))
+                - (int(a[row, col - 3]) + int(a[row, col + 3]))
+                + 8
+            ) // 16
+            assert int(d[row, col]) == cubic, (
+                f"masked px {row},{col}: {d[row, col]} vs hcubic {cubic}"
+            )
+    # anti-vacuity: the unmasked (white) half is interpolated, not the cubic
+    cols = np.arange(6, WIDTH // 2 - 6, 2)
+    cubic_left = (
+        9 * (a[31, cols - 1] + a[31, cols + 1]) - (a[31, cols - 3] + a[31, cols + 3]) + 8
     ) // 16
-    assert abs(int(d[row, col]) - int(taps)) <= 1, (
-        f"masked px {row},{col}: {d[row, col]} vs hcubic {taps}"
-    )
+    assert int((d[31, cols] != cubic_left).sum()) > 0
 
 
 def test_eedi3h_determinism(clip_gray16):

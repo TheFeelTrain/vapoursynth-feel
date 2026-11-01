@@ -1655,8 +1655,14 @@ try:
     frac = 0
     total = 0
     for n, b in zip(frames, ref):
-        a = read_plane(my.get_frame(n), 0, np.float16)
-        d = np.abs(a.astype(np.float64) - b.astype(np.float64))
+        a = read_plane(my.get_frame(n), 0, np.float16).astype(np.float64)
+        b = b.astype(np.float64)
+        # max() and comparisons ignore NaN, so a non-finite side would pass
+        # both assertions below; fail on it instead (the reference side too,
+        # rather than skipping).
+        assert np.isfinite(a).all(), f"non-finite vsfeel output at frame {n}"
+        assert np.isfinite(b).all(), f"non-finite reference output at frame {n}"
+        d = np.abs(a - b)
         worst = max(worst, float(d.max()))
         frac += int((d > 0.002).sum())
         total += d.size
