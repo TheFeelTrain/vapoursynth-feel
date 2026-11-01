@@ -2632,6 +2632,10 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         }
     };
 
+    if (!vsh::isConstantVideoFormat(d->vi)) {
+        return set_error("only constant format clips are supported");
+    }
+
     if (const char * spec = env_str("VSFEEL_BM3D_MATCHTRACE")) {
         // <frame>,<x>,<y>, parsed with strtol so a malformed value is an error
         // rather than a silently truncated one.

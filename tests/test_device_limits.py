@@ -497,21 +497,27 @@ def test_push_descriptor_limit_is_reported():
 
 
 def test_two_dimensional_grid_overflow_is_reported():
-    """Bilateral and GaussBlur cannot fold an over-wide plane into Y.
+    """A 2D tiling kernel cannot fold an over-wide plane into Y.
 
-    Their kernels address a tile as (ID.x, ID.y), so a width past the device's
-    X group limit has nowhere to go: it must fail with the grid and the limits
-    rather than dispatch a clamped grid that leaves the tail unwritten.
+    Bilateral, GaussBlur, Box and DFTTest address their output as (ID.x,
+    ID.y), so a width past the device's X group limit has nowhere to go: it
+    must fail with the grid and the limits rather than dispatch a clamped grid
+    that leaves the tail unwritten.
     """
     cases = [
         {"label": "bilateral", "filter": "bilateral"},
         {"label": "gaussblur", "filter": "gaussblur"},
         {"label": "box", "filter": "box"},
+        {"label": "dfttest", "filter": "dfttest"},
     ]
     res = _run_limits(cases, {"VSFEEL_LIMIT_GRID_X": "4"})
     for case in cases:
         err = res[case["label"]].get("error", "")
         assert "workgroup grid" in err and "4x" in err, res[case["label"]]
+
+    # The same config must still evaluate when the device advertises enough X.
+    default = _run_limits([{"label": "dfttest", "filter": "dfttest"}])
+    assert default["dfttest"].get("finite") is True, default["dfttest"]
 
 
 def test_subgroup_size_requests_require_compute_stage_support():

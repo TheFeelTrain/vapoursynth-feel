@@ -939,6 +939,10 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         vsapi->freeNode(d->node);
     };
 
+    if (!vsh::isConstantVideoFormat(d->vi)) {
+        return set_error("only constant format clips are supported");
+    }
+
     const auto & fmt = d->vi->format;
     const int bits = fmt.bitsPerSample;
     const bool depth_ok =

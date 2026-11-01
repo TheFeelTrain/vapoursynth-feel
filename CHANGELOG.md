@@ -10,6 +10,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - BM3D's `radius` argument can be set per plane like `sigma`
 
+### Fixed
+
+- DFTTest and NLMeans reject unknown-length clips at creation
+- DFTTest rejects a negative `pmin` and non-finite or negative sigma arrays
+- DFTTest rejects an output grid larger than the device instead of leaving part of the frame unwritten
+- DFTTest, BM3D and NNEDI3 reject variable-format clips at creation
+
 ## [v1.3.2] - 2026-10-31
 
 ### Changed

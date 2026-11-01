@@ -474,6 +474,54 @@ static void dft_plan_spatial(DftPlaneConfig & cfg, int block_step) {
                         256 * sizeof(float);
 }
 
+// A 2D dispatch cannot fold an over-wide grid into Y, so reject it at creation
+// instead of dispatching a clamped grid that leaves the tail unwritten.
+static std::optional<std::string>
+dft_grid_error(const DftPlaneConfig & cfg, int plane, int block_step,
+               const VkPhysicalDeviceLimits & lim) {
+    const int64_t max_x = lim.maxComputeWorkGroupCount[0];
+    const int64_t max_y = lim.maxComputeWorkGroupCount[1];
+    const auto over = [&](int64_t gx, int64_t gy,
+                          const char * what) -> std::optional<std::string> {
+        if (gx <= max_x && gy <= max_y) {
+            return std::nullopt;
+        }
+        return "plane " + std::to_string(plane) + "'s " + what + " needs a " +
+               std::to_string(gx) + "x" + std::to_string(gy) +
+               " workgroup grid, more than this device can dispatch (" +
+               std::to_string(max_x) + "x" + std::to_string(max_y) + ")";
+    };
+
+    const int64_t plane_gx = (static_cast<int64_t>(cfg.pw) + 31) / 32;
+    const int64_t plane_gy = (static_cast<int64_t>(cfg.ph) + 7) / 8;
+    if (auto e = over(plane_gx, plane_gy, "pad pass")) {
+        return e;
+    }
+
+    const int64_t stripe_blocks =
+        static_cast<int64_t>(std::min(cfg.stripe_rows, cfg.vn)) * cfg.hn;
+    if (auto e = over((stripe_blocks + 7) / 8, 1, "fused pass")) {
+        return e;
+    }
+
+    const int y_first = (cfg.ph - cfg.height) / 2;
+    const int y_last = y_first + cfg.height - 1;
+    for (int row_base = 0; row_base < cfg.vn; row_base += cfg.stripe_rows) {
+        const int row_end = std::min(row_base + cfg.stripe_rows, cfg.vn);
+        const int y_begin = std::max(y_first, row_base * block_step);
+        const int y_end = std::min(y_last, row_end * block_step - 1);
+        if (y_end < y_begin) {
+            continue;
+        }
+        const int64_t col_gy =
+            (static_cast<int64_t>(y_end - y_begin) + 1 + 7) / 8;
+        if (auto e = over(plane_gx, col_gy, "col2im pass")) {
+            return e;
+        }
+    }
+    return std::nullopt;
+}
+
 // The push constants narrow every pitch to int32, and the creation-time
 // padded-plane bound does not cover (height-1)*stride, so the frame path bounds
 // the pitches it actually reads and writes (source pitches are not probed at
@@ -863,15 +911,12 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
                         " overflows the kernel's 32-bit addressing");
         }
 
-        // pad and col2im both walk the padded plane
-        const uint32_t plane_gx = std::max(
-            std::min<uint32_t>((static_cast<uint32_t>(cfg.pw) + 31u) / 32u,
-                               lim.maxComputeWorkGroupCount[0]),
-            1u);
-        const uint32_t plane_gy = std::max(
-            std::min<uint32_t>((static_cast<uint32_t>(cfg.ph) + 7u) / 8u,
-                               lim.maxComputeWorkGroupCount[1]),
-            1u);
+        // pad and col2im both walk the padded plane; creation rejected any
+        // grid this device cannot dispatch.
+        const uint32_t plane_gx =
+            static_cast<uint32_t>((static_cast<uint64_t>(cfg.pw) + 31u) / 32u);
+        const uint32_t plane_gy =
+            static_cast<uint32_t>((static_cast<uint64_t>(cfg.ph) + 7u) / 8u);
 
         // fused + col2im, stripe by stripe over block rows: the spatial block
         // buffer is a ring of cfg.spatial_rows rows, so the fused write and the
@@ -949,12 +994,9 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
                 pc.spatial_row_mask = cfg.spatial_row_mask;
                 pc.block_base = row_base * cfg.hn;
                 pc.block_end = row_end * cfg.hn;
-                const uint32_t stripe_blocks =
-                    static_cast<uint32_t>(pc.block_end - pc.block_base);
-                const uint32_t fused_gx = std::max(
-                    std::min<uint32_t>((stripe_blocks + 7u) / 8u,
-                                       lim.maxComputeWorkGroupCount[0]),
-                    1u);
+                const uint32_t fused_gx = static_cast<uint32_t>(
+                    (static_cast<uint64_t>(pc.block_end - pc.block_base) + 7u) /
+                    8u);
                 // 0 wt, 1 padded, 2 spatial; 3 (dst) and 4 (the source
                 // array) are col2im's and pad's and stay unbound here
                 const VkBuffer buffers[3] { d->wt.buffer, padded.buffer,
@@ -993,12 +1035,9 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
                     pc.spatial_row_mask = cfg.spatial_row_mask;
                     pc.y_begin = y_begin;
                     pc.y_end = y_end;
-                    const uint32_t col_gy = std::max(
-                        std::min<uint32_t>(
-                            (static_cast<uint32_t>(y_end - y_begin) + 1u + 7u) /
-                                8u,
-                            lim.maxComputeWorkGroupCount[1]),
-                        1u);
+                    const uint32_t col_gy = static_cast<uint32_t>(
+                        (static_cast<uint64_t>(y_end - y_begin) + 1u + 7u) /
+                        8u);
                     const VkBuffer buffers[4] { d->wt.buffer, padded.buffer,
                                                 spatial.buffer,
                                                 dst_plane.buffer };
@@ -1159,6 +1198,10 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         vsapi->freeNode(d->node);
     };
 
+    if (!vsh::isConstantVideoFormat(d->vi)) {
+        return set_error("only constant format clips are supported");
+    }
+
     const auto & fmt = d->vi->format;
     const int bits = fmt.bitsPerSample;
     const bool depth_ok =
@@ -1168,7 +1211,10 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV &&
          fmt.colorFamily != cfRGB)) {
         return set_error(
-            "input bitdepth must be u16 (16-bit integer), f16 or f32 (16/32-bit float), Gray/YUV/RGB, constant format.");
+            "input bitdepth must be u16 (16-bit integer), f16 or f32 (16/32-bit float), Gray/YUV/RGB.");
+    }
+    if (d->vi->numFrames <= 0) {
+        return set_error("clip frame count must be known and positive");
     }
     d->bits = bits;
     d->elem_bytes = bits / 8;
@@ -1202,12 +1248,12 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         !std::isfinite(pmin) || !std::isfinite(pmax)) {
         return set_error("sigma/sigma2/pmin/pmax must be finite.");
     }
-    // A negative pmax makes the ftype=4 gain sqrt(negative) and poisons the
-    // whole frame; a negative f0beta is pow(0, negative) in the ftype=0 gain.
-    // Both are accepted by vszipcl but produce an all-NaN clip, so refuse them
-    // at creation like the non-finite values above.
-    if (pmax < 0.0) {
-        return set_error("pmax must be non-negative.");
+    // A negative pmin/pmax makes the ftype=4 gain sqrt(negative) and poisons
+    // the whole frame; a negative f0beta is pow(0, negative) in the ftype=0
+    // gain. They are accepted by vszipcl but produce an all-NaN clip, so
+    // refuse them at creation like the non-finite values above.
+    if (pmin < 0.0 || pmax < 0.0) {
+        return set_error("pmin/pmax must be non-negative.");
     }
 
     int sbsize = vsh::int64ToIntS(vsapi->mapGetInt(in, "sbsize", 0, &error));
@@ -1322,6 +1368,32 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             return set_error(
                 "number of elements in slocation/ssx/ssy/sst must be a non-zero multiple of 2.");
         }
+    }
+    const auto all_finite = [](const double * data, int count) {
+        for (int i = 0; i < count; ++i) {
+            if (!std::isfinite(data[i])) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto sigmas_non_negative = [](const double * data, int count) {
+        for (int i = 1; i < count; i += 2) {
+            if (data[i] < 0.0) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if ((slocation && !all_finite(slocation, n_slocation)) ||
+        (ssx && !all_finite(ssx, n_ssx)) || (ssy && !all_finite(ssy, n_ssy)) ||
+        (sst && !all_finite(sst, n_sst))) {
+        return set_error("slocation/ssx/ssy/sst values must be finite.");
+    }
+    if ((ssx && !sigmas_non_negative(ssx, n_ssx)) ||
+        (ssy && !sigmas_non_negative(ssy, n_ssy)) ||
+        (sst && !sigmas_non_negative(sst, n_sst))) {
+        return set_error("ssx/ssy/sst sigma values must be non-negative.");
     }
 
     // device_id and num_streams are registered but never read: the core owns
@@ -1537,6 +1609,15 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             return set_error(std::get<std::string>(result));
         }
         d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
+    }
+    for (int plane = 0; plane < num_planes; ++plane) {
+        if (!d->process[plane]) {
+            continue;
+        }
+        if (auto e = dft_grid_error(d->planes[plane], plane, d->block_step,
+                                    d->gpu->limits)) {
+            return set_error(*e);
+        }
     }
 
     // ------------------------------------------------------------------

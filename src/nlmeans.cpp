@@ -734,6 +734,10 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
     d->half = fmt.sampleType == stFloat && d->bits == 16;
     d->elem_bytes = fmt.bytesPerSample;
 
+    if (d->vi->numFrames <= 0) {
+        return set_error("clip frame count must be known and positive");
+    }
+
     if (d->vi->width <= 0 || d->vi->height <= 0) {
         return set_error("clip must have constant dimensions.");
     }

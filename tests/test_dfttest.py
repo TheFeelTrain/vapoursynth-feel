@@ -956,9 +956,29 @@ def test_rejects_illegal_high_overlap_sosize(clip_grays, sosize):
 
 
 @pytest.mark.parametrize(
-    "kwargs", [{"ftype": 0, "f0beta": -0.5}, {"ftype": 4, "pmin": 0.0, "pmax": -1.0}]
+    "kwargs",
+    [
+        {"ftype": 0, "f0beta": -0.5},
+        {"ftype": 4, "pmin": 0.0, "pmax": -1.0},
+        {"ftype": 4, "pmin": -1.0, "pmax": 500.0},
+    ],
 )
-def test_rejects_negative_f0beta_and_pmax(clip_grays, kwargs):
-    """These produced an all-NaN clip in vszipcl; refuse them at creation."""
+def test_rejects_negative_gain_parameters(clip_grays, kwargs):
+    """Negative f0beta or pmin/pmax produced an all-NaN clip in vszipcl."""
     with pytest.raises(vs.Error, match="non-negative"):
+        vs.core.vsfeel.DFTTest(clip_grays, tbsize=1, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"ssx": [0.0, -1.0]},
+        {"ssx": [0.0, float("nan")]},
+        {"slocation": [0.0, float("nan")]},
+    ],
+    ids=["negative-ssx", "nan-ssx", "nan-slocation"],
+)
+def test_rejects_non_finite_or_negative_sigma_arrays(clip_grays, kwargs):
+    """NaN and negative sigma entries reach sqrt() and poison the frame."""
+    with pytest.raises(vs.Error, match="finite|non-negative"):
         vs.core.vsfeel.DFTTest(clip_grays, tbsize=1, **kwargs)

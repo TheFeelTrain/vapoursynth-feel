@@ -19,6 +19,7 @@ import sys
 import textwrap
 
 import pytest
+import vapoursynth as vs
 
 from conftest import CLIP_PATH
 
@@ -270,6 +271,25 @@ def test_validation_layer_smoke(filter_name):
         + "\n"
         + tail
     )
+
+
+@pytest.mark.parametrize(
+    "filter_name,kwargs",
+    [("DFTTest", {}), ("BM3D", {}), ("NNEDI3", {"field": 1})],
+)
+def test_variable_format_clips_are_rejected(filter_name, kwargs):
+    """A variable-format clip has no single format to validate at creation."""
+    core = vs.core
+    clip = core.std.Splice(
+        [
+            core.std.BlankClip(format=vs.GRAYS, width=64, height=64, length=2),
+            core.std.BlankClip(format=vs.GRAY16, width=64, height=64, length=2),
+        ],
+        mismatch=1,
+    )
+    assert clip.format.color_family == vs.UNDEFINED
+    with pytest.raises(vs.Error, match="constant format"):
+        getattr(core.vsfeel, filter_name)(clip, **kwargs)
 
 
 _LEAK_SCRIPT = textwrap.dedent("""\
