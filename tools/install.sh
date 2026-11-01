@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
-# Build libvsfeel.so, install it into VapourSynth's plugin directory, and prove
-# the installed copy is byte-identical to the build. Use this instead of copying
-# by hand: a failed compile used to be indistinguishable from a successful one,
-# and the notes record a phantom bug traced to a stale .spv shipped that way.
+# Build the plugin library (libvsfeel.so / .dylib / vsfeel.dll), install it into
+# VapourSynth's plugin directory, and prove the installed copy is byte-identical
+# to the build. Use this instead of copying by hand: a failed compile used to be
+# indistinguishable from a successful one, and the notes record a phantom bug
+# traced to a stale .spv shipped that way.
 #
 # Run `uv sync` first: the plugin is built against the project venv's VapourSynth
 # headers and installed into that venv's plugin directory.
@@ -73,14 +74,21 @@ vs_include=$("$py" -c 'import os, vapoursynth as vs; print(os.path.join(os.path.
     || die "cannot locate VapourSynth headers from $py"
 [[ -f $vs_include/VapourSynth4.h ]] || die "no VapourSynth4.h under $vs_include"
 
-# CMake spells the library per platform (libvsfeel.so / libvsfeel.dylib); the
-# manifest names it without an extension, so only the file names differ here.
+# CMake spells the library per platform (libvsfeel.so / libvsfeel.dylib /
+# vsfeel.dll); the manifest names it without an extension, so only the file
+# names differ here.
 case "$(uname -s)" in
     Darwin) lib_name=libvsfeel.dylib ;;
+    MINGW*|MSYS*|CYGWIN*) lib_name=vsfeel.dll ;;
     *)      lib_name=libvsfeel.so ;;
 esac
 
 build_lib=$build_dir/$lib_name
+# Multi-config generators (Visual Studio) put the DLL in a per-config subdir
+# instead of the build root.
+if [[ ! -f $build_lib && -f $build_dir/$build_type/$lib_name ]]; then
+    build_lib=$build_dir/$build_type/$lib_name
+fi
 install_subdir=$plugin_dir/vsfeel
 install_lib=$install_subdir/$lib_name
 

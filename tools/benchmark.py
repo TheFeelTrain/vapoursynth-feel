@@ -71,6 +71,7 @@ reports the median ratio B-vs-A with the delta.
 """
 
 import argparse
+import ast
 import contextlib
 import hashlib
 import importlib.util
@@ -251,7 +252,10 @@ def make_vpy(
         # frames the chain would otherwise read, format and depth included, not
         # the raw source.
         conv = f"clip = {scaled(cache_conv)}\n" if (gpu_cache and cache_conv) else ""
-        gpu_lines = scale_lines + (
+        # The scale must be applied exactly once: `conv` already folds it into
+        # the converted clip, so the standalone upscale line is only for the
+        # path that has no conversion expression (e.g. --cpu-cache).
+        gpu_lines = ("" if conv else scale_lines) + (
             conv + "clip_gpu = core.std.GPUUpload(clip=clip)\n" if gpu_cache else ""
         )
     return f"""\
@@ -510,11 +514,15 @@ PLUGINS = {
     "vszip": Plugin("vszip"),
     "eedi3vk2": Plugin("eedi3vk2"),
     "nnedi3vk": Plugin("nnedi3vk"),
-    "bm3dhip": Plugin("bm3dhip"),
-    "nlm_hip": Plugin("nlm_hip"),
     "bm3dvk": Plugin("bm3dvk"),
     "bm3dvk2": Plugin("bm3dvk2"),
     "knlmvk": Plugin("knlmvk"),
+    # Box's oracle: resize2's custom-kernel entry with the same box kernel
+    # tests/test_box.py drives through vskernels.Box.
+    "resize2": Plugin(
+        "resize2",
+        loader="def _box_kernel(x):\n    return 1.0 if -0.5 <= x < 0.5 else 0.0",
+    ),
 }
 
 
@@ -683,6 +691,19 @@ def _gauss_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[st
     }
 
 
+def _box_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
+    # Downscale by a ratio, so the target follows --clip and --scale. Both
+    # arms get the same integer target; the kernel the reference needs is
+    # defined by PLUGINS["resize2"].loader in that arm's vpy.
+    ratio = ns.box_ratio
+    width = f"round({clip}.width / {ratio})"
+    height = f"round({clip}.height / {ratio})"
+    return {
+        "vsfeel": f"core.vsfeel.Box({clip}, width={width}, height={height})",
+        "resize2": f"core.resize2.Custom({clip}, _box_kernel, 1, {width}, {height})",
+    }
+
+
 def _dfttest_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
     # all three plugins share the vszipcu parameter surface
     args = (
@@ -848,7 +869,7 @@ def _eedi3aa_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
     """
     use_mclip = getattr(ns, "eedi3_mclip", True)
     field = ns.eedi3_field
-    if field <= 1:
+    if field not in (2, 3):
         # EEDI3AA is the fused *double-rate* chain (four sub-passes + two
         # merges); a single-rate field has no fused form to grade.
         raise SystemExit(
@@ -974,6 +995,16 @@ FILTERS: dict[str, FilterSpec] = {
         build=_gauss_build,
         # vsfeel's GaussBlur is vnode:gpu under the R80 GPU API; the
         # references take the downloaded frames.
+        gpu_plugins=frozenset({"vsfeel"}),
+    ),
+    "box": FilterSpec(
+        title="Box",
+        args=[
+            Arg("ratio", "box_ratio", float, 2.0, "downscale ratio (2 = half size)"),
+        ],
+        build=_box_build,
+        # vsfeel's Box is vnode:gpu under the R80 GPU API; resize2 takes the
+        # downloaded frames.
         gpu_plugins=frozenset({"vsfeel"}),
     ),
     "dfttest": FilterSpec(
@@ -1292,7 +1323,7 @@ def _available_plugins() -> frozenset[str]:
 
 def _vspipe_cmd(vpy_path: Path, no_download: bool) -> list[str]:
     """The vspipe command line; ``--progress`` supplies the timing window."""
-    outfile = "--" if no_download else "/dev/null"
+    outfile = "--" if no_download else os.devnull
     return [vspipe_binary(), "--progress", str(vpy_path), outfile]
 
 
@@ -1878,7 +1909,8 @@ def _run_plan_once(
     )
 
 
-def bench_filter(fname: str, ns: argparse.Namespace) -> None:
+def bench_filter(fname: str, ns: argparse.Namespace) -> bool:
+    """Benchmark one filter; True when at least one measured arm produced a timing."""
     spec = FILTERS[fname]
     plan = _prepare_filter(fname, ns)
     print(
@@ -1933,6 +1965,7 @@ def bench_filter(fname: str, ns: argparse.Namespace) -> None:
                 ratio = f"  ({fps / base:.3f}x vs {base_name})"
             print(f"  {rank}. {plugin:10s} {fps:9.2f} fps{ratio}")
         print()
+    return bool(valid)
 
 
 # ---------------------------------------------------------------------------
@@ -2036,6 +2069,45 @@ def _ab_round_order(round_idx: int, order: str) -> list[int]:
     return [0, 1] if round_idx % 2 == 1 else [1, 0]
 
 
+def _vspipe_plugin_path() -> Path | None:
+    """The vsfeel library the configured vspipe actually loads.
+
+    A/B installs the arm .so files into the benchmark interpreter's plugin
+    directory; a VSPIPE pointing at another VapourSynth would load its own copy
+    and both arms would time the same binary.
+    """
+    script = (
+        "import vapoursynth as vs\n"
+        "core = vs.core\n"
+        "print('PLUGIN_PATH', [p.plugin_path for p in core.plugins() "
+        "if p.namespace == 'vsfeel'])\n"
+        "core.std.BlankClip(width=8, height=8, format=vs.GRAY8, length=1).set_output()\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "probe_plugin.vpy"
+        path.write_text(script)
+        try:
+            proc = subprocess.run(
+                [vspipe_binary(), "--info", str(path), "-"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        if line.startswith("PLUGIN_PATH "):
+            try:
+                paths = ast.literal_eval(line[len("PLUGIN_PATH ") :])
+            except (ValueError, SyntaxError):
+                return None
+            if paths:
+                return Path(paths[0]).resolve()
+    return None
+
+
 def _install_ab_so(src: Path, dst: Path) -> None:
     """Copy an arm's .so over the installed plugin, verifying the copy by sha.
 
@@ -2072,6 +2144,18 @@ def bench_filter_ab(fname: str, ns: argparse.Namespace) -> None:
         if install is None or not install.exists():
             sys.exit(f"--ab-so: installed plugin not found: {install}")
         arms[0].so, arms[1].so = arm_sos
+        loaded = _vspipe_plugin_path()
+        if loaded is None:
+            sys.exit(
+                "ab: could not determine which plugin vspipe loads; point "
+                "VSPIPE at the same VapourSynth install as the benchmark"
+            )
+        if loaded != install.resolve():
+            sys.exit(
+                f"ab: vspipe loads {loaded}, but the arms are installed into "
+                f"{install}; point VSPIPE at the same VapourSynth install "
+                "(or set VSFEEL_PLUGIN_DIR)"
+            )
 
     # Swapping .so files only changes vsfeel: default to it unless the caller
     # names plugins explicitly (a reference would measure the same binary in
@@ -2136,6 +2220,7 @@ def bench_filter_ab(fname: str, ns: argparse.Namespace) -> None:
     print()
 
     a, b = arms[0].name, arms[1].name
+    complete = True
     for plugin in plan.plugins:
         va, vb = samples[a][plugin], samples[b][plugin]
         for arm_name, v in ((a, va), (b, vb)):
@@ -2145,6 +2230,8 @@ def bench_filter_ab(fname: str, ns: argparse.Namespace) -> None:
                 print(f"  {plugin:10s} {arm_name:10s}  {_fmt_stats(v)}")
             else:
                 print(f"  {plugin:10s} {arm_name:10s}  unavailable / failed")
+        if plugin not in plan.unavailable and not (va and vb):
+            complete = False
         if va and vb:
             ma = statistics.median(x.fps for x in va)
             mb = statistics.median(x.fps for x in vb)
@@ -2152,6 +2239,7 @@ def bench_filter_ab(fname: str, ns: argparse.Namespace) -> None:
                 f"  ab: {a} {ma:9.2f} fps vs {b} {mb:9.2f} fps "
                 f"-> {b}/{a} {mb / ma:.3f}x ({(mb / ma - 1) * 100:+.2f}%)\n"
             )
+    return complete and bool(plan.plugins)
 
 
 # ---------------------------------------------------------------------------
@@ -2159,13 +2247,22 @@ def bench_filter_ab(fname: str, ns: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _plugin_library_name() -> str:
+    """The plugin filename CMake produces on this platform."""
+    if sys.platform == "darwin":
+        return "libvsfeel.dylib"
+    if sys.platform == "win32":
+        return "vsfeel.dll"
+    return "libvsfeel.so"
+
+
 def _default_plugin_so() -> Path | None:
-    """Installed libvsfeel.so path, discovered without importing the core."""
+    """Installed plugin library path, discovered without importing the core."""
     spec = importlib.util.find_spec("vapoursynth")
     if spec is None or not spec.submodule_search_locations:
         return None
     pkg = Path(next(iter(spec.submodule_search_locations)))
-    return pkg / "plugins" / "vsfeel" / "libvsfeel.so"
+    return pkg / "plugins" / "vsfeel" / _plugin_library_name()
 
 
 def _sha256(path: Path) -> str:
@@ -2193,13 +2290,10 @@ def check_fresh(install_so: Path | None, build_so: Path | None) -> None:
             f"--check-fresh: {install_so} differs from {build}; "
             "copy the built .so into the plugin directory"
         )
-    stale = [
-        p
-        for p in sorted(REPO_ROOT.glob("src/*"))
-        if p.suffix in (".cpp", ".h", ".comp") and p.stat().st_mtime > build.stat().st_mtime
-    ]
-    if (REPO_ROOT / "CMakeLists.txt").stat().st_mtime > build.stat().st_mtime:
-        stale.append(REPO_ROOT / "CMakeLists.txt")
+    # Every CMake input, not only the host sources: the embedded weights, the
+    # SPIR-V header generator and the config template all change the binary.
+    inputs = [REPO_ROOT / "CMakeLists.txt", *(REPO_ROOT / "src").rglob("*")]
+    stale = [p for p in sorted(inputs) if p.is_file() and p.stat().st_mtime > build.stat().st_mtime]
     if stale:
         names = ", ".join(str(p.relative_to(REPO_ROOT)) for p in stale[:5])
         sys.exit(f"--check-fresh: sources newer than {build}: {names} (rebuild)")
@@ -2446,6 +2540,10 @@ def main() -> None:
         )
     if ns.aa_cache_mb < 0:
         sys.exit(f"--aa-cache-mb must be >= 0, got {ns.aa_cache_mb}")
+    if ns.cache_frames < 0:
+        sys.exit(f"--cache-frames must be >= 0, got {ns.cache_frames}")
+    if ns.gpu_cache_mb < 1:
+        sys.exit(f"--gpu-cache-mb must be >= 1, got {ns.gpu_cache_mb}")
     if ns.scale < 1:
         sys.exit(f"--scale must be >= 1, got {ns.scale:g}")
     # Named once: which VapourSynth the numbers came from is part of the result.
@@ -2457,11 +2555,13 @@ def main() -> None:
     for fname in FILTERS:
         if getattr(ns, f"{fname}_args", None) and fname not in filters:
             sys.exit(f"--{fname}-args given but --filter {ns.filter} does not run {fname}")
+    failed = []
     for fname in filters:
-        if ab:
-            bench_filter_ab(fname, ns)
-        else:
-            bench_filter(fname, ns)
+        ok = bench_filter_ab(fname, ns) if ab else bench_filter(fname, ns)
+        if not ok:
+            failed.append(FILTERS[fname].title)
+    if failed:
+        sys.exit(f"no arm produced a timing for: {', '.join(failed)}")
 
 
 if __name__ == "__main__":

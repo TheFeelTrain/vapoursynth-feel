@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -49,9 +50,27 @@ def stub_header(text: str) -> str:
     return _ARRAY_RE.sub(lambda m: f"static const uint32_t {m.group(1)}[] = {{0}};", text)
 
 
-def stub_database(database: list[dict], include_dir: Path) -> list[dict]:
-    """Point each entry's first include path at the stub header."""
+def _split_command(command: str, posix: bool) -> list[str]:
+    """Split a compile_commands command string with its own quoting rules."""
+    if posix:
+        return shlex.split(command)
+    # cmd.exe quoting: shlex's non-POSIX mode keeps the quotes; strip the
+    # pairs so list2cmdline can re-quote the token for the analyser.
+    return [
+        token[1:-1] if len(token) >= 2 and token[0] == token[-1] == '"' else token
+        for token in shlex.split(command, posix=False)
+    ]
+
+
+def stub_database(database: list[dict], include_dir: Path, posix: bool | None = None) -> list[dict]:
+    """Point each entry's first include path at the stub header.
+
+    ``posix`` overrides the shell-quoting convention (tests); by default it
+    follows the host, since compile_commands.json may carry a command string
+    instead of an argument vector.
+    """
     flag = f"-I{include_dir}"
+    posix = (os.name != "nt") if posix is None else posix
     stubbed = []
     for entry in database:
         entry = dict(entry)
@@ -59,9 +78,9 @@ def stub_database(database: list[dict], include_dir: Path) -> list[dict]:
             argv = list(entry["arguments"])
             entry["arguments"] = [argv[0], flag, *argv[1:]]
         else:
-            argv = shlex.split(entry["command"])
+            argv = _split_command(entry["command"], posix)
             argv.insert(1, flag)
-            entry["command"] = shlex.join(argv)
+            entry["command"] = shlex.join(argv) if posix else subprocess.list2cmdline(argv)
         stubbed.append(entry)
     return stubbed
 

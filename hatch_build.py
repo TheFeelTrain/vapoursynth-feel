@@ -130,6 +130,9 @@ class CustomHook(BuildHookInterface):
         # install/ is gitignored and reused checkouts keep it around, so a stale
         # (possibly foreign-platform) library must not survive into this build.
         shutil.rmtree(self.install_dir, ignore_errors=True)
+        # find_staged_library only validates install/, so a stale library left
+        # in the wheel's include tree by an earlier failed build has to go too.
+        shutil.rmtree(self.target_dir, ignore_errors=True)
 
         build_data["pure_python"] = False
         # A `py3-none-<platform>` wheel: the payload is a VapourSynth plugin, not

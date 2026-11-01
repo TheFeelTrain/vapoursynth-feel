@@ -4,6 +4,7 @@ generation, wheel staging)."""
 
 import importlib.util
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -184,10 +185,13 @@ def test_benchmark_synthetic_scripts_compile_and_eval(monkeypatch):
             # reads the clip and the vstools helpers applied to it.
             env = {
                 "core": MagicMock(),
-                "clip": object(),
+                "clip": MagicMock(),
                 "depth": MagicMock(),
                 "get_y": MagicMock(),
             }
+            # A plugin's loader (resize2's box kernel) defines names the chain
+            # uses, exactly as it does in the generated vpy.
+            exec(bench._plugin_loader(plugin), env)
             exec(chain, env)
 
 
@@ -274,7 +278,132 @@ def test_benchmark_download_selects_vspipe_output(monkeypatch):
     download = bench._vspipe_cmd(Path("chain.vpy"), no_download=False)
     assert "--progress" in default
     assert default[-1] == "--"
-    assert download[-1] == "/dev/null"
+    assert download[-1] == os.devnull
+
+
+def test_benchmark_scale_is_applied_once(monkeypatch):
+    """--no-cache --scale must not fold the upscale into the GPU path twice."""
+    bench = _load_module("benchmark", BENCHMARK)
+    for gpu_cache in (True, False):
+        vpy = bench.make_vpy(
+            clip="/nonexistent.mkv",
+            extra="",
+            chain="core.vsfeel.GaussBlur(clip, sigma=1.0)",
+            frames=2,
+            synth_format=None,
+            cache_frames=None,
+            cache_conv="depth(get_y(clip), 16)",
+            gpu_cache=gpu_cache,
+            scale=1.5,
+        )
+        assert vpy.count("resize.Point") == 1, vpy
+
+
+def test_benchmark_eedi3aa_rejects_a_non_double_rate_field(monkeypatch):
+    """field 2/3 are the double-rate forms; 4 has no fused chain to grade."""
+    bench = _load_module("benchmark", BENCHMARK)
+    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--eedi3aa-args", "field=4"])
+    ns = bench.parse_args()
+    spec = bench.FILTERS["eedi3aa"]
+    bench._apply_filter_args(ns, "eedi3aa", spec)
+    with pytest.raises(SystemExit, match="field 2 or 3"):
+        spec.build(ns, spec.input, spec)
+
+
+def test_benchmark_all_arms_failed_is_reported(monkeypatch):
+    """A run where every arm fails must not exit 0."""
+    bench = _load_module("benchmark", BENCHMARK)
+    monkeypatch.setattr(sys, "argv", ["benchmark.py", "--filter", "box", "--synthetic"])
+    ns = bench.parse_args()
+    bench._apply_filter_args(ns, "box", bench.FILTERS["box"])
+    plan = bench.FilterPlan(
+        input_expr=bench.FILTERS["box"].input,
+        frames=1,
+        synth=bench.FILTERS["box"].synth_format,
+        cache_frames=None,
+        cache_conv=None,
+        clip_desc="synthetic",
+        format_desc="",
+        calls={"vsfeel": "core.vsfeel.Box(clip, width=8, height=8)"},
+        gpu_arms=[],
+        download_arms=[],
+        plugins=["vsfeel"],
+        unavailable=[],
+    )
+    monkeypatch.setattr(bench, "_prepare_filter", lambda *a, **k: plan)
+    monkeypatch.setattr(bench, "_run_plan_once", lambda *a, **k: None)
+    assert bench.bench_filter("box", ns) is False
+
+
+def test_plugin_library_name_follows_the_platform(monkeypatch):
+    bench = _load_module("benchmark", BENCHMARK)
+    for platform, name in (
+        ("linux", "libvsfeel.so"),
+        ("darwin", "libvsfeel.dylib"),
+        ("win32", "vsfeel.dll"),
+    ):
+        monkeypatch.setattr(bench.sys, "platform", platform)
+        assert bench._plugin_library_name() == name
+
+
+def test_check_fresh_sees_every_cmake_input(monkeypatch, tmp_path):
+    """A weights/bin/config edit must fail freshness, not only a .cpp edit."""
+    bench = _load_module("benchmark", BENCHMARK)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "CMakeLists.txt").write_text("")
+    (tmp_path / "src" / "a.cpp").write_text("")
+    weights = tmp_path / "src" / "nnedi3_weights.bin"
+    weights.write_bytes(b"")
+    build = tmp_path / "build" / "libvsfeel.so"
+    build.parent.mkdir()
+    build.write_bytes(b"binary")
+    monkeypatch.setattr(bench, "REPO_ROOT", tmp_path)
+    old = 1000.0
+    for p in (tmp_path / "CMakeLists.txt", tmp_path / "src" / "a.cpp", weights):
+        os.utime(p, (old, old))
+    os.utime(build, (old + 10, old + 10))
+    bench.check_fresh(build, build)
+    os.utime(weights, (old + 20, old + 20))
+    with pytest.raises(SystemExit, match="nnedi3_weights.bin"):
+        bench.check_fresh(build, build)
+
+
+def test_lint_stub_uses_the_host_shell_quoting(tmp_path):
+    """A Windows command string must not be split as POSIX shell words."""
+    lint = _load_module("lint_stub", LINT_STUB)
+    win = [
+        {
+            "directory": str(tmp_path),
+            "file": "a.cpp",
+            "command": '"C:\\Program Files\\LLVM\\clang-cl.exe" /c "a b.cpp"',
+        }
+    ]
+    out = lint.stub_database(win, tmp_path, posix=False)
+    assert out[0]["command"].startswith('"C:\\Program Files\\LLVM\\clang-cl.exe" -I')
+    argv = [{"directory": str(tmp_path), "file": "a.cpp", "arguments": ["cl.exe", "/c", "a.cpp"]}]
+    out = lint.stub_database(argv, tmp_path)
+    assert out[0]["arguments"][1] == f"-I{tmp_path}"
+
+
+def test_benchmark_rejects_negative_cache_budgets(monkeypatch):
+    """A negative cache budget must fail at the CLI, not deep inside vspipe."""
+    bench = _load_module("benchmark", BENCHMARK)
+    for argv, match in (
+        (["--cache-frames", "-1"], "cache-frames"),
+        (["--gpu-cache-mb", "0"], "gpu-cache-mb"),
+    ):
+        monkeypatch.setattr(sys, "argv", ["benchmark.py", "--synthetic", *argv])
+        with pytest.raises(SystemExit, match=match):
+            bench.main()
+
+
+def test_vspipe_plugin_path_matches_the_install():
+    """The A/B guard must see the same plugin path vspipe actually loads."""
+    bench = _load_module("benchmark", BENCHMARK)
+    expected = bench._default_plugin_so()
+    if expected is None or not expected.exists():
+        pytest.skip("plugin is not installed")
+    assert bench._vspipe_plugin_path() == expected.resolve()
 
 
 def test_benchmark_time_window_counts_frames(monkeypatch):
