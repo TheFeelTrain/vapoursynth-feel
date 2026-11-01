@@ -14,7 +14,9 @@
 #include <variant>
 #include <vector>
 
-#include <strings.h>
+#if !defined(_WIN32)
+#include <strings.h> // strcasecmp
+#endif
 
 #include <VapourSynth4.h>
 #include <VSHelper4.h>
@@ -688,6 +690,17 @@ static void VS_CC NLMeansFree(void * instanceData,
 // Creation
 // ---------------------------------------------------------------------------
 
+// Case-insensitive compare for the `channels` argument. strcasecmp is
+// POSIX-only and _stricmp is its Windows spelling; keeping both behind this
+// name keeps the platform difference out of the call sites.
+static bool iequals(const char * x, const char * y) {
+#if defined(_WIN32)
+    return _stricmp(x, y) == 0;
+#else
+    return strcasecmp(x, y) == 0;
+#endif
+}
+
 static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
                                 [[maybe_unused]] void * userData, VSCore * core,
                                 const VSAPI * vsapi) {
@@ -805,13 +818,10 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
     if (error || !chstr) {
         chstr = "auto";
     }
-    auto eq = [](const char * x, const char * y) {
-        return strcasecmp(x, y) == 0;
-    };
 
     switch (fmt.colorFamily) {
     case cfGray:
-        if (!(eq(chstr, "Y") || eq(chstr, "auto"))) {
+        if (!(iequals(chstr, "Y") || iequals(chstr, "auto"))) {
             return set_error("'channels' must be 'Y' with Gray.");
         }
         d->ref_mode = REF_LUMA;
@@ -819,18 +829,18 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         d->plane0 = 0;
         break;
     case cfYUV:
-        if (eq(chstr, "YUV")) {
+        if (iequals(chstr, "YUV")) {
             if (fmt.subSamplingW != 0 || fmt.subSamplingH != 0) {
                 return set_error("'channels'='YUV' requires 4:4:4.");
             }
             d->ref_mode = REF_YUV;
             d->channels = 3;
             d->plane0 = 0;
-        } else if (eq(chstr, "Y") || eq(chstr, "auto")) {
+        } else if (iequals(chstr, "Y") || iequals(chstr, "auto")) {
             d->ref_mode = REF_LUMA;
             d->channels = 1;
             d->plane0 = 0;
-        } else if (eq(chstr, "UV")) {
+        } else if (iequals(chstr, "UV")) {
             d->ref_mode = REF_CHROMA;
             d->channels = 2;
             d->plane0 = 1;
@@ -839,7 +849,7 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         }
         break;
     case cfRGB:
-        if (!(eq(chstr, "RGB") || eq(chstr, "auto"))) {
+        if (!(iequals(chstr, "RGB") || iequals(chstr, "auto"))) {
             return set_error("'channels' must be 'RGB' with RGB.");
         }
         d->ref_mode = REF_RGB;

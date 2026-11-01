@@ -198,6 +198,10 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
 
 The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
+- **2026-11-01 — the `channels` comparison is portable.** `strcasecmp` is
+  POSIX-only, so an MSVC build of the filter failed; the call sites now use a
+  local `iequals` that selects `_stricmp` on Windows. No behavior or perf
+  change.
 - **2026-10-18 — f16 io shipped; full-fp16 internals rejected.** The half window
   measured +3.5% over u16 and +12.2% over f32 (default: resident GPU input, no
   download, 3000 frames, medians of 3). The probe that also narrowed the ring,

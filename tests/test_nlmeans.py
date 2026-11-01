@@ -983,6 +983,31 @@ def test_channels_invalid_on_rgb(clip_rgbs):
         _run(clip_rgbs, channels="Y")
 
 
+def test_channels_argument_is_case_insensitive(
+    clip_grays, clip_yuv420ps, clip_yuv444p16, clip_rgbs
+):
+    """`channels` is matched case-insensitively on every platform.
+
+    The comparison used to call POSIX-only strcasecmp; the local helper that
+    replaced it must keep the same contract (and compile on MSVC).
+    """
+    cases = [
+        (clip_grays, "Y", "y"),
+        (clip_yuv420ps, "UV", "uv"),
+        (clip_yuv444p16, "YUV", "yuv"),
+        (clip_rgbs, "RGB", "rgb"),
+    ]
+    for clip, upper, lower in cases:
+        a = _run(clip, d=0, channels=upper)
+        b = _run(clip, d=0, channels=lower)
+        for n in (0, 11):
+            fa, fb = a.get_frame(n), b.get_frame(n)
+            for p in range(a.format.num_planes):
+                assert np.array_equal(_plane(fa, p), _plane(fb, p)), (
+                    f"{upper} and {lower} differ on plane {p} at frame {n}"
+                )
+
+
 def test_reject_search_window_larger_than_frame():
     core = vs.core
     src = core.std.BlankClip(None, 8, 8, vs.GRAYS, length=1, color=[0.5])
