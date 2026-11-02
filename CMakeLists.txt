@@ -158,7 +158,8 @@ else()
 endif()
 
 # SPIR-V: compile the GLSL kernels with glslc when available.
-# Each kernel is compiled for the u16 and f32 staging formats.
+# Each filter lists its own io variants in the VK_*_VARIANTS tables below
+# (BM3D and WNNM run f32 kernels only).
 
 # --- shader variant table -----------------------------------------------------
 # One "|"-separated "<out>|<source>|<defs>" entry per .spv (pipes, not
@@ -177,14 +178,6 @@ endif()
 # needing uniformAndStorageBuffer16BitAccess, which the baseline lacks) and
 # covers the subgroup ops (1.3+), buffer references and Vulkan memory model the
 # kernels rely on.
-
-# The io variants every kernel is built for. Each name is the storage type the
-# kernel stages through (u16 = 16-bit integer, f32 = 32-bit float) and becomes
-# the -DIO_<NAME> the shader selects its IO_TYPE on, so an f16 variant is one
-# more entry plus its shader branch. A filter that grows one adds it to a local
-# list (VK_GAUSS_IO_TYPES) rather than here, because every other filter's
-# kernels would silently build the u16 branch under an -DIO_F16 name.
-set(VK_IO_TYPES "u16" "f32")
 
 # Bilateral: one entry point per file, per io variant (u16, f16, f32). Its io
 # list is local for the same reason GaussBlur's is: the other filters' kernels
@@ -244,9 +237,8 @@ set(VK_GAUSS_ENTRY_DEFS
     "-DENTRY_GAUSS -DBLK_X=16 -DBLK_Y=8 -DR=8"
     "-DENTRY_VERT -DBLK_X=32 -DBLK_Y=4 -DR=16"
     "-DENTRY_HORIZ -DBLK_X=16 -DBLK_Y=8 -DR=8")
-# GaussBlur is the first filter with an f16 kernel, so its io list is local: a
-# half clip is staged as its real sample type, i.e. half the bytes per load and
-# store. The other filters keep VK_IO_TYPES until they grow an f16 branch.
+# GaussBlur's io list is local, like the other io-list filters': a half clip
+# is staged as its real sample type, i.e. half the bytes per load and store.
 set(VK_GAUSS_IO_TYPES "u16" "f16" "f32")
 set(VK_GAUSS_VARIANTS)
 foreach(io IN LISTS VK_GAUSS_IO_TYPES)

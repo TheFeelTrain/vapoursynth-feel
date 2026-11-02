@@ -507,12 +507,7 @@ struct GpuBuffer {
     VSGPUBuffer * handle {};
     VkBuffer buffer {};
     void * mapped {};
-    VkDeviceSize size {};
     VkMemoryPropertyFlags memory_flags {};
-
-    explicit operator bool() const {
-        return handle != nullptr;
-    }
 };
 
 // Storage buffer from the pool; empty return means success, otherwise the
@@ -547,7 +542,6 @@ inline std::string gpu_make_buffer(const GPUDevice & g, VSCore * core,
     }
     out.buffer = info.buffer;
     out.mapped = info.mapped;
-    out.size = info.size;
     out.memory_flags = info.memoryFlags;
     return {};
 }

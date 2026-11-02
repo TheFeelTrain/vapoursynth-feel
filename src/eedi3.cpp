@@ -323,12 +323,6 @@ struct Eedi3Data {
     std::vector<std::pair<int, VSFrame *>>
         cache; // computed frames awaiting a caller
     std::vector<std::pair<int, int>> claims; // ranges being recorded
-    // Scratch reuse (VSFEEL_EEDI3_SCRATCH_REUSE=1): a per-instance free list
-    // of scratch buffers the exec pool hands back through gpuExecRetain when
-    // the submission using them retires. A steady-state graph then reuses one
-    // buffer per frame in flight instead of allocating and destroying the
-    // whole (100+ MiB) region set on every frame.
-    std::vector<GpuBuffer> scratch_free;
 
     // mask kernels, indexed by mask format (0 = 8 bit, 1 = 16, 2 = 32, 3 = f16)
     std::array<const uint32_t *, 4> maskpack_code {};
@@ -340,7 +334,6 @@ struct Eedi3Data {
 
     std::mutex cache_lock;
     std::mutex qt_lock;
-    std::mutex scratch_lock;
     // vcheck d2p source. Levels trade accuracy for work: 1 = the un-vchecked
     // dst row, 2..6 = +an increasing number of Jacobi steps. The shipped
     // default reproduces the serial walk exactly on the whole tested surface;
@@ -374,7 +367,6 @@ struct Eedi3Data {
     // Output-frame batching (see the batching section above).
     int batch_size { 4 };
     int max_out { -1 }; // last valid output frame index, -1 if unknown
-    int scratch_cap { 8 };
 
     // f16: a 2-byte io element like u16, but the sample is a float. The pad,
     // the transposed copies and EEDI3AA's intermediate planes stay native half
@@ -400,17 +392,9 @@ struct Eedi3Data {
     // serializes the pipeline, so it measures one frame's GPU time alone.
     bool sync_wait { false };
     bool gpu_time { false };
-    bool scratch_reuse { false };
     bool process[MAX_PLANES] { true, true, true };
 
     ~Eedi3Data();
-};
-
-// Lease handed to gpuExecRetain; the release callback returns the buffer to
-// the free list (or destroys it when the list is already deep enough).
-struct Eedi3ScratchLease {
-    Eedi3Data * d {};
-    GpuBuffer buf {};
 };
 
 Eedi3Data::~Eedi3Data() {
