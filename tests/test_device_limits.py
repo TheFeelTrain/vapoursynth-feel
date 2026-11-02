@@ -220,8 +220,8 @@ def _eedi3_batch(stderr):
 
 
 def _nlmeans_ring(stderr):
-    """(ring MiB, ring budget MiB, pack) from the VRAM banner."""
-    m = re.search(r"ring ([\d.]+) MiB of ([\d.]+) MiB, \d+ slots, pack (\d+)", stderr)
+    """(ring MiB, ring target MiB, batch) from the VRAM banner."""
+    m = re.search(r"ring ([\d.]+) MiB of ([\d.]+) MiB target, \d+ slots, batch (\d+)", stderr)
     assert m, stderr[-2000:]
     return float(m.group(1)), float(m.group(2)), int(m.group(3))
 
@@ -257,42 +257,41 @@ def test_eedi3_batch_is_capped_by_the_vram_budget():
 
 
 def test_nlmeans_ring_is_capped_by_the_vram_budget():
-    """The 64 MiB u4a ring optimum is a target, not a claim on the device."""
-    ring, budget_mib, pack = _nlmeans_ring(_trace("nlmeans"))
-    if pack == 1:
-        pytest.skip("device budget is already at the one-pack ring floor")
-    assert ring <= budget_mib + 1e-6
+    """The 96 MiB live-set target is a target, not a claim on the device."""
+    ring, target_mib, batch = _nlmeans_ring(_trace("nlmeans"))
+    if batch == 1:
+        pytest.skip("device budget is already at the one-entry ring floor")
+    assert ring <= target_mib + 1e-6
 
-    # A quarter of the tuned ring budget must pack fewer entries per round.
-    ring2, budget2, pack2 = _nlmeans_ring(
-        _trace("nlmeans", {"VSFEEL_LIMIT_VRAM_BUDGET": str(int(budget_mib / 4 * 16) << 20)})
+    # A quarter of the target must plan a smaller round.
+    ring2, target2, batch2 = _nlmeans_ring(
+        _trace("nlmeans", {"VSFEEL_LIMIT_VRAM_BUDGET": str(int(target_mib / 4 * 16) << 20)})
     )
-    assert pack2 < pack, (pack, pack2, ring, budget_mib)
-    # One pack is the floor (a run group has to fit), so a ring smaller than
-    # that is not expressible; above it the ring never exceeds the budget.
-    assert ring2 <= max(budget2, ring2 / pack2) + 1e-6
+    assert batch2 < batch, (batch, batch2, ring, target_mib)
+    # One entry per round is the floor, so a target smaller than one entry's
+    # ring is not expressible; above it the ring never exceeds the target.
+    assert ring2 <= max(target2, ring2 / batch2) + 1e-6
 
 
 def test_nlmeans_pack_is_capped_by_the_grid_z_limit():
-    """The weight dispatch's Z is a batch's row count: one or two per entry.
+    """The weight dispatch's Z is a round's row count: one or two per entry.
 
-    A batch of ``qb*pack`` sweep entries dispatches one workgroup per table row
-    and every entry with a non-zero temporal offset emits two, so ``pack`` has
+    A round of ``batch`` sweep entries dispatches one workgroup per table row
+    and every entry with a non-zero temporal offset emits two, so ``batch`` has
     to yield to ``maxComputeWorkGroupCount[2]`` rather than dispatch an invalid
     grid. The default already fits the guaranteed 65535; the forced limit here
-    (640x360, d=3 -> qb=8) is well below it, so the banner must show the clamp
-    and the frame must still evaluate.
+    (640x360, d=3) is well below it, so the banner must show the clamp and the
+    frame must still evaluate.
     """
     rows_per_entry = 2  # d=3: every kk != 0 entry emits a +q and a -q row
-    qb = 8  # 640x360 is under the qb=8 threshold
     z_limit = 16
 
-    _, _, pack = _nlmeans_ring(_trace("nlmeans"))
-    assert pack * rows_per_entry * qb <= 65535, pack
+    _, _, batch = _nlmeans_ring(_trace("nlmeans"))
+    assert batch * rows_per_entry <= 65535, batch
 
     force = {"VSFEEL_LIMIT_GRID_Z": str(z_limit), "VSFEEL_NLMEANS_PACK": "16384"}
     _, _, capped = _nlmeans_ring(_trace("nlmeans", force))
-    assert capped == z_limit // (rows_per_entry * qb), capped
+    assert capped == z_limit // rows_per_entry, capped
 
     # Creation alone cannot see an over-limit dispatch; the frame run must.
     res = _run_limits([{"label": "nlmeans", "filter": "nlmeans"}], force)

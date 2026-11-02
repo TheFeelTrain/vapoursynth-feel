@@ -86,7 +86,7 @@ static constexpr std::array<VkSpecializationMapEntry, 15> spec_entries { {
 // Workgroup tile geometry of the weight kernel (must match nlmeans.comp).
 constexpr int BLK_X = 32;
 constexpr int BLK_Y = 8;
-constexpr int VRT_RESULT = 3;
+constexpr int VRT_RESULT = 6;
 
 // GPU-trace timestamp pool size: slot 0 is the frame start, then three stamps
 // per weight+acc round (weight start, weight end, accumulation end).
@@ -135,10 +135,13 @@ struct NLMeansData {
     int64_t tile_elems {};
     int clips {};     // 1, or 2 with rclip
     int guide_off {}; // window tile offset of the guide half
-    int qb {};
-    uint32_t pack { 1 }; // sweep rounds: entries per weight+acc round
-    int64_t ring_budget { 128LL << 20 }; // u4a ring target, capped by the core
-    int slots {};                        // u4a ring slots = ring_base * pack
+    // Sweep entries per weight+acc round. One round's live set -- the weight
+    // ring, the accumulators and the window -- is sized to stay inside the
+    // GPU's last-level cache (see the sizing block in create()).
+    uint32_t batch { 1 };
+    int64_t ring_target { 96LL << 20 }; // per-round live-set target
+    int64_t ring_bytes {};              // actual u4a ring bytes per frame
+    int slots {};                       // u4a ring slots = (1 or 2) * batch
 
     // create()-time q-sweep tables (stride-8 rows), shared by all recordings
     std::vector<int> wq_host;
@@ -232,9 +235,10 @@ create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
     //
     // LDS: only ENTRY_WEIGHT declares the two tiles,
     // `dist[VRT_RESULT*BY + 2*NLM_S][BX + 2*NLM_S]` and
-    // `hsum[VRT_RESULT*BY + 2*NLM_S][BX]` (nlmeans.comp:156), sized here for
-    // BX=32, BY=8, VRT_RESULT=3 and a search radius of NLM_S = spec.s.
-    const uint32_t rows = 3 * 8 + 2 * static_cast<uint32_t>(spec.s);
+    // `hsum[VRT_RESULT*BY + 2*NLM_S][BX]` (nlmeans.comp), sized here for
+    // BX=32, BY=8, VRT_RESULT and a search radius of NLM_S = spec.s.
+    const uint32_t rows =
+        VRT_RESULT * BLK_Y + 2 * static_cast<uint32_t>(spec.s);
     const GpuWorkgroup workgroup {
         .x = 32,
         .y = 8,
@@ -491,8 +495,7 @@ static const VSFrame * nlmeans_gpu_frame(NLMeansData * d, int n,
     uint32_t q0 = 0;
     size_t bi = 0;
     while (q0 < v.q_cnt) {
-        const uint32_t nb = std::min<uint32_t>(
-            static_cast<uint32_t>(d->qb) * d->pack, v.q_cnt - q0);
+        const uint32_t nb = std::min<uint32_t>(d->batch, v.q_cnt - q0);
         const uint32_t p0 = v.w_boff[bi];
         const uint32_t p1 = v.w_boff[bi + 1];
 
@@ -901,7 +904,6 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         vsapi->freeFrame(probe);
     }
     d->npix = static_cast<int64_t>(d->stride) * d->height;
-    d->qb = d->npix <= static_cast<int64_t>(1920) * 1152 ? 8 : 4;
 
     // Zero-padded temporal window geometry. PAD = a makes every OOB candidate
     // read land in the zero margin, which is the reference's zero border.
@@ -912,47 +914,53 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
     d->clips = d->has_ref ? 2 : 1;
     d->guide_off = d->has_ref ? d->channels * (2 * dd + 1) : 0;
 
-    // Pack as many sweep entries into one weight+accumulation round as the u4a
-    // plane-ring budget allows: the kernels' arithmetic is cheap next to the
-    // fixed per-dispatch/barrier drain. The ring is f32 (see the shader's
-    // WeightBuf) and budgeted at 128 MiB so `pack` stays at the measured
-    // optimum of the older fp16 layout: halving it for the same bytes costs
-    // more in extra rounds than the wider ring costs in DRAM traffic, and the
-    // reference's own u4a is f32 too. The budget is capped by the core's
-    // VRAM allowance -- a device with a smaller allowance packs fewer entries
-    // per round. One pack is the floor: the run groups have to fit, so a ring
-    // smaller than that is not expressible and the core's allocator is what
-    // rejects it.
+    // Sweep entries per weight+acc round, sized so one round's live set fits the
+    // GPU's last-level cache. That set is the f32 weight ring (one slot per
+    // field, two for a temporal offset because the accumulation reads the
+    // temporal mirror back at a shifted pixel), the interleaved accumulators and
+    // the window. Both kernels then touch a round of weights that stays in L2
+    // instead of streaming it through DRAM; the 128 MiB f32 ring this replaces
+    // put every round past the card's 96 MiB Infinity Cache, which cost ~15% on
+    // luma and ~12% on chroma (jpbd 1080p, d=2). The trade is the extra rounds:
+    // their accumulator traffic grows as 1/batch and is bounded here.
     {
-        const int64_t ring_base_slots =
-            (dd == 0) ? d->qb : 2 * static_cast<int64_t>(d->qb);
-        const int64_t bytes_per_pack =
-            ring_base_slots * d->npix * NLMeansData::kWeightBytes;
-        int64_t ring_budget = 128LL << 20;
+        const int64_t ring_slots_per_entry = (dd == 0) ? 1 : 2;
+        const int64_t acc_bytes = d->npix * (d->channels + 2) * sizeof(float);
+        const int64_t window_bytes = d->clips * d->channels * (2 * dd + 1) *
+                                     d->tile_elems * d->elem_bytes;
+        const int64_t ring_bytes_per_entry =
+            ring_slots_per_entry * d->npix * NLMeansData::kWeightBytes;
+        int64_t target = d->ring_target;
         if (const VkDeviceSize budget = vsfeel_vram_limit(*d->gpu, core);
             budget > 0) {
-            ring_budget = std::min<int64_t>(ring_budget,
-                                            static_cast<int64_t>(budget / 16));
+            target =
+                std::min<int64_t>(target, static_cast<int64_t>(budget / 16));
         }
-        d->ring_budget = ring_budget;
-        int64_t pack = ring_budget / std::max<int64_t>(bytes_per_pack, 1);
-        const int pack_env = env_int("VSFEEL_NLMEANS_PACK", 0);
-        if (pack_env > 0) {
-            pack = pack_env;
-        }
-        // A dispatch may not exceed maxComputeWorkGroupCount[2] and the weight
-        // dispatch's Z is the batch's row count, one or two rows per sweep entry
-        // (two whenever the temporal offset is non-zero). Vulkan guarantees at
-        // least 65535 there, so at least one entry always fits.
+        d->ring_target = target;
+        // Clamp against the sweep's own entry count (each round carries whole
+        // entries) and against the device's Z group-count limit: the weight
+        // dispatch's Z is the round's row count, one row per field, two rows per
+        // temporal entry. Vulkan guarantees at least 65535 there.
+        const int64_t spt_side = 2LL * aa + 1;
+        const int64_t entries = ((2LL * dd + 1) * spt_side * spt_side - 1) / 2;
         const int64_t rows_per_entry = (dd == 0) ? 1 : 2;
         const int64_t z_limit = std::max<int64_t>(
             static_cast<int64_t>(d->gpu->limits.maxComputeWorkGroupCount[2]) /
-                (rows_per_entry * d->qb),
+                rows_per_entry,
             1);
-        pack = std::clamp<int64_t>(pack, 1, std::min<int64_t>(16384, z_limit));
-        d->pack = static_cast<uint32_t>(pack);
+        int64_t batch = (target - acc_bytes - window_bytes) /
+                        std::max<int64_t>(ring_bytes_per_entry, 1);
+        const int batch_env = env_int("VSFEEL_NLMEANS_PACK", 0);
+        if (batch_env > 0) {
+            batch = batch_env;
+        }
+        batch = std::clamp<int64_t>(
+            batch, 1,
+            std::min<int64_t>(16384, std::min<int64_t>(z_limit, entries)));
+        d->batch = static_cast<uint32_t>(batch);
+        d->ring_bytes = batch * ring_bytes_per_entry;
     }
-    d->slots = ((dd == 0) ? d->qb : 2 * d->qb) * static_cast<int>(d->pack);
+    d->slots = ((dd == 0) ? 1 : 2) * static_cast<int>(d->batch);
 
     // int32 addressing bound of the device-side layouts (the reference falls
     // back to 64-bit indices here; we reject instead)
@@ -971,14 +979,13 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
 
     // Run-merged sweep tables, equivalent to the reference q-batched sweep:
     // for each reachable boundary count m the half-space of displacements
-    // (exploiting weight(p,p+q)==weight(p,p-q)) in k/j/i order, with
-    // consecutive-i displacements sharing (qy,qz) merged into RUN GROUPS of at
-    // most qb entries (so the u4a slot ring still covers one whole group).
+    // (exploiting weight(p,p+q)==weight(p,p-q)) in k/j/i order, cut into rounds
+    // of `batch` entries (the u4a slot ring covers one whole round).
     {
         const int64_t spt_side = 2LL * aa + 1;
         const int64_t spt_area = spt_side * spt_side;
         d->variants.resize(dd + 1);
-        const uint32_t batch = static_cast<uint32_t>(d->qb) * d->pack;
+        const uint32_t batch = d->batch;
         for (int mm = 0; mm <= dd; ++mm) {
             Variant & v = d->variants[mm];
             v.w_base = static_cast<uint32_t>(d->wq_host.size() / 8);
@@ -1201,8 +1208,7 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
 
     if (vsfeel_debug_flag("VSFEEL_NLMEANS_VRAM")) {
         const double mib = 1024.0 * 1024.0;
-        const double ring_mib = static_cast<double>(d->npix) * d->slots *
-                                NLMeansData::kWeightBytes / mib;
+        const double ring_mib = static_cast<double>(d->ring_bytes) / mib;
         const double window_mib = static_cast<double>(d->clips) * d->channels *
                                   (2 * d->d + 1) * d->tile_elems *
                                   d->elem_bytes / mib;
@@ -1211,9 +1217,10 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
                                      (d->channels + 2) * sizeof(float) / mib;
         fprintf(stderr,
                 "[nlmeans] %.1f MiB per in-flight frame (ring %.1f MiB of "
-                "%.1f MiB, %d slots, pack %u; window %.1f MiB, %dx%d tiles)\n",
-                per_frame, ring_mib, static_cast<double>(d->ring_budget) / mib,
-                d->slots, d->pack, window_mib, d->pstride, d->ph);
+                "%.1f MiB target, %d slots, batch %u; window %.1f MiB, %dx%d "
+                "tiles)\n",
+                per_frame, ring_mib, static_cast<double>(d->ring_target) / mib,
+                d->slots, d->batch, window_mib, d->pstride, d->ph);
     }
 
     NLMeansData * data = d.release();

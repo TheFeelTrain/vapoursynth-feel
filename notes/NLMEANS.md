@@ -17,7 +17,7 @@ Status: **shipped on the R80 GPU API.** Verified against
   `layer*TILE_ELEMS`), i.e. 32-bit offsets into one storage buffer. Reading the
   core's per-layer planes directly through buffer references costs 64-bit
   addressing per load and ~10% on the chroma benchmark (see Performance).
-- Sweep tables (`wq`/`aq`, stride-8 rows, `qb` batches, variants by
+- Sweep tables (`wq`/`aq`, stride-8 rows, rounds of `batch` entries, variants by
   `m=min(d,n)`), the f32 weight ring, `first`-flag init and the finish in the
   last acc round are unchanged from the pre-R80 implementation.
 - Three io variants — u16, f16, f32 — selected by the input format (half is
@@ -32,38 +32,46 @@ Status: **shipped on the R80 GPU API.** Verified against
 - `num_streams` and `device_id` are registered no-ops (never read): depth is
   the core's exec ring, device choice is `core.set_vulkan_device`.
 
-Scoreboard — jpbd 1080p YUV420P16, `d=2 a=2 s=4 h=0.2 wmode=0 wref=1
-channels=UV`, 3000 frames, medians of 3 through `tools/benchmark.py`:
+Scoreboard — jpbd 1080p YUV420P16, `d=2 a=2 s=4 h=0.2 wmode=0 wref=1`,
+medians of 3 (5 s window) through `tools/benchmark.py`:
 
-| mode | vsfeel | vszipcl | knlmvk | ratio |
+| `channels` | vsfeel | vszipcl | knlmvk | vs vszipcl | vs knlmvk |
+|---|---|---|---|---|---|
+| `UV` (chroma) | 1270.7 | 456.8 | 599.6 | 2.78x | 2.12x |
+| `Y` (luma) | 329.7 | 175.1 | 239.5 | 1.88x | 1.38x |
+
+Transfers, `channels=UV`:
+
+| mode | vsfeel | vszipcl | knlmvk | vs knlmvk |
 |---|---|---|---|---|
-| `--cpu-cache --download` (CPU cache) | 1020.9 | 550.9 | 622.0 | 1.64x |
-| `--download` (resident GPU input) | 1026.7 | 460.0 | 625.5 | 1.64x |
+| `--cpu-cache --download` (CPU cache) | 1260.0 | 561.8 | 647.2 | 1.95x |
+| `--download` (resident GPU input) | 1272.0 | 460.1 | 649.7 | 1.96x |
 
-- The two modes agree within 1%: the frame is the interleaved sweep rounds, and
+- The two transfer modes agree within 1%: the frame is the interleaved sweep rounds, and
   the transfers ride along on the transfer queue.
-- GRAY16 (all planes processed) was at parity in a manual same-session pair
-  (281 vs 279 fps, ~0.7%); its absolute fps are void with the rest of the
-  pre-fix numbers, but the parity it showed is a relative result.
+- Luma cannot reach the chroma ratio: one weight plane serves U and V jointly,
+  so a chroma pixel buys two output channels' worth of weight, while a luma
+  pixel pays a whole weight plane for one channel (see Performance).
 
 io depth (default: resident GPU input, no download, same config, medians of 3):
 
 | io | vsfeel | vs u16 | vszipcl |
 |---|---:|---:|---:|
-| u16 | 1033.1 | — | 443.2 |
-| f16 | 1069.4 | +3.5% | 457.1 |
-| f32 | 953.4 | −7.7% | 465.8 |
+| u16 | 1273.5 | — | 461.0 |
+| f16 | 1311.8 | +3.0% | 452.6 |
+| f32 | 1141.6 | −10.4% | 488.3 |
 
 - The half window is 2 bytes like u16's, and the sweep (not the transfers) is
-  the frame, so f16 lands +3.5% over u16 and +12.2% over f32. The io width is
+  the frame, so f16 lands +3% over u16 and +15% over f32. The io width is
   the whole difference: the kernels are the same shape at every depth. README's
   f16 row is a different session and sits below its own u16, which the 2-byte
   window and f32 weights rule out (a re-measure gave 1081 against 1033).
 
-The f32 weight ring (2026-10-02) replaces the fp16 one and costs **−7.2%** on
-the same config: same-session pair, 1080.2 → 1002.4 fps (vszipcl control flat at
-548.9/551.4, n=3 each). The rings are the same size (576 slots, pack 36); only
-the element width doubled (128 MiB budget).
+The f32 weight ring (2026-10-02) replaces the fp16 one for accuracy: 2^-11
+relative weight quantisation drifts the average by up to ~2e-3 f32 / ~180 codes
+u16 at `a=64`, while f32 holds the whole comparison surface at ≤1 LSB /
+≤4.4e-6. The −7.2% it cost when widened was measured under the superseded fixed
+128 MiB ring budget; the round sizing below absorbs its 2x bytes.
 
 ## Implementation
 
@@ -101,8 +109,10 @@ the element width doubled (128 MiB budget).
   write 0, the interior loads the core's plane through the address table
   (buffer reference) and stores raw.
 - `ENTRY_WEIGHT`: unchanged box-sum/weight transform; `BX=32`, `BY=8`,
-  `VRT_RESULT=3`, the interior tile+halo fast path, and the exact per-instance
+  `VRT_RESULT=6`, the interior tile+halo fast path, and the exact per-instance
   LDS sizing (`dist[VRT*BY+2S][BX+2S]`, `hsum[...][BX]`) are the pre-R80 ones.
+  The border path walks tile rows instead of a fixed chunk unroll, so the tile
+  height is a free parameter.
 - `ENTRY_ACC`: unchanged per-pixel `+q/-q` accumulation with `first`-flag init
   and the finish folded into the last round (`pc3`).
 - `VI_DIM`, `STRIDE`, `PSTRIDE`, `PH`, `PAD`, `NLM_S`, `NLM_D`, `NLM_REF`,
@@ -132,15 +142,29 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
 
 ## Performance
 
+- **Round sizing is a cache-residency decision.** One weight+acc round's live
+  set is the f32 ring, the accumulators and the window; it is sized to 96 MiB,
+  the card's Infinity Cache, so the accumulation reads a round's weights from L2
+  instead of DRAM. At 1080p that is batch 3 (21 rounds) for luma and batch 19
+  (4 rounds) for chroma; the old fixed 128 MiB ring gave 8 and 2 rounds and made
+  every round's 133 MiB of weights re-read from DRAM. Graded medians:
+  `channels=Y` 249 → 330 fps, `UV` 1042 → 1271 fps. The trade is the extra
+  rounds' accumulator traffic, which grows as 1/batch; batch 2/5/6/8 measured
+  272/272/263/247 fps against 293 at 3-4 (400-frame screen, `VRT_RESULT=3`).
+- **The weight tile is 32x48 (`VRT_RESULT=6`).** A taller tile cuts the separable
+  box sum's halo overfetch (40x32 dist cells per 32x24 outputs → 40x56 per
+  32x48) and the hsum cells per output (1.33 → 1.17). 400-frame probe ladder:
+  294 (3) → 314 (5) → 322 (6) → 296 (7) → 299 (8) fps; 7+ loses occupancy.
+  LDS is 16 KiB at `s=4`, still 16 subgroups/SIMD. The box sum itself runs at
+  ~80% of the LDS issue rate at `s=4`, so it is the pipeline floor, not codegen.
 - **The f32 weight ring is an accuracy purchase, not a free one.** The fp16
   ring (×4096 to dodge the subnormal cliff) quantises every weight to 2^-11
   relative, which on real content drifts the weighted average by up to 2.1e-3
   f32 / ~180 codes u16 at `a=64` and ~6 codes on the cropped geometry - the
   recorded 1 LSB band held only on the old near-black clip, where every weight
   sat on exactly 4096. f32 collapses the whole comparison surface to ≤1 LSB /
-  ≤4.4e-6 for −7.2%: the ring carries 2x the bytes at the same pack, which the
-  measured optimum wants at 128 MiB rather than 64 (halving pack costs more in
-  rounds than the wider ring costs in DRAM traffic).
+  ≤4.4e-6; its 2x bytes are paid inside the cache-sized round above, so the
+  −7.2% that widening first cost does not apply to the shipped sizing.
 
 - **Full-fp16 internals are a measured dead end: +10.4%.** With the half io
   window already shipped, a probe that also narrowed the weight ring, the
@@ -200,6 +224,12 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
 
 The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
+- **2026-11-01 — round sizing was past the Infinity Cache.** The f32 ring's fixed
+  128 MiB budget made a round's live set 130 MiB+, so the accumulation re-read
+  every weight plane from DRAM; sizing the round to the 96 MiB cache and taking
+  the weight tile to 32x48 gave luma 249 → 330 fps and chroma 1042 → 1271 fps
+  (jpbd 1080p u16, graded medians). A unorm16 ring measured +2% on luma and lost
+  on chroma, so the ring stays f32.
 - **2026-11-01 — the `channels` comparison is portable.** `strcasecmp` is
   POSIX-only, so an MSVC build of the filter failed; the call sites now use a
   local `iequals` that selects `_stricmp` on Windows. No behavior or perf
@@ -273,12 +303,9 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   (hundreds of thousands at `a=64, d=16`) and the weight ring both need scaling,
   and the u2/u5 interleave has to be repacked. Estimated as a rewrite, not a
   tweak.
-- **The ring's DRAM traffic is the one f16 lever that pays** (+10.6% alone), but
-  only the accuracy budget can unlock it: 2^-11 relative weight quantisation is
-  ~180 codes u16 at `a=64`. A scaled half ring that keeps more range (a shared
-  exponent per tile, or block floating point) is the untried route; the plain
-  fp16 ring is already rejected (see the banner's f32-ring round).
-- **Subgroup-shuffle box sums** to cut LDS phases (complex).
+- **Subgroup-shuffle box sums** to cut LDS phases (complex). On AMD a shuffle
+  lowers to `ds_bpermute`, i.e. the same LDS pipe the box sum already saturates,
+  so this trades one LDS instruction for another rather than relieving it.
 - **Incremental window cache**: copy only newly-entered layers instead of
   rebuilding the whole window, if a large-`d` workload ever makes the copy
   matter.
@@ -303,12 +330,21 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 - **Run-merging** (one WG sweeping consecutive-i displacements with
   LDS-resident union tiles): neutral; the warm weight kernel is ALU/LDS/barrier
   bound, not load bound.
-- **Round packing >1** (bigger W/A rings): pack=2 tied, 4/8 lost; rings >33 MB
-  stream u4a through DRAM. Its 10-binding push-descriptor layout is bounded by
-  `maxPushDescriptors` (checked at layout creation; the per-stage pool limits do
-  not apply to push descriptors), which RADV reports at the minimum of 32. The 128 MiB target is capped by the core's VRAM limit,
-  so a device with a smaller allowance packs fewer entries per round instead of
-  planning the optimum anyway.
+- **A narrower weight ring does not pay: unorm16 measured +2%.** A weight is
+  already in [0,1], so 16-bit fixed point has a clean ≤0.5 LSB bound and the
+  round it funds doubles the batch (luma batch 3 → 6, chroma 19 → 39). It
+  measured 330 vs 322 fps on luma and 1160 vs 1221 on chroma (400-frame screen):
+  the accumulation is bound per entry-pixel, not by ring bytes, so halving the
+  ring's width is not worth its accuracy cost. f32 stays.
+- **A bigger round than the cache allows loses.** Past the 96 MiB live set the
+  accumulation re-reads the round's ring from DRAM: luma batch 5/6/8 measured
+  272/263/247 fps against 293 at 3-4 (400-frame screen). The old note's
+  "pack=2 tied, 4/8 lost" was the fp16 ring at the fixed 128 MiB budget. The
+  10-binding push-descriptor layout is bounded by `maxPushDescriptors` (checked
+  at layout creation; the per-stage pool limits do not apply to push
+  descriptors), which RADV reports at the minimum of 32. The ring target is
+  capped by the core's VRAM limit, so a device with a smaller allowance plans a
+  smaller round.
 - **`a=64, d=16` hard-recovers the GPU when the device is shared** — a
   co-scheduled weight sweep is the trigger, not an OOB or a timeout. Do not run
   it beside another GPU client; `-n 8 --dist loadfile` keeps it serial per file.
@@ -319,8 +355,8 @@ Flags are `VSFEEL_NLMEANS_<FLAG>`.
 
 - `VSFEEL_NLMEANS_TIMING=1` — per-frame host stage split (acquire/record/submit).
 - `VSFEEL_NLMEANS_GPUTRACE=1[,frame]` — one-shot per-batch GPU timestamps.
-- `VSFEEL_NLMEANS_PACK=N` — entries per W/A round (clamped 1..16384, and so the
-  weight dispatch's Z fits the device's group-count limit; default from the
-  128 MiB ring budget, itself capped by the core's VRAM limit).
+- `VSFEEL_NLMEANS_PACK=N` — entries per weight+acc round (default: the largest
+  that fits the 96 MiB live-set target; clamped 1..16384, at most the sweep's
+  entry count and the device's Z group-count limit).
 - `VSFEEL_NLMEANS_VRAM=1` — creation banner with ring/window/per-frame bytes.
 - `VSFEEL_DEBUG`/`VSFEEL_TRACE` and `RADV_DEBUG=asm|shaderstats` as elsewhere.

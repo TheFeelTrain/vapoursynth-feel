@@ -169,7 +169,7 @@ void main() {
 // Workgroup tile geometry (matches the reference launch config).
 #define BX        32
 #define BY        8
-#define VRT_RESULT 3
+#define VRT_RESULT 6
 // Exact per-instance LDS sizing: NLM_S is a specialization constant, so the
 // pipeline allocates precisely what this instance needs (occupancy). Even
 // strides like the OpenCL reference (gfx11 has no bank-conflict penalty here).
@@ -236,17 +236,6 @@ void main() {
     const int yy_c = gy0 - NLM_S + (RY); \
     dist[RY][CX] = (xx_c >= 0 && xx_c < VI_DIM_X && yy_c >= 0 && yy_c < VI_DIM_Y) \
                    ? nlm_pix_dist(a0, a1, a2, b0, b1, b2, xx_c, yy_c, qx, qy) : 0.0f; }
-#undef DIST_CHUNK
-#define DIST_CHUNK(RYBASE) { \
-    const int ry_g = (RYBASE); \
-    if (ry_g < VRT_RESULT*BY + 2*NLM_S) { \
-        if (lx < 2*NLM_S) { \
-            DIST_CELL(ry_g, lx) \
-            DIST_CELL(ry_g, lx + BX) \
-        } else { \
-            DIST_CELL(ry_g, lx) \
-        } \
-    } }
 
     // uniform per-invocation test: is this workgroup's whole tile+halo region
     // (reference AND candidate) inside the frame? Then the zero-border
@@ -311,13 +300,15 @@ void main() {
             if (two) dist[ry_g2][cx_b] = vb;
         }
     } else {
-        DIST_CHUNK(ly)
-        DIST_CHUNK(ly + BY)
-        DIST_CHUNK(ly + 2*BY)
-        DIST_CHUNK(ly + 3*BY)
-        DIST_CHUNK(ly + 4*BY)
+        // The border path walks every tile row (not a fixed chunk count), so
+        // the tile height can change without leaving the halo rows unwritten.
+        for (int ry_g2 = ly; ry_g2 < VRT_RESULT*BY + 2*NLM_S; ry_g2 += BY) {
+            DIST_CELL(ry_g2, lx)
+            if (lx < 2*NLM_S) {
+                DIST_CELL(ry_g2, lx + BX)
+            }
+        }
     }
-#undef DIST_CHUNK
 #undef DIST_CELL
     barrier();
     // 2) horizontal box-sum: hsum[ry][lx] = sum dist[ry][lx..lx+2S] (ascending x).

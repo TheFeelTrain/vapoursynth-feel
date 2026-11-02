@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- NLMeans is 20-30% faster, with the largest gain on luma-only processing
 - BM3D's `radius` argument can be set per plane like `sigma`
 
 ### Fixed
