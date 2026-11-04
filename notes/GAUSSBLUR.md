@@ -88,8 +88,9 @@ sigma, frames and repeats (3-repeat medians, one session):
   `gpu_frame_buffer` retires it with the submission.
 - The fused small path covers `radius <= 32` and declares
   `vblur[VRT*BLK_Y][BLK_X + 2*RAD]` — 7 680 B at the widest radius, under the
-  16 KiB of workgroup memory Vulkan guarantees, so the device's own limit is the
-  only check that can reject it (`gaussblur.cpp` static_asserts that bound).
+  16 KiB of workgroup memory Vulkan guarantees, so no device limit can reject
+  it (`gaussblur.cpp` static_asserts that bound). `VRT` is one CMake value
+  shared by the shader's `-DVRT` and the host launch math.
   Wider kernels take the two-pass vertical + horizontal path, which declares no
   shared memory.
 - int32 guards on the plane's last element and the scratch end (same 32-bit

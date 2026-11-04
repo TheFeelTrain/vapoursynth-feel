@@ -401,7 +401,6 @@ layout(push_constant) uniform PC {
     int sclip_base;   // io elements into b5
     int cint_base;    // io elements into b6
     int vout_base;    // io elements into b7 (vcheck output rows)
-    int pad_stride;   // padded plane row pitch in pad elements
     int pad_height;   // padded plane height in rows
     int field;        // parity of the interpolated dst rows (0/1)
     int rows;         // number of interpolated rows (== kept source rows)

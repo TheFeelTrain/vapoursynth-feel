@@ -46,7 +46,12 @@ constexpr int V_BLK_X = 32;
 constexpr int V_BLK_Y = 4;
 constexpr int H_BLK_X = 16;
 constexpr int H_BLK_Y = 8;
-constexpr int VRT = 3;              // output rows per thread, small path
+// Output rows per thread, small path. VSFEEL_GAUSS_VRT comes from the same
+// CMake value as the fused shader's -DVRT, so the launch math cannot drift.
+#ifndef VSFEEL_GAUSS_VRT
+#define VSFEEL_GAUSS_VRT 3
+#endif
+constexpr int VRT = VSFEEL_GAUSS_VRT;
 constexpr int LARGE_R_V = 16;       // vertical outputs per thread
 constexpr int LARGE_R_H = 8;        // horizontal outputs per thread
 constexpr int LARGE_THRESHOLD = 32; // radius <= 32 => fused small path
@@ -750,14 +755,12 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
 
     const int n_cfg = static_cast<int>(keys.size());
 
-    // Code path per config: the fused small path only when its shared-memory
-    // tile fits the device. The tile is `vblur[VRT*BLK_Y][BLK_X + 2*RAD]`, and
-    // the largest one the small path can ask for is 7 680 B (radius
-    // LARGE_THRESHOLD), under the 16 KiB of workgroup memory Vulkan guarantees --
-    // so the device limit cannot reject a small path, and the hardcoded 48 KiB
-    // cap that used to sit beside it never bound anything. The static_assert is
-    // what keeps that claim true: raise LARGE_THRESHOLD or the block and the
-    // build stops instead of silently falling back to the two-pass path.
+    // Code path per config: the fused small path for radius <= LARGE_THRESHOLD.
+    // Its tile is `vblur[VRT*BLK_Y][BLK_X + 2*RAD]`, and the largest one the
+    // small path can ask for is 7 680 B (radius LARGE_THRESHOLD), under the
+    // 16 KiB of workgroup memory Vulkan guarantees, so no device limit can
+    // reject it. The static_assert keeps that claim true: raise LARGE_THRESHOLD
+    // or the block and the build stops instead of silently falling back.
     static_assert(
         VRT * BLK_Y * (BLK_X + 2 * LARGE_THRESHOLD) *
                 static_cast<int>(sizeof(float)) <=
@@ -765,12 +768,8 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
         "the fused small path must fit the guaranteed workgroup memory");
     std::array<bool, 3> cfg_small {};
     for (int ci = 0; ci < n_cfg; ++ci) {
-        const int ksize = static_cast<int>(weights[ci].size());
-        const int radius = ksize / 2;
-        const size_t tile_bytes = static_cast<size_t>(VRT) * BLK_Y *
-                                  (BLK_X + 2 * radius) * sizeof(float);
-        cfg_small[ci] = radius <= LARGE_THRESHOLD &&
-                        tile_bytes <= d->gpu->limits.maxComputeSharedMemorySize;
+        cfg_small[ci] =
+            static_cast<int>(weights[ci].size()) / 2 <= LARGE_THRESHOLD;
     }
 
     // Push descriptor layout: one whole-buffer binding per shader buffer, so

@@ -233,8 +233,11 @@ set(VK_BM3D_VARIANTS
 # notes/GAUSSBLUR.md, and tools/shader_limits.py --check compares the compiled
 # local size against the host launch in src/gaussblur.cpp.
 set(VK_GAUSS_ENTRIES gauss vert horiz)
+# The fused path's output rows per thread live here so the shader's -DVRT and
+# the host's launch/tile math (VSFEEL_GAUSS_VRT) cannot drift.
+set(VSFEEL_GAUSS_VRT 3)
 set(VK_GAUSS_ENTRY_DEFS
-    "-DENTRY_GAUSS -DBLK_X=16 -DBLK_Y=8 -DR=8"
+    "-DENTRY_GAUSS -DBLK_X=16 -DBLK_Y=8 -DVRT=${VSFEEL_GAUSS_VRT}"
     "-DENTRY_VERT -DBLK_X=32 -DBLK_Y=4 -DR=16"
     "-DENTRY_HORIZ -DBLK_X=16 -DBLK_Y=8 -DR=8")
 # GaussBlur's io list is local, like the other io-list filters': a half clip
@@ -339,7 +342,6 @@ foreach(io IN LISTS VK_EEDI3_IO_TYPES)
         "eedi3_${io}_vcheck_para_j3|eedi3.comp|-DIO_${io_define} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=4"
         "eedi3_${io}_vcheck_para_j4|eedi3.comp|-DIO_${io_define} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=5"
         "eedi3_${io}_vcheck_para_j5|eedi3.comp|-DIO_${io_define} -DPROBE=${EEDI3_PROBE} -DMAXW=${EEDI3_MAXW} -DENTRY_VCHECK -DVCHECK_PARA=6"
-        # upload kernels: mirror-pad builder + empty-row vcheck copy and the
         # upload kernels: mirror-pad builder + hp's half-pel precompute +
         # empty-row vcheck copy and the assemble/transpose passes (plain 1D
         # kernels, fixed local size, no subgroup ops).
@@ -656,8 +658,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     endif()
 endif()
 # Keep the host's EEDI3 vcheck LDS fit check in step with the -DMAXW the shader
-# was compiled with (defined above, in the EEDI3 shader block).
-target_compile_definitions(vsfeel PRIVATE EEDI3_MAXW_LDS=${EEDI3_MAXW})
+# was compiled with (defined above, in the EEDI3 shader block), and the host's
+# GaussBlur small-path tile math in step with the fused kernel's -DVRT.
+target_compile_definitions(vsfeel PRIVATE EEDI3_MAXW_LDS=${EEDI3_MAXW}
+    VSFEEL_GAUSS_VRT=${VSFEEL_GAUSS_VRT})
 # The core's Vulkan device is reached through VSAPI::getVulkanAPI, which exists
 # only from API 4.3 on (R80). Defined for every TU so no include order can
 # silently drop the plugin back to API 4.0.

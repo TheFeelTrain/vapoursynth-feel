@@ -39,7 +39,6 @@ constexpr int kMaxRadius = 32767;
 struct BilateralPlaneConfig {
     int width {}; // visible pixels
     int height {};
-    int stride {}; // the core's plane pitch in elements
     VkPipeline pipeline {};
     uint32_t grid_x {};
     uint32_t grid_y {};
@@ -745,7 +744,6 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
 
         cfg.width = key.width;
         cfg.height = key.height;
-        cfg.stride = key.stride;
 
         // the shared kernel keeps the source tile plus the guide tile (if any);
         // the output goes straight to dst[] — there is no output tile. The tile

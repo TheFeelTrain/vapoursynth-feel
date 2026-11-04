@@ -41,7 +41,7 @@ struct BoxTaps {
 };
 
 struct BoxPlaneConfig {
-    int src_w {}, src_h {}, dst_w {}, dst_h {};
+    int src_w {}, dst_w {}, dst_h {};
     int src_stride {}, dst_stride {};
     VkPipeline v_pipeline {}, h_pipeline {};
     uint32_t v_grid_x {}, v_grid_y {}, h_grid_x {}, h_grid_y {};
@@ -153,16 +153,10 @@ static std::vector<BoxTaps> box_taps(int src, int dst, bool & ok) {
             if (w < -0.5 || w >= 0.5) {
                 continue; // outside the box kernel
             }
-            // zimg mirrors a position that leaves the image and clamps the
-            // result; included taps are in bounds for a downscale, but mirror
-            // them the same way so the table cannot drift from the reference.
-            double real = xpos;
-            if (real < 0.0) {
-                real = -real;
-            } else if (real >= static_cast<double>(src)) {
-                real = 2.0 * static_cast<double>(src) - real;
-            }
-            real = std::clamp(real, 0.0, last_pos);
+            // Included taps stay inside [0, src) over the downscale-only domain
+            // the creator enforces (out <= in), so zimg's mirror never runs;
+            // clamp only covers a rounding edge at the first/last sample.
+            const double real = std::clamp(xpos, 0.0, last_pos);
             const int idx = static_cast<int>(std::floor(real));
             if (count == 0) {
                 first = idx;
@@ -190,20 +184,18 @@ static std::vector<BoxTaps> box_taps(int src, int dst, bool & ok) {
 
 struct BoxSpecData {
     int32_t src_w;
-    int32_t src_h;
     int32_t dst_w;
     int32_t dst_h;
     int32_t src_stride;
     int32_t dst_stride;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 6> spec_entries { {
+static constexpr std::array<VkSpecializationMapEntry, 5> spec_entries { {
     { 0, 0, sizeof(int32_t) },
     { 1, 4, sizeof(int32_t) },
     { 2, 8, sizeof(int32_t) },
     { 3, 12, sizeof(int32_t) },
     { 4, 16, sizeof(int32_t) },
-    { 5, 20, sizeof(int32_t) },
 } };
 
 static std::variant<VkPipeline, std::string>
@@ -592,7 +584,6 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         const int plane_dst_h = (plane == 0) ? out_h : (out_h >> subH);
 
         cfg.src_w = plane_src_w;
-        cfg.src_h = plane_src_h;
         cfg.dst_w = plane_dst_w;
         cfg.dst_h = plane_dst_h;
         cfg.src_stride = src_stride[plane];
@@ -666,7 +657,6 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         cfg.h_grid_y = static_cast<uint32_t>(h_y);
 
         const BoxSpecData spec { .src_w = cfg.src_w,
-                                 .src_h = cfg.src_h,
                                  .dst_w = cfg.dst_w,
                                  .dst_h = cfg.dst_h,
                                  .src_stride = cfg.src_stride,

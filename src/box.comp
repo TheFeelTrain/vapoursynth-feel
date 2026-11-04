@@ -46,15 +46,14 @@
 #define PEAK    1.0f
 #endif
 
-// Full source width and height, the destination dimensions, and the row
-// pitches of the source/destination planes and of the `mid` scratch (which is
-// SRC_W wide, so SRC_STRIDE pitches it).
+// Full source width, the destination dimensions, and the row pitches of the
+// source/destination planes and of the `mid` scratch (which is SRC_W wide, so
+// SRC_STRIDE pitches it).
 layout(constant_id = 0) const int SRC_W = 1920;
-layout(constant_id = 1) const int SRC_H = 1080;
-layout(constant_id = 2) const int DST_W = 960;
-layout(constant_id = 3) const int DST_H = 540;
-layout(constant_id = 4) const int SRC_STRIDE = 1920;
-layout(constant_id = 5) const int DST_STRIDE = 960;
+layout(constant_id = 1) const int DST_W = 960;
+layout(constant_id = 2) const int DST_H = 540;
+layout(constant_id = 3) const int SRC_STRIDE = 1920;
+layout(constant_id = 4) const int DST_STRIDE = 960;
 
 layout(std430, binding = 0) readonly buffer SrcBuf { IO_TYPE src[]; };
 layout(std430, binding = 1) writeonly buffer DstBuf { IO_TYPE dst[]; };

@@ -53,7 +53,9 @@
 #define PEAK    1.0f
 #endif
 
-const int VRT = 3;
+#ifndef VRT
+#define VRT 3
+#endif
 // Workgroup shape and outputs per thread, set per entry by the VK_GAUSS_VARIANTS
 // table in CMakeLists.txt (defaults here are for a standalone glslc). The passes
 // want different ones: the vertical pass reads one column per thread, so a warp

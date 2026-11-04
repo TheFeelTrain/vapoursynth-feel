@@ -86,7 +86,6 @@ struct Eedi3PushConstants {
     int32_t sclip_base;
     int32_t cint_base;
     int32_t vout_base;
-    int32_t pad_stride;
     int32_t pad_height;
     int32_t field;
     int32_t rows;
@@ -111,9 +110,9 @@ struct Eedi3PushConstants {
     int32_t pad_src_pitched;
     int32_t hp_base; // half-pel rows (b8) element base
 };
-// Exactly the guaranteed 128 B of push constants (maxPushConstantsSize is 256
-// on the reference device, but a conformant device may report 128).
-static_assert(sizeof(Eedi3PushConstants) == 32 * sizeof(int32_t),
+// 31 words fit the guaranteed 128 B of push constants (maxPushConstantsSize is
+// 256 on the reference device, but a conformant device may report 128).
+static_assert(sizeof(Eedi3PushConstants) == 31 * sizeof(int32_t),
               "push constants size");
 
 // Row/vcheck specialization block (constant ids 0-5 and the two local sizes,
@@ -162,9 +161,8 @@ struct Eedi3Pipelines {
 // Per-geometry plane description: kernel dims, region offsets into the per
 // frame scratch buffer, and the pipelines that run it.
 struct Eedi3PlaneConfig {
-    int width {};  // kernel plane width (row kernel's WIDTH)
-    int height {}; // kernel plane height
-    int out_w {};  // output (frame order) plane dims
+    int width {}; // kernel plane width (row kernel's WIDTH)
+    int out_w {}; // output (frame order) plane dims
     int out_h {};
     int rows {};             // interp rows == height / 2
     int pad_stride {};       // pad elements per padded row
@@ -737,7 +735,6 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                 pc.src_first = kept_first;
                 pc.src_step = kept_step;
                 pc.pad_base = static_cast<int32_t>(cfg.pad_off / pad_elem);
-                pc.pad_stride = cfg.pad_stride;
                 pc.pad_height = cfg.pad_height;
                 pc.field = field;
                 pc.rows = cfg.rows;
@@ -763,7 +760,6 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
             pc.cint_base = static_cast<int32_t>(cfg.cint_off / scratch);
             pc.vout_base = static_cast<int32_t>(
                 (second ? cfg.vout2_off : cfg.vout_off) / scratch);
-            pc.pad_stride = cfg.pad_stride;
             pc.pad_height = cfg.pad_height;
             pc.field = field;
             pc.rows = cfg.rows;
@@ -793,7 +789,6 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                 const auto & cfg = planes[plane];
                 Eedi3PushConstants pc {};
                 pc.pad_base = static_cast<int32_t>(cfg.pad_off / pad_elem);
-                pc.pad_stride = cfg.pad_stride;
                 pc.field = field;
                 pc.rows = cfg.rows;
                 pc.hp_base = static_cast<int32_t>(cfg.hp_off / hp_elem);
@@ -2548,13 +2543,12 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
                 (plane == 0) ? d->vi->height : d->vi->height >> subH;
             auto & a = d->aplanes[plane];
             a.width = in_h;
-            a.height = in_w;
             a.rows = in_w / 2;
             a.out_w = in_w;
             a.out_h = in_h;
             a.tpitch = tpitch;
             a.pad_stride = (a.width + MARGIN_H * 2 + 15) & ~15;
-            a.pad_height = a.height + MARGIN_V * 2;
+            a.pad_height = in_w + MARGIN_V * 2;
             if (auto e = eedi3_fill_grids(*d->gpu, a)) {
                 return set_error(*e);
             }
@@ -2571,7 +2565,6 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         const int kh =
             d->horiz ? (d->dh ? 2 * in_w : in_w) : (d->dh ? 2 * in_h : in_h);
         cfg.width = kw;
-        cfg.height = kh;
         cfg.rows = kh / 2;
         cfg.out_w = d->horiz ? kh : kw;
         cfg.out_h = d->horiz ? kw : kh;

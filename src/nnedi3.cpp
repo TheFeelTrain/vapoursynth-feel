@@ -1,9 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cfloat>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -12,7 +10,6 @@
 #include <optional>
 #include <span>
 #include <string>
-#include <utility>
 #include <variant>
 #include <vector>
 
@@ -396,7 +393,6 @@ struct Nnedi3Plane {
     VkPipeline keep_pipeline {};
     // Regions of the per-frame scratch buffer (the rejected-pixel list and
     // the indirect dispatch struct), one pair per plane.
-    VkDeviceSize list_offset {};
     VkDeviceSize ind_offset {};
     int32_t list_elem {}; // uint element offsets into the scratch
     int32_t ind_elem {};
@@ -1522,13 +1518,12 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
 
         // Scratch regions: the list holds one uint per field pixel, then this
         // plane's 16-byte indirect struct.
-        cfg.list_offset = align32(list_run);
-        list_run =
-            align32(cfg.list_offset + static_cast<VkDeviceSize>(cfg.width) *
-                                          cfg.rows * sizeof(uint32_t));
+        const VkDeviceSize list_offset = align32(list_run);
+        list_run = align32(list_offset + static_cast<VkDeviceSize>(cfg.width) *
+                                             cfg.rows * sizeof(uint32_t));
         cfg.ind_offset = align32(list_run);
         list_run = align32(cfg.ind_offset + 16);
-        cfg.list_elem = static_cast<int32_t>(cfg.list_offset / 4);
+        cfg.list_elem = static_cast<int32_t>(list_offset / 4);
         cfg.ind_elem = static_cast<int32_t>(cfg.ind_offset / 4);
 
         // The kept-row writer's grid is linearized over x and y, and each
