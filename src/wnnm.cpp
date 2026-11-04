@@ -50,8 +50,8 @@ constexpr int kMaxPsNum = 64;
 // 2*range+1 and the search rectangle well inside int.
 constexpr int kMaxRange = 4096;
 constexpr int kWorkgroup = 128;
-// Threads in the split-matching group kernel: one reference block needs a
-// warp for its Gram rows and its round-robin Jacobi, so the other 96 idle.
+// Fused group kernel threads: one warp per reference block, the measured
+// configuration (the split estimate has its own 128/256-thread kernels).
 constexpr int kGroupThreads = 32;
 // Floats of split-estimate scratch per group: the Gram matrix (64), the
 // per-pixel mean (M floats when residual strips it, otherwise the reserved
@@ -189,8 +189,8 @@ struct WnnmGpuProbe {
     std::atomic<int> armed { 0 };
 };
 
-// The probe slots: one per dispatch, per plane, plus a start and an end.
-constexpr int kProbeSlots = 1 + 3 * 6 + 1;
+// The probe slots: a start stamp and one per recorded phase.
+constexpr int kProbeSlots = 6;
 
 struct GPUWNNM {
     VSNode * node {};
@@ -206,7 +206,6 @@ struct GPUWNNM {
     int planes {};
     std::array<WnnmPlane, 3> plane;
 
-    int patch_elems {}; // bs*bs
     int64_t acc_bytes {}, pmat_bytes {}, locs_bytes {};
     int64_t dist_bytes {}, match_bytes {};
     int addr_elems {}; // address-table entries over all planes
@@ -374,23 +373,23 @@ static WnnmVariant pick_variant(int qmax, bool hw_atomics, bool match_only,
         v.group = wnnm_group_q8_mo_spv;
         v.group_size = sizeof(wnnm_group_q8_mo_spv);
     } else if (qmax == 8 && hw_atomics) {
-        v.group = wnnm_group_q8_spv;
-        v.group_size = sizeof(wnnm_group_q8_spv);
+        v.group = wnnm_group_q8_wg32_spv;
+        v.group_size = sizeof(wnnm_group_q8_wg32_spv);
     } else if (qmax == 8) {
-        v.group = wnnm_group_q8_cas_spv;
-        v.group_size = sizeof(wnnm_group_q8_cas_spv);
+        v.group = wnnm_group_q8_wg32_cas_spv;
+        v.group_size = sizeof(wnnm_group_q8_wg32_cas_spv);
     } else if (qmax == 16 && hw_atomics) {
-        v.group = wnnm_group_q16_spv;
-        v.group_size = sizeof(wnnm_group_q16_spv);
+        v.group = wnnm_group_q16_wg32_spv;
+        v.group_size = sizeof(wnnm_group_q16_wg32_spv);
     } else if (qmax == 16) {
-        v.group = wnnm_group_q16_cas_spv;
-        v.group_size = sizeof(wnnm_group_q16_cas_spv);
+        v.group = wnnm_group_q16_wg32_cas_spv;
+        v.group_size = sizeof(wnnm_group_q16_wg32_cas_spv);
     } else if (hw_atomics) {
-        v.group = wnnm_group_q32_spv;
-        v.group_size = sizeof(wnnm_group_q32_spv);
+        v.group = wnnm_group_q32_wg32_spv;
+        v.group_size = sizeof(wnnm_group_q32_wg32_spv);
     } else {
-        v.group = wnnm_group_q32_cas_spv;
-        v.group_size = sizeof(wnnm_group_q32_cas_spv);
+        v.group = wnnm_group_q32_wg32_cas_spv;
+        v.group_size = sizeof(wnnm_group_q32_wg32_cas_spv);
     }
     return v;
 }
@@ -1398,7 +1397,6 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     d->bs = bs;
     d->step = step;
     d->gs = gs;
-    d->patch_elems = m;
     d->q = std::min(m, gs);
 
     int bm = vsh::int64ToIntS(vsapi->mapGetInt(in, "bm_range", 0, &error));
@@ -1606,6 +1604,50 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                        "increase block_step or reduce the frame size";
             }
             pl.ng = static_cast<int>(ng64);
+            // The select/Gram/solve/apply dispatches are 1D and index only X,
+            // so their workgroup count has no Y fold and must be checked here.
+            if (d->split_match && !d->skip_group) {
+                const uint64_t max_x =
+                    d->gpu->limits.maxComputeWorkGroupCount[0];
+                const uint64_t slots = uint64_t(pl.ng) * uint64_t(pl.folds);
+                const auto check_grid = [&](uint64_t grid,
+                                            const char * what) -> std::string {
+                    if (grid <= max_x) {
+                        return {};
+                    }
+                    return "plane " + std::to_string(p) + "'s " + what +
+                           " grid needs " + std::to_string(grid) +
+                           " workgroups, more than this device can dispatch (" +
+                           std::to_string(max_x) +
+                           "); increase block_step or reduce the frame size";
+                };
+                if (pl.radius == 0) {
+                    if (auto e = check_grid((uint64_t(pl.ng) + kWorkgroup - 1) /
+                                                kWorkgroup,
+                                            "WNNM select");
+                        !e.empty()) {
+                        return e;
+                    }
+                }
+                if (!d->skip_gram) {
+                    if (auto e = check_grid((slots + 15) / 16, "WNNM Gram");
+                        !e.empty()) {
+                        return e;
+                    }
+                }
+                if (!d->skip_solve) {
+                    if (auto e = check_grid((slots + 255) / 256, "WNNM solve");
+                        !e.empty()) {
+                        return e;
+                    }
+                }
+                if (!d->skip_apply) {
+                    if (auto e = check_grid((slots + 15) / 16, "WNNM apply");
+                        !e.empty()) {
+                        return e;
+                    }
+                }
+            }
             if (pl.radius == 0) {
                 const int stride = std::min(2 * d->bm_range + 1, temp_r + 1) *
                                    std::min(2 * d->bm_range + 1, temp_c + 1);
@@ -1647,7 +1689,9 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                     std::min<int64_t>(int64_t(centers) * rect,
                                       int64_t(temp_c + 1) * (temp_r + 1));
             } else {
-                pl.locs_elems = int64_t(pl.ng);
+                // The spatial path never reads the temporal search-location
+                // list; bind a dummy rather than allocating it.
+                pl.locs_elems = 0;
             }
             // Bases are element offsets (the kernels index float/uint arrays), kept
             // 32-byte aligned so every plane region starts on a cache-line boundary.
@@ -2075,7 +2119,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             // The group kernel's LDS footprint is a function of qmax, bs and
             // the estimate path; gpu_create_pipeline checks it against the
             // device.
-            const GpuWorkgroup wg { .x = uint32_t(kWorkgroup),
+            const GpuWorkgroup wg { .x = uint32_t(kGroupThreads),
                                     .shared_bytes = group_shared_bytes(
                                         qmax, d->bs, d->gs, false) };
             pl.group_pipe = add(tag, variant.group, variant.group_size, wg);

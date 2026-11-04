@@ -78,6 +78,8 @@ def build(name, params):
         return core.vsfeel.GaussBlur(clip, sigma=2.0)
     if name == "wnnm_u16":
         return core.vsfeel.WNNM(clip16, sigma=3.0, radius=0)
+    if name == "wnnm":
+        return core.vsfeel.WNNM(clip, sigma=3.0, radius=0, **params)
     if name == "box":
         return core.vsfeel.Box(clip)
     raise SystemExit("unknown filter %r" % name)
@@ -532,6 +534,20 @@ def test_nnedi3_scratch_range_is_a_creation_error():
     err = res["nnedi3"].get("error", "")
     assert "per-frame scratch" in err and "maxStorageBufferRange" in err, res["nnedi3"]
     assert str(2 << 20) in err, res["nnedi3"]
+
+
+def test_wnnm_select_and_estimate_grid_overflow_is_reported():
+    """The 1D WNNM phases cannot fold into Y, so creation must reject them.
+
+    With X forced to 4 the group grid still folds, but the select/Gram/apply
+    grids do not; leaving them to dispatch would silently leave work unwritten.
+    """
+    res = _run_limits(
+        [{"label": "wnnm", "filter": "wnnm"}],
+        {"VSFEEL_LIMIT_GRID_X": "4"},
+    )
+    err = res["wnnm"].get("error", "")
+    assert "WNNM" in err and "workgroups" in err, res["wnnm"]
 
 
 def test_push_descriptor_limit_is_reported():

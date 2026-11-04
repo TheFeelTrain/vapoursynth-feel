@@ -402,12 +402,14 @@ list(APPEND VK_NNEDI3_VARIANTS
 # 8/16/32) and per eigen precision (f64 as the reference, f32 for devices
 # without shaderFloat64), plus the flat num/den finish kernel. NO_FLOAT_ATOMICS
 # is a second arm of the group kernel for devices without buffer float atomics.
+# The fused group arm is also built at 32 threads (the measured configuration);
+# the temporal matcher's MATCH_ONLY variant already uses that shape.
 set(VK_WNNM_QMAX 8 16 32)
 set(VK_WNNM_VARIANTS)
 foreach(qmax IN LISTS VK_WNNM_QMAX)
     list(APPEND VK_WNNM_VARIANTS
-        "wnnm_group_q${qmax}|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax}"
-        "wnnm_group_q${qmax}_cas|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DNO_FLOAT_ATOMICS")
+        "wnnm_group_q${qmax}_wg32|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DWG=32"
+        "wnnm_group_q${qmax}_wg32_cas|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DWG=32 -DNO_FLOAT_ATOMICS")
 endforeach()
 list(APPEND VK_WNNM_VARIANTS
     "wnnm_finish|wnnm.comp|-DENTRY_FINISH"

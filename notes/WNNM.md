@@ -1,6 +1,6 @@
 # WNNM — notes
 
-Status: **iterating** (2026-10-25 review). Port of `reference/vapoursynth-zip`
+Status: **shipped** (performance work continues). Port of `reference/vapoursynth-zip`
 (`src/filters/wnnm.zig`, `src/vapoursynth/wnnm.zig`); vszipcl/vszipcu never had a
 GPU WNNM. Everything is
 **f32**: the estimate is a three-kernel split (Gram, eigen step, scatter), the
@@ -89,7 +89,7 @@ The port is f32 end to end; there is no f64 path any more.
   match buffer, while the temporal planes use the ring; every dispatch binds
   that plane's buffer, so the two never share a record slot.
 - **Native 16-bit transport**: a u16/f16 clip's processed planes are widened
-  into a persistent device-local ring of `4*Rmax+3` slots, one per frame of the
+  into a persistent device-local ring of `4*Rmax+2` slots, one per frame of the
   widest plane's window plus one; each plane copies only its own window, and the
   address table points at those slots; the source ring keeps the source's
   *sample* stride, so each copy is one linear range and the kernels' `STRIDE` is
@@ -141,9 +141,8 @@ The port is f32 end to end; there is no f64 path any more.
     block gets its own stride instead of overrunning a fixed one. It is the same
     per-frame buffer the fused path uses for its patch matrix.
 - **Fused path** (`group_size > 8`), one workgroup per group:
-  streaming top-k match, Gram, the reference's round-robin parallel Jacobi in
-  f32 (mechanism from
-  `reference/vapoursynth-nssfactory/src/cuda/common/block_jacobi.cuh`), shrink,
+  streaming top-k match, Gram, nssfactory's round-robin parallel Jacobi in f32
+  (vszip's own Jacobi is a serial row-major sweep), shrink,
   `V diag(r) V^T`, scatter. Odd `q` takes the reference's serial rotation order:
   the padded round-robin does not converge.
 - `residual` subtracts each pixel's mean over the group (sequential f32 sum,
@@ -161,7 +160,7 @@ The port is f32 end to end; there is no f64 path any more.
 The f32 estimate reproduces vszip's f64 *decisions* except where an eigenvalue
 sits within ~1e-5 of the shrink threshold, which happens on ~0.2% of groups and
 moves the affected pixels by up to 1.4e-2 (typically ~3e-3). That is a deliberate
-trade for 13.5x on the whole frame, and the bound is documented in the tests
+trade for 13.5x on the estimate, and the bound is documented in the tests
 (`REF_TOL`). The default-parameter error against an f64 exact-SVD oracle is
 3.1e-5 with 47 bad pixels at 640x360, i.e. 150x closer than the nssfactory CPU
 reference (4.7e-3, 889 bad); `REF_TOL` keeps both references' own spread visible.
@@ -506,12 +505,12 @@ staying a bit-exact copy and the request orders on both.
   its 64 pixels from global (the reference block is already staged). The
   spatial pass could stage its window like `ENTRY_DIST` does, but `win` costs
   4 KB of the LDS that the occupancy depends on.
-- **The spatial matcher is still ~40% of its frame (~0.33 ms).** Its SSDs read both
-  patches from LDS but the *reference* block is re-read for every candidate, and
-  the 225 distances per group go out to a 52 MB array and come back. The shape
-  that removes both (nssfactory `match.cu`, `spatial_match_warp_kernel`) is one
-  warp per reference, the reference block in registers, the top-K by warp-wide
-  argmin and no distance array at all.
+- **The spatial matcher is still ~40% of its frame (~0.33 ms in the pre-cache
+  profile).** Its SSDs read both patches from LDS but the *reference* block is
+  re-read for every candidate, and the 225 distances per group go out to a
+  52 MB array and come back. The shape that removes both (nssfactory `match.cu`,
+  `spatial_match_warp_kernel`) is one warp per reference, the reference block in
+  registers, the top-K by warp-wide argmin and no distance array at all.
 - `group_size > 8` (or `NOSPLIT`) takes the fused f32 kernel, which is correct
   but slower than the split estimate. Porting the split estimate to `q = 16/32`
   needs a different eigen step: 16x16 f32 no longer fits in registers
@@ -539,8 +538,7 @@ staying a bit-exact copy and the request orders on both.
   Gram, solve, apply and finish dispatches of that frame, printed to stderr.
   Feed the filter device-resident frames or the number is the upload.
 - `VSFEEL_WNNM_NOSPLIT=1` - take the fused kernel for the split path's configs
-  too (the `group_size > 8` code path); it is the workaround for the split
-  `residual` and `win` paths.
+  too (the `group_size > 8` code path).
 - `VSFEEL_WNNM_SKIPMATCH=1` / `VSFEEL_WNNM_SKIPGROUP=1` - ablations: skip the
   match phase or the estimate phase (output is garbage, timing only).
 - `VSFEEL_WNNM_NOGRAM=1` / `VSFEEL_WNNM_NOSOLVE=1` / `VSFEEL_WNNM_NOAPPLY=1` -
