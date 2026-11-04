@@ -5,12 +5,14 @@ Status: **shipped** — `core.vsfeel.EEDI3AA` (`Eedi3AaCreate`, `src/eedi3.cpp`)
 `Merge(H(Merge(V(x))))` in **one plugin call, one submit**, both 50/50 merges
 folded into the kernels. Runs on the R80 GPU API (`vnode:gpu` in/out, one exec
 pool) and batches output frames per submission like `EEDI3` (see
-`notes/EEDI3.md`); `field`, `mdis`, `nrad` and `vcheck` are unchanged. Bit-exact vs the two-call chain for u16 and f16, a few ulp for
-f32. Specialised `dh=false`, `field>1`, single-rate. The `vsfeel/vsaa.py`
-wrapper, the `eedi3aa` benchmark entry (1000 f, ns=8) and `tests/test_eedi3aa.py`
-ship.
+`notes/EEDI3.md`); `field`, `mdis`, `nrad` and `vcheck` are unchanged. Bit-exact
+vs the two-call chain for u16, f16 and f32. Specialised `dh=false`, `field>1`,
+single-rate. The `vsfeel/vsaa.py` wrapper, the `eedi3aa` benchmark entry and
+`tests/test_eedi3aa.py` ship.
 
-Scoreboard — real based_aa clip (jpbd 2x Point → 3840x2160, 1000 f,
+Scoreboard — real based_aa clip (jpbd 2x Point → 3840x2160; the table is a
+pre-wall-clock 1000 f/ns=8 session, medians of 3; the current harness uses
+`--seconds` and the ratios are the part to quote):
 `tools/benchmark.py --filter eedi3aa --format <u16|f16|f32>` (the default
 device-resident, resident-output mode), medians of 3):
 
@@ -39,8 +41,9 @@ Measured, not assumed — do not re-derive from intuition.
 
 - **`std.Merge(a,b)` weight 0.5** (`.scratch/merge_semantics.py`, random GRAY16, 512
   samples): u16 `(a+b+1)>>1` (0 mismatches; `(a+b)>>1` 263 wrong, half-even
-  131); f32 `0.5f*a + 0.5f*b` bitwise. The fused merge is **integer u16, after**
-  the vcheck's quantisation.
+  131); f32 `v1 + (v2 - v1) * 0.5` bitwise. The fused merge is **integer u16,
+  after** the vcheck's quantisation; the f32 arms use the reference expression
+  with the chain's operand order, so f32 is bit-exact too.
 - **Parity** (`Eedi3GetFrame`'s `field`, `Eedi3AaGetFrame`'s `base`/`fh0`):
   `field = d->field & 1`, overridden by the frame's `_FieldBased` (TOP→1,
   BOTTOM→0), then `(n&1) ^ field`. Vertical sub-frames take the input's
@@ -64,24 +67,26 @@ Measured, not assumed — do not re-derive from intuition.
   `ENTRY_ASSEMBLEV`/`ENTRY_COMPOSE` in `src/eedi3.comp`, the `comp_fuse` arms in
   the compose entry point.
 - `record_pass(d, cmd, jobs, njobs, phase)` over `PassPhase`
-  `kPrep`/`kRow`/`kVcheck`/`kTail`; one `Eedi3Job` per frame per sub-pass
+  `kPrep`/`kHp`/`kRow`/`kVcheck`/`kTail`; one `Eedi3Job` per frame per sub-pass
   (`Eedi3Job`/`PassPhase`/`record_pass`, `src/eedi3.cpp`).
 - `Eedi3AaGetFrame`: one exec context and one CB for the whole batch. Four
   sub-pass groups run in order — vertical v0, vertical v1 (`kAssembleV`),
-  horizontal h0, horizontal h1 (`kCompose`) — each `kPrep` → barrier → `kRow` →
-  barrier → `kVcheck` → barrier → `kTail`, with a barrier between groups
-  (`Eedi3AaGetFrame`'s four-sub-pass loop). All four share the frame's one
-  scratch buffer (the `GpuBuffer scratch` in `Eedi3AaGetFrame`); the vertical
-  merge writes the intermediate `v` into the scratch's `v` region and the
-  horizontal pass reads it from there, so nothing is gathered to the host and
+  horizontal h0, horizontal h1 (`kCompose`) — each `kPrep` → barrier → (`kHp` →
+  barrier when `hp`) → `kRow` → barrier → `kVcheck` → barrier → `kTail`, with a
+  barrier between groups (`Eedi3AaGetFrame`'s four-sub-pass loop). All four share
+  the frame's one scratch buffer (the `GpuBuffer scratch` in
+  `Eedi3AaGetFrame`); the vertical merge writes the intermediate `v` into the
+  scratch's `v` region and the horizontal pass reads it from there, so nothing is
+  gathered to the host and
   there is no CPU blit.
 - Output is `newGPUVideoFrame` when every plane is processed, else
   `newVideoFrame2` sharing the unprocessed planes from the source
   (`Eedi3AaGetFrame`).
-- The scratch is filled with 0 once per submission so a pass reading a region it
-  never wrote gets the benign value; `VSFEEL_EEDI3_NOCLEAR=1` opts out and
-  `VSFEEL_EEDI3_POISON` overlays a chosen pattern (`eedi3_fill_scratch` /
-  `eedi3_poison_scratch`, called from `Eedi3AaGetFrame`).
+- The scratch is allocated and filled with 0 once per frame (the batch loop calls
+  `Eedi3AaGetFrame` per frame), so a pass reading a region it never wrote gets
+  the benign value; `VSFEEL_EEDI3_NOCLEAR=1` opts out and `VSFEEL_EEDI3_POISON`
+  overlays a chosen pattern (`eedi3_fill_scratch` / `eedi3_poison_scratch`,
+  called from `Eedi3AaGetFrame`).
 - `vsfeel_eedi3_create` `aa` mode: vertical geometry in `planes`, horizontal (the
   transpose) in `aplanes`, sized up front for the larger of the two; every region
   the two geometries share is placed once at `max(V, H)` and they alias it
@@ -187,6 +192,10 @@ progressive) vs the chain; input validation.
 forwarded parameters the plugin does not declare).
 
 ## Performance
+
+The `ns=` and frame-count configs in this section predate the wall-clock
+harness; current `tools/benchmark.py` runs use `--seconds`, so quote the ratios
+and the mechanisms, not those absolute frame counts.
 
 **Absolute fps is state-dependent; the table is one session's medians.** The same
 build has measured 161 to 198 fps on this workload with *identical* GPU work (two
@@ -295,16 +304,18 @@ under-reported every stage 10x).
   interleaved reps (within-arm spread 1.3%): fused 98.2 → 150.4 fps with the row
   kernel deleted, but that arm leaves `dmap` stale so vcheck takes its cheap
   `dirc == 0` branch; the faithful ablation (`PROBE=12`, real dmap) is ~1.25x.
-- **The LDS vcheck IS engaged at the benchmark width**: gate is
+- **The LDS vcheck is not selected by default**: the gate is
   `p.vcheck_lds = !p.vcheck_para && want_lds && d->have_lds && key.width <= MAXW_LDS`,
-  `MAXW_LDS` (`src/eedi3.cpp`, from `-DEEDI3_MAXW_LDS`) — a **column count**, not
-  bytes; 3840 ≤ 4096. `ENTRY_VCHECK` nonetheless defaults to the global-read
-  (empty-row-skipping) form (`VSFEEL_EEDI3_VCLDS=1` restores the LDS ping-pong),
-  and the two horizontal planes are 50/50-merged inside `ENTRY_COMPOSE` in VRAM
-  (vcheck 0 falls back). Together, round 6: fused 89.7 → 108.8 fps (1200 f × 4
-  order-reversed reps), bit-exact vs the old path (30 real 4K frames, 497 MB/arm
-  byte-identical); `benchmark.py --filter eedi3aa` then measured ~121 fps at ns=8
-  (vszipcl 48.6, eedi3vk2 36.2).
+  and `VPARA` defaults to 6, so `vcheck_para` is true and the LDS ping-pong is
+  off. `VSFEEL_EEDI3_VCLDS=1` together with `VSFEEL_EEDI3_VPARA=0` selects it;
+  `MAXW_LDS` (`src/eedi3.cpp`, from `-DEEDI3_MAXW_LDS`) is a **column count**,
+  not bytes (3840 ≤ 4096). `ENTRY_VCHECK` otherwise uses the global-read
+  (empty-row-skipping) form, and the two horizontal planes are 50/50-merged
+  inside `ENTRY_COMPOSE` in VRAM (vcheck 0 falls back). Together, round 6:
+  fused 89.7 → 108.8 fps (pre-wall-clock 1200 f × 4 order-reversed reps),
+  bit-exact vs the old path (30 real 4K frames, 497 MB/arm byte-identical);
+  `benchmark.py --filter eedi3aa` then measured ~121 fps at ns=8 (vszipcl 48.6,
+  eedi3vk2 36.2).
 - **Dead end — GPU K compaction (`ENTRY_ASSEMBLEK`).** One kernel merging
   src+vout *and* emitting both compacted column matrices was **bit-exact for
   luma but left every chroma plane untouched by the dispatch**, in ReBAR and

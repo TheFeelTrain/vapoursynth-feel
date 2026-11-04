@@ -16,12 +16,9 @@ Agreement measured on the committed noise clip (640x360, 24 frames):
   mclip present/absent, aliased and non-aliased sclip, ``_FieldBased``
   progressive/TFF/BFF input, YUV420 (all planes and luma-only) and every
   tested frame.
-* f32 (GRAYS): within a few ulp of the chain (measured max 5.96e-8 absolute
-  on the 0..1 float clip, ~1 ulp on the values involved). The residual is
-  rounding-order: the chain averages two *materialised* f32 frames with two
-  roundings while the fused kernels average in place; the merge formula is
-  identical (``0.5*a + 0.5*b``). Bound used below: 1e-6, the repo's
-  ulp-level float32 tier.
+* f32 (GRAYS): max diff **0** (bit-exact) across the same surface. The fused
+  arms use `std.Merge`'s own `v1 + (v2 - v1) * 0.5` expression with the
+  chain's operand order, so no merge-rounding residual remains.
 
 Self-consistency (determinism across runs, multi-stream == single stream,
 parallel load) is exact. The chain's props (N frames, input fps,
@@ -48,8 +45,8 @@ from conftest import (
 
 pytestmark = pytest.mark.usefixtures("clip_grays")
 
-# Tolerance for f32: measured 5.96e-8 (a few ulp); the repo's ulp-level tier.
-F32_TOL = 1e-6
+# f32 is exact after matching std.Merge's v1 + (v2-v1)*0.5 expression.
+F32_TOL = 0.0
 
 # Mask-plane formats the mclip sweep builds: u16 is GRAY16, f32 is GRAYS.
 _MASK_BITS = {"gray8": 8, "gray16": 16, "grays": 32}
@@ -221,7 +218,7 @@ ORACLE_CASES_F32 = [
     "kw", ORACLE_CASES_F32, ids=[f"case{i}" for i in range(len(ORACLE_CASES_F32))]
 )
 def test_eedi3aa_oracle_f32(clip_grays, kw, mc, sc):
-    """f32 EEDI3AA == the chain within a few ulp (documented F32_TOL)."""
+    """f32 EEDI3AA == the two-call based_aa chain, bit-exactly."""
     clip = clip_grays
     mclip = None if mc == "none" else _mask(clip, _MASK_BITS[mc])
     sclip = {"none": None, "alias": _interleave2(clip), "distinct": _interleave_distinct(clip)}[sc]
@@ -355,7 +352,7 @@ def test_eedi3aa_deterministic(clip_grays, clip_gray16, bits):
         if bits == 16:
             assert np.array_equal(fa, fb), f"nondeterministic output at frame {n}"
         else:
-            assert np.abs(fa - fb).max() < F32_TOL
+            assert np.array_equal(fa, fb), f"nondeterministic f32 output at frame {n}"
 
 
 def test_eedi3aa_parallel_load_consistent(clip_gray16):

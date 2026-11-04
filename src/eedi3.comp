@@ -2295,10 +2295,11 @@ layout(local_size_x = 16, local_size_y = 16) in;
 shared SHARED_T compV[16][17];
 shared SHARED_T compR[16][17];
 
-// std.Merge's default 50/50. u16 is (a+b+1)>>1 (== _mm256_avg_epu16), f32 is
-// 0.5f*a + 0.5f*b in the same association order the CPU merge used. f16's
-// chain merges two *half* frames, so the new sub-pass's value is rounded to
-// half first and the reference's v1 + (v2 - v1) * 0.5 then rounds once more.
+// std.Merge's default 50/50. u16 is (a+b+1)>>1 (== _mm256_avg_epu16); f32
+// uses the reference's v1 + (v2 - v1) * 0.5 expression, not 0.5a+0.5b (they
+// differ by one ulp at some inputs). f16's chain merges two *half* frames, so
+// the new sub-pass's value is rounded to half first and the reference's
+// v1 + (v2 - v1) * 0.5 then rounds once more.
 SHARED_T merge_avg(const SHARED_T a, const SHARED_T b) {
 #if defined(IO_U16)
     return (a + b + 1u) >> 1;
@@ -2306,7 +2307,7 @@ SHARED_T merge_avg(const SHARED_T a, const SHARED_T b) {
     const SHARED_T bh = SHARED_T(half_rne(b));
     return half_rne(a + (bh - a) * 0.5f);
 #else
-    return 0.5f * a + 0.5f * b;
+    return a + (b - a) * 0.5f;
 #endif
 }
 
@@ -2352,8 +2353,8 @@ void main() {
             } else if (pc.comp_fuse == 2) {
                 // Second AA horizontal sub-pass: O_1 is assembled here and
                 // averaged 50/50 with O_0 (in cdst) exactly like std.Merge's
-                // u16 (a+b+1)>>1 / f32 0.5a+0.5b, then written straight into
-                // the output frame.
+                // u16 (a+b+1)>>1 / f32 a + (b-a)*0.5, then written straight
+                // into the output frame.
                 cout2[o + pc.field] = IO_TYPE(merge_avg(
                     SHARED_T(cdst[pc.out_base + o0 + pc.field]), compV[tx][ty]));
                 cout2[o + (1 - pc.field)] = IO_TYPE(merge_avg(
@@ -2405,7 +2406,14 @@ void main() {
         (p == pc.field) ? v + (s - v) * 0.5f : s + (v - s) * 0.5f;
     asm_out[pc.out_base + int(idx)] = IO_TYPE(half_rne(res));
 #else
-    asm_out[pc.out_base + int(idx)] = 0.5f * asm_src[i] + 0.5f * asm_vout[j];
+    // std.Merge's f32 expression. The row's other sub-pass is a kept row
+    // (the source); which operand comes first follows the chain's
+    // Merge(V0, V1) order, as in the f16 arm above.
+    const float s = asm_src[i];
+    const float v = asm_vout[j];
+    const float res =
+        (p == pc.field) ? v + (s - v) * 0.5f : s + (v - s) * 0.5f;
+    asm_out[pc.out_base + int(idx)] = IO_TYPE(res);
 #endif
 }
 
