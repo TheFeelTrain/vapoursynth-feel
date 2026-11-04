@@ -105,9 +105,9 @@ etype=0 pscrn=4`), 5000 frames, medians of 3 through `tools/benchmark.py`:
   (`newGPUVideoFrame`, or `newVideoFrame2` sharing unprocessed planes —
   **always fresh under `dh`**, since the keep kernel expands them there) →
   parity from `_Field`/`_FieldBased`/`field` (double-rate flips on odd `n`) →
-  acquire, transient scratch (list mode only), record per plane: keep →
-  fill the indirect struct `{0,1,1,0}` → transfer→compute barrier →
-  prescreen → compute→(compute|indirect) barrier → indirect predict →
+  acquire, transient scratch (list mode only), batch every plane's indirect
+  fill `{0,1,1,0}` behind one transfer→compute barrier, record per plane:
+  keep → prescreen → compute→(compute|indirect) barrier → indirect predict →
   declare reads/writes → submit → props (`_FieldBased=0`, `_Field` deleted,
   `field>1` halves duration). Plane regions are disjoint, so nothing else is
   ordered. `dh=True` requires every plane to be processed; a subset is a
@@ -117,10 +117,10 @@ etype=0 pscrn=4`), 5000 frames, medians of 3 through `tools/benchmark.py`:
   tails); predict indirect off the prescreen count (prescreen keeps `groupsX`
   via `atomicMax` off its `atomicAdd` — no count kernel); direct grid
   `ceil(width*rows/(4*PXP))` for pscrn=0; keep grid linearized over x and y
-  (`ID.y * groups.x * 256 + ID.x`) so a 4K double-rate plane stays under the
-  65535-group x limit.
-- Pipelines deduplicated per `{width, rows, pscrn, xdim, ydim, nns, qual,
-  zero}`; predict module by the shader's own rule (PXP=8 when
+  (`ID.y * groups.x * 1024 + ID.x`), with four samples per thread, so a 4K
+  double-rate plane stays under the 65535-group x limit.
+- Pipelines deduplicated per `{width, rows, pscrn, xdim, ydim, nns, qual}`;
+  predict module by the shader's own rule (PXP=8 when
   `ceil(nns/32)<=2 && fs<=128`, PXP=4 small-tile `SHSTRIDE=64` when `fs<=64`,
   PXP=4 otherwise; the packed half module is always PX=4). Prescreen/predict
   ask 32-lane full subgroups; the keep writer takes the driver's default.

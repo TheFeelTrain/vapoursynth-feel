@@ -714,6 +714,22 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
             cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, d->probe.query, 0);
     }
 
+    // Reset every processed plane's indirect struct to
+    // {groupsX, groupsY, groupsZ, count} = {0, 1, 1, 0} in one transfer batch;
+    // the regions are disjoint, so one barrier covers them all.
+    if (d->use_list) {
+        for (int p = 0; p < numPlanes; ++p) {
+            if (!d->process[p]) {
+                continue;
+            }
+            const VkDeviceSize base = d->planes[p].ind_offset;
+            d->gpu->vk->vkCmdFillBuffer(cmd, scratch.buffer, base + 0, 4, 0);
+            d->gpu->vk->vkCmdFillBuffer(cmd, scratch.buffer, base + 4, 8, 1);
+            d->gpu->vk->vkCmdFillBuffer(cmd, scratch.buffer, base + 12, 4, 0);
+        }
+        barrier_transfer_to_compute(*d->gpu, cmd);
+    }
+
     // Plane dispatches touch disjoint buffers (and disjoint scratch regions),
     // so no barrier separates them; only the two stages of one list-mode plane
     // are ordered.
@@ -775,15 +791,6 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
                                     d->gpu->limits.maxComputeWorkGroupCount[0],
                                     INT32_MAX)) };
         if (d->use_list) {
-            // Reset this plane's indirect struct to {groupsX, groupsY,
-            // groupsZ, count} = {0, 1, 1, 0}: prescreen bumps the count and
-            // the groupsX with atomics every frame.
-            const VkDeviceSize base = cfg.ind_offset;
-            d->gpu->vk->vkCmdFillBuffer(cmd, scratch.buffer, base + 0, 4, 0);
-            d->gpu->vk->vkCmdFillBuffer(cmd, scratch.buffer, base + 4, 8, 1);
-            d->gpu->vk->vkCmdFillBuffer(cmd, scratch.buffer, base + 12, 4, 0);
-            barrier_transfer_to_compute(*d->gpu, cmd);
-
             // Prescreen: cubic stores into the output plane plus rejected-pixel
             // compaction into the list.
             gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push,
@@ -1511,15 +1518,18 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         cfg.list_elem = static_cast<int32_t>(cfg.list_offset / 4);
         cfg.ind_elem = static_cast<int32_t>(cfg.ind_offset / 4);
 
-        // The kept-row writer's grid is linearized over x and y, so a 4K
+        // The kept-row writer's grid is linearized over x and y, and each
+        // 256-thread workgroup covers 1024 samples (four per thread), so a 4K
         // double-rate plane stays under the 65535-group x limit.
         {
             const int64_t total = static_cast<int64_t>(cfg.rows) * cfg.width;
-            const int64_t gx =
-                std::clamp<int64_t>((total + 255) / 256, 1, max_grid_x);
+            const int64_t per_group = 256 * 4;
+            const int64_t gx = std::clamp<int64_t>(
+                (total + per_group - 1) / per_group, 1, max_grid_x);
             cfg.keep_grid_x = static_cast<uint32_t>(gx);
             cfg.keep_grid_y = static_cast<uint32_t>(std::clamp<int64_t>(
-                (total + 256 * gx - 1) / (256 * gx), 1, max_grid_y));
+                (total + per_group * gx - 1) / (per_group * gx), 1,
+                max_grid_y));
         }
 
         int ki = 0;

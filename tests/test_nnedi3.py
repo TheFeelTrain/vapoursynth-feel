@@ -115,6 +115,9 @@ REFERENCE_CASES_U16 = [
     {"nsize": 5},
     {"nns": 1},
     {"nns": 3},
+    # n4s: 48/64-pixel nets with nns=256 select the 4 KiB predictor tile
+    {"nsize": 0, "nns": 4},
+    {"nsize": 5, "nns": 4},
 ]
 
 
@@ -172,6 +175,8 @@ REFERENCE_CASES_F32 = [
     {"etype": 1},
     {"nsize": 0},
     {"nns": 4},
+    {"nsize": 0, "nns": 4},
+    {"nsize": 5, "nns": 4},
     {"field": 0},
     # float-path gaps: field 2/3 and dh (u16 only before)
     {"field": 2},
@@ -469,9 +474,13 @@ def test_nnedi3_deterministic(clip_grays, clip_gray16, bits):
 
 
 def test_nnedi3_parallel_load_consistent(clip_gray16):
-    expect = _plane(_run(clip_gray16).get_frame(5), 0)
+    ref = _run(clip_gray16)
     got = eval_parallel(_run, clip_gray16)
-    assert np.abs(got[5].astype(np.int32) - expect.astype(np.int32)).max() == 0
+    for n in range(clip_gray16.num_frames):
+        expect = _plane(ref.get_frame(n), 0)
+        assert np.abs(got[n].astype(np.int32) - expect.astype(np.int32)).max() == 0, (
+            f"parallel/serial mismatch at frame {n}"
+        )
 
 
 def test_nnedi3_f16_deterministic(clip_grayh):
@@ -487,9 +496,13 @@ def test_nnedi3_f16_deterministic(clip_grayh):
 def test_nnedi3_f16_parallel_load_consistent(clip_grayh):
     """The packed half kernel's shared tile and subgroup reductions must not
     depend on how many frames are in flight."""
-    expect = _plane(_run(clip_grayh).get_frame(5), 0)
+    ref = _run(clip_grayh)
     got = eval_parallel(_run, clip_grayh)
-    assert np.abs(got[5].astype(np.float64) - expect.astype(np.float64)).max() == 0
+    for n in range(clip_grayh.num_frames):
+        expect = _plane(ref.get_frame(n), 0)
+        assert np.abs(got[n].astype(np.float64) - expect.astype(np.float64)).max() == 0, (
+            f"f16 parallel/serial mismatch at frame {n}"
+        )
 
 
 # ---------------------------------------------------------------------------

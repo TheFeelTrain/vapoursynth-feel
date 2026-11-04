@@ -318,7 +318,10 @@ void main() {
     // per predict workgroup (PXP rule mirrors ENTRY_PREDICT).
     const uint total = subgroupAdd(uint(cnt));
     uint base = 0u;
-    if (subgroupElect() && total > 0u) {
+    // subgroupElect() is implementation-defined; elect the first active lane
+    // explicitly so the atomic reservation and the broadcast cannot disagree.
+    const uint leader = subgroupBroadcastFirst(gl_SubgroupInvocationID);
+    if (gl_SubgroupInvocationID == leader && total > 0u) {
         base = atomicAdd(indBuf[pc.d_base + 3], total);
 #if defined(PRED16)
         // The packed predictor is always 4 pixels per subgroup.
@@ -679,25 +682,31 @@ void main() {
 #elif defined(ENTRY_KEEP)
 
 // Kept-row writer: output rows of parity pc.parity are copies of their source
-// row (identity when dh=0, the field row when dh=1).
+// row (identity when dh=0, the field row when dh=1). Four samples per thread,
+// so the 256-thread launch covers a 1K-element block; the host grid uses the
+// same 4x factor.
 //
-// The grid is linearized across x and y (i = ID.y * groups.x * 256 + ID.x),
+// The grid is linearized across x and y (i = ID.y * groups.x * 1024 + ID.x),
 // which keeps a 4K double-rate plane (16.6M pixels) under the guaranteed
 // 65535 workgroup limit in x.
 layout(local_size_x = 256, local_size_y = 1) in;
 
 void main() {
-    const int per_group = int(gl_NumWorkGroups.x) * 256;
-    const int i = int(gl_GlobalInvocationID.y) * per_group +
-                  int(gl_GlobalInvocationID.x);
+    const int per_group = int(gl_NumWorkGroups.x) * 1024;
+    const int base = int(gl_GlobalInvocationID.y) * per_group +
+                     int(gl_WorkGroupID.x) * 1024 +
+                     int(gl_LocalInvocationIndex);
     const int total = ROWS * WIDTH;
-    if (i >= total)
-        return;
-    const int x = i % WIDTH;
-    const int r = i / WIDTH;
-    const int y = 2 * r + pc.parity;
-    const int sy = (DH != 0) ? r : y;
-    dstBuf[y * pc.dst_stride + x] = fieldBuf[sy * pc.src_stride + x];
+    for (int j = 0; j < 4; ++j) {
+        const int i = base + j * 256;
+        if (i >= total)
+            break;
+        const int x = i % WIDTH;
+        const int r = i / WIDTH;
+        const int y = 2 * r + pc.parity;
+        const int sy = (DH != 0) ? r : y;
+        dstBuf[y * pc.dst_stride + x] = fieldBuf[sy * pc.src_stride + x];
+    }
 }
 
 #endif

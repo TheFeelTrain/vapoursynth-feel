@@ -22,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - EEDI3, EEDI3H, EEDI3AA, and NNEDI3 remove stale `_Field` tags from progressive output
 - EEDI3AA's fp32 output is bit-exact with the EEDI3/EEDI3H chain it fuses
 - NNEDI3 rejects `dh=True` with a `planes` subset instead of writing zero rows into the unprocessed planes
+- NNEDI3's rejected-pixel compaction no longer relies on a driver-specific subgroup leader
 - WNNM rejects block lattices whose select or estimate dispatch exceeds the device's workgroup-count limit
 - WNNM no longer allocates an unused search-location buffer for spatial-only processing
 
