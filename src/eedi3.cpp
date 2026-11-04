@@ -1127,6 +1127,12 @@ static bool fill_mask_sclip(const Eedi3Data & d, const VSAPI * vsapi,
                       " is not GPU resident";
                 return false;
             }
+            if (auto e =
+                    vsfeel_plane_range_error(pi, *d.gpu, "the sclip plane");
+                !e.empty()) {
+                err = e;
+                return false;
+            }
             sclip[plane] = pi.buffer;
             sclip_stride[plane] =
                 static_cast<int>(vsapi->getStride(scp, plane) / d.elem_bytes);
@@ -1138,6 +1144,11 @@ static bool fill_mask_sclip(const Eedi3Data & d, const VSAPI * vsapi,
         VSVulkanPlaneInfo pi {};
         if (d.gpu->api->getGPUPlane(mcp, 0, &pi)) {
             err = "mclip is not GPU resident";
+            return false;
+        }
+        if (auto e = vsfeel_plane_range_error(pi, *d.gpu, "the mask plane");
+            !e.empty()) {
+            err = e;
             return false;
         }
         mask = pi.buffer;
@@ -1161,6 +1172,11 @@ static bool fill_out_planes(const Eedi3Data & d, const VSAPI * vsapi,
         if (d.gpu->api->getGPUPlane(dst, plane, &pi)) {
             err = "the output plane " + std::to_string(plane) +
                   " is not GPU resident";
+            return false;
+        }
+        if (auto e = vsfeel_plane_range_error(pi, *d.gpu, "the output plane");
+            !e.empty()) {
+            err = e;
             return false;
         }
         out[plane] = pi.buffer;
@@ -1268,46 +1284,28 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
 
     for (int j = n; j <= last; ++j) {
         const int sn = eedi3_clip_index(*d, j);
-        const VSFrame * src = vsfeel_get_frame(
-            vsapi, sn, d->node, frameCtx, "EEDI3",
-            "the source frame could not be fetched", d->gpu.get());
+        // The context and batch claim are held here, so a missing frame must
+        // leave through fail() to abandon/release them.
+        const VSFrame * src = vsapi->getFrameFilter(sn, d->node, frameCtx);
         if (!src) {
-            for (const VSFrame * f : inputs) {
-                vsapi->freeFrame(f);
-            }
-            return nullptr;
-        }
-        const bool need_scp = d->vcheck > 0 && d->sclip_node;
-        const VSFrame * scp =
-            need_scp
-                ? vsfeel_get_frame(vsapi, j, d->sclip_node, frameCtx, "EEDI3",
-                                   "the sclip frame could not be fetched",
-                                   d->gpu.get())
-                : nullptr;
-        if (need_scp && !scp) {
-            vsapi->freeFrame(src);
-            for (const VSFrame * f : inputs) {
-                vsapi->freeFrame(f);
-            }
-            return nullptr;
-        }
-        const VSFrame * mcp =
-            d->mclip_node
-                ? vsfeel_get_frame(vsapi, sn, d->mclip_node, frameCtx, "EEDI3",
-                                   "the mclip frame could not be fetched",
-                                   d->gpu.get())
-                : nullptr;
-        if (d->mclip_node && !mcp) {
-            vsapi->freeFrame(src);
-            vsapi->freeFrame(scp);
-            for (const VSFrame * f : inputs) {
-                vsapi->freeFrame(f);
-            }
-            return nullptr;
+            return fail("the source frame could not be fetched");
         }
         inputs.push_back(src);
+        const bool need_scp = d->vcheck > 0 && d->sclip_node;
+        const VSFrame * scp =
+            need_scp ? vsapi->getFrameFilter(j, d->sclip_node, frameCtx)
+                     : nullptr;
+        if (need_scp && !scp) {
+            return fail("the sclip frame could not be fetched");
+        }
         if (scp) {
             inputs.push_back(scp);
+        }
+        const VSFrame * mcp =
+            d->mclip_node ? vsapi->getFrameFilter(sn, d->mclip_node, frameCtx)
+                          : nullptr;
+        if (d->mclip_node && !mcp) {
+            return fail("the mclip frame could not be fetched");
         }
         if (mcp) {
             inputs.push_back(mcp);
@@ -1590,7 +1588,8 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
             vsapi->freeFrame(f);
         }
         eedi3_release_claim(d, n, last);
-        return eedi3_error(guard, frameCtx, vsapi, nullptr, "EEDI3AA", message);
+        return eedi3_error(guard, frameCtx, vsapi, nullptr,
+                           eedi3_filter_name(*d), message);
     };
     if (!ctx) {
         return fail("could not acquire a recording context: "s + errbuf);
@@ -1608,62 +1607,37 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
     const auto t1 = timing ? now() : std::chrono::steady_clock::time_point {};
 
     for (int j = n; j <= last; ++j) {
-        const VSFrame * src = vsfeel_get_frame(
-            vsapi, j, d->node, frameCtx, "EEDI3H",
-            "the source frame could not be fetched", d->gpu.get());
+        // The context and batch claim are held here, so a missing frame must
+        // leave through fail() to abandon/release them.
+        const VSFrame * src = vsapi->getFrameFilter(j, d->node, frameCtx);
         if (!src) {
-            for (const VSFrame * f : inputs) {
-                vsapi->freeFrame(f);
-            }
-            return nullptr;
-        }
-        const bool need_scp = d->vcheck > 0 && d->sclip_node;
-        const VSFrame * scp0 =
-            need_scp ? vsfeel_get_frame(
-                           vsapi, 2 * j, d->sclip_node, frameCtx, "EEDI3H",
-                           "the sclip frame could not be fetched", d->gpu.get())
-                     : nullptr;
-        if (need_scp && !scp0) {
-            vsapi->freeFrame(src);
-            for (const VSFrame * f : inputs) {
-                vsapi->freeFrame(f);
-            }
-            return nullptr;
-        }
-        const VSFrame * scp1 =
-            need_scp ? vsfeel_get_frame(
-                           vsapi, 2 * j + 1, d->sclip_node, frameCtx, "EEDI3H",
-                           "the sclip frame could not be fetched", d->gpu.get())
-                     : nullptr;
-        if (need_scp && !scp1) {
-            vsapi->freeFrame(src);
-            vsapi->freeFrame(scp0);
-            for (const VSFrame * f : inputs) {
-                vsapi->freeFrame(f);
-            }
-            return nullptr;
-        }
-        const VSFrame * mcp =
-            d->mclip_node
-                ? vsfeel_get_frame(vsapi, j, d->mclip_node, frameCtx, "EEDI3H",
-                                   "the mclip frame could not be fetched",
-                                   d->gpu.get())
-                : nullptr;
-        if (d->mclip_node && !mcp) {
-            vsapi->freeFrame(src);
-            vsapi->freeFrame(scp0);
-            vsapi->freeFrame(scp1);
-            for (const VSFrame * f : inputs) {
-                vsapi->freeFrame(f);
-            }
-            return nullptr;
+            return fail("the source frame could not be fetched");
         }
         inputs.push_back(src);
+        const bool need_scp = d->vcheck > 0 && d->sclip_node;
+        const VSFrame * scp0 =
+            need_scp ? vsapi->getFrameFilter(2 * j, d->sclip_node, frameCtx)
+                     : nullptr;
+        if (need_scp && !scp0) {
+            return fail("the sclip frame could not be fetched");
+        }
         if (scp0) {
             inputs.push_back(scp0);
         }
+        const VSFrame * scp1 =
+            need_scp ? vsapi->getFrameFilter(2 * j + 1, d->sclip_node, frameCtx)
+                     : nullptr;
+        if (need_scp && !scp1) {
+            return fail("the sclip frame could not be fetched");
+        }
         if (scp1) {
             inputs.push_back(scp1);
+        }
+        const VSFrame * mcp =
+            d->mclip_node ? vsapi->getFrameFilter(j, d->mclip_node, frameCtx)
+                          : nullptr;
+        if (d->mclip_node && !mcp) {
+            return fail("the mclip frame could not be fetched");
         }
         if (mcp) {
             inputs.push_back(mcp);

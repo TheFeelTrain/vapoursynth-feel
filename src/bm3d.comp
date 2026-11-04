@@ -184,7 +184,7 @@ layout(push_constant) uniform PushConstants {
     int nmod;      // centre frame index of the window
     int nframes;   // total frame count (temporal bounds)
     int src_slot;  // radius 0: the stream's private source slot
-    int tag_base;  // first tag index of this slot (slot * TW)
+    int src_base;  // absolute frame of source ring slot 0
     int trace_xy;  // TRACE: packed origin to record, else -1
     int focus;     // isolated frame: scatter only this target, else -1
 } pc;
@@ -203,7 +203,7 @@ int slot_base(int z) {
     if (RINGED == 0) {
         return pc.src_slot;
     }
-    const int rel = src_frame(z) - pc.tag_base;
+    const int rel = src_frame(z) - pc.src_base;
     return ((rel % SRC_RING) + SRC_RING) % SRC_RING;
 }
 

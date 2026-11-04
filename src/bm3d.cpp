@@ -132,7 +132,6 @@ struct Bm3dGroup {
 
     int src_ring {};          // ring slots for the temporal source window
     int res_cap {};           // accumulator slots of the frame ring
-    int tag_base {};          // first ring slot of this entry's indexed region
     VkDeviceSize src_size {}; // src_ring * clips * n_planes * pe
     VkDeviceSize res_size {}; // res_cap * 2 * n_planes * pe
     GpuBuffer src;
@@ -1000,11 +999,8 @@ static void record_est_position(BM3DData * d, const Bm3dFrame & fr,
             static_cast<int32_t>((r == 0) ? fr.slot0[gi] : 0);
         const int32_t pushes[7] {
             0, // acc_base: the accumulator slot is derived in the shader
-            m_i,
-            nf,
-            slot0_push,
-            static_cast<int32_t>(static_cast<VkDeviceSize>(g.tag_base + slot) *
-                                 d->max_tw),
+            m_i,      nf, slot0_push,
+            0, // src_base: unused with RINGED=0 (a private slot)
             trace_xy,
             -1 // focus: radius 0 scatters every member
         };
@@ -1371,6 +1367,11 @@ static void record_center_cmd(BM3DData * d, VkCommandBuffer cmd, int m,
                                              " plane " + std::to_string(plane) +
                                              " is not GPU resident");
                 }
+                if (auto e = vsfeel_plane_range_error(info, *d->gpu,
+                                                      "the reference plane");
+                    !e.empty()) {
+                    throw std::runtime_error(e);
+                }
                 w.ref[plane] = info.buffer;
                 w.ref_range[plane] =
                     bm3d_range(d->vi->format, plane,
@@ -1447,7 +1448,9 @@ static void record_center_cmd(BM3DData * d, VkCommandBuffer cmd, int m,
         bm3d_bind(*d->gpu, cmd, d->pipeline_layout, src_buf, acc_buf, dst_bind,
                   aux_bind);
         const int32_t pushes[7] {
-            acc_base, m, d->nframes, 0, 0, trace_xy, focus
+            acc_base, m,    d->nframes, 0,
+            0, // src_base: slots are frame % SRC_RING, so 0 is the ring base
+            trace_xy, focus
         };
         gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, pushes,
                            sizeof(pushes));
@@ -1993,6 +1996,12 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
                                      std::to_string(plane) +
                                      " is not GPU resident");
                 }
+                if (auto e = vsfeel_plane_range_error(plane_info, *d->gpu,
+                                                      "the source plane");
+                    !e.empty()) {
+                    vsapi->freeFrame(src);
+                    return set_error(e);
+                }
                 window[k].source[plane] = plane_info.buffer;
                 window[k].src_range[plane] =
                     bm3d_range(d->vi->format, plane,
@@ -2013,6 +2022,12 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
                         return set_error("ref clip " + std::to_string(f) +
                                          " plane " + std::to_string(plane) +
                                          " is not GPU resident");
+                    }
+                    if (auto e = vsfeel_plane_range_error(
+                            plane_info, *d->gpu, "the reference plane");
+                        !e.empty()) {
+                        vsapi->freeFrame(rsrc);
+                        return set_error(e);
                     }
                     window[k].ref[plane] = plane_info.buffer;
                     window[k].ref_range[plane] =
@@ -2860,7 +2875,6 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             auto & g = d->groups[gi];
             g.src_ring = src_ring;
             g.res_cap = res_cap;
-            g.tag_base = gi * res_cap;
             // In final mode each ring slot holds [ref][source], so the ring
             // doubles.
             const int clips = d->final ? 2 : 1;

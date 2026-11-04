@@ -112,13 +112,13 @@ longer, but do not pad them. Never cite work-order or report IDs (`WO-55`,
 
 Keep a Changelog format, newest first, with an `## [Unreleased]` section for
 what has landed since the last tag. Write the entry with the change, not at
-release time. One bullet per user-visible change, under `Added`, `Changed`,
-`Fixed` or `Removed`: one unwrapped source line that names the filter or
+release time. One bullet per user-visible symptom, under `Added`, `Changed`,
+`Fixed`, or `Removed`: one unwrapped source line that names the filter or
 component first. Entries read like this:
 
 ```markdown
 - BM3D accepts up to `radius=16` instead of 4, matching vszipcl
-- A BM3D cache slot could be overwritten by a stale writer
+- BM3D no longer reuses stale cached data
 - Upload fixes for EEDI3 and BM3D on devices without a ReBAR heap
 ```
 
@@ -126,6 +126,19 @@ component first. Entries read like this:
   function names, no buffer budgets, no rationale, and no "Added support for ..."
   openers. A fix to the development tooling (`tools/`, the lint and notes gates,
   the benchmark harness) is not an entry either. Strictly user-facing changes.
+- **Write for the upgrade, not the implementation.** Say what changes in
+  output, speed, compatibility, or errors. Drop internals such as workgroups,
+  dispatches, pipelines, subgroups, buffers, scratch memory, addressing,
+  memory models, or ReBAR; keep a term only when it names a parameter, format,
+  or device capability the user needs.
+- **Merge by symptom.** One bullet per user-visible symptom, not per internal
+  cause. When several fixes produce the same user-visible result, they share a
+  bullet. The mechanism belongs in `notes/<filter>.md`.
+- **Keep the section scannable.** Aim for roughly 3-8 bullets per release and no
+  more than about 10 in `[Unreleased]`; past that, merge related entries rather
+  than growing the list. A release is not a debugging log.
+- **Oxford comma.** In every list of three or more items, put a comma before the
+  final `and` or `or`.
 - **No em-dashes.** Use a comma, a full stop, or parentheses.
 - **Only what the last release did differently.** An entry is read by someone
   upgrading from the last tag, so a bug in something that has only ever existed

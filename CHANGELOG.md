@@ -8,48 +8,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Bilateral no longer ignores a valid explicit `block_x` or `block_y` when the other dimension exceeds a device limit
+- Bilateral respects valid explicit `block_x` and `block_y` values on devices with tighter limits and matches vszipcl at very large radii
 
 ### Fixed
 
-- BM3D applies limited-range `_Range` to RGB clips
-- BM3D no longer corrupts multi-plane output when block matching and filtering run as separate GPU passes
-- BM3D no longer leaks pipelines when block matching and filtering run as separate GPU passes
-- BM3D reports a missing source frame instead of dereferencing it
-- Bilateral matches vszipcl's border pixels at radii 50-52
-- DFTTest no longer corrupts output or leaves the last rows zero on tall frames with high spatial overlap (`sosize` 1-7)
-- DFTTest and NNEDI3 report an oversized per-frame scratch buffer at creation instead of on every frame
-- EEDI3, EEDI3H, EEDI3AA, and NNEDI3 remove stale `_Field` tags from progressive output
-- EEDI3AA's fp32 output is bit-exact with the EEDI3/EEDI3H chain it fuses
-- NNEDI3 rejects `dh=True` with a `planes` subset instead of writing zero rows into the unprocessed planes
-- DFTTest f32 padding no longer rounds twice
-- DFTTest rejects negative `slocation` sigmas and duplicate locations
-- NLMeans' u16 conversion uses the reference's divide and round-to-nearest-even
-- A failed upstream frame now reports a filter error instead of crashing the process
-- `VSFEEL_PIPELINE_CACHE` paths with Windows separators are created and saved correctly
-- Malformed or out-of-range numeric environment settings fall back to their defaults
-- NNEDI3's rejected-pixel compaction no longer relies on a driver-specific subgroup leader
-- WNNM rejects block lattices whose select or estimate dispatch exceeds the device's workgroup-count limit
-- WNNM no longer allocates an unused search-location buffer for spatial-only processing
+- BM3D applies limited-range `_Range` to RGB clips and no longer corrupts multi-plane output, leaks resources, or crashes on a missing frame
+- DFTTest no longer corrupts tall frames with high spatial overlap or double-rounds float32 padding
+- DFTTest and NNEDI3 report oversized memory requests at creation, and DFTTest also rejects negative sigmas and duplicate frequency locations
+- EEDI3, EEDI3H, EEDI3AA, and NNEDI3 clear stale field tags, and EEDI3AA and its two-pass equivalent now agree exactly in 32-bit float
+- NNEDI3 rejects `dh=True` with a `planes` subset and works more reliably across GPU drivers
+- NLMeans uses the reference's rounding for 16-bit output
+- A failed upstream frame is reported as an error instead of crashing
+- Cache paths containing Windows separators work, and malformed numeric environment settings fall back to their defaults
+- WNNM rejects frames that are too large for the device and no longer allocates unused memory
 
 ## [v1.3.3] - 2026-11-04
 
 ### Changed
 
-- NLMeans is 20-30% faster, with the largest gain on luma-only processing
+- NLMeans is 20-30% faster, especially on luma-only processing
 - BM3D's `radius` argument can be set per plane like `sigma`
 
 ### Fixed
 
-- All filters reject unknown-length and variable-format clips at creation
-- A failed Box, GaussBlur, EEDI3, NLMeans, NNEDI3, or WNNM creation no longer leaks its instance
-- BM3D rejects frames whose block-matching workspace does not fit 32-bit addressing
-- BM3D validates `extractor_exp` even when every sigma is zero
-- DFTTest rejects a negative `pmin` and non-finite or negative sigma arrays
-- DFTTest rejects an output grid larger than the device instead of leaving part of the frame unwritten
-- DFTTest no longer reads a partially written filter table on ReBAR devices
-- WNNM's GPU-trace mode no longer leaks memory per instance
-- WNNM rejects frames whose block lattice or 16-bit conversion ring does not fit 32-bit addressing
+- All filters reject unknown-length or variable-format clips at creation, and failed creation no longer leaks resources
+- BM3D rejects invalid arguments and frames that are too large
+- DFTTest rejects invalid parameters and frames the device cannot process, and no longer reads partial data on some devices
+- WNNM rejects very large frames and its trace mode no longer leaks memory
 
 ## [v1.3.2] - 2026-10-31
 
@@ -59,13 +44,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- WNNM releases its input clips when a filter instance is destroyed
-- WNNM no longer corrupts frames when its match cache cannot be allocated
-- WNNM output no longer depends on concurrent same-address GPU writes the Vulkan memory model does not guarantee
-- WNNM no longer rejects a configuration whose combined scratch exceeds the device's per-buffer storage range
-- WNNM's split Gram reduction no longer depends on the driver's subgroup lane layout, and a device that cannot run it falls back to the fused kernel
-- WNNM copies a 16-bit boundary frame into its conversion ring once per plane instead of once per clamped window position
-- WNNM no longer releases its input clips more than once when pipeline creation fails
+- WNNM no longer crashes, double-frees clips, or corrupts frames when caches or inputs fail on some drivers
+- WNNM works on more GPUs, no longer rejects large configurations that fit, and handles 16-bit boundary frames more efficiently
 
 ## [v1.3.1] - 2026-10-30
 
@@ -75,52 +55,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- Bilateral rejects non-positive `block_x`/`block_y` instead of silently using the default shape
-- BM3D follows a 16-bit clip's `_Range` like the reference instead of treating every integer clip as full range
-- BM3D validates its block/search arguments even when every sigma is zero
-- Box no longer terminates the host process when the output size is illegal for a subsampled format
-- Box matches resize2 at tap boundaries on cropped and odd-sized sources
-- DFTTest rejects a negative `f0beta` or `pmax` instead of returning an all-NaN frame
+- Bilateral rejects invalid `block_x` and `block_y` values instead of silently using defaults
+- BM3D follows a 16-bit clip's `_Range` and validates its arguments even when every sigma is zero
+- Box no longer crashes on illegal output sizes and matches resize2 when scaling cropped or odd-sized sources
+- DFTTest rejects invalid filter parameters instead of returning NaNs
 
 ## [v1.3.0] - 2026-10-25
 
 ### Added
 
-- `core.vsfeel.WNNM`, a Vulkan implementation of the WNNM patch denoiser that matches vszip's CPU filter
-- WNNM accepts 16-bit integer and fp16 input and output natively
+- `core.vsfeel.WNNM`, a Vulkan implementation of the WNNM patch denoiser
+- WNNM accepts 16-bit integer and half-float input and output
 
 ### Changed
 
-- DFTTest is about 30% faster
-- DFTTest with larger temporal windows (tbsize 5 and 7) is up to 6.7x faster
+- DFTTest is about 30% faster, and up to 6.7x faster with larger temporal windows
 
 ### Fixed
 
-- Windows builds link against the current MinGW CRT
+- Windows builds use the current MinGW runtime
 
 ## [v1.2.0] - 2026-10-21
 
 ### Added
 
-- `vsfeel.feel_aa`, a copy of `vsaa.based_aa` that keeps its processing entirely on the GPU
-- `core.vsfeel.Box`, a Vulkan implementation of a box downscale
-- All filters support fp16 input and output
+- `vsfeel.feel_aa`, a copy of `vsaa.based_aa` that keeps processing on the GPU
+- `core.vsfeel.Box`, a Vulkan box downscale
+- All filters support half-float input and output
 
 ### Changed
 
-- GaussBlur is over 2x faster
-- BM3D is about 18% faster
-- Bilateral is about 15% faster
+- GaussBlur is over 2x faster, BM3D about 18% faster, and Bilateral about 15% faster
 
 ## [v1.1.2] - 2026-10-18
-
-### Fixed
-
-- BM3D no longer runs at 1 fps on Nvidia GPUs
 
 ### Changed
 
 - BM3D is now registered as `core.vsfeel.BM3D` instead of `core.vsfeel.BM3Dv2`
+
+### Fixed
+
+- BM3D no longer runs at 1 fps on Nvidia GPUs
 
 ## [v1.1.1] - 2026-10-05
 
@@ -136,87 +111,70 @@ All filters now have full feature parity with other implementations and are more
 
 - BM3D supports 16-bit integer input and output
 - BM3D supports the joint 4:4:4 `chroma=True` mode for denoising chroma planes
-- EEDI3, EEDI3H, and EEDI3AA implement `hp` (half-pel search), bit-exact with eedi3vk2
+- EEDI3, EEDI3H, and EEDI3AA implement `hp` (half-pel search), matching eedi3vk2
 
 ### Changed
 
-- EEDI3AA is about 8% faster
-- BM3D is about 5% faster with less run-to-run variance
-- BM3D accepts up to `radius=16`, matching vszipcl
-- BM3D now matches VapourSynth-BM3D output, diverging from bm3dcuda/vszipcl/bm3dvk
+- EEDI3AA is about 8% faster, and BM3D about 5% faster with less run-to-run variance
+- BM3D accepts up to `radius=16` and now matches VapourSynth-BM3D output
 
 ### Fixed
 
-- EEDI3 and EEDI3H are now bit-exact with eedi3vk2 in fp32 (u16 already matched)
-- NLMeans more closely matches vszipcl in fp32 and u16
-- The pipeline cache is only rewritten when a process compiled something new
+- EEDI3 and EEDI3H now match eedi3vk2 exactly in 32-bit float
+- NLMeans more closely matches vszipcl
+- The shader cache is only rewritten when a process compiled something new
 
 ## [v1.0.0] - 2026-10-01
 
-The plugin has moved to the VapourSynth R80 GPU API. The core now owns the device, the queues, and the transfers.
+The plugin now uses the core's GPU device, queues, and transfers instead of managing its own.
 
 ### Added
 
-- macOS and arm64 wheels
-- Capability checks at filter creation, so an unsupported device or argument is reported instead of failing later
+- macOS and arm64 wheels, plus capability checks at filter creation
 
 ### Changed
 
-- All nine filters were ported to the R80 GPU API. The plugin no longer creates its own device, queues or host transfer path
-- Frame caches are capped by the core's VRAM budget instead of fixed sizes
-- Invalid arguments and unsupported input are rejected at creation time
+- All nine filters use the core's GPU device, queues, and transfers
+- Frame caches follow the core's GPU memory budget, and invalid input is rejected at creation
 
 ### Fixed
 
-- Resource leaks on creation and frame error paths across every filter
-- Frame cache races in BM3D's rings and EEDI3's batched output, which could read a wrong or recycled frame
-- EEDI3AA's per plane merge, and its handling of odd plane geometry
+- Resource leaks, frame-cache races, and EEDI3AA plane-merge errors
 
 ## [v0.2.2] - 2026-09-21
 
 ### Added
 
-- `VSFEEL_DEBUG=1` prints a device banner and a full error trace. `VSFEEL_DEBUG=2` adds per frame traces and GPU timings
+- `VSFEEL_DEBUG=1` prints a device banner and a full error trace, while `VSFEEL_DEBUG=2` adds per-frame traces and GPU timings
 
 ### Changed
 
-- BM3D sizes its estimate cache to the working set instead of a fixed size
-- Direct upload staging is only used when the GPU has a ReBAR heap
+- BM3D sizes its cache to the working set, and upload staging is only used on GPUs that benefit from it
 
 ### Fixed
 
-- BM3D could hang the driver on long submissions. The estimation now submits one window position at a time
-- A BM3D cache slot could be overwritten by a stale writer
-- `env_flag=0` was treated as enabled in some filters
-- Subgroup support was assumed rather than checked in several creation paths
-- Upload fixes for EEDI3 and BM3D on devices without a ReBAR heap
-- GPU timing probes are only armed when the queue family reports valid timestamps
-- Small fixes in DFTTest's fused transpose window and NNEDI3's download slots
+- BM3D no longer hangs on long jobs or reuses stale cache data
+- Several device detection, upload, and timing probe fixes, plus small DFTTest and NNEDI3 fixes
 
 ## [v0.2.1] - 2026-09-20
 
 ### Fixed
 
-- BM3D now works on GPUs without buffer float atomics, using a compare and swap aggregation path
+- BM3D now works on more GPUs, including ones without float atomics
 
 ## [v0.2.0] - 2026-09-20
 
 ### Changed
 
 - The Vulkan requirement was lowered from 1.4 to 1.3
-- BM3D matching is faster, with a wider scan, subgroup operations and uploads staged in host visible memory
-- EEDI3's vertical consistency check runs in parallel, which is a large speedup
-- EEDI3AA's two horizontal passes share one submission
-- Shader, pipeline and buffer helpers are shared by all filters in `vsfeel.h`
+- BM3D, EEDI3, and EEDI3AA are faster
 
 ## [v0.1.0] - 2026-09-18
 
 ### Added
 
-- First release: Bilateral, BM3D, GaussBlur, DFTTest, NLMeans, EEDI3, EEDI3H, EEDI3AA and NNEDI3, all implemented as Vulkan compute shaders driven from C++
-- A benchmark harness comparing every filter against the reference implementations
-- vs-jetpack backend integration, so the filters can be used through the vs-jetpack wrappers
-- Windows and Linux wheels, built and published by CI
+- First release: Bilateral, BM3D, GaussBlur, DFTTest, NLMeans, EEDI3, EEDI3H, EEDI3AA, and NNEDI3
+- A benchmark harness, vs-jetpack backend integration, and Windows and Linux wheels
 
 [v1.3.3]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.2...v1.3.3
 [v1.3.2]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.1...v1.3.2

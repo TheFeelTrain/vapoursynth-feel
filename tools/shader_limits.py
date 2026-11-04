@@ -248,8 +248,10 @@ ASSIGN_LHS = re.compile(
 ASSIGN_RHS = re.compile(r"\s*([^;]{0,900});")
 # An identifier holds a module only when it is assigned one (or a list/ternary
 # of them). `result = create_agg_pipeline(..., bm3d_agg_spv, ...)` must not make
-# `result` -- and so every call that reads it -- a holder of bm3d_agg.
-MODULE_RHS = re.compile(r"^[^()]*$", re.S)
+# `result` -- and so every call that reads it -- a holder of bm3d_agg, and a
+# comparison such as `v = v >= 0 ? v : 0` must not turn a local into one.
+CALL_LIKE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\(")
+COMPARISON = re.compile(r"==|!=|<=|>=|&&|\|\||(?<![=!<>])=(?!=)")
 WORKGROUP_LITERAL = re.compile(r"GpuWorkgroup\s*\{([^{}]*)\}", re.S)
 CASTS = re.compile(r"static_cast<[^>]*>|\([a-z0-9_]+\)|(?<=[0-9])[uUlL]+\b")
 IDENT = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
@@ -380,6 +382,20 @@ def assignments(text):
         yield name, rhs.group(1)
 
 
+def module_rhs(rhs):
+    """True when an assignment's right-hand side is a module expression.
+
+    Allows the selector ternaries and braced variant tables the filters use
+    (`d->patch_lds ? (one_plane ? bm3d_spv : bm3d_1plane_spv) : ...`,
+    `{ eedi3_u16_vcheck_para_spv, ... }`), but not calls or comparisons: a
+    local that merely appears in `mapGet(...)` or `x >= 0 ? x : 0` must not
+    inherit the modules of whatever identifier happens to share its name.
+    """
+    if ";" in rhs or CALL_LIKE.search(rhs):
+        return False
+    return COMPARISON.search(rhs) is None
+
+
 def ident_stems(text):
     """`ident -> {stem}` for every `ident = <stem>_spv` (and through other idents).
 
@@ -389,19 +405,21 @@ def ident_stems(text):
     """
     direct, via = {}, []
     for name, rhs in assignments(text):
-        stems = set(SPV_REF.findall(rhs)) if MODULE_RHS.match(rhs) else set()
+        stems = set(SPV_REF.findall(rhs)) if module_rhs(rhs) else set()
         if stems:
             direct.setdefault(name, set()).update(stems)
         via.append((name, rhs))
     # Fixed point: `mod = pred_n4_code;` reaches the symbols one hop away.
-    for _ in range(4):
+    for _ in range(6):
         grew = False
         for name, rhs in via:
+            if not module_rhs(rhs):
+                continue
             found = set()
-            for ident in IDENT.findall(rhs):
-                found |= direct.get(ident, set())
             for obj, member in MEMBER.findall(rhs):
                 found |= direct.get(f"{obj}->{member}", set())
+            for ident in IDENT.findall(rhs):
+                found |= direct.get(ident, set())
             if found - direct.get(name, set()):
                 direct.setdefault(name, set()).update(found)
                 grew = True

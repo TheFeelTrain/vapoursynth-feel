@@ -1034,6 +1034,7 @@ def test_rejects_negative_gain_parameters(clip_grays, kwargs):
         {"slocation": [0.0, float("nan")]},
         {"slocation": [0.0, -1.0]},
         {"slocation": [0.0, 1.0, 0.0, 2.0]},
+        {"ssx": [0.0, 1.0, 0.0, 2.0]},
     ],
     ids=[
         "negative-ssx",
@@ -1041,6 +1042,7 @@ def test_rejects_negative_gain_parameters(clip_grays, kwargs):
         "nan-slocation",
         "negative-slocation",
         "duplicate-slocation",
+        "duplicate-ssx",
     ],
 )
 def test_rejects_non_finite_or_negative_sigma_arrays(clip_grays, kwargs):

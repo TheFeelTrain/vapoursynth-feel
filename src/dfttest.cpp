@@ -510,7 +510,11 @@ dft_grid_error(const DftPlaneConfig & cfg, int plane, int block_step,
     for (int row_base = 0; row_base < cfg.vn; row_base += cfg.stripe_rows) {
         const int row_end = std::min(row_base + cfg.stripe_rows, cfg.vn);
         const int y_begin = std::max(y_first, row_base * block_step);
-        const int y_end = std::min(y_last, row_end * block_step - 1);
+        // Same bound the recording uses: the last stripe owns every remaining
+        // row because col2im clamps its window to vn-1.
+        const int y_end = (row_end == cfg.vn)
+                              ? y_last
+                              : std::min(y_last, row_end * block_step - 1);
         if (y_end < y_begin) {
             continue;
         }
@@ -1409,27 +1413,28 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         (sst && !all_finite(sst, n_sst))) {
         return set_error("slocation/ssx/ssy/sst values must be finite.");
     }
-    if ((ssx && !sigmas_non_negative(ssx, n_ssx)) ||
+    if ((slocation && !sigmas_non_negative(slocation, n_slocation)) ||
+        (ssx && !sigmas_non_negative(ssx, n_ssx)) ||
         (ssy && !sigmas_non_negative(ssy, n_ssy)) ||
         (sst && !sigmas_non_negative(sst, n_sst))) {
-        return set_error("ssx/ssy/sst sigma values must be non-negative.");
+        return set_error(
+            "slocation/ssx/ssy/sst sigma values must be non-negative.");
     }
-    if (slocation) {
-        if (!sigmas_non_negative(slocation, n_slocation)) {
-            return set_error("slocation sigma values must be non-negative.");
-        }
-        // initPacks sorts the locations; a duplicate makes eval divide by zero.
+    // initPacks sorts the locations; a duplicate makes eval divide by zero.
+    const auto duplicate_locations = [](const double * data, int count) {
         std::vector<double> locs;
-        locs.reserve(static_cast<size_t>(n_slocation / 2));
-        for (int i = 0; i < n_slocation; i += 2) {
-            locs.push_back(slocation[i]);
+        locs.reserve(static_cast<size_t>(count / 2));
+        for (int i = 0; i < count; i += 2) {
+            locs.push_back(data[i]);
         }
         std::sort(locs.begin(), locs.end());
-        for (size_t i = 1; i < locs.size(); ++i) {
-            if (locs[i] == locs[i - 1]) {
-                return set_error("slocation locations must be distinct.");
-            }
-        }
+        return std::adjacent_find(locs.begin(), locs.end()) != locs.end();
+    };
+    if ((slocation && duplicate_locations(slocation, n_slocation)) ||
+        (ssx && duplicate_locations(ssx, n_ssx)) ||
+        (ssy && duplicate_locations(ssy, n_ssy)) ||
+        (sst && duplicate_locations(sst, n_sst))) {
+        return set_error("slocation/ssx/ssy/sst locations must be distinct.");
     }
 
     // device_id and num_streams are registered but never read: the core owns

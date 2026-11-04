@@ -692,17 +692,18 @@ void main() {
 layout(local_size_x = 256, local_size_y = 1) in;
 
 void main() {
-    const int per_group = int(gl_NumWorkGroups.x) * 1024;
-    const int base = int(gl_GlobalInvocationID.y) * per_group +
-                     int(gl_WorkGroupID.x) * 1024 +
-                     int(gl_LocalInvocationIndex);
-    const int total = ROWS * WIDTH;
-    for (int j = 0; j < 4; ++j) {
-        const int i = base + j * 256;
+    // Unsigned: the host allows a field up to 2^31-1 pixels, where the
+    // per-group stride (groups.x * 1024) itself no longer fits a positive int.
+    const uint per_group = gl_NumWorkGroups.x * 1024u;
+    const uint base = gl_GlobalInvocationID.y * per_group +
+                      gl_WorkGroupID.x * 1024u + gl_LocalInvocationIndex;
+    const uint total = uint(ROWS) * uint(WIDTH);
+    for (uint j = 0u; j < 4u; ++j) {
+        const uint i = base + j * 256u;
         if (i >= total)
             break;
-        const int x = i % WIDTH;
-        const int r = i / WIDTH;
+        const int x = int(i % uint(WIDTH));
+        const int r = int(i / uint(WIDTH));
         const int y = 2 * r + pc.parity;
         const int sy = (DH != 0) ? r : y;
         dstBuf[y * pc.dst_stride + x] = fieldBuf[sy * pc.src_stride + x];

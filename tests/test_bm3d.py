@@ -597,16 +597,18 @@ def test_bm3d_rejects_oversized_split_handoff(monkeypatch):
         BM3D(src, sigma=SIGMA, radius=0, block_step=1)
 
 
-def test_bm3d_split_kernel_matches_fused(clip_yuv420p16, monkeypatch):
+@pytest.mark.parametrize("radius", [0, 2], ids=["spatial", "temporal"])
+def test_bm3d_split_kernel_matches_fused(clip_yuv420p16, monkeypatch, radius):
     """The split's shared handoff must not race across the three YUV groups.
 
     YUV420 gives one entry per processed plane, so the match half of the next
     entry writes the same buffer while the previous entry's filter half reads
-    it. The split path used to have no write-after-read barrier there; this
-    compares every plane against the fused path.
+    it. Both radius paths had a missing write-after-read barrier (one chunk per
+    position at radius 0, the per-centre cursor above it); this compares every
+    plane against the fused path.
     """
     kwargs = dict(
-        sigma=SIGMA, radius=2, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=BLOCK_STEP
+        sigma=SIGMA, radius=radius, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=BLOCK_STEP
     )
     monkeypatch.setenv("VSFEEL_BM3D_SPLIT_KERNEL", "0")
     fused = BM3D(clip_yuv420p16, **kwargs)
@@ -618,7 +620,7 @@ def test_bm3d_split_kernel_matches_fused(clip_yuv420p16, monkeypatch):
         for p in range(3):
             da = plane_to_ndarray(a, p, np.uint16).astype(np.float64)
             db = plane_to_ndarray(b, p, np.uint16).astype(np.float64)
-            assert np.abs(da - db).max() <= 1.0, f"split/fused mismatch n={n} p={p}"
+            assert np.abs(da - db).max() <= 1.0, f"split/fused mismatch n={n} p={p} radius={radius}"
 
 
 def test_bm3d_accepts_radius4_within_addressing_limit():
@@ -1800,11 +1802,13 @@ def test_bm3d_u16_matches_cpu(clip_gray16, radius, stage, bound, measured, full)
 
 
 def test_bm3d_rgb_range_tag_is_honored(clip_grays):
-    """The RGB arm of `_Range` must not ignore the tag.
+    """The RGB arm of `_Range` must use the reference's limited-range mapping.
 
     The old `bm3d_range` returned full-range scaling for every RGB plane, so
-    full and limited RGB48 produced identical pixels. A real gradient makes
-    the two domains visibly different.
+    full and limited RGB48 produced identical pixels. The float conversion of
+    the same limited clip applies exactly `(code - 4096) / 56064`, so comparing
+    against it pins both the input scale and the output inverse, not merely
+    that the two tags differ.
     """
     rgb = vs.core.std.ShufflePlanes([clip_grays, clip_grays, clip_grays], [0, 0, 0], vs.RGB)
     rgb16 = vs.core.resize.Bicubic(rgb, format=vs.RGB48)
@@ -1815,10 +1819,19 @@ def test_bm3d_rgb_range_tag_is_honored(clip_grays):
     )
     a = BM3D(full, **kwargs)
     b = BM3D(limited, **kwargs)
+    # Point honours the tag, so this clip holds the limited codes widened by
+    # the same 16..235 mapping the integer path must invert.
+    float_limited = vs.core.resize.Point(limited, format=vs.RGBS)
+    c = BM3D(float_limited, **kwargs)
     for n in (0, 5):
         fa = plane_to_ndarray(a.get_frame(n), 0, np.uint16)
         fb = plane_to_ndarray(b.get_frame(n), 0, np.uint16)
+        fc = plane_to_ndarray(c.get_frame(n), 0).astype(np.float64)
         assert np.abs(fa.astype(np.int32) - fb.astype(np.int32)).max() > 1
+        mapped = np.clip(fc * (219 * 256) + 16 * 256, 0, 65535)
+        assert np.abs(fb.astype(np.float64) - mapped).max() <= 1.0, (
+            f"limited RGB48 is not the float conversion's inverse at n={n}"
+        )
 
 
 U16_SWEEP = [

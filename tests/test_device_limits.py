@@ -547,7 +547,7 @@ def test_wnnm_select_and_estimate_grid_overflow_is_reported():
         {"VSFEEL_LIMIT_GRID_X": "4"},
     )
     err = res["wnnm"].get("error", "")
-    assert "WNNM" in err and "workgroups" in err, res["wnnm"]
+    assert "WNNM select" in err and "workgroups" in err, res["wnnm"]
 
 
 def test_push_descriptor_limit_is_reported():
