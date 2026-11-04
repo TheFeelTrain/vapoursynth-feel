@@ -583,32 +583,31 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
     {
         const VkPhysicalDeviceLimits & limits = d->gpu->limits;
 
-        // A block over a device limit falls back to 16x16.
-        if (static_cast<uint32_t>(block_x) >
-                limits.maxComputeWorkGroupSize[0] ||
-            static_cast<uint32_t>(block_y) >
-                limits.maxComputeWorkGroupSize[1] ||
-            static_cast<uint32_t>(block_x) * block_y >
-                limits.maxComputeWorkGroupInvocations) {
-            block_x = std::min<int>(
-                16, static_cast<int>(limits.maxComputeWorkGroupSize[0]));
-            block_y = std::min<int>(
-                16, static_cast<int>(limits.maxComputeWorkGroupSize[1]));
-        }
-        // That fallback is still 256 invocations, so halve the shape until the
-        // device accepts it: 16x16 failed on a device whose limit is the Vulkan
-        // minimum of 128. Both dimensions are spec constants and the grid
-        // follows them, so any shape here is valid.
+        // Preserve every dimension the device can accept: clamp each axis to
+        // its own limit, then halve the larger axis until the invocation
+        // budget fits. Replacing both with 16x16 used to discard a valid
+        // explicit dimension (4x16 became 16x8 on a device whose Y limit is 8).
+        block_x = static_cast<int>(std::min<uint32_t>(
+            static_cast<uint32_t>(block_x), limits.maxComputeWorkGroupSize[0]));
+        block_y = static_cast<int>(std::min<uint32_t>(
+            static_cast<uint32_t>(block_y), limits.maxComputeWorkGroupSize[1]));
         const auto over_budget = [&] {
             return static_cast<uint64_t>(block_x) *
                        static_cast<uint64_t>(block_y) >
                    limits.maxComputeWorkGroupInvocations;
         };
-        while (block_y > 1 && over_budget()) {
-            block_y /= 2;
+        while (over_budget() && block_x > 1 && block_y > 1) {
+            if (block_x >= block_y) {
+                block_x /= 2;
+            } else {
+                block_y /= 2;
+            }
         }
-        while (block_x > 1 && over_budget()) {
+        while (over_budget() && block_x > 1) {
             block_x /= 2;
+        }
+        while (over_budget() && block_y > 1) {
+            block_y /= 2;
         }
 
         if (block_x <= 0 || block_y <= 0 || over_budget()) {
@@ -741,12 +740,21 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
                    static_cast<size_t>(tile_x) * static_cast<size_t>(tile_y) *
                    sizeof(float);
         };
-        const bool shared2 =
-            use_shared_memory &&
-            tile_bytes(2) <= d->gpu->limits.maxComputeSharedMemorySize;
-        const bool shared1 =
-            use_shared_memory &&
-            tile_bytes(1) <= d->gpu->limits.maxComputeSharedMemorySize;
+        // vszipcl chooses its tiled kernel from its 16x8 tile and a
+        // min(48 KiB, device LDS) budget; match that decision, then still
+        // require our own wider tile to fit. Otherwise R=50..52 would take
+        // the shared kernel here while the reference has already gone plain,
+        // and their border handling differs.
+        const uint64_t ref_tile = static_cast<uint64_t>(1 + has_ref) *
+                                  static_cast<uint64_t>(2 * key.radius + 8) *
+                                  static_cast<uint64_t>(2 * key.radius + 16) *
+                                  sizeof(float);
+        const uint64_t ref_budget = std::min<uint64_t>(
+            48 * 1024, d->gpu->limits.maxComputeSharedMemorySize);
+        const bool ref_shared = use_shared_memory && ref_tile < ref_budget;
+        const uint32_t max_lds = d->gpu->limits.maxComputeSharedMemorySize;
+        const bool shared2 = ref_shared && tile_bytes(2) <= max_lds;
+        const bool shared1 = ref_shared && tile_bytes(1) <= max_lds;
         // 2 columns per thread only where the wider shared tile fits; the
         // one-column kernel (shared or plain) covers one column per thread.
         plane_cols[plane] = shared2 ? 2 : 1;

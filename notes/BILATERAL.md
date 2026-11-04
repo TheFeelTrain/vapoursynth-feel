@@ -29,20 +29,25 @@ Design (current):
   creation (a GPU frame uses the identical stride math).
 - Auto block shape (`32x8` for max radius ≤ 12, `32x16` above); explicit
   `block_x`/`block_y` must be positive (a non-positive value is an error, not a
-  silent fallback) and is clamped to the device limits. The block is the thread
-  count, so with the two-column kernel a workgroup covers `2*block_x` columns
-  and the tile is `2R + 2*block_x` wide.
+  silent fallback), is clamped to each device limit, and then has its larger
+  axis halved until the invocation budget fits. The block is the thread count,
+  so with the two-column kernel a workgroup covers `2*block_x` columns and the
+  tile is `2R + 2*block_x` wide.
 - Unprocessed planes (`sigma < FLT_EPSILON`) ride along from the source through
   `newVideoFrame2`, keeping their own producer pairs; nothing is submitted when
   every plane is unprocessed.
 - `num_streams` and `device_id` are registered no-ops (never read): depth is
   the core's call and device choice is `core.set_vulkan_device`.
 - **`RADV_EXPERIMENTAL=transfer_queue` is required for the numbers below**
-  (mechanism in Performance), and `tools/benchmark.py` now forces it. Every
-  −16% figure in this file's history predates that and is void.
+  (mechanism in Performance), and `tools/benchmark.py` now forces it for the
+  core's transfer queue; the filter creates no queue itself. Pre-R80
+  per-stream transfer-path numbers in this file are void -- do not quote them
+  as the current filter.
 
-Scoreboard — 1080p jpbd, 5000 frames, sigma 3.0/0.02 (R=9), medians of 3
-through `tools/benchmark.py`. u16 input unless noted:
+Scoreboard — 1080p jpbd, sigma 3.0/0.02 (R=9), medians of 3 through
+`tools/benchmark.py`; the 5000-frame runs predate the wall-clock harness
+(`--frames` was removed), so use the ratios, not the frame count. u16 input
+unless noted.
 
 | mode | vsfeel u16 | vszipcl | ratio | vsfeel f16 | vsfeel f32 |
 |---|---|---|---|---|---|
@@ -108,7 +113,8 @@ session noise, not a regression.
   `v_cndmask_b32` per tap (722 per thread) and, more importantly, could no
   longer keep the body in registers (430 instructions, VGPR 48). Moving the test
   to the store alone dropped the body to 381 instructions and measured
-  2319 → 2694 fps (u16/f32 compute-only, 5000 frames, 3-repeat medians; +16.0%
+  2319 → 2694 fps (u16/f32 compute-only, pre-wall-clock 5000-frame run,
+  3-repeat medians; +16.0%
   on an ABBA A/B, n=24 per arm). Same mechanism as
   `notes/GAUSSBLUR.md`'s skipped padding taps: one select per tap in an unrolled
   body is never free.
@@ -178,8 +184,9 @@ session noise, not a regression.
 - **Half storage costs nothing on compute and one step on accuracy.** The f16
   kernel is the f32 one plus an `OpFConvert` on every tile load and on the store
   (the 361-tap sweep is the same shape at both depths), so compute-only is a
-  tie: 2693 fps f16 vs 2662 f32 (1080p, sigma 3.0/0.02, 5000 frames, 3-repeat
-  medians). Every f16 reference config measures exactly 4.88e-4 (one half step
+  tie: 2693 fps f16 vs 2662 f32 (1080p, sigma 3.0/0.02, pre-wall-clock
+  5000-frame run, 3-repeat medians). Every f16 reference config measures
+  exactly 4.88e-4 (one half step
   at |v| ∈ [0.5, 1)) on a few tens of samples per frame, and 125 of 2.07M
   samples differ from the *same-input* f32 run: the extra `OpFConvert` shifts
   ACO's contraction by one instruction, so the two variants' f32 sums differ in
@@ -207,9 +214,10 @@ Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter bilateral
   carried (the port changed nothing, **−0.1%**) stands. The banner's table
   replaces the absolute numbers.
 - **2026-09-30 — u16 SSBOs need the StorageBuffer class.**
-  `bilateral_shared_16`/`bilateral_plain_16` carried the same invalid SPIR-V 1.0
-  Uniform+BufferBlock 16-bit buffer access as GaussBlur (mechanism and feature
-  names in `notes/GAUSSBLUR.md`); both now build with `--target-env=vulkan1.1`.
+  `bilateral_shared_u16`/`bilateral_plain_u16` carried the same invalid SPIR-V
+  1.0 Uniform+BufferBlock 16-bit buffer access as GaussBlur (mechanism and
+  feature names in `notes/GAUSSBLUR.md`); both were fixed by the move to
+  `--target-env=vulkan1.1`, now subsumed by the global `vulkan1.4` target.
   Bit-exact vs vszipcl, f32 SPIR-V unchanged.
 
 ### 2026-09-30 — creation-failure leak
@@ -262,20 +270,21 @@ SDMA and the port reaches parity without any core change.
 
 ### Kernel findings that still ship
 
-- **Shared vs plain is worth ~3.2–3.8x, and the gate must be the device limit.**
-  The old hardcoded 48 KiB cap used to drop the tiled kernel for no-guide
-  R∈[28,43] / guide R∈[21,27] even though this device reports 65 536 B. Raising
-  the gate to `maxComputeSharedMemorySize` measured 3.29x (no-guide R=45),
-  3.12x (guide R=28) and 3.31x (guide R=32) against vszipcl at 1.50–3.10x, and
-  improved reference agreement in the changed band (the plain kernel's border
-  semantics are the divergent side). Every shared-kernel cell in the radius ×
-  guide matrix wins (1.00–2.65x); every plain-kernel cell loses.
-- **The R=24 loss was LDS occupancy, not ACO VOPD packing.** Reserving one whole
-  tile instead of `(1 + has_ref)` doubled the LDS at every radius and pushed
-  R∈[21,27] guide and R∈[28,43] no-guide over the cap; with the sizing fixed,
-  R=24 no-guide went 345 → 407.8 fps (1.12x vs reference) because 40 960 →
-  20 480 B raised the fit from 1 to 3 workgroups/CU. The "ACO VOPD=0" theory is
-  retired.
+- **Shared vs plain is worth ~3.2–3.8x, and the gate must follow vszipcl's
+  reference budget.** vszipcl picks its 16x8 tile when
+  `(2R+8)(2R+16)*4 < min(48 KiB, deviceLDS)`; vsfeel now uses the same
+  predicate, then still requires its own wider tile to fit. On this 64 KiB
+  device R=49 is shared on both sides and R=50..52 is plain on both; before
+  the change vsfeel stayed shared through R=52 and the border pixels diverged
+  by 0.024 against vszipcl (measured on 64x64 f32). Every shared-kernel cell
+  in the radius × guide matrix still wins (1.00–2.65x); every plain-kernel
+  cell loses.
+- **The R=24 loss was LDS occupancy, not ACO VOPD packing.** Under the old
+  48 KiB gate, reserving one whole tile instead of `(1 + has_ref)` doubled the
+  LDS at every radius and pushed R∈[21,27] guide and R∈[28,43] no-guide over
+  the cap; with the sizing fixed, R=24 no-guide went 345 → 407.8 fps (1.12x vs
+  reference) because 40 960 → 20 480 B raised the fit from 1 to 3 workgroups/CU.
+  The "ACO VOPD=0" theory is retired.
 - **Default block shape is a real knob at wide radii**: R=3 32x8 (2449), R=9 32x8
   (1742) > 16x8 (1707) > 16x16 (1705), R=12 32x16 (1360) ≈ 32x8, R=24 16x16
   (345) ≫ 16x8 (228). The auto rule (`32x8` R≤12, `32x16` above) is unchanged by

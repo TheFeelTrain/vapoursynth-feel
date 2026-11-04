@@ -252,6 +252,22 @@ def test_bilateral_radius_sweep_matches_reference_f32(clip_grays, radius):
     assert worst < REF_TOL, f"max diff {worst}"
 
 
+@pytest.mark.parametrize("radius", [45, 49, 50, 52, 53])
+def test_bilateral_wide_radius_gate_matches_reference_f32(clip_grays, radius):
+    """The shared/plain gate must follow vszipcl's 48 KiB reference budget.
+
+    R=50..52 is the band where the device's 64 KiB LDS budget used to keep
+    the shared kernel while vszipcl had already dropped to the plain gather;
+    their border pixels differ, so this is a direct oracle for the gate.
+    """
+    worst = _compare(
+        "grays",
+        (0, 11),
+        dict(sigma_spatial=2.0, sigma_color=0.05, radius=radius),
+    )
+    assert worst < REF_TOL, f"max diff {worst}"
+
+
 @pytest.mark.parametrize("use_shared_memory", [True, False], ids=["shared", "plain"])
 def test_bilateral_shader_variants_match_vszipcl_f32(clip_grays, use_shared_memory):
     """Both shader variants (shared LDS tile and plain gather) track the

@@ -543,6 +543,29 @@ def test_push_descriptor_limit_is_reported():
     assert "push descriptors" in err and "4" in err, res["nlmeans"]
 
 
+def test_bilateral_explicit_block_fits_reduced_invocation_budget():
+    """An explicit 4x16 block on a 32-invocation device must clamp, not error.
+
+    The old fallback replaced both dimensions with 16x16 and then halved; the
+    valid X=4 request was lost. Creation still succeeds either way, so this
+    pins the no-error path and the finite output, while the shape preservation
+    is covered by inspection in the host code.
+    """
+    res = _run_limits(
+        [
+            {
+                "label": "bilateral",
+                "filter": "bilateral",
+                "params": {"block_x": 4, "block_y": 16},
+            }
+        ],
+        {"VSFEEL_LIMIT_INVOCATIONS": "32"},
+    )
+    out = res["bilateral"]
+    assert "error" not in out, out
+    assert out["finite"], out
+
+
 def test_two_dimensional_grid_overflow_is_reported():
     """A 2D tiling kernel cannot fold an over-wide plane into Y.
 
