@@ -950,9 +950,10 @@ def test_eedi3_field_gt1_doubles_frames():
 
 
 def test_eedi3_output_props_progressive_and_duration():
-    """Output frames are progressive (_FieldBased=0) and under field>1 the
-    duration is halved (fps doubles) — the standard EEDI3 deinterlace props."""
-    clip = noise_u16()
+    """Output frames are progressive (_FieldBased=0), drop the input's _Field,
+    and under field>1 the duration is halved (fps doubles) -- the standard
+    EEDI3 deinterlace props."""
+    clip = vs.core.std.SetFrameProp(noise_u16(), prop="_Field", intval=1)
     s0 = clip.get_frame(0).props
     sn, sd = s0.get("_DurationNum"), s0.get("_DurationDen")
     for field, factor in ((1, 1), (3, 2)):
@@ -963,6 +964,7 @@ def test_eedi3_output_props_progressive_and_duration():
         for n in (0, min(out.num_frames - 1, 5)):
             pr = out.get_frame(n).props
             assert pr.get("_FieldBased") == 0, f"_FieldBased not progressive (n={n})"
+            assert "_Field" not in pr, f"stale _Field at n={n}"
             on, od = pr.get("_DurationNum"), pr.get("_DurationDen")
             # duration on/od == (1/factor) * sn/sd, compared without floats
             assert on is not None and od is not None, f"no duration props (n={n})"

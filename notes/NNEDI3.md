@@ -13,8 +13,9 @@ Status: **shipped on the R80 GPU API.** Design (current):
 - The kernels read the source plane in place (field row `f` → source row
   `DH ? f : 2f+parity` at the plane's own pitch) and write interpolated row `r`
   straight into the output plane at `2r + (1-parity)`. `ENTRY_KEEP` copies the
-  kept rows and, on a skipped plane under `dh`, zero-fills the interpolated
-  rows. `DH`/`ZERO` are spec constants (ids 9/10; 11 spec entries total).
+  kept rows. `DH` is a spec constant (id 9; 10 spec entries total), and
+  `dh=True` requires every plane to be processed (a subset is a creation
+  error, as in EEDI3).
 - Per frame: one transient device-local scratch (`width*rows*4 B` list +
   16 B indirect struct per plane) handed to the recording context; six push
   words `{a_base, src_stride, dst_stride, parity, d_base, max_grid_x}` (the
@@ -30,8 +31,9 @@ Status: **shipped on the R80 GPU API.** Design (current):
   with nnedi3vk f16**; without the feature, or with
   `VSFEEL_NNEDI3_PRED16=0`, the f16 kernels keep the f32 arithmetic and stay
   within one half step of the f32 path. u16 and f32 are unchanged.
-- Runs need `RADV_EXPERIMENTAL=transfer_queue`, which `tools/benchmark.py`
-  forces (mechanism: `notes/BILATERAL.md`).
+- Benchmark runs force `RADV_EXPERIMENTAL=transfer_queue` for the core's
+  transfer queue; the filter itself creates no queue (mechanism:
+  `notes/BILATERAL.md`).
 
 Scoreboard — jpbd 1080p, bench defaults (`field=3 dh=0 nsize=0 nns=4 qual=2
 etype=0 pscrn=4`), 5000 frames, medians of 3 through `tools/benchmark.py`:
@@ -108,8 +110,8 @@ etype=0 pscrn=4`), 5000 frames, medians of 3 through `tools/benchmark.py`:
   prescreen → compute→(compute|indirect) barrier → indirect predict →
   declare reads/writes → submit → props (`_FieldBased=0`, `_Field` deleted,
   `field>1` halves duration). Plane regions are disjoint, so nothing else is
-  ordered. Under `dh`, a planes subset zeroes interp lines on skipped planes
-  (deliberate; the reference leaves them uninitialized).
+  ordered. `dh=True` requires every plane to be processed; a subset is a
+  creation error, so there is no zero-filled skipped plane.
 - Grids: prescreen `ceil(rows*ceil(width/P)/128)` (P=1 at pscrn=1 else 4 —
   grouping is per ROW, so this exact form is what covers non-divisible row
   tails); predict indirect off the prescreen count (prescreen keeps `groupsX`
@@ -132,7 +134,8 @@ etype=0 pscrn=4`), 5000 frames, medians of 3 through `tools/benchmark.py`:
   the packed path ships one predict module.
 - Weights: blob parsed at creation (prescreener mean/scale, model
   mean-subtraction projected out), packed into three vec4/vec2-layout blobs
-  and written through persistently mapped host-visible buffers + `_mm_sfence`.
+  and written through persistently mapped host-visible buffers plus
+  `store_fence()`.
 - f16 io adds `-DIO_F16` variants of all three kernels plus `-DPRED16=1` for
   the packed predictor **and its prescreen** (the compaction's `ppg = 4*PX`
   must equal the predictor's pixels per subgroup, so the pair ships together).
@@ -186,10 +189,11 @@ figures are void as current-filter numbers (same marker as
 
 - **The dispatch grids folded into Y** — every dimension is capped at 65535
   workgroups (this box's Y limit; X only looks unlimited here), and a 3840x2160
-  `pscrn=0` plane needs 129600 of them, so the grid would have been dispatched
-  truncated -- pixels silently never written. Both kernels now index
-  `ID.y * NumWorkGroups.x + ID.x`, the host folds the direct grids and the
-  compaction publishes the folded Y for the indirect predictor. Verified
+  `pscrn=0` plane needs >=259200 of them (518400 without PXP=8), so the grid
+  would have been dispatched truncated -- pixels silently never written. Both
+  kernels now index `ID.y * NumWorkGroups.x + ID.x`, the host folds the direct
+  grids and the compaction publishes the folded Y for the indirect predictor.
+  Verified
   bit-identical with `VSFEEL_LIMIT_GRID_X=4` (`tests/test_device_limits.py`).
 - **Weight-buffer locality is reported, not fixed** — the three weight buffers
   ask for host-visible + device-local-preferred, which lands them in VRAM on a
@@ -207,7 +211,7 @@ figures are void as current-filter numbers (same marker as
   12 KiB) now covers every window but the 48x6 network and FS=288 reports
   `18432` against the limit instead of failing inside the driver. Every pipeline
   is measured against the device the same way (`gpu_create_pipeline`), so a
-  128-invocation device gets "needs a 32x8x1 workgroup (256 invocations)" per
+  128-invocation device gets "needs a 256x1x1 workgroup (256 invocations)" per
   kernel rather than a `vkCreateComputePipelines` failure; `tools/shader_limits.py`
   prints the per-variant numbers those checks are built from, and
   `VSFEEL_LIMIT_SHARED_MEMORY` / `VSFEEL_LIMIT_INVOCATIONS` /
@@ -293,8 +297,9 @@ upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
 - **`dh` refuses a height past `INT32_MAX/2`** before doubling `vi_out.height`
   (an `int`); the later geometry check would otherwise fire only after the
   signed overflow.
-- **`mstd2` deleted** (written, never read — the tile is normalized through the
-  local `m2`); the header/host comments naming it are gone.
+- **`mstd2` is PRED16 state.** The non-PRED16 tile is normalized through the
+  local `m2`; the packed predictor keeps `mstd2[4]` for its correlation. The
+  old "written, never read" note described only the non-PRED16 path.
 
 ### Measured dead ends (mechanisms)
 
@@ -343,9 +348,9 @@ upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
   explicitly; covered by `tests/test_validation.py`.
 - `numFrames == -1` is the unknown-length sentinel: `field>1` doubling is
   guarded (`numFrames > 0`), same fix as EEDI3.
-- Pipeline teardown deduped into a fixed six-entry set, so a YUV420 `dh` clip
-  with `planes=[0,1]` (seven pipelines: two processed planes plus the skipped
-  plane's zero-fill keep) leaked the seventh. The set is unbounded now.
+- Pipeline teardown is deduped across all per-plane roles; the old fixed
+  six-entry set leaked a pipeline once a `dh` planes subset added a skipped
+  plane's keep (`dh` now requires every plane, so that case is gone).
 - `has_subgroup_size` read the size bounds but not
   `requiredSubgroupSizeStages`, so a device whose mask omits COMPUTE was handed
   an invalid `requiredSubgroupSize`. It is refused now: DFTTest/NLMeans/BM3D
@@ -377,13 +382,16 @@ upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
 
 ## Debug env vars
 
-All in `src/nnedi3.cpp`.
+The filter knobs are in `src/nnedi3.cpp`; `VSFEEL_DEBUG`/`VSFEEL_TRACE` are
+the global switches in `src/vsfeel.h`.
 
 | env | what it does |
 |---|---|
 | `VSFEEL_NNEDI3_TSTAMP=<frame>` | one-shot GPU stamps for that frame: top / prescreen done / predict done (default 100; gated on the queue family's `timestampValidBits`) |
 | `VSFEEL_NNEDI3_TIMING=1` | per-frame host stage averages (acquire/record/submit/total) printed at teardown |
 | `VSFEEL_NNEDI3_PRED16=0` | force the storage-only f16 kernels instead of the packed half predictor (default on where the device has `shaderFloat16`) |
+| `VSFEEL_DEBUG=1\|2` | device banner and full error trail; level 2 also enables the probe traces |
+| `VSFEEL_TRACE=1\|2` | first 50 / every trace line (the banner is also printed) |
 
 `BENCH`, `COUNT`, `SKIPIL` and `QUEUES` were deleted with the pre-R80
 machinery; `TSTAMP` became a one-shot probe and `BENCH` was renamed `TIMING`.

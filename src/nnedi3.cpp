@@ -48,7 +48,7 @@ using namespace std::string_literals;
 // producer pairs the exec pool publishes.
 //
 // Per plane (src/nnedi3.comp):
-//   ENTRY_KEEP      kept rows (and the dh zero-fill of skipped planes)
+//   ENTRY_KEEP      kept rows straight into the output plane
 //   ENTRY_PRESCREEN cubic taps + prescreener decision, compacts rejected
 //                   pixel indices and maintains the indirect grid size
 //   ENTRY_PREDICT   the network over the listed pixels, launched indirectly
@@ -474,10 +474,7 @@ struct Nnedi3Data {
             pool = nullptr;
         }
         VkDevice dev = gpu->device;
-        // One pipeline per (plane, role): three planes times pre/pred/keep. A
-        // fixed six-entry dedup set leaked the seventh -- YUV420 with dh and
-        // planes=[0,1] makes one for each processed plane plus the skipped
-        // plane's zero-fill keep.
+        // One pipeline per (plane, role): three planes times pre/pred/keep.
         std::vector<VkPipeline> seen;
         for (auto & plane : planes) {
             const VkPipeline pipes[3] { plane.pre_pipeline, plane.pred_pipeline,
@@ -512,12 +509,12 @@ struct Nnedi3Data {
 // ---------------------------------------------------------------------------
 
 struct Nnedi3Spec {
-    int32_t width, rows, peak, pscrn, xdim, ydim, nns, qual, use_list, dh, zero;
+    int32_t width, rows, peak, pscrn, xdim, ydim, nns, qual, use_list, dh;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 11> spec_entries = [] {
-    std::array<VkSpecializationMapEntry, 11> e {};
-    for (uint32_t i = 0; i < 11; ++i) {
+static constexpr std::array<VkSpecializationMapEntry, 10> spec_entries = [] {
+    std::array<VkSpecializationMapEntry, 10> e {};
+    for (uint32_t i = 0; i < 10; ++i) {
         e[i] = { i, i * static_cast<uint32_t>(sizeof(int32_t)),
                  sizeof(int32_t) };
     }
@@ -603,20 +600,20 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
     const int numPlanes = d->vi->format.numPlanes;
     const VSFrame * src = vsapi->getFrameFilter(sn, d->node, frameCtx);
 
-    // Output frame: every plane is fresh when all are processed or dh doubles
-    // the height (unprocessed planes then need the keep kernel's expand too);
-    // otherwise the unprocessed planes share the source's, producer pairs and
-    // all. newVideoFrame2 infers residency from the shared planes.
+    // Output frame: every plane is fresh when all are processed; otherwise the
+    // unprocessed planes share the source's, producer pairs and all.
+    // newVideoFrame2 infers residency from the shared planes. dh always
+    // processes every plane (enforced at creation), so it takes the fresh path.
     bool all_process = true;
     for (int p = 0; p < numPlanes; ++p) {
         all_process &= d->process[p];
     }
     const int pl[] = { 0, 1, 2 };
-    const VSFrame * fr[] = { (!d->dh && !d->process[0]) ? src : nullptr,
-                             (!d->dh && !d->process[1]) ? src : nullptr,
-                             (!d->dh && !d->process[2]) ? src : nullptr };
+    const VSFrame * fr[] = { d->process[0] ? nullptr : src,
+                             d->process[1] ? nullptr : src,
+                             d->process[2] ? nullptr : src };
     VSFrame * dst =
-        (all_process || d->dh)
+        all_process
             ? d->gpu->api->newGPUVideoFrame(&d->vi_out.format, d->vi_out.width,
                                             d->vi_out.height, src, core)
             : vsapi->newVideoFrame2(&d->vi_out.format, d->vi_out.width,
@@ -721,8 +718,7 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
     // so no barrier separates them; only the two stages of one list-mode plane
     // are ordered.
     for (int p = 0; p < numPlanes; ++p) {
-        const bool keep = d->process[p] || d->dh;
-        if (!keep) {
+        if (!d->process[p]) {
             continue;
         }
         const auto & cfg = d->planes[p];
@@ -753,8 +749,8 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
                                     d->use_list ? scratch.buffer : sp.buffer };
         gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 7);
 
-        // Kept rows (and the dh zero-fill of a skipped plane) straight into
-        // the output plane; they overlap nothing the network writes.
+        // Kept rows straight into the output plane; they overlap nothing the
+        // network writes.
         {
             const int32_t push[5] { 0, src_stride, dst_stride, parity, 0 };
             gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push,
@@ -889,19 +885,7 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
 
     vsapi->freeFrame(src);
 
-    VSMap * props = vsapi->getFramePropertiesRW(dst);
-    vsapi->mapSetInt(props, "_FieldBased", VSC_FIELD_PROGRESSIVE, maReplace);
-    vsapi->mapDeleteKey(props, "_Field");
-    if (d->field > 1) {
-        int err_num, err_den;
-        int64_t dur_num = vsapi->mapGetInt(props, "_DurationNum", 0, &err_num);
-        int64_t dur_den = vsapi->mapGetInt(props, "_DurationDen", 0, &err_den);
-        if (!err_num && !err_den) {
-            vsh::muldivRational(&dur_num, &dur_den, 1, 2);
-            vsapi->mapSetInt(props, "_DurationNum", dur_num, maReplace);
-            vsapi->mapSetInt(props, "_DurationDen", dur_den, maReplace);
-        }
-    }
+    vsfeel_mark_progressive(dst, d->field > 1, vsapi);
 
     return dst;
 }
@@ -996,6 +980,16 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
     }
     if (!any_process) {
         return set_error("no planes to process.");
+    }
+    if (d->dh) {
+        // Every doubled output plane needs both the kept-row writer and the
+        // predictor; an unprocessed plane would have no interpolated rows.
+        for (int p = 0; p < fmt.numPlanes; ++p) {
+            if (!d->process[p]) {
+                return set_error(
+                    "dh=True requires every plane to be processed.");
+            }
+        }
     }
 
     const int nsize =
@@ -1329,8 +1323,8 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         return set_error(e);
     }
 
-    // Shader blobs for this io depth (the entry point by role; dh / the zero
-    // fill are specialization constants).
+    // Shader blobs for this io depth (the entry point by role; dh is a
+    // specialization constant).
     const uint32_t * pre_code = nullptr;
     size_t pre_size = 0;
     const uint32_t * pred_code = nullptr;
@@ -1445,7 +1439,7 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
     };
 
     struct Key {
-        int w, rows, pscrn, xdim, ydim, nns, qual, zero;
+        int w, rows, pscrn, xdim, ydim, nns, qual;
     };
     std::array<Key, 3> keys {};
     std::array<VkPipeline, 3> pre_pipes {};
@@ -1456,10 +1450,10 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
 
     for (int plane = 0; plane < fmt.numPlanes; ++plane) {
         // Geometry follows the INPUT clip (d->vi), not the output: rows is
-        // the field height (input rows in dh mode, half otherwise). Under dh
-        // a skipped plane still needs the kept-row writer (expand + zero).
-        const bool zero = d->dh && !d->process[plane];
-        if (!d->process[plane] && !d->dh) {
+        // the field height (input rows in dh mode, half otherwise). dh
+        // requires every plane to be processed, so there is no skipped-plane
+        // keep writer any more.
+        if (!d->process[plane]) {
             continue;
         }
         auto & cfg = d->planes[plane];
@@ -1469,64 +1463,58 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
             plane == 0 ? d->vi->height : d->vi->height >> fmt.subSamplingH;
         cfg.width = in_w;
         cfg.rows = d->dh ? in_h : in_h / 2;
-        // 2* in the bound: the dh zero-fill indexes the whole doubled output.
-        if (static_cast<int64_t>(2) * cfg.width * cfg.rows >=
-                (int64_t(1) << 31) ||
+        if (static_cast<int64_t>(cfg.width) * cfg.rows >= (int64_t(1) << 31) ||
             cfg.rows < 1 || cfg.width < 1) {
             return set_error("plane geometry out of range.");
         }
 
-        if (d->process[plane]) {
-            // prescreen: one thread per pixel group (P=1 old, P=4 new), one
-            // group of 128 threads. The shader groups pixels per ROW as
-            // ceil(width/P), so the grid must cover rows*ceil(width/P)
-            // threads -- never ceil(width*rows/P), which leaves the tail of
-            // every non-divisible row unwritten. Only the list path dispatches
-            // it, so only that path has to fit the device's group count.
-            if (d->use_list) {
-                const uint32_t pps = d->pscrn == 1 ? 1 : 4;
-                const uint32_t groups_per_row =
-                    (static_cast<uint32_t>(cfg.width) + pps - 1) / pps;
-                if (auto e = fold_grid(
-                        (static_cast<uint32_t>(cfg.rows) * groups_per_row +
-                         127) /
-                            128,
-                        "prescreen", cfg.pre_grid_x, cfg.pre_grid_y)) {
-                    return set_error(*e);
-                }
-            }
-            // cooperative direct grid (pscrn==0): 4 subgroups x PXP pixels
-            // per 128-thread workgroup. The packed half predictor is PXP=4.
-            const int host_pxp =
-                d->pred16 ? static_cast<int>(kPackedPxp)
-                          : (use_pxp8(d->nns, d->xdim * d->ydim) ? 8 : 4);
-            const uint32_t ppg = static_cast<uint32_t>(4 * host_pxp);
-            if (auto e = fold_grid((static_cast<uint32_t>(cfg.width) *
-                                        static_cast<uint32_t>(cfg.rows) +
-                                    ppg - 1) /
-                                       ppg,
-                                   "direct predictor", cfg.pred_grid_direct_x,
-                                   cfg.pred_grid_direct_y)) {
+        // prescreen: one thread per pixel group (P=1 old, P=4 new), one
+        // group of 128 threads. The shader groups pixels per ROW as
+        // ceil(width/P), so the grid must cover rows*ceil(width/P)
+        // threads -- never ceil(width*rows/P), which leaves the tail of
+        // every non-divisible row unwritten. Only the list path dispatches
+        // it, so only that path has to fit the device's group count.
+        if (d->use_list) {
+            const uint32_t pps = d->pscrn == 1 ? 1 : 4;
+            const uint32_t groups_per_row =
+                (static_cast<uint32_t>(cfg.width) + pps - 1) / pps;
+            if (auto e = fold_grid(
+                    (static_cast<uint32_t>(cfg.rows) * groups_per_row + 127) /
+                        128,
+                    "prescreen", cfg.pre_grid_x, cfg.pre_grid_y)) {
                 return set_error(*e);
             }
-
-            // Scratch regions: the list holds one uint per field pixel, then
-            // this plane's 16-byte indirect struct.
-            cfg.list_offset = align32(list_run);
-            list_run =
-                align32(cfg.list_offset + static_cast<VkDeviceSize>(cfg.width) *
-                                              cfg.rows * sizeof(uint32_t));
-            cfg.ind_offset = align32(list_run);
-            list_run = align32(cfg.ind_offset + 16);
-            cfg.list_elem = static_cast<int32_t>(cfg.list_offset / 4);
-            cfg.ind_elem = static_cast<int32_t>(cfg.ind_offset / 4);
         }
+        // cooperative direct grid (pscrn==0): 4 subgroups x PXP pixels per
+        // 128-thread workgroup. The packed half predictor is PXP=4.
+        const int host_pxp =
+            d->pred16 ? static_cast<int>(kPackedPxp)
+                      : (use_pxp8(d->nns, d->xdim * d->ydim) ? 8 : 4);
+        const uint32_t ppg = static_cast<uint32_t>(4 * host_pxp);
+        if (auto e = fold_grid((static_cast<uint32_t>(cfg.width) *
+                                    static_cast<uint32_t>(cfg.rows) +
+                                ppg - 1) /
+                                   ppg,
+                               "direct predictor", cfg.pred_grid_direct_x,
+                               cfg.pred_grid_direct_y)) {
+            return set_error(*e);
+        }
+
+        // Scratch regions: the list holds one uint per field pixel, then this
+        // plane's 16-byte indirect struct.
+        cfg.list_offset = align32(list_run);
+        list_run =
+            align32(cfg.list_offset + static_cast<VkDeviceSize>(cfg.width) *
+                                          cfg.rows * sizeof(uint32_t));
+        cfg.ind_offset = align32(list_run);
+        list_run = align32(cfg.ind_offset + 16);
+        cfg.list_elem = static_cast<int32_t>(cfg.list_offset / 4);
+        cfg.ind_elem = static_cast<int32_t>(cfg.ind_offset / 4);
 
         // The kept-row writer's grid is linearized over x and y, so a 4K
         // double-rate plane stays under the 65535-group x limit.
         {
-            const int64_t total =
-                static_cast<int64_t>(zero ? 2 : 1) * cfg.rows * cfg.width;
+            const int64_t total = static_cast<int64_t>(cfg.rows) * cfg.width;
             const int64_t gx =
                 std::clamp<int64_t>((total + 255) / 256, 1, max_grid_x);
             cfg.keep_grid_x = static_cast<uint32_t>(gx);
@@ -1539,17 +1527,15 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
             if (keys[ki].w == cfg.width && keys[ki].rows == cfg.rows &&
                 keys[ki].pscrn == d->pscrn && keys[ki].xdim == d->xdim &&
                 keys[ki].ydim == d->ydim && keys[ki].nns == d->nns &&
-                keys[ki].qual == d->qual && keys[ki].zero == zero) {
+                keys[ki].qual == d->qual) {
                 break;
             }
         }
         if (ki == n_keys) {
-            const Nnedi3Spec spec {
-                cfg.width,     cfg.rows,    d->peak,
-                d->pscrn,      d->xdim,     d->ydim,
-                d->nns,        d->qual,     d->use_list ? 1 : 0,
-                d->dh ? 1 : 0, zero ? 1 : 0
-            };
+            const Nnedi3Spec spec { cfg.width,    cfg.rows, d->peak,
+                                    d->pscrn,     d->xdim,  d->ydim,
+                                    d->nns,       d->qual,  d->use_list ? 1 : 0,
+                                    d->dh ? 1 : 0 };
             // Each handle lands in d->planes the moment it is created: a later
             // create for this key (keep is the 256-invocation one) can still
             // fail, and the destructor walks only d->planes, so a handle left
@@ -1622,7 +1608,7 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
                 cfg.keep_pipeline = keep_pipes[n_keys];
             }
             keys[n_keys] = { cfg.width, cfg.rows, d->pscrn, d->xdim,
-                             d->ydim,   d->nns,   d->qual,  zero };
+                             d->ydim,   d->nns,   d->qual };
             ++n_keys;
         } else {
             // A key already built by an earlier plane: share its handles.
@@ -1632,6 +1618,13 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         }
     }
     d->scratch_bytes = d->use_list ? std::max<VkDeviceSize>(list_run, 16) : 4;
+    if (d->scratch_bytes > d->gpu->limits.maxStorageBufferRange) {
+        return set_error(
+            "the per-frame scratch (" + std::to_string(d->scratch_bytes) +
+            " bytes) exceeds this device's maxStorageBufferRange (" +
+            std::to_string(d->gpu->limits.maxStorageBufferRange) +
+            " bytes); lower the frame size");
+    }
 
     // GPU-timing probe: only when the queue family can timestamp at all, since
     // a timestamp write where timestampValidBits is 0 can hang the engine.

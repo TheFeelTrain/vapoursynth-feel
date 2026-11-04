@@ -510,7 +510,8 @@ def test_nnedi3_dh_doubles_height(clip_gray16):
 
 
 def test_nnedi3_output_props_progressive(clip_gray16):
-    out = _run(clip_gray16, field=3)
+    clip = vs.core.std.SetFrameProp(clip_gray16, prop="_Field", intval=1)
+    out = _run(clip, field=3)
     props = out.get_frame(1).props
     assert props["_FieldBased"] == 0
     assert "_Field" not in props
@@ -656,6 +657,14 @@ def test_nnedi3_rejects_bad_planes(clip_gray16):
         _run(clip_gray16, planes=[0, 0])
     with pytest.raises(vs.Error):
         _run(clip_gray16, planes=[3])
+
+
+def test_nnedi3_rejects_dh_planes_subset(clip_yuv420p16):
+    """dh doubles every plane, so a skipped plane would have no interpolated
+    rows. EEDI3 rejects this too; zero-filling the missing rows is not a valid
+    output."""
+    with pytest.raises(vs.Error, match="dh=True requires every plane"):
+        _run(clip_yuv420p16, field=1, dh=1, planes=[0])
 
 
 def test_nnedi3_rejects_odd_height(clip_gray16):

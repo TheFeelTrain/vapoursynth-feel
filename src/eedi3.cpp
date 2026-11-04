@@ -1412,21 +1412,7 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
     }
 
     for (auto & p : produced) {
-        VSMap * props = vsapi->getFramePropertiesRW(p.second);
-        vsapi->mapSetInt(props, "_FieldBased", VSC_FIELD_PROGRESSIVE,
-                         maReplace);
-        if (d->field > 1) {
-            int errNum, errDen;
-            int64_t durationNum =
-                vsapi->mapGetInt(props, "_DurationNum", 0, &errNum);
-            int64_t durationDen =
-                vsapi->mapGetInt(props, "_DurationDen", 0, &errDen);
-            if (!errNum && !errDen) {
-                vsh::muldivRational(&durationNum, &durationDen, 1, 2);
-                vsapi->mapSetInt(props, "_DurationNum", durationNum, maReplace);
-                vsapi->mapSetInt(props, "_DurationDen", durationDen, maReplace);
-            }
-        }
+        vsfeel_mark_progressive(p.second, d->field > 1, vsapi);
     }
     if (VSFrame * out = eedi3_publish(d, n, last, produced, vsapi)) {
         return out;
@@ -1858,9 +1844,7 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
         vsapi->freeFrame(f);
     }
     for (auto & p : produced) {
-        VSMap * props = vsapi->getFramePropertiesRW(p.second);
-        vsapi->mapSetInt(props, "_FieldBased", VSC_FIELD_PROGRESSIVE,
-                         maReplace);
+        vsfeel_mark_progressive(p.second, false, vsapi);
     }
     if (VSFrame * out = eedi3_publish(d, n, last, produced, vsapi)) {
         return out;

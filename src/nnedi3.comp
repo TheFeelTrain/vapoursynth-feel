@@ -28,8 +28,7 @@
  *   ENTRY_PRESCREEN — per output pixel group: cubic taps, prescreener
  *                     decision, cubic store or list compaction
  *   ENTRY_PREDICT   — predictor network over listed (or all) pixels
- *   ENTRY_KEEP      — kept (and, under dh on a skipped plane, zeroed) rows
- *                     straight into the output frame plane
+ *   ENTRY_KEEP      — kept rows straight into the output frame plane
  *
  * The kernels read the source frame plane in place at its own row pitch
  * (field row f is source row DH ? f : 2f+parity) and write interpolated
@@ -89,10 +88,8 @@ layout(constant_id = 6) const int NNS = 32;
 layout(constant_id = 7) const int QUAL = 1;
 layout(constant_id = 8) const int USE_LIST = 1;
 // dh doubles the height: the whole source plane is the field, otherwise the
-// field is every second source row starting at pc.parity (ENTRY_KEEP only
-// reads ZERO).
+// field is every second source row starting at pc.parity.
 layout(constant_id = 9) const int DH = 0;
-layout(constant_id = 10) const int ZERO = 0;
 
 const int FS = XDIM * YDIM;
 
@@ -682,9 +679,7 @@ void main() {
 #elif defined(ENTRY_KEEP)
 
 // Kept-row writer: output rows of parity pc.parity are copies of their source
-// row (identity when dh=0, the field row when dh=1). On a skipped plane under
-// dh the interpolated rows have no producer, so ZERO fills them -- the output
-// frame plane is fresh memory there and the host used to zero it itself.
+// row (identity when dh=0, the field row when dh=1).
 //
 // The grid is linearized across x and y (i = ID.y * groups.x * 256 + ID.x),
 // which keeps a 4K double-rate plane (16.6M pixels) under the guaranteed
@@ -695,25 +690,14 @@ void main() {
     const int per_group = int(gl_NumWorkGroups.x) * 256;
     const int i = int(gl_GlobalInvocationID.y) * per_group +
                   int(gl_GlobalInvocationID.x);
-    const int total = (ZERO != 0) ? (2 * ROWS * WIDTH) : (ROWS * WIDTH);
+    const int total = ROWS * WIDTH;
     if (i >= total)
         return;
     const int x = i % WIDTH;
-    if (ZERO != 0) {
-        const int y = i / WIDTH;
-        if (((y - pc.parity) & 1) == 0) {
-            const int r = (y - pc.parity) >> 1;
-            dstBuf[y * pc.dst_stride + x] = fieldBuf[r * pc.src_stride + x];
-        } else {
-            // storeDst addresses exactly the (1-parity) rows by construction.
-            storeDst((y - (1 - pc.parity)) >> 1, x, 0.0);
-        }
-    } else {
-        const int r = i / WIDTH;
-        const int y = 2 * r + pc.parity;
-        const int sy = (DH != 0) ? r : y;
-        dstBuf[y * pc.dst_stride + x] = fieldBuf[sy * pc.src_stride + x];
-    }
+    const int r = i / WIDTH;
+    const int y = 2 * r + pc.parity;
+    const int sy = (DH != 0) ? r : y;
+    dstBuf[y * pc.dst_stride + x] = fieldBuf[sy * pc.src_stride + x];
 }
 
 #endif

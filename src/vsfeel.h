@@ -26,6 +26,8 @@
 #define VS_USE_API_43
 #endif
 #include <VapourSynth4.h>
+#include <VSConstants4.h>
+#include <VSHelper4.h>
 #include <VSVulkan4.h>
 
 using namespace std::string_literals;
@@ -44,6 +46,28 @@ using namespace std::string_literals;
 // the portable spelling is what lets this build on arm64 as well as x86-64.
 inline void store_fence() {
     std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+// Mark a deinterlacer's output as progressive and drop the input's field tag.
+// `doubled` halves a tagged duration when the filter doubled the frame rate;
+// EEDI3H/EEDI3AA keep the frame count and pass false.
+inline void vsfeel_mark_progressive(VSFrame * frame, bool doubled,
+                                    const VSAPI * vsapi) {
+    VSMap * props = vsapi->getFramePropertiesRW(frame);
+    vsapi->mapSetInt(props, "_FieldBased", VSC_FIELD_PROGRESSIVE, maReplace);
+    vsapi->mapDeleteKey(props, "_Field");
+    if (!doubled) {
+        return;
+    }
+    int err_num = 0;
+    int err_den = 0;
+    int64_t num = vsapi->mapGetInt(props, "_DurationNum", 0, &err_num);
+    int64_t den = vsapi->mapGetInt(props, "_DurationDen", 0, &err_den);
+    if (!err_num && !err_den) {
+        vsh::muldivRational(&num, &den, 1, 2);
+        vsapi->mapSetInt(props, "_DurationNum", num, maReplace);
+        vsapi->mapSetInt(props, "_DurationDen", den, maReplace);
+    }
 }
 
 #define checkVK(expr)                                                          \

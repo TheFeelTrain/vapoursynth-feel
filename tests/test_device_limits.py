@@ -45,6 +45,8 @@ spec = json.loads(sys.argv[1])
 src = core.bs.VideoSource(spec["source"])
 clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                           bits=32, fulls=True, fulld=True)
+clip_large = core.resize.Bicubic(clip, width=1920, height=1080,
+                                 format=vs.GRAYS)
 clip16 = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                             bits=16, fulls=True, fulld=True)
 
@@ -52,6 +54,8 @@ clip16 = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
 def build(name, params):
     if name == "nnedi3":
         return core.vsfeel.NNEDI3(clip, field=1, **params)
+    if name == "nnedi3_large":
+        return core.vsfeel.NNEDI3(clip_large, field=1, **params)
     if name == "eedi3":
         return core.vsfeel.EEDI3(clip, field=1, **params)
     if name == "eedi3h":
@@ -512,6 +516,22 @@ def test_dfttest_scratch_range_is_a_creation_error():
     err = res["dfttest"].get("error", "")
     assert "padded window" in err and "maxStorageBufferRange" in err, res["dfttest"]
     assert str(1 << 20) in err, res["dfttest"]
+
+
+def test_nnedi3_scratch_range_is_a_creation_error():
+    """The list/indirect scratch is checked before the first frame.
+
+    A 1080p field needs ~3.95 MiB; 2 MiB leaves the weight buffers (about
+    1.2 MiB) room and makes the per-frame scratch the first thing over the
+    limit.
+    """
+    res = _run_limits(
+        [{"label": "nnedi3", "filter": "nnedi3_large"}],
+        {"VSFEEL_LIMIT_STORAGE_RANGE": str(2 << 20)},
+    )
+    err = res["nnedi3"].get("error", "")
+    assert "per-frame scratch" in err and "maxStorageBufferRange" in err, res["nnedi3"]
+    assert str(2 << 20) in err, res["nnedi3"]
 
 
 def test_push_descriptor_limit_is_reported():

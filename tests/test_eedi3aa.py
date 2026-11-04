@@ -381,12 +381,14 @@ def test_eedi3aa_parallel_load_consistent(clip_gray16):
 
 def test_eedi3aa_single_rate_and_props(clip_gray16):
     """N in, N out at the input's fps, progressive, matching the chain."""
-    clip = clip_gray16
+    clip = vs.core.std.SetFrameProp(clip_gray16, prop="_Field", intval=1)
     out = _aa(clip, sclip=_interleave2(clip), mclip=_mask(clip, 16))
     assert out.num_frames == clip.num_frames
     assert (out.fps_num, out.fps_den) == (clip.fps_num, clip.fps_den)
     assert out.width == clip.width and out.height == clip.height
-    assert out.get_frame(0).props.get("_FieldBased") == 0
+    props = out.get_frame(0).props
+    assert props.get("_FieldBased") == 0
+    assert "_Field" not in props
 
 
 def test_eedi3aa_props_match_chain(clip_gray16):

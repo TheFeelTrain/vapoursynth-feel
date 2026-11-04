@@ -228,7 +228,7 @@ def test_eedi3h_vszipcl_loose(clip_gray16):
 
 def test_eedi3h_output_dims_and_props(clip_gray16):
     """Width/height/frames follow the horizontal convention."""
-    clip = clip_gray16
+    clip = vs.core.std.SetFrameProp(clip_gray16, prop="_Field", intval=1)
     base = _runh(clip, field=1, mdis=5)
     assert (base.width, base.height) == (WIDTH, HEIGHT)
     assert base.num_frames == clip.num_frames
@@ -239,6 +239,7 @@ def test_eedi3h_output_dims_and_props(clip_gray16):
     assert (dbl.width, dbl.height) == (WIDTH, HEIGHT)
     props = dbl.get_frame(0).props
     assert props["_FieldBased"] == 0  # progressive
+    assert "_Field" not in props
     # Duration halved under field>1 (same rule as EEDI3). The helper tags the
     # source, so a dropped duration is a failure rather than a skipped check.
     assert_preserves_frame_props(_runh, clip, frames=(0,), field=3, mdis=5, duration_factor=2)

@@ -373,11 +373,11 @@ list(APPEND VK_EEDI3_VARIANTS
 # predictor variants for the shipped PXP selection: PXP=8 needs a 256-vec4
 # shared stride, wide networks (PXP=4) the 288 one, and FS<=64 the 64-stride
 # small tile (4KB LDS instead of 16/18KB). SHSTRIDE is always a -D so the
-# array dimension and the addressing cannot disagree. dh / the dh zero-fill
-# are specialization constants, so the kept-row writer needs one variant per
-# io type. The predictor needs subgroup ops + the Vulkan memory model, so
-# SPIR-V 1.3+. The io list is local for the usual reason: the other filters'
-# kernels would build their u16 branch under an -DIO_F16 name.
+# array dimension and the addressing cannot disagree. dh is a specialization
+# constant, so the kept-row writer needs one variant per io type. The
+# predictor needs subgroup ops + the Vulkan memory model, so SPIR-V 1.3+. The
+# io list is local for the usual reason: the other filters' kernels would
+# build their u16 branch under an -DIO_F16 name.
 set(VK_NNEDI3_IO_TYPES "u16" "f16" "f32")
 set(VK_NNEDI3_VARIANTS)
 foreach(io IN LISTS VK_NNEDI3_IO_TYPES)
