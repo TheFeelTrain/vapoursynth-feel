@@ -68,8 +68,8 @@ the native type, dropping the caller's `depth()` node (see Performance).
   aggregation's ~3e-8 jitter crosses a half tie. That equivalence plus the CPU
   reference run on the widened clip (it refuses a half input) is the oracle.
 - A u16 clip follows its frame's **`_Range`** like the CPU reference: full maps
-  the whole code range, limited 219/224 with 4096 luma and 32768 chroma offsets;
-  an f16 clip is already in the reference's float domain.
+  the whole code range, limited 219/224 with 4096 luma/RGB and 32768 chroma
+  offsets; an f16 clip is already in the reference's float domain.
 - One entry per processed plane, or one over all three planes of a 4:4:4 clip
   under `chroma=True`. An entry owns a source ring `[slot][clip][plane][h][stride]`
   and an accumulator ring `[slot][plane][2][h][stride]` (numerator, denominator);
@@ -185,9 +185,9 @@ the native type, dropping the caller's `depth()` node (see Performance).
 - Cross-frame handoff inside a request is a full pipeline barrier: the normalize
   reads the atomics the scatter just wrote, and the next centre's ring copy runs
   after the previous centre's reads. Across submissions the first barrier covers
-  everything already queued on the one compute queue. The old per-slot
-  submitted-ready handoff remains for radius 0; the temporal path no longer
-  waits host side.
+  everything already queued on the one compute queue. Radius 0 uses private
+  slots, so it has no cross-frame wait; the old submitted-ready handoff and its
+  `RINGWAIT` diagnostic are gone.
 - R80 GPU API: `clip:vnode:gpu` in and out with `ffGPUOutput`; an unprocessed
   plane is shared from the centre frame and only planes the aggregation writes are
   published. `num_streams` and `device_id` are registered no-ops. The 8-lane
@@ -239,15 +239,15 @@ the native type, dropping the caller's `depth()` node (see Performance).
 - **A u16 ring is a pessimisation; widen at copy time (+3%).** The SSD re-reads
   each source sample once per candidate origin out of an L1-resident window, so
   halving the bytes saves no DRAM traffic while the load path doubles (0.95 ->
-  1.27 ms). Widening once at copy time: 970 against 932 fps (`--format u16`),
-  and a real 16 bit chain 846 vs 634.
+  1.27 ms). Widening once at copy time: 970 against 932 fps (`--format u16`,
+  pre-wall-clock 1000-frame run), and a real 16 bit chain 846 vs 634.
 - **f16 is the same io-only win, inside the noise at the benchmark config.**
-  f16 972.4-977.9, f32 959.7-972.8, u16 969.7-973.5 (1000 frames x3). The ring
-  and the accumulators stay f32, so a half chain's win is dropping the caller's
-  `depth()` node and halving its upload/download.
+  f16 972.4-977.9, f32 959.7-972.8, u16 969.7-973.5 (pre-wall-clock 1000 frames
+  x3). The ring and the accumulators stay f32, so a half chain's win is dropping
+  the caller's `depth()` node and halving its upload/download.
 - Other denoisers gain more from u16 because they stream each byte once or twice
-  with a few ALU ops per tap (GaussBlur 2284 vs 1093, DFTTest 1132 vs 911).
-  BM3D's matcher is the opposite end, so only its io can narrow.
+  with a few ALU ops per tap (GaussBlur 2284 vs 1093, DFTTest 2144 vs 1894,
+  pre-wall-clock). BM3D's matcher is the opposite end, so only its io can narrow.
 - Marginal cost per candidate per lane: 0.0032 ms (`bm_range`), 0.0030
   (`ps_range`), with a ~1.4-2.0 ms intercept at tiny windows.
 - **The estimation launch shape comes from the device, not a fixed warp.** It is
@@ -530,15 +530,16 @@ Chronological; each entry keeps the mechanism, not the story.
 - **2026-09-25 — the aggregation trusted slices that were not this frame's.** A
   zero-filled slot divided by zero (black band), a partly accumulated one
   averaged short (dim band), a recycled one contributed another frame's groups.
-  Each slice now carries a witness the aggregation checks, falling back to the
-  source pixel when none survive. No perf change.
+  Each slice carried a witness the aggregation checked, falling back to the
+  source pixel when none survived. No perf change. (Superseded: the tuned cursor
+  and private radius-0 slots made the tag buffer unnecessary; it is removed.)
 - **2026-09-24 — pre-port correctness fixes.** Block matching reused shifted SSD
   columns, changing candidate ranks at radius 0-2 (all radii now use exact
   per-candidate SSD: 647 → 766.5 fps). Concurrent first-use tag clearing could
   erase witnesses; each estimate now clears only its exclusively reserved slot.
   The radius-0 aggregation fallback used a frame-derived ring slot; a failed
   frame advertised ring copies that never landed (0.038 max diff at frame 1; the
-  error path clears the keys and releases blocked readers, and `FAULT` pins it).
+  error path now returns the private slot directly, and `FAULT` pins it).
   The CAS fallback's retry bound counted the wrong contributors: it is now the
   contention bound (968 at bm_range=16/step 4, 13448 at step 1) that `res_add`
   derives. A creation failure leaked the instance (`createVideoFilterEx2`
@@ -592,7 +593,8 @@ Chronological; each entry keeps the mechanism, not the story.
   per earlier window; a merged-row-interval enumeration has not been measured
   against it.
 - **The 2-byte copy and store are unvectorized and unmeasured.** `bm3d_copy`
-  converts one element per thread and `store_result` writes four scalar halves;
+  converts one element per thread and `store_result` writes one element per
+  thread;
   a 4-element copy (`uint64` in, `vec4` out) and a packed 8-byte store would cut
   their instruction counts 4x. The store's catch is alignment (the pitch is only
   guaranteed to be a multiple of the element size, so a packed store needs an
@@ -637,8 +639,6 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
 - `VSFEEL_BM3D_PROFILE=1` — per-dispatch GPU kernel table at free, bm3dvk2's `BM3DVK_PROFILE` layout.
 - `VSFEEL_BM3D_VRAM=1` — creation-time VRAM budget.
 - `VSFEEL_BM3D_SPLIT=0` — radius 0: one estimation submission per frame.
-- `VSFEEL_BM3D_RINGWAIT=1` — radius 0: wait the ring copier's submission out
-  host side instead of riding the handoff barrier.
 - `VSFEEL_BM3D_INFLIGHT=<1..8>` — radius 0: private slots for this many frames
   (default 4). The temporal rings are one window deep plus the isolated copy.
 - `VSFEEL_BM3D_CAS=1` — force the CAS aggregation build (A/B only).
@@ -658,5 +658,5 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
 - `VSFEEL_BM3D_DUMP=1` / `VSFEEL_BM3D_GPUTRACE=1` — slot dump / GPU timestamps
   (the probe waits each instrumented frame out; never a benchmark).
 - `VSFEEL_BM3D_FAULT=<n>` — fail frame `n`'s estimation on a fresh instance,
-  after its reservations but before any command buffer; pins the error path's
-  ring-key clearing and reader release.
+  after its reservations but before any command buffer; pins the private-slot
+  release on the error path.

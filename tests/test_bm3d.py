@@ -597,6 +597,30 @@ def test_bm3d_rejects_oversized_split_handoff(monkeypatch):
         BM3D(src, sigma=SIGMA, radius=0, block_step=1)
 
 
+def test_bm3d_split_kernel_matches_fused(clip_yuv420p16, monkeypatch):
+    """The split's shared handoff must not race across the three YUV groups.
+
+    YUV420 gives one entry per processed plane, so the match half of the next
+    entry writes the same buffer while the previous entry's filter half reads
+    it. The split path used to have no write-after-read barrier there; this
+    compares every plane against the fused path.
+    """
+    kwargs = dict(
+        sigma=SIGMA, radius=2, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=BLOCK_STEP
+    )
+    monkeypatch.setenv("VSFEEL_BM3D_SPLIT_KERNEL", "0")
+    fused = BM3D(clip_yuv420p16, **kwargs)
+    monkeypatch.setenv("VSFEEL_BM3D_SPLIT_KERNEL", "1")
+    split = BM3D(clip_yuv420p16, **kwargs)
+    for n in (0, 5, 23):
+        a = fused.get_frame(n)
+        b = split.get_frame(n)
+        for p in range(3):
+            da = plane_to_ndarray(a, p, np.uint16).astype(np.float64)
+            db = plane_to_ndarray(b, p, np.uint16).astype(np.float64)
+            assert np.abs(da - db).max() <= 1.0, f"split/fused mismatch n={n} p={p}"
+
+
 def test_bm3d_accepts_radius4_within_addressing_limit():
     """The guard must not reject radius 4 when the stack stays addressable."""
     out = BM3D(
@@ -1773,6 +1797,28 @@ def test_bm3d_u16_matches_cpu(clip_gray16, radius, stage, bound, measured, full)
     assert payload["maxdiff"] < bound, (
         f"u16 radius {radius} ({'full' if full else 'limited'}) vs CPU: {payload} (was {measured})"
     )
+
+
+def test_bm3d_rgb_range_tag_is_honored(clip_grays):
+    """The RGB arm of `_Range` must not ignore the tag.
+
+    The old `bm3d_range` returned full-range scaling for every RGB plane, so
+    full and limited RGB48 produced identical pixels. A real gradient makes
+    the two domains visibly different.
+    """
+    rgb = vs.core.std.ShufflePlanes([clip_grays, clip_grays, clip_grays], [0, 0, 0], vs.RGB)
+    rgb16 = vs.core.resize.Bicubic(rgb, format=vs.RGB48)
+    full = vs.core.std.SetFrameProp(rgb16, prop="_Range", intval=1)
+    limited = vs.core.std.SetFrameProp(rgb16, prop="_Range", intval=0)
+    kwargs = dict(
+        sigma=SIGMA, radius=0, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=BLOCK_STEP
+    )
+    a = BM3D(full, **kwargs)
+    b = BM3D(limited, **kwargs)
+    for n in (0, 5):
+        fa = plane_to_ndarray(a.get_frame(n), 0, np.uint16)
+        fb = plane_to_ndarray(b.get_frame(n), 0, np.uint16)
+        assert np.abs(fa.astype(np.int32) - fb.astype(np.int32)).max() > 1
 
 
 U16_SWEEP = [

@@ -127,20 +127,14 @@ layout(std430, binding = 1) readonly buffer SrcBuf { float src[]; };
 // The destination plane of the aggregation. The estimation dispatch binds the
 // trace buffer here instead: it never writes a destination.
 layout(std430, binding = 2) buffer TraceBuf { uint trace[]; };
-// Per-(slot, slice) witness: the frame index the estimation kernel wrote that
-// slice for (frame + 1, so 0 means "never written"). The aggregation refuses a
-// slice whose witness is not the frame it intends to read, which makes it
-// impossible to aggregate another frame's data -- the intermittent contaminant
-// band -- no matter what the slot bookkeeping or the host-side timing does.
-layout(std430, binding = 3) buffer TagBuf { uint tags[]; };
 // The split's handoff (VSFEEL_BM3D_SPLIT_KERNEL): one group per reference block,
 // written by the match build and read by the filter build. One flat word array,
 // [counts: one word per block][members: 8 x (xy, z)], so a block's member run
 // needs no uvec2 alignment. The fused build declares neither binding.
 #ifdef SPLIT_MATCH
-layout(std430, binding = 4) writeonly buffer MatchBuf { uint match_words[]; };
+layout(std430, binding = 3) writeonly buffer MatchBuf { uint match_words[]; };
 #elif defined(SPLIT_FILTER)
-layout(std430, binding = 4) readonly buffer MatchBuf { uint match_words[]; };
+layout(std430, binding = 3) readonly buffer MatchBuf { uint match_words[]; };
 #endif
 
 // Adds val to the float at res[idx]. The no-extension form is the reference's
@@ -1129,19 +1123,6 @@ void main() {
     // searched, and their slices are the only ones written.
     const int zlo = max(KRADIUS - m, 0);
     const int zhi = min(2 * KRADIUS, pc.nframes - 1 - m + KRADIUS);
-
-    // Witness what this dispatch writes: one tag per real window slice, holding
-    // the frame it is the contribution of. Slices outside [zlo, zhi] keep the
-    // zero fill, so the aggregation skips them instead of reading a clamped
-    // copy of an endpoint frame. The match half writes no estimate stack, so it
-    // does not witness one.
-#ifndef SPLIT_MATCH
-    if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u) {
-        for (int z = zlo; z <= zhi; ++z) {
-            tags[pc.tag_base + z] = uint(src_frame(z) + 1);
-        }
-    }
-#endif
 
     const int lid = int(gl_LocalInvocationID.x);
     const int group = lid >> 3;

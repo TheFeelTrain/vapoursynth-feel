@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Bilateral no longer ignores a valid explicit `block_x` or `block_y` when the other dimension exceeds a device limit
+
+### Fixed
+
+- BM3D applies limited-range `_Range` to RGB clips
+- BM3D no longer corrupts multi-plane output when block matching and filtering run as separate GPU passes
+- BM3D no longer leaks pipelines when block matching and filtering run as separate GPU passes
+- BM3D reports a missing source frame instead of dereferencing it
+- Bilateral matches vszipcl's border pixels at radii 50-52
+- DFTTest no longer corrupts output or leaves the last rows zero on tall frames with high spatial overlap (`sosize` 1-7)
+- DFTTest and NNEDI3 report an oversized per-frame scratch buffer at creation instead of on every frame
+- EEDI3, EEDI3H, EEDI3AA, and NNEDI3 remove stale `_Field` tags from progressive output
+- EEDI3AA's fp32 output is bit-exact with the EEDI3/EEDI3H chain it fuses
+- NNEDI3 rejects `dh=True` with a `planes` subset instead of writing zero rows into the unprocessed planes
+
 ## [v1.3.3] - 2026-11-04
 
 ### Changed

@@ -53,15 +53,11 @@ struct Bm3dPlane {
     // Per-plane temporal radius, like sigma: a missing entry repeats the
     // previous one and the first defaults to 0 (spatial only).
     int radius {};
-    int tw { 1 }; // 2 * radius + 1
     // Scaled sigma, or exactly 0 when the plane is not processed (the
     // reference zeroes it so its kernel's epsilon test agrees with the
     // unscaled decision the host made).
     float sigma {};
     bool process {};
-    // A YUV chroma plane: its ring and output conversion carry the 32768
-    // neutral code (see bm3d_copy.comp and bm3d_agg.comp).
-    bool chroma {};
     int block_step {};
     int bm_range {};
     int ps_num {};
@@ -74,7 +70,7 @@ struct Bm3dPlane {
 // A native u16 code to the f32 working domain, and the inverse the normalize
 // kernel applies. The CPU reference (mawen's VSProcess::Int2Float/Float2Int)
 // scales by the frame's _Range: full range spans the whole code range, limited
-// range spans 219/224 of it with luma's 4096 and chroma's 32768 offsets. RGB
+// range spans 219/224 of it with luma/RGB's 4096 and chroma's 32768 offsets. RGB
 // untagged is full; a tagged RGB clip follows its tag. The gain matches the
 // reference's RangeConvert exactly, so a native clip and a float conversion of
 // the same content carry the same values.
@@ -86,7 +82,8 @@ struct Bm3dRange {
 static Bm3dRange bm3d_range(const VSVideoFormat & format, int plane,
                             bool full) {
     if (format.colorFamily == cfRGB) {
-        return { 1.0f / 65535.0f, 0.0f };
+        return { full ? 1.0f / 65535.0f : 1.0f / 56064.0f,
+                 full ? 0.0f : 4096.0f };
     }
     const bool chroma = format.colorFamily == cfYUV && plane > 0;
     if (chroma) {
@@ -133,9 +130,9 @@ struct Bm3dGroup {
     uint32_t copy_grid_x {};
     uint32_t copy_grid_y {};
 
-    int src_ring {};          // cache slots for the source window
+    int src_ring {};          // ring slots for the temporal source window
     int res_cap {};           // accumulator slots of the frame ring
-    int tag_base {};          // first witness slot of this entry's tags region
+    int tag_base {};          // first ring slot of this entry's indexed region
     VkDeviceSize src_size {}; // src_ring * clips * n_planes * pe
     VkDeviceSize res_size {}; // res_cap * 2 * n_planes * pe
     GpuBuffer src;
@@ -150,29 +147,13 @@ struct Bm3dGroup {
     // table coherent: a slot is reassigned only after its frame retired.
     std::vector<int> acc_frame {};
 
-    // Slots are reserved all-or-nothing for the duration of a frame (shared
-    // holds for reads, exclusive for recompute/upload), so no two in-flight
-    // frames ever touch the same slot; when the cache cannot hold the working
-    // set (e.g. seeking), the acquire blocks like the reference's fused-mode
-    // accumulator cache. One set per entry, keyed by frame modulo the capacity.
-    std::vector<int> src_frame {};
-    std::vector<int> src_writer {};
-    std::vector<uint8_t> src_ready {};
-    std::vector<std::vector<uint64_t>> src_holders {};
-    std::vector<int> res_frame {};
-    std::vector<int> res_writer {};
-    std::vector<uint8_t> res_ready {};
-    std::vector<std::vector<uint64_t>> res_holders {};
     // Radius 0 has no cross-frame sharing, so each in-flight frame takes one of
-    // these slots outright for its whole life instead of going through the
-    // window cache. Size is the old in-flight depth.
+    // these private slots for its whole life. Size is the in-flight depth.
     std::vector<int> r0_free {};
 };
 
-// Per-frame bookkeeping, per entry. The exec pool owns the command buffers,
-// the timeline and the in-flight gate, so nothing here outlives the getFrame
-// call: a frame's window reservations are described by this struct, and what a
-// reader needs afterwards lives in the reservation tables (see BM3DData).
+// Radius 0 bookkeeping, per entry. The exec pool owns the command buffers and
+// the in-flight gate, so nothing here outlives the getFrame call.
 struct Bm3dGroupFrame {
     // window position maps to a real frame (radius 0 and the clip's ends have
     // fewer than tw valid positions)
@@ -198,11 +179,6 @@ struct Bm3dGroupFrame {
 };
 
 struct Bm3dFrame {
-    // unique token identifying this frame's cache reservation. A frame index
-    // is not a unique holder identity: the scheduler can process the same
-    // frame twice at once, and erasing holders by value would then drop both
-    // entries at the first release, freeing a slot another reader still uses.
-    uint64_t token {};
     std::array<int, 3>
         slot0 {}; // radius 0: this frame's private slot, per entry
     std::array<Bm3dGroupFrame, 3> g {};
@@ -404,14 +380,6 @@ struct BM3DData {
     // submits, and hands it the frames and scratch a submission must keep alive.
     VSGPUExecPool * exec {};
 
-    // Per-(entry, slot, slice) frame witness: each entry's estimate slots are
-    // keyed by frame index, so two entries that hold different frames in the
-    // same slot index must not share witnesses.
-    GpuBuffer tags {};
-    GpuBuffer skipped {}; // host-visible: dispatches that skipped a slice
-    volatile uint32_t * skipped_mapped {};
-    GpuBuffer refusal {}; // host-visible: first refusal fingerprint
-    volatile uint32_t * refusal_mapped {};
     // Debug match trace (VSFEEL_BM3D_MATCHTRACE=frame,x,y): the traced dispatch
     // is the one that estimates the requested centre frame itself, and the
     // kernel records the group of the reference block at (x, y) into this
@@ -427,7 +395,6 @@ struct BM3DData {
     bool split_kernel {};
     GpuBuffer matches {};
     uint64_t match_words {};
-    VkDeviceSize tags_size {}; // uints
     int nframes {};
 
     // Cross-frame ordering is a ready flag per slot, not a timeline value: the
@@ -439,17 +406,9 @@ struct BM3DData {
     // dependency across the two submissions. (The per-slot tables live in each
     // Bm3dGroup.)
     //
-    // Set when a frame of this instance fails before its chunk-0 submission: its
-    // ring keys were cleared, so a reader already waiting on one must be
-    // released and then fail rather than read a slot that was never copied.
+    // Set when a temporal frame fails before its submission, so a later frame
+    // does not try to build on a partially updated cursor.
     bool failed {};
-    // Diagnostic (VSFEEL_BM3D_RINGWAIT): the ring copier's chunk-0 submission
-    // value per frame, so a reader can wait the copy out instead of trusting
-    // the barrier. The witness covers the estimate slots but cannot see a ring
-    // copy that lands late (the estimation writes the witness itself).
-    bool ring_wait { false };
-    std::vector<uint64_t> chunk0_value {};
-    uint64_t next_res_token { 1 };
     // Temporal cursor (radius > 0). Frames are processed in order: one centre
     // is scattered into every accumulator it touches, then the frame whose
     // contributors are all in is normalized. An out-of-order request restarts
@@ -506,8 +465,8 @@ struct BM3DData {
     // holding them all (VSFEEL_BM3D_SPLIT=0 restores the single submission).
     bool split_est { true };
     // VSFEEL_BM3D_FAULT=<n> fails frame n's estimation on a fresh instance,
-    // before its chunk-0 submission, so tests can exercise the error path's
-    // cache handoff (-1 disables).
+    // before its chunk-0 submission, so tests can exercise the private-slot
+    // release path (-1 disables).
     int fault_frame { -1 };
     std::atomic<uint64_t> ht_acquire_ns {}, ht_source_ns {}, ht_est_ns {},
         ht_agg_ns {}, ht_release_ns {}, ht_total_ns {}, ht_n {};
@@ -563,35 +522,19 @@ struct BM3DData {
             if (g.bm3d_pipeline) {
                 gpu->vk->vkDestroyPipeline(dev, g.bm3d_pipeline, nullptr);
             }
+            if (g.bm3d_match_pipeline) {
+                gpu->vk->vkDestroyPipeline(dev, g.bm3d_match_pipeline, nullptr);
+            }
+            if (g.bm3d_filter_pipeline) {
+                gpu->vk->vkDestroyPipeline(dev, g.bm3d_filter_pipeline,
+                                           nullptr);
+            }
         }
         for (auto & p : planes) {
             if (p.agg_pipeline) {
                 gpu->vk->vkDestroyPipeline(dev, p.agg_pipeline, nullptr);
             }
         }
-        gpu_destroy_buffer(*gpu, tags);
-        if (skipped_mapped) {
-            const uint32_t n = *skipped_mapped;
-            if (n) {
-                fprintf(stderr,
-                        "[bm3d] %u dispatches skipped an unwitnessed slice\n",
-                        n);
-            }
-        }
-        if (refusal_mapped && refusal_mapped[0]) {
-            const uint32_t frame = refusal_mapped[1];
-            const uint32_t expected = refusal_mapped[2];
-            const uint32_t found = refusal_mapped[3];
-            fprintf(stderr,
-                    "[bm3d] first refusal: frame %u wanted witness %u, found %u"
-                    " -- %s\n",
-                    frame, expected, found,
-                    found == 0
-                        ? "slice never written (fill without estimation)"
-                        : "slice holds another frame's stacks (recycled slot)");
-        }
-        gpu_destroy_buffer(*gpu, skipped);
-        gpu_destroy_buffer(*gpu, refusal);
         gpu_destroy_buffer(*gpu, match_trace);
         gpu_destroy_buffer(*gpu, matches);
         if (pipeline_layout) {
@@ -774,21 +717,15 @@ create_agg_pipeline(const GPUDevice & gpu, const Bm3dPlane & plane,
                     VkPipelineLayout layout) {
 
     struct Spec {
-        int32_t height, stride, tw, radius, res_cap, nplanes, tag_base, chroma;
-        int32_t ringed;
-    } spec { plane.height,   plane.stride,         plane.tw,
-             plane.radius,   group.res_cap,        group.n_planes,
-             group.tag_base, plane.chroma ? 1 : 0, d.max_radius > 0 ? 1 : 0 };
-    const std::array<VkSpecializationMapEntry, 9> entries { {
+        int32_t height, stride, res_cap, nplanes, ringed;
+    } spec { plane.height, plane.stride, group.res_cap, group.n_planes,
+             d.max_radius > 0 ? 1 : 0 };
+    const std::array<VkSpecializationMapEntry, 5> entries { {
         { 0, 0, sizeof(int32_t) },
         { 1, 4, sizeof(int32_t) },
         { 2, 8, sizeof(int32_t) },
         { 3, 12, sizeof(int32_t) },
         { 4, 16, sizeof(int32_t) },
-        { 5, 20, sizeof(int32_t) },
-        { 6, 24, sizeof(int32_t) },
-        { 7, 28, sizeof(int32_t) },
-        { 8, 32, sizeof(int32_t) },
     } };
     // Normalize is a 16x16 tile kernel: it needs a shared tile of the block
     // weights around the output tile for the separable box sum.
@@ -819,32 +756,18 @@ create_copy_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
 // Frame processing
 // ---------------------------------------------------------------------------
 
-// Radius 0 has no cross-frame sharing, so a frame takes one slot per entry
-// outright for its whole life instead of going through the window cache; the
-// acquisition itself lives in acquire_cache, which takes every entry's slot in
-// one step.
+// Radius 0 has no cross-frame sharing, so a frame takes one private slot per
+// entry for its whole life; it returns it as soon as aggregation is queued.
 static void give_r0_slot(BM3DData * d, Bm3dGroup & g, int slot) {
     std::lock_guard lock(d->cache_lock);
     g.r0_free.push_back(slot);
     d->cache_cv.notify_all();
 }
 
-// Reserve the cache slots this frame needs, all-or-nothing: the res slots of
-// the temporal window (recomputing the missing stacks) and the src slots of the
-// source window (re-uploading the missing frames). Slots held by other
-// in-flight frames block until they complete, so no two frames ever touch the
-// same slot concurrently; the blocking only happens when the working set
-// exceeds the cache (seeks, very out-of-order arrivals) and never holds a
-// recording context while waiting.
-//
-// The reservation is atomic across every entry, not per entry: a frame that
-// held one entry's slots while waiting for another's could deadlock against a
-// frame doing the mirror image, because a reader takes a shared hold on a slot
-// whose writer has not published yet (a cache hit does not check holders). One
-// atomic step keeps the wait graph on the acquisition order, which is acyclic.
-static void acquire_cache(BM3DData * d, Bm3dFrame & fr, int n) {
-    const int r = d->max_radius;
-    const int nf = d->nframes;
+// Reserve one private slot per entry for this radius-0 frame. Taking every
+// entry's slot in one critical section keeps concurrent frames from waiting on
+// each other while holding one, and no recording context is held while blocked.
+static void acquire_r0_slots(BM3DData * d, Bm3dFrame & fr, int n) {
     for (int gi = 0; gi < d->n_groups; ++gi) {
         auto & gf = fr.g[gi];
         gf.win_slots.fill(-1);
@@ -859,297 +782,36 @@ static void acquire_cache(BM3DData * d, Bm3dFrame & fr, int n) {
     }
 
     std::unique_lock lock(d->cache_lock);
-    if (r == 0) {
-        // per-frame slots: private to one in-flight frame, so concurrent
-        // out-of-order frames never share a slot. Every entry's slot is taken
-        // in the same step, so no frame waits for another while holding one.
-        d->cache_cv.wait(lock, [&] {
-            for (int gi = 0; gi < d->n_groups; ++gi) {
-                if (d->groups[gi].r0_free.empty()) {
-                    return false;
-                }
-            }
-            return true;
-        });
-        for (int gi = 0; gi < d->n_groups; ++gi) {
-            auto & g = d->groups[gi];
-            auto & gf = fr.g[gi];
-            fr.slot0[gi] = g.r0_free.back();
-            g.r0_free.pop_back();
-            gf.win_slots[0] = fr.slot0[gi];
-            gf.win_writer[0] = n;
-            gf.win_recompute[0] = true;
-            gf.upload_new[0] = true;
-            gf.src_slot[0] = fr.slot0[gi];
-        }
-        return;
-    }
-    // Every entry covers the same source window, clamped to the clip.
-    const int lo = std::clamp(n - 2 * r, 0, nf - 1);
-    const int hi = std::clamp(n + 2 * r, 0, nf - 1);
-    for (int gi = 0; gi < d->n_groups; ++gi) {
-        fr.g[gi].src_lo = lo;
-        fr.g[gi].n_src = hi - lo + 1;
-    }
-    for (;;) {
-        bool ok = true;
-        for (int gi = 0; gi < d->n_groups && ok; ++gi) {
-            auto & g = d->groups[gi];
-            auto & gf = fr.g[gi];
-            gf.win_slots.fill(-1);
-            gf.win_writer.fill(-1);
-            gf.win_valid.fill(false);
-            gf.win_recompute.fill(false);
-            gf.upload_new.fill(false);
-            gf.src_slot.fill(-1);
-            gf.src_writer.fill(-1);
-            // Phase 1: check-only, with no side effects. The failed passes must
-            // not leave half-applied reservations behind, or a retry would treat
-            // the abandoned slots as cached and never recompute them.
-            for (int i = 0; i < d->max_tw; ++i) {
-                // Window positions outside the clip are not estimate centres at
-                // all: an output frame near the start has fewer than tw real
-                // centres, and the missing ones must not alias the endpoint.
-                const int m = n - r + i;
-                if (m < 0 || m >= nf) {
-                    continue;
-                }
-                gf.win_valid[i] = true;
-                const int slot = m % g.res_cap;
-                gf.win_slots[i] = slot;
-                gf.win_writer[i] = g.res_writer[slot];
-                gf.win_recompute[i] = (g.res_frame[slot] != m);
-                if (gf.win_recompute[i] && !g.res_holders[slot].empty()) {
-                    ok = false; // slot in use by an in-flight frame
-                    break;
-                }
-            }
-            if (!ok) {
-                break;
-            }
-            for (int k = 0; k < gf.n_src; ++k) {
-                const int slot = (lo + k) % g.src_ring;
-                gf.src_slot[k] = slot;
-                gf.src_writer[k] = g.src_writer[slot];
-                if (g.src_frame[slot] != lo + k &&
-                    !g.src_holders[slot].empty()) {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if (!ok) {
-            d->cache_cv.wait(lock);
-            continue;
-        }
-        // Phase 2: apply every entry's reservations (the lock is held, so the
-        // phase-1 checks are still valid).
-        if (fr.token == 0) {
-            fr.token = d->next_res_token++;
-        }
-        for (int gi = 0; gi < d->n_groups; ++gi) {
-            auto & g = d->groups[gi];
-            auto & gf = fr.g[gi];
-            for (int i = 0; i < d->max_tw; ++i) {
-                if (!gf.win_valid[i]) {
-                    continue;
-                }
-                const int m = n - r + i;
-                const int slot = gf.win_slots[i];
-                if (gf.win_recompute[i]) {
-                    g.res_frame[slot] = m;
-                    g.res_writer[slot] = n;
-                    g.res_ready[slot] = 0;
-                    // this frame overwrites the slot's contents, so it owes the
-                    // previous writer nothing
-                    gf.win_writer[i] = -1;
-                }
-                g.res_holders[slot].push_back(fr.token);
-            }
-            for (int k = 0; k < gf.n_src; ++k) {
-                const int slot = gf.src_slot[k];
-                if (g.src_frame[slot] != lo + k) {
-                    g.src_frame[slot] = lo + k;
-                    g.src_writer[slot] = n;
-                    g.src_ready[slot] = 0;
-                    gf.upload_new[k] = true;
-                }
-                g.src_holders[slot].push_back(fr.token);
-            }
-        }
-        return;
-    }
-}
-
-// The slots this frame wrote are submitted, so a reader waiting on them may
-// record and submit: submission order on the one compute queue plus the
-// reader's leading barrier is the whole cross-frame handoff.
-static void publish_est_submitted(BM3DData * d, const Bm3dFrame & fr) {
-    if (d->max_radius == 0) {
-        return; // radius 0 slots are private to one frame
-    }
-    std::lock_guard lock(d->cache_lock);
-    for (int gi = 0; gi < d->n_groups; ++gi) {
-        auto & g = d->groups[gi];
-        const auto & gf = fr.g[gi];
-        for (int i = 0; i < d->max_tw; ++i) {
-            if (gf.win_valid[i] && gf.win_recompute[i]) {
-                g.res_ready[gf.win_slots[i]] = 1;
-            }
-        }
-        for (int k = 0; k < gf.n_src; ++k) {
-            if (gf.upload_new[k]) {
-                g.src_ready[gf.src_slot[k]] = 1;
-            }
-        }
-    }
-    d->cache_cv.notify_all();
-}
-
-// A frame that will never submit must not advertise slots it never wrote. The
-// ring copies live only in chunk 0, so when that submission did not land the
-// source keys are cleared: a later frame then copies those frames itself
-// instead of block-matching against whatever the slot held. The failure flag
-// releases a reader already blocked on a cleared ready flag (it would otherwise
-// hang) and makes it fail instead of reading the slot. The res keys stay as
-// published: the per-slice witness in `tags` makes an unwritten stack refuse
-// itself and fall back to the source pixel, which the cleared ring keys make
-// honest again.
-static void fail_pending_frame(BM3DData * d, const Bm3dFrame & fr,
-                               bool ring_copied) {
-    if (d->max_radius == 0) {
-        return; // radius 0 slots are private to one frame
-    }
-    std::lock_guard lock(d->cache_lock);
-    d->failed = true;
-    for (int gi = 0; gi < d->n_groups; ++gi) {
-        auto & g = d->groups[gi];
-        const auto & gf = fr.g[gi];
-        for (int i = 0; i < d->max_tw; ++i) {
-            if (gf.win_valid[i] && gf.win_recompute[i]) {
-                g.res_ready[gf.win_slots[i]] = 1;
-            }
-        }
-        for (int k = 0; k < gf.n_src; ++k) {
-            if (!gf.upload_new[k]) {
-                continue;
-            }
-            g.src_frame[gf.src_slot[k]] = ring_copied ? gf.src_lo + k : -1;
-            g.src_ready[gf.src_slot[k]] = ring_copied ? 1 : 0;
-        }
-    }
-    d->cache_cv.notify_all();
-}
-
-// True once any frame of this instance has failed: the cache's keys are no
-// longer trustworthy, so a reader must fail fast instead of reading a slot.
-static bool frame_failed(BM3DData * d) {
-    std::lock_guard lock(d->cache_lock);
-    return d->failed;
-}
-
-// Wait host side until every source slot this frame reads has been submitted by
-// its copier. The frame holds those slots, so the writer cannot be re-reserved
-// underneath it. With VSFEEL_BM3D_RINGWAIT the copier's copy is additionally
-// waited out on the device, which lifts the whole handoff off the barrier's
-// scopes (diagnostic: the witness cannot see a ring copy that lands late).
-static void wait_src_submitted(BM3DData * d, const Bm3dFrame & fr) {
-    if (d->max_radius == 0) {
-        return;
-    }
-    std::vector<uint64_t> waits;
-    {
-        std::unique_lock lock(d->cache_lock);
-        d->cache_cv.wait(lock, [&] {
-            if (d->failed) {
-                return true; // the copier will never submit; let the caller fail
-            }
-            for (int gi = 0; gi < d->n_groups; ++gi) {
-                const auto & g = d->groups[gi];
-                const auto & gf = fr.g[gi];
-                for (int k = 0; k < gf.n_src; ++k) {
-                    if (!gf.upload_new[k] && !g.src_ready[gf.src_slot[k]]) {
-                        return false;
-                    }
-                }
-            }
-            return true;
-        });
-        if (!d->ring_wait) {
-            return;
-        }
-        for (int gi = 0; gi < d->n_groups; ++gi) {
-            const auto & g = d->groups[gi];
-            const auto & gf = fr.g[gi];
-            for (int k = 0; k < gf.n_src; ++k) {
-                if (gf.upload_new[k]) {
-                    continue;
-                }
-                const int writer = g.src_writer[gf.src_slot[k]];
-                if (writer >= 0 &&
-                    writer < static_cast<int>(d->chunk0_value.size())) {
-                    const uint64_t value = d->chunk0_value[writer];
-                    if (value != 0) {
-                        waits.push_back(value);
-                    }
-                }
-            }
-        }
-    }
-    for (const uint64_t value : waits) {
-        char err[256] {};
-        d->gpu->api->gpuExecWaitValue(d->exec, value, err, sizeof(err));
-    }
-}
-
-// Same for the estimate stacks the aggregation reads.
-static void wait_res_submitted(BM3DData * d, const Bm3dFrame & fr) {
-    if (d->max_radius == 0) {
-        return;
-    }
-    std::unique_lock lock(d->cache_lock);
+    // Every entry's free slot is taken in one step, so no frame waits for
+    // another while holding one.
     d->cache_cv.wait(lock, [&] {
-        if (d->failed) {
-            return true; // the writer will never submit; let the caller fail
-        }
         for (int gi = 0; gi < d->n_groups; ++gi) {
-            const auto & g = d->groups[gi];
-            const auto & gf = fr.g[gi];
-            for (int i = 0; i < d->max_tw; ++i) {
-                if (gf.win_valid[i] && !gf.win_recompute[i] &&
-                    !g.res_ready[gf.win_slots[i]]) {
-                    return false;
-                }
+            if (d->groups[gi].r0_free.empty()) {
+                return false;
             }
         }
         return true;
     });
-}
-
-// Release the cache reservations after this frame's aggregation has been
-// submitted: queue order already makes a later recompute run after that
-// aggregation, and the later frame's leading barrier completes the ordering.
-static void release_cache(BM3DData * d, const Bm3dFrame & fr) {
     for (int gi = 0; gi < d->n_groups; ++gi) {
         auto & g = d->groups[gi];
-        const auto & gf = fr.g[gi];
-        if (d->max_radius == 0) {
-            give_r0_slot(d, g, fr.slot0[gi]);
-            continue;
-        }
-        std::lock_guard lock(d->cache_lock);
-        for (int i = 0; i < d->max_tw; ++i) {
-            if (!gf.win_valid[i]) {
-                continue;
-            }
-            auto & h = g.res_holders[gf.win_slots[i]];
-            h.erase(std::remove(h.begin(), h.end(), fr.token), h.end());
-        }
-        for (int k = 0; k < gf.n_src; ++k) {
-            auto & h = g.src_holders[gf.src_slot[k]];
-            h.erase(std::remove(h.begin(), h.end(), fr.token), h.end());
-        }
-        d->cache_cv.notify_all();
+        auto & gf = fr.g[gi];
+        fr.slot0[gi] = g.r0_free.back();
+        g.r0_free.pop_back();
+        gf.win_slots[0] = fr.slot0[gi];
+        gf.win_writer[0] = n;
+        gf.win_valid[0] = true;
+        gf.win_recompute[0] = true;
+        gf.upload_new[0] = true;
+        gf.src_slot[0] = fr.slot0[gi];
+        gf.src_writer[0] = n;
+    }
+}
+
+// Return the private slots once the frame's aggregation has been queued; a
+// later frame's leading barrier completes the ordering.
+static void release_r0_slots(BM3DData * d, const Bm3dFrame & fr) {
+    for (int gi = 0; gi < d->n_groups; ++gi) {
+        give_r0_slot(d, d->groups[gi], fr.slot0[gi]);
     }
 }
 
@@ -1169,16 +831,13 @@ static void collect_est_positions(BM3DData * d, Bm3dGroupFrame & gf) {
     }
 }
 
-// The three buffers both kernels address, in the order the shader declares
-// them: estimate stacks, source ring, destination plane.
-// The three buffers both kernels address, in the order the shader declares
-// them: estimate stacks, source ring, destination plane.
+// The buffers both kernels address, in the order the shader declares them:
+// estimate stacks, source ring, destination/trace, and the split's handoff.
 static void bm3d_bind(const GPUDevice & gpu, VkCommandBuffer cmd,
                       VkPipelineLayout layout, VkBuffer src, VkBuffer res,
-                      VkBuffer dst, VkBuffer tags, VkBuffer skipped,
-                      VkBuffer refusal) {
-    const VkBuffer bufs[6] { res, src, dst, tags, skipped, refusal };
-    gpu_push_buffers(gpu, cmd, layout, bufs, 6);
+                      VkBuffer dst, VkBuffer aux) {
+    const VkBuffer bufs[4] { res, src, dst, aux };
+    gpu_push_buffers(gpu, cmd, layout, bufs, 4);
 }
 
 // Dump the group the matcher selected for the traced reference block, once the
@@ -1281,6 +940,13 @@ static void record_est_position(BM3DData * d, const Bm3dFrame & fr,
     const int i = gf.est_pos[c];
     const int slot = gf.win_slots[i];
     const int m_i = n - r + i;
+    // The split shares one handoff buffer across entries. The match half of
+    // the next entry would otherwise overwrite it while this entry's filter
+    // dispatch is still reading; the match->filter barrier below only orders
+    // one entry's pair.
+    if (d->split_kernel && gi > 0) {
+        bm3d_compute_barrier(*d->gpu, cmd);
+    }
     if (d->dump) {
         fprintf(stderr, "[d] n=%d entry %d computes slot %d for frame %d\n", n,
                 gi, slot, m_i);
@@ -1318,17 +984,17 @@ static void record_est_position(BM3DData * d, const Bm3dFrame & fr,
     const VkBuffer dst_bind = trace_xy >= 0 ? d->match_trace.buffer : dst_plane;
 
     // With the split, the same bindings and push constants serve both halves:
-    // the match buffer rides the skipped slot, which neither half reads, and
-    // only the pipeline changes between the two dispatches.
+    // the match buffer is binding 3 and only the pipeline changes between the
+    // two dispatches.
     const VkBuffer aux_bind =
-        d->split_kernel ? d->matches.buffer : d->skipped.buffer;
+        d->split_kernel ? d->matches.buffer : g.src.buffer;
     d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                   d->split_kernel ? g.bm3d_match_pipeline
                                                   : g.bm3d_pipeline);
     // The estimation kernel reads only the estimate stacks and the source ring;
     // the destination binding carries the output plane and is unused here.
     bm3d_bind(*d->gpu, cmd, d->pipeline_layout, g.src.buffer, g.res.buffer,
-              dst_bind, d->tags.buffer, aux_bind, d->refusal.buffer);
+              dst_bind, aux_bind);
     {
         const int32_t slot0_push =
             static_cast<int32_t>((r == 0) ? fr.slot0[gi] : 0);
@@ -1574,8 +1240,8 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame * fr,
             bm3d_bind(*d->gpu, cmd, d->pipeline_layout,
                       isolated ? g.scratch_src.buffer : g.src.buffer,
                       isolated ? g.scratch_acc.buffer : g.res.buffer,
-                      dst_planes[plane], d->tags.buffer, d->skipped.buffer,
-                      d->refusal.buffer);
+                      dst_planes[plane],
+                      isolated ? g.scratch_src.buffer : g.src.buffer);
             {
                 const int clips = d->final ? 2 : 1;
                 // The fallback source pixel: the *source* section of this
@@ -1757,11 +1423,16 @@ static void record_center_cmd(BM3DData * d, VkCommandBuffer cmd, int m,
             ? static_cast<int32_t>((d->trace_x & 0xFFFF) | (d->trace_y << 16))
             : -1;
     const VkBuffer dst_bind =
-        trace_xy >= 0 ? d->match_trace.buffer : d->tags.buffer;
+        trace_xy >= 0 ? d->match_trace.buffer : d->groups[0].src.buffer;
     const VkBuffer aux_bind =
-        d->split_kernel ? d->matches.buffer : d->skipped.buffer;
+        d->split_kernel ? d->matches.buffer : d->groups[0].src.buffer;
 
     for (int gi = 0; gi < d->n_groups; ++gi) {
+        // Same write-after-read hazard as record_est_position: one split
+        // handoff buffer is shared by every entry.
+        if (d->split_kernel && gi > 0) {
+            bm3d_compute_barrier(*d->gpu, cmd);
+        }
         const auto & g = d->groups[gi];
         const VkBuffer src_buf = isolated ? g.scratch_src.buffer : g.src.buffer;
         const VkBuffer acc_buf = isolated ? g.scratch_acc.buffer : g.res.buffer;
@@ -1769,7 +1440,7 @@ static void record_center_cmd(BM3DData * d, VkCommandBuffer cmd, int m,
                                       d->split_kernel ? g.bm3d_match_pipeline
                                                       : g.bm3d_pipeline);
         bm3d_bind(*d->gpu, cmd, d->pipeline_layout, src_buf, acc_buf, dst_bind,
-                  d->tags.buffer, aux_bind, d->refusal.buffer);
+                  aux_bind);
         const int32_t pushes[7] {
             acc_base, m, d->nframes, 0, 0, trace_xy, focus
         };
@@ -2245,11 +1916,8 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
                                  : std::chrono::steady_clock::time_point {};
         vsfeel_trace_mark("acquire");
 
-        // The GPU-timing probe serializes instrumented frames from before the
-        // cache reservation: the one query pool is shared, and locking only
-        // around the recording would let a frame hold the lock while waiting on
-        // another frame's submission -- which could itself be blocked on the
-        // lock. Taken here, every writer a frame waits on has already finished.
+        // The GPU-timing probe serializes instrumented frames: the one query
+        // pool is shared, so the probe lock is taken before recording.
         bool gputrace = false;
         std::unique_lock<std::mutex> probe_lock(d->probe.lock, std::defer_lock);
         if (d->probe.enabled) {
@@ -2257,11 +1925,10 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
             gputrace = true;
         }
 
-        // Reserve this frame's cache slots (blocks only when the working set
-        // exceeds the cache, e.g. on seeks; holds no recording context while
-        // waiting).
+        // Reserve this frame's private radius-0 slots; blocks until another
+        // in-flight frame returns one, holding no recording context meanwhile.
         Bm3dFrame fr;
-        acquire_cache(d, fr, n);
+        acquire_r0_slots(d, fr, n);
         auto c_t1 = d->host_timing ? cpu_now() : 0ull;
         auto t1 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
@@ -2269,19 +1936,11 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
         const int n_src = fr.g[0].n_src;
         std::vector<Bm3dWindowCopy> window(static_cast<size_t>(n_src));
         std::vector<const VSFrame *> sources;
-        // Chunk 0 is the submission that records the ring copies; until it
-        // lands, the src keys this frame committed at acquire are promises, not
-        // facts (see fail_pending_frame).
-        bool ring_copied = false;
 
         const auto set_error =
             [&](const std::string & error_message) -> const VSFrame * {
             vsfeel_trace_error("BM3D", n, error_message, d->gpu.get());
-            // A reader may be waiting for this frame's estimation; it must be
-            // released instead of blocking forever on a signal that is never
-            // coming. This frame's own output is an error either way.
-            fail_pending_frame(d, fr, ring_copied);
-            release_cache(d, fr);
+            release_r0_slots(d, fr);
             for (const VSFrame * f : sources) {
                 vsapi->freeFrame(f);
             }
@@ -2290,14 +1949,14 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
             return nullptr;
         };
 
-        // Fault injection for the error-path test: fail after the reservations
-        // exist but before anything was recorded, so the test exercises exactly
-        // the window where a src key is committed but its copy never lands.
+        // Fault injection for the error-path test: fail after the private
+        // slots exist but before anything was recorded, so the test exercises
+        // the release path.
         if (n == d->fault_frame) {
             return set_error("injected estimation fault");
         }
 
-        // Copy only the frames whose cache slots the acquire reserved. The
+        // Copy only the frames whose private slots the acquire reserved. The
         // needed range is the union of every window that this record's
         // dispatches may read: [clamp(n-2r), clamp(n+2r)], and every entry
         // reserves the same range, so one upload flag per frame covers them all.
@@ -2311,6 +1970,10 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
             }
             const int f = fr.g[0].src_lo + k;
             const VSFrame * src = vsapi->getFrameFilter(f, d->node, frameCtx);
+            if (!src) {
+                return set_error("clip frame " + std::to_string(f) +
+                                 " could not be fetched");
+            }
             for (int plane = 0; plane < d->num_planes; ++plane) {
                 VSVulkanPlaneInfo plane_info {};
                 if (d->gpu->api->getGPUPlane(src, plane, &plane_info)) {
@@ -2328,6 +1991,10 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
             if (d->final) {
                 const VSFrame * rsrc =
                     vsapi->getFrameFilter(f, d->ref_node, frameCtx);
+                if (!rsrc) {
+                    return set_error("ref clip frame " + std::to_string(f) +
+                                     " could not be fetched");
+                }
                 for (int plane = 0; plane < d->num_planes; ++plane) {
                     VSVulkanPlaneInfo plane_info {};
                     if (d->gpu->api->getGPUPlane(rsrc, plane, &plane_info)) {
@@ -2401,17 +2068,8 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
             }
         }
 
-        // The source window this frame reads may have been copied by other
-        // frames; wait host side until those copies have been submitted. This
-        // frame holds the slots, so no writer can be re-reserved underneath it.
-        wait_src_submitted(d, fr);
-        if (frame_failed(d)) {
-            return set_error("a source frame's estimation never submitted");
-        }
-
         // The estimation is submitted first, so the GPU stays busy with the
-        // heavy kernels while the host waits for the writers of the
-        // aggregation slots.
+        // heavy kernels.
         vsfeel_trace_mark("sub est");
         for (int c = 0; c < chunks; ++c) {
             char errbuf[512] {};
@@ -2436,13 +2094,6 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
                                            sizeof(errbuf))) {
                 return set_error("estimation submit failed: "s + errbuf);
             }
-            if (c == 0 && n < static_cast<int>(d->chunk0_value.size())) {
-                // The ring copy rides in chunk 0; RINGWAIT readers wait this out.
-                d->chunk0_value[n] = signaled;
-            }
-            if (c == 0) {
-                ring_copied = true;
-            }
         }
         for (const VSFrame * f : sources) {
             vsapi->freeFrame(f);
@@ -2451,17 +2102,6 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
         auto c_t3 = d->host_timing ? cpu_now() : 0ull;
         auto t3 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
-        // Everything this frame wrote is in the queue now, so a reader may go
-        // ahead: queue order plus its leading barrier is the whole handoff.
-        publish_est_submitted(d, fr);
-
-        // The aggregation reads the estimate stacks, so wait host side until
-        // every stack writer has submitted (see publish_est_submitted). The
-        // waits follow cache-acquisition order, which is acyclic.
-        wait_res_submitted(d, fr);
-        if (frame_failed(d)) {
-            return set_error("an estimate stack's writer never submitted");
-        }
 
         char aerr[512] {};
         VSGPUExecContext * agg_ctx =
@@ -2537,10 +2177,8 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
             }
         }
 
-        // Reserved slots go back as soon as the aggregation is queued: a later
-        // frame's recompute is ordered after it by the queue, and its leading
-        // barrier completes the ordering.
-        release_cache(d, fr);
+        // Private slots go back as soon as the aggregation is queued.
+        release_r0_slots(d, fr);
         auto c_t5 = d->host_timing ? cpu_now() : 0ull;
         auto t5 = d->host_timing ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point {};
@@ -2612,9 +2250,6 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     d->dump = env_flag("VSFEEL_BM3D_DUMP");
     d->split_est = env_int("VSFEEL_BM3D_SPLIT", 1) != 0;
     d->fault_frame = env_int("VSFEEL_BM3D_FAULT", -1);
-    // Diagnostic: wait the ring copier's submission out host side instead of
-    // riding the handoff barrier (see wait_src_submitted).
-    d->ring_wait = env_flag("VSFEEL_BM3D_RINGWAIT");
     // Debug oracle: VSFEEL_BM3D_MATCHTRACE=<frame>,<x>,<y> records the group
     // the matcher selects for one reference block of one centre frame.
 
@@ -2901,14 +2536,9 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // device_id and num_streams are registered but never read: the core owns
     // the one device and sizes in-flight depth itself (exec pool ring).
 
-    // at radius 0 every frame only touches its own slot and never depends on
-    // the previous frames' estimates, so give each in-flight frame its own
-    // src/res slot to keep the pipeline full; otherwise the ring of 1 would
-    // serialize the frames behind the timeline waits. At radius > 0 the caches
-    // are keyed by frame modulo the capacity and reserved all-or-nothing per
-    // frame, so they only need to cover the working set of the concurrent
-    // frames (like the reference's fused-mode accumulator cache); anything
-    // beyond that (e.g. seeking) blocks in the acquire instead of corrupting.
+    // Radius 0 gives every in-flight frame its own src/res slot so concurrent
+    // frames never serialize on a one-deep ring. Radius > 0 uses the temporal
+    // cursor and its separate ring sizes.
     int inflight =
         std::clamp(env_int("VSFEEL_BM3D_INFLIGHT", kInflightFrames), 1, 8);
 
@@ -2997,7 +2627,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         // Push descriptors: the bindings change every frame (the destination
         // plane is the frame's own storage), so nothing is allocated from a
         // pool and nothing survives the command buffer.
-        const auto result = gpu_push_set_layout(*d->gpu, 6);
+        const auto result = gpu_push_set_layout(*d->gpu, 4);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -3017,18 +2647,10 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // the format (no subsampling for 4:4:4 and RGB).
     const int subW = d->vi->format.subSamplingW;
     const int subH = d->vi->format.subSamplingH;
-    // YUV chroma (planes 1 and 2; a 4-plane clip's alpha is neither) is centred
-    // on zero in the reference's float domain, so the integer copy removes its
-    // 32768 neutral and the store adds it back. Luma and RGB keep the plain
-    // full-range normalisation, which is what a float clip of the same content
-    // already holds for them.
-    const bool yuv = d->vi->format.colorFamily == cfYUV;
     for (int plane = 0; plane < d->num_planes; ++plane) {
         auto & p = d->planes[plane];
         p.width = (plane == 0) ? d->vi->width : d->vi->width >> subW;
         p.height = (plane == 0) ? d->vi->height : d->vi->height >> subH;
-        p.tw = 2 * p.radius + 1;
-        p.chroma = yuv && plane > 0 && plane < 3;
         // The kernel clamps block origins to (dimension - 8), so a smaller
         // plane would address before its buffer. It only ever reads processed
         // planes, and a joint entry's luma, which is processed in every joint
@@ -3304,152 +2926,92 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         }
     }
 
-    // shared buffers
-    d->tags_size = static_cast<VkDeviceSize>(d->n_groups) * res_cap * d->max_tw;
-    {
-        {
-            std::string err =
-                gpu_make_buffer(*d->gpu, core, d->tags_size * 4, d->tags,
-                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
-                                VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-            if (!err.empty()) {
-                return set_error("the per-slice frame witness could not be "
-                                 "allocated: " +
-                                 err);
+    // The split's handoff, sized and validated from the geometry above.
+    if (d->split_kernel) {
+        std::string err = gpu_make_buffer(
+            *d->gpu, core, static_cast<VkDeviceSize>(d->match_words) * 4,
+            d->matches, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!err.empty()) {
+            return set_error("the match handoff could not be allocated: " +
+                             err);
+        }
+    }
+    if (d->trace_frame >= 0) {
+        // One record is the marker, the five counts that follow it, eight
+        // (x, y, z, error) slots and two counts per temporal frame and
+        // direction: 6 + 32 + 4 * radius words, all of which the kernel
+        // writes (the last temporal word of a radius-16 trace is index 101).
+        constexpr VkDeviceSize kTraceWords = 6 + 8 * 4 + 2 * 2 * MAX_RADIUS;
+        std::string err =
+            gpu_make_buffer(*d->gpu, core, kTraceWords * 4, d->match_trace,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (!err.empty()) {
+            return set_error("the match trace buffer could not be "
+                             "allocated: " +
+                             err);
+        }
+        d->match_trace_mapped =
+            static_cast<volatile uint32_t *>(d->match_trace.mapped);
+        if (d->match_trace_mapped) {
+            for (VkDeviceSize i = 0; i < kTraceWords; ++i) {
+                d->match_trace_mapped[i] = 0;
             }
         }
-        {
-            // The split's handoff, sized and validated from the geometry above.
-            if (d->split_kernel) {
-                std::string err = gpu_make_buffer(
-                    *d->gpu, core,
-                    static_cast<VkDeviceSize>(d->match_words) * 4, d->matches,
-                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                if (!err.empty()) {
-                    return set_error("the match handoff could not be "
-                                     "allocated: " +
-                                     err);
-                }
-            }
-        }
-        {
-            std::string err =
-                gpu_make_buffer(*d->gpu, core, 4 * sizeof(uint32_t), d->skipped,
-                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            if (!err.empty()) {
-                return set_error("the skip counter could not be allocated: " +
-                                 err);
-            }
-            d->skipped_mapped =
-                static_cast<volatile uint32_t *>(d->skipped.mapped);
-            if (d->skipped_mapped) {
-                for (int i = 0; i < 4; ++i) {
-                    d->skipped_mapped[i] = 0;
-                }
-            }
-        }
-        {
-            std::string err =
-                gpu_make_buffer(*d->gpu, core, 16, d->refusal,
-                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            if (!err.empty()) {
-                return set_error("the refusal report could not be allocated: " +
-                                 err);
-            }
-            d->refusal_mapped =
-                static_cast<volatile uint32_t *>(d->refusal.mapped);
-            for (int i = 0; i < 4; ++i) {
-                if (d->refusal_mapped) {
-                    d->refusal_mapped[i] = 0;
-                }
-            }
-        }
-        if (d->trace_frame >= 0) {
-            // One record is the marker, the five counts that follow it, eight
-            // (x, y, z, error) slots and two counts per temporal frame and
-            // direction: 6 + 32 + 4 * radius words, all of which the kernel
-            // writes (the last temporal word of a radius-16 trace is index 101).
-            constexpr VkDeviceSize kTraceWords = 6 + 8 * 4 + 2 * 2 * MAX_RADIUS;
-            std::string err =
-                gpu_make_buffer(*d->gpu, core, kTraceWords * 4, d->match_trace,
-                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            if (!err.empty()) {
-                return set_error("the match trace buffer could not be "
-                                 "allocated: " +
-                                 err);
-            }
-            d->match_trace_mapped =
-                static_cast<volatile uint32_t *>(d->match_trace.mapped);
-            if (d->match_trace_mapped) {
-                for (VkDeviceSize i = 0; i < kTraceWords; ++i) {
-                    d->match_trace_mapped[i] = 0;
-                }
-            }
-        }
-        // The kernels read or atomically update these host-initialised words.
-        store_fence();
+    }
+    // The kernels read or atomically update these host-initialised words.
+    store_fence();
 
-        // Both buffers come from the core's pool, so they count against the
-        // VRAM budget the frame cache and the thread pool's admission control
-        // also see. The source ring only ever receives copies; the estimate
-        // cache is filled and read by kernels.
-        for (int gi = 0; gi < d->n_groups; ++gi) {
-            auto & g = d->groups[gi];
-            std::string err =
-                gpu_make_buffer(*d->gpu, core, g.src_size * 4, g.src,
-                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
-                                VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    // Both buffers come from the core's pool, so they count against the
+    // VRAM budget the frame cache and the thread pool's admission control
+    // also see. The source ring only ever receives copies; the estimate
+    // cache is filled and read by kernels.
+    for (int gi = 0; gi < d->n_groups; ++gi) {
+        auto & g = d->groups[gi];
+        std::string err = gpu_make_buffer(*d->gpu, core, g.src_size * 4, g.src,
+                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                          0, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (!err.empty()) {
+            return set_error(err);
+        }
+        err = gpu_make_buffer(*d->gpu, core, g.res_size * 4, g.res,
+                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                              VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        if (!err.empty()) {
+            // The estimate cache is by far the largest allocation, so an
+            // out-of-memory here is the usual "radius too high for this
+            // card"; name the size and what shrinks it.
+            char msg[320];
+            snprintf(msg, sizeof(msg),
+                     "%s; the estimate cache needs %.0f MiB (radius %d): "
+                     "lower radius",
+                     err.c_str(),
+                     static_cast<double>(g.res_size) * 4.0 / (1024.0 * 1024.0),
+                     d->max_radius);
+            return set_error(msg);
+        }
+        if (d->max_radius > 0) {
+            err = gpu_make_buffer(*d->gpu, core, g.src_size * 4, g.scratch_src,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             if (!err.empty()) {
-                return set_error(err);
+                return set_error("the isolated source ring could not be "
+                                 "allocated: " +
+                                 err);
             }
-            err = gpu_make_buffer(*d->gpu, core, g.res_size * 4, g.res,
+            const VkDeviceSize one_slot =
+                static_cast<VkDeviceSize>(2) * g.n_planes * g.pe * 4;
+            err = gpu_make_buffer(*d->gpu, core, one_slot, g.scratch_acc,
                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
                                   VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             if (!err.empty()) {
-                // The estimate cache is by far the largest allocation, so an
-                // out-of-memory here is the usual "radius too high for this
-                // card"; name the size and what shrinks it.
-                char msg[320];
-                snprintf(msg, sizeof(msg),
-                         "%s; the estimate cache needs %.0f MiB (radius %d): "
-                         "lower radius",
-                         err.c_str(),
-                         static_cast<double>(g.res_size) * 4.0 /
-                             (1024.0 * 1024.0),
-                         d->max_radius);
-                return set_error(msg);
-            }
-            if (d->max_radius > 0) {
-                err = gpu_make_buffer(*d->gpu, core, g.src_size * 4,
-                                      g.scratch_src,
-                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
-                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-                if (!err.empty()) {
-                    return set_error("the isolated source ring could not be "
-                                     "allocated: " +
-                                     err);
-                }
-                const VkDeviceSize one_slot =
-                    static_cast<VkDeviceSize>(2) * g.n_planes * g.pe * 4;
-                err = gpu_make_buffer(*d->gpu, core, one_slot, g.scratch_acc,
-                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
-                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-                if (!err.empty()) {
-                    return set_error("the isolated accumulator ring could not "
-                                     "be allocated: " +
-                                     err);
-                }
+                return set_error("the isolated accumulator ring could not "
+                                 "be allocated: " +
+                                 err);
             }
         }
     }
@@ -3637,17 +3199,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             res_cap, src_ring, d->planes[0].stride, d->bits);
     }
 
-    d->chunk0_value.assign(static_cast<size_t>(d->nframes), 0);
     for (int gi = 0; gi < d->n_groups; ++gi) {
         auto & g = d->groups[gi];
-        g.src_frame.assign(g.src_ring, -1);
-        g.src_writer.assign(g.src_ring, -1);
-        g.src_ready.assign(g.src_ring, 0);
-        g.src_holders.resize(g.src_ring);
-        g.res_frame.assign(g.res_cap, -1);
-        g.res_writer.assign(g.res_cap, -1);
-        g.res_ready.assign(g.res_cap, 0);
-        g.res_holders.resize(g.res_cap);
         g.acc_frame.assign(g.res_cap, -1);
         g.r0_free.reserve(inflight);
         for (int i = 0; i < inflight; ++i) {
