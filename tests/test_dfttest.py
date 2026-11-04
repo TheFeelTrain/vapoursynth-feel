@@ -393,6 +393,17 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
         src = core.std.Trim(src, first=0, length={CLIP_FRAMES})
     if clip_kind == "grays":
         clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
+    elif clip_kind == "grays_tall":
+        # 640x360 never leaves the last stripe's tail unwritten; 2160 tall
+        # reaches that case for the high-overlap sosizes (block_step 9..15).
+        clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
+        clip = core.resize.Bicubic(clip, width=640, height=2160, format=vs.GRAYS)
+    elif clip_kind == "grays_wide_tall":
+        # 3840 wide shrinks the ring to 128 block rows while 4320 tall gives
+        # >2*ring block rows, so a middle stripe is full and the ring lookback
+        # is exercised; 2160 tall alone only reaches the last-stripe tail.
+        clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=32, fulls=True, fulld=True)
+        clip = core.resize.Bicubic(clip, width=3840, height=4320, format=vs.GRAYS)
     elif clip_kind == "gray16":
         clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY), bits=16, fulls=True, fulld=True)
     elif clip_kind == "yuv420ps":
@@ -403,7 +414,7 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
         raise SystemExit("bad clip kind %r" % clip_kind)
     dt = np.float32 if clip.format.sample_type == vs.FLOAT else np.uint16
 
-    frames = (0, 11, 23)
+    frames = tuple(json.loads(sys.argv[4])) if len(sys.argv) > 4 else (0, 11, 23)
 
     # --- reference phase: materialise and copy before touching vsfeel ---
     ref_frames = []
@@ -445,7 +456,9 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 """)
 
 
-def _reference_max_diffs(clip_kind="grays", cases=None, planes=(0,)) -> list[float]:
+def _reference_max_diffs(
+    clip_kind="grays", cases=None, planes=(0,), frames=(0, 11, 23)
+) -> list[float]:
     """Run every config in a single subprocess.
 
     A missing/crashing reference skips (via compare_or_skip); a vsfeel crash,
@@ -455,7 +468,12 @@ def _reference_max_diffs(clip_kind="grays", cases=None, planes=(0,)) -> list[flo
         cases = [kw for kw, _ in REFERENCE_CASES]
     return compare_or_skip(
         _COMPARE_SCRIPT,
-        [clip_kind, json.dumps(cases), json.dumps(list(planes))],
+        [
+            clip_kind,
+            json.dumps(cases),
+            json.dumps(list(planes)),
+            json.dumps(list(frames)),
+        ],
         timeout=600,
     )
 
@@ -485,6 +503,34 @@ def test_dfttest_matches_reference_u16(clip_gray16, kwargs):
     """u16 path: at most one code level of rounding difference."""
     worst = _ref_compare("gray16", kwargs)
     assert worst <= 1, f"gray16 max diff {worst} ({kwargs})"
+
+
+def test_dfttest_sosize_last_stripe_tail_matches_reference():
+    """The last stripe must emit every remaining padded row.
+
+    col2im clamps i2 to vn-1, so past row_end*block_step-1 there is no next
+    stripe and the tail is ready; the old bound left the final rows zero.
+    640x2160 exposes that on sosize 3/5.
+    """
+    reference_or_skip("vszipcl", "DFTTest")
+    cases = [{"sosize": v, "tbsize": 1} for v in (1, 2, 3, 5, 6, 7)]
+    maxdiffs = _reference_max_diffs("grays_tall", cases, frames=(0,))
+    for case, maxdiff in zip(cases, maxdiffs):
+        assert maxdiff < REF_TOL, f"max diff {maxdiff} vs vszipcl for {case}"
+
+
+def test_dfttest_sosize_stripe_ring_lookback_matches_reference():
+    """A full middle stripe must not overwrite the block row col2im is reading.
+
+    3840x4320 with block_step 13/11 gives more than two rings of block rows,
+    so the second stripe is full and the previous stripe's last block row is
+    still needed. The 640x360/2160 fixtures never reach that state.
+    """
+    reference_or_skip("vszipcl", "DFTTest")
+    cases = [{"sosize": v, "tbsize": 1} for v in (3, 5)]
+    maxdiffs = _reference_max_diffs("grays_wide_tall", cases, frames=(0,))
+    for case, maxdiff in zip(cases, maxdiffs):
+        assert maxdiff < REF_TOL, f"max diff {maxdiff} vs vszipcl for {case}"
 
 
 # Window indices 0..11 on both axes, sigma2, the legal sosize surface (incl.

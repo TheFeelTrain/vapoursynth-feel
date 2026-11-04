@@ -499,6 +499,21 @@ def test_storage_buffer_range_limit_is_reported():
     assert "maxStorageBufferRange" in err and str(1 << 20) in err, res["bm3d"]
 
 
+def test_dfttest_scratch_range_is_a_creation_error():
+    """The padded window and block ring are checked before the first frame.
+
+    gpu_make_buffer already rejects an oversized per-frame buffer, but that
+    used to happen on every frame; creation must name the plane and the limit.
+    """
+    res = _run_limits(
+        [{"label": "dfttest", "filter": "dfttest"}],
+        {"VSFEEL_LIMIT_STORAGE_RANGE": str(1 << 20)},
+    )
+    err = res["dfttest"].get("error", "")
+    assert "padded window" in err and "maxStorageBufferRange" in err, res["dfttest"]
+    assert str(1 << 20) in err, res["dfttest"]
+
+
 def test_push_descriptor_limit_is_reported():
     """The binding count is bounded by maxPushDescriptors, checked explicitly."""
     res = _run_limits(

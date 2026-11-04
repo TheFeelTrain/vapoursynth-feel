@@ -433,9 +433,10 @@ struct DftPlaneConfig {
 
 // Block rows whose windows overlap a stripe's last output row, i.e. how far back
 // col2im reaches into blocks the previous stripe produced. col2im's floor((y -
-// 16 + step) / step) at y = row*step is row - (16-step)/step for step <= 16.
+// 16 + step) / step) at y = row*step reaches row - ceil((16-step)/step); the
+// integer ceiling is (BS - 1) / step for every legal block_step.
 static int dft_lookback(int block_step) {
-    return (BS - block_step) / block_step;
+    return (BS - 1) / block_step;
 }
 
 // The spatial handoff between fused and col2im is the filter's largest traffic:
@@ -443,7 +444,7 @@ static int dft_lookback(int block_step) {
 // and read once per frame, far past the 96 MB Infinity Cache, so it lands in
 // VRAM. Processing the frame in stripes of block rows and keeping the handoff
 // inside a ring of SPATIAL_ROW_BUDGET bytes keeps the write and the read in L2
-// (~+29% at 1080p, see notes/DFTTEST.md).
+// (+18.5% shipped at 1080p, see notes/DFTTEST.md).
 constexpr VkDeviceSize kSpatialRowBudget = 64 * 1024 * 1024;
 
 static void dft_plan_spatial(DftPlaneConfig & cfg, int block_step) {
@@ -922,11 +923,6 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
         // buffer is a ring of cfg.spatial_rows rows, so the fused write and the
         // col2im read of each stripe stay in L2 instead of streaming a
         // full-frame block buffer through VRAM.
-        VSVulkanPlaneInfo cp {};
-        if (d->gpu->api->getGPUPlane(center, plane, &cp)) {
-            return fail("center plane " + std::to_string(plane) +
-                        " is not GPU resident");
-        }
         // One source plane buffer per temporal slice, all read by fused: the
         // descriptor array binding. Each slice keeps its own row stride.
         std::array<VkBuffer, 7> src_buffers {};
@@ -1022,11 +1018,16 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
             // col2im: overlap-add the stripe's completed output rows straight
             // into the output plane. Only rows whose block support is complete
             // (blocks up to row_end-1) are ready; the next stripe's rows need
-            // blocks the next stripe produces.
+            // blocks the next stripe produces. The last stripe has no next one,
+            // and col2im clamps i2 to vn-1, so every remaining padded row is
+            // ready even past row_end*block_step-1.
             vsfeel_trace_mark("col2im");
             {
                 const int y_begin = std::max(y_first, row_base * d->block_step);
-                const int y_end = std::min(y_last, row_end * d->block_step - 1);
+                const int y_end =
+                    (row_end == cfg.vn)
+                        ? y_last
+                        : std::min(y_last, row_end * d->block_step - 1);
                 if (y_end >= y_begin) {
                     DftPushConstants pc = pc_base;
                     pc.width = cfg.width;
@@ -1618,6 +1619,26 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
                                     d->gpu->limits)) {
             return set_error(*e);
         }
+        // The per-frame scratch is created with gpu_make_buffer, which checks
+        // this same limit; doing it here turns a per-frame failure into one
+        // creation error naming the plane.
+        const auto & cfg = d->planes[plane];
+        const auto range =
+            static_cast<VkDeviceSize>(d->gpu->limits.maxStorageBufferRange);
+        if (cfg.padded_bytes > range) {
+            return set_error(
+                "plane " + std::to_string(plane) + "'s padded window (" +
+                std::to_string(cfg.padded_bytes) +
+                " bytes) exceeds this device's maxStorageBufferRange (" +
+                std::to_string(range) + " bytes); lower tbsize");
+        }
+        if (cfg.spatial_bytes > range) {
+            return set_error(
+                "plane " + std::to_string(plane) + "'s block ring (" +
+                std::to_string(cfg.spatial_bytes) +
+                " bytes) exceeds this device's maxStorageBufferRange (" +
+                std::to_string(range) + " bytes); reduce the frame size");
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1631,8 +1652,8 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         // one descriptor array (only pad reads it, only with a constant index).
         // 5/6 alias wt as vec2/vec4 views for the table loads. Binding 4 is
         // sized for the widest temporal window any compiled variant declares
-        // (tbsize 7), not this instance's: the pipelines of every radius are
-        // created here and their SPIR-V array length must fit the layout.
+        // (tbsize 7), not this instance's: the one shared layout must also fit
+        // the other radius variants' SPIR-V array length.
         const uint32_t counts[7] { 1, 1, 1, 1, 7, 1, 1 };
         const auto result = gpu_push_set_layout(*d->gpu, counts, 7);
         if (std::holds_alternative<std::string>(result)) {
@@ -1789,23 +1810,29 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             return set_error("unsupported io type");
         }
 
-        for (int r = 0; r < 4; ++r) {
+        // Only this instance's temporal radius is ever dispatched
+        // (d->pad_pipeline[d->radius] / d->fused_pipeline[d->radius]); the
+        // other radius variants would only cost creation time and make an
+        // unused variant able to reject a valid instance.
+        const int radius = d->radius;
+        {
             const auto result =
-                create_pipeline(*d->gpu, d->pipeline_layout, pad_code[r],
-                                pad_size[r], kPlaneWorkgroup);
+                create_pipeline(*d->gpu, d->pipeline_layout, pad_code[radius],
+                                pad_size[radius], kPlaneWorkgroup);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
-            d->pad_pipeline[r] = std::get<VkPipeline>(result);
+            d->pad_pipeline[radius] = std::get<VkPipeline>(result);
         }
-        for (int r = 0; r < 4; ++r) {
-            const auto result = create_pipeline(
-                *d->gpu, d->pipeline_layout, fused_code[r], fused_size[r],
-                kFusedWorkgroup, d->filter_type, d->zmean ? 1 : 0);
+        {
+            const auto result =
+                create_pipeline(*d->gpu, d->pipeline_layout, fused_code[radius],
+                                fused_size[radius], kFusedWorkgroup,
+                                d->filter_type, d->zmean ? 1 : 0);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
-            d->fused_pipeline[r] = std::get<VkPipeline>(result);
+            d->fused_pipeline[radius] = std::get<VkPipeline>(result);
         }
         {
             const auto result =

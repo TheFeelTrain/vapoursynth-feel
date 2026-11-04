@@ -68,8 +68,9 @@ IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
 - Push descriptors with seven bindings: `wt` (scalar view), `padded`, `spatial`,
   `dst`, the tw source planes as one descriptor array (binding 4, pad only), and
   two vector views of `wt` (5 = vec2 for the window_freq pairs, 6 = vec4 for the
-  transposed window). The layout declares 7 descriptors; the pad update binds
-  `tw` of them, and every radius's pipelines share the one layout.
+  transposed window). The layout declares 7 bindings / 13 descriptors; the pad
+  update binds `4 + tw + 2` of them, and every radius's pipelines share the one
+  layout.
 - `num_streams` and `device_id` are registered no-ops (never read): depth is
   the core's call, device choice is `core.set_vulkan_device`.
 
@@ -82,15 +83,19 @@ IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
 - Block rows are processed in stripes and the handoff stays in a ring of
   `spatial_rows` rows indexed by `block row & (spatial_rows-1)`: the largest
   power of two whose bytes fit `kSpatialRowBudget` (64 MiB) and at least
-  `lookback+1`. `lookback = (16-block_step)/block_step` is how far back
-  `col2im`'s window reaches into the previous stripe; `stripe_rows =
-  spatial_rows - lookback` (125 rows = 3 stripes at 1080p).
+  `lookback+1`. `lookback = ceil((16-block_step)/block_step)`, the integer
+  `(BS-1)/block_step`, is how far back `col2im`'s window reaches into the
+  previous stripe; `stripe_rows = max(1, ring - lookback)`.
 - Per stripe: `fused` writes rows `[row_base, row_end)`, `col2im` emits the
   output rows whose block support is complete (padded `y < row_end*block_step`)
   and the rows left over by the previous stripe are still in the ring, then the
-  trailing barrier protects the slots the next `fused` overwrites
-  (`spatial_rows` is exactly `stripe_rows + lookback`).
-- `vn <= spatial_rows` is one stripe and behaves like a full-frame layout, so
+  trailing barrier protects the slots the next `fused` overwrites.
+  `spatial_rows = min(ring, vn)`; when `vn >= ring` this is exactly
+  `stripe_rows + lookback`, while a frame smaller than one stripe does not
+  satisfy the identity and is handled as a single stripe. The last stripe
+  emits through `y_last` because `col2im` clamps `i2` to `vn-1`; without that
+  the final padded rows are never written.
+- `vn <= stripe_rows` is one stripe and behaves like a full-frame layout, so
   small frames pay neither the extra dispatches nor the barriers.
 
 ### Kernels (`src/dfttest.comp`)
@@ -160,12 +165,13 @@ force-pad / fail-pad probes.
 
 ## Performance
 
-- **The L2-resident block handoff is the win: +24% at the default config**
-  (jpbd 1080p GRAY16, 3000 frames, medians of 3, one session: 1515.9 → 1875.2
-  fps). Ladder: aliasing the block buffer to a 1 MB footprint +32%, a 128-row
-  ring (63 MB) +27.6%, a 64-row ring (32 MB) +29%; shipped with the 63 MB ring
-  and 3 stripes (+18.5%), because the 5-stripe version's extra dispatches and
-  barriers ate 7 points of it.
+- **The L2-resident block handoff is the win.** At the handoff round it was
+  +24% over the full-frame buffer (jpbd 1080p GRAY16, 3000 frames, medians of
+  3, one session: 1515.9 → 1875.2 fps); the cube-spread round then took the
+  same config to 1984.9 fps. Ladder: aliasing the block buffer to a 1 MB
+  footprint +32%, a 128-row ring (63 MB) +27.6%, a 64-row ring (32 MB) +29%;
+  shipped with the 63 MB ring and 3 stripes (+18.5%), because the 5-stripe
+  version's extra dispatches and barriers ate 7 points of it.
 - **One pad dispatch instead of 3–7 (+3.35%)**: the tw source planes are one
   descriptor array read with a compile-time slice index. Deleting the pad pass
   entirely and folding branchless reflection into fused was 4% *slower* — the
@@ -210,9 +216,10 @@ force-pad / fail-pad probes.
   oracle holds. The f16 module's fused_r1 codegen is within a few percent of
   the f32 module's (VGPR 120, 12 waves/SIMD; VALU 1710 vs 1777).
 - **CPU in / CPU out** is core-inserted upload+download (both free: ReBAR memcpy
-  ahead, SDMA download). `--download` is −1% (core planes read in place) and
-  chained instances +4%, the residual being the pad dispatch and the ring
-  barriers the chain still pays.
+  ahead, SDMA download). `--download` is +1.4% over the CPU-cache row
+  (2013.6 vs 1984.9 fps; core planes read in place) and chained instances +4%,
+  the residual being the pad dispatch and the ring barriers the chain still
+  pays.
 - **Fused codegen residue is deliberately left**: remaining IM2COL/window ALU
   and pointer-walk strength reduction; col2im already runs ~2x the references.
 
@@ -339,7 +346,8 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 - **The stripe floor.** 6 dispatches and 6 barriers per plane stand between the
   32 MB-ring ceiling (+29%) and the shipped +18.5%; a column-direction stripe
   would fit 2 stripes at 1080p (72 MB ring) if the reindexing is worth ~2-3%.
-- `pad`/`col2im` are 32x8 (256 invocations, the plugin's largest workgroup):
+- `pad`/`col2im` are 32x8 (256 invocations, one of the plugin's largest
+  workgroups):
   a device at the Vulkan minimum of 128 cannot run DFTTest at all and now says
   so at creation (`tests/test_device_limits.py`). The local size is a literal in
   the shader and the grid is sized from it, so a smaller variant means a `-D`
@@ -360,8 +368,9 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 ## Debug env vars
 
 - `VSFEEL_DFTTEST_GPUTRACE=<frame>` — one-shot warm GPU timings for that frame
-  (`pad`, then the *first stripe's* `fused`/`col2im`, then the whole frame);
-  defaults to frame 100 and requires the queue family to report timestamp bits.
+  (`pad`, then the *first stripe's* `fused`/`col2im`); the `total` covers pad +
+  first stripe only. Defaults to frame 100 and requires the queue family to
+  report timestamp bits.
 - `VSFEEL_DFTTEST_TIMING=1` — per-frame host stage averages
   (`acquire`/`record`/`submit`).
 - `VSFEEL_DFTTEST_TRACE=1` — one line per submitted frame.
