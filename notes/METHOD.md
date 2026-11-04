@@ -233,15 +233,14 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   merging the second pass into the first while the row is still cache-hot is
   nearly free (+3.5% on EEDI3, deleting a frame-sized DRAM re-read).
 - **Do not invoke a graph node to normalize an input your kernel only reads as
-  a predicate.** EEDI3 forced every mask through `SetFrameProps(_Range=1) ->
-  resize.Point -> Gray8` so the kernel could test `byte != 0` — a whole extra
-  full-frame pass, every frame. The reduction is monotonic, so that predicate is
-  exactly `v >= 129` on the native u16 input: the node was deleted for an
-  instant +8%. Whenever a filter adds a
-  std/resize/format node at create time, ask what the consumer actually needs
-  from it; a monotone transform or a threshold can usually be folded into the
-  native data. Verify equivalence exhaustively when the domain is small
-  (65536 values is a proof, not a hope).
+  a predicate.** EEDI3 used to force every mask through `SetFrameProps(_Range=1)
+  -> resize.Point -> Gray8` for a whole extra full-frame pass; Gray8/16/f32/f16
+  masks are now read directly and the u16 predicate is exactly `v >= 129`, so
+  the node is gone for an instant +8% on the native path (10/12-bit masks still
+  take the conversion). Whenever a filter adds a std/resize/format node at
+  create time, ask what the consumer actually needs from it; a monotone
+  transform or a threshold can usually be folded into the native data. Verify
+  equivalence exhaustively when the domain is small; 65536 values is a proof.
 - **Sweep workgroup shape across workload configs, not just the default.**
   The best tile is a function of the algorithm's workload params (window
   radius, taps, halo overfetch), not a universal constant — a shape that
@@ -343,8 +342,8 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   on the notes (shape, style, the line budgets `tools/notes_check.py` enforces),
   so none of that is repeated here. Keep entries short regardless: conclusion
   first, a number only with its config, one line for a correctness-only change,
-  mechanism not story. **Worked examples of most rules above live in
-  `notes/EEDI3.md` rounds 10–12** (host-bounded frames, the SIMD dilation
-  rewrite, the ReBAR upload, the boundary-input oracle bug, the harness-memory
-  bimodality, and a list of measured non-wins) — worth reading before starting
-  a new filter, even though none of it is EEDI3-specific.
+  mechanism not story. **Worked examples live in `notes/EEDI3.md`'s `Pre-round
+  14 — the benchmark's mask was broken` and `Rounds 5–13 — pre-port host path`**
+  (the SIMD dilation rewrite, the ReBAR upload, the boundary-input oracle bug,
+  the harness-memory bimodality, measured non-wins) — worth reading before
+  starting a new filter, even though none is EEDI3-specific.

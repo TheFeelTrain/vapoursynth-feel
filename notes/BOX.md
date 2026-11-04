@@ -29,6 +29,9 @@ written to match. Measured on the 640x360 fixture, every depth, every plane:
 | vsfeel.Box, CPU frames both sides | 3408 | 874 |
 | control: the same graph with no filter | 10811 | 2434 |
 
+This table predates the wall-clock harness (`--frames` was removed; every arm is
+now a `--seconds` window), so use the ratios, not the absolute fps.
+
 Box is the fastest option only in the middle row. Standalone it loses to the CPU
 resizer, because an upload and a download cost more than the resize does; it is
 worth reaching for when its input and output are already on the device, which is
@@ -70,12 +73,14 @@ An output width/height that a subsampled format cannot store (odd width on
 probe frame is allocated at the requested size, and the core treats an illegal
 subsampled size as a fatal error, so this cannot be left to the probe.
 
-Smaller things worth knowing: `skip_vert` drops the first dispatch when an axis is
-unscaled; both strides are read off scratch frames at creation, because a GPU
-frame's stride is the CPU frame's; the two tables are concatenated into one host
-visible buffer like GaussBlur's weights; the io variant (u16/f16/f32) is one
-compile-time `-D` selected from the input format (half is `stFloat` + 16 bits),
-so Box ships six SPIR-V variants, two passes times three depths.
+Smaller things worth knowing: `skip_vert` drops the vertical dispatch when the
+output height is unscaled; a height-only downscale still runs both passes
+because the horizontal pass is never skipped. Both strides are read off scratch
+frames at creation, because a GPU frame's stride is the CPU frame's; the two
+tables are concatenated into one host visible buffer like GaussBlur's weights;
+the io variant (u16/f16/f32) is one compile-time `-D` selected from the input
+format (half is `stFloat` + 16 bits), so Box ships six SPIR-V variants, two
+passes times three depths.
 
 ### Tests
 `tests/test_box.py` — reference comparison per ratio × depth and per color family
@@ -87,10 +92,13 @@ residency, identity, determinism, frame properties, validation.
 
 ## Performance
 
-The kernel is two dispatches over `SRC_H` and `SRC_W` outputs, one load per tap,
-no shared memory. Subtracting the no-filter control above, Box's own work is
-**~30 µs/frame at 1080p→540p and ~65 µs at 4K→1080p**, against ~175 µs and
-~675 µs for the CPU resizer.
+The kernel is two dispatches, one load per tap, no shared memory: the vertical
+pass runs `SRC_W × DST_H` outputs and the horizontal pass `DST_W × DST_H`.
+Subtracting the no-filter control above, Box's own work is **~30 µs/frame at
+1080p→540p and ~65 µs at 4K→1080p**; total-to-total (device frames both sides,
+which is what the table's fps implies) it is ~123/476 µs against ~181/680 µs for
+the CPU resizer. The marginal figure is not comparable to the resizer's total
+frame time.
 
 Everything else in the standalone row is the round trip: at 1080p a u16 upload or
 download is ~100 µs, so CPU frames on both sides cost ~200 µs more than the

@@ -9,11 +9,12 @@ intermediates, f32 arithmetic), i.e. the f32 result rounded once. `hp`
 bit-exact too. EEDI3, EEDI3H (native transposed-plane) and EEDI3AA (fused
 based_aa chain) share every kernel, geometry and pipeline. Runs on the **R80
 GPU API**: `clip/sclip/mclip:vnode:gpu` in and `ffGPUOutput` out, one exec pool,
-and no host upload/download/gather/blit machinery at all. The parallel vcheck is
+and no host upload/download/gather/blit machinery at all; the parallel vcheck is
 the default.
 
-Benchmark (`--filter eedi3`, the README's config): 1080p jpbd, mask, default
-args (field=3, mdis=20, vcheck=2), 5 s medians of 3 (README differs):
+Benchmark (`--filter eedi3`, the README's config): 1080p jpbd, mask, benchmark
+args (alpha=0.125, gamma=40, vthresh0/1/2=12/24/4; field=3, mdis=20, vcheck=2),
+5 s medians of 3 (README differs):
 
 | depth | vsfeel | eedi3vk2 | ratio |
 |---|---|---|---|
@@ -27,34 +28,30 @@ widens the relax to ±2 and grows `pbt` 16 → 81 bytes; it cannot 2-bit pack.
 - **The graded vertical EEDI3 is HOST<->DEVICE TRANSFER bound, not kernel
   bound.** The bill is ~50 MB per output frame (sclip every frame, clip+mclip
   every other, the download); `GPUUpload → GPUDownload` of one 4K16 plane is
-  2.82 ms, which is the 2x2160p frame time. The legacy `SKIP=1` ablation was
-  void (the knob takes a kernel list); `VSFEEL_EEDI3_SKIP=mask,pad,row,vcheck,tail`
-  is the live ladder.
+  2.82 ms, which is the 2x2160p frame time. `VSFEEL_EEDI3_SKIP=...` is the live
+  ablation ladder.
 - **Batch size (`VSFEEL_EEDI3_BATCH`, default from a scratch target — 256 MiB,
-  768 for EEDI3AA).** The knee is where the submit path stops being amortised by
-  the GPU fill: with RADV's transfer queue on (what the benchmark sets) 2x2160p
-  wants **B=2** (B=1 355 / B=4 453 / B=8 339); neither knee moves with it off.
+  768 for EEDI3AA).** The knee is where the submit path stops being amortised:
+  with RADV's transfer queue on 2x2160p wants **B=2** (B=1 355 / B=4 453 /
+  B=8 339); neither knee moves with it off.
 - **`pbt` is 2-bit packed** when a lane owns exactly two directions (TPITCH
   33..63, i.e. mdis 16..31, which includes the default 20): each lane builds a
   nibble and only even lanes store, combining their odd neighbour's nibble
   through a `subgroupShuffleXor`, so no barrier and no write race. Column stride
   41 → 16 bytes, per-frame scratch at 2x2160p 225 → 120 MiB. Bit-exact on the
-  whole 16-config sweep (mdis 5/20/40 cover K=1/2/3). Reusing the scratch
-  (`gpuExecRetain` free list) instead of allocating per frame was **neutral**.
-  hp cannot pack: its deltas span ±2.
+  whole 16-config sweep (mdis 5/20/40 cover K=1/2/3); hp cannot pack (±2 deltas).
 
 ## Implementation
 
-Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter eedi3 vsfeel
-eedi3vk2` (1080p + mask; `--filter eedi3h` horizontal, `--filter eedi3aa` the
-2x based_aa chain; `--eedi3-args "hp=1"` for the half-pel search).
+Benchmark: `tools/benchmark.py --filter eedi3` (add `eedi3h`, `eedi3aa`, or
+`--eedi3-args "hp=1"` for the other entries).
 
-Two GPU passes per plane: `ENTRY_PAD` expands eedi3m's mirrors in VRAM from the
-tight kept-row upload; `ENTRY_ROW` does the DP + backtrack; `ENTRY_VCHECK`
-finalises each interp row. EEDI3H adds `ENTRY_XPOSE` (16x16 tiled transpose with an
-LDS stage, clip → R', sclip → B') and `ENTRY_COMPOSE`; EEDI3AA adds `ENTRY_ASSEMBLEV`
-(vertical merge of the two sub-frames) and reuses `ENTRY_COMPOSE` with a
-`comp_fuse` push constant.
+Per plane the R80 path uploads nothing: it reads the core's GPU planes directly
+and records mask predicate/dilation (+ transpose for EEDI3H), xpose, pad (+
+hpfill), row, vcheck/vcopy and tail blit/compose/assemble (3-6 dispatches).
+EEDI3H adds `ENTRY_XPOSE` (16x16 tiled transpose, clip → R', sclip → B') and
+`ENTRY_COMPOSE`; EEDI3AA adds `ENTRY_ASSEMBLEV` (vertical merge of the two
+sub-frames) and reuses `ENTRY_COMPOSE` with a `comp_fuse` constant.
 
 ### f16 (half io)
 
@@ -119,8 +116,8 @@ dmap.
 
 `cint = sclip ? scpp[x] : cubic(dst1p,dst1n,dst3p,dst3n)`; u16 cubic
 `(9*(dst1p+dst1n)-(dst3p+dst3n)+8)/16` clamped [0,peak], floats unclamped.
-`tline[x]=cint` directly if `dirc==0`, `max(dirc*dirt,dirc*dirb)<0`,
-`dirt==dirb==0`, or `x±|dirc|` leaves `[0,width)`. Else, with
+`tline[x]=cint` directly if `dirc==0`, `max(dirc*dirt,dirc*dirb)<0`, or
+`dirt==dirb==0`. Else, with
 `it=(dst2p[x+dirc]+dstp[x-dirc]+1)/2`, `ib=(dstp[x+dirc]+dst2n[x-dirc]+1)/2`,
 `vt=|dst2p[x+dirc]-dst1p[x+dirc]|+|dstp[x+dirc]-dst1p[x+dirc]|`,
 `vb=|dst2n[x-dirc]-dst1n[x-dirc]|+|dstp[x-dirc]-dst1n[x-dirc]|`,
@@ -173,8 +170,11 @@ identical everywhere):
 ### Constraints vsfeel implements
 
 - `eedi3m` validation: field 0..3; !dh ⇒ processed planes even; dh ⇒ field≤1;
-  alpha+beta≤1; nrad 0..3; mdis 1..40; vcheck 0..3; vthresh*>0 if vcheck>0;
-  mclip/sclip same videoinfo+numFrames (sclip only when vcheck>0). `cost3` gates:
+  alpha+beta≤1; nrad 0..3; mdis 1..40; vcheck 0..3; vthresh*>0 if vcheck>0.
+  vsfeel's clips differ: `mclip` must be Gray at the clip's width/height/frame
+  count, any Gray depth (8/16/f32/f16 native, 10/12-bit converted via
+  `SetFrameProps(_Range=1)` + Point); `sclip` must match the **output** info
+  (doubled frames/axis under field/dh) and is read only when vcheck>0. `cost3`:
   s1 if `(u>=0&&x>=u2)||(u<=0&&x<W+u2)`; s2 if `(u<=0&&x>=-u2)||(u>=0&&x<W-u2)`;
   `s1=s2=s0` fallbacks.
 - `eedi3m` DP/backtrack: `z=(double)ppT[mdis+v] + (double)(gamma*|u-v|)` capped
@@ -682,9 +682,9 @@ passes). All bit-identical to the previous build unless stated.
   parallel with that many Jacobi steps. Default 6 (bit-exact on the test surface).
 - `VSFEEL_EEDI3_BATCH` — output frames recorded per submission (default: a
   ~256 MiB scratch target, 768 for EEDI3AA, capped by the core's VRAM allowance;
-  clamped 2..8, which lands on 2 at 2x2160p for EEDI3 and 4 for EEDI3AA, 8 at
-  1080p; drops to 1 when the allowance cannot hold two frames). `=1` is the A/B
-  control.
+  the auto plan clamps 2..8, which lands on 2 at 2x2160p for EEDI3 and 4 for
+  EEDI3AA, 8 at 1080p; drops to 1 when the allowance cannot hold two frames).
+  The env override accepts 1..8; `=1` is the A/B control.
 - `VSFEEL_EEDI3_TRACE` — one-shot banner: VRAM accounting, per-plane region layout,
   spec constants per geometry.
 - `VSFEEL_EEDI3_TIMING` — per-frame host stage split (acquire/alloc/record/submit).

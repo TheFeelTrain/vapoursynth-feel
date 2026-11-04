@@ -18,7 +18,8 @@ Target GPU: RX 7900 XTX (RDNA3, gfx1100), Mesa 26.2 RADV.
   `notes/BILATERAL.md`), which `tools/benchmark.py` forces.
 
 Scoreboard — jpbd 1080p GRAY16, 3000 frames, medians of 3 through
-`tools/benchmark.py --filter dfttest`:
+`tools/benchmark.py --filter dfttest` (pre-wall-clock: `--frames` was removed,
+so use the ratios):
 
 | mode | vsfeel | vszipcl | ratio |
 |---|---|---|---|

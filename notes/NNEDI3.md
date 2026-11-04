@@ -44,9 +44,12 @@ etype=0 pscrn=4`), 5000 frames, medians of 3 through `tools/benchmark.py`:
 | `--download` (resident GPU clip) | 3340 | 3441 | - | 2276 / 2246 / - |
 | default (resident GPU clip, no download) | 4679 | 4839 | 3929 | - |
 
+These 5000-frame runs predate the wall-clock harness (`--frames` was removed);
+use the ratios, not the absolute fps.
+
 - f16 is the fastest io type now, and the packed predictor is why: same-session
-  interleaved A/B, 5000 frames ×3, default (resident GPU input, no download):
-  **packed 4862 vs mixed 3830 fps (+26.9%)**, CPU cache 3157 vs 2981
+  interleaved A/B, pre-wall-clock 5000 frames ×3, default (resident GPU input, no
+  download): **packed 4862 vs mixed 3830 fps (+26.9%)**, CPU cache 3157 vs 2981
   (**+5.9%**). At `pscrn=0` (every pixel predicted,
   `VSFEEL_NNEDI3_GPUTRACE=100`)
   predict is 3483 µs packed vs 4887 mixed (**+40%**): the sparse `pscrn=4` list

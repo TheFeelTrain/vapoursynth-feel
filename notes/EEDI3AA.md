@@ -268,8 +268,9 @@ reference chain:
   is back at 0. The premise (which pixels the distinct sclip leaves alone) was
   never content-specific.
 
-**Cost model** (pre-R80; 2x-2160p, mdis=20, vcheck=2, ns=1, steady state, four
-sub-passes / two submissions) from the `VSFEEL_EEDI3_GBENCH` profiler:
+**Cost model** (pre-R80 and pre-wall-clock; 2x-2160p, mdis=20, vcheck=2, ns=1,
+steady state, four sub-passes / two submissions) from the
+`VSFEEL_EEDI3_GBENCH` profiler:
 
 | stage | x4 / frame | share |
 |---|---|---|

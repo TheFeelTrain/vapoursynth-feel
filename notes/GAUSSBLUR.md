@@ -10,16 +10,17 @@ Design (current):
   queues or queue cap.
 - Three io variants — u16, f16, f32 — selected by the input format (half is
   `stFloat` + 16 bits). Half is a storage width, not a precision: the f16 path
-  runs the f32 arithmetic, is bit-exact with vszipcl's f16 output and sits
-  within one half ulp of the f32 one.
+  runs the f32 arithmetic, matches vszipcl's f16 output bit-exactly on the fused
+  path (one half step on the two-pass path) and sits within one half ulp of the
+  f32 one.
 - Two code paths, three kernels: fused small (radius ≤ 32) and two-pass
   vertical/horizontal (larger). Each pass carries its own workgroup shape and
   outputs per thread, because the two want opposite ones: the vertical pass is
   32x4 with 16 outputs per thread (a warp then reads one row of 32 consecutive
   elements, one full cache line, and its strided row loads amortize over 16
-  outputs), while the fused path and the horizontal pass stay 16x8 with 8
-  outputs per thread (a warp spanning two rows, where a wider per-lane stride
-  splits each load across more lines).
+  outputs), while the fused path stays 16x8 with `VRT=3` output rows per thread
+  and the horizontal pass 16x8 with 8 output columns per thread (a warp spanning
+  two rows, where a wider per-lane stride splits each load across more lines).
 - Per-plane float scratch is one transient `createGPUBuffer` per frame (record
   stage: 10 µs/frame with it).
 - `WIDTH/HEIGHT/STRIDE/KLEN/RAD` are specialization constants read off a probe
@@ -30,8 +31,9 @@ Design (current):
 - Runs need `RADV_EXPERIMENTAL=transfer_queue`, which `tools/benchmark.py`
   forces (mechanism: `notes/BILATERAL.md`).
 
-Scoreboard — jpbd 1080p GRAY16, sigma=16 (95 taps, two-pass), 5000 frames,
-3 repeats, same-session medians through `tools/benchmark.py`:
+Scoreboard — jpbd 1080p GRAY16, sigma=16 (95 taps, two-pass), pre-wall-clock
+5000-frame runs (`--frames` was removed; ratios only), 3 repeats, same-session
+medians through `tools/benchmark.py`:
 
 | mode | vsfeel | vszipcl | ratio |
 |---|---|---|---|
@@ -199,17 +201,21 @@ sigma, frames and repeats (3-repeat medians, one session):
 
 ## Historical
 
+Historical A/Bs below quote the pre-wall-clock `--frames` harness; the option
+is gone, so only their ratios transfer.
+
 - **The u16 variants were invalid Vulkan** (build/correctness only, no perf
   change). SPIR-V 1.0 emits `buffer` blocks as Uniform + BufferBlock, so a
   16-bit element needs `uniformAndStorageBuffer16BitAccess` — a feature the
   core's device baseline does not enable — and the validation layer flagged it.
-  The u16 variants (all three entries) now build with
-  `--target-env=vulkan1.1`, which emits the StorageBuffer class covered by the
-  baseline's `storageBuffer16BitAccess`; bit-exact vs vszipcl, f32 SPIR-V
-  unchanged.
+  The u16 variants (all three entries) built with
+  `--target-env=vulkan1.1` then (superseded: every variant now builds with
+  `vulkan1.4`), which emits the StorageBuffer class covered by the baseline's
+  `storageBuffer16BitAccess`; bit-exact vs vszipcl, f32 SPIR-V unchanged.
 - **The fused path's 48 KiB tile cap was dead.** The widest small-path tile is
   7 680 B, so `min(48 KiB, device LDS)` was always decided by the device; the cap
-  is gone and the device limit is now the only check. No perf change.
+  is gone and the static_assert keeps the tile under the guaranteed 16 KiB. No
+  perf change.
 - **An over-wide plane is refused, not truncated.** Both passes tile by
   (ID.x, ID.y), so the old clamped grids left everything past
   `maxComputeWorkGroupCount[0]` (1 048 560 px at BLK_X=16 on a 65 535-group
@@ -254,7 +260,7 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
   in-command-buffer timestamps or fps.
 - **Default `num_streams` 1 → 4**: the shipped default was the "cannot
   overlap" case; the knee was at 4. Superseded: in-flight depth is the core's
-  exec ring now, the argument is validated and ignored.
+  exec ring now, the argument is registered and ignored.
 - Validation hardening (correctness-only, no perf change): upload
   flush/download invalidate ranges through the shared `mapped_range` helper,
   unconditional `_mm_sfence()` before submit for the NT-staged upload, creation
@@ -322,9 +328,9 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
   not as an absolute per-frame cost. Record+submit is ~23 µs per call.
 - `VSFEEL_GAUSS_GPUTRACE=<first frame>` and `VSFEEL_GAUSS_GPUTRACE_RANGE=<n>`
   (default 100/40) — in-command-buffer GPU timestamps: per-plane per-dispatch
-  p25/median/p75 over the traced window, printed at destruction. The window's
-  first 8 frames are skipped (the first stamped frame reads back an impossible
-  value) and the median is what to quote. Gated on the queue family's timestamp
-  bits.
+  p25/median/p75 over the traced window, printed at destruction. The window
+  starts at the first traced frame (default 100, no skipped frames); `=0` turns
+  the probe off, so frame 0 cannot be selected. The median is what to quote;
+  gated on the queue family's timestamp bits.
 - `VSFEEL_DEBUG=1|2`, `VSFEEL_TRACE=1|2` — the shared error trace and trail
   (`acquire`/`record`/`submit` marks are recorded in the frame path).

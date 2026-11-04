@@ -29,9 +29,9 @@ Status: **shipped on the R80 GPU API.** Verified against
 - u16 transport divides by 65535 on load and uses the reference's saturating
   round-to-nearest-even store, so its code values match vszipcl's conversion;
   the earlier reciprocal-multiply/half-up pair is gone.
-- Accuracy: ≤1 LSB u16, ≤4.4e-6 f32 and ≤1 half step f16 against vszipcl across
-  the whole parameter surface (spatial, temporal, joint, rclip, cropped, `a=64`,
-  `d=16`).
+- Accuracy: ≤1 LSB u16 (≤2 on the joint YUV444 path), ≤4.4e-6 f32 and ≤1 half
+  step f16 against vszipcl across the whole parameter surface (spatial, temporal,
+  joint, rclip, cropped, `a=64`, `d=16`).
 - `num_streams` and `device_id` are registered no-ops (never read): depth is
   the core's exec ring, device choice is `core.set_vulkan_device`.
 
@@ -66,9 +66,7 @@ io depth (default: resident GPU input, no download, same config, medians of 3):
 
 - The half window is 2 bytes like u16's, and the sweep (not the transfers) is
   the frame, so f16 lands +3% over u16 and +15% over f32. The io width is
-  the whole difference: the kernels are the same shape at every depth. README's
-  f16 row is a different session and sits below its own u16, which the 2-byte
-  window and f32 weights rule out (a re-measure gave 1081 against 1033).
+  the whole difference: the kernels are the same shape at every depth.
 
 The f32 weight ring (2026-10-02) replaces the fp16 one for accuracy: 2^-11
 relative weight quantisation drifts the average by up to ~2e-3 f32 / ~180 codes
@@ -92,7 +90,7 @@ u16 at `a=64`, while f32 holds the whole comparison surface at ≤1 LSB /
 - The address table is a small host-visible buffer of `2*C*(2d+1)`
   `VkDeviceAddress` values, filled with `getGPUPlane` +
   `vkGetBufferDeviceAddress`. It may land in the write-combining VRAM BAR, so
-  the fill is followed by `_mm_sfence()` before submit; the sweep tables get
+  the fill is followed by `store_fence()` before submit; the sweep tables get
   the same fence at creation. The layout is `[source half][guide half]`; with no
   `rclip` the guide half repeats the source addresses and `GUIDE_OFF` is 0.
 - Window geometry: `PAD = a`, `PSTRIDE = (width + 2a + 7) & ~7`,
@@ -100,9 +98,9 @@ u16 at `a=64`, while f32 holds the whole comparison surface at ≤1 LSB /
   layer)`. The `PAD` margin is the reference's zero border, so the sweep needs
   no bounds checks. The compose writes the whole tile (margins zeroed) and the
   interior is a straight copy of the core's plane at its own row stride.
-- The per-frame window has no explicit cap (the old 512 MiB slot budget is
-  gone); an over-large window surfaces as a core allocation failure, not a
-  creation-time rejection.
+- Per-frame size is not capped in bytes; a window whose element counts pass
+  2^31, or whose buffers exceed `maxStorageBufferRange`, is a clean creation or
+  allocation error instead of an out-of-bounds access.
 - `num_streams`/`device_id` stay registered so existing scripts load; both are
   never read (see the banner).
 
@@ -210,8 +208,9 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
   16-subgroups/SIMD cap) and ran ~10% slower at 1080p `channels='UV'`. Copying
   the window once per frame into one device-local buffer restores the
   `buffer_load`/32-bit-offset form (1055 instructions) and the gap goes away;
-  the copy is ~2% of the frame at `d=2` (10.5 MiB window at 1080p UV) and
-  shrinks relative to the sweep as `d` grows. GRAY16 hid the same instruction
+  the copy is ~2% of the frame at `d=2` (10.0 MiB window at 1080p UV). Compose
+  work scales with `(2d+1)` and the sweep with `(2d+1)(2a+1)^2`, so their ratio
+  is independent of `d`, not shrinking with it. GRAY16 hid the same instruction
   increase behind its transfer cost, which is why the first A/B looked
   plane-count dependent.
 - **Transfers** (mechanism: `notes/BILATERAL.md`): with the SDMA opt-in the
@@ -248,7 +247,7 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   1065.9 → 1083.4 (`--download`) fps against the pre-fix benchmark harness
   (`notes/METHOD.md`); the same-session deltas it carried (−0.2%, +1.6%) stand.
   The banner's table replaces the absolute numbers.
-- **R80 port** (`src/nlmeans.cpp` 1818 → ~1090 lines). Deleted: the slot pool
+- **R80 port** (`src/nlmeans.cpp` 1818 → 1295 lines). Deleted: the slot pool
   (`CacheSlot`, `res_token` holders, `writer_token`/`writer_count`,
   `cache_cv`, the all-or-nothing acquire), host compose into per-stream staging,
   the ReBAR staging option (`VSFEEL_NLMEANS_HD`), per-stream
@@ -266,7 +265,7 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   weight envelope. Fixed by clamping the index; the compose pass then removed
   the whole class by giving the sweep a zero margin again.
 - **Address-table write fence.** A host-written table in the VRAM BAR is
-  write-combining; `_mm_sfence()` before submit.
+  write-combining; `store_fence()` before submit.
 - **Slot-direct cache + reservation tokens** — a shared pool of padded
   per-(clip,frame,channel) tiles with holder tokens, filled by the host. Worth
   ~1.4x over vszipcl pre-R80; superseded by the core's frame cache.
@@ -357,7 +356,8 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 Flags are `VSFEEL_NLMEANS_<FLAG>`.
 
 - `VSFEEL_NLMEANS_TIMING=1` — per-frame host stage split (acquire/record/submit).
-- `VSFEEL_NLMEANS_GPUTRACE=1[,frame]` — one-shot per-batch GPU timestamps.
+- `VSFEEL_NLMEANS_GPUTRACE=<frame>` — one-shot per-batch GPU timestamps
+  (default 100; the value is the first traced frame).
 - `VSFEEL_NLMEANS_PACK=N` — entries per weight+acc round (default: the largest
   that fits the 96 MiB live-set target; clamped 1..16384, at most the sweep's
   entry count and the device's Z group-count limit).
