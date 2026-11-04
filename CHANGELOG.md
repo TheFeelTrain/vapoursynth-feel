@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [v1.3.3] - 2026-11-04
+
 ### Changed
 
 - NLMeans is 20-30% faster, with the largest gain on luma-only processing
@@ -13,16 +15,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- DFTTest and NLMeans reject unknown-length clips at creation
+- All filters reject unknown-length and variable-format clips at creation
+- A failed Box, GaussBlur, EEDI3, NLMeans, NNEDI3, or WNNM creation no longer leaks its instance
+- BM3D rejects frames whose block-matching workspace does not fit 32-bit addressing
+- BM3D validates `extractor_exp` even when every sigma is zero
 - DFTTest rejects a negative `pmin` and non-finite or negative sigma arrays
 - DFTTest rejects an output grid larger than the device instead of leaving part of the frame unwritten
-- DFTTest, BM3D, and NNEDI3 reject variable-format clips at creation
 - DFTTest no longer reads a partially written filter table on ReBAR devices
 - WNNM's GPU-trace mode no longer leaks memory per instance
 - WNNM rejects frames whose block lattice or 16-bit conversion ring does not fit 32-bit addressing
-- BM3D rejects frames whose block-matching workspace does not fit 32-bit addressing
-- BM3D validates `extractor_exp` even when every sigma is zero
-- A failed Box, GaussBlur, EEDI3, NLMeans, NNEDI3, or WNNM creation no longer leaks its instance
 
 ## [v1.3.2] - 2026-10-31
 
@@ -138,14 +139,12 @@ The plugin has moved to the VapourSynth R80 GPU API. The core now owns the devic
 - All nine filters were ported to the R80 GPU API. The plugin no longer creates its own device, queues or host transfer path
 - Frame caches are capped by the core's VRAM budget instead of fixed sizes
 - Invalid arguments and unsupported input are rejected at creation time
-- Python packaging was reworked. Wheel and sdist contents are pinned, and every build is verified before publishing
 
 ### Fixed
 
 - Resource leaks on creation and frame error paths across every filter
 - Frame cache races in BM3D's rings and EEDI3's batched output, which could read a wrong or recycled frame
 - EEDI3AA's per plane merge, and its handling of odd plane geometry
-- Benchmark and test harness bugs that reported misleading results
 
 ## [v0.2.2] - 2026-09-21
 
@@ -193,6 +192,7 @@ The plugin has moved to the VapourSynth R80 GPU API. The core now owns the devic
 - vs-jetpack backend integration, so the filters can be used through the vs-jetpack wrappers
 - Windows and Linux wheels, built and published by CI
 
+[v1.3.3]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.2...v1.3.3
 [v1.3.2]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.1...v1.3.2
 [v1.3.1]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.0...v1.3.1
 [v1.3.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.2.0...v1.3.0
