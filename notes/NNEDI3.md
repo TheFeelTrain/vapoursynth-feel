@@ -47,7 +47,8 @@ etype=0 pscrn=4`), 5000 frames, medians of 3 through `tools/benchmark.py`:
 - f16 is the fastest io type now, and the packed predictor is why: same-session
   interleaved A/B, 5000 frames ×3, default (resident GPU input, no download):
   **packed 4862 vs mixed 3830 fps (+26.9%)**, CPU cache 3157 vs 2981
-  (**+5.9%**). At `pscrn=0` (every pixel predicted, `VSFEEL_NNEDI3_TSTAMP=100`)
+  (**+5.9%**). At `pscrn=0` (every pixel predicted,
+  `VSFEEL_NNEDI3_GPUTRACE=100`)
   predict is 3483 µs packed vs 4887 mixed (**+40%**): the sparse `pscrn=4` list
   scatters the windows and the gather's latency, which half storage does not
   remove, takes a bigger share there.
@@ -69,7 +70,7 @@ etype=0 pscrn=4`), 5000 frames, medians of 3 through `tools/benchmark.py`:
   chain dropped it 3034 → 2156 fps (−29%): the delta was the deleted transfer
   path, not the filter. The relative result stands; its absolute numbers are
   void (Historical).
-- Kernels at parity: `VSFEEL_NNEDI3_TSTAMP=100` (GRAY16, warm frame) gives
+- Kernels at parity: `VSFEEL_NNEDI3_GPUTRACE=100` (GRAY16, warm frame) gives
   pre 76 / pred 192 / total 268 µs — pred against the pre-port uncontended
   195–200, and the pre-port segment includes keep + indirect fills where the
   old stamp was prescreen alone. The old inline copy stamp (89 µs D2H on the
@@ -387,11 +388,11 @@ the global switches in `src/vsfeel.h`.
 
 | env | what it does |
 |---|---|
-| `VSFEEL_NNEDI3_TSTAMP=<frame>` | one-shot GPU stamps for that frame: top / prescreen done / predict done (default 100; gated on the queue family's `timestampValidBits`) |
+| `VSFEEL_NNEDI3_GPUTRACE=<frame>` | one-shot GPU stamps for that frame: top / prescreen done / predict done (default 100; gated on the queue family's `timestampValidBits`; the former `_TSTAMP` spelling still works) |
 | `VSFEEL_NNEDI3_TIMING=1` | per-frame host stage averages (acquire/record/submit/total) printed at teardown |
 | `VSFEEL_NNEDI3_PRED16=0` | force the storage-only f16 kernels instead of the packed half predictor (default on where the device has `shaderFloat16`) |
 | `VSFEEL_DEBUG=1\|2` | device banner and full error trail; level 2 also enables the probe traces |
 | `VSFEEL_TRACE=1\|2` | first 50 / every trace line (the banner is also printed) |
 
 `BENCH`, `COUNT`, `SKIPIL` and `QUEUES` were deleted with the pre-R80
-machinery; `TSTAMP` became a one-shot probe and `BENCH` was renamed `TIMING`.
+machinery; the stamp probe became `GPUTRACE` and `BENCH` was renamed `TIMING`.

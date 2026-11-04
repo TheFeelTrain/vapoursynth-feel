@@ -322,6 +322,9 @@ struct BM3DData {
     VSNode * node {};
     VSNode * ref_node {}; // optional basic-estimate clip (final/Wiener pass)
     const VSVideoInfo * vi {};
+    // Invoked entry point: BM3D or the BM3Dv2 alias, used in error messages
+    // and the node name.
+    const char * name { "BM3D" };
 
     int max_radius {};
     int max_tw {}; // 2 * max_radius + 1
@@ -510,30 +513,21 @@ struct BM3DData {
             gpu->vk->vkDestroyQueryPool(dev, probe.query, nullptr);
         }
         profile.destroy();
-        if (copy_pipeline) {
-            gpu->vk->vkDestroyPipeline(dev, copy_pipeline, nullptr);
-        }
+        std::vector<VkPipeline> pipelines { copy_pipeline };
+        pipelines.reserve(1 + groups.size() * 3 + planes.size());
         for (auto & g : groups) {
             gpu_destroy_buffer(*gpu, g.scratch_acc);
             gpu_destroy_buffer(*gpu, g.scratch_src);
             gpu_destroy_buffer(*gpu, g.res);
             gpu_destroy_buffer(*gpu, g.src);
-            if (g.bm3d_pipeline) {
-                gpu->vk->vkDestroyPipeline(dev, g.bm3d_pipeline, nullptr);
-            }
-            if (g.bm3d_match_pipeline) {
-                gpu->vk->vkDestroyPipeline(dev, g.bm3d_match_pipeline, nullptr);
-            }
-            if (g.bm3d_filter_pipeline) {
-                gpu->vk->vkDestroyPipeline(dev, g.bm3d_filter_pipeline,
-                                           nullptr);
-            }
+            pipelines.push_back(g.bm3d_pipeline);
+            pipelines.push_back(g.bm3d_match_pipeline);
+            pipelines.push_back(g.bm3d_filter_pipeline);
         }
         for (auto & p : planes) {
-            if (p.agg_pipeline) {
-                gpu->vk->vkDestroyPipeline(dev, p.agg_pipeline, nullptr);
-            }
+            pipelines.push_back(p.agg_pipeline);
         }
+        vsfeel_destroy_pipelines(*gpu, pipelines);
         gpu_destroy_buffer(*gpu, match_trace);
         gpu_destroy_buffer(*gpu, matches);
         if (pipeline_layout) {
@@ -1624,16 +1618,20 @@ static const VSFrame * temporalFrame(BM3DData * d, int n,
     std::lock_guard lock(d->temporal_lock);
     vsfeel_trace_frame_begin();
     if (d->failed) {
-        vsfeel_trace_error("BM3D", n, "a previous frame failed", d->gpu.get());
-        vsapi->setFilterError("BM3D: a previous frame failed", frameCtx);
+        vsfeel_trace_error(d->name, n, "a previous frame failed", d->gpu.get());
+        vsapi->setFilterError(
+            (std::string(d->name) + ": a previous frame failed").c_str(),
+            frameCtx);
         return nullptr;
     }
     if (n == d->fault_frame) {
         d->failed = true;
         d->cursor.valid = false;
-        vsfeel_trace_error("BM3D", n, "injected estimation fault",
+        vsfeel_trace_error(d->name, n, "injected estimation fault",
                            d->gpu.get());
-        vsapi->setFilterError("BM3D: injected estimation fault", frameCtx);
+        vsapi->setFilterError(
+            (std::string(d->name) + ": injected estimation fault").c_str(),
+            frameCtx);
         return nullptr;
     }
     if (n < 0 || n >= d->nframes) {
@@ -1683,9 +1681,9 @@ static const VSFrame * temporalFrame(BM3DData * d, int n,
             if (const auto p = d->pending.find(n); p != d->pending.end()) {
                 d->pending.erase(p);
             }
-            vsfeel_trace_error("BM3D", n, e.what(), d->gpu.get());
-            vsapi->setFilterError(("BM3D: " + std::string(e.what())).c_str(),
-                                  frameCtx);
+            vsfeel_trace_error(d->name, n, e.what(), d->gpu.get());
+            vsapi->setFilterError(
+                (std::string(d->name) + ": " + e.what()).c_str(), frameCtx);
             return nullptr;
         }
     }
@@ -1784,8 +1782,8 @@ static const VSFrame * temporalFrame(BM3DData * d, int n,
             d->pending.erase(it);
         }
         d->request_lo.erase(n);
-        vsfeel_trace_error("BM3D", n, e.what(), d->gpu.get());
-        vsapi->setFilterError(("BM3D: " + std::string(e.what())).c_str(),
+        vsfeel_trace_error(d->name, n, e.what(), d->gpu.get());
+        vsapi->setFilterError((std::string(d->name) + ": " + e.what()).c_str(),
                               frameCtx);
         return nullptr;
     }
@@ -1817,8 +1815,10 @@ static const VSFrame * temporalFrame(BM3DData * d, int n,
     d->request_lo.erase(n);
     d->failed = true;
     c.valid = false;
-    vsapi->setFilterError("BM3D: the requested frame did not normalize",
-                          frameCtx);
+    vsapi->setFilterError(
+        (std::string(d->name) + ": the requested frame did not normalize")
+            .c_str(),
+        frameCtx);
     return nullptr;
 }
 
@@ -1880,7 +1880,9 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
         // 4:4:4 clip into one entry.
         const VSFrame * center = vsapi->getFrameFilter(n, d->node, frameCtx);
         if (!center) {
-            vsapi->setFilterError("BM3D: the centre frame could not be fetched",
+            vsapi->setFilterError((std::string(d->name) +
+                                   ": the centre frame could not be fetched")
+                                      .c_str(),
                                   frameCtx);
             return nullptr;
         }
@@ -1911,8 +1913,10 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
         }
         vsapi->freeFrame(center);
         if (!dst) {
-            vsapi->setFilterError("BM3D: failed to allocate the output frame",
-                                  frameCtx);
+            vsapi->setFilterError(
+                (std::string(d->name) + ": failed to allocate the output frame")
+                    .c_str(),
+                frameCtx);
             return nullptr;
         }
         // All planes are processed or the node would have been passed through
@@ -1953,12 +1957,14 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
 
         const auto set_error =
             [&](const std::string & error_message) -> const VSFrame * {
-            vsfeel_trace_error("BM3D", n, error_message, d->gpu.get());
+            vsfeel_trace_error(d->name, n, error_message, d->gpu.get());
             release_r0_slots(d, fr);
             for (const VSFrame * f : sources) {
                 vsapi->freeFrame(f);
             }
-            vsapi->setFilterError(("BM3D: " + error_message).c_str(), frameCtx);
+            vsapi->setFilterError(
+                (std::string(d->name) + ": " + error_message).c_str(),
+                frameCtx);
             vsapi->freeFrame(dst);
             return nullptr;
         };
@@ -2259,11 +2265,12 @@ static void VS_CC BM3DFree(void * instanceData, VSCore * core,
 // Creation
 // ---------------------------------------------------------------------------
 
-static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
-                             [[maybe_unused]] void * userData, VSCore * core,
-                             const VSAPI * vsapi) {
+static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
+                             VSCore * core, const VSAPI * vsapi) {
 
     auto d { std::make_unique<BM3DData>() };
+
+    d->name = userData ? static_cast<const char *>(userData) : "BM3D";
 
     // Opt-in host-path probe: the default path records no clocks.
     d->host_timing = vsfeel_debug_probe("VSFEEL_BM3D_TIMING");
@@ -2285,8 +2292,9 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     int error;
 
     auto set_error = [&](const std::string & error_message) {
-        vsfeel_trace_error("BM3D", -1, error_message, d->gpu.get());
-        vsapi->mapSetError(out, ("BM3D: " + error_message).c_str());
+        vsfeel_trace_error(d->name, -1, error_message, d->gpu.get());
+        vsapi->mapSetError(
+            out, (std::string(d->name) + ": " + error_message).c_str());
         vsapi->freeNode(d->node);
         if (d->ref_node) {
             vsapi->freeNode(d->ref_node);
@@ -2294,7 +2302,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     };
 
     if (!vsh::isConstantVideoFormat(d->vi)) {
-        return set_error("only constant format clips are supported");
+        return set_error("only constant format clips are supported.");
     }
 
     if (const char * spec = env_str("VSFEEL_BM3D_MATCHTRACE")) {
@@ -2313,7 +2321,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             p = end + 1;
         }
         if (!ok) {
-            return set_error("VSFEEL_BM3D_MATCHTRACE must be <frame>,<x>,<y>");
+            return set_error("VSFEEL_BM3D_MATCHTRACE must be "
+                             "<frame>,<x>,<y>.");
         }
         d->trace_frame = vals[0];
         d->trace_x = vals[1];
@@ -2331,15 +2340,15 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             rvi->format.bitsPerSample != d->vi->format.bitsPerSample ||
             rvi->format.subSamplingW != d->vi->format.subSamplingW ||
             rvi->format.subSamplingH != d->vi->format.subSamplingH) {
-            return set_error("\"ref\" must be of the same format as \"clip\"");
+            return set_error("\"ref\" must be of the same format as \"clip\".");
         }
         if (rvi->width != d->vi->width || rvi->height != d->vi->height) {
             return set_error(
-                "\"ref\" must be of the same dimensions as \"clip\"");
+                "\"ref\" must be of the same dimensions as \"clip\".");
         }
         if (rvi->numFrames != d->vi->numFrames) {
             return set_error(
-                "\"ref\" must be of the same number of frames as \"clip\"");
+                "\"ref\" must be of the same number of frames as \"clip\".");
         }
         d->final = true;
     }
@@ -2352,7 +2361,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
            d->vi->format.bitsPerSample == 16))) {
         return set_error(
             "only constant format 16-bit integer (u16), 16-bit float (f16) or "
-            "32-bit float (f32) input supported");
+            "32-bit float (f32) input supported.");
     }
     d->bits = d->vi->format.bitsPerSample;
     d->half = d->vi->format.sampleType == stFloat && d->bits == 16;
@@ -2361,7 +2370,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     if (d->vi->format.colorFamily != cfGray &&
         d->vi->format.colorFamily != cfYUV &&
         d->vi->format.colorFamily != cfRGB) {
-        return set_error("only Gray, YUV and RGB input are supported");
+        return set_error("only Gray, YUV and RGB input are supported.");
     }
     d->num_planes = d->vi->format.numPlanes;
 
@@ -2371,19 +2380,19 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // resources rather than relying on robust buffer access (which is not
     // enabled).
     if (d->vi->width < 8 || d->vi->height < 8) {
-        return set_error("clip dimensions must be at least 8x8");
+        return set_error("clip dimensions must be at least 8x8.");
     }
 
     // The scan lists pack a candidate's (x, y) into one 32-bit word (16 + 15
     // bits) so the top-8 insert shifts three arrays instead of four.
     if (d->vi->width > 0xFFFF || d->vi->height > 0x7FFF) {
-        return set_error("clip dimensions must not exceed 65535x32767");
+        return set_error("clip dimensions must not exceed 65535x32767.");
     }
 
     // The window clamps and the cache keys assume [0, numFrames-1]; an empty
     // or unknown length would index the slot tables before their base.
     if (d->vi->numFrames <= 0) {
-        return set_error("clip frame count must be known and positive");
+        return set_error("clip frame count must be known and positive.");
     }
 
     // Per-plane sigma, exactly as the reference's perPlane: a missing entry
@@ -2398,7 +2407,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         if (error) {
             sigma[i] = (i == 0) ? 3.0f : sigma[i - 1];
         } else if (!std::isfinite(sigma[i]) || sigma[i] < 0.0f) {
-            return set_error("\"sigma\" must be finite and non-negative");
+            return set_error("\"sigma\" must be finite and non-negative.");
         }
     }
     bool any_process = false;
@@ -2424,7 +2433,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         } else if (!std::isfinite(th_mse) || th_mse < 0.0) {
             return set_error(
                 "\"th_mse\" must be a finite non-negative number of 8-bit MSE "
-                "units (0 selects the reference block alone)");
+                "units (0 selects the reference block alone).");
         }
         constexpr double kMatrixNormY = 0.7496149945138504;
         double th_sse = th_mse * kMatrixNormY * (64.0 / (255.0 * 255.0));
@@ -2452,7 +2461,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         const int extractor_exp =
             vsh::int64ToIntS(vsapi->mapGetInt(in, "extractor_exp", 0, &error));
         if (extractor_exp < 0 || extractor_exp > 127) {
-            return set_error("\"extractor_exp\" must be in range [0, 127]");
+            return set_error("\"extractor_exp\" must be in range [0, 127].");
         }
         d->extractor =
             (extractor_exp != 0) ? std::ldexp(1.0f, extractor_exp) : 0.0f;
@@ -2475,7 +2484,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         if (error) {
             block_step[i] = (i == 0) ? 8 : block_step[i - 1];
         } else if (block_step[i] <= 0 || block_step[i] > 8) {
-            return set_error("\"block_step\" must be in range [1, 8]");
+            return set_error("\"block_step\" must be in range [1, 8].");
         }
     }
 
@@ -2486,7 +2495,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         if (error) {
             bm_range[i] = (i == 0) ? 9 : bm_range[i - 1];
         } else if (bm_range[i] <= 0 || bm_range[i] > kMaxSearchRange) {
-            return set_error("\"bm_range\" must be in range [1, 8192]");
+            return set_error("\"bm_range\" must be in range [1, "s +
+                             std::to_string(kMaxSearchRange) + "].");
         }
     }
 
@@ -2501,7 +2511,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
             radius[i] = (i == 0) ? 0 : radius[i - 1];
         } else if (radius[i] < 0 || radius[i] > MAX_RADIUS) {
             return set_error("\"radius\" must be in range [0, "s +
-                             std::to_string(MAX_RADIUS) + "]");
+                             std::to_string(MAX_RADIUS) + "].");
         }
     }
     for (int i = 0; i < d->num_planes; ++i) {
@@ -2514,7 +2524,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         if (error) {
             ps_num[i] = (i == 0) ? 2 : ps_num[i - 1];
         } else if (ps_num[i] <= 0 || ps_num[i] > 8) {
-            return set_error("\"ps_num\" must be in range [1, 8]");
+            return set_error("\"ps_num\" must be in range [1, 8].");
         }
     }
 
@@ -2525,7 +2535,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
         if (error) {
             ps_range[i] = (i == 0) ? 4 : ps_range[i - 1];
         } else if (ps_range[i] <= 0 || ps_range[i] > kMaxSearchRange) {
-            return set_error("\"ps_range\" must be in range [1, 8192]");
+            return set_error("\"ps_range\" must be in range [1, "s +
+                             std::to_string(kMaxSearchRange) + "].");
         }
     }
 
@@ -2542,7 +2553,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     if (d->joint &&
         (d->vi->format.colorFamily != cfYUV ||
          d->vi->format.subSamplingW != 0 || d->vi->format.subSamplingH != 0)) {
-        return set_error("clip format must be YUV444 when \"chroma\" is true");
+        return set_error("clip format must be YUV444 when \"chroma\" is true.");
     }
 
     // Nothing to denoise: hand the source clip straight back, as the
@@ -2622,7 +2633,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     d->subgroup_size = std::get<uint32_t>(subgroup);
     d->workgroup = choose_workgroup(*d->gpu, d->subgroup_size, d->patch_lds);
     if (d->workgroup % 8 != 0) {
-        return set_error("VSFEEL_BM3D_WORKGROUP must be a multiple of 8");
+        return set_error("VSFEEL_BM3D_WORKGROUP must be a multiple of 8.");
     }
     d->groups_per_wg = d->workgroup / 8;
     if (vsfeel_device_info_enabled()) {
@@ -2644,7 +2655,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // is the only operation Vulkan mandates, so this is a real check.
     if (!d->gpu->has_subgroup_ops(VK_SUBGROUP_FEATURE_SHUFFLE_BIT)) {
         return set_error("subgroup shuffle is not supported by this device "
-                         "(VK_SUBGROUP_FEATURE_SHUFFLE_BIT is required)");
+                         "(VK_SUBGROUP_FEATURE_SHUFFLE_BIT is required).");
     }
 
     VkDevice dev = d->gpu->device;
@@ -2753,22 +2764,13 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
 
     // The plane layout has to be the one the core's GPU frames carry, because
     // a source frame's plane is copied into the ring with a single flat
-    // buffer-to-buffer region. A GPU frame's stride is the CPU frame's stride
-    // (the core stores planes exactly as the CPU allocator would), so it is
-    // read off a scratch frame here rather than guessed from an alignment rule.
+    // buffer-to-buffer region (see vsfeel_probe_strides).
     std::array<int, 3> plane_stride_elems {};
-    {
-        VSFrame * probe = vsapi->newVideoFrame(&d->vi->format, d->vi->width,
-                                               d->vi->height, nullptr, core);
-        if (probe == nullptr) {
-            return set_error(
-                "could not allocate a probe frame to read the plane stride");
-        }
-        for (int plane = 0; plane < d->num_planes; ++plane) {
-            plane_stride_elems[plane] = static_cast<int>(
-                vsapi->getStride(probe, plane) / d->elem_bytes);
-        }
-        vsapi->freeFrame(probe);
+    if (auto e = vsfeel_probe_strides(vsapi, core, d->vi->format, d->vi->width,
+                                      d->vi->height, d->elem_bytes,
+                                      plane_stride_elems.data());
+        !e.empty()) {
+        return set_error(e);
     }
     for (int plane = 0; plane < d->num_planes; ++plane) {
         auto & p = d->planes[plane];
@@ -2787,8 +2789,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     if (d->joint) {
         for (int plane = 0; plane < d->num_planes; ++plane) {
             if (d->planes[plane].stride != d->planes[0].stride) {
-                return set_error("chroma=True needs a single row stride across "
-                                 "the three planes");
+                return set_error("\"chroma\" needs a single row stride across "
+                                 "the three planes.");
             }
         }
         auto & g = d->groups[d->n_groups++];
@@ -3249,14 +3251,18 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
     // core serializes the calls so the cursor always belongs to the frame it
     // is working on. Radius 0 has no cross-frame state and stays parallel.
     VSNode * result = vsapi->createVideoFilterEx2(
-        "BM3D", data->vi, BM3DGetFrame, BM3DFree,
+        data->name, data->vi, BM3DGetFrame, BM3DFree,
         data->max_radius > 0 ? fmUnordered : fmParallel, ffGPUOutput, deps,
         data->ref_node ? 2 : 1, data, core);
     if (result == nullptr) {
         // The core returns nullptr without running the free callback when the
         // node constructor throws, so release the instance through it here.
+        vsfeel_trace_error(data->name, -1, "filter creation failed",
+                           data->gpu.get());
+        const char * name = data->name;
         BM3DFree(data, core, vsapi);
-        vsapi->mapSetError(out, "BM3D: filter creation failed");
+        vsapi->mapSetError(
+            out, (std::string(name) + ": filter creation failed").c_str());
         return;
     }
     vsapi->mapConsumeNode(out, "clip", result, maAppend);
@@ -3266,15 +3272,10 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out,
 // Registration
 // ---------------------------------------------------------------------------
 
-// The filter has always been BM3D (see createVideoFilterEx2 above); only the
-// plugin entry point carried the v2, so BM3Dv2 stays registered as a bare
-// proxy for scripts written against the old name.
-static void VS_CC BM3Dv2Create(const VSMap * in, VSMap * out, void * userData,
-                               VSCore * core, const VSAPI * vsapi) {
-    BM3DCreate(in, out, userData, core, vsapi);
-}
-
 void vsfeel_register_bm3d(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
+    // The documented argument order, with the ignored compatibility pair last
+    // like every other filter. BM3Dv2 is the same filter under its former name;
+    // the invoked name reaches the instance so its errors and node say BM3Dv2.
     static constexpr const char * argspec = "clip:vnode:gpu;"
                                             "ref:vnode:gpu:opt;"
                                             "sigma:float[]:opt;"
@@ -3285,11 +3286,11 @@ void vsfeel_register_bm3d(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
                                             "ps_range:int[]:opt;"
                                             "th_mse:float:opt;"
                                             "chroma:int:opt;"
-                                            "num_streams:int:opt;"
                                             "extractor_exp:int:opt;"
-                                            "device_id:int:opt;";
+                                            "device_id:int:opt;"
+                                            "num_streams:int:opt;";
     vspapi->registerFunction("BM3D", argspec, "clip:vnode:gpu;", BM3DCreate,
-                             nullptr, plugin);
-    vspapi->registerFunction("BM3Dv2", argspec, "clip:vnode:gpu;", BM3Dv2Create,
-                             nullptr, plugin);
+                             const_cast<char *>("BM3D"), plugin);
+    vspapi->registerFunction("BM3Dv2", argspec, "clip:vnode:gpu;", BM3DCreate,
+                             const_cast<char *>("BM3Dv2"), plugin);
 }

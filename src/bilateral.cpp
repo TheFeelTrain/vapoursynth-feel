@@ -88,28 +88,19 @@ struct BilateralData {
             gpu->api->freeGPUExecPool(pool);
             pool = nullptr;
         }
-        VkDevice dev = gpu->device;
-        VkPipeline destroyed[3] {};
-        int num_destroyed = 0;
-        for (auto & plane : planes) {
-            if (!plane.pipeline) {
-                continue;
-            }
-            bool seen = false;
-            for (int i = 0; i < num_destroyed; ++i) {
-                seen |= destroyed[i] == plane.pipeline;
-            }
-            if (seen) {
-                continue;
-            }
-            destroyed[num_destroyed++] = plane.pipeline;
-            gpu->vk->vkDestroyPipeline(dev, plane.pipeline, nullptr);
+        std::vector<VkPipeline> destroyed;
+        destroyed.reserve(planes.size());
+        for (const auto & plane : planes) {
+            destroyed.push_back(plane.pipeline);
         }
+        vsfeel_destroy_pipelines(*gpu, destroyed);
         if (pipeline_layout) {
-            gpu->vk->vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
+            gpu->vk->vkDestroyPipelineLayout(gpu->device, pipeline_layout,
+                                             nullptr);
         }
         if (set_layout) {
-            gpu->vk->vkDestroyDescriptorSetLayout(dev, set_layout, nullptr);
+            gpu->vk->vkDestroyDescriptorSetLayout(gpu->device, set_layout,
+                                                  nullptr);
         }
     }
 };
@@ -458,7 +449,8 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         if (!vsh::isSameVideoInfo(d->vi, ref_vi) ||
             d->vi->numFrames != ref_vi->numFrames) {
             return set_error(
-                "\"ref\" must be of the same format and dimensions as \"clip\"");
+                "\"ref\" must be of the same format and dimensions as "
+                "\"clip\".");
         }
     }
 
@@ -480,7 +472,7 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
             }
         } else if (!std::isfinite(sigma_spatial[i]) || sigma_spatial[i] < 0.f) {
             return set_error(
-                "\"sigma_spatial\" must be finite and non-negative");
+                "\"sigma_spatial\" must be finite and non-negative.");
         }
 
         if (sigma_spatial[i] < FLT_EPSILON) {
@@ -507,7 +499,8 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
                 sigma_color[i] = sigma_color[i - 1];
             }
         } else if (!std::isfinite(sigma_color[i]) || sigma_color[i] < 0.f) {
-            return set_error("\"sigma_color\" must be finite and non-negative");
+            return set_error(
+                "\"sigma_color\" must be finite and non-negative.");
         }
     }
 
@@ -533,7 +526,7 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
                 1, static_cast<int>(std::min(
                        std::roundf(sigma_spatial[i] * 3.f), 1000000.f)));
         } else if (radius[i] <= 0) {
-            return set_error("\"radius\" must be positive");
+            return set_error("\"radius\" must be positive.");
         }
 
         // Bound the *final* radius: the explicit branch reaches INT_MAX, and
@@ -541,9 +534,9 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         // that sizes LDS later in this function.
         if (radius[i] > kMaxRadius) {
             return set_error(
-                "\"radius\" (explicit or derived from sigma_spatial) "
+                "\"radius\" (explicit or derived from \"sigma_spatial\") "
                 "must be at most " +
-                std::to_string(kMaxRadius));
+                std::to_string(kMaxRadius) + ".");
         }
     }
 
@@ -581,7 +574,7 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
     // reject it like block_x=0, so a typo is an error rather than a no-op.
     if ((!block_x_default && block_x <= 0) ||
         (!block_y_default && block_y <= 0)) {
-        return set_error("\"block_x\"/\"block_y\" must be positive");
+        return set_error("\"block_x\"/\"block_y\" must be positive.");
     }
 
     {
@@ -623,7 +616,8 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         }
 
         if (block_x <= 0 || block_y <= 0 || over_budget()) {
-            return set_error("invalid \"block_x\"/\"block_y\" for this device");
+            return set_error(
+                "invalid \"block_x\"/\"block_y\" for this device.");
         }
     }
 
@@ -645,23 +639,13 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
     }
 
     // The plane geometry has to be the one the core's GPU frames carry, because
-    // kernel addressing is STRIDE elements per row. A GPU frame's stride is the
-    // CPU frame's stride (the core stores planes exactly as the CPU allocator
-    // would), so it is read off a scratch frame here rather than guessed from an
-    // alignment rule.
+    // kernel addressing is STRIDE elements per row (see vsfeel_probe_strides).
     int plane_stride[3] {};
-    {
-        VSFrame * probe = vsapi->newVideoFrame(&d->vi->format, d->vi->width,
-                                               d->vi->height, nullptr, core);
-        if (probe == nullptr) {
-            return set_error(
-                "could not allocate a probe frame to read the plane stride");
-        }
-        for (int p = 0; p < d->vi->format.numPlanes; ++p) {
-            plane_stride[p] =
-                static_cast<int>(vsapi->getStride(probe, p) / d->elem_bytes);
-        }
-        vsapi->freeFrame(probe);
+    if (auto e =
+            vsfeel_probe_strides(vsapi, core, d->vi->format, d->vi->width,
+                                 d->vi->height, d->elem_bytes, plane_stride);
+        !e.empty()) {
+        return set_error(e);
     }
 
     int width = d->vi->width;
@@ -793,7 +777,7 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
                 std::to_string(grid_y) +
                 " workgroup grid, more than this device can dispatch (" +
                 std::to_string(max_grid_x) + "x" + std::to_string(max_grid_y) +
-                ")");
+                ").");
         }
         cfg.grid_x = static_cast<uint32_t>(grid_x);
         cfg.grid_y = static_cast<uint32_t>(grid_y);
@@ -832,7 +816,7 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         plain_size = bilateral_plain_f32_spv_size;
         break;
     default:
-        return set_error("unsupported io type");
+        return set_error("unsupported io type.");
     }
 
     for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
@@ -917,6 +901,8 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
     if (result == nullptr) {
         // The core returns nullptr without running the free callback when the
         // node constructor throws, so release the instance through it here.
+        vsfeel_trace_error("Bilateral", -1, "filter creation failed",
+                           data->gpu.get());
         BilateralFree(data, core, vsapi);
         vsapi->mapSetError(out, "Bilateral: filter creation failed");
         return;

@@ -185,7 +185,7 @@ identical everywhere):
 
 ## Performance
 
-`VSFEEL_EEDI3_GPUTIME=1` timestamps the phases inside the submission's own
+`VSFEEL_EEDI3_GPUTRACE=1` timestamps the phases inside the submission's own
 command buffer (it waits that submission out, so it serializes the pipeline: a
 diagnostic, never a benchmark config). 2x2160p u16, GPU-resident input, per
 frame: prep 0.40 ms, **row 1.61**, vcheck 0.03, blit 0.03, hp ~0. The row kernel
@@ -655,7 +655,7 @@ passes). All bit-identical to the previous build unless stated.
   reproduce what the consumer reads (PROBE=2/5 leave `dmap` stale → cheaper vcheck →
   overstated row kernel). Additive costs of similar size mean a shared memory path;
   one dominant item means a loop. `VSFEEL_EEDI3_SKIP` is the live ladder;
-  `VSFEEL_EEDI3_GPUTIME` reads the per-phase GPU split directly.
+  `VSFEEL_EEDI3_GPUTRACE` reads the per-phase GPU split directly.
 - **Before trusting any `PROBE` number, `stat -c %s build/vk_spv/eedi3_u16_row.spv`**:
   a `>=` guard once compiled 4-7 to an empty kernel (1656 B).
 - **The benchmark's EEDI3 mask follows the clip's depth, like based_aa**; both depths
@@ -673,9 +673,9 @@ passes). All bit-identical to the previous build unless stated.
 
 - `VSFEEL_EEDI3_VCLDS` — `=1` forces the LDS vcheck ping-pong back; needs
   `VSFEEL_EEDI3_VPARA=0` (the two forms are mutually exclusive). Global is default.
-- `VSFEEL_EEDI3_GPUTIME` — `=1` stamps each phase inside the submission's command
+- `VSFEEL_EEDI3_GPUTRACE` — `=1` stamps each phase inside the submission's command
   buffer and reports the split. It waits each submission out, so it serializes the
-  pipeline: a diagnostic, never a benchmark config.
+  pipeline: a diagnostic, never a benchmark config. Formerly `_GPUTIME`.
 - `VSFEEL_EEDI3_SKIP` — comma-separated `mask,pad,row,vcheck,tail` to leave a kernel
   out of the recording. Changes the output by design; the GPU-cost ablation ladder.
 - `VSFEEL_EEDI3_VPARA` — vcheck form: 0 = serial row walk (A/B control), 1..6 =

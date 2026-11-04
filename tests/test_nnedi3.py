@@ -676,7 +676,7 @@ def test_nnedi3_rejects_dh_planes_subset(clip_yuv420p16):
     """dh doubles every plane, so a skipped plane would have no interpolated
     rows. EEDI3 rejects this too; zero-filling the missing rows is not a valid
     output."""
-    with pytest.raises(vs.Error, match="dh=True requires every plane"):
+    with pytest.raises(vs.Error, match="requires every plane"):
         _run(clip_yuv420p16, field=1, dh=1, planes=[0])
 
 

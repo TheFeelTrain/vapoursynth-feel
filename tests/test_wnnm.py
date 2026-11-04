@@ -531,7 +531,7 @@ def test_u16_boundary_copies_are_deduplicated():
     Every processed plane must be converted once, not once per window position:
     the duplicate copies would write one ring slot before any tag is published.
     """
-    env = {**os.environ, "MANGOHUD": "0", "VSFEEL_WNNM": "1"}
+    env = {**os.environ, "MANGOHUD": "0", "VSFEEL_WNNM_DEBUG": "1"}
     proc = subprocess.run(
         [sys.executable, "-c", _COPY_COUNT_SCRIPT],
         capture_output=True,
@@ -855,7 +855,7 @@ def test_cache_budget_respects_storage_range():
     env = {
         **os.environ,
         "MANGOHUD": "0",
-        "VSFEEL_WNNM": "1",
+        "VSFEEL_WNNM_DEBUG": "1",
         "VSFEEL_LIMIT_STORAGE_RANGE": str(cap),
     }
     proc = subprocess.run(
@@ -894,7 +894,7 @@ def test_storage_range_is_per_scratch_buffer():
     env = {
         **os.environ,
         "MANGOHUD": "0",
-        "VSFEEL_WNNM": "1",
+        "VSFEEL_WNNM_DEBUG": "1",
         "VSFEEL_LIMIT_STORAGE_RANGE": str(cap),
     }
     proc = subprocess.run(
@@ -937,7 +937,7 @@ def test_estimate_cache_budget_follows_the_device_allowance(vram_gib, est):
     env = {
         **os.environ,
         "MANGOHUD": "0",
-        "VSFEEL_WNNM": "1",
+        "VSFEEL_WNNM_DEBUG": "1",
         "VSFEEL_LIMIT_VRAM_BUDGET": str(vram_gib << 30),
     }
     proc = subprocess.run(
@@ -1049,7 +1049,7 @@ def test_8bit_format_rejected(fmt, msg):
         ),
         (
             dict(block_size=16, group_size=64),
-            r"min\(block_size\^2, group_size\) must be <= 32",
+            r"must be <= 32",
         ),
         (
             dict(block_size=8, block_step=9),
@@ -1076,6 +1076,18 @@ def test_8bit_format_rejected(fmt, msg):
 def test_validation_errors(kwargs, msg):
     with pytest.raises(vs.Error, match=msg):
         vs.core.vsfeel.WNNM(_blank(), **kwargs)
+
+
+def test_positional_arguments_follow_the_documented_order(clip_grays):
+    """WNNM(clip, sigma, ..., rclip): the second positional argument is sigma.
+
+    rclip used to be second, so this call bound 3.0 to a vnode argument and
+    failed; the README and the reference have always put rclip last.
+    """
+    node = cpu_node(vs.core.vsfeel.WNNM(clip_grays, 3.0))
+    assert node.get_frame(0) is not None
+    with pytest.raises(vs.Error, match="sigma"):
+        vs.core.vsfeel.WNNM(clip_grays, -1.0)
 
 
 def test_rejects_a_lattice_past_the_32_bit_index_range():

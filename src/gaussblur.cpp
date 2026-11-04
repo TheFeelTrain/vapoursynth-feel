@@ -182,32 +182,21 @@ struct GaussData {
             gpu->vk->vkDestroyQueryPool(gpu->device, ts_query, nullptr);
         }
         gpu_destroy_buffer(*gpu, ts_buf);
-        VkDevice dev = gpu->device;
-        VkPipeline destroyed[9] {};
-        int num_destroyed = 0;
-        for (auto & plane : planes) {
-            const VkPipeline pipelines[3] { plane.pipeline, plane.v_pipeline,
-                                            plane.h_pipeline };
-            for (VkPipeline p : pipelines) {
-                if (!p) {
-                    continue;
-                }
-                bool seen = false;
-                for (int i = 0; i < num_destroyed; ++i) {
-                    seen |= destroyed[i] == p;
-                }
-                if (seen) {
-                    continue;
-                }
-                destroyed[num_destroyed++] = p;
-                gpu->vk->vkDestroyPipeline(dev, p, nullptr);
-            }
+        std::vector<VkPipeline> destroyed;
+        destroyed.reserve(planes.size() * 3);
+        for (const auto & plane : planes) {
+            destroyed.push_back(plane.pipeline);
+            destroyed.push_back(plane.v_pipeline);
+            destroyed.push_back(plane.h_pipeline);
         }
+        vsfeel_destroy_pipelines(*gpu, destroyed);
         if (pipeline_layout) {
-            gpu->vk->vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
+            gpu->vk->vkDestroyPipelineLayout(gpu->device, pipeline_layout,
+                                             nullptr);
         }
         if (set_layout) {
-            gpu->vk->vkDestroyDescriptorSetLayout(dev, set_layout, nullptr);
+            gpu->vk->vkDestroyDescriptorSetLayout(gpu->device, set_layout,
+                                                  nullptr);
         }
         gpu_destroy_buffer(*gpu, wt);
     }
@@ -634,7 +623,7 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
                 sigma[i] = sigma[i - 1];
             }
         } else if (!std::isfinite(sigma[i]) || sigma[i] < 0.0f) {
-            return set_error("sigma must be a finite value >= 0.");
+            return set_error("\"sigma\" must be a finite value >= 0.");
         }
     }
 
@@ -645,7 +634,7 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
     }
     if (!any_process) {
         return set_error(
-            "all planes have sigma < FLT_EPSILON (nothing to process).");
+            "all planes have \"sigma\" < FLT_EPSILON (nothing to process).");
     }
 
     {
@@ -657,31 +646,22 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
     }
 
     // The plane geometry has to be the one the core's GPU frames carry, because
-    // kernel addressing is STRIDE elements per row. A GPU frame's stride is the
-    // CPU frame's stride, so it is read off a scratch frame here rather than
-    // guessed from an alignment rule.
+    // kernel addressing is STRIDE elements per row (see vsfeel_probe_strides).
     int plane_stride[3] {};
-    {
-        VSFrame * probe = vsapi->newVideoFrame(&fmt, d->vi->width,
-                                               d->vi->height, nullptr, core);
-        if (probe == nullptr) {
-            return set_error(
-                "could not allocate a probe frame to read the plane stride");
+    if (auto e =
+            vsfeel_probe_strides(vsapi, core, fmt, d->vi->width, d->vi->height,
+                                 d->elem_bytes, plane_stride);
+        !e.empty()) {
+        return set_error(e);
+    }
+    for (int p = 0; p < fmt.numPlanes; ++p) {
+        const int h = p == 0 ? d->vi->height : d->vi->height >> subH;
+        if (auto e = vsfeel_plane_range_error(
+                static_cast<VkDeviceSize>(plane_stride[p]), h, d->elem_bytes,
+                *d->gpu, ("plane " + std::to_string(p)).c_str());
+            !e.empty()) {
+            return set_error(e);
         }
-        for (int p = 0; p < fmt.numPlanes; ++p) {
-            plane_stride[p] =
-                static_cast<int>(vsapi->getStride(probe, p) / d->elem_bytes);
-            const int h = p == 0 ? d->vi->height : d->vi->height >> subH;
-            if (auto e = vsfeel_plane_range_error(
-                    static_cast<VkDeviceSize>(plane_stride[p]), h,
-                    d->elem_bytes, *d->gpu,
-                    ("plane " + std::to_string(p)).c_str());
-                !e.empty()) {
-                vsapi->freeFrame(probe);
-                return set_error(e);
-            }
-        }
-        vsapi->freeFrame(probe);
     }
 
     // Per-plane configuration, with deduplication for identical planes
@@ -736,14 +716,16 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
         if (ci == std::ssize(keys)) {
             if (key.sigma > static_cast<float>(std::min(key.w, key.h))) {
                 return set_error(
-                    "sigma too large for plane (radius >= dimension).");
+                    "\"sigma\" is too large for the plane (radius >= "
+                    "dimension).");
             }
             auto kernel = get_gauss_kernel(key.sigma);
             const int ksize = static_cast<int>(kernel.size());
             const int radius = ksize / 2;
             if (radius > key.w - 1 || radius > key.h - 1) {
                 return set_error(
-                    "sigma too large for plane (radius >= dimension).");
+                    "\"sigma\" is too large for the plane (radius >= "
+                    "dimension).");
             }
             keys.push_back(key);
             weights.push_back(std::move(kernel));
@@ -888,7 +870,8 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
             if (last_tmp > INT32_MAX) {
                 return set_error(
                     "plane " + std::to_string(plane) +
-                    " two-pass scratch overflows the kernel's 32-bit addressing");
+                    " two-pass scratch overflows the kernel's 32-bit "
+                    "addressing.");
             }
             plane_tmp_elem = off / 4;
             tmp_total = align32(off + bytes);

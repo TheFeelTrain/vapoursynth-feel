@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -203,6 +204,18 @@ inline bool vsfeel_debug_probe(const char * specific) {
     return vsfeel_debug_level() >= 2 || env_flag(specific);
 }
 
+// A renamed per-filter switch also accepts its previous spelling for one
+// release, so a bug report's existing command keeps producing diagnostics.
+inline bool vsfeel_debug_flag_alias(const char * specific,
+                                    const char * previous) {
+    return vsfeel_debug_flag(specific) || env_flag(previous);
+}
+
+inline bool vsfeel_debug_probe_alias(const char * specific,
+                                     const char * previous) {
+    return vsfeel_debug_probe(specific) || env_flag(previous);
+}
+
 struct GPUDevice;
 
 // Declared here, defined below with the debug helpers: the frame trail is what
@@ -332,6 +345,48 @@ vsfeel_get_frame(const VSAPI * vsapi, int n, VSNode * node,
                               frameCtx);
     }
     return frame;
+}
+
+// Parse a "planes" argument into a bit mask; absent means every plane. The
+// core's two plane-selection errors are identical for every filter, so they
+// live here instead of being retyped (and reworded) per filter.
+inline std::variant<uint32_t, std::string>
+vsfeel_parse_planes(const VSMap * in, const VSAPI * vsapi, int num_planes) {
+    const int count = vsapi->mapNumElements(in, "planes");
+    if (count <= 0) {
+        return (uint32_t { 1 } << num_planes) - 1;
+    }
+    uint32_t mask = 0;
+    for (int i = 0; i < count; ++i) {
+        int error = 0;
+        const int plane = vsapi->mapGetIntSaturated(in, "planes", i, &error);
+        if (error || plane < 0 || plane >= num_planes) {
+            return "plane index out of range.";
+        }
+        if (mask & (uint32_t { 1 } << plane)) {
+            return "plane specified twice.";
+        }
+        mask |= uint32_t { 1 } << plane;
+    }
+    return mask;
+}
+
+// Read every plane's sample stride from a scratch frame: a GPU frame carries
+// the CPU allocator's pitch, and the kernels address planes through it, so it
+// cannot be guessed from an alignment rule. Returns an empty string on success.
+inline std::string vsfeel_probe_strides(const VSAPI * vsapi, VSCore * core,
+                                        const VSVideoFormat & fmt, int width,
+                                        int height, int elem_bytes,
+                                        int * strides) {
+    VSFrame * probe = vsapi->newVideoFrame(&fmt, width, height, nullptr, core);
+    if (probe == nullptr) {
+        return "could not allocate a probe frame to read the plane stride.";
+    }
+    for (int p = 0; p < fmt.numPlanes; ++p) {
+        strides[p] = static_cast<int>(vsapi->getStride(probe, p) / elem_bytes);
+    }
+    vsapi->freeFrame(probe);
+    return {};
 }
 
 // ---------------------------------------------------------------------------
@@ -496,7 +551,7 @@ inline std::string vsfeel_plane_range_error(VkDeviceSize stride, int height,
     return std::string(what) + " needs " + std::to_string(bytes) +
            " bytes, more than this device's maxStorageBufferRange (" +
            std::to_string(gpu.limits.maxStorageBufferRange) +
-           "); reduce the frame size";
+           "); reduce the frame size.";
 }
 
 inline std::string vsfeel_plane_range_error(const VSVulkanPlaneInfo & plane,
@@ -508,7 +563,7 @@ inline std::string vsfeel_plane_range_error(const VSVulkanPlaneInfo & plane,
     return std::string(what) + " needs " + std::to_string(plane.bufferSize) +
            " bytes, more than this device's maxStorageBufferRange (" +
            std::to_string(gpu.limits.maxStorageBufferRange) +
-           "); reduce the frame size";
+           "); reduce the frame size.";
 }
 
 // GPU-timing probes: a timestamp write where timestampValidBits is 0 can hang
@@ -644,6 +699,36 @@ inline void gpu_destroy_buffer(const GPUDevice & g, GpuBuffer & b) {
         g.api->destroyGPUBuffer(b.handle);
         b = {};
     }
+}
+
+// Destroy a set of pipelines once each. A filter that shares pipelines across
+// planes or geometries hands the whole set here; duplicates and nulls are
+// ignored, so the plan never has to know which ones it already destroyed.
+inline void vsfeel_destroy_pipelines(const GPUDevice & g,
+                                     const VkPipeline * pipes, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        const VkPipeline pipe = pipes[i];
+        if (!pipe) {
+            continue;
+        }
+        bool seen = false;
+        for (size_t j = 0; j < i && !seen; ++j) {
+            seen = pipes[j] == pipe;
+        }
+        if (!seen) {
+            g.vk->vkDestroyPipeline(g.device, pipe, nullptr);
+        }
+    }
+}
+
+inline void vsfeel_destroy_pipelines(const GPUDevice & g,
+                                     std::initializer_list<VkPipeline> pipes) {
+    vsfeel_destroy_pipelines(g, pipes.begin(), pipes.size());
+}
+
+inline void vsfeel_destroy_pipelines(const GPUDevice & g,
+                                     const std::vector<VkPipeline> & pipes) {
+    vsfeel_destroy_pipelines(g, pipes.data(), pipes.size());
 }
 
 // Bind `count` storage buffers to set 0, bindings `first`..first+count-1

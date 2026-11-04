@@ -441,7 +441,7 @@ def test_eedi3aa_rejects_odd_height(clip_gray16):
     """The transposed vertical pass needs an even processed plane height."""
     odd = vs.core.std.Crop(clip_gray16, bottom=1)
     assert odd.height % 2 == 1
-    with pytest.raises(vs.Error, match="mod 2"):
+    with pytest.raises(vs.Error, match="must be even"):
         _aa(odd, field=3)
 
 

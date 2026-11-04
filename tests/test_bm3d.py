@@ -100,6 +100,23 @@ def test_bm3d_legacy_bm3dv2_alias(clip_grays):
         assert np.array_equal(a, b), f"alias diverged at frame {n}"
 
 
+def test_bm3d_v2_errors_use_the_invoked_name(clip_grays):
+    """The alias reports BM3Dv2, like EEDI3H reports EEDI3H."""
+    with pytest.raises(vs.Error, match=r"BM3Dv2: .*extractor_exp"):
+        vs.core.vsfeel.BM3Dv2(clip_grays, sigma=[0.0], extractor_exp=999)
+
+
+def test_positional_extractor_exp_is_the_documented_slot(clip_grays):
+    """clip, ref, sigma, ..., chroma, extractor_exp, then the compat pair.
+
+    The ignored num_streams used to sit between chroma and extractor_exp, so a
+    documented positional call silently bound the wrong argument.
+    """
+    args = [clip_grays, None, [0.0], 8, 9, 0, 2, 4, 0.0, 0, 999]
+    with pytest.raises(vs.Error, match="extractor_exp"):
+        vs.core.vsfeel.BM3D(*args)
+
+
 def test_bm3d_parallel_load_matches_serial(clip_grays):
     """Parallel request load must produce the same pixel
     values as the serial path.

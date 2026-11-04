@@ -76,32 +76,20 @@ struct BoxData {
             gpu->api->freeGPUExecPool(pool);
             pool = nullptr;
         }
-        VkDevice dev = gpu->device;
-        VkPipeline destroyed[6] {};
-        int num_destroyed = 0;
-        for (auto & plane : planes) {
-            const VkPipeline pipelines[2] { plane.v_pipeline,
-                                            plane.h_pipeline };
-            for (VkPipeline p : pipelines) {
-                if (!p) {
-                    continue;
-                }
-                bool seen = false;
-                for (int i = 0; i < num_destroyed; ++i) {
-                    seen |= destroyed[i] == p;
-                }
-                if (seen) {
-                    continue;
-                }
-                destroyed[num_destroyed++] = p;
-                gpu->vk->vkDestroyPipeline(dev, p, nullptr);
-            }
+        std::vector<VkPipeline> destroyed;
+        destroyed.reserve(planes.size() * 2);
+        for (const auto & plane : planes) {
+            destroyed.push_back(plane.v_pipeline);
+            destroyed.push_back(plane.h_pipeline);
         }
+        vsfeel_destroy_pipelines(*gpu, destroyed);
         if (pipeline_layout) {
-            gpu->vk->vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
+            gpu->vk->vkDestroyPipelineLayout(gpu->device, pipeline_layout,
+                                             nullptr);
         }
         if (set_layout) {
-            gpu->vk->vkDestroyDescriptorSetLayout(dev, set_layout, nullptr);
+            gpu->vk->vkDestroyDescriptorSetLayout(gpu->device, set_layout,
+                                                  nullptr);
         }
         gpu_destroy_buffer(*gpu, taps);
     }
@@ -405,11 +393,11 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
     const int out_w = dst_w_set ? dst_w : d->vi->width;
     const int out_h = dst_h_set ? dst_h : d->vi->height;
     if (out_w <= 0 || out_h <= 0) {
-        return set_error("width and height must be positive.");
+        return set_error("\"width\" and \"height\" must be positive.");
     }
     if (out_w > d->vi->width || out_h > d->vi->height) {
-        return set_error(
-            "Box only downscales: width/height must not exceed the input.");
+        return set_error("Box only downscales: \"width\" and \"height\" must "
+                         "not exceed the input.");
     }
     // A subsampled format's frame dimensions must be multiples of its
     // subsampling factors. The output-stride probe frame below is allocated at
@@ -419,14 +407,14 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
     const int subW = fmt.subSamplingW;
     const int subH = fmt.subSamplingH;
     if (subW > 0 && out_w % (1 << subW) != 0) {
-        return set_error("width must be a multiple of " +
+        return set_error("\"width\" must be a multiple of " +
                          std::to_string(1 << subW) +
-                         " for this subsampled format");
+                         " for this subsampled format.");
     }
     if (subH > 0 && out_h % (1 << subH) != 0) {
-        return set_error("height must be a multiple of " +
+        return set_error("\"height\" must be a multiple of " +
                          std::to_string(1 << subH) +
-                         " for this subsampled format");
+                         " for this subsampled format.");
     }
 
     d->out_vi = *d->vi;
@@ -442,51 +430,36 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
     }
 
     // The kernel addresses both planes through signed 32-bit element offsets
-    // and needs the core's row pitch, which is the CPU frame's (a GPU frame's
-    // stride is the CPU frame's). Read both off scratch frames rather than
-    // guessing from an alignment rule.
+    // and needs the core's row pitch, which is the CPU frame's (see
+    // vsfeel_probe_strides).
     int src_stride[3] {}, dst_stride[3] {};
-    {
-        VSFrame * probe = vsapi->newVideoFrame(&fmt, d->vi->width,
-                                               d->vi->height, nullptr, core);
-        if (probe == nullptr) {
-            return set_error(
-                "could not allocate a probe frame to read the input stride");
-        }
-        for (int p = 0; p < fmt.numPlanes; ++p) {
-            src_stride[p] =
-                static_cast<int>(vsapi->getStride(probe, p) / d->elem_bytes);
-            const int h = p == 0 ? d->vi->height : d->vi->height >> subH;
-            if (auto e = vsfeel_plane_range_error(
-                    static_cast<VkDeviceSize>(src_stride[p]), h, d->elem_bytes,
-                    *d->gpu, ("input plane " + std::to_string(p)).c_str());
-                !e.empty()) {
-                vsapi->freeFrame(probe);
-                return set_error(e);
-            }
-        }
-        vsapi->freeFrame(probe);
+    if (auto e = vsfeel_probe_strides(vsapi, core, fmt, d->vi->width,
+                                      d->vi->height, d->elem_bytes, src_stride);
+        !e.empty()) {
+        return set_error(e);
     }
-    {
-        VSFrame * probe =
-            vsapi->newVideoFrame(&fmt, out_w, out_h, nullptr, core);
-        if (probe == nullptr) {
-            return set_error(
-                "could not allocate a probe frame to read the output stride");
+    for (int p = 0; p < fmt.numPlanes; ++p) {
+        const int h = p == 0 ? d->vi->height : d->vi->height >> subH;
+        if (auto e = vsfeel_plane_range_error(
+                static_cast<VkDeviceSize>(src_stride[p]), h, d->elem_bytes,
+                *d->gpu, ("input plane " + std::to_string(p)).c_str());
+            !e.empty()) {
+            return set_error(e);
         }
-        for (int p = 0; p < fmt.numPlanes; ++p) {
-            dst_stride[p] =
-                static_cast<int>(vsapi->getStride(probe, p) / d->elem_bytes);
-            const int h = p == 0 ? out_h : out_h >> subH;
-            if (auto e = vsfeel_plane_range_error(
-                    static_cast<VkDeviceSize>(dst_stride[p]), h, d->elem_bytes,
-                    *d->gpu, ("output plane " + std::to_string(p)).c_str());
-                !e.empty()) {
-                vsapi->freeFrame(probe);
-                return set_error(e);
-            }
+    }
+    if (auto e = vsfeel_probe_strides(vsapi, core, fmt, out_w, out_h,
+                                      d->elem_bytes, dst_stride);
+        !e.empty()) {
+        return set_error(e);
+    }
+    for (int p = 0; p < fmt.numPlanes; ++p) {
+        const int h = p == 0 ? out_h : out_h >> subH;
+        if (auto e = vsfeel_plane_range_error(
+                static_cast<VkDeviceSize>(dst_stride[p]), h, d->elem_bytes,
+                *d->gpu, ("output plane " + std::to_string(p)).c_str());
+            !e.empty()) {
+            return set_error(e);
         }
-        vsapi->freeFrame(probe);
     }
 
     // The tap tables depend only on the ratio, which every plane shares, so
@@ -722,6 +695,8 @@ void vsfeel_register_box(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
     vspapi->registerFunction("Box",
                              "clip:vnode:gpu;"
                              "width:int:opt;"
-                             "height:int:opt;",
+                             "height:int:opt;"
+                             "device_id:int:opt;"
+                             "num_streams:int:opt;",
                              "clip:vnode:gpu;", BoxCreate, nullptr, plugin);
 }

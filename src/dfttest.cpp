@@ -1222,7 +1222,7 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
     };
 
     if (!vsh::isConstantVideoFormat(d->vi)) {
-        return set_error("only constant format clips are supported");
+        return set_error("only constant format clips are supported.");
     }
 
     const auto & fmt = d->vi->format;
@@ -1237,7 +1237,7 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             "input bitdepth must be u16 (16-bit integer), f16 or f32 (16/32-bit float), Gray/YUV/RGB.");
     }
     if (d->vi->numFrames <= 0) {
-        return set_error("clip frame count must be known and positive");
+        return set_error("clip frame count must be known and positive.");
     }
     d->bits = bits;
     d->elem_bytes = bits / 8;
@@ -1248,7 +1248,7 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         ftype = 0;
     }
     if (ftype < 0 || ftype > 4) {
-        return set_error("ftype must be 0, 1, 2, 3, or 4.");
+        return set_error("\"ftype\" must be 0, 1, 2, 3, or 4.");
     }
 
     double sigma = vsapi->mapGetFloat(in, "sigma", 0, &error);
@@ -1269,14 +1269,15 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
     }
     if (!std::isfinite(sigma) || !std::isfinite(sigma2) ||
         !std::isfinite(pmin) || !std::isfinite(pmax)) {
-        return set_error("sigma/sigma2/pmin/pmax must be finite.");
+        return set_error("\"sigma\", \"sigma2\", \"pmin\" and \"pmax\" must be "
+                         "finite.");
     }
     // A negative pmin/pmax makes the ftype=4 gain sqrt(negative) and poisons
     // the whole frame; a negative f0beta is pow(0, negative) in the ftype=0
     // gain. They are accepted by vszipcl but produce an all-NaN clip, so
     // refuse them at creation like the non-finite values above.
     if (pmin < 0.0 || pmax < 0.0) {
-        return set_error("pmin/pmax must be non-negative.");
+        return set_error("\"pmin\" and \"pmax\" must be non-negative.");
     }
 
     int sbsize = vsh::int64ToIntS(vsapi->mapGetInt(in, "sbsize", 0, &error));
@@ -1284,29 +1285,32 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         sbsize = 16;
     }
     if (sbsize != 16) {
-        return set_error("sbsize must be 16 (hipRTC-backend port).");
+        return set_error("\"sbsize\" must be 16 (hipRTC-backend port).");
     }
     int sosize = vsh::int64ToIntS(vsapi->mapGetInt(in, "sosize", 0, &error));
     if (error) {
         sosize = 12;
     }
     if (sosize < 0 || sosize > 15) {
-        return set_error("sosize must be 0..15.");
+        return set_error("\"sosize\" must be 0..15.");
     }
     if (sosize > 8 && sbsize % (sbsize - sosize) != 0) {
         return set_error(
-            "spatial overlap > 50% requires that sbsize-sosize is a divisor of sbsize.");
+            "spatial overlap > 50% requires that \"sbsize\" - \"sosize\" is a "
+            "divisor of \"sbsize\".");
     }
     int tbsize = vsh::int64ToIntS(vsapi->mapGetInt(in, "tbsize", 0, &error));
     if (error) {
         tbsize = 3;
     }
     if (tbsize < 1 || tbsize > 7) {
-        return set_error("tbsize must be odd, 1..7 (temporal radius 0..3).");
+        return set_error(
+            "\"tbsize\" must be odd, 1..7 (temporal radius 0..3).");
     }
     if (tbsize % 2 == 0) {
         return set_error(
-            "tbsize must be odd (dfttest2 silently aliases even values to tbsize-1).");
+            "\"tbsize\" must be odd (dfttest2 silently aliases even values to "
+            "tbsize-1).");
     }
     int swin = vsh::int64ToIntS(vsapi->mapGetInt(in, "swin", 0, &error));
     if (error) {
@@ -1317,7 +1321,7 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         twin = 7;
     }
     if (swin < 0 || swin > 11 || twin < 0 || twin > 11) {
-        return set_error("swin/twin must be 0..11.");
+        return set_error("\"swin\" and \"twin\" must be 0..11.");
     }
     double sbeta = vsapi->mapGetFloat(in, "sbeta", 0, &error);
     if (error) {
@@ -1328,7 +1332,7 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         tbeta = 2.5;
     }
     if (!std::isfinite(sbeta) || !std::isfinite(tbeta)) {
-        return set_error("sbeta/tbeta must be finite.");
+        return set_error("\"sbeta\" and \"tbeta\" must be finite.");
     }
     int zmean = vsh::int64ToIntS(vsapi->mapGetInt(in, "zmean", 0, &error));
     if (error) {
@@ -1339,17 +1343,17 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         f0beta = 1.0;
     }
     if (!std::isfinite(f0beta)) {
-        return set_error("f0beta must be finite.");
+        return set_error("\"f0beta\" must be finite.");
     }
     if (f0beta < 0.0) {
-        return set_error("f0beta must be non-negative.");
+        return set_error("\"f0beta\" must be non-negative.");
     }
     int ssystem = vsh::int64ToIntS(vsapi->mapGetInt(in, "ssystem", 0, &error));
     if (error) {
         ssystem = 0;
     }
     if (ssystem < 0 || ssystem > 1) {
-        return set_error("ssystem must be 0 or 1.");
+        return set_error("\"ssystem\" must be 0 or 1.");
     }
 
     const double * slocation = nullptr;
@@ -1360,28 +1364,28 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
     if (vsapi->mapNumElements(in, "slocation") > 0) {
         slocation = vsapi->mapGetFloatArray(in, "slocation", &error);
         if (error) {
-            return set_error("slocation must be an array of floats.");
+            return set_error("\"slocation\" must be an array of floats.");
         }
         n_slocation = vsapi->mapNumElements(in, "slocation");
     }
     if (vsapi->mapNumElements(in, "ssx") > 0) {
         ssx = vsapi->mapGetFloatArray(in, "ssx", &error);
         if (error) {
-            return set_error("ssx must be an array of floats.");
+            return set_error("\"ssx\" must be an array of floats.");
         }
         n_ssx = vsapi->mapNumElements(in, "ssx");
     }
     if (vsapi->mapNumElements(in, "ssy") > 0) {
         ssy = vsapi->mapGetFloatArray(in, "ssy", &error);
         if (error) {
-            return set_error("ssy must be an array of floats.");
+            return set_error("\"ssy\" must be an array of floats.");
         }
         n_ssy = vsapi->mapNumElements(in, "ssy");
     }
     if (vsapi->mapNumElements(in, "sst") > 0) {
         sst = vsapi->mapGetFloatArray(in, "sst", &error);
         if (error) {
-            return set_error("sst must be an array of floats.");
+            return set_error("\"sst\" must be an array of floats.");
         }
         n_sst = vsapi->mapNumElements(in, "sst");
     }
@@ -1389,7 +1393,8 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
     for (int cnt : array_counts) {
         if (cnt != 0 && (cnt % 2 != 0 || cnt < 2)) {
             return set_error(
-                "number of elements in slocation/ssx/ssy/sst must be a non-zero multiple of 2.");
+                "number of elements in \"slocation\", \"ssx\", \"ssy\" and "
+                "\"sst\" must be a non-zero multiple of 2.");
         }
     }
     const auto all_finite = [](const double * data, int count) {
@@ -1411,14 +1416,16 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
     if ((slocation && !all_finite(slocation, n_slocation)) ||
         (ssx && !all_finite(ssx, n_ssx)) || (ssy && !all_finite(ssy, n_ssy)) ||
         (sst && !all_finite(sst, n_sst))) {
-        return set_error("slocation/ssx/ssy/sst values must be finite.");
+        return set_error("\"slocation\", \"ssx\", \"ssy\" and \"sst\" values "
+                         "must be finite.");
     }
     if ((slocation && !sigmas_non_negative(slocation, n_slocation)) ||
         (ssx && !sigmas_non_negative(ssx, n_ssx)) ||
         (ssy && !sigmas_non_negative(ssy, n_ssy)) ||
         (sst && !sigmas_non_negative(sst, n_sst))) {
         return set_error(
-            "slocation/ssx/ssy/sst sigma values must be non-negative.");
+            "\"slocation\", \"ssx\", \"ssy\" and \"sst\" sigma values must be "
+            "non-negative.");
     }
     // initPacks sorts the locations; a duplicate makes eval divide by zero.
     const auto duplicate_locations = [](const double * data, int count) {
@@ -1434,7 +1441,8 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         (ssx && duplicate_locations(ssx, n_ssx)) ||
         (ssy && duplicate_locations(ssy, n_ssy)) ||
         (sst && duplicate_locations(sst, n_sst))) {
-        return set_error("slocation/ssx/ssy/sst locations must be distinct.");
+        return set_error("\"slocation\", \"ssx\", \"ssy\" and \"sst\" "
+                         "locations must be distinct.");
     }
 
     // device_id and num_streams are registered but never read: the core owns
@@ -1447,22 +1455,12 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
     d->beta = static_cast<float>(f0beta);
 
     const int num_planes = fmt.numPlanes;
-    if (vsapi->mapNumElements(in, "planes") > 0) {
-        for (int i = 0; i < vsapi->mapNumElements(in, "planes"); ++i) {
-            const int idx =
-                vsh::int64ToIntS(vsapi->mapGetInt(in, "planes", i, &error));
-            if (idx < 0 || idx >= num_planes) {
-                return set_error("plane index out of range.");
-            }
-            if (d->process[idx]) {
-                return set_error("plane specified twice.");
-            }
-            d->process[idx] = true;
-        }
-    } else {
-        for (int i = 0; i < num_planes; ++i) {
-            d->process[i] = true;
-        }
+    const auto plane_mask = vsfeel_parse_planes(in, vsapi, num_planes);
+    if (std::holds_alternative<std::string>(plane_mask)) {
+        return set_error(std::get<std::string>(plane_mask));
+    }
+    for (int i = 0; i < 3; ++i) {
+        d->process[i] = (std::get<uint32_t>(plane_mask) >> i) & 1u;
     }
 
     // FILTER_TYPE mapping (ftype 0 with f0beta variants)
@@ -1955,6 +1953,8 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
     if (result == nullptr) {
         // The core returns nullptr without running the free callback when the
         // node constructor throws, so release the instance through it here.
+        vsfeel_trace_error("DFTTest", -1, "filter creation failed",
+                           data->gpu.get());
         DftFree(data, core, vsapi);
         vsapi->mapSetError(out, "DFTTest: filter creation failed");
         return;

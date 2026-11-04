@@ -296,7 +296,7 @@ struct Eedi3Data {
     // previous blocking call so a wait never leaks into the next stage.
     std::atomic<uint64_t> ht_acquire_ns {}, ht_alloc_ns {}, ht_record_ns {},
         ht_submit_ns {}, ht_total_ns {}, ht_n {}, ht_fence_ns {};
-    // VSFEEL_EEDI3_GPUTIME=1: timestamp the phases of one submission at a time
+    // VSFEEL_EEDI3_GPUTRACE=1: timestamp the phases of one submission at a time
     // (the readback waits that submission out, so the probe serializes the
     // pipeline by design -- never benchmark with it on).
     VkQueryPool qt_pool {};
@@ -429,23 +429,15 @@ Eedi3Data::~Eedi3Data() {
         qt_pool = nullptr;
     }
     const GPUDevice & g = *gpu;
-    std::vector<VkPipeline> destroyed;
-    for (auto & [key, p] : width_pipes) {
-        const VkPipeline all[] { p.row,           p.vcheck,   p.pad,
-                                 p.vcopy,         p.blit,     p.xpose,
-                                 p.compose,       p.maskpack, p.maskdilate_raw,
-                                 p.maskdilate_tr, p.assemble, p.hpfill };
-        for (VkPipeline pipe : all) {
-            if (!pipe) {
-                continue;
-            }
-            if (std::find(destroyed.begin(), destroyed.end(), pipe) ==
-                destroyed.end()) {
-                destroyed.push_back(pipe);
-                g.vk->vkDestroyPipeline(g.device, pipe, nullptr);
-            }
-        }
+    std::vector<VkPipeline> pipes;
+    pipes.reserve(width_pipes.size() * 12);
+    for (const auto & [key, p] : width_pipes) {
+        pipes.insert(pipes.end(),
+                     { p.row, p.vcheck, p.pad, p.vcopy, p.blit, p.xpose,
+                       p.compose, p.maskpack, p.maskdilate_raw, p.maskdilate_tr,
+                       p.assemble, p.hpfill });
     }
+    vsfeel_destroy_pipelines(g, pipes);
     if (pipeline_layout) {
         g.vk->vkDestroyPipelineLayout(g.device, pipeline_layout, nullptr);
     }
@@ -458,7 +450,7 @@ Eedi3Data::~Eedi3Data() {
 // Recording helpers
 // ---------------------------------------------------------------------------
 
-// GPU phase timing (VSFEEL_EEDI3_GPUTIME). Stamps sit inside the submission's
+// GPU phase timing (VSFEEL_EEDI3_GPUTRACE). Stamps sit inside the submission's
 // own command buffer and the readback waits that submission out, so the probe
 // serializes the pipeline -- it is a diagnostic, never a benchmark config.
 static void eedi3_qt_stamp(const Eedi3Data & d, VkCommandBuffer cmd,
@@ -1974,20 +1966,13 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     d->dh = !!vsapi->mapGetInt(in, "dh", 0, &err);
     err = 0;
 
-    const int m = vsapi->mapNumElements(in, "planes");
-    for (int i = 0; i < MAX_PLANES; ++i) {
-        d->process[i] = (m <= 0);
+    const auto plane_mask =
+        vsfeel_parse_planes(in, vsapi, d->vi->format.numPlanes);
+    if (std::holds_alternative<std::string>(plane_mask)) {
+        return set_error(std::get<std::string>(plane_mask));
     }
-    for (int i = 0; i < m; ++i) {
-        const int n = vsh::int64ToIntS(
-            vsapi->mapGetIntSaturated(in, "planes", i, nullptr));
-        if (n < 0 || n >= d->vi->format.numPlanes) {
-            return set_error("plane index out of range");
-        }
-        if (d->process[n]) {
-            return set_error("plane specified twice");
-        }
-        d->process[n] = true;
+    for (int i = 0; i < MAX_PLANES; ++i) {
+        d->process[i] = (std::get<uint32_t>(plane_mask) >> i) & 1u;
     }
 
     // dh's output keeps an unprocessed plane only by pointing newVideoFrame2 at
@@ -1997,7 +1982,7 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
             if (!d->process[plane]) {
                 return set_error(
-                    "dh=True requires every plane to be processed");
+                    "\"dh\" requires every plane to be processed.");
             }
         }
     }
@@ -2030,7 +2015,8 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     if (!std::isfinite(d->alpha) || !std::isfinite(d->beta) ||
         !std::isfinite(d->gamma) || !std::isfinite(vthresh0) ||
         !std::isfinite(vthresh1) || !std::isfinite(d->vthresh2)) {
-        return set_error("alpha, beta, gamma and vthresh0/1/2 must be finite");
+        return set_error("\"alpha\", \"beta\", \"gamma\", \"vthresh0\", "
+                         "\"vthresh1\" and \"vthresh2\" must be finite.");
     }
 
     // Compat no-ops (registered like the other legacy args, never read):
@@ -2044,14 +2030,14 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     (void)get_int("cost3", 1);
 
     if (d->field < 0 || d->field > 3) {
-        return set_error("field must be 0, 1, 2, or 3");
+        return set_error("\"field\" must be 0, 1, 2, or 3.");
     }
     if (d->aa) {
         if (d->field < 2) {
-            return set_error("field must be 2 or 3 for EEDI3AA");
+            return set_error("\"field\" must be 2 or 3 for EEDI3AA.");
         }
         if (d->dh) {
-            return set_error("dh is not supported by EEDI3AA");
+            return set_error("\"dh\" is not supported by EEDI3AA.");
         }
     }
     if (!d->dh) {
@@ -2067,41 +2053,46 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
             // in_w / 2), so both axes must be even even though d->horiz is
             // false; the single-axis filters keep checking their own axis.
             if ((d->horiz || d->aa) && (pw & 1)) {
-                return set_error("plane's width must be mod 2 when dh=False");
+                return set_error(
+                    "a processed plane's width must be even when \"dh\" is "
+                    "false.");
             }
             if ((!d->horiz || d->aa) && (ph & 1)) {
-                return set_error("plane's height must be mod 2 when dh=False");
+                return set_error(
+                    "a processed plane's height must be even when \"dh\" is "
+                    "false.");
             }
         }
     }
     if (d->dh && d->field > 1) {
-        return set_error("field must be 0 or 1 when dh=True");
+        return set_error("\"field\" must be 0 or 1 when \"dh\" is true.");
     }
     if (d->alpha < 0.0f || d->alpha > 1.0f) {
-        return set_error("alpha must be between 0.0 and 1.0 (inclusive)");
+        return set_error("\"alpha\" must be between 0.0 and 1.0 (inclusive).");
     }
     if (d->beta < 0.0f || d->beta > 1.0f) {
-        return set_error("beta must be between 0.0 and 1.0 (inclusive)");
+        return set_error("\"beta\" must be between 0.0 and 1.0 (inclusive).");
     }
     if (d->alpha + d->beta > 1.0f) {
-        return set_error("alpha+beta must be between 0.0 and 1.0 (inclusive)");
+        return set_error(
+            "\"alpha\" + \"beta\" must be between 0.0 and 1.0 (inclusive).");
     }
     if (d->gamma < 0.0f) {
-        return set_error("gamma must be greater than or equal to 0.0");
+        return set_error("\"gamma\" must be greater than or equal to 0.0.");
     }
     if (d->nrad < 0 || d->nrad > 3) {
-        return set_error("nrad must be between 0 and 3 (inclusive)");
+        return set_error("\"nrad\" must be between 0 and 3 (inclusive).");
     }
     if (d->mdis < 1 || d->mdis > 40) {
-        return set_error("mdis must be between 1 and 40 (inclusive)");
+        return set_error("\"mdis\" must be between 1 and 40 (inclusive).");
     }
     if (d->vcheck < 0 || d->vcheck > 3) {
-        return set_error("vcheck must be 0, 1, 2, or 3");
+        return set_error("\"vcheck\" must be 0, 1, 2, or 3.");
     }
     if (d->vcheck > 0 &&
         (vthresh0 <= 0.0f || vthresh1 <= 0.0f || d->vthresh2 <= 0.0f)) {
-        return set_error(
-            "vthresh0, vthresh1 and vthresh2 must be greater than 0.0");
+        return set_error("\"vthresh0\", \"vthresh1\" and \"vthresh2\" must be "
+                         "greater than 0.0.");
     }
 
     // mclip must be a single Gray plane (vszip CPU semantic). Gray16 integer and
@@ -2111,13 +2102,13 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     if (d->mclip_node) {
         const auto * const mvi = vsapi->getVideoInfo(d->mclip_node);
         if (mvi->format.colorFamily != cfGray) {
-            return set_error("mclip must be Gray");
+            return set_error("\"mclip\" must be Gray.");
         }
         if (mvi->width != d->vi->width || mvi->height != d->vi->height) {
-            return set_error("mclip's dimensions don't match");
+            return set_error("\"mclip\" dimensions do not match \"clip\".");
         }
         if (mvi->numFrames != d->vi->numFrames) {
-            return set_error("mclip's number of frames doesn't match");
+            return set_error("\"mclip\" frame count does not match \"clip\".");
         }
 
         if (mvi->format.bitsPerSample == 16 &&
@@ -2192,7 +2183,7 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         VSVideoInfo out_vi = *d->vi;
         if (d->field > 1) {
             if (d->vi->numFrames > INT32_MAX / 2) {
-                return set_error("resulting clip is too long");
+                return set_error("resulting clip is too long.");
             }
             if (d->vi->numFrames > 0) {
                 out_vi.numFrames *= 2;
@@ -2206,10 +2197,11 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
             }
         }
         if (!vsh::isSameVideoInfo(svi, &out_vi)) {
-            return set_error("sclip's format and dimensions don't match");
+            return set_error("\"sclip\" format and dimensions do not match "
+                             "\"clip\".");
         }
         if (svi->numFrames != out_vi.numFrames) {
-            return set_error("sclip's number of frames doesn't match");
+            return set_error("\"sclip\" frame count does not match \"clip\".");
         }
     }
 
@@ -2259,7 +2251,8 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         const int v = atoi(vp);
         d->vcheck_para = (v >= 0 && v <= Eedi3Data::VCHECK_PARA_LEVELS) ? v : 0;
     }
-    d->gpu_time = vsfeel_debug_probe("VSFEEL_EEDI3_GPUTIME");
+    d->gpu_time = vsfeel_debug_probe_alias("VSFEEL_EEDI3_GPUTRACE",
+                                           "VSFEEL_EEDI3_GPUTIME");
     const bool want_lds = env_flag("VSFEEL_EEDI3_VCLDS");
     d->trace = vsfeel_debug_flag("VSFEEL_EEDI3_TRACE");
     d->host_timing = vsfeel_debug_probe("VSFEEL_EEDI3_TIMING");
@@ -2298,11 +2291,11 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         }
     }
 
-    // VSFEEL_EEDI3_GPUTIME: a timestamp write on a queue family reporting zero
+    // VSFEEL_EEDI3_GPUTRACE: a timestamp write on a queue family reporting zero
     // valid bits is invalid usage (and on a lenient driver can hang the
     // engine), so the probe is gated on the core's own answer.
     if (d->gpu_time) {
-        if (!vsfeel_probe_timestamps(*d->gpu, "eedi3")) {
+        if (!vsfeel_probe_timestamps(*d->gpu, filter_name)) {
             d->gpu_time = false;
         } else {
             VkQueryPoolCreateInfo qi {};
@@ -2356,13 +2349,13 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     if (!d->gpu->has_subgroup_ops(VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
                                   VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT)) {
         return set_error("device cannot run the EEDI3 row kernel (it needs "
-                         "subgroup shuffle and shuffle-relative operations)");
+                         "subgroup shuffle and shuffle-relative operations).");
     }
     uint32_t row_subgroup_size = 0;
     if (!d->gpu->resolve_subgroup_size(SGSIZE, SGSIZE, row_subgroup_size)) {
         return set_error(
             "device cannot run the EEDI3 row kernel (needs 32-lane "
-            "subgroups, natively or via subgroup size control)");
+            "subgroups, natively or via subgroup size control).");
     }
 
     // Shader blobs for this io depth. f16 is 16 bits too, so the half set is
@@ -2468,7 +2461,7 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         d->hpfill_size = eedi3_f16_hpfill_spv_size;
         break;
     default:
-        return set_error("unsupported io type");
+        return set_error("unsupported io type.");
     }
     d->maskpack_code = { eedi3_maskpack_8_spv, eedi3_maskpack_16_spv,
                          eedi3_maskpack_32_spv, eedi3_maskpack_f16_spv };
@@ -2505,7 +2498,7 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     VSVideoInfo out_video = *d->vi;
     if (d->field > 1 && !d->aa) {
         if (d->vi->numFrames > INT32_MAX / 2) {
-            return set_error("resulting clip is too long");
+            return set_error("resulting clip is too long.");
         }
         if (d->vi->numFrames > 0) {
             out_video.numFrames *= 2;
@@ -2698,7 +2691,7 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         return set_error("the per-frame scratch (" +
                          std::to_string(d->scratch_bytes >> 20) +
                          " MiB) exceeds the 2 GiB int32 "
-                         "addressing limit; lower mdis or the frame size");
+                         "addressing limit; lower \"mdis\" or the frame size.");
     }
 
     if (d->trace) {

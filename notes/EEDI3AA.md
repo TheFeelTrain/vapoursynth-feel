@@ -203,7 +203,7 @@ runs 11% apart reported phase sums of 22719 and 22921 µs per batch, so the kern
 and clocks matched and only the gaps between submissions differed). Grade on
 same-session interleaved pairs (`notes/METHOD.md`).
 
-`VSFEEL_EEDI3_GPUTIME=1` stamps every phase of every sub-pass inside the
+`VSFEEL_EEDI3_GPUTRACE=1` stamps every phase of every sub-pass inside the
 submission's command buffer (it waits that submission out, so it serializes the
 pipeline: a diagnostic, never a benchmark config). 2x2160p u16, mclip+sclip,
 batch 4, per batch of ~3 frames:
@@ -438,8 +438,9 @@ the shared core's knobs plus its own `..._NOCLEAR`/`..._POISON`.
 
 - `..._BATCH=<n>` — output frames per submission (default from the scratch
   target, see `notes/EEDI3.md`); `=1` is the A/B control.
-- `..._GPUTIME=1` — per-phase GPU timestamps inside the
+- `..._GPUTRACE=1` — per-phase GPU timestamps inside the
   submission's own command buffer (serializes the pipeline; diagnostic only).
+  The former `..._GPUTIME` spelling still works.
 - `..._SKIP=<kernels>` — omit `mask,pad,row,vcheck,tail` from the
   recording, to price a kernel end to end. Changes the output.
 - `..._VPARA=<n>` — vcheck form: 0 = serial row walk (A/B control), 1..6 =

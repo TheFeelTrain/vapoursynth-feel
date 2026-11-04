@@ -398,7 +398,7 @@ struct Nnedi3Plane {
     int32_t ind_elem {};
 };
 
-// VSFEEL_NNEDI3_TSTAMP=<frame>: one warm frame stamps head / prescreen done /
+// VSFEEL_NNEDI3_GPUTRACE=<frame>: one warm frame stamps head / prescreen done /
 // predict done into a query pool, whose results the same command buffer copies
 // into a mapped buffer. The host waits that submission out once to read them.
 struct Nnedi3Probe {
@@ -471,19 +471,14 @@ struct Nnedi3Data {
         }
         VkDevice dev = gpu->device;
         // One pipeline per (plane, role): three planes times pre/pred/keep.
-        std::vector<VkPipeline> seen;
-        for (auto & plane : planes) {
-            const VkPipeline pipes[3] { plane.pre_pipeline, plane.pred_pipeline,
-                                        plane.keep_pipeline };
-            for (VkPipeline p : pipes) {
-                if (!p ||
-                    std::find(seen.begin(), seen.end(), p) != seen.end()) {
-                    continue;
-                }
-                seen.push_back(p);
-                gpu->vk->vkDestroyPipeline(dev, p, nullptr);
-            }
+        std::vector<VkPipeline> pipes_all;
+        pipes_all.reserve(planes.size() * 3);
+        for (const auto & plane : planes) {
+            pipes_all.push_back(plane.pre_pipeline);
+            pipes_all.push_back(plane.pred_pipeline);
+            pipes_all.push_back(plane.keep_pipeline);
         }
+        vsfeel_destroy_pipelines(*gpu, pipes_all);
         if (pipeline_layout) {
             gpu->vk->vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
         }
@@ -963,39 +958,19 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
     d->field =
         vsh::int64ToIntS(vsapi->mapGetIntSaturated(in, "field", 0, nullptr));
     if (d->field < 0 || d->field > 3) {
-        return set_error("field must be 0, 1, 2, or 3.");
+        return set_error("\"field\" must be 0, 1, 2, or 3.");
     }
     d->dh = !!vsapi->mapGetInt(in, "dh", 0, &error);
     if (d->dh && d->field > 1) {
-        return set_error("field must be 0 or 1 when dh is true.");
+        return set_error("\"field\" must be 0 or 1 when \"dh\" is true.");
     }
 
+    const auto plane_mask = vsfeel_parse_planes(in, vsapi, fmt.numPlanes);
+    if (std::holds_alternative<std::string>(plane_mask)) {
+        return set_error(std::get<std::string>(plane_mask));
+    }
     for (int i = 0; i < 3; ++i) {
-        d->process[i] = true;
-    }
-    const int num_plane_args = vsapi->mapNumElements(in, "planes");
-    if (num_plane_args > 0) {
-        for (int i = 0; i < 3; ++i) {
-            d->process[i] = false;
-        }
-        for (int i = 0; i < num_plane_args; ++i) {
-            const int p = vsh::int64ToIntS(
-                vsapi->mapGetIntSaturated(in, "planes", i, nullptr));
-            if (p < 0 || p >= fmt.numPlanes) {
-                return set_error("plane index out of range.");
-            }
-            if (d->process[p]) {
-                return set_error("plane specified twice.");
-            }
-            d->process[p] = true;
-        }
-    }
-    bool any_process = false;
-    for (int p = 0; p < fmt.numPlanes; ++p) {
-        any_process |= d->process[p];
-    }
-    if (!any_process) {
-        return set_error("no planes to process.");
+        d->process[i] = (std::get<uint32_t>(plane_mask) >> i) & 1u;
     }
     if (d->dh) {
         // Every doubled output plane needs both the kept-row writer and the
@@ -1003,7 +978,7 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         for (int p = 0; p < fmt.numPlanes; ++p) {
             if (!d->process[p]) {
                 return set_error(
-                    "dh=True requires every plane to be processed.");
+                    "\"dh\" requires every plane to be processed.");
             }
         }
     }
@@ -1028,19 +1003,19 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         d->pscrn = 2;
     }
     if (nsize_v < 0 || nsize_v > 6) {
-        return set_error("nsize must be between 0 and 6 (inclusive).");
+        return set_error("\"nsize\" must be between 0 and 6 (inclusive).");
     }
     if (nns_v < 0 || nns_v > 4) {
-        return set_error("nns must be between 0 and 4 (inclusive).");
+        return set_error("\"nns\" must be between 0 and 4 (inclusive).");
     }
     if (d->qual < 1 || d->qual > 2) {
-        return set_error("qual must be 1 or 2.");
+        return set_error("\"qual\" must be 1 or 2.");
     }
     if (etype_v < 0 || etype_v > 1) {
-        return set_error("etype must be 0 or 1.");
+        return set_error("\"etype\" must be 0 or 1.");
     }
     if (d->pscrn < 0 || d->pscrn > 4) {
-        return set_error("pscrn must be between 0 and 4 (inclusive).");
+        return set_error("\"pscrn\" must be between 0 and 4 (inclusive).");
     }
     d->use_list = d->pscrn > 0;
 
@@ -1062,13 +1037,15 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         const int64_t in_h = h >> sub_h;
         if (d->dh) {
             if (((2 * h) >> sub_h) != 2 * in_h) {
-                return set_error("output plane height must be even when dh is "
-                                 "true; the input height has to be a multiple "
-                                 "of " +
-                                 std::to_string(1 << sub_h) + ".");
+                return set_error(
+                    "output plane height must be even when \"dh\" is true; the "
+                    "input height has to be a multiple of " +
+                    std::to_string(1 << sub_h) + ".");
             }
         } else if ((in_h & 1) != 0) {
-            return set_error("plane height must be mod 2 when dh is false.");
+            return set_error(
+                "a processed plane's height must be even when \"dh\" is "
+                "false.");
         }
     }
 
@@ -1646,8 +1623,12 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
 
     // GPU-timing probe: only when the queue family can timestamp at all, since
     // a timestamp write where timestampValidBits is 0 can hang the engine.
-    d->gpu_trace_frame = env_int("VSFEEL_NNEDI3_TSTAMP", 100);
-    d->gpu_trace = vsfeel_debug_probe("VSFEEL_NNEDI3_TSTAMP") &&
+    // VSFEEL_NNEDI3_GPUTRACE=<frame>; the former _TSTAMP spelling still works.
+    d->gpu_trace_frame = env_str("VSFEEL_NNEDI3_GPUTRACE")
+                             ? env_int("VSFEEL_NNEDI3_GPUTRACE", 100)
+                             : env_int("VSFEEL_NNEDI3_TSTAMP", 100);
+    d->gpu_trace = vsfeel_debug_probe_alias("VSFEEL_NNEDI3_GPUTRACE",
+                                            "VSFEEL_NNEDI3_TSTAMP") &&
                    vsfeel_probe_timestamps(*d->gpu, "NNEDI3");
     if (d->gpu_trace) {
         VkQueryPoolCreateInfo qp_info {

@@ -293,36 +293,22 @@ struct GPUWNNM {
         gpu_destroy_buffer(*gpu, ring_buf);
         gpu_destroy_buffer(*gpu, est_ring);
         gpu_destroy_buffer(*gpu, src_ring);
-        if (copy_pipe) {
-            gpu->vk->vkDestroyPipeline(dev, copy_pipe, nullptr);
+        std::vector<VkPipeline> pipes { copy_pipe };
+        pipes.reserve(1 + plane.size() * 7);
+        for (const auto & p : plane) {
+            pipes.push_back(p.group_pipe);
+            pipes.push_back(p.gram_pipe);
+            pipes.push_back(p.solve_pipe);
+            pipes.push_back(p.apply_pipe);
+            pipes.push_back(p.finish_pipe);
+            pipes.push_back(p.dist_pipe);
+            pipes.push_back(p.select_pipe);
         }
+        vsfeel_destroy_pipelines(*gpu, pipes);
         if (probe.query) {
             gpu->vk->vkDestroyQueryPool(dev, probe.query, nullptr);
         }
         gpu_destroy_buffer(*gpu, probe.buf);
-        for (auto & p : plane) {
-            if (p.group_pipe) {
-                gpu->vk->vkDestroyPipeline(dev, p.group_pipe, nullptr);
-            }
-            if (p.gram_pipe) {
-                gpu->vk->vkDestroyPipeline(dev, p.gram_pipe, nullptr);
-            }
-            if (p.solve_pipe) {
-                gpu->vk->vkDestroyPipeline(dev, p.solve_pipe, nullptr);
-            }
-            if (p.apply_pipe) {
-                gpu->vk->vkDestroyPipeline(dev, p.apply_pipe, nullptr);
-            }
-            if (p.finish_pipe) {
-                gpu->vk->vkDestroyPipeline(dev, p.finish_pipe, nullptr);
-            }
-            if (p.dist_pipe) {
-                gpu->vk->vkDestroyPipeline(dev, p.dist_pipe, nullptr);
-            }
-            if (p.select_pipe) {
-                gpu->vk->vkDestroyPipeline(dev, p.select_pipe, nullptr);
-            }
-        }
         if (pipeline_layout) {
             gpu->vk->vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
         }
@@ -702,7 +688,7 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                     todo[p].push_back(i);
                 }
             }
-            if (vsfeel_debug_flag("VSFEEL_WNNM")) {
+            if (vsfeel_debug_flag_alias("VSFEEL_WNNM_DEBUG", "VSFEEL_WNNM")) {
                 fprintf(
                     stderr, "[wnnm] n=%d p=%d cached %d of %d folds, todo:", n,
                     p, dpl.folds - static_cast<int>(todo[p].size()), dpl.folds);
@@ -876,7 +862,8 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     }
     // A 2-byte window's clamped positions collapse to one conversion each; the
     // count is the dedup's only observable.
-    if (d->elem_bytes == 2 && vsfeel_debug_flag("VSFEEL_WNNM")) {
+    if (d->elem_bytes == 2 &&
+        vsfeel_debug_flag_alias("VSFEEL_WNNM_DEBUG", "VSFEEL_WNNM")) {
         fprintf(stderr, "[wnnm] n=%d: %zu conversions\n", n, copies.size());
     }
     // The table may land in the host-visible VRAM BAR, whose mapping is
@@ -1363,7 +1350,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     };
 
     if (!vsh::isConstantVideoFormat(d->vi)) {
-        return set_error("only constant format clips are supported");
+        return set_error("only constant format clips are supported.");
     }
     if (d->vi->format.sampleType == stFloat &&
         d->vi->format.bitsPerSample == 32) {
@@ -1379,16 +1366,16 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         d->elem_bytes = 2;
     } else {
         return set_error("only 16 bit integer (u16), 16 bit float (f16) or "
-                         "32 bit float (f32) input supported");
+                         "32 bit float (f32) input supported.");
     }
     if (d->vi->width <= 0 || d->vi->height <= 0) {
-        return set_error("clip must have constant dimensions");
+        return set_error("clip must have constant dimensions.");
     }
     if (d->vi->numFrames <= 0) {
-        return set_error("clip frame count must be known and positive");
+        return set_error("clip frame count must be known and positive.");
     }
     if (d->vi->width > 65535 || d->vi->height > 65535) {
-        return set_error("clip dimensions must not exceed 65535x65535");
+        return set_error("clip dimensions must not exceed 65535x65535.");
     }
 
     int bs = vsh::int64ToIntS(vsapi->mapGetInt(in, "block_size", 0, &error));
@@ -1396,15 +1383,15 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         bs = 8;
     }
     if (bs < 1 || bs > 64) {
-        return set_error("\"block_size\" must be in [1, 64]");
+        return set_error("\"block_size\" must be in [1, 64].");
     }
     int step = vsh::int64ToIntS(vsapi->mapGetInt(in, "block_step", 0, &error));
     if (error) {
         step = bs;
     }
     if (step < 1 || step > bs) {
-        return set_error(
-            "\"block_step\" must be positive and no larger than \"block_size\"");
+        return set_error("\"block_step\" must be positive and no larger than "
+                         "\"block_size\".");
     }
     int gs = vsh::int64ToIntS(vsapi->mapGetInt(in, "group_size", 0, &error));
     if (error) {
@@ -1412,14 +1399,14 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     }
     if (gs < 1 || gs > kMaxList) {
         return set_error("\"group_size\" must be in [1, " +
-                         std::to_string(kMaxList) + "]");
+                         std::to_string(kMaxList) + "].");
     }
     const int m = bs * bs;
     if (std::min(m, gs) > 32) {
         // The LDS eigen workspace is sized by -DQMAX (8/16/32); the reference
         // caps this product at 64.
-        return set_error("min(block_size^2, group_size) must be <= 32 on this "
-                         "GPU implementation");
+        return set_error("min(\"block_size\"^2, \"group_size\") must be <= 32 "
+                         "on this GPU implementation.");
     }
     d->bs = bs;
     d->step = step;
@@ -1432,7 +1419,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     }
     if (bm < 0 || bm > kMaxRange) {
         return set_error("\"bm_range\" must be in [0, " +
-                         std::to_string(kMaxRange) + "]");
+                         std::to_string(kMaxRange) + "].");
     }
     d->bm_range = bm;
 
@@ -1444,7 +1431,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         if (error) {
             radius[i] = (i == 0) ? 0 : radius[i - 1];
         } else if (radius[i] < 0 || radius[i] > kMaxRadius) {
-            return set_error("\"radius\" must be in [0, 15]");
+            return set_error("\"radius\" must be in [0, " +
+                             std::to_string(kMaxRadius) + "].");
         }
     }
 
@@ -1453,7 +1441,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         ps_num = 2;
     }
     if (ps_num < 1 || ps_num > kMaxPsNum) {
-        return set_error("\"ps_num\" must be in [1, 64]");
+        return set_error("\"ps_num\" must be in [1, " +
+                         std::to_string(kMaxPsNum) + "].");
     }
     d->ps_num = ps_num;
 
@@ -1464,7 +1453,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     }
     if (ps_range < 0 || ps_range > kMaxRange) {
         return set_error("\"ps_range\" must be in [0, " +
-                         std::to_string(kMaxRange) + "]");
+                         std::to_string(kMaxRange) + "].");
     }
     d->ps_range = ps_range;
 
@@ -1484,7 +1473,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         if (error) {
             sigma[i] = (i == 0) ? 3.0f : sigma[i - 1];
         } else if (!std::isfinite(sigma[i]) || sigma[i] < 0.0f) {
-            return set_error("\"sigma\" must be finite and non-negative");
+            return set_error("\"sigma\" must be finite and non-negative.");
         }
     }
 
@@ -1494,7 +1483,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         if (!vsh::isSameVideoInfo(rvi, d->vi) ||
             rvi->numFrames != d->vi->numFrames) {
             return set_error("\"rclip\" must be of the same format, dimensions "
-                             "and number of frames as \"clip\"");
+                             "and number of frames as \"clip\".");
         }
     }
 
@@ -1543,7 +1532,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         (!d->gpu->has_subgroup_ops(VK_SUBGROUP_FEATURE_SHUFFLE_BIT) ||
          d->gpu->subgroup_size < 8)) {
         d->split_match = false;
-        if (vsfeel_debug_flag("VSFEEL_WNNM")) {
+        if (vsfeel_debug_flag_alias("VSFEEL_WNNM_DEBUG", "VSFEEL_WNNM")) {
             fprintf(stderr, "[wnnm] no 8-lane subgroup shuffle: using the "
                             "fused kernel\n");
         }
@@ -1597,6 +1586,15 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         // Match records are split by the buffer they live in: the persistent
         // per-centre ring, or the frame's own buffer.
         int64_t ring_match_off = 0, frame_match_off = 0, addr_off = 0;
+        // One probe frame serves every processed plane; only its strides are
+        // read (samples, not bytes: the kernels index an f32 plane).
+        int plane_strides[3] {};
+        if (auto e = vsfeel_probe_strides(vsapi, core, d->vi->format,
+                                          d->vi->width, d->vi->height,
+                                          d->elem_bytes, plane_strides);
+            !e.empty()) {
+            return e;
+        }
         for (int p = 0; p < 3; ++p) {
             WnnmPlane & pl = d->plane[p];
             // The address table is per plane: its own 4*radius+1-entry window,
@@ -1614,7 +1612,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             if (d->bs > pl.width || d->bs > pl.height) {
                 return std::string(
                     "\"block_size\" must not exceed the dimensions "
-                    "of any processed plane");
+                    "of any processed plane.");
             }
             const int temp_c = pl.width - d->bs;
             const int temp_r = pl.height - d->bs;
@@ -1628,7 +1626,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                        "'s block lattice (" + std::to_string(pl.gx) + "x" +
                        std::to_string(pl.gy) + " = " + std::to_string(ng64) +
                        " blocks) exceeds the 32-bit kernel index range; "
-                       "increase block_step or reduce the frame size";
+                       "increase \"block_step\" or reduce the frame size.";
             }
             pl.ng = static_cast<int>(ng64);
             // The select/Gram/solve/apply dispatches are 1D and index only X,
@@ -1680,19 +1678,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                                    std::min(2 * d->bm_range + 1, temp_c + 1);
                 d->dist_stride_max = std::max(d->dist_stride_max, stride);
             }
-            // The probe frame is only read for its strides, so it comes after
-            // the geometry checks that can reject the clip without it.
-            VSFrame * probe = vsapi->newVideoFrame(
-                &d->vi->format, d->vi->width, d->vi->height, nullptr, core);
-            if (probe == nullptr) {
-                return std::string("could not allocate a probe frame");
-            }
-            // Samples, not bytes: the kernels index an f32 plane, and the
-            // conversion ring keeps a 2-byte source's sample stride so its
-            // copy is linear.
-            pl.stride = static_cast<int>(vsapi->getStride(probe, p) /
-                                         size_t(d->elem_bytes));
-            vsapi->freeFrame(probe);
+            pl.stride = plane_strides[p];
             pl.npix = int64_t(pl.stride) * pl.height;
             pl.finish_x = uint32_t((pl.width + kWorkgroup - 1) / kWorkgroup);
 
@@ -1770,8 +1756,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         if (acc_off >= kIndexMax || pmat_off >= kIndexMax ||
             locs_off >= kIndexMax) {
             return std::string("the scratch layout exceeds the 2^31-element "
-                               "index range; lower block_size/group_size or "
-                               "radius");
+                               "index range; lower \"block_size\", "
+                               "\"group_size\" or \"radius\".");
         }
         return std::string();
     };
@@ -2031,7 +2017,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     }
 
     const bool hw_atomics = d->gpu->feat_atomic_float32_add;
-    if (!hw_atomics && vsfeel_debug_flag("VSFEEL_WNNM")) {
+    if (!hw_atomics &&
+        vsfeel_debug_flag_alias("VSFEEL_WNNM_DEBUG", "VSFEEL_WNNM")) {
         fprintf(stderr, "[wnnm] no buffer float atomics: using the CAS "
                         "accumulator\n");
     }
@@ -2084,7 +2071,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         spec.est_base =
             d->est_cache && temporal ? static_cast<int32_t>(pl.est_base) : -1;
 
-        if (vsfeel_debug_flag("VSFEEL_WNNM")) {
+        if (vsfeel_debug_flag_alias("VSFEEL_WNNM_DEBUG", "VSFEEL_WNNM")) {
             fprintf(stderr,
                     "[wnnm] plane %d: %dx%d stride=%d ng=%d grid=%ux%u "
                     "acc_base=%lld pmat_base=%lld addr_base=%d locs=%lld "
@@ -2229,7 +2216,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         }
     }
 
-    if (vsfeel_debug_flag("VSFEEL_WNNM")) {
+    if (vsfeel_debug_flag_alias("VSFEEL_WNNM_DEBUG", "VSFEEL_WNNM")) {
         const char * io = d->io == 2 ? "u16" : (d->io == 1 ? "f16" : "f32");
         fprintf(stderr,
                 "[wnnm] io=%s bs=%d step=%d gs=%d bm=%d radius=%d,%d,%d "
@@ -2269,9 +2256,11 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
 } // namespace
 
 void vsfeel_register_wnnm(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
+    // rclip is the last documented argument, matching the reference and README;
+    // device_id/num_streams are the ignored compatibility pair every filter
+    // carries.
     vspapi->registerFunction("WNNM",
                              "clip:vnode:gpu;"
-                             "rclip:vnode:gpu:opt;"
                              "sigma:float[]:opt;"
                              "block_size:int:opt;"
                              "block_step:int:opt;"
@@ -2282,6 +2271,7 @@ void vsfeel_register_wnnm(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
                              "ps_range:int:opt;"
                              "residual:int:opt;"
                              "adaptive_aggregation:int:opt;"
+                             "rclip:vnode:gpu:opt;"
                              "device_id:int:opt;"
                              "num_streams:int:opt;",
                              "clip:vnode:gpu;", WNNMCreate, nullptr, plugin);

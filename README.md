@@ -57,6 +57,8 @@ core.vsfeel.BM3D(clip clip[,
     int[]   radius=0,               # per-plane temporal search radius in frames, 0..16 (0 = spatial only)
     int[]   ps_num=2,               # motion-predicted candidates seeding each temporal search, 1..8
     int[]   ps_range=4,             # search radius around each predicted candidate, in pixels, 1..8192
+    float   th_mse,                 # matching threshold in 8-bit MSE units; default 400+80*sigma,
+                                    #   200+10*sigma with a ref clip; 0 = reference block only
     bool    chroma=False,           # True = one joint 4:4:4 entry, whose groups come from luma
     int     extractor_exp=0])       # aggregation weight bias, 0..127; 0 = off, >= 3 = reproducible output
 ```
@@ -115,7 +117,8 @@ EEDI3 is an [edge-directed interpolator](https://en.wikipedia.org/wiki/Image_sca
 
 ```python
 core.vsfeel.EEDI3(clip clip, int field[,   # and EEDI3H, same args, horizontal
-    int     dh=False,               # double-height output keeping every source line (no field extracted)
+    int     dh=False,               # double the interpolated axis (height for EEDI3, width for
+                                    #   EEDI3H), keeping every source line
     int[]   planes,                 # planes to process; default: all
     float   alpha=0.2,              # 0..1 (alpha+beta <= 1): weight given to connecting similar
                                     #   neighborhoods. Larger = more lines/edges connected
@@ -127,6 +130,7 @@ core.vsfeel.EEDI3(clip clip, int field[,   # and EEDI3H, same args, horizontal
     int     nrad=2,                 # radius used for neighborhood similarity, 0..3
     int     mdis=20,                # max connection radius, 1..40; larger connects shallower
                                     #   lines, but costs speed and risks artifacts
+    int     hp=0,                   # 1 = also search half-pel connections (slower, usually sharper)
     int     vcheck=2,               # 0..3: strength of the vertical-consistency check
     float   vthresh0=32.0,          # vcheck thresholds; all must be > 0 when vcheck > 0
     float   vthresh1=64.0,

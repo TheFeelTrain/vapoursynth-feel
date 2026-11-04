@@ -754,7 +754,7 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         if (!vsh::isSameVideoInfo(rvi, d->vi) ||
             rvi->numFrames != d->vi->numFrames || rvi->width != d->vi->width ||
             rvi->height != d->vi->height) {
-            return set_error("'rclip' must match the source clip's format, "
+            return set_error("\"rclip\" must match the source clip's format, "
                              "dimensions and frame count.");
         }
     }
@@ -772,7 +772,7 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
     d->elem_bytes = fmt.bytesPerSample;
 
     if (d->vi->numFrames <= 0) {
-        return set_error("clip frame count must be known and positive");
+        return set_error("clip frame count must be known and positive.");
     }
 
     if (d->vi->width <= 0 || d->vi->height <= 0) {
@@ -789,7 +789,7 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         dd = 1;
     }
     if (dd < 0 || dd > 16) {
-        return set_error("d must be 0..16.");
+        return set_error("\"d\" must be 0..16.");
     }
 
     int aa = vsh::int64ToIntS(vsapi->mapGetInt(in, "a", 0, &error));
@@ -797,7 +797,7 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         aa = 2;
     }
     if (aa < 1 || aa > 64) {
-        return set_error("a must be 1..64.");
+        return set_error("\"a\" must be 1..64.");
     }
 
     int ss = vsh::int64ToIntS(vsapi->mapGetInt(in, "s", 0, &error));
@@ -805,7 +805,7 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         ss = 4;
     }
     if (ss < 0 || ss > 8) {
-        return set_error("s must be 0..8.");
+        return set_error("\"s\" must be 0..8.");
     }
 
     d->h_param = static_cast<float>(vsapi->mapGetFloat(in, "h", 0, &error));
@@ -815,7 +815,7 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
     // +Inf would make h2_inv_norm 0 and the filter an unweighted box mean; the
     // reference rejects every non-finite h.
     if (!std::isfinite(d->h_param) || d->h_param <= 0.0f) {
-        return set_error("h must be finite and > 0.");
+        return set_error("\"h\" must be finite and > 0.");
     }
 
     d->wmode = vsh::int64ToIntS(vsapi->mapGetInt(in, "wmode", 0, &error));
@@ -823,7 +823,7 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         d->wmode = 0;
     }
     if (d->wmode < 0 || d->wmode > 3) {
-        return set_error("wmode must be 0..3.");
+        return set_error("\"wmode\" must be 0..3.");
     }
 
     d->wref_param =
@@ -832,7 +832,7 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         d->wref_param = 1.0f;
     }
     if (!std::isfinite(d->wref_param) || d->wref_param < 0.0f) {
-        return set_error("wref must be >= 0.");
+        return set_error("\"wref\" must be >= 0.");
     }
 
     // device_id and num_streams are registered but never read: the core owns
@@ -846,7 +846,7 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
     switch (fmt.colorFamily) {
     case cfGray:
         if (!(iequals(chstr, "Y") || iequals(chstr, "auto"))) {
-            return set_error("'channels' must be 'Y' with Gray.");
+            return set_error("\"channels\" must be 'Y' with Gray.");
         }
         d->ref_mode = REF_LUMA;
         d->channels = 1;
@@ -855,7 +855,7 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
     case cfYUV:
         if (iequals(chstr, "YUV")) {
             if (fmt.subSamplingW != 0 || fmt.subSamplingH != 0) {
-                return set_error("'channels'='YUV' requires 4:4:4.");
+                return set_error("\"channels\"='YUV' requires 4:4:4.");
             }
             d->ref_mode = REF_YUV;
             d->channels = 3;
@@ -869,12 +869,13 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
             d->channels = 2;
             d->plane0 = 1;
         } else {
-            return set_error("'channels' must be 'YUV', 'Y' or 'UV' with YUV.");
+            return set_error("\"channels\" must be 'YUV', 'Y' or 'UV' with "
+                             "YUV.");
         }
         break;
     case cfRGB:
         if (!(iequals(chstr, "RGB") || iequals(chstr, "auto"))) {
-            return set_error("'channels' must be 'RGB' with RGB.");
+            return set_error("\"channels\" must be 'RGB' with RGB.");
         }
         d->ref_mode = REF_RGB;
         d->channels = 3;
@@ -891,7 +892,8 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         (d->ref_mode == REF_CHROMA) ? d->vi->height >> ssh : d->vi->height;
 
     if (2 * aa + 1 > d->width || 2 * aa + 1 > d->height) {
-        return set_error("research window (2*a+1) larger than the frame.");
+        return set_error("\"a\" is too large: the research window (2*a+1) is "
+                         "larger than the frame.");
     }
 
     d->d = dd;
@@ -911,19 +913,15 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
     }
 
     // The plane geometry has to be the one the core's GPU frames carry, because
-    // kernel addressing is STRIDE elements per row. A GPU frame's stride is the
-    // CPU frame's stride, so it is read off a scratch frame here.
-    {
-        VSFrame * probe = vsapi->newVideoFrame(&fmt, d->vi->width,
-                                               d->vi->height, nullptr, core);
-        if (probe == nullptr) {
-            return set_error(
-                "could not allocate a probe frame to read the plane stride");
-        }
-        d->stride = static_cast<int>(vsapi->getStride(probe, d->plane0) /
-                                     d->elem_bytes);
-        vsapi->freeFrame(probe);
+    // kernel addressing is STRIDE elements per row (see vsfeel_probe_strides).
+    int plane_stride[3] {};
+    if (auto e =
+            vsfeel_probe_strides(vsapi, core, fmt, d->vi->width, d->vi->height,
+                                 d->elem_bytes, plane_stride);
+        !e.empty()) {
+        return set_error(e);
     }
+    d->stride = plane_stride[d->plane0];
     d->npix = static_cast<int64_t>(d->stride) * d->height;
     if (auto e = vsfeel_plane_range_error(static_cast<VkDeviceSize>(d->stride),
                                           d->height, d->elem_bytes, *d->gpu,

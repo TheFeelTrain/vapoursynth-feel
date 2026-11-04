@@ -1,7 +1,7 @@
 """Legacy device_id/num_streams arguments are accepted and ignored.
 
-Every filter but Box registers both for script compatibility. They must not
-change the pixels: the core owns the device and sizes the pipeline itself.
+Every filter registers both for script compatibility. They must not change the
+pixels: the core owns the device and sizes the pipeline itself.
 """
 
 import numpy as np
@@ -21,6 +21,7 @@ KWARGS = {
     "EEDI3AA": {"field": 3},
     "NNEDI3": {"field": 1},
     "WNNM": {"sigma": [3.0], "radius": 0},
+    "Box": {"width": 320, "height": 180},
 }
 
 # WNNM/BM3D aggregate with atomics; their last bits can differ between runs.

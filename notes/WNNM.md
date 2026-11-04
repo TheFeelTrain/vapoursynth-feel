@@ -519,8 +519,9 @@ staying a bit-exact copy and the request orders on both.
 
 ## Debug env vars
 
-- `VSFEEL_WNNM=1` - creation banner and per-frame lines (geometry, scratch
-  bases, qmax, estimate path, cached folds, conversions).
+- `VSFEEL_WNNM_DEBUG=1` (formerly `VSFEEL_WNNM=1`) - creation banner and
+  per-frame lines (geometry, scratch bases, qmax, estimate path, cached folds,
+  conversions).
 - `VSFEEL_WNNM_TIMING=1` - per-frame host split (acquire/record/submit).
 - `VSFEEL_WNNM_DUMP=<frame>` - dump each searched centre's selected group
   (errors, positions, temporal slot, kept count, weight) to stderr. Cached
