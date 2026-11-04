@@ -78,6 +78,19 @@ if [ "$#" -eq 0 ]; then
     set -- tests
 fi
 
+# The worker cap and `--dist loadfile` are not advisory: more than 8 workers
+# exhausts the GPU (see AGENTS.md), and a user-supplied -n would appear after
+# the one this script passes, so pytest would win. Reject the override instead
+# of silently running 16 workers; VSFEEL_TEST_WORKERS is the supported knob.
+for arg in "$@"; do
+    case $arg in
+        -n|--numprocesses|--dist|-n[0-9]*|-n=*|--numprocesses=*|--dist=*)
+            printf 'test.sh: -n and --dist are controlled by this script; use VSFEEL_TEST_WORKERS (max 8) to change workers\n' >&2
+            exit 1
+            ;;
+    esac
+done
+
 # A flags-only invocation (`tools/test.sh -q`) must still target `tests`: with
 # no path at all pytest collects from the rootdir, sweeps in the reference/
 # trees, and their test modules share basenames with ours, which makes pytest's

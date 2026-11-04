@@ -153,6 +153,26 @@ def test_shader_limits_stem_survives_windows_globs():
     assert limits.variant_stem("build\\vk_spv\\notes.txt") == "notes.txt"
 
 
+def test_shader_limits_check_fails_on_an_unattributable_module(tmp_path):
+    """--check must fail when a live module has no resolvable host workgroup.
+
+    WNNM's runtime picker is allow-listed because its module and workgroup are
+    both runtime state; anything else unattributable is a gate failure.
+    """
+    limits = _load_module("shader_limits", SHADER_LIMITS)
+    src = tmp_path / "src"
+    src.mkdir()
+    module = MagicMock()
+    module.local_size = (64, 1, 1)
+    module.shared_bytes.return_value = (0, False)
+
+    assert limits.check(str(src), {"unattributed": module}, {"unattributed"}) == 1
+    assert limits.check(str(src), {"wnnm_finish": module}, {"wnnm_finish"}) == 0
+    # A module the generated header does not embed is a removed variant, not a
+    # live one: stale artifacts must not fail the gate.
+    assert limits.check(str(src), {"removed_variant": module}, set()) == 0
+
+
 def test_benchmark_synthetic_scripts_compile_and_eval(monkeypatch):
     """Every ``--synthetic`` vpy the benchmark can emit must compile and run.
 
@@ -527,9 +547,38 @@ def test_ab_env_spec_sets_and_unsets():
     assert bench._parse_ab_env("A=1,,B=2", "--ab-a-env") == [("A", "1"), ("B", "2")]
     # A value may itself contain '=' (split on the first one only).
     assert bench._parse_ab_env("A=b=c", "--ab-a-env") == [("A", "b=c")]
-    for bad in ("VSFEEL_X", "1A=1", "-"):
+    # ... or a comma, when quoted.
+    assert bench._parse_ab_env('A="1,2",B=3', "--ab-a-env") == [("A", "1,2"), ("B", "3")]
+    for bad in ("VSFEEL_X", "1A=1", "-", 'A="unterminated'):
         with pytest.raises(SystemExit):
             bench._parse_ab_env(bad, "--ab-a-env")
+
+
+def test_benchmark_bm3d_radius_none_means_unset(monkeypatch):
+    """The documented literal None must leave radius off the call, not crash."""
+    bench = _load_module("benchmark", BENCHMARK)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["benchmark.py", "--filter", "bm3d", "vsfeel", "--bm3d-args", "radius=None"],
+    )
+    ns = bench.parse_args()
+    bench._apply_filter_args(ns, "bm3d", bench.FILTERS["bm3d"])
+    assert ns.bm3d_radius is None
+    calls = bench._bm3d_build(ns, "clip", bench.FILTERS["bm3d"])
+    assert "radius" not in calls["vsfeel"]
+
+
+def test_test_sh_rejects_a_worker_override():
+    """The 8-worker GPU guard must not be bypassed by a later pytest -n."""
+    proc = subprocess.run(
+        [str(ROOT / "tools" / "test.sh"), "-n", "16", "--collect-only"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode != 0
+    assert "VSFEEL_TEST_WORKERS" in proc.stderr
 
 
 def test_ab_env_applies_and_restores(monkeypatch):

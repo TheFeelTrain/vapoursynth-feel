@@ -34,8 +34,11 @@ then compares:
 A field the host computes from runtime values (bilateral's block, eedi3's row
 width, nlmeans' patch radius) is reported `dependent` and not compared: those are
 the caller's numbers, checked against the device at creation instead. Anything the
-resolver could not attribute is reported `unchecked` with the reason, so a new
-call shape shows up here rather than passing silently.
+resolver could not attribute is reported `unchecked` and fails `--check`, so a new
+call shape cannot pass silently. WNNM's runtime kernel picker is the one
+allow-listed case (`RUNTIME_SELECTED`): its module and workgroup are both chosen
+from runtime state. A `.spv` left behind by a removed variant is not in the
+generated header and is ignored with a note.
 """
 
 import argparse
@@ -256,6 +259,35 @@ WORKGROUP_LITERAL = re.compile(r"GpuWorkgroup\s*\{([^{}]*)\}", re.S)
 CASTS = re.compile(r"static_cast<[^>]*>|\([a-z0-9_]+\)|(?<=[0-9])[uUlL]+\b")
 IDENT = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
 MEMBER = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*->\s*([A-Za-z_][A-Za-z0-9_]*)")
+
+# WNNM picks its kernels and workgroup at runtime (pick_variant), so the
+# module -> call-site edge is a struct field the resolver cannot follow. These
+# are checked for size and reported dependent; every other unattributable module
+# fails --check, so a new call shape cannot hide behind a silent count.
+RUNTIME_SELECTED = frozenset(
+    {
+        "wnnm_copy_f16",
+        "wnnm_copy_u16",
+        "wnnm_dist",
+        "wnnm_finish",
+        "wnnm_finish_f16",
+        "wnnm_finish_u16",
+        "wnnm_group_q8",
+        "wnnm_group_q8_cas",
+        "wnnm_group_q8_mo",
+        "wnnm_group_q8_wg32",
+        "wnnm_group_q8_wg32_cas",
+        "wnnm_group_q16",
+        "wnnm_group_q16_cas",
+        "wnnm_group_q16_wg32",
+        "wnnm_group_q16_wg32_cas",
+        "wnnm_group_q32",
+        "wnnm_group_q32_cas",
+        "wnnm_group_q32_wg32",
+        "wnnm_group_q32_wg32_cas",
+        "wnnm_select",
+    }
+)
 
 
 def strip_comments(text):
@@ -551,10 +583,13 @@ def source_expectations(src_dir):
                 wg = literal
                 if wg_i is not None and wg_i < len(args):
                     # A literal at the call site, a named `constexpr
-                    # GpuWorkgroup`, or something this resolver cannot follow.
+                    # GpuWorkgroup`, a local `const GpuWorkgroup` (wnnm's
+                    # `lanes`/`one`), or something this resolver cannot follow.
                     wg = workgroup_from(args[wg_i], consts)
                     if wg is None:
                         wg = workgroup_from(consts.get(args[wg_i].strip(), ""), consts)
+                    if wg is None:
+                        wg = workgroup_from(decls.get(args[wg_i].strip(), ""), consts)
                 for stem in stems:
                     found.setdefault(stem, []).append((name, wg))
     return found
@@ -576,12 +611,20 @@ def call_sites(text, name):
 def check(src_dir, modules, embedded, verbose=False):
     """Compare every module against the workgroup its host call site declares."""
     expectations = source_expectations(src_dir)
-    bad, unchecked, dependent, checked = [], [], set(), []
+    bad, unchecked, stale, dependent, checked = [], [], [], set(), []
     for stem, module in sorted(modules.items()):
+        # A .spv the generated header does not embed belongs to a variant that
+        # was removed from the CMake table; nothing can select it.
+        if embedded is not None and stem not in embedded:
+            stale.append(stem)
+            continue
         local, (shared, dynamic) = module.local_size, module.shared_bytes()
         sites = expectations.get(stem)
         if not sites:
-            unchecked.append((stem, "not referenced from any src/*.cpp call site"))
+            if stem in RUNTIME_SELECTED:
+                dependent.add(stem)
+            else:
+                unchecked.append((stem, "not referenced from any src/*.cpp call site"))
             continue
         host = None
         for _file, wg in sites:
@@ -589,7 +632,10 @@ def check(src_dir, modules, embedded, verbose=False):
                 host = wg
                 break
         if host is None:
-            dependent.add(stem)
+            if stem in RUNTIME_SELECTED:
+                dependent.add(stem)
+            else:
+                unchecked.append((stem, "call-site workgroup could not be resolved"))
             continue
         hx, hy, hz, hlds = host
         reasons = []
@@ -616,12 +662,16 @@ def check(src_dir, modules, embedded, verbose=False):
     if embedded is not None:
         for stem in sorted(embedded - set(modules)):
             unchecked.append((stem, "embedded, but no .spv in the build directory"))
-        for stem in sorted(set(modules) - embedded):
-            unchecked.append((stem, "built, but not embedded in the header"))
 
     for stem, where, reasons in bad:
         print("%s: %s" % (stem, "; ".join(reasons)), file=sys.stderr)
         print("  first declared in %s" % where, file=sys.stderr)
+    if stale:
+        print(
+            "\nstale (%d, ignored: not in %s):\n  %s"
+            % (len(stale), "the generated header", " ".join(sorted(stale))),
+            file=sys.stderr,
+        )
     if unchecked:
         print("\nunchecked (%d):" % len(unchecked), file=sys.stderr)
         for stem, why in unchecked:
@@ -630,10 +680,11 @@ def check(src_dir, modules, embedded, verbose=False):
         print("\nfully checked (%d):\n  %s" % (len(checked), " ".join(checked)))
         print("\npartly checked (%d):\n  %s" % (len(dependent), " ".join(sorted(dependent))))
     print(
-        "\n%d checked, %d partly checked (host computes a field), %d unchecked, %d MISMATCHED"
-        % (len(checked), len(dependent), len(unchecked), len(bad))
+        "\n%d checked, %d partly checked (host computes a field), %d unchecked, "
+        "%d stale, %d MISMATCHED"
+        % (len(checked), len(dependent), len(unchecked), len(stale), len(bad))
     )
-    return 1 if bad else 0
+    return 1 if (bad or unchecked) else 0
 
 
 def main():

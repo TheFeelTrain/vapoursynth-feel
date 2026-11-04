@@ -83,11 +83,14 @@ case "$(uname -s)" in
     *)      lib_name=libvsfeel.so ;;
 esac
 
-build_lib=$build_dir/$lib_name
-# Multi-config generators (Visual Studio) put the DLL in a per-config subdir
-# instead of the build root.
-if [[ ! -f $build_lib && -f $build_dir/$build_type/$lib_name ]]; then
+# Multi-config generators (Visual Studio) put the DLL in a per-config subdir;
+# single-config generators put it at the build root. Prefer the per-config path
+# when it exists: with a stale root Release library, a `-c Debug` build must
+# install the Debug output, never the old Release one.
+if [[ -f $build_dir/$build_type/$lib_name ]]; then
     build_lib=$build_dir/$build_type/$lib_name
+else
+    build_lib=$build_dir/$lib_name
 fi
 install_subdir=$plugin_dir/vsfeel
 install_lib=$install_subdir/$lib_name
@@ -121,21 +124,46 @@ build_hash=$(hash_file "$build_lib")
 
 mkdir -p "$install_subdir"
 
-# Skip the copy when the plugin directory already holds this exact build, so a
-# second run is a true no-op rather than a needless mtime bump.
-if [[ -f $install_lib ]] && [[ $(hash_file "$install_lib") == "$build_hash" ]]; then
-    echo "==> install: already up to date, copy skipped"
-else
-    cp -f -- "$build_lib" "$install_lib"
-    echo "==> install: copied $build_lib -> $install_lib"
-fi
+# Copy to a unique temp file, verify it, then rename over the target. An
+# interrupt or a bad copy leaves the previous file in place instead of a
+# truncated one, and the rename is atomic.
+tmp_file=
+cleanup() {
+    if [[ -n $tmp_file && -e $tmp_file ]]; then
+        rm -f -- "$tmp_file"
+    fi
+}
+trap cleanup EXIT
+
+install_file() {
+    local src=$1 dst=$2 label=$3
+    local src_hash dst_hash
+    src_hash=$(hash_file "$src")
+    if [[ -f $dst ]] && [[ $(hash_file "$dst") == "$src_hash" ]]; then
+        echo "==> install: $label already up to date, copy skipped"
+        return
+    fi
+    tmp_file=$(mktemp "$(dirname -- "$dst")/.vsfeel-install.XXXXXX") \
+        || die "cannot create a temporary file next to $dst"
+    cp -f -- "$src" "$tmp_file"
+    dst_hash=$(hash_file "$tmp_file")
+    if [[ $src_hash != "$dst_hash" ]]; then
+        die "$label copy does not match its source; left $dst untouched"
+    fi
+    # Flush before the rename so a crash cannot leave the new name pointing at
+    # unwritten data.
+    sync
+    mv -f -- "$tmp_file" "$dst"
+    tmp_file=
+    printf '==> install: copied %s -> %s\n' "$src" "$dst"
+}
+
+install_file "$build_lib" "$install_lib" "plugin library"
 
 manifest_src=$build_dir/vk/manifest.vs
 manifest_dst=$install_subdir/manifest.vs
-if [[ -f $manifest_src ]] && ! cmp -s -- "$manifest_src" "$manifest_dst"; then
-    cp -f -- "$manifest_src" "$manifest_dst"
-    echo "==> install: wrote $manifest_dst"
-fi
+[[ -f $manifest_src ]] || die "build produced no $manifest_src"
+install_file "$manifest_src" "$manifest_dst" "manifest"
 
 install_hash=$(hash_file "$install_lib")
 

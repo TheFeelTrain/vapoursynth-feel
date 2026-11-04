@@ -163,6 +163,11 @@ class CustomHook(BuildHookInterface):
             # find one on PATH (it generates the SPIR-V header at build time).
             "-D",
             f"Python3_EXECUTABLE={sys.executable}",
+            # The wheel tag (linux_x86_64/win_amd64/manylinux) cannot express
+            # an AVX2 floor, so shipped binaries must run on any x86-64 CPU.
+            # Local tools/install.sh builds keep the default (ON).
+            "-D",
+            "VSFEEL_AVX2=OFF",
         ]
         # Passed explicitly rather than left to CMake's env-var pickup: the
         # cached value in a reused build tree would otherwise win, and the tag

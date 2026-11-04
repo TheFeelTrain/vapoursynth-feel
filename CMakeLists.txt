@@ -20,10 +20,19 @@ include(FetchContent)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)   # the plugin is a shared library
 FetchContent_Declare(vulkan_headers
     URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.357.0.tar.gz
-    URL_HASH SHA256=e87dce08116151f6b6d7de6b6faf41498e87e6cf848ff16fa3bd5402190ad4a3)
+    URL_HASH SHA256=e87dce08116151f6b6d7de6b6faf41498e87e6cf848ff16fa3bd5402190ad4a3
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(vulkan_headers)
 
 find_program(VK_GLSLC glslc)
+if(VK_GLSLC)
+    # The compiler version is part of every variant's stamp: a new glslc must
+    # rebuild the modules even when no flag changed.
+    execute_process(COMMAND "${VK_GLSLC}" --version
+        OUTPUT_VARIABLE VK_GLSLC_VERSION
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+endif()
 # Optional: validates each variant's SPIR-V against the environment glslc was
 # given. Not every toolchain that ships glslc ships SPIRV-Tools, so a build
 # without it skips validation instead of failing.
@@ -449,18 +458,21 @@ set(VK_VARIANTS
 # One .spv per table entry. <defs> is a single string so the rule stays one
 # command; it is split back into arguments here.
 #
-# Each rule also DEPENDS on a per-variant flags file holding that variant's
-# glslc arguments. Ninja tracks the command line itself, but the default Unix
-# Makefiles generator does not: without the stamp a -D or a PROBE/MAXW cache
-# change leaves a stale .spv behind and silently ships the old kernel. The file
-# is written with file(GENERATE) (content-hash: only a real flag change touches
-# it, so an unrelated CMakeLists edit does not recompile the shaders).
+# Each rule also DEPENDS on a per-variant command stamp. Ninja tracks the
+# command line itself, but the default Unix Makefiles generator does not:
+# without the stamp a -D, a PROBE/MAXW cache change, a different target env, a
+# new glslc or a changed fixed flag leaves a stale .spv behind and silently
+# ships the old kernel. The stamp holds the complete command (compiler and
+# version, fixed flags, variant flags, source), and is written with
+# file(GENERATE) so only a real command change touches it.
 function(add_spv_variant out source defs)
     separate_arguments(flags UNIX_COMMAND "${defs}")
 
     set(spv "${VK_SPV_DIR}/${out}.spv")
     set(stamp "${VK_SPV_DIR}/${out}.spv.flags")
-    file(GENERATE OUTPUT "${stamp}" CONTENT "${flags}\n")
+    set(command
+        "${VK_GLSLC} ${VK_GLSLC_VERSION} -O -Werror --target-env=${VK_SPV_ENV} -fshader-stage=compute ${flags} -o ${spv} ${source}")
+    file(GENERATE OUTPUT "${stamp}" CONTENT "${command}\n")
 
     # -Werror: every variant is warning-free today, so a glslang warning is a
     # real signal rather than noise to scroll past.
@@ -468,7 +480,7 @@ function(add_spv_variant out source defs)
         OUTPUT "${spv}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${VK_SPV_DIR}"
         COMMAND "${VK_GLSLC}" -O -Werror --target-env=${VK_SPV_ENV} -fshader-stage=compute ${flags} -o "${spv}" "${source}"
-        DEPENDS "${source}" "${stamp}"
+        DEPENDS "${source}" "${stamp}" "${VK_GLSLC}"
         VERBATIM)
     set(VK_SPV_OUTPUTS ${VK_SPV_OUTPUTS} "${spv}" PARENT_SCOPE)
 
@@ -531,15 +543,22 @@ if(VK_SPIRV_VAL)
 else()
     set(VK_SPV_HEADER_DEPS ${VK_SPV_OUTPUTS})
 endif()
+# Removing a variant changes the header's command line (the list shrinks), and
+# Makefiles does not track that: stamp the argument list so the header is
+# regenerated, not left with the removed variant's arrays.
+set(VK_SPV_HEADER "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h")
+set(VK_SPV_HEADER_STAMP "${VK_SPV_HEADER}.args")
+file(GENERATE OUTPUT "${VK_SPV_HEADER_STAMP}" CONTENT "${VK_SPV_OUTPUTS}\n")
 add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
+    OUTPUT "${VK_SPV_HEADER}"
     COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/src/gen_spirv_header.py"
-            --out "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
+            --out "${VK_SPV_HEADER}"
             ${VK_SPV_OUTPUTS}
     DEPENDS ${VK_SPV_HEADER_DEPS}
+            "${VK_SPV_HEADER_STAMP}"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/gen_spirv_header.py"
     VERBATIM)
-set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h" PROPERTIES GENERATED TRUE)
+set_source_files_properties("${VK_SPV_HEADER}" PROPERTIES GENERATED TRUE)
 
 # NNEDI3 weights: link the raw blob straight into the binary so the 13.5 MB
 # never passes through the compiler, and the wheel stays self-contained
@@ -620,14 +639,16 @@ if(WIN32)
     set_target_properties(vsfeel PROPERTIES PREFIX "")
 endif()
 # AVX2 is x86-only, and nothing here uses its intrinsics, so an ARM target
-# builds the portable code instead. On by default because every other processor
-# this builds for is x86-64: an unrecognized CMAKE_SYSTEM_PROCESSOR (MinGW and
-# some generators) must not silently drop the flag from a shipped x86 wheel.
+# builds the portable code instead. On by default for local builds (every other
+# processor this builds for is x86-64, and an unrecognized CMAKE_SYSTEM_PROCESSOR
+# on MinGW must not silently drop the flag); the wheel hook passes this OFF
+# because the wheel tag cannot express an AVX2 requirement.
 string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" VSFEEL_PROCESSOR)
-set(VSFEEL_AVX2 ON)
+option(VSFEEL_AVX2 "Compile the host code with AVX2 (x86-64 only)" ON)
 if(VSFEEL_PROCESSOR MATCHES "^(arm|aarch64)")
     set(VSFEEL_AVX2 OFF)
 endif()
+message(STATUS "AVX2 host code: ${VSFEEL_AVX2}")
 
 if(MSVC)
     # The sources are UTF-8 with non-ASCII punctuation in comments and messages.
@@ -783,8 +804,15 @@ if(_vsfeel_install_dir)
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vk/manifest.vs" DESTINATION "${_vsfeel_install_dir}")
 else()
     # Isolated build environments (pip/pdm-build) can import no vapoursynth
-    # module; stage into <prefix>/lib|bin + <prefix>/ so packaging hooks can
-    # collect the artifacts.
-    install(TARGETS vsfeel LIBRARY RUNTIME)
-    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vk/manifest.vs" DESTINATION .)
+    # module; stage into <prefix>/lib|bin with the manifest beside the library
+    # so packaging hooks can collect the pair.
+    if(WIN32)
+        set(_vsfeel_fallback_dest bin)
+    else()
+        set(_vsfeel_fallback_dest lib)
+    endif()
+    install(TARGETS vsfeel LIBRARY DESTINATION "${_vsfeel_fallback_dest}"
+            RUNTIME DESTINATION "${_vsfeel_fallback_dest}")
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vk/manifest.vs"
+            DESTINATION "${_vsfeel_fallback_dest}")
 endif()

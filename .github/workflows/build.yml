@@ -314,12 +314,14 @@ jobs:
     environment:
       name: pypi
       url: https://pypi.org/project/vapoursynth-feel/
-    needs: [sdist, linux-wheel, macos-wheel, windows-wheel]
-    # Publish whatever was built even when a platform failed or stalled. PyPI
-    # takes the rest on a re-run, and each build job above skips a distribution
-    # it already finds published, so a re-run rebuilds only what is missing.
-    # Without always() one stalled leg publishes nothing at all.
-    if: ${{ always() && startsWith(github.ref, 'refs/tags/') && contains(needs.*.result, 'success') }}
+    needs: [sdist, linux-wheel, macos-wheel, windows-wheel, smoke]
+    # Publish whatever was built even when a platform failed or stalled, but
+    # only after smoke loaded the wheel: a failed smoke means the source builds
+    # a plugin that cannot register, so nothing may ship. PyPI takes the rest on
+    # a re-run, and each build job above skips a distribution it already finds
+    # published, so a re-run rebuilds only what is missing. Without always() one
+    # stalled leg publishes nothing at all.
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/') && contains(needs.*.result, 'success') && needs.smoke.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -363,10 +365,10 @@ jobs:
   release-assets:
     # Separate from the PyPI upload on purpose: the two channels are
     # independent, so whichever one fails, the other still completes.
-    # Same always() reasoning as publish: attach what exists, and a re-run
-    # --clobbers the rest onto the same release.
-    if: ${{ always() && startsWith(github.ref, 'refs/tags/') && contains(needs.*.result, 'success') }}
-    needs: [sdist, linux-wheel, macos-wheel, windows-wheel]
+    # Same always() reasoning as publish, and the same smoke gate: attach what
+    # exists, but only once smoke has loaded the wheel.
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/') && contains(needs.*.result, 'success') && needs.smoke.result == 'success' }}
+    needs: [sdist, linux-wheel, macos-wheel, windows-wheel, smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

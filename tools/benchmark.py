@@ -182,32 +182,25 @@ def make_vpy(
         # chain's own input expression then reduces to an identity.
         clip_expr = f"BestSource(cachepath=None).source({clip!r}, 32)"
         conv = f"clip = {scaled(cache_conv)}\n" if cache_conv else ""
-        # The GPU copy of the cache is whole frames in VRAM, so it gets a byte
-        # budget of its own; both caches then serve the same span.
+        # The cache is whole frames in VRAM by default and in RAM with
+        # --cpu-cache; --gpu-cache-mb bounds whichever holds them, so
+        # --cache-frames cannot pin an unbounded amount of host memory.
         size_lines = (
-            (
-                # Per-plane sizes: a 4:2:0 frame is 1.5 samples per pixel, not
-                # num_planes, so counting every plane at full size halved the
-                # span a subsampled arm pinned (258 frames of 1080p 4:2:0 for a
-                # 6 GiB budget instead of 495) and cut the loop period with it.
-                "_fbytes = sum(\n"
-                "    (clip.width >> (clip.format.subsampling_w if p else 0))\n"
-                "    * (clip.height >> (clip.format.subsampling_h if p else 0))\n"
-                "    for p in range(clip.format.num_planes)\n"
-                ") * clip.format.bytes_per_sample\n"
-                f"_cap = max(1, {gpu_cache_mb} * 1024 * 1024 // _fbytes)\n"
-                f"m = min({cache_frames}, _cap, clip.num_frames)\n"
-            )
-            if (gpu_cache and gpu_cache_mb)
-            else f"m = min({cache_frames}, clip.num_frames)\n"
+            # Per-plane sizes: a 4:2:0 frame is 1.5 samples per pixel, not
+            # num_planes, so counting every plane at full size halved the
+            # span a subsampled arm pinned (258 frames of 1080p 4:2:0 for a
+            # 6 GiB budget instead of 495) and cut the loop period with it.
+            "_fbytes = sum(\n"
+            "    (clip.width >> (clip.format.subsampling_w if p else 0))\n"
+            "    * (clip.height >> (clip.format.subsampling_h if p else 0))\n"
+            "    for p in range(clip.format.num_planes)\n"
+            ") * clip.format.bytes_per_sample\n"
+            f"_cap = max(1, {gpu_cache_mb} * 1024 * 1024 // _fbytes)\n"
+            f"m = min({cache_frames}, _cap, clip.num_frames)\n"
         )
-        # The cap has to be measured on the cached format, so on the default
-        # (device-resident) path the conversion comes first; with --cpu-cache
-        # the order is unchanged.
-        if gpu_cache:
-            head = conv + size_lines
-        else:
-            head = f"m = min({cache_frames}, clip.num_frames)\n" + conv
+        # The cap has to be measured on the cached format, so the conversion
+        # comes first on both cache paths.
+        head = conv + size_lines
         cache_setup = (
             f"{head}"
             "_src_frames = [clip.get_frame(n) for n in range(m)]\n"
@@ -630,13 +623,19 @@ def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
     )
     # vsfeel's radius is per plane; the references take one value for all
     # planes, so only a uniform list has a reference arm to compare against.
-    try:
-        radii = [int(v) for v in str(ns.bm3d_radius).split(",") if v.strip()]
-    except ValueError:
-        sys.exit(f"--bm3d-args radius=[{ns.bm3d_radius}]: expected integers, e.g. [1, 0, 2]")
-    if not radii:
-        sys.exit("--bm3d-args radius=[]: expected one value or [y,u,v]")
-    uniform = len(set(radii)) == 1
+    # A literal None means "unset": leave radius off every call (all plugins
+    # default to 0), rather than feeding str(None) to int().
+    if ns.bm3d_radius is None:
+        radii: list[int] = []
+        uniform = True
+    else:
+        try:
+            radii = [int(v) for v in str(ns.bm3d_radius).split(",") if v.strip()]
+        except ValueError:
+            sys.exit(f"--bm3d-args radius=[{ns.bm3d_radius}]: expected integers, e.g. [1, 0, 2]")
+        if not radii:
+            sys.exit("--bm3d-args radius=[]: expected one value or [y,u,v]")
+        uniform = len(set(radii)) == 1
     requested = getattr(ns, "plugins", None) or []
     if not uniform and (
         any(p in requested for p in ("vszipcl", "bm3dvk", "bm3dvk2"))
@@ -650,12 +649,16 @@ def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
     # th_mse only exists in vsfeel, and a value that accepts every candidate
     # makes its groups as large as the references' fixed eight: the only way to
     # compare the two matchers on the same amount of filtering work.
-    feel = f"{common}, radius=[{ns.bm3d_radius}]"
+    feel = common
+    if ns.bm3d_radius is not None:
+        feel = f"{feel}, radius=[{ns.bm3d_radius}]"
     if ns.bm3d_th_mse is not None:
         feel = f"{feel}, th_mse={ns.bm3d_th_mse}"
     calls = {"vsfeel": f"core.vsfeel.BM3D({clip}, {feel})"}
     if uniform:
-        same = f"{common}, radius={radii[0]}"
+        same = common
+        if ns.bm3d_radius is not None:
+            same = f"{same}, radius={radii[0]}"
         calls.update(
             {
                 "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {same})",
@@ -1436,25 +1439,32 @@ def run_vspipe(
     reader.start()
     spawned = time.monotonic()
     timed_out = False
-    while True:
-        if time.monotonic() - spawned > timeout:
-            timed_out = True
-            _stop_vspipe(proc, force=True)
-            break
-        if reports and reports[-1][0] - reports[0][0] >= seconds:
-            break
-        if proc.poll() is not None and not reader.is_alive():
-            break
-        time.sleep(0.01)
-    if proc.poll() is None or reader.is_alive():
-        _stop_vspipe(proc)
     try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        _stop_vspipe(proc, force=True)
-        proc.wait()
-    reader.join(timeout=10)
-    proc.stderr.close()
+        while True:
+            if time.monotonic() - spawned > timeout:
+                timed_out = True
+                _stop_vspipe(proc, force=True)
+                break
+            if reports and reports[-1][0] - reports[0][0] >= seconds:
+                break
+            if proc.poll() is not None and not reader.is_alive():
+                break
+            time.sleep(0.01)
+        if proc.poll() is None or reader.is_alive():
+            _stop_vspipe(proc)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _stop_vspipe(proc, force=True)
+            proc.wait()
+    finally:
+        # Also runs on Ctrl-C: vspipe is in its own session, so an interrupt of
+        # the harness must kill the GPU run rather than orphan it.
+        if proc.poll() is None:
+            _stop_vspipe(proc, force=True)
+            proc.wait()
+        reader.join(timeout=10)
+        proc.stderr.close()
 
     if timed_out:
         print(f"  [vspipe timed out after {timeout:g}s] {vpy_path.name}", file=sys.stderr)
@@ -2018,9 +2028,33 @@ def _ab_names(ns: argparse.Namespace) -> tuple[str, str]:
 
 
 def _parse_ab_env(spec: str, flag: str) -> list[tuple[str, str | None]]:
-    """Parse ``--ab-a-env``/``--ab-b-env``: ``NAME=value`` sets, ``-NAME`` unsets."""
+    """Parse ``--ab-a-env``/``--ab-b-env``: ``NAME=value`` sets, ``-NAME`` unsets.
+
+    Commas separate items, so a value that contains one must be quoted
+    (``NAME="a,b"``); the quotes are removed here.
+    """
+    items: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    for ch in spec:
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            else:
+                current.append(ch)
+        elif ch in "\"'":
+            quote = ch
+        elif ch == ",":
+            items.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    if quote is not None:
+        sys.exit(f"{flag}: unterminated quote in {spec!r}")
+    items.append("".join(current))
+
     parsed: list[tuple[str, str | None]] = []
-    for raw in spec.split(","):
+    for raw in items:
         item = raw.strip()
         if not item:
             continue
@@ -2230,7 +2264,9 @@ def bench_filter_ab(fname: str, ns: argparse.Namespace) -> None:
                 print(f"  {plugin:10s} {arm_name:10s}  {_fmt_stats(v)}")
             else:
                 print(f"  {plugin:10s} {arm_name:10s}  unavailable / failed")
-        if plugin not in plan.unavailable and not (va and vb):
+        if plugin in plan.unavailable:
+            complete = False
+        elif not (va and vb):
             complete = False
         if va and vb:
             ma = statistics.median(x.fps for x in va)
@@ -2380,8 +2416,9 @@ def parse_args() -> argparse.Namespace:
         "--gpu-cache-mb",
         type=int,
         default=6144,
-        help="VRAM budget for the device-resident cached frames; the cached "
-        "span is capped to what fits, for both caches (default: 6144)",
+        help="cache byte budget: VRAM for the device-resident cached frames, "
+        "RAM with --cpu-cache; the cached span is capped to what fits "
+        "(default: 6144)",
     )
     parser.add_argument(
         "--scale",
@@ -2439,7 +2476,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="SPEC",
         help="comma-separated env overrides for arm A (NAME=value sets, "
-        "-NAME unsets; empty/missing means inherit)",
+        '-NAME unsets; quote a value containing commas, e.g. NAME="a,b"; '
+        "empty/missing means inherit)",
     )
     parser.add_argument(
         "--ab-b-env",
@@ -2547,7 +2585,7 @@ def main() -> None:
     if ns.scale < 1:
         sys.exit(f"--scale must be >= 1, got {ns.scale:g}")
     # Named once: which VapourSynth the numbers came from is part of the result.
-    # print(f"vspipe: {vspipe_binary()}", file=sys.stderr)
+    print(f"vspipe: {vspipe_binary()}", file=sys.stderr)
     if ns.check_fresh:
         check_fresh(ns.vsfeel_so or _default_plugin_so(), ns.build_so)
     ab = _ab_active(ns)

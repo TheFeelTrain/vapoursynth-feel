@@ -231,12 +231,14 @@ runs it. Plugins are described separately in `PLUGINS`.
 - The default clip is `/home/encode/test/jpbd.mkv` (1920x1080, YUV420P8).
 - Set `MANGOHUD=0` for every benchmark run. It does not change results, it just
   suppresses extra messages in the output.
-- By default the run **caches real frames in RAM**: the first `--cache-frames`
-  (default 1000) frames are decoded while vspipe evaluates the script, and the
-  timed window starts at the first output frame, so timing measures filter
-  throughput on real content without the BestSource decode bottleneck
-  (~630 fps). Frames loop for as long as the run needs, so temporal filters see
-  a seam every N frames — fine for throughput, not for output inspection.
+- By default the run **caches real frames in device memory**: the first
+  `--cache-frames` (default 1000) frames are decoded while vspipe evaluates the
+  script and uploaded once to VRAM, so the timed window starts at the first
+  output frame and timing measures filter throughput on real content without
+  the BestSource decode bottleneck (~630 fps). `--cpu-cache` keeps them in RAM
+  instead, and `--gpu-cache-mb` bounds whichever cache holds them. Frames loop
+  for as long as the run needs, so temporal filters see a seam every N frames —
+  fine for throughput, not for output inspection.
 - **Every arm runs for the same wall time** (`--seconds`, default 5): the
   harness stops vspipe once its progress reports span that window and reports
   the frames counted over it, so a 25 fps reference costs no more than a
@@ -308,6 +310,12 @@ fails, the previous `.so` stays installed and the test run silently "passes"
 against a binary that does not contain your change. Build and install with
 `tools/install.sh`, then test as a separate command.
 
+`VSFEEL_AVX2` compiles the host code with `-mavx2` for local builds. Wheel
+builds pass it `OFF`: the generic wheel tag cannot express an AVX2 floor, and
+the flag only auto-vectorises setup/copy code. The host-side cost measured
+below noise (+0.05% on the bilateral synthetic benchmark, 4 repeats, spread
+under 0.5%); the GPU kernels are unaffected either way.
+
 Vulkan headers (`Vulkan-Headers`) are pinned and fetched by `FetchContent` at
 configure time, so no Vulkan SDK is needed to link — only `glslc` from one.
 **Nothing links a Vulkan library**: the R80 GPU API hands the plugin the core's
@@ -343,13 +351,15 @@ entry in that component's `VK_*_VARIANTS` table, and a module/pipeline pair in
 the filter's creation function — nothing else.
 
 Every variant rule also depends on a generated `<out>.spv.flags` stamp holding
-that variant's `glslc` arguments. Ninja would rebuild on a flag-only change by
+the complete `glslc` command (compiler path and version, target environment,
+fixed and variant flags, source). Ninja would rebuild on a command change by
 itself, but the default Makefiles generator does not: without the stamp a
-changed `-D` or `PROBE`/`MAXW` cache value leaves a stale
+changed `-D`, `PROBE`/`MAXW` cache value, target env or compiler leaves a stale
 `.spv` in place and silently ships the old kernel (a stale probe kernel already
 invalidated a round of measurements once). The stamp is written with
 `file(GENERATE)` and content-hashed, so an unrelated `CMakeLists.txt` edit does
-not recompile the shaders. Do not remove it.
+not recompile the shaders. The generated header has its own argument stamp so
+removing a variant regenerates it. Do not remove either.
 
 ### Persistent pipeline cache (makes creation and the test suite fast)
 
@@ -400,9 +410,9 @@ not a defect. Six gates:
 - **tidy** — `clang-tidy` over the compile database (`.clang-tidy`).
 - **cppcheck** — over the same database; the one tool whose version is not
   pinned, so its findings can differ between a developer's box and CI.
-- **ruff** — `ruff check` over `vsfeel/`, `tools/`, `hatch_build.py`,
-  `src/gen_spirv_header.py` and `tests/` (see `[tool.ruff.lint]` in
-  `pyproject.toml` for the curated check set).
+- **ruff** — `ruff check` and `ruff format --check` over `vsfeel/`, `tools/`,
+  `.github/scripts/`, `hatch_build.py`, `src/gen_spirv_header.py` and `tests/`
+  (see `[tool.ruff.lint]` in `pyproject.toml` for the curated check set).
 - **notes** — `tools/notes_check.py` over `notes/*.md`, against
   `notes/AGENTS.md`: the fixed parts and their order, both line budgets, the
   file index, report IDs. It reads no build directory, so it also runs on a

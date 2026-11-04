@@ -21,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A failed upstream frame is reported as an error instead of crashing
 - Cache paths containing Windows separators work, and malformed numeric environment settings fall back to their defaults
 - WNNM rejects frames that are too large for the device and no longer allocates unused memory
+- The `feel_aa` wrapper validates `rfactor` and `pscale`, and uploads a host prefilter once instead of once per reader
 
 ## [v1.3.3] - 2026-11-04
 
