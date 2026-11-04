@@ -598,7 +598,12 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
     }
 
     const int numPlanes = d->vi->format.numPlanes;
-    const VSFrame * src = vsapi->getFrameFilter(sn, d->node, frameCtx);
+    const VSFrame * src =
+        vsfeel_get_frame(vsapi, sn, d->node, frameCtx, "NNEDI3",
+                         "the source frame could not be fetched", d->gpu.get());
+    if (!src) {
+        return nullptr;
+    }
 
     // Output frame: every plane is fresh when all are processed; otherwise the
     // unprocessed planes share the source's, producer pairs and all.
@@ -744,10 +749,18 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
             return fail("source plane " + std::to_string(p) +
                         " is not GPU resident");
         }
+        if (auto e = vsfeel_plane_range_error(sp, *d->gpu, "the source plane");
+            !e.empty()) {
+            return fail(e);
+        }
         VSVulkanPlaneInfo dp {};
         if (d->gpu->api->getGPUPlane(dst, p, &dp)) {
             return fail("output plane " + std::to_string(p) +
                         " is not GPU resident");
+        }
+        if (auto e = vsfeel_plane_range_error(dp, *d->gpu, "the output plane");
+            !e.empty()) {
+            return fail(e);
         }
         const int src_stride =
             static_cast<int>(vsapi->getStride(src, p) / d->elem_bytes);

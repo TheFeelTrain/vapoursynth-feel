@@ -555,10 +555,33 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     std::vector<const VSFrame *> rframes(layers);
     for (int l = 0; l < layers; ++l) {
         const int f = std::clamp(first + l, 0, nf - 1);
-        frames[l] = vsapi->getFrameFilter(f, d->node, frameCtx);
-        rframes[l] = d->ref_node
-                         ? vsapi->getFrameFilter(f, d->ref_node, frameCtx)
-                         : frames[l];
+        frames[l] = vsfeel_get_frame(
+            vsapi, f, d->node, frameCtx, "WNNM",
+            "a temporal source frame could not be fetched", d->gpu.get());
+        if (!frames[l]) {
+            for (int u = 0; u <= l; ++u) {
+                vsapi->freeFrame(frames[u]);
+                if (d->ref_node && u < l) {
+                    vsapi->freeFrame(rframes[u]);
+                }
+            }
+            return nullptr;
+        }
+        if (d->ref_node) {
+            rframes[l] = vsfeel_get_frame(
+                vsapi, f, d->ref_node, frameCtx, "WNNM",
+                "a temporal reference frame could not be fetched",
+                d->gpu.get());
+            if (!rframes[l]) {
+                for (int u = 0; u <= l; ++u) {
+                    vsapi->freeFrame(frames[u]);
+                    vsapi->freeFrame(rframes[u]);
+                }
+                return nullptr;
+            }
+        } else {
+            rframes[l] = frames[l];
+        }
     }
     const VSFrame * center = frames[layers / 2];
 
@@ -870,6 +893,10 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
         if (d->gpu->api->getGPUPlane(dst, p, &dp)) {
             return fail("output plane " + std::to_string(p) +
                         " is not GPU resident");
+        }
+        if (auto e = vsfeel_plane_range_error(dp, *d->gpu, "the output plane");
+            !e.empty()) {
+            return fail(e);
         }
         dst_plane[p] = dp.buffer;
     }

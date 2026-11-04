@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -104,8 +107,13 @@ inline int env_int(const char * env, int default_value) {
         return default_value;
     }
     char * end = nullptr;
+    errno = 0;
     const long parsed = std::strtol(v, &end, 10);
-    return end != v ? static_cast<int>(parsed) : default_value;
+    if (end == v || *end != '\0' || errno == ERANGE || parsed < INT_MIN ||
+        parsed > INT_MAX) {
+        return default_value;
+    }
+    return static_cast<int>(parsed);
 }
 
 inline const char * env_str(const char * env) {
@@ -129,10 +137,10 @@ inline const char * env_str(const char * env) {
 // the instrumentation -- the per-filter frame-path traces (several lines per
 // frame) and the measurement probes (host stage timings, GPU kernel
 // timestamps), which a hang or a stutter needs as much as the trace does.
-// VSFEEL_TRACE is the trace alone (1 = first 50 lines, 2 = every line), and the
-// per-filter names turn on one filter's own diagnostics alone. Probes only
-// observe (a timestamp query, a clock read) but they are not free, so never
-// benchmark a level-2 run.
+// VSFEEL_TRACE is the trace plus the device/capability banner (1 = first 50
+// lines, 2 = every line), and the per-filter names turn on one filter's own
+// diagnostics alone. Probes only observe (a timestamp query, a clock read) but
+// they are not free, so never benchmark a level-2 run.
 
 inline int vsfeel_debug_level() {
     static const int level = [] {
@@ -311,6 +319,21 @@ constexpr VkDeviceSize align32(VkDeviceSize v) {
     return (v + 31) & ~VkDeviceSize(31);
 }
 
+// Fetch a filter dependency frame and turn the core's null on error into the
+// filter's normal error path. Callers still free frames they fetched earlier.
+inline const VSFrame *
+vsfeel_get_frame(const VSAPI * vsapi, int n, VSNode * node,
+                 VSFrameContext * frameCtx, const char * filter,
+                 const char * message, const GPUDevice * device) {
+    const VSFrame * frame = vsapi->getFrameFilter(n, node, frameCtx);
+    if (!frame) {
+        vsfeel_trace_error(filter, n, message, device);
+        vsapi->setFilterError((std::string(filter) + ": " + message).c_str(),
+                              frameCtx);
+    }
+    return frame;
+}
+
 // ---------------------------------------------------------------------------
 // R80 GPU API (VSVulkan4): the device the core owns
 // ---------------------------------------------------------------------------
@@ -459,6 +482,35 @@ struct GPUDevice {
 std::variant<std::shared_ptr<GPUDevice>, std::string>
 get_gpu_device(VSCore * core, const VSAPI * vsapi);
 
+// Core frame planes are bound with VK_WHOLE_SIZE, and the core does not cap
+// their allocation; reject a plane whose buffer exceeds this device's range.
+inline std::string vsfeel_plane_range_error(VkDeviceSize stride, int height,
+                                            int elem_bytes,
+                                            const GPUDevice & gpu,
+                                            const char * what) {
+    const VkDeviceSize bytes =
+        stride * VkDeviceSize(height) * VkDeviceSize(elem_bytes);
+    if (bytes <= gpu.limits.maxStorageBufferRange) {
+        return {};
+    }
+    return std::string(what) + " needs " + std::to_string(bytes) +
+           " bytes, more than this device's maxStorageBufferRange (" +
+           std::to_string(gpu.limits.maxStorageBufferRange) +
+           "); reduce the frame size";
+}
+
+inline std::string vsfeel_plane_range_error(const VSVulkanPlaneInfo & plane,
+                                            const GPUDevice & gpu,
+                                            const char * what) {
+    if (plane.bufferSize <= gpu.limits.maxStorageBufferRange) {
+        return {};
+    }
+    return std::string(what) + " needs " + std::to_string(plane.bufferSize) +
+           " bytes, more than this device's maxStorageBufferRange (" +
+           std::to_string(gpu.limits.maxStorageBufferRange) +
+           "); reduce the frame size";
+}
+
 // GPU-timing probes: a timestamp write where timestampValidBits is 0 can hang
 // the engine, so every probe is gated on this and says so once when skipped.
 inline bool vsfeel_probe_timestamps(const GPUDevice & dev, const char * tag) {
@@ -491,8 +543,9 @@ inline VkDeviceSize vsfeel_vram_limit(const GPUDevice & dev, VSCore * core) {
     // interesting allowance overflows an int.
     if (const char * v = env_str("VSFEEL_LIMIT_VRAM_BUDGET")) {
         char * end = nullptr;
+        errno = 0;
         const long long parsed = std::strtoll(v, &end, 10);
-        if (end != v && parsed > 0) {
+        if (end != v && *end == '\0' && errno != ERANGE && parsed > 0) {
             limit = known ? std::min(limit, static_cast<VkDeviceSize>(parsed))
                           : static_cast<VkDeviceSize>(parsed);
         }
@@ -600,10 +653,12 @@ inline void gpu_destroy_buffer(const GPUDevice & g, GpuBuffer & b) {
 inline void gpu_push_buffers_at(const GPUDevice & g, VkCommandBuffer cmd,
                                 VkPipelineLayout layout, uint32_t first,
                                 const VkBuffer * buffers, uint32_t count) {
-    // The arrays are fixed at GPU_MAX_BINDINGS; a call site that binds more would
-    // write past them, so clamp rather than trust the caller.
-    count =
-        std::min(count, GPU_MAX_BINDINGS - std::min(first, GPU_MAX_BINDINGS));
+    // The arrays are fixed at GPU_MAX_BINDINGS. No caller exceeds it today;
+    // fail loudly in debug builds rather than silently dropping a binding.
+    if (first >= GPU_MAX_BINDINGS || count > GPU_MAX_BINDINGS - first) {
+        assert(false && "push descriptor binding exceeds GPU_MAX_BINDINGS");
+        count = first < GPU_MAX_BINDINGS ? GPU_MAX_BINDINGS - first : 0;
+    }
     VkDescriptorBufferInfo infos[GPU_MAX_BINDINGS] {};
     VkWriteDescriptorSet writes[GPU_MAX_BINDINGS] {};
     for (uint32_t i = 0; i < count; ++i) {
@@ -631,7 +686,10 @@ inline void gpu_push_buffers(const GPUDevice & g, VkCommandBuffer cmd,
 inline void gpu_push_buffer_array(const GPUDevice & g, VkCommandBuffer cmd,
                                   VkPipelineLayout layout, uint32_t binding,
                                   const VkBuffer * buffers, uint32_t count) {
-    count = std::min(count, GPU_MAX_BINDINGS);
+    if (count > GPU_MAX_BINDINGS) {
+        assert(false && "descriptor array exceeds GPU_MAX_BINDINGS");
+        count = GPU_MAX_BINDINGS;
+    }
     VkDescriptorBufferInfo infos[GPU_MAX_BINDINGS] {};
     for (uint32_t i = 0; i < count; ++i) {
         infos[i].buffer = buffers[i];
@@ -689,11 +747,16 @@ inline void gpu_barrier(const GPUDevice & g, VkCommandBuffer cmd) {
 inline std::variant<VkDescriptorSetLayout, std::string>
 gpu_push_set_layout(const GPUDevice & g, const uint32_t * counts,
                     uint32_t bindings) {
+    if (bindings > GPU_MAX_BINDINGS) {
+        return "a pipeline needs more than " +
+               std::to_string(GPU_MAX_BINDINGS) +
+               " buffer bindings, which this build does not support";
+    }
     uint64_t descriptors = 0;
     for (uint32_t i = 0; i < bindings; ++i) {
         descriptors += counts[i];
     }
-    if (descriptors > g.max_push_descriptors || bindings > GPU_MAX_BINDINGS) {
+    if (descriptors > g.max_push_descriptors) {
         return "a pipeline needs " + std::to_string(descriptors) +
                " push descriptors, more than the " +
                std::to_string(
@@ -722,8 +785,13 @@ gpu_push_set_layout(const GPUDevice & g, const uint32_t * counts,
 
 inline std::variant<VkDescriptorSetLayout, std::string>
 gpu_push_set_layout(const GPUDevice & g, uint32_t bindings) {
+    if (bindings > GPU_MAX_BINDINGS) {
+        return "a pipeline needs more than " +
+               std::to_string(GPU_MAX_BINDINGS) +
+               " buffer bindings, which this build does not support";
+    }
     uint32_t counts[GPU_MAX_BINDINGS] {};
-    for (uint32_t i = 0; i < std::min(bindings, GPU_MAX_BINDINGS); ++i) {
+    for (uint32_t i = 0; i < bindings; ++i) {
         counts[i] = 1;
     }
     return gpu_push_set_layout(g, counts, bindings);

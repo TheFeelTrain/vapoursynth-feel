@@ -25,6 +25,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - DFTTest f32 padding no longer rounds twice
 - DFTTest rejects negative `slocation` sigmas and duplicate locations
 - NLMeans' u16 conversion uses the reference's divide and round-to-nearest-even
+- A failed upstream frame now reports a filter error instead of crashing the process
+- `VSFEEL_PIPELINE_CACHE` paths with Windows separators are created and saved correctly
+- Malformed or out-of-range numeric environment settings fall back to their defaults
 - NNEDI3's rejected-pixel compaction no longer relies on a driver-specific subgroup leader
 - WNNM rejects block lattices whose select or estimate dispatch exceeds the device's workgroup-count limit
 - WNNM no longer allocates an unused search-location buffer for spatial-only processing

@@ -144,13 +144,13 @@ pipeline_cache_path_for(const VkPhysicalDeviceProperties & props) {
 }
 
 // config.h holds the hatch-vcs version ("1.2.3", "0.1.dev117+gad916b3" or
-// "unknown"). Numeric version fields take its leading major.minor.patch; a
-// string without leading digits leaves them all zero.
-static std::array<uint32_t, 3> version_components() {
-    std::array<uint32_t, 3> parts { 0, 0, 0 };
+// "unknown"). VS_MAKE_VERSION only has major/minor fields, so parse those two;
+// a string without leading digits leaves them zero.
+static std::array<uint32_t, 2> version_components() {
+    std::array<uint32_t, 2> parts { 0, 0 };
     // The version string is ours; a component that does not parse stays zero.
     // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion)
-    std::sscanf(VSFEEL_VERSION, "%u.%u.%u", &parts[0], &parts[1], &parts[2]);
+    std::sscanf(VSFEEL_VERSION, "%u.%u", &parts[0], &parts[1]);
     return parts;
 }
 
@@ -188,10 +188,10 @@ static bool device_extension_present(const VSVulkanFunctions * vk,
     return false;
 }
 
-// Same file layout and best-effort policy as the legacy path, but written
-// through the core's dispatch table. The VkPipelineCache object is the plugin's
-// own: the GPU API exposes no cache of the core's, and compiling from SPIR-V is
-// seconds per spec-constant variant on RADV.
+// Same file layout and best-effort policy as the cache's on-disk format, but
+// written through the core's dispatch table. The VkPipelineCache object is the
+// plugin's own: the GPU API exposes no cache of the core's, and compiling from
+// SPIR-V is seconds per spec-constant variant on RADV.
 static void load_gpu_pipeline_cache(GPUDevice & dev,
                                     const VkPhysicalDeviceProperties & props) {
     dev.pipeline_cache_path = pipeline_cache_path_for(props);
@@ -285,11 +285,10 @@ static void save_gpu_pipeline_cache(GPUDevice & dev) {
         }
         data.resize(size);
 
-        if (const size_t slash = dev.pipeline_cache_path.find_last_of('/');
-            slash != std::string::npos) {
+        const std::filesystem::path cache_path(dev.pipeline_cache_path);
+        if (cache_path.has_parent_path()) {
             std::error_code ec;
-            std::filesystem::create_directories(
-                dev.pipeline_cache_path.substr(0, slash), ec);
+            std::filesystem::create_directories(cache_path.parent_path(), ec);
         }
 
         const std::string tmp_path =
@@ -302,9 +301,14 @@ static void save_gpu_pipeline_cache(GPUDevice & dev) {
         if (f == nullptr) {
             return;
         }
-        const bool written =
+        bool written =
             std::fwrite(data.data(), 1, data.size(), f) == data.size();
-        std::fclose(f);
+        if (written && std::fflush(f) != 0) {
+            written = false;
+        }
+        if (std::fclose(f) != 0) {
+            written = false;
+        }
         if (!written) {
             std::remove(tmp_path.c_str());
             return;

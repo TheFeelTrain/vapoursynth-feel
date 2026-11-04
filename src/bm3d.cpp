@@ -1346,6 +1346,11 @@ static void record_center_cmd(BM3DData * d, VkCommandBuffer cmd, int m,
                                          " plane " + std::to_string(plane) +
                                          " is not GPU resident");
             }
+            if (auto e =
+                    vsfeel_plane_range_error(info, *d->gpu, "the source plane");
+                !e.empty()) {
+                throw std::runtime_error(e);
+            }
             w.source[plane] = info.buffer;
             w.src_range[plane] =
                 bm3d_range(d->vi->format, plane,
@@ -1513,6 +1518,12 @@ static VSFrame * normalize_cmd(BM3DData * d, VkCommandBuffer cmd, int f,
         if (d->gpu->api->getGPUPlane(dst, plane, &info)) {
             vsapi->freeFrame(dst);
             throw std::runtime_error("the output frame is not GPU resident");
+        }
+        if (auto e =
+                vsfeel_plane_range_error(info, *d->gpu, "the output plane");
+            !e.empty()) {
+            vsapi->freeFrame(dst);
+            throw std::runtime_error(e);
         }
         dst_planes[plane] = info.buffer;
     }

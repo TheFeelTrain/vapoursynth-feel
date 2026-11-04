@@ -285,9 +285,30 @@ static const VSFrame * nlmeans_gpu_frame(NLMeansData * d, int n,
     std::vector<const VSFrame *> rframes(d->has_ref ? L : 0);
     for (int l = 0; l < L; ++l) {
         const int idx = std::clamp(n - d->d + l, 0, nf - 1);
-        frames[l] = vsapi->getFrameFilter(idx, d->node, frameCtx);
+        frames[l] = vsfeel_get_frame(
+            vsapi, idx, d->node, frameCtx, "NLMeans",
+            "a temporal source frame could not be fetched", d->gpu.get());
+        if (!frames[l]) {
+            for (int u = 0; u <= l; ++u) {
+                vsapi->freeFrame(frames[u]);
+                if (d->has_ref) {
+                    vsapi->freeFrame(rframes[u]);
+                }
+            }
+            return nullptr;
+        }
         if (d->has_ref) {
-            rframes[l] = vsapi->getFrameFilter(idx, d->ref_node, frameCtx);
+            rframes[l] = vsfeel_get_frame(
+                vsapi, idx, d->ref_node, frameCtx, "NLMeans",
+                "a temporal reference frame could not be fetched",
+                d->gpu.get());
+            if (!rframes[l]) {
+                for (int u = 0; u <= l; ++u) {
+                    vsapi->freeFrame(frames[u]);
+                    vsapi->freeFrame(rframes[u]);
+                }
+                return nullptr;
+            }
         }
     }
     const VSFrame * center = frames[d->d];
@@ -904,6 +925,12 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         vsapi->freeFrame(probe);
     }
     d->npix = static_cast<int64_t>(d->stride) * d->height;
+    if (auto e = vsfeel_plane_range_error(static_cast<VkDeviceSize>(d->stride),
+                                          d->height, d->elem_bytes, *d->gpu,
+                                          "plane 0");
+        !e.empty()) {
+        return set_error(e);
+    }
 
     // Zero-padded temporal window geometry. PAD = a makes every OOB candidate
     // read land in the zero margin, which is the reference's zero border.

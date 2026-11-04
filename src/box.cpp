@@ -227,7 +227,12 @@ static const VSFrame * box_gpu_frame(BoxData * d, int n,
                                      const VSAPI * vsapi) {
 
     const int numPlanes = d->out_vi.format.numPlanes;
-    const VSFrame * src = vsapi->getFrameFilter(n, d->node, frameCtx);
+    const VSFrame * src =
+        vsfeel_get_frame(vsapi, n, d->node, frameCtx, "Box",
+                         "the source frame could not be fetched", d->gpu.get());
+    if (!src) {
+        return nullptr;
+    }
 
     VSFrame * dst = d->gpu->api->newGPUVideoFrame(
         &d->out_vi.format, d->out_vi.width, d->out_vi.height, src, core);
@@ -459,6 +464,14 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         for (int p = 0; p < fmt.numPlanes; ++p) {
             src_stride[p] =
                 static_cast<int>(vsapi->getStride(probe, p) / d->elem_bytes);
+            const int h = p == 0 ? d->vi->height : d->vi->height >> subH;
+            if (auto e = vsfeel_plane_range_error(
+                    static_cast<VkDeviceSize>(src_stride[p]), h, d->elem_bytes,
+                    *d->gpu, ("input plane " + std::to_string(p)).c_str());
+                !e.empty()) {
+                vsapi->freeFrame(probe);
+                return set_error(e);
+            }
         }
         vsapi->freeFrame(probe);
     }
@@ -472,6 +485,14 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         for (int p = 0; p < fmt.numPlanes; ++p) {
             dst_stride[p] =
                 static_cast<int>(vsapi->getStride(probe, p) / d->elem_bytes);
+            const int h = p == 0 ? out_h : out_h >> subH;
+            if (auto e = vsfeel_plane_range_error(
+                    static_cast<VkDeviceSize>(dst_stride[p]), h, d->elem_bytes,
+                    *d->gpu, ("output plane " + std::to_string(p)).c_str());
+                !e.empty()) {
+                vsapi->freeFrame(probe);
+                return set_error(e);
+            }
         }
         vsapi->freeFrame(probe);
     }

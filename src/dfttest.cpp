@@ -796,7 +796,15 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
     std::array<const VSFrame *, 7> src {};
     for (int t = 0; t < tw; ++t) {
         const int idx = std::clamp(n - d->radius + t, 0, d->vi->numFrames - 1);
-        src[t] = vsapi->getFrameFilter(idx, d->node, frameCtx);
+        src[t] = vsfeel_get_frame(
+            vsapi, idx, d->node, frameCtx, "DFTTest",
+            "a temporal source frame could not be fetched", d->gpu.get());
+        if (!src[t]) {
+            for (int u = 0; u < t; ++u) {
+                vsapi->freeFrame(src[u]);
+            }
+            return nullptr;
+        }
     }
     const VSFrame * center = src[d->radius];
 
@@ -904,6 +912,11 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
             return fail("output plane " + std::to_string(plane) +
                         " is not GPU resident");
         }
+        if (auto e = vsfeel_plane_range_error(dst_plane, *d->gpu,
+                                              "the output plane");
+            !e.empty()) {
+            return fail(e);
+        }
         const int dst_stride =
             static_cast<int>(vsapi->getStride(dst, plane) / d->elem_bytes);
         if (!dft_offsets_fit(cfg, dst_stride)) {
@@ -933,6 +946,11 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
             if (d->gpu->api->getGPUPlane(src[t], plane, &sp)) {
                 return fail("source plane " + std::to_string(plane) +
                             " is not GPU resident");
+            }
+            if (auto e =
+                    vsfeel_plane_range_error(sp, *d->gpu, "the source plane");
+                !e.empty()) {
+                return fail(e);
             }
             src_buffers[t] = sp.buffer;
             const int src_stride = static_cast<int>(

@@ -210,9 +210,22 @@ static const VSFrame * bilateral_gpu_frame(BilateralData * d, int n,
                                            VSCore * core, const VSAPI * vsapi) {
 
     const int numPlanes = d->vi->format.numPlanes;
-    const VSFrame * src = vsapi->getFrameFilter(n, d->node, frameCtx);
+    const VSFrame * src =
+        vsfeel_get_frame(vsapi, n, d->node, frameCtx, "Bilateral",
+                         "the source frame could not be fetched", d->gpu.get());
+    if (!src) {
+        return nullptr;
+    }
     const VSFrame * ref =
-        d->ref_node ? vsapi->getFrameFilter(n, d->ref_node, frameCtx) : nullptr;
+        d->ref_node
+            ? vsfeel_get_frame(vsapi, n, d->ref_node, frameCtx, "Bilateral",
+                               "the guide frame could not be fetched",
+                               d->gpu.get())
+            : nullptr;
+    if (d->ref_node && !ref) {
+        vsapi->freeFrame(src);
+        return nullptr;
+    }
 
     bool any_process = false, all_process = true;
     bilateral_process_mask(*d, numPlanes, any_process, all_process);
@@ -685,6 +698,12 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         const int plane_width { plane == 0 ? width : width >> ssw };
         const int plane_height { plane == 0 ? height : height >> ssh };
         const int stride = plane_stride[plane];
+        if (auto e = vsfeel_plane_range_error(
+                static_cast<VkDeviceSize>(stride), plane_height, d->elem_bytes,
+                *d->gpu, ("plane " + std::to_string(plane)).c_str());
+            !e.empty()) {
+            return set_error(e);
+        }
 
         // The kernel addresses a plane through signed 32-bit element offsets;
         // reject a plane whose last element would not fit rather than letting it

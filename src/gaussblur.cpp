@@ -310,7 +310,12 @@ static const VSFrame * gauss_gpu_frame(GaussData * d, int n,
                                        const VSAPI * vsapi) {
 
     const int numPlanes = d->vi->format.numPlanes;
-    const VSFrame * src = vsapi->getFrameFilter(n, d->node, frameCtx);
+    const VSFrame * src =
+        vsfeel_get_frame(vsapi, n, d->node, frameCtx, "GaussBlur",
+                         "the source frame could not be fetched", d->gpu.get());
+    if (!src) {
+        return nullptr;
+    }
 
     // Creation guarantees at least one processed plane; unprocessed ones ride
     // along from the source frame, keeping their own producer pairs.
@@ -661,6 +666,15 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
         for (int p = 0; p < fmt.numPlanes; ++p) {
             plane_stride[p] =
                 static_cast<int>(vsapi->getStride(probe, p) / d->elem_bytes);
+            const int h = p == 0 ? d->vi->height : d->vi->height >> subH;
+            if (auto e = vsfeel_plane_range_error(
+                    static_cast<VkDeviceSize>(plane_stride[p]), h,
+                    d->elem_bytes, *d->gpu,
+                    ("plane " + std::to_string(p)).c_str());
+                !e.empty()) {
+                vsapi->freeFrame(probe);
+                return set_error(e);
+            }
         }
         vsapi->freeFrame(probe);
     }
