@@ -69,6 +69,7 @@ from conftest import (
     reference_or_skip,
     right_half_mask,
     source_clip,
+    widen_half as _widen_half,
 )
 
 pytestmark = pytest.mark.usefixtures("clip_grays")
@@ -1381,14 +1382,6 @@ def test_eedi3_creates_the_hpfill_pipeline_only_for_hp():
 # The AA merge is the one place that needs the chain's per-frame half rounding
 # explicitly (see the half_rne comment in src/eedi3.comp); EEDI3/EEDI3H do not.
 
-F16_TOL = 1e-3  # one half step at the unit peak
-
-
-def _widen_half(clip):
-    """The f32 clip carrying ``clip``'s half samples (an exact container
-    change, not an independent depth conversion)."""
-    return vs.core.resize.Point(clip, format=vs.GRAYS)
-
 
 def _half_parity(clip, kwargs, frames=(0, 11, 23)):
     """(worst abs diff, fraction bit-identical) of f16 vs the widened f32 run.
@@ -1431,8 +1424,9 @@ def test_eedi3_f16_is_f32_rounded(clip_grayh, kwargs):
     field = kwargs.get("field", 1)
     frames = (0, 11) if field <= 1 else (0, 5, 2 * clip_grayh.num_frames - 1)
     worst, exact = _half_parity(clip_grayh, dict(kwargs), frames)
-    assert exact == 1.0, f"only {exact:.6f} of samples are the rounded f32 value for {kwargs}"
-    assert worst <= F16_TOL, f"f16 vs f32 diff {worst} for {kwargs}"
+    assert exact == 1.0, (
+        f"only {exact:.6f} of samples are the rounded f32 value for {kwargs} (worst diff {worst})"
+    )
 
 
 def test_eedi3_f16_deterministic(clip_grayh):

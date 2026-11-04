@@ -106,8 +106,8 @@ def _assert_oracle_planes(clip, dtype, frames, compare_planes, tol=0.0, **kwargs
     for n in frames:
         fm, fr = mine.get_frame(n), ref.get_frame(n)
         for p in compare_planes:
-            a = _plane(fm, p, fm.width, fm.height, dtype).astype(np.float64)
-            b = _plane(fr, p, fr.width, fr.height, dtype).astype(np.float64)
+            a = _plane(fm, p, dtype=dtype).astype(np.float64)
+            b = _plane(fr, p, dtype=dtype).astype(np.float64)
             worst = max(worst, float(np.abs(a - b).max()))
     assert worst <= tol, f"oracle mismatch: {worst} > {tol}"
 
@@ -289,8 +289,8 @@ def test_eedi3aa_yuv_all_planes(bits):
         fm = mine.get_frame(n)
         fr = ref.get_frame(n)
         for p in range(3):
-            a = _plane(fm, p, fm.width, fm.height, dtype).astype(np.float64)
-            b = _plane(fr, p, fr.width, fr.height, dtype).astype(np.float64)
+            a = _plane(fm, p, dtype=dtype).astype(np.float64)
+            b = _plane(fr, p, dtype=dtype).astype(np.float64)
             worst = max(worst, float(np.abs(a - b).max()))
     assert worst <= (0.0 if bits == 16 else F32_TOL), worst
 
@@ -306,8 +306,8 @@ def test_eedi3aa_yuv_plane0_only(bits):
         fm = out.get_frame(n)
         fs = clip.get_frame(n)
         for p in (1, 2):
-            a = _plane(fm, p, fm.width, fm.height, dtype)
-            b = _plane(fs, p, fs.width, fs.height, dtype)
+            a = _plane(fm, p, dtype=dtype)
+            b = _plane(fs, p, dtype=dtype)
             assert np.array_equal(a, b), f"chroma plane {p} not passed through"
 
 

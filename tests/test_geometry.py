@@ -44,8 +44,8 @@ CROP_FROM = 640
 #   bilateral  f16 630/638 (gray, with guide, yuv420): one half step (4.88e-4)
 #                                     -> F16_STEP, the same f16 bound as
 #                                     tests/test_bilateral.py
-#   bm3d       f32 630/638 (radius=1): 6.44e-3 -> block-match decision flips
-#                                     on rounding order; 7e-3 bound
+#   bm3d       f32, radius=1, CPU VBasic+VAggregate oracle: 1.3e-3..1.4e-3
+#                                     (block-match tie order); 7e-3 bound
 #   eedi3      u16: bit-exact vs eedi3vk2 (shared surface); f32 ~1 ulp
 #   eedi3h     u16/f32: 0.0 vs the same-plugin transpose oracle
 #   eedi3aa    u16: 0.0; f32: a few ulp of the fused chain (~6e-8 measured)
@@ -71,7 +71,7 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     import json
     import sys
     import vapoursynth as vs
-    from vstools import core
+    core = vs.core
 
     spec = json.loads(sys.argv[1])
     bits = spec["bits"]
@@ -96,10 +96,13 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     # sees a different window at the last frame otherwise.
     if src.num_frames > {CLIP_FRAMES}:
         src = core.std.Trim(src, first=0, length={CLIP_FRAMES})
-    if color == "yuv420":
+    if color in ("yuv420", "yuv422"):
         # subsampled chroma: the chroma planes are half width, so their rows
         # are a different (and typically less aligned) length than luma's
         main = core.fmtc.bitdepth(src, bits=bits, fulls=True, fulld=True)
+        if color == "yuv422":
+            main = core.resize.Point(
+                main, format=vs.YUV422PS if bits == 32 else vs.YUV422P16)
         if half:
             main = core.resize.Point(main, format=vs.YUV420PH)
     else:
@@ -112,7 +115,7 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
                          right=({CROP_FROM} - width - left),
                          top=top, bottom=bottom)
     dtype = np.float16 if half else (np.float32 if bits == 32 else np.uint16)
-    planes = list(range(main.format.num_planes))
+    planes = spec.get("planes") or list(range(main.format.num_planes))
 
     # Guide/reference clip from a different chain (distinct frame allocations).
     guide = None
@@ -138,7 +141,34 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
             return core.vszipcl.Bilateral(main, ref=guide,
                                           **params)
         if filter_ == "bm3d":
-            return core.vszipcl.BM3Dv2(main, **params)
+            # The CPU bm3d plugin is the only oracle test_bm3d accepts: vszipcl's
+            # CUDA matcher answers a different question (see notes/BM3D.md), so
+            # grading this pitch case against it can fail for a matcher reason.
+            sigma = params.get("sigma", 3.0)
+            if not isinstance(sigma, (list, tuple)):
+                sigma = [sigma]
+            cpu = dict(
+                sigma=list(sigma),
+                block_size=8,
+                block_step=params["block_step"],
+                group_size=8,
+                bm_range=params["bm_range"],
+                bm_step=1,
+                matrix=1,
+                th_mse=400.0 + sigma[0] * 80.0,
+            )
+            radius = params.get("radius", 0)
+            if radius > 0:
+                cpu.update(
+                    radius=radius,
+                    ps_num=params.get("ps_num", 2),
+                    ps_range=params["ps_range"],
+                    ps_step=1,
+                )
+                basic = core.bm3d.VBasic(main, **cpu)
+                return core.bm3d.VAggregate(basic, radius=radius,
+                                            sample=vs.FLOAT)
+            return core.bm3d.Basic(main, **cpu)
         if filter_ == "nnedi3":
             return core.nnedi3vk.NNEDI3(main, field=1, **params)
         if filter_ == "nlmeans":
@@ -224,6 +254,10 @@ _BILATERAL_PARAMS = {"sigma_spatial": 3.0, "sigma_color": 0.05}
 _DFTTEST_PARAMS = {"tbsize": 3}
 _GAUSS_PARAMS = {"sigma": 2.0}
 _BM3D_PARAMS = {"sigma": 0.7, "radius": 1, "bm_range": 16, "ps_range": 7, "block_step": 4}
+# The CPU oracle refuses a subsampled clip when chroma is processed, so the
+# YUV420 geometry case grades luma; chroma strides are covered by the other
+# filters' 4:2:0/4:2:2 rows.
+_BM3D_YUV_PARAMS = dict(_BM3D_PARAMS, sigma=[0.7, 0.0])
 # Default pscrn (2) means P=4 pixels/thread, the grouping that under-covered.
 _NNEDI3_PARAMS = {"pscrn": 2}
 # EEDI3 family: the config eedi3vk2 agrees with bit-exactly on u16.
@@ -247,7 +281,20 @@ _CROP_BOTTOM = 3
 CASES = []
 
 
-def _add(filter_, bits, width, guide, params, tol, color="gray", top=0, bottom=0, half=0, left=0):
+def _add(
+    filter_,
+    bits,
+    width,
+    guide,
+    params,
+    tol,
+    color="gray",
+    top=0,
+    bottom=0,
+    half=0,
+    left=0,
+    planes=None,
+):
     spec = {
         "filter": filter_,
         "bits": bits,
@@ -261,6 +308,8 @@ def _add(filter_, bits, width, guide, params, tol, color="gray", top=0, bottom=0
         "bottom": bottom,
         "left": left,
     }
+    if planes is not None:
+        spec["planes"] = list(planes)
     cid = "%s-%s-w%d" % (filter_, "f16" if half else ("f32" if bits == 32 else "u16"), width)
     if guide:
         cid += "-guide"
@@ -327,9 +376,17 @@ for _w in WIDTHS:
     # Half chroma: the 315-sample chroma rows are 630 bytes, the second 2-byte
     # plane width in this matrix.
     _add("bilateral", 16, _w, 0, _BILATERAL_PARAMS, TOL_F16, "yuv420", half=1)
-    # BM3D denoises every plane, so the half-width chroma rows are part of the
-    # graded surface now (they were passed through before).
-    _add("bm3d", 32, _w, 0, _BM3D_PARAMS, TOL_BM3D, "yuv420")
+    # BM3D on the half-width chroma layout: the CPU oracle refuses processed
+    # chroma on a subsampled clip and the unprocessed planes' GPU download path
+    # is not the subject here, so this grades luma only.
+    _add("bm3d", 32, _w, 0, _BM3D_YUV_PARAMS, TOL_BM3D, "yuv420", planes=[0])
+
+# 4:2:2 chroma is half-width and full-height, the one subsampling lattice with
+# no other oracle: a chroma-stride or plane-size bug there would be invisible.
+for _w in WIDTHS:
+    _add("dfttest", 32, _w, 0, _DFTTEST_PARAMS, TOL_F32_ULP, "yuv422")
+    _add("bilateral", 32, _w, 0, _BILATERAL_PARAMS, TOL_F32_ULP, "yuv422")
+    _add("bilateral", 16, _w, 0, _BILATERAL_PARAMS, TOL_U16_LSB, "yuv422")
 
 # Vertical crop: a non-zero row origin and a shorter plane exercise the row
 # staging / pad-origin path that the right-only crop leaves at row 0.

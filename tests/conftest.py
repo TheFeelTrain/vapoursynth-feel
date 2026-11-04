@@ -77,6 +77,28 @@ def dtype_for_bits(bits):
     return np.uint16 if bits == 16 else np.float32
 
 
+def widen_half(clip):
+    """The f32 clip carrying ``clip``'s half samples (an exact container
+    change, not an independent depth conversion)."""
+    return vs.core.resize.Point(clip, format=vs.GRAYS)
+
+
+def transfers(build):
+    """The implicit transfers the core inserted while building this graph.
+
+    The core logs them when the consuming node is *created*, so the handler has
+    to wrap the construction, not the frame pull. Returns the built node and
+    the insertion messages.
+    """
+    messages: list[str] = []
+    handle = vs.core.add_log_handler(lambda level, msg: messages.append(msg))
+    try:
+        node = build()
+    finally:
+        vs.core.remove_log_handler(handle)
+    return node, [m for m in messages if "automatically inserted" in m]
+
+
 def plane_to_ndarray(frame, plane, dtype=np.float32):
     """Copy one *visible* plane of a VapourSynth frame into a fresh ndarray.
 
@@ -99,13 +121,18 @@ def plane_to_ndarray(frame, plane, dtype=np.float32):
 def plane(frame, plane, width=None, height=None, dtype=None):
     """Stride-aware, copying plane read for test call sites.
 
-    The visible geometry is derived from the frame, so ``width``/``height`` are
-    accepted for call-site compatibility and ignored. ``dtype=None`` reads the
-    frame's native sample type (float32 or uint16); pass one explicitly to
-    reinterpret, e.g. ``np.uint16`` for whole-code integer comparisons.
+    The visible geometry is derived from the frame; ``width``/``height``, when
+    given, are asserted against it instead of silently ignored. ``dtype=None``
+    reads the frame's native sample type (float32 or uint16); pass one
+    explicitly to reinterpret, e.g. ``np.uint16`` for whole-code comparisons.
     """
     if dtype is None:
         dtype = format_dtype(frame.format)
+    w, h = _plane_size(frame, plane)
+    if width is not None:
+        assert width == w, f"plane {plane}: width {width} != visible width {w}"
+    if height is not None:
+        assert height == h, f"plane {plane}: height {height} != visible height {h}"
     return plane_to_ndarray(frame, plane, dtype)
 
 
@@ -992,6 +1019,18 @@ def clip_yuv420p16():
 def clip_yuv444p16():
     """YUV444P16 version (for joint 'YUV' processing)."""
     return _resized(vs.YUV444P16)
+
+
+@pytest.fixture(scope="session")
+def clip_yuv422p16():
+    """YUV422P16 version (half-width, full-height chroma)."""
+    return _resized(vs.YUV422P16)
+
+
+@pytest.fixture(scope="session")
+def clip_yuv422ps():
+    """YUV422PS version (half-width, full-height f32 chroma)."""
+    return _resized(vs.YUV422PS)
 
 
 @pytest.fixture(scope="session")

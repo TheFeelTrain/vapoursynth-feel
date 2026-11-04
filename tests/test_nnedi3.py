@@ -30,6 +30,7 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 
 import numpy as np
 import pytest
@@ -48,6 +49,7 @@ from conftest import (
     cpu_node,
     eval_parallel,
     frame_to_ndarray,
+    compare_or_skip,
     plane as _plane,
     reference_compare,
     reference_or_skip,
@@ -90,6 +92,74 @@ def _ref_compare(fmt, frames, params, planes=None, env=None):
     return reference_compare(spec, env=env)
 
 
+# One subprocess for the whole GRAY16 parameter sweep: every case shares the
+# reference clip and the plugin/device initialization instead of paying one
+# creation per parametrized case.
+_SWEEP_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
+    import json
+    import sys
+    import vapoursynth as vs
+
+    core = vs.core
+    cases = json.loads(sys.argv[1])
+    frames = json.loads(sys.argv[2])
+    src = core.bs.VideoSource({CLIP_PATH!r})
+    if src.num_frames > {CLIP_FRAMES}:
+        src = core.std.Trim(src, first=0, length={CLIP_FRAMES})
+    clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
+                              bits=16, fulls=True, fulld=True)
+
+    ref_frames = []
+    try:
+        for case in cases:
+            kwargs = dict(case)
+            kwargs.setdefault("field", 1)
+            node = core.nnedi3vk.NNEDI3(clip, **kwargs)
+            ref_frames.append([[read_plane(node.get_frame(n), 0, np.uint16)
+                                for n in frames]])
+    except Exception as exc:
+        print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
+        raise SystemExit(2)
+    print("REF ok", flush=True)
+
+    results = []
+    try:
+        for case, rframes in zip(cases, ref_frames):
+            kwargs = dict(case)
+            kwargs.setdefault("field", 1)
+            node = core.std.GPUDownload(
+                clip=core.vsfeel.NNEDI3(clip, **kwargs))
+            worst = 0.0
+            for n, rplanes in zip(frames, rframes):
+                a = read_plane(node.get_frame(n), 0, np.uint16)
+                b = rplanes[0]
+                if not (np.isfinite(a.astype(np.float64)).all()
+                        and np.isfinite(b.astype(np.float64)).all()):
+                    print("VSFEEL fail: non-finite at frame %d for %s"
+                          % (n, kwargs), flush=True)
+                    raise SystemExit(3)
+                worst = max(worst, float(np.abs(a.astype(np.float64)
+                                                - b.astype(np.float64)).max()))
+            results.append(worst)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print("VSFEEL fail: %s: %s" % (type(exc).__name__, exc), flush=True)
+        raise SystemExit(3)
+    print("RESULT " + json.dumps(results), flush=True)
+""")
+
+
+def _sweep_max_diffs(cases, frames=(0, 11, 23)) -> list[float]:
+    """Worst diff against nnedi3vk for every case, in one subprocess."""
+    reference_or_skip("nnedi3vk", "NNEDI3")
+    return compare_or_skip(
+        _SWEEP_SCRIPT,
+        [json.dumps(cases), json.dumps(list(frames))],
+        timeout=1200,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reference agreement, GRAY16
 # ---------------------------------------------------------------------------
@@ -121,12 +191,11 @@ REFERENCE_CASES_U16 = [
 ]
 
 
-@pytest.mark.parametrize(
-    "kwargs", REFERENCE_CASES_U16, ids=[str(sorted(k.items())) for k in REFERENCE_CASES_U16]
-)
-def test_nnedi3_matches_reference_u16(clip_gray16, kwargs):
-    payload = _ref_compare("gray16", (0, 11, 23), kwargs)
-    assert payload["maxdiff"] <= 1, kwargs
+def test_nnedi3_matches_reference_u16(clip_gray16):
+    """The full GRAY16 sweep, batched into one reference subprocess."""
+    maxdiffs = _sweep_max_diffs(REFERENCE_CASES_U16)
+    for kwargs, worst in zip(REFERENCE_CASES_U16, maxdiffs):
+        assert worst <= 1, f"gray16 max diff {worst} ({kwargs})"
 
 
 def test_nnedi3_pscrn0_within_1lsb(clip_gray16):

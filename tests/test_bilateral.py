@@ -95,13 +95,13 @@ def test_bilateral_deterministic_f32(clip_grays):
 
 
 def test_bilateral_rejects_8bit(clip_gray8):
-    """Only u16 and f32 input is supported."""
+    """Only u16, f16, and f32 input is supported."""
     with pytest.raises(vs.Error):
         _run(clip_gray8)
 
 
 def test_bilateral_rejects_10bit(clip_gray8):
-    """Formats other than u16 int and f32 must be rejected."""
+    """Formats other than u16 integer, f16, and f32 must be rejected."""
     clip10 = vs.core.fmtc.bitdepth(clip_gray8, bits=10)
     with pytest.raises(vs.Error):
         _run(clip10)
@@ -191,21 +191,21 @@ WIDE_SIGMA_TOL_CODES = 2.0
     ids=["small-sigma", "default-like", "wide-sigma"],
 )
 def test_bilateral_sigma_sweep_matches_reference_u16(clip_gray16, sigma_spatial, sigma_color, tol):
-    """u16 mirror of test_bilateral_sigma_sweep_matches_reference."""
+    """u16 mirror of test_bilateral_sigma_sweep_matches_reference_f32."""
     worst = _compare("gray16", (3, 17), dict(sigma_spatial=sigma_spatial, sigma_color=sigma_color))
     assert worst <= tol, f"max diff {worst} LSB (tol {tol})"
 
 
 @pytest.mark.parametrize("radius", [1, 5])
 def test_bilateral_radius_sweep_matches_reference_u16(clip_gray16, radius):
-    """u16 mirror of test_bilateral_radius_sweep_matches_reference."""
+    """u16 mirror of test_bilateral_radius_sweep_matches_reference_f32."""
     worst = _compare("gray16", (3, 17), dict(sigma_spatial=2.0, sigma_color=0.05, radius=radius))
     assert worst <= 1.0, f"max diff {worst} LSB"
 
 
 @pytest.mark.parametrize("use_shared_memory", [True, False], ids=["shared", "plain"])
 def test_bilateral_shader_variants_match_vszipcl_u16(clip_gray16, use_shared_memory):
-    """u16 mirror of test_bilateral_shader_variants_match_vszipcl."""
+    """u16 mirror of test_bilateral_shader_variants_match_vszipcl_f32."""
     worst = _compare(
         "gray16",
         (0, 23),
@@ -347,7 +347,7 @@ def test_bilateral_deterministic_u16(clip_gray16):
 
 
 def test_bilateral_ref_clip_matches_reference_u16(clip_gray16):
-    """u16 mirror of test_bilateral_ref_clip_matches_reference."""
+    """u16 mirror of test_bilateral_ref_clip_matches_reference_f32."""
     worst = _compare(
         "gray16",
         (0, 11, 23),

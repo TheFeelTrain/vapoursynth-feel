@@ -1055,13 +1055,13 @@ _SEEK_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     import sys
     import threading
     import vapoursynth as vs
-    from vstools import core
+    core = vs.core
 
     core.max_cache_size = 512
     src = core.bs.VideoSource({CLIP_PATH!r})
     gray = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                               bits=32, fulls=True, fulld=True)
-    clip = core.std.Loop(gray, times=4)
+    clip = gray
     kwargs = dict(sigma={SIGMA}, radius=2, bm_range={BM_RANGE},
                   ps_range={PS_RANGE}, block_step={BLOCK_STEP})
 
@@ -1114,9 +1114,9 @@ _SEEK_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 
 
 def test_bm3d_seek_collision_self_consistent():
-    """The 0/64/1/65/2 schedule on a 1200-frame clip (the 300-frame source
-    looped four times) must not deadlock and must match a serial run
-    (measured max diff ~2e-8)."""
+    """The 0/64/1/65/2 schedule must not deadlock and must match a serial run
+    (measured max diff ~2e-8). Every index is under 96, so the 300-frame
+    fixture is long enough and no Loop inflation is needed."""
     try:
         worst = run_compare_subprocess(_SEEK_SCRIPT, [], timeout=300)
     except ReferenceUnavailable as exc:
@@ -1127,7 +1127,8 @@ def test_bm3d_seek_collision_self_consistent():
 
 
 def test_bm3d_frame_request_order_matches_serial():
-    """repeat/reverse/far/random request orders must match the serial run.
+    """forward/reverse/far/interleave/scramble/revisit orders must match the
+    serial run.
 
     The aggregation accumulates with atomicAdd, so the self-consistency floor
     is the ordering rounding of the sums (~3e-8 measured), not exact equality.
@@ -1621,6 +1622,28 @@ RADIUS_CASES = [
 def test_bm3d_matches_cpu_radius(clip_grays, radius, stage, bound, measured):
     """Every supported radius must track the CPU implementation."""
     payload = _cpu_compare(dict(BASE_KWARGS, radius=radius), stage=stage)
+    assert payload["maxdiff"] < bound, f"radius {radius} vs CPU: {payload} (was {measured})"
+
+
+# Radius 8..16 is where the per-slice aggregation window and the cache sizing
+# are widest. Two frames keep the CPU oracle's full-window search affordable;
+# measured on the committed clip at the same parameters as RADIUS_CASES.
+WIDE_RADIUS_CASES = [
+    # (radius, bound, measured)
+    (8, 4e-3, 0.00105),
+    (12, 4e-3, 0.00096),
+    (16, 4e-3, 0.00103),
+]
+
+
+@pytest.mark.parametrize(
+    "radius,bound,measured",
+    WIDE_RADIUS_CASES,
+    ids=[str(c[0]) for c in WIDE_RADIUS_CASES],
+)
+def test_bm3d_matches_cpu_wide_radius(clip_grays, radius, bound, measured):
+    """The wide temporal windows must track the CPU implementation too."""
+    payload = _cpu_compare(dict(BASE_KWARGS, radius=radius), stage="basic", frames=(0, 1))
     assert payload["maxdiff"] < bound, f"radius {radius} vs CPU: {payload} (was {measured})"
 
 

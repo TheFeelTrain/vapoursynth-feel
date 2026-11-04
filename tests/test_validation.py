@@ -38,8 +38,10 @@ FILTERS = [
     "GaussBlur_f16",
     "GaussBlurLarge_f16",
     "DFTTest",
+    "DFTTest_u16",
     "DFTTest_f16",
     "NLMeans",
+    "NLMeans_u16",
     "NLMeans_f16",
     "BM3D",
     "BM3D_u16",
@@ -125,6 +127,10 @@ _SCRIPT = textwrap.dedent(f"""\
         node = core.vsfeel.GaussBlur(gh, sigma=20.0)
     elif name == "DFTTest":
         node = core.vsfeel.DFTTest(gs, tbsize=3)
+    elif name == "DFTTest_u16":
+        # The integer slice layout in the padded plane and the u16 col2im
+        # store: the u16 modules of the same three kernels.
+        node = core.vsfeel.DFTTest(g16, tbsize=3)
     elif name == "DFTTest_f16":
         # The half variants stage float16_t slices in the padded plane and
         # narrow the col2im store: separate SPIR-V modules from the u16 pair,
@@ -132,6 +138,9 @@ _SCRIPT = textwrap.dedent(f"""\
         node = core.vsfeel.DFTTest(gh, tbsize=3)
     elif name == "NLMeans":
         node = core.vsfeel.NLMeans(gs, d=2)
+    elif name == "NLMeans_u16":
+        # The integer compose path and the u16 finish store.
+        node = core.vsfeel.NLMeans(g16, d=2)
     elif name == "NLMeans_f16":
         # Half storage end to end: the compose pass names the core's planes
         # through a float16_t PhysicalStorageBuffer reference (a capability
@@ -275,7 +284,18 @@ def test_validation_layer_smoke(filter_name):
 
 @pytest.mark.parametrize(
     "filter_name,kwargs",
-    [("DFTTest", {}), ("BM3D", {}), ("NNEDI3", {"field": 1})],
+    [
+        ("Bilateral", {}),
+        ("GaussBlur", {}),
+        ("DFTTest", {}),
+        ("NLMeans", {}),
+        ("BM3D", {}),
+        ("EEDI3", {"field": 1}),
+        ("EEDI3H", {"field": 1}),
+        ("EEDI3AA", {"field": 3}),
+        ("NNEDI3", {"field": 1}),
+        ("WNNM", {}),
+    ],
 )
 def test_variable_format_clips_are_rejected(filter_name, kwargs):
     """A variable-format clip has no single format to validate at creation."""
@@ -288,7 +308,7 @@ def test_variable_format_clips_are_rejected(filter_name, kwargs):
         mismatch=1,
     )
     assert clip.format.color_family == vs.UNDEFINED
-    with pytest.raises(vs.Error, match="constant format"):
+    with pytest.raises(vs.Error, match="constant format|bitdepth"):
         getattr(core.vsfeel, filter_name)(clip, **kwargs)
 
 

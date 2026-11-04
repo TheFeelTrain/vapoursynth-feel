@@ -28,12 +28,14 @@ from conftest import (
     HEIGHT,
     assert_preserves_frame_props,
     cpu_node,
+    eval_parallel,
     plane as _plane,
     reference_compare,
     reference_or_skip,
     reference_spec,
     right_half_mask,
     source_clip,
+    widen_half as _widen_half,
 )
 
 pytestmark = pytest.mark.usefixtures("clip_grays")
@@ -304,6 +306,38 @@ def test_eedi3h_determinism(clip_gray16):
     assert np.array_equal(a, b)
 
 
+def test_eedi3h_parallel_load_consistent(clip_gray16):
+    """The parallel request pattern must equal the serial path, and itself.
+
+    The same load test every other filter family carries: stale descriptor
+    bindings, fence misuse and command-pool reuse show up only when several
+    frames are in flight at once. Both paths are deterministic, so the match
+    is exact.
+    """
+    clip = clip_gray16
+    a = eval_parallel(_runh, clip, dtype=np.uint16)
+    b = eval_parallel(_runh, clip, dtype=np.uint16)
+    ref = _runh(clip)
+    for n in range(clip.num_frames):
+        r = _plane(ref.get_frame(n), 0, dtype=np.uint16)
+        assert np.array_equal(a[n], r), f"parallel 1/serial mismatch at frame {n}"
+        assert np.array_equal(b[n], r), f"parallel 2/serial mismatch at frame {n}"
+        assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
+
+
+def test_eedi3h_parallel_load_consistent_f16(clip_grayh):
+    """Half mirror: the 2-byte storage path must survive parallel load too."""
+    clip = clip_grayh
+    a = eval_parallel(_runh, clip, dtype=np.float16)
+    b = eval_parallel(_runh, clip, dtype=np.float16)
+    ref = _runh(clip)
+    for n in range(clip.num_frames):
+        r = _plane(ref.get_frame(n), 0, dtype=np.float16)
+        assert np.array_equal(a[n], r), f"parallel 1/serial mismatch at frame {n}"
+        assert np.array_equal(b[n], r), f"parallel 2/serial mismatch at frame {n}"
+        assert np.array_equal(a[n], b[n]), f"nondeterministic output at frame {n}"
+
+
 def test_eedi3h_yuv_planes(clip_gray16):
     """YUV input works; unprocessed chroma passes through (exact oracle)."""
     src = vs.core.std.ShufflePlanes(clip_gray16, [0, 0, 0], vs.YUV)
@@ -494,10 +528,6 @@ def test_eedi3h_sclip_dh_requires_doubled_width(clip_gray16):
 # values), and the half path is the f32 path rounded once, so the half-specific
 # property to pin is the same one test_eedi3.py pins: the f16 result is the
 # widened-f32 result rounded to half, bit for bit.
-
-
-def _widen_half(clip):
-    return vs.core.resize.Point(clip, format=vs.GRAYS)
 
 
 @pytest.mark.parametrize(

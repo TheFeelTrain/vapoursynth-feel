@@ -380,7 +380,7 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     import json
     import sys
     import vapoursynth as vs
-    from vstools import core
+    core = vs.core
 
     clip_kind = sys.argv[1]
     cases = json.loads(sys.argv[2])
@@ -498,11 +498,16 @@ def test_dfttest_matches_reference_f32(clip_grays):
 GRAY16_CASES = [kwargs for kwargs, _ in REFERENCE_CASES]
 
 
-@pytest.mark.parametrize("kwargs", GRAY16_CASES, ids=lambda kw: str(kw) or "defaults")
-def test_dfttest_matches_reference_u16(clip_gray16, kwargs):
-    """u16 path: at most one code level of rounding difference."""
-    worst = _ref_compare("gray16", kwargs)
-    assert worst <= 1, f"gray16 max diff {worst} ({kwargs})"
+def test_dfttest_matches_reference_u16(clip_gray16):
+    """u16 path: at most one code level of rounding difference.
+
+    All configs share one reference subprocess, so the sweep pays one
+    plugin/device initialization instead of one per parametrized case.
+    """
+    reference_or_skip("vszipcl", "DFTTest")
+    maxdiffs = _reference_max_diffs("gray16", GRAY16_CASES)
+    for kwargs, worst in zip(GRAY16_CASES, maxdiffs):
+        assert worst <= 1, f"gray16 max diff {worst} ({kwargs})"
 
 
 def test_dfttest_sosize_last_stripe_tail_matches_reference():

@@ -19,6 +19,7 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
+    F16_STEP,
     assert_changes_on_clip,
     assert_grays,
     assert_preserves_frame_props,
@@ -212,7 +213,6 @@ NLMEANS_REF_TOL = 1e-5
 # 1.11), so its half ulp doubles. The bound keeps 2x headroom over the worst
 # measurement, matching tests/test_bilateral.py's F16_TOL.
 F16_TOL = 2e-3
-F16_STEP = 4.8828125e-4
 
 REFERENCE_CASES = [
     {},
@@ -794,17 +794,13 @@ def test_parallel_load_deterministic_f16(clip_grayh):
 
 @pytest.mark.parametrize("d", [2, 16])
 def test_frame_request_order_matches_serial(d):
-    """The tile cache must return the same pixels whatever order frames arrive.
-
-    A cached slot keyed and released by frame index instead of a per-request
-    token can be freed while another request still reads it; only an
-    out-of-sequence request pattern makes that observable.
-    """
+    """NLMeans keeps no cross-frame cache, but the request order must not
+    change the pixels once a cache is added: this pins the invariant."""
     assert_temporal_order_consistent("NLMeans", {"d": d}, tol=0.0, timeout=300)
 
 
 def test_frame_request_order_matches_serial_f16():
-    """Half mirror: the window's own element width must not change the cache
+    """Half mirror: the window's own element width must not change the request
     order invariant."""
     assert_temporal_order_consistent("NLMeans", {"d": 2}, tol=0.0, clip="grayh", timeout=300)
 

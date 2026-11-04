@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 import vapoursynth as vs
 
-from conftest import require_optional
+from conftest import require_optional, transfers as _transfers
 
 require_optional("vstools")
 require_optional("vsaa")
@@ -44,21 +44,6 @@ def _plane(node, n=0, dtype=np.float64):
     if node.gpu_resident:
         node = vs.core.std.GPUDownload(clip=node)
     return np.asarray(node.get_frame(n)[0]).astype(dtype).copy()
-
-
-def _transfers(build):
-    """The implicit transfers the core inserted while building this graph.
-
-    The core logs them when the consuming node is *created*, so the handler has
-    to wrap the construction, not the frame pull.
-    """
-    messages: list[str] = []
-    handle = vs.core.add_log_handler(lambda level, msg: messages.append(msg))
-    try:
-        node = build()
-    finally:
-        vs.core.remove_log_handler(handle)
-    return node, [m for m in messages if "automatically inserted" in m]
 
 
 def test_feel_aa_is_resident(clip_grays):

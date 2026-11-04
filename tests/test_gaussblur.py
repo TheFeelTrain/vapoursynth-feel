@@ -161,7 +161,7 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     import sys
     import json
     import vapoursynth as vs
-    from vstools import core
+    core = vs.core
 
     fmt = sys.argv[1]
     sigma = json.loads(sys.argv[2])
@@ -341,20 +341,24 @@ def test_gaussblur_sigma_small_vs_large_consistent_f32(clip_grays):
     plane to the same value."""
     core = vs.core
     flat = core.std.BlankClip(clip_grays, color=[0.5])
-    out = _run(flat, sigma=20.0)  # large path
-    for n in (0,):
-        a = frame_to_ndarray(out.get_frame(n))
-        assert np.abs(a - 0.5).max() < 1e-3, "large path does not preserve a constant plane"
+    for sigma in (2.0, 20.0):  # fused small, two-pass large
+        out = _run(flat, sigma=sigma)
+        a = frame_to_ndarray(out.get_frame(0))
+        assert np.abs(a - 0.5).max() < 1e-3, (
+            f"sigma={sigma} path does not preserve a constant plane"
+        )
 
 
 def test_gaussblur_sigma_small_vs_large_consistent_u16(clip_gray16):
     """u16 mirror of the constant-plane check (both code paths)."""
     core = vs.core
     flat = core.std.BlankClip(clip_gray16, color=[32768])
-    out = _run(flat, sigma=20.0)  # large path
-    for n in (0,):
-        a = _plane(out.get_frame(n), 0, WIDTH, HEIGHT, np.uint16).astype(np.float64)
-        assert np.abs(a - 32768.0).max() < 66.0, "large path does not preserve a constant plane"
+    for sigma in (2.0, 20.0):  # fused small, two-pass large
+        out = _run(flat, sigma=sigma)
+        a = _plane(out.get_frame(0), 0, WIDTH, HEIGHT, np.uint16).astype(np.float64)
+        assert np.abs(a - 32768.0).max() < 66.0, (
+            f"sigma={sigma} path does not preserve a constant plane"
+        )
 
 
 def test_gaussblur_sigma_zero_passthrough_yuv_u16(clip_grays):
@@ -421,10 +425,12 @@ def test_gaussblur_sigma_small_vs_large_consistent_f16(clip_grayh):
     """f16 mirror of the constant-plane check (both code paths)."""
     core = vs.core
     flat = core.std.BlankClip(clip_grayh, color=[0.5])
-    out = _run(flat, sigma=20.0)  # large path
-    for n in (0,):
-        a = _plane(out.get_frame(n), 0, dtype=np.float16).astype(np.float64)
-        assert np.abs(a - 0.5).max() < 1e-3, "large path does not preserve a constant plane"
+    for sigma in (2.0, 20.0):  # fused small, two-pass large
+        out = _run(flat, sigma=sigma)
+        a = _plane(out.get_frame(0), 0, dtype=np.float16).astype(np.float64)
+        assert np.abs(a - 0.5).max() < 1e-3, (
+            f"sigma={sigma} path does not preserve a constant plane"
+        )
 
 
 # --- f16 is a storage width, not a precision -------------------------------
@@ -788,7 +794,7 @@ _NONFINITE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     import json
     import numpy as np
     import vapoursynth as vs
-    from vstools import core
+    core = vs.core
 
     kind, sigma, fmt = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3]
 

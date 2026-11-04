@@ -28,6 +28,7 @@ from conftest import (
     plane_to_ndarray,
     plane as _plane,
     require_optional,
+    transfers as _transfers,
 )
 
 require_optional("vskernels")
@@ -68,8 +69,11 @@ RATIO_ABS = {ratio: abs_bound for ratio, abs_bound, _ in RATIOS}
 COLOR_CASES = [
     ("yuv420p16", 2),
     ("yuv420p16", 4),
+    ("yuv422p16", 2),
+    ("yuv422p16", 4),
     ("yuv420ps", 2),
     ("yuv420ps", 4),
+    ("yuv422ps", 2),
     ("yuv444p16", 2),
     ("yuv444p16", 4),
     ("yuv444p16", 1.5),
@@ -188,21 +192,6 @@ def _worst_f16(clip, width, height, planes):
         out = _pxf(_box(clip, width, height), p)
         worst = max(worst, float(np.abs(ref - out).max()))
     return worst
-
-
-def _transfers(build):
-    """The implicit transfers the core inserted while building this graph.
-
-    The core logs them when the consuming node is *created*, so the handler has
-    to wrap the construction, not the frame pull.
-    """
-    messages: list[str] = []
-    handle = vs.core.add_log_handler(lambda level, msg: messages.append(msg))
-    try:
-        node = build()
-    finally:
-        vs.core.remove_log_handler(handle)
-    return node, [m for m in messages if "automatically inserted" in m]
 
 
 # ---------------------------------------------------------------------------
