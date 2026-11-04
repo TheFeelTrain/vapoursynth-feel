@@ -1282,8 +1282,11 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame * fr,
             // The estimation kernel's atomic accumulation (and the fill that
             // zeroed the slot) must be visible to the normalize reads; the
             // reads are plain loads, so this explicit cross-dispatch barrier is
-            // still required.
-            bm3d_full_barrier(*d->gpu, cmd);
+            // still required. Later planes read their own accumulator and write
+            // their own output plane, disjoint from the first one's.
+            if (first_dispatch) {
+                bm3d_full_barrier(*d->gpu, cmd);
+            }
             if (gputrace && first_dispatch) {
                 d->gpu->vk->vkCmdWriteTimestamp2(
                     cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, d->probe.query,
@@ -1306,8 +1309,9 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame * fr,
 // source window [m-r, m+r] is copied into the ring first (each frame once, as
 // the cursor advances), the accumulator slots the window's frames occupy are
 // zeroed when they are first assigned, and one estimation dispatch per entry
-// scatters the estimates. A full barrier after the dispatch orders the ring
-// reuse of the next centre behind these reads.
+// scatters the estimates. The leading barrier orders the previous centre's
+// reads behind these writes; the first normalize's barrier carries this
+// centre's atomics across.
 static void record_center_cmd(BM3DData * d, VkCommandBuffer cmd, int m,
                               VSFrameContext * frameCtx, const VSAPI * vsapi,
                               int acc_base, int focus, int & converted,
@@ -1462,7 +1466,6 @@ static void record_center_cmd(BM3DData * d, VkCommandBuffer cmd, int m,
             d->profile.end(cmd, filter_timer);
         }
     }
-    bm3d_full_barrier(*d->gpu, cmd);
     converted = lastFrame + 1;
 }
 
@@ -1525,7 +1528,6 @@ static VSFrame * normalize_cmd(BM3DData * d, VkCommandBuffer cmd, int f,
         dst_planes[plane] = info.buffer;
     }
 
-    bm3d_full_barrier(*d->gpu, cmd);
     record_bm3d_agg(d, nullptr, cmd, f, base, isolated, dst_planes, out_range,
                     false);
     return dst;
@@ -1542,6 +1544,9 @@ static VSFrame * record_isolated(BM3DData * d, int n, VSFrameContext * frameCtx,
     const int last = d->nframes - 1;
     const int first = std::max(0, n - r);
     const int top = std::min(last, n + r);
+    if (d->trace) {
+        fprintf(stderr, "[t] n=%d isolated\n", n);
+    }
     std::vector<const VSFrame *> holds;
     VSGPUExecContext * ctx = nullptr;
     char errbuf[512] {};
@@ -1658,14 +1663,43 @@ static const VSFrame * temporalFrame(BM3DData * d, int n,
     // keeps a small out-of-order step from costing a restart. A seek, or a
     // request for a frame the ring has already dropped, restarts.
     constexpr int kMaxJump = 24;
-    const bool wide = req_lo <= c.retired_up_to - 2 * r;
-    const bool narrow_safe = n - c.retired_up_to <= 2 * r;
-    if (n < c.retired_up_to || n - c.retired_up_to > kMaxJump ||
-        !(wide || narrow_safe)) {
+    // What the cursor would have to copy for this request: only source frames
+    // at or above this one are fetched. The arInitial range the request was
+    // given must cover that, or advancing would fetch frames nobody requested.
+    const int copy_from = std::max(c.converted_up_to, c.next_ref - r);
+    const bool sources_ok = copy_from >= req_lo;
+    if (n < c.retired_up_to || n - c.retired_up_to > kMaxJump || !sources_ok) {
         // A seek or a frame the cursor has passed: compute it in its own ring
         // so the main cursor is not disturbed.
         try {
             VSFrame * out = record_isolated(d, n, frameCtx, core, vsapi);
+            // The isolated ring leaves the cursor where it was, so a forward
+            // seek would otherwise pin every later frame to this same
+            // full-window recompute. Re-anchoring skips the frames in between,
+            // which is only free when none of them is still waiting at a
+            // reachable distance: an out-of-order prefetch inside a batch must
+            // keep catching up through the cursor, or each waiting frame
+            // becomes its own one-window recompute. Re-anchor at the first
+            // centre whose window covers the next frame, and forget the
+            // accumulator tags so the next centre zeroes the slots it uses
+            // instead of building on the old ring's contents.
+            bool waiting = false;
+            for (auto it = d->pending.lower_bound(c.retired_up_to);
+                 it != d->pending.end() && *it < n; ++it) {
+                if (*it - c.retired_up_to <= kMaxJump) {
+                    waiting = true;
+                    break;
+                }
+            }
+            if (n >= c.retired_up_to && !waiting) {
+                c.next_ref = std::max(0, n + 1 - r);
+                c.retired_up_to = n + 1;
+                c.converted_up_to = std::max(0, n + 1 - 2 * r);
+                for (int gi = 0; gi < d->n_groups; ++gi) {
+                    std::fill(d->groups[gi].acc_frame.begin(),
+                              d->groups[gi].acc_frame.end(), -1);
+                }
+            }
             const auto [it, inserted] = d->emitted.emplace(n, out);
             if (!inserted) {
                 vsapi->freeFrame(it->second);
@@ -1699,7 +1733,10 @@ static const VSFrame * temporalFrame(BM3DData * d, int n,
                                      std::string(errbuf));
         }
         VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
-        bm3d_full_barrier(*d->gpu, cmd);
+        // No leading barrier: the first centre records one before it writes the
+        // ring, and the first normalize records one before it reads, so the
+        // cross-submission dependency is already carried by the first command
+        // that touches shared state.
         while (c.retired_up_to <= n) {
             const int m = c.next_ref;
             if (m <= last) {

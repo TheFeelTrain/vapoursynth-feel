@@ -1147,6 +1147,57 @@ def test_bm3d_frame_request_order_matches_serial():
     )
 
 
+_SEEK_REANCHOR_SCRIPT = (
+    _SUBPROCESS_PRELUDE
+    + r"""
+import os
+
+# The reference instance must not print a trace: isolate it from any inherited
+# debug setting, then turn the trace on just for the seek instance.
+os.environ.pop("VSFEEL_DEBUG", None)
+os.environ.pop("VSFEEL_BM3D_TRACE", None)
+
+
+def build():
+    raw = core.vsfeel.BM3D(grays(), sigma=0.7, radius=2, bm_range=9,
+                           ps_range=4, block_step=8)
+    return core.std.GPUDownload(clip=raw)
+
+
+# A fresh instance reads the frames in order, so its cursor starts at 40 and
+# never re-anchors: the oracle for what the seek instance must produce.
+ref_node = build()
+ref = {n: frame_to_ndarray(ref_node.get_frame(n)) for n in range(40, 48)}
+
+os.environ["VSFEEL_BM3D_TRACE"] = "1"
+seek_node = build()
+order = list(range(4)) + list(range(40, 48))
+got = {n: frame_to_ndarray(seek_node.get_frame(n)) for n in order}
+worst = max(
+    float(np.abs(got[n].astype(np.float64) - ref[n].astype(np.float64)).max())
+    for n in range(40, 48)
+)
+print("RESULT " + json.dumps(worst))
+"""
+)
+
+
+def test_bm3d_forward_seek_reanchors_the_cursor():
+    """A forward seek past the jump limit must move the cursor with it.
+
+    The seek frame is computed in the private one-window ring; if the cursor
+    stays behind, every later frame is still "too far ahead" and pays the same
+    full-window recompute. Only the seek frame itself may be isolated, and the
+    re-anchored playback must still match a fresh instance's frames.
+    """
+    proc = _run_subprocess_script(_SEEK_REANCHOR_SCRIPT)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    worst = _result_payload(proc.stdout)
+    assert worst < 1e-5, f"seek re-anchor mismatch: {worst}"
+    isolated = [line for line in proc.stderr.splitlines() if "isolated" in line]
+    assert isolated == ["[t] n=40 isolated"], proc.stderr[-2000:]
+
+
 def test_bm3d_per_plane_radius_frame_request_order_matches_serial():
     """A spatial plane beside temporal ones must survive every request order.
 

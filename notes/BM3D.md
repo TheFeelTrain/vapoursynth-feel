@@ -151,10 +151,11 @@ the native type, dropping the caller's `depth()` node (see Performance).
   normalize every frame whose last contributor (`f + r`) is in. The pipeline is
   one command buffer per request, not one submission per centre. A request the
   cursor cannot reach (a seek, or a frame it has passed) is computed in a
-  private one-window ring with `focus` set: only members from the requested
-  frame are scattered, so the main ring keeps its state and the cursor stays
-  monotonic. That is what keeps vspipe's out-of-order prefetch from paying a
-  window restart per jump.
+  private one-window ring with `focus` set, so the main ring keeps its state. A
+  seek that strands no reachable pending frame re-anchors the cursor just behind
+  itself (`next_ref = n+1-r`, cleared accumulator tags) so playback after it is
+  one pass; a reachable pending frame blocks that, which keeps vspipe's
+  out-of-order prefetch catching up through the cursor.
 - The accumulator ring is `2*max_radius+1` slots (capped by the clip length),
   keyed by frame index; a slot is zeroed when first assigned and reused only
   after its frame retired. Every entry uses that floor, so a spatial plane
@@ -182,12 +183,11 @@ the native type, dropping the caller's `depth()` node (see Performance).
   normalizes and the source copies into one command buffer and submits once per
   request; the pool overlaps that with the next request. Radius 0 still records
   one submission per frame (`VSFEEL_BM3D_SPLIT=0` collapses its chunks).
-- Cross-frame handoff inside a request is a full pipeline barrier: the normalize
-  reads the atomics the scatter just wrote, and the next centre's ring copy runs
-  after the previous centre's reads. Across submissions the first barrier covers
-  everything already queued on the one compute queue. Radius 0 uses private
-  slots, so it has no cross-frame wait; the old submitted-ready handoff and its
-  `RINGWAIT` diagnostic are gone.
+- Cross-frame handoff inside a request is a full pipeline barrier: the first
+  normalize's barrier carries the scatter's atomics, and the next centre's
+  leading barrier orders the previous reads behind its ring writes. It is
+  emitted once for the first processed plane (later planes are disjoint), so a
+  request needs no leading barrier of its own; radius 0 uses private slots.
 - R80 GPU API: `clip:vnode:gpu` in and out with `ffGPUOutput`; an unprocessed
   plane is shared from the centre frame and only planes the aggregation writes are
   published. `num_streams` and `device_id` are registered no-ops. The 8-lane
@@ -202,10 +202,18 @@ the native type, dropping the caller's `depth()` node (see Performance).
   `2r+1`-slice stack per centre and re-aggregated it with two atomics per pixel;
   the new one scatters into the target frame, adds the weight once per block and
   normalizes with a box sum. Harness A/B (default, 1000 frames x3): slice 867.7,
-  accumulators 922.9 before the cursor was finished,
-  1022-1028 after the isolated ring removed the restarts (median of five, 2%).
-  Kernel table at 1022 fps: blockMatch+filter 0.86 ms, normalize 0.044, convert
-  0.018, zero 0.011, and 1000 estimation dispatches for 1000 frames.
+  922.9 before the cursor was finished, 1022-1028 after the isolated ring removed
+  the restarts (median of five, 2%). Kernel table at 1022: blockMatch+filter
+  0.86 ms, normalize 0.044, convert 0.018, zero 0.011 for 1000 frames.
+- **A forward seek re-anchors the cursor: 249 -> 643 fps.** The isolated ring
+  served the seek frame but left the cursor behind, so every later frame was
+  still past `kMaxJump` and recomputed a full `2r+1`-centre window. The seek now
+  moves the cursor to `n+1-r` unless a pending frame inside the jump limit would
+  be stranded: vspipe requests a batch ahead, so unconditional re-anchoring
+  isolated every in-flight prefetch frame (default harness 1169 -> 793 fps).
+  Seek schedule 10 frames at 0 then 500..2999 looped, 1080p f32, r=2, 5 s x3
+  interleaved pairs: 720 without it, 643 with it (5 of 401 isolated, against
+  108-137); default harness A/B 1162 against 1169.
 - **The candidate bookkeeping, not the SSD, was the cost.** A per-candidate
   ablation ladder on the estimation kernel (fps, 1080p jpbd, harness config)
   prices the pieces as: search ~29% of the frame, estimate/transform 8.7%,
@@ -215,27 +223,23 @@ the native type, dropping the caller's `depth()` node (see Performance).
   nothing. `gpu_busy_percent` is 100% through a default-config run (~10% during
   the harness's cache preload, what a mistimed poll sees), so kernel work pays.
 - The bookkeeping round (1000 frames x3): **845 -> 952 fps**. The ownership
-  seeds went to registers (8 LDS loads with a `lgkmcnt(0)` drain each), the
-  merge became a shuffle tournament, the candidate lists left LDS for registers,
-  and `group_add` stops at the first entry that cannot beat an overflowed
-  group's worst.
+  seeds went to registers (8 LDS loads drained with `lgkmcnt(0)` each), the
+  merge became a shuffle tournament, the candidate lists left LDS, and
+  `group_add` stops at the first entry that cannot beat an overflowed worst.
 - The SSD's 1-ulp divergence is deliberate: `precise` costs ~8 ALU ops per row
   to buy back ~10% of the tie floor.
-- The estimate phase's 0.40 ms used to be transform plus two `atomicAdd`s; the
-  CAS arm's +0.66 ms/frame bounded the atomics as most of it. The denominator
-  round removed half of them (one weight add per block, not per pixel), which is
-  most of the +18%.
+- The estimate phase's 0.40 ms was transform plus two atomics; the CAS arm's
+  +0.66 ms/frame bounded the atomics, and one weight add per block removed half.
 - Timestamp figures before 2026-09-21 read 1000x low; do not quote them.
 - **The run-to-run swing was pipeline depth, not the kernels (+5%).** Two
   in-flight frames serialized the source-ring reuse distance (a third blocked in
-  `acquire_cache`), putting the host at the GPU's pace: 871-947 fps (8.7%);
-  sizing for the pool's four frames gave 933-960 (2.8%). Depth 6-8 add <1%.
+  `acquire_cache`), putting the host at the GPU's pace (871-947 fps, 8.7%);
+  sizing for the pool's four frames gave 933-960 (2.8%); depth 6-8 add <1%.
 - **Do not unroll the walk.** The loop body is 309 instructions per candidate
-  (SSD 45%, insert 27%, addressing 9%, waits 6%, scheduler `s_delay_alu` 14%),
-  and several candidates per iteration only raise the register count: 1-wide is
-  168 VGPRs / 9 waves/SIMD, 2-wide 192 / 8, 4-wide 192 / 8; fine-interleaved A/B
-  puts 1-wide 1.6% ahead of 2-wide and 2.7% ahead of 4-wide. The earlier "the
-  unroll helps" readings were against baselines that had drifted (Method rules).
+  (SSD 45%, insert 27%, addressing 9%, waits 6%, `s_delay_alu` 14%); several
+  candidates per iteration only raise registers (1-wide 168 VGPRs / 9 waves,
+  2-wide 192 / 8, 4-wide 192 / 8), and the interleaved A/B puts 1-wide 1.6%
+  ahead of 2-wide and 2.7% ahead of 4-wide.
 - **A u16 ring is a pessimisation; widen at copy time (+3%).** The SSD re-reads
   each source sample once per candidate origin out of an L1-resident window, so
   halving the bytes saves no DRAM traffic while the load path doubles (0.95 ->
@@ -243,11 +247,9 @@ the native type, dropping the caller's `depth()` node (see Performance).
   pre-wall-clock 1000-frame run), and a real 16 bit chain 846 vs 634.
 - **f16 is the same io-only win, inside the noise at the benchmark config.**
   f16 972.4-977.9, f32 959.7-972.8, u16 969.7-973.5 (pre-wall-clock 1000 frames
-  x3). The ring and the accumulators stay f32, so a half chain's win is dropping
-  the caller's `depth()` node and halving its upload/download.
-- Other denoisers gain more from u16 because they stream each byte once or twice
-  with a few ALU ops per tap (GaussBlur 2284 vs 1093, DFTTest 2144 vs 1894,
-  pre-wall-clock). BM3D's matcher is the opposite end, so only its io can narrow.
+  x3). The ring and accumulator stay f32, so only the io narrows; denoisers that
+  stream a byte or two per tap gain more (GaussBlur 2284 vs 1093, DFTTest 2144
+  vs 1894), while BM3D's matcher is the opposite end.
 - Marginal cost per candidate per lane: 0.0032 ms (`bm_range`), 0.0030
   (`ps_range`), with a ~1.4-2.0 ms intercept at tiny windows.
 - **The estimation launch shape comes from the device, not a fixed warp.** It is
@@ -260,13 +262,11 @@ the native type, dropping the caller's `depth()` node (see Performance).
 - **LDS is a trap here.** Three attempts to move kernel-live data into shared
   memory each raised VGPRs 216 -> 240 and dropped occupancy 7 -> 6 waves/SIMD,
   losing 5-90%: the cost is dynamic LDS addressing, not traffic, so the wins came
-  from reducing the data instead. Two later attempts confirmed it: the reference
+  from reducing the data instead. Later attempts confirmed it: the reference
   patch in shared memory cost 8-10% (ABBA, 1000 frames x3, n=12: 952.8 against
-  879.1 fps), and the group arrays (`g_e`/`g_xy`/`g_z`, 24 registers) 5.8% even
-  though they cut VGPRs 192 -> 144 (8 -> 10 waves) and code 118 -> 80 KB: the
-  group assembly is a serial chain of dynamic-index accesses, where LDS latency
-  costs more than the occupancy buys. On Ada the same move is worse still (2.6x
-  for the group list; see Historical).
+  879.1 fps) and the group arrays 5.8% (a serial chain of dynamic-index
+  accesses) even though they cut VGPRs 192 -> 144 (8 -> 10 waves) and code
+  118 -> 80 KB. On Ada the same move is worse (2.6x).
 - Color costs the planes: 4:2:0 is 1.5x the luma-only estimate/source footprint
   and 4:4:4/RGB 3x, all inside the same `maxStorageBufferRange` budget.
 - The multi-plane round did not move the luma path (NPLANES == 1: 6131 vs 6133
@@ -276,6 +276,18 @@ the native type, dropping the caller's `depth()` node (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-11-04 — a forward seek re-anchors the temporal cursor; barriers
+  trimmed.** The isolated ring served the seek frame but left the cursor behind,
+  so playback after a seek recomputed a full `2r+1`-centre window per frame:
+  249 fps against 720 without the seek (10 frames at 0 then 500..2999 looped,
+  1080p f32, r=2), now 643. The re-anchor is gated on there being no pending
+  frame inside `kMaxJump`: vspipe requests a batch ahead, and an unconditional
+  re-anchor made every in-flight prefetch frame a backward seek (default
+  harness 1169 -> 793 fps). The cursor's `wide`/`narrow_safe` source test became
+  "the first frame the cursor would copy is at or above this request's
+  `arInitial` lower bound", which is what makes the re-anchored ring copy safe.
+  The duplicate leading barrier and the per-plane aggregation barriers are gone
+  (within noise, 1162 against 1169).
 - **2026-11-01 — `extractor_exp` is validated before the all-zero shortcut.**
   The shortcut returned the source clip before the exponent was parsed, so
   `sigma=0, extractor_exp=999` was silently accepted; the read and range check
@@ -589,9 +601,10 @@ Chronological; each entry keeps the mechanism, not the story.
 
 - **The search is the remaining kernel cost**, and the only one: the
   sigma-scaled threshold rejects most candidates on real content, so the filter
-  cost behind it is small. The union's ownership test is 4 int ops per candidate
-  per earlier window; a merged-row-interval enumeration has not been measured
-  against it.
+  cost behind it is small. For `PS_NUM <= 2` the union's ownership test is
+  register-only (seed 0 is hoisted and no later seed exists), so a
+  merged-row-interval enumeration would buy the duplicate candidates'
+  predicated SSD, not the test; that has not been measured.
 - **The 2-byte copy and store are unvectorized and unmeasured.** `bm3d_copy`
   converts one element per thread and `store_result` writes one element per
   thread;

@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- BM3D plays on at full speed after a seek instead of recomputing a full temporal window for every frame
 - BM3D applies limited-range `_Range` to RGB clips and no longer corrupts multi-plane output, leaks resources, or crashes on a missing frame
 - DFTTest no longer corrupts tall frames with high spatial overlap or double-rounds float32 padding
 - DFTTest and NNEDI3 report oversized memory requests at creation, and DFTTest also rejects negative sigmas and duplicate frequency locations
