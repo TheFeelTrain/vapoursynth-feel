@@ -1348,9 +1348,9 @@ void irdft16(inout float data[TD_SZ], int base) {
 // SCALE), so the fused kernel is IO-type agnostic.
 // ---------------------------------------------------------------------------
 
-// Sample `sample_idx` of temporal slice `t`'s padded plane. The padded plane is
-// a lossless copy of the source (u16/f16 round-trip exactly, f32 keeps its
-// bits), so this is bit-identical to reading the source plane directly.
+// Sample `sample_idx` of temporal slice `t`'s padded plane. u16/f16 store the
+// native sample and scale on load; f32 stores the already-scaled working value,
+// so its pad is exactly one multiply and no second rounding.
 float load_fused(int t, int sample_idx) {
 #if defined(IO_U16)
     return float(int(padded16[t * pc.pad_slice + sample_idx])) * SCALE;
@@ -1358,7 +1358,7 @@ float load_fused(int t, int sample_idx) {
     // half -> float is exact, and the *255 is exact in f32 as well
     return float(padded16[t * pc.pad_slice + sample_idx]) * SCALE;
 #else
-    return uintBitsToFloat(padded_raw[t * pc.pad_slice + sample_idx]) * SCALE;
+    return uintBitsToFloat(padded_raw[t * pc.pad_slice + sample_idx]);
 #endif
 }
 
@@ -1384,7 +1384,8 @@ void store_padded(int t, int sample_idx, float v) {
 #elif defined(IO_F16)
     padded16[t * pc.pad_slice + sample_idx] = float16_t(v / SCALE);
 #else
-    padded_raw[t * pc.pad_slice + sample_idx] = floatBitsToUint(v / SCALE);
+    // f32 keeps the internal working value: load_fused must not scale again.
+    padded_raw[t * pc.pad_slice + sample_idx] = floatBitsToUint(v);
 #endif
 }
 

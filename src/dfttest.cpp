@@ -1396,6 +1396,23 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         (sst && !sigmas_non_negative(sst, n_sst))) {
         return set_error("ssx/ssy/sst sigma values must be non-negative.");
     }
+    if (slocation) {
+        if (!sigmas_non_negative(slocation, n_slocation)) {
+            return set_error("slocation sigma values must be non-negative.");
+        }
+        // initPacks sorts the locations; a duplicate makes eval divide by zero.
+        std::vector<double> locs;
+        locs.reserve(static_cast<size_t>(n_slocation / 2));
+        for (int i = 0; i < n_slocation; i += 2) {
+            locs.push_back(slocation[i]);
+        }
+        std::sort(locs.begin(), locs.end());
+        for (size_t i = 1; i < locs.size(); ++i) {
+            if (locs[i] == locs[i - 1]) {
+                return set_error("slocation locations must be distinct.");
+            }
+        }
+    }
 
     // device_id and num_streams are registered but never read: the core owns
     // the one device and sizes in-flight depth itself (exec pool ring).

@@ -1032,10 +1032,18 @@ def test_rejects_negative_gain_parameters(clip_grays, kwargs):
         {"ssx": [0.0, -1.0]},
         {"ssx": [0.0, float("nan")]},
         {"slocation": [0.0, float("nan")]},
+        {"slocation": [0.0, -1.0]},
+        {"slocation": [0.0, 1.0, 0.0, 2.0]},
     ],
-    ids=["negative-ssx", "nan-ssx", "nan-slocation"],
+    ids=[
+        "negative-ssx",
+        "nan-ssx",
+        "nan-slocation",
+        "negative-slocation",
+        "duplicate-slocation",
+    ],
 )
 def test_rejects_non_finite_or_negative_sigma_arrays(clip_grays, kwargs):
-    """NaN and negative sigma entries reach sqrt() and poison the frame."""
-    with pytest.raises(vs.Error, match="finite|non-negative"):
+    """NaN/negative sigmas or duplicate locations reach sqrt/eval and poison it."""
+    with pytest.raises(vs.Error, match="finite|non-negative|distinct"):
         vs.core.vsfeel.DFTTest(clip_grays, tbsize=1, **kwargs)

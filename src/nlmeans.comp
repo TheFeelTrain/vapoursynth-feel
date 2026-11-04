@@ -44,15 +44,12 @@
 
 #if defined(IO_U16)
 #define PEAK       65535.0f
-#define SCALE      (1.0f / 65535.0f)
 #define VTYPE      uint16_t
 #elif defined(IO_F16)
 #define PEAK       1.0f
-#define SCALE      1.0f
 #define VTYPE      float16_t
 #else
 #define PEAK       1.0f
-#define SCALE      1.0f
 #define VTYPE      float
 #endif
 
@@ -118,7 +115,7 @@ float load_u1(int idx) {
 #elif defined(IO_F16)
     return float(u1[idx]);   // half -> float is exact
 #else
-    return float(int(u1[idx])) * SCALE;
+    return float(int(u1[idx])) / 65535.0f;
 #endif
 }
 
@@ -130,9 +127,10 @@ VTYPE to_vtype(float v) {
     // saturation, i.e. the reference's vstore_half_rte
     return float16_t(v);
 #else
-    // glslc -O chokes on a direct float->uint16_t convert (OpUConvert);
-    // go through uint with an explicit mask (same workaround as DFTTest)
-    return uint16_t(uint(v * PEAK + 0.5f) & 0xFFFFu);
+    // Reference: convert_ushort_sat_rte(v * 65535). Clamp before narrowing so
+    // a value just above 1 cannot wrap to 0; roundEven is RNE like the
+    // reference's saturating conversion.
+    return uint16_t(uint(clamp(roundEven(v * PEAK), 0.0f, PEAK)));
 #endif
 }
 

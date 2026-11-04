@@ -176,8 +176,9 @@ force-pad / fail-pad probes.
   descriptor array read with a compile-time slice index. Deleting the pad pass
   entirely and folding branchless reflection into fused was 4% *slower* — the
   reflection costs more than the pass it replaces — and the padded plane is a
-  lossless copy (u16/f16 round-trip exactly, f32 keeps its bits), so there was
-  nothing else to gain there.
+  lossless copy for u16/f16 (native samples round-trip exactly), while f32
+  stores the already-scaled working value so the fused kernel does not scale a
+  second time, so there was nothing else to gain there.
 - **The table loads are not the cost: 0.73%.** Ablating the window weights and
   window_freq reads measured 15.5% of the frame, but vectorizing them (144 → 60
   loads per thread through a transposed window copy and vec2/vec4 views of the
@@ -231,6 +232,11 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   perf change). vszipcl accepts both and produces an all-NaN clip: negative
   `f0beta` is `pow(0, negative)` in the ftype=0 gain and negative `pmax` makes
   the ftype=4 gain `sqrt(negative)`. The suite now pins the rejection.
+
+- **Negative `slocation` sigmas and duplicate locations are rejected at
+  creation** (correctness-only). The reference sorts locations and evaluates a
+  linear interpolation; duplicates make it divide by zero. `ssx/ssy/sst` and
+  `slocation` sigmas are all checked now. No perf change.
 
 - **The R80 port's scoreboard is void.** It read 1452.6/1376.0 → 1361.3/1360.3
   (CPU cache), 1182.3 → 1350.3 (`--download`) and 1376.2 → 1364.7

@@ -26,6 +26,9 @@ Status: **shipped on the R80 GPU API.** Verified against
   accumulator and LDS tile stays f32 exactly as the reference's own u4a/u2/u5,
   and the finish store narrows once with `OpFConvert`'s round-to-nearest-even
   (vszipcl's `vstore_half_rte`).
+- u16 transport divides by 65535 on load and uses the reference's saturating
+  round-to-nearest-even store, so its code values match vszipcl's conversion;
+  the earlier reciprocal-multiply/half-up pair is gone.
 - Accuracy: ≤1 LSB u16, ≤4.4e-6 f32 and ≤1 half step f16 against vszipcl across
   the whole parameter surface (spatial, temporal, joint, rclip, cropped, `a=64`,
   `d=16`).
