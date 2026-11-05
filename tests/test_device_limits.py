@@ -536,6 +536,205 @@ def test_nnedi3_scratch_range_is_a_creation_error():
     assert str(2 << 20) in err, res["nnedi3"]
 
 
+# ---------------------------------------------------------------------------
+# Per-frame scratch vs maxStorageBufferRange at creation
+# ---------------------------------------------------------------------------
+#
+# These filters size one scratch buffer per frame. A device whose storage range
+# cannot bind it used to create the filter and then fail every get_frame; the
+# cases below only build, so the error has to come from the constructor.
+
+_SCRATCH_RANGE_SCRIPT = r"""
+import json
+import sys
+
+import vapoursynth as vs
+
+core = vs.core
+
+
+def build(case):
+    clip = core.std.BlankClip(
+        width=case["w"], height=case["h"], format=getattr(vs, case["format"]),
+        length=1,
+    )
+    kwargs = dict(case.get("kwargs") or {})
+    name = case["filter"]
+    if name == "eedi3":
+        core.vsfeel.EEDI3(clip, **kwargs)
+    elif name == "eedi3aa":
+        core.vsfeel.EEDI3AA(clip, **kwargs)
+    elif name == "gaussblur":
+        core.vsfeel.GaussBlur(clip, **kwargs)
+    elif name == "nlmeans":
+        core.vsfeel.NLMeans(clip, **kwargs)
+    elif name == "box":
+        core.vsfeel.Box(clip, **kwargs)
+    else:
+        raise SystemExit("unknown filter %r" % name)
+
+
+out = {}
+for case in json.loads(sys.argv[1])["cases"]:
+    try:
+        build(case)
+        out[case["label"]] = {"result": "created"}
+    except Exception as exc:
+        out[case["label"]] = {"error": "%s: %s" % (type(exc).__name__, exc)}
+print("RESULT " + json.dumps(out))
+"""
+
+
+def _scratch_range(cases, env=None):
+    """Create every case in a fresh process; return {label: result/error}."""
+    run_env = {**os.environ, "MANGOHUD": "0", **(env or {})}
+    proc = subprocess.run(
+        [sys.executable, "-c", _SCRATCH_RANGE_SCRIPT, json.dumps({"cases": cases})],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=run_env,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    for line in proc.stdout.splitlines():
+        if line.startswith("RESULT "):
+            return json.loads(line[len("RESULT ") :])
+    raise AssertionError(proc.stdout[-2000:])
+
+
+def test_eedi3_family_scratch_range_is_a_creation_error():
+    """A 4K scratch over the storage range is refused by the constructor.
+
+    EEDI3's 4K f32 scratch (146.7 MiB) and EEDI3AA's 4K u16 scratch (162.4 MiB)
+    exceed the 128 MiB conformant range; EEDI3's 4K u16 scratch (107.0 MiB) must
+    still create, or the check would reject what the device can run.
+    """
+    cases = [
+        {
+            "label": "eedi3-f32",
+            "filter": "eedi3",
+            "w": 3840,
+            "h": 2160,
+            "format": "GRAYS",
+            "kwargs": {"field": 1, "mdis": 20},
+        },
+        {
+            "label": "eedi3-u16",
+            "filter": "eedi3",
+            "w": 3840,
+            "h": 2160,
+            "format": "GRAY16",
+            "kwargs": {"field": 1, "mdis": 20},
+        },
+        {
+            "label": "eedi3aa-u16",
+            "filter": "eedi3aa",
+            "w": 3840,
+            "h": 2160,
+            "format": "GRAY16",
+            "kwargs": {"field": 3, "mdis": 20},
+        },
+    ]
+    res = _scratch_range(cases, {"VSFEEL_LIMIT_STORAGE_RANGE": str(128 << 20)})
+    assert res["eedi3-u16"].get("result") == "created", res["eedi3-u16"]
+    for label, size in (("eedi3-f32", 153847872), ("eedi3aa-u16", 170317952)):
+        err = res[label].get("error", "")
+        assert "per-frame scratch" in err, res[label]
+        assert str(128 << 20) in err and str(size) in err, res[label]
+
+
+def test_gaussblur_scratch_range_is_a_creation_error():
+    """sigma=20 takes the two-pass path: the scratch is a creation error.
+
+    The 640x360 u16 plane (460 800 B) fits a 512 KiB range and the 921 600-byte
+    two-pass scratch does not.
+    """
+    res = _scratch_range(
+        [
+            {
+                "label": "gaussblur",
+                "filter": "gaussblur",
+                "w": 640,
+                "h": 360,
+                "format": "GRAY16",
+                "kwargs": {"sigma": 20.0},
+            }
+        ],
+        {"VSFEEL_LIMIT_STORAGE_RANGE": str(512 << 10)},
+    )
+    err = res["gaussblur"].get("error", "")
+    assert "two-pass scratch" in err and "921600" in err, res["gaussblur"]
+    assert str(512 << 10) in err, res["gaussblur"]
+
+
+def test_box_scratch_range_is_a_creation_error():
+    """The packed RGB scratch is checked at creation, not on every frame.
+
+    A 640x360 RGBS -> 320x180 box packs 1 382 400 B; the 921 600-byte source
+    plane fits a 1 MiB range and the scratch does not.
+    """
+    res = _scratch_range(
+        [
+            {
+                "label": "box",
+                "filter": "box",
+                "w": 640,
+                "h": 360,
+                "format": "RGBS",
+                "kwargs": {"width": 320, "height": 180},
+            }
+        ],
+        {"VSFEEL_LIMIT_STORAGE_RANGE": str(1 << 20)},
+    )
+    err = res["box"].get("error", "")
+    assert "two-pass scratch" in err and "1382400" in err, res["box"]
+    assert str(1 << 20) in err, res["box"]
+
+
+def test_nlmeans_scratch_range_is_a_creation_error():
+    """The weight ring is refused at creation, with the ring size named.
+
+    A 60 MB range passes the 921 600-byte plane and fails the 92 160 000-byte
+    ring; the pack knob pins the ring so the case does not depend on the
+    device's VRAM allowance.
+    """
+    res = _scratch_range(
+        [
+            {
+                "label": "nlmeans",
+                "filter": "nlmeans",
+                "w": 640,
+                "h": 360,
+                "format": "GRAYS",
+                "kwargs": {"d": 2},
+            }
+        ],
+        {"VSFEEL_LIMIT_STORAGE_RANGE": "60000000", "VSFEEL_NLMEANS_PACK": "50"},
+    )
+    err = res["nlmeans"].get("error", "")
+    assert "weight ring" in err and "92160000" in err, res["nlmeans"]
+    assert "60000000" in err, res["nlmeans"]
+
+
+def test_nlmeans_plane_range_error_names_the_uv_plane():
+    """channels="UV" checks plane 1, so the error must say so."""
+    res = _scratch_range(
+        [
+            {
+                "label": "uv",
+                "filter": "nlmeans",
+                "w": 640,
+                "h": 360,
+                "format": "YUV420PS",
+                "kwargs": {"d": 2, "channels": "UV"},
+            }
+        ],
+        {"VSFEEL_LIMIT_STORAGE_RANGE": "200000"},
+    )
+    err = res["uv"].get("error", "")
+    assert "plane 1" in err and "200000" in err, res["uv"]
+
+
 def test_wnnm_select_and_estimate_grid_overflow_is_reported():
     """The 1D WNNM phases cannot fold into Y, so creation must reject them.
 

@@ -653,6 +653,15 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         }
     }
     d->mid_total = mid_total;
+    // The packed two-pass scratch is allocated per frame; a pure horizontal
+    // scale leaves it zero. A device that cannot bind it must fail at creation.
+    if (mid_total > 0) {
+        if (auto e = vsfeel_frame_scratch_error(mid_total, *d->gpu,
+                                                "the two-pass scratch");
+            !e.empty()) {
+            return set_error(e);
+        }
+    }
 
     {
         char err[512] {};

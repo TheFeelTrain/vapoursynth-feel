@@ -566,6 +566,20 @@ inline std::string vsfeel_plane_range_error(const VSVulkanPlaneInfo & plane,
            "); reduce the frame size.";
 }
 
+// A scratch buffer created for every frame: its size is fixed at creation, so
+// reject it there rather than on the first frame, naming the buffer.
+inline std::string vsfeel_frame_scratch_error(VkDeviceSize bytes,
+                                              const GPUDevice & gpu,
+                                              const char * what) {
+    if (bytes <= gpu.limits.maxStorageBufferRange) {
+        return {};
+    }
+    return std::string(what) + " needs " + std::to_string(bytes) +
+           " bytes, more than this device's maxStorageBufferRange (" +
+           std::to_string(gpu.limits.maxStorageBufferRange) +
+           " bytes); lower the filter's size parameters.";
+}
+
 // GPU-timing probes: a timestamp write where timestampValidBits is 0 can hang
 // the engine, so every probe is gated on this and says so once when skipped.
 inline bool vsfeel_probe_timestamps(const GPUDevice & dev, const char * tag) {

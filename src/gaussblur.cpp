@@ -991,6 +991,15 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
         }
     }
     d->tmp_total = tmp_total;
+    // The two-pass scratch is one buffer, allocated per frame; the fused path
+    // leaves it zero. A device that cannot bind it must fail at creation.
+    if (tmp_total > 0) {
+        if (auto e = vsfeel_frame_scratch_error(tmp_total, *d->gpu,
+                                                "the two-pass scratch");
+            !e.empty()) {
+            return set_error(e);
+        }
+    }
 
     {
         char err[512] {};

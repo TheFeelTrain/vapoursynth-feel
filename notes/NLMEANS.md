@@ -99,8 +99,9 @@ u16 at `a=64`, while f32 holds the whole comparison surface at ≤1 LSB /
   no bounds checks. The compose writes the whole tile (margins zeroed) and the
   interior is a straight copy of the core's plane at its own row stride.
 - Per-frame size is not capped in bytes; a window whose element counts pass
-  2^31, or whose buffers exceed `maxStorageBufferRange`, is a clean creation or
-  allocation error instead of an out-of-bounds access.
+  2^31, or whose buffers exceed `maxStorageBufferRange`, is a clean creation error
+  (the frame-time allocation keeps the check as a backstop) instead of an
+  out-of-bounds access.
 - `num_streams`/`device_id` stay registered so existing scripts load; both are
   never read (see the banner).
 

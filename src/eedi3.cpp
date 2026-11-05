@@ -2707,6 +2707,13 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
                          " MiB) exceeds the 2 GiB int32 "
                          "addressing limit; lower \"mdis\" or the frame size.");
     }
+    // The scratch is one buffer allocated per frame; a device whose storage
+    // range cannot bind it must fail here, not on every get_frame.
+    if (auto e = vsfeel_frame_scratch_error(d->scratch_bytes, *d->gpu,
+                                            "the per-frame scratch");
+        !e.empty()) {
+        return set_error(e);
+    }
 
     if (d->trace) {
         VSVulkanCoreInfo info {};

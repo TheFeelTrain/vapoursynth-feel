@@ -923,9 +923,11 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
     }
     d->stride = plane_stride[d->plane0];
     d->npix = static_cast<int64_t>(d->stride) * d->height;
+    // UV processes plane 1; the label must name the plane actually checked.
+    const std::string plane_what = "plane " + std::to_string(d->plane0);
     if (auto e = vsfeel_plane_range_error(static_cast<VkDeviceSize>(d->stride),
                                           d->height, d->elem_bytes, *d->gpu,
-                                          "plane 0");
+                                          plane_what.c_str());
         !e.empty()) {
         return set_error(e);
     }
@@ -986,6 +988,35 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         d->ring_bytes = batch * ring_bytes_per_entry;
     }
     d->slots = ((dd == 0) ? 1 : 2) * static_cast<int>(d->batch);
+
+    // Every per-frame buffer's size is fixed by now. Reject one the device's
+    // storage range cannot bind here, not on every get_frame; the frame-time
+    // allocation keeps the same check as a backstop.
+    {
+        const struct {
+            int64_t bytes;
+            const char * what;
+        } buffers[] = {
+            { d->ring_bytes, "weight ring" },
+            { d->npix * (d->channels + 1) * static_cast<int64_t>(sizeof(float)),
+              "accumulator buffer" },
+            { d->npix * static_cast<int64_t>(sizeof(float)),
+              "max-weight buffer" },
+            { d->clips * static_cast<int64_t>(d->channels) * (2 * dd + 1) *
+                  d->tile_elems * d->elem_bytes,
+              "temporal window" },
+            { 2 * static_cast<int64_t>(d->channels) * (2 * dd + 1) *
+                  static_cast<int64_t>(sizeof(VkDeviceAddress)),
+              "address table" },
+        };
+        for (const auto & b : buffers) {
+            if (auto e = vsfeel_frame_scratch_error(
+                    static_cast<VkDeviceSize>(b.bytes), *d->gpu, b.what);
+                !e.empty()) {
+                return set_error(e);
+            }
+        }
+    }
 
     // int32 addressing bound of the device-side layouts (the reference falls
     // back to 64-bit indices here; we reject instead)
