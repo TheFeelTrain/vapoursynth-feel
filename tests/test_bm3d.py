@@ -204,37 +204,83 @@ def test_bm3d_cas_fallback_matches_hardware_atomics(clip_grays, monkeypatch):
 def test_bm3d_cas_fallback_holds_at_small_block_step(clip_grays, monkeypatch):
     """The CAS arm must stay exact where contention is highest.
 
-    One res element receives up to `8 * (ceil((2*bm_range + 8)/block_step) +
-    1)^2` adds -- every matched patch of every reference block whose search
-    window can reach it -- so block_step=1 is the worst case (13448 at
-    bm_range=16) and a retry budget below it can silently drop addends: the
-    old 32-retry bound put 16 of 4096 pixels 1e-5..6.1e-5 out against the
-    hardware arm, while the geometry-derived bound lands at float add order
-    alone. The bound is what this pins.
+    One res element receives up to
+    `8 * (2*radius + 1) * (ceil((2*bm_range + 8)/block_step) + 1)^2` adds:
+    every matched patch of every reference block whose window reaches it,
+    from each of the window's `2*radius+1` temporal centres. block_step=1 is
+    the worst case (13448 spatial-only retries at bm_range=16), and a bound
+    without the temporal factor silently drops addends once a temporal window
+    supplies more than that. Pin a narrow radius and the widest one against
+    the hardware-atomic arm; the comparison floor is float add order alone.
     """
 
-    def small_step(clip):
-        return BM3D(clip, sigma=SIGMA, radius=2, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=1)
+    def compare(radius, frames):
+        def small_step(clip):
+            return BM3D(
+                clip,
+                sigma=SIGMA,
+                radius=radius,
+                bm_range=BM_RANGE,
+                ps_range=PS_RANGE,
+                block_step=1,
+            )
 
-    monkeypatch.setenv("VSFEEL_BM3D_CAS", "1")
-    cas = small_step(clip_grays)
-    monkeypatch.delenv("VSFEEL_BM3D_CAS", raising=False)
-    hardware = small_step(clip_grays)
-    # Both arms add the same 13448 addends in a scheduler-dependent order, so
-    # the comparison floor is the arms' own spread, not exactness: measured
-    # 4.2e-7 (hardware vs itself) and 5.4e-7 (cross-arm) at |max| ~ 1, frames
-    # 0/11. A dropped addend moves one element by 1/13448 of an addend, ~7e-5
-    # of the result, so 1e-5 still separates the two (the two runs must be
-    # scaled, since the same order noise was 7e-9 on the old near-black clip).
-    for n in (0, 11):
-        a = frame_to_ndarray(hardware.get_frame(n))
-        b = frame_to_ndarray(cas.get_frame(n))
-        assert np.isfinite(b).all(), f"non-finite CAS output at frame {n}"
-        scale = max(1.0, float(np.abs(a).max()))
-        worst = float(np.abs(a - b).max()) / scale
-        assert worst < 1e-5, (
-            f"CAS lost an addend at block_step=1, frame {n}: {worst:g} of full scale"
+        monkeypatch.setenv("VSFEEL_BM3D_CAS", "1")
+        cas = small_step(clip_grays)
+        monkeypatch.delenv("VSFEEL_BM3D_CAS", raising=False)
+        hardware = small_step(clip_grays)
+        # Both arms add the same set of addends in a scheduler-dependent order,
+        # so the comparison floor is the arms' own spread, not exactness
+        # (measured 4.2e-7..5.4e-7 at |max| ~ 1). A dropped addend moves an
+        # element by a whole fraction of an addend, so 1e-5 of full scale
+        # separates the two at both radii; scale, since the arms' own noise
+        # was 7e-9 on the old near-black clip.
+        for n in frames:
+            a = frame_to_ndarray(hardware.get_frame(n))
+            b = frame_to_ndarray(cas.get_frame(n))
+            assert np.isfinite(b).all(), f"non-finite CAS output at frame {n}"
+            scale = max(1.0, float(np.abs(a).max()))
+            worst = float(np.abs(a - b).max()) / scale
+            assert worst < 1e-5, (
+                f"CAS lost an addend at radius={radius}, block_step=1, "
+                f"frame {n}: {worst:g} of full scale"
+            )
+
+    compare(2, (0, 11))
+    compare(16, (0, 1, 11))
+
+
+def test_bm3d_cas_bound_rejects_oversized_search_range(clip_grays):
+    """A CAS retry bound past 2^32 is rejected at creation, not wrapped.
+
+    At block_step=1 the exact temporal bound is
+    `8*(2*radius+1)*(ceil((2*bm_range+8)/block_step)+1)^2`: bm_range=8192,
+    radius=16 gives 7.1e10 (> UINT32_MAX) and must fail, while bm_range=9,
+    radius=16 gives 192456 (< UINT32_MAX) and still creates. The bound is a
+    32-bit loop counter on the CAS arm, so wrapping it would make the loop
+    give up early and lose addends.
+    """
+    with pytest.raises(vs.Error, match="CAS retry bound"):
+        vs.core.vsfeel.BM3D(
+            clip_grays,
+            sigma=SIGMA,
+            radius=16,
+            bm_range=8192,
+            ps_range=PS_RANGE,
+            block_step=1,
         )
+    # The default-sized search window at the same radius still creates.
+    assert (
+        vs.core.vsfeel.BM3D(
+            clip_grays,
+            sigma=SIGMA,
+            radius=16,
+            bm_range=9,
+            ps_range=PS_RANGE,
+            block_step=1,
+        )
+        is not None
+    )
 
 
 def test_bm3d_shared_reference_patch_matches_registers(clip_grays, monkeypatch):

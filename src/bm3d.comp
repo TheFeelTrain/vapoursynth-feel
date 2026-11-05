@@ -146,22 +146,23 @@ layout(std430, binding = 3) readonly buffer MatchBuf { uint match_words[]; };
 // The loop is bounded on purpose: an unbounded retry that cannot make progress
 // spins the GPU until the driver resets the device (seen as
 // VK_ERROR_DEVICE_LOST with no fault). The bound is a contention bound, derived
-// from the kernel's own geometry: one element can receive one add per matched
-// patch from every reference block whose search window reaches it, and the
-// blocks that can reach it are spaced BLOCK_STEP over a span of
-// 2 * BM_RANGE + 8 origins, so at most 8 * (ceil((2 * BM_RANGE + 8) /
-// BLOCK_STEP) + 1)^2 adds -- the 8 matches of each block. That is 968 at
-// bm_range=16/block_step=4 and 13448 at bm_range=16/block_step=1. Erring high
-// is safe: a failed exchange means another one of those adds landed, so the
-// true retry count is below it.
-// Unsigned arithmetic keeps the derivation in range at BM_RANGE's 8192 cap
-// (the maximum, 8 * 16393^2, is still below 2^32).
+// from the kernel's own geometry: one element receives one add per matched
+// patch from every reference block whose search window reaches it, spaced
+// BLOCK_STEP over a span of 2 * BM_RANGE + 8 origins, so
+// cells = ceil((2 * BM_RANGE + 8) / BLOCK_STEP) + 1 blocks reach it and each
+// contributes its 8 matches. In temporal mode every one of the 2 * RADIUS + 1
+// centres scatters into that frame, so the exact bound is
+// 8 * (2 * RADIUS + 1) * cells^2. The host rejects any config whose bound
+// exceeds UINT32_MAX at creation, so this stays a 32-bit loop without a
+// shaderInt64 variant. Erring high is safe: a failed exchange means another
+// one of those adds landed, so the true retry count is below it.
 void res_add(int idx, float val) {
 #ifndef NO_FLOAT_ATOMICS
     atomicAdd(res[idx], val);
 #else
     uint cells = (2u * uint(BM_RANGE) + 8u + uint(BLOCK_STEP) - 1u) / uint(BLOCK_STEP) + 1u;
-    uint retries = 8u * cells * cells;
+    // host guarantees this product <= UINT32_MAX at creation
+    const uint retries = 8u * (2u * uint(RADIUS) + 1u) * cells * cells;
     uint assumed = atomicCompSwap(res_u[idx], 0u, 0u);
     for (uint i = 0u; i < retries; ++i) {
         const uint old = atomicCompSwap(res_u[idx], assumed,

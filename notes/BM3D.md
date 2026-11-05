@@ -276,6 +276,12 @@ the native type, dropping the caller's `depth()` node (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-11-05 — the CAS retry bound counts the temporal centres.** The
+  `-DNO_FLOAT_ATOMICS` loop bounded retries by spatial-only `8*cells^2`
+  (13448 at bm_range=16/step 1), but `2*radius+1` centres scatter into one
+  accumulator element; it is now `8*(2*radius+1)*cells^2`, with creation
+  rejecting a config whose exact bound (kept in uint64) exceeds `UINT32_MAX`,
+  so no `shaderInt64` variant is needed. No perf change.
 - **2026-11-05 — color-matrix norms and internal RGB-to-OPP.** Sigma and th_mse
   had carried the bt709 luma norm for every plane and resolution; they now use
   the reference's resolution-selected matrix (SD smpte170m, HD bt709, UHD

@@ -3151,6 +3151,43 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
         d->max_radius = std::max(d->max_radius, d->groups[gi].radius);
     }
     d->max_tw = 2 * d->max_radius + 1;
+
+    // The CAS fallback (src/bm3d.comp) bounds its compare-exchange loop with a
+    // 32-bit counter. In temporal mode one accumulator element is written by
+    // 2*radius+1 centres, each scattering 8 patches from every reference block
+    // whose window reaches it, so the exact bound is
+    // 8*(2*radius+1)*cells^2 with
+    // cells = ceil((2*bm_range + 8)/block_step) + 1. Reject configs whose bound
+    // would overflow the counter; the shader keeps a 32-bit loop, so this needs
+    // no shaderInt64 feature or extra variant.
+    uint64_t cas_retries = 0;
+    int cas_gi = -1;
+    for (int gi = 0; gi < d->n_groups; ++gi) {
+        const auto & g = d->groups[gi];
+        const auto & first = d->planes[g.planes[0]];
+        const uint64_t step = static_cast<uint64_t>(first.block_step);
+        const uint64_t range = static_cast<uint64_t>(first.bm_range);
+        const uint64_t cells = (2ull * range + 8 + step - 1) / step + 1;
+        const uint64_t temporal = 2ull * g.radius + 1;
+        const uint64_t bound = 8ull * temporal * cells * cells;
+        if (bound > cas_retries) {
+            cas_retries = bound;
+            cas_gi = gi;
+        }
+    }
+    if (cas_retries > UINT32_MAX) {
+        const auto & g = d->groups[cas_gi];
+        const auto & first = d->planes[g.planes[0]];
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "the temporal CAS retry bound (%llu) overflows the kernel's "
+                 "32-bit loop counter (bm_range %d, block_step %d, radius %d); "
+                 "lower bm_range, raise block_step or lower radius",
+                 static_cast<unsigned long long>(cas_retries), first.bm_range,
+                 first.block_step, g.radius);
+        return set_error(msg);
+    }
+
     // The temporal cursor copies each frame into the ring once as the centre
     // advances, so the source ring only has to hold one search window plus the
     // frame the next centre is about to add. Radius 0 keeps a private slot per

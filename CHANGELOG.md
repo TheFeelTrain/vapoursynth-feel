@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - EEDI3, EEDI3H, EEDI3AA, GaussBlur, Box, and NLMeans report an over-large frame at creation instead of failing on every frame
 - NLMeans names the chroma plane in its plane-range error when `channels="UV"`
 - WNNM reports an over-large frame instead of failing with an allocation error
+- BM3D no longer loses denoise contributions at large temporal radii on GPUs without float atomics
 
 ## [v1.3.4] - 2026-11-05
 
