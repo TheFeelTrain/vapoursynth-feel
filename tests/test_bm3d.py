@@ -653,6 +653,65 @@ def test_bm3d_accepts_radius4_within_addressing_limit():
     assert out.num_frames == 3
 
 
+def test_bm3d_rejects_temporal_rings_over_the_vram_budget(monkeypatch):
+    """A temporal configuration that cannot fit the VRAM budget fails at creation.
+
+    The rings are one fixed search window each and cannot shrink like the
+    radius-0 depth, so the failure must name the size instead of surfacing as
+    an allocator error on the first frame.
+    """
+    monkeypatch.setenv("VSFEEL_LIMIT_VRAM_BUDGET", str(64 << 20))
+    with pytest.raises(vs.Error, match="temporal rings need"):
+        BM3D(
+            _blank(1024, 1024),
+            sigma=SIGMA,
+            radius=7,
+            bm_range=BM_RANGE,
+            ps_range=PS_RANGE,
+            block_step=BLOCK_STEP,
+        )
+
+
+_VRAM_BANNER_SCRIPT = r"""
+import vapoursynth as vs
+
+core = vs.core
+clip = core.std.BlankClip(width=640, height=360, format=vs.GRAYS, length=8)
+core.vsfeel.BM3D(clip, sigma=0.7, radius=2, bm_range=16, ps_range=7, block_step=4)
+"""
+
+
+@pytest.mark.parametrize("budget_mib", [None, 192], ids=["default", "small"])
+def test_bm3d_vram_banner_reports_budget_and_lazy_scratch(budget_mib):
+    """Creation must name the budget, the emitted cap and the lazy source ring.
+
+    The isolated source ring is the private duplicate of the source ring; it is
+    no longer in the creation footprint, so the banner has to say it is not
+    allocated yet, and a small allowance must lower the emitted cap below its
+    count default.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "VSFEEL_LIMIT_VRAM_BUDGET"}
+    env.update({"MANGOHUD": "0", "VSFEEL_BM3D_VRAM": "1"})
+    if budget_mib is not None:
+        env["VSFEEL_LIMIT_VRAM_BUDGET"] = str(budget_mib << 20)
+    proc = subprocess.run(
+        [sys.executable, "-c", _VRAM_BANNER_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "iso_src=lazy" in proc.stderr, proc.stderr[-2000:]
+    assert re.search(r"budget=\d+ MiB", proc.stderr), proc.stderr[-2000:]
+    match = re.search(r"emitted_cap=(\d+)", proc.stderr)
+    assert match, proc.stderr[-2000:]
+    if budget_mib is None:
+        assert int(match.group(1)) == 40, proc.stderr[-2000:]
+    else:
+        assert 0 < int(match.group(1)) < 40, proc.stderr[-2000:]
+
+
 def test_bm3d_device_id(clip_grays):
     """device_id and num_streams are accepted no-ops.
 
@@ -1195,7 +1254,44 @@ def test_bm3d_forward_seek_reanchors_the_cursor():
     worst = _result_payload(proc.stdout)
     assert worst < 1e-5, f"seek re-anchor mismatch: {worst}"
     isolated = [line for line in proc.stderr.splitlines() if "isolated" in line]
-    assert isolated == ["[t] n=40 isolated"], proc.stderr[-2000:]
+    assert isolated == ["[t] n=40 isolated cached=4"], proc.stderr[-2000:]
+
+
+_REVERSE_CACHE_SCRIPT = (
+    _SUBPROCESS_PRELUDE
+    + r"""
+# A clip longer than the emitted cap, requested backwards: every request is
+# served by the isolated ring, so the cache must be reaped on that path too.
+node = core.std.GPUDownload(clip=core.vsfeel.BM3D(
+    core.std.Trim(core.std.Loop(grays(), 3), 0, 63),
+    sigma=0.7, radius=2, bm_range=16, ps_range=7, block_step=4))
+for n in range(63, -1, -1):
+    plane = frame_to_ndarray(node.get_frame(n))
+    if not np.isfinite(plane).all():
+        raise SystemExit("non-finite output at frame %d" % n)
+print("RESULT 64")
+"""
+)
+
+
+def test_bm3d_reverse_playback_keeps_the_emitted_cache_bounded():
+    """A reverse run must not pin one full frame per request.
+
+    Every frame after the first is served by the isolated ring, which used to
+    return before the reap; the trace prints the cache size before the insert,
+    so an unbounded cache reaches 63 at the last request while a capped one
+    stays at the cap.
+    """
+    proc = _run_subprocess_script(_REVERSE_CACHE_SCRIPT, env={"VSFEEL_BM3D_TRACE": "1"})
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert _result_payload(proc.stdout) == 64
+    cached = [
+        int(m.group(1)) for m in re.finditer(r"\[t\] n=\d+ isolated cached=(\d+)", proc.stderr)
+    ]
+    # The cursor starts at the first request, so only the 63 frames behind it
+    # are isolated; all of them must be traced.
+    assert len(cached) == 63, proc.stderr[-2000:]
+    assert max(cached) <= 40, f"emitted cache grew to {max(cached)}: {cached}"
 
 
 def test_bm3d_per_plane_radius_frame_request_order_matches_serial():

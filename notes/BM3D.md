@@ -166,12 +166,12 @@ the native type, dropping the caller's `depth()` node (see Performance).
   loop (`-DNO_FLOAT_ATOMICS`; `VSFEEL_BM3D_CAS=1` forces it). Both arms declare
   the accumulation buffer `coherent`. No cheaper fallback exists without the bit:
   shared-memory atomics cannot help, a group's patches land anywhere.
-- Radius accepts up to 16. The accumulator ring is `2r+1` slots of two planes,
-  so 1080p at radius 16 costs ~550 MiB per entry instead of the old
-  `(2+2r)(2r+1)` plane pairs that refused radius 8. The source ring is
-  `2r+3` slots (one search window plus the frame the next centre adds), and the
-  isolated path gets its own copy of it. A device's `maxStorageBufferRange` is
-  still checked; every refusal names the size.
+- Radius accepts up to 16: accumulator ring `2r+1` two-plane slots, source
+  ring `2r+3` (1080p radius 16 ~550 MiB per entry). The isolated duplicate is
+  allocated on the first seek, so linear playback never pays it. Persistent
+  allocations share a quarter of the core's VRAM allowance: an oversized
+  temporal configuration fails at creation, and the cache gets the rest (40
+  frames at most); `maxStorageBufferRange` still names every refusal.
 - Degenerate paths: `sigma < FLT_EPSILON` copies a plane through, and with no
   plane above it the filter is not built (the clip is handed back). Validation
   runs before that shortcut: `extractor_exp` `[0, 127]` as bm3dvk does, `th_mse`
@@ -276,6 +276,10 @@ the native type, dropping the caller's `depth()` node (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-11-05 — temporal caches are bounded.** The isolated return skipped the
+  reap (one full frame pinned per reverse request), the isolated source ring was
+  eager, and creation had no VRAM budget; now all three are bounded. No perf
+  change on linear playback.
 - **2026-11-04 — a forward seek re-anchors the temporal cursor; barriers
   trimmed.** The isolated ring served the seek frame but left the cursor behind,
   so playback after a seek recomputed a full `2r+1`-centre window per frame:
@@ -650,10 +654,10 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
 - `VSFEEL_BM3D_TRACE=1` — acquire/submit/wait trace.
 - `VSFEEL_BM3D_TIMING=1` — per-frame host-stage split.
 - `VSFEEL_BM3D_PROFILE=1` — per-dispatch GPU kernel table at free, bm3dvk2's `BM3DVK_PROFILE` layout.
-- `VSFEEL_BM3D_VRAM=1` — creation-time VRAM budget.
+- `VSFEEL_BM3D_VRAM=1` — creation-time VRAM budget and emitted cap.
 - `VSFEEL_BM3D_SPLIT=0` — radius 0: one estimation submission per frame.
 - `VSFEEL_BM3D_INFLIGHT=<1..8>` — radius 0: private slots for this many frames
-  (default 4). The temporal rings are one window deep plus the isolated copy.
+  (default 4). Temporal rings are fixed; the isolated source ring is lazy.
 - `VSFEEL_BM3D_CAS=1` — force the CAS aggregation build (A/B only).
 - `VSFEEL_BM3D_PATCH_LDS=0/1` — force either reference-patch arm; unset follows
   the driver rule (shared memory everywhere except RADV).

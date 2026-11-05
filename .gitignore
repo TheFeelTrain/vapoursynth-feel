@@ -28,3 +28,6 @@ VP_VULKANINFO_*.json
 # Misc local state
 .vsjet/
 .dsh-managed-access.json
+
+# Code reviews and reports
+reports/

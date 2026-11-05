@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- BM3D uses less VRAM before its first seek
+
+### Fixed
+
+- BM3D no longer pins a full frame per request during reverse or random playback, and rejects a radius that does not fit the VRAM allowance at creation
+
 ## [v1.3.4] - 2026-11-05
 
 ### Changed

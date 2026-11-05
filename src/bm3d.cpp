@@ -44,6 +44,9 @@ constexpr int kMaxSearchRange = 8192;
 // 8% run-to-run swing, and 6% slower on average). VSFEEL_BM3D_INFLIGHT lowers
 // it to trade pipeline depth back for VRAM on a small card.
 constexpr int kInflightFrames = 4;
+// The finished-frame cache's depth. The VRAM budget lowers it further at
+// creation, so a large frame does not pin forty of them by count alone.
+constexpr size_t kEmittedMax = 40;
 
 struct Bm3dPlane {
     int width {};
@@ -424,8 +427,10 @@ struct BM3DData {
     } cursor {};
     // Frames already normalized ahead of their request. vspipe's request order
     // is close to, but not exactly, frame order; serving a cached frame beats
-    // restarting the whole window for a request that arrived late.
+    // restarting the whole window for a request that arrived late. The cap is
+    // the count kEmittedMax, lowered by the VRAM budget at creation.
     std::map<int, VSFrame *> emitted {};
+    size_t emitted_cap { kEmittedMax };
     // Frames the core has requested but not yet taken. A frame is normalized
     // only if it is needed now or still pending, so a prefetch that jumps ahead
     // costs the window it advances through, not a normalize per frame.
@@ -1533,6 +1538,22 @@ static VSFrame * normalize_cmd(BM3DData * d, VkCommandBuffer cmd, int f,
     return dst;
 }
 
+// Reap finished frames beyond the cache's cap, keeping the one just served and
+// anything the core has requested but not taken. Both returns from the temporal
+// path go through this: a request served by the isolated ring used to skip it,
+// so a reverse or random-access run grew the cache by one frame per request.
+static void reap_emitted(BM3DData * d, const VSAPI * vsapi, int keep) {
+    for (auto it = d->emitted.begin();
+         d->emitted.size() > d->emitted_cap && it != d->emitted.end();) {
+        if (it->first == keep || d->pending.count(it->first) != 0) {
+            ++it;
+            continue;
+        }
+        vsapi->freeFrame(it->second);
+        it = d->emitted.erase(it);
+    }
+}
+
 // A request the cursor cannot advance to (a seek, or a frame it has already
 // passed) is computed in its own one-window ring: the centres around it are
 // scattered with only the requested frame kept, and the main ring keeps its
@@ -1545,7 +1566,7 @@ static VSFrame * record_isolated(BM3DData * d, int n, VSFrameContext * frameCtx,
     const int first = std::max(0, n - r);
     const int top = std::min(last, n + r);
     if (d->trace) {
-        fprintf(stderr, "[t] n=%d isolated\n", n);
+        fprintf(stderr, "[t] n=%d isolated cached=%zu\n", n, d->emitted.size());
     }
     std::vector<const VSFrame *> holds;
     VSGPUExecContext * ctx = nullptr;
@@ -1557,6 +1578,23 @@ static VSFrame * record_isolated(BM3DData * d, int n, VSFrameContext * frameCtx,
                                      std::string(errbuf));
         }
         VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
+        // Allocate the private source ring on the first isolated request and
+        // keep it: a linear playback never pays it, and a seek-heavy consumer
+        // pays one allocation instead of one per request.
+        for (int gi = 0; gi < d->n_groups; ++gi) {
+            auto & g = d->groups[gi];
+            if (g.scratch_src.handle) {
+                continue;
+            }
+            if (auto e = gpu_make_buffer(*d->gpu, core, g.src_size * 4,
+                                         g.scratch_src,
+                                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                                         VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                !e.empty()) {
+                throw std::runtime_error(
+                    "the isolated source ring could not be allocated: " + e);
+            }
+        }
         bm3d_full_barrier(*d->gpu, cmd);
         for (int gi = 0; gi < d->n_groups; ++gi) {
             const auto & g = d->groups[gi];
@@ -1708,6 +1746,7 @@ static const VSFrame * temporalFrame(BM3DData * d, int n,
             if (const auto p = d->pending.find(n); p != d->pending.end()) {
                 d->pending.erase(p);
             }
+            reap_emitted(d, vsapi, n);
             return vsapi->addFrameRef(it->second);
         } catch (const std::exception & e) {
             d->failed = true;
@@ -1828,18 +1867,9 @@ static const VSFrame * temporalFrame(BM3DData * d, int n,
         vsapi->freeFrame(h);
     }
 
-    // Reap emitted frames beyond the ring's depth, keeping anything the core
-    // has requested but not taken yet.
-    constexpr size_t kEmittedMax = 40;
-    for (auto it = d->emitted.begin();
-         d->emitted.size() > kEmittedMax && it != d->emitted.end();) {
-        if (it->first == n || d->pending.count(it->first) != 0) {
-            ++it;
-            continue;
-        }
-        vsapi->freeFrame(it->second);
-        it = d->emitted.erase(it);
-    }
+    // Reap emitted frames beyond the cache cap, keeping anything the core has
+    // requested but not taken yet.
+    reap_emitted(d, vsapi, n);
     if (const auto it = d->emitted.find(n); it != d->emitted.end()) {
         if (const auto p = d->pending.find(n); p != d->pending.end()) {
             d->pending.erase(p);
@@ -2899,18 +2929,14 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
 
     VkDeviceSize src_total = 0;
     VkDeviceSize res_total = 0;
-    // One entry's buffers, sized from the current pipeline depth. The estimate
-    // cache is by far the largest allocation and a device's
-    // maxStorageBufferRange binds before VRAM does at the top of the radius
-    // range (1080p radius 7 on a 4 GiB-range card), so the depth gives way
-    // first: two frames are the floor the recording pipeline needs to overlap
-    // with execution at all, and the deeper default is worth having only while
-    // it fits.
-    for (;;) {
+    // One entry's buffers, sized from the current pipeline depth and checked
+    // against a device's maxStorageBufferRange, which can bind before VRAM does
+    // at the top of the radius range (1080p radius 7 on a 4 GiB-range card).
+    const auto size_groups = [&]() {
         bool fits = true;
         src_total = 0;
         res_total = 0;
-        for (int gi = 0; gi < d->n_groups && fits; ++gi) {
+        for (int gi = 0; gi < d->n_groups; ++gi) {
             auto & g = d->groups[gi];
             g.src_ring = src_ring;
             g.res_cap = res_cap;
@@ -2921,17 +2947,29 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
                          g.n_planes * g.pe;
             g.res_size =
                 static_cast<VkDeviceSize>(g.res_cap) * 2 * g.n_planes * g.pe;
-            fits = g.res_size * 4 <= d->gpu->limits.maxStorageBufferRange &&
+            fits = fits &&
+                   g.res_size * 4 <= d->gpu->limits.maxStorageBufferRange &&
                    g.src_size * 4 <= d->gpu->limits.maxStorageBufferRange;
             src_total += g.src_size;
             res_total += g.res_size;
         }
-        if (fits || inflight <= 2) {
-            break;
+        return fits;
+    };
+    // Radius 0's rings scale with the in-flight depth, so the depth can give
+    // way: two frames are the floor the recording pipeline needs to overlap
+    // with execution at all, and the deeper default is worth having only while
+    // it fits. A temporal ring is fixed at one window (shrinking either ring
+    // would break the cursor), so it has nothing to give way; the budget check
+    // below rejects it instead.
+    bool buffers_fit = false;
+    if (d->max_radius == 0) {
+        while (!(buffers_fit = size_groups()) && inflight > 2) {
+            --inflight;
+            src_ring = src_ring_of(inflight);
+            res_cap = res_cap_of(inflight);
         }
-        --inflight;
-        src_ring = src_ring_of(inflight);
-        res_cap = res_cap_of(inflight);
+    } else {
+        buffers_fit = size_groups();
     }
     for (int gi = 0; gi < d->n_groups; ++gi) {
         auto & g = d->groups[gi];
@@ -2959,6 +2997,55 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
                      d->max_radius);
             return set_error(msg);
         }
+    }
+
+    // Persistent VRAM: the rings just sized, the one-slot isolated accumulator,
+    // the split handoff and the finished-frame cache. The isolated source ring
+    // is outside this on purpose: it is allocated on the first seek and a
+    // linear playback never pays it. A quarter of the core's allowance is the
+    // budget, which leaves room for that duplicate ring plus the frame being
+    // normalized. An unknown allowance (0) skips the check, and a buffer past
+    // maxStorageBufferRange is left to the allocation's own error, which names
+    // the device limit rather than the budget.
+    VkDeviceSize frame_bytes = 0;
+    for (int p = 0; p < d->num_planes; ++p) {
+        if (d->planes[p].process) {
+            frame_bytes += d->planes[p].pe * d->elem_bytes;
+        }
+    }
+    VkDeviceSize ring_bytes = 0;
+    for (int gi = 0; gi < d->n_groups; ++gi) {
+        const auto & g = d->groups[gi];
+        ring_bytes += (g.src_size + g.res_size) * 4;
+        if (d->max_radius > 0) {
+            ring_bytes += static_cast<VkDeviceSize>(2) * g.n_planes * g.pe * 4;
+        }
+    }
+    if (d->split_kernel) {
+        ring_bytes += static_cast<VkDeviceSize>(d->match_words) * 4;
+    }
+    const VkDeviceSize vram = vsfeel_vram_limit(*d->gpu, core);
+    const VkDeviceSize budget = vram / 4;
+    if (budget > 0 && d->max_radius > 0 && buffers_fit) {
+        const double mib = 1024.0 * 1024.0;
+        if (ring_bytes > budget) {
+            char msg[320];
+            snprintf(
+                msg, sizeof(msg),
+                "the temporal rings need %.0f MiB (radius %d, %d planes, "
+                "%dx%d) but the VRAM allowance is %.0f MiB and BM3D keeps "
+                "them within a quarter of it; lower radius or use a smaller "
+                "clip",
+                static_cast<double>(ring_bytes) / mib, d->max_radius,
+                d->num_planes, d->vi->width, d->vi->height,
+                static_cast<double>(vram) / mib);
+            return set_error(msg);
+        }
+        const VkDeviceSize room = budget - ring_bytes;
+        const VkDeviceSize frames =
+            room / std::max<VkDeviceSize>(frame_bytes, 1);
+        d->emitted_cap = static_cast<size_t>(std::min<VkDeviceSize>(
+            frames, static_cast<VkDeviceSize>(kEmittedMax)));
     }
 
     if (d->trace_frame >= 0) {
@@ -3058,14 +3145,9 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
             return set_error(msg);
         }
         if (d->max_radius > 0) {
-            err = gpu_make_buffer(*d->gpu, core, g.src_size * 4, g.scratch_src,
-                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
-                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-            if (!err.empty()) {
-                return set_error("the isolated source ring could not be "
-                                 "allocated: " +
-                                 err);
-            }
+            // The isolated source ring is allocated by record_isolated, on the
+            // first request the cursor cannot serve, so a linear playback does
+            // not reserve a duplicate of the source ring.
             const VkDeviceSize one_slot =
                 static_cast<VkDeviceSize>(2) * g.n_planes * g.pe * 4;
             err = gpu_make_buffer(*d->gpu, core, one_slot, g.scratch_acc,
@@ -3244,23 +3326,44 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
         }
     }
 
-    // Per-instance VRAM budget. Both shared buffers come from the core's pool,
-    // so this is the whole footprint now: there is no per-stream staging and no
-    // download buffer. Gated by an env flag so a normal creation prints nothing.
+    // Per-instance VRAM budget. The rings and the handoff come from the core's
+    // pool, the finished-frame cache from the core's frame allocator; the
+    // isolated source ring is not in the total because it does not exist yet.
+    // Gated by an env flag so a normal creation prints nothing.
     if (vsfeel_debug_flag("VSFEEL_BM3D_VRAM")) {
         const double mib = 1024.0 * 1024.0;
         const double src_bytes = static_cast<double>(src_total) * 4.0;
         const double res_bytes = static_cast<double>(res_total) * 4.0;
-        const double total = src_bytes + res_bytes;
+        double iso_acc_bytes = 0.0;
+        for (int gi = 0; gi < d->n_groups; ++gi) {
+            const auto & g = d->groups[gi];
+            if (d->max_radius > 0) {
+                iso_acc_bytes +=
+                    static_cast<double>(2) * g.n_planes * g.pe * 4.0;
+            }
+        }
+        const double handoff_bytes =
+            d->split_kernel ? static_cast<double>(d->match_words) * 4.0 : 0.0;
+        const double total =
+            src_bytes + res_bytes + iso_acc_bytes + handoff_bytes;
+        char budget_txt[48];
+        if (budget > 0) {
+            snprintf(budget_txt, sizeof(budget_txt), "%.0f MiB",
+                     static_cast<double>(budget) / mib);
+        } else {
+            snprintf(budget_txt, sizeof(budget_txt), "unknown");
+        }
         fprintf(
             stderr,
-            "[bm3d] vram: src=%.1f MiB acc=%.1f MiB (%.0f%% of total) -> total=%.1f MiB "
+            "[bm3d] vram: src=%.1f MiB acc=%.1f MiB iso_acc=%.1f MiB "
+            "handoff=%.1f MiB iso_src=lazy -> total=%.1f MiB "
+            "(budget=%s, emitted_cap=%zu) "
             "(planes=%d entries=%d radius=%d inflight=%d res_cap=%d src_ring=%d "
             "stride=%d bits=%d)\n",
-            src_bytes / mib, res_bytes / mib,
-            100.0 * static_cast<double>(res_total) / (total > 0 ? total : 1.0),
-            total / mib, d->num_planes, d->n_groups, d->max_radius, inflight,
-            res_cap, src_ring, d->planes[0].stride, d->bits);
+            src_bytes / mib, res_bytes / mib, iso_acc_bytes / mib,
+            handoff_bytes / mib, total / mib, budget_txt, d->emitted_cap,
+            d->num_planes, d->n_groups, d->max_radius, inflight, res_cap,
+            src_ring, d->planes[0].stride, d->bits);
     }
 
     for (int gi = 0; gi < d->n_groups; ++gi) {
