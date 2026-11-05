@@ -21,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - NLMeans names the chroma plane in its plane-range error when `channels="UV"`
 - WNNM reports an over-large frame instead of failing with an allocation error
 - BM3D no longer loses denoise contributions at large temporal radii on GPUs without float atomics
+- Bilateral matches vszipcl at the frame edge on GPUs with less workgroup memory
 
 ## [v1.3.4] - 2026-11-05
 

@@ -379,10 +379,12 @@ def test_bilateral_lds_gate_has_three_ordered_tiers():
 
     The two-column shared tile is 28672 B and the one-column one 20480 B, so a
     limit between them must fall back to one column rather than all the way to
-    the ~4x slower plain kernel. The banner's `lds=` is the only place the
-    choice is observable, and the two-column kernel is worth ~16% (measured), so
-    a silent regression to the fallback must fail here rather than only show up
-    in the benchmark.
+    the ~4x slower plain kernel. At 12288 vszipcl's own 14336-byte tile no
+    longer fits its budget either, so the plain gather is required by the
+    reference's tier, not by our tile: the shared shape search stops at that
+    boundary. The banner's `lds=` is the only place the choice is observable,
+    and the two-column kernel is worth ~16% (measured), so a silent regression
+    to the fallback must fail here rather than only show up in the benchmark.
     """
     assert _bilateral_lds() == [28672], "the two-column tile is not the default"
     assert _bilateral_lds({"VSFEEL_LIMIT_SHARED_MEMORY": "24576"}) == [20480], (
@@ -390,7 +392,7 @@ def test_bilateral_lds_gate_has_three_ordered_tiers():
         "select the one-column shared kernel"
     )
     assert _bilateral_lds({"VSFEEL_LIMIT_SHARED_MEMORY": "12288"}) == [0], (
-        "a limit under both shared tiles must select the plain kernel"
+        "a budget that rejects the reference's own tile must select the plain kernel"
     )
 
 

@@ -20,6 +20,11 @@ reference crash cannot take the pytest process down with it.
 Run from the repository root:  tools/test.sh tests/test_bilateral.py -q
 """
 
+import os
+import re
+import subprocess
+import sys
+
 import numpy as np
 import pytest
 import vapoursynth as vs
@@ -64,6 +69,41 @@ def _compare(fmt, frames, params, guide=None):
     reference_or_skip("vszipcl", "Bilateral")
     spec = reference_spec("vszipcl", "Bilateral", fmt, frames=frames, kwargs=params, guide=guide)
     return reference_compare(spec)["maxdiff"]
+
+
+_TIER_PROBE = r"""
+import sys
+
+import vapoursynth as vs
+
+clip = vs.core.std.BlankClip(width=640, height=360, format=vs.GRAYS, length=2)
+kwargs = {"sigma_spatial": float(sys.argv[1]), "sigma_color": 0.15}
+if sys.argv[2] == "guide":
+    kwargs["ref"] = vs.core.std.FlipVertical(clip)
+vs.core.vsfeel.Bilateral(clip, **kwargs)
+"""
+
+
+def _bilateral_tiers(sigma_spatial, guide=False, env=None):
+    """The (local, lds) of every pipeline a creation reported.
+
+    A tier probe: the debug banner names the launch shape and the shared tile,
+    which is how a test proves a forced limit reached the kernel it meant to
+    cover rather than silently taking another one.
+    """
+    run_env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1", **(env or {})}
+    proc = subprocess.run(
+        [sys.executable, "-c", _TIER_PROBE, str(sigma_spatial), "guide" if guide else "none"],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=run_env,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return [
+        (m.group(1), int(m.group(2)))
+        for m in re.finditer(r"pipeline bilateral .* local=(\S+) lds=(\d+)", proc.stderr)
+    ]
 
 
 def test_bilateral_output_finite_f32(clip_grays):
@@ -422,6 +462,81 @@ def test_bilateral_ref_clip_matches_reference_f16(clip_grayh):
     assert out.format.id == clip_grayh.format.id
     worst = _compare("grayh", (0, 11, 23), kwargs, guide={"kind": "flipvertical"})
     assert worst <= F16_TOL, f"max diff {worst}"
+
+
+@pytest.mark.parametrize(
+    "fmt,tol",
+    [("gray16", 1.0), ("grayh", F16_TOL), ("grays", REF_TOL)],
+    ids=["u16", "f16", "f32"],
+)
+def test_bilateral_plain_with_guide_matches_reference(fmt, tol):
+    """The plain gather must read the guide, not the source, at every depth.
+
+    Every other guide comparison runs the two-column shared kernel, so only
+    its HAS_REF branch is covered; with ``use_shared_memory=False`` on both
+    arms, the plain kernel's guide load and center read run instead. Bounds:
+    one output code (u16), one half step (f16), f32 noise (measured 2.4e-7).
+    """
+    worst = _compare(
+        fmt,
+        (0, 23),
+        dict(sigma_spatial=2.0, sigma_color=0.05, use_shared_memory=False),
+        guide={"kind": "flipvertical"},
+    )
+    assert worst <= tol, f"max diff {worst} (tol {tol})"
+
+
+@pytest.mark.parametrize(
+    "fmt,tol",
+    [("yuv420ps", REF_TOL), ("yuv420p16", 1.0)],
+    ids=["f32", "u16"],
+)
+def test_bilateral_x1_with_guide_matches_reference(fmt, tol):
+    """The one-column shared kernel must index the guide through ref_offset.
+
+    With a guide at radius 24, a 45056-byte cap leaves no room for luma's
+    two-column tile (57344 B) but its one-column tile (40960 B) fits, while
+    chroma's two-column tile still fits: both guide-reading shared forms run
+    in one filter. That cap can only lower the reported limit, so the test
+    runs only when the banner confirms the 32x16 one-column tile; a device
+    that lands on another tier skips instead of silently grading it.
+    """
+    reference_or_skip("vszipcl", "Bilateral")
+    env = {"VSFEEL_LIMIT_SHARED_MEMORY": "45056"}
+    if ("32x16x1", 40960) not in _bilateral_tiers(8.0, guide=True, env=env):
+        pytest.skip("this device's workgroup memory does not select the one-column tile")
+    spec = reference_spec(
+        "vszipcl",
+        "Bilateral",
+        fmt,
+        frames=(0, 11, 23),
+        kwargs=dict(sigma_spatial=[8.0, 1.0, 1.0], sigma_color=[0.15, 0.05, 0.05]),
+        guide={"kind": "flipvertical"},
+    )
+    worst = reference_compare(spec, env=env)["maxdiff"]
+    assert worst <= tol, f"max diff {worst} (tol {tol})"
+
+
+def test_bilateral_small_lds_matches_reference_borders(clip_grays):
+    """A 16 KiB device must keep the reference's clamped border semantics.
+
+    At radius 24 vszipcl's 16x8 tile is 14336 B, so it stays on its shared
+    kernel at the Vulkan workgroup-memory floor, while the old fixed-shape
+    gate dropped the plane to the plain gather whose clipped window differs on
+    the frame edge (measured 9.3e-2 max, interior exact). The shape floor
+    means a shared tile always fits when the reference's does, so this is f32
+    noise now. This is the regression net for the tier decision, not just for
+    the pixels: plain-vs-clamped is invisible on a 64 KiB device.
+    """
+    spec = reference_spec(
+        "vszipcl",
+        "Bilateral",
+        "grays",
+        frames=(0, 11, 23),
+        kwargs=dict(sigma_spatial=8.0, sigma_color=0.15),
+    )
+    worst = reference_compare(spec, env={"VSFEEL_LIMIT_SHARED_MEMORY": "16384"})["maxdiff"]
+    assert worst < REF_TOL, f"max diff {worst}"
 
 
 def test_bilateral_per_plane_lds_tiers_match_reference_f32(clip_grays, monkeypatch):

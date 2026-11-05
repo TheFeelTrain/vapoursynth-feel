@@ -14,7 +14,10 @@ Design (current):
   runs two adjacent output columns per thread off one tile read per tap: their
   windows overlap in 2R of 2R+1 columns, so the LDS reads halve. It is worth
   ~16% over the one-column shared kernel. A plane drops a tier when its tile
-  does not fit the device's LDS (28672 B vs 20480 B at R=24/32x16).
+  does not fit the device's LDS (28672 B vs 20480 B at R=24/32x16), and the
+  shared tier first searches the block shape down to 4x8: the plain gather
+  clips its window where the reference's shared kernel clamps, so it is only
+  correct when the reference is plain too.
 - Three io variants — u16, f16, f32 — selected by the input format (half is
   `stFloat` + 16 bits). A half element is a storage width, not a precision: the
   f16 path runs the f32 tile and arithmetic, widens exactly on load and narrows
@@ -32,7 +35,9 @@ Design (current):
   silent fallback), is clamped to each device limit, and then has its larger
   axis halved until the invocation budget fits. The block is the thread count,
   so with the two-column kernel a workgroup covers `2*block_x` columns and the
-  tile is `2R + 2*block_x` wide.
+  tile is `2R + 2*block_x` wide. A shared plane may halve a defaulted axis
+  further (to `block_y=8` and `block_x=4`) so its tile fits; a pinned axis
+  always keeps the clamped shape.
 - Unprocessed planes (`sigma < FLT_EPSILON`) ride along from the source through
   `newVideoFrame2`, keeping their own producer pairs; nothing is submitted when
   every plane is unprocessed.
@@ -71,8 +76,9 @@ session noise, not a regression.
 
 `src/bilateral.cpp` + `src/bilateral_shared.comp` / `src/bilateral_plain.comp`.
 
-- Per plane at creation: `BilateralPlaneConfig{width, height, stride, pipeline,
-  grid_x, grid_y}`; identical plane configs share one `VkPipeline`.
+- Per plane at creation: `BilateralPlaneConfig{width, height, block_x,
+  block_y, cols, shared, pipeline, grid_x, grid_y}`; identical plane configs
+  share one `VkPipeline`.
 - The input format's `bits`/`half` select the SPIR-V pair: u16 →
   `bilateral_{shared,plain}_u16`, f16 → `..._f16`, f32 → `..._f32`. The LDS
   tile and the tap arithmetic are f32 at every depth; only the element type and
@@ -81,13 +87,18 @@ session noise, not a regression.
   (3 storage buffers via push descriptors, `VK_WHOLE_SIZE`), `vkCmdDispatch`,
   then `gpuExecReadsFrame`/`gpuExecWritesPlane`/`gpuExecSubmit`. No barrier is
   needed: the plane dispatches touch disjoint buffers.
-- The kernel tier is per plane: the two-column shared kernel while
-  `(1 + has_ref) * (2R + 2*block_x) * (2R + block_y) * 4` fits
-  `maxComputeSharedMemorySize`, else the one-column shared kernel while
-  `(1 + has_ref) * (2R + block_x) * (2R + block_y) * 4` does, else the plain
-  gather. `use_shared_memory=0` forces the last. `SHARED_FLOATS` is exactly what
+- The tier is per plane and follows the reference first: vszipcl filters a
+  plane with its shared kernel while `(1 + has_ref) * (2R + 8) * (2R + 16) * 4`
+  fits `min(48 KiB, maxComputeSharedMemorySize)`, and its shared kernel clamps
+  the window at the frame edge where the plain one clips it. While that holds,
+  vsfeel searches the defaulted block axes down from the auto shape for a
+  two-column then one-column tile within `maxComputeSharedMemorySize`, halving
+  `block_y` to 8 and `block_x` to 4; the two-column tile at 4x8 is strictly
+  smaller than the reference tile at every radius, so one always fits. When it
+  does not hold, the plane is plain, exactly like the reference.
+  `use_shared_memory=0` forces the last. `SHARED_FLOATS` is exactly what
   `buf[SHARED_FLOATS]` reserves (the output goes straight to `dst[]`), and the
-  grid follows the chosen column count.
+  grid follows the chosen shape and column count.
 - The two-column kernel indexes the tile from the workgroup's first plane column
   (`gx0 = group.x * 2*gl_WorkGroupSize.x`), so the load's `clamp` and the
   accumulation share one base. Per row it walks the `2R+2` columns spanning both
@@ -208,6 +219,17 @@ Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter bilateral
 
 ## Historical
 
+- **2026-11-05 — shared-tier border parity on small-LDS devices.** The tier
+  was fixed to one block shape, so a device that could hold the reference's
+  16x8 tile but not the 32x16 one ran the plain gather while vszipcl stayed
+  shared, and the clipped vs clamped window differed at the frame edge
+  (640x360 GRAYS f32, R=24, forced 16 KiB: 9.3e-2 max; interior exact).
+  Creation now searches the defaulted block axes down to 4x8 first, where the
+  two-column tile is smaller than the reference's at every radius
+  (2.98e-7 after, same config, one-column 16x16 tile). A pinned axis is never
+  resized. No perf change on this 64 KiB device, where every shared plane
+  already fit at the auto shape.
+
 - **2026-10-12 — the R80 port's scoreboard is void.** It read 1982.1 → 1980.5
   (CPU cache) and 1975.3 → 1974.0 (`--download`) fps, measured against the
   pre-fix benchmark harness (`notes/METHOD.md`); the same-session result it
@@ -273,7 +295,8 @@ SDMA and the port reaches parity without any core change.
 - **Shared vs plain is worth ~3.2–3.8x, and the gate must follow vszipcl's
   reference budget.** vszipcl picks its 16x8 tile when
   `(2R+8)(2R+16)*4 < min(48 KiB, deviceLDS)`; vsfeel now uses the same
-  predicate, then still requires its own wider tile to fit. On this 64 KiB
+  predicate, then requires one of its own shared tiles to fit, shrinking the
+  defaulted block axes to 4x8 if needed. On this 64 KiB
   device R=49 is shared on both sides and R=50..52 is plain on both; before
   the change vsfeel stayed shared through R=52 and the border pixels diverged
   by 0.024 against vszipcl (measured on 64x64 f32). Every shared-kernel cell
