@@ -6,23 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [v1.3.4] - 2026-11-05
+
 ### Changed
 
-- Bilateral respects valid explicit `block_x` and `block_y` values on devices with tighter limits and matches vszipcl at very large radii
+- Bilateral respects explicit `block_x` and `block_y` on more GPUs and matches vszipcl at very large radii
 
 ### Fixed
 
-- BM3D plays on at full speed after a seek instead of recomputing a full temporal window for every frame
-- BM3D applies limited-range `_Range` to RGB clips and no longer corrupts multi-plane output, leaks resources, or crashes on a missing frame
-- DFTTest no longer corrupts tall frames with high spatial overlap or double-rounds float32 padding
-- DFTTest and NNEDI3 report oversized memory requests at creation, and DFTTest also rejects negative sigmas and duplicate frequency locations
-- EEDI3, EEDI3H, EEDI3AA, and NNEDI3 clear stale field tags, and EEDI3AA and its two-pass equivalent now agree exactly in 32-bit float
-- NNEDI3 rejects `dh=True` with a `planes` subset and works more reliably across GPU drivers
-- NLMeans uses the reference's rounding for 16-bit output
+- BM3D no longer slows down after a seek, corrupts limited-range RGB or multi-plane output, or crashes on missing frames
+- DFTTest's 32-bit float output and NLMeans's 16-bit output now match the reference more closely, and DFTTest no longer corrupts tall frames with high spatial overlap
+- DFTTest rejects invalid `slocation` values, and DFTTest, NNEDI3, and WNNM reject oversized frames at creation
+- EEDI3, EEDI3H, EEDI3AA, and NNEDI3 clear stale field tags, and EEDI3AA matches its two-pass equivalent exactly in 32-bit float
+- NNEDI3 rejects `dh=True` with a `planes` subset and works on more GPU drivers
 - A failed upstream frame is reported as an error instead of crashing
-- Cache paths containing Windows separators work, and malformed numeric environment settings fall back to their defaults
-- WNNM rejects frames that are too large for the device and no longer allocates unused memory
-- The `feel_aa` wrapper validates `rfactor` and `pscale`, and uploads a host prefilter once instead of once per reader
+- Cache paths with Windows separators work, and invalid numeric environment settings fall back to their defaults
+- `feel_aa` validates `rfactor` and `pscale`, and is faster with a host prefilter
 
 ## [v1.3.3] - 2026-11-04
 
@@ -178,6 +177,7 @@ The plugin now uses the core's GPU device, queues, and transfers instead of mana
 - First release: Bilateral, BM3D, GaussBlur, DFTTest, NLMeans, EEDI3, EEDI3H, EEDI3AA, and NNEDI3
 - A benchmark harness, vs-jetpack backend integration, and Windows and Linux wheels
 
+[v1.3.4]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.3...v1.3.4
 [v1.3.3]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.2...v1.3.3
 [v1.3.2]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.1...v1.3.2
 [v1.3.1]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.0...v1.3.1
