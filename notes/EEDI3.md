@@ -212,6 +212,8 @@ register is the largest addressable item; the three-window redundancy is worth
 
 ## Historical
 
+- **2026-11-05 — dependencies match the batched requests.** A batch reads
+  `n..n+B-1` from all three and AA's sclip `2j`/`2j+1`; they are `rpGeneral` now.
 - **2026-10-18 — f16 as a storage-only third io depth.** Pad, xpose copies, the
   AA intermediate `v`/O_0 and the mask kernels gained native `float16_t`
   variants; `dst`/`cint`/`vout`/`hp` stay f32, so f16 = the f32 path rounded

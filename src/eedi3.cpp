@@ -2975,10 +2975,17 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     }
 
     std::vector<VSFilterDependency> deps;
-    const bool general = d->field > 1 && !d->aa;
+    // What each dependency is actually asked for. A batch requests `last > n`
+    // from all three, and AA additionally reads sclip at 2*j and 2*j+1, so its
+    // sclip is general even when the batch is one frame. Only an unbatched,
+    // non-AA instance reads nothing past its own frame.
+    const bool batched = d->batch_size > 1;
+    const bool general = (d->field > 1 && !d->aa) || batched;
+    const bool sclip_general = general || d->aa;
     deps.push_back({ d->node, general ? rpGeneral : rpStrictSpatial });
     if (d->vcheck > 0 && d->sclip_node) {
-        deps.push_back({ d->sclip_node, rpStrictSpatial });
+        deps.push_back(
+            { d->sclip_node, sclip_general ? rpGeneral : rpStrictSpatial });
     }
     if (d->mclip_node) {
         deps.push_back(
