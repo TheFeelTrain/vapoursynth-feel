@@ -295,10 +295,16 @@ def test_validation_layer_smoke(filter_name):
         ("EEDI3AA", {"field": 3}),
         ("NNEDI3", {"field": 1}),
         ("WNNM", {}),
+        ("Box", {"width": 32, "height": 16}),
     ],
 )
 def test_variable_format_clips_are_rejected(filter_name, kwargs):
-    """A variable-format clip has no single format to validate at creation."""
+    """A variable-format clip has no single format to validate at creation.
+
+    Box must name the format, not the bitdepth: its check used to share one
+    message with the depth/family test, so a variable clip reported a bitdepth
+    problem it did not have.
+    """
     core = vs.core
     clip = core.std.Splice(
         [
@@ -308,7 +314,8 @@ def test_variable_format_clips_are_rejected(filter_name, kwargs):
         mismatch=1,
     )
     assert clip.format.color_family == vs.UNDEFINED
-    with pytest.raises(vs.Error, match="constant format|bitdepth"):
+    expected = "constant format" if filter_name == "Box" else "constant format|bitdepth"
+    with pytest.raises(vs.Error, match=expected):
         getattr(core.vsfeel, filter_name)(clip, **kwargs)
 
 

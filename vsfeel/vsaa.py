@@ -153,7 +153,9 @@ def _scale_on_device(
     Point. The scaler still supplies the kernel name and its parameters, which
     go straight to ``core.resize`` for the built-in kernels -- Catrom, Lanczos
     and the rest are all resident through that entry point -- and to
-    ``core.vsfeel.Box`` for ``Box``, whose ``resize2.Custom`` is CPU-only.
+    ``core.vsfeel.Box`` for ``Box``, whose ``resize2.Custom`` is CPU-only. Box
+    runs on the device for downscales only; an upscale takes that host path and
+    is uploaded once by the caller, like any other host scaler.
 
     A scaler with neither (a learned model such as ``ArtCNN``, or a custom
     kernel whose plugin is CPU-only) falls back to its own ``scale`` and may
@@ -169,6 +171,11 @@ def _scale_on_device(
                 feel_aa,
                 f"shift={shift}",
             )
+        # The device kernel only downscales; a Box supersampler at rfactor > 1
+        # is an upscale, so take Box's host resize2 path and let the caller
+        # upload the result once.
+        if width > clip.width or height > clip.height:
+            return scaler.scale(clip, width, height)
         return core.vsfeel.Box(clip, width=width, height=height)
 
     name = getattr(getattr(scaler, "scale_function", None), "name", None)
@@ -323,10 +330,11 @@ def feel_aa(
 
     A scaler is used on the device when it has a ``core.resize`` equivalent
     (``Point``, ``Bilinear``, ``Bicubic``/``Catrom``/``Mitchell``/``Hermite``,
-    ``Lanczos``, ``Spline16/36/64``) or is ``Box``. One that does not, such as
-    the default ``ArtCNN``, runs wherever it can and its result is uploaded
-    once, so everything after it stays resident. The input must be 16-bit
-    integer or 16/32-bit float, with even dimensions.
+    ``Lanczos``, ``Spline16/36/64``) or is ``Box``. A Box upscale (as a
+    supersampler at ``rfactor`` > 1) runs on the host and is uploaded once. One
+    that does not, such as the default ``ArtCNN``, runs wherever it can and its
+    result is uploaded once, so everything after it stays resident. The input
+    must be 16-bit integer or 16/32-bit float, with even dimensions.
     """
     UnsupportedColorFamilyError.check(clip, (vs.YUV, vs.GRAY), feel_aa)
 

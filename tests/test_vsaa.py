@@ -144,6 +144,27 @@ def test_feel_aa_allows_host_supersampler(clip_grays):
     assert _plane(out).shape == (clip_grays.height, clip_grays.width)
 
 
+def test_feel_aa_box_supersampler_runs_on_the_host(clip_grays):
+    """Box at rfactor > 1 is an upscale, which the device Box cannot take.
+
+    feel_aa must run that one step through Box's host resize2 path (the single
+    auto-inserted download) and upload the result once (no auto-inserted
+    upload), then keep the default Box downscale on the device. Measured
+    against the based_aa chain with the same scalers: mean 5.6e-7, max 7.6e-3,
+    inside the float chain's usual mask-difference bound.
+    """
+    out, transfers = _transfers(lambda: feel_aa(clip_grays, rfactor=2, supersampler=Box))
+    assert out.gpu_resident, transfers
+    downloads = [m for m in transfers if "GPUDownload" in m]
+    uploads = [m for m in transfers if "GPUUpload" in m]
+    assert len(downloads) == 1, transfers  # the host Box scaler's own input
+    assert uploads == [], transfers  # one explicit upload covered every reader
+    ref = _reference(clip_grays, rfactor=2, supersampler=Box)
+    d = np.abs(_plane(ref) - _plane(out))
+    assert d.mean() <= 1e-5, f"mean|d|={d.mean()}"
+    assert d.max() <= 1.5e-2, f"max|d|={d.max()}"
+
+
 def test_feel_aa_matches_based_aa_yuv_float(clip_yuv420ps):
     """YUV float32: the same bound, and the untouched chroma rides along."""
     ref = _reference(clip_yuv420ps, supersampler=Point(), downscaler=Catrom())

@@ -368,15 +368,18 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         vsapi->freeNode(d->node);
     };
 
+    if (!vsh::isConstantVideoFormat(d->vi)) {
+        return set_error(
+            "input must have a constant format and positive dimensions.");
+    }
+
     const auto & fmt = d->vi->format;
     const int bits = fmt.bitsPerSample;
     const bool depth_ok =
         (fmt.sampleType == stFloat && (bits == 16 || bits == 32)) ||
         (fmt.sampleType == stInteger && bits == 16);
-    if (!vsh::isConstantVideoFormat(d->vi) || !depth_ok || d->vi->width <= 0 ||
-        d->vi->height <= 0 ||
-        (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV &&
-         fmt.colorFamily != cfRGB)) {
+    if (!depth_ok || (fmt.colorFamily != cfGray && fmt.colorFamily != cfYUV &&
+                      fmt.colorFamily != cfRGB)) {
         return set_error(
             "input bitdepth must be u16 (16-bit integer), f16 or f32 (16/32-bit float), Gray/YUV/RGB.");
     }
