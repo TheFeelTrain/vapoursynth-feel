@@ -253,7 +253,14 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
 _BILATERAL_PARAMS = {"sigma_spatial": 3.0, "sigma_color": 0.05}
 _DFTTEST_PARAMS = {"tbsize": 3}
 _GAUSS_PARAMS = {"sigma": 2.0}
-_BM3D_PARAMS = {"sigma": 0.7, "radius": 1, "bm_range": 16, "ps_range": 7, "block_step": 4}
+_BM3D_PARAMS = {
+    "sigma": 0.7,
+    "radius": 1,
+    "bm_range": 16,
+    "ps_range": 7,
+    "block_step": 4,
+    "matrix": 1,
+}
 # The CPU oracle refuses a subsampled clip when chroma is processed, so the
 # YUV420 geometry case grades luma; chroma strides are covered by the other
 # filters' 4:2:0/4:2:2 rows.

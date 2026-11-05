@@ -131,11 +131,11 @@ the native type, dropping the caller's `depth()` node (see Performance).
 - Filtering follows the CPU: strict `|c| > thr`, no exempt coefficient, weight
   one when every coefficient was thresholded away, Wiener
   `ref^2/(ref^2 + sigma^2)` per coefficient with its `den > 0` fallback, and
-  `1/max(FLT_EPSILON, sum coeff^2)`. Sigma factors are the CPU's
-  `2.7*normY*64/255` and `normY*64/255` (normY = bt709 luma-row norm
-  0.7496149945138504, which `th_mse` carries too); in this kernel's `A = D^-1 F`
-  domain the CPU's per-DC-axis threshold collapses to a uniform one (pinned by a
-  test).
+  `1/max(FLT_EPSILON, sum coeff^2)`. Each plane's sigma is the CPU's
+  `2.7*norm*64/255` (final `norm*64/255`) and `th_mse` carries the luma norm;
+  the norms come from the matrix the reference selects by resolution (or
+  `matrix=`); in this kernel's `A = D^-1 F` domain the CPU's per-DC-axis
+  threshold collapses to a uniform one (pinned by a test).
 - A centre frame searches only real frames (`zlo = max(0, r-m)`,
   `zhi = min(2r, nframes-1-m+r)`). Each group member's filtered patch is
   scattered into the frame it was taken from, so an output frame's accumulator
@@ -276,6 +276,17 @@ the native type, dropping the caller's `depth()` node (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-11-05 — color-matrix norms and internal RGB-to-OPP.** Sigma and th_mse
+  had carried the bt709 luma norm for every plane and resolution; they now use
+  the reference's resolution-selected matrix (SD smpte170m, HD bt709, UHD
+  bt2020nc, or `matrix=`) and each plane's own row norm, so chroma is no longer
+  filtered 10-17% too strong. RGB input is converted to the opponent space
+  inside the filter (`bm3d_opp.comp`: the ring conversion mixes the three source
+  planes, a per-frame three-plane scratch holds the normalized OPP result, and
+  the output conversion mixes it back to RGB), matching the references and
+  bm3dvk2; the temporal aggregation stays in OPP, as the reference's VBasic
+  does. Color CPU bounds tightened 1.5e-2 -> 8e-3 (measured 0.00532); RGB's
+  spatial path matches the CPU's Basic (~0.006).
 - **2026-11-05 — temporal caches are bounded.** The isolated return skipped the
   reap (one full frame pinned per reverse request), the isolated source ring was
   eager, and creation had no VRAM budget; now all three are bounded. No perf

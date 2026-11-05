@@ -60,9 +60,11 @@ core.vsfeel.BM3D(clip clip[,
     float   th_mse,                 # matching threshold in 8-bit MSE units; default 400+80*sigma,
                                     #   200+10*sigma with a ref clip; 0 = reference block only
     bool    chroma=False,           # True = one joint 4:4:4 entry, whose groups come from luma
-    int     extractor_exp=0])       # aggregation weight bias, 0..127; 0 = off, >= 3 = reproducible output
+    int     extractor_exp=0,        # aggregation weight bias, 0..127; 0 = off, >= 3 = reproducible output
+    int     matrix=2])              # color matrix (VapourSynth enum): 2 = by resolution (SD/HDS/UHD),
+                                    #   100 = opponent (forced for RGB input)
 ```
-`chroma=True` requires YUV444. `BM3Dv2` stays registered as an alias for scripts written against the old name.
+`chroma=True` requires YUV444. The default `matrix`, 2, selects the color matrix from the clip's resolution (SD: smpte170m, HD: bt709, UHD: bt2020nc); it scales each plane's sigma by that plane's row norm and `th_mse` by the luma norm. RGB input is converted to the opponent color space internally and converted back on output; `matrix` is ignored for RGB. `BM3Dv2` stays registered as an alias for scripts written against the old name.
 
 ### Box
 

@@ -108,6 +108,27 @@ static bool bm3d_full_range(const VSFrame * frame, const VSVideoFormat & format,
     return !error && range != 0;
 }
 
+// Push blocks of bm3d_opp.comp. The shader declares a packed scalar layout, so
+// the host structs must stay 4-byte aligned with no padding.
+struct Bm3dOppInPush {
+    uint32_t dst_off; // first destination element of this plane
+    uint32_t count;   // elements to convert
+    int32_t plane;    // 0 = Y, 1 = U, 2 = V
+    float neutral;    // Int2Float neutral
+    float gain;       // Int2Float gain
+};
+struct Bm3dOppOutPush {
+    uint32_t count; // elements to convert
+    uint32_t y_off; // plane bases in the three-plane scratch
+    uint32_t u_off;
+    uint32_t v_off;
+    int32_t plane;  // 0 = R, 1 = G, 2 = B
+    float out_gain; // Float2Int scale for this frame's _Range
+    float out_bias; // neutral + 0.5
+};
+static_assert(sizeof(Bm3dOppInPush) == 20, "bm3d_opp in push block");
+static_assert(sizeof(Bm3dOppOutPush) == 28, "bm3d_opp out push block");
+
 // One estimation entry: a source ring and an estimate stack that cover the
 // planes it filters. The reference's default mode builds one entry per
 // processed plane (each plane block-matches on its own content, at its own
@@ -446,6 +467,16 @@ struct BM3DData {
     std::condition_variable cache_cv;
     Bm3dProbe probe {};
     Bm3dKernelProfile profile {};
+    // RGB is filtered in the opponent space (see bm3d_opp.comp): one input
+    // pipeline converts the source planes into the ring, one output pipeline
+    // writes the RGB frame from the normalized OPP planes, and the scratch
+    // holds those three planes until the output conversion has read them.
+    bool rgb {};
+    VkPipeline opp_in_pipeline {};
+    VkPipeline opp_out_pipeline {};
+    VkDeviceSize opp_pe {};
+    uint32_t opp_grid_x {};
+    uint32_t opp_grid_y {};
 
     // Drain every submission this instance made; also called from BM3DFree so
     // the profile can read its timestamp queries before the pool goes away.
@@ -519,7 +550,9 @@ struct BM3DData {
         }
         profile.destroy();
         std::vector<VkPipeline> pipelines { copy_pipeline };
-        pipelines.reserve(1 + groups.size() * 3 + planes.size());
+        pipelines.reserve(3 + groups.size() * 3 + planes.size());
+        pipelines.push_back(opp_in_pipeline);
+        pipelines.push_back(opp_out_pipeline);
         for (auto & g : groups) {
             gpu_destroy_buffer(*gpu, g.scratch_acc);
             gpu_destroy_buffer(*gpu, g.scratch_src);
@@ -748,6 +781,22 @@ create_copy_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
     const GpuWorkgroup kCopyWorkgroup { .x = 256 };
     return gpu_create_pipeline(gpu, code, code_size, layout, nullptr, nullptr,
                                0, 0, "bm3d_copy", 0, kCopyWorkgroup);
+}
+
+// The RGB <-> OPP pair (bm3d_opp.comp): four bindings and a linear index, so it
+// shares the estimation kernels' set layout and push-constant block range.
+static std::variant<VkPipeline, std::string>
+create_opp_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
+                    const uint32_t * code, size_t code_size, bool input) {
+    if (input) {
+        const GpuWorkgroup kOppInWorkgroup { .x = 256 };
+        return gpu_create_pipeline(gpu, code, code_size, layout, nullptr,
+                                   nullptr, 0, 0, "bm3d_opp_in", 0,
+                                   kOppInWorkgroup);
+    }
+    const GpuWorkgroup kOppOutWorkgroup { .x = 256 };
+    return gpu_create_pipeline(gpu, code, code_size, layout, nullptr, nullptr,
+                               0, 0, "bm3d_opp_out", 0, kOppOutWorkgroup);
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,6 +1133,26 @@ static void record_src_copies(BM3DData * d, const Bm3dFrame & fr,
         d->gpu->vk->vkCmdCopyBuffer2(cmd, &copy);
         d->profile.end(cmd, timer);
     };
+    // RGB is filtered in OPP: one dispatch reads the three source planes and
+    // writes this entry's OPP plane into the ring, the same linear range the
+    // copy path handles.
+    const auto convert_plane = [&](const VkBuffer rgb[3], VkBuffer dst,
+                                   VkDeviceSize offset, VkDeviceSize bytes,
+                                   const Bm3dGroup & g, const Bm3dRange & range,
+                                   int plane) {
+        const auto timer = d->profile.begin(cmd, "BM3D opp in");
+        Bm3dOppInPush push { static_cast<uint32_t>(offset),
+                             static_cast<uint32_t>(bytes), plane, range.neutral,
+                             range.gain };
+        const VkBuffer bufs[4] { rgb[0], rgb[1], rgb[2], dst };
+        d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                      d->opp_in_pipeline);
+        gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, bufs, 4);
+        gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &push,
+                           sizeof(push));
+        d->gpu->vk->vkCmdDispatch(cmd, g.copy_grid_x, g.copy_grid_y, 1);
+        d->profile.end(cmd, timer);
+    };
     for (int gi = 0; gi < d->n_groups; ++gi) {
         const auto & g = d->groups[gi];
         const auto & gf = fr.g[gi];
@@ -1105,16 +1174,27 @@ static void record_src_copies(BM3DData * d, const Bm3dFrame & fr,
                 }
                 // The clip that is denoised rides in the slot's last clip
                 // section; in final mode the Wiener reference clip precedes it.
-                copy_plane(w.source[plane], src_buf,
-                           slot_base +
-                               static_cast<VkDeviceSize>(clips - 1) *
-                                   g.n_planes * g.pe +
-                               static_cast<VkDeviceSize>(pi) * g.pe,
-                           g.pe, g, w.src_range[plane]);
+                const VkDeviceSize src_off =
+                    slot_base +
+                    static_cast<VkDeviceSize>(clips - 1) * g.n_planes * g.pe +
+                    static_cast<VkDeviceSize>(pi) * g.pe;
+                if (d->rgb) {
+                    convert_plane(w.source, src_buf, src_off, g.pe, g,
+                                  w.src_range[plane], plane);
+                } else {
+                    copy_plane(w.source[plane], src_buf, src_off, g.pe, g,
+                               w.src_range[plane]);
+                }
                 if (d->final) {
-                    copy_plane(w.ref[plane], src_buf,
-                               slot_base + static_cast<VkDeviceSize>(pi) * g.pe,
-                               g.pe, g, w.ref_range[plane]);
+                    const VkDeviceSize ref_off =
+                        slot_base + static_cast<VkDeviceSize>(pi) * g.pe;
+                    if (d->rgb) {
+                        convert_plane(w.ref, src_buf, ref_off, g.pe, g,
+                                      w.ref_range[plane], plane);
+                    } else {
+                        copy_plane(w.ref[plane], src_buf, ref_off, g.pe, g,
+                                   w.ref_range[plane]);
+                    }
                 }
             }
         }
@@ -1201,7 +1281,7 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame * fr,
                             VkCommandBuffer cmd, int n, int base, bool isolated,
                             const std::array<VkBuffer, 3> & dst_planes,
                             const std::array<Bm3dRange, 3> & out_range,
-                            bool gputrace) {
+                            bool gputrace, const GpuBuffer & opp) {
     const int r = d->max_radius;
     bool first_dispatch = true;
     int remaining = 0;
@@ -1232,10 +1312,16 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame * fr,
             // so without this bind the dispatch runs on undefined descriptor
             // state (black output, and device loss under concurrent
             // submissions).
+            // An RGB plane is normalized into the OPP scratch; the output
+            // conversion below turns the three of them into the RGB frame.
+            const VkBuffer dst_buf = d->rgb ? opp.buffer : dst_planes[plane];
+            const int32_t dst_base =
+                d->rgb ? static_cast<int32_t>(static_cast<VkDeviceSize>(plane) *
+                                              d->opp_pe)
+                       : 0;
             bm3d_bind(*d->gpu, cmd, d->pipeline_layout,
                       isolated ? g.scratch_src.buffer : g.src.buffer,
-                      isolated ? g.scratch_acc.buffer : g.res.buffer,
-                      dst_planes[plane],
+                      isolated ? g.scratch_acc.buffer : g.res.buffer, dst_buf,
                       isolated ? g.scratch_src.buffer : g.src.buffer);
             {
                 const int clips = d->final ? 2 : 1;
@@ -1272,6 +1358,7 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame * fr,
                     int32_t src_base;
                     float gain;
                     float bias;
+                    int32_t dst_base;
                 } push { n,
                          isolated ? n : base,
                          slot0_push,
@@ -1280,7 +1367,8 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame * fr,
                          out_range[plane].gain != 0.0f
                              ? 1.0f / out_range[plane].gain
                              : 0.0f,
-                         out_range[plane].neutral + 0.5f };
+                         out_range[plane].neutral + 0.5f,
+                         dst_base };
                 gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &push,
                                    sizeof(push));
             }
@@ -1306,6 +1394,32 @@ static void record_bm3d_agg(BM3DData * d, const Bm3dFrame * fr,
                     3);
             }
             first_dispatch = false;
+        }
+    }
+    if (d->rgb) {
+        // The three OPP planes are in the scratch; a barrier makes them visible
+        // to the output conversion, which writes each RGB plane of the frame.
+        bm3d_full_barrier(*d->gpu, cmd);
+        for (int plane = 0; plane < 3; ++plane) {
+            const VkBuffer bufs[4] { opp.buffer, opp.buffer, opp.buffer,
+                                     dst_planes[plane] };
+            const Bm3dOppOutPush push { static_cast<uint32_t>(d->opp_pe),
+                                        0,
+                                        static_cast<uint32_t>(d->opp_pe),
+                                        static_cast<uint32_t>(2 * d->opp_pe),
+                                        plane,
+                                        out_range[plane].gain != 0.0f
+                                            ? 1.0f / out_range[plane].gain
+                                            : 0.0f,
+                                        out_range[plane].neutral + 0.5f };
+            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                          d->opp_out_pipeline);
+            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, bufs, 4);
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &push,
+                               sizeof(push));
+            const auto timer = d->profile.begin(cmd, "BM3D opp out");
+            d->gpu->vk->vkCmdDispatch(cmd, d->opp_grid_x, d->opp_grid_y, 1);
+            d->profile.end(cmd, timer);
         }
     }
 }
@@ -1477,7 +1591,8 @@ static void record_center_cmd(BM3DData * d, VkCommandBuffer cmd, int m,
 // Allocate the output frame for f and record its normalization into the
 // request's command buffer. The frame's unprocessed planes are shared from the
 // centre source frame, as in the radius-0 path.
-static VSFrame * normalize_cmd(BM3DData * d, VkCommandBuffer cmd, int f,
+static VSFrame * normalize_cmd(BM3DData * d, VkCommandBuffer cmd,
+                               VSGPUExecContext * ctx, int f,
                                VSFrameContext * frameCtx, VSCore * core,
                                const VSAPI * vsapi, int base, bool isolated) {
     const VSFrame * center = vsapi->getFrameFilter(f, d->node, frameCtx);
@@ -1533,8 +1648,22 @@ static VSFrame * normalize_cmd(BM3DData * d, VkCommandBuffer cmd, int f,
         dst_planes[plane] = info.buffer;
     }
 
+    // RGB: the aggregation writes the three OPP planes here and the output
+    // conversion below reads them. The buffer lives as long as this
+    // submission's context, so concurrent frames never share it.
+    GpuBuffer opp;
+    if (d->rgb) {
+        if (auto e =
+                gpu_frame_buffer(*d->gpu, core, ctx, 3 * d->opp_pe * 4, opp);
+            !e.empty()) {
+            vsapi->freeFrame(dst);
+            throw std::runtime_error("the opponent output scratch could not "
+                                     "be allocated: " +
+                                     e);
+        }
+    }
     record_bm3d_agg(d, nullptr, cmd, f, base, isolated, dst_planes, out_range,
-                    false);
+                    false, opp);
     return dst;
 }
 
@@ -1611,7 +1740,7 @@ static VSFrame * record_isolated(BM3DData * d, int n, VSFrameContext * frameCtx,
                               holds);
         }
         VSFrame * out =
-            normalize_cmd(d, cmd, n, frameCtx, core, vsapi, n, true);
+            normalize_cmd(d, cmd, ctx, n, frameCtx, core, vsapi, n, true);
         for (const VSFrame * h : holds) {
             d->gpu->api->gpuExecReadsFrame(ctx, h);
         }
@@ -1798,8 +1927,8 @@ static const VSFrame * temporalFrame(BM3DData * d, int n,
                     continue;
                 }
                 vsfeel_trace_mark("normalize");
-                VSFrame * out =
-                    normalize_cmd(d, cmd, f, frameCtx, core, vsapi, 0, false);
+                VSFrame * out = normalize_cmd(d, cmd, ctx, f, frameCtx, core,
+                                              vsapi, 0, false);
                 const auto [it, inserted] = d->emitted.emplace(f, out);
                 if (!inserted) {
                     vsapi->freeFrame(it->second);
@@ -2215,8 +2344,19 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
             }
         }
         vsfeel_trace_mark("sub agg");
+        GpuBuffer opp;
+        if (d->rgb) {
+            if (auto e = gpu_frame_buffer(*d->gpu, core, agg_ctx,
+                                          3 * d->opp_pe * 4, opp);
+                !e.empty()) {
+                d->gpu->api->gpuExecAbandon(agg_ctx);
+                return set_error("the opponent output scratch could not be "
+                                 "allocated: " +
+                                 e);
+            }
+        }
         record_bm3d_agg(d, &fr, d->gpu->api->gpuExecCommandBuffer(agg_ctx), n,
-                        0, false, dst_planes, out_range, gputrace);
+                        0, false, dst_planes, out_range, gputrace, opp);
         uint64_t agg_value = 0;
         if (d->gpu->api->gpuExecSubmit(agg_ctx, &agg_value, aerr,
                                        sizeof(aerr))) {
@@ -2439,6 +2579,9 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
         d->vi->format.colorFamily != cfRGB) {
         return set_error("only Gray, YUV and RGB input are supported.");
     }
+    // RGB is filtered in the reference's opponent space: the ring conversion
+    // and the output conversion below are that space's transport.
+    d->rgb = d->vi->format.colorFamily == cfRGB;
     d->num_planes = d->vi->format.numPlanes;
 
     // The block-matching kernel always loads unconditional 8x8 patches and
@@ -2462,6 +2605,116 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
         return set_error("clip frame count must be known and positive.");
     }
 
+    // The reference's color matrix: th_mse is scaled by its luma-row norm and
+    // each plane's sigma by that plane's own row norm. `matrix` takes the CPU
+    // plugin's enum; 2 (unspecified) follows the reference's resolution rule
+    // (SD smpte170m, HD bt709, UHD bt2020nc). 100 is the opponent matrix,
+    // forced for RGB input and available for a clip converted with RGB2OPP.
+    std::array<double, 3> matrix_norm {};
+    // Every accepted matrix sets it; the switch's default returns.
+    const char * matrix_name;
+    {
+        int matrix =
+            vsh::int64ToIntS(vsapi->mapGetInt(in, "matrix", 0, &error));
+        if (d->rgb) {
+            // The references force the opponent space for RGB, whatever
+            // `matrix` says.
+            matrix = 100;
+        } else if (error || matrix == 2) {
+            const bool uhd = d->vi->width > 2048 || d->vi->height > 1536;
+            const bool hd = d->vi->width > 1024 || d->vi->height > 576;
+            matrix = uhd ? 9 : (hd ? 1 : 6);
+        }
+        double yr {}, yg {}, yb {}, ur {}, ug {}, ub {}, vr {}, vg {}, vb {};
+        if (matrix == 0) {
+            // GBR: Y=G, U=B, V=R.
+            matrix_name = "gbr";
+            yg = 1.0;
+            ub = 1.0;
+            vr = 1.0;
+        } else if (matrix == 100) {
+            matrix_name = "opp";
+            yr = yg = yb = 1.0 / 3.0;
+            ur = 0.5;
+            ub = -0.5;
+            vr = 0.25;
+            vg = -0.5;
+            vb = 0.25;
+        } else {
+            double kr {}, kg {}, kb {};
+            switch (matrix) {
+            case 1:
+                matrix_name = "bt709";
+                kr = 0.2126;
+                kg = 0.7152;
+                kb = 0.0722;
+                break;
+            case 4:
+                matrix_name = "fcc";
+                kr = 0.30;
+                kg = 0.59;
+                kb = 0.11;
+                break;
+            case 5:
+                matrix_name = "bt470bg";
+                kr = 0.299;
+                kg = 0.587;
+                kb = 0.114;
+                break;
+            case 6:
+                matrix_name = "smpte170m";
+                kr = 0.299;
+                kg = 0.587;
+                kb = 0.114;
+                break;
+            case 7:
+                matrix_name = "smpte240m";
+                kr = 0.212;
+                kg = 0.701;
+                kb = 0.087;
+                break;
+            case 9:
+                matrix_name = "bt2020nc";
+                kr = 0.2627;
+                kg = 0.6780;
+                kb = 0.0593;
+                break;
+            case 10:
+                matrix_name = "bt2020c";
+                kr = 0.2627;
+                kg = 0.6780;
+                kb = 0.0593;
+                break;
+            default:
+                return set_error(
+                    "\"matrix\" must be 0 (GBR), 1 (bt709), 2 (auto), 4 "
+                    "(fcc), 5 (bt470bg), 6 (smpte170m), 7 (smpte240m), 9 "
+                    "(bt2020nc), 10 (bt2020c) or 100 (opponent).");
+            }
+            yr = kr;
+            yg = kg;
+            yb = kb;
+            ur = -yr * 0.5 / (1.0 - yb);
+            ug = -yg * 0.5 / (1.0 - yb);
+            ub = 0.5;
+            vr = 0.5;
+            vg = -yg * 0.5 / (1.0 - yr);
+            vb = -yb * 0.5 / (1.0 - yr);
+        }
+        // The rows are summed explicitly: GCC 16 miscompiles the same three
+        // scalar sqrt expressions at -O3 (the U term is dropped).
+        const double rows[3][3] = { { yr, yg, yb },
+                                    { ur, ug, ub },
+                                    { vr, vg, vb } };
+        for (int i = 0; i < 3; ++i) {
+            double sum = 0.0;
+            for (int j = 0; j < 3; ++j) {
+                sum += rows[i][j] * rows[i][j];
+            }
+            matrix_norm[i] = std::sqrt(sum);
+        }
+    }
+
     // Per-plane sigma, exactly as the reference's perPlane: a missing entry
     // repeats the previous one, the first defaults to 3. A plane whose sigma is
     // below FLT_EPSILON is a bit-exact source copy (the reference's PROC_MASK,
@@ -2479,7 +2732,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
     }
     bool any_process = false;
     for (int i = 0; i < d->num_planes; ++i) {
-        d->planes[i].process = sigma[i] >= FLT_EPSILON;
+        // The reference processes all three RGB planes in OPP, even at sigma 0.
+        d->planes[i].process = d->rgb || sigma[i] >= FLT_EPSILON;
         any_process = any_process || d->planes[i].process;
     }
     // th_mse: the CPU matcher's threshold in 8-bit MSE units, derived from the
@@ -2488,10 +2742,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
     // conditionally accepted, and converted to the shader's SSD domain once:
     // MSE_8bit = SSD * 255^2 / 64.
     //
-    // The CPU scales both its threshold and its sigmas by normY, the norm of
-    // the RGB->YUV luma row of its color matrix (0.7496 for the bt709 default
-    // at HD). The sigma factors above already carry that 0.75, so the threshold
-    // carries the same constant and the two stay in the same units.
+    // The reference scales both its threshold and its per-plane sigmas by the
+    // norms of its color matrix rows; th_mse carries the luma-row norm.
     {
         double th_mse = vsapi->mapGetFloat(in, "th_mse", 0, &error);
         if (error) {
@@ -2502,8 +2754,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
                 "\"th_mse\" must be a finite non-negative number of 8-bit MSE "
                 "units (0 selects the reference block alone).");
         }
-        constexpr double kMatrixNormY = 0.7496149945138504;
-        double th_sse = th_mse * kMatrixNormY * (64.0 / (255.0 * 255.0));
+        double th_sse = th_mse * matrix_norm[0] * (64.0 / (255.0 * 255.0));
         if (th_sse > static_cast<double>(FLT_MAX)) {
             // A finite but enormous threshold accepts every finite distance; a
             // saturated float keeps that meaning instead of narrowing to inf.
@@ -2534,12 +2785,14 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
             (extractor_exp != 0) ? std::ldexp(1.0f, extractor_exp) : 0.0f;
     }
 
-    // match the reference sigma scaling exactly (different factor for the
-    // final Wiener pass); a skipped plane keeps exactly zero so the kernel's
-    // epsilon test cannot disagree with the unscaled decision above
-    const float sigma_factor = d->final ? std::bit_cast<float>(0x3e40a76cu)
-                                        : std::bit_cast<float>(0x3f020a9cu);
+    // Match the reference's sigma scaling exactly: each plane's sigma carries
+    // its own color-matrix row norm, and the final Wiener pass uses 1x instead
+    // of the basic stage's 2.7x. A skipped plane keeps exactly zero so the
+    // kernel's epsilon test cannot disagree with the unscaled decision above.
+    const double sigma_scale = d->final ? 1.0 : 2.7;
     for (int i = 0; i < d->num_planes; ++i) {
+        const float sigma_factor =
+            static_cast<float>(sigma_scale * matrix_norm[i] * 64.0 / 255.0);
         d->planes[i].sigma =
             d->planes[i].process ? sigma[i] * sigma_factor : 0.0f;
     }
@@ -2715,6 +2968,9 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
                 d->gpu->driver_id);
         fprintf(stderr, "[bm3d] workgroup: %u threads, %u groups\n",
                 d->workgroup, d->groups_per_wg);
+        fprintf(stderr,
+                "[bm3d] color matrix: %s (norms y=%.6f u=%.6f v=%.6f)\n",
+                matrix_name, matrix_norm[0], matrix_norm[1], matrix_norm[2]);
     }
     // The 8x8 group transposes and the group-8 reduction are subgroup shuffles,
     // and the kernel's per-lane layout puts each 8-lane group inside one
@@ -2738,9 +2994,10 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
         d->set_layout = std::get<VkDescriptorSetLayout>(result);
     }
     {
-        const auto result = // 7 ints; the aggregation kernel declares the
-                            // first 5 of the same block
-            gpu_pipeline_layout(*d->gpu, d->set_layout, 7 * sizeof(int32_t));
+        // The largest block is the aggregation's eight ints (the OPP output
+        // base included); the estimation kernel declares the first seven.
+        const auto result =
+            gpu_pipeline_layout(*d->gpu, d->set_layout, 8 * sizeof(int32_t));
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -3198,6 +3455,50 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
         d->copy_pipeline = std::get<VkPipeline>(result);
     }
 
+    // RGB: the input conversion widens and mixes each source frame into OPP,
+    // and the output conversion mixes the three normalized OPP planes back
+    // into the RGB frame. Both follow the clip's depth at the outside and f32
+    // in the middle (the ring and the scratch).
+    if (d->rgb) {
+        const uint32_t * in_code = bm3d_opp_in_f32_spv;
+        size_t in_size = bm3d_opp_in_f32_spv_size;
+        const uint32_t * out_code = bm3d_opp_out_f32_spv;
+        size_t out_size = bm3d_opp_out_f32_spv_size;
+        if (d->bits == 16) {
+            if (d->half) {
+                in_code = bm3d_opp_in_f16_spv;
+                in_size = bm3d_opp_in_f16_spv_size;
+                out_code = bm3d_opp_out_f16_spv;
+                out_size = bm3d_opp_out_f16_spv_size;
+            } else {
+                in_code = bm3d_opp_in_u16_spv;
+                in_size = bm3d_opp_in_u16_spv_size;
+                out_code = bm3d_opp_out_u16_spv;
+                out_size = bm3d_opp_out_u16_spv_size;
+            }
+        }
+        const auto in_pipe = create_opp_pipeline(*d->gpu, d->pipeline_layout,
+                                                 in_code, in_size, true);
+        if (std::holds_alternative<std::string>(in_pipe)) {
+            return set_error(std::get<std::string>(in_pipe));
+        }
+        d->opp_in_pipeline = std::get<VkPipeline>(in_pipe);
+        const auto out_pipe = create_opp_pipeline(*d->gpu, d->pipeline_layout,
+                                                  out_code, out_size, false);
+        if (std::holds_alternative<std::string>(out_pipe)) {
+            return set_error(std::get<std::string>(out_pipe));
+        }
+        d->opp_out_pipeline = std::get<VkPipeline>(out_pipe);
+        d->opp_pe = d->planes[0].pe;
+        std::string grid_err;
+        if (!vsfeel_fold_grid(d->gpu->limits,
+                              (static_cast<uint64_t>(d->opp_pe) + 255) / 256,
+                              "bm3d's opponent output", d->opp_grid_x,
+                              d->opp_grid_y, grid_err)) {
+            return set_error(grid_err);
+        }
+    }
+
     for (int gi = 0; gi < d->n_groups; ++gi) {
         auto & g = d->groups[gi];
         const auto & first = d->planes[g.planes[0]];
@@ -3293,7 +3594,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
             // an identifier carrying the io stems attaches them to every other
             // helper it is passed through.
             const auto result =
-                d->bits != 16
+                (d->rgb || d->bits != 16)
                     ? create_agg_pipeline(*d->gpu, p, g, *d, bm3d_agg_f32_spv,
                                           bm3d_agg_f32_spv_size,
                                           d->pipeline_layout)
@@ -3426,6 +3727,7 @@ void vsfeel_register_bm3d(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
                                             "th_mse:float:opt;"
                                             "chroma:int:opt;"
                                             "extractor_exp:int:opt;"
+                                            "matrix:int:opt;"
                                             "device_id:int:opt;"
                                             "num_streams:int:opt;";
     vspapi->registerFunction("BM3D", argspec, "clip:vnode:gpu;", BM3DCreate,

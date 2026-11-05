@@ -56,6 +56,7 @@ layout(push_constant) uniform PushConstants {
     int src_base;  // this frame's source plane in the src ring
     float out_gain; // Float2Int scale for this frame's _Range
     float out_bias; // neutral + 0.5, already including the rounding term
+    int dst_base;  // RGB: this OPP plane's base in the three-plane scratch
 } pc;
 
 const int BLOCK = 8;
@@ -99,7 +100,8 @@ void store_result(int x, int y, float v) {
 #elif defined(IO_F16)
     dst16[o] = float16_t(v);
 #else
-    dst[o] = v;
+    // The f32 arm also serves RGB, whose three OPP planes share the scratch.
+    dst[pc.dst_base + o] = v;
 #endif
 }
 

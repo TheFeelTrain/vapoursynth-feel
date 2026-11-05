@@ -1,0 +1,162 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+/*
+ * RGB <-> OPP around the filter. The references convert an RGB clip to mawen's
+ * opponent space before the kernel and back after it (the CPU's RGB2FloatYUV /
+ * FloatYUV2RGB, bm3dvk2's matrixOPP), so an RGB clip is filtered as three OPP
+ * planes, each with its own color-matrix norm.
+ *
+ * ENTRY_RGB2OPP reads the three source planes and writes one OPP plane into the
+ * ring (binding 3); -DIO_U16/-DIO_F16/-DIO_F32 selects the source type and the
+ * integer arm applies the same Int2Float gain/neutral as the copy kernel.
+ * ENTRY_OPP2RGB reads the three normalized OPP planes from the scratch and
+ * writes one plane of the RGB output frame with the same Float2Int rounding the
+ * aggregation uses. Both are linear, so the index folds into Y exactly like the
+ * copy kernel's (see vsfeel_fold_grid).
+ */
+
+#if !defined(IO_U16) && !defined(IO_F16) && !defined(IO_F32)
+#define IO_F32 1
+#endif
+
+#if defined(IO_U16)
+#define PEAK 65535.0f
+#else
+#define PEAK 1.0f
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+uint flat_index() {
+    return (uint(gl_WorkGroupID.y) * uint(gl_NumWorkGroups.x) +
+            uint(gl_WorkGroupID.x)) *
+               256u +
+           uint(gl_LocalInvocationIndex);
+}
+
+#if defined(ENTRY_RGB2OPP)
+
+#if defined(IO_U16)
+layout(std430, binding = 0) readonly buffer RBuf { uint16_t r[]; };
+layout(std430, binding = 1) readonly buffer GBuf { uint16_t g[]; };
+layout(std430, binding = 2) readonly buffer BBuf { uint16_t b[]; };
+#elif defined(IO_F16)
+layout(std430, binding = 0) readonly buffer RBuf { float16_t r[]; };
+layout(std430, binding = 1) readonly buffer GBuf { float16_t g[]; };
+layout(std430, binding = 2) readonly buffer BBuf { float16_t b[]; };
+#else
+layout(std430, binding = 0) readonly buffer RBuf { float r[]; };
+layout(std430, binding = 1) readonly buffer GBuf { float g[]; };
+layout(std430, binding = 2) readonly buffer BBuf { float b[]; };
+#endif
+layout(std430, binding = 3) writeonly buffer DstBuf { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint dst_off;  // first destination element of this plane
+    uint count;    // elements to convert
+    int plane;     // 0 = Y, 1 = U, 2 = V
+    float neutral; // Int2Float neutral (4:4:4 RGB keeps its own range mapping)
+    float gain;    // Int2Float gain
+} pc;
+
+float load_r(uint i) {
+#if defined(IO_U16)
+    return (float(int(r[i])) - pc.neutral) * pc.gain;
+#elif defined(IO_F16)
+    return float(r[i]);
+#else
+    return r[i];
+#endif
+}
+
+float load_g(uint i) {
+#if defined(IO_U16)
+    return (float(int(g[i])) - pc.neutral) * pc.gain;
+#elif defined(IO_F16)
+    return float(g[i]);
+#else
+    return g[i];
+#endif
+}
+
+float load_b(uint i) {
+#if defined(IO_U16)
+    return (float(int(b[i])) - pc.neutral) * pc.gain;
+#elif defined(IO_F16)
+    return float(b[i]);
+#else
+    return b[i];
+#endif
+}
+
+void main() {
+    const uint i = flat_index();
+    if (i >= pc.count) {
+        return;
+    }
+    const float rr = load_r(i);
+    const float gg = load_g(i);
+    const float bb = load_b(i);
+    float o;
+    if (pc.plane == 0) {
+        o = (rr + gg + bb) * (1.0 / 3.0);
+    } else if (pc.plane == 1) {
+        o = (rr - bb) * 0.5;
+    } else {
+        o = (rr - 2.0 * gg + bb) * 0.25;
+    }
+    dst[pc.dst_off + i] = o;
+}
+
+#endif // ENTRY_RGB2OPP
+
+#if defined(ENTRY_OPP2RGB)
+
+layout(std430, binding = 0) readonly buffer YBuf { float y[]; };
+layout(std430, binding = 1) readonly buffer UBuf { float u[]; };
+layout(std430, binding = 2) readonly buffer VBuf { float v[]; };
+#if defined(IO_U16)
+layout(std430, binding = 3) writeonly buffer DstBuf { uint16_t dst[]; };
+#elif defined(IO_F16)
+layout(std430, binding = 3) writeonly buffer DstBuf { float16_t dst[]; };
+#else
+layout(std430, binding = 3) writeonly buffer DstBuf { float dst[]; };
+#endif
+
+layout(push_constant) uniform PushConstants {
+    uint count;    // elements to convert
+    uint y_off;    // plane bases in the three-plane scratch
+    uint u_off;
+    uint v_off;
+    int plane;     // 0 = R, 1 = G, 2 = B
+    float out_gain; // Float2Int scale for this frame's _Range
+    float out_bias; // neutral + 0.5, already including the rounding term
+} pc;
+
+void main() {
+    const uint i = flat_index();
+    if (i >= pc.count) {
+        return;
+    }
+    const float yy = y[pc.y_off + i];
+    const float uu = u[pc.u_off + i];
+    const float vv = v[pc.v_off + i];
+    float o;
+    if (pc.plane == 0) {
+        o = yy + uu + vv * (2.0 / 3.0);
+    } else if (pc.plane == 1) {
+        o = yy - vv * (4.0 / 3.0);
+    } else {
+        o = yy - uu + vv * (2.0 / 3.0);
+    }
+#if defined(IO_U16)
+    dst[i] = uint16_t(uint(clamp(o * pc.out_gain + pc.out_bias, 0.0, PEAK)));
+#elif defined(IO_F16)
+    dst[i] = float16_t(o);
+#else
+    dst[i] = o;
+#endif
+}
+
+#endif // ENTRY_OPP2RGB

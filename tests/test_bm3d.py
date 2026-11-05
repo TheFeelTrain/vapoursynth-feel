@@ -712,6 +712,50 @@ def test_bm3d_vram_banner_reports_budget_and_lazy_scratch(budget_mib):
         assert 0 < int(match.group(1)) < 40, proc.stderr[-2000:]
 
 
+_MATRIX_BANNER_SCRIPT = r"""
+import vapoursynth as vs
+
+core = vs.core
+for width, height in ((640, 360), (1025, 577), (2049, 1537)):
+    clip = core.std.BlankClip(width=width, height=height, format=vs.GRAYS,
+                              length=1)
+    core.vsfeel.BM3D(clip, sigma=0.7)
+"""
+
+
+def test_bm3d_matrix_banner_names_the_resolution_rule():
+    """VSFEEL_DEBUG=1 must show the matrix the resolution rule selected.
+
+    The threshold and sigma norms depend on it, so a stale choice would be
+    invisible in the output; 640x360 is SD, 1025x577 crosses the HD threshold
+    and 2049x1537 the UHD one.
+    """
+    env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1"}
+    proc = subprocess.run(
+        [sys.executable, "-c", _MATRIX_BANNER_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    lines = [line for line in proc.stderr.splitlines() if "color matrix:" in line]
+    assert len(lines) == 3, proc.stderr[-2000:]
+    assert "smpte170m" in lines[0] and "0.668555" in lines[0], lines[0]
+    assert "bt709" in lines[1] and "0.749615" in lines[1], lines[1]
+    assert "bt2020nc" in lines[2] and "0.729528" in lines[2], lines[2]
+
+
+def test_bm3d_rejects_an_unknown_matrix():
+    """A matrix outside the CPU enum must fail at creation, not fall back."""
+    with pytest.raises(vs.Error, match="matrix"):
+        vs.core.vsfeel.BM3D(
+            vs.core.fmtc.bitdepth(source_clip(), bits=32, fulls=True, fulld=True),
+            sigma=0.7,
+            matrix=3,
+        )
+
+
 def test_bm3d_device_id(clip_grays):
     """device_id and num_streams are accepted no-ops.
 
@@ -866,7 +910,9 @@ def test_bm3d_per_plane_radius_matches_scalar_runs(clip_yuv420ps):
 
     The reference's radius is one value, so the oracle is the filter itself run
     one plane at a time: a plane's estimate depends only on its own pixels and
-    window, which is what per-plane radius relies on. The atomic-ordering floor
+    window, which is what per-plane radius relies on. The oracle keeps the color
+    clip and matrix, because a Gray run of a chroma plane would scale its sigma
+    by the luma-row norm instead of that plane's own. The atomic-ordering floor
     (1e-5) is the only difference allowed between the two.
     """
     src = vs.core.std.Crop(clip_yuv420ps, left=64, top=48)
@@ -876,16 +922,22 @@ def test_bm3d_per_plane_radius_matches_scalar_runs(clip_yuv420ps):
         ([SIGMA, SIGMA, SIGMA], [0, 3, 1]),
         ([SIGMA, SIGMA], [1, 2, 0]),
     ]
+    # th_mse defaults to 400 + sigma[0]*80, and the single-plane oracle zeroes
+    # the other planes' sigma, so pin the same threshold on both runs.
+    th = 400.0 + SIGMA * 80.0
     for sigma, radius in cases:
-        out = _run_with(src, sigma=sigma, radius=radius)
+        out = _run_with(src, sigma=sigma, radius=radius, th_mse=th)
         for p in range(3):
             s = sigma[min(p, len(sigma) - 1)]
             r = radius[min(p, len(radius) - 1)]
-            gray = vs.core.std.ShufflePlanes(src, p, vs.GRAY)
-            ref = _run_with(gray, sigma=s, radius=r)
+            only_sigma = [0.0, 0.0, 0.0]
+            only_sigma[p] = s
+            only_radius = [0, 0, 0]
+            only_radius[p] = r
+            ref = _run_with(src, sigma=only_sigma, radius=only_radius, th_mse=th)
             for n in (0, 11, 23):
                 a = plane_to_ndarray(out.get_frame(n), p)
-                b = plane_to_ndarray(ref.get_frame(n), 0)
+                b = plane_to_ndarray(ref.get_frame(n), p)
                 worst = float(np.abs(a - b).max())
                 assert worst < 1e-5, f"plane {p} (radius {r}) at frame {n}: {worst:.3e}"
 
@@ -951,9 +1003,6 @@ def test_bm3d_chroma_requires_yuv444():
     yuv420 = vs.core.fmtc.bitdepth(source_clip(), bits=32, fulls=True, fulld=True)
     with pytest.raises(vs.Error, match="YUV444"):
         vs.core.vsfeel.BM3D(yuv420, sigma=0.7, chroma=1)
-    rgb = vs.core.resize.Bicubic(source_clip(), format=vs.RGBS, matrix_in_s="709")
-    with pytest.raises(vs.Error, match="YUV444"):
-        vs.core.vsfeel.BM3D(rgb, sigma=0.7, chroma=1)
 
 
 def test_bm3d_joint_chroma_denoises_every_plane():
@@ -1022,7 +1071,12 @@ def test_bm3d_joint_chroma_shares_luma_groups():
 
 
 def test_bm3d_rgb_is_denoised():
-    """RGB input runs all three planes like the references do."""
+    """RGB input runs all three planes in the reference's opponent space.
+
+    The conversion is internal (bm3d_opp.comp), so the output is RGB again;
+    the CPU's Basic path does the same and is compared by
+    test_bm3d_rgb_matches_cpu.
+    """
     rgb = vs.core.resize.Bicubic(source_clip(), format=vs.RGBS, matrix_in_s="709")
     out = BM3D(
         rgb, sigma=0.7, radius=2, bm_range=BM_RANGE, ps_range=PS_RANGE, block_step=BLOCK_STEP
@@ -1035,6 +1089,17 @@ def test_bm3d_rgb_is_denoised():
             assert float(np.abs(a - plane_to_ndarray(s, plane)).max()) > 1e-4, (
                 f"RGB plane {plane} was not denoised at frame {n}"
             )
+
+
+def test_bm3d_rgb_matches_cpu():
+    """RGB pixels must match the CPU's internal-OPP spatial path.
+
+    The CPU converts RGB to OPP, filters and converts back inside Basic, which
+    is exactly the domain bm3d_opp.comp reproduces; the measured residual is
+    the matcher's tie order (~0.006).
+    """
+    payload = _cpu_compare(dict(BASE_KWARGS, radius=0), stage="image", clip="rgbs")
+    assert payload["maxdiff"] < 8e-3, f"RGB vs CPU: {payload} (measured 0.0058)"
 
 
 def test_bm3d_rejects_subsampled_plane_below_block():
@@ -1553,8 +1618,8 @@ def test_bm3d_group_dct_tables_are_a_scaled_dct_ii_pair():
 # The CPU plugin is driven as `VBasic` + `VAggregate` for the temporal stages
 # and as `Basic` for the radius-zero spatial one, with every parameter the two
 # sides share set explicitly (`block_size=8`, `group_size=8`, `bm_step=1`,
-# `ps_step=1`, and `matrix=1` to pin the CPU's color-matrix norm to the bt709
-# value vsfeel's sigma and threshold factors carry). `th_mse` is passed
+# `ps_step=1`, and the same `matrix`: the pinned cases use bt709, the auto
+# cases pass 2 so both sides follow the resolution rule). `th_mse` is passed
 # explicitly whenever vsfeel is given one, and otherwise reproduced from the
 # documented stage default.
 #
@@ -1604,6 +1669,9 @@ elif kind == "yuv420ps":
 elif kind == "yuv444ps":
     clip = core.resize.Bicubic(source, format=vs.YUV444PS)
 elif kind == "rgbs":
+    # The CPU's Basic on RGB is the internal-OPP path, so this branch is only
+    # valid with stage="image": VBasic/VAggregate on RGB return OPP planes,
+    # not RGB (the CPU has no temporal RGB entry point that converts back).
     clip = core.resize.Bicubic(source, format=vs.RGBS, matrix_in_s="709")
 elif kind == "gray16":
     clip = core.fmtc.bitdepth(core.std.ShufflePlanes(source, 0, vs.GRAY), bits=16,
@@ -1649,6 +1717,9 @@ feel.setdefault("bm_range", 9)
 feel.setdefault("ps_range", 4)
 feel.setdefault("ps_num", 2)
 feel.setdefault("block_step", 8)
+# Both sides take the same CPU-enum matrix; the pinned comparisons use bt709
+# and the auto cases pass 2, so a norm difference is a real defect.
+feel.setdefault("matrix", 1)
 
 sigma = feel["sigma"]
 if not isinstance(sigma, (list, tuple)):
@@ -1663,7 +1734,7 @@ cpu = dict(
     group_size=8,
     bm_range=feel["bm_range"],
     bm_step=1,
-    matrix=1,
+    matrix=feel["matrix"],
 )
 if stage != "image":
     cpu.update(radius=radius, ps_num=feel["ps_num"], ps_range=feel["ps_range"],
@@ -1883,12 +1954,10 @@ def test_bm3d_final_stage_matches_cpu(clip_grays):
 def test_bm3d_luma_only_color_matches_cpu():
     """A color clip with chroma disabled must match the CPU on luma.
 
-    Only the luma plane is comparable: the CPU scales a plane's sigma by that
-    plane's color-matrix norm (normY/normU/normV) while vsfeel's factors carry
-    normY for every plane, and its RGB input goes through no opponent-color
-    transform at all. With `sigma=[x, 0, 0]` both sides process luma alone, so
-    the domains are identical. 4:4:4 because the CPU's plugin refuses
-    subsampled input when chroma is processed.
+    Only the luma plane is comparable here: the chroma planes are not processed,
+    so their different norm does not enter. With `sigma=[x, 0, 0]` both sides
+    process luma alone. 4:4:4 because the CPU's plugin refuses subsampled input
+    when chroma is processed.
     """
     payload = _cpu_compare(dict(BASE_KWARGS, sigma=[0.7, 0.0, 0.0]), clip="yuv444ps")
     assert payload["per_plane"][0] < 3e-3, f"luma vs CPU: {payload}"
@@ -1897,14 +1966,48 @@ def test_bm3d_luma_only_color_matches_cpu():
 def test_bm3d_per_plane_color_matches_cpu():
     """All three planes of a 4:4:4 clip, chroma included.
 
-    The chroma thresholds differ by the normU/normV ratio (0.64/0.68 against
-    normY 0.75), so this is a close but not exact domain; the measured bound
-    carries that, and it still catches a gross matcher or indexing error on
-    chroma. The joint `chroma=True` entry has no CPU equivalent at all and is
-    covered by the self-consistency tests.
+    Both sides now scale each plane's sigma by its own color-matrix norm, so
+    the remaining residual is the CPU matcher's tie order, which is larger on
+    chroma than on luma. The joint `chroma=True` entry has no CPU equivalent at
+    all and is covered by the self-consistency tests.
     """
     payload = _cpu_compare(BASE_KWARGS, clip="yuv444ps")
-    assert payload["maxdiff"] < 1.5e-2, f"color vs CPU: {payload} (was 0.00676)"
+    assert payload["maxdiff"] < 8e-3, f"color vs CPU: {payload} (measured 0.00532)"
+
+
+def test_bm3d_sd_auto_matrix_matches_cpu():
+    """The default matrix is the reference's resolution rule: 640x360 is SD.
+
+    smpte170m's luma norm is 0.6686 against bt709's 0.7496, so a filter that
+    still carried the bt709 constant would denoise ~12% stronger than the CPU.
+    """
+    payload = _cpu_compare(dict(BASE_KWARGS, sigma=3.0, matrix=2), clip="grays")
+    assert payload["maxdiff"] < 5e-3, f"SD auto luma vs CPU: {payload} (measured 0.00365)"
+
+
+def test_bm3d_sd_auto_matrix_color_matches_cpu():
+    """The same SD default on a 4:4:4 clip, luma and chroma.
+
+    The per-plane norms differ (0.6686/0.6231/0.6572), so a norm error shows
+    on any plane; the chroma bound is wider because its tie residual is.
+    """
+    payload = _cpu_compare(dict(BASE_KWARGS, sigma=3.0, matrix=2), clip="yuv444ps")
+    assert payload["per_plane"][0] < 5e-3, f"SD auto color luma vs CPU: {payload}"
+    assert payload["maxdiff"] < 2e-2, f"SD auto color vs CPU: {payload} (measured 0.01527)"
+
+
+def test_bm3d_pinned_matrix_changes_the_sd_output():
+    """`matrix` must reach the norms: bt709 and SD-auto differ at 640x360."""
+    clip = vs.core.fmtc.bitdepth(source_clip(), bits=32, fulls=True, fulld=True)
+    kw = dict(BASE_KWARGS, sigma=3.0)
+    auto = BM3D(clip, matrix=2, **kw)
+    bt709 = BM3D(clip, matrix=1, **kw)
+    d = float(
+        np.abs(
+            plane_to_ndarray(auto.get_frame(0), 0) - plane_to_ndarray(bt709.get_frame(0), 0)
+        ).max()
+    )
+    assert d > 1e-3, f"matrix did not change the SD output (diff {d})"
 
 
 def test_bm3d_color_ref_pass_matches_cpu():
@@ -1991,11 +2094,12 @@ def test_bm3d_u16_matches_cpu(clip_gray16, radius, stage, bound, measured, full)
 def test_bm3d_rgb_range_tag_is_honored(clip_grays):
     """The RGB arm of `_Range` must use the reference's limited-range mapping.
 
-    The old `bm3d_range` returned full-range scaling for every RGB plane, so
-    full and limited RGB48 produced identical pixels. The float conversion of
-    the same limited clip applies exactly `(code - 4096) / 56064`, so comparing
-    against it pins both the input scale and the output inverse, not merely
-    that the two tags differ.
+    The opponent conversion applies the same 16..235 Int2Float gain/neutral as
+    the copy kernel, so a limited RGB48 clip must equal the float conversion of
+    the same limited content after the filter's own OPP round trip. The
+    integer arm's widening happens inside the OPP kernel and rounds one ulp
+    away from Point's conversion, so a few matcher ties flip: the bound is the
+    0.002 full-scale tie band (measured 47 codes), far below a wrong mapping.
     """
     rgb = vs.core.std.ShufflePlanes([clip_grays, clip_grays, clip_grays], [0, 0, 0], vs.RGB)
     rgb16 = vs.core.resize.Bicubic(rgb, format=vs.RGB48)
@@ -2016,7 +2120,7 @@ def test_bm3d_rgb_range_tag_is_honored(clip_grays):
         fc = plane_to_ndarray(c.get_frame(n), 0).astype(np.float64)
         assert np.abs(fa.astype(np.int32) - fb.astype(np.int32)).max() > 1
         mapped = np.clip(fc * (219 * 256) + 16 * 256, 0, 65535)
-        assert np.abs(fb.astype(np.float64) - mapped).max() <= 1.0, (
+        assert np.abs(fb.astype(np.float64) - mapped).max() <= 0.002 * 65535, (
             f"limited RGB48 is not the float conversion's inverse at n={n}"
         )
 
@@ -2061,11 +2165,10 @@ def test_bm3d_u16_final_stage_matches_cpu(clip_gray16, full):
 def test_bm3d_u16_joint_chroma_matches_cpu(full):
     """The joint 4:4:4 entry on an integer clip at both ranges.
 
-    Same close-but-not-exact chroma domain as the f32 color test: the CPU
-    scales each plane's sigma by that plane's matrix norm, vsfeel carries
-    normY for all three."""
+    Both sides scale each plane's sigma by its own matrix norm; the residual is
+    the CPU matcher's tie order on chroma (measured 0.00597 on the full arm)."""
     payload = _u16_compare({"sigma": [0.7, 0.7, 0.7]}, clip="yuv444p16", full=full)
-    assert payload["maxdiff"] < 1.5e-2, f"u16 joint chroma vs CPU: {payload}"
+    assert payload["maxdiff"] < 8e-3, f"u16 joint chroma vs CPU: {payload}"
 
 
 def _u16_gain_neutral(full, chroma):
@@ -2559,6 +2662,25 @@ def test_bm3d_color_parallel_load_matches_serial():
     for n in range(clip.num_frames):
         d = par[n] - plane_to_ndarray(ref.get_frame(n), 1)
         assert np.abs(d).max() < 1e-5, f"parallel/serial chroma mismatch at frame {n}"
+
+
+def test_bm3d_rgb_parallel_load_matches_serial():
+    """RGB radius 0 runs fmParallel, so each frame needs its own OPP scratch.
+
+    A shared three-plane scratch would be overwritten by a neighbour's
+    aggregation between the writes and the output conversion.
+    """
+    clip = vs.core.resize.Bicubic(source_clip(), format=vs.RGBS, matrix_in_s="709")
+    kwargs = dict(sigma=0.7, radius=0, bm_range=2, ps_range=1, block_step=4)
+    ref = BM3D(clip, **kwargs)
+    for plane in range(3):
+        par = eval_parallel(BM3D, clip, plane=plane, dtype=np.float32, **kwargs)
+        for n in range(clip.num_frames):
+            serial = plane_to_ndarray(ref.get_frame(n), plane)
+            d = par[n] - serial
+            assert np.abs(d).max() < 1e-5, (
+                f"parallel/serial RGB plane {plane} mismatch at frame {n}"
+            )
 
 
 def test_bm3d_color_parallel_load_repeated():

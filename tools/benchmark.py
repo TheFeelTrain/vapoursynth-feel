@@ -663,14 +663,11 @@ def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
             {
                 "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {same})",
                 "bm3dvk": f"core.bm3dvk.BM3Dv2({clip}, {same})",
-                # bm3dvk2 derives a color matrix from the resolution when none
-                # is given while vsfeel hardcodes the BT.709 luma-row norm its
-                # sigma and th_mse are scaled by, so an SD --clip would
-                # silently denoise at a different strength. Pinning BT.709
-                # keeps the two arms on equal work (its other defaults, 8x8
-                # blocks, 8-wide groups, bm/ps step 1, hard_thr 2.7 and
-                # th_mse = sigma[0]*80 + 400, already equal vsfeel's).
-                "bm3dvk2": f"core.bm3dvk2.BM3D({clip}, {same}, matrix=1)",
+                # Both arms derive the color matrix from the resolution when
+                # none is given, and their other defaults (8x8 blocks, 8-wide
+                # groups, bm/ps step 1, hard_thr 2.7, th_mse = sigma[0]*80 +
+                # 400) already equate, so the two arms do equal work.
+                "bm3dvk2": f"core.bm3dvk2.BM3D({clip}, {same})",
             }
         )
     return calls

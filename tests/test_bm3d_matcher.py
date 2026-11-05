@@ -60,7 +60,9 @@ clip = core.std.ModifyFrame(src, src, setter)
 for job in jobs:
     os.environ["VSFEEL_BM3D_MATCHTRACE"] = "%d,%d,%d" % (
         job["frame"], job["x"], job["y"])
-    node = core.vsfeel.BM3D(clip, **job["kwargs"])
+    # The oracle's threshold carries the bt709 luma norm; pin the matrix so the
+    # filter's 32x32 SD default (smpte170m) does not change the comparison.
+    node = core.vsfeel.BM3D(clip, **dict(job["kwargs"], matrix=1))
     node = core.std.GPUDownload(clip=node) if node.gpu_resident else node
     if job.get("sequence"):
         for f in range(job["frame"] + 1):

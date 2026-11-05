@@ -9,8 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - All filter creation uses less memory
-- BM3D uses less VRAM before its first seek
 - EEDI3, EEDI3H, and EEDI3AA use less VRAM for the same output
+- BM3D uses less VRAM before its first seek
+- BM3D scales sigma and its matching threshold by a color matrix selected from the clip's resolution, and accepts a `matrix` argument to pin it
+- BM3D filters RGB input in the opponent color space, converting internally
 
 ### Fixed
 

@@ -233,7 +233,16 @@ set(VK_BM3D_VARIANTS
     "bm3d_agg_u16|bm3d_agg.comp|-DIO_U16"
     "bm3d_agg_f16|bm3d_agg.comp|-DIO_F16"
     "bm3d_copy_u16|bm3d_copy.comp|-DIO_U16"
-    "bm3d_copy_f16|bm3d_copy.comp|-DIO_F16")
+    "bm3d_copy_f16|bm3d_copy.comp|-DIO_F16"
+    # RGB is filtered in mawen's opponent space, like the references: the input
+    # conversion writes one OPP plane into the ring, the output one writes an
+    # RGB plane from the three normalized OPP planes.
+    "bm3d_opp_in_u16|bm3d_opp.comp|-DENTRY_RGB2OPP -DIO_U16"
+    "bm3d_opp_in_f16|bm3d_opp.comp|-DENTRY_RGB2OPP -DIO_F16"
+    "bm3d_opp_in_f32|bm3d_opp.comp|-DENTRY_RGB2OPP -DIO_F32"
+    "bm3d_opp_out_u16|bm3d_opp.comp|-DENTRY_OPP2RGB -DIO_U16"
+    "bm3d_opp_out_f16|bm3d_opp.comp|-DENTRY_OPP2RGB -DIO_F16"
+    "bm3d_opp_out_f32|bm3d_opp.comp|-DENTRY_OPP2RGB -DIO_F32")
 
 # GaussBlur: one kernel with three entry points (fused small path + the two
 # large-path passes), per io variant (u16, f16, f32). Each pass carries its
