@@ -50,7 +50,8 @@
  *   b6 cint   SCRATCH_T, rows x WIDTH vertical cubic per pixel (only when
  *             VCHECK > 0 && !HAS_SCLIP)
  *   b7 vout   SCRATCH_T, rows x WIDTH vcheck output rows
- *   b8 hp     HP_T, padHeight x WIDTH half-pel rows (only HPF > 1)
+ *   b8 hp     HP_T, (rows + 3) x WIDTH dense kept-parity half-pel rows (only
+ *             HPF > 1)
  *
  * ENTRY_HPFILL grid (rows + 3): one workgroup per written pad row (hp only).
  * ENTRY_ROW grid (1, rows): one workgroup per interpolated row.
@@ -524,14 +525,16 @@ float cubic_float(int dy, int x) {
 // ---------------------------------------------------------------------------
 
 // Half-pel value between columns i and i+1 of the kept-parity pad row
-// MARGIN_V + dst_row, as ENTRY_HPFILL wrote it. The reference clamps the
-// column (its plane is padHeight x WIDTH, one row per pad row).
+// MARGIN_V + dst_row, as ENTRY_HPFILL wrote it. Rows are dense from pad row
+// MARGIN_V + field - 3 (every other row), so `row` below is 0..rows+2; the
+// reference clamps the column.
 float hp_get(int dst_row, int i) {
-    i = clamp(i, 0, WIDTH - 2);
+    i = clamp(i, 0, max(WIDTH - 2, 0));
+    const int row = (dst_row - pc.field + 3) >> 1;
 #if defined(IO_U16)
-    return float(int(hp[pc.hp_base + (MARGIN_V + dst_row) * WIDTH + i]));
+    return float(int(hp[pc.hp_base + row * WIDTH + i]));
 #else
-    return hp[pc.hp_base + (MARGIN_V + dst_row) * WIDTH + i];
+    return hp[pc.hp_base + row * WIDTH + i];
 #endif
 }
 
@@ -999,9 +1002,12 @@ void main() {
     // masked columns, nonzero on the DP columns) so the downstream vcheck takes
     // the same branch mix it takes on the real kernel. PROBE 2 returns with
     // dmap stale, which leaves the vcheck on its dirc==0 fast branch and
-    // therefore overstates the row kernel's share.
-    for (int x = lane; x < WIDTH; x += SGSIZE)
-        dmap[pc.dmap_base + r * WIDTH + x] = int8_t((x >= xmin) ? 1 : 0);
+    // therefore overstates the row kernel's share. With no vcheck the region
+    // is not even placed, so only fill it when one will read it.
+    if (VCHECK_MODE > 0) {
+        for (int x = lane; x < WIDTH; x += SGSIZE)
+            dmap[pc.dmap_base + r * WIDTH + x] = int8_t((x >= xmin) ? 1 : 0);
+    }
     return;
 #endif
 #if PROBE == 2
@@ -2017,7 +2023,9 @@ layout(local_size_x = 256) in;
 void main() {
     const int pad_row = MARGIN_V + pc.field - 3 + 2 * int(gl_WorkGroupID.x);
     const int in_base = pc.pad_base + pad_row * PAD_STRIDE + MARGIN_H;
-    const int out_base = pc.hp_base + pad_row * WIDTH;
+    // Dense half-pel rows: workgroup x is the row index (0..rows+2), which is
+    // what hp_get reverses from the pad row it reads.
+    const int out_base = pc.hp_base + int(gl_WorkGroupID.x) * WIDTH;
 
     for (int i = int(gl_LocalInvocationID.x); i < WIDTH - 1; i += 256) {
 #if defined(IO_U16)

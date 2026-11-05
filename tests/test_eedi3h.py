@@ -192,6 +192,26 @@ def test_eedi3h_transpose_oracle_mclip_sclip(clip_gray16):
     _assert_oracle_exact(clip, np.uint16, WIDTH, HEIGHT, [0, 11], mclip=m, sclip=clip, **kw)
 
 
+def test_eedi3h_hp_one_sample_tall_matches_transpose():
+    """A 4x1 clip makes the transposed hp plane one sample wide.
+
+    hp_get's column clamp then has minVal (0) > maxVal (-1), which GLSL leaves
+    undefined, and the old address read the previous half-pel row. The
+    transpose oracle covers the only defined half-pel position on that axis.
+    """
+    core = vs.core
+    base = core.std.BlankClip(width=4, height=1, format=vs.GRAY16, length=2, color=[0])
+    arr = np.array([[100, 200, 300, 400]], dtype=np.uint16)
+
+    def mk(n, f):
+        out = f.copy()
+        np.asarray(out[0])[:1, :4] = arr
+        return out
+
+    clip = base.std.ModifyFrame(base, mk)
+    _assert_oracle_exact(clip, np.uint16, 4, 1, [0, 1], field=1, hp=1)
+
+
 # ---------------------------------------------------------------------------
 # vszipcl reference (loose sanity: different algorithm family)
 # ---------------------------------------------------------------------------

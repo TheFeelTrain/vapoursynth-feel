@@ -872,6 +872,67 @@ def test_eedi3_hp_sclip_matches_vk2(clip_gray16):
     assert payload["maxdiff"] == 0, "hp sclip mismatch"
 
 
+_HP_ONE_COLUMN_SCRIPT = (
+    COMPARE_PRELUDE
+    + r"""
+import json
+import sys
+import vapoursynth as vs
+
+core = vs.core
+base = core.std.BlankClip(width=1, height=4, format=vs.GRAY16, length=2,
+                          color=[0])
+arr = np.array([[100], [200], [300], [400]], dtype=np.uint16)
+
+
+def mk(n, f):
+    out = f.copy()
+    np.asarray(out[0])[:4, :1] = arr
+    return out
+
+
+clip = base.std.ModifyFrame(base, mk)
+kwargs = {"field": 1, "hp": 1}
+try:
+    ref = core.eedi3vk2.EEDI3(clip, **kwargs)
+    ref_frames = {n: read_plane(ref.get_frame(n), 0, np.uint16)
+                  for n in (0, 1)}
+except Exception as exc:
+    print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
+    raise SystemExit(2)
+print("REF ok", flush=True)
+try:
+    mine = core.std.GPUDownload(clip=core.vsfeel.EEDI3(clip, **kwargs))
+    maxdiff = 0.0
+    for n in (0, 1):
+        a = read_plane(mine.get_frame(n), 0, np.uint16)
+        b = ref_frames[n]
+        maxdiff = max(maxdiff, float(np.abs(a.astype(np.int64) -
+                                            b.astype(np.int64)).max()))
+except SystemExit:
+    raise
+except Exception as exc:
+    print("VSFEEL fail: %s: %s" % (type(exc).__name__, exc), flush=True)
+    raise SystemExit(3)
+print("RESULT " + json.dumps({"maxdiff": maxdiff, "width": mine.width,
+                              "height": mine.height}), flush=True)
+"""
+)
+
+
+def test_eedi3_hp_one_sample_wide_column_matches_vk2():
+    """A one-sample-wide plane makes hp_get's column clamp minVal > maxVal.
+
+    GLSL leaves `clamp(i, 0, WIDTH - 2)` undefined when WIDTH is 1; the old
+    expression also addressed the previous half-pel row. eedi3vk2 accepts this
+    geometry, so the one defined half-pel position must match it.
+    """
+    reference_or_skip("eedi3vk2", "EEDI3")
+    payload = compare_or_skip(_HP_ONE_COLUMN_SCRIPT)
+    assert payload["width"] == 1 and payload["height"] == 4, payload
+    assert payload["maxdiff"] == 0, f"1-wide hp mismatch: {payload}"
+
+
 # ---------------------------------------------------------------------------
 # Formats and plane handling
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - BM3D uses less VRAM before its first seek
+- EEDI3, EEDI3H, and EEDI3AA use less VRAM for the same output
 
 ### Fixed
 

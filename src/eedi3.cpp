@@ -2582,6 +2582,11 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     auto sz_io = [&](const Eedi3PlaneConfig & c) {
         return static_cast<VkDeviceSize>(c.rows) * c.width * elem;
     };
+    // The vcheck's direction map is one int8 per column per interp row, not an
+    // io element.
+    auto sz_dmap = [&](const Eedi3PlaneConfig & c) {
+        return static_cast<VkDeviceSize>(c.rows) * c.width;
+    };
     // dst/cint/vout: f32 for half input, native u16/f32 otherwise.
     auto sz_scratch = [&](const Eedi3PlaneConfig & c) {
         return static_cast<VkDeviceSize>(c.rows) * c.width * scratch_elem;
@@ -2601,9 +2606,10 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
                pad_elem;
     };
     auto sz_hp = [&](const Eedi3PlaneConfig & c) {
-        // One half-pel element per padded row and column (WIDTH per row). u16
+        // One half-pel element per written column and kept-parity pad row:
+        // rows + 3 of them, starting at pad row MARGIN_V + field - 3. u16
         // keeps the native type; f16/f32 keep float so hp stays exact.
-        return d->hp ? static_cast<VkDeviceSize>(c.width) * c.pad_height *
+        return d->hp ? static_cast<VkDeviceSize>(c.width) * (c.rows + 3) *
                            d->hp_elem
                      : 0;
     };
@@ -2630,20 +2636,27 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         }
         auto & V = d->planes[plane];
         auto & H = d->aa ? d->aplanes[plane] : d->planes[plane];
+        // H aliases V in the single-geometry filters: EEDI3 has only the
+        // vertical layout and EEDI3H only the horizontal one, already sized by
+        // V. Only an AA instance has a distinct transposed geometry.
+        const bool horiz_geom = d->horiz || d->aa;
+        // EEDI3AA with no vcheck writes the row kernel's interp value straight
+        // into vout, so a placed dst/dst2 band would be orphaned.
+        const bool aa_novcheck = d->aa && d->vcheck == 0;
         const bool has_io = true;
         shared(sz_pad(V), sz_pad(H), V.pad_off, V.pad_bytes, H.pad_off,
                H.pad_bytes);
         shared(sz_hp(V), sz_hp(H), V.hp_off, V.hp_bytes, H.hp_off, H.hp_bytes);
-        shared(sz_scratch(V), sz_scratch(H), V.dst_off, V.dst_bytes, H.dst_off,
-               H.dst_bytes);
-        shared(d->aa ? sz_scratch(V) : 0, d->aa ? sz_scratch(H) : 0, V.dst2_off,
+        shared(aa_novcheck ? 0 : sz_scratch(V), aa_novcheck ? 0 : sz_scratch(H),
+               V.dst_off, V.dst_bytes, H.dst_off, H.dst_bytes);
+        shared((d->aa && !aa_novcheck) ? sz_scratch(V) : 0,
+               (d->aa && !aa_novcheck) ? sz_scratch(H) : 0, V.dst2_off,
                V.dst2_bytes, H.dst2_off, H.dst2_bytes);
         shared(sz_pbt(V), sz_pbt(H), V.pbt_off, V.pbt_bytes, H.pbt_off,
                H.pbt_bytes);
-        // dmap is the walk's direction buffer as well as the vcheck's, so it is
-        // needed even when vcheck == 0 (the interpolate reads it either way).
-        shared(sz_io(V), sz_io(H), V.dmap_off, V.dmap_bytes, H.dmap_off,
-               H.dmap_bytes);
+        // The vcheck's direction map; no other kernel reads it.
+        shared(d->vcheck > 0 ? sz_dmap(V) : 0, d->vcheck > 0 ? sz_dmap(H) : 0,
+               V.dmap_off, V.dmap_bytes, H.dmap_off, H.dmap_bytes);
         shared((d->vcheck > 0 && !d->sclip_node) ? sz_scratch(V) : 0,
                (d->vcheck > 0 && !d->sclip_node) ? sz_scratch(H) : 0,
                V.cint_off, V.cint_bytes, H.cint_off, H.cint_bytes);
@@ -2657,17 +2670,18 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
                H.rempty_off, H.rempty_bytes);
         shared(d->mclip_node ? sz_bits(V) : 0, d->mclip_node ? sz_bits(H) : 0,
                V.bits_off, V.bits_bytes, H.bits_off, H.bits_bytes);
-        shared(0, d->mclip_node ? sz_bits(H) : 0, V.pred_off, V.pred_bytes,
-               H.pred_off, H.pred_bytes);
-        shared(0, sz_rt(H), V.rt_off, V.rt_bytes, H.rt_off, H.rt_bytes);
-        shared(0, (d->vcheck > 0 && d->sclip_node) ? sz_io(H) : 0, V.rtS_off,
-               V.rtS_bytes, H.rtS_off, H.rtS_bytes);
+        shared(0, (horiz_geom && d->mclip_node) ? sz_bits(H) : 0, V.pred_off,
+               V.pred_bytes, H.pred_off, H.pred_bytes);
+        shared(0, horiz_geom ? sz_rt(H) : 0, V.rt_off, V.rt_bytes, H.rt_off,
+               H.rt_bytes);
+        shared(0, (horiz_geom && d->vcheck > 0 && d->sclip_node) ? sz_io(H) : 0,
+               V.rtS_off, V.rtS_bytes, H.rtS_off, H.rtS_bytes);
         const VkDeviceSize plane_io =
             static_cast<VkDeviceSize>(V.out_w) * V.out_h * elem;
         // Without a vcheck the row kernel's dst IS the interp value, so point
         // the assembler's vout/vout2 regions at it (bit-exact: the elements are
         // the same, only the name differs).
-        if (d->aa && d->vcheck == 0) {
+        if (aa_novcheck) {
             V.dst_off = V.vout_off;
             V.dst_bytes = V.vout_bytes;
             V.dst2_off = V.vout2_off;
