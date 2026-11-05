@@ -455,8 +455,8 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         if (!vsh::isSameVideoInfo(d->vi, ref_vi) ||
             d->vi->numFrames != ref_vi->numFrames) {
             return set_error(
-                "\"ref\" must be of the same format and dimensions as "
-                "\"clip\".");
+                "\"ref\" must match \"clip\" in format, dimensions and "
+                "frame count.");
         }
     }
 
@@ -963,9 +963,9 @@ void vsfeel_register_bilateral(const VSPLUGINAPI * vspapi, VSPlugin * plugin) {
                              "device_id:int:opt;"
                              "num_streams:int:opt;"
                              "use_shared_memory:int:opt;"
+                             "ref:vnode:gpu:opt;"
                              "block_x:int:opt;"
-                             "block_y:int:opt;"
-                             "ref:vnode:gpu:opt;",
+                             "block_y:int:opt;",
                              "clip:vnode:gpu;", BilateralCreate, nullptr,
                              plugin);
 }

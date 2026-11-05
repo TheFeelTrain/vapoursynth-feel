@@ -25,6 +25,10 @@ Design (current):
   output rounded once and sits within one half step of vszipcl's f16 output.
 - Three whole-buffer bindings per dispatch (src, dst, guide); without a guide the
   source stands in on binding 2 and `HAS_REF=0` means the shader never reads it.
+- Guide (`ref`): optional; same format, dimensions and frame count as `clip`.
+  It may be CPU- or GPU-resident (only the transport differs), and it is read
+  in place, never uploaded by the filter. `ref` sits in vszipcl's positional
+  slot, before the optional `block_x`/`block_y` keywords.
 - Native `uint16_t`/`float16_t`/`float` SSBOs at `#version 450`, no push
   constants; every geometry/weight parameter is a specialization constant
   (`WIDTH/HEIGHT/STRIDE/RADIUS/SIGMA_*/HAS_REF/TILE_*/BLOCK_*`).

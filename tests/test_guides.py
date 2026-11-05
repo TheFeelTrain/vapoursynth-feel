@@ -55,3 +55,14 @@ def test_guide_mismatch_is_rejected(clip_grays, name, kwargs, guide_kwarg, kind)
     fn = getattr(vs.core.vsfeel, name)
     with pytest.raises(vs.Error):
         fn(clip_grays, **kwargs, **{guide_kwarg: bad}).get_frame(11)
+
+
+def test_bilateral_guide_frame_count_mismatch_names_the_contract(clip_grays):
+    """A length mismatch must name the frame-count requirement, not just fail.
+
+    The parametrized case above accepts any vs.Error, so dropping the
+    numFrames comparison (or the message naming it) would still pass there.
+    """
+    guide = vs.core.std.Trim(vs.core.vsfeel.GaussBlur(clip_grays, sigma=1.5), length=2)
+    with pytest.raises(vs.Error, match="frame count"):
+        vs.core.vsfeel.Bilateral(clip_grays, sigma_spatial=3.0, sigma_color=0.05, ref=guide)

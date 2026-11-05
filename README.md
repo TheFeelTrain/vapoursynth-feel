@@ -40,8 +40,8 @@ core.vsfeel.Bilateral(clip clip[,
     float[] sigma_color=0.02,       # edge sensitivity: how different pixels may be to blend; depth-normalized
     int[]   radius,                 # per-plane blur window radius; default max(1, round(sigma_spatial*3))
     int     use_shared_memory=1,    # faster on-chip kernel while the window fits; falls back otherwise
-    int     block_x, int block_y,   # GPU thread-block dims; auto-tuned when unset (32 x 8, x16 when radius > 12)
-    clip    ref])                   # guide clip: weights from ref, values from clip
+    clip    ref,                    # guide clip: weights from ref, values from clip; same format, dimensions and frame count
+    int     block_x, int block_y])  # optional keywords: GPU thread-block dims; auto-tuned when unset (32 x 8, x16 when radius > 12)
 ```
 
 ### BM3D
