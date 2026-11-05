@@ -1684,11 +1684,20 @@ void main() {
     const int hn = calc_pad_num(pc.width, pc.block_step);
     const int tsub = sub * TR_SUB;
 
-    for (int block_id = pc.block_base + int(gl_WorkGroupID.x) * SUB_BLOCKS + sub;
-         block_id < pc.block_end;
-         block_id += int(gl_NumWorkGroups.x) * SUB_BLOCKS) {
-        const int ix = block_id % hn;
-        const int iy = block_id / hn;
+    // Uniform across the workgroup: the trip count depends only on the group's
+    // first block, never on `sub`, so every lane of a subgroup reaches the
+    // subgroupBarrier() calls below. A tile with no block of its own computes
+    // an in-range block and drops only its store; the old per-tile loop bound
+    // let part of a subgroup skip the body (and its barriers) entirely.
+    const int stride = int(gl_NumWorkGroups.x) * SUB_BLOCKS;
+    const int first = pc.block_base + int(gl_WorkGroupID.x) * SUB_BLOCKS;
+    const int iters = (pc.block_end - first + stride - 1) / stride;
+    for (int iter = 0; iter < iters; ++iter) {
+        const int block_id = first + sub + iter * stride;
+        const bool owned = block_id < pc.block_end;
+        const int bid = owned ? block_id : first;
+        const int ix = bid % hn;
+        const int iy = bid / hn;
 
         float td[TD_SZ];
 
@@ -1745,11 +1754,15 @@ void main() {
             trans[tsub + TR_ROW_1 * j + lane] = td[TB + (j == 0 ? 0 : 16 - j)];
         }
         subgroupBarrier();
-        // write the block's center slice into the spatial buffer ring
-        const int dst_base =
-            pc.spatial_base + ((iy & pc.spatial_row_mask) * hn + ix) * 256;
-        for (int j = 0; j < 16; ++j) {
-            spatial[dst_base + j * 16 + lane] = trans[tsub + TR_ROW_1 * lane + j];
+        // Only the tile that owns this block writes it; an inactive tile ran
+        // the body for the barrier alone.
+        if (owned) {
+            const int dst_base =
+                pc.spatial_base + ((iy & pc.spatial_row_mask) * hn + ix) * 256;
+            for (int j = 0; j < 16; ++j) {
+                spatial[dst_base + j * 16 + lane] =
+                    trans[tsub + TR_ROW_1 * lane + j];
+            }
         }
     }
 }

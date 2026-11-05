@@ -130,6 +130,11 @@ IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
   requested when the device offers it, and when it does not, the driver's default
   is accepted only if it is a multiple of 16. Otherwise creation fails with that
   reason instead of running tiles that span two subgroups.
+- Every tile of a workgroup runs the same number of fused block iterations: the
+  trip count comes from the group's first block, not each tile's own, and a tile
+  whose block is past `block_end` computes that first block and drops only its
+  store. Every `subgroupBarrier()` call in the body is therefore reached by the
+  whole subgroup; a per-tile loop bound let part of a wave skip them.
 - FFTW codelets, window/sigma table math, filter formulas and the reflect-pad
   rule are unchanged from the ported reference; only the buffers the data comes
   from and goes to changed.
@@ -228,6 +233,18 @@ force-pad / fail-pad probes.
 ## Historical
 
 The pre-R80 design and every round that shaped it, kept for the mechanisms:
+
+- **The fused block loop is workgroup-uniform** (correctness-only, no perf
+  change). Its trip count followed each tile's own first block, so in every
+  partial last workgroup some tiles skipped the body and the `subgroupBarrier()`
+  calls in it — 7 of 8 tiles still run in the last workgroup at 1080p — and the
+  port worked only because RADV lowers a subgroup barrier to a wave-level one.
+  The bound now comes from the workgroup's first block alone, and a tile past
+  `block_end` runs the body on that block and drops its store. Re-measured on
+  llvmpipe with a forced 8-lane subgroup: bit-identical before and after, but
+  llvmpipe at HEAD no longer matches gfx1100 there (0.92 max at the 360p
+  defaults); the one-ulp lavapipe figure below predates the switch from
+  workgroup barriers to `subgroupBarrier()`.
 
 - **Negative `f0beta`/`pmax` are rejected at creation** (correctness-only, no
   perf change). vszipcl accepts both and produces an all-NaN clip: negative
