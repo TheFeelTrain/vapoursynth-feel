@@ -536,13 +536,10 @@ static bool dft_offsets_fit(const DftPlaneConfig & cfg, int stride) {
            INT32_MAX;
 }
 
-// Every offset pushed to the shader is int32; the per-plane buffers below are
-// separate allocations, so the bases are 0 and only the plane-internal offsets
-// (spatial float index, pad slice) carry real values.
+// Every offset pushed to the shader is int32. The window/sigma tables share
+// one `wt` buffer and are addressed by the `*_base` fields; the plane buffers
+// are bound whole, so their indices start at 0.
 struct DftPushConstants {
-    int32_t spatial_base;
-    int32_t dst_base;
-    int32_t wt_base;
     int32_t wf_base;
     int32_t sigma_base;
     int32_t radius;
@@ -590,9 +587,8 @@ struct DftData {
     bool half {};
     bool process[3] { false, false, false };
 
-    int radius {}, block_step {}, filter_type {}, tw {};
+    int radius {}, block_step {}, tw {};
     bool zmean {};
-    bool sigma_is_scalar { true };
     float sigma_scalar {}; // scaled by wscale when ftype < 2
     float sigma2 {};
     float pmin {};
@@ -602,9 +598,9 @@ struct DftData {
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
     VkPipelineLayout pipeline_layout {};
-    VkPipeline pad_pipeline[4] {};
+    VkPipeline pad_pipeline {};
     VkPipeline col2im_pipeline {};
-    VkPipeline fused_pipeline[4] {};
+    VkPipeline fused_pipeline {};
 
     // shared constant buffer: window, then window_freq, then the sigma array
     GpuBuffer wt;
@@ -651,18 +647,14 @@ struct DftData {
             pool = nullptr;
         }
         VkDevice dev = gpu->device;
-        for (auto & p : pad_pipeline) {
-            if (p) {
-                gpu->vk->vkDestroyPipeline(dev, p, nullptr);
-            }
+        if (pad_pipeline) {
+            gpu->vk->vkDestroyPipeline(dev, pad_pipeline, nullptr);
         }
         if (col2im_pipeline) {
             gpu->vk->vkDestroyPipeline(dev, col2im_pipeline, nullptr);
         }
-        for (auto & p : fused_pipeline) {
-            if (p) {
-                gpu->vk->vkDestroyPipeline(dev, p, nullptr);
-            }
+        if (fused_pipeline) {
+            gpu->vk->vkDestroyPipeline(dev, fused_pipeline, nullptr);
         }
         if (pipeline_layout) {
             gpu->vk->vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
@@ -768,7 +760,6 @@ static bool dfttest_trace() {
 
 static DftPushConstants base_pc(const DftData & d) {
     DftPushConstants pc {};
-    pc.wt_base = 0;
     pc.wf_base = d.wf_base;
     pc.wf2_base = d.wf2_base;
     pc.win4_base = d.win4_base;
@@ -981,7 +972,7 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
             const VkBuffer buffers[4] { d->wt.buffer, padded.buffer,
                                         spatial.buffer, dst_plane.buffer };
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                          d->pad_pipeline[d->radius]);
+                                          d->pad_pipeline);
             gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 4);
             gpu_push_buffer_array(*d->gpu, cmd, d->pipeline_layout, 4,
                                   src_buffers.data(),
@@ -1019,9 +1010,8 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
                 // array) are col2im's and pad's and stay unbound here
                 const VkBuffer buffers[3] { d->wt.buffer, padded.buffer,
                                             spatial.buffer };
-                d->gpu->vk->vkCmdBindPipeline(cmd,
-                                              VK_PIPELINE_BIND_POINT_COMPUTE,
-                                              d->fused_pipeline[d->radius]);
+                d->gpu->vk->vkCmdBindPipeline(
+                    cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->fused_pipeline);
                 gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 3);
                 const VkBuffer tables[2] { d->wt.buffer, d->wt.buffer };
                 gpu_push_buffers_at(*d->gpu, cmd, d->pipeline_layout, 5, tables,
@@ -1279,6 +1269,12 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
     if (pmin < 0.0 || pmax < 0.0) {
         return set_error("\"pmin\" and \"pmax\" must be non-negative.");
     }
+    // ftype=2 multiplies every bin by sigma and ftype=3 uses it as the gain
+    // inside [pmin, pmax]; a negative scalar sign-inverts those bins, the same
+    // garbage frame the array forms already refuse.
+    if (sigma < 0.0 || sigma2 < 0.0) {
+        return set_error("\"sigma\" and \"sigma2\" must be non-negative.");
+    }
 
     int sbsize = vsh::int64ToIntS(vsapi->mapGetInt(in, "sbsize", 0, &error));
     if (error) {
@@ -1474,7 +1470,6 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             filter_type = 5;
         }
     }
-    d->filter_type = filter_type;
 
     const int subW = fmt.subSamplingW;
     const int subH = fmt.subSamplingH;
@@ -1535,10 +1530,10 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
     const double wscale = fsum(sq.data(), sq.size());
 
     // sigma array (per-bin) unless every sigma source is scalar
-    d->sigma_is_scalar = (slocation == nullptr && ssx == nullptr &&
-                          ssy == nullptr && sst == nullptr);
+    const bool sigma_is_scalar = (slocation == nullptr && ssx == nullptr &&
+                                  ssy == nullptr && sst == nullptr);
     std::vector<double> sigma_array;
-    if (!d->sigma_is_scalar) {
+    if (!sigma_is_scalar) {
         const Norm norm = (slocation != nullptr && ssystem == 1)
                               ? Norm::identity
                           : (tbsize == 1) ? Norm::sqrt
@@ -1616,7 +1611,7 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
 
     // scale sigma/sigma2/pmin/pmax by the window scale factor (ftype < 2)
     if (ftype < 2) {
-        if (d->sigma_is_scalar) {
+        if (sigma_is_scalar) {
             sigma *= wscale;
         } else {
             for (double & s : sigma_array) {
@@ -1848,10 +1843,10 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             return set_error("unsupported io type");
         }
 
-        // Only this instance's temporal radius is ever dispatched
-        // (d->pad_pipeline[d->radius] / d->fused_pipeline[d->radius]); the
-        // other radius variants would only cost creation time and make an
-        // unused variant able to reject a valid instance.
+        // Only this instance's temporal radius is ever dispatched, so one pad
+        // and one fused pipeline are created from that radius's blobs; the
+        // other variants would only cost creation time and make an unused
+        // variant able to reject a valid instance.
         const int radius = d->radius;
         {
             const auto result =
@@ -1860,17 +1855,17 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
-            d->pad_pipeline[radius] = std::get<VkPipeline>(result);
+            d->pad_pipeline = std::get<VkPipeline>(result);
         }
         {
             const auto result =
                 create_pipeline(*d->gpu, d->pipeline_layout, fused_code[radius],
                                 fused_size[radius], kFusedWorkgroup,
-                                d->filter_type, d->zmean ? 1 : 0);
+                                filter_type, d->zmean ? 1 : 0);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
-            d->fused_pipeline[radius] = std::get<VkPipeline>(result);
+            d->fused_pipeline = std::get<VkPipeline>(result);
         }
         {
             const auto result =

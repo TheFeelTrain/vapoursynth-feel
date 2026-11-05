@@ -1023,10 +1023,19 @@ def test_rejects_illegal_high_overlap_sosize(clip_grays, sosize):
         {"ftype": 0, "f0beta": -0.5},
         {"ftype": 4, "pmin": 0.0, "pmax": -1.0},
         {"ftype": 4, "pmin": -1.0, "pmax": 500.0},
+        {"ftype": 3, "sigma": -4.0},
+        {"ftype": 3, "sigma2": -4.0},
     ],
+    ids=["negative-f0beta", "negative-pmax", "negative-pmin", "negative-sigma", "negative-sigma2"],
 )
 def test_rejects_negative_gain_parameters(clip_grays, kwargs):
-    """Negative f0beta or pmin/pmax produced an all-NaN clip in vszipcl."""
+    """Negative f0beta, pmin/pmax or scalar sigma produced garbage frames.
+
+    vszipcl accepts them: a negative f0beta or pmin/pmax is pow/sqrt of a
+    negative number (all-NaN frame) and a negative scalar sigma sign-inverts
+    the bins inside [pmin, pmax]. The array sigma forms already refuse
+    negatives, so the scalars must too.
+    """
     with pytest.raises(vs.Error, match="non-negative"):
         vs.core.vsfeel.DFTTest(clip_grays, tbsize=1, **kwargs)
 

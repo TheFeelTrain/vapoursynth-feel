@@ -127,9 +127,6 @@ layout(std430, binding = 4) readonly buffer SrcBuf { uint src_raw[]; } src_bufs[
 #endif
 
 layout(push_constant) uniform PushConstants {
-    int spatial_base;   // float element offset into the spatial buffer
-    int dst_base;       // byte offset into the output frame plane (0)
-    int wt_base;        // float element offset of window[] in wt
     int wf_base;        // float element offset of window_freq[] in wt (-1 if !zmean)
     int sigma_base;     // float element offset of sigma[] in wt (-1 if scalar)
     int radius;
@@ -1394,14 +1391,13 @@ void store_sample(int sample_idx, float v) {
 #if defined(IO_U16)
     float x = v / SCALE;
     x = clamp(x + 0.5, 0.0, PEAK);
-    dst16[(pc.dst_base >> 1) + sample_idx] = uint16_t(uint(x) & ELEM_MASK);
+    dst16[sample_idx] = uint16_t(uint(x) & ELEM_MASK);
 #elif defined(IO_F16)
     // OpFConvert narrows to half with round-to-nearest-even, the same rounding
     // a half clip stores with; no clamp (half covers the whole range)
-    dst16[(pc.dst_base >> 1) + sample_idx] = float16_t(v / SCALE);
+    dst16[sample_idx] = float16_t(v / SCALE);
 #else
-    int byte = pc.dst_base + sample_idx * ELEM_BYTES;
-    dst_raw[byte >> 2] = floatBitsToUint(v / SCALE);
+    dst_raw[sample_idx] = floatBitsToUint(v / SCALE);
 #endif
 }
 
@@ -1757,10 +1753,10 @@ void main() {
         // Only the tile that owns this block writes it; an inactive tile ran
         // the body for the barrier alone.
         if (owned) {
-            const int dst_base =
-                pc.spatial_base + ((iy & pc.spatial_row_mask) * hn + ix) * 256;
+            const int block_offset =
+                ((iy & pc.spatial_row_mask) * hn + ix) * 256;
             for (int j = 0; j < 16; ++j) {
-                spatial[dst_base + j * 16 + lane] =
+                spatial[block_offset + j * 16 + lane] =
                     trans[tsub + TR_ROW_1 * lane + j];
             }
         }
@@ -1804,7 +1800,7 @@ void main() {
                     const int src_offset =
                         (((i & pc.spatial_row_mask) * hn + j) * 16 + offset_y) * 16 + offset_x;
                     const int window_offset = (pc.radius * 16 + offset_y) * 16 + offset_x;
-                    sum += spatial[pc.spatial_base + src_offset] * wt[pc.wt_base + window_offset];
+                    sum += spatial[src_offset] * wt[window_offset];
                 }
             }
 

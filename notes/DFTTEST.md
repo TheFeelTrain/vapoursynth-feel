@@ -246,6 +246,19 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   defaults); the one-ulp lavapipe figure below predates the switch from
   workgroup barriers to `subgroupBarrier()`.
 
+- **Negative scalar `sigma`/`sigma2` are rejected at creation** (correctness-only,
+  no perf change). With `ftype=2` the gain is literally `sigma`, and `ftype=3`
+  uses it as the gain inside `[pmin, pmax]`, so a negative value sign-inverted
+  those bins and the frame came out near zero; vszipcl accepts it. The
+  `slocation`/`ssx`/`ssy`/`sst` array forms already rejected negatives.
+
+- **Dead push constants and creation-only members removed** (no output change).
+  `spatial_base`, `dst_base` and `wt_base` were always zero, so their adds are
+  gone from every shader address (including col2im's per-tap sum);
+  `filter_type`/`sigma_is_scalar` are `DftCreate` locals rather than `DftData`
+  members, and the per-radius `pad_pipeline[4]`/`fused_pipeline[4]` arrays are
+  single handles since only the instance's radius is ever created.
+
 - **Negative `f0beta`/`pmax` are rejected at creation** (correctness-only, no
   perf change). vszipcl accepts both and produces an all-NaN clip: negative
   `f0beta` is `pow(0, negative)` in the ftype=0 gain and negative `pmax` makes
