@@ -641,9 +641,8 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
     // The plane geometry has to be the one the core's GPU frames carry, because
     // kernel addressing is STRIDE elements per row (see vsfeel_probe_strides).
     int plane_stride[3] {};
-    if (auto e =
-            vsfeel_probe_strides(vsapi, core, d->vi->format, d->vi->width,
-                                 d->vi->height, d->elem_bytes, plane_stride);
+    if (auto e = vsfeel_probe_strides(vsapi, core, d->vi->format, d->vi->width,
+                                      d->elem_bytes, plane_stride);
         !e.empty()) {
         return set_error(e);
     }

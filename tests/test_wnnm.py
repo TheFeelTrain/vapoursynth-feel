@@ -1094,8 +1094,8 @@ def test_rejects_a_lattice_past_the_32_bit_index_range():
     """A 65535x65535 plane at block_step 1 is 65535^2 reference blocks.
 
     The group count is an int32 spec constant; without the guard the lattice
-    wrapped negative and every region was sized from it. The check runs before
-    the probe frame, so this clip is never allocated.
+    wrapped negative and every region was sized from it. The geometry pass runs
+    before the short stride probe, so the full 8.6 GB frame is never allocated.
     """
     src = vs.core.std.BlankClip(width=65535, height=65535, format=vs.GRAY16, length=1)
     with pytest.raises(vs.Error, match="block lattice"):

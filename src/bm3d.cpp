@@ -2834,8 +2834,7 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
     // buffer-to-buffer region (see vsfeel_probe_strides).
     std::array<int, 3> plane_stride_elems {};
     if (auto e = vsfeel_probe_strides(vsapi, core, d->vi->format, d->vi->width,
-                                      d->vi->height, d->elem_bytes,
-                                      plane_stride_elems.data());
+                                      d->elem_bytes, plane_stride_elems.data());
         !e.empty()) {
         return set_error(e);
     }

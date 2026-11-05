@@ -434,7 +434,7 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
     // vsfeel_probe_strides).
     int src_stride[3] {}, dst_stride[3] {};
     if (auto e = vsfeel_probe_strides(vsapi, core, fmt, d->vi->width,
-                                      d->vi->height, d->elem_bytes, src_stride);
+                                      d->elem_bytes, src_stride);
         !e.empty()) {
         return set_error(e);
     }
@@ -447,8 +447,8 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
             return set_error(e);
         }
     }
-    if (auto e = vsfeel_probe_strides(vsapi, core, fmt, out_w, out_h,
-                                      d->elem_bytes, dst_stride);
+    if (auto e = vsfeel_probe_strides(vsapi, core, fmt, out_w, d->elem_bytes,
+                                      dst_stride);
         !e.empty()) {
         return set_error(e);
     }

@@ -1586,22 +1586,10 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         // Match records are split by the buffer they live in: the persistent
         // per-centre ring, or the frame's own buffer.
         int64_t ring_match_off = 0, frame_match_off = 0, addr_off = 0;
-        // One probe frame serves every processed plane; only its strides are
-        // read (samples, not bytes: the kernels index an f32 plane).
-        int plane_strides[3] {};
-        if (auto e = vsfeel_probe_strides(vsapi, core, d->vi->format,
-                                          d->vi->width, d->vi->height,
-                                          d->elem_bytes, plane_strides);
-            !e.empty()) {
-            return e;
-        }
+        // Geometry first: a plane whose lattice the kernels cannot index must
+        // fail before the stride probe allocates anything for it.
         for (int p = 0; p < 3; ++p) {
             WnnmPlane & pl = d->plane[p];
-            // The address table is per plane: its own 4*radius+1-entry window,
-            // refs then sources. Unprocessed planes keep their entries too, so
-            // the table is fully written.
-            pl.addr_base = static_cast<int>(addr_off);
-            addr_off += 2 * pl.wl;
             if (!pl.process) {
                 continue;
             }
@@ -1678,6 +1666,29 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                                    std::min(2 * d->bm_range + 1, temp_c + 1);
                 d->dist_stride_max = std::max(d->dist_stride_max, stride);
             }
+        }
+        // One short probe frame serves every processed plane; only its
+        // strides are read (samples, not bytes: the kernels index an f32
+        // plane).
+        int plane_strides[3] {};
+        if (auto e =
+                vsfeel_probe_strides(vsapi, core, d->vi->format, d->vi->width,
+                                     d->elem_bytes, plane_strides);
+            !e.empty()) {
+            return e;
+        }
+        for (int p = 0; p < 3; ++p) {
+            WnnmPlane & pl = d->plane[p];
+            // The address table is per plane: its own 4*radius+1-entry window,
+            // refs then sources. Unprocessed planes keep their entries too, so
+            // the table is fully written.
+            pl.addr_base = static_cast<int>(addr_off);
+            addr_off += 2 * pl.wl;
+            if (!pl.process) {
+                continue;
+            }
+            const int temp_c = pl.width - d->bs;
+            const int temp_r = pl.height - d->bs;
             pl.stride = plane_strides[p];
             pl.npix = int64_t(pl.stride) * pl.height;
             pl.finish_x = uint32_t((pl.width + kWorkgroup - 1) / kWorkgroup);

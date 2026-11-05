@@ -374,10 +374,15 @@ vsfeel_parse_planes(const VSMap * in, const VSAPI * vsapi, int num_planes) {
 // Read every plane's sample stride from a scratch frame: a GPU frame carries
 // the CPU allocator's pitch, and the kernels address planes through it, so it
 // cannot be guessed from an alignment rule. Returns an empty string on success.
+// The probe is one chroma block tall (one row for 4:4:4): the pitch depends on
+// the width and its alignment, not the height, and a full frame is a whole
+// plane of memory at large sizes.
 inline std::string vsfeel_probe_strides(const VSAPI * vsapi, VSCore * core,
                                         const VSVideoFormat & fmt, int width,
-                                        int height, int elem_bytes,
-                                        int * strides) {
+                                        int elem_bytes, int * strides) {
+    // A subsampled chroma plane needs at least one sample row, so 4:2:0 and
+    // 4:4:0 probe at two luma rows rather than one.
+    const int height = 1 << fmt.subSamplingH;
     VSFrame * probe = vsapi->newVideoFrame(&fmt, width, height, nullptr, core);
     if (probe == nullptr) {
         return "could not allocate a probe frame to read the plane stride.";

@@ -255,12 +255,16 @@ staying a bit-exact copy and the request orders on both.
 
 ## Historical
 
+- **2026-11-05 - the stride probe is short, after the geometry checks.** A
+  65535x65535 GRAY16 clip allocated an 8.6 GB probe frame before the lattice
+  check; the probe now reads only the width-dependent pitch, and WNNM's
+  block-lattice checks run before it. No output change.
 - **2026-11-01 - the lattice and the conversion ring are checked for 32-bit
   overflow.** `gx * gy` is an int32 spec constant, so a 65535x65535 plane at
   `block_step=1` wrapped it negative; the 16-bit copy's destination offset is a
   uint32 element index, so a large ring (2 sets x 62 slots) wrapped too. Both are
-  now rejected at creation, before the probe frame or any ring allocation. No
-  perf change.
+  now rejected at creation, before the (one-row) probe frame or any ring
+  allocation. No perf change.
 - **2026-10-30 - the estimate-cache budget now follows the device allowance.**
   Three processed 1080p planes need ~404 MiB for the solved-M ring, so the old
   fixed 320 MiB target dropped the cache and the all-plane arm paid for it: 333.4
