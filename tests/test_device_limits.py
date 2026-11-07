@@ -14,10 +14,12 @@ limit, so a device with a smaller allowance gets smaller allocations instead of
 the tuned ones.
 
 No GPU in the test box is that small, so the checks are exercised by forcing the
-device limits down through the knobs the plugin reads (VSFEEL_LIMIT_INVOCATIONS,
-VSFEEL_LIMIT_SHARED_MEMORY, VSFEEL_LIMIT_VRAM_BUDGET). Those are read once per
+device limits down through the knobs the plugin reads (VSFEEL_LIMIT_SHARED_MEMORY,
+VSFEEL_LIMIT_STORAGE_RANGE, VSFEEL_LIMIT_VRAM_BUDGET). Those are read once per
 process when the core's device is brought up, so each case runs in its own
-subprocess.
+subprocess. `VSFEEL_LIMIT_INVOCATIONS` is not one of them: the 256-invocation
+floor is a Vulkan 1.4 guarantee, so a smaller value would test a device no
+supported driver reports.
 
 Run from the repository root:  tools/test.sh tests/test_device_limits.py -q
 """
@@ -780,27 +782,31 @@ def test_push_descriptor_limit_is_reported():
     assert "push descriptors" in err and "4" in err, res["nlmeans"]
 
 
-def test_bilateral_explicit_block_fits_reduced_invocation_budget():
-    """An explicit 4x16 block on a 32-invocation device must clamp, not error.
+def test_bilateral_clamps_an_oversized_explicit_block():
+    """A block over the device's invocation budget must clamp, not error.
 
-    The old fallback replaced both dimensions with 16x16 and then halved; the
-    valid X=4 request was lost. Creation still succeeds either way, so this
-    pins the no-error path and the finite output, while the shape preservation
-    is covered by inspection in the host code.
+    The clamp keeps every dimension the device accepts and halves the larger
+    axis until the product fits, so a request no device can launch still
+    creates and renders (it lands on 32x32 on the target). 64x64 is 4096
+    invocations, over the target's 1024 budget and over the 256 Vulkan 1.4
+    guarantees.
+    The block shape is a tiling choice, so its pixels must equal the auto
+    shape's; the old fallback replaced both dimensions with 16x16 and lost the
+    requested one.
     """
-    res = _run_limits(
-        [
-            {
-                "label": "bilateral",
-                "filter": "bilateral",
-                "params": {"block_x": 4, "block_y": 16},
-            }
-        ],
-        {"VSFEEL_LIMIT_INVOCATIONS": "32"},
-    )
-    out = res["bilateral"]
-    assert "error" not in out, out
-    assert out["finite"], out
+    cases = [
+        {
+            "label": "explicit",
+            "filter": "bilateral",
+            "params": {"block_x": 64, "block_y": 64},
+        },
+        {"label": "auto", "filter": "bilateral"},
+    ]
+    res = _run_limits(cases)
+    assert res["auto"].get("finite") is True, res["auto"]
+    out = res["explicit"]
+    assert out.get("finite") is True, out
+    assert out["sha1"] == res["auto"]["sha1"], "block shape changed pixels"
 
 
 def test_two_dimensional_grid_overflow_is_reported():

@@ -343,7 +343,8 @@ _LEAK_SCRIPT = textwrap.dedent("""\
 
 # The knob that makes a *later* kernel fail, after the earlier ones were built:
 # EEDI3's pad is fixed at 256 invocations while its row and vcheck kernels fit
-# 128, and NNEDI3's 48x6 predictor needs 18 KiB after the prescreen.
+# 128 (a simulated device: no 1.4 driver reports it), and NNEDI3's 48x6
+# predictor needs 18 KiB after the prescreen (the real floor).
 _LEAK_LIMITS = {
     "EEDI3": {"VSFEEL_LIMIT_INVOCATIONS": "128"},
     "NNEDI3": {"VSFEEL_LIMIT_SHARED_MEMORY": "12288"},
@@ -354,12 +355,14 @@ _LEAK_LIMITS = {
 def test_failed_creation_does_not_leak_pipelines(filter_name):
     """A creation that fails partway must destroy the pipelines it already made.
 
-    EEDI3 under ``VSFEEL_LIMIT_INVOCATIONS=128`` loses two (row, vcheck) before
-    pad; NNEDI3 under ``VSFEEL_LIMIT_SHARED_MEMORY=12288`` loses the prescreen
-    before the 18 KiB predictor. Either way the failure comes after the earlier
-    pipelines were created, so an abandoned partial set is exactly the
-    pipelines already built -- which the validation layer names at
-    ``vkDestroyDevice`` (``VUID-vkDestroyDevice-device-05137``).
+    NNEDI3 under ``VSFEEL_LIMIT_SHARED_MEMORY=12288`` loses the prescreen
+    before the 18 KiB predictor, a real Vulkan 1.4 floor. EEDI3 has no
+    late-failing pipeline at any limit a 1.4 device may report, so its case
+    simulates a 128-invocation device (``VSFEEL_LIMIT_INVOCATIONS``) purely to
+    make pad fail after row, vcheck and blit were built; no driver reports it.
+    Either way an abandoned partial set is exactly the pipelines already
+    built -- which the validation layer names at ``vkDestroyDevice``
+    (``VUID-vkDestroyDevice-device-05137``).
     """
     env = {
         **os.environ,

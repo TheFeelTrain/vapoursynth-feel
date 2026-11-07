@@ -1000,15 +1000,16 @@ except vs.Error as e:
 def test_pipeline_failure_stops_creation_at_the_first_error():
     """A failed pipeline must release the input nodes once and return.
 
-    The 64-invocation cap makes the 128-lane Gram fail before solve (256) and
-    apply (128); without an early return those failures call set_error again,
-    which frees the already-freed input nodes.
+    A 2 KiB workgroup-memory cap passes Gram, the eigen step, the scatter and
+    the finish (0 LDS) and makes the distance kernel's 4 KiB tile fail; without
+    an early return that failure calls set_error again, which frees the
+    already-freed input nodes, and the rest of the pipeline set is built anyway.
     """
     env = {
         **os.environ,
         "MANGOHUD": "0",
         "VSFEEL_DEBUG": "1",
-        "VSFEEL_LIMIT_INVOCATIONS": "64",
+        "VSFEEL_LIMIT_SHARED_MEMORY": "2048",
     }
     proc = subprocess.run(
         [sys.executable, "-c", _FIRST_PIPELINE_FAILURE_SCRIPT],
@@ -1019,8 +1020,8 @@ def test_pipeline_failure_stops_creation_at_the_first_error():
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert "ERROR:" in proc.stdout, proc.stderr[-2000:]
-    assert "gram" in proc.stdout, proc.stdout[-2000:]
-    assert "wnnm group p0 solve" not in proc.stderr, "creation continued past the first failure"
+    assert "dist" in proc.stdout, proc.stdout[-2000:]
+    assert "wnnm select p0" not in proc.stderr, "creation continued past the first failure"
 
 
 @pytest.mark.parametrize(
