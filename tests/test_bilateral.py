@@ -120,12 +120,6 @@ def test_bilateral_output_finite_f32(clip_grays):
         assert a.min() >= 0.0 and a.max() <= 1.0
 
 
-def test_bilateral_defaults_run_f32(clip_grays):
-    out = _run(clip_grays)
-    assert_grays(out)
-    assert np.isfinite(frame_to_ndarray(out.get_frame(0))).all()
-
-
 def test_bilateral_deterministic_f32(clip_grays):
     a = _run(clip_grays, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
     b = _run(clip_grays, sigma_spatial=SIGMA_SPATIAL, sigma_color=SIGMA_COLOR)
@@ -173,11 +167,6 @@ def test_bilateral_output_finite_f16(clip_grayh):
         a = _plane(out.get_frame(n), 0, dtype=np.float16).astype(np.float64)
         assert np.isfinite(a).all(), f"non-finite output at frame {n}"
         assert a.min() >= 0.0 and a.max() <= 1.0
-
-
-def test_bilateral_defaults_run_f16(clip_grayh):
-    out = _run(clip_grayh)
-    assert_changes_on_clip(out, clip_grayh, frames=(0,), what="bilateral f16")
 
 
 def test_bilateral_deterministic_f16(clip_grayh):
@@ -355,12 +344,6 @@ def test_bilateral_output_finite_u16(clip_gray16):
     )
     assert out.format.id == clip_gray16.format.id
     assert_changes_on_clip(out, clip_gray16, frames=(10,), what="bilateral")
-
-
-def test_bilateral_defaults_run_u16(clip_gray16):
-    out = _run(clip_gray16)
-    assert out.format.id == clip_gray16.format.id
-    assert_changes_on_clip(out, clip_gray16, frames=(0,), what="bilateral")
 
 
 def test_bilateral_preserves_frame_props(clip_grays):

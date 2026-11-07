@@ -52,15 +52,6 @@ def test_feel_aa_is_resident(clip_grays):
     assert transfers == []
 
 
-def test_feel_aa_reference_transfers(clip_grays):
-    """Sanity: the chain it replaces does insert transfers on the same clip."""
-    ref, transfers = _transfers(
-        lambda: _reference(clip_grays, supersampler=Point(), downscaler=Catrom())
-    )
-    assert not ref.gpu_resident
-    assert transfers
-
-
 # based_aa's own default supersampler is ArtCNN, a learned model whose imports
 # are incomplete in this environment, so every case names its scalers instead.
 # The reference runs most steps on the host and feel_aa on the device, and the
@@ -247,20 +238,6 @@ def test_native_box_matches_resize2(clip_gray16, ratio, exact):
     out = _plane(got)
     d = np.abs(ref - out)
     assert d.max() == 0 if exact else d.max() <= 4, f"max|d|={d.max()}"
-
-
-def test_native_box_is_resident(clip_gray16):
-    resident = vs.core.std.GPUUpload(clip=clip_gray16)
-    node, transfers = _transfers(
-        lambda: vs.core.vsfeel.Box(resident, width=resident.width // 2, height=resident.height // 2)
-    )
-    assert node.gpu_resident
-    assert transfers == []
-
-
-def test_native_box_rejects_upscale(clip_grays):
-    with pytest.raises(Exception, match="downscales"):
-        vs.core.vsfeel.Box(clip_grays, width=clip_grays.width * 2)
 
 
 def test_feel_aa_box_other_ratio_is_resident(clip_grays):

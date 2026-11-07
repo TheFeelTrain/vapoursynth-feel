@@ -522,7 +522,7 @@ def test_gaussblur_preserves_frame_props(clip_grays):
 
 
 def test_gaussblur_rejects_all_copy_through(clip_grays):
-    with pytest.raises(vs.Error):
+    with pytest.raises(vs.Error, match="nothing to process"):
         _run(clip_grays, sigma=0.0)
 
 

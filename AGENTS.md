@@ -194,6 +194,32 @@ for one explicitly.
   install first, or you are testing the previous binary.
 - A rewrite is only acceptable if all tests still pass.
 
+### What earns a test
+
+Every test must name the regression it catches that the rest of the suite would
+not. Before adding one, search `tests/` for the same behavior on the same depth
+and code path, and extend that test (or its parametrization) instead. The full
+suite gates every change, so its runtime is a shared cost, and a near-duplicate
+test pays that cost forever.
+
+Do not add:
+
+- **Tests of the reference or its chain.** Whether vszipcl, bm3dvk2 or
+  `based_aa` transfers frames, chooses a host scaler, or accepts an argument is
+  not vsfeel behavior. Assert what vsfeel does.
+- **Default-parameter smoke tests.** `tests/test_defaults.py` is the one place
+  that pins defaults against the reference. Add a row there; a call that only
+  asserts the default run produced a frame adds no coverage.
+- **Shape-, format- or finiteness-only tests** where a reference comparison
+  already reads the same planes: wrong geometry, plane count, sample type or
+  channel order fails that comparison. Fold the cheap format assertion into the
+  comparison test rather than adding a separate function.
+- **Another pass over an already-covered path.** Zero-sigma passthrough, f16
+  acceptance and "creation succeeds" are pinned per filter and depth by the
+  existing tests. A sibling test earns its place only when it reaches a distinct
+  kernel, storage width or creation-time choice, and its docstring should say
+  which one.
+
 ### Reference-comparison coverage and tolerance policy
 
 - **Sweep parameters against the reference** — every scalar parameter, every

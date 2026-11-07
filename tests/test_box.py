@@ -314,16 +314,6 @@ def test_chroma_planes_are_scaled_f16(clip_yuv420ph):
     assert _pxf(out, p=2).shape == (90, 160)
 
 
-def test_gray_has_one_plane_f16(clip_grayh):
-    w, h = _target(clip_grayh, 2)
-    assert _pxf(_box(clip_grayh, w, h)).shape == (h, w)
-
-
-def test_gray_has_one_plane(clip_grays):
-    w, h = _target(clip_grays, 2)
-    assert _pxf32(_box(clip_grays, w, h)).shape == (h, w)
-
-
 # ---------------------------------------------------------------------------
 # Residency
 # ---------------------------------------------------------------------------
@@ -342,15 +332,6 @@ def test_is_resident_f16(clip_grayh):
     node, transfers = _transfers(lambda: _box(resident, resident.width // 2, resident.height // 2))
     assert node.gpu_resident
     assert transfers == []
-
-
-def test_reference_is_not_resident(clip_gray16):
-    """The CPU-only oracle this replaces is exactly why the filter exists."""
-    resident = vs.core.std.GPUUpload(clip=clip_gray16)
-    _, transfers = _transfers(
-        lambda: Box().scale(resident, resident.width // 2, resident.height // 2, (0, 0))
-    )
-    assert transfers
 
 
 # ---------------------------------------------------------------------------

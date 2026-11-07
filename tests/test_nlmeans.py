@@ -952,18 +952,6 @@ def test_rejects_half_and_integer_mismatch(clip_grayh, clip_gray16):
         _run(clip_grayh, d=0, rclip=clip_gray16)
 
 
-def test_accepts_f16(clip_grayh):
-    """A half clip is processed natively, not rejected as an unsupported depth.
-
-    The reference comparison is what anchors the storage type (a u16 kernel
-    fed half bit patterns produces a wild picture); this pins the format
-    contract and that creation succeeds.
-    """
-    out = _run(clip_grayh, d=0, h=1.2)
-    assert out.format.id == clip_grayh.format.id
-    assert out.get_frame(5) is not None
-
-
 def test_channels_yuv_requires_444(clip_yuv420ps):
     with pytest.raises(vs.Error, match=r"requires 4:4:4"):
         _run(clip_yuv420ps, channels="YUV")
