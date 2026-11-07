@@ -569,18 +569,6 @@ def test_benchmark_bm3d_radius_none_means_unset(monkeypatch):
     assert "radius" not in calls["vsfeel"]
 
 
-def test_test_sh_rejects_a_worker_override():
-    """The 8-worker GPU guard must not be bypassed by a later pytest -n."""
-    proc = subprocess.run(
-        [str(ROOT / "tools" / "test.sh"), "-n", "16", "--collect-only"],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert proc.returncode != 0
-    assert "VSFEEL_TEST_WORKERS" in proc.stderr
-
-
 def test_ab_env_applies_and_restores(monkeypatch):
     """An arm's overrides are visible inside the cell and gone after it."""
     import os

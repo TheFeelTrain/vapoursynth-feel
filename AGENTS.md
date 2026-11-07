@@ -172,7 +172,7 @@ Every filter needs **comprehensive unit tests** in `tests/`, run with pytest.
 The committed `tests/bigbuckbunny_360p_grain.mp4` clip is the standard test
 input. The fixtures expose its first 24 frames (`CLIP_FRAMES`): the helpers
 iterate every frame they are handed, so the whole file would make a full run
-12x longer without covering anything new. A test that needs a longer run asks
+much longer without covering anything new. A test that needs a longer run asks
 for one explicitly.
 
 - Tests must verify **correctness against the reference behavior** and
@@ -180,8 +180,9 @@ for one explicitly.
   agreement, parallel-load consistency).
 - The `tests/` folder has `conftest.py` with shared fixtures/helpers
   (`WIDTH`, `HEIGHT`, `CLIP_PATH`, `frame_to_ndarray`, ...).
-- Always run the full test suite for the filter you touch before and after
-  changes: `tools/test.sh tests/test_<filter>.py -q`.
+- **Work the test ladder below; never use the full suite as an edit loop.**
+  Iterate on the narrowest failing case, then the affected files, and run the
+  full gate once before hand-off.
 - Run the whole suite with **`tools/test.sh`** (extra args are passed through,
   default target `tests`). It uses pytest-xdist (`dev` dependency group) with
   `--dist loadfile` and caps workers at 8. Do not raise the cap and
@@ -193,6 +194,34 @@ for one explicitly.
 - **The suite loads the installed plugin, not `build/libvsfeel.so`** — build and
   install first, or you are testing the previous binary.
 - A rewrite is only acceptable if all tests still pass.
+
+### Choosing what to run
+
+| Scope | Command | Rough cost |
+| --- | --- | --- |
+| One failing case | `tools/test.sh tests/test_x.py::test_y -q -x` | seconds |
+| The working-tree changes | `tools/test_changed.sh` | seconds to one filter file |
+| Broad smoke, BM3D excluded | `tools/test.sh` | about 2 minutes |
+| Full gate, once before hand-off | `tools/test.sh --all` | about 5 minutes |
+
+The costs are deliberately rough. Do not replace them with measured durations:
+they go stale as soon as tests are added.
+
+`tools/test_changed.sh` reads `git diff` plus staged and untracked files, maps
+`src/<filter>.*` to `tests/test_<filter>.py` (plus the BM3D matcher and the
+EEDI3 variants), and runs only those files. It escalates to `--all` for shared
+plumbing (`src/vsfeel.h`, `src/vsfeel.cpp`, `tests/conftest.py`,
+`CMakeLists.txt`, the environment and build files) or an unrecognised path;
+`--list` prints the selection without running it.
+
+`tools/test.sh` without `--all` skips `tests/test_bm3d.py`. BM3D is the single
+largest block of suite time, so it is opt-in: it runs when named explicitly,
+when an option contains `bm3d`, or with `--all`. `--lf` replays the last failures
+and never applies the skip. The full gate is required once
+before you report work complete, after shared plumbing changes, and after a new
+binary is installed. CI runs only the GPU-less tests, so there is no remote
+fallback. If a change spans several filters or the mapping is uncertain, use
+`--all` rather than the default run.
 
 ### What earns a test
 
@@ -219,6 +248,12 @@ Do not add:
   existing tests. A sibling test earns its place only when it reaches a distinct
   kernel, storage width or creation-time choice, and its docstring should say
   which one.
+- **Tests about the test harness.** Do not add pytest tests that shell out to
+  `tools/test.sh` or `tools/test_changed.sh` to pin their flags, defaults or
+  output. Run the script when changing it. A harness test pays its runtime on
+  every suite run and cannot fail on a filter regression. Build tools with real
+  logic (`benchmark.py`, `shader_limits.py`, the header generator) still earn
+  tests; the test runner and the change selector are verified by running them.
 
 ### Reference-comparison coverage and tolerance policy
 
@@ -261,15 +296,15 @@ runs it. Plugins are described separately in `PLUGINS`.
   `--cache-frames` (default 1000) frames are decoded while vspipe evaluates the
   script and uploaded once to VRAM, so the timed window starts at the first
   output frame and timing measures filter throughput on real content without
-  the BestSource decode bottleneck (~630 fps). `--cpu-cache` keeps them in RAM
-  instead, and `--gpu-cache-mb` bounds whichever cache holds them. Frames loop
-  for as long as the run needs, so temporal filters see a seam every N frames —
-  fine for throughput, not for output inspection.
+  the BestSource decode bottleneck. `--cpu-cache` keeps them in RAM instead,
+  and `--gpu-cache-mb` bounds whichever cache holds them. Frames loop for as
+  long as the run needs, so temporal filters see a seam every N frames — fine
+  for throughput, not for output inspection.
 - **Every arm runs for the same wall time** (`--seconds`, default 5): the
   harness stops vspipe once its progress reports span that window and reports
-  the frames counted over it, so a 25 fps reference costs no more than a
-  5000 fps filter. The clock ramp is inside the window; do not shrink
-  `--seconds` to iterate faster (the harness warns below 2 s).
+  the frames counted over it, so a slow reference costs no more than a fast
+  filter. The clock ramp is inside the window; do not shrink `--seconds` to
+  iterate faster (the harness warns below 2 s).
 
 To benchmark a single filter against the references:
 
@@ -338,9 +373,8 @@ against a binary that does not contain your change. Build and install with
 
 `VSFEEL_AVX2` compiles the host code with `-mavx2` for local builds. Wheel
 builds pass it `OFF`: the generic wheel tag cannot express an AVX2 floor, and
-the flag only auto-vectorises setup/copy code. The host-side cost measured
-below noise (+0.05% on the bilateral synthetic benchmark, 4 repeats, spread
-under 0.5%); the GPU kernels are unaffected either way.
+the flag only auto-vectorises setup/copy code. The host-side cost is below noise
+in local benchmarks; the GPU kernels are unaffected either way.
 
 Vulkan headers (`Vulkan-Headers`) are pinned and fetched by `FetchContent` at
 configure time, so no Vulkan SDK is needed to link — only `glslc` from one.
@@ -389,10 +423,10 @@ removing a variant regenerates it. Do not remove either.
 
 ### Persistent pipeline cache (makes creation and the test suite fast)
 
-Compiling the compute shaders from SPIR-V dominates filter creation on RADV —
-about 4.4 s for the first DFTTest variant in a process, versus ~0.11 s once the
-driver has it. The plugin therefore keeps a `VkPipelineCache` seeded from and
-flushed to a file:
+Compiling the compute shaders from SPIR-V dominates filter creation on RADV:
+the first variant takes seconds, versus a fraction of a second once the driver
+has it. The plugin therefore keeps a `VkPipelineCache` seeded from and flushed
+to a file:
 
 - default location: `$XDG_CACHE_HOME/vsfeel/pipeline_cache_<pipelineCacheUUID>.bin`
   (`~/.cache/vsfeel/...`), with an automatic fallback to `$TMPDIR/vsfeel/` when
@@ -406,13 +440,12 @@ flushed to a file:
   concurrent test subprocesses cannot corrupt it;
 - the write is **skipped when the blob is the size it was loaded at**, so a
   process that compiled nothing new leaves the file alone. Without that check
-  every short-lived process rewrote it at exit: 25.8 GB of device writes for
-  `tests/test_bm3d.py` alone, 0.2 GB after it.
+  every short-lived process rewrote the whole blob at exit, which turned a short
+  test run into a large amount of device writes; with the check it is
+  negligible.
 
-Measured on the full suite: **~7.5 min cold → ~3.5 min for
-the run that builds the cache → 142 s warm** (904 tests, 323 s before the write
-check). The first run after a driver or `glslc` update pays the compile again by
-design.
+Cold runs are slower because they build the cache. The first run after a driver
+or `glslc` update pays the compile again by design.
 
 ## Code quality (lint)
 
@@ -451,8 +484,8 @@ missing fails, because then it did not run.
 
 After the shader gate, the remaining gates run concurrently, so a full run
 costs about the slowest one. The analysers read a derived view in
-`build/lint/`: `tools/lint_stub.py` replaces the tens of MB of generated SPIR-V
-arrays in `build/spirv_binaries.h` with a stub that keeps every symbol, then
+`build/lint/`: `tools/lint_stub.py` replaces the generated SPIR-V arrays
+in `build/spirv_binaries.h` with a stub that keeps every symbol, then
 rewrites the compile database to resolve it first. Parsing that data-only
 header once per translation unit was most of a lint run; neither gate reports
 on it, since both keep findings in `src/`. `VSFEEL_LINT_JOBS` caps the

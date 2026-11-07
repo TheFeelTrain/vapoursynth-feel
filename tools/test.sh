@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 #
 # Run the pytest suite in parallel. Use this instead of a bare `pytest tests`:
-# the suite is mostly one-shot subprocesses (median ~1.4 s each, the bulk of
-# the serial wall time), so it parallelises well, but the worker count must
-# stay capped and distribution must stay file-level.
+# the suite is mostly one-shot subprocesses, so it parallelises well, but the
+# worker count must stay capped and distribution must stay file-level.
 #
 # The project venv is the environment under test (`uv sync` installs the suite's
 # reference plugins into it, and tools/install.sh installs the plugin into its
@@ -14,9 +13,15 @@
 # another client shares it; `--dist loadfile` keeps that config from
 # overlapping another heavy file. See notes/NLMEANS.md.
 #
-# Usage: tools/test.sh [pytest args...]        default target: tests
+# Usage: tools/test.sh [--all] [pytest args...]   default target: tests
+#        tools/test.sh --all                     full gate, BM3D included
 #        tools/test.sh tests/test_nlmeans.py -q
-#        VSFEEL_TEST_WORKERS=1 tools/test.sh   serial, no xdist
+#        VSFEEL_TEST_WORKERS=1 tools/test.sh     serial, no xdist
+#
+# Without --all this skips tests/test_bm3d.py, the single biggest block of
+# suite time. Naming BM3D (or putting "bm3d" in an option) includes it, and
+# --all is the full gate. Use tools/test_changed.sh while iterating; run --all
+# once before hand-off, not after every edit.
 #
 # A missing reference plugin fails the run by default (`--require-references`):
 # the reference comparisons skip when one is absent, which would silently delete
@@ -74,6 +79,25 @@ if [ "$workers" -gt 8 ]; then
     workers=8
 fi
 
+# --all is the explicit full gate, consumed here so pytest never sees it.
+# VSFEEL_TEST_ALL=1 is the same switch for wrappers that cannot add an argument.
+include_all=0
+if [[ ${VSFEEL_TEST_ALL:-0} == 1 ]]; then
+    include_all=1
+fi
+args=()
+for arg in "$@"; do
+    case $arg in
+        --all) include_all=1 ;;
+        *) args+=("$arg") ;;
+    esac
+done
+if [ "${#args[@]}" -gt 0 ]; then
+    set -- "${args[@]}"
+else
+    set --
+fi
+
 if [ "$#" -eq 0 ]; then
     set -- tests
 fi
@@ -113,6 +137,24 @@ if [ -z "$target_given" ]; then
     set -- "$@" tests
 fi
 
+# BM3D is the one filter whose numerical suite is long enough to dominate a
+# run. Keep it out of the default and broad smoke runs; any argument naming it,
+# and --lf (which can replay a BM3D failure), opts back in.
+default_target=0
+include_bm3d=0
+for arg in "$@"; do
+    case $arg in
+        tests|tests/) default_target=1 ;;
+        *[Bb][Mm]3[Dd]*) include_bm3d=1 ;;
+        --lf|--last-failed) include_bm3d=1 ;;
+    esac
+done
+bm3d_args=()
+if [ "$include_all" -eq 0 ] && [ "$default_target" -eq 1 ] && [ "$include_bm3d" -eq 0 ]; then
+    bm3d_args=(--ignore=tests/test_bm3d.py)
+    printf 'test.sh: BM3D excluded (it is most of the suite). Run tools/test.sh --all for the full gate.\n' >&2
+fi
+
 cd -- "$root_dir"
 
 # reference/ is read-only porting material, never part of this suite: it holds
@@ -121,13 +163,13 @@ cd -- "$root_dir"
 ignore_reference=(--ignore=reference)
 
 if [ "$workers" -le 1 ]; then
-    exec "$py" -m pytest -q "${ignore_reference[@]}" "${refs_args[@]}" "$@"
+    exec "$py" -m pytest -q "${ignore_reference[@]}" "${bm3d_args[@]}" "${refs_args[@]}" "$@"
 fi
 
 if ! "$py" -c 'import xdist' >/dev/null 2>&1; then
     printf 'test.sh: pytest-xdist is not installed (dev dependency group); running serially\n' >&2
-    exec "$py" -m pytest -q "${ignore_reference[@]}" "${refs_args[@]}" "$@"
+    exec "$py" -m pytest -q "${ignore_reference[@]}" "${bm3d_args[@]}" "${refs_args[@]}" "$@"
 fi
 
 exec "$py" -m pytest -q -n "$workers" --dist loadfile \
-    "${ignore_reference[@]}" "${refs_args[@]}" "$@"
+    "${ignore_reference[@]}" "${bm3d_args[@]}" "${refs_args[@]}" "$@"
