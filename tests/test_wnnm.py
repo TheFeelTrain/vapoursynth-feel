@@ -75,7 +75,15 @@ def WNNM(*args, **kwargs):
 
 
 def _ref_payload(
-    fmt, frames, params, planes=None, guide=None, crop=None, nframes=None, diff_tol=None
+    fmt,
+    frames,
+    params,
+    planes=None,
+    guide=None,
+    crop=None,
+    nframes=None,
+    diff_tol=None,
+    env=None,
 ):
     reference_or_skip("vszip", "WNNM")
     spec = reference_spec(
@@ -92,10 +100,10 @@ def _ref_payload(
     )
     if nframes is not None:
         spec["nframes"] = int(nframes)
-    return reference_compare(spec)
+    return reference_compare(spec, env=env)
 
 
-def _ref_compare(fmt, frames, params, planes=None, guide=None, crop=None, nframes=None):
+def _ref_compare(fmt, frames, params, planes=None, guide=None, crop=None, nframes=None, env=None):
     payload = _ref_payload(
         fmt,
         frames,
@@ -105,6 +113,7 @@ def _ref_compare(fmt, frames, params, planes=None, guide=None, crop=None, nframe
         crop=crop,
         nframes=nframes,
         diff_tol=1e-5,
+        env=env,
     )
     assert payload["ndiff_frac"] <= REF_NDIFF, (
         f"{payload['ndiff_frac']:.2%} of samples differ (params {params})"
@@ -974,6 +983,28 @@ def test_split_falls_back_without_eight_lane_shuffle(knob):
     err = _creation_stderr("dict(sigma=3)", knob)
     assert "split=0" in err, err[-2000:]
     assert "fused kernel" in err, err[-2000:]
+
+
+def test_matcher_width_follows_a_wave64_device(clip_grays):
+    """A wave64-only device runs the group/matcher at 64 threads, same pixels.
+
+    The group kernel owns one reference block per workgroup and stages one
+    candidate per lane, so a 64-lane wave wants 64 threads and TFULL=64. The
+    target reports a 64-lane default subgroup size but can launch 32-lane waves,
+    so it keeps the measured 32-thread shape (the knob is how the other arm is
+    exercised here); its pixels must not depend on the width either, so both
+    paths are compared against vszip.
+    """
+    assert "matcher: 32 threads" in _creation_stderr("dict(sigma=3)")
+    assert "matcher: 64 threads" in _creation_stderr(
+        "dict(sigma=3, group_size=32)", {"VSFEEL_WNNM_GROUP_WG": "64"}
+    )
+    forced = {"VSFEEL_WNNM_GROUP_WG": "64"}
+    # The fused group kernel (group_size above the split's 8) and the temporal
+    # matcher (radius > 0) are the two kernels the width applies to.
+    for params in (dict(sigma=3, radius=2, group_size=8), dict(sigma=3, group_size=32)):
+        worst = _ref_compare("grays", (0, 11), params, env=forced)
+        assert worst <= REF_TOL, f"{params} at 64 threads: max diff {worst:.3e}"
 
 
 # ---------------------------------------------------------------------------

@@ -50,8 +50,10 @@ constexpr int kMaxPsNum = 64;
 // 2*range+1 and the search rectangle well inside int.
 constexpr int kMaxRange = 4096;
 constexpr int kWorkgroup = 128;
-// Fused group kernel threads: one warp per reference block, the measured
-// configuration (the split estimate has its own 128/256-thread kernels).
+// Fused group kernel threads where a subgroup is 32 lanes: one warp per
+// reference block, the measured configuration. A 64-lane device runs 64 (see
+// the width selection in create()); the split estimate has its own 128/256
+// thread kernels.
 constexpr int kGroupThreads = 32;
 // Floats of split-estimate scratch per group: the Gram matrix (64), the
 // per-pixel mean (M floats when residual strips it, otherwise the reserved
@@ -241,6 +243,9 @@ struct GPUWNNM {
     uint32_t src_grid_x[3] {}, src_grid_y[3] {};
     std::vector<int> src_tag; // [set][plane][slot] -> frame, or INT_MIN
     VkPipeline copy_pipe {};
+    // Group/matcher workgroup width, from the device's subgroup size: 32 or 64.
+    // The selection tile is one candidate per lane, so TFULL follows it.
+    uint32_t group_wg { 32 };
 
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
@@ -336,7 +341,7 @@ struct WnnmVariant {
 };
 
 static WnnmVariant pick_variant(int qmax, bool hw_atomics, bool match_only,
-                                int io) {
+                                int io, bool wg64) {
     WnnmVariant v { nullptr,         0,
                     wnnm_finish_spv, sizeof(wnnm_finish_spv),
                     wnnm_dist_spv,   sizeof(wnnm_dist_spv),
@@ -356,26 +361,36 @@ static WnnmVariant pick_variant(int qmax, bool hw_atomics, bool match_only,
         v.copy_size = sizeof(wnnm_copy_f16_spv);
     }
     if (match_only) {
-        v.group = wnnm_group_q8_mo_spv;
-        v.group_size = sizeof(wnnm_group_q8_mo_spv);
+        v.group = wg64 ? wnnm_group_q8_mo64_spv : wnnm_group_q8_mo_spv;
+        v.group_size = wg64 ? sizeof(wnnm_group_q8_mo64_spv)
+                            : sizeof(wnnm_group_q8_mo_spv);
     } else if (qmax == 8 && hw_atomics) {
-        v.group = wnnm_group_q8_wg32_spv;
-        v.group_size = sizeof(wnnm_group_q8_wg32_spv);
+        v.group = wg64 ? wnnm_group_q8_wg64_spv : wnnm_group_q8_wg32_spv;
+        v.group_size = wg64 ? sizeof(wnnm_group_q8_wg64_spv)
+                            : sizeof(wnnm_group_q8_wg32_spv);
     } else if (qmax == 8) {
-        v.group = wnnm_group_q8_wg32_cas_spv;
-        v.group_size = sizeof(wnnm_group_q8_wg32_cas_spv);
+        v.group =
+            wg64 ? wnnm_group_q8_wg64_cas_spv : wnnm_group_q8_wg32_cas_spv;
+        v.group_size = wg64 ? sizeof(wnnm_group_q8_wg64_cas_spv)
+                            : sizeof(wnnm_group_q8_wg32_cas_spv);
     } else if (qmax == 16 && hw_atomics) {
-        v.group = wnnm_group_q16_wg32_spv;
-        v.group_size = sizeof(wnnm_group_q16_wg32_spv);
+        v.group = wg64 ? wnnm_group_q16_wg64_spv : wnnm_group_q16_wg32_spv;
+        v.group_size = wg64 ? sizeof(wnnm_group_q16_wg64_spv)
+                            : sizeof(wnnm_group_q16_wg32_spv);
     } else if (qmax == 16) {
-        v.group = wnnm_group_q16_wg32_cas_spv;
-        v.group_size = sizeof(wnnm_group_q16_wg32_cas_spv);
+        v.group =
+            wg64 ? wnnm_group_q16_wg64_cas_spv : wnnm_group_q16_wg32_cas_spv;
+        v.group_size = wg64 ? sizeof(wnnm_group_q16_wg64_cas_spv)
+                            : sizeof(wnnm_group_q16_wg32_cas_spv);
     } else if (hw_atomics) {
-        v.group = wnnm_group_q32_wg32_spv;
-        v.group_size = sizeof(wnnm_group_q32_wg32_spv);
+        v.group = wg64 ? wnnm_group_q32_wg64_spv : wnnm_group_q32_wg32_spv;
+        v.group_size = wg64 ? sizeof(wnnm_group_q32_wg64_spv)
+                            : sizeof(wnnm_group_q32_wg32_spv);
     } else {
-        v.group = wnnm_group_q32_wg32_cas_spv;
-        v.group_size = sizeof(wnnm_group_q32_wg32_cas_spv);
+        v.group =
+            wg64 ? wnnm_group_q32_wg64_cas_spv : wnnm_group_q32_wg32_cas_spv;
+        v.group_size = wg64 ? sizeof(wnnm_group_q32_wg64_cas_spv)
+                            : sizeof(wnnm_group_q32_wg32_cas_spv);
     }
     return v;
 }
@@ -454,13 +469,13 @@ static bool wnnm_full_range(const VSFrame * frame, const VSVideoFormat & format,
 // tools/shader_limits.py cannot attribute these variants (their code pointer
 // comes from the runtime variant table), so that table reports them unchecked.
 static constexpr uint32_t group_shared_bytes(int qmax, int bs, int gs,
-                                             bool match_only) {
+                                             bool match_only, uint32_t tf) {
     const uint32_t q2 = uint32_t(qmax) * uint32_t(qmax);
     // top_{e,xy,t}[TOPCAP], top_n.
     const uint32_t topcap = match_only ? uint32_t(gs) : 64u;
     uint32_t bytes = topcap * 3u * 4u + 4u;
-    // cand[TFULL], tile/merg_{e,xy}[SELCAP], tile_n.
-    bytes += 32u * 4u + 4u * 32u * 4u + 4u;
+    // cand[TFULL], tile_{e,xy}[TFULL], merg_{e,xy}[SELCAP], tile_n.
+    bytes += tf * 4u + 2u * tf * 4u + 2u * 32u * 4u + 4u;
     // fr_{e,xy}[KMAXL], fr_n, loc_n, ctr_xy[KMAXL], ctr_n, seed_order.
     bytes += 2u * 64u * 4u + 2u * 4u + 64u * 4u + 4u + 64u * 4u;
     if (!match_only) {
@@ -473,10 +488,14 @@ static constexpr uint32_t group_shared_bytes(int qmax, int bs, int gs,
 }
 
 // The built modules' numbers, for the formula above to stay honest.
-static_assert(group_shared_bytes(8, 8, 8, false) == 3592);
-static_assert(group_shared_bytes(8, 8, 8, true) == 2036);
-static_assert(group_shared_bytes(16, 8, 8, false) == 5992);
-static_assert(group_shared_bytes(32, 8, 8, false) == 15400);
+static_assert(group_shared_bytes(8, 8, 8, false, 32) == 3592);
+static_assert(group_shared_bytes(8, 8, 8, true, 32) == 2036);
+static_assert(group_shared_bytes(16, 8, 8, false, 32) == 5992);
+static_assert(group_shared_bytes(32, 8, 8, false, 32) == 15400);
+// One candidate per lane at 64 threads: cand and the tile arrays grow by 32.
+static_assert(group_shared_bytes(8, 8, 8, false, 64) == 3592 + 3 * 32 * 4);
+static_assert(group_shared_bytes(8, 8, 8, true, 64) == 2036 + 3 * 32 * 4);
+static_assert(group_shared_bytes(32, 8, 8, false, 64) == 15400 + 3 * 32 * 4);
 
 // ---------------------------------------------------------------------------
 // Frame processing
@@ -1538,6 +1557,28 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         }
     }
 
+    // Matcher workgroup width. The group kernel owns one reference block per
+    // workgroup and stages one candidate per lane in its selection tile, so a
+    // wave64-only device fills a wave at 64 threads (TFULL=64). A device that
+    // can launch 32-lane waves keeps the measured 32-thread shape even when it
+    // reports 64 as its default subgroup size: RADV does, and both the fused and
+    // the temporal matcher are ~1% slower at 64 threads on the target, which is
+    // what a 32-lane wave predicts. VSFEEL_WNNM_GROUP_WG forces one for an A/B
+    // or to exercise the other arm.
+    const bool can_narrow =
+        d->gpu->subgroup_size_control && d->gpu->min_subgroup_size <= 32;
+    d->group_wg = (d->gpu->subgroup_size >= 64 && !can_narrow) ? 64u : 32u;
+    if (const int forced = env_int("VSFEEL_WNNM_GROUP_WG", 0); forced > 0) {
+        if (forced != 32 && forced != 64) {
+            return set_error("\"VSFEEL_WNNM_GROUP_WG\" must be 32 or 64.");
+        }
+        d->group_wg = static_cast<uint32_t>(forced);
+    }
+    if (vsfeel_device_info_enabled()) {
+        fprintf(stderr, "[wnnm] matcher: %u threads (%u-lane subgroups)\n",
+                d->group_wg, d->gpu->subgroup_size);
+    }
+
     // Geometry and per-plane scratch. The kernel's group lattice is the
     // reference's `min(_x, temp_c)` walk. The layout runs again when the
     // centre cache's ring has to shrink to its budget.
@@ -2040,7 +2081,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         }
         const bool temporal = pl.radius > 0;
         const WnnmVariant variant =
-            pick_variant(qmax, hw_atomics, d->split_match && temporal, d->io);
+            pick_variant(qmax, hw_atomics, d->split_match && temporal, d->io,
+                         d->group_wg == 64);
         const int locs_folds = d->split_match ? pl.folds : 1;
         WnnmSpec spec {};
         spec.width = pl.width;
@@ -2131,9 +2173,10 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             if (temporal) {
                 // The temporal matcher still runs the fused kernel, up to the
                 // point where it publishes its selection.
-                const GpuWorkgroup gwg { .x = 32u,
+                const GpuWorkgroup gwg { .x = d->group_wg,
                                          .shared_bytes = group_shared_bytes(
-                                             qmax, d->bs, d->gs, true) };
+                                             qmax, d->bs, d->gs, true,
+                                             d->group_wg) };
                 pl.group_pipe =
                     add(tag, variant.group, variant.group_size, gwg);
                 if (!pl.group_pipe) {
@@ -2144,9 +2187,10 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             // The group kernel's LDS footprint is a function of qmax, bs and
             // the estimate path; gpu_create_pipeline checks it against the
             // device.
-            const GpuWorkgroup wg { .x = uint32_t(kGroupThreads),
+            const GpuWorkgroup wg { .x = d->group_wg,
                                     .shared_bytes = group_shared_bytes(
-                                        qmax, d->bs, d->gs, false) };
+                                        qmax, d->bs, d->gs, false,
+                                        d->group_wg) };
             pl.group_pipe = add(tag, variant.group, variant.group_size, wg);
             if (!pl.group_pipe) {
                 return;

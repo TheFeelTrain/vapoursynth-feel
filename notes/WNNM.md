@@ -56,9 +56,12 @@ The port is f32 end to end; there is no f64 path any more.
   record per *centre*. Its candidate selection is parallel (`fr_tile`): every
   candidate counts how many rank below it, error first and then arrival order,
   which is the reference's stable order, and the tile's list is merged into the
-  running one. The kernel runs at **32 threads per group** (`-DWG=32`): the
-  candidate tile is 32 wide, so a 128-thread workgroup left three quarters of it
-  idle while still paying four-warp barriers (1.6x at 32).
+  running one. The kernel runs at **32 threads per group** on a 32-lane wave:
+  the candidate tile is one candidate per lane, so a 128-thread workgroup left
+  three quarters of it idle while still paying four-warp barriers (1.6x at 32).
+  A wave64-only device takes the `-DWG=64 -DTFULL=64` pair instead, one
+  candidate per lane of a 64-lane wave; the width is the device's, not a
+  constant (see Historical).
 - **Per-centre match cache** (`radius > 0`, `group_size <= 8`): a centre's
   selection is identical for every output that consumes it, and there are
   `2r+1` of those, so `CACHE`/`RING` spec constants key the match records by
@@ -254,6 +257,18 @@ staying a bit-exact copy and the request orders on both.
   faster, which is what pointed at the estimate path in the first place.
 
 ## Historical
+
+- **2026-11-07 - the matcher width follows the device's wave.** The group and
+  temporal-matcher kernels were fixed at `-DWG=32`, the measured RDNA3 shape, so
+  a wave64-only device (GCN/CDNA) ran one reference block on half a wave. Both
+  entries now also ship `-DWG=64 -DTFULL=64` (one candidate per lane, `cand` and
+  the tile arrays +32 entries = +384 B of LDS) and creation picks them when the
+  device cannot launch a 32-lane wave. The target reports a 64-lane *default*
+  subgroup size (RADV) but has `minSubgroupSize=32` and size control, so it
+  keeps the 32-thread arm, which the A/B confirms: 64 threads is 1% slower on
+  both the fused (`group_size=32`) and the temporal (`radius=2`) matcher at
+  1080p, medians of 12, and a 64-lane wave predicts exactly that. The temporal
+  and fused pixels are unchanged (<=4.2e-7, the atomic floor).
 
 - **2026-11-05 - the stride probe is short, after the geometry checks.** A
   65535x65535 GRAY16 clip allocated an 8.6 GB probe frame before the lattice
@@ -534,6 +549,8 @@ staying a bit-exact copy and the request orders on both.
   frame (the fallback path, and the A/B arm for the cache).
 - `VSFEEL_WNNM_NORING=1` - forces the match-ring allocation to fail, so the
   per-frame fallback runs through the same teardown as a real out-of-memory.
+- `VSFEEL_WNNM_GROUP_WG=32|64` - force the group/matcher workgroup width instead
+  of taking it from the device's wave.
 - `VSFEEL_WNNM_RING=<n>` - cap the match ring at the next power of two (below
   one fold pair's slots the cache is dropped); the ring-size A/B knob.
 - `VSFEEL_WNNM_NOEST=1` - keep the match cache but recompute every fold's M;

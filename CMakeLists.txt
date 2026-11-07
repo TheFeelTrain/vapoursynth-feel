@@ -419,23 +419,28 @@ list(APPEND VK_NNEDI3_VARIANTS
     "nnedi3_f16_predict16|nnedi3.comp|-DIO_F16 -DPRED16=1 -DENTRY_PREDICT -DSHSTRIDE=288u")
 
 # WNNM: one group kernel per LDS eigen-workspace size (q = min(bs^2, gs) picks
-# 8/16/32) and per eigen precision (f64 as the reference, f32 for devices
-# without shaderFloat64), plus the flat num/den finish kernel. NO_FLOAT_ATOMICS
-# is a second arm of the group kernel for devices without buffer float atomics.
-# The fused group arm is also built at 32 threads (the measured configuration);
-# the temporal matcher's MATCH_ONLY variant already uses that shape.
+# 8/16/32), per eigen precision (f64 as the reference, f32 for devices without
+# shaderFloat64) and per matcher workgroup width, plus the flat num/den finish
+# kernel. NO_FLOAT_ATOMICS is a second arm of the group kernel for devices
+# without buffer float atomics. The group kernel owns one reference block per
+# workgroup: 32 threads (one RDNA3 wave, the measured configuration) or 64 with
+# one candidate per lane (a 64-lane device, where 32 would leave half a wave
+# idle), so TFULL doubles with the width.
 set(VK_WNNM_QMAX 8 16 32)
 set(VK_WNNM_VARIANTS)
 foreach(qmax IN LISTS VK_WNNM_QMAX)
     list(APPEND VK_WNNM_VARIANTS
         "wnnm_group_q${qmax}_wg32|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DWG=32"
-        "wnnm_group_q${qmax}_wg32_cas|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DWG=32 -DNO_FLOAT_ATOMICS")
+        "wnnm_group_q${qmax}_wg32_cas|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DWG=32 -DNO_FLOAT_ATOMICS"
+        "wnnm_group_q${qmax}_wg64|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DWG=64 -DTFULL=64"
+        "wnnm_group_q${qmax}_wg64_cas|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DWG=64 -DTFULL=64 -DNO_FLOAT_ATOMICS")
 endforeach()
 list(APPEND VK_WNNM_VARIANTS
     "wnnm_finish|wnnm.comp|-DENTRY_FINISH"
     # The temporal matcher: the fused kernel up to the selection, which it
     # publishes for the split estimate instead of estimating inline.
     "wnnm_group_q8_mo|wnnm.comp|-DENTRY_GROUP -DQMAX=8 -DMATCH_ONLY -DWG=32"
+    "wnnm_group_q8_mo64|wnnm.comp|-DENTRY_GROUP -DQMAX=8 -DMATCH_ONLY -DWG=64 -DTFULL=64"
     # The split estimate (radius 0, group_size <= 8): Gram, eigen step, scatter.
     "wnnm_gram|wnnm.comp|-DENTRY_GRAM -DQMAX=8 -DWG=128"
     "wnnm_solve|wnnm.comp|-DENTRY_SOLVE -DQMAX=8 -DWG=256"
