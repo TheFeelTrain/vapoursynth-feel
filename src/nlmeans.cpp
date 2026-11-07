@@ -83,10 +83,23 @@ static constexpr std::array<VkSpecializationMapEntry, 15> spec_entries { {
     { 14, 56, sizeof(float) },
 } };
 
-// Workgroup tile geometry of the weight kernel (must match nlmeans.comp).
+// Workgroup tile geometry of the weight kernel (must match nlmeans.comp). A
+// workgroup covers BLK_X x (vrt*BLK_Y) output pixels, so its weight tile is
+// vrt*BLK_Y + 2s rows of a BLK_X + 2s wide distance array plus the BLK_X wide
+// row sums. The tile is linear in s, so `s >= 5` needs 17-20 KiB: more than the
+// 16 KiB of workgroup memory Vulkan 1.4 guarantees. The two shapes below cover
+// that floor; both produce the same pixels, only the workgroup's footprint and
+// occupancy differ.
 constexpr int BLK_X = 32;
 constexpr int BLK_Y = 8;
-constexpr int VRT_RESULT = 6;
+constexpr uint32_t kNlmVrtTall = 6;  // 48 output rows per workgroup
+constexpr uint32_t kNlmVrtShort = 3; // 24, the 16 KiB fallback
+
+// Shared memory the weight tile of one shape needs at search radius `s`.
+constexpr uint64_t nlm_tile_bytes(uint32_t vrt, uint32_t s) {
+    const uint64_t rows = static_cast<uint64_t>(vrt) * BLK_Y + 2 * s;
+    return (rows * (BLK_X + 2 * s) + rows * BLK_X) * 4u;
+}
 
 // GPU-trace timestamp pool size: slot 0 is the frame start, then three stamps
 // per weight+acc round (weight start, weight end, accumulation end).
@@ -133,6 +146,9 @@ struct NLMeansData {
     int pstride {}; // padded tile pitch
     int ph {};      // padded tile height
     int64_t tile_elems {};
+    // Weight-tile shape: kNlmVrtTall (48 output rows) or kNlmVrtShort (24) when
+    // the device's 16 KiB of workgroup memory cannot hold the tall tile.
+    uint32_t vrt { kNlmVrtTall };
     int clips {};     // 1, or 2 with rclip
     int guide_off {}; // window tile offset of the guide half
     // Sweep entries per weight+acc round. One round's live set -- the weight
@@ -227,26 +243,22 @@ struct NLMeansData {
 static std::variant<VkPipeline, std::string>
 create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
                 const uint32_t * code, size_t code_size,
-                const NLMeansSpecData & spec, bool weight_pass) {
+                const NLMeansSpecData & spec, uint32_t vrt, bool weight_pass) {
 
     // Explicit wave32, same knob the legacy build used (measured neutral here).
     // No kernel here uses a subgroup intrinsic, so this is a launch-shape
     // choice, not a requirement: take the default when 32 is not on offer.
     //
     // LDS: only ENTRY_WEIGHT declares the two tiles,
-    // `dist[VRT_RESULT*BY + 2*NLM_S][BX + 2*NLM_S]` and
-    // `hsum[VRT_RESULT*BY + 2*NLM_S][BX]` (nlmeans.comp), sized here for
-    // BX=32, BY=8, VRT_RESULT and a search radius of NLM_S = spec.s.
-    const uint32_t rows =
-        VRT_RESULT * BLK_Y + 2 * static_cast<uint32_t>(spec.s);
+    // `dist[vrt*BY + 2*NLM_S][BX + 2*NLM_S]` and `hsum[...][BX]`
+    // (nlmeans.comp), declared here from the same shape the module was built
+    // with and the instance's search radius NLM_S = spec.s.
     const GpuWorkgroup workgroup {
-        .x = 32,
-        .y = 8,
-        .shared_bytes = weight_pass
-                            ? (rows * (32 + 2 * static_cast<uint32_t>(spec.s)) +
-                               rows * 32) *
-                                  4u
-                            : 0u
+        .x = static_cast<uint32_t>(BLK_X),
+        .y = static_cast<uint32_t>(BLK_Y),
+        .shared_bytes = weight_pass ? static_cast<uint32_t>(
+                                          nlm_tile_bytes(vrt, uint32_t(spec.s)))
+                                    : 0u
     };
     const uint32_t subgroup_size =
         gpu.has_subgroup_size(32, workgroup.invocations()) ? 32 : 0;
@@ -254,6 +266,16 @@ create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
         gpu, code, code_size, layout, spec_entries.data(), &spec,
         static_cast<uint32_t>(spec_entries.size()), sizeof(spec), "nlmeans",
         subgroup_size, workgroup);
+}
+
+// The device's weight tile: the tall 48-row shape wherever its workgroup memory
+// holds it, the 24-row one on a device at the 16 KiB floor. If even that does
+// not fit, gpu_create_pipeline reports the tile's byte count against the limit
+// rather than launching a shape the device cannot host.
+static uint32_t choose_nlm_vrt(const GPUDevice & gpu, int s) {
+    const uint64_t tall = nlm_tile_bytes(kNlmVrtTall, static_cast<uint32_t>(s));
+    return tall <= gpu.limits.maxComputeSharedMemorySize ? kNlmVrtTall
+                                                         : kNlmVrtShort;
 }
 
 // Device address of a frame plane buffer, for the per-frame address table.
@@ -504,8 +526,9 @@ static const VSFrame * nlmeans_gpu_frame(NLMeansData * d, int n,
     }
 
     const uint32_t gx = static_cast<uint32_t>((d->width + BLK_X - 1) / BLK_X);
-    const uint32_t gy_w = static_cast<uint32_t>(
-        (d->height + VRT_RESULT * BLK_Y - 1) / (VRT_RESULT * BLK_Y));
+    const uint32_t tile_rows = d->vrt * BLK_Y;
+    const uint32_t gy_w =
+        static_cast<uint32_t>((d->height + tile_rows - 1) / tile_rows);
     const uint32_t gy = static_cast<uint32_t>((d->height + BLK_Y - 1) / BLK_Y);
 
     const Variant & v = d->variants[std::min(d->d, n)];
@@ -940,6 +963,29 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
     d->clips = d->has_ref ? 2 : 1;
     d->guide_off = d->has_ref ? d->channels * (2 * dd + 1) : 0;
 
+    // The weight tile comes from the device's workgroup-memory budget.
+    // VSFEEL_NLMEANS_TILE forces one shape for an A/B or to simulate a device;
+    // the pipeline's own device checks still apply to it.
+    d->vrt = choose_nlm_vrt(*d->gpu, d->s);
+    if (const char * forced = std::getenv("VSFEEL_NLMEANS_TILE");
+        forced != nullptr && *forced != '\0') {
+        if (std::strcmp(forced, "48") == 0) {
+            d->vrt = kNlmVrtTall;
+        } else if (std::strcmp(forced, "24") == 0) {
+            d->vrt = kNlmVrtShort;
+        } else {
+            return set_error("\"VSFEEL_NLMEANS_TILE\" must be 48 or 24.");
+        }
+    }
+    if (vsfeel_device_info_enabled()) {
+        fprintf(stderr,
+                "[nlmeans] weight tile: 32x8, %u output rows, %llu B at s=%d\n",
+                d->vrt * BLK_Y,
+                static_cast<unsigned long long>(
+                    nlm_tile_bytes(d->vrt, static_cast<uint32_t>(d->s))),
+                d->s);
+    }
+
     // Sweep entries per weight+acc round, sized so one round's live set fits the
     // GPU's last-level cache. That set is the f32 weight ring (one slot per
     // field, two for a temporal offset because the accumulation reads the
@@ -1196,6 +1242,9 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
     }
 
     {
+        // Only the weight kernel declares a tile, so only it has a shape
+        // variant; compose and acc are shared by both shapes.
+        const bool fewer_rows = d->vrt == kNlmVrtShort;
         const uint32_t * compose_code = nullptr;
         const uint32_t * weight_code = nullptr;
         const uint32_t * acc_code = nullptr;
@@ -1204,30 +1253,36 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
             if (d->half) {
                 compose_code = nlmeans_f16_compose_spv;
                 compose_size = nlmeans_f16_compose_spv_size;
-                weight_code = nlmeans_f16_weight_spv;
-                weight_size = nlmeans_f16_weight_spv_size;
+                weight_code = fewer_rows ? nlmeans_f16_weight_v3_spv
+                                         : nlmeans_f16_weight_spv;
+                weight_size = fewer_rows ? nlmeans_f16_weight_v3_spv_size
+                                         : nlmeans_f16_weight_spv_size;
                 acc_code = nlmeans_f16_acc_spv;
                 acc_size = nlmeans_f16_acc_spv_size;
             } else {
                 compose_code = nlmeans_u16_compose_spv;
                 compose_size = nlmeans_u16_compose_spv_size;
-                weight_code = nlmeans_u16_weight_spv;
-                weight_size = nlmeans_u16_weight_spv_size;
+                weight_code = fewer_rows ? nlmeans_u16_weight_v3_spv
+                                         : nlmeans_u16_weight_spv;
+                weight_size = fewer_rows ? nlmeans_u16_weight_v3_spv_size
+                                         : nlmeans_u16_weight_spv_size;
                 acc_code = nlmeans_u16_acc_spv;
                 acc_size = nlmeans_u16_acc_spv_size;
             }
         } else {
             compose_code = nlmeans_f32_compose_spv;
             compose_size = nlmeans_f32_compose_spv_size;
-            weight_code = nlmeans_f32_weight_spv;
-            weight_size = nlmeans_f32_weight_spv_size;
+            weight_code =
+                fewer_rows ? nlmeans_f32_weight_v3_spv : nlmeans_f32_weight_spv;
+            weight_size = fewer_rows ? nlmeans_f32_weight_v3_spv_size
+                                     : nlmeans_f32_weight_spv_size;
             acc_code = nlmeans_f32_acc_spv;
             acc_size = nlmeans_f32_acc_spv_size;
         }
         {
             const auto result =
                 create_pipeline(*d->gpu, d->pipeline_layout, compose_code,
-                                compose_size, spec, false);
+                                compose_size, spec, d->vrt, false);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -1236,15 +1291,16 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         {
             const auto result =
                 create_pipeline(*d->gpu, d->pipeline_layout, weight_code,
-                                weight_size, spec, true);
+                                weight_size, spec, d->vrt, true);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
             d->weight_pipeline = std::get<VkPipeline>(result);
         }
         {
-            const auto result = create_pipeline(
-                *d->gpu, d->pipeline_layout, acc_code, acc_size, spec, false);
+            const auto result =
+                create_pipeline(*d->gpu, d->pipeline_layout, acc_code, acc_size,
+                                spec, d->vrt, false);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }

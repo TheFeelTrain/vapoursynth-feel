@@ -110,11 +110,21 @@ u16 at `a=64`, while f32 holds the whole comparison surface at ≤1 LSB /
 - `ENTRY_COMPOSE`: one thread per padded tile element; `PAD`/`PSTRIDE` margins
   write 0, the interior loads the core's plane through the address table
   (buffer reference) and stores raw.
-- `ENTRY_WEIGHT`: unchanged box-sum/weight transform; `BX=32`, `BY=8`,
-  `VRT_RESULT=6`, the interior tile+halo fast path, and the exact per-instance
-  LDS sizing (`dist[VRT*BY+2S][BX+2S]`, `hsum[...][BX]`) are the pre-R80 ones.
-  The border path walks tile rows instead of a fixed chunk unroll, so the tile
-  height is a free parameter.
+- `ENTRY_WEIGHT`: unchanged box-sum/weight transform; `BX=32`, `BY=8`, the
+  interior tile+halo fast path, and the exact per-instance LDS sizing
+  (`dist[VRT*BY+2S][BX+2S]`, `hsum[...][BX]`) are the pre-R80 ones. The border
+  path walks tile rows instead of a fixed chunk unroll, so the tile height is a
+  free parameter: `VRT_RESULT` is 6 (48 rows) or 3 (24 rows), chosen at creation
+  from the device's `maxComputeSharedMemorySize` (the tall tile needs 17-20 KiB
+  at `s>=5`, over the 16 KiB Vulkan 1.4 guarantees) and shipped as
+  `-DNLM_VRT` variants, 24-row weight only. `VSFEEL_NLMEANS_TILE=48|24` forces
+  one for an A/B.
+- The u16 load is one `precise` multiply by 1/65535. Without `precise` the
+  batched interior path let the compiler fold the scale into the sample
+  difference (`(a-b)*k` for `a*k - b*k`), so a pixel's weight depended on which
+  tile computed it; every path is bit-identical now. Costs <=0.5% on the u16
+  benchmark (three A/B pairs against the unfolded build: +0.05%, +0.47%,
+  -0.45%), which is the run-to-run spread.
 - `ENTRY_ACC`: unchanged per-pixel `+q/-q` accumulation with `first`-flag init
   and the finish folded into the last round (`pc3`).
 - `VI_DIM`, `STRIDE`, `PSTRIDE`, `PH`, `PAD`, `NLM_S`, `NLM_D`, `NLM_REF`,
@@ -224,6 +234,18 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
   above a few percent.
 
 ## Historical
+
+- **2026-11-07 - the weight tile follows the device's workgroup memory.** The
+  single 48-row shape needs 17,168/18,240/19,344/20,480 B at `s=5..8`, over the
+  16 KiB a Vulkan 1.4 device may report, so `s>=5` failed creation there. The
+  tile is now `VRT_RESULT` 6 or 3 by `maxComputeSharedMemorySize`, with a
+  24-row weight module per io type; 16 KiB devices run `s=8` at 12,800 B and
+  the pixels are identical, which the u16 `precise` fix above made true (it
+  was not before: a pixel's weight depended on its tile). The occupancy idea is measured and rejected: on the target
+  the 24-row tile is 1.9% slower at `s=6` (1020 vs 1001 fps) and 14.8% slower
+  at `s=8` (946 vs 806 fps), `d=2 a=2 h=0.2` 1080p UV16 medians of 12, because
+  the extra halo work outweighs the 3 -> 5 resident workgroups, so the tall
+  tile stays the default wherever it fits.
 
 The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
@@ -363,4 +385,6 @@ Flags are `VSFEEL_NLMEANS_<FLAG>`.
   that fits the 96 MiB live-set target; clamped 1..16384, at most the sweep's
   entry count and the device's Z group-count limit).
 - `VSFEEL_NLMEANS_VRAM=1` — creation banner with ring/window/per-frame bytes.
+- `VSFEEL_NLMEANS_TILE=48|24` — force the weight tile's height instead of
+  letting the workgroup-memory budget choose it.
 - `VSFEEL_DEBUG`/`VSFEEL_TRACE` and `RADV_DEBUG=asm|shaderstats` as elsewhere.

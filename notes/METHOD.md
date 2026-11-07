@@ -115,6 +115,10 @@ ACO will not save you.
 
 ## Porting discipline
 
+**Device floors are the 1.4 profile's.** The core refuses anything below Vulkan
+1.4 (256 workgroup invocations, 256x256x64 per dimension, 16 KiB of workgroup
+memory); core Vulkan's 128 figures are not a floor any supported device reports.
+
 Lessons from porting DFTTest and NLMeans that go beyond the method above:
 
 - **MVP first, verbatim.** Port tables, index math, and formulas from the
@@ -147,19 +151,16 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   device-limit knob so sibling planes take different variants.
 - **For a semantics-preserving rewrite, build inputs that straddle the new
   code's decision boundaries.** The oracle alone was not enough: EEDI3's
-  replacement mask predicate was off by one (`>= 130` instead of `>= 129`) and
-  BOTH binary masks and uniformly-random masks passed — neither can see a
-  threshold error. Only masks concentrated at the boundary (values 120–139)
-  exposed it. So when you swap a computation for a cheaper equivalent, run the
-  old and new implementations side by side on identical inputs across
-  distributions that target every threshold, rounding, and tie-break in the
-  new code. Comparing both against a reference is weaker: the reference may
-  itself be permissive.
-- **Compose variants from shipped filters before writing new code.** A filter
-  that is a geometric or parametric transform of an existing one is often a
-  few invokes with zero new state — correct by construction, with a free
-  self-consistency oracle and near-zero maintenance; new kernels are for what
-  composition cannot express.
+  replacement mask predicate was off by one (`>= 130` for `>= 129`) and both
+  binary masks and uniformly-random masks passed, since neither can see a
+  threshold error; only masks concentrated at 120–139 exposed it. Run the old
+  and new implementations side by side across distributions that target every
+  threshold, rounding and tie-break. Comparing both against a reference is
+  weaker: the reference may itself be permissive.
+- **Compose variants from shipped filters before writing new code.** A
+  geometric or parametric transform of an existing filter is often a few
+  invokes with zero new state: correct by construction, with a free
+  self-consistency oracle; new kernels are for what composition cannot do.
 - **Only noise-clip comparisons against the reference prove correctness.**
   Constant/BlankClip input hides bugs (the references themselves deviate at
   borders on such input).

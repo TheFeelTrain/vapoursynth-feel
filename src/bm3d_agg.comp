@@ -28,12 +28,7 @@
 #define PEAK 1.0f
 #endif
 
-// The launch shape is the host's choice (vsfeel_fit_workgroup): 16x16 where the
-// device allows it, 16x8 on the 128-invocation floor. The shared layout below is
-// sized for the 16-wide tile either way (ids 5/6 are the launch dimensions, read
-// back as gl_WorkGroupSize), and both loops stride by it, so only the tile's
-// height changes with the shape.
-layout(local_size_x_id = 5, local_size_y_id = 6, local_size_z = 1) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(constant_id = 0) const int HEIGHT = 1080;
 layout(constant_id = 1) const int STRIDE = 1920;
@@ -116,21 +111,14 @@ shared float blockWeights[SPAN][SPAN];
 shared float rowSums[SPAN][TILE];
 
 void main() {
-    const int tile_x = int(gl_WorkGroupSize.x);
-    const int tile_y = int(gl_WorkGroupSize.y);
     const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-    const ivec2 origin = ivec2(gl_WorkGroupID.xy) * ivec2(tile_x, tile_y) -
-                         ivec2(BLOCK - 1);
+    const ivec2 origin = ivec2(gl_WorkGroupID.xy) * TILE - ivec2(BLOCK - 1);
     const int lx = int(gl_LocalInvocationID.x);
     const int ly = int(gl_LocalInvocationID.y);
-    // Only the rows this tile's boxes reach are worth staging; at 16x16 that is
-    // every row the array has.
-    const int rows = min(SPAN, tile_y + BLOCK - 1);
 
     // Every invocation takes part in both barriers, including those covering
     // the padding columns past STRIDE.
-    for (int i = int(gl_LocalInvocationIndex); i < SPAN * rows;
-         i += tile_x * tile_y) {
+    for (int i = int(gl_LocalInvocationIndex); i < SPAN * SPAN; i += TILE * TILE) {
         const int c = i % SPAN;
         const int r = i / SPAN;
         const ivec2 q = origin + ivec2(c, r);
@@ -140,7 +128,7 @@ void main() {
     barrier();
 
     // Row sums: rowSums[r][x] covers block weights x .. x + BLOCK - 1.
-    for (int r = ly; r < rows; r += tile_y) {
+    for (int r = ly; r < SPAN; r += TILE) {
         float sum = 0.0;
         for (int c = 0; c < BLOCK; ++c) {
             sum += blockWeights[r][lx + c];

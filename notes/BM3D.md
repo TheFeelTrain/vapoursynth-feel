@@ -276,10 +276,6 @@ the native type, dropping the caller's `depth()` node (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
-- **2026-11-07 — the tile shapes follow the device.** Normalization's 16x16 tile
-  and the copy/OPP blocks' 256 were constants (a 128-invocation device could not
-  create BM3D); spec constants now, 16x8 and 128 there. Same pixels, A/B flat.
-
 - **2026-11-05 — the CAS retry bound counts the temporal centres.** The
   `-DNO_FLOAT_ATOMICS` loop bounded retries by spatial-only `8*cells^2`
   (13448 at bm_range=16/step 1), but `2*radius+1` centres scatter into one

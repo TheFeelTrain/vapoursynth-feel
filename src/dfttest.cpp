@@ -479,7 +479,7 @@ static void dft_plan_spatial(DftPlaneConfig & cfg, int block_step) {
 // instead of dispatching a clamped grid that leaves the tail unwritten.
 static std::optional<std::string>
 dft_grid_error(const DftPlaneConfig & cfg, int plane, int block_step,
-               const VkPhysicalDeviceLimits & lim, const GpuWorkgroup & tile) {
+               const VkPhysicalDeviceLimits & lim) {
     const int64_t max_x = lim.maxComputeWorkGroupCount[0];
     const int64_t max_y = lim.maxComputeWorkGroupCount[1];
     const auto over = [&](int64_t gx, int64_t gy,
@@ -493,10 +493,8 @@ dft_grid_error(const DftPlaneConfig & cfg, int plane, int block_step,
                std::to_string(max_x) + "x" + std::to_string(max_y) + ")";
     };
 
-    const int64_t plane_gx =
-        (static_cast<int64_t>(cfg.pw) + tile.x - 1) / tile.x;
-    const int64_t plane_gy =
-        (static_cast<int64_t>(cfg.ph) + tile.y - 1) / tile.y;
+    const int64_t plane_gx = (static_cast<int64_t>(cfg.pw) + 31) / 32;
+    const int64_t plane_gy = (static_cast<int64_t>(cfg.ph) + 7) / 8;
     if (auto e = over(plane_gx, plane_gy, "pad pass")) {
         return e;
     }
@@ -520,9 +518,8 @@ dft_grid_error(const DftPlaneConfig & cfg, int plane, int block_step,
         if (y_end < y_begin) {
             continue;
         }
-        // col2im covers y_begin..y_end inclusive.
-        const int64_t col_rows = static_cast<int64_t>(y_end - y_begin) + 1;
-        const int64_t col_gy = (col_rows + tile.y - 1) / tile.y;
+        const int64_t col_gy =
+            (static_cast<int64_t>(y_end - y_begin) + 1 + 7) / 8;
         if (auto e = over(plane_gx, col_gy, "col2im pass")) {
             return e;
         }
@@ -591,11 +588,6 @@ struct DftData {
     bool process[3] { false, false, false };
 
     int radius {}, block_step {}, tw {};
-    // Launch shape of the pad and col2im kernels, fitted to the device: 32x8
-    // where it allows 256 invocations, 16x8 on the 128 floor. Both kernels and
-    // the grids that dispatch them are sized from it (see
-    // vsfeel_fit_workgroup).
-    GpuWorkgroup plane_tile {};
     bool zmean {};
     float sigma_scalar {}; // scaled by wscale when ftype < 2
     float sigma2 {};
@@ -693,23 +685,21 @@ constexpr GpuWorkgroup kFusedWorkgroup {
     .x = 8 * 16, // SUB_BLOCKS * 16
     .shared_bytes = (8 * 288 + 8) * 4
 }; // trans[SUB_BLOCKS*TR_SUB] + s_gf
-// The pad and col2im kernels take their tile from the device instead of a
-// constant (vsfeel_fit_workgroup): 32x8 where 256 invocations are allowed, 16x8
-// on the 128-invocation floor.
+constexpr GpuWorkgroup kPlaneWorkgroup { .x = 32, .y = 8 };
 
 // The fused kernel's variant is baked in as specialization constants so the
 // dead filter branches (and their divisions) vanish, matching the reference's
 // compile-time `#if FILTER_TYPE` selection. The env overrides exist so a probe
 // run can force a subgroup size (or deliberately request an invalid one and
 // watch the driver reject it).
-// `plane_tile` marks a pad/col2im kernel: its launch shape is the value
-// argument, passed as specialization constants 3 and 4, and it uses no subgroup
-// operations, so it also leaves the driver's subgroup width alone.
+// `no_subgroups` marks a kernel that uses no subgroup operation (pad and
+// col2im): it then leaves the driver's subgroup width alone instead of being
+// pinned to wave32 for the fused kernel's sake.
 static std::variant<VkPipeline, std::string>
 create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
                 const uint32_t * code, size_t code_size, GpuWorkgroup workgroup,
                 int32_t filter_type = -1, int32_t zmean = -1,
-                bool plane_tile = false) {
+                bool no_subgroups = false) {
 
     // The probe knobs win over the default selection below on purpose: they
     // exist so a run can force a subgroup size, or deliberately request one the
@@ -723,7 +713,7 @@ create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
     // subgroups are 8 lanes wide with every 16-lane tile split across two
     // subgroups: a silent race the subgroup barrier cannot order.
     uint32_t subgroup_size = 0;
-    if (!plane_tile) {
+    if (!no_subgroups) {
         if (forced_invalid) {
             subgroup_size = 17; // invalid on purpose, to test driver validation
         } else if (forced_sgsize > 0) {
@@ -742,8 +732,8 @@ create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
 
     // Build the spec-constant map from an explicit (id, value) list so the
     // offset always matches the slot the value is stored in.
-    VkSpecializationMapEntry spec_entries[4] {};
-    int32_t spec_values[4] {};
+    VkSpecializationMapEntry spec_entries[2] {};
+    int32_t spec_values[2] {};
     uint32_t n_spec = 0;
     if (filter_type >= 0) {
         spec_entries[n_spec] = { .constantID = 1,
@@ -759,20 +749,6 @@ create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
                                      n_spec * sizeof(int32_t)),
                                  .size = sizeof(int32_t) };
         spec_values[n_spec] = zmean;
-        ++n_spec;
-    }
-    if (plane_tile) {
-        spec_entries[n_spec] = { .constantID = 3,
-                                 .offset = static_cast<uint32_t>(
-                                     n_spec * sizeof(int32_t)),
-                                 .size = sizeof(int32_t) };
-        spec_values[n_spec] = static_cast<int32_t>(workgroup.x);
-        ++n_spec;
-        spec_entries[n_spec] = { .constantID = 4,
-                                 .offset = static_cast<uint32_t>(
-                                     n_spec * sizeof(int32_t)),
-                                 .size = sizeof(int32_t) };
-        spec_values[n_spec] = static_cast<int32_t>(workgroup.y);
         ++n_spec;
     }
 
@@ -952,12 +928,10 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
 
         // pad and col2im both walk the padded plane; creation rejected any
         // grid this device cannot dispatch.
-        const uint32_t plane_gx = static_cast<uint32_t>(
-            (static_cast<uint64_t>(cfg.pw) + d->plane_tile.x - 1) /
-            d->plane_tile.x);
-        const uint32_t plane_gy = static_cast<uint32_t>(
-            (static_cast<uint64_t>(cfg.ph) + d->plane_tile.y - 1) /
-            d->plane_tile.y);
+        const uint32_t plane_gx =
+            static_cast<uint32_t>((static_cast<uint64_t>(cfg.pw) + 31u) / 32u);
+        const uint32_t plane_gy =
+            static_cast<uint32_t>((static_cast<uint64_t>(cfg.ph) + 7u) / 8u);
 
         // fused + col2im, stripe by stripe over block rows: the spatial block
         // buffer is a ring of cfg.spatial_rows rows, so the fused write and the
@@ -1676,13 +1650,12 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         }
         d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
     }
-    d->plane_tile = vsfeel_fit_workgroup(d->gpu->limits, 32, 8);
     for (int plane = 0; plane < num_planes; ++plane) {
         if (!d->process[plane]) {
             continue;
         }
         if (auto e = dft_grid_error(d->planes[plane], plane, d->block_step,
-                                    d->gpu->limits, d->plane_tile)) {
+                                    d->gpu->limits)) {
             return set_error(*e);
         }
         // The per-frame scratch is created with gpu_make_buffer, which checks
@@ -1881,13 +1854,11 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         // other variants would only cost creation time and make an unused
         // variant able to reject a valid instance.
         const int radius = d->radius;
-        // The fitted shape, as the named literal the shader-limits gate resolves.
-        const GpuWorkgroup plane_wg { .x = d->plane_tile.x,
-                                      .y = d->plane_tile.y };
         {
-            const auto result = create_pipeline(
-                *d->gpu, d->pipeline_layout, pad_code[radius], pad_size[radius],
-                plane_wg, -1, -1, /*plane_tile=*/true);
+            const auto result =
+                create_pipeline(*d->gpu, d->pipeline_layout, pad_code[radius],
+                                pad_size[radius], kPlaneWorkgroup, -1, -1,
+                                /*no_subgroups=*/true);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -1904,9 +1875,10 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             d->fused_pipeline = std::get<VkPipeline>(result);
         }
         {
-            const auto result = create_pipeline(
-                *d->gpu, d->pipeline_layout, col2im_code, col2im_size, plane_wg,
-                -1, -1, /*plane_tile=*/true);
+            const auto result =
+                create_pipeline(*d->gpu, d->pipeline_layout, col2im_code,
+                                col2im_size, kPlaneWorkgroup, -1, -1,
+                                /*no_subgroups=*/true);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }

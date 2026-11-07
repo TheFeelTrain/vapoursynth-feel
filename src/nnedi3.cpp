@@ -428,10 +428,6 @@ struct Nnedi3Data {
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
     VkPipelineLayout pipeline_layout {};
-    // Launch width of the kept-row writer, fitted to the device: 256 where it
-    // allows it, 128 on the 128-invocation floor (see vsfeel_fit_workgroup).
-    // Each workgroup still owns a 1K-element block, so the grid is unchanged.
-    uint32_t keep_threads { 256 };
     // Prescreener / predictor weights: host visible so creation fills them
     // with three memcpys; the kernels stream them every dispatch.
     GpuBuffer ps {};
@@ -505,13 +501,11 @@ struct Nnedi3Data {
 
 struct Nnedi3Spec {
     int32_t width, rows, peak, pscrn, xdim, ydim, nns, qual, use_list, dh;
-    // The kept-row writer's launch width (id 10).
-    int32_t keep_threads;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 11> spec_entries = [] {
-    std::array<VkSpecializationMapEntry, 11> e {};
-    for (uint32_t i = 0; i < 11; ++i) {
+static constexpr std::array<VkSpecializationMapEntry, 10> spec_entries = [] {
+    std::array<VkSpecializationMapEntry, 10> e {};
+    for (uint32_t i = 0; i < 10; ++i) {
         e[i] = { i, i * static_cast<uint32_t>(sizeof(int32_t)),
                  sizeof(int32_t) };
     }
@@ -1084,7 +1078,6 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         }
         d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
     }
-    d->keep_threads = vsfeel_fit_workgroup(d->gpu->limits, 256).x;
 
     // The packed half predictor computes in half, which needs the optional
     // shaderFloat16 feature; a device without it keeps the storage-only f16
@@ -1511,11 +1504,11 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         cfg.ind_elem = static_cast<int32_t>(cfg.ind_offset / 4);
 
         // The kept-row writer's grid is linearized over x and y, and each
-        // workgroup covers a 1024-sample block however wide the device's launch
-        // is, so a 4K double-rate plane stays under the 65535-group x limit.
+        // 256-thread workgroup covers 1024 samples (four per thread), so a 4K
+        // double-rate plane stays under the 65535-group x limit.
         {
             const int64_t total = static_cast<int64_t>(cfg.rows) * cfg.width;
-            const int64_t per_group = 1024; // the kernel's block of the field
+            const int64_t per_group = 256 * 4;
             const int64_t gx = std::clamp<int64_t>(
                 (total + per_group - 1) / per_group, 1, max_grid_x);
             cfg.keep_grid_x = static_cast<uint32_t>(gx);
@@ -1534,20 +1527,14 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
             }
         }
         if (ki == n_keys) {
-            const Nnedi3Spec spec { cfg.width,
-                                    cfg.rows,
-                                    d->peak,
-                                    d->pscrn,
-                                    d->xdim,
-                                    d->ydim,
-                                    d->nns,
-                                    d->qual,
-                                    d->use_list ? 1 : 0,
-                                    d->dh ? 1 : 0,
-                                    static_cast<int32_t>(d->keep_threads) };
+            const Nnedi3Spec spec { cfg.width,    cfg.rows, d->peak,
+                                    d->pscrn,     d->xdim,  d->ydim,
+                                    d->nns,       d->qual,  d->use_list ? 1 : 0,
+                                    d->dh ? 1 : 0 };
             // Each handle lands in d->planes the moment it is created: a later
-            // create for this key can still fail, and the destructor walks only
-            // d->planes, so a handle left in a local staging array would leak.
+            // create for this key (keep is the 256-invocation one) can still
+            // fail, and the destructor walks only d->planes, so a handle left
+            // in a local staging array would leak.
             if (d->process[plane]) {
                 if (d->use_list) {
                     const auto result =
@@ -1606,12 +1593,9 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
                 }
             }
             {
-                // The kept-row writer takes its fitted launch width as spec
-                // constant 10, so the workgroup literal is that same width.
-                const GpuWorkgroup keep_workgroup { .x = d->keep_threads };
-                const auto result =
-                    create_pipeline(*d->gpu, spec, keep_code, keep_size,
-                                    d->pipeline_layout, 0, keep_workgroup);
+                const auto result = create_pipeline(
+                    *d->gpu, spec, keep_code, keep_size, d->pipeline_layout, 0,
+                    GpuWorkgroup { .x = 256 });
                 if (std::holds_alternative<std::string>(result)) {
                     return set_error(std::get<std::string>(result));
                 }

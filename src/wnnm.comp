@@ -65,14 +65,7 @@
 #define TOPCAP KMAXL
 #endif
 
-#if defined(ENTRY_SOLVE)
-// One thread per group at the host's fitted width (spec constant 28: 256 where
-// the device allows it, 128 on the invocation floor); the guard below reads
-// gl_WorkGroupSize.x and the host divides its dispatch by the same number.
-layout(local_size_x_id = 28) in;
-#else
 layout(local_size_x = WG) in;
-#endif
 
 layout(constant_id = 0) const int W = 1920;
 layout(constant_id = 1) const int H = 1080;
@@ -1669,8 +1662,7 @@ void main() {
     // One thread per group. The 8x8 Gram matrix, the eigenvectors and every
     // rotation index live in registers, which is why the sweep is written out
     // over its 28 pairs.
-    const uint sr =
-        gl_WorkGroupID.x * uint(gl_WorkGroupSize.x) + gl_LocalInvocationIndex;
+    const uint sr = gl_WorkGroupID.x * WG + gl_LocalInvocationIndex;
     if (sr >= est_count()) {
         return;
     }

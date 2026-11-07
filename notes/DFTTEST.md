@@ -141,12 +141,6 @@ IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
 - 27 SPIR-V blobs (`col2im` × 3 depths, `pad_r0..3` × 3, `fused_r0..3` × 3):
   pad and fused are per radius because pad's slice count and fused's temporal
   unroll are both compile-time.
-- `pad` and `col2im` launch at the device's tile: 32x8 where 256 invocations are
-  allowed, 16x8 on the Vulkan floor of 128. The shape is specialization
-  constants 3 and 4, so no blobs double, and both kernels read it back as
-  `gl_WorkGroupSize` for their grid strides while `DftCreate` sizes the
-  dispatches from the same value. Neither requests a subgroup size (neither uses
-  a subgroup operation); the fused kernel still does.
 
 ### f16 IO (`IO_F16`, `src/dfttest.comp`)
 
@@ -239,14 +233,6 @@ force-pad / fail-pad probes.
 ## Historical
 
 The pre-R80 design and every round that shaped it, kept for the mechanisms:
-
-- **2026-11-07 — pad/col2im fit a 128-invocation device.** Their 32x8 local size
-  was a shader literal, so a device at the Vulkan minimum could not create
-  DFTTest. The tile is now specialization constants 3 and 4 (32x8 or 16x8),
-  chosen by `vsfeel_fit_workgroup`, and the grid strides, the recorded grids and
-  `dft_grid_error` all read the same shape. The two kernels also stopped asking
-  for wave32; the fused kernel's request is unchanged. Default shapes are
-  bit-identical to before and the A/B is flat (2074 vs 2079 fps, medians of 12).
 
 - **The fused block loop is workgroup-uniform** (correctness-only, no perf
   change). Its trip count followed each tile's own first block, so in every
@@ -397,10 +383,11 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 - **The stripe floor.** 6 dispatches and 6 barriers per plane stand between the
   32 MB-ring ceiling (+29%) and the shipped +18.5%; a column-direction stripe
   would fit 2 stripes at 1080p (72 MB ring) if the reindexing is worth ~2-3%.
-- **The kernels still fixed at 256 invocations.** NLMeans' compose/weight/acc
-  and the EEDI3 family's copy and transpose kernels are the remaining filters
-  that cannot create on the Vulkan-minimum device (a forced 128 reports both
-  numbers at creation). BM3D, NNEDI3, WNNM and this filter's pad/col2im now fit.
+- `pad`/`col2im` are 32x8 (256 invocations, one of the plugin's largest
+  workgroups), which Vulkan 1.4 guarantees: `maxComputeWorkGroupInvocations` is
+  256 for a 1.4 device, the 128 in core Vulkan's limit table included. Neither
+  kernel uses a subgroup operation, so they no longer request wave32. The real
+  1.4 gap is the 16 KiB workgroup-memory floor, and these two use none.
 
 ### Do not retry
 

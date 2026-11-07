@@ -31,11 +31,7 @@
 #define IO_U16 1
 #endif
 
-// The element block per workgroup is the host's choice (vsfeel_fit_workgroup):
-// 256 where the device allows it, 128 on the invocation floor. The copy is one
-// linear range either way, so only the index stride and the host's grid divisor
-// change.
-layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 #if defined(IO_F16)
 layout(std430, binding = 0) readonly buffer SrcBuf { float16_t src[]; };
@@ -58,7 +54,7 @@ void main() {
     // unwritten. See vsfeel_fold_grid.
     const uint i = (uint(gl_WorkGroupID.y) * uint(gl_NumWorkGroups.x) +
                     uint(gl_WorkGroupID.x)) *
-                       uint(gl_WorkGroupSize.x) +
+                       256u +
                    uint(gl_LocalInvocationIndex);
     if (i >= pc.count) {
         return;

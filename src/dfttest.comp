@@ -1612,20 +1612,15 @@ void filter_value(inout float re, inout float im, int binbase, int t) {
                  load_src((t), sy * pc.src_stride[(t)] + sx)); \
 }
 
-// The launch shape is the host's choice (vsfeel_fit_workgroup): 32x8 where the
-// device allows 256 invocations, 16x8 on the 128 floor. Both loops are
-// grid-stride, so they only need the shape they were launched with.
-layout(local_size_x_id = 3, local_size_y_id = 4, local_size_z = 1) in;
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
 void main() {
     const int pw = calc_pad_size(pc.width, pc.block_step);
     const int ph = calc_pad_size(pc.height, pc.block_step);
     const int pad_x = (pw - pc.width) / 2;
     const int pad_y = (ph - pc.height) / 2;
-    const int wg_x = int(gl_WorkGroupSize.x);
-    const int wg_y = int(gl_WorkGroupSize.y);
 
-    for (int y = int(gl_GlobalInvocationID.y); y < ph; y += int(gl_NumWorkGroups.y) * wg_y) {
-        for (int x = int(gl_GlobalInvocationID.x); x < pw; x += int(gl_NumWorkGroups.x) * wg_x) {
+    for (int y = int(gl_GlobalInvocationID.y); y < ph; y += int(gl_NumWorkGroups.y) * 8) {
+        for (int x = int(gl_GlobalInvocationID.x); x < pw; x += int(gl_NumWorkGroups.x) * 32) {
             // one fold per side, so abs() is the whole reflection
             const int sx = pc.width - 1 - abs(pc.width - 1 - abs(x - pad_x));
             const int sy = pc.height - 1 - abs(pc.height - 1 - abs(y - pad_y));
@@ -1776,9 +1771,7 @@ void main() {
 
 #if defined(ENTRY_COL2IM)
 
-// Same fitted shape as pad: two dims of the launch are specialization
-// constants, and the grid-stride steps read them back.
-layout(local_size_x_id = 3, local_size_y_id = 4, local_size_z = 1) in;
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
 void main() {
     const int pw = calc_pad_size(pc.width, pc.block_step);
     const int ph = calc_pad_size(pc.height, pc.block_step);
@@ -1786,12 +1779,10 @@ void main() {
             const int vn = calc_pad_num(pc.height, pc.block_step);
             const int pad_x = (pw - pc.width) / 2;
     const int pad_y = (ph - pc.height) / 2;
-    const int wg_x = int(gl_WorkGroupSize.x);
-    const int wg_y = int(gl_WorkGroupSize.y);
 
     for (int y = pc.y_begin + int(gl_GlobalInvocationID.y); y <= pc.y_end;
-         y += int(gl_NumWorkGroups.y) * wg_y) {
-        for (int x = int(gl_GlobalInvocationID.x); x < pw; x += int(gl_NumWorkGroups.x) * wg_x) {
+         y += int(gl_NumWorkGroups.y) * 8) {
+        for (int x = int(gl_GlobalInvocationID.x); x < pw; x += int(gl_NumWorkGroups.x) * 32) {
             if (y < pad_y || y >= pad_y + pc.height || x < pad_x || x >= pad_x + pc.width) {
                 continue;
             }

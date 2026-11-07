@@ -38,6 +38,14 @@
 #define IO_U16 1
 #endif
 
+// NLM_VRT is the number of output row groups each thread walks, so a
+// workgroup covers NLM_VRT*BY output rows plus 2*NLM_S halo rows. The host
+// picks 6 (48 rows) or 3 (24 rows) from the device's workgroup-memory budget:
+// 16 KiB, the Vulkan 1.4 floor, cannot hold the 48-row tile at s>=5.
+#ifndef NLM_VRT
+#define NLM_VRT 6
+#endif
+
 // the weight ring is f32 regardless of the io depth (see WeightBuf below)
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_buffer_reference : require
@@ -115,7 +123,12 @@ float load_u1(int idx) {
 #elif defined(IO_F16)
     return float(u1[idx]);   // half -> float is exact
 #else
-    return float(int(u1[idx])) / 65535.0f;
+    // One `precise` multiply: without `precise` the batched interior path folds
+    // the scale into the sample difference ((a-b)*k instead of a*k - b*k),
+    // which rounds differently, so a pixel's weight depended on which tile
+    // computed it. One operation, pinned, keeps every path bit-identical.
+    precise float v = float(int(u1[idx])) * (1.0f / 65535.0f);
+    return v;
 #endif
 }
 
@@ -164,10 +177,11 @@ void main() {
 
 #ifdef ENTRY_WEIGHT
 
-// Workgroup tile geometry (matches the reference launch config).
+// Workgroup tile geometry; VRT_RESULT is the one the host selects a module for
+// (see NLM_VRT at the top of the file).
 #define BX        32
 #define BY        8
-#define VRT_RESULT 6
+#define VRT_RESULT NLM_VRT
 // Exact per-instance LDS sizing: NLM_S is a specialization constant, so the
 // pipeline allocates precisely what this instance needs (occupancy). Even
 // strides like the OpenCL reference (gfx11 has no bank-conflict penalty here).

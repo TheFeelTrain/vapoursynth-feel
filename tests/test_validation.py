@@ -356,9 +356,9 @@ def test_failed_creation_does_not_leak_pipelines(filter_name):
 
     EEDI3 under ``VSFEEL_LIMIT_INVOCATIONS=128`` loses two (row, vcheck) before
     pad; NNEDI3 under ``VSFEEL_LIMIT_SHARED_MEMORY=12288`` loses the prescreen
-    ``n4`` predictor of the 48x6 network. Either way the failure comes after
-    the earlier pipelines were created, so an abandoned partial set is exactly
-    the pipelines already built -- which the validation layer names at
+    before the 18 KiB predictor. Either way the failure comes after the earlier
+    pipelines were created, so an abandoned partial set is exactly the
+    pipelines already built -- which the validation layer names at
     ``vkDestroyDevice`` (``VUID-vkDestroyDevice-device-05137``).
     """
     env = {

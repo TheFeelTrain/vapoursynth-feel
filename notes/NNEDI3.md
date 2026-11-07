@@ -121,13 +121,8 @@ use the ratios, not the absolute fps.
   tails); predict indirect off the prescreen count (prescreen keeps `groupsX`
   via `atomicMax` off its `atomicAdd` — no count kernel); direct grid
   `ceil(width*rows/(4*PXP))` for pscrn=0; keep grid linearized over x and y
-  (`ID.y * groups.x * 1024 + ID.x`), one 1K-element block per workgroup, so a
-  4K double-rate plane stays under the 65535-group x limit.
-- The keep writer's launch width is fitted to the device (256 where the limit
-  allows it, 128 on the Vulkan floor) and arrives as specialization constant
-  10; the block stride is `gl_WorkGroupSize.x` and a run stops at its own
-  block's end, so the width need not divide 1024. Prescreen and predict keep
-  their 128.
+  (`ID.y * groups.x * 1024 + ID.x`), with four samples per thread, so a 4K
+  double-rate plane stays under the 65535-group x limit.
 - Pipelines deduplicated per `{width, rows, pscrn, xdim, ydim, nns, qual}`;
   predict module by the shader's own rule (PXP=8 when
   `ceil(nns/32)<=2 && fs<=128`, PXP=4 small-tile `SHSTRIDE=64` when `fs<=64`,
@@ -168,13 +163,6 @@ use the ratios, not the absolute fps.
   `EEDI3`, so `import vsfeel` never needs vsaa.
 
 ## Historical
-
-- **2026-11-07 — the kept-row writer launches at the fitted width.** It was a
-  fixed 256, so a device limited to 128 invocations could not create the filter;
-  the kernel now strides its 1K-element block by the host's width (256 or 128)
-  and stops at the block's end. Pixels are unchanged: the same block, the same
-  element mapping, only the thread count differs (identical at both shapes on
-  the 360p fixture), and the A/B is flat (4650 vs 4648 fps, medians of 12).
 
 - **2026-10-17 — f16 io, predictor GEMV in packed half.** Half was a storage
   width; the packed predictor now runs nnedi3vk's own f16 arithmetic
@@ -226,13 +214,13 @@ figures are void as current-filter numbers (same marker as
   is `4 * 288` vec4, more than a device may report, so `n4m` (`SHSTRIDE=192`,
   12 KiB) now covers every window but the 48x6 network and FS=288 reports
   `18432` against the limit instead of failing inside the driver. Every pipeline
-  is measured against the device the same way (`gpu_create_pipeline`), so a
-  128-invocation device gets "needs a 256x1x1 workgroup (256 invocations)" per
-  kernel rather than a `vkCreateComputePipelines` failure; `tools/shader_limits.py`
-  prints the per-variant numbers those checks are built from, and
-  `VSFEEL_LIMIT_SHARED_MEMORY` / `VSFEEL_LIMIT_INVOCATIONS` /
-  `VSFEEL_LIMIT_VRAM_BUDGET` clamp the reported limits down so the paths are
-  testable on a GPU that fits everything (`tests/test_device_limits.py`).
+  is measured against the device the same way (`gpu_create_pipeline`);
+  `tools/shader_limits.py` prints the per-variant numbers those checks are built
+  from, and `VSFEEL_LIMIT_SHARED_MEMORY` / `VSFEEL_LIMIT_VRAM_BUDGET` clamp the
+  reported limits down so the paths are testable on a GPU that fits everything
+  (`tests/test_device_limits.py`). The invocation floor is not one of them: a
+  Vulkan 1.4 device guarantees 256 per workgroup, so the 256-thread kept-row
+  writer needs no fallback.
 
 ### 2026-09-23 — R80 GPU API port
 
@@ -298,10 +286,10 @@ upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
 
 - **Pipelines are owned from the first create.** Each handle lands in
   `d->planes` the moment it is created; the local `pre/pred/keep` arrays are
-  only the key→handle dedup table. A device that cannot hold the
-  kept-row writer's 256-invocation workgroup (128 forced) failed *after*
-  prescreen and predict were built, and those two lived in the staging arrays
-  the destructor never walked — validation named the leak at `vkDestroyDevice`.
+  only the key→handle dedup table. A device that cannot hold the 48x6
+  predictor's 18 KiB (a forced 12 KiB) failed *after* the prescreen pipeline
+  was built, and that handle lived in a staging array the destructor never
+  walked — validation named the leak at `vkDestroyDevice`.
 - **`dh` plane geometry is validated.** The keep and predict writers cover
   exactly `2*(height >> subSamplingH)` rows, but the core sizes a subsampled
   plane as `(2*height) >> subSamplingH` — one row taller when the input height
