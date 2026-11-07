@@ -38,14 +38,6 @@
 #define IO_U16 1
 #endif
 
-// NLM_VRT is the number of output row groups each thread walks, so a
-// workgroup covers NLM_VRT*BY output rows plus 2*NLM_S halo rows. The host
-// picks 6 (48 rows) or 3 (24 rows) from the device's workgroup-memory budget:
-// 16 KiB, the Vulkan 1.4 floor, cannot hold the 48-row tile at s>=5.
-#ifndef NLM_VRT
-#define NLM_VRT 6
-#endif
-
 // the weight ring is f32 regardless of the io depth (see WeightBuf below)
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_buffer_reference : require
@@ -177,11 +169,11 @@ void main() {
 
 #ifdef ENTRY_WEIGHT
 
-// Workgroup tile geometry; VRT_RESULT is the one the host selects a module for
-// (see NLM_VRT at the top of the file).
+// Workgroup tile geometry: 48 output rows per workgroup, whose tile needs
+// 20,480 B at s=8 — inside the 32 KiB of workgroup memory vsfeel designs for.
 #define BX        32
 #define BY        8
-#define VRT_RESULT NLM_VRT
+#define VRT_RESULT 6
 // Exact per-instance LDS sizing: NLM_S is a specialization constant, so the
 // pipeline allocates precisely what this instance needs (occupancy). Even
 // strides like the OpenCL reference (gfx11 has no bank-conflict penalty here).

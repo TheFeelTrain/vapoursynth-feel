@@ -115,9 +115,9 @@ ACO will not save you.
 
 ## Porting discipline
 
-**Device floors are the 1.4 profile's.** The core refuses anything below Vulkan
-1.4 (256 workgroup invocations, 256x256x64 per dimension, 16 KiB of workgroup
-memory); core Vulkan's 128 figures are not a floor any supported device reports.
+**Design floors: 256 invocations, 32 KiB of workgroup memory.** The core
+refuses anything below Vulkan 1.4; core Vulkan's 128 invocations cannot exist
+there, and no 1.4 part is known to ship the 16 KiB it still permits.
 
 Lessons from porting DFTTest and NLMeans that go beyond the method above:
 

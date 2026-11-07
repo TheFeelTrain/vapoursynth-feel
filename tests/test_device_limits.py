@@ -143,34 +143,6 @@ def test_default_shapes_are_used_when_the_device_allows_them():
         assert res[case["label"]].get("finite") is True, res[case["label"]]
 
 
-def test_nlmeans_fits_a_16kib_device():
-    """A 16 KiB device runs s=8 from the 24-row weight tile, same pixels.
-
-    The weight tile's shared memory is linear in the search radius, so the
-    shipped 48-row shape needs 17-20 KiB at s>=5: more than the 16 KiB a Vulkan
-    1.4 device may report. The fallback is a 24-row tile of the same width, and
-    the tile is internal, so its pixels must equal the 48-row run's.
-
-    The two error cases pin which shape was actually launched: at 12288 neither
-    fits and the message names the 24-row tile's 12800 (not the 48-row tile's
-    20480), while forcing 48 rows on a 16 KiB device fails with that 20480 --
-    so the successful 16 KiB run cannot have used it.
-    """
-    case = {"label": "s8", "filter": "nlmeans", "params": {"s": 8}}
-    default = _run_limits([case])
-    small = _run_limits([case], {"VSFEEL_LIMIT_SHARED_MEMORY": "16384"})
-    too_small = _run_limits([case], {"VSFEEL_LIMIT_SHARED_MEMORY": "12288"})
-    forced_tall = _run_limits(
-        [case], {"VSFEEL_NLMEANS_TILE": "48", "VSFEEL_LIMIT_SHARED_MEMORY": "16384"}
-    )
-
-    assert default["s8"].get("finite") is True, default["s8"]
-    assert small["s8"].get("finite") is True, small["s8"]
-    assert small["s8"]["sha1"] == default["s8"]["sha1"], "tile variant changed pixels"
-    assert "12800" in too_small["s8"].get("error", ""), too_small["s8"]
-    assert "20480" in forced_tall["s8"].get("error", ""), forced_tall["s8"]
-
-
 def test_shared_memory_limit_selects_the_small_predict_tile():
     """A 16 KiB device runs the PXP=4 predictor from its 12 KiB tile.
 

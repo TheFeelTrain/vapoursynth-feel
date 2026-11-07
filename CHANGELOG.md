@@ -25,7 +25,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Bilateral matches vszipcl at the frame edge on GPUs with less workgroup memory
 - Box's variable-format error names the format, and `feel_aa` runs a Box supersampler on the host instead of failing
 - DFTTest rejects negative `sigma` and `sigma2` instead of producing an inverted frame
-- NLMeans no longer fails at creation with `s` above 4 on GPUs with 16 KiB of workgroup memory
 
 ## [v1.3.4] - 2026-11-05
 

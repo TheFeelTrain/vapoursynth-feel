@@ -334,14 +334,6 @@ foreach(io IN LISTS VK_NLM_IO_TYPES)
             "nlmeans_${io}_${entry}|nlmeans.comp|-DIO_${io_define} ${entry_def}")
     endforeach()
 endforeach()
-# The 24-row weight tile: the 48-row one needs 17-20 KiB at s>=5, more than the
-# 16 KiB a Vulkan 1.4 device may report, and only the weight kernel declares a
-# tile, so this is the whole fallback.
-foreach(io IN LISTS VK_NLM_IO_TYPES)
-    string(TOUPPER "${io}" io_define)
-    list(APPEND VK_NLM_VARIANTS
-        "nlmeans_${io}_weight_v3|nlmeans.comp|-DIO_${io_define} -DENTRY_WEIGHT -DNLM_VRT=3")
-endforeach()
 
 # EEDI3: row kernel (one 32-lane WG per interp row, subgroup-register DP
 # with shuffles) + vcheck kernel (single WG serial row walk), per io
