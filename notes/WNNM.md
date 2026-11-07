@@ -111,7 +111,9 @@ The port is f32 end to end; there is no f64 path any more.
   half arm is an exact widening. The finish kernel stores the inverse mapping,
   `clamp(v * 1/gain + neutral + 0.5, 0, 65535)`, or narrows to half.
 - **Estimate phase** (any radius, `group_size <= 8`), three kernels over
-  `NG * (2*radius+1)` slots, so each phase runs at the width its work needs:
+  `NG * (2*radius+1)` slots, so each phase runs at the width its work needs
+  (Gram and the scatter 128, the eigen step one thread per group at the fitted
+  width: 256 where the device allows it, 128 on the invocation floor):
   - `ENTRY_GRAM`: 8 lanes per group, lane l takes column l of every patch row.
     Each lane accumulates the whole 8x8 outer-product sum over its pixels and a
     three-step `subgroupShuffleXor` tree adds the eight partial matrices, so all
@@ -254,6 +256,15 @@ staying a bit-exact copy and the request orders on both.
   faster, which is what pointed at the estimate path in the first place.
 
 ## Historical
+
+- **2026-11-07 — the copy and the eigen step fit a 128-invocation device.** Both
+  requested 256, so a device at the Vulkan minimum could not create a 16-bit
+  instance or the split estimate. The conversion copy's element block and the
+  solve's width are now fitted (`vsfeel_fit_workgroup`, 256 or 128), pushed as
+  spec constants 0 and 28, and every dispatch and grid check divides by the same
+  number. Pixels differ only by the accumulator's atomic order (~2e-8, one code
+  on u16), the floor the suite already uses; the A/B is flat (1276 vs 1280 fps,
+  medians of 12).
 
 - **2026-11-05 - the stride probe is short, after the geometry checks.** A
   65535x65535 GRAY16 clip allocated an 8.6 GB probe frame before the lattice

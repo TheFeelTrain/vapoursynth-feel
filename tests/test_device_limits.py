@@ -3,8 +3,10 @@
 Vulkan only guarantees 128 invocations per compute workgroup, 128 per dimension
 and 16 KiB of workgroup memory, while several kernels here ask for 256
 invocations or 18 KiB. Every pipeline is therefore measured against the device
-before it is created, and a device that cannot host one gets an error naming the
-kernel rather than a failure out of vkCreateComputePipelines.
+before it is created: a filter whose shape can shrink (BM3D's normalization,
+DFTTest's pad/col2im, NNEDI3's kept-row writer, WNNM's copy and eigen step) takes
+the fitted shape, and one whose kernel cannot gets an error naming the kernel
+rather than a failure out of vkCreateComputePipelines.
 
 The allocation targets that *are* tuning (EEDI3's batch, NLMeans' u4a ring) are
 the values measured on the RX 7900 XTX, each capped by the core's VRAM eviction
@@ -26,16 +28,18 @@ import re
 import subprocess
 import sys
 
+import numpy as np
 import pytest
 
 from conftest import COMPARE_PRELUDE, CLIP_PATH, run_compare_subprocess
 
-# Every filter that needs a 256-invocation workgroup, plus one that fits 128.
+# Every filter the limit cases build, including the ones that fit 128.
 _LIMITS_SCRIPT = (
     COMPARE_PRELUDE
     + r"""
 import hashlib
 import json
+import os
 import sys
 
 import vapoursynth as vs
@@ -66,6 +70,11 @@ def build(name, params):
         return core.vsfeel.EEDI3AA(clip, field=2, **params)
     if name == "bm3d":
         return core.vsfeel.BM3D(clip, **params)
+    if name == "bm3d_u16":
+        return core.vsfeel.BM3D(clip16, **params)
+    if name == "bm3d_rgb":
+        rgb = core.std.ShufflePlanes([clip, clip, clip], [0, 0, 0], vs.RGB)
+        return core.vsfeel.BM3D(rgb, **params)
     if name == "dfttest":
         return core.vsfeel.DFTTest(clip, **params)
     if name == "nlmeans":
@@ -86,6 +95,7 @@ def build(name, params):
 
 
 out = {}
+dump = spec.get("dump")
 for case in spec["cases"]:
     label = case["label"]
     try:
@@ -95,6 +105,8 @@ for case in spec["cases"]:
         plane = read_plane(frame, 0, dtype)
         out[label] = {"sha1": hashlib.sha1(plane.tobytes()).hexdigest(),
                       "finite": bool(np.isfinite(plane.astype(np.float64)).all())}
+        if dump:
+            np.save(os.path.join(dump, label + ".npy"), plane)
     except Exception as exc:
         out[label] = {"error": "%s: %s" % (type(exc).__name__, exc)}
 print("REF ok", flush=True)
@@ -102,22 +114,41 @@ print("RESULT " + json.dumps(out), flush=True)
 """
 )
 
-# name -> kwargs; the empty ones just take the filter's defaults.
+# The kernels still fixed at 256 invocations; every message has to name both
+# numbers.
 _256_KERNELS = [
-    "dfttest",
     "nlmeans",
     "eedi3",
     "eedi3h",
     "eedi3aa",
-    "nnedi3",
-    "bm3d",
-    "wnnm_u16",
 ]
 
+# The filters whose launch shape is fitted to the device instead (BM3D,
+# DFTTest, NNEDI3, WNNM): a 128-invocation device gets a smaller tile rather
+# than a creation error. `exact` cases are bit-reproducible and must match the
+# default run's SHA-1; the others aggregate with float atomics, so two runs
+# differ by the accumulation order alone and are compared with the floor their
+# own suites use (1e-5 on float planes, one code on u16).
+_FITTED_SHAPES = ["dfttest", "nnedi3", "bm3d", "bm3d_u16", "bm3d_rgb", "wnnm_u16"]
+_FITTED_EXACT = {"dfttest", "nnedi3"}
+_FITTED_TOL = {
+    "bm3d": 1e-5,
+    "bm3d_u16": 1.0,
+    "bm3d_rgb": 1e-5,
+    "wnnm_u16": 1.0,
+}
 
-def _run_limits(cases, env=None):
-    """Run every case in a fresh process, optionally under a limit override."""
+
+def _run_limits(cases, env=None, dump=None):
+    """Run every case in a fresh process, optionally under a limit override.
+
+    `dump` names a directory the script writes each case's plane into, for the
+    cases that need a numeric comparison rather than a hash.
+    """
     spec = {"source": CLIP_PATH, "cases": cases}
+    if dump is not None:
+        dump.mkdir(parents=True, exist_ok=True)
+        spec["dump"] = str(dump)
     return run_compare_subprocess(_LIMITS_SCRIPT, [json.dumps(spec)], env=env or {})
 
 
@@ -143,10 +174,44 @@ def test_workgroup_limit_is_reported_per_kernel():
 
 def test_default_shapes_are_used_when_the_device_allows_them():
     """The same cases must run normally with no limit forced (anti-vacuity)."""
-    cases = [{"label": name, "filter": name} for name in _256_KERNELS + ["gaussblur"]]
+    cases = [
+        {"label": name, "filter": name} for name in _256_KERNELS + _FITTED_SHAPES + ["gaussblur"]
+    ]
     res = _run_limits(cases)
     for case in cases:
         assert res[case["label"]].get("finite") is True, res[case["label"]]
+
+
+def test_workgroup_limit_shrinks_the_fitted_shapes(tmp_path):
+    """A 128-invocation device runs BM3D, DFTTest, NNEDI3 and WNNM, unchanged.
+
+    Each of these takes its launch shape from `vsfeel_fit_workgroup`, so the
+    limit selects a smaller tile (BM3D's normalization 16x8, DFTTest's pad and
+    col2im 16x8, the linear copies and NNEDI3's kept-row writer 128) instead of
+    failing pipeline creation. The pixels must not depend on that choice:
+    DFTTest and NNEDI3 have no atomics and must stay bit-identical, while BM3D
+    and WNNM accumulate with float atomics whose order is not fixed, so they get
+    the same floor their own suites use. `bm3d_u16` and `bm3d_rgb` are here
+    because they reach the copy and OPP kernels; `wnnm_u16` reaches the
+    conversion copy and the eigen step.
+    """
+    cases = [{"label": name, "filter": name} for name in _FITTED_SHAPES]
+    default = _run_limits(cases, dump=tmp_path / "default")
+    limited = _run_limits(cases, {"VSFEEL_LIMIT_INVOCATIONS": "128"}, dump=tmp_path / "limited")
+
+    for case in cases:
+        label = case["label"]
+        assert default[label].get("finite") is True, default[label]
+        assert limited[label].get("finite") is True, limited[label]
+        if label in _FITTED_EXACT:
+            assert limited[label]["sha1"] == default[label]["sha1"], (
+                f"{label}: the 128-invocation tile changed pixels"
+            )
+            continue
+        a = np.load(tmp_path / "default" / f"{label}.npy").astype(np.float64)
+        b = np.load(tmp_path / "limited" / f"{label}.npy").astype(np.float64)
+        worst = float(np.abs(a - b).max())
+        assert worst <= _FITTED_TOL[label], f"{label}: shape changed output by {worst:.3e}"
 
 
 def test_shared_memory_limit_selects_the_small_predict_tile():

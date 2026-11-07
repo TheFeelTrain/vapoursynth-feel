@@ -121,8 +121,13 @@ use the ratios, not the absolute fps.
   tails); predict indirect off the prescreen count (prescreen keeps `groupsX`
   via `atomicMax` off its `atomicAdd` — no count kernel); direct grid
   `ceil(width*rows/(4*PXP))` for pscrn=0; keep grid linearized over x and y
-  (`ID.y * groups.x * 1024 + ID.x`), with four samples per thread, so a 4K
-  double-rate plane stays under the 65535-group x limit.
+  (`ID.y * groups.x * 1024 + ID.x`), one 1K-element block per workgroup, so a
+  4K double-rate plane stays under the 65535-group x limit.
+- The keep writer's launch width is fitted to the device (256 where the limit
+  allows it, 128 on the Vulkan floor) and arrives as specialization constant
+  10; the block stride is `gl_WorkGroupSize.x` and a run stops at its own
+  block's end, so the width need not divide 1024. Prescreen and predict keep
+  their 128.
 - Pipelines deduplicated per `{width, rows, pscrn, xdim, ydim, nns, qual}`;
   predict module by the shader's own rule (PXP=8 when
   `ceil(nns/32)<=2 && fs<=128`, PXP=4 small-tile `SHSTRIDE=64` when `fs<=64`,
@@ -163,6 +168,13 @@ use the ratios, not the absolute fps.
   `EEDI3`, so `import vsfeel` never needs vsaa.
 
 ## Historical
+
+- **2026-11-07 — the kept-row writer launches at the fitted width.** It was a
+  fixed 256, so a device limited to 128 invocations could not create the filter;
+  the kernel now strides its 1K-element block by the host's width (256 or 128)
+  and stops at the block's end. Pixels are unchanged: the same block, the same
+  element mapping, only the thread count differs (identical at both shapes on
+  the 360p fixture), and the A/B is flat (4650 vs 4648 fps, medians of 12).
 
 - **2026-10-17 — f16 io, predictor GEMV in packed half.** Half was a storage
   width; the packed predictor now runs nnedi3vk's own f16 arithmetic

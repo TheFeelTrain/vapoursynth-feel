@@ -331,34 +331,41 @@ _LEAK_SCRIPT = textwrap.dedent("""\
         if name == "EEDI3":
             core.vsfeel.EEDI3(clip, field=1, mdis=5, nrad=1)
         elif name == "NNEDI3":
-            core.vsfeel.NNEDI3(clip, field=1)
+            core.vsfeel.NNEDI3(clip, field=1, nsize=3, nns=3)
         else:
             raise SystemExit("unknown filter %r" % name)
     except vs.Error:
         pass
     else:
-        raise SystemExit("creation should have failed under the 128 limit")
+        raise SystemExit("creation should have failed under the forced limit")
     print("LEAK OK", flush=True)
 """)
+
+# The knob that makes a *later* kernel fail, after the earlier ones were built:
+# EEDI3's pad is fixed at 256 invocations while its row and vcheck kernels fit
+# 128, and NNEDI3's 48x6 predictor needs 18 KiB after the prescreen.
+_LEAK_LIMITS = {
+    "EEDI3": {"VSFEEL_LIMIT_INVOCATIONS": "128"},
+    "NNEDI3": {"VSFEEL_LIMIT_SHARED_MEMORY": "12288"},
+}
 
 
 @pytest.mark.parametrize("filter_name", ["EEDI3", "NNEDI3"])
 def test_failed_creation_does_not_leak_pipelines(filter_name):
     """A creation that fails partway must destroy the pipelines it already made.
 
-    Under ``VSFEEL_LIMIT_INVOCATIONS=128`` a 256-invocation pipeline fails
-    after the earlier 128-invocation ones were created, so an abandoned
-    partial set is exactly the pipelines already built -- which the validation
-    layer names at ``vkDestroyDevice``
-    (``VUID-vkDestroyDevice-device-05137``). EEDI3 loses two (row, vcheck)
-    before pad; NNEDI3 loses two (prescreen, predict) before the kept-row
-    writer.
+    EEDI3 under ``VSFEEL_LIMIT_INVOCATIONS=128`` loses two (row, vcheck) before
+    pad; NNEDI3 under ``VSFEEL_LIMIT_SHARED_MEMORY=12288`` loses the prescreen
+    ``n4`` predictor of the 48x6 network. Either way the failure comes after
+    the earlier pipelines were created, so an abandoned partial set is exactly
+    the pipelines already built -- which the validation layer names at
+    ``vkDestroyDevice`` (``VUID-vkDestroyDevice-device-05137``).
     """
     env = {
         **os.environ,
         "VK_INSTANCE_LAYERS": _LAYER,
         "VK_LOADER_DEBUG": "layer",
-        "VSFEEL_LIMIT_INVOCATIONS": "128",
+        **_LEAK_LIMITS[filter_name],
         "MANGOHUD": "0",
     }
     proc = subprocess.run(

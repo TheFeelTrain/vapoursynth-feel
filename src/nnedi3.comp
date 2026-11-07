@@ -682,26 +682,30 @@ void main() {
 #elif defined(ENTRY_KEEP)
 
 // Kept-row writer: output rows of parity pc.parity are copies of their source
-// row (identity when dh=0, the field row when dh=1). Four samples per thread,
-// so the 256-thread launch covers a 1K-element block; the host grid uses the
-// same 4x factor.
+// row (identity when dh=0, the field row when dh=1). Each workgroup owns a
+// 1K-element block of the field and strides it by the launch width, which is
+// the host's fitted shape (spec constant 10: 256 where the device allows it,
+// 128 on the invocation floor), so the block is the same work at either width.
 //
-// The grid is linearized across x and y (i = ID.y * groups.x * 1024 + ID.x),
-// which keeps a 4K double-rate plane (16.6M pixels) under the guaranteed
-// 65535 workgroup limit in x.
-layout(local_size_x = 256, local_size_y = 1) in;
+// The grid is linearized across x and y, which keeps a 4K double-rate plane
+// (16.6M pixels) under the guaranteed 65535 workgroup limit in x.
+layout(local_size_x_id = 10, local_size_y = 1) in;
 
 void main() {
-    // Unsigned: the host allows a field up to 2^31-1 pixels, where the
-    // per-group stride (groups.x * 1024) itself no longer fits a positive int.
-    const uint per_group = gl_NumWorkGroups.x * 1024u;
-    const uint base = gl_GlobalInvocationID.y * per_group +
-                      gl_WorkGroupID.x * 1024u + gl_LocalInvocationIndex;
+    // Unsigned: the host allows a field up to 2^31-1 pixels, so the index
+    // arithmetic stays in uint and the block index cannot go negative.
+    const uint block = gl_GlobalInvocationID.y * gl_NumWorkGroups.x +
+                       gl_WorkGroupID.x;
+    const uint block_base = block * 1024u;
     const uint total = uint(ROWS) * uint(WIDTH);
-    for (uint j = 0u; j < 4u; ++j) {
-        const uint i = base + j * 256u;
-        if (i >= total)
-            break;
+    if (block_base >= total) {
+        return;
+    }
+    // The width need not divide 1024 on a device whose limits do not halve
+    // evenly, so the run stops at this block's own end.
+    const uint block_end = min(block_base + 1024u, total);
+    for (uint i = block_base + gl_LocalInvocationIndex; i < block_end;
+         i += gl_WorkGroupSize.x) {
         const int x = int(i % uint(WIDTH));
         const int r = int(i / uint(WIDTH));
         const int y = 2 * r + pc.parity;

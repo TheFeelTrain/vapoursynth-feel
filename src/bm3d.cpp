@@ -375,6 +375,12 @@ struct BM3DData {
     // fixed. `groups_per_wg` is the same number in 8-lane groups.
     uint32_t workgroup {};
     uint32_t groups_per_wg {};
+    // Tile shape of the normalization kernel and the element block of the
+    // linear copy/OPP kernels: fitted to the device, so a 128-invocation one
+    // runs the aggregation at 16x8 and the copies at 128. Both are
+    // specialization constants in the shaders (see vsfeel_fit_workgroup).
+    GpuWorkgroup agg_wg {};
+    uint32_t copy_wg { 256 };
     // Pinned subgroup width (0 keeps the device default), chosen once so the
     // occupancy calculation and every pipeline agree.
     uint32_t subgroup_size {};
@@ -745,58 +751,74 @@ static std::variant<VkPipeline, std::string>
 create_agg_pipeline(const GPUDevice & gpu, const Bm3dPlane & plane,
                     const Bm3dGroup & group, const BM3DData & d,
                     const uint32_t * code, size_t code_size,
-                    VkPipelineLayout layout) {
+                    VkPipelineLayout layout, uint32_t wg_x, uint32_t wg_y) {
 
     struct Spec {
         int32_t height, stride, res_cap, nplanes, ringed;
-    } spec { plane.height, plane.stride, group.res_cap, group.n_planes,
-             d.max_radius > 0 ? 1 : 0 };
-    const std::array<VkSpecializationMapEntry, 5> entries { {
-        { 0, 0, sizeof(int32_t) },
-        { 1, 4, sizeof(int32_t) },
-        { 2, 8, sizeof(int32_t) },
-        { 3, 12, sizeof(int32_t) },
-        { 4, 16, sizeof(int32_t) },
+        // Ids 5 and 6 are the launch shape itself, which the shader reads back
+        // as gl_WorkGroupSize. The tile's shared layout is sized for 16 columns
+        // and the rows the longest box reaches, so any shape up to 16x16 fits.
+        uint32_t wg_x, wg_y;
+    } spec { plane.height,
+             plane.stride,
+             group.res_cap,
+             group.n_planes,
+             d.max_radius > 0 ? 1 : 0,
+             wg_x,
+             wg_y };
+    const std::array<VkSpecializationMapEntry, 7> entries { {
+        { 0, offsetof(Spec, height), sizeof(int32_t) },
+        { 1, offsetof(Spec, stride), sizeof(int32_t) },
+        { 2, offsetof(Spec, res_cap), sizeof(int32_t) },
+        { 3, offsetof(Spec, nplanes), sizeof(int32_t) },
+        { 4, offsetof(Spec, ringed), sizeof(int32_t) },
+        { 5, offsetof(Spec, wg_x), sizeof(uint32_t) },
+        { 6, offsetof(Spec, wg_y), sizeof(uint32_t) },
     } };
-    // Normalize is a 16x16 tile kernel: it needs a shared tile of the block
-    // weights around the output tile for the separable box sum.
+    // Normalize is a tiled kernel: it needs a shared tile of the block weights
+    // around the output tile for the separable box sum.
     constexpr uint32_t kSpan = 16 + 8 - 1;
     constexpr uint32_t kShared = (kSpan * kSpan + kSpan * 16) * 4;
-    return gpu_create_pipeline(
-        gpu, code, code_size, layout, entries.data(), &spec,
-        static_cast<uint32_t>(entries.size()), sizeof(spec), "bm3d_agg", 0,
-        GpuWorkgroup { .x = 16, .y = 16, .shared_bytes = kShared });
+    const GpuWorkgroup kAggWorkgroup { .x = wg_x,
+                                       .y = wg_y,
+                                       .shared_bytes = kShared };
+    return gpu_create_pipeline(gpu, code, code_size, layout, entries.data(),
+                               &spec, static_cast<uint32_t>(entries.size()),
+                               sizeof(spec), "bm3d_agg", 0, kAggWorkgroup);
 }
 
 // The copy-and-widen kernel an integer input needs: one linear range per source
-// plane, 256 threads per workgroup, no LDS. It declares the first two bindings
-// of the estimation kernels' set layout (source plane, ring) and its own block
-// inside their push-constant range, so the same pipeline layout serves it.
+// plane, no LDS. It declares the first two bindings of the estimation kernels'
+// set layout (source plane, ring) and its own block inside their push-constant
+// range, so the same pipeline layout serves it. The element block is the
+// host's fitted shape (spec constant 0): 256 where the device allows it, 128 on
+// the invocation floor.
 static std::variant<VkPipeline, std::string>
 create_copy_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
-                     const uint32_t * code, size_t code_size) {
+                     const uint32_t * code, size_t code_size,
+                     uint32_t threads) {
+    const VkSpecializationMapEntry entry { 0, 0, sizeof(uint32_t) };
     // The name is unique per file on purpose: tools/shader_limits.py keys its
     // workgroup table by variable name, so reusing `workgroup` here would
     // shadow the estimation kernel's and report a false mismatch.
-    const GpuWorkgroup kCopyWorkgroup { .x = 256 };
-    return gpu_create_pipeline(gpu, code, code_size, layout, nullptr, nullptr,
-                               0, 0, "bm3d_copy", 0, kCopyWorkgroup);
+    const GpuWorkgroup kCopyWorkgroup { .x = threads };
+    return gpu_create_pipeline(gpu, code, code_size, layout, &entry, &threads,
+                               1, sizeof(threads), "bm3d_copy", 0,
+                               kCopyWorkgroup);
 }
 
 // The RGB <-> OPP pair (bm3d_opp.comp): four bindings and a linear index, so it
-// shares the estimation kernels' set layout and push-constant block range.
+// shares the estimation kernels' set layout and push-constant block range. It
+// uses the copy kernel's element block, and the same grid.
 static std::variant<VkPipeline, std::string>
 create_opp_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
-                    const uint32_t * code, size_t code_size, bool input) {
-    if (input) {
-        const GpuWorkgroup kOppInWorkgroup { .x = 256 };
-        return gpu_create_pipeline(gpu, code, code_size, layout, nullptr,
-                                   nullptr, 0, 0, "bm3d_opp_in", 0,
-                                   kOppInWorkgroup);
-    }
-    const GpuWorkgroup kOppOutWorkgroup { .x = 256 };
-    return gpu_create_pipeline(gpu, code, code_size, layout, nullptr, nullptr,
-                               0, 0, "bm3d_opp_out", 0, kOppOutWorkgroup);
+                    const uint32_t * code, size_t code_size, bool input,
+                    uint32_t threads) {
+    const VkSpecializationMapEntry entry { 0, 0, sizeof(uint32_t) };
+    const GpuWorkgroup kOppWorkgroup { .x = threads };
+    return gpu_create_pipeline(
+        gpu, code, code_size, layout, &entry, &threads, 1, sizeof(threads),
+        input ? "bm3d_opp_in" : "bm3d_opp_out", 0, kOppWorkgroup);
 }
 
 // ---------------------------------------------------------------------------
@@ -2956,6 +2978,12 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
         return set_error("VSFEEL_BM3D_WORKGROUP must be a multiple of 8.");
     }
     d->groups_per_wg = d->workgroup / 8;
+    // The normalization tile and the copy/OPP element blocks come from the
+    // device: 16x16 and 256 where it allows them, 16x8 and 128 on the
+    // 128-invocation floor. The grid divisors below and in the frame path are
+    // computed from the same two shapes the shaders launch with.
+    d->agg_wg = vsfeel_fit_workgroup(d->gpu->limits, 16, 16);
+    d->copy_wg = vsfeel_fit_workgroup(d->gpu->limits, 256).x;
     if (vsfeel_device_info_enabled()) {
         fprintf(stderr, "[bm3d] aggregation: %s\n",
                 d->cas_atomics ? "CAS loop (atom_add_f fallback)"
@@ -2968,6 +2996,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
                 d->gpu->driver_id);
         fprintf(stderr, "[bm3d] workgroup: %u threads, %u groups\n",
                 d->workgroup, d->groups_per_wg);
+        fprintf(stderr, "[bm3d] shapes: normalize %ux%u, copies %u\n",
+                d->agg_wg.x, d->agg_wg.y, d->copy_wg);
         fprintf(stderr,
                 "[bm3d] color matrix: %s (norms y=%.6f u=%.6f v=%.6f)\n",
                 matrix_name, matrix_norm[0], matrix_norm[1], matrix_norm[2]);
@@ -3214,7 +3244,8 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
         auto & g = d->groups[gi];
         std::string err;
         if (!vsfeel_fold_grid(
-                d->gpu->limits, (static_cast<uint64_t>(g.pe) + 255) / 256,
+                d->gpu->limits,
+                (static_cast<uint64_t>(g.pe) + d->copy_wg - 1) / d->copy_wg,
                 "bm3d's ring copy", g.copy_grid_x, g.copy_grid_y, err)) {
             return set_error(err);
         }
@@ -3482,10 +3513,10 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
         const auto result =
             d->half ? create_copy_pipeline(*d->gpu, d->pipeline_layout,
                                            bm3d_copy_f16_spv,
-                                           bm3d_copy_f16_spv_size)
+                                           bm3d_copy_f16_spv_size, d->copy_wg)
                     : create_copy_pipeline(*d->gpu, d->pipeline_layout,
                                            bm3d_copy_u16_spv,
-                                           bm3d_copy_u16_spv_size);
+                                           bm3d_copy_u16_spv_size, d->copy_wg);
         if (std::holds_alternative<std::string>(result)) {
             return set_error(std::get<std::string>(result));
         }
@@ -3514,24 +3545,26 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
                 out_size = bm3d_opp_out_u16_spv_size;
             }
         }
-        const auto in_pipe = create_opp_pipeline(*d->gpu, d->pipeline_layout,
-                                                 in_code, in_size, true);
+        const auto in_pipe = create_opp_pipeline(
+            *d->gpu, d->pipeline_layout, in_code, in_size, true, d->copy_wg);
         if (std::holds_alternative<std::string>(in_pipe)) {
             return set_error(std::get<std::string>(in_pipe));
         }
         d->opp_in_pipeline = std::get<VkPipeline>(in_pipe);
-        const auto out_pipe = create_opp_pipeline(*d->gpu, d->pipeline_layout,
-                                                  out_code, out_size, false);
+        const auto out_pipe = create_opp_pipeline(
+            *d->gpu, d->pipeline_layout, out_code, out_size, false, d->copy_wg);
         if (std::holds_alternative<std::string>(out_pipe)) {
             return set_error(std::get<std::string>(out_pipe));
         }
         d->opp_out_pipeline = std::get<VkPipeline>(out_pipe);
         d->opp_pe = d->planes[0].pe;
         std::string grid_err;
-        if (!vsfeel_fold_grid(d->gpu->limits,
-                              (static_cast<uint64_t>(d->opp_pe) + 255) / 256,
-                              "bm3d's opponent output", d->opp_grid_x,
-                              d->opp_grid_y, grid_err)) {
+        if (!vsfeel_fold_grid(
+                d->gpu->limits,
+                (static_cast<uint64_t>(d->opp_pe) + d->copy_wg - 1) /
+                    d->copy_wg,
+                "bm3d's opponent output", d->opp_grid_x, d->opp_grid_y,
+                grid_err)) {
             return set_error(grid_err);
         }
     }
@@ -3634,20 +3667,22 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
                 (d->rgb || d->bits != 16)
                     ? create_agg_pipeline(*d->gpu, p, g, *d, bm3d_agg_f32_spv,
                                           bm3d_agg_f32_spv_size,
-                                          d->pipeline_layout)
+                                          d->pipeline_layout, d->agg_wg.x,
+                                          d->agg_wg.y)
                     : (d->half ? create_agg_pipeline(
                                      *d->gpu, p, g, *d, bm3d_agg_f16_spv,
-                                     bm3d_agg_f16_spv_size, d->pipeline_layout)
-                               : create_agg_pipeline(*d->gpu, p, g, *d,
-                                                     bm3d_agg_u16_spv,
-                                                     bm3d_agg_u16_spv_size,
-                                                     d->pipeline_layout));
+                                     bm3d_agg_f16_spv_size, d->pipeline_layout,
+                                     d->agg_wg.x, d->agg_wg.y)
+                               : create_agg_pipeline(
+                                     *d->gpu, p, g, *d, bm3d_agg_u16_spv,
+                                     bm3d_agg_u16_spv_size, d->pipeline_layout,
+                                     d->agg_wg.x, d->agg_wg.y));
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
             p.agg_pipeline = std::get<VkPipeline>(result);
-            p.agg_grid_x = static_cast<uint32_t>((p.stride + 15) / 16);
-            p.agg_grid_y = static_cast<uint32_t>((p.height + 15) / 16);
+            p.agg_grid_x = (p.stride + d->agg_wg.x - 1) / d->agg_wg.x;
+            p.agg_grid_y = (p.height + d->agg_wg.y - 1) / d->agg_wg.y;
         }
     }
 

@@ -941,6 +941,34 @@ struct GpuWorkgroup {
     }
 };
 
+// Fit a kernel's preferred workgroup shape to the device. Each axis is clamped
+// to the device's own dimension limit, then the larger axis halves, ties going
+// to y so a tile keeps its width, until the invocation budget fits. Kernels
+// that take the shape as a specialization constant read it back from
+// gl_WorkGroupSize, so the caller only has to launch the grid this shape
+// implies. Shared memory is not part of the choice: gpu_create_pipeline still
+// reports a tile that does not fit.
+inline GpuWorkgroup vsfeel_fit_workgroup(const VkPhysicalDeviceLimits & limits,
+                                         uint32_t x, uint32_t y = 1) {
+    const auto clamp_axis = [](uint32_t v, uint32_t limit) {
+        return std::max(1u, std::min(v, std::max(limit, 1u)));
+    };
+    GpuWorkgroup wg;
+    wg.x = clamp_axis(x, limits.maxComputeWorkGroupSize[0]);
+    wg.y = clamp_axis(y, limits.maxComputeWorkGroupSize[1]);
+    const uint64_t budget = std::max(limits.maxComputeWorkGroupInvocations, 1u);
+    // The larger axis is always at least 2 while the budget is exceeded, so
+    // every step makes progress and neither axis can reach zero.
+    while (static_cast<uint64_t>(wg.x) * wg.y > budget) {
+        if (wg.x > wg.y) {
+            wg.x /= 2;
+        } else {
+            wg.y /= 2;
+        }
+    }
+    return wg;
+}
+
 // Compute pipeline from an embedded SPIR-V blob plus its specialization
 // constants. maintenance5 is part of the core's baseline, so the module is
 // chained straight into pipeline creation and never exists as an object.

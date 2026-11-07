@@ -99,9 +99,10 @@ struct WnnmSpec {
     int32_t ring;
     int32_t cache;
     int32_t est_base;
+    int32_t solve_wg;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 28> spec_entries { {
+static constexpr std::array<VkSpecializationMapEntry, 29> spec_entries { {
     { 0, offsetof(WnnmSpec, width), sizeof(int32_t) },
     { 1, offsetof(WnnmSpec, height), sizeof(int32_t) },
     { 2, offsetof(WnnmSpec, stride), sizeof(int32_t) },
@@ -130,6 +131,7 @@ static constexpr std::array<VkSpecializationMapEntry, 28> spec_entries { {
     { 25, offsetof(WnnmSpec, ring), sizeof(int32_t) },
     { 26, offsetof(WnnmSpec, cache), sizeof(int32_t) },
     { 27, offsetof(WnnmSpec, est_base), sizeof(int32_t) },
+    { 28, offsetof(WnnmSpec, solve_wg), sizeof(int32_t) },
 } };
 
 struct WnnmPlane {
@@ -241,6 +243,11 @@ struct GPUWNNM {
     uint32_t src_grid_x[3] {}, src_grid_y[3] {};
     std::vector<int> src_tag; // [set][plane][slot] -> frame, or INT_MIN
     VkPipeline copy_pipe {};
+    // Element block of the conversion copy, and the eigen step's launch width:
+    // fitted to the device (256 where it allows it, 128 on the invocation
+    // floor), pushed as spec constants 0 and 28 and used for the grids.
+    uint32_t copy_threads { 256 };
+    uint32_t solve_threads { 256 };
 
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
@@ -1082,7 +1089,8 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                 static_cast<uint32_t>(pln.ng) * uint32_t(pln.folds);
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           pln.solve_pipe);
-            d->gpu->vk->vkCmdDispatch(cmd, (slots + 255) / 256, 1, 1);
+            d->gpu->vk->vkCmdDispatch(
+                cmd, (slots + d->solve_threads - 1) / d->solve_threads, 1, 1);
         }
         gpu_barrier(*d->gpu, cmd);
     }
@@ -1519,6 +1527,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         return set_error(std::get<std::string>(dev_result));
     }
     d->gpu = std::get<std::shared_ptr<GPUDevice>>(dev_result);
+    d->copy_threads = vsfeel_fit_workgroup(d->gpu->limits, 256).x;
+    d->solve_threads = vsfeel_fit_workgroup(d->gpu->limits, 256).x;
 
     const int qmax = d->q <= 8 ? 8 : (d->q <= 16 ? 16 : 32);
     // The split estimate runs any radius; only a group too wide for its
@@ -1649,7 +1659,9 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                     }
                 }
                 if (!d->skip_solve) {
-                    if (auto e = check_grid((slots + 255) / 256, "WNNM solve");
+                    if (auto e = check_grid((slots + d->solve_threads - 1) /
+                                                d->solve_threads,
+                                            "WNNM solve");
                         !e.empty()) {
                         return e;
                     }
@@ -1971,7 +1983,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                 continue;
             }
             std::string err;
-            const uint64_t groups = (uint64_t(pl.npix) + 255) / 256;
+            const uint64_t groups =
+                (uint64_t(pl.npix) + d->copy_threads - 1) / d->copy_threads;
             if (!vsfeel_fold_grid(d->gpu->limits, groups, "WNNM conversion",
                                   d->src_grid_x[p], d->src_grid_y[p], err)) {
                 return set_error(err);
@@ -2017,10 +2030,11 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             d->io == 2 ? wnnm_copy_u16_spv : wnnm_copy_f16_spv;
         const size_t copy_size =
             d->io == 2 ? sizeof(wnnm_copy_u16_spv) : sizeof(wnnm_copy_f16_spv);
-        const GpuWorkgroup wg { .x = 256, .shared_bytes = 0 };
-        auto r = gpu_create_pipeline(*d->gpu, copy_code, copy_size,
-                                     d->pipeline_layout, nullptr, nullptr, 0, 0,
-                                     "wnnm copy", 0, wg);
+        const VkSpecializationMapEntry copy_entry { 0, 0, sizeof(uint32_t) };
+        const GpuWorkgroup wg { .x = d->copy_threads, .shared_bytes = 0 };
+        auto r = gpu_create_pipeline(
+            *d->gpu, copy_code, copy_size, d->pipeline_layout, &copy_entry,
+            &d->copy_threads, 1, sizeof(d->copy_threads), "wnnm copy", 0, wg);
         if (std::holds_alternative<std::string>(r)) {
             return set_error(std::get<std::string>(r));
         }
@@ -2081,6 +2095,9 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         spec.cache = pl.match_ring ? 1 : 0;
         spec.est_base =
             d->est_cache && temporal ? static_cast<int32_t>(pl.est_base) : -1;
+        // The eigen step's launch width: its kernels launch at this shape and
+        // the dispatch divisor follows the same number.
+        spec.solve_wg = static_cast<int32_t>(d->solve_threads);
 
         if (vsfeel_debug_flag_alias("VSFEEL_WNNM_DEBUG", "VSFEEL_WNNM")) {
             fprintf(stderr,
@@ -2110,7 +2127,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             // the scatter are eight-lane per group, the eigen step one thread
             // per group (and needs no workgroup memory at all).
             const GpuWorkgroup lanes { .x = 128, .shared_bytes = 0 };
-            const GpuWorkgroup one { .x = 256, .shared_bytes = 0 };
+            const GpuWorkgroup one { .x = d->solve_threads, .shared_bytes = 0 };
             pl.gram_pipe =
                 add(tag + " gram", wnnm_gram_spv, sizeof(wnnm_gram_spv), lanes);
             if (!pl.gram_pipe) {
