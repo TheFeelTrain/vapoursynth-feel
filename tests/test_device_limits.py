@@ -52,6 +52,8 @@ clip = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                           bits=32, fulls=True, fulld=True)
 clip_large = core.resize.Bicubic(clip, width=1920, height=1080,
                                  format=vs.GRAYS)
+clip_4k = core.resize.Bicubic(clip, width=3840, height=2160,
+                              format=vs.GRAYS)
 clip16 = core.fmtc.bitdepth(core.std.ShufflePlanes(src, 0, vs.GRAY),
                             bits=16, fulls=True, fulld=True)
 
@@ -75,6 +77,8 @@ def build(name, params):
         return core.vsfeel.DFTTest(clip, **params)
     if name == "nlmeans":
         return core.vsfeel.NLMeans(clip, **params)
+    if name == "nlmeans_4k":
+        return core.vsfeel.NLMeans(clip_4k, **params)
     if name == "bilateral":
         kwargs = {"sigma_spatial": 6.0, "sigma_color": 0.1}
         kwargs.update(params)
@@ -367,11 +371,48 @@ def test_nlmeans_round_target_follows_the_cache():
     want = 96.0 if llc == 0.0 or llc >= 96.0 else max(32.0, llc)
     assert target == want, (llc, target)
     assert batch >= 1, batch
+    # The banner names every per-frame buffer and the cache it used.
+    for field in ("u2", "u5", "addr", "tables", "cache"):
+        assert field in trace, trace[-2000:]
     # The knob is the override, and the VRAM cap still applies after it.
     _, forced, _ = _nlmeans_ring(_trace("nlmeans", {"VSFEEL_NLMEANS_RING_TARGET": "48"}))
     assert forced == 48.0, forced
     _, capped, _ = _nlmeans_ring(_trace("nlmeans", {"VSFEEL_LIMIT_VRAM_BUDGET": str(256 << 20)}))
     assert capped == 16.0, capped
+
+
+def test_nlmeans_live_set_is_bounded_at_creation():
+    """One round must fit the per-frame allowance, and a supported case still runs.
+
+    4K f32 `d=2` is the case the check must not reject: its window alone is
+    159 MiB of a 317 MiB live set, far past the 96 MiB cache target, so the
+    comparison is against an eighth of the VRAM allowance. A 64 MiB allowance
+    cannot host even one round of the 360p case and has to say so at creation.
+    """
+    large = {"label": "nlmeans4k", "filter": "nlmeans_4k", "params": {"d": 2}}
+    supported = _run_limits([large])
+    assert supported["nlmeans4k"].get("finite") is True, supported["nlmeans4k"]
+
+    case = {"label": "live", "filter": "nlmeans", "params": {"d": 3}}
+    res = _run_limits([case], {"VSFEEL_LIMIT_VRAM_BUDGET": str(64 << 20)})
+    err = res["live"].get("error", "")
+    assert "one weight+acc round needs" in err and "eighth" in err, res["live"]
+
+
+def test_nlmeans_sweep_tables_are_budgeted():
+    """The m=0..d sweep tables are budgeted, not allocated at any size.
+
+    At `a=64, d=16` they are 215.8 MiB (142.4 wq + 73.4 aq) while one variant is
+    read per frame; the budget is a thirty-second of the VRAM allowance capped
+    at 64 MiB. `a=64` with a small `d` still creates (the suite renders it).
+    """
+    created = _run_limits([{"label": "small", "filter": "nlmeans", "params": {"a": 64}}])
+    assert created["small"].get("finite") is True, created["small"]
+
+    case = {"label": "wide", "filter": "nlmeans", "params": {"a": 64, "d": 16}}
+    res = _run_limits([case], {"VSFEEL_LIMIT_VRAM_BUDGET": str(1 << 30)})
+    err = res["wide"].get("error", "")
+    assert "sweep tables need" in err and "215.8" in err and "32.0 MiB" in err, res["wide"]
 
 
 def test_nlmeans_ring_is_capped_by_the_vram_budget():

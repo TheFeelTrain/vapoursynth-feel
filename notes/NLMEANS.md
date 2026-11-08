@@ -19,7 +19,11 @@ Status: **shipped on the R80 GPU API.** Verified against
   addressing per load and ~10% on the chroma benchmark (see Performance).
 - Sweep tables (`wq`/`aq`, stride-8 rows, rounds of `batch` entries, variants by
   `m=min(d,n)`), the f32 weight ring, `first`-flag init and the finish in the
-  last acc round are unchanged from the pre-R80 implementation.
+  last acc round are unchanged from the pre-R80 implementation. The tables hold
+  every variant at once, so creation budgets them at a thirty-second of the VRAM
+  allowance capped at 64 MiB (`a=64, d=16` would be 215.8 MiB), and one
+  weight+acc round's live set must fit an eighth of the allowance, the per-frame
+  rule.
 - Three io variants — u16, f16, f32 — selected by the input format (half is
   `stFloat` + 16 bits). A half element is a storage width, not a precision: the
   temporal window holds the clip's own 2-byte samples, every weight,
@@ -235,6 +239,19 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
 
 ## Historical
 
+- **2026-11-07 - the live set and the sweep tables are bounded at creation.**
+  Two allocations were unbudgeted. One weight+acc round (ring + accumulators +
+  window) is now checked against an eighth of the VRAM allowance, so a device
+  that cannot host even batch 1 fails at creation with the three components
+  named instead of on every frame; the comparison is the per-frame rule, not the
+  96 MiB cache target, because the supported 4K f32 `d=2` case is a 317 MiB live
+  set whose window alone is 159 MiB. And the `m=0..d` sweep tables grow as
+  `d^2*a^2` (215.8 MiB at `a=64, d=16`, of which one variant is read per frame),
+  so they are rejected when they exceed a thirty-second of the allowance capped
+  at 64 MiB. The VRAM banner now names every buffer it sizes: ring, window, `u2`,
+  `u5`, the address table, the tables (with `wq`/`aq` split) and the cache the
+  round target came from.
+
 - **2026-11-07 - the round target follows the part's cache.** The 96 MiB target
   is the 7900 XTX's Infinity Cache, and the only adjustment was `vram/16`, which
   never bites on a real card: a 32 MiB-cache part still planned a 96 MiB live
@@ -396,8 +413,8 @@ Flags are `VSFEEL_NLMEANS_<FLAG>`.
 - `VSFEEL_NLMEANS_PACK=N` — entries per weight+acc round (default: the largest
   that fits the 96 MiB live-set target; clamped 1..16384, at most the sweep's
   entry count and the device's Z group-count limit).
-- `VSFEEL_NLMEANS_VRAM=1` — creation banner with ring/window/per-frame bytes
-  and the cache the round target was derived from.
+- `VSFEEL_NLMEANS_VRAM=1` — creation banner with ring, window, `u2`, `u5`, the
+  address table, the sweep tables and the cache the round target came from.
 - `VSFEEL_NLMEANS_RING_TARGET=<MiB>` — override the round target (default: the
   tuned 96 MiB capped by the part's cache and floored at 32).
 - `VSFEEL_DEBUG`/`VSFEEL_TRACE` and `RADV_DEBUG=asm|shaderstats` as elsewhere.

@@ -996,6 +996,27 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
             std::min<int64_t>(16384, std::min<int64_t>(z_limit, entries)));
         d->batch = static_cast<uint32_t>(batch);
         d->ring_bytes = batch * ring_bytes_per_entry;
+        // One round is the smallest plan there is, so a device that cannot host
+        // it fails at creation rather than on every frame. The allowance is the
+        // per-frame memory rule (an eighth of the VRAM), not the cache target:
+        // the 4K f32 d=2 window alone is 159 MiB.
+        const int64_t live = d->ring_bytes + acc_bytes + window_bytes;
+        if (const VkDeviceSize allowance = vsfeel_vram_limit(*d->gpu, core);
+            allowance > 0 && live > static_cast<int64_t>(allowance / 8)) {
+            const double mib = 1024.0 * 1024.0;
+            char msg[420];
+            snprintf(msg, sizeof(msg),
+                     "one weight+acc round needs %.1f MiB (ring %.1f + "
+                     "accumulators %.1f + window %.1f), more than an eighth of "
+                     "the %.1f MiB VRAM allowance; lower \"d\", \"a\" or the "
+                     "frame size",
+                     static_cast<double>(live) / mib,
+                     static_cast<double>(d->ring_bytes) / mib,
+                     static_cast<double>(acc_bytes) / mib,
+                     static_cast<double>(window_bytes) / mib,
+                     static_cast<double>(allowance) / mib);
+            return set_error(msg);
+        }
     }
     d->slots = ((dd == 0) ? 1 : 2) * static_cast<int>(d->batch);
 
@@ -1169,6 +1190,37 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         d->pipeline_layout = std::get<VkPipelineLayout>(result);
     }
 
+    // The sweep tables hold one variant per reachable boundary count m, so their
+    // size grows as d^2*a^2 and has nothing to do with the frame or the device:
+    // a=64, d=16 is 216 MiB (142 wq + 73 aq) while only one variant is ever
+    // read. Budget them before the upload.
+    {
+        const VkDeviceSize wq_bytes =
+            static_cast<VkDeviceSize>(d->wq_host.size()) * sizeof(int32_t);
+        const VkDeviceSize aq_bytes =
+            static_cast<VkDeviceSize>(d->aq_host.size()) * sizeof(int32_t);
+        const VkDeviceSize tables = wq_bytes + aq_bytes;
+        VkDeviceSize table_budget = 64 * 1024 * 1024;
+        if (const VkDeviceSize allowance = vsfeel_vram_limit(*d->gpu, core);
+            allowance > 0) {
+            table_budget = std::min(table_budget, allowance / 32);
+        }
+        if (tables > table_budget) {
+            const double mib = 1024.0 * 1024.0;
+            char msg[420];
+            snprintf(msg, sizeof(msg),
+                     "the sweep tables need %.1f MiB (wq %.1f + aq %.1f) at "
+                     "\"a\"=%d, \"d\"=%d, more than their %.1f MiB budget (a "
+                     "thirty-second of the VRAM allowance, capped at 64 MiB); "
+                     "lower \"a\" or \"d\"",
+                     static_cast<double>(tables) / mib,
+                     static_cast<double>(wq_bytes) / mib,
+                     static_cast<double>(aq_bytes) / mib, d->a, d->d,
+                     static_cast<double>(table_budget) / mib);
+            return set_error(msg);
+        }
+    }
+
     // Sweep tables in two small buffers, host visible and coherent so a plain
     // memcpy lands; the device-local preference puts them in VRAM when the
     // device has a ReBAR window, and in system RAM otherwise.
@@ -1284,12 +1336,24 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         const double llc_mib = static_cast<double>(vsfeel_gpu_llc_bytes(
                                    d->gpu->vendor_id, d->gpu->device_id)) /
                                mib;
+        const double u2_mib = static_cast<double>(d->npix) * (d->channels + 1) *
+                              sizeof(float) / mib;
+        const double u5_mib =
+            static_cast<double>(d->npix) * sizeof(float) / mib;
+        const double addr_mib = static_cast<double>(2) * d->channels *
+                                (2 * d->d + 1) * sizeof(VkDeviceAddress) / mib;
+        const double wq_mib =
+            static_cast<double>(d->wq_host.size()) * sizeof(int32_t) / mib;
+        const double aq_mib =
+            static_cast<double>(d->aq_host.size()) * sizeof(int32_t) / mib;
         fprintf(stderr,
                 "[nlmeans] %.1f MiB per in-flight frame (ring %.1f MiB of "
                 "%.1f MiB target, %d slots, batch %u; window %.1f MiB, %dx%d "
-                "tiles; cache %.1f MiB)\n",
+                "tiles; u2 %.1f MiB, u5 %.1f MiB, addr %.1f MiB, tables %.1f "
+                "MiB = wq %.1f + aq %.1f; cache %.1f MiB)\n",
                 per_frame, ring_mib, static_cast<double>(d->ring_target) / mib,
-                d->slots, d->batch, window_mib, d->pstride, d->ph, llc_mib);
+                d->slots, d->batch, window_mib, d->pstride, d->ph, u2_mib,
+                u5_mib, addr_mib, wq_mib + aq_mib, wq_mib, aq_mib, llc_mib);
     }
 
     NLMeansData * data = d.release();
