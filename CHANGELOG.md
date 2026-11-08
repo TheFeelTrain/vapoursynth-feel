@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - WNNM runs its matcher at the GPU's wave width, so wave64 GPUs fill the wave instead of half of it
+- DFTTest sizes its stripe ring from the GPU's cache on known parts, so a card with less cache no longer streams it
 - All filter creation uses less memory
 - EEDI3, EEDI3H, and EEDI3AA use less VRAM for the same output
 - BM3D uses less VRAM before its first seek

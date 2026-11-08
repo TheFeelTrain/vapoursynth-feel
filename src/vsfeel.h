@@ -422,6 +422,10 @@ struct GPUDevice {
     // off this, not the PCI vendor, because one vendor ships several compilers
     // (AMD's RADV/ACO and its proprietary LLPC share a vendorID).
     uint32_t driver_id {};
+    // VkPhysicalDeviceProperties::vendorID/deviceID (PCI IDs), for the tables
+    // that key a device fact by part.
+    uint32_t vendor_id {};
+    uint32_t device_id {};
     uint32_t queue_family {};
     // VkQueueFamilyProperties::timestampValidBits for the core's compute queue
     // family. Zero means a vkCmdWriteTimestamp2 there is invalid usage, so the
@@ -625,6 +629,123 @@ inline VkDeviceSize vsfeel_vram_limit(const GPUDevice & dev, VSCore * core) {
         }
     }
     return limit;
+}
+
+// A part's last-level cache size in bytes, or 0 when the PCI IDs are not in
+// the table. Nothing in Vulkan (up to 1.4) reports a cache size, so sizing a
+// cache-resident working set has to key off the part itself: the entries are
+// the dies whose last level exceeds the 32 MiB a caller can assume, with AMD's
+// Infinity Cache (reported as L3 by amdsmi: 96 MiB on a 7900 XTX, whose L2 is
+// 6 MiB) and Nvidia's/Intel's L2. It is a table of published figures, not a
+// measurement; extend it by adding rows (and keep it to parts with a vendor
+// figure). This is a creation-time lookup, called once per filter instance.
+inline VkDeviceSize vsfeel_gpu_llc_bytes(uint32_t vendor_id,
+                                         uint32_t device_id) {
+    struct Entry {
+        uint32_t vendor;
+        uint32_t device;
+        uint32_t mib;
+    };
+    static constexpr std::array<Entry, 92> kTable { {
+        { 0x1002, 0x73a1, 128 }, // Navi 21
+        { 0x1002, 0x73a2, 128 }, // Navi 21
+        { 0x1002, 0x73a3, 128 }, // Navi 21
+        { 0x1002, 0x73a5, 128 }, // Navi 21
+        { 0x1002, 0x73ab, 128 }, // Navi 21
+        { 0x1002, 0x73ae, 128 }, // Navi 21
+        { 0x1002, 0x73af, 128 }, // Navi 21
+        { 0x1002, 0x73bf, 128 }, // Navi 21
+        { 0x1002, 0x73df, 96 },  // Navi 22
+        { 0x1002, 0x7448, 96 },  // Navi 31
+        { 0x1002, 0x7449, 96 },  // Navi 31
+        { 0x1002, 0x744a, 96 },  // Navi 31
+        { 0x1002, 0x744b, 96 },  // Navi 31
+        { 0x1002, 0x744c, 96 },  // Navi 31
+        { 0x1002, 0x745e, 96 },  // Navi 31
+        { 0x1002, 0x7460, 64 },  // Navi 32
+        { 0x1002, 0x7461, 64 },  // Navi 32
+        { 0x1002, 0x7470, 64 },  // Navi 32
+        { 0x1002, 0x747e, 64 },  // Navi 32
+        { 0x1002, 0x7550, 64 },  // Navi 48
+        { 0x1002, 0x7551, 64 },  // Navi 48
+        { 0x10de, 0x2681, 96 },  // AD102
+        { 0x10de, 0x2684, 96 },  // AD102
+        { 0x10de, 0x2685, 96 },  // AD102
+        { 0x10de, 0x2689, 96 },  // AD102
+        { 0x10de, 0x26af, 96 },  // AD102
+        { 0x10de, 0x26b1, 96 },  // AD102
+        { 0x10de, 0x26b2, 96 },  // AD102
+        { 0x10de, 0x26b3, 96 },  // AD102
+        { 0x10de, 0x26b5, 96 },  // AD102
+        { 0x10de, 0x26b7, 96 },  // AD102
+        { 0x10de, 0x26b8, 96 },  // AD102
+        { 0x10de, 0x26b9, 96 },  // AD102
+        { 0x10de, 0x26ba, 96 },  // AD102
+        { 0x10de, 0x26bb, 96 },  // AD102
+        { 0x10de, 0x26f5, 96 },  // AD102
+        { 0x10de, 0x2702, 64 },  // AD103
+        { 0x10de, 0x2703, 64 },  // AD103
+        { 0x10de, 0x2704, 64 },  // AD103
+        { 0x10de, 0x2705, 64 },  // AD103
+        { 0x10de, 0x2709, 64 },  // AD103
+        { 0x10de, 0x2717, 64 },  // AD103
+        { 0x10de, 0x2730, 64 },  // AD103
+        { 0x10de, 0x2757, 64 },  // AD103
+        { 0x10de, 0x2770, 64 },  // AD103
+        { 0x10de, 0x2782, 48 },  // AD104
+        { 0x10de, 0x2783, 48 },  // AD104
+        { 0x10de, 0x2785, 48 },  // AD104
+        { 0x10de, 0x2786, 48 },  // AD104
+        { 0x10de, 0x2788, 48 },  // AD104
+        { 0x10de, 0x27a0, 48 },  // AD104
+        { 0x10de, 0x27b0, 48 },  // AD104
+        { 0x10de, 0x27b1, 48 },  // AD104
+        { 0x10de, 0x27b2, 48 },  // AD104
+        { 0x10de, 0x27b6, 48 },  // AD104
+        { 0x10de, 0x27b7, 48 },  // AD104
+        { 0x10de, 0x27b8, 48 },  // AD104
+        { 0x10de, 0x27ba, 48 },  // AD104
+        { 0x10de, 0x27bb, 48 },  // AD104
+        { 0x10de, 0x27e0, 48 },  // AD104
+        { 0x10de, 0x27fa, 48 },  // AD104
+        { 0x10de, 0x27fb, 48 },  // AD104
+        { 0x10de, 0x2b85, 96 },  // GB202
+        { 0x10de, 0x2b87, 96 },  // GB202
+        { 0x10de, 0x2b8c, 96 },  // GB202
+        { 0x10de, 0x2bb1, 96 },  // GB202
+        { 0x10de, 0x2bb2, 96 },  // GB202
+        { 0x10de, 0x2bb3, 96 },  // GB202
+        { 0x10de, 0x2bb4, 96 },  // GB202
+        { 0x10de, 0x2bb5, 96 },  // GB202
+        { 0x10de, 0x2bb9, 96 },  // GB202
+        { 0x10de, 0x2bbc, 96 },  // GB202
+        { 0x10de, 0x2c02, 64 },  // GB203
+        { 0x10de, 0x2c05, 64 },  // GB203
+        { 0x10de, 0x2c09, 64 },  // GB203
+        { 0x10de, 0x2c18, 64 },  // GB203
+        { 0x10de, 0x2c19, 64 },  // GB203
+        { 0x10de, 0x2c31, 64 },  // GB203
+        { 0x10de, 0x2c33, 64 },  // GB203
+        { 0x10de, 0x2c34, 64 },  // GB203
+        { 0x10de, 0x2c38, 64 },  // GB203
+        { 0x10de, 0x2c39, 64 },  // GB203
+        { 0x10de, 0x2c3a, 64 },  // GB203
+        { 0x10de, 0x2c58, 64 },  // GB203
+        { 0x10de, 0x2c59, 64 },  // GB203
+        { 0x10de, 0x2c77, 64 },  // GB203
+        { 0x10de, 0x2c79, 64 },  // GB203
+        { 0x10de, 0x2f04, 48 },  // GB205
+        { 0x10de, 0x2f06, 48 },  // GB205
+        { 0x10de, 0x2f18, 48 },  // GB205
+        { 0x10de, 0x2f38, 48 },  // GB205
+        { 0x10de, 0x2f58, 48 },  // GB205
+    } };
+    for (const Entry & e : kTable) {
+        if (e.vendor == vendor_id && e.device == device_id) {
+            return static_cast<VkDeviceSize>(e.mib) << 20;
+        }
+    }
+    return 0;
 }
 
 // Folds a 1D workgroup count into the device's per-dimension limits: a dispatch

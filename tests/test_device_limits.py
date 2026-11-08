@@ -189,6 +189,11 @@ if sys.argv[1] == "eedi3":
     # forced budget smaller than that has to change the batch.
     clip = core.std.BlankClip(width=1920, height=1080, format=vs.GRAYS, length=3)
     core.vsfeel.EEDI3(clip, field=1, mdis=20)
+elif sys.argv[1] == "dfttest":
+    # 1080p: the ring is capped by the frame's block rows at the default budget,
+    # so the plan can only change if the budget does.
+    clip = core.std.BlankClip(width=1920, height=1080, format=vs.GRAYS, length=3)
+    core.vsfeel.DFTTest(clip)
 else:
     clip = core.std.BlankClip(width=640, height=360, format=vs.GRAYS, length=3)
     core.vsfeel.NLMeans(clip, d=3)
@@ -197,7 +202,12 @@ else:
 
 def _trace(which, env=None):
     """stderr of a creation run, with that filter's trace flag turned on."""
-    trace_flag = "VSFEEL_EEDI3_TRACE" if which == "eedi3" else "VSFEEL_NLMEANS_VRAM"
+    if which == "eedi3":
+        trace_flag = "VSFEEL_EEDI3_TRACE"
+    elif which == "dfttest":
+        trace_flag = "VSFEEL_DFTTEST_TRACE"
+    else:
+        trace_flag = "VSFEEL_NLMEANS_VRAM"
     run_env = {**os.environ, "MANGOHUD": "0", trace_flag: "1", **(env or {})}
     proc = subprocess.run(
         [sys.executable, "-c", _BUDGET_SCRIPT, which],
@@ -224,6 +234,85 @@ def _nlmeans_ring(stderr):
     m = re.search(r"ring ([\d.]+) MiB of ([\d.]+) MiB target, \d+ slots, batch (\d+)", stderr)
     assert m, stderr[-2000:]
     return float(m.group(1)), float(m.group(2)), int(m.group(3))
+
+
+def _dft_plan(stderr):
+    """(target MiB, ring block rows, stripes) from the creation plan lines."""
+    b = re.search(
+        r"stripe budget ([\d.]+) MiB \(tuned ([\d.]+), llc ([\d.]+), "
+        r"vram/16 ([\d.]+), max buffer ([\d.]+)",
+        stderr,
+    )
+    p = re.search(
+        r"target ([\d.]+) MiB, ring (\d+) of \d+ block rows "
+        r"\([\d.]+ MiB\), (\d+) stripes",
+        stderr,
+    )
+    assert b and p, stderr[-2000:]
+    return float(p.group(1)), int(p.group(2)), int(p.group(3)), float(b.group(3))
+
+
+def test_dfttest_stripe_budget_is_device_sized():
+    """The stripe ring is sized from the part's cache, bounded by its VRAM.
+
+    Nothing in Vulkan reports a cache size, so the target comes from a table of
+    published last-level cache sizes keyed by PCI IDs, capped at the tuned 64
+    MiB and floored at 32: the measured stripe ladder on the 96 MiB part
+    (64/32/24/16/8 MiB -> 2068/1832/1484/1481/1412 fps at 1080p) says the stripe
+    count dominates below 32, whatever the cache does. An unknown part gets the
+    floor. The plan only partitions the dispatch, so the frame must not move.
+    """
+    target, ring, stripes, llc = _dft_plan(_trace("dfttest"))
+    if llc == 0.0:
+        assert target == 32.0, target
+    elif llc >= 64.0:
+        assert target == 64.0, (llc, target)
+    else:
+        assert target == llc, (llc, target)
+    assert 32.0 <= target <= 64.0, target
+
+    # The knob overrides the table: a 32 MiB budget halves the ring.
+    small_target, small_ring, small_stripes, _ = _dft_plan(
+        _trace("dfttest", {"VSFEEL_DFTTEST_L2_TARGET": str(32 << 20)})
+    )
+    assert small_target == 32.0, small_target
+    assert small_ring * 2 == ring, (ring, small_ring)
+    assert small_stripes > stripes, (stripes, small_stripes)
+
+    # The VRAM allowance bounds it too: a 256 MiB allowance is 16 MiB of ring.
+    vram_target, vram_ring, vram_stripes, _ = _dft_plan(
+        _trace("dfttest", {"VSFEEL_LIMIT_VRAM_BUDGET": str(256 << 20)})
+    )
+    assert vram_target == 16.0, vram_target
+    assert vram_ring < small_ring, (small_ring, vram_ring)
+    assert vram_stripes > small_stripes, (small_stripes, vram_stripes)
+
+    # A 640x360 plane is one ring under any of those, so use an 8 MiB target
+    # there to force a second partition, and compare the frame.
+    case = {"label": "dfttest", "filter": "dfttest"}
+    default = _run_limits([case])
+    small = _run_limits([case], {"VSFEEL_DFTTEST_L2_TARGET": str(8 << 20)})
+    assert default["dfttest"].get("finite") is True, default["dfttest"]
+    assert small["dfttest"].get("finite") is True, small["dfttest"]
+    assert small["dfttest"]["sha1"] == default["dfttest"]["sha1"], (
+        "the stripe budget changed pixels"
+    )
+
+
+def test_dfttest_ring_fits_a_small_storage_range():
+    """A device whose buffer range is below the tuned plan runs a smaller ring.
+
+    The ring is one buffer, so the budget is clamped by maxStorageBufferRange:
+    before that clamp a 32 MiB-range device rejected the whole filter with
+    "reduce the frame size" even though a 5-stripe plan fits.
+    """
+    case = {"label": "dfttest", "filter": "dfttest"}
+    default = _run_limits([case])
+    tight = _run_limits([case], {"VSFEEL_LIMIT_STORAGE_RANGE": str(32 << 20)})
+    assert tight["dfttest"].get("finite") is True, tight["dfttest"]
+    assert tight["dfttest"]["sha1"] == default["dfttest"]["sha1"], (
+        "the range-clamped plan changed pixels"
+    )
 
 
 def test_eedi3_batch_is_capped_by_the_vram_budget():

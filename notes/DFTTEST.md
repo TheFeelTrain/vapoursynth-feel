@@ -83,10 +83,12 @@ IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
   filter's largest single cost (aliasing the buffer to 1 MB: +32%).
 - Block rows are processed in stripes and the handoff stays in a ring of
   `spatial_rows` rows indexed by `block row & (spatial_rows-1)`: the largest
-  power of two whose bytes fit `kSpatialRowBudget` (64 MiB) and at least
-  `lookback+1`. `lookback = ceil((16-block_step)/block_step)`, the integer
-  `(BS-1)/block_step`, is how far back `col2im`'s window reaches into the
-  previous stripe; `stripe_rows = max(1, ring - lookback)`.
+  power of two whose bytes fit the budget and at least `lookback+1`. The
+  budget starts at the tuned 64 MiB, capped by the part's last-level cache
+  (`vsfeel_gpu_llc_bytes`, a PCI-ID table of published sizes), floored at
+  32 MiB, then min'd with a sixteenth of the VRAM allowance and with
+  `maxStorageBufferRange` (the ring is one buffer).
+  `VSFEEL_DFTTEST_L2_TARGET=<bytes>` overrides it, clamped by the range.
 - Per stripe: `fused` writes rows `[row_base, row_end)`, `col2im` emits the
   output rows whose block support is complete (padded `y < row_end*block_step`)
   and the rows left over by the previous stripe are still in the ring, then the
@@ -231,6 +233,26 @@ force-pad / fail-pad probes.
   and pointer-walk strength reduction; col2im already runs ~2x the references.
 
 ## Historical
+
+- **2026-11-07 - the stripe ring's budget is sized from the part's cache.** The
+  64 MiB constant was the 7900 XTX (96 MiB Infinity Cache) decision with no
+  override. Vulkan reports no cache size; `amdsmi` does (this part's L3 is
+  96 MiB, its L2 6 MiB), but a ROCm dependency is not something a Vulkan plugin
+  can take, and the sysfs/DXGI paths expose no such attribute. The budget
+  therefore comes from a table of published last-level cache sizes keyed by PCI
+  IDs (`vsfeel_gpu_llc_bytes`: 92 IDs over 11 dies, AMD's Infinity Cache plus
+  Nvidia's and Intel's L2), capped at the tuned 64 MiB and floored at 32: the
+  measured target ladder on the 96 MiB part is 64/32/24/16/8 MiB ->
+  2068/1832/1484/1481/1412 fps at 1080p, so the stripe count dominates below
+  32 MiB whatever the cache does, and an unknown part (or one at or below the
+  floor) gets 32. Two device bounds follow: a sixteenth of the VRAM allowance
+  (a 256 MiB allowance plans 16 MiB/10 stripes) and `maxStorageBufferRange`,
+  since the ring is one buffer -- the second turns a range below the tuned plan
+  from a creation error into a 5-stripe plan (32 MiB range at 1080p, previously
+  "reduce the frame size"). Output is bit-identical across every target tested
+  (16/32/48/64 MiB and the derived defaults, frames 0/5): the plan only
+  partitions the dispatch. Raising it is the tempting move for a bigger-cache
+  card and the worst one here: 128 MiB on the 96 MiB part is -46%.
 
 The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
@@ -383,6 +405,8 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 - **The stripe floor.** 6 dispatches and 6 barriers per plane stand between the
   32 MB-ring ceiling (+29%) and the shipped +18.5%; a column-direction stripe
   would fit 2 stripes at 1080p (72 MB ring) if the reindexing is worth ~2-3%.
+  The budget now follows the part's cache (see Historical), so a device with a
+  different last level trades stripes for it without a rebuild.
 - `pad`/`col2im` are 32x8 (256 invocations, one of the plugin's largest
   workgroups), which Vulkan 1.4 guarantees: `maxComputeWorkGroupInvocations` is
   256 for a 1.4 device, the 128 in core Vulkan's limit table included. Neither
@@ -407,7 +431,11 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   report timestamp bits.
 - `VSFEEL_DFTTEST_TIMING=1` — per-frame host stage averages
   (`acquire`/`record`/`submit`).
-- `VSFEEL_DFTTEST_TRACE=1` — one line per submitted frame.
+- `VSFEEL_DFTTEST_TRACE=1` — one line per submitted frame, plus the ring/stripe
+  plan of every processed plane at creation.
+- `VSFEEL_DFTTEST_L2_TARGET=<bytes>` — override the stripe ring's byte budget
+  (default: the part's cache size capped at 64 MiB and floored at 32 MiB); the
+  plan line prints the derivation and the ring/stripe count.
 - `VSFEEL_DFTTEST_VRAM=1` — per-in-flight-frame scratch banner.
 - `VSFEEL_DFTTEST_SGSIZE=N`, `VSFEEL_DFTTEST_SGSIZE_INVALID` — force (or
   deliberately break) the requested subgroup size; both bypass the multiple-of-16

@@ -443,16 +443,19 @@ static int dft_lookback(int block_step) {
 // a full-frame block buffer is num_blocks*256*4 bytes (136 MB at 1080p) written
 // and read once per frame, far past the 96 MB Infinity Cache, so it lands in
 // VRAM. Processing the frame in stripes of block rows and keeping the handoff
-// inside a ring of SPATIAL_ROW_BUDGET bytes keeps the write and the read in L2
-// (+18.5% shipped at 1080p, see notes/DFTTEST.md).
+// inside a ring of kSpatialRowBudget bytes keeps the write and the read in L2
+// (+18.5% shipped at 1080p, see notes/DFTTEST.md). The default is the measured
+// 7900 XTX decision; VSFEEL_DFTTEST_L2_TARGET overrides it per device (a
+// smaller L2 wants a smaller ring, which costs stripes).
 constexpr VkDeviceSize kSpatialRowBudget = 64 * 1024 * 1024;
 
-static void dft_plan_spatial(DftPlaneConfig & cfg, int block_step) {
+static void dft_plan_spatial(DftPlaneConfig & cfg, int block_step,
+                             VkDeviceSize target) {
     const int lookback = dft_lookback(block_step);
     const VkDeviceSize bytes_per_row =
         static_cast<VkDeviceSize>(cfg.hn) * 256 * sizeof(float);
     const VkDeviceSize budget_rows =
-        std::max<VkDeviceSize>(1, kSpatialRowBudget / bytes_per_row);
+        std::max<VkDeviceSize>(1, target / bytes_per_row);
     // Largest power of two that fits the budget and the frame; the ring mask
     // must cover the lookback plus at least one stripe row.
     int ring = 1;
@@ -588,6 +591,9 @@ struct DftData {
     bool process[3] { false, false, false };
 
     int radius {}, block_step {}, tw {};
+    // Bytes the stripe ring's block rows may occupy (VSFEEL_DFTTEST_L2_TARGET);
+    // the default is the measured L2-sized budget.
+    VkDeviceSize spatial_target { kSpatialRowBudget };
     bool zmean {};
     float sigma_scalar {}; // scaled by wscale when ftype < 2
     float sigma2 {};
@@ -1477,6 +1483,59 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         }
     }
 
+    {
+        const auto result = get_gpu_device(core, vsapi);
+        if (std::holds_alternative<std::string>(result)) {
+            return set_error(std::get<std::string>(result));
+        }
+        d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
+    }
+
+    // The stripe ring's budget, in bytes, before the per-plane geometry that
+    // sizes the ring from it. Nothing in Vulkan reports a cache size, so the
+    // tuned 64 MiB plan is bounded by the part's published last-level cache
+    // (vsfeel_gpu_llc_bytes), by the VRAM allowance (a sixteenth of it, as
+    // NLMeans sizes its ring) and by one buffer's range, since the ring is a
+    // single buffer. The stripe ladder measured on the 96 MiB part (64/32/24/16/8
+    // MiB -> 2068/1832/1484/1481/1412 fps at 1080p) puts a floor under the first
+    // bound: below 32 MiB the stripe count dominates, whatever the cache does,
+    // so a small cache or an unknown part gets 32 MiB rather than a ring that
+    // fits it.
+    {
+        const VkDeviceSize tuned = kSpatialRowBudget;
+        const VkDeviceSize floor = 32 * 1024 * 1024;
+        const VkDeviceSize llc =
+            vsfeel_gpu_llc_bytes(d->gpu->vendor_id, d->gpu->device_id);
+        const VkDeviceSize vram = vsfeel_vram_limit(*d->gpu, core);
+        const VkDeviceSize range = d->gpu->limits.maxStorageBufferRange;
+        const VkDeviceSize vram_cap = vram > 0 ? vram / 16 : 0;
+        VkDeviceSize target = std::clamp(
+            llc != 0 ? std::min(tuned, llc) : VkDeviceSize(0), floor, tuned);
+        if (vram_cap > 0) {
+            target = std::min(target, vram_cap);
+        }
+        target = std::min(target, range);
+        if (const int forced = env_int("VSFEEL_DFTTEST_L2_TARGET", 0);
+            forced > 0) {
+            target = std::min<VkDeviceSize>(static_cast<VkDeviceSize>(forced),
+                                            range);
+        }
+        d->spatial_target = target;
+        if (dfttest_trace()) {
+            const double mib = 1024.0 * 1024.0;
+            fprintf(
+                stderr,
+                "[dfttest-plan] stripe budget %.1f MiB (tuned %.1f, llc %.1f, "
+                "vram/16 %.1f, max buffer %.1f; VSFEEL_DFTTEST_L2_TARGET "
+                "overrides)\n",
+                static_cast<double>(target) / mib,
+                static_cast<double>(tuned) / mib,
+                static_cast<double>(llc) / mib,
+                static_cast<double>(vram_cap) / mib,
+                static_cast<double>(range) / mib);
+        }
+    }
+
     const int subW = fmt.subSamplingW;
     const int subH = fmt.subSamplingH;
 
@@ -1509,7 +1568,19 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         const VkDeviceSize nblk = cfg.num_blocks;
         cfg.padded_bytes =
             static_cast<VkDeviceSize>(d->tw) * pad_elems * d->elem_bytes;
-        dft_plan_spatial(cfg, d->block_step);
+        dft_plan_spatial(cfg, d->block_step, d->spatial_target);
+        if (dfttest_trace()) {
+            const int stripes =
+                (cfg.vn + cfg.stripe_rows - 1) / cfg.stripe_rows;
+            fprintf(stderr,
+                    "[dfttest-plan] plane %d: target %.1f MiB, ring %d of %d "
+                    "block rows (%.1f MiB), %d stripes of %d rows\n",
+                    plane,
+                    static_cast<double>(d->spatial_target) / (1024 * 1024),
+                    cfg.spatial_rows, cfg.vn,
+                    static_cast<double>(cfg.spatial_bytes) / (1024 * 1024),
+                    stripes, cfg.stripe_rows);
+        }
 
         // Every region below is addressed by an int32 push constant, so bound
         // each per-plane region in the units the shader actually uses.
@@ -1643,13 +1714,6 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         window_freq = rdftTables(d->radius, scaled);
     }
 
-    {
-        const auto result = get_gpu_device(core, vsapi);
-        if (std::holds_alternative<std::string>(result)) {
-            return set_error(std::get<std::string>(result));
-        }
-        d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
-    }
     for (int plane = 0; plane < num_planes; ++plane) {
         if (!d->process[plane]) {
             continue;

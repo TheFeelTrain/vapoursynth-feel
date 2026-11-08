@@ -406,6 +406,10 @@ get_gpu_device(VSCore * core, const VSAPI * vsapi) {
     vk->vkGetPhysicalDeviceProperties2(handles.physicalDevice, &props);
     dev->limits = props.properties.limits;
     dev->api_version = props.properties.apiVersion;
+    // PCI IDs: stable per part, unlike the driver's device-name string, so a
+    // table of device facts keys off these (see vsfeel_gpu_llc_mib).
+    dev->vendor_id = props.properties.vendorID;
+    dev->device_id = props.properties.deviceID;
     dev->driver_id = driver.driverID;
     dev->subgroup_size = subgroup.subgroupSize;
     dev->min_subgroup_size = size_control.minSubgroupSize;
@@ -555,8 +559,8 @@ get_gpu_device(VSCore * core, const VSAPI * vsapi) {
         // cache file a run is actually using.
         fprintf(
             stderr,
-            "[vsfeel] version=%s commit=%s device: %s (Vulkan %u.%u, driver %u.%u.%u)\n",
-            VSFEEL_VERSION, VSFEEL_COMMIT, p.deviceName,
+            "[vsfeel] version=%s commit=%s device: %s [%04x:%04x] (Vulkan %u.%u, driver %u.%u.%u)\n",
+            VSFEEL_VERSION, VSFEEL_COMMIT, p.deviceName, p.vendorID, p.deviceID,
             VK_API_VERSION_MAJOR(dev->api_version),
             VK_API_VERSION_MINOR(dev->api_version),
             VK_API_VERSION_MAJOR(p.driverVersion),
