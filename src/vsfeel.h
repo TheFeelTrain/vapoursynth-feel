@@ -748,6 +748,21 @@ inline VkDeviceSize vsfeel_gpu_llc_bytes(uint32_t vendor_id,
     return 0;
 }
 
+// A cache-resident budget for a working set the filter wants to keep in the
+// last level: the part's known cache size when it is smaller than the tuned
+// value, clamped to `floor`. The floor is the filter's measured limit -- below
+// it the per-round overhead (stripes, rounds) grows faster than the cache
+// saves -- and an unknown part gets it too, so an unknown device gets the
+// conservative plan rather than the tuned card's. Callers cap the result with
+// their own device bounds (VRAM, buffer range) afterwards.
+inline VkDeviceSize vsfeel_llc_budget(const GPUDevice & gpu, VkDeviceSize tuned,
+                                      VkDeviceSize floor) {
+    const VkDeviceSize f = std::min(floor, tuned);
+    const VkDeviceSize llc = vsfeel_gpu_llc_bytes(gpu.vendor_id, gpu.device_id);
+    return std::clamp(llc != 0 ? std::min(tuned, llc) : VkDeviceSize(0), f,
+                      tuned);
+}
+
 // Folds a 1D workgroup count into the device's per-dimension limits: a dispatch
 // may not exceed maxComputeWorkGroupCount[i] (Vulkan guarantees only 65535, and
 // this box reports exactly that in Y while X is 2^32-1), so X is capped and the

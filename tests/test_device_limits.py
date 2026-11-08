@@ -236,6 +236,14 @@ def _nlmeans_ring(stderr):
     return float(m.group(1)), float(m.group(2)), int(m.group(3))
 
 
+def _nlmeans_llc(stderr):
+    """(ring MiB, last-level cache MiB) from the VRAM banner."""
+    ring = re.search(r"ring ([\d.]+) MiB", stderr)
+    llc = re.search(r"cache ([\d.]+) MiB", stderr)
+    assert ring and llc, stderr[-2000:]
+    return float(ring.group(1)), float(llc.group(1))
+
+
 def _dft_plan(stderr):
     """(target MiB, ring block rows, stripes) from the creation plan lines."""
     b = re.search(
@@ -343,6 +351,27 @@ def test_eedi3_batch_is_capped_by_the_vram_budget():
     assert batch2 == 1, (batch2, scratch2, tiny_mib)
     cap2 = min(limit2, tiny_mib) / cap_divisor
     assert batch2 * scratch2 <= max(cap2, scratch2) + 1e-6
+
+
+def test_nlmeans_round_target_follows_the_cache():
+    """NLMeans' per-round live set is sized from the part's cache.
+
+    The tuned 96 MiB is the target card's last-level cache; a part with a
+    smaller one plans a smaller round instead of streaming it, floored at 32 MiB
+    like DFTTest's stripe ring. The knob overrides the tuned value in MiB and the
+    VRAM allowance still caps the result.
+    """
+    trace = _trace("nlmeans")
+    ring, target, batch = _nlmeans_ring(trace)
+    _, llc = _nlmeans_llc(trace)
+    want = 96.0 if llc == 0.0 or llc >= 96.0 else max(32.0, llc)
+    assert target == want, (llc, target)
+    assert batch >= 1, batch
+    # The knob is the override, and the VRAM cap still applies after it.
+    _, forced, _ = _nlmeans_ring(_trace("nlmeans", {"VSFEEL_NLMEANS_RING_TARGET": "48"}))
+    assert forced == 48.0, forced
+    _, capped, _ = _nlmeans_ring(_trace("nlmeans", {"VSFEEL_LIMIT_VRAM_BUDGET": str(256 << 20)}))
+    assert capped == 16.0, capped
 
 
 def test_nlmeans_ring_is_capped_by_the_vram_budget():

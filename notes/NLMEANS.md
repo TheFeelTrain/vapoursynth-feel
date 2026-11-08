@@ -159,6 +159,10 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
   `channels=Y` 249 → 330 fps, `UV` 1042 → 1271 fps. The trade is the extra
   rounds' accumulator traffic, which grows as 1/batch; batch 2/5/6/8 measured
   272/272/263/247 fps against 293 at 3-4 (400-frame screen, `VRT_RESULT=3`).
+  The 96 MiB is the target card's cache exactly, so the target is derived per
+  part now (`vsfeel_llc_budget`: capped by the cache table, floored at 32 MiB),
+  with `VSFEEL_NLMEANS_RING_TARGET` and the VRAM `/16` cap on top; see
+  Historical.
 - **The weight tile is 32x48 (`VRT_RESULT=6`).** A taller tile cuts the separable
   box sum's halo overfetch (40x32 dist cells per 32x24 outputs → 40x56 per
   32x48) and the hsum cells per output (1.33 → 1.17). 400-frame probe ladder:
@@ -230,6 +234,19 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
   above a few percent.
 
 ## Historical
+
+- **2026-11-07 - the round target follows the part's cache.** The 96 MiB target
+  is the 7900 XTX's Infinity Cache, and the only adjustment was `vram/16`, which
+  never bites on a real card: a 32 MiB-cache part still planned a 96 MiB live
+  set and re-read the ring from DRAM, the exact failure round sizing exists to
+  fix. It now goes through `vsfeel_llc_budget` (the PCI-ID cache table in
+  `src/vsfeel.h`, the same one DFTTest's stripe ring uses): the tuned 96 MiB
+  capped by the cache, floored at 32, then `VSFEEL_NLMEANS_RING_TARGET` (MiB)
+  and the VRAM `/16` allowance on top, with the cache printed in the banner. On
+  the target nothing moves (cache 96 MiB -> target 96, batch 3 at 1080p u16
+  `d=2`); a 64 MiB-cache part drops to batch 1-2, which is unmeasured here but
+  is the same "fit the cache rather than stream it" trade DFTTest measured at
+  -46% for a ring over its cache.
 
 - **2026-11-07 - a 24-row tile is measured and rejected.** The shipped 48-row
   tile needs 17,168/18,240/19,344/20,480 B at `s=5..8`, over core Vulkan's
@@ -379,5 +396,8 @@ Flags are `VSFEEL_NLMEANS_<FLAG>`.
 - `VSFEEL_NLMEANS_PACK=N` — entries per weight+acc round (default: the largest
   that fits the 96 MiB live-set target; clamped 1..16384, at most the sweep's
   entry count and the device's Z group-count limit).
-- `VSFEEL_NLMEANS_VRAM=1` — creation banner with ring/window/per-frame bytes.
+- `VSFEEL_NLMEANS_VRAM=1` — creation banner with ring/window/per-frame bytes
+  and the cache the round target was derived from.
+- `VSFEEL_NLMEANS_RING_TARGET=<MiB>` — override the round target (default: the
+  tuned 96 MiB capped by the part's cache and floored at 32).
 - `VSFEEL_DEBUG`/`VSFEEL_TRACE` and `RADV_DEBUG=asm|shaderstats` as elsewhere.

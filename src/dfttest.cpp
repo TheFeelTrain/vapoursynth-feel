@@ -1509,8 +1509,7 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         const VkDeviceSize vram = vsfeel_vram_limit(*d->gpu, core);
         const VkDeviceSize range = d->gpu->limits.maxStorageBufferRange;
         const VkDeviceSize vram_cap = vram > 0 ? vram / 16 : 0;
-        VkDeviceSize target = std::clamp(
-            llc != 0 ? std::min(tuned, llc) : VkDeviceSize(0), floor, tuned);
+        VkDeviceSize target = vsfeel_llc_budget(*d->gpu, tuned, floor);
         if (vram_cap > 0) {
             target = std::min(target, vram_cap);
         }

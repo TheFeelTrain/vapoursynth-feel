@@ -959,7 +959,15 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
                                      d->tile_elems * d->elem_bytes;
         const int64_t ring_bytes_per_entry =
             ring_slots_per_entry * d->npix * NLMeansData::kWeightBytes;
-        int64_t target = d->ring_target;
+        // The tuned 96 MiB is the 7900 XTX's last-level cache; a part with less
+        // cache plans a smaller round instead of streaming it (the floor is the
+        // same conservative 32 MiB DFTTest uses). VSFEEL_NLMEANS_RING_TARGET
+        // overrides the tuned value in MiB.
+        int64_t target = static_cast<int64_t>(vsfeel_llc_budget(
+            *d->gpu, static_cast<VkDeviceSize>(d->ring_target), 32 << 20));
+        if (const int mib = env_int("VSFEEL_NLMEANS_RING_TARGET", 0); mib > 0) {
+            target = static_cast<int64_t>(mib) << 20;
+        }
         if (const VkDeviceSize budget = vsfeel_vram_limit(*d->gpu, core);
             budget > 0) {
             target =
@@ -1273,12 +1281,15 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         const double per_frame = ring_mib + window_mib +
                                  static_cast<double>(d->npix) *
                                      (d->channels + 2) * sizeof(float) / mib;
+        const double llc_mib = static_cast<double>(vsfeel_gpu_llc_bytes(
+                                   d->gpu->vendor_id, d->gpu->device_id)) /
+                               mib;
         fprintf(stderr,
                 "[nlmeans] %.1f MiB per in-flight frame (ring %.1f MiB of "
                 "%.1f MiB target, %d slots, batch %u; window %.1f MiB, %dx%d "
-                "tiles)\n",
+                "tiles; cache %.1f MiB)\n",
                 per_frame, ring_mib, static_cast<double>(d->ring_target) / mib,
-                d->slots, d->batch, window_mib, d->pstride, d->ph);
+                d->slots, d->batch, window_mib, d->pstride, d->ph, llc_mib);
     }
 
     NLMeansData * data = d.release();
