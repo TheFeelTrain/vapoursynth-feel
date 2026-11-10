@@ -237,19 +237,20 @@ create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
     // choice, not a requirement: take the default when 32 is not on offer.
     //
     // LDS: only ENTRY_WEIGHT declares the two tiles,
-    // `dist[VRT_RESULT*BY + 2*NLM_S][BX + 2*NLM_S]` and `hsum[...][BX]`
+    // `dist[VRT_RESULT*BY + 2*NLM_S][DIST_WP]` and `hsum[...][BX]`
     // (nlmeans.comp), sized here for BX=32, BY=8, VRT_RESULT and a search
-    // radius of NLM_S = spec.s.
+    // radius of NLM_S = spec.s. DIST_WP pads the dist row to 16 bytes for the
+    // vec4 box-sum loads.
     const uint32_t rows =
         VRT_RESULT * BLK_Y + 2 * static_cast<uint32_t>(spec.s);
+    const uint32_t dist_w =
+        static_cast<uint32_t>(BLK_X) + 2 * static_cast<uint32_t>(spec.s);
+    const uint32_t dist_wp = (dist_w + 3u) & ~3u;
     const GpuWorkgroup workgroup {
         .x = static_cast<uint32_t>(BLK_X),
         .y = static_cast<uint32_t>(BLK_Y),
         .shared_bytes =
-            weight_pass ? (rows * (BLK_X + 2 * static_cast<uint32_t>(spec.s)) +
-                           rows * BLK_X) *
-                              4u
-                        : 0u
+            weight_pass ? (rows * dist_wp + rows * BLK_X) * 4u : 0u
     };
     const uint32_t subgroup_size =
         gpu.has_subgroup_size(32, workgroup.invocations()) ? 32 : 0;

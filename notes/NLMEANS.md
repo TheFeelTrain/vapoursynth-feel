@@ -171,8 +171,20 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
   box sum's halo overfetch (40x32 dist cells per 32x24 outputs → 40x56 per
   32x48) and the hsum cells per output (1.33 → 1.17). 400-frame probe ladder:
   294 (3) → 314 (5) → 322 (6) → 296 (7) → 299 (8) fps; 7+ loses occupancy.
-  LDS is 16 KiB at `s=4`, still 16 subgroups/SIMD. The box sum itself runs at
-  ~80% of the LDS issue rate at `s=4`, so it is the pipeline floor, not codegen.
+  LDS is 16 KiB at `s=4`, still 16 subgroups/SIMD. The scalar horizontal box
+  sum was at ~80% of the LDS issue rate at `s=4`, i.e. the pipeline floor; the
+  vec4 form below moved it.
+- **The `s>=2` horizontal box sum shares four outputs' taps (+5.6-7.7%).** One
+  thread emits four adjacent `hsum` cells from their 2S+4-tap union: the first
+  vec4 is triangular, the full vec4s feed all four, and the last three taps are
+  partial. Every cell still adds its taps in ascending x, so the output is
+  bit-identical. The middles are straight-line so the spec-constant bounds fold
+  (a looped form lost 4.4% at `s=4`). ACO forms `ds_read_b64` pairs (not the
+  hoped-for b128) and one `ds_store_b128` for the four stores, at VGPR 24 / 16
+  subgroups/SIMD unchanged (shader dump). Same-session ABBA, 5 s runs, 3x
+  medians, 1080p jpbd UV16 d=2 a=2 h=0.2: `s=2` 1369.0 → 1445.2 fps; `s=4`
+  1229.0 → 1316.1; `s=8` 956.6 → 1017.4; luma `s=4` 314.7 → 339.1. `s=0/1`
+  keep the scalar loop.
 - **The f32 weight ring is an accuracy purchase, not a free one.** The fp16
   ring (×4096 to dodge the subnormal cliff) quantises every weight to 2^-11
   relative, which on real content drifts the weighted average by up to 2.1e-3
@@ -360,6 +372,9 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 - **Subgroup-shuffle box sums** to cut LDS phases (complex). On AMD a shuffle
   lowers to `ds_bpermute`, i.e. the same LDS pipe the box sum already saturates,
   so this trades one LDS instruction for another rather than relieving it.
+- **Vectorise the horizontal box sum for `s=0/1`**: their union's head and tail
+  overlap (s=1) or collapse (s=0), so they keep the scalar loop; a dedicated
+  pattern would cover them.
 - **Incremental window cache**: copy only newly-entered layers instead of
   rebuilding the whole window, if a large-`d` workload ever makes the copy
   matter.

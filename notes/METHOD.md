@@ -264,17 +264,17 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   for load ILP at an occupancy cost; forcing registers down often regresses.
   Read `RADV_DEBUG=shaderstats` before assuming more waves would help.
   **LDS is not a way out.** Three attempts to move kernel-live data into shared
-  memory to free registers (a resolved match group, per-lane sorted lists,
-  loop-invariant centres) each *raised* VGPRs
-  216 → 240 and dropped occupancy 7 → 6 waves/SIMD; two of them lost 5–90%.
-  The mechanism is data-dependent addressing — extra address registers and
-  longer live ranges — so spilling to shared only helps when the index is a
-  compile-time constant. Diff VGPR *and* subgroups/SIMD on every kernel edit:
-  one "small" register step is a whole wave here.
-  The same applies to `requiredSubgroupSize`: forcing wave32 halves
-  Subgroups-per-SIMD and only pays off for kernels with subgroup ops or
-  extreme register pressure — otherwise it regresses. Sweep it per filter
-  like any other launch param.
+  memory (a resolved match group, per-lane sorted lists, loop-invariant
+  centres) each *raised* VGPRs 216 → 240 and dropped occupancy 7 → 6
+  waves/SIMD; two lost 5–90%. Staging only helps a constant index: a dynamic
+  one adds address registers and longer live ranges. Diff VGPR and
+  subgroups/SIMD on every edit; one register step is a wave here.
+  `requiredSubgroupSize` is the same lever: forcing wave32 halves
+  Subgroups-per-SIMD; VOPD's f32 packing does not compensate (GFX11 has no
+  INT VOPD). A blanket sweep (1080p, 5 s runs, 12-sample ABBA medians) lost
+  on every filter with a sizable kernel: Box 25.4%, Bilateral 4.5%, EEDI3
+  3.2%, EEDI3AA 1.7%, WNNM 1.6%, GaussBlur 1.5%, BM3D 1.9% (DFTTest and
+  NNEDI3 neutral). Never blanket-flip it.
 - **Reduced-precision storage needs explicit range management** (fp16 hit a
   subnormal cliff; scaling values up on store and down on load fixed it).
   Measure the actual drift against the reference and agree on the accuracy

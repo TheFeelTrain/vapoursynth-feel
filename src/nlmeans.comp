@@ -178,9 +178,11 @@ void main() {
 // pipeline allocates precisely what this instance needs (occupancy). Even
 // strides like the OpenCL reference (gfx11 has no bank-conflict penalty here).
 #define DIST_W (BX + 2*NLM_S)
+// Padded row stride: the vec4 box-sum loads need a 16-byte-aligned row.
+#define DIST_WP ((DIST_W + 3) & ~3)
 #define HSUM_W (BX)
 
-shared float dist[VRT_RESULT*BY + 2*NLM_S][DIST_W];
+shared float dist[VRT_RESULT*BY + 2*NLM_S][DIST_WP];
 shared float hsum[VRT_RESULT*BY + 2*NLM_S][HSUM_W];
 
 float load_guide(int base, int idx) { return load_u1(base + idx); }
@@ -214,6 +216,48 @@ float nlm_pix_dist(int a0, int a1, int a2, int b0, int b1, int b2,
         const float m_red = (ar + br) / 6.0f;
         return (2.0f/3.0f + m_red) * (dr*dr) + (4.0f/3.0f) * (dg*dg) + (1.0f - m_red) * (db*db);
     }
+}
+
+// Add one union tap to the outputs whose window holds it. k >= 4: the head's
+// triangular taps are already added, so only the trailing three are partial.
+void hsum_add(inout float s0, inout float s1, inout float s2, inout float s3,
+              float x, int k, int twoS) {
+    if (k <= twoS) {
+        s0 += x;
+        s1 += x;
+        s2 += x;
+        s3 += x;
+    } else if (k == twoS + 1) {
+        s1 += x;
+        s2 += x;
+        s3 += x;
+    } else if (k == twoS + 2) {
+        s2 += x;
+        s3 += x;
+    } else {
+        s3 += x;
+    }
+}
+
+// Add a full middle vec4 (relative taps 4..) to all four outputs.
+void hsum_all(inout float s0, inout float s1, inout float s2, inout float s3,
+              vec4 v) {
+    s0 += v.x;
+    s0 += v.y;
+    s0 += v.z;
+    s0 += v.w;
+    s1 += v.x;
+    s1 += v.y;
+    s1 += v.z;
+    s1 += v.w;
+    s2 += v.x;
+    s2 += v.y;
+    s2 += v.z;
+    s2 += v.w;
+    s3 += v.x;
+    s3 += v.y;
+    s3 += v.z;
+    s3 += v.w;
 }
 
 void main() {
@@ -316,10 +360,71 @@ void main() {
 #undef DIST_CELL
     barrier();
     // 2) horizontal box-sum: hsum[ry][lx] = sum dist[ry][lx..lx+2S] (ascending x).
-    for (int ry = ly; ry < VRT_RESULT*BY + 2*NLM_S; ry += BY) {
-        float sh = 0.0f;
-        for (int i = 0; i <= 2*NLM_S; ++i) sh += dist[ry][lx + i];
-        hsum[ry][lx] = sh;
+    // For s >= 2 one thread emits four adjacent outputs from their 2S+4-tap
+    // union: the first vec4 is triangular, the full vec4s feed all four and the
+    // tail's last three taps are partial. Every sum still adds its taps in
+    // ascending x, so the result is bit-identical; s=0/1 keep the scalar loop.
+    if (NLM_S >= 2) {
+        const int c = (lx & 7) * 4;
+        const int twoS = 2 * NLM_S;
+        for (int ry = (lx >> 3) + ly * 4; ry < VRT_RESULT*BY + twoS;
+             ry += 32) {
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            vec4 v = vec4(dist[ry][c + 0], dist[ry][c + 1],
+                          dist[ry][c + 2], dist[ry][c + 3]);
+            s0 += v.x;
+            s0 += v.y;
+            s0 += v.z;
+            s0 += v.w;
+            s1 += v.y;
+            s1 += v.z;
+            s1 += v.w;
+            s2 += v.z;
+            s2 += v.w;
+            s3 += v.w;
+            // Straight-line full vec4s: the spec-constant bounds fold, so k is
+            // a constant in each specialized module (s <= 8 needs three).
+            int k = 4;
+            if (7 <= twoS) {
+                v = vec4(dist[ry][c + 4], dist[ry][c + 5],
+                         dist[ry][c + 6], dist[ry][c + 7]);
+                hsum_all(s0, s1, s2, s3, v);
+                k = 8;
+            }
+            if (11 <= twoS) {
+                v = vec4(dist[ry][c + 8], dist[ry][c + 9],
+                         dist[ry][c + 10], dist[ry][c + 11]);
+                hsum_all(s0, s1, s2, s3, v);
+                k = 12;
+            }
+            if (15 <= twoS) {
+                v = vec4(dist[ry][c + 12], dist[ry][c + 13],
+                         dist[ry][c + 14], dist[ry][c + 15]);
+                hsum_all(s0, s1, s2, s3, v);
+                k = 16;
+            }
+            v = vec4(dist[ry][c + k], dist[ry][c + k + 1],
+                     dist[ry][c + k + 2], dist[ry][c + k + 3]);
+            hsum_add(s0, s1, s2, s3, v.x, k + 0, twoS);
+            hsum_add(s0, s1, s2, s3, v.y, k + 1, twoS);
+            hsum_add(s0, s1, s2, s3, v.z, k + 2, twoS);
+            hsum_add(s0, s1, s2, s3, v.w, k + 3, twoS);
+            if (k + 4 <= twoS + 3) {
+                vec2 w = vec2(dist[ry][c + k + 4], dist[ry][c + k + 5]);
+                hsum_add(s0, s1, s2, s3, w.x, k + 4, twoS);
+                hsum_add(s0, s1, s2, s3, w.y, k + 5, twoS);
+            }
+            hsum[ry][c + 0] = s0;
+            hsum[ry][c + 1] = s1;
+            hsum[ry][c + 2] = s2;
+            hsum[ry][c + 3] = s3;
+        }
+    } else {
+        for (int ry = ly; ry < VRT_RESULT*BY + 2*NLM_S; ry += BY) {
+            float sh = 0.0f;
+            for (int i = 0; i <= 2*NLM_S; ++i) sh += dist[ry][lx + i];
+            hsum[ry][lx] = sh;
+        }
     }
     barrier();
     // 3) vertical box-sum + weight transform, VRT_RESULT output rows per thread.
