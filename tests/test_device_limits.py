@@ -193,6 +193,16 @@ if sys.argv[1] == "eedi3":
     # forced budget smaller than that has to change the batch.
     clip = core.std.BlankClip(width=1920, height=1080, format=vs.GRAYS, length=3)
     core.vsfeel.EEDI3(clip, field=1, mdis=20)
+elif sys.argv[1] == "eedi3_4k":
+    # The geometry the batch knees were swept on: 2x2160p, luma only.
+    clip = core.std.BlankClip(width=3840, height=2160, format=vs.GRAY16, length=3)
+    core.vsfeel.EEDI3(clip, field=1, mdis=20)
+elif sys.argv[1] == "eedi3aa":
+    clip = core.std.BlankClip(width=1920, height=1080, format=vs.GRAYS, length=3)
+    core.vsfeel.EEDI3AA(clip, field=3, mdis=20)
+elif sys.argv[1] == "eedi3aa_4k":
+    clip = core.std.BlankClip(width=3840, height=2160, format=vs.GRAY16, length=3)
+    core.vsfeel.EEDI3AA(clip, field=3, mdis=20)
 elif sys.argv[1] == "dfttest":
     # 1080p: the ring is capped by the frame's block rows at the default budget,
     # so the plan can only change if the budget does.
@@ -206,7 +216,7 @@ else:
 
 def _trace(which, env=None):
     """stderr of a creation run, with that filter's trace flag turned on."""
-    if which == "eedi3":
+    if which in ("eedi3", "eedi3_4k", "eedi3aa", "eedi3aa_4k"):
         trace_flag = "VSFEEL_EEDI3_TRACE"
     elif which == "dfttest":
         trace_flag = "VSFEEL_DFTTEST_TRACE"
@@ -224,13 +234,24 @@ def _trace(which, env=None):
     return proc.stderr
 
 
+def _planned_batch(cap, scratch):
+    """The plan from the trace's own numbers: what the cap holds, up to eight."""
+    return max(1, min(8, int(cap // scratch)))
+
+
 def _eedi3_batch(stderr):
-    """(scratch MiB, batch, reported limit MiB) from the trace."""
-    scratch = re.search(r"scratch=([\d.]+) MiB", stderr)
-    batch = re.search(r"batch=(\d+)", stderr)
-    limit = re.search(r"limit=(\d+) MiB", stderr)
-    assert scratch and batch and limit, stderr[-2000:]
-    return float(scratch.group(1)), int(batch.group(1)), float(limit.group(1))
+    """(cap MiB, scratch MiB, batch, cap source) from the batch plan line."""
+    plan = re.search(
+        r"batch cap=([\d.]+) MiB \(([^)]+)\) scratch=([\d.]+) MiB batch=(\d+)",
+        stderr,
+    )
+    assert plan, stderr[-2000:]
+    return (
+        float(plan.group(1)),
+        float(plan.group(3)),
+        int(plan.group(4)),
+        plan.group(2),
+    )
 
 
 def _nlmeans_ring(stderr):
@@ -328,33 +349,76 @@ def test_dfttest_ring_fits_a_small_storage_range():
 
 
 def test_eedi3_batch_is_capped_by_the_vram_budget():
-    """The tuned batch must yield to the budget it was capped by.
+    """The batch is what the VRAM cap holds, never more, and one when nothing fits.
 
-    The old code floored the target back up to 256 MiB *after* capping it at
-    limit/CAP_DIVISOR, so a small allowance was ignored: the batch could plan
-    several times the cap as scratch. Two frames are the minimum a submission
-    needs to overlap, so the batch only drops below two when even those do not
-    fit.
+    The plan used to be a byte target (256 MiB) floored at two frames, which
+    planned two frames at 2160p and six at 1080p f32; both are slower than eight
+    (46% and 6%, measured on this build). A cap that cannot host two frames must
+    still run one frame per submission rather than overshoot.
     """
-    # The divisor the batch planner caps its tuned scratch target with. It is
-    # 12 rather than 16 because EEDI3AA's measured knee (batch 4 at 2x2160p,
-    # 670 MiB of scratch) sits just above limit/16 on a 10 GiB allowance.
-    cap_divisor = 12
-    scratch, batch, limit_mib = _eedi3_batch(_trace("eedi3"))
-    cap = limit_mib / cap_divisor
-    if cap >= 2 * scratch:
-        assert batch >= 2, (batch, scratch, limit_mib)
-    assert batch * scratch <= max(cap, scratch) + 1e-6
+    cap, scratch, batch, source = _eedi3_batch(_trace("eedi3"))
+    assert source == "vram/12", source
+    assert batch == _planned_batch(cap, scratch), (batch, cap, scratch)
+    assert batch == 8, (batch, cap, scratch)
 
-    # A budget whose cap is half a frame cannot host two frames: one frame, not
-    # the five the floor used to pick here.
-    tiny_mib = scratch * 8
-    scratch2, batch2, limit2 = _eedi3_batch(
-        _trace("eedi3", {"VSFEEL_LIMIT_VRAM_BUDGET": str(int(tiny_mib) << 20)})
+    # Half a frame of cap: one frame per submission, not two.
+    tiny = _eedi3_batch(_trace("eedi3", {"VSFEEL_EEDI3_SCRATCH_MB": str(int(scratch * 1.5))}))
+    assert tiny[2] == 1, tiny
+    assert tiny[0] == int(scratch * 1.5), tiny
+
+
+@pytest.mark.parametrize("which", ["eedi3_4k", "eedi3aa_4k"], ids=["eedi3", "eedi3aa"])
+def test_batch_plan_follows_a_ten_gib_allowance(which):
+    """A small allowance plans the frames its cap holds, not the eight clamp.
+
+    The cap is at most a twelfth of the allowance, so a 10 GiB device holds seven
+    2160p EEDI3 frames (107 MiB each) but only five 2160p EEDI3AA ones (162.4
+    MiB): the plan has to follow the scratch, which is what a fixed target could
+    not do. The core's own limit also moves with memory pressure, so the cap is
+    an upper bound rather than an equality.
+    """
+    cap, scratch, batch, source = _eedi3_batch(
+        _trace(which, {"VSFEEL_LIMIT_VRAM_BUDGET": str(10 << 30)})
     )
-    assert batch2 == 1, (batch2, scratch2, tiny_mib)
-    cap2 = min(limit2, tiny_mib) / cap_divisor
-    assert batch2 * scratch2 <= max(cap2, scratch2) + 1e-6
+    assert source == "vram/12", source
+    assert 0 < cap <= 10240 / 12 + 0.1, cap
+    assert batch == _planned_batch(cap, scratch), (batch, cap, scratch)
+    assert batch < 8, (batch, cap, scratch)
+
+
+def test_eedi3aa_batch_scales_with_its_own_scratch():
+    """EEDI3AA plans from its own frame size, not the single-stage one.
+
+    AA's four sub-passes make its 2160p scratch 1.5x the vertical filter's, so at
+    the same geometry and cap it must plan fewer frames. A plan that reused
+    EEDI3's numbers would land on the same count here, which is the regression
+    the old untested AA branch allowed.
+    """
+    e_cap, e_scratch, e_batch, _ = _eedi3_batch(_trace("eedi3_4k"))
+    a_cap, a_scratch, a_batch, _ = _eedi3_batch(_trace("eedi3aa_4k"))
+    assert a_scratch > e_scratch, (a_scratch, e_scratch)
+    assert a_batch == _planned_batch(a_cap, a_scratch), (a_batch, a_cap, a_scratch)
+    assert a_batch < e_batch, (a_batch, e_batch, a_scratch, e_scratch)
+
+
+def test_eedi3_scratch_budget_knob_moves_the_plan():
+    """VSFEEL_EEDI3_SCRATCH_MB overrides the batch's scratch cap.
+
+    The plan's only input is the cap, so the knob is the cap: a 100 MiB budget
+    plans two of the 1080p f32 frames (36.8 MiB each) and 50 MiB plans one, which
+    is how a sweep asks what a smaller device would choose.
+    """
+    cap, scratch, batch, _ = _eedi3_batch(_trace("eedi3"))
+    assert batch == 8, (batch, cap, scratch)
+
+    cap, scratch, batch, source = _eedi3_batch(_trace("eedi3", {"VSFEEL_EEDI3_SCRATCH_MB": "100"}))
+    assert source == "knob", source
+    assert cap == 100.0, cap
+    assert batch == _planned_batch(cap, scratch), (batch, cap, scratch)
+    assert batch == 2, (batch, cap, scratch)
+
+    _, _, lowered, _ = _eedi3_batch(_trace("eedi3", {"VSFEEL_EEDI3_SCRATCH_MB": "50"}))
+    assert lowered == 1, lowered
 
 
 def test_nlmeans_round_target_follows_the_cache():

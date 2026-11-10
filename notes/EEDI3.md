@@ -12,9 +12,8 @@ GPU API**: `clip/sclip/mclip:vnode:gpu` in and `ffGPUOutput` out, one exec pool,
 and no host upload/download/gather/blit machinery at all; the parallel vcheck is
 the default.
 
-Benchmark (`--filter eedi3`, the README's config): 1080p jpbd, mask, benchmark
-args (alpha=0.125, gamma=40, vthresh0/1/2=12/24/4; field=3, mdis=20, vcheck=2),
-5 s medians of 3 (README differs):
+Benchmark (`--filter eedi3`, the README's config; field=3, mdis=20, vcheck=2):
+1080p jpbd, mask, benchmark args, 5 s medians of 3 (README differs):
 
 | depth | vsfeel | eedi3vk2 | ratio |
 |---|---|---|---|
@@ -25,15 +24,11 @@ args (alpha=0.125, gamma=40, vthresh0/1/2=12/24/4; field=3, mdis=20, vcheck=2),
 The hp direction set doubles the kernel's work (TPITCH 41 → 81, K 2 → 3),
 widens the relax to ±2 and grows `pbt` 16 → 81 bytes; it cannot 2-bit pack.
 
-- **The graded vertical EEDI3 is HOST<->DEVICE TRANSFER bound, not kernel
-  bound.** The bill is ~50 MB per output frame (sclip every frame, clip+mclip
-  every other, the download); `GPUUpload → GPUDownload` of one 4K16 plane is
-  2.82 ms, which is the 2x2160p frame time. `VSFEEL_EEDI3_SKIP=...` is the live
-  ablation ladder.
-- **Batch size (`VSFEEL_EEDI3_BATCH`, default from a scratch target — 256 MiB,
-  768 for EEDI3AA).** The knee is where the submit path stops being amortised:
-  with RADV's transfer queue on 2x2160p wants **B=2** (B=1 355 / B=4 453 /
-  B=8 339); neither knee moves with it off.
+- **Batch size (`VSFEEL_EEDI3_BATCH`): as many frames as `vram/12` holds, up
+  to 8.** The 2026-10 byte targets (256 MiB, 768 for EEDI3AA) planned 2 frames
+  at 2160p, which cost 45% there and 5.7% at 1080p f32; those knees are stale
+  on this build. The cap is a third of the core's quarter-limit in-flight
+  budget, so EEDI3AA plans fewer frames from the same cap.
 - **`pbt` is 2-bit packed** when a lane owns exactly two directions (TPITCH
   33..63, i.e. mdis 16..31, which includes the default 20): each lane builds a
   nibble and only even lanes store, combining their odd neighbour's nibble
@@ -117,23 +112,17 @@ dmap.
 `cint = sclip ? scpp[x] : cubic(dst1p,dst1n,dst3p,dst3n)`; u16 cubic
 `(9*(dst1p+dst1n)-(dst3p+dst3n)+8)/16` clamped [0,peak], floats unclamped.
 `tline[x]=cint` directly if `dirc==0`, `max(dirc*dirt,dirc*dirb)<0`, or
-`dirt==dirb==0`. Else, with
-`it=(dst2p[x+dirc]+dstp[x-dirc]+1)/2`, `ib=(dstp[x+dirc]+dst2n[x-dirc]+1)/2`,
-`vt=|dst2p[x+dirc]-dst1p[x+dirc]|+|dstp[x+dirc]-dst1p[x+dirc]|`,
-`vb=|dst2n[x-dirc]-dst1n[x-dirc]|+|dstp[x-dirc]-dst1n[x-dirc]|`,
-`vc=|dstp[x]-dst1p[x]|+|dstp[x]-dst1n[x]|`, `d0=|it-dst1p[x]|`,
-`d1=|ib-dst1n[x]|`, `d2=|vt-vc|`, `d3=|vb-vc|`; mdiff0/1 combine per mode (mode 2
-int `(d+d+1)/2`, else float /2); `a=min(max(mdiff0*rcpVthresh0,
-mdiff1*rcpVthresh1, max((vthresh2-|dirc|)*rcpVthresh2, 0)), 1)`;
-`tline=(1-a)*dstp[x]+a*cint`; u16 stores round half-up into `vout`, floats
-unclamped; the row is then memcpy'd to dst.
+`dirt==dirb==0`. Else the reference's inverse-distance blend: two midpoint taps
+and three gradient sums give `d0..d3`, paired per mode (mode 2 int `(d+d+1)/2`,
+else float /2), then `a=min(max(mdiff0*rcpVthresh0, mdiff1*rcpVthresh1,
+max((vthresh2-|dirc|)*rcpVthresh2, 0)), 1)` and `tline=(1-a)*dstp[x]+a*cint`;
+u16 stores round half-up into `vout`, floats unclamped, then memcpy to dst. The
+tap expressions themselves are `ENTRY_VCHECK` in `src/eedi3.comp`.
 
 **Serial vs parallel.** The contract above is the serial walk
-(`VSFEEL_EEDI3_VPARA=0`): `dst2p` is the **already vchecked** previous interp row,
-so rows are ordered and one pass carries the previous row's tline in shared memory.
-The shipped default (`VPARA=6`) is parallel: each row's `d2p` term is the
-un-vchecked previous row (dst) refined by that many Jacobi steps, so rows have no
-ordering dependence and one workgroup owns each row; 6 is bit-exact on the tests.
+(`VSFEEL_EEDI3_VPARA=0`), where `dst2p` is the already-vchecked previous row. The
+shipped default (`VPARA=6`) refines the un-vchecked row with that many Jacobi
+steps, so rows are independent and one workgroup owns each; 6 is bit-exact.
 
 ### Reference structure (five backends, same GPU, READ-ONLY)
 
@@ -153,9 +142,8 @@ ordering dependence and one workgroup owns each row; 6 is bit-exact on the tests
 ~3·mdis+nrad+8; `pbackt` **deltas**; center-pref tie-break; vszipcl's [0,1] u16 is
 a **third numeric domain** (thousands of LSB vs A).
 
-**Target.** Ground truth = **eedi3m** (user); vk2 shows A + f32 DP ≈ eedi3m.
-vsfeel = family-A semantics, f32 DP: u16 native int scale, int32 SAD costs, f32
-combine. Bar from round 2: **bit-exact vs eedi3vk2**; eedi3m = loose oracle.
+**Target.** Ground truth is `eedi3m`; the bar is bit-exactness against
+`eedi3vk2`, and vsfeel is family A with an f32 DP (u16 native int scale).
 
 Accuracy landscape, jpbd frame 100, 1920x1080, field=1, interp rows only (kept rows
 identical everywhere):
@@ -174,9 +162,8 @@ identical everywhere):
   vsfeel's clips differ: `mclip` must be Gray at the clip's width/height/frame
   count, any Gray depth (8/16/f32/f16 native, 10/12-bit converted via
   `SetFrameProps(_Range=1)` + Point); `sclip` must match the **output** info
-  (doubled frames/axis under field/dh) and is read only when vcheck>0. `cost3`:
-  s1 if `(u>=0&&x>=u2)||(u<=0&&x<W+u2)`; s2 if `(u<=0&&x>=-u2)||(u>=0&&x<W-u2)`;
-  `s1=s2=s0` fallbacks.
+  (doubled frames/axis under field/dh) and is read only when vcheck>0; `cost3`
+  picks the s1/s2 search windows with the s0 fallbacks (`src/eedi3.comp`).
 - `eedi3m` DP/backtrack: `z=(double)ppT[mdis+v] + (double)(gamma*|u-v|)` capped
   `FLT_MAX*0.9` on the f32 store; `fpath[x]=pbackt[tpitch*x+mdis+fpath[x+1]]`
   (column x's pbackt written during column x+1's DP); `copyMask` = per interp line
@@ -682,11 +669,12 @@ passes). All bit-identical to the previous build unless stated.
   out of the recording. Changes the output by design; the GPU-cost ablation ladder.
 - `VSFEEL_EEDI3_VPARA` — vcheck form: 0 = serial row walk (A/B control), 1..6 =
   parallel with that many Jacobi steps. Default 6 (bit-exact on the test surface).
-- `VSFEEL_EEDI3_BATCH` — output frames recorded per submission (default: a
-  ~256 MiB scratch target, 768 for EEDI3AA, capped by the core's VRAM allowance;
-  the auto plan clamps 2..8, which lands on 2 at 2x2160p for EEDI3 and 4 for
-  EEDI3AA, 8 at 1080p; drops to 1 when the allowance cannot hold two frames).
-  The env override accepts 1..8; `=1` is the A/B control.
+- `VSFEEL_EEDI3_BATCH` — output frames recorded per submission (default: what
+  `limit/12` holds, 1..8: 8 at 1080p and at 2160p for EEDI3, 7 for 2160p
+  EEDI3AA, 4 for 2160p YUV420 AA). Accepts 1..8; `=1` is the A/B control.
+- `VSFEEL_EEDI3_SCRATCH_MB` — overrides that cap in MiB, which is how a sweep
+  asks what a smaller device would plan; `VSFEEL_EEDI3_TRACE` prints the cap,
+  its source and the plan.
 - `VSFEEL_EEDI3_TRACE` — one-shot banner: VRAM accounting, per-plane region layout,
   spec constants per geometry.
 - `VSFEEL_EEDI3_TIMING` — per-frame host stage split (acquire/alloc/record/submit).
@@ -698,3 +686,8 @@ passes). All bit-identical to the previous build unless stated.
   the scratch, or one named region, before the passes. Changes output by design.
 - `EEDI3_PROBE` — CMake cache var: ablation level 0–10, 12–19, 22 (11 and 20–21 unused).
 - `EEDI3_MAXW` — CMake cache var: LDS vcheck max width -> `-DMAXW` + `-DEEDI3_MAXW_LDS` (default 4096).
+
+The other tuned numbers are checked, so there is nothing to sweep: `SGSIZE` 32
+and the 256-invocation helpers (pad, blit, vcopy, assemble, hpfill, xpose,
+compose) are enforced at creation, `lsz_vcheck` is derived from the device, and
+`MAXW_LDS`/`BT_TILE`/`RING_CAP`/`MAX_PLANES` are build-time or format bounds.

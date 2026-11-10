@@ -355,6 +355,15 @@ under-reported every stage 10x).
   appends `chroma`), so a build whose BM3D has no `chroma` still received
   `chroma=0` and failed; the native signature decides now. No perf change.
 
+- **2026-11-10 — the batch knee is 8, so the plan follows the cap and AA is
+  11.5% faster.** B=4 (the 2026-10 auto plan) 177.5 vs B=7 197.9 fps at the
+  scoreboard's geometry (2x2160p u16, ABBA, n=12). The byte targets behind that
+  4 were the knee below, which this note already records as taken against the
+  pre-fix harness. The plan is now "as many frames as `vram/12` holds, up to 8",
+  which gives AA 7 at 2x2160p (its frame is 162.4 MiB) and EEDI3 8.
+  `VSFEEL_EEDI3_SCRATCH_MB` is the cap override. The scoreboard's 176 fps was
+  measured with the old plan.
+
 - **2026-10-03 — the batch knee moves to 4 and the row kernel is priced.** Re-swept
   the batch under the harness's own RADV env (the transfer queue is what sets the
   knee): B=3 189 / **B=4 198** / B=5 197 / B=6 175 fps, so the auto rule's target

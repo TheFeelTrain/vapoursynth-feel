@@ -2743,55 +2743,49 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
     }
 
     // Batch size. A submission's frames overlap only inside it (one compute
-    // queue), so a bigger batch overlaps more -- but only up to a knee that
-    // moves with the frame size. Swept on the graded 2x2160p EEDI3 workload
-    // (masked, so most rows take the cheap cubic branch): with the packed pbt
-    // B=2 387, B=4 381, B=6 323, B=8 277 fps, and the same sweep with a 3.7x
-    // smaller scratch (mdis=5) still preferred 4 over 8, so the knee is not
-    // memory -- it is VRAM-independent and the batch simply must not grow with
-    // the frame. At 1080p, where one frame is 4x cheaper, B=8 wins (1273 vs
-    // 892 fps). That is what the byte target below encodes: a 256 MiB scratch
-    // target (768 for EEDI3AA's four sub-passes) lands on 2 at 2x2160p for
-    // EEDI3 and 4 for EEDI3AA, 8 at 1080p, and never below two frames while the
-    // device's budget can host two.
-    // VSFEEL_EEDI3_BATCH overrides.
+    // queue), so a bigger batch overlaps more until the knee. The knee is at
+    // or beyond the clamp of eight on every geometry re-swept on this build,
+    // 1080p and 2160p, both filters, u16 and f32 (B=8 beats B=2..6 by 6% at
+    // 1080p f32, 15% over B=4 at 2160p, 46% over the planned B=2 at 2160p and
+    // 12% for EEDI3AA at 2x2160p), so the plan is "as many frames as the cap
+    // holds". The old byte targets (256 MiB, 768 for EEDI3AA) planned 2-6
+    // frames at those same geometries; they encoded the 2026-10 knee and are
+    // stale, which the notes keep as history.
     {
-        // EEDI3AA's four sub-passes make a frame ~4x heavier, so it drains a
-        // batch slower and its knee is 4 where the single-stage filters' is 2
-        // (swept on the graded workload: EEDI3 2->406/4->389, EEDI3AA 2->142
-        // /4->157 fps at 2x2160p).
-        //
-        // The target above is the measured value, capped by the core's budget.
-        // The floor that used to follow -- max(target, 256 MiB) -- undid that
-        // cap, so a device whose whole allowance was under 4 GiB planned the
-        // tuned 256 MiB of scratch regardless. Two frames are what a submission
-        // needs to overlap at all; when the budget cannot host two, the batch
-        // drops to one instead of the budget giving way.
+        // A twelfth of the VRAM limit: a conservative third of the core's own
+        // in-flight budget, which caps the bytes submitted-but-unfinished work
+        // retains at a quarter of that limit across all pools. The core exposes
+        // neither that cap nor the pool's context ring (two to eight
+        // recordings, sized from its worker count), so the plan keeps a margin
+        // rather than spending the budget.
+        constexpr int64_t kCapDivisor = 12;
+        constexpr int kMaxBatch = 8;
         const VkDeviceSize budget = vsfeel_vram_limit(*d->gpu, core);
-        const VkDeviceSize cap = budget > 0 ? budget / 12 : ~VkDeviceSize(0);
-        // Re-swept with the harness's own environment (RADV transfer queue on,
-        // which is what moves the input uploads off the compute queue): EEDI3
-        // 2x2160p B=1 355 / **B=2 470** / B=3 463 / B=4 453 / B=6 390 / B=8 339
-        // (order-reversed 2000 f). The knee is sharp and the transfer queue is
-        // what puts it at 2, so sweep batches with that env or the answer is
-        // wrong.
-        const VkDeviceSize target =
-            std::min(VkDeviceSize(d->aa ? 768 : 256) << 20, cap);
-        // Swept with the harness's own environment (RADV's transfer queue on,
-        // which is what keeps the input uploads off the compute queue), real
-        // clip, order-reversed, 2x2160p: EEDI3 B=1 355 / **B=2 470** / B=3 463
-        // / B=4 453 / B=6 390 / B=8 339 (2000 f); EEDI3AA **B=4 198** / B=5 197
-        // / B=3 189 / B=6 175 (1000 f). Neither knee moves with the transfer
-        // queue off, so sweep batches in the harness's env or the answer is
-        // wrong. EEDI3's 119.8 MiB scratch then wants a 256 MiB target and
-        // EEDI3AA's 167.4 MiB wants 768.
-        int auto_batch = static_cast<int>(std::clamp<VkDeviceSize>(
-            target / std::max<VkDeviceSize>(d->scratch_bytes, 1), 2, 8));
-        if (VkDeviceSize(auto_batch) * d->scratch_bytes > cap) {
-            auto_batch = 1;
+        VkDeviceSize cap = budget > 0 ? budget / kCapDivisor : ~VkDeviceSize(0);
+        // The sweep knob is the cap, not the result: a workload that wants to
+        // know what a smaller device would plan changes only this.
+        const int scratch_mib = env_int("VSFEEL_EEDI3_SCRATCH_MB", 0);
+        if (scratch_mib > 0) {
+            cap = std::min(cap, VkDeviceSize(scratch_mib) << 20);
         }
+        // One frame always runs: when the cap cannot host two, the batch is one
+        // rather than the budget giving way.
+        const VkDeviceSize per_frame =
+            std::max<VkDeviceSize>(d->scratch_bytes, 1);
+        int auto_batch = static_cast<int>(
+            std::min<VkDeviceSize>(cap / per_frame, VkDeviceSize(kMaxBatch)));
+        auto_batch = std::max(auto_batch, 1);
         d->batch_size =
-            std::clamp(env_int("VSFEEL_EEDI3_BATCH", auto_batch), 1, 8);
+            std::clamp(env_int("VSFEEL_EEDI3_BATCH", auto_batch), 1, kMaxBatch);
+        if (d->trace) {
+            fprintf(stderr,
+                    "[eedi3] batch cap=%.1f MiB (%s) scratch=%.1f MiB "
+                    "batch=%d\n",
+                    static_cast<double>(cap) / (1024.0 * 1024.0),
+                    scratch_mib > 0 ? "knob" : "vram/12",
+                    static_cast<double>(d->scratch_bytes) / (1024.0 * 1024.0),
+                    d->batch_size);
+        }
     }
 
     // Pipelines, one set per distinct geometry.

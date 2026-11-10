@@ -2581,8 +2581,6 @@ def main() -> None:
         sys.exit(f"--gpu-cache-mb must be >= 1, got {ns.gpu_cache_mb}")
     if ns.scale < 1:
         sys.exit(f"--scale must be >= 1, got {ns.scale:g}")
-    # Named once: which VapourSynth the numbers came from is part of the result.
-    print(f"vspipe: {vspipe_binary()}", file=sys.stderr)
     if ns.check_fresh:
         check_fresh(ns.vsfeel_so or _default_plugin_so(), ns.build_so)
     ab = _ab_active(ns)
