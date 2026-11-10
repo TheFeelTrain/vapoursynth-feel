@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - NLMeans is 5-7% faster across search radii
 - EEDI3 and EEDI3AA are up to 45% faster at 2160p, and faster on f32 1080p
+- GaussBlur is up to 6x faster at sigmas between 2 and 10, and about 6% faster at its default
 - WNNM runs its matcher at the GPU's wave width, so wave64 GPUs fill the wave instead of half of it
 - DFTTest's stripe ring and NLMeans' round are sized from the GPU's cache on known parts, so a card with less cache no longer streams them
 - All filter creation uses less memory

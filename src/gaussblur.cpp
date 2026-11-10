@@ -40,8 +40,17 @@ using namespace std::string_literals;
 // in the vertical pass (32x4) and within as few cache lines as possible in the
 // horizontal pass (16x8). The two-pass outputs-per-thread are separate for the
 // same reason. Mechanisms are in notes/GAUSSBLUR.md.
-constexpr int BLK_X = 16;
-constexpr int BLK_Y = 8;
+// The fused block is single-sourced with the shader's -D values. 64x2 is the
+// measured winner and 32x4 is noise: its Phase-1 halo is (BLK_X + 2*RAD)/BLK_X,
+// so at the measured threshold (radius 3) 64 is 1.09x against 16x8's 1.19x.
+#ifndef VSFEEL_GAUSS_BLK_X
+#define VSFEEL_GAUSS_BLK_X 64
+#endif
+#ifndef VSFEEL_GAUSS_BLK_Y
+#define VSFEEL_GAUSS_BLK_Y 2
+#endif
+constexpr int BLK_X = VSFEEL_GAUSS_BLK_X;
+constexpr int BLK_Y = VSFEEL_GAUSS_BLK_Y;
 constexpr int V_BLK_X = 32;
 constexpr int V_BLK_Y = 4;
 constexpr int H_BLK_X = 16;
@@ -52,9 +61,14 @@ constexpr int H_BLK_Y = 8;
 #define VSFEEL_GAUSS_VRT 3
 #endif
 constexpr int VRT = VSFEEL_GAUSS_VRT;
-constexpr int LARGE_R_V = 16;       // vertical outputs per thread
-constexpr int LARGE_R_H = 8;        // horizontal outputs per thread
-constexpr int LARGE_THRESHOLD = 32; // radius <= 32 => fused small path
+constexpr int LARGE_R_V = 16; // vertical outputs per thread
+constexpr int LARGE_R_H = 8;  // horizontal outputs per thread
+// Radius <= this takes the fused small path. Measured, not derived: the same
+// session A/B against the two-pass kernels puts the crossover between radius 3
+// (sigma 1.2: fused 32 051 vs 27 435 fps) and radius 4 (sigma 1.4: fused 26 875
+// vs 30 969), so 4 and up run two-pass. The old 32 was never measured at the
+// switch and put sigma 2-10 on the slower path by up to 65%.
+constexpr int LARGE_THRESHOLD = 3;
 
 // VSFEEL_GAUSS_GPUTRACE=<first frame> (default 100) with
 // VSFEEL_GAUSS_GPUTRACE_RANGE=<count> (default 40): each traced frame's
@@ -737,20 +751,26 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
     const int n_cfg = static_cast<int>(keys.size());
 
     // Code path per config: the fused small path for radius <= LARGE_THRESHOLD.
-    // Its tile is `vblur[VRT*BLK_Y][BLK_X + 2*RAD]`, and the largest one the
-    // small path can ask for is 7 680 B (radius LARGE_THRESHOLD), under the
-    // 16 KiB of workgroup memory Vulkan guarantees, so no device limit can
-    // reject it. The static_assert keeps that claim true: raise LARGE_THRESHOLD
-    // or the block and the build stops instead of silently falling back.
+    // Its tile is `vblur[VRT*BLK_Y][BLK_X + 2*RAD]` = 1 680 B at the measured
+    // threshold, far under the 16 KiB of workgroup memory Vulkan guarantees, so
+    // no device limit can reject it. The static_assert keeps that claim true:
+    // raise LARGE_THRESHOLD or the block and the build stops instead of
+    // silently falling back.
     static_assert(
         VRT * BLK_Y * (BLK_X + 2 * LARGE_THRESHOLD) *
                 static_cast<int>(sizeof(float)) <=
             16384,
         "the fused small path must fit the guaranteed workgroup memory");
+    // The threshold is what decides fused vs two-pass for every radius at or
+    // below it, so a sweep has to be able to move it without patching: the
+    // knob may only lower it or raise it into the range where the fused tile
+    // still fits this device (gpu_create_pipeline is the final check).
+    const int large_threshold =
+        std::clamp(env_int("VSFEEL_GAUSS_THRESHOLD", LARGE_THRESHOLD), 0, 64);
     std::array<bool, 3> cfg_small {};
     for (int ci = 0; ci < n_cfg; ++ci) {
         cfg_small[ci] =
-            static_cast<int>(weights[ci].size()) / 2 <= LARGE_THRESHOLD;
+            static_cast<int>(weights[ci].size()) / 2 <= large_threshold;
     }
 
     // Push descriptor layout: one whole-buffer binding per shader buffer, so

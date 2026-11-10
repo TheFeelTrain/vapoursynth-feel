@@ -648,23 +648,23 @@ def _gauss_lds(sigma, env=None):
 
 
 def test_gaussblur_small_path_fits_the_guaranteed_workgroup_memory():
-    """The fused path's largest tile is 7 680 B, under the 16 KiB floor.
+    """The fused path's largest tile is 1 728 B, far under the 16 KiB floor.
 
-    That is why the 48 KiB cap that used to sit beside the device check could
-    never bind: the small path's tile is `VRT*BLK_Y*(BLK_X + 2*RAD)` floats and
-    `RAD` is capped by LARGE_THRESHOLD well below it. Pinned so a change to
-    either constant fails loudly (`gaussblur.cpp`'s static_assert catches it at
-    build time as well), and so the device's own limit stays the check that
-    decides which path a config takes.
+    The tile is `VRT*BLK_Y*(BLK_X + 2*RAD)` floats and `RAD` is capped by
+    LARGE_THRESHOLD, so the bound follows the measured threshold: at radius 3
+    with the shipped 64x2 block the largest is 3*2*(64+6)*4 = 1 680 B. Pinned so
+    a change to either constant fails loudly (`gaussblur.cpp`'s static_assert
+    catches it at build time as well), and so the LDS number stays a way to tell
+    which path a config took.
     """
     floor = {"VSFEEL_LIMIT_SHARED_MEMORY": "16384"}  # the Vulkan minimum
-    lds = [v for sigma in (2.0, 5.0, 8.0, 11.0) for v in _gauss_lds(sigma, floor)]
-    assert 7680 in lds, lds  # the largest tile the small path asks for
+    lds = [v for sigma in (0.5, 1.0, 1.2) for v in _gauss_lds(sigma, floor)]
+    assert 1680 in lds, lds  # radius 3, the largest the small path asks for
     assert max(lds) <= 16384, lds  # and it fits the floor
-    # The two-pass path creates two pipelines (vert + horiz) and uses no
-    # shared memory at all, so the numbers say which path a config took.
-    large = _gauss_lds(20.0, floor)
-    assert large == [0, 0], large
+    # Sigma 1.4 is radius 4, already two-pass: it creates two pipelines
+    # (vert + horiz) and uses no shared memory, so the numbers say which path a
+    # config took.
+    assert _gauss_lds(1.4, floor) == [0, 0]
 
 
 # ---------------------------------------------------------------------------

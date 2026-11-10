@@ -54,6 +54,14 @@ from conftest import (
 
 pytestmark = pytest.mark.usefixtures("clip_grays")
 
+# Where the code paths split. The fused path serves radius <= LARGE_THRESHOLD,
+# and the threshold is the measured crossover (radius 4, ~sigma 1.33), not the
+# old unmeasured 32: every list below is the fused side, the two sides of the
+# switch, or the two-pass side.
+FUSED_SIGMAS = [0.5, 1.0, 1.2]  # radius 2..4
+PATH_BOUNDARY_SIGMAS = [1.2, 1.4]  # radius 4 (fused) vs 5 (two-pass)
+TWO_PASS_SIGMAS = [2.0, 5.0, 11.0, 20.0, 40.0, 80.0]
+
 
 def _run(clip, sigma=2.0, **kwargs):
     """GaussBlur as a clip the test can read pixels from.
@@ -232,32 +240,31 @@ def _max_diff_vs_reference(fmt: str, sigma) -> float:
     return compare_or_skip(_COMPARE_SCRIPT, [fmt, json.dumps(sigma)], timeout=300)
 
 
-@pytest.mark.parametrize("sigma", [0.5, 2.0, 5.0, 10.0])
+@pytest.mark.parametrize("sigma", FUSED_SIGMAS)
 def test_gaussblur_matches_reference_small_f32(clip_grays, sigma):
-    """Fused small path (radius <= 32) must be bit-identical to vszipcl."""
+    """Fused small path (radius <= LARGE_THRESHOLD) must be bit-identical."""
     reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("grays", sigma)
     assert maxdiff == 0.0, f"small path max diff: {maxdiff}"
 
 
-@pytest.mark.parametrize("sigma", [10.5, 11.0, 12.0])
+@pytest.mark.parametrize("sigma", PATH_BOUNDARY_SIGMAS)
 def test_gaussblur_matches_reference_path_boundary_f32(clip_grays, sigma):
-    """Sigmas around the fused-small / two-pass transition (radius ~32) must
-    be bit-identical on both sides of the switch."""
+    """The two sides of the fused / two-pass switch must both be bit-identical."""
     reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("grays", sigma)
     assert maxdiff == 0.0, f"path boundary max diff: {maxdiff}"
 
 
-@pytest.mark.parametrize("sigma", [20.0, 30.0, 40.0, 80.0])
+@pytest.mark.parametrize("sigma", TWO_PASS_SIGMAS)
 def test_gaussblur_matches_reference_large_f32(clip_grays, sigma):
-    """Two-pass large path (radius > 32) must be bit-identical to vszipcl."""
+    """Two-pass path (radius > LARGE_THRESHOLD) must be bit-identical."""
     reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("grays", sigma)
     assert maxdiff == 0.0, f"large path max diff: {maxdiff}"
 
 
-@pytest.mark.parametrize("sigma", [0.5, 2.0, 5.0, 10.0, 10.5, 11.0, 12.0, 20.0, 30.0, 40.0, 80.0])
+@pytest.mark.parametrize("sigma", [0.5, 1.0, 1.2, 1.4, 2.0, 5.0, 11.0, 20.0, 40.0, 80.0])
 def test_gaussblur_matches_reference_u16(clip_grays, sigma):
     """u16 input must be bit-identical on both code paths — the
     same sigma sweep (small path, transition, large path) as the f32
@@ -267,7 +274,7 @@ def test_gaussblur_matches_reference_u16(clip_grays, sigma):
     assert maxdiff == 0.0, f"gray16 max diff ({sigma}): {maxdiff}"
 
 
-@pytest.mark.parametrize("sigma", [0.5, 3.0, 20.0])
+@pytest.mark.parametrize("sigma", [0.5, 2.0, 20.0])
 def test_gaussblur_matches_reference_yuv_f32(clip_grays, sigma):
     """YUV420: all three planes (incl. the subsampled chroma defaults) must
     match vszipcl bit-for-bit, on both code paths."""
@@ -276,7 +283,7 @@ def test_gaussblur_matches_reference_yuv_f32(clip_grays, sigma):
     assert maxdiff == 0.0, f"yuv420ps max diff ({sigma}): {maxdiff}"
 
 
-@pytest.mark.parametrize("sigma", [0.5, 3.0, 20.0])
+@pytest.mark.parametrize("sigma", [0.5, 2.0, 20.0])
 def test_gaussblur_matches_reference_yuv_u16(clip_grays, sigma):
     """u16 YUV420: all three planes must match vszipcl bit-for-bit on both
     code paths (mirror of the f32 YUV test)."""
@@ -296,33 +303,31 @@ def test_gaussblur_matches_reference_yuv_u16(clip_grays, sigma):
 # (F16_STEP) and none by more. Only that path needs a bound.
 
 
-@pytest.mark.parametrize("sigma", [0.5, 2.0, 5.0, 10.0])
+@pytest.mark.parametrize("sigma", FUSED_SIGMAS)
 def test_gaussblur_matches_reference_small_f16(clip_grayh, sigma):
-    """Fused small path (radius <= 32) on half input must be bit-identical to
-    vszipcl's f16 output."""
+    """Fused small path (radius <= LARGE_THRESHOLD) on half input: bit-exact."""
     reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("grayh", sigma)
     assert maxdiff == 0.0, f"f16 small path max diff: {maxdiff}"
 
 
-@pytest.mark.parametrize("sigma", [10.5, 11.0, 12.0])
+@pytest.mark.parametrize("sigma", PATH_BOUNDARY_SIGMAS)
 def test_gaussblur_matches_reference_path_boundary_f16(clip_grayh, sigma):
-    """Sigmas around the fused-small / two-pass transition (radius ~32) on half
-    input, on both sides of the switch."""
+    """The two sides of the fused / two-pass switch on half input."""
     reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("grayh", sigma)
     assert maxdiff <= F16_STEP, f"f16 path boundary max diff: {maxdiff}"
 
 
-@pytest.mark.parametrize("sigma", [20.0, 30.0, 40.0, 80.0])
+@pytest.mark.parametrize("sigma", TWO_PASS_SIGMAS)
 def test_gaussblur_matches_reference_large_f16(clip_grayh, sigma):
-    """Two-pass large path (radius > 32) on half input."""
+    """Two-pass path (radius > LARGE_THRESHOLD) on half input."""
     reference_or_skip("vszipcl", "GaussBlur")
     maxdiff = _max_diff_vs_reference("grayh", sigma)
     assert maxdiff <= F16_STEP, f"f16 large path max diff: {maxdiff}"
 
 
-@pytest.mark.parametrize("sigma", [0.5, 3.0, 20.0])
+@pytest.mark.parametrize("sigma", [0.5, 2.0, 20.0])
 def test_gaussblur_matches_reference_yuv_f16(clip_grayh, sigma):
     """YUV420PH: all three planes (incl. the subsampled chroma defaults) must
     match vszipcl's f16 output bit-for-bit on both code paths."""
@@ -341,7 +346,7 @@ def test_gaussblur_sigma_small_vs_large_consistent_f32(clip_grays):
     plane to the same value."""
     core = vs.core
     flat = core.std.BlankClip(clip_grays, color=[0.5])
-    for sigma in (2.0, 20.0):  # fused small, two-pass large
+    for sigma in (0.5, 20.0):  # fused small, two-pass large
         out = _run(flat, sigma=sigma)
         a = frame_to_ndarray(out.get_frame(0))
         assert np.abs(a - 0.5).max() < 1e-3, (
@@ -353,7 +358,7 @@ def test_gaussblur_sigma_small_vs_large_consistent_u16(clip_gray16):
     """u16 mirror of the constant-plane check (both code paths)."""
     core = vs.core
     flat = core.std.BlankClip(clip_gray16, color=[32768])
-    for sigma in (2.0, 20.0):  # fused small, two-pass large
+    for sigma in (0.5, 20.0):  # fused small, two-pass large
         out = _run(flat, sigma=sigma)
         a = _plane(out.get_frame(0), 0, WIDTH, HEIGHT, np.uint16).astype(np.float64)
         assert np.abs(a - 32768.0).max() < 66.0, (
@@ -425,7 +430,7 @@ def test_gaussblur_sigma_small_vs_large_consistent_f16(clip_grayh):
     """f16 mirror of the constant-plane check (both code paths)."""
     core = vs.core
     flat = core.std.BlankClip(clip_grayh, color=[0.5])
-    for sigma in (2.0, 20.0):  # fused small, two-pass large
+    for sigma in (0.5, 20.0):  # fused small, two-pass large
         out = _run(flat, sigma=sigma)
         a = _plane(out.get_frame(0), 0, dtype=np.float16).astype(np.float64)
         assert np.abs(a - 0.5).max() < 1e-3, (
@@ -457,7 +462,7 @@ def _widened_f32(clip):
     return vs.core.resize.Point(clip, format=vs.GRAYS)
 
 
-@pytest.mark.parametrize("sigma", [0.5, 2.0, 5.0, 10.0, 10.5, 12.0, 20.0, 40.0, 80.0])
+@pytest.mark.parametrize("sigma", [0.5, 1.2, 1.4, 2.0, 5.0, 11.0, 20.0, 40.0, 80.0])
 def test_gaussblur_f16_is_f32_rounded_f16(clip_grayh, sigma):
     """The f16 output is the f32 output rounded to half, on both code paths."""
     f32 = _widened_f32(clip_grayh)
@@ -571,7 +576,7 @@ def test_gaussblur_accepts_f16(clip_grayh):
         ([2.0, 3.0, 4.0], 0.0),  # increasing, all processed
         ([0.0, 2.0, 2.0], 0.0),  # luma passes through
         ([20.0, 2.0, 2.0], 0.0),  # large path on luma only
-        ([0.5, 10.5, 30.0], 0.0),  # one sigma per code path
+        ([0.5, 1.4, 30.0], 0.0),  # one sigma per code path, both sides
     ],
     ids=["chroma-rule", "increasing", "luma-passthrough", "luma-large", "per-plane-paths"],
 )
@@ -602,7 +607,7 @@ def test_gaussblur_per_plane_sigma_matches_reference_yuv_u16(clip_grays, sigma):
         [2.0, 3.0, 4.0],  # increasing, all processed
         [0.0, 2.0, 2.0],  # luma passes through
         [20.0, 2.0, 2.0],  # large path on luma only
-        [0.5, 10.5, 30.0],  # one sigma per code path
+        [0.5, 1.4, 30.0],  # one sigma per code path, both sides
     ],
     ids=["chroma-rule", "increasing", "luma-passthrough", "luma-large", "per-plane-paths"],
 )
@@ -615,7 +620,7 @@ def test_gaussblur_per_plane_sigma_matches_reference_yuv_f16(clip_grayh, sigma):
 
 @pytest.mark.parametrize(
     "sigma",
-    [[2.0, 2.0, 2.0], [0.5, 10.5, 30.0]],
+    [[2.0, 2.0, 2.0], [0.5, 1.4, 30.0]],
     ids=["identical-chroma", "per-plane-paths"],
 )
 def test_gaussblur_matches_reference_yuv444_f16(clip_grayh, sigma):

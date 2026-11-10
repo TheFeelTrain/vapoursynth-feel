@@ -13,14 +13,18 @@ Design (current):
   runs the f32 arithmetic, matches vszipcl's f16 output bit-exactly on the fused
   path (one half step on the two-pass path) and sits within one half ulp of the
   f32 one.
-- Two code paths, three kernels: fused small (radius ≤ 32) and two-pass
-  vertical/horizontal (larger). Each pass carries its own workgroup shape and
-  outputs per thread, because the two want opposite ones: the vertical pass is
-  32x4 with 16 outputs per thread (a warp then reads one row of 32 consecutive
-  elements, one full cache line, and its strided row loads amortize over 16
-  outputs), while the fused path stays 16x8 with `VRT=3` output rows per thread
-  and the horizontal pass 16x8 with 8 output columns per thread (a warp spanning
-  two rows, where a wider per-lane stride splits each load across more lines).
+- Two code paths, three kernels: fused small (radius ≤ 3) and two-pass
+  vertical/horizontal (larger). The split is the measured crossover, not a
+  guess: radius 3 (sigma 1.2) is 17% faster fused and radius 4 (sigma 1.4) 15%
+  slower, and every larger radius is further behind (sigma 5 was 6.2x). Each
+  pass carries its own workgroup shape and outputs per thread: the vertical pass
+  is 32x4 with 16 outputs per thread (a warp then reads one row of 32
+  consecutive elements, one full cache line, and its strided row loads amortize
+  over 16 outputs), the fused path is 64x2 with `VRT=3` (a warp covers half a
+  row, so the ±RAD halo is 1.09x the tile at radius 3 instead of 1.19x, and both
+  its LDS accesses are conflict-free), and the horizontal pass is 16x8 with 8
+  output columns per thread (a warp spanning two rows, where a wider per-lane
+  stride splits each load across more lines).
 - Per-plane float scratch is one transient `createGPUBuffer` per frame (record
   stage: 10 µs/frame with it).
 - `WIDTH/HEIGHT/STRIDE/KLEN/RAD` are specialization constants read off a probe
@@ -33,7 +37,13 @@ Design (current):
 
 Scoreboard — jpbd 1080p GRAY16, sigma=16 (95 taps, two-pass), pre-wall-clock
 5000-frame runs (`--frames` was removed; ratios only), 3 repeats, same-session
-medians through `tools/benchmark.py`:
+medians through `tools/benchmark.py`.
+
+The other arm, the fused path at the filter's default (`--gaussblur-args
+"sigma=0.5"`, 1080p u16, 5 s, medians of 3): **vsfeel 41 164.7 fps vs vszipcl
+2 250.8 (18.29x)**. The two-pass path at sigma 2-5 now runs 30-32k fps where the
+old threshold put those sigmas on the fused path: 18 355 fps at sigma 2 and
+5 146 at sigma 5 (same-session A/B, ABBA, n=12).
 
 | mode | vsfeel | vszipcl | ratio |
 |---|---|---|---|
@@ -85,14 +95,15 @@ sigma, frames and repeats (3-repeat medians, one session):
   one memcpy + `_mm_sfence()` (may land in the write-combined VRAM BAR).
 - Each kernel's `GpuWorkgroup` is set at its `gpu_create_pipeline` call, so the
   passes can differ; `uv run python tools/shader_limits.py` prints the table
-  (16x8 fused, 32x4 vertical, 16x8 horizontal, 128 invocations each).
+  (64x2 fused, 32x4 vertical, 16x8 horizontal, 128 invocations each).
 - Scratch is ~7.9 MiB transient per in-flight frame at 1080p GRAY16 sigma=16;
   `gpu_frame_buffer` retires it with the submission.
-- The fused small path covers `radius <= 32` and declares
-  `vblur[VRT*BLK_Y][BLK_X + 2*RAD]` — 7 680 B at the widest radius, under the
-  16 KiB of workgroup memory Vulkan guarantees, so no device limit can reject
-  it (`gaussblur.cpp` static_asserts that bound). `VRT` is one CMake value
-  shared by the shader's `-DVRT` and the host launch math.
+- The fused small path covers `radius <= 3` and declares
+  `vblur[VRT*BLK_Y][BLK_X + 2*RAD]` — 1 680 B at the widest radius, far under
+  the 16 KiB of workgroup memory Vulkan guarantees, so no device limit can
+  reject it (`gaussblur.cpp` static_asserts that bound). `BLK_X`/`BLK_Y`/`VRT`
+  are single CMake values shared by the shader's `-D` values and the host launch
+  and tile math.
   Wider kernels take the two-pass vertical + horizontal path, which declares no
   shared memory.
 - int32 guards on the plane's last element and the scratch end (same 32-bit
@@ -201,6 +212,23 @@ sigma, frames and repeats (3-repeat medians, one session):
 
 ## Historical
 
+- **2026-11-10 — the path threshold was 8x too high, and the fused block was
+  7-25% short.** The threshold (32) had never been measured at the value it
+  governed. A same-session A/B per sigma, forcing each path with a new
+  `VSFEEL_GAUSS_THRESHOLD`, puts the crossover between **radius 3 and 4**:
+  fused wins by 42% at sigma 0.5, 31% at 1.0 and 17% at 1.2 (radius 1/2/3), and
+  loses by 15% at 1.4 and 1.6 (radius 4), 33% at 2.0 (radius 5) and **6.2x at
+  5.0** (radius 15: 5 171 vs 32 247 fps), so every sigma above ~1.33 was on the
+  slower path. End to end against the previous binary (ABBA, n=12, 3 s, 1080p
+  u16): sigma 0.5 37 895 -> 40 873 (+7.9%), 1.2 26 341 -> 31 896 (+21.1%), 1.4
+  21 845 -> 30 963 (+41.7%), 2.0 18 355 -> 30 499 (+66.2%), 5.0 5 146 -> 32 320
+  (**+528.1%**), 20 unchanged (two-pass both). The fused block went 16x8 ->
+  **64x2** (a warp covers half a row, halo 1.19x -> 1.09x at the threshold):
+  +7.4% at sigma 0.5, +13.4% at 1.0, +21.9% at 1.2, +24.8% at 2.0 on the
+  forced-fused A/B; 32x4 was measured and is noise (+0.4% to +1.0%), so the
+  report's predicted 33%/50% arithmetic cut does not exist -- the fused cost is
+  global traffic, not arithmetic or LDS conflicts.
+
 Historical A/Bs below quote the pre-wall-clock `--frames` harness; the option
 is gone, so only their ratios transfer.
 
@@ -213,9 +241,9 @@ is gone, so only their ratios transfer.
   `vulkan1.4`), which emits the StorageBuffer class covered by the baseline's
   `storageBuffer16BitAccess`; bit-exact vs vszipcl, f32 SPIR-V unchanged.
 - **The fused path's 48 KiB tile cap was dead.** The widest small-path tile is
-  7 680 B, so `min(48 KiB, device LDS)` was always decided by the device; the cap
-  is gone and the static_assert keeps the tile under the guaranteed 16 KiB. No
-  perf change.
+  1 680 B (7 680 B while the threshold was 32), so `min(48 KiB, device LDS)` was
+  always decided by the device; the cap is gone and the static_assert keeps the
+  tile under the guaranteed 16 KiB. No perf change.
 - **An over-wide plane is refused, not truncated.** Both passes tile by
   (ID.x, ID.y), so the old clamped grids left everything past
   `maxComputeWorkGroupCount[0]` (1 048 560 px at BLK_X=16 on a 65 535-group
@@ -287,11 +315,14 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
   parity is known (start = `tmp_base + y*STRIDE + x0 - RAD`, and `RAD` is a spec
   constant, so an odd start needs one scalar tap first). The vertical pass would
   need two output columns per thread and an even `STRIDE`.
-- **Sweep the shipped shapes across sigma ∈ {4, 40, 80}** — the block and width
-  choice was swept at radius 47 only. The fused path (radius ≤ 32) carries
-  `VRT`/`BLK` that have never been swept at all, and the two-pass shapes might
-  have a different winner at radius 120/240. The f16 variants inherit those
-  shapes unexamined.
+- **Sweep the two-pass shapes across sigma ∈ {4, 40, 80}** — that choice was
+  swept at radius 47 only, so the vertical/horizontal blocks and `R` might have a
+  different winner at radius 120/240. The fused path is done: 64x2 beats 16x8 by
+  7-25% and 32x4 is noise, and `VRT=3` is still unswept. The f16 variants
+  inherit those shapes unexamined.
+- **The fused path's LDS weight staging is moot** (it was priced as worth it at
+  KLEN 33-65): the measured crossover puts every radius above 4 on the two-pass
+  path, so the fused kernel never sees more than 9 taps.
 - The two-pass path still re-reads its 8.3 MB float intermediate ~13x. Staging
   the horizontal pass' taps in shared memory is the untried structural cut
   (radius-sized tiles, so it needs a bounded variant plus a fallback); the
@@ -316,8 +347,10 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
 - Do not re-introduce a host transfer path to win the CPU-sink row — that
   is exactly what the port deletes, and it is what loses the resident chain
   (pre-R80: 1408 resident fps vs 2239).
-- Do not raise `LARGE_THRESHOLD` to cover radius 33–64: the fused path is 7x the
-  two-pass time there (mechanism in Historical).
+- Do not raise `LARGE_THRESHOLD` above the measured 4. The fused path's halo
+  grows as `(64+2R)/64` and its global traffic with it: radius 4 is 15% slower
+  than two-pass, radius 5 33%, radius 15 6.2x, and radius 47 7x (Historical).
+  The old 32 was never measured at the switch.
 
 ## Debug env vars
 
@@ -332,5 +365,9 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
   starts at the first traced frame (default 100, no skipped frames); `=0` turns
   the probe off, so frame 0 cannot be selected. The median is what to quote;
   gated on the queue family's timestamp bits.
+- `VSFEEL_GAUSS_THRESHOLD=<radius>` — overrides `LARGE_THRESHOLD` (3) for a
+  crossover sweep, clamped to 0..64; `=0` forces the two-pass path everywhere
+  and `=64` the fused one. The fused tile is checked against the device's
+  workgroup memory, so a value that cannot fit fails at creation.
 - `VSFEEL_DEBUG=1|2`, `VSFEEL_TRACE=1|2` — the shared error trace and trail
   (`acquire`/`record`/`submit` marks are recorded in the frame path).

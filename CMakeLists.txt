@@ -251,11 +251,15 @@ set(VK_BM3D_VARIANTS
 # notes/GAUSSBLUR.md, and tools/shader_limits.py --check compares the compiled
 # local size against the host launch in src/gaussblur.cpp.
 set(VK_GAUSS_ENTRIES gauss vert horiz)
-# The fused path's output rows per thread live here so the shader's -DVRT and
-# the host's launch/tile math (VSFEEL_GAUSS_VRT) cannot drift.
-set(VSFEEL_GAUSS_VRT 3)
+# The fused path's block and output rows per thread live here so the shader's
+# -D values and the host's launch/tile math (VSFEEL_GAUSS_BLK_X/_BLK_Y/_VRT)
+# cannot drift. 64x2 is the measured winner: its 1.09x halo at radius 3 beats the
+# 16x8 block by 7-25% on the fused path, and 32x4 is noise.
+set(VSFEEL_GAUSS_BLK_X 64 CACHE STRING "GaussBlur fused block width")
+set(VSFEEL_GAUSS_BLK_Y 2 CACHE STRING "GaussBlur fused block height")
+set(VSFEEL_GAUSS_VRT 3 CACHE STRING "GaussBlur fused output rows per thread")
 set(VK_GAUSS_ENTRY_DEFS
-    "-DENTRY_GAUSS -DBLK_X=16 -DBLK_Y=8 -DVRT=${VSFEEL_GAUSS_VRT}"
+    "-DENTRY_GAUSS -DBLK_X=${VSFEEL_GAUSS_BLK_X} -DBLK_Y=${VSFEEL_GAUSS_BLK_Y} -DVRT=${VSFEEL_GAUSS_VRT}"
     "-DENTRY_VERT -DBLK_X=32 -DBLK_Y=4 -DR=16"
     "-DENTRY_HORIZ -DBLK_X=16 -DBLK_Y=8 -DR=8")
 # GaussBlur's io list is local, like the other io-list filters': a half clip
@@ -696,6 +700,8 @@ endif()
 # was compiled with (defined above, in the EEDI3 shader block), and the host's
 # GaussBlur small-path tile math in step with the fused kernel's -DVRT.
 target_compile_definitions(vsfeel PRIVATE EEDI3_MAXW_LDS=${EEDI3_MAXW}
+    VSFEEL_GAUSS_BLK_X=${VSFEEL_GAUSS_BLK_X}
+    VSFEEL_GAUSS_BLK_Y=${VSFEEL_GAUSS_BLK_Y}
     VSFEEL_GAUSS_VRT=${VSFEEL_GAUSS_VRT})
 # The core's Vulkan device is reached through VSAPI::getVulkanAPI, which exists
 # only from API 4.3 on (R80). Defined for every TU so no include order can
