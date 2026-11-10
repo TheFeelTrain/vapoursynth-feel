@@ -19,7 +19,11 @@ Status: **shipped on the R80 GPU API.** Design (current):
 - Per frame: one transient device-local scratch (`width*rows*4 B` list +
   16 B indirect struct per plane) handed to the recording context; six push
   words `{a_base, src_stride, dst_stride, parity, d_base, max_grid_x}` (the
-  keep pass fills five and a trailing zero).
+  keep pass fills five and a trailing zero). Creation holds it to
+  `maxStorageBufferRange` first, then to an eighth of `vsfeel_vram_limit` (the
+  pool keeps several recordings in flight), and rejects a doubled output plane
+  no buffer can hold, so a too-large clip fails on the constructor rather than
+  on every `get_frame`.
 - Persistent VRAM: the three weight buffers (worst config qual2/nsize3/nns4 ≈
   1.2 MB, host-visible, device-local preferred) plus pipelines; transient
   4.2 MB scratch per in-flight frame (1080p GRAY16 `field=3`), bounded by the
@@ -123,19 +127,27 @@ use the ratios, not the absolute fps.
   `ceil(width*rows/(4*PXP))` for pscrn=0; keep grid linearized over x and y
   (`ID.y * groups.x * 1024 + ID.x`), with four samples per thread, so a 4K
   double-rate plane stays under the 65535-group x limit.
-- Pipelines deduplicated per `{width, rows, pscrn, xdim, ydim, nns, qual}`;
-  predict module by the shader's own rule (PXP=8 when
+- Pipelines deduplicated per `{width, rows, pscrn, xdim, ydim, nns, qual}`.
+  The predict module is resolved once at creation -- the window and the io
+  depth are clip-wide -- by the shader's own rule (PXP=8 when
   `ceil(nns/32)<=2 && fs<=128`, PXP=4 small-tile `SHSTRIDE=64` when `fs<=64`,
-  PXP=4 otherwise; the packed half module is always PX=4). Prescreen/predict
-  ask 32-lane full subgroups; the keep writer takes the driver's default.
+  PXP=4 otherwise; the packed half module is always PX=4) and named in the
+  banner (`tile=`, `lds=`). `VSFEEL_NNEDI3_TILE`/`VSFEEL_NNEDI3_PXP` force a
+  variant for a sweep and reject a pair that cannot work, since PXP is the
+  module's shared stride. Prescreen/predict ask 32-lane full subgroups; the
+  keep writer takes the driver's default.
 - The predict module's tile is `4 * SHSTRIDE` vec4 rows: 16 KiB for PXP=8
   (256), 18 KiB for `n4` (288, every PXP=4 window), 12 KiB for `n4m` (192) and
   4 KiB for `n4s` (64). `n4m` takes over from `n4` only where the device cannot
   hold 18 KiB and the window is at most 192 rows, so the measured module still
   runs wherever it fits. The FS=96 `n4m` arm is bit-identical to `n4`
-  (`tests/test_device_limits.py`, sha1 of the plane). The packed half tile is
+  (`tests/test_device_limits.py`, sha1 of the plane), and every forced tile is
+  bit-identical to the default (`tests/test_nnedi3.py`). The packed half tile is
   `4 * SHSTRIDE` **f16vec4** rows (9 KiB at 288) and covers every network, so
-  the packed path ships one predict module.
+  the packed path ships one predict module. Forcing a tile wider than its
+  window (`n4s` above 64 pixels), `pxp8` on a wide network, or a tile/PXP pair
+  that disagrees is a creation error naming the window or the module, not a
+  read past the tile.
 - Weights: blob parsed at creation (prescreener mean/scale, model
   mean-subtraction projected out), packed into three vec4/vec2-layout blobs
   and written through persistently mapped host-visible buffers plus
@@ -164,6 +176,17 @@ use the ratios, not the absolute fps.
 
 ## Historical
 
+- **2026-11-10 — the predictor tile and the scratch budget are named and
+  device-checked.** The tile rule was the reference's measured one but was
+  applied inline per plane and never named, so no test could pin it and no sweep
+  could reach it: it is now resolved once, printed (`tile=`, `lds=`) and forced
+  by `VSFEEL_NNEDI3_TILE`/`VSFEEL_NNEDI3_PXP`, with a window or a tile/PXP pair
+  the module cannot serve rejected at creation. The list scratch is held to an
+  eighth of the VRAM allowance after the range check, and a doubled output plane
+  over `maxStorageBufferRange` fails on the constructor. No perf change: the
+  default rule is untouched, every forced tile is bit-identical to it
+  (`tests/test_nnedi3.py`), and a previous-binary A/B measures 4604.3 vs 4597.8
+  fps (ABBA, n=12).
 - **2026-10-17 — f16 io, predictor GEMV in packed half.** Half was a storage
   width; the packed predictor now runs nnedi3vk's own f16 arithmetic
   (f16vec4 weights, two elements x two pixels per FMA, centered window with
@@ -394,6 +417,8 @@ the global switches in `src/vsfeel.h`.
 | `VSFEEL_NNEDI3_GPUTRACE=<frame>` | one-shot GPU stamps for that frame: top / prescreen done / predict done (default 100; gated on the queue family's `timestampValidBits`; the former `_TSTAMP` spelling still works) |
 | `VSFEEL_NNEDI3_TIMING=1` | per-frame host stage averages (acquire/record/submit/total) printed at teardown |
 | `VSFEEL_NNEDI3_PRED16=0` | force the storage-only f16 kernels instead of the packed half predictor (default on where the device has `shaderFloat16`) |
+| `VSFEEL_NNEDI3_TILE=<auto\|packed\|pxp8\|n4\|n4m\|n4s>` | force the predictor module for a sweep; the banner's `tile=`/`lds=` is what it chose. A window or a tile/PXP pair that disagrees is a creation error |
+| `VSFEEL_NNEDI3_PXP=<4\|8>` | force the tile-internal pixel block; it is baked into the module's shared stride, so `8` excludes the `n4*` modules and `4` excludes `pxp8` |
 | `VSFEEL_DEBUG=1\|2` | device banner and full error trail; level 2 also enables the probe traces |
 | `VSFEEL_TRACE=1\|2` | first 50 / every trace line (the banner is also printed) |
 

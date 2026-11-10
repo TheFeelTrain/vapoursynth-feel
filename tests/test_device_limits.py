@@ -755,6 +755,41 @@ def test_nnedi3_scratch_range_is_a_creation_error():
     assert str(2 << 20) in err, res["nnedi3"]
 
 
+def test_nnedi3_scratch_is_budgeted_against_the_vram_allowance():
+    """The list scratch must also fit an eighth of the VRAM allowance.
+
+    1080p f32 at field=1 is a 540-row field: 1920 * 540 * 4 = 4.05 MiB of list
+    per in-flight frame, which the eighth of a 24 MiB allowance (3 MiB) cannot
+    host. The range check passes there, so this is the allowance's own error and
+    the same clip still renders at the device's real allowance.
+    """
+    case = [{"label": "nnedi3", "filter": "nnedi3_large"}]
+    res = _run_limits(case, {"VSFEEL_LIMIT_VRAM_BUDGET": str(24 << 20)})
+    err = res["nnedi3"].get("error", "")
+    assert "per-frame scratch" in err and "VRAM allowance" in err, res["nnedi3"]
+    assert "eighth" in err, res["nnedi3"]
+
+    ok = _run_limits(case)
+    assert ok["nnedi3"].get("finite") is True, ok["nnedi3"]
+
+
+def test_nnedi3_output_plane_range_is_a_creation_error():
+    """A doubled output plane no buffer can hold fails on the constructor.
+
+    1080p f32 at field=1 writes a 1920x1080 output (8.29 MB) from a 4.05 MB
+    scratch, so a 6 MiB range accepts the weights and the scratch and rejects
+    the plane the predictor would write: the alternative is an allocation error
+    on every get_frame.
+    """
+    res = _run_limits(
+        [{"label": "nnedi3", "filter": "nnedi3_large"}],
+        {"VSFEEL_LIMIT_STORAGE_RANGE": str(6 << 20)},
+    )
+    err = res["nnedi3"].get("error", "")
+    assert "output" in err and "maxStorageBufferRange" in err, res["nnedi3"]
+    assert str(6 << 20) in err, res["nnedi3"]
+
+
 # ---------------------------------------------------------------------------
 # Per-frame scratch vs maxStorageBufferRange at creation
 # ---------------------------------------------------------------------------

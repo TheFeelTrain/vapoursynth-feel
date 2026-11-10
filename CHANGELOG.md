@@ -22,7 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - BM3D no longer pins a full frame per request during reverse or random playback, and rejects a radius that does not fit the VRAM allowance at creation
-- EEDI3, EEDI3H, EEDI3AA, GaussBlur, Box, and NLMeans report an over-large frame at creation instead of failing on every frame
+- EEDI3, EEDI3H, EEDI3AA, GaussBlur, Box, NLMeans, and NNEDI3 report an over-large frame at creation instead of failing on every frame
 - NLMeans names the chroma plane in its plane-range error when `channels="UV"`
 - NLMeans rejects a frame or `a`/`d` combination whose memory the device cannot hold at creation, instead of failing on every frame or allocating hundreds of MiB of sweep tables
 - WNNM reports an over-large frame instead of failing with an allocation error

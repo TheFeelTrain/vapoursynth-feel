@@ -69,7 +69,6 @@ constexpr uint32_t kPredictLdsN4s = 4 * 64 * 16;   // 4 KiB
 // each), FS rows per subgroup: 4 subgroups x SHSTRIDE=288 rows x 8 B = 9 KiB,
 // which covers every network (the Vulkan shared-memory floor is 16 KiB).
 constexpr uint32_t kPredictLdsF16 = 4 * 288 * 8;
-constexpr uint32_t kPackedPxp = 4;
 
 // Weight blob linked into the binary (see CMakeLists.txt): the assembler's
 // .incbin everywhere except Windows, which embeds the same bytes as an RCDATA
@@ -1084,14 +1083,6 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
     // kernels (f32 arithmetic, one half rounding on store).
     d->pred16 = d->half && d->gpu->feat_shader_float16 &&
                 env_flag_default_on("VSFEEL_NNEDI3_PRED16");
-    if (vsfeel_device_info_enabled()) {
-        // One line per created filter naming the predictor that will run: a
-        // feature- or env-selected variant is invisible in the pixels, so this
-        // is what a test pins it by.
-        fprintf(stderr, "[nnedi3] io=%s predictor=%s\n",
-                d->half ? "f16" : (d->elem_bytes == 2 ? "u16" : "f32"),
-                d->pred16 ? "f16-packed" : (d->half ? "f16-storage" : "f32"));
-    }
     if (d->half && !d->pred16 && vsfeel_device_info_enabled()) {
         // The storage-only f16 kernels run this file's f32 arithmetic and are
         // bit-exact with the f32 path; say why the packed one is not in use.
@@ -1406,10 +1397,172 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
                          "(required by the predictor kernel).");
     }
 
+    // Predictor tile. One module serves the whole clip (the window and the io
+    // depth are creation-time state), so it is resolved once, here, and named
+    // in the banner. The measured rule stays the default: the PXP=8 module for
+    // a narrow network, the 4 KiB tile for a window it covers, the 12 KiB one
+    // where the device cannot hold 18 KiB, else the 18 KiB one that covers
+    // every PXP=4 window. VSFEEL_NNEDI3_TILE / VSFEEL_NNEDI3_PXP force a
+    // variant for a sweep; PXP is baked into the module's shared stride, so the
+    // two must agree and a window the tile cannot hold is rejected here rather
+    // than as a read past it.
+    enum class PredictTile { kPxp8, kN4, kN4m, kN4s, kPacked };
+    const int net_fs = d->xdim * d->ydim;
+    const bool narrow = ((d->nns + 31) / 32 <= 2) && (net_fs <= 128);
+    const uint32_t max_shared = d->gpu->limits.maxComputeSharedMemorySize;
+    const auto tile_name = [](PredictTile t) {
+        switch (t) {
+        case PredictTile::kPxp8:
+            return "pxp8";
+        case PredictTile::kN4:
+            return "n4";
+        case PredictTile::kN4m:
+            return "n4m";
+        case PredictTile::kN4s:
+            return "n4s";
+        default:
+            return "packed";
+        }
+    };
+    const auto tile_lds = [](PredictTile t) {
+        switch (t) {
+        case PredictTile::kPxp8:
+            return kPredictLdsPxp8;
+        case PredictTile::kN4:
+            return kPredictLdsN4;
+        case PredictTile::kN4m:
+            return kPredictLdsN4m;
+        case PredictTile::kN4s:
+            return kPredictLdsN4s;
+        default:
+            return kPredictLdsF16;
+        }
+    };
+    // A PXP=4 row is one vec4, so `4 * SHSTRIDE` holds 4 subgroups of SHSTRIDE
+    // rows each; the packed module's f16vec4 tile covers every network.
+    const auto tile_window = [](PredictTile t) {
+        switch (t) {
+        case PredictTile::kN4s:
+            return 64;
+        case PredictTile::kN4m:
+            return 192;
+        default:
+            return 288;
+        }
+    };
+    const auto default_tile = [&] {
+        if (net_fs <= 64) {
+            return PredictTile::kN4s;
+        }
+        if (net_fs <= 192 && max_shared < kPredictLdsN4) {
+            return PredictTile::kN4m;
+        }
+        return PredictTile::kN4;
+    };
+    const char * const tile_env = env_str("VSFEEL_NNEDI3_TILE");
+    const int pxp_env = env_int("VSFEEL_NNEDI3_PXP", 0);
+    if (pxp_env != 0 && pxp_env != 4 && pxp_env != 8) {
+        return set_error(
+            "\"VSFEEL_NNEDI3_PXP\" must be 4 or 8; leave it unset for auto.");
+    }
+    const auto tile_auto = [&]() {
+        if (d->pred16) {
+            return PredictTile::kPacked;
+        }
+        if (pxp_env == 8) {
+            return PredictTile::kPxp8;
+        }
+        if (pxp_env == 0 && narrow) {
+            return PredictTile::kPxp8;
+        }
+        return default_tile();
+    };
+    PredictTile pick = tile_auto();
+    if (tile_env != nullptr && std::strcmp(tile_env, "auto") != 0) {
+        if (std::strcmp(tile_env, "packed") == 0) {
+            pick = PredictTile::kPacked;
+        } else if (std::strcmp(tile_env, "pxp8") == 0) {
+            pick = PredictTile::kPxp8;
+        } else if (std::strcmp(tile_env, "n4") == 0) {
+            pick = PredictTile::kN4;
+        } else if (std::strcmp(tile_env, "n4m") == 0) {
+            pick = PredictTile::kN4m;
+        } else if (std::strcmp(tile_env, "n4s") == 0) {
+            pick = PredictTile::kN4s;
+        } else {
+            return set_error(
+                "\"VSFEEL_NNEDI3_TILE\" must be auto, packed, pxp8, n4, n4m "
+                "or n4s.");
+        }
+    }
+    if (pick == PredictTile::kPacked && !d->pred16) {
+        return set_error(
+            "\"VSFEEL_NNEDI3_TILE=packed\" needs an f16 clip and the "
+            "shaderFloat16 feature.");
+    }
+    if (pick != PredictTile::kPacked && d->pred16) {
+        return set_error(
+            "the packed half predictor is one module at 4 pixels per subgroup; "
+            "use a u16 or f32 clip to sweep \"VSFEEL_NNEDI3_TILE\".");
+    }
+    if (pick == PredictTile::kPxp8 && pxp_env == 4) {
+        return set_error(
+            "\"VSFEEL_NNEDI3_TILE=pxp8\" runs the PXP=8 module; drop "
+            "\"VSFEEL_NNEDI3_PXP=4\" or the tile.");
+    }
+    if (pick != PredictTile::kPxp8 && pick != PredictTile::kPacked &&
+        pxp_env == 8) {
+        return set_error("\"" + std::string(tile_name(pick)) +
+                         "\" is a PXP=4 module; drop \"VSFEEL_NNEDI3_PXP=8\" "
+                         "or the tile.");
+    }
+    if (pick == PredictTile::kPxp8 && !narrow) {
+        return set_error("the PXP=8 predictor needs at most two 32-neuron "
+                         "network blocks and a window of at most 128 pixels; "
+                         "this network is nns=" +
+                         std::to_string(d->nns) + " over " +
+                         std::to_string(net_fs) + " pixels.");
+    }
+    if (pick != PredictTile::kPxp8 && pick != PredictTile::kPacked &&
+        net_fs > tile_window(pick)) {
+        return set_error("\"" + std::string(tile_name(pick)) +
+                         "\" holds a window of at most " +
+                         std::to_string(tile_window(pick)) +
+                         " pixels; this network is " + std::to_string(net_fs) +
+                         ".");
+    }
+    const uint32_t pred_lds = tile_lds(pick);
+    if (pred_lds > max_shared) {
+        return set_error(
+            "the " + std::string(tile_name(pick)) + " predictor tile needs " +
+            std::to_string(pred_lds) +
+            " bytes of workgroup memory, more than this device's " +
+            std::to_string(max_shared) + ".");
+    }
+    const uint32_t * pred_sel_code = pred_code;
+    size_t pred_sel_size = pred_size;
+    if (pick == PredictTile::kN4) {
+        pred_sel_code = pred_n4_code;
+        pred_sel_size = pred_n4_size;
+    } else if (pick == PredictTile::kN4m) {
+        pred_sel_code = pred_n4m_code;
+        pred_sel_size = pred_n4m_size;
+    } else if (pick == PredictTile::kN4s) {
+        pred_sel_code = pred_n4s_code;
+        pred_sel_size = pred_n4s_size;
+    }
+    if (vsfeel_device_info_enabled()) {
+        // One line per created filter naming the predictor that will run: a
+        // feature- or env-selected variant is invisible in the pixels, so this
+        // is what a test pins it by.
+        fprintf(stderr, "[nnedi3] io=%s predictor=%s tile=%s lds=%u B\n",
+                d->half ? "f16" : (d->elem_bytes == 2 ? "u16" : "f32"),
+                d->pred16 ? "f16-packed" : (d->half ? "f16-storage" : "f32"),
+                tile_name(pick), pred_lds);
+    }
+
     // Per-plane geometry, grids and pipelines, deduplicated across identical
-    // planes. The predict module is chosen per key: narrow networks (PPL<=2
-    // and FS<=128) use the PXP=8 module, wide networks the PXP=4 one (the
-    // shader's own PXP rule), FS<=64 the small-tile PXP=4 module.
+    // planes. The predictor module is the one resolved above for every plane.
     const uint32_t max_grid_x = d->gpu->limits.maxComputeWorkGroupCount[0];
     const uint32_t max_grid_y = d->gpu->limits.maxComputeWorkGroupCount[1];
 
@@ -1427,10 +1580,6 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         }
         return std::nullopt;
     };
-    const auto use_pxp8 = [](int net_nns, int net_fs) {
-        return ((net_nns + 31) / 32 <= 2) && (net_fs <= 128);
-    };
-
     struct Key {
         int w, rows, pscrn, xdim, ydim, nns, qual;
     };
@@ -1479,11 +1628,10 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
             }
         }
         // cooperative direct grid (pscrn==0): 4 subgroups x PXP pixels per
-        // 128-thread workgroup. The packed half predictor is PXP=4.
-        const int host_pxp =
-            d->pred16 ? static_cast<int>(kPackedPxp)
-                      : (use_pxp8(d->nns, d->xdim * d->ydim) ? 8 : 4);
-        const uint32_t ppg = static_cast<uint32_t>(4 * host_pxp);
+        // 128-thread workgroup, with the selected module's PXP (the packed half
+        // predictor is PXP=4).
+        const uint32_t ppg =
+            static_cast<uint32_t>(pick == PredictTile::kPxp8 ? 4 * 8 : 4 * 4);
         if (auto e = fold_grid((static_cast<uint32_t>(cfg.width) *
                                     static_cast<uint32_t>(cfg.rows) +
                                 ppg - 1) /
@@ -1549,42 +1697,12 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
                     cfg.pre_pipeline = pre_pipes[n_keys];
                 }
                 {
-                    // The predict module is picked by the window size: the PXP=8
-                    // one addresses 256 vec4 rows, and the PXP=4 ones one row per
-                    // element, so `n4` (288 rows, 18 KiB) covers every window and
-                    // `n4m` (192) covers all but the 48x6 network. Take the small
-                    // tile only where the device cannot hold the big one, so the
-                    // measured variant is what runs wherever it fits.
-                    const int net_fs = d->xdim * d->ydim;
-                    uint32_t lds = kPredictLdsPxp8;
-                    const uint32_t * mod = pred_code;
-                    size_t mod_size = pred_size;
-                    if (d->pred16) {
-                        // One packed module, 4 pixels per subgroup, every window.
-                        lds = kPredictLdsF16;
-                    } else if (!use_pxp8(d->nns, net_fs)) {
-                        if (net_fs <= 64) {
-                            mod = pred_n4s_code;
-                            mod_size = pred_n4s_size;
-                            lds = kPredictLdsN4s;
-                        } else if (net_fs <= 192 &&
-                                   d->gpu->limits.maxComputeSharedMemorySize <
-                                       kPredictLdsN4) {
-                            mod = pred_n4m_code;
-                            mod_size = pred_n4m_size;
-                            lds = kPredictLdsN4m;
-                        } else {
-                            mod = pred_n4_code;
-                            mod_size = pred_n4_size;
-                            lds = kPredictLdsN4;
-                        }
-                    }
-                    const auto result =
-                        create_pipeline(*d->gpu, spec, mod, mod_size,
-                                        d->pipeline_layout, pred_subgroup_size,
-                                        GpuWorkgroup { .x = kCoopInvocations,
-                                                       .shared_bytes = lds },
-                                        /*full_subgroups=*/true);
+                    const auto result = create_pipeline(
+                        *d->gpu, spec, pred_sel_code, pred_sel_size,
+                        d->pipeline_layout, pred_subgroup_size,
+                        GpuWorkgroup { .x = kCoopInvocations,
+                                       .shared_bytes = pred_lds },
+                        /*full_subgroups=*/true);
                     if (std::holds_alternative<std::string>(result)) {
                         return set_error(std::get<std::string>(result));
                     }
@@ -1619,6 +1737,41 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
             " bytes) exceeds this device's maxStorageBufferRange (" +
             std::to_string(d->gpu->limits.maxStorageBufferRange) +
             " bytes); lower the frame size");
+    }
+    // The range is one buffer; the allowance is what the pool may keep in
+    // flight, so an eighth of it is this filter's share (the same fraction
+    // WNNM and EEDI3 use). A device that reports no allowance skips the check.
+    if (const VkDeviceSize vram = vsfeel_vram_limit(*d->gpu, core);
+        vram > 0 && d->scratch_bytes > vram / 8) {
+        return set_error(
+            "the per-frame scratch (" + std::to_string(d->scratch_bytes) +
+            " bytes) exceeds an eighth of the device's VRAM allowance (" +
+            std::to_string(vram / 8) +
+            " bytes); lower the frame size or raise the allowance");
+    }
+
+    // The output plane is `2 * rows` tall either way (dh doubles the input
+    // height instead of the field), and it is the larger of the two scratch
+    // allocations. One no buffer can hold has to fail on the constructor, not
+    // on every get_frame; the scratch checks above come first so their
+    // messages keep naming the buffer that is actually the budget's problem.
+    for (int plane = 0; plane < fmt.numPlanes; ++plane) {
+        if (!d->process[plane]) {
+            continue;
+        }
+        const auto & cfg = d->planes[plane];
+        const int64_t out_bytes =
+            static_cast<int64_t>(cfg.width) * 2 * cfg.rows * d->elem_bytes;
+        if (out_bytes >
+            static_cast<int64_t>(d->gpu->limits.maxStorageBufferRange)) {
+            return set_error(
+                "plane " + std::to_string(plane) + "'s output (" +
+                std::to_string(cfg.width) + "x" + std::to_string(2 * cfg.rows) +
+                ", " + std::to_string(out_bytes) +
+                " bytes) exceeds this device's maxStorageBufferRange (" +
+                std::to_string(d->gpu->limits.maxStorageBufferRange) +
+                " bytes); lower the frame size");
+        }
     }
 
     // GPU-timing probe: only when the queue family can timestamp at all, since

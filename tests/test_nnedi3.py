@@ -461,12 +461,14 @@ def test_nnedi3_f16_yuv_matches_reference(clip_yuv420ps, f16_packed):
         assert payload["maxdiff"] <= bound, kwargs
 
 
-def _creation_stderr(env=None):
-    """stderr of a GRAYH creation run, with the device banner on.
+def _creation_stderr(env=None, params=None, half=True):
+    """stderr of a creation run, with the device banner on.
 
-    The predictor variant is chosen from a device feature and an env knob, so
-    it is invisible in the pixels; the creation banner is the only place a test
-    can pin it (notes/METHOD.md: a creation-time variant needs a test).
+    The predictor variant is chosen from a device feature, the network and an
+    env knob, so it is invisible in the pixels; the creation banner is the only
+    place a test can pin it (notes/METHOD.md: a creation-time variant needs a
+    test). ``params`` reaches NNEDI3 as keyword arguments; ``half`` picks the
+    GRAYH clip, whose packed predictor has no tile to sweep.
     """
     code = (
         "import vapoursynth as vs\n"
@@ -474,8 +476,9 @@ def _creation_stderr(env=None):
         f"src = core.bs.VideoSource({CLIP_PATH!r})\n"
         "gray = core.std.ShufflePlanes(src, 0, vs.GRAY)\n"
         "f32 = core.fmtc.bitdepth(gray, bits=32, fulls=True, fulld=True)\n"
-        "half = core.resize.Point(f32, format=vs.GRAYH)\n"
-        "node = core.vsfeel.NNEDI3(half, field=1)\n"
+        + ("half = core.resize.Point(f32, format=vs.GRAYH)\n" if half else "")
+        + f"node = core.vsfeel.NNEDI3({'half' if half else 'f32'}, field=1, "
+        + f"**{params or {}})\n"
         "core.std.GPUDownload(clip=node).get_frame(0)\n"
     )
     run_env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1", **(env or {})}
@@ -484,6 +487,32 @@ def _creation_stderr(env=None):
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
     return proc.stderr
+
+
+def _creation_error(env=None, params=None, half=False):
+    """stderr of a creation run that is expected to fail."""
+    code = (
+        "import vapoursynth as vs\n"
+        "core = vs.core\n"
+        f"src = core.bs.VideoSource({CLIP_PATH!r})\n"
+        "gray = core.std.ShufflePlanes(src, 0, vs.GRAY)\n"
+        "f32 = core.fmtc.bitdepth(gray, bits=32, fulls=True, fulld=True)\n"
+        + ("half = core.resize.Point(f32, format=vs.GRAYH)\n" if half else "")
+        + f"core.vsfeel.NNEDI3({'half' if half else 'f32'}, field=1, "
+        + f"**{params or {}})\n"
+    )
+    run_env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1", **(env or {})}
+    proc = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=run_env, timeout=300
+    )
+    assert proc.returncode != 0, proc.stderr[-2000:]
+    return proc.stderr
+
+
+def _banner_tile(err):
+    match = re.search(r"tile=(\S+)", err)
+    assert match, err[-2000:]
+    return match.group(1)
 
 
 def test_nnedi3_f16_predictor_variant_pinned():
@@ -496,6 +525,76 @@ def test_nnedi3_f16_predictor_variant_pinned():
         assert "predictor=f16-packed" in default, default[-2000:]
     storage = _creation_stderr({"VSFEEL_NNEDI3_PRED16": "0"})
     assert "predictor=f16-storage" in storage, storage[-2000:]
+
+
+@pytest.mark.parametrize(
+    ("params", "tile"),
+    [
+        ({"nsize": 0, "nns": 0}, "pxp8"),
+        ({}, "pxp8"),
+        ({"nsize": 3, "nns": 0}, "n4"),
+        ({"nsize": 0, "nns": 4}, "n4s"),
+        ({"nsize": 5, "nns": 4}, "n4s"),
+        ({"nsize": 1, "nns": 4}, "n4"),
+    ],
+    ids=["narrow", "default", "wide-window", "fs48", "fs64", "fs96"],
+)
+def test_nnedi3_predict_tile_variant_pinned(params, tile):
+    """The measured tile rule is pinned by the creation banner.
+
+    Narrow networks take the 16 KiB PXP=8 tile, a 48/64-pixel window the 4 KiB
+    one, everything else the 18 KiB `n4`; a device that cannot hold 18 KiB
+    falls to `n4m` (test_device_limits). The tile is invisible in the pixels,
+    so the banner is the only place the choice can regress silently.
+    """
+    assert _banner_tile(_creation_stderr(params=params, half=False)) == tile
+
+
+def test_nnedi3_predict_tile_override_matches_the_default(monkeypatch, clip_grays):
+    """A forced tile must produce the default's pixels, not a different port.
+
+    `n4` covers every PXP=4 window, so forcing it where the rule picks the 4
+    KiB `n4s` has to be arithmetically identical; only the shared-memory
+    footprint changes. The knob is read at creation, so the second node is
+    built after it is set.
+    """
+    default = _creation_stderr(params={"nsize": 0, "nns": 4}, half=False)
+    forced = _creation_stderr({"VSFEEL_NNEDI3_TILE": "n4"}, {"nsize": 0, "nns": 4}, half=False)
+    assert _banner_tile(default) == "n4s", default[-2000:]
+    assert _banner_tile(forced) == "n4", forced[-2000:]
+    assert "lds=4096" in default and "lds=18432" in forced, (default, forced)
+
+    a = _run(clip_grays, nsize=0, nns=4)
+    monkeypatch.setenv("VSFEEL_NNEDI3_TILE", "n4")
+    b = _run(clip_grays, nsize=0, nns=4)
+    for n in (0, 11):
+        fa, fb = a.get_frame(n), b.get_frame(n)
+        for p in range(fa.format.num_planes):
+            assert np.array_equal(_plane(fa, p), _plane(fb, p)), (n, p)
+
+
+def test_nnedi3_predict_tile_overrides_are_rejected():
+    """A tile/PXP pair the module cannot serve fails at creation, not in the kernel.
+
+    PXP is baked into the module's shared stride, so `n4` forced with PXP=8
+    would address past its tile; a 64-pixel tile on a 288-pixel window would
+    read past its rows; and the packed half predictor is a single module.
+    """
+    wide = {"nsize": 3}  # the 48x6 network, fs=288
+    cases = [
+        ({"VSFEEL_NNEDI3_TILE": "n4s"}, wide, "at most 64 pixels"),
+        ({"VSFEEL_NNEDI3_TILE": "pxp8"}, wide, "at most 128 pixels"),
+        ({"VSFEEL_NNEDI3_TILE": "n4", "VSFEEL_NNEDI3_PXP": "8"}, {}, "PXP=4 module"),
+        ({"VSFEEL_NNEDI3_TILE": "packed"}, {}, "needs an f16 clip"),
+        ({"VSFEEL_NNEDI3_TILE": "bogus"}, {}, "must be auto"),
+        ({"VSFEEL_NNEDI3_PXP": "16"}, {}, "must be 4 or 8"),
+    ]
+    for env, params, message in cases:
+        err = _creation_error(env, params)
+        assert message in err, (env, params, err[-2000:])
+    # The packed half predictor is one module, so a tile sweep cannot apply.
+    err = _creation_error({"VSFEEL_NNEDI3_TILE": "n4"}, half=True)
+    assert "packed half predictor is one module" in err, err[-2000:]
 
 
 @pytest.fixture(scope="module")
