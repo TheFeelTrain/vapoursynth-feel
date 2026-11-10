@@ -1585,33 +1585,38 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     // The ring is persistent, not per-frame scratch, and spans the request
     // depth rather than 2r+1 slots, so it gets a budget of its own: 160 MiB
     // fits the depth-sized ring at 1080p luma and 4K chroma (the old 2r+1 ring
-    // held under 20 MiB there).
+    // held under 20 MiB there). A device's maxStorageBufferRange is also a
+    // hard cap on the ring buffer, and the same eighth of the VRAM allowance
+    // that bounds the per-frame scratch bounds this one, or a small device
+    // plans a cache that competes with the core's frame cache.
     constexpr int64_t kCacheBudget = INT64_C(160) << 20;
-    // A device's maxStorageBufferRange is also a hard cap on the ring buffer;
-    // the budget has to respect it or a ring that passes the check still fails
-    // allocation and the whole cache is dropped.
+    const int64_t vram = static_cast<int64_t>(vsfeel_vram_limit(*d->gpu, core));
     const int64_t cache_budget = std::min<int64_t>(
         kCacheBudget,
-        static_cast<int64_t>(d->gpu->limits.maxStorageBufferRange));
+        std::min<int64_t>(
+            static_cast<int64_t>(d->gpu->limits.maxStorageBufferRange),
+            vram > 0 ? vram / 8 : kCacheBudget));
     d->cache =
         d->split_match && d->max_radius > 0 && !env_flag("VSFEEL_WNNM_NOCACHE");
     // A centre's record is only published when its own frame is submitted, so
     // the ring has to span the frames the core keeps in flight: a smaller ring
     // evicts a tag before the neighbouring frame that would hit it reads it,
     // and every frame re-searches all folds (0.95 of 3 cached instead of 2 at
-    // the default request depth of 32, ~3x the matcher's time).
+    // the default request depth of 32, ~3x the matcher's time). There is no
+    // literal slot cap: a core with more threads gets the ring its request
+    // depth asks for, and the budget above decides whether it fits.
     int depth = 2 * d->max_folds;
     {
         VSCoreInfo info {};
         vsapi->getCoreInfo(core, &info);
         depth += std::max(0, info.numThreads);
     }
-    d->ring = d->cache ? std::min(256, round_up_pow2(depth)) : d->max_folds;
+    d->ring = d->cache ? round_up_pow2(depth) : d->max_folds;
     if (const int cap = env_int("VSFEEL_WNNM_RING", 0); cap > 0 && d->cache) {
         // Debug knob: force the request-spanning ring smaller so the cache
         // budget's trade-offs can be swept on this device.
         const int floor_ring = round_up_pow2(2 * d->max_folds);
-        const int r = std::min(d->ring, round_up_pow2(std::min(cap, 256)));
+        const int r = std::min(d->ring, round_up_pow2(cap));
         if (r < floor_ring) {
             d->cache = false;
             d->ring = d->max_folds;
@@ -1902,17 +1907,15 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     // Per-centre solved-M cache: the match ring already knows which centres
     // are published, so the estimate cache uses the same slot and depth. It is
     // a persistent buffer with its own budget; when it does not fit, Gram and
-    // Solve run for every fold exactly as before. The old fixed 320 MiB target
-    // is a floor, and up to 512 MiB is allowed when the core's allowance covers
-    // it (limit/8, the fraction the per-frame scratch is held to): 1080p with
-    // three processed planes needs ~404 MiB, and dropping the cache there cost
-    // 16.1%.
+    // Solve run for every fold exactly as before. At most 512 MiB, and never
+    // more than the core's allowance covers (limit/8, the fraction the
+    // per-frame scratch is held to): 1080p with three processed planes needs
+    // ~404 MiB at a 32-slot ring, and dropping the cache there cost 16.1%. A
+    // fixed floor would plan that much on a device whose whole allowance is
+    // smaller, so the allowance is the only lower bound.
     constexpr int64_t kEstimateBudget = INT64_C(512) << 20;
-    constexpr int64_t kEstimateFloor = INT64_C(320) << 20;
-    const int64_t vram = static_cast<int64_t>(vsfeel_vram_limit(*d->gpu, core));
     int64_t est_budget =
-        vram > 0 ? std::min(kEstimateBudget, std::max(kEstimateFloor, vram / 8))
-                 : kEstimateBudget;
+        vram > 0 ? std::min(kEstimateBudget, vram / 8) : kEstimateBudget;
     if (const int cap = env_int("VSFEEL_WNNM_ESTBUDGET", 0); cap > 0) {
         // Debug knob: the budget is what decides whether the M cache exists at
         // all, so it has to be sweepable on this device.
@@ -1966,8 +1969,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     const int64_t per_frame = d->acc_bytes + d->pmat_bytes + d->locs_bytes +
                               d->dist_bytes + d->match_bytes;
     {
-        const VkDeviceSize limit = vsfeel_vram_limit(*d->gpu, core);
-        if (limit > 0 && per_frame > static_cast<int64_t>(limit / 8)) {
+        if (vram > 0 && per_frame > vram / 8) {
             return set_error(
                 "per-frame scratch (" + std::to_string(per_frame) +
                 " bytes) exceeds one eighth of the VRAM allowance; "

@@ -79,9 +79,9 @@ The port is f32 end to end; there is no f64 path any more.
   the submit and every cached frame starts with a whole-queue barrier, the same
   cross-submission handoff the BM3D ring uses; the record slot is the only state
   shared across frames, and holding one lock across record-to-submit keeps
-  record order equal to submission order. A 160 MiB budget halves the ring when
-  its records do not fit (a partial cache still hits), and `VSFEEL_WNNM_NOCACHE`
-  drops the ring for per-frame slots.
+  record order equal to submission order. A `min(160 MiB, range, vram/8)`
+  budget halves the ring when its records do not fit (a partial cache still
+  hits), and `VSFEEL_WNNM_NOCACHE` drops the ring for per-frame slots.
 - **Per-plane radius**: each plane owns its window end to end. Its address table
   holds `4r+1` entries for `n-2r..n+2r` (so the frame requests the widest
   plane's window and maps a frame number onto it), its scratch and dispatch
@@ -258,6 +258,27 @@ staying a bit-exact copy and the request orders on both.
 
 ## Historical
 
+- **2026-11-10 - the match ring and the estimate cache are capped by the VRAM
+  allowance.** The ring budget was `min(160 MiB, range)` and the estimate
+  `min(512 MiB, max(320 MiB, limit/8))`, so a 1 GiB device could plan a
+  270.9 MiB chroma-only estimate cache against its 128 MiB eighth (135.5 MiB at
+  a 32-slot ring), and a 512 MiB device could plan a 134.5 MiB ring against
+  64 MiB. Both budgets are now `vram/8` with no floor, the ring's literal
+  256-slot cap is gone (on a >250-thread core it cut the ring below the request
+  depth: 256 instead of 512 at 320x180, and a short ring costs ~3x the matcher's
+  time), and the estimate keeps its 512 MiB ceiling. The 1080p/32-thread plans
+  are unchanged (ring 64/32, estimate 270.9/404.4 MiB), so no perf change here;
+  the device-limit tests pin the new caps.
+- **2026-11-10 - folding the accumulator clear into the normalize pass is
+  byte-neutral.** The fill wrote 7.9 MiB per frame at the chroma default and
+  23.7 MiB with three planes; a folded accumulator (one persistent buffer, the
+  normalize pass storing 0 to each cell after reading it) replaced that with the
+  same bytes of stores: 1266.0 vs 1260.6 fps (chroma default) and 385.1 vs
+  385.1 (three planes), ABBA n=12 over 5 s runs, both inside the 2-4% spread.
+  Removing the fill *entirely* (a persistent buffer never cleared, for timing
+  only) also measured flat, 381.5 vs 380.0, so the fill is free and the report's
+  ~1% was bandwidth arithmetic rather than a measurement. Reverted; the fill and
+  its transfer-to-compute barrier stay.
 - **2026-11-07 - the matcher width follows the device's wave.** The group and
   temporal-matcher kernels were fixed at `-DWG=32`, the measured RDNA3 shape, so
   a wave64-only device (GCN/CDNA) ran one reference block on half a wave. Both

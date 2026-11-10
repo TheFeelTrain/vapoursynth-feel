@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - WNNM runs its matcher at the GPU's wave width, so wave64 GPUs fill the wave instead of half of it
 - DFTTest's stripe ring and NLMeans' round are sized from the GPU's cache on known parts, so a card with less cache no longer streams them
 - All filter creation uses less memory
+- WNNM uses less VRAM on GPUs with a small VRAM allowance
 - EEDI3, EEDI3H, and EEDI3AA use less VRAM for the same output
 - BM3D uses less VRAM before its first seek
 - BM3D scales sigma and its matching threshold by a color matrix selected from the clip's resolution, and accepts a `matrix` argument to pin it

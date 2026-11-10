@@ -849,6 +849,39 @@ def test_qmax_variant_pinned(kwargs, qmax):
     assert int(match.group(1)) == qmax, err[-2000:]
 
 
+_RING_DEPTH_SCRIPT = r"""
+import vapoursynth as vs
+
+core = vs.core
+core.num_threads = 300
+clip = core.std.BlankClip(width=320, height=180, format=vs.YUV420PS, length=2)
+core.vsfeel.WNNM(clip, sigma=[0, 3, 3], radius=1)
+"""
+
+
+def test_ring_spans_the_request_depth_without_a_slot_cap():
+    """The ring is sized from the request depth, not from a literal slot cap.
+
+    A 300-thread core keeps one request per thread in flight and this geometry
+    needs 512 slots; a 256-slot cap cut the ring below that depth, so a tag was
+    evicted before the frame that would hit it ran and every frame re-searched
+    all folds. Small geometry and a pinned thread count keep the ring inside
+    its budget, so the ring size itself is what the banner shows.
+    """
+    env = {**os.environ, "MANGOHUD": "0", "VSFEEL_WNNM_DEBUG": "1"}
+    proc = subprocess.run(
+        [sys.executable, "-c", _RING_DEPTH_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    match = re.search(r"cache=1 ring=(\d+)", proc.stderr)
+    assert match, proc.stderr[-2000:]
+    assert int(match.group(1)) == 512, proc.stderr[-2000:]
+
+
 _CACHE_LIMIT_SCRIPT = r"""
 import vapoursynth as vs
 
@@ -858,14 +891,28 @@ core.vsfeel.WNNM(clip, sigma=[3, 0], radius=1, ps_num=1, ps_range=0)
 """
 
 
-def test_cache_budget_respects_storage_range():
-    """A ring above maxStorageBufferRange must halve, not drop the cache."""
-    cap = 70 << 20  # the luma-only 1080p ring is 134.5 MiB unbounded here
+@pytest.mark.parametrize(
+    ("knob", "cap"),
+    [("VSFEEL_LIMIT_STORAGE_RANGE", 70 << 20), ("VSFEEL_LIMIT_VRAM_BUDGET", 1 << 30)],
+    ids=["storage-range", "vram-eighth"],
+)
+def test_cache_budget_respects_the_device_limits(knob, cap):
+    """The ring halves against whichever cap binds, keeping a partial cache.
+
+    The request depth is pinned so the starting ring does not move with the
+    core's thread count: a luma-only 1080p ring is 134.5 MiB at 64 slots. A
+    70 MiB storage range and a 1 GiB VRAM allowance (an eighth is 128 MiB) both
+    halve it to 32 slots, 67.2 MiB. Without the VRAM term the allowance did not
+    bound the ring at all, and a small device planned a cache that competed
+    with the core's frame cache.
+    """
+    budget = cap // 8 if knob == "VSFEEL_LIMIT_VRAM_BUDGET" else cap
     env = {
         **os.environ,
         "MANGOHUD": "0",
         "VSFEEL_WNNM_DEBUG": "1",
-        "VSFEEL_LIMIT_STORAGE_RANGE": str(cap),
+        "VSFEEL_WNNM_RING": "64",
+        knob: str(cap),
     }
     proc = subprocess.run(
         [sys.executable, "-c", _CACHE_LIMIT_SCRIPT],
@@ -879,8 +926,8 @@ def test_cache_budget_respects_storage_range():
     assert match, proc.stderr[-2000:]
     cache, ring, mib = int(match.group(1)), int(match.group(2)), float(match.group(3))
     assert cache == 1, proc.stderr[-2000:]
-    assert ring <= 32, proc.stderr[-2000:]
-    assert mib <= cap / (1 << 20), proc.stderr[-2000:]
+    assert ring == 32, proc.stderr[-2000:]
+    assert mib <= budget / (1 << 20), proc.stderr[-2000:]
 
 
 _PER_BUFFER_LIMIT_SCRIPT = r"""
@@ -922,35 +969,45 @@ def test_storage_range_is_per_scratch_buffer():
 
 
 _EST_BUDGET_SCRIPT = r"""
+import json
+import sys
+
 import vapoursynth as vs
 
 core = vs.core
 core.max_cache_size = 8
 clip = core.std.BlankClip(width=1920, height=1080, format=vs.YUV420PS, length=2)
-core.vsfeel.WNNM(clip, sigma=3, radius=1)
+core.vsfeel.WNNM(clip, **json.loads(sys.argv[1]))
 """
 
 
 @pytest.mark.parametrize(
-    ("vram_gib", "est"),
-    [(8, 1), (2, 0)],
-    ids=["allowance-covers-512", "floor-keeps-320"],
+    ("vram_gib", "params", "est"),
+    [
+        (8, {"sigma": 3, "radius": 1}, 1),
+        (2, {"sigma": 3, "radius": 1}, 0),
+        (1, {"sigma": [0, 3, 3], "radius": 1}, 0),
+    ],
+    ids=["allowance-covers-512", "small-allowance-drops-it", "no-floor-beyond-it"],
 )
-def test_estimate_cache_budget_follows_the_device_allowance(vram_gib, est):
-    """Three processed 1080p planes need ~404 MiB for the M cache.
+def test_estimate_cache_budget_follows_the_device_allowance(vram_gib, params, est):
+    """The M cache is planned from the core's allowance, with no fixed floor.
 
-    The old fixed 320 MiB target dropped it (-16.1%); the budget now allows up
-    to 512 MiB when the core's allowance covers it (limit/8), and keeps the old
-    target as the floor on a small device.
+    Three processed 1080p planes need ~404 MiB at a 32-slot ring, which a 512
+    MiB budget (an 8 GiB allowance) covers; dropping it there cost 16.1%. The
+    old 320 MiB floor outlived the allowance: at 1 GiB it planned 135.5 MiB of
+    chroma-only cache into a 128 MiB eighth. The ring is pinned so the estimate
+    size does not move with the core's thread count.
     """
     env = {
         **os.environ,
         "MANGOHUD": "0",
         "VSFEEL_WNNM_DEBUG": "1",
+        "VSFEEL_WNNM_RING": "32",
         "VSFEEL_LIMIT_VRAM_BUDGET": str(vram_gib << 30),
     }
     proc = subprocess.run(
-        [sys.executable, "-c", _EST_BUDGET_SCRIPT],
+        [sys.executable, "-c", _EST_BUDGET_SCRIPT, json.dumps(params)],
         capture_output=True,
         text=True,
         env=env,

@@ -249,8 +249,7 @@ create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
     const GpuWorkgroup workgroup {
         .x = static_cast<uint32_t>(BLK_X),
         .y = static_cast<uint32_t>(BLK_Y),
-        .shared_bytes =
-            weight_pass ? (rows * dist_wp + rows * BLK_X) * 4u : 0u
+        .shared_bytes = weight_pass ? (rows * dist_wp + rows * BLK_X) * 4u : 0u
     };
     const uint32_t subgroup_size =
         gpu.has_subgroup_size(32, workgroup.invocations()) ? 32 : 0;
