@@ -10,6 +10,12 @@
  * frame plane. All three hold native elements, so loads and stores are plain
  * coalesced accesses — no shift/mask unpacking, no dword packing, no atomics.
  *
+ * -DCLIP_BORDERS makes the tile optional: a group whose window leaves the
+ * plane reproduces the reference's *plain* window there (clipped, not clamped)
+ * by gathering from the src/ref bindings, so a plane whose tile fits may run
+ * this kernel even where vszipcl went plain. The predicate is group-uniform,
+ * so the barrier stays uniform and the border path is cold.
+ *
  * -DCOLS2 additionally gives each thread two adjacent output columns. Their
  * windows overlap in 2R of 2R+1 columns, so a row is read once for both
  * accumulations (2R+2 tile reads instead of 2*(2R+1)). The host pairs it with
@@ -103,6 +109,35 @@ void store_value(int idx, float v) {
 #endif
 }
 
+#if defined(CLIP_BORDERS)
+// One output pixel the way the reference's plain kernel computes it: the
+// window is clipped to the plane, not clamped, which is what makes a border
+// group here agree with a plane the reference filters plain.
+void gather_clipped(int ox, int oy, out float num, out float den) {
+    const float center = (HAS_REF == 1) ? load_ref(oy * STRIDE + ox)
+                                        : load_src(oy * STRIDE + ox);
+    num = 0.0f;
+    den = 0.0f;
+    for (int cy = max(oy - RADIUS, 0); cy <= min(oy + RADIUS, HEIGHT - 1); ++cy) {
+        for (int cx = max(ox - RADIUS, 0); cx <= min(ox + RADIUS, WIDTH - 1);
+             ++cx) {
+            float value = (HAS_REF == 1) ? load_ref(cy * STRIDE + cx)
+                                         : load_src(cy * STRIDE + cx);
+            const int space =
+                (oy - cy) * (oy - cy) + (ox - cx) * (ox - cx);
+            const float range = (value - center) * (value - center);
+            const float weight = exp2(float(space) * SIGMA_SPATIAL_SCALED +
+                                      range * SIGMA_COLOR_SCALED);
+            if (HAS_REF == 1) {
+                value = load_src(cy * STRIDE + cx);
+            }
+            num += weight * value;
+            den += weight;
+        }
+    }
+}
+#endif
+
 void main() {
     const int tx = int(gl_LocalInvocationID.x);
     const int ty = int(gl_LocalInvocationID.y);
@@ -118,25 +153,46 @@ void main() {
     const int gx0 = x - tx;
 #endif
     const int y = int(gl_GlobalInvocationID.y);
+    const int gy0 = y - ty;
+
+#if defined(CLIP_BORDERS)
+    // Group-uniform: every thread of a group takes the same side, so the
+    // barrier below stays uniform.
+#if defined(COLS2)
+    const int group_cols = 2 * int(gl_WorkGroupSize.x);
+#else
+    const int group_cols = int(gl_WorkGroupSize.x);
+#endif
+    const bool interior =
+        gx0 - RADIUS >= 0 && gx0 + group_cols - 1 + RADIUS < WIDTH &&
+        gy0 - RADIUS >= 0 &&
+        gy0 + int(gl_WorkGroupSize.y) - 1 + RADIUS < HEIGHT;
+#else
+    const bool interior = true;
+#endif
 
     // the guide tile sits above the source tile; with no guide the source tile
     // is what both the weight and the value read
     const int ref_offset = HAS_REF * TILE_Y * TILE_X;
 
-    // tile column 0 covers plane column gx0 - RADIUS
-    for (int cy = ty; cy < TILE_Y; cy += int(gl_WorkGroupSize.y)) {
-        const int sy = clamp(cy - ty - RADIUS + y, 0, HEIGHT - 1);
-        for (int cx = tx; cx < TILE_X; cx += int(gl_WorkGroupSize.x)) {
-            const int sx = clamp(gx0 - RADIUS + cx, 0, WIDTH - 1);
-            buf[cy * TILE_X + cx] = load_src(sy * STRIDE + sx);
-        }
-    }
-    if (HAS_REF == 1) {
+    // tile column 0 covers plane column gx0 - RADIUS; a clipped-border group
+    // that is not interior never reads the tile, so it does not load it.
+    if (interior) {
         for (int cy = ty; cy < TILE_Y; cy += int(gl_WorkGroupSize.y)) {
             const int sy = clamp(cy - ty - RADIUS + y, 0, HEIGHT - 1);
             for (int cx = tx; cx < TILE_X; cx += int(gl_WorkGroupSize.x)) {
                 const int sx = clamp(gx0 - RADIUS + cx, 0, WIDTH - 1);
-                buf[ref_offset + cy * TILE_X + cx] = load_ref(sy * STRIDE + sx);
+                buf[cy * TILE_X + cx] = load_src(sy * STRIDE + sx);
+            }
+        }
+        if (HAS_REF == 1) {
+            for (int cy = ty; cy < TILE_Y; cy += int(gl_WorkGroupSize.y)) {
+                const int sy = clamp(cy - ty - RADIUS + y, 0, HEIGHT - 1);
+                for (int cx = tx; cx < TILE_X; cx += int(gl_WorkGroupSize.x)) {
+                    const int sx = clamp(gx0 - RADIUS + cx, 0, WIDTH - 1);
+                    buf[ref_offset + cy * TILE_X + cx] =
+                        load_ref(sy * STRIDE + sx);
+                }
             }
         }
     }
@@ -145,6 +201,21 @@ void main() {
     if (x >= WIDTH || y >= HEIGHT) {
         return;
     }
+
+#if defined(CLIP_BORDERS)
+    if (!interior) {
+        float num = 0.0f, den = 0.0f;
+        gather_clipped(x, y, num, den);
+        store_value(y * STRIDE + x, num / den);
+#if defined(COLS2)
+        if (x + 1 < WIDTH) {
+            gather_clipped(x + 1, y, num, den);
+            store_value(y * STRIDE + x + 1, num / den);
+        }
+#endif
+        return;
+    }
+#endif
 
 #if defined(COLS2)
     const int cx0 = RADIUS + 2 * tx;

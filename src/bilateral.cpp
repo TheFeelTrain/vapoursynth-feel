@@ -45,6 +45,7 @@ struct BilateralPlaneConfig {
     int block_y {};
     int cols {}; // output columns per thread (2 for the two-column shared tile)
     bool shared {};
+    bool clip {}; // shared kernel that clips its window at the border
     VkPipeline pipeline {};
     uint32_t grid_x {};
     uint32_t grid_y {};
@@ -669,13 +670,14 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         int block_y;
         int cols;
         bool shared;
+        bool clip;
 
         bool operator==(const PipelineKey & other) const noexcept {
             return width == other.width && height == other.height &&
                    stride == other.stride && ss == other.ss && sc == other.sc &&
                    radius == other.radius && block_x == other.block_x &&
                    block_y == other.block_y && cols == other.cols &&
-                   shared == other.shared;
+                   shared == other.shared && clip == other.clip;
         }
     };
     std::array<PipelineKey, 3> pipeline_keys {};
@@ -776,7 +778,13 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         cfg.block_y = block_y;
         cfg.cols = 1;
         cfg.shared = false;
-        if (ref_shared) {
+        cfg.clip = false;
+        // A plane the reference filters plain still has an interior that matches
+        // our tile; only its border groups differ (it clips the window, we
+        // clamp). The clipped variant takes the reference's window there, so the
+        // tier follows our own LDS fit instead of the reference's budget.
+        if (use_shared_memory) {
+            cfg.clip = !ref_shared;
             const int x_floor =
                 block_x_default ? std::min(block_x, kMinSharedBlockX) : block_x;
             const int y_floor =
@@ -801,6 +809,7 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         key.block_y = cfg.block_y;
         key.cols = cfg.cols;
         key.shared = cfg.shared;
+        key.clip = cfg.clip;
 
         const int group_x = cfg.block_x * cfg.cols;
 
@@ -824,10 +833,42 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         cfg.grid_y = static_cast<uint32_t>(grid_y);
     }
 
+    if (vsfeel_device_info_enabled()) {
+        // The tier is chosen per plane from the tile fit and the reference's
+        // border mode, so it is invisible in the output unless a border pixel
+        // is read; the banner is what a test and a device probe pin it by.
+        for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
+            if (!pipeline_valid[plane]) {
+                continue;
+            }
+            const auto & cfg = planes[plane];
+            const int radius = pipeline_keys[plane].radius;
+            const char * tier = !cfg.shared ? "plain"
+                                : cfg.clip  ? "shared+clipped"
+                                            : "shared";
+            const size_t lds =
+                cfg.shared ? static_cast<size_t>(1 + has_ref) *
+                                 static_cast<size_t>(2 * radius +
+                                                     cfg.block_x * cfg.cols) *
+                                 static_cast<size_t>(2 * radius + cfg.block_y) *
+                                 sizeof(float)
+                           : 0;
+            fprintf(stderr,
+                    "[bilat] plane %d: %dx%d tier=%s block=%dx%d "
+                    "cols=%d lds=%zu B\n",
+                    plane, cfg.width, cfg.height, tier, cfg.block_x,
+                    cfg.block_y, cfg.cols, lds);
+        }
+    }
+
     const uint32_t * c2_code = nullptr;
     size_t c2_size = 0;
     const uint32_t * x1_code = nullptr;
     size_t x1_size = 0;
+    const uint32_t * clip_c2_code = nullptr;
+    size_t clip_c2_size = 0;
+    const uint32_t * clip_x1_code = nullptr;
+    size_t clip_x1_size = 0;
     const uint32_t * plain_code = nullptr;
     size_t plain_size = 0;
     switch (d->bits) {
@@ -837,6 +878,10 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
             c2_size = bilateral_shared_f16_spv_size;
             x1_code = bilateral_shared_f16_x1_spv;
             x1_size = bilateral_shared_f16_x1_spv_size;
+            clip_c2_code = bilateral_shared_f16_clip_spv;
+            clip_c2_size = bilateral_shared_f16_clip_spv_size;
+            clip_x1_code = bilateral_shared_f16_clip_x1_spv;
+            clip_x1_size = bilateral_shared_f16_clip_x1_spv_size;
             plain_code = bilateral_plain_f16_spv;
             plain_size = bilateral_plain_f16_spv_size;
         } else {
@@ -844,6 +889,10 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
             c2_size = bilateral_shared_u16_spv_size;
             x1_code = bilateral_shared_u16_x1_spv;
             x1_size = bilateral_shared_u16_x1_spv_size;
+            clip_c2_code = bilateral_shared_u16_clip_spv;
+            clip_c2_size = bilateral_shared_u16_clip_spv_size;
+            clip_x1_code = bilateral_shared_u16_clip_x1_spv;
+            clip_x1_size = bilateral_shared_u16_clip_x1_spv_size;
             plain_code = bilateral_plain_u16_spv;
             plain_size = bilateral_plain_u16_spv_size;
         }
@@ -853,6 +902,10 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         c2_size = bilateral_shared_f32_spv_size;
         x1_code = bilateral_shared_f32_x1_spv;
         x1_size = bilateral_shared_f32_x1_spv_size;
+        clip_c2_code = bilateral_shared_f32_clip_spv;
+        clip_c2_size = bilateral_shared_f32_clip_spv_size;
+        clip_x1_code = bilateral_shared_f32_clip_x1_spv;
+        clip_x1_size = bilateral_shared_f32_clip_x1_spv_size;
         plain_code = bilateral_plain_f32_spv;
         plain_size = bilateral_plain_f32_spv_size;
         break;
@@ -904,7 +957,10 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         const bool use_c2 = cfg.shared && cfg.cols == 2;
         const uint32_t * code = plain_code;
         size_t code_size = plain_size;
-        if (cfg.shared) {
+        if (cfg.shared && cfg.clip) {
+            code = use_c2 ? clip_c2_code : clip_x1_code;
+            code_size = use_c2 ? clip_c2_size : clip_x1_size;
+        } else if (cfg.shared) {
             code = use_c2 ? c2_code : x1_code;
             code_size = use_c2 ? c2_size : x1_size;
         }

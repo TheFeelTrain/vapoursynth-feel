@@ -527,19 +527,19 @@ def test_nlmeans_pack_is_capped_by_the_grid_z_limit():
 
 def test_bilateral_auto_lds_gate_falls_back_to_the_plain_kernel():
     """The automatic LDS gate must drop to the plain kernel when even the
-    one-column tile is over budget, exactly as an explicit
+    smallest shared tile is over budget, exactly as an explicit
     use_shared_memory=False does.
 
-    sigma_spatial=8 derives radius 24 with the auto-tuned 32x16 block: the
-    two-column tile is (2*24+2*32)*(2*24+16)*4 = 28672 B and the one-column
-    tile (2*24+32)*(2*24+16)*4 = 20480 B, so a forced 12288-byte limit admits
-    neither. Both runs below therefore use the plain kernel, and must agree
-    bit-for-bit.
+    sigma_spatial=8 derives radius 24. The auto 32x16 block gives a
+    (2*24+2*32)*(2*24+16)*4 = 28672 B two-column tile and a 20480 B one-column
+    one; the shape search's floor is 4x8, whose one-column tile is
+    (48+4)*(48+8)*4 = 11648 B. An 8192-byte limit admits none of them, so both
+    runs below use the plain kernel and must agree bit-for-bit.
     """
     params = {"sigma_spatial": 8.0, "sigma_color": 0.15}
     auto = _run_limits(
         [{"label": "auto", "filter": "bilateral", "params": params}],
-        {"VSFEEL_LIMIT_SHARED_MEMORY": "12288"},
+        {"VSFEEL_LIMIT_SHARED_MEMORY": "8192"},
     )
     plain = _run_limits(
         [
@@ -549,7 +549,7 @@ def test_bilateral_auto_lds_gate_falls_back_to_the_plain_kernel():
                 "params": {**params, "use_shared_memory": False},
             }
         ],
-        {"VSFEEL_LIMIT_SHARED_MEMORY": "12288"},
+        {"VSFEEL_LIMIT_SHARED_MEMORY": "8192"},
     )
     assert auto["auto"].get("finite") is True, auto["auto"]
     assert plain["plain"].get("finite") is True, plain["plain"]
@@ -595,25 +595,28 @@ def _bilateral_lds(env=None):
     return [int(m) for m in re.findall(r"pipeline bilateral .* lds=(\d+)", proc.stderr)]
 
 
-def test_bilateral_lds_gate_has_three_ordered_tiers():
-    """R=24 with the auto 32x16 block pins all three kernels.
+def test_bilateral_lds_gate_has_four_ordered_tiers():
+    """R=24 with the auto 32x16 block pins every tier the gate can select.
 
-    The two-column shared tile is 28672 B and the one-column one 20480 B, so a
-    limit between them must fall back to one column rather than all the way to
-    the ~4x slower plain kernel. At 12288 vszipcl's own 14336-byte tile no
-    longer fits its budget either, so the plain gather is required by the
-    reference's tier, not by our tile: the shared shape search stops at that
-    boundary. The banner's `lds=` is the only place the choice is observable,
-    and the two-column kernel is worth ~16% (measured), so a silent regression
-    to the fallback must fail here rather than only show up in the benchmark.
+    The two-column shared tile is 28672 B, the one-column one 20480 B, and the
+    shape search's 4x8 floor gives 11648 B, so limits between them walk the
+    tiers down instead of jumping to the ~4x slower plain kernel. Only a limit
+    under the floor reaches plain: the tier no longer depends on vszipcl's own
+    budget, since the clipped-border build serves the planes it filters plain.
+    The pipeline's `lds=` is where the choice is observable, and the two-column
+    kernel is worth ~16% (measured), so a silent regression to the fallback must
+    fail here rather than only show up in the benchmark.
     """
     assert _bilateral_lds() == [28672], "the two-column tile is not the default"
     assert _bilateral_lds({"VSFEEL_LIMIT_SHARED_MEMORY": "24576"}) == [20480], (
         "a limit over the one-column tile but under the two-column one must "
         "select the one-column shared kernel"
     )
-    assert _bilateral_lds({"VSFEEL_LIMIT_SHARED_MEMORY": "12288"}) == [0], (
-        "a budget that rejects the reference's own tile must select the plain kernel"
+    assert _bilateral_lds({"VSFEEL_LIMIT_SHARED_MEMORY": "12288"}) == [11648], (
+        "a limit under the auto shapes must halve the block to 4x8, not go plain"
+    )
+    assert _bilateral_lds({"VSFEEL_LIMIT_SHARED_MEMORY": "8192"}) == [0], (
+        "a budget under every shared tile must select the plain kernel"
     )
 
 

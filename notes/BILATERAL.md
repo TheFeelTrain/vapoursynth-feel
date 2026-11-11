@@ -13,11 +13,16 @@ Design (current):
   (`bilateral_shared_*_x1`) and `bilateral_plain.comp`. The two-column kernel
   runs two adjacent output columns per thread off one tile read per tap: their
   windows overlap in 2R of 2R+1 columns, so the LDS reads halve. It is worth
-  ~16% over the one-column shared kernel. A plane drops a tier when its tile
-  does not fit the device's LDS (28672 B vs 20480 B at R=24/32x16), and the
-  shared tier first searches the block shape down to 4x8: the plain gather
-  clips its window where the reference's shared kernel clamps, so it is only
-  correct when the reference is plain too.
+  ~16% over the one-column shared kernel. A plane only drops a tier when its
+  own tile does not fit the device's LDS (28672 B vs 20480 B at R=24/32x16),
+  and the shared tier first searches the block shape down to 4x8. The border
+  mode follows the reference rather than the tier: a plane vszipcl filters
+  shared runs the clamped kernel, and one it filters plain runs the
+  `-DCLIP_BORDERS` build, whose border groups gather the reference's clipped
+  window per pixel (the interiors already agree, and the predicate is
+  workgroup-uniform so the barrier stays uniform). That is worth 2.1x at
+  R=50-52, where the reference's budget had dragged every pixel onto the plain
+  gather. `use_shared_memory=0` still selects the plain kernel.
 - Three io variants — u16, f16, f32 — selected by the input format (half is
   `stFloat` + 16 bits). A half element is a storage width, not a precision: the
   f16 path runs the f32 tile and arithmetic, widens exactly on load and narrows
@@ -91,16 +96,16 @@ session noise, not a regression.
   (3 storage buffers via push descriptors, `VK_WHOLE_SIZE`), `vkCmdDispatch`,
   then `gpuExecReadsFrame`/`gpuExecWritesPlane`/`gpuExecSubmit`. No barrier is
   needed: the plane dispatches touch disjoint buffers.
-- The tier is per plane and follows the reference first: vszipcl filters a
-  plane with its shared kernel while `(1 + has_ref) * (2R + 8) * (2R + 16) * 4`
-  fits `min(48 KiB, maxComputeSharedMemorySize)`, and its shared kernel clamps
-  the window at the frame edge where the plain one clips it. While that holds,
-  vsfeel searches the defaulted block axes down from the auto shape for a
-  two-column then one-column tile within `maxComputeSharedMemorySize`, halving
-  `block_y` to 8 and `block_x` to 4; the two-column tile at 4x8 is strictly
-  smaller than the reference tile at every radius, so one always fits. When it
-  does not hold, the plane is plain, exactly like the reference.
-  `use_shared_memory=0` forces the last. `SHARED_FLOATS` is exactly what
+- The tier is per plane; the *border mode* follows the reference. vszipcl
+  filters a plane with its shared kernel while
+  `(1 + has_ref) * (2R + 8) * (2R + 16) * 4` fits
+  `min(48 KiB, maxComputeSharedMemorySize)`, and its shared kernel clamps the
+  window at the frame edge where the plain one clips it. vsfeel searches the
+  defaulted block axes down from the auto shape for a two-column then
+  one-column tile within `maxComputeSharedMemorySize` (halving `block_y` to 8,
+  `block_x` to 4) and takes `-DCLIP_BORDERS` when the reference is plain, so the
+  tiles are only abandoned when they do not fit this device. A plane is plain
+  when no shared shape fits or `use_shared_memory=0` forces it. `SHARED_FLOATS` is exactly what
   `buf[SHARED_FLOATS]` reserves (the output goes straight to `dst[]`), and the
   grid follows the chosen shape and column count.
 - The two-column kernel indexes the tile from the workgroup's first plane column
@@ -296,16 +301,14 @@ SDMA and the port reaches parity without any core change.
 
 ### Kernel findings that still ship
 
-- **Shared vs plain is worth ~3.2–3.8x, and the gate must follow vszipcl's
-  reference budget.** vszipcl picks its 16x8 tile when
-  `(2R+8)(2R+16)*4 < min(48 KiB, deviceLDS)`; vsfeel now uses the same
-  predicate, then requires one of its own shared tiles to fit, shrinking the
-  defaulted block axes to 4x8 if needed. On this 64 KiB
-  device R=49 is shared on both sides and R=50..52 is plain on both; before
-  the change vsfeel stayed shared through R=52 and the border pixels diverged
-  by 0.024 against vszipcl (measured on 64x64 f32). Every shared-kernel cell
-  in the radius × guide matrix still wins (1.00–2.65x); every plain-kernel
-  cell loses.
+- **Shared vs plain is worth ~3.2–3.8x, and the border mode is what the
+  reference's budget decides, not the tier.** vszipcl picks its 16x8 tile when
+  `(2R+8)(2R+16)*4 < min(48 KiB, deviceLDS)`; our tile still fits the device at
+  R=50-52, so those planes run the shared kernel and take the reference's
+  clipped window at border groups. Measured 50.3 against 23.9 fps at R=51
+  (2.1x, ABBA n=12) and unchanged at R=24 and R=3 (the reference is shared
+  there). Every shared-kernel cell in the radius × guide matrix still wins
+  (1.00–2.65x); every plain-kernel cell loses.
 - **The R=24 loss was LDS occupancy, not ACO VOPD packing.** Under the old
   48 KiB gate, reserving one whole tile instead of `(1 + has_ref)` doubled the
   LDS at every radius and pushed R∈[21,27] guide and R∈[28,43] no-guide over
@@ -371,6 +374,20 @@ SDMA and the port reaches parity without any core change.
 
 ### Do not retry
 
+- **Bank-conflict-free tile layouts.** The two-column kernel reads tile columns
+  `cx0 - RADIUS + k` with `cx0` advancing by two per lane, a stride-2 walk that
+  hits every bank twice, so interleaving the even and odd columns into two
+  halves (`TILE_AT`) should have made it stride-1. It measured **-6.3% at
+  R=9** and -5.1% at R=24 (ABBA n=12): the extra index arithmetic in both the
+  load and the read costs more than the conflicts, so the two-row pairing that
+  BIL-07 proposed (the same conflict-free goal, with a new tile) is not worth
+  building. An ablation that replaced the tile reads with constants gave 4.0x
+  at R=9, but that also folds the whole weight chain into immediates, so it
+  prices the tile *and* its dependent arithmetic, not the conflicts.
+- **Hoisting the spatial term out of the tap loop.** `(cy*cy + k2)*ss` cannot be
+  split by the compiler (it is not exact), and splitting it by hand measured
+  -1.3% at R=9 and +1.3% at R=24 while moving the output by 1.8e-7; the extra
+  add per tap offsets the saved I2F+FMUL. The current form stays.
 - **Pre-scaling the tile to fold the exponent to two ops.** Scaling the tile by
   `k = sqrt(-SIGMA_COLOR_SCALED)` at load time makes the exponent
   `fma(-d, d, lit)` (two ops instead of three) and measured **+6.8%** — but it

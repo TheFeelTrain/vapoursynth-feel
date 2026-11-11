@@ -20,6 +20,7 @@ reference crash cannot take the pytest process down with it.
 Run from the repository root:  tools/test.sh tests/test_bilateral.py -q
 """
 
+import json
 import os
 import re
 import subprocess
@@ -283,11 +284,12 @@ def test_bilateral_radius_sweep_matches_reference_f32(clip_grays, radius):
 
 @pytest.mark.parametrize("radius", [45, 49, 50, 52, 53])
 def test_bilateral_wide_radius_gate_matches_reference_f32(clip_grays, radius):
-    """The shared/plain gate must follow vszipcl's 48 KiB reference budget.
+    """The clipped-border tier must reproduce vszipcl's plain output exactly.
 
-    R=50..52 is the band where the device's 64 KiB LDS budget used to keep
-    the shared kernel while vszipcl had already dropped to the plain gather;
-    their border pixels differ, so this is a direct oracle for the gate.
+    R=50..52 is the band where vszipcl's own 16x8 tile stops fitting its 48 KiB
+    budget and it drops to the plain gather, which clips the window instead of
+    clamping it. Those planes run our shared kernel with `-DCLIP_BORDERS`, so
+    every border pixel this compares is the clipped path's output.
     """
     worst = _compare(
         "grays",
@@ -295,6 +297,73 @@ def test_bilateral_wide_radius_gate_matches_reference_f32(clip_grays, radius):
         dict(sigma_spatial=2.0, sigma_color=0.05, radius=radius),
     )
     assert worst < REF_TOL, f"max diff {worst}"
+
+
+_TIER_BANNER_SCRIPT = r"""
+import json
+import sys
+
+import vapoursynth as vs
+
+spec = json.loads(sys.argv[1])
+core = vs.core
+clip = core.std.BlankClip(width=1920, height=1080, format=vs.GRAY16, length=1)
+core.vsfeel.Bilateral(clip, **spec)
+"""
+
+
+def _tier_banner(**kwargs):
+    """(tier, block_x, block_y, cols, lds) from the creation banner."""
+    env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1"}
+    proc = subprocess.run(
+        [sys.executable, "-c", _TIER_BANNER_SCRIPT, json.dumps(kwargs)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    plan = re.search(
+        r"\[bilat\] plane 0: \d+x\d+ tier=(\S+) block=(\d+)x(\d+) "
+        r"cols=(\d+) lds=(\d+) B",
+        proc.stderr,
+    )
+    assert plan, proc.stderr[-2000:]
+    return (
+        plan.group(1),
+        int(plan.group(2)),
+        int(plan.group(3)),
+        int(plan.group(4)),
+        int(plan.group(5)),
+    )
+
+
+def test_bilateral_tier_pinned():
+    """The tier follows the tile fit and the reference's border mode, not its budget.
+
+    R=51 is the band where vszipcl's own 16x8 tile stops fitting its 48 KiB
+    budget and it drops to the plain gather. Our one-column tile still fits this
+    device, so the plane keeps the shared kernel and takes the reference's
+    *clipped* window at border groups instead of its clamped one. R=9 is inside
+    the reference's shared range, where both sides clamp (and the two-column tile
+    fits). `use_shared_memory=0` still selects the plain kernel.
+    """
+    assert _tier_banner(sigma_spatial=17.0, sigma_color=0.15) == (
+        "shared+clipped",
+        32,
+        16,
+        1,
+        63248,
+    )
+    assert _tier_banner(sigma_spatial=3.0, sigma_color=0.02) == (
+        "shared",
+        32,
+        8,
+        2,
+        8528,
+    )
+    tier, _, _, _, lds = _tier_banner(sigma_spatial=17.0, sigma_color=0.15, use_shared_memory=0)
+    assert tier == "plain" and lds == 0, (tier, lds)
 
 
 @pytest.mark.parametrize("use_shared_memory", [True, False], ids=["shared", "plain"])

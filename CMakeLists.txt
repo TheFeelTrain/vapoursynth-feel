@@ -201,6 +201,11 @@ foreach(io IN LISTS VK_BILATERAL_IO_TYPES)
     list(APPEND VK_BILATERAL_VARIANTS
         "bilateral_shared_${io}|bilateral_shared.comp|-DIO_${io_define} -DCOLS2"
         "bilateral_shared_${io}_x1|bilateral_shared.comp|-DIO_${io_define}"
+        # The clipped-border pair: the same tiles, but a group whose window
+        # leaves the plane gathers the reference's clipped window instead, so a
+        # plane the reference filters plain can still run this kernel.
+        "bilateral_shared_${io}_clip|bilateral_shared.comp|-DIO_${io_define} -DCOLS2 -DCLIP_BORDERS"
+        "bilateral_shared_${io}_clip_x1|bilateral_shared.comp|-DIO_${io_define} -DCLIP_BORDERS"
         "bilateral_plain_${io}|bilateral_plain.comp|-DIO_${io_define}")
 endforeach()
 
