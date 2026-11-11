@@ -112,6 +112,17 @@ copies this filter removes.
 
 ## Historical
 
+- **2026-11-10 — the workgroup shape was swept: 64x4 ships, 32x8 is noise.** Both
+  passes were 16x8, so a warp spanned two output rows and only half a 64-byte
+  sector per u16 row. A same-session A/B with a shape knob (ABBA, n=12, 3 s,
+  medians) puts **64x4** at +2.1% (1080p->540p u16), +1.3% (4K->1080p u16) and
+  +1.9% (4K->1080p f32), and flat at 1080p->540p f32 (-0.1%); **32x8** is noise
+  across the same four cases (+1.1%, -0.4%, +0.6%, +0.0%). Device's shape is now
+  chosen at creation: 64x4 when `maxComputeWorkGroupInvocations >= 256` and a
+  64-wide workgroup, else 16x8 (the 128-invocation floor shape). The pixels do
+  not move: the local size is the only difference, and a sha1 comparison across
+  the shapes is in `tests/test_device_limits.py`.
+
 - **2026-10-12 — the Merge composition.** The first version reproduced resize2's
   rounded 2x2 mean from shipped filters only: `std.Merge(0.5)` of a plane and a
   one-pixel-shifted `Point` copy, bit-exact on u16 and within 1e-6 on f32, with
@@ -140,8 +151,9 @@ copies this filter removes.
 - `width == src.width` and `height == src.height` still runs the horizontal
   dispatch; `skip_vert` drops only the vertical pass (`src/box.cpp:579`). A
   no-op path could copy instead; it is not on any current route.
-- The workgroup shape (16x8) is inherited, not swept. With one load per tap and
-  no LDS the shape looks unlikely to be the lever, but that is unmeasured.
+- The workgroup shape is now measured (64x4 where the device allows 256
+  invocations, else 16x8): see Historical. The remaining shape question is
+  whether a ratio-dependent width beats both, which nothing points at.
 - Do not re-introduce the Merge composition "because it needs no new filter": it
   is bit-exact and ~8 fps slower on the chain that uses this one.
 - Do not chase the f16 half-step residue at ratios 3/2.5/3.5/5 with a host
@@ -150,4 +162,6 @@ copies this filter removes.
 
 ## Debug env vars
 
-None. The filter has no probe, opt-out or tunable.
+- `VSFEEL_BOX_BLK_X=16|64` — forces the workgroup width (`64` is 64x4, `16` is
+  16x8); creation refuses a shape the device cannot launch. `VSFEEL_DEBUG=1`
+  prints the chosen one as `[box] shape=`.

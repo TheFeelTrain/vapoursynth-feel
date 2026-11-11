@@ -91,6 +91,10 @@ def build(name, params):
         return core.vsfeel.WNNM(clip, sigma=3.0, radius=0, **params)
     if name == "box":
         return core.vsfeel.Box(clip)
+    if name == "box_down":
+        # A real two-pass downscale (the shared clip is 640x360): the shape test
+        # needs both kernels.
+        return core.vsfeel.Box(clip, width=320, height=180)
     raise SystemExit("unknown filter %r" % name)
 
 
@@ -737,6 +741,55 @@ def test_dfttest_scratch_range_is_a_creation_error():
     err = res["dfttest"].get("error", "")
     assert "padded window" in err and "maxStorageBufferRange" in err, res["dfttest"]
     assert str(1 << 20) in err, res["dfttest"]
+
+
+_BOX_SHAPE_SCRIPT = r"""
+import vapoursynth as vs
+
+core = vs.core
+clip = core.std.BlankClip(width=1920, height=1080, format=vs.GRAY16, length=2)
+core.vsfeel.Box(clip, width=960, height=540)
+"""
+
+
+def _box_shape(env=None):
+    """(returncode, stderr) of a Box creation with the banner on."""
+    run_env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1", **(env or {})}
+    proc = subprocess.run(
+        [sys.executable, "-c", _BOX_SHAPE_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=run_env,
+        timeout=300,
+    )
+    return proc.returncode, proc.stderr
+
+
+def test_box_shape_follows_the_device():
+    """Box runs 64x4 where the device allows it and 16x8 where it cannot.
+
+    The shape is a measured choice: 64x4 is +1-2% over 16x8 at 1080p->540p and
+    4K->1080p, and 32x8 was measured flat. 16x8 is the shape the
+    128-invocation floor allows, so the fallback keeps a small device running
+    instead of failing creation. Invisible in the pixels, so the banner names
+    the choice and the sha1 below pins that it changes nothing.
+    """
+    code, stderr = _box_shape()
+    assert code == 0 and "shape=64x4" in stderr, stderr[-2000:]
+
+    low = {"VSFEEL_LIMIT_INVOCATIONS": "128"}
+    code, stderr = _box_shape(low)
+    assert code == 0 and "shape=16x8" in stderr, stderr[-2000:]
+
+    # Forcing the wide shape on a 128-invocation device is refused by name.
+    code, stderr = _box_shape({"VSFEEL_BOX_BLK_X": "64", **low})
+    assert code != 0 and "cannot launch a 64x4 workgroup" in stderr, stderr[-2000:]
+
+    case = [{"label": "box", "filter": "box_down"}]
+    wide = _run_limits(case)
+    narrow = _run_limits(case, {"VSFEEL_BOX_BLK_X": "16"})
+    assert wide["box"].get("finite") is True, wide["box"]
+    assert wide["box"]["sha1"] == narrow["box"]["sha1"], "the shape changed pixels"
 
 
 def test_nnedi3_scratch_range_is_a_creation_error():

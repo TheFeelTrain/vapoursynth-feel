@@ -292,7 +292,8 @@ foreach(io IN LISTS VK_BOX_IO_TYPES)
         list(GET VK_BOX_ENTRIES ${entry_i} entry)
         list(GET VK_BOX_ENTRY_DEFS ${entry_i} entry_def)
         list(APPEND VK_BOX_VARIANTS
-            "box_${io}_${entry}|box.comp|-DIO_${io_define} ${entry_def}")
+            "box_${io}_${entry}|box.comp|-DIO_${io_define} ${entry_def} -DBLK_X=16 -DBLK_Y=8"
+            "box_${io}_${entry}_w64|box.comp|-DIO_${io_define} ${entry_def} -DBLK_X=64 -DBLK_Y=4")
     endforeach()
 endforeach()
 

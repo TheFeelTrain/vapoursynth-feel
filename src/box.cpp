@@ -30,8 +30,12 @@ using namespace std::string_literals;
 // it) with the scratch in the frame's own sample type, because that rounding
 // is what makes the result match resize2.
 
-constexpr int BLK_X = 16;
-constexpr int BLK_Y = 8;
+// The workgroup shape is chosen at creation (see BoxCreate): 64x4 where the
+// device allows 256 invocations and a 64-wide workgroup, else 16x8, the Vulkan
+// 128-invocation floor shape. Both are compiled variants; 32x8 was measured and
+// is noise, 64x4 is +1-2%.
+constexpr int kBlkXFallback = 16;
+constexpr int kBlkXFull = 64;
 
 // (first source tap, tap count) for one output position. See the shader header
 // and notes/BOX.md for why this is a table and not a formula.
@@ -55,6 +59,8 @@ struct BoxData {
     VSVideoInfo out_vi {};     // output geometry (same format)
 
     int bits {}, elem_bytes {};
+    int blk_x { kBlkXFallback }; // chosen workgroup shape, see BoxCreate
+    int blk_y { 8 };
     bool half {}; // stFloat + 16 bits: a 2-byte element whose sample is a float
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
@@ -189,9 +195,11 @@ static constexpr std::array<VkSpecializationMapEntry, 5> spec_entries { {
 static std::variant<VkPipeline, std::string>
 create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
                 const uint32_t * code, size_t code_size,
-                const BoxSpecData & spec) {
+                const BoxSpecData & spec, int blk_x, int blk_y) {
 
-    const GpuWorkgroup workgroup { .x = BLK_X, .y = BLK_Y, .shared_bytes = 0 };
+    const GpuWorkgroup workgroup { .x = static_cast<uint32_t>(blk_x),
+                                   .y = static_cast<uint32_t>(blk_y),
+                                   .shared_bytes = 0 };
     return gpu_create_pipeline(gpu, code, code_size, layout,
                                spec_entries.data(), &spec,
                                static_cast<uint32_t>(spec_entries.size()),
@@ -522,25 +530,92 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         store_fence();
     }
 
+    // Workgroup shape. One output row per warp keeps the vertical pass' tap
+    // count from diverging across a warp, and a 64-wide row is one full sector
+    // per warp; 16x8 is the shape the 128-invocation floor allows.
+    // VSFEEL_BOX_BLK_X forces one for a sweep and refuses a width the device
+    // cannot launch rather than failing in gpu_create_pipeline.
+    const auto shape_ok = [&](int x, int y) {
+        return d->gpu->limits.maxComputeWorkGroupSize[0] >=
+                   static_cast<uint32_t>(x) &&
+               d->gpu->limits.maxComputeWorkGroupSize[1] >=
+                   static_cast<uint32_t>(y) &&
+               d->gpu->limits.maxComputeWorkGroupInvocations >=
+                   static_cast<uint32_t>(x * y);
+    };
+    int blk_x = shape_ok(kBlkXFull, 4) ? kBlkXFull : kBlkXFallback;
+    if (const int forced = env_int("VSFEEL_BOX_BLK_X", 0); forced != 0) {
+        if (forced != kBlkXFallback && forced != kBlkXFull) {
+            return set_error("\"VSFEEL_BOX_BLK_X\" must be 16 or 64.");
+        }
+        const int forced_y = forced == kBlkXFull ? 4 : 8;
+        if (!shape_ok(forced, forced_y)) {
+            return set_error(
+                "this device cannot launch a " + std::to_string(forced) + "x" +
+                std::to_string(forced_y) + " workgroup (" +
+                std::to_string(d->gpu->limits.maxComputeWorkGroupInvocations) +
+                " invocations, " +
+                std::to_string(d->gpu->limits.maxComputeWorkGroupSize[0]) +
+                "x" +
+                std::to_string(d->gpu->limits.maxComputeWorkGroupSize[1]) +
+                " workgroup); \"VSFEEL_BOX_BLK_X\" must be 16 here.");
+        }
+        blk_x = forced;
+    }
+    d->blk_x = blk_x;
+    d->blk_y = blk_x == kBlkXFull ? 4 : 8;
+    if (vsfeel_device_info_enabled()) {
+        // The shape is invisible in the pixels, so the banner is where a test
+        // (and a device probe) pins it.
+        fprintf(stderr, "[box] shape=%dx%d\n", d->blk_x, d->blk_y);
+    }
+
     const uint32_t * vert_code = nullptr;
     size_t vert_size = 0;
     const uint32_t * horiz_code = nullptr;
     size_t horiz_size = 0;
+    // Plain assignments rather than ternaries: the shader-limits gate resolves
+    // a module from the symbols assigned to the variable a helper call passes,
+    // and it cannot follow a ternary. The workgroup's x stays "dependent" there
+    // (it is a runtime choice, like the other filters' block sizes), while y and
+    // the LDS bound are still compared.
+    const bool full = d->blk_x == kBlkXFull;
     if (d->half) {
-        vert_code = box_f16_vert_spv;
-        vert_size = box_f16_vert_spv_size;
-        horiz_code = box_f16_horiz_spv;
-        horiz_size = box_f16_horiz_spv_size;
+        if (full) {
+            vert_code = box_f16_vert_w64_spv;
+            vert_size = box_f16_vert_w64_spv_size;
+            horiz_code = box_f16_horiz_w64_spv;
+            horiz_size = box_f16_horiz_w64_spv_size;
+        } else {
+            vert_code = box_f16_vert_spv;
+            vert_size = box_f16_vert_spv_size;
+            horiz_code = box_f16_horiz_spv;
+            horiz_size = box_f16_horiz_spv_size;
+        }
     } else if (d->bits == 16) {
-        vert_code = box_u16_vert_spv;
-        vert_size = box_u16_vert_spv_size;
-        horiz_code = box_u16_horiz_spv;
-        horiz_size = box_u16_horiz_spv_size;
+        if (full) {
+            vert_code = box_u16_vert_w64_spv;
+            vert_size = box_u16_vert_w64_spv_size;
+            horiz_code = box_u16_horiz_w64_spv;
+            horiz_size = box_u16_horiz_w64_spv_size;
+        } else {
+            vert_code = box_u16_vert_spv;
+            vert_size = box_u16_vert_spv_size;
+            horiz_code = box_u16_horiz_spv;
+            horiz_size = box_u16_horiz_spv_size;
+        }
     } else {
-        vert_code = box_f32_vert_spv;
-        vert_size = box_f32_vert_spv_size;
-        horiz_code = box_f32_horiz_spv;
-        horiz_size = box_f32_horiz_spv_size;
+        if (full) {
+            vert_code = box_f32_vert_w64_spv;
+            vert_size = box_f32_vert_w64_spv_size;
+            horiz_code = box_f32_horiz_w64_spv;
+            horiz_size = box_f32_horiz_w64_spv_size;
+        } else {
+            vert_code = box_f32_vert_spv;
+            vert_size = box_f32_vert_spv_size;
+            horiz_code = box_f32_horiz_spv;
+            horiz_size = box_f32_horiz_spv_size;
+        }
     }
 
     const uint32_t max_grid_x = d->gpu->limits.maxComputeWorkGroupCount[0];
@@ -602,10 +677,10 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         // 64-bit: a width/height near INT32_MAX would otherwise overflow the
         // additions before the quotient widens, and a wrapped grid could pass
         // the `over` test and be dispatched.
-        const int64_t v_x = (plane_src_w + BLK_X - 1) / BLK_X;
-        const int64_t v_y = (plane_dst_h + BLK_Y - 1) / BLK_Y;
-        const int64_t h_x = (plane_dst_w + BLK_X - 1) / BLK_X;
-        const int64_t h_y = (plane_dst_h + BLK_Y - 1) / BLK_Y;
+        const int64_t v_x = (plane_src_w + d->blk_x - 1) / d->blk_x;
+        const int64_t v_y = (plane_dst_h + d->blk_y - 1) / d->blk_y;
+        const int64_t h_x = (plane_dst_w + d->blk_x - 1) / d->blk_x;
+        const int64_t h_y = (plane_dst_h + d->blk_y - 1) / d->blk_y;
         // A 2D grid cannot fold an over-wide plane into Y: refuse it instead
         // of dispatching a clamped grid that leaves pixels unwritten.
         const auto over = [&](int64_t gx, int64_t gy,
@@ -639,16 +714,18 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
                                  .dst_stride = cfg.dst_stride };
 
         if (!cfg.skip_vert) {
-            const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                                                vert_code, vert_size, spec);
+            const auto result =
+                create_pipeline(*d->gpu, d->pipeline_layout, vert_code,
+                                vert_size, spec, d->blk_x, d->blk_y);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
             cfg.v_pipeline = std::get<VkPipeline>(result);
         }
         {
-            const auto result = create_pipeline(*d->gpu, d->pipeline_layout,
-                                                horiz_code, horiz_size, spec);
+            const auto result =
+                create_pipeline(*d->gpu, d->pipeline_layout, horiz_code,
+                                horiz_size, spec, d->blk_x, d->blk_y);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
