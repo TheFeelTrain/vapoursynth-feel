@@ -704,8 +704,8 @@ constexpr GpuWorkgroup kPlaneWorkgroup { .x = 32, .y = 8 };
 static std::variant<VkPipeline, std::string>
 create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
                 const uint32_t * code, size_t code_size, GpuWorkgroup workgroup,
-                int32_t filter_type = -1, int32_t zmean = -1,
-                bool no_subgroups = false) {
+                int32_t block_step, int32_t filter_type = -1,
+                int32_t zmean = -1, bool no_subgroups = false) {
 
     // The probe knobs win over the default selection below on purpose: they
     // exist so a run can force a subgroup size, or deliberately request one the
@@ -737,10 +737,21 @@ create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
     }
 
     // Build the spec-constant map from an explicit (id, value) list so the
-    // offset always matches the slot the value is stored in.
-    VkSpecializationMapEntry spec_entries[2] {};
-    int32_t spec_values[2] {};
+    // offset always matches the slot the value is stored in. BLOCK_STEP goes to
+    // col2im only: that kernel divides by it four times per output pixel, while
+    // pad and fused use it once per invocation and compiled better with the
+    // runtime value (block_step 4 lost 3.7% when all three were specialized).
+    VkSpecializationMapEntry spec_entries[3] {};
+    int32_t spec_values[3] {};
     uint32_t n_spec = 0;
+    if (block_step > 0) {
+        spec_entries[n_spec] = { .constantID = 3,
+                                 .offset = static_cast<uint32_t>(
+                                     n_spec * sizeof(int32_t)),
+                                 .size = sizeof(int32_t) };
+        spec_values[n_spec] = block_step;
+        ++n_spec;
+    }
     if (filter_type >= 0) {
         spec_entries[n_spec] = { .constantID = 1,
                                  .offset = static_cast<uint32_t>(
@@ -1081,8 +1092,12 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
                     cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->probe.query,
                     3);
             }
-            // the next stripe's fused overwrites the ring slots this col2im read
-            gpu_barrier(*d->gpu, cmd);
+            // The next stripe's fused overwrites the ring slots this col2im
+            // read; the last stripe has no next writer, and the next plane's pad
+            // writes a buffer it re-acquires, so nothing needs ordering.
+            if (row_end < cfg.vn) {
+                gpu_barrier(*d->gpu, cmd);
+            }
         }
     }
     if (gputrace) {
@@ -1844,6 +1859,8 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         size_t pad_size[4] {};
         const uint32_t * col2im_code = nullptr;
         size_t col2im_size = 0;
+        const uint32_t * col2im_cbs_code = nullptr;
+        size_t col2im_cbs_size = 0;
         const uint32_t * fused_code[4] {};
         size_t fused_size[4] {};
         // Selects the half blobs, which `bits` alone cannot: f16 is 16 bits too.
@@ -1859,6 +1876,8 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             pad_size[3] = dfttest_u16_pad_r3_spv_size;
             col2im_code = dfttest_u16_col2im_spv;
             col2im_size = dfttest_u16_col2im_spv_size;
+            col2im_cbs_code = dfttest_u16_col2im_cbs_spv;
+            col2im_cbs_size = dfttest_u16_col2im_cbs_spv_size;
             fused_code[0] = dfttest_u16_fused_r0_spv;
             fused_size[0] = dfttest_u16_fused_r0_spv_size;
             fused_code[1] = dfttest_u16_fused_r1_spv;
@@ -1879,6 +1898,8 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             pad_size[3] = dfttest_f32_pad_r3_spv_size;
             col2im_code = dfttest_f32_col2im_spv;
             col2im_size = dfttest_f32_col2im_spv_size;
+            col2im_cbs_code = dfttest_f32_col2im_cbs_spv;
+            col2im_cbs_size = dfttest_f32_col2im_cbs_spv_size;
             fused_code[0] = dfttest_f32_fused_r0_spv;
             fused_size[0] = dfttest_f32_fused_r0_spv_size;
             fused_code[1] = dfttest_f32_fused_r1_spv;
@@ -1899,6 +1920,8 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             pad_size[3] = dfttest_f16_pad_r3_spv_size;
             col2im_code = dfttest_f16_col2im_spv;
             col2im_size = dfttest_f16_col2im_spv_size;
+            col2im_cbs_code = dfttest_f16_col2im_cbs_spv;
+            col2im_cbs_size = dfttest_f16_col2im_cbs_spv_size;
             fused_code[0] = dfttest_f16_fused_r0_spv;
             fused_size[0] = dfttest_f16_fused_r0_spv_size;
             fused_code[1] = dfttest_f16_fused_r1_spv;
@@ -1918,10 +1941,9 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         // variant able to reject a valid instance.
         const int radius = d->radius;
         {
-            const auto result =
-                create_pipeline(*d->gpu, d->pipeline_layout, pad_code[radius],
-                                pad_size[radius], kPlaneWorkgroup, -1, -1,
-                                /*no_subgroups=*/true);
+            const auto result = create_pipeline(
+                *d->gpu, d->pipeline_layout, pad_code[radius], pad_size[radius],
+                kPlaneWorkgroup, -1, -1, -1, /*no_subgroups=*/true);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }
@@ -1930,7 +1952,7 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         {
             const auto result =
                 create_pipeline(*d->gpu, d->pipeline_layout, fused_code[radius],
-                                fused_size[radius], kFusedWorkgroup,
+                                fused_size[radius], kFusedWorkgroup, -1,
                                 filter_type, d->zmean ? 1 : 0);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
@@ -1938,10 +1960,20 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
             d->fused_pipeline = std::get<VkPipeline>(result);
         }
         {
-            const auto result =
-                create_pipeline(*d->gpu, d->pipeline_layout, col2im_code,
-                                col2im_size, kPlaneWorkgroup, -1, -1,
-                                /*no_subgroups=*/true);
+            // The constant-step col2im is 6-13% faster at block_step 8..16 and
+            // 3.5% slower at 4, where the ring traffic dominates instead, so it
+            // is selected rather than always used (the default sosize=12 is 4).
+            const bool const_step = d->block_step >= 8;
+            const uint32_t * col2_code = col2im_code;
+            size_t col2_size = col2im_size;
+            if (const_step) {
+                col2_code = col2im_cbs_code;
+                col2_size = col2im_cbs_size;
+            }
+            const auto result = create_pipeline(
+                *d->gpu, d->pipeline_layout, col2_code, col2_size,
+                kPlaneWorkgroup, const_step ? d->block_step : -1, -1, -1,
+                /*no_subgroups=*/true);
             if (std::holds_alternative<std::string>(result)) {
                 return set_error(std::get<std::string>(result));
             }

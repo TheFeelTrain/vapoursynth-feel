@@ -317,7 +317,11 @@ set(VK_DFT_VARIANTS)
 foreach(io IN LISTS VK_DFT_IO_TYPES)
     string(TOUPPER "${io}" io_define)
     list(APPEND VK_DFT_VARIANTS
-        "dfttest_${io}_col2im|dfttest.comp|-DIO_${io_define} -DENTRY_COL2IM")
+        "dfttest_${io}_col2im|dfttest.comp|-DIO_${io_define} -DENTRY_COL2IM"
+        # The specialized col2im: BLOCK_STEP as a constant instead of the push
+        # value. Measured 6-13% at block_step 8..16 and a 3.5% loss at 4, so the
+        # host picks this one only when the step is 8 or more.
+        "dfttest_${io}_col2im_cbs|dfttest.comp|-DIO_${io_define} -DENTRY_COL2IM -DBLOCK_STEP_CONST")
     foreach(radius RANGE 0 3)
         list(APPEND VK_DFT_VARIANTS
             "dfttest_${io}_pad_r${radius}|dfttest.comp|-DIO_${io_define} -DENTRY_PAD -DRADIUS=${radius}"

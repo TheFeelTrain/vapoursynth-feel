@@ -57,7 +57,8 @@ IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
 - One recording per output frame, per processed plane: `pad` (one dispatch,
   every temporal slice, reading the tw source frame planes through a descriptor
   array) → barrier → per stripe of block rows `fused` → barrier → `col2im`
-  (straight into the output frame plane) → barrier. Then `gpuExecReadsFrame`
+  (straight into the output frame plane) → barrier, except after the last
+  stripe, which has no next writer. Then `gpuExecReadsFrame`
   per distinct source, `gpuExecWritesPlane` per processed plane,
   `gpuExecSubmit`.
 - Per-frame scratch is two `createGPUBuffer` allocations per plane — the padded
@@ -91,8 +92,9 @@ IO depth, jpbd 1080p, 3000 frames, medians of 3, one session
   `VSFEEL_DFTTEST_L2_TARGET=<bytes>` overrides it, clamped by the range.
 - Per stripe: `fused` writes rows `[row_base, row_end)`, `col2im` emits the
   output rows whose block support is complete (padded `y < row_end*block_step`)
-  and the rows left over by the previous stripe are still in the ring, then the
-  trailing barrier protects the slots the next `fused` overwrites.
+  and the rows left over by the previous stripe are still in the ring, then a
+  trailing barrier protects the slots the next `fused` overwrites (the last
+  stripe emits none).
   `spatial_rows = min(ring, vn)`; when `vn >= ring` this is exactly
   `stripe_rows + lookback`, while a frame smaller than one stripe does not
   satisfy the identity and is handled as a single stripe. The last stripe
@@ -233,6 +235,20 @@ force-pad / fail-pad probes.
   and pointer-walk strength reduction; col2im already runs ~2x the references.
 
 ## Historical
+
+- **2026-11-10 — col2im's divides are gone where they pay, and the last stripe
+  lost its barrier.** `BLOCK_STEP` is a specialization constant (`constant_id`
+  3, the reference bakes it in with `#define`), so col2im's four divides per
+  output pixel become shifts. Specializing it *everywhere* cost 3.5% at
+  block_step 4 (the ring traffic dominates there), so the filter now compiles
+  col2im twice and picks the constant build only at block_step 8..16, where it
+  measures +5.9% (8), +7.3% (9), +7.4% (11), +9.2% (13), +8.9% (15) and +13.0%
+  (16); block_step 4 stays neutral (−0.2%) because it keeps the runtime build.
+  `pad` and `fused` keep the push value too (they divide once per invocation,
+  and specializing them measured inside that same loss). The trailing barrier
+  after col2im is now conditional on there being another stripe: +2.45% (1080p
+  u16, n=20) and +2.6% (f32), flat at 4K. Both measured against the previous
+  binary, ABBA, medians of the full window.
 
 - **2026-11-07 - the stripe ring's budget is sized from the part's cache.** The
   64 MiB constant was the 7900 XTX (96 MiB Infinity Cache) decision with no
