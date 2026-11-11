@@ -12,6 +12,7 @@ Run from the repository root:  tools/test.sh tests/test_box.py -q
 # before the imports it guards.
 # ruff: noqa: E402
 
+import ctypes
 import os
 import subprocess
 import sys
@@ -232,6 +233,64 @@ def test_agrees_with_resize2_color(request, fmt, ratio):
         _, rel_d = _worst_f32(clip, w, h, planes)
         bound = RATIO_REL[ratio]
         assert rel_d <= bound, f"{ratio}: rel={rel_d} > {bound}"
+
+
+# zimg's WORD path multiplies by 14-bit integer coefficients whose row sum is
+# exactly 16384 and rounds with (acc + 8192) >> 14, while this filter computes
+# the exact equal-weight mean in f32. The two part wherever 1/count does not fit
+# an integer coefficient, and by how much depends on the content: the 640x360
+# fixture (real, band-limited) never moves more than 2 codes, while a full-range
+# pseudo-random plane reaches these bounds (measured at 192x64).
+HIGH_CONTRAST_BOUNDS = {2: 0, 3: 2, 2.5: 2, 5: 2, 6: 3, 7: 4}
+
+
+def _pseudo_random_gray16(width=192, height=64):
+    """A deterministic full-range 16-bit plane: 8830 distinct values."""
+    rows = (
+        (
+            np.add.outer(
+                np.arange(height, dtype=np.uint64) * 2654435761,
+                np.arange(width, dtype=np.uint64) * 40503,
+            )
+            + 12345
+        )
+        >> 7
+    ) & 0xFFFF
+    rows = rows.astype(np.uint16)
+    blank = vs.core.std.BlankClip(width=width, height=height, format=vs.GRAY16, color=0)
+
+    def fill(n, f):
+        out = f.copy()
+        stride = out.get_stride(0)
+        buf = np.ctypeslib.as_array(
+            ctypes.cast(out.get_write_ptr(0), ctypes.POINTER(ctypes.c_uint8)),
+            shape=(height, stride),
+        )
+        buf[:, : width * 2] = rows.view(np.uint8).reshape(height, width * 2)
+        return out
+
+    return blank.std.ModifyFrame(blank, fill)
+
+
+@pytest.mark.parametrize("ratio", sorted(HIGH_CONTRAST_BOUNDS))
+def test_u16_residual_is_the_reference_coefficient_quantization(ratio):
+    """On adversarial content the u16 residual is the reference's coefficients.
+
+    resize2 rounds each output from a 14-bit integer weighted sum, this filter
+    from the exact f32 mean, so the two differ by a few codes wherever the tap
+    count's reciprocal is not an integer coefficient, and by nothing at all where
+    it is (the power-of-two ratios). The number is content-dependent: the
+    fixture's real content stays within 2 codes, a full-range plane reaches the
+    bounds below. Pinned so the residual is a known quantity rather than a
+    tolerance nobody re-measures, and so a switch to an integer coefficient path
+    has to update it deliberately.
+    """
+    clip = _pseudo_random_gray16()
+    width, height = _target(clip, ratio)
+    ref = _px(_ref(clip, width, height), 0)
+    out = _px(_box(clip, width, height), 0)
+    worst = float(np.abs(ref.astype(np.int64) - out.astype(np.int64)).max())
+    assert worst <= HIGH_CONTRAST_BOUNDS[ratio], f"{ratio}: max|d|={worst}"
 
 
 def test_chroma_planes_are_scaled(clip_yuv420p16):

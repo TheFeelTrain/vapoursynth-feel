@@ -50,7 +50,12 @@ struct BoxPlaneConfig {
     VkPipeline v_pipeline {}, h_pipeline {};
     uint32_t v_grid_x {}, v_grid_y {}, h_grid_x {}, h_grid_y {};
     uint32_t mid_elem {}; // element offset of this plane's scratch
-    bool skip_vert {}; // dst_h == src_h: the horizontal pass reads the source
+    // Which passes this plane runs. A pass is skipped only when its axis is
+    // unchanged *and* the other one does the work: an identity plane still
+    // needs one of them as a copy, and the vertical is the cheaper one when it
+    // can write the destination plane directly.
+    bool run_vert {};
+    bool run_horiz {};
 };
 
 struct BoxData {
@@ -267,7 +272,9 @@ static const VSFrame * box_gpu_frame(BoxData * d, int n,
     VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
 
     // The plane dispatches touch disjoint buffers and disjoint scratch regions,
-    // so only the two passes of one plane are ordered.
+    // so only the two passes of one plane are ordered. A phase-major form (every
+    // vertical, one barrier, every horizontal) measured exactly neutral; the
+    // per-frame cost here is not the barrier count.
     for (int p = 0; p < numPlanes; ++p) {
         const auto & cfg = d->planes[p];
 
@@ -282,14 +289,18 @@ static const VSFrame * box_gpu_frame(BoxData * d, int n,
                         " is not GPU resident");
         }
 
-        // A plane whose height is unchanged skips the vertical pass, so it
-        // reads the source where the others read the scratch.
-        const VkBuffer mid_buffer = cfg.skip_vert ? sp.buffer : mid.buffer;
+        // Without a horizontal pass the vertical one writes the destination
+        // plane through this binding; without a vertical pass the horizontal
+        // one reads the source. Both running is the only case that needs the
+        // scratch.
+        const VkBuffer mid_buffer = !cfg.run_horiz  ? dp.buffer
+                                    : !cfg.run_vert ? sp.buffer
+                                                    : mid.buffer;
         const VkBuffer buffers[4] { sp.buffer, dp.buffer, mid_buffer,
                                     d->taps.buffer };
         gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 4);
 
-        if (!cfg.skip_vert) {
+        if (cfg.run_vert) {
             const int32_t push[4] { 0, 0, static_cast<int32_t>(cfg.mid_elem),
                                     static_cast<int32_t>(d->y_tap_base) };
             gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push,
@@ -297,15 +308,20 @@ static const VSFrame * box_gpu_frame(BoxData * d, int n,
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           cfg.v_pipeline);
             d->gpu->vk->vkCmdDispatch(cmd, cfg.v_grid_x, cfg.v_grid_y, 1);
-            gpu_barrier(*d->gpu, cmd); // the horizontal pass reads these writes
+            if (cfg.run_horiz) {
+                gpu_barrier(*d->gpu, cmd); // the horizontal pass reads this
+            }
         }
 
-        const int32_t push[4] { 0, 0, static_cast<int32_t>(cfg.mid_elem), 0 };
-        gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push,
-                           sizeof(push));
-        d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                      cfg.h_pipeline);
-        d->gpu->vk->vkCmdDispatch(cmd, cfg.h_grid_x, cfg.h_grid_y, 1);
+        if (cfg.run_horiz) {
+            const int32_t push[4] { 0, 0, static_cast<int32_t>(cfg.mid_elem),
+                                    0 };
+            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push,
+                               sizeof(push));
+            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                          cfg.h_pipeline);
+            d->gpu->vk->vkCmdDispatch(cmd, cfg.h_grid_x, cfg.h_grid_y, 1);
+        }
     }
 
     d->gpu->api->gpuExecReadsFrame(ctx, src);
@@ -639,7 +655,16 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         cfg.dst_h = plane_dst_h;
         cfg.src_stride = src_stride[plane];
         cfg.dst_stride = dst_stride[plane];
-        cfg.skip_vert = (plane_dst_h == plane_src_h);
+        // With the width unchanged the vertical pass' output cell is the
+        // destination cell: the same pitch, and store_mid/store_dst are the
+        // same rounding for every io type, so it can write dst directly instead
+        // of the scratch a horizontal copy would read back. That makes the
+        // vertical the copy pass for an identity plane; only a width-shrinking
+        // one can skip it, and its horizontal pass reads the source instead.
+        const bool width_same =
+            plane_dst_w == plane_src_w && cfg.src_stride == cfg.dst_stride;
+        cfg.run_vert = plane_dst_h != plane_src_h || width_same;
+        cfg.run_horiz = !width_same;
 
         // The kernel addresses the plane through signed 32-bit element
         // offsets; reject a plane whose last element would not fit rather than
@@ -657,8 +682,9 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         }
 
         // The scratch is SRC_W wide (so the horizontal pass reads contiguous
-        // taps) and DST_H tall, at the source plane's pitch.
-        if (!cfg.skip_vert) {
+        // taps) and DST_H tall, at the source plane's pitch; a plane that skips
+        // either pass writes or reads a real plane and needs none.
+        if (cfg.run_vert && cfg.run_horiz) {
             const VkDeviceSize bytes = static_cast<VkDeviceSize>(plane_dst_h) *
                                        cfg.src_stride * d->elem_bytes;
             const VkDeviceSize off = align32(mid_total);
@@ -694,10 +720,12 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
                    std::to_string(max_grid_x) + "x" +
                    std::to_string(max_grid_y) + ")";
         };
-        if (auto e = over(h_x, h_y, "horizontal pass")) {
-            return set_error(*e);
+        if (cfg.run_horiz) {
+            if (auto e = over(h_x, h_y, "horizontal pass")) {
+                return set_error(*e);
+            }
         }
-        if (!cfg.skip_vert) {
+        if (cfg.run_vert) {
             if (auto e = over(v_x, v_y, "vertical pass")) {
                 return set_error(*e);
             }
@@ -713,7 +741,7 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
                                  .src_stride = cfg.src_stride,
                                  .dst_stride = cfg.dst_stride };
 
-        if (!cfg.skip_vert) {
+        if (cfg.run_vert) {
             const auto result =
                 create_pipeline(*d->gpu, d->pipeline_layout, vert_code,
                                 vert_size, spec, d->blk_x, d->blk_y);
@@ -722,7 +750,7 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
             }
             cfg.v_pipeline = std::get<VkPipeline>(result);
         }
-        {
+        if (cfg.run_horiz) {
             const auto result =
                 create_pipeline(*d->gpu, d->pipeline_layout, horiz_code,
                                 horiz_size, spec, d->blk_x, d->blk_y);

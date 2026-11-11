@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - EEDI3 and EEDI3AA are up to 45% faster at 2160p, and faster on f32 1080p
 - GaussBlur is up to 6x faster at sigmas between 2 and 10, and about 6% faster at its default
 - Bilateral is 2.1x faster at the largest spatial sigmas
+- Box is 12-40% faster when only one dimension is scaled
 - DFTTest and NLMeans size their working set to the card's cache, so a GPU with less cache no longer streams it
 - EEDI3, EEDI3H, and EEDI3AA use less VRAM for the same output
 - WNNM uses less VRAM on GPUs with a small VRAM allowance

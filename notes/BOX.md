@@ -39,11 +39,15 @@ what `vsfeel.vsaa.feel_aa` does (see `notes/EEDI3AA.md`).
 
 ## Implementation
 
-`src/box.cpp` and `src/box.comp`. Two dispatches per plane with a barrier between
-them: vertical into a transient per-frame scratch (`gpu_frame_buffer`, in the
-frame's own sample type), then horizontal out of it into the output frame's
-plane. The scratch is a buffer, not a frame, pitched at the source plane's
-stride, so the horizontal pass reads contiguous taps.
+`src/box.cpp` and `src/box.comp`. Which passes run is per plane: both scales
+both axes (vertical into a transient per-frame scratch from `gpu_frame_buffer`,
+in the frame's own sample type, then horizontal out of it into the output
+plane, with a barrier between), only the vertical when the width is unchanged
+(it writes the output plane directly: same pitch, and `store_mid`/`store_dst`
+are the same rounding), only the horizontal when the height is unchanged (it
+reads the source), and the vertical alone as the copy for an identity plane.
+The scratch is a buffer, not a frame, pitched at the source plane's stride, so
+the horizontal pass reads contiguous taps.
 
 The *rounded* intermediate is not an optimisation choice. resize2 quantises the
 vertical result to the sample type before the horizontal pass; a single-pass
@@ -112,6 +116,19 @@ copies this filter removes.
 
 ## Historical
 
+- **2026-11-10 — one-axis downscales stopped materialising the scratch.** A
+  plane whose width is unchanged ran a full horizontal pass over a 1-tap table,
+  i.e. a write+read of the two-pass scratch to copy a column. The vertical pass
+  now writes the output plane directly (same pitch, identical rounding), so the
+  scratch, the second dispatch and its barrier are gone; an identity plane runs
+  that same pass as its copy, which is why the pass flags are `run_vert`/
+  `run_horiz` rather than skips. Measured against the previous binary at
+  1080p u16, ABBA n=12: height-only 41 557 -> 46 740 fps (**+12.5%**); at
+  2160p, u16 17 883 -> 25 284 (**+41.4%**) and f32 10 628 -> 14 696
+  (**+38.3%**). The both-axes and width-only paths are unchanged (45 380 vs
+  45 699 and 46 651 vs 46 530 fps). The benchmark's `--box-args "axis=..."` is
+  new: it is what makes those one-axis paths measurable at all.
+
 - **2026-11-10 — the workgroup shape was swept: 64x4 ships, 32x8 is noise.** Both
   passes were 16x8, so a warp spanned two output rows and only half a 64-byte
   sector per u16 row. A same-session A/B with a shape knob (ABBA, n=12, 3 s,
@@ -151,9 +168,19 @@ copies this filter removes.
 - `width == src.width` and `height == src.height` still runs the horizontal
   dispatch; `skip_vert` drops only the vertical pass (`src/box.cpp:579`). A
   no-op path could copy instead; it is not on any current route.
-- The workgroup shape is now measured (64x4 where the device allows 256
-  invocations, else 16x8): see Historical. The remaining shape question is
-  whether a ratio-dependent width beats both, which nothing points at.
+- **A fused single-pass downscale is not worth building.** At ratio 2 the
+  plain fused gather reads each source sample twice (once per output column),
+  which is exactly the scratch round-trip it removes, and across lanes it reads
+  every other column, so it also doubles the lines touched; an LDS-staged source
+  tile would fix the coalescing and is the only form that could win, at a
+  rewrite of both passes. The ordering-only alternative measured exactly neutral
+  (one barrier for every plane instead of one per plane: 45 704.8 vs 45 705.0
+  fps), so the barrier count is not the limiter either.
+- **The u16 residual is zimg's coefficient quantization, not a float divide**
+  (see Historical). Making it exact needs zimg's error-diffused 14-bit
+  coefficient table and an int32 MAC; until then the bound is content-dependent:
+  the fixture stays within 2 codes, a full-range plane reaches 4 at ratio 7
+  (`tests/test_box.py`'s `HIGH_CONTRAST_BOUNDS`).
 - Do not re-introduce the Merge composition "because it needs no new filter": it
   is bit-exact and ~8 fps slower on the chain that uses this one.
 - Do not chase the f16 half-step residue at ratios 3/2.5/3.5/5 with a host

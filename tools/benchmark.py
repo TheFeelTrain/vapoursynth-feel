@@ -694,10 +694,13 @@ def _gauss_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[st
 def _box_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
     # Downscale by a ratio, so the target follows --clip and --scale. Both
     # arms get the same integer target; the kernel the reference needs is
-    # defined by PLUGINS["resize2"].loader in that arm's vpy.
+    # defined by PLUGINS["resize2"].loader in that arm's vpy. `axis` is what
+    # makes Box's one-axis paths (and the identity one) measurable: the other
+    # axis keeps the source dimension, so vsfeel runs one pass instead of two.
     ratio = ns.box_ratio
-    width = f"round({clip}.width / {ratio})"
-    height = f"round({clip}.height / {ratio})"
+    axis = ns.box_axis
+    width = f"round({clip}.width / {ratio})" if axis in ("both", "width") else f"{clip}.width"
+    height = f"round({clip}.height / {ratio})" if axis in ("both", "height") else f"{clip}.height"
     return {
         "vsfeel": f"core.vsfeel.Box({clip}, width={width}, height={height})",
         "resize2": f"core.resize2.Custom({clip}, _box_kernel, 1, {width}, {height})",
@@ -1001,6 +1004,13 @@ FILTERS: dict[str, FilterSpec] = {
         title="Box",
         args=[
             Arg("ratio", "box_ratio", float, 2.0, "downscale ratio (2 = half size)"),
+            Arg(
+                "axis",
+                "box_axis",
+                str,
+                "both",
+                "which axes to downscale: both, height, width, or none",
+            ),
         ],
         build=_box_build,
         # vsfeel's Box is vnode:gpu under the R80 GPU API; resize2 takes the
