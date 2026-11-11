@@ -107,14 +107,11 @@ the native type, dropping the caller's `depth()` node (see Performance).
 - The combined group list (`ge`/`gxy`/`gz`) is the one private array left whose
   index is not a compile-time constant (the tail sort's `b`, the insert's `pos`).
   It stays per-lane: a shared copy measured 2.6x slower on Ada (see Historical).
-- The group's reference patch (the 64 floats the SSD subtracts from) is either
-  sixteen `vec4` locals per lane or a row-major shared copy, and the choice keys
-  off the **driver**, not the vendor: registers are only right if the backend
-  promotes them, else every one of the SSD's 64 reads per candidate is a memory
-  access (RADV/ACO promotes the array: 168 VGPRs, zero scratch). Shared memory is
-  the default everywhere except `VK_DRIVER_ID_MESA_RADV`, where it measures 8-10%
-  worse, and it is what makes the kernel run at all on a backend that will not
-  promote the register arm (Ada; see Historical for the alignment and ISA detail).
+- The codegen pair is per compiler: RADV keeps registers + fused, which measure
+  8-10% and 13% better there, and every other compiler gets the shared patch
+  plus the split, the low-pressure side of both choices. Historical has the
+  numbers and the ~3x a non-promoted patch array costs; `driver_id` names the
+  compiler family, so nothing claims "Ada" from it.
 - Each walk evaluates one candidate per iteration in place (skip the reference
   origin, SSD, threshold, insert) with scalar coordinates; the row wrap is a
   `while` because the 8-lane step can overshoot a window narrower than 8 (the
@@ -677,9 +674,12 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
   (default 4). Temporal rings are fixed; the isolated source ring is lazy.
 - `VSFEEL_BM3D_CAS=1` — force the CAS aggregation build (A/B only).
 - `VSFEEL_BM3D_PATCH_LDS=0/1` — force either reference-patch arm; unset follows
-  the driver rule (shared memory everywhere except RADV).
+  the measured driver rule. The banner names the arm and its source.
 - `VSFEEL_BM3D_SPLIT_KERNEL=0/1` — force either estimation path; unset follows
-  the driver rule (split everywhere except RADV).
+  the measured driver rule (split everywhere except RADV, where it is 13%
+  worse). Banner likewise.
+- `VSFEEL_LIMIT_DRIVER_ID=<id>` — tests only: report that id, so one GPU can
+  stand on both sides of the rule (`3` is RADV).
 - `VSFEEL_BM3D_SUBGROUP=64` — force wave64 instead of the driver's default.
 - `VSFEEL_BM3D_WORKGROUP=<n>` — launch width, a multiple of 8.
 - `VSFEEL_BM3D_NOSEARCH=1` / `NOESTIMATE=1` — ablation knobs; NOSEARCH is the

@@ -145,6 +145,15 @@ component first. Entries read like this:
   in the `[Unreleased]` section is not an entry: no release ever had it, and
   fixing it only makes the unreleased feature work as first documented.
 
+Version numbers are SemVer, and what lands in `[Unreleased]` decides the next one. A **minor**
+is anything a user can now do that they could not before: a new filter, input format, bit depth,
+argument, or a new capability on an existing one (per-plane control, a new mode). A **patch** is a
+backwards-compatible fix, a speed, memory or accuracy change, including output that moves toward
+the reference. A **major** is anything that stops an existing script working: a removed or renamed
+argument or function, a value that used to be valid now rejected, or a raised minimum VapourSynth
+or Vulkan version. Rejecting input that was never valid is a fix. Operationally: a release with
+any `### Added` entry is a minor, and when a change could be argued either way, bump the minor.
+
 The notes files carry the mechanism; the changelog carries the result.
 
 ## Environment (uv)

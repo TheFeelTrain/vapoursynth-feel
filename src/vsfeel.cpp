@@ -483,6 +483,13 @@ get_gpu_device(VSCore * core, const VSAPI * vsapi) {
         cap > 0 && static_cast<uint32_t>(cap) < dev->subgroup_size) {
         dev->subgroup_size = static_cast<uint32_t>(cap);
     }
+    // A policy keyed on the driver (BM3D's register/shared and fused/split
+    // pair) cannot be tested on one GPU without standing on the other side of
+    // its rule, so this reports a different id the way the caps above report a
+    // smaller device. It changes no capability, only what a policy reads.
+    if (const int id = env_int("VSFEEL_LIMIT_DRIVER_ID", 0); id > 0) {
+        dev->driver_id = static_cast<uint32_t>(id);
+    }
 
     uint32_t families = 0;
     vk->vkGetPhysicalDeviceQueueFamilyProperties2(handles.physicalDevice,

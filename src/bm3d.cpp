@@ -2920,30 +2920,48 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
     // atom_add_f CAS loop. VSFEEL_BM3D_CAS forces the CAS build.
     d->cas_atomics =
         env_flag("VSFEEL_BM3D_CAS") || !d->gpu->feat_atomic_float32_add;
-    // Where the group's reference patch lives is a codegen decision, not a
-    // register-file or cache one: the 64 values are sixteen vec4 locals (a
-    // private array is what a backend that will not promote it stages in
-    // scratch, and then every SSD read per candidate is a memory access). A
-    // backend that keeps them in registers (RADV/ACO: 168 VGPRs, zero scratch,
-    // the same count the vectors get) pays nothing, and shared memory is 8-10%
-    // worse there; a backend that does not loses ~3x without it. Every compiler
-    // except the one measured to keep them gets shared memory.
-    // VSFEEL_BM3D_PATCH_LDS=0/1 overrides either way.
+    // Codegen pair per compiler. The two choices differ in kind, and in each
+    // one the conservative side is the low-register-pressure side:
+    //   RADV/ACO   registers + fused   (measured: shared is 8-10% worse,
+    //                                   split -13%)
+    //   unmeasured shared + split      (the pair that cannot fail badly)
+    //
+    // Registers are only right if the compiler promotes the 64-value private
+    // patch array; where it does not, every SSD read per candidate becomes a
+    // memory access and the arm loses ~3x (RADV/ACO promotes it: 168 VGPRs,
+    // zero scratch). An unmeasured compiler therefore gets the shared patch.
+    //
+    // The split runs the search and the estimate as two dispatches, with the
+    // group handed over through a buffer that is already part of the VRAM ring
+    // budget. It *lowers* the search kernel's register pressure (120 -> 96
+    // VGPRs, 12 -> 16 waves/SIMD), so its measured cost is -13% on RADV, the
+    // one compiler that was never occupancy-bound, and it is +8.8% on a 4070,
+    // the only non-RADV compiler measured. A compiler we have not measured is
+    // exactly where a tight register file would bite the fused arm, so the
+    // unmeasured default is the low-pressure one there too. driver_id names
+    // the compiler family, not the microarchitecture, so nothing here claims
+    // "Ada": RADV is the one measured family and everything else takes the
+    // safe pair. VSFEEL_BM3D_PATCH_LDS / VSFEEL_BM3D_SPLIT_KERNEL=0/1
+    // override either.
     const char * patch_lds_env = std::getenv("VSFEEL_BM3D_PATCH_LDS");
+    const char * split_env = std::getenv("VSFEEL_BM3D_SPLIT_KERNEL");
     d->patch_lds = patch_lds_env && *patch_lds_env
                        ? env_flag("VSFEEL_BM3D_PATCH_LDS")
                        : d->gpu->driver_id != VK_DRIVER_ID_MESA_RADV;
-    // The split runs the search and the estimate as two dispatches, with the
-    // group handed over through a buffer. The search then carries no estimate
-    // stack and the filter no search state, which is where the search's
-    // occupancy comes from: 120 -> 96 VGPRs and 12 -> 16 waves/SIMD. A 4070
-    // reads that as +8.8%, RADV as -13% (at 12 waves/SIMD it was never
-    // occupancy-bound), so it follows the same driver rule as the patch above.
-    // VSFEEL_BM3D_SPLIT_KERNEL=0/1 overrides.
-    const char * split_env = std::getenv("VSFEEL_BM3D_SPLIT_KERNEL");
     d->split_kernel = split_env && *split_env
                           ? env_flag("VSFEEL_BM3D_SPLIT_KERNEL")
                           : d->gpu->driver_id != VK_DRIVER_ID_MESA_RADV;
+    // Both halves of the pair follow the same rule: the one measured compiler
+    // keeps its measured pair, everything else gets the conservative one.
+    const bool measured_driver = d->gpu->driver_id == VK_DRIVER_ID_MESA_RADV;
+    const char * patch_policy =
+        patch_lds_env && *patch_lds_env
+            ? "VSFEEL_BM3D_PATCH_LDS"
+            : (measured_driver ? "measured driver" : "conservative default");
+    const char * split_policy =
+        split_env && *split_env
+            ? "VSFEEL_BM3D_SPLIT_KERNEL"
+            : (measured_driver ? "measured driver" : "conservative default");
     // One launch shape for every pipeline of this instance: the split's
     // handoff and the per-plane grid are indexed by it.
     const auto subgroup = choose_subgroup(*d->gpu);
@@ -2960,12 +2978,16 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
         fprintf(stderr, "[bm3d] aggregation: %s\n",
                 d->cas_atomics ? "CAS loop (atom_add_f fallback)"
                                : "hardware buffer float atomics");
-        fprintf(stderr, "[bm3d] estimation: %s\n",
+        // Name the policy source, not just the choice: a driver rule that
+        // silently changes a default is exactly what a reader has to be able
+        // to tell from an env-forced arm.
+        fprintf(stderr, "[bm3d] estimation: %s (policy: %s, driver %u)\n",
                 d->split_kernel ? "match + filter split"
-                                : "fused match/estimate");
-        fprintf(stderr, "[bm3d] reference patch: %s (driver %u)\n",
+                                : "fused match/estimate",
+                split_policy, d->gpu->driver_id);
+        fprintf(stderr, "[bm3d] reference patch: %s (policy: %s)\n",
                 d->patch_lds ? "shared memory" : "per-lane registers",
-                d->gpu->driver_id);
+                patch_policy);
         fprintf(stderr, "[bm3d] workgroup: %u threads, %u groups\n",
                 d->workgroup, d->groups_per_wg);
         fprintf(stderr,

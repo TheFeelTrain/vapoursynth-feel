@@ -6,29 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- BM3D accepts a `matrix` argument to pin the color matrix instead of deriving it from the resolution
+
 ### Changed
 
 - NLMeans is 5-7% faster across search radii
 - EEDI3 and EEDI3AA are up to 45% faster at 2160p, and faster on f32 1080p
 - GaussBlur is up to 6x faster at sigmas between 2 and 10, and about 6% faster at its default
-- WNNM runs its matcher at the GPU's wave width, so wave64 GPUs fill the wave instead of half of it
-- DFTTest's stripe ring and NLMeans' round are sized from the GPU's cache on known parts, so a card with less cache no longer streams them
-- All filter creation uses less memory
-- WNNM uses less VRAM on GPUs with a small VRAM allowance
+- DFTTest and NLMeans size their working set to the card's cache, so a GPU with less cache no longer streams it
 - EEDI3, EEDI3H, and EEDI3AA use less VRAM for the same output
+- WNNM uses less VRAM on GPUs with a small VRAM allowance
 - BM3D uses less VRAM before its first seek
-- BM3D scales sigma and its matching threshold by a color matrix selected from the clip's resolution, and accepts a `matrix` argument to pin it
-- BM3D filters RGB input in the opponent color space, converting internally
+- BM3D matches the reference's color handling: the matrix comes from the clip's resolution and RGB input is filtered in the opponent space
 
 ### Fixed
 
-- BM3D no longer pins a full frame per request during reverse or random playback, and rejects a radius that does not fit the VRAM allowance at creation
-- EEDI3, EEDI3H, EEDI3AA, GaussBlur, Box, NLMeans, and NNEDI3 report an over-large frame at creation instead of failing on every frame
-- NLMeans names the chroma plane in its plane-range error when `channels="UV"`
-- NLMeans rejects a frame or `a`/`d` combination whose memory the device cannot hold at creation, instead of failing on every frame or allocating hundreds of MiB of sweep tables
-- WNNM reports an over-large frame instead of failing with an allocation error
+- BM3D, EEDI3, EEDI3H, EEDI3AA, GaussBlur, Box, NLMeans, NNEDI3, and WNNM report an over-large frame or radius at creation instead of failing on every frame
+- BM3D no longer pins a full frame per request during reverse or random playback
+- NLMeans rejects an `a`/`d` combination whose sweep tables the device cannot hold, and names the chroma plane in its plane-range error
 - BM3D no longer loses denoise contributions at large temporal radii on GPUs without float atomics
-- DFTTest no longer hangs on GPUs whose drivers require every lane of a subgroup to reach a barrier
+- DFTTest no longer hangs on some GPU drivers
 - Bilateral matches vszipcl at the frame edge on GPUs with less workgroup memory
 - Box's variable-format error names the format, and `feel_aa` runs a Box supersampler on the host instead of failing
 - DFTTest rejects negative `sigma` and `sigma2` instead of producing an inverted frame

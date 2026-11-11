@@ -792,6 +792,81 @@ def test_bm3d_matrix_banner_names_the_resolution_rule():
     assert "bt2020nc" in lines[2] and "0.729528" in lines[2], lines[2]
 
 
+_POLICY_BANNER_SCRIPT = r"""
+import vapoursynth as vs
+
+core = vs.core
+clip = core.std.BlankClip(width=320, height=180, format=vs.GRAY16, length=1)
+core.vsfeel.BM3D(clip, sigma=0.7)
+"""
+
+
+def _policy_banner(env=None):
+    """stderr of a BM3D creation run with the creation banner on."""
+    run_env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1", **(env or {})}
+    proc = subprocess.run(
+        [sys.executable, "-c", _POLICY_BANNER_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=run_env,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return proc.stderr
+
+
+def test_bm3d_codegen_policy_is_named_and_conservative_by_default():
+    """Both halves of the codegen pair name their choice and their source.
+
+    The rule is a measured pair per compiler, and the two arms differ in kind:
+    the shared reference patch is what keeps a compiler that will not promote
+    the private array off a ~3x path, and the split estimation keeps the search
+    kernel's register pressure low (96 instead of 120 VGPRs), so a compiler
+    nobody has measured gets the low-pressure pair. RADV is the one measured
+    family and keeps registers + fused, which is 8-10% and 13% better there.
+    The banner is the only place the policy is visible, and
+    `VSFEEL_LIMIT_DRIVER_ID` is what lets one GPU stand on both sides of it.
+    """
+    # Whatever this box is, the unforced default must be one of the two rule
+    # outcomes, and the measured pair belongs to RADV only.
+    default = _policy_banner()
+    plan = re.search(r"\[bm3d\] estimation: (.+) \(policy: ([^,]+), driver (\d+)\)", default)
+    assert plan, default[-2000:]
+    choice, source, driver = plan.group(1), plan.group(2), int(plan.group(3))
+    if driver == 3:  # VK_DRIVER_ID_MESA_RADV
+        assert (choice, source) == ("fused match/estimate", "measured driver"), plan.group(0)
+        assert "reference patch: per-lane registers (policy: measured driver)" in default, default[
+            -2000:
+        ]
+    else:
+        assert (choice, source) == ("match + filter split", "conservative default"), plan.group(0)
+        assert "reference patch: shared memory (policy: conservative default)" in default, default[
+            -2000:
+        ]
+
+    # Both sides of the rule, deterministically.
+    radv = _policy_banner({"VSFEEL_LIMIT_DRIVER_ID": "3"})
+    assert "estimation: fused match/estimate (policy: measured driver, driver 3)" in radv, radv[
+        -2000:
+    ]
+    assert "reference patch: per-lane registers (policy: measured driver)" in radv, radv[-2000:]
+    other = _policy_banner({"VSFEEL_LIMIT_DRIVER_ID": "1"})
+    assert "estimation: match + filter split (policy: conservative default, driver 1)" in other, (
+        other[-2000:]
+    )
+    assert "reference patch: shared memory (policy: conservative default)" in other, other[-2000:]
+
+    # Either half can still be forced, and the banner names the knob as the
+    # source rather than the rule.
+    forced = _policy_banner({"VSFEEL_BM3D_SPLIT_KERNEL": "0", "VSFEEL_BM3D_PATCH_LDS": "0"})
+    assert "estimation: fused match/estimate (policy: VSFEEL_BM3D_SPLIT_KERNEL" in forced, forced[
+        -2000:
+    ]
+    assert "reference patch: per-lane registers (policy: VSFEEL_BM3D_PATCH_LDS)" in forced, forced[
+        -2000:
+    ]
+
+
 def test_bm3d_rejects_an_unknown_matrix():
     """A matrix outside the CPU enum must fail at creation, not fall back."""
     with pytest.raises(vs.Error, match="matrix"):
