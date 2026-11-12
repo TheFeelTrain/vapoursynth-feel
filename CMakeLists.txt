@@ -449,8 +449,20 @@ foreach(qmax IN LISTS VK_WNNM_QMAX)
         "wnnm_group_q${qmax}_wg64|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DWG=64 -DTFULL=64"
         "wnnm_group_q${qmax}_wg64_cas|wnnm.comp|-DENTRY_GROUP -DQMAX=${qmax} -DWG=64 -DTFULL=64 -DNO_FLOAT_ATOMICS")
 endforeach()
+# The finish kernel sums the BS x BS block window around each pixel from a
+# shared window sized for the largest block this variant accepts (-DBSMAX); the
+# host picks the class from block_size (finish_bsmax in src/wnnm.cpp), so the
+# common 8x8 block keeps the small window. The finish store is the only
+# depth-specific kernel: -DIO_U16/-DIO_F16 store the clip's sample type, and
+# the copy kernel widens a 2-byte plane into the f32 conversion ring.
+set(VK_WNNM_BSMAX 8 16 32 64)
+foreach(bsmax IN LISTS VK_WNNM_BSMAX)
+    list(APPEND VK_WNNM_VARIANTS
+        "wnnm_finish${bsmax}|wnnm.comp|-DENTRY_FINISH -DBSMAX=${bsmax}"
+        "wnnm_finish${bsmax}_u16|wnnm.comp|-DENTRY_FINISH -DIO_U16 -DBSMAX=${bsmax}"
+        "wnnm_finish${bsmax}_f16|wnnm.comp|-DENTRY_FINISH -DIO_F16 -DBSMAX=${bsmax}")
+endforeach()
 list(APPEND VK_WNNM_VARIANTS
-    "wnnm_finish|wnnm.comp|-DENTRY_FINISH"
     # The temporal matcher: the fused kernel up to the selection, which it
     # publishes for the split estimate instead of estimating inline.
     "wnnm_group_q8_mo|wnnm.comp|-DENTRY_GROUP -DQMAX=8 -DMATCH_ONLY -DWG=32"
@@ -463,10 +475,6 @@ list(APPEND VK_WNNM_VARIANTS
     # The split matching (radius 0): every candidate's SSD, then the selection.
     "wnnm_dist|wnnm.comp|-DENTRY_DIST -DQMAX=8"
     "wnnm_select|wnnm.comp|-DENTRY_SELECT -DQMAX=8"
-    # Native 16-bit transport: the finish kernel stores the clip's sample type,
-    # and the copy kernel widens a 2-byte plane into the f32 conversion ring.
-    "wnnm_finish_u16|wnnm.comp|-DENTRY_FINISH -DIO_U16"
-    "wnnm_finish_f16|wnnm.comp|-DENTRY_FINISH -DIO_F16"
     "wnnm_copy_u16|wnnm_copy.comp|-DIO_U16"
     "wnnm_copy_f16|wnnm_copy.comp|-DIO_F16")
 

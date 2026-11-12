@@ -138,7 +138,15 @@ The port is f32 end to end; there is no f64 path any more.
     output columns come from the 64-entry `M` in registers. A temporal fold
     scatters only the patches whose source layer is its own destination slab
     (`fold_dest`, recomputed from the fold index and the push constants), which
-    is how the reference's VAggregate hands each output one slab.
+    is how the reference's VAggregate hands each output one slab. The
+    aggregation weight is not scattered per pixel: lane 0 adds one per matched
+    block at its origin, and the finish kernel sums the block window.
+  - `ENTRY_FINISH`: a 16x8-pixel tile stages the `BS x BS` block-weight window
+    in shared memory and reduces it separably (a `BS`-tap row sum, then `BS`
+    row sums per pixel) before dividing the numerator, then stores the native
+    depth. The finish variant is compiled per block class (`-DBSMAX` 8/16/32/64,
+    picked from `block_size`), so the common 8x8 block's window is 2.3 KiB and
+    a 64x64 block's is 27 KiB.
   - Scratch: `split_stride(m, residual)` floats per group (the Gram then M,
     the residual mean when `residual`, and the aggregation weight), so a larger
     block gets its own stride instead of overrunning a fixed one. It is the same
@@ -247,9 +255,16 @@ staying a bit-exact copy and the request orders on both.
   rank is quadratic in the tile) took it to 190, and cutting the list arrays from
   256 to 64 entries (they were the whole 64 KB LDS budget, i.e. occupancy) to
   **270 fps**. `ps_num` now stops at 64, where those arrays do.
-- The scatter is *free*: replacing both atomics with a plain store gave 769 vs
-  814 fps (noise). Do not spend effort on fixed-point accumulation or den
-  box-summing.
+- **The denominator is one weight per block at its origin, summed in the finish
+  (alternate A/B, n=6, 1080p 5 s medians: 1200 vs 1177 fps at the benchmark
+  default, +2.0%; 2192 vs 2036 at `radius=0`, +7.7%).** The apply adds up to
+  eight weights per group instead of `BS*BS` per member, and the finish stages
+  the `BS x BS` block window in a 16x8 tile and reduces it separably (one-frame
+  `VSFEEL_WNNM_GPUTRACE` screen at 360p, radius 4: 24 vs 14 µs, so the tile
+  costs ~10 µs against the scatter saving). The gain is largest where the
+  scatter is a bigger share (spatial); at the temporal default the matcher and
+  eigen step dominate. The finish variant is classed by `block_size` (`BSMAX`
+  8/16/32/64: 2.3 KiB of shared window at 8x8, 27 KiB at 64x64).
 - Match cost is bounds-checked: `bm_range` 3 vs 7 was flat when the Jacobi
   dominated, so the window size is not what makes the matcher slow; it is one
   global load pair per SSD term.
@@ -258,6 +273,15 @@ staying a bit-exact copy and the request orders on both.
 
 ## Historical
 
+- **2026-11-12 - the aggregation weight moves to the block origin (+2.0% /
+  +7.7%).** The scatter's cost was not the atomic type: replacing both atomics
+  with a plain store had measured flat (769 vs 814 fps) and was read as "do not
+  den box-sum", but that variant kept every per-pixel store. Moving the weight
+  to one add per matched block, and summing the `BS x BS` block window per pixel
+  in a 16x8 shared tile in the finish, measured 1200.2 vs 1176.8 fps at the
+  benchmark default (+2.0%) and 2191.8 vs 2036.0 with `radius=0` (+7.7%) (jpbd
+  1080p, 5 s medians, alternate A/B n=6). Fixed-point accumulation is still not
+  worth it.
 - **2026-11-10 - the match ring and the estimate cache are capped by the VRAM
   allowance.** The ring budget was `min(160 MiB, range)` and the estimate
   `min(512 MiB, max(320 MiB, limit/8))`, so a 1 GiB device could plan a

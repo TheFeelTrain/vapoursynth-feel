@@ -112,6 +112,30 @@ layout(constant_id = 27) const int EST_BASE = -1;
 #define M (BS * BS)
 #define TEMP_C (W - BS)
 #define TEMP_R (H - BS)
+
+// Finish aggregation tile (see ENTRY_FINISH): 16x8 pixels per workgroup. The
+// weight plane holds one aggregation weight per block origin (added by the
+// scatter at the member's origin), so a pixel's denominator is the sum of the
+// BS x BS block window covering it. The shared window is sized by -DBSMAX, the
+// largest block this pipeline was compiled for, which the host picks from
+// block_size; sizing it for BS itself is not possible because BS is a spec
+// constant and the common small block must not pay the large block's LDS.
+#ifndef BSMAX
+#define BSMAX 8
+#endif
+#define FIN_TILE_W 16
+#define FIN_TILE_H 8
+#define FIN_THREADS 128
+#define FIN_SPAN_W (FIN_TILE_W + BSMAX - 1)
+#define FIN_SPAN_H (FIN_TILE_H + BSMAX - 1)
+#if defined(ENTRY_FINISH) && WG != FIN_THREADS
+#error "the finish tile's threads must match WG"
+#endif
+#if defined(ENTRY_FINISH)
+shared float fin_w[FIN_SPAN_W * FIN_SPAN_H];
+shared float fin_row[FIN_TILE_W * FIN_SPAN_H];
+#endif
+
 // Candidates per group of the largest window (the distance array's stride).
 #define DIST_STRIDE                                                           \
     (min(2 * BM_RANGE + 1, TEMP_R + 1) * min(2 * BM_RANGE + 1, TEMP_C + 1))
@@ -1128,6 +1152,11 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
         const uint xy = top_xy[j];
         const int bx = unpack_x(xy);
         const int by = unpack_y(xy);
+        // One aggregation weight per block, at its origin; the finish kernel
+        // sums the BS x BS block window that covers each pixel.
+        if (tid == 0) {
+            add_acc(W * H + by * W + bx, wgt);
+        }
         for (int p = tid; p < M; p += WG) {
             float s = 0.0f;
             if (tall) {
@@ -1148,7 +1177,6 @@ void run_group(uint wg, int x, int y, int layer_base, int t_dest, int fold) {
             const int px = p - py * BS;
             const int o = (by + py) * W + bx + px;
             add_acc(o, s * wgt);
-            add_acc(W * H + o, wgt);
         }
     }
     barrier();
@@ -1264,17 +1292,18 @@ int fold_dest(uint slot) {
 #endif
 
 #if defined(ENTRY_APPLY)
-// Output column J of one pixel: the 8-term dot product with that column of M,
-// the mean back, and the weighted scatter of both the estimate and the weight.
+// Output column J of one pixel: the 8-term dot product with that column of M
+// and the mean back. The aggregation weight is not part of this scatter: one
+// weight per block goes to the block origin, and the finish kernel sums the
+// BS x BS block window for the denominator.
 #define ADOT(J, O, U)                                                         \
-    if ((J) < an && (U)) {                                                           \
-        const float ad =                                                     \
+    if ((J) < an && (U)) {                                                    \
+        const float ad =                                                      \
             fma(a7, am[56 + (J)], fma(a6, am[48 + (J)], fma(a5, am[40 + (J)],  \
                 fma(a4, am[32 + (J)], fma(a3, am[24 + (J)],                   \
                     fma(a2, am[16 + (J)], fma(a1, am[8 + (J)],                 \
                         fma(a0, am[0 + (J)], mu))))))));                      \
         add_acc((O) + row, wgt * ad);                                         \
-        add_acc(W * H + (O) + row, wgt);                                      \
     }
 #endif
 
@@ -1836,6 +1865,35 @@ void main() {
     const int ao5 = match_out(aslot, 5, an);
     const int ao6 = match_out(aslot, 6, an);
     const int ao7 = match_out(aslot, 7, an);
+    // One aggregation weight per matched block, at its origin. Only lane 0
+    // writes, so a group contributes up to eight atomics instead of BS*BS per
+    // member; the finish kernel sums the block window for the denominator.
+    if (lane == 0) {
+        if (0 < an && use0) {
+            add_acc(W * H + ao0, wgt);
+        }
+        if (1 < an && use1) {
+            add_acc(W * H + ao1, wgt);
+        }
+        if (2 < an && use2) {
+            add_acc(W * H + ao2, wgt);
+        }
+        if (3 < an && use3) {
+            add_acc(W * H + ao3, wgt);
+        }
+        if (4 < an && use4) {
+            add_acc(W * H + ao4, wgt);
+        }
+        if (5 < an && use5) {
+            add_acc(W * H + ao5, wgt);
+        }
+        if (6 < an && use6) {
+            add_acc(W * H + ao6, wgt);
+        }
+        if (7 < an && use7) {
+            add_acc(W * H + ao7, wgt);
+        }
+    }
     for (int py = 0; py < BS; ++py) {
         const int rp = py * STRIDE;
         const int orow = py * W;
@@ -1887,13 +1945,55 @@ void main() {
         }
     }
 #elif defined(ENTRY_FINISH)
-    const int gx = int(gl_GlobalInvocationID.x);
-    const int gy = int(gl_GlobalInvocationID.y);
+    // The weight plane holds one aggregation weight per block origin, so a
+    // pixel's denominator is the BS x BS block window covering it. Stage the
+    // window for a 16x8 tile in shared memory and reduce it separably: a row
+    // sum of BS taps per output column, then BS row sums per pixel. The tile's
+    // halo overlaps its neighbours by BS-1, so the weight plane is read <2x.
+    const int lx = int(gl_LocalInvocationIndex) % FIN_TILE_W;
+    const int ly = int(gl_LocalInvocationIndex) / FIN_TILE_W;
+    const int tx = int(gl_WorkGroupID.x) * FIN_TILE_W;
+    const int ty = int(gl_WorkGroupID.y) * FIN_TILE_H;
+    const int span_w = FIN_TILE_W + BS - 1;
+    const int span_h = FIN_TILE_H + BS - 1;
+    const int hx = tx - (BS - 1);
+    const int hy = ty - (BS - 1);
+    for (int i = int(gl_LocalInvocationIndex); i < span_w * span_h;
+         i += FIN_THREADS) {
+        const int c = i % span_w;
+        const int r = i / span_w;
+        const int sx = hx + c;
+        const int sy = hy + r;
+        float w = 0.0;
+        if (sx >= 0 && sx < W && sy >= 0 && sy < H) {
+            w = acc[ACC_BASE + W * H + sy * W + sx];
+        }
+        fin_w[r * FIN_SPAN_W + c] = w;
+    }
+    barrier();
+    for (int i = int(gl_LocalInvocationIndex); i < span_h * FIN_TILE_W;
+         i += FIN_THREADS) {
+        const int c = i % FIN_TILE_W;
+        const int r = i / FIN_TILE_W;
+        float s = 0.0;
+        for (int k = 0; k < BS; ++k) {
+            s += fin_w[r * FIN_SPAN_W + c + k];
+        }
+        fin_row[r * FIN_TILE_W + c] = s;
+    }
+    barrier();
+
+    const int gx = tx + lx;
+    const int gy = ty + ly;
     if (gx >= W || gy >= H) {
         return;
     }
+    float den = 0.0;
+    for (int k = 0; k < BS; ++k) {
+        den += fin_row[(ly + k) * FIN_TILE_W + lx];
+    }
     const int o = gy * W + gx;
-    const float v = acc[ACC_BASE + o] / acc[ACC_BASE + W * H + o];
+    const float v = acc[ACC_BASE + o] / den;
 #if defined(IO_U16)
     // The inverse of the copy kernel's widening: a limited-range plane scales
     // by 219/224 of 65535 and carries a 4096/32768 code offset, and the weight

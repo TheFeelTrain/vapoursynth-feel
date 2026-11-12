@@ -179,6 +179,7 @@ struct WnnmPlane {
     uint32_t grid_x {};
     uint32_t grid_y {};
     uint32_t finish_x {};
+    uint32_t finish_y {};
 };
 
 // VSFEEL_WNNM_GPUTRACE=<frame>: one-shot per-kernel GPU timings on that frame.
@@ -327,6 +328,25 @@ struct GPUWNNM {
 // Pipeline creation
 // ---------------------------------------------------------------------------
 
+// Finish aggregation tile, matching FIN_TILE_W/H in src/wnnm.comp: 16x8 pixels
+// per workgroup, 128 threads. The finish variant is compiled per block-size
+// class (-DBSMAX) so the common 8x8 block does not pay a 64x64 block's shared
+// window; the class is picked from block_size here and in the shader variant.
+constexpr int kFinishTileW = 16;
+constexpr int kFinishTileH = 8;
+static_assert(kFinishTileW * kFinishTileH == kWorkgroup);
+
+static int finish_bsmax(int bs) {
+    return bs <= 8 ? 8 : bs <= 16 ? 16 : bs <= 32 ? 32 : 64;
+}
+
+static uint32_t finish_shared_bytes(int bsmax) {
+    const uint32_t span_w = uint32_t(kFinishTileW + bsmax - 1);
+    const uint32_t span_h = uint32_t(kFinishTileH + bsmax - 1);
+    return (span_w * span_h + uint32_t(kFinishTileW) * span_h) *
+           uint32_t(sizeof(float));
+}
+
 struct WnnmVariant {
     const uint32_t * group;
     size_t group_size;
@@ -340,23 +360,48 @@ struct WnnmVariant {
     size_t copy_size;
 };
 
+struct FinishBlob {
+    const uint32_t * code;
+    size_t size;
+};
+
+static FinishBlob pick_finish(int io, int bsmax) {
+    const int c = bsmax <= 8 ? 0 : bsmax <= 16 ? 1 : bsmax <= 32 ? 2 : 3;
+    static constexpr FinishBlob f32[4] {
+        { wnnm_finish8_spv, sizeof(wnnm_finish8_spv) },
+        { wnnm_finish16_spv, sizeof(wnnm_finish16_spv) },
+        { wnnm_finish32_spv, sizeof(wnnm_finish32_spv) },
+        { wnnm_finish64_spv, sizeof(wnnm_finish64_spv) },
+    };
+    static constexpr FinishBlob u16[4] {
+        { wnnm_finish8_u16_spv, sizeof(wnnm_finish8_u16_spv) },
+        { wnnm_finish16_u16_spv, sizeof(wnnm_finish16_u16_spv) },
+        { wnnm_finish32_u16_spv, sizeof(wnnm_finish32_u16_spv) },
+        { wnnm_finish64_u16_spv, sizeof(wnnm_finish64_u16_spv) },
+    };
+    static constexpr FinishBlob f16[4] {
+        { wnnm_finish8_f16_spv, sizeof(wnnm_finish8_f16_spv) },
+        { wnnm_finish16_f16_spv, sizeof(wnnm_finish16_f16_spv) },
+        { wnnm_finish32_f16_spv, sizeof(wnnm_finish32_f16_spv) },
+        { wnnm_finish64_f16_spv, sizeof(wnnm_finish64_f16_spv) },
+    };
+    return io == 2 ? u16[c] : io == 1 ? f16[c] : f32[c];
+}
+
 static WnnmVariant pick_variant(int qmax, bool hw_atomics, bool match_only,
-                                int io, bool wg64) {
+                                int io, bool wg64, int bs) {
+    const FinishBlob finish = pick_finish(io, finish_bsmax(bs));
     WnnmVariant v { nullptr,         0,
-                    wnnm_finish_spv, sizeof(wnnm_finish_spv),
+                    finish.code,     finish.size,
                     wnnm_dist_spv,   sizeof(wnnm_dist_spv),
                     wnnm_select_spv, sizeof(wnnm_select_spv),
                     nullptr,         0 };
     // The finish store and the conversion copy are the only depth-specific
     // kernels: everything between them runs on f32.
     if (io == 2) {
-        v.finish = wnnm_finish_u16_spv;
-        v.finish_size = sizeof(wnnm_finish_u16_spv);
         v.copy = wnnm_copy_u16_spv;
         v.copy_size = sizeof(wnnm_copy_u16_spv);
     } else if (io == 1) {
-        v.finish = wnnm_finish_f16_spv;
-        v.finish_size = sizeof(wnnm_finish_f16_spv);
         v.copy = wnnm_copy_f16_spv;
         v.copy_size = sizeof(wnnm_copy_f16_spv);
     }
@@ -1143,8 +1188,7 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
         gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &out, sizeof(out));
         d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                       pln.finish_pipe);
-        d->gpu->vk->vkCmdDispatch(cmd, pln.finish_x,
-                                  static_cast<uint32_t>(pln.height), 1);
+        d->gpu->vk->vkCmdDispatch(cmd, pln.finish_x, pln.finish_y, 1);
     }
     gpu_barrier(*d->gpu, cmd);
     probe_ts();
@@ -1737,7 +1781,10 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             const int temp_r = pl.height - d->bs;
             pl.stride = plane_strides[p];
             pl.npix = int64_t(pl.stride) * pl.height;
-            pl.finish_x = uint32_t((pl.width + kWorkgroup - 1) / kWorkgroup);
+            pl.finish_x =
+                uint32_t((pl.width + kFinishTileW - 1) / kFinishTileW);
+            pl.finish_y =
+                uint32_t((pl.height + kFinishTileH - 1) / kFinishTileH);
 
             pl.acc_elems = int64_t(2) * pl.width * pl.height;
             pl.pmat_elems = d->split_match
@@ -2084,7 +2131,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         const bool temporal = pl.radius > 0;
         const WnnmVariant variant =
             pick_variant(qmax, hw_atomics, d->split_match && temporal, d->io,
-                         d->group_wg == 64);
+                         d->group_wg == 64, d->bs);
         const int locs_folds = d->split_match ? pl.folds : 1;
         WnnmSpec spec {};
         spec.width = pl.width;
@@ -2199,7 +2246,12 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
             }
         }
         {
-            const GpuWorkgroup wg { .x = kWorkgroup };
+            // The finish tile's halo is BS-1 wide, so the shared weight window
+            // grows with the block class; the blobs and this number come from
+            // the same finish_bsmax().
+            const GpuWorkgroup wg { .x = kWorkgroup,
+                                    .shared_bytes = finish_shared_bytes(
+                                        finish_bsmax(d->bs)) };
             auto r = gpu_create_pipeline(
                 *d->gpu, variant.finish, variant.finish_size,
                 d->pipeline_layout, spec_entries.data(), &spec,

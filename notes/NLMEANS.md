@@ -383,6 +383,25 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
 ### Do not retry
 
+- **A 64-wide weight tile.** The weight pass runs 32 columns per workgroup and
+  the halo plus the row sums are its measured floor, so a 64-wide tile looked
+  like the last unswept dimension: its per-output cells fall from 2.625 to
+  2.479. Built (`-DNLM_BX=64`, one module per depth, the box-sum indexing
+  generalised to any width) and measured, it is **6.5% slower** with
+  `channels='UV'` (1229.9 vs 1315.3 fps) and **7.0% slower** on luma (316.4 vs
+  340.3) at 1080p u16, ABBA n=12. The tile is 30,464 B at s=4, which drops the
+  device from four resident workgroups to two, and that costs more than the
+  5.5% of cells it saves. A wider tile would have to keep the LDS under the
+  four-workgroup step, i.e. shrink the row count at the same time, which is the
+  VRT ladder the notes already swept.
+- **Composing only the layers a boundary frame reads.** A frame within `d` of a
+  clip boundary reads `2m+1` layers but the compose pass copies all `2d+1`.
+  Dispatching per (clip, channel) with the tile base in the push constants and
+  `z = 2m+1` measured **flat on the arm built to show it** (a 16-frame loop at
+  `d=16`: 38.64 vs 38.73 fps) and **2.3% slower** on a 200-frame cache
+  (38.85 vs 39.78), so the copy it saves is smaller than the extra dispatch
+  costs. At 1080p u16 one u16 luma layer is 4.2 MB, so even a 33-layer boundary
+  copy is under 1% of that frame's 26 ms. The window copy is not the lever.
 - **Full-half internals** (ring + LDS + accumulators): +10.4% vs the shipped
   mixed path, and the ring alone is +10.6%, so the LDS/accumulator half reach is
   slightly negative (mechanism in Performance). Do not retry without a shape ACO

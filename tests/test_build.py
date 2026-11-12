@@ -167,7 +167,7 @@ def test_shader_limits_check_fails_on_an_unattributable_module(tmp_path):
     module.shared_bytes.return_value = (0, False)
 
     assert limits.check(str(src), {"unattributed": module}, {"unattributed"}) == 1
-    assert limits.check(str(src), {"wnnm_finish": module}, {"wnnm_finish"}) == 0
+    assert limits.check(str(src), {"wnnm_finish8": module}, {"wnnm_finish8"}) == 0
     # A module the generated header does not embed is a removed variant, not a
     # live one: stale artifacts must not fail the gate.
     assert limits.check(str(src), {"removed_variant": module}, set()) == 0

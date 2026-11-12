@@ -141,6 +141,9 @@ SPATIAL_CASES = [
     dict(sigma=5, residual=True),
     dict(sigma=3, adaptive_aggregation=False),
     dict(sigma=3, block_size=16, block_step=16, group_size=16),
+    # The largest finish block class (BSMAX=64); a 64-step lattice keeps the
+    # group count small enough for the CPU reference.
+    dict(sigma=3, block_size=64, block_step=64, group_size=8),
     # wide patch matrix (n > m): reconWide's geometry
     dict(sigma=3, block_size=4, block_step=4, group_size=32),
 ]
@@ -1088,16 +1091,17 @@ except vs.Error as e:
 def test_pipeline_failure_stops_creation_at_the_first_error():
     """A failed pipeline must release the input nodes once and return.
 
-    A 2 KiB workgroup-memory cap passes Gram, the eigen step, the scatter and
-    the finish (0 LDS) and makes the distance kernel's 4 KiB tile fail; without
-    an early return that failure calls set_error again, which frees the
-    already-freed input nodes, and the rest of the pipeline set is built anyway.
+    A 3 KiB workgroup-memory cap passes Gram, the eigen step, the scatter and
+    the finish (2340 B at this geometry) and makes the distance kernel's 4 KiB
+    tile fail; without an early return that failure calls set_error again, which
+    frees the already-freed input nodes, and the rest of the pipeline set is
+    built anyway.
     """
     env = {
         **os.environ,
         "MANGOHUD": "0",
         "VSFEEL_DEBUG": "1",
-        "VSFEEL_LIMIT_SHARED_MEMORY": "2048",
+        "VSFEEL_LIMIT_SHARED_MEMORY": "3000",
     }
     proc = subprocess.run(
         [sys.executable, "-c", _FIRST_PIPELINE_FAILURE_SCRIPT],

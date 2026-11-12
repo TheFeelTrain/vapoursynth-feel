@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - DFTTest is up to 13% faster at `sosize` 8 and below, and about 2.5% faster at 1080p
 - DFTTest and NLMeans size their working set to the card's cache, so a GPU with less cache no longer streams it
 - EEDI3, EEDI3H, and EEDI3AA use less VRAM for the same output
+- WNNM is about 8% faster at `radius=0` and about 2% faster with a temporal search
 - WNNM uses less VRAM on GPUs with a small VRAM allowance
 - BM3D uses less VRAM before its first seek
 - BM3D matches the reference's color handling: the matrix comes from the clip's resolution and RGB input is filtered in the opponent space
