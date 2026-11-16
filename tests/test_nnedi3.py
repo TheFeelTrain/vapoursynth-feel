@@ -5,6 +5,9 @@ baked-in grain) is used as the input. The vsfeel implementation is a from-scratc
 NNEDI3 predictor/prescreener math; the reference oracle is nnedi3vk (Vulkan),
 which agrees BIT-EXACTLY with vszipcu's NNEDI3 (measured max diff 0 on the
 noise clip, all planes, frames 0/11/23 — so matching nnedi3vk matches both).
+nnedi3vk is pinned to its plain f32 kernel (``coopvec=0``): its default on a
+``VK_NV_cooperative_vector`` device is a device-specific fp16 matrix path that
+vsfeel does not port, so it is not the algorithm being tested against.
 
 Agreement measured on the noise clip (see notes/NNEDI3.md):
 
@@ -77,6 +80,13 @@ def _run(clip, field=1, **kwargs):
     )
 
 
+# nnedi3vk enables its VK_NV_cooperative_vector fp16 matrix kernel by default on
+# a device that has the extension. That is the reference's own fp16 arithmetic,
+# not the algorithm vsfeel ports, so the oracle is pinned to its plain f32
+# kernel; the argument is a no-op where the extension is absent (RADV).
+_REF_KWARGS = {"coopvec": 0}
+
+
 def _ref_compare(fmt, frames, params, planes=None, env=None):
     """Compare against nnedi3vk in a subprocess; skip if it is not installed.
 
@@ -88,7 +98,15 @@ def _ref_compare(fmt, frames, params, planes=None, env=None):
     reference_or_skip("nnedi3vk", "NNEDI3")
     params = dict(params)
     params.setdefault("field", 1)
-    spec = reference_spec("nnedi3vk", "NNEDI3", fmt, frames=frames, planes=planes, kwargs=params)
+    spec = reference_spec(
+        "nnedi3vk",
+        "NNEDI3",
+        fmt,
+        frames=frames,
+        planes=planes,
+        kwargs=params,
+        ref_kwargs=_REF_KWARGS,
+    )
     return reference_compare(spec, env=env)
 
 
@@ -103,6 +121,7 @@ _SWEEP_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     core = vs.core
     cases = json.loads(sys.argv[1])
     frames = json.loads(sys.argv[2])
+    ref_kwargs = {_REF_KWARGS!r}
     src = core.bs.VideoSource({CLIP_PATH!r})
     if src.num_frames > {CLIP_FRAMES}:
         src = core.std.Trim(src, first=0, length={CLIP_FRAMES})
@@ -114,6 +133,7 @@ _SWEEP_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
         for case in cases:
             kwargs = dict(case)
             kwargs.setdefault("field", 1)
+            kwargs.update(ref_kwargs)
             node = core.nnedi3vk.NNEDI3(clip, **kwargs)
             ref_frames.append([[read_plane(node.get_frame(n), 0, np.uint16)
                                 for n in frames]])

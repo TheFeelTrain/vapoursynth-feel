@@ -579,6 +579,9 @@ else:
 planes = spec.get("planes") or list(range(clip.format.num_planes))
 diff_tol = float(spec.get("diff_tol", 0.0))
 kwargs = dict(spec.get("kwargs") or {})
+# Arguments the reference understands and vsfeel does not (nnedi3vk's
+# coopvec) apply to the reference call only.
+ref_kwargs = dict(spec.get("ref_kwargs") or {})
 if guide is not None:
     kwargs[spec.get("guide_kwarg", "ref")] = guide
 
@@ -588,7 +591,7 @@ ref_func = getattr(getattr(core, spec["plugin"], None), spec["filter"], None)
 try:
     if ref_func is None:
         raise RuntimeError("no %s.%s reference" % (spec["plugin"], spec["filter"]))
-    ref_node = ref_func(clip, **kwargs)
+    ref_node = ref_func(clip, **{**kwargs, **ref_kwargs})
     # A GPU-resident reference (knlmvk) has no host pointer, so it is
     # downloaded first; a CPU-resident one passes through untouched.
     ref_node = cpu_node(ref_node)
@@ -649,6 +652,7 @@ def reference_spec(
     frames=(0, 11, 23),
     planes=None,
     kwargs=None,
+    ref_kwargs=None,
     guide=None,
     guide_kwarg="ref",
     crop=None,
@@ -659,6 +663,8 @@ def reference_spec(
     """Build the JSON spec consumed by :data:`REFERENCE_SCRIPT`.
 
     ``clip`` names the input format ("grays", "gray16", "yuv420p16", ...);
+    ``ref_kwargs`` go only to the reference call, for an argument the
+    reference has and vsfeel does not (e.g. nnedi3vk's ``coopvec``);
     ``guide`` is a JSONable description of the joint-filter clip, if any;
     ``source`` overrides the input file (default: the committed noise clip);
     ``diff_tol`` counts only differences above it in ``ndiff_frac`` (default:
@@ -673,6 +679,8 @@ def reference_spec(
         "frames": list(frames),
         "kwargs": dict(kwargs or {}),
     }
+    if ref_kwargs is not None:
+        spec["ref_kwargs"] = dict(ref_kwargs)
     if planes is not None:
         spec["planes"] = list(planes)
     if crop is not None:

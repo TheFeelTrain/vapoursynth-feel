@@ -86,7 +86,10 @@ use the ratios, not the absolute fps.
   acquire's ~1000 µs mean is the exec ring wait, a sleep, not host work.
 - Agreement: nnedi3vk vs vszipcu **BIT-EXACT** (maxdiff 0, frames 0/5/11, all
   planes, noise_24f → YUV420P8 field=1); vs CPU znedi3 maxdiff 5, ~1 % px
-  (CPU float ordering) — **nnedi3vk is ground truth**.
+  (CPU float ordering) — **nnedi3vk's plain f32 kernel (`coopvec=0`) is ground
+  truth**. Its NV cooperative-vector default exists only on NVIDIA, where it is
+  an fp16 matrix path measured 52 codes off the f32 kernel on GRAY16; RADV has
+  no such extension, so the tests pin `coopvec=0` (a no-op here).
 - Accuracy (unchanged by the port, `tests/test_nnedi3.py` green under
   `cpu_node`): u16 within **1 LSB** (isolated 1-code flips from
   serial-vs-butterfly reduction order), GRAYS within **~3e-8** (bound 1e-6).

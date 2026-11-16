@@ -62,6 +62,12 @@ CASES = [
 ]
 
 
+# nnedi3vk's default on a VK_NV_cooperative_vector device is its fp16 matrix
+# kernel; that is a device-specific path vsfeel does not port, so its rows are
+# graded against the reference's plain f32 kernel.
+REF_KWARGS = {"nnedi3vk": {"coopvec": 0}}
+
+
 @pytest.mark.parametrize(
     "name,plugin,ref_filter,kind,kwargs,bound",
     CASES,
@@ -74,6 +80,7 @@ def test_rgb_matches_reference(name, plugin, ref_filter, kind, kwargs, bound):
         kind,
         frames=(0, 11),
         kwargs=kwargs,
+        ref_kwargs=REF_KWARGS.get(plugin),
         vsfeel_filter=name.split("_")[0],
     )
     payload = reference_compare(spec)

@@ -170,7 +170,10 @@ _GEOM_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
                                             sample=vs.FLOAT)
             return core.bm3d.Basic(main, **cpu)
         if filter_ == "nnedi3":
-            return core.nnedi3vk.NNEDI3(main, field=1, **params)
+            # Pin the reference's plain f32 kernel: its NV cooperative-vector
+            # default is a device-specific fp16 path vsfeel does not port.
+            # Never in _NNEDI3_PARAMS -- that dict also reaches vsfeel.
+            return core.nnedi3vk.NNEDI3(main, field=1, coopvec=0, **params)
         if filter_ == "nlmeans":
             return core.vszipcl.NLMeans(main, **params)
         if filter_ == "eedi3":
