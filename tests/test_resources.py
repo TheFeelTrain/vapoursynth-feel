@@ -10,6 +10,10 @@ it is not perturbed by the desktop.  Both are reported; only the per-process
 series is graded, and RSS covers host-side owners.  A subprocess per filter
 keeps a hang or crash out of the suite.
 
+That test is Linux-only: the graded figure is DRM fdinfo, which has no Windows
+or macOS equivalent, so it skips elsewhere.  A green run there says nothing
+about GPU leaks; the concurrency test below is portable and runs everywhere.
+
 ``test_mixed_filter_concurrency_matches_solo`` creates every filter at once on
 the shared device, evaluates them together and compares each against its solo
 run; BM3D uses ``extractor_exp=8`` so its atomic aggregation is
@@ -115,10 +119,14 @@ def build(name, gs, g16):
 
 def drm_memory():
     """Per-process (vram, gtt, cpu) bytes from the DRM render-node fds; None
-    when the process holds no DRM fd at all."""
+    when the process holds no DRM fd or procfs is absent."""
+    try:
+        fds = os.listdir("/proc/self/fd")
+    except OSError:
+        return None
     vram = gtt = cpu = 0
     found = False
-    for fd in os.listdir("/proc/self/fd"):
+    for fd in fds:
         try:
             target = os.readlink("/proc/self/fd/" + fd)
         except OSError:
@@ -166,10 +174,14 @@ def device_vram():
 
 
 def read_rss():
-    with open("/proc/self/status") as fh:
-        for line in fh:
-            if line.startswith("VmRSS:"):
-                return int(line.split()[1]) * 1024
+    """Resident set size in bytes; None where /proc/self/status is absent."""
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
     return None
 
 
@@ -364,6 +376,10 @@ def _format(key, trend, limit=None):
     )
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="per-process GPU memory comes from DRM fdinfo; no Windows or macOS equivalent",
+)
 @pytest.mark.parametrize("filter_name", FILTERS)
 def test_create_destroy_cycles_keep_memory_bounded(filter_name):
     """200 create/evaluate/destroy cycles must not raise RSS or GPU memory.
