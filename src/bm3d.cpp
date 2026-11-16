@@ -2943,11 +2943,20 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
     // "Ada": RADV is the one measured family and everything else takes the
     // safe pair. VSFEEL_BM3D_PATCH_LDS / VSFEEL_BM3D_SPLIT_KERNEL=0/1
     // override either.
+    //
+    // Blackwell is the second measured family and it inverts the patch choice:
+    // the register arm is +7.2% there (RTX 5060 Laptop, 1080p f32, ABBA n=12),
+    // against Ada's +8.8% for the shared one, so the arch decides and the
+    // driver family alone cannot.
     const char * patch_lds_env = std::getenv("VSFEEL_BM3D_PATCH_LDS");
     const char * split_env = std::getenv("VSFEEL_BM3D_SPLIT_KERNEL");
-    d->patch_lds = patch_lds_env && *patch_lds_env
-                       ? env_flag("VSFEEL_BM3D_PATCH_LDS")
-                       : d->gpu->driver_id != VK_DRIVER_ID_MESA_RADV;
+    const bool blackwell =
+        vsfeel_is_blackwell(d->gpu->vendor_id, d->gpu->device_id);
+    const bool patch_default = !blackwell;
+    d->patch_lds =
+        patch_lds_env && *patch_lds_env
+            ? env_flag("VSFEEL_BM3D_PATCH_LDS")
+            : (d->gpu->driver_id != VK_DRIVER_ID_MESA_RADV && patch_default);
     d->split_kernel = split_env && *split_env
                           ? env_flag("VSFEEL_BM3D_SPLIT_KERNEL")
                           : d->gpu->driver_id != VK_DRIVER_ID_MESA_RADV;
@@ -2957,7 +2966,9 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
     const char * patch_policy =
         patch_lds_env && *patch_lds_env
             ? "VSFEEL_BM3D_PATCH_LDS"
-            : (measured_driver ? "measured driver" : "conservative default");
+            : (measured_driver ? "measured driver"
+                               : (blackwell ? "measured Blackwell"
+                                            : "conservative default"));
     const char * split_policy =
         split_env && *split_env
             ? "VSFEEL_BM3D_SPLIT_KERNEL"

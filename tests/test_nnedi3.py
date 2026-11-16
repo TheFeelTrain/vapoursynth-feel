@@ -84,6 +84,26 @@ def _run(clip, field=1, **kwargs):
     )
 
 
+def test_nnedi3_staged_output_matches_the_in_place_path(clip_gray16, monkeypatch):
+    """The staged output is a byte copy, so it must not move a code.
+
+    NVIDIA publishes through a staged plane by default; elsewhere the path is
+    reached only when a test forces it, and the commit copy is the riskiest
+    operation the filter does (it publishes a whole plane from a private buffer).
+    """
+    # Both arms are forced: the default follows the vendor, so neither may rely
+    # on it on the machine the test happens to run on.
+    monkeypatch.setenv("VSFEEL_NNEDI3_OSTAGE", "0")
+    in_place = _run(clip_gray16, field=3, nsize=0, nns=4, qual=2)
+    monkeypatch.setenv("VSFEEL_NNEDI3_OSTAGE", "1")
+    staged = _run(clip_gray16, field=3, nsize=0, nns=4, qual=2)
+    monkeypatch.delenv("VSFEEL_NNEDI3_OSTAGE", raising=False)
+    for n in (0, 7, 23):
+        a, b = in_place.get_frame(n), staged.get_frame(n)
+        for p in range(a.format.num_planes):
+            assert np.array_equal(_plane(a, p), _plane(b, p)), (n, p)
+
+
 # nnedi3vk enables its VK_NV_cooperative_vector fp16 matrix kernel by default on
 # a device that has the extension. That is the reference's own fp16 arithmetic,
 # not the algorithm vsfeel ports, so the oracle is pinned to its plain f32

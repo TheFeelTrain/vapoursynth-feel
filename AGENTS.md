@@ -70,6 +70,18 @@ All filters share an inline (zero-overhead, C++20) plumbing layer in
   owns the ring, the timeline and the scratch lifetime and turns producer pairs
   into device-side waits, so the host never waits per frame. Copy the pattern
   from gaussblur/bilateral/nnedi3 (stateless) or bm3d/dfttest (cached/temporal).
+- **Input staging**: `gpu_stage_plane` records one `vkCmdCopyBuffer2` per input
+  plane per frame into filter-owned device-local memory, and
+  `gpu_stage_barrier` orders the copies before the first reader; bind the copy
+  instead of the core plane. It is on by default for NVIDIA and off elsewhere
+  (`VSFEEL_STAGE`): reading a core plane measured 1.2x-5.7x slower there, while
+  the copy costs up to 13.8% on an RX 7900 XTX. Record every copy before the
+  barrier.
+- **Output staging**: `gpu_out_stage_begin` hands a plane-sized private buffer
+  and `gpu_out_stage_commit` orders the consumer's stores, then bulk-copies it
+  into the core plane. Use it only where the stores are not coalesced (it lost
+  7% on coalesced `col2im` stores and won up to 76% on strided ones), and
+  commit after the last write. It defaults on for NVIDIA (`VSFEEL_OSTAGE`).
 - **Cross-frame caches stay possible without owning a submission**: the slot's
   ready flag is *submitted*, not a timeline value, and a full
   `vkCmdPipelineBarrier` at the start of the reader's first command buffer
@@ -309,6 +321,17 @@ runs it. Plugins are described separately in `PLUGINS`.
   and `--gpu-cache-mb` bounds whichever cache holds them. Frames loop for as
   long as the run needs, so temporal filters see a seam every N frames — fine
   for throughput, not for output inspection.
+- `--vs-cache-mb` pins `core.max_cache_size` (default 49152) and
+  `--gpu-limit-mb` pins `core.max_vram_cache_size` (default: the core's own).
+  Every generated script prints
+  `[bench] vram budget=... limit=... host_cache=...`, which the harness forwards
+  on success; quote that line with any ratio, because the regime moves a filter
+  by tens of percent on a small card. The run header also names each arm's input
+  residency: an arm outside `FilterSpec.gpu_plugins` pays a per-frame download,
+  so a ratio that only holds in the default mode belongs to a transfer, and a
+  cross-machine pair needs the same mode on both sides. Check the reference
+  arm's numerics class too: `nnedi3vk` defaults to NVIDIA's fp16
+  cooperative-vector path there, and `vszipcu` is a CUDA build.
 - **Every arm runs for the same wall time** (`--seconds`, default 5): the
   harness stops vspipe once its progress reports span that window and reports
   the frames counted over it, so a slow reference costs no more than a fast

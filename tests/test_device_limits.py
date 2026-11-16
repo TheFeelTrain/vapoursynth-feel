@@ -676,10 +676,15 @@ def test_gaussblur_small_path_fits_the_guaranteed_workgroup_memory():
     lds = [v for sigma in (0.5, 1.0, 1.2) for v in _gauss_lds(sigma, floor)]
     assert 1680 in lds, lds  # radius 3, the largest the small path asks for
     assert max(lds) <= 16384, lds  # and it fits the floor
-    # Sigma 1.4 is radius 4, already two-pass: it creates two pipelines
-    # (vert + horiz) and uses no shared memory, so the numbers say which path a
-    # config took.
-    assert _gauss_lds(1.4, floor) == [0, 0]
+    # Sigma 1.4 is radius 4, already two-pass: it creates two pipelines (vert +
+    # horiz). The vertical pass asks for no shared memory; the horizontal one
+    # stages its input span (`VSFEEL_GAUSS_HORIZ_LDS`), so its tile is positive
+    # and must fit the same floor - which is what makes the numbers say both
+    # which path a config took and that the tile is device-safe. The tile is
+    # forced on: its vendor default is an A/B result, not a device limit.
+    two_pass = _gauss_lds(1.4, {**floor, "VSFEEL_GAUSS_HORIZ_LDS": "1"})
+    assert len(two_pass) == 2 and two_pass[0] == 0, two_pass
+    assert 0 < two_pass[1] <= 16384, two_pass
 
 
 # ---------------------------------------------------------------------------

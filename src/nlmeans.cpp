@@ -33,7 +33,8 @@ namespace {
 // ---------------------------------------------------------------------------
 //
 // NLMeans reads the core's GPU resident source (and guide) frame planes
-// directly and writes the output frame's planes in place: `vnode:gpu` in,
+// directly or from per-frame copies on NVIDIA, and writes the output frame's
+// planes in place: `vnode:gpu` in,
 // `vnode:gpu` out with ffGPUOutput. There is no tile pool, no host upload, no
 // download and no custom queue/fence: the core caches the temporal window's
 // frames in VRAM and the exec pool carries synchronization as producer pairs.

@@ -107,11 +107,10 @@ the native type, dropping the caller's `depth()` node (see Performance).
 - The combined group list (`ge`/`gxy`/`gz`) is the one private array left whose
   index is not a compile-time constant (the tail sort's `b`, the insert's `pos`).
   It stays per-lane: a shared copy measured 2.6x slower on Ada (see Historical).
-- The codegen pair is per compiler: RADV keeps registers + fused, which measure
-  8-10% and 13% better there, and every other compiler gets the shared patch
-  plus the split, the low-pressure side of both choices. Historical has the
-  numbers and the ~3x a non-promoted patch array costs; `driver_id` names the
-  compiler family, so nothing claims "Ada" from it.
+- The codegen pair is keyed on compiler and arch: RADV keeps registers + fused
+  (8-10% and 13% better there); other compilers get the shared patch plus the
+  split, except Blackwell, where registers measured 7.2% better. Historical
+  has the numbers; `driver_id` names the compiler family, not an arch.
 - Each walk evaluates one candidate per iteration in place (skip the reference
   origin, SSD, threshold, insert) with scalar coordinates; the row wrap is a
   `while` because the 8-lane step can overshoot a window narrower than 8 (the
@@ -273,6 +272,10 @@ the native type, dropping the caller's `depth()` node (see Performance).
 
 Chronological; each entry keeps the mechanism, not the story.
 
+- **2026-11-16 — the reference patch's home is an arch choice; Blackwell
+  inverts it (+7.2%, 1080p f32).** Non-RADV took the shared patch from one Ada
+  measurement; on GB206 per-lane registers are faster (**237.5 -> 254.5 fps**,
+  ABBA n=12), so `vsfeel_is_blackwell()` picks it and the banner names why.
 - **2026-11-05 — the CAS retry bound counts the temporal centres.** The
   `-DNO_FLOAT_ATOMICS` loop bounded retries by spatial-only `8*cells^2`
   (13448 at bm_range=16/step 1), but `2*radius+1` centres scatter into one
@@ -674,12 +677,12 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
   (default 4). Temporal rings are fixed; the isolated source ring is lazy.
 - `VSFEEL_BM3D_CAS=1` — force the CAS aggregation build (A/B only).
 - `VSFEEL_BM3D_PATCH_LDS=0/1` — force either reference-patch arm; unset follows
-  the measured driver rule. The banner names the arm and its source.
+  the measured compiler/arch rule. The banner names the arm and its source.
 - `VSFEEL_BM3D_SPLIT_KERNEL=0/1` — force either estimation path; unset follows
   the measured driver rule (split everywhere except RADV, where it is 13%
   worse). Banner likewise.
-- `VSFEEL_LIMIT_DRIVER_ID=<id>` — tests only: report that id, so one GPU can
-  stand on both sides of the rule (`3` is RADV).
+- `VSFEEL_LIMIT_DRIVER_ID`/`..._VENDOR_ID`/`..._DEVICE_ID` — tests only: report
+  that identity so one GPU stands on both sides of a rule (`3` is RADV).
 - `VSFEEL_BM3D_SUBGROUP=64` — force wave64 instead of the driver's default.
 - `VSFEEL_BM3D_WORKGROUP=<n>` — launch width, a multiple of 8.
 - `VSFEEL_BM3D_NOSEARCH=1` / `NOESTIMATE=1` — ablation knobs; NOSEARCH is the

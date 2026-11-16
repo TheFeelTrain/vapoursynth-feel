@@ -39,10 +39,11 @@ using namespace std::string_literals;
 // vsfeel's own implementation of the predictor/prescreener math both GPU
 // references compute (nnedi3vk and vszipcu agree bit-exactly, see
 // notes/NNEDI3.md). The filter moves no pixels itself: the kernels read the
-// source frame plane in place at its own row pitch and write kept rows and
-// interpolated rows straight into the output frame's planes, so the whole
-// frame is one recorded command buffer whose synchronization travels as the
-// producer pairs the exec pool publishes.
+// source frame plane (directly or from a per-frame copy) at its own row pitch
+// and write kept rows and interpolated rows into the output frame's planes
+// (directly or through a staged copy), so the whole frame is one recorded
+// command buffer whose synchronization travels as the producer pairs the exec
+// pool publishes.
 //
 // Per plane (src/nnedi3.comp):
 //   ENTRY_KEEP      kept rows straight into the output plane
@@ -444,6 +445,9 @@ struct Nnedi3Data {
     // Read the source plane from a private device-local copy per frame (see
     // gpu_stage_plane); off with VSFEEL_NNEDI3_STAGE=0.
     bool stage { true };
+    // Publish the output plane through a private copy; off with
+    // VSFEEL_NNEDI3_OSTAGE=0.
+    bool ostage { true };
     std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
         ht_total_ns {}, ht_n {};
 
@@ -570,7 +574,8 @@ static void barrier_prescreen_to_predict(const GPUDevice & g,
 // ---------------------------------------------------------------------------
 
 // GPU input, GPU output: the kernels read the source plane and write the
-// output frame's planes in place; the core owns every transfer.
+// output frame's planes, directly or through the staging helpers; the core owns
+// every transfer.
 static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
                                             void * instanceData,
                                             [[maybe_unused]] void ** frameData,
@@ -760,9 +765,9 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
         const int dst_stride =
             static_cast<int>(vsapi->getStride(dst, p) / d->elem_bytes);
 
-        // Keep, prescreen and predict all read the source plane in place; a
-        // private device-local copy is what makes those reads fast here
-        // (see gpu_stage_plane).
+        // Keep, prescreen and predict all read the source plane, in place or
+        // from a private copy; a private device-local copy is what makes those
+        // reads fast here (see gpu_stage_plane).
         VkBuffer src_buffer = sp.buffer;
         if (d->stage) {
             GpuBuffer staged {};
@@ -774,10 +779,23 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
             gpu_stage_barrier(*d->gpu, cmd);
         }
 
+        // Keep and predict both write the output plane; into a core plane those
+        // stores measured slower than into a private buffer, so stage them and
+        // publish with one bulk copy (VSFEEL_NNEDI3_OSTAGE=0 opts out).
+        GpuBuffer out_stage {};
+        VkBuffer dst_buffer = dp.buffer;
+        if (d->ostage) {
+            if (auto e = gpu_out_stage_begin(*d->gpu, core, ctx, dp, out_stage);
+                !e.empty()) {
+                return fail("staged output: " + e);
+            }
+            dst_buffer = out_stage.buffer;
+        }
+
         // All seven bindings re-pushed per dispatch; the scratch slots stand
         // in where this entry statically reads nothing (see src/nnedi3.comp).
         const VkBuffer buffers[7] { src_buffer,
-                                    dp.buffer,
+                                    dst_buffer,
                                     d->ps.buffer,
                                     d->pdw.buffer,
                                     d->pdb.buffer,
@@ -794,9 +812,6 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           cfg.keep_pipeline);
             d->gpu->vk->vkCmdDispatch(cmd, cfg.keep_grid_x, cfg.keep_grid_y, 1);
-        }
-        if (!d->process[p]) {
-            continue;
         }
 
         // max_grid_x rides along so the compaction can cap X and publish the Y
@@ -846,6 +861,11 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
         if (gputrace && p == probe_plane) {
             d->gpu->vk->vkCmdWriteTimestamp2(
                 cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->probe.query, 2);
+        }
+        // Every plane that reaches here is processed (the loop head skips the
+        // rest), so the output stage always has a full plane to publish.
+        if (d->ostage) {
+            gpu_out_stage_commit(*d->gpu, cmd, out_stage, dp);
         }
     }
 
@@ -1097,6 +1117,8 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
 
     d->stage =
         env_flag_or("VSFEEL_NNEDI3_STAGE", vsfeel_stage_default(*d->gpu));
+    d->ostage =
+        env_flag_or("VSFEEL_NNEDI3_OSTAGE", vsfeel_ostage_default(*d->gpu));
 
     // The packed half predictor computes in half, which needs the optional
     // shaderFloat16 feature; a device without it keeps the storage-only f16

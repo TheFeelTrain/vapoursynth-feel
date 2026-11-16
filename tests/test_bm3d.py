@@ -840,9 +840,12 @@ def test_bm3d_codegen_policy_is_named_and_conservative_by_default():
         ]
     else:
         assert (choice, source) == ("match + filter split", "conservative default"), plan.group(0)
-        assert "reference patch: shared memory (policy: conservative default)" in default, default[
-            -2000:
-        ]
+        patch_line = re.search(r"\[bm3d\] reference patch: (.+) \(policy: ([^)]+)\)", default)
+        assert patch_line, default[-2000:]
+        assert (patch_line.group(1), patch_line.group(2)) in (
+            ("per-lane registers", "measured Blackwell"),
+            ("shared memory", "conservative default"),
+        ), patch_line.group(0)
 
     # Both sides of the rule, deterministically.
     radv = _policy_banner({"VSFEEL_LIMIT_DRIVER_ID": "3"})
@@ -854,7 +857,42 @@ def test_bm3d_codegen_policy_is_named_and_conservative_by_default():
     assert "estimation: match + filter split (policy: conservative default, driver 1)" in other, (
         other[-2000:]
     )
-    assert "reference patch: shared memory (policy: conservative default)" in other, other[-2000:]
+
+    # The arch rule, pinned from both sides with the identity seam: a non-RADV
+    # driver on a Blackwell part takes the register arm; on an Ada part it keeps
+    # the shared patch. Either the rule or its negation would pass a looser
+    # assertion, so both outcomes are named.
+    def _patch_line(stderr):
+        found = re.search(r"\[bm3d\] reference patch: (.+) \(policy: ([^)]+)\)", stderr)
+        assert found, stderr[-2000:]
+        return found.group(1), found.group(2)
+
+    blackwell = _policy_banner(
+        {
+            "VSFEEL_LIMIT_DRIVER_ID": "1",
+            "VSFEEL_LIMIT_VENDOR_ID": "4318",
+            "VSFEEL_LIMIT_DEVICE_ID": "11349",
+        }
+    )
+    assert _patch_line(blackwell) == ("per-lane registers", "measured Blackwell"), _patch_line(
+        blackwell
+    )
+    ada = _policy_banner(
+        {
+            "VSFEEL_LIMIT_DRIVER_ID": "1",
+            "VSFEEL_LIMIT_VENDOR_ID": "4318",
+            "VSFEEL_LIMIT_DEVICE_ID": "9860",
+        }
+    )
+    assert _patch_line(ada) == ("shared memory", "conservative default"), _patch_line(ada)
+    amd = _policy_banner(
+        {
+            "VSFEEL_LIMIT_DRIVER_ID": "1",
+            "VSFEEL_LIMIT_VENDOR_ID": "4098",
+            "VSFEEL_LIMIT_DEVICE_ID": "29772",
+        }
+    )
+    assert _patch_line(amd) == ("shared memory", "conservative default"), _patch_line(amd)
 
     # Either half can still be forced, and the banner names the knob as the
     # source rather than the rule.

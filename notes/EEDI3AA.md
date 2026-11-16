@@ -247,6 +247,9 @@ reference chain:
 
 ## Historical
 
+- **2026-11-16 — output staging measured +15% and was reverted.** It failed the
+  shared EEDI3 f16 tests, and the cause is open; see `notes/EEDI3.md`'s Open work
+  before retrying.
 - **2026-11-16 — the clip, sclip and mask planes are staged per batch (+25%,
   1080p16).** On an RTX 5060 the pads' in-place reads measured several times
   slower than a private copy, so each submission's planes are staged first:

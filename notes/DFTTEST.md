@@ -5,7 +5,9 @@ Target GPU: RX 7900 XTX (RDNA3, gfx1100), Mesa 26.2 RADV.
 
 - `clip:vnode:gpu` in, `ffGPUOutput` out: the core owns every transfer and the
   filter records one submission per output frame into one exec pool (no
-  filter-owned staging, timelines, fences or descriptor sets).
+  filter-owned host upload/download machinery, timelines, fences or descriptor
+  sets). The temporal source planes are read in place, or from per-frame private
+  device-local copies on NVIDIA (`gpu_stage_plane`, see Historical).
 - u16 / f16 / f32 IO. The half path stages native `float16_t` in the padded
   plane and widens for the f32 work; half is a storage width, not a precision
   (Implementation).
@@ -228,9 +230,9 @@ force-pad / fail-pad probes.
   the f32 module's (VGPR 120, 12 waves/SIMD; VALU 1710 vs 1777).
 - **CPU in / CPU out** is core-inserted upload+download (both free: ReBAR memcpy
   ahead, SDMA download). `--download` is +1.4% over the CPU-cache row
-  (2013.6 vs 1984.9 fps; core planes read in place) and chained instances +4%,
-  the residual being the pad dispatch and the ring barriers the chain still
-  pays.
+  (2013.6 vs 1984.9 fps; core planes read in place on this GPU), chained
+  instances +4%, the residual being the pad dispatch and the ring barriers the
+  chain still pays.
 - **Fused codegen residue is deliberately left**: remaining IM2COL/window ALU
   and pointer-walk strength reduction; col2im already runs ~2x the references.
 
@@ -442,6 +444,12 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   would fit 2 stripes at 1080p (72 MB ring) if the reindexing is worth ~2-3%.
   The budget now follows the part's cache (see Historical), so a device with a
   different last level trades stripes for it without a rebuild.
+- **The whole-memory barrier is not the cost.** No-op'ing it measured +9.8% on
+  an RTX 5060, but that ablation also removes the ordering between passes. A
+  correct per-buffer narrowing measured 1.005x (428.5 vs 430.8 fps), so the
+  fence is worth ~0.5% and the patch was dropped as surface without a gain.
+- **Output staging is not a win here** (0.93x): `col2im`'s stores are already
+  coalesced, so the bulk copy is pure added work (see `notes/BILATERAL.md`).
 - `pad`/`col2im` are 32x8 (256 invocations, one of the plugin's largest
   workgroups), which Vulkan 1.4 guarantees: `maxComputeWorkGroupInvocations` is
   256 for a 1.4 device, the 128 in core Vulkan's limit table included. Neither

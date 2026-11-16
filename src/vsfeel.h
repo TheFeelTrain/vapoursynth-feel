@@ -637,6 +637,14 @@ inline VkDeviceSize vsfeel_vram_limit(const GPUDevice & dev, VSCore * core) {
     return limit;
 }
 
+// A device-class override seam, like VSFEEL_LIMIT_DRIVER_ID: a policy keyed on
+// the part cannot be tested on one GPU without standing on the other side of its
+// rule, so the reported identity can be forced for a test.
+inline uint32_t vsfeel_limit_u32(const char * env, uint32_t value) {
+    const int forced = env_int(env, static_cast<int>(value));
+    return forced < 0 ? value : static_cast<uint32_t>(forced);
+}
+
 // A part's last-level cache size in bytes, or 0 when the PCI IDs are not in
 // the table. Nothing in Vulkan (up to 1.4) reports a cache size, so sizing a
 // cache-resident working set has to key off the part itself: the entries are
@@ -752,6 +760,19 @@ inline VkDeviceSize vsfeel_gpu_llc_bytes(uint32_t vendor_id,
         }
     }
     return 0;
+}
+
+// Whether the part is a consumer Blackwell die (GB20x). Only used to pick which
+// of two measured kernel shapes to default to: the register patch arm is +7.2%
+// on GB206 (RTX 5060 Laptop, 1080p f32, ABBA n=12) while Ada measured +8.8%
+// the other way, so the arch has to decide and a driver-family rule cannot. The
+// range holds every published GB20x ID and no Ampere, Ada or Hopper one (those
+// stop below 0x2900); GB206 is the only part measured, so the family rule is an
+// SM-generation assumption to re-check on the next Blackwell part.
+inline bool vsfeel_is_blackwell(uint32_t vendor_id, uint32_t device_id) {
+    vendor_id = vsfeel_limit_u32("VSFEEL_LIMIT_VENDOR_ID", vendor_id);
+    device_id = vsfeel_limit_u32("VSFEEL_LIMIT_DEVICE_ID", device_id);
+    return vendor_id == 0x10de && device_id >= 0x2b00 && device_id <= 0x2fff;
 }
 
 // A cache-resident budget for a working set the filter wants to keep in the
@@ -926,6 +947,16 @@ inline bool vsfeel_stage_default(const GPUDevice & gpu) {
     return gpu.vendor_id == 0x10de;
 }
 
+// Output staging's default: its own switch, falling back to the input default so
+// one vendor rule still decides both. Separate because a caller A/B'ing an
+// input-staging hypothesis must not move the write side too.
+inline bool vsfeel_ostage_default(const GPUDevice & gpu) {
+    if (std::getenv("VSFEEL_OSTAGE")) {
+        return env_flag("VSFEEL_OSTAGE");
+    }
+    return vsfeel_stage_default(gpu);
+}
+
 inline void gpu_stage_barrier(const GPUDevice & g, VkCommandBuffer cmd) {
     VkMemoryBarrier2 mb {};
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
@@ -938,6 +969,50 @@ inline void gpu_stage_barrier(const GPUDevice & g, VkCommandBuffer cmd) {
     dep.memoryBarrierCount = 1;
     dep.pMemoryBarriers = &mb;
     g.vk->vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+// --- Output staging ----------------------------------------------------------
+//
+// The write side of the same asymmetry: shader stores into a core frame plane
+// measured 9x slower than stores into a private buffer (GaussBlur's horizontal
+// pass on an RTX 5060, 1080p16: 646 us into the plane, 72 us into a filter-owned
+// copy). So a filter can write its result into `gpu_out_stage_begin`'s buffer
+// and publish it with one bulk copy, which is fast. The copy is byte-for-byte
+// the plane, so padding and layout are unchanged.
+inline std::string gpu_out_stage_begin(const GPUDevice & g, VSCore * core,
+                                       VSGPUExecContext * ctx,
+                                       const VSVulkanPlaneInfo & plane,
+                                       GpuBuffer & out) {
+    return gpu_frame_buffer(g, core, ctx, plane.bufferSize, out,
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+}
+
+// Order the consumer's stores against the copy, then copy the whole plane. The
+// core's producer pair orders the result for the frame's next consumer.
+inline void gpu_out_stage_commit(const GPUDevice & g, VkCommandBuffer cmd,
+                                 const GpuBuffer & out,
+                                 const VSVulkanPlaneInfo & plane) {
+    VkMemoryBarrier2 mb {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    VkDependencyInfo dep {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &mb;
+    g.vk->vkCmdPipelineBarrier2(cmd, &dep);
+    VkBufferCopy2 region {};
+    region.sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2;
+    region.size = plane.bufferSize;
+    VkCopyBufferInfo2 info {};
+    info.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2;
+    info.srcBuffer = out.buffer;
+    info.dstBuffer = plane.buffer;
+    info.regionCount = 1;
+    info.pRegions = &region;
+    g.vk->vkCmdCopyBuffer2(cmd, &info);
 }
 
 // Destroy a set of pipelines once each. A filter that shares pipelines across

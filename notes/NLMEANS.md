@@ -5,8 +5,9 @@ Status: **shipped on the R80 GPU API.** Verified against
 
 - `clip:vnode:gpu` in, `ffGPUOutput` out: the core owns every transfer and the
   filter records one submission per output frame into one exec pool. No slot
-  pool, frame cache, staging, host upload/download, per-stream buffers,
-  fences, command pools, descriptor pool or custom queue.
+  pool, frame cache, host upload/download, per-stream buffers, fences, command
+  pools, descriptor pool or custom queue; the window's planes are read in place,
+  or from per-frame private copies on NVIDIA (see Historical).
 - Per output frame: request the `2d+1` (clamped) source frames, acquire a
   context, build a tiny address table of every `(clip, channel, layer)` plane
   address, **compose** those planes once into one zero-padded device-local
@@ -242,7 +243,7 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
   plane-count dependent.
 - **Transfers** (mechanism: `notes/BILATERAL.md`): with the SDMA opt-in the
   CPU-fed chain (`--cpu-cache --download`) is at parity and `--download` is
-  +1.6% (core planes in place).
+  +1.6% (core planes in place on this GPU).
 - **The window is rebuilt every frame.** A persistent GPU slot cache copying
   only the layers that newly entered the window would cut the compose cost, but
   at the shipped `d=2` it is ~2% and not worth the holder/lifetime machinery the
@@ -444,6 +445,8 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   descriptors), which RADV reports at the minimum of 32. The ring target is
   capped by the core's VRAM limit, so a device with a smaller allowance plans a
   smaller round.
+- **Output staging is neutral here** (1.00x): the finish stores are coalesced,
+  so the bulk copy is pure added work (see `notes/BILATERAL.md`).
 - **`a=64, d=16` hard-recovers the GPU when the device is shared** — a
   co-scheduled weight sweep is the trigger, not an OOB or a timeout. Do not run
   it beside another GPU client; `-n 8 --dist loadfile` keeps it serial per file.

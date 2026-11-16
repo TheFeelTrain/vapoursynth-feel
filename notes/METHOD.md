@@ -26,9 +26,9 @@ The order to work in; the two sections below are the detail behind it.
 ## Comparing a vsfeel kernel against the reference kernels
 
 When a vsfeel filter is slower than a reference on the same GPU, the win is
-almost always in kernel *codegen* or *launch structure*, not the algorithm.
-Both references (vszipcl = OpenCL/ROCm, vszipcu = HIP/ROCm) run on the same
-RX 7900XTX, so a fair comparison is possible. Method that worked for DFTTest:
+almost always kernel *codegen* or *launch structure*, not the algorithm.
+vszipcl (OpenCL) is the AMD reference; vszipcu is CUDA and NVIDIA-only, so it
+is compared on an NVIDIA box. This is the method that worked for DFTTest:
 
 1. **Profile each GPU kernel of the references directly** before theorizing.
    For ROCm references use `rocprofv3 -S --kernel-trace --memory-copy-trace --
@@ -38,11 +38,10 @@ RX 7900XTX, so a fair comparison is possible. Method that worked for DFTTest:
    pool and stamp inside the one submitted CB, arm on a warm frame (frame 0 runs
    at idle clocks; check `pp_dpm_sclk`), read back with
    `vkCmdCopyQueryPoolResults` + `WAIT_BIT`. Reset and stamps share one CB or
-   pool reuse across frames/resources races, and a CB recorded but never
-   submitted reads back as epoch values — sanity-check deltas.
-   Correlate structural differences (frame caches, launch config, stream/queue
-   counts) against the numbers before trusting any theory — e.g. the DFTTest
-   frame cache was worth only ~+24%, NOT the whole lead.
+   pool reuse races; a CB never submitted reads back as epoch values.
+   Correlate structure (frame caches, launch config, stream/queue counts)
+   against the numbers before trusting a theory: DFTTest's frame cache was
+   worth only ~+24%, not the whole lead.
 2. **Compare compiled instruction streams, not just time.** OpenCL reference
    kernels can be disassembled offline:
    `/opt/rocm/llvm/bin/clang -x cl -target amdgcn-amd-amdhsa -mcpu=gfx1100 -O3
@@ -99,6 +98,12 @@ RX 7900XTX, so a fair comparison is possible. Method that worked for DFTTest:
    four candidates' loads before consuming any took BM3D's estimation kernel
    ~20% off. Sweep the width: 2/4/8 is a shallow optimum, because register
    pressure eventually wins.
+- **A GPU stamp is not a kernel time until it passes the memory roofline and
+  the submission's own state.** The first interval of a submission also carries
+  the previous frame's drain, so a 1x1 dispatch reported 1941 µs before the
+  identical full dispatch reported 32 µs; 25 MB in 32 µs is 780 GB/s on a
+  ~448 GB/s part, so it was no kernel. Cross-check every stamp against the
+  bandwidth and the frame's actual work before quoting it.
 
 General lesson: make every branch that is fixed per invocation (filter type,
 bit depth, window shape) a specialization constant or `#if` so the shader
@@ -166,21 +171,19 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   borders on such input).
 - **Trust only end-to-end benchmark fps medians over the default 5 s window.**
   Each arm runs until vspipe's progress reports span `--seconds` (default 5),
-  so the run outlasts the clock ramp and a slow reference costs the same wall
-  time; never shrink `--seconds` to iterate faster.
-  Microsecond GPU traces swing run-to-run (clock variance), and concurrent
-  submissions share the compute queue, so per-kernel timings from a deep
-  pipeline include other frames' work — attribute kernels only in serialized
-  traces. A change that does not move the fps median did not happen. Identical
-  binaries swing between invocations too: compare same-session pairs or medians
-  over the full window, never single short bursts, and check `pp_dpm_sclk` and
-  repeat 3x before debugging a one-shot trace that moved. When one plugin swings
-  while the other stays flat, triage in order: repeat the same command 5x,
-  interleave alone-vs-pair, poll `pp_dpm_sclk` / `gpu_busy_percent` *during* the
-  run (a single read afterwards only sees idle), then thermals and host load,
-  then **harness memory** (the bimodal rule below). Same-session pairs stay fair
-  through all of it; grade on those, and lengthen the run before trusting an
-  absolute number.
+  so the clock ramp is inside the window and a slow reference costs the same
+  wall time; never shrink `--seconds` to iterate faster.
+  GPU traces swing run-to-run, and a deep pipeline's per-kernel timings include
+  other frames' work: attribute kernels only in serialized traces. A change
+  that does not move the fps median did not happen. Identical binaries swing
+  too: compare same-session pairs or full-window medians, never short bursts,
+  and repeat 3x before debugging a one-shot trace that moved. When one plugin
+  swings while the other stays flat, triage in order: repeat the same command
+  5x, interleave alone-vs-pair, poll `pp_dpm_sclk` / `gpu_busy_percent`
+  *during* the run (a single read afterwards only sees idle), then thermals and
+  host load, then **harness memory** (the bimodal rule below). Same-session
+  pairs stay fair through all of it; grade on those, and lengthen the run before
+  trusting an absolute number.
 - **A GPU filter's fps carries the chain's transfers unless the output side is
   dropped, which is the benchmark's default.** vspipe's output node is a CPU
   node, so left alone the core downloads a GPU-resident output — a per-frame
@@ -204,12 +207,12 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   upscale is folded into the cached frames, so it stays out of the timed region
   and the filter's compute at that size is what the fps shows.
 - **Prove the host/GPU split before optimizing anything.** Add a small env-gated
-  chrono probe around the frame path (acquire / record / submit) and read it on
-  real content first — kernel work that looks dominant from reading code is
-  routinely not the bottleneck. Reset the stage clock after every blocking
-  acquire so waits never leak into the next stage, and cross-check summed stages
-  against wall-clock — a stage reporting milliseconds for a microsecond memcpy
-  is a timer bug, not a finding. Keep durable probes in-tree; delete one-shots.
+  chrono probe around the frame path and read it on real content first: kernel
+  work that looks dominant from reading code is routinely not the bottleneck.
+  Reset the stage clock after each blocking acquire, cross-check summed stages
+  against wall-clock (milliseconds for a microsecond memcpy is a bug), and read
+  `record`/`submit` for host cost: `acquire` is the exec ring sleeping. Keep
+  durable probes in-tree; delete one-shots.
 - **"I removed the work and nothing changed" is a RESULT, not a failed probe.**
   On EEDI3, deleting the entire DP + backtrack + interpolate changed fps by −1%:
   the GPU kernel was fully hidden behind the host path at that stream count. The
@@ -226,6 +229,10 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   a same-session sweep of the real binary** — ten lines, and both arms are
   measured under identical conditions. Reach for the scratch C program only to
   rule a mechanism *out*, never to pick a winner.
+- **Price an input read before pricing a kernel.** A core frame plane measured
+  1.2x-5.7x slower to read than a private copy on an RTX 5060, while the copy
+  cost 1.7-13.8% on an RX 7900 XTX, so `gpu_stage_plane` defaults on for NVIDIA
+  only. Gate a device workaround on the device, never the OS.
 - **Minimize bytes moved, then minimize copies — and count reads per source
   byte, not just copies.** Transfer buffers in the narrowest
   exactly-representable type and widen on load (native u16 pad instead of f32
@@ -292,24 +299,20 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   buffer-binding table in minutes.
 - **A bimodal measurement is a bug to chase, and the harness's memory budget
   is part of the measurement.** One binary swung 143–260 fps on consecutive
-  f32 runs while the GPU-bound reference stayed flat at ~190. The cause was
-  the *harness*: the framework's `max_cache_size` and the harness's own
-  decoded-frame cache are additive, and together they exceeded RAM. When
-  fixing it, shrink the *test-specific* cache, not the shared framework one:
-  lowering `max_cache_size` instead made the timed region re-run the upstream
-  chain and collapsed *every* plugin by 3–4× — a much more confusing failure
-  than the original noise.
+  f32 runs while the GPU-bound reference stayed flat at ~190: the framework's
+  `max_cache_size` and the harness's decoded-frame cache are additive, and
+  together they exceeded RAM. Shrink the *test-specific* cache, not the shared
+  one: lowering `max_cache_size` made the timed region re-run the upstream
+  chain and collapsed *every* plugin by 3–4×.
 - **A subprocess that aborts with `free(): invalid pointer` after printing
   `RESULT` is MangoHud, not the filter** — its implicit Vulkan overlay layer
   aborts on teardown under high concurrency; `tools/test.sh` forces `MANGOHUD=0`.
 - **Decompose kernel cost with short-lived probes**, not theory: kill the
-  theory with arithmetic before coding anything — bandwidth math (taps ×
-  bytes × pixels vs bus), value-range math (min/max exponent vs subnormal),
-  tile-size math (halo overfetch, LDS bytes vs budget). Then structure
-  probes as a ladder: remove-all first (empty/box kernel) to read the
-  ceiling, then remove-half (keep exactly one cost center) to attribute.
-  Implement probes as temporary `-D` variants or env flags, back up the
-  `.comp` first for a trivial revert, measure, revert immediately. Re-rank the
+  theory with arithmetic first (bandwidth: taps × bytes × pixels vs bus; value
+  range vs subnormal; tile halo overfetch vs LDS budget), then ladder the
+  probes: remove-all (empty/box kernel) for the ceiling, remove-half (one cost
+  center) to attribute. Implement them as temporary `-D` variants or env flags,
+  back the `.comp` up first, measure, revert immediately. Re-rank the
   shares by addressability: the largest is usually the algorithm's own floor
   (a per-tap transcendental, a format's resolution), so work the next one down
   — and pin the rest with an arm. Expect plausible theories to be wrong — one
@@ -323,28 +326,25 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   build (wrong output is the point), revert, and read its speed as a price tag,
   never a result; if an ablation built for one hypothesis moves the frame
   beyond what that hypothesis explains, drop it. Price a guard by its *dynamic*
-  count: a body test is paid per iteration, and N items per thread multiply
-  every per-item test by N. Where device profilers are
-  unavailable, bound cost centers with workload-shape variants instead: inputs
-  that isolate each stage (all-skip, full-work, no auxiliary data) read ceilings
-  straight off end-to-end fps.
+  count: a body test is paid per iteration, and N items per thread multiply it.
+  Where profilers are unavailable, bound cost centers with workload-shape
+  variants instead: inputs that isolate each stage (all-skip, full-work, no
+  auxiliary data) read ceilings straight off end-to-end fps.
   **An ablation that changes the data is not an ablation.** BM3D's
-  `NOSEARCH=1` kill-switch also made every candidate tie, which suppressed the
-  temporal search's insert branch, so its 0.741 ms could not be read as "the
-  spatial search costs 2.1 ms". Prefer a **workload sweep** — vary the search
-  radius and take the marginal ms per candidate — because that changes how much
-  work happens without changing how the branches behave; the sweep is what
-  actually localized BM3D's cost.
+  `NOSEARCH=1` kill-switch made every candidate tie, suppressing the temporal
+  search's insert branch, so its 0.741 ms was not "the spatial search costs
+  2.1 ms". Prefer a **workload sweep** (vary the radius, take the marginal ms
+  per candidate): it changes how much work happens without changing the
+  branches, and it localized BM3D's cost.
 - **Keep `notes/<filter>.md` updated immediately** after every finding,
   including dead ends, so nothing is re-derived or retried later. The notes
-  are **tracked**: the durable design record and the first thing a new
-  contributor reads, so durable findings belong there, not only in a code
-  comment. **Read `notes/AGENTS.md` first and follow it** — it is the authority
-  on the notes (shape, style, the line budgets `tools/notes_check.py` enforces),
-  so none of that is repeated here. Keep entries short regardless: conclusion
-  first, a number only with its config, one line for a correctness-only change,
-  mechanism not story. **Worked examples live in `notes/EEDI3.md`'s `Pre-round
-  14 — the benchmark's mask was broken` and `Rounds 5–13 — pre-port host path`**
-  (the SIMD dilation rewrite, the ReBAR upload, the boundary-input oracle bug,
-  the harness-memory bimodality, measured non-wins) — worth reading before
-  starting a new filter, even though none is EEDI3-specific.
+  are **tracked** and the first thing a new contributor reads; findings belong
+  there, not only in a code comment. **Read `notes/AGENTS.md` first and
+  follow it** — it is the authority on the notes (shape, style, the line budgets
+  `tools/notes_check.py` enforces), so none of that is repeated here. Keep
+  entries short regardless: conclusion first, a number only with its config, one
+  line for a correctness-only change, mechanism not story. **Worked examples
+  live in `notes/EEDI3.md`'s `Pre-round 14 — the benchmark's mask was broken`
+  and `Rounds 5–13 — pre-port host path`** (SIMD dilation, ReBAR upload,
+  boundary-input oracle, harness-memory bimodality, measured non-wins) — read
+  them before a new filter; none is EEDI3-specific.

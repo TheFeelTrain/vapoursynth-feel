@@ -6,16 +6,17 @@ Status: **shipped on the R80 GPU API.** Design (current):
 
 - `clip:vnode:gpu` in, `ffGPUOutput` out: the core owns every transfer
   (`std.GPUUpload`/`std.GPUDownload`); the filter owns its pipelines, three
-  weight buffers and one exec pool — no staging, per-stream resources,
-  download-slot pool, descriptor pool, fences, queue cap or queue choice.
+  weight buffers and one exec pool — no per-stream staging, download-slot pool,
+  descriptor pool, fences, queue cap or queue choice.
   `num_streams` and `device_id` are registered no-ops (never read), and the
   device is chosen by `core.set_vulkan_device`.
-- The kernels read the source plane in place (field row `f` → source row
-  `DH ? f : 2f+parity` at the plane's own pitch) and write interpolated row `r`
-  straight into the output plane at `2r + (1-parity)`. `ENTRY_KEEP` copies the
-  kept rows. `DH` is a spec constant (id 9; 10 spec entries total), and
-  `dh=True` requires every plane to be processed (a subset is a creation
-  error, as in EEDI3).
+- The kernels read the source plane (in place, or from a per-frame private
+  device-local copy on NVIDIA; see Historical) at the plane's own pitch, field
+  row `f` → source row `DH ? f : 2f+parity`, and write interpolated row `r`
+  into the output plane, or into a per-frame private copy on NVIDIA, at
+  `2r + (1-parity)`. `ENTRY_KEEP` copies the kept rows. `DH` is a spec constant
+  (id 9; 10 spec entries total), and `dh=True` requires every plane to be
+  processed (a subset is a creation error, as in EEDI3).
 - Per frame: one transient device-local scratch (`width*rows*4 B` list +
   16 B indirect struct per plane) handed to the recording context; six push
   words `{a_base, src_stride, dst_stride, parity, d_base, max_grid_x}` (the
@@ -181,6 +182,13 @@ use the ratios, not the absolute fps.
 
 ## Historical
 
+- **2026-11-16 — the output plane is published through a copy (+76%, 1080p16).**
+  Keep and predict store straight into the output plane, and predict's stores
+  are one per listed pixel, so they are scattered. Writing into a filter-owned
+  buffer and publishing it with one `vkCmdCopyBuffer2` measured **390.7 ->
+  686.1 fps** (ABBA n=12); the copy is byte-for-byte the plane, so output is
+  unchanged. `VSFEEL_NNEDI3_OSTAGE=0` restores the direct write; the default is
+  NVIDIA only.
 - **2026-11-16 — the source plane is staged per frame (+34%, 1080p16).** Keep,
   prescreen and predict all read the field in place, and the same read of a
   private copy measured several times faster on an RTX 5060 (mechanism unnamed);
@@ -437,6 +445,7 @@ the global switches in `src/vsfeel.h`.
 | `VSFEEL_NNEDI3_TILE=<auto\|packed\|pxp8\|n4\|n4m\|n4s>` | force the predictor module for a sweep; the banner's `tile=`/`lds=` is what it chose. A window or a tile/PXP pair that disagrees is a creation error |
 | `VSFEEL_NNEDI3_PXP=<4\|8>` | force the tile-internal pixel block; it is baked into the module's shared stride, so `8` excludes the `n4*` modules and `4` excludes `pxp8` |
 | `VSFEEL_NNEDI3_STAGE=1\|0` | stage the source plane per frame, or read it in place (default: NVIDIA; `VSFEEL_STAGE` sets the default for every filter) |
+| `VSFEEL_NNEDI3_OSTAGE=1\|0` | publish the output through a private copy, or write the plane directly (default: NVIDIA) |
 | `VSFEEL_DEBUG=1\|2` | device banner and full error trail; level 2 also enables the probe traces |
 | `VSFEEL_TRACE=1\|2` | first 50 / every trace line (the banner is also printed) |
 

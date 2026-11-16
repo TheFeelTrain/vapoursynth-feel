@@ -30,10 +30,10 @@ using namespace std::string_literals;
 // ---------------------------------------------------------------------------
 //
 // GaussBlur runs on the R80 GPU API: `vnode:gpu` in, `ffGPUOutput` out, so the
-// core owns every transfer (std.GPUUpload/GPUDownload) and the filter reads the
-// core's frame planes and writes the output frame's planes in place. What it
-// owns is its pipelines, the constant kernel-weights buffer and one exec pool
-// -- no staging buffers, no per-stream resources, no fences, no queue cap.
+// core owns every transfer (std.GPUUpload/GPUDownload) and the filter reads and
+// writes the core's frame planes directly, or through per-frame staging buffers
+// on NVIDIA. What it owns is its pipelines, the constant kernel-weights buffer
+// and one exec pool -- no per-stream resources, no fences, no queue cap.
 
 // Work-group / code-path constants. The fused small path and the two large-path
 // passes each get their own block shape: a warp must stay within one source row
@@ -128,6 +128,9 @@ struct GaussData {
     // Read the input from a private device-local copy per frame (see
     // gpu_stage_plane); off with VSFEEL_GAUSS_STAGE=0.
     bool stage { true };
+    // Write the result into filter-owned memory and bulk-copy it into the output
+    // plane (see the frame path); off with VSFEEL_GAUSS_OSTAGE=0.
+    bool ostage { true };
     std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
         ht_total_ns {}, ht_n {};
 
@@ -282,15 +285,34 @@ struct GaussSpecData {
     int32_t stride;
     int32_t ksize;
     int32_t radius;
+    int32_t horiz_lds; // 1: stage the horizontal pass' span in workgroup memory
+    int32_t horiz_twords; // HORIZ_TWORDS: the tile's float count, 1 when off
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 5> spec_entries { {
+static constexpr std::array<VkSpecializationMapEntry, 7> spec_entries { {
     { 0, 0, sizeof(int32_t) },
     { 1, 4, sizeof(int32_t) },
     { 2, 8, sizeof(int32_t) },
     { 3, 12, sizeof(int32_t) },
     { 4, 16, sizeof(int32_t) },
+    { 5, 20, sizeof(int32_t) },
+    { 6, 24, sizeof(int32_t) },
 } };
+
+// The horizontal pass' staging tile, mirroring HORIZ_TSPAN / HORIZ_TSTRIDE in
+// gaussblur.comp: H_BLK_Y rows of the block's input span, skewed by c + c/4
+// and rounded up to an odd stride so a warp's second tile row lands on the
+// banks the first one left free. The size the driver allocates comes from the
+// module itself, so this only feeds the creation-time LDS check -- but keep
+// both expressions identical or the check stops describing the kernel.
+constexpr int h_tile_stride(int ksize) {
+    const int span = H_BLK_X * LARGE_R_H + ksize - 1;
+    return (span + (span >> 2)) | 1;
+}
+
+constexpr size_t h_tile_bytes(int ksize) {
+    return static_cast<size_t>(H_BLK_Y) * h_tile_stride(ksize) * sizeof(float);
+}
 
 static std::variant<VkPipeline, std::string>
 create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
@@ -298,8 +320,9 @@ create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
                 const GaussSpecData & spec, int blk_x, int blk_y,
                 size_t tile_bytes) {
 
-    // Only the fused small path declares the `vblur` tile, whose bytes the
-    // caller computed for this config; the two large-path passes declare none.
+    // The fused small path declares the `vblur` tile and the staged horizontal
+    // pass its `htile`; the caller computes both for this config. The vertical
+    // pass declares none.
     const GpuWorkgroup workgroup { .x = static_cast<uint32_t>(blk_x),
                                    .y = static_cast<uint32_t>(blk_y),
                                    .shared_bytes =
@@ -315,7 +338,7 @@ create_pipeline(const GPUDevice & gpu, VkPipelineLayout layout,
 // ---------------------------------------------------------------------------
 
 // GPU input: the kernels read the source planes and write the output frame's
-// planes in place. The core owns every transfer.
+// planes, directly or through the staging helpers. The core owns every transfer.
 static const VSFrame * gauss_gpu_frame(GaussData * d, int n,
                                        VSFrameContext * frameCtx, VSCore * core,
                                        const VSAPI * vsapi) {
@@ -461,7 +484,22 @@ static const VSFrame * gauss_gpu_frame(GaussData * d, int n,
         const VkBuffer buffers[5] { d->wt.buffer, src_buffer, dp.buffer,
                                     d->tmp_total > 0 ? tmp.buffer : src_buffer,
                                     dp.buffer };
-        gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 5);
+        // Write the result into filter-owned memory and hand it to the plane
+        // with one bulk copy: shader stores into a core frame plane measured 9x
+        // slower than stores into a private buffer on an RTX 5060 (1080p16,
+        // VSFEEL_GAUSS_OSTAGE=0 restores the direct write).
+        VkBuffer dst_buffer = dp.buffer;
+        GpuBuffer out_stage {};
+        if (d->ostage) {
+            if (auto e = gpu_out_stage_begin(*d->gpu, core, ctx, dp, out_stage);
+                !e.empty()) {
+                return fail("staged output: " + e);
+            }
+            dst_buffer = out_stage.buffer;
+        }
+        const VkBuffer bound[5] { buffers[0], buffers[1], dst_buffer,
+                                  buffers[3], dst_buffer };
+        gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, bound, 5);
 
         // Element offsets into the bound buffers: src and dst are whole plane
         // buffers now, so both bases are 0; only the scratch region and the
@@ -492,6 +530,9 @@ static const VSFrame * gauss_gpu_frame(GaussData * d, int n,
                                           cfg.h_pipeline);
             d->gpu->vk->vkCmdDispatch(cmd, cfg.h_grid_x, cfg.h_grid_y, 1);
             stamp(p, 1);
+        }
+        if (d->ostage) {
+            gpu_out_stage_commit(*d->gpu, cmd, out_stage, dp);
         }
     }
     if (gputrace) {
@@ -673,6 +714,15 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
     }
 
     d->stage = env_flag_or("VSFEEL_GAUSS_STAGE", vsfeel_stage_default(*d->gpu));
+    d->ostage =
+        env_flag_or("VSFEEL_GAUSS_OSTAGE", vsfeel_ostage_default(*d->gpu));
+    // Stage the horizontal pass' input span in workgroup memory; the untiled
+    // kernel is the A/B arm (VSFEEL_GAUSS_HORIZ_LDS=0) and the fallback for a
+    // plane whose tile the device's LDS cannot hold. The tile is an address
+    // win on an RTX 5060 (+10.4% with output staging) and 7-8% slower on an
+    // RX 7900 XTX, so it follows the vendor that was measured.
+    const bool horiz_lds =
+        env_flag_or("VSFEEL_GAUSS_HORIZ_LDS", d->gpu->vendor_id == 0x10de);
 
     // The plane geometry has to be the one the core's GPU frames carry, because
     // kernel addressing is STRIDE elements per row (see vsfeel_probe_strides).
@@ -987,11 +1037,22 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
         cfg.wt_base = wt_running;
         wt_running += static_cast<uint32_t>(weights[ci].size());
 
-        const GaussSpecData spec { .width = cfg.width,
-                                   .height = cfg.height,
-                                   .stride = cfg.stride,
-                                   .ksize = cfg.ksize,
-                                   .radius = cfg.radius };
+        // The staged horizontal pass runs only where its tile fits, so a very
+        // wide kernel keeps the untiled one instead of failing creation.
+        const size_t h_tile = h_tile_bytes(cfg.ksize);
+        const bool h_lds = horiz_lds && cfg.ksize > LARGE_R_H &&
+                           h_tile <= d->gpu->limits.maxComputeSharedMemorySize;
+        const GaussSpecData spec {
+            .width = cfg.width,
+            .height = cfg.height,
+            .stride = cfg.stride,
+            .ksize = cfg.ksize,
+            .radius = cfg.radius,
+            .horiz_lds = h_lds ? 1 : 0,
+            .horiz_twords =
+                h_lds ? static_cast<int32_t>(H_BLK_Y * h_tile_stride(cfg.ksize))
+                      : 1
+        };
 
         if (cfg.small) {
             const size_t tile_bytes = static_cast<size_t>(VRT) * BLK_Y *
@@ -1014,9 +1075,9 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
                 cfg.v_pipeline = std::get<VkPipeline>(result);
             }
             {
-                const auto result =
-                    create_pipeline(*d->gpu, d->pipeline_layout, horiz_code,
-                                    horiz_size, spec, H_BLK_X, H_BLK_Y, 0);
+                const auto result = create_pipeline(
+                    *d->gpu, d->pipeline_layout, horiz_code, horiz_size, spec,
+                    H_BLK_X, H_BLK_Y, h_lds ? h_tile : 0);
                 if (std::holds_alternative<std::string>(result)) {
                     return set_error(std::get<std::string>(result));
                 }

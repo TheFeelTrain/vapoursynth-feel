@@ -9,8 +9,9 @@ intermediates, f32 arithmetic), i.e. the f32 result rounded once. `hp`
 bit-exact too. EEDI3, EEDI3H (native transposed-plane) and EEDI3AA (fused
 based_aa chain) share every kernel, geometry and pipeline. Runs on the **R80
 GPU API**: `clip/sclip/mclip:vnode:gpu` in and `ffGPUOutput` out, one exec pool,
-and no host upload/download/gather/blit machinery at all; the parallel vcheck is
-the default.
+and no host upload/download/gather machinery at all; on NVIDIA the clip, sclip
+and mask planes are copied device-side once per batch (see Historical). The
+parallel vcheck is the default.
 
 Benchmark (`--filter eedi3`, the README's config; field=3, mdis=20, vcheck=2):
 1080p jpbd, mask, benchmark args, 5 s medians of 3 (README differs):
@@ -124,7 +125,7 @@ tap expressions themselves are `ENTRY_VCHECK` in `src/eedi3.comp`.
 shipped default (`VPARA=6`) refines the un-vchecked row with that many Jacobi
 steps, so rows are independent and one workgroup owns each; 6 is bit-exact.
 
-### Reference structure (five backends, same GPU, READ-ONLY)
+### Reference structure (five backends, READ-ONLY; vszipcu is CUDA/NVIDIA-only)
 
 | ref | type | mclip | io convention |
 |---|---|---|---|
@@ -132,7 +133,7 @@ steps, so rows are independent and one workgroup owns each; 6 is bit-exact.
 | `eedi3vk2` | Vulkan GLSL | same as clip (planes[]) | native int scale; f32 `precise` DP |
 | `vszip` | CPU Zig SIMD | single Gray→Gray8, all planes | native int scale; alpha÷3 beta÷255 gamma÷255; NO per-column clamp |
 | `vszipcl` | OpenCL | **none** | **u16 normalized [0,1]** (÷65535); f32 identity; mirror-pad full mdis |
-| `vszipcu` | CUDA/HIP | none | u16 normalized [0,1]; same structure as vszipcl |
+| `vszipcu` | CUDA (NVIDIA) | none | u16 normalized [0,1]; same structure as vszipcl |
 
 **Two semantic families.** **A = eedi3m + eedi3vk2:** clamp
 `umax=min(x,W-1-x,mdis)`; relax `v ∈ [max(-umax2,u-1), min(umax2,u+1)]`,
@@ -218,9 +219,7 @@ register is the largest addressable item; the three-window redundancy is worth
   DP does not pack (eedi3vk2's full-half f16 measures 0.044 / ~20% of pixels
   off its own f32), and the arithmetic scratch it would narrow is ~90 MB per
   2x2160p frame, under 1% of the 6.2 ms frame at ~2 TB/s, so it cannot reach the
-  30% bar that would justify the accuracy loss. vk2 f16 exists and is used only
-  as a loose sanity bound.
-
+  30% bar that would justify the accuracy loss.
 - **2026-10-12 — the banner's table is re-measured; the old numbers are void.**
   u16 472/56, EEDI3H 471/52, hp 198/48 and the "470.4 → 469.6 fps (+0.0%)"
   pre-optimization pair were taken against the pre-fix benchmark harness
@@ -572,6 +571,8 @@ passes). All bit-identical to the previous build unless stated.
 - **The three-window redundancy** (PROBE=14: 8.2%) needs a 2|u|-deep delay line
   per direction: ~90 registers at K=2 vs the 96 in use today, so only reachable if
   something else gives up registers first.
+- **Output staging** measured +28%/+11%/+15% but failed four f16 tests; the
+  cause is open, so retry under git from a clean revert, not a story.
 - `ENTRY_PAD`/`VCOPY`/`BLIT` div/mod by `pad_stride`/`WIDTH`: a 2D dispatch
   removes them (per-plane passes, not the row kernel).
 - **f16's remaining levers**: half `dst`/`cint`/`vout` (loses f32 parity) and
@@ -682,9 +683,8 @@ passes). All bit-identical to the previous build unless stated.
 - `VSFEEL_EEDI3_TRACE` — one-shot banner: VRAM accounting, per-plane region layout,
   spec constants per geometry.
 - `VSFEEL_EEDI3_TIMING` — per-frame host stage split (acquire/alloc/record/submit).
-- `VSFEEL_EEDI3_STAGE=1|0` - stage the clip, sclip and mask planes, or read them
-  in place (default: NVIDIA, EEDI3H excepted; `VSFEEL_STAGE` sets the default
-  for every filter).
+- `VSFEEL_EEDI3_STAGE=1|0` - stage the clip, sclip and mask planes, or read
+  them in place (default: NVIDIA, EEDI3H excepted; `VSFEEL_STAGE` for all).
 - `VSFEEL_EEDI3_SYNC` — additionally wait each submission out and report its wall time
   (serializes the pipeline; for GPU-time measurements at depth 1).
 - `VSFEEL_EEDI3_NOCLEAR` — EEDI3AA's frame path only: skip the per-submission

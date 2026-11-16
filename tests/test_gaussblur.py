@@ -79,6 +79,28 @@ def _run(clip, sigma=2.0, **kwargs):
     )
 
 
+def test_gaussblur_staged_output_matches_the_in_place_path(clip_gray16, monkeypatch):
+    """Both halves of the write path must agree to the code.
+
+    The two-pass path publishes through a staged plane and a bulk copy on
+    NVIDIA; the fused path does the same. Neither may move a sample, and both
+    are unexercised on a vendor where the default is off unless a test forces
+    them.
+    """
+    for sigma in (1.2, 20.0):  # fused, then two-pass
+        # Both arms are forced: the default follows the vendor, so neither may
+        # rely on it on the machine the test happens to run on.
+        monkeypatch.setenv("VSFEEL_GAUSS_OSTAGE", "0")
+        in_place = _run(clip_gray16, sigma=sigma)
+        monkeypatch.setenv("VSFEEL_GAUSS_OSTAGE", "1")
+        staged = _run(clip_gray16, sigma=sigma)
+        monkeypatch.delenv("VSFEEL_GAUSS_OSTAGE", raising=False)
+        for n in (0, 7, 23):
+            assert np.array_equal(
+                _plane(in_place.get_frame(n), 0), _plane(staged.get_frame(n), 0)
+            ), (sigma, n)
+
+
 # ---------------------------------------------------------------------------
 # Determinism / stream count
 # ---------------------------------------------------------------------------

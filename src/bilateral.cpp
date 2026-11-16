@@ -26,10 +26,10 @@ using namespace std::string_literals;
 // ---------------------------------------------------------------------------
 //
 // Bilateral is a pure per-pixel gather over the frame's own planes. It takes
-// `vnode:gpu` and returns `vnode:gpu` with ffGPUOutput: the kernels read the
-// core's GPU frame planes and write the output frame's planes in place, and the
-// core owns every transfer (std.GPUUpload/GPUDownload). The filter owns no copy
-// of the pixels — one pipeline per plane and one exec pool is all of it.
+// `vnode:gpu` and returns `vnode:gpu` with ffGPUOutput: the kernels read and
+// write the core's GPU frame planes directly, or through per-frame staging
+// buffers (gpu_stage_plane/gpu_out_stage), and the core owns every transfer.
+// One pipeline per plane and one exec pool is all of it.
 
 // Largest radius whose tile math (2*radius + block) and squared-distance term
 // (2*radius^2) stay inside signed 32-bit int; past this the kernel indexes out
@@ -75,6 +75,9 @@ struct BilateralData {
     // Read the input planes from a private device-local copy per frame (see
     // gpu_stage_plane); off with VSFEEL_BILAT_STAGE=0.
     bool stage { true };
+    // Publish the output plane through a private copy; off with
+    // VSFEEL_BILAT_OSTAGE=0.
+    bool ostage { true };
     std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
         ht_total_ns {}, ht_n {};
 
@@ -204,7 +207,8 @@ static void bilateral_process_mask(const BilateralData & d, int numPlanes,
 }
 
 // GPU input: the kernels read the source (and guide) planes and write the output
-// frame's planes in place. The core owns every transfer.
+// frame's planes, directly or through the staging helpers. The core owns every
+// transfer.
 static const VSFrame * bilateral_gpu_frame(BilateralData * d, int n,
                                            VSFrameContext * frameCtx,
                                            VSCore * core, const VSAPI * vsapi) {
@@ -294,8 +298,8 @@ static const VSFrame * bilateral_gpu_frame(BilateralData * d, int n,
     auto t1 = d->host_timing ? std::chrono::steady_clock::now()
                              : std::chrono::steady_clock::time_point {};
 
-    // The kernels read the source (and the guide) and write the output planes
-    // in place; each plane is a disjoint dispatch, so no barrier is needed.
+    // Each plane is a disjoint dispatch, so no barrier is needed; the input
+    // read and the output write are direct or staged (see gpu_stage_plane).
     vsfeel_trace_mark("record");
     VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
     for (int p = 0; p < numPlanes; ++p) {
@@ -325,6 +329,19 @@ static const VSFrame * bilateral_gpu_frame(BilateralData * d, int n,
         }
 
         const auto & cfg = d->planes[p];
+        // Publish the output through a private copy: stores into a core plane
+        // measured slower than into a filter-owned buffer (VSFEEL_BILAT_OSTAGE=0
+        // opts out).
+        GpuBuffer out_stage {};
+        VkBuffer dst_buffer = dst_plane.buffer;
+        if (d->ostage) {
+            if (auto e = gpu_out_stage_begin(*d->gpu, core, ctx, dst_plane,
+                                             out_stage);
+                !e.empty()) {
+                return fail("staged output: " + e);
+            }
+            dst_buffer = out_stage.buffer;
+        }
         // Read the input (and guide) from a private device-local copy when the
         // filter's staging switch is on: a core plane is not always cheap to
         // read in place (see gpu_stage_plane).
@@ -354,10 +371,12 @@ static const VSFrame * bilateral_gpu_frame(BilateralData * d, int n,
                                       cfg.pipeline);
         // binding 2 is the guide; without one the source stands in for it and
         // the shader's HAS_REF==0 path never reads it
-        const VkBuffer buffers[3] { src_buffer, dst_plane.buffer,
-                                    guide_buffer };
+        const VkBuffer buffers[3] { src_buffer, dst_buffer, guide_buffer };
         gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 3);
         d->gpu->vk->vkCmdDispatch(cmd, cfg.grid_x, cfg.grid_y, 1);
+        if (d->ostage) {
+            gpu_out_stage_commit(*d->gpu, cmd, out_stage, dst_plane);
+        }
     }
     auto t2 = d->host_timing ? std::chrono::steady_clock::now()
                              : std::chrono::steady_clock::time_point {};
@@ -623,6 +642,8 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
     }
 
     d->stage = env_flag_or("VSFEEL_BILAT_STAGE", vsfeel_stage_default(*d->gpu));
+    d->ostage =
+        env_flag_or("VSFEEL_BILAT_OSTAGE", vsfeel_ostage_default(*d->gpu));
 
     {
         const VkPhysicalDeviceLimits & limits = d->gpu->limits;

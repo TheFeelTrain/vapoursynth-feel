@@ -2,9 +2,11 @@
 
 Status: **shipped on the R80 GPU API.** `clip`/`ref` are `vnode:gpu` and the
 output carries `ffGPUOutput`, so the core's `GPUUpload`/`GPUDownload` cross the
-bus and the filter owns only its pipelines and one exec pool. Every plane is the
-core's own GPU frame plane: the kernels read the source and guide in place and
-write the output frame in place. The old per-stream staging buffers, VRAM
+bus and the filter owns only its pipelines and one exec pool. The output frame
+is the core's own GPU plane and is written in place, or through a per-frame
+private copy on NVIDIA (`gpu_out_stage_*`); the source and guide are read in
+place, or from a per-frame private device-local copy on NVIDIA
+(`gpu_stage_plane`, see Historical). The old per-stream staging buffers, VRAM
 src/dst buffers, queue cap and fence are gone.
 
 Design (current):
@@ -32,8 +34,9 @@ Design (current):
   source stands in on binding 2 and `HAS_REF=0` means the shader never reads it.
 - Guide (`ref`): optional; same format, dimensions and frame count as `clip`.
   It may be CPU- or GPU-resident (only the transport differs), and it is read
-  in place, never uploaded by the filter. `ref` sits in vszipcl's positional
-  slot, before the optional `block_x`/`block_y` keywords.
+  in place (or from the per-frame copy), never uploaded by the filter. `ref`
+  sits in vszipcl's positional slot, before the optional `block_x`/`block_y`
+  keywords.
 - Native `uint16_t`/`float16_t`/`float` SSBOs at `#version 450`, no push
   constants; every geometry/weight parameter is a specialization constant
   (`WIDTH/HEIGHT/STRIDE/RADIUS/SIGMA_*/HAS_REF/TILE_*/BLOCK_*`).
@@ -228,6 +231,13 @@ Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter bilateral
 
 ## Historical
 
+- **2026-11-16 — the output plane is published through a copy (+43%, 1080p16).**
+  The kernel writes two columns per thread, a 4-byte lane stride into the output
+  plane; writing into a filter-owned buffer and publishing it with one
+  `vkCmdCopyBuffer2` measured **504.0 -> 723.3 fps** (ABBA n=12), output
+  unchanged. `VSFEEL_BILAT_OSTAGE=0` restores the direct write. The same change
+  loses 2-7% on filters whose stores are already fully coalesced, so it is per
+  store pattern, not per filter, and it defaults on for NVIDIA only.
 - **2026-11-16 — the input plane is staged per frame (+197%, 1080p16).** Reading
   the source (and guide) in place cost more than the kernel on an RTX 5060,
   where the same read of a private copy measured several times faster (mechanism
@@ -238,7 +248,10 @@ Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter bilateral
   in the same session. The copy costs 4.5% on the RX 7900 XTX, which also
   exposes host-visible device-local memory, so the default follows the vendor,
   not the platform or the memory type: staged on NVIDIA, in place elsewhere.
-  `VSFEEL_BILAT_STAGE=0` restores the in-place read.
+  Staging adds one copy per plane per in-flight frame outside the creation-time
+  VRAM plan, so a card already at its plan can fail the allocation and the
+  switch below is the fallback. `VSFEEL_BILAT_STAGE=0` restores the in-place
+  read.
 - **2026-11-05 — shared-tier border parity on small-LDS devices.** The tier
   was fixed to one block shape, so a device that could hold the reference's
   16x8 tile but not the 32x16 one ran the plain gather while vszipcl stayed
@@ -432,5 +445,7 @@ SDMA and the port reaches parity without any core change.
 - `VSFEEL_BILAT_STAGE=1|0` — stage the source and guide planes per frame, or
   read them in place (default: NVIDIA; `VSFEEL_STAGE` sets the default for
   every filter). See Historical for the vendor gate.
+- `VSFEEL_BILAT_OSTAGE=1|0` — publish the output through a private copy, or
+  write the plane directly (default: NVIDIA).
 - `VSFEEL_DEBUG=1|2`, `VSFEEL_TRACE=1|2` — the shared error trace and trail
   (`acquire`/`record`/`submit` marks are recorded in the frame path).

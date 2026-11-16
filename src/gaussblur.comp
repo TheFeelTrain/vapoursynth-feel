@@ -78,6 +78,10 @@ layout(constant_id = 1) const int HEIGHT = 1080;
 layout(constant_id = 2) const int STRIDE = 1920;
 layout(constant_id = 3) const int KLEN = 1;
 layout(constant_id = 4) const int RAD = 0;
+// 1 stages the horizontal pass' input span in workgroup memory (ENTRY_HORIZ
+// only; the other entries leave it alone). Declared in every entry so the
+// host's one specialization map is valid for whichever module it names.
+layout(constant_id = 5) const int HORIZ_LDS = 0;
 
 layout(std430, binding = 0) readonly buffer WtBuf { float wt[]; };
 layout(std430, binding = 1) readonly buffer SrcBuf { IO_TYPE src[]; };
@@ -370,11 +374,156 @@ void main() {
 
 // Large path, horizontal pass: R consecutive output columns per thread,
 // reading the vertical pass' float tmp buffer. Same optimizations as the
-// vertical pass (interior fast path + two taps in flight), plus the output
+// vertical pass (interior fast path + taps in flight), plus the output
 // is written as packed dword pairs — R/2 32-bit stores instead of R 16-bit
 // stores (thread ownership of whole dwords is guaranteed: x0 is even).
+//
+// A lane's consecutive taps are R elements apart, so the untiled form's warp
+// load spans 32 sectors to use 4 of them and the pass ends up at L2 speed
+// (~15x the vertical pass). HORIZ_LDS == 1 stages the block's input span in
+// workgroup memory instead: the load is contiguous and the window is read
+// back from LDS. Layout: span column c sits at c + c/4, so a warp's 16-lane
+// tile row covers 16 banks and the row below it, one TSTRIDE further on
+// (TSTRIDE is odd), covers the other 16 — conflict-free on a 32-lane warp,
+// 2-way on a 64-lane wave, four rows of 16 lanes being more than 32 banks.
+// The skew is free inside the window: with R a multiple of 4 the steady
+// loop's four taps are at +0/+2/+3/+4 from one base that advances by 5.
+#if (R & 3) != 0
+#error "the tiled horizontal window's 4-tap step needs R to be a multiple of 4"
+#endif
+// Block span (BLK_X*R outputs plus the kernel's halo) and its skewed stride,
+// from the KLEN spec constant: the host's shared_bytes mirrors this formula
+// (h_tile_bytes in src/gaussblur.cpp), so the two can only drift together.
+#define HORIZ_TSPAN (BLK_X * R + KLEN - 1)
+#define HORIZ_TSTRIDE ((HORIZ_TSPAN + (HORIZ_TSPAN >> 2)) | 1)
+#define HORIZ_SKEW(c) ((c) + ((c) >> 2))
+// The tile length is a spec constant the host sets, not an expression over KLEN:
+// the off arm has to declare ONE element, so a device with too little shared
+// memory for the tile can still create the untiled pipeline, and the LDS size a
+// module asks for is then exactly the number the host reported.
+layout(constant_id = 6) const int HORIZ_TWORDS = 1;
+shared float htile[HORIZ_TWORDS];
+
 layout(local_size_x = BLK_X, local_size_y = BLK_Y, local_size_z = 1) in;
+
+// The staged form. Every thread of the block loads (a lane that returned
+// early would leave its part of the tile unwritten), and the span carries the
+// mirror of its columns, so this one window body also serves the border
+// threads the untiled form needs a second copy of. Values, weights and fma
+// order are the untiled form's, so the output is bit-identical.
+void horiz_tiled() {
+    const int lx = int(gl_LocalInvocationID.x);
+    const int ly = int(gl_LocalInvocationID.y);
+    const int gx0 = int(gl_WorkGroupID.x) * (BLK_X * R); // first output col
+    const int gy0 = int(gl_WorkGroupID.y) * BLK_Y;       // first output row
+    const int radius = KLEN / 2;
+    const int tid = int(gl_LocalInvocationIndex);
+
+    for (int r = 0; r < BLK_Y; ++r) {
+        // a row past the frame is loaded as the last row: nothing reads it
+        const int gbase = pc.tmp_base + min(gy0 + r, HEIGHT - 1) * STRIDE;
+        const int tro = r * HORIZ_TSTRIDE;
+        for (int c = tid; c < HORIZ_TSPAN; c += BLK_X * BLK_Y) {
+            int sx = gx0 - radius + c;
+            sx = mirror(sx, WIDTH);
+            sx = min(max(sx, 0), WIDTH - 1);
+            htile[tro + HORIZ_SKEW(c)] = tmp[gbase + sx];
+        }
+    }
+    barrier();
+
+    const int x0 = gx0 + lx * R;
+    const int y = gy0 + ly;
+    if (x0 >= WIDTH || y >= HEIGHT) return;
+    const int row = y * STRIDE;
+    // skew(lx*R + k) == trow + skew(k) for every k, R being a multiple of 4
+    const int trow = ly * HORIZ_TSTRIDE + HORIZ_SKEW(lx * R);
+    float sum[R], wreg[R];
+    #pragma unroll
+    for (int j = 0; j < R; ++j) { sum[j] = 0.0f; wreg[j] = 0.0f; }
+
+    #pragma unroll
+    for (int k = 0; k < R - 1; ++k) {            // ramp-up: j <= k live
+        #pragma unroll
+        for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+        wreg[0] = wt[pc.wt_base + k];
+        const float v = htile[trow + HORIZ_SKEW(k)];
+        #pragma unroll
+        for (int j = 0; j < R; ++j)
+            if (j <= k) sum[j] = fma(v, wreg[j], sum[j]);
+    }
+    // steady: every j live, four taps per step so the skew costs one add and
+    // four LDS reads are in flight. KLEN is odd and R is a multiple of 4, so
+    // KLEN - R + 1 is even: the step leaves nothing or one pair.
+    int k = R - 1;
+    int toff = trow + HORIZ_SKEW(R - 1);
+    for (; k + 3 < KLEN; k += 4, toff += 5) {
+        const float v0 = htile[toff + 0];
+        const float v1 = htile[toff + 2];
+        const float v2 = htile[toff + 3];
+        const float v3 = htile[toff + 4];
+        #pragma unroll
+        for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+        wreg[0] = wt[pc.wt_base + k];
+        #pragma unroll
+        for (int j = 0; j < R; ++j) sum[j] = fma(v0, wreg[j], sum[j]);
+        #pragma unroll
+        for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+        wreg[0] = wt[pc.wt_base + k + 1];
+        #pragma unroll
+        for (int j = 0; j < R; ++j) sum[j] = fma(v1, wreg[j], sum[j]);
+        #pragma unroll
+        for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+        wreg[0] = wt[pc.wt_base + k + 2];
+        #pragma unroll
+        for (int j = 0; j < R; ++j) sum[j] = fma(v2, wreg[j], sum[j]);
+        #pragma unroll
+        for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+        wreg[0] = wt[pc.wt_base + k + 3];
+        #pragma unroll
+        for (int j = 0; j < R; ++j) sum[j] = fma(v3, wreg[j], sum[j]);
+    }
+    if (k < KLEN) {                              // the leftover pair
+        const float v0 = htile[toff + 0];
+        const float v1 = htile[toff + 2];
+        #pragma unroll
+        for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+        wreg[0] = wt[pc.wt_base + k];
+        #pragma unroll
+        for (int j = 0; j < R; ++j) sum[j] = fma(v0, wreg[j], sum[j]);
+        #pragma unroll
+        for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+        wreg[0] = wt[pc.wt_base + k + 1];
+        #pragma unroll
+        for (int j = 0; j < R; ++j) sum[j] = fma(v1, wreg[j], sum[j]);
+    }
+    #pragma unroll
+    for (int t = 0; t < R - 1; ++t) {            // ramp-down: j > t live
+        #pragma unroll
+        for (int j = R - 1; j >= 1; --j) wreg[j] = wreg[j - 1];
+        wreg[0] = 0.0f;                          // this slot is padding
+        const float v = htile[trow + HORIZ_SKEW(KLEN + t)];
+        #pragma unroll
+        for (int j = 0; j < R; ++j)
+            if (j > t) sum[j] = fma(v, wreg[j], sum[j]);
+    }
+
+    // the packed form owns whole dwords, so it needs the whole window in range
+    if (x0 + R <= WIDTH) {
+        store_row_packed(row, x0, sum);
+    } else {
+        #pragma unroll
+        for (int j = 0; j < R; ++j) {
+            if (x0 + j < WIDTH) store_value(row + x0 + j, sum[j]);
+        }
+    }
+}
+
 void main() {
+    if (HORIZ_LDS == 1 && KLEN > R) {   // spec constants: one body survives
+        horiz_tiled();
+        return;
+    }
     const int x0 = int(gl_GlobalInvocationID.x) * R;     // first output column
     const int y = int(gl_GlobalInvocationID.y);
     if (x0 >= WIDTH || y >= HEIGHT) return;

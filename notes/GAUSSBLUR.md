@@ -6,8 +6,9 @@ and `tools/benchmark.py`. Target GPU: RX 7900 XTX (RDNA3, gfx1100), RADV, ReBAR.
 Design (current):
 - `clip:vnode:gpu` in, `ffGPUOutput` out: the core owns every transfer
   (`std.GPUUpload`/`GPUDownload`); the filter owns its pipelines, one constant
-  weights buffer and one exec pool — no staging, per-stream resources, fences,
-  queues or queue cap.
+  weights buffer and one exec pool — no per-stream staging, fences, queues or
+  queue cap. The source plane is read in place, or from a per-frame private
+  device-local copy on NVIDIA (`gpu_stage_plane`, see Historical).
 - Three io variants — u16, f16, f32 — selected by the input format (half is
   `stFloat` + 16 bits). Half is a storage width, not a precision: the f16 path
   runs the f32 arithmetic, matches vszipcl's f16 output bit-exactly on the fused
@@ -24,12 +25,16 @@ Design (current):
   row, so the ±RAD halo is 1.09x the tile at radius 3 instead of 1.19x, and both
   its LDS accesses are conflict-free), and the horizontal pass is 16x8 with 8
   output columns per thread (a warp spanning two rows, where a wider per-lane
-  stride splits each load across more lines).
+  stride splits each load across more lines). On NVIDIA the horizontal pass
+  stages each block's input span in LDS (skewed, 1-way banks) and writes the
+  result through a private copy that is bulk-copied into the plane; both are
+  off elsewhere (`VSFEEL_GAUSS_HORIZ_LDS`/`_OSTAGE`).
 - Per-plane float scratch is one transient `createGPUBuffer` per frame (record
   stage: 10 µs/frame with it).
-- `WIDTH/HEIGHT/STRIDE/KLEN/RAD` are specialization constants read off a probe
-  frame at creation; five push-descriptor bindings (`wt`, `src`, `dst`, `tmp`,
-  `dst` dword view), only `tmp_elem`/`wt_base` push constants carry values.
+- `WIDTH/HEIGHT/STRIDE/KLEN/RAD` plus the horizontal LDS switch and tile size
+  are specialization constants read off a probe frame at creation; five
+  push-descriptor bindings (`wt`, `src`, `dst`, `tmp`, `dst` dword view), only
+  `tmp_elem`/`wt_base` push constants carry values.
 - Unprocessed planes ride along via `newVideoFrame2`; `num_streams` and
   `device_id` are registered no-ops (never read).
 - Runs need `RADV_EXPERIMENTAL=transfer_queue`, which `tools/benchmark.py`
@@ -70,7 +75,7 @@ sigma, frames and repeats (3-repeat medians, one session):
 - The f16 chain rows are ~2x their f32 twins because those modes move the
   frames; compute-only the gap is +11%, the half-width loads of the two-pass
   kernels (mechanism under Performance).
-- vszipcu is not installed in this checkout, so vszipcl is the reference here.
+- vszipcu is CUDA and NVIDIA-only, so vszipcl is the reference on this AMD box.
 - Bench: `MANGOHUD=0 uv run tools/benchmark.py --filter gaussblur
   [--gaussblur-args "sigma=X"] [--format u16|f16|f32] [--cpu-cache]
   [--download] [--scale N] vsfeel vszipcl`.
@@ -127,16 +132,15 @@ sigma, frames and repeats (3-repeat medians, one session):
   flush/invalidate ranges, and the HD/KD/QUEUES/GPU_BENCH knobs: 1443 → 834
   lines.
 
-### Reference structure (same GPU, READ-ONLY)
+### Reference structure (READ-ONLY; vszipcu is CUDA/NVIDIA-only)
 
-- **vszipcu:** device-local `d_src`/`d_dst` + float `d_tmp`; per plane async
-  `memcpyHtoD` (copy stream) → kernels → async `memcpyDtoH`, then sync both.
+- **vszipcu (CUDA):** device-local `d_src`/`d_dst` + float `d_tmp`; per plane
+  async `memcpyHtoD` (copy stream) → kernels → async `memcpyDtoH`, then sync
+  both.
 - **vszipcl:** same shape with OpenCL pinned staging + `clFinish` per frame.
   Its f16 io is `vload_half`/`vstore_half_rte` around the same f32 math (its
   `tests/test_f16_parity.py` grades that at ~2 half ulps of its f32 path);
   vsfeel's half variant takes the same split and is bit-exact against it.
-- `rocprofv3` profile of vszipcu (BlankClip gray16 1080p, sigma=16, ns=1, 200
-  frames): vertical 118 µs, horizontal 177 µs, H2D 153 µs, D2H 152 µs.
 
 ## Performance
 
@@ -212,6 +216,17 @@ sigma, frames and repeats (3-repeat medians, one session):
 
 ## Historical
 
+- **2026-11-16 — the horizontal pass was the frame: a tiled read and a staged
+  write (+10% then +76%, 1080p16).** `GPUTRACE` split sigma=16 into vertical
+  48.6 us / horizontal 758.4 us. The horizontal gives each thread 8 consecutive
+  columns, so a warp's tap load spans 32 sectors to use 4; staging each block's
+  input span in LDS (skewed layout) took the pass to 646 us. The remaining cost
+  was the store side: writing the same values into a filter-owned buffer
+  measured 72 us, so the kernel now writes a staged plane and publishes it with
+  one `vkCmdCopyBuffer2`. Frame 981 -> 302 us; **961 -> 1930 fps** (ABBA n=12).
+  `VSFEEL_GAUSS_HORIZ_LDS=0` and `VSFEEL_GAUSS_OSTAGE=0` restore each half; both
+  are NVIDIA-only by default because the tile lost 7-8% and the copy 22.8% on
+  an RX 7900 XTX.
 - **2026-11-16 — the input plane is staged per frame (+65%, 1080p16).** Both
   passes read the source plane in place, the same read of a private copy measured
   several times faster on an RTX 5060 (mechanism unnamed), so the reads, not the
@@ -371,6 +386,10 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
   not as an absolute per-frame cost. Record+submit is ~23 µs per call.
 - `VSFEEL_GAUSS_STAGE=1|0` — stage the source plane per frame, or read it in
   place (default: NVIDIA; `VSFEEL_STAGE` sets the default for every filter).
+- `VSFEEL_GAUSS_OSTAGE=1|0` — publish the output through a private copy, or
+  write the plane directly (default: NVIDIA).
+- `VSFEEL_GAUSS_HORIZ_LDS=1|0` — tile the horizontal pass' input span in LDS,
+  or use the untiled kernel (default: NVIDIA, where the tile fits).
 - `VSFEEL_GAUSS_GPUTRACE=<first frame>` and `VSFEEL_GAUSS_GPUTRACE_RANGE=<n>`
   (default 100/40) — in-command-buffer GPU timestamps: per-plane per-dispatch
   p25/median/p75 over the traced window, printed at destruction. The window
