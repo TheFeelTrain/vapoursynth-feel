@@ -638,7 +638,7 @@ def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
         uniform = len(set(radii)) == 1
     requested = getattr(ns, "plugins", None) or []
     if not uniform and (
-        any(p in requested for p in ("vszipcl", "bm3dvk", "bm3dvk2"))
+        any(p in requested for p in ("vszipcl", "vszipcu", "bm3dvk", "bm3dvk2"))
         or (not requested and not _ab_active(ns))
     ):
         sys.exit(
@@ -662,11 +662,12 @@ def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
         calls.update(
             {
                 "vszipcl": f"core.vszipcl.BM3Dv2({clip}, {same})",
+                "vszipcu": f"core.vszipcu.BM3Dv2({clip}, {same})",
                 "bm3dvk": f"core.bm3dvk.BM3Dv2({clip}, {same})",
-                # Both arms derive the color matrix from the resolution when
+                # These arms derive the color matrix from the resolution when
                 # none is given, and their other defaults (8x8 blocks, 8-wide
                 # groups, bm/ps step 1, hard_thr 2.7, th_mse = sigma[0]*80 +
-                # 400) already equate, so the two arms do equal work.
+                # 400) already equate, so all of them do equal work.
                 "bm3dvk2": f"core.bm3dvk2.BM3D({clip}, {same})",
             }
         )
@@ -774,7 +775,7 @@ def _nlmeans_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
 def _eedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
     """Plain 1x EEDI3 with the optional 1080p mask; based_aa is `eedi3aa`.
 
-    vsfeel and eedi3vk2 take mclip; vszipcl has no such parameter.
+    vsfeel and eedi3vk2 take mclip; vszipcl and vszipcu have no such parameter.
     """
     use_mclip = getattr(ns, "eedi3_mclip", True)
     common = (
@@ -791,12 +792,14 @@ def _eedi3_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[st
             "vsfeel": f"core.vsfeel.EEDI3({clip}, {common})",
             "eedi3vk2": f"core.eedi3vk2.EEDI3({clip}, {common})",
             "vszipcl": f"core.vszipcl.EEDI3({clip}, {common})",
+            "vszipcu": f"core.vszipcu.EEDI3({clip}, {common})",
         }
     masked = f"{common}, mclip=mclip" if use_mclip else common
     return {
         "vsfeel": f"core.vsfeel.EEDI3({clip}, {masked})",
         "eedi3vk2": f"core.eedi3vk2.EEDI3({clip}, {masked})",
         "vszipcl": f"core.vszipcl.EEDI3({clip}, {common})",
+        "vszipcu": f"core.vszipcu.EEDI3({clip}, {common})",
     }
 
 
