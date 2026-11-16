@@ -842,17 +842,18 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
                 continue;
             }
             const auto & cfg = planes[plane];
-            const int radius = pipeline_keys[plane].radius;
+            const int plane_radius = pipeline_keys[plane].radius;
             const char * tier = !cfg.shared ? "plain"
                                 : cfg.clip  ? "shared+clipped"
                                             : "shared";
             const size_t lds =
-                cfg.shared ? static_cast<size_t>(1 + has_ref) *
-                                 static_cast<size_t>(2 * radius +
-                                                     cfg.block_x * cfg.cols) *
-                                 static_cast<size_t>(2 * radius + cfg.block_y) *
-                                 sizeof(float)
-                           : 0;
+                cfg.shared
+                    ? static_cast<size_t>(1 + has_ref) *
+                          static_cast<size_t>(2 * plane_radius +
+                                              cfg.block_x * cfg.cols) *
+                          static_cast<size_t>(2 * plane_radius + cfg.block_y) *
+                          sizeof(float)
+                    : 0;
             fprintf(stderr,
                     "[bilat] plane %d: %dx%d tier=%s block=%dx%d "
                     "cols=%d lds=%zu B\n",
