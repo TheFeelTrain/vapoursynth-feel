@@ -35,6 +35,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Bilateral matches vszipcl at the frame edge on GPUs with less workgroup memory
 - Box's variable-format error names the format, and `feel_aa` runs a Box supersampler on the host instead of failing
 - DFTTest rejects negative `sigma` and `sigma2` instead of producing an inverted frame
+- DFTTest rejects `f0beta=0` instead of returning a NaN frame
 
 ## [v1.3.4] - 2026-11-05
 

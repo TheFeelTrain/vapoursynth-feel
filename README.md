@@ -104,7 +104,7 @@ core.vsfeel.DFTTest(clip clip[,
     float   sbeta=2.5,              # kaiser-bessel beta (swin=4 only)
     float   tbeta=2.5,              # kaiser-bessel beta (twin=4 only)
     int     zmean=1,                # subtract the windowed mean before filtering
-    float   f0beta=1.0,             # ftype=0 exponent (1.0 = plain Wiener, 0.5 = sqrt)
+    float   f0beta=1.0,             # ftype=0 exponent, > 0 (1.0 = Wiener, 0.5 = sqrt)
     int     ssystem=0,              # slocation scale: 0 = relative to block size, 1 = absolute
     float[] slocation,              # frequency-dependent sigma: [freq, sigma, freq, sigma, ...]
     float[] ssx,                    # slocation along the X axis only

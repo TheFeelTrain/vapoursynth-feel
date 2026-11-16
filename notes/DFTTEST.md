@@ -236,6 +236,14 @@ force-pad / fail-pad probes.
 
 ## Historical
 
+- **2026-11-15 — `f0beta=0` is rejected at creation.** At beta 0 the ftype=0
+  gain is `pow(0, 0)` for every bin at or below sigma, which GLSL leaves
+  undefined: NVIDIA returns NaN and the shift spreads it over the frame, and
+  vszipcl's NVIDIA build produces the same NaN frame (its store writes 65535
+  where ours wrote 0), so that config had no valid oracle. The suite drops 0.0
+  from the parameter sweep and keeps 0.25/2/4 on the `pow` path.
+  Correctness-only, no perf change.
+
 - **2026-11-10 — col2im's divides are gone where they pay, and the last stripe
   lost its barrier.** `BLOCK_STEP` is a specialization constant (`constant_id`
   3, the reference bakes it in with `#define`), so col2im's four divides per

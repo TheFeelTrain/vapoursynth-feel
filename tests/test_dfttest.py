@@ -426,6 +426,15 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
     except Exception as exc:
         print("REF unavailable: %s: %s" % (type(exc).__name__, exc), flush=True)
         raise SystemExit(2)
+    # A non-finite reference sample is a broken oracle, not a vsfeel failure:
+    # some configs (f0beta=0's pow(0, 0)) are undefined on both sides.
+    for rframes in ref_frames:
+        for n, rplanes in zip(frames, rframes):
+            for p, b in zip(planes, rplanes):
+                if not np.isfinite(b.astype(np.float64)).all():
+                    print("REF unavailable: non-finite reference at frame %d plane %d"
+                          % (n, p), flush=True)
+                    raise SystemExit(2)
     print("REF ok", flush=True)
 
     # --- vsfeel phase ---
@@ -439,8 +448,7 @@ _COMPARE_SCRIPT = COMPARE_PRELUDE + textwrap.dedent(f"""\
                 my_frame = my_node.get_frame(n)
                 for p, b in zip(planes, rplanes):
                     a = read_plane(my_frame, p, dt)
-                    if not (np.isfinite(a.astype(np.float64)).all()
-                            and np.isfinite(b.astype(np.float64)).all()):
+                    if not np.isfinite(a.astype(np.float64)).all():
                         print("VSFEEL fail: non-finite at frame %d plane %d for %s"
                               % (n, p, kwargs), flush=True)
                         raise SystemExit(3)
@@ -461,8 +469,9 @@ def _reference_max_diffs(
 ) -> list[float]:
     """Run every config in a single subprocess.
 
-    A missing/crashing reference skips (via compare_or_skip); a vsfeel crash,
-    exception, timeout or non-finite result fails with the captured tail.
+    A missing, crashing or non-finite reference skips (via compare_or_skip); a
+    vsfeel crash, exception, timeout or non-finite result fails with the
+    captured tail.
     """
     if cases is None:
         cases = [kw for kw, _ in REFERENCE_CASES]
@@ -539,7 +548,7 @@ def test_dfttest_sosize_stripe_ring_lookback_matches_reference():
 
 
 # Window indices 0..11 on both axes, sigma2, the legal sosize surface (incl.
-# the two >50% overlaps and their divisor rule), every f0beta variant, ftype
+# the two >50% overlaps and their divisor rule), every valid f0beta variant, ftype
 # 2/3/4 with a non-default sigma, the per-axis ssystem=0 product, a Kaiser
 # temporal window that actually reads tbeta, and sigma2 on the ftype=3 gain
 # (the default ftype=0 never reads it). Batched per depth: one process per
@@ -551,7 +560,7 @@ DFTEST_PARAM_SWEEP = (
     # 9/10/11/13 are illegal (>50% overlap whose divisor rule fails); the rest
     # of 0..15 is the legal surface.
     + [{"sosize": v} for v in (0, 1, 2, 3, 5, 6, 7, 8, 14, 15)]
-    + [{"f0beta": v} for v in (0.0, 0.25, 2.0, 4.0)]
+    + [{"f0beta": v} for v in (0.25, 2.0, 4.0)]  # 0.0 is rejected at creation
     + [{"ftype": t, "sigma": 4.0, "pmin": 10.0, "pmax": 200.0} for t in (2, 3, 4)]
     + [
         {
@@ -1021,22 +1030,31 @@ def test_rejects_illegal_high_overlap_sosize(clip_grays, sosize):
     "kwargs",
     [
         {"ftype": 0, "f0beta": -0.5},
+        {"ftype": 0, "f0beta": 0.0},
         {"ftype": 4, "pmin": 0.0, "pmax": -1.0},
         {"ftype": 4, "pmin": -1.0, "pmax": 500.0},
         {"ftype": 3, "sigma": -4.0},
         {"ftype": 3, "sigma2": -4.0},
     ],
-    ids=["negative-f0beta", "negative-pmax", "negative-pmin", "negative-sigma", "negative-sigma2"],
+    ids=[
+        "negative-f0beta",
+        "zero-f0beta",
+        "negative-pmax",
+        "negative-pmin",
+        "negative-sigma",
+        "negative-sigma2",
+    ],
 )
-def test_rejects_negative_gain_parameters(clip_grays, kwargs):
-    """Negative f0beta, pmin/pmax or scalar sigma produced garbage frames.
+def test_rejects_invalid_gain_parameters(clip_grays, kwargs):
+    """Negative f0beta, pmin/pmax or scalar sigma, and f0beta=0, produced garbage.
 
     vszipcl accepts them: a negative f0beta or pmin/pmax is pow/sqrt of a
-    negative number (all-NaN frame) and a negative scalar sigma sign-inverts
-    the bins inside [pmin, pmax]. The array sigma forms already refuse
-    negatives, so the scalars must too.
+    negative number (all-NaN frame), a beta of 0 leaves pow(0, 0) undefined
+    (also an all-NaN frame on drivers that return NaN), and a negative scalar
+    sigma sign-inverts the bins inside [pmin, pmax]. The array sigma forms
+    already refuse negatives, so the scalars must too.
     """
-    with pytest.raises(vs.Error, match="non-negative"):
+    with pytest.raises(vs.Error, match="non-negative|greater than 0"):
         vs.core.vsfeel.DFTTest(clip_grays, tbsize=1, **kwargs)
 
 

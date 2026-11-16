@@ -1371,6 +1371,14 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
     if (f0beta < 0.0) {
         return set_error("\"f0beta\" must be non-negative.");
     }
+    // x0 is 0 for every bin at or below sigma and GLSL leaves pow(0, 0)
+    // undefined (NaN on NVIDIA, then spread over the frame), so beta 0 is the
+    // same garbage frame as the negatives above.
+    if (f0beta == 0.0) {
+        return set_error(
+            "\"f0beta\" must be greater than 0 (a beta of 0 leaves "
+            "pow(0, 0) undefined for the bins below sigma).");
+    }
     int ssystem = vsh::int64ToIntS(vsapi->mapGetInt(in, "ssystem", 0, &error));
     if (error) {
         ssystem = 0;
