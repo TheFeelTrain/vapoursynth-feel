@@ -41,7 +41,10 @@ from vskernels import Box
 #        every fractional ratio that only ever pairs one or two source pixels.
 #        Where resize2's own float32 quantisation of 1/count is inexact (the tap
 #        counts 3, 5, 6, 7) a handful of codes move, never more than 2.
-#   f32: within 1-2 ulp of the peak everywhere, and bit-exact for most ratios.
+#   f32: within 1-2 ulp of the peak at most ratios; ratio 6 (640x360 ->
+#        107x60) differs by 1-4 ulp on most samples (max 1.8e-7 on RADV,
+#        2.4e-7 on NVIDIA, the two sides' divide lowering differing per device),
+#        so its bound keeps headroom.
 #
 # (ratio, u16 bound in whole codes, f32 bound as a fraction of the peak)
 RATIOS = [
@@ -57,7 +60,7 @@ RATIOS = [
     (2.5, 2, 2.4e-7),
     (3.5, 1, 2.4e-7),
     (5, 2, 2.4e-7),
-    (6, 1, 1.8e-7),
+    (6, 1, 3.0e-7),
 ]
 
 # The per-ratio bounds for the ratios the color sweep uses, so a color case is
