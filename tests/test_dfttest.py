@@ -251,7 +251,7 @@ def test_dfttest_vspipe_pipelined_chained_no_hang_u16(chained, tmp_path):
         pytest.skip("vspipe not on PATH")
     try:
         result = subprocess.run(
-            [vspipe, "-p", str(script), "/dev/null"],
+            [vspipe, "-p", str(script), os.devnull],
             capture_output=True,
             text=True,
             timeout=45,

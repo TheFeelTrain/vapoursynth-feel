@@ -6,7 +6,6 @@ import importlib.util
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -99,7 +98,8 @@ def test_lint_stub_collapses_arrays_and_shadows_the_build_include(tmp_path):
     assert "static const uint32_t shader_spv[] = {0};" in stub
     assert "static const size_t shader_spv_size = sizeof(shader_spv);" in stub
     database = json.loads((build / "lint" / "compile_commands.json").read_text())
-    argv = shlex.split(database[0]["command"])
+    lint = _load_module("lint_stub", LINT_STUB)
+    argv = lint._split_command(database[0]["command"], posix=os.name != "nt")
     # The stub directory must come before the build directory, which holds the
     # real generated header.
     assert argv.index(f"-I{build / 'lint'}") < argv.index(f"-I{build}")
@@ -388,18 +388,32 @@ def test_check_fresh_sees_every_cmake_input(monkeypatch, tmp_path):
         bench.check_fresh(build, build)
 
 
-def test_lint_stub_uses_the_host_shell_quoting(tmp_path):
-    """A Windows command string must not be split as POSIX shell words."""
+@pytest.mark.parametrize(
+    ("posix", "compiler", "quoted"),
+    [
+        (True, "/opt/llvm bin/clang++", "'/opt/llvm bin/clang++'"),
+        (False, "C:\\Program Files\\LLVM\\clang-cl.exe", '"C:\\Program Files\\LLVM\\clang-cl.exe"'),
+    ],
+    ids=["posix", "windows"],
+)
+def test_lint_stub_keeps_the_command_shell_quoting(tmp_path, posix, compiler, quoted):
+    """A command string must round-trip through the convention it came from."""
     lint = _load_module("lint_stub", LINT_STUB)
-    win = [
+    stub = tmp_path / "lint"
+    database = [
         {
             "directory": str(tmp_path),
-            "file": "a.cpp",
-            "command": '"C:\\Program Files\\LLVM\\clang-cl.exe" /c "a b.cpp"',
+            "file": "a b.cpp",
+            "command": f'"{compiler}" -I{tmp_path} -c "a b.cpp"',
         }
     ]
-    out = lint.stub_database(win, tmp_path, posix=False)
-    assert out[0]["command"].startswith('"C:\\Program Files\\LLVM\\clang-cl.exe" -I')
+    out = lint.stub_database(database, stub, posix=posix)
+    assert out[0]["command"].startswith(f"{quoted} -I")
+    argv = lint._split_command(out[0]["command"], posix=posix)
+    assert argv[0] == compiler
+    # The stub directory must come before the build directory, which holds the
+    # real generated header.
+    assert argv.index(f"-I{stub}") < argv.index(f"-I{tmp_path}")
     argv = [{"directory": str(tmp_path), "file": "a.cpp", "arguments": ["cl.exe", "/c", "a.cpp"]}]
     out = lint.stub_database(argv, tmp_path)
     assert out[0]["arguments"][1] == f"-I{tmp_path}"
