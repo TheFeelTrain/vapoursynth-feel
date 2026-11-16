@@ -465,6 +465,17 @@ wheels = [
 ]
 
 [[package]]
+name = "nvidia-cuda-nvrtc"
+version = "13.5.37"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a9/54/db4e7f650746265f61c05cf1f8f556dd8c6739b58c823fbc9a7d6fda3247/nvidia_cuda_nvrtc-13.5.37-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:86b4d68058807988b7d9af5b44917a0601e9c337f35ccd657bfb3c759ff8d8bc", size = 58185930, upload-time = "2026-11-04T23:23:57.537Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/9f/e8321dfd9dcd923c864213fed3da815da474800ead891a99b6322bdd2039/nvidia_cuda_nvrtc-13.5.37-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:36e4fa2a8ada293f5693d308e531c196ab6f91cf7a0ff479bf96a537d43a6096", size = 56419462, upload-time = "2026-11-04T23:23:44.768Z" },
+    { url = "https://files.pythonhosted.org/packages/9f/6c/241c5155199a6de55bad8862213ed64b487dc9526aae817e4af31afea1a4/nvidia_cuda_nvrtc-13.5.37-py3-none-win_amd64.whl", hash = "sha256:e8e6c10b251385707ae3abd7b4ee118de6736fd7678d0f0f4eab4d759f679c21", size = 49248991, upload-time = "2026-11-04T23:35:13.589Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/62/b858b2e6da4d9f4ab2744dcd337dc31c75bc4db4ad35543a04ee07bb3eab/nvidia_cuda_nvrtc-13.5.37-py3-none-win_arm64.whl", hash = "sha256:d47388d9054a9f16c705d86e59d7e6c57e85beece36d23d1657833531fa913aa", size = 45119472, upload-time = "2026-11-04T23:40:19.254Z" },
+]
+
+[[package]]
 name = "packaging"
 version = "26.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1161,6 +1172,7 @@ dev = [
     { name = "vapoursynth-nnedi3vk" },
     { name = "vapoursynth-resize2" },
     { name = "vapoursynth-vszipcl" },
+    { name = "vapoursynth-vszipcu" },
     { name = "vapoursynth-zsmooth" },
     { name = "vsjetpack", extra = ["scale"] },
 ]
@@ -1205,6 +1217,7 @@ dev = [
     { name = "vapoursynth-nnedi3vk", specifier = ">=1.0" },
     { name = "vapoursynth-resize2", specifier = ">=0.4.2" },
     { name = "vapoursynth-vszipcl", git = "https://github.com/dnjulek/vapoursynth-zipcl?rev=2c1b97742bf4f086f0bd31d26ba630e834c661ed" },
+    { name = "vapoursynth-vszipcu", specifier = ">=1.2.0" },
     { name = "vapoursynth-zsmooth", specifier = ">=0.20" },
     { name = "vsjetpack", extras = ["scale"], specifier = ">=2.2.6" },
 ]
@@ -1410,6 +1423,20 @@ version = "1.2.0"
 source = { git = "https://github.com/dnjulek/vapoursynth-zipcl?rev=2c1b97742bf4f086f0bd31d26ba630e834c661ed#2c1b97742bf4f086f0bd31d26ba630e834c661ed" }
 dependencies = [
     { name = "vapoursynth" },
+]
+
+[[package]]
+name = "vapoursynth-vszipcu"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nvidia-cuda-nvrtc" },
+    { name = "vapoursynth" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e1/b0/6ae895af5a15a2c63933178f542cf547c885ae627965931b5fc742614358/vapoursynth_vszipcu-1.2.0.tar.gz", hash = "sha256:43a12a562b386e42d718cd19a57948b6e53f626900c36613a327ae039ba1e828", size = 12825790, upload-time = "2026-07-14T16:06:06.383Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ad/af/3906459e05a23e5cbfb88037bd8e2de3ef8de0cdeae961acb2d21e1b9bcc/vapoursynth_vszipcu-1.2.0-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:e3f4d5f1f5eeebb1e507c6aee2b554a69b52ac716b574bc4f67f2701505cf7d7", size = 12954947, upload-time = "2026-07-14T16:06:01.875Z" },
+    { url = "https://files.pythonhosted.org/packages/06/27/8977bc201fe31508f7af00aa261132f73af32ad4cf8bb39d31dd92dd48a1/vapoursynth_vszipcu-1.2.0-py3-none-win_amd64.whl", hash = "sha256:7c71247a8caf82883187b2560c690807cf2ea4a2db465f935cbd923ef21251fd", size = 13017813, upload-time = "2026-07-14T16:06:04.148Z" },
 ]
 
 [[package]]
