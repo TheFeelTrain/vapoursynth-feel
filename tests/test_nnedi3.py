@@ -49,6 +49,7 @@ from conftest import (
     COMPARE_PRELUDE,
     F16_PACKED_MAX,
     F16_STEP,
+    F16_STORAGE_MAX,
     ReferenceUnavailable,
     assert_changes_on_clip,
     assert_preserves_frame_props,
@@ -351,9 +352,9 @@ F16_STORAGE_CASES = [
 )
 def test_nnedi3_f16_storage_only_matches_reference(clip_grayh, kwargs):
     """The storage-only f16 path is graded against the reference's own f16
-    arithmetic, so the bound is the reference's error, not ours."""
+    arithmetic, so the bound is the reference's error plus our one half step."""
     payload = _ref_compare("grayh", (0, 11), kwargs, env={"VSFEEL_NNEDI3_PRED16": "0"})
-    assert payload["maxdiff"] <= F16_PACKED_MAX, kwargs
+    assert payload["maxdiff"] <= F16_STORAGE_MAX, kwargs
 
 
 # The device-independent half of the oracle: f16 in/out against the f32 path

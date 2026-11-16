@@ -399,12 +399,16 @@ def test_check_fresh_sees_every_cmake_input(monkeypatch, tmp_path):
 def test_lint_stub_keeps_the_command_shell_quoting(tmp_path, posix, compiler, quoted):
     """A command string must round-trip through the convention it came from."""
     lint = _load_module("lint_stub", LINT_STUB)
-    stub = tmp_path / "lint"
+    # Each arm carries the path convention its database would have: a POSIX
+    # command string with a Windows include path is quoted (and its backslashes
+    # eaten) by the POSIX splitter, which is not a case a real database mixes.
+    root = tmp_path.as_posix() if posix else str(tmp_path)
+    stub = f"{root}/lint"
     database = [
         {
-            "directory": str(tmp_path),
+            "directory": root,
             "file": "a b.cpp",
-            "command": f'"{compiler}" -I{tmp_path} -c "a b.cpp"',
+            "command": f'"{compiler}" -I{root} -c "a b.cpp"',
         }
     ]
     out = lint.stub_database(database, stub, posix=posix)
@@ -413,7 +417,7 @@ def test_lint_stub_keeps_the_command_shell_quoting(tmp_path, posix, compiler, qu
     assert argv[0] == compiler
     # The stub directory must come before the build directory, which holds the
     # real generated header.
-    assert argv.index(f"-I{stub}") < argv.index(f"-I{tmp_path}")
+    assert argv.index(f"-I{stub}") < argv.index(f"-I{root}")
     argv = [{"directory": str(tmp_path), "file": "a.cpp", "arguments": ["cl.exe", "/c", "a.cpp"]}]
     out = lint.stub_database(argv, tmp_path)
     assert out[0]["arguments"][1] == f"-I{tmp_path}"

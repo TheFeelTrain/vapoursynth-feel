@@ -29,6 +29,12 @@ F16_STEP = 4.8828125e-4
 # own f32 path). Shared by test_nnedi3 and test_rgb.
 F16_PACKED_MAX = 2.6e-3
 
+# The storage-only f16 path against the reference's f16 output is the loosest
+# pair: it stores one rounded f16 sample (F16_STEP) from an f32 result the
+# reference's half GEMV can already be F16_PACKED_MAX away from. Measured
+# 3.05e-3 at nsize=3 against nnedi3vk's plain f32 kernel.
+F16_STORAGE_MAX = 3.5e-3
+
 
 def _source(path, frames=CLIP_FRAMES):
     core = vs.core
