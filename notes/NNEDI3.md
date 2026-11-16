@@ -99,12 +99,14 @@ use the ratios, not the absolute fps.
   green via `tools/test.sh` (one unrelated NLMeans `a=64,d=16` contention
   flake, passes serially — see `notes/NLMEANS.md`).
 - f16 accuracy (same noise clip, f32 clip widened from the half one so both
-  see identical input values): the packed predictor is **bit-exact with
-  nnedi3vk f16** (maxdiff 0) on every mode swept — field 0/1/2/3, dh, planes
-  subsets, nsize 0/3/6, nns 0/2/4, pscrn 0..4, qual/etype — and within
-  **2.5e-3** of vsfeel's f32 path, *identical* to nnedi3vk's own f16-vs-f32
-  gap (its f16 arithmetic is what we run). The storage-only path is within
-  **4.5e-4** (one half step) of the f32 path.
+  see identical input values): the packed predictor tracks nnedi3vk's f16
+  output to **1-5 half ulp** (up to 1.95e-3 on GRAYH, 2.44e-3 on RGBH) and
+  vsfeel's own f32 path to **2.5e-3**, the reference's f16 error. It is
+  bit-exact on RADV but not on NVIDIA, whose half FMA and reduction lowering is
+  not identical to the reference's (the instruction-level source is unproven),
+  so the f16 comparisons carry `F16_PACKED_MAX` and u16/f32 (bit-exact with
+  `coopvec=0`) remain the oracles. The storage-only path is within **4.5e-4**
+  (one half step) of the f32 path.
 - Weights `src/nnedi3_weights.bin`, 13,574,928 B, md5
   `5c97e25c4a7277d06d3e3851373f1065`.
 

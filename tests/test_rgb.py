@@ -13,6 +13,7 @@ import pytest
 import vapoursynth as vs
 
 from conftest import (
+    F16_PACKED_MAX,
     F16_STEP,
     assert_preserves_frame_props,
     cpu_node,
@@ -57,7 +58,7 @@ CASES = [
     ("EEDI3", "eedi3vk2", "EEDI3", "rgbs", {"field": 1}, 1e-6),
     ("EEDI3_48", "eedi3vk2", "EEDI3", "rgb48", {"field": 1}, 0),
     ("NNEDI3", "nnedi3vk", "NNEDI3", "rgbs", {"field": 1}, 1e-6),
-    ("NNEDI3_h", "nnedi3vk", "NNEDI3", "rgbh", {"field": 1}, 0),
+    ("NNEDI3_h", "nnedi3vk", "NNEDI3", "rgbh", {"field": 1}, F16_PACKED_MAX),
     ("NNEDI3_48", "nnedi3vk", "NNEDI3", "rgb48", {"field": 1}, 0),
 ]
 

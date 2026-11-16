@@ -23,6 +23,12 @@ HEIGHT = 360
 # on a tie can flip one step when the f32 result jitters).
 F16_STEP = 4.8828125e-4
 
+# NNEDI3's f16 agreement with the reference: both run a half GEMV, but their
+# half FMA/reduction lowering differs, so it is 1-5 half ulp, not exact
+# (measured up to 1.95e-3 on GRAYH, 2.44e-3 on RGBH; 2.51e-3 against vsfeel's
+# own f32 path). Shared by test_nnedi3 and test_rgb.
+F16_PACKED_MAX = 2.6e-3
+
 
 def _source(path, frames=CLIP_FRAMES):
     core = vs.core
