@@ -308,19 +308,24 @@ def test_dfttest_stripe_budget_is_device_sized():
         assert target == llc, (llc, target)
     assert 32.0 <= target <= 64.0, target
 
-    # The knob overrides the table: a 32 MiB budget halves the ring.
+    # The knob overrides the table: half the device's own target halves the
+    # ring (forcing a fixed 32 MiB is a no-op on a part whose target is 32).
+    half = max(8.0, target / 2)
     small_target, small_ring, small_stripes, _ = _dft_plan(
-        _trace("dfttest", {"VSFEEL_DFTTEST_L2_TARGET": str(32 << 20)})
+        _trace("dfttest", {"VSFEEL_DFTTEST_L2_TARGET": str(int(half) << 20)})
     )
-    assert small_target == 32.0, small_target
+    assert small_target == half, (target, small_target)
     assert small_ring * 2 == ring, (ring, small_ring)
     assert small_stripes > stripes, (stripes, small_stripes)
 
-    # The VRAM allowance bounds it too: a 256 MiB allowance is 16 MiB of ring.
+    # The VRAM allowance bounds it too: a sixteenth of the allowance is the
+    # target, so asking for half of the half budget shows the ladder's next
+    # step on every device class.
+    quarter = max(8.0, half / 2)
     vram_target, vram_ring, vram_stripes, _ = _dft_plan(
-        _trace("dfttest", {"VSFEEL_LIMIT_VRAM_BUDGET": str(256 << 20)})
+        _trace("dfttest", {"VSFEEL_LIMIT_VRAM_BUDGET": str(int(quarter * 16) << 20)})
     )
-    assert vram_target == 16.0, vram_target
+    assert vram_target == quarter, (half, vram_target)
     assert vram_ring < small_ring, (small_ring, vram_ring)
     assert vram_stripes > small_stripes, (small_stripes, vram_stripes)
 
@@ -430,13 +435,16 @@ def test_nlmeans_round_target_follows_the_cache():
 
     The tuned 96 MiB is the target card's last-level cache; a part with a
     smaller one plans a smaller round instead of streaming it, floored at 32 MiB
-    like DFTTest's stripe ring. The knob overrides the tuned value in MiB and the
+    like DFTTest's stripe ring. A part the table does not know also gets that
+    floor, since guessing the tuned value for an unknown cache is exactly what
+    the floor exists to avoid. The knob overrides the tuned value in MiB and the
     VRAM allowance still caps the result.
     """
     trace = _trace("nlmeans")
     ring, target, batch = _nlmeans_ring(trace)
     _, llc = _nlmeans_llc(trace)
-    want = 96.0 if llc == 0.0 or llc >= 96.0 else max(32.0, llc)
+    # vsfeel_llc_budget: an unknown part (llc == 0) clamps to the floor.
+    want = max(32.0, min(96.0, llc))
     assert target == want, (llc, target)
     assert batch >= 1, batch
     # The banner names every per-frame buffer and the cache it used.
@@ -1119,14 +1127,32 @@ def test_two_dimensional_grid_overflow_is_reported():
     assert default["dfttest"].get("finite") is True, default["dfttest"]
 
 
+def _device_subgroup_size():
+    """The device's default subgroup size, from the debug banner."""
+    env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1"}
+    proc = subprocess.run(
+        [sys.executable, "-c", _BUDGET_SCRIPT, "dfttest"],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    match = re.search(r"subgroup (\d+) \[", proc.stderr)
+    assert match, proc.stderr[-2000:]
+    return int(match.group(1))
+
+
 def test_subgroup_size_requests_require_compute_stage_support():
     """A required-size mask without COMPUTE must degrade, not break.
 
     Requesting requiredSubgroupSize for a stage outside
     requiredSubgroupSizeStages is invalid usage, so with the mask cleared the
     filters whose default width already fits (DFTTest, NLMeans, BM3D) must run
-    unchanged, and the two that need exactly 32 lanes (NNEDI3, EEDI3) must say
-    so rather than hand the driver an invalid required size.
+    unchanged. NNEDI3 and EEDI3 need exactly 32 lanes: the resolver falls back
+    to the driver's default when it cannot request that size, so a 32-lane
+    device runs them unchanged, and a device with another default must say
+    "32-lane subgroups" instead of handing the driver an invalid required size.
     """
     labels = ["dfttest", "nlmeans", "bm3d"]
     cases = [{"label": name, "filter": name} for name in labels]
@@ -1141,7 +1167,16 @@ def test_subgroup_size_requests_require_compute_stage_support():
         assert cleared[label]["sha1"] == default[label]["sha1"], label
 
     strict = [{"label": "nnedi3", "filter": "nnedi3"}, {"label": "eedi3", "filter": "eedi3"}]
-    res = _run_limits(strict, {"VSFEEL_LIMIT_SUBGROUP_STAGES": "0"})
-    for case in strict:
-        err = res[case["label"]].get("error", "")
-        assert "32-lane subgroups" in err, res[case["label"]]
+    strict_cleared = _run_limits(strict, {"VSFEEL_LIMIT_SUBGROUP_STAGES": "0"})
+    if _device_subgroup_size() == 32:
+        # The driver's default is already the required width, which is the
+        # documented fallback: nothing changes, pixels included.
+        strict_default = _run_limits(strict)
+        for case in strict:
+            label = case["label"]
+            assert strict_cleared[label].get("finite") is True, strict_cleared[label]
+            assert strict_cleared[label]["sha1"] == strict_default[label]["sha1"], label
+    else:
+        for case in strict:
+            err = strict_cleared[case["label"]].get("error", "")
+            assert "32-lane subgroups" in err, strict_cleared[case["label"]]

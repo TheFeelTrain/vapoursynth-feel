@@ -312,8 +312,8 @@ core.vsfeel.Bilateral(clip, **spec)
 """
 
 
-def _tier_banner(**kwargs):
-    """(tier, block_x, block_y, cols, lds) from the creation banner."""
+def _tier_stderr(**kwargs):
+    """stderr of a creation run with the debug banner on."""
     env = {**os.environ, "MANGOHUD": "0", "VSFEEL_DEBUG": "1"}
     proc = subprocess.run(
         [sys.executable, "-c", _TIER_BANNER_SCRIPT, json.dumps(kwargs)],
@@ -323,12 +323,18 @@ def _tier_banner(**kwargs):
         timeout=300,
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
+    return proc.stderr
+
+
+def _tier_banner(**kwargs):
+    """(tier, block_x, block_y, cols, lds) from the creation banner."""
+    stderr = _tier_stderr(**kwargs)
     plan = re.search(
         r"\[bilat\] plane 0: \d+x\d+ tier=(\S+) block=(\d+)x(\d+) "
         r"cols=(\d+) lds=(\d+) B",
-        proc.stderr,
+        stderr,
     )
-    assert plan, proc.stderr[-2000:]
+    assert plan, stderr[-2000:]
     return (
         plan.group(1),
         int(plan.group(2)),
@@ -338,23 +344,47 @@ def _tier_banner(**kwargs):
     )
 
 
+def _device_shared_memory():
+    """The device's maxComputeSharedMemorySize, from the debug banner."""
+    match = re.search(r"shared=(\d+) bytes", _tier_stderr())
+    assert match, "no shared-memory limit in the device banner"
+    return int(match.group(1))
+
+
+def _wide_radius_plan(limit):
+    """The R=51 plan on a device with `limit` bytes of LDS, or None.
+
+    The kernel starts at the 32x16 launch tile and searches tall before wide
+    (down to the 4x8 floor) for the largest shape that fits, preferring two
+    tile columns. Measured: 64 KiB parts keep 32x16x1 (63,248 B), 48 KiB parts
+    land on 8x8x1 (48,400 B). Encoding the pinned rule lets both classes be
+    graded from one device.
+    """
+    for by in (16, 8):
+        for bx in (32, 16, 8, 4):
+            for cols in (2, 1):
+                lds = (102 + bx * cols) * (102 + by) * 4  # 102 = 2 * radius 51
+                if lds <= limit:
+                    return ("shared+clipped", bx, by, cols, lds)
+    return None
+
+
 def test_bilateral_tier_pinned():
     """The tier follows the tile fit and the reference's border mode, not its budget.
 
     R=51 is the band where vszipcl's own 16x8 tile stops fitting its 48 KiB
-    budget and it drops to the plain gather. Our one-column tile still fits this
-    device, so the plane keeps the shared kernel and takes the reference's
-    *clipped* window at border groups instead of its clamped one. R=9 is inside
-    the reference's shared range, where both sides clamp (and the two-column tile
-    fits). `use_shared_memory=0` still selects the plain kernel.
+    budget and it drops to the plain gather. Our one-column tile still fits a
+    64 KiB device, so the plane keeps the shared kernel and takes the
+    reference's *clipped* window at border groups instead of its clamped one;
+    a 48 KiB device searches down to the largest fitting tile and keeps the
+    same tier. R=9 is inside the reference's shared range, where both sides
+    clamp (and the two-column tile fits). `use_shared_memory=0` still selects
+    the plain kernel.
     """
-    assert _tier_banner(sigma_spatial=17.0, sigma_color=0.15) == (
-        "shared+clipped",
-        32,
-        16,
-        1,
-        63248,
-    )
+    limit = _device_shared_memory()
+    expected = _wide_radius_plan(limit)
+    assert expected is not None, f"no shared tile fits {limit} B of LDS at R=51"
+    assert _tier_banner(sigma_spatial=17.0, sigma_color=0.15) == expected
     assert _tier_banner(sigma_spatial=3.0, sigma_color=0.02) == (
         "shared",
         32,
