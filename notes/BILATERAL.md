@@ -228,6 +228,17 @@ Benchmark call: `MANGOHUD=0 uv run tools/benchmark.py --filter bilateral
 
 ## Historical
 
+- **2026-11-16 — the input plane is staged per frame (+197%, 1080p16).** Reading
+  the source (and guide) in place cost more than the kernel on an RTX 5060,
+  where the same read of a private copy measured several times faster (mechanism
+  unnamed). Each plane is now copied once per frame into filter-owned
+  device-local memory (`vkCmdCopyBuffer2`, one COPY->COMPUTE barrier) and the
+  kernel reads that. Same-session ABBA, `--repeat 3`, n=12,
+  `tools/benchmark.py --filter bilateral`: **179.2 -> 531.3 fps**, vszipcl 375.0
+  in the same session. The copy costs 4.5% on the RX 7900 XTX, which also
+  exposes host-visible device-local memory, so the default follows the vendor,
+  not the platform or the memory type: staged on NVIDIA, in place elsewhere.
+  `VSFEEL_BILAT_STAGE=0` restores the in-place read.
 - **2026-11-05 — shared-tier border parity on small-LDS devices.** The tier
   was fixed to one block shape, so a device that could hold the reference's
   16x8 tile but not the 32x16 one ran the plain gather while vszipcl stayed
@@ -418,5 +429,8 @@ SDMA and the port reaches parity without any core change.
 
 - `VSFEEL_BILAT_TIMING=1` — per-frame host stage `[bilat-timing]` averages
   (acquire/record/submit/total) at instance destruction.
+- `VSFEEL_BILAT_STAGE=1|0` — stage the source and guide planes per frame, or
+  read them in place (default: NVIDIA; `VSFEEL_STAGE` sets the default for
+  every filter). See Historical for the vendor gate.
 - `VSFEEL_DEBUG=1|2`, `VSFEEL_TRACE=1|2` — the shared error trace and trail
   (`acquire`/`record`/`submit` marks are recorded in the frame path).

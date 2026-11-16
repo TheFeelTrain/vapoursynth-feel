@@ -212,6 +212,16 @@ sigma, frames and repeats (3-repeat medians, one session):
 
 ## Historical
 
+- **2026-11-16 — the input plane is staged per frame (+65%, 1080p16).** Both
+  passes read the source plane in place, the same read of a private copy measured
+  several times faster on an RTX 5060 (mechanism unnamed), so the reads, not the
+  taps, were the cost. One `vkCmdCopyBuffer2` per plane per frame into
+  filter-owned device-local memory (one COPY->COMPUTE barrier) fixed it:
+  same-session ABBA, `--repeat 3`, n=12, `--filter gaussblur`: **582.9 -> 959.5
+  fps**, vszipcl 858.1 in the same session (the reference is unaffected by the
+  switch: 852.4 vs 858.1). The copy costs 13.8% on the RX 7900 XTX, so staging is
+  NVIDIA-only by default (see `notes/BILATERAL.md`). `VSFEEL_GAUSS_STAGE=0`
+  restores the in-place read.
 - **2026-11-10 — the path threshold was 8x too high, and the fused block was
   7-25% short.** The threshold (32) had never been measured at the value it
   governed. A same-session A/B per sigma, forcing each path with a new
@@ -359,6 +369,8 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
   over concurrently recorded frames, so with the GPU saturated the total can
   exceed the frame time and `acquire` dominates; read it as the host/GPU split,
   not as an absolute per-frame cost. Record+submit is ~23 µs per call.
+- `VSFEEL_GAUSS_STAGE=1|0` — stage the source plane per frame, or read it in
+  place (default: NVIDIA; `VSFEEL_STAGE` sets the default for every filter).
 - `VSFEEL_GAUSS_GPUTRACE=<first frame>` and `VSFEEL_GAUSS_GPUTRACE_RANGE=<n>`
   (default 100/40) — in-command-buffer GPU timestamps: per-plane per-dispatch
   p25/median/p75 over the traced window, printed at destruction. The window

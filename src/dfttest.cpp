@@ -629,6 +629,9 @@ struct DftData {
     // only acquire/record/submit now, but the split still says whether a frame
     // is host- or GPU-bound, which no kernel timing can.
     bool host_timing { false };
+    // Read the temporal source planes from private device-local copies (see
+    // gpu_stage_plane); off with VSFEEL_DFT_STAGE=0.
+    bool stage { true };
     std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
         ht_total_ns {}, ht_n {};
 
@@ -957,8 +960,10 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
         // One source plane buffer per temporal slice, all read by fused: the
         // descriptor array binding. Each slice keeps its own row stride.
         std::array<VkBuffer, 7> src_buffers {};
+        std::array<GpuBuffer, 7> staged {};
         DftPushConstants pc_base = base_pc(*d);
         pc_base.pad_slice = cfg.pw * cfg.ph;
+        bool any_staged = false;
         for (int t = 0; t < tw; ++t) {
             VSVulkanPlaneInfo sp {};
             if (d->gpu->api->getGPUPlane(src[t], plane, &sp)) {
@@ -971,6 +976,17 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
                 return fail(e);
             }
             src_buffers[t] = sp.buffer;
+            // The pad pass is the only reader of these planes; a private copy
+            // (see gpu_stage_plane) is what makes it fast here.
+            if (d->stage) {
+                if (auto e =
+                        gpu_stage_plane(*d->gpu, core, ctx, cmd, sp, staged[t]);
+                    !e.empty()) {
+                    return fail("staged source: " + e);
+                }
+                src_buffers[t] = staged[t].buffer;
+                any_staged = true;
+            }
             const int src_stride = static_cast<int>(
                 vsapi->getStride(src[t], plane) / d->elem_bytes);
             if (!dft_offsets_fit(cfg, src_stride)) {
@@ -979,6 +995,9 @@ static const VSFrame * dft_gpu_frame(DftData * d, int n,
                             " overflows the kernel's 32-bit addressing");
             }
             pc_base.src_stride[t] = src_stride;
+        }
+        if (any_staged) {
+            gpu_stage_barrier(*d->gpu, cmd);
         }
         const int pad_y = (cfg.ph - cfg.height) / 2;
         const int y_first = pad_y;
@@ -1513,6 +1532,8 @@ static void VS_CC DftCreate(const VSMap * in, VSMap * out,
         }
         d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
     }
+
+    d->stage = env_flag_or("VSFEEL_DFT_STAGE", vsfeel_stage_default(*d->gpu));
 
     // The stripe ring's budget, in bytes, before the per-plane geometry that
     // sizes the ring from it. Nothing in Vulkan reports a cache size, so the

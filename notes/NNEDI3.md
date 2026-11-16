@@ -181,6 +181,18 @@ use the ratios, not the absolute fps.
 
 ## Historical
 
+- **2026-11-16 — the source plane is staged per frame (+34%, 1080p16).** Keep,
+  prescreen and predict all read the field in place, and the same read of a
+  private copy measured several times faster on an RTX 5060 (mechanism unnamed);
+  the predictor's gather is what pays for it. One `vkCmdCopyBuffer2` per plane
+  per frame into filter-owned device-local memory (one COPY->COMPUTE barrier)
+  fixed it: same-session ABBA, `--repeat 3`, n=12, `--filter nnedi3`:
+  **303.2 -> 407.2 fps**. The copy costs 2.3% on the RX 7900 XTX, so staging is
+  NVIDIA-only by default (see `notes/BILATERAL.md`). `VSFEEL_NNEDI3_STAGE=0`
+  restores the in-place read. The remaining gap to
+  `nnedi3vk` is not transport: its f32 arm measured **1027.5 fps** and its
+  cooperative-vector default **1933.3 fps** here, so the predictor network itself
+  is 2.5x off at an fp32-peak-bound instruction count (see Open work).
 - **2026-11-10 — the predictor tile and the scratch budget are named and
   device-checked.** The tile rule was the reference's measured one but was
   applied inline per plane and never named, so no test could pin it and no sweep
@@ -424,6 +436,7 @@ the global switches in `src/vsfeel.h`.
 | `VSFEEL_NNEDI3_PRED16=0` | force the storage-only f16 kernels instead of the packed half predictor (default on where the device has `shaderFloat16`) |
 | `VSFEEL_NNEDI3_TILE=<auto\|packed\|pxp8\|n4\|n4m\|n4s>` | force the predictor module for a sweep; the banner's `tile=`/`lds=` is what it chose. A window or a tile/PXP pair that disagrees is a creation error |
 | `VSFEEL_NNEDI3_PXP=<4\|8>` | force the tile-internal pixel block; it is baked into the module's shared stride, so `8` excludes the `n4*` modules and `4` excludes `pxp8` |
+| `VSFEEL_NNEDI3_STAGE=1\|0` | stage the source plane per frame, or read it in place (default: NVIDIA; `VSFEEL_STAGE` sets the default for every filter) |
 | `VSFEEL_DEBUG=1\|2` | device banner and full error trail; level 2 also enables the probe traces |
 | `VSFEEL_TRACE=1\|2` | first 50 / every trace line (the banner is also printed) |
 

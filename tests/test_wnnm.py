@@ -468,6 +468,31 @@ def _code_diff(a_frame, b_frame, planes):
     )
 
 
+def test_staged_input_matches_the_in_place_path(clip_yuv420p16, monkeypatch):
+    """The staged read is a byte copy, so it must not move more than the atomics do.
+
+    Both storage classes are covered: the 2-byte path stages its widening source
+    by descriptor, the f32 path stages device addresses, and each has its own
+    usage flags. The aggregation's atomicAdd order already moves the last code
+    between two identically configured instances (measured 0-1 codes on frames
+    0/7/23), so the bound is that same one code.
+    """
+    from vstools import depth
+
+    clip = clip_yuv420p16
+    for fmt, node in (("u16", clip), ("f32", depth(clip, 32))):
+        # Both arms are forced: the default follows the vendor, so neither may
+        # rely on it on the machine the test happens to run on.
+        monkeypatch.setenv("VSFEEL_WNNM_STAGE", "0")
+        in_place = cpu_node(WNNM(node))
+        monkeypatch.setenv("VSFEEL_WNNM_STAGE", "1")
+        staged = cpu_node(WNNM(node))
+        monkeypatch.delenv("VSFEEL_WNNM_STAGE", raising=False)
+        for n in (0, 7, 23):
+            worst = _code_diff(in_place.get_frame(n), staged.get_frame(n), (0, 1, 2))
+            assert worst <= 1, f"{fmt} frame {n}: staged path moved {worst} codes"
+
+
 @pytest.mark.parametrize("full", [False, True], ids=["limited", "full"])
 def test_u16_matches_the_float_chain(clip_yuv420p16, full):
     """Native u16 is `depth(WNNM(depth(clip, 32)), 16)` to the last code."""

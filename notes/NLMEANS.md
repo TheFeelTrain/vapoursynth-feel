@@ -251,6 +251,17 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
 
 ## Historical
 
+- **2026-11-16 - the temporal window's planes are staged per frame (+135%,
+  1080p16).** Compose reads every `(clip, channel, layer)` plane once per frame
+  and the same read of a private copy measured several times faster on an
+  RTX 5060 (mechanism unnamed), so the read, not the sweep, dominated. Each
+  plane is now copied once per frame into filter-owned device-local memory and
+  the address table points at the copy (`vkCmdCopyBuffer2`, one COPY->COMPUTE
+  barrier). Same-session ABBA, `--repeat 3`, n=12, `--filter nlmeans`:
+  **122.2 -> 286.6 fps**; knlmvk 225.4 in the same session, also fed in place.
+  The copy costs 1.7% on the RX 7900 XTX, so staging is NVIDIA-only by default
+  (see `notes/BILATERAL.md`). `VSFEEL_NLMEANS_STAGE=0` restores the in-place
+  read.
 - **2026-11-07 - the live set and the sweep tables are bounded at creation.**
   Two allocations were unbudgeted. One weight+acc round (ring + accumulators +
   window) is now checked against an eighth of the VRAM allowance, so a device
@@ -451,4 +462,7 @@ Flags are `VSFEEL_NLMEANS_<FLAG>`.
   address table, the sweep tables and the cache the round target came from.
 - `VSFEEL_NLMEANS_RING_TARGET=<MiB>` — override the round target (default: the
   tuned 96 MiB capped by the part's cache and floored at 32).
+- `VSFEEL_NLMEANS_STAGE=1|0` — stage the window's planes per frame, or read
+  them in place (default: NVIDIA; `VSFEEL_STAGE` sets the default for every
+  filter).
 - `VSFEEL_DEBUG`/`VSFEEL_TRACE` and `RADV_DEBUG=asm|shaderstats` as elsewhere.

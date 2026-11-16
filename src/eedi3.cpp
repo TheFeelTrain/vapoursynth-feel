@@ -382,6 +382,9 @@ struct Eedi3Data {
     // VSFEEL_EEDI3_TRACE only.
     bool trace { false };
     bool host_timing { false };
+    // Read the clip (and mask) from private device-local copies per frame (see
+    // gpu_stage_plane); off with VSFEEL_EEDI3_STAGE=0.
+    bool stage { true };
     // VSFEEL_EEDI3_SKIP diagnostics: omit a kernel from the recording so its
     // GPU cost can be read off an end-to-end A/B.
     bool skip_mask { false }, skip_pad { false }, skip_row { false },
@@ -1243,6 +1246,10 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
     std::vector<const VSFrame *> inputs;
     std::vector<std::pair<int, VSFrame *>> produced;
     std::vector<Eedi3Job> jobs;
+    // Private device-local copies of every plane this submission reads (see
+    // gpu_stage_plane); the handles stay in the exec context's retention.
+    std::vector<GpuBuffer> staged;
+    bool any_staged = false;
     auto fail = [&](const std::string & message) -> const VSFrame * {
         for (auto & p : produced) {
             vsapi->freeFrame(p.second);
@@ -1349,6 +1356,46 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
             vsapi->freeFrame(dst);
             return fail(err);
         }
+        // The row and tail kernels read the sclip and mask planes; AA stages
+        // them and most of its gain comes from it, so the plain filter does too.
+        if (d->stage) {
+            for (int plane = 0; plane < numPlanes; ++plane) {
+                if (in.sclip[plane] == VK_NULL_HANDLE) {
+                    continue;
+                }
+                VSVulkanPlaneInfo pi {};
+                if (d->gpu->api->getGPUPlane(scp, plane, &pi)) {
+                    vsapi->freeFrame(dst);
+                    return fail("sclip plane " + std::to_string(plane) +
+                                " is not GPU resident");
+                }
+                staged.emplace_back();
+                if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, pi,
+                                             staged.back());
+                    !e.empty()) {
+                    vsapi->freeFrame(dst);
+                    return fail("staged sclip: " + e);
+                }
+                in.sclip[plane] = staged.back().buffer;
+                any_staged = true;
+            }
+            if (in.mask != VK_NULL_HANDLE) {
+                VSVulkanPlaneInfo pi {};
+                if (d->gpu->api->getGPUPlane(mcp, 0, &pi)) {
+                    vsapi->freeFrame(dst);
+                    return fail("mclip is not GPU resident");
+                }
+                staged.emplace_back();
+                if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, pi,
+                                             staged.back());
+                    !e.empty()) {
+                    vsapi->freeFrame(dst);
+                    return fail("staged mclip: " + e);
+                }
+                in.mask = staged.back().buffer;
+                any_staged = true;
+            }
+        }
         if (!fill_out_planes(*d, vsapi, dst, in.out, in.out_stride, err)) {
             vsapi->freeFrame(dst);
             return fail(err);
@@ -1373,9 +1420,24 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
             in.src_base[plane] = 0;
             in.src_stride[plane] =
                 static_cast<int>(vsapi->getStride(src, plane) / d->elem_bytes);
+            if (d->stage) {
+                staged.emplace_back();
+                if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, pi,
+                                             staged.back());
+                    !e.empty()) {
+                    vsapi->freeFrame(dst);
+                    return fail("staged source: " + e);
+                }
+                in.src[plane] = staged.back().buffer;
+                any_staged = true;
+            }
         }
         jobs.push_back(job);
         produced.emplace_back(j, dst);
+    }
+
+    if (any_staged) {
+        gpu_stage_barrier(*d->gpu, cmd);
     }
 
     const auto t2 = timing ? now() : std::chrono::steady_clock::time_point {};
@@ -1567,6 +1629,8 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
     std::vector<std::pair<int, VSFrame *>> produced;
     // jobs[sub-pass][frame]: vertical fv0, vertical fv1, horizontal fh0, fh1.
     std::array<std::vector<Eedi3Job>, 4> jobs;
+    std::vector<GpuBuffer> staged;
+    bool any_staged = false;
     auto fail = [&](const std::string & message) -> const VSFrame * {
         for (auto & p : produced) {
             vsapi->freeFrame(p.second);
@@ -1703,7 +1767,19 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
             mask = pi.buffer;
             mask_stride = static_cast<int>(vsapi->getStride(mcp, 0) /
                                            (d->mclip_bits / 8));
+            if (d->stage) {
+                staged.emplace_back();
+                if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, pi,
+                                             staged.back());
+                    !e.empty()) {
+                    vsapi->freeFrame(dst);
+                    return fail("staged mclip: " + e);
+                }
+                mask = staged.back().buffer;
+                any_staged = true;
+            }
         }
+        std::string sclip_err = "sclip is not GPU resident";
         auto sclip_planes = [&](const VSFrame * scf, VkBuffer * out,
                                 int * strides) {
             for (int plane = 0; plane < numPlanes; ++plane) {
@@ -1717,6 +1793,17 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
                     return false;
                 }
                 out[plane] = pi.buffer;
+                if (d->stage) {
+                    staged.emplace_back();
+                    if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, pi,
+                                                 staged.back());
+                        !e.empty()) {
+                        sclip_err = "staged sclip: " + e;
+                        return false;
+                    }
+                    out[plane] = staged.back().buffer;
+                    any_staged = true;
+                }
                 strides[plane] = static_cast<int>(vsapi->getStride(scf, plane) /
                                                   d->elem_bytes);
             }
@@ -1726,7 +1813,7 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
         int sc0s[MAX_PLANES] {}, sc1s[MAX_PLANES] {};
         if (!sclip_planes(scp0, sc0, sc0s) || !sclip_planes(scp1, sc1, sc1s)) {
             vsapi->freeFrame(dst);
-            return fail("sclip is not GPU resident");
+            return fail(sclip_err);
         }
 
         std::string err;
@@ -1800,6 +1887,17 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
                     in.src_base[plane] = 0;
                     in.src_stride[plane] = static_cast<int>(
                         vsapi->getStride(src, plane) / d->elem_bytes);
+                    if (d->stage) {
+                        staged.emplace_back();
+                        if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd,
+                                                     pi, staged.back());
+                            !e.empty()) {
+                            vsapi->freeFrame(dst);
+                            return fail("staged source: " + e);
+                        }
+                        in.src[plane] = staged.back().buffer;
+                        any_staged = true;
+                    }
                 }
             }
         }
@@ -1817,6 +1915,9 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
         jobs[2].push_back(h0);
         jobs[3].push_back(h1);
         produced.emplace_back(j, dst);
+    }
+    if (any_staged) {
+        gpu_stage_barrier(*d->gpu, cmd);
     }
 
     const auto t2 = timing ? now() : std::chrono::steady_clock::time_point {};
@@ -2265,6 +2366,15 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
             return set_error(std::get<std::string>(result));
         }
         d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
+    }
+
+    d->stage = env_flag_or("VSFEEL_EEDI3_STAGE", vsfeel_stage_default(*d->gpu));
+    // EEDI3H's horizontal passes read a transpose scratch, so the only plane it
+    // stages is the source the vertical passes read; it measured -2%, so the
+    // default leaves it in place and the env can still force it on.
+    if (horiz && !aa && !std::getenv("VSFEEL_EEDI3_STAGE") &&
+        !std::getenv("VSFEEL_STAGE")) {
+        d->stage = false;
     }
 
     {

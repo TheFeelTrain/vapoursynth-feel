@@ -102,6 +102,12 @@ inline bool env_flag_default_on(const char * env) {
     return !v || !*v || env_flag(env);
 }
 
+// On when `env` is unset (then `fallback`), otherwise the usual flag rule.
+inline bool env_flag_or(const char * env, bool fallback) {
+    const char * v = std::getenv(env);
+    return v ? env_flag(env) : fallback;
+}
+
 inline int env_int(const char * env, int default_value) {
     const char * v = std::getenv(env);
     if (!v || !*v) {
@@ -854,6 +860,84 @@ inline void gpu_destroy_buffer(const GPUDevice & g, GpuBuffer & b) {
         g.api->destroyGPUBuffer(b.handle);
         b = {};
     }
+}
+
+// --- Input staging -----------------------------------------------------------
+//
+// A frame plane the core produced is not always cheap to read: on an RTX 5060,
+// reading one in place measured 1.2x-5.7x slower than reading a private
+// device-local copy of the same bytes across seven filters (1080p16). The
+// mechanism is not named; what is measured is that a bulk copy into
+// filter-owned memory makes the kernel's reads fast again, which is also what
+// the reference plugins do with their own uploads.
+//
+// `gpu_stage_plane` records that copy and returns the buffer to bind in place of
+// the plane's; `gpu_stage_barrier` orders every staged copy against the compute
+// dispatches that read them. Both are no-ops on the caller's side when the
+// filter's staging switch is off, so a filter keeps one code path.
+//
+// Cost: one copy of each staged plane per in-flight frame, outside the filter's
+// creation-time VRAM plan; it measured 1.7-13.8% on the RX 7900 XTX.
+inline std::string gpu_stage_range(const GPUDevice & g, VSCore * core,
+                                   VSGPUExecContext * ctx, VkCommandBuffer cmd,
+                                   VkBuffer src, VkDeviceSize bytes,
+                                   GpuBuffer & out,
+                                   VkBufferUsageFlags extra_usage = 0) {
+    // The copy target needs TRANSFER_DST; a kernel reading it through a device
+    // address also needs the address bit, hence `extra_usage`.
+    if (auto e =
+            gpu_frame_buffer(g, core, ctx, bytes, out,
+                             VK_BUFFER_USAGE_TRANSFER_DST_BIT | extra_usage);
+        !e.empty()) {
+        return e;
+    }
+    VkBufferCopy2 region {};
+    region.sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2;
+    region.size = bytes;
+    VkCopyBufferInfo2 info {};
+    info.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2;
+    info.srcBuffer = src;
+    info.dstBuffer = out.buffer;
+    info.regionCount = 1;
+    info.pRegions = &region;
+    g.vk->vkCmdCopyBuffer2(cmd, &info);
+    return {};
+}
+
+inline std::string gpu_stage_plane(const GPUDevice & g, VSCore * core,
+                                   VSGPUExecContext * ctx, VkCommandBuffer cmd,
+                                   const VSVulkanPlaneInfo & plane,
+                                   GpuBuffer & out,
+                                   VkBufferUsageFlags extra_usage = 0) {
+    return gpu_stage_range(g, core, ctx, cmd, plane.buffer, plane.bufferSize,
+                           out, extra_usage);
+}
+
+// Whether a filter stages its input by default. The copy is 1.2x-5.7x faster
+// where the input read was the tax (seven filters on an RTX 5060, 1080p16) and
+// up to 13.8% slower on the RX 7900 XTX, so the default follows the vendor that
+// was measured rather than the platform. VSFEEL_STAGE=1|0 sets the default for
+// every filter at once, and each filter keeps its own VSFEEL_<FILTER>_STAGE
+// switch.
+inline bool vsfeel_stage_default(const GPUDevice & gpu) {
+    if (std::getenv("VSFEEL_STAGE")) {
+        return env_flag("VSFEEL_STAGE");
+    }
+    return gpu.vendor_id == 0x10de;
+}
+
+inline void gpu_stage_barrier(const GPUDevice & g, VkCommandBuffer cmd) {
+    VkMemoryBarrier2 mb {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    VkDependencyInfo dep {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &mb;
+    g.vk->vkCmdPipelineBarrier2(cmd, &dep);
 }
 
 // Destroy a set of pipelines once each. A filter that shares pipelines across

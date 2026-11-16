@@ -72,6 +72,9 @@ struct BilateralData {
     // side is only acquire/record/submit, but the split still says whether the
     // frame is host- or GPU-bound, which no kernel timing can.
     bool host_timing { false };
+    // Read the input planes from a private device-local copy per frame (see
+    // gpu_stage_plane); off with VSFEEL_BILAT_STAGE=0.
+    bool stage { true };
     std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
         ht_total_ns {}, ht_n {};
 
@@ -309,23 +312,50 @@ static const VSFrame * bilateral_gpu_frame(BilateralData * d, int n,
             return fail("output plane " + std::to_string(p) +
                         " is not GPU resident");
         }
+        VSVulkanPlaneInfo ref_plane {};
+        bool has_ref_plane = false;
         VkBuffer ref_buffer = src_plane.buffer;
         if (d->ref_node) {
-            VSVulkanPlaneInfo ref_plane {};
             if (d->gpu->api->getGPUPlane(ref, p, &ref_plane)) {
                 return fail("guide plane " + std::to_string(p) +
                             " is not GPU resident");
             }
             ref_buffer = ref_plane.buffer;
+            has_ref_plane = true;
         }
 
         const auto & cfg = d->planes[p];
+        // Read the input (and guide) from a private device-local copy when the
+        // filter's staging switch is on: a core plane is not always cheap to
+        // read in place (see gpu_stage_plane).
+        VkBuffer src_buffer = src_plane.buffer;
+        VkBuffer guide_buffer = ref_buffer;
+        if (d->stage) {
+            GpuBuffer staged_src {};
+            if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, src_plane,
+                                         staged_src);
+                !e.empty()) {
+                return fail("staged source: " + e);
+            }
+            src_buffer = staged_src.buffer;
+            guide_buffer = staged_src.buffer;
+            if (has_ref_plane && ref_buffer != src_plane.buffer) {
+                GpuBuffer staged_ref {};
+                if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, ref_plane,
+                                             staged_ref);
+                    !e.empty()) {
+                    return fail("staged guide: " + e);
+                }
+                guide_buffer = staged_ref.buffer;
+            }
+            gpu_stage_barrier(*d->gpu, cmd);
+        }
         d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                       cfg.pipeline);
         // binding 2 is the guide; without one the source stands in for it and
         // the shader's HAS_REF==0 path never reads it
-        const VkBuffer buffers[3] { src_plane.buffer, dst_plane.buffer,
-                                    ref_buffer };
+        const VkBuffer buffers[3] { src_buffer, dst_plane.buffer,
+                                    guide_buffer };
         gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 3);
         d->gpu->vk->vkCmdDispatch(cmd, cfg.grid_x, cfg.grid_y, 1);
     }
@@ -591,6 +621,8 @@ static void VS_CC BilateralCreate(const VSMap * in, VSMap * out,
         }
         d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
     }
+
+    d->stage = env_flag_or("VSFEEL_BILAT_STAGE", vsfeel_stage_default(*d->gpu));
 
     {
         const VkPhysicalDeviceLimits & limits = d->gpu->limits;

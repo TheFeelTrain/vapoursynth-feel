@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Bilateral, WNNM, NLMeans, DFTTest, GaussBlur, NNEDI3, EEDI3, and EEDI3AA are 1.2-6.5x faster on NVIDIA GPUs
 - NLMeans is 5-7% faster across search radii
 - EEDI3 and EEDI3AA are up to 45% faster at 2160p, and faster on f32 1080p
 - GaussBlur is up to 6x faster at sigmas between 2 and 10, and about 6% faster at its default

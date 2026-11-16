@@ -236,6 +236,17 @@ force-pad / fail-pad probes.
 
 ## Historical
 
+- **2026-11-16 — the temporal source planes are staged per frame (+133%,
+  1080p16).** The pad pass reads `tw` source planes in place and was the whole
+  filter's cost on an RTX 5060: a second identical pad dispatch measured 32 us
+  against the first interval's 3.2 ms, and reading a filter-owned buffer instead
+  of the plane took the same kernel to 33 us (mechanism unnamed). Each slice is
+  now copied once per frame into filter-owned device-local memory
+  (`vkCmdCopyBuffer2`, one COPY->COMPUTE barrier). Same-session ABBA,
+  `--repeat 3`, n=12, `--filter dfttest`: **188.3 -> 439.5 fps**, vszipcl 392.3
+  in the same session (unaffected by the switch). The copy costs 3.5% on the RX
+  7900 XTX, so staging is NVIDIA-only by default (see `notes/BILATERAL.md`).
+  `VSFEEL_DFT_STAGE=0` restores the in-place read.
 - **2026-11-15 — `f0beta=0` is rejected at creation.** At beta 0 the ftype=0
   gain is `pow(0, 0)` for every bin at or below sigma, which GLSL leaves
   undefined: NVIDIA returns NaN and the shift spreads it over the frame, and
@@ -455,6 +466,9 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   report timestamp bits.
 - `VSFEEL_DFTTEST_TIMING=1` — per-frame host stage averages
   (`acquire`/`record`/`submit`).
+- `VSFEEL_DFT_STAGE=1|0` — stage the temporal source planes per frame, or read
+  them in place (default: NVIDIA; `VSFEEL_STAGE` sets the default for every
+  filter).
 - `VSFEEL_DFTTEST_TRACE=1` — one line per submitted frame, plus the ring/stripe
   plan of every processed plane at creation.
 - `VSFEEL_DFTTEST_L2_TARGET=<bytes>` — override the stripe ring's byte budget

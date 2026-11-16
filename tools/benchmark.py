@@ -117,6 +117,8 @@ def make_vpy(
     gpu_cache: bool = True,
     gpu_cache_mb: int | None = None,
     scale: float = 1.0,
+    vs_cache_mb: int = 1024 * 48,
+    gpu_limit_mb: int | None = None,
 ) -> str:
     # --scale N grades the filter at N times the source resolution (2 = 1080p ->
     # 4K). The upscale is a Point resize folded into the *cached* frames (and
@@ -251,9 +253,11 @@ def make_vpy(
         gpu_lines = ("" if conv else scale_lines) + (
             conv + "clip_gpu = core.std.GPUUpload(clip=clip)\n" if gpu_cache else ""
         )
+    gpu_limit_line = f"core.max_vram_cache_size = {gpu_limit_mb}\n" if gpu_limit_mb else ""
     return f"""\
 from vssource import BestSource
 from vstools import core, depth, get_y
+import sys
 import vapoursynth as vs
 
 def _pin_cache(node, budget):
@@ -267,8 +271,21 @@ def _pin_cache(node, budget):
 
 # Big enough that the timed region never re-runs the decode/mask chain (a
 # small value here collapses every plugin: measured 61 fps vs 220 for vsfeel
-# and 39 vs 200 for vszipcl at 8 GB).
-core.max_cache_size = 1024 * 48
+# and 39 vs 200 for vszipcl at 8 GB). This is the *host* pool: GPU frames are
+# cached against a separate VRAM limit (--gpu-limit-mb), and shrinking this one
+# also throttles the core's staging admission, so it is not a free knob.
+core.max_cache_size = {vs_cache_mb}
+{gpu_limit_line}
+try:
+    _vi = core.vulkan_device_info
+    print(
+        "[bench] vram "
+        f"budget={{_vi['budget'] >> 20}} MiB allocated={{_vi['allocated'] >> 20}} MiB "
+        f"limit={{_vi['limit'] >> 20}} MiB host_cache={{str(core.max_cache_size)}} MiB",
+        file=sys.stderr,
+    )
+except Exception:
+    pass
 
 clip = {clip_expr}
 
@@ -315,6 +332,8 @@ def make_aa_vpy(
     gpu_cache: bool = True,
     download_inputs: bool = False,
     upscale: bool = True,
+    vs_cache_mb: int = 1024 * 48,
+    gpu_limit_mb: int | None = None,
 ) -> str:
     """Real-clip vpy that mirrors vsaa.based_aa's EEDI3 usage:
 
@@ -450,12 +469,14 @@ sclip = {"core.std.Interleave([clip, clip])" if upscale and eedi3_field > 1 else
         )
     else:
         resize_lines = "ss = luma\nmclip = mask\n"
+    gpu_limit_line = f"core.max_vram_cache_size = {gpu_limit_mb}\n" if gpu_limit_mb else ""
     return f"""\
 from vssource import BestSource
 from vstools import core, depth, get_y
 from vsmasktools import EdgeDetect, Morpho, Prewitt
 from vsrgtools import box_blur
 from vstools import scale_mask
+import sys
 import vapoursynth as vs
 
 def _pin_cache(node, budget):
@@ -463,10 +484,19 @@ def _pin_cache(node, budget):
     core.std.SetVideoCache(node, mode=1, fixedsize=1, maxsize=budget)
     return node
 
-# Big enough that the timed region never re-runs the decode/mask chain (a
-# small value here collapses every plugin: measured 61 fps vs 220 for vsfeel
-# and 39 vs 200 for vszipcl at 8 GB).
-core.max_cache_size = 1024 * 48
+# See the make_vpy template's note on --vs-cache-mb.
+core.max_cache_size = {vs_cache_mb}
+{gpu_limit_line}
+try:
+    _vi = core.vulkan_device_info
+    print(
+        "[bench] vram "
+        f"budget={{_vi['budget'] >> 20}} MiB allocated={{_vi['allocated'] >> 20}} MiB "
+        f"limit={{_vi['limit'] >> 20}} MiB host_cache={{str(core.max_cache_size)}} MiB",
+        file=sys.stderr,
+    )
+except Exception:
+    pass
 
 src = BestSource(cachepath=None).source({clip!r}, 32)
 luma = {luma_expr}
@@ -1361,6 +1391,22 @@ def _report_tail(raw: bytearray, lines: int = 15) -> None:
         print(textwrap.indent(tail, "    "), file=sys.stderr)
 
 
+_BENCH_LINES_SHOWN: set[str] = set()
+
+
+def _report_bench_lines(raw: bytearray) -> None:
+    """Print the generated script's `[bench] ` lines once per distinct message.
+
+    They report the core's VRAM budget/limit and the host cache actually in
+    force, which is what makes a run reproducible on a card small enough for
+    those numbers to matter. vspipe's stderr is otherwise swallowed on success.
+    """
+    for line in raw.decode(errors="replace").splitlines():
+        if line.startswith("[bench] ") and line not in _BENCH_LINES_SHOWN:
+            _BENCH_LINES_SHOWN.add(line)
+            print(f"  {line}", flush=True)
+
+
 def _start_vspipe(cmd: list[str]) -> subprocess.Popen:
     """Start vspipe in its own process group, so the whole tree can be stopped.
 
@@ -1483,6 +1529,7 @@ def run_vspipe(
 
     timing = _timing_from_reports(reports, seconds)
     if timing is not None:
+        _report_bench_lines(raw)
         return timing
 
     # The clip ran out before the window filled. vspipe's own final line still
@@ -1528,6 +1575,8 @@ def bench(
     no_download: bool = True,
     scale: float = 1.0,
     seconds: float = DEFAULT_SECONDS,
+    vs_cache_mb: int = 1024 * 48,
+    gpu_limit_mb: int | None = None,
 ) -> Timing | None:
     vpy = make_vpy(
         clip=clip,
@@ -1540,6 +1589,8 @@ def bench(
         gpu_cache=gpu_cache,
         gpu_cache_mb=gpu_cache_mb,
         scale=scale,
+        vs_cache_mb=vs_cache_mb,
+        gpu_limit_mb=gpu_limit_mb,
     )
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"bench_{plugin}.vpy"
@@ -1562,6 +1613,8 @@ def bench_aa(
     no_download: bool = True,
     upscale: bool = True,
     seconds: float = DEFAULT_SECONDS,
+    vs_cache_mb: int = 1024 * 48,
+    gpu_limit_mb: int | None = None,
 ) -> Timing | None:
     """Run an EEDI3 mask benchmark (see make_aa_vpy)."""
     vpy = make_aa_vpy(
@@ -1576,6 +1629,8 @@ def bench_aa(
         gpu_cache=gpu_cache,
         download_inputs=download_inputs,
         upscale=upscale,
+        vs_cache_mb=vs_cache_mb,
+        gpu_limit_mb=gpu_limit_mb,
     )
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"bench_{plugin}.vpy"
@@ -1781,6 +1836,8 @@ def _run_once(
             no_download=ns.no_download,
             upscale=spec.aa_scale == 2,
             seconds=ns.seconds,
+            vs_cache_mb=ns.vs_cache_mb,
+            gpu_limit_mb=ns.gpu_limit_mb,
         )
     return bench(
         plugin,
@@ -1796,6 +1853,8 @@ def _run_once(
         no_download=ns.no_download,
         scale=ns.scale,
         seconds=ns.seconds,
+        vs_cache_mb=ns.vs_cache_mb,
+        gpu_limit_mb=ns.gpu_limit_mb,
     )
 
 
@@ -1938,6 +1997,17 @@ def bench_filter(fname: str, ns: argparse.Namespace) -> bool:
         f"clip: {plan.clip_desc}{plan.format_desc}"
     )
     print(f"args: {args_desc(spec, ns)}")
+    # Naming each arm's input path guards against the harness itself being the
+    # measurement: an arm not in gpu_plugins is handed GPUDownload(clip_gpu), so
+    # it pays a per-frame D2H the in-place arms do not.
+    in_place = sorted(p for p in plan.plugins if p in spec.gpu_plugins)
+    downloaded = sorted(p for p in plan.plugins if p not in spec.gpu_plugins)
+    print(
+        "input: "
+        + (f"in-place {', '.join(in_place)}" if in_place else "in-place none")
+        + " | GPUDownload "
+        + (", ".join(downloaded) if downloaded else "none")
+    )
     print(
         f"{_cache_desc(spec, ns, plan.synth, plan.cache_frames)}{_mode_desc(ns)} | "
         f"repeat: {ns.repeat} | timeout: {ns.timeout:g}s\n"
@@ -2429,6 +2499,22 @@ def parse_args() -> argparse.Namespace:
         help="cache byte budget: VRAM for the device-resident cached frames, "
         "RAM with --cpu-cache; the cached span is capped to what fits "
         "(default: 6144)",
+    )
+    parser.add_argument(
+        "--vs-cache-mb",
+        type=int,
+        default=1024 * 48,
+        help="core.max_cache_size for the timed script, in MB (default: 49152). "
+        "This is the host pool; it also throttles the core's staging admission, "
+        "so it moves GPU-filter fps even though it does not bound VRAM",
+    )
+    parser.add_argument(
+        "--gpu-limit-mb",
+        type=int,
+        default=None,
+        help="core.max_vram_cache_size for the timed script, in MB (default: "
+        "the core's own choice). This is the limit GPU-resident frames are "
+        "cached against, and every filter's VRAM plan is derived from it",
     )
     parser.add_argument(
         "--scale",

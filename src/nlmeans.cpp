@@ -164,6 +164,9 @@ struct NLMeansData {
     // submit). The host side is only those three under the API, but the split
     // still says whether the frame is host- or GPU-bound.
     bool host_timing { false };
+    // Read the temporal window's planes from private device-local copies (see
+    // gpu_stage_plane); off with VSFEEL_NLMEANS_STAGE=0.
+    bool stage { true };
     std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
         ht_total_ns {}, ht_n {};
 
@@ -444,6 +447,12 @@ static const VSFrame * nlmeans_gpu_frame(NLMeansData * d, int n,
     if (table == nullptr) {
         return fail("address table is not host visible");
     }
+    // The compose pass is the only reader of these planes, and a private
+    // device-local copy is what makes those reads fast here (see
+    // gpu_stage_plane). Each staged plane keeps its own buffer alive for the
+    // submission through the exec context.
+    std::vector<GpuBuffer> staged;
+    bool any_staged = false;
     for (int c = 0; c < C; ++c) {
         for (int l = 0; l < L; ++l) {
             VSVulkanPlaneInfo sp {};
@@ -451,18 +460,46 @@ static const VSFrame * nlmeans_gpu_frame(NLMeansData * d, int n,
                 return fail("source plane " + std::to_string(plane0 + c) +
                             " is not GPU resident");
             }
-            table[c * L + l] = plane_address(*d->gpu, sp.buffer);
+            if (d->stage) {
+                staged.emplace_back();
+                if (auto e = gpu_stage_plane(
+                        *d->gpu, core, ctx, cmd, sp, staged.back(),
+                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+                    !e.empty()) {
+                    return fail("staged source: " + e);
+                }
+                table[c * L + l] = plane_address(*d->gpu, staged.back().buffer);
+                any_staged = true;
+            } else {
+                table[c * L + l] = plane_address(*d->gpu, sp.buffer);
+            }
             if (d->has_ref) {
                 VSVulkanPlaneInfo gp {};
                 if (d->gpu->api->getGPUPlane(rframes[l], plane0 + c, &gp)) {
                     return fail("guide plane " + std::to_string(plane0 + c) +
                                 " is not GPU resident");
                 }
-                table[C * L + c * L + l] = plane_address(*d->gpu, gp.buffer);
+                if (d->stage) {
+                    staged.emplace_back();
+                    if (auto e = gpu_stage_plane(
+                            *d->gpu, core, ctx, cmd, gp, staged.back(),
+                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+                        !e.empty()) {
+                        return fail("staged guide: " + e);
+                    }
+                    table[C * L + c * L + l] =
+                        plane_address(*d->gpu, staged.back().buffer);
+                } else {
+                    table[C * L + c * L + l] =
+                        plane_address(*d->gpu, gp.buffer);
+                }
             } else {
                 table[C * L + c * L + l] = table[c * L + l];
             }
         }
+    }
+    if (any_staged) {
+        gpu_stage_barrier(*d->gpu, cmd);
     }
     // The table may have landed in the host-visible VRAM BAR, whose mapping is
     // write-combined: without this the GPU can read a stale pointer, or a
@@ -914,6 +951,9 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         }
         d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
     }
+
+    d->stage =
+        env_flag_or("VSFEEL_NLMEANS_STAGE", vsfeel_stage_default(*d->gpu));
 
     // The plane geometry has to be the one the core's GPU frames carry, because
     // kernel addressing is STRIDE elements per row (see vsfeel_probe_strides).

@@ -198,6 +198,26 @@ def test_bilateral_accepts_f16(clip_grayh):
 # ---------------------------------------------------------------------------
 
 
+def test_bilateral_staged_input_matches_the_in_place_path(clip_gray16, monkeypatch):
+    """The staged read is a byte copy, so it must not move a single code.
+
+    NVIDIA stages by default; every other vendor reaches this path only when a
+    test forces it, so without this the copy plus its COPY->COMPUTE barrier is
+    unexercised there.
+    """
+    params = dict(sigma_spatial=2.0, sigma_color=0.05)
+    # Both arms are forced: the default follows the vendor, so neither may rely
+    # on it on the machine the test happens to run on.
+    monkeypatch.setenv("VSFEEL_BILAT_STAGE", "0")
+    in_place = _run(clip_gray16, **params)
+    monkeypatch.setenv("VSFEEL_BILAT_STAGE", "1")
+    staged = _run(clip_gray16, **params)
+    monkeypatch.delenv("VSFEEL_BILAT_STAGE", raising=False)
+    for n in (0, 7, 23):
+        a, b = _plane(in_place.get_frame(n), 0), _plane(staged.get_frame(n), 0)
+        assert np.array_equal(a, b), f"frame {n} moved under staging"
+
+
 def test_bilateral_matches_reference_u16(clip_gray16):
     """u16 input: within one output-code rounding step."""
     params = dict(sigma_spatial=2.0, sigma_color=0.05)

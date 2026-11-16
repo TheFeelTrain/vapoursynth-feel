@@ -125,6 +125,9 @@ struct GaussData {
     // side is only acquire/record/submit, but the split still says whether the
     // frame is host- or GPU-bound, which no kernel timing can.
     bool host_timing { false };
+    // Read the input from a private device-local copy per frame (see
+    // gpu_stage_plane); off with VSFEEL_GAUSS_STAGE=0.
+    bool stage { true };
     std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
         ht_total_ns {}, ht_n {};
 
@@ -445,8 +448,18 @@ static const VSFrame * gauss_gpu_frame(GaussData * d, int n,
         // Binding 4 is the dword view of the destination (packed pair stores
         // of the horizontal pass). Without a two-pass plane there is no
         // scratch to bind, so the source stands in where no shader reads it.
-        const VkBuffer buffers[5] { d->wt.buffer, sp.buffer, dp.buffer,
-                                    d->tmp_total > 0 ? tmp.buffer : sp.buffer,
+        VkBuffer src_buffer = sp.buffer;
+        if (d->stage) {
+            GpuBuffer staged {};
+            if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, sp, staged);
+                !e.empty()) {
+                return fail("staged source: " + e);
+            }
+            src_buffer = staged.buffer;
+            gpu_stage_barrier(*d->gpu, cmd);
+        }
+        const VkBuffer buffers[5] { d->wt.buffer, src_buffer, dp.buffer,
+                                    d->tmp_total > 0 ? tmp.buffer : src_buffer,
                                     dp.buffer };
         gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 5);
 
@@ -658,6 +671,8 @@ static void VS_CC GaussCreate(const VSMap * in, VSMap * out,
         }
         d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
     }
+
+    d->stage = env_flag_or("VSFEEL_GAUSS_STAGE", vsfeel_stage_default(*d->gpu));
 
     // The plane geometry has to be the one the core's GPU frames carry, because
     // kernel addressing is STRIDE elements per row (see vsfeel_probe_strides).

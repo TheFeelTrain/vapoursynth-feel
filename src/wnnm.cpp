@@ -276,6 +276,9 @@ struct GPUWNNM {
     bool skip_solve {}; // ablation: the estimate without its eigen dispatch
     bool skip_apply {}; // ablation: the estimate without its scatter
     bool host_timing {};
+    // Read the window's planes from private device-local copies (see
+    // gpu_stage_plane); off with VSFEEL_WNNM_STAGE=0.
+    bool stage { true };
     bool gpu_trace {}; // VSFEEL_WNNM_GPUTRACE=<frame>
 
     ~GPUWNNM() {
@@ -814,6 +817,7 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
         return fail("address table: " + e);
     }
     d->gpu->api->gpuExecUsesBuffer(ctx, addr_buf.handle);
+    bool staged_any = false;
     if (tracing) {
         if (auto e = gpu_make_buffer(
                 *d->gpu, core, VkDeviceSize(d->trace_elems) * sizeof(uint32_t),
@@ -920,6 +924,34 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                 return fail("source plane " + std::to_string(p) +
                             " is not GPU resident");
             }
+            // The matcher and the estimate read these planes several times per
+            // frame; a private device-local copy is what makes that fast here
+            // (see gpu_stage_plane). Without a guide clip the reference
+            // frame is the source frame, so one copy serves both slots.
+            if (d->stage) {
+                GpuBuffer s_ref {};
+                const VkBufferUsageFlags addr =
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+                if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, sp, s_ref,
+                                             addr);
+                    !e.empty()) {
+                    return fail("staged reference: " + e);
+                }
+                VkBuffer src_copy = s_ref.buffer;
+                GpuBuffer s_src {};
+                if (pp.buffer != sp.buffer) {
+                    if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, pp,
+                                                 s_src, addr);
+                        !e.empty()) {
+                        return fail("staged source: " + e);
+                    }
+                    src_copy = s_src.buffer;
+                }
+                table[base + l] = plane_address(*d->gpu, s_ref.buffer);
+                table[base + dpl.wl + l] = plane_address(*d->gpu, src_copy);
+                staged_any = true;
+                continue;
+            }
             table[base + l] = plane_address(*d->gpu, sp.buffer);
             table[base + dpl.wl + l] = plane_address(*d->gpu, pp.buffer);
         }
@@ -953,6 +985,9 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     }
 
     VkBuffer dummy = acc_buf.buffer ? acc_buf.buffer : addr_buf.buffer;
+    if (staged_any) {
+        gpu_stage_barrier(*d->gpu, cmd);
+    }
     // The cache's records and a 2-byte source ring slot are both read across
     // frames: a later frame may overwrite either while an earlier submission
     // still reads it, so this frame starts behind everything already queued.
@@ -964,8 +999,26 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     // Widen the window's 2-byte planes into the ring. The matcher and the
     // estimate read these slots, so they start behind the barrier below.
     if (!copies.empty()) {
-        for (const WnnmCopy & c : copies) {
-            const VkBuffer bufs[2] { c.src, d->src_ring.buffer };
+        // Stage every source plane first, then one copy->compute barrier, then
+        // the widening dispatches: the dispatches read the staged copies.
+        std::vector<GpuBuffer> staged(copies.size());
+        if (d->stage) {
+            for (size_t i = 0; i < copies.size(); ++i) {
+                const WnnmCopy & c = copies[i];
+                if (auto e = gpu_stage_range(*d->gpu, core, ctx, cmd, c.src,
+                                             VkDeviceSize(c.count) *
+                                                 VkDeviceSize(d->elem_bytes),
+                                             staged[i]);
+                    !e.empty()) {
+                    return fail("staged source: " + e);
+                }
+            }
+            gpu_stage_barrier(*d->gpu, cmd);
+        }
+        for (size_t i = 0; i < copies.size(); ++i) {
+            const WnnmCopy & c = copies[i];
+            const VkBuffer copy_src = d->stage ? staged[i].buffer : c.src;
+            const VkBuffer bufs[2] { copy_src, d->src_ring.buffer };
             gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, bufs, 2);
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           d->copy_pipe);
@@ -1582,6 +1635,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         return set_error(std::get<std::string>(dev_result));
     }
     d->gpu = std::get<std::shared_ptr<GPUDevice>>(dev_result);
+
+    d->stage = env_flag_or("VSFEEL_WNNM_STAGE", vsfeel_stage_default(*d->gpu));
 
     const int qmax = d->q <= 8 ? 8 : (d->q <= 16 ? 16 : 32);
     // The split estimate runs any radius; only a group too wide for its

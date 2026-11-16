@@ -441,6 +441,9 @@ struct Nnedi3Data {
     // host side is only acquire/record/submit, but the split still says
     // whether the frame is host- or GPU-bound.
     bool host_timing { false };
+    // Read the source plane from a private device-local copy per frame (see
+    // gpu_stage_plane); off with VSFEEL_NNEDI3_STAGE=0.
+    bool stage { true };
     std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
         ht_total_ns {}, ht_n {};
 
@@ -757,15 +760,29 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
         const int dst_stride =
             static_cast<int>(vsapi->getStride(dst, p) / d->elem_bytes);
 
+        // Keep, prescreen and predict all read the source plane in place; a
+        // private device-local copy is what makes those reads fast here
+        // (see gpu_stage_plane).
+        VkBuffer src_buffer = sp.buffer;
+        if (d->stage) {
+            GpuBuffer staged {};
+            if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, sp, staged);
+                !e.empty()) {
+                return fail("staged source: " + e);
+            }
+            src_buffer = staged.buffer;
+            gpu_stage_barrier(*d->gpu, cmd);
+        }
+
         // All seven bindings re-pushed per dispatch; the scratch slots stand
         // in where this entry statically reads nothing (see src/nnedi3.comp).
-        const VkBuffer buffers[7] { sp.buffer,
+        const VkBuffer buffers[7] { src_buffer,
                                     dp.buffer,
                                     d->ps.buffer,
                                     d->pdw.buffer,
                                     d->pdb.buffer,
-                                    d->use_list ? scratch.buffer : sp.buffer,
-                                    d->use_list ? scratch.buffer : sp.buffer };
+                                    d->use_list ? scratch.buffer : src_buffer,
+                                    d->use_list ? scratch.buffer : src_buffer };
         gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 7);
 
         // Kept rows straight into the output plane; they overlap nothing the
@@ -1077,6 +1094,9 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         }
         d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
     }
+
+    d->stage =
+        env_flag_or("VSFEEL_NNEDI3_STAGE", vsfeel_stage_default(*d->gpu));
 
     // The packed half predictor computes in half, which needs the optional
     // shaderFloat16 feature; a device without it keeps the storage-only f16

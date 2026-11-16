@@ -247,6 +247,11 @@ reference chain:
 
 ## Historical
 
+- **2026-11-16 — the clip, sclip and mask planes are staged per batch (+25%,
+  1080p16).** On an RTX 5060 the pads' in-place reads measured several times
+  slower than a private copy, so each submission's planes are staged first:
+  **20.8 -> 26.0 fps**. The copy costs 7.7% on the RX 7900 XTX, so staging is
+  NVIDIA-only by default (see `notes/BILATERAL.md`).
 - **2026-10-18 — f16 ships as a third depth and is bit-exact against the chain.**
   The intermediate `v`/parked O_0 and the io frames are half, everything else
   f32; 161 fps against f32's 125 (+28%) at the scoreboard config. The first cut
@@ -463,6 +468,8 @@ the shared core's knobs plus its own `..._NOCLEAR`/`..._POISON`.
   exactly on the pixels that depend on unwritten scratch. Changes output by
   design.
 - `..._TIMING=1` — per-frame host stage split (acquire/alloc/record/submit).
+- `..._STAGE=1|0` — stage the clip, sclip and mask planes per batch, or read
+  them in place (default: NVIDIA; see `notes/EEDI3.md`).
 - `..._SYNC=1` — additionally wait each submission out and report its wall time.
 - `..._TRACE=1` — one-shot creation banner: VRAM accounting, per-plane region
   layout.

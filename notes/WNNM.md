@@ -273,6 +273,19 @@ staying a bit-exact copy and the request orders on both.
 
 ## Historical
 
+- **2026-11-16 - the window's planes are staged per frame (+469%, f32 YUV420).**
+  The float path hands kernels the source planes' device addresses and the
+  matcher and the estimate read them several times per frame, so those reads were
+  the whole filter on an RTX 5060. Each plane is now copied once per frame into
+  filter-owned device-local memory (with the device-address usage bit) and the
+  address table points at the copy; with no guide clip the reference slot reuses
+  the source's copy instead of staging the same plane twice, and the 2-byte path
+  stages `c.src` for its widening pass the same way (copies recorded before the
+  widening dispatches, so one COPY->COMPUTE barrier covers them). Same-session
+  ABBA, `--filter wnnm` (default `sigma=[0,3,3]`, `radius=[1]`): **31.8 -> 209.9
+  fps**, vszip 83.3 in the same session. The copy costs 3.5% on the RX 7900 XTX,
+  so staging is NVIDIA-only by default (see `notes/BILATERAL.md`).
+  `VSFEEL_WNNM_STAGE=0` restores the in-place read.
 - **2026-11-12 - the aggregation weight moves to the block origin (+2.0% /
   +7.7%).** The scatter's cost was not the atomic type: replacing both atomics
   with a plain store had measured flat (769 vs 814 fps) and was read as "do not
@@ -592,6 +605,8 @@ staying a bit-exact copy and the request orders on both.
   centres are not re-traced, so they are omitted.
 - `VSFEEL_WNNM_NOCACHE=1` - no per-centre match cache: one record per fold per
   frame (the fallback path, and the A/B arm for the cache).
+- `VSFEEL_WNNM_STAGE=1|0` - stage the window's planes per frame, or read them
+  in place (default: NVIDIA; `VSFEEL_STAGE` sets the default for every filter).
 - `VSFEEL_WNNM_NORING=1` - forces the match-ring allocation to fail, so the
   per-frame fallback runs through the same teardown as a real out-of-memory.
 - `VSFEEL_WNNM_GROUP_WG=32|64` - force the group/matcher workgroup width instead

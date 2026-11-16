@@ -199,6 +199,10 @@ register is the largest addressable item; the three-window redundancy is worth
 
 ## Historical
 
+- **2026-11-16 — the clip's planes are staged per batch (+23%, 1080p16).** On an
+  RTX 5060 the pads' in-place reads measured several times slower than a private
+  copy, so each frame's planes, sclip and mask are staged first: **EEDI3 223.8 ->
+  275.9**, **EEDI3AA 20.8 -> 26.0 fps**; EEDI3H stays in place (transpose; -2%).
 - **2026-11-05 — dependencies match the batched requests.** A batch reads
   `n..n+B-1` from all three and AA's sclip `2j`/`2j+1`; they are `rpGeneral` now.
 - **2026-10-18 — f16 as a storage-only third io depth.** Pad, xpose copies, the
@@ -678,6 +682,9 @@ passes). All bit-identical to the previous build unless stated.
 - `VSFEEL_EEDI3_TRACE` — one-shot banner: VRAM accounting, per-plane region layout,
   spec constants per geometry.
 - `VSFEEL_EEDI3_TIMING` — per-frame host stage split (acquire/alloc/record/submit).
+- `VSFEEL_EEDI3_STAGE=1|0` - stage the clip, sclip and mask planes, or read them
+  in place (default: NVIDIA, EEDI3H excepted; `VSFEEL_STAGE` sets the default
+  for every filter).
 - `VSFEEL_EEDI3_SYNC` — additionally wait each submission out and report its wall time
   (serializes the pipeline; for GPU-time measurements at depth 1).
 - `VSFEEL_EEDI3_NOCLEAR` — EEDI3AA's frame path only: skip the per-submission
