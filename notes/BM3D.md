@@ -644,9 +644,9 @@ Chronological; each entry keeps the mechanism, not the story.
   The float estimate stack (83 MB/frame) cannot narrow (no f16/u16 atomics), and
   bm3dvk2's fp16 mode is 16% slower here (133.4 vs 159.1 fps, `--cpu-cache`)
   while reading half the bytes. Narrowing the *transport* is what ships.
-- **Output staging on the aggregation.** 241.7 staged vs 244.6 direct fps on
-  an RTX 5060 (1080p f32, ABBA n=12); the control moved +2.8% the other way.
-  The coalesced stores do not need a private copy.
+- **Output staging on the aggregation** (`VSFEEL_BM3D_OSTAGE=1`, default off).
+  241.7 staged vs 244.6 direct fps on an RTX 5060 (1080p f32, ABBA n=12); the
+  control moved +2.8% the other way. Coalesced stores do not need a copy.
 - **Emulating libstdc++'s `partial_sort` tie order.** Survivors are heap
   positions, not a positional rule; exactness needs the whole candidate sequence
   replayed through a 7-element heap (~940 keys/block in LDS plus a serial pass,
@@ -676,6 +676,7 @@ All flags are `VSFEEL_BM3D_<FLAG>`, read through `vsfeel.h`'s helpers; `TRACE` a
 - `VSFEEL_BM3D_INFLIGHT=<1..8>` — radius 0: private slots for this many frames
   (default 4). Temporal rings are fixed; the isolated source ring is lazy.
 - `VSFEEL_BM3D_CAS=1` — force the CAS aggregation build (A/B only).
+- `VSFEEL_BM3D_OSTAGE=1` — write the aggregation through a private buffer and bulk-copy it, or store directly (default: off).
 - `VSFEEL_BM3D_PATCH_LDS=0/1` — force either reference-patch arm; unset follows
   the measured compiler/arch rule. The banner names the arm and its source.
 - `VSFEEL_BM3D_SPLIT_KERNEL=0/1` — force either estimation path; unset follows

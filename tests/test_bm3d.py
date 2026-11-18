@@ -180,6 +180,21 @@ def test_bm3d_deterministic(clip_grays):
         assert np.abs(d).max() < 1e-5, f"nondeterministic output at frame {n}"
 
 
+def test_bm3d_staged_output_matches_the_direct_path(clip_grays, monkeypatch):
+    """The aggregation's output staging is a byte copy, so only atomics may move.
+
+    Covers the non-rgb private-buffer path the opt-in selects.
+    """
+    monkeypatch.setenv("VSFEEL_BM3D_OSTAGE", "0")
+    direct = _run(clip_grays, radius=2)
+    monkeypatch.setenv("VSFEEL_BM3D_OSTAGE", "1")
+    staged = _run(clip_grays, radius=2)
+    monkeypatch.delenv("VSFEEL_BM3D_OSTAGE", raising=False)
+    for n in (0, 11, 23):
+        d = frame_to_ndarray(direct.get_frame(n)) - frame_to_ndarray(staged.get_frame(n))
+        assert np.abs(d).max() < 1e-5, f"staged output moved at frame {n}"
+
+
 def test_bm3d_cas_fallback_matches_hardware_atomics(clip_grays, monkeypatch):
     """The CAS arm a device without float32 add atomics gets must match.
 

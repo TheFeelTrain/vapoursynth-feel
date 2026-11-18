@@ -492,6 +492,9 @@ struct BM3DData {
     // about whether the frame is GPU- or host-bound. Reset the clock after every
     // blocking acquire so a wait never leaks into the next stage.
     bool host_timing { false };
+    // Output-plane staging for the aggregation (VSFEEL_BM3D_OSTAGE=1); off by
+    // default, the coalesced aggregation stores lose to a private copy.
+    bool ostage { false };
     // Cached at creation: the timestamp query pool only exists when the env
     // var was set then, so recording must not be driven by a frame-time getenv.
     bool gpu_trace { false };
@@ -1630,6 +1633,7 @@ static VSFrame * normalize_cmd(BM3DData * d, VkCommandBuffer cmd,
     }
 
     std::array<VkBuffer, 3> dst_planes {};
+    std::array<VSVulkanPlaneInfo, 3> dst_infos {};
     for (int plane = 0; plane < d->num_planes; ++plane) {
         if (!d->planes[plane].process) {
             continue;
@@ -1646,6 +1650,27 @@ static VSFrame * normalize_cmd(BM3DData * d, VkCommandBuffer cmd,
             throw std::runtime_error(e);
         }
         dst_planes[plane] = info.buffer;
+        dst_infos[plane] = info;
+    }
+
+    // Output-plane staging for the aggregation (VSFEEL_BM3D_OSTAGE=1, non-rgb):
+    // the agg kernel's stores go into private buffers and are published with
+    // one bulk copy each after the last dispatch. Byte-identical output.
+    std::array<GpuBuffer, 3> out_bufs {};
+    const bool ostage = d->ostage && !d->rgb;
+    if (ostage) {
+        for (int plane = 0; plane < d->num_planes; ++plane) {
+            if (!d->planes[plane].process) {
+                continue;
+            }
+            if (auto e = gpu_out_stage_begin(*d->gpu, core, ctx,
+                                             dst_infos[plane], out_bufs[plane]);
+                !e.empty()) {
+                vsapi->freeFrame(dst);
+                throw std::runtime_error("the staged output: " + e);
+            }
+            dst_planes[plane] = out_bufs[plane].buffer;
+        }
     }
 
     // RGB: the aggregation writes the three OPP planes here and the output
@@ -1664,6 +1689,14 @@ static VSFrame * normalize_cmd(BM3DData * d, VkCommandBuffer cmd,
     }
     record_bm3d_agg(d, nullptr, cmd, f, base, isolated, dst_planes, out_range,
                     false, opp);
+    if (ostage) {
+        for (int plane = 0; plane < d->num_planes; ++plane) {
+            if (out_bufs[plane].buffer) {
+                gpu_out_stage_commit(*d->gpu, cmd, out_bufs[plane],
+                                     dst_infos[plane]);
+            }
+        }
+    }
     return dst;
 }
 
@@ -2244,8 +2277,10 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
                                  : std::chrono::steady_clock::time_point {};
 
         // The destination planes the aggregation writes: the output frame's own
-        // storage, so nothing is downloaded.
+        // storage, so nothing is downloaded. With VSFEEL_BM3D_OSTAGE=1 the agg
+        // kernel writes private buffers instead, published after the last dispatch.
         std::array<VkBuffer, 3> dst_planes {};
+        std::array<VSVulkanPlaneInfo, 3> dst_infos {};
         for (int plane = 0; plane < d->num_planes; ++plane) {
             if (!d->planes[plane].process) {
                 continue;
@@ -2255,6 +2290,7 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
                 return set_error("the output frame is not GPU resident");
             }
             dst_planes[plane] = plane_info.buffer;
+            dst_infos[plane] = plane_info;
         }
         // The estimation kernel's destination binding is unused unless it is
         // tracing (which binds the trace buffer instead), but an unused binding
@@ -2337,6 +2373,25 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
         if (!agg_ctx) {
             return set_error("could not acquire a recording context: "s + aerr);
         }
+        // VSFEEL_BM3D_OSTAGE=1 (non-rgb): the agg kernel writes private buffers,
+        // published with one bulk copy each after the last dispatch.
+        const bool ostage = d->ostage && !d->rgb;
+        std::array<GpuBuffer, 3> out_bufs {};
+        if (ostage) {
+            for (int plane = 0; plane < d->num_planes; ++plane) {
+                if (!d->planes[plane].process) {
+                    continue;
+                }
+                if (auto e =
+                        gpu_out_stage_begin(*d->gpu, core, agg_ctx,
+                                            dst_infos[plane], out_bufs[plane]);
+                    !e.empty()) {
+                    d->gpu->api->gpuExecAbandon(agg_ctx);
+                    return set_error("the staged output: " + e);
+                }
+                dst_planes[plane] = out_bufs[plane].buffer;
+            }
+        }
         // The pool publishes the output planes' producer pairs at submit.
         for (int plane = 0; plane < d->num_planes; ++plane) {
             if (d->planes[plane].process) {
@@ -2355,8 +2410,17 @@ static const VSFrame * VS_CC BM3DGetFrame(int n, int activationReason,
                                  e);
             }
         }
-        record_bm3d_agg(d, &fr, d->gpu->api->gpuExecCommandBuffer(agg_ctx), n,
-                        0, false, dst_planes, out_range, gputrace, opp);
+        VkCommandBuffer agg_cmd = d->gpu->api->gpuExecCommandBuffer(agg_ctx);
+        record_bm3d_agg(d, &fr, agg_cmd, n, 0, false, dst_planes, out_range,
+                        gputrace, opp);
+        if (ostage) {
+            for (int plane = 0; plane < d->num_planes; ++plane) {
+                if (out_bufs[plane].buffer) {
+                    gpu_out_stage_commit(*d->gpu, agg_cmd, out_bufs[plane],
+                                         dst_infos[plane]);
+                }
+            }
+        }
         uint64_t agg_value = 0;
         if (d->gpu->api->gpuExecSubmit(agg_ctx, &agg_value, aerr,
                                        sizeof(aerr))) {
@@ -2484,8 +2548,6 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
     // The timestamp pool is created only when this is set, so every later
     // recording/readback must use the cached flag, not a frame-time getenv.
     d->gpu_trace = vsfeel_debug_probe("VSFEEL_BM3D_GPUTRACE");
-    // Cached too: the frame path must not pay a getenv for a flag that is fixed
-    // per instance.
     d->trace = vsfeel_debug_trace("VSFEEL_BM3D_TRACE");
     d->dump = env_flag("VSFEEL_BM3D_DUMP");
     d->split_est = env_int("VSFEEL_BM3D_SPLIT", 1) != 0;
@@ -2908,6 +2970,9 @@ static void VS_CC BM3DCreate(const VSMap * in, VSMap * out, void * userData,
         }
         d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
     }
+    // VSFEEL_BM3D_OSTAGE=1 opts in; the default keeps the direct stores (the
+    // coalesced aggregation stores don't benefit from a private copy).
+    d->ostage = env_flag("VSFEEL_BM3D_OSTAGE");
 
     // The GPU-timing probe is invalid usage on a queue family whose
     // timestampValidBits is 0, where a timestamp write can hang the engine
