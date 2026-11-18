@@ -2226,8 +2226,20 @@ def _install_ab_so(src: Path, dst: Path) -> None:
     """Copy an arm's .so over the installed plugin, verifying the copy by sha.
 
     A half-copied binary must abort the run, never benchmark the wrong build.
+    Windows keeps the loaded image section open for a short while after vspipe
+    exits, so a plain copy right after a run can fail with a bare permission
+    error; retry briefly before giving up.
     """
-    shutil.copyfile(src, dst)
+    last: OSError | None = None
+    for _ in range(30):
+        try:
+            shutil.copyfile(src, dst)
+            break
+        except PermissionError as exc:
+            last = exc
+            time.sleep(0.1)
+    else:
+        raise last  # type: ignore[misc]
     if _sha256(src) != _sha256(dst):
         sys.exit(f"ab: copy of {src} to {dst} failed verification (sha mismatch)")
 
@@ -2326,7 +2338,16 @@ def bench_filter_ab(fname: str, ns: argparse.Namespace) -> None:
                             print(f"  {tag} {plugin:10s}  unavailable / failed")
     finally:
         if install is not None and original is not None:
-            install.write_bytes(original)
+            last: OSError | None = None
+            for _ in range(30):
+                try:
+                    install.write_bytes(original)
+                    break
+                except PermissionError as exc:
+                    last = exc
+                    time.sleep(0.1)
+            else:
+                raise last  # type: ignore[misc]
             want = hashlib.sha256(original).hexdigest()
             if _sha256(install) != want:
                 sys.exit(f"ab: failed to restore {install}; reinstall the plugin")
