@@ -161,7 +161,8 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
   rounds' accumulator traffic, which grows as 1/batch; batch 2/5/6/8 measured
   272/272/263/247 fps against 293 at 3-4 (400-frame screen, `VRT_RESULT=3`).
   The 96 MiB is the target card's cache exactly, so the target is derived per
-  part now (`vsfeel_llc_budget`: capped by the cache table, floored at 32 MiB),
+  part now (capped by the cache table, or the tuned plan for an unknown part —
+  the 32 MiB floor was superseded 2026-11-18),
   with `VSFEEL_NLMEANS_RING_TARGET` and the VRAM `/16` cap on top; see
   Historical.
 - **The weight tile is 32x48 (`VRT_RESULT=6`).** A taller tile cuts the separable
@@ -248,6 +249,18 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
 
 ## Historical
 
+- **2026-11-18 — the 32 MiB floor planned batch 1 on small-cache parts
+  (+15.5% Y, +2.0% UV, 1080p16 d=2).** The "fit the cache" rule has no solution
+  at 32 MiB — even batch 1's live set (acc + window + ring) is ~62 MiB — so an
+  unknown part degenerated to batch 1 (62 rounds at d=2, ~3x the accumulator
+  re-traffic), which is also why 96 MiB "worked" there: the fallback was never
+  a solution, only a smaller wrong answer. An unknown part (cache-table miss)
+  now plans the tuned 96 MiB round instead, known-table parts are capped as
+  before, and a plateau runs 128-224 MiB for tuning. Same-session ABBA
+  `--repeat 3`, n=12, `--filter nlmeans --gpu-cache-mb 4096 --cache-frames 400`:
+  `channels=Y` 100.25 → 115.83 fps, `channels=UV` 384.75 → 392.60 fps.
+  Output scheduling changes only; the suite is bit-identical (210 passed).
+  Supersedes the 32 MiB floor in the 2026-11-07 entry below.
 - **2026-11-17 — UV pair tiles (+8.7%, 1080p16).** The chroma window packs {U,V}
   into one 32-bit element, halving the weight and accumulation loads; compose
   packs once, and the values, tap order and `precise` multiply are unchanged, so

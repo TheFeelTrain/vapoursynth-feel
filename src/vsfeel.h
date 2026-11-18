@@ -653,8 +653,13 @@ inline uint32_t vsfeel_limit_u32(const char * env, uint32_t value) {
 // 6 MiB) and Nvidia's/Intel's L2. It is a table of published figures, not a
 // measurement; extend it by adding rows (and keep it to parts with a vendor
 // figure). This is a creation-time lookup, called once per filter instance.
+// The ids may be overridden with VSFEEL_LIMIT_VENDOR_ID / VSFEEL_LIMIT_DEVICE_ID
+// so the unknown-part path can be pinned on any one machine; no capability
+// moves, only what policies read.
 inline VkDeviceSize vsfeel_gpu_llc_bytes(uint32_t vendor_id,
                                          uint32_t device_id) {
+    vendor_id = vsfeel_limit_u32("VSFEEL_LIMIT_VENDOR_ID", vendor_id);
+    device_id = vsfeel_limit_u32("VSFEEL_LIMIT_DEVICE_ID", device_id);
     struct Entry {
         uint32_t vendor;
         uint32_t device;

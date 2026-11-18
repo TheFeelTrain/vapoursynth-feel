@@ -433,18 +433,17 @@ def test_eedi3_scratch_budget_knob_moves_the_plan():
 def test_nlmeans_round_target_follows_the_cache():
     """NLMeans' per-round live set is sized from the part's cache.
 
-    The tuned 96 MiB is the target card's last-level cache; a part with a
-    smaller one plans a smaller round instead of streaming it, floored at 32 MiB
-    like DFTTest's stripe ring. A part the table does not know also gets that
-    floor, since guessing the tuned value for an unknown cache is exactly what
-    the floor exists to avoid. The knob overrides the tuned value in MiB and the
-    VRAM allowance still caps the result.
+    Known parts get the tuned 96 MiB round capped by the table entry; a part
+    the table does not know gets the tuned plan as well, because a 32 MiB
+    floor plan cannot fit even one round's live set (window + accumulators)
+    at 1080p and degenerated to batch 1. The knob overrides the tuned value
+    in MiB and the VRAM allowance still caps the result.
     """
     trace = _trace("nlmeans")
     ring, target, batch = _nlmeans_ring(trace)
     _, llc = _nlmeans_llc(trace)
-    # vsfeel_llc_budget: an unknown part (llc == 0) clamps to the floor.
-    want = max(32.0, min(96.0, llc))
+    # vsfeel_gpu_llc_bytes: an unknown part gets the tuned plan.
+    want = 96.0 if llc == 0 else min(96.0, llc)
     assert target == want, (llc, target)
     assert batch >= 1, batch
     # The banner names every per-frame buffer and the cache it used.
@@ -455,6 +454,17 @@ def test_nlmeans_round_target_follows_the_cache():
     assert forced == 48.0, forced
     _, capped, _ = _nlmeans_ring(_trace("nlmeans", {"VSFEEL_LIMIT_VRAM_BUDGET": str(256 << 20)}))
     assert capped == 16.0, capped
+    # The identity seam can pin the known-part side: a 64 MiB table row
+    # (0x2c18); decimal because env_int parses base 10.
+    _, forced64, _ = _nlmeans_ring(
+        _trace("nlmeans", {"VSFEEL_LIMIT_VENDOR_ID": "4318", "VSFEEL_LIMIT_DEVICE_ID": "11288"})
+    )
+    assert forced64 == 64.0, forced64
+    # ...and the unknown side: an id absent from the table plans 96 MiB.
+    _, unknown, _ = _nlmeans_ring(
+        _trace("nlmeans", {"VSFEEL_LIMIT_VENDOR_ID": "4318", "VSFEEL_LIMIT_DEVICE_ID": "11609"})
+    )
+    assert unknown == 96.0, unknown
 
 
 def test_nlmeans_live_set_is_bounded_at_creation():

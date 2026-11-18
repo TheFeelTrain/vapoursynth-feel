@@ -1014,12 +1014,22 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
                                      d->tile_elems * d->elem_bytes;
         const int64_t ring_bytes_per_entry =
             ring_slots_per_entry * d->npix * NLMeansData::kWeightBytes;
-        // The tuned 96 MiB is the 7900 XTX's last-level cache; a part with less
-        // cache plans a smaller round instead of streaming it (the floor is the
-        // same conservative 32 MiB DFTTest uses). VSFEEL_NLMEANS_RING_TARGET
-        // overrides the tuned value in MiB.
-        int64_t target = static_cast<int64_t>(vsfeel_llc_budget(
-            *d->gpu, static_cast<VkDeviceSize>(d->ring_target), 32 << 20));
+        // The tuned 96 MiB is the 7900 XTX's last-level cache. A part with a
+        // table entry plans min(tuned, cache); an unknown part used to get the
+        // 32 MiB floor, which cannot fit even one round's live set (acc +
+        // window + ring is ~62 MiB at 1080p d=2) and so degenerated to batch 1
+        // (62 rounds, ~3x the accumulator re-traffic). Unknown parts now get
+        // the tuned plan (Y +15.5%, UV +2.0% on an RTX 5060 at 1080p16 d=2; the
+        // plateau runs 128-224 MiB). VSFEEL_NLMEANS_RING_TARGET overrides the
+        // target in MiB, and the VRAM clamp still applies.
+        int64_t target;
+        if (const VkDeviceSize llc =
+                vsfeel_gpu_llc_bytes(d->gpu->vendor_id, d->gpu->device_id);
+            llc != 0) {
+            target = std::min<int64_t>(d->ring_target, llc);
+        } else {
+            target = d->ring_target;
+        }
         if (const int mib = env_int("VSFEEL_NLMEANS_RING_TARGET", 0); mib > 0) {
             target = static_cast<int64_t>(mib) << 20;
         }
