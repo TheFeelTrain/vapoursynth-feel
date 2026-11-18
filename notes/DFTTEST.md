@@ -439,6 +439,8 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   is read with stride 9, so a `[x][t][y]` transpose would make each thread's 144
   reads contiguous and take the same vec4 treatment the window got. Not the
   default path, hence not done with it.
+- **64 MiB is past the GB206 knee.** An `L2_TARGET` sweep on the RTX 5060 read
+  16 ≈ 32 MiB and 64 MiB -12.1%, so the 32 MiB default stands for a 32 MiB part.
 - **The stripe floor.** 6 dispatches and 6 barriers per plane stand between the
   32 MB-ring ceiling (+29%) and the shipped +18.5%; a column-direction stripe
   would fit 2 stripes at 1080p (72 MB ring) if the reindexing is worth ~2-3%.

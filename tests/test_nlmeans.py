@@ -1063,3 +1063,33 @@ def test_reject_rclip_shorter_than_the_requested_frame(clip_grays):
     short = vs.core.std.Trim(clip_grays, length=2)
     with pytest.raises(vs.Error, match="rclip"):
         _run(clip_grays, d=0, h=1.5, rclip=short)
+
+
+def test_nlmeans_staged_input_matches_the_in_place_path(clip_yuv420p16, monkeypatch):
+    """The staged window is a byte copy, so the output must not move."""
+    monkeypatch.setenv("VSFEEL_NLMEANS_STAGE", "0")
+    in_place = _run(clip_yuv420p16, d=2, channels="UV")
+    monkeypatch.setenv("VSFEEL_NLMEANS_STAGE", "1")
+    staged = _run(clip_yuv420p16, d=2, channels="UV")
+    monkeypatch.delenv("VSFEEL_NLMEANS_STAGE", raising=False)
+    for n in (0, 7, 23):
+        for p in (1, 2):
+            assert np.array_equal(
+                _plane(in_place.get_frame(n), p), _plane(staged.get_frame(n), p)
+            ), (n, p)
+
+
+def test_nlmeans_pair_tiles_match_the_scalar_path(clip_yuv420p16, clip_yuv420ph, monkeypatch):
+    """Packing U,V into one element is a storage change only, so output is exact."""
+    params = dict(d=2, channels="UV")
+    for clip in (clip_yuv420p16, clip_yuv420ph):
+        monkeypatch.setenv("VSFEEL_NLMEANS_PAIR", "0")
+        scalar = _run(clip, **params)
+        monkeypatch.setenv("VSFEEL_NLMEANS_PAIR", "1")
+        pair = _run(clip, **params)
+        for n in (0, 7, 23):
+            for p in (1, 2):
+                assert np.array_equal(
+                    _plane(scalar.get_frame(n), p), _plane(pair.get_frame(n), p)
+                ), (clip.format.name, n, p)
+    monkeypatch.delenv("VSFEEL_NLMEANS_PAIR", raising=False)

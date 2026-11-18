@@ -216,6 +216,10 @@ sigma, frames and repeats (3-repeat medians, one session):
 
 ## Historical
 
+- **2026-11-17 — the staging copies are BAR-aperture bound.** On the RTX 5060
+  `GPUTRACE` attributed ~178 us to the input copy and ~225 us to the publish
+  copy (u16, 4.15 MB); f32 doubled both exactly. That is a platform tax, not a
+  kernel cost, so these numbers do not transfer to the RX 7900 XTX.
 - **2026-11-16 — the horizontal pass was the frame: a tiled read and a staged
   write (+10% then +76%, 1080p16).** `GPUTRACE` split sigma=16 into vertical
   48.6 us / horizontal 758.4 us. The horizontal gives each thread 8 consecutive

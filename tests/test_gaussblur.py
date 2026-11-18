@@ -894,3 +894,14 @@ def test_gaussblur_nonfinite_footprint_matches_reference_f16(kind, sigma):
     assert result["maxdiff"] <= F16_STEP, (
         f"f16 {kind} sigma={sigma}: finite pixels differ from vszipcl by {result['maxdiff']}"
     )
+
+
+def test_gaussblur_staged_input_matches_the_in_place_path(clip_gray16, monkeypatch):
+    """The staged read is a byte copy, so the visible plane must not move."""
+    monkeypatch.setenv("VSFEEL_GAUSS_STAGE", "0")
+    in_place = _run(clip_gray16, sigma=2.0)
+    monkeypatch.setenv("VSFEEL_GAUSS_STAGE", "1")
+    staged = _run(clip_gray16, sigma=2.0)
+    monkeypatch.delenv("VSFEEL_GAUSS_STAGE", raising=False)
+    for n in (0, 7, 23):
+        assert np.array_equal(_plane(in_place.get_frame(n), 0), _plane(staged.get_frame(n), 0)), n

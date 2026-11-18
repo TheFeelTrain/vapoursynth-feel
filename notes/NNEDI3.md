@@ -412,6 +412,8 @@ upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
 
 ## Open work
 
+- **Per-tap clamp peel** measured +1% (bit-exact, no variant growth), below
+  this box's noise floor; the shader is unchanged.
 - **Prescreen vs reference ~2.8x claim is pre-port** (40 µs gap on old
   stamps): re-measure against nnedi3vk's kernels on the current binary before
   quoting it.

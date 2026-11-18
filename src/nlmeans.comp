@@ -53,6 +53,14 @@
 #define VTYPE      float
 #endif
 
+// Pair tiles pack the two chroma channels of one (clip, layer) into one 32-bit
+// element. A packed uint keeps the load a single 32-bit access without needing
+// shaderInt16 or f16 arithmetic types; f32 has no pair module (2xLDG.32 is
+// already one LDG.64 there, and 8-byte elements would change the layout).
+#if defined(NLM_PAIR) && !defined(IO_F32)
+#define PAIR_UINT 1
+#endif
+
 layout(constant_id = 0)  const int VI_DIM_X = 640;
 layout(constant_id = 1)  const int VI_DIM_Y = 360;
 layout(constant_id = 2)  const int STRIDE = 640;   // source plane pitch, elements
@@ -87,7 +95,11 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Img
 };
 layout(std430, binding = 0) readonly buffer AddrBuf { ImgRef img[]; } addr;
 /* The padded temporal window: clips*C*LAYERS tiles of TILE_ELEMS elements. */
+#if defined(PAIR_UINT)
+layout(std430, binding = 1) buffer Window { uint u1[]; };
+#else
 layout(std430, binding = 1) buffer Window { VTYPE u1[]; };
+#endif
 layout(std430, binding = 2) writeonly buffer Dst0 { VTYPE d0[]; };
 layout(std430, binding = 3) writeonly buffer Dst1 { VTYPE d1[]; };
 layout(std430, binding = 4) writeonly buffer Dst2 { VTYPE d2[]; };
@@ -109,6 +121,21 @@ layout(push_constant) uniform PushConstants {
     int pc3;   /* acc: last sweep round -> apply the finish transform */
 } pc;
 
+#if defined(PAIR_UINT)
+// One packed (channel 0, channel 1) pair. The widening and the `precise`
+// multiply match load_u1's scalar path per component.
+vec2 load_pair(int idx) {
+    const uint p = u1[idx];
+#if defined(IO_F16)
+    return unpackHalf2x16(p);   // half -> float is exact
+#else
+    precise float lo = float(int(p & 0xffffu)) * (1.0f / 65535.0f);
+    precise float hi = float(int(p >> 16)) * (1.0f / 65535.0f);
+    return vec2(lo, hi);
+#endif
+}
+
+#else
 float load_u1(int idx) {
 #if defined(IO_F32)
     return u1[idx];
@@ -123,6 +150,7 @@ float load_u1(int idx) {
     return v;
 #endif
 }
+#endif
 
 VTYPE to_vtype(float v) {
 #if defined(IO_F32)
@@ -159,9 +187,27 @@ void main() {
     const int tile = int(gl_WorkGroupID.z);
     const int idx = tile*TILE_ELEMS + py*PSTRIDE + px;
     if (px >= PAD && px < PAD + VI_DIM_X && py >= PAD && py < PAD + VI_DIM_Y) {
+#if defined(PAIR_UINT)
+        const int clip = tile / LAYERS;
+        const int layer = tile % LAYERS;
+        const int src = (py - PAD)*STRIDE + (px - PAD);
+        const int base = clip*NLM_CHANNELS*LAYERS + layer;
+#if defined(IO_F16)
+        u1[idx] = packHalf2x16(vec2(float(addr.img[base].v[src]),
+                                    float(addr.img[base + LAYERS].v[src])));
+#else
+        u1[idx] = uint(addr.img[base].v[src]) |
+                  (uint(addr.img[base + LAYERS].v[src]) << 16);
+#endif
+#else
         u1[idx] = addr.img[tile].v[(py - PAD)*STRIDE + (px - PAD)];
+#endif
     } else {
+#if defined(PAIR_UINT)
+        u1[idx] = 0u;
+#else
         u1[idx] = to_vtype(PAD_ZERO);
+#endif
     }
 }
 
@@ -185,7 +231,13 @@ void main() {
 shared float dist[VRT_RESULT*BY + 2*NLM_S][DIST_WP];
 shared float hsum[VRT_RESULT*BY + 2*NLM_S][HSUM_W];
 
+#if defined(PAIR_UINT)
+vec2 load_guide_pair(int base, int idx) { return load_pair(base + idx); }
+// Only NLM_REF==1 reaches a pair module; the other REF branches still compile.
+float load_guide(int base, int idx) { return load_guide_pair(base, idx).x; }
+#else
 float load_guide(int base, int idx) { return load_u1(base + idx); }
+#endif
 
 /* Joint multi-channel patch distance for the center pixel (xx,y) vs the
  * candidate (xx+qx, y+qy). aK/bK are the element bases of channel K's padded
@@ -200,8 +252,15 @@ float nlm_pix_dist(int a0, int a1, int a2, int b0, int b1, int b2,
         const float d0 = load_guide(a0, rc) - load_guide(b0, cc);
         return 3.0f * (d0 * d0);
     } else if (NLM_REF == 1) {   /* CHROMA (U,V) */
+#if defined(PAIR_UINT)
+        const vec2 pa = load_guide_pair(a0, rc);
+        const vec2 pb = load_guide_pair(b0, cc);
+        const float du = pa.x - pb.x;
+        const float dv = pa.y - pb.y;
+#else
         const float du = load_guide(a0, rc) - load_guide(b0, cc);
         const float dv = load_guide(a1, rc) - load_guide(b1, cc);
+#endif
         return 1.5f * (du*du + dv*dv);
     } else if (NLM_REF == 2) {   /* YUV (4:4:4 only) */
         const float dy = load_guide(a0, rc) - load_guide(b0, cc);
@@ -270,8 +329,12 @@ void main() {
     // guide tile bases for layers t (reference) and t+qz (candidate)
     const int gb = GUIDE_OFF * TILE_ELEMS;
     const int a0 = gb + t*TILE_ELEMS,              b0 = gb + (t+qz)*TILE_ELEMS;
+#if defined(PAIR_UINT)
+    const int a1 = a0, b1 = b0, a2 = a0, b2 = b0;
+#else
     const int a1 = gb + (LAYERS + t)*TILE_ELEMS,   b1 = gb + (LAYERS + t+qz)*TILE_ELEMS;
     const int a2 = gb + (2*LAYERS + t)*TILE_ELEMS, b2 = gb + (2*LAYERS + t+qz)*TILE_ELEMS;
+#endif
 
     const int lx = int(gl_LocalInvocationID.x);
     const int ly = int(gl_LocalInvocationID.y);
@@ -310,6 +373,18 @@ void main() {
             const int cx_b = two ? lx + BX : cx_a;
             const int rc_a2 = br + cx_a, cc_a2 = bc + cx_a;
             const int rc_b2 = br + cx_b, cc_b2 = bc + cx_b;
+#if defined(PAIR_UINT)
+            // Pair modules are selected for NLM_REF==1 only: one 32-bit load
+            // per side instead of two scalar loads.
+            const vec2 pa0 = load_guide_pair(a0, rc_a2);
+            const vec2 pb0 = load_guide_pair(b0, cc_a2);
+            const vec2 pa1 = load_guide_pair(a0, rc_b2);
+            const vec2 pb1 = load_guide_pair(b0, cc_b2);
+            const float du0 = pa0.x - pb0.x, dv0 = pa0.y - pb0.y;
+            const float du1 = pa1.x - pb1.x, dv1 = pa1.y - pb1.y;
+            const float va = 1.5f * (du0*du0 + dv0*dv0);
+            const float vb = 1.5f * (du1*du1 + dv1*dv1);
+#else
             const float ar0 = load_guide(a0, rc_a2), br0 = load_guide(b0, cc_a2);
             const float ar1 = load_guide(a0, rc_b2), br1 = load_guide(b0, cc_b2);
             float va, vb;
@@ -344,6 +419,7 @@ void main() {
                 va = (2.0f/3.0f + mr0)*(dr0*dr0) + (4.0f/3.0f)*(dg0*dg0) + (1.0f - mr0)*(db0*db0);
                 vb = (2.0f/3.0f + mr1)*(dr1*dr1) + (4.0f/3.0f)*(dg1*dg1) + (1.0f - mr1)*(db1*db1);
             }
+#endif
             dist[ry_g2][cx_a] = va;
             if (two) dist[ry_g2][cx_b] = vb;
         }
@@ -454,7 +530,14 @@ void main() {
 
 #ifdef ENTRY_ACC
 
+#if defined(PAIR_UINT)
+vec2 load_src_pair(int base, int idx) { return load_pair(base + idx); }
+// Pair modules are selected for NLM_REF==1 only; the dead scalar branch
+// compiles against the first component.
+float load_src(int base, int idx) { return load_src_pair(base, idx).x; }
+#else
 float load_src(int base, int idx) { return load_u1(base + idx); }
+#endif
 
 void main() {
     const int x = int(gl_GlobalInvocationID.x);
@@ -512,18 +595,31 @@ void main() {
                                 ? 0.0f : u4a[sm*U4_LAYER + ym*STRIDE + xm];
             u5v = max(u4, max(u4_mq, u5v));
             const int qps = qy*PSTRIDE + qx;
+#if defined(PAIR_UINT)
+            const vec2 pq = load_src_pair((NLM_D+qz)*TILE_ELEMS, gpad + qps);
+            const vec2 mq = load_src_pair((NLM_D-qz)*TILE_ELEMS, gpad - qps);
+            acc0 += (u4*pq.x) + (u4_mq*mq.x);
+            acc1 += (u4*pq.y) + (u4_mq*mq.y);
+#else
             const float pq0 = load_src((NLM_D+qz)*TILE_ELEMS, gpad + qps);
             const float mq0 = load_src((NLM_D-qz)*TILE_ELEMS, gpad - qps);
             const float pq1 = load_src((LAYERS+NLM_D+qz)*TILE_ELEMS, gpad + qps);
             const float mq1 = load_src((LAYERS+NLM_D-qz)*TILE_ELEMS, gpad - qps);
             acc0 += (u4*pq0) + (u4_mq*mq0);
             acc1 += (u4*pq1) + (u4_mq*mq1);
+#endif
             accw += (u4 + u4_mq);
         }
         if (pc.pc3 != 0) {
             const float m = WREF * u5v;
+#if defined(PAIR_UINT)
+            const vec2 c = load_src_pair(s0, gpad);
+            d0[g] = to_vtype(finish_sample(c.x, m, acc0, accw));
+            d1[g] = to_vtype(finish_sample(c.y, m, acc1, accw));
+#else
             d0[g] = to_vtype(finish_sample(load_src(s0, gpad), m, acc0, accw));
             d1[g] = to_vtype(finish_sample(load_src(s1, gpad), m, acc1, accw));
+#endif
         } else {
             u2[3*g] = acc0; u2[3*g+1] = acc1; u2[3*g+2] = accw;
         }

@@ -348,6 +348,16 @@ foreach(io IN LISTS VK_NLM_IO_TYPES)
             "nlmeans_${io}_${entry}|nlmeans.comp|-DIO_${io_define} ${entry_def}")
     endforeach()
 endforeach()
+# Interleaved UV pair tiles: 16-bit io only (see src/nlmeans.comp NLM_PAIR).
+foreach(io IN ITEMS u16 f16)
+    string(TOUPPER "${io}" io_define)
+    foreach(entry_i RANGE 0 2)
+        list(GET VK_NLM_ENTRIES ${entry_i} entry)
+        list(GET VK_NLM_ENTRY_DEFS ${entry_i} entry_def)
+        list(APPEND VK_NLM_VARIANTS
+            "nlmeans_${io}_pair_${entry}|nlmeans.comp|-DIO_${io_define} -DNLM_PAIR ${entry_def}")
+    endforeach()
+endforeach()
 
 # EEDI3: row kernel (one 32-lane WG per interp row, subgroup-register DP
 # with shuffles) + vcheck kernel (single WG serial row walk), per io

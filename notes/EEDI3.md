@@ -214,12 +214,9 @@ register is the largest addressable item; the three-window redundancy is worth
   an f16 FMA by the compiler, so the operand was the unrounded vout and the
   horizontal DP amplified one half ulp into ~2% of pixels; `half_rne` (integer
   RNE) fixed it and EEDI3AA f16 is bit-exact against the two-call chain. A full
-  half arithmetic path was rejected on mechanism: the row kernel is ALU-issue
-  bound at ~1 IPC, where RDNA3 scalar f16 is no faster than f32 and the serial
-  DP does not pack (eedi3vk2's full-half f16 measures 0.044 / ~20% of pixels
-  off its own f32), and the arithmetic scratch it would narrow is ~90 MB per
-  2x2160p frame, under 1% of the 6.2 ms frame at ~2 TB/s, so it cannot reach the
-  30% bar that would justify the accuracy loss.
+  half arithmetic path was rejected: the row kernel is ALU-issue bound, scalar
+  f16 is no faster than f32 there and the DP does not pack, and the ~90 MB
+  frame scratch is under 1% of the 6.2 ms frame, so it cannot reach the 30% bar.
 - **2026-10-12 — the banner's table is re-measured; the old numbers are void.**
   u16 472/56, EEDI3H 471/52, hp 198/48 and the "470.4 → 469.6 fps (+0.0%)"
   pre-optimization pair were taken against the pre-fix benchmark harness
@@ -571,8 +568,8 @@ passes). All bit-identical to the previous build unless stated.
 - **The three-window redundancy** (PROBE=14: 8.2%) needs a 2|u|-deep delay line
   per direction: ~90 registers at K=2 vs the 96 in use today, so only reachable if
   something else gives up registers first.
-- **Output staging** measured +28%/+11%/+15% but failed four f16 tests; the
-  cause is open, so retry under git from a clean revert, not a story.
+- **EEDI3H/EEDI3AA output staging** ships on NVIDIA (+43%/+24%); the vertical
+  BLIT is flat and stays direct. `VSFEEL_EEDI3_OSTAGE` overrides the default.
 - `ENTRY_PAD`/`VCOPY`/`BLIT` div/mod by `pad_stride`/`WIDTH`: a 2D dispatch
   removes them (per-plane passes, not the row kernel).
 - **f16's remaining levers**: half `dst`/`cint`/`vout` (loses f32 parity) and
@@ -685,6 +682,8 @@ passes). All bit-identical to the previous build unless stated.
 - `VSFEEL_EEDI3_TIMING` — per-frame host stage split (acquire/alloc/record/submit).
 - `VSFEEL_EEDI3_STAGE=1|0` - stage the clip, sclip and mask planes, or read
   them in place (default: NVIDIA, EEDI3H excepted; `VSFEEL_STAGE` for all).
+- `VSFEEL_EEDI3_OSTAGE=1|0` - publish the output through a private copy, or
+  write the plane directly (default: NVIDIA, EEDI3H and EEDI3AA only).
 - `VSFEEL_EEDI3_SYNC` — additionally wait each submission out and report its wall time
   (serializes the pipeline; for GPU-time measurements at depth 1).
 - `VSFEEL_EEDI3_NOCLEAR` — EEDI3AA's frame path only: skip the per-submission

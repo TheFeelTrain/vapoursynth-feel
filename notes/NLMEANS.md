@@ -14,26 +14,22 @@ Status: **shipped on the R80 GPU API.** Verified against
   window, barrier, then the interleaved weight/accumulation sweep rounds,
   submit. Scratch (window, f32 weight ring, u2, u5) is per-frame from
   `createGPUBuffer`, retired by the submission.
-- The sweep kernels keep the pre-R80 padded-tile indexing (`(y+PAD)*PSTRIDE`,
-  `layer*TILE_ELEMS`), i.e. 32-bit offsets into one storage buffer. Reading the
-  core's per-layer planes directly through buffer references costs 64-bit
-  addressing per load and ~10% on the chroma benchmark (see Performance).
-- Sweep tables (`wq`/`aq`, stride-8 rows, rounds of `batch` entries, variants by
-  `m=min(d,n)`), the f32 weight ring, `first`-flag init and the finish in the
-  last acc round are unchanged from the pre-R80 implementation. The tables hold
-  every variant at once, so creation budgets them at a thirty-second of the VRAM
-  allowance capped at 64 MiB (`a=64, d=16` would be 215.8 MiB), and one
-  weight+acc round's live set must fit an eighth of the allowance, the per-frame
-  rule.
+- The padded-tile indexing (`(y+PAD)*PSTRIDE`, `layer*TILE_ELEMS`) keeps 32-bit
+  offsets into one storage buffer; reading per-layer planes directly costs
+  64-bit addressing and ~10% on chroma (see Performance).
+- The `wq`/`aq` tables (stride-8 rows, `batch` entries per round, variants by
+  `m=min(d,n)`), f32 weight ring, `first`-flag init and finish-in-last-round are
+  unchanged from the pre-R80 implementation. They hold every variant at once and
+  are budgeted at a thirty-second of the VRAM allowance (capped 64 MiB); one
+  weight+acc round's live set must fit an eighth, the per-frame rule.
 - Three io variants — u16, f16, f32 — selected by the input format (half is
-  `stFloat` + 16 bits). A half element is a storage width, not a precision: the
-  temporal window holds the clip's own 2-byte samples, every weight,
-  accumulator and LDS tile stays f32 exactly as the reference's own u4a/u2/u5,
-  and the finish store narrows once with `OpFConvert`'s round-to-nearest-even
-  (vszipcl's `vstore_half_rte`).
-- u16 transport divides by 65535 on load and uses the reference's saturating
-  round-to-nearest-even store, so its code values match vszipcl's conversion;
-  the earlier reciprocal-multiply/half-up pair is gone.
+  `stFloat` + 16 bits). Half is a storage width, not a precision: the window
+  holds the clip's 2-byte samples, every weight/accumulator/LDS tile stays f32
+  as the reference's own u4a/u2/u5, and the finish narrows once with `OpFConvert`
+  round-to-nearest-even (vszipcl's `vstore_half_rte`).
+- On the 16-bit UV path the window packs U,V into one 32-bit pair tile, one load
+  per side instead of two; `VSFEEL_NLMEANS_PAIR=0` selects the scalar tiles.
+- u16 divides by 65535 on load and uses the reference's saturating RNE store.
 - Accuracy: ≤1 LSB u16 (≤2 on the joint YUV444 path), ≤4.4e-6 f32 and ≤1 half
   step f16 against vszipcl across the whole parameter surface (spatial, temporal,
   joint, rclip, cropped, `a=64`, `d=16`).
@@ -252,6 +248,11 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
 
 ## Historical
 
+- **2026-11-17 — UV pair tiles (+8.7%, 1080p16).** The chroma window packs {U,V}
+  into one 32-bit element, halving the weight and accumulation loads; compose
+  packs once, and the values, tap order and `precise` multiply are unchanged, so
+  output is bit-identical. **282.1 -> 306.8 fps** (ABBA n=20, knlmvk flat).
+  Measured +0.4% on the RX 7900 XTX, so it ships on every vendor.
 - **2026-11-16 - the temporal window's planes are staged per frame (+135%,
   1080p16).** Compose reads every `(clip, channel, layer)` plane once per frame
   and the same read of a private copy measured several times faster on an
@@ -468,4 +469,6 @@ Flags are `VSFEEL_NLMEANS_<FLAG>`.
 - `VSFEEL_NLMEANS_STAGE=1|0` — stage the window's planes per frame, or read
   them in place (default: NVIDIA; `VSFEEL_STAGE` sets the default for every
   filter).
+- `VSFEEL_NLMEANS_PAIR=1|0` — pack the UV window tiles as 32-bit pairs, or use
+  scalar tiles (default: on for 16-bit UV).
 - `VSFEEL_DEBUG`/`VSFEEL_TRACE` and `RADV_DEBUG=asm|shaderstats` as elsewhere.

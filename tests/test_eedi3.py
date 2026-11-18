@@ -1776,3 +1776,35 @@ def test_eedi3_f16_uses_the_half_pad_and_f32_scratch():
     assert pf16 < p32, "f16 pad is not narrower than the f32 pad"
     assert sf16 > s16, "f16 arithmetic scratch is not the f32 one"
     assert sf16 < s32, "f16 scratch is not narrower than the f32 scratch"
+
+
+def test_eedi3_staged_output_matches_the_direct_path(clip_gray16, clip_grayh, monkeypatch):
+    """Output staging is a byte copy, so the visible plane must not move.
+
+    The default is vendor-keyed, so both arms are forced. f16 is included
+    because the reverted first attempt only failed on the strict f16 compares.
+    """
+    params = dict(field=1, mdis=5, nrad=1)
+    for clip in (clip_gray16, clip_grayh):
+        monkeypatch.setenv("VSFEEL_EEDI3_OSTAGE", "0")
+        direct = _run(clip, **params)
+        monkeypatch.setenv("VSFEEL_EEDI3_OSTAGE", "1")
+        staged = _run(clip, **params)
+        for n in (0, 11, 23):
+            assert np.array_equal(_plane(direct.get_frame(n), 0), _plane(staged.get_frame(n), 0)), (
+                clip.format.name,
+                n,
+            )
+    monkeypatch.delenv("VSFEEL_EEDI3_OSTAGE", raising=False)
+
+
+def test_eedi3_staged_input_matches_the_in_place_path(clip_gray16, monkeypatch):
+    """The staged clip/sclip planes are byte copies; luma must not move."""
+    params = dict(field=1, mdis=5, nrad=1)
+    monkeypatch.setenv("VSFEEL_EEDI3_STAGE", "0")
+    in_place = _run(clip_gray16, **params)
+    monkeypatch.setenv("VSFEEL_EEDI3_STAGE", "1")
+    staged = _run(clip_gray16, **params)
+    monkeypatch.delenv("VSFEEL_EEDI3_STAGE", raising=False)
+    for n in (0, 11, 23):
+        assert np.array_equal(_plane(in_place.get_frame(n), 0), _plane(staged.get_frame(n), 0)), n

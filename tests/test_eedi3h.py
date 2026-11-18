@@ -611,3 +611,19 @@ def test_eedi3h_f16_yuv_planes():
             ca = _plane(my.get_frame(n), plane, dtype=np.float16)
             cb = _plane(s, plane, dtype=np.float16)
             assert np.array_equal(ca, cb), f"chroma{plane} changed at frame {n}"
+
+
+def test_eedi3h_staged_output_matches_the_direct_path(clip_gray16, clip_grayh, monkeypatch):
+    """The compose tail's staged write must not move a sample, at either width."""
+    params = dict(field=1, mdis=5, nrad=1)
+    for clip in (clip_gray16, clip_grayh):
+        monkeypatch.setenv("VSFEEL_EEDI3_OSTAGE", "0")
+        direct = _runh(clip, **params)
+        monkeypatch.setenv("VSFEEL_EEDI3_OSTAGE", "1")
+        staged = _runh(clip, **params)
+        for n in (0, 11, 23):
+            assert np.array_equal(_plane(direct.get_frame(n), 0), _plane(staged.get_frame(n), 0)), (
+                clip.format.name,
+                n,
+            )
+    monkeypatch.delenv("VSFEEL_EEDI3_OSTAGE", raising=False)

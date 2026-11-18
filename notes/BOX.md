@@ -165,6 +165,9 @@ copies this filter removes.
 
 ## Open work
 
+- **Staged input is a measured loss** (-9.45% on an RTX 5060): the read is
+  coalesced and single-pass, so the copy is pure overhead. `VSFEEL_BOX_STAGE=1`
+  is the arm to re-check on another device.
 - `width == src.width` and `height == src.height` still runs the horizontal
   dispatch; `skip_vert` drops only the vertical pass (`src/box.cpp:579`). A
   no-op path could copy instead; it is not on any current route.

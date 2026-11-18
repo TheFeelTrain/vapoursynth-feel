@@ -684,7 +684,8 @@ def test_gaussblur_small_path_fits_the_guaranteed_workgroup_memory():
     # forced on: its vendor default is an A/B result, not a device limit.
     two_pass = _gauss_lds(1.4, {**floor, "VSFEEL_GAUSS_HORIZ_LDS": "1"})
     assert len(two_pass) == 2 and two_pass[0] == 0, two_pass
-    assert 0 < two_pass[1] <= 16384, two_pass
+    # BLK_Y * h_tile_stride(ksize 9) * 4; pinned so a tile-geometry edit fails.
+    assert two_pass[1] == 5472, two_pass
 
 
 # ---------------------------------------------------------------------------

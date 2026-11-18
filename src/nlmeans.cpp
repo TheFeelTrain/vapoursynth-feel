@@ -168,6 +168,9 @@ struct NLMeansData {
     // Read the temporal window's planes from private device-local copies (see
     // gpu_stage_plane); off with VSFEEL_NLMEANS_STAGE=0.
     bool stage { true };
+    // Interleaved U/V pair tiles for the chroma path; off with
+    // VSFEEL_NLMEANS_PAIR=0.
+    bool pair { false };
     std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
         ht_total_ns {}, ht_n {};
 
@@ -539,8 +542,10 @@ static const VSFrame * nlmeans_gpu_frame(NLMeansData * d, int n,
         const uint32_t cgy = static_cast<uint32_t>((d->ph + BLK_Y - 1) / BLK_Y);
         d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                       d->compose_pipeline);
-        d->gpu->vk->vkCmdDispatch(cmd, cgx, cgy,
-                                  static_cast<uint32_t>(d->clips) * C * L);
+        d->gpu->vk->vkCmdDispatch(
+            cmd, cgx, cgy,
+            static_cast<uint32_t>(d->clips) *
+                static_cast<uint32_t>(d->pair ? L : C * L));
         gpu_barrier(*d->gpu, cmd);
     }
 
@@ -955,6 +960,12 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
 
     d->stage =
         env_flag_or("VSFEEL_NLMEANS_STAGE", vsfeel_stage_default(*d->gpu));
+    // The pair tile packs the two chroma channels into one 32-bit element, so
+    // it exists only on the UV path and only for the 16-bit io widths.
+    // Measured flat on the RX 7900 XTX (+0.4%, inside the arm spread) and
+    // +8.7% on the RTX 5060, so it ships for every vendor with an opt-out.
+    d->pair = d->bits == 16 && d->ref_mode == REF_CHROMA && d->channels == 2 &&
+              env_flag_or("VSFEEL_NLMEANS_PAIR", true);
 
     // The plane geometry has to be the one the core's GPU frames carry, because
     // kernel addressing is STRIDE elements per row (see vsfeel_probe_strides).
@@ -982,7 +993,10 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
     d->ph = d->height + 2 * d->pad;
     d->tile_elems = static_cast<int64_t>(d->pstride) * d->ph;
     d->clips = d->has_ref ? 2 : 1;
-    d->guide_off = d->has_ref ? d->channels * (2 * dd + 1) : 0;
+    // Pair tiles halve the tile count (both channels in one), so the guide
+    // half starts one tile run later.
+    d->guide_off =
+        d->has_ref ? (d->pair ? (2 * dd + 1) : d->channels * (2 * dd + 1)) : 0;
 
     // Sweep entries per weight+acc round, sized so one round's live set fits the
     // GPU's last-level cache. That set is the f32 weight ring (one slot per
@@ -1305,13 +1319,27 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         const uint32_t * acc_code = nullptr;
         size_t compose_size = 0, weight_size = 0, acc_size = 0;
         if (d->bits == 16) {
-            if (d->half) {
+            if (d->half && d->pair) {
+                compose_code = nlmeans_f16_pair_compose_spv;
+                compose_size = nlmeans_f16_pair_compose_spv_size;
+                weight_code = nlmeans_f16_pair_weight_spv;
+                weight_size = nlmeans_f16_pair_weight_spv_size;
+                acc_code = nlmeans_f16_pair_acc_spv;
+                acc_size = nlmeans_f16_pair_acc_spv_size;
+            } else if (d->half) {
                 compose_code = nlmeans_f16_compose_spv;
                 compose_size = nlmeans_f16_compose_spv_size;
                 weight_code = nlmeans_f16_weight_spv;
                 weight_size = nlmeans_f16_weight_spv_size;
                 acc_code = nlmeans_f16_acc_spv;
                 acc_size = nlmeans_f16_acc_spv_size;
+            } else if (d->pair) {
+                compose_code = nlmeans_u16_pair_compose_spv;
+                compose_size = nlmeans_u16_pair_compose_spv_size;
+                weight_code = nlmeans_u16_pair_weight_spv;
+                weight_size = nlmeans_u16_pair_weight_spv_size;
+                acc_code = nlmeans_u16_pair_acc_spv;
+                acc_size = nlmeans_u16_pair_acc_spv_size;
             } else {
                 compose_code = nlmeans_u16_compose_spv;
                 compose_size = nlmeans_u16_compose_spv_size;

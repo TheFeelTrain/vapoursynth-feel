@@ -252,7 +252,8 @@ struct Eedi3PassInputs {
     int sclip_stride[MAX_PLANES] {}; // sclip row pitch, io elements
     VkBuffer out[MAX_PLANES] {};     // output frame planes
     int out_stride[MAX_PLANES] {};   // output row pitch, io elements
-    VkBuffer scratch {};             // per-frame scratch buffer
+    VSVulkanPlaneInfo out_info[MAX_PLANES] {}; // the core plane behind out[]
+    VkBuffer scratch {};                       // per-frame scratch buffer
 };
 
 struct Eedi3Data {
@@ -385,6 +386,9 @@ struct Eedi3Data {
     // Read the clip (and mask) from private device-local copies per frame (see
     // gpu_stage_plane); off with VSFEEL_EEDI3_STAGE=0.
     bool stage { true };
+    // Publish the output through a private copy; off with
+    // VSFEEL_EEDI3_OSTAGE=0.
+    bool ostage { true };
     // VSFEEL_EEDI3_SKIP diagnostics: omit a kernel from the recording so its
     // GPU cost can be read off an end-to-end A/B.
     bool skip_mask { false }, skip_pad { false }, skip_row { false },
@@ -584,6 +588,12 @@ struct Eedi3Job {
     int field {};
     bool horiz {}, second {};
     PassTail tail { PassTail::kNone };
+};
+
+// One plane's staged output, retained for the submission by the exec context.
+struct Eedi3OutStage {
+    GpuBuffer buf;
+    VSVulkanPlaneInfo plane {};
 };
 
 static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
@@ -1150,11 +1160,14 @@ static bool fill_mask_sclip(const Eedi3Data & d, const VSAPI * vsapi,
 
 static bool fill_out_planes(const Eedi3Data & d, const VSAPI * vsapi,
                             const VSFrame * dst, VkBuffer out[MAX_PLANES],
-                            int out_stride[MAX_PLANES], std::string & err) {
+                            int out_stride[MAX_PLANES],
+                            VSVulkanPlaneInfo out_info[MAX_PLANES],
+                            std::string & err) {
     const int numPlanes = d.vi->format.numPlanes;
     for (int plane = 0; plane < numPlanes; ++plane) {
         out[plane] = VK_NULL_HANDLE;
         out_stride[plane] = 0;
+        out_info[plane] = {};
         if (!d.process[plane]) {
             continue;
         }
@@ -1172,6 +1185,7 @@ static bool fill_out_planes(const Eedi3Data & d, const VSAPI * vsapi,
         out[plane] = pi.buffer;
         out_stride[plane] =
             static_cast<int>(vsapi->getStride(dst, plane) / d.elem_bytes);
+        out_info[plane] = pi;
     }
     return true;
 }
@@ -1246,6 +1260,8 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
     std::vector<const VSFrame *> inputs;
     std::vector<std::pair<int, VSFrame *>> produced;
     std::vector<Eedi3Job> jobs;
+    // Output-plane staging for each job, parallel to jobs (see gpu_out_stage).
+    std::vector<std::array<Eedi3OutStage, MAX_PLANES>> out_stages;
     // Private device-local copies of every plane this submission reads (see
     // gpu_stage_plane); the handles stay in the exec context's retention.
     std::vector<GpuBuffer> staged;
@@ -1396,9 +1412,27 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
                 any_staged = true;
             }
         }
-        if (!fill_out_planes(*d, vsapi, dst, in.out, in.out_stride, err)) {
+        if (!fill_out_planes(*d, vsapi, dst, in.out, in.out_stride, in.out_info,
+                             err)) {
             vsapi->freeFrame(dst);
             return fail(err);
+        }
+        out_stages.emplace_back();
+        if (d->ostage) {
+            for (int plane = 0; plane < numPlanes; ++plane) {
+                if (!d->process[plane]) {
+                    continue;
+                }
+                auto & st = out_stages.back()[plane];
+                if (auto e = gpu_out_stage_begin(*d->gpu, core, ctx,
+                                                 in.out_info[plane], st.buf);
+                    !e.empty()) {
+                    vsapi->freeFrame(dst);
+                    return fail("staged output: " + e);
+                }
+                st.plane = in.out_info[plane];
+                in.out[plane] = st.buf.buffer;
+            }
         }
         for (int plane = 0; plane < numPlanes; ++plane) {
             if (!d->process[plane]) {
@@ -1458,6 +1492,13 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
     gpu_barrier(*d->gpu, cmd);
     eedi3_qt_stamp(*d, cmd, 4);
     record_pass(*d, cmd, jobs.data(), njobs, PassPhase::kTail);
+    for (auto & job_stages : out_stages) {
+        for (auto & st : job_stages) {
+            if (st.buf.buffer) {
+                gpu_out_stage_commit(*d->gpu, cmd, st.buf, st.plane);
+            }
+        }
+    }
     eedi3_qt_stamp(*d, cmd, 5);
     vsfeel_trace_mark("submit");
     const auto t3 = timing ? now() : std::chrono::steady_clock::time_point {};
@@ -1629,6 +1670,7 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
     std::vector<std::pair<int, VSFrame *>> produced;
     // jobs[sub-pass][frame]: vertical fv0, vertical fv1, horizontal fh0, fh1.
     std::array<std::vector<Eedi3Job>, 4> jobs;
+    std::vector<std::array<Eedi3OutStage, MAX_PLANES>> out_stages;
     std::vector<GpuBuffer> staged;
     bool any_staged = false;
     auto fail = [&](const std::string & message) -> const VSFrame * {
@@ -1903,11 +1945,29 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
         }
         // Output planes (used by the horizontal compose tail).
         if (!fill_out_planes(*d, vsapi, dst, h0.in.out, h0.in.out_stride,
-                             err) ||
+                             h0.in.out_info, err) ||
             !fill_out_planes(*d, vsapi, dst, h1.in.out, h1.in.out_stride,
-                             err)) {
+                             h1.in.out_info, err)) {
             vsapi->freeFrame(dst);
             return fail(err);
+        }
+        out_stages.emplace_back();
+        if (d->ostage) {
+            for (int plane = 0; plane < numPlanes; ++plane) {
+                if (!d->process[plane]) {
+                    continue;
+                }
+                auto & st = out_stages.back()[plane];
+                if (auto e = gpu_out_stage_begin(*d->gpu, core, ctx,
+                                                 h1.in.out_info[plane], st.buf);
+                    !e.empty()) {
+                    vsapi->freeFrame(dst);
+                    return fail("staged output: " + e);
+                }
+                st.plane = h1.in.out_info[plane];
+                h0.in.out[plane] = st.buf.buffer;
+                h1.in.out[plane] = st.buf.buffer;
+            }
         }
 
         jobs[0].push_back(v0);
@@ -1950,6 +2010,13 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
             gpu_barrier(*d->gpu, cmd);
         }
         eedi3_qt_stamp(*d, cmd, stamp);
+    }
+    for (auto & frame_stages : out_stages) {
+        for (auto & st : frame_stages) {
+            if (st.buf.buffer) {
+                gpu_out_stage_commit(*d->gpu, cmd, st.buf, st.plane);
+            }
+        }
     }
     vsfeel_trace_mark("submit");
     const auto t3 = timing ? now() : std::chrono::steady_clock::time_point {};
@@ -2376,6 +2443,11 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
         !std::getenv("VSFEEL_STAGE")) {
         d->stage = false;
     }
+    // The compose tail (EEDI3H, EEDI3AA) wins from a staged write; the vertical
+    // BLIT is flat, so it stays direct unless the env forces it. Both share the
+    // same knob so one A/B can cover the family.
+    d->ostage = env_flag_or("VSFEEL_EEDI3_OSTAGE",
+                            vsfeel_ostage_default(*d->gpu) && (horiz || aa));
 
     {
         // b0 pad, b1 dst, b2 pbt, b3 dmap, b4 bmask, b5 sclip, b6 cint,

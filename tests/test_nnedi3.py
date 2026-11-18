@@ -865,3 +865,15 @@ def test_nnedi3_rejects_dh_over_int32_height():
     clip = vs.core.std.BlankClip(width=1, height=1 << 30, format=vs.GRAY16, length=1)
     with pytest.raises(vs.Error, match="too tall"):
         vs.core.vsfeel.NNEDI3(clip, field=1, dh=True)
+
+
+def test_nnedi3_staged_input_matches_the_in_place_path(clip_gray16, monkeypatch):
+    """The staged source plane is a byte copy, so the output must not move."""
+    params = dict(field=3, nsize=0, nns=4, qual=2)
+    monkeypatch.setenv("VSFEEL_NNEDI3_STAGE", "0")
+    in_place = _run(clip_gray16, **params)
+    monkeypatch.setenv("VSFEEL_NNEDI3_STAGE", "1")
+    staged = _run(clip_gray16, **params)
+    monkeypatch.delenv("VSFEEL_NNEDI3_STAGE", raising=False)
+    for n in (0, 7, 23):
+        assert np.array_equal(_plane(in_place.get_frame(n), 0), _plane(staged.get_frame(n), 0)), n

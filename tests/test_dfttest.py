@@ -1081,3 +1081,14 @@ def test_rejects_non_finite_or_negative_sigma_arrays(clip_grays, kwargs):
     """NaN/negative sigmas or duplicate locations reach sqrt/eval and poison it."""
     with pytest.raises(vs.Error, match="finite|non-negative|distinct"):
         vs.core.vsfeel.DFTTest(clip_grays, tbsize=1, **kwargs)
+
+
+def test_dfttest_staged_input_matches_the_in_place_path(clip_gray16, monkeypatch):
+    """The staged temporal window is a byte copy; output must not move."""
+    monkeypatch.setenv("VSFEEL_DFT_STAGE", "0")
+    in_place = _run(clip_gray16)
+    monkeypatch.setenv("VSFEEL_DFT_STAGE", "1")
+    staged = _run(clip_gray16)
+    monkeypatch.delenv("VSFEEL_DFT_STAGE", raising=False)
+    for n in (0, 7, 23):
+        assert np.array_equal(_plane(in_place.get_frame(n), 0), _plane(staged.get_frame(n), 0)), n
