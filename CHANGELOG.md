@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - BM3D is 7% faster on Blackwell GPUs
 - NLMeans is 5-7% faster across search radii
 - NLMeans is faster on GPUs not in the device cache table
+- NLMeans is up to 40% faster on luma on NVIDIA GPUs
 - EEDI3 and EEDI3AA are up to 45% faster at 2160p, and faster on f32 1080p
 - GaussBlur is up to 6x faster at sigmas between 2 and 10, and about 6% faster at its default
 - Bilateral is 2.1x faster at the largest spatial sigmas
@@ -23,7 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - DFTTest is up to 13% faster at `sosize` 8 and below, and about 2.5% faster at 1080p
 - DFTTest and NLMeans size their working set to the card's cache, so a GPU with less cache no longer streams it
 - EEDI3, EEDI3H, and EEDI3AA use less VRAM for the same output
-- EEDI3 and EEDI3AA are about 10-20% faster on NVIDIA GPUs
+- EEDI3, EEDI3H and EEDI3AA are about 10-20% faster on NVIDIA GPUs
 - WNNM is about 8% faster at `radius=0` and about 2% faster with a temporal search
 - WNNM is faster on float clips on NVIDIA GPUs
 - WNNM uses less VRAM on GPUs with a small VRAM allowance

@@ -706,8 +706,14 @@ def _bm3d_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
 
 def _bilateral_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
     args = f"sigma_spatial={ns.bilateral_sigma_spatial}, sigma_color={ns.bilateral_sigma_color}"
+    # block shape is a vsfeel-only knob; the references do not accept it
+    vsfeel_args = args
+    if getattr(ns, "bilateral_block_x", 0):
+        vsfeel_args += f", block_x={ns.bilateral_block_x}"
+    if getattr(ns, "bilateral_block_y", 0):
+        vsfeel_args += f", block_y={ns.bilateral_block_y}"
     return {
-        "vsfeel": f"core.vsfeel.Bilateral({clip}, {args})",
+        "vsfeel": f"core.vsfeel.Bilateral({clip}, {vsfeel_args})",
         "vszipcl": f"core.vszipcl.Bilateral({clip}, {args})",
         "vszipcu": f"core.vszipcu.Bilateral({clip}, {args})",
     }
@@ -1017,6 +1023,20 @@ FILTERS: dict[str, FilterSpec] = {
         args=[
             Arg("sigma_spatial", "bilateral_sigma_spatial", float, 3.0),
             Arg("sigma_color", "bilateral_sigma_color", float, 0.02),
+            Arg(
+                "block_x",
+                "bilateral_block_x",
+                int,
+                0,
+                "workgroup width (0 = the filter's rule)",
+            ),
+            Arg(
+                "block_y",
+                "bilateral_block_y",
+                int,
+                0,
+                "workgroup height (0 = the filter's rule)",
+            ),
         ],
         build=_bilateral_build,
         # vsfeel's Bilateral runs on the R80 GPU API (vnode:gpu in/out); the

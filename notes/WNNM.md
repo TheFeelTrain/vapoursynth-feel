@@ -12,11 +12,12 @@ last entry, the first defaults to 0), so one plane can search temporally while
 another stays spatial. A **u16 or f16 clip** is accepted natively: a copy kernel
 widens each window plane into a persistent f32 conversion ring and the finish
 kernel narrows the result, so the kernels above never see a 2-byte sample. On
-NVIDIA the window's planes are copied into private device-local memory once per
-frame before the matcher and the estimate read them (see Historical). The
-widening reproduces VapourSynth's `depth` bit for bit (multiply by the range
-gain, then subtract the pre-scaled neutral, in that order) and reads the frame's
-`_Range`, so `WNNM(clip)` and `WNNM(depth(clip, 32))` agree to the last code.
+NVIDIA the window's planes are copied into private device-local memory before
+the matcher and the estimate read them, re-copied only on a slot miss (see
+Historical). The widening reproduces VapourSynth's `depth` bit for bit
+(multiply by the range gain, then subtract the pre-scaled neutral, in that
+order) and reads the frame's `_Range`, so `WNNM(clip)` and
+`WNNM(depth(clip, 32))` agree to the last code.
 
 | config (jpbd 1080p, `sigma=3`, 5 s medians) | vsfeel | vszip |
 |---|---|---|
