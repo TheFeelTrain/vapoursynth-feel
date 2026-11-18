@@ -1093,3 +1093,24 @@ def test_nlmeans_pair_tiles_match_the_scalar_path(clip_yuv420p16, clip_yuv420ph,
                     _plane(scalar.get_frame(n), p), _plane(pair.get_frame(n), p)
                 ), (clip.format.name, n, p)
     monkeypatch.delenv("VSFEEL_NLMEANS_PAIR", raising=False)
+
+
+def test_nlmeans_weight_preload_matches_the_scalar_reload(clip_yuv420p16, clip_rgbs, monkeypatch):
+    """The phase-3 register preload is a reindexing, so output must be exact.
+
+    It is NVIDIA-gated, so this pins the preload path on every GPU.
+    """
+    for clip, params in (
+        (clip_yuv420p16, dict(d=2, channels="UV")),
+        (clip_rgbs, dict(d=2, channels="RGB")),
+    ):
+        monkeypatch.setenv("VSFEEL_NLMEANS_WEIGHT_PRELOAD", "0")
+        scalar = _run(clip, **params)
+        monkeypatch.setenv("VSFEEL_NLMEANS_WEIGHT_PRELOAD", "1")
+        preload = _run(clip, **params)
+        for n in (0, 7, 23):
+            for p in range(clip.format.num_planes):
+                assert np.array_equal(
+                    _plane(scalar.get_frame(n), p), _plane(preload.get_frame(n), p)
+                ), (clip.format.name, n, p)
+    monkeypatch.delenv("VSFEEL_NLMEANS_WEIGHT_PRELOAD", raising=False)

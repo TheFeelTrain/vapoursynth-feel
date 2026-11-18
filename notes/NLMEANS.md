@@ -249,6 +249,19 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
 
 ## Historical
 
+- **2026-11-18 — the vertical box-sum preloads its window in registers
+  (+10.0-10.8% UV, +13.0-13.2% Y, 1080p16 d=2 a=2, RTX 5060 Laptop / GB206).**
+  Phase 3 mapped a thread to strided rows and re-loaded the 9-tap window from
+  `hsum` for every output (54 scalar LDS loads per thread per entry at s=4;
+  -74% on the new mapping, 0% at s=0). Each thread now owns a consecutive run
+  of 6 rows and preloads the 14 `hsum` values once; each output still adds its
+  taps in ascending hsum row, so the result is bit-identical. Same-session
+  ABBA, `--repeat 3`, n=12, knlmvk flat (0.999-1.017x): `channels=UV`
+  387-391 → 428-433 fps, `channels=Y` 115.8 → 130.9-131.1 fps. Gated to NVIDIA:
+  on an RX 7900 XTX the preload measured 1079 vs 1319 fps UV and 263 vs 333 fps
+  Y (same-session ABBA, 1080p16 d=2, 18-21% slower), so RDNA3 keeps the scalar
+  reload; `VSFEEL_NLMEANS_WEIGHT_PRELOAD=1` re-enables it. Both mappings are
+  pinned bit-identical by `test_nlmeans_weight_preload_matches_the_scalar_reload`.
 - **2026-11-18 — the 32 MiB floor planned batch 1 on small-cache parts
   (+15.5% Y, +2.0% UV, 1080p16 d=2).** The "fit the cache" rule has no solution
   at 32 MiB — even batch 1's live set (acc + window + ring) is ~62 MiB — so an
@@ -475,15 +488,15 @@ Flags are `VSFEEL_NLMEANS_<FLAG>`.
 - `VSFEEL_NLMEANS_GPUTRACE=<frame>` — one-shot per-batch GPU timestamps
   (default 100; the value is the first traced frame).
 - `VSFEEL_NLMEANS_PACK=N` — entries per weight+acc round (default: the largest
-  that fits the 96 MiB live-set target; clamped 1..16384, at most the sweep's
-  entry count and the device's Z group-count limit).
+  that fits the round target; clamped 1..16384 and the device's Z limit).
 - `VSFEEL_NLMEANS_VRAM=1` — creation banner with ring, window, `u2`, `u5`, the
   address table, the sweep tables and the cache the round target came from.
 - `VSFEEL_NLMEANS_RING_TARGET=<MiB>` — override the round target (default: the
-  tuned 96 MiB capped by the part's cache and floored at 32).
+  tuned 96 MiB capped by the part's cache; a table miss gets the tuned plan).
 - `VSFEEL_NLMEANS_STAGE=1|0` — stage the window's planes per frame, or read
   them in place (default: NVIDIA; `VSFEEL_STAGE` sets the default for every
   filter).
 - `VSFEEL_NLMEANS_PAIR=1|0` — pack the UV window tiles as 32-bit pairs, or use
   scalar tiles (default: on for 16-bit UV).
+- `VSFEEL_NLMEANS_WEIGHT_PRELOAD=1|0` — preload phase 3's hsum window in registers, or re-load it per output row (default: NVIDIA).
 - `VSFEEL_DEBUG`/`VSFEEL_TRACE` and `RADV_DEBUG=asm|shaderstats` as elsewhere.

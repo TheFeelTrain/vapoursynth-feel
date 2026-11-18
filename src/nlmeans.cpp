@@ -64,9 +64,13 @@ struct NLMeansSpecData {
     // Zero the compose pad stores; see PAD_ZERO in nlmeans.comp for why this is
     // a spec constant rather than a literal.
     float pad_zero;
+    // Phase 3's row mapping: 1 preloads the hsum window in registers, 0
+    // re-loads it per output row. The preload is a measured NVIDIA win and an
+    // RDNA3 loss, so the host picks it (VSFEEL_NLMEANS_WEIGHT_PRELOAD).
+    int32_t weight_preload;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 15> spec_entries { {
+static constexpr std::array<VkSpecializationMapEntry, 16> spec_entries { {
     { 0, 0, sizeof(int32_t) },
     { 1, 4, sizeof(int32_t) },
     { 2, 8, sizeof(int32_t) },
@@ -82,6 +86,7 @@ static constexpr std::array<VkSpecializationMapEntry, 15> spec_entries { {
     { 12, 48, sizeof(float) },
     { 13, 52, sizeof(int32_t) },
     { 14, 56, sizeof(float) },
+    { 15, 60, sizeof(int32_t) },
 } };
 
 // Workgroup tile geometry of the weight kernel (must match nlmeans.comp). A
@@ -171,6 +176,9 @@ struct NLMeansData {
     // Interleaved U/V pair tiles for the chroma path; off with
     // VSFEEL_NLMEANS_PAIR=0.
     bool pair { false };
+    // Phase 3's register-preload mapping; off with
+    // VSFEEL_NLMEANS_WEIGHT_PRELOAD=0 (default: NVIDIA).
+    bool weight_preload { false };
     std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
         ht_total_ns {}, ht_n {};
 
@@ -960,6 +968,10 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
 
     d->stage =
         env_flag_or("VSFEEL_NLMEANS_STAGE", vsfeel_stage_default(*d->gpu));
+    // Phase 3's register preload is a measured NVIDIA win and an RDNA3 loss,
+    // so gate it on the vendor, not the OS.
+    d->weight_preload = env_flag_or("VSFEEL_NLMEANS_WEIGHT_PRELOAD",
+                                    d->gpu->vendor_id == 0x10de);
     // The pair tile packs the two chroma channels into one 32-bit element, so
     // it exists only on the UV path and only for the 16-bit io widths.
     // Measured flat on the RX 7900 XTX (+0.4%, inside the arm spread) and
@@ -1237,7 +1249,8 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
                                  .wref = d->wref_param,
                                  .h2_inv_norm = nlm_norm / denom,
                                  .guide_off = d->guide_off,
-                                 .pad_zero = 0.0f };
+                                 .pad_zero = 0.0f,
+                                 .weight_preload = d->weight_preload ? 1 : 0 };
 
     {
         const auto result = gpu_push_set_layout(*d->gpu, 10);

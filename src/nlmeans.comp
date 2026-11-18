@@ -82,6 +82,10 @@ layout(constant_id = 13) const int GUIDE_OFF = 0;
 // baseline, and spirv-val rejects the module for it. A spec constant stays a
 // 32-bit value, so the store is an OpUConvert instead (as in to_vtype).
 layout(constant_id = 14) const float PAD_ZERO = 0.0;
+// Phase 3's row mapping: 1 preloads the hsum window and gives each thread
+// consecutive rows, 0 re-loads the window per output row (the RDNA3 default;
+// the preload measured 18-22% slower there).
+layout(constant_id = 15) const int WEIGHT_PRELOAD = 1;
 
 #define LAYERS     (2*NLM_D+1)
 #define TILE_ELEMS (PSTRIDE*PH)
@@ -503,26 +507,57 @@ void main() {
         }
     }
     barrier();
-    // 3) vertical box-sum + weight transform, VRT_RESULT output rows per thread.
+    // 3) vertical box-sum + weight transform, VRT_RESULT output rows per
+    // thread. WEIGHT_PRELOAD gives each thread a consecutive run of rows and
+    // preloads the 2S+VRT_RESULT hsum values once (-74% LDS loads per entry at
+    // s=4, neutral at s=0); the scalar reload walks BY-strided rows. Each
+    // output still adds its taps in ascending hsum row, so the result is
+    // bit-identical.
     const int x = gx0 + lx;
     if (x >= VI_DIM_X) return;
-    int y = gy0 + ly, lc = ly;
-    for (int r = 0; r < VRT_RESULT; ++r, y += BY, lc += BY) {
-        if (y >= VI_DIM_Y) return;
-        float sum = 0.0f;
-        for (int i = 0; i <= 2*NLM_S; ++i) sum += hsum[lc + i][lx];
-        const float arg = sum * H2_INV_NORM;
-        float w;
-        if (WMODE == 0) {
-            w = exp(-arg);
-        } else if (WMODE == 1) {
-            w = max(1.0f - arg, 0.0f);            // fdimf(1, arg)
-        } else if (WMODE == 2) {
-            float c = max(1.0f - arg, 0.0f); w = c*c;
-        } else {
-            float c = max(1.0f - arg, 0.0f); c = c*c; c = c*c; w = c*c;
+    if (WEIGHT_PRELOAD != 0) {
+        float hw[2 * NLM_S + VRT_RESULT];
+        const int row0 = ly * VRT_RESULT;
+        for (int j = 0; j < 2 * NLM_S + VRT_RESULT; ++j) {
+            hw[j] = hsum[row0 + j][lx];
         }
-        u4a[slot*U4_LAYER + y*STRIDE + x] = w;
+        int y = gy0 + row0;
+        for (int r = 0; r < VRT_RESULT; ++r, ++y) {
+            if (y >= VI_DIM_Y) return;
+            float sum = 0.0f;
+            for (int i = 0; i <= 2*NLM_S; ++i) sum += hw[r + i];
+            const float arg = sum * H2_INV_NORM;
+            float w;
+            if (WMODE == 0) {
+                w = exp(-arg);
+            } else if (WMODE == 1) {
+                w = max(1.0f - arg, 0.0f);            // fdimf(1, arg)
+            } else if (WMODE == 2) {
+                float c = max(1.0f - arg, 0.0f); w = c*c;
+            } else {
+                float c = max(1.0f - arg, 0.0f); c = c*c; c = c*c; w = c*c;
+            }
+            u4a[slot*U4_LAYER + y*STRIDE + x] = w;
+        }
+    } else {
+        int y = gy0 + ly, lc = ly;
+        for (int r = 0; r < VRT_RESULT; ++r, y += BY, lc += BY) {
+            if (y >= VI_DIM_Y) return;
+            float sum = 0.0f;
+            for (int i = 0; i <= 2*NLM_S; ++i) sum += hsum[lc + i][lx];
+            const float arg = sum * H2_INV_NORM;
+            float w;
+            if (WMODE == 0) {
+                w = exp(-arg);
+            } else if (WMODE == 1) {
+                w = max(1.0f - arg, 0.0f);            // fdimf(1, arg)
+            } else if (WMODE == 2) {
+                float c = max(1.0f - arg, 0.0f); w = c*c;
+            } else {
+                float c = max(1.0f - arg, 0.0f); c = c*c; c = c*c; w = c*c;
+            }
+            u4a[slot*U4_LAYER + y*STRIDE + x] = w;
+        }
     }
 }
 
