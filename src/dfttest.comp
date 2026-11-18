@@ -108,28 +108,45 @@ layout(constant_id = 2) const int ZMEAN = 1;
 // 8..16).
 layout(constant_id = 3) const int BLOCK_STEP = 4;
 
+// Per-entry buffer access. wt/wt2/wt4 are aliased views of one buffer and stay
+// unrestricted; padded/spatial/dst are disjoint. ENTRY_PAD writes the pad, the
+// fused kernel reads it and produces spatial, col2im drains spatial into the
+// output plane.
+#if defined(ENTRY_PAD)
+#define PAD_Q restrict writeonly
+#define SPATIAL_Q restrict readonly
+#define DST_Q restrict writeonly
+#elif defined(ENTRY_COL2IM)
+#define PAD_Q restrict readonly
+#define SPATIAL_Q restrict readonly
+#define DST_Q restrict writeonly
+#else // ENTRY_FUSED
+#define PAD_Q restrict readonly
+#define SPATIAL_Q restrict writeonly
+#define DST_Q restrict writeonly
+#endif
 layout(std430, binding = 0) readonly buffer WtBuf { float wt[]; };
 // Two vector views of the same table buffer: window_freq is read one (re,im)
 // pair at a time and the transposed window one four-float row at a time, so a
 // wide load replaces 2 and 4 scalar ones per bin.
 layout(std430, binding = 5) readonly buffer Wt2Buf { vec2 wt2[]; };
 layout(std430, binding = 6) readonly buffer Wt4Buf { vec4 wt4[]; };
-layout(std430, binding = 2) buffer SpatialBuf { float spatial[]; };
+layout(std430, binding = 2) SPATIAL_Q buffer SpatialBuf { float spatial[]; };
 // The tw temporal source planes the pad kernel reads, as one descriptor array:
 // slice t is src_bufs[t], indexed only with the compile-time slice number the
 // pad kernel's slice unroll produces.
 #if defined(IO_U16)
-layout(std430, binding = 1) buffer PaddedBuf { uint16_t padded16[]; };
-layout(std430, binding = 3) buffer DstBuf { uint16_t dst16[]; };
-layout(std430, binding = 4) readonly buffer SrcBuf { uint16_t src16[]; } src_bufs[TW];
+layout(std430, binding = 1) PAD_Q buffer PaddedBuf { uint16_t padded16[]; };
+layout(std430, binding = 3) DST_Q buffer DstBuf { uint16_t dst16[]; };
+layout(std430, binding = 4) restrict readonly buffer SrcBuf { uint16_t src16[]; } src_bufs[TW];
 #elif defined(IO_F16)
-layout(std430, binding = 1) buffer PaddedBuf { float16_t padded16[]; };
-layout(std430, binding = 3) buffer DstBuf { float16_t dst16[]; };
-layout(std430, binding = 4) readonly buffer SrcBuf { float16_t src16[]; } src_bufs[TW];
+layout(std430, binding = 1) PAD_Q buffer PaddedBuf { float16_t padded16[]; };
+layout(std430, binding = 3) DST_Q buffer DstBuf { float16_t dst16[]; };
+layout(std430, binding = 4) restrict readonly buffer SrcBuf { float16_t src16[]; } src_bufs[TW];
 #else
-layout(std430, binding = 1) buffer PaddedBuf { uint padded_raw[]; };
-layout(std430, binding = 3) buffer DstBuf { uint dst_raw[]; };
-layout(std430, binding = 4) readonly buffer SrcBuf { uint src_raw[]; } src_bufs[TW];
+layout(std430, binding = 1) PAD_Q buffer PaddedBuf { uint padded_raw[]; };
+layout(std430, binding = 3) DST_Q buffer DstBuf { uint dst_raw[]; };
+layout(std430, binding = 4) restrict readonly buffer SrcBuf { uint src_raw[]; } src_bufs[TW];
 #endif
 
 layout(push_constant) uniform PushConstants {
@@ -1351,6 +1368,7 @@ void irdft16(inout float data[TD_SZ], int base) {
 // SCALE), so the fused kernel is IO-type agnostic.
 // ---------------------------------------------------------------------------
 
+#if defined(ENTRY_FUSED)
 // Sample `sample_idx` of temporal slice `t`'s padded plane. u16/f16 store the
 // native sample and scale on load; f32 stores the already-scaled working value,
 // so its pad is exactly one multiply and no second rounding.
@@ -1364,7 +1382,9 @@ float load_fused(int t, int sample_idx) {
     return uintBitsToFloat(padded_raw[t * pc.pad_slice + sample_idx]);
 #endif
 }
+#endif
 
+#if defined(ENTRY_PAD)
 // Sample `sample_idx` of temporal slice `t`'s source frame plane (row stride in
 // elements). t is always the compile-time slice number of the pad kernel's
 // unrolled slice loop, so the descriptor array index folds away.
@@ -1391,7 +1411,9 @@ void store_padded(int t, int sample_idx, float v) {
     padded_raw[t * pc.pad_slice + sample_idx] = floatBitsToUint(v);
 #endif
 }
+#endif
 
+#if defined(ENTRY_COL2IM)
 // col2im writes the output frame plane directly
 void store_sample(int sample_idx, float v) {
 #if defined(IO_U16)
@@ -1406,6 +1428,7 @@ void store_sample(int sample_idx, float v) {
     dst_raw[sample_idx] = floatBitsToUint(v / SCALE);
 #endif
 }
+#endif
 
 
 // ---------------------------------------------------------------------------

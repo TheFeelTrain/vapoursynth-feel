@@ -42,9 +42,9 @@ layout(constant_id = 6) const int HAS_REF = 0;
 
 layout(local_size_x_id = 10, local_size_y_id = 11, local_size_z = 1) in;
 
-layout(std430, binding = 0) readonly buffer SrcBuf { IO_TYPE src[]; };
-layout(std430, binding = 1) writeonly buffer DstBuf { IO_TYPE dst[]; };
-layout(std430, binding = 2) readonly buffer RefBuf { IO_TYPE ref[]; };
+layout(std430, binding = 0) restrict readonly buffer SrcBuf { IO_TYPE src[]; };
+layout(std430, binding = 1) restrict writeonly buffer DstBuf { IO_TYPE dst[]; };
+layout(std430, binding = 2) restrict readonly buffer RefBuf { IO_TYPE ref[]; };
 
 float load_src(int idx) {
 #if defined(IO_F32)

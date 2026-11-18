@@ -276,6 +276,9 @@ struct GPUWNNM {
     bool skip_solve {}; // ablation: the estimate without its eigen dispatch
     bool skip_apply {}; // ablation: the estimate without its scatter
     bool host_timing {};
+    // Frame-path debug prints, read once at creation (a getenv per frame is
+    // not acceptable on a hot path); mirrors host_timing.
+    bool debug {};
     // Read the window's planes from private device-local copies (see
     // gpu_stage_plane); off with VSFEEL_WNNM_STAGE=0.
     bool stage { true };
@@ -761,7 +764,7 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
                     todo[p].push_back(i);
                 }
             }
-            if (vsfeel_debug_flag_alias("VSFEEL_WNNM_DEBUG", "VSFEEL_WNNM")) {
+            if (d->debug) {
                 fprintf(
                     stderr, "[wnnm] n=%d p=%d cached %d of %d folds, todo:", n,
                     p, dpl.folds - static_cast<int>(todo[p].size()), dpl.folds);
@@ -1019,8 +1022,7 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     }
     // A 2-byte window's clamped positions collapse to one conversion each; the
     // count is the dedup's only observable.
-    if (d->elem_bytes == 2 &&
-        vsfeel_debug_flag_alias("VSFEEL_WNNM_DEBUG", "VSFEEL_WNNM")) {
+    if (d->elem_bytes == 2 && d->debug) {
         fprintf(stderr, "[wnnm] n=%d: %zu conversions\n", n, copies.size());
     }
     // The table may land in the host-visible VRAM BAR, whose mapping is
@@ -1526,6 +1528,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     auto d { std::make_unique<GPUWNNM>() };
 
     d->host_timing = vsfeel_debug_probe("VSFEEL_WNNM_TIMING");
+    d->debug = vsfeel_debug_flag_alias("VSFEEL_WNNM_DEBUG", "VSFEEL_WNNM");
     d->skip_group = env_flag("VSFEEL_WNNM_SKIPGROUP");
     d->skip_match = env_flag("VSFEEL_WNNM_SKIPMATCH");
     d->skip_gram = env_flag("VSFEEL_WNNM_NOGRAM");

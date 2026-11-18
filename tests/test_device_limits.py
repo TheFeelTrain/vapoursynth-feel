@@ -401,11 +401,11 @@ def test_eedi3aa_batch_scales_with_its_own_scratch():
     AA's four sub-passes make its 2160p scratch 1.5x the vertical filter's, so at
     the same geometry and cap it must plan fewer frames. A plan that reused
     EEDI3's numbers would land on the same count here, which is the regression
-    the old untested AA branch allowed. The cap is pinned because the live
-    allowance moves with memory pressure and can round both plans to the same
-    batch.
+    the old untested AA branch allowed. The cap is pinned with the scratch knob
+    because the live allowance moves with memory pressure and can round both
+    plans to the same batch.
     """
-    fixed = {"VSFEEL_LIMIT_VRAM_BUDGET": str(10 << 30)}
+    fixed = {"VSFEEL_EEDI3_SCRATCH_MB": "300"}
     e_cap, e_scratch, e_batch, _ = _eedi3_batch(_trace("eedi3_4k", fixed))
     a_cap, a_scratch, a_batch, _ = _eedi3_batch(_trace("eedi3aa_4k", fixed))
     assert a_scratch > e_scratch, (a_scratch, e_scratch)
