@@ -118,6 +118,23 @@ layout(std430, binding = 7) buffer WeightBuf { float u4a[]; };
 layout(std430, binding = 8) buffer AccBuf { float u2[]; };
 layout(std430, binding = 9) buffer MaxBuf { float u5[]; };
 
+// Two pixels per thread (PAIR_X2): the scalar bindings stay for the arbitrary
+// parity reads, and paired views alias the same bindings for aligned pairs.
+#if defined(PAIR_X2)
+layout(std430, binding = 7) readonly buffer WeightBufV { vec2 u4a2[]; };
+layout(std430, binding = 8) buffer AccBufV { vec2 u2v[]; };
+layout(std430, binding = 9) buffer MaxBufV { vec2 u5v[]; };
+#if defined(IO_F32)
+layout(std430, binding = 2) writeonly buffer Dst0V { vec2 d0v[]; };
+layout(std430, binding = 3) writeonly buffer Dst1V { vec2 d1v[]; };
+layout(std430, binding = 4) writeonly buffer Dst2V { vec2 d2v[]; };
+#else
+layout(std430, binding = 2) writeonly buffer Dst0V { uint d0v[]; };
+layout(std430, binding = 3) writeonly buffer Dst1V { uint d1v[]; };
+layout(std430, binding = 4) writeonly buffer Dst2V { uint d2v[]; };
+#endif
+#endif
+
 layout(push_constant) uniform PushConstants {
     int pc0;
     int pc1;
@@ -574,6 +591,7 @@ float load_src(int base, int idx) { return load_src_pair(base, idx).x; }
 float load_src(int base, int idx) { return load_u1(base + idx); }
 #endif
 
+#if !defined(PAIR_X2)
 void main() {
     const int x = int(gl_GlobalInvocationID.x);
     const int y = int(gl_GlobalInvocationID.y);
@@ -695,5 +713,273 @@ void main() {
     }
     u5[g] = u5v;
 }
+#endif
 
+// Two pixels per thread (PAIR_X2): the scalar bindings stay for the arbitrary
+// parity view; pair views alias the same bindings for aligned pairs.
+#if defined(PAIR_X2)
+// Pack two 16-bit outputs into one dword, same rounding as to_vtype.
+// Pack two u16 outputs into one dword, same rounding as to_vtype (f16 uses
+// scalar to_vtype stores above).
+uint pack_v2(float v0, float v1) {
+    // Step 1: convert_ushort_sat_rte(v * 65535), RNE, then narrow.
+    return uint(uint(clamp(roundEven(v0 * PEAK), 0.0f, PEAK))) |
+           (uint(uint(clamp(roundEven(v1 * PEAK), 0.0f, PEAK))) << 16);
+}
+float mirror_w(int sm, int ym, int xm) {
+    return (xm < 0 || xm >= VI_DIM_X || ym < 0 || ym >= VI_DIM_Y)
+               ? 0.0f
+               : u4a[sm*U4_LAYER + ym*STRIDE + xm];
+}
+void main() {
+    const int x = 2 * int(gl_GlobalInvocationID.x);
+    const int y = int(gl_GlobalInvocationID.y);
+    if (x >= VI_DIM_X || y >= VI_DIM_Y) return;
+    const int g = y*STRIDE + x; // even; VI_DIM_X and STRIDE are even here
+    const int cx = x+PAD, cy = y+PAD;
+    const int gpad = cy*PSTRIDE + cx;
+    const int q_base = pc.pc0, nb = pc.pc1;
+    const bool first = pc.pc2 != 0;
+    const int s0 = NLM_D*TILE_ELEMS;
+    const int s1 = (LAYERS + NLM_D)*TILE_ELEMS;
+    const int s2 = (2*LAYERS + NLM_D)*TILE_ELEMS;
+
+    vec2 u5vv;
+    if (first) {
+        u5vv = vec2(1.1920929e-7f);
+    } else {
+        u5vv = u5v[g >> 1];
+    }
+
+    if (NLM_CHANNELS == 1) {
+        vec2 a, b;
+        if (first) {
+            a = vec2(0.0f);
+            b = vec2(0.0f);
+        } else {
+            a = u2v[g];
+            b = u2v[g + 1];
+        }
+        for (int bIdx = 0; bIdx < nb; ++bIdx) {
+            const int r = (q_base + bIdx) * 8;
+            const int qx = aq[r+0], qy = aq[r+1], qz = aq[r+2];
+            const int sc = aq[r+3], sm = aq[r+4];
+            const vec2 sc4 = u4a2[(sc*U4_LAYER + g) >> 1];
+            const int xm0 = x-qx, xm1 = xm0+1, ym = y-qy;
+            const float u4_mq0 = mirror_w(sm, ym, xm0);
+            const float u4_mq1 = mirror_w(sm, ym, xm1);
+            u5vv.x = max(sc4.x, max(u4_mq0, u5vv.x));
+            u5vv.y = max(sc4.y, max(u4_mq1, u5vv.y));
+            const int qps = qy*PSTRIDE + qx;
+            const int q0 = (NLM_D+qz)*TILE_ELEMS, q1 = (NLM_D-qz)*TILE_ELEMS;
+            const float pq0 = load_src(q0, gpad + qps);
+            const float mq0 = load_src(q1, gpad - qps);
+            const float pq1 = load_src(q0, gpad + qps + 1);
+            const float mq1 = load_src(q1, gpad - qps + 1);
+            a.x += (sc4.x*pq0) + (u4_mq0*mq0);
+            a.y += (sc4.x + u4_mq0);
+            b.x += (sc4.y*pq1) + (u4_mq1*mq1);
+            b.y += (sc4.y + u4_mq1);
+        }
+        if (pc.pc3 != 0) {
+            const float m0 = WREF * u5vv.x, m1 = WREF * u5vv.y;
+#if defined(IO_F32)
+            d0v[g >> 1] = vec2(finish_sample(load_src(s0, gpad), m0, a.x, a.y),
+                               finish_sample(load_src(s0, gpad+1), m1, b.x, b.y));
+#elif defined(IO_F16)
+            d0[g] = to_vtype(finish_sample(load_src(s0, gpad), m0, a.x, a.y));
+            d0[g + 1] =
+                to_vtype(finish_sample(load_src(s0, gpad+1), m1, b.x, b.y));
+#else
+            d0v[g >> 1] = pack_v2(finish_sample(load_src(s0, gpad), m0, a.x, a.y),
+                                  finish_sample(load_src(s0, gpad+1), m1, b.x, b.y));
+#endif
+        } else {
+            u2v[g] = a;
+            u2v[g + 1] = b;
+        }
+    } else if (NLM_CHANNELS == 2) {
+        vec2 a, b, c;
+        if (first) {
+            a = vec2(0.0f);
+            b = vec2(0.0f);
+            c = vec2(0.0f);
+        } else {
+            a = u2v[(3*g) >> 1];       // floats 3g, 3g+1: acc0/acc1 p0
+            b = u2v[((3*g) >> 1) + 1]; // 3g+2, 3g+3: accw p0, acc0 p1
+            c = u2v[((3*g) >> 1) + 2]; // 3g+4, 3g+5: acc1/accw p1
+        }
+        for (int bIdx = 0; bIdx < nb; ++bIdx) {
+            const int r = (q_base + bIdx) * 8;
+            const int qx = aq[r+0], qy = aq[r+1], qz = aq[r+2];
+            const int sc = aq[r+3], sm = aq[r+4];
+            const vec2 sc4 = u4a2[(sc*U4_LAYER + g) >> 1];
+            const int xm0 = x-qx, xm1 = xm0+1, ym = y-qy;
+            const float u4_mq0 = mirror_w(sm, ym, xm0);
+            const float u4_mq1 = mirror_w(sm, ym, xm1);
+            u5vv.x = max(sc4.x, max(u4_mq0, u5vv.x));
+            u5vv.y = max(sc4.y, max(u4_mq1, u5vv.y));
+            const int qps = qy*PSTRIDE + qx;
+#if defined(PAIR_UINT)
+            const vec2 pqA = load_src_pair((NLM_D+qz)*TILE_ELEMS, gpad + qps);
+            const vec2 mqA = load_src_pair((NLM_D-qz)*TILE_ELEMS, gpad - qps);
+            const vec2 pqB = load_src_pair((NLM_D+qz)*TILE_ELEMS, gpad + qps + 1);
+            const vec2 mqB = load_src_pair((NLM_D-qz)*TILE_ELEMS, gpad - qps + 1);
+            a.x += (sc4.x*pqA.x) + (u4_mq0*mqA.x);
+            a.y += (sc4.x*pqA.y) + (u4_mq0*mqA.y);
+            b.y += (sc4.y*pqB.x) + (u4_mq1*mqB.x);
+            c.x += (sc4.y*pqB.y) + (u4_mq1*mqB.y);
+#else
+            const float pq0 = load_src((NLM_D+qz)*TILE_ELEMS, gpad + qps);
+            const float mq0 = load_src((NLM_D-qz)*TILE_ELEMS, gpad - qps);
+            const float pq1 = load_src((LAYERS+NLM_D+qz)*TILE_ELEMS, gpad + qps);
+            const float mq1 = load_src((LAYERS+NLM_D-qz)*TILE_ELEMS, gpad - qps);
+            const float pq2 = load_src((NLM_D+qz)*TILE_ELEMS, gpad + qps + 1);
+            const float mq2 = load_src((NLM_D-qz)*TILE_ELEMS, gpad - qps + 1);
+            const float pq3 = load_src((LAYERS+NLM_D+qz)*TILE_ELEMS, gpad + qps + 1);
+            const float mq3 = load_src((LAYERS+NLM_D-qz)*TILE_ELEMS, gpad - qps + 1);
+            a.x += (sc4.x*pq0) + (u4_mq0*mq0);
+            a.y += (sc4.x*pq1) + (u4_mq0*mq1);
+            b.y += (sc4.y*pq2) + (u4_mq1*mq2);
+            c.x += (sc4.y*pq3) + (u4_mq1*mq3);
+#endif
+            b.x += (sc4.x + u4_mq0);
+            c.y += (sc4.y + u4_mq1);
+        }
+        if (pc.pc3 != 0) {
+            const float m0 = WREF * u5vv.x, m1 = WREF * u5vv.y;
+#if defined(PAIR_UINT)
+            const vec2 cA = load_src_pair(s0, gpad);
+            const vec2 cB = load_src_pair(s0, gpad + 1);
+#else
+            const float c00 = load_src(s0, gpad), c01 = load_src(s0, gpad + 1);
+            const float c10 = load_src(s1, gpad), c11 = load_src(s1, gpad + 1);
+#endif
+#if defined(IO_F32)
+#if defined(PAIR_UINT)
+            d0v[g >> 1] = vec2(finish_sample(cA.x, m0, a.x, b.x),
+                               finish_sample(cB.x, m1, b.y, c.y));
+            d1v[g >> 1] = vec2(finish_sample(cA.y, m0, a.y, b.x),
+                               finish_sample(cB.y, m1, c.x, c.y));
+#else
+            d0v[g >> 1] = vec2(finish_sample(c00, m0, a.x, b.x),
+                               finish_sample(c01, m1, b.y, c.y));
+            d1v[g >> 1] = vec2(finish_sample(c10, m0, a.y, b.x),
+                               finish_sample(c11, m1, c.x, c.y));
+#endif
+#elif defined(IO_F16)
+#if defined(PAIR_UINT)
+            d0[g] = to_vtype(finish_sample(cA.x, m0, a.x, b.x));
+            d0[g + 1] = to_vtype(finish_sample(cB.x, m1, b.y, c.y));
+            d1[g] = to_vtype(finish_sample(cA.y, m0, a.y, b.x));
+            d1[g + 1] = to_vtype(finish_sample(cB.y, m1, c.x, c.y));
+#else
+            d0[g] = to_vtype(finish_sample(c00, m0, a.x, b.x));
+            d0[g + 1] = to_vtype(finish_sample(c01, m1, b.y, c.y));
+            d1[g] = to_vtype(finish_sample(c10, m0, a.y, b.x));
+            d1[g + 1] = to_vtype(finish_sample(c11, m1, c.x, c.y));
+#endif
+#else
+#if defined(PAIR_UINT)
+            d0v[g >> 1] = pack_v2(finish_sample(cA.x, m0, a.x, b.x),
+                                  finish_sample(cB.x, m1, b.y, c.y));
+            d1v[g >> 1] = pack_v2(finish_sample(cA.y, m0, a.y, b.x),
+                                  finish_sample(cB.y, m1, c.x, c.y));
+#else
+            d0v[g >> 1] = pack_v2(finish_sample(c00, m0, a.x, b.x),
+                                  finish_sample(c01, m1, b.y, c.y));
+            d1v[g >> 1] = pack_v2(finish_sample(c10, m0, a.y, b.x),
+                                  finish_sample(c11, m1, c.x, c.y));
+#endif
+#endif
+        } else {
+            u2v[(3*g) >> 1] = a;
+            u2v[((3*g) >> 1) + 1] = b;
+            u2v[((3*g) >> 1) + 2] = c;
+        }
+    } else {
+        vec2 a, b, c, d;
+        if (first) {
+            a = vec2(0.0f);
+            b = vec2(0.0f);
+            c = vec2(0.0f);
+            d = vec2(0.0f);
+        } else {
+            a = u2v[2*g]; // floats 4g, 4g+1: acc0/acc1 p0
+            b = u2v[2*g+1]; // 4g+2, 4g+3: acc2/accw p0
+            c = u2v[2*g+2]; // 4g+4, 4g+5: acc0/acc1 p1
+            d = u2v[2*g+3]; // 4g+6, 4g+7: acc2/accw p1
+        }
+        for (int bIdx = 0; bIdx < nb; ++bIdx) {
+            const int r = (q_base + bIdx) * 8;
+            const int qx = aq[r+0], qy = aq[r+1], qz = aq[r+2];
+            const int sc = aq[r+3], sm = aq[r+4];
+            const vec2 sc4 = u4a2[(sc*U4_LAYER + g) >> 1];
+            const int xm0 = x-qx, xm1 = xm0+1, ym = y-qy;
+            const float u4_mq0 = mirror_w(sm, ym, xm0);
+            const float u4_mq1 = mirror_w(sm, ym, xm1);
+            u5vv.x = max(sc4.x, max(u4_mq0, u5vv.x));
+            u5vv.y = max(sc4.y, max(u4_mq1, u5vv.y));
+            const int qps = qy*PSTRIDE + qx;
+            const int q0 = (NLM_D+qz)*TILE_ELEMS, q1 = (NLM_D-qz)*TILE_ELEMS;
+            const int q2 = (LAYERS+NLM_D+qz)*TILE_ELEMS, q3 = (LAYERS+NLM_D-qz)*TILE_ELEMS;
+            const int q4 = (2*LAYERS+NLM_D+qz)*TILE_ELEMS, q5 = (2*LAYERS+NLM_D-qz)*TILE_ELEMS;
+            const float pq0 = load_src(q0, gpad + qps);
+            const float mq0 = load_src(q1, gpad - qps);
+            const float pq1 = load_src(q2, gpad + qps);
+            const float mq1 = load_src(q3, gpad - qps);
+            const float pq2 = load_src(q4, gpad + qps);
+            const float mq2 = load_src(q5, gpad - qps);
+            const float pq3 = load_src(q0, gpad + qps + 1);
+            const float mq3 = load_src(q1, gpad - qps + 1);
+            const float pq4 = load_src(q2, gpad + qps + 1);
+            const float mq4 = load_src(q3, gpad - qps + 1);
+            const float pq5 = load_src(q4, gpad + qps + 1);
+            const float mq5 = load_src(q5, gpad - qps + 1);
+            a.x += (sc4.x*pq0) + (u4_mq0*mq0);
+            a.y += (sc4.x*pq1) + (u4_mq0*mq1);
+            b.x += (sc4.x*pq2) + (u4_mq0*mq2);
+            c.x += (sc4.y*pq3) + (u4_mq1*mq3);
+            c.y += (sc4.y*pq4) + (u4_mq1*mq4);
+            d.x += (sc4.y*pq5) + (u4_mq1*mq5);
+            b.y += (sc4.x + u4_mq0);
+            d.y += (sc4.y + u4_mq1);
+        }
+        if (pc.pc3 != 0) {
+            const float m0 = WREF * u5vv.x, m1 = WREF * u5vv.y;
+            const float c00 = load_src(s0, gpad), c01 = load_src(s0, gpad + 1);
+            const float c10 = load_src(s1, gpad), c11 = load_src(s1, gpad + 1);
+            const float c20 = load_src(s2, gpad), c21 = load_src(s2, gpad + 1);
+#if defined(IO_F32)
+            d0v[g >> 1] = vec2(finish_sample(c00, m0, a.x, b.y),
+                               finish_sample(c01, m1, c.x, d.y));
+            d1v[g >> 1] = vec2(finish_sample(c10, m0, a.y, b.y),
+                               finish_sample(c11, m1, c.y, d.y));
+            d2v[g >> 1] = vec2(finish_sample(c20, m0, b.x, b.y),
+                               finish_sample(c21, m1, d.x, d.y));
+#elif defined(IO_F16)
+            d0[g] = to_vtype(finish_sample(c00, m0, a.x, b.y));
+            d0[g + 1] = to_vtype(finish_sample(c01, m1, c.x, d.y));
+            d1[g] = to_vtype(finish_sample(c10, m0, a.y, b.y));
+            d1[g + 1] = to_vtype(finish_sample(c11, m1, c.y, d.y));
+            d2[g] = to_vtype(finish_sample(c20, m0, b.x, b.y));
+            d2[g + 1] = to_vtype(finish_sample(c21, m1, d.x, d.y));
+#else
+            d0v[g >> 1] = pack_v2(finish_sample(c00, m0, a.x, b.y),
+                                  finish_sample(c01, m1, c.x, d.y));
+            d1v[g >> 1] = pack_v2(finish_sample(c10, m0, a.y, b.y),
+                                  finish_sample(c11, m1, c.y, d.y));
+            d2v[g >> 1] = pack_v2(finish_sample(c20, m0, b.x, b.y),
+                                  finish_sample(c21, m1, d.x, d.y));
+#endif
+        } else {
+            u2v[2*g] = vec2(a.x, a.y);
+            u2v[2*g+1] = vec2(b.x, b.y);
+            u2v[2*g+2] = vec2(c.x, c.y);
+            u2v[2*g+3] = vec2(d.x, d.y);
+        }
+    }
+    u5v[g >> 1] = u5vv;
+}
+#endif
 #endif /* ENTRY_ACC */

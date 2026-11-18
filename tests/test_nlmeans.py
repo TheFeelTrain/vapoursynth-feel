@@ -1114,3 +1114,29 @@ def test_nlmeans_weight_preload_matches_the_scalar_reload(clip_yuv420p16, clip_r
                     _plane(scalar.get_frame(n), p), _plane(preload.get_frame(n), p)
                 ), (clip.format.name, n, p)
     monkeypatch.delenv("VSFEEL_NLMEANS_WEIGHT_PRELOAD", raising=False)
+
+
+def test_nlmeans_two_thread_path_matches_the_scalar_path(
+    clip_yuv420p16, clip_yuv420ph, clip_rgbs, monkeypatch
+):
+    """The pair-of-pixels accumulation is a reindexing only, so output is exact.
+
+    Covers u16 luma (scalar window, one channel), u16 UV (packed window), f16 UV
+    (the narrowed store) and f32 RGB (scalar window, 3-channel).
+    """
+    for clip, params in (
+        (clip_yuv420p16, dict(d=2, channels="Y")),
+        (clip_yuv420p16, dict(d=2, channels="UV")),
+        (clip_yuv420ph, dict(d=2, channels="UV")),
+        (clip_rgbs, dict(d=2, channels="RGB")),
+    ):
+        monkeypatch.setenv("VSFEEL_NLMEANS_PAIR_X2", "0")
+        scalar = _run(clip, **params)
+        monkeypatch.setenv("VSFEEL_NLMEANS_PAIR_X2", "1")
+        pair = _run(clip, **params)
+        for n in (0, 7, 23):
+            for p in range(clip.format.num_planes):
+                assert np.array_equal(
+                    _plane(scalar.get_frame(n), p), _plane(pair.get_frame(n), p)
+                ), (clip.format.name, n, p)
+    monkeypatch.delenv("VSFEEL_NLMEANS_PAIR_X2", raising=False)

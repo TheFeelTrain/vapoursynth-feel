@@ -176,6 +176,7 @@ struct NLMeansData {
     // Interleaved U/V pair tiles for the chroma path; off with
     // VSFEEL_NLMEANS_PAIR=0.
     bool pair { false };
+    bool pair_x2 { false }; // two pixels per thread in the accumulation kernel
     // Phase 3's register-preload mapping; off with
     // VSFEEL_NLMEANS_WEIGHT_PRELOAD=0 (default: NVIDIA).
     bool weight_preload { false };
@@ -558,6 +559,9 @@ static const VSFrame * nlmeans_gpu_frame(NLMeansData * d, int n,
     }
 
     const uint32_t gx = static_cast<uint32_t>((d->width + BLK_X - 1) / BLK_X);
+    // The two-pixel accumulation kernel halves the x extent of its dispatch.
+    const uint32_t gx_acc = static_cast<uint32_t>(
+        ((d->pair_x2 ? d->width / 2 : d->width) + BLK_X - 1) / BLK_X);
     const uint32_t gy_w = static_cast<uint32_t>(
         (d->height + VRT_RESULT * BLK_Y - 1) / (VRT_RESULT * BLK_Y));
     const uint32_t gy = static_cast<uint32_t>((d->height + BLK_Y - 1) / BLK_Y);
@@ -606,7 +610,7 @@ static const VSFrame * nlmeans_gpu_frame(NLMeansData * d, int n,
                                           d->acc_pipeline);
             gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, a_push,
                                sizeof(a_push));
-            d->gpu->vk->vkCmdDispatch(cmd, gx, gy, 1);
+            d->gpu->vk->vkCmdDispatch(cmd, gx_acc, gy, 1);
         }
         gpu_barrier(*d->gpu, cmd);
         if (gputrace && ts_used < NLMEANS_TS_MAX) {
@@ -989,6 +993,11 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
     }
     d->stride = plane_stride[d->plane0];
     d->npix = static_cast<int64_t>(d->stride) * d->height;
+    // The pair kernel owns both pixels of a pair in one thread and reads
+    // vec2/vec4-aligned spans, so the lattice, plane pitch and u4a layer
+    // stride must be even (the latter is npix, also the sc-load alignment).
+    d->pair_x2 = d->width % 2 == 0 && d->stride % 2 == 0 && d->npix % 2 == 0 &&
+                 env_flag_or("VSFEEL_NLMEANS_PAIR_X2", true);
     // UV processes plane 1; the label must name the plane actually checked.
     const std::string plane_what = "plane " + std::to_string(d->plane0);
     if (auto e = vsfeel_plane_range_error(static_cast<VkDeviceSize>(d->stride),
@@ -1341,43 +1350,51 @@ static void VS_CC NLMeansCreate(const VSMap * in, VSMap * out,
         const uint32_t * weight_code = nullptr;
         const uint32_t * acc_code = nullptr;
         size_t compose_size = 0, weight_size = 0, acc_size = 0;
+        const bool px2 = d->pair_x2;
         if (d->bits == 16) {
             if (d->half && d->pair) {
                 compose_code = nlmeans_f16_pair_compose_spv;
                 compose_size = nlmeans_f16_pair_compose_spv_size;
                 weight_code = nlmeans_f16_pair_weight_spv;
                 weight_size = nlmeans_f16_pair_weight_spv_size;
-                acc_code = nlmeans_f16_pair_acc_spv;
-                acc_size = nlmeans_f16_pair_acc_spv_size;
+                acc_code = px2 ? nlmeans_f16_pair_px2_acc_spv
+                               : nlmeans_f16_pair_acc_spv;
+                acc_size = px2 ? nlmeans_f16_pair_px2_acc_spv_size
+                               : nlmeans_f16_pair_acc_spv_size;
             } else if (d->half) {
                 compose_code = nlmeans_f16_compose_spv;
                 compose_size = nlmeans_f16_compose_spv_size;
                 weight_code = nlmeans_f16_weight_spv;
                 weight_size = nlmeans_f16_weight_spv_size;
-                acc_code = nlmeans_f16_acc_spv;
-                acc_size = nlmeans_f16_acc_spv_size;
+                acc_code = px2 ? nlmeans_f16_px2_acc_spv : nlmeans_f16_acc_spv;
+                acc_size = px2 ? nlmeans_f16_px2_acc_spv_size
+                               : nlmeans_f16_acc_spv_size;
             } else if (d->pair) {
                 compose_code = nlmeans_u16_pair_compose_spv;
                 compose_size = nlmeans_u16_pair_compose_spv_size;
                 weight_code = nlmeans_u16_pair_weight_spv;
                 weight_size = nlmeans_u16_pair_weight_spv_size;
-                acc_code = nlmeans_u16_pair_acc_spv;
-                acc_size = nlmeans_u16_pair_acc_spv_size;
+                acc_code = px2 ? nlmeans_u16_pair_px2_acc_spv
+                               : nlmeans_u16_pair_acc_spv;
+                acc_size = px2 ? nlmeans_u16_pair_px2_acc_spv_size
+                               : nlmeans_u16_pair_acc_spv_size;
             } else {
                 compose_code = nlmeans_u16_compose_spv;
                 compose_size = nlmeans_u16_compose_spv_size;
                 weight_code = nlmeans_u16_weight_spv;
                 weight_size = nlmeans_u16_weight_spv_size;
-                acc_code = nlmeans_u16_acc_spv;
-                acc_size = nlmeans_u16_acc_spv_size;
+                acc_code = px2 ? nlmeans_u16_px2_acc_spv : nlmeans_u16_acc_spv;
+                acc_size = px2 ? nlmeans_u16_px2_acc_spv_size
+                               : nlmeans_u16_acc_spv_size;
             }
         } else {
             compose_code = nlmeans_f32_compose_spv;
             compose_size = nlmeans_f32_compose_spv_size;
             weight_code = nlmeans_f32_weight_spv;
             weight_size = nlmeans_f32_weight_spv_size;
-            acc_code = nlmeans_f32_acc_spv;
-            acc_size = nlmeans_f32_acc_spv_size;
+            acc_code = px2 ? nlmeans_f32_px2_acc_spv : nlmeans_f32_acc_spv;
+            acc_size =
+                px2 ? nlmeans_f32_px2_acc_spv_size : nlmeans_f32_acc_spv_size;
         }
         {
             const auto result =

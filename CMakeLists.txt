@@ -346,6 +346,11 @@ foreach(io IN LISTS VK_NLM_IO_TYPES)
         list(GET VK_NLM_ENTRY_DEFS ${entry_i} entry_def)
         list(APPEND VK_NLM_VARIANTS
             "nlmeans_${io}_${entry}|nlmeans.comp|-DIO_${io_define} ${entry_def}")
+        # Two-pixels-per-thread accumulation kernel (ENTRY_ACC only).
+        if(entry STREQUAL "acc")
+            list(APPEND VK_NLM_VARIANTS
+                "nlmeans_${io}_px2_acc|nlmeans.comp|-DIO_${io_define} ${entry_def} -DPAIR_X2")
+        endif()
     endforeach()
 endforeach()
 # Interleaved UV pair tiles: 16-bit io only (see src/nlmeans.comp NLM_PAIR).
@@ -356,6 +361,10 @@ foreach(io IN ITEMS u16 f16)
         list(GET VK_NLM_ENTRY_DEFS ${entry_i} entry_def)
         list(APPEND VK_NLM_VARIANTS
             "nlmeans_${io}_pair_${entry}|nlmeans.comp|-DIO_${io_define} -DNLM_PAIR ${entry_def}")
+        if(entry STREQUAL "acc")
+            list(APPEND VK_NLM_VARIANTS
+                "nlmeans_${io}_pair_px2_acc|nlmeans.comp|-DIO_${io_define} -DNLM_PAIR ${entry_def} -DPAIR_X2")
+        endif()
     endforeach()
 endforeach()
 

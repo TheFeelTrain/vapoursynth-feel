@@ -249,6 +249,18 @@ also in `tests/test_geometry.py`'s cropped-width matrix and in
 
 ## Historical
 
+- **2026-11-18 — the accumulation kernel runs two pixels per thread
+  (+5.5% UV, +7.9% Y, 1080p16 d=2 a=2, RTX 5060 Laptop / GB206).** `ENTRY_ACC`
+  gained a paired form (x = 2*id): aligned vec2 weight loads, vector u2/u5
+  accesses, packed dword stores of the u16 output, unchanged tap order/rounding.
+  Host-gated on an even lattice, even pitch and even u4a layer stride;
+  `VSFEEL_NLMEANS_PAIR_X2=0` restores the scalar kernel for one release.
+  Bit-identity of both kernels on identical inputs is pinned by
+  `tests/test_nlmeans.py::test_nlmeans_two_thread_path_matches_the_scalar_path`.
+  ABBA `--repeat 3`, n=12: UV 428.5 → 452.2 fps, Y 131.1 → 141.4 fps
+  (knlmvk flat at 228.2/77.2). On an RX 7900 XTX it is +4.1% UV and +2.7% Y
+  (same-session ABBA, 1080p16 d=2), and +4.1% on f16 UV, so it is not
+  NVIDIA-specific.
 - **2026-11-18 — the vertical box-sum preloads its window in registers
   (+10.0-10.8% UV, +13.0-13.2% Y, 1080p16 d=2 a=2, RTX 5060 Laptop / GB206).**
   Phase 3 mapped a thread to strided rows and re-loaded the 9-tap window from
@@ -491,12 +503,12 @@ Flags are `VSFEEL_NLMEANS_<FLAG>`.
   that fits the round target; clamped 1..16384 and the device's Z limit).
 - `VSFEEL_NLMEANS_VRAM=1` — creation banner with ring, window, `u2`, `u5`, the
   address table, the sweep tables and the cache the round target came from.
-- `VSFEEL_NLMEANS_RING_TARGET=<MiB>` — override the round target (default: the
-  tuned 96 MiB capped by the part's cache; a table miss gets the tuned plan).
+- `VSFEEL_NLMEANS_RING_TARGET=<MiB>` — override the round target (default: the tuned 96 MiB, capped by the cache table; a table miss gets the tuned plan).
 - `VSFEEL_NLMEANS_STAGE=1|0` — stage the window's planes per frame, or read
   them in place (default: NVIDIA; `VSFEEL_STAGE` sets the default for every
   filter).
 - `VSFEEL_NLMEANS_PAIR=1|0` — pack the UV window tiles as 32-bit pairs, or use
   scalar tiles (default: on for 16-bit UV).
+- `VSFEEL_NLMEANS_PAIR_X2=1|0` — two pixels per accumulation thread, or the scalar kernel (default: on where the lattice, pitch and u4a layer stride are even).
 - `VSFEEL_NLMEANS_WEIGHT_PRELOAD=1|0` — preload phase 3's hsum window in registers, or re-load it per output row (default: NVIDIA).
 - `VSFEEL_DEBUG`/`VSFEEL_TRACE` and `RADV_DEBUG=asm|shaderstats` as elsewhere.
