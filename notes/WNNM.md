@@ -275,6 +275,20 @@ staying a bit-exact copy and the request orders on both.
 
 ## Historical
 
+- **2026-11-18 — the f32 window lands in a persistent slot ring too
+  (+18.6% r=1, +25.7% r=2, f32 1080p, RTX 5060 Laptop / GB206).** The
+  2-byte path's slot ring was extended to f32: each window's planes live in a
+  frame-slot-indexed device-local ring (tagged per slot, written only on a
+  miss, the same per-frame queue barrier and post-submit tag publish), so a
+  frame that shares window layers with the previous re-copies nothing.
+  Byte-verbatim copies (no widening kernel), ordered by a COPY->COMPUTE
+  barrier. Same-session ABBA, `--filter wnnm --format f32 --gpu-cache-mb 4096
+  --cache-frames 400`: r=1 **218.2 -> 258.7 fps**, r=2 **157.3 -> 197.6 fps**.
+  Output unchanged; 129 wnnm tests passed. The ring follows the f32 staging
+  default, so it is NVIDIA-only in practice; `VSFEEL_WNNM_STAGECACHE=0`
+  restores the per-frame staging. With staging forced on, an RX 7900 XTX
+  measured +0.8% r=1 and +3.2% r=2 (same-session ABBA, f32 1080p), so the ring
+  itself is not NVIDIA-specific.
 - **2026-11-16 - the window's planes are staged per frame (+469%, f32 YUV420).**
   The float path hands kernels the source planes' device addresses and the
   matcher and the estimate read them several times per frame, so those reads were
@@ -609,6 +623,7 @@ staying a bit-exact copy and the request orders on both.
   frame (the fallback path, and the A/B arm for the cache).
 - `VSFEEL_WNNM_STAGE=1|0` - stage the window's planes per frame, or read them
   in place (default: NVIDIA; `VSFEEL_STAGE` sets the default for every filter).
+- `VSFEEL_WNNM_STAGECACHE=1|0` - re-copy only window slots that fell out of the ring, or re-stage every plane per frame (default: on where staging is on).
 - `VSFEEL_WNNM_NORING=1` - forces the match-ring allocation to fail, so the
   per-frame fallback runs through the same teardown as a real out-of-memory.
 - `VSFEEL_WNNM_GROUP_WG=32|64` - force the group/matcher workgroup width instead

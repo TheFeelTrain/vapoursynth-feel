@@ -25,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - EEDI3, EEDI3H, and EEDI3AA use less VRAM for the same output
 - EEDI3 and EEDI3AA are about 10-20% faster on NVIDIA GPUs
 - WNNM is about 8% faster at `radius=0` and about 2% faster with a temporal search
+- WNNM is faster on float clips on NVIDIA GPUs
 - WNNM uses less VRAM on GPUs with a small VRAM allowance
 - BM3D uses less VRAM before its first seek
 - BM3D matches the reference's color handling: the matrix comes from the clip's resolution and RGB input is filtered in the opponent space

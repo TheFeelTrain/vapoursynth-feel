@@ -279,6 +279,10 @@ struct GPUWNNM {
     // Read the window's planes from private device-local copies (see
     // gpu_stage_plane); off with VSFEEL_WNNM_STAGE=0.
     bool stage { true };
+    // The f32 window's planes land in a persistent slot ring, re-copied only
+    // for frames not already resident; VSFEEL_WNNM_STAGECACHE=0 forces the
+    // per-frame staging this replaces.
+    bool stage_ring {};
     bool gpu_trace {}; // VSFEEL_WNNM_GPUTRACE=<frame>
 
     ~GPUWNNM() {
@@ -460,7 +464,7 @@ struct WnnmPush {
 // buffer, the ring slot, and the frame the slot will hold.
 struct WnnmCopy {
     VkBuffer src {};
-    uint32_t dst_off {};
+    VkDeviceSize dst_off {}; // element offset into the ring
     uint32_t count {};
     uint32_t grid_x {};
     uint32_t grid_y {};
@@ -721,8 +725,10 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     // the lock from here to the submit is what makes record order the
     // submission order the ring needs; without it a later frame can enqueue
     // its copy before the frame whose slot it overwrites.
+    const bool f32_ring = d->stage_ring;
+    const bool src_ring_active = d->elem_bytes == 2 || f32_ring;
     std::unique_lock<std::mutex> submit_guard(d->cache_lock, std::defer_lock);
-    if (d->cache || d->elem_bytes == 2) {
+    if (d->cache || src_ring_active) {
         submit_guard.lock();
     }
     // Folds this frame has to search, per plane: a cached centre is one an
@@ -837,8 +843,9 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     // copies are queued here (the tags only move after a successful submit).
     std::vector<WnnmCopy> copies;
     const int src_set = d->ref_node ? 1 : 0;
+    // ring_base feeds the table for both ring paths.
     const VkDeviceAddress ring_base =
-        d->elem_bytes == 2 ? plane_address(*d->gpu, d->src_ring.buffer) : 0;
+        src_ring_active ? plane_address(*d->gpu, d->src_ring.buffer) : 0;
     const auto queue_copy = [&](int set, int p, int f,
                                 const VSFrame * src_frame) {
         const int slot = f % d->src_slots;
@@ -863,14 +870,48 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
             d->vi->format, p, wnnm_full_range(src_frame, d->vi->format, vsapi));
         WnnmCopy c {};
         c.src = sp.buffer;
-        c.dst_off = static_cast<uint32_t>(d->src_off[set][p] +
-                                          VkDeviceSize(slot) *
-                                              VkDeviceSize(d->plane[p].npix));
+        c.dst_off = d->src_off[set][p] +
+                    VkDeviceSize(slot) * VkDeviceSize(d->plane[p].npix);
         c.count = static_cast<uint32_t>(d->plane[p].npix);
         c.grid_x = d->src_grid_x[p];
         c.grid_y = d->src_grid_y[p];
         c.scale = r.gain;
         c.bias = r.offset * r.gain; // the copy subtracts the pre-scaled offset
+        c.set = set;
+        c.plane = p;
+        c.slot = slot;
+        c.frame = f;
+        copies.push_back(c);
+        return true;
+    };
+    // The f32 path's ring holds verbatim float copies (no widening kernel):
+    // same slot map and tag discipline, one plain copy per miss.
+    const auto queue_copy_f32 = [&](int set, int p, int f,
+                                    const VSFrame * src_frame) {
+        const int slot = f % d->src_slots;
+        const size_t tag =
+            (size_t(set) * 3 + size_t(p)) * size_t(d->src_slots) + size_t(slot);
+        if (d->src_tag[tag] == f) {
+            return true;
+        }
+        for (const WnnmCopy & q : copies) {
+            if (q.set == set && q.plane == p && q.frame == f) {
+                return true;
+            }
+        }
+        VSVulkanPlaneInfo sp {};
+        if (d->gpu->api->getGPUPlane(src_frame, p, &sp)) {
+            return false;
+        }
+        WnnmCopy c {};
+        c.src = sp.buffer;
+        c.dst_off = d->src_off[set][p] +
+                    VkDeviceSize(slot) * VkDeviceSize(d->plane[p].npix);
+        c.count = static_cast<uint32_t>(d->plane[p].npix);
+        c.grid_x = 0;
+        c.grid_y = 0;
+        c.scale = 1.0f;
+        c.bias = 0.0f;
         c.set = set;
         c.plane = p;
         c.slot = slot;
@@ -894,6 +935,26 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
         for (int l = 0; l < dpl.wl; ++l) {
             const int f = std::clamp(pfirst + l, 0, nf - 1);
             const int gi = f - first;
+            if (f32_ring) {
+                const VkDeviceSize slot =
+                    VkDeviceSize(f % d->src_slots) * VkDeviceSize(dpl.npix);
+                const VkDeviceAddress at =
+                    ring_base + (d->src_off[src_set][p] + slot) * 4;
+                table[base + l] = at;
+                table[base + dpl.wl + l] = at;
+                if (d->ref_node) {
+                    table[base + l] = ring_base + (d->src_off[0][p] + slot) * 4;
+                    if (!queue_copy_f32(0, p, f, rframes[gi])) {
+                        return fail("reference plane " + std::to_string(p) +
+                                    " is not GPU resident");
+                    }
+                }
+                if (!queue_copy_f32(src_set, p, f, frames[gi])) {
+                    return fail("source plane " + std::to_string(p) +
+                                " is not GPU resident");
+                }
+                continue;
+            }
             if (d->elem_bytes == 2) {
                 const VkDeviceSize slot =
                     VkDeviceSize(f % d->src_slots) * VkDeviceSize(dpl.npix);
@@ -991,48 +1052,72 @@ static const VSFrame * wnnm_frame(GPUWNNM * d, int n, VSFrameContext * frameCtx,
     // The cache's records and a 2-byte source ring slot are both read across
     // frames: a later frame may overwrite either while an earlier submission
     // still reads it, so this frame starts behind everything already queued.
-    if (d->cache || d->elem_bytes == 2) {
+    if (d->cache || src_ring_active) {
         record_queue_barrier(*d->gpu, cmd);
     }
     record_acc_clear(*d->gpu, cmd, acc_buf.buffer, d->acc_bytes);
 
-    // Widen the window's 2-byte planes into the ring. The matcher and the
-    // estimate read these slots, so they start behind the barrier below.
+    // Widen the window's 2-byte planes into the ring; the f32 path copies its
+    // window planes verbatim into its own slots. The matcher and the estimate
+    // read these slots, so they start behind the barrier below.
     if (!copies.empty()) {
-        // Stage every source plane first, then one copy->compute barrier, then
-        // the widening dispatches: the dispatches read the staged copies.
-        std::vector<GpuBuffer> staged(copies.size());
-        if (d->stage) {
+        if (d->elem_bytes == 4) {
+            // Plain byte copies into the slots; the dst offset is an element
+            // offset into the f32 ring, times 4 for bytes.
+            for (const WnnmCopy & c : copies) {
+                VkBufferCopy2 region {};
+                region.sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2;
+                region.srcOffset = 0;
+                region.dstOffset = c.dst_off * 4;
+                region.size = static_cast<VkDeviceSize>(c.count) * 4;
+                VkCopyBufferInfo2 info {};
+                info.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2;
+                info.srcBuffer = c.src;
+                info.dstBuffer = d->src_ring.buffer;
+                info.regionCount = 1;
+                info.pRegions = &region;
+                d->gpu->vk->vkCmdCopyBuffer2(cmd, &info);
+            }
+            // The slots were written by the copy engine; the compute kernels
+            // that read them need a COPY->COMPUTE barrier, not a compute one.
+            gpu_stage_barrier(*d->gpu, cmd);
+        } else {
+            // Stage every source plane first, then one copy->compute barrier,
+            // then the widening dispatches: the dispatches read the staged copies.
+            std::vector<GpuBuffer> staged(copies.size());
+            if (d->stage) {
+                for (size_t i = 0; i < copies.size(); ++i) {
+                    const WnnmCopy & c = copies[i];
+                    if (auto e = gpu_stage_range(
+                            *d->gpu, core, ctx, cmd, c.src,
+                            VkDeviceSize(c.count) * VkDeviceSize(d->elem_bytes),
+                            staged[i]);
+                        !e.empty()) {
+                        return fail("staged source: " + e);
+                    }
+                }
+                gpu_stage_barrier(*d->gpu, cmd);
+            }
             for (size_t i = 0; i < copies.size(); ++i) {
                 const WnnmCopy & c = copies[i];
-                if (auto e = gpu_stage_range(*d->gpu, core, ctx, cmd, c.src,
-                                             VkDeviceSize(c.count) *
-                                                 VkDeviceSize(d->elem_bytes),
-                                             staged[i]);
-                    !e.empty()) {
-                    return fail("staged source: " + e);
-                }
+                const VkBuffer copy_src = d->stage ? staged[i].buffer : c.src;
+                const VkBuffer bufs[2] { copy_src, d->src_ring.buffer };
+                gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, bufs, 2);
+                d->gpu->vk->vkCmdBindPipeline(
+                    cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->copy_pipe);
+                struct {
+                    uint32_t off;
+                    uint32_t count;
+                    float scale;
+                    float bias;
+                } push { static_cast<uint32_t>(c.dst_off), c.count, c.scale,
+                         c.bias };
+                gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &push,
+                                   sizeof(push));
+                d->gpu->vk->vkCmdDispatch(cmd, c.grid_x, c.grid_y, 1);
             }
-            gpu_stage_barrier(*d->gpu, cmd);
+            gpu_barrier(*d->gpu, cmd);
         }
-        for (size_t i = 0; i < copies.size(); ++i) {
-            const WnnmCopy & c = copies[i];
-            const VkBuffer copy_src = d->stage ? staged[i].buffer : c.src;
-            const VkBuffer bufs[2] { copy_src, d->src_ring.buffer };
-            gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, bufs, 2);
-            d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                          d->copy_pipe);
-            struct {
-                uint32_t off;
-                uint32_t count;
-                float scale;
-                float bias;
-            } push { c.dst_off, c.count, c.scale, c.bias };
-            gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, &push,
-                               sizeof(push));
-            d->gpu->vk->vkCmdDispatch(cmd, c.grid_x, c.grid_y, 1);
-        }
-        gpu_barrier(*d->gpu, cmd);
     }
 
     vsfeel_trace_mark("dispatch");
@@ -1637,6 +1722,8 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     d->gpu = std::get<std::shared_ptr<GPUDevice>>(dev_result);
 
     d->stage = env_flag_or("VSFEEL_WNNM_STAGE", vsfeel_stage_default(*d->gpu));
+    d->stage_ring = d->elem_bytes == 4 && d->stage &&
+                    env_flag_or("VSFEEL_WNNM_STAGECACHE", true);
 
     const int qmax = d->q <= 8 ? 8 : (d->q <= 16 ? 16 : 32);
     // The split estimate runs any radius; only a group too wide for its
@@ -1930,7 +2017,7 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
     // can be reused while an earlier frame's kernels still read it, which the
     // per-frame queue barrier (WNNMGetFrame) orders. The ring is sized before
     // anything is allocated so an addressing overflow costs no memory.
-    if (d->elem_bytes == 2) {
+    if (d->elem_bytes == 2 || d->stage_ring) {
         const int layers = 4 * d->max_radius + 1;
         d->src_slots = layers + 1;
         d->src_sets = d->ref_node ? 2 : 1;
@@ -1942,17 +2029,22 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
                     continue;
                 }
                 d->src_off[st][p] = elems;
-                // The copy kernel takes a slot's first element as a 32-bit
-                // offset; its region runs to the next plane's first slot.
-                const VkDeviceSize end =
-                    elems + VkDeviceSize(d->src_slots) * VkDeviceSize(pl.npix);
-                if (end > VkDeviceSize(UINT32_MAX) + 1) {
-                    return set_error(
-                        "the 16 bit conversion ring's plane " +
-                        std::to_string(p) + " region ends at element " +
-                        std::to_string(end) +
-                        ", past the copy kernel's 32-bit addressing; use a "
-                        "float clip or a smaller radius");
+                // The 16-bit copy kernel takes a slot's first element as a
+                // 32-bit offset; its region runs to the next plane's first
+                // slot. The f32 path copies bytes directly and has no such
+                // limit.
+                if (d->elem_bytes == 2) {
+                    const VkDeviceSize end =
+                        elems +
+                        VkDeviceSize(d->src_slots) * VkDeviceSize(pl.npix);
+                    if (end > VkDeviceSize(UINT32_MAX) + 1) {
+                        return set_error(
+                            "the 16 bit conversion ring's plane " +
+                            std::to_string(p) + " region ends at element " +
+                            std::to_string(end) +
+                            ", past the copy kernel's 32-bit addressing; use a "
+                            "float clip or a smaller radius");
+                    }
                 }
                 elems += VkDeviceSize(d->src_slots) * VkDeviceSize(pl.npix);
             }
@@ -2089,24 +2181,28 @@ static void VS_CC WNNMCreate(const VSMap * in, VSMap * out,
         }
     }
 
-    // Allocate the 16-bit conversion ring sized above and fold its copy grids.
-    if (d->elem_bytes == 2) {
+    // Allocate the persistent slot rings sized above.
+    if (d->elem_bytes == 2 || d->stage_ring) {
         const VkDeviceSize limit = vsfeel_vram_limit(*d->gpu, core);
         if (limit > 0 && d->src_ring_bytes > int64_t(limit / 4)) {
             return set_error(
-                "the 16 bit conversion ring (" +
+                (d->elem_bytes == 2 ? "the 16 bit conversion ring ("
+                                    : "the source slot ring (") +
                 std::to_string(d->src_ring_bytes >> 20) +
-                " MiB) exceeds a quarter of the VRAM allowance; use a float "
-                "clip or a smaller radius");
+                " MiB) exceeds a quarter of the VRAM allowance; use a "
+                "smaller radius");
         }
         // The kernels read the ring through the address table, so the buffer
-        // needs a device address as well as storage use.
+        // needs a device address; the f32 path also copies into it verbatim.
         if (auto e = gpu_make_buffer(
                 *d->gpu, core, VkDeviceSize(d->src_ring_bytes), d->src_ring,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
-                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                    (d->elem_bytes == 4 ? VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                                        : 0));
             !e.empty()) {
-            return set_error("conversion ring: " + e);
+            return set_error(d->elem_bytes == 2 ? "conversion ring: "
+                                                : "source slot ring: " + e);
         }
         d->src_tag.assign(size_t(d->src_sets) * 3 * size_t(d->src_slots),
                           INT_MIN);
