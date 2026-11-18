@@ -165,9 +165,6 @@ copies this filter removes.
 
 ## Open work
 
-- **Staged input is a measured loss** (-9.45% on an RTX 5060): the read is
-  coalesced and single-pass, so the copy is pure overhead. `VSFEEL_BOX_STAGE=1`
-  is the arm to re-check on another device.
 - `width == src.width` and `height == src.height` still runs the horizontal
   dispatch; `skip_vert` drops only the vertical pass (`src/box.cpp:579`). A
   no-op path could copy instead; it is not on any current route.
@@ -189,6 +186,16 @@ copies this filter removes.
 - Do not chase the f16 half-step residue at ratios 3/2.5/3.5/5 with a host
   reciprocal: mechanism under Historical. Ratios 6 and 8 are resize2's own f16
   tap blocking and are not ours to match.
+
+### Do not retry
+
+- **Staged input.** On an RTX 5060 a private copy measured **-9.45%** (4358 ->
+  3946 fps, ABBA n=20): Box reads coalesced and single-pass, so the copy is
+  pure overhead.
+- **Staged output.** **-2% on an RTX 5060**: the stores are already coalesced,
+  so the bulk copy is added work.
+- **Block 16 or 64.** Block 16 measured **0.43x on an RTX 5060**; the default
+  already picks 64 where it fits, and 16 leaves too few lanes per row.
 
 ## Debug env vars
 

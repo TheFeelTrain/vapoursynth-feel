@@ -637,6 +637,7 @@ Chronological; each entry keeps the mechanism, not the story.
 
 ### Do not retry
 
+- **Workgroups 64/128/256**: -0.8 to -1.5% on an RTX 5060, 32 stays.
 - **A half-precision or otherwise narrowed *processing* mode.** The filter is not
   bandwidth-bound (1080p r=2: `gpu_busy_percent` 100, `mem_busy_percent` ~35)
   and its compute is depth-independent: u16 is 979.4 against f32's 956.5 fps

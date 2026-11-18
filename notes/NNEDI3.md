@@ -412,8 +412,6 @@ upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
 
 ## Open work
 
-- **Per-tap clamp peel** measured +1% (bit-exact, no variant growth), below
-  this box's noise floor; the shader is unchanged.
 - **Prescreen vs reference ~2.8x claim is pre-port** (40 µs gap on old
   stamps): re-measure against nnedi3vk's kernels on the current binary before
   quoting it.
@@ -433,6 +431,14 @@ upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
   accuracy test** — the input rounding is amplified by the window
   normalization (~2.8e-2 on the noise clip, 10x the arithmetic's own error).
   Widen the f32 clip from the half one instead (`tests/test_nnedi3.py`).
+
+### Do not retry
+
+- **Dense `pscrn=0` predictor.** On an RTX 5060 51 fps against ~413 for the
+  sparse list: the predictor is at its weight-stream floor, and ~9x fewer
+  predicted pixels is where its speed comes from, not codegen.
+- **The clamp peel.** +1% bit-exact on an RTX 5060 over two sessions, below
+  the noise floor; the shader is unchanged.
 
 ## Debug env vars
 

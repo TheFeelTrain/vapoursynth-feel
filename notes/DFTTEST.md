@@ -439,19 +439,11 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   is read with stride 9, so a `[x][t][y]` transpose would make each thread's 144
   reads contiguous and take the same vec4 treatment the window got. Not the
   default path, hence not done with it.
-- **64 MiB is past the GB206 knee.** An `L2_TARGET` sweep on the RTX 5060 read
-  16 ≈ 32 MiB and 64 MiB -12.1%, so the 32 MiB default stands for a 32 MiB part.
 - **The stripe floor.** 6 dispatches and 6 barriers per plane stand between the
   32 MB-ring ceiling (+29%) and the shipped +18.5%; a column-direction stripe
   would fit 2 stripes at 1080p (72 MB ring) if the reindexing is worth ~2-3%.
   The budget now follows the part's cache (see Historical), so a device with a
   different last level trades stripes for it without a rebuild.
-- **The whole-memory barrier is not the cost.** No-op'ing it measured +9.8% on
-  an RTX 5060, but that ablation also removes the ordering between passes. A
-  correct per-buffer narrowing measured 1.005x (428.5 vs 430.8 fps), so the
-  fence is worth ~0.5% and the patch was dropped as surface without a gain.
-- **Output staging is not a win here** (0.93x): `col2im`'s stores are already
-  coalesced, so the bulk copy is pure added work (see `notes/BILATERAL.md`).
 - `pad`/`col2im` are 32x8 (256 invocations, one of the plugin's largest
   workgroups), which Vulkan 1.4 guarantees: `maxComputeWorkGroupInvocations` is
   256 for a 1.4 device, the 128 in core Vulkan's limit table included. Neither
@@ -460,6 +452,28 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
 ### Do not retry
 
+- **One stripe over the whole plane.** 11 dispatches become 3, but one stripe
+  needs the whole 63 MiB block plane at 1080p and spills; measured **-21%**
+  on an RTX 5060 (149.7 vs 189.8 fps). The 32 MiB ring keeps the handoff in L2.
+- **Output staging** on an RTX 5060: 0.93x; `col2im`'s stores are already
+  coalesced, so the bulk copy is pure added work.
+- **Per-buffer barriers.** A correct narrowing on an RTX 5060 measured 1.005x
+  (428.5 vs 430.8 fps); the +9.8% no-barrier ablation removed the dependency,
+  not the fence, so 0.5% does not pay for the surface.
+- **A bandwidth rewrite of the pad kernel.** On an RTX 5060 the pad's in-place
+  source read was the cost, not its index math: a second identical full dispatch
+  measured 32 us against the first interval's 3.2 ms, and a filter-owned buffer
+  took the same kernel to 33 us.
+- **`L2_TARGET=64 MiB` on a 32 MiB part.** On an RTX 5060 16 MiB ≈ 32 MiB and
+  64 MiB measured **-12.1%**; the 32 MiB floor is the default.
+- **Per-frame allocation zero-fill.** `createGPUBuffer` suballocates same-size
+  requests from a free list; the 1941 us 1x1 dispatch on an RTX 5060 was the
+  submission's first interval, not an allocation.
+- **A fixed per-dispatch cost.** On an RTX 5060 Box (0.25 ms/frame, 6
+  dispatches) bounds any such constant at <=42 us; the col2im ablation also
+  deleted ~155 MB of traffic, so dispatch count is secondary.
+- **An LLC table row for the RTX 5060 (GB206).** Its L2 is 32 MiB, the same as
+  the floor, so the missing row already resolves to the right budget.
 - **Half arithmetic in the fused kernel.** 5.6% slower and less accurate, for
   the VALU/VOPD mechanism in Performance; half pays only as a storage width.
 - **In-filter download alternatives.** A second *compute-family* queue for the

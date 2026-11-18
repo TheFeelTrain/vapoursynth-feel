@@ -396,6 +396,8 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
 
 ### Do not retry
 
+- **Output staging.** 1.00x on an RTX 5060: the `finish` stores are already
+  coalesced, so the bulk copy is pure added work.
 - **A 64-wide weight tile.** The weight pass runs 32 columns per workgroup and
   the halo plus the row sums are its measured floor, so a 64-wide tile looked
   like the last unswept dimension: its per-output cells fall from 2.625 to
@@ -446,8 +448,6 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   descriptors), which RADV reports at the minimum of 32. The ring target is
   capped by the core's VRAM limit, so a device with a smaller allowance plans a
   smaller round.
-- **Output staging is neutral here** (1.00x): the finish stores are coalesced,
-  so the bulk copy is pure added work (see `notes/BILATERAL.md`).
 - **`a=64, d=16` hard-recovers the GPU when the device is shared** — a
   co-scheduled weight sweep is the trigger, not an OOB or a timeout. Do not run
   it beside another GPU client; `-n 8 --dist loadfile` keeps it serial per file.

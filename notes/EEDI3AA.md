@@ -445,6 +445,8 @@ under-reported every stage 10x).
 
 ### Do not retry
 
+- **A commit between the two horizontal sub-passes** publishes h0's unwritten
+  plane (h0 stores to the o0 scratch); commit once, after h1.
 - **Row-kernel / `pbt` levers on the AA workload** (SGSIZE 64 / K=1, `pbt`
   packing): measured dead. Attribution and the live item are in
   `notes/EEDI3.md` (Performance / Open work).

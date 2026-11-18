@@ -376,6 +376,8 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
 - Do not re-introduce a host transfer path to win the CPU-sink row — that
   is exactly what the port deletes, and it is what loses the resident chain
   (pre-R80: 1408 resident fps vs 2239).
+- **The fused path at sigma=16.** 0.55x on an RTX 5060 against the split path:
+  the fused halo grows with radius, and the threshold rule below covers it.
 - Do not raise `LARGE_THRESHOLD` above the measured 4. The fused path's halo
   grows as `(64+2R)/64` and its global traffic with it: radius 4 is 15% slower
   than two-pass, radius 5 33%, radius 15 6.2x, and radius 47 7x (Historical).

@@ -557,23 +557,19 @@ passes). All bit-identical to the previous build unless stated.
   the lever is the `K=2` direction state. (Spec constants *can* size arrays here —
   `notes/NLMEANS.md` ships it.) ACO raises VGPRs for load ILP deliberately: a
   lower count with new spills or schedule damage is a regression.
-- **hp's row cost**: three structural items ride on the doubled window work —
-  the pbt column is 81 bytes at full TPITCH (hp's ±2 deltas would fit 3 bits),
-  K = 3 keeps 69 ring registers live per lane, and hpfill is its own phase.
+- **hp's row cost**: an 81-byte pbt column (±2 deltas would fit 3 bits), 69
+  ring registers per lane at K=3, and hpfill's own phase.
 - **Kill the ring shift register** (PROBE=15: 12.0% of the kernel, ~8% of
-  EEDI3AA). Needs a circular ring read from a rotating base, so the column loop
-  must be unrolled by RN with the base compile-time per copy (a runtime index
-  spills). The base then advances on every column, so `roll_seed` must write all
-  RN slots at the current phase — a rotation of its write indices.
-- **The three-window redundancy** (PROBE=14: 8.2%) needs a 2|u|-deep delay line
-  per direction: ~90 registers at K=2 vs the 96 in use today, so only reachable if
-  something else gives up registers first.
+  EEDI3AA): a circular ring needs the column loop unrolled by RN with a
+  compile-time base, and `roll_seed` must rotate its write indices.
+- **The three-window redundancy** (PROBE=14: 8.2%) needs a 2|u|-deep delay line;
+  ~90 registers at K=2 vs 96 today, so only if something else gives up first.
 - **EEDI3H/EEDI3AA output staging** ships on NVIDIA (+43%/+24%); the vertical
   BLIT is flat and stays direct. `VSFEEL_EEDI3_OSTAGE` overrides the default.
 - `ENTRY_PAD`/`VCOPY`/`BLIT` div/mod by `pad_stride`/`WIDTH`: a 2D dispatch
   removes them (per-plane passes, not the row kernel).
-- **f16's remaining levers**: half `dst`/`cint`/`vout` (loses f32 parity) and
-  packed `f16vec2` cost windows (loses argmins) — both the non-limiter side.
+- **f16's remaining levers**: half `dst`/`cint`/`vout` and packed `f16vec2`
+  cost windows both lose exactness; the non-limiter side.
 - **Fuse the vcheck across planes** (one launch, `gl_WorkGroupID.y = plane`, as
   vszipcl does) — YUV-only, cannot move the Gray flagship, real for color AA.
 - **The graded vertical number is a transfer budget** (~50 MB/frame across PCIe;
@@ -586,6 +582,10 @@ passes). All bit-identical to the previous build unless stated.
 
 *(stale)*: verdict from the degenerate pre-round-14 config; mechanism kept.
 
+- **Vertical output staging** measured +0.02% on an RTX 5060: the BLIT's
+  stores are already coalesced, so only the compose tails stage.
+- **`VSFEEL_EEDI3_VPARA=1`** is +11% on an RTX 5060 but gives up the exact
+  Jacobi chain; the spec default 6 is the accuracy-and-speed choice.
 - **SGSIZE 64 / K=1.** +2% on EEDI3AA only, neutral on EEDI3; not shipped (a
   second row module plus device-limit handling for ~2% on one workload), and
   the kernel is issue-bound anyway (round 29).

@@ -382,9 +382,6 @@ SDMA and the port reaches parity without any core change.
 
 ## Open work
 
-- **Weight factorization** (`A(cy)·B(k)·C(range)`) measured -4.9%: the two
-  MUFUs per tap cost more than the saved integer chain; an LDS B table is the
-  only remaining form.
 - The kernel is at ~372 µs/frame against a ~211 µs `exp2` floor, so the lever
   left is hiding the ALU/LDS behind the SFU, not shortening the weight math. The
   two-column kernel's shape was swept at R=9 only (32x8 still wins there); the
@@ -411,6 +408,11 @@ SDMA and the port reaches parity without any core change.
   building. An ablation that replaced the tile reads with constants gave 4.0x
   at R=9, but that also folds the whole weight chain into immediates, so it
   prices the tile *and* its dependent arithmetic, not the conflicts.
+- **Factoring the weight into `A(cy)·B(k)·C(range)`.** It replaces one
+  `exp2(space·SS + range·SC)` with two MUFUs per tap (a row factor and a tap
+  factor); measured **-4.9%** on an RTX 5060 (u16 1080p, 737.2 vs 701.1 fps,
+  ABBA n=20), and f32 broke the 1e-6 bound before the split was limited to
+  u16/f16. The integer chain it saves is cheaper than the second MUFU.
 - **Hoisting the spatial term out of the tap loop.** `(cy*cy + k2)*ss` cannot be
   split by the compiler (it is not exact), and splitting it by hand measured
   -1.3% at R=9 and +1.3% at R=24 while moving the output by 1.8e-7; the extra
