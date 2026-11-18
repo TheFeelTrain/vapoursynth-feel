@@ -361,6 +361,11 @@ Pre-R80 rounds, superseded by the port but kept for their mechanisms:
 
 ### Do not retry
 
+- **A two-column vertical pass (`VERT_PAIR`).** The vertical pass is only ~49 µs
+  of a ~471 µs frame on an RTX 5060 (GPUTRACE), and repeated runs put the
+  end-to-end delta at +0.5%, -1.0% and +0.5%: it overlaps other work and never
+  reaches the wall clock. Do not retry without a profile showing the pass as a
+  larger share.
 - **A half `tmp`** (25% slower end to end, mechanism under Performance) — the
   f32 scratch is both faster and bit-exact.
 - **Half arithmetic** (mechanism under Performance): ACO emits scalar

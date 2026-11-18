@@ -337,14 +337,13 @@ Lessons from porting DFTTest and NLMeans that go beyond the method above:
   per candidate): it changes how much work happens without changing the
   branches, and it localized BM3D's cost.
 - **Keep `notes/<filter>.md` updated immediately** after every finding,
-  including dead ends, so nothing is re-derived or retried later. The notes
-  are **tracked** and the first thing a new contributor reads; findings belong
-  there, not only in a code comment. **Read `notes/AGENTS.md` first and
-  follow it** — it is the authority on the notes (shape, style, the line budgets
-  `tools/notes_check.py` enforces), so none of that is repeated here. Keep
-  entries short regardless: conclusion first, a number only with its config, one
-  line for a correctness-only change, mechanism not story. **Worked examples
-  live in `notes/EEDI3.md`'s `Pre-round 14 — the benchmark's mask was broken`
-  and `Rounds 5–13 — pre-port host path`** (SIMD dilation, ReBAR upload,
-  boundary-input oracle, harness-memory bimodality, measured non-wins) — read
-  them before a new filter; none is EEDI3-specific.
+  including dead ends, so nothing is re-derived or retried later; the notes are
+  tracked and **read `notes/AGENTS.md` first** (shape, style, budgets). Keep
+  entries short: conclusion first, a number only with its config, one line for
+  a correctness-only change, mechanism not story. Worked examples:
+  `notes/EEDI3.md`'s pre-round-14 and rounds-5–13 sections.
+
+### Do not retry
+
+- **Recycling staged buffers in a ring.** Flat except for -2.5% on DFTTest
+  (RTX 5060, ABBA n=12), so the allocation is not the staging cost.

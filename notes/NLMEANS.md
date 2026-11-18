@@ -447,11 +447,9 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   LDS-resident union tiles): neutral; the warm weight kernel is ALU/LDS/barrier
   bound, not load bound.
 - **A narrower weight ring does not pay: unorm16 measured +2%.** A weight is
-  already in [0,1], so 16-bit fixed point has a clean ≤0.5 LSB bound and the
-  round it funds doubles the batch (luma batch 3 → 6, chroma 19 → 39). It
-  measured 330 vs 322 fps on luma and 1160 vs 1221 on chroma (400-frame screen):
-  the accumulation is bound per entry-pixel, not by ring bytes, so halving the
-  ring's width is not worth its accuracy cost. f32 stays.
+  already in [0,1] with a clean ≤0.5 LSB bound, and the round it funds doubles
+  the batch (luma 3 → 6, chroma 19 → 39), but accumulation is bound per
+  entry-pixel, not by ring bytes. The accuracy cost is not worth it; f32 stays.
 - **A bigger round than the cache allows loses.** Past the 96 MiB live set the
   accumulation re-reads the round's ring from DRAM: luma batch 5/6/8 measured
   272/263/247 fps against 293 at 3-4 (400-frame screen). The old note's
@@ -459,8 +457,12 @@ The pre-R80 design and every round that shaped it, kept for the mechanisms:
   10-binding push-descriptor layout is bounded by `maxPushDescriptors` (checked
   at layout creation; the per-stage pool limits do not apply to push
   descriptors), which RADV reports at the minimum of 32. The ring target is
-  capped by the core's VRAM limit, so a device with a smaller allowance plans a
-  smaller round.
+  capped by the core's VRAM limit, so a smaller allowance plans a smaller round.
+  On an RTX 5060, raising the unknown-part fallback from 96 to
+  128/160/192/224 MiB measured 119.9/123.4/124.8/125.1 luma fps against 116.5
+  at 96, inside the spread; it stays 96 without a cross-cache-class test.
+- **Input staging off for the f16 widen path.** 340.8 in-place vs 334.2 staged
+  fps on an RTX 5060 (`VSFEEL_NLMEANS_STAGE=0`), inside the ±9% spread.
 - **`a=64, d=16` hard-recovers the GPU when the device is shared** — a
   co-scheduled weight sweep is the trigger, not an OOB or a timeout. Do not run
   it beside another GPU client; `-n 8 --dist loadfile` keeps it serial per file.

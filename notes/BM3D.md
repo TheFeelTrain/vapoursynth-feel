@@ -638,16 +638,15 @@ Chronological; each entry keeps the mechanism, not the story.
 ### Do not retry
 
 - **Workgroups 64/128/256**: -0.8 to -1.5% on an RTX 5060, 32 stays.
-- **A half-precision or otherwise narrowed *processing* mode.** The filter is not
-  bandwidth-bound (1080p r=2: `gpu_busy_percent` 100, `mem_busy_percent` ~35)
-  and its compute is depth-independent: u16 is 979.4 against f32's 956.5 fps
-  (1000 frames) and 977.5 against 968.5 with the io removed; f16 is the same
-  1% band (see Performance). The float estimate stack (83 MB/frame at r=2) is
-  the only large narrowable traffic and cannot narrow anyway (no
-  `shaderBufferFloat16AtomicAdd`; no u16 atomics in core Vulkan). bm3dvk2's own
-  fp16 mode is 16% slower here (133.4 against 159.1 fps, 500 frames,
-  `--cpu-cache`) while reading half the source bytes. Narrowing the *transport*
-  (u16, f16) is what ships; this prices narrowing the arithmetic or the ring.
+- **A half-precision or otherwise narrowed *processing* mode.** The filter is
+  not bandwidth-bound (1080p r=2: busy 100%, memory ~35%) and its compute is
+  depth-independent: u16 979.4 vs f32 956.5 fps, 977.5 vs 968.5 with io removed.
+  The float estimate stack (83 MB/frame) cannot narrow (no f16/u16 atomics), and
+  bm3dvk2's fp16 mode is 16% slower here (133.4 vs 159.1 fps, `--cpu-cache`)
+  while reading half the bytes. Narrowing the *transport* is what ships.
+- **Output staging on the aggregation.** 241.7 staged vs 244.6 direct fps on
+  an RTX 5060 (1080p f32, ABBA n=12); the control moved +2.8% the other way.
+  The coalesced stores do not need a private copy.
 - **Emulating libstdc++'s `partial_sort` tie order.** Survivors are heap
   positions, not a positional rule; exactness needs the whole candidate sequence
   replayed through a 7-element heap (~940 keys/block in LDS plus a serial pass,

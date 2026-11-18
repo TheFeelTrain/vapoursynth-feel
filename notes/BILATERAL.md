@@ -398,6 +398,16 @@ SDMA and the port reaches parity without any core change.
 
 ### Do not retry
 
+- **Three output columns per thread (`-DCOLS3`).** On an RTX 5060 it lost at
+  every radius outside noise (default sigma 3.0 -0.85%, sigma 2.0 -1.96%,
+  sigma 8.0 -32.8%; sigma 4.0 was noise): the tile grows from `2R+2*32` to
+  `2R+3*32` floats (R=9: 8.5 -> 11.9 KB) and drops occupancy 5 -> 4 blocks/SM.
+  At R=20 both shapes fit one block/SM and COLS3 still lost 33%, so register
+  pressure from the three `num/den` pairs and centres is the remaining suspect.
+  Do not retry without a wide-radius shape sweep and a register-count
+  explanation.
+- **A 32x4 block at R=12.** 260 fps against 492 for the 32x8 default
+  (`sigma_spatial=4.0`) on an RTX 5060. The auto rule stays.
 - **Bank-conflict-free tile layouts.** The two-column kernel reads tile columns
   `cx0 - RADIUS + k` with `cx0` advancing by two per lane, a stride-2 walk that
   hits every bank twice, so interleaving the even and odd columns into two
