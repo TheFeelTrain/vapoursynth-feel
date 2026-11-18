@@ -4,14 +4,12 @@ Status: **shipped** — family-A semantics (eedi3m/eedi3vk2). u16 and f32 are
 bit-exact against eedi3vk2: the f32 rolling sums are re-summed in the
 reference's k order and the cost/relax/vcheck/cubic float expressions carry its
 `precise` qualifiers. f16 is **storage-only** (native half pad/copies/AA
-intermediates, f32 arithmetic), i.e. the f32 result rounded once. `hp`
-(eedi3m only registers it; eedi3vk2/vszip/vszipcl implement it) is live and
-bit-exact too. EEDI3, EEDI3H (native transposed-plane) and EEDI3AA (fused
-based_aa chain) share every kernel, geometry and pipeline. Runs on the **R80
-GPU API**: `clip/sclip/mclip:vnode:gpu` in and `ffGPUOutput` out, one exec pool,
-and no host upload/download/gather machinery at all; on NVIDIA the clip, sclip
-and mask planes are copied device-side once per batch (see Historical). The
-parallel vcheck is the default.
+intermediates, f32 arithmetic). `hp` (eedi3m only registers it) is live and
+bit-exact too. EEDI3, EEDI3H and EEDI3AA (fused based_aa chain) share every
+kernel, geometry and pipeline. Runs on the **R80 GPU API**:
+`clip/sclip/mclip:vnode:gpu` in and `ffGPUOutput` out, one exec pool, no host
+upload/download; on NVIDIA the clip, sclip and mask planes are copied
+device-side once per batch (see Historical). The parallel vcheck is the default.
 
 Benchmark (`--filter eedi3`, the README's config; field=3, mdis=20, vcheck=2):
 1080p jpbd, mask, benchmark args, 5 s medians of 3 (README differs):
@@ -25,11 +23,11 @@ Benchmark (`--filter eedi3`, the README's config; field=3, mdis=20, vcheck=2):
 The hp direction set doubles the kernel's work (TPITCH 41 → 81, K 2 → 3),
 widens the relax to ±2 and grows `pbt` 16 → 81 bytes; it cannot 2-bit pack.
 
-- **Batch size (`VSFEEL_EEDI3_BATCH`): as many frames as `vram/12` holds, up
-  to 8.** The 2026-10 byte targets (256 MiB, 768 for EEDI3AA) planned 2 frames
-  at 2160p, which cost 45% there and 5.7% at 1080p f32; those knees are stale
-  on this build. The cap is a third of the core's quarter-limit in-flight
-  budget, so EEDI3AA plans fewer frames from the same cap.
+- **Batch size (`VSFEEL_EEDI3_BATCH`): as many frames as `vram/12` holds, up to 8.**
+  The 2026-10 byte targets (256 MiB, 768 for EEDI3AA) planned 2 frames at 2160p,
+  which cost 45% there and 5.7% at 1080p f32; those knees are stale on this
+  build. The cap is a third of the core's quarter-limit in-flight budget (EEDI3AA
+  plans fewer frames from the same cap).
 - **`pbt` is 2-bit packed** when a lane owns exactly two directions (TPITCH
   33..63, i.e. mdis 16..31, which includes the default 20): each lane builds a
   nibble and only even lanes store, combining their odd neighbour's nibble
@@ -143,18 +141,7 @@ steps, so rows are independent and one workgroup owns each; 6 is bit-exact.
 ~3·mdis+nrad+8; `pbackt` **deltas**; center-pref tie-break; vszipcl's [0,1] u16 is
 a **third numeric domain** (thousands of LSB vs A).
 
-**Target.** Ground truth is `eedi3m`; the bar is bit-exactness against
-`eedi3vk2`, and vsfeel is family A with an f32 DP (u16 native int scale).
-
-Accuracy landscape, jpbd frame 100, 1920x1080, field=1, interp rows only (kept rows
-identical everywhere):
-
-| comparison | f32 max abs | u8 max LSB |
-|---|---|---|
-| vszipcl vs vszip | 1.2e-7 (ulp) | — |
-| eedi3m vs vszipcl | 0.067 on 1e-4 of px | 17 on 3.1% |
-| eedi3vk2 vs vszipcl | 0.012 | — |
-| eedi3m vs eedi3vk2 | 0.067 on 1e-4 px | 17 on 0.003% |
+Accuracy drift at jpbd frame 100 (1920x1080, field=1, interp rows only): vszipcl-vs-vszip is ulp-level; eedi3m-vs-vszipcl 0.067 on 1e-4 of px (17 LSB on 3.1%); eedi3m-vs-eedi3vk2 0.067 on 0.003%. Family-gap sanity bound only (`eedi3h_vszipcl_loose`).
 
 ### Constraints vsfeel implements
 
@@ -200,6 +187,19 @@ register is the largest addressable item; the three-window redundancy is worth
 
 ## Historical
 
+- **2026-11-18 — jobs sharing a plane in one submission share its staged
+  copy (+18% EEDI3, +10% EEDI3AA, 1080p16).** Field doubling halves `sn`
+  across a pair, and the AA chain stages the same source planes for both
+  vertical sub-passes, so a batch re-copied the same planes twice; a
+  per-submission map from the plane's buffer handle to its staged copy now
+  stages each plane at most once per submission. ABBA, `--gpu-cache-mb 4096
+  --cache-frames 400`: EEDI3 **573-588 -> 693-698 fps** (vszipcu flat at
+  223.1-223.3), EEDI3AA **31.9 -> 35.3 fps**. Output bit-identical; 391 eedi3
+  tests passed. The plain bandwidth saving is only ~3-6 MB/frame; the rest is
+  unattributed, believed to be allocator/VRAM relief on an 8 GB part near its
+  limit — this machine's number, not a portable constant. On an RX 7900 XTX
+  with staging on it is +0.8% EEDI3 and +4.4% EEDI3AA (spread-dominated), so it
+  is not NVIDIA-specific.
 - **2026-11-16 — the clip's planes are staged per batch (+23%, 1080p16).** On an
   RTX 5060 the pads' in-place reads measured several times slower than a private
   copy, so each frame's planes, sclip and mask are staged first: **EEDI3 223.8 ->

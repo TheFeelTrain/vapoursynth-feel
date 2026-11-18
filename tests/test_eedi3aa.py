@@ -617,3 +617,21 @@ def test_eedi3aa_staged_output_matches_the_direct_path(clip_gray16, clip_grayh, 
                 n,
             )
     monkeypatch.delenv("VSFEEL_EEDI3_OSTAGE", raising=False)
+
+
+def test_eedi3aa_staged_input_matches_the_in_place_path(clip_gray16, monkeypatch):
+    """The AA chain's staged clip/sclip/mask inputs are byte copies.
+
+    The dedup binds one staged copy to several jobs, so the staged path must
+    stay bit-identical to the in-place one at the largest batch.
+    """
+    params = dict(field=3, mdis=5, nrad=1)
+    monkeypatch.setenv("VSFEEL_EEDI3_BATCH", "8")
+    monkeypatch.setenv("VSFEEL_EEDI3_STAGE", "0")
+    in_place = _aa(clip_gray16, **params)
+    monkeypatch.setenv("VSFEEL_EEDI3_STAGE", "1")
+    staged = _aa(clip_gray16, **params)
+    monkeypatch.delenv("VSFEEL_EEDI3_STAGE", raising=False)
+    monkeypatch.delenv("VSFEEL_EEDI3_BATCH", raising=False)
+    for n in (0, 11, 23):
+        assert np.array_equal(_plane(in_place.get_frame(n), 0), _plane(staged.get_frame(n), 0)), n

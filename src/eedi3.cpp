@@ -590,6 +590,34 @@ struct Eedi3Job {
     PassTail tail { PassTail::kNone };
 };
 
+// Per-submission staged-copy dedup. Several jobs in one submission can stage
+// the same plane (field doubling halves sn across a pair, and the AA chain
+// stages the same source planes for both sub-passes); the copy is made once
+// and the staged handle is bound everywhere. Keyed on the plane's buffer
+// handle; the copies live in `staged` until the submission completes. Sized
+// for the worst case (batch 8 x 7 staged planes per job); overflow degrades
+// to a re-copy, never to a wrong binding.
+struct StageDedup {
+    std::array<std::pair<VkBuffer, VkBuffer>, 64> lut {};
+    size_t n {};
+
+    VkBuffer find(VkBuffer key) const {
+        for (size_t i = 0; i < n && i < lut.size(); ++i) {
+            if (lut[i].first == key) {
+                return lut[i].second;
+            }
+        }
+        return VK_NULL_HANDLE;
+    }
+
+    void insert(VkBuffer key, VkBuffer value) {
+        if (n < lut.size()) {
+            lut[n] = { key, value };
+            ++n;
+        }
+    }
+};
+
 // One plane's staged output, retained for the submission by the exec context.
 struct Eedi3OutStage {
     GpuBuffer buf;
@@ -1266,6 +1294,7 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
     // gpu_stage_plane); the handles stay in the exec context's retention.
     std::vector<GpuBuffer> staged;
     bool any_staged = false;
+    StageDedup dedup;
     auto fail = [&](const std::string & message) -> const VSFrame * {
         for (auto & p : produced) {
             vsapi->freeFrame(p.second);
@@ -1385,15 +1414,20 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
                     return fail("sclip plane " + std::to_string(plane) +
                                 " is not GPU resident");
                 }
-                staged.emplace_back();
-                if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, pi,
-                                             staged.back());
-                    !e.empty()) {
-                    vsapi->freeFrame(dst);
-                    return fail("staged sclip: " + e);
+                if (const VkBuffer dup = dedup.find(pi.buffer)) {
+                    in.sclip[plane] = dup;
+                } else {
+                    staged.emplace_back();
+                    if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, pi,
+                                                 staged.back());
+                        !e.empty()) {
+                        vsapi->freeFrame(dst);
+                        return fail("staged sclip: " + e);
+                    }
+                    in.sclip[plane] = staged.back().buffer;
+                    dedup.insert(pi.buffer, in.sclip[plane]);
+                    any_staged = true;
                 }
-                in.sclip[plane] = staged.back().buffer;
-                any_staged = true;
             }
             if (in.mask != VK_NULL_HANDLE) {
                 VSVulkanPlaneInfo pi {};
@@ -1401,15 +1435,20 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
                     vsapi->freeFrame(dst);
                     return fail("mclip is not GPU resident");
                 }
-                staged.emplace_back();
-                if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, pi,
-                                             staged.back());
-                    !e.empty()) {
-                    vsapi->freeFrame(dst);
-                    return fail("staged mclip: " + e);
+                if (const VkBuffer dup = dedup.find(pi.buffer)) {
+                    in.mask = dup;
+                } else {
+                    staged.emplace_back();
+                    if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, pi,
+                                                 staged.back());
+                        !e.empty()) {
+                        vsapi->freeFrame(dst);
+                        return fail("staged mclip: " + e);
+                    }
+                    in.mask = staged.back().buffer;
+                    dedup.insert(pi.buffer, in.mask);
+                    any_staged = true;
                 }
-                in.mask = staged.back().buffer;
-                any_staged = true;
             }
         }
         if (!fill_out_planes(*d, vsapi, dst, in.out, in.out_stride, in.out_info,
@@ -1455,15 +1494,20 @@ static const VSFrame * VS_CC Eedi3GetFrame(int n, int activationReason,
             in.src_stride[plane] =
                 static_cast<int>(vsapi->getStride(src, plane) / d->elem_bytes);
             if (d->stage) {
-                staged.emplace_back();
-                if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, pi,
-                                             staged.back());
-                    !e.empty()) {
-                    vsapi->freeFrame(dst);
-                    return fail("staged source: " + e);
+                if (const VkBuffer dup = dedup.find(pi.buffer)) {
+                    in.src[plane] = dup;
+                } else {
+                    staged.emplace_back();
+                    if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, pi,
+                                                 staged.back());
+                        !e.empty()) {
+                        vsapi->freeFrame(dst);
+                        return fail("staged source: " + e);
+                    }
+                    in.src[plane] = staged.back().buffer;
+                    dedup.insert(pi.buffer, in.src[plane]);
+                    any_staged = true;
                 }
-                in.src[plane] = staged.back().buffer;
-                any_staged = true;
             }
         }
         jobs.push_back(job);
@@ -1673,6 +1717,7 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
     std::vector<std::array<Eedi3OutStage, MAX_PLANES>> out_stages;
     std::vector<GpuBuffer> staged;
     bool any_staged = false;
+    StageDedup dedup;
     auto fail = [&](const std::string & message) -> const VSFrame * {
         for (auto & p : produced) {
             vsapi->freeFrame(p.second);
@@ -1810,15 +1855,20 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
             mask_stride = static_cast<int>(vsapi->getStride(mcp, 0) /
                                            (d->mclip_bits / 8));
             if (d->stage) {
-                staged.emplace_back();
-                if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, pi,
-                                             staged.back());
-                    !e.empty()) {
-                    vsapi->freeFrame(dst);
-                    return fail("staged mclip: " + e);
+                if (const VkBuffer dup = dedup.find(pi.buffer)) {
+                    mask = dup;
+                } else {
+                    staged.emplace_back();
+                    if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, pi,
+                                                 staged.back());
+                        !e.empty()) {
+                        vsapi->freeFrame(dst);
+                        return fail("staged mclip: " + e);
+                    }
+                    mask = staged.back().buffer;
+                    dedup.insert(pi.buffer, mask);
+                    any_staged = true;
                 }
-                mask = staged.back().buffer;
-                any_staged = true;
             }
         }
         std::string sclip_err = "sclip is not GPU resident";
@@ -1836,15 +1886,20 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
                 }
                 out[plane] = pi.buffer;
                 if (d->stage) {
-                    staged.emplace_back();
-                    if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, pi,
-                                                 staged.back());
-                        !e.empty()) {
-                        sclip_err = "staged sclip: " + e;
-                        return false;
+                    if (const VkBuffer dup = dedup.find(pi.buffer)) {
+                        out[plane] = dup;
+                    } else {
+                        staged.emplace_back();
+                        if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd,
+                                                     pi, staged.back());
+                            !e.empty()) {
+                            sclip_err = "staged sclip: " + e;
+                            return false;
+                        }
+                        out[plane] = staged.back().buffer;
+                        dedup.insert(pi.buffer, out[plane]);
+                        any_staged = true;
                     }
-                    out[plane] = staged.back().buffer;
-                    any_staged = true;
                 }
                 strides[plane] = static_cast<int>(vsapi->getStride(scf, plane) /
                                                   d->elem_bytes);
@@ -1930,15 +1985,20 @@ static const VSFrame * VS_CC Eedi3AaGetFrame(int n, int activationReason,
                     in.src_stride[plane] = static_cast<int>(
                         vsapi->getStride(src, plane) / d->elem_bytes);
                     if (d->stage) {
-                        staged.emplace_back();
-                        if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd,
-                                                     pi, staged.back());
-                            !e.empty()) {
-                            vsapi->freeFrame(dst);
-                            return fail("staged source: " + e);
+                        if (const VkBuffer dup = dedup.find(pi.buffer)) {
+                            in.src[plane] = dup;
+                        } else {
+                            staged.emplace_back();
+                            if (auto e = gpu_stage_plane(
+                                    *d->gpu, core, ctx, cmd, pi, staged.back());
+                                !e.empty()) {
+                                vsapi->freeFrame(dst);
+                                return fail("staged source: " + e);
+                            }
+                            in.src[plane] = staged.back().buffer;
+                            dedup.insert(pi.buffer, in.src[plane]);
+                            any_staged = true;
                         }
-                        in.src[plane] = staged.back().buffer;
-                        any_staged = true;
                     }
                 }
             }
