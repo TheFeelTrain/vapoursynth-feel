@@ -420,14 +420,15 @@ constexpr uint32_t GPU_MAX_BINDINGS = 32;
 // every other filter's entries.
 struct GpuPipelineCache {
     VkPipelineCache cache {};
-    std::string path;
+    std::filesystem::path path;
     // Size of the blob the cache was seeded with: a process that compiled
     // nothing new must not rewrite the file at exit.
     size_t loaded_size {};
-    // The blob itself, kept between filter instances so the next one seeds
-    // from memory instead of reading the file back.
+    // The seed blob, used only while the cache is created. The pending map or
+    // the file keeps it afterwards, so the device does not retain it.
     std::vector<uint8_t> blob;
     bool dirty {};
+    bool seeded_from_pending {};
     int pid {};
 };
 
@@ -497,14 +498,14 @@ struct GPUDevice {
 
     // Persistent pipeline caches, one per filter family. The core exposes no
     // cache of its own, and compiling from SPIR-V is seconds per variant on
-    // RADV. Files are named for the device UUID, the shader build and the
-    // family, so a shader change starts a fresh cache and one filter's sweep
-    // cannot rewrite another filter's entries.
+    // RADV. Files are named for the device UUID, the family's shader hash and
+    // the family, so editing one kernel starts a fresh cache for that filter
+    // and one filter's sweep cannot rewrite another filter's entries.
     mutable std::map<std::string, GpuPipelineCache> pipeline_caches;
     mutable GpuPipelineCache pipeline_cache_disabled;
-    std::string pipeline_cache_dir;
-    std::string pipeline_cache_prefix;
-    std::string pipeline_cache_suffix { ".bin" };
+    std::filesystem::path pipeline_cache_dir;
+    std::filesystem::path::string_type pipeline_cache_prefix;
+    std::filesystem::path::string_type pipeline_cache_suffix;
     std::mutex * pipeline_cache_lock {};
 
     GpuPipelineCache & pipeline_cache_for(const char * tag) const;
@@ -1377,8 +1378,12 @@ inline std::variant<VkPipeline, std::string> gpu_create_pipeline(
     GpuPipelineCache & cache = g.pipeline_cache_for(tag);
     {
         // vkCreateComputePipelines requires the host to serialize access to the
-        // cache it compiles into.
-        std::lock_guard lock(*g.pipeline_cache_lock);
+        // cache it compiles into. The lock is always allocated with the device;
+        // the null check only keeps a hypothetical lockless device safe.
+        std::unique_lock<std::mutex> lock;
+        if (g.pipeline_cache_lock != nullptr) {
+            lock = std::unique_lock<std::mutex>(*g.pipeline_cache_lock);
+        }
         // Timed so a cold-start report can tell compilation apart from a slow
         // frame: the first run compiles every kernel serially here.
         const auto t0 = std::chrono::steady_clock::now();

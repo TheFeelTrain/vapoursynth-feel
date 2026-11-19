@@ -426,9 +426,11 @@ variant is one line in the owning component's `VK_*_VARIANTS` table in
 every variant uses it (the R80 core's device baseline). `add_spv_variant()`
 turns each entry into the `glslc` rule and collects the outputs into
 `VK_SPV_OUTPUTS`, which is generated, not edited by hand. The header script
-(`--out <header> <spv...>`) derives symbol names from the filenames
-(`<stem>.spv` → `<stem>_spv` / `<stem>_spv_size`), so it never needs editing for
-new variants.
+(`--out <header> [--hash-out <header>] <spv...>`) derives symbol names from the
+filenames (`<stem>.spv` → `<stem>_spv` / `<stem>_spv_size`), so it never needs
+editing for new variants. `--hash-out` writes `spirv_hash.h`: the whole-build
+hash plus one content hash per filter family (the leading alphanumeric run of a
+variant's output name), which names the runtime pipeline cache files.
 
 ### How the shader pipeline fits together
 
@@ -461,18 +463,23 @@ has it. The plugin therefore keeps one `VkPipelineCache` per filter family,
 seeded from and flushed to a file:
 
 - default location: `$XDG_CACHE_HOME/vsfeel/`
-  (`~/.cache/vsfeel/...`), with an automatic fallback to `$TMPDIR/vsfeel/` when
-  the home cache is not writable (read-only home, sandbox, CI). File names are
-  `pipeline_cache_<pipelineCacheUUID>_<spirvhash>_<family>.bin`;
+  (`~/.cache/vsfeel/...`; `%LOCALAPPDATA%\vsfeel` on Windows), with an automatic
+  fallback to `$TMPDIR/vsfeel/` when the home cache is not writable (read-only
+  home, sandbox, CI). File names are
+  `pipeline_cache_<pipelineCacheUUID>_<familyhash>_<family>.bin`;
 - `VSFEEL_PIPELINE_CACHE=<path>` overrides the location. An existing directory
-  (or a path ending in `/`) holds the standard file names; any other path is a
-  file prefix, so `/tmp/cache.bin` becomes `/tmp/cache_<spirvhash>_<family>.bin`.
-  `VSFEEL_PIPELINE_CACHE=0` disables the cache entirely (useful when checking
-  that a shader change actually recompiles);
-- the driver's `pipelineCacheUUID` and a content hash of the embedded SPIR-V are
-  both in the filename, so a driver, device or shader change misses instead of
-  feeding the driver incompatible data or appending to an older build's entries.
-  Caches from an older shader hash are pruned from the directory;
+  (or a path ending in `/` or `\`) holds the standard file names; any other path
+  is a file prefix, so `/tmp/cache.bin` becomes
+  `/tmp/cache_<familyhash>_<family>.bin`. `VSFEEL_PIPELINE_CACHE=0`, or an empty
+  value, disables the cache entirely (useful when checking that a shader change
+  actually recompiles);
+- the driver's `pipelineCacheUUID` and a content hash of the modules that family
+  compiles are both in the filename, so a driver, device or kernel change
+  misses instead of feeding the driver incompatible data or appending to an
+  older build's entries. Editing one shader only invalidates its own family; a
+  tag that matches no generated family falls back to the whole-build hash.
+  Files from an older hash are pruned for the current UUID and a known family,
+  while another build's unknown family is left alone;
 - a process holds the blob in memory between filter instances and writes it
   **once**, when the core unloads the plugin or the process exits. The write is
   skipped when the blob is the size it was loaded at, and a concurrent
@@ -482,7 +489,8 @@ seeded from and flushed to a file:
   `/dev/shm` (see `tools/test.sh`), so a cold run writes RAM, not the SSD.
 
 Cold runs are slower because they build the cache. The first run after a driver
-or `glslc` update pays the compile again by design.
+or `glslc` update, and after editing a shader, pays the compile for the affected
+families by design.
 
 ## Code quality (lint)
 

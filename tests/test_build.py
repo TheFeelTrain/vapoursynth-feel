@@ -64,10 +64,23 @@ def test_generator_rejects_a_truncated_module(tmp_path):
     assert "multiple of 4" in proc.stderr
 
 
-def test_generator_emits_a_content_hash(tmp_path):
-    """The hash names the runtime cache file, so shader bytes must change it."""
-    spv = tmp_path / "shader.spv"
-    spv.write_bytes(SPV_HEADER)
+def read_hashes(path):
+    text = path.read_text()
+    whole = re.search(r'#define VSFEEL_SPIRV_HASH "([0-9a-f]{16})"', text)
+    assert whole, text
+    families = dict(re.findall(r'\{\s*"([a-z0-9]+)",\s*"([0-9a-f]{16})"\s*\}', text))
+    return whole.group(1), families
+
+
+def test_generator_emits_per_family_hashes(tmp_path):
+    """A family's hash names its cache file, so one shader edit moves one family.
+
+    The other families must stay warm; the whole-build hash still changes.
+    """
+    eedi3 = tmp_path / "eedi3_row.spv"
+    bm3d = tmp_path / "bm3d_row.spv"
+    eedi3.write_bytes(SPV_HEADER)
+    bm3d.write_bytes(SPV_HEADER)
     out = tmp_path / "shader.h"
     hash_out = tmp_path / "shader_hash.h"
     cmd = [
@@ -77,21 +90,23 @@ def test_generator_emits_a_content_hash(tmp_path):
         str(out),
         "--hash-out",
         str(hash_out),
-        str(spv),
+        str(eedi3),
+        str(bm3d),
     ]
 
     proc = subprocess.run(cmd, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
-    match = re.search(r'#define VSFEEL_SPIRV_HASH "([0-9a-f]{16})"', hash_out.read_text())
-    assert match, hash_out.read_text()
-    first = match.group(1)
+    whole_first, families_first = read_hashes(hash_out)
+    assert set(families_first) == {"eedi3", "bm3d"}, families_first
+    assert families_first["eedi3"] != families_first["bm3d"]
 
-    spv.write_bytes(SPV_HEADER + b"\0\0\0\0")
+    eedi3.write_bytes(SPV_HEADER + b"\0\0\0\0")
     proc = subprocess.run(cmd, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
-    match = re.search(r'#define VSFEEL_SPIRV_HASH "([0-9a-f]{16})"', hash_out.read_text())
-    assert match, hash_out.read_text()
-    assert match.group(1) != first
+    whole_second, families_second = read_hashes(hash_out)
+    assert whole_second != whole_first
+    assert families_second["eedi3"] != families_first["eedi3"]
+    assert families_second["bm3d"] == families_first["bm3d"]
 
 
 def run_lint_stub(build):

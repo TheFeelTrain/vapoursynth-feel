@@ -9,8 +9,9 @@
 #include <cstring>
 #include <filesystem>
 #if defined(_WIN32)
-#include <io.h>      // _access
 #include <process.h> // _getpid
+#include <stdio.h>   // _wfopen
+#include <stdlib.h>  // _wgetenv
 #else
 #include <unistd.h> // access, getpid
 #endif
@@ -32,11 +33,15 @@
 #include "config.h"
 
 // Generated alongside spirv_binaries.h: names the cache files after the shader
-// build so a changed kernel starts a fresh cache instead of growing an old one.
+// modules each filter family compiles, so a changed kernel starts a fresh
+// cache for that filter only.
 #if __has_include("spirv_hash.h")
 #include "spirv_hash.h"
 #else
 #define VSFEEL_SPIRV_HASH "unknown"
+inline const char * vsfeel_spirv_hash_for_family(const char *) {
+    return nullptr;
+}
 #endif
 
 using namespace std::string_literals;
@@ -75,16 +80,69 @@ const char * vk_result_string(VkResult result) {
 // device (and its VkPipelineCache) dies with the last node. Writing the blob
 // from that destructor meant one whole-file rewrite per filter; when the file
 // had grown to 302 MB, a 16 KB addition cost 302 MB of I/O. Two changes bound
-// that: one cache per filter family and shader build, and an in-memory blob
-// handed between instances that is flushed once at process exit. Every
+// that: one cache per filter family and family shader hash, and a pending blob
+// shared between instances that is flushed once at process exit. Every
 // operation here is best effort: a read-only cache directory costs a recompile,
 // never a filter error.
 
-static bool directory_writable(const std::string & path) {
+// Paths stay in the native type end to end. The narrow strings built below
+// (uuid, hash, family, suffix) are ASCII; a user's own path is never re-encoded
+// between std::filesystem (which reads narrow strings as UTF-8 in a MinGW
+// build) and the CRT's raw fopen/access (which read them as ANSI).
+using cache_path = std::filesystem::path;
+using cache_native = cache_path::string_type;
+
+static cache_native ascii_native(const std::string & text) {
+    cache_native out;
+    out.reserve(text.size());
+    for (const char c : text) {
+        out.push_back(
+            static_cast<cache_path::value_type>(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
+static cache_path ascii_path(const std::string & text) {
+    return cache_path(ascii_native(text));
+}
+
+static constexpr cache_path::value_type native_char(char c) {
+    return static_cast<cache_path::value_type>(static_cast<unsigned char>(c));
+}
+
+// Narrow a native name to ASCII for the family lookup; anything else is not a
+// family this build generated, so the caller keeps the file.
+static bool narrow_ascii(const cache_native & from, std::string & out) {
+    out.clear();
+    out.reserve(from.size());
+    for (const cache_path::value_type c : from) {
 #if defined(_WIN32)
-    return ::_access(path.c_str(), 2 /* write */) == 0;
+        if (c > 0x7f) {
+            return false;
+        }
+        out.push_back(static_cast<char>(c));
 #else
-    return ::access(path.c_str(), W_OK) == 0;
+        const auto value = static_cast<unsigned char>(c);
+        if (value > 0x7f) {
+            return false;
+        }
+        out.push_back(static_cast<char>(value));
+#endif
+    }
+    return true;
+}
+
+#if defined(_WIN32)
+#define VSFEEL_CACHE_PATH_FMT "%ls"
+#else
+#define VSFEEL_CACHE_PATH_FMT "%s"
+#endif
+
+static bool cache_is_sep(cache_path::value_type c) {
+#if defined(_WIN32)
+    return c == L'/' || c == L'\\';
+#else
+    return c == '/';
 #endif
 }
 
@@ -96,7 +154,38 @@ static int process_id() {
 #endif
 }
 
-static bool cache_dir_usable(const std::string & dir) {
+static FILE * cache_fopen(const cache_path & path, const char * mode) {
+#if defined(_WIN32)
+    wchar_t wide_mode[4] {};
+    for (size_t i = 0; i < 3 && mode[i] != '\0'; ++i) {
+        wide_mode[i] = static_cast<wchar_t>(mode[i]);
+    }
+    return ::_wfopen(path.c_str(), wide_mode);
+#else
+    return std::fopen(path.c_str(), mode);
+#endif
+}
+
+static bool directory_writable(const cache_path & dir) {
+#if defined(_WIN32)
+    // The read-only attribute is meaningless for directories and access() does
+    // not see ACLs; a probe file is the reliable writability test.
+    const cache_path probe =
+        dir / ascii_path("vsfeel-write-test-" + std::to_string(process_id()));
+    FILE * file = cache_fopen(probe, "wb");
+    if (file == nullptr) {
+        return false;
+    }
+    std::fclose(file);
+    std::error_code ec;
+    std::filesystem::remove(probe, ec);
+    return true;
+#else
+    return ::access(dir.c_str(), W_OK) == 0;
+#endif
+}
+
+static bool cache_dir_usable(const cache_path & dir) {
     if (dir.empty()) {
         return false;
     }
@@ -140,121 +229,172 @@ static std::string cache_family_for(const char * tag) {
 }
 
 struct CacheLayout {
-    std::string dir;
-    std::string prefix;
-    std::string suffix { ".bin" };
+    cache_path dir;
+    cache_native prefix;
+    cache_native suffix;
     bool prune {};
 };
 
-static std::string default_cache_dir() {
-    std::string dir;
+static cache_path default_cache_dir() {
+    cache_path dir;
+#if defined(_WIN32)
+    // LOCALAPPDATA first: an XDG_CACHE_HOME set by a Git Bash/MSYS shell is a
+    // POSIX path a native process cannot resolve.
+    if (const wchar_t * local = _wgetenv(L"LOCALAPPDATA"); local && *local) {
+        dir = local;
+    } else if (const wchar_t * xdg = _wgetenv(L"XDG_CACHE_HOME"); xdg && *xdg) {
+        dir = xdg;
+    } else if (const wchar_t * home = _wgetenv(L"HOME"); home && *home) {
+        dir = cache_path(home) / ascii_path(".cache");
+    }
+#else
     if (const char * xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg) {
         dir = xdg;
     } else if (const char * local = std::getenv("LOCALAPPDATA");
                local && *local) {
         dir = local;
     } else if (const char * home = std::getenv("HOME"); home && *home) {
-        dir = std::string(home) + "/.cache";
+        dir = cache_path(home) / ascii_path(".cache");
     }
+#endif
     if (!dir.empty()) {
-        dir += "/vsfeel";
+        dir /= ascii_path("vsfeel");
     }
     return dir;
 }
 
 static CacheLayout cache_layout_for(const VkPhysicalDeviceProperties & props) {
     CacheLayout layout;
+    layout.suffix = ascii_native(".bin");
     const std::string uuid = device_uuid(props);
-    const std::string hash = VSFEEL_SPIRV_HASH;
-    const std::string standard_prefix =
-        "pipeline_cache_" + uuid + "_" + hash + "_";
+    const std::string standard_prefix = "pipeline_cache_" + uuid + "_";
 
+#if defined(_WIN32)
+    const wchar_t * env = _wgetenv(L"VSFEEL_PIPELINE_CACHE");
+#else
     const char * env = std::getenv("VSFEEL_PIPELINE_CACHE");
-    if (env != nullptr && (env[0] == '\0' || std::strcmp(env, "0") == 0)) {
-        return layout; // explicitly disabled
-    }
-
+#endif
     if (env != nullptr) {
-        std::string value { env };
+        const cache_path value(env);
+        if (value.empty() || value.native() == ascii_native("0")) {
+            return CacheLayout {}; // explicitly disabled
+        }
         bool is_dir =
-            !value.empty() && (value.back() == '/' || value.back() == '\\');
+            !value.native().empty() && cache_is_sep(value.native().back());
         if (!is_dir) {
             std::error_code ec;
             is_dir = std::filesystem::is_directory(value, ec);
         }
         if (is_dir) {
-            while (value.size() > 1 &&
-                   (value.back() == '/' || value.back() == '\\')) {
-                value.pop_back();
+            cache_native stripped = value.native();
+            while (stripped.size() > 1 && cache_is_sep(stripped.back())) {
+#if defined(_WIN32)
+                // Keep the separator that makes "C:\" the drive root: "C:" is
+                // drive-relative and is not the directory the caller named.
+                if (stripped.size() >= 3 &&
+                    stripped[stripped.size() - 2] == L':') {
+                    break;
+                }
+#endif
+                stripped.pop_back();
             }
-            layout.dir = value;
-            layout.prefix = standard_prefix;
+            layout.dir = cache_path(stripped);
+            layout.prefix = ascii_native(standard_prefix);
             layout.prune = true;
         } else {
             // A file path is a prefix: <stem>_<hash>_<family><ext>. One file
             // cannot hold several families without putting them back together.
-            const std::filesystem::path path(value);
-            layout.dir = path.parent_path().string();
+            layout.dir = value.parent_path();
             if (layout.dir.empty()) {
-                layout.dir = ".";
+                layout.dir = ascii_path(".");
             }
-            std::string stem = path.stem().string();
+            cache_native stem = value.stem().native();
             if (stem.empty()) {
-                stem = "pipeline_cache";
+                stem = ascii_native("pipeline_cache");
             }
-            layout.prefix = stem + "_" + hash + "_";
-            layout.suffix =
-                path.has_extension() ? path.extension().string() : ".bin";
+            layout.prefix = stem + ascii_native("_");
+            layout.suffix = value.has_extension() ? value.extension().native()
+                                                  : ascii_native(".bin");
         }
     } else {
         layout.dir = default_cache_dir();
-        layout.prefix = standard_prefix;
+        layout.prefix = ascii_native(standard_prefix);
         layout.prune = true;
     }
 
     if (!cache_dir_usable(layout.dir)) {
         if (env != nullptr) {
-            return {};
+            return CacheLayout {};
         }
         std::error_code ec;
-        const std::string tmp =
-            (std::filesystem::temp_directory_path(ec) / "vsfeel").string();
-        if (ec || !cache_dir_usable(tmp)) {
-            return {};
+        const cache_path temp = std::filesystem::temp_directory_path(ec);
+        if (ec) {
+            return CacheLayout {};
         }
-        layout.dir = tmp;
+        const cache_path fallback = temp / ascii_path("vsfeel");
+        if (!cache_dir_usable(fallback)) {
+            return CacheLayout {};
+        }
+        layout.dir = fallback;
     }
     return layout;
 }
 
-// Files from an older shader build use the same device UUID but a different
-// hash. They are dead weight, and the 302 MB unversioned file from before the
-// split is the one that made every small write expensive.
+// Files from an older shader build use the same device UUID and family but a
+// different family hash. They are dead weight, and the old unversioned file is
+// the one that made every small write expensive. A family the build does not
+// know is left alone: another build may still be using it.
 static void prune_stale_caches(const CacheLayout & layout,
                                const std::string & uuid) {
     if (!layout.prune || layout.dir.empty()) {
         return;
     }
-    const std::string old_file = "pipeline_cache_" + uuid + ".bin";
-    const std::string uuid_prefix = "pipeline_cache_" + uuid + "_";
-    std::error_code ec;
-    std::filesystem::directory_iterator it(layout.dir, ec);
-    const std::filesystem::directory_iterator end;
-    if (ec) {
-        return;
-    }
-    for (; it != end; it.increment(ec)) {
+    try {
+        const cache_native old_file =
+            ascii_native("pipeline_cache_" + uuid + ".bin");
+        const cache_native & uuid_prefix = layout.prefix;
+        const cache_native & suffix = layout.suffix;
+        const cache_path::value_type underscore = native_char('_');
+        std::error_code ec;
+        std::filesystem::directory_iterator it(layout.dir, ec);
+        const std::filesystem::directory_iterator end;
         if (ec) {
             return;
         }
-        const std::string name = it->path().filename().string();
-        const bool stale =
-            name == old_file || (name.rfind(uuid_prefix, 0) == 0 &&
-                                 name.rfind(layout.prefix, 0) != 0);
-        if (stale) {
-            std::error_code remove_ec;
-            std::filesystem::remove(it->path(), remove_ec);
+        for (; it != end; it.increment(ec)) {
+            if (ec) {
+                return;
+            }
+            const cache_native name = it->path().filename().native();
+            bool stale = name == old_file;
+            if (!stale && name.size() > uuid_prefix.size() + suffix.size() &&
+                name.compare(0, uuid_prefix.size(), uuid_prefix) == 0 &&
+                name.compare(name.size() - suffix.size(), suffix.size(),
+                             suffix) == 0) {
+                const cache_native middle = name.substr(
+                    uuid_prefix.size(),
+                    name.size() - uuid_prefix.size() - suffix.size());
+                const size_t sep = middle.rfind(underscore);
+                if (sep != cache_native::npos && sep > 0 &&
+                    sep + 1 < middle.size()) {
+                    std::string family;
+                    if (narrow_ascii(middle.substr(sep + 1), family)) {
+                        const char * current =
+                            vsfeel_spirv_hash_for_family(family.c_str());
+                        if (current != nullptr &&
+                            middle.substr(0, sep) != ascii_native(current)) {
+                            stale = true;
+                        }
+                    }
+                }
+            }
+            if (stale) {
+                std::error_code remove_ec;
+                std::filesystem::remove(it->path(), remove_ec);
+            }
         }
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+        // A broken cache directory is a cold run, not a filter error.
     }
 }
 
@@ -266,7 +406,7 @@ struct PendingBlob {
 
 struct PendingCaches {
     std::mutex lock;
-    std::map<std::string, PendingBlob> entries;
+    std::map<cache_path, PendingBlob> entries;
 };
 
 // Leaked on purpose: the flush object's destructor runs at library unload and
@@ -278,44 +418,30 @@ static PendingCaches & pending_caches() {
 
 static std::atomic<uint64_t> g_cache_write_seq { 0 };
 
-static bool cache_blob_on_disk_is_larger(const std::string & path,
-                                         size_t size) {
-    FILE * f = std::fopen(path.c_str(), "rb");
-    if (f == nullptr) {
-        return false;
-    }
-    bool larger = false;
-    if (std::fseek(f, 0, SEEK_END) == 0) {
-        const long end = std::ftell(f);
-        larger = end >= 0 && static_cast<size_t>(end) >= size;
-    }
-    std::fclose(f);
-    return larger;
-}
-
-static void write_cache_blob(const std::string & path,
+static void write_cache_blob(const cache_path & path,
                              const std::vector<uint8_t> & data) {
     if (path.empty() || data.empty()) {
         return;
     }
-    // Another process may already have saved a more complete blob; do not
-    // replace it with a smaller one and lose its entries.
-    if (cache_blob_on_disk_is_larger(path, data.size())) {
+    // Another process may already have saved a more complete blob; never
+    // shrink the file. Equal sizes are written: the newer blob may be the one
+    // that added pipelines.
+    std::error_code ec;
+    const auto on_disk = std::filesystem::file_size(path, ec);
+    if (!ec && on_disk > data.size()) {
         return;
     }
-    const std::filesystem::path cache_path(path);
-    if (cache_path.has_parent_path()) {
-        std::error_code ec;
-        std::filesystem::create_directories(cache_path.parent_path(), ec);
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path(), ec);
     }
 
-    const std::string tmp_path =
-        path + "." + std::to_string(static_cast<unsigned long>(process_id())) +
-        "." +
+    cache_path tmp = path;
+    tmp += ascii_path(
+        "." + std::to_string(static_cast<unsigned long>(process_id())) + "." +
         std::to_string(
             g_cache_write_seq.fetch_add(1, std::memory_order_relaxed)) +
-        ".tmp";
-    FILE * f = std::fopen(tmp_path.c_str(), "wb");
+        ".tmp");
+    FILE * f = cache_fopen(tmp, "wb");
     if (f == nullptr) {
         return;
     }
@@ -327,13 +453,14 @@ static void write_cache_blob(const std::string & path,
         written = false;
     }
     if (!written) {
-        std::remove(tmp_path.c_str());
+        std::error_code remove_ec;
+        std::filesystem::remove(tmp, remove_ec);
         return;
     }
-    std::error_code ec;
-    std::filesystem::rename(tmp_path, cache_path, ec);
+    std::filesystem::rename(tmp, path, ec);
     if (ec) {
-        std::remove(tmp_path.c_str());
+        std::error_code remove_ec;
+        std::filesystem::remove(tmp, remove_ec);
     }
 }
 
@@ -348,7 +475,10 @@ static void flush_pending_caches() {
             }
             write_cache_blob(path, blob.data);
             blob.dirty = false;
+            // The map is leaked on purpose; release the blob itself.
+            std::vector<uint8_t>().swap(blob.data);
         }
+        state.entries.clear();
     } catch (...) { // NOLINT(bugprone-empty-catch)
         // The process is exiting; a failed cache write is only a recompile.
     }
@@ -365,22 +495,31 @@ struct CacheFlushOnUnload {
 };
 static CacheFlushOnUnload g_cache_flush_on_unload;
 
-static bool take_pending_blob(const std::string & path,
+// Copies rather than moves: the pending entry is the authoritative blob for
+// the exit flush, so a failed create later cannot lose it.
+static bool take_pending_blob(const cache_path & path,
                               GpuPipelineCache & cache) {
     PendingCaches & state = pending_caches();
     std::lock_guard lock(state.lock);
     auto it = state.entries.find(path);
-    if (it == state.entries.end() || it->second.pid != process_id()) {
+    if (it == state.entries.end() || it->second.pid != process_id() ||
+        it->second.data.empty()) {
         return false;
     }
-    cache.blob = std::move(it->second.data);
+    cache.blob = it->second.data;
     cache.dirty = it->second.dirty;
     cache.pid = it->second.pid;
-    it->second.dirty = false;
-    return !cache.blob.empty();
+    cache.seeded_from_pending = true;
+    return true;
 }
 
-static void store_pending_blob(const std::string & path,
+static void drop_pending_blob(const cache_path & path) {
+    PendingCaches & state = pending_caches();
+    std::lock_guard lock(state.lock);
+    state.entries.erase(path);
+}
+
+static void store_pending_blob(const cache_path & path,
                                GpuPipelineCache & cache) {
     if (path.empty()) {
         return;
@@ -388,43 +527,71 @@ static void store_pending_blob(const std::string & path,
     PendingCaches & state = pending_caches();
     std::lock_guard lock(state.lock);
     auto & entry = state.entries[path];
+    // Keep the larger blob another instance already produced. This does not
+    // merge the blobs: a smaller one's new pipelines are dropped, which is a
+    // cache miss next process, never a wrong one.
     if (entry.data.size() > cache.blob.size()) {
-        return; // keep the larger blob another instance already produced
+        return;
     }
     entry.data = std::move(cache.blob);
     entry.dirty = cache.dirty;
     entry.pid = cache.pid != 0 ? cache.pid : process_id();
 }
 
+// A mis-pointed override (a video, a core dump, a sparse file) must not be
+// read into RAM in full before the driver rejects it.
+constexpr size_t kMaxPipelineCacheBytes = size_t { 512 } << 20;
+
 static void load_pipeline_cache(const GPUDevice & dev, GpuPipelineCache & cache,
                                 const std::string & family) {
     if (dev.pipeline_cache_dir.empty()) {
         return;
     }
-    cache.path = dev.pipeline_cache_dir + "/" + dev.pipeline_cache_prefix +
-                 family + dev.pipeline_cache_suffix;
+    const char * family_hash = vsfeel_spirv_hash_for_family(family.c_str());
+    if (family_hash == nullptr) {
+        family_hash = VSFEEL_SPIRV_HASH;
+    }
+    cache.path = dev.pipeline_cache_dir /
+                 cache_path(dev.pipeline_cache_prefix +
+                            ascii_native(family_hash) + ascii_native("_") +
+                            ascii_native(family) + dev.pipeline_cache_suffix);
     cache.pid = process_id();
 
-    if (!take_pending_blob(cache.path, cache)) {
+    try {
+        if (!take_pending_blob(cache.path, cache)) {
+            cache.blob.clear();
+            cache.dirty = false;
+            cache.seeded_from_pending = false;
+            std::error_code size_ec;
+            const auto on_disk =
+                std::filesystem::file_size(cache.path, size_ec);
+            if (!size_ec && on_disk > 0) {
+                if (on_disk > kMaxPipelineCacheBytes) {
+                    if (vsfeel_debug_enabled()) {
+                        fprintf(stderr,
+                                "[vsfeel] pipeline cache " VSFEEL_CACHE_PATH_FMT
+                                " is %llu B, ignoring it\n",
+                                cache.path.c_str(),
+                                static_cast<unsigned long long>(on_disk));
+                    }
+                    // Drop it so a valid blob can replace it instead of the
+                    // size guard preserving it forever.
+                    std::error_code remove_ec;
+                    std::filesystem::remove(cache.path, remove_ec);
+                } else if (FILE * f = cache_fopen(cache.path, "rb")) {
+                    cache.blob.resize(static_cast<size_t>(on_disk));
+                    if (std::fread(cache.blob.data(), 1, cache.blob.size(),
+                                   f) != cache.blob.size()) {
+                        cache.blob.clear();
+                    }
+                    std::fclose(f);
+                }
+            }
+        }
+    } catch (...) {
         cache.blob.clear();
         cache.dirty = false;
-        try {
-            if (FILE * f = std::fopen(cache.path.c_str(), "rb")) {
-                if (std::fseek(f, 0, SEEK_END) == 0) {
-                    const long size = std::ftell(f);
-                    if (size > 0 && std::fseek(f, 0, SEEK_SET) == 0) {
-                        cache.blob.resize(static_cast<size_t>(size));
-                        if (std::fread(cache.blob.data(), 1, cache.blob.size(),
-                                       f) != cache.blob.size()) {
-                            cache.blob.clear();
-                        }
-                    }
-                }
-                std::fclose(f);
-            }
-        } catch (...) {
-            cache.blob.clear();
-        }
+        cache.seeded_from_pending = false;
     }
 
     VkPipelineCacheCreateInfo info {};
@@ -440,35 +607,44 @@ static void load_pipeline_cache(const GPUDevice & dev, GpuPipelineCache & cache,
                     "[vsfeel] pipeline cache rejected (%s), starting empty\n",
                     vk_result_string(result));
         }
-        // The file cannot be used by this driver. Drop it so the new blob
-        // replaces it instead of being appended to a rejected one.
+        // The seed cannot be used by this driver. Drop it and the file so the
+        // new blob replaces it instead of being appended to a rejected one.
+        if (cache.seeded_from_pending) {
+            drop_pending_blob(cache.path);
+        }
         std::error_code ec;
         std::filesystem::remove(cache.path, ec);
         cache.blob.clear();
         cache.dirty = false;
+        cache.seeded_from_pending = false;
         info.initialDataSize = 0;
         info.pInitialData = nullptr;
         result = dev.vk->vkCreatePipelineCache(dev.device, &info, nullptr,
                                                &cache.cache);
     }
     if (result != VK_SUCCESS) {
+        // The seed stays in the pending map or in the file; a failed create is
+        // only a recompile.
         cache.cache = VK_NULL_HANDLE;
         cache.path.clear();
+        cache.blob.clear();
         return;
     }
     cache.loaded_size = cache.blob.size();
+    // The pending map or the file still holds the seed; the device does not
+    // need a copy for its whole life.
+    std::vector<uint8_t>().swap(cache.blob);
+    cache.seeded_from_pending = false;
     if (vsfeel_debug_enabled()) {
-        fprintf(stderr, "[vsfeel] pipeline cache %s (%zu B loaded)\n",
+        fprintf(stderr,
+                "[vsfeel] pipeline cache " VSFEEL_CACHE_PATH_FMT
+                " (%zu B loaded)\n",
                 cache.path.c_str(), cache.loaded_size);
     }
 }
 
 static void save_pipeline_cache(GPUDevice & dev, GpuPipelineCache & cache) {
-    if (cache.path.empty()) {
-        return;
-    }
-    if (cache.cache == VK_NULL_HANDLE) {
-        store_pending_blob(cache.path, cache);
+    if (cache.path.empty() || cache.cache == VK_NULL_HANDLE) {
         return;
     }
     try {
@@ -478,19 +654,17 @@ static void save_pipeline_cache(GPUDevice & dev, GpuPipelineCache & cache) {
         if (dev.vk->vkGetPipelineCacheData(dev.device, cache.cache, &size,
                                            nullptr) != VK_SUCCESS ||
             size == 0) {
-            store_pending_blob(cache.path, cache);
             return;
         }
         // The blob only grows when a pipeline is added, so an unchanged size
-        // means nothing was compiled beyond what the cache already held.
+        // means nothing was compiled beyond what the cache already held; the
+        // seed is still in the pending map or in the file.
         if (size == cache.loaded_size) {
-            store_pending_blob(cache.path, cache);
             return;
         }
         std::vector<uint8_t> data(size);
         if (dev.vk->vkGetPipelineCacheData(dev.device, cache.cache, &size,
                                            data.data()) != VK_SUCCESS) {
-            store_pending_blob(cache.path, cache);
             return;
         }
         data.resize(size);
@@ -515,7 +689,9 @@ static void configure_pipeline_cache(GPUDevice & dev,
         prune_stale_caches(layout, device_uuid(props));
     }
     if (vsfeel_debug_enabled()) {
-        fprintf(stderr, "[vsfeel] pipeline cache dir %s\n", layout.dir.c_str());
+        fprintf(stderr,
+                "[vsfeel] pipeline cache dir " VSFEEL_CACHE_PATH_FMT "\n",
+                layout.dir.c_str());
     }
 }
 

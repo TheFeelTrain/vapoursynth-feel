@@ -159,10 +159,11 @@ cd -- "$root_dir"
 
 # The pipeline cache is a data blob, not test state. A cold sweep still writes
 # one blob per filter family, and the suite creates hundreds of nodes, so keep
-# it in RAM instead of on the SSD. An explicit VSFEEL_PIPELINE_CACHE (or 0 to
-# disable it) is respected; otherwise the directory persists across runs so the
-# cache stays warm without ever naming a shader build by hand.
-if [[ -z ${VSFEEL_PIPELINE_CACHE:-} ]]; then
+# it in RAM instead of on the SSD. An explicit VSFEEL_PIPELINE_CACHE is
+# respected, including an empty value (which disables the cache, like the
+# plugin); otherwise the directory persists across runs so the cache stays warm
+# without ever naming a shader build by hand.
+if [[ -z ${VSFEEL_PIPELINE_CACHE+x} ]]; then
     cache_root=
     for candidate in "${XDG_RUNTIME_DIR:-}" /dev/shm; do
         if [[ -n $candidate && -d $candidate && -w $candidate ]]; then
