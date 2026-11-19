@@ -583,44 +583,42 @@ staying a bit-exact copy and the request orders on both.
 ## Open work
 
 - **The eigen step is the next latency-bound dispatch (~0.18 ms after the M
-  cache, 0.26 before).** It is one thread per group, so the whole dispatch is ~2 waves/SIMD
-  however many groups there are: mostly per-thread dependency chain (560
-  rotations of two transcendentals each), not work. A warp-per-group port of
-  the fused round-robin Jacobi over LDS was measured: solve 0.18 -> 0.26 ms and
-  the frame 1.16 -> 1.18 ms. A 32-lane workgroup per group wastes 28 lanes and
-  adds a barrier per round, so the serial register sweep stays; a
-  4-lane-per-group version (8 groups per warp) is the only remaining shape.
+  cache, 0.26 before).** One thread per group means ~2 waves/SIMD whatever the
+  group count, mostly a dependency chain (560 rotations of two transcendentals
+  each). A warp-per-group LDS Jacobi measured solve 0.18 -> 0.26 ms and the
+  frame 1.16 -> 1.18 ms; a 4-lane-per-group shape (8 groups per warp) is the
+  only remaining lever.
 - **The pre-cache default frame was 62% match, 18% apply, 15% solve, 4% gram,
   1% finish (GPUTRACE frame 5: 0.72/0.21/0.18/0.04/0.01 ms of 1.16 ms; the
-  cached frame is the banner's 0.78 ms, so read the shares).** The matcher is
-  at ~8 waves/SIMD. Its 32 threads
-  are right for the tile and the barriers, but the SSD chains are latency-bound.
-  The remaining lever is more groups per workgroup (two groups of 32 threads
-  with subgroup barriers, which needs the per-group arrays indexed by
-  `gl_SubgroupID` and the per-group LDS under 1 KB), or one warp per reference
-  block with the top-K by shuffle argmin (nssfactory `match.cu`). Both need the
-  candidate loop to stop using workgroup barriers.
+  cached frame is the banner's 0.78 ms).** The matcher is at ~8 waves/SIMD;
+  its 32 threads are right for the tile and barriers, but the SSD chains are
+  latency-bound. The remaining lever is more groups per workgroup (two groups
+  of 32 with subgroup barriers, per-group arrays via `gl_SubgroupID` and LDS
+  under 1 KB) or one warp per reference block with the top-K by shuffle
+  argmin; both need the candidate loop to stop using workgroup barriers.
 - The M cache removed the cached folds' Gram+Solve; Apply is now the second
-  cost (~0.21 ms) and re-reads the 64-float M from the estimate ring as scalar
-  loads while the pmat path uses sixteen `LD4`s. Vectorising the estimate
-  buffer is the cheap next step; caching the per-centre estimated patches
-  (64 floats per match, up to 8 matches) would skip Apply entirely but costs
-  far more memory.
+  cost (~0.21 ms). The estimate ring is `vec4` now; caching the per-centre
+  estimated patches would skip Apply entirely but costs far more memory.
 - What is left in the matcher itself is the SSD traffic: each candidate reads
   its 64 pixels from global (the reference block is already staged). The
   spatial pass could stage its window like `ENTRY_DIST` does, but `win` costs
   4 KB of the LDS that the occupancy depends on.
-- **The spatial matcher is still ~40% of its frame (~0.33 ms in the pre-cache
-  profile).** Its SSDs read both patches from LDS but the *reference* block is
-  re-read for every candidate, and the 225 distances per group go out to a
-  52 MB array and come back. The shape that removes both (nssfactory `match.cu`,
-  `spatial_match_warp_kernel`) is one warp per reference, the reference block in
-  registers, the top-K by warp-wide argmin and no distance array at all.
+- **The spatial matcher is still ~40% of its frame (~0.33 ms).** Its SSDs read
+  both patches from LDS, but the reference block is re-read per candidate and
+  the 225 distances per group go through a 52 MB array. The warp-per-reference
+  shape (`spatial_match_warp_kernel`) removes both.
 - `group_size > 8` (or `NOSPLIT`) takes the fused f32 kernel, which is correct
   but slower than the split estimate. Porting the split estimate to `q = 16/32`
   needs a different eigen step: 16x16 f32 no longer fits in registers
   (nssfactory switches to 16 lanes per group over equivalent LDS).
 - q > 32 is rejected (LDS eigen workspace); the reference allows 64.
+
+### Do not retry
+
+- **KMAXD-sized matcher lists.** The LDS saving vanishes above kk=32
+  (`next_pow2` saturates at 64) and the lists are not the occupancy limiter
+  there; the wired build measured +1.59% against an R08-only arm on an RTX
+  5060, inside noise, and a revival needs the full host LDS-model wiring.
 
 ## Debug env vars
 

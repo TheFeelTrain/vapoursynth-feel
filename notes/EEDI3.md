@@ -206,23 +206,18 @@ register is the largest addressable item; the three-window redundancy is worth
   275.9**, **EEDI3AA 20.8 -> 26.0 fps**; EEDI3H stays in place (transpose; -2%).
 - **2026-11-05 — dependencies match the batched requests.** A batch reads
   `n..n+B-1` from all three and AA's sclip `2j`/`2j+1`; they are `rpGeneral` now.
-- **2026-10-18 — f16 as a storage-only third io depth.** Pad, xpose copies, the
-  AA intermediate `v`/O_0 and the mask kernels gained native `float16_t`
-  variants; `dst`/`cint`/`vout`/`hp` stay f32, so f16 = the f32 path rounded
-  once (u16/f16/f32 medians 618/603/489, 748/719/630, 176/161/125 fps). The
-  first cut was not exact: the AA merge's `float16_t` narrowing was folded into
-  an f16 FMA by the compiler, so the operand was the unrounded vout and the
-  horizontal DP amplified one half ulp into ~2% of pixels; `half_rne` (integer
-  RNE) fixed it and EEDI3AA f16 is bit-exact against the two-call chain. A full
-  half arithmetic path was rejected: the row kernel is ALU-issue bound, scalar
-  f16 is no faster than f32 there and the DP does not pack, and the ~90 MB
-  frame scratch is under 1% of the 6.2 ms frame, so it cannot reach the 30% bar.
+- **2026-10-18 — f16 as a storage-only third io depth.** Pad, xpose copies,
+  the AA intermediate `v`/O_0 and mask kernels gained native `float16_t`;
+  `dst`/`cint`/`vout`/`hp` stay f32, so f16 = f32 rounded once (u16/f16/f32
+  medians 618/603/489, 748/719/630, 176/161/125 fps). The first cut was not
+  exact: the AA merge's half narrowing folded into an f16 FMA and the
+  horizontal DP amplified one half ulp into ~2% of pixels; `half_rne` fixed
+  it. Full half arithmetic was rejected (ALU-issue bound; the DP does not
+  pack).
 - **2026-10-12 — the banner's table is re-measured; the old numbers are void.**
-  u16 472/56, EEDI3H 471/52, hp 198/48 and the "470.4 → 469.6 fps (+0.0%)"
-  pre-optimization pair were taken against the pre-fix benchmark harness
-  (`notes/METHOD.md`). The same-session result that pair carried (the
-  optimization changed nothing because the frame is transfer bound) is what the
-  banner's ablation now measures directly.
+  u16 472/56, EEDI3H 471/52, hp 198/48 and the "470.4 → 469.6 fps" pair used
+  the pre-fix harness (`notes/METHOD.md`); the banner's ablation now measures
+  the transfer-bound frame directly.
 - **2026-10-03 — hp (half-pel search), bit-exact against eedi3vk2.** `hp` was
   an accepted no-op (eedi3m registers it that way: "only full pel is
   implemented"); eedi3vk2, vszip and vszipcl implement it, so vsfeel does too.
@@ -237,25 +232,18 @@ register is the largest addressable item; the three-window redundancy is worth
   hp=1 on u16 (mdis 1..40, nrad 0..3, vcheck 0..3, field 0..3, dh, sclip, mclip
   right/left/all) ; f32 too, except nrad=3 at mdis ≥ 25 (1.19e-7, the parallel
   vcheck's Jacobi residual). hp costs 2.3x the full-pel row.
-- **2026-10-02 — f32 bit-exactness, found by the clip change.** On real content
-  the f32 path lost its ~1 ulp band to DP argmin flips worth up to 4.9e-2, and
-  u16 lost bit-exactness by 1 LSB on a few pixels per frame; every failing
-  config had `vcheck > 0`. Two mechanisms, both in `ENTRY_ROW`/`ENTRY_VCHECK`:
-  eedi3vk2's `precise` qualifiers were missing, so ACO contracted
-  `alpha*(s0+s1+s2)+beta*|u|`, the relax's `gamma*|dd|+ext` and the vcheck's
-  `a0/a1/a2`/blend into FMAs an ulp off (and `cubic4` on essentially every
-  interpolated pixel); and the rolling window sums were accumulated
-  incrementally where the reference re-sums the term ring in k order
-  (`orderedSum`), which drifts by an ulp per column. Diffing the two shaders
-  expression by expression is what found both; the ring re-sum costs −1.2% (459.3
-  → 453.7 fps on the graded chain, inside the run spread). The `mclip` cubic
-  test's own oracle was also wrong (`p3`/`n3` read as the same row); corrected to
-  the integer cubic, which the masked region reproduces exactly.
+- **2026-10-02 — f32 bit-exactness, found by the clip change.** On real
+  content f32 lost its ~1 ulp band to DP argmin flips (up to 4.9e-2) and u16
+  lost 1 LSB on a few pixels; every failing config had `vcheck > 0`. Missing
+  `precise` qualifiers let ACO contract the cost/relax/vcheck expressions into
+  FMAs an ulp off, and the rolling sums were accumulated incrementally where
+  the reference re-sums the ring in k order (`orderedSum`). Both fixed; the
+  ring re-sum costs −1.2% (459.3 → 453.7 fps, inside the run spread). The
+  mclip cubic oracle was also wrong (`p3`/`n3` read as the same row); fixed.
 - **Compat args `opt`/`ucubic`/`cost3` are registered accepted no-ops.** They
   select behaviour vsfeel always runs (AVX2-class path, cubic fill, three-window
   costs), so any value is byte-identical to the default
-  (`test_eedi3_compat_args_are_accepted_noops`); `hp` used to fail dispatch
-  (vsaa forwards it). No perf change.
+  (`test_eedi3_compat_args_are_accepted_noops`); `hp` used to fail dispatch.
 - **The R80 port's own cost** (same-session A/B against the pre-port build, 2
   reps, graded medians): EEDI3 **612 → 384 fps**, EEDI3H 417 → 401, EEDI3AA
   155 → 148.
@@ -559,9 +547,6 @@ passes). All bit-identical to the previous build unless stated.
   lower count with new spills or schedule damage is a regression.
 - **hp's row cost**: an 81-byte pbt column (±2 deltas would fit 3 bits), 69
   ring registers per lane at K=3, and hpfill's own phase.
-- **Kill the ring shift register** (PROBE=15: 12.0% of the kernel, ~8% of
-  EEDI3AA): a circular ring needs the column loop unrolled by RN with a
-  compile-time base, and `roll_seed` must rotate its write indices.
 - **The three-window redundancy** (PROBE=14: 8.2%) needs a 2|u|-deep delay line;
   ~90 registers at K=2 vs 96 today, so only if something else gives up first.
 - **EEDI3H/EEDI3AA output staging** ships on NVIDIA (+43%/+24%); the vertical
@@ -580,6 +565,23 @@ passes). All bit-identical to the previous build unless stated.
 
 ### Do not retry
 
+- **Killing the ring-shift register with a phased ring.** Three bit-exact
+  implementations (nested RN-group unroll, textual 7-slot unroll, 7-way
+  uniform switch) measured **-16.8%, -9.3% and -6.0%** on an RTX 5060
+  (1080p16, field=3, mdis=20, nrad=2, ABBA, 18/18 samples below base). The
+  shift movs are effectively free there; the extra control/encoding dominates.
+  PROBE=15 priced issue slots, not their throughput; re-test on a toolchain
+  that folds the spec-constant modulo chain.
+- **`BT_TILE` 32 -> 64.** Halving the backtrack tile iterations measured
+  +1.51% on plain EEDI3 and flat on EEDI3AA (RTX 5060, 1080p); confirmation
+  was void when the control arm moved ~95%. The row kernel is issue-bound, so
+  ~120 fewer barrier pairs are worth at most 0.1-0.3% of issue slots. Any
+  revisit must flip the host `BT_TILE` too, not just the shader.
+- **Vectorized `row_word` mask loads.** Correct only after gating `MASK_HALF`
+  out (the first cut compared half bits as u16 codes). Its effect is at most
+  ~1% of `prep`, below the floor on the session-bimodal RTX 5060 box; the 2x
+  "regression" was the machine, not the code.
+
 *(stale)*: verdict from the degenerate pre-round-14 config; mechanism kept.
 
 - **Vertical output staging** measured +0.02% on an RTX 5060: the BLIT's
@@ -589,7 +591,6 @@ passes). All bit-identical to the previous build unless stated.
 - **SGSIZE 64 / K=1.** +2% on EEDI3AA only, neutral on EEDI3; not shipped (a
   second row module plus device-limit handling for ~2% on one workload), and
   the kernel is issue-bound anyway (round 29).
-
 - **Breaking the walk's serial load chain** (lookahead, ±1 windows, an
   f-independent address): 453.9 / 451.4 / 457.0 fps — identical — and PROBE=6 ties
   real (532.6 vs 530.6); 4x-unrolling with merged `tileF` stores is a wash (8
