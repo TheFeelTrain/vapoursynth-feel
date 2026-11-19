@@ -177,7 +177,10 @@ layout(std430, binding = 7) readonly buffer MatchBuf { uint matches[]; };
 #endif
 // Per-centre solved M (8x8) and weight for the split path's cached folds.
 // EST_BASE is -1 when the cache is disabled for this instance.
-layout(std430, binding = 8) buffer EstBuf { float est[]; };
+// binding 8: the solved-M ring, one 68-float record per centre (64 matrix
+// floats + weight + padding), i.e. exactly 17 vec4s — the vector view the
+// solve/apply paths use.
+layout(std430, binding = 8) buffer EstBuf { vec4 est4[]; };
 
 // Temporal mode only: the output frame and the clip length, for the reference's
 // VAggregate fold (its slab index is clamped at the clip boundaries, so the
@@ -1773,14 +1776,19 @@ void main() {
             primary = primary && (centre_of(k) != sc);
         }
         if (primary) {
-            const uint eb = uint(EST_BASE) +
-                            (uint(sc & (RING - 1)) * uint(NG) +
-                             uint(sgroup)) *
-                                68u;
-            for (int i = 0; i < 64; ++i) {
-                est[eb + uint(i)] = pmat[gbase + uint(i)];
+            // EST_BASE accumulates ring*ng*68 per plane (always a multiple of
+            // 4), so the vec4 view is exact.
+            const uint eb4 =
+                uint(EST_BASE >> 2) +
+                (uint(sc & (RING - 1)) * uint(NG) + uint(sgroup)) * 17u;
+            for (int i = 0; i < 16; ++i) {
+                const uint o = uint(i * 4);
+                est4[eb4 + uint(i)] = vec4(pmat[gbase + o + 0u],
+                                           pmat[gbase + o + 1u],
+                                           pmat[gbase + o + 2u],
+                                           pmat[gbase + o + 3u]);
             }
-            est[eb + 64u] = weight;
+            est4[eb4 + 16u] = vec4(weight, 0.0, 0.0, 0.0);
         }
     }
     if (TRACE != 0) {
@@ -1807,14 +1815,19 @@ void main() {
     float wgt;
     float am[64];
     if (acached) {
-        const uint eb = uint(EST_BASE) +
-                        (uint(centre_of(afold) & (RING - 1)) * uint(NG) +
-                         uint(int(aslot) - afold * NG)) *
-                            68u;
-        for (int i = 0; i < 64; ++i) {
-            am[i] = est[eb + uint(i)];
+        const uint eb4 =
+            uint(EST_BASE >> 2) +
+            (uint(centre_of(afold) & (RING - 1)) * uint(NG) +
+             uint(int(aslot) - afold * NG)) *
+                17u;
+        for (int i = 0; i < 16; ++i) {
+            const vec4 t = est4[eb4 + uint(i)];
+            am[i * 4 + 0] = t.x;
+            am[i * 4 + 1] = t.y;
+            am[i * 4 + 2] = t.z;
+            am[i * 4 + 3] = t.w;
         }
-        wgt = est[eb + 64u];
+        wgt = est4[eb4 + 16u].x;
     } else {
         wgt = pmat[gbase + uint(MAT_WEIGHT)];
         LD4(am, gbase, 0) LD4(am, gbase, 4) LD4(am, gbase, 8)

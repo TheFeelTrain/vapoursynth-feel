@@ -276,6 +276,17 @@ staying a bit-exact copy and the request orders on both.
 
 ## Historical
 
+- **2026-11-19 — the solved-M estimate ring moves as `vec4` (+2.8% RTX 5060,
+  flat on RX 7900 XTX).** `EstBuf` holds one 68-float record per cached
+  centre; `ENTRY_SOLVE` wrote 64 scalars and `ENTRY_APPLY` read them back
+  scalar. The ring is now a `vec4` view: 17 16-byte accesses each way, with
+  `EST_BASE >> 2` exact because every plane base is a multiple of 68 (17
+  vec4s). The stored floats are identical lane-for-lane; the padding floats
+  are now deterministic zeros and unread. Same-session ABBA: RTX 5060 (1080p
+  yuv420p10, chroma radius=1) 257.05 -> 264.45 fps (+2.80%, 6/8 pairs); RX
+  7900 XTX (1080p f32, default benchmark config) 1305.5 -> 1306.3 fps
+  (-0.06%, 24 samples), i.e. neutral where the scalar loads were already
+  coalesced.
 - **2026-11-18 — the f32 window lands in a persistent slot ring too
   (+18.6% r=1, +25.7% r=2, f32 1080p, RTX 5060 Laptop / GB206).** The
   2-byte path's slot ring was extended to f32: each window's planes live in a
