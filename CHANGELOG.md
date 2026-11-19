@@ -25,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - DFTTest and NLMeans size their working set to the card's cache, so a GPU with less cache no longer streams it
 - EEDI3, EEDI3H, and EEDI3AA use less VRAM for the same output
 - EEDI3, EEDI3H and EEDI3AA are about 10-20% faster on NVIDIA GPUs
+- EEDI3AA is about 3% faster
 - WNNM is about 8% faster at `radius=0` and about 2% faster with a temporal search
 - WNNM is faster on float clips on NVIDIA GPUs
 - WNNM uses less VRAM on GPUs with a small VRAM allowance

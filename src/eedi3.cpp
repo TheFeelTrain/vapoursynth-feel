@@ -635,6 +635,35 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
     const int32_t scratch = d.scratch_elem;
     const int32_t hp_elem = d.hp_elem;
     const int numPlanes = d.vi->format.numPlanes;
+    // EEDI3AA vertical merge fusion is all-or-nothing across every vertical
+    // job and every processed plane: the kAssembleV tail reads the vout
+    // regions of all of them, so if any plane cannot fuse (its vcheck is not
+    // the para form), no plane may fuse and the assembler runs as before.
+    // The scan covers every job in this frame, so the kVcheck and kTail
+    // decisions in one record_pass call decide identically; the two call
+    // sites of the AA vertical groups also see the same jobs array, the same
+    // d.process and the same (global, i.e. job-independent) pipe selection,
+    // so they decide identically across calls as well. The shader's asm
+    // path is only valid on the para vcheck: setting vout2_base on the
+    // serial/LDS forms would corrupt their vout rows, and the host guard is
+    // what keeps amode != 0 unreachable there.
+    const bool fuse_av_all = [&] {
+        if (!d.aa || d.dh || d.skip_vcheck || d.vcheck <= 0) {
+            return false;
+        }
+        for (int jj = 0; jj < njobs; ++jj) {
+            const Eedi3Job & j2 = jobs[jj];
+            if (j2.horiz) {
+                continue;
+            }
+            for (int p = 0; p < numPlanes; ++p) {
+                if (d.process[p] && !j2.planes[p].pipes.vcheck_para) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }();
 
     for (int job = 0; job < njobs; ++job) {
         const Eedi3Job & jb = jobs[job];
@@ -866,7 +895,18 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                 const auto & cfg = planes[plane];
                 const VkBuffer sclip_buf =
                     (horiz || !in.sclip[plane]) ? in.scratch : in.sclip[plane];
-                const Eedi3PushConstants pc = row_pc(cfg, plane);
+                Eedi3PushConstants pc = row_pc(cfg, plane);
+                // EEDI3AA vertical: fuse the assemblev merge into the vcheck
+                // (para form only). Each sub-pass's vcheck then writes exactly
+                // the v rows of its parity, the vout stores go dead, and the
+                // kAssembleV tail is skipped wholesale.
+                const bool fuse_av = fuse_av_all && !horiz;
+                if (fuse_av) {
+                    pc.out_base = static_cast<int32_t>(cfg.v_off / elem);
+                    pc.vout2_base = second ? 2 : 1;
+                    pc.raw_base = in.src_base[plane];
+                    pc.src_stride = in.src_stride[plane];
+                }
                 // Fully-masked rows are copied in parallel so the serial walk
                 // only visits non-empty rows (the LDS and parallel forms carry
                 // every row and need no copy pass).
@@ -884,7 +924,8 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
                 bind_pipe(d, cmd, cfg.pipes.vcheck);
                 bind_bufs(d, cmd,
                           { in.scratch, in.scratch, in.scratch, in.scratch,
-                            in.scratch, sclip_buf, in.scratch, in.scratch });
+                            in.scratch, sclip_buf, in.scratch, in.scratch,
+                            in.scratch, in.scratch, in.src[plane] });
                 pc_push(d, cmd, pc);
                 dispatch(d, cmd, 1, cfg.pipes.vcheck_para ? cfg.rows : 1);
             }
@@ -897,6 +938,12 @@ static void record_pass(const Eedi3Data & d, VkCommandBuffer cmd,
 
         if (tail == PassTail::kAssembleV) {
             // EEDI3AA vertical merge: v[y] = (src[y] + vout_{y&1}[y>>1] + 1) >> 1.
+            // When the merge is fused into every plane's vcheck the v rows are
+            // already complete and the assembler would read vout regions that
+            // are never written (asm mode skips the vout stores).
+            if (fuse_av_all) {
+                continue;
+            }
             // Recorded with the SECOND sub-pass's parity, so the assembler's
             // `pc.field` (which vout region belongs to which parity) is its
             // complement.
@@ -2511,8 +2558,9 @@ static void vsfeel_eedi3_create(const VSMap * in, VSMap * out,
 
     {
         // b0 pad, b1 dst, b2 pbt, b3 dmap, b4 bmask, b5 sclip, b6 cint,
-        // b7 vout, b8 hp.
-        const auto layout = gpu_push_set_layout(*d->gpu, 9);
+        // b7 vout, b8 hp, b9 asmv (EEDI3AA fused vertical merge), b10 the
+        // source plane the merge reads.
+        const auto layout = gpu_push_set_layout(*d->gpu, 11);
         if (std::holds_alternative<std::string>(layout)) {
             return set_error(std::get<std::string>(layout));
         }

@@ -247,6 +247,17 @@ reference chain:
 
 ## Historical
 
+- **2026-11-19 — the vertical merge is fused into the vcheck (+1% RTX 5060,
+  +3.3% RX 7900 XTX).** The AA chain's `ENTRY_ASSEMBLEV` merge ran as a second
+  dispatch over the whole v frame; the para vcheck now writes each parity's
+  merged rows directly (`v[y] = merge(src[y], vout[y>>1])`), deleting the
+  dispatch and the vout round-trip. The fusion is all-or-nothing across every
+  vertical job and plane and only on the para vcheck; other paths, EEDI3 and
+  EEDI3H pay three extra descriptor writes and nothing else. u16/f16/f32 merge
+  math matches the assembler bit for bit; the EEDI3/EEDI3H/EEDI3AA suites pass.
+  Same-session ABBA, 1080p16 field=3 mdis=20 nrad=2: RTX 5060 35.70→36.26 /
+  35.52→35.90 / 36.22→36.54 fps (three sessions); RX 7900 XTX 192.4→198.9 fps
+  (36 samples, spread 13%, default cache).
 - **2026-11-16 — output staging ships for the compose tail (+24%).** The fused
   chain publishes once after the four sub-pass groups; the vertical EEDI3 BLIT
   stays direct. `VSFEEL_EEDI3_OSTAGE` overrides.

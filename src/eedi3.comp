@@ -390,6 +390,14 @@ layout(std430, binding = 6) buffer CintBuf { SCRATCH_T cint[]; };
 layout(std430, binding = 7) buffer VoutBuf { SCRATCH_T vout[]; };
 // Half-pel rows (hp only), built by ENTRY_HPFILL; WIDTH elements per pad row.
 layout(std430, binding = 8) readonly buffer HpBuf { HP_T hp[]; };
+// EEDI3AA vertical merge fused into the vcheck (asm mode != 0 in the push
+// constants): the merged frame v, io elements, written at rows field + 2*r.
+// Always bound (scratch) so the fused code compiles to a runtime guard.
+layout(std430, binding = 9) writeonly buffer AsmVNode { IO_TYPE avout[]; };
+// The source plane (binding 10): the merge reads src[yf] directly, because the
+// pad only holds the kept-parity rows (interp-parity pad rows are never
+// written).
+layout(std430, binding = 10) readonly buffer AsmSrcIn { IO_TYPE asrc[]; };
 #endif
 
 layout(push_constant) uniform PC {
@@ -1838,8 +1846,35 @@ DEF_VC_EVAL(vc_eval, vc_pr)
 void vc_row(int r) {
     const int tid = int(gl_LocalInvocationID.x);
     const int lsz = int(gl_WorkGroupSize.x);
+    // EEDI3AA vertical merge fused in (para form only; the host sets the asm
+    // mode): rows of one parity belong to one sub-pass, so every output row
+    // is written by exactly one of the two sub-passes' vchecks.
+    const int amode = pc.vout2_base;
+    const int outbase = pc.out_base;
     for (int x = tid; x < WIDTH; x += lsz) {
-        vc_store(x, vc_quant(vc_eval(r, x)));
+        const float qe = vc_eval(r, x);
+        if (amode == 0) {
+            vc_store(x, vc_quant(qe));
+            continue;
+        }
+        const int yf = pc.field + 2 * r;
+        const int si = pc.raw_base + yf * pc.src_stride + x;
+#if defined(IO_U16)
+        const float s = float(int(asrc[si]));
+        const int vi = int(vc_quant(qe));
+        avout[outbase + yf * WIDTH + x] = IO_TYPE((int(s) + vi + 1) >> 1);
+#elif defined(IO_F16)
+        const float s = float(asrc[si]);
+        const float vv = half_rne(qe);
+        const float res = (amode == 1) ? vv + (s - vv) * 0.5f
+                                       : s + (vv - s) * 0.5f;
+        avout[outbase + yf * WIDTH + x] = IO_TYPE(half_rne(res));
+#else
+        const float s = asrc[si];
+        const float res = (amode == 1) ? qe + (s - qe) * 0.5f
+                                       : s + (qe - s) * 0.5f;
+        avout[outbase + yf * WIDTH + x] = IO_TYPE(res);
+#endif
     }
 }
 
