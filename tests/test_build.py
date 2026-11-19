@@ -64,6 +64,36 @@ def test_generator_rejects_a_truncated_module(tmp_path):
     assert "multiple of 4" in proc.stderr
 
 
+def test_generator_emits_a_content_hash(tmp_path):
+    """The hash names the runtime cache file, so shader bytes must change it."""
+    spv = tmp_path / "shader.spv"
+    spv.write_bytes(SPV_HEADER)
+    out = tmp_path / "shader.h"
+    hash_out = tmp_path / "shader_hash.h"
+    cmd = [
+        sys.executable,
+        str(GENERATOR),
+        "--out",
+        str(out),
+        "--hash-out",
+        str(hash_out),
+        str(spv),
+    ]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    match = re.search(r'#define VSFEEL_SPIRV_HASH "([0-9a-f]{16})"', hash_out.read_text())
+    assert match, hash_out.read_text()
+    first = match.group(1)
+
+    spv.write_bytes(SPV_HEADER + b"\0\0\0\0")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    match = re.search(r'#define VSFEEL_SPIRV_HASH "([0-9a-f]{16})"', hash_out.read_text())
+    assert match, hash_out.read_text()
+    assert match.group(1) != first
+
+
 def run_lint_stub(build):
     return subprocess.run(
         [sys.executable, str(LINT_STUB), "--build-dir", str(build)],

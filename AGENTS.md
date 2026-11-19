@@ -457,24 +457,29 @@ removing a variant regenerates it. Do not remove either.
 
 Compiling the compute shaders from SPIR-V dominates filter creation on RADV:
 the first variant takes seconds, versus a fraction of a second once the driver
-has it. The plugin therefore keeps a `VkPipelineCache` seeded from and flushed
-to a file:
+has it. The plugin therefore keeps one `VkPipelineCache` per filter family,
+seeded from and flushed to a file:
 
-- default location: `$XDG_CACHE_HOME/vsfeel/pipeline_cache_<pipelineCacheUUID>.bin`
+- default location: `$XDG_CACHE_HOME/vsfeel/`
   (`~/.cache/vsfeel/...`), with an automatic fallback to `$TMPDIR/vsfeel/` when
-  the home cache is not writable (read-only home, sandbox, CI);
-- `VSFEEL_PIPELINE_CACHE=<path>` overrides the file, `VSFEEL_PIPELINE_CACHE=0`
-  disables the cache entirely (useful when checking that a shader change
-  actually recompiles);
-- the driver's `pipelineCacheUUID` is both the filename and part of the cache
-  contents, so a driver/device change misses instead of feeding the driver
-  incompatible data. The file is written via a unique temp file + rename, so
-  concurrent test subprocesses cannot corrupt it;
-- the write is **skipped when the blob is the size it was loaded at**, so a
-  process that compiled nothing new leaves the file alone. Without that check
-  every short-lived process rewrote the whole blob at exit, which turned a short
-  test run into a large amount of device writes; with the check it is
-  negligible.
+  the home cache is not writable (read-only home, sandbox, CI). File names are
+  `pipeline_cache_<pipelineCacheUUID>_<spirvhash>_<family>.bin`;
+- `VSFEEL_PIPELINE_CACHE=<path>` overrides the location. An existing directory
+  (or a path ending in `/`) holds the standard file names; any other path is a
+  file prefix, so `/tmp/cache.bin` becomes `/tmp/cache_<spirvhash>_<family>.bin`.
+  `VSFEEL_PIPELINE_CACHE=0` disables the cache entirely (useful when checking
+  that a shader change actually recompiles);
+- the driver's `pipelineCacheUUID` and a content hash of the embedded SPIR-V are
+  both in the filename, so a driver, device or shader change misses instead of
+  feeding the driver incompatible data or appending to an older build's entries.
+  Caches from an older shader hash are pruned from the directory;
+- a process holds the blob in memory between filter instances and writes it
+  **once**, when the core unloads the plugin or the process exits. The write is
+  skipped when the blob is the size it was loaded at, and a concurrent
+  process's larger file is never replaced by a smaller one. This is what keeps
+  a filter sweep from rewriting hundreds of MB for every node it creates;
+- tests keep this cache in a per-user directory under `$XDG_RUNTIME_DIR` or
+  `/dev/shm` (see `tools/test.sh`), so a cold run writes RAM, not the SSD.
 
 Cold runs are slower because they build the cache. The first run after a driver
 or `glslc` update pays the compile again by design.

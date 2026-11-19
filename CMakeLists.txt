@@ -602,18 +602,21 @@ endif()
 # Makefiles does not track that: stamp the argument list so the header is
 # regenerated, not left with the removed variant's arrays.
 set(VK_SPV_HEADER "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h")
+set(VK_SPV_HASH "${CMAKE_CURRENT_BINARY_DIR}/spirv_hash.h")
 set(VK_SPV_HEADER_STAMP "${VK_SPV_HEADER}.args")
 file(GENERATE OUTPUT "${VK_SPV_HEADER_STAMP}" CONTENT "${VK_SPV_OUTPUTS}\n")
 add_custom_command(
-    OUTPUT "${VK_SPV_HEADER}"
+    OUTPUT "${VK_SPV_HEADER}" "${VK_SPV_HASH}"
     COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/src/gen_spirv_header.py"
             --out "${VK_SPV_HEADER}"
+            --hash-out "${VK_SPV_HASH}"
             ${VK_SPV_OUTPUTS}
     DEPENDS ${VK_SPV_HEADER_DEPS}
             "${VK_SPV_HEADER_STAMP}"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/gen_spirv_header.py"
     VERBATIM)
-set_source_files_properties("${VK_SPV_HEADER}" PROPERTIES GENERATED TRUE)
+set_source_files_properties("${VK_SPV_HEADER}" "${VK_SPV_HASH}"
+    PROPERTIES GENERATED TRUE)
 
 # NNEDI3 weights: link the raw blob straight into the binary so the 13.5 MB
 # never passes through the compiler, and the wheel stays self-contained
@@ -676,6 +679,7 @@ add_library(vsfeel SHARED
     src/eedi3.cpp
     src/nnedi3.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/spirv_binaries.h"
+    "${CMAKE_CURRENT_BINARY_DIR}/spirv_hash.h"
     ${VSFEEL_WEIGHTS_SOURCE})
 configure_common(vsfeel)
 

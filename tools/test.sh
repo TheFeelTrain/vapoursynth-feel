@@ -157,6 +157,27 @@ fi
 
 cd -- "$root_dir"
 
+# The pipeline cache is a data blob, not test state. A cold sweep still writes
+# one blob per filter family, and the suite creates hundreds of nodes, so keep
+# it in RAM instead of on the SSD. An explicit VSFEEL_PIPELINE_CACHE (or 0 to
+# disable it) is respected; otherwise the directory persists across runs so the
+# cache stays warm without ever naming a shader build by hand.
+if [[ -z ${VSFEEL_PIPELINE_CACHE:-} ]]; then
+    cache_root=
+    for candidate in "${XDG_RUNTIME_DIR:-}" /dev/shm; do
+        if [[ -n $candidate && -d $candidate && -w $candidate ]]; then
+            cache_root=$candidate
+            break
+        fi
+    done
+    if [[ -n $cache_root ]]; then
+        cache_dir=$cache_root/vsfeel-test-cache-$(id -u 2>/dev/null || echo 0)
+        if mkdir -p -- "$cache_dir" 2>/dev/null; then
+            export VSFEEL_PIPELINE_CACHE=$cache_dir
+        fi
+    fi
+fi
+
 # reference/ is read-only porting material, never part of this suite: it holds
 # the references' own tests plus their dependency trees (lvsfunc, vs-jetpack),
 # which are not ours to run and whose collection is what breaks ours.

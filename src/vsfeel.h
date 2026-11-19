@@ -415,6 +415,22 @@ inline std::string vsfeel_probe_strides(const VSAPI * vsapi, VSCore * core,
 // arrays below; a device never reports fewer than this for the filters here.
 constexpr uint32_t GPU_MAX_BINDINGS = 32;
 
+// One persistent cache per filter family. The driver's blob is opaque, so a
+// family's cache is the smallest unit that can be written without rewriting
+// every other filter's entries.
+struct GpuPipelineCache {
+    VkPipelineCache cache {};
+    std::string path;
+    // Size of the blob the cache was seeded with: a process that compiled
+    // nothing new must not rewrite the file at exit.
+    size_t loaded_size {};
+    // The blob itself, kept between filter instances so the next one seeds
+    // from memory instead of reading the file back.
+    std::vector<uint8_t> blob;
+    bool dirty {};
+    int pid {};
+};
+
 struct GPUDevice {
     const VSVULKANAPI * api {};
     const VSVulkanFunctions * vk {};
@@ -479,20 +495,24 @@ struct GPUDevice {
     // -- subgroup size control/full subgroups, the subgroup operation bits, the
     // float-atomic extension, push-descriptor counts -- are queried above.
 
-    // Persistent pipeline cache, shared by every instance on this device: the
-    // core exposes no cache of its own, and compiling from SPIR-V is seconds
-    // per variant on RADV.
-    VkPipelineCache pipeline_cache {};
+    // Persistent pipeline caches, one per filter family. The core exposes no
+    // cache of its own, and compiling from SPIR-V is seconds per variant on
+    // RADV. Files are named for the device UUID, the shader build and the
+    // family, so a shader change starts a fresh cache and one filter's sweep
+    // cannot rewrite another filter's entries.
+    mutable std::map<std::string, GpuPipelineCache> pipeline_caches;
+    mutable GpuPipelineCache pipeline_cache_disabled;
+    std::string pipeline_cache_dir;
+    std::string pipeline_cache_prefix;
+    std::string pipeline_cache_suffix { ".bin" };
     std::mutex * pipeline_cache_lock {};
-    std::string pipeline_cache_path;
-    // Size of the blob the cache was seeded with: a process that compiled
-    // nothing new must not rewrite ~150 MB at exit.
-    size_t pipeline_cache_loaded_size {};
 
-    // The core owns the device and destroys it with the core, so the cache has
-    // to be flushed while the last reference here is still dropped -- an
-    // atexit handler would run after the device is gone. The registry holds a
-    // weak reference for exactly that reason.
+    GpuPipelineCache & pipeline_cache_for(const char * tag) const;
+
+    // The core owns the device and destroys it with the core, so the caches
+    // have to be captured while the last reference here is still dropped. The
+    // captured blobs are flushed once, at process exit, with no Vulkan calls
+    // left to make. The registry holds a weak reference for that reason.
     ~GPUDevice();
 
     // One device per VkDevice, reached through a shared_ptr: copying the handle
@@ -1352,15 +1372,18 @@ inline std::variant<VkPipeline, std::string> gpu_create_pipeline(
 
     VkPipeline pipeline {};
     VkResult result;
+    // The family's cache is loaded (or taken from the previous instance's
+    // in-memory blob) here, once per family rather than once per filter.
+    GpuPipelineCache & cache = g.pipeline_cache_for(tag);
     {
         // vkCreateComputePipelines requires the host to serialize access to the
-        // shared cache.
+        // cache it compiles into.
         std::lock_guard lock(*g.pipeline_cache_lock);
         // Timed so a cold-start report can tell compilation apart from a slow
         // frame: the first run compiles every kernel serially here.
         const auto t0 = std::chrono::steady_clock::now();
-        result = g.vk->vkCreateComputePipelines(g.device, g.pipeline_cache, 1,
-                                                &info, nullptr, &pipeline);
+        result = g.vk->vkCreateComputePipelines(g.device, cache.cache, 1, &info,
+                                                nullptr, &pipeline);
         if (vsfeel_debug_enabled()) {
             const double ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - t0)
