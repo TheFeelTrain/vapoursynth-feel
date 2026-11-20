@@ -75,6 +75,7 @@ import ast
 import contextlib
 import hashlib
 import importlib.util
+import math
 import os
 import re
 import shutil
@@ -104,6 +105,27 @@ TIME_RUN_FRAMES = 4_000_000
 # which is additive: 6 GiB keeps the pair well under the incident point.
 AA_CACHE_MB = 6144
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _gpu_limit_line(gpu_limit_mb: int | None) -> str:
+    """The --gpu-limit-mb pin, guarded for cores without the VRAM knob.
+
+    A truthiness test used to drop an explicit value the same as the unset
+    default, silently restoring the core's own limit, and a bare assignment
+    aborted script evaluation on a core predating the R80 GPU API with an
+    AttributeError from deep inside the binding; the guard makes that a
+    [bench] line instead, which the harness forwards. (0 never reaches here:
+    the core's own rule is a positive number, so the CLI rejects it.)
+    """
+    if gpu_limit_mb is None:
+        return ""
+    return (
+        'if hasattr(core, "max_vram_cache_size"):\n'
+        f"    core.max_vram_cache_size = {gpu_limit_mb}\n"
+        "else:\n"
+        '    print("[bench] this core has no max_vram_cache_size; '
+        '--gpu-limit-mb ignored", file=sys.stderr)\n'
+    )
 
 
 def make_vpy(
@@ -253,7 +275,7 @@ def make_vpy(
         gpu_lines = ("" if conv else scale_lines) + (
             conv + "clip_gpu = core.std.GPUUpload(clip=clip)\n" if gpu_cache else ""
         )
-    gpu_limit_line = f"core.max_vram_cache_size = {gpu_limit_mb}\n" if gpu_limit_mb else ""
+    gpu_limit_line = _gpu_limit_line(gpu_limit_mb)
     return f"""\
 from vssource import BestSource
 from vstools import core, depth, get_y
@@ -332,6 +354,7 @@ def make_aa_vpy(
     gpu_cache: bool = True,
     download_inputs: bool = False,
     upscale: bool = True,
+    scale: float = 1.0,
     vs_cache_mb: int = 1024 * 48,
     gpu_limit_mb: int | None = None,
 ) -> str:
@@ -360,6 +383,12 @@ def make_aa_vpy(
     ``upscale=False`` keeps the mask but skips the Point upscale: the plain
     EEDI3/EEDI3H mclip benchmarks run at the source resolution, and their
     chains use `clip`/`mclip` only (`sclip` stays defined but unused).
+
+    ``scale`` (default 1) is --scale: the luma is Point-upscaled to N times
+    the source before the mask chain and the AA resize, so the grade is the
+    filter's own work at N x source with eedi3aa's 2x supersample stacked
+    on top. Like make_vpy, the resize is off the clock whenever the frames
+    are preloaded and timed with --no-cache.
     """
     if cache_frames is not None:
         if cache_bytes:
@@ -460,6 +489,15 @@ sclip = {"core.std.Interleave([clip, clip])" if upscale and eedi3_field > 1 else
             sclip_expr = "core.std.Interleave([ss, ss])" if upscale and eedi3_field > 1 else "clip"
             cache_lines = f"clip = ss\nsclip = {sclip_expr}\n"
     luma_expr = _depth_expr("get_y(src)", io_format)
+    # --scale N grades the chain at N x source: the luma is upscaled before
+    # the mask chain derives from it, and the AA's own resize follows, so
+    # eedi3aa's 2x supersample stacks on top of the grade.
+    scale_lines = (
+        f"luma = core.resize.Point(luma, round(luma.width * {scale}), "
+        f"round(luma.height * {scale}))\n"
+        if scale > 1
+        else ""
+    )
     if upscale:
         resize_lines = (
             '# Point 2x upscale of input + mask (user: "double the size of the input frames\n'
@@ -469,7 +507,7 @@ sclip = {"core.std.Interleave([clip, clip])" if upscale and eedi3_field > 1 else
         )
     else:
         resize_lines = "ss = luma\nmclip = mask\n"
-    gpu_limit_line = f"core.max_vram_cache_size = {gpu_limit_mb}\n" if gpu_limit_mb else ""
+    gpu_limit_line = _gpu_limit_line(gpu_limit_mb)
     return f"""\
 from vssource import BestSource
 from vstools import core, depth, get_y
@@ -500,7 +538,7 @@ except Exception:
 
 src = BestSource(cachepath=None).source({clip!r}, 32)
 luma = {luma_expr}
-
+{scale_lines}
 # vsaa.based_aa mask chain (defaults: Prewitt, mask_thr=60). The threshold
 # must be scaled to 32 (not to `io_format`): Morpho.binarize_mask re-scales its
 # midthr from the f32 range to the clip's format, so passing an
@@ -566,14 +604,16 @@ def _plugin_loader(plugin: str) -> str:
 def resolve_plugins(requested: list[str], calls: dict[str, str], title: str) -> list[str]:
     """Filter ``requested`` down to the plugins that provide this filter.
 
-    Unknown names and plugins that do not implement the filter are reported on
-    stderr rather than dropped silently, so a typo cannot produce a bogus pass.
+    A name outside PLUGINS can never run anything, so it aborts: a typo used
+    to leave a shorter-but-successful comparison behind a stderr note. A
+    registered plugin that simply does not implement this filter still skips
+    with that note, which ``--filter all <plugin>`` depends on.
     """
     out: list[str] = []
     for p in requested:
         if p not in PLUGINS:
-            print(f"  [ignoring unknown plugin {p!r}: not in PLUGINS]", file=sys.stderr)
-        elif p not in calls:
+            sys.exit(f"unknown plugin {p!r}: not in PLUGINS ({', '.join(sorted(PLUGINS))})")
+        if p not in calls:
             print(f"  [ignoring plugin {p!r}: does not provide {title}]", file=sys.stderr)
         elif p not in out:
             out.append(p)
@@ -736,6 +776,12 @@ def _box_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str,
     # axis keeps the source dimension, so vsfeel runs one pass instead of two.
     ratio = ns.box_ratio
     axis = ns.box_axis
+    # A typo'd axis used to fall through to the no-op shape and silently
+    # benchmark the identity; a non-positive ratio cannot name a target size.
+    if not ratio > 0:
+        sys.exit(f"--box-args ratio={ratio}: must be > 0")
+    if axis not in ("both", "height", "width", "none"):
+        sys.exit(f"--box-args axis={axis!r}: must be one of both, height, width, none")
     width = f"round({clip}.width / {ratio})" if axis in ("both", "width") else f"{clip}.width"
     height = f"round({clip}.height / {ratio})" if axis in ("both", "height") else f"{clip}.height"
     return {
@@ -772,13 +818,19 @@ def _wnnm_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
     tail = f"ps_num={ns.wnnm_ps_num}, ps_range={ns.wnnm_ps_range}"
     # vsfeel's radius is per plane like its sigma; the reference's is one value
     # for all planes, so only a uniform list has a vszip arm to compare against.
-    try:
-        radii = [int(v) for v in str(ns.wnnm_radius).split(",") if v.strip()]
-    except ValueError:
-        sys.exit(f"--wnnm-args radius=[{ns.wnnm_radius}]: expected integers, e.g. [1, 0, 2]")
-    if not radii:
-        sys.exit("--wnnm-args radius=[]: expected one value or [y,u,v]")
-    uniform = len(set(radii)) == 1
+    # The literal None leaves radius off every call: both plugins default an
+    # absent radius to 0 (spatial only), so the arms stay comparable.
+    if ns.wnnm_radius is None:
+        radii: list[int] = []
+        uniform = True
+    else:
+        try:
+            radii = [int(v) for v in str(ns.wnnm_radius).split(",") if v.strip()]
+        except ValueError:
+            sys.exit(f"--wnnm-args radius=[{ns.wnnm_radius}]: expected integers, e.g. [1, 0, 2]")
+        if not radii:
+            sys.exit("--wnnm-args radius=[]: expected one value or [y,u,v]")
+        uniform = len(set(radii)) == 1
     requested = getattr(ns, "plugins", None) or []
     if not uniform and ("vszip" in requested or (not requested and not _ab_active(ns))):
         sys.exit(
@@ -786,11 +838,13 @@ def _wnnm_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str
             "all planes, so a per-plane radius has a vsfeel arm only; run it as "
             "'--filter wnnm vsfeel' (or pass a uniform list)"
         )
+    radius = f"radius=[{ns.wnnm_radius}], " if ns.wnnm_radius is not None else ""
     calls = {
-        "vsfeel": f"core.vsfeel.WNNM({clip}, {common}radius=[{ns.wnnm_radius}], {tail})",
+        "vsfeel": f"core.vsfeel.WNNM({clip}, {common}{radius}{tail})",
     }
     if uniform:
-        calls["vszip"] = f"core.vszip.WNNM({clip}, {common}radius={radii[0]}, {tail})"
+        same = f"radius={radii[0]}, " if radii else ""
+        calls["vszip"] = f"core.vszip.WNNM({clip}, {common}{same}{tail})"
     return calls
 
 
@@ -917,6 +971,15 @@ def _eedi3aa_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[
         raise SystemExit(
             "the eedi3aa benchmark grades the double-rate chain only "
             f"(field 2 or 3), got field={field} in --eedi3aa-args"
+        )
+    if importlib.util.find_spec("vsaa") is None:
+        # Without the wrapper the reference arms are dropped from `calls`, and
+        # resolve_plugins would then blame each plugin for not providing the
+        # filter when the missing piece is the vsaa package itself.
+        print(
+            "  [vsaa is not importable: the eedi3aa reference arms cannot run, "
+            "only the fused vsfeel arm is graded]",
+            file=sys.stderr,
         )
     # vsfeel's plugin takes the three thresholds separately; the vsaa
     # antialiaser carries based_aa's `vthresh=(v0, v1, v2)` object field and
@@ -1632,6 +1695,7 @@ def bench_aa(
     download_inputs: bool = False,
     no_download: bool = True,
     upscale: bool = True,
+    scale: float = 1.0,
     seconds: float = DEFAULT_SECONDS,
     vs_cache_mb: int = 1024 * 48,
     gpu_limit_mb: int | None = None,
@@ -1649,6 +1713,7 @@ def bench_aa(
         gpu_cache=gpu_cache,
         download_inputs=download_inputs,
         upscale=upscale,
+        scale=scale,
         vs_cache_mb=vs_cache_mb,
         gpu_limit_mb=gpu_limit_mb,
     )
@@ -1855,6 +1920,7 @@ def _run_once(
             download_inputs=download_inputs,
             no_download=ns.no_download,
             upscale=spec.aa_scale == 2,
+            scale=ns.scale,
             seconds=ns.seconds,
             vs_cache_mb=ns.vs_cache_mb,
             gpu_limit_mb=ns.gpu_limit_mb,
@@ -1928,9 +1994,10 @@ def _prepare_filter(
             f"{synth.removeprefix('vs.')}"
         )
     elif spec.aa:
-        clip_desc = (
-            f"{str(ns.clip)} -> 2x Point" if spec.aa_scale == 2 else f"{str(ns.clip)} + mask"
-        )
+        # The source grade comes first, the chain's own upscale second: an
+        # AA run under --scale used to time 1x while the header said nothing.
+        aa_desc = "-> 2x Point" if spec.aa_scale == 2 else "+ mask"
+        clip_desc = f"{str(ns.clip)}{scale_desc} {aa_desc}"
     else:
         clip_desc = f"{str(ns.clip)}{scale_desc}"
     format_desc = f" | format: {ns.format}" if ns.format else ""
@@ -2264,7 +2331,7 @@ def _install_ab_so(src: Path, dst: Path) -> None:
         sys.exit(f"ab: copy of {src} to {dst} failed verification (sha mismatch)")
 
 
-def bench_filter_ab(fname: str, ns: argparse.Namespace) -> None:
+def bench_filter_ab(fname: str, ns: argparse.Namespace) -> bool:
     """Interleaved A/B of two builds and/or two env configs (replaces ab_*.sh).
 
     Each round measures arm A then arm B (or the reverse / ABBA), swapping the
@@ -2553,9 +2620,9 @@ def parse_args() -> argparse.Namespace:
         "--gpu-limit-mb",
         type=int,
         default=None,
-        help="core.max_vram_cache_size for the timed script, in MB (default: "
-        "the core's own choice). This is the limit GPU-resident frames are "
-        "cached against, and every filter's VRAM plan is derived from it",
+        help="core.max_vram_cache_size for the timed script, in MB (>= 1; "
+        "default: the core's own choice). This is the limit GPU-resident "
+        "frames are cached against, and every filter's VRAM plan is derived from it",
     )
     parser.add_argument(
         "--scale",
@@ -2564,7 +2631,9 @@ def parse_args() -> argparse.Namespace:
         help="grade the filter at N times the source resolution (2 = 1080p -> "
         "4K, 1.5 = 1620p): the Point upscale is folded into the cached frames, so the "
         "timed region is the filter's own work at that size. Filter parameters "
-        "are not scaled, so pass e.g. sigma=N*sigma to keep the same blur",
+        "are not scaled, so pass e.g. sigma=N*sigma to keep the same blur. "
+        "The EEDI3 arms upscale luma and mask, with eedi3aa's own 2x "
+        "supersample stacked on top",
     )
     parser.add_argument(
         "--download",
@@ -2647,7 +2716,7 @@ def parse_args() -> argparse.Namespace:
         default=AA_CACHE_MB,
         help="byte budget for the EEDI3 AA Python cache, in MiB "
         f"(default: {AA_CACHE_MB}); this budget is in addition "
-        "to VapourSynth's own frame cache",
+        "to VapourSynth's own frame cache; 0 disables the cap",
     )
     parser.add_argument(
         "--check-fresh",
@@ -2698,14 +2767,17 @@ def main() -> None:
     ns.clip = str(Path(ns.clip).expanduser().resolve())
     if not ns.synthetic and not Path(ns.clip).is_file():
         sys.exit(f"--clip not found: {ns.clip}")
-    if ns.repeat < 1:
+    # The float guards reject non-finite values outright: a NaN slips through
+    # every ``<=`` comparison (silently benchmarking 1x under --scale nan), and
+    # an inf only fails later, as a window that can never fill.
+    if not ns.repeat >= 1:
         sys.exit(f"--repeat must be >= 1, got {ns.repeat}")
-    if ns.seconds <= 0:
-        sys.exit(f"--seconds must be > 0, got {ns.seconds:g}")
-    if ns.timeout <= ns.seconds:
+    if not math.isfinite(ns.seconds) or ns.seconds <= 0:
+        sys.exit(f"--seconds must be finite and > 0, got {ns.seconds:g}")
+    if not math.isfinite(ns.timeout) or ns.timeout <= ns.seconds:
         sys.exit(
-            f"--timeout ({ns.timeout:g}) must exceed --seconds ({ns.seconds:g}), "
-            f"or a run cannot fill the window"
+            f"--timeout ({ns.timeout:g}) must be finite and exceed "
+            f"--seconds ({ns.seconds:g}), or a run cannot fill the window"
         )
     if ns.seconds < 2:
         print(
@@ -2713,14 +2785,18 @@ def main() -> None:
             f"run-to-run swing dominate the fps; the default is {DEFAULT_SECONDS:g}.",
             file=sys.stderr,
         )
-    if ns.aa_cache_mb < 0:
+    if not ns.aa_cache_mb >= 0:
         sys.exit(f"--aa-cache-mb must be >= 0, got {ns.aa_cache_mb}")
-    if ns.cache_frames < 0:
+    if not ns.cache_frames >= 0:
         sys.exit(f"--cache-frames must be >= 0, got {ns.cache_frames}")
-    if ns.gpu_cache_mb < 1:
+    if not ns.gpu_cache_mb >= 1:
         sys.exit(f"--gpu-cache-mb must be >= 1, got {ns.gpu_cache_mb}")
-    if ns.scale < 1:
-        sys.exit(f"--scale must be >= 1, got {ns.scale:g}")
+    if not ns.vs_cache_mb >= 0:
+        sys.exit(f"--vs-cache-mb must be >= 0, got {ns.vs_cache_mb}")
+    if ns.gpu_limit_mb is not None and not ns.gpu_limit_mb >= 1:
+        sys.exit(f"--gpu-limit-mb must be >= 1, got {ns.gpu_limit_mb}")
+    if not math.isfinite(ns.scale) or ns.scale < 1:
+        sys.exit(f"--scale must be finite and >= 1, got {ns.scale:g}")
     if ns.check_fresh:
         check_fresh(ns.vsfeel_so or _default_plugin_so(), ns.build_so)
     ab = _ab_active(ns)
