@@ -6,44 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Added
-
-- BM3D accepts a `matrix` argument to pin the color matrix instead of deriving it from the resolution
+- BM3D accepts a `matrix` argument to set the color matrix instead of deriving it from the clip's resolution
 
 ### Changed
 
-- Compiled shaders are cached per filter, written once per process instead of once per filter
-- Bilateral, WNNM, NLMeans, DFTTest, GaussBlur, NNEDI3, EEDI3, EEDI3H, and EEDI3AA are up to 6.5x faster on NVIDIA GPUs
-- BM3D is 7% faster on Blackwell GPUs
-- NLMeans is 5-7% faster across search radii
-- NLMeans is faster on GPUs not in the device cache table
-- NLMeans is up to 40% faster on luma on NVIDIA GPUs
-- EEDI3 and EEDI3AA are up to 45% faster at 2160p, and faster on f32 1080p
-- GaussBlur is up to 6x faster at sigmas between 2 and 10, and about 6% faster at its default
+- All filters are much faster on NVIDIA GPUs (up to 6.5x)
+- Filter creation is faster when a script makes many filters
 - Bilateral is 2.1x faster at the largest spatial sigmas
-- Box is 12-40% faster when only one dimension is scaled
-- DFTTest is up to 13% faster at `sosize` 8 and below, and about 2.5% faster at 1080p
-- DFTTest and NLMeans size their working set to the card's cache, so a GPU with less cache no longer streams it
-- EEDI3, EEDI3H, and EEDI3AA use less VRAM for the same output
-- EEDI3, EEDI3H and EEDI3AA are about 10-20% faster on NVIDIA GPUs
-- EEDI3AA is about 3% faster
-- WNNM is about 8% faster at `radius=0` and about 5% faster with a temporal search
-- WNNM is faster on float clips on NVIDIA GPUs
-- WNNM uses less VRAM on GPUs with a small VRAM allowance
-- BM3D uses less VRAM before its first seek
-- BM3D matches the reference's color handling: the matrix comes from the clip's resolution and RGB input is filtered in the opponent space
+- BM3D matches bm3dvk2's color handling, including how RGB input is filtered
+- BM3D, EEDI3/H/AA, NNEDI3, and WNNM use less VRAM for the same output
+- Box is up to 40% faster when only one dimension is scaled
+- DFTTest is up to 13% faster at `sosize` 8 and below, and about 3% faster at defaults
+- DFTTest and NLMeans are faster on GPUs with smaller memory caches
+- EEDI3 and EEDI3AA are up to 45% faster at 2160p
+- GaussBlur is up to 6x faster at sigmas between 2 and 10, and about 6% faster in general
+- NLMeans is 5-7% faster across search radii, and up to 40% faster on luma on NVIDIA GPUse
+- WNNM is about 8% faster at `radius=0` and about 5% faster at higher radii
 
 ### Fixed
 
-- BM3D, EEDI3, EEDI3H, EEDI3AA, GaussBlur, Box, NLMeans, NNEDI3, and WNNM report an over-large frame or radius at creation instead of failing on every frame
-- BM3D no longer pins a full frame per request during reverse or random playback
-- NLMeans rejects an `a`/`d` combination whose sweep tables the device cannot hold, and names the chroma plane in its plane-range error
-- BM3D no longer loses denoise contributions at large temporal radii on GPUs without float atomics
-- DFTTest no longer hangs on some GPU drivers
-- Bilateral matches vszipcl at the frame edge on GPUs with less workgroup memory
-- Box's variable-format error names the format, and `feel_aa` runs a Box supersampler on the host instead of failing
-- DFTTest rejects negative `sigma` and `sigma2` instead of producing an inverted frame
-- DFTTest rejects `f0beta=0` instead of returning a NaN frame
+- All filters reject oversized frames or radii at creation instead of failing on every frame
+- BM3D no longer uses excessive memory during reverse or random playback, and no longer loses denoise strength at large temporal radii on some GPUs
+- NLMeans rejects `a`/`d` combinations the GPU cannot hold, and its plane-range error names the chroma plane
+- DFTTest no longer hangs on some GPU drivers, and rejects negative `sigma`/`sigma2` and `f0beta=0` instead of producing broken frames
+- Bilateral matches vszipcl at frame edges on some GPUs
+- Box's variable-format error names the format, and `feel_aa` runs its Box supersampler on the CPU instead of failing
 
 ## [v1.3.4] - 2026-11-05
 
@@ -216,6 +203,7 @@ The plugin now uses the core's GPU device, queues, and transfers instead of mana
 - First release: Bilateral, BM3D, GaussBlur, DFTTest, NLMeans, EEDI3, EEDI3H, EEDI3AA, and NNEDI3
 - A benchmark harness, vs-jetpack backend integration, and Windows and Linux wheels
 
+[v1.4.0]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.4...v1.4.0
 [v1.3.4]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.3...v1.3.4
 [v1.3.3]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.2...v1.3.3
 [v1.3.2]: https://github.com/TheFeelTrain/vapoursynth-feel/compare/v1.3.1...v1.3.2

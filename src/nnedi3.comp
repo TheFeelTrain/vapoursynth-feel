@@ -30,10 +30,10 @@
  *   ENTRY_PREDICT   — predictor network over listed (or all) pixels
  *   ENTRY_KEEP      — kept rows straight into the output frame plane
  *
- * The kernels read the source frame plane in place at its own row pitch
- * (field row f is source row DH ? f : 2f+parity) and write interpolated
- * rows straight into the output frame plane at row 2r + (1-parity), so the
- * host moves no pixels at all.
+ * The kernels read the source frame plane at its own row pitch (or a field the
+ * host staged compactly, FIELD_STAGED), field row f mapping to source row
+ * DH ? f : 2f+parity, and write interpolated rows straight into the output
+ * frame plane at row 2r + (1-parity), so the host moves no pixels at all.
  *
  * Formula order mirrors the references so results agree to ~1 LSB:
  * - cubic and all prescreener dots accumulate `precise` (no FMA contraction,
@@ -90,6 +90,11 @@ layout(constant_id = 8) const int USE_LIST = 1;
 // dh doubles the height: the whole source plane is the field, otherwise the
 // field is every second source row starting at pc.parity.
 layout(constant_id = 9) const int DH = 0;
+// The source buffer handed to the kernel is a compact field: field row f sits
+// at row f at the plane's stride, because the host staged exactly the field's
+// rows into a buffer of that shape. Distinct from DH, which describes the clip:
+// under FIELD_STAGED the addressing no longer maps f to 2f+parity.
+layout(constant_id = 10) const int FIELD_STAGED = 0;
 
 const int FS = XDIM * YDIM;
 
@@ -142,7 +147,7 @@ float loadPad(int row, int col) {
     const int fp = 1 - pc.parity;
     const int f = clamp(row - (MARGIN_V - fp), 0, ROWS - 1);
     const int c = clamp(col - MARGIN_H, 0, WIDTH - 1);
-    const int sy = (DH != 0) ? f : (2 * f + pc.parity);
+    const int sy = (DH != 0 || FIELD_STAGED != 0) ? f : (2 * f + pc.parity);
     const int idx = sy * pc.src_stride + c;
 #if defined(IO_F32) || defined(IO_F16)
     return float(fieldBuf[idx]); // half -> float is exact
@@ -705,7 +710,7 @@ void main() {
         const int x = int(i % uint(WIDTH));
         const int r = int(i / uint(WIDTH));
         const int y = 2 * r + pc.parity;
-        const int sy = (DH != 0) ? r : y;
+        const int sy = (DH != 0 || FIELD_STAGED != 0) ? r : y;
         dstBuf[y * pc.dst_stride + x] = fieldBuf[sy * pc.src_stride + x];
     }
 }

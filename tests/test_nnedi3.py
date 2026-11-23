@@ -867,13 +867,30 @@ def test_nnedi3_rejects_dh_over_int32_height():
         vs.core.vsfeel.NNEDI3(clip, field=1, dh=True)
 
 
-def test_nnedi3_staged_input_matches_the_in_place_path(clip_gray16, monkeypatch):
-    """The staged source plane is a byte copy, so the output must not move."""
+def test_nnedi3_staged_input_matches_the_in_place_path(clip_yuv420p16, monkeypatch):
+    """Staging a field compactly must not move a code.
+
+    The compact copy changes the shader's row mapping (FIELD_STAGED), so all
+    three addressing modes have to agree; YUV covers the per-plane row lists,
+    whose chroma rows differ from luma's.
+    """
     params = dict(field=3, nsize=0, nns=4, qual=2)
-    monkeypatch.setenv("VSFEEL_NNEDI3_STAGE", "0")
-    in_place = _run(clip_gray16, **params)
-    monkeypatch.setenv("VSFEEL_NNEDI3_STAGE", "1")
-    staged = _run(clip_gray16, **params)
+    arms = {}
+    # Both staging arms are forced: the default follows the vendor, so neither
+    # may rely on the machine the test happens to run on.
+    for name, stage, stage_field in (
+        ("in_place", "0", "0"),
+        ("whole_plane", "1", "0"),
+        ("compact_field", "1", "1"),
+    ):
+        monkeypatch.setenv("VSFEEL_NNEDI3_STAGE", stage)
+        monkeypatch.setenv("VSFEEL_NNEDI3_STAGE_FIELD", stage_field)
+        arms[name] = _run(clip_yuv420p16, **params)
     monkeypatch.delenv("VSFEEL_NNEDI3_STAGE", raising=False)
+    monkeypatch.delenv("VSFEEL_NNEDI3_STAGE_FIELD", raising=False)
     for n in (0, 7, 23):
-        assert np.array_equal(_plane(in_place.get_frame(n), 0), _plane(staged.get_frame(n), 0)), n
+        frames = {name: clip.get_frame(n) for name, clip in arms.items()}
+        for p in range(frames["in_place"].format.num_planes):
+            want = _plane(frames["in_place"], p)
+            for name, frame in frames.items():
+                assert np.array_equal(_plane(frame, p), want), (n, p, name)

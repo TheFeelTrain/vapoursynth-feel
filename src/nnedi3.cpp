@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -381,6 +382,18 @@ parse_weights(int nsize, int nns_sel, int etype, int pscrn, double pixel_half,
 // Filter state
 // ---------------------------------------------------------------------------
 
+// VSFEEL_NNEDI3_TIMING record-split laps. The middle four repeat per plane;
+// the teardown print is the only reader, so they are named for it.
+enum Nnedi3Lap {
+    kLapFills,
+    kLapBind,
+    kLapStageIn,
+    kLapStageOut,
+    kLapDispatch,
+    kLapDeclare,
+    kNnedi3Laps
+};
+
 struct Nnedi3Plane {
     int width {};
     int rows {}; // field rows == interpolated output rows
@@ -396,11 +409,17 @@ struct Nnedi3Plane {
     VkDeviceSize ind_offset {};
     int32_t list_elem {}; // uint element offsets into the scratch
     int32_t ind_elem {};
+    // Source row *indices* of one field, one list per parity, so staging can
+    // copy a field instead of a plane (the byte offset is row_index * stride,
+    // filled per frame). Empty under dh, where the field is the whole plane.
+    std::array<std::vector<int32_t>, 2> stage_rows;
 };
 
-// VSFEEL_NNEDI3_GPUTRACE=<frame>: one warm frame stamps head / prescreen done /
-// predict done into a query pool, whose results the same command buffer copies
-// into a mapped buffer. The host waits that submission out once to read them.
+// VSFEEL_NNEDI3_GPUTRACE=<frame>: one warm frame stamps six points into a query
+// pool, whose results the same command buffer copies into a mapped buffer. The
+// host waits that submission out once to read them. The stages are head /
+// staged-input / keep done / prescreen done / predict done / publish done, so a
+// per-theory cost is separable instead of folded into two sums.
 struct Nnedi3Probe {
     VkQueryPool query {};
     GpuBuffer buf;
@@ -428,8 +447,8 @@ struct Nnedi3Data {
     std::shared_ptr<GPUDevice> gpu;
     VkDescriptorSetLayout set_layout {};
     VkPipelineLayout pipeline_layout {};
-    // Prescreener / predictor weights: host visible so creation fills them
-    // with three memcpys; the kernels stream them every dispatch.
+    // Prescreener / predictor weights: pure device-local, filled through one
+    // staging upload at creation (see vsfeel_upload_table).
     GpuBuffer ps {};
     GpuBuffer pdw {};
     GpuBuffer pdb {};
@@ -445,11 +464,25 @@ struct Nnedi3Data {
     // Read the source plane from a private device-local copy per frame (see
     // gpu_stage_plane); off with VSFEEL_NNEDI3_STAGE=0.
     bool stage { true };
+    // Stage only the field's rows instead of the whole plane; off with
+    // VSFEEL_NNEDI3_STAGE_FIELD=0 (default: NVIDIA, see Nnedi3Create).
+    bool stage_field { true };
+    // Byte offsets of one field's rows at that plane's stride, per
+    // [plane][parity]. Built once from the first frame's stride (clip-wide, so
+    // it cannot change) behind a once_flag: the frame path runs on up to eight
+    // threads over one instance, so rebuilding a vector lazily there would be a
+    // data race. VkDeviceSize because a tall narrow plane's row offset can
+    // exceed 2^31 bytes even when its pixel count cannot.
+    std::array<std::array<std::vector<VkDeviceSize>, 2>, 3> stage_offsets;
+    std::array<std::array<std::once_flag, 2>, 3> stage_offsets_once;
     // Publish the output plane through a private copy; off with
     // VSFEEL_NNEDI3_OSTAGE=0.
     bool ostage { true };
+
     std::atomic<uint64_t> ht_acquire_ns {}, ht_record_ns {}, ht_submit_ns {},
         ht_total_ns {}, ht_n {};
+    // Record-split laps (see Nnedi3Lap).
+    std::array<std::atomic<uint64_t>, kNnedi3Laps> ht_piece_ns {};
 
     bool gpu_trace { false };
     int gpu_trace_frame { 100 };
@@ -465,6 +498,16 @@ struct Nnedi3Data {
                     ht_record_ns.load() / 1000.0 / n,
                     ht_submit_ns.load() / 1000.0 / n,
                     ht_total_ns.load() / 1000.0 / n);
+            fprintf(stderr,
+                    "[nnedi3-timing] record split us: fills=%.1f declare=%.1f "
+                    "| per plane: bind=%.1f stage_in=%.1f stage_out=%.1f "
+                    "dispatch=%.1f\n",
+                    ht_piece_ns[kLapFills].load() / 1000.0 / n,
+                    ht_piece_ns[kLapDeclare].load() / 1000.0 / n,
+                    ht_piece_ns[kLapBind].load() / 1000.0 / n,
+                    ht_piece_ns[kLapStageIn].load() / 1000.0 / n,
+                    ht_piece_ns[kLapStageOut].load() / 1000.0 / n,
+                    ht_piece_ns[kLapDispatch].load() / 1000.0 / n);
         }
         if (!gpu) {
             return;
@@ -507,11 +550,13 @@ struct Nnedi3Data {
 
 struct Nnedi3Spec {
     int32_t width, rows, peak, pscrn, xdim, ydim, nns, qual, use_list, dh;
+    // The staged source buffer is a compact field (field row f at row f).
+    int32_t field_staged;
 };
 
-static constexpr std::array<VkSpecializationMapEntry, 10> spec_entries = [] {
-    std::array<VkSpecializationMapEntry, 10> e {};
-    for (uint32_t i = 0; i < 10; ++i) {
+static constexpr std::array<VkSpecializationMapEntry, 11> spec_entries = [] {
+    std::array<VkSpecializationMapEntry, 11> e {};
+    for (uint32_t i = 0; i < 11; ++i) {
         e[i] = { i, i * static_cast<uint32_t>(sizeof(int32_t)),
                  sizeof(int32_t) };
     }
@@ -702,6 +747,18 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
 
     vsfeel_trace_mark("record");
     VkCommandBuffer cmd = d->gpu->api->gpuExecCommandBuffer(ctx);
+    auto rt = d->host_timing ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point {};
+    auto rt_lap = [&](int which) {
+        if (!d->host_timing) {
+            return;
+        }
+        auto now = std::chrono::steady_clock::now();
+        d->ht_piece_ns[which] += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - rt)
+                .count());
+        rt = now;
+    };
 
     const bool gputrace = d->gpu_trace && n == d->gpu_trace_frame &&
                           d->probe.armed.exchange(1) == 0;
@@ -712,7 +769,7 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
         }
     }
     if (gputrace) {
-        d->gpu->vk->vkCmdResetQueryPool(cmd, d->probe.query, 0, 3);
+        d->gpu->vk->vkCmdResetQueryPool(cmd, d->probe.query, 0, 6);
         d->gpu->vk->vkCmdWriteTimestamp2(
             cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, d->probe.query, 0);
     }
@@ -732,6 +789,8 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
         }
         barrier_transfer_to_compute(*d->gpu, cmd);
     }
+
+    rt_lap(kLapFills); // scratch + indirect fills + their barrier
 
     // Plane dispatches touch disjoint buffers (and disjoint scratch regions),
     // so no barrier separates them; only the two stages of one list-mode plane
@@ -764,20 +823,52 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
             static_cast<int>(vsapi->getStride(src, p) / d->elem_bytes);
         const int dst_stride =
             static_cast<int>(vsapi->getStride(dst, p) / d->elem_bytes);
+        rt_lap(kLapBind); // plane fetch, range checks and strides
 
-        // Keep, prescreen and predict all read the source plane, in place or
-        // from a private copy; a private device-local copy is what makes those
-        // reads fast here (see gpu_stage_plane).
+        // Keep, prescreen and predict all read the source field, in place or
+        // from a private device-local copy; the copy is what makes those reads
+        // fast where the in-place read is the tax (see gpu_stage_field).
+        //
+        // A one-field read only touches every second source row, so the copy
+        // stages exactly the field's rows, compactly: half the bytes of a
+        // whole-plane copy, with the kernels addressing field row f at row f
+        // (FIELD_STAGED). Under dh the field is the plane, so that path stages
+        // whole.
         VkBuffer src_buffer = sp.buffer;
         if (d->stage) {
             GpuBuffer staged {};
-            if (auto e = gpu_stage_plane(*d->gpu, core, ctx, cmd, sp, staged);
-                !e.empty()) {
+            std::string e;
+            if (d->dh || cfg.stage_rows[parity].empty() || !d->stage_field) {
+                e = gpu_stage_plane(*d->gpu, core, ctx, cmd, sp, staged);
+            } else {
+                // One source row per field row, straight into a compact buffer
+                // of `rows` rows: the shader's FIELD_STAGED addressing then
+                // reads field row f at row f. `rows` regions in one call,
+                // contiguous on the destination side, and the staged buffer is
+                // half a plane instead of a plane.
+                const auto & idx = cfg.stage_rows[parity];
+                const VkDeviceSize row_bytes =
+                    static_cast<VkDeviceSize>(src_stride) * d->elem_bytes;
+                auto & offs = d->stage_offsets[p][parity];
+                std::call_once(d->stage_offsets_once[p][parity], [&] {
+                    offs.resize(idx.size());
+                    for (size_t i = 0; i < idx.size(); ++i) {
+                        offs[i] = static_cast<VkDeviceSize>(idx[i]) * row_bytes;
+                    }
+                });
+                e = gpu_stage_field(
+                    *d->gpu, core, ctx, cmd, sp.buffer,
+                    static_cast<VkDeviceSize>(idx.size()) * row_bytes,
+                    offs.data(), static_cast<uint32_t>(offs.size()), row_bytes,
+                    staged);
+            }
+            if (!e.empty()) {
                 return fail("staged source: " + e);
             }
             src_buffer = staged.buffer;
             gpu_stage_barrier(*d->gpu, cmd);
         }
+        rt_lap(kLapStageIn);
 
         // Keep and predict both write the output plane; into a core plane those
         // stores measured slower than into a private buffer, so stage them and
@@ -791,6 +882,12 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
             }
             dst_buffer = out_stage.buffer;
         }
+        rt_lap(kLapStageOut);
+
+        if (gputrace && p == probe_plane) {
+            d->gpu->vk->vkCmdWriteTimestamp2(
+                cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, d->probe.query, 1);
+        }
 
         // All seven bindings re-pushed per dispatch; the scratch slots stand
         // in where this entry statically reads nothing (see src/nnedi3.comp).
@@ -803,6 +900,7 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
                                     d->use_list ? scratch.buffer : src_buffer };
         gpu_push_buffers(*d->gpu, cmd, d->pipeline_layout, buffers, 7);
 
+
         // Kept rows straight into the output plane; they overlap nothing the
         // network writes.
         {
@@ -812,6 +910,11 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                           cfg.keep_pipeline);
             d->gpu->vk->vkCmdDispatch(cmd, cfg.keep_grid_x, cfg.keep_grid_y, 1);
+        }
+
+        if (gputrace && p == probe_plane) {
+            d->gpu->vk->vkCmdWriteTimestamp2(
+                cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, d->probe.query, 2);
         }
 
         // max_grid_x rides along so the compaction can cap X and publish the Y
@@ -836,7 +939,7 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
         }
         if (gputrace && p == probe_plane) {
             d->gpu->vk->vkCmdWriteTimestamp2(
-                cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, d->probe.query, 1);
+                cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, d->probe.query, 3);
         }
         if (d->use_list) {
             // The predictor launches off the count prescreen accumulated.
@@ -860,20 +963,26 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
         }
         if (gputrace && p == probe_plane) {
             d->gpu->vk->vkCmdWriteTimestamp2(
-                cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->probe.query, 2);
+                cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, d->probe.query, 4);
         }
         // Every plane that reaches here is processed (the loop head skips the
         // rest), so the output stage always has a full plane to publish.
         if (d->ostage) {
             gpu_out_stage_commit(*d->gpu, cmd, out_stage, dp);
         }
+        if (gputrace && p == probe_plane) {
+            d->gpu->vk->vkCmdWriteTimestamp2(
+                cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, d->probe.query, 5);
+        }
+        rt_lap(kLapDispatch); // push descriptors, dispatches, publish copy
     }
 
     if (gputrace) {
         d->gpu->vk->vkCmdCopyQueryPoolResults(
-            cmd, d->probe.query, 0, 3, d->probe.buf.buffer, 0, sizeof(uint64_t),
+            cmd, d->probe.query, 0, 6, d->probe.buf.buffer, 0, sizeof(uint64_t),
             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     }
+    rt_lap(kLapDeclare); // reads/writes declaration
     auto t2 = d->host_timing ? std::chrono::steady_clock::now()
                              : std::chrono::steady_clock::time_point {};
 
@@ -923,8 +1032,10 @@ static const VSFrame * VS_CC Nnedi3GetFrame(int n, int activationReason,
             };
             const uint64_t * ts = d->probe.map;
             fprintf(stderr,
-                    "[nnedi3-gpu] n=%d pre=%.1fus pred=%.1fus total=%.1fus\n",
-                    n, us(ts[0], ts[1]), us(ts[1], ts[2]), us(ts[0], ts[2]));
+                    "[nnedi3-gpu] n=%d stage=%.1f keep=%.1f pre=%.1f "
+                    "pred=%.1f publish=%.1f total=%.1fus\n",
+                    n, us(ts[0], ts[1]), us(ts[1], ts[2]), us(ts[2], ts[3]),
+                    us(ts[3], ts[4]), us(ts[4], ts[5]), us(ts[0], ts[5]));
         } else {
             fprintf(stderr, "[nnedi3-gpu] probe wait failed: %s\n", perr);
         }
@@ -1119,6 +1230,11 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         env_flag_or("VSFEEL_NNEDI3_STAGE", vsfeel_stage_default(*d->gpu));
     d->ostage =
         env_flag_or("VSFEEL_NNEDI3_OSTAGE", vsfeel_ostage_default(*d->gpu));
+    // The compact field halves the staged bytes but costs one copy region per
+    // row: a measured NVIDIA win (270-280 -> 182-191 us at 1080p) and an RDNA3
+    // loss (18 -> 228 us), so gate it on the vendor, not the OS.
+    d->stage_field =
+        env_flag_or("VSFEEL_NNEDI3_STAGE_FIELD", d->gpu->vendor_id == 0x10de);
 
     // The packed half predictor computes in half, which needs the optional
     // shaderFloat16 feature; a device without it keeps the storage-only f16
@@ -1288,39 +1404,26 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
         d->pipeline_layout = std::get<VkPipelineLayout>(result);
     }
 
-    // Weight buffers: host visible (creation fills them with three memcpys),
-    // device-local preferred so on a ReBAR window they land in VRAM -- the
-    // predictor streams the whole matrix per subgroup and thrashes L2.
+    {
+        char err[512] {};
+        d->pool =
+            d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
+        if (d->pool == nullptr) {
+            return set_error("createGPUExecPool failed: "s + err);
+        }
+    }
+
+    // The predictor streams the whole matrix per subgroup, so the weights go in
+    // pure device-local memory: the device-local-and-host-visible type is a BAR
+    // window whose shader reads measured several times slower (see
+    // vsfeel_upload_table). One staging upload at creation.
     auto make_weights = [&](GpuBuffer & buf, const void * data, size_t bytes,
                             const char * what) -> std::string {
-        std::string e = gpu_make_buffer(
-            *d->gpu, core, std::max<VkDeviceSize>(bytes, 4), buf,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        std::string e =
+            vsfeel_upload_table(*d->gpu, core, d->pool, data, bytes, buf);
         if (!e.empty()) {
             return std::string(what) + " buffer: " + e;
         }
-        if (buf.mapped == nullptr) {
-            return std::string(what) + " buffer is not host visible";
-        }
-        // The predictor streams the whole matrix per subgroup, so a weight
-        // buffer that did not land in device-local memory is read over the bus
-        // on every workgroup. There is no host-visible VRAM on such a device to
-        // prefer, and a one-time upload into a device-local copy is the fix to
-        // measure there, so say which memory the allocation got.
-        if (vsfeel_device_info_enabled() &&
-            (buf.memory_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
-            fprintf(stderr,
-                    "[nnedi3] %s weights are not device-local "
-                    "(memoryFlags=0x%x): the predictor reads them per "
-                    "subgroup\n",
-                    what, static_cast<unsigned>(buf.memory_flags));
-        }
-        std::memcpy(buf.mapped, data, bytes);
-        // The mapping may be the host-visible VRAM BAR (write-combining): the
-        // first dispatch must not read a tail the CPU store buffer missed.
-        store_fence();
         return {};
     };
     if (std::string e =
@@ -1652,6 +1755,20 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
             return set_error("plane geometry out of range.");
         }
 
+        // Which source rows a one-field read touches, per parity. The byte
+        // offsets need the stride, which is not known until a frame arrives, so
+        // this holds the row indices and the frame path multiplies by the
+        // stride; dh stages whole and leaves both lists empty.
+        if (!d->dh) {
+            for (int par = 0; par < 2; ++par) {
+                auto & rows = cfg.stage_rows[par];
+                rows.resize(static_cast<size_t>(cfg.rows));
+                for (int f = 0; f < cfg.rows; ++f) {
+                    rows[static_cast<size_t>(f)] = 2 * f + par;
+                }
+            }
+        }
+
         // prescreen: one thread per pixel group (P=1 old, P=4 new), one
         // group of 128 threads. The shader groups pixels per ROW as
         // ceil(width/P), so the grid must cover rows*ceil(width/P)
@@ -1717,10 +1834,19 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
             }
         }
         if (ki == n_keys) {
-            const Nnedi3Spec spec { cfg.width,    cfg.rows, d->peak,
-                                    d->pscrn,     d->xdim,  d->ydim,
-                                    d->nns,       d->qual,  d->use_list ? 1 : 0,
-                                    d->dh ? 1 : 0 };
+            const Nnedi3Spec spec { cfg.width,
+                                    cfg.rows,
+                                    d->peak,
+                                    d->pscrn,
+                                    d->xdim,
+                                    d->ydim,
+                                    d->nns,
+                                    d->qual,
+                                    d->use_list ? 1 : 0,
+                                    d->dh ? 1 : 0,
+                                    (d->stage && d->stage_field && !d->dh)
+                                        ? 1
+                                        : 0 };
             // Each handle lands in d->planes the moment it is created: a later
             // create for this key (keep is the 256-invocation one) can still
             // fail, and the destructor walks only d->planes, so a handle left
@@ -1830,7 +1956,7 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
             .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
             .flags = 0,
             .queryType = VK_QUERY_TYPE_TIMESTAMP,
-            .queryCount = 3
+            .queryCount = 6
         };
         if (d->gpu->vk->vkCreateQueryPool(d->gpu->device, &qp_info, nullptr,
                                           &d->probe.query) != VK_SUCCESS) {
@@ -1840,7 +1966,7 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
     }
     if (d->gpu_trace) {
         auto e =
-            gpu_make_buffer(*d->gpu, core, 3 * sizeof(uint64_t), d->probe.buf,
+            gpu_make_buffer(*d->gpu, core, 6 * sizeof(uint64_t), d->probe.buf,
                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                             0, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -1848,15 +1974,6 @@ static void VS_CC Nnedi3Create(const VSMap * in, VSMap * out,
             d->gpu_trace = false;
         } else {
             d->probe.map = static_cast<uint64_t *>(d->probe.buf.mapped);
-        }
-    }
-
-    {
-        char err[512] {};
-        d->pool =
-            d->gpu->api->createGPUExecPool(core, vqCompute, err, sizeof(err));
-        if (d->pool == nullptr) {
-            return set_error("createGPUExecPool failed: "s + err);
         }
     }
 

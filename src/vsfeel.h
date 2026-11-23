@@ -960,6 +960,51 @@ inline std::string gpu_stage_plane(const GPUDevice & g, VSCore * core,
                            out, extra_usage);
 }
 
+// Compact-field staging: copy `count` source rows, given by byte offset, into a
+// destination of exactly `count` rows at the same row pitch. A one-field read
+// only touches every second source row, so staging the whole plane copies twice
+// the bytes it needs; the destination is contiguous, so a kernel reading field
+// row f at row f reaches it without the 2x row walk.
+//
+// `src_rows` holds each source row's byte offset and `row_bytes` one row's
+// payload. The destination offsets are derived, so a caller cannot leave a gap a
+// field read would then land on.
+inline std::string gpu_stage_field(const GPUDevice & g, VSCore * core,
+                                   VSGPUExecContext * ctx, VkCommandBuffer cmd,
+                                   VkBuffer src, VkDeviceSize dst_bytes,
+                                   const VkDeviceSize * src_rows,
+                                   uint32_t count, VkDeviceSize row_bytes,
+                                   GpuBuffer & out,
+                                   VkBufferUsageFlags extra_usage = 0) {
+    if (count == 0) {
+        return {};
+    }
+    if (auto e =
+            gpu_frame_buffer(g, core, ctx, dst_bytes, out,
+                             VK_BUFFER_USAGE_TRANSFER_DST_BIT | extra_usage);
+        !e.empty()) {
+        return e;
+    }
+    // One region per row: the source rows are one stride apart, and only the
+    // destination side is contiguous. Still one vkCmdCopyBuffer2.
+    std::vector<VkBufferCopy2> regions(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        VkBufferCopy2 & r = regions[i];
+        r.sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2;
+        r.srcOffset = src_rows[i];
+        r.dstOffset = static_cast<VkDeviceSize>(i) * row_bytes;
+        r.size = row_bytes;
+    }
+    VkCopyBufferInfo2 info {};
+    info.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2;
+    info.srcBuffer = src;
+    info.dstBuffer = out.buffer;
+    info.regionCount = static_cast<uint32_t>(regions.size());
+    info.pRegions = regions.data();
+    g.vk->vkCmdCopyBuffer2(cmd, &info);
+    return {};
+}
+
 // Whether a filter stages its input by default. The copy is 1.2x-5.7x faster
 // where the input read was the tax (seven filters on an RTX 5060, 1080p16) and
 // up to 13.8% slower on the RX 7900 XTX, so the default follows the vendor that
@@ -1039,6 +1084,130 @@ inline void gpu_out_stage_commit(const GPUDevice & g, VkCommandBuffer cmd,
     info.regionCount = 1;
     info.pRegions = &region;
     g.vk->vkCmdCopyBuffer2(cmd, &info);
+}
+
+// --- Static tables -----------------------------------------------------------
+//
+// A table the host builds once (weights, a tap table, a LUT) is read by every
+// dispatch for the life of the instance, so it belongs in pure device-local
+// memory. Asking for HOST_VISIBLE | HOST_COHERENT with DEVICE_LOCAL preferred
+// lands it in the one type that is both instead, which on a discrete device is a
+// BAR window: shader reads of it measured 1.36x-6.5x slower than the same bytes
+// in VRAM (seven filters on an RTX 5060, 1080p16), and core frame planes live in
+// that same window.
+//
+// This creates the destination in VRAM, fills it through one host-visible staging
+// buffer on the filter's own exec pool, and waits that one submission out. It is
+// a creation-time call, so the wait is free and the first dispatch cannot race
+// the copy. A device whose memory is all host-visible falls back to a single
+// mapped memcpy.
+inline std::string vsfeel_upload_table(const GPUDevice & g, VSCore * core,
+                                       VSGPUExecPool * pool, const void * data,
+                                       VkDeviceSize bytes, GpuBuffer & out,
+                                       VkBufferUsageFlags extra_usage = 0) {
+    const VkDeviceSize size = std::max<VkDeviceSize>(bytes, 4);
+    auto host_fill = [&]() -> std::string {
+        std::string e =
+            gpu_make_buffer(g, core, size, out,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, extra_usage);
+        if (!e.empty()) {
+            return e;
+        }
+        if (out.mapped == nullptr) {
+            gpu_destroy_buffer(g, out);
+            return "a host-visible table buffer is not mapped";
+        }
+        std::memcpy(out.mapped, data, bytes);
+        store_fence();
+        return {};
+    };
+
+    std::string e =
+        gpu_make_buffer(g, core, size, out, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                        0, VK_BUFFER_USAGE_TRANSFER_DST_BIT | extra_usage);
+    if (!e.empty()) {
+        return host_fill();
+    }
+    // DEVICE_LOCAL was required, but the allocator falls back when no type
+    // satisfies it; what it picked says whether this is VRAM or the BAR window.
+    if ((out.memory_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0 ||
+        (out.memory_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+        gpu_destroy_buffer(g, out);
+        return host_fill();
+    }
+
+    GpuBuffer staging {};
+    e = gpu_make_buffer(g, core, size, staging,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        0, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    if (!e.empty()) {
+        gpu_destroy_buffer(g, out);
+        return "staging for a static table: " + e;
+    }
+    if (staging.mapped == nullptr) {
+        gpu_destroy_buffer(g, staging);
+        gpu_destroy_buffer(g, out);
+        return "static-table staging is not mapped";
+    }
+    std::memcpy(staging.mapped, data, bytes);
+    store_fence();
+
+    char err[512] {};
+    VSGPUExecContext * ctx = g.api->gpuExecAcquire(pool, err, sizeof(err));
+    if (!ctx) {
+        gpu_destroy_buffer(g, staging);
+        gpu_destroy_buffer(g, out);
+        return "upload context for a static table: "s + err;
+    }
+    // Ownership of the staging buffer transfers to the context; the pool
+    // destroys it once this submission retires, so it is never ours again.
+    g.api->gpuExecUsesBuffer(ctx, staging.handle);
+    VkCommandBuffer cmd = g.api->gpuExecCommandBuffer(ctx);
+    VkBufferCopy2 region {};
+    region.sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2;
+    region.size = bytes;
+    VkCopyBufferInfo2 info {};
+    info.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2;
+    info.srcBuffer = staging.buffer;
+    info.dstBuffer = out.buffer;
+    info.regionCount = 1;
+    info.pRegions = &region;
+    g.vk->vkCmdCopyBuffer2(cmd, &info);
+    VkMemoryBarrier2 mb {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    VkDependencyInfo dep {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &mb;
+    g.vk->vkCmdPipelineBarrier2(cmd, &dep);
+    if (const int submit_error =
+            g.api->gpuExecSubmit(ctx, nullptr, err, sizeof(err))) {
+        gpu_destroy_buffer(g, out);
+        return "static-table upload submit: "s + err;
+    }
+    // Creation must not return before the table holds its bytes, so this one
+    // submission is waited for on the host; the wait also releases the staging
+    // buffer the pool owns now.
+    const int drain = g.api->gpuExecPoolWaitIdle(pool, err, sizeof(err));
+    if (drain != gdDrained) {
+        // A reset means nothing executes any more, so the table may go. Any other
+        // failed drain leaves this copy queued: drop the handle rather than
+        // destroy a buffer the GPU may still write.
+        if (drain == gdDeviceLost) {
+            gpu_destroy_buffer(g, out);
+        } else {
+            out = {};
+        }
+        return "static-table upload did not drain: "s + err;
+    }
+    return {};
 }
 
 // Destroy a set of pipelines once each. A filter that shares pipelines across

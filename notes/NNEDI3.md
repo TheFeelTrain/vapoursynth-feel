@@ -15,8 +15,10 @@ Status: **shipped on the R80 GPU API.** Design (current):
   row `f` → source row `DH ? f : 2f+parity`, and write interpolated row `r`
   into the output plane, or into a per-frame private copy on NVIDIA, at
   `2r + (1-parity)`. `ENTRY_KEEP` copies the kept rows. `DH` is a spec constant
-  (id 9; 10 spec entries total), and `dh=True` requires every plane to be
-  processed (a subset is a creation error, as in EEDI3).
+  (id 9; 11 spec entries total), and `dh=True` requires every plane to be
+  processed (a subset is a creation error, as in EEDI3). On NVIDIA the staged
+  copy holds only the field's rows, and `FIELD_STAGED` (id 10) addresses field
+  row `f` at row `f` instead.
 - Per frame: one transient device-local scratch (`width*rows*4 B` list +
   16 B indirect struct per plane) handed to the recording context; six push
   words `{a_base, src_stride, dst_stride, parity, d_base, max_grid_x}` (the
@@ -26,7 +28,7 @@ Status: **shipped on the R80 GPU API.** Design (current):
   no buffer can hold, so a too-large clip fails on the constructor rather than
   on every `get_frame`.
 - Persistent VRAM: the three weight buffers (worst config qual2/nsize3/nns4 ≈
-  1.2 MB, host-visible, device-local preferred) plus pipelines; transient
+  1.2 MB, pure device-local; see Historical) plus pipelines; transient
   4.2 MB scratch per in-flight frame (1080p GRAY16 `field=3`), bounded by the
   exec ring; src/output frames are core-owned.
 - Three io variants — u16, f16, f32 — picked from the input format (half is
@@ -156,8 +158,7 @@ use the ratios, not the absolute fps.
   read past the tile.
 - Weights: blob parsed at creation (prescreener mean/scale, model
   mean-subtraction projected out), packed into three vec4/vec2-layout blobs
-  and written through persistently mapped host-visible buffers plus
-  `store_fence()`.
+  and uploaded once into pure device-local memory (`vsfeel_upload_table`).
 - f16 io adds `-DIO_F16` variants of all three kernels plus `-DPRED16=1` for
   the packed predictor **and its prescreen** (the compaction's `ppg = 4*PX`
   must equal the predictor's pixels per subgroup, so the pair ships together).
@@ -182,6 +183,25 @@ use the ratios, not the absolute fps.
 
 ## Historical
 
+- **2026-11-23 — the staged input is a compact field on NVIDIA (copy 32% cheaper,
+  bit-exact).** A one-field read touches every second source row, so the copy
+  stages only those rows into a `rows`-row buffer and `FIELD_STAGED` (spec
+  constant 10) addresses field row f at row f, in `loadPad` and `ENTRY_KEEP`.
+  RTX 5060, 1080p `pscrn=4`, GPU stamps, three interleaved rounds: input copy
+  **270-280 -> 182-191 us**, staged footprint halved, output bit-exact (97 tests,
+  three whole 1080p frames maxdiff 0). No wall-clock claim there: that box's own
+  NNEDI3 samples span 198-331 fps on one binary. RDNA3 loses on it: splitting the
+  copy into one region per row measures stage **18 -> 228 us** on the RX 7900 XTX,
+  and a same-session A/B with staging forced gives **4500 vs 3091 fps** (1.456x),
+  so the compact field defaults to NVIDIA (`VSFEEL_NNEDI3_STAGE_FIELD`).
+- **2026-11-23 — static tables are uploaded into pure device-local memory, no perf
+  change.** The weight buffers asked for host-visible + device-local-preferred,
+  which on the RTX 5060 landed them in `memoryTypes[4]` (the BAR window, `0x7`);
+  `vsfeel_upload_table` creates the destination in VRAM, fills it through one
+  staging copy on the filter's exec pool and waits that submission out at
+  creation. Neutral on the RTX 5060 at 0/59/100% list density, and +0.04% at
+  defaults / +0.5% at `pscrn=0` on the RX 7900 XTX (n=8-12); kept because a
+  static table has no reason to share the planes' BAR window.
 - **2026-11-16 — the output plane is published through a copy (+76%, 1080p16).**
   Keep and predict store straight into the output plane, and predict's stores
   are one per listed pixel, so they are scattered. Writing into a filter-owned
@@ -447,12 +467,13 @@ the global switches in `src/vsfeel.h`.
 
 | env | what it does |
 |---|---|
-| `VSFEEL_NNEDI3_GPUTRACE=<frame>` | one-shot GPU stamps for that frame: top / prescreen done / predict done (default 100; gated on the queue family's `timestampValidBits`; the former `_TSTAMP` spelling still works) |
+| `VSFEEL_NNEDI3_GPUTRACE=<frame>` | one-shot GPU stamps for that frame: top / staged input / keep / prescreen / predict / publish (default 100; gated on the queue family's `timestampValidBits`; the former `_TSTAMP` spelling still works) |
 | `VSFEEL_NNEDI3_TIMING=1` | per-frame host stage averages (acquire/record/submit/total) printed at teardown |
 | `VSFEEL_NNEDI3_PRED16=0` | force the storage-only f16 kernels instead of the packed half predictor (default on where the device has `shaderFloat16`) |
 | `VSFEEL_NNEDI3_TILE=<auto\|packed\|pxp8\|n4\|n4m\|n4s>` | force the predictor module for a sweep; the banner's `tile=`/`lds=` is what it chose. A window or a tile/PXP pair that disagrees is a creation error |
 | `VSFEEL_NNEDI3_PXP=<4\|8>` | force the tile-internal pixel block; it is baked into the module's shared stride, so `8` excludes the `n4*` modules and `4` excludes `pxp8` |
 | `VSFEEL_NNEDI3_STAGE=1\|0` | stage the source plane per frame, or read it in place (default: NVIDIA; `VSFEEL_STAGE` sets the default for every filter) |
+| `VSFEEL_NNEDI3_STAGE_FIELD=1\|0` | stage only the field's rows (compact), or the whole plane (default: NVIDIA; needs `STAGE`) |
 | `VSFEEL_NNEDI3_OSTAGE=1\|0` | publish the output through a private copy, or write the plane directly (default: NVIDIA) |
 | `VSFEEL_DEBUG=1\|2` | device banner and full error trail; level 2 also enables the probe traces |
 | `VSFEEL_TRACE=1\|2` | first 50 / every trace line (the banner is also printed) |
