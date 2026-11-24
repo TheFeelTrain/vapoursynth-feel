@@ -6,31 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [v1.4.0] - 2026-11-23
+
+### Added
+
 - BM3D accepts a `matrix` argument to set the color matrix instead of deriving it from the clip's resolution
 
 ### Changed
 
 - All filters are much faster on NVIDIA GPUs (up to 6.5x)
-- Filter creation is faster when a script makes many filters
-- Bilateral is 2.1x faster at the largest spatial sigmas
-- BM3D matches bm3dvk2's color handling, including how RGB input is filtered
-- BM3D, EEDI3/H/AA, NNEDI3, and WNNM use less VRAM for the same output
-- Box is up to 40% faster when only one dimension is scaled
-- DFTTest is up to 13% faster at `sosize` 8 and below, and about 3% faster at defaults
-- DFTTest and NLMeans are faster on GPUs with smaller memory caches
-- EEDI3 and EEDI3AA are up to 45% faster at 2160p
-- GaussBlur is up to 6x faster at sigmas between 2 and 10, and about 6% faster in general
-- NLMeans is 5-7% faster across search radii, and up to 40% faster on luma on NVIDIA GPUse
+- GaussBlur is up to 6x faster at sigmas between 2 and 10, and EEDI3 and EEDI3AA are up to 45% faster at 2160p
+- Bilateral is 2.1x faster at very large radii, and Box is up to 40% faster when only one dimension is scaled
+- DFTTest is up to 13% faster at `sosize` 8 and below and about 3% faster at defaults, NLMeans is 5-7% faster across search radii, and both are faster on GPUs with smaller memory caches
 - WNNM is about 8% faster at `radius=0` and about 5% faster at higher radii
+- BM3D, EEDI3, EEDI3H, EEDI3AA, NNEDI3, and WNNM use less VRAM for the same output
+- Filter creation is faster when a script makes many filters
+- BM3D matches bm3dvk2's color handling, filtering RGB input in the opponent color space
 
 ### Fixed
 
-- All filters reject oversized frames or radii at creation instead of failing on every frame
-- BM3D no longer uses excessive memory during reverse or random playback, and no longer loses denoise strength at large temporal radii on some GPUs
-- NLMeans rejects `a`/`d` combinations the GPU cannot hold, and its plane-range error names the chroma plane
-- DFTTest no longer hangs on some GPU drivers, and rejects negative `sigma`/`sigma2` and `f0beta=0` instead of producing broken frames
+- All filters reject oversized frames and invalid arguments at creation instead of failing on every frame
+- BM3D no longer uses excessive memory during reverse or random playback
+- BM3D no longer loses denoise strength at large temporal radii on some GPUs
+- DFTTest no longer hangs on some GPU drivers
 - Bilateral matches vszipcl at frame edges on some GPUs
-- Box's variable-format error names the format, and `feel_aa` runs its Box supersampler on the CPU instead of failing
+- `feel_aa` with a Box supersampler at `rfactor` > 1 runs the upscale on the CPU instead of failing
 
 ## [v1.3.4] - 2026-11-05
 
