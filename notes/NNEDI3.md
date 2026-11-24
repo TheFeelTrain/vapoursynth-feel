@@ -199,9 +199,9 @@ use the ratios, not the absolute fps.
   which on the RTX 5060 landed them in `memoryTypes[4]` (the BAR window, `0x7`);
   `vsfeel_upload_table` creates the destination in VRAM, fills it through one
   staging copy on the filter's exec pool and waits that submission out at
-  creation. Neutral on the RTX 5060 at 0/59/100% list density, and +0.04% at
-  defaults / +0.5% at `pscrn=0` on the RX 7900 XTX (n=8-12); kept because a
-  static table has no reason to share the planes' BAR window.
+  creation. Neutral on the RTX 5060 at 0/59/100% list density and on the RX
+  7900 XTX (see Do not retry); kept because a static table has no reason to
+  share the planes' BAR window.
 - **2026-11-16 — the output plane is published through a copy (+76%, 1080p16).**
   Keep and predict store straight into the output plane, and predict's stores
   are one per listed pixel, so they are scattered. Writing into a filter-owned
@@ -442,11 +442,29 @@ upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
 - **Packed PX=8** for `PPL<=2 && FS<=192` (4 banks, 12 KiB tile) halves the
   weight bytes per pixel again. Not measured, and the bench default
   (`nns=4` → PPL=8) cannot use it, so it would need its own config.
+- **FP16 weight storage with FP32 accumulation for `u16`/`f32` input.** Predict
+  is 53-61% of a 1080p grain frame on an RTX 5060 (1.2-1.5 ms of 2.2 ms), and its
+  cost is the 192 KiB per-subgroup weight stream, not FMA issue; halving the
+  subgroup count was flat (`pxp8`), so the bytes are the lever. `f16` already
+  halves them (`PRED16`); `u16` has no equivalent and needs a call on the
+  ≤1 LSB accuracy contract before a kernel.
 - **Hand-unrolled k2 with hoisted weight loads** (METHOD's "unroll N wide"):
   PPL=8 already gives 32 independent FMA chains, so ILP is high and this was
   not tried.
+- **Predictor register count and a tile A/B on grain** (`VSFEEL_NNEDI3_TILE=n4s`
+  vs `pxp8`). Worth measuring now that the kernel is 1.2-1.5 ms rather than the
+  gradient clip's 4 us; do not ship a register-pressure change blind.
+- **Prescreen sector efficiency.** One `uint16_t` per tap with adjacent lanes
+  8 B apart is 25% sectors, but the prescreen is 74 us, 3% of the grain frame.
+  A paired-`u32` load was written and reverted unmeasured (the box cannot grade
+  3% of a frame); do not re-attempt without a quiet box.
 - **Prescreen in half** was rejected: its verdict is a threshold and the
   reference keeps its prescreen f32 too.
+- **Settle the copy-cost regime before trading predictor time for copy bytes.**
+  The input and publish copies swing 3x within one session on an RTX 5060
+  (4.15 MB in 100-673 us, 41.7 GB/s at the fast end) with the mechanism
+  unnamed; the same A/B at a pinned `--gpu-cache-mb` (1024 vs 4096) with clocks
+  sampled decides whether that is a benchmark artifact.
 - **Comparing a half clip with an f32 one *rounded* to half is not an
   accuracy test** — the input rounding is amplified by the window
   normalization (~2.8e-2 on the noise clip, 10x the arithmetic's own error).
@@ -459,6 +477,31 @@ upload; host kept-lines pre-`take` — now `ENTRY_KEEP`.
   predicted pixels is where its speed comes from, not codegen.
 - **The clamp peel.** +1% bit-exact on an RTX 5060 over two sessions, below
   the noise floor; the shader is unchanged.
+- **Publishing straight into the core output plane** (`VSFEEL_NNEDI3_OSTAGE=0`).
+  **169 against 646 fps** on an RTX 5060 (1080p, `--filter nnedi3` defaults):
+  the predictor's scattered stores into a core plane are far more expensive than
+  a private buffer plus one bulk copy, so the staged output stays.
+- **Reading the source plane in place** (`VSFEEL_NNEDI3_STAGE=0`). **135.9 against
+  595.3 fps** on an RTX 5060: a per-frame shader read of a core plane is several
+  times slower than a filter-owned copy, and the predictor's gather is what pays
+  for it.
+- **The weight buffers' memory type.** The premise was real, the three buffers
+  did land in `memoryTypes[4]` (the BAR window, `0x7`), but moving them to pure
+  device-local was neutral at 0%, 59% and 100% predictor list density on an
+  RTX 5060, because 192 KiB read by every subgroup stays in L2. Re-measured on
+  the RX 7900 XTX: +0.04% at defaults, +0.5% at `pscrn=0`. Placement is not a
+  lever on either box.
+- **`PXP=8` (the `pxp8` module) at `nns=4`.** Bit-exact and flat on an RTX
+  5060: 294.1 against 268.0 fps at a fixed frame count, inside the ±30% sample
+  spread. (An earlier counting-harness pair is void and not a second sample:
+  that harness re-counted one frame, reading 2.3M "fps".) With `PPL=8` the
+  accumulator traffic (8 `vec4` pairs x 4 arrays) offsets the halved weight
+  stream. The packed-`f16` PX=8 variant is a different module and still untried.
+- **Grading an NNEDI3 change under ~100 us on an RTX 5060.** One identical binary
+  swung 198-331 fps across samples on 1080p grain while `nnedi3vk` stayed inside
+  ±1.5%, so a change that moves a few percent of 2.2 ms cannot be resolved
+  there. Grade on the GPU stamps (`VSFEEL_NNEDI3_GPUTRACE`) plus bit-exactness,
+  and quote wall ratios only with their spread.
 
 ## Debug env vars
 
