@@ -26,12 +26,19 @@ manager:
 ``based_aa``'s EEDI3 antialiaser runs two EEDI3 calls plus two ``std.Merge``
 nodes; ``vsfeel.EEDI3`` is a subclass of ``vsaa``'s antialiaser that replaces
 that whole chain with the fused ``core.vsfeel.EEDI3`` call. ``vsfeel.NNEDI3``
-is the same idea for the supersampler, running ``core.vsfeel.NNEDI3``:
+is the same idea for the supersampler, running ``core.vsfeel.NNEDI3``.
+
+``vsdehalo.fine_dehalo`` gets the same treatment:
+
+    dehaloed = vsfeel.feel_dehalo(clip, pre_ss=2)
+
+It is the same graph with every stage on the device, so only the input upload
+and the consumer's download cross the bus.
 """
 
 from .backend import Backend, FeelBackend
 
-__all__ = ["Backend", "FeelBackend", "EEDI3", "NNEDI3", "feel_aa"]
+__all__ = ["Backend", "FeelBackend", "EEDI3", "NNEDI3", "feel_aa", "feel_dehalo"]
 
 
 def __getattr__(name: str):  # pragma: no cover - thin lazy re-export
@@ -39,4 +46,8 @@ def __getattr__(name: str):  # pragma: no cover - thin lazy re-export
         from . import vsaa
 
         return getattr(vsaa, name)
+    if name == "feel_dehalo":
+        from .dehalo import feel_dehalo
+
+        return feel_dehalo
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

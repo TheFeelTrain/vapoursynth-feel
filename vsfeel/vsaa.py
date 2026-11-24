@@ -124,7 +124,7 @@ class _ResidentScaler(Catrom):
     implementation.
 
     Scalers that ``feel_aa`` drives itself do not need this: they go through
-    ``_scale_on_device``, which calls ``core.resize`` directly, where every
+    ``scale_on_device``, which calls ``core.resize`` directly, where every
     built-in kernel including this one is resident.
     """
 
@@ -140,10 +140,10 @@ class _ResidentScaler(Catrom):
             return super().scale(clip, width, height, shift, **kwargs)
 
         w, h = self._wh_norm(clip, width, height)
-        return _scale_on_device(self, clip, w, h, shift)
+        return scale_on_device(self, clip, w, h, shift)
 
 
-def _scale_on_device(
+def scale_on_device(
     scaler: Any, clip: vs.VideoNode, width: int, height: int, shift: tuple[float, float] = (0, 0)
 ) -> vs.VideoNode:
     """``scaler.scale``, on the device wherever the scaler allows it.
@@ -161,7 +161,7 @@ def _scale_on_device(
     kernel whose plugin is CPU-only) falls back to its own ``scale`` and may
     hand back a host frame. That is allowed rather than refused, because it is
     the only way to use those scalers at all; the caller makes the result
-    resident once with ``_ensure_resident``.
+    resident once with ``ensure_resident``.
     """
     if isinstance(scaler, Box):
         if shift != (0, 0):
@@ -193,7 +193,7 @@ def _scale_on_device(
     return scaler.scale(clip, width, height)
 
 
-def _ensure_resident(node: vs.VideoNode) -> vs.VideoNode:
+def ensure_resident(node: vs.VideoNode) -> vs.VideoNode:
     """Upload a frame that came back on the host, once, for all of its readers.
 
     One host frame in the middle of the chain would otherwise be uploaded again
@@ -400,11 +400,11 @@ def feel_aa(
         ss_clip = luma
     # A callable prefilter can hand back a host clip; every reader below
     # (the pscale blend and the postfilters) needs it resident.
-    ss_clip = _ensure_resident(ss_clip)
+    ss_clip = ensure_resident(ss_clip)
 
     # A supersampler with no device path (ArtCNN) lands the 4K frame on the
     # host; this is the one upload that puts it back for every reader below.
-    ss = _ensure_resident(_scale_on_device(supersampler, ss_clip, aaw, aah))
+    ss = ensure_resident(scale_on_device(supersampler, ss_clip, aaw, aah))
 
     # A class here is instantiated per call, so the default stays one object
     # shared by every invocation without ever being mutated by one of them.
@@ -428,11 +428,11 @@ def feel_aa(
         and mask is not False
     ):
         aa_kwargs.update(
-            mclip=mask if rfactor == 1 else _scale_on_device(Bilinear(), mask, ss.width, ss.height)
+            mclip=mask if rfactor == 1 else scale_on_device(Bilinear(), mask, ss.width, ss.height)
         )
 
     aa = antialiaser.antialias(ss, **aa_kwargs)
-    aa = _ensure_resident(_scale_on_device(downscaler, aa, clip.width, clip.height))
+    aa = ensure_resident(scale_on_device(downscaler, aa, clip.width, clip.height))
 
     # pscale_blend's expression, on std.Expr: its own path goes through the
     # CPU-only akarin plugin (vsexprtools), which downloads every operand.
@@ -441,7 +441,7 @@ def feel_aa(
             [
                 ss_clip,
                 aa,
-                _ensure_resident(_scale_on_device(downscaler, ss, clip.width, clip.height)),
+                ensure_resident(scale_on_device(downscaler, ss, clip.width, clip.height)),
             ],
             f"x z - {1.0 - pscale} * y +",
         )

@@ -212,7 +212,7 @@ core.vsfeel.WNNM(clip clip[,
 
 The wheel ships a small Python module alongside the plugin that adds vsfeel as a backend for the [vs-jetpack](https://github.com/Jaded-Encoding-Thaumaturgy/vs-jetpack) wrappers.
 
-vsjetpack is an optional dependency, only needed at runtime when you use these backends.
+vs-jetpack is an optional dependency, only needed at runtime when you use these backends.
 
 ```python
 from vsrgtools import bilateral, gauss_blur
@@ -236,13 +236,23 @@ smooth = gauss_blur(clip, 1.5, backend=vsfeel.Backend)
 denoised = nl_means(clip, h=0.2, tr=2, a=2, s=4, ref=ref, planes=[1, 2], backend=vsfeel.Backend)
 ```
 
-To also route the *internal* filters vs-jetpack calls on its own (e.g. the bilateral postfilter inside `vsaa.based_aa`), use the backend as a context manager:
+To route the *internal* filters vs-jetpack calls on its own (e.g. the bilateral postfilter inside `vsaa.based_aa`), use the backend as a context manager:
 
 ```python
 from vsaa import based_aa
 
 with vsfeel.Backend():
     based = based_aa(clip, antialiaser=vsfeel.EEDI3())
+```
+
+There are also two variants of vs-jetpack functions with full GPU processing. Output is identical within rounding.
+
+```python
+# based_aa with the upscale, mask, antialiasing, and downscale on the GPU
+aa = vsfeel.feel_aa(clip, supersampler=vsfeel.NNEDI3())
+
+# fine_dehalo with the mask, blurs, and resizes on the GPU
+dehaloed = vsfeel.feel_dehalo(clip, pre_ss=2)
 ```
 
 ## Manual Compilation

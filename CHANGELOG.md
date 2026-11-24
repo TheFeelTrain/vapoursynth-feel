@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `vsfeel.feel_dehalo`, a fully GPU-resident version of `vsdehalo.fine_dehalo`
+
 ## [v1.4.0] - 2026-11-23
 
 ### Added
