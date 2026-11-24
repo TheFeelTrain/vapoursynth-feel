@@ -23,6 +23,7 @@ from conftest import (
     transfers as _transfers,
 )
 
+from vskernels import Bilinear
 from vstools import Range, get_peak_value
 
 from vsfeel.dehalo import feel_dehalo
@@ -90,6 +91,7 @@ U16_CASES = [
     ("two-iters", {"blur": (1.2, 1.8), "brightstr": (0.9, 0.5)}, 2e-5),
     ("thresholds", {"thmi": 60, "thma": 100, "thlimi": 30, "thlima": 80}, 1e-5),
     ("prewitt", {"edgemask": "prewitt"}, 1.5e-5),
+    ("clamp-bilinear", {"supersampler": Bilinear(), "supersampler_ref": Bilinear()}, 1.5e-5),
     ("kirsch", {"edgemask": "kirsch"}, 1e-6),
     ("contra", {"contra": 0.5}, 1e-5),
 ]

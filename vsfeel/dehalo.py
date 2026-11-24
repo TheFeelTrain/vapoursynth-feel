@@ -1,54 +1,13 @@
-"""``feel_dehalo``: ``vsdehalo.fine_dehalo`` with the chain kept on the device.
+"""``feel_dehalo``: ``vsdehalo.fine_dehalo`` kept on the GPU.
 
-``fine_dehalo`` is a host chain: an ``edgemasks`` compass mask, ``akarin``
-expressions, ``vszip.BoxBlur``, ``resize2``'s Gaussian and zimg resamplers.
-``feel_dehalo`` rebuilds the same graph out of the core's GPU filters and
-``core.vsfeel``'s kernels -- the input is uploaded once and every stage after
-it stays in VRAM, so the only transfer left is the download its consumer asks
-for. ``pre_ss`` supersamples with ``core.vsfeel.NNEDI3`` and point-downscales on
-the device, exactly as ``vsscale.pre_ss`` does.
+Usage:
 
-The stages, in the reference's order, are ``FineDehalo.Masks``
-(``vsdehalo/mask.py``) and ``dehalo_alpha`` (``vsdehalo/alpha.py``). The
-substitutions are:
+    from vsfeel import feel_dehalo
 
-- ``core.edgemasks.<detector>`` -> the detector's own matrices as
-  ``std.Convolution`` nodes plus its merge expression (``Max``,
-  ``EuclideanDistance``, ``SingleMatrix``); a detector that cannot be written
-  that way runs on the host and its mask is uploaded once.
-- ``akarin.Expr`` -> ``std.Expr``, except that the core's GPU expression has no
-  relative pixel access, so ``Morpho.gradient`` is a ``std.Maximum`` and a
-  ``std.Minimum`` followed by the subtraction.
-- ``vszip.BoxBlur`` -> ``std.BoxBlur``, ``resize2.Gaussian`` ->
-  ``core.vsfeel.GaussBlur``, ``vszip.Limiter`` (float masks only) ->
-  ``std.Expr``.
-- ``resize2`` Lanczos/Mitchell -> ``core.resize`` Lanczos/Bicubic, which is
-  what ``vsfeel.vsaa`` already does for ``feel_aa``'s scalers.
-- ``znedi3`` -> ``core.vsfeel.NNEDI3`` for the ``pre_ss`` doubling.
+    dehaloed = feel_dehalo(src)
 
-The result is close to, not identical with, ``fine_dehalo``. Away from the
-frame border every stage is the same arithmetic on a different device: measured
-against the reference on the 640x360 fixture and on 1080p, the interior agrees
-to 2.6e-4 of the full range at worst (mean ~1e-6), which is 0.07 codes of 255.
-Four things are left, in order of size:
-
-- The frame's outermost pixels, where ``edgemasks`` extends the edge operator
-  with a policy no ``std.Convolution`` reproduces. ``Morpho.expand`` carries
-  that pixel inward by ``rx``, so the ring is a few pixels wide and it is the
-  only place the full-frame difference exceeds the interior bound.
-- ``resize2``'s Gaussian (10 taps, with an asymmetric tail at the support edge)
-  against ``GaussBlur``'s 9 symmetric ones. The impulse responses agree to
-  1.4e-4, which is the ~26-code residual the blur leaves in the gradients.
-- The core's GPU Lanczos at the ``ss=1.5`` clamp: zimg's kernel, but it samples
-  26 of 345 600 pixels differently at 1.5x.
-- ``std.BoxBlur`` against ``vszip.BoxBlur``: identical on float, one code apart
-  on integer masks at worst.
-
-Residency is what makes the win possible rather than a bonus. A port that left
-each host node in place would insert about fifteen upload/download pairs per 4K
-frame, which costs more than the chain's own work: the reference graph is
-entirely CPU (``edgemasks``, ``akarin``, ``vszip``, ``resize2``, ``znedi3`` and
-zimg's resizers), so what the device buys is the compute itself.
+Same parameters as ``fine_dehalo``. The input is uploaded once and every stage after it 
+stays in VRAM; ``pre_ss`` supersamples with ``core.vsfeel.NNEDI3`` and point-downscales.
 """
 
 from __future__ import annotations
@@ -62,7 +21,13 @@ if TYPE_CHECKING:
 
 __all__ = ["feel_dehalo"]
 
-from jetpytools import CustomIndexError, CustomTypeError, FuncExcept, mod_x, normalize_seq
+from jetpytools import (
+    CustomIndexError,
+    CustomTypeError,
+    FuncExcept,
+    mod_x,
+    normalize_seq,
+)
 from vsdenoise import Prefilter
 from vskernels import Lanczos, Mitchell, Point, Scaler, ScalerLike
 from vsmasktools import (
@@ -98,13 +63,8 @@ _MASK_NAMES = ("EDGES", "SHARP_EDGES", "LARGE_EDGES", "IGNORE_DETAILS", "SHRINK"
 _RECTANGLE = tuple(Coordinates.RECTANGLE)
 _DIAMOND = tuple(Coordinates.DIAMOND)
 
-# The reference's own default, named so the signature can state it.
+# fine_dehalo's own default.
 _GAUSS_SIGMA = 1.4
-
-
-# ---------------------------------------------------------------------------
-# core.std plumbing
-# ---------------------------------------------------------------------------
 
 
 def _expr(
@@ -113,37 +73,31 @@ def _expr(
     planes: Planes = None,
     format: vs.VideoFormat | None = None,
 ) -> vs.VideoNode:
-    """``std.Expr`` with one expression per processed plane.
+    """One expression per processed plane, through ``std.Expr``.
 
-    ``norm_expr`` cannot be used here: it goes through ``akarin.Expr``, which
-    downloads every operand. ``std.Expr`` compiles the same bytecode on the
-    device as long as the expression has no relative pixel access.
+    ``norm_expr`` would route through the CPU-only akarin plugin and download every operand.
     """
     first = clips[0]
     selected = normalize_planes(first, planes)
     num = first.format.num_planes
 
     if isinstance(exprs, str):
-        per_plane = [exprs if p in selected else "" for p in range(num)]
-    else:
-        per_plane = [exprs[p] if p in selected else "" for p in range(num)]
+        exprs = [exprs] * num
 
-    return core.std.Expr(list(clips), per_plane, format)
+    return core.std.Expr(
+        list(clips), [exprs[p] if p in selected else "" for p in range(num)], format
+    )
 
 
 def _token_values(clip: vs.VideoNode) -> tuple[float, float]:
-    """``mask_max`` and ``range_size`` for the mask expressions.
-
-    ``ExprToken.MaskMax`` is the full-range peak of the *first* clip and
-    ``ExprToken.RangeSize`` is that peak plus one for integer formats.
-    """
+    """Full-range peak, and peak plus one for integer clips."""
     peak = float(get_peak_value(clip, range_in=Range.FULL))
 
     return (peak, peak if clip.format.sample_type is vs.FLOAT else peak + 1.0)
 
 
 def _gauss(clip: vs.VideoNode, sigma: Sequence[float], planes: Planes) -> vs.VideoNode:
-    """``gauss_blur`` on the device: unprocessed planes get sigma 0 (copied)."""
+    """``gauss_blur`` on the device; unprocessed planes get sigma 0."""
     selected = normalize_planes(clip, planes)
     per_plane = [float(sigma[p]) if p in selected else 0.0 for p in range(clip.format.num_planes)]
 
@@ -159,12 +113,7 @@ def _morpho(
     *,
     expand: bool,
 ) -> vs.VideoNode:
-    """``Morpho.expand``/``inpand``: the descending 3x3 dilation/erosion ladder.
-
-    ``_xxpand_transform`` walks both radii down together and picks the 3x3
-    subset from the larger one; ``ELLIPSE`` is a diamond on every iteration
-    that is not the first of a three-step group.
-    """
+    """Morpho-style expand (or inpand) from 3x3 maximum (minimum) steps."""
     op = core.std.Maximum if expand else core.std.Minimum
 
     for wi, hi in zip_longest(range(w, -1, -1), range(h, -1, -1), fillvalue=0):
@@ -183,44 +132,59 @@ def _morpho(
 
 
 def _box_blur(clip: vs.VideoNode, passes: int, planes: Planes) -> vs.VideoNode:
-    """``vsrgtools.box_blur(radius=1, mode=HV)`` through the GPU BoxBlur."""
+    """``box_blur(radius=1)`` through the GPU BoxBlur."""
     return core.std.BoxBlur(
         clip, planes=planes, hradius=1, hpasses=passes, vradius=1, vpasses=passes
     )
 
 
-def _gradient(clip: vs.VideoNode, planes: Planes) -> vs.VideoNode:
-    """``Morpho.gradient(radius=1)``: max 3x3 minus min 3x3.
+def _gradient(dilated: str, eroded: str, *, is_float: bool) -> str:
+    """``Morpho.gradient(radius=1)`` as max minus min; float sides clamp first."""
+    if is_float:
+        return f"{dilated} 0 max 1 min {eroded} 0 max 1 min -"
 
-    The reference builds this as one akarin expression with relative pixel
-    access (clamping each side to [0, 1] on float clips); the core's GPU
-    expression has no relative access, so the two neighbourhoods are real
-    filters. Integer clips match the reference away from the border ring,
-    where ``std.Maximum`` replicates and the expression mirrors.
-    """
-    dilated = core.std.Maximum(clip, planes=planes)
-    eroded = core.std.Minimum(clip, planes=planes)
-
-    if clip.format.sample_type is vs.FLOAT:
-        return _expr([dilated, eroded], "x 0 max 1 min y 0 max 1 min -", planes)
-
-    return _expr([dilated, eroded], "x y -", planes)
+    return f"{dilated} {eroded} -"
 
 
-def _limit_mask(mask: vs.VideoNode, planes: Planes) -> vs.VideoNode:
-    """``vstools.limiter(mask, mask=True)``: a no-op for integer clips."""
-    if mask.format.sample_type is not vs.FLOAT:
-        return mask
+def _halo_mask(
+    work: vs.VideoNode,
+    dehalo: vs.VideoNode,
+    lowsens: Sequence[float],
+    highsens: Sequence[float],
+    planes: Planes,
+) -> vs.VideoNode:
+    """How much gradient the blur removed, per plane."""
+    peak, range_size = _token_values(work)
+    is_float = work.format.sample_type is vs.FLOAT
 
-    return _expr([mask], "x 0 max 1 min", planes)
+    # std.Expr names its clips x/y/z, then a, b, ...: the fourth clip is "a".
+    work_gradient = _gradient("x", "y", is_float=is_float)
+    dehalo_gradient = _gradient("z", "a", is_float=is_float)
+
+    exprs = [
+        (
+            f"{work_gradient} 0 = 0 {work_gradient} {dehalo_gradient} - {work_gradient} / ? "
+            f"{peak} * {scale_mask(lowsens[p], 8, work)} - "
+            f"{work_gradient} {range_size} + {range_size} 2 * / {highsens[p] / 100} + *"
+            + (" 0 max 1 min" if is_float else "")
+        )
+        for p in range(len(lowsens))
+    ]
+
+    return _expr(
+        [
+            core.std.Maximum(work, planes=planes),
+            core.std.Minimum(work, planes=planes),
+            core.std.Maximum(dehalo, planes=planes),
+            core.std.Minimum(dehalo, planes=planes),
+        ],
+        exprs,
+        planes,
+    )
 
 
 def _repair_minmax(clip: vs.VideoNode, ref: vs.VideoNode, planes: Planes) -> vs.VideoNode:
-    """``repair.Mode.MINMAX_SQUARE1(clip, ref)``: clamp to the ref's 3x3 range.
-
-    zsmooth mirrors at the borders where ``std.Minimum``/``std.Maximum``
-    replicate, so the 1-pixel ring can differ; everything inside it matches.
-    """
+    """``repair.Mode.MINMAX_SQUARE1`` as a clamp to the reference's 3x3 range."""
     return _expr(
         [clip, core.std.Minimum(ref, planes=planes), core.std.Maximum(ref, planes=planes)],
         "x y max z min",
@@ -228,22 +192,28 @@ def _repair_minmax(clip: vs.VideoNode, ref: vs.VideoNode, planes: Planes) -> vs.
     )
 
 
-# ---------------------------------------------------------------------------
-# Edge masks
-# ---------------------------------------------------------------------------
+def _threshold(
+    edges: vs.VideoNode,
+    lo: Sequence[float],
+    hi: Sequence[float],
+    peak: float,
+    planes: Planes,
+) -> vs.VideoNode:
+    """Linear ramp of the edge mask between per-plane thresholds."""
+    return _expr(
+        [edges],
+        [f"x {lo[p]} - {hi[p]} {lo[p]} - / {peak} * 0 max {peak} min" for p in range(len(lo))],
+        planes,
+    )
 
 
 def _convolution_mode(mode: str) -> str:
+    """The ``std.Convolution`` mode for an edge matrix."""
     return mode[:1] if mode[:1] in ("s", "h", "v") else "s"
 
 
 def _matrix_edge_mask(detector: MatrixEdgeDetect, clip: vs.VideoNode) -> vs.VideoNode:
-    """A matrix edge detector as ``std.Convolution`` nodes plus its merge.
-
-    This is the graph ``vsmasktools`` builds when it is asked to ``use_expr``:
-    one convolution per matrix with ``saturate=False`` (which is ``abs``),
-    merged by ``Max``, ``EuclideanDistance`` or ``SingleMatrix``.
-    """
+    """A matrix edge detector as ``std.Convolution`` nodes plus its merge."""
     matrices = list(detector._get_matrices())
     divisors = list(detector._get_divisors())
     modes = list(detector._get_mode_types())
@@ -278,7 +248,7 @@ def _matrix_edge_mask(detector: MatrixEdgeDetect, clip: vs.VideoNode) -> vs.Vide
 
 
 def _edge_mask(edgemask: MaskLike, clip: vs.VideoNode) -> vs.VideoNode:
-    """``normalize_mask(edgemask, clip, clip)``, on the device where possible."""
+    """The edge mask on the device; detectors with their own kernel run on the host."""
     if isinstance(edgemask, vs.VideoNode):
         return ensure_resident(edgemask)
 
@@ -290,14 +260,7 @@ def _edge_mask(edgemask: MaskLike, clip: vs.VideoNode) -> vs.VideoNode:
     try:
         return _matrix_edge_mask(detector, clip)
     except (CustomTypeError, AttributeError):
-        # A detector with a kernel of its own (ASobel, FreyChen, a plugin's):
-        # run it on the host and pay one round trip for its mask.
         return ensure_resident(detector.edgemask(core.std.GPUDownload(clip=clip)))
-
-
-# ---------------------------------------------------------------------------
-# The mask pipeline
-# ---------------------------------------------------------------------------
 
 
 class Masks(Mapping[str, vs.VideoNode]):
@@ -371,40 +334,28 @@ def _build_masks(
     edgeproc: Any,
     planes: Planes,
 ) -> Masks:
-    """``vsdehalo.mask.FineDehalo.Masks`` with the same node graph."""
+    """``FineDehalo.Masks`` as the same node graph."""
     selected = normalize_planes(clip, planes)
     work = get_y(clip) if selected == [0] else clip
     num = work.format.num_planes
-    ry = ry if ry is not None else rx
+    ry = rx if ry is None else ry
 
     peak, _ = _token_values(work)
 
-    thmif, thmaf, thlimif, thlimaf = (
-        [scale_mask(x, 8, work) for x in normalize_seq(values, num)]
-        for values in (thmi, thma, thlimi, thlima)
-    )
-    exclude_i = normalize_seq(exclude, num)
-    edgeproc_f = normalize_seq(edgeproc, num)
+    thmif = [scale_mask(x, 8, work) for x in normalize_seq(thmi, num)]
+    thmaf = [scale_mask(x, 8, work) for x in normalize_seq(thma, num)]
+    thlimif = [scale_mask(x, 8, work) for x in normalize_seq(thlimi, num)]
+    thlimaf = [scale_mask(x, 8, work) for x in normalize_seq(thlima, num)]
+    excludes = normalize_seq(exclude, num)
+    edgeprocs = normalize_seq(edgeproc, num)
 
+    # Sharpest edges, grown to cover the halos.
     edges = _edge_mask(edgemask, work)
-
-    strong = _expr(
-        [edges],
-        [f"x {thmif[p]} - {thmaf[p]} {thmif[p]} - / {peak} * 0 max {peak} min" for p in range(num)],
-        selected,
-    )
-
+    strong = _threshold(edges, thmif, thmaf, peak, selected)
     large = _morpho(strong, rx, ry, XxpandMode.RECTANGLE, selected, expand=True)
 
-    light = _expr(
-        [edges],
-        [
-            f"x {thlimif[p]} - {thlimaf[p]} {thlimif[p]} - / {peak} * 0 max {peak} min"
-            for p in range(num)
-        ],
-        selected,
-    )
-
+    # Close edges merged into exclusion zones, then smoothed.
+    light = _threshold(edges, thlimif, thlimaf, peak, selected)
     shrink = _morpho(light, rx, ry, XxpandMode.ELLIPSE, selected, expand=True)
     shrink = core.std.BinarizeMask(shrink, threshold=scale_mask(0.25, 32, work), planes=selected)
     shrink = _morpho(shrink, rx, ry, XxpandMode.ELLIPSE, selected, expand=False)
@@ -414,8 +365,8 @@ def _build_masks(
         [strong, shrink, large],
         [
             (
-                f"{edgeproc_f[p]} 0 > z {int(exclude_i[p])} x y max x ? - 2 * dup x "
-                f"{edgeproc_f[p]} 2 3 / * * + ? 0 max {peak} min"
+                f"{edgeprocs[p]} 0 > z {int(excludes[p])} x y max x ? - 2 * dup x "
+                f"{edgeprocs[p]} 2 3 / * * + ? 0 max {peak} min"
             )
             for p in range(num)
         ],
@@ -427,13 +378,8 @@ def _build_masks(
     return Masks(edges, strong, large, light, shrink, mask)
 
 
-# ---------------------------------------------------------------------------
-# dehalo_alpha
-# ---------------------------------------------------------------------------
-
-
 def _iters(*values: Any) -> list[tuple[list[Any], ...]]:
-    """``vsdehalo.alpha._normalize_iter_arr_t``: per-iteration per-plane values."""
+    """Per-iteration, per-plane values, broadcast like the reference."""
     longest = max(len(v) if isinstance(v, tuple) else 1 for v in values)
 
     broadcast = [
@@ -441,7 +387,7 @@ def _iters(*values: Any) -> list[tuple[list[Any], ...]]:
         for v in values
     ]
 
-    return list(zip(*([normalize_seq(item, 3) for item in group] for group in broadcast)))
+    return list(zip(*[[normalize_seq(item, 3) for item in group] for group in broadcast]))
 
 
 def _blur(clip: vs.VideoNode, blur: Sequence[Any], planes: Planes) -> vs.VideoNode:
@@ -454,8 +400,6 @@ def _blur(clip: vs.VideoNode, blur: Sequence[Any], planes: Planes) -> vs.VideoNo
 
             return _gauss(clip, sigma, planes)
 
-        # A blur of the caller's own: it runs wherever it can, and its result
-        # is made resident once so the rest of the chain stays put.
         return ensure_resident(head(clip, planes=planes))
 
     return _gauss(clip, [float(x) for x in blur], planes)
@@ -474,7 +418,7 @@ def _dehalo_alpha(
     supersampler_ref: ScalerLike,
     func: FuncExcept,
 ) -> vs.VideoNode:
-    """``vsdehalo.alpha.dehalo_alpha`` with every node on the device."""
+    """``dehalo_alpha`` with every node on the device."""
     supersampler = Scaler.ensure_obj(supersampler, func)
     supersampler_ref = Scaler.ensure_obj(supersampler_ref, func)
 
@@ -493,21 +437,9 @@ def _dehalo_alpha(
         dehalo = _blur(work, blur_i, planes)
 
         if all(0 <= x <= 100 for x in (*lowsens_i, *highsens_i)):
-            peak, range_size = _token_values(work)
+            mask = _halo_mask(work, dehalo, lowsens_i, highsens_i, planes)
 
-            mask = _expr(
-                [_gradient(work, planes), _gradient(dehalo, planes)],
-                [
-                    (
-                        f"x 0 = 0 x y - x / ? {peak} * {scale_mask(lowsens_i[p], 8, work)} - "
-                        f"x {range_size} + {range_size} 2 * / {highsens_i[p] / 100} + *"
-                    )
-                    for p in range(len(lowsens_i))
-                ],
-                planes,
-            )
-
-            dehalo = core.std.MaskedMerge(dehalo, work, _limit_mask(mask, planes), planes)
+            dehalo = core.std.MaskedMerge(dehalo, work, mask, planes)
 
         elif all(x == -1 for x in lowsens_i) and all(x == -1 for x in highsens_i):
             pass
@@ -517,6 +449,7 @@ def _dehalo_alpha(
         if ss_i == 1:
             dehalo = _repair_minmax(work, dehalo, planes)
         else:
+            # Clamp through the supersampled envelope, then downscale.
             ss_w = mod_x(work.width * ss_i, 2**work.format.subsampling_w)
             ss_h = mod_x(work.height * ss_i, 2**work.format.subsampling_h)
 
@@ -542,28 +475,17 @@ def _dehalo_alpha(
     return dehalo
 
 
-# ---------------------------------------------------------------------------
-# pre_ss
-# ---------------------------------------------------------------------------
-
-
 def _nnedi3(clip: vs.VideoNode, field: int) -> vs.VideoNode:
-    """``vsaa.NNEDI3``'s doubling, with the wrapper's own predictor settings."""
+    """NNEDI3 doubling with the wrapper's predictor settings."""
     return core.vsfeel.NNEDI3(clip, field, dh=True, nsize=0, nns=4, qual=2, etype=0, pscrn=4)
 
 
 def _supersample(clip: vs.VideoNode, field: int, rfactor: int) -> vs.VideoNode:
-    """``SuperSamplerProcess[NNEDI3]`` at ``rfactor`` with ``noshift``.
+    """NNEDI3 supersampling by ``rfactor``; the caller point-downscales after.
 
-    ``SuperSampler.scale`` doubles the height until it reaches the target, then
-    the width the same way (``transpose_first`` is False: the width is the
-    transposed height). With no sub-pixel shift that is ``log2(rfactor)``
-    NNEDI3 doublings per axis around two transposes.
-
-    The field of each doubling comes from the accumulator the reference keeps
-    for the sub-pixel shift it discards: it starts at 0, so the first doubling
-    takes the caller's field and every later one takes the opposite (the
-    accumulator settles at +/-0.5).
+    Doubles the height first, then the width across a transpose. The first
+    doubling takes ``field`` and the rest take the opposite, as the reference's
+    sub-pixel shift accumulator settles.
     """
     steps = rfactor.bit_length() - 1
     fields = [field] + [1 - field] * (steps - 1)
@@ -579,13 +501,8 @@ def _supersample(clip: vs.VideoNode, field: int, rfactor: int) -> vs.VideoNode:
     return core.std.Transpose(clip)
 
 
-# ---------------------------------------------------------------------------
-# Assembly
-# ---------------------------------------------------------------------------
-
-
 def _return_clip(processed: vs.VideoNode, src: vs.VideoNode, planes: list[int]) -> vs.VideoNode:
-    """``FunctionUtil.return_clip``: merge the chroma that was not processed."""
+    """Merge the processed planes back onto the source clip."""
     if planes == [0] and src.format.num_planes > 1:
         return join([processed, plane(src, 1), plane(src, 2)], src.format.color_family)
 
@@ -609,7 +526,7 @@ def _integer_format(fmt: vs.VideoFormat, bits: int) -> vs.VideoFormat:
 
 
 def _narrow(clip: vs.VideoNode, fmt: vs.VideoFormat) -> vs.VideoNode:
-    """Return ``clip`` to an 8-bit input's depth (the widened chain's inverse)."""
+    """Back to an 8-bit input's depth; the widened chain's inverse."""
     if (
         clip.format.sample_type is fmt.sample_type
         and clip.format.bits_per_sample == fmt.bits_per_sample
@@ -622,7 +539,7 @@ def _narrow(clip: vs.VideoNode, fmt: vs.VideoFormat) -> vs.VideoNode:
 def _contrasharpen(
     flt: vs.VideoNode, src: vs.VideoNode, contra: float, planes: Planes
 ) -> vs.VideoNode:
-    """``vsrgtools.contrasharpening_dehalo`` on the host (its median is zsmooth's)."""
+    """Host-only contra-sharpening; imported lazily."""
     from vsrgtools import contrasharpening_dehalo
 
     return contrasharpening_dehalo(flt, src, contra, planes=planes)
@@ -652,30 +569,26 @@ def feel_dehalo(
     func: FuncExcept | None = None,
     **kwargs: Any,
 ) -> vs.VideoNode:
-    """``vsdehalo.fine_dehalo`` with the chain kept on the GPU.
+    """Halo removal with the ``fine_dehalo`` chain kept on the GPU.
 
-    The parameters are ``fine_dehalo``'s, with one difference: ``blur`` is a
-    Gaussian sigma (or per-plane, or per-iteration sigmas) rather than the
-    ``Prefilter.GAUSS`` partial, which is what the default runs. A
-    ``Prefilter.GAUSS`` partial is accepted too, and so is any other blur
-    callable, which runs where it can and is uploaded once.
+    ``ss`` can be set per iteration, while ``blur``, ``lowsens``, ``highsens``,
+    ``darkstr`` and ``brightstr`` can be set per plane and per iteration: a
+    single value applies everywhere, a tuple is per-iteration, and a list
+    inside the tuple is per-plane for that iteration. ``thmi``, ``thma``,
+    ``thlimi``, ``thlima``, ``exclude`` and ``edgeproc`` can be set per plane.
 
-    The input is uploaded once and everything after it runs on the device, so
-    the output stays GPU resident; ``pre_ss`` uses ``core.vsfeel.NNEDI3`` for
-    the doubling. ``u16``, ``f16`` and ``f32`` are the native depths; an 8-bit
-    input is widened to 16 bits on the device, which makes it process at a
-    finer mask depth than the reference (``fine_dehalo`` keeps the source
-    depth through the whole mask chain).
-
-    The output is close to ``fine_dehalo``'s, not bit-exact: the module
-    docstring lists the substitutions and the measured deviations.
+    The output is close to ``fine_dehalo``'s, not bit-exact.
 
     Args:
         clip: Source clip.
-        blur: Gaussian sigma, per-plane list, or per-iteration tuple of those.
-        lowsens: Lower sensitivity threshold; -1 on both disables the mask.
-        highsens: Upper sensitivity threshold.
-        ss: Supersampling factor for the aliasing clamp; 1 disables it.
+        blur: Gaussian sigma, per-plane list, or per-iteration tuple of those. A
+            ``Prefilter.GAUSS`` partial runs as its sigma, any other callable runs
+            where it can and is uploaded once.
+        lowsens: Lower sensitivity threshold; dehalo is fully applied below it.
+            Setting both `lowsens` and `highsens` to `-1` disables the mask.
+        highsens: Upper sensitivity threshold; dehalo is skipped above it.
+            Setting both `lowsens` and `highsens` to `-1` disables the mask.
+        ss: Supersampling factor for the aliasing clamp; 1 takes the other path.
         darkstr: Strength factor for suppressing dark halos.
         brightstr: Strength factor for suppressing bright halos.
         rx: Horizontal radius for halo removal.
@@ -715,8 +628,7 @@ def feel_dehalo(
     norm_planes = normalize_planes(clip, planes)
     out_format = clip.format
 
-    # The one upload. An 8-bit input is widened on the device because no
-    # vsfeel kernel has an 8-bit io variant; the chain then runs at 16 bits.
+    # The one upload. No 8-bit io variant exists, so 8-bit is widened on the device.
     src = core.std.GPUUpload(clip=clip)
     if clip.format.sample_type is vs.INTEGER and clip.format.bits_per_sample < 16:
         src = _expr(
@@ -729,27 +641,26 @@ def feel_dehalo(
     work = get_y(src) if norm_planes == [0] else src
 
     if pre_ss > 1:
-        # vsscale.pre_ss: supersample, run the chain, point-downscale. The
-        # field follows fine_dehalo's `tff` (any chroma plane selected).
+        # Supersample, run the chain, point-downscale. Any selected chroma plane means tff.
         field = int(any(p in norm_planes for p in (1, 2)))
         processed = feel_dehalo(
             _supersample(work, field, pre_ss),
-            blur,
-            lowsens,
-            highsens,
-            ss,
-            darkstr,
-            brightstr,
-            rx,
-            ry,
-            edgemask,
-            thmi,
-            thma,
-            thlimi,
-            thlima,
-            exclude,
-            edgeproc,
-            contra,
+            blur=blur,
+            lowsens=lowsens,
+            highsens=highsens,
+            ss=ss,
+            darkstr=darkstr,
+            brightstr=brightstr,
+            rx=rx,
+            ry=ry,
+            edgemask=edgemask,
+            thmi=thmi,
+            thma=thma,
+            thlimi=thlimi,
+            thlima=thlima,
+            exclude=exclude,
+            edgeproc=edgeproc,
+            contra=contra,
             pre_ss=1,
             planes=planes,
             attach_masks=attach_masks,
@@ -764,7 +675,17 @@ def feel_dehalo(
         return _narrow(_return_clip(down, src, norm_planes), out_format)
 
     masks = _build_masks(
-        work, rx, ry, edgemask, thmi, thma, thlimi, thlima, exclude, edgeproc, planes
+        work,
+        rx=rx,
+        ry=ry,
+        edgemask=edgemask,
+        thmi=thmi,
+        thma=thma,
+        thlimi=thlimi,
+        thlima=thlima,
+        exclude=exclude,
+        edgeproc=edgeproc,
+        planes=planes,
     )
     feel_dehalo.masks = masks  # type: ignore[attr-defined]
 
@@ -783,8 +704,7 @@ def feel_dehalo(
     )
 
     if contra:
-        # contrasharpening_dehalo is a host chain (zsmooth's median, akarin's
-        # expression); running it there is exact and costs one round trip.
+        # Host-only (zsmooth's median); one round trip each way.
         dehaloed = ensure_resident(
             _contrasharpen(
                 core.std.GPUDownload(clip=dehaloed), core.std.GPUDownload(clip=work), contra, planes
