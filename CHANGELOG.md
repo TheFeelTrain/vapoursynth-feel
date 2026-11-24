@@ -18,7 +18,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- All filters are much faster on NVIDIA GPUs (up to 6.5x)
+- Most filters are much faster on NVIDIA GPUs, measured on an RTX 5060:
+  - WNNM about 6.5x
+  - Bilateral about 4x
+  - GaussBlur about 3x
+  - NLMeans, DFTTest, and NNEDI3 about 2.5x
+  - EEDI3 and EEDI3AA about 1.7x
 - GaussBlur is up to 6x faster at sigmas between 2 and 10, and EEDI3 and EEDI3AA are up to 45% faster at 2160p
 - Bilateral is 2.1x faster at very large radii, and Box is up to 40% faster when only one dimension is scaled
 - DFTTest is up to 13% faster at `sosize` 8 and below and about 3% faster at defaults, NLMeans is 5-7% faster across search radii, and both are faster on GPUs with smaller memory caches
