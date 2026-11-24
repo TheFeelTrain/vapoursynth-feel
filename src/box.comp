@@ -2,7 +2,7 @@
 #extension GL_EXT_shader_16bit_storage : require
 
 /*
- * Box — separable box downscale (vskernels' `Box`, i.e. resize2's
+ * Box — separable box scale (vskernels' `Box`, i.e. resize2's
  * `resize2.Custom` with the box kernel). Exactly one of ENTRY_VERT /
  * ENTRY_HORIZ is defined at compile time:
  *
@@ -17,18 +17,20 @@
  * resize2 bit-for-bit wherever its own weights are exact.
  *
  * The tap window is not a formula here. zimg's filter for a box kernel is
- * *not* an area average: at a fractional ratio some output pixels average one
- * source pixel and their neighbours average two or three, and the phase of that
- * pattern is what makes it match. It is precomputed on the host by reproducing
- * zimg's coordinate loop into a `(first tap, tap count)` table, so the shader's
- * window is exact integer arithmetic. See notes/BOX.md.
+ * *not* an area average: at a fractional downscale some output pixels average
+ * one source pixel and their neighbours average two or three, and the phase of
+ * that pattern is what makes it match. It is precomputed on the host by
+ * reproducing zimg's coordinate loop into a `(first tap, tap count)` table, so
+ * the shader's window is exact integer arithmetic. An upscaled axis is the
+ * same table with one tap per output: zimg's box stays one source pixel wide,
+ * so resize2's Box upscale is a nearest-neighbour gather. See notes/BOX.md.
  *
  * Buffers: src/dst are the core's own GPU frame planes (vnode: in/out), `mid`
- * is a transient per-frame scratch buffer, `taps` the constant table above.
- * Compile-time variants: -DIO_U16 / -DIO_F16 / -DIO_F32. A half element is a
- * 2-byte storage type like u16 but the sample is a float: it widens exactly on
- * load and the accumulator stays f32, so `mid` is the sample type at every
- * depth and only the stores round.
+ * is a transient per-frame scratch buffer, `taps` the constant tables above
+ * (one x/y pair per plane). Compile-time variants: -DIO_U16 / -DIO_F16 /
+ * -DIO_F32. A half element is a 2-byte storage type like u16 but the sample is
+ * a float: it widens exactly on load and the accumulator stays f32, so `mid`
+ * is the sample type at every depth and only the stores round.
  */
 
 #if !defined(IO_U16) && !defined(IO_F32) && !defined(IO_F16)

@@ -28,7 +28,8 @@ using namespace std::string_literals;
 // owns every transfer and the filter writes the output frame's planes in
 // place. Two dispatches per plane (vertical into a scratch, horizontal out of
 // it) with the scratch in the frame's own sample type, because that rounding
-// is what makes the result match resize2.
+// is what makes the result match resize2. Either axis may grow or shrink; an
+// upscaled axis is a single-tap table, so those passes are exact gathers.
 
 // The workgroup shape is chosen at creation (see BoxCreate): 64x4 where the
 // device allows 256 invocations and a 64-wide workgroup, else 16x8, the Vulkan
@@ -49,6 +50,7 @@ struct BoxPlaneConfig {
     int src_stride {}, dst_stride {};
     VkPipeline v_pipeline {}, h_pipeline {};
     uint32_t v_grid_x {}, v_grid_y {}, h_grid_x {}, h_grid_y {};
+    uint32_t x_tap_base {}, y_tap_base {}; // this plane's two tables
     uint32_t mid_elem {}; // element offset of this plane's scratch
     // Which passes this plane runs. A pass is skipped only when its axis is
     // unchanged *and* the other one does the work: an identity plane still
@@ -73,8 +75,7 @@ struct BoxData {
     std::array<BoxPlaneConfig, 3> planes {};
 
     VkDeviceSize mid_total {}; // bytes of per-frame two-pass scratch
-    GpuBuffer taps {};         // x table then y table
-    uint32_t y_tap_base {};    // element offset of the y table
+    GpuBuffer taps {};         // per plane: x table then y table
     VSGPUExecPool * pool {};
 
     ~BoxData() {
@@ -112,13 +113,19 @@ struct BoxData {
 
 // resize2 is zimg's resizer with the box kernel. A box kernel is not an area
 // average: zimg samples the kernel at half-integer source positions around
-// `pos = (i + 0.5) / scale`, so at a fractional ratio the tap count alternates
-// and an output pixel can average one, two or three source pixels. The set of
-// samples that land inside the kernel is decided by zimg's own coordinate
-// arithmetic; reproducing that loop, expression for expression, is what makes
-// the boundary cases agree. A closed-form "pixel centres in the output cell"
-// formula disagrees with it whenever the cell edge lands exactly on a sample
-// centre (613 -> 306 and 613 -> 612 are the measured examples).
+// `pos = (i + 0.5) / scale`, so at a fractional downscale the tap count
+// alternates and an output pixel can average one, two or three source pixels.
+// The set of samples that land inside the kernel is decided by zimg's own
+// coordinate arithmetic; reproducing that loop, expression for expression, is
+// what makes the boundary cases agree. A closed-form "pixel centres in the
+// output cell" formula disagrees with it whenever the cell edge lands exactly
+// on a sample centre (613 -> 306 and 613 -> 612 are the measured examples).
+//
+// At an upscale the kernel stays one source pixel wide (`step` is clamped to
+// 1), so exactly one sample centre lands inside it and every output is a
+// single tap: resize2's Box upscale is nearest-neighbour with zimg's tie
+// rule. The same loop produces that case, which is why one table serves both
+// directions.
 //
 // Included taps all have weight 1 and are contiguous, so the table can stay the
 // shader's `(first, count)` pair. `ok` goes false if that ever stops being true
@@ -152,9 +159,10 @@ static std::vector<BoxTaps> box_taps(int src, int dst, bool & ok) {
             if (w < -0.5 || w >= 0.5) {
                 continue; // outside the box kernel
             }
-            // Included taps stay inside [0, src) over the downscale-only domain
-            // the creator enforces (out <= in), so zimg's mirror never runs;
-            // clamp only covers a rounding edge at the first/last sample.
+            // A box window never reaches past the image at either scale (the
+            // first and last output sit half a window inside), so zimg's mirror
+            // never runs; the clamp only covers a rounding edge at a boundary
+            // sample.
             const double real = std::clamp(xpos, 0.0, last_pos);
             const int idx = static_cast<int>(std::floor(real));
             if (count == 0) {
@@ -302,7 +310,7 @@ static const VSFrame * box_gpu_frame(BoxData * d, int n,
 
         if (cfg.run_vert) {
             const int32_t push[4] { 0, 0, static_cast<int32_t>(cfg.mid_elem),
-                                    static_cast<int32_t>(d->y_tap_base) };
+                                    static_cast<int32_t>(cfg.y_tap_base) };
             gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push,
                                sizeof(push));
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -315,7 +323,7 @@ static const VSFrame * box_gpu_frame(BoxData * d, int n,
 
         if (cfg.run_horiz) {
             const int32_t push[4] { 0, 0, static_cast<int32_t>(cfg.mid_elem),
-                                    0 };
+                                    static_cast<int32_t>(cfg.x_tap_base) };
             gpu_push_constants(*d->gpu, cmd, d->pipeline_layout, push,
                                sizeof(push));
             d->gpu->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -422,10 +430,6 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
     if (out_w <= 0 || out_h <= 0) {
         return set_error("\"width\" and \"height\" must be positive.");
     }
-    if (out_w > d->vi->width || out_h > d->vi->height) {
-        return set_error("Box only downscales: \"width\" and \"height\" must "
-                         "not exceed the input.");
-    }
     // A subsampled format's frame dimensions must be multiples of its
     // subsampling factors. The output-stride probe frame below is allocated at
     // this size, and VapourSynth treats an illegal size as a fatal error
@@ -454,6 +458,88 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
             return set_error(std::get<std::string>(result));
         }
         d->gpu = std::get<std::shared_ptr<GPUDevice>>(result);
+    }
+
+    // Per-plane geometry and tap tables: a subsampled plane is filtered on its
+    // own lattice. The luma ratio happens to equal a legal chroma plane's, but
+    // only because frame dimensions are multiples of the subsampling factor;
+    // a table per plane keeps the kernel independent of that.
+    struct BoxPlaneGeom {
+        int src_w {}, src_h {}, dst_w {}, dst_h {};
+    };
+    std::array<BoxPlaneGeom, 3> geom {};
+    int64_t tap_total = 0;
+    for (int p = 0; p < fmt.numPlanes; ++p) {
+        geom[p] = { .src_w = p == 0 ? d->vi->width : d->vi->width >> subW,
+                    .src_h = p == 0 ? d->vi->height : d->vi->height >> subH,
+                    .dst_w = p == 0 ? out_w : out_w >> subW,
+                    .dst_h = p == 0 ? out_h : out_h >> subH };
+        // The stride probe below allocates a frame at the output size, and the
+        // tables are one entry per output position. Reject an output the device
+        // cannot store before either allocation exists; width * height is a
+        // lower bound on the plane's bytes, since the stride is at least the
+        // width.
+        if (auto e = vsfeel_plane_range_error(
+                static_cast<VkDeviceSize>(geom[p].dst_w), geom[p].dst_h,
+                d->elem_bytes, *d->gpu,
+                ("output plane " + std::to_string(p)).c_str());
+            !e.empty()) {
+            return set_error(e);
+        }
+        tap_total += static_cast<int64_t>(geom[p].dst_w) + geom[p].dst_h;
+    }
+
+    // Tap buffer: every plane's two tables concatenated, host visible so
+    // creation fills it directly and the kernels read it every dispatch. Size
+    // it before building the tables so a device that cannot hold them fails
+    // before the host-side work starts.
+    {
+        const VkDeviceSize bytes =
+            static_cast<VkDeviceSize>(tap_total) * sizeof(BoxTaps);
+        auto e = gpu_make_buffer(*d->gpu, core,
+                                 std::max<VkDeviceSize>(bytes, 8), d->taps,
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!e.empty()) {
+            return set_error("tap buffer: " + e);
+        }
+        if (d->taps.mapped == nullptr) {
+            return set_error("tap buffer is not host visible");
+        }
+    }
+
+    bool taps_ok = true;
+    std::array<std::vector<BoxTaps>, 3> x_taps {}, y_taps {};
+    int64_t tap_elements = 0;
+    for (int p = 0; p < fmt.numPlanes; ++p) {
+        x_taps[p] = box_taps(geom[p].src_w, geom[p].dst_w, taps_ok);
+        y_taps[p] = box_taps(geom[p].src_h, geom[p].dst_h, taps_ok);
+        d->planes[p].x_tap_base = static_cast<uint32_t>(tap_elements);
+        tap_elements += static_cast<int64_t>(x_taps[p].size());
+        d->planes[p].y_tap_base = static_cast<uint32_t>(tap_elements);
+        tap_elements += static_cast<int64_t>(y_taps[p].size());
+    }
+    if (!taps_ok) {
+        return set_error(
+            "could not express the box tap window as one equal-weight run");
+    }
+    if (tap_elements > INT32_MAX) {
+        return set_error(
+            "the tap tables are too large for the kernel's 32-bit addressing");
+    }
+    {
+        auto * map = static_cast<BoxTaps *>(d->taps.mapped);
+        for (int p = 0; p < fmt.numPlanes; ++p) {
+            std::memcpy(map + d->planes[p].x_tap_base, x_taps[p].data(),
+                        x_taps[p].size() * sizeof(BoxTaps));
+            std::memcpy(map + d->planes[p].y_tap_base, y_taps[p].data(),
+                        y_taps[p].size() * sizeof(BoxTaps));
+        }
+        // The buffer may have landed in the host-visible VRAM BAR, whose
+        // mapping is write-combining: the first submission must not read a
+        // tail the CPU store buffer has not drained yet.
+        store_fence();
     }
 
     // The kernel addresses both planes through signed 32-bit element offsets
@@ -489,17 +575,6 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         }
     }
 
-    // The tap tables depend only on the ratio, which every plane shares, so
-    // the plane-0 tables serve the subsampled planes as prefixes.
-    bool taps_ok = true;
-    const auto x_taps = box_taps(d->vi->width, out_w, taps_ok);
-    const auto y_taps = box_taps(d->vi->height, out_h, taps_ok);
-    if (!taps_ok) {
-        return set_error(
-            "could not express the box tap window as one equal-weight run");
-    }
-    d->y_tap_base = static_cast<uint32_t>(x_taps.size());
-
     // Push descriptor layout: one whole-buffer binding per shader buffer, so
     // each dispatch rebinds its own view of the planes and nothing is
     // allocated from a descriptor pool.
@@ -517,33 +592,6 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
             return set_error(std::get<std::string>(result));
         }
         d->pipeline_layout = std::get<VkPipelineLayout>(result);
-    }
-
-    // Tap buffer: the two tables concatenated, host visible so creation fills
-    // it with one memcpy and the kernels read it every dispatch.
-    {
-        const VkDeviceSize bytes =
-            static_cast<VkDeviceSize>(x_taps.size() + y_taps.size()) *
-            sizeof(BoxTaps);
-        auto e = gpu_make_buffer(*d->gpu, core,
-                                 std::max<VkDeviceSize>(bytes, 8), d->taps,
-                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (!e.empty()) {
-            return set_error("tap buffer: " + e);
-        }
-        if (d->taps.mapped == nullptr) {
-            return set_error("tap buffer is not host visible");
-        }
-        auto * map = static_cast<BoxTaps *>(d->taps.mapped);
-        std::memcpy(map, x_taps.data(), x_taps.size() * sizeof(BoxTaps));
-        std::memcpy(map + x_taps.size(), y_taps.data(),
-                    y_taps.size() * sizeof(BoxTaps));
-        // The buffer may have landed in the host-visible VRAM BAR, whose
-        // mapping is write-combining: the first submission must not read a
-        // tail the CPU store buffer has not drained yet.
-        store_fence();
     }
 
     // Workgroup shape. One output row per warp keeps the vertical pass' tap
@@ -643,12 +691,10 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
     for (int plane = 0; plane < fmt.numPlanes; ++plane) {
         BoxPlaneConfig & cfg = planes[plane];
 
-        const int plane_src_w =
-            (plane == 0) ? d->vi->width : (d->vi->width >> subW);
-        const int plane_src_h =
-            (plane == 0) ? d->vi->height : (d->vi->height >> subH);
-        const int plane_dst_w = (plane == 0) ? out_w : (out_w >> subW);
-        const int plane_dst_h = (plane == 0) ? out_h : (out_h >> subH);
+        const int plane_src_w = geom[plane].src_w;
+        const int plane_src_h = geom[plane].src_h;
+        const int plane_dst_w = geom[plane].dst_w;
+        const int plane_dst_h = geom[plane].dst_h;
 
         cfg.src_w = plane_src_w;
         cfg.dst_w = plane_dst_w;
@@ -659,7 +705,7 @@ static void VS_CC BoxCreate(const VSMap * in, VSMap * out,
         // destination cell: the same pitch, and store_mid/store_dst are the
         // same rounding for every io type, so it can write dst directly instead
         // of the scratch a horizontal copy would read back. That makes the
-        // vertical the copy pass for an identity plane; only a width-shrinking
+        // vertical the copy pass for an identity plane; only a width-changing
         // one can skip it, and its horizontal pass reads the source instead.
         const bool width_same =
             plane_dst_w == plane_src_w && cfg.src_stride == cfg.dst_stride;

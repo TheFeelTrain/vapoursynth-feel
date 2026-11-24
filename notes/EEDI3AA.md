@@ -163,7 +163,9 @@ Four library steps had to be replaced, each a wrapper around a CPU-only plugin:
   `ComplexScaler` with a resident one.
 
 `Box` is `resize2.Custom` (CPU-only), so the chain calls `core.vsfeel.Box`
-instead; see `notes/BOX.md` for what it reproduces and how closely.
+instead; it scales either way on the device, including the upscale a Box
+supersampler at `rfactor` > 1 asks for. See `notes/BOX.md` for what it
+reproduces and how closely.
 
 `ArtCNN()` needs `platformdirs` for its ONNX model cache, so the `jetpack` and
 `dev` dependencies pull `vsjetpack[scale]`, the smallest extra that has it.

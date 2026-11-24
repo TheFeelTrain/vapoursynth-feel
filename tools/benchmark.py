@@ -769,7 +769,7 @@ def _gauss_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[st
 
 
 def _box_build(ns: argparse.Namespace, clip: str, spec: FilterSpec) -> dict[str, str]:
-    # Downscale by a ratio, so the target follows --clip and --scale. Both
+    # Scale by a ratio, so the target follows --clip and --scale. Both
     # arms get the same integer target; the kernel the reference needs is
     # defined by PLUGINS["resize2"].loader in that arm's vpy. `axis` is what
     # makes Box's one-axis paths (and the identity one) measurable: the other
@@ -1119,13 +1119,13 @@ FILTERS: dict[str, FilterSpec] = {
     "box": FilterSpec(
         title="Box",
         args=[
-            Arg("ratio", "box_ratio", float, 2.0, "downscale ratio (2 = half size)"),
+            Arg("ratio", "box_ratio", float, 2.0, "scale ratio (2 = half size, 0.5 = double)"),
             Arg(
                 "axis",
                 "box_axis",
                 str,
                 "both",
-                "which axes to downscale: both, height, width, or none",
+                "which axes to scale: both, height, width, or none",
             ),
         ],
         build=_box_build,

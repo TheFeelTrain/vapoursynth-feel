@@ -68,7 +68,7 @@ core.vsfeel.BM3D(clip clip[,
 
 ### Box
 
-[Box sampling](https://en.wikipedia.org/wiki/Image_scaling#Box_sampling) treats each output pixel as a box over the source image and averages the source pixels inside it with equal weight, so every input pixel contributes. Downscaling with it gives a clean, smooth result, without the ringing or added sharpness a cubic kernel can introduce.
+[Box sampling](https://en.wikipedia.org/wiki/Image_scaling#Box_sampling) treats each output pixel as a box over the source image and averages the source pixels inside it with equal weight, so every input pixel contributes. Downscaling with it gives a clean, smooth result, without the ringing or added sharpness a cubic kernel can introduce. Upscaling with it takes the single source sample its box covers, matching resize2's Box.
 
 ```python
 core.vsfeel.Box(clip clip[,
@@ -76,7 +76,7 @@ core.vsfeel.Box(clip clip[,
     int height])                    # output height; defaults to the input height
 ```
 
-Any downscale ratio is supported. Omitting one dimension leaves that axis unchanged.
+Any scale ratio is supported, in either direction. Omitting one dimension leaves that axis unchanged.
 
 ### DFTTest
 

@@ -9,6 +9,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `vsfeel.feel_dehalo`, a fully GPU-resident version of `vsdehalo.fine_dehalo`
+- Box accepts upscales as well as downscales
+
+### Changed
+
+- `feel_aa` keeps a Box supersampler upscale on the device instead of uploading it
 
 ## [v1.4.0] - 2026-11-23
 

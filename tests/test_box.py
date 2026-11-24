@@ -4,6 +4,8 @@ The oracle is ``vskernels.Box`` (resize2's ``resize2.Custom`` with the box
 kernel), which is also what ``vsaa.based_aa`` uses for an integer ``rfactor``.
 Every depth (u16, f16, f32) and every color family are compared on the committed
 bigbuckbunny_360p_grain.mp4 clip, whose grain exercises every tap window.
+Downscales average their tap window; upscales are a single-tap gather (zimg's
+box is one source pixel wide there) and are compared just as strictly.
 
 Run from the repository root:  tools/test.sh tests/test_box.py -q
 """
@@ -68,6 +70,10 @@ RATIOS = [
 RATIO_REL = {ratio: rel_bound for ratio, _, rel_bound in RATIOS}
 RATIO_ABS = {ratio: abs_bound for ratio, abs_bound, _ in RATIOS}
 
+# Upscales are single-tap gathers at every depth, so they are bit-exact; the
+# factors (input/output) cover integer and fractional ratios.
+UPSCALE_RATIOS = [0.5, 0.25, 2 / 3, 0.75, 0.8, 4 / 7, 0.4, 2 / 7, 0.125]
+
 # Subsampled formats need even chroma planes, so their fractional ratios are
 # limited to the ones that keep the lattice legal (resize2 rejects the rest).
 COLOR_CASES = [
@@ -129,6 +135,23 @@ COLOR_CASES_F16 = [
     ("rgbh", 2),
     ("rgbh", 4),
     ("rgbh", 1.5),
+]
+
+# Subsampled upsamples (input/output factor), covering both integer and
+# fractional ratios and the chroma planes' own tap tables.
+UPSCALE_COLOR_CASES = [
+    ("yuv420p16", 0.5),
+    ("yuv422p16", 0.5),
+    ("yuv420ps", 0.5),
+    ("yuv444p16", 2 / 3),
+    ("rgb48", 0.5),
+    ("rgbs", 2 / 3),
+]
+
+UPSCALE_COLOR_CASES_F16 = [
+    ("yuv420ph", 0.5),
+    ("yuv444ph", 2 / 3),
+    ("rgbh", 0.5),
 ]
 
 
@@ -236,6 +259,87 @@ def test_agrees_with_resize2_color(request, fmt, ratio):
         _, rel_d = _worst_f32(clip, w, h, planes)
         bound = RATIO_REL[ratio]
         assert rel_d <= bound, f"{ratio}: rel={rel_d} > {bound}"
+
+
+# ---------------------------------------------------------------------------
+# Reference comparison: upscales
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ratio", UPSCALE_RATIOS)
+def test_upscale_agrees_with_resize2_u16(clip_gray16, ratio):
+    """An upscale is a single-tap gather, so it reproduces resize2 exactly."""
+    w, h = _target(clip_gray16, ratio)
+    abs_d, _ = _worst(clip_gray16, w, h, [0])
+    assert abs_d == 0, f"{ratio}: max|d|={abs_d}"
+
+
+@pytest.mark.parametrize("ratio", UPSCALE_RATIOS)
+def test_upscale_agrees_with_resize2_float(clip_grays, ratio):
+    """The float path is exact too: weight 1.0 needs no rounding."""
+    w, h = _target(clip_grays, ratio)
+    _, rel_d = _worst_f32(clip_grays, w, h, [0])
+    assert rel_d == 0.0, f"{ratio}: rel={rel_d}"
+
+
+@pytest.mark.parametrize("ratio", UPSCALE_RATIOS)
+def test_upscale_agrees_with_resize2_f16(clip_grayh, ratio):
+    """The half path stores each gathered sample unchanged."""
+    w, h = _target(clip_grayh, ratio)
+    worst = _worst_f16(clip_grayh, w, h, [0])
+    assert worst == 0.0, f"{ratio}: max|d|={worst}"
+
+
+@pytest.mark.parametrize("fmt,ratio", UPSCALE_COLOR_CASES)
+def test_upscale_agrees_with_resize2_color(request, fmt, ratio):
+    """Every plane is exact, including the subsampled planes on their lattice."""
+    clip = request.getfixturevalue(f"clip_{fmt}")
+    w, h = _target(clip, ratio)
+    out = _box(clip, w, h)
+    assert out.format.num_planes == clip.format.num_planes
+    assert (out.width, out.height) == (w, h)
+    planes = list(range(clip.format.num_planes))
+    if clip.format.sample_type == vs.INTEGER:
+        abs_d, _ = _worst(clip, w, h, planes)
+        assert abs_d == 0, f"{ratio}: max|d|={abs_d}"
+    else:
+        _, rel_d = _worst_f32(clip, w, h, planes)
+        assert rel_d == 0.0, f"{ratio}: rel={rel_d}"
+
+
+@pytest.mark.parametrize("fmt,ratio", UPSCALE_COLOR_CASES_F16)
+def test_upscale_agrees_with_resize2_color_f16(request, fmt, ratio):
+    """The half color planes are exact upscale gathers too."""
+    clip = request.getfixturevalue(f"clip_{fmt}")
+    w, h = _target(clip, ratio)
+    worst = _worst_f16(clip, w, h, list(range(clip.format.num_planes)))
+    assert worst == 0.0, f"{ratio}: max|d|={worst}"
+
+
+def test_mixed_axis_directions_match_resize2(clip_gray16, clip_grays, clip_grayh):
+    """One axis up, the other down: the exact gather commutes with the average.
+
+    The upscaled pass is a copy, so it does not matter on which side of the
+    rounded intermediate resize2 puts it.
+    """
+    cases = (
+        (clip_gray16, _worst, (1280, 180)),
+        (clip_gray16, _worst, (320, 720)),
+        (clip_grays, _worst_f32, (1280, 180)),
+        (clip_grayh, _worst_f16, (320, 720)),
+    )
+    for clip, worst_fn, (w, h) in cases:
+        worst = worst_fn(clip, w, h, [0])
+        worst = worst[0] if isinstance(worst, tuple) else worst
+        assert worst == 0, f"{clip.format.name} {w}x{h}: max|d|={worst}"
+
+
+def test_odd_width_matches_resize2_upscale(clip_gray16):
+    """613 -> {614, 920, 1226}: the boundary rule holds when growing too."""
+    cropped = clip_gray16.std.Crop(right=27)
+    for width in (614, 920, 1226):
+        worst, _ = _worst(cropped, width, 180, [0])
+        assert worst == 0, f"613->{width}: {worst} codes"
 
 
 # zimg's WORD path multiplies by 14-bit integer coefficients whose row sum is
@@ -462,11 +566,6 @@ def test_preserves_frame_props_f16(clip_grayh):
 # ---------------------------------------------------------------------------
 
 
-def test_rejects_upscale(clip_grays):
-    with pytest.raises(Exception, match="downscales"):
-        _box(clip_grays, clip_grays.width * 2, clip_grays.height)
-
-
 def test_rejects_8bit(clip_gray8):
     with pytest.raises(Exception, match="bitdepth"):
         _box(clip_gray8, clip_gray8.width // 2, clip_gray8.height)
@@ -520,10 +619,12 @@ def test_odd_height_matches_resize2_f32(clip_grays):
 
 
 def test_one_axis_omitted_matches_resize2(clip_gray16):
-    """Width-only and height-only requests exercise skip_vert in one pass."""
+    """Width-only and height-only requests exercise the one-pass paths."""
     for kwargs, width, height in (
         ({"width": 320}, 320, clip_gray16.height),
         ({"height": 180}, clip_gray16.width, 180),
+        ({"width": clip_gray16.width * 2}, clip_gray16.width * 2, clip_gray16.height),
+        ({"height": clip_gray16.height * 2}, clip_gray16.width, clip_gray16.height * 2),
     ):
         out = cpu_node(vs.core.vsfeel.Box(clip_gray16, **kwargs))
         ref = _ref(clip_gray16, width, height)

@@ -6,7 +6,7 @@ Usage:
 
     dehaloed = feel_dehalo(src)
 
-Same parameters as ``fine_dehalo``. The input is uploaded once and every stage after it 
+Same parameters as ``fine_dehalo``. The input is uploaded once and every stage after it
 stays in VRAM; ``pre_ss`` supersamples with ``core.vsfeel.NNEDI3`` and point-downscales.
 """
 
